@@ -35,6 +35,26 @@ const RUNNING_JUMP: f32 = 1.0;
 const RUNNING_LAND: f32 = 1.5;
 /// How fast she turns to face where she is going, radians per second.
 const TURN_RATE: f32 = 10.0;
+/// Swimming. She swims where the sea over the ground under her is deeper
+/// than this, metres (chest deep: the depth she gets out of a boat into,
+/// `game::WADE`), and stands again where it is shallower than
+/// [`SWIM_STOP`]; between the two she keeps doing what she did, so the
+/// shore's slope doesn't flick her in and out. Invented: the game's own
+/// depth isn't read.
+pub const SWIM_START: f32 = 1.4;
+pub const SWIM_STOP: f32 = 1.15;
+/// How far her model's origin hangs under the surface while she swims,
+/// metres: the stroke's body lies flat (its highest node only 0.11 m
+/// over its hips, from samples) about a third of a metre over the origin,
+/// so her back is at the waterline. Invented, by eye (at 0.9 m she was
+/// all under the water in the picture).
+const SWIM_FLOAT: f32 = 0.35;
+/// Swimming speed, m/s: the stroke's own root speed (0.81 m/s, from
+/// samples) played at twice its rate. Invented.
+const SWIM_SPEED: f32 = 1.6;
+/// The stroke's rate while she floats still (the `Swim` stance's `Idle`
+/// gives no clip of its own). Invented.
+const SWIM_STILL_RATE: f32 = 0.35;
 /// Camera: eye height looked at, distance behind, and closest it gets
 /// when something is in the way.
 const LOOK_HEIGHT: f32 = 1.6;
@@ -309,9 +329,114 @@ pub struct Player {
     /// Changing the clip ([`Player::start_reload`]): the clip and seconds
     /// in, over her upper body.
     pub reloading: Option<(usize, f32)>,
+    /// The scripts put her weapons away (`Human.DisableWeapons`): none is
+    /// drawn or fired until `EnableWeapons`.
+    pub holstered: bool,
+    /// In the water, out of her depth: she swims ([`Swim`]).
+    pub swim: Option<Swim>,
+}
+
+/// Swimming: how long she has been in, for the stroke's start.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Swim {
+    pub since: f32,
 }
 
 impl Player {
+    /// Whether she swims.
+    pub fn swimming(&self) -> bool {
+        self.swim.is_some()
+    }
+
+    /// Whether her weapons are away: swimming, or put away by the scripts
+    /// ([`holstered`](Self::holstered)). None is drawn in her hands or on
+    /// her back, and nothing fires.
+    pub fn weapons_away(&self) -> bool {
+        self.swimming() || self.holstered
+    }
+
+    /// Swims her when the sea under her is out of her depth
+    /// ([`SWIM_START`]), `direction` the way she is told to go: she floats
+    /// at the surface ([`SWIM_FLOAT`]), goes at [`SWIM_SPEED`] and plays
+    /// the stroke, her weapon away. Where it shallows again
+    /// ([`SWIM_STOP`]) she stands up with the climb-out. True while she
+    /// swims: the rest of the step (running, jumping, aiming) is left
+    /// out.
+    ///
+    /// From samples (the on-foot tables): the `Swim` stance's `EnterSwim`
+    /// handle (cca02d6b) gives the looped stroke c846e6fd, which the
+    /// transition table enters from any handle; `Upright` `ExitSwim`
+    /// (e5653a8b) gives the climb-out 97c840ed. The depths, speed and
+    /// the stroke's rate when still are invented. Only the sea is water
+    /// here (the inland water's heights are drawn, not yet given to
+    /// physics).
+    fn update_swim(&mut self, physics: &Physics, direction: Vec3, dt: f32) -> bool {
+        let Some(water) = physics.water() else {
+            self.swim = None;
+            return false;
+        };
+        let at = self.character.position;
+        let top = at.y.max(water) + 1.0;
+        let ground = physics
+            .cast_ray(at.with_y(top), Vec3::NEG_Y, 400.0)
+            .map(|(d, _)| top - d);
+        let depth = ground.map_or(f32::INFINITY, |g| water - g);
+        match self.swim {
+            None if depth > SWIM_START => {
+                eprintln!("player: out of her depth ({depth:.1} m) at {at:.1}: she swims");
+                self.swim = Some(Swim { since: 0.0 });
+                self.aiming = false;
+                self.throwing = None;
+                self.bashing = None;
+                self.picking = None;
+                self.leap = Leap::No;
+            }
+            Some(_) if depth < SWIM_STOP => {
+                eprintln!("player: in her depth ({depth:.1} m) at {at:.1}: she stands");
+                self.swim = None;
+                if let Some(g) = ground {
+                    self.character.position.y = self.character.position.y.max(g);
+                }
+                if let (Some((_, rig)), Some(clip)) = (&mut self.model, self.clips.swim_out) {
+                    rig.animator.play_once(clip);
+                    self.leap = Leap::Land(0.0, clip);
+                }
+                return false;
+            }
+            _ => {}
+        }
+        let Some(swim) = &mut self.swim else {
+            return false;
+        };
+        swim.since += dt;
+        physics.move_character(&mut self.character, direction * SWIM_SPEED, None, dt);
+        self.character.position.y = water - SWIM_FLOAT;
+        self.character.velocity.y = 0.0;
+        if direction.length_squared() > 0.01 {
+            let target = direction.x.atan2(direction.z);
+            let mut turn = (target - self.facing).rem_euclid(std::f32::consts::TAU);
+            if turn > std::f32::consts::PI {
+                turn -= std::f32::consts::TAU;
+            }
+            self.facing += turn.clamp(-TURN_RATE * dt, TURN_RATE * dt);
+        }
+        let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
+        if let Some((_, rig)) = &mut self.model {
+            rig.animator.set_upper(None);
+            rig.two_handed = false;
+            let rate = match self.clips.swim {
+                Some(clip) => {
+                    rig.animator.play(clip);
+                    let own = rig.clips[clip].info.speed.max(0.1);
+                    (moved / own).clamp(SWIM_STILL_RATE, 2.5)
+                }
+                None => 1.0,
+            };
+            rig.advance(dt * rate);
+        }
+        true
+    }
+
     /// A player who will drop onto the ground at `(x, z)` once it loads.
     pub fn new(x: f32, z: f32, yaw: f32, model: Option<(GpuModel, Rig)>) -> Self {
         Self {
@@ -351,6 +476,8 @@ impl Player {
             picking: None,
             reloading: None,
             binoculars: None,
+            swim: None,
+            holstered: false,
         }
     }
 
@@ -624,6 +751,11 @@ impl Player {
         // Right-handed, +y up: right is forward turned clockwise from above.
         let right = Vec3::new(-c, 0.0, s);
         let direction = forward * intent.movement.y + right * intent.movement.x;
+
+        if self.update_swim(physics, direction, dt) {
+            self.camera(physics);
+            return;
+        }
         let [walk, run, sprint] = self.speeds;
         let speed = if intent.walk {
             walk
@@ -1169,6 +1301,36 @@ mod tests {
         // The camera is behind her and above.
         let eye = p.eye();
         assert!(eye.x < at.x && eye.y > at.y, "{eye}");
+    }
+
+    #[test]
+    fn out_of_her_depth_she_swims_at_the_surface_and_stands_where_it_shallows() {
+        // The ground at y 10, the sea at 12: 2 m deep, out of her depth.
+        let mut physics = ground();
+        physics.set_water(12.0);
+        let mut p = Player::new(0.0, 0.0, std::f32::consts::FRAC_PI_2, None);
+        let dt = 1.0 / 60.0;
+        for _ in 0..usize::from(SETTLED) {
+            p.update(&physics, Intent::default(), dt);
+        }
+        assert!(p.landed);
+        let forward = Intent {
+            movement: Vec2::Y,
+            sprint: true,
+            ..Intent::default()
+        };
+        for _ in 0..60 {
+            p.update(&physics, forward, dt);
+        }
+        assert!(p.swimming());
+        let at = p.character.position;
+        assert!((at.y - (12.0 - SWIM_FLOAT)).abs() < 1e-3, "{at}");
+        // At swimming speed, not running (the sprint is not hers here).
+        assert!((at.x - SWIM_SPEED).abs() < 0.4, "{at}");
+        // The sea goes down to 1 m over the ground: she stands.
+        physics.set_water(11.0);
+        p.update(&physics, forward, dt);
+        assert!(!p.swimming());
     }
 
     // A pillar 2 m behind her, its side 0.1 m off the line from her head

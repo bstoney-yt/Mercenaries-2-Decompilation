@@ -49,6 +49,10 @@ m2-alpha [options]
   --gait <gait>          idle, walk, run or sprint: what characters shown
                          with --model play first; with --screenshot on the
                          island, how the player moves before the picture
+  --walk-seconds <s>     with --gait on the island: she goes on this long
+                         (default 3), logging each second where she is, how
+                         deep the sea is over her feet and whether she swims
+                         (walk lines)
   --config <file>        settings file (default m2-alpha.toml)
   --size <w>x<h>         window size
   --vsync on|off
@@ -186,6 +190,22 @@ m2-alpha [options]
   --placed-check         with --mission: every 5 s, try each pickup, crate and
                          emplaced gun the layers have put out (logged as
                          placed-check lines), for testing
+  --context <text>       with --mission: once the scripts offer a context
+                         action whose prompt reads <text> (exit, talk; a
+                         comma-separated list for each in turn), put her at
+                         it and take it with the use key, logging where she
+                         is after (context-check lines)
+  --dialog-keys <keys>   with --mission --after-contract: the keys pressed in a
+                         dialog box the scripts put up (up, down, accept,
+                         back; comma-separated), the first 3 s after it
+                         opens and each 2 s on (dialog-check lines)
+  --medevac <s>          with --mission --after-contract: this long after the
+                         contract, the pause menu's Medevac as confirmed, if
+                         the scripts allow it then (medevac-check lines)
+  --visit-faction <f>    with --mission --after-contract: 30 s after the
+                         contract, put her by a soldier of faction <f> (All,
+                         Chi, Gur, Oil, Pir, Vza), hurt one 15 s on, and log
+                         who fights her (faction-check lines)
   --jump-with-enter      with --mission --autoplay --after-contract: the
                          Enter pressed after the contract jumps too, as the
                          pad's A; where she is while the scripts hold her

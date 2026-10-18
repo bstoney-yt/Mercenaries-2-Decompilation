@@ -271,6 +271,13 @@ pub struct FightClips {
     /// the one starting nearest the rifle held ready.
     pub bash: Option<(usize, f32)>,
     pub bash_low: Option<(usize, f32)>,
+    /// Swimming: the looped stroke, and standing up out of the water. From
+    /// samples (the on-foot tables): `Swim` `EnterSwim` (handle cca02d6b)
+    /// gives c846e6fd, `Upright` `ExitSwim` (e5653a8b) 97c840ed. The
+    /// [`jump`](Self::jump) stand-in is that stroke too, as named before
+    /// the tables were read; Jennifer's own take-offs come first.
+    pub swim: Option<usize>,
+    pub swim_out: Option<usize>,
 }
 
 /// How far apart a clip's hands get over the whole clip, for its hip
@@ -332,6 +339,9 @@ impl FightClips {
     pub const RUN_LOW: [u32; 4] = [0xe340_14c3, 0x2105_c540, 0x94b1_e4ac, 0x745e_b940];
     pub const JUMP: u32 = 0xc846_e6fd;
     pub const DIE: u32 = 0x479c_4a51;
+    /// The swim stroke and the climb-out (see [`FightClips::swim`]).
+    pub const SWIM: u32 = 0xc846_e6fd;
+    pub const SWIM_OUT: u32 = 0x97c8_40ed;
     /// Jennifer's running take-offs (0.93 s, 3.6 m/s), then the
     /// resident's; standing (0.37 s).
     pub const TAKEOFF: [u32; 4] = [0xdaf7_966f, 0x4fdb_3497, 0x0e18_b683, 0x47af_6321];
@@ -408,6 +418,8 @@ impl FightClips {
                 })
                 .or_else(|| by_event(Self::BASH)),
             bash_low: by_event(Self::BASH_LOW),
+            swim: find(Self::SWIM),
+            swim_out: find(Self::SWIM_OUT),
         }
     }
 
@@ -718,6 +730,14 @@ pub struct Npc {
     /// The layer that placed them (a state layer or a static sub-layer):
     /// they go when it does.
     pub layer: Option<u32>,
+    /// The faction they are of ([`faction_of`]), if an army's.
+    pub faction: Option<&'static str>,
+    /// She hurt them: they fight her while her pursuit lasts.
+    pub provoked: bool,
+    /// Their death was taken as an infraction already.
+    pub reported_dead: bool,
+    /// Hurt since the last look ([`People::pursue`]).
+    pub hurt_by_her: bool,
     /// A story character (placed by a layer, not fighting: `Carmona`):
     /// the scripts', they stay where they are put and never run.
     pub held: bool,
@@ -865,6 +885,10 @@ impl Npc {
             spawn,
             layer: None,
             held: false,
+            faction: None,
+            provoked: false,
+            hurt_by_her: false,
+            reported_dead: false,
             gun: None,
             hp: 100.0,
             most_hp: 100.0,
@@ -910,6 +934,7 @@ impl Npc {
             return false;
         }
         self.hp -= damage;
+        self.hurt_by_her = true;
         self.alert = self.soldier;
         self.hit = true;
         if self.hp <= 0.0 {
@@ -927,11 +952,12 @@ impl Npc {
         !self.alive
     }
 
-    /// Runs from `danger` (those who don't fight, but story characters).
+    /// Runs from `danger` (those who don't fight, but story characters
+    /// and armies' soldiers standing down).
     /// Someone already running, and not towards it, keeps going the way
     /// they are.
     pub fn panic(&mut self, danger: Vec3) {
-        if !self.alive || self.soldier || self.held {
+        if !self.alive || self.soldier || self.held || self.faction.is_some() {
             return;
         }
         let at = self.character.position;
@@ -1685,6 +1711,17 @@ pub struct People {
     /// The looks spawned so far, each by kind and parts picked (for
     /// checking: each new one is said once).
     pub looks_seen: HashSet<(usize, Vec<usize>)>,
+    /// The factions (the faction manager's abbreviations, `Vza`, `All`) the
+    /// scripts have hostile to her, as they last said
+    /// ([`People::set_hostile`]); `None` before they have: then only the
+    /// Venezuelans fight.
+    pub hostile: Option<HashSet<&'static str>>,
+    /// Factions she provoked (hurt one of theirs): their soldiers fight her
+    /// for this many seconds more ([`PURSUIT_SECONDS`]).
+    pub pursuit: HashMap<&'static str, f32>,
+    /// What she did to the factions' people since the mission last took
+    /// them ([`People::take_infractions`]), for their reporters.
+    pub infractions: Vec<Infraction>,
 }
 
 /// Soldier-seconds near her, by what the soldiers were at (for checking
@@ -1899,18 +1936,74 @@ fn venezuelan(name: &str) -> bool {
     name.to_ascii_lowercase().starts_with("vz ")
 }
 
+/// The faction a person of template or entity name `name` is of, as the
+/// faction manager (`MrxFactionManager`) abbreviates it: `Vza` (`VZ
+/// Soldier`), `All` (`Allied Soldier`), `Chi` (`Chinese Soldier`), `Gur`
+/// (`Guerilla Soldier`), `Oil` (`OC Soldier`), `Pir` (`Pirate ..`).
+/// From samples: the faction manager's `sFactionTemplate`s (`Allied`,
+/// `China`, `Guerilla`, `OC`, `Pirate`, `VZ`) and the layers' person
+/// templates, which begin with them (inferred: a template's own faction
+/// link isn't read).
+pub fn faction_of(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_lowercase();
+    [
+        ("vz ", "Vza"),
+        ("allied ", "All"),
+        ("chinese ", "Chi"),
+        ("china ", "Chi"),
+        ("guerilla ", "Gur"),
+        ("guerrilla ", "Gur"),
+        ("oc ", "Oil"),
+        ("pirate ", "Pir"),
+    ]
+    .into_iter()
+    .find_map(|(prefix, f)| n.starts_with(prefix).then_some(f))
+}
+
+/// Something she did to one of a faction's people, for its witnesses to
+/// report ([`m2_game::report`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Infraction {
+    /// The faction, as [`faction_of`] has it.
+    pub faction: &'static str,
+    /// `DamagePerson` or `DestroyPerson` (a [`m2_game::report::KINDS`] key).
+    pub kind: &'static str,
+    /// Where the victim was.
+    pub at: Vec3,
+    /// The victim's spawn entity, if a layer's.
+    pub victim: Option<u32>,
+}
+
+/// The faction's label as the faction manager names it (`Object.HasLabel`
+/// with its `sFactionTemplate`: `OC`, `Allied`) from [`faction_of`]'s
+/// abbreviation.
+pub fn faction_label(f: &str) -> &'static str {
+    match f {
+        "All" => "Allied",
+        "Chi" => "China",
+        "Gur" => "Guerilla",
+        "Oil" => "OC",
+        "Pir" => "Pirate",
+        _ => "VZ",
+    }
+}
+
+/// Seconds the soldiers of a faction she provoked fight her: the first of
+/// the pursuit level times the faction manager sets
+/// (`Pg.SetPursuitLevelTimes(120, 300)`, from the scripts; which level is
+/// which is inferred).
+pub const PURSUIT_SECONDS: f32 = 120.0;
+
 /// Whether spawn `s` (a `target` of a mission's or not) is in its
-/// template's own model but left out: which side people are on isn't
-/// decoded, so of those who don't fight only a story character (a
-/// one-word template, `Carmona`) stands, not another army's or a
-/// passer-by's (`Allied Soldier`, `GR Defender`).
+/// template's own model but left out: of those who don't fight, a story
+/// character (a one-word template, `Carmona`) and an army's soldier (one
+/// with an `Ai` of a faction, [`faction_of`]) stand, not a passer-by
+/// (`GR Defender` without one).
 fn left_out(s: &SpawnPoint, target: bool) -> bool {
-    let fights = target
-        || [s.template.as_deref(), Some(s.name.as_str())]
-            .iter()
-            .flatten()
-            .any(|n| venezuelan(n));
-    s.model.is_some() && !fights && s.template.as_deref().is_some_and(|t| t.contains(' '))
+    let names = [s.template.as_deref(), Some(s.name.as_str())];
+    let fights = target || names.iter().flatten().any(|n| venezuelan(n));
+    let army = s.ai.is_some() && names.iter().flatten().any(|n| faction_of(n).is_some());
+    s.model.is_some() && !fights && !army && s.template.as_deref().is_some_and(|t| t.contains(' '))
 }
 
 /// The role a name asks for when it is a Venezuelan's (`VZ Heavy ..`):
@@ -1987,6 +2080,173 @@ impl People {
         None
     }
 
+    /// Someone of the scripts' own, `guid` (template `template`, its own
+    /// model `model`), stands at `at` facing `facing` as they have them:
+    /// the HQ's starter out of her seat for her briefing. Brought in
+    /// (in the looks `outfit`, if given) the first time; moved and turned
+    /// after. They don't fight or run (a story character). False when
+    /// their kind isn't in yet.
+    pub(crate) fn stand_scripted(
+        &mut self,
+        guid: u32,
+        template: &str,
+        model: Option<u32>,
+        outfit: Option<Vec<bool>>,
+        at: Vec3,
+        facing: f32,
+    ) -> bool {
+        if let Some(n) = self.npcs.iter_mut().find(|n| n.spawn == Some(guid)) {
+            if n.character.position.distance(at) > 0.25 || (n.facing - facing).abs() > 0.01 {
+                n.character.position = at;
+                n.character.velocity = Vec3::ZERO;
+                n.facing = facing;
+                n.brain = Brain::Post { facing };
+            }
+            return true;
+        }
+        let Some(kind) = self.rider_kind(template, model) else {
+            return false;
+        };
+        let mut n = Npc::new(
+            kind,
+            &self.kinds[kind].rig,
+            at,
+            facing,
+            Brain::Post { facing },
+            Some(guid),
+        );
+        n.outfit = outfit.unwrap_or_else(|| self.dress_as(kind, template));
+        n.held = true;
+        // Unarmed and not fighting (inferred: the scripts give the HQ's
+        // starters no weapon; a soldier is drawn with the stand-in AK47).
+        n.soldier = false;
+        n.gun = None;
+        eprintln!("people: {template} ({guid:#x}) stands at {at:.1}, as the scripts have them");
+        self.npcs.push(n);
+        true
+    }
+
+    /// The scripts' own `guid` ([`People::stand_scripted`]) is no longer
+    /// on foot (back in a seat, or gone).
+    pub(crate) fn unstand_scripted(&mut self, physics: &mut Physics, guid: u32) {
+        self.npcs.retain(|n| {
+            if n.spawn != Some(guid) {
+                return true;
+            }
+            if let Some(doll) = n.ragdoll {
+                physics.remove_ragdoll(doll);
+            }
+            false
+        });
+    }
+
+    /// Whether soldiers of faction `f` fight her now: their faction is
+    /// hostile to her (the scripts' attitudes; before they say, only the
+    /// Venezuelans), or she provoked them a while ago ([`PURSUIT_SECONDS`]).
+    pub fn fights_for(&self, f: &str) -> bool {
+        let hostile = match &self.hostile {
+            Some(set) => set.contains(f),
+            None => f == "Vza",
+        };
+        hostile || self.pursuit.contains_key(f)
+    }
+
+    /// The factions hostile to her, as the scripts' attitudes now have
+    /// them (asked of the faction manager once a second, `crate::mission`): their
+    /// soldiers about fight her, the rest's stand down.
+    pub fn set_hostile(&mut self, hostile: HashSet<&'static str>) {
+        if self.hostile.as_ref() != Some(&hostile) {
+            eprintln!("people: factions hostile to her now {hostile:?}");
+            self.hostile = Some(hostile);
+            self.refresh_sides();
+        }
+    }
+
+    /// Faction soldiers fight her or stand down as their faction now
+    /// does ([`fights_for`](Self::fights_for)), one she hurt fights on;
+    /// the scripts' targets always fight.
+    fn refresh_sides(&mut self) {
+        let fights: Vec<bool> = self
+            .npcs
+            .iter()
+            .map(|n| match n.faction {
+                Some(f) => {
+                    n.provoked
+                        || self.fights_for(f)
+                        || n.spawn.is_some_and(|s| self.mission_soldiers.contains(&s))
+                }
+                None => n.soldier,
+            })
+            .collect();
+        for (n, fights) in self.npcs.iter_mut().zip(fights) {
+            if n.soldier != fights {
+                n.soldier = fights;
+                if !fights {
+                    n.alert = false;
+                }
+            }
+        }
+    }
+
+    /// What she did to the factions' people since the last call.
+    pub fn take_infractions(&mut self) -> Vec<Infraction> {
+        std::mem::take(&mut self.infractions)
+    }
+
+    /// The pursuits: a faction member she hurt starts one for their
+    /// faction ([`PURSUIT_SECONDS`]), and each runs down by `dt`.
+    fn pursue(&mut self, dt: f32) {
+        let mut started = Vec::new();
+        for n in &mut self.npcs {
+            let Some(f) = n.faction else { continue };
+            let hurt = std::mem::take(&mut n.hurt_by_her);
+            if hurt {
+                // What a witness of theirs reports: hurt, or killed.
+                let kind = if n.alive {
+                    "DamagePerson"
+                } else {
+                    "DestroyPerson"
+                };
+                if n.alive || !n.reported_dead {
+                    n.reported_dead |= !n.alive;
+                    self.infractions.push(Infraction {
+                        faction: f,
+                        kind,
+                        at: n.character.position,
+                        victim: n.spawn,
+                    });
+                }
+            }
+            if hurt && !n.provoked {
+                n.provoked = true;
+                started.push(f);
+            }
+        }
+        let before = self.pursuit.len();
+        for f in started {
+            if self.pursuit.insert(f, PURSUIT_SECONDS).is_none() {
+                eprintln!("people: she provoked {f}: they fight her for {PURSUIT_SECONDS:.0} s");
+            }
+        }
+        let mut ended = Vec::new();
+        self.pursuit.retain(|f, left| {
+            *left -= dt;
+            if *left <= 0.0 {
+                eprintln!("people: {f} give up the pursuit");
+                ended.push(*f);
+            }
+            *left > 0.0
+        });
+        for n in &mut self.npcs {
+            if n.faction.is_some_and(|f| ended.contains(&f)) {
+                n.provoked = false;
+            }
+        }
+        if self.pursuit.len() != before || self.npcs.iter().any(|n| n.provoked && !n.soldier) {
+            self.refresh_sides();
+        }
+    }
+
     /// A rider of template `template` (its own model `model`) put out of
     /// their seat at `at`: they stand there, in the looks their seat had
     /// (`outfit`), and run from `from` (invented: no car hijack in the
@@ -2038,7 +2298,11 @@ impl People {
             if left_out(s, target) {
                 return Who::Nobody;
             }
-            let fights = target || names.iter().flatten().any(|n| venezuelan(n));
+            let fights = target
+                || names
+                    .iter()
+                    .flatten()
+                    .any(|n| faction_of(n).is_some_and(|f| self.fights_for(f)));
             if let Some(kind) = self.own(template, model) {
                 return Who::Kind {
                     kind,
@@ -2086,7 +2350,7 @@ impl People {
             return Who::Nobody;
         };
         let (template, model, _) = &s.list[i as usize];
-        let fights = venezuelan(template);
+        let fights = faction_of(template).is_some_and(|f| self.fights_for(f));
         if let Some(kind) = self.own(template, *model) {
             return Who::Kind {
                 kind,
@@ -2171,6 +2435,7 @@ impl People {
         threat: Option<Vec3>,
         dt: f32,
     ) {
+        self.pursue(dt);
         self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
         let mut callouts = Vec::new();
@@ -2665,9 +2930,16 @@ impl People {
             npc.hp = npc.ai.health;
             npc.most_hp = npc.ai.health;
             npc.soldier = fights;
+            // An army's soldier (by their template's name, else their
+            // spawner's list's first): they fight as their faction does.
+            npc.faction = [s.template.as_deref(), Some(s.name.as_str())]
+                .into_iter()
+                .flatten()
+                .chain(s.list.first().map(|(t, _, _)| t.as_str()))
+                .find_map(faction_of);
             // A story character the layers place is the scripts': where
             // they are put, they stay.
-            npc.held = !fights && !listed;
+            npc.held = !fights && !listed && npc.faction.is_none();
             // Their own template's gun (in the catalogue's model too); a
             // spawner's pick's, by the kind of their template.
             npc.gun = if listed {
@@ -2999,6 +3271,57 @@ pub(crate) mod tests {
         assert_eq!(sent.len(), 1);
         // Not a Venezuelan: doesn't fight, nor is he a story character.
         assert!(!sent[0].soldier && !sent[0].held);
+    }
+
+    #[test]
+    fn an_armys_soldiers_fight_her_when_their_faction_is_hostile_or_she_hurt_one() {
+        assert_eq!(faction_of("Allied Soldier"), Some("All"));
+        assert_eq!(faction_of("OC Soldier (Saunter)"), Some("Oil"));
+        assert_eq!(faction_of("VZ Heavy (RPG)"), Some("Vza"));
+        assert_eq!(faction_of("Carmona"), None);
+        let mut physics = ground();
+        let mut people = People::default();
+        let post = SpawnPoint {
+            template: Some("OC Soldier".into()),
+            ai: Some(AiProfile::default()),
+            model: Some(0x0d0b),
+            ..spawn(5, "OC Soldier 0x0011055e", 10.0)
+        };
+        let spawns = [post];
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        // Not left out: his template's own model is asked for.
+        assert_eq!(people.wanted, [(0x0d0b, "OC Soldier".to_owned())]);
+        people.add_kind(kind("OC Soldier", true));
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        let him = |p: &People| {
+            p.npcs
+                .iter()
+                .find(|n| n.spawn == Some(5))
+                .map(|n| (n.soldier, n.held))
+        };
+        // He stands (not left out), armed but not fighting, nor the scripts'.
+        assert_eq!(him(&people), Some((false, false)));
+        // The scripts' attitudes make OC hostile: he fights; back: he doesn't.
+        people.set_hostile(["Vza", "Oil"].into_iter().collect());
+        assert_eq!(him(&people), Some((true, false)));
+        people.set_hostile(["Vza"].into_iter().collect());
+        assert_eq!(him(&people), Some((false, false)));
+        // She hurts him: OC pursue her for the pursuit's time, then stop.
+        if let Some(n) = people.npcs.iter_mut().find(|n| n.spawn == Some(5)) {
+            n.hurt(1.0, Vec3::ZERO);
+        }
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        assert!(people.pursuit.contains_key("Oil"));
+        assert_eq!(him(&people), Some((true, false)));
+        people.update(
+            &mut physics,
+            &spawns,
+            Vec3::ZERO,
+            None,
+            PURSUIT_SECONDS + 1.0,
+        );
+        assert!(people.pursuit.is_empty());
+        assert_eq!(him(&people), Some((false, false)));
     }
 
     #[test]

@@ -173,6 +173,9 @@ pub struct Game {
     /// Models taken only by their action hijack while crewed (an entrance
     /// in the data, [`crate::hijack`]): the use key doesn't get her in.
     pub hijack_only: HashSet<u32>,
+    /// Vehicles (by guid) the scripts keep for themselves
+    /// (`Vehicle.Usable(vehicle, false)`): the use key doesn't get her in.
+    pub unusable: HashSet<u32>,
     /// The field of view (degrees, bottom to top) and the screen's width
     /// over its height the last frame was drawn with: what the scripts'
     /// camera sees (`Event.ObjectIsVisible`).
@@ -180,6 +183,70 @@ pub struct Game {
     /// The scripts seated her in the vehicle she is in (the start's boat), rather
     /// than she getting in herself: no remark on it ([`car_remark`]).
     pub scripts_seated: bool,
+    /// The scripts' context action she stands at (`Pg.AddContextAction`:
+    /// an HQ exit, a starter's talk), its object and prompt, as the
+    /// mission last found it; the use key takes it before anything else.
+    pub context: Option<(u32, String)>,
+    /// The context action she took with the use key, for the mission to
+    /// tell the scripts.
+    pub context_taken: Option<u32>,
+    /// The scripts' camera shot for a scene (the HQ's briefings), while
+    /// it lasts: the frame is seen from it ([`Shot::view`]).
+    pub shot: Option<Shot>,
+    /// Seconds the HUD's save icon has left up after the game was saved
+    /// ([`SAVE_ICON_SECONDS`]).
+    pub save_icon: f32,
+    /// Seconds before the factions' attitudes are asked of the scripts again.
+    pub attitude_wait: f32,
+    /// Witnesses reporting her: guid, faction and seconds since they set
+    /// off ([`crate::mission`]).
+    pub reporters: Vec<(u32, &'static str, f32)>,
+}
+
+/// A camera shot the scripts asked for (`Camera.SetShot`): the engine's
+/// named shot from one object to another.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shot {
+    /// `OverTheShoulderLeft`, `OverTheShoulderRight` (the HQ's briefings).
+    pub name: String,
+    pub base: u32,
+    pub target: u32,
+    /// Where it sees from and looks at, as last placed
+    /// ([`Shot::place`]); `None` until both objects are known.
+    pub view: Option<(Vec3, Vec3)>,
+}
+
+/// An over-the-shoulder shot's eye from its base's feet: this far up, back
+/// from the target and aside (metres), and where on the target it looks.
+/// Invented (the engine's shot table is not read, and these are not yet
+/// checked against the footage of the HQ's briefings).
+const SHOULDER_UP: f32 = 1.65;
+
+/// How long the HUD's save icon stays up once the game is saved, seconds:
+/// the HUD's own icon (`HandleSaveIconShow`) takes `_knSaveIconTime`
+/// (0.5 s, from the scripts) to come in and as long to go; a second
+/// between is invented (the save itself is at once here).
+pub const SAVE_ICON_SECONDS: f32 = 2.0;
+const SHOULDER_BACK: f32 = 1.1;
+const SHOULDER_ASIDE: f32 = 0.45;
+const SHOULDER_LOOK_UP: f32 = 1.5;
+
+impl Shot {
+    /// Places the shot from where its base and target stand (feet): over
+    /// the base's left or right shoulder at the target's head; any other
+    /// shot is taken as the left one.
+    pub fn place(&mut self, base: Vec3, target: Vec3) {
+        let ahead = (target - base).with_y(0.0).normalize_or(Vec3::Z);
+        let right = ahead.cross(Vec3::Y).normalize_or(Vec3::X);
+        let side = if self.name.ends_with("Right") {
+            1.0
+        } else {
+            -1.0
+        };
+        let eye =
+            base + Vec3::Y * SHOULDER_UP - ahead * SHOULDER_BACK + right * side * SHOULDER_ASIDE;
+        self.view = Some((eye, target + Vec3::Y * SHOULDER_LOOK_UP));
+    }
 }
 
 /// A soldier's pickup is told from the others by its "crate": this, plus
@@ -274,8 +341,15 @@ impl Game {
             placed: crate::placed::Placed::default(),
             input_locked: false,
             hijack_only: HashSet::new(),
+            unusable: HashSet::new(),
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
+            context: None,
+            context_taken: None,
+            shot: None,
+            save_icon: 0.0,
+            attitude_wait: 0.0,
+            reporters: Vec::new(),
             scripts_seated: false,
         }
     }
@@ -508,6 +582,14 @@ impl Game {
             self.toggle_fly();
         }
         if self.on_foot {
+            // A context action she stands at takes the use key first.
+            if let Some((g, _)) = &self.context
+                && !self.input_locked
+                && input.take_pressed(Action::Use)
+            {
+                eprintln!("context: she takes the action at {g:#x}");
+                self.context_taken = Some(*g);
+            }
             let mut intent = Intent::from_input(input, config, mouse_look);
             let toggle = input.take_pressed(Action::Binoculars);
             let zoom = i32::from(input.take_pressed(Action::ZoomIn))
@@ -654,6 +736,7 @@ impl Game {
 
     /// One fixed tick with `intent` for the player (ignored while flying).
     pub fn step(&mut self, intent: Intent, dt: f32) {
+        self.save_icon = (self.save_icon - dt).max(0.0);
         if let Some((every, run, since)) = &mut self.census {
             *run += dt;
             *since += dt;
@@ -748,11 +831,8 @@ impl Game {
                     })
                     .flatten();
                     match player.driving {
-                        // Not out of a boat into deep water.
-                        Some(i) if can_get_out(physics, &scene.vehicles[i]) => {
-                            get_out(physics, &scene.vehicles[i], player)
-                        }
-                        Some(_) => {}
+                        // Out over deep water she swims (`Player::update_swim`).
+                        Some(i) => get_out(physics, &scene.vehicles[i], player),
                         // Off the emplaced gun she mans.
                         None if self.combat.manned.is_some() => {
                             if let Some(m) = self.combat.manned.take() {
@@ -798,8 +878,13 @@ impl Game {
                             self.combat.manned = Some(m);
                         }
                         None => {
-                            player.driving =
-                                nearest(physics, &scene.vehicles, &self.hijack_only, player, REACH);
+                            player.driving = nearest(
+                                physics,
+                                &scene.vehicles,
+                                (&self.hijack_only, &self.unusable),
+                                player,
+                                REACH,
+                            );
                             // Seated: she no longer waits to land (people
                             // wait on that, and she may have hopped out and
                             // back in before the ground streamed).
@@ -1074,7 +1159,15 @@ impl Game {
                 explosives: &mut scene.explosives,
             };
             crate::spans::time("on foot: combat", || {
-                self.combat.step(&mut field, intent.trigger, dt);
+                // Her weapons away (swimming, or put away by the scripts):
+                // nothing to fire, aim or throw (the on-foot table's `Swim`
+                // stance has no firing or aiming rows).
+                let trigger = if field.player.weapons_away() {
+                    crate::combat::Trigger::default()
+                } else {
+                    intent.trigger
+                };
+                self.combat.step(&mut field, trigger, dt);
             });
             crate::spans::time("on foot: vehicles hit her", || {
                 self.combat.vehicles_hit_her(&mut field, dt);
@@ -1716,7 +1809,7 @@ impl Game {
             (Some(w), Some(p)) if p.driving.is_none() && p.landed => nearest(
                 &w.physics,
                 &self.scene.vehicles,
-                &self.hijack_only,
+                (&self.hijack_only, &self.unusable),
                 p,
                 REACH,
             )
@@ -1795,7 +1888,13 @@ impl Game {
             }
             .map(|r| (r.clip, r.stored)),
             // Looking through the satellite, its own overlay is shown.
-            prompt: prompt.filter(|_| !self.support.busy()),
+            prompt: self
+                .context
+                .as_ref()
+                .filter(|_| self.on_foot && !self.input_locked)
+                .map(|(_, text)| text.clone())
+                .or(prompt)
+                .filter(|_| !self.support.busy()),
             driving,
             crosshair: crosshair.filter(|_| self.support.looking().is_none()),
             can_enter: can_enter.filter(|_| !self.support.busy()),
@@ -1817,7 +1916,7 @@ impl Game {
         player.driving = nearest(
             &world.physics,
             &self.scene.vehicles,
-            &self.hijack_only,
+            (&self.hijack_only, &self.unusable),
             player,
             reach,
         );
@@ -1999,12 +2098,17 @@ impl Game {
     /// Where the frame is seen from: her camera (shaken by a bomb close
     /// by), the satellite's while she looks through it, or the free one.
     pub fn view(&self, fov: f32, aspect: f32) -> View {
-        let mut view = match self.walking() {
-            Some(p) => match self.support.looking() {
-                Some(at) => support::satellite_view(at, p.character.position.y, aspect),
-                None => p.view(fov, aspect),
+        let shot = self.shot.as_ref().and_then(|s| s.view);
+        let mut view = match (self.walking(), shot) {
+            // A scene's shot of the scripts' (the HQ's briefings).
+            (Some(_), Some((eye, at))) => FlyCamera::looking_at(eye, at).view(fov, aspect),
+            (p, _) => match p {
+                Some(p) => match self.support.looking() {
+                    Some(at) => support::satellite_view(at, p.character.position.y, aspect),
+                    None => p.view(fov, aspect),
+                },
+                None => self.camera.view(fov, aspect),
             },
-            None => self.camera.view(fov, aspect),
         };
         if let Some((a, b)) = self.support.shake_turn()
             && self.support.looking().is_none()
@@ -3048,7 +3152,7 @@ fn put_out(
         let kind = people.rider_kind(&who, model);
         let outfit = riders
             .iter()
-            .find(|r| r.vehicle == i && Some(r.kind) == kind)
+            .find(|r| r.prop.is_none() && r.vehicle == i && Some(r.kind) == kind)
             .map(|r| r.outfit.clone());
         let stood = people.put_out(&who, model, outfit, door, her);
         eprintln!(
@@ -3068,7 +3172,7 @@ fn put_out(
 fn nearest(
     physics: &Physics,
     vehicles: &[ParkedVehicle],
-    hijack_only: &HashSet<u32>,
+    (hijack_only, unusable): (&HashSet<u32>, &HashSet<u32>),
     player: &Player,
     reach: f32,
 ) -> Option<usize> {
@@ -3081,6 +3185,8 @@ fn nearest(
         // 5: the villa's tank, whose scripts make it usable by the hijack
         // alone, `Vehicle.Usable(tank, false)`, was got into at a press).
         .filter(|(_, v)| !(hijack_only.contains(&v.spec.model) && has_driver(&v.crew)))
+        // Kept by the scripts for themselves (`Vehicle.Usable(v, false)`).
+        .filter(|(_, v)| !v.guid.is_some_and(|g| unusable.contains(&g)))
         // One with someone in the driver's seat is taken from them: the
         // action hijacks (tanks, helicopters) took the key first if near
         // ([`crate::hijack`]); cars, bikes and jeeps have none in the data
@@ -3114,8 +3220,10 @@ fn door_out(at: Mat4, spec: &VehicleSpec) -> Vec3 {
     at.transform_point3(Vec3::new(x, 0.0, door.z))
 }
 
-/// Whether she can get out of `v` where it is: not from a boat over water
-/// deeper than she can stand in ([`WADE`]).
+/// Whether she can get out of `v` where it is on her feet: not from a boat
+/// over water
+/// deeper than she can stand in ([`WADE`]); the autoplay waits for it
+/// (the player may get out anywhere, and swims).
 pub(crate) fn can_get_out(physics: &Physics, v: &ParkedVehicle) -> bool {
     let (Some(water), Some(id)) = (physics.water(), v.id.filter(|_| v.spec.is_boat())) else {
         return true;
@@ -3212,6 +3320,27 @@ fn switch_weapon(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    #[test]
+    fn a_shoulder_shot_sees_the_target_from_behind_the_base() {
+        // Jennifer at the origin facing Fiona 2 m up +z.
+        let mut shot = super::Shot {
+            name: "OverTheShoulderLeft".into(),
+            base: 1,
+            target: 2,
+            view: None,
+        };
+        let (base, target) = (super::Vec3::ZERO, super::Vec3::new(0.0, 0.0, 2.0));
+        shot.place(base, target);
+        let (eye, at) = shot.view.unwrap();
+        assert!(eye.z < 0.0 && eye.y > 1.0, "{eye}");
+        assert!((at - super::Vec3::new(0.0, 1.5, 2.0)).length() < 1e-5);
+        let left = eye.x;
+        shot.name = "OverTheShoulderRight".into();
+        shot.place(base, target);
+        let right = shot.view.unwrap().0.x;
+        assert!((left + right).abs() < 1e-5 && left != right);
+    }
 
     #[test]
     fn the_switch_picks_the_vehicles_gun_at_the_wheel() {

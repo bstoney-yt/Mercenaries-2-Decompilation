@@ -39,6 +39,19 @@ pub struct Blip {
     pub icon: i64,
 }
 
+/// A disc on the ground round a target or a point (`Marker.AddDisc`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Disc {
+    pub target: Option<u32>,
+    /// Its point, when it was given one rather than an object.
+    pub at: Option<[f32; 3]>,
+    /// Metres.
+    pub radius: f32,
+    pub colour: [u8; 3],
+    /// Over the ground, metres.
+    pub lift: f32,
+}
+
 /// A marker over a target in the world.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Marker {
@@ -75,6 +88,8 @@ pub struct Hud {
     pub radar: BTreeMap<String, Blip>,
     /// World markers by handle.
     pub markers: BTreeMap<u32, Marker>,
+    /// Discs on the ground by handle (`Marker.AddDisc`).
+    pub discs: BTreeMap<u32, Disc>,
     /// Objective messages not yet shown.
     pub messages: Vec<ObjectiveMessage>,
     next_marker: u32,
@@ -347,9 +362,47 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         );
         Ok(MultiValue::from_vec(vec![guid_value(handle)]))
     })?;
+    // Marker.AddDisc(target, radius, r, g, b, lift): a disc on the ground
+    // round an object or a point, `radius` metres, in the colour, `lift`
+    // metres over the ground (inferred from the 3 call sites: 0.02 to 0.1,
+    // too small for anything else; the wardrobe's is 0.5 m across its
+    // 1 m reach, a delivery's its drop-off radius `fDist`). Returns its
+    // handle, which `Marker.Remove` takes as a blip's.
+    add(&marker, "AddDisc", |hud, _, a| {
+        let handle = FIRST_MARKER + hud.next_marker;
+        hud.next_marker += 1;
+        let f = |i: usize, d: f64| number(a.get(i)).unwrap_or(d) as f32;
+        let at = match a.first() {
+            Some(Value::Table(t)) => {
+                let c = |k: &str, i: i64| {
+                    t.get::<Option<f32>>(k)
+                        .ok()
+                        .flatten()
+                        .or_else(|| t.get::<Option<f32>>(i).ok().flatten())
+                };
+                c("x", 1)
+                    .zip(c("y", 2))
+                    .zip(c("z", 3))
+                    .map(|((x, y), z)| [x, y, z])
+            }
+            _ => None,
+        };
+        hud.discs.insert(
+            handle,
+            Disc {
+                target: guid(a.first()),
+                at,
+                radius: f(1, 1.0),
+                colour: [byte(a.get(2)), byte(a.get(3)), byte(a.get(4))],
+                lift: f(5, 0.0),
+            },
+        );
+        Ok(MultiValue::from_vec(vec![guid_value(handle)]))
+    })?;
     add(&marker, "Remove", |hud, _, a| {
         if let Some(h) = guid(a.first()) {
             hud.markers.remove(&h);
+            hud.discs.remove(&h);
         }
         Ok(MultiValue::new())
     })?;

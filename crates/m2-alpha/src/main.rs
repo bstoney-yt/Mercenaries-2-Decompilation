@@ -292,6 +292,23 @@ struct Options {
     /// With `--mission`: try every placed pickup, crate and emplaced gun
     /// as the layers put them out ([`placed::check`]), for testing.
     placed_check: bool,
+    /// With `--mission`: once the scripts offer a context action whose
+    /// prompt reads this (`exit`, `talk`), put her at its object and take
+    /// it with the use key, logging where she is after
+    /// ([`context_check`]), for testing.
+    context: Option<String>,
+    /// With `--mission`: the keys pressed in a dialog box the scripts put
+    /// up (`up`, `down`, `accept`, `back`, comma-separated), for testing.
+    dialog_keys: Option<String>,
+    /// With `--screenshot` on foot and `--gait`: she goes on this long
+    /// (seconds, default 3), logging where she is each second.
+    walk_seconds: Option<f32>,
+    /// With `--mission --after-contract`: this many seconds after the
+    /// contract, take the pause menu's Medevac (if the scripts allow it).
+    medevac: Option<f32>,
+    /// With `--mission --after-contract`: visit a faction's soldiers (`All`,
+    /// `Oil`...) and hurt one, logging their sides (faction-check lines).
+    visit_faction: Option<String>,
     /// With `--mission --autoplay --after-contract`: the Enter pressed
     /// every four seconds after the contract jumps too, as the pad's A
     /// does; where she is while the scripts hold her controls is logged
@@ -499,6 +516,10 @@ fn parse_args() -> anyhow::Result<Options> {
             "--hijack-crew" => o.hijack_crew = Some(value()?),
             "--hijack" => o.hijack = true,
             "--placed-check" => o.placed_check = true,
+            "--context" => o.context = Some(value()?),
+            "--dialog-keys" => o.dialog_keys = Some(value()?),
+            "--medevac" => o.medevac = Some(value()?.parse()?),
+            "--visit-faction" => o.visit_faction = Some(value()?),
             "--jump-with-enter" => o.jump_with_enter = true,
             "--props-check" => {
                 let v = value()?;
@@ -654,6 +675,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--smarter-ai" => o.smarter_ai = true,
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
             "--gates" => o.gates = true,
+            "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
             "--mission-seconds" => {
                 o.mission_seconds = value()?
                     .parse()
@@ -1205,7 +1227,12 @@ fn take_for_screenshot(
             render(backend, game, fov, aspect, None)?;
         }
     }
-    let seated = game.scene.riders.iter().filter(|r| r.vehicle == i).count();
+    let seated = game
+        .scene
+        .riders
+        .iter()
+        .filter(|r| r.prop.is_none() && r.vehicle == i)
+        .count();
     for n in &game.scene.people.npcs[before..] {
         let p = n.character.position;
         eprintln!(
@@ -1560,7 +1587,11 @@ fn screenshot(
             let r = &mut game.combat.rifle_rounds;
             r.clip = r.clip.saturating_sub(5);
         }
-        for i in 0..180 {
+        // `--walk-seconds`: she goes on this long (3 s by default).
+        let ticks = options
+            .walk_seconds
+            .map_or(180, |s| (s * 60.0).round() as usize);
+        for i in 0..ticks {
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
                 if i == 0 {
@@ -1592,13 +1623,13 @@ fn screenshot(
             // A jump takes the picture on the way up (by default), a
             // throw with the grenade still in her hand; aiming, the
             // weapon comes up for the last second.
-            let jump = (options.jump && i == 180 - lead) || (options.jump_spam && i % 6 == 0);
+            let jump = (options.jump && i == ticks - lead) || (options.jump_spam && i % 6 == 0);
             // With --jump-with-enter too, the scripts take her controls a
             // moment into the jump, as the contract's end does when its
             // fanfare is closed with the pad's A (playtest 8: she hung in
             // the air till the screen went black); where she is after.
-            if options.jump && options.jump_with_enter && i > 180 - lead {
-                if i == 180 - lead + 5 {
+            if options.jump && options.jump_with_enter && i > ticks - lead {
+                if i == ticks - lead + 5 {
                     game.input_locked = true;
                     eprintln!("held: her controls taken 5 ticks into the jump");
                 }
@@ -1615,14 +1646,14 @@ fn screenshot(
                 }
             }
             let trigger = combat::Trigger {
-                aim: options.aim && i >= 120,
+                aim: options.aim && i + 60 >= ticks,
                 // The last shot's flash is still up for the picture.
-                fire: options.fire && i == 177,
-                throw: options.throw && i == 180 - lead,
-                melee: options.bash && i == 180 - lead,
-                reload: options.reload && i == 180 - lead,
+                fire: options.fire && i + 3 == ticks,
+                throw: options.throw && i == ticks - lead,
+                melee: options.bash && i == ticks - lead,
+                reload: options.reload && i == ticks - lead,
                 select: options.weapon.filter(|_| i == 0).or_else(|| {
-                    (options.switch && i == 180 - lead).then_some(match game.combat.weapon {
+                    (options.switch && i == ticks - lead).then_some(match game.combat.weapon {
                         combat::Weapon::Rifle => combat::Weapon::Rpg,
                         _ => combat::Weapon::Rifle,
                     })
@@ -1630,7 +1661,7 @@ fn screenshot(
                 ..combat::Trigger::default()
             };
             if options.pickup
-                && i == 180 - lead
+                && i == ticks - lead
                 && let Some(p) = game.scene.player.as_mut()
                 && !p.start_pickup()
             {
@@ -1645,6 +1676,26 @@ fn screenshot(
                 },
                 tick,
             );
+            // With `--walk-seconds`, where she is each second: how deep the
+            // sea is over her feet, and whether she swims.
+            if options.walk_seconds.is_some()
+                && i % 60 == 59
+                && let (Some(p), Some(w)) = (&game.scene.player, &game.scene.world)
+            {
+                let at = p.character.position;
+                eprintln!(
+                    "walk: {:.0} s at {at:.1}, sea {} over her feet, {}",
+                    (i + 1) as f32 / 60.0,
+                    w.physics
+                        .water()
+                        .map_or("none".to_owned(), |s| format!("{:.2} m", s - at.y)),
+                    if p.swimming() {
+                        "swimming"
+                    } else {
+                        "on her feet"
+                    }
+                );
+            }
             if i % 30 == 0 {
                 // Keep streaming around her as she goes.
                 render(&mut backend, &mut game, fov, aspect, None)?;
@@ -3073,6 +3124,10 @@ fn mission_for_screenshot(
     let mut props_ready = 0.0;
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
     let mut cheat_check = options.cheat_check.then(cheats::Check::default);
+    let mut context = ContextCheck::default();
+    let (mut dialog_up, mut dialog_pressed) = (0.0f32, 0usize);
+    let (mut medevac_done, mut medevac_from) = (false, None::<(f32, m2_math::glam::Vec3)>);
+    let mut visit: Option<f32> = None;
     let (mut locked_was, mut locked_for) = (false, 0.0f32);
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
@@ -3156,9 +3211,25 @@ fn mission_for_screenshot(
         }
         game.step(intent, tick);
         link.tick(game, tick);
+        // `--context exit,enter,talk`: each in turn, once the last is done.
+        if let Some(want) = options
+            .context
+            .as_deref()
+            .and_then(|c| c.split(',').nth(context.step))
+        {
+            context_check(game, &link, want, &mut context, tick);
+            if context.logged.contains(&10.0) || context.logged.contains(&0.0) {
+                context = ContextCheck {
+                    step: context.step + 1,
+                    ..ContextCheck::default()
+                };
+            }
+        }
         // The saves the scripts ask for are written, as in play.
         for slot in link.take_saves() {
-            write_save(game, Some(&link), &save::SaveGame::slot_path(&slot));
+            if write_save(game, Some(&link), &save::SaveGame::slot_path(&slot)) {
+                game.save_icon = game::SAVE_ICON_SECONDS;
+            }
         }
         // With --placed-check, what the layers have put out is tried
         // every few seconds ([`placed::check`]).
@@ -3288,6 +3359,36 @@ fn mission_for_screenshot(
             if i % (4.0 / tick).round() as u32 == 0 {
                 state.buttons.push("selection".into());
             }
+            // `--dialog-keys`: with a dialog box of the scripts up, its keys
+            // in turn, the first 3 s after it opened and each 2 s on.
+            if link.dialog_open() {
+                dialog_up += tick;
+                let keys: Vec<&str> = options
+                    .dialog_keys
+                    .as_deref()
+                    .map(|k| k.split(',').collect())
+                    .unwrap_or_default();
+                let due = ((dialog_up - 3.0) / 2.0).floor();
+                if due >= 0.0 && (due as usize) == dialog_pressed && dialog_pressed < keys.len() {
+                    let name = keys[dialog_pressed];
+                    let b = match name {
+                        "up" => Some("BUTTON_PAD1_U"),
+                        "down" => Some("BUTTON_PAD1_D"),
+                        "accept" => Some("BUTTON_PAD2_D"),
+                        "back" => Some("BUTTON_PAD2_R"),
+                        _ => None,
+                    };
+                    eprintln!(
+                        "dialog-check: {:.0} s into the box, she presses {name}",
+                        dialog_up
+                    );
+                    state.dialog_keys.extend(b);
+                    dialog_pressed += 1;
+                }
+            } else if dialog_up > 0.0 {
+                eprintln!("dialog-check: the box closed after {dialog_up:.1} s");
+                dialog_up = 0.0;
+            }
             info.game = Some(state);
             let (w, h) = backend.size();
             let mut input = ui::headless_input(w, h, f64::from(i) * f64::from(tick));
@@ -3308,6 +3409,130 @@ fn mission_for_screenshot(
                 for seq in g.take_callbacks() {
                     eprintln!("after contract: the HUD called back call {seq}");
                     link.hud_callback(seq);
+                }
+                for (seq, picked) in g.take_choices() {
+                    eprintln!("dialog-check: box {seq} closed on option {picked}");
+                    link.hud_choice(seq, picked);
+                }
+            }
+        }
+        // `--visit-faction <abbrev>`: 30 s after the contract, she is put
+        // 25 m from the nearest soldier spawn of that faction whose layer
+        // is in; 15 s on, she hurts the nearest of them; who stands with
+        // which side is logged every 5 s from the visit.
+        if let (Some(f), Some(done)) = (options.visit_faction.as_deref(), contract_done) {
+            let t = i.saturating_sub(done) as f32 * tick;
+            if visit.is_none() && t >= 30.0 {
+                let her = game.focus();
+                let spot = game.scene.world.as_ref().and_then(|w| {
+                    w.index
+                        .spawns
+                        .iter()
+                        .filter(|s| game.scene.people.layer_in(s.layer) && s.ai.is_some())
+                        .filter(|s| {
+                            [s.template.as_deref(), Some(s.name.as_str())]
+                                .into_iter()
+                                .flatten()
+                                .find_map(npc::faction_of)
+                                == Some(f)
+                        })
+                        .min_by(|a, b| {
+                            a.position
+                                .distance(her)
+                                .total_cmp(&b.position.distance(her))
+                        })
+                        .map(|s| (s.position, s.name.clone()))
+                });
+                match (spot, game.scene.player.as_mut()) {
+                    (Some((at, name)), Some(p)) => {
+                        let away = (her - at).with_y(0.0).normalize_or(m2_math::glam::Vec3::X);
+                        p.drop_at(at + away * 25.0);
+                        eprintln!("faction-check: {f}: put 25 m from {name} at {at:.1}");
+                        visit = Some(0.0);
+                    }
+                    _ => {
+                        eprintln!(
+                            "faction-check: {f}: no soldier spawn of theirs in a layer that is in"
+                        );
+                        visit = Some(f32::INFINITY);
+                    }
+                }
+            }
+            if let Some(v) = visit.as_mut().filter(|v| v.is_finite()) {
+                *v += tick;
+                let her = game.focus();
+                if (*v - 15.0).abs() < tick / 2.0 {
+                    let near = game
+                        .scene
+                        .people
+                        .npcs
+                        .iter_mut()
+                        .filter(|n| n.alive && n.faction == Some(f))
+                        .min_by(|a, b| {
+                            a.character
+                                .position
+                                .distance(her)
+                                .total_cmp(&b.character.position.distance(her))
+                        });
+                    if let Some(n) = near {
+                        n.hurt(10.0, m2_math::glam::Vec3::ZERO);
+                        eprintln!(
+                            "faction-check: she hurts one of them at {:.1}",
+                            n.character.position
+                        );
+                    }
+                }
+                if ((*v / 5.0).fract() * 5.0) < tick && *v < 45.0 {
+                    let near: Vec<&npc::Npc> = game
+                        .scene
+                        .people
+                        .npcs
+                        .iter()
+                        .filter(|n| {
+                            n.alive
+                                && n.faction == Some(f)
+                                && n.character.position.distance(her) < 120.0
+                        })
+                        .collect();
+                    eprintln!(
+                        "faction-check: {:.0} s: {} of {f} within 120 m, {} fighting her, {} on alert; pursuit {:?}; hostile {:?}",
+                        *v,
+                        near.len(),
+                        near.iter().filter(|n| n.soldier).count(),
+                        near.iter().filter(|n| n.alert).count(),
+                        game.scene.people.pursuit,
+                        game.scene.people.hostile
+                    );
+                }
+            }
+        }
+        // `--medevac <s>`: that long after the contract, the pause menu's
+        // Medevac as confirmed, if the scripts let her have it then.
+        if let (Some(at), Some(done)) = (options.medevac, contract_done)
+            && !medevac_done
+            && i.saturating_sub(done) as f32 * tick >= at
+        {
+            medevac_done = true;
+            let state = link.medevac_state();
+            eprintln!(
+                "medevac-check: at {:.1} the scripts answer {state:?} (can, cost); cash {:.0}",
+                game.focus(),
+                link.view().cash.unwrap_or(0.0)
+            );
+            if state.is_some_and(|(can, _)| can) {
+                link.medevac();
+                medevac_from = Some((0.0, game.focus()));
+            }
+        }
+        if let Some((t, from)) = &mut medevac_from {
+            *t += tick;
+            for after in [1.0f32, 10.0, 30.0] {
+                if (*t - after).abs() < tick / 2.0 {
+                    eprintln!(
+                        "medevac-check: {after:.0} s after (from {from:.1}) she is at {:.1}, cash {:.0}",
+                        game.focus(),
+                        link.view().cash.unwrap_or(0.0)
+                    );
                 }
             }
         }
@@ -3837,6 +4062,106 @@ fn hijack_for_screenshot(
     eprintln!("hijack: over after {t:.1} s; driving it: {driving}");
     render(backend, game, fov, aspect, None)?;
     Ok(())
+}
+
+/// Where `--context` is: seconds since she was put at the action's object,
+/// and since she took it (each `None` until then).
+#[derive(Debug, Default)]
+struct ContextCheck {
+    put: Option<f32>,
+    taken: Option<(f32, m2_math::glam::Vec3)>,
+    /// Her place was logged this long after taking it (0: never offered).
+    logged: Vec<f32>,
+    /// Times she was put by it again, moved away from it.
+    moved: u32,
+    /// Which of the comma-separated actions asked for this is.
+    step: usize,
+}
+
+/// The pad button a key stands for in a dialog box the scripts put up
+/// (`MrxGuiDialogBox._HandleInputEvent` reads the pad's d-pad or left
+/// stick up and down, A to take the option, B to back out): the arrows or
+/// W and S step, Enter, Space or E take, Escape or Backspace back out.
+/// Which keys is invented (the PC's bindings for the box aren't read).
+fn dialog_button(code: KeyCode) -> Option<&'static str> {
+    Some(match code {
+        KeyCode::ArrowUp | KeyCode::KeyW => "BUTTON_PAD1_U",
+        KeyCode::ArrowDown | KeyCode::KeyS => "BUTTON_PAD1_D",
+        KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space | KeyCode::KeyE => "BUTTON_PAD2_D",
+        KeyCode::Escape | KeyCode::Backspace => "BUTTON_PAD2_R",
+        _ => return None,
+    })
+}
+
+/// With `--context`: once the scripts offer a context action whose prompt
+/// reads `want`, she is put 1.5 m from its object; once the game offers it
+/// her (a second on), she takes it as the use key does. Her place is
+/// logged 1, 4 and 10 s after (`context-check:` lines): an HQ exit takes
+/// her out of the interior, 450 m up, to the villa's grounds.
+fn context_check(
+    game: &mut Game,
+    link: &mission::MissionLink,
+    want: &str,
+    c: &mut ContextCheck,
+    tick: f32,
+) {
+    use m2_math::glam::Vec3;
+    let here = game.scene.player.as_ref().map(|p| p.character.position);
+    if let Some((since, from)) = &mut c.taken {
+        *since += tick;
+        for after in [1.0, 4.0, 10.0] {
+            if *since >= after && !c.logged.contains(&after) {
+                c.logged.push(after);
+                eprintln!(
+                    "context-check: {after:.0} s after taking {want:?} (at {from:.1}) she is at {:.1}",
+                    here.unwrap_or(Vec3::NAN)
+                );
+            }
+        }
+        return;
+    }
+    let Some((g, at)) = link.context_spot(want) else {
+        return;
+    };
+    match &mut c.put {
+        None => {
+            if let Some(p) = game.scene.player.as_mut() {
+                // 0.6 m short of it, from where she stands (the wardrobe's
+                // reaches 1 m): a starter sits at
+                // a desk she would be put into.
+                let from = (p.character.position - at)
+                    .with_y(0.0)
+                    .normalize_or(Vec3::X);
+                p.character.position = at + from * 0.6;
+                p.character.velocity = Vec3::ZERO;
+            }
+            eprintln!("context-check: {want:?} offered at {g:#x} ({at:.1}): she is put by it");
+            c.put = Some(0.0);
+        }
+        Some(t) => {
+            *t += tick;
+            let offered = game.context.as_ref().filter(|(o, _)| *o == g);
+            if *t >= 1.0
+                && let Some((_, text)) = offered
+            {
+                eprintln!("context-check: the prompt reads {text:?}; she takes it");
+                game.context_taken = Some(g);
+                c.taken = Some((0.0, here.unwrap_or(at)));
+            } else if *t >= 2.0 && here.is_some_and(|h| h.distance(at) > 5.0) && c.moved < 5 {
+                // Moved away by the scripts (the move into the HQ came
+                // after the action was offered): put by it again.
+                c.moved += 1;
+                c.put = None;
+            } else if *t >= 10.0 && c.logged.is_empty() {
+                c.logged.push(0.0);
+                eprintln!(
+                    "context-check: not offered her in 10 s (she is at {:.1}; offered {:?})",
+                    here.unwrap_or(Vec3::NAN),
+                    game.context
+                );
+            }
+        }
+    }
 }
 
 /// Parks the vehicle she drives 12 m short of the nearest placed object
@@ -5456,6 +5781,9 @@ struct Running {
     /// The GUI's named buttons pressed since the last frame (Enter is
     /// `"selection"`), for the game HUD's scripts.
     buttons: Vec<String>,
+    /// The pad buttons pressed for a dialog box the scripts have up
+    /// ([`dialog_button`]), for the game HUD's.
+    dialog_keys: Vec<&'static str>,
     /// The developer's keys work ([`App::dev`]).
     dev: bool,
     /// The cheat menu's god mode and infinite ammo ([`cheats::keep_up`]).
@@ -5609,6 +5937,7 @@ impl App {
                 _ => None,
             },
             buttons: Vec::new(),
+            dialog_keys: Vec::new(),
             dev: self.dev,
             cheats: cheats::Toggles::default(),
             cheat_code: cheats::CodeWatch::default(),
@@ -5742,6 +6071,11 @@ impl Running {
         if self.hud.game.is_some() {
             let mut state = gamehud::HudState::of(&mut self.game);
             state.buttons = buttons;
+            state.dialog_keys = std::mem::take(&mut self.dialog_keys);
+            state.medevac = self
+                .mission
+                .as_ref()
+                .and_then(mission::MissionLink::medevac_state);
             state.gui_calls = gui_calls;
             state.pad = self.input.pad();
             info.game = Some(state);
@@ -5761,6 +6095,10 @@ impl Running {
         if let (Some(g), Some(m)) = (&mut self.hud.game, &mut self.mission) {
             for seq in g.take_callbacks() {
                 m.hud_callback(seq);
+            }
+            // And the options picked in its dialog boxes.
+            for (seq, picked) in g.take_choices() {
+                m.hud_choice(seq, picked);
             }
         }
         // With no game HUD to show the contract's fanfare (`--old-hud`,
@@ -5867,6 +6205,24 @@ impl Running {
                     MenuKey::Left => KeyCode::ArrowLeft,
                     MenuKey::Right => KeyCode::ArrowRight,
                 });
+                continue;
+            }
+            // A dialog box the scripts put up takes the pad's d-pad, A
+            // and B ([`dialog_button`]).
+            if !self.hud.menu
+                && self
+                    .mission
+                    .as_ref()
+                    .is_some_and(mission::MissionLink::dialog_open)
+            {
+                let b = match key {
+                    MenuKey::Up => Some("BUTTON_PAD1_U"),
+                    MenuKey::Down => Some("BUTTON_PAD1_D"),
+                    MenuKey::Enter => Some("BUTTON_PAD2_D"),
+                    MenuKey::Escape => Some("BUTTON_PAD2_R"),
+                    MenuKey::Left | MenuKey::Right => None,
+                };
+                self.dialog_keys.extend(b);
                 continue;
             }
             // Our pause menu's buttons are egui's: up and down step its
@@ -6022,6 +6378,11 @@ impl Running {
         if let Some(v) = news.volumes {
             self.set_volumes(v);
         }
+        if news.medevac
+            && let Some(m) = &mut self.mission
+        {
+            m.medevac();
+        }
         for unused in &news.unused {
             eprintln!("pause: {unused} kept in the menu; the alpha has nothing for it");
         }
@@ -6107,7 +6468,9 @@ impl Running {
     /// Writes the game to `path`, with her cash, fuel and support stock as
     /// the scripts hold them.
     fn save_to(&mut self, path: &std::path::Path) {
-        write_save(&self.game, self.mission.as_ref(), path);
+        if write_save(&self.game, self.mission.as_ref(), path) {
+            self.game.save_icon = game::SAVE_ICON_SECONDS;
+        }
     }
 
     /// Loads the newest save: the player's own, or the scripts' autosave.
@@ -6531,6 +6894,24 @@ impl ApplicationHandler for App {
                     && let Some(flow) = &mut state.flow
                 {
                     flow.key(code);
+                }
+            }
+            // A dialog box the scripts put up (Fiona's briefing menu) takes
+            // the menu keys, as the pad's buttons it reads; she stays put.
+            WindowEvent::KeyboardInput { event, .. }
+                if state.focused
+                    && state
+                        .mission
+                        .as_ref()
+                        .is_some_and(mission::MissionLink::dialog_open)
+                    && matches!(event.physical_key, PhysicalKey::Code(c) if dialog_button(c).is_some()) =>
+            {
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                    && let Some(b) = dialog_button(code)
+                {
+                    state.dialog_keys.push(b);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if state.focused => {

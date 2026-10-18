@@ -344,6 +344,10 @@ pub struct News {
     /// The video screen's Resolution and Refresh Rate kept: put the
     /// window into them.
     pub video: Option<Video>,
+    /// The menu's Medevac was confirmed (`MrxGuiPauseScreen.
+    /// _HandleMedEvacEvent` calls `MrxPlayer.MedEvac`): the mission's own
+    /// scripts run it (to the sickbay, for its cost).
+    pub medevac: bool,
 }
 
 impl News {
@@ -361,6 +365,7 @@ impl News {
         self.capture = later.capture.or(self.capture);
         self.keys = later.keys.or(self.keys.take());
         self.video = later.video.or(self.video);
+        self.medevac |= later.medevac;
     }
 }
 
@@ -439,6 +444,12 @@ impl Native {
     pub fn library(&mut self, name: &str, arg: &str) -> bool {
         match name {
             "LTIPauseItemChanged" => self.item_changed(arg),
+            // The HUD's stand-in `MrxPlayer.MedEvac` ([`crate::gamehud`]'s
+            // `MEDEVAC`): the confirmed Medevac, for the mission to run.
+            "M2MedEvac" => {
+                self.news.medevac = true;
+                true
+            }
             "LTIVideoEnter" => {
                 self.pending.extend(self.video_calls());
                 true

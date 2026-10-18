@@ -182,6 +182,25 @@ pub enum Command {
     /// Open a gate or door (`Object.OpenGate`): PmcCon001's villa doors
     /// as the player comes near them.
     OpenGate(u32),
+    /// Shut a gate or door again (`Object.CloseGate`).
+    CloseGate(u32),
+    /// Whether `guid` may take up its weapons (`Human.DisableWeapons` and
+    /// `EnableWeapons`): the HQ's briefings put the starter's and the
+    /// player's away, a teleport the hero's while she moves.
+    Weapons {
+        guid: u32,
+        on: bool,
+    },
+    /// Whether vehicle `guid` may be got into (`Vehicle.Usable(vehicle,
+    /// usable)`): story vehicles the scripts keep for themselves (JetCon001's
+    /// scramble copter, ChiCon009's ZBD2000, a race's tank).
+    Usable {
+        guid: u32,
+        on: bool,
+    },
+    /// The player's fuel goes up by this (`Player.AddFuel`: a fuel
+    /// pickup's script), up to the tanks' capacity.
+    AddFuel(f32),
     /// Seat a character in a vehicle (seat as the scripts name it, `"d"`
     /// for the driver); `instant` skips the climb-in.
     EnterVehicle {
@@ -359,7 +378,38 @@ pub enum Command {
     RemoveDesignator {
         who: u32,
     },
+    /// The camera takes the engine's named shot `shot`
+    /// (`"OverTheShoulderLeft"`) from object `base` to `target`
+    /// (`Camera.SetShot`), until the scene ends ([`Command::Cinematic`]).
+    CameraShot {
+        shot: String,
+        base: u32,
+        target: u32,
+    },
+    /// A scene of the scripts' begins (true) or ends
+    /// (`Player.SetCinematicMode`): on its end the camera is hers again.
+    Cinematic(bool),
 }
+
+/// An action the player can take beside an object (`Pg.AddContextAction`):
+/// the HQ's exits and entrances, talking to a starter, the wardrobe.
+///
+/// From the scripts: `Pg.AddContextAction(guid, text, reach, 0, 0, 255,
+/// reach, false)`; the HQ's exits pass 2 (twice), a starter's talk 4, the
+/// wardrobe only its guid, text and 1. The third argument is taken as how
+/// near (metres) she must stand: inferred, as the only distance-like value
+/// every call gives, growing with the size of what is used; the rest are
+/// not read. `Event.ContextAction` `{ 0, guid }` waits for her to take it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextAction {
+    /// The prompt's text id (`[ContextAction.Exit]`).
+    pub text: String,
+    /// Metres from the object within which it is offered.
+    pub reach: f32,
+}
+
+/// Reach (metres) for a context action whose call gives none (invented).
+pub const CONTEXT_REACH: f32 = 2.0;
 
 /// The scripts' view of the game, and what they asked of it.
 #[derive(Debug, Default)]
@@ -451,6 +501,27 @@ pub struct ScriptWorld {
     /// The player's latest presses of the GUI's named buttons, with
     /// their game time ([`crate::events::World::button_presses`]).
     pub buttons: Vec<(f64, String)>,
+    /// The context actions on offer, by object ([`ContextAction`]).
+    pub context_actions: std::collections::BTreeMap<u32, ContextAction>,
+    /// The player's latest takings of a context action, by object, with
+    /// their game time ([`crate::events::World::context_presses`]).
+    pub context_presses: Vec<(f64, u32)>,
+    /// The crews the layers' vehicles came into play with, by vehicle:
+    /// (seat, rider template), as each entity's own `Rider` records say
+    /// (the HQ interior's `HqInterior` seats Fiona, its PMC boss), else
+    /// its template's.
+    pub crews: HashMap<u32, Vec<(String, String)>>,
+    /// The riders those crews came in as, each with what it came in on: a
+    /// rider out of its seat is still known by it (the HQ's starter, out
+    /// of her seat for her briefing).
+    pub crew_riders: HashMap<u32, u32>,
+    /// The player is in a scene of the scripts' (`Player.SetCinematicMode`).
+    pub cinematic: bool,
+    /// Characters swimming, as the game last said (`Human.IsSwimming`).
+    pub swimming: HashSet<u32>,
+    /// Witnesses reporting her, and what each faction has against her
+    /// (`Report`, [`crate::report`]).
+    pub reports: crate::report::Reports,
     /// Strikes and designators under way.
     pub strikes: crate::airstrike::Strikes,
     /// Whether vehicle disguises work (`Player.SetVehicleDisguise`): the
@@ -781,6 +852,10 @@ impl World for ScriptWorld {
         &self.buttons
     }
 
+    fn context_presses(&self) -> &[(f64, u32)] {
+        &self.context_presses
+    }
+
     fn hijack_held_since(&self, button: u32) -> Option<f64> {
         self.hijack.held_since(button)
     }
@@ -961,7 +1036,7 @@ pub const SUPPORT_EARS: &str = "__m2_support";
 /// missing (or stubs, with `ScriptHost::stub_missing_globals`).
 /// The engine's libraries (the rest of the globals scripts use are their
 /// own modules); see `ScriptHost::complete_libraries`.
-pub const LIBRARIES: [&str; 27] = [
+pub const LIBRARIES: [&str; 28] = [
     "Ai",
     "Airstrike",
     "Camera",
@@ -982,6 +1057,7 @@ pub const LIBRARIES: [&str; 27] = [
     "Pda",
     "Pg",
     "Player",
+    "Report",
     "Sound",
     "String",
     "Sys",
@@ -1200,6 +1276,39 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&object, "IsAttached", |_, _, _| {
         values([Value::Boolean(false)])
     })?;
+    // Object.SetTransformToObject(object, target[, hardpoint]): `object`
+    // goes where `target` (a guid, or an object's name: the sickbay's
+    // "Sickbay Hero Respawn 1") stands, turned as it is. From the scripts'
+    // 4 call sites: the HQ's briefings put the player and the starter at
+    // their `..._BriefingLoc` locators, the sickbay its hero at a respawn
+    // point, the teleport helper its hero at an object's hardpoint (where
+    // the game knows that hardpoint, else at the object itself).
+    add(&object, "SetTransformToObject", |w, _, a| {
+        let target = match a.get(1) {
+            Some(Value::String(s)) => w.by_name(&s.to_string_lossy()),
+            v => id(v),
+        };
+        let (Some(guid), Some(t)) = (id(a.first()), target) else {
+            return values([]);
+        };
+        let Some(to) = w.objects.get(&t).map(|o| (o.position, o.yaw)) else {
+            return values([]);
+        };
+        let hardpoint = match a.get(2) {
+            Some(Value::String(s)) => w
+                .hijack
+                .hardpoint(t, m2_assets::name_hash(&s.to_string_lossy())),
+            _ => None,
+        };
+        let (position, yaw) = (hardpoint.unwrap_or(to.0), to.1);
+        if let Some(o) = w.objects.get_mut(&guid) {
+            o.position = position;
+            o.yaw = yaw;
+        }
+        w.commands.push(Command::Move { guid, position });
+        w.commands.push(Command::Turn { guid, yaw });
+        values([])
+    })?;
     // How far off an object goes to sleep (metres). The deliveries place
     // a helicopter's cargo by it, with 155 as their own fallback: that,
     // until the templates' hibernation data is read.
@@ -1291,6 +1400,18 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // (gate): shuts it again (3 scripts: the mine's gate, `vz_mine_gate`,
+    // and two outposts' gate scripts once their convoy is through).
+    add(&object, "CloseGate", |w, _, a| {
+        let gate = id(a.first()).or_else(|| match a.first() {
+            Some(Value::String(s)) => w.by_name(&s.to_string_lossy()),
+            _ => None,
+        });
+        if let Some(guid) = gate {
+            w.commands.push(Command::CloseGate(guid));
+        }
+        values([])
+    })?;
     // What an object is a copy of: a weapon's template (saves keep it and
     // hand it back to `SetAllWeapons`), a spawned object's.
     add(&object, "GetParent", |w, _, a| {
@@ -1309,9 +1430,60 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([guid_value(Some(w.template(&name)))])
     })?;
 
+    // The witnesses' reports ([`crate::report`]).
+    let report = lib("Report")?;
+    add(&report, "Init", |w, _, a| {
+        if let Some(Value::Table(t)) = a.first() {
+            w.reports.callback = t.get::<Option<Function>>("Callback").ok().flatten();
+        }
+        values([])
+    })?;
+    add(&report, "Failed", |w, _, a| {
+        if let Some(g) = id(a.first())
+            && w.reports.reporting.remove(&g).is_some()
+        {
+            w.reports.ended.push((g, false));
+        }
+        values([])
+    })?;
+    add(&report, "Completed", |w, _, a| {
+        if let Some(g) = id(a.first())
+            && w.reports.reporting.remove(&g).is_some()
+        {
+            w.reports.ended.push((g, true));
+        }
+        values([])
+    })?;
+    add(&report, "GetInfractions", |w, lua, a| {
+        let g = id(a.first()).unwrap_or(0);
+        values([Value::Table(w.reports.infractions(lua, g)?)])
+    })?;
+    // (reporter, seconds): a reporter kept from reporting for a while (the
+    // faction manager delays a disabled one by 3 s); not used yet.
+    add(&report, "SetDelay", |_, _, _| values([]))?;
     // Weapons as objects: a loadout of templates, each weapon with its own
     // reserve of ammunition.
     let human = lib("Human")?;
+    // Human.DisableWeapons(character) / EnableWeapons(character).
+    add(&human, "DisableWeapons", |w, _, a| {
+        if let Some(guid) = id(a.first()) {
+            w.commands.push(Command::Weapons { guid, on: false });
+        }
+        values([])
+    })?;
+    add(&human, "EnableWeapons", |w, _, a| {
+        if let Some(guid) = id(a.first()) {
+            w.commands.push(Command::Weapons { guid, on: true });
+        }
+        values([])
+    })?;
+    // Human.IsSwimming(character): out of her depth in the water, as the
+    // game says ([`ScriptWorld::swimming`]); a vehicle's script asks it of
+    // a character before acting (7c99e43e).
+    add(&human, "IsSwimming", |w, _, a| {
+        let on = id(a.first()).is_some_and(|g| w.swimming.contains(&g));
+        values([Value::Boolean(on)])
+    })?;
     let inventory = match human.raw_get::<Value>("Inventory")? {
         Value::Table(t) => t,
         _ => {
@@ -1539,6 +1711,44 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .map_or(0.0, |o| o.yaw);
         values([Value::Number(f64::from(yaw))])
     })?;
+    // Camera.SetShot(camera, shot, base, target, ...): a named shot of the
+    // engine's (the HQ's briefings ask `OverTheShoulderLeft` and `Right`,
+    // from one speaker to the other, `MrxBriefing`'s cheap cinematic),
+    // held while the player is in cinematic mode.
+    add(&camera, "SetShot", |w, _, a| {
+        let name = match a.get(1) {
+            Some(Value::String(s)) => s.to_string_lossy(),
+            _ => return values([]),
+        };
+        if let (Some(base), Some(target)) = (id(a.get(2)), id(a.get(3))) {
+            w.commands.push(Command::CameraShot {
+                shot: name,
+                base,
+                target,
+            });
+        }
+        values([])
+    })?;
+    // Player.SetCinematicMode([player,] on, ...): the scripts take her
+    // controls and the camera for a scene (the HQ's briefings), and give
+    // them back with false; the first boolean is the switch (the scripts'
+    // 1-argument and 5-argument calls).
+    add(&player, "SetCinematicMode", |w, _, a| {
+        let Some(on) = a.iter().find_map(|v| match v {
+            Value::Boolean(b) => Some(*b),
+            _ => None,
+        }) else {
+            return values([]);
+        };
+        if on != w.cinematic {
+            w.cinematic = on;
+            w.commands.push(Command::Cinematic(on));
+        }
+        values([])
+    })?;
+    add(&player, "InCinematicMode", |w, _, _| {
+        values([Value::Boolean(w.cinematic)])
+    })?;
     // (player number, on): the hero's survival script turns the clamp on
     // at set-up and off once its one rescue has cooled down.
     add(&player, "SetHealthClamp", |w, _, a| {
@@ -1587,6 +1797,19 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&player, "SetFuelCapacity", |w, _, a| {
         if let Some(c) = num(a.first()) {
             w.fuel_capacity = Some(c);
+        }
+        values([])
+    })?;
+    // Player.AddFuel(amount): a fuel pickup's script (133dde94) adds its
+    // amount once it checked her tanks have room; clamped to the
+    // capacity here too.
+    add(&player, "AddFuel", |w, _, a| {
+        if let Some(n) = num(a.first()) {
+            let cap = w.fuel_capacity.unwrap_or(100.0);
+            if let Some(o) = w.player.and_then(|p| w.objects.get_mut(&p)) {
+                o.fuel = (o.fuel + n).clamp(0.0, cap);
+            }
+            w.commands.push(Command::AddFuel(n));
         }
         values([])
     })?;
@@ -1694,6 +1917,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&vehicle, "GetFromRider", |w, _, a| {
         values([guid_value(id(a.first()).and_then(|g| w.vehicle_of(g)))])
+    })?;
+    // Vehicle.Usable(vehicle, usable): all three calls in the scripts pass
+    // false, for vehicles the scripts keep for themselves.
+    add(&vehicle, "Usable", |w, _, a| {
+        if let Some(guid) = id(a.first()) {
+            let on = !matches!(a.get(1), Some(Value::Boolean(false)));
+            w.commands.push(Command::Usable { guid, on });
+        }
+        values([])
     })?;
     add(&vehicle, "GetRiders", |w, lua, a| {
         let v = id(a.first());
@@ -1865,6 +2097,28 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
     add(&pg, "UnloadAsset", |_, _, _| values([]))?;
+    // Pg.AddContextAction(guid, text[, reach, ...]) and
+    // Pg.RemoveContextAction(guid): see [`ContextAction`].
+    add(&pg, "AddContextAction", |w, _, a| {
+        let (Some(guid), Some(Value::String(text))) = (id(a.first()), a.get(1)) else {
+            return values([]);
+        };
+        let reach = num(a.get(2)).filter(|r| *r > 0.0).unwrap_or(CONTEXT_REACH);
+        w.context_actions.insert(
+            guid,
+            ContextAction {
+                text: text.to_string_lossy(),
+                reach,
+            },
+        );
+        values([])
+    })?;
+    add(&pg, "RemoveContextAction", |w, _, a| {
+        if let Some(guid) = id(a.first()) {
+            w.context_actions.remove(&guid);
+        }
+        values([])
+    })?;
     add(&ai, "Goal", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([]);
@@ -2662,6 +2916,86 @@ mod tests {
     }
 
     #[test]
+    fn gates_weapons_usable_vehicles_and_fuel_reach_the_game() {
+        let (host, world) = setup();
+        world.borrow_mut().fuel_capacity = Some(50.0);
+        host.lua()
+            .load(
+                "Object.CloseGate('_global_veh_jeep 0x0001')\n\
+                 Human.DisableWeapons(Player.GetAnyCharacter())\n\
+                 Human.EnableWeapons(Player.GetAnyCharacter())\n\
+                 Vehicle.Usable(Pg.GetGuidByName('_global_veh_jeep 0x0001'), false)\n\
+                 Player.AddFuel(80)",
+            )
+            .exec()
+            .unwrap();
+        let mut w = world.borrow_mut();
+        assert_eq!(
+            w.take_commands(),
+            [
+                Command::CloseGate(50),
+                Command::Weapons { guid: 1, on: false },
+                Command::Weapons { guid: 1, on: true },
+                Command::Usable {
+                    guid: 50,
+                    on: false
+                },
+                Command::AddFuel(80.0),
+            ]
+        );
+        // Up to the tanks' capacity.
+        assert_eq!(w.objects[&1].fuel, 50.0);
+    }
+
+    #[test]
+    fn set_transform_to_object_puts_one_where_another_stands() {
+        // The HQ's briefing: the hero to `..._BriefingLoc_Hero1`, by guid
+        // or by name; a hardpoint the game reported goes over the origin.
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            let mut spot = Object::new(
+                "PmcInterior_StarterFiona_BriefingLoc_Hero1",
+                [3.0, 4.0, 5.0],
+            );
+            spot.yaw = 1.5;
+            w.insert(60, spot);
+            w.hijack
+                .set_hardpoint(50, m2_assets::name_hash("hp_seat"), [7.0, 8.0, 9.0]);
+        }
+        host.lua()
+            .load(
+                "Object.SetTransformToObject(Player.GetAnyCharacter(), \
+                 'PmcInterior_StarterFiona_BriefingLoc_Hero1')",
+            )
+            .exec()
+            .unwrap();
+        {
+            let mut w = world.borrow_mut();
+            assert_eq!(w.objects[&1].position, [3.0, 4.0, 5.0]);
+            assert_eq!(w.objects[&1].yaw, 1.5);
+            assert_eq!(
+                w.take_commands(),
+                [
+                    Command::Move {
+                        guid: 1,
+                        position: [3.0, 4.0, 5.0]
+                    },
+                    Command::Turn { guid: 1, yaw: 1.5 }
+                ]
+            );
+        }
+        host.lua()
+            .load(
+                "Object.SetTransformToObject(Player.GetAnyCharacter(), \
+                 Pg.GetGuidByName('_global_veh_jeep 0x0001'), 'hp_seat')",
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(world.borrow().objects[&1].position, [7.0, 8.0, 9.0]);
+    }
+
+    #[test]
     fn scripts_read_and_change_the_world() {
         let (host, world) = setup();
         let (x, name, alive): (f64, String, bool) = host
@@ -2819,6 +3153,38 @@ mod tests {
                     region: 1,
                     setting: "night".into()
                 }
+            ]
+        );
+    }
+
+    #[test]
+    fn context_actions_are_offered_until_removed() {
+        let (host, world) = setup();
+        host.lua()
+            .load(
+                r#"
+                -- WifPmcInterior's exit, its starter's talk, the wardrobe.
+                Pg.AddContextAction(11, "[ContextAction.Exit]", 2, 0, 0, 255, 2, false)
+                Pg.AddContextAction(12, "[ContextAction.Talk]", 4, 0, 0, 255, 4, false)
+                Pg.AddContextAction(13, "[ContextAction.ChangeOutfit]", 1)
+                Pg.AddContextAction(14, "[ContextAction.Enter]")
+                Pg.RemoveContextAction(12)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        let offered: Vec<(u32, &str, f32)> = w
+            .context_actions
+            .iter()
+            .map(|(&g, a)| (g, a.text.as_str(), a.reach))
+            .collect();
+        assert_eq!(
+            offered,
+            [
+                (11, "[ContextAction.Exit]", 2.0),
+                (13, "[ContextAction.ChangeOutfit]", 1.0),
+                (14, "[ContextAction.Enter]", CONTEXT_REACH),
             ]
         );
     }

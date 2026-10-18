@@ -134,6 +134,8 @@ pub struct MissionView {
     pub key_names: Vec<(String, String)>,
     /// Markers over targets.
     pub markers: Vec<MarkerView>,
+    /// Discs on the ground (`Marker.AddDisc`): centre, radius, colour.
+    pub discs: Vec<(Vec3, f32, [u8; 3])>,
     /// The newest objective message: completed (or else added), and text.
     pub message: Option<(bool, String)>,
     /// The same message as the scripts sent it, for the game's own HUD to
@@ -331,9 +333,166 @@ for group, names in pairs(methods) do
 end
 "#;
 
+/// The scripts' dialog boxes (`MrxGuiDialogBox.DisplayDialogBox(owner,
+/// title, options, default, callback, callback args, ...)`, which
+/// `MrxGui.DisplayDialogBox` names too): a box the game's HUD builds from
+/// its widgets and works with the pad, so here each is a [`HUD_CALLS`]
+/// call of its own group, `DialogBox` `Display` (title, option texts,
+/// default and the plain arguments after), with a callback; the HUD's
+/// answer is the option picked, and the callback runs as the box's own
+/// `_CloseAndCallCallback` runs it, `callback(unpack(args), picked)`
+/// ([`MissionLink::hud_callback`]). What the scripts get back stands for
+/// the box: its `Close` (`MrxGuiDialogBox.Close`) is a `DialogBox`
+/// `Close` call naming it. Run every tick: the scripts import the module
+/// afresh as they go, over what was wrapped.
+///
+/// From the scripts (no executable read): the HQ's briefings put up their
+/// menus this way (`MrxBriefing`'s `[Briefing.Bribe]`, `[Generic.Exit]`
+/// list after `LTILibName.ChangeShellState(true)`), and the contract's
+/// description with its Accept and Decline
+/// (`MrxGuiDialogBox.DisplayScrollingDialogBox`, method `Scroll`).
+const DIALOG_BOXES: &str = r##"
+__m2_dialog_wrapped = __m2_dialog_wrapped or setmetatable({}, { __mode = "k" })
+local function plain(v)
+    local t = type(v)
+    if t == "string" or t == "number" or t == "boolean" then return v end
+    return nil
+end
+local function texts(options)
+    local out = {}
+    if type(options) == "table" then
+        for i, o in ipairs(options) do out[i] = plain(o) or "" end
+    end
+    return out
+end
+-- A box the HUD puts up for the call `seq`: what the scripts get back.
+local function open(method, data, callback, args)
+    __m2_hud_call_count = __m2_hud_call_count + 1
+    local seq = __m2_hud_call_count
+    __m2_hud_callbacks[seq] = { fCallback = callback, tCallbackData = args, dialog = true }
+    table.insert(__m2_hud_calls, { seq = seq, group = "DialogBox", method = method,
+        data = data, callback = type(callback) == "function" })
+    if #__m2_hud_calls > 64 then table.remove(__m2_hud_calls, 1) end
+    local box = { CustomData = {}, __m2_dialog = seq }
+    box.Close = function()
+        if __m2_hud_callbacks[seq] then __m2_hud_callbacks[seq] = nil end
+        __m2_hud_call_count = __m2_hud_call_count + 1
+        table.insert(__m2_hud_calls, { seq = __m2_hud_call_count, group = "DialogBox",
+            method = "Close", data = { nBox = seq }, callback = false })
+    end
+    -- Whatever else the scripts ask of a box does nothing here.
+    return setmetatable(box, { __index = function() return function() end end })
+end
+local function rest(...)
+    local out, n = {}, select("#", ...)
+    for i = 1, n do out[i] = plain((select(i, ...))) end
+    return out
+end
+-- DisplayDialogBox(owner, title, options, default, callback, args, ...).
+local function display(owner, title, options, default, callback, args, ...)
+    return open("Display", { sTitle = plain(title) or "", tOptions = texts(options),
+        nDefault = plain(default), tRest = rest(...) }, callback, args)
+end
+-- DisplayScrollingDialogBox(owner, text, callback, args, options, ...): the
+-- contract's description with its Accept and Decline (a cancel picks 2).
+local function scrolling(owner, text, callback, args, options, ...)
+    return open("Scroll", { sText = plain(text) or "", tOptions = texts(options),
+        tRest = rest(...) }, callback, args)
+end
+__m2_dialog_wrapped[display] = true
+__m2_dialog_wrapped[scrolling] = true
+local function close(box)
+    if type(box) == "table" and type(box.Close) == "function" and box.__m2_dialog then
+        box.Close(box)
+    end
+end
+__m2_dialog_wrapped[close] = true
+local function wrap(m, name, f)
+    local d = rawget(m, name)
+    if d ~= nil and not __m2_dialog_wrapped[d] then rawset(m, name, f) end
+end
+function __m2_wrap_dialogs()
+    local m = rawget(_G, "MrxGuiDialogBox")
+    if type(m) == "table" then
+        wrap(m, "DisplayDialogBox", display)
+        wrap(m, "DisplayScrollingDialogBox", scrolling)
+        wrap(m, "Close", close)
+    end
+    local g = rawget(_G, "MrxGui")
+    if type(g) == "table" then
+        wrap(g, "DisplayDialogBox", display)
+        wrap(g, "CloseDialogBox", close)
+    end
+end
+__m2_wrap_dialogs()
+"##;
+
+/// The factions whose attitude to the PMC the scripts have at
+/// `Hostile` (`MrxFactionManager.GetAttitudeLabel(faction, "Pmc")`:
+/// relations below -33 of -100..100, from the scripts' `_tAttitudes`),
+/// by the manager's abbreviations; `None` before the manager runs.
+fn hostile_factions(m: &Mission) -> Option<HashSet<&'static str>> {
+    let labels: Option<mlua::Table> = m
+        .lua()
+        .load(
+            "local m = rawget(_G, 'MrxFactionManager') \
+             if type(m) ~= 'table' or type(m.GetAttitudeLabel) ~= 'function' then return nil end \
+             local out = {} \
+             for _, f in ipairs({ 'All', 'Chi', 'Gur', 'Oil', 'Pir', 'Vza' }) do \
+                 local ok, a = pcall(m.GetAttitudeLabel, f, 'Pmc') \
+                 if ok then out[f] = type(a) == 'table' and a.sLabel or a end \
+             end \
+             return out",
+        )
+        .eval()
+        .ok()
+        .flatten();
+    let labels = labels?;
+    let hostile = ["All", "Chi", "Gur", "Oil", "Pir", "Vza"]
+        .into_iter()
+        .filter(|f| {
+            labels
+                .get::<Option<String>>(*f)
+                .ok()
+                .flatten()
+                .is_some_and(|l| l.eq_ignore_ascii_case("hostile"))
+        })
+        .chain(["Vza"])
+        .collect();
+    // The Venezuelans always fight her (the faction manager leaves them
+    // out of reporting: "VZ, civilian, or reporting is disabled").
+    Some(hostile)
+}
+
+/// Runs the callback of dialog box `seq` ([`DIALOG_BOXES`]) for option
+/// `picked`: `callback(unpack(args), picked)`, as the game's box's own
+/// `_CloseAndCallCallback` calls it.
+fn choice_code(seq: u64, picked: i64) -> String {
+    format!(
+        "local t = __m2_hud_callbacks[{seq}]\n\
+         __m2_hud_callbacks[{seq}] = nil\n\
+         if t and type(t.fCallback) == 'function' then\n\
+             local a = {{}}\n\
+             if type(t.tCallbackData) == 'table' then\n\
+                 for i = 1, table.getn(t.tCallbackData) do a[i] = t.tCallbackData[i] end\n\
+             end\n\
+             table.insert(a, {picked})\n\
+             t.fCallback(unpack(a))\n\
+         end"
+    )
+}
+
 /// People this near a marker's target are listed with it, metres; story
 /// characters' spawns this near the player.
 const MARK_NEAR: f32 = 6.0;
+/// A witness this near what she did reports it, metres; he gets through
+/// this many seconds after he is offered (his call-in line, measured at
+/// 3.7 s for `OCSoldier01.Reporting.CallIn03`), and is given up on after
+/// this many if the faction manager hasn't finished with him (invented:
+/// the game's own choice of reporter and his call aren't read).
+const REPORT_WITNESS: f32 = 80.0;
+const REPORT_CALL_IN: f32 = 4.0;
+const REPORT_GIVE_UP: f32 = 30.0;
 const STORY_REACH: f32 = 450.0;
 
 /// A marker the scripts put up, over one of their objects.
@@ -775,6 +934,73 @@ impl MissionLink {
         }
     }
 
+    /// The HUD's dialog box for the mission's call `seq` ([`DIALOG_BOXES`])
+    /// closed on option `picked`: its callback runs with its arguments and
+    /// then the option, as the game's box calls it.
+    pub fn hud_choice(&mut self, seq: u64, picked: i64) {
+        let State::Running(m) = &mut self.state else {
+            return;
+        };
+        let code = choice_code(seq, picked);
+        let line = match m.run(&code, "hud choice") {
+            Ok(_) => format!("hud choice {seq}: option {picked}"),
+            Err(e) => format!("hud choice {seq}: {e}"),
+        };
+        eprintln!("mission: dialog box {seq}: option {picked} picked");
+        self.write([line]);
+    }
+
+    /// What the pause menu's Medevac reads (`MrxPlayer.CanMedEvac` and
+    /// `GetMedEvacCost`), as the mission's scripts answer now: whether she
+    /// can be flown out (alive, not in transit, a hijack, the HQ or a
+    /// locked state) and its cost. `None` before they run.
+    pub fn medevac_state(&self) -> Option<(bool, f64)> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        m.lua()
+            .load(
+                "local p = rawget(_G, 'MrxPlayer') \
+                 if type(p) ~= 'table' then return nil end \
+                 local ok, can = pcall(p.CanMedEvac) \
+                 local okc, cost = pcall(p.GetMedEvacCost) \
+                 return ok and can == true, okc and tonumber(cost) or 0",
+            )
+            .eval::<(Option<bool>, Option<f64>)>()
+            .ok()
+            .and_then(|(can, cost)| Some((can?, cost.unwrap_or(0.0))))
+    }
+
+    /// The pause menu's Medevac was confirmed: the scripts' own
+    /// `MrxPlayer.MedEvac` runs (a contract under way is cancelled, else
+    /// she goes to the sickbay).
+    pub fn medevac(&mut self) {
+        let State::Running(m) = &mut self.state else {
+            return;
+        };
+        let line = match m.run("MrxPlayer.MedEvac()", "medevac") {
+            Ok(_) => "medevac: MrxPlayer.MedEvac() ran".to_owned(),
+            Err(e) => format!("medevac: {e}"),
+        };
+        eprintln!("mission: {line}");
+        self.write([line]);
+    }
+
+    /// Whether a dialog box the scripts put up ([`DIALOG_BOXES`]) is still
+    /// waiting for a pick: the menu keys go to it, not to her.
+    pub fn dialog_open(&self) -> bool {
+        let State::Running(m) = &self.state else {
+            return false;
+        };
+        m.lua()
+            .load(
+                "for _, t in pairs(__m2_hud_callbacks or {}) do \
+                 if type(t) == 'table' and t.dialog then return true end end return false",
+            )
+            .eval::<bool>()
+            .unwrap_or(false)
+    }
+
     /// Has the scripts' movies (`01_AOA_J`, `02_AOB_J`) wait for the game:
     /// [`take_movie`](Self::take_movie) hands them out.
     pub fn with_movies(self, movies: bool) -> Self {
@@ -974,6 +1200,163 @@ impl MissionLink {
         // beeps, its correct and failed presses).
         self.sounds
             .extend(game.support.cues.iter().map(|&c| (c.to_owned(), false)));
+        // The scripts' context actions (the HQ's exits, a starter's talk):
+        // the one she stands at is offered, and taken with the use key.
+        if let Some(g) = game.context_taken.take() {
+            mission.take_context_action(g);
+        }
+        // Her infractions against the factions, for their witnesses to
+        // report: the first one of a faction not already reporting, a
+        // witness of theirs near it (not the victim) is offered to the
+        // faction manager ([`m2_game::report`]).
+        for inf in game.scene.people.take_infractions() {
+            let label = crate::npc::faction_label(inf.faction);
+            mission.record_infraction(label, inf.kind);
+            if inf.faction == "Vza" || game.reporters.iter().any(|r| r.1 == inf.faction) {
+                continue;
+            }
+            let witness = game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .filter(|n| n.alive && n.faction == Some(inf.faction) && n.spawn != inf.victim)
+                .filter_map(|n| {
+                    let d = n.character.position.distance(inf.at);
+                    (d <= REPORT_WITNESS).then_some((d, n.spawn?))
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, g)| g);
+            if let Some(g) = witness {
+                if mission.begin_report(g, label) {
+                    eprintln!(
+                        "mission: {g:#x} of {label} goes to report her ({})",
+                        inf.kind
+                    );
+                    game.reporters.push((g, inf.faction, 0.0));
+                } else {
+                    eprintln!("mission: {g:#x} of {label} was turned down as a reporter");
+                }
+            }
+        }
+        // Reporters: each calls in, then gets through (state 1) and the
+        // faction manager's own timer finishes his report; one killed
+        // first, or that it never finishes with, is stopped (state 2).
+        let mut through = Vec::new();
+        let mut stopped = Vec::new();
+        for (g, _, t) in &mut game.reporters {
+            let before = *t;
+            *t += dt;
+            let alive = game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .any(|n| n.spawn == Some(*g) && n.alive);
+            if !alive || *t >= REPORT_GIVE_UP {
+                stopped.push(*g);
+            } else if before < REPORT_CALL_IN && *t >= REPORT_CALL_IN {
+                through.push(*g);
+            }
+        }
+        for g in through {
+            eprintln!("mission: reporter {g:#x} got through");
+            mission.report_through(g);
+        }
+        for g in stopped {
+            eprintln!("mission: reporter {g:#x} was stopped before he reported");
+            mission.stop_report(g);
+            game.reporters.retain(|r| r.0 != g);
+        }
+        for (g, done) in mission.take_report_ends() {
+            game.reporters.retain(|r| r.0 != g);
+            eprintln!(
+                "mission: the faction manager is done with reporter {g:#x} (reported: {done})"
+            );
+        }
+        // The factions' attitudes, once a second: whose soldiers fight her.
+        game.attitude_wait -= dt;
+        if game.attitude_wait <= 0.0 {
+            game.attitude_wait = 1.0;
+            if let Some(hostile) = hostile_factions(mission) {
+                game.scene.people.set_hostile(hostile);
+            }
+        }
+        // Whether she swims, for `Human.IsSwimming`.
+        let swimming = game
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.driving.is_none() && p.swimming());
+        mission.set_swimming(PLAYER, swimming);
+        // A scene's camera shot, from where its two stand now.
+        if let Some(shot) = game.shot.as_mut() {
+            let w = mission.world().borrow();
+            let at = |g: &u32| w.objects.get(g).map(|o| Vec3::from(o.position));
+            if let (Some(b), Some(t)) = (at(&shot.base), at(&shot.target)) {
+                shot.place(b, t);
+            }
+        }
+        // The dialog boxes, as the scripts may have imported their module
+        // afresh ([`DIALOG_BOXES`]).
+        if let Ok(Some(wrap)) = mission
+            .lua()
+            .globals()
+            .get::<Option<mlua::Function>>("__m2_wrap_dialogs")
+            && let Err(e) = wrap.call::<()>(())
+        {
+            eprintln!("mission: dialog boxes: {e}");
+        }
+        // Riders of the layers' props (the HQ interior's starter): drawn in
+        // their seats by `crate::hijack`, which says where those are; the
+        // scripts hear it, so what is offered by her (her `Talk`) is where
+        // she sits, not at the building's origin.
+        for (g, at, yaw) in std::mem::take(&mut game.scene.prop_rider_spots) {
+            mission.place(g, at.to_array(), yaw);
+        }
+        let props = &game.scene.props;
+        game.scene.prop_crews = mission
+            .crews_aboard()
+            .into_iter()
+            .filter(|(g, _)| props.get(*g).is_some())
+            .collect();
+        // Out of their seats (a starter at her briefing spot), they stand
+        // where the scripts have them; back in, they sit again.
+        let scene = &mut game.scene;
+        if let Some(world) = scene.world.as_mut() {
+            for (_, crew) in &scene.prop_crews {
+                for (_, rider, _) in crew {
+                    scene.people.unstand_scripted(&mut world.physics, *rider);
+                }
+            }
+            let here = scene.player.as_ref().map(|p| p.character.position);
+            for (rider, from, who, at, yaw) in mission.crews_on_foot() {
+                let at = Vec3::from(at);
+                let near = here.is_some_and(|h| h.distance(at) <= crate::npc::DRAW_DISTANCE);
+                if scene.props.get(from).is_none() || !near {
+                    continue;
+                }
+                let model = world.index.template_db.get(&who).and_then(|t| t.model);
+                scene
+                    .people
+                    .stand_scripted(rider, &who, model, None, at, yaw);
+            }
+        }
+        let on_foot = game
+            .scene
+            .player
+            .as_ref()
+            .filter(|p| p.driving.is_none())
+            .map(|p| p.character.position);
+        let offered = on_foot.and_then(|at| nearest_context(&mission.context_actions(), at));
+        let offered = offered.map(|(g, id)| (g, mission.text(&id)));
+        if offered != game.context {
+            match &offered {
+                Some((g, text)) => eprintln!("context: {text:?} offered at {g:#x}"),
+                None => eprintln!("context: none offered"),
+            }
+            game.context = offered;
+        }
         self.lag += dt;
         let mut lines = Vec::new();
         while self.lag >= STEP {
@@ -1273,6 +1656,9 @@ impl MissionLink {
                 if let Err(e) = mission.run(HUD_CALLS, "hud calls") {
                     self.write([format!("hud calls: {e}")]);
                 }
+                if let Err(e) = mission.run(DIALOG_BOXES, "dialog boxes") {
+                    self.write([format!("dialog boxes: {e}")]);
+                }
                 if let Err(e) = mission.run(TRESPASS, "trespass") {
                     self.write([format!("trespass: {e}")]);
                 }
@@ -1311,6 +1697,21 @@ impl MissionLink {
         eprintln!("mission: {why}");
         self.write([why.clone()]);
         self.state = State::Failed(why);
+    }
+
+    /// The first context action on offer whose prompt reads `text` (as
+    /// shown, any case): its object and where that stands. For
+    /// `--context`.
+    pub fn context_spot(&self, text: &str) -> Option<(u32, Vec3)> {
+        let State::Running(mission) = &self.state else {
+            return None;
+        };
+        let text = text.to_ascii_lowercase();
+        mission
+            .context_actions()
+            .into_iter()
+            .filter(|(_, _, id, _)| mission.text(id).to_ascii_lowercase().contains(&text))
+            .find_map(|(g, at, _, _)| Some((g, Vec3::from(at?))))
     }
 
     /// Scripted voice lines to play (id, cue, where said) and to stop,
@@ -1623,6 +2024,18 @@ impl MissionLink {
             objectives = hud.mission.iter().map(|(t, _)| mission.text(t)).collect();
         }
         objectives.dedup();
+        let discs = hud
+            .discs
+            .values()
+            .filter_map(|d| {
+                let at = match (d.at, d.target.and_then(|g| w.objects.get(&g))) {
+                    (Some(p), _) => Vec3::from(p),
+                    (None, Some(o)) => Vec3::from(o.position),
+                    (None, None) => return None,
+                };
+                Some((at + Vec3::Y * d.lift, d.radius, d.colour))
+            })
+            .collect();
         let markers = hud
             .markers
             .values()
@@ -1655,6 +2068,7 @@ impl MissionLink {
             key_names: crate::input::token_keys(&self.keys),
             objectives,
             markers,
+            discs,
             message,
             game_message,
             contract_complete: self.completed.is_some_and(|age| age < BANNER_TIME),
@@ -1674,6 +2088,30 @@ impl MissionLink {
 /// scripts' or the HUD's) `hero`, whole at `max` health: their name, the
 /// labels their template has in the data, and their health
 /// ([`Mission::set_hero`]). Says so on stderr after `who`.
+/// How far above or below a context action's object she may stand and
+/// still be offered it (metres; invented: a floor's height, so the HQ's
+/// upper landing doesn't offer what stands below it).
+const CONTEXT_RISE: f32 = 2.5;
+
+/// The context action (`(object, position, text id, reach)`, as
+/// [`m2_game::mission::Mission::context_actions`] lists them) nearest `at`
+/// within its reach, measured flat, and within [`CONTEXT_RISE`] of it up
+/// or down: its object and text id.
+fn nearest_context(
+    actions: &[(u32, Option<[f32; 3]>, String, f32)],
+    at: Vec3,
+) -> Option<(u32, String)> {
+    actions
+        .iter()
+        .filter_map(|(g, pos, text, reach)| {
+            let p = Vec3::from(pos.as_ref()?.to_owned());
+            let flat = p.with_y(0.0).distance(at.with_y(0.0));
+            (flat <= *reach && (p.y - at.y).abs() <= CONTEXT_RISE).then_some((flat, g, text))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, &g, text)| (g, text.clone()))
+}
+
 pub fn set_hero(mission: &mut Mission, hero: Hero, max: f32, who: &str) {
     let labels = mission.set_hero(hero.name(), hero.template(), max);
     eprintln!(
@@ -1860,6 +2298,10 @@ impl Fleet {
                 && is_ruin(&island.index.template_db, &o.name)
             {
                 game.scene.ruins.insert(g);
+            }
+            let crew = mission.crew_of(g);
+            if !crew.is_empty() {
+                game.scene.mission_crews.insert(g, crew);
             }
             game.scene.load_vehicle(g, models);
         }
@@ -2534,6 +2976,36 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 return false;
             }
         }
+        // Turned by the scripts (`Object.SetYaw`, or put at a locator with
+        // `Object.SetTransformToObject`: the HQ's briefing faces her to
+        // its starter). Their yaw is taken as her facing, both about
+        // +y from +z (inferred: the briefing's two spots face each other
+        // by it, 0.58 and -2.54).
+        Command::Turn { guid, yaw } if *guid == PLAYER => {
+            if let Some(p) = game.scene.player.as_mut()
+                && p.driving.is_none()
+            {
+                p.facing = *yaw;
+            }
+            return false;
+        }
+        // The briefings' camera shots: held until the scene ends.
+        Command::CameraShot { shot, base, target } => {
+            eprintln!("mission: camera shot {shot} from {base:#x} to {target:#x}");
+            game.shot = Some(crate::game::Shot {
+                name: shot.clone(),
+                base: *base,
+                target: *target,
+                view: None,
+            });
+            return false;
+        }
+        Command::Cinematic(on) => {
+            if !on && game.shot.take().is_some() {
+                eprintln!("mission: the scene ends; the camera is hers again");
+            }
+            return false;
+        }
         Command::ExitVehicle(guid) if *guid == PLAYER => {
             fleet.reenter = None;
             let (Some(world), Some(p)) = (&game.scene.world, game.scene.player.as_mut()) else {
@@ -2736,6 +3208,46 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 _ => eprintln!(
                     "mission: Object.OpenGate {name} ({guid:#x}): no model of it up to open"
                 ),
+            }
+            return false;
+        }
+        // Shut again: its model and collision go back up where its layer
+        // has it (as OpenGate took them down).
+        Command::CloseGate(guid) => {
+            let put = game.scene.show_props([*guid]);
+            eprintln!(
+                "mission: Object.CloseGate {guid:#x}: {}",
+                if put > 0 {
+                    "shut, its model and collision back up"
+                } else {
+                    "already shut, or not a layer's model here"
+                }
+            );
+            return false;
+        }
+        Command::Weapons { guid, on } if *guid == PLAYER => {
+            if let Some(p) = game.scene.player.as_mut()
+                && p.holstered == *on
+            {
+                p.holstered = !on;
+                eprintln!(
+                    "mission: her weapons {}",
+                    if *on { "back in her hands" } else { "put away" }
+                );
+            }
+            return false;
+        }
+        Command::Usable { guid, on } => {
+            let changed = if *on {
+                game.unusable.remove(guid)
+            } else {
+                game.unusable.insert(*guid)
+            };
+            if changed {
+                eprintln!(
+                    "mission: vehicle {guid:#x} {} to her",
+                    if *on { "usable again" } else { "kept from" }
+                );
             }
             return false;
         }
@@ -3248,6 +3760,46 @@ pub(crate) fn vehicle_models(name: &str, catalogue: &[CatalogueEntry]) -> Vec<Ca
 mod tests {
     use std::collections::HashMap;
 
+    #[test]
+    fn the_nearest_context_action_in_reach_is_offered() {
+        // The HQ's exits stand at its doors, a floor up in the sky
+        // (y 450); its starter's talk reaches 4 m.
+        let actions = vec![
+            (
+                1,
+                Some([0.0, 450.0, 0.0]),
+                "[ContextAction.Exit]".into(),
+                2.0,
+            ),
+            (
+                2,
+                Some([3.0, 450.0, 0.0]),
+                "[ContextAction.Talk]".into(),
+                4.0,
+            ),
+            (3, None, "[ContextAction.Exit]".into(), 2.0),
+            (
+                4,
+                Some([1.0, 446.0, 0.0]),
+                "[ContextAction.Exit]".into(),
+                2.0,
+            ),
+        ];
+        let at = |x: f32, y: f32| Vec3::new(x, y, 0.0);
+        let near = |p| nearest_context(&actions, p).map(|(g, _)| g);
+        // Beside the exit: it, though the talk reaches too.
+        assert_eq!(near(at(0.5, 450.0)), Some(1));
+        // Nearer the starter.
+        assert_eq!(near(at(2.5, 450.0)), Some(2));
+        // Out of reach of all; one a floor below never offered.
+        assert_eq!(near(at(10.0, 450.0)), None);
+        assert_eq!(near(at(1.0, 446.0 - CONTEXT_RISE - 0.5)), None);
+        assert_eq!(
+            nearest_context(&actions, at(0.0, 450.0)),
+            Some((1, "[ContextAction.Exit]".to_owned()))
+        );
+    }
+
     use super::*;
 
     fn entry(model: u32, kind: &str, label: &str) -> CatalogueEntry {
@@ -3313,6 +3865,67 @@ mod tests {
         };
         assert!(cash.contains(&(Plain::Text("vPlayer".into()), Plain::Guid(1))));
         assert_eq!(calls[1].method, "SetSlotToText");
+    }
+
+    #[test]
+    fn the_scripts_dialog_boxes_go_to_the_hud_and_the_pick_comes_back() {
+        // The HQ's briefing menu: `MrxGui.DisplayDialogBox(owner, title,
+        // options, default, callback, args, ...)`; the box's own module
+        // stands in the mission's state until it is wrapped.
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            Hud = {}
+            MrxGuiDialogBox = { DisplayDialogBox = function() error("drawn here") end,
+                DisplayScrollingDialogBox = function() error("drawn here") end,
+                Close = function() end }
+            MrxGui = { DisplayDialogBox = MrxGuiDialogBox.DisplayDialogBox }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(DIALOG_BOXES).exec().unwrap();
+        lua.load(
+            r#"
+            picked = nil
+            box = MrxGui.DisplayDialogBox(1, "[Briefing.RootMenuDialog]",
+                { "[OilCon020.Title]", "[Generic.Exit]" }, 1,
+                function(who, n) picked = { who, n } end, { "Fiona" }, 48, 36, "left")
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let calls = hud_calls(&lua);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            (calls[0].group.as_str(), calls[0].method.as_str()),
+            ("DialogBox", "Display")
+        );
+        assert!(calls[0].callback);
+        let Plain::Table(data) = &calls[0].data else {
+            panic!("{:?}", calls[0].data);
+        };
+        assert!(data.contains(&(
+            Plain::Text("sTitle".into()),
+            Plain::Text("[Briefing.RootMenuDialog]".into())
+        )));
+        // The HUD's pick: the callback, with its args and then the option.
+        lua.load(choice_code(calls[0].seq, 2)).exec().unwrap();
+        let (who, n): (String, i64) = lua.load("return picked[1], picked[2]").eval().unwrap();
+        assert_eq!((who.as_str(), n), ("Fiona", 2));
+        // The scrolling box (the contract's Accept) goes the same way, and
+        // closing a box tells the HUD.
+        lua.load(
+            r#"s = MrxGuiDialogBox.DisplayScrollingDialogBox(1, "[OilCon020.Terms.Summary]",
+                function(n) picked = n end, {}, { "[Generic.Accept]" })
+            s:Close()"#,
+        )
+        .exec()
+        .unwrap();
+        let calls = hud_calls(&lua);
+        let methods: Vec<&str> = calls.iter().map(|c| c.method.as_str()).collect();
+        assert_eq!(methods, ["Display", "Scroll", "Close"]);
     }
 
     #[test]
