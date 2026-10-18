@@ -3851,6 +3851,8 @@ struct ContextCheck {
     taken: Option<(f32, m2_math::glam::Vec3)>,
     /// Her place was logged this long after taking it (0: never offered).
     logged: Vec<f32>,
+    /// Times she was put by it again, moved away from it.
+    moved: u32,
     /// Which of the comma-separated actions asked for this is.
     step: usize,
 }
@@ -3903,12 +3905,13 @@ fn context_check(
     match &mut c.put {
         None => {
             if let Some(p) = game.scene.player.as_mut() {
-                // 1.5 m short of it, from where she stands: a starter sits at
+                // 0.6 m short of it, from where she stands (the wardrobe's
+                // reaches 1 m): a starter sits at
                 // a desk she would be put into.
                 let from = (p.character.position - at)
                     .with_y(0.0)
                     .normalize_or(Vec3::X);
-                p.character.position = at + from * 1.5;
+                p.character.position = at + from * 0.6;
                 p.character.velocity = Vec3::ZERO;
             }
             eprintln!("context-check: {want:?} offered at {g:#x} ({at:.1}): she is put by it");
@@ -3923,6 +3926,11 @@ fn context_check(
                 eprintln!("context-check: the prompt reads {text:?}; she takes it");
                 game.context_taken = Some(g);
                 c.taken = Some((0.0, here.unwrap_or(at)));
+            } else if *t >= 2.0 && here.is_some_and(|h| h.distance(at) > 5.0) && c.moved < 5 {
+                // Moved away by the scripts (the move into the HQ came
+                // after the action was offered): put by it again.
+                c.moved += 1;
+                c.put = None;
             } else if *t >= 10.0 && c.logged.is_empty() {
                 c.logged.push(0.0);
                 eprintln!(

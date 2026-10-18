@@ -359,6 +359,17 @@ pub enum Command {
     RemoveDesignator {
         who: u32,
     },
+    /// The camera takes the engine's named shot `shot`
+    /// (`"OverTheShoulderLeft"`) from object `base` to `target`
+    /// (`Camera.SetShot`), until the scene ends ([`Command::Cinematic`]).
+    CameraShot {
+        shot: String,
+        base: u32,
+        target: u32,
+    },
+    /// A scene of the scripts' begins (true) or ends
+    /// (`Player.SetCinematicMode`): on its end the camera is hers again.
+    Cinematic(bool),
 }
 
 /// An action the player can take beside an object (`Pg.AddContextAction`):
@@ -485,6 +496,8 @@ pub struct ScriptWorld {
     /// rider out of its seat is still known by it (the HQ's starter, out
     /// of her seat for her briefing).
     pub crew_riders: HashMap<u32, u32>,
+    /// The player is in a scene of the scripts' (`Player.SetCinematicMode`).
+    pub cinematic: bool,
     /// Strikes and designators under way.
     pub strikes: crate::airstrike::Strikes,
     /// Whether vehicle disguises work (`Player.SetVehicleDisguise`): the
@@ -1609,6 +1622,44 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .and_then(|g| w.objects.get(&g))
             .map_or(0.0, |o| o.yaw);
         values([Value::Number(f64::from(yaw))])
+    })?;
+    // Camera.SetShot(camera, shot, base, target, ...): a named shot of the
+    // engine's (the HQ's briefings ask `OverTheShoulderLeft` and `Right`,
+    // from one speaker to the other, `MrxBriefing`'s cheap cinematic),
+    // held while the player is in cinematic mode.
+    add(&camera, "SetShot", |w, _, a| {
+        let name = match a.get(1) {
+            Some(Value::String(s)) => s.to_string_lossy(),
+            _ => return values([]),
+        };
+        if let (Some(base), Some(target)) = (id(a.get(2)), id(a.get(3))) {
+            w.commands.push(Command::CameraShot {
+                shot: name,
+                base,
+                target,
+            });
+        }
+        values([])
+    })?;
+    // Player.SetCinematicMode([player,] on, ...): the scripts take her
+    // controls and the camera for a scene (the HQ's briefings), and give
+    // them back with false; the first boolean is the switch (the scripts'
+    // 1-argument and 5-argument calls).
+    add(&player, "SetCinematicMode", |w, _, a| {
+        let Some(on) = a.iter().find_map(|v| match v {
+            Value::Boolean(b) => Some(*b),
+            _ => None,
+        }) else {
+            return values([]);
+        };
+        if on != w.cinematic {
+            w.cinematic = on;
+            w.commands.push(Command::Cinematic(on));
+        }
+        values([])
+    })?;
+    add(&player, "InCinematicMode", |w, _, _| {
+        values([Value::Boolean(w.cinematic)])
     })?;
     // (player number, on): the hero's survival script turns the clamp on
     // at set-up and off once its one rescue has cooled down.

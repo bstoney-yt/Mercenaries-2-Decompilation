@@ -184,6 +184,49 @@ pub struct Game {
     /// The context action she took with the use key, for the mission to
     /// tell the scripts.
     pub context_taken: Option<u32>,
+    /// The scripts' camera shot for a scene (the HQ's briefings), while
+    /// it lasts: the frame is seen from it ([`Shot::view`]).
+    pub shot: Option<Shot>,
+}
+
+/// A camera shot the scripts asked for (`Camera.SetShot`): the engine's
+/// named shot from one object to another.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shot {
+    /// `OverTheShoulderLeft`, `OverTheShoulderRight` (the HQ's briefings).
+    pub name: String,
+    pub base: u32,
+    pub target: u32,
+    /// Where it sees from and looks at, as last placed
+    /// ([`Shot::place`]); `None` until both objects are known.
+    pub view: Option<(Vec3, Vec3)>,
+}
+
+/// An over-the-shoulder shot's eye from its base's feet: this far up, back
+/// from the target and aside (metres), and where on the target it looks.
+/// Invented (the engine's shot table is not read, and these are not yet
+/// checked against the footage of the HQ's briefings).
+const SHOULDER_UP: f32 = 1.65;
+const SHOULDER_BACK: f32 = 1.1;
+const SHOULDER_ASIDE: f32 = 0.45;
+const SHOULDER_LOOK_UP: f32 = 1.5;
+
+impl Shot {
+    /// Places the shot from where its base and target stand (feet): over
+    /// the base's left or right shoulder at the target's head; any other
+    /// shot is taken as the left one.
+    pub fn place(&mut self, base: Vec3, target: Vec3) {
+        let ahead = (target - base).with_y(0.0).normalize_or(Vec3::Z);
+        let right = ahead.cross(Vec3::Y).normalize_or(Vec3::X);
+        let side = if self.name.ends_with("Right") {
+            1.0
+        } else {
+            -1.0
+        };
+        let eye =
+            base + Vec3::Y * SHOULDER_UP - ahead * SHOULDER_BACK + right * side * SHOULDER_ASIDE;
+        self.view = Some((eye, target + Vec3::Y * SHOULDER_LOOK_UP));
+    }
 }
 
 /// A soldier's pickup is told from the others by its "crate": this, plus
@@ -282,6 +325,7 @@ impl Game {
             lens: (60.0, 16.0 / 9.0),
             context: None,
             context_taken: None,
+            shot: None,
         }
     }
 
@@ -2021,12 +2065,17 @@ impl Game {
     /// Where the frame is seen from: her camera (shaken by a bomb close
     /// by), the satellite's while she looks through it, or the free one.
     pub fn view(&self, fov: f32, aspect: f32) -> View {
-        let mut view = match self.walking() {
-            Some(p) => match self.support.looking() {
-                Some(at) => support::satellite_view(at, p.character.position.y, aspect),
-                None => p.view(fov, aspect),
+        let shot = self.shot.as_ref().and_then(|s| s.view);
+        let mut view = match (self.walking(), shot) {
+            // A scene's shot of the scripts' (the HQ's briefings).
+            (Some(_), Some((eye, at))) => FlyCamera::looking_at(eye, at).view(fov, aspect),
+            (p, _) => match p {
+                Some(p) => match self.support.looking() {
+                    Some(at) => support::satellite_view(at, p.character.position.y, aspect),
+                    None => p.view(fov, aspect),
+                },
+                None => self.camera.view(fov, aspect),
             },
-            None => self.camera.view(fov, aspect),
         };
         if let Some((a, b)) = self.support.shake_turn()
             && self.support.looking().is_none()
@@ -3171,6 +3220,27 @@ fn would_leave(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    #[test]
+    fn a_shoulder_shot_sees_the_target_from_behind_the_base() {
+        // Jennifer at the origin facing Fiona 2 m up +z.
+        let mut shot = super::Shot {
+            name: "OverTheShoulderLeft".into(),
+            base: 1,
+            target: 2,
+            view: None,
+        };
+        let (base, target) = (super::Vec3::ZERO, super::Vec3::new(0.0, 0.0, 2.0));
+        shot.place(base, target);
+        let (eye, at) = shot.view.unwrap();
+        assert!(eye.z < 0.0 && eye.y > 1.0, "{eye}");
+        assert!((at - super::Vec3::new(0.0, 1.5, 2.0)).length() < 1e-5);
+        let left = eye.x;
+        shot.name = "OverTheShoulderRight".into();
+        shot.place(base, target);
+        let right = shot.view.unwrap().0.x;
+        assert!((left + right).abs() < 1e-5 && left != right);
+    }
 
     #[test]
     fn a_crew_has_a_driver_by_its_seat() {

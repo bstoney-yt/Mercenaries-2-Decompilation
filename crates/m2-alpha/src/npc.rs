@@ -1737,6 +1737,10 @@ impl People {
         );
         n.outfit = outfit.unwrap_or_else(|| self.dress_as(kind, template));
         n.held = true;
+        // Unarmed and not fighting (inferred: the scripts give the HQ's
+        // starters no weapon; a soldier is drawn with the stand-in AK47).
+        n.soldier = false;
+        n.gun = None;
         eprintln!("people: {template} ({guid:#x}) stands at {at:.1}, as the scripts have them");
         self.npcs.push(n);
         true

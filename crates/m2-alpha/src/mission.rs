@@ -1158,6 +1158,14 @@ impl MissionLink {
         if let Some(g) = game.context_taken.take() {
             mission.take_context_action(g);
         }
+        // A scene's camera shot, from where its two stand now.
+        if let Some(shot) = game.shot.as_mut() {
+            let w = mission.world().borrow();
+            let at = |g: &u32| w.objects.get(g).map(|o| Vec3::from(o.position));
+            if let (Some(b), Some(t)) = (at(&shot.base), at(&shot.target)) {
+                shot.place(b, t);
+            }
+        }
         // The dialog boxes, as the scripts may have imported their module
         // afresh ([`DIALOG_BOXES`]).
         if let Ok(Some(wrap)) = mission
@@ -2817,6 +2825,36 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 eprintln!("mission: she waits at {at:.1} for {vehicle:#x} to load, to be seated");
                 return false;
             }
+        }
+        // Turned by the scripts (`Object.SetYaw`, or put at a locator with
+        // `Object.SetTransformToObject`: the HQ's briefing faces her to
+        // its starter). Their yaw is taken as her facing, both about
+        // +y from +z (inferred: the briefing's two spots face each other
+        // by it, 0.58 and -2.54).
+        Command::Turn { guid, yaw } if *guid == PLAYER => {
+            if let Some(p) = game.scene.player.as_mut()
+                && p.driving.is_none()
+            {
+                p.facing = *yaw;
+            }
+            return false;
+        }
+        // The briefings' camera shots: held until the scene ends.
+        Command::CameraShot { shot, base, target } => {
+            eprintln!("mission: camera shot {shot} from {base:#x} to {target:#x}");
+            game.shot = Some(crate::game::Shot {
+                name: shot.clone(),
+                base: *base,
+                target: *target,
+                view: None,
+            });
+            return false;
+        }
+        Command::Cinematic(on) => {
+            if !on && game.shot.take().is_some() {
+                eprintln!("mission: the scene ends; the camera is hers again");
+            }
+            return false;
         }
         Command::ExitVehicle(guid) if *guid == PLAYER => {
             fleet.reenter = None;

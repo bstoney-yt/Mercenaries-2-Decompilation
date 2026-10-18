@@ -1096,14 +1096,20 @@ fn check(
         // event was made (persistent: after it last fired).
         // { 0, object }: as the player takes the context action offered
         // beside the object (`Pg.AddContextAction`: the HQ's exits, a
-        // starter's talk). Passes nothing of its own.
+        // starter's talk). Passes who took it: the wardrobe's callback
+        // (`WifPmcInterior._SelectOutfit(who)`, made with no data) opens only
+        // for the primary character.
         "ContextAction" => match guid(&p.params, 2) {
             Some(g) => {
                 let taken = world
                     .context_presses()
                     .iter()
                     .any(|(t, o)| *o == g && *t >= p.last && (*t > p.last || !p.persistent));
-                if taken { Check::Fire(Vec::new()) } else { no }
+                if taken {
+                    Check::Fire(world.player().map(id).into_iter().collect())
+                } else {
+                    no
+                }
             }
             None => no,
         },
@@ -1336,6 +1342,19 @@ mod tests {
         events.update(0.5, &world);
         assert_eq!(log(&host), ["exit A", "exit A"]);
         assert!(events.take_unhandled().is_empty());
+        // Made with no data (the wardrobe's `_SelectOutfit(who)`): its
+        // callback gets who took it.
+        host.lua()
+            .load(
+                "Event.CreatePersistent(Event.ContextAction, { 0, 9 }, \
+                 function(who) table.insert(log, 'outfit ' .. tostring(who ~= nil)) end)",
+            )
+            .exec()
+            .unwrap();
+        world.context.push((2.25, 9));
+        events.update(0.5, &world);
+        events.update(0.5, &world);
+        assert_eq!(log(&host), ["exit A", "exit A", "outfit true"]);
     }
 
     #[test]
