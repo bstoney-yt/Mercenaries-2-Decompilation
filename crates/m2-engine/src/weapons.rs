@@ -366,7 +366,26 @@ pub struct WeaponSpec {
     pub feel: Feel,
     /// How soldiers fire it (`WeaponHint`), if its template says.
     pub hint: Option<FireHint>,
+    /// What the HUD shows of it in her hands (`WeaponUI`), if its
+    /// template says.
+    pub ui: Option<GunUi>,
 }
+
+/// A gun's `WeaponUI`: the gun box's picture of it and its reticle, as
+/// name hashes of their textures (the pistol's `weapons_pistol_1` and
+/// `reticle_bullets`, the shotgun's `weapons_shotgun_1` and
+/// `reticle_shotgun`), and whether the reticle has its crosshair (the
+/// shotgun's and the launchers' have none). From samples (PC data,
+/// playtest 4); the reticle's field name is unknown, only its hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GunUi {
+    pub icon: u32,
+    pub reticle: u32,
+    pub crosshair: bool,
+}
+
+/// `WeaponUI`'s reticle texture field (its name not found).
+const UI_RETICLE: u32 = 0x0e36_56d4;
 
 /// How a soldier fires a gun, from its template's `WeaponHint` (names
 /// found by hashing guesses, gap round 13; the carbine's values in
@@ -871,6 +890,7 @@ pub fn read(db: &Layer<'_>) -> Arms {
     let hint = Table::new(db, "WeaponHint");
     let effects = Table::new(db, "WeaponEffects");
     let sound = Table::new(db, "SoundEffect");
+    let ui = Table::new(db, "WeaponUI");
     let name_of = |id: u32| names.get(&id).map_or(String::new(), |n| (*n).to_owned());
     let model_of = |id: u32| parts.models.get(&id).copied().filter(|&m| m != 0);
     let class_of = |id: u32| Parts::first(&equipment, id, CLASS).filter(|&c| c != 0);
@@ -928,6 +948,15 @@ pub fn read(db: &Layer<'_>) -> Arms {
                             .map(|f| Parts::float(&scatter, id, f).unwrap_or(0.0)),
                     },
                     hint: FireHint::read(&hint, id),
+                    ui: (|| {
+                        Some(GunUi {
+                            icon: Parts::first(&ui, id, name_hash("texture"))
+                                .filter(|&t| t != 0)?,
+                            reticle: Parts::first(&ui, id, UI_RETICLE).filter(|&t| t != 0)?,
+                            crosshair: Parts::first(&ui, id, name_hash("bReticleCrosshair"))
+                                .is_some_and(|c| c & 0xff != 0),
+                        })
+                    })(),
                 },
             ))
         })
@@ -1172,6 +1201,7 @@ mod tests {
                 pickup: None,
                 feel: Default::default(),
                 hint: None,
+                ui: None,
             },
             nodes: vec![Some(0)],
         }
@@ -1330,6 +1360,7 @@ mod tests {
             pickup: None,
             feel: Default::default(),
             hint: None,
+            ui: None,
         };
         let arms = Arms {
             weapons: HashMap::from([(7, spec)]),

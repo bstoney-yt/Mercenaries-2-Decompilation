@@ -440,6 +440,10 @@ pub struct HudState {
     /// them be (the HUD starts as [`GameHud::start`]'s hero).
     pub hero: Option<(Hero, f32)>,
     pub weapon: Weapon,
+    /// The gun in her rifle's place, as its template names and shows it
+    /// (`WeaponUI`): the pistol, the shotgun. `None`: the carbine she
+    /// starts with, as the constants have it.
+    pub gun: Option<(u32, String, m2_engine::weapons::GunUi)>,
     pub fired: Fired,
     /// The rifle's rounds: in the clip, stored.
     pub rifle: Rounds,
@@ -702,6 +706,10 @@ impl HudState {
             hp: vehicle.map_or(game.combat.hp_percent(), |v| v.health()),
             in_vehicle: vehicle.is_some(),
             weapon: game.combat.weapon,
+            gun: {
+                let r = &game.combat.rifle;
+                r.template.zip(r.ui).map(|(t, ui)| (t, r.name.clone(), ui))
+            },
             fired: game.combat.fired,
             picked: game.combat.picked,
             launcher: game.combat.launcher_rounds,
@@ -846,6 +854,26 @@ fn fanfare_failed(line: &str) -> bool {
 /// leaves the state as it was.
 fn broken_lua(line: &str) -> bool {
     line.contains("out of Lua stack")
+}
+
+/// A widget texture's name hash: `#` and eight hex digits name a texture
+/// by its hash itself, as the gun box's and the reticle's are (the guns'
+/// `WeaponUI` records name them by hash only); any other, its name's.
+fn texture_hash(name: &str) -> u32 {
+    name.strip_prefix('#')
+        .filter(|h| h.len() == 8)
+        .and_then(|h| u32::from_str_radix(h, 16).ok())
+        .unwrap_or_else(|| name_hash(name))
+}
+
+/// A texture named by its hash, for [`texture_hash`].
+fn by_hash(hash: u32) -> String {
+    format!("#{hash:08x}")
+}
+
+/// Whether a movie's `fscommand` plays or stops an interface sound.
+fn is_sound_command(command: &str) -> bool {
+    matches!(command, "Sound.Play" | "Sound.Loop" | "Sound.Stop")
 }
 
 /// What the thread sends back.
@@ -1234,7 +1262,7 @@ impl GameHud {
         rect: egui::Rect,
         colour: Color32,
     ) -> bool {
-        let Some(Some(texture)) = self.textures.get(&name_hash(name)) else {
+        let Some(Some(texture)) = self.textures.get(&texture_hash(name)) else {
             return false;
         };
         let uv = egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
@@ -1610,6 +1638,8 @@ struct Told {
     /// The gun in her hands, whether she holds the designator, and whether
     /// she drives a vehicle with a cannon.
     weapon: Option<(Weapon, bool, bool)>,
+    /// The template of the gun in her rifle's place ([`HudState::gun`]).
+    gun: Option<u32>,
     ammo: Option<[i64; 5]>,
     /// She was in a vehicle ([`HudState::in_vehicle`]).
     in_vehicle: Option<bool>,
@@ -2104,12 +2134,23 @@ impl Thread {
         }
         log.extend(screen.borrow_mut().take_log());
         log.extend(self.mission.take_log());
-        // The scripts' own commands (sounds, camera) are not the HUD's,
-        // but the game states the pause menu's ask for (leaving it).
+        // Of the HUD scripts' own commands, the game states the pause
+        // menu's ask for (leaving it), and their interface sounds (the
+        // cash counter's `UI_hud_cashUp_*` as it counts up: playtest 4).
         for c in self.mission.take_commands() {
-            if let m2_game::api::Command::GameState(s) = c {
-                log.push(format!("pause: the scripts ask for game state {s}"));
-                self.pause_native.game_state(&s);
+            use m2_game::api::Command;
+            match c {
+                Command::GameState(s) => {
+                    log.push(format!("pause: the scripts ask for game state {s}"));
+                    self.pause_native.game_state(&s);
+                }
+                Command::CueSound { at: None, cue } => {
+                    self.pause_native.command("Sound.Play", &cue);
+                }
+                Command::StopSound { at: None, cue } => {
+                    self.pause_native.command("Sound.Stop", &cue);
+                }
+                _ => {}
             }
         }
         let names = gui_runtime::script_names(self.mission.lua());
@@ -2638,7 +2679,11 @@ impl Thread {
         }
         let pause = self.pause_movie.map(|(id, _)| id);
         for (id, command, arg) in std::mem::take(&mut self.unheard_by) {
-            if Some(id) == pause && self.pause_native.command(&command, &arg) {
+            // Any movie's sounds are the engine's (the PDA map's pan and
+            // zoom loops: playtest 4); the rest only the pause movie's.
+            let heard = (Some(id) == pause || is_sound_command(&command))
+                && self.pause_native.command(&command, &arg);
+            if heard {
                 log.push(format!("pause: the engine hears {command}({arg})"));
             }
         }
@@ -3095,21 +3140,72 @@ impl Thread {
         // once, on the boat at the start, and never again on foot, as no
         // gun was changed after (PC playtest, 2026-10-08).
         self.told.seat(s.in_vehicle);
-        if self.told.weapon != Some((s.weapon, holding, cannon)) {
+        let gun = s.gun.as_ref().map(|g| g.0);
+        if self.told.weapon != Some((s.weapon, holding, cannon)) || self.told.gun != gun {
             self.told.weapon = Some((s.weapon, holding, cannon));
-            let (icon, guid, reticle) = match s.weapon {
-                Weapon::Rifle => (RIFLE_ICON, RIFLE_GUID, RIFLE_RETICLE),
-                Weapon::Rpg => (RPG_ICON, RPG_GUID, RPG_RETICLE),
-                Weapon::GrenadeLauncher => (LAUNCHER_ICON, LAUNCHER_GUID, LAUNCHER_RETICLE),
+            self.told.gun = gun;
+            // The gun in her rifle's place shows as its `WeaponUI` says,
+            // and the gun box names it (playtest 4: her pistol showed the
+            // carbine's picture and name, her shotgun the bullets'
+            // reticle).
+            let (rifle_icon, rifle_reticle, rifle_cross) = match &s.gun {
+                Some((_, name, ui)) => {
+                    if let Some(o) = self
+                        .mission
+                        .world()
+                        .borrow_mut()
+                        .objects
+                        .get_mut(&RIFLE_GUID)
+                    {
+                        o.name.clone_from(name);
+                    }
+                    eprintln!(
+                        "hud: the gun box shows {name} (icon {:08x}, reticle {:08x}, crosshair {})",
+                        ui.icon, ui.reticle, ui.crosshair
+                    );
+                    (by_hash(ui.icon), by_hash(ui.reticle), ui.crosshair)
+                }
+                None => {
+                    if let Some(o) = self
+                        .mission
+                        .world()
+                        .borrow_mut()
+                        .objects
+                        .get_mut(&RIFLE_GUID)
+                    {
+                        RIFLE_NAME.clone_into(&mut o.name);
+                    }
+                    (RIFLE_ICON.to_owned(), RIFLE_RETICLE.to_owned(), true)
+                }
+            };
+            let (icon, guid, reticle, crosshair) = match s.weapon {
+                Weapon::Rifle => (rifle_icon, RIFLE_GUID, rifle_reticle, rifle_cross),
+                Weapon::Rpg => (RPG_ICON.to_owned(), RPG_GUID, RPG_RETICLE.to_owned(), true),
+                Weapon::GrenadeLauncher => (
+                    LAUNCHER_ICON.to_owned(),
+                    LAUNCHER_GUID,
+                    LAUNCHER_RETICLE.to_owned(),
+                    true,
+                ),
             };
             // The designator up in her hands: the gun box names it; the
             // reticle stays the gun's. In a tank, its cannon.
-            let (icon, guid, reticle) = if cannon {
-                (CANNON_ICON, CANNON_GUID, CANNON_RETICLE)
+            let (icon, guid, reticle, crosshair) = if cannon {
+                (
+                    CANNON_ICON.to_owned(),
+                    CANNON_GUID,
+                    CANNON_RETICLE.to_owned(),
+                    false,
+                )
             } else if holding {
-                (DESIGNATOR_ICON, DESIGNATOR_GUID, reticle)
+                (
+                    DESIGNATOR_ICON.to_owned(),
+                    DESIGNATOR_GUID,
+                    reticle,
+                    crosshair,
+                )
             } else {
-                (icon, guid, reticle)
+                (icon, guid, reticle, crosshair)
             };
             // What `MrxGuiHudReticle.HandleReticleGunSwitchEvent` reads:
             // without a type it leaves the reticle as it was. No target
@@ -3119,14 +3215,14 @@ impl Thread {
             let t = table(
                 lua,
                 [
-                    ("uNewCurrentGun", Value::String(lua.create_string(icon)?)),
+                    ("uNewCurrentGun", Value::String(lua.create_string(&icon)?)),
                     ("uNewCurrentGunGuid", guid_value(guid)),
                     ("sReticleType", Value::String(lua.create_string("Normal")?)),
                     (
                         "uReticleTexture",
-                        Value::String(lua.create_string(reticle)?),
+                        Value::String(lua.create_string(&reticle)?),
                     ),
-                    ("bReticleCrosshair", Value::Boolean(!cannon)),
+                    ("bReticleCrosshair", Value::Boolean(crosshair)),
                 ],
             )?;
             fire(lua, "GuiWeaponEquippedUpdate", t)?;
@@ -3604,7 +3700,7 @@ impl Thread {
                 pie,
                 ..
             } => {
-                let hash = name_hash(texture);
+                let hash = texture_hash(texture);
                 want.push(hash);
                 match pie {
                     Some(pie) => out.extend(wedge(hash, *rect, *uv, *colour, *rotation, *pie)),
@@ -4998,6 +5094,25 @@ fn text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_texture_named_by_hash_is_that_hash() {
+        // The shotgun's reticle, by its `WeaponUI` hash.
+        assert_eq!(texture_hash(&by_hash(0xe350_5568)), 0xe350_5568);
+        assert_eq!(
+            texture_hash("reticle_shotgun"),
+            name_hash("reticle_shotgun")
+        );
+        // Not eight hex digits: a name like any other.
+        assert_eq!(texture_hash("#beef"), name_hash("#beef"));
+    }
+
+    #[test]
+    fn hud_sounds_are_the_movies_sound_commands() {
+        assert!(is_sound_command("Sound.Loop"));
+        assert!(is_sound_command("Sound.Stop"));
+        assert!(!is_sound_command("audioSetSFXVolume"));
+    }
 
     /// Where on screen the hit arc shows, clockwise from straight ahead:
     /// `HandleUpdateEvent` turns it by direction + heading, from the top
