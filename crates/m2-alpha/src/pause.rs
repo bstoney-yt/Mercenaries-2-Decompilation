@@ -34,6 +34,19 @@
 //!   (`preopComplete(true, what)`): listing them (`listLoadGame`), the
 //!   engine first hands it each (`addSaveGame`); saving, it says the slot
 //!   (`saveGame` with its number).
+//! - Its video screen's Resolution and Refresh Rate: the movie keeps no
+//!   list. Its arrows ask the engine (`LTIFscommand` with
+//!   `LTIVideoNextRes`, `LTIVideoPrevRes`, `LTIVideoNextRefresh`,
+//!   `LTIVideoPrevRefresh`, which the scripts hand to the library) and
+//!   it shows whatever text comes back (`LTIVideoSetResolution`,
+//!   `LTIVideoSetRefresh`). Its `applyChanges` reports neither, so the
+//!   engine keeps what it stepped to and applies it on `pauseSave`. The
+//!   screen's third item, Aspect Ratio (16:9 or 4:3, `videoModeVar`,
+//!   `LTIVideoSwitchMode`), has nothing to do with fullscreen: the movie
+//!   has no fullscreen item. So the Refresh Rate list ends in `Windowed`:
+//!   a rate means fullscreen at that mode, `Windowed` a window of that
+//!   size ([`Video`]). The lists are the monitor's modes ([`resolutions`],
+//!   [`rates`]); their texts (`"1920 x 1080"`, `"144 Hz"`) are invented.
 //! - Its keyboard and mouse table (Controls, Keyboard/Mouse): filled as
 //!   it starts, rebound a cell at a time, kept on Accept
 //!   ([`crate::keytable`]).
@@ -45,7 +58,8 @@
 //!
 //! From the game's data: the pause layout and `MrxGuiPauseScreen` (which
 //! movie, which commands the scripts take) and the `pause_menu` movie (its
-//! commands, its test path's calls and boxes, its setters' ranges). The
+//! commands, its test path's calls and boxes, its setters' ranges, the
+//! video screen's commands and item names from its strings). The
 //! settings' meaning in play (how far 0 to 100 of mouse sensitivity
 //! turns, which sounds each volume covers) is invented; see
 //! [`Settings`]. Checked against the PC footage's pause menu (1:46-2:04:
@@ -104,9 +118,12 @@ pub struct Settings {
     pub dialog: f64,
     /// The window is wide (the video screen's aspect ratio: wide or 4:3).
     pub wide: bool,
-    /// The window's size and refresh as the video screen writes them.
-    pub resolution: String,
-    pub refresh: String,
+    /// How the window is shown: its size, and fullscreen at a rate or a
+    /// window ([`Video`]).
+    pub video: Video,
+    /// The modes the window's monitor offers, for the video screen to
+    /// cycle through ([`resolutions`], [`rates`]).
+    pub modes: Vec<Mode>,
     /// The saves to list on the save screen.
     pub saves: Vec<SaveEntry>,
     /// The keyboard and mouse table ([`crate::keytable`]).
@@ -132,8 +149,8 @@ impl Default for Settings {
             music: 100.0,
             dialog: 100.0,
             wide: true,
-            resolution: String::new(),
-            refresh: "60".into(),
+            video: Video::default(),
+            modes: Vec::new(),
             saves: Vec::new(),
             keys: KeyTable::default(),
         }
@@ -154,6 +171,127 @@ pub fn mouse_slider(radians: f32) -> f64 {
 /// The pad's turn rate, times its default, for the menu's 0 to 100.
 pub fn pad_scale(v: f64) -> f64 {
     4f64.powf((v.clamp(0.0, 100.0) - 50.0) / 50.0)
+}
+
+/// A mode the monitor offers: its size and refresh rate (whole hertz).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Mode {
+    pub width: u32,
+    pub height: u32,
+    pub hz: u32,
+}
+
+/// How the window is shown, as the video screen's Resolution and Refresh
+/// Rate say it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Video {
+    pub width: u32,
+    pub height: u32,
+    /// Fullscreen at this rate (hertz), or `None`: a window of that size
+    /// (the Refresh Rate list's last entry, `Windowed`; invented, as the
+    /// movie has no item for it).
+    pub fullscreen: Option<u32>,
+}
+
+impl Default for Video {
+    fn default() -> Self {
+        Self {
+            width: 1600,
+            height: 900,
+            fullscreen: None,
+        }
+    }
+}
+
+impl Video {
+    /// The Resolution item's text: `"1920 x 1080"` (invented; the movie
+    /// shows what it is given).
+    pub fn resolution_text(&self) -> String {
+        format!("{} x {}", self.width, self.height)
+    }
+
+    /// The Refresh Rate item's text: `"144 Hz"`, or `"Windowed"` (both
+    /// invented).
+    pub fn refresh_text(&self) -> String {
+        match self.fullscreen {
+            Some(hz) => format!("{hz} Hz"),
+            None => WINDOWED.into(),
+        }
+    }
+}
+
+/// The Refresh Rate entry that means a window (invented).
+pub const WINDOWED: &str = "Windowed";
+
+/// The sizes the Resolution item cycles through, narrowest first (then shortest): the
+/// monitor's, and `current` (a window can be any size) if not among them.
+pub fn resolutions(modes: &[Mode], current: (u32, u32)) -> Vec<(u32, u32)> {
+    let mut sizes: Vec<(u32, u32)> = modes.iter().map(|m| (m.width, m.height)).collect();
+    sizes.push(current);
+    sizes.sort_unstable();
+    sizes.dedup();
+    sizes
+}
+
+/// The entries the Refresh Rate item cycles through at `size`: the
+/// monitor's rates there, fastest first, then a window.
+pub fn rates(modes: &[Mode], size: (u32, u32)) -> Vec<Option<u32>> {
+    let mut hz: Vec<u32> = modes
+        .iter()
+        .filter(|m| (m.width, m.height) == size)
+        .map(|m| m.hz)
+        .collect();
+    hz.sort_unstable_by(|a, b| b.cmp(a));
+    hz.dedup();
+    hz.into_iter().map(Some).chain([None]).collect()
+}
+
+/// The entry `step` (1 next, -1 previous) from `at` in `list`, wrapping;
+/// from the start if `at` is not there.
+fn cycle<T: PartialEq + Copy>(list: &[T], at: T, step: isize) -> Option<T> {
+    let n = list.len() as isize;
+    if n == 0 {
+        return None;
+    }
+    // Not there: next is the first, previous the last.
+    let i = list
+        .iter()
+        .position(|&x| x == at)
+        .map_or(if step > 0 { -1 } else { 0 }, |i| i as isize);
+    Some(list[(i + step).rem_euclid(n) as usize])
+}
+
+/// `video` with the Resolution item stepped through the monitor's sizes
+/// and `kept` (the window's own): the next size, fullscreen at the same
+/// rate if the monitor has it there, else its fastest, a window if it has
+/// none.
+pub fn step_resolution(video: Video, modes: &[Mode], kept: (u32, u32), step: isize) -> Video {
+    let size = (video.width, video.height);
+    let Some((width, height)) = cycle(&resolutions(modes, kept), size, step) else {
+        return video;
+    };
+    let fullscreen = video.fullscreen.and_then(|hz| {
+        let there = rates(modes, (width, height));
+        if there.contains(&Some(hz)) {
+            Some(hz)
+        } else {
+            there[0]
+        }
+    });
+    Video {
+        width,
+        height,
+        fullscreen,
+    }
+}
+
+/// `video` with the Refresh Rate item stepped.
+pub fn step_rate(video: Video, modes: &[Mode], step: isize) -> Video {
+    let list = rates(modes, (video.width, video.height));
+    Video {
+        fullscreen: cycle(&list, video.fullscreen, step).unwrap_or(video.fullscreen),
+        ..video
+    }
 }
 
 /// A save as the save screen lists it (`addSaveGame`'s arguments).
@@ -203,6 +341,9 @@ pub struct News {
     pub capture: Option<bool>,
     /// The keyboard table accepted: bind as it says.
     pub keys: Option<KeyTable>,
+    /// The video screen's Resolution and Refresh Rate kept: put the
+    /// window into them.
+    pub video: Option<Video>,
 }
 
 impl News {
@@ -219,6 +360,7 @@ impl News {
         self.unused.extend(later.unused);
         self.capture = later.capture.or(self.capture);
         self.keys = later.keys.or(self.keys.take());
+        self.video = later.video.or(self.video);
     }
 }
 
@@ -239,6 +381,9 @@ pub struct Native {
     /// column) waiting for a key.
     keys: KeyTable,
     waiting: Option<(usize, usize)>,
+    /// The video screen's Resolution and Refresh Rate as the player has
+    /// stepped them, applied when the changes are kept.
+    video: Video,
 }
 
 impl Native {
@@ -255,6 +400,7 @@ impl Native {
         let mut calls = Vec::new();
         if !std::mem::replace(&mut self.set_up, true) {
             self.settings = settings.clone();
+            self.video = settings.video;
             calls.extend([
                 ("setPlatform", vec![text("PC")]),
                 ("setTerritory", vec![text("EN")]),
@@ -297,6 +443,25 @@ impl Native {
                 self.pending.extend(self.video_calls());
                 true
             }
+            // The video screen's arrows: the engine steps the item and
+            // says what it now reads.
+            "LTIVideoNextRes"
+            | "LTIVideoPrevRes"
+            | "LTIVideoNextRefresh"
+            | "LTIVideoPrevRefresh" => {
+                let step = if name.contains("Next") { 1 } else { -1 };
+                let (modes, kept) = (&self.settings.modes, self.settings.video);
+                self.video = if name.ends_with("Res") {
+                    step_resolution(self.video, modes, (kept.width, kept.height), step)
+                } else {
+                    step_rate(self.video, modes, step)
+                };
+                self.pending.extend(self.video_calls().into_iter().skip(1));
+                true
+            }
+            // Its aspect ratio (16:9 or 4:3) switched: the movie keeps
+            // which; the alpha draws to the window's shape either way.
+            "LTIVideoSwitchMode" => true,
             "LTIInputGeneralEnter" => {
                 self.pending.extend(self.controls_calls());
                 true
@@ -406,11 +571,16 @@ impl Native {
                 true
             }
             "pauseSave" => {
+                // Its `applyChanges` reports no Resolution or Refresh
+                // Rate: the engine's own stepping is what is kept.
+                self.settings.video = self.video;
+                self.news.video = Some(self.video);
                 self.news.settings = Some(self.settings.clone());
                 true
             }
             "pauseCancel" => {
                 // Back as they were, sliders heard included.
+                self.video = self.settings.video;
                 self.news.settings = Some(self.settings.clone());
                 self.news.volumes =
                     Some([self.settings.sfx, self.settings.music, self.settings.dialog]);
@@ -562,8 +732,11 @@ impl Native {
                 "LTIVideoSetMode",
                 vec![Value::Number(f64::from(u8::from(s.wide)))],
             ),
-            ("LTIVideoSetResolution", vec![text(&s.resolution)]),
-            ("LTIVideoSetRefresh", vec![text(&s.refresh)]),
+            (
+                "LTIVideoSetResolution",
+                vec![text(&self.video.resolution_text())],
+            ),
+            ("LTIVideoSetRefresh", vec![text(&self.video.refresh_text())]),
         ]
     }
 }
@@ -838,6 +1011,121 @@ mod tests {
         n.game_state("unloading");
         assert!(n.take_news().quit);
         assert!(!n.command("kickPlayer", "true"));
+    }
+
+    fn monitor() -> Vec<Mode> {
+        let m = |width, height, hz| Mode { width, height, hz };
+        vec![
+            m(2560, 1440, 165),
+            m(1920, 1080, 60),
+            m(2560, 1440, 60),
+            m(1280, 720, 60),
+            m(1920, 1080, 144),
+            m(1920, 1080, 60),
+        ]
+    }
+
+    #[test]
+    fn the_lists_are_the_monitors_modes_with_a_window_last() {
+        let modes = monitor();
+        assert_eq!(
+            resolutions(&modes, (2560, 1351)),
+            [(1280, 720), (1920, 1080), (2560, 1351), (2560, 1440)]
+        );
+        assert_eq!(resolutions(&modes, (1920, 1080)).len(), 3);
+        assert_eq!(rates(&modes, (1920, 1080)), [Some(144), Some(60), None]);
+        assert_eq!(rates(&modes, (2560, 1351)), [None]);
+        // A size down from 165 Hz: not there, so that size's fastest.
+        let fast = Video {
+            width: 2560,
+            height: 1440,
+            fullscreen: Some(165),
+        };
+        assert_eq!(
+            step_resolution(fast, &modes, (2560, 1440), -1).fullscreen,
+            Some(144)
+        );
+        assert_eq!(step_rate(fast, &modes, 1).fullscreen, Some(60));
+        let v = Video {
+            width: 1920,
+            height: 1080,
+            fullscreen: Some(144),
+        };
+        assert_eq!(
+            (v.resolution_text(), v.refresh_text()),
+            ("1920 x 1080".to_owned(), "144 Hz".to_owned())
+        );
+        let w = Video {
+            fullscreen: None,
+            ..v
+        };
+        assert_eq!(w.refresh_text(), WINDOWED);
+    }
+
+    #[test]
+    fn the_arrows_step_the_items_and_keeping_applies_them() {
+        let mut n = Native::default();
+        let s = Settings {
+            video: Video {
+                width: 2560,
+                height: 1351,
+                fullscreen: None,
+            },
+            modes: monitor(),
+            ..Settings::default()
+        };
+        n.calls(&s);
+        // The maximized window: the next size up is the monitor's.
+        assert!(n.library("LTIVideoNextRes", ""));
+        let calls = n.calls(&s);
+        assert_eq!(
+            calls.iter().map(texts).collect::<Vec<_>>(),
+            [vec!["2560 x 1440"], vec!["Windowed"]]
+        );
+        assert_eq!(
+            names(calls),
+            ["LTIVideoSetResolution", "LTIVideoSetRefresh"]
+        );
+        // Previous from Windowed is the slowest rate, then the fastest.
+        assert!(n.library("LTIVideoPrevRefresh", ""));
+        assert_eq!(texts(&n.calls(&s)[1]), ["60 Hz"]);
+        assert!(n.library("LTIVideoPrevRefresh", ""));
+        assert_eq!(texts(&n.calls(&s)[1]), ["165 Hz"]);
+        // Back to the window's own size, which no mode has: a window.
+        assert!(n.library("LTIVideoPrevRes", ""));
+        assert_eq!(
+            n.calls(&s).iter().map(texts).collect::<Vec<_>>(),
+            [vec!["2560 x 1351"], vec!["Windowed"]]
+        );
+        // Down a size, still a window; next from Windowed wraps to the
+        // fastest rate.
+        assert!(n.library("LTIVideoPrevRes", ""));
+        assert!(n.library("LTIVideoNextRefresh", ""));
+        assert_eq!(texts(n.calls(&s).last().unwrap()), ["144 Hz"]);
+        assert!(n.library("LTIVideoSwitchMode", ""));
+        // Leaving the video screen and coming back shows the choice.
+        assert!(n.library("LTIPauseItemChanged", "VideoEnter"));
+        assert_eq!(texts(&n.calls(&s)[1]), ["1920 x 1080"]);
+        assert!(n.library("LTIPauseItemChanged", "pauseSave"));
+        let news = n.take_news();
+        let kept = news.settings.unwrap().video;
+        assert_eq!(news.video, Some(kept));
+        assert_eq!(
+            kept,
+            Video {
+                width: 1920,
+                height: 1080,
+                fullscreen: Some(144),
+            }
+        );
+        // Dropped: back to what was kept.
+        assert!(n.library("LTIVideoNextRes", ""));
+        n.calls(&s);
+        assert!(n.library("LTIPauseItemChanged", "pauseCancel"));
+        let news = n.take_news();
+        assert_eq!((news.settings.unwrap().video, news.video), (kept, None));
+        assert!(n.library("LTIPauseItemChanged", "VideoEnter"));
+        assert_eq!(texts(&n.calls(&s)[1]), ["1920 x 1080"]);
     }
 
     #[test]

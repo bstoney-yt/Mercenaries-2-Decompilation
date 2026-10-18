@@ -272,7 +272,7 @@ pub const RAM_KIND: &str = "Car";
 /// its [`ram`] times the damage table's cell. A `Human` takes three times a
 /// `Car`'s and twice a `Tank`'s, a `HumanArmor` once either, the `Hero`
 /// a fifth. A row or column the table lacks takes the `Human` row's, then
-/// the ram itself.
+/// the ram itself. People take [`PERSON_RAM`] times the ram.
 pub fn run_over(
     table: &crate::tuning::DamageTable,
     row: u32,
@@ -284,8 +284,15 @@ pub fn run_over(
         .scale(row, key)
         .or_else(|| table.scale(name_hash("Human"), key))
         .unwrap_or(1.0);
-    ram(mass, speed) * scale
+    ram(mass, speed) * PERSON_RAM * scale
 }
+
+/// How much harder a ram hits a person than a prop. Invented (playtest
+/// 6): at 1, a 1,000 kg car at 15 m/s did a `Human` 45 of their 100
+/// health, and the playtest's soldiers got up from cars driven through
+/// them (4 killed by vehicles in 25 minutes); at 5, one at 7 m/s
+/// (25 km/h) kills.
+pub const PERSON_RAM: f32 = 5.0;
 
 /// A blast's reach and damage (`Explosive`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -388,10 +395,10 @@ mod tests {
         put(0.2f32.to_bits());
         let table = crate::tuning::DamageTable::parse(&data).expect("table");
         assert_eq!(ram(2000.0, 10.0), 20.0);
-        assert_eq!(run_over(&table, human, car, 2000.0, 10.0), 60.0);
-        assert!((run_over(&table, hero, car, 2000.0, 10.0) - 4.0).abs() < 1e-5);
-        assert_eq!(run_over(&table, 0x1234, car, 2000.0, 10.0), 60.0);
-        assert_eq!(run_over(&table, human, 0x1234, 2000.0, 10.0), 20.0);
+        assert_eq!(run_over(&table, human, car, 2000.0, 10.0), 300.0);
+        assert!((run_over(&table, hero, car, 2000.0, 10.0) - 20.0).abs() < 1e-5);
+        assert_eq!(run_over(&table, 0x1234, car, 2000.0, 10.0), 300.0);
+        assert_eq!(run_over(&table, human, 0x1234, 2000.0, 10.0), 100.0);
     }
 
     #[test]

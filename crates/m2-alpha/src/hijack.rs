@@ -66,6 +66,8 @@ const CAMERA_PITCH: f32 = -0.5;
 /// How far above the vehicle's top (later her feet) the camera looks,
 /// metres.
 const CAMERA_LIFT: f32 = 1.0;
+/// Mouse counts in a tick that make a flick (`Hijacks::pad`). Invented.
+const FLICK: f64 = 40.0;
 /// How long an action lasts when its clip is unknown, seconds.
 const UNKNOWN_CLIP: f64 = 2.0;
 /// The pad, as the scripts number its buttons
@@ -166,6 +168,8 @@ struct Active {
     actions: Vec<(u32, f64)>,
     /// Pad buttons held, as the scripts were last told.
     held: Vec<u32>,
+    /// The mouse flicked last tick (a flick presses once).
+    flicked: bool,
     /// Her hijack clip playing (an index into her rig's clips).
     clip: Option<usize>,
     /// The entrance, in the world when it started: the camera looks at it.
@@ -221,6 +225,8 @@ pub struct Hijacks {
     rider_seats: HashMap<(u32, String, u32), Option<Seat>>,
     /// Seated clips read for riders, by hash.
     rider_clips: HashMap<u32, Option<Clip>>,
+    /// Seated clips (hash) that don't bind to a people's kind (index).
+    rider_unbound: std::collections::HashSet<(u32, usize)>,
     /// The riders' looks, by vehicle (index, model) and seat: kept while
     /// the vehicle is.
     rider_looks: HashMap<(usize, u32, u32), Vec<bool>>,
@@ -312,6 +318,7 @@ impl Hijacks {
             dressed: Default::default(),
             rider_seats: HashMap::new(),
             rider_clips: HashMap::new(),
+            rider_unbound: Default::default(),
             rider_looks: HashMap::new(),
             riders: RiderTally::default(),
             told_riders: RiderTally::default(),
@@ -420,7 +427,10 @@ impl Hijacks {
         if self.by_model.is_none()
             && let Some(world) = &game.scene.world
         {
-            self.by_model = Some(hijackable(&world.index.template_db));
+            let by_model = hijackable(&world.index.template_db);
+            // Crewed, these are taken by their hijack alone.
+            game.hijack_only = by_model.keys().copied().collect();
+            self.by_model = Some(by_model);
         }
         if self.active.is_some() {
             self.pad(input);
@@ -465,6 +475,21 @@ impl Hijacks {
         let (State::Ready(l), Some(a)) = (&mut self.state, &mut self.active) else {
             return;
         };
+        // A flick of the mouse the way an arrow points presses it, as the
+        // PC HUD draws the face buttons as arrows (see
+        // [`crate::input::Bindings`]; inferred).
+        let (dx, dy) = input.take_mouse();
+        let flick = if dy.abs() > dx.abs() {
+            (dy.abs() > FLICK).then_some(if dy < 0.0 { 5 } else { 6 })
+        } else {
+            (dx.abs() > FLICK).then_some(if dx < 0.0 { 7 } else { 8 })
+        };
+        if let Some(button) = flick
+            && !a.flicked
+        {
+            l.mission.press(button);
+        }
+        a.flicked = flick.is_some();
         for (action, button) in PAD {
             if input.take_pressed(action) {
                 l.mission.press(button);
@@ -603,6 +628,7 @@ impl Hijacks {
                 set: l.clips.sets.get(&c.template.to_ascii_lowercase()).copied(),
                 actions: Vec::new(),
                 held: Vec::new(),
+                flicked: false,
                 clip: None,
                 // Over the entrance at the top of the vehicle, where the
                 // hijack plays out (the M1A2's driver's hatch is low on
@@ -848,10 +874,17 @@ impl Hijacks {
                         e.insert(load(game, seat.clip));
                     }
                     let k = &game.scene.people.kinds[kind];
+                    // A clip that won't bind to a kind's skeleton is tried
+                    // once, not cloned and bound again every tick.
+                    if self.rider_unbound.contains(&(seat.clip, kind)) {
+                        tally.no_clip += 1;
+                        continue;
+                    }
                     let Some(bound) = self.rider_clips[&seat.clip]
                         .clone()
                         .and_then(|c| m2_engine::BoundClip::bind(seat.clip, c, &k.rig.skeleton))
                     else {
+                        self.rider_unbound.insert((seat.clip, kind));
                         tally.no_clip += 1;
                         continue;
                     };

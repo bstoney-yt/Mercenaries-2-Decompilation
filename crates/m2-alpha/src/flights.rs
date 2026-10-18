@@ -419,18 +419,34 @@ impl Flights {
     /// The nearest of what lies with `at` (her feet, on foot) within its
     /// reach: level with her, within a body's height.
     pub fn within(&self, at: Vec3) -> Option<&Pickup> {
+        self.within_by(at, |_| 0)
+    }
+
+    /// Of what lies with `at` within its reach ([`within`](Self::within)),
+    /// the first by `rank` (lowest first), then the nearest: what she
+    /// would take ahead of what she would leave lying. A soldier's
+    /// grenade, ammunition and gun fall together, and the grenade she has
+    /// no room for hid the gun from her (playtest 5: the machine pistol
+    /// could not be taken up at all).
+    pub fn within_by(&self, at: Vec3, rank: impl Fn(&Pickup) -> u8) -> Option<&Pickup> {
         self.pickups
             .iter()
-            .map(|p| (p, (p.at - at).with_y(0.0).length()))
-            .filter(|&(p, d)| d <= p.what.reach && (p.at.y - at.y).abs() < TAKE_HEIGHT)
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(p, _)| p)
+            .map(|p| (p, rank(p), (p.at - at).with_y(0.0).length()))
+            .filter(|&(p, _, d)| d <= p.what.reach && (p.at.y - at.y).abs() < TAKE_HEIGHT)
+            .min_by(|a, b| a.1.cmp(&b.1).then(a.2.total_cmp(&b.2)))
+            .map(|(p, _, _)| p)
     }
 
     /// Takes the nearest of what lies with `at` within its reach
     /// ([`within`](Self::within)).
+    #[cfg(test)]
     pub fn take_within(&mut self, at: Vec3) -> Option<Pickup> {
         let key = self.within(at)?.key();
+        self.take(key)
+    }
+
+    /// Takes what lies under `key` ([`Pickup::key`]).
+    pub fn take(&mut self, key: (u32, u32)) -> Option<Pickup> {
         let i = self.pickups.iter().position(|p| p.key() == key)?;
         Some(self.pickups.remove(i))
     }
@@ -1174,6 +1190,39 @@ mod tests {
         flights.leave(rpg);
         assert_eq!(flights.take_wanted(), [96]);
         assert_eq!(flights.take_within(at), Some(rpg));
+    }
+
+    // A soldier's grenade and gun lie on one spot: the nearest-first pick
+    // gives the grenade, which came first; ranked, the gun she would
+    // take comes ahead of it, whatever lies nearer.
+    #[test]
+    fn what_she_would_take_comes_ahead_of_what_she_would_leave() {
+        let mut flights = Flights::default();
+        let at = Vec3::new(10.0, 0.1, 10.0);
+        let lying = |from, template| Pickup {
+            from,
+            what: Leaves {
+                template,
+                reach: 1.5,
+                ..Leaves::default()
+            },
+            at,
+            yaw: 0.0,
+        };
+        let (grenade, pistol) = (lying(1, 0x8000_8a0b), lying(2, 0x8000_6b59));
+        flights.leave(grenade);
+        flights.leave(pistol);
+        let her = at + Vec3::X * 0.5;
+        assert_eq!(flights.within(her), Some(&grenade));
+        let rank = |p: &Pickup| u8::from(p.what.template == 0x8000_8a0b);
+        assert_eq!(flights.within_by(her, rank), Some(&pistol));
+        // The nearer of two she would take.
+        let mut near = lying(3, 0x8000_6b59);
+        near.at = at + Vec3::X * 0.4;
+        flights.leave(near);
+        assert_eq!(flights.within_by(her, rank), Some(&near));
+        assert_eq!(flights.take(pistol.key()), Some(pistol));
+        assert_eq!(flights.take(pistol.key()), None);
     }
 
     #[test]

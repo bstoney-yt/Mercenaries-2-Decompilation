@@ -38,6 +38,10 @@ const COME_FAR: f32 = 320.0;
 const GONE: f32 = 420.0;
 /// Seconds between looks for a place to bring one.
 const LOOK: f32 = 1.0;
+/// None comes out nearer another vehicle than this, metres (a semi is 9
+/// m long), and so many places are tried for each. Invented.
+const CLEAR: f32 = 12.0;
+const PLACE_TRIES: usize = 8;
 /// A point of the way is reached this near, metres.
 const ARRIVE: f32 = 6.0;
 /// A road's end meets a junction's port this near, metres.
@@ -205,16 +209,40 @@ impl RoadTraffic {
             }
         }
         near += self.loading.len();
+        // Where vehicles stand already: none comes out on top of another
+        // (playtest 5: a Sportbike and an Austin semi came out on the same
+        // spot, the semi on the bike).
+        let mut stands: Vec<Vec3> = scene
+            .vehicles
+            .iter()
+            .filter_map(|v| {
+                v.id.and_then(|id| world.physics.vehicle_transform(id))
+                    .map(|m| m.w_axis.truncate())
+                    .or(v.spot.map(|s| s.1))
+            })
+            .collect();
         let mut loads = Vec::new();
-        while near < wanted {
-            let Some((road, forward, s, list)) = self.place_near(&index.roads, &zones, focus)
-            else {
+        'come: while near < wanted {
+            let mut found = None;
+            for _ in 0..PLACE_TRIES {
+                let Some((road, forward, s, list)) = self.place_near(&index.roads, &zones, focus)
+                else {
+                    break 'come;
+                };
+                let r = &index.roads[road];
+                let lanes = r.lane_offsets().len().max(1);
+                let pick = ((self.roll() * lanes as f32) as usize).min(lanes - 1);
+                let (at, dir) = lane(r, s, forward, pick);
+                if stands.iter().all(|&o| flat(o - at).length() >= CLEAR) {
+                    found = Some((road, forward, s, list, pick, at, dir));
+                    break;
+                }
+            }
+            let Some((road, forward, s, list, pick, at, dir)) = found else {
                 break;
             };
+            stands.push(at);
             let r = &index.roads[road];
-            let lanes = r.lane_offsets().len().max(1);
-            let pick = ((self.roll() * lanes as f32) as usize).min(lanes - 1);
-            let (at, dir) = lane(r, s, forward, pick);
             let yaw = dir.x.atan2(dir.z);
             let next = next_point(&r.points, s, forward);
             let car = Car {

@@ -232,12 +232,16 @@ impl Default for Bindings {
             (QuickLoad, vec![k(F9)]),
             (Cheats, vec![k(F7)]),
             (Quit, vec![k(Escape)]),
-            // Laid out as the face buttons are (the PC game's are not
-            // known), beside the look keys.
-            (PadY, vec![k(KeyI)]),
-            (PadA, vec![k(KeyK)]),
-            (PadX, vec![k(KeyJ)]),
-            (PadB, vec![k(KeyL)]),
+            // The PC HUD draws the face buttons as arrows (its own
+            // `icon_hijack_button_*` for the pad's `BUTTON_PAD2_U`, `_D`,
+            // `_L`, `_R`: a fist under an arrow pointing that way, playtest
+            // 5's footage), so they sit on the look keys, which lie the
+            // same way, and on the arrow keys (playtest 5: no key named,
+            // every try at the villa's tank timed out). Inferred.
+            (PadY, vec![k(KeyI), k(ArrowUp)]),
+            (PadA, vec![k(KeyK), k(ArrowDown)]),
+            (PadX, vec![k(KeyJ), k(ArrowLeft)]),
+            (PadB, vec![k(KeyL), k(ArrowRight)]),
             (SwitchWeapon, vec![k(Tab), m(WheelUp), m(WheelDown)]),
         ]))
     }

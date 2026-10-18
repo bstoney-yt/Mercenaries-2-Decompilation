@@ -1125,6 +1125,16 @@ pub fn layer_name(block_path: &str) -> String {
     parts.join("_").to_ascii_lowercase()
 }
 
+/// Whether a template's name (`_marsh_bridgemid_AIcollision`,
+/// `_pmcoutpost_bridge_aicollision`) makes it a blocker for the AI's
+/// driving alone. Inferred from the names (playtest 5: the first
+/// contract's moat bridge and the PMC's held vehicles, a tank on the
+/// bridge among them, where no wall stands): nothing in the way of her
+/// or her vehicle.
+pub fn ai_collision(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("aicollision")
+}
+
 /// An entity name without its leading `_` and its trailing ` 26` or
 /// ` 0x001384eb`: the name of the model or template it is. A name with
 /// no such id (`AMX30 (Full)`) is kept whole.
@@ -2587,6 +2597,14 @@ pub fn low_res_tile<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blockers_for_the_ai_alone_go_by_their_name() {
+        assert!(ai_collision("_marsh_bridgemid_AIcollision"));
+        assert!(ai_collision("_pmcoutpost_bridge_aicollision"));
+        assert!(!ai_collision("_marsh_bridgemid"));
+        assert!(!ai_collision("_pmcoutpost_bridgepole"));
+    }
 
     #[test]
     fn start_points_end_start_and_a_number() {

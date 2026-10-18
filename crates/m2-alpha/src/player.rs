@@ -120,6 +120,9 @@ impl ChaseRig {
 /// Ticks the world must have been quiet before she lands: a building's
 /// collision can arrive a few frames after the ground under it.
 const SETTLED: u8 = 3;
+/// Ticks she waits for the world to stop coming in before she lands
+/// anyway (ten seconds; invented: models that never load hold no one up).
+const LAND_WAIT: u16 = 600;
 
 /// Put down at a height ([`Player::drop_at`]), she lands on what is under
 /// a point this far above it, found within this far down: the floor or
@@ -246,8 +249,13 @@ pub struct Player {
     /// not land until it has been quiet for [`SETTLED`] ticks, so that she
     /// lands on the buildings and not inside one that loads a moment later.
     pub streaming: bool,
+    /// Set each tick the layers' models near her are still loading.
+    pub models_coming: bool,
     /// Ticks in a row the world has been quiet while she waits to land.
     settled: u8,
+    /// Ticks she has waited to land: past [`LAND_WAIT`] she no longer
+    /// waits for the layers' models.
+    waited: u16,
     pub model: Option<(GpuModel, Rig)>,
     /// The vehicle she is driving (index into the scene's vehicles).
     pub driving: Option<usize>,
@@ -307,6 +315,8 @@ impl Player {
             land_from: None,
             streaming: false,
             settled: 0,
+            waited: 0,
+            models_coming: false,
             model,
             driving: None,
             aiming: false,
@@ -483,6 +493,7 @@ impl Player {
         self.character.velocity = Vec3::ZERO;
         self.landed = false;
         self.land_from = Some(at);
+        self.waited = 0;
     }
 
     /// One fixed tick of `dt` seconds.
@@ -494,17 +505,24 @@ impl Player {
             // Wait for the ground and whatever stands on it, then stand on
             // what is under the spot she was put at, else on the top of
             // whatever is there.
-            self.settled = if self.streaming {
-                0
-            } else {
-                self.settled.saturating_add(1)
-            };
             let p = self.character.position;
             let near = |at: Vec3| {
                 let from = at + Vec3::Y * LAND_ABOVE;
                 physics
                     .cast_ray(from, -Vec3::Y, LAND_REACH)
                     .map(|(d, _)| from.y - d)
+            };
+            // Nothing under the spot yet while the layers' models still
+            // come: wait for them, a while (the PMC's interior, its floor
+            // 100 m over the mountain).
+            self.waited = self.waited.saturating_add(1);
+            let floor_coming = self.models_coming
+                && self.waited < LAND_WAIT
+                && self.land_from.and_then(near).is_none();
+            self.settled = if self.streaming || floor_coming {
+                0
+            } else {
+                self.settled.saturating_add(1)
             };
             let top = || {
                 physics
@@ -522,6 +540,7 @@ impl Player {
                 self.landed = true;
                 self.land_from = None;
                 self.settled = 0;
+                self.waited = 0;
             }
             self.camera(physics);
             return;
@@ -941,6 +960,7 @@ mod tests {
             road_wheels: Vec::new(),
             rest: Vec::new(),
             node_wheel: Vec::new(),
+            node_rolls: Vec::new(),
             mass: 32_000.0,
             turret: vec![true],
             pivot: Some(Vec3::new(0.0, 1.53, 0.55)),

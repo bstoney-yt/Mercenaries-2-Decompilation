@@ -170,6 +170,9 @@ pub struct Game {
     pub placed: crate::placed::Placed,
     /// The scripts have turned her controls off (a loading fade).
     pub input_locked: bool,
+    /// Models taken only by their action hijack while crewed (an entrance
+    /// in the data, [`crate::hijack`]): the use key doesn't get her in.
+    pub hijack_only: HashSet<u32>,
     /// The field of view (degrees, bottom to top) and the screen's width
     /// over its height the last frame was drawn with: what the scripts'
     /// camera sees (`Event.ObjectIsVisible`).
@@ -267,6 +270,7 @@ impl Game {
             refused: std::collections::HashSet::new(),
             placed: crate::placed::Placed::default(),
             input_locked: false,
+            hijack_only: HashSet::new(),
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
         }
@@ -695,12 +699,20 @@ impl Game {
         // The use key at what lies within reach: taken with the fight's.
         let mut taking = false;
         let scene = &mut self.scene;
+        // The models the layers put up near her, still loading: with
+        // nothing yet under where the scripts put her, she waits for them.
+        // The PMC's interior, 100 m over the mountain, loads after the
+        // ground under it (playtest 5: put there after the villa, she
+        // landed on the mountain below and saw the hall overhead).
+        let props = scene.props.counts();
+        let models_coming = props.loading + props.waiting_near > 0;
         if let Some(world) = &mut scene.world {
             let streaming = world.stats().pending > 0;
             let physics = &mut world.physics;
             let player = scene.player.as_mut().filter(|_| self.on_foot);
             if let Some(player) = player {
                 player.streaming = streaming;
+                player.models_coming = models_coming;
                 self.park_wait -= dt;
                 if !self.restore.is_empty() {
                     restore(physics, &mut scene.vehicles, &mut self.restore);
@@ -778,7 +790,8 @@ impl Game {
                             self.combat.manned = Some(m);
                         }
                         None => {
-                            player.driving = nearest(physics, &scene.vehicles, player, REACH);
+                            player.driving =
+                                nearest(physics, &scene.vehicles, &self.hijack_only, player, REACH);
                             // Seated: she no longer waits to land (people
                             // wait on that, and she may have hopped out and
                             // back in before the ground streamed).
@@ -929,7 +942,9 @@ impl Game {
                         v.rolled += ROTOR_SPIN * dt;
                     }
                 } else {
-                    v.rolled += world.physics.vehicle_speed(id) * dt;
+                    // As the chassis moves forward: a parked or held
+                    // vehicle's tracks stand still (playtest 5).
+                    v.rolled += world.physics.vehicle_rolling(id) * dt;
                 }
                 // Nobody at the wheel: it brakes to a stop and stays put,
                 // on a hill too (a wreck drags on its rims, driven by
@@ -1049,7 +1064,13 @@ impl Game {
             // the use key, taken up ("Equip").
             use crate::mission::Offer;
             let templates = &world.index.template_db;
-            let near = scene.flights.within(player.character.position).map(|p| {
+            // What she would take comes ahead of what she would leave
+            // lying ([`crate::flights::Flights::within_by`]).
+            let chosen = scene.flights.within_by(player.character.position, |p| {
+                would_leave(templates, &self.combat, p)
+            });
+            let chosen_key = chosen.map(crate::flights::Pickup::key);
+            let near = chosen.map(|p| {
                 let refill = crate::mission::refill(templates, &self.combat, &p.what);
                 let usable = p.what.is_money() || self.combat.can_use(refill, p.what.health);
                 let offer = crate::mission::offer(templates, &self.combat, &p.what);
@@ -1075,7 +1096,7 @@ impl Game {
             if player.driving.is_none()
                 && self.combat.manned.is_none()
                 && take
-                && let Some(p) = scene.flights.take_within(player.character.position)
+                && let Some(p) = chosen_key.and_then(|k| scene.flights.take(k))
             {
                 let walked = near.is_some_and(|n| n.0 != Offer::Equip);
                 let from = p.from;
@@ -1651,12 +1672,17 @@ impl Game {
             _ => None,
         };
         let can_enter = match (&self.scene.world, player) {
-            (Some(w), Some(p)) if p.driving.is_none() && p.landed => {
-                nearest(&w.physics, &self.scene.vehicles, p, REACH).map(|i| {
-                    let spec = &self.scene.vehicles[i].spec;
-                    vehicle_name(&w.index.template_db, strings, &spec.label, spec.model)
-                })
-            }
+            (Some(w), Some(p)) if p.driving.is_none() && p.landed => nearest(
+                &w.physics,
+                &self.scene.vehicles,
+                &self.hijack_only,
+                p,
+                REACH,
+            )
+            .map(|i| {
+                let spec = &self.scene.vehicles[i].spec;
+                vehicle_name(&w.index.template_db, strings, &spec.label, spec.model)
+            }),
             _ => None,
         };
         // What the use key takes, as the game words it.
@@ -1669,7 +1695,11 @@ impl Game {
                         .and_then(|s| s.strings.get(&key).cloned())
                         .unwrap_or_else(|| english.to_owned())
                 };
-                match self.scene.flights.within(p.character.position) {
+                match self
+                    .scene
+                    .flights
+                    .within_by(p.character.position, |l| would_leave(db, &self.combat, l))
+                {
                     Some(lying) => match crate::mission::offer(db, &self.combat, &lying.what) {
                         // Walked over, unworded.
                         Offer::Walk => None,
@@ -1743,7 +1773,13 @@ impl Game {
         let (Some(world), Some(player)) = (&self.scene.world, &mut self.scene.player) else {
             return false;
         };
-        player.driving = nearest(&world.physics, &self.scene.vehicles, player, reach);
+        player.driving = nearest(
+            &world.physics,
+            &self.scene.vehicles,
+            &self.hijack_only,
+            player,
+            reach,
+        );
         player.landed |= player.driving.is_some();
         player.driving.is_some()
     }
@@ -2842,6 +2878,12 @@ fn shown_name(
         .unwrap_or_else(|| format!("{t:#x}"))
 }
 
+/// Whether someone sits in the driver's seat of a crew.
+fn has_driver(crew: &[(String, String)]) -> bool {
+    crew.iter()
+        .any(|(seat, _)| seat.to_ascii_lowercase().contains("driver"))
+}
+
 /// She gets into `v`'s driver's seat: whoever drove it is put out (its
 /// crew forgets them: playtest 4, no car could be taken from traffic).
 fn take_seat(v: &mut ParkedVehicle) {
@@ -2858,6 +2900,7 @@ fn take_seat(v: &mut ParkedVehicle) {
 fn nearest(
     physics: &Physics,
     vehicles: &[ParkedVehicle],
+    hijack_only: &HashSet<u32>,
     player: &Player,
     reach: f32,
 ) -> Option<usize> {
@@ -2866,6 +2909,10 @@ fn nearest(
         .iter()
         .enumerate()
         .filter(|(_, v)| !v.wrecked)
+        // Crewed, one with an action hijack is taken only by it (playtest
+        // 5: the villa's tank, whose scripts make it usable by the hijack
+        // alone, `Vehicle.Usable(tank, false)`, was got into at a press).
+        .filter(|(_, v)| !(hijack_only.contains(&v.spec.model) && has_driver(&v.crew)))
         // One with someone in the driver's seat is taken from them: the
         // action hijacks (tanks, helicopters) took the key first if near
         // ([`crate::hijack`]); cars, bikes and jeeps have none in the data
@@ -2942,9 +2989,32 @@ fn view_heading(player: Option<&Player>, fly: &FlyCamera) -> f32 {
     player.map_or(fly.yaw, |p| p.yaw)
 }
 
+/// How far down the pickups she stands at `p` comes
+/// ([`crate::flights::Flights::within_by`]): 0 for what she would take
+/// (walked over or with the use key, given room for it, or a weapon to
+/// equip), 1 for what she would leave lying.
+fn would_leave(
+    templates: &m2_engine::Templates,
+    combat: &Combat,
+    p: &crate::flights::Pickup,
+) -> u8 {
+    let refill = crate::mission::refill(templates, combat, &p.what);
+    let usable = p.what.is_money() || combat.can_use(refill, p.what.health);
+    let offer = crate::mission::offer(templates, combat, &p.what);
+    u8::from(!usable && offer != crate::mission::Offer::Equip)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    #[test]
+    fn a_crew_has_a_driver_by_its_seat() {
+        let seat = |s: &str| (s.to_owned(), "VZ Tank Commander".to_owned());
+        assert!(super::has_driver(&[seat("Gunner"), seat("seat_driver")]));
+        assert!(!super::has_driver(&[seat("Gunner")]));
+        assert!(!super::has_driver(&[]));
+    }
 
     use m2_engine::TemplateInfo;
 
