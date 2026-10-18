@@ -343,6 +343,9 @@ pub struct Screen {
     /// An Xbox pad plays: control words show its pictures
     /// ([`pad_picture`]) and `Gui.IsXboxController` answers true.
     pad: bool,
+    /// She is at the wheel: the pad's pictures are the vehicle layout's
+    /// ([`driving_pad_picture`]).
+    driving: bool,
 }
 
 impl Screen {
@@ -356,6 +359,12 @@ impl Screen {
 
     pub fn pad(&self) -> bool {
         self.pad
+    }
+
+    /// She is at the wheel (or on foot again): the pad's pictures follow
+    /// the vehicle layout ([`driving_pad_picture`]).
+    pub fn set_driving(&mut self, driving: bool) {
+        self.driving = driving;
     }
 
     /// Names the keys bound to control words (`[l-stick up]`):
@@ -667,7 +676,13 @@ impl Screen {
                     colour: Some(c),
                     ..TextSpan::default()
                 });
-            } else if let Some(picture) = pad_picture(id).filter(|_| self.pad && parts.len() == 1) {
+            } else if let Some(picture) = if self.driving {
+                driving_pad_picture(id)
+            } else {
+                pad_picture(id)
+            }
+            .filter(|_| self.pad && parts.len() == 1)
+            {
                 // Inline, as the objective icons are.
                 let colour = out.last().and_then(|s| s.colour);
                 out.push(TextSpan {
@@ -1189,6 +1204,21 @@ pub fn pad_picture(word: &str) -> Option<&'static str> {
         "dpad right" => "button_dpad_right",
         _ => return None,
     })
+}
+
+/// [`pad_picture`] while she is at the wheel. The vehicles' hints name the
+/// handbrake by the jump's word (`[jump] Handbrake`, the PC's Space), but
+/// on the pad the jump's A is the accelerator: the pause screen's car and
+/// boat layouts (`tControlMap.car`, `.boat`, vz.wad) put
+/// `[SHELL.Controls.Handbrake]` on `Joystick.BUTTON_ALT1_1`, 17, the left
+/// trigger (`Forward` on A, `Reverse` on X, `Call_Allies` on B). From the
+/// game's data; the helicopter's and the jet's layouts put `Lower` there.
+/// Playtest 8: the prompt showed A.
+pub fn driving_pad_picture(word: &str) -> Option<&'static str> {
+    match word.to_ascii_lowercase().as_str() {
+        "jump" => Some("button_trigger_l"),
+        _ => pad_picture(word),
+    }
 }
 
 /// The texture an inline icon word stands for (`MrxUtil.tInlineIcons`:
@@ -2733,6 +2763,13 @@ mod tests {
         let spans = s.spans("[green][reload] Reload[n][jump] Handbrake");
         let icons: Vec<_> = spans.iter().filter_map(|s| s.icon.as_deref()).collect();
         assert_eq!(icons, ["button_x", "button_a"]);
+        // At the wheel the handbrake is the car layout's left trigger, not
+        // the A that drives her forward (playtest 8); on foot again, A.
+        s.set_driving(true);
+        let at_wheel = s.spans("[green][reload] Reload[n][jump] Handbrake");
+        let icons: Vec<_> = at_wheel.iter().filter_map(|s| s.icon.as_deref()).collect();
+        assert_eq!(icons, ["button_x", "button_trigger_l"]);
+        s.set_driving(false);
         // In the colour so far, and the text goes on after each.
         assert!(spans.iter().all(|s| s.colour == colour_name("green")));
         assert_eq!(s.display_text("[reload] Reload"), " Reload");

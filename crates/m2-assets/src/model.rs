@@ -1164,8 +1164,54 @@ impl PartStates {
     /// Which of `nodes` are hidden (with everything under them) intact,
     /// or `wrecked`: switchable nodes start hidden, then each part enters
     /// its intact or wrecked state (intact if it has no wrecked one).
+    ///
+    /// A wreck whose states show nothing of their own, where intact ones
+    /// do and other states show pieces (nodes neither shows), leaves every
+    /// switchable node hidden: it has gone to its pieces, made objects of
+    /// their own ([`chunks`](Self::chunks); `pmcoutpost_gate`, Solano's
+    /// villa gate: each leaf's destroyed state is empty and its collapse
+    /// makes its debris leaf a `CreateObject`). Read as "nothing read", as
+    /// a model whose states show nothing either way is, it drew whole:
+    /// the closed gate stood after a car had broken both leaves
+    /// (playtest 8). 41 of the archive's 1,344 models with part states
+    /// read so, each now breaking into pieces. From the model data; that
+    /// the game draws nothing of their switchable nodes is inferred.
     pub fn hidden(&self, nodes: &[Node], wrecked: bool) -> Vec<bool> {
-        self.hidden_parts(nodes, |_| wrecked)
+        let (mask, any) = self.hidden_raw(nodes, |_, m| Self::entered(m, wrecked));
+        if any {
+            return mask;
+        }
+        let (intact, intact_shows) = self.hidden_raw(nodes, |_, m| Self::entered(m, false));
+        // Gone to pieces: a node some state shows that neither the intact
+        // nor this wreck does (the gate's debris leaves).
+        let off = |v: &[bool], n: u16| v.get(usize::from(n)).copied().unwrap_or(false);
+        let pieces = self
+            .machines
+            .iter()
+            .flat_map(|m| &m.states)
+            .flat_map(|(_, commands)| commands)
+            .any(|&(n, shown)| shown && off(&intact, n) && off(&mask, n));
+        if wrecked && intact_shows && pieces {
+            mask
+        } else {
+            vec![false; nodes.len()]
+        }
+    }
+
+    /// The state part `m` enters intact or `wrecked`: where its start
+    /// puts it, else the usual states. A part whose destroyed start shows
+    /// nothing (a gate's leaf, gone to its pieces) is hidden on the
+    /// wreck, not left up intact.
+    fn entered(m: &PartMachine, wrecked: bool) -> Option<usize> {
+        let state = |name: u32| m.states.iter().position(|s| s.0 == name);
+        let started = |k: usize| m.starts[k].and_then(state);
+        if wrecked {
+            started(1)
+                .or_else(|| state(STATE_WRECKED))
+                .or_else(|| state(STATE_INTACT))
+        } else {
+            started(0).or_else(|| state(STATE_INTACT))
+        }
     }
 
     /// The part (index into [`machines`](Self::machines)) a node belongs
@@ -1189,20 +1235,7 @@ impl PartStates {
     /// `wrecked` says of its index: a hedge one of whose sections a
     /// vehicle flattened, the others standing.
     pub fn hidden_parts(&self, nodes: &[Node], wrecked: impl Fn(usize) -> bool) -> Vec<bool> {
-        self.hidden_in(nodes, |k, m| {
-            let state = |name: u32| m.states.iter().position(|s| s.0 == name);
-            // Where its start puts it, else the usual states: a part
-            // whose destroyed start shows nothing (a gate's leaf, gone to
-            // its pieces) is hidden on the wreck, not left up intact.
-            let started = |k: usize| m.starts[k].and_then(state);
-            if wrecked(k) {
-                started(1)
-                    .or_else(|| state(STATE_WRECKED))
-                    .or_else(|| state(STATE_INTACT))
-            } else {
-                started(0).or_else(|| state(STATE_INTACT))
-            }
-        })
+        self.hidden_in(nodes, |k, m| Self::entered(m, wrecked(k)))
     }
 
     /// The state part `m` is in at the start, intact: where its
@@ -1222,6 +1255,21 @@ impl PartStates {
         nodes: &[Node],
         state: impl Fn(usize, &PartMachine) -> Option<usize>,
     ) -> Vec<bool> {
+        match self.hidden_raw(nodes, state) {
+            (mask, true) => mask,
+            // Nothing read as shown: draw everything rather than nothing.
+            (_, false) => vec![false; nodes.len()],
+        }
+    }
+
+    /// As [`hidden_in`](Self::hidden_in), and whether any state entered
+    /// shows a node: if none does, the mask leaves every switchable node
+    /// hidden.
+    fn hidden_raw(
+        &self,
+        nodes: &[Node],
+        state: impl Fn(usize, &PartMachine) -> Option<usize>,
+    ) -> (Vec<bool>, bool) {
         let mut off = vec![false; nodes.len()];
         let mut any = false;
         for &n in &self.switchable {
@@ -1238,15 +1286,11 @@ impl PartStates {
                 }
             }
         }
-        if !any {
-            // Nothing read as shown: draw everything rather than nothing.
-            return vec![false; nodes.len()];
-        }
         let parent = |n: u16| nodes.get(usize::from(n)).and_then(|x| x.parent);
         // A node goes with the nearest switchable node at or above it: a
         // hidden turret takes its barrel, but a wheel shown on a wreck
         // shows though the intact body it hangs from is hidden.
-        (0..nodes.len())
+        let mask = (0..nodes.len())
             .map(|i| {
                 let mut at = Some(i as u16);
                 let mut steps = 0;
@@ -1262,7 +1306,8 @@ impl PartStates {
                 }
                 false
             })
-            .collect()
+            .collect();
+        (mask, any)
     }
 }
 
@@ -2105,6 +2150,122 @@ mod tests {
         assert_eq!(states.hidden(&nodes, false), vec![false, false, true]);
         // Wrecked: the wreck shows and the leaf is gone with it.
         assert_eq!(states.hidden(&nodes, true), vec![false, true, false]);
+    }
+
+    #[test]
+    fn a_wreck_that_shows_nothing_but_has_pieces_is_gone_to_them() {
+        // As `pmcoutpost_gate`, Solano's villa gate (playtest 8): the
+        // root's destroyed state shows nothing, the leaf's destroyed start
+        // shows nothing, and the leaf's debris shows only in a state of
+        // its own (`DebrisState`, made an object by the collapse). Read
+        // as "nothing shown", the wreck drew whole: the closed gate stood.
+        let show = crate::name_hash("show");
+        let hide = crate::name_hash("hide");
+        let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));
+        let exit = || leaf(b"CHDR", le(&[0xdb41_017d, 0]));
+        let (gone, debris) = (0xca26_1e5b, 0x37a6_05ff);
+        let start = |part: u32, intact: u32, wrecked: Option<u32>| {
+            let mut v = vec![
+                leaf(b"STAT", le(&[START_STATES[0]])),
+                enter(),
+                leaf(b"CEXE", le(&[1, intact, 1, part, 2, SET_STATE, 3])),
+            ];
+            if let Some(w) = wrecked {
+                v.push(leaf(b"STAT", le(&[START_STATES[1]])));
+                v.push(enter());
+                v.push(leaf(b"CEXE", le(&[1, w, 1, part, 2, SET_STATE, 3])));
+            }
+            v
+        };
+        let mut stam = vec![
+            leaf(b"INFO", le(&[5, 15, 7])),
+            leaf(b"SWIT", le(&[101, 102])),
+            leaf(b"NODE", le(&[100, 3])),
+        ];
+        stam.extend(start(100, STATE_INTACT, Some(STATE_WRECKED)));
+        stam.extend([
+            leaf(b"STAT", le(&[STATE_INTACT])),
+            leaf(b"STAT", le(&[STATE_WRECKED])),
+            leaf(b"NODE", le(&[101, 4])),
+        ]);
+        stam.extend(start(101, STATE_INTACT, Some(gone)));
+        stam.extend([
+            leaf(b"STAT", le(&[STATE_INTACT])),
+            enter(),
+            leaf(b"CEXE", le(&[1, 101, 2, show, 3])),
+            exit(),
+            leaf(b"CEXE", le(&[1, 101, 2, hide, 3])),
+            leaf(b"STAT", le(&[gone])),
+            leaf(b"NODE", le(&[102, 3])),
+        ]);
+        stam.extend(start(102, STATE_INTACT, None));
+        stam.extend([
+            leaf(b"STAT", le(&[STATE_INTACT])),
+            leaf(b"STAT", le(&[debris])),
+            enter(),
+            leaf(b"CEXE", le(&[1, 102, 2, show, 3])),
+        ]);
+        let data = ucfx(&[node(b"STAM", stam)]);
+        let u = Ucfx::parse(&data).unwrap();
+        let stam = u.children(None).next().unwrap();
+        let n = |name: u32, parent: Option<u16>| Node {
+            name_hash: name,
+            flags: 0,
+            first_child: None,
+            parent,
+            next_sibling: None,
+            unk_0x0c: 0,
+            local: Default::default(),
+            inverse_bind: Default::default(),
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
+        };
+        let nodes = [n(100, None), n(101, Some(0)), n(102, Some(0))];
+        let states = PartStates::parse(&u, stam, &nodes);
+        // Intact: the leaf up, its debris hidden.
+        assert_eq!(states.hidden(&nodes, false), vec![false, false, true]);
+        // Wrecked: the leaf and its debris both hidden, not all drawn.
+        assert_eq!(states.hidden(&nodes, true), vec![false, true, true]);
+        // So the debris is a piece the gate breaks into.
+        assert_eq!(states.chunks(&nodes), vec![2]);
+    }
+
+    #[test]
+    fn a_wreck_that_shows_nothing_and_has_no_pieces_still_draws_whole() {
+        // A part whose states show nothing either way: as before, drawn
+        // whole intact and wrecked rather than not at all.
+        let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));
+        let data = ucfx(&[node(
+            b"STAM",
+            vec![
+                leaf(b"INFO", le(&[5, 15, 7])),
+                leaf(b"SWIT", le(&[101])),
+                leaf(b"NODE", le(&[100, 3])),
+                leaf(b"STAT", le(&[START_STATES[0]])),
+                enter(),
+                leaf(b"CEXE", le(&[1, STATE_INTACT, 1, 100, 2, SET_STATE, 3])),
+                leaf(b"STAT", le(&[STATE_INTACT])),
+                leaf(b"STAT", le(&[STATE_WRECKED])),
+            ],
+        )]);
+        let u = Ucfx::parse(&data).unwrap();
+        let stam = u.children(None).next().unwrap();
+        let n = |name: u32, parent: Option<u16>| Node {
+            name_hash: name,
+            flags: 0,
+            first_child: None,
+            parent,
+            next_sibling: None,
+            unk_0x0c: 0,
+            local: Default::default(),
+            inverse_bind: Default::default(),
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
+        };
+        let nodes = [n(100, None), n(101, Some(0))];
+        let states = PartStates::parse(&u, stam, &nodes);
+        assert_eq!(states.hidden(&nodes, false), vec![false, false]);
+        assert_eq!(states.hidden(&nodes, true), vec![false, false]);
     }
 
     #[test]

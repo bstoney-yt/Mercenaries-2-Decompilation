@@ -151,10 +151,15 @@ struct Options {
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
+    /// With `--screenshot` on foot: press jump ten times a second all the
+    /// way (a player spamming it), each take-off in the log.
+    jump_spam: bool,
     /// With `--screenshot` on foot: throw a grenade just before it.
     throw: bool,
     /// With `--screenshot` on foot: bash just before it.
     bash: bool,
+    /// With `--screenshot` on foot: change the rifle's clip just before it.
+    reload: bool,
     /// With `--bash`: the clip (by hash) to bash with, rather than the one
     /// chosen.
     bash_clip: Option<u32>,
@@ -304,6 +309,11 @@ struct Options {
     /// With `--mission --after-contract`: visit a faction's soldiers (`All`,
     /// `Oil`...) and hurt one, logging their sides (faction-check lines).
     visit_faction: Option<String>,
+    /// With `--mission --autoplay --after-contract`: the Enter pressed
+    /// every four seconds after the contract jumps too, as the pad's A
+    /// does; where she is while the scripts hold her controls is logged
+    /// (`held:` lines). For testing.
+    jump_with_enter: bool,
     /// With `--mission`: hit every placed prop as `--props-check` says
     /// (`vehicle`, `gun` or `blast`), once she stands in `--props-area`
     /// (x, z corners) if given, and stop ([`breakables::check`]).
@@ -452,8 +462,10 @@ fn parse_args() -> anyhow::Result<Options> {
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
+            "--jump-spam" => o.jump_spam = true,
             "--throw" => o.throw = true,
             "--bash" => o.bash = true,
+            "--reload" => o.reload = true,
             "--bash-clip" => {
                 let v = value()?;
                 o.bash_clip = Some(
@@ -508,6 +520,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--dialog-keys" => o.dialog_keys = Some(value()?),
             "--medevac" => o.medevac = Some(value()?.parse()?),
             "--visit-faction" => o.visit_faction = Some(value()?),
+            "--jump-with-enter" => o.jump_with_enter = true,
             "--props-check" => {
                 let v = value()?;
                 o.props_check = Some(breakables::HitKind::parse(&v).with_context(|| {
@@ -1569,6 +1582,11 @@ fn screenshot(
             game.combat.equip(w, 3 * combat::LAUNCHER_CLIP);
             game.combat.weapon = options.weapon.unwrap_or(combat::Weapon::Rifle);
         }
+        // `--reload`: rounds spent first, so the clip has room.
+        if options.reload {
+            let r = &mut game.combat.rifle_rounds;
+            r.clip = r.clip.saturating_sub(5);
+        }
         // `--walk-seconds`: she goes on this long (3 s by default).
         let ticks = options
             .walk_seconds
@@ -1605,13 +1623,35 @@ fn screenshot(
             // A jump takes the picture on the way up (by default), a
             // throw with the grenade still in her hand; aiming, the
             // weapon comes up for the last second.
-            let jump = options.jump && i == ticks - lead;
+            let jump = (options.jump && i == ticks - lead) || (options.jump_spam && i % 6 == 0);
+            // With --jump-with-enter too, the scripts take her controls a
+            // moment into the jump, as the contract's end does when its
+            // fanfare is closed with the pad's A (playtest 8: she hung in
+            // the air till the screen went black); where she is after.
+            if options.jump && options.jump_with_enter && i > ticks - lead {
+                if i == ticks - lead + 5 {
+                    game.input_locked = true;
+                    eprintln!("held: her controls taken 5 ticks into the jump");
+                }
+                if i % 6 == 0
+                    && let Some(p) = &game.scene.player
+                {
+                    eprintln!(
+                        "held: tick {i}, she is at {:.2}, landed {}, grounded {}, rising {:.2} m/s",
+                        p.character.position,
+                        p.landed,
+                        p.character.grounded,
+                        p.character.velocity.y
+                    );
+                }
+            }
             let trigger = combat::Trigger {
                 aim: options.aim && i + 60 >= ticks,
                 // The last shot's flash is still up for the picture.
                 fire: options.fire && i + 3 == ticks,
                 throw: options.throw && i == ticks - lead,
                 melee: options.bash && i == ticks - lead,
+                reload: options.reload && i == ticks - lead,
                 select: options.weapon.filter(|_| i == 0).or_else(|| {
                     (options.switch && i == ticks - lead).then_some(match game.combat.weapon {
                         combat::Weapon::Rifle => combat::Weapon::Rpg,
@@ -3088,6 +3128,7 @@ fn mission_for_screenshot(
     let (mut dialog_up, mut dialog_pressed) = (0.0f32, 0usize);
     let (mut medevac_done, mut medevac_from) = (false, None::<(f32, m2_math::glam::Vec3)>);
     let mut visit: Option<f32> = None;
+    let (mut locked_was, mut locked_for) = (false, 0.0f32);
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
             Some(a) => {
@@ -3105,6 +3146,39 @@ fn mission_for_screenshot(
         }
         // With --support she throws the marker the scripts hand her.
         let mut intent = intent;
+        // With --jump-with-enter, the Enter pressed after the contract (to
+        // close a fanfare) is the pad's A, which jumps too.
+        if options.jump_with_enter
+            && contract_done.is_some()
+            && i % (4.0 / tick).round() as u32 == 0
+        {
+            intent.jump = true;
+        }
+        // Where she is while the scripts hold her controls, the first
+        // few seconds of each hold (playtest 8: she hung in the air as
+        // the screen went to black).
+        if options.jump_with_enter {
+            if game.input_locked != locked_was {
+                locked_was = game.input_locked;
+                locked_for = 0.0;
+            }
+            locked_for += tick;
+            if game.input_locked
+                && locked_for <= 4.0
+                && i % (0.25 / tick).round() as u32 == 0
+                && let Some(p) = game.scene.player.as_ref()
+            {
+                eprintln!(
+                    "held: {locked_for:.2} s into the hold she is at {:.2}, landed {}, \
+                     grounded {}, falling {:.2} m/s, driving {:?}",
+                    p.character.position,
+                    p.landed,
+                    p.character.grounded,
+                    p.character.velocity.y,
+                    p.driving
+                );
+            }
+        }
         if (!options.support.is_empty() || options.cheat_check) && game.combat.to_throw {
             intent.trigger.throw = true;
         }
@@ -3489,6 +3563,11 @@ fn mission_for_screenshot(
                 game.combat.tally.line(game.combat.fired.rifle),
                 game.scene.people.idle.line(),
                 game.scene.people.fight_summary()
+            );
+            eprintln!(
+                "after contract checks {:.0} s: {}",
+                i as f32 * tick,
+                game.scene.people.checks.line()
             );
         }
         // And the strike is pictured 2 s and 6 s after its first ordnance
@@ -3897,6 +3976,23 @@ fn hijack_for_screenshot(
         return Ok(());
     };
     eprintln!("hijack: prompt \"Hijack {}\"", view.vehicle);
+    // As a player walks up, the crewman's model streams in.
+    let waiting = Instant::now();
+    while !hijacks.crew_in(game) && waiting.elapsed() < Duration::from_secs(60) {
+        let focus = game.focus();
+        game.scene.update(backend, focus)?;
+        hijacks.tick(game, &mut input, tick);
+        game.step(Intent::default(), tick);
+    }
+    eprintln!(
+        "hijack: crewman {} after {:.1} s",
+        if hijacks.crew_in(game) {
+            "in"
+        } else {
+            "not in"
+        },
+        waiting.elapsed().as_secs_f32()
+    );
     // The HUD up before she starts (its scripts load in the background).
     if hud.game.is_some() {
         let mut info = hud_info(game, None, fov, aspect);
@@ -4101,6 +4197,53 @@ fn plough_at(game: &mut Game, kind: &str) -> bool {
     else {
         return false;
     };
+    // `prop:<entity>`: a state layer's prop (Solano's villa gate,
+    // `prop:a3b32`), put up here as its layer would.
+    if let Some(e) = kind
+        .strip_prefix("prop:")
+        .and_then(|h| u32::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+    {
+        let Some(placed) = world.index.state_objects.get(&e).copied() else {
+            eprintln!("plough: {e:#x} is no state layer's prop");
+            return false;
+        };
+        let at = placed.position;
+        // Straight at it along its own facing (its z axis: a gate's way
+        // through), from whichever side she is.
+        let axis = (placed.rotation * Vec3::Z)
+            .with_y(0.0)
+            .normalize_or(Vec3::X);
+        let back = if (here - at).dot(axis) >= 0.0 {
+            axis
+        } else {
+            -axis
+        };
+        let spot = at + back * 14.0;
+        let ground = world
+            .physics
+            .island_below(spot.with_y(spot.y + 200.0), 400.0)
+            .unwrap_or(spot.y);
+        let ahead = -back;
+        let turn = Quat::from_rotation_y(ahead.x.atan2(ahead.z));
+        world.physics.remove_vehicle(id);
+        let v = &mut game.scene.vehicles[i];
+        v.id = Some(
+            world
+                .physics
+                .add_vehicle_turned(&v.spec, spot.with_y(ground + 1.0), turn),
+        );
+        let label = v.spec.label.clone();
+        game.scene.props.note_layer([e], "--plough");
+        let shown = game.scene.show_props([e]);
+        eprintln!(
+            "plough: prop {e:#x} (model {:08x}, template {:08x}) at {at:.1}, put up {shown}; \
+             the {label} parked 14 m short at {:.1}, facing it",
+            placed.model,
+            placed.template,
+            spot.with_y(ground)
+        );
+        return true;
+    }
     let wanted = |w: &m2_engine::World, o: usize| {
         let t = w.index.objects[o].template;
         let crash = w.index.template_db.crashable.get(&t).map(|c| c.how);
@@ -4553,6 +4696,14 @@ fn drive_for_screenshot(
         }
         let swing = 10;
         for i in 0..90 {
+            // `--switch`: the weapon switch pressed as a player presses it
+            // (Tab, the pad's right bumper), through the input and the
+            // game's tick, to the vehicle's other gun (playtest 8).
+            if options.switch && i == 0 {
+                let mut input = input::Input::default();
+                input.button(input::Action::SwitchWeapon, true);
+                game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+            }
             let look = if i < swing {
                 m2_math::glam::Vec2::new(options.look / swing as f32, 0.0)
             } else {
@@ -4620,6 +4771,26 @@ fn describe_vehicle_fire(game: &Game) {
     else {
         return;
     };
+    // The gun chosen, and what the HUD's gun box counts for it
+    // ([`gamehud::HudState::of`]: the machine gun's while it is chosen
+    // and has a `WeaponUI`).
+    let mg = v
+        .machine_gun()
+        .filter(|_| game.combat.vehicle_gun == 1)
+        .and_then(|(w, left)| Some((w.ui?, left, w.clip)));
+    eprintln!(
+        "drive: fire: {} chosen; gun box {}",
+        if game.combat.vehicle_gun == 1 {
+            "machine gun"
+        } else {
+            "main gun"
+        },
+        match (mg, v.rounds()) {
+            (Some((_, left, of)), _) => format!("machine gun, {left} of {of} rounds"),
+            (None, Some(left)) => format!("cannon, {left} shells"),
+            _ => "none".to_owned(),
+        }
+    );
     let body =
         v.id.zip(game.scene.world.as_ref())
             .and_then(|(id, w)| w.physics.vehicle_transform(id));
@@ -6624,8 +6795,11 @@ impl Running {
         self.audio.rotors(&self.game.scene.flights.sounding());
         let driving = self.game.driving().is_some();
         let mut remarks = self.game.combat.take_remarks();
-        if driving && !self.was_driving {
+        if driving && !self.was_driving && self.game.car_remark_due() {
             remarks.push(combat::Remark::Vehicle);
+        }
+        if !driving {
+            self.game.scripts_seated = false;
         }
         self.was_driving = driving;
         for remark in remarks {
