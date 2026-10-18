@@ -1059,6 +1059,16 @@ impl Mission {
         self.world.borrow_mut().hijack.press(button, now);
     }
 
+    /// Whether character `guid` swims (`Human.IsSwimming`).
+    pub fn set_swimming(&mut self, guid: u32, on: bool) {
+        let mut w = self.world.borrow_mut();
+        if on {
+            w.swimming.insert(guid);
+        } else {
+            w.swimming.remove(&guid);
+        }
+    }
+
     /// Whether aircraft `guid` is in the air (`Vehicle.IsFlying`).
     pub fn set_flying(&mut self, guid: u32, flying: bool) {
         self.world.borrow_mut().hijack.set_flying(guid, flying);

@@ -262,6 +262,13 @@ pub struct FightClips {
     /// the one starting nearest the rifle held ready.
     pub bash: Option<(usize, f32)>,
     pub bash_low: Option<(usize, f32)>,
+    /// Swimming: the looped stroke, and standing up out of the water. From
+    /// samples (the on-foot tables): `Swim` `EnterSwim` (handle cca02d6b)
+    /// gives c846e6fd, `Upright` `ExitSwim` (e5653a8b) 97c840ed. The
+    /// [`jump`](Self::jump) stand-in is that stroke too, as named before
+    /// the tables were read; Jennifer's own take-offs come first.
+    pub swim: Option<usize>,
+    pub swim_out: Option<usize>,
 }
 
 impl FightClips {
@@ -275,6 +282,9 @@ impl FightClips {
     pub const RUN_LOW: [u32; 4] = [0xe340_14c3, 0x2105_c540, 0x94b1_e4ac, 0x745e_b940];
     pub const JUMP: u32 = 0xc846_e6fd;
     pub const DIE: u32 = 0x479c_4a51;
+    /// The swim stroke and the climb-out (see [`FightClips::swim`]).
+    pub const SWIM: u32 = 0xc846_e6fd;
+    pub const SWIM_OUT: u32 = 0x97c8_40ed;
     /// Jennifer's running take-offs (0.93 s, 3.6 m/s), then the
     /// resident's; standing (0.37 s).
     pub const TAKEOFF: [u32; 4] = [0xdaf7_966f, 0x4fdb_3497, 0x0e18_b683, 0x47af_6321];
@@ -350,6 +360,8 @@ impl FightClips {
                 })
                 .or_else(|| by_event(Self::BASH)),
             bash_low: by_event(Self::BASH_LOW),
+            swim: find(Self::SWIM),
+            swim_out: find(Self::SWIM_OUT),
         }
     }
 

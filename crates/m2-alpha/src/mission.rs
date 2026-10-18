@@ -1158,6 +1158,13 @@ impl MissionLink {
         if let Some(g) = game.context_taken.take() {
             mission.take_context_action(g);
         }
+        // Whether she swims, for `Human.IsSwimming`.
+        let swimming = game
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.driving.is_none() && p.swimming());
+        mission.set_swimming(PLAYER, swimming);
         // A scene's camera shot, from where its two stand now.
         if let Some(shot) = game.shot.as_mut() {
             let w = mission.world().borrow();

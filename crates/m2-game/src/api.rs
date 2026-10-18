@@ -498,6 +498,8 @@ pub struct ScriptWorld {
     pub crew_riders: HashMap<u32, u32>,
     /// The player is in a scene of the scripts' (`Player.SetCinematicMode`).
     pub cinematic: bool,
+    /// Characters swimming, as the game last said (`Human.IsSwimming`).
+    pub swimming: HashSet<u32>,
     /// Strikes and designators under way.
     pub strikes: crate::airstrike::Strikes,
     /// Whether vehicle disguises work (`Player.SetVehicleDisguise`): the
@@ -1396,6 +1398,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Weapons as objects: a loadout of templates, each weapon with its own
     // reserve of ammunition.
     let human = lib("Human")?;
+    // Human.IsSwimming(character): out of her depth in the water, as the
+    // game says ([`ScriptWorld::swimming`]); a vehicle's script asks it of
+    // a character before acting (7c99e43e).
+    add(&human, "IsSwimming", |w, _, a| {
+        let on = id(a.first()).is_some_and(|g| w.swimming.contains(&g));
+        values([Value::Boolean(on)])
+    })?;
     let inventory = match human.raw_get::<Value>("Inventory")? {
         Value::Table(t) => t,
         _ => {

@@ -295,6 +295,9 @@ struct Options {
     /// With `--mission`: the keys pressed in a dialog box the scripts put
     /// up (`up`, `down`, `accept`, `back`, comma-separated), for testing.
     dialog_keys: Option<String>,
+    /// With `--screenshot` on foot and `--gait`: she goes on this long
+    /// (seconds, default 3), logging where she is each second.
+    walk_seconds: Option<f32>,
     /// With `--mission --after-contract`: this many seconds after the
     /// contract, take the pause menu's Medevac (if the scripts allow it).
     medevac: Option<f32>,
@@ -655,6 +658,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--smarter-ai" => o.smarter_ai = true,
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
             "--gates" => o.gates = true,
+            "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
             "--mission-seconds" => {
                 o.mission_seconds = value()?
                     .parse()
@@ -1561,7 +1565,11 @@ fn screenshot(
             game.combat.equip(w, 3 * combat::LAUNCHER_CLIP);
             game.combat.weapon = options.weapon.unwrap_or(combat::Weapon::Rifle);
         }
-        for i in 0..180 {
+        // `--walk-seconds`: she goes on this long (3 s by default).
+        let ticks = options
+            .walk_seconds
+            .map_or(180, |s| (s * 60.0).round() as usize);
+        for i in 0..ticks {
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
                 if i == 0 {
@@ -1593,15 +1601,15 @@ fn screenshot(
             // A jump takes the picture on the way up (by default), a
             // throw with the grenade still in her hand; aiming, the
             // weapon comes up for the last second.
-            let jump = options.jump && i == 180 - lead;
+            let jump = options.jump && i == ticks - lead;
             let trigger = combat::Trigger {
-                aim: options.aim && i >= 120,
+                aim: options.aim && i + 60 >= ticks,
                 // The last shot's flash is still up for the picture.
-                fire: options.fire && i == 177,
-                throw: options.throw && i == 180 - lead,
-                melee: options.bash && i == 180 - lead,
+                fire: options.fire && i + 3 == ticks,
+                throw: options.throw && i == ticks - lead,
+                melee: options.bash && i == ticks - lead,
                 select: options.weapon.filter(|_| i == 0).or_else(|| {
-                    (options.switch && i == 180 - lead).then_some(match game.combat.weapon {
+                    (options.switch && i == ticks - lead).then_some(match game.combat.weapon {
                         combat::Weapon::Rifle => combat::Weapon::Rpg,
                         _ => combat::Weapon::Rifle,
                     })
@@ -1609,7 +1617,7 @@ fn screenshot(
                 ..combat::Trigger::default()
             };
             if options.pickup
-                && i == 180 - lead
+                && i == ticks - lead
                 && let Some(p) = game.scene.player.as_mut()
                 && !p.start_pickup()
             {
@@ -1624,6 +1632,26 @@ fn screenshot(
                 },
                 tick,
             );
+            // With `--walk-seconds`, where she is each second: how deep the
+            // sea is over her feet, and whether she swims.
+            if options.walk_seconds.is_some()
+                && i % 60 == 59
+                && let (Some(p), Some(w)) = (&game.scene.player, &game.scene.world)
+            {
+                let at = p.character.position;
+                eprintln!(
+                    "walk: {:.0} s at {at:.1}, sea {} over her feet, {}",
+                    (i + 1) as f32 / 60.0,
+                    w.physics
+                        .water()
+                        .map_or("none".to_owned(), |s| format!("{:.2} m", s - at.y)),
+                    if p.swimming() {
+                        "swimming"
+                    } else {
+                        "on her feet"
+                    }
+                );
+            }
             if i % 30 == 0 {
                 // Keep streaming around her as she goes.
                 render(&mut backend, &mut game, fov, aspect, None)?;

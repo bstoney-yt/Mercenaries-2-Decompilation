@@ -808,11 +808,8 @@ impl Game {
                     })
                     .flatten();
                     match player.driving {
-                        // Not out of a boat into deep water.
-                        Some(i) if can_get_out(physics, &scene.vehicles[i]) => {
-                            get_out(physics, &scene.vehicles[i], player)
-                        }
-                        Some(_) => {}
+                        // Out over deep water she swims (`Player::update_swim`).
+                        Some(i) => get_out(physics, &scene.vehicles[i], player),
                         // Off the emplaced gun she mans.
                         None if self.combat.manned.is_some() => {
                             if let Some(m) = self.combat.manned.take() {
@@ -1134,7 +1131,15 @@ impl Game {
                 explosives: &mut scene.explosives,
             };
             crate::spans::time("on foot: combat", || {
-                self.combat.step(&mut field, intent.trigger, dt);
+                // Swimming, her weapons are away: nothing to fire, aim or
+                // throw (the on-foot table's `Swim` stance has no firing
+                // or aiming rows).
+                let trigger = if field.player.swimming() {
+                    crate::combat::Trigger::default()
+                } else {
+                    intent.trigger
+                };
+                self.combat.step(&mut field, trigger, dt);
             });
             crate::spans::time("on foot: vehicles hit her", || {
                 self.combat.vehicles_hit_her(&mut field, dt);
@@ -3159,8 +3164,10 @@ fn door_out(at: Mat4, spec: &VehicleSpec) -> Vec3 {
     at.transform_point3(Vec3::new(x, 0.0, door.z))
 }
 
-/// Whether she can get out of `v` where it is: not from a boat over water
-/// deeper than she can stand in ([`WADE`]).
+/// Whether she can get out of `v` where it is on her feet: not from a boat
+/// over water
+/// deeper than she can stand in ([`WADE`]); the autoplay waits for it
+/// (the player may get out anywhere, and swims).
 pub(crate) fn can_get_out(physics: &Physics, v: &ParkedVehicle) -> bool {
     let (Some(water), Some(id)) = (physics.water(), v.id.filter(|_| v.spec.is_boat())) else {
         return true;

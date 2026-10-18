@@ -49,6 +49,10 @@ m2-alpha [options]
   --gait <gait>          idle, walk, run or sprint: what characters shown
                          with --model play first; with --screenshot on the
                          island, how the player moves before the picture
+  --walk-seconds <s>     with --gait on the island: she goes on this long
+                         (default 3), logging each second where she is, how
+                         deep the sea is over her feet and whether she swims
+                         (walk lines)
   --config <file>        settings file (default m2-alpha.toml)
   --size <w>x<h>         window size
   --vsync on|off
