@@ -1686,6 +1686,15 @@ pub fn fire(lua: &Lua, event: &str, args: impl IntoLuaMulti) -> mlua::Result<usi
     fire.call::<usize>(MultiValue::from_vec(call))
 }
 
+/// `SendFlash...AnalogInput(widget, x, y)`: the movie's `function(x, y)`.
+fn analog(s: &mut Screen, a: &Args, function: &str) -> mlua::Result<MultiValue> {
+    let args = a.0.iter().skip(1).take(2).map(FlashArg::of).collect();
+    if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+        w.flash_calls.push((function.to_owned(), args));
+    }
+    Ok(MultiValue::new())
+}
+
 macro_rules! natives {
     ($($name:literal => $f:expr,)*) => {
         const NATIVES: &[(&str, Native)] = &[$(($name, $f),)*];
@@ -2281,6 +2290,14 @@ natives! {
         }
         Ok(MultiValue::new())
     },
+    // (widget, x, y): a stick's push to the movie, which `MrxGui`'s
+    // `HandleLeftAnalogInput` sends (the PDA map's cursor). Inferred: as
+    // the movie's own `leftAnalog(x, y)` (`rightAnalog`), which the GUI
+    // base's other path calls by name (`CallActionScriptCallback(
+    // "leftAnalog", { x, y })`, script d00fdf05) and the PDA's movies
+    // define.
+    "SendFlashLeftAnalogInput" => |s, _, a| analog(s, a, "leftAnalog"),
+    "SendFlashRightAnalogInput" => |s, _, a| analog(s, a, "rightAnalog"),
     // (widget, function, arguments...), as `CallActionScriptCallback`
     // unpacks them; a table in their place is taken as the arguments.
     "CallFlashScriptFunction" => |s, _, a| {
@@ -2822,6 +2839,30 @@ mod tests {
         tick(host.lua(), 0.1);
         tick(host.lua(), 0.1);
         assert_eq!(host.lua().globals().get::<i64>("ended").unwrap(), 2);
+    }
+
+    #[test]
+    fn a_sticks_push_reaches_the_movie_as_its_analog_function() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            pda = G.CreateFlashWidget()
+            G.SendFlashLeftAnalogInput(pda, 1, -0.5)
+            G.SendFlashRightAnalogInput(pda, 0, 0)
+            "#,
+        );
+        let pda = host.lua().globals().get::<u32>("pda").unwrap();
+        let calls = screen.borrow_mut().take_flash_calls();
+        let n = FlashArg::Number;
+        assert_eq!(
+            calls,
+            vec![
+                (pda, "leftAnalog".to_owned(), vec![n(1.0), n(-0.5)]),
+                (pda, "rightAnalog".to_owned(), vec![n(0.0), n(0.0)]),
+            ]
+        );
     }
 
     #[test]

@@ -56,7 +56,8 @@ const FLAGS: [(&str, Switch); 10] = [
 /// What a person template says of how they fight.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AiProfile {
-    /// `Health`: points to kill (VZ mooks 75, AT defenders 80).
+    /// `Health`: points to kill (`VZ Soldier` 100, the VZ heavies and AT
+    /// defenders 80, `VZ Soldier (Mook)` 30, the deathsquad mooks 75).
     pub health: f32,
     /// `Ai`, all 0..1: VZ soldiers 0.3, 0.5, 0.4; Chinese 0.85, 0.75,
     /// 0.8; pirates 1, 1, 0.35.
@@ -81,6 +82,12 @@ pub struct AiProfile {
     /// Carries grenades: an `EquipmentLink` names a grenade template
     /// (`Grenade (AI)`, as VZ soldiers have).
     pub grenades: bool,
+    /// `ModifierKey`: the damage table's row for what rounds and blasts
+    /// do to them (a name hash). `Human` for plain soldiers; `HumanArmor`
+    /// for the VZ heavies, defenders, elites and riot police (a quarter
+    /// of a `Bullet`, half an `Explosion`). `None`: their template names
+    /// none, and they take what a `Human` does.
+    pub modifier: Option<u32>,
 }
 
 impl Default for AiProfile {
@@ -88,7 +95,7 @@ impl Default for AiProfile {
     /// speaks for.
     fn default() -> Self {
         Self {
-            health: 75.0,
+            health: 100.0,
             aggressive: 0.3,
             offensive: 0.5,
             accuracy: 0.4,
@@ -101,6 +108,7 @@ impl Default for AiProfile {
             vision_fov: 180.0,
             flags: AiFlags::default(),
             grenades: true,
+            modifier: None,
         }
     }
 }
@@ -124,6 +132,7 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, AiProfile> {
     let perception = Table::new(db, "Perception");
     let health = Table::new(db, "Health");
     let equipment = Table::new(db, "EquipmentLink");
+    let modifier = Table::new(db, "ModifierKey");
     let names = db.names();
     // `EquipmentLink`'s template field is unnamed (54704554).
     let carries_grenades = |id: u32| {
@@ -171,6 +180,11 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, AiProfile> {
                     .first()
                     .map_or_else(AiFlags::default, |r| flags(&behaviour, r)),
                 grenades: carries_grenades(id),
+                modifier: modifier
+                    .of_template(id)
+                    .first()
+                    .and_then(|r| modifier.word(r, name_hash("ModifierKey")))
+                    .filter(|&k| k != 0),
             };
             (id, profile)
         })
@@ -200,8 +214,18 @@ mod tests {
             ("NoGrenades", 0xc51b_fdf9),
             ("NoFollow", 0x57f9_2df7),
             ("NoExitVehicle", 0x528a_268c),
+            ("ModifierKey", 0x99c2_b81f),
+            ("Human", 0xad43_1bf0),
         ] {
             assert_eq!(name_hash(name), hash, "{name}");
         }
+    }
+
+    // Nobody's template: a plain `VZ Soldier`'s 100 health, hurt as a
+    // `Human`.
+    #[test]
+    fn the_default_is_a_plain_vz_soldier() {
+        let d = AiProfile::default();
+        assert_eq!((d.health, d.modifier), (100.0, None));
     }
 }

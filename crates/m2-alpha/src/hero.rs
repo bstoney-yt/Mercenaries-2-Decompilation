@@ -30,6 +30,16 @@ impl Hero {
     pub const ALL: [Hero; 3] = [Hero::Mattias, Hero::Jennifer, Hero::Chris];
 
     /// The name the scripts and the template database know the hero by.
+    /// Full name, as the pause menu's profile line shows it (Mattias's as
+    /// in the PC footage; the others' full names, not checked there).
+    pub fn full_name(self) -> &'static str {
+        match self {
+            Hero::Mattias => "Mattias Nilsson",
+            Hero::Jennifer => "Jennifer Mui",
+            Hero::Chris => "Chris Jacobs",
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Hero::Mattias => "Mattias",

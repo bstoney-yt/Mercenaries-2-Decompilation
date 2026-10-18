@@ -35,6 +35,20 @@ const EM: f32 = 20480.0;
 /// Twips to pixels.
 const TWIPS: f32 = 20.0;
 
+/// The em a texture font's glyphs were drawn at, as a share of the
+/// texture's nominal size: a field's text is its height per em, so a
+/// glyph's texture pixels scale by `height / (nominal * TEXTURE_EM)`.
+///
+/// From samples: over all 18 font textures in `Loading`, `shell` and `vz`
+/// (all nominal 48, padding 2), the glyphs' reach above and below the
+/// baseline, less the padding, against the font's ascent + descent gives
+/// 30.4-33.2 px per em, Times New Roman's capitals (0.662 em) 33 px; and
+/// from footage: the loading screen's hint and "Loading" lines (0:20)
+/// line up best between 0.625 and 0.667 (lit-pixel IoU at the best shift,
+/// hint 0.23 at 1.0, 0.46 at 2/3; label 0.33, 0.73). Scaleform's own rule
+/// was not read; 2/3 is the fit.
+pub const TEXTURE_EM: f32 = 2.0 / 3.0;
+
 /// A text field's definition.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EditText {
@@ -48,7 +62,11 @@ pub struct EditText {
     pub align: u8,
     pub left_margin: f32,
     pub right_margin: f32,
+    /// The first line's extra indent, pixels.
+    pub indent: f32,
     pub leading: f32,
+    /// The tag's AutoSize flag.
+    pub auto_size: bool,
     pub word_wrap: bool,
     pub multiline: bool,
     pub html: bool,
@@ -58,6 +76,29 @@ pub struct EditText {
 }
 
 impl EditText {
+    /// `textWidth` and `textHeight` of `text` in this field, estimated
+    /// without the font: each character 0.55 of the font's height wide,
+    /// each line 1.2 high, and a word-wrapped field's paragraphs as many
+    /// lines as that width needs inside its 2 px gutters (inferred; a
+    /// two-line hint in the loading screen's field comes out two lines).
+    pub fn text_size(&self, text: &str) -> (f32, f32) {
+        let h = self.height;
+        let inside = (self.bounds[2] - self.bounds[0] - 4.0).max(1.0);
+        let mut longest: f32 = 0.0;
+        let mut lines = 0.0;
+        for paragraph in text.split(['\n', '\r']) {
+            let w = paragraph.chars().count() as f32 * h * 0.55;
+            if self.word_wrap && w > inside {
+                lines += (w / inside).ceil();
+                longest = longest.max(inside);
+            } else {
+                lines += 1.0;
+                longest = longest.max(w);
+            }
+        }
+        (longest, f32::max(lines, 1.0) * h * 1.2)
+    }
+
     /// Parses a `DefineEditText` tag's body.
     pub fn parse(data: &[u8]) -> Option<(u16, EditText)> {
         if data.len() < 6 {
@@ -75,6 +116,7 @@ impl EditText {
             word_wrap: f1 & 0x40 != 0,
             multiline: f1 & 0x20 != 0,
             html: f2 & 0x02 != 0,
+            auto_size: f2 & 0x40 != 0,
             ..EditText::default()
         };
         if f1 & 0x01 != 0 {
@@ -96,7 +138,7 @@ impl EditText {
             t.align = b.u8();
             t.left_margin = f32::from(b.u16()) / TWIPS;
             t.right_margin = f32::from(b.u16()) / TWIPS;
-            b.u16();
+            t.indent = f32::from(b.u16()) / TWIPS;
             t.leading = f32::from(b.u16() as i16) / TWIPS;
         }
         t.variable = b.cstr();
@@ -121,7 +163,9 @@ pub struct FontTexture {
     /// The texture's name (its file without the extension).
     pub name: String,
     pub size: [f32; 2],
-    /// The em the glyphs were drawn at, pixels.
+    /// The blank pixels left round each glyph.
+    pub pad: f32,
+    /// The texture glyphs' nominal size, pixels (see [`TEXTURE_EM`]).
     pub nominal: f32,
     pub glyphs: Vec<TextureGlyph>,
     /// A font glyph's texture glyph, by font character id.
@@ -144,7 +188,7 @@ impl FontTexture {
             .rsplit_once('.')
             .map_or(name.clone(), |(s, _)| s.to_owned());
         let size = [f32::from(b.u16()), f32::from(b.u16())];
-        b.u8();
+        let pad = f32::from(b.u8());
         let nominal = f32::from(b.u16());
         let count = usize::from(b.u16());
         let mut glyphs = Vec::with_capacity(count);
@@ -173,6 +217,7 @@ impl FontTexture {
         (b.bit / 8 <= data.len()).then_some(FontTexture {
             name,
             size,
+            pad,
             nominal,
             glyphs,
             maps,
@@ -450,6 +495,81 @@ pub fn plain(text: &str, html: bool) -> (String, Option<[f32; 4]>) {
     (out.trim_end_matches('\n').to_owned(), colour)
 }
 
+/// `text` (plain) in lines as the field `def` shows it with `font`: its
+/// own lines, word-wrapped fields' also wrapped at spaces to the box.
+fn wrap(def: &EditText, text: &str, subs: &[Substitution], font: &Font) -> Vec<String> {
+    let size = def.height;
+    let width = (def.bounds[2] - def.bounds[0] - def.left_margin - def.right_margin).max(1.0);
+    let measure = |s: &str| -> f32 {
+        pieces(s, subs)
+            .into_iter()
+            .map(|p| match p {
+                Piece::Char(c) => font.advance(c) * size,
+                Piece::Image(i) => subs[i].size[0],
+            })
+            .sum()
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        if !def.word_wrap {
+            lines.push(line.to_owned());
+            continue;
+        }
+        let mut current = String::new();
+        let mut w = 0.0;
+        for word in line.split(' ') {
+            let ww = measure(word);
+            let space = if current.is_empty() {
+                0.0
+            } else {
+                font.advance(' ') * size
+            };
+            if !current.is_empty() && w + space + ww > width {
+                // The space it breaks at stays on the line, so counts in
+                // its alignment (inferred from footage: wrapped hint lines
+                // centre half a space left of their ink; 10 lines of 4
+                // hints, centres 2.45 -> 0.25 px off).
+                current.push(' ');
+                lines.push(std::mem::take(&mut current));
+                w = 0.0;
+            } else if !current.is_empty() {
+                current.push(' ');
+                w += space;
+            }
+            current.push_str(word);
+            w += ww;
+        }
+        lines.push(current);
+    }
+    lines
+}
+
+/// `textWidth` and `textHeight` of `text` in the field `def` with `font`:
+/// its widest line, and its lines' height as [`layout`] spaces them.
+pub fn measure(def: &EditText, text: &str, font: &Font) -> (f32, f32) {
+    let (text, _) = plain(text, def.html);
+    let size = def.height;
+    let lines = wrap(def, &text, &[], font);
+    let widest = lines
+        .iter()
+        .map(|l| {
+            l.trim_end_matches(' ')
+                .chars()
+                .map(|c| font.advance(c) * size)
+                .sum::<f32>()
+        })
+        .fold(0.0, f32::max);
+    let line_height = (font.ascent + font.descent).max(1.0) * size + def.leading;
+    // No leading under the last line (inferred from footage, with the
+    // text box corner rule in avm1: the hint lines, placed by
+    // `textHeight`, tops 1.4 -> 0.4 px off; Flash's rule not read).
+    // Trailing spaces (a wrapped line's break) don't count in the width.
+    (
+        widest,
+        lines.len().max(1) as f32 * line_height - def.leading,
+    )
+}
+
 /// Lays out `text` in the field `def` with `font`, as textured quads
 /// (two triangles each), through `matrix` and `colour`, cut to `clip`.
 #[allow(clippy::too_many_arguments)]
@@ -477,40 +597,12 @@ pub fn layout(
         Piece::Char(c) => font.advance(c) * size,
         Piece::Image(i) => subs[i].size[0],
     };
-    let measure = |s: &str| -> f32 { pieces(s, subs).into_iter().map(advance).sum() };
-    // Lines: the text's own, then wrapped at spaces to the box.
-    let mut lines: Vec<String> = Vec::new();
-    for line in text.split('\n') {
-        if !def.word_wrap {
-            lines.push(line.to_owned());
-            continue;
-        }
-        let mut current = String::new();
-        let mut w = 0.0;
-        for word in line.split(' ') {
-            let ww = measure(word);
-            let space = if current.is_empty() {
-                0.0
-            } else {
-                font.advance(' ') * size
-            };
-            if !current.is_empty() && w + space + ww > width {
-                lines.push(std::mem::take(&mut current));
-                w = 0.0;
-            } else if !current.is_empty() {
-                current.push(' ');
-                w += space;
-            }
-            current.push_str(word);
-            w += ww;
-        }
-        lines.push(current);
-    }
+    let lines = wrap(def, &text, subs, font);
     let ascent = if font.ascent > 0.0 { font.ascent } else { 0.8 } * size;
     let line_height = (font.ascent + font.descent).max(1.0) * size + def.leading;
     // Flash puts the first baseline 2 px in and down by the ascent.
     let mut baseline = def.bounds[1] + 2.0 + ascent;
-    let scale = size / nominal.max(1.0);
+    let scale = size / (nominal.max(1.0) * TEXTURE_EM);
     let quad =
         |out: &mut Vec<Triangle>, p0: [f32; 2], p1: [f32; 2], uv: [f32; 4], tint, tex: &str| {
             let [u0, v0, u1, v1] = uv;

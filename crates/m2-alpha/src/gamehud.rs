@@ -9,9 +9,10 @@
 //! need for the first time decoded. Drawing lags play by a frame.
 //!
 //! The minimap is drawn here, as the engine draws its own: the island's
-//! sea round her (see [`MAP_TEXTURE`]), turned with the camera, on the
-//! radar's backdrop, with the island's roads over it ([`road_strokes`]),
-//! the zones its Flash movie would outline (see [`Zone`]), the mission's
+//! sea round her (see [`MAP_TEXTURE`]), turned with the camera that draws
+//! the frame ([`HudState::heading`]), on the radar's backdrop, with the
+//! island's roads over it ([`road_strokes`]), the zones its Flash movie
+//! would outline (see [`Zone`]), the mission's
 //! markers and her white square. Not drawn yet: the other Flash
 //! pieces (pop-ups, the PDA) and clock wipes. With no aim point
 //! the reticle's widgets are left out ([`reticle_widgets`], by the names
@@ -47,6 +48,7 @@ use m2_game::mission::{GameData, Mission};
 use m2_math::glam::Vec3;
 use mlua::{IntoLuaMulti, Lua, Table, Value};
 
+use crate::binoculars;
 use crate::combat::{Combat, Fired, Picked, RIFLE_CLIP, Rounds, Weapon};
 use crate::config::Config;
 use crate::game::Game;
@@ -54,6 +56,23 @@ use crate::hero::Hero;
 use crate::hijack::GuiCall;
 use crate::support::{self, SupportHud};
 
+/// The pause menu's movie (`MrxGuiPauseScreen._Initialize`'s `sFile`).
+const PAUSE_MOVIE: &str = crate::pause::MOVIE;
+/// The pause layout's widget (`Pause_Layout`).
+const PAUSE_LAYOUT: &str = "Pause Layout";
+/// The PC's library behind the pause menu's options (`LTILibName`): its
+/// calls are queued for the engine ([`crate::pause::Native::library`]).
+const LTI_LIBRARY: &str = r#"
+__m2_lti = {}
+LTILibName = setmetatable({}, {
+    __index = function(_, k)
+        return function(a)
+            local q = __m2_lti
+            q[#q + 1] = { tostring(k), a == nil and "" or tostring(a) }
+        end
+    end,
+})
+"#;
 /// The fonts the HUD's text widgets use.
 const FONTS: [&str; 2] = ["english_18", "english_20"];
 /// The player's guid as the scripts know her (`Sys.StringToGuid("0x1")`).
@@ -386,6 +405,10 @@ const MAX_TEXTURE: u32 = 2048;
 /// `+x` and `+z` towards its left and top edges: its sea (see
 /// [`radar_map`]), and the grey of its paved roads tells them from tracks.
 const MAP_TEXTURE: &str = "vz_lrterrain";
+/// The radar's movie, whose `roads_mc` holds the island's map of sea and
+/// roads ([`minimap::MovieMap`]): the radar's map is drawn from it, and
+/// from the terrain and the road network only without it.
+const RADAR_MOVIE: &str = "minimap";
 /// The radar's backdrop (its `sBorderTexture`), with the north pointer on
 /// its rim, `BORDER` virtual units across round a minimap 100 across.
 const BORDER_TEXTURE: &str = "global_gui_hud_radar";
@@ -439,8 +462,15 @@ pub struct HudState {
     /// Its cannon's shells, when they run out: left, and how many it
     /// carries (the AMX-30's 40, counted down in the gun box).
     pub cannon: Option<(u32, u32)>,
-    /// Which way the camera looks, degrees, growing as it turns left
-    /// (`Player.GetCameraXZHeading`).
+    /// Which way the camera that draws the frame looks, degrees, growing
+    /// as it turns left (`Player.GetCameraXZHeading`): hers in play, on
+    /// foot or driving ([`crate::game::Game::view_heading`]). The radar's
+    /// north pointer sits this far clockwise round its rim, as the PC
+    /// footage's does (from the footage: north found in every eighth of
+    /// the rim over the first contracts). That it is the camera's heading
+    /// and not her facing is from the scripts: `MinimapDataUpdateHandler`
+    /// passes the heading it is given on as the rotation; which heading
+    /// the engine gives it was not read from the 360 code.
     pub heading: f32,
     /// Hurts since the last state: damage and the bearing it came from
     /// (see [`direction`]).
@@ -490,6 +520,9 @@ pub struct HudState {
     /// The contract's objectives for the PDA: text id and icon tag each
     /// (`MissionView::pda_objectives`).
     pub pda_objectives: Vec<(String, String)>,
+    /// Her cash, as the scripts hold it (`PlayerCashChanged` tells the HUD;
+    /// the PDA's stats page reads `Player.GetCash`).
+    pub cash: Option<f64>,
     /// What the faction zones last told the HUD (`MissionView::trespass`).
     pub trespass: crate::mission::Trespass,
     /// Whether vehicle disguises work, and her disguise while one holds:
@@ -504,6 +537,19 @@ pub struct HudState {
     /// its pictures and the hijack's buttons its Xbox ones
     /// ([`gui_runtime::Screen::set_pad`]).
     pub pad: bool,
+    /// The pause menu is wanted open (Escape, the pad's Start): the
+    /// engine's `Pause` game state, which the pause layout's
+    /// `MrxGuiPauseScreen` opens its movie for.
+    pub pause: bool,
+    /// The player's settings and saves, for the pause menu's movie
+    /// ([`crate::pause`]).
+    pub pause_settings: crate::pause::Settings,
+    /// Keys and mouse buttons pressed while the pause menu's keyboard
+    /// table waited for one ([`crate::pause::News::capture`]).
+    pub pause_captured: Vec<crate::input::Control>,
+    /// Her binoculars are up: what their screen shows
+    /// ([`crate::binoculars`]).
+    pub binoculars: Option<binoculars::View>,
 }
 
 /// Flash's key code (the PC's virtual-key code) of `key`, for the keys
@@ -675,13 +721,20 @@ impl HudState {
                 })
                 .unwrap_or_default(),
             cannon: vehicle.and_then(|v| Some((v.rounds()?, v.spec.tuning.gun?.rounds))),
-            heading: game.camera.yaw.to_degrees(),
+            heading: game.view_heading().to_degrees(),
             target,
             position: at.map(|p| p.to_array()),
             facing: player.map_or(0.0, |p| p.facing.to_degrees()),
             hurts,
             sea_level: game.scene.world.as_ref().map(|w| w.settings.sea_level),
             hero: Some((game.scene.hero, game.combat.max_hp)),
+            binoculars: game.walking().and_then(|p| {
+                p.binoculars.map(|b| binoculars::View {
+                    zoom: b.zoom,
+                    heading: binoculars::wrap_degrees(game.view_heading().to_degrees()),
+                    pitch: p.pitch.to_degrees(),
+                })
+            }),
             ..Self::default()
         }
     }
@@ -699,6 +752,8 @@ impl HudState {
         keys.extend(later.keys.iter().copied());
         let mut buttons = std::mem::take(&mut self.buttons);
         buttons.extend(later.buttons.iter().cloned());
+        let mut pause_captured = std::mem::take(&mut self.pause_captured);
+        pause_captured.extend(later.pause_captured.iter().copied());
         hurts.extend(later.hurts.iter().copied());
         messages.extend(later.messages.iter().cloned());
         hud_calls.extend(later.hud_calls.iter().cloned());
@@ -710,6 +765,7 @@ impl HudState {
             gui_calls,
             keys,
             buttons,
+            pause_captured,
             ..later
         };
     }
@@ -802,8 +858,18 @@ enum Output {
         callbacks: Vec<u64>,
         /// The front end's news (nothing for the HUD).
         shell: ShellNews,
+        /// The pause menu's (nothing for the front end).
+        pause: Box<PauseOut>,
     },
     Failed(String),
+}
+
+/// What the pause menu ([`crate::pause`]) asks of play, and whether the
+/// game's own is there to open.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PauseOut {
+    news: crate::pause::News,
+    available: bool,
 }
 
 /// What the front end ([`GameHud::start_shell`]) asks of the game.
@@ -865,6 +931,10 @@ pub struct GameHud {
     dropped_fanfare: bool,
     /// The front end's latest news (see [`GameHud::start_shell`]).
     shell: ShellNews,
+    /// What the game's pause menu asked of play, not yet taken, and
+    /// whether the HUD's scripts have it ([`crate::pause`]).
+    pause_news: crate::pause::News,
+    pause_available: bool,
     log: Option<BufWriter<File>>,
 }
 
@@ -925,8 +995,21 @@ impl GameHud {
             last_call: 0,
             last_time: None,
             shell: ShellNews::default(),
+            pause_news: crate::pause::News::default(),
+            pause_available: false,
             log,
         }
+    }
+
+    /// The game's own pause menu can open: its scripts run and have its
+    /// layout ([`HudState::pause`]).
+    pub fn pause_available(&self) -> bool {
+        self.ready() && self.pause_available
+    }
+
+    /// What the game's pause menu asked of play since the last time.
+    pub fn take_pause_news(&mut self) -> crate::pause::News {
+        std::mem::take(&mut self.pause_news)
     }
 
     /// The front end's latest news.
@@ -1056,8 +1139,12 @@ impl GameHud {
                 log,
                 callbacks,
                 shell,
+                pause,
             } => {
                 self.callbacks.extend(callbacks);
+                let pause = *pause;
+                self.pause_news.merge(pause.news);
+                self.pause_available = pause.available;
                 // Handed over already (a frame queued before it in this
                 // drain broke): a later frame does not take it back.
                 if self.failed() {
@@ -1288,6 +1375,81 @@ if type(pda) == "table" and type(pda.Map) == "table" then
 end
 "#;
 
+/// The PDA map's left stick (x right, y up, -1..=1), as the game hands
+/// the map widget its `ControllerInput` event (`MrxGuiPda._HandleInput`,
+/// script 97f9c4ee: in map mode it passes `LeftAnalogX`/`Y` to the map
+/// movie's `leftAnalog`, which moves the map under its cursor). Inferred
+/// from the alpha's renders: the movie moves the map's picture by the pair
+/// as given, so the view's way across is the stick's reversed. Answers
+/// whether the PDA's map took it.
+const PDA_STICK: &str = r#"
+local x, y = ...
+local module = rawget(_G, "MrxGuiPda")
+if type(module) ~= "table" or type(module._HandleInput) ~= "function" then
+    return false
+end
+-- The PDA's widget: the one whose CustomData holds the map's movie
+-- (`oMapFlash`), found from the globals once.
+local widget = rawget(_G, "__m2_pda_widget")
+if widget == nil then
+    local seen = {}
+    local function find(t, depth)
+        if depth > 6 or seen[t] then return nil end
+        seen[t] = true
+        local cd = rawget(t, "CustomData")
+        if type(cd) == "table" and rawget(cd, "oMapFlash") ~= nil then
+            return t
+        end
+        for _, v in pairs(t) do
+            if type(v) == "table" then
+                local w = find(v, depth + 1)
+                if w then return w end
+            end
+        end
+        return nil
+    end
+    widget = find(_G, 0)
+    if widget == nil then return false end
+    rawset(_G, "__m2_pda_widget", widget)
+end
+-- It opens on its map page; the page change that says so
+-- (`_HandlePageChangeEvent`) comes only when the page is changed.
+if widget.CustomData.bMapMode == nil then
+    widget.CustomData.bMapMode = true
+end
+-- The movie moves the map's picture by the pair (right, down): up the
+-- screen is north, and the view goes against x, so x is reversed.
+module._HandleInput(widget, { LeftAnalogX = -x, LeftAnalogY = y })
+return true
+"#;
+
+/// The keys that move the PDA's map, as Flash key codes, and the way
+/// each pushes the stick (x right, y up): W A S D and the arrows.
+/// Invented: the PC game's PDA moves its cursor with these (the owner's
+/// play; the PC footage shows the cursor moving, not the keys).
+const PDA_STICK_KEYS: [(i32, [f32; 2]); 8] = [
+    (87, [0.0, 1.0]),
+    (65, [-1.0, 0.0]),
+    (83, [0.0, -1.0]),
+    (68, [1.0, 0.0]),
+    (38, [0.0, 1.0]),
+    (37, [-1.0, 0.0]),
+    (40, [0.0, -1.0]),
+    (39, [1.0, 0.0]),
+];
+
+/// The stick the PDA's movement keys `held` (Flash key codes) push.
+fn pda_stick(held: &HashSet<i32>) -> [f32; 2] {
+    let mut stick = [0.0f32; 2];
+    for (code, [x, y]) in PDA_STICK_KEYS {
+        if held.contains(&code) {
+            stick[0] += x;
+            stick[1] += y;
+        }
+    }
+    stick.map(|v| v.clamp(-1.0, 1.0))
+}
+
 /// Puts the contract in the PDA ([`CONTRACT_IN_PDA`]) with `objectives`.
 fn contract_in_pda(lua: &Lua, objectives: &[(String, String)]) -> mlua::Result<()> {
     let list = lua.create_table()?;
@@ -1453,6 +1615,8 @@ struct Told {
     in_vehicle: Option<bool>,
     /// The gun box's icon widgets as last logged ([`Thread::gun_box`]).
     gun_box: String,
+    /// Her cash as last told, in whole dollars.
+    cash: Option<i64>,
     vehicle: Option<Option<String>>,
     vehicle_templates: Option<Vec<String>>,
     target: Option<Option<(i32, i32, i32)>>,
@@ -1463,6 +1627,11 @@ struct Told {
     menu: Option<bool>,
     /// The satellite's view is open.
     satellite: bool,
+    /// What the binocular screen was last told (None: down).
+    binoculars: Option<binoculars::View>,
+    /// The zoom and the handlers that answered when the meters were last
+    /// logged.
+    binoculars_logged: Option<(u8, usize)>,
     /// What the tutorial box says (None: never anything).
     tutorial: Option<Option<String>>,
     trespass: crate::mission::Trespass,
@@ -1511,6 +1680,18 @@ struct Thread {
     pda_shown: bool,
     /// Keys for the movies' `Key` listeners ([`HudState::keys`]).
     keys: Vec<(i32, bool)>,
+    /// Whether the scripts were told the `Pause` game state was entered.
+    pause: bool,
+    /// The engine's side of the pause menu's movie, and the movie it
+    /// set up (widget, restarts).
+    pause_native: crate::pause::Native,
+    pause_movie: Option<(u32, u32)>,
+    /// The player's options as last told the HUD's scripts.
+    options_told: Option<(bool, bool, bool, bool)>,
+    /// The PDA's movement keys held ([`PDA_STICK_KEYS`]), and the stick
+    /// they last pushed its map with.
+    pda_held: HashSet<i32>,
+    pda_stick: [f32; 2],
     /// HUD updates since the PDA's movie loaded (`None`: not yet), and
     /// since `TogglePDA` was last sent.
     pda_ready: Option<u32>,
@@ -1539,6 +1720,8 @@ struct Thread {
     native: crate::shell::Native,
     /// `fscommand`s no script heard, for the engine (the front end's).
     unheard: Vec<(String, String)>,
+    /// The HUD's, with the widget whose movie said them.
+    unheard_by: Vec<(u32, String, String)>,
     /// Seconds since `M2_SHELL_PROBE` (or `M2_HUD_PROBE`) last logged.
     probe_time: f64,
     /// How many natives the scripts called that aren't made, as last
@@ -1634,7 +1817,7 @@ impl Thread {
         // the same userdata, not m2's number. The game has the dialog box
         // module loaded at boot; unloaded, its `oSystemDialogBoxFlash` is a
         // stub, and `MrxGuiPda.Open` takes that for a system dialog up.
-        // Her cash is 0, as `PlayerCashChanged` tells the HUD (the PDA's
+        // Her cash is the scripts', as `PlayerCashChanged` tells the HUD (the PDA's
         // stats page formats `Player.GetCash()`). She is the only player
         // (`UpdateAllPlayerMarkers` puts each on the PDA's map).
         mission
@@ -1643,7 +1826,7 @@ impl Thread {
                  for _, f in ipairs({\"GetLocalPlayer\", \"GetPrimaryPlayer\"}) do
                      rawset(Player, f, function() return me end)
                  end
-                 rawset(Player, \"GetCash\", function() return 0 end)
+                 rawset(Player, \"GetCash\", function() return __m2_cash or 0 end)
                  rawset(Player, \"GetAllPlayers\", function() return { me } end)
                  import(\"MrxGuiDialogBox\")
                  MrxGuiManager.CreateGui(me)",
@@ -1652,6 +1835,9 @@ impl Thread {
             .map_err(|e| e.to_string())?;
         mission
             .run(VIEW_POINT, "m2-hud view point")
+            .map_err(|e| e.to_string())?;
+        mission
+            .run(LTI_LIBRARY, "m2-hud pc library")
             .map_err(|e| e.to_string())?;
         // What the game finishes while it loads, before play: the
         // movies' load callbacks (the PDA's closes it, `_FinishLoadAndClose`;
@@ -1684,6 +1870,12 @@ impl Thread {
             reticle_logged: false,
             pda_shown: false,
             keys: Vec::new(),
+            pause: false,
+            pause_native: crate::pause::Native::default(),
+            pause_movie: None,
+            options_told: None,
+            pda_held: HashSet::new(),
+            pda_stick: [0.0; 2],
             pda_ready: None,
             since_toggle: u32::MAX,
             pda_scripted: None,
@@ -1699,6 +1891,7 @@ impl Thread {
             shell_seen: String::new(),
             native: crate::shell::Native::default(),
             unheard: Vec::new(),
+            unheard_by: Vec::new(),
             probe_time: 0.0,
             unknown_seen: 0,
             wheel_seen: String::new(),
@@ -1805,9 +1998,20 @@ impl Thread {
                 Err(e) => log.push(format!("TogglePDA: {e}")),
             }
         }
+        if state.pause != self.pause {
+            self.pause = state.pause;
+            let phase = if state.pause { "Enter" } else { "Exit" };
+            match gui_runtime::fire(self.mission.lua(), "GuiGameStateChange", ("Pause", phase)) {
+                Ok(n) => log.push(format!("pause: game state Pause {phase} ({n} handlers)")),
+                Err(e) => log.push(format!("pause: game state Pause {phase}: {e}")),
+            }
+        }
         let dt = state.dt.min(MAX_STEP);
         if let Err(e) = self.feed_support(state, dt) {
             log.push(format!("support: {e}"));
+        }
+        if let Err(e) = self.feed_binoculars(state, &mut log) {
+            log.push(format!("binoculars: {e}"));
         }
         if dt > 0.0 {
             self.mission.tick(dt);
@@ -1820,10 +2024,42 @@ impl Thread {
         // Keys go to the movie that has the controls: the mission's
         // fanfare while it is up (its Key listener's Enter continues, as
         // `_HandleFanfareInput` passes the select button on), else the PDA.
-        if self.pda_shown || self.fanfare_up() {
+        self.tell_options(&state.pause_settings, &mut log);
+        if self.pda_shown || self.fanfare_up() || self.pause_up() {
             self.keys.extend(state.keys.iter().copied());
         }
+        // The PDA's map moves while its movement keys are held, as the
+        // pad's left stick moves it.
+        for &(code, down) in &state.keys {
+            if down && self.pda_shown {
+                self.pda_held.insert(code);
+            } else {
+                self.pda_held.remove(&code);
+            }
+        }
+        if !self.pda_shown {
+            self.pda_held.clear();
+        }
+        let stick = pda_stick(&self.pda_held);
+        if stick != [0.0; 2] || self.pda_stick != [0.0; 2] {
+            let took = self
+                .mission
+                .lua()
+                .load(PDA_STICK)
+                .set_name("=m2-hud pda stick")
+                .call::<bool>((stick[0], stick[1]));
+            if stick != self.pda_stick {
+                log.push(format!("pda: stick {stick:?} ({took:?})"));
+            }
+            self.pda_stick = stick;
+        }
+        for &c in &state.pause_captured {
+            log.push(format!("pause: the keyboard table takes {c:?}"));
+            self.pause_native.captured(c);
+        }
+        self.pause_calls(state, &mut log);
         self.play_flash(dt, &mut log);
+        self.pause_answers(&mut log);
         let Some(screen) = gui_runtime::screen(self.mission.lua()) else {
             return Output::Failed("no GUI runtime".into());
         };
@@ -1868,8 +2104,14 @@ impl Thread {
         }
         log.extend(screen.borrow_mut().take_log());
         log.extend(self.mission.take_log());
-        // The scripts' own commands (sounds, camera) are not the HUD's.
-        let _ = self.mission.take_commands();
+        // The scripts' own commands (sounds, camera) are not the HUD's,
+        // but the game states the pause menu's ask for (leaving it).
+        for c in self.mission.take_commands() {
+            if let m2_game::api::Command::GameState(s) = c {
+                log.push(format!("pause: the scripts ask for game state {s}"));
+                self.pause_native.game_state(&s);
+            }
+        }
         let names = gui_runtime::script_names(self.mission.lua());
         let zones = self.zones(&names);
         if zones.len() != self.zones.len() {
@@ -1944,6 +2186,13 @@ impl Thread {
                 ));
             }
             Some(keep)
+        } else if state.binoculars.is_some() {
+            // Through the binoculars only their screen shows: the scripts
+            // put the HUD to sleep (`ToggleHud(owner, false, "scope")`),
+            // which leaves some of it awake here.
+            Some(widgets_under(&screen.borrow(), &names, |n| {
+                n == "Binoculars"
+            }))
         } else {
             state.support.satellite.map(|_| {
                 widgets_under(&screen.borrow(), &names, |n| {
@@ -1952,8 +2201,12 @@ impl Thread {
             })
         };
         // No aim point: the reticle's widgets are left out (not the
-        // satellite's own, its crosshair).
-        let hidden = match state.reticle.or(state.support.satellite.map(|_| [0.0; 2])) {
+        // satellite's own, its crosshair, nor the binoculars').
+        let hidden = match state
+            .reticle
+            .or(state.support.satellite.map(|_| [0.0; 2]))
+            .or(state.binoculars.map(|_| [0.0; 2]))
+        {
             Some(_) => HashSet::new(),
             None => {
                 let hidden = reticle_widgets(&screen.borrow(), &names);
@@ -2064,11 +2317,15 @@ impl Thread {
                     let image = match radar_map(&mut self.assets, sea) {
                         Ok((i, roads)) => {
                             let paved = roads.iter().filter(|r| r.paved).count();
+                            let from = if roads.iter().any(|r| r.width.is_some()) {
+                                format!("the radar movie's map, {} road strokes", roads.len())
+                            } else {
+                                format!("sea at {sea} m, {} roads ({paved} paved)", roads.len())
+                            };
                             log.push(format!(
-                                "radar map: {}x{}, sea at {sea} m, {} roads ({paved} paved), in {:.0?}",
+                                "radar map: {}x{}, {from}, in {:.0?}",
                                 i.width,
                                 i.height,
-                                roads.len(),
                                 started.elapsed()
                             ));
                             self.roads = roads;
@@ -2105,6 +2362,10 @@ impl Thread {
             log,
             callbacks,
             shell: ShellNews::default(),
+            pause: Box::new(PauseOut {
+                news: self.pause_native.take_news(),
+                available: names.values().any(|n| n == PAUSE_LAYOUT),
+            }),
         }
     }
 
@@ -2304,6 +2565,7 @@ impl Thread {
                 under,
                 new_game,
             },
+            pause: Box::default(),
         }
     }
 
@@ -2314,6 +2576,92 @@ impl Thread {
     /// A fanfare movie is playing (`fanfare_mission`...).
     fn fanfare_up(&self) -> bool {
         self.flash.values().any(|m| m.swf.contains("fanfare"))
+    }
+
+    /// The pause menu's movie is playing.
+    fn pause_up(&self) -> bool {
+        self.flash.values().any(|m| m.swf == PAUSE_MOVIE)
+    }
+
+    /// The engine's calls into the pause menu's movie: set up as it
+    /// starts (again when the scripts load it again), then its answers.
+    fn pause_calls(&mut self, state: &HudState, log: &mut Vec<String>) {
+        let movie = self
+            .flash
+            .iter()
+            .find(|(_, m)| m.swf == PAUSE_MOVIE)
+            .map(|(&id, m)| (id, m.restarts));
+        if movie != self.pause_movie {
+            self.pause_movie = movie;
+            self.pause_native.reset();
+        }
+        let Some((id, _)) = movie else {
+            return;
+        };
+        let calls = self.pause_native.calls(&state.pause_settings);
+        if let Some(m) = self.flash.get_mut(&id) {
+            for (name, args) in calls {
+                log.push(format!(
+                    "pause: the engine calls {name}({} args)",
+                    args.len()
+                ));
+                m.rt.call(name, &args);
+            }
+        }
+    }
+
+    /// The scripts' calls to the PC's library ([`LTI_LIBRARY`]) and the
+    /// pause movie's commands no script heard, for the engine.
+    fn pause_answers(&mut self, log: &mut Vec<String>) {
+        let lua = self.mission.lua();
+        let globals = lua.globals();
+        let calls: Vec<(String, String)> = globals
+            .raw_get::<Option<mlua::Table>>("__m2_lti")
+            .ok()
+            .flatten()
+            .map(|t| {
+                t.sequence_values::<mlua::Table>()
+                    .flatten()
+                    .filter_map(|c| Some((c.get(1).ok()?, c.get(2).ok()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !calls.is_empty() {
+            let _ = globals.raw_set("__m2_lti", lua.create_table().ok());
+        }
+        for (name, arg) in calls {
+            let answered = self.pause_native.library(&name, &arg);
+            log.push(format!(
+                "pause: LTILibName.{name}({arg}){}",
+                if answered { "" } else { " not answered" }
+            ));
+        }
+        let pause = self.pause_movie.map(|(id, _)| id);
+        for (id, command, arg) in std::mem::take(&mut self.unheard_by) {
+            if Some(id) == pause && self.pause_native.command(&command, &arg) {
+                log.push(format!("pause: the engine hears {command}({arg})"));
+            }
+        }
+    }
+
+    /// The player's options the HUD's own scripts read (`Sys.*`), as they
+    /// change.
+    fn tell_options(&mut self, s: &crate::pause::Settings, log: &mut Vec<String>) {
+        let told = (s.subtitles, s.tutorials, s.rumble, s.invert_pad);
+        if self.options_told == Some(told) {
+            return;
+        }
+        self.options_told = Some(told);
+        self.mission.set_subtitles(s.subtitles);
+        self.mission.set_tutorials(s.tutorials);
+        let set = format!(
+            "rawset(Sys, \"RumbleEnabled\", function() return {} end)
+             rawset(Sys, \"YAxisInverted\", function() return {} end)",
+            s.rumble, s.invert_pad
+        );
+        if let Err(e) = self.mission.run(&set, "m2-hud options") {
+            log.push(format!("options: {e}"));
+        }
     }
 
     fn play_flash(&mut self, dt: f64, log: &mut Vec<String>) {
@@ -2415,12 +2763,16 @@ impl Thread {
                 "flash: key {code} {}",
                 if down { "down" } else { "up" }
             ));
+            // The pause menu over all holds them; else a fanfare.
+            let pause = self.pause_up();
             let fanfare = self.fanfare_up();
-            for m in self
-                .flash
-                .values_mut()
-                .filter(|m| !fanfare || m.swf.contains("fanfare"))
-            {
+            for m in self.flash.values_mut().filter(|m| {
+                if pause {
+                    m.swf == PAUSE_MOVIE
+                } else {
+                    !fanfare || m.swf.contains("fanfare")
+                }
+            }) {
                 if down {
                     m.rt.key_down(code);
                 } else {
@@ -2488,6 +2840,8 @@ impl Thread {
                     ));
                     if self.mode == Mode::Shell {
                         self.unheard.push((command, arg));
+                    } else {
+                        self.unheard_by.push((id, command, arg));
                     }
                 }
                 Err(e) => log.push(format!("flash: widget {id}: {command}: {e}")),
@@ -2603,6 +2957,18 @@ impl Thread {
             lua.load(FUEL).set_name("=m2-hud fuel").call::<()>(0)?;
             let t = table(lua, [("nX", Value::Integer(0)), ("nY", Value::Integer(0))])?;
             fire(lua, "GuiReticlePositionChange", t)?;
+        }
+        // Her cash, whenever the scripts' changes.
+        let cash = s.cash.map(|c| c.round() as i64);
+        if cash.is_some() && cash != self.told.cash {
+            self.told.cash = cash;
+            let n = cash.unwrap_or(0) as f64;
+            lua.globals().set("__m2_cash", n)?;
+            let t = table(
+                lua,
+                [("uGuid", guid_value(PLAYER)), ("nValue", Value::Number(n))],
+            )?;
+            fire(lua, "PlayerCashChanged", t)?;
         }
         // The satellite looks down with north up: its compass reads the
         // camera's heading as the view opens.
@@ -2875,6 +3241,86 @@ impl Thread {
                 .call::<()>((r.name.as_str(), red, green, blue, alpha, r.invert))?;
         }
         self.told.regions = Some(s.radar_regions.clone());
+        Ok(())
+    }
+
+    /// Feeds the binocular screen the engine's events, as
+    /// `MrxGuiBinoculars` takes them ([`crate::binoculars`]):
+    /// `BinocularsEnter` as they come up, `BinocularsUpdate` with the
+    /// heading, pitch and zoom while they are up, `BinocularsExit` as they
+    /// go down. The faction badge is told a number (none: put away) and the
+    /// name under the reticle is not told.
+    fn feed_binoculars(&mut self, s: &HudState, log: &mut Vec<String>) -> mlua::Result<()> {
+        let lua = self.mission.lua();
+        let was = self.told.binoculars;
+        if was.is_none() && s.binoculars.is_none() {
+            return Ok(());
+        }
+        let event = |kind: &str| -> mlua::Result<Table> {
+            let t = lua.create_table()?;
+            t.raw_set("EventType", kind)?;
+            t.raw_set("uPlayerGuid", guid_value(PLAYER))?;
+            Ok(t)
+        };
+        match (was, s.binoculars) {
+            (None, Some(_)) => {
+                let t = event("BinocularsEnter")?;
+                t.set("bSniper", false)?;
+                let n = gui_runtime::fire(lua, "BinocularsEnter", t)?;
+                log.push(format!("binoculars: up ({n} handlers)"));
+            }
+            (Some(_), None) => {
+                let n = gui_runtime::fire(lua, "BinocularsExit", event("BinocularsExit")?)?;
+                log.push(format!("binoculars: down ({n} handlers)"));
+            }
+            _ => {}
+        }
+        // Each frame while they are up, as the engine does: the meters'
+        // handlers answer only once the frame has closed in
+        // (`_FinishEnter` enables them).
+        if let Some(v) = s.binoculars {
+            let t = event("BinocularsUpdate")?;
+            t.set("nCameraHeading", f64::from(v.heading))?;
+            t.set("nPitch", f64::from(v.pitch))?;
+            t.set("nZoomLevel", f64::from(v.zoom))?;
+            t.set("FactionTexture", 0)?;
+            let n = gui_runtime::fire(lua, "BinocularsUpdate", t)?;
+            if self.told.binoculars_logged != Some((v.zoom, n)) {
+                self.told.binoculars_logged = Some((v.zoom, n));
+                // Where the handlers put the meters' pointers: the
+                // pointer's middle from its meter's, a share of the
+                // meter's length, against the share their sums give.
+                let names = gui_runtime::script_names(lua);
+                let mut at = Vec::new();
+                if let Some(screen) = gui_runtime::screen(lua) {
+                    let screen = screen.borrow();
+                    for (id, name) in &names {
+                        let (across, want) = match name.as_str() {
+                            "top pointer" => (true, binoculars::heading_meter(v.heading)),
+                            "left pointer" => (false, binoculars::pitch_meter(v.pitch)),
+                            "right pointer" => (false, binoculars::zoom_meter(f32::from(v.zoom))),
+                            _ => continue,
+                        };
+                        let Some(bar) = screen.widget(*id).and_then(|w| w.parent) else {
+                            continue;
+                        };
+                        let (p, b) = (screen.rect(*id), screen.rect(bar));
+                        let i = if across { 0 } else { 1 };
+                        let mid = |r: [f32; 4]| (r[i] + r[i + 2]) * 0.5;
+                        let share = (mid(p) - mid(b)) / (b[i + 2] - b[i]).max(1e-3);
+                        at.push(format!("{name} {share:.3} (sums {want:.3})"));
+                    }
+                }
+                log.push(format!(
+                    "binoculars: zoom {}x heading {:.1} pitch {:.1} ({n} handlers): {}",
+                    v.zoom,
+                    v.heading,
+                    v.pitch,
+                    at.join(", ")
+                ));
+            }
+        }
+        self.told.binoculars = s.binoculars;
         Ok(())
     }
 
@@ -3205,7 +3651,11 @@ impl Thread {
                 ..
             } => {
                 if let Some(m) = self.flash.get(widget) {
-                    flash_prims(m, &self.movies.borrow(), *rect, *fullscreen, out, want);
+                    // The pause menu fills the screen, its stage stretched
+                    // across (the PC footage: its 850 x 720 stage spans
+                    // the 1280 x 720 picture, 1.5 times wider than high).
+                    let fit = *fullscreen && m.swf != PAUSE_MOVIE;
+                    flash_prims(m, &self.movies.borrow(), *rect, fit, out, want);
                 }
             }
             // Not drawn yet (see the module docs).
@@ -3501,6 +3951,16 @@ fn radar_map(
         .map_err(|e| e.to_string())?;
     let rgba = texture.mips.first().ok_or("no mips")?;
     let (width, height) = (texture.width as usize, texture.height as usize);
+    if let Some(map) = movie_map(assets) {
+        return Ok((
+            Image {
+                width: texture.width,
+                height: width as u32,
+                rgba: map.image(width, ISLAND),
+            },
+            map.roads,
+        ));
+    }
     let index = WorldIndex::build(assets).map_err(|e| e.to_string())?;
     let mut heights = Heights::new(width, ISLAND);
     for (&hash, centre) in &index.tiles {
@@ -3533,6 +3993,14 @@ fn radar_map(
         },
         roads,
     ))
+}
+
+/// The radar movie's own map (see [`minimap::MovieMap`]), if it reads.
+fn movie_map(assets: &mut AssetSource<BufReader<File>>) -> Option<minimap::MovieMap> {
+    let data = assets.asset(name_hash(RADAR_MOVIE), MOVIE_TYPE).ok()?;
+    let lib = flash::Library::new(&movie_from_asset(&data).ok()?);
+    let (shape, mesh) = minimap::roads_shape(&lib)?;
+    Some(minimap::MovieMap::new(shape, mesh))
 }
 
 /// How dark the scene goes behind the PDA (the black's alpha): the
@@ -4032,10 +4500,12 @@ fn road_strokes(view: &MapView, roads: &[Road], out: &mut Vec<Prim>, want: &mut 
     let period = minimap::DASH + minimap::DASH_GAP;
     let at = [view.player[0], view.player[2]];
     for road in roads.iter().filter(|road| road.near(at, view.range)) {
-        let width = if road.paved {
-            minimap::PAVED_WIDTH
-        } else {
-            minimap::ROAD_WIDTH
+        // A stroke of the movie's map is so many metres across, as the
+        // movie's strokes widen with its map.
+        let width = match road.width {
+            Some(metres) => metres / view.range.max(1.0),
+            None if road.paved => minimap::PAVED_WIDTH,
+            None => minimap::ROAD_WIDTH,
         };
         let half = r * width / 2.0;
         // Metres along the road, for its dashes to run on unbroken.
@@ -4744,6 +5214,29 @@ mod tests {
     }
 
     #[test]
+    fn a_stroke_of_the_movie_map_widens_with_the_map() {
+        // A 12 m stroke across the middle of a minimap 200 across.
+        let road = Road::stroke(vec![[-50.0, 0.0], [50.0, 0.0]], 12.0);
+        let across = |range: f32| {
+            let view = MapView {
+                rect: [0.0, 0.0, 200.0, 200.0],
+                player: [0.0; 3],
+                heading: 0.0,
+                range,
+            };
+            let (mut out, mut want) = (Vec::new(), Vec::new());
+            road_strokes(&view, std::slice::from_ref(&road), &mut out, &mut want);
+            assert_eq!(out.len(), 1, "solid: one quad");
+            let [a, _, _, d] = out[0].corners;
+            (a[0] - d[0]).hypot(a[1] - d[1])
+        };
+        // 12 m of 150 m to the rim, of a radius of 100: 8 across; twice
+        // as far out, half as wide.
+        assert!((across(150.0) - 8.0).abs() < 1e-3, "{}", across(150.0));
+        assert!((across(300.0) - 4.0).abs() < 1e-3);
+    }
+
+    #[test]
     fn roads_are_cut_at_the_minimap_rim() {
         // Across the middle of a disc of radius 10 from well outside it.
         let (t0, t1) = clip_to_disc([-20.0, 0.0], [20.0, 0.0], [0.0, 0.0], 10.0).unwrap();
@@ -5018,6 +5511,8 @@ mod paint_tests {
             last_message: None,
             last_call: 0,
             last_time: None,
+            pause_news: crate::pause::News::default(),
+            pause_available: false,
             log: None,
         }
     }
@@ -5091,6 +5586,7 @@ mod paint_tests {
             log: log.iter().map(|l| (*l).to_owned()).collect(),
             callbacks: Vec::new(),
             shell: ShellNews::default(),
+            pause: Box::default(),
         }
     }
 

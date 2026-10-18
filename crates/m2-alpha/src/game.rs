@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use m2_engine::atmosphere::AtmosphereMix;
-use m2_engine::durability::Explosion;
+use m2_engine::durability::{CrashHow, Explosion};
 use m2_engine::physics::FLOAT_DEPTH;
 use m2_engine::{
     CatalogueEntry, Install, Physics, StaticKey, Templates, VehicleControls, VehicleSpec, World,
@@ -12,6 +12,7 @@ use m2_engine::{
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3, Vec4, Vec4Swizzles};
 use m2_render::View;
 
+use crate::binoculars::Binoculars;
 use crate::camera::FlyCamera;
 use crate::combat::{self, Combat, Effect, Field, Weapon};
 use crate::config::CameraConfig;
@@ -86,6 +87,22 @@ const TOPPLE: f32 = 0.3;
 /// (metres).
 const BOMB_DROP: f32 = 600.0;
 
+/// A move by the scripts longer than this, metres, is a load with the
+/// loading screen up (inferred: the footage shows it on the move to PMC
+/// HQ at 19:54; the length that makes one is not known).
+pub const FAR_TELEPORT: f32 = 300.0;
+/// Seconds an arrival's load lasts at least, and at most (invented; the
+/// footage's screen there is up about 4 s with its wipes).
+pub const ARRIVAL_MIN: f32 = 1.0;
+pub const ARRIVAL_CAP: f32 = 20.0;
+
+/// Whether an arrival's load `t` seconds in is over: its place `in_place`
+/// (nothing near still loading) after [`ARRIVAL_MIN`], or at
+/// [`ARRIVAL_CAP`] whatever.
+fn arrived(t: f32, in_place: bool) -> bool {
+    t >= ARRIVAL_CAP || (t >= ARRIVAL_MIN && in_place)
+}
+
 #[derive(Debug)]
 pub struct Game {
     pub scene: Scene,
@@ -108,12 +125,23 @@ pub struct Game {
     pub traffic: crate::traffic::Traffic,
     /// Vehicles the mission scripts send along a path (`crate::paths`).
     pub paths: crate::paths::PathMoves,
+    /// Traffic on the road network (`crate::roads`).
+    pub roads: crate::roads::RoadTraffic,
+    /// With `M2_LIFE_CENSUS=<seconds>` (or `--traffic`): how often to log
+    /// what lives near her ([`Game::life_census`]), the seconds run and
+    /// the seconds since the last.
+    pub census: Option<(f32, f32, f32)>,
     /// Seconds to the next look for the island's vehicles near the player.
     vehicle_wait: f32,
     /// The layers the game starts with, which the island's vehicles come
     /// from; `None` places them from every static layer (`--mission`,
     /// where the scripts' own layers rule).
     pub startup: Option<Startup>,
+    /// Seconds since the scripts moved her far ([`teleported`]), while
+    /// the place she came to still loads: the loading screen is up.
+    ///
+    /// [`teleported`]: Self::teleported
+    pub arrival: Option<f32>,
     /// The start-up's state layers have their models up.
     props_up: bool,
     /// The driver's throttle last tick, -1 (reverse) to 1.
@@ -128,6 +156,9 @@ pub struct Game {
     /// health when it last stepped (hurt, a call is called off).
     pub support: Support,
     support_hp: f32,
+    /// Money she has picked up since the scripts last heard: cash and
+    /// fuel ([`crate::mission::MissionLink`] gives them to the scripts).
+    pub earned: Vec<(u32, u32)>,
     /// The soldier script's count of deaths and rolls: what the dead
     /// leave ([`crate::drops`]), and how many have.
     drops: Drops,
@@ -135,6 +166,8 @@ pub struct Game {
     /// The pickups she has stood at and left lying, each logged once
     /// with why.
     refused: std::collections::HashSet<(u32, u32)>,
+    /// The pickups, crates and emplaced guns the state layers place.
+    pub placed: crate::placed::Placed,
     /// The scripts have turned her controls off (a loading fade).
     pub input_locked: bool,
     /// The field of view (degrees, bottom to top) and the screen's width
@@ -214,17 +247,25 @@ impl Game {
             fetched: HashSet::new(),
             traffic: crate::traffic::Traffic::default(),
             paths: crate::paths::PathMoves::default(),
+            roads: crate::roads::RoadTraffic::default(),
+            census: std::env::var("M2_LIFE_CENSUS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(|every: f32| (every, 0.0, every)),
             vehicle_wait: 0.0,
             startup: None,
+            arrival: None,
             props_up: false,
             throttle: 0.0,
             spray_wait: 0.0,
             sky: AtmosphereMix::default(),
             moving: MovingProps::default(),
             support: Support::default(),
+            earned: Vec::new(),
             drops: Drops::default(),
             dropped: 0,
             refused: std::collections::HashSet::new(),
+            placed: crate::placed::Placed::default(),
             input_locked: false,
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
@@ -420,10 +461,11 @@ impl Game {
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
         // Traffic has its own limit.
         let traffic = &self.traffic;
+        let roads = &self.roads;
         let mut placed = scene
             .vehicles
             .iter()
-            .filter(|v| v.spot.is_some_and(|(e, _, _)| !traffic.owns(e)))
+            .filter(|v| v.spot.is_some_and(|(e, _, _)| !traffic.owns(e)) && !roads.owns(v))
             .count();
         let mut loads = Vec::new();
         for (_, t) in wanted {
@@ -440,6 +482,10 @@ impl Game {
                 "island vehicle {:#x}: {} as {}",
                 t.entity, t.name, models[0].label
             );
+            // A vehicle's ruin stands wrecked.
+            if crate::mission::is_ruin(&world.index.template_db, t.name) {
+                scene.ruins.insert(t.entity);
+            }
             let crew = world.index.template_db.crew(t.name);
             loads.push((t.entity, t.at, t.yaw, crew, models));
         }
@@ -455,9 +501,17 @@ impl Game {
         }
         if self.on_foot {
             let mut intent = Intent::from_input(input, config, mouse_look);
+            let toggle = input.take_pressed(Action::Binoculars);
+            let zoom = i32::from(input.take_pressed(Action::ZoomIn))
+                - i32::from(input.take_pressed(Action::ZoomOut));
+            let switch = input.take_pressed(Action::SwitchWeapon);
+            if self.binoculars(toggle, zoom, switch, &mut intent) {
+                self.step(intent, dt);
+                return;
+            }
             // The pad's switch: the other of the rifle and what she
             // carries in the launcher's place.
-            if input.take_pressed(Action::SwitchWeapon) && intent.trigger.select.is_none() {
+            if switch && intent.trigger.select.is_none() {
                 intent.trigger.select = Some(match self.combat.weapon {
                     Weapon::Rifle => Weapon::Rpg,
                     _ => Weapon::Rifle,
@@ -465,18 +519,138 @@ impl Game {
             }
             self.step(intent, dt);
         } else {
+            if let Some(p) = self.scene.player.as_mut() {
+                p.binoculars = None;
+            }
             self.camera.update(input, config, mouse_look, dt);
             self.step(Intent::default(), dt);
         }
     }
 
+    /// Her binoculars ([`crate::binoculars`]): `toggle` puts them up or
+    /// down, `zoom` steps their zoom (the wheel) and `switch` steps it up
+    /// and round (Tab, the pad's right bumper). They come up only on
+    /// foot, standing, with no support call or PDA in hand, and go down
+    /// when that changes or the support menu or PDA is asked for. While
+    /// they are up she stands and only looks, slower by the zoom: `intent`
+    /// is cut down to that, and true is returned.
+    fn binoculars(&mut self, toggle: bool, zoom: i32, switch: bool, intent: &mut Intent) -> bool {
+        let busy = self.support.busy() || self.support.pda;
+        let Some(player) = self.scene.player.as_mut() else {
+            return false;
+        };
+        let free = player.driving.is_none() && !player.down && player.landed && !busy;
+        let wanted = intent.trigger.support || intent.trigger.pda;
+        player.binoculars = match player.binoculars {
+            Some(_) if toggle || !free || wanted => None,
+            None if toggle && free => Some(Binoculars::default()),
+            b => b,
+        };
+        let Some(b) = &mut player.binoculars else {
+            return false;
+        };
+        b.step(zoom);
+        if switch && zoom == 0 {
+            b.cycle();
+        }
+        let look = intent.look * b.look_scale();
+        *intent = Intent {
+            look,
+            ..Intent::default()
+        };
+        true
+    }
+
+    /// The scripts moved her from `from` to `to`: past [`FAR_TELEPORT`]
+    /// that is a load (the second contract's end takes her to PMC HQ), and
+    /// the loading screen stays up while the place loads.
+    pub fn teleported(&mut self, from: Vec3, to: Vec3) {
+        if from.distance(to) > FAR_TELEPORT {
+            self.arrival = Some(0.0);
+        }
+    }
+
+    /// The arrival's load, `dt` seconds on: over once her surroundings are
+    /// in (after [`ARRIVAL_MIN`]), or after [`ARRIVAL_CAP`] whatever.
+    fn arrive(&mut self, dt: f32) {
+        let Some(t) = &mut self.arrival else { return };
+        *t += dt;
+        let counts = self.scene.props.counts();
+        let in_place = counts.loading + counts.waiting_near == 0
+            && self
+                .scene
+                .world
+                .as_ref()
+                .is_none_or(|w| w.stats().pending == 0);
+        if arrived(*t, in_place) {
+            eprintln!("arrival: loaded after {t:.1} s");
+            self.arrival = None;
+        }
+    }
+
+    /// What lives near the player, for measuring against the footage: the
+    /// vehicles moving within 150 m (and of them, the road traffic's), and
+    /// the people standing within 100 m (fighting or not).
+    pub fn life_census(&self) -> String {
+        let focus = self.focus();
+        let near = |p: m2_math::glam::Vec3, d: f32| {
+            m2_math::glam::Vec2::new(p.x - focus.x, p.z - focus.z).length() < d
+        };
+        let (mut moving, mut road) = (0, 0);
+        if let Some(world) = &self.scene.world {
+            for v in &self.scene.vehicles {
+                let Some(id) = v.id.filter(|_| !v.wrecked) else {
+                    continue;
+                };
+                let Some(m) = world.physics.vehicle_transform(id) else {
+                    continue;
+                };
+                if near(m.w_axis.truncate(), 150.0) && world.physics.vehicle_speed(id) > 2.0 {
+                    moving += 1;
+                    road += usize::from(self.roads.owns(v));
+                }
+            }
+        }
+        let people = &self.scene.people.npcs;
+        let about = people
+            .iter()
+            .filter(|n| n.alive && near(n.character.position, 100.0));
+        let soldiers = about.clone().filter(|n| n.soldier).count();
+        let others = about.count() - soldiers;
+        let zone = self.scene.world.as_ref().and_then(|w| {
+            let people = &self.scene.people;
+            let zones = w
+                .index
+                .zones
+                .iter()
+                .filter(|z| people.layer_in(Some(z.layer)));
+            m2_engine::population::zone_at(zones, focus.x, focus.z)
+        });
+        let zone = zone.map_or("none".to_owned(), |z| {
+            format!("{} ({} vehicles, {} people)", z.name, z.vehicles, z.people)
+        });
+        format!(
+            "{moving} vehicles moving within 150 m ({road} road traffic), {others} people within 100 m not fighting, {soldiers} soldiers; zone {zone}"
+        )
+    }
+
     /// One fixed tick with `intent` for the player (ignored while flying).
     pub fn step(&mut self, intent: Intent, dt: f32) {
+        if let Some((every, run, since)) = &mut self.census {
+            *run += dt;
+            *since += dt;
+            if *since >= *every {
+                *since = 0.0;
+                let run = *run;
+                eprintln!("life at {run:.0} s: {}", self.life_census());
+            }
+        }
         self.update_sky(dt);
         let focus = self.focus();
         self.moving.update(&mut self.scene, focus, dt);
         self.startup_props();
         self.fetch_world_vehicles(dt);
+        self.arrive(dt);
         let intent = if self.input_locked {
             Intent::default()
         } else {
@@ -489,6 +663,20 @@ impl Game {
             let people = &self.scene.people;
             self.traffic
                 .spawn(&self.scene, focus, |l| people.layer_in(l), dt);
+        }
+        // The road traffic comes on foot and at the wheel alike, as the
+        // traffic zone there says, as do the passers-by.
+        if self.scene.player.as_ref().is_some_and(|p| p.landed) {
+            let focus = self.focus();
+            let layers = self.scene.people.state_layers.clone();
+            let layer_in = |l: u32| layers.as_ref().is_none_or(|set| set.contains(&l));
+            if let Some(world) = &self.scene.world {
+                let zones = world.index.zones.iter().filter(|z| layer_in(z.layer));
+                self.scene.people.walker_cap =
+                    m2_engine::population::zone_at(zones, focus.x, focus.z)
+                        .map_or(0, |z| z.people as usize);
+            }
+            self.roads.spawn(&mut self.scene, focus, layer_in, dt);
         }
         let intent = self.call_support(intent, dt);
         // The use key at what lies within reach: taken with the fight's.
@@ -513,15 +701,63 @@ impl Game {
                     park(physics, &mut scene.vehicles, player, self.park_tries);
                 }
                 if intent.use_pressed {
+                    // The emplaced gun she would man, if nothing nearer
+                    // takes the key.
+                    let manning = (player.driving.is_none()
+                        && self.combat.manned.is_none()
+                        && scene.flights.within(player.character.position).is_none())
+                    .then(|| {
+                        self.placed.emplacement_near(
+                            &scene.props,
+                            &world.index.template_db,
+                            player.character.position,
+                        )
+                    })
+                    .flatten();
                     match player.driving {
                         // Not out of a boat into deep water.
                         Some(i) if can_get_out(physics, &scene.vehicles[i]) => {
                             get_out(physics, &scene.vehicles[i], player)
                         }
                         Some(_) => {}
+                        // Off the emplaced gun she mans.
+                        None if self.combat.manned.is_some() => {
+                            if let Some(m) = self.combat.manned.take() {
+                                eprintln!(
+                                    "placed: she leaves the emplaced gun {:#x} with {} rounds",
+                                    m.entity, m.rounds
+                                );
+                            }
+                        }
                         // What lies within reach before any vehicle.
                         None if scene.flights.within(player.character.position).is_some() => {
                             taking = true;
+                        }
+                        // An emplaced gun, before any vehicle.
+                        None if manning.is_some() => {
+                            let Some(m) = manning else { unreachable!() };
+                            eprintln!(
+                                "placed: she mans {} ({:#x}) at {:.1}: {} ({} rounds, {:.0} a \
+                                 minute), turning {:.0}..{:.0} and tilting {:.0}..{:.0} degrees",
+                                world
+                                    .index
+                                    .template_db
+                                    .names
+                                    .get(&m.template)
+                                    .map_or("?", String::as_str),
+                                m.entity,
+                                m.pivot,
+                                m.weapon.name,
+                                m.rounds,
+                                m.weapon.rate_of_fire,
+                                m.yaw.0.to_degrees(),
+                                m.yaw.1.to_degrees(),
+                                m.pitch.0.to_degrees(),
+                                m.pitch.1.to_degrees()
+                            );
+                            // Where she stands, facing the way it does.
+                            player.facing = m.facing;
+                            self.combat.manned = Some(m);
                         }
                         None => {
                             player.driving = nearest(physics, &scene.vehicles, player, REACH);
@@ -586,6 +822,17 @@ impl Game {
                     None => {
                         player.driving = None;
                         player.chase_target = None;
+                        // At an emplaced gun she stands behind it and only
+                        // looks.
+                        let intent = match self.combat.manned {
+                            Some(_) => Intent {
+                                movement: Vec2::ZERO,
+                                sprint: false,
+                                jump: false,
+                                ..intent
+                            },
+                            None => intent,
+                        };
                         player.update(physics, intent, dt);
                     }
                 }
@@ -682,6 +929,20 @@ impl Game {
                 .drive(&mut world.physics, &self.scene.vehicles, driven);
             self.paths
                 .drive(&mut world.physics, &self.scene.vehicles, driven);
+            let walking = self
+                .scene
+                .player
+                .as_ref()
+                .filter(|p| p.driving.is_none())
+                .map(|p| p.character.position);
+            self.roads.drive(
+                &mut world.physics,
+                &self.scene.vehicles,
+                &world.index.roads,
+                driven,
+                walking,
+                dt,
+            );
             knock_loose(
                 world,
                 &mut self.scene.props,
@@ -692,8 +953,12 @@ impl Game {
             // What came down (to a vehicle, the traffic's too, or a blast
             // last tick) comes down whether she is on foot or the free
             // camera flies: its island copy has lost its collision already.
-            self.destruction
-                .update(world, &mut self.scene.props, &mut self.combat);
+            self.destruction.update(
+                world,
+                &mut self.scene.props,
+                &mut self.combat,
+                self.scene.install.as_ref(),
+            );
             self.scene.props.advance(dt);
             self.spray_wait -= dt;
             if self.spray_wait <= 0.0 {
@@ -719,10 +984,17 @@ impl Game {
                 .filter_map(|v| {
                     let id = v.id?;
                     let at = world.physics.vehicle_transform(id)?;
-                    Some((at, world.physics.vehicle_velocity(id), v.spec.hull))
+                    let velocity = world.physics.vehicle_velocity(id);
+                    Some((at, velocity, v.spec.hull, v.spec.mass))
                 })
                 .collect();
-            self.scene.people.traffic(&cars);
+            let run_over = self
+                .scene
+                .people
+                .traffic(&cars, self.combat.damage_table.as_ref());
+            if run_over > 0 {
+                eprintln!("run over: {run_over} soldier(s) killed by a vehicle");
+            }
         }
         let scene = &mut self.scene;
         if self.on_foot
@@ -740,85 +1012,105 @@ impl Game {
             world
                 .destroyed
                 .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));
-            blast_loose(
+            hit_world(
                 world,
                 &mut scene.props,
-                &self.combat.went_off,
-                combat::REACH,
-                false,
+                &mut scene.flights,
+                scene.install.as_ref(),
+                &mut self.placed,
+                &mut self.destruction,
+                &mut self.combat,
             );
-            if let Some(install) = &scene.install {
-                let (radius, damage, least) = blast_strength(&world.index.template_db);
-                for &at in &self.combat.went_off {
-                    let blast = Blast {
-                        at,
-                        radius,
-                        damage,
-                        least,
-                    };
-                    self.destruction
-                        .blast(world, &mut scene.props, install, blast);
-                }
-            }
-            // A supply crate broken open: a puff of dust off its boards.
-            let broken = scene.flights.strike(
-                &mut world.physics,
-                &self.combat.struck,
-                &self.combat.went_off,
-            );
-            for (_, at) in broken {
-                self.combat.show(
-                    Effect::Smoke {
-                        at: at + Vec3::Y * 0.6,
-                        size: 1.4,
-                    },
-                    1.2,
-                );
-                self.combat
-                    .show_fx(crate::combat::fx::CRATE, at + Vec3::Y * 0.6);
-            }
-            // What lies within her reach: a weapon taken up with the use
-            // key; ammunition and health as she walks over them, if they
-            // give her anything (else with the use key, as before). A
-            // weapon lying there whose ammunition records give a weapon of
-            // hers rounds she has room for (a dead soldier's `Assault
-            // Rifle`, to her own rifle) is walked over for them.
+            // What lies within her reach, taken as the real game takes it
+            // ([`crate::mission::offer`]): health and the small ammunition
+            // box as she walks over them, if they give her anything; an
+            // ammunition box, or a weapon she carries, with the use key for
+            // its ammunition ("Take Ammo"); a weapon she doesn't carry with
+            // the use key, taken up ("Equip").
+            use crate::mission::Offer;
             let templates = &world.index.template_db;
             let near = scene.flights.within(player.character.position).map(|p| {
                 let refill = crate::mission::refill(templates, &self.combat, &p.what);
-                let usable = self.combat.can_use(refill, p.what.health);
+                let usable = p.what.is_money() || self.combat.can_use(refill, p.what.health);
+                let offer = crate::mission::offer(templates, &self.combat, &p.what);
                 // Each pickup she stands at and leaves lying, once, with
                 // why: what each record would go to and its room.
-                if !usable && !taking && self.refused.insert(p.key()) {
+                if !usable && offer != Offer::Equip && self.refused.insert(p.key()) {
                     eprintln!(
-                        "pickup: she leaves {} ({:#x}) at {:.1} lying: {}{}",
+                        "pickup: she leaves {} ({:#x}) at {:.1} lying ({offer:?}): {}",
                         templates.by_id(p.what.template).map_or("?", |t| t.0),
                         p.what.template,
                         p.at,
                         crate::mission::refusal(templates, &self.combat, &p.what),
-                        match p.what.weapon {
-                            Some(w) => format!(" (a weapon, {w:?}: taken up with the use key)"),
-                            None => String::new(),
-                        }
                     );
                 }
-                usable
+                (offer, usable)
             });
+            let take = match near {
+                Some((Offer::Walk, usable)) => usable,
+                Some((Offer::TakeAmmo, usable)) => taking && usable,
+                Some((Offer::Equip, _)) => taking,
+                None => false,
+            };
             if player.driving.is_none()
-                && (taking || near == Some(true))
+                && self.combat.manned.is_none()
+                && take
                 && let Some(p) = scene.flights.take_within(player.character.position)
             {
-                take_up(
-                    &mut self.combat,
-                    &mut scene.flights,
-                    &world.index.template_db,
-                    player,
-                    p,
-                    !taking,
-                );
+                let walked = near.is_some_and(|n| n.0 != Offer::Equip);
+                let from = p.from;
+                if p.what.is_money() {
+                    eprintln!(
+                        "pickup: she takes {} ({:#x}) at {:.1}: cash {}, fuel {}",
+                        templates.by_id(p.what.template).map_or("?", |t| t.0),
+                        p.what.template,
+                        p.at,
+                        p.what.cash,
+                        p.what.fuel
+                    );
+                    self.earned.push((p.what.cash, p.what.fuel));
+                } else {
+                    take_up(
+                        &mut self.combat,
+                        &mut scene.flights,
+                        &world.index.template_db,
+                        player,
+                        p,
+                        walked,
+                    );
+                }
+                // A placed one's prop comes down with it.
+                if self.placed.is_pickup(from) {
+                    self.placed
+                        .taken(from, &mut scene.props, &mut world.physics);
+                }
+            }
+            // Off an emplaced gun once she is down, in a vehicle, or it
+            // is gone with its layer.
+            if let Some(m) = &self.combat.manned
+                && (self.combat.down > 0.0
+                    || player.driving.is_some()
+                    || scene.props.get(m.entity).is_none_or(|(p, _)| p.wrecked))
+            {
+                self.combat.manned = None;
             }
         }
         self.drop_pickups();
+        // What the state layers place, as they come and go.
+        if let Some(world) = &self.scene.world {
+            let new = self.placed.sync(
+                &self.scene.props,
+                &mut self.scene.flights,
+                &world.index.template_db,
+                dt,
+            );
+            if new != crate::placed::Counts::default() {
+                eprintln!(
+                    "placed: {new:?} more stand; in play {:?}",
+                    self.placed.counts()
+                );
+            }
+        }
         self.support_impacts();
         self.strike_impacts(dt);
         self.run_particles(dt);
@@ -954,15 +1246,26 @@ impl Game {
             .map(|p| p.character.position)
             .unwrap_or(self.camera.position);
         let hp = self.combat.hp;
+        // Lasing, the point the crosshair is on.
+        let aim_at = match (her, &self.scene.world) {
+            (Some(p), Some(world)) if self.support.lasing() => Some(Combat::aim_point(
+                &world.physics,
+                &self.scene.people,
+                p,
+                None,
+            )),
+            _ => None,
+        };
         let call = match her {
             Some(_) => Call {
+                aim_at,
                 menu: intent.trigger.support,
+                menu_down: intent.trigger.support_down,
                 // At the menu or the view, the jump (the pad's A, which
                 // the texts' `[confirm]` shows) confirms as well.
                 use_pressed: intent.use_pressed || (intent.jump && self.support.busy()),
                 fire: intent.trigger.fire,
                 steer: intent.movement,
-                look: intent.look,
                 select: intent.trigger.select.is_some(),
                 hurt: hp < self.support_hp,
                 pda: intent.trigger.pda,
@@ -985,7 +1288,13 @@ impl Game {
         if before || self.support.busy() {
             // At the menu, the designator in her hands or looking through
             // the satellite, she stands, and fire is the satellite's.
+            // Lasing, she still looks and aims about.
+            let (look, aim) = (intent.look, intent.trigger.aim);
             intent = Intent::default();
+            if self.support.lasing() {
+                intent.look = look;
+                intent.trigger.aim = aim;
+            }
         }
         intent
     }
@@ -1034,9 +1343,10 @@ impl Game {
                                 radius: e.map_or(radius, |e| e.radius),
                                 damage: e.map_or(damage, |e| e.damage),
                                 least: e.map_or(0.0, |e| e.least),
+                                kind: e.map_or(0, |e| e.kind),
                             };
                             self.destruction
-                                .blast(world, &mut scene.props, install, blast);
+                                .blast(world, &mut scene.props, Some(install), blast);
                         }
                     }
                 }
@@ -1172,6 +1482,9 @@ impl Game {
             },
             vehicles,
             killed: self.scene.people.all_killed(),
+            // The scripts' to fill in ([`crate::mission::MissionLink::pmc_save`]).
+            pmc: None,
+            scripts: None,
         })
     }
 
@@ -1288,6 +1601,7 @@ impl Game {
             Some(_) if self.scene.vehicles_loading() => {
                 Some("Finding vehicles and people...".to_owned())
             }
+            _ if self.arrival.is_some() => Some("Arriving...".to_owned()),
             _ => None,
         };
         let driving = player.and_then(|p| p.driving).and_then(|i| {
@@ -1327,21 +1641,39 @@ impl Game {
         };
         // What the use key takes, as the game words it.
         let prompt = match (&self.scene.world, player) {
-            (Some(w), Some(p)) if p.driving.is_none() && p.landed && self.on_foot => self
-                .scene
-                .flights
-                .within(p.character.position)
-                // Ammunition is walked over, unworded (round 138).
-                .and_then(|p| {
-                    let weapon = p.what.weapon?;
-                    Some(format!(
-                        "Equip {}",
-                        w.index
-                            .template_db
-                            .by_id(p.what.template)
-                            .map_or_else(|| format!("{weapon:?}"), |t| t.0.to_owned())
-                    ))
-                }),
+            (Some(w), Some(p)) if p.driving.is_none() && p.landed && self.on_foot => {
+                use crate::mission::Offer;
+                let db = &w.index.template_db;
+                let word = |key: u32, english: &str| {
+                    strings
+                        .and_then(|s| s.strings.get(&key).cloned())
+                        .unwrap_or_else(|| english.to_owned())
+                };
+                match self.scene.flights.within(p.character.position) {
+                    Some(lying) => match crate::mission::offer(db, &self.combat, &lying.what) {
+                        // Walked over, unworded.
+                        Offer::Walk => None,
+                        Offer::TakeAmmo => {
+                            let refill = crate::mission::refill(db, &self.combat, &lying.what);
+                            self.combat
+                                .can_use(refill, lying.what.health)
+                                .then(|| word(TAKE_AMMO, "Take Ammo"))
+                        }
+                        Offer::Equip => Some(word(EQUIP, "Equip %s").replace(
+                            "%s",
+                            &shown_name(db, strings, lying.what.template, lying.what.gun),
+                        )),
+                    },
+                    None if self.combat.manned.is_none() => self
+                        .placed
+                        .emplacement_near(&self.scene.props, db, p.character.position)
+                        .map(|m| {
+                            word(USE, "Use %s")
+                                .replace("%s", &shown_name(db, strings, m.template, None))
+                        }),
+                    None => None,
+                }
+            }
             _ => None,
         };
         HudInfo {
@@ -1361,9 +1693,14 @@ impl Game {
                 0 => String::new(),
                 _ => self.combat.explosive_left().0.to_owned(),
             },
-            rounds: match self.combat.weapon {
-                Weapon::Rifle => Some(self.combat.rifle_rounds),
-                Weapon::GrenadeLauncher | Weapon::Rpg => self.combat.launcher_rounds,
+            // At an emplaced gun, its rounds.
+            rounds: match (&self.combat.manned, self.combat.weapon) {
+                (Some(m), _) => Some(combat::Rounds {
+                    clip: m.rounds,
+                    stored: 0,
+                }),
+                (None, Weapon::Rifle) => Some(self.combat.rifle_rounds),
+                (None, Weapon::GrenadeLauncher | Weapon::Rpg) => self.combat.launcher_rounds,
             }
             .map(|r| (r.clip, r.stored)),
             // Looking through the satellite, its own overlay is shown.
@@ -1462,8 +1799,15 @@ impl Game {
         self.on_foot = !self.on_foot;
     }
 
-    fn walking(&self) -> Option<&crate::player::Player> {
+    pub fn walking(&self) -> Option<&crate::player::Player> {
         self.scene.player.as_ref().filter(|_| self.on_foot)
+    }
+
+    /// The heading of the camera the frame is seen from ([`Self::view`]),
+    /// radians as [`FlyCamera::yaw`]: the HUD's compass and minimap turn
+    /// with it.
+    pub fn view_heading(&self) -> f32 {
+        view_heading(self.walking(), &self.camera)
     }
 
     /// Moves the light on to the atmosphere region the player is in.
@@ -1703,7 +2047,7 @@ fn take_up(
     combat: &mut Combat,
     flights: &mut crate::flights::Flights,
     templates: &m2_engine::Templates,
-    player: &Player,
+    player: &mut Player,
     p: crate::flights::Pickup,
     walked: bool,
 ) {
@@ -1742,6 +2086,11 @@ fn take_up(
     let left = combat
         .equip_gun(gun, rounds)
         .map(|(g, n)| (g.slot(), n, g.template, g.model_hash, g.name));
+    // Taken up with the use key, she picks it up off the ground
+    // (`PickupWeapon`); walked over, it is just had.
+    if !walked {
+        player.start_pickup();
+    }
     eprintln!(
         "pickup: she takes up the {} ({:#x}) at {:.1} with {rounds} rounds{}",
         spec.map_or(format!("{weapon:?}"), |s| s.name.clone()),
@@ -1898,6 +2247,108 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
     }
 }
 
+/// What the fight's rounds, blows and blasts of the last step
+/// ([`Combat::struck`], [`Combat::went_off`]) do to the world: blasts
+/// knock loose what comes loose and wear down what they reach
+/// ([`Destruction::blast`]); supply crates, delivered and placed, break
+/// open (a puff of dust off their boards).
+fn hit_world(
+    world: &mut World,
+    props: &mut Props,
+    flights: &mut crate::flights::Flights,
+    install: Option<&Install>,
+    placed: &mut crate::placed::Placed,
+    destruction: &mut Destruction,
+    combat: &mut Combat,
+) {
+    // Rounds, blows and blasts wear down what they reach, each as the
+    // damage table's row for it says (a café chair breaks to a clip; a
+    // box or a wall takes nothing of a round); what still stands and
+    // comes loose is knocked loose after. A round does nothing to what
+    // has no row.
+    for s in &combat.struck {
+        if let Some(key) = s.key {
+            destruction.wear(world, props, install, key, (s.round, s.kind, 0.0), s.at);
+        }
+    }
+    for &at in &combat.went_off {
+        for blast in rocket_blasts(&world.index.template_db, at) {
+            destruction.blast(world, props, install, blast);
+        }
+    }
+    blast_loose(world, props, &combat.went_off, combat::REACH, false);
+    // What was worn down and blows up goes off a moment later.
+    for (at, size) in destruction.set_off.drain(..) {
+        combat.set_off(at, size);
+    }
+    let mut broken = flights.strike(&mut world.physics, &combat.struck, &combat.went_off);
+    // The state layers' crates too ([`crate::placed`]).
+    broken.extend(placed.strike(
+        props,
+        &mut world.physics,
+        flights,
+        &world.index.template_db,
+        &combat.struck,
+        &combat.went_off,
+    ));
+    for (_, at) in broken {
+        combat.show(
+            Effect::Smoke {
+                at: at + Vec3::Y * 0.6,
+                size: 1.4,
+            },
+            1.2,
+        );
+        combat.show_fx(crate::combat::fx::CRATE, at + Vec3::Y * 0.6);
+    }
+}
+
+impl Game {
+    /// What `struck` and `went_off` do to the world, as the fight's own
+    /// rounds and blasts would ([`hit_world`]): the props check's hits
+    /// ([`crate::breakables::check`]). The fight's own of the last step
+    /// are dropped.
+    pub fn hit_world_with(&mut self, struck: Vec<combat::Strike>, went_off: Vec<Vec3>) {
+        let scene = &mut self.scene;
+        let Some(world) = &mut scene.world else {
+            return;
+        };
+        self.combat.struck = struck;
+        self.combat.went_off = went_off;
+        hit_world(
+            world,
+            &mut scene.props,
+            &mut scene.flights,
+            scene.install.as_ref(),
+            &mut self.placed,
+            &mut self.destruction,
+            &mut self.combat,
+        );
+        self.combat.struck.clear();
+        self.combat.went_off.clear();
+    }
+
+    /// What a vehicle like `crasher` going at its velocity does to what
+    /// its box meets, as one driven would ([`run_into`]): the props
+    /// check's crashes ([`crate::breakables::check`]).
+    pub fn crash_with(&mut self, crasher: &Crasher) {
+        let scene = &mut self.scene;
+        let Some(world) = &mut scene.world else {
+            return;
+        };
+        let keys = world.physics.statics_in_box(crasher.place, crasher.bounds);
+        run_into(
+            world,
+            &mut scene.props,
+            &mut self.destruction,
+            scene.install.as_ref(),
+            crasher,
+            keys,
+            (crasher.velocity.length(), "props check's vehicle"),
+        );
+    }
+}
+
 /// Vehicles knock loose what they hit that comes loose, with the weight
 /// and speed for it ([`KNOCK_RATIO`]): it flies off ahead, and the vehicle
 /// ploughs on slowed as by the mass it shifted, rather than stopped as by
@@ -1923,64 +2374,111 @@ fn knock_loose(
             continue;
         }
         let mass = v.spec.mass;
-        let mut shifted = 0.0;
-        let mut keys = world.physics.vehicle_statics(id);
-        let mut ploughed = false;
-        let mut down = Vec::new();
-        if let (Some(install), Some(place)) = (install, world.physics.vehicle_transform(id)) {
-            let crasher = Crasher {
-                place,
-                bounds: v.model.bounds,
-                velocity: before,
-                mass,
-            };
-            // What its body touched in the step counts as run into, as
-            // what its box meets does.
-            for c in destruction.crash(world, props, install, &crasher, &keys) {
-                match c {
-                    Crashed::Down(key) => {
-                        ploughed |= keys.contains(&key);
-                        down.push(key);
-                    }
-                    Crashed::Loose(key) => {
-                        if !keys.contains(&key) {
-                            keys.push(key);
-                        }
-                    }
-                }
-            }
-        }
-        // What broke is not knocked loose as well.
-        keys.retain(|k| !down.contains(k));
-        for key in keys {
-            let loose = match key {
-                StaticKey::Object(i) => world.loose_mass(i),
-                StaticKey::Entity(e) => props.loose_mass(&world.physics, e),
-                _ => None,
-            };
-            let Some(m) = loose.filter(|&m| mass * speed >= KNOCK_RATIO * m) else {
-                continue;
-            };
-            let (fling, topple) = flung(before, mass, m);
-            let knocked = match key {
-                StaticKey::Object(i) => world.knock(i, fling, topple),
-                StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple, false),
-                _ => false,
-            };
-            if knocked {
-                shifted += m;
-                eprintln!(
-                    "knocked loose: {key:?} ({m:.0} kg) by the {} at {speed:.1} m/s",
-                    v.spec.label
-                );
-            }
-        }
+        let Some(place) = world.physics.vehicle_transform(id) else {
+            continue;
+        };
+        let crasher = Crasher {
+            place,
+            bounds: v.model.bounds,
+            velocity: before,
+            mass,
+        };
+        let keys = world.physics.vehicle_statics(id);
+        let (shifted, ploughed) = run_into(
+            world,
+            props,
+            destruction,
+            install,
+            &crasher,
+            keys,
+            (speed, &v.spec.label),
+        );
         if shifted > 0.0 || ploughed {
             world
                 .physics
                 .set_vehicle_velocity(id, before * (mass / (mass + shifted)));
         }
     }
+}
+
+/// What `vehicle` does to what it runs into: what its body touched in
+/// the step (`keys`) and what its box meets ([`Destruction::crash`]):
+/// what its weight breaks comes down, and what comes loose it knocks
+/// loose with the weight and `speed` for it ([`KNOCK_RATIO`]: as fast as
+/// it pushes, pulling against what holds it). Returns the mass it
+/// shifted (kg) and whether it ploughed on through something it broke.
+/// `label` names it for the log.
+fn run_into(
+    world: &mut World,
+    props: &mut Props,
+    destruction: &mut Destruction,
+    install: Option<&Install>,
+    vehicle: &Crasher,
+    mut keys: Vec<StaticKey>,
+    (speed, label): (f32, &str),
+) -> (f32, bool) {
+    // A building of a merged batch touched is its own placed object (a
+    // shanty town's shack), where it is placed by its own model too.
+    for k in &mut keys {
+        *k = world.as_object(*k);
+    }
+    let mut seen = std::collections::HashSet::new();
+    keys.retain(|k| seen.insert(*k));
+    let mass = vehicle.mass;
+    let mut shifted = 0.0;
+    let mut ploughed = false;
+    let mut down = Vec::new();
+    if let Some(install) = install {
+        // What its body touched in the step counts as run into, as
+        // what its box meets does.
+        for c in destruction.crash(world, props, install, vehicle, &keys) {
+            match c {
+                Crashed::Down(key) => {
+                    ploughed |= keys.contains(&key);
+                    down.push(key);
+                }
+                Crashed::Loose(key) => {
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+        }
+    }
+    // What broke is not knocked loose as well.
+    keys.retain(|k| !down.contains(k));
+    for key in keys {
+        let (loose, template) = match key {
+            StaticKey::Object(i) => (world.loose_mass(i), world.index.objects[i].template),
+            StaticKey::Entity(e) => (
+                props.loose_mass(&world.physics, e),
+                props.get(e).map_or(0, |(p, _)| p.template),
+            ),
+            _ => (None, 0),
+        };
+        // What its template says a vehicle this light doesn't break (a
+        // wall a jeep runs into) stands, loose or not.
+        let holds = world
+            .index
+            .template_db
+            .crashable
+            .get(&template)
+            .is_some_and(|c| c.how == CrashHow::Breaks && mass < c.takes);
+        let Some(m) = loose.filter(|&m| !holds && mass * speed >= KNOCK_RATIO * m) else {
+            continue;
+        };
+        let (fling, topple) = flung(vehicle.velocity, mass, m);
+        let knocked = match key {
+            StaticKey::Object(i) => world.knock(i, fling, topple),
+            StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple, false),
+            _ => false,
+        };
+        if knocked {
+            shifted += m;
+            eprintln!("knocked loose: {key:?} ({m:.0} kg) by the {label} at {speed:.1} m/s");
+        }
+    }
+    (shifted, ploughed)
 }
 
 /// How what a vehicle of `mass` (kg) going at `velocity` (m/s) knocks
@@ -2019,9 +2517,81 @@ fn explosion(db: &Templates, names: &[&str]) -> Option<Explosion> {
 
 /// An ordinary blast's reach and damage, heart to edge: a rocket's from
 /// the template database, else combat's own reach and 100 to nothing.
-fn blast_strength(db: &Templates) -> (f32, f32, f32) {
+pub(crate) fn blast_strength(db: &Templates) -> (f32, f32, f32) {
     explosion(db, &ROCKET_BLASTS).map_or((combat::REACH, 100.0, 0.0), |e| {
         (e.radius, e.damage, e.least)
+    })
+}
+
+/// The RPG's frag and its rocket (`Explosion (Handheld RPG)` links
+/// `Explosion (Handheld RPG Frag)` as its `Frag`; the `RPG Rocket` is
+/// the projectile, PC data).
+const ROCKET_FRAG: &str = "Explosion (Handheld RPG Frag)";
+const ROCKET: &str = "RPG Rocket";
+/// How near a rocket's heart what it lands on is, metres (invented): its
+/// own `Damage` is done to what it strikes, not around.
+const ROCKET_HIT: f32 = 0.5;
+
+/// What an ordinary blast (a rocket's: combat doesn't yet tell them
+/// apart) does to what stands around it, as the data has an RPG's: its
+/// explosion (`Explosion`, 200 to nothing over 5 m), its frag (`Bullet`,
+/// 300 to 40 over 15 m) and the rocket itself on what it lands on
+/// (`Rocket`, 100, within [`ROCKET_HIT`]), each at `at`. Those the data
+/// doesn't give are left out; with none, combat's own reach and 100 to
+/// nothing.
+pub(crate) fn rocket_blasts(db: &Templates, at: Vec3) -> Vec<Blast> {
+    let of = |e: Explosion| Blast {
+        at,
+        radius: e.radius,
+        damage: e.damage,
+        least: e.least,
+        kind: e.kind,
+    };
+    let mut out: Vec<Blast> = [explosion(db, &ROCKET_BLASTS), explosion(db, &[ROCKET_FRAG])]
+        .into_iter()
+        .flatten()
+        .map(of)
+        .collect();
+    if let Some(p) = db.id(ROCKET).and_then(|id| db.projectiles.get(&id)) {
+        out.push(Blast {
+            at,
+            radius: ROCKET_HIT,
+            damage: p.damage,
+            least: p.damage,
+            kind: p.kind,
+        });
+    }
+    if out.is_empty() {
+        let (radius, damage, least) = blast_strength(db);
+        out.push(Blast {
+            at,
+            radius,
+            damage,
+            least,
+            kind: 0,
+        });
+    }
+    out
+}
+
+/// Whether an ordinary blast throws loose what template `t`'s objects
+/// are: a light physics prop (`_PropPhysics`, not one of the heavy ones:
+/// a chair, a box, a barricade), or what the damage table's row for it
+/// takes something of a blast's explosion or frag (`Explosion`,
+/// `Bullet`: a lamp, a fence). A wall (`Building`) or a shipping
+/// container (`Tank`, 20,000 kg) takes nothing of either and stands, its
+/// breakable parts with it; one with no row is thrown as before.
+fn blown_loose(db: &Templates, t: u32) -> bool {
+    if let Some(p) = db.prop_physics.get(&t) {
+        return !p.heavy;
+    }
+    let (Some(&row), Some(table)) = (db.modifiers.get(&t), db.damage.as_ref()) else {
+        return true;
+    };
+    ["Explosion", "Bullet"].iter().any(|k| {
+        table
+            .scale(row, m2_assets::name_hash(k))
+            .is_some_and(|s| s > 0.0)
     })
 }
 
@@ -2035,13 +2605,20 @@ fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3], reach: f32
     };
     for &at in blasts {
         for (i, d) in world.loose_near(at, reach) {
-            let (velocity, spin) = thrown(at, world.index.objects[i].position, d);
+            let o = world.index.objects[i];
+            if !strike && !blown_loose(&world.index.template_db, o.template) {
+                continue;
+            }
+            let (velocity, spin) = thrown(at, o.position, d);
             world.knock(i, velocity, spin);
         }
         for (e, d) in props.loose_near(&world.physics, at, reach, strike) {
-            let Some(p) = props.get(e).map(|(p, _)| p.position) else {
+            let Some((p, template)) = props.get(e).map(|(p, _)| (p.position, p.template)) else {
                 continue;
             };
+            if !strike && !blown_loose(&world.index.template_db, template) {
+                continue;
+            }
             let (velocity, spin) = thrown(at, p, d);
             props.knock(&mut world.physics, e, velocity, spin, strike);
         }
@@ -2223,6 +2800,28 @@ fn vehicle_name(
     shown.or(name).unwrap_or_else(|| label.to_owned())
 }
 
+/// The game's words for the use key at what lies within reach, by their
+/// string table keys (`English.wad`; PC data, 2026-10-10): "Take Ammo",
+/// "Equip %s", "Use %s".
+const TAKE_AMMO: u32 = 0xbd07_d121;
+const EQUIP: u32 = 0xdb58_ae4b;
+const USE: u32 = 0x93e3_1c00;
+
+/// The name the game shows for template `t` (or, without one, for `or`):
+/// the English string its `LocalizedName` keys; else its template's name.
+fn shown_name(
+    db: &Templates,
+    strings: Option<&m2_assets::StringTable>,
+    t: u32,
+    or: Option<u32>,
+) -> String {
+    let localized = |t: u32| strings?.strings.get(db.localized.get(&t)?).cloned();
+    localized(t)
+        .or_else(|| or.and_then(localized))
+        .or_else(|| db.names.get(&t).cloned())
+        .unwrap_or_else(|| format!("{t:#x}"))
+}
+
 /// The vehicle nearest her within `reach` metres of its door marker (or its
 /// hull, for those without one).
 fn nearest(
@@ -2307,6 +2906,13 @@ pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player)
     player.chase_target = None;
 }
 
+/// Her camera's heading while she is played, on foot or driving (its yaw
+/// turns with the mouse; the free camera's stays where it was left), else
+/// the free camera's.
+fn view_heading(player: Option<&Player>, fly: &FlyCamera) -> f32 {
+    player.map_or(fly.yaw, |p| p.yaw)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -2314,6 +2920,16 @@ mod tests {
     use m2_engine::TemplateInfo;
 
     use super::*;
+
+    #[test]
+    fn an_arrival_loads_until_its_place_is_in_or_its_time_is_up() {
+        // Not before the least time, even with everything in.
+        assert!(!arrived(ARRIVAL_MIN - 0.1, true));
+        assert!(arrived(ARRIVAL_MIN, true));
+        // Still loading: up until the cap.
+        assert!(!arrived(ARRIVAL_CAP - 0.1, false));
+        assert!(arrived(ARRIVAL_CAP, false));
+    }
 
     #[test]
     fn the_use_prompt_names_vehicles_as_the_game_shows_them() {
@@ -2361,5 +2977,84 @@ mod tests {
             vehicle_name(&db, Some(&strings), "vz_veh_truck_M151", 7),
             "M151 Softtop (V2)"
         );
+    }
+
+    #[test]
+    fn an_rpg_blasts_with_its_explosion_frag_and_rocket_from_the_data() {
+        let key = m2_assets::name_hash;
+        let e = |radius, damage, least, kind: &str| Explosion {
+            radius,
+            damage,
+            least,
+            kind: key(kind),
+        };
+        let db = Templates {
+            names: HashMap::from([
+                (0x8000_0001, "Explosion (Handheld RPG)".to_owned()),
+                (0x8000_0002, "Explosion (Handheld RPG Frag)".to_owned()),
+                (0x8000_0003, "RPG Rocket".to_owned()),
+            ]),
+            explosions: HashMap::from([
+                (0x8000_0001, e(5.0, 200.0, 0.0, "Explosion")),
+                (0x8000_0002, e(15.0, 300.0, 40.0, "Bullet")),
+            ]),
+            projectiles: HashMap::from([(
+                0x8000_0003,
+                m2_engine::durability::Projectile {
+                    damage: 100.0,
+                    kind: key("Rocket"),
+                },
+            )]),
+            ..Templates::default()
+        };
+        let at = Vec3::new(1.0, 2.0, 3.0);
+        let blasts = rocket_blasts(&db, at);
+        let kinds: Vec<u32> = blasts.iter().map(|b| b.kind).collect();
+        assert_eq!(kinds, [key("Explosion"), key("Bullet"), key("Rocket")]);
+        assert!(blasts.iter().all(|b| b.at == at));
+        // The rocket only on what it lands on.
+        assert_eq!(blasts[2].at_distance(0.2), 100.0);
+        assert_eq!(blasts[2].at_distance(1.0), 0.0);
+        // The frag still bites at 10 m.
+        assert!(blasts[1].at_distance(10.0) > 100.0);
+        // With none in the data: one blast of combat's own, taken in full.
+        let none = rocket_blasts(&Templates::default(), at);
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].kind, 0);
+    }
+
+    #[test]
+    fn the_compass_reads_the_camera_the_frame_is_seen_from() {
+        // The free camera left looking north; she looks east, then
+        // south-west, as the mouse turns her camera.
+        let fly = FlyCamera {
+            position: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        for yaw in [std::f32::consts::FRAC_PI_2, -2.4] {
+            let p = Player::new(0.0, 0.0, yaw, None);
+            let heading = view_heading(Some(&p), &fly);
+            // The heading her view looks along (right-handed: down -z).
+            let ahead = -p.view(60.0, 16.0 / 9.0).view.inverse().z_axis.truncate();
+            let seen = ahead.x.atan2(ahead.z);
+            assert!((heading - seen).abs() < 1e-4, "{heading} {seen}");
+        }
+        // Flying, the free camera's.
+        assert_eq!(view_heading(None, &fly), 0.0);
+    }
+
+    #[test]
+    fn a_blast_throws_light_props_not_heavy_ones() {
+        let prop = |heavy| m2_engine::durability::PropPhysics { mass: None, heavy };
+        let db = Templates {
+            prop_physics: HashMap::from([(1, prop(false)), (2, prop(true))]),
+            ..Templates::default()
+        };
+        // A café chair flies; a 20 t container stands.
+        assert!(blown_loose(&db, 1));
+        assert!(!blown_loose(&db, 2));
+        // One the data gives no damage table row: thrown, as before.
+        assert!(blown_loose(&db, 3));
     }
 }

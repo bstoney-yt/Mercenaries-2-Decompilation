@@ -32,8 +32,8 @@ committed or shipped.
 
 ## The engine API the scripts call
 
-Counted across the 645 scripts. The full lists are on the dev PC in
-`C:\Claude\scratch\missions\scripts-vz.txt`.
+Counted across the 645 scripts. The full lists are kept locally, outside the
+repository.
 
 | Library | Most-used calls | Scripts |
 |---|---|---|

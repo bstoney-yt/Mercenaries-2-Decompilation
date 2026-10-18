@@ -214,9 +214,19 @@ pub enum Command {
     /// Atmosphere changes from now on happen at once (true) or ease in
     /// over their records' time (false).
     AtmosphereImmediate(bool),
-    /// A call the game only needs to hear about: `"Pg.SaveGame"`,
+    /// The loading screen up (true) or down (`Net.SetLoadingScreen`): the
+    /// teleport helpers and state changes put it up before a move; the
+    /// engine takes it down once the place has loaded.
+    LoadingScreen(bool),
+    /// A call the game only needs to hear about:
     /// `"Pg.ContractActivated"`, `"Pg.ContractCompleted"`, ...
     Notify(String),
+    /// Save the game now, in slot `slot`: the scripts' checkpoints
+    /// (`Pg.SaveGame("retry")`), and their autosaves (`Sys.RequestAutosave`
+    /// after a contract, `Pg.SaveGame("autosave")`) in slot [`AUTOSAVE`].
+    Save {
+        slot: String,
+    },
     /// The scripts gave the player a support item free
     /// (`MrxSupportData.AddFreebie`): its key (`"VzaCon01_SatBomb"`), how
     /// many, and the most she may hold, if they said.
@@ -383,6 +393,10 @@ pub struct ScriptWorld {
     /// Drop and landing zone tests asked for (`Ai.TestDropZone`): the
     /// callback to answer and the spot tested.
     drop_tests: Vec<(Function, [f32; 3])>,
+    /// Assets asked for with a callback (`Pg.LoadAsset(name, type,
+    /// callback, data)`): answered as loaded on the next tick
+    /// ([`answer_asset_loads`]).
+    asset_loads: Vec<(Function, Value)>,
     /// The outlines of region objects (`LineRegion`), by the region's guid;
     /// placed at the object's position and yaw.
     pub regions: HashMap<u32, m2_assets::Region>,
@@ -401,6 +415,8 @@ pub struct ScriptWorld {
     pub vo: crate::vo::Lines,
     /// The player has subtitles off (`Sys.SubtitlesEnabled`).
     pub subtitles_off: bool,
+    /// The player has the tutorial tips off (`Sys.TutorialsEnabled`).
+    pub tutorials_off: bool,
     /// The score.
     pub music: crate::music::Music,
     /// Why each object is invincible (`Object.SetInvincible` reasons).
@@ -413,6 +429,10 @@ pub struct ScriptWorld {
     pub outside: bool,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Who drives each template's vehicle, by name in lower case, as its
+    /// `Rider` in the driver's seat names them: a vehicle spawned without
+    /// "(Driver)" in its name comes with them ([`ScriptWorld::spawn`]).
+    pub template_drivers: HashMap<String, String>,
     /// Every layer entity's place, and its guid by name in lower case,
     /// loaded or not: `Pg.GetGuidByName` finds markers (landing zones) of
     /// layers that aren't in, and scripts measure to them.
@@ -497,9 +517,16 @@ impl ScriptWorld {
 
     /// Spawns a copy of `what` and tells the game to. A crewed vehicle
     /// (`"Mi26 (VZA Intro) (Driver)"`) comes with its pilot in the
-    /// driver's seat, as scripts expect of `Vehicle.GetDriver`.
+    /// driver's seat, as scripts expect of `Vehicle.GetDriver`; so does one
+    /// whose template seats its own driver (the support helicopters,
+    /// `"AH1Z (Ewan)"`: Ewan, `"Recruit Ewen Garret"`).
     pub(crate) fn spawn(&mut self, what: String, position: [f32; 3], yaw: f32) -> u32 {
-        let crewed = what.to_ascii_lowercase().ends_with("(driver)");
+        let lower = what.to_ascii_lowercase();
+        let driver = if lower.ends_with("(driver)") {
+            Some(PILOT.to_owned())
+        } else {
+            self.template_drivers.get(&lower).cloned()
+        };
         let guid = self.spawn_guid();
         let mut object = Object::new(&what, position);
         object.yaw = yaw;
@@ -514,15 +541,15 @@ impl ScriptWorld {
             position,
             yaw,
         });
-        if crewed {
+        if let Some(driver) = driver {
             let pilot = self.spawn_guid();
-            let mut o = Object::new(PILOT, position);
+            let mut o = Object::new(&driver, position);
             o.vehicle = Some(guid);
             o.seated_instantly = true;
             self.insert(pilot, o);
             self.commands.push(Command::Spawn {
                 guid: pilot,
-                what: PILOT.into(),
+                what: driver,
                 position,
                 yaw,
             });
@@ -817,8 +844,35 @@ pub fn answer_drop_tests(world: &Shared) -> Vec<mlua::Error> {
     errors
 }
 
+/// Tells the scripts the assets they asked for have loaded: each load's
+/// callback with its data unpacked, as `MrxUtil.CallWithOptionalArgs`
+/// calls it (a table's items, else the value itself). The callbacks take
+/// that shape (`MrxBriefing`'s takes the asset's name and false for "not
+/// timed out", `MrxStarter`'s its name, type and false, `MrxUtil.
+/// LoadingCallback` its counter); their own 15 s timers give the same call
+/// with true. Returns any errors.
+pub fn answer_asset_loads(world: &Shared) -> Vec<mlua::Error> {
+    let loads = std::mem::take(&mut world.borrow_mut().asset_loads);
+    let mut errors = Vec::new();
+    for (f, data) in loads {
+        let args: Vec<Value> = match data {
+            Value::Table(t) => t.sequence_values().filter_map(Result::ok).collect(),
+            Value::Nil => Vec::new(),
+            other => vec![other],
+        };
+        if let Err(e) = f.call::<()>(MultiValue::from_vec(args)) {
+            errors.push(e);
+        }
+    }
+    errors
+}
+
 /// Calls the goal callbacks of `guid`'s finished AI goals, with their data
-/// unpacked. Returns any errors.
+/// unpacked, then who had the goal and 1 for done. Those last two are
+/// inferred from the support helicopter's landing callback
+/// (`MrxSupportCopterDelivery._VehicleLanded(self, copter, pilot,
+/// result)`: it gets the pilot out of the helicopter, and takes a result
+/// of 0 for a landing that failed). Returns any errors.
 pub fn goal_finished(world: &Shared, guid: u32) -> Vec<mlua::Error> {
     let done: Vec<_> = {
         let mut w = world.borrow_mut();
@@ -830,10 +884,11 @@ pub fn goal_finished(world: &Shared, guid: u32) -> Vec<mlua::Error> {
     };
     let mut errors = Vec::new();
     for (_, f, data) in done {
-        let args: Vec<Value> = match data {
+        let mut args: Vec<Value> = match data {
             Some(t) => t.sequence_values().filter_map(Result::ok).collect(),
             None => Vec::new(),
         };
+        args.extend([guid_value(Some(guid)), Value::Integer(1)]);
         if let Err(e) = f.call::<()>(MultiValue::from_vec(args)) {
             errors.push(e);
         }
@@ -894,6 +949,9 @@ fn guid_value(g: Option<u32>) -> Value {
 fn values<I: IntoIterator<Item = Value>>(v: I) -> mlua::Result<MultiValue> {
     Ok(MultiValue::from_iter(v))
 }
+
+/// The save slot of the scripts' autosaves ([`Command::Save`]).
+pub const AUTOSAVE: &str = "autosave";
 
 /// The table of the game's own functions that hear the scripts' free
 /// support items (`AddFreebie`, `RemoveFreebie`).
@@ -961,6 +1019,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     };
 
     crate::airstrike::install(&lib("Airstrike")?, &add)?;
+    crate::shop::install(lua, &lib("Hud")?)?;
 
     // A string's hash, as the scripts key tables by name (their recruits'
     // states). The archive's name hash: the scripts only compare hashes
@@ -993,6 +1052,35 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let pg = lib("Pg")?;
+    // The objects of a kind within a radius of a point (x, y, z, radius),
+    // as a list: what the strikes hit (the bunker buster's buildings, the
+    // tank buster's tanks, the air patrol's aircraft). Which labels make
+    // each kind is inferred from the templates' labels ("Vehicle",
+    // "helicopter"...), not read from the engine.
+    add(&pg, "FastCollectBuildings", |w, lua, a| {
+        collect(w, lua, a, &["Building", "Structure"], &[])
+    })?;
+    add(&pg, "FastCollectHumans", |w, lua, a| {
+        collect(w, lua, a, &["Human", "Soldier", "Civilian"], &[])
+    })?;
+    add(&pg, "FastCollectTanks", |w, lua, a| {
+        collect(w, lua, a, &["Tank"], &[])
+    })?;
+    add(&pg, "FastCollectHelicopters", |w, lua, a| {
+        collect(w, lua, a, &["helicopter"], &[])
+    })?;
+    add(&pg, "FastCollectFlying", |w, lua, a| {
+        collect(w, lua, a, &["helicopter", "Plane", "Aircraft"], &[])
+    })?;
+    add(&pg, "FastCollectGroundVehicles", |w, lua, a| {
+        collect(
+            w,
+            lua,
+            a,
+            &["Vehicle"],
+            &["helicopter", "Plane", "Aircraft"],
+        )
+    })?;
     // A region's outline in the world: the corners' x and z as two lists
     // (the PDA map and radar draw the play area with them).
     add(&pg, "GetLineRegionPoints", |w, lua, a| {
@@ -1311,11 +1399,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // The number of the player controlling it (scripts pass it on to
     // `Player.IsLocal` and key tables by it), else nil.
     // Metres between two objects (or markers of layers not loaded).
+    // From an object to another, or to a point x, y, z (`MrxUtil.
+    // GetDistanceToObject(her, x, y, z)`, as the laser guided bomb and the
+    // daisy cutter ask how far she is from their target).
     add(&object, "GetDistanceFrom", |w, _, a| {
-        let (Some(p), Some(q)) = (
-            id(a.first()).and_then(|g| w.place_of(g)),
-            id(a.get(1)).and_then(|g| w.place_of(g)),
-        ) else {
+        let to = match (num(a.get(1)), num(a.get(2)), num(a.get(3))) {
+            (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+            _ => id(a.get(1)).and_then(|g| w.place_of(g)),
+        };
+        let (Some(p), Some(q)) = (id(a.first()).and_then(|g| w.place_of(g)), to) else {
             return values([Value::Nil]);
         };
         let d: f32 = (0..3).map(|i| (p[i] - q[i]).powi(2)).sum::<f32>().sqrt();
@@ -1619,9 +1711,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Table(t)])
     })?;
     // Riders change seats at once here, so seat events see it on the next
-    // update; the command lets the game animate it.
+    // update; the command lets the game animate it. Vehicle.Exit(vehicle,
+    // rider, instant): all 21 calls in the scripts pass the vehicle first
+    // (`Vehicle.GetFromRider(hero)`, `Player.GetControlledObject`) and the
+    // rider second; a lone argument is the rider.
     add(&vehicle, "Exit", |w, _, a| {
-        if let Some(guid) = id(a.first()) {
+        if let Some(guid) = id(a.get(1)).or_else(|| id(a.first())) {
             if let Some(o) = w.objects.get_mut(&guid) {
                 o.vehicle = None;
                 o.seated_instantly = false;
@@ -1757,6 +1852,19 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => values([Value::Boolean(false)]),
         }
     })?;
+    // Pg.LoadAsset(name, type[, callback, data]): the alpha reads what it
+    // draws itself, so every asset is there at once; a callback hears so
+    // on the next tick ([`answer_asset_loads`]). Of the scripts' calls,
+    // most preload (name and type); four pass a callback: the HQ's starter
+    // and its briefing wait on them before the screen comes down.
+    add(&pg, "LoadAsset", |w, _, a| {
+        if let Some(Value::Function(f)) = a.get(2) {
+            w.asset_loads
+                .push((f.clone(), a.get(3).cloned().unwrap_or(Value::Nil)));
+        }
+        values([])
+    })?;
+    add(&pg, "UnloadAsset", |_, _, _| values([]))?;
     add(&ai, "Goal", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([]);
@@ -1825,10 +1933,22 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     ] {
         add(&net, name, |_, _, _| values([]))?;
     }
+    add(&net, "SetLoadingScreen", |w, _, a| {
+        let on = matches!(a.first(), Some(Value::Boolean(true)));
+        w.commands.push(Command::LoadingScreen(on));
+        values([])
+    })?;
 
     // Calls the game only needs to hear about.
+    add(&pg, "SaveGame", |w, _, a| {
+        let slot = match a.first() {
+            Some(Value::String(s)) => s.to_string_lossy(),
+            _ => String::new(),
+        };
+        w.commands.push(Command::Save { slot });
+        values([])
+    })?;
     for name in [
-        "SaveGame",
         "ContractActivated",
         "ContractCompleted",
         "ContractCancelled",
@@ -2082,14 +2202,23 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     // Developer switches (skip to a mission, force a briefing): all off.
     let sys = lib("Sys")?;
-    // The game shows its tutorial tips.
-    add(&sys, "TutorialsEnabled", |_, _, _| {
-        values([Value::Boolean(true)])
+    // The game shows its tutorial tips, unless the player turned them off.
+    add(&sys, "TutorialsEnabled", |w, _, _| {
+        values([Value::Boolean(!w.tutorials_off)])
     })?;
     for name in ["GetSkipMission", "GetINIBriefing", "GetForceNewGame"] {
         add(&sys, name, |_, _, _| values([Value::Nil]))?;
     }
     add(&sys, "SetSkipMission", |_, _, _| values([]))?;
+    // `WifMissionFlow.Autosave` asks this after a contract (with whether
+    // a mission is on, the last contract, the time played and the share
+    // of the game done): the game saves.
+    add(&sys, "RequestAutosave", |w, _, _| {
+        w.commands.push(Command::Save {
+            slot: AUTOSAVE.into(),
+        });
+        values([])
+    })?;
     add(&sys, "SubtitlesEnabled", |w, _, _| {
         values([Value::Boolean(!w.subtitles_off)])
     })?;
@@ -2173,6 +2302,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             local l = math.sqrt(x * x + y * y + z * z)
             if l == 0 then return x, y, z end
             return x / l, y / l, z / l
+        end
+        -- A vector's length (the fuel-air bomb measures its drop so).
+        function M.Length(x, y, z)
+            return math.sqrt(x * x + y * y + (z or 0) * (z or 0))
         end
         -- Math is the math library with the additions.
         for k, v in pairs(math) do
@@ -2351,6 +2484,51 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     )?;
     crate::hud::install(lua, world)?;
     crate::layers::install(lua, world)
+}
+
+/// The objects in play within `a`'s radius of its point (x, y, z,
+/// radius) with any of the labels `with` and none of `without`, as a
+/// list ([`ScriptWorld::place_of`]: a rider is where its vehicle is).
+fn collect(
+    w: &mut ScriptWorld,
+    lua: &Lua,
+    a: &[Value],
+    with: &[&str],
+    without: &[&str],
+) -> mlua::Result<MultiValue> {
+    let (Some(x), Some(y), Some(z), Some(r)) =
+        (num(a.first()), num(a.get(1)), num(a.get(2)), num(a.get(3)))
+    else {
+        return values([Value::Table(lua.create_table()?)]);
+    };
+    let hashes = |names: &[&str]| -> Vec<u32> {
+        names
+            .iter()
+            .map(|n| m2_assets::name_hash(&n.to_ascii_lowercase()))
+            .chain(names.iter().map(|n| m2_assets::name_hash(n)))
+            .collect()
+    };
+    let (with, without) = (hashes(with), hashes(without));
+    let mut found: Vec<u32> = w
+        .objects
+        .iter()
+        .filter(|(_, o)| !o.hidden)
+        .filter(|(_, o)| {
+            let labels = o.all_labels();
+            labels.iter().any(|l| with.contains(l)) && !labels.iter().any(|l| without.contains(l))
+        })
+        .filter_map(|(&g, _)| {
+            let p = w.place_of(g)?;
+            let d = ((p[0] - x).powi(2) + (p[1] - y).powi(2) + (p[2] - z).powi(2)).sqrt();
+            (d <= r).then_some(g)
+        })
+        .collect();
+    found.sort_unstable();
+    let list = lua.create_table()?;
+    for g in found {
+        list.raw_push(guid_value(Some(g)))?;
+    }
+    values([Value::Table(list)])
 }
 
 /// A function that records `call` as a [`Command::Notify`].
@@ -2734,10 +2912,51 @@ mod tests {
         assert!(events.update_shared(0.1, &world).is_empty());
         let log: String = host.lua().globals().get("log").unwrap();
         assert_eq!(log, "car ");
-        host.lua().load("Vehicle.Exit(1)").exec().unwrap();
+        // The vehicle first, then its rider, as the scripts call it.
+        host.lua().load("Vehicle.Exit(50, 1, true)").exec().unwrap();
         assert!(events.update_shared(0.1, &world).is_empty());
         let log: String = host.lua().globals().get("log").unwrap();
         assert_eq!(log, "car out ");
+        assert_eq!(world.borrow().objects.get(&1).and_then(|o| o.vehicle), None);
+    }
+
+    #[test]
+    fn asset_loads_call_back_with_their_data_unpacked() {
+        let (host, world) = setup();
+        host.lua()
+            .load(
+                r#"
+                log = {}
+                Pg.LoadAsset("preload", "animation")
+                Pg.LoadAsset("fx", "facefxanimationset", function(name, timed_out)
+                    table.insert(log, name .. " " .. tostring(timed_out))
+                end, { "fx", false })
+                local counter = { n = 1 }
+                Pg.LoadAsset("bank", "soundbank", function(t)
+                    t.n = t.n - 1
+                    table.insert(log, "counter " .. t.n)
+                end, { counter })
+                Pg.UnloadAsset("preload", "animation")
+                "#,
+            )
+            .exec()
+            .unwrap();
+        // Nothing yet: the load answers on the next tick.
+        let count = |host: &ScriptHost| host.lua().load("return #log").eval::<i64>().unwrap();
+        assert_eq!(count(&host), 0);
+        assert!(answer_asset_loads(&world).is_empty());
+        let log: Vec<String> = host
+            .lua()
+            .globals()
+            .get::<Table>("log")
+            .unwrap()
+            .sequence_values()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(log, ["fx false", "counter 0"]);
+        // Each once.
+        assert!(answer_asset_loads(&world).is_empty());
+        assert_eq!(count(&host), 2);
     }
 
     #[test]
@@ -3070,6 +3289,101 @@ mod tests {
     }
 
     #[test]
+    fn a_support_helicopter_comes_with_the_driver_its_template_seats() {
+        let (host, world) = setup();
+        world
+            .borrow_mut()
+            .template_drivers
+            .insert("ah1z (ewan)".into(), "Recruit Ewen Garret".into());
+        let pilot: String = host
+            .lua()
+            .load(
+                r#"local copter = Pg.Spawn("AH1Z (Ewan)", 0, 50, 0, 0)
+                return Object.GetName(Vehicle.GetDriver(copter))"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(pilot, "Recruit Ewen Garret");
+    }
+
+    #[test]
+    fn the_scripts_save_requests_reach_the_game_with_their_slots() {
+        let (host, world) = setup();
+        host.lua()
+            .load(r#"Pg.SaveGame("retry") Sys.RequestAutosave(true, "VzaCon001", 600, 2)"#)
+            .exec()
+            .unwrap();
+        let saves: Vec<Command> = world
+            .borrow_mut()
+            .take_commands()
+            .into_iter()
+            .filter(|c| matches!(c, Command::Save { .. }))
+            .collect();
+        assert_eq!(
+            saves,
+            [
+                Command::Save {
+                    slot: "retry".into()
+                },
+                Command::Save {
+                    slot: AUTOSAVE.into()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_goal_callback_hears_who_had_the_goal_and_that_it_was_done() {
+        let (host, world) = setup();
+        host.lua()
+            .load(
+                r#"Ai.Goal({ AIGuid = Sys.StringToGuid("0x1"), Goal = "HeliLand",
+                    Location = { 1, 2, 3 }, Callback = function(me, pilot, result)
+                        heard = { me, Object.GetName(pilot), result } end,
+                    CallbackData = { "copter" } })"#,
+            )
+            .exec()
+            .unwrap();
+        assert!(goal_finished(&world, 1).is_empty());
+        let (me, pilot, result): (String, String, i64) = host
+            .lua()
+            .load("return heard[1], heard[2], heard[3]")
+            .eval()
+            .unwrap();
+        assert_eq!(
+            (me.as_str(), pilot.as_str(), result),
+            ("copter", "Mattias", 1)
+        );
+    }
+
+    #[test]
+    fn strikes_collect_what_is_near_by_kind_and_measure_to_points() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            let mut tank = Object::new("Tank", [20.0, 0.0, 0.0]);
+            tank.labels.extend(["Vehicle".into(), "Tank".into()]);
+            w.insert(60, tank);
+            let mut far = Object::new("Tank", [500.0, 0.0, 0.0]);
+            far.labels.push("Tank".into());
+            w.insert(61, far);
+        }
+        let (tanks, ground, flying, d): (i64, i64, i64, f64) = host
+            .lua()
+            .load(
+                r#"return #Pg.FastCollectTanks(0, 0, 0, 200),
+                    #Pg.FastCollectGroundVehicles(0, 0, 0, 200),
+                    #Pg.FastCollectFlying(0, 0, 0, 200),
+                    Object.GetDistanceFrom(Sys.StringToGuid("0x1"), 10, 0, 8)"#,
+            )
+            .eval()
+            .unwrap();
+        // The tank and the jeep are ground vehicles; the far tank is out.
+        assert_eq!((tanks, ground, flying), (1, 2, 0));
+        assert!((d - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
     fn single_player_answers() {
         let (host, _) = setup();
         let (server, client, second): (bool, bool, Value) = host
@@ -3078,6 +3392,20 @@ mod tests {
             .eval()
             .unwrap();
         assert!(server && !client && second.is_nil());
+    }
+
+    #[test]
+    fn the_scripts_put_the_loading_screen_up() {
+        let (host, world) = setup();
+        world.borrow_mut().take_commands();
+        host.lua()
+            .load("Net.SetLoadingScreen(true) Net.SetLoadingScreen(false)")
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [Command::LoadingScreen(true), Command::LoadingScreen(false)]
+        );
     }
 
     #[test]

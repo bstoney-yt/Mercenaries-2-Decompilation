@@ -75,6 +75,9 @@ const SUPPORT_FUEL: f64 = 1000.0;
 /// She is ashore this far above the water (metres): not seated in the
 /// start's boat, which the scripts don't count as driving.
 const ASHORE_HEIGHT: f32 = 2.0;
+/// The scripts' steps between looks at her support stock, cash and fuel
+/// (and at once after anything that changes them).
+const STOCK_LOOK: u32 = 10;
 /// ... for this long without a break (seconds): she stands ashore a moment
 /// at the start, before the scripts seat her in the boat.
 const SUPPORT_ASHORE: f32 = 10.0;
@@ -138,6 +141,8 @@ pub struct MissionView {
     pub game_message: Option<ObjectiveMessage>,
     /// The contract was just completed (for [`BANNER_TIME`] seconds).
     pub contract_complete: bool,
+    /// Her cash, as the scripts hold it.
+    pub cash: Option<f64>,
     /// The contract is completed and its fanfare waits for Enter to
     /// close it ([`MissionLink::waiting_fanfare`]).
     pub fanfare_waiting: bool,
@@ -359,12 +364,16 @@ pub struct MissionLink {
     /// ([`Mission::hold_movies`]); otherwise they end at once.
     movies: bool,
     /// With [`movies`](Self::movies), the scripts' skip mode ends once the
-    /// start has run ([`Mission::end_skip_mode`], `--skip-mode-off`).
-    /// Off by default until the scripts that ask about it are surveyed on
-    /// the game's data: the flow was only seen to finish with it on.
+    /// start has run ([`Mission::end_skip_mode`]; `--skip-mode-on` keeps
+    /// it). Surveyed on the game's data (round 25): 7 scripts ask, 36
+    /// times; the mission flow (27 of them) skips its fades and voice
+    /// sequences with it, the PMC HQ its interior. Both contracts' flows
+    /// were seen to finish with it off.
     end_skip: bool,
     /// The player has subtitles on.
     subtitles: bool,
+    /// The player has the tutorial tips on.
+    tutorials: bool,
     /// Time not yet given to the scripts.
     lag: f32,
     log: Option<BufWriter<File>>,
@@ -410,6 +419,33 @@ pub struct MissionLink {
     /// Whether each object `ObjectIsVisible` events wait for was on
     /// screen at the last look, for the log.
     sighted: HashMap<u32, bool>,
+    /// Saves the scripts asked for (`Pg.SaveGame`, `Sys.RequestAutosave`),
+    /// by slot, for the game to write.
+    saves: Vec<String>,
+    /// Steps to the next look at her support stock.
+    stock_look: u32,
+    /// Aimed designators' marks (guid, where) waiting to settle, and the
+    /// scripts' time they do.
+    aimed: Vec<(u32, Vec3, f64)>,
+    /// The pilots of support helicopters that have landed: they get out
+    /// and walk off, and the helicopter stays for her.
+    landed: HashSet<u32>,
+    /// Her cash and fuel as the scripts last said, and the cash and fuel
+    /// she has picked up in all.
+    resources: Option<(f64, f64)>,
+    pub earned: (u64, u64),
+    /// What the support brought so far, for checks.
+    pub counts: SupportCounts,
+}
+
+/// What the support brought in play: helicopters at their drop points
+/// (deliveries and landings), aircraft over their marks, ordnance gone
+/// off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SupportCounts {
+    pub arrived: u32,
+    pub flown: u32,
+    pub burst: u32,
 }
 
 /// The scripts' vehicles in play.
@@ -483,6 +519,7 @@ impl MissionLink {
             movies: false,
             end_skip: false,
             subtitles: true,
+            tutorials: true,
             lag: 0.0,
             log,
             message: None,
@@ -505,6 +542,212 @@ impl MissionLink {
             marked: HashMap::new(),
             markers_logged: HashSet::new(),
             sighted: HashMap::new(),
+            saves: Vec::new(),
+            stock_look: 0,
+            aimed: Vec::new(),
+            landed: HashSet::new(),
+            resources: None,
+            earned: (0, 0),
+            counts: SupportCounts::default(),
+        }
+    }
+
+    /// Every item of the scripts' support catalogue, by key.
+    /// Every item of the scripts' support catalogue: its key, and whether
+    /// it is a strike (`sType` "Airstrike") rather than a delivery.
+    pub fn support_keys(&self) -> Vec<(String, bool)> {
+        match &self.state {
+            State::Running(m) => m
+                .support_items()
+                .into_iter()
+                .map(|i| (i.key, i.kind == "Airstrike"))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Every item of the scripts' support catalogue, readable, for the
+    /// cheat menu ([`crate::cheats`]).
+    pub fn cheat_support(&self) -> Vec<crate::cheats::SupportLine> {
+        let State::Running(m) = &self.state else {
+            return Vec::new();
+        };
+        let mut out: Vec<crate::cheats::SupportLine> = m
+            .support_items()
+            .into_iter()
+            .map(|i| crate::cheats::SupportLine {
+                name: m.text(&i.name),
+                key: i.key,
+                kind: i.kind,
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
+        out
+    }
+
+    /// The cheat menu's support: one of item `key` stocked free into her
+    /// support menu, and called in at once if `call`, as `--support`
+    /// does. The recruits that bring it are freed first, so a second call
+    /// isn't kept waiting. Whether the scripts took the call (true when
+    /// only stocked).
+    pub fn cheat_support_item(&mut self, key: &str, call: bool) -> bool {
+        self.free_recruits();
+        let State::Running(m) = &mut self.state else {
+            return false;
+        };
+        m.stock_support(key, 1, 0.0, 0.0);
+        let took = !call || m.use_support(key);
+        let lines = m.take_log();
+        self.write(lines);
+        self.stock_look = 0;
+        took
+    }
+
+    /// The cheat menu's money: `cash` and `fuel` given the scripts' way.
+    pub fn cheat_money(&mut self, cash: f64, fuel: f64) {
+        if let State::Running(m) = &mut self.state {
+            m.give_resources(cash, fuel, "[Generic.Pickups]");
+            let lines = m.take_log();
+            self.write(lines);
+            self.stock_look = 0;
+        }
+    }
+
+    /// Frees every recruit of the support's (the helicopter pilot, the jet
+    /// pilot...) at once, their cooldowns and errands cut short: for a
+    /// check calling one item after another.
+    pub fn free_recruits(&mut self) {
+        if let State::Running(m) = &mut self.state {
+            let code = "local s = MrxSupportManager._tRecruitStates \
+                        for k in pairs(s or {}) do s[k] = true end";
+            if let Err(e) = m.run(code, "free recruits") {
+                eprintln!("mission: could not free the recruits: {e}");
+            }
+        }
+    }
+
+    /// The saves the scripts asked for since the last call, by slot
+    /// ([`Command::Save`]).
+    pub fn take_saves(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.saves)
+    }
+
+    /// Her cash and fuel as the scripts hold them, once they run.
+    pub fn resources(&self) -> Option<(f64, f64)> {
+        self.resources
+    }
+
+    /// Puts her cash, fuel and support stock back as a save had them:
+    /// what she has now is made up to it the scripts' way
+    /// ([`Mission::give_resources`], `MrxPmc.SetSupportQty`).
+    pub fn restore(&mut self, pmc: &crate::save::PmcSave) {
+        let State::Running(m) = &mut self.state else {
+            return;
+        };
+        let (cash, fuel) = m.resources();
+        m.give_resources(pmc.cash - cash, pmc.fuel - fuel, "[Generic.Pickups]");
+        for (key, count) in &pmc.stock {
+            let code = format!("MrxPmc.SetSupportQty({key:?}, {count})");
+            if let Err(e) = m.run(&code, "restore stock") {
+                eprintln!("mission: could not restore {key}: {e}");
+            }
+        }
+        self.resources = Some(m.resources());
+        self.stock_look = 0;
+    }
+
+    /// Her cash, fuel and the support items she holds, to save.
+    pub fn pmc_save(&self) -> Option<crate::save::PmcSave> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        let (cash, fuel) = m.resources();
+        Some(crate::save::PmcSave {
+            cash,
+            fuel,
+            stock: m
+                .support_items()
+                .into_iter()
+                .filter(|i| i.stock > 0)
+                .map(|i| (i.key, i.stock))
+                .collect(),
+        })
+    }
+
+    /// The scripts' own save data, to keep in a save
+    /// ([`Mission::save_data`]).
+    pub fn script_save(&self) -> Option<String> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        match m.save_data() {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!("mission: the scripts' save data: {e}");
+                None
+            }
+        }
+    }
+
+    /// Opens faction `faction`'s shop as its contact does
+    /// ([`Mission::open_shop`]); with `unlock_all`, everything it sells is
+    /// unlocked first (a cheat: the scripts unlock items as contract
+    /// rewards). What it sells, if it came up.
+    pub fn open_shop(&mut self, faction: &str, unlock_all: bool) -> Option<ShopView> {
+        let State::Running(m) = &mut self.state else {
+            return None;
+        };
+        if unlock_all {
+            let code = format!("{UNLOCK_ALL}\n__m2_unlock_all({faction:?})");
+            if let Err(e) = m.run(&code, "unlock all") {
+                eprintln!("mission: could not unlock the shop: {e}");
+            }
+        }
+        let opened = m.open_shop(faction);
+        let lines = m.take_log();
+        self.write(lines);
+        let State::Running(m) = &mut self.state else {
+            return None;
+        };
+        opened.then(|| shop_view(m))
+    }
+
+    /// Buys one of shop item `id`; the shop as it is now, and whether it
+    /// was sold.
+    pub fn buy(&mut self, id: &str) -> Option<(ShopView, bool)> {
+        let State::Running(m) = &mut self.state else {
+            return None;
+        };
+        let bought = m.buy(id, 1);
+        self.resources = Some(m.resources());
+        self.stock_look = 0;
+        eprintln!(
+            "shop: {id} bought: {bought}; cash {:.0}",
+            self.resources.map_or(0.0, |r| r.0)
+        );
+        let lines = m.take_log();
+        self.write(lines);
+        let State::Running(m) = &mut self.state else {
+            return None;
+        };
+        Some((shop_view(m), bought))
+    }
+
+    /// Leaves the shop.
+    pub fn close_shop(&mut self) {
+        if let State::Running(m) = &mut self.state {
+            m.close_shop();
+        }
+    }
+
+    /// The player's subtitles and tutorial tips, from now on (the pause
+    /// menu's options).
+    pub fn set_options(&mut self, subtitles: bool, tutorials: bool) {
+        self.subtitles = subtitles;
+        self.tutorials = tutorials;
+        if let State::Running(m) = &mut self.state {
+            m.set_subtitles(subtitles);
+            m.set_tutorials(tutorials);
         }
     }
 
@@ -539,7 +782,7 @@ impl MissionLink {
     }
 
     /// Ends the scripts' skip mode once the start has run, when the movies
-    /// wait for the game (`--skip-mode-off`).
+    /// wait for the game (unless `--skip-mode-on`).
     pub fn with_skip_mode_off(self, end_skip: bool) -> Self {
         Self { end_skip, ..self }
     }
@@ -561,6 +804,15 @@ impl MissionLink {
         let lines = m.take_log();
         self.write(lines);
         name.map(|n| (n, subtitles))
+    }
+
+    /// How black the scripts' fade has the screen, 0 to 1 (0 until they
+    /// run).
+    pub fn black(&self) -> f32 {
+        match &self.state {
+            State::Running(m) => m.black(),
+            _ => 0.0,
+        }
     }
 
     /// The game's English strings, once the scripts run.
@@ -632,6 +884,7 @@ impl MissionLink {
                 }
                 self.vehicles.dropped.extend(r.dropped);
                 mission.arrived(r.pilot, r.to.to_array());
+                self.counts.arrived += 1;
             }
         }
         // A crate she broke open is destroyed for the scripts too (what
@@ -839,7 +1092,48 @@ impl MissionLink {
                     eprintln!("mission: support {key} called in: {took}");
                 }
             }
-            report_strikes(game, mission);
+            // The money she picked up is the scripts' to count.
+            for (cash, fuel) in std::mem::take(&mut game.earned) {
+                self.earned.0 += u64::from(cash);
+                self.earned.1 += u64::from(fuel);
+                mission.give_resources(f64::from(cash), f64::from(fuel), "[Generic.Pickups]");
+                self.stock_look = 0;
+            }
+            // What she chose in the support menu, the scripts call in;
+            // they hand her its designator.
+            if let Some(key) = game.support.call_in.take() {
+                let took = mission.use_support(&key);
+                eprintln!("mission: she calls in {key}: {took}");
+                self.stock_look = 0;
+            }
+            // An aimed designator came down: the support manager takes the
+            // spot as it takes a thrown marker's (the laser's own callback,
+            // `LaserFinished`, isn't called).
+            if let Some((what, at)) = game.support.designated.take() {
+                let at = ground_under(game, at);
+                let g = mission.designator_thrown(PLAYER, what, at.to_array());
+                eprintln!("mission: her {what} marks {at:.1} ({g:#x})");
+                self.aimed
+                    .push((g, at, mission.now() + f64::from(MARKER_TIMER)));
+                self.stock_look = 0;
+            }
+            // ... and settles there after a thrown marker's time: the
+            // manager checks the spot in between (its validation queue),
+            // and a mark settled at once is never taken up.
+            let now = mission.now();
+            for (g, at, _) in self.aimed.extract_if(.., |a| a.2 <= now) {
+                mission.designator_settled(g, at.to_array());
+            }
+            // Her stock, cash and fuel as the scripts hold them.
+            if self.stock_look == 0 {
+                game.support.stock = stocked(mission);
+                self.resources = Some(mission.resources());
+                self.stock_look = STOCK_LOOK;
+            }
+            self.stock_look -= 1;
+            let (flown, burst) = report_strikes(game, mission);
+            self.counts.flown += flown;
+            self.counts.burst += burst;
             mission.set_player_reserve("C4", game.combat.charges);
             let spare = game.combat.rifle_rounds.stored;
             mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
@@ -932,11 +1226,15 @@ impl MissionLink {
                     Command::DropWeapon { who, weapon } => {
                         eprintln!("mission: {who:#x} lets go of their {weapon}");
                     }
+                    Command::Save { slot } => {
+                        eprintln!("mission: the scripts ask for a save ({slot})");
+                        self.saves.push(slot.clone());
+                    }
                     _ => {}
                 }
                 support_item(game, &c);
                 strike(game, &c);
-                fly(game, mission, &c);
+                fly(game, mission, &mut self.landed, &c);
                 if obey(game, mission, &mut self.vehicles, &c) {
                     self.ashore = ASHORE_TRIES;
                 }
@@ -987,13 +1285,14 @@ impl MissionLink {
                     mission.hold_movies();
                 }
                 mission.set_subtitles(self.subtitles);
+                mission.set_tutorials(self.tutorials);
                 mission.start();
                 if self.movies && self.end_skip {
                     // The movies wait for the game, so the scripts' skip
                     // mode has done its part.
                     mission.end_skip_mode();
                 } else if self.movies {
-                    eprintln!("mission: the scripts' skip mode stays on (--skip-mode-off)");
+                    eprintln!("mission: the scripts' skip mode stays on (--skip-mode-on)");
                 }
                 let lines = mission.take_log();
                 for c in mission.take_commands() {
@@ -1359,6 +1658,7 @@ impl MissionLink {
             message,
             game_message,
             contract_complete: self.completed.is_some_and(|age| age < BANNER_TIME),
+            cash: self.resources.map(|r| r.0),
             fanfare_waiting: self.completed.is_some() && waiting_fanfare(mission.lua()).is_some(),
             radar_regions: radar_regions(mission.lua()),
             hud_calls: hud_calls(mission.lua()),
@@ -1497,7 +1797,8 @@ impl Fleet {
             let (Some(g), Some(id)) = (v.guid, v.id) else {
                 continue;
             };
-            if v.wrecked {
+            // A ruin stands wrecked from the start: nothing died.
+            if v.wrecked && !game.scene.ruins.contains(&g) {
                 mission.kill(g);
             }
             if self.landing.contains_key(&g) {
@@ -1541,8 +1842,15 @@ impl Fleet {
             .count();
         drop(w);
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let w = mission.world().borrow();
         for (_, g, models) in wanted.into_iter().take(MAX_VEHICLES.saturating_sub(live)) {
             self.requested.insert(g);
+            // A vehicle's ruin (`M151_Ruin`) stands wrecked.
+            if let (Some(o), Some(island)) = (w.objects.get(&g), game.scene.world.as_ref())
+                && is_ruin(&island.index.template_db, &o.name)
+            {
+                game.scene.ruins.insert(g);
+            }
             game.scene.load_vehicle(g, models);
         }
     }
@@ -1776,16 +2084,19 @@ fn strike(game: &mut Game, c: &Command) {
     game.scene.strikes.start(c, templates);
     match c {
         // A smoke grenade, flare or beacon is thrown; the satellite and
-        // laser designators are aimed, which this game doesn't do for the
-        // scripts' strikes yet.
+        // laser designators are aimed ([`support::Aim`]).
         Command::EquipDesignator { who, kind, .. } if *who == PLAYER => {
             let thrown = ["Smoke", "Flare", "Beacon"]
                 .iter()
                 .any(|k| kind.contains(k));
-            eprintln!("mission: the scripts hand her a {kind} (thrown: {thrown})");
+            let aimed = !thrown && game.support.equip(kind);
+            eprintln!("mission: the scripts hand her a {kind} (thrown: {thrown}, aimed: {aimed})");
             game.combat.to_throw = thrown;
         }
-        Command::RemoveDesignator { who } if *who == PLAYER => game.combat.to_throw = false,
+        Command::RemoveDesignator { who } if *who == PLAYER => {
+            game.combat.to_throw = false;
+            game.support.unequip();
+        }
         Command::DirectedEffect { what, at, .. } => {
             eprintln!("mission: effect {what} at {at:?} (not drawn yet)");
         }
@@ -1794,8 +2105,9 @@ fn strike(game: &mut Game, c: &Command) {
 }
 
 /// Tells the scripts of her designators thrown and come to rest, the
-/// aircraft over their marks and the ordnance gone off.
-fn report_strikes(game: &mut Game, mission: &mut Mission) {
+/// aircraft over their marks and the ordnance gone off; how many of the
+/// last two there were.
+fn report_strikes(game: &mut Game, mission: &mut Mission) -> (u32, u32) {
     let settle = game
         .scene
         .world
@@ -1822,12 +2134,129 @@ fn report_strikes(game: &mut Game, mission: &mut Mission) {
         }
     }
     let strikes = &mut game.scene.strikes;
+    let counts = (strikes.arrived.len() as u32, strikes.burst.len() as u32);
     for (g, at) in strikes.arrived.drain(..) {
         mission.flyby_arrived(g, at.to_array());
     }
     for (g, _, at) in strikes.burst.drain(..) {
         mission.ordnance_burst(g, at.to_array());
     }
+    counts
+}
+
+/// The ground under `at` (a satellite's mark is on the ground she stands
+/// on); `at` itself where nothing is found.
+fn ground_under(game: &Game, at: Vec3) -> Vec3 {
+    const ABOVE: f32 = 300.0;
+    let top = at + Vec3::Y * ABOVE;
+    game.scene
+        .world
+        .as_ref()
+        .and_then(|w| w.physics.cast_ray(top, Vec3::NEG_Y, ABOVE * 2.0))
+        .map_or(at, |(d, _)| top - Vec3::Y * d)
+}
+
+/// The factions whose contacts keep a shop, as the scripts name them
+/// (`MrxFactionManager`'s keys), and as the shop's tabs name them.
+pub const SHOPS: [(&str, &str); 6] = [
+    ("All", "Allied Nations"),
+    ("Chi", "China"),
+    ("Gur", "PLAV"),
+    ("Pir", "Pirates"),
+    ("Oil", "Universal Petroleum"),
+    ("Pmc", "Your PMC"),
+];
+
+/// Lua that unlocks everything faction `f`'s shop could ever sell, as
+/// the contracts' rewards would one by one (`MrxRewardData`'s potential
+/// shop items; a support item is unlocked by its `tUnlockStatus` for the
+/// faction, equipment by `WifEquipmentData.UnlockItem`). The recruits the
+/// support needs (the helicopter and jet pilots, the mechanic: the story
+/// brings them one by one, and without them a strike is refused, "Pilot
+/// unavailable") join too, as the scripts' own setters have them.
+const UNLOCK_ALL: &str = r#"
+function __m2_unlock_all(f)
+    MrxSupportData.SetHeliPilotRecruited(true)
+    MrxSupportData.SetJetPilotRecruited(true)
+    MrxSupportData.SetMechanicRecruited(true)
+    local support, equipment = MrxRewardData.GetAllPotentialShopItems(f)
+    local seen = MrxSupportData._knUnlockStatusViewed or 2
+    for _, key in ipairs(support or {}) do
+        local item = MrxSupportData.tSupportData[key]
+        if item then
+            item.tUnlockStatus = item.tUnlockStatus or {}
+            if item.tUnlockStatus[f] == nil then item.tUnlockStatus[f] = seen end
+        end
+    end
+    for _, key in ipairs(equipment or {}) do
+        WifEquipmentData.UnlockItem(key, f)
+    end
+end
+"#;
+
+/// A shop as the player sees it: her cash, and each thing on sale.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShopView {
+    pub cash: f64,
+    pub fuel: f64,
+    pub items: Vec<ShopLine>,
+}
+
+/// A thing on sale, readable.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShopLine {
+    /// What buying it names.
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub price: f64,
+    /// How many she holds, and the most she may.
+    pub stock: i64,
+    pub most: i64,
+    pub unlocked: bool,
+}
+
+/// The shop the scripts have up, its texts read.
+fn shop_view(m: &Mission) -> ShopView {
+    let (cash, fuel) = m.resources();
+    let items = m
+        .shop()
+        .items
+        .into_iter()
+        .map(|i| ShopLine {
+            name: m.text(&i.name),
+            description: m.text(&i.description),
+            id: i.id,
+            price: i.cash,
+            stock: i.stock,
+            most: i.max_stock,
+            unlocked: i.unlocked,
+        })
+        .collect();
+    ShopView { cash, fuel, items }
+}
+
+/// The scripts' support items she holds (bought or free), readable, for
+/// the support menu.
+fn stocked(m: &Mission) -> Vec<support::Stocked> {
+    m.support_items()
+        .into_iter()
+        .filter(|i| i.stock > 0 || i.free > 0)
+        .map(|i| support::Stocked {
+            name: {
+                let shown = m.text(&i.name);
+                if shown.is_empty() {
+                    i.key.clone()
+                } else {
+                    shown
+                }
+            },
+            method: i.designator.trim_end_matches(" Designator").to_owned(),
+            count: u32::try_from(i.stock.max(0) + i.free.max(0)).unwrap_or(0),
+            free: i.free > 0,
+            key: i.key,
+        })
+        .collect()
 }
 
 /// The scripts' free support items, given her or taken back.
@@ -1907,14 +2336,28 @@ fn break_props(game: &mut Game, mission: &Mission) {
 /// with what hangs from its winch, sends it home once it has let go (the
 /// scripts' `MoveTo`), and takes away crates the scripts remove. A
 /// delivery whose helicopter the scripts don't have arrives at once.
-fn fly(game: &mut Game, mission: &mut Mission, c: &Command) {
+///
+/// A support helicopter's landing ([`m2_game::mission::LAND`]) is flown
+/// the same way, with nothing on the winch, down to the mark: its goal's
+/// location is 50 m over the mark (the copter delivery's script adds 50
+/// to the mark's height). Once down its pilot gets out and walks off, and
+/// the helicopter stays: its pilot's `MoveTo` doesn't send it home
+/// (`landed`). It can't be flown in this game yet.
+fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Command) {
+    const LAND_ABOVE: f32 = 50.0;
     match c {
         Command::Goal {
             guid,
             goal,
             location: Some(to),
             ..
-        } if goal == "Deliver" => {
+        } if goal == "Deliver" || goal == m2_game::mission::LAND => {
+            let to = &if goal == m2_game::mission::LAND {
+                landed.insert(*guid);
+                [to[0], to[1] - LAND_ABOVE, to[2]]
+            } else {
+                *to
+            };
             let none = Templates::default();
             let templates = game
                 .scene
@@ -2014,7 +2457,7 @@ fn fly(game: &mut Game, mission: &mut Mission, c: &Command) {
             goal,
             location: Some(to),
             ..
-        } if goal == "MoveTo" && game.scene.flights.flying(*guid) => {
+        } if goal == "MoveTo" && game.scene.flights.flying(*guid) && !landed.contains(guid) => {
             game.scene.flights.send_home(*guid, Vec3::from(*to));
         }
         Command::Remove(guid) => game
@@ -2240,6 +2683,11 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             game.sky.immediate = *on;
             return false;
         }
+        // Up until the place has loaded (the engine's to take down).
+        Command::LoadingScreen(on) => {
+            game.arrival = on.then_some(0.0);
+            return false;
+        }
         // A state layer in or out: its models and people with it.
         Command::Layer { op, name } => {
             let entities: Vec<u32> = mission
@@ -2287,6 +2735,9 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         _ => None,
     };
     let Some(to) = to else { return false };
+    if let Some(from) = game.scene.player.as_ref().map(|p| p.character.position) {
+        game.teleported(from, Vec3::from(to));
+    }
     if let Some(p) = game.scene.player.as_mut() {
         // At the height they give: onto the floor or ground there, not a
         // roof over it.
@@ -2332,6 +2783,11 @@ pub(crate) fn template_models(
             vehicle: Some(VehicleKind::Boat | VehicleKind::Helicopter),
             ..
         }) => Vec::new(),
+        // A template the database knows with no vehicle physics is no
+        // vehicle, whatever its name's words: `68Valiant_Ruin`, a burnt
+        // car its own model draws, isn't a Valiant to drive (round 8:
+        // the two ruins by VzaCon001's huts stood twice, intact too).
+        Some(&TemplateInfo { vehicle: None, .. }) => Vec::new(),
         _ => vehicle_models(name, catalogue),
     }
 }
@@ -2362,6 +2818,18 @@ pub(crate) fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
 pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
     let info = templates.leavings.pickups.get(&id)?;
     let model = templates.by_id(id).and_then(|(_, t)| t.model);
+    // Money: cash or fuel, as much as its rounds field says.
+    if matches!(info.kind, m2_engine::pickup::CASH | m2_engine::pickup::FUEL) {
+        let cash = info.kind == m2_engine::pickup::CASH;
+        return Some(Leaves {
+            template: id,
+            model,
+            reach: info.radius,
+            cash: if cash { info.rounds } else { 0 },
+            fuel: if cash { 0 } else { info.rounds },
+            ..Leaves::default()
+        });
+    }
     // A gun of the templates' with its model (of several, the lowest).
     let gun = model.and_then(|m| {
         templates
@@ -2415,7 +2883,55 @@ pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
         // Every health record's, not only a health pickup's: the small
         // ammunition box heals 3 as well.
         health: info.heals as f32,
+        ..Leaves::default()
     })
+}
+
+/// How she takes a pickup lying within reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Offer {
+    /// As she walks over it, unworded.
+    Walk,
+    /// With the use key, worded "Take Ammo": its ammunition only.
+    TakeAmmo,
+    /// With the use key, worded "Equip <its name>": the weapon taken up
+    /// in place of one of hers.
+    Equip,
+}
+
+/// How she takes pickup `what`, as the real game's footage shows it
+/// (playtest 3; inferred, no `Pickup` field found to say it): what has a
+/// health record (`Health Pickup`, and `Ammo Pickup (Small)`, which heals
+/// 3) is walked over (3:32, health 62 to 100); a weapon she doesn't carry
+/// is "Equip Assault Rifle" (3:14, 14:20, 15:24); one she carries, and an
+/// ammunition box without health (`Ammo Pickup (Bullet)`, the rockets),
+/// "Take Ammo" (9:00, 9:42, 15:38, 16:36).
+pub(crate) fn offer(templates: &Templates, combat: &combat::Combat, what: &Leaves) -> Offer {
+    // Money is walked over, whatever she carries (inferred: its record
+    // names nothing to choose, and no prompt for it was seen).
+    if what.is_money() {
+        return Offer::Walk;
+    }
+    if what.weapon.is_some() {
+        let is = |t: Option<u32>| t.is_some() && (t == what.gun || t == Some(what.template));
+        let carries =
+            is(combat.rifle.template) || (combat.second.is_some() && is(combat.launcher.template));
+        return if carries {
+            Offer::TakeAmmo
+        } else {
+            Offer::Equip
+        };
+    }
+    let heals = templates
+        .leavings
+        .pickups
+        .get(&what.template)
+        .is_some_and(|p| p.heals > 0);
+    if heals || what.health > 0.0 {
+        Offer::Walk
+    } else {
+        Offer::TakeAmmo
+    }
 }
 
 /// Whether a `Pickup` record's ammunition `ammo` is for weapon template
@@ -2550,6 +3066,17 @@ fn ai_flown(w: &m2_game::api::ScriptWorld, guid: u32, models: &[CatalogueEntry])
 /// ([`template_models`]): by its name, else (a state layer's renamed
 /// entity, the first contract's `VzaCon001_StartingBoat`) by the template
 /// it is an instance of.
+/// Whether the template an object or entity named `name` is an instance
+/// of stands destroyed ([`Templates::ruined`]: its `Health` is 0): a
+/// vehicle's ruin (`M151_Ruin`, `AMX30_RUIN`) has its intact twin's
+/// model and physics, to stand wrecked.
+pub(crate) fn is_ruin(templates: &Templates, name: &str) -> bool {
+    templates
+        .ids(name)
+        .iter()
+        .any(|id| templates.ruined.contains(id))
+}
+
 fn object_models(
     guid: u32,
     name: &str,
@@ -2729,6 +3256,52 @@ mod tests {
     }
 
     #[test]
+    fn health_and_small_boxes_are_walked_over_and_the_rest_worded() {
+        use m2_engine::pickup::{AMMUNITION, HEALTH, Leavings, PickupInfo};
+        let info = |kind, heals, gives: Vec<(u32, u32)>| PickupInfo {
+            kind,
+            radius: 1.0,
+            ammo: None,
+            rounds: 0,
+            walked: gives.clone(),
+            gives,
+            heals,
+            cue: None,
+            effect: None,
+        };
+        // The PC data's `Health Pickup` (50), `Ammo Pickup (Small)` (3
+        // rounds and 3 health), `Ammo Pickup (Bullet)` (20 rounds).
+        let (health, small, bullet) = (0x8000_6ea9, 0x8000_a286, 0x8000_233e);
+        let db = Templates {
+            leavings: Leavings {
+                pickups: HashMap::from([
+                    (health, info(HEALTH, 50, Vec::new())),
+                    (small, info(AMMUNITION, 3, vec![(0x8000_4375, 3)])),
+                    (bullet, info(AMMUNITION, 0, vec![(0x8000_4375, 20)])),
+                ]),
+                ..Leavings::default()
+            },
+            ..Templates::default()
+        };
+        let mut combat = combat::Combat::default();
+        let lying = |template, weapon: Option<Weapon>| Leaves {
+            template,
+            weapon,
+            ..Leaves::default()
+        };
+        assert_eq!(offer(&db, &combat, &lying(health, None)), Offer::Walk);
+        assert_eq!(offer(&db, &combat, &lying(small, None)), Offer::Walk);
+        assert_eq!(offer(&db, &combat, &lying(bullet, None)), Offer::TakeAmmo);
+        // A soldier's `Assault Rifle`: "Equip" over her carbine, "Take
+        // Ammo" once she carries one.
+        let ak = lying(0x8000_436f, Some(Weapon::Rifle));
+        combat.rifle.template = Some(0x8000_af91);
+        assert_eq!(offer(&db, &combat, &ak), Offer::Equip);
+        combat.rifle.template = Some(0x8000_436f);
+        assert_eq!(offer(&db, &combat, &ak), Offer::TakeAmmo);
+    }
+
+    #[test]
     fn a_soldiers_rifle_lies_loaded_and_gives_its_bullets_walked_over() {
         use m2_engine::pickup::{EQUIPMENT, Leavings, PickupInfo};
         use m2_engine::weapons::{Ammo, Arms, WeaponSpec};
@@ -2758,6 +3331,7 @@ mod tests {
                 damage: 10.0,
                 damage_min: 10.0,
                 falloff: (0.0, 0.0),
+                hero: 1.0,
                 key: None,
                 blast: None,
                 timer: None,
@@ -2768,6 +3342,8 @@ mod tests {
             },
             lock_on: None,
             pickup: Some(8),
+            feel: Default::default(),
+            hint: None,
         };
         let db = Templates {
             infos: HashMap::from([(
@@ -3000,6 +3576,45 @@ mod tests {
         assert!(models("Alouette3 Transport (VZA Intro) (Driver)").is_empty());
         assert!(models("VZ Soldier 0x00000001").is_empty());
         assert!(models("Supply Drop (GL)").is_empty());
+    }
+
+    #[test]
+    fn a_burnt_car_is_no_car_to_drive_and_a_vehicle_ruin_stands_wrecked() {
+        let catalogue = [
+            entry(1, "car", "global_veh_68valiant"),
+            entry(2, "truck", "vz_veh_truck_m151"),
+        ];
+        let mut db = Templates::default();
+        // `68Valiant_Ruin`: a burnt car of its own model, no vehicle
+        // physics; `M151_Ruin`: the jeep's model and physics, `Health` 0.
+        for (id, name, vehicle) in [
+            (0x8000_6a30, "68Valiant_Ruin", None),
+            (0x9000_01f6, "M151_Ruin", Some(VehicleKind::Car)),
+        ] {
+            let info = TemplateInfo {
+                model: Some(id),
+                vehicle,
+                engine: None,
+                person: false,
+                human: false,
+            };
+            db.by_name.insert(name.to_ascii_lowercase(), info);
+            db.infos.insert(id, info);
+            db.names.insert(id, name.to_owned());
+            db.ruined.insert(id);
+        }
+        // Its name's words (`68valiant`) found the Valiant to drive.
+        assert_eq!(
+            vehicle_models("68Valiant_Ruin 0x00133154", &catalogue).len(),
+            1
+        );
+        assert!(template_models("68Valiant_Ruin 0x00133154", &db, &catalogue).is_empty());
+        assert_eq!(
+            template_models("M151_Ruin 0x000aef56", &db, &catalogue).len(),
+            1
+        );
+        assert!(is_ruin(&db, "M151_Ruin 0x000aef56"));
+        assert!(!is_ruin(&db, "M151 Softtop (VZ) 0x0012abcd"));
     }
 
     #[test]

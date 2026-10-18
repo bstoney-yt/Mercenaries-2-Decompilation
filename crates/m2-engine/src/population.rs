@@ -12,11 +12,24 @@
 //! id and a weight; `AiPatrol` has its path entity at 8 and `Haste` at 12.
 //! The names are found by hash first, so a schema that moves them still
 //! reads.
+//!
+//! The spawner's other fields, named by hashing guesses (2026-10-14/15):
+//! `SpawnerName` (32), `UnitList` (44, the list above), `PathSpacing`
+//! (64, 0 on every template), `SpawnerRadiusType` (76), `SpawnerGroup`
+//! (88), the bytes `SkipPercentChance` (92), `ChanceNotActive` (95),
+//! `ChanceToDeactivate` (96) and `PathCount` (99), and `TrafficSpawner`
+//! (108). Still unnamed, so unused: 56 (`d192b18a`, read as [`Spawner::far`]),
+//! 68 (a template, on 7 records), 72 (`87f967e5`: 1 on 1,368 of 1,411
+//! records, 4, 0, 5, 7, 9 or 2 on the rest), 80 (`a57afeeb`: 0 to 4), the
+//! bytes at 93, 94, 97 and 98, and the flags at 100 and 104. Which of
+//! them, if any, says how many a spawner keeps out is not known: the
+//! alpha's one at a time stands.
 
 use std::collections::HashMap;
 
 use m2_assets::layer::Component;
 use m2_assets::{Layer, name_hash};
+use m2_math::glam::{Quat, Vec2, Vec3};
 
 /// A spawner's settings.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -63,6 +76,159 @@ pub struct Population {
     /// Who rides in a vehicle template, by id: each `Rider` record's seat
     /// (its name's hash) and person template id (empty seats left out).
     pub riders: HashMap<u32, Vec<(u32, u32)>>,
+    /// The road kinds, by the hash of their template's name without its
+    /// leading underscore (`commercial_road10`), the name a placed
+    /// `Road` gives at 4: [`RoadKind`].
+    pub road_kinds: HashMap<u32, RoadKind>,
+}
+
+/// What a kind of road is, as its template says: its name and its
+/// `LaneData`, if it has one.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RoadKind {
+    pub name: String,
+    pub lanes: Option<RoadLanes>,
+}
+
+/// A road template's `LaneData` (read off the install, 2026-10-15: 105
+/// templates). Four strips, each a kind and a width (the record's
+/// 16-byte groups: kind at 0, a word always 0, the width at 8, a float
+/// always 0 but once); and `LaneZeroDirection`'s `LaneDirection` (name
+/// found by hash) where the template has one: only the five `road5`s.
+///
+/// What the strips mean is inferred from samples, not from the code:
+/// - The kinds: 0 on the carriageways only (two on the `road20`s and
+///   freeways, one on the `road10`s), 1 on every sidewalk template and
+///   at the edge of the town roads but none of the freeways, the
+///   bridges or the runway, 2 only in the first strip of the `road20`s,
+///   freeways and bridges (a median), and 3 the rest, with a width of 5
+///   or 0 alike (none: the curbs', walls' and driveways' four strips are
+///   all 3). So 0 is a lane of traffic, 1 a walkway, 2 a median.
+/// - The strips go out from the road's line, each side alike (the
+///   median first; a sidewalk template is one walkway strip).
+/// - The widths don't add up to the road's own (its box, see
+///   [`crate::world::Road`]: `commercial_road10`'s strips 8 + 4, its
+///   half-width 13; `commercial_road20`'s 4 + 7.5 + 7.5 + 4, its 22), so
+///   they are taken as shares of it.
+/// - `LaneDirection` likely makes a `road5` one way; which way is not
+///   known, so it isn't used.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RoadLanes {
+    pub strips: [(u32, f32); 4],
+    pub direction: Option<u32>,
+}
+
+/// [`RoadLanes`] strip kinds.
+pub const LANE_TRAFFIC: u32 = 0;
+pub const LANE_WALKWAY: u32 = 1;
+pub const LANE_MEDIAN: u32 = 2;
+pub const LANE_NONE: u32 = 3;
+
+impl RoadLanes {
+    /// Each strip that is something, with how far out from the road's
+    /// line its middle is, for a road `half` metres from its line to its
+    /// edge: the strips' widths as shares of it.
+    pub fn layout(&self, half: f32) -> Vec<(u32, f32)> {
+        let used: Vec<(u32, f32)> = self
+            .strips
+            .iter()
+            .copied()
+            .filter(|&(k, w)| k != LANE_NONE && w > 0.0)
+            .collect();
+        let total: f32 = used.iter().map(|&(_, w)| w).sum();
+        if total <= 0.0 {
+            return Vec::new();
+        }
+        let mut from = 0.0;
+        used.into_iter()
+            .map(|(k, w)| {
+                let w = w / total * half;
+                let mid = from + w / 2.0;
+                from += w;
+                (k, mid)
+            })
+            .collect()
+    }
+
+    /// How far out from the line the middles of its lanes of traffic
+    /// are, inner first.
+    pub fn traffic(&self, half: f32) -> Vec<f32> {
+        self.of(LANE_TRAFFIC, half)
+    }
+
+    /// How far out from the line the middles of its walkways are.
+    pub fn walkways(&self, half: f32) -> Vec<f32> {
+        self.of(LANE_WALKWAY, half)
+    }
+
+    fn of(&self, kind: u32, half: f32) -> Vec<f32> {
+        self.layout(half)
+            .into_iter()
+            .filter(|&(k, _)| k == kind)
+            .map(|(_, at)| at)
+            .collect()
+    }
+}
+
+/// Every road kind of the database, by its name's hash without the
+/// leading underscore: the templates with `LaneData`, and the others
+/// whose name holds "road". Of templates sharing that hash, one with
+/// `LaneData` first, then one whose name has the underscore (the
+/// model's own template, `_commercial_road5`, not the test template
+/// `commercial_road5` that shares the generic `Road`'s strips), then the
+/// lowest id.
+pub fn road_kinds(db: &Layer<'_>) -> HashMap<u32, RoadKind> {
+    let direction: HashMap<u32, u32> = db
+        .component("LaneZeroDirection")
+        .map(|c| {
+            let at = field_at(c, "LaneDirection").unwrap_or(0);
+            c.records()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(id, r)| Some((id, word(r, at)?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let lanes: HashMap<u32, RoadLanes> = db
+        .component("LaneData")
+        .map(|c| {
+            c.records()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(id, r)| {
+                    let strip = |i: usize| Some((word(r, i * 16)?, float(r, i * 16 + 8)?));
+                    Some((
+                        id,
+                        RoadLanes {
+                            strips: [strip(0)?, strip(1)?, strip(2)?, strip(3)?],
+                            direction: direction.get(&id).copied(),
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let rank = |k: &RoadKind| (k.lanes.is_some(), k.name.starts_with('_'));
+    let mut out: HashMap<u32, RoadKind> = HashMap::new();
+    let mut names: Vec<(u32, &str)> = db.names().into_iter().collect();
+    names.sort_unstable();
+    for (id, name) in names {
+        let kind = RoadKind {
+            name: name.to_owned(),
+            lanes: lanes.get(&id).copied(),
+        };
+        if kind.lanes.is_none() && !name.to_ascii_lowercase().contains("road") {
+            continue;
+        }
+        let key = name_hash(name.trim_start_matches('_'));
+        match out.get(&key) {
+            Some(had) if rank(had) >= rank(&kind) => {}
+            _ => {
+                out.insert(key, kind);
+            }
+        }
+    }
+    out
 }
 
 const LIST_AT: usize = 44;
@@ -94,6 +260,7 @@ impl Population {
             lists,
             haste: db.component("AiPatrol").map(haste).unwrap_or_default(),
             riders: db.component("Rider").map(riders).unwrap_or_default(),
+            road_kinds: road_kinds(db),
         }
     }
 }
@@ -216,6 +383,140 @@ fn weight_of(b: &[u8]) -> f32 {
     }
 }
 
+/// An area's traffic and passers-by: a `LineRegion` entity's outline with
+/// its `PopulationDensity` record. Read off the install (2026-10-14, 281
+/// records in 80 layers): each names a vehicle list and a people list
+/// (`VehList_Mar_Outskirt_Act1`, `PedList_Mar_Outskirt_Act1`; or
+/// `VehList_Blank` and `PedList_Blank`, in the `*_DeadTraffic` regions
+/// round the mission sites), two counts, a `Priority` (5 to 100) and a
+/// `faction`. Inferred from samples, not from the code: the first count
+/// is how many vehicles are out (Maracaibo's city centre 8, its
+/// outskirts 6, a dead region 1), the second how many people (the city
+/// centre 20, the outskirts 2), and where regions overlap the one of
+/// highest priority rules (the dead regions are 100, the island-wide
+/// `mar_bigA` 5).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DensityZone {
+    pub entity: u32,
+    pub name: String,
+    /// The layer placing it, by name hash: a state layer
+    /// (`vz_state_mar_outskirt_act1`) or a static sub-layer.
+    pub layer: u32,
+    pub static_layer: bool,
+    /// Its outline on the ground (x, z), world space.
+    pub outline: Vec<Vec2>,
+    pub vehicles: u32,
+    pub people: u32,
+    /// The lists, by template id (0: none).
+    pub vehicle_list: u32,
+    pub people_list: u32,
+    pub priority: u32,
+    pub faction: u32,
+}
+
+impl DensityZone {
+    /// Whether the column over (`x`, `z`) is inside.
+    pub fn contains(&self, x: f32, z: f32) -> bool {
+        let mut inside = false;
+        let n = self.outline.len();
+        for i in 0..n {
+            let (a, b) = (self.outline[i], self.outline[(i + n - 1) % n]);
+            if (a.y > z) != (b.y > z) && x < (b.x - a.x) * (z - a.y) / (b.y - a.y) + a.x {
+                inside = !inside;
+            }
+        }
+        inside
+    }
+}
+
+/// The zone of `zones` that rules at (`x`, `z`): of those it is inside,
+/// the one of highest priority (the lowest entity of equals).
+pub fn zone_at<'a>(
+    zones: impl IntoIterator<Item = &'a DensityZone>,
+    x: f32,
+    z: f32,
+) -> Option<&'a DensityZone> {
+    zones
+        .into_iter()
+        .filter(|zone| zone.contains(x, z))
+        .min_by_key(|zone| (std::cmp::Reverse(zone.priority), zone.entity))
+}
+
+/// `PopulationDensity`'s fields by hash: the two counts (names not found
+/// in 2- and 3-word guesses of a 450-word list), `VehicleSpawnList` and
+/// `PedSpawnList` (names found by hash, 2026-10-15).
+const DENSITY_VEHICLES: u32 = 0x263c_1369;
+const DENSITY_PEOPLE: u32 = 0xc63c_9abc;
+const DENSITY_VEHICLE_LIST: u32 = 0x77e8_38e4;
+const DENSITY_PEOPLE_LIST: u32 = 0xafb4_5fd9;
+
+/// A layer's traffic zones: its entities with `PopulationDensity` and a
+/// `LineRegion`, whose outline `shape` reads from the region's hash (in
+/// the entity's own space).
+pub fn read_zones(
+    layer: &Layer<'_>,
+    layer_hash: u32,
+    static_layer: bool,
+    mut shape: impl FnMut(u32) -> Option<Vec<[f32; 2]>>,
+) -> Vec<DensityZone> {
+    let Some(c) = layer.component("PopulationDensity") else {
+        return Vec::new();
+    };
+    let by_hash = |h: u32| {
+        c.fields
+            .iter()
+            .find(|f| f.name_hash == h)
+            .map(|f| usize::from(f.offset))
+    };
+    let at = [
+        by_hash(DENSITY_VEHICLES),
+        by_hash(DENSITY_PEOPLE),
+        by_hash(DENSITY_VEHICLE_LIST),
+        by_hash(DENSITY_PEOPLE_LIST),
+        field_at(c, "Priority"),
+        field_at(c, "faction"),
+    ];
+    let lines = layer.hashes("LineRegion");
+    let placements = layer.placements();
+    let names = layer.names();
+    let mut out: Vec<DensityZone> = c
+        .records()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(entity, r)| {
+            let [v, p, vl, pl, pr, f] = at.map(|o| o.and_then(|o| word(r, o)).unwrap_or(0));
+            let place = placements.get(&entity)?;
+            let corners = shape(*lines.get(&entity)?)?;
+            let (centre, q) = (
+                Vec3::from(place.position),
+                Quat::from_array(place.rotation).normalize(),
+            );
+            let outline = corners
+                .iter()
+                .map(|&[x, z]| {
+                    let w = centre + q * Vec3::new(x, 0.0, z);
+                    Vec2::new(w.x, w.z)
+                })
+                .collect();
+            Some(DensityZone {
+                entity,
+                name: names.get(&entity).copied().unwrap_or("").to_owned(),
+                layer: layer_hash,
+                static_layer,
+                outline,
+                vehicles: v,
+                people: p,
+                vehicle_list: vl,
+                people_list: pl,
+                priority: pr,
+                faction: f,
+            })
+        })
+        .collect();
+    out.sort_unstable_by_key(|z| z.entity);
+    out
+}
+
 /// Picks an entry by weight; `roll` is in [0, 1).
 pub fn pick(entries: &[(u32, f32)], roll: f32) -> Option<u32> {
     let total: f32 = entries.iter().map(|&(_, w)| w.max(0.0)).sum();
@@ -263,6 +564,67 @@ mod tests {
         assert_eq!(seat_name(0xf8b8_325f), "seat_driver");
         assert_eq!(seat_name(0x1b21_7b8a), "seat_gunner_rearcenter");
         assert_eq!(seat_name(0xd055_9110), "d0559110");
+    }
+
+    #[test]
+    fn the_zone_of_highest_priority_rules() {
+        let square = |x0: f32, z0: f32, side: f32| {
+            vec![
+                Vec2::new(x0, z0),
+                Vec2::new(x0 + side, z0),
+                Vec2::new(x0 + side, z0 + side),
+                Vec2::new(x0, z0 + side),
+            ]
+        };
+        let zone = |entity, outline, priority| DensityZone {
+            entity,
+            name: String::new(),
+            layer: 0,
+            static_layer: false,
+            outline,
+            vehicles: 6,
+            people: 2,
+            vehicle_list: 0,
+            people_list: 0,
+            priority,
+            faction: 0,
+        };
+        // An island-wide zone of 5 and a dead one of 100 inside it.
+        let zones = [
+            zone(1, square(0.0, 0.0, 1000.0), 5),
+            zone(2, square(100.0, 100.0, 50.0), 100),
+        ];
+        assert_eq!(zone_at(&zones, 500.0, 500.0).map(|z| z.entity), Some(1));
+        assert_eq!(zone_at(&zones, 120.0, 130.0).map(|z| z.entity), Some(2));
+        assert_eq!(zone_at(&zones, -5.0, 10.0), None);
+    }
+
+    #[test]
+    fn lanes_share_out_the_road_and_skip_the_strips_of_nothing() {
+        // `commercial_road10`: nothing (5), traffic 8, walkway 4,
+        // nothing (5).
+        let road10 = RoadLanes {
+            strips: [(3, 5.0), (0, 8.0), (1, 4.0), (3, 5.0)],
+            direction: None,
+        };
+        let close = |a: &[f32], b: &[f32]| {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4)
+        };
+        assert!(close(&road10.traffic(12.0), &[4.0]));
+        assert!(close(&road10.walkways(12.0), &[10.0]));
+        // `commercial_road20`: median 4, traffic 7.5 and 7.5, walkway 4.
+        let road20 = RoadLanes {
+            strips: [(2, 4.0), (0, 7.5), (0, 7.5), (1, 4.0)],
+            direction: None,
+        };
+        assert!(close(&road20.traffic(23.0), &[7.75, 15.25]));
+        assert!(close(&road20.walkways(23.0), &[21.0]));
+        // A curb: four strips of nothing.
+        let curb = RoadLanes {
+            strips: [(3, 5.0); 4],
+            direction: None,
+        };
+        assert!(curb.layout(1.0).is_empty());
     }
 
     #[test]

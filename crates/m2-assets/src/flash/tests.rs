@@ -345,10 +345,51 @@ fn a_mask_clips_what_it_masks() {
     assert_eq!(bounds(&whole).unwrap(), [30.0, 0.0, 50.0, 20.0]);
 }
 
+#[test]
+fn a_mask_shows_through_its_shape_not_its_box() {
+    // A 20 px textured square (uv = corners / 20) under a mask that is the
+    // square's lower-left half, as two triangles of a shape's mesh.
+    let square = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| Triangle {
+        corners: [a, b, c],
+        uv: [a, b, c].map(|p| [p[0] / 20.0, p[1] / 20.0]),
+        colour: [1.0; 4],
+        texture: Some("t".into()),
+        multiply: true,
+    };
+    let content = [
+        square([0.0, 0.0], [20.0, 0.0], [20.0, 20.0]),
+        square([0.0, 0.0], [20.0, 20.0], [0.0, 20.0]),
+    ];
+    let mask = [
+        [[0.0, 0.0], [10.0, 10.0], [0.0, 20.0]],
+        [[0.0, 20.0], [20.0, 20.0], [10.0, 10.0]],
+    ];
+    let cut = super::cut_to_mask(&content, &mask);
+    let area: f32 = cut
+        .iter()
+        .map(|t| {
+            let [a, b, c] = t.corners;
+            ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs() / 2.0
+        })
+        .sum();
+    // Half the square (its box would have let all 400 through).
+    assert!((area - 200.0).abs() < 1e-3, "area {area}");
+    for t in &cut {
+        for (p, uv) in t.corners.iter().zip(t.uv) {
+            // Nothing above the diagonal; texture kept where it was.
+            assert!(p[1] >= p[0] - 1e-4, "{p:?} outside the mask");
+            assert!((uv[0] - p[0] / 20.0).abs() < 1e-5 && (uv[1] - p[1] / 20.0).abs() < 1e-5);
+        }
+        assert!(t.multiply && t.texture.as_deref() == Some("t"));
+    }
+    // Nothing under an empty mask.
+    assert!(super::cut_to_mask(&content, &[]).is_empty());
+}
+
 // ---- ActionScript ---------------------------------------------------------
 
 /// Assembles action bytes.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Asm(Vec<u8>);
 
 impl Asm {
@@ -713,7 +754,7 @@ fn text_fields_lay_out_in_texture_glyphs() {
     font.codes.insert('A', 0);
     font.codes.insert(' ', 1);
     // Glyph A: a 24 x 48 box in a 512 x 256 texture, origin at its bottom
-    // left; drawn at 48 px nominal.
+    // left; drawn at 48 px nominal, so 32 px to the em.
     let g = text::TextureGlyph {
         uv: [0.0, 0.0, 24.0 / 512.0, 48.0 / 256.0],
         origin: [0.0, 36.0 / 256.0],
@@ -742,8 +783,8 @@ fn text_fields_lay_out_in_texture_glyphs() {
     assert_eq!(out[0].texture.as_deref(), Some("font_f0"));
     let b0 = bounds(&out[..2]).unwrap();
     let b1 = bounds(&out[2..]).unwrap();
-    // Half size: 12 x 24, its baseline 18 px down (2 + ascent 18 - origin).
-    assert!((b0[2] - b0[0] - 12.0).abs() < 1e-4 && (b0[3] - b0[1] - 24.0).abs() < 1e-4);
+    // A 24 px field takes 24 of the texture's 32 px em: 18 x 36.
+    assert!((b0[2] - b0[0] - 18.0).abs() < 1e-4 && (b0[3] - b0[1] - 36.0).abs() < 1e-4);
     assert!((b1[0] - b0[0] - 24.0).abs() < 1e-4);
     // An inline image for "[f]", 10 px wide, sitting on the baseline: the
     // second glyph moves along by its width.
@@ -779,6 +820,33 @@ fn text_fields_lay_out_in_texture_glyphs() {
         ),
         ("Marga".to_owned(), Some([1.0, 0.0, 0.0, 1.0]))
     );
+}
+
+#[test]
+fn a_font_texture_reads_its_padding_and_nominal_size() {
+    let mut d = Vec::new();
+    d.extend_from_slice(&[1, 0, 0, 0, 0, 0]);
+    d.push(9);
+    d.extend_from_slice(b"f0_F0.tga");
+    for v in [512u16, 256] {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    d.push(2);
+    d.extend_from_slice(&48u16.to_le_bytes());
+    d.extend_from_slice(&1u16.to_le_bytes());
+    for v in [0.0f32, 0.0, 0.5, 0.25, 0.0, 0.2] {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [1u16, 7, 1, 3, 0] {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    let t = text::FontTexture::parse(&d).unwrap();
+    assert_eq!(t.name, "f0_F0");
+    assert_eq!((t.size, t.pad, t.nominal), ([512.0, 256.0], 2.0, 48.0));
+    assert_eq!(t.glyphs[0].origin, [0.0, 0.2]);
+    assert_eq!(t.maps[&7][&3], 0);
+    // Its glyphs were drawn 32 px to the em.
+    assert!((t.nominal * text::TEXTURE_EM - 32.0).abs() < 1e-4);
 }
 
 #[test]
@@ -890,4 +958,226 @@ fn key_listeners_hear_key_presses() {
     assert_eq!(rt.avm.keys_down, vec![36]);
     rt.key_up(36);
     assert!(rt.avm.keys_down.is_empty());
+}
+
+#[test]
+fn a_word_wrapped_field_measures_its_wrapped_lines() {
+    let field = EditText {
+        bounds: [0.0, 0.0, 604.0, 40.0],
+        height: 20.0,
+        word_wrap: true,
+        ..EditText::default()
+    };
+    // 92 characters at 11 px: 1012 px in 600, two lines of 24 px.
+    let hint = "x".repeat(92);
+    let round = |(w, h): (f32, f32)| (w.round(), h.round());
+    assert_eq!(round(field.text_size(&hint)), (600.0, 48.0));
+    // A short line, and two explicit ones.
+    assert_eq!(round(field.text_size("Loading")), (77.0, 24.0));
+    assert_eq!(field.text_size("a\nb").1, 48.0);
+    // Without word wrap, one line however long.
+    let one = EditText {
+        word_wrap: false,
+        ..field
+    };
+    assert_eq!(round(one.text_size(&hint)), (1012.0, 24.0));
+}
+
+#[test]
+fn going_back_keeps_an_instance_the_target_frame_has_too() {
+    let lib = library(vec![vec![put(1, 2, at(0.0, 0.0), "clip")]], sprite_frames());
+    let mut p = Player::new(lib);
+    let clip = p.child(p.root, "clip").unwrap();
+    let square = p.child(clip, "square").unwrap();
+    p.goto(clip, 1);
+    // A script's change to it (as a text field's text would be).
+    p.clip_mut(square).unwrap().visible = false;
+    p.goto(clip, 0);
+    // The same instance, its change kept, placed as frame one has it.
+    let again = p.clip(clip).unwrap().children[&(1 + TIMELINE_DEPTH)];
+    assert_eq!(again, square);
+    assert!(!p.clip(square).unwrap().visible);
+    assert_eq!(p.clip(square).unwrap().matrix.tx, 0.0);
+}
+
+#[test]
+fn a_text_fields_x_and_y_name_its_box_corner() {
+    // got = t._y; t._y = 50;
+    let mut a = Asm::default();
+    a.set("got", |a| {
+        a.str("t").op(0x1C).str("_y").op(0x4E);
+    });
+    a.str("t").op(0x1C).str("_y").int(50).op(0x4F);
+    let mut lib = Rc::try_unwrap(library(
+        vec![vec![
+            put(1, 3, at(10.0, 20.0), "t"),
+            Control::Script(a.bytes()),
+        ]],
+        sprite_frames(),
+    ))
+    .unwrap();
+    lib.texts.insert(
+        3,
+        EditText {
+            bounds: [-2.0, -2.0, 100.0, 20.0],
+            ..EditText::default()
+        },
+    );
+    let mut rt = Runtime::new(Player::new(Rc::new(lib)));
+    // The box's top is 2 px above the field's origin: `_y` reads 18, and
+    // setting it to 50 puts the origin at 52.
+    assert_eq!(number(&var(&mut rt, "got")), 18.0);
+    let t = rt.player.child(rt.player.root, "t").unwrap();
+    assert_eq!(rt.player.clip(t).unwrap().matrix.ty, 52.0);
+}
+
+/// A runtime with text field `t` (character 3: `def`, showing `text`)
+/// whose first frame runs `script`.
+fn text_field(def: EditText, text: &str, script: Asm) -> (Runtime, ClipId) {
+    let mut lib = Rc::try_unwrap(library(
+        vec![vec![
+            put(1, 3, at(10.0, 20.0), "t"),
+            Control::Script(script.bytes()),
+        ]],
+        sprite_frames(),
+    ))
+    .unwrap();
+    lib.texts.insert(
+        3,
+        EditText {
+            initial: text.into(),
+            ..def
+        },
+    );
+    let rt = Runtime::new(Player::new(Rc::new(lib)));
+    let t = rt.player.child(rt.player.root, "t").unwrap();
+    (rt, t)
+}
+
+#[test]
+fn a_text_fields_width_sizes_its_box_not_its_text() {
+    // t._width = 30; got = t._width;
+    let mut a = Asm::default();
+    a.str("t").op(0x1C).str("_width").int(30).op(0x4F);
+    a.set("got", |a| {
+        a.str("t").op(0x1C).str("_width").op(0x4E);
+    });
+    let def = EditText {
+        bounds: [-2.0, -2.0, 100.0, 20.0],
+        ..EditText::default()
+    };
+    let (mut rt, t) = text_field(def, "abc", a);
+    assert_eq!(number(&var(&mut rt, "got")), 30.0);
+    let c = rt.player.clip(t).unwrap();
+    // Unscaled: the box is 30 wide from its left edge.
+    assert_eq!(c.matrix.a, 1.0);
+    assert_eq!(c.text_box, Some([-2.0, -2.0, 28.0, 20.0]));
+}
+
+#[test]
+fn auto_size_fits_the_box_round_its_text() {
+    // t.autoSize = "center";
+    let mut a = Asm::default();
+    a.str("t").op(0x1C).str("autoSize").str("center").op(0x4F);
+    let def = EditText {
+        bounds: [-2.0, -2.0, 100.0, 20.0],
+        height: 20.0,
+        ..EditText::default()
+    };
+    // Estimated 11 px a character: "abcd" 44 wide, 48 with the gutters,
+    // centred on the box's 102: from 25.
+    let (rt, t) = text_field(def.clone(), "abcd", a.clone());
+    assert_eq!(
+        rt.player.clip(t).unwrap().text_box,
+        Some([25.0, -2.0, 73.0, 26.0])
+    );
+    // A wrapping field keeps its width and grows down.
+    let wraps = EditText {
+        word_wrap: true,
+        ..def
+    };
+    let (rt, t) = text_field(wraps, "abcd", a);
+    assert_eq!(
+        rt.player.clip(t).unwrap().text_box,
+        Some([-2.0, -2.0, 100.0, 26.0])
+    );
+}
+
+#[test]
+fn auto_size_fits_again_when_the_text_is_set() {
+    // t.autoSize = "right"; t.text = "abcd";
+    let mut a = Asm::default();
+    a.str("t").op(0x1C).str("autoSize").str("right").op(0x4F);
+    a.str("t").op(0x1C).str("text").str("abcd").op(0x4F);
+    let def = EditText {
+        bounds: [-2.0, -2.0, 100.0, 20.0],
+        height: 20.0,
+        ..EditText::default()
+    };
+    // Empty, it shrank to its right edge; "abcd" grows it back leftwards.
+    let (rt, t) = text_field(def, "", a);
+    assert_eq!(
+        rt.player.clip(t).unwrap().text_box,
+        Some([52.0, -2.0, 100.0, 26.0])
+    );
+}
+
+#[test]
+fn text_width_measures_the_text_as_drawn() {
+    let def = EditText {
+        bounds: [-2.0, -2.0, 400.0, 20.0],
+        height: 20.0,
+        ..EditText::default()
+    };
+    let (mut rt, t) = text_field(def, "[0x1]", Asm::default());
+    rt.player.translate = Some(Translator(Rc::new(|s: &str| s.replace("[0x1]", "ab"))));
+    assert_eq!(rt.player.text_size(t).map(|(w, _)| w.round()), Some(22.0));
+}
+
+#[test]
+fn a_wrapped_centred_line_keeps_its_break_space() {
+    let mut font = Font {
+        ascent: 0.75,
+        descent: 0.25,
+        advances: vec![0.5, 0.5],
+        ..Font::default()
+    };
+    font.codes.insert('A', 0);
+    font.codes.insert(' ', 1);
+    let g = text::TextureGlyph {
+        uv: [0.0, 0.0, 24.0 / 512.0, 48.0 / 256.0],
+        origin: [0.0, 36.0 / 256.0],
+    };
+    font.texture = Some(("f".into(), [512.0, 256.0], 48.0, vec![Some(g), None]));
+    let def = EditText {
+        bounds: [0.0, 0.0, 50.0, 60.0],
+        height: 24.0,
+        colour: [1.0; 4],
+        align: 2,
+        leading: 2.0,
+        word_wrap: true,
+        multiline: true,
+        ..EditText::default()
+    };
+    // 12 px a character: "A A A" (60) breaks in 50 as "A A " and "A".
+    let mut out = Vec::new();
+    text::layout(
+        &def,
+        "A A A",
+        &[],
+        &font,
+        &Matrix::IDENTITY,
+        &ColourTransform::IDENTITY,
+        None,
+        &mut out,
+    );
+    assert_eq!(out.len(), 6);
+    // Centred in 46 px past the 2 px gutter: the first line 48 wide with
+    // its space (x 1, not 7), the last 12 (x 19).
+    assert!((bounds(&out[..2]).unwrap()[0] - 1.0).abs() < 1e-4);
+    assert!((bounds(&out[4..]).unwrap()[0] - 19.0).abs() < 1e-4);
+    // textWidth leaves the space out; textHeight has no leading under the
+    // last line: 2 x 26 - 2.
+    let (w, h) = text::measure(&def, "A A A", &font);
+    assert_eq!((w, h), (36.0, 50.0));
 }

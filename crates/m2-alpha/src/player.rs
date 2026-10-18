@@ -5,8 +5,10 @@ use m2_engine::{Character, Gait, GpuModel, Physics, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
 
+use crate::binoculars::Binoculars;
 use crate::combat::{Trigger, Weapon};
 use crate::config::CameraConfig;
+use crate::held::{InHand, Moves, Phase, Switch};
 use crate::input::{Action, Input};
 use crate::npc::FightClips;
 use crate::scene::{Carry, Rig};
@@ -188,6 +190,7 @@ impl Intent {
                     None
                 },
                 support: input.take_pressed(Action::Support),
+                support_down: input.take_pressed(Action::SupportDown),
                 pda: input.take_pressed(Action::Pda),
             },
         }
@@ -272,6 +275,20 @@ pub struct Player {
     /// (pitch and roll as well as heading) with her clip's origin on the
     /// seat ([`model_matrix`](Self::model_matrix)).
     pub seat_frame: Option<Mat4>,
+    /// Her clips for each class of weapon she can hold, a switch's and
+    /// the pickup's ([`crate::held`]).
+    pub moves: Moves,
+    /// What the fight has in her hands (set each tick), and what her
+    /// pose holds: they differ while a switch plays.
+    pub in_hand: InHand,
+    shown: InHand,
+    /// A weapon switch, while it plays over her upper body.
+    pub switching: Option<Switch>,
+    /// Her binoculars, while they are up ([`crate::binoculars`]): the
+    /// frame is seen through them and her body is left out.
+    pub binoculars: Option<Binoculars>,
+    /// Picking a weapon up: the clip and seconds in (she stands).
+    pub picking: Option<(usize, f32)>,
 }
 
 impl Player {
@@ -302,6 +319,12 @@ impl Player {
             down: false,
             seated: false,
             seat_frame: None,
+            moves: Moves::default(),
+            in_hand: InHand::default(),
+            shown: InHand::default(),
+            switching: None,
+            picking: None,
+            binoculars: None,
         }
     }
 
@@ -320,12 +343,69 @@ impl Player {
     /// Takes `model` as her body, with its rig's fight `clips`: a jump,
     /// throw or bash under way played the old rig's clips by index, so it
     /// stops.
-    pub fn set_body(&mut self, model: Option<(GpuModel, Rig)>, clips: FightClips) {
+    pub fn set_body(&mut self, model: Option<(GpuModel, Rig)>, clips: FightClips, moves: Moves) {
         self.model = model;
         self.clips = clips;
+        self.moves = moves;
         self.leap = Leap::No;
         self.throwing = None;
         self.bashing = None;
+        self.switching = None;
+        self.picking = None;
+        // The rifle's clips are the ones just given: another class held
+        // takes its own.
+        self.shown = InHand::default();
+        let now = self.in_hand;
+        self.hold_class(now);
+    }
+
+    /// Her pose holds `held` from now: its class's fight clips and gaits
+    /// ([`Moves::of`]).
+    fn hold_class(&mut self, held: InHand) {
+        self.shown = held;
+        if let Some((_, rig)) = &mut self.model {
+            rig.barrel = held.class != m2_assets::name_hash("pistol");
+        }
+        // The launchers keep the rifle's stance: the weapons' grip and the
+        // aim's turn are worked out on the rifle's aim, and with the
+        // rocket class's own (round 13) the RPG lay across her chest.
+        let class = if held.class == m2_assets::name_hash("rocket") {
+            m2_assets::animation_table::RIFLE
+        } else {
+            held.class
+        };
+        let Some(set) = self.moves.of(class) else {
+            return;
+        };
+        self.clips = set.clips;
+        if let Some((_, rig)) = &mut self.model
+            && let Some(l) = rig.locomotion.as_mut()
+        {
+            l.clips.extend(set.gaits.iter().copied());
+            let gait = rig.gait;
+            rig.set_gait(gait);
+        }
+    }
+
+    /// Starts picking a weapon up off the ground (the whole body, once:
+    /// she stands till it is over), if she has the clip and is free to.
+    pub fn start_pickup(&mut self) -> bool {
+        let Some(clip) = self.moves.pickup else {
+            return false;
+        };
+        if !self.can_bash() || self.picking.is_some() || self.driving.is_some() {
+            return false;
+        }
+        let Some((_, rig)) = self.model.as_mut() else {
+            return false;
+        };
+        rig.animator.set_upper(None);
+        rig.animator.play_once(clip);
+        rig.animator.seek(0.0);
+        rig.two_handed = false;
+        eprintln!("anim: pickup {:08x}", rig.clips[clip].hash);
+        self.picking = Some((clip, 0.0));
+        true
     }
 
     /// Leaves what she does on foot behind for a vehicle's clips (in a
@@ -337,6 +417,12 @@ impl Player {
         self.leap = Leap::No;
         self.throwing = None;
         self.bashing = None;
+        self.picking = None;
+        // A switch under way is over: she holds what the fight has up.
+        if self.switching.take().is_some() {
+            let now = self.in_hand;
+            self.hold_class(now);
+        }
         if let Some((_, rig)) = &mut self.model {
             rig.animator.set_upper(None);
             rig.aim = None;
@@ -463,8 +549,8 @@ impl Player {
         } else {
             run
         };
-        // Bashing, she stands.
-        let bashing = self.bashing.is_some();
+        // Bashing or picking a weapon up, she stands.
+        let bashing = self.bashing.is_some() || self.picking.is_some();
         let wanted = if bashing {
             Vec3::ZERO
         } else {
@@ -492,6 +578,7 @@ impl Player {
         if let Some(t) = &mut self.throwing {
             *t += dt;
         }
+        let (mut swap, mut switched) = (None, false);
         if let Some((_, rig)) = &mut self.model {
             let gait = if moved < 0.3 {
                 Gait::Idle
@@ -561,7 +648,16 @@ impl Player {
                     self.bashing = None;
                 }
             }
-            if self.bashing.is_some() {
+            if let Some((clip, t)) = &mut self.picking {
+                *t += dt;
+                if *t + LAND_FADE >= rig.clips[*clip].info.duration {
+                    self.picking = None;
+                    // The weapon picked up is in her hands as it ends: no
+                    // switch to play (inferred).
+                    swap = Some(self.in_hand);
+                }
+            }
+            if self.bashing.is_some() || self.picking.is_some() {
                 rig.two_handed = false;
             } else if leaping {
                 // The legs jump; the arms keep the weapon as they were
@@ -575,6 +671,44 @@ impl Player {
                 rig.animator.set_upper(upper.zip(rig.upper.clone()));
             } else {
                 rig.hold_rifle(gait, clips, carry);
+                // A pistol is held in the right hand alone.
+                if !rig.barrel {
+                    rig.two_handed = false;
+                }
+            }
+            // A weapon switch: what she holds goes away over her upper
+            // body, then the next comes up ([`crate::held`]); her pose
+            // takes the new class's clips between the two.
+            let free = self.bashing.is_none() && self.picking.is_none() && self.throwing.is_none();
+            if self.switching.is_none() && self.in_hand != self.shown && free && swap.is_none() {
+                let s = Switch::new(&self.moves, self.shown, self.in_hand, gait != Gait::Idle)
+                    .timed(|c| rig.clips[c].info.duration);
+                let h = |c: Option<(usize, f32)>| {
+                    c.map_or("none".to_owned(), |(c, _)| {
+                        format!("{:08x}", rig.clips[c].hash)
+                    })
+                };
+                eprintln!(
+                    "anim: switch {:?} to {:?}: stow {}, take up {}",
+                    s.from.side,
+                    s.to.side,
+                    h(s.stow),
+                    h(s.equip)
+                );
+                self.switching = Some(s);
+            }
+            if let Some(s) = &mut self.switching {
+                s.time += dt;
+                if s.swapped() && self.shown != s.to {
+                    swap = Some(s.to);
+                }
+                match (s.at(s.time), rig.upper.clone()) {
+                    (Phase::Stow(c, t) | Phase::Equip(c, t), Some(mask)) => {
+                        rig.animator.upper_at(c, mask, t);
+                        rig.two_handed = false;
+                    }
+                    (Phase::Done, _) | (_, None) => switched = true,
+                }
             }
             // A throw plays over the upper body, whatever the legs do.
             match (self.throwing, clips.throw, rig.upper.clone()) {
@@ -598,6 +732,12 @@ impl Player {
                 _ => 1.0,
             };
             rig.advance(dt * rate);
+        }
+        if let Some(to) = swap {
+            self.hold_class(to);
+        }
+        if switched {
+            self.switching = None;
         }
         self.camera(physics);
     }
@@ -737,7 +877,19 @@ impl Player {
         }
     }
 
+    /// Her camera's view; through her binoculars, from the point the
+    /// camera turns about above her head, with their narrower lens.
     pub fn view(&self, fov_degrees: f32, aspect: f32) -> View {
+        if let Some(b) = self.binoculars.filter(|_| self.driving.is_none()) {
+            return View::perspective(
+                self.look_at(),
+                self.camera_forward(),
+                b.fov(fov_degrees).to_radians(),
+                aspect,
+                0.1,
+                10_000.0,
+            );
+        }
         View::perspective(
             self.eye(),
             self.camera_forward(),
@@ -800,6 +952,7 @@ mod tests {
             hull: (Vec3::new(-1.8, 0.0, -3.3), Vec3::new(1.8, 1.5, 3.3)),
             turret_box: None,
             rotors: Vec::new(),
+            damage: None,
             tuning: Default::default(),
         };
         let plain = ChaseRig::of(&spec);

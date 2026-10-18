@@ -125,6 +125,18 @@ pub struct Leaves {
     pub gives: Option<(Weapon, u32)>,
     /// The health it gives.
     pub health: f32,
+    /// The cash and fuel it gives, if money (`Cash (Small)`, `Fuel Pickup
+    /// (Large)`): the scripts get them ([`m2_game::mission::Mission::
+    /// give_resources`]).
+    pub cash: u32,
+    pub fuel: u32,
+}
+
+impl Leaves {
+    /// Money: cash or fuel, taken walking over it whatever she carries.
+    pub fn is_money(&self) -> bool {
+        self.cash > 0 || self.fuel > 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -421,6 +433,12 @@ impl Flights {
         let key = self.within(at)?.key();
         let i = self.pickups.iter().position(|p| p.key() == key)?;
         Some(self.pickups.remove(i))
+    }
+
+    /// Takes away what lies under `key` ([`Pickup::key`]) untaken: a
+    /// placed pickup whose layer went out.
+    pub fn forget(&mut self, key: (u32, u32)) {
+        self.pickups.retain(|p| p.key() != key);
     }
 
     /// Lays `p` down to be taken (a weapon she left for another), its
@@ -1004,6 +1022,8 @@ mod tests {
             at: Vec3::ZERO,
             damage,
             key: Some(StaticKey::Entity(3)),
+            round: 0.0,
+            kind: 0,
         };
         // A round chips it; a bash breaks it open.
         assert!(flights.strike(&mut physics, &[hit(34.0)], &[]).is_empty());
@@ -1105,6 +1125,8 @@ mod tests {
             at: middle,
             damage: 100.0,
             key: Some(StaticKey::Entity(3)),
+            round: 0.0,
+            kind: 0,
         };
         flights.strike(&mut physics, &[blow], &[]);
         let [first, lying] = flights.pickups() else {

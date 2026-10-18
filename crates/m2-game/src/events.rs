@@ -103,7 +103,7 @@ pub trait World {
 }
 
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 15] = [
+pub const KINDS: [&str; 16] = [
     "TimerRelative",
     "ObjectHibernation",
     "Boundary",
@@ -119,6 +119,7 @@ pub const KINDS: [&str; 15] = [
     "GameStateChange",
     "ObjectWinched",
     "ObjectIsVisible",
+    "ObjectDelete",
 ];
 
 /// Kinds the game delivers itself through `Event.__m2_fire` (besides
@@ -847,6 +848,14 @@ fn check(
                 .map(|g| (g, !world.is_alive(g), vec![id(g)]))
                 .collect(),
         ),
+        // { object }: once it is gone from play (removed, or faded out):
+        // the support helicopter's pilot is free again once his
+        // helicopter is (`MakeRecruitAvailable("Copter")`). Passes the
+        // object.
+        "ObjectDelete" => match guid(&p.params, 1) {
+            Some(g) => Check::Holds(world.position(g).is_none(), vec![id(g)]),
+            None => no,
+        },
         // { a, b, op, metres, stopped, flat }: when some a is within
         // ("<", "<=") or beyond (">", ">=") the distance of some b,
         // checked whenever it is pending (scripts wanting repeats make a
@@ -930,6 +939,24 @@ fn check(
                     })
                     .collect(),
             )
+        }
+        // { player, "Human" or "Vehicle", "Enter" or "Exit" }: as the
+        // player takes control of her character on foot (or of a vehicle),
+        // or gives it up. The one call site (`MrxUtil._TeleportHeroes`)
+        // takes her out of her vehicle and waits for "Human", "Enter"
+        // before it moves her. Passes nothing of its own.
+        "Player" => {
+            let Some(hero) = world.player() else {
+                return no;
+            };
+            let riding = world.vehicle_of(hero).is_some();
+            let on_foot = match text(&p.params, 2).as_deref() {
+                Some("human") => true,
+                Some("vehicle") => false,
+                _ => return no,
+            };
+            let exit = text(&p.params, 3).as_deref() == Some("exit");
+            Check::Holds((riding != on_foot) != exit, Vec::new())
         }
         // { state, "enter" or "exit" }: as the game enters or leaves a
         // state; passes both.
@@ -1218,6 +1245,31 @@ mod tests {
         host.lua().load("Event.Delete(id)").exec().unwrap();
         events.update(1.0, &world);
         assert_eq!(log(&host).len(), 3);
+    }
+
+    #[test]
+    fn the_player_event_fires_once_she_is_on_foot() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                "Event.Create('Player', { 1, 'Human', 'Enter' }, function(a) \
+                 table.insert(log, 'on foot ' .. a) end, { 'teleport' }) \
+                 Event.Create('Player', { 1, 'Vehicle', 'Exit' }, function() \
+                 table.insert(log, 'out') end)",
+            )
+            .exec()
+            .unwrap();
+        // In her boat: neither holds.
+        let mut world = TestWorld::default();
+        world.seats.insert(1, 9);
+        events.update(0.5, &world);
+        assert!(log(&host).is_empty());
+        // Out of it: both fire, once.
+        world.seats.clear();
+        events.update(0.5, &world);
+        events.update(0.5, &world);
+        assert_eq!(log(&host), ["on foot teleport", "out"]);
+        assert!(events.take_unhandled().is_empty());
     }
 
     #[test]

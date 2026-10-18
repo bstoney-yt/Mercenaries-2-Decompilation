@@ -32,6 +32,7 @@
 use std::collections::HashMap;
 
 use m2_assets::{Layer, name_hash};
+use m2_math::glam::Vec3;
 
 use crate::tuning::Table;
 
@@ -44,6 +45,11 @@ const HUMAN_BOOST: u32 = 0xf3f6_f0a9;
 /// their values (the carbine round's 15 and 50 m, the shotgun's 5 and 50,
 /// the heavy machine gun's 20 and 300); inferred.
 const DAMAGE_MINIMUM: u32 = 0x33f1_fb12;
+/// `ProjectilePhysics`' `HeroMultiplier` (name found by hashing guesses,
+/// round 19): the carbine's, rifles', pistols' and machine guns' rounds 3,
+/// the automatic rifle's and light machine gun's 2, the RPG's 1.5, the
+/// sniper and anti-material rifles' and every bomb's 1.
+const HERO_MULTIPLIER: u32 = 0x0858_81b0;
 const FALLOFF_NEAR: u32 = 0xe184_b8a0;
 const FALLOFF_FAR: u32 = 0x1d98_7340;
 /// `SpawnOnDeath`'s and `TimerResponse`'s template field (name unknown).
@@ -75,6 +81,158 @@ const STIMULUS_REACH: u32 = 0x1417_f4dd;
 /// `WeaponScatter`'s first field (see [`WeaponSpec::scatter`]).
 const SCATTER: u32 = 0x0006_5d26;
 
+/// `WeaponEffects`' `ShellEjectHardpoint` (the gun model's node a spent
+/// case flies from, a name hash: `hp_shelleject` on all guns but the
+/// covert pistol's `7eabfa05`; round 17 read its bits as a float, 0.035,
+/// and took it for the flash's time) and `ShellEjectTemplate` (the case's effect,
+/// `global_particle_shellsmall`). Both names found by hashing guesses.
+const SHELL_HARDPOINT: u32 = 0xd62d_ab7b;
+const SHELL: u32 = 0x1efe_cdea;
+/// `SoundEffect`'s field naming a sound bank (the carbine's
+/// `wpn_combatrifle` block's bank `50333181`; vehicles' engines too).
+const SOUND_BANK: u32 = 0x14a6_7fa6;
+
+/// What firing a gun looks and sounds like, as its template says.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Feel {
+    /// Its shots' sound bank (`SoundEffect`), a name hash: each gun
+    /// family has its own (`wpn_combatrifle`, `wpn_shotgun`, ...).
+    pub sound_bank: Option<u32>,
+    /// Its `SoundSet` (a hash; the carbine's `01b47c45`): what the
+    /// `Sounds` table keys its cues by ([`crate::gun_sounds`]).
+    pub sound_set: Option<u32>,
+    /// Its muzzle flash's template (`MuzzleFlashTemplate`:
+    /// `global_particle_muzzleflash_blue` for the carbine).
+    pub flash: Option<u32>,
+    /// The effect of a spent case thrown out (`ShellEjectTemplate`:
+    /// `global_particle_shellsmall`), and the model node it flies from
+    /// (`ShellEjectHardpoint`, see [`SHELL_HARDPOINT`]).
+    pub shell: Option<u32>,
+    pub shell_hardpoint: Option<u32>,
+    /// `WeaponScatter`'s seven fields in their order (see
+    /// [`SCATTER_FIELDS`]; [`Feel::scatter_min`] and the next two are
+    /// named, the first four are not).
+    pub scatter: [f32; 7],
+}
+
+impl Feel {
+    /// `ScatterMin`, `ScatterMax` and `ScatterPerShot`: the cone a gun's
+    /// rounds leave in (degrees across, as the alpha reads them: the
+    /// carbine's 1 to 2, the assault rifle's 1.5 to 3, the sniper rifle's 0
+    /// to 3), and what each shot adds to it (0.2; the sniper rifle's 1).
+    pub fn scatter_min(&self) -> f32 {
+        self.scatter[4]
+    }
+
+    pub fn scatter_max(&self) -> f32 {
+        self.scatter[5]
+    }
+
+    pub fn scatter_per_shot(&self) -> f32 {
+        self.scatter[6]
+    }
+
+    /// The cone its next round leaves in, degrees across, when its shots
+    /// so far have added `bloom` ([`Bloom::added`]): `ScatterMin` plus that,
+    /// no more than `ScatterMax`.
+    pub fn cone(&self, bloom: f32) -> f32 {
+        let (lo, hi) = (self.scatter_min(), self.scatter_max());
+        (lo + bloom.max(0.0)).min(hi.max(lo))
+    }
+}
+
+/// What a gun's shots have added to its cone ([`Feel::cone`]): each
+/// shot `ScatterPerShot`, up to `ScatterMax`. Once the gun has gone
+/// [`Bloom::REST`] seconds without firing, the cone settles back to
+/// `ScatterMin`, in [`Bloom::SETTLE`] seconds from the most.
+///
+/// Provenance: the three fields and their names are the template's (from
+/// samples); that they add up so is inferred from the names; when and how
+/// fast the cone settles is invented (the game's own rule is not decoded:
+/// the first field, once taken for a rate, is `LowSkillScatter`; none of
+/// the 31 components on the guns' templates names a settle rate among
+/// the fields named so far, gap round 13).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Bloom {
+    /// Degrees added to `ScatterMin`.
+    pub added: f32,
+    /// Seconds since the last shot.
+    idle: f32,
+}
+
+impl Bloom {
+    /// Seconds without a shot before the cone settles (invented).
+    pub const REST: f32 = 0.25;
+    /// Seconds from `ScatterMax` back to `ScatterMin` (invented).
+    pub const SETTLE: f32 = 1.0;
+
+    /// After a shot of a gun that feels as `feel`.
+    pub fn shot(&mut self, feel: &Feel) {
+        let room = (feel.scatter_max() - feel.scatter_min()).max(0.0);
+        self.added = (self.added + feel.scatter_per_shot().max(0.0)).min(room);
+        self.idle = 0.0;
+    }
+
+    /// After `dt` seconds.
+    pub fn settle(&mut self, feel: &Feel, dt: f32) {
+        self.idle += dt;
+        if self.idle < Self::REST {
+            return;
+        }
+        let room = (feel.scatter_max() - feel.scatter_min()).max(0.0);
+        self.added = (self.added - room * dt / Self::SETTLE).max(0.0);
+    }
+}
+
+/// `WeaponScatter`'s fields in the order the template database lists
+/// them. The last three are `ScatterMin`, `ScatterMax` and
+/// `ScatterPerShot` (names found by hashing guesses, round 19); the first
+/// is `LowSkillScatter` (gap round 13: a soldier's cone, not a settle
+/// rate); the second to fourth are not named. The third and fourth look like a second pair of a
+/// least and a most (the third is never above the fourth, and both are
+/// mostly below `ScatterMin` and `ScatterMax`: the carbine's 1 and 1.5
+/// beside 1 and 2), perhaps for aiming or crouching; not decided.
+pub const SCATTER_FIELDS: [u32; 7] = [
+    0x0006_5d26,
+    0xa2f3_cad9,
+    0x3a4e_af3b,
+    0x0bbd_cc45,
+    0x2de4_f3c3,
+    0x2f0e_093d,
+    0x9318_44be,
+];
+
+/// The hand guns' sound banks, by name: each is its own block
+/// (`wpn_combatrifle_P000_Q3.block`), and a gun template's `SoundEffect`
+/// names one by hash (the carbine's `50333181`, `wpn_combatrifle`).
+pub const GUN_BANKS: [&str; 26] = [
+    "wpn_antiair",
+    "wpn_antimaterialrifle",
+    "wpn_assaultrifle",
+    "wpn_automaticrifle",
+    "wpn_bullpuprifle",
+    "wpn_coilgun",
+    "wpn_combatrifle",
+    "wpn_covertpistol",
+    "wpn_covertsmg",
+    "wpn_designator_flare",
+    "wpn_emplacedheavymg",
+    "wpn_emplacedlightmg",
+    "wpn_grapplegun",
+    "wpn_grenadelauncher",
+    "wpn_heavyatmissile",
+    "wpn_huntingpistol",
+    "wpn_lightmg",
+    "wpn_machinepistol",
+    "wpn_minigun",
+    "wpn_pistol",
+    "wpn_rocketlauncher",
+    "wpn_rpg",
+    "wpn_shotgun",
+    "wpn_smg",
+    "wpn_sniperrifle",
+    "wpn_tankgun",
+];
 /// An explosion: `Explosive` and the explosion template's `DamageKey`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Blast {
@@ -116,6 +274,9 @@ pub struct Ammo {
     pub damage: f32,
     pub damage_min: f32,
     pub falloff: (f32, f32),
+    /// `HeroMultiplier`: what the hero's rounds of it do, times `Damage`
+    /// (1 where the template gives none).
+    pub hero: f32,
     pub key: Option<u32>,
     /// What it becomes where it strikes (`SpawnOnDeath`).
     pub blast: Option<Blast>,
@@ -192,14 +353,151 @@ pub struct WeaponSpec {
     pub pellets: u32,
     /// Rounds a reload puts in (0: the whole clip).
     pub rounds_per_reload: u32,
-    /// Its scatter, degrees (`WeaponScatter`'s first field, unnamed: the
-    /// sniper rifle's 0.1, the carbine's 1, the shotgun's 3.5; inferred).
+    /// `WeaponScatter`'s first field, `LowSkillScatter` (the sniper
+    /// rifle's 0.1, the carbine's 1, the shotgun's 3.5). Round 17 read it as the cone; the
+    /// cone is now [`Feel::cone`], from the named fields.
     pub scatter: f32,
     pub ammo: Ammo,
     /// Seconds to lock on (`HomingWeapon` `LockOnTime`), and how far.
     pub lock_on: Option<(f32, f32)>,
     /// Rounds an ammunition pickup of it gives (its `Pickup` of type 1).
     pub pickup: Option<u32>,
+    /// Its shots' sound, muzzle flash and scatter.
+    pub feel: Feel,
+    /// How soldiers fire it (`WeaponHint`), if its template says.
+    pub hint: Option<FireHint>,
+}
+
+/// How a soldier fires a gun, from its template's `WeaponHint` (names
+/// found by hashing guesses, gap round 13; the carbine's values in
+/// brackets): within what range, and in bursts of how long with what
+/// pauses between, far off and close in.
+///
+/// Provenance: the names and values are the template's (from samples).
+/// That the lengths are seconds is inferred from the names and values
+/// (the carbine's 0.3 s burst is 3 rounds at its 562 a minute, the
+/// minigun's 2 s 30 at 900); that a negative close length means "as far
+/// off" is inferred (it is -1 or a length, never 0); the range at which
+/// a target counts as close is not in this table and is invented
+/// ([`FireHint::CLOSE`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FireHint {
+    /// Nearest and farthest a soldier fires it at, metres (`MinFireRange`
+    /// 1, `FireRange` 70).
+    pub min_range: f32,
+    pub range: f32,
+    /// `FireAngle`'s word (0, 1 or 2: the carbine's 0, the assault
+    /// rifle's 2; a whole number, so not degrees; meaning unknown, unused).
+    pub angle: u32,
+    /// A burst's length and the pause after it, seconds
+    /// (`BurstOnLength` 0.3, `BurstOffLength` 4.5).
+    pub on: f32,
+    pub off: f32,
+    /// The same at close range (`BurstOnCloseLength` -1,
+    /// `BurstOffCloseLength` 0.75); below 0, as far off.
+    pub on_close: f32,
+    pub off_close: f32,
+}
+
+impl FireHint {
+    /// Within this of its target, metres, a soldier fires the close
+    /// bursts (invented: no field read gives it).
+    pub const CLOSE: f32 = 15.0;
+
+    /// Template `id`'s, from the `WeaponHint` table.
+    pub(crate) fn read(hint: &Table<'_>, id: u32) -> Option<Self> {
+        let r = *hint.of_template(id).first()?;
+        let f = |name: &str| hint.float(r, name_hash(name));
+        Some(Self {
+            min_range: f("MinFireRange")?,
+            range: f("FireRange")?,
+            angle: hint.word(r, name_hash("FireAngle")).unwrap_or(0),
+            on: f("BurstOnLength")?,
+            off: f("BurstOffLength")?,
+            on_close: f("BurstOnCloseLength")?,
+            off_close: f("BurstOffCloseLength")?,
+        })
+    }
+
+    /// A burst's length and the pause after it, seconds, far off or
+    /// `close`.
+    pub fn burst(&self, close: bool) -> (f32, f32) {
+        let pick = |near: f32, far: f32| if close && near >= 0.0 { near } else { far };
+        (
+            pick(self.on_close, self.on).max(0.0),
+            pick(self.off_close, self.off).max(0.0),
+        )
+    }
+
+    /// Rounds a burst fires `gap` seconds apart: as many as start within
+    /// its length (the first at once), so a length of 0 is one round.
+    pub fn rounds(&self, gap: f32, close: bool) -> u32 {
+        let (on, _) = self.burst(close);
+        (on / gap.max(1e-3) + 1e-3).floor() as u32 + 1
+    }
+
+    /// The share of the time a soldier who keeps firing spends in bursts.
+    pub fn firing_share(&self, gap: f32, close: bool) -> f32 {
+        let (_, off) = self.burst(close);
+        let firing = self.rounds(gap, close) as f32 * gap;
+        firing / (firing + off).max(1e-3)
+    }
+}
+
+/// How far a soldier's rounds stray from where he aims: widths across,
+/// radians, sideways and up, each round a uniform pick within them
+/// ([`SoldierSpread::stray`]), as her own rounds scatter over her gun's
+/// cone. Two parts add up:
+///
+/// - his gun's `LowSkillScatter` (`WeaponScatter`'s first field, degrees
+///   across: the sniper rifle's 0.1, the rifles' 0.8 to 1.5, the pistols'
+///   3, the machine pistols' 4, the shotgun's 3.5), the same both ways;
+/// - a miss of his own that grows with range and with what his
+///   `AiAttributes` `Accuracy` lacks of a perfect 1, twice as wide
+///   sideways as up (rounds 1-14's whole rule, scaled by
+///   [`SoldierSpread::MISS`]).
+///
+/// Provenance: the field's name and values are the template's (from
+/// samples, gap round 13); that it is a soldier's cone is inferred from
+/// its name ("low skill") and that its values are cones of the same size
+/// as `ScatterMin`'s; that it is degrees across as `ScatterMin` is, and
+/// that the two parts add, are inferred. The miss by range and
+/// `Accuracy` is invented (no field read gives it), and its scale is
+/// fitted so that a VZ soldier ([`SoldierSpread::VZ_ACCURACY`]) with the
+/// Assault Rifle hits at 20 m as often as under the old rule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SoldierSpread {
+    pub side: f32,
+    pub up: f32,
+}
+
+impl SoldierSpread {
+    /// A VZ soldier's `Accuracy` (the old rule's anchor).
+    pub const VZ_ACCURACY: f32 = 0.4;
+    /// The old rule's miss, scaled down so his gun's cone added to it
+    /// leaves the VZ soldier's Assault Rifle hitting as often at 20 m
+    /// (fitted with the `soldierspread` example).
+    pub const MISS: f32 = 0.75;
+
+    /// For a soldier of `accuracy` firing a gun of `low_skill` degrees
+    /// (`LowSkillScatter`) at `distance` metres.
+    pub fn new(distance: f32, accuracy: f32, low_skill: f32) -> Self {
+        let lack = ((1.0 - accuracy) / (1.0 - Self::VZ_ACCURACY)).clamp(0.2, 2.0);
+        let miss = Self::MISS * (0.02 + distance.max(0.0) * 0.004) * lack;
+        let cone = low_skill.max(0.0).to_radians();
+        Self {
+            side: cone + 2.0 * miss,
+            up: cone + miss,
+        }
+    }
+
+    /// The way a round goes for an aim along unit `aim`, given two
+    /// uniform picks in [-0.5, 0.5).
+    pub fn stray(&self, aim: Vec3, a: f32, b: f32) -> Vec3 {
+        let side = aim.cross(Vec3::Y).normalize_or(Vec3::X);
+        let up = side.cross(aim).normalize_or(Vec3::Y);
+        (aim + side * (a * self.side) + up * (b * self.up)).normalize_or(aim)
+    }
 }
 
 impl WeaponSpec {
@@ -366,6 +664,36 @@ pub fn mounted(arm: &Armament, arms: &Arms, nodes: &[u32]) -> Vec<Mounted> {
     out
 }
 
+/// What a vehicle's machine gun fires as ([`machine_gun`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MachineGun<'a> {
+    /// A gun its template mounts: its own rate, round, flash and sound.
+    Mounted(&'a WeaponSpec),
+    /// Its template mounts weapons, none of them a gun for this: it has
+    /// no such gun, and fires nothing.
+    Unmounted,
+    /// No template armament was read: the alpha's own gun stands in.
+    StandIn,
+}
+
+/// What a vehicle armed with `armed` fires as its machine gun (beside a
+/// tank's cannon, or a turret gun no seat's mount fires): the first
+/// mount whose rounds are bullets ([`Flight::Round`]: the AMX-30's
+/// `Mounted Heavy MG (Tank) (VZ)`). A vehicle whose armament mounts none
+/// has no machine gun: the AMX-30 AA and the PGZ95 mount missiles and
+/// their own gun, nothing beside it.
+///
+/// Provenance: the mounts are the template's (from samples); that a
+/// template with no bullet gun has no machine gun to fire is inferred
+/// from the mounts (the game's seat logic is not decoded).
+pub fn machine_gun(armed: &[Mounted]) -> MachineGun<'_> {
+    match armed.iter().find(|m| m.weapon.flight() == Flight::Round) {
+        Some(m) => MachineGun::Mounted(&m.weapon),
+        None if armed.is_empty() => MachineGun::StandIn,
+        None => MachineGun::Unmounted,
+    }
+}
+
 /// Every weapon the database names.
 #[derive(Clone, Debug, Default)]
 pub struct Arms {
@@ -505,6 +833,7 @@ impl Parts<'_> {
                 p(FALLOFF_NEAR).unwrap_or(0.0),
                 p(FALLOFF_FAR).unwrap_or(0.0),
             ),
+            hero: p(HERO_MULTIPLIER).filter(|m| *m > 0.0).unwrap_or(1.0),
             key: self.damage_key(id),
             blast,
             timer,
@@ -539,6 +868,9 @@ pub fn read(db: &Layer<'_>) -> Arms {
     let lock = Table::new(db, "HomingWeapon");
     let pickup = Table::new(db, "Pickup");
     let scatter = Table::new(db, "WeaponScatter");
+    let hint = Table::new(db, "WeaponHint");
+    let effects = Table::new(db, "WeaponEffects");
+    let sound = Table::new(db, "SoundEffect");
     let name_of = |id: u32| names.get(&id).map_or(String::new(), |n| (*n).to_owned());
     let model_of = |id: u32| parts.models.get(&id).copied().filter(|&m| m != 0);
     let class_of = |id: u32| Parts::first(&equipment, id, CLASS).filter(|&c| c != 0);
@@ -583,6 +915,19 @@ pub fn read(db: &Layer<'_>) -> Arms {
                     ammo: parts.ammo(ammo_id),
                     lock_on,
                     pickup: refill(id, ammo_id),
+                    feel: Feel {
+                        sound_bank: Parts::first(&sound, id, SOUND_BANK).filter(|&b| b != 0),
+                        sound_set: Parts::first(&sound, id, name_hash("SoundSet"))
+                            .filter(|&s| s != 0),
+                        flash: Parts::first(&effects, id, name_hash("MuzzleFlashTemplate"))
+                            .filter(|&f| f != 0),
+                        shell: Parts::first(&effects, id, SHELL).filter(|&s| s != 0),
+                        shell_hardpoint: Parts::first(&effects, id, SHELL_HARDPOINT)
+                            .filter(|&h| h != 0),
+                        scatter: SCATTER_FIELDS
+                            .map(|f| Parts::float(&scatter, id, f).unwrap_or(0.0)),
+                    },
+                    hint: FireHint::read(&hint, id),
                 },
             ))
         })
@@ -709,12 +1054,70 @@ pub fn read(db: &Layer<'_>) -> Arms {
 mod tests {
     use super::*;
 
+    // The carbine's `WeaponScatter` as its template has it: 1, 0, 1, 1.5,
+    // then `ScatterMin` 1, `ScatterMax` 2, `ScatterPerShot` 0.2.
+    #[test]
+    fn a_guns_cone_grows_per_shot_to_its_most_and_settles() {
+        assert_eq!(SCATTER_FIELDS[4], name_hash("ScatterMin"));
+        assert_eq!(SCATTER_FIELDS[5], name_hash("ScatterMax"));
+        assert_eq!(SCATTER_FIELDS[6], name_hash("ScatterPerShot"));
+        assert_eq!(SHELL_HARDPOINT, name_hash("ShellEjectHardpoint"));
+        assert_eq!(SHELL, name_hash("ShellEjectTemplate"));
+        // The carbine's (as read on a legally installed copy).
+        assert_eq!(name_hash("hp_shelleject"), 0x3d10_6439);
+        let carbine = Feel {
+            scatter: [1.0, 0.0, 1.0, 1.5, 1.0, 2.0, 0.2],
+            ..Feel::default()
+        };
+        let mut bloom = Bloom::default();
+        assert_eq!(carbine.cone(bloom.added), 1.0);
+        // Held at 562 a minute: it grows, settling not while it fires.
+        for _ in 0..3 {
+            bloom.shot(&carbine);
+            bloom.settle(&carbine, 60.0 / 562.0);
+        }
+        assert!((carbine.cone(bloom.added) - 1.6).abs() < 1e-5);
+        for _ in 0..10 {
+            bloom.shot(&carbine);
+        }
+        assert_eq!(carbine.cone(bloom.added), 2.0);
+        // Let go: after a rest it settles, from the most in a second.
+        bloom.settle(&carbine, Bloom::REST);
+        bloom.settle(&carbine, 0.25);
+        assert!((carbine.cone(bloom.added) - 1.5).abs() < 1e-5);
+        bloom.settle(&carbine, Bloom::SETTLE);
+        assert_eq!(carbine.cone(bloom.added), 1.0);
+        // The sniper rifle: dead on first, 1 more a shot, at most 3.
+        let sniper = Feel {
+            scatter: [0.1, 0.0, 0.0, 2.0, 0.0, 3.0, 1.0],
+            ..Feel::default()
+        };
+        let mut bloom = Bloom::default();
+        assert_eq!(sniper.cone(bloom.added), 0.0);
+        bloom.shot(&sniper);
+        assert_eq!(sniper.cone(bloom.added), 1.0);
+    }
+
+    // The gun banks' names hash to the banks the templates' `SoundEffect`
+    // name (read on a legally installed copy: the carbine's `50333181`,
+    // the pistol's `4a1f94d0`, the shotgun's `08e43a91`), and the flash
+    // field to its key.
+    #[test]
+    fn gun_banks_hash_to_the_templates_banks() {
+        assert_eq!(name_hash("wpn_combatrifle"), 0x5033_3181);
+        assert_eq!(name_hash("wpn_pistol"), 0x4a1f_94d0);
+        assert_eq!(name_hash("wpn_shotgun"), 0x08e4_3a91);
+        assert!(GUN_BANKS.contains(&"wpn_combatrifle"));
+        assert_eq!(name_hash("MuzzleFlashTemplate"), 0x87ac_b4be);
+    }
+
     // The names that hash to the weapon fields' keys (survey `arsenal`
     // and the weapons thread's brute force).
     #[test]
     fn the_names_hash_to_the_fields_keys() {
         for (name, key) in [
             ("DamageMinimum", DAMAGE_MINIMUM),
+            ("HeroMultiplier", HERO_MULTIPLIER),
             ("HumanBoost", HUMAN_BOOST),
             ("TurnSpeed", TURN_SPEED),
             ("MaxAngle", MAX_ANGLE),
@@ -737,6 +1140,7 @@ mod tests {
             damage,
             damage_min: min,
             falloff,
+            hero: 1.0,
             key: None,
             blast: None,
             timer: None,
@@ -745,6 +1149,58 @@ mod tests {
             model: None,
             sticky: false,
         }
+    }
+
+    fn mount(template: u32, ammo: Ammo, homing: bool) -> Mounted {
+        Mounted {
+            seat: 1,
+            priority: 0,
+            weapon: WeaponSpec {
+                template,
+                name: format!("gun {template}"),
+                model: None,
+                class: None,
+                semi: false,
+                rate_of_fire: 400.0,
+                clip: 100,
+                reserve_clips: 0,
+                pellets: 1,
+                rounds_per_reload: 0,
+                scatter: 0.0,
+                ammo,
+                lock_on: homing.then_some((1.0, 500.0)),
+                pickup: None,
+                feel: Default::default(),
+                hint: None,
+            },
+            nodes: vec![Some(0)],
+        }
+    }
+
+    // The AMX-30: a heavy MG beside its gun; the PGZ95: its own bursting
+    // gun and missiles, no machine gun.
+    #[test]
+    fn a_vehicles_machine_gun_is_its_mounted_bullet_gun_or_none() {
+        let blast = Blast {
+            template: 9,
+            radius: 2.0,
+            damage: 40.0,
+            min_damage: 0.0,
+            max_force: 0.0,
+            key: None,
+        };
+        let shell = Ammo {
+            blast: Some(blast),
+            ..ammo(40.0, 40.0, (0.0, 0.0))
+        };
+        let bullet = mount(1, ammo(6.0, 3.0, (15.0, 50.0)), false);
+        let cannon = mount(2, shell, false);
+        let missile = mount(3, ammo(100.0, 100.0, (0.0, 0.0)), true);
+
+        let armed = [cannon.clone(), bullet.clone()];
+        assert_eq!(machine_gun(&armed), MachineGun::Mounted(&bullet.weapon));
+        assert_eq!(machine_gun(&[cannon, missile]), MachineGun::Unmounted);
+        assert_eq!(machine_gun(&[]), MachineGun::StandIn);
     }
 
     // The carbine round: 6 out to 15 m, 3 from 50 m; 340 m/s from her
@@ -778,6 +1234,64 @@ mod tests {
         assert_eq!(t.speed_at(0.0), 13.0);
         assert!((t.speed_at(22.5) - 14.5).abs() < 1e-4);
         assert_eq!(t.speed_at(60.0), 16.0);
+    }
+
+    // `WeaponHint`'s names hash to the fields the database lists, in
+    // order after the four leading words (gap round 13).
+    #[test]
+    fn weapon_hint_names_hash_as_listed() {
+        let listed = [
+            ("MinFireRange", 0x67a3_cde6),
+            ("FireRange", 0x12b4_9564),
+            ("FireAngle", 0x8d62_0c3a),
+            ("BurstOnLength", 0xee64_1a7e),
+            ("BurstOffLength", 0xb5ef_5ea8),
+            ("ChargeTime", 0x2d59_5f06),
+            ("BurstOnCloseLength", 0x169f_a172),
+            ("BurstOffCloseLength", 0x6a2c_0fb4),
+        ];
+        for (name, hash) in listed {
+            assert_eq!(name_hash(name), hash, "{name}");
+        }
+        // And `WeaponScatter`'s first field.
+        assert_eq!(SCATTER_FIELDS[0], name_hash("LowSkillScatter"));
+    }
+
+    // The carbine's and the minigun's bursts (their `WeaponHint`s).
+    #[test]
+    fn bursts_follow_the_hint() {
+        let carbine = FireHint {
+            min_range: 1.0,
+            range: 70.0,
+            angle: 0,
+            on: 0.3,
+            off: 4.5,
+            on_close: -1.0,
+            off_close: 0.75,
+        };
+        let gap = 60.0 / 562.0;
+        // 0.3 s at 562 a minute: rounds at 0, 0.107 and 0.214 s.
+        assert_eq!(carbine.rounds(gap, false), 3);
+        // Close in, the far burst (-1) with the close pause.
+        assert_eq!(carbine.burst(true), (0.3, 0.75));
+        assert_eq!(carbine.rounds(gap, true), 3);
+        let share = carbine.firing_share(gap, false);
+        assert!((share - 0.32 / 4.82).abs() < 0.01, "{share}");
+        // A 0 s burst is a single round; the pistol's 0 s pause fires at
+        // its rate.
+        let pistol = FireHint {
+            on: 0.0,
+            off: 0.0,
+            ..carbine
+        };
+        assert_eq!(pistol.rounds(0.4, false), 1);
+        assert_eq!(pistol.firing_share(0.4, false), 1.0);
+        let minigun = FireHint {
+            on: 3.0,
+            off: 4.0,
+            ..carbine
+        };
+        assert_eq!(minigun.rounds(60.0 / 900.0, false), 46);
     }
 
     // A rocket pod chain: each pod once, in the coupling's order.
@@ -814,6 +1328,8 @@ mod tests {
             ammo: ammo(50.0, 50.0, (0.0, 0.0)),
             lock_on: None,
             pickup: None,
+            feel: Default::default(),
+            hint: None,
         };
         let arms = Arms {
             weapons: HashMap::from([(7, spec)]),
@@ -824,5 +1340,75 @@ mod tests {
         assert_eq!((m[0].seat, m[0].priority), (5, 0));
         assert_eq!(m[0].nodes, vec![Some(2), None, Some(0)]);
         assert_eq!(m[1].nodes, vec![None]);
+    }
+
+    /// Share of rounds within 0.45 m of a mark `distance` ahead, by a
+    /// fixed xorshift, for `spread`.
+    fn hit_share(spread: SoldierSpread, distance: f32) -> f32 {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut pick = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let (n, at) = (20_000, Vec3::Z * distance);
+        let hits = (0..n)
+            .filter(|_| {
+                let dir = spread.stray(Vec3::Z, pick(), pick());
+                (dir * at.dot(dir)).distance(at) < 0.45
+            })
+            .count();
+        hits as f32 / n as f32
+    }
+
+    #[test]
+    fn soldiers_spread_by_their_guns_cone() {
+        let vz = SoldierSpread::VZ_ACCURACY;
+        // A perfect shot with the sniper rifle's 0.1 degrees still misses
+        // a little; the shotgun's 3.5 is wider than the carbine's 1.
+        let sniper = SoldierSpread::new(0.0, 1.0, 0.1);
+        assert!(sniper.up > 0.1f32.to_radians());
+        let (carbine, shotgun) = (
+            SoldierSpread::new(20.0, vz, 1.0),
+            SoldierSpread::new(20.0, vz, 3.5),
+        );
+        assert!((shotgun.side - carbine.side - 2.5f32.to_radians()).abs() < 1e-6);
+        assert!((shotgun.up - carbine.up - 2.5f32.to_radians()).abs() < 1e-6);
+        // The miss is twice as wide sideways and grows with range.
+        let far = SoldierSpread::new(40.0, vz, 0.0);
+        assert!((far.side - 2.0 * far.up).abs() < 1e-6);
+        assert!(far.up > SoldierSpread::new(20.0, vz, 0.0).up);
+        // A negative cone counts as none.
+        assert_eq!(
+            SoldierSpread::new(20.0, vz, -1.0),
+            SoldierSpread::new(20.0, vz, 0.0)
+        );
+    }
+
+    #[test]
+    fn a_vz_soldiers_rifle_hits_at_20_m_as_before() {
+        // The old rule (0.1 rad up, 0.2 along the world's x and z, the
+        // same for every gun) hit 9.0% of his rounds at 20 m, over all
+        // headings (the soldierspread example). The fitted miss keeps his
+        // Assault Rifle (1.5 degrees) hitting as often.
+        let new = SoldierSpread::new(20.0, SoldierSpread::VZ_ACCURACY, 1.5);
+        let now = hit_share(new, 20.0);
+        assert!((now - 0.090).abs() < 0.01, "{now}");
+        // The machine pistols' 4 degrees hit less, the carbine's 1 more.
+        let vz = SoldierSpread::VZ_ACCURACY;
+        assert!(hit_share(SoldierSpread::new(10.0, vz, 4.0), 10.0) < 0.4);
+        assert!(hit_share(SoldierSpread::new(10.0, vz, 1.0), 10.0) > 0.74);
+    }
+
+    #[test]
+    fn a_stray_round_stays_within_the_widths() {
+        let s = SoldierSpread { side: 0.2, up: 0.1 };
+        let aim = Vec3::new(1.0, 0.0, 1.0).normalize();
+        let d = s.stray(aim, 0.5, -0.5);
+        let side = aim.cross(Vec3::Y).normalize();
+        assert!((d.dot(side) / d.dot(aim) - 0.1).abs() < 1e-5);
+        assert!((d.dot(Vec3::Y) / d.dot(aim) + 0.05).abs() < 1e-5);
+        assert!(s.stray(aim, 0.0, 0.0).distance(aim) < 1e-6);
     }
 }

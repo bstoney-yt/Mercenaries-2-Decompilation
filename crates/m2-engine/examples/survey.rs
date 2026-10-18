@@ -67,6 +67,26 @@
 //!                           alpha makes of them (wheels, tracked, turret),
 //!                           and every node with its geometry box and how
 //!                           it fares in the wheel tests
+//! pickups[:<word>,..]       every placed pickup (health, ammunition, a
+//!                           weapon, cash), supply crate (what it leaves)
+//!                           and emplaced gun, in the areas of the state
+//!                           layers whose name holds a word (default
+//!                           vzacon001,pmccon001): their box, 150 m wider,
+//!                           over every layer; counts, then each one
+//! trees[:<x0>,<z0>,<x1>,<z1>] every species of the tree table: its
+//!                           template and trees (all, and within the box,
+//!                           default VzaCon001's breakables box), with the
+//!                           components that say how it reacts when hit
+//!                           (as `breakables`)
+//! breakables[:<word>,..]    every placed object in the areas of the state
+//!                           layers whose name holds a word (default
+//!                           vzacon001,pmccon001; their box, 150 m wider,
+//!                           the island's layers and the contract's own),
+//!                           by template: how many (island, state), and
+//!                           the components that say how it reacts when
+//!                           hit (`Health`, `PhysicsPropertyCrashable`,
+//!                           `_PropPhysics`, `ModifierKey`, ...) with
+//!                           their fields; then a tally by components
 //! templates:<word|id>[,..]  templates whose name holds a word (or whose
 //!                           id is given, 8 hex digits), with their
 //!                           components' fields (text fields not read), a
@@ -119,6 +139,14 @@
 //!                           hash): each 4-byte word, 8 a line, as a name,
 //!                           a float or hex
 //! find:<hash>[,..]          names for hashes
+//! roadboxes                 every placed road by kind (its record's name
+//!                           hash at 4): its template's `LaneData`
+//!                           strips, and how far its record's box reaches
+//!                           past its path (median, most; a few samples)
+//! traffic                   what the alpha makes of the roads: widths,
+//!                           which carry traffic and in which lanes, and
+//!                           the passers-by placed and how far off their
+//!                           road's line they walk
 //! hijack                    every template that can be hijacked: its
 //!                           entrances' template, script, point, radius
 //!                           and flag, and whether vz.wad has the script
@@ -186,6 +214,32 @@
 //!                           and state, the handler kind and its commands
 //!                           (operands by name, node with its height, or
 //!                           number), and every node's height and box
+//! wrecks[:<word>,..]        across every model with a state machine, its
+//!                           geometry nodes by whether they show intact,
+//!                           wrecked, both or never; then each model with
+//!                           a wreck whose switched parts show both ways
+//!                           (or those whose name holds a word)
+//! runover                   every vehicle's mass and ram kind, every
+//!                           person's health and damage row: kill speeds
+//!                           and bashes to kill, before and after
+//! vdamage[:<word>,..]       vehicle models: parts, their health, the
+//!                           looks the alpha drew before and the looks
+//!                           their parts reach shot with rifle rounds,
+//!                           parts thrown off, burning and wreck effects
+//! blends[:<word>,..]        every model with blend shapes (top-level
+//!                           `BSHP`), and those with a texture whose name
+//!                           holds a word: blend shape names, morph
+//!                           targets per group, states and textures
+//! doubles:<file>[,x0,z0,x1,z1] what stands twice: with the layers a run
+//!                           had in (its `state layers loaded:` line in
+//!                           the file), every two placed models or
+//!                           vehicles whose boxes lie one within the
+//!                           other (within the box, if given)
+//! treefit[:x0,z0,x1,z1]     how far the tree table's trees stand off the
+//!                           full-detail ground (default the villa's box),
+//!                           as decoded and moved by up to 12 m, per
+//!                           species and on slopes; the layers' plants
+//!                           likewise; the trees near a road's line
 //! ```
 //!
 //! Names come from every NUL-terminated string in the four archives and
@@ -958,6 +1012,22 @@ fn main() -> Result<(), Error> {
                 |_, _, _| true,
                 |p| p.x,
             ),
+            // Every entity of the layers whose name holds a word, with all
+            // their records (`layer:vz_state_car_estate`).
+            "layer" => {
+                let words = words_of(arg);
+                layer_entities_with(
+                    &mut source,
+                    &names,
+                    usize::MAX,
+                    None,
+                    |layer, _, _| {
+                        let l = layer.to_ascii_lowercase();
+                        words.iter().any(|w| l.contains(w.as_str()))
+                    },
+                    |p| p.x,
+                )
+            }
             "collision" => collision(&mut source, &names, arg),
             "phy2words" => {
                 if world.is_none() {
@@ -977,6 +1047,13 @@ fn main() -> Result<(), Error> {
                 phy2_census(&mut source, world.as_ref().expect("just built"), &names)
             }
             "phy2rules" => phy2_rules(&mut source),
+            "traffic" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                traffic_census(world.as_ref().expect("just built"));
+                Ok(())
+            }
             "hijack" => {
                 if world.is_none() {
                     world = Some(WorldIndex::build(&mut source)?);
@@ -987,6 +1064,7 @@ fn main() -> Result<(), Error> {
             "vo" => vo_lines(&install, arg),
             "scan" => scan_words(&install, &names, arg),
             "dump" => dump_assets(&mut source, &names, arg),
+            "roadboxes" => road_boxes(&mut source, &names),
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
@@ -1010,7 +1088,37 @@ fn main() -> Result<(), Error> {
                     arg,
                 )
             }
+            "pickups" => pickups(&mut source, arg),
+            "breakables" => breakables(&mut source, &names, arg),
+            "trees" => trees(&mut source, &names, arg),
             "stam" => stam(&mut source, &names, arg),
+            "wrecks" => wrecks(&mut source, &names, arg),
+            "blends" => blends(&mut source, &names, arg),
+            "vdamage" => vdamage(&mut source, &names, arg),
+            "runover" => runover(&mut source, &names, arg),
+            "partdata" => partdata(&mut source, &names, arg),
+            "treefit" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                treefit(
+                    &mut source,
+                    world.as_ref().expect("just built"),
+                    &names,
+                    arg,
+                )
+            }
+            "doubles" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                doubles(
+                    &mut source,
+                    world.as_ref().expect("just built"),
+                    &names,
+                    arg,
+                )
+            }
             "strings" => script_strings(&mut source, &names, arg),
             "text" => texts(&mut source, &names, arg),
             "names" => names_holding(&mut source, &names, arg),
@@ -1046,7 +1154,7 @@ fn main() -> Result<(), Error> {
 fn atmospheres(world: &WorldIndex, names: &Names, arg: &str) {
     let show = |a: &m2_engine::Atmosphere| {
         format!(
-            "time {:.3} li {:.2} light {:.2},{:.2},{:.2} tone {:.2},{:.2},{:.2} cover {:.2} up {:.2},{:.2},{:.2} interp {:.1} dark {:.0} inscat {:.1} haze {:?}",
+            "time {:.3} li {:.2} light {:.2},{:.2},{:.2} tone {:.2},{:.2},{:.2} cover {:.2} up {:.2},{:.2},{:.2} interp {:.1} dark {:.0} inscat {:.1} haze {:?} bloom {:?} tone map {:?}",
             a.light_time[0],
             a.light_intensity,
             a.light_color.x,
@@ -1062,7 +1170,9 @@ fn atmospheres(world: &WorldIndex, names: &Names, arg: &str) {
             a.interpolate_time,
             a.cloud_darkness,
             a.inscattering,
-            a.haze_layers
+            a.haze_layers,
+            a.bloom,
+            a.tone_map
         )
     };
     if let Some(a) = &world.atmosphere {
@@ -3492,7 +3602,7 @@ fn print_model_materials(names: &Names, got: &Gathered, model: &Model<'_>) {
             m.technique,
             names.show(m.technique),
             m.flags,
-            m.unk_tail
+            m.surface
         );
         println!("      constants {}", constants.join(" "));
         for (s, &t) in m.textures.iter().enumerate() {
@@ -5440,6 +5550,428 @@ fn components<R: Read + Seek>(
     Ok(())
 }
 
+/// What a placed template is to the player, for the `pickups` census.
+fn pickup_kind(
+    leavings: &m2_engine::pickup::Leavings,
+    tnames: &HashMap<u32, &str>,
+    t: u32,
+) -> Option<&'static str> {
+    use m2_engine::pickup::EQUIPMENT;
+    let name = tnames.get(&t).copied().unwrap_or("");
+    if let Some(p) = leavings.pickups.get(&t) {
+        return Some(if name.contains("Cash") {
+            "cash"
+        } else if p.kind == EQUIPMENT {
+            "weapon"
+        } else if p.heals > 0 && p.gives.is_empty() {
+            "health"
+        } else {
+            "ammo"
+        });
+    }
+    let labels = leavings.labels.get(&t).map_or(&[][..], Vec::as_slice);
+    if labels.contains(&m2_assets::name_hash("Emplacedweapon")) {
+        return Some("emplaced");
+    }
+    // Whatever leaves a pickup when destroyed: a crate, labelled so or
+    // not.
+    let spawns = leavings.spawns.get(&t)?;
+    spawns
+        .iter()
+        .any(|s| leavings.pickups.contains_key(s))
+        .then_some("crate")
+}
+
+fn pickups<R: Read + Seek>(source: &mut AssetSource<R>, arg: &str) -> Result<(), Error> {
+    let mut words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if words.is_empty() {
+        words = vec!["vzacon001".into(), "pmccon001".into()];
+    }
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let leavings = m2_engine::pickup::read(&db);
+    // Every placed one: its layer, kind, template, entity and place.
+    let mut rows: Vec<(String, &str, u32, u32, Vec3)> = Vec::new();
+    // Each state layer's box.
+    let mut boxes: HashMap<String, (Vec3, Vec3)> = HashMap::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        let layer = m2_engine::world::layer_name(&paths[b]);
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(l) = Layer::parse(data) else {
+                continue;
+            };
+            for (id, p) in l.placements() {
+                let at = Vec3::from_array(p.position);
+                if layer.contains("state") {
+                    let b = boxes.entry(layer.clone()).or_insert((at, at));
+                    *b = (b.0.min(at), b.1.max(at));
+                }
+                if let Some(kind) = pickup_kind(&leavings, &tnames, p.parent) {
+                    rows.push((layer.clone(), kind, p.parent, id, at));
+                }
+            }
+        }
+    }
+    const WIDER: f32 = 150.0;
+    for w in &words {
+        let mut lo = Vec3::splat(f32::MAX);
+        let mut hi = Vec3::splat(f32::MIN);
+        for (_, b) in boxes
+            .iter()
+            .filter(|(n, _)| n.replace('_', "").contains(w.as_str()))
+        {
+            lo = lo.min(b.0);
+            hi = hi.max(b.1);
+        }
+        if lo.x > hi.x {
+            println!("{w}: no state layer");
+            continue;
+        }
+        let (lo, hi) = (lo - Vec3::splat(WIDER), hi + Vec3::splat(WIDER));
+        // In the box, of the island's layers or the contract's own
+        // (`vz_state_vza_con001_post` is VzaCon001's too), not another
+        // contract's that shares the ground.
+        let own =
+            |layer: &str| !layer.contains("state") || layer.replace('_', "").contains(w.as_str());
+        let inside: Vec<_> = rows
+            .iter()
+            .filter(|r| r.4.x >= lo.x && r.4.x <= hi.x && r.4.z >= lo.z && r.4.z <= hi.z)
+            .filter(|r| own(&r.0))
+            .collect();
+        let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
+        for r in &inside {
+            *tally.entry(r.1).or_default() += 1;
+        }
+        println!(
+            "pickups\t{w}\tbox {:.0},{:.0}..{:.0},{:.0}\t{} placed\t{tally:?}",
+            lo.x,
+            lo.z,
+            hi.x,
+            hi.z,
+            inside.len()
+        );
+        for (layer, kind, t, id, at) in inside {
+            let leaves: Vec<&str> = leavings
+                .spawns
+                .get(t)
+                .into_iter()
+                .flatten()
+                .map(|s| tnames.get(s).copied().unwrap_or("?"))
+                .collect();
+            println!(
+                "placed\t{w}\t{kind}\t{t:08x}\t{}\t{layer}\t{id:#x}\t{:.1},{:.1},{:.1}\t{}",
+                tnames.get(t).copied().unwrap_or("?"),
+                at.x,
+                at.y,
+                at.z,
+                leaves.join("; ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The components that say how a placed object reacts when hit, for the
+/// `breakables` census.
+const REACTING: [&str; 14] = [
+    "Health",
+    "PhysicsPropertyCrashable",
+    "_PropPhysics",
+    "_DebrisPhysics",
+    "ModifierKey",
+    "SoundKey",
+    "BuildingCollapseAnim",
+    "_BuildingPhysics",
+    "DamageChunks",
+    "DebrisEffect",
+    "Explosive",
+    "SpawnOnDeath",
+    "PhysicsDefaultActivator",
+    "PhysicsPropertyUncrushable",
+];
+
+/// Every placed object in the contracts' areas by template, with the
+/// components that say how it reacts when hit.
+fn breakables<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let mut words = words_of(arg);
+    if words.is_empty() {
+        words = vec!["vzacon001".into(), "pmccon001".into()];
+    }
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let comps: Vec<_> = REACTING
+        .iter()
+        .filter_map(|n| db.components.iter().find(|c| c.name == *n))
+        .map(|c| (c, by_entity(c)))
+        .collect();
+    // Every placed entity: its layer, template and place.
+    let mut rows: Vec<(String, u32, Vec3)> = Vec::new();
+    let mut boxes: HashMap<String, (Vec3, Vec3)> = HashMap::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        let layer = m2_engine::world::layer_name(&paths[b]);
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(l) = Layer::parse(data) else {
+                continue;
+            };
+            for (_, p) in l.placements() {
+                let at = Vec3::from_array(p.position);
+                if layer.contains("state") {
+                    let b = boxes.entry(layer.clone()).or_insert((at, at));
+                    *b = (b.0.min(at), b.1.max(at));
+                }
+                rows.push((layer.clone(), p.parent, at));
+            }
+        }
+    }
+    // The damage table: what each kind of damage does to each kind of
+    // target (a template's `ModifierKey`), of the damage.
+    use m2_engine::tuning::{DAMAGE_TABLE, DAMAGE_TABLE_TYPE, DamageTable};
+    if let Some(table) = source
+        .asset(m2_assets::name_hash(DAMAGE_TABLE), DAMAGE_TABLE_TYPE)
+        .ok()
+        .and_then(|d| DamageTable::parse(&d))
+    {
+        let (rows, columns) = table.keys();
+        let name = |k: u32| names.get(k).map_or(format!("{k:08x}"), str::to_owned);
+        let head: Vec<String> = columns.iter().map(|&c| name(c)).collect();
+        println!("damage\ttarget\t{}", head.join("\t"));
+        for &r in rows {
+            let cells: Vec<String> = columns
+                .iter()
+                .map(|&c| table.scale(r, c).map_or("-".into(), |v| format!("{v}")))
+                .collect();
+            println!("damage\t{}\t{}", name(r), cells.join("\t"));
+        }
+    }
+    const WIDER: f32 = 150.0;
+    let name_field = m2_assets::name_hash("Name");
+    for w in &words {
+        let mut lo = Vec3::splat(f32::MAX);
+        let mut hi = Vec3::splat(f32::MIN);
+        for (_, b) in boxes
+            .iter()
+            .filter(|(n, _)| n.replace('_', "").contains(w.as_str()))
+        {
+            lo = lo.min(b.0);
+            hi = hi.max(b.1);
+        }
+        if lo.x > hi.x {
+            println!("{w}: no state layer");
+            continue;
+        }
+        let (lo, hi) = (lo - Vec3::splat(WIDER), hi + Vec3::splat(WIDER));
+        let own =
+            |layer: &str| !layer.contains("state") || layer.replace('_', "").contains(w.as_str());
+        // By template: (island placements, state placements).
+        let mut by: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
+        for r in rows
+            .iter()
+            .filter(|r| r.2.x >= lo.x && r.2.x <= hi.x && r.2.z >= lo.z && r.2.z <= hi.z)
+            .filter(|r| own(&r.0))
+        {
+            let n = by.entry(r.1).or_default();
+            if r.0.contains("state") {
+                n.1 += 1;
+            } else {
+                n.0 += 1;
+            }
+        }
+        let total: usize = by.values().map(|n| n.0 + n.1).sum();
+        println!(
+            "breakables\t{w}\tbox {:.0},{:.0}..{:.0},{:.0}\t{total} placed\t{} templates",
+            lo.x,
+            lo.z,
+            hi.x,
+            hi.z,
+            by.len()
+        );
+        let mut tally: BTreeMap<String, usize> = BTreeMap::new();
+        let mut list: Vec<_> = by.into_iter().collect();
+        list.sort_by_key(|(t, n)| (std::cmp::Reverse(n.0 + n.1), *t));
+        for (t, (island, state)) in list {
+            let mut has = Vec::new();
+            let mut fields = Vec::new();
+            for (c, recs) in &comps {
+                let Some(r) = recs.get(&t).and_then(|v| v.first()) else {
+                    continue;
+                };
+                has.push(c.name);
+                let vals: Vec<String> = c
+                    .fields
+                    .iter()
+                    .filter(|f| f.name_hash != name_field)
+                    .map(|f| field_value(names, f, r))
+                    .collect();
+                fields.push(format!("{}({})", c.name, vals.join(" ")));
+            }
+            *tally.entry(has.join("+")).or_default() += island + state;
+            println!(
+                "template\t{w}\t{t:08x}\t{}\t{island}\t{state}\t{}",
+                tnames.get(&t).copied().unwrap_or("?"),
+                fields.join(" ")
+            );
+        }
+        let mut tally: Vec<_> = tally.into_iter().collect();
+        tally.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for (k, n) in tally {
+            let k = if k.is_empty() { "(none)" } else { k.as_str() };
+            println!("tally\t{w}\t{n}\t{k}");
+        }
+    }
+    Ok(())
+}
+
+/// The tree table's species, with what their templates say of how their
+/// trees react when hit (round 7: the tank's crushing).
+fn trees<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let b: Vec<f32> = arg.split(',').filter_map(|v| v.parse().ok()).collect();
+    let area = match b[..] {
+        [x0, z0, x1, z1] => [x0, z0, x1, z1],
+        _ => [-2133.0, 803.0, -618.0, 3371.0],
+    };
+    let index = source.archive().index();
+    let find = |kind: u32| {
+        index
+            .assets()
+            .iter()
+            .find(|a| index.type_hash(a) == kind)
+            .map(|a| a.name_hash)
+    };
+    let tree_type = m2_assets::tree::TREE_TYPE;
+    let (Some(db_hash), Some(tree_hash)) = (find(TEMPLATE_DB_TYPE), find(tree_type)) else {
+        println!("no template database or tree table");
+        return Ok(());
+    };
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let comps: Vec<_> = REACTING
+        .iter()
+        .filter_map(|n| db.components.iter().find(|c| c.name == *n))
+        .map(|c| (c, by_entity(c)))
+        .collect();
+    let table = match m2_assets::TreeTable::parse(&source.asset(tree_hash, tree_type)?) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("tree table: {e}");
+            return Ok(());
+        }
+    };
+    let name_field = m2_assets::name_hash("Name");
+    // Each species' model (its template's `ModelName`).
+    let model_of = db
+        .components
+        .iter()
+        .find(|c| c.name == "ModelName")
+        .and_then(|c| {
+            let f = c
+                .fields
+                .iter()
+                .find(|f| f.name_hash == m2_assets::name_hash("model"))?;
+            Some((by_entity(c), usize::from(f.offset)))
+        });
+    for (k, s) in table.species.iter().enumerate() {
+        let model = model_of
+            .as_ref()
+            .and_then(|(recs, at)| {
+                let r = recs.get(&s.template)?.first()?;
+                Some(u32::from_le_bytes(r.get(*at..*at + 4)?.try_into().ok()?))
+            })
+            .unwrap_or(0);
+        let inside = s
+            .trees
+            .iter()
+            .filter(|t| {
+                let [x, _, z] = t.position;
+                x >= area[0] && x <= area[2] && z >= area[1] && z <= area[3]
+            })
+            .count();
+        let mut fields = Vec::new();
+        for (c, recs) in &comps {
+            let Some(r) = recs.get(&s.template).and_then(|v| v.first()) else {
+                continue;
+            };
+            let vals: Vec<String> = c
+                .fields
+                .iter()
+                .filter(|f| f.name_hash != name_field)
+                .map(|f| field_value(names, f, r))
+                .collect();
+            fields.push(format!("{}({})", c.name, vals.join(" ")));
+        }
+        println!(
+            "species\t{k}\t{:08x}\t{}\tmodel {model:08x} {}\t{} trees\t{inside} in box\tscale {:.2?}\t{}",
+            s.template,
+            tnames.get(&s.template).copied().unwrap_or("?"),
+            names.show(model),
+            s.trees.len(),
+            s.scale,
+            fields.join(" ")
+        );
+    }
+    Ok(())
+}
+
 fn templates<R: Read + Seek>(
     source: &mut AssetSource<R>,
     names: &Names,
@@ -5529,8 +6061,13 @@ fn templates<R: Read + Seek>(
             }
         }
     };
-    let shown: Vec<u32> = picked.iter().take(150).map(|p| p.1).collect();
-    for &(name, id) in picked.iter().take(150) {
+    // 150 at most, or as many as `M2_SURVEY_MOST` says.
+    let most = std::env::var("M2_SURVEY_MOST")
+        .ok()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(150);
+    let shown: Vec<u32> = picked.iter().take(most).map(|p| p.1).collect();
+    for &(name, id) in picked.iter().take(most) {
         show(id, name, &mut named);
     }
     named.retain(|v| !shown.contains(v));
@@ -6408,6 +6945,1152 @@ fn destruct_names(names: &Names) -> Names {
         names.add(w);
     }
     names
+}
+
+/// `vdamage[:<word>,..]`: over every vehicle template (any vehicle
+/// physics component) whose model is in the archive, or those whose name
+/// holds a word, what its parts do as they are damaged
+/// ([`m2_engine::vehicle_damage`]): its parts, those its `NodeHealth`
+/// gives health, the records naming no part; how many looks the alpha
+/// drew before this round (intact, and the wreck if it has one) and how
+/// many its parts reach as each is shot with rifle rounds (9 damage) at
+/// its box's centre until it changes no more, the parts damaged and
+/// destroyed, those thrown off, and the effects the body starts burning
+/// and wrecked (and how many name a template). One tab-separated
+/// `vdamage` line per model, then totals.
+fn vdamage<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    use m2_engine::vehicle_damage::{DamageModel, PartDamage};
+    let words = words_of(arg);
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let models: HashSet<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == MODEL_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let template_hashes: HashSet<u32> = tnames.values().map(|n| m2_assets::name_hash(n)).collect();
+    let model_of = db.hashes("ModelName");
+    let healths = m2_engine::vehicle_damage::read(&db);
+    let mut vehicles: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for p in VEHICLE_PHYSICS {
+        if let Some(c) = db.component(p) {
+            for (id, _) in c.records().unwrap_or_default() {
+                let Some(&m) = model_of.get(&id) else {
+                    continue;
+                };
+                let name = tnames.get(&id).copied().unwrap_or("").to_ascii_lowercase();
+                if models.contains(&m)
+                    && (words.is_empty() || words.iter().any(|w| name.contains(w.as_str())))
+                    && !vehicles.get(&m).is_some_and(|v| v.contains(&id))
+                {
+                    vehicles.entry(m).or_default().push(id);
+                }
+            }
+        }
+    }
+    println!(
+        "vdamage\tmodel\tname\ttemplate\tparts\twith health\tunmatched records\tlooks before\tlooks after\tdamaged\tdestroyed\tthrown off\tburning fx\twreck fx\tfx named"
+    );
+    let mut t = [0usize; 12];
+    // Records naming the unsolved whole-vehicle name, weak parts, chunks
+    // thrown (twice the mean: min + max), models throwing any.
+    let mut extra = [0usize; 4];
+    for (m, ids) in &vehicles {
+        let Ok(data) = source.model(*m) else { continue };
+        let Ok(model) = data.parse() else { continue };
+        let wreck = model
+            .states
+            .as_ref()
+            .is_some_and(|s| s.hidden(&model.nodes, false) != s.hidden(&model.nodes, true));
+        let before = 1 + usize::from(wreck);
+        // The model's first template (by id) with parts' health.
+        let Some((id, h)) = ids
+            .iter()
+            .filter_map(|id| healths.get(id).map(|h| (*id, h)))
+            .min_by_key(|(id, _)| *id)
+        else {
+            t[0] += 1;
+            continue;
+        };
+        let Some(dm) = DamageModel::from_model(&model) else {
+            t[1] += 1;
+            println!(
+                "vdamage\t{m:08x}\t{}\t{}\t0\t0\t{}\t{before}\t{before}\t0\t0\t0\t0\t0\t0",
+                names.show(*m),
+                tnames.get(&id).copied().unwrap_or("?"),
+                h.parts.len()
+            );
+            t[3] += before;
+            t[4] += before;
+            continue;
+        };
+        let mut d = PartDamage::new(&dm, h);
+        let unmatched = h
+            .parts
+            .iter()
+            .filter(|p| dm.part_named(p.part).is_none())
+            .count();
+        let whole = h
+            .parts
+            .iter()
+            .filter(|p| p.part == m2_engine::vehicle_damage::UNNAMED_WHOLE)
+            .count();
+        let chunks: u32 = h
+            .debris
+            .iter()
+            .filter(|c| c.model.is_some())
+            .map(|c| c.count.0 + c.count.1)
+            .sum();
+        let mut looks: HashSet<Vec<bool>> = HashSet::new();
+        looks.insert(d.hidden(&dm));
+        let parts = dm.states.machines.len();
+        let (mut damaged, mut destroyed, mut thrown) = (0, 0, 0);
+        for k in 0..parts {
+            if dm.boxes[k].is_none() || Some(k) == d.body {
+                continue;
+            }
+            let start = d.state[k];
+            for _ in 0..200 {
+                d.hurt(&dm, k, 9.0);
+                looks.insert(d.hidden(&dm));
+            }
+            if d.state[k] != start {
+                damaged += 1;
+                // Its last state: a wreck of it (broken glass), or
+                // nothing (thrown off).
+                let shows = |s: Option<usize>| {
+                    s.and_then(|s| dm.states.machines[k].states.get(s))
+                        .map(|s| s.1.iter().filter(|x| x.1).map(|x| x.0).collect::<Vec<_>>())
+                };
+                if shows(d.state[k]) != shows(start) {
+                    destroyed += 1;
+                }
+            }
+            thrown += d.take_detached().len();
+        }
+        let named = |fx: &[(usize, u32, Vec3)]| {
+            fx.iter().filter(|e| template_hashes.contains(&e.1)).count()
+        };
+        d.body_damaged(&dm);
+        let burning = d.emitters(&dm);
+        looks.insert(d.hidden(&dm));
+        d.body_destroyed(&dm);
+        let wrecked = d.emitters(&dm);
+        let fx_named = named(&burning) + named(&wrecked);
+        let after = looks.len().max(before);
+        println!(
+            "vdamage\t{m:08x}\t{}\t{}\t{parts}\t{}\t{unmatched}\t{before}\t{after}\t{damaged}\t{destroyed}\t{thrown}\t{}\t{}\t{fx_named}",
+            names.show(*m),
+            tnames.get(&id).copied().unwrap_or("?"),
+            d.with_health(),
+            burning.len(),
+            wrecked.len()
+        );
+        t[2] += 1;
+        t[3] += before;
+        t[4] += after;
+        t[5] += damaged;
+        t[6] += destroyed;
+        t[7] += thrown;
+        t[8] += burning.len() + wrecked.len();
+        t[9] += fx_named;
+        t[10] += parts;
+        t[11] += unmatched;
+        extra[0] += whole;
+        extra[1] += d.with_key();
+        extra[2] += chunks as usize;
+        extra[3] += usize::from(chunks > 0);
+        if d.with_key() > 0 {
+            println!(
+                "vdweak\t{m:08x}\t{}\t{} weak parts",
+                tnames.get(&id).copied().unwrap_or("?"),
+                d.with_key()
+            );
+        }
+    }
+    println!(
+        "vdamage totals: {} vehicle models; {} without NodeHealth, {} without part messages, {} with; parts {}, NodeHealth records naming no part {}; looks before {} after {}; parts changing state {} changing look {} thrown off {}; body effects {} ({} name a template)",
+        vehicles.len(),
+        t[0],
+        t[1],
+        t[2],
+        t[10],
+        t[11],
+        t[3],
+        t[4],
+        t[5],
+        t[6],
+        t[7],
+        t[8],
+        t[9]
+    );
+    println!(
+        "vdamage parts: NodeHealth records naming no part {} = {} the unsolved c851b695 (health 1000, one a template) + {} nodes the model lacks; weak parts {}; models whose wreck throws chunks {}, {:.1} chunks each on average",
+        t[11],
+        extra[0],
+        t[11] - extra[0],
+        extra[1],
+        extra[3],
+        extra[2] as f32 / 2.0 / extra[3].max(1) as f32
+    );
+    Ok(())
+}
+
+/// One component's records by template, with a field reader by name
+/// hash (the survey's own: `m2_engine`'s table reader is the crate's).
+struct Recs<'a> {
+    fields: HashMap<u32, (usize, u8, u8)>,
+    by: HashMap<u32, Vec<&'a [u8]>>,
+}
+
+impl<'a> Recs<'a> {
+    fn new(db: &Layer<'a>, name: &str) -> Self {
+        let Some(c) = db.component(name) else {
+            return Self {
+                fields: HashMap::new(),
+                by: HashMap::new(),
+            };
+        };
+        let mut by: HashMap<u32, Vec<&'a [u8]>> = HashMap::new();
+        for (id, r) in c.records().unwrap_or_default() {
+            by.entry(id).or_default().push(r);
+        }
+        Self {
+            fields: c
+                .fields
+                .iter()
+                .map(|f| {
+                    (
+                        f.name_hash,
+                        (usize::from(f.offset), f.bit_shift, f.bit_width),
+                    )
+                })
+                .collect(),
+            by,
+        }
+    }
+
+    fn of(&self, id: u32) -> &[&'a [u8]] {
+        self.by.get(&id).map_or(&[], Vec::as_slice)
+    }
+
+    fn word(&self, r: &[u8], field: u32) -> Option<u32> {
+        let &(at, shift, width) = self.fields.get(&field)?;
+        let b = r.get(at..at + 4)?;
+        let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        Some(if (1..32).contains(&width) {
+            (v >> shift) & ((1 << width) - 1)
+        } else {
+            v
+        })
+    }
+
+    fn float(&self, r: &[u8], field: u32) -> Option<f32> {
+        self.word(r, field).map(f32::from_bits)
+    }
+}
+
+/// `partdata[:<word>,..]`: over every vehicle template (as `vdamage`
+/// finds them) the part data its template holds beyond what round 14
+/// read: `NodeHealth` records by what their `Name` names (a part of the
+/// state machine, another node, nothing in the model) with their two
+/// unread fields; `ModifierKey` records naming a node (a part's own
+/// damage key); `PhysicsPropertyCrashable`; `DebrisEffect` (the chunks a
+/// wreck throws) with its counts and four floats; `VehiclePart` types.
+/// `pd*` lines, then totals.
+fn partdata<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    use m2_engine::vehicle_damage::DamageModel;
+    let words = words_of(arg);
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let models: HashSet<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == MODEL_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let model_of = db.hashes("ModelName");
+    let mut vehicles: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for p in VEHICLE_PHYSICS {
+        if let Some(c) = db.component(p) {
+            for (id, _) in c.records().unwrap_or_default() {
+                let Some(&m) = model_of.get(&id) else {
+                    continue;
+                };
+                let name = tnames.get(&id).copied().unwrap_or("").to_ascii_lowercase();
+                if models.contains(&m)
+                    && (words.is_empty() || words.iter().any(|w| name.contains(w.as_str())))
+                    && !vehicles.get(&m).is_some_and(|v| v.contains(&id))
+                {
+                    vehicles.entry(m).or_default().push(id);
+                }
+            }
+        }
+    }
+    let h = m2_assets::name_hash;
+    let nh = Recs::new(&db, "NodeHealth");
+    let mk = Recs::new(&db, "ModifierKey");
+    let crash = Recs::new(&db, "PhysicsPropertyCrashable");
+    let debris = Recs::new(&db, "DebrisEffect");
+    let vpart = Recs::new(&db, "VehiclePart");
+    let (name, health) = (h("Name"), h("Health"));
+    let show = |v: u32| match names.get(v) {
+        Some(n) => format!("{v:08x} {n}"),
+        None => format!("{v:08x}"),
+    };
+    // NodeHealth: records, naming a part, another node, nothing; per
+    // unmatched name, (records, templates); the other fields' values.
+    let mut t = [0usize; 4];
+    let mut unmatched: BTreeMap<u32, (usize, f32, f32)> = BTreeMap::new();
+    let mut extra: BTreeMap<(u32, String), usize> = BTreeMap::new();
+    let (mut mk_named, mut crash_n, mut debris_n, mut debris_tpl) = (0, 0, 0, 0);
+    let mut debris_vals: BTreeMap<String, usize> = BTreeMap::new();
+    let mut part_types: BTreeMap<u32, usize> = BTreeMap::new();
+    for (m, ids) in &vehicles {
+        let Ok(data) = source.model(*m) else { continue };
+        let Ok(model) = data.parse() else { continue };
+        let dm = DamageModel::from_model(&model);
+        let node = |v: u32| model.nodes.iter().position(|n| n.name_hash == v);
+        let part = |v: u32| dm.as_ref().and_then(|d| d.part_named(v));
+        for &id in ids {
+            let tn = tnames.get(&id).copied().unwrap_or("?");
+            for r in nh.of(id) {
+                let Some(n) = nh.word(r, name) else { continue };
+                t[0] += 1;
+                let hp = nh.float(r, health).unwrap_or(0.0);
+                if part(n).is_some() {
+                    t[1] += 1;
+                } else if node(n).is_some() {
+                    t[2] += 1;
+                    println!("pdnode\t{tn}\t{}\tnode {:?}\thealth {hp}", show(n), node(n));
+                } else {
+                    t[3] += 1;
+                    if n != 0xc851_b695 {
+                        println!(
+                            "pdmiss\t{tn}\t{}\tmodel {}\thealth {hp}",
+                            show(n),
+                            names.show(*m)
+                        );
+                    }
+                    let e = unmatched.entry(n).or_insert((0, f32::MAX, f32::MIN));
+                    e.0 += 1;
+                    e.1 = e.1.min(hp);
+                    e.2 = e.2.max(hp);
+                }
+                for f in [0x27c5_0f84u32, 0xea81_3967, 0x0ec0_aee7, 0x261b_2109] {
+                    let v = nh.float(r, f).unwrap_or(0.0);
+                    if v != 0.0 && !(f == 0x27c5_0f84 && v == 1.0) {
+                        *extra.entry((f, format!("{v}"))).or_default() += 1;
+                    }
+                }
+            }
+            for r in mk.of(id) {
+                let n = mk.word(r, name).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                mk_named += 1;
+                let key = mk.word(r, h("ModifierKey")).unwrap_or(0);
+                println!(
+                    "pdkey\t{tn}\t{}\tkey {}\tpart {:?}\tnode {:?}",
+                    show(n),
+                    show(key),
+                    part(n),
+                    node(n)
+                );
+            }
+            for r in crash.of(id) {
+                crash_n += 1;
+                let n = crash.word(r, name).unwrap_or(0);
+                println!(
+                    "pdcrash\t{tn}\t{}\tnode {:?}\taf54061b {}\t6b54d7a7 {}",
+                    show(n),
+                    node(n),
+                    crash.word(r, 0xaf54_061b).unwrap_or(0),
+                    crash.float(r, 0x6b54_d7a7).unwrap_or(f32::NAN)
+                );
+            }
+            let d = debris.of(id);
+            if !d.is_empty() {
+                debris_tpl += 1;
+            }
+            for r in d {
+                debris_n += 1;
+                let w = |f: u32| debris.word(r, f).unwrap_or(0);
+                let fl = |f: u32| debris.float(r, f).unwrap_or(f32::NAN);
+                let tpl = w(h("Template"));
+                let key = format!(
+                    "{} n {}-{} f {} {} {} {} trail {} type {} hp {}",
+                    tnames.get(&tpl).copied().unwrap_or("?"),
+                    w(0xc552_8d68),
+                    w(0xb4cb_8ad2),
+                    fl(0xb5d8_61c7),
+                    fl(0xcf25_e331),
+                    fl(0x83ba_82b5),
+                    fl(0x51d7_bd57),
+                    w(h("Trail")),
+                    w(h("Type")),
+                    show(w(h("Hardpoint"))),
+                );
+                *debris_vals.entry(key).or_default() += 1;
+            }
+            for r in vpart.of(id) {
+                *part_types
+                    .entry(vpart.word(r, h("Type")).unwrap_or(99))
+                    .or_default() += 1;
+            }
+        }
+    }
+    for (n, (k, lo, hi)) in &unmatched {
+        println!("pdunmatched\t{}\t{k} records\thealth {lo}..{hi}", show(*n));
+    }
+    for ((f, v), k) in &extra {
+        println!("pdfield\t{f:08x}\t{v}\t{k}");
+    }
+    for (v, k) in &debris_vals {
+        println!("pddebris\t{k}\t{v}");
+    }
+    println!("pdparttypes\t{part_types:?}");
+    println!(
+        "partdata totals: {} vehicle models; NodeHealth records {} (part {}, other node {}, nothing {}, {} names); part ModifierKeys {mk_named}; Crashable {crash_n}; DebrisEffect {debris_n} on {debris_tpl} templates",
+        vehicles.len(),
+        t[0],
+        t[1],
+        t[2],
+        t[3],
+        unmatched.len()
+    );
+    Ok(())
+}
+
+/// `blends[:<word>,..]`: every model with blend shapes, and every model
+/// with a texture whose name holds a word: blend shape names, morph
+/// targets per group, state machine states, textures.
+fn blends<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let index = source.archive().index();
+    let mut models: Vec<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == MODEL_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    models.sort_unstable();
+    models.dedup();
+    let (mut with_blends, mut shown) = (0usize, 0usize);
+    let mut shape_names: HashMap<String, usize> = HashMap::new();
+    for h in models {
+        let Ok(data) = source.model(h) else { continue };
+        let Ok(m) = data.parse() else { continue };
+        let mut textures: Vec<String> = m
+            .materials
+            .iter()
+            .flat_map(|x| x.textures.iter())
+            .filter(|&&t| t != 0)
+            .map(|&t| names.show(t).to_string())
+            .collect();
+        textures.sort();
+        textures.dedup();
+        let worded = !words.is_empty()
+            && textures
+                .iter()
+                .any(|t| words.iter().any(|w| t.to_ascii_lowercase().contains(w)));
+        if !m.blend_shapes.is_empty() {
+            with_blends += 1;
+            for &b in &m.blend_shapes {
+                *shape_names.entry(names.show(b).to_string()).or_default() += 1;
+            }
+        }
+        if m.blend_shapes.is_empty() && !worded {
+            continue;
+        }
+        shown += 1;
+        let shapes: Vec<String> = m
+            .blend_shapes
+            .iter()
+            .map(|&b| names.show(b).to_string())
+            .collect();
+        let mut groups = Vec::new();
+        for seg in &m.segments {
+            if let Some(g) = m.geometry(seg.slot) {
+                for (k, grp) in g.groups.iter().enumerate() {
+                    if !grp.morphs.is_empty() {
+                        groups.push(format!(
+                            "n{}/s{}/g{k}:{}x{}v",
+                            seg.node,
+                            seg.slot,
+                            grp.morphs.len(),
+                            grp.vertices.count
+                        ));
+                    }
+                }
+            }
+        }
+        groups.dedup();
+        let mut states: Vec<String> = m
+            .states
+            .iter()
+            .flat_map(|st| st.machines.iter())
+            .flat_map(|mc| mc.states.iter())
+            .map(|(s, _)| names.show(*s).to_string())
+            .collect();
+        states.sort();
+        states.dedup();
+        println!(
+            "blends\t{h:08x}\t{}\tshapes [{}]\tmorph groups [{}]\tstates [{}]\ttextures [{}]",
+            names.show(h),
+            shapes.join(", "),
+            groups.join(", "),
+            states.join(", "),
+            textures.join(", ")
+        );
+    }
+    let mut tally: Vec<(String, usize)> = shape_names.into_iter().collect();
+    tally.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    println!("blends: {with_blends} models with blend shapes, {shown} shown");
+    for (n, c) in tally {
+        println!("blend-name\t{c}\t{n}");
+    }
+    Ok(())
+}
+
+/// `wrecks[:<word>,..]`: across every model with a state machine, what
+/// its parts show intact and wrecked ([`m2_assets::model::PartStates::hidden`]
+/// as the alpha reads it): each node with geometry by whether it shows
+/// intact, wrecked, both or never, counting apart the nodes a switchable
+/// node governs that show both ways (a part the machine switches that
+/// stays up on the wreck: a gate's leaves standing over their own
+/// broken pieces). Then each model with such nodes, by name, or only
+/// those whose name holds a word.
+fn wrecks<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let index = source.archive().index();
+    let mut models: Vec<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == MODEL_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    models.sort_unstable();
+    models.dedup();
+    let (mut with_states, mut with_wreck, mut flagged) = (0usize, 0usize, 0usize);
+    // Geometry nodes: intact only, wrecked only, both, never; and of
+    // the both, those a switchable node governs.
+    let mut classes = [0usize; 5];
+    let mut lines = Vec::new();
+    for h in models {
+        let Ok(data) = source.model(h) else { continue };
+        let Ok(m) = data.parse() else { continue };
+        let Some(st) = &m.states else { continue };
+        with_states += 1;
+        let (intact, wrecked) = (st.hidden(&m.nodes, false), st.hidden(&m.nodes, true));
+        if intact != wrecked {
+            with_wreck += 1;
+        }
+        let governed = |i: usize| {
+            let mut at = Some(i as u16);
+            let mut steps = 0;
+            while let Some(n) = at {
+                if st.switchable.contains(&n) {
+                    return true;
+                }
+                at = m.nodes.get(usize::from(n)).and_then(|x| x.parent);
+                steps += 1;
+                if steps > m.nodes.len() {
+                    break;
+                }
+            }
+            false
+        };
+        let mut geometry: Vec<usize> = m.segments.iter().map(|s| usize::from(s.node)).collect();
+        geometry.sort_unstable();
+        geometry.dedup();
+        let mut both = Vec::new();
+        for &i in &geometry {
+            let on = |h: &[bool]| !h.get(i).copied().unwrap_or(false);
+            let k = match (on(&intact), on(&wrecked)) {
+                (true, false) => 0,
+                (false, true) => 1,
+                (true, true) => 2,
+                (false, false) => 3,
+            };
+            classes[k] += 1;
+            if k == 2 && intact != wrecked && governed(i) {
+                classes[4] += 1;
+                both.push(i);
+            }
+        }
+        if both.is_empty() {
+            continue;
+        }
+        flagged += 1;
+        let name = names.show(h).to_string();
+        if words.is_empty() || words.iter().any(|w| name.to_ascii_lowercase().contains(w)) {
+            let nodes: Vec<String> = both
+                .iter()
+                .map(|&i| {
+                    let n = &m.nodes[i];
+                    let size: Vec<String> = (0..3)
+                        .map(|k| format!("{:.1}", n.bounds_max[k] - n.bounds_min[k]))
+                        .collect();
+                    format!("n{i} {}", size.join("x"))
+                })
+                .collect();
+            lines.push(format!(
+                "wreck-both\t{h:08x}\t{name}\t{}\t{}",
+                both.len(),
+                nodes.join(", ")
+            ));
+        }
+    }
+    println!(
+        "wrecks: {with_states} models with a state machine, {with_wreck} with a wreck; geometry nodes intact only {}, wrecked only {}, both {}, never {}; both under a switchable node on a model with a wreck {} on {flagged} models",
+        classes[0], classes[1], classes[2], classes[3], classes[4]
+    );
+    for l in lines {
+        println!("{l}");
+    }
+    Ok(())
+}
+
+/// `doubles:<layers file>[,x0,z0,x1,z1]`: what stands twice. The layers
+/// in (a run's `mission: state layers loaded:` line, or the names in a
+/// file, comma or line separated) place models, island and state layers
+/// alike, and vehicles; any two of those whose placed boxes lie one
+/// within the other, near enough (centres within 1 m, the smaller box at
+/// least 60% inside the larger), are listed: the same model twice, a
+/// vehicle and something else, or two other models (a gate's leaves in
+/// its arch stand so; so would a ruin over its pristine twin). Within the
+/// box when one is given. Each by its layer, entity and model.
+fn doubles<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    world: &WorldIndex,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    use m2_math::glam::Mat4;
+    let mut parts = arg.split(',');
+    let file = parts.next().unwrap_or_default();
+    let area: Vec<f32> = parts.filter_map(|v| v.parse().ok()).collect();
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    let text = text
+        .split_once("state layers loaded:")
+        .map_or(text.as_str(), |(_, rest)| rest.lines().next().unwrap_or(""));
+    let loaded: HashSet<String> = text
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|w| w.trim().to_ascii_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if loaded.is_empty() {
+        println!("doubles: no layers read from {file}");
+        return Ok(());
+    }
+    // Each entity's layer and name, from every layer.
+    let index = source.archive().index();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut layer_of: HashMap<u32, (String, String)> = HashMap::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(layer) = Layer::parse(data) else {
+                continue;
+            };
+            let lname = names.show(e.name_hash).to_string().to_ascii_lowercase();
+            let enames = layer.names();
+            for id in layer.placements().keys() {
+                let n = enames.get(id).copied().unwrap_or("").to_owned();
+                layer_of.insert(*id, (lname.clone(), n));
+            }
+        }
+    }
+    let inside = |p: Vec3| match area[..] {
+        [x0, z0, x1, z1] => p.x >= x0 && p.x <= x1 && p.z >= z0 && p.z <= z1,
+        _ => true,
+    };
+    let in_loaded = |entity: u32| {
+        // A tree belongs to no layer: always in.
+        m2_engine::world::tree_species(entity).is_some()
+            || layer_of
+                .get(&entity)
+                .is_some_and(|(l, _)| loaded.contains(l))
+    };
+    // (entity, model, place, what): what is placed in the loaded layers.
+    let mut placed: Vec<(u32, u32, Mat4, &str)> = Vec::new();
+    for o in &world.objects {
+        if inside(o.position) && in_loaded(o.entity) {
+            let at = Mat4::from_rotation_translation(o.rotation, o.position);
+            placed.push((o.entity, o.model, at, "island"));
+        }
+    }
+    for (e, o) in &world.state_objects {
+        if inside(o.position) && in_loaded(*e) {
+            let at = Mat4::from_rotation_translation(o.rotation, o.position);
+            placed.push((*e, o.model, at, "state"));
+        }
+    }
+    for v in world.templates.iter().chain(world.state_vehicles.values()) {
+        if let Some(model) = v.model
+            && inside(v.position)
+            && in_loaded(v.entity)
+        {
+            let at = Mat4::from_rotation_translation(v.rotation, v.position);
+            placed.push((v.entity, model, at, "vehicle"));
+        }
+    }
+    // Each model's box.
+    let mut boxes: HashMap<u32, Option<(Vec3, Vec3)>> = HashMap::new();
+    for &(_, m, _, _) in &placed {
+        boxes.entry(m).or_insert_with(|| {
+            let data = source.model(m).ok()?;
+            let b = data.parse().ok()?.info.bounds;
+            Some((Vec3::from(b.min), Vec3::from(b.max)))
+        });
+    }
+    // Each placed box in the world, axis-aligned round its turned corners.
+    let world_box = |m: u32, at: Mat4| -> Option<(Vec3, Vec3)> {
+        let (lo, hi) = (*boxes.get(&m)?)?;
+        let mut wlo = Vec3::splat(f32::MAX);
+        let mut whi = Vec3::splat(f32::MIN);
+        for k in 0..8 {
+            let c = Vec3::new(
+                if k & 1 == 0 { lo.x } else { hi.x },
+                if k & 2 == 0 { lo.y } else { hi.y },
+                if k & 4 == 0 { lo.z } else { hi.z },
+            );
+            let w = at.transform_point3(c);
+            wlo = wlo.min(w);
+            whi = whi.max(w);
+        }
+        Some((wlo, whi))
+    };
+    let items: Vec<(usize, (Vec3, Vec3))> = placed
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(_, m, at, _))| Some((i, world_box(m, at)?)))
+        .filter(|(_, (lo, hi))| (*hi - *lo).min_element() > 0.05)
+        .collect();
+    // Binned by 8 m.
+    let mut bins: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    let bin = |p: Vec3| ((p.x / 8.0).floor() as i32, (p.z / 8.0).floor() as i32);
+    for (k, (_, (lo, hi))) in items.iter().enumerate() {
+        bins.entry(bin((*lo + *hi) * 0.5)).or_default().push(k);
+    }
+    let what = |i: usize| {
+        let (e, m, _, kind) = placed[i];
+        let (l, n) = layer_of.get(&e).cloned().unwrap_or_default();
+        format!("{kind} {l} {e:08x} \"{n}\" model {m:08x} {}", names.show(m))
+    };
+    let vol = |a: Vec3, b: Vec3| {
+        let s = b - a;
+        s.x * s.y * s.z
+    };
+    let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut lines = Vec::new();
+    for (k, (i, (lo, hi))) in items.iter().enumerate() {
+        let c = (*lo + *hi) * 0.5;
+        let (bx, bz) = bin(c);
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                for &k2 in bins.get(&(bx + dx, bz + dz)).into_iter().flatten() {
+                    if k2 <= k {
+                        continue;
+                    }
+                    let (j, (lo2, hi2)) = &items[k2];
+                    let c2 = (*lo2 + *hi2) * 0.5;
+                    if c.distance(c2) > 1.0 {
+                        continue;
+                    }
+                    let shared = (hi.min(*hi2) - lo.max(*lo2)).max(Vec3::ZERO);
+                    let inner = shared.x * shared.y * shared.z;
+                    if inner < 0.6 * vol(*lo, *hi).min(vol(*lo2, *hi2)) {
+                        continue;
+                    }
+                    let (a, b) = (placed[*i], placed[*j]);
+                    let class = if a.1 == b.1 {
+                        "same model"
+                    } else if a.3 == "vehicle" || b.3 == "vehicle" {
+                        "vehicle and another"
+                    } else {
+                        "two models"
+                    };
+                    *tally.entry(class).or_default() += 1;
+                    lines.push(format!(
+                        "double\t{class}\t{:.1}\t{}\t{}",
+                        c.distance(c2),
+                        what(*i),
+                        what(*j)
+                    ));
+                }
+            }
+        }
+    }
+    println!(
+        "doubles: {} layers in, {} placed with a box{}; pairs {tally:?}",
+        loaded.len(),
+        items.len(),
+        if area.len() == 4 {
+            format!(" in {area:?}")
+        } else {
+            String::new()
+        }
+    );
+    lines.sort();
+    for l in lines {
+        println!("{l}");
+    }
+    Ok(())
+}
+
+/// `treefit[:x0,z0,x1,z1]`: whether the tree table's trees stand where
+/// their heights say. A tree's decoded height is the ground's under its
+/// true place (the town species stand on it, round DX), so on sloping
+/// ground a tree put a few metres off its place stands above or below
+/// the ground there. Over the trees in the box (default the villa's,
+/// 2293,-1400,3127,147) on full-detail ground: per species, the median
+/// gap between a tree's height and the ground under it as decoded, and
+/// under it moved by each offset of up to 12 m on x and z (half-metre
+/// steps); the offset with the least gap, and that gap. All species
+/// together the same, for the trees on a slope of at least 1 in 5; and
+/// the plants the layers place on such slopes, whose places are exact,
+/// for comparison. Then how many trees stand near a road's line.
+fn treefit<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    world: &WorldIndex,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let b: Vec<f32> = arg.split(',').filter_map(|v| v.parse().ok()).collect();
+    let area = match b[..] {
+        [x0, z0, x1, z1] => [x0, z0, x1, z1],
+        _ => [2293.0, -1400.0, 3127.0, 147.0],
+    };
+    let index = source.archive().index();
+    let Some(tree_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == m2_assets::tree::TREE_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no tree table");
+        return Ok(());
+    };
+    let table = m2_assets::TreeTable::parse(&source.asset(tree_hash, m2_assets::tree::TREE_TYPE)?)
+        .map_err(|e| e.to_string())?;
+    // The ground: every full-detail cell over the box (and 10 m round it),
+    // its upward-facing triangles binned by 4 m.
+    const BIN: f32 = 4.0;
+    let pad = 10.0;
+    let mut tris: Vec<[Vec3; 3]> = Vec::new();
+    for (&cell, &centre) in &world.cells {
+        // Cells are 200 m squares round their centres.
+        if centre.x + 100.0 < area[0] - pad
+            || centre.x - 100.0 > area[2] + pad
+            || centre.z + 100.0 < area[1] - pad
+            || centre.z - 100.0 > area[3] + pad
+        {
+            continue;
+        }
+        let Ok(mesh) = m2_engine::world::terrain_cell(source, cell, centre) else {
+            continue;
+        };
+        let p = mesh.positions();
+        for t in mesh.indices.chunks_exact(3) {
+            let v = [0, 1, 2].map(|k| mesh.origin + p[t[k] as usize]);
+            let n = (v[1] - v[0]).cross(v[2] - v[0]);
+            if n.length() > 1e-6 && (n.normalize().y).abs() > 0.2 {
+                tris.push(v);
+            }
+        }
+    }
+    let mut bins: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    let key = |x: f32, z: f32| ((x / BIN).floor() as i32, (z / BIN).floor() as i32);
+    for (i, t) in tris.iter().enumerate() {
+        let lo = key(
+            t[0].x.min(t[1].x).min(t[2].x),
+            t[0].z.min(t[1].z).min(t[2].z),
+        );
+        let hi = key(
+            t[0].x.max(t[1].x).max(t[2].x),
+            t[0].z.max(t[1].z).max(t[2].z),
+        );
+        if (hi.0 - lo.0 + 1) * (hi.1 - lo.1 + 1) > 64 {
+            continue;
+        }
+        for bx in lo.0..=hi.0 {
+            for bz in lo.1..=hi.1 {
+                bins.entry((bx, bz)).or_default().push(i);
+            }
+        }
+    }
+    // The highest ground at (x, z).
+    let ground = |x: f32, z: f32| -> Option<f32> {
+        let mut best: Option<f32> = None;
+        for &i in bins.get(&key(x, z))? {
+            let [a, b, c] = tris[i];
+            let d = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
+            if d.abs() < 1e-9 {
+                continue;
+            }
+            let u = ((b.z - c.z) * (x - c.x) + (c.x - b.x) * (z - c.z)) / d;
+            let v = ((c.z - a.z) * (x - c.x) + (a.x - c.x) * (z - c.z)) / d;
+            let w = 1.0 - u - v;
+            if u < -1e-4 || v < -1e-4 || w < -1e-4 {
+                continue;
+            }
+            let y = u * a.y + v * b.y + w * c.y;
+            best = Some(best.map_or(y, |m: f32| m.max(y)));
+        }
+        best
+    };
+    // Offsets of up to 12 m each way, by half metres.
+    let steps: Vec<f32> = (-24..=24).map(|k| k as f32 * 0.5).collect();
+    let n = steps.len();
+    let zero = (n / 2) * n + n / 2;
+    let median = |v: &mut Vec<f32>| -> f32 {
+        if v.is_empty() {
+            return f32::NAN;
+        }
+        v.sort_by(f32::total_cmp);
+        v[v.len() / 2]
+    };
+    let slope = |x: f32, z: f32| {
+        [(1.0, 0.0), (0.0, 1.0)]
+            .iter()
+            .filter_map(|&(dx, dz)| {
+                Some(((ground(x + dx, z + dz)? - ground(x - dx, z - dz)?) / 2.0).abs())
+            })
+            .fold(0.0f32, f32::max)
+    };
+    // How `points` fit the ground: how many stand on it, the median gap
+    // as placed, and the offset with the least median gap and that gap.
+    let fit = |points: &[[f32; 3]]| -> (usize, f32, f32, f32, f32) {
+        let mut gaps: Vec<Vec<f32>> = vec![Vec::new(); n * n];
+        let mut on = 0;
+        for &[x, y, z] in points {
+            if ground(x, z).is_none() {
+                continue;
+            }
+            on += 1;
+            for (a, &dx) in steps.iter().enumerate() {
+                for (c, &dz) in steps.iter().enumerate() {
+                    if let Some(g) = ground(x + dx, z + dz) {
+                        gaps[a * n + c].push((y - g).abs());
+                    }
+                }
+            }
+        }
+        let meds: Vec<f32> = gaps.iter_mut().map(median).collect();
+        let (best, gap) = meds
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.is_finite())
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .map_or((zero, f32::NAN), |(k, m)| (k, *m));
+        (on, meds[zero], steps[best / n], steps[best % n], gap)
+    };
+    let inside =
+        |&[x, _, z]: &[f32; 3]| x >= area[0] && x <= area[2] && z >= area[1] && z <= area[3];
+    println!(
+        "treefit: {} ground triangles over {area:?}; per species: trees on ground, median gap as decoded, best offset (dx, dz) within 12 m and its gap",
+        tris.len()
+    );
+    let mut sloped: Vec<[f32; 3]> = Vec::new();
+    for s in &table.species {
+        let trees: Vec<[f32; 3]> = s.trees.iter().map(|t| t.position).filter(inside).collect();
+        if trees.is_empty() {
+            continue;
+        }
+        sloped.extend(trees.iter().filter(|&&[x, _, z]| slope(x, z) >= 0.2));
+        let (on, as_placed, dx, dz, gap) = fit(&trees);
+        println!(
+            "treefit\t{:08x}\t{}\t{on}\t{as_placed:.2}\t({dx:+.1}, {dz:+.1})\t{gap:.2}",
+            s.template,
+            names.show(s.template)
+        );
+    }
+    let (on, as_placed, dx, dz, gap) = fit(&sloped);
+    println!(
+        "treefit all trees on slopes of 1 in 5 or more: {on}, median gap as decoded {as_placed:.2}, best offset ({dx:+.1}, {dz:+.1}) gap {gap:.2}"
+    );
+    // The same for what the layers place on the ground by name (plants,
+    // bushes, ferns), whose places are exact: they should fit as placed.
+    let plants: Vec<[f32; 3]> = world
+        .objects
+        .iter()
+        .filter(|o| m2_engine::world::tree_species(o.entity).is_none() && o.named)
+        .filter(|o| {
+            let n = names.show(o.model).to_string();
+            n.contains("plant") || n.contains("bush") || n.contains("fern")
+        })
+        .map(|o| o.position.to_array())
+        .filter(inside)
+        .filter(|&[x, _, z]| slope(x, z) >= 0.2)
+        .collect();
+    let (on, as_placed, dx, dz, gap) = fit(&plants);
+    println!(
+        "treefit layer plants on slopes of 1 in 5 or more: {on}, median gap as placed {as_placed:.2}, best offset ({dx:+.1}, {dz:+.1}) gap {gap:.2}"
+    );
+    // The trees standing near a road's line (the `Road` entities' paths,
+    // as the world index reads them): within 2 m, 3.5 m (what the world
+    // clears, `ROAD_CLEAR`) and 6 m (the half width of a two-lane road,
+    // the villa's drive: `RoadIntersection`'s 6 and -6).
+    let index = source.archive().index();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut roads: Vec<(Vec3, m2_math::glam::Quat, u32)> = Vec::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(layer) = Layer::parse(data) else {
+                continue;
+            };
+            let Some(c) = layer.component("Road") else {
+                continue;
+            };
+            let placements = layer.placements();
+            for (entity, rec) in c.records().unwrap_or_default() {
+                let (Some(p), Some(path)) = (
+                    placements.get(&entity),
+                    rec.get(..4)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                ) else {
+                    continue;
+                };
+                let q = m2_math::glam::Quat::from_array(p.rotation);
+                let q = if q.is_finite() && q.length() > 0.5 {
+                    q.normalize()
+                } else {
+                    m2_math::glam::Quat::IDENTITY
+                };
+                roads.push((Vec3::from(p.position), q, path));
+            }
+        }
+    }
+    let mut segments: Vec<[f32; 4]> = Vec::new();
+    let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
+    for &(at, q, path) in &roads {
+        let points = paths.entry(path).or_insert_with(|| {
+            source
+                .asset(path, m2_assets::path::PATH_TYPE)
+                .ok()
+                .and_then(|d| m2_assets::Path::parse(&d).ok())
+                .map(|p| p.points.into_iter().map(Vec3::from).collect())
+                .unwrap_or_default()
+        });
+        for w in points.windows(2) {
+            let (a, b) = (at + q * w[0], at + q * w[1]);
+            let near = |p: Vec3| {
+                p.x >= area[0] - 50.0
+                    && p.x <= area[2] + 50.0
+                    && p.z >= area[1] - 50.0
+                    && p.z <= area[3] + 50.0
+            };
+            if near(a) || near(b) {
+                segments.push([a.x, a.z, b.x, b.z]);
+            }
+        }
+    }
+    let gap_to_road = |x: f32, z: f32| {
+        segments
+            .iter()
+            .map(|s| {
+                let (dx, dz) = (s[2] - s[0], s[3] - s[1]);
+                let len = dx * dx + dz * dz;
+                let t = if len > 0.0 {
+                    (((x - s[0]) * dx + (z - s[1]) * dz) / len).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let (px, pz) = (s[0] + t * dx - x, s[1] + t * dz - z);
+                (px * px + pz * pz).sqrt()
+            })
+            .fold(f32::MAX, f32::min)
+    };
+    let mut near = [0usize; 3];
+    let mut all = 0;
+    for s in &table.species {
+        for t in s.trees.iter().map(|t| t.position).filter(inside) {
+            all += 1;
+            let d = gap_to_road(t[0], t[2]);
+            for (k, r) in [2.0, 3.5, 6.0].iter().enumerate() {
+                near[k] += usize::from(d < *r);
+            }
+        }
+    }
+    println!(
+        "treefit roads: {} road segments; of {all} trees, within 2 m of a road's line {}, 3.5 m {}, 6 m {}",
+        segments.len(),
+        near[0],
+        near[1],
+        near[2]
+    );
+    Ok(())
 }
 
 /// `stam:<hash>,..`: each model's state machine written out in full.
@@ -7324,4 +9007,401 @@ fn effect_detail(names: &Names, fx: &m2_assets::effect::Effect) {
     for f in &fx.forces {
         println!("    force {}", show(f));
     }
+}
+
+/// Every placed `Road`, by the hash at 4 (the road kind's name without
+/// its leading underscore, `commercial_road10`): how many, and the two
+/// vectors at 16 and 28 against the extent of the road's own path (in the
+/// entity's space), to tell what those vectors measure.
+fn road_boxes<R: Read + Seek>(source: &mut AssetSource<R>, names: &Names) -> Result<(), Error> {
+    let index = source.archive().index();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let f = |r: &[u8], o: usize| {
+        r.get(o..o + 4)
+            .map_or(f32::NAN, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let w = |r: &[u8], o: usize| {
+        r.get(o..o + 4)
+            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    // (kind, path, box at 16, box at 28)
+    let mut roads: Vec<(u32, u32, Vec3, Vec3)> = Vec::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(layer) = Layer::parse(data) else {
+                continue;
+            };
+            for c in layer.components.iter().filter(|c| c.name == "Road") {
+                for (_, r) in c.records().unwrap_or_default() {
+                    let v = |o: usize| Vec3::new(f(r, o), f(r, o + 4), f(r, o + 8));
+                    roads.push((w(r, 4), w(r, 0), v(16), v(28)));
+                }
+            }
+        }
+    }
+    // The road kinds' templates: name hash without the leading underscore
+    // -> (name, LaneData strips as (type, width)).
+    let mut kind_names: HashMap<u32, (String, Vec<(u32, f32)>)> = HashMap::new();
+    let index = source.archive().index();
+    let db_hash = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash);
+    if let Some(h) = db_hash {
+        let data = source.asset(h, TEMPLATE_DB_TYPE)?;
+        let db = Layer::parse(&data)?;
+        let lanes: HashMap<u32, Vec<(u32, f32)>> = db
+            .component("LaneData")
+            .map(|c| {
+                c.records()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(id, r)| {
+                        let strips = (0..4).map(|i| (w(r, i * 16), f(r, i * 16 + 8))).collect();
+                        (id, strips)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (id, n) in db.names() {
+            let key = m2_assets::name_hash(n.trim_start_matches('_'));
+            kind_names
+                .entry(key)
+                .or_insert_with(|| (n.to_string(), lanes.get(&id).cloned().unwrap_or_default()));
+        }
+    }
+    let mut kinds: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    let mut counts: HashMap<u32, usize> = HashMap::new();
+    // Per kind, each road's widest spread of its box past its path.
+    let mut spreads: HashMap<u32, Vec<f32>> = HashMap::new();
+    for &(kind, path, lo, hi) in &roads {
+        *counts.entry(kind).or_default() += 1;
+        let points: Vec<Vec3> = source
+            .asset(path, m2_assets::path::PATH_TYPE)
+            .ok()
+            .and_then(|d| m2_assets::Path::parse(&d).ok())
+            .map(|p| p.points.into_iter().map(Vec3::from).collect())
+            .unwrap_or_default();
+        if !points.is_empty() {
+            let (mut a, mut b) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for p in &points {
+                a = a.min(*p);
+                b = b.max(*p);
+            }
+            let spread = (a.x - lo.x).max(hi.x - b.x).max(a.z - lo.z).max(hi.z - b.z);
+            spreads.entry(kind).or_default().push(spread);
+        }
+        let lines = kinds.entry(kind).or_default();
+        if lines.len() >= 3 {
+            continue;
+        }
+        let points: Vec<Vec3> = source
+            .asset(path, m2_assets::path::PATH_TYPE)
+            .ok()
+            .and_then(|d| m2_assets::Path::parse(&d).ok())
+            .map(|p| p.points.into_iter().map(Vec3::from).collect())
+            .unwrap_or_default();
+        let (mut pmin, mut pmax) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for p in &points {
+            pmin = pmin.min(*p);
+            pmax = pmax.max(*p);
+        }
+        lines.push(format!(
+            "    box ({:.2} {:.2} {:.2})..({:.2} {:.2} {:.2})  path {} pts ({:.2} {:.2} {:.2})..({:.2} {:.2} {:.2})",
+            lo.x, lo.y, lo.z, hi.x, hi.y, hi.z, points.len(), pmin.x, pmin.y, pmin.z, pmax.x, pmax.y, pmax.z
+        ));
+    }
+    println!("{} roads, {} kinds", roads.len(), kinds.len());
+    for (kind, lines) in &kinds {
+        let (name, lanes) = kind_names.get(kind).cloned().unwrap_or_default();
+        let mut sp = spreads.get(kind).cloned().unwrap_or_default();
+        sp.sort_by(f32::total_cmp);
+        let (med, max) = (
+            sp.get(sp.len() / 2).copied().unwrap_or(f32::NAN),
+            sp.last().copied().unwrap_or(f32::NAN),
+        );
+        let strips: Vec<String> = lanes.iter().map(|(t, w)| format!("{t}:{w}")).collect();
+        println!(
+            "  {kind:08x} {} x{} ({name}) spread median {med:.2} max {max:.2} lanes [{}]",
+            names.show(*kind),
+            counts[kind],
+            strips.join(" ")
+        );
+        for l in lines {
+            println!("{l}");
+        }
+    }
+    Ok(())
+}
+
+/// What the alpha makes of the island's roads for traffic and passers-by:
+/// how many roads, how wide (a histogram by metre), how many carry
+/// vehicle lanes and how far off the line they drive, and the passers-by
+/// placed (how many, how far off their road's line they walk).
+fn traffic_census(world: &WorldIndex) {
+    let roads = &world.roads;
+    let mut widths: BTreeMap<i32, usize> = BTreeMap::new();
+    for r in roads {
+        *widths.entry(r.width.round() as i32).or_default() += 1;
+    }
+    let length: f32 = roads
+        .iter()
+        .map(|r| m2_engine::world::path_length(&r.points))
+        .sum();
+    println!(
+        "roads {} ({:.0} km), widths (m: roads) {widths:?}",
+        roads.len(),
+        length / 1000.0
+    );
+    let driven: Vec<&m2_engine::world::Road> = roads.iter().filter(|r| r.drivable()).collect();
+    let mut lanes: BTreeMap<String, usize> = BTreeMap::new();
+    for r in &driven {
+        let key = r
+            .lane_offsets()
+            .iter()
+            .map(|o| format!("{o:.1}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        *lanes.entry(key).or_default() += 1;
+    }
+    let driven_km: f32 = driven
+        .iter()
+        .map(|r| m2_engine::world::path_length(&r.points))
+        .sum::<f32>()
+        / 1000.0;
+    println!(
+        "drivable roads {} ({driven_km:.0} km); lane offsets (m: roads) {lanes:?}",
+        driven.len()
+    );
+    let walkers: Vec<&m2_engine::world::SpawnPoint> = world
+        .spawns
+        .iter()
+        .filter(|s| m2_engine::world::is_walker(s.entity))
+        .collect();
+    let mut outs: BTreeMap<i32, usize> = BTreeMap::new();
+    for w in &walkers {
+        // How far off the nearest road line its route starts.
+        let at = w.position;
+        let d = roads
+            .iter()
+            .flat_map(|r| r.points.windows(2))
+            .map(|s| {
+                let (a, b) = (s[0], s[1]);
+                let ab = Vec3::new(b.x - a.x, 0.0, b.z - a.z);
+                let ap = Vec3::new(at.x - a.x, 0.0, at.z - a.z);
+                let t = (ap.dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+                (ap - ab * t).length()
+            })
+            .fold(f32::MAX, f32::min);
+        *outs.entry(d.round() as i32).or_default() += 1;
+    }
+    println!(
+        "passers-by {}; off the nearest road line (m: walkers) {outs:?}",
+        walkers.len()
+    );
+}
+
+/// Run-overs and bashes against the damage table (gap round 23): every
+/// vehicle template's mass and `DamageKey`, every person template's
+/// health and `ModifierKey`, the templates whose `DamageKey` is
+/// `MeleeBash`; then, per person row, the speed each vehicle must go to
+/// kill (before: any vehicle at 2.5 m/s; after: `run_over`) and the
+/// bashes to kill (before: 60 a blow; after: times the row's `MeleeBash`).
+fn runover<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    _arg: &str,
+) -> Result<(), Error> {
+    use m2_engine::durability::{RAM_KIND, damage_keys, modifier_keys, run_over};
+    use m2_engine::tuning::{DAMAGE_TABLE, DAMAGE_TABLE_TYPE, DamageTable};
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let table = source
+        .asset(m2_assets::name_hash(DAMAGE_TABLE), DAMAGE_TABLE_TYPE)
+        .ok()
+        .and_then(|d| DamageTable::parse(&d));
+    let Some(table) = table else {
+        println!("no damage table");
+        return Ok(());
+    };
+    let key_name = |k: u32| names.get(k).map_or(format!("{k:08x}"), str::to_owned);
+    let dkeys = damage_keys(&db);
+    let mods = modifier_keys(&db);
+    let tuning = m2_engine::tuning::read(&db, Some(&table));
+    // Vehicles: any with a vehicle physics component.
+    let mut vehicles: BTreeMap<u32, (f32, u32)> = BTreeMap::new();
+    for p in VEHICLE_PHYSICS {
+        if let Some(c) = db.component(p) {
+            for (id, _) in c.records().unwrap_or_default() {
+                let Some(mass) = tuning.get(&id).and_then(|t| t.mass) else {
+                    continue;
+                };
+                vehicles.insert(id, (mass, dkeys.get(&id).copied().unwrap_or(0)));
+            }
+        }
+    }
+    let mut by_key: BTreeMap<String, usize> = BTreeMap::new();
+    for (mass, k) in vehicles.values() {
+        let _ = mass;
+        *by_key.entry(key_name(*k)).or_default() += 1;
+    }
+    println!("vehicles\t{}\tby DamageKey {by_key:?}", vehicles.len());
+    // Bash templates.
+    let bash = m2_assets::name_hash("MeleeBash");
+    for (&id, &k) in &dkeys {
+        if k == bash {
+            println!(
+                "bashkey\t{id:08x}\t{}",
+                tnames.get(&id).copied().unwrap_or("?")
+            );
+        }
+    }
+    // People.
+    let people = m2_engine::ai::read(&db);
+    let human = m2_assets::name_hash("Human");
+    let mut rows: BTreeMap<u32, Vec<(u32, f32)>> = BTreeMap::new();
+    for (&id, p) in &people {
+        let row = p
+            .modifier
+            .or_else(|| mods.get(&id).copied())
+            .unwrap_or(human);
+        rows.entry(row).or_default().push((id, p.health));
+    }
+    // Each row: the cells, and over every (vehicle, person) pair the kill
+    // speed.
+    let ram_default = m2_assets::name_hash(RAM_KIND);
+    let speeds = [2.5f32, 5.0, 10.0, 15.0, 20.0, 30.0];
+    let mut pairs = 0usize;
+    let mut killed_before = [0usize; 6];
+    let mut killed_after = [0usize; 6];
+    for (&row, who) in &rows {
+        let cells: Vec<String> = [
+            "Car",
+            "Armor",
+            "MediumArmor",
+            "Tank",
+            "CarMonsterTruck",
+            "MeleeBash",
+        ]
+        .iter()
+        .map(|c| {
+            table
+                .scale(row, m2_assets::name_hash(c))
+                .map_or("-".into(), |v| format!("{c} {v}"))
+        })
+        .collect();
+        let mut hp: Vec<f32> = who.iter().map(|w| w.1).collect();
+        hp.sort_by(f32::total_cmp);
+        let bash_scale = table.scale(row, bash).unwrap_or(1.0);
+        let bashes = |h: f32, per: f32| {
+            if per > 0.0 {
+                (h / per).ceil()
+            } else {
+                f32::INFINITY
+            }
+        };
+        println!(
+            "row\t{}\t{} templates\thealth {}..{}\t{}\tbashes to kill (median hp) {} -> {}",
+            key_name(row),
+            who.len(),
+            hp[0],
+            hp[hp.len() - 1],
+            cells.join(", "),
+            bashes(hp[hp.len() / 2], 60.0),
+            bashes(hp[hp.len() / 2], 60.0 * bash_scale),
+        );
+        if who.len() <= 12 {
+            let list: Vec<String> = who
+                .iter()
+                .map(|(id, h)| format!("{} {h}", tnames.get(id).copied().unwrap_or("?")))
+                .collect();
+            println!("row	{}	who	{}", key_name(row), list.join("; "));
+        }
+        for &(_, h) in who {
+            for (mass, k) in vehicles.values() {
+                let key = if *k == 0 { ram_default } else { *k };
+                pairs += 1;
+                for (i, &v) in speeds.iter().enumerate() {
+                    killed_before[i] += usize::from(v >= 2.5);
+                    killed_after[i] += usize::from(run_over(&table, row, key, *mass, v) >= h);
+                }
+            }
+        }
+    }
+    // Blows to kill each person template: 60 a blow before, times the
+    // row's `MeleeBash` after.
+    let (mut one_before, mut one_after, mut never, mut all) = (0, 0, 0, 0);
+    for (&row, who) in &rows {
+        let scale = table.scale(row, bash).unwrap_or(1.0);
+        for &(_, h) in who {
+            all += 1;
+            one_before += usize::from(60.0 >= h);
+            if scale <= 0.0 {
+                never += 1;
+            } else {
+                one_after += usize::from(60.0 * scale >= h);
+            }
+        }
+    }
+    println!("bash\tone blow kills {one_before}/{all} -> {one_after}/{all}; never {never}");
+    println!("pairs\t{pairs} (person template x vehicle template)");
+    for (i, v) in speeds.iter().enumerate() {
+        println!(
+            "killed at {v} m/s\t{:.3} -> {:.3}",
+            killed_before[i] as f64 / pairs as f64,
+            killed_after[i] as f64 / pairs as f64
+        );
+    }
+    // Named examples.
+    for (vn, pn) in [
+        ("Valiant", "VZ Soldier"),
+        ("Valiant", "VZ Heavy (RPG)"),
+        ("AMX30", "VZ Soldier"),
+    ] {
+        let v = vehicles
+            .iter()
+            .find(|(id, _)| tnames.get(id).copied() == Some(vn));
+        let p = people
+            .iter()
+            .find(|(id, _)| tnames.get(id).copied() == Some(pn));
+        if let (Some((_, &(mass, k))), Some((pid, prof))) = (v, p) {
+            let row = prof
+                .modifier
+                .or_else(|| mods.get(pid).copied())
+                .unwrap_or(human);
+            let key = if k == 0 { ram_default } else { k };
+            let per = run_over(&table, row, key, mass, 1.0);
+            println!(
+                "example\t{vn} ({mass} kg, {}) on {pn} ({} hp, {}): kills from {:.1} m/s",
+                key_name(key),
+                prof.health,
+                key_name(row),
+                prof.health / per.max(1e-6)
+            );
+        }
+    }
+    Ok(())
 }

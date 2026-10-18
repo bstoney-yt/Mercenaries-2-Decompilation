@@ -16,12 +16,14 @@
 //! scripts ([`Player::take_scripts`]), as the Flash player runs them.
 //! [`Player::draw`] lays out what is on stage as triangles.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use super::text::{EditText, Font, FontBook, layout};
 use super::{
-    Bits, ColourTransform, Image, Matrix, Shape, ShapeTriangle, Triangle, bounds, draw_shape, tags,
+    Bits, ColourTransform, Corners, Image, Matrix, Shape, ShapeTriangle, Triangle, bounds,
+    draw_shape, tags,
 };
 use crate::gfx::{Character, Movie, tag};
 
@@ -373,6 +375,12 @@ pub struct Clip {
     pub drawing: Vec<Triangle>,
     /// A text field's inline images (`setImageSubstitutions`).
     pub substitutions: Vec<super::text::Substitution>,
+    /// A text field's box as its scripts sized it (`_width`, `_height`,
+    /// `autoSize`), in place of its definition's.
+    pub text_box: Option<[f32; 4]>,
+    /// A text field fits its box to its text (`autoSize`), from its left
+    /// edge (0), centre (0.5) or right edge (1), each time its text is set.
+    pub auto_size: Option<f32>,
 }
 
 impl Clip {
@@ -403,7 +411,24 @@ impl Clip {
             children: BTreeMap::new(),
             drawing: Vec::new(),
             substitutions: Vec::new(),
+            text_box: None,
+            auto_size: None,
         }
+    }
+
+    /// A text field's definition, with its box as its scripts sized it.
+    pub fn text_def(&self) -> Option<Cow<'_, EditText>> {
+        let Kind::Text(def, _) = &self.kind else {
+            return None;
+        };
+        let t = self.lib.texts.get(def)?;
+        Some(match self.text_box {
+            Some(bounds) => Cow::Owned(EditText {
+                bounds,
+                ..t.clone()
+            }),
+            None => Cow::Borrowed(t),
+        })
     }
 
     /// Frames in its timeline (1 for one without).
@@ -430,6 +455,9 @@ pub struct Player {
     /// Looks up the text ids in what text fields show (`[0x129ee2f1]`), as
     /// the game's translator does when they draw; the scripts keep the ids.
     pub translate: Option<Translator>,
+    /// The fonts its text is drawn with, if the scripts may measure it
+    /// (`textWidth`, `textHeight`); else those are estimated.
+    pub fonts: Option<Rc<FontBook>>,
 }
 
 /// Text as drawn from text as set ([`Player::translate`]).
@@ -455,6 +483,7 @@ impl Player {
             clock: 0.0,
             scripts: Vec::new(),
             translate: None,
+            fonts: None,
         };
         p.goto(0, 0);
         p
@@ -530,8 +559,32 @@ impl Player {
         if entered && frame == from {
             return;
         }
+        // Going back, an instance the timeline has at the same depth with
+        // the same character at the target frame stays (with what scripts
+        // set on it, such as a text field's text), as Flash keeps it: by
+        // depth, the frame its placement there was made on.
+        let mut kept: HashMap<i32, usize> = HashMap::new();
         let start = if !entered || frame < from {
-            // Back to the start: what the timeline placed goes.
+            let mut target: HashMap<i32, (u16, usize)> = HashMap::new();
+            for (f, controls) in timeline.frames.iter().enumerate().take(frame + 1) {
+                for control in controls {
+                    match control {
+                        Control::Place(p) => {
+                            let depth = i32::from(p.depth) + TIMELINE_DEPTH;
+                            if let Some(ch) = p.character
+                                && (p.moving || !target.contains_key(&depth))
+                            {
+                                target.insert(depth, (ch, f));
+                            }
+                        }
+                        Control::Remove(d) => {
+                            target.remove(&(i32::from(*d) + TIMELINE_DEPTH));
+                        }
+                        Control::Script(_) => {}
+                    }
+                }
+            }
+            // What the timeline placed goes, but for those.
             let placed: Vec<(i32, ClipId)> = c
                 .children
                 .iter()
@@ -539,7 +592,13 @@ impl Player {
                 .map(|(d, k)| (*d, *k))
                 .collect();
             for (depth, child) in placed {
-                self.remove(id, depth, child);
+                let same = self.clip(child).map(|k| k.character);
+                match target.get(&depth) {
+                    Some(&(ch, born)) if entered && same == Some(ch) => {
+                        kept.insert(depth, born);
+                    }
+                    _ => self.remove(id, depth, child),
+                }
             }
             0
         } else {
@@ -547,8 +606,23 @@ impl Player {
         };
         for f in start..=frame {
             for control in &timeline.frames[f] {
+                let depth_of = |d: u16| i32::from(d) + TIMELINE_DEPTH;
                 match control {
-                    Control::Place(p) => self.place(id, p),
+                    Control::Place(p) => match kept.get(&depth_of(p.depth)) {
+                        // Before a kept instance was placed: not its.
+                        Some(&born) if f < born => {}
+                        // Its placement: only what it sets.
+                        Some(&born) if f == born => self.place(
+                            id,
+                            &Place {
+                                character: None,
+                                moving: true,
+                                ..p.clone()
+                            },
+                        ),
+                        _ => self.place(id, p),
+                    },
+                    Control::Remove(d) if kept.get(&depth_of(*d)).is_some_and(|&b| f < b) => {}
                     Control::Remove(depth) => {
                         let depth = i32::from(*depth) + TIMELINE_DEPTH;
                         if let Some(child) =
@@ -852,6 +926,31 @@ impl Player {
         }
     }
 
+    /// A text field's `textWidth` and `textHeight`: its text as drawn
+    /// (the ids looked up, [`Player::translate`]) laid out with its font,
+    /// or estimated without the fonts.
+    pub fn text_size(&self, id: ClipId) -> Option<(f32, f32)> {
+        let c = self.clip(id)?;
+        let Kind::Text(_, s) = &c.kind else {
+            return None;
+        };
+        let Some(t) = c.text_def() else {
+            return Some((0.0, 12.0 * 1.2));
+        };
+        let shown = match &self.translate {
+            Some(tr) if s.contains('[') => (tr.0)(s),
+            _ => s.clone(),
+        };
+        let font = self
+            .fonts
+            .as_deref()
+            .and_then(|book| t.font.and_then(|f| Self::font_for(&c.lib, f, book)));
+        Some(match font {
+            Some(font) => super::text::measure(&t, &shown, font),
+            None => t.text_size(&shown),
+        })
+    }
+
     /// The font a text field's font id stands for: the movie's own if it
     /// is drawn in a texture, else the one it imports by that name, else
     /// the font library's of its style.
@@ -902,15 +1001,15 @@ impl Player {
                     draw_shape(shape, mesh, &c.lib.images, &m, &col, clip, out);
                 }
             }
-            Kind::Text(def, s) => {
-                if let Some(t) = c.lib.texts.get(def)
+            Kind::Text(_, s) => {
+                if let Some(t) = c.text_def()
                     && let Some(font) = t.font.and_then(|f| Self::font_for(&c.lib, f, fonts))
                 {
                     match &self.translate {
                         Some(tr) if s.contains('[') => {
-                            layout(t, &(tr.0)(s), &c.substitutions, font, &m, &col, clip, out);
+                            layout(&t, &(tr.0)(s), &c.substitutions, font, &m, &col, clip, out);
                         }
-                        _ => layout(t, s, &c.substitutions, font, &m, &col, clip, out),
+                        _ => layout(&t, s, &c.substitutions, font, &m, &col, clip, out),
                     }
                 }
             }
@@ -927,20 +1026,27 @@ impl Player {
                 clip,
             );
         }
-        // Masks under way among the children: up to which depth, the box.
-        let mut masks: Vec<(i32, [f32; 4])> = Vec::new();
+        // Masks under way among the children: up to which depth, the box
+        // round the mask and its triangles. What they cover shows through
+        // its own shape, not its box (the loading screen's wipe is a
+        // ragged edge, from the movie).
+        let mut masks: Vec<(i32, [f32; 4], Vec<Corners>)> = Vec::new();
         for (&depth, &child) in &c.children {
-            masks.retain(|(to, _)| depth <= *to);
+            masks.retain(|(to, ..)| depth <= *to);
             let Some(k) = self.clip(child) else { continue };
             if let Some(to) = k.clip_depth {
                 let mut shape = Vec::new();
                 self.draw_clip(child, &m, &col, None, fonts, &mut shape, nesting + 1);
-                if let Some(b) = bounds(&shape) {
-                    masks.push((to, b));
-                }
+                // An empty mask shows nothing (Flash's rule).
+                let b = bounds(&shape).unwrap_or([0.0, 0.0, -1.0, -1.0]);
+                masks.push((to, b, shape.iter().map(|t| t.corners).collect()));
                 continue;
             }
-            let inner = masks.iter().fold(clip, |acc, (_, b)| {
+            if masks.is_empty() {
+                self.draw_clip(child, &m, &col, clip, fonts, out, nesting + 1);
+                continue;
+            }
+            let inner = masks.iter().fold(clip, |acc, (_, b, _)| {
                 Some(match acc {
                     Some(a) => [
                         a[0].max(b[0]),
@@ -951,7 +1057,16 @@ impl Player {
                     None => *b,
                 })
             });
-            self.draw_clip(child, &m, &col, inner, fonts, out, nesting + 1);
+            if inner.is_some_and(|b| b[0] > b[2] || b[1] > b[3]) {
+                continue;
+            }
+            // Cut to the boxes first (cheap), then to each mask's shape.
+            let mut part = Vec::new();
+            self.draw_clip(child, &m, &col, inner, fonts, &mut part, nesting + 1);
+            for (_, _, tris) in &masks {
+                part = super::cut_to_mask(&part, tris);
+            }
+            out.extend(part);
         }
         // Multiply: each triangle multiplies what is under it (as the
         // whole would, where they do not overlap).

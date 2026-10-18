@@ -42,7 +42,8 @@
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::tuning::HandGun;
-use m2_engine::world::SpawnPoint;
+use m2_engine::weapons::FireHint;
+use m2_engine::world::{SpawnPoint, is_walker};
 use m2_engine::{AiProfile, BoundClip, Character, Gait, GpuModel, Physics, RagdollId};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
@@ -52,8 +53,15 @@ use crate::scene::{Carry, Rig};
 /// Soldiers come and go within these distances of the player, metres.
 const ACTIVE: f32 = 450.0;
 const INACTIVE: f32 = 500.0;
-/// Most soldiers about at once.
+/// Most soldiers about at once, and most passers-by on the roads
+/// (invented: the frame rate's limits; the traffic zones ask for 20 at
+/// most, Maracaibo's centre).
 const MAX_SOLDIERS: usize = 48;
+const MAX_WALKERS: usize = 24;
+/// A spawner whose one fell sends the next its `SecondsPerCycle` later,
+/// but not while she is this near it, metres (invented: the data's
+/// fields for how many it sends in all aren't decoded).
+const REFILL_CLEAR: f32 = 20.0;
 /// How far from where they settled after running people stroll, metres.
 const WANDER: f32 = 30.0;
 /// Walking and fleeing speeds, m/s, and the pause at each end of a route
@@ -64,7 +72,8 @@ const FLEE_TIME: f32 = 6.0;
 /// How far a runner who meets a wall looks along it each way, metres.
 const CLEAR: f32 = 6.0;
 /// A soldier fights within this range of the player, and fires within
-/// `FIRE_RANGE` once facing within `FIRE_ARC` radians of them.
+/// his gun's `FireRange` once facing within `FIRE_ARC` radians of them
+/// (`FIRE_RANGE` for one with no gun: the "Assault Rifle"'s).
 const FIGHT_RANGE: f32 = 80.0;
 const FIRE_RANGE: f32 = 70.0;
 const FIRE_ARC: f32 = 0.3;
@@ -81,20 +90,34 @@ const SPRINT: f32 = 7.2;
 /// how close to where he last saw her he goes (inferred).
 const GIVE_UP: f32 = 20.0;
 const CLOSE_ENOUGH: f32 = 2.0;
+/// A chase stopped by a wall goes along it until the way on is open this
+/// far, metres, or for at most this long, seconds (invented).
+const DETOUR_OPEN: f32 = 2.5;
+const DETOUR_TIME: f32 = 4.0;
 /// Between steps about in a fight: seconds (at least, plus up to), how
 /// far a step goes, metres, and how close he pushes in to her (inferred).
 const STEP_GAP: (f32, f32) = (2.0, 3.0);
 const STEP: (f32, f32) = (3.0, 6.0);
 const PUSH_TO: f32 = 15.0;
-/// Seconds between a soldier's shots: at least this, plus up to as much
-/// again at random.
-const FIRE_GAP: (f32, f32) = (0.9, 0.8);
-/// They fire in bursts: at least this many rounds, plus up to this many
-/// more at random (invented, as no field names them), at their gun's
-/// `RateOfFire`; this many seconds apart for those whose template names
-/// no gun (the "Assault Rifle"'s 450 a minute, as the AK47 stands in).
-const BURST: (u32, u32) = (3, 2);
+/// They fire in bursts as their gun's `WeaponHint` has it
+/// ([`FireHint`]): rounds at its `RateOfFire` for `BurstOnLength`, then
+/// `BurstOffLength`'s pause (the close pair within [`FireHint::CLOSE`]),
+/// between its `MinFireRange` and `FireRange`. Those whose template names
+/// no gun fire as the "Assault Rifle" does (the AK47 stands in): 450 a
+/// minute, its `WeaponHint` below (gap round 13's dump).
 const BURST_GAP: f32 = 60.0 / 450.0;
+const STAND_IN: FireHint = FireHint {
+    min_range: 1.0,
+    range: FIRE_RANGE,
+    angle: 2,
+    on: 0.8,
+    off: 9.0,
+    on_close: 0.8,
+    off_close: 1.5,
+};
+/// Each pause is this much longer or shorter at random, so soldiers who
+/// see her together don't fire together (invented).
+const PAUSE_JITTER: f32 = 0.25;
 const PAUSE: (f32, f32) = (2.0, 6.0);
 /// A soldier lobs a grenade at where she hides once she has been out of
 /// his sight this long, seconds, within this reach, metres, and no
@@ -157,6 +180,10 @@ const TURN_RATE: f32 = 6.0;
 const TOPPLE: f32 = 0.6;
 /// Slowest a vehicle hurts people it meets, m/s.
 const RUN_OVER: f32 = 2.5;
+/// Seconds after a vehicle hurts someone it doesn't kill before one can
+/// hurt them again, and how hard it shoves them aside (m/s). Invented.
+pub const RAM_GAP: f32 = 1.0;
+const SHOVE: f32 = 4.0;
 /// How far ahead (seconds) people see a vehicle coming at them.
 const DODGE_TIME: f32 = 2.0;
 
@@ -661,6 +688,8 @@ pub struct Npc {
     pub alert: bool,
     /// Set by a tick when a soldier fires; the fight takes the shot.
     pub fires: bool,
+    /// Seconds before a vehicle can hurt them again ([`RAM_GAP`]).
+    pub rammed: f32,
     cooldown: f32,
     /// How their template fights (a plain VZ soldier's when unknown).
     pub ai: AiProfile,
@@ -676,6 +705,10 @@ pub struct Npc {
     /// Set by a tick when a soldier throws a grenade, at where; the
     /// fight lobs it.
     pub throws: Option<Vec3>,
+    /// Their look: per node of their model, hidden (the heads, bodies
+    /// and kit their mixer didn't pick, [`People::dress`]); empty for the
+    /// model's own.
+    pub outfit: Vec<bool>,
     grenade_wait: f32,
     /// The smarter soldiers' settings (off: the original's).
     pub smart: SmarterAi,
@@ -686,8 +719,13 @@ pub struct Npc {
     /// and the seconds since he was last hit.
     cover: Option<(Vec3, f32)>,
     hit: bool,
-    /// Rounds left in the burst he is firing.
+    /// In a chase, a way round what stopped him: which way and for how
+    /// much longer; and the side (1 or -1, 0 for none yet) he went round.
+    detour: Option<(Vec3, f32)>,
+    detour_side: f32,
+    /// Rounds left in the burst he is firing, and seconds since his last.
     burst: u32,
+    since_shot: f32,
     /// Running from gunfire: where to, and for how much longer.
     flee: Option<(Vec3, f32)>,
     brain: Brain,
@@ -697,6 +735,10 @@ pub struct Npc {
     /// point.
     pub hand: Option<usize>,
     pub attach: Option<usize>,
+    /// A number of this person's, fixed where they came in: picks their
+    /// variant of a gun's shot ([`m2_engine::gun_sounds::GunCues::shot_by`];
+    /// invented).
+    pub shooter: u32,
     /// Seconds since they died.
     dead_for: f32,
     /// Their body gone limp, once dead.
@@ -719,6 +761,18 @@ pub enum Shout {
     Flee,
 }
 
+/// A person's number from where they came in and which way they faced:
+/// the bits mixed (FNV-1a over the three words), so people a step apart
+/// differ.
+fn shooter_number(at: Vec3, facing: f32) -> u32 {
+    [at.x, at.z, facing]
+        .iter()
+        .flat_map(|v| v.to_bits().to_le_bytes())
+        .fold(0x811c_9dc5_u32, |h, b| {
+            (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+        })
+}
+
 impl Npc {
     pub(crate) fn new(
         kind: usize,
@@ -736,6 +790,7 @@ impl Npc {
             clips,
             hand,
             attach: crate::combat::right_attach(&rig.skeleton),
+            shooter: shooter_number(at, facing),
             dead_for: 0.0,
             ragdoll: None,
             fling: None,
@@ -756,6 +811,7 @@ impl Npc {
             alive: true,
             alert: false,
             fires: false,
+            rammed: 0.0,
             cooldown: 0.0,
             ai: AiProfile::default(),
             last_seen: None,
@@ -764,12 +820,16 @@ impl Npc {
             step: None,
             step_wait: 0.0,
             throws: None,
+            outfit: Vec::new(),
             grenade_wait: 0.0,
             smart: SmarterAi::default(),
             spotted: false,
             cover: None,
             hit: false,
+            detour: None,
+            detour_side: 0.0,
             burst: 0,
+            since_shot: f32::INFINITY,
             flee: None,
             brain,
         }
@@ -858,7 +918,8 @@ impl Npc {
     }
 
     /// A soldier's tick in a fight with the player at `threat`. While he
-    /// sees her within `FIRE_RANGE` he turns to her, aims and fires, and
+    /// sees her within his gun's `FireRange` he turns to her, aims and
+    /// fires in its bursts (no nearer than its `MinFireRange`), and
     /// every few seconds steps aside or (as `Offensive` has it) closer;
     /// otherwise he runs to where he last saw her (`PursueSpeed`). False
     /// when the fight is off: she is out of his sight's reach, or he has
@@ -931,13 +992,32 @@ impl Npc {
         }
         if hiding {
             self.step = None;
-        } else if !seen || distance > FIRE_RANGE {
+        } else if !seen || distance > self.fire_hint().range {
             self.step = None;
-            let flat = (goal - at).with_y(0.0);
-            if flat.length() > CLOSE_ENOUGH {
-                wanted = flat.normalize() * SPRINT * self.ai.pursue_speed;
+            let mut toward = (goal - at).with_y(0.0);
+            // Where he last saw her, and she isn't there: on towards the
+            // fight, where she is (invented: he hears it).
+            if toward.length() <= CLOSE_ENOUGH {
+                toward = (threat - at).with_y(0.0);
+            }
+            // Going round what stopped him, until the way on is open.
+            if let Some((way, left)) = &mut self.detour {
+                *left -= dt;
+                let waist = at + Vec3::Y * 0.9;
+                let open = physics
+                    .cast_ray(waist, toward.normalize_or(Vec3::Z), DETOUR_OPEN)
+                    .is_none();
+                if *left <= 0.0 || open {
+                    self.detour = None;
+                } else {
+                    wanted = *way * SPRINT * self.ai.pursue_speed;
+                }
+            }
+            if self.detour.is_none() && toward.length() > CLOSE_ENOUGH {
+                wanted = toward.normalize() * SPRINT * self.ai.pursue_speed;
             }
         } else {
+            self.detour = None;
             self.step_wait -= dt;
             if self.step.is_none() && self.step_wait <= 0.0 {
                 self.step_wait = STEP_GAP.0 + rng.range(0.0, STEP_GAP.1);
@@ -975,11 +1055,38 @@ impl Npc {
         physics.move_character(&mut self.character, wanted, None, dt);
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
         if wanted != Vec3::ZERO && moved < 0.2 {
-            // Walked into something: stop stepping; a chase gives up on
-            // that spot and stands looking.
+            // Walked into something: stop stepping; a chase goes round it
+            // (along it the clearer way, or back if it is a corner) for a
+            // while, then on.
             self.step = None;
-            if !seen {
-                self.last_seen = Some(at);
+            let chasing = !hiding && (!seen || distance > self.fire_hint().range);
+            if chasing {
+                let waist = self.character.position + Vec3::Y * 0.9;
+                let clear = |d: Vec3| physics.cast_ray(waist, d, CLEAR).map_or(CLEAR, |(t, _)| t);
+                let way = match self.detour.take() {
+                    // The way round is blocked too: the other way.
+                    Some(_) => {
+                        self.detour_side = if self.detour_side > 0.0 { -1.0 } else { 1.0 };
+                        let ahead = (goal - at).with_y(0.0).normalize_or(Vec3::Z);
+                        Vec3::new(ahead.z, 0.0, -ahead.x) * self.detour_side
+                    }
+                    None => {
+                        let ahead = wanted.with_y(0.0).normalize_or(Vec3::Z);
+                        let side = Vec3::new(ahead.z, 0.0, -ahead.x);
+                        let (l, r) = (clear(side), clear(-side));
+                        // The side he went round last, while it is open;
+                        // else the clearer; back if it is a corner.
+                        if l.max(r) < 1.0 {
+                            -ahead
+                        } else {
+                            if self.detour_side == 0.0 || clear(side * self.detour_side) < 1.0 {
+                                self.detour_side = if l >= r { 1.0 } else { -1.0 };
+                            }
+                            side * self.detour_side
+                        }
+                    }
+                };
+                self.detour = Some((way, DETOUR_TIME));
             }
         }
         let seen = seen && !hiding;
@@ -1002,18 +1109,25 @@ impl Npc {
             self.rig.aim_along(self.facing, Some(threat - self.chest()));
         }
         self.cooldown -= dt;
-        if seen && self.cooldown <= 0.0 && off < FIRE_ARC && distance < FIRE_RANGE {
+        let hint = self.fire_hint();
+        if seen
+            && self.cooldown <= 0.0
+            && off < FIRE_ARC
+            && distance < hint.range
+            && distance >= hint.min_range
+        {
             self.fires = true;
+            self.since_shot = 0.0;
+            let close = distance < FireHint::CLOSE;
             if self.burst == 0 {
-                let more = rng.range(0.0, BURST.1 as f32 + 1.0) as u32;
-                self.burst = BURST.0 + more.min(BURST.1);
+                self.burst = hint.rounds(self.burst_gap(), close);
             }
             self.burst -= 1;
-            self.cooldown = if self.burst > 0 {
-                self.burst_gap()
-            } else {
-                FIRE_GAP.0 + rng.range(0.0, FIRE_GAP.1)
-            };
+            self.cooldown = self.burst_gap();
+            if self.burst == 0 {
+                let pause = hint.burst(close).1;
+                self.cooldown += pause * rng.range(1.0 - PAUSE_JITTER, 1.0 + PAUSE_JITTER);
+            }
         }
         let rate = match self.rig.gait_speed(gait) {
             Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
@@ -1029,6 +1143,12 @@ impl Npc {
         self.gun
             .filter(|g| g.rate_of_fire > 0.0)
             .map_or(BURST_GAP, |g| 60.0 / g.rate_of_fire)
+    }
+
+    /// How he fires his gun: its `WeaponHint`, else the "Assault
+    /// Rifle"'s ([`STAND_IN`]).
+    fn fire_hint(&self) -> FireHint {
+        self.gun.and_then(|g| g.hint).unwrap_or(STAND_IN)
     }
 
     /// His `Accuracy`, as the smarter soldiers have it when on.
@@ -1097,6 +1217,8 @@ impl Npc {
         self.last_seen = None;
         self.unseen = 0.0;
         self.step = None;
+        self.detour = None;
+        self.detour_side = 0.0;
         self.cover = None;
         self.hit = false;
     }
@@ -1180,6 +1302,7 @@ impl Npc {
             self.rig.advance(dt);
             return;
         }
+        self.since_shot += dt;
         // A soldier on watch who catches sight of her turns on her.
         if self.soldier && !self.alert && !self.ai.flags.pacifist {
             self.look -= dt;
@@ -1358,9 +1481,83 @@ pub struct People {
     /// stand, not where their layer has them.
     moved: HashMap<u32, Vec3>,
     active: HashSet<u32>,
+    /// Spawners sending from a list, by entity: their `SecondsPerCycle`
+    /// (filled on first use).
+    cycles: Option<HashMap<u32, f32>>,
+    /// Spawners whose one fell, by entity: seconds before the next.
+    pub refills: HashMap<u32, f32>,
+    /// How many passers-by the traffic zone where she is asks for (its
+    /// people count, [`m2_engine::population::DensityZone`]).
+    pub walker_cap: usize,
     rng: Rng,
     /// The enhanced, smarter soldiers' settings (off: the original's).
     pub smarter: SmarterAi,
+    /// What soldiers near her have been at (for checking).
+    pub idle: IdleTally,
+    /// Each person template's mixer profile, by name, lower case
+    /// ([`m2_engine::world::Templates::mixer_profiles`]).
+    pub mixer_profiles: HashMap<String, u32>,
+    /// The looks spawned so far, each by kind and parts picked (for
+    /// checking: each new one is said once).
+    pub looks_seen: HashSet<(usize, Vec<usize>)>,
+}
+
+/// Soldier-seconds near her, by what the soldiers were at (for checking
+/// soldiers who stand about in a fight): those on alert within
+/// `FIRE_RANGE` of her shooting (a round within [`STILL_AFTER`]),
+/// moving, or neither, with her in sight or not; and those not on alert
+/// within [`UNAWARE_RANGE`] with her in sight.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct IdleTally {
+    pub fighting: f32,
+    pub shooting: f32,
+    pub moving: f32,
+    pub still_seen: f32,
+    pub still_unseen: f32,
+    pub unaware: f32,
+}
+
+/// A soldier who hasn't fired for this long, seconds, isn't shooting (his
+/// longest pause between bursts is 1.7 s).
+const STILL_AFTER: f32 = 3.0;
+/// How near her a calm soldier who could see her counts, metres.
+const UNAWARE_RANGE: f32 = 30.0;
+
+impl IdleTally {
+    /// The tally in a line.
+    pub fn line(&self) -> String {
+        format!(
+            "soldier-seconds near her: {:.0} fighting ({:.0} shooting, {:.0} moving, {:.0} still with her in sight, {:.0} still without); {:.0} calm with her in sight",
+            self.fighting,
+            self.shooting,
+            self.moving,
+            self.still_seen,
+            self.still_unseen,
+            self.unaware
+        )
+    }
+
+    fn count(&mut self, physics: &Physics, n: &Npc, threat: Vec3, dt: f32) {
+        if !n.alive || !n.soldier || !n.landed {
+            return;
+        }
+        let d = n.character.position.distance(threat);
+        if n.alert && d < FIRE_RANGE {
+            self.fighting += dt;
+            let speed = Vec2::new(n.character.velocity.x, n.character.velocity.z).length();
+            if n.since_shot < STILL_AFTER {
+                self.shooting += dt;
+            } else if speed > 0.3 {
+                self.moving += dt;
+            } else if n.sees(physics, threat, true) {
+                self.still_seen += dt;
+            } else {
+                self.still_unseen += dt;
+            }
+        } else if !n.alert && d < UNAWARE_RANGE && n.sees(physics, threat, true) {
+            self.unaware += dt;
+        }
+    }
 }
 
 /// Who a spawn stands as.
@@ -1606,11 +1803,16 @@ impl People {
         threat: Option<Vec3>,
         dt: f32,
     ) {
+        self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
         let mut callouts = Vec::new();
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
+            npc.rammed = (npc.rammed - dt).max(0.0);
             npc.update(physics, &mut self.rng, threat, dt);
+            if let Some(t) = threat {
+                self.idle.count(physics, npc, t, dt);
+            }
             if std::mem::take(&mut npc.spotted) && npc.alive && self.smarter.enabled {
                 callouts.push(npc.character.position);
             }
@@ -1660,13 +1862,24 @@ impl People {
     }
 
     /// Vehicles going through people: `cars` are (model to world,
-    /// velocity, model-space hull box) of each one moving. Anyone a car's
-    /// box meets is knocked flying, dead; those who don't fight in its
-    /// path (as wide as it is, and a little more) dive out of the way, but
-    /// story characters. The number of soldiers killed.
-    pub fn traffic(&mut self, cars: &[(Mat4, Vec3, (Vec3, Vec3))]) -> usize {
+    /// velocity, model-space hull box, mass in kg) of each one moving.
+    /// Anyone a car's box meets takes its ram by the damage table `table`
+    /// ([`m2_engine::durability::run_over`]: a `Human` three times a
+    /// `Car`'s, a `HumanArmor` once, the bosses and targets once) and is
+    /// knocked flying if it kills, shoved aside if not (and not hurt by a
+    /// vehicle again for [`RAM_GAP`]); without the table, as before, it
+    /// kills. Those who don't fight in its path (as wide as it is, and a
+    /// little more) dive out of the way, but story characters. The number
+    /// of soldiers killed.
+    pub fn traffic(
+        &mut self,
+        cars: &[(Mat4, Vec3, (Vec3, Vec3), f32)],
+        table: Option<&m2_engine::tuning::DamageTable>,
+    ) -> usize {
+        let human = m2_assets::name_hash("Human");
+        let kind = m2_assets::name_hash(m2_engine::durability::RAM_KIND);
         let mut killed = 0;
-        for &(at, velocity, (lo, hi)) in cars {
+        for &(at, velocity, (lo, hi), mass) in cars {
             let speed = velocity.length();
             if speed < RUN_OVER {
                 continue;
@@ -1680,9 +1893,24 @@ impl People {
                 let local = to_car.transform_point3(p + Vec3::Y * 0.9);
                 let pad = Vec3::new(0.35, 0.9, 0.35);
                 if local.cmpge(lo - pad).all() && local.cmple(hi + pad).all() {
+                    if n.rammed > 0.0 {
+                        continue;
+                    }
                     let push = velocity * 1.1 + Vec3::Y * (2.0 + speed * 0.15);
-                    if n.hurt(1000.0, push) && n.soldier {
-                        killed += 1;
+                    let damage = table.map_or(1000.0, |t| {
+                        let row = n.ai.modifier.unwrap_or(human);
+                        m2_engine::durability::run_over(t, row, kind, mass, speed)
+                    });
+                    if n.hurt(damage, push) {
+                        killed += usize::from(n.soldier);
+                    } else {
+                        // Knocked aside, off the way it drives.
+                        let rel = (p - centre).with_y(0.0);
+                        let side = (rel - heading * rel.dot(heading))
+                            .normalize_or(Vec3::new(heading.z, 0.0, -heading.x));
+                        n.character.velocity = heading * speed * 0.5 + side * SHOVE;
+                        n.rammed = RAM_GAP;
+                        n.panic(centre);
                     }
                     continue;
                 }
@@ -1816,6 +2044,40 @@ impl People {
         })
     }
 
+    /// A spawner sending from its list (not a mission's target) sends
+    /// another its `SecondsPerCycle` after its one fell, while it is in
+    /// reach and she isn't on top of it: the fallen one lies where he fell,
+    /// no longer the spawner's. From the data: the cycle; the rest is
+    /// invented (see [`REFILL_CLEAR`]).
+    fn refill(&mut self, spawns: &[SpawnPoint], focus: Vec3, dt: f32) {
+        let cycles = self.cycles.get_or_insert_with(|| {
+            spawns
+                .iter()
+                .filter(|s| !s.list.is_empty())
+                .filter_map(|s| Some((s.entity, s.cycle?)))
+                .collect()
+        });
+        for n in &mut self.npcs {
+            let Some(id) = n.spawn.filter(|_| !n.alive) else {
+                continue;
+            };
+            let Some(&cycle) = cycles.get(&id) else {
+                continue;
+            };
+            if self.mission_soldiers.contains(&id) {
+                continue;
+            }
+            let left = self.refills.entry(id).or_insert(cycle);
+            *left -= dt;
+            let at = n.character.position;
+            if *left <= 0.0 && Vec2::new(at.x - focus.x, at.z - focus.z).length() > REFILL_CLEAR {
+                self.refills.remove(&id);
+                self.active.remove(&id);
+                n.spawn = None;
+            }
+        }
+    }
+
     fn populate(&mut self, physics: &mut Physics, spawns: &[SpawnPoint], focus: Vec3) {
         let far = |p: Vec3, d: f32| Vec2::new(p.x - focus.x, p.z - focus.z).length() > d;
         // People out of range, or whose layer went, go.
@@ -1877,7 +2139,16 @@ impl People {
         }
         // People who come into range: a mission's targets first, then the
         // nearest. Where the scripts put someone, they stand.
-        let soldiers = self.npcs.iter().filter(|n| n.spawn.is_some()).count();
+        let soldiers = self
+            .npcs
+            .iter()
+            .filter(|n| n.spawn.is_some_and(|e| !is_walker(e)))
+            .count();
+        let walkers = self
+            .npcs
+            .iter()
+            .filter(|n| n.spawn.is_some_and(is_walker))
+            .count();
         let mut near: Vec<(f32, &SpawnPoint, Vec3)> = spawns
             .iter()
             .map(|s| (s, self.moved.get(&s.entity).copied()))
@@ -1901,10 +2172,16 @@ impl People {
         // A mission's targets come even when the island's soldiers fill
         // the place up.
         let mut room = MAX_SOLDIERS.saturating_sub(soldiers);
+        let mut walker_room = self.walker_cap.min(MAX_WALKERS).saturating_sub(walkers);
         for (_, s, at) in near {
             let target = self.mission_soldiers.contains(&s.entity);
-            if room == 0 && !target {
-                break;
+            let room = if is_walker(s.entity) {
+                &mut walker_room
+            } else {
+                &mut room
+            };
+            if *room == 0 && !target {
+                continue;
             }
             let (kind, fights, listed) = match self.who(s, target) {
                 Who::Kind {
@@ -1915,12 +2192,12 @@ impl People {
                 // One whose model is still loading keeps their place, so
                 // spawns further off don't take it meanwhile.
                 Who::Waiting => {
-                    room = room.saturating_sub(1);
+                    *room = room.saturating_sub(1);
                     continue;
                 }
                 Who::Nobody => continue,
             };
-            room = room.saturating_sub(1);
+            *room = room.saturating_sub(1);
             let forward = s.rotation * Vec3::Z;
             let facing = forward.x.atan2(forward.z);
             let brain = if s.route.len() >= 2 && !self.moved.contains_key(&s.entity) {
@@ -1946,7 +2223,7 @@ impl People {
             if let Some(ai) = s.ai {
                 npc.ai = ai;
             }
-            // Their template's `Health` (a plain VZ soldier's 75 when none
+            // Their template's `Health` (a plain VZ soldier's 100 when none
             // speaks for them).
             npc.hp = npc.ai.health;
             npc.most_hp = npc.ai.health;
@@ -1961,9 +2238,46 @@ impl People {
             } else {
                 s.gun.or(self.kinds[kind].gun)
             };
+            npc.outfit = self.dress(kind, s);
             self.tell(s, &npc);
             self.npcs.push(npc);
         }
+    }
+
+    /// A look for one of kind `kind` spawned at `s`: of the parts their
+    /// template's `ModelMixerProfile` lets them wear in their model (every
+    /// part, for a template naming none or one the model lacks), a random
+    /// pick ([`m2_engine::Looks::pick`]); empty (the model's own) for a
+    /// model with no mixer. Each new look is said once.
+    fn dress(&mut self, kind: usize, s: &SpawnPoint) -> Vec<bool> {
+        let k = &self.kinds[kind];
+        let Some(looks) = k.model.looks.clone() else {
+            return Vec::new();
+        };
+        let template = if k.named {
+            k.role.clone()
+        } else {
+            s.template.clone().unwrap_or_else(|| s.name.clone())
+        };
+        let model = k.model.hash;
+        let profile = self
+            .mixer_profiles
+            .get(&template.to_ascii_lowercase())
+            .copied();
+        let rng = &mut self.rng;
+        let (picked, hidden) = looks.pick(profile, |n| {
+            ((rng.next() * n as f32) as usize).min(n.saturating_sub(1))
+        });
+        let has = profile.is_some_and(|p| looks.mixer.profiles.iter().any(|x| x.0 == p));
+        if self.looks_seen.insert((kind, picked.clone())) {
+            eprintln!(
+                "look: {template:?} in {model:08x}, profile {} ({}): parts {picked:?}; {} looks so far",
+                profile.map_or_else(|| "none".to_owned(), |p| format!("{p:08x}")),
+                if has { "its own" } else { "every part" },
+                self.looks_seen.len()
+            );
+        }
+        hidden
     }
 
     /// Says whom spawn `s` first stands as, once per kind and template:
@@ -2052,6 +2366,20 @@ pub(crate) mod tests {
     }
     use std::sync::Arc;
 
+    // A squad standing a step apart takes all three of the assault
+    // rifles' shot cues (six variants), and a person keeps their number.
+    #[test]
+    fn a_squad_a_step_apart_spreads_over_the_variants() {
+        let at = |i: usize| Vec3::new(10.0 + i as f32, 0.0, -4.0);
+        let mut cues = std::collections::HashSet::new();
+        for i in 0..8 {
+            cues.insert(shooter_number(at(i), 0.5) % 3);
+        }
+        assert_eq!(cues.len(), 3);
+        assert_eq!(shooter_number(at(2), 0.5), shooter_number(at(2), 0.5));
+        assert_ne!(shooter_number(at(2), 0.5), shooter_number(at(2), 0.6));
+    }
+
     pub(crate) fn ground() -> Physics {
         let mut p = Physics::new();
         let h = 200.0;
@@ -2081,6 +2409,8 @@ pub(crate) mod tests {
             tiny_members: Vec::new(),
             sinks: Vec::new(),
             breakup: None,
+            parts: None,
+            looks: None,
         };
         let mut backend = m2_render::NullBackend::default();
         let mut materials = m2_engine::MaterialCache::new();
@@ -2103,6 +2433,7 @@ pub(crate) mod tests {
             own: Default::default(),
             foreign: Default::default(),
             aim_clip: None,
+            barrel: true,
         }
     }
 
@@ -2216,6 +2547,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_spawner_sends_another_a_cycle_after_its_one_fell() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.add_kind(kind("VZ Soldier", true));
+        let spawner = SpawnPoint {
+            list: vec![("VZ Soldier".into(), 0x45cc, 1.0)],
+            cycle: Some(10.0),
+            ..spawn(9, "PopulationSpawner", 40.0)
+        };
+        let spawns = [spawner];
+        let dt = 1.0 / 60.0;
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, dt);
+        let first = people.npcs.iter().position(|n| n.spawn == Some(9));
+        let first = first.expect("sent one");
+        assert!(people.npcs[first].hurt(1000.0, Vec3::ZERO));
+        // Not before the cycle is out.
+        for _ in 0..(9.5 / dt) as usize {
+            people.update(&mut physics, &spawns, Vec3::ZERO, None, dt);
+        }
+        assert_eq!(people.npcs.iter().filter(|n| n.alive).count(), 0);
+        for _ in 0..(1.0 / dt) as usize {
+            people.update(&mut physics, &spawns, Vec3::ZERO, None, dt);
+        }
+        let alive: Vec<&Npc> = people.npcs.iter().filter(|n| n.alive).collect();
+        assert_eq!(alive.len(), 1);
+        assert_eq!(alive[0].spawn, Some(9));
+        // The fallen one lies where he fell, the spawner's no more.
+        assert!(people.npcs.iter().any(|n| !n.alive && n.spawn.is_none()));
+        // Nor while she stands on top of it.
+        let i = people.npcs.iter().position(|n| n.alive).expect("one");
+        assert!(people.npcs[i].hurt(1000.0, Vec3::ZERO));
+        let near = Vec3::new(40.0, 0.0, 5.0);
+        for _ in 0..(12.0 / dt) as usize {
+            people.update(&mut physics, &spawns, near, None, dt);
+        }
+        assert_eq!(people.npcs.iter().filter(|n| n.alive).count(), 0);
+    }
+
+    #[test]
+    fn as_many_pass_by_as_the_zone_asks() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.add_kind(kind("Civ Casual (male)", true));
+        let walker = |i: u32, x: f32| SpawnPoint {
+            list: vec![("Civ Casual (male)".into(), 0x6e44, 1.0)],
+            ..spawn(m2_engine::world::WALKER_BASE + i, "walker", x)
+        };
+        let spawns = [walker(0, 5.0), walker(1, 10.0), walker(2, 15.0)];
+        let dt = 1.0 / 60.0;
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, dt);
+        assert!(people.npcs.is_empty(), "a zone of none");
+        people.walker_cap = 2;
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, dt);
+        let out: Vec<Option<u32>> = people.npcs.iter().map(|n| n.spawn).collect();
+        // The nearest two.
+        let base = m2_engine::world::WALKER_BASE;
+        assert_eq!(out, [Some(base), Some(base + 1)]);
+        assert!(people.npcs.iter().all(|n| !n.soldier));
+    }
+
+    #[test]
     fn everyone_stands_in_their_templates_own_model() {
         let mut physics = ground();
         let mut people = People::default();
@@ -2248,6 +2640,7 @@ pub(crate) mod tests {
             reserve_clips: 7,
             damage: 9.0,
             damage_key: None,
+            hint: None,
         };
         people.add_kind(kind("Carmona", true));
         people.add_kind(PersonKind {
@@ -2366,7 +2759,10 @@ pub(crate) mod tests {
         let mut people = People::default();
         people.npcs.push(him);
         let bounds = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
-        people.traffic(&[(Mat4::IDENTITY, Vec3::new(0.0, 0.0, 10.0), bounds)]);
+        people.traffic(
+            &[(Mat4::IDENTITY, Vec3::new(0.0, 0.0, 10.0), bounds, 1000.0)],
+            None,
+        );
         assert!(people.npcs[0].alive && people.npcs[0].flee.is_none());
         assert!(people.take_shouts().is_empty(), "nor shouts");
     }
@@ -2465,6 +2861,7 @@ pub(crate) mod tests {
             reserve_clips: 7,
             damage: 8.0,
             damage_key: None,
+            hint: None,
         }
     }
 
@@ -2495,6 +2892,7 @@ pub(crate) mod tests {
             list: Vec::new(),
             ai: None,
             gun: None,
+            cycle: None,
         }
     }
 
@@ -2702,8 +3100,8 @@ pub(crate) mod tests {
         }
         // A car at the origin doing 10 m/s along +z.
         let bounds = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
-        let car = (Mat4::IDENTITY, Vec3::new(0.0, 0.0, 10.0), bounds);
-        people.traffic(&[car]);
+        let car = (Mat4::IDENTITY, Vec3::new(0.0, 0.0, 10.0), bounds, 1000.0);
+        people.traffic(&[car], None);
         let [hit, ahead, behind] = &people.npcs[..] else {
             unreachable!()
         };
@@ -2715,8 +3113,63 @@ pub(crate) mod tests {
         let mut n = Npc::new(0, &rig(), Vec3::new(0.3, 0.0, 1.5), 0.0, stroll(), None);
         n.landed = true;
         people.npcs.push(n);
-        people.traffic(&[(Mat4::IDENTITY, Vec3::ZERO, bounds)]);
+        people.traffic(&[(Mat4::IDENTITY, Vec3::ZERO, bounds, 1000.0)], None);
         assert!(people.npcs[0].alive);
+    }
+
+    // With the damage table, a car hurts as its ram times their row's
+    // `Car` cell: a tonne at 10 m/s does 30 to a `Human` (3x), who is
+    // shoved aside and not hurt again at once; two tonnes at 20 m/s do
+    // 120 and kill; a `HumanArmor` (1x) takes 40 of that and lives.
+    #[test]
+    fn a_car_hurts_people_by_the_damage_table() {
+        let (human, armor, car_key) = (
+            m2_assets::name_hash("Human"),
+            m2_assets::name_hash("HumanArmor"),
+            m2_assets::name_hash("Car"),
+        );
+        let mut data = vec![0u8; 0x48];
+        let mut put = |v: u32| data.extend_from_slice(&v.to_le_bytes());
+        put(2);
+        put(1);
+        put(human);
+        put(armor);
+        put(car_key);
+        put(3.0f32.to_bits());
+        put(1.0f32.to_bits());
+        let table = m2_engine::tuning::DamageTable::parse(&data).expect("table");
+        let stroll = || Brain::Wander {
+            home: Vec3::ZERO,
+            target: Vec3::ZERO,
+            wait: 10.0,
+        };
+        let bounds = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
+        let person = |modifier: Option<u32>| {
+            let mut n = Npc::new(0, &rig(), Vec3::new(0.3, 0.0, 1.5), 0.0, stroll(), None);
+            n.landed = true;
+            n.ai.modifier = modifier;
+            n
+        };
+        let mut people = People::default();
+        people.npcs.push(person(None));
+        let slow = (Mat4::IDENTITY, Vec3::new(0.0, 0.0, 10.0), bounds, 1000.0);
+        assert_eq!(people.traffic(&[slow], Some(&table)), 0);
+        let n = &people.npcs[0];
+        assert!(n.alive && n.hp == 70.0 && n.rammed == RAM_GAP);
+        assert!(n.character.velocity.x > 0.0, "shoved off its line");
+        people.traffic(&[slow], Some(&table));
+        assert_eq!(people.npcs[0].hp, 70.0, "not again at once");
+        // Faster and heavier: a soldier dies, a heavy lives.
+        let fast = (Mat4::IDENTITY, Vec3::new(0.0, 0.0, 20.0), bounds, 2000.0);
+        let mut people = People::default();
+        people.npcs.push(person(Some(human)));
+        people.npcs.push(person(Some(armor)));
+        for n in &mut people.npcs {
+            n.soldier = true;
+        }
+        assert_eq!(people.traffic(&[fast], Some(&table)), 1);
+        assert!(!people.npcs[0].alive);
+        assert!(people.npcs[1].alive && people.npcs[1].hp == 60.0);
     }
 
     // Running from a car into a wall, they run along it, not stand
@@ -2750,6 +3203,40 @@ pub(crate) mod tests {
         }
         let p = n.character.position;
         assert!(p.x < 1.0 && p.z.abs() > 6.0, "{p}");
+    }
+
+    // Hit by her from behind a wall, a soldier chasing her goes round it
+    // and comes to see her, not stand against it.
+    #[test]
+    fn a_chase_goes_round_a_wall() {
+        let mut physics = ground();
+        let shape = CollisionShape::mesh(
+            &[
+                Vec3::new(-5.0, -1.0, 6.0),
+                Vec3::new(5.0, -1.0, 6.0),
+                Vec3::new(5.0, 4.0, 6.0),
+                Vec3::new(-5.0, 4.0, 6.0),
+            ],
+            &[[0, 1, 2], [0, 2, 3], [0, 2, 1], [0, 3, 2]],
+        )
+        .unwrap();
+        physics.add_static(StaticKey::Cell(2), &shape, Vec3::ZERO, Quat::IDENTITY);
+        let dt = 1.0 / 60.0;
+        physics.step(dt);
+        let mut rng = Rng::default();
+        let post = Brain::Post { facing: 0.0 };
+        let mut n = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(1));
+        n.update(&physics, &mut rng, None, dt);
+        let her = Vec3::new(0.0, 1.2, 14.0);
+        assert!(!n.sees(&physics, her, true));
+        n.hurt(1.0, Vec3::ZERO);
+        let mut saw = false;
+        for _ in 0..60 * 12 {
+            n.update(&physics, &mut rng, Some(her), dt);
+            saw |= n.sees(&physics, her, true);
+        }
+        assert!(n.alert, "still fighting");
+        assert!(saw, "came round: {}", n.character.position);
     }
 
     #[test]

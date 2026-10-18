@@ -17,7 +17,7 @@ use crate::game::{Game, can_get_out, get_out, place};
 use crate::mission::{Mark, WATERLINE};
 use crate::player::{Intent, Player};
 use crate::route::{Mover, Route};
-use crate::support::{PDA_CLOSE, PDA_OPEN, Phase};
+use crate::support::{Aim, PDA_CLOSE, PDA_OPEN, Phase};
 
 /// How fast she turns the camera, radians a second (a quick hand on the
 /// mouse).
@@ -472,8 +472,14 @@ impl Autoplay {
                 .flights
                 .pickups()
                 .iter()
+                // What the layers place she leaves to the player: going out
+                // of her way for each would keep her from the contract.
+                // (Cheapest first: there are hundreds placed.)
                 .filter(|p| {
-                    wanted(templates, &game.combat, p) && !self.left_lying.contains(&p.key())
+                    !game.placed.is_pickup(p.from)
+                        && p.at.distance(here) < OPEN_NEAR
+                        && !self.left_lying.contains(&p.key())
+                        && wanted(templates, &game.combat, p)
                 })
                 .map(|p| (p.key(), p.at.distance(here)))
                 .filter(|&(_, d)| d < OPEN_NEAR)
@@ -767,10 +773,15 @@ impl Autoplay {
             if press {
                 self.pressed = 0.0;
             }
-            // A rifle lying there is walked over for its rounds, not taken
-            // up in place of hers ([`wanted`]).
+            // A rifle lying there is taken for its rounds ("Take Ammo"),
+            // not taken up in place of hers ([`wanted`]).
+            let templates = game.scene.world.as_ref().map(|w| &w.index.template_db);
+            let swap = p.what.weapon == Some(Weapon::Rifle)
+                && templates.is_none_or(|t| {
+                    crate::mission::offer(t, &game.combat, &p.what) == crate::mission::Offer::Equip
+                });
             return Intent {
-                use_pressed: press && p.what.weapon != Some(Weapon::Rifle),
+                use_pressed: press && !swap,
                 ..Intent::default()
             };
         }
@@ -889,6 +900,19 @@ impl Autoplay {
         }
         if self.stalled > STALL {
             self.stalled = 0.0;
+            // Each stall logged, with what holds it (round 7 counts the
+            // tank's over its jungle drive).
+            if let (Some(w), Some(v)) = (game.scene.world.as_ref(), game.scene.vehicles.get(i))
+                && let Some(id) = v.id
+            {
+                eprintln!(
+                    "autoplay {:.1} s: stalled driving the {} at {:.1}: {}",
+                    self.clock,
+                    v.spec.label,
+                    game.focus(),
+                    stuck_report(w, id, v.spec.hull, false)
+                );
+            }
             // A boat run aground near the place: out, into the shallows
             // (further off, it backs off the rocks).
             if d < RIDE_FOR && self.can_leave(game, i) {
@@ -1118,6 +1142,7 @@ impl Autoplay {
             Phase::Viewing { .. } => "the satellite's view",
             Phase::Timing { .. } => "the timing wheel",
             Phase::Confirmed { .. } => "confirmed",
+            Phase::Designating { .. } => "aiming a designator",
         };
         if step != self.support_logged {
             self.support_logged = step;
@@ -1158,7 +1183,12 @@ impl Autoplay {
             Phase::Menu => intent.use_pressed = true,
             // The view opens by itself.
             Phase::Holding { .. } => {}
-            Phase::Viewing { at: view, .. } => {
+            Phase::Viewing { at: view, .. }
+            | Phase::Designating {
+                aim: Aim::Satellite,
+                at: view,
+                ..
+            } => {
                 let to = Vec2::new(at.x, at.z) - view;
                 if to.length() < ON_SPOT {
                     intent.trigger.fire = self.tap();
@@ -1169,6 +1199,15 @@ impl Autoplay {
             }
             Phase::Timing { .. } => intent.trigger.fire = support.wheel_ready() && self.tap(),
             Phase::Confirmed { .. } => {}
+            // The laser held on the target.
+            Phase::Designating {
+                aim: Aim::Laser, ..
+            } => {
+                if let Some(p) = game.scene.player.as_ref() {
+                    intent.look = aim(p, at, dt).0;
+                }
+                intent.trigger.fire = true;
+            }
         }
         intent
     }
@@ -1633,6 +1672,13 @@ impl Autoplay {
             self.hops.len(),
             game.scene.people.fight_summary()
         );
+        eprintln!(
+            "autoplay tally {:.1} s: {}; {}; {}",
+            self.clock,
+            game.combat.tally.line(game.combat.fired.rifle),
+            game.scene.people.idle.line(),
+            game.combat.shots_line()
+        );
     }
 
     /// A summary for the end of the run.
@@ -1659,6 +1705,13 @@ fn wanted(templates: &Templates, combat: &Combat, p: &crate::flights::Pickup) ->
     match p.what.weapon {
         Some(w) if p.from == 0 => combat.second != Some(w) && !combat.second_loaded(),
         Some(w) if w != Weapon::Rifle => combat.second != Some(w),
+        // A rifle she doesn't carry gives nothing short of taking it up.
+        Some(_)
+            if crate::mission::offer(templates, combat, &p.what)
+                == crate::mission::Offer::Equip =>
+        {
+            false
+        }
         _ => {
             let refill = crate::mission::refill(templates, combat, &p.what);
             combat.can_use(refill, p.what.health)
@@ -2144,6 +2197,7 @@ mod tests {
             hull,
             turret_box: None,
             rotors: Vec::new(),
+            damage: None,
             tuning: Default::default(),
         };
         let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);

@@ -31,7 +31,7 @@ use rapier3d::control::{
     KinematicCharacterController, WheelTuning,
 };
 
-use crate::tuning::FlightTuning;
+use crate::tuning::{BikeTuning, BoatTuning, FlightTuning};
 use crate::vehicle::VehicleSpec;
 use rapier3d::prelude as r;
 
@@ -68,6 +68,16 @@ pub struct CollisionShape {
     /// How the model comes loose when knocked, if its `PHY2` has bodies
     /// that move.
     pub loose: Option<Arc<Loose>>,
+    /// How it comes loose as one, its box a single piece, if its `PHY2`
+    /// has no body that moves (or none at all) and it is small enough
+    /// ([`LOOSE_SIZE`]): for a template whose objects are physics props
+    /// (`_PropPhysics`: a café chair, a planter), whose mass it is given
+    /// ([`Loose::weighing`]).
+    pub whole: Option<Arc<Loose>>,
+    /// What its triangles are made of ([`crate::surface`]): runs of
+    /// (first triangle, surface name hash) in triangle order; empty when
+    /// nothing says (surface 0).
+    pub surfaces: Arc<[(u32, u32)]>,
 }
 
 impl fmt::Debug for CollisionShape {
@@ -76,9 +86,14 @@ impl fmt::Debug for CollisionShape {
             .field("triangles", &self.triangles)
             .field("stand_in", &self.stand_in)
             .field("loose", &self.loose)
+            .field("whole", &self.whole)
             .finish()
     }
 }
+
+/// A `PHY2` shape as [`CollisionShape::shape_meshes`] gives it: its node,
+/// its vertices (model space) and triangles.
+pub type ShapeMesh = (u16, Vec<Vec3>, Vec<[u32; 3]>);
 
 /// How a prop comes loose when a vehicle or a blast knocks it (its `PHY2`
 /// has bodies that move: traffic lights, plants, barricades, poles): its
@@ -275,6 +290,33 @@ impl Loose {
             }
         }
         Self::with_pieces(model, pieces, breaks, rest)
+    }
+
+    /// `model` coming loose as one, its collision's box `bounds` (model
+    /// space) a single piece of the lightest mass ([`Loose::weighing`]
+    /// gives it its own); `None` for one too big ([`LOOSE_SIZE`]).
+    fn whole(model: &Model<'_>, (lo, hi): (Vec3, Vec3)) -> Option<Self> {
+        let size = (hi - lo).length();
+        if !size.is_finite() || size > LOOSE_SIZE {
+            return None;
+        }
+        let half = ((hi - lo) * 0.5).max(Vec3::splat(LOOSE_HALF));
+        let piece = LoosePiece::block(None, (lo + hi) * 0.5, half, LOOSE_MASS);
+        let rest = (0..model.nodes.len())
+            .map(|n| model.node_to_model(n as u16).unwrap_or(Mat4::IDENTITY))
+            .collect();
+        Self::with_pieces(model, vec![piece], false, rest)
+    }
+
+    /// The same, weighing `kg` in all (each piece its share).
+    pub fn weighing(&self, kg: f32) -> Self {
+        let k = loose_mass(kg) / self.mass.max(f32::EPSILON);
+        let mut out = self.clone();
+        for p in &mut out.pieces {
+            p.mass *= k;
+        }
+        out.mass = out.pieces.iter().map(|p| p.mass).sum();
+        out
     }
 
     /// A model coming loose as `pieces` (breaking into them with
@@ -511,30 +553,58 @@ impl CollisionShape {
             triangles: 12,
             stand_in: false,
             loose: None,
+            whole: None,
+            surfaces: Arc::new([]),
         }
     }
 
     /// A triangle mesh; `None` if it has no valid triangle.
     pub fn mesh(vertices: &[Vec3], triangles: &[[u32; 3]]) -> Option<Self> {
+        Self::mesh_of(vertices, triangles, &[])
+    }
+
+    /// A triangle mesh whose triangles are made of `surfaces`, one per
+    /// triangle (surface 0 past its end); `None` if it has no valid
+    /// triangle.
+    pub fn mesh_of(vertices: &[Vec3], triangles: &[[u32; 3]], surfaces: &[u32]) -> Option<Self> {
         let n = vertices.len() as u32;
-        let triangles: Vec<[u32; 3]> = triangles
-            .iter()
-            .copied()
-            .filter(|t| t.iter().all(|&i| i < n) && t[0] != t[1] && t[1] != t[2] && t[0] != t[2])
-            .collect();
-        if triangles.is_empty() || vertices.iter().any(|v| !v.is_finite()) {
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        let mut kept: Vec<[u32; 3]> = Vec::with_capacity(triangles.len());
+        for (k, t) in triangles.iter().enumerate() {
+            if !(t.iter().all(|&i| i < n) && t[0] != t[1] && t[1] != t[2] && t[0] != t[2]) {
+                continue;
+            }
+            let s = surfaces.get(k).copied().unwrap_or(0);
+            if runs.last().is_none_or(|r| r.1 != s) {
+                runs.push((kept.len() as u32, s));
+            }
+            kept.push(*t);
+        }
+        if kept.is_empty() || vertices.iter().any(|v| !v.is_finite()) {
             return None;
         }
-        let count = triangles.len();
+        if runs.iter().all(|r| r.1 == 0) {
+            runs.clear();
+        }
+        let count = kept.len();
         let shape =
-            r::SharedShape::trimesh(vertices.iter().map(|&v| vector(v)).collect(), triangles)
-                .ok()?;
+            r::SharedShape::trimesh(vertices.iter().map(|&v| vector(v)).collect(), kept).ok()?;
         Some(Self {
             shape,
             triangles: count,
             stand_in: false,
             loose: None,
+            whole: None,
+            surfaces: runs.into(),
         })
+    }
+
+    /// What triangle `face` is made of (a surface name hash; 0 for none
+    /// known). Faces past the triangle count wrap round.
+    pub fn surface_of(&self, face: u32) -> u32 {
+        let face = face % (self.triangles.max(1) as u32);
+        let k = self.surfaces.partition_point(|r| r.0 <= face);
+        k.checked_sub(1).map_or(0, |k| self.surfaces[k].1)
     }
 
     /// The box the shape fills, in its own space.
@@ -548,6 +618,40 @@ impl CollisionShape {
     /// in).
     pub fn for_model(model: &Model<'_>, phy2: Option<&[u8]>, lod: u32) -> Option<Self> {
         Self::for_model_part(model, phy2, lod, None)
+    }
+
+    /// The `PHY2` shapes [`for_model`](Self::for_model) stands in the
+    /// way, one by one: each one's node, and its vertices (model space)
+    /// and triangles. None for a model without `PHY2` shapes.
+    pub fn shape_meshes(model: &Model<'_>, phy2: Option<&[u8]>) -> Vec<ShapeMesh> {
+        let Some(p) = phy2.and_then(|d| Phy2::parse(d).ok()) else {
+            return Vec::new();
+        };
+        let hidden = model
+            .states
+            .as_ref()
+            .map(|s| s.hidden(&model.nodes, false))
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for (k, s) in p.shapes.iter().enumerate() {
+            if !standing(&p, k, &hidden) {
+                continue;
+            }
+            let Some(node) = p.shape_node(k).and_then(|n| u16::try_from(n).ok()) else {
+                continue;
+            };
+            let to_model = model.node_to_model(node).unwrap_or(Mat4::IDENTITY)
+                * p.shape_place(k).map_or(Mat4::IDENTITY, place);
+            let (v, t) = s.geometry.triangles(s.radius);
+            out.push((
+                node,
+                v.iter()
+                    .map(|&x| to_model.transform_point3(Vec3::from(x)))
+                    .collect(),
+                t,
+            ));
+        }
+        out
     }
 
     /// One sub-object of a merged batch (a `TINY` model), by the index its
@@ -565,6 +669,7 @@ impl CollisionShape {
     ) -> Option<Self> {
         let mut vertices = Vec::new();
         let mut triangles = Vec::new();
+        let mut surfaces = Vec::new();
         let mut loose = None;
         // Shapes of its own, whether or not any stands in the way: no
         // stand-in then.
@@ -648,6 +753,11 @@ impl CollisionShape {
                         })
                     };
                     for range in group.material_ranges.iter().filter(|r| solid(r.material)) {
+                        let surface = model
+                            .materials
+                            .get(range.material as usize)
+                            .map_or(0, |m| m.surface);
+                        let before = triangles.len();
                         triangles.extend(
                             group
                                 .triangles(range)
@@ -655,16 +765,72 @@ impl CollisionShape {
                                 .filter(|t| t.iter().all(|&i| mine(i)))
                                 .map(|t| t.map(|i| first + u32::from(i))),
                         );
+                        surfaces.resize(surfaces.len() + triangles.len() - before, surface);
                     }
                 }
             }
+        } else {
+            // Its shapes say nothing of what they are made of: they take
+            // the surface most of its solid drawn area has (inferred).
+            surfaces = vec![drawn_surface(model, lod); triangles.len()];
         }
-        Self::mesh(&vertices, &triangles).map(|shape| Self {
+        let shape = Self::mesh_of(&vertices, &triangles, &surfaces)?;
+        let whole = match (&loose, sub_object) {
+            (None, None) => Loose::whole(model, shape.bounds()).map(Arc::new),
+            _ => None,
+        };
+        Some(Self {
             stand_in,
             loose,
+            whole,
             ..shape
         })
     }
+}
+
+/// The surface ([`m2_assets::model::Material::surface`]) of most of a
+/// model's solid drawn area at `lod` (or its next level drawn); 0 for a
+/// model drawing nothing solid.
+pub fn drawn_surface(model: &Model<'_>, lod: u32) -> u32 {
+    let lod = (lod..model.info.lod_count.max(lod + 1))
+        .find(|&l| model.has_lod(l))
+        .unwrap_or(lod);
+    let mut area: Vec<(u32, f32)> = Vec::new();
+    for (_, geometry) in model.lod(lod) {
+        for group in &geometry.groups {
+            let Some(pos) = group
+                .decl
+                .find(DeclUsage::Position, 0)
+                .and_then(|e| group.vertices.read(e))
+            else {
+                continue;
+            };
+            let at = |i: u16| {
+                pos.get(usize::from(i))
+                    .map_or(Vec3::ZERO, |p| Vec3::new(p[0], p[1], p[2]))
+            };
+            for range in &group.material_ranges {
+                let Some(m) = model.materials.get(range.material as usize) else {
+                    continue;
+                };
+                if m.flags & NOT_SOLID != 0 {
+                    continue;
+                }
+                let a: f32 = group
+                    .triangles(range)
+                    .into_iter()
+                    .map(|[a, b, c]| (at(b) - at(a)).cross(at(c) - at(a)).length() * 0.5)
+                    .sum();
+                match area.iter_mut().find(|e| e.0 == m.surface) {
+                    Some(e) => e.1 += a,
+                    None => area.push((m.surface, a)),
+                }
+            }
+        }
+    }
+    area.into_iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map_or(0, |e| e.0)
 }
 
 /// Material flags of surfaces nothing stands on or bumps into: additive
@@ -698,14 +864,26 @@ pub enum StaticKey {
     Entity(u32),
 }
 
-/// Suspension rest length and travel, metres.
+/// Suspension rest length and travel, metres. Invented.
 const SUSPENSION: f32 = 0.3;
-/// Steering lock at a standstill, radians.
+/// Each wheel's spring and dampers (squeezed, stretched), per kilogram,
+/// for a vehicle whose template gives no `FrontWheelSuspStrength` and
+/// the rest ([`Handling`](crate::tuning::Handling)'s `spring` and
+/// `damping`). Invented.
+const SPRING: f32 = 40.0;
+const DAMPING: (f32, f32) = (2.0, 3.0);
+/// Steering lock at a standstill, radians, for a vehicle whose template
+/// gives none (its `SteerMaxAngle` otherwise,
+/// [`Handling`](crate::tuning::Handling)). Invented.
 const MAX_STEER: f32 = 0.6;
-/// Braking with the throttle against the motion, the handbrake (on the
-/// wheels that don't steer), rolling with no throttle, and holding still,
-/// m/s² (as if all wheels braked so).
+/// Braking with the throttle against the motion (for a vehicle whose
+/// template gives no `FrontBrake` and `RearBrake`), the handbrake (on
+/// the wheels that don't steer), rolling with no throttle, and holding
+/// still, m/s² (as if all wheels braked so). Invented.
 const SERVICE_BRAKE: f32 = 8.0;
+/// The tyres' friction coefficient, for a vehicle whose template gives
+/// no `FrontWheelFrictionSide` and `RearWheelFrictionSide`. Invented.
+const GRIP: f32 = 2.0;
 const HANDBRAKE: f32 = 9.0;
 const ROLLING: f32 = 0.6;
 const HOLD: f32 = 3.0;
@@ -727,26 +905,42 @@ const TRACK_TURN: f32 = 0.9;
 /// and backwards.
 const TOP_SPEED: f32 = 30.0;
 const REVERSE_SPEED: f32 = 8.0;
+/// A wheeled or tracked vehicle's drag, per second (a helicopter's is
+/// 0.1, a boat's its water drag). Until round 18 it was 0.1 too, which held every
+/// car to about 60% of its template's `MaxSpeed` against the old pull of
+/// 4 m/s² falling to nothing at the top (the playtest's "vehicles feel
+/// slower"); its own engine now sets how it gathers speed. Invented.
+const GROUND_DAMPING: f32 = 0.02;
+/// How a vehicle's pull fades as it reaches its top speed, over this
+/// many m/s below it (its template's `MaxSpeed` caps it). Invented.
+const TOP_EASE: f32 = 1.0;
+/// A tracked vehicle's most pull, m/s², shaped by its tracks' curve
+/// ([`VehicleTuning::tracks`](crate::VehicleTuning)); and a vehicle's
+/// whose template gives neither engine nor tracks. Invented.
+const TRACK_PULL: f32 = 4.0;
 /// Boats ([`Physics::set_water`]): how deep a boat's origin floats,
 /// metres (the layers put the start's boat 0.35 m under the -36 m sea,
-/// patrol boats at it); how hard it pushes on flat out, m/s²; how its
-/// speed falls off coasting and braking, sideways (its keel) and up and
-/// down, and how its rocking dies down, per second; how fast it turns at
-/// speed, radians a second, from what speed, m/s; its top speed backing
-/// up and when its template gives none, m/s; and the most of its weight
-/// a wreck's buoyancy holds up (it sinks). All invented.
+/// patrol boats at it); how its rocking dies down, per second; how fast
+/// it turns at speed, radians a second, from what speed, m/s; its top
+/// speed when its template gives none, m/s; and the most of its weight a
+/// wreck's buoyancy holds up (it sinks). All invented.
 pub const FLOAT_DEPTH: f32 = 0.35;
-const BOAT_PUSH: f32 = 5.0;
-const BOAT_COAST: f32 = 0.3;
-const BOAT_BRAKE: f32 = 1.2;
-const BOAT_KEEL: f32 = 2.5;
-const BOAT_HEAVE: f32 = 3.0;
 const BOAT_ROCK: f32 = 2.5;
 const BOAT_TURN: f32 = 0.9;
 const BOAT_TURN_SPEED: f32 = 6.0;
-const BOAT_REVERSE: f32 = 4.0;
 const BOAT_TOP: f32 = 18.0;
 const WRECK_FLOAT: f32 = 0.4;
+/// A boat's engine and drag when its template gives none (its own
+/// `_BoatPhysics` otherwise, gap round 17): the alpha's earlier invented
+/// coasting, keel and heave drag (0.3, 2.5, 3 a second), braking 1.2 a
+/// second in all, 4 m/s backing up. Invented.
+const BOAT: BoatTuning = BoatTuning {
+    reverse_speed: 4.0,
+    torque: (1.0, 0.8),
+    drag: [0.3, 2.5, 3.0],
+    brake: 0.9,
+    curve: [1.0; 4],
+};
 /// A boat going fast planes (the playthroughs' speedboat rides high, bow
 /// up): from a standstill to this speed, m/s, its hull rises up to this
 /// far, metres, and its bow this much more than its stern (and the stern
@@ -761,7 +955,7 @@ const PLANE_TRIM: f32 = 0.25;
 const CLIMB: f32 = 0.52;
 /// Tracks grip: on the ground, a tracked vehicle's weight doesn't pull it
 /// down hills up to this steep, radians, so it climbs, turns and stands on
-/// them as on the flat (Brendan: the game's tank "should be able to climb
+/// them as on the flat (a play-tester: the game's tank "should be able to climb
 /// almost any hill"; the steepness is invented).
 const CLIMB_TRACKED: f32 = 0.87;
 
@@ -776,11 +970,17 @@ const CLIMB_EASE: f32 = 1.5;
 /// How quickly it leans to the tilt its stick asks, a second (its
 /// template's `PitchAccel` and `RollAccel` scale it).
 const LEAN_EASE: f32 = 3.0;
-/// How far a motorbike leans into a full-lock turn, radians, from this
-/// speed up (m/s), and how quickly it gets there, a second. Invented.
-const BIKE_LEAN: f32 = 0.45;
-const BIKE_LEAN_SPEED: f32 = 12.0;
-const BIKE_EASE: f32 = 8.0;
+/// A motorbike's balance when its template gives none: the Scooter's and
+/// the Chopper's strength and damps, the most common control in the air
+/// (invented: a mid-range record's).
+const BIKE: BikeTuning = BikeTuning {
+    roll: 20.0,
+    damp: [10.0, 10.0, 1.0],
+    air: (5.0, 1.5),
+};
+/// The most a motorbike leans to balance a turn, radians (45 degrees;
+/// invented: flat out at full lock its tyres' grip asks up to 66).
+const BIKE_LEAN: f32 = 0.785;
 
 /// A helicopter's body is at most this wide, metres either side: its hull
 /// box leaves the rotor disc out.
@@ -808,10 +1008,24 @@ struct VehicleBody {
     steers: Vec<bool>,
     /// On tracks: turns on the spot instead of steering wheels.
     tracked: bool,
-    /// On two wheels in line: held upright, leaning into its turns.
-    bike: bool,
-    /// Top speed forwards, m/s.
+    /// On two wheels in line: held up, leaning into its turns.
+    bike: Option<Bike>,
+    /// Top speed forwards and backing up, m/s.
     top: f32,
+    reverse_top: f32,
+    /// Its template's engine and gearbox, or its tracks' pull over its
+    /// speed ([`VehicleTuning`](crate::VehicleTuning)).
+    engine: Option<crate::tuning::EngineTuning>,
+    tracks: Option<[f32; 4]>,
+    /// The forward gear its engine is in (0 is first), and how long its
+    /// clutch is still out changing to it, seconds.
+    gear: usize,
+    clutch: f32,
+    /// Its template's steering lock and brakes, on wheels.
+    handling: Option<crate::tuning::Handling>,
+    /// Where its front wheels point now, radians (left positive): they
+    /// swing towards where the driver steers as its `handling` says.
+    steering: f32,
     /// Wrecked: nothing drives it any more.
     wrecked: bool,
     /// Held where it is ([`Physics::hold_vehicle`]): its body fixed.
@@ -832,6 +1046,15 @@ struct Rotorcraft {
     lift: f32,
 }
 
+/// A motorbike's balance: its template's (else [`BIKE`]), and its body's
+/// inertia about its own axes (right, up, ahead), per kilogram, m², that
+/// turns those per-kilogram torques into turning accelerations.
+#[derive(Clone, Copy)]
+struct Bike {
+    tuning: BikeTuning,
+    inertia: Vec3,
+}
+
 /// A boat's hull in the water: the points on its waterline that float it,
 /// and what its driver asks of it.
 struct Hull {
@@ -839,6 +1062,9 @@ struct Hull {
     /// its corners, the middles of its sides and its middle.
     points: Vec<Vec3>,
     controls: VehicleControls,
+    /// Its engine and how the water slows it: its template's, else
+    /// [`BOAT`].
+    water: BoatTuning,
 }
 
 /// A character's capsule and motion.
@@ -895,6 +1121,63 @@ const VEHICLE: r::Group = r::Group::GROUP_4;
 /// through a gate's rubble in the videos; shots pass).
 const RUBBLE: r::Group = r::Group::GROUP_5;
 
+/// Of a tracked vehicle's most pull, what its tracks give at `along` of
+/// its top speed (0 to 1): its curve's four points at a standstill, a
+/// third, two thirds and all of it, between them in a line.
+fn track_pull(curve: [f32; 4], along: f32) -> f32 {
+    let at = along.clamp(0.0, 1.0) * 3.0;
+    let i = (at as usize).min(2);
+    let k = at - i as f32;
+    curve[i] + (curve[i + 1] - curve[i]) * k
+}
+
+/// A motorbike's spin after a step of `dt` s, from its spin `w` (rad/s,
+/// world), turned `turn` and moving at `velocity`: its template's
+/// strength turns it towards the lean that balances its turn (at most
+/// [`BIKE_LEAN`]), against its roll damp, and its pitch and yaw damps
+/// slow those; in the air its rider's `controls` turn its nose
+/// (throttle ahead dips it) and its heading. Each is a torque per
+/// kilogram over its inertia per kilogram, stepped implicitly so the
+/// stiffest (the street bike's 250 against a 0.2 m² roll inertia)
+/// stays steady at 60 steps a second.
+fn balance(
+    bike: Bike,
+    turn: Quat,
+    velocity: Vec3,
+    w: Vec3,
+    controls: Option<VehicleControls>,
+    dt: f32,
+) -> Vec3 {
+    let BikeTuning { roll, damp, air } = bike.tuning;
+    let per = |i: f32| 1.0 / i.max(1e-3);
+    // Leans so its weight and its turn's pull sum along its up axis.
+    let pull = Vec3::new(0.0, w.y, 0.0).cross(velocity).with_y(0.0);
+    let most = GRAVITY * BIKE_LEAN.tan();
+    let pull = pull.clamp_length_max(most);
+    let want = (Vec3::Y * GRAVITY + pull).normalize();
+    // About its heading, level (so a turn's yaw is no pitch or roll).
+    let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or(Vec3::Z);
+    let off = (turn * Vec3::Y).cross(want).dot(ahead);
+    let (k, c) = (roll * per(bike.inertia.z), damp[0] * per(bike.inertia.z));
+    let spin = w.dot(ahead);
+    let rolled = spin + dt * (k * off - c * spin) / (1.0 + c * dt + k * dt * dt);
+    let mut w = w + ahead * (rolled - spin);
+    // Pitch about its left, level (nose down positive); yaw about the
+    // vertical.
+    let (stick, steer) = controls.map_or((0.0, 0.0), |c| {
+        (c.throttle.clamp(-1.0, 1.0), c.steer.clamp(-1.0, 1.0))
+    });
+    for (axis, inertia, damp, push) in [
+        (Vec3::Y.cross(ahead), bike.inertia.x, damp[1], stick * air.0),
+        (Vec3::Y, bike.inertia.y, damp[2], steer * air.1),
+    ] {
+        let spin = w.dot(axis);
+        let to = (spin + dt * push * per(inertia)) / (1.0 + damp * per(inertia) * dt);
+        w += axis * (to - spin);
+    }
+    w
+}
+
 /// Queries that see everything but ragdolls and rubble.
 fn solid<'a>() -> r::QueryFilter<'a> {
     r::QueryFilter::default().groups(r::InteractionGroups::new(
@@ -947,6 +1230,8 @@ pub struct Physics {
     statics: HashMap<StaticKey, r::ColliderHandle>,
     /// What each static collider belongs to.
     keys: HashMap<r::ColliderHandle, StaticKey>,
+    /// What each static's triangles are made of ([`CollisionShape::surfaces`]).
+    surfaces: HashMap<r::ColliderHandle, CollisionShape>,
     controller: KinematicCharacterController,
     vehicles: Vec<Option<VehicleBody>>,
     ragdolls: Vec<Option<Ragdoll>>,
@@ -1005,6 +1290,7 @@ impl Physics {
             world: r::PhysicsWorld::default(),
             statics: HashMap::new(),
             keys: HashMap::new(),
+            surfaces: HashMap::new(),
             controller,
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
@@ -1039,11 +1325,15 @@ impl Physics {
         let handle = self.world.insert_collider(collider, None);
         self.statics.insert(key, handle);
         self.keys.insert(handle, key);
+        if !shape.surfaces.is_empty() {
+            self.surfaces.insert(handle, shape.clone());
+        }
     }
 
     pub fn remove_static(&mut self, key: StaticKey) {
         if let Some(h) = self.statics.remove(&key) {
             self.keys.remove(&h);
+            self.surfaces.remove(&h);
             self.world.remove_collider(h);
         }
     }
@@ -1089,7 +1379,8 @@ impl Physics {
     /// drives them as asked: each point of a hull's waterline under the
     /// surface lifts it as deep as it is (the hull's whole weight with its
     /// origin [`FLOAT_DEPTH`] under), and in the water a boat is pushed and
-    /// steered, slowed, kept from sliding sideways and stopped rocking.
+    /// steered, slowed along, across and up and down as its template's
+    /// drag says ([`BoatTuning`]), and stopped rocking.
     fn float_boats(&mut self, dt: f32) {
         let Some(water) = self.water else {
             return;
@@ -1150,21 +1441,21 @@ impl Physics {
             let mut along = velocity.dot(ahead);
             let throttle = c.throttle.clamp(-1.0, 1.0);
             let against = throttle * along < -0.5;
-            let top = if throttle >= 0.0 { v.top } else { BOAT_REVERSE };
-            if throttle != 0.0 && !against && !c.brake && !c.parked {
-                let headroom = (1.0 - along.abs() / top).clamp(0.0, 1.0);
-                along += throttle * BOAT_PUSH * headroom * dt * wet;
+            let w = hull.water;
+            // Its engine pulls the way the throttle asks (against the way
+            // it goes as well, so a boat with no brake stops); its drag
+            // along holds it at its top speed ahead; backing up, it goes
+            // no faster than its template's reverse top speed.
+            if throttle != 0.0 && !c.brake && !c.parked {
+                along += throttle * w.push(along, v.top, throttle < 0.0) * dt * wet;
             }
-            let slowing = if c.brake || c.parked || against {
-                BOAT_BRAKE
-            } else if throttle == 0.0 {
-                BOAT_COAST
-            } else {
-                0.0
-            };
-            along *= ease(slowing);
-            let across = velocity.dot(side) * ease(BOAT_KEEL);
-            let rise = velocity.y * ease(BOAT_HEAVE);
+            let braking = c.brake || c.parked || against;
+            along *= ease(w.drag[0] + if braking { w.brake } else { 0.0 });
+            if throttle < 0.0 && !braking {
+                along = along.max(-w.reverse_speed);
+            }
+            let across = velocity.dot(side) * ease(w.drag[1]);
+            let rise = velocity.y * ease(w.drag[2]);
             b.set_linvel(vector(ahead * along + side * across + Vec3::Y * rise), true);
             // The rudder bites as the water goes by (the other way round
             // backing up), a little with the throttle open at a standstill;
@@ -1427,7 +1718,15 @@ impl Physics {
         let body = self.world.insert_body(
             r::RigidBodyBuilder::dynamic()
                 .pose(pose(position, rotation))
-                .linear_damping(0.1)
+                // A boat's water drag slows it instead
+                // ([`Physics::float_boats`]).
+                .linear_damping(if spec.is_boat() {
+                    0.0
+                } else if spec.is_helicopter() {
+                    0.1
+                } else {
+                    GROUND_DAMPING
+                })
                 .angular_damping(0.5)
                 .can_sleep(false)
                 .ccd_enabled(true),
@@ -1467,16 +1766,32 @@ impl Physics {
         let mut controller = DynamicRayCastVehicleController::new(body);
         controller.index_up_axis = 1;
         controller.index_forward_axis = 2;
-        let tuning = WheelTuning {
-            suspension_stiffness: 40.0,
-            suspension_compression: 2.0,
-            suspension_damping: 3.0,
-            max_suspension_travel: SUSPENSION,
-            side_friction_stiffness: 1.0,
-            friction_slip: 2.0,
-            max_suspension_force: spec.mass * 40.0,
+        // Each axle's tyres grip as its template's side friction says (the
+        // steering axle's as the front's).
+        let handling = spec.tuning.handling.filter(|_| !spec.tracked);
+        let grip = |front: bool| handling.map_or(GRIP, |h| if front { h.grip.0 } else { h.grip.1 });
+        // Its springs and dampers as its template's, each axle's own.
+        let spring = |front: bool| {
+            handling.map_or((SPRING, DAMPING), |h| {
+                let (k, c) = if front {
+                    (h.spring.0, h.damping.0)
+                } else {
+                    (h.spring.1, h.damping.1)
+                };
+                (k, (c, c))
+            })
         };
         for w in &spec.wheels {
+            let (stiffness, (squeezed, stretched)) = spring(w.steers);
+            let tuning = WheelTuning {
+                suspension_stiffness: stiffness,
+                suspension_compression: squeezed,
+                suspension_damping: stretched,
+                max_suspension_travel: SUSPENSION,
+                side_friction_stiffness: 1.0,
+                friction_slip: grip(w.steers),
+                max_suspension_force: spec.mass * 40.0,
+            };
             controller.add_wheel(
                 vector(w.centre + Vec3::Y * SUSPENSION),
                 -r::Vector::Y,
@@ -1500,6 +1815,7 @@ impl Physics {
             Hull {
                 points,
                 controls: VehicleControls::default(),
+                water: spec.tuning.boat.unwrap_or(BOAT),
             }
         });
         let rotor = spec
@@ -1521,8 +1837,21 @@ impl Physics {
             mass: spec.mass,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
             tracked: spec.tracked,
-            bike: spec.is_bike(),
+            bike: spec.is_bike().then(|| Bike {
+                tuning: spec.tuning.bike.unwrap_or(BIKE),
+                inertia: inertia / m.max(1.0),
+            }),
             top: spec.tuning.max_speed.unwrap_or(top),
+            reverse_top: match spec.tuning.engine {
+                Some(e) if !spec.tracked => e.reverse_speed,
+                _ => (spec.tuning.max_speed.unwrap_or(top) * 0.5).min(REVERSE_SPEED),
+            },
+            engine: spec.tuning.engine.filter(|_| !spec.tracked),
+            tracks: spec.tuning.tracks,
+            gear: 0,
+            clutch: 0.0,
+            handling: spec.tuning.handling.filter(|_| !spec.tracked),
+            steering: 0.0,
             wrecked: false,
             held: false,
             before: Vec3::ZERO,
@@ -1575,18 +1904,50 @@ impl Physics {
         let slowing = |decel: f32| v.mass * decel * dt / wheels;
         let throttle = controls.throttle.clamp(-1.0, 1.0);
         let against = speed.abs() > 0.5 && throttle * speed < 0.0;
-        // Accelerates at about 4 m/s² flat out, slower near top speed;
-        // backs up at half its top speed, at most 8 m/s.
+        // Its gearbox changes up and down as its template's shift speeds
+        // say, rolling forwards, and while its clutch is out its engine
+        // drives nothing (the clutch's delay read so, inferred).
+        if let Some(e) = v.engine {
+            if v.clutch > 0.0 {
+                v.clutch -= dt;
+            } else {
+                let next = e.shift(v.gear, speed.max(0.0));
+                if next != v.gear {
+                    v.gear = next;
+                    v.clutch = e.clutch_delay;
+                }
+            }
+        }
+        let declutched = v.clutch > 0.0 && throttle > 0.0;
+        // Pulls as its engine turns in the gear it is in, or as its
+        // tracks' curve says (else 4 m/s² falling to nothing at the
+        // top), up to its top speed; backs up to its reverse top speed
+        // (else half its top speed, at most 8 m/s).
         let top = if throttle >= 0.0 {
             v.top
         } else {
-            (v.top * 0.5).min(REVERSE_SPEED)
+            v.reverse_top
         };
         let headroom = (1.0 - speed.abs() / top).clamp(0.0, 1.0);
+        let ease = ((top - speed.abs()) / TOP_EASE).clamp(0.0, 1.0);
+        let push = match (v.engine, v.tracks) {
+            (Some(_), _) if declutched => 0.0,
+            (Some(e), _) => e.push_in(v.gear, speed.abs(), throttle < 0.0) / v.mass * ease,
+            (None, Some(curve)) => TRACK_PULL * track_pull(curve, 1.0 - headroom) * ease,
+            (None, None) => TRACK_PULL * headroom,
+        };
         // Uphill (the way it is driven), the pull that holds it as on the
         // flat, up to its steepest hill (tracks hold it by their grip).
         let most = if v.tracked { 0.0 } else { CLIMB };
         let uphill = (nose * throttle.signum()).clamp(0.0, most.sin());
+        // Braking against the motion: each axle as its template's brake
+        // says (else 8 m/s²), the front's on the wheels that steer.
+        let service = |front: bool| {
+            let decel = v
+                .handling
+                .map_or(SERVICE_BRAKE, |h| if front { h.brake.0 } else { h.brake.1 });
+            slowing(decel * throttle.abs())
+        };
         let (force, brake) = if controls.parked {
             let hard = if speed.abs() > PARKED_FAST {
                 HOLD
@@ -1597,17 +1958,29 @@ impl Physics {
         } else if controls.brake {
             (0.0, slowing(ROLLING))
         } else if against {
-            (0.0, slowing(SERVICE_BRAKE * throttle.abs()))
+            (0.0, -1.0)
         } else if throttle != 0.0 {
-            let pull = 4.0 * headroom + GRAVITY * uphill;
+            let pull = push + GRAVITY * uphill;
             (throttle * v.mass * pull / wheels, 0.0)
         } else if speed.abs() < 1.0 {
             (0.0, slowing(HOLD))
         } else {
             (0.0, slowing(ROLLING))
         };
-        let steer = controls.steer.clamp(-1.0, 1.0) * MAX_STEER / (1.0 + speed.abs() * 0.04);
-        let steer = if v.tracked { 0.0 } else { steer };
+        // Its template's lock at a standstill, less as it speeds up (the
+        // fall with speed invented); the wheels swing there as quickly
+        // as its template says at this speed (else at once).
+        let lock = v.handling.map_or(MAX_STEER, |h| h.steer_lock);
+        let want = controls.steer.clamp(-1.0, 1.0) * lock / (1.0 + speed.abs() * 0.04);
+        let want = if v.tracked { 0.0 } else { want };
+        v.steering = match v.handling {
+            Some(h) => {
+                let most = h.swing(speed) * dt;
+                v.steering + (want - v.steering).clamp(-most, most)
+            }
+            None => want,
+        };
+        let steer = v.steering;
         let tracked = v
             .tracked
             .then(|| (v.controller.chassis, controls.steer.clamp(-1.0, 1.0)));
@@ -1620,6 +1993,8 @@ impl Physics {
             w.steering = if front { steer } else { 0.0 };
             w.brake = if controls.brake && !front {
                 slowing(HANDBRAKE)
+            } else if brake < 0.0 {
+                service(front)
             } else {
                 brake
             };
@@ -1632,28 +2007,26 @@ impl Physics {
             .count()
             >= 2;
         let mass = v.mass;
-        // A motorbike stays upright, leaning into the turn (the stand
-        // holds it up parked).
-        if v.bike
+        // A motorbike holds itself up as its template says, towards the
+        // lean that balances its turn; gravity and its tyres do the rest
+        // (it can fall over).
+        let airborne = !v
+            .controller
+            .wheels()
+            .iter()
+            .any(|w| w.raycast_info().is_in_contact);
+        if let Some(bike) = v.bike
             && let Some(body) = self.world.bodies.get_mut(v.controller.chassis)
         {
-            let turn = Quat::from_array(body.position().rotation.to_array());
-            let ahead = turn * Vec3::Z;
-            let up = turn * Vec3::Y;
-            let flat = ahead.with_y(0.0).normalize_or(Vec3::Z);
-            // Steering left (positive, as the wheels turn) leans it left.
-            let lean = controls.steer.clamp(-1.0, 1.0)
-                * BIKE_LEAN
-                * (speed.abs() / BIKE_LEAN_SPEED).min(1.0);
-            let want = Quat::from_axis_angle(flat, -lean) * Vec3::Y;
-            // Turning about `flat` the positive way tips the top this way
-            // (to its right).
-            let right = flat.cross(Vec3::Y);
-            let error = (up - want).dot(right);
-            let w = vec3(body.angvel());
-            let roll = w.dot(flat);
-            let fix = -error * BIKE_EASE;
-            body.set_angvel(vector(w + flat * (fix - roll)), true);
+            let w = balance(
+                bike,
+                Quat::from_array(body.position().rotation.to_array()),
+                vec3(body.linvel()),
+                vec3(body.angvel()),
+                airborne.then_some(controls),
+                dt,
+            );
+            body.set_angvel(vector(w), true);
         }
         // Tracks turn the hull on the spot (one track forward, the other
         // back), so the yaw is set directly; a little slower on the move.
@@ -1720,6 +2093,29 @@ impl Physics {
                     .wheels()
                     .iter()
                     .map(|w| (w.steering, w.rotation))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// How far each of a vehicle's springs is compressed from its rest
+    /// length, metres (0 for a wheel off the ground).
+    pub fn vehicle_suspension(&self, id: VehicleId) -> Vec<f32> {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map(|v| {
+                v.controller
+                    .wheels()
+                    .iter()
+                    .map(|w| {
+                        let ray = w.raycast_info();
+                        if ray.is_in_contact {
+                            w.suspension_rest_length - ray.suspension_length
+                        } else {
+                            0.0
+                        }
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -1894,6 +2290,16 @@ impl Physics {
             .get(id.0)
             .and_then(Option::as_ref)
             .map_or(0.0, |v| v.controller.current_vehicle_speed)
+    }
+
+    /// The forward gear a wheeled vehicle's engine drives in (0 is first)
+    /// and how fast that engine turns in it, rpm; `None` without an
+    /// engine from its template.
+    pub fn vehicle_gear(&self, id: VehicleId) -> Option<(usize, f32)> {
+        let v = self.vehicles.get(id.0).and_then(Option::as_ref)?;
+        let e = v.engine?;
+        let speed = v.controller.current_vehicle_speed.abs();
+        Some((v.gear, e.rpm_at(e.gears[v.gear], speed)))
     }
 
     /// Makes a vehicle a wreck: burst tyres and bent axles no longer carry
@@ -2323,6 +2729,29 @@ impl Physics {
         Some((hit.time_of_impact, vec3(hit.normal), key))
     }
 
+    /// [`cast_ray_keyed`](Self::cast_ray_keyed), with what the triangle it
+    /// strikes is made of (a surface name hash, [`crate::surface`]; 0 for
+    /// none known or not a static).
+    pub fn cast_ray_surface(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max: f32,
+    ) -> Option<(f32, Vec3, Option<StaticKey>, u32)> {
+        let ray = r::Ray::new(vector(origin), vector(direction.normalize_or_zero()));
+        let (handle, hit) = self
+            .world
+            .query_pipeline_with_filter(solid())
+            .cast_ray_and_get_normal(&ray, max, true)?;
+        let key = self.keys.get(&handle).copied();
+        // A triangle mesh names the triangle struck as the hit's sub-shape.
+        let surface = self
+            .surfaces
+            .get(&handle)
+            .map_or(0, |shape| shape.surface_of(hit.subshape));
+        Some((hit.time_of_impact, vec3(hit.normal), key, surface))
+    }
+
     /// [`cast_ray`](Self::cast_ray) that passes through the statics whose
     /// keys `skip` picks: the ground under a building that is coming down.
     pub fn cast_ray_skipping(
@@ -2421,6 +2850,54 @@ mod tests {
             Vec3::new(x, y, z),
             Quat::IDENTITY,
         );
+    }
+
+    #[test]
+    fn meshes_keep_their_triangles_surfaces_past_dropped_ones() {
+        let v = [Vec3::ZERO, Vec3::X, Vec3::Z, Vec3::new(1.0, 0.0, 1.0)];
+        // The second triangle is degenerate and dropped; the runs follow
+        // the triangles kept.
+        let shape =
+            CollisionShape::mesh_of(&v, &[[0, 1, 2], [0, 0, 1], [1, 3, 2]], &[7, 8, 9]).unwrap();
+        assert_eq!(shape.triangles, 2);
+        assert_eq!(&shape.surfaces[..], &[(0, 7), (1, 9)]);
+        assert_eq!((shape.surface_of(0), shape.surface_of(1)), (7, 9));
+        // Past the count, faces wrap round.
+        assert_eq!(shape.surface_of(3), 9);
+        // Nothing said, nothing kept.
+        assert!(
+            CollisionShape::mesh(&v, &[[0, 1, 2]])
+                .unwrap()
+                .surfaces
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rays_find_the_surface_of_the_triangle_they_strike() {
+        let mut p = Physics::new();
+        // Two halves of a 4 m floor: dirt on the -x side, rock on the +x.
+        let v = [
+            Vec3::new(-2.0, 0.0, -2.0),
+            Vec3::new(0.0, 0.0, -2.0),
+            Vec3::new(0.0, 0.0, 2.0),
+            Vec3::new(-2.0, 0.0, 2.0),
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, 2.0),
+        ];
+        let tris = [[0, 2, 1], [0, 3, 2], [1, 2, 5], [1, 5, 4]];
+        let shape = CollisionShape::mesh_of(&v, &tris, &[11, 11, 22, 22]).unwrap();
+        p.add_static(StaticKey::Cell(5), &shape, Vec3::ZERO, Quat::IDENTITY);
+        p.step(DT);
+        let down =
+            |p: &Physics, x: f32| p.cast_ray_surface(Vec3::new(x, 3.0, 0.5), Vec3::NEG_Y, 10.0);
+        let (t, _, key, surface) = down(&p, -1.0).unwrap();
+        assert!((t - 3.0).abs() < 1e-3);
+        assert_eq!((key, surface), (Some(StaticKey::Cell(5)), 11));
+        assert_eq!(down(&p, 1.0).unwrap().3, 22);
+        p.remove_static(StaticKey::Cell(5));
+        p.step(DT);
+        assert!(down(&p, 1.0).is_none());
     }
 
     fn walk(physics: &Physics, c: &mut Character, velocity: Vec3, seconds: f32) {
@@ -2656,6 +3133,7 @@ mod tests {
             hull: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2)),
             turret_box: None,
             rotors: Vec::new(),
+            damage: None,
             tuning: crate::VehicleTuning::default(),
         }
     }
@@ -2783,6 +3261,125 @@ mod tests {
         assert!(m.transform_vector3(Vec3::Y).y > 0.8, "still up");
     }
 
+    /// The Offroad Motorcycle (AL)'s `Bike*` fields, the weakest.
+    const OFFROAD: BikeTuning = BikeTuning {
+        roll: 10.0,
+        damp: [6.0, 10.0, 0.0],
+        air: (2.0, 1.5),
+    };
+
+    #[test]
+    fn the_weakest_bike_template_stands_back_up_after_a_shove() {
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(2000.0, 1.0, 2000.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let wheel = |z: f32| crate::vehicle::WheelSpec {
+            centre: Vec3::new(0.0, 0.3, z),
+            radius: 0.3,
+            width: 0.15,
+            steers: z > 0.0,
+        };
+        let hull = (Vec3::new(-0.45, 0.0, -1.1), Vec3::new(0.45, 1.3, 1.1));
+        let mut bike = VehicleSpec {
+            wheels: vec![wheel(0.7), wheel(-0.75)],
+            bounds: hull,
+            hull,
+            mass: 300.0,
+            ..car()
+        };
+        bike.tuning.bike = Some(OFFROAD);
+        let id = p.add_vehicle(&bike, Vec3::new(0.0, 0.2, 0.0), 0.0);
+        let up = |p: &Physics| p.vehicle_transform(id).unwrap().transform_vector3(Vec3::Y);
+        let ahead = VehicleControls {
+            throttle: 1.0,
+            ..Default::default()
+        };
+        for _ in 0..240 {
+            p.drive(id, ahead);
+            p.step(DT);
+        }
+        assert!(up(&p).y > 0.99, "upright riding");
+        let m = p.vehicle_transform(id).unwrap();
+        let at = m.transform_point3(Vec3::Y);
+        p.push_vehicle(id, m.transform_vector3(Vec3::X) * 300.0 * 1.5, at);
+        let mut most = 1.0f32;
+        for _ in 0..180 {
+            p.drive(id, ahead);
+            p.step(DT);
+            most = most.min(up(&p).y);
+        }
+        assert!(most < 0.995, "the shove rolls it ({most})");
+        assert!(most > 0.5, "without tipping it over ({most})");
+        assert!(up(&p).y > 0.9986, "back up within 3 degrees in 3 s");
+    }
+
+    #[test]
+    fn a_bike_leans_into_its_turn_and_turns_in_the_air_as_its_template_says() {
+        let bike = Bike {
+            tuning: OFFROAD,
+            inertia: Vec3::new(0.7, 0.6, 0.24),
+        };
+        // Upright at 10 m/s ahead (+z), turning left (+y) 1 rad/s: it
+        // rolls left, about -z.
+        let w = balance(bike, Quat::IDENTITY, Vec3::Z * 10.0, Vec3::Y, None, DT);
+        assert!(w.z < -0.1, "{w}");
+        // Leaned as far as that turn balances (45 degrees: 10 m/s² of
+        // pull), it holds there.
+        let leaned = Quat::from_rotation_z(-std::f32::consts::FRAC_PI_4);
+        let pull = GRAVITY / 10.0;
+        let w = balance(bike, leaned, Vec3::Z * 10.0, Vec3::Y * pull, None, DT);
+        assert!(w.z.abs() < 1e-3, "{w}");
+        // In the air the throttle dips its nose (+x) and the stick turns
+        // it left (+y): at most control / damp rad/s, its nose's 0.2.
+        let air = Some(VehicleControls {
+            throttle: 1.0,
+            steer: 1.0,
+            ..Default::default()
+        });
+        let mut w = Vec3::ZERO;
+        for _ in 0..600 {
+            w = balance(bike, Quat::IDENTITY, Vec3::ZERO, w, air, DT);
+        }
+        assert!((w.x - 0.2).abs() < 1e-3, "{w}");
+        assert!(w.y > 1.0, "{w}");
+        // On the ground the stick does nothing to its pitch or yaw.
+        let w = balance(bike, Quat::IDENTITY, Vec3::ZERO, Vec3::ZERO, None, DT);
+        assert_eq!(w, Vec3::ZERO);
+    }
+
+    #[test]
+    fn the_stiffest_bike_settles_without_ringing() {
+        // The street `Motorcycle`'s 250 and 50, over a 0.2 m² roll
+        // inertia: stepped explicitly it would overshoot each step.
+        let bike = Bike {
+            tuning: BikeTuning {
+                roll: 250.0,
+                damp: [50.0, 10.0, 1.0],
+                air: (5.0, 1.5),
+            },
+            inertia: Vec3::new(0.7, 0.6, 0.2),
+        };
+        let mut lean = 0.3f32;
+        let mut spin = 0.0;
+        for _ in 0..120 {
+            let turn = Quat::from_rotation_z(lean);
+            let w = balance(bike, turn, Vec3::ZERO, Vec3::Z * spin, None, DT);
+            spin = w.z;
+            let before = lean;
+            lean += spin * DT;
+            assert!(
+                lean.abs() <= before.abs() + 1e-6,
+                "rings: {before} to {lean}"
+            );
+        }
+        assert!(lean.abs() < 0.01, "settled at {lean}");
+    }
+
     #[test]
     fn a_helicopter_climbs_flies_turns_and_falls_unflown() {
         let mut p = Physics::new();
@@ -2871,6 +3468,62 @@ mod tests {
             p.step(DT);
         }
         assert!(p.vehicle_velocity(id).y < -5.0, "falls");
+    }
+
+    /// The Speed Boat's `_BoatPhysics` (gap round 17): flat out it
+    /// settles at its `MaxSpeed`, backing up at its `MaxSpeedReverse`,
+    /// and coasting and braking the water slows it at its drag's rate.
+    #[test]
+    fn a_boat_goes_and_slows_as_its_template_says() {
+        let spec = VehicleSpec {
+            tuning: crate::VehicleTuning {
+                max_speed: Some(120.0 / 3.6),
+                boat: Some(BoatTuning {
+                    reverse_speed: 40.0 / 3.6,
+                    torque: (1000.0, 500.0),
+                    drag: [0.2, 2.0, 2.0],
+                    brake: 3.0,
+                    curve: [1.0, 0.7, 0.6, 0.5],
+                }),
+                ..crate::VehicleTuning::default()
+            },
+            ..boat()
+        };
+        let run = |throttle: f32, brake: bool, secs: f32, from: Option<f32>| {
+            let mut p = Physics::new();
+            p.set_water(0.0);
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.5, 0.0), 0.0);
+            for _ in 0..300 {
+                p.drive(id, VehicleControls::default());
+                p.step(DT);
+            }
+            if let Some(v) = from {
+                let up = p.vehicle_velocity(id).y;
+                p.set_vehicle_velocity(id, Vec3::new(0.0, up, v));
+            }
+            for _ in 0..(secs / DT) as usize {
+                let c = VehicleControls {
+                    throttle,
+                    brake,
+                    ..VehicleControls::default()
+                };
+                p.drive(id, c);
+                p.step(DT);
+            }
+            p.vehicle_velocity(id).z
+        };
+        let ahead = run(1.0, false, 40.0, None);
+        assert!((ahead - 33.33).abs() < 0.7, "ahead {ahead}");
+        let astern = run(-1.0, false, 30.0, None);
+        assert!((astern + 11.11).abs() < 0.3, "astern {astern}");
+        // From 8 m/s for a second: e^-0.2 and e^-(0.2 + 3) of it.
+        let coast = run(0.0, false, 1.0, Some(8.0));
+        assert!((coast - 8.0 * (-0.2f32).exp()).abs() < 0.2, "coast {coast}");
+        let braked = run(0.0, true, 1.0, Some(8.0));
+        assert!(
+            (braked - 8.0 * (-3.2f32).exp()).abs() < 0.1,
+            "braked {braked}"
+        );
     }
 
     #[test]
@@ -2976,11 +3629,12 @@ mod tests {
             );
             p.step(DT);
         }
-        // The beach comes out of the water at z 241.
+        // The beach comes out of the water at z 241; it runs up it at its
+        // top speed (18 m/s since gap round 17, 13 before) and slides on.
         let m = place(&p);
         assert!(p.vehicle_speed(id).abs() < 2.0, "{}", p.vehicle_speed(id));
         assert!(
-            (215.0..250.0).contains(&m.w_axis.z),
+            (215.0..265.0).contains(&m.w_axis.z),
             "aground at {}",
             m.w_axis
         );
@@ -3243,6 +3897,140 @@ mod tests {
         );
     }
 
+    // Round 18: with the M151's engine and gearbox it reaches its
+    // template's 85 km/h in seconds and holds there (it used to level
+    // off at 60% of it), and backs up no faster than its 55 km/h.
+    #[test]
+    fn an_engine_drives_a_car_to_its_max_speed() {
+        let engine = crate::tuning::EngineTuning {
+            torque: 130.0,
+            rpm: (900.0, 3000.0, 12000.0),
+            upshift: 4000.0,
+            downshift: 2500.0,
+            clutch_delay: 0.0,
+            primary: 3.5,
+            gears: [4.0, 3.1, 2.4, 2.0, 1.5],
+            reverse: 3.7,
+            radius: 0.39,
+            torque_at: (0.8, 1.0),
+            reverse_speed: 55.0 / 3.6,
+        };
+        let spec = VehicleSpec {
+            mass: 1000.0,
+            tuning: crate::VehicleTuning {
+                max_speed: Some(85.0 / 3.6),
+                engine: Some(engine),
+                ..Default::default()
+            },
+            ..car()
+        };
+        let run = |throttle: f32, seconds: f32| {
+            let mut p = Physics::new();
+            floor(&mut p, 1, 0.0, 0.0, 0.0, 600.0);
+            p.step(DT);
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, -500.0 * throttle), 0.0);
+            let mut speeds = Vec::new();
+            for _ in 0..(seconds / DT) as usize {
+                p.drive(
+                    id,
+                    VehicleControls {
+                        throttle,
+                        ..Default::default()
+                    },
+                );
+                p.step(DT);
+                speeds.push(p.vehicle_speed(id).abs());
+            }
+            speeds
+        };
+        let ahead = run(1.0, 15.0);
+        let top = 85.0 / 3.6;
+        let reached = ahead.iter().position(|&s| s > 0.9 * top);
+        assert!(
+            reached.is_some_and(|i| (i as f32) * DT < 10.0),
+            "{reached:?}"
+        );
+        let fastest = ahead.iter().copied().fold(0.0, f32::max);
+        assert!(fastest < top * 1.03, "{fastest}");
+        let back = run(-1.0, 12.0);
+        let fastest = back.iter().copied().fold(0.0, f32::max);
+        assert!(fastest > 0.8 * engine.reverse_speed, "{fastest}");
+        assert!(fastest < engine.reverse_speed * 1.03, "{fastest}");
+    }
+
+    // Gap round 24: with its template's clutch delay, its gearbox changes
+    // up one gear at a time as it speeds up, and for that long after
+    // each change its engine drives nothing, so it gathers no speed.
+    #[test]
+    fn a_change_of_gear_takes_its_clutch_delay() {
+        let engine = crate::tuning::EngineTuning {
+            torque: 130.0,
+            rpm: (900.0, 3000.0, 12000.0),
+            upshift: 4000.0,
+            downshift: 2500.0,
+            clutch_delay: 0.5,
+            primary: 3.5,
+            gears: [4.0, 3.1, 2.4, 2.0, 1.5],
+            reverse: 3.7,
+            radius: 0.39,
+            torque_at: (0.8, 1.0),
+            reverse_speed: 55.0 / 3.6,
+        };
+        let spec = VehicleSpec {
+            mass: 1000.0,
+            tuning: crate::VehicleTuning {
+                max_speed: Some(85.0 / 3.6),
+                engine: Some(engine),
+                ..Default::default()
+            },
+            ..car()
+        };
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 600.0);
+        p.step(DT);
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, -500.0), 0.0);
+        let mut steps = Vec::new();
+        for _ in 0..(12.0 / DT) as usize {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+            steps.push((
+                p.vehicle_gear(id).expect("an engine").0,
+                p.vehicle_speed(id),
+            ));
+        }
+        let first_change = steps.iter().position(|s| s.0 == 1).expect("changes up");
+        assert_eq!(steps[first_change - 1].0, 0);
+        // Over the delay that follows it gains next to nothing.
+        let after = steps[first_change + (0.4 / DT) as usize];
+        assert!(after.1 - steps[first_change].1 < 0.1, "{after:?}");
+        // Then it pulls again.
+        let later = steps[first_change + (1.0 / DT) as usize];
+        assert!(later.1 - after.1 > 0.5, "{later:?}");
+        // One gear at a time, never back down while it speeds up.
+        assert!(
+            steps
+                .windows(2)
+                .all(|w| w[1].0 == w[0].0 || w[1].0 == w[0].0 + 1)
+        );
+        assert!(steps.last().expect("steps").0 >= 3);
+    }
+
+    #[test]
+    fn tracks_pull_along_their_curve() {
+        let curve = [1.0, 0.45, 0.3, 0.1];
+        assert_eq!(track_pull(curve, 0.0), 1.0);
+        assert!((track_pull(curve, 1.0 / 3.0) - 0.45).abs() < 1e-5);
+        assert!((track_pull(curve, 0.5) - 0.375).abs() < 1e-5);
+        assert!((track_pull(curve, 1.0) - 0.1).abs() < 1e-5);
+        assert!((track_pull(curve, 2.0) - 0.1).abs() < 1e-5);
+    }
+
     #[test]
     fn cars_settle_drive_and_steer() {
         let mut p = Physics::new();
@@ -3312,6 +4100,177 @@ mod tests {
         assert!(p.vehicle_speed(id).abs() < 0.5, "{}", p.vehicle_speed(id));
         p.remove_vehicle(id);
         assert!(p.vehicle_transform(id).is_none());
+    }
+
+    // A car whose template gives its brakes and lock slows as its brakes
+    // say (the mean of its axles' m/s²) and turns its front wheels as
+    // far as its lock, not the invented 8 m/s² and 0.6 rad.
+    #[test]
+    fn brakes_and_lock_come_from_the_template() {
+        let slowing = |brake: (f32, f32), lock: f32| {
+            let mut spec = car();
+            spec.tuning.handling = Some(crate::tuning::Handling {
+                steer_lock: lock,
+                brake,
+                grip: (1.5, 1.5),
+                steer_speed: 100.0,
+                low_speed: 0.0,
+                low_steer_speed: 0.0,
+                spring: (40.0, 40.0),
+                damping: (2.5, 2.5),
+            });
+            let mut p = Physics::new();
+            floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
+            p.step(DT);
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, -400.0), 0.0);
+            for _ in 0..60 {
+                p.step(DT);
+            }
+            // Full lock at a standstill.
+            p.drive(
+                id,
+                VehicleControls {
+                    steer: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+            let steered = p.vehicle_wheels(id)[0].0;
+            while p.vehicle_speed(id) < 12.0 {
+                p.drive(
+                    id,
+                    VehicleControls {
+                        throttle: 1.0,
+                        ..Default::default()
+                    },
+                );
+                p.step(DT);
+            }
+            let (v0, mut t) = (p.vehicle_speed(id), 0.0);
+            while p.vehicle_speed(id) > 0.3 && t < 10.0 {
+                p.drive(
+                    id,
+                    VehicleControls {
+                        throttle: -1.0,
+                        ..Default::default()
+                    },
+                );
+                p.step(DT);
+                t += DT;
+            }
+            (steered, v0 / t)
+        };
+        let (lock, soft) = slowing((3.0, 1.0), 1.0);
+        assert!((lock - 1.0).abs() < 0.05, "{lock}");
+        assert!((soft - 2.0).abs() < 0.4, "{soft}");
+        let (lock, hard) = slowing((9.0, 7.0), 0.5);
+        assert!((lock - 0.5).abs() < 0.05, "{lock}");
+        assert!((hard - 8.0).abs() < 1.0, "{hard}");
+    }
+
+    // Its front wheels swing towards full lock as quickly as its template
+    // says (radians a second): `LowSpeedSteerSpeed` below its
+    // `LowSpeedLimit`, `SteerSpeed` above it; and back as quickly.
+    #[test]
+    fn wheels_swing_at_the_templates_steer_speed() {
+        let mut spec = car();
+        spec.tuning.handling = Some(crate::tuning::Handling {
+            steer_lock: 0.7,
+            brake: (7.0, 6.0),
+            grip: (1.5, 1.5),
+            steer_speed: 0.6,
+            low_speed: 35.0 / 3.6,
+            low_steer_speed: 0.9,
+            spring: (40.0, 40.0),
+            damping: (2.5, 2.5),
+        });
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
+        p.step(DT);
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, -400.0), 0.0);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        let steer = |p: &mut Physics, steer: f32, secs: f32| {
+            for _ in 0..(secs / DT).round() as usize {
+                p.drive(
+                    id,
+                    VehicleControls {
+                        steer,
+                        ..Default::default()
+                    },
+                );
+                p.step(DT);
+            }
+            p.vehicle_wheels(id)[0].0
+        };
+        // At a standstill: 0.9 rad/s, so 0.45 rad after half a second,
+        // full lock (0.7) by 0.8 s, and straight again 0.8 s later.
+        let half = steer(&mut p, 1.0, 0.5);
+        assert!((half - 0.45).abs() < 0.03, "{half}");
+        let full = steer(&mut p, 1.0, 0.5);
+        assert!((full - 0.7).abs() < 0.01, "{full}");
+        let back = steer(&mut p, 0.0, 0.8);
+        assert!(back.abs() < 0.01, "{back}");
+        // Above 35 km/h: 0.6 rad/s.
+        let h = spec.tuning.handling.expect("set");
+        assert_eq!(h.swing(5.0), 0.9);
+        assert_eq!(h.swing(-12.0), 0.6);
+    }
+
+    // Its springs and dampers are its template's, per kilogram: on four
+    // wheels of strength k it sits g / 4k down on them, and kicked
+    // downwards bounces back past its settled height after half a swing
+    // at sqrt(4k (1 - zeta^2)) rad/s, zeta = 4c / (2 sqrt(4k)).
+    #[test]
+    fn springs_and_dampers_come_from_the_template() {
+        let ride = |k: f32, c: f32| {
+            let mut spec = car();
+            spec.tuning.handling = Some(crate::tuning::Handling {
+                steer_lock: 0.7,
+                brake: (7.0, 6.0),
+                grip: (1.5, 1.5),
+                steer_speed: 0.6,
+                low_speed: 0.0,
+                low_steer_speed: 0.0,
+                spring: (k, k),
+                damping: (c, c),
+            });
+            let mut p = Physics::new();
+            floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
+            p.step(DT);
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, -400.0), 0.0);
+            for _ in 0..180 {
+                p.step(DT);
+            }
+            let sag = p.vehicle_suspension(id).iter().sum::<f32>() / 4.0;
+            let height = |p: &Physics| p.vehicle_transform(id).expect("car").w_axis.y;
+            let rest = height(&p);
+            let v = p.vehicle_velocity(id);
+            p.set_vehicle_velocity(id, v - Vec3::Y * 0.3);
+            let mut t = 0.0;
+            loop {
+                p.step(DT);
+                t += DT;
+                if height(&p) >= rest || t > 2.0 {
+                    break;
+                }
+            }
+            (sag, t)
+        };
+        let half = |k: f32, c: f32| {
+            let w = (4.0 * k).sqrt();
+            let zeta = 4.0 * c / (2.0 * w);
+            std::f32::consts::PI / (w * (1.0 - zeta * zeta).sqrt())
+        };
+        // An M151's 25 and 1.7: 9.8 cm down, back up after 0.34 s.
+        let (sag, t) = ride(25.0, 1.7);
+        assert!((sag - 9.81 / 100.0).abs() < 0.01, "{sag}");
+        assert!((t - half(25.0, 1.7)).abs() < 0.04, "{t}");
+        // A sports car's 60 and 3: 4.1 cm, 0.22 s.
+        let (sag, t) = ride(60.0, 3.0);
+        assert!((sag - 9.81 / 240.0).abs() < 0.01, "{sag}");
+        assert!((t - half(60.0, 3.0)).abs() < 0.04, "{t}");
     }
 
     #[test]
@@ -3557,6 +4516,8 @@ mod tests {
             triangles: 12,
             stand_in: false,
             loose: None,
+            whole: None,
+            surfaces: Arc::new([]),
         };
         let base = Vec3::new(0.0, 0.0, 12.0);
         p.add_static(StaticKey::Object(7), &pole, base, Quat::IDENTITY);
