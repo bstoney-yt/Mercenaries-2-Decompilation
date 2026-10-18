@@ -303,6 +303,9 @@ pub struct Player {
     pub binoculars: Option<Binoculars>,
     /// Picking a weapon up: the clip and seconds in (she stands).
     pub picking: Option<(usize, f32)>,
+    /// Changing the clip ([`Player::start_reload`]): the clip and seconds
+    /// in, over her upper body.
+    pub reloading: Option<(usize, f32)>,
 }
 
 impl Player {
@@ -342,6 +345,7 @@ impl Player {
             shown: InHand::default(),
             switching: None,
             picking: None,
+            reloading: None,
             binoculars: None,
         }
     }
@@ -370,6 +374,7 @@ impl Player {
         self.bashing = None;
         self.switching = None;
         self.picking = None;
+        self.reloading = None;
         // The rifle's clips are the ones just given: another class held
         // takes its own.
         self.shown = InHand::default();
@@ -436,6 +441,7 @@ impl Player {
         self.throwing = None;
         self.bashing = None;
         self.picking = None;
+        self.reloading = None;
         // A switch under way is over: she holds what the fight has up.
         if self.switching.take().is_some() {
             let now = self.in_hand;
@@ -459,6 +465,24 @@ impl Player {
         self.model.as_ref()?;
         self.throwing = Some(0.0);
         Some(release)
+    }
+
+    /// Starts changing the clip of what she holds: its class's
+    /// `ReloadRun` on the move, else its `ReloadIdle` ([`crate::held`]),
+    /// over her upper body. The clip's seconds, or `None` without one or
+    /// without her body (nothing plays).
+    pub fn start_reload(&mut self) -> Option<f32> {
+        let running = self.character.velocity.with_y(0.0).length() > RUNNING_JUMP;
+        let clip = self.moves.of(self.shown.class)?.reload_clip(running)?;
+        let (_, rig) = self.model.as_ref()?;
+        let length = rig.clips.get(clip)?.info.duration;
+        eprintln!(
+            "anim: reload {:08x} ({length:.2} s{})",
+            rig.clips[clip].hash,
+            if running { ", running" } else { "" }
+        );
+        self.reloading = Some((clip, 0.0));
+        Some(length)
     }
 
     /// Whether she is free to bash: not throwing, bashing or in a jump.
@@ -765,6 +789,20 @@ impl Player {
                 }
                 (Some(_), ..) => self.throwing = None,
                 _ => {}
+            }
+            // Changing the clip plays over the upper body too, where a
+            // switch or a throw doesn't (playtest 8: only its sound was
+            // heard).
+            if let Some((clip, t)) = &mut self.reloading {
+                *t += dt;
+                let busy = self.switching.is_some() || self.throwing.is_some() || !free;
+                match rig.upper.clone() {
+                    Some(mask) if *t < rig.clips[*clip].info.duration && !busy => {
+                        rig.animator.upper_at(*clip, mask, *t);
+                        rig.two_handed = false;
+                    }
+                    _ => self.reloading = None,
+                }
             }
             // Aimed, the weapon points where the crosshair does; the
             // launcher at rest points level the way she faces.
