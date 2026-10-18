@@ -6,7 +6,10 @@
 //! `FrontWheelSuspStrength`, `RearWheelSuspStrength`,
 //! `FrontWheelSuspDamp` and `RearWheelSuspDamp` give, and its template's
 //! `FrontWheelRadius` and `RearWheelRadius` beside the model's wheels
-//! (gap round 16).
+//! (gap round 16), and how far below the plane its tyres are drawn once
+//! settled (`sunk`, deepest and mean over its wheels; `SUNK_AT_MODEL=1`
+//! measures them where the model has them, as the alpha drew them before
+//! they followed their springs).
 //!
 //! ```text
 //! cargo run --release -p m2-engine --example susptest -- "<install dir>"
@@ -91,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "template\tcount\twheels\tk front\tk rear\tc front\tc rear\t\
          sag m\tdata Hz\tdata damped Hz\tHz\tdata zeta\tzeta\t\
-         data r front\tr front\tdata r rear\tr rear"
+         data r front\tr front\tdata r rear\tr rear\tsunk max m\tsunk mean m"
     );
     let (mut driven, mut skipped) = (0, 0);
     for ((model, record), ids) in &groups {
@@ -140,6 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ids.len(),
             spec.wheels.len()
         );
+        let sunk = sunk(&spec);
         let (sag, hz, z) = bounce(&spec);
         row += &format!(
             "\t{sag:.3}\t{:.2}\t{:.2}\t{hz:.2}\t{zeta:.2}\t{z:.2}",
@@ -151,6 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             radius(true),
             radius(false)
         );
+        row += &format!("\t{:.3}\t{:.3}", sunk.0, sunk.1);
         println!("{row}");
     }
     println!("driven {driven}, skipped {skipped}");
@@ -179,6 +184,41 @@ fn start(spec: &VehicleSpec) -> (Physics, VehicleId) {
         p.step(DT);
     }
     (p, id)
+}
+
+/// How far below the plane each wheel's tyre is drawn once settled, m
+/// (deepest and mean over its wheels; negative: above it): the lowest
+/// point of each wheel's circle as drawn, in the world.
+fn sunk(spec: &VehicleSpec) -> (f32, f32) {
+    let (p, id) = start(spec);
+    let Some(m) = p.vehicle_transform(id) else {
+        return (f32::NAN, f32::NAN);
+    };
+    // `SUNK_AT_MODEL=1`: the wheels where the model has them, as the
+    // alpha drew them before its wheels followed their springs.
+    let lift = if std::env::var("SUNK_AT_MODEL").is_ok() {
+        Vec::new()
+    } else {
+        p.vehicle_wheel_lift(id)
+    };
+    let depths: Vec<f32> = spec
+        .wheels
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let c = m.transform_point3(w.centre + Vec3::Y * lift.get(i).copied().unwrap_or(0.0));
+            // The circle's lowest point in the wheel's plane (axle along
+            // the model's x).
+            let axle = m.transform_vector3(Vec3::X).normalize();
+            let down = (Vec3::NEG_Y - axle * axle.dot(Vec3::NEG_Y)).normalize_or_zero();
+            -(c + down * w.radius).y
+        })
+        .collect();
+    let deepest = depths.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    (
+        deepest,
+        depths.iter().sum::<f32>() / depths.len().max(1) as f32,
+    )
 }
 
 /// Settled, then kicked [`KICK`] m/s down and watched [`WATCH`] s: its

@@ -72,6 +72,18 @@ pub const DRIVER_DOOR: u32 = 0x688c_4858;
 /// The marker outside the passenger's door.
 pub const PASSENGER_DOOR: u32 = 0x8869_e876;
 
+/// Material name hash of a vehicle's rear red lamps (the brake lights):
+/// the same name on 109 of the 200 vehicle models catalogued, every one
+/// a glowing technique (`PgDiffEmisFP`, 5 `PgDiffEmisAmbOccFP`) whose
+/// emissive colour is pure red (2 to 4, 0, 0), drawn by a left and a
+/// right node at the model's back (the 68 Valiant's at z -2.6, the
+/// Stryker's -3.3). Beside it, the same models share the headlights'
+/// material (0x35ca6ba7, white, at the front), an amber one (0xfbe7dabb)
+/// and on 14 a rear white one (0x066ad526, reversing lamps by their
+/// colour and place). The names are unread (none of 330,000 guesses
+/// such as `brakelight_l` hashed to them); which lamp does what is read from colour and place.
+pub const BRAKE_LAMP: u32 = 0xd85e_d9a4;
+
 /// Node name hashes of a helicopter's main rotor: the blades and the blur
 /// disc (texture `global_veh_rotorblur`), both centred on the hub. Shared
 /// by the UH-1 and the Mi-26 (hub at y 3.55 and 8.16).

@@ -1071,6 +1071,10 @@ struct Piece {
     /// model's coarser levels of detail aren't uploaded, so a cut-out LOD
     /// material isn't drawn with them.
     track: Vec<[f32; 2]>,
+    /// Per range, a brake lamp's material unlit (its glow off), drawn in
+    /// place of its own while the vehicle isn't braking
+    /// ([`GpuModel::braking`]); `None` for everything else.
+    unlit: Vec<Option<MaterialId>>,
     centre: Vec3,
     bones: Vec<u16>,
     node: Option<u16>,
@@ -1112,6 +1116,21 @@ pub struct GpuModel {
     /// The looks a person model can take ([`CpuModel::looks`]); each
     /// person's is drawn by [`draw_posed_as`](Self::draw_posed_as).
     pub looks: Option<std::sync::Arc<Looks>>,
+    /// A vehicle's brake lamps ([`m2_assets::vehicle::BRAKE_LAMP`]) glow
+    /// while it brakes and are dark otherwise; `None` draws them as the
+    /// data has them, glowing.
+    pub braking: Option<bool>,
+}
+
+/// A brake lamp's material ([`m2_assets::vehicle::BRAKE_LAMP`]) with its
+/// glow off: its emissive colour (constants 9 to 11) zero, so it draws
+/// as its texture alone. `None` for any other material.
+fn unlit_lamp(m: &Material) -> Option<Material> {
+    (m.name_hash == m2_assets::vehicle::BRAKE_LAMP).then(|| {
+        let mut off = m.clone();
+        off.constants[9..12].fill(0.0);
+        off
+    })
 }
 
 /// How far a track's texture moves per metre the track runs where its
@@ -1219,8 +1238,15 @@ impl GpuModel {
         cpu: &CpuModel,
     ) -> Result<Self, BackendError> {
         let mut ids = Vec::with_capacity(cpu.materials.len());
+        // Each brake lamp also unlit: its emissive colour (constants 9 to
+        // 11) off.
+        let mut unlit = Vec::with_capacity(cpu.materials.len());
         for m in &cpu.materials {
             ids.push(materials.material(backend, m)?);
+            unlit.push(match unlit_lamp(m) {
+                Some(off) => Some(materials.material(backend, &off)?),
+                None => None,
+            });
         }
         // Which model draws a tinted material, as its textures may never
         // all load to log it by.
@@ -1286,6 +1312,11 @@ impl GpuModel {
                         }
                     })
                     .collect(),
+                unlit: p
+                    .ranges
+                    .iter()
+                    .map(|&(_, _, m)| unlit.get(m).copied().flatten())
+                    .collect(),
                 // Kept in geometry space, so any transform places it.
                 centre: p.local.inverse().transform_point3(p.centre),
                 bones: p.bones.clone(),
@@ -1308,6 +1339,7 @@ impl GpuModel {
             parts_hidden: None,
             forced: Vec::new(),
             looks: cpu.looks.clone(),
+            braking: None,
         })
     }
 
@@ -1574,6 +1606,10 @@ impl GpuModel {
             if !keep(k) {
                 continue;
             }
+            let material = match piece.unlit.get(k) {
+                Some(&Some(off)) if self.braking == Some(false) => off,
+                _ => material,
+            };
             queue.push(Primitive {
                 call: DrawCall {
                     material,
@@ -1726,6 +1762,25 @@ mod tests {
         let glow = backend.material(m).emissive.unwrap();
         assert_eq!(glow.color, [4.0, 4.0, 2.5]);
         assert!(glow.map.is_some());
+        assert_eq!(unlit_lamp(&lamp), None);
+        // A brake lamp glows red as the data has it; unlit, not at all
+        // but drawn with its texture as before.
+        let mut brake = Material {
+            name_hash: m2_assets::vehicle::BRAKE_LAMP,
+            ..lamp.clone()
+        };
+        brake.constants[9..12].copy_from_slice(&[3.0, 0.0, 0.0]);
+        let lit = cache.material(&mut backend, &brake).unwrap();
+        assert_eq!(
+            backend.material(lit).emissive.unwrap().color,
+            [3.0, 0.0, 0.0]
+        );
+        let off = cache
+            .material(&mut backend, &unlit_lamp(&brake).unwrap())
+            .unwrap();
+        assert_ne!(off, lit);
+        assert!(backend.material(off).emissive.is_none());
+        assert_eq!(backend.material(off).texture, backend.material(lit).texture);
         // Paint: PgDiffSpecMetalNormFP mirrors by constant 14, weighted by
         // Fresnel from constant 15.
         let mut paint = Material {
