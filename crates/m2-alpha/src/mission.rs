@@ -427,6 +427,43 @@ end
 __m2_wrap_dialogs()
 "##;
 
+/// The factions whose attitude to the PMC the scripts have at
+/// `Hostile` (`MrxFactionManager.GetAttitudeLabel(faction, "Pmc")`:
+/// relations below -33 of -100..100, from the scripts' `_tAttitudes`),
+/// by the manager's abbreviations; `None` before the manager runs.
+fn hostile_factions(m: &Mission) -> Option<HashSet<&'static str>> {
+    let labels: Option<mlua::Table> = m
+        .lua()
+        .load(
+            "local m = rawget(_G, 'MrxFactionManager') \
+             if type(m) ~= 'table' or type(m.GetAttitudeLabel) ~= 'function' then return nil end \
+             local out = {} \
+             for _, f in ipairs({ 'All', 'Chi', 'Gur', 'Oil', 'Pir', 'Vza' }) do \
+                 local ok, a = pcall(m.GetAttitudeLabel, f, 'Pmc') \
+                 if ok then out[f] = type(a) == 'table' and a.sLabel or a end \
+             end \
+             return out",
+        )
+        .eval()
+        .ok()
+        .flatten();
+    let labels = labels?;
+    let hostile = ["All", "Chi", "Gur", "Oil", "Pir", "Vza"]
+        .into_iter()
+        .filter(|f| {
+            labels
+                .get::<Option<String>>(*f)
+                .ok()
+                .flatten()
+                .is_some_and(|l| l.eq_ignore_ascii_case("hostile"))
+        })
+        .chain(["Vza"])
+        .collect();
+    // The Venezuelans always fight her (the faction manager leaves them
+    // out of reporting: "VZ, civilian, or reporting is disabled").
+    Some(hostile)
+}
+
 /// Runs the callback of dialog box `seq` ([`DIALOG_BOXES`]) for option
 /// `picked`: `callback(unpack(args), picked)`, as the game's box's own
 /// `_CloseAndCallCallback` calls it.
@@ -1159,6 +1196,14 @@ impl MissionLink {
         // the one she stands at is offered, and taken with the use key.
         if let Some(g) = game.context_taken.take() {
             mission.take_context_action(g);
+        }
+        // The factions' attitudes, once a second: whose soldiers fight her.
+        game.attitude_wait -= dt;
+        if game.attitude_wait <= 0.0 {
+            game.attitude_wait = 1.0;
+            if let Some(hostile) = hostile_factions(mission) {
+                game.scene.people.set_hostile(hostile);
+            }
         }
         // Whether she swims, for `Human.IsSwimming`.
         let swimming = game

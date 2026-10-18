@@ -2620,7 +2620,7 @@ impl Scene {
             let (nodes, skin) = n.rig.posed();
             let body = n.model_matrix();
             model.draw_posed_as(backend, queue, body, &nodes, &skin, outfit)?;
-            if n.soldier
+            if (n.soldier || n.faction.is_some())
                 && n.alive
                 && let Some(w) = self.arsenal.npc_gun(n.gun)
                 && let Some(at) =

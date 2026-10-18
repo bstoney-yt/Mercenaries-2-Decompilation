@@ -193,6 +193,8 @@ pub struct Game {
     /// Seconds the HUD's save icon has left up after the game was saved
     /// ([`SAVE_ICON_SECONDS`]).
     pub save_icon: f32,
+    /// Seconds before the factions' attitudes are asked of the scripts again.
+    pub attitude_wait: f32,
 }
 
 /// A camera shot the scripts asked for (`Camera.SetShot`): the engine's
@@ -340,6 +342,7 @@ impl Game {
             context_taken: None,
             shot: None,
             save_icon: 0.0,
+            attitude_wait: 0.0,
         }
     }
 

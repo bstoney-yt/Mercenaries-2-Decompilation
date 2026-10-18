@@ -301,6 +301,9 @@ struct Options {
     /// With `--mission --after-contract`: this many seconds after the
     /// contract, take the pause menu's Medevac (if the scripts allow it).
     medevac: Option<f32>,
+    /// With `--mission --after-contract`: visit a faction's soldiers (`All`,
+    /// `Oil`...) and hurt one, logging their sides (faction-check lines).
+    visit_faction: Option<String>,
     /// With `--mission`: hit every placed prop as `--props-check` says
     /// (`vehicle`, `gun` or `blast`), once she stands in `--props-area`
     /// (x, z corners) if given, and stop ([`breakables::check`]).
@@ -504,6 +507,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--context" => o.context = Some(value()?),
             "--dialog-keys" => o.dialog_keys = Some(value()?),
             "--medevac" => o.medevac = Some(value()?.parse()?),
+            "--visit-faction" => o.visit_faction = Some(value()?),
             "--props-check" => {
                 let v = value()?;
                 o.props_check = Some(breakables::HitKind::parse(&v).with_context(|| {
@@ -3083,6 +3087,7 @@ fn mission_for_screenshot(
     let mut context = ContextCheck::default();
     let (mut dialog_up, mut dialog_pressed) = (0.0f32, 0usize);
     let (mut medevac_done, mut medevac_from) = (false, None::<(f32, m2_math::glam::Vec3)>);
+    let mut visit: Option<f32> = None;
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
             Some(a) => {
@@ -3334,6 +3339,96 @@ fn mission_for_screenshot(
                 for (seq, picked) in g.take_choices() {
                     eprintln!("dialog-check: box {seq} closed on option {picked}");
                     link.hud_choice(seq, picked);
+                }
+            }
+        }
+        // `--visit-faction <abbrev>`: 30 s after the contract, she is put
+        // 25 m from the nearest soldier spawn of that faction whose layer
+        // is in; 15 s on, she hurts the nearest of them; who stands with
+        // which side is logged every 5 s from the visit.
+        if let (Some(f), Some(done)) = (options.visit_faction.as_deref(), contract_done) {
+            let t = i.saturating_sub(done) as f32 * tick;
+            if visit.is_none() && t >= 30.0 {
+                let her = game.focus();
+                let spot = game.scene.world.as_ref().and_then(|w| {
+                    w.index
+                        .spawns
+                        .iter()
+                        .filter(|s| game.scene.people.layer_in(s.layer) && s.ai.is_some())
+                        .filter(|s| {
+                            [s.template.as_deref(), Some(s.name.as_str())]
+                                .into_iter()
+                                .flatten()
+                                .find_map(npc::faction_of)
+                                == Some(f)
+                        })
+                        .min_by(|a, b| {
+                            a.position
+                                .distance(her)
+                                .total_cmp(&b.position.distance(her))
+                        })
+                        .map(|s| (s.position, s.name.clone()))
+                });
+                match (spot, game.scene.player.as_mut()) {
+                    (Some((at, name)), Some(p)) => {
+                        let away = (her - at).with_y(0.0).normalize_or(m2_math::glam::Vec3::X);
+                        p.drop_at(at + away * 25.0);
+                        eprintln!("faction-check: {f}: put 25 m from {name} at {at:.1}");
+                        visit = Some(0.0);
+                    }
+                    _ => {
+                        eprintln!(
+                            "faction-check: {f}: no soldier spawn of theirs in a layer that is in"
+                        );
+                        visit = Some(f32::INFINITY);
+                    }
+                }
+            }
+            if let Some(v) = visit.as_mut().filter(|v| v.is_finite()) {
+                *v += tick;
+                let her = game.focus();
+                if (*v - 15.0).abs() < tick / 2.0 {
+                    let near = game
+                        .scene
+                        .people
+                        .npcs
+                        .iter_mut()
+                        .filter(|n| n.alive && n.faction == Some(f))
+                        .min_by(|a, b| {
+                            a.character
+                                .position
+                                .distance(her)
+                                .total_cmp(&b.character.position.distance(her))
+                        });
+                    if let Some(n) = near {
+                        n.hurt(10.0, m2_math::glam::Vec3::ZERO);
+                        eprintln!(
+                            "faction-check: she hurts one of them at {:.1}",
+                            n.character.position
+                        );
+                    }
+                }
+                if ((*v / 5.0).fract() * 5.0) < tick && *v < 45.0 {
+                    let near: Vec<&npc::Npc> = game
+                        .scene
+                        .people
+                        .npcs
+                        .iter()
+                        .filter(|n| {
+                            n.alive
+                                && n.faction == Some(f)
+                                && n.character.position.distance(her) < 120.0
+                        })
+                        .collect();
+                    eprintln!(
+                        "faction-check: {:.0} s: {} of {f} within 120 m, {} fighting her, {} on alert; pursuit {:?}; hostile {:?}",
+                        *v,
+                        near.len(),
+                        near.iter().filter(|n| n.soldier).count(),
+                        near.iter().filter(|n| n.alert).count(),
+                        game.scene.people.pursuit,
+                        game.scene.people.hostile
+                    );
                 }
             }
         }
