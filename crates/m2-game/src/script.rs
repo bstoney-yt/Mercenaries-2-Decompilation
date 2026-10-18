@@ -610,6 +610,15 @@ fn default_for(name: &str) -> Option<Value> {
     {
         return Some(Value::Nil);
     }
+    // A contract's or job's own module (`OilCon020`, `PmcJob001`) not
+    // loaded is nil, as in the game: the scripts' data modules see the
+    // globals through `package.seeall`, so the HQ's briefing reading
+    // `WifBriefingData[ "OilCon020" ]` (no entry of its own) finds the
+    // global, and takes nil for "no briefing data". A stub there handed
+    // its `tActors` loop a stub's name and stopped the briefing.
+    if is_contract_module(name) {
+        return Some(Value::Nil);
+    }
     if !next.is_ascii_uppercase() {
         return None;
     }
@@ -624,6 +633,18 @@ fn default_for(name: &str) -> Option<Value> {
         ('n' | 's' | 'b' | 't' | 'u' | 'o', _) => Some(Value::Nil),
         _ => None,
     }
+}
+
+/// Whether `name` is a contract's or job's module name, as the mission
+/// flow names them: a faction's three letters, `Con` or `Job`, three
+/// digits (`OilCon020`, `VzaCon001`, `PmcJob001`).
+fn is_contract_module(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() == 9
+        && b[0].is_ascii_uppercase()
+        && b[1..3].iter().all(u8::is_ascii_lowercase)
+        && matches!(&b[3..6], b"Con" | b"Job")
+        && b[6..].iter().all(u8::is_ascii_digit)
 }
 
 /// Drops the "runtime error: " each nested call adds to a message.
@@ -894,6 +915,17 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(built, 7);
+        // A contract's module not loaded is nil, not a stub: the HQ's
+        // briefing reads `WifBriefingData[ "OilCon020" ]` through to here.
+        let contracts: bool = host
+            .lua()
+            .load("return OilCon020 == nil and PmcJob001 == nil and VzaCon001 == nil")
+            .eval()
+            .unwrap();
+        assert!(contracts);
+        assert!(!is_contract_module("OilCon20"));
+        assert!(!is_contract_module("OILCon020"));
+        assert!(!is_contract_module("MrxBriefing"));
         let is_stub: bool = host
             .lua()
             .load("return getmetatable(Event) ~= nil")

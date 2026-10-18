@@ -187,6 +187,13 @@ m2-alpha [options]
                          comma-separated list for each in turn), put her at
                          it and take it with the use key, logging where she
                          is after (context-check lines)
+  --dialog-keys <keys>   with --mission --after-contract: the keys pressed in a
+                         dialog box the scripts put up (up, down, accept,
+                         back; comma-separated), the first 3 s after it
+                         opens and each 2 s on (dialog-check lines)
+  --medevac <s>          with --mission --after-contract: this long after the
+                         contract, the pause menu's Medevac as confirmed, if
+                         the scripts allow it then (medevac-check lines)
   --props-check <hit>    with --mission: once she is ashore (and inside
                          --props-area x0,z0,x1,z1 if given), hit every placed
                          prop there by <hit> (vehicle, gun or blast), log what

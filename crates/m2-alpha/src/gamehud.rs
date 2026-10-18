@@ -178,6 +178,80 @@ if method == "AddMessage" and call then
 end
 return true
 "#;
+/// A mission's dialog box ([`HudCall`] group `DialogBox`, as the
+/// mission's `DIALOG_BOXES` records it) put up with the HUD's own
+/// `MrxGuiDialogBox` (its widgets, fonts and pad handling), or taken down.
+/// The option picked goes into `__m2_hud_choices` with the call's number,
+/// for the mission's callback ([`GameHud::take_choices`]).
+const DIALOG_CALL: &str = r#"
+local method, data, seq = ...
+__m2_dialog_boxes = __m2_dialog_boxes or {}
+local m = rawget(_G, "MrxGuiDialogBox")
+if type(m) ~= "table" or type(m.DisplayDialogBox) ~= "function" then return false end
+if method == "Display" then
+    local rest = data.tRest or {}
+    local box = m.DisplayDialogBox(Player.GetLocalPlayer(), data.sTitle, data.tOptions or {},
+        data.nDefault or 1,
+        function(picked)
+            __m2_hud_choices = __m2_hud_choices or {}
+            table.insert(__m2_hud_choices, { seq, tonumber(picked) or 0 })
+            __m2_dialog_boxes[seq] = nil
+        end,
+        {}, rest[1], rest[2], rest[3], rest[4], rest[5], rest[6])
+    __m2_dialog_boxes[seq] = box
+    return box ~= nil
+elseif method == "Scroll" and type(m.DisplayScrollingDialogBox) == "function" then
+    local rest = data.tRest or {}
+    local box = m.DisplayScrollingDialogBox(Player.GetLocalPlayer(), data.sText,
+        function(picked)
+            __m2_hud_choices = __m2_hud_choices or {}
+            table.insert(__m2_hud_choices, { seq, tonumber(picked) or 0 })
+            __m2_dialog_boxes[seq] = nil
+        end,
+        {}, data.tOptions or {}, rest[1], rest[2], rest[3])
+    __m2_dialog_boxes[seq] = box
+    return box ~= nil
+elseif method == "Close" then
+    local box = __m2_dialog_boxes[data.nBox]
+    __m2_dialog_boxes[data.nBox] = nil
+    if type(box) == "table" and type(box.Close) == "function" then box.Close(box) end
+    return true
+end
+return false
+"#;
+
+/// The pause menu's Medevac (`MrxGuiPauseScreen` asks
+/// `MrxPlayer.CanMedEvac` to enable it, `GetMedEvacCost` for its message,
+/// and calls `MrxPlayer.MedEvac` once confirmed): here the player module
+/// is the mission's, in its own Lua state, so these answer as it last did
+/// (`can`, `cost`) and the Medevac goes to the engine's library
+/// (`M2MedEvac`, [`crate::pause::News::medevac`]) for the mission to run.
+/// Set again each frame, over the module should it be loaded afresh.
+const MEDEVAC: &str = r#"
+local can, cost = ...
+local p = rawget(_G, "MrxPlayer")
+if type(p) ~= "table" then
+    p = {}
+    rawset(_G, "MrxPlayer", p)
+end
+rawset(p, "CanMedEvac", function() return can end)
+rawset(p, "GetMedEvacCost", function() return cost end)
+rawset(p, "MedEvac", function() LTILibName.M2MedEvac() end)
+"#;
+
+/// A pad button by the HUD's name for it (`BUTTON_PAD1_D`) as a
+/// `ControllerInput` event's table, for a dialog box's `_HandleInputEvent`:
+/// `ButtonPress` is `MrxGuiBase.Joystick`'s number for it. Nil when the
+/// HUD's scripts don't name it.
+const CONTROLLER_PRESS: &str = r#"
+local name = ...
+local base = rawget(_G, "MrxGuiBase")
+local j = type(base) == "table" and base.Joystick
+local b = type(j) == "table" and j[name]
+if b == nil then return nil end
+return { ButtonPress = b }
+"#;
+
 /// A call of the hijack scripts to one of the HUD's modules
 /// (`MrxGuiHudActionHijack.ShowButton(player, button, ...)`), made here
 /// as they made it.
@@ -550,6 +624,15 @@ pub struct HudState {
     /// The GUI's named buttons pressed (`"selection"`: Enter), for the
     /// scripts' `Button` events (the contract fanfare's skip).
     pub buttons: Vec<String>,
+    /// The pad's buttons pressed for a dialog box the mission put up
+    /// ([`crate::mission`]'s `DIALOG_BOXES`), by the HUD's names for them
+    /// (`MrxGuiBase.Joystick`'s `BUTTON_PAD1_U`...): each goes to the box
+    /// as a `ControllerInput` event.
+    pub dialog_keys: Vec<&'static str>,
+    /// What the mission's scripts answer for the pause menu's Medevac:
+    /// whether she can be flown out, and its cost
+    /// ([`crate::mission::MissionLink::medevac_state`]).
+    pub medevac: Option<(bool, f64)>,
     /// The contract's objectives for the PDA: text id and icon tag each
     /// (`MissionView::pda_objectives`).
     pub pda_objectives: Vec<(String, String)>,
@@ -794,6 +877,8 @@ impl HudState {
         keys.extend(later.keys.iter().copied());
         let mut buttons = std::mem::take(&mut self.buttons);
         buttons.extend(later.buttons.iter().cloned());
+        let mut dialog_keys = std::mem::take(&mut self.dialog_keys);
+        dialog_keys.extend(later.dialog_keys.iter().copied());
         let mut pause_captured = std::mem::take(&mut self.pause_captured);
         pause_captured.extend(later.pause_captured.iter().copied());
         hurts.extend(later.hurts.iter().copied());
@@ -807,6 +892,7 @@ impl HudState {
             gui_calls,
             keys,
             buttons,
+            dialog_keys,
             pause_captured,
             ..later
         };
@@ -918,6 +1004,8 @@ enum Output {
         log: Vec<String>,
         /// The mission calls whose callbacks the HUD called.
         callbacks: Vec<u64>,
+        /// The mission's dialog boxes closed, each with the option picked.
+        choices: Vec<(u64, i64)>,
         /// The front end's news (nothing for the HUD).
         shell: ShellNews,
         /// The pause menu's (nothing for the front end).
@@ -990,6 +1078,9 @@ pub struct GameHud {
     last_time: Option<f64>,
     /// Mission calls whose callbacks the HUD has called, to hand back.
     callbacks: Vec<u64>,
+    /// The mission's dialog boxes closed and the options picked, to hand
+    /// back.
+    choices: Vec<(u64, i64)>,
     /// A mission fanfare call (`Hud.Fanfare`) failed in the HUD's scripts:
     /// it can't show, nor its Enter close it.
     dropped_fanfare: bool,
@@ -1049,6 +1140,7 @@ impl GameHud {
             rx,
             status: Status::Loading,
             callbacks: Vec::new(),
+            choices: Vec::new(),
             dropped_fanfare: false,
             prims: Vec::new(),
             pending: Vec::new(),
@@ -1139,6 +1231,12 @@ impl GameHud {
         std::mem::take(&mut self.callbacks)
     }
 
+    /// The mission's dialog boxes ([`HudCall::seq`]) the player closed on
+    /// an option, each with the option, since the last call.
+    pub fn take_choices(&mut self) -> Vec<(u64, i64)> {
+        std::mem::take(&mut self.choices)
+    }
+
     /// The mission's HUD calls in `calls` not passed on yet.
     pub fn hud_calls(&mut self, calls: &[HudCall]) -> Vec<HudCall> {
         let new: Vec<HudCall> = calls
@@ -1208,10 +1306,12 @@ impl GameHud {
                 images,
                 log,
                 callbacks,
+                choices,
                 shell,
                 pause,
             } => {
                 self.callbacks.extend(callbacks);
+                self.choices.extend(choices);
                 let pause = *pause;
                 self.pause_news.merge(pause.news);
                 self.pause_available = pause.available;
@@ -2444,11 +2544,25 @@ impl Thread {
                 t.sequence_values::<u64>().flatten().collect()
             })
             .unwrap_or_default();
+        // Taken out the same way.
+        let choices = globals
+            .raw_get::<Option<mlua::Table>>("__m2_hud_choices")
+            .ok()
+            .flatten()
+            .map(|t| {
+                let _ = globals.raw_set("__m2_hud_choices", mlua::Value::Nil);
+                t.sequence_values::<mlua::Table>()
+                    .flatten()
+                    .filter_map(|c| Some((c.get::<u64>(1).ok()?, c.get::<i64>(2).ok()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
         Output::Frame {
             prims,
             images,
             log,
             callbacks,
+            choices,
             shell: ShellNews::default(),
             pause: Box::new(PauseOut {
                 news: self.pause_native.take_news(),
@@ -2658,6 +2772,7 @@ impl Thread {
             images,
             log,
             callbacks: Vec::new(),
+            choices: Vec::new(),
             shell: ShellNews {
                 movie,
                 under,
@@ -3009,7 +3124,36 @@ impl Thread {
                 Err(e) => format!("gui call {name}: {e}"),
             });
         }
-        for c in &s.hud_calls {
+        for c in s.hud_calls.iter().filter(|c| c.group == "DialogBox") {
+            let done = c.data.to_lua(lua).and_then(|data| {
+                lua.load(DIALOG_CALL)
+                    .set_name("=m2-dialog call")
+                    .call::<bool>((c.method.as_str(), data, c.seq))
+            });
+            log.push(match done {
+                Ok(true) => format!("dialog box {} {}: {:?}", c.seq, c.method, c.data),
+                Ok(false) => format!(
+                    "dialog box {} {}: the HUD has no dialog box",
+                    c.seq, c.method
+                ),
+                Err(e) => format!("dialog box {} {}: {e}", c.seq, c.method),
+            });
+        }
+        for &key in &s.dialog_keys {
+            let fired = lua
+                .load(CONTROLLER_PRESS)
+                .set_name("=m2-controller press")
+                .call::<Value>(key)
+                .and_then(|event| match event {
+                    Value::Table(t) => gui_runtime::fire(lua, "ControllerInput", t),
+                    _ => Ok(0),
+                });
+            log.push(match fired {
+                Ok(n) => format!("dialog key {key}: {n} handlers"),
+                Err(e) => format!("dialog key {key}: {e}"),
+            });
+        }
+        for c in s.hud_calls.iter().filter(|c| c.group != "DialogBox") {
             let name = format!("{}.{}", c.group, c.method);
             let done = c.data.to_lua(lua).and_then(|data| {
                 lua.load(HUD_CALL).set_name("=m2-hud call").call::<bool>((
@@ -3034,6 +3178,11 @@ impl Thread {
     /// Fires the GUI events for what changed since the last state.
     fn feed(&mut self, s: &HudState) -> mlua::Result<()> {
         let lua = self.mission.lua();
+        if let Some((can, cost)) = s.medevac {
+            lua.load(MEDEVAC)
+                .set_name("=m2-hud medevac")
+                .call::<()>((can, cost))?;
+        }
         let first = self.told.hp.is_none();
         if first {
             let t = table(
@@ -5754,6 +5903,7 @@ mod paint_tests {
             rx,
             status,
             callbacks: Vec::new(),
+            choices: Vec::new(),
             dropped_fanfare: false,
             shell: ShellNews::default(),
             prims,
@@ -5838,6 +5988,7 @@ mod paint_tests {
             images: Vec::new(),
             log: log.iter().map(|l| (*l).to_owned()).collect(),
             callbacks: Vec::new(),
+            choices: Vec::new(),
             shell: ShellNews::default(),
             pause: Box::default(),
         }

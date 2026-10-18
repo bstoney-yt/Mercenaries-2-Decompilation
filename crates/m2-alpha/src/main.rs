@@ -292,6 +292,12 @@ struct Options {
     /// it with the use key, logging where she is after
     /// ([`context_check`]), for testing.
     context: Option<String>,
+    /// With `--mission`: the keys pressed in a dialog box the scripts put
+    /// up (`up`, `down`, `accept`, `back`, comma-separated), for testing.
+    dialog_keys: Option<String>,
+    /// With `--mission --after-contract`: this many seconds after the
+    /// contract, take the pause menu's Medevac (if the scripts allow it).
+    medevac: Option<f32>,
     /// With `--mission`: hit every placed prop as `--props-check` says
     /// (`vehicle`, `gun` or `blast`), once she stands in `--props-area`
     /// (x, z corners) if given, and stop ([`breakables::check`]).
@@ -493,6 +499,8 @@ fn parse_args() -> anyhow::Result<Options> {
             "--hijack" => o.hijack = true,
             "--placed-check" => o.placed_check = true,
             "--context" => o.context = Some(value()?),
+            "--dialog-keys" => o.dialog_keys = Some(value()?),
+            "--medevac" => o.medevac = Some(value()?.parse()?),
             "--props-check" => {
                 let v = value()?;
                 o.props_check = Some(breakables::HitKind::parse(&v).with_context(|| {
@@ -3045,6 +3053,8 @@ fn mission_for_screenshot(
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
     let mut cheat_check = options.cheat_check.then(cheats::Check::default);
     let mut context = ContextCheck::default();
+    let (mut dialog_up, mut dialog_pressed) = (0.0f32, 0usize);
+    let (mut medevac_done, mut medevac_from) = (false, None::<(f32, m2_math::glam::Vec3)>);
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
             Some(a) => {
@@ -3240,6 +3250,36 @@ fn mission_for_screenshot(
             if i % (4.0 / tick).round() as u32 == 0 {
                 state.buttons.push("selection".into());
             }
+            // `--dialog-keys`: with a dialog box of the scripts up, its keys
+            // in turn, the first 3 s after it opened and each 2 s on.
+            if link.dialog_open() {
+                dialog_up += tick;
+                let keys: Vec<&str> = options
+                    .dialog_keys
+                    .as_deref()
+                    .map(|k| k.split(',').collect())
+                    .unwrap_or_default();
+                let due = ((dialog_up - 3.0) / 2.0).floor();
+                if due >= 0.0 && (due as usize) == dialog_pressed && dialog_pressed < keys.len() {
+                    let name = keys[dialog_pressed];
+                    let b = match name {
+                        "up" => Some("BUTTON_PAD1_U"),
+                        "down" => Some("BUTTON_PAD1_D"),
+                        "accept" => Some("BUTTON_PAD2_D"),
+                        "back" => Some("BUTTON_PAD2_R"),
+                        _ => None,
+                    };
+                    eprintln!(
+                        "dialog-check: {:.0} s into the box, she presses {name}",
+                        dialog_up
+                    );
+                    state.dialog_keys.extend(b);
+                    dialog_pressed += 1;
+                }
+            } else if dialog_up > 0.0 {
+                eprintln!("dialog-check: the box closed after {dialog_up:.1} s");
+                dialog_up = 0.0;
+            }
             info.game = Some(state);
             let (w, h) = backend.size();
             let mut input = ui::headless_input(w, h, f64::from(i) * f64::from(tick));
@@ -3260,6 +3300,40 @@ fn mission_for_screenshot(
                 for seq in g.take_callbacks() {
                     eprintln!("after contract: the HUD called back call {seq}");
                     link.hud_callback(seq);
+                }
+                for (seq, picked) in g.take_choices() {
+                    eprintln!("dialog-check: box {seq} closed on option {picked}");
+                    link.hud_choice(seq, picked);
+                }
+            }
+        }
+        // `--medevac <s>`: that long after the contract, the pause menu's
+        // Medevac as confirmed, if the scripts let her have it then.
+        if let (Some(at), Some(done)) = (options.medevac, contract_done)
+            && !medevac_done
+            && i.saturating_sub(done) as f32 * tick >= at
+        {
+            medevac_done = true;
+            let state = link.medevac_state();
+            eprintln!(
+                "medevac-check: at {:.1} the scripts answer {state:?} (can, cost); cash {:.0}",
+                game.focus(),
+                link.view().cash.unwrap_or(0.0)
+            );
+            if state.is_some_and(|(can, _)| can) {
+                link.medevac();
+                medevac_from = Some((0.0, game.focus()));
+            }
+        }
+        if let Some((t, from)) = &mut medevac_from {
+            *t += tick;
+            for after in [1.0f32, 10.0, 30.0] {
+                if (*t - after).abs() < tick / 2.0 {
+                    eprintln!(
+                        "medevac-check: {after:.0} s after (from {from:.1}) she is at {:.1}, cash {:.0}",
+                        game.focus(),
+                        link.view().cash.unwrap_or(0.0)
+                    );
                 }
             }
         }
@@ -3781,8 +3855,23 @@ struct ContextCheck {
     step: usize,
 }
 
+/// The pad button a key stands for in a dialog box the scripts put up
+/// (`MrxGuiDialogBox._HandleInputEvent` reads the pad's d-pad or left
+/// stick up and down, A to take the option, B to back out): the arrows or
+/// W and S step, Enter, Space or E take, Escape or Backspace back out.
+/// Which keys is invented (the PC's bindings for the box aren't read).
+fn dialog_button(code: KeyCode) -> Option<&'static str> {
+    Some(match code {
+        KeyCode::ArrowUp | KeyCode::KeyW => "BUTTON_PAD1_U",
+        KeyCode::ArrowDown | KeyCode::KeyS => "BUTTON_PAD1_D",
+        KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space | KeyCode::KeyE => "BUTTON_PAD2_D",
+        KeyCode::Escape | KeyCode::Backspace => "BUTTON_PAD2_R",
+        _ => return None,
+    })
+}
+
 /// With `--context`: once the scripts offer a context action whose prompt
-/// reads `want`, she is put 0.5 m from its object; once the game offers it
+/// reads `want`, she is put 1.5 m from its object; once the game offers it
 /// her (a second on), she takes it as the use key does. Her place is
 /// logged 1, 4 and 10 s after (`context-check:` lines): an HQ exit takes
 /// her out of the interior, 450 m up, to the villa's grounds.
@@ -5388,6 +5477,9 @@ struct Running {
     /// The GUI's named buttons pressed since the last frame (Enter is
     /// `"selection"`), for the game HUD's scripts.
     buttons: Vec<String>,
+    /// The pad buttons pressed for a dialog box the scripts have up
+    /// ([`dialog_button`]), for the game HUD's.
+    dialog_keys: Vec<&'static str>,
     /// The developer's keys work ([`App::dev`]).
     dev: bool,
     /// The cheat menu's god mode and infinite ammo ([`cheats::keep_up`]).
@@ -5541,6 +5633,7 @@ impl App {
                 _ => None,
             },
             buttons: Vec::new(),
+            dialog_keys: Vec::new(),
             dev: self.dev,
             cheats: cheats::Toggles::default(),
             cheat_code: cheats::CodeWatch::default(),
@@ -5674,6 +5767,11 @@ impl Running {
         if self.hud.game.is_some() {
             let mut state = gamehud::HudState::of(&mut self.game);
             state.buttons = buttons;
+            state.dialog_keys = std::mem::take(&mut self.dialog_keys);
+            state.medevac = self
+                .mission
+                .as_ref()
+                .and_then(mission::MissionLink::medevac_state);
             state.gui_calls = gui_calls;
             state.pad = self.input.pad();
             info.game = Some(state);
@@ -5693,6 +5791,10 @@ impl Running {
         if let (Some(g), Some(m)) = (&mut self.hud.game, &mut self.mission) {
             for seq in g.take_callbacks() {
                 m.hud_callback(seq);
+            }
+            // And the options picked in its dialog boxes.
+            for (seq, picked) in g.take_choices() {
+                m.hud_choice(seq, picked);
             }
         }
         // With no game HUD to show the contract's fanfare (`--old-hud`,
@@ -5799,6 +5901,24 @@ impl Running {
                     MenuKey::Left => KeyCode::ArrowLeft,
                     MenuKey::Right => KeyCode::ArrowRight,
                 });
+                continue;
+            }
+            // A dialog box the scripts put up takes the pad's d-pad, A
+            // and B ([`dialog_button`]).
+            if !self.hud.menu
+                && self
+                    .mission
+                    .as_ref()
+                    .is_some_and(mission::MissionLink::dialog_open)
+            {
+                let b = match key {
+                    MenuKey::Up => Some("BUTTON_PAD1_U"),
+                    MenuKey::Down => Some("BUTTON_PAD1_D"),
+                    MenuKey::Enter => Some("BUTTON_PAD2_D"),
+                    MenuKey::Escape => Some("BUTTON_PAD2_R"),
+                    MenuKey::Left | MenuKey::Right => None,
+                };
+                self.dialog_keys.extend(b);
                 continue;
             }
             // Our pause menu's buttons are egui's: up and down step its
@@ -5953,6 +6073,11 @@ impl Running {
         }
         if let Some(v) = news.volumes {
             self.set_volumes(v);
+        }
+        if news.medevac
+            && let Some(m) = &mut self.mission
+        {
+            m.medevac();
         }
         for unused in &news.unused {
             eprintln!("pause: {unused} kept in the menu; the alpha has nothing for it");
@@ -6460,6 +6585,24 @@ impl ApplicationHandler for App {
                     && let Some(flow) = &mut state.flow
                 {
                     flow.key(code);
+                }
+            }
+            // A dialog box the scripts put up (Fiona's briefing menu) takes
+            // the menu keys, as the pad's buttons it reads; she stays put.
+            WindowEvent::KeyboardInput { event, .. }
+                if state.focused
+                    && state
+                        .mission
+                        .as_ref()
+                        .is_some_and(mission::MissionLink::dialog_open)
+                    && matches!(event.physical_key, PhysicalKey::Code(c) if dialog_button(c).is_some()) =>
+            {
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                    && let Some(b) = dialog_button(code)
+                {
+                    state.dialog_keys.push(b);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if state.focused => {

@@ -331,6 +331,118 @@ for group, names in pairs(methods) do
 end
 "#;
 
+/// The scripts' dialog boxes (`MrxGuiDialogBox.DisplayDialogBox(owner,
+/// title, options, default, callback, callback args, ...)`, which
+/// `MrxGui.DisplayDialogBox` names too): a box the game's HUD builds from
+/// its widgets and works with the pad, so here each is a [`HUD_CALLS`]
+/// call of its own group, `DialogBox` `Display` (title, option texts,
+/// default and the plain arguments after), with a callback; the HUD's
+/// answer is the option picked, and the callback runs as the box's own
+/// `_CloseAndCallCallback` runs it, `callback(unpack(args), picked)`
+/// ([`MissionLink::hud_callback`]). What the scripts get back stands for
+/// the box: its `Close` (`MrxGuiDialogBox.Close`) is a `DialogBox`
+/// `Close` call naming it. Run every tick: the scripts import the module
+/// afresh as they go, over what was wrapped.
+///
+/// From the scripts (no executable read): the HQ's briefings put up their
+/// menus this way (`MrxBriefing`'s `[Briefing.Bribe]`, `[Generic.Exit]`
+/// list after `LTILibName.ChangeShellState(true)`), and the contract's
+/// description with its Accept and Decline
+/// (`MrxGuiDialogBox.DisplayScrollingDialogBox`, method `Scroll`).
+const DIALOG_BOXES: &str = r##"
+__m2_dialog_wrapped = __m2_dialog_wrapped or setmetatable({}, { __mode = "k" })
+local function plain(v)
+    local t = type(v)
+    if t == "string" or t == "number" or t == "boolean" then return v end
+    return nil
+end
+local function texts(options)
+    local out = {}
+    if type(options) == "table" then
+        for i, o in ipairs(options) do out[i] = plain(o) or "" end
+    end
+    return out
+end
+-- A box the HUD puts up for the call `seq`: what the scripts get back.
+local function open(method, data, callback, args)
+    __m2_hud_call_count = __m2_hud_call_count + 1
+    local seq = __m2_hud_call_count
+    __m2_hud_callbacks[seq] = { fCallback = callback, tCallbackData = args, dialog = true }
+    table.insert(__m2_hud_calls, { seq = seq, group = "DialogBox", method = method,
+        data = data, callback = type(callback) == "function" })
+    if #__m2_hud_calls > 64 then table.remove(__m2_hud_calls, 1) end
+    local box = { CustomData = {}, __m2_dialog = seq }
+    box.Close = function()
+        if __m2_hud_callbacks[seq] then __m2_hud_callbacks[seq] = nil end
+        __m2_hud_call_count = __m2_hud_call_count + 1
+        table.insert(__m2_hud_calls, { seq = __m2_hud_call_count, group = "DialogBox",
+            method = "Close", data = { nBox = seq }, callback = false })
+    end
+    -- Whatever else the scripts ask of a box does nothing here.
+    return setmetatable(box, { __index = function() return function() end end })
+end
+local function rest(...)
+    local out, n = {}, select("#", ...)
+    for i = 1, n do out[i] = plain((select(i, ...))) end
+    return out
+end
+-- DisplayDialogBox(owner, title, options, default, callback, args, ...).
+local function display(owner, title, options, default, callback, args, ...)
+    return open("Display", { sTitle = plain(title) or "", tOptions = texts(options),
+        nDefault = plain(default), tRest = rest(...) }, callback, args)
+end
+-- DisplayScrollingDialogBox(owner, text, callback, args, options, ...): the
+-- contract's description with its Accept and Decline (a cancel picks 2).
+local function scrolling(owner, text, callback, args, options, ...)
+    return open("Scroll", { sText = plain(text) or "", tOptions = texts(options),
+        tRest = rest(...) }, callback, args)
+end
+__m2_dialog_wrapped[display] = true
+__m2_dialog_wrapped[scrolling] = true
+local function close(box)
+    if type(box) == "table" and type(box.Close) == "function" and box.__m2_dialog then
+        box.Close(box)
+    end
+end
+__m2_dialog_wrapped[close] = true
+local function wrap(m, name, f)
+    local d = rawget(m, name)
+    if d ~= nil and not __m2_dialog_wrapped[d] then rawset(m, name, f) end
+end
+function __m2_wrap_dialogs()
+    local m = rawget(_G, "MrxGuiDialogBox")
+    if type(m) == "table" then
+        wrap(m, "DisplayDialogBox", display)
+        wrap(m, "DisplayScrollingDialogBox", scrolling)
+        wrap(m, "Close", close)
+    end
+    local g = rawget(_G, "MrxGui")
+    if type(g) == "table" then
+        wrap(g, "DisplayDialogBox", display)
+        wrap(g, "CloseDialogBox", close)
+    end
+end
+__m2_wrap_dialogs()
+"##;
+
+/// Runs the callback of dialog box `seq` ([`DIALOG_BOXES`]) for option
+/// `picked`: `callback(unpack(args), picked)`, as the game's box's own
+/// `_CloseAndCallCallback` calls it.
+fn choice_code(seq: u64, picked: i64) -> String {
+    format!(
+        "local t = __m2_hud_callbacks[{seq}]\n\
+         __m2_hud_callbacks[{seq}] = nil\n\
+         if t and type(t.fCallback) == 'function' then\n\
+             local a = {{}}\n\
+             if type(t.tCallbackData) == 'table' then\n\
+                 for i = 1, table.getn(t.tCallbackData) do a[i] = t.tCallbackData[i] end\n\
+             end\n\
+             table.insert(a, {picked})\n\
+             t.fCallback(unpack(a))\n\
+         end"
+    )
+}
+
 /// People this near a marker's target are listed with it, metres; story
 /// characters' spawns this near the player.
 const MARK_NEAR: f32 = 6.0;
@@ -775,6 +887,73 @@ impl MissionLink {
         }
     }
 
+    /// The HUD's dialog box for the mission's call `seq` ([`DIALOG_BOXES`])
+    /// closed on option `picked`: its callback runs with its arguments and
+    /// then the option, as the game's box calls it.
+    pub fn hud_choice(&mut self, seq: u64, picked: i64) {
+        let State::Running(m) = &mut self.state else {
+            return;
+        };
+        let code = choice_code(seq, picked);
+        let line = match m.run(&code, "hud choice") {
+            Ok(_) => format!("hud choice {seq}: option {picked}"),
+            Err(e) => format!("hud choice {seq}: {e}"),
+        };
+        eprintln!("mission: dialog box {seq}: option {picked} picked");
+        self.write([line]);
+    }
+
+    /// What the pause menu's Medevac reads (`MrxPlayer.CanMedEvac` and
+    /// `GetMedEvacCost`), as the mission's scripts answer now: whether she
+    /// can be flown out (alive, not in transit, a hijack, the HQ or a
+    /// locked state) and its cost. `None` before they run.
+    pub fn medevac_state(&self) -> Option<(bool, f64)> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        m.lua()
+            .load(
+                "local p = rawget(_G, 'MrxPlayer') \
+                 if type(p) ~= 'table' then return nil end \
+                 local ok, can = pcall(p.CanMedEvac) \
+                 local okc, cost = pcall(p.GetMedEvacCost) \
+                 return ok and can == true, okc and tonumber(cost) or 0",
+            )
+            .eval::<(Option<bool>, Option<f64>)>()
+            .ok()
+            .and_then(|(can, cost)| Some((can?, cost.unwrap_or(0.0))))
+    }
+
+    /// The pause menu's Medevac was confirmed: the scripts' own
+    /// `MrxPlayer.MedEvac` runs (a contract under way is cancelled, else
+    /// she goes to the sickbay).
+    pub fn medevac(&mut self) {
+        let State::Running(m) = &mut self.state else {
+            return;
+        };
+        let line = match m.run("MrxPlayer.MedEvac()", "medevac") {
+            Ok(_) => "medevac: MrxPlayer.MedEvac() ran".to_owned(),
+            Err(e) => format!("medevac: {e}"),
+        };
+        eprintln!("mission: {line}");
+        self.write([line]);
+    }
+
+    /// Whether a dialog box the scripts put up ([`DIALOG_BOXES`]) is still
+    /// waiting for a pick: the menu keys go to it, not to her.
+    pub fn dialog_open(&self) -> bool {
+        let State::Running(m) = &self.state else {
+            return false;
+        };
+        m.lua()
+            .load(
+                "for _, t in pairs(__m2_hud_callbacks or {}) do \
+                 if type(t) == 'table' and t.dialog then return true end end return false",
+            )
+            .eval::<bool>()
+            .unwrap_or(false)
+    }
+
     /// Has the scripts' movies (`01_AOA_J`, `02_AOB_J`) wait for the game:
     /// [`take_movie`](Self::take_movie) hands them out.
     pub fn with_movies(self, movies: bool) -> Self {
@@ -978,6 +1157,16 @@ impl MissionLink {
         // the one she stands at is offered, and taken with the use key.
         if let Some(g) = game.context_taken.take() {
             mission.take_context_action(g);
+        }
+        // The dialog boxes, as the scripts may have imported their module
+        // afresh ([`DIALOG_BOXES`]).
+        if let Ok(Some(wrap)) = mission
+            .lua()
+            .globals()
+            .get::<Option<mlua::Function>>("__m2_wrap_dialogs")
+            && let Err(e) = wrap.call::<()>(())
+        {
+            eprintln!("mission: dialog boxes: {e}");
         }
         // Riders of the layers' props (the HQ interior's starter): drawn in
         // their seats by `crate::hijack`, which says where those are; the
@@ -1327,6 +1516,9 @@ impl MissionLink {
                 }
                 if let Err(e) = mission.run(HUD_CALLS, "hud calls") {
                     self.write([format!("hud calls: {e}")]);
+                }
+                if let Err(e) = mission.run(DIALOG_BOXES, "dialog boxes") {
+                    self.write([format!("dialog boxes: {e}")]);
                 }
                 if let Err(e) = mission.run(TRESPASS, "trespass") {
                     self.write([format!("trespass: {e}")]);
@@ -3445,6 +3637,67 @@ mod tests {
         };
         assert!(cash.contains(&(Plain::Text("vPlayer".into()), Plain::Guid(1))));
         assert_eq!(calls[1].method, "SetSlotToText");
+    }
+
+    #[test]
+    fn the_scripts_dialog_boxes_go_to_the_hud_and_the_pick_comes_back() {
+        // The HQ's briefing menu: `MrxGui.DisplayDialogBox(owner, title,
+        // options, default, callback, args, ...)`; the box's own module
+        // stands in the mission's state until it is wrapped.
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            Hud = {}
+            MrxGuiDialogBox = { DisplayDialogBox = function() error("drawn here") end,
+                DisplayScrollingDialogBox = function() error("drawn here") end,
+                Close = function() end }
+            MrxGui = { DisplayDialogBox = MrxGuiDialogBox.DisplayDialogBox }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(DIALOG_BOXES).exec().unwrap();
+        lua.load(
+            r#"
+            picked = nil
+            box = MrxGui.DisplayDialogBox(1, "[Briefing.RootMenuDialog]",
+                { "[OilCon020.Title]", "[Generic.Exit]" }, 1,
+                function(who, n) picked = { who, n } end, { "Fiona" }, 48, 36, "left")
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let calls = hud_calls(&lua);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            (calls[0].group.as_str(), calls[0].method.as_str()),
+            ("DialogBox", "Display")
+        );
+        assert!(calls[0].callback);
+        let Plain::Table(data) = &calls[0].data else {
+            panic!("{:?}", calls[0].data);
+        };
+        assert!(data.contains(&(
+            Plain::Text("sTitle".into()),
+            Plain::Text("[Briefing.RootMenuDialog]".into())
+        )));
+        // The HUD's pick: the callback, with its args and then the option.
+        lua.load(choice_code(calls[0].seq, 2)).exec().unwrap();
+        let (who, n): (String, i64) = lua.load("return picked[1], picked[2]").eval().unwrap();
+        assert_eq!((who.as_str(), n), ("Fiona", 2));
+        // The scrolling box (the contract's Accept) goes the same way, and
+        // closing a box tells the HUD.
+        lua.load(
+            r#"s = MrxGuiDialogBox.DisplayScrollingDialogBox(1, "[OilCon020.Terms.Summary]",
+                function(n) picked = n end, {}, { "[Generic.Accept]" })
+            s:Close()"#,
+        )
+        .exec()
+        .unwrap();
+        let calls = hud_calls(&lua);
+        let methods: Vec<&str> = calls.iter().map(|c| c.method.as_str()).collect();
+        assert_eq!(methods, ["Display", "Scroll", "Close"]);
     }
 
     #[test]
