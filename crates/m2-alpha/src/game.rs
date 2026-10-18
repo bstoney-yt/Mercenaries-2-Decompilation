@@ -177,6 +177,9 @@ pub struct Game {
     /// over its height the last frame was drawn with: what the scripts'
     /// camera sees (`Event.ObjectIsVisible`).
     pub lens: (f32, f32),
+    /// The scripts seated her in the vehicle she is in (the start's boat), rather
+    /// than she getting in herself: no remark on it ([`car_remark`]).
+    pub scripts_seated: bool,
 }
 
 /// A soldier's pickup is told from the others by its "crate": this, plus
@@ -273,6 +276,7 @@ impl Game {
             hijack_only: HashSet::new(),
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
+            scripts_seated: false,
         }
     }
 
@@ -2978,6 +2982,32 @@ fn log_floor(props: &Props, physics: &Physics, at: Vec3) {
 }
 
 /// Whether someone sits in the driver's seat of a crew.
+/// Whether getting into a vehicle whose template's physics is `kind`
+/// earns her vehicle remark ([`combat::Remark::Vehicle`]): her lines for
+/// it are about taking someone's car (`jennifer_cues`), so only a car she
+/// got into herself. Not a boat, tank or helicopter, nor a seat the
+/// scripts put her in (playtest 8: seated in the start's speedboat, she
+/// called it a nice car).
+pub fn car_remark(kind: Option<m2_engine::world::VehicleKind>, scripts_seated: bool) -> bool {
+    !scripts_seated && kind == Some(m2_engine::world::VehicleKind::Car)
+}
+
+impl Game {
+    /// Whether her getting into the vehicle she now drives earns her
+    /// vehicle remark ([`car_remark`]).
+    pub fn car_remark_due(&self) -> bool {
+        let kind = self
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| self.scene.vehicles.get(i))
+            .zip(self.scene.world.as_ref())
+            .and_then(|(v, w)| w.index.template_db.get(&v.spec.label)?.vehicle);
+        car_remark(kind, self.scripts_seated)
+    }
+}
+
 fn has_driver(crew: &[(String, String)]) -> bool {
     crew.iter()
         .any(|(seat, _)| seat.to_ascii_lowercase().contains("driver"))
@@ -3169,6 +3199,19 @@ mod tests {
         // Still loading: up until the cap.
         assert!(!arrived(ARRIVAL_CAP - 0.1, false));
         assert!(arrived(ARRIVAL_CAP, false));
+    }
+
+    #[test]
+    fn only_a_car_she_takes_herself_earns_her_car_remark() {
+        use m2_engine::world::VehicleKind as K;
+        assert!(car_remark(Some(K::Car), false));
+        // Seated in the start's speedboat by the scripts (playtest 8).
+        assert!(!car_remark(Some(K::Boat), true));
+        assert!(!car_remark(Some(K::Car), true));
+        for kind in [K::Boat, K::Tank, K::Helicopter, K::Unknown] {
+            assert!(!car_remark(Some(kind), false), "{kind:?}");
+        }
+        assert!(!car_remark(None, false));
     }
 
     #[test]

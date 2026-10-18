@@ -305,6 +305,9 @@ pub struct Templates {
     /// The sound each template's objects make breaking (its `SoundKey`),
     /// by id ([`crate::durability::sound_keys`]).
     pub sound_keys: HashMap<u32, u32>,
+    /// What each piece of a template's objects weighs once broken off,
+    /// kg, by id ([`crate::durability::piece_masses`]).
+    pub piece_masses: HashMap<u32, f32>,
     /// The templates that stand already destroyed, by id: those whose
     /// `Health` is 0. All 201 such are ruins (`_marsh_bridgemid_ruined`,
     /// `AMX30_RUIN`), each with the model of its intact twin, whose
@@ -743,6 +746,7 @@ impl Templates {
                 })
                 .collect(),
             infos,
+            piece_masses: crate::durability::piece_masses(&db, &names),
             names: names
                 .into_iter()
                 .map(|(id, name)| (id, name.to_owned()))

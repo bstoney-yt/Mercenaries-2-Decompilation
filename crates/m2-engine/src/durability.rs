@@ -184,6 +184,41 @@ pub fn sound_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
         .collect()
 }
 
+/// `OSMParameter`'s value field (name unknown): with `Name` `PropTemplate`
+/// or `DebrisTemplate`, the name hash of a template.
+const OSM_VALUE: u32 = 0x255f_12c0;
+
+/// What each piece of a template's objects weighs once broken off (kg),
+/// by id: the `_DebrisPhysics` `Mass` of the template its `OSMParameter`
+/// `PropTemplate` names, the object its pieces become as its model's
+/// collapse state `CreateObject`s them. Solano's villa gate
+/// (`_pmcoutpost_gate`) names `prop_metal_lrg`, 40 kg: a leaf a car
+/// throws aside, not the 19 t a stone block its size would weigh. From
+/// the template database; that the leaves become such objects is read
+/// from the state machine's verbs (not the executable).
+pub fn piece_masses(db: &Layer<'_>, names: &HashMap<u32, &str>) -> HashMap<u32, f32> {
+    let osm = Table::new(db, "OSMParameter");
+    let debris = Table::new(db, "_DebrisPhysics");
+    let (name, prop, mass) = (
+        name_hash("Name"),
+        name_hash("PropTemplate"),
+        name_hash("Mass"),
+    );
+    let by_hash: HashMap<u32, u32> = names.iter().map(|(&id, n)| (name_hash(n), id)).collect();
+    osm.templates()
+        .filter_map(|id| {
+            let named = osm
+                .of_template(id)
+                .iter()
+                .find(|r| osm.word(r, name) == Some(prop))
+                .and_then(|r| osm.word(r, OSM_VALUE))?;
+            let t = *by_hash.get(&named)?;
+            let kg = debris.float(debris.of_template(t).first()?, mass)?;
+            (kg > 0.0).then_some((id, kg))
+        })
+        .collect()
+}
+
 /// `_PropPhysics`'s field read as a flag (name unknown; 1 on 102
 /// templates' records only for the heavy ones: shipping containers
 /// (20,000 kg), dumpsters, fuel and propane tanks (10,000 kg), the

@@ -405,7 +405,7 @@ impl Loose {
 /// flying as a box round its geometry, the rest drawn wrecked; and the
 /// points its breaking names besides, empty ones (where the videos show
 /// fires burning and smoke rising).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Breakup {
     pub pieces: Loose,
     /// Model space.

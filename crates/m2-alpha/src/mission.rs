@@ -1761,6 +1761,7 @@ impl Fleet {
             mission.ride(riding);
             self.riding = riding;
         }
+        let mut seated = false;
         {
             let w = mission.world().borrow();
             for (i, v) in game.scene.vehicles.iter_mut().enumerate() {
@@ -1783,6 +1784,7 @@ impl Fleet {
                     p.landed = true;
                     self.reenter = None;
                     self.boarding = 0;
+                    seated = true;
                     eprintln!(
                         "mission: she is seated in {} ({g:#x}){}",
                         v.spec.label,
@@ -1790,6 +1792,9 @@ impl Fleet {
                     );
                 }
             }
+        }
+        if seated {
+            game.scripts_seated = true;
         }
         let now = mission.now();
         self.landing.retain(|_, until| *until > now);
@@ -2499,6 +2504,7 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 && let Some(p) = game.scene.player.as_mut()
             {
                 p.driving = Some(i);
+                game.scripts_seated = true;
                 return false;
             }
             // One still to load (the start's boat): she waits where it is,
