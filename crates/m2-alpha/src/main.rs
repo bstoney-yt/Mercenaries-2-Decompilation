@@ -151,6 +151,9 @@ struct Options {
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
+    /// With `--screenshot` on foot: press jump ten times a second all the
+    /// way (a player spamming it), each take-off in the log.
+    jump_spam: bool,
     /// With `--screenshot` on foot: throw a grenade just before it.
     throw: bool,
     /// With `--screenshot` on foot: bash just before it.
@@ -442,6 +445,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
+            "--jump-spam" => o.jump_spam = true,
             "--throw" => o.throw = true,
             "--bash" => o.bash = true,
             "--reload" => o.reload = true,
@@ -1588,7 +1592,7 @@ fn screenshot(
             // A jump takes the picture on the way up (by default), a
             // throw with the grenade still in her hand; aiming, the
             // weapon comes up for the last second.
-            let jump = options.jump && i == 180 - lead;
+            let jump = (options.jump && i == 180 - lead) || (options.jump_spam && i % 6 == 0);
             // With --jump-with-enter too, the scripts take her controls a
             // moment into the jump, as the contract's end does when its
             // fanfare is closed with the pad's A (playtest 8: she hung in
@@ -3737,6 +3741,23 @@ fn hijack_for_screenshot(
         return Ok(());
     };
     eprintln!("hijack: prompt \"Hijack {}\"", view.vehicle);
+    // As a player walks up, the crewman's model streams in.
+    let waiting = Instant::now();
+    while !hijacks.crew_in(game) && waiting.elapsed() < Duration::from_secs(60) {
+        let focus = game.focus();
+        game.scene.update(backend, focus)?;
+        hijacks.tick(game, &mut input, tick);
+        game.step(Intent::default(), tick);
+    }
+    eprintln!(
+        "hijack: crewman {} after {:.1} s",
+        if hijacks.crew_in(game) {
+            "in"
+        } else {
+            "not in"
+        },
+        waiting.elapsed().as_secs_f32()
+    );
     // The HUD up before she starts (its scripts load in the background).
     if hud.game.is_some() {
         let mut info = hud_info(game, None, fov, aspect);

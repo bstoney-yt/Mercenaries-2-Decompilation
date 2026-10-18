@@ -657,7 +657,8 @@ impl Rig {
     /// Moves at `gait` holding a rifle as `carry` says. Aiming, it is
     /// shouldered: by the whole body standing, by the upper body over the
     /// legs' gait when moving. Running, it is held low across the body in
-    /// both hands; otherwise the plain gait carries it low in the right
+    /// both hands, and sprinting too (the player's [`npc::FightClips::sprint`]);
+    /// otherwise the plain gait carries it low in the right
     /// hand, except that a soldier at the ready standing holds it across
     /// the chest. Falls back to the plain gait without the clips.
     pub fn hold_rifle(&mut self, gait: Gait, clips: &npc::FightClips, carry: Carry) {
@@ -666,6 +667,7 @@ impl Rig {
             (_, Carry::Aim) => (None, clips.aim),
             (Gait::Idle, Carry::Ready) => (clips.ready, None),
             (Gait::Run, _) => (clips.run_low, None),
+            (Gait::Sprint, _) => (clips.sprint, None),
             _ => (None, None),
         };
         match whole {
@@ -946,6 +948,10 @@ pub struct ParkedVehicle {
     /// How far its turret is turned from straight ahead, radians
     /// (anticlockwise from above).
     pub turret: f32,
+    /// While a hijack plays on it: the nodes its hijack clip moves (the
+    /// hatch thrown open) and those under them, model space, over its
+    /// posed nodes ([`crate::hijack::Hijacks::place`]).
+    pub hijack_nodes: Vec<(usize, Mat4)>,
     /// How far its gun is raised, radians (down is negative).
     pub gun: f32,
     /// How far it has rolled, metres (backwards less), for turning a
@@ -2217,6 +2223,7 @@ impl Scene {
                 spot: None,
                 crew: Vec::new(),
                 turret: 0.0,
+                hijack_nodes: Vec::new(),
                 gun: 0.0,
                 rolled: 0.0,
                 fired: 0,
@@ -2242,6 +2249,7 @@ impl Scene {
                     spot: None,
                     crew,
                     turret: 0.0,
+                    hijack_nodes: Vec::new(),
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
@@ -2262,6 +2270,7 @@ impl Scene {
                     spot: Some((entity, at, yaw)),
                     crew,
                     turret: 0.0,
+                    hijack_nodes: Vec::new(),
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
@@ -2548,6 +2557,11 @@ impl Scene {
                     v.gun,
                 );
                 v.spec.spin_rotors(&mut nodes, v.rolled);
+                for &(i, m) in &v.hijack_nodes {
+                    if let Some(n) = nodes.get_mut(i) {
+                        *n = m;
+                    }
+                }
                 v.model.draw_posed(backend, queue, at, &nodes, &[])?;
             }
         }
