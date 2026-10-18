@@ -288,16 +288,29 @@ impl BoundClip {
     /// bones it lacks are dropped, nodes no track names keep their rest
     /// pose. `None` unless most tracks find their bone.
     pub fn rebind(&self, skeleton: &Skeleton) -> Option<Self> {
-        let found = self
-            .clip
+        Self::bind_family(self.hash, self.clip.clone(), skeleton)
+    }
+
+    /// Binds `clip` to a `skeleton` of its character family, as
+    /// [`rebind`](Self::rebind) does: `None` unless most tracks find
+    /// their bone.
+    pub fn bind_family(hash: u32, clip: Clip, skeleton: &Skeleton) -> Option<Self> {
+        let (found, tracks) = Self::tracks_found(&clip, skeleton);
+        if found * 10 < tracks * 8 {
+            return None;
+        }
+        Self::bind_by_name(hash, clip, skeleton)
+    }
+
+    /// How many of `clip`'s tracks name a node of `skeleton`, and of how
+    /// many tracks.
+    pub fn tracks_found(clip: &Clip, skeleton: &Skeleton) -> (usize, usize) {
+        let found = clip
             .track_nodes
             .iter()
             .filter(|h| skeleton.name_hashes.contains(h))
             .count();
-        if found * 10 < self.clip.track_nodes.len() * 8 {
-            return None;
-        }
-        Self::bind_by_name(self.hash, self.clip.clone(), skeleton)
+        (found, clip.track_nodes.len())
     }
 
     fn bind_by_name(hash: u32, clip: Clip, skeleton: &Skeleton) -> Option<Self> {

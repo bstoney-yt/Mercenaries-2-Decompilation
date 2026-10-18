@@ -256,6 +256,12 @@ pub struct Player {
     /// Ticks she has waited to land: past [`LAND_WAIT`] she no longer
     /// waits for the layers' models.
     waited: u16,
+    /// The floor under her was taken down ([`floor_went`](Self::floor_went)):
+    /// she waits for the layers' models even with ground far below.
+    floor_gone: bool,
+    /// Set as she lands after her floor went (taken by the log of what
+    /// stands there).
+    pub floor_landed: bool,
     pub model: Option<(GpuModel, Rig)>,
     /// The vehicle she is driving (index into the scene's vehicles).
     pub driving: Option<usize>,
@@ -316,6 +322,8 @@ impl Player {
             streaming: false,
             settled: 0,
             waited: 0,
+            floor_gone: false,
+            floor_landed: false,
             models_coming: false,
             model,
             driving: None,
@@ -494,6 +502,15 @@ impl Player {
         self.landed = false;
         self.land_from = Some(at);
         self.waited = 0;
+        self.floor_gone = false;
+    }
+
+    /// The floor she stands on was taken down (a state layer went): she
+    /// stays where she is until the layers' models coming in have loaded
+    /// (at most [`LAND_WAIT`]), then lands on the floor nearest under her.
+    pub fn floor_went(&mut self) {
+        self.drop_at(self.character.position);
+        self.floor_gone = true;
     }
 
     /// One fixed tick of `dt` seconds.
@@ -518,7 +535,7 @@ impl Player {
             self.waited = self.waited.saturating_add(1);
             let floor_coming = self.models_coming
                 && self.waited < LAND_WAIT
-                && self.land_from.and_then(near).is_none();
+                && (self.floor_gone || self.land_from.and_then(near).is_none());
             self.settled = if self.streaming || floor_coming {
                 0
             } else {
@@ -536,11 +553,22 @@ impl Player {
                     .and_then(near)
                     .or_else(top)
             {
+                if self.floor_gone {
+                    self.floor_landed = true;
+                    eprintln!(
+                        "player: her floor gone, she lands at y {y:.1} after {} ticks \
+                         (models coming {}, top {:?})",
+                        self.waited,
+                        self.models_coming,
+                        top()
+                    );
+                }
                 self.character.position.y = y + 0.05;
                 self.landed = true;
                 self.land_from = None;
                 self.settled = 0;
                 self.waited = 0;
+                self.floor_gone = false;
             }
             self.camera(physics);
             return;
@@ -1117,26 +1145,57 @@ mod tests {
         );
         physics.step(1.0 / 60.0);
         let dt = 1.0 / 60.0;
-        let land = |p: &mut Player| {
+        let land = |p: &mut Player, physics: &Physics| {
             for _ in 0..usize::from(SETTLED) {
-                p.update(&physics, Intent::default(), dt);
+                p.update(physics, Intent::default(), dt);
             }
             assert!(p.landed);
             p.character.position.y
         };
         // A spawn's x and z alone: the top of what is there.
         let mut p = Player::new(1.0, 1.0, 0.0, None);
-        assert!((land(&mut p) - 20.0).abs() < 0.2);
+        assert!((land(&mut p, &physics) - 20.0).abs() < 0.2);
         // Put down at the ground's height: the ground under the roof.
         p.drop_at(Vec3::new(1.0, 10.5, 1.0));
-        assert!((land(&mut p) - 10.0).abs() < 0.2);
+        assert!((land(&mut p, &physics) - 10.0).abs() < 0.2);
         // Nothing near under the spot: the top again.
         p.drop_at(Vec3::new(1.0, 200.0, 1.0));
-        assert!((land(&mut p) - 20.0).abs() < 0.2);
+        assert!((land(&mut p, &physics) - 20.0).abs() < 0.2);
         // Moved since she was put down: where she is now decides.
         p.drop_at(Vec3::new(1.0, 10.5, 1.0));
         p.character.position = Vec3::new(30.0, 0.0, 30.0);
-        assert!((land(&mut p) - 10.0).abs() < 0.2);
+        assert!((land(&mut p, &physics) - 10.0).abs() < 0.2);
+
+        // On the roof, it is taken down (a state layer went) while the
+        // next layer's models load: she stays up, though the ground is
+        // there below, and lands on the floor they bring.
+        p.drop_at(Vec3::new(1.0, 20.5, 1.0));
+        assert!((land(&mut p, &physics) - 20.0).abs() < 0.2);
+        physics.remove_static(StaticKey::Cell(2));
+        physics.add_static(
+            StaticKey::Cell(3),
+            &roof,
+            Vec3::new(0.0, 19.0, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.remove_static(StaticKey::Cell(3));
+        physics.step(dt);
+        p.floor_went();
+        p.models_coming = true;
+        for _ in 0..30 {
+            p.update(&physics, Intent::default(), dt);
+        }
+        assert!(!p.landed);
+        assert!((p.character.position.y - 20.0).abs() < 0.2, "she waited");
+        physics.add_static(
+            StaticKey::Cell(3),
+            &roof,
+            Vec3::new(0.0, 19.0, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.step(dt);
+        p.models_coming = false;
+        assert!((land(&mut p, &physics) - 19.0).abs() < 0.2);
     }
 
     #[test]
