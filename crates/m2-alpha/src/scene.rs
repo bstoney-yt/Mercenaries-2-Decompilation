@@ -2562,7 +2562,7 @@ impl Scene {
             };
             if !player.down
                 && !player.seated
-                && !player.swimming()
+                && !player.weapons_away()
                 && let Some(w) = weapon
                 && let Some(at) = self.arsenal.in_hand(
                     w,
@@ -2578,7 +2578,7 @@ impl Scene {
             // seated: it would go through the seat's back, and the one
             // she holds isn't drawn there either).
             let holding = !fight.designator && player.throwing.is_none() && !player.down;
-            let slung = if player.seated || player.swimming() {
+            let slung = if player.seated || player.weapons_away() {
                 [None; 2]
             } else {
                 fight.slung(holding)

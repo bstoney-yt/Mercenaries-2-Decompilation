@@ -130,7 +130,12 @@ pub const KINDS: [&str; 16] = [
 /// Kinds the game delivers itself through `Event.__m2_fire` (besides
 /// every `Gui...` kind), never checked against the world: not reported
 /// as unhandled.
-const ENGINE_FIRED: [&str; 2] = ["TogglePDA", "PlayerCashChanged"];
+const ENGINE_FIRED: [&str; 4] = [
+    "TogglePDA",
+    "PlayerCashChanged",
+    "ShowSaveIcon",
+    "HideSaveIcon",
+];
 
 #[derive(Debug)]
 struct Pending {

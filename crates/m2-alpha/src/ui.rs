@@ -649,6 +649,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
         // The scripts' markers in the world, under the HUD.
         if let (Some(m), Some(vp)) = (&info.mission, info.view_proj) {
             let here = info.game.as_ref().and_then(|s| s.position).map(Vec3::from);
+            ground_discs(&painter, screen, vp, m, here);
             world_markers(&painter, screen, vp, m, game, here);
         }
         game.paint(&painter);
@@ -1343,6 +1344,45 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             14.0,
             colour,
         );
+    }
+}
+
+/// How far off a disc on the ground is drawn, metres (invented).
+const DISC_RANGE: f32 = 150.0;
+
+/// The scripts' discs on the ground (`Marker.AddDisc`: the wardrobe's, a
+/// delivery's drop-off): a ring of their radius in their colour, filled
+/// faintly, flat at its height. Drawn over the world as the markers are,
+/// so not hidden behind walls (inferred: the engine's own drawing of
+/// them isn't known); one partly behind the camera isn't drawn.
+fn ground_discs(
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    view_proj: Mat4,
+    m: &MissionView,
+    here: Option<Vec3>,
+) {
+    const SIDES: usize = 48;
+    for &(at, radius, [r, g, b]) in &m.discs {
+        if here.is_some_and(|h| h.distance(at) > DISC_RANGE) {
+            continue;
+        }
+        let points: Option<Vec<egui::Pos2>> = (0..SIDES)
+            .map(|i| {
+                let a = i as f32 / SIDES as f32 * std::f32::consts::TAU;
+                project(
+                    view_proj,
+                    at + Vec3::new(a.cos(), 0.0, a.sin()) * radius,
+                    screen,
+                )
+            })
+            .collect();
+        let Some(points) = points else { continue };
+        painter.add(egui::Shape::convex_polygon(
+            points,
+            Color32::from_rgba_unmultiplied(r, g, b, 50),
+            Stroke::new(2.0, Color32::from_rgba_unmultiplied(r, g, b, 200)),
+        ));
     }
 }
 

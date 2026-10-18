@@ -173,6 +173,9 @@ pub struct Game {
     /// Models taken only by their action hijack while crewed (an entrance
     /// in the data, [`crate::hijack`]): the use key doesn't get her in.
     pub hijack_only: HashSet<u32>,
+    /// Vehicles (by guid) the scripts keep for themselves
+    /// (`Vehicle.Usable(vehicle, false)`): the use key doesn't get her in.
+    pub unusable: HashSet<u32>,
     /// The field of view (degrees, bottom to top) and the screen's width
     /// over its height the last frame was drawn with: what the scripts'
     /// camera sees (`Event.ObjectIsVisible`).
@@ -187,6 +190,9 @@ pub struct Game {
     /// The scripts' camera shot for a scene (the HQ's briefings), while
     /// it lasts: the frame is seen from it ([`Shot::view`]).
     pub shot: Option<Shot>,
+    /// Seconds the HUD's save icon has left up after the game was saved
+    /// ([`SAVE_ICON_SECONDS`]).
+    pub save_icon: f32,
 }
 
 /// A camera shot the scripts asked for (`Camera.SetShot`): the engine's
@@ -207,6 +213,12 @@ pub struct Shot {
 /// Invented (the engine's shot table is not read, and these are not yet
 /// checked against the footage of the HQ's briefings).
 const SHOULDER_UP: f32 = 1.65;
+
+/// How long the HUD's save icon stays up once the game is saved, seconds:
+/// the HUD's own icon (`HandleSaveIconShow`) takes `_knSaveIconTime`
+/// (0.5 s, from the scripts) to come in and as long to go; a second
+/// between is invented (the save itself is at once here).
+pub const SAVE_ICON_SECONDS: f32 = 2.0;
 const SHOULDER_BACK: f32 = 1.1;
 const SHOULDER_ASIDE: f32 = 0.45;
 const SHOULDER_LOOK_UP: f32 = 1.5;
@@ -321,11 +333,13 @@ impl Game {
             placed: crate::placed::Placed::default(),
             input_locked: false,
             hijack_only: HashSet::new(),
+            unusable: HashSet::new(),
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
             context: None,
             context_taken: None,
             shot: None,
+            save_icon: 0.0,
         }
     }
 
@@ -714,6 +728,7 @@ impl Game {
 
     /// One fixed tick with `intent` for the player (ignored while flying).
     pub fn step(&mut self, intent: Intent, dt: f32) {
+        self.save_icon = (self.save_icon - dt).max(0.0);
         if let Some((every, run, since)) = &mut self.census {
             *run += dt;
             *since += dt;
@@ -855,8 +870,13 @@ impl Game {
                             self.combat.manned = Some(m);
                         }
                         None => {
-                            player.driving =
-                                nearest(physics, &scene.vehicles, &self.hijack_only, player, REACH);
+                            player.driving = nearest(
+                                physics,
+                                &scene.vehicles,
+                                (&self.hijack_only, &self.unusable),
+                                player,
+                                REACH,
+                            );
                             // Seated: she no longer waits to land (people
                             // wait on that, and she may have hopped out and
                             // back in before the ground streamed).
@@ -1131,10 +1151,10 @@ impl Game {
                 explosives: &mut scene.explosives,
             };
             crate::spans::time("on foot: combat", || {
-                // Swimming, her weapons are away: nothing to fire, aim or
-                // throw (the on-foot table's `Swim` stance has no firing
-                // or aiming rows).
-                let trigger = if field.player.swimming() {
+                // Her weapons away (swimming, or put away by the scripts):
+                // nothing to fire, aim or throw (the on-foot table's `Swim`
+                // stance has no firing or aiming rows).
+                let trigger = if field.player.weapons_away() {
                     crate::combat::Trigger::default()
                 } else {
                     intent.trigger
@@ -1781,7 +1801,7 @@ impl Game {
             (Some(w), Some(p)) if p.driving.is_none() && p.landed => nearest(
                 &w.physics,
                 &self.scene.vehicles,
-                &self.hijack_only,
+                (&self.hijack_only, &self.unusable),
                 p,
                 REACH,
             )
@@ -1888,7 +1908,7 @@ impl Game {
         player.driving = nearest(
             &world.physics,
             &self.scene.vehicles,
-            &self.hijack_only,
+            (&self.hijack_only, &self.unusable),
             player,
             reach,
         );
@@ -3118,7 +3138,7 @@ fn put_out(
 fn nearest(
     physics: &Physics,
     vehicles: &[ParkedVehicle],
-    hijack_only: &HashSet<u32>,
+    (hijack_only, unusable): (&HashSet<u32>, &HashSet<u32>),
     player: &Player,
     reach: f32,
 ) -> Option<usize> {
@@ -3131,6 +3151,8 @@ fn nearest(
         // 5: the villa's tank, whose scripts make it usable by the hijack
         // alone, `Vehicle.Usable(tank, false)`, was got into at a press).
         .filter(|(_, v)| !(hijack_only.contains(&v.spec.model) && has_driver(&v.crew)))
+        // Kept by the scripts for themselves (`Vehicle.Usable(v, false)`).
+        .filter(|(_, v)| !v.guid.is_some_and(|g| unusable.contains(&g)))
         // One with someone in the driver's seat is taken from them: the
         // action hijacks (tanks, helicopters) took the key first if near
         // ([`crate::hijack`]); cars, bikes and jeeps have none in the data

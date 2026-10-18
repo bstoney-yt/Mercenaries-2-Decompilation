@@ -182,6 +182,25 @@ pub enum Command {
     /// Open a gate or door (`Object.OpenGate`): PmcCon001's villa doors
     /// as the player comes near them.
     OpenGate(u32),
+    /// Shut a gate or door again (`Object.CloseGate`).
+    CloseGate(u32),
+    /// Whether `guid` may take up its weapons (`Human.DisableWeapons` and
+    /// `EnableWeapons`): the HQ's briefings put the starter's and the
+    /// player's away, a teleport the hero's while she moves.
+    Weapons {
+        guid: u32,
+        on: bool,
+    },
+    /// Whether vehicle `guid` may be got into (`Vehicle.Usable(vehicle,
+    /// usable)`): story vehicles the scripts keep for themselves (JetCon001's
+    /// scramble copter, ChiCon009's ZBD2000, a race's tank).
+    Usable {
+        guid: u32,
+        on: bool,
+    },
+    /// The player's fuel goes up by this (`Player.AddFuel`: a fuel
+    /// pickup's script), up to the tanks' capacity.
+    AddFuel(f32),
     /// Seat a character in a vehicle (seat as the scripts name it, `"d"`
     /// for the driver); `instant` skips the climb-in.
     EnterVehicle {
@@ -1377,6 +1396,18 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // (gate): shuts it again (3 scripts: the mine's gate, `vz_mine_gate`,
+    // and two outposts' gate scripts once their convoy is through).
+    add(&object, "CloseGate", |w, _, a| {
+        let gate = id(a.first()).or_else(|| match a.first() {
+            Some(Value::String(s)) => w.by_name(&s.to_string_lossy()),
+            _ => None,
+        });
+        if let Some(guid) = gate {
+            w.commands.push(Command::CloseGate(guid));
+        }
+        values([])
+    })?;
     // What an object is a copy of: a weapon's template (saves keep it and
     // hand it back to `SetAllWeapons`), a spawned object's.
     add(&object, "GetParent", |w, _, a| {
@@ -1398,6 +1429,19 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Weapons as objects: a loadout of templates, each weapon with its own
     // reserve of ammunition.
     let human = lib("Human")?;
+    // Human.DisableWeapons(character) / EnableWeapons(character).
+    add(&human, "DisableWeapons", |w, _, a| {
+        if let Some(guid) = id(a.first()) {
+            w.commands.push(Command::Weapons { guid, on: false });
+        }
+        values([])
+    })?;
+    add(&human, "EnableWeapons", |w, _, a| {
+        if let Some(guid) = id(a.first()) {
+            w.commands.push(Command::Weapons { guid, on: true });
+        }
+        values([])
+    })?;
     // Human.IsSwimming(character): out of her depth in the water, as the
     // game says ([`ScriptWorld::swimming`]); a vehicle's script asks it of
     // a character before acting (7c99e43e).
@@ -1721,6 +1765,19 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // Player.AddFuel(amount): a fuel pickup's script (133dde94) adds its
+    // amount once it checked her tanks have room; clamped to the
+    // capacity here too.
+    add(&player, "AddFuel", |w, _, a| {
+        if let Some(n) = num(a.first()) {
+            let cap = w.fuel_capacity.unwrap_or(100.0);
+            if let Some(o) = w.player.and_then(|p| w.objects.get_mut(&p)) {
+                o.fuel = (o.fuel + n).clamp(0.0, cap);
+            }
+            w.commands.push(Command::AddFuel(n));
+        }
+        values([])
+    })?;
     add(&player, "GetFuel", |w, _, _| {
         let fuel = w
             .player
@@ -1825,6 +1882,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&vehicle, "GetFromRider", |w, _, a| {
         values([guid_value(id(a.first()).and_then(|g| w.vehicle_of(g)))])
+    })?;
+    // Vehicle.Usable(vehicle, usable): all three calls in the scripts pass
+    // false, for vehicles the scripts keep for themselves.
+    add(&vehicle, "Usable", |w, _, a| {
+        if let Some(guid) = id(a.first()) {
+            let on = !matches!(a.get(1), Some(Value::Boolean(false)));
+            w.commands.push(Command::Usable { guid, on });
+        }
+        values([])
     })?;
     add(&vehicle, "GetRiders", |w, lua, a| {
         let v = id(a.first());
@@ -2812,6 +2878,38 @@ mod tests {
             world.borrow_mut().take_commands(),
             [Command::OpenGate(50), Command::OpenGate(50)]
         );
+    }
+
+    #[test]
+    fn gates_weapons_usable_vehicles_and_fuel_reach_the_game() {
+        let (host, world) = setup();
+        world.borrow_mut().fuel_capacity = Some(50.0);
+        host.lua()
+            .load(
+                "Object.CloseGate('_global_veh_jeep 0x0001')\n\
+                 Human.DisableWeapons(Player.GetAnyCharacter())\n\
+                 Human.EnableWeapons(Player.GetAnyCharacter())\n\
+                 Vehicle.Usable(Pg.GetGuidByName('_global_veh_jeep 0x0001'), false)\n\
+                 Player.AddFuel(80)",
+            )
+            .exec()
+            .unwrap();
+        let mut w = world.borrow_mut();
+        assert_eq!(
+            w.take_commands(),
+            [
+                Command::CloseGate(50),
+                Command::Weapons { guid: 1, on: false },
+                Command::Weapons { guid: 1, on: true },
+                Command::Usable {
+                    guid: 50,
+                    on: false
+                },
+                Command::AddFuel(80.0),
+            ]
+        );
+        // Up to the tanks' capacity.
+        assert_eq!(w.objects[&1].fuel, 50.0);
     }
 
     #[test]

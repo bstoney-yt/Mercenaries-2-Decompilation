@@ -3148,7 +3148,9 @@ fn mission_for_screenshot(
         }
         // The saves the scripts ask for are written, as in play.
         for slot in link.take_saves() {
-            write_save(game, Some(&link), &save::SaveGame::slot_path(&slot));
+            if write_save(game, Some(&link), &save::SaveGame::slot_path(&slot)) {
+                game.save_icon = game::SAVE_ICON_SECONDS;
+            }
         }
         // With --placed-check, what the layers have put out is tried
         // every few seconds ([`placed::check`]).
@@ -6200,7 +6202,9 @@ impl Running {
     /// Writes the game to `path`, with her cash, fuel and support stock as
     /// the scripts hold them.
     fn save_to(&mut self, path: &std::path::Path) {
-        write_save(&self.game, self.mission.as_ref(), path);
+        if write_save(&self.game, self.mission.as_ref(), path) {
+            self.game.save_icon = game::SAVE_ICON_SECONDS;
+        }
     }
 
     /// Loads the newest save: the player's own, or the scripts' autosave.

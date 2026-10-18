@@ -323,6 +323,9 @@ pub struct Player {
     pub binoculars: Option<Binoculars>,
     /// Picking a weapon up: the clip and seconds in (she stands).
     pub picking: Option<(usize, f32)>,
+    /// The scripts put her weapons away (`Human.DisableWeapons`): none is
+    /// drawn or fired until `EnableWeapons`.
+    pub holstered: bool,
     /// In the water, out of her depth: she swims ([`Swim`]).
     pub swim: Option<Swim>,
 }
@@ -337,6 +340,13 @@ impl Player {
     /// Whether she swims.
     pub fn swimming(&self) -> bool {
         self.swim.is_some()
+    }
+
+    /// Whether her weapons are away: swimming, or put away by the scripts
+    /// ([`holstered`](Self::holstered)). None is drawn in her hands or on
+    /// her back, and nothing fires.
+    pub fn weapons_away(&self) -> bool {
+        self.swimming() || self.holstered
     }
 
     /// Swims her when the sea under her is out of her depth
@@ -459,6 +469,7 @@ impl Player {
             picking: None,
             binoculars: None,
             swim: None,
+            holstered: false,
         }
     }
 

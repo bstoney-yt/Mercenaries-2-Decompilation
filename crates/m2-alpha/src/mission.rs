@@ -134,6 +134,8 @@ pub struct MissionView {
     pub key_names: Vec<(String, String)>,
     /// Markers over targets.
     pub markers: Vec<MarkerView>,
+    /// Discs on the ground (`Marker.AddDisc`): centre, radius, colour.
+    pub discs: Vec<(Vec3, f32, [u8; 3])>,
     /// The newest objective message: completed (or else added), and text.
     pub message: Option<(bool, String)>,
     /// The same message as the scripts sent it, for the game's own HUD to
@@ -1900,6 +1902,18 @@ impl MissionLink {
             objectives = hud.mission.iter().map(|(t, _)| mission.text(t)).collect();
         }
         objectives.dedup();
+        let discs = hud
+            .discs
+            .values()
+            .filter_map(|d| {
+                let at = match (d.at, d.target.and_then(|g| w.objects.get(&g))) {
+                    (Some(p), _) => Vec3::from(p),
+                    (None, Some(o)) => Vec3::from(o.position),
+                    (None, None) => return None,
+                };
+                Some((at + Vec3::Y * d.lift, d.radius, d.colour))
+            })
+            .collect();
         let markers = hud
             .markers
             .values()
@@ -1932,6 +1946,7 @@ impl MissionLink {
             key_names: crate::input::token_keys(&self.keys),
             objectives,
             markers,
+            discs,
             message,
             game_message,
             contract_complete: self.completed.is_some_and(|age| age < BANNER_TIME),
@@ -3065,6 +3080,46 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 _ => eprintln!(
                     "mission: Object.OpenGate {name} ({guid:#x}): no model of it up to open"
                 ),
+            }
+            return false;
+        }
+        // Shut again: its model and collision go back up where its layer
+        // has it (as OpenGate took them down).
+        Command::CloseGate(guid) => {
+            let put = game.scene.show_props([*guid]);
+            eprintln!(
+                "mission: Object.CloseGate {guid:#x}: {}",
+                if put > 0 {
+                    "shut, its model and collision back up"
+                } else {
+                    "already shut, or not a layer's model here"
+                }
+            );
+            return false;
+        }
+        Command::Weapons { guid, on } if *guid == PLAYER => {
+            if let Some(p) = game.scene.player.as_mut()
+                && p.holstered == *on
+            {
+                p.holstered = !on;
+                eprintln!(
+                    "mission: her weapons {}",
+                    if *on { "back in her hands" } else { "put away" }
+                );
+            }
+            return false;
+        }
+        Command::Usable { guid, on } => {
+            let changed = if *on {
+                game.unusable.remove(guid)
+            } else {
+                game.unusable.insert(*guid)
+            };
+            if changed {
+                eprintln!(
+                    "mission: vehicle {guid:#x} {} to her",
+                    if *on { "usable again" } else { "kept from" }
+                );
             }
             return false;
         }

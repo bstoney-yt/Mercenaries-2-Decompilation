@@ -633,6 +633,9 @@ pub struct HudState {
     /// whether she can be flown out, and its cost
     /// ([`crate::mission::MissionLink::medevac_state`]).
     pub medevac: Option<(bool, f64)>,
+    /// The game was just saved: the HUD's save icon is up
+    /// ([`crate::game::SAVE_ICON_SECONDS`]).
+    pub saving: bool,
     /// The contract's objectives for the PDA: text id and icon tag each
     /// (`MissionView::pda_objectives`).
     pub pda_objectives: Vec<(String, String)>,
@@ -852,6 +855,7 @@ impl HudState {
             facing: player.map_or(0.0, |p| p.facing.to_degrees()),
             hurts,
             sea_level: game.scene.world.as_ref().map(|w| w.settings.sea_level),
+            saving: game.save_icon > 0.0,
             hero: Some((game.scene.hero, game.combat.max_hp)),
             binoculars: game.walking().and_then(|p| {
                 p.binoculars.map(|b| binoculars::View {
@@ -1781,6 +1785,8 @@ fn run(
 /// What the HUD has been told, to fire only what changed.
 #[derive(Default)]
 struct Told {
+    /// The save icon was asked up ([`HudState::saving`]).
+    saving: bool,
     hp: Option<(i32, bool)>,
     /// The gun in her hands, whether she holds the designator, and whether
     /// she drives a vehicle with a cannon.
@@ -3182,6 +3188,18 @@ impl Thread {
             lua.load(MEDEVAC)
                 .set_name("=m2-hud medevac")
                 .call::<()>((can, cost))?;
+        }
+        // The save icon (the HUD's own skull and "Saving", which its
+        // loading-screen module shows on `ShowSaveIcon` and takes down on
+        // `HideSaveIcon`), as the game saves.
+        if s.saving != self.told.saving {
+            self.told.saving = s.saving;
+            let event = if s.saving {
+                "ShowSaveIcon"
+            } else {
+                "HideSaveIcon"
+            };
+            gui_runtime::fire(lua, event, ())?;
         }
         let first = self.told.hp.is_none();
         if first {

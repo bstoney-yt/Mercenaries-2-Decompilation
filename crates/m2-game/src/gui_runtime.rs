@@ -1271,22 +1271,17 @@ fn sprite_uv(w: &Widget) -> [f32; 4] {
     [u, v, u + fw / tw, v + fh / th]
 }
 
-/// Maps `r` as it sat in `from` onto `to`, per axis (a zero-size `from`
-/// axis only moves).
+/// Maps `r` as it sat in `from` onto `to`: it moves with the parent's
+/// corner, keeping its own size and its offset from that corner.
+///
+/// It once stretched with the parent too. The game's dialog boxes
+/// (`MrxGuiDialogBox._BuildDialogBox`) place their lines one under the
+/// other and only then size the box to fit them, so stretched, their
+/// lines were squeezed together and drawn over each other. Inferred from
+/// the scripts: they size and place each child themselves.
 fn map_rect(r: [f32; 4], from: [f32; 4], to: [f32; 4]) -> [f32; 4] {
-    let axis = |v: f32, a0: f32, a1: f32, b0: f32, b1: f32| {
-        if (a1 - a0).abs() < 1e-6 {
-            v + (b0 - a0)
-        } else {
-            b0 + (v - a0) * (b1 - b0) / (a1 - a0)
-        }
-    };
-    [
-        axis(r[0], from[0], from[2], to[0], to[2]),
-        axis(r[1], from[1], from[3], to[1], to[3]),
-        axis(r[2], from[0], from[2], to[0], to[2]),
-        axis(r[3], from[1], from[3], to[1], to[3]),
-    ]
+    let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
+    [r[0] + dx, r[1] + dy, r[2] + dx, r[3] + dy]
 }
 
 /// The anchor a script names (`left`, `center`, `right`, `top`, `bottom`).
@@ -2525,10 +2520,11 @@ mod tests {
             G.SetWidgetLocation(p, 0, 0, 100, 100)
             G.SetWidgetLocation(c, 10, 20, 30, 40)
             G.AddWidgetChild(p, c)
-            -- Moved and squashed to zero height, then back.
+            -- Moved and squashed to zero height: it moves with the corner,
+            -- keeping its size; then back.
             G.SetWidgetLocation(p, 50, 50, 150, 50)
             local _, y1, _, y2 = G.GetWidgetLocation(c)
-            assert(y1 == 50 and y2 == 50)
+            assert(y1 == 70 and y2 == 90)
             G.SetWidgetLocation(p, 50, 0, 150, 100)
             "#,
         );
