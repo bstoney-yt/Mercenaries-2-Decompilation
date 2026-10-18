@@ -408,7 +408,9 @@ end
 /// menus this way (`MrxBriefing`'s `[Briefing.Bribe]`, `[Generic.Exit]`
 /// list after `LTILibName.ChangeShellState(true)`), and the contract's
 /// description with its Accept and Decline
-/// (`MrxGuiDialogBox.DisplayScrollingDialogBox`, method `Scroll`).
+/// (`MrxGuiDialogBox.DisplayScrollingDialogBox`, method `Scroll`), and a
+/// recruit's wager its digit box (`MrxGui.DisplayNumericBox`, method
+/// `Numeric`, with an accept and a cancel callback).
 const DIALOG_BOXES: &str = r##"
 __m2_dialog_wrapped = __m2_dialog_wrapped or setmetatable({}, { __mode = "k" })
 local function plain(v)
@@ -457,8 +459,32 @@ local function scrolling(owner, text, callback, args, options, ...)
     return open("Scroll", { sText = plain(text) or "", tOptions = texts(options),
         tRest = rest(...) }, callback, args)
 end
+-- DisplayNumericBox(owner, title, text, prefix, suffix, start, min, max,
+-- _, _, _, accept, accept args, cancel, cancel args, ...): the HQ's wager
+-- (`[Briefing.ChangeWagerQuery]`). The HUD answers the value accepted, or
+-- -1 - the value for a cancel; each callback gets its args and the value.
+local function numeric(owner, ...)
+    local a, n = { ... }, select("#", ...)
+    local accept, aargs, cancel, cargs = a[11], a[12], a[13], a[14]
+    local p = {}
+    for i = 1, 10 do p[i] = plain(a[i]) end
+    local tail = {}
+    for i = 15, n do tail[i - 14] = plain(a[i]) end
+    local function answer(v)
+        local f, args = accept, aargs
+        if v < 0 then f, args, v = cancel, cargs, -1 - v end
+        local call = {}
+        if type(args) == "table" then
+            for i = 1, table.getn(args) do call[i] = args[i] end
+        end
+        table.insert(call, v)
+        if type(f) == "function" then f(unpack(call)) end
+    end
+    return open("Numeric", { tArgs = p, nArgs = 10, tRest = tail, nRest = n - 14 }, answer, {})
+end
 __m2_dialog_wrapped[display] = true
 __m2_dialog_wrapped[scrolling] = true
+__m2_dialog_wrapped[numeric] = true
 local function close(box)
     if type(box) == "table" and type(box.Close) == "function" and box.__m2_dialog then
         box.Close(box)
@@ -480,6 +506,12 @@ function __m2_wrap_dialogs()
     if type(g) == "table" then
         wrap(g, "DisplayDialogBox", display)
         wrap(g, "CloseDialogBox", close)
+        wrap(g, "DisplayNumericBox", numeric)
+    end
+    local nb = rawget(_G, "MrxGuiNumericBox")
+    if type(nb) == "table" then
+        wrap(nb, "DisplayNumericBox", numeric)
+        wrap(nb, "Close", close)
     end
 end
 __m2_wrap_dialogs()
@@ -4010,6 +4042,35 @@ mod tests {
         let calls = hud_calls(&lua);
         let methods: Vec<&str> = calls.iter().map(|c| c.method.as_str()).collect();
         assert_eq!(methods, ["Display", "Scroll", "Close"]);
+        // The wager's digit box, as the HQ's `_ChangeWager` calls it: the
+        // HUD answers the value, or -1 - the value for a cancel.
+        lua.load(
+            r#"MrxGui.DisplayNumericBox = function() error("drawn here") end
+            __m2_wrap_dialogs()
+            local function n(...) MrxGui.DisplayNumericBox(1, "[Briefing.ChangeWagerQuery]", "",
+                "$", ".0 K", 20000, 10000, 50000, 5, 3, 5,
+                function(tag, v) picked = { tag, v } end, { "accept" },
+                function(tag, v) picked = { tag, v } end, { "cancel" },
+                48, 36, "right", "bottom", false) end
+            n() n()"#,
+        )
+        .exec()
+        .unwrap();
+        let calls = hud_calls(&lua);
+        let numeric: Vec<u64> = calls
+            .iter()
+            .filter(|c| c.method == "Numeric")
+            .map(|c| c.seq)
+            .collect();
+        assert_eq!(numeric.len(), 2);
+        let answer = |seq, v| {
+            lua.load(choice_code(seq, v)).exec().unwrap();
+            lua.load("return picked[1], picked[2]")
+                .eval::<(String, i64)>()
+                .unwrap()
+        };
+        assert_eq!(answer(numeric[0], 30000), ("accept".into(), 30000));
+        assert_eq!(answer(numeric[1], -1 - 20000), ("cancel".into(), 20000));
     }
 
     #[test]

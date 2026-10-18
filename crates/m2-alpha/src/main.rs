@@ -3374,6 +3374,8 @@ fn mission_for_screenshot(
                     let b = match name {
                         "up" => Some("BUTTON_PAD1_U"),
                         "down" => Some("BUTTON_PAD1_D"),
+                        "left" => Some("BUTTON_PAD1_L"),
+                        "right" => Some("BUTTON_PAD1_R"),
                         "accept" => Some("BUTTON_PAD2_D"),
                         "back" => Some("BUTTON_PAD2_R"),
                         _ => None,
@@ -4102,13 +4104,17 @@ struct ContextCheck {
 
 /// The pad button a key stands for in a dialog box the scripts put up
 /// (`MrxGuiDialogBox._HandleInputEvent` reads the pad's d-pad or left
-/// stick up and down, A to take the option, B to back out): the arrows or
-/// W and S step, Enter, Space or E take, Escape or Backspace back out.
-/// Which keys is invented (the PC's bindings for the box aren't read).
+/// stick up and down, A to take the option, B to back out; the wager's
+/// `MrxGuiNumericBox` left and right too, between its digits and its
+/// buttons): the arrows or WASD step, Enter, Space or E take, Escape or
+/// Backspace back out. Which keys is invented (the PC's bindings for the
+/// boxes aren't read).
 fn dialog_button(code: KeyCode) -> Option<&'static str> {
     Some(match code {
         KeyCode::ArrowUp | KeyCode::KeyW => "BUTTON_PAD1_U",
         KeyCode::ArrowDown | KeyCode::KeyS => "BUTTON_PAD1_D",
+        KeyCode::ArrowLeft | KeyCode::KeyA => "BUTTON_PAD1_L",
+        KeyCode::ArrowRight | KeyCode::KeyD => "BUTTON_PAD1_R",
         KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space | KeyCode::KeyE => "BUTTON_PAD2_D",
         KeyCode::Escape | KeyCode::Backspace => "BUTTON_PAD2_R",
         _ => return None,
