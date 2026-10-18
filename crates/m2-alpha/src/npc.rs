@@ -1118,7 +1118,10 @@ impl Npc {
                         .cast_ray(at + Vec3::Y, -Vec3::Y, SEA_LOOK + WET + 1.0)
                         .is_some_and(|(d, _)| at.y + 1.0 - d < water - WET))
         };
-        if deep(now) && !deep(before) {
+        // In it already, they walk out, not further in (stood up from a
+        // swim, they went back out of their depth and swam again).
+        let deeper = deep(before) && now.y < before.y - 0.01;
+        if deep(now) && (!deep(before) || deeper) {
             self.character.position = before;
             self.character.velocity = Vec3::ZERO;
         }
