@@ -44,8 +44,8 @@
 //! spot:<x>,<z>[,<r>]        what stands near a spot (default 30 m): models
 //!                           with their techniques and textures, and the
 //!                           layer entities with their components' fields
-//! music                     every music region (faction, area); the score's
-//!                           faction over a 25 m grid and at each start point
+//! music                     every sound region (faction, ambience, area); the
+//!                           score and ambience over a 25 m grid and at starts
 //! atmospheres[:<word>,..]   every atmosphere region (area, centre) with
 //!                           its records' time of day, sunlight, clouds,
 //!                           top ambient light and haze; then the region
@@ -940,6 +940,7 @@ fn main() -> Result<(), Error> {
                 }
             }),
             "banks" => banks(&mut source, &names),
+            "ambience" => ambience(&install, &mut source, &names),
             "sounds" => sounds(&mut source, &names, arg),
             "hashes" => hashes(&mut source, &names, arg),
             "soundkeys" => soundkeys(&mut source, &names),
@@ -1135,7 +1136,8 @@ fn main() -> Result<(), Error> {
                 if world.is_none() {
                     world = Some(WorldIndex::build(&mut source)?);
                 }
-                music_regions(world.as_ref().expect("just built"), &names);
+                let stems = block_stems(&mut source);
+                music_regions(world.as_ref().expect("just built"), &names, &stems);
                 Ok(())
             }
             "find" => {
@@ -1227,16 +1229,292 @@ fn atmospheres(world: &WorldIndex, names: &Names, arg: &str) {
     }
 }
 
-/// Every music region (faction, area, centre); then the free-play score's
-/// faction over a 25 m grid across the regions' bounds, and at every
-/// start point (outside every region the root, `freeplay_city`).
-fn music_regions(world: &WorldIndex, names: &Names) {
-    use m2_engine::music_regions::region_at;
-    let regions = &world.music_regions;
-    let faction = |r: Option<&m2_engine::music_regions::MusicRegion>| {
-        r.map_or("freeplay_city (root)".to_owned(), |r| {
-            names.show(r.faction).to_owned()
-        })
+/// The `SoundAmbience` regions: each one's fields (banks named by the
+/// `amb_*` block they sit in); each named bank's cue table (cues, loops,
+/// records with their volume, distances and variants); and the streams
+/// of `ambience.pws`.
+fn ambience<R: Read + Seek>(
+    install: &Install,
+    source: &mut AssetSource<R>,
+    names: &Names,
+) -> Result<(), Error> {
+    let index = source.archive().index();
+    let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
+    // Banks by the stem of their block's file: `amb_jungle`.
+    let mut banks: HashMap<u32, String> = HashMap::new();
+    for p in &paths {
+        let file = p.rsplit('\\').next().unwrap_or(p);
+        let stem = file.split("_P0").next().unwrap_or(file);
+        banks.insert(m2_assets::name_hash(stem), stem.to_owned());
+    }
+    let show = |h: u32| -> String {
+        if h == 0 {
+            return "0".into();
+        }
+        match banks.get(&h) {
+            Some(b) => format!("{b} ({h:08x})"),
+            None => format!("{} ({h:08x})", names.show(h)),
+        }
+    };
+    let mut layer_blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    layer_blocks.sort_unstable();
+    layer_blocks.dedup();
+    let mut used: BTreeMap<u32, usize> = BTreeMap::new();
+    for b in layer_blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(layer) = Layer::parse(data) else {
+                continue;
+            };
+            let Some(c) = layer.component("SoundAmbience") else {
+                continue;
+            };
+            let entity_names = layer.names();
+            let music = layer.hashes("MusicRegion");
+            println!(
+                "layer {} ({} regions); fields {}",
+                names.show(e.name_hash),
+                c.count,
+                c.fields
+                    .iter()
+                    .map(|f| format!(
+                        "{}@{} t{}",
+                        names
+                            .get(f.name_hash)
+                            .map_or(format!("{:08x}", f.name_hash), str::to_owned),
+                        f.offset,
+                        f.ty
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let mut rows: Vec<(u32, &[u8])> = c.records().unwrap_or_default();
+            rows.sort_unstable_by_key(|r| r.0);
+            for (entity, rec) in rows {
+                let words: Vec<String> = c
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        let o = usize::from(f.offset);
+                        let w = rec
+                            .get(o..o + 4)
+                            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                        if f.ty == 6 {
+                            *used.entry(w).or_default() += 1;
+                            show(w)
+                        } else {
+                            format!("{w:#x}")
+                        }
+                    })
+                    .collect();
+                println!(
+                    "  {entity:08x} {:40} {}{}",
+                    entity_names.get(&entity).copied().unwrap_or("?"),
+                    words.join(" | "),
+                    music
+                        .get(&entity)
+                        .map_or(String::new(), |f| format!("  [music {}]", names.show(*f)))
+                );
+            }
+        }
+    }
+    println!("hashes named by the regions:");
+    for (h, n) in &used {
+        println!("  {n:3} {}", show(*h));
+    }
+    for (&h, _) in used.iter().filter(|(h, _)| **h != 0) {
+        let Ok(data) = source.asset(h, m2_assets::voice::CUE_TABLE_TYPE) else {
+            println!("table {}: none", show(h));
+            continue;
+        };
+        let Ok(t) = m2_assets::CueTable::parse(&data) else {
+            println!("table {}: does not parse", show(h));
+            continue;
+        };
+        println!(
+            "table {}: {} cues, {} mixes, {} records, {} lines, {} groups",
+            show(h),
+            t.cues.len(),
+            t.mixes.len(),
+            t.records.len(),
+            t.lines.len(),
+            t.groups.len()
+        );
+        for c in &t.cues {
+            let r = t.records.get(c.record as usize);
+            println!(
+                "  cue {} record {} a {:.2} seconds {:.2}; volume {:.2}, {:.0}-{:.0} m, {} variants {:?}",
+                names.show(c.cue),
+                c.record,
+                c.a,
+                c.seconds,
+                r.map_or(0.0, |r| r.volume),
+                r.map_or(0.0, |r| r.min_distance),
+                r.map_or(0.0, |r| r.max_distance),
+                r.map_or(0, |r| r.variants.len()),
+                r.map(|r| r
+                    .variants
+                    .iter()
+                    .take(4)
+                    .map(|v| (show(v.0), v.1, v.2))
+                    .collect::<Vec<_>>())
+            );
+        }
+        for m in &t.mixes {
+            println!(
+                "  mix {} seconds {:.2}, {} tracks",
+                names.show(m.cue),
+                m.seconds,
+                m.tracks.len()
+            );
+        }
+    }
+    // Every cue table whose records play from those banks or from
+    // `ambience.pws`.
+    let streams = m2_engine::Streams::load(install, source).ok();
+    let ambience_hash = streams.as_ref().map_or(0, |s| s.ambience.hash);
+    println!("ambience.pws index hash {ambience_hash:08x}");
+    let index = source.archive().index();
+    let tables: Vec<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == m2_assets::voice::CUE_TABLE_TYPE)
+        .map(|a| a.name_hash)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    for h in tables {
+        let Ok(data) = source.asset(h, m2_assets::voice::CUE_TABLE_TYPE) else {
+            continue;
+        };
+        let Ok(t) = m2_assets::CueTable::parse(&data) else {
+            continue;
+        };
+        let hits = |b: u32| b == ambience_hash || used.contains_key(&b);
+        let n = t
+            .records
+            .iter()
+            .filter(|r| r.variants.iter().any(|v| hits(v.0)))
+            .count();
+        if n == 0 {
+            continue;
+        }
+        println!(
+            "table {} ({h:08x}): {n} of {} records play ambience; {} cues, {} mixes",
+            show(h),
+            t.records.len(),
+            t.cues.len(),
+            t.mixes.len()
+        );
+        for c in &t.cues {
+            let Some(r) = t.records.get(c.record as usize) else {
+                continue;
+            };
+            if !r.variants.iter().any(|v| hits(v.0)) {
+                continue;
+            }
+            println!(
+                "  cue {} ({:08x}) record {} a {:.2} seconds {:.2}; volume {:.2}, {:.0}-{:.0} m; {}",
+                names.show(c.cue),
+                c.cue,
+                c.record,
+                c.a,
+                c.seconds,
+                r.volume,
+                r.min_distance,
+                r.max_distance,
+                r.variants
+                    .iter()
+                    .map(|v| format!("{}#{} w{:.2}", show(v.0), v.1, v.2))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        for m in &t.mixes {
+            println!(
+                "  mix {} seconds {:.2}, {} tracks",
+                show(m.cue),
+                m.seconds,
+                m.tracks.len()
+            );
+            for k in &m.tracks {
+                let r = (k.table == h)
+                    .then(|| t.records.get(k.record as usize))
+                    .flatten();
+                println!(
+                    "    record {} (table {:08x}) start {:.2} weight {:.2} level {:.2}; {}",
+                    k.record,
+                    k.table,
+                    k.start,
+                    k.weight,
+                    k.level,
+                    r.map_or("?".to_owned(), |r| format!(
+                        "volume {:.2}, {:.0}-{:.0} m: {}",
+                        r.volume,
+                        r.min_distance,
+                        r.max_distance,
+                        r.variants
+                            .iter()
+                            .map(|v| format!("{}#{} w{:.2}", show(v.0), v.1, v.2))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                );
+            }
+        }
+        for (i, r) in t.records.iter().enumerate() {
+            if r.variants.iter().any(|v| hits(v.0))
+                && !t.cues.iter().any(|c| c.record as usize == i)
+            {
+                println!(
+                    "  record {i} (cue word {}) volume {:.2}, {:.0}-{:.0} m; {} variants, first {}",
+                    names.show(r.cue),
+                    r.volume,
+                    r.min_distance,
+                    r.max_distance,
+                    r.variants.len(),
+                    r.variants
+                        .first()
+                        .map_or(String::new(), |v| format!("{}#{}", show(v.0), v.1))
+                );
+            }
+        }
+    }
+    if let Some(streams) = streams {
+        println!("ambience.pws: {} streams", streams.ambience.streams.len());
+        for (i, s) in streams.ambience.streams.iter().enumerate() {
+            println!(
+                "  #{i} {} {} ch {} Hz {:.1} s",
+                show(s.hash),
+                s.channels,
+                s.rate,
+                s.seconds()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Every sound region (score faction, ambience cue, area, centre); then
+/// the score and ambience over a 25 m grid across the regions' bounds, and
+/// at every start point (outside every music region the root,
+/// `freeplay_city`).
+fn music_regions(world: &WorldIndex, names: &Names, stems: &HashMap<u32, String>) {
+    use m2_engine::sound_regions::{ambience_at, music_at};
+    let regions = &world.sound_regions;
+    let name = |h: u32| {
+        stems
+            .get(&h)
+            .cloned()
+            .unwrap_or_else(|| names.get(h).map_or(format!("{h:08x}"), str::to_owned))
     };
     let (mut lo, mut hi) = (m2_math::glam::Vec2::MAX, m2_math::glam::Vec2::MIN);
     for r in regions {
@@ -1251,59 +1529,95 @@ fn music_regions(world: &WorldIndex, names: &Names) {
             hi = hi.max(*p);
         }
         println!(
-            "region {} ({:08x}) {} area {:.0} km2 centre {:.0},{:.0}, {} corners",
+            "region {} ({:08x}) score {} ambience {} area {:.2} km2 centre {:.0},{:.0}, {} corners",
             r.name,
             r.entity,
-            names.show(r.faction),
+            r.faction.map_or("-".to_owned(), name),
+            r.ambience.map_or("-".to_owned(), name),
             r.area / 1e6,
             c.x,
             c.y,
             r.outline.len()
         );
     }
-    let mut grid: std::collections::BTreeMap<String, usize> = Default::default();
+    let score = |x: f32, z: f32| {
+        music_at(regions, x, z)
+            .and_then(|r| r.faction)
+            .map_or("freeplay_city (root)".to_owned(), name)
+    };
+    let ambience = |x: f32, z: f32| {
+        ambience_at(regions, x, z)
+            .and_then(|r| r.ambience)
+            .map_or("none".to_owned(), name)
+    };
+    let mut grid: [BTreeMap<String, usize>; 2] = Default::default();
     let mut cells = 0;
     let mut z = lo.y;
     while z <= hi.y {
         let mut x = lo.x;
         while x <= hi.x {
-            *grid.entry(faction(region_at(regions, x, z))).or_default() += 1;
+            *grid[0].entry(score(x, z)).or_default() += 1;
+            *grid[1].entry(ambience(x, z)).or_default() += 1;
             cells += 1;
             x += 25.0;
         }
         z += 25.0;
     }
     println!(
-        "{} regions; grid {:.0},{:.0} to {:.0},{:.0}, {cells} cells of 25 m:",
+        "{} regions ({} music, {} ambience); grid {:.0},{:.0} to {:.0},{:.0}, {cells} cells of 25 m:",
         regions.len(),
+        regions.iter().filter(|r| r.faction.is_some()).count(),
+        regions.iter().filter(|r| r.ambience.is_some()).count(),
         lo.x,
         lo.y,
         hi.x,
         hi.y
     );
-    for (f, n) in &grid {
-        println!(
-            "  {f}: {n} ({:.1} %)",
-            100.0 * *n as f32 / cells.max(1) as f32
-        );
+    for (what, g) in ["score", "ambience"].iter().zip(&grid) {
+        println!("  {what}:");
+        for (f, n) in g {
+            println!(
+                "    {f}: {n} ({:.1} %)",
+                100.0 * *n as f32 / cells.max(1) as f32
+            );
+        }
     }
-    let mut starts: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut starts: [BTreeMap<String, usize>; 2] = Default::default();
     for s in &world.starts {
-        let r = region_at(regions, s.position.x, s.position.z);
-        *starts.entry(faction(r)).or_default() += 1;
-        println!(
-            "start {} at {:.0},{:.0}: {} ({})",
-            s.name,
-            s.position.x,
-            s.position.z,
-            faction(r),
-            r.map_or("no region", |r| r.name.as_str())
+        let (a, b) = (
+            score(s.position.x, s.position.z),
+            ambience(s.position.x, s.position.z),
         );
+        println!(
+            "start {} at {:.0},{:.0}: score {a}, ambience {b}",
+            s.name, s.position.x, s.position.z
+        );
+        *starts[0].entry(a).or_default() += 1;
+        *starts[1].entry(b).or_default() += 1;
     }
     println!("{} start points:", world.starts.len());
-    for (f, n) in &starts {
-        println!("  {f}: {n}");
+    for (what, g) in ["score", "ambience"].iter().zip(&starts) {
+        println!("  {what}:");
+        for (f, n) in g {
+            println!("    {f}: {n}");
+        }
     }
+}
+
+/// Banks and other blocks by the name of their block's file
+/// (`amb_jungle`).
+fn block_stems<R: Read + Seek>(source: &mut AssetSource<R>) -> HashMap<u32, String> {
+    source
+        .archive()
+        .index()
+        .blocks()
+        .iter()
+        .map(|b| {
+            let file = b.path.rsplit('\\').next().unwrap_or(&b.path);
+            let stem = file.split("_P0").next().unwrap_or(file);
+            (m2_assets::name_hash(stem), stem.to_owned())
+        })
+        .collect()
 }
 
 /// The words of a section's argument, lower case.

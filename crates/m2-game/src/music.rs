@@ -10,7 +10,7 @@
 //! quiet.
 //!
 //! In free play the score follows the player: the music regions
-//! ([`m2_engine::music_regions`]) name `freeplay_jungle` or
+//! ([`m2_engine::sound_regions`]) name `freeplay_jungle` or
 //! `freeplay_water` where they lie, and the root faction (`freeplay_city`)
 //! plays outside them, once `ActivateFactionRegionMusic` has been called
 //! and while the faction is not locked. Changing faction keeps the state

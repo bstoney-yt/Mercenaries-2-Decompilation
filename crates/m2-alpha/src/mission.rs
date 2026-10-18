@@ -1107,11 +1107,11 @@ impl MissionLink {
         // The music region she is in: the free-play score follows it.
         if let Some(world) = &game.scene.world {
             let region =
-                m2_engine::music_regions::region_at(&world.index.music_regions, focus.x, focus.z);
+                m2_engine::sound_regions::music_at(&world.index.sound_regions, focus.x, focus.z);
             let entity = region.map(|r| r.entity);
             if self.music_region != Some(entity) {
                 self.music_region = Some(entity);
-                mission.music_region(region.map(|r| r.faction));
+                mission.music_region(region.and_then(|r| r.faction));
                 eprintln!(
                     "music: region {} at ({:.0}, {:.0}), score {}",
                     region.map_or("none", |r| r.name.as_str()),

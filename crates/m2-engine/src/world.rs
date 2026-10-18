@@ -987,9 +987,9 @@ pub struct WorldIndex {
     pub atmosphere: Option<Atmosphere>,
     /// The regions whose light differs from it (`vz_atmosphere_regions`).
     pub atmosphere_regions: Vec<AtmosphereRegion>,
-    /// Where the free-play score is the jungle's or the water's
-    /// (`vz_sfx_ambience`).
-    pub music_regions: Vec<crate::music_regions::MusicRegion>,
+    /// Where the free-play score is the jungle's or the water's, and which
+    /// ambience plays where (`vz_sfx_ambience`).
+    pub sound_regions: Vec<crate::sound_regions::SoundRegion>,
     /// How the placed props that move on their own move, by entity (state
     /// layers' and static layers' alike).
     pub motions: HashMap<u32, PropMotion>,
@@ -1318,10 +1318,12 @@ impl WorldIndex {
                             Some(m2_assets::Region::parse(&data).ok()?.corners)
                         }));
                 }
-                if layer.component("MusicRegion").is_some() {
+                if layer.component("MusicRegion").is_some()
+                    || layer.component("SoundAmbience").is_some()
+                {
                     world
-                        .music_regions
-                        .extend(crate::music_regions::read_regions(&layer, |h| {
+                        .sound_regions
+                        .extend(crate::sound_regions::read_regions(&layer, |h| {
                             let data = source.asset(h, m2_assets::region::REGION_TYPE).ok()?;
                             Some(m2_assets::Region::parse(&data).ok()?.corners)
                         }));
