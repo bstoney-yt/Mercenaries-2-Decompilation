@@ -11,8 +11,11 @@
 //!
 //! Not done: the engine's own action level (combat raising the score to
 //! `action` while dynamic music is on), the state timings and the
-//! transitions' sync kinds, and the source (radio) playlists. The first
-//! contract turns dynamic music off as it starts, so it needs none of it.
+//! transitions' sync kinds. The first contract turns dynamic music off as
+//! it starts, so it needs none of it.
+//!
+//! The radios' playlists are kept here too ([`Music::playlist`]); the game
+//! plays one near its radio (`m2_engine::music_source`).
 
 use std::collections::HashMap;
 
@@ -34,6 +37,9 @@ pub struct Music {
     playing: Option<String>,
     /// Picks among a state's cues.
     turn: usize,
+    /// The radios' playlists (`Sound.AddMusicSourcePlaylist`, filled by
+    /// `AddCueToMusicSourcePlaylist`), by name hash: their cues in order.
+    playlists: HashMap<u32, Vec<String>>,
 }
 
 impl Music {
@@ -66,6 +72,31 @@ impl Music {
         if let Some(f) = self.bindings.get_mut(&self.faction) {
             f.remove(&state.to_ascii_lowercase());
         }
+    }
+
+    /// A radio playlist named `name` (`mu_src_radio`), empty.
+    pub fn add_playlist(&mut self, name: &str) {
+        self.playlists
+            .insert(m2_assets::name_hash(name), Vec::new());
+    }
+
+    /// Cue `cue` goes on the end of playlist `name`.
+    pub fn add_to_playlist(&mut self, name: &str, cue: &str) {
+        self.playlists
+            .entry(m2_assets::name_hash(name))
+            .or_default()
+            .push(cue.to_owned());
+    }
+
+    pub fn clear_playlist(&mut self, name: &str) {
+        if let Some(p) = self.playlists.get_mut(&m2_assets::name_hash(name)) {
+            p.clear();
+        }
+    }
+
+    /// The cues of the playlist with name hash `hash` (a radio's).
+    pub fn playlist(&self, hash: u32) -> &[String] {
+        self.playlists.get(&hash).map_or(&[], Vec::as_slice)
     }
 
     /// Goes to `state`: returns the command for the game when what plays

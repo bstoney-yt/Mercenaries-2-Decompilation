@@ -204,7 +204,8 @@ m2-alpha [options]
                          the scripts allow it then (medevac-check lines)
   --visit-faction <f>    with --mission --after-contract: 30 s after the
                          contract, put her by a soldier of faction <f> (All,
-                         Chi, Gur, Oil, Pir, Vza), hurt one 15 s on, and log
+                         Chi, Gur, Oil, Pir, Vza; Radio: 10 m from the
+                         nearest radio), hurt one 15 s on, and log
                          who fights her (faction-check lines); <f>:watch
                          hurts nobody; a picture with the HUD 40 s on
                          (-faction40)

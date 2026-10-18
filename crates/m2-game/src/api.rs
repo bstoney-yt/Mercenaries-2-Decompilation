@@ -2490,6 +2490,27 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // The radios' playlists ([`crate::music::Music::playlist`]):
+    // (name, _), (name, cue), (name).
+    add(&sound, "AddMusicSourcePlaylist", |w, _, a| {
+        if let Some(Value::String(name)) = a.first() {
+            w.music.add_playlist(&name.to_string_lossy());
+        }
+        values([])
+    })?;
+    add(&sound, "AddCueToMusicSourcePlaylist", |w, _, a| {
+        if let (Some(Value::String(name)), Some(Value::String(cue))) = (a.first(), a.get(1)) {
+            w.music
+                .add_to_playlist(&name.to_string_lossy(), &cue.to_string_lossy());
+        }
+        values([])
+    })?;
+    add(&sound, "ClearMusicSourcePlaylist", |w, _, a| {
+        if let Some(Value::String(name)) = a.first() {
+            w.music.clear_playlist(&name.to_string_lossy());
+        }
+        values([])
+    })?;
     add(&sound, "LockFactionMusic", |w, _, a| {
         w.music.locked = matches!(a.first(), Some(Value::Boolean(true)));
         values([])
@@ -3083,6 +3104,32 @@ mod tests {
         assert_eq!(w.objects[&1].fuel, 50.0);
     }
 
+    #[test]
+    fn the_scripts_radio_playlists_are_kept_by_name_hash() {
+        let (host, world) = setup();
+        host.lua()
+            .load(
+                "Sound.AddMusicSourcePlaylist('mu_src_radio', 0)\n\
+                 Sound.AddCueToMusicSourcePlaylist('mu_src_radio', 'MU_SRC_PMC_HQ_01')\n\
+                 Sound.AddCueToMusicSourcePlaylist('mu_src_radio', 'MU_SRC_PMC_HQ_02')\n\
+                 Sound.AddMusicSourcePlaylist('mu_src_civ', 0)\n\
+                 Sound.AddCueToMusicSourcePlaylist('mu_src_civ', 'mu_src_civ')\n\
+                 Sound.ClearMusicSourcePlaylist('mu_src_civ')",
+            )
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        assert_eq!(
+            w.music.playlist(m2_assets::name_hash("mu_src_radio")),
+            ["MU_SRC_PMC_HQ_01", "MU_SRC_PMC_HQ_02"]
+        );
+        assert!(
+            w.music
+                .playlist(m2_assets::name_hash("mu_src_civ"))
+                .is_empty()
+        );
+        assert!(w.music.playlist(0x1234).is_empty());
+    }
     #[test]
     fn the_scripts_pursuit_calls_reach_the_game_and_read_back_their_level() {
         let (host, world) = setup();

@@ -288,6 +288,9 @@ pub struct Templates {
     pub explosions: HashMap<u32, crate::durability::Explosion>,
     /// How the templates that can be hijacked are, by id.
     pub hijack: HashMap<u32, Vec<crate::hijack::HijackEntrance>>,
+    /// The radio templates' playlist and reach, by id
+    /// ([`crate::music_source`]).
+    pub music_sources: HashMap<u32, (u32, f32)>,
     /// Where each template's entrances are got in by (`DriverHatch`), by
     /// id ([`crate::hijack::entrance_points`]).
     pub entrance_points: HashMap<u32, Vec<u32>>,
@@ -761,6 +764,7 @@ impl Templates {
             durability: crate::durability::read(&db),
             explosions: crate::durability::explosions(&db),
             hijack: crate::hijack::read(&db),
+            music_sources: crate::music_source::read(&db),
             entrance_points: crate::hijack::entrance_points(&db),
             ordnance: crate::ordnance::read(&db),
             effects: crate::particles::template_effects(&db),
@@ -963,6 +967,9 @@ pub struct WorldIndex {
     pub cells: HashMap<u32, Vec3>,
     /// Low-resolution tile asset hash to tile centre.
     pub tiles: HashMap<u32, Vec3>,
+    /// The radios ([`crate::music_source`]): placed with a record of their
+    /// own, or as a template that has one (the HQ's `Dance Radio`).
+    pub music_sources: Vec<crate::music_source::MusicSource>,
     /// Models placed by the static layers (the world as it always is,
     /// without mission states).
     pub objects: Vec<ObjectPlacement>,
@@ -1782,6 +1789,22 @@ impl WorldIndex {
         for (entity, asset) in layer.hashes("LowResTerrainObject") {
             if let Some(p) = at(entity) {
                 self.tiles.insert(asset, Vec3::from(p.position));
+            }
+        }
+        // Radios: a record of the entity's own, else its template's.
+        let own = crate::music_source::read(layer);
+        for (&entity, p) in &placements {
+            let source = own
+                .get(&entity)
+                .or_else(|| assets.templates.music_sources.get(&p.parent));
+            if let Some(&(playlist, reach)) = source {
+                self.music_sources.push(crate::music_source::MusicSource {
+                    entity,
+                    layer: layer_hash,
+                    at: Vec3::from(p.position),
+                    playlist,
+                    reach,
+                });
             }
         }
         if !is_static {
