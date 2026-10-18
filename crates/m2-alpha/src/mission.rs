@@ -584,6 +584,10 @@ const REPORT_WITNESS: f32 = 80.0;
 const REPORT_CALL_IN: f32 = 4.0;
 const REPORT_GIVE_UP: f32 = 30.0;
 const STORY_REACH: f32 = 450.0;
+/// The player's verify photo clips, by hero ([`Command::DoAction`]), and
+/// how long an action without a clip lasts (invented).
+const VERIFY_CLIPS: [u32; 3] = [0x5ae2_cef2, 0x0053_81c4, 0xb448_382e];
+const ACTION_SECONDS: f32 = 2.0;
 
 /// A marker the scripts put up, over one of their objects.
 #[derive(Clone, Debug, PartialEq)]
@@ -657,6 +661,9 @@ pub struct MissionLink {
     music: Option<Option<String>>,
     /// The radios near her ([`Radio`]).
     radio: Radio,
+    /// The human state each placed person was last told to the scripts
+    /// in ([`crate::npc::Down`]), by guid.
+    states: HashMap<u32, &'static str>,
     /// Support items to stock and call in once the scripts run
     /// (`--support`).
     support: Vec<String>,
@@ -789,6 +796,7 @@ impl MissionLink {
             fades: Vec::new(),
             music: None,
             radio: Radio::default(),
+            states: HashMap::new(),
             support: Vec::new(),
             ashore_for: 0.0,
             marked: HashMap::new(),
@@ -1296,7 +1304,65 @@ impl MissionLink {
         // The scripts' context actions (the HQ's exits, a starter's talk):
         // the one she stands at is offered, and taken with the use key.
         if let Some(g) = game.context_taken.take() {
+            let text = mission.context_text(g).unwrap_or_default();
             mission.take_context_action(g);
+            // The verify objective's prompts no script answers: the engine
+            // subdues a knocked-down target, and picks a subdued one up
+            // (from the scripts: `MrxTaskObjectiveVerify` offers them and
+            // waits on the states; who acts on them is inferred).
+            if let Some(n) = game.scene.people.npcs.iter_mut().find(|n| n.spawn == Some(g)) {
+                if text.eq_ignore_ascii_case("[ContextAction.Subdue]") && n.subdue() {
+                    eprintln!("mission: she subdues {g:#x}");
+                } else if text.eq_ignore_ascii_case("[ContextAction.Carry]") && n.carry(true) {
+                    eprintln!("mission: she picks {g:#x} up");
+                }
+            }
+        }
+        // Whom she carries rides her shoulder (invented: over her right
+        // shoulder, facing behind her).
+        if let Some(p) = game.scene.player.as_ref() {
+            let (at, facing) = (p.character.position, p.facing);
+            for n in game
+                .scene
+                .people
+                .npcs
+                .iter_mut()
+                .filter(|n| n.down == Some(crate::npc::Down::Carried))
+            {
+                let right = Vec3::new(facing.cos(), 0.0, -facing.sin());
+                n.character.position = at + right * 0.25 + Vec3::Y * 1.3;
+                n.facing = facing + std::f32::consts::PI;
+            }
+        }
+        // Keyed actions run out: `HumanActionComplete` fires.
+        for a in &mut game.actions {
+            a.2 -= dt;
+        }
+        let (done, left): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut game.actions).into_iter().partition(|a| a.2 <= 0.0);
+        game.actions = left;
+        for (g, action, _) in done {
+            eprintln!("mission: {g:#x}'s {action} ends");
+            mission.action_finished(g);
+        }
+        // Whom she carries, for `Human.IsCarrying`.
+        let carried = game
+            .scene
+            .people
+            .npcs
+            .iter()
+            .find(|n| n.down == Some(crate::npc::Down::Carried))
+            .and_then(|n| n.spawn);
+        mission.set_carrying(PLAYER, carried);
+        // The placed people's human states, as they change, for the
+        // scripts' `HumanStateTransition` events.
+        for n in &game.scene.people.npcs {
+            let Some(g) = n.spawn else { continue };
+            let state = n.human_state();
+            if self.states.get(&g).copied().unwrap_or("Upright.Idle") != state {
+                self.states.insert(g, state);
+                mission.set_human_state(g, state);
+            }
         }
         // Her infractions against the factions, for their witnesses to
         // report: the first one of a faction not already reporting, a
@@ -3327,6 +3393,39 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             None => eprintln!("mission: a pursuit by {faction}, not an army here"),
         },
         Command::PursuitClear => game.scene.people.clear_scripted_pursuit(),
+        // A keyed action: the player's verify photo plays her hero's
+        // `VerifyCamera` clip (the on-foot tables' handle fe0ead5a: rifle
+        // 5ae2cef2 Jennifer's, 005381c4 Mattias's, b448382e Chris's, from
+        // samples) and ends with it; anyone else's ends at once (no clip
+        // is looked up for theirs yet).
+        Command::DoAction { guid, action } if *guid == PLAYER => {
+            let mut seconds = ACTION_SECONDS;
+            if action.eq_ignore_ascii_case("VerifyCamera")
+                && let Some(p) = game.scene.player.as_mut()
+                && let Some((_, rig)) = p.model.as_mut()
+                && let Some(i) = VERIFY_CLIPS.iter().find_map(|&h| {
+                    rig.clips
+                        .iter()
+                        .position(|c| c.hash == h && !rig.foreign.contains(&h))
+                })
+            {
+                seconds = rig.clips[i].info.duration;
+                rig.animator.play_once(i);
+            }
+            eprintln!("mission: she plays {action} ({seconds:.1} s)");
+            game.actions.push((*guid, action.clone(), seconds));
+        }
+        Command::DoAction { guid, action } => {
+            eprintln!("mission: {guid:#x} plays {action}");
+            game.actions.push((*guid, action.clone(), 0.0));
+        }
+        Command::Drop(guid) => {
+            for n in &mut game.scene.people.npcs {
+                if n.carry(false) {
+                    eprintln!("mission: {guid:#x} puts down {:?}", n.spawn);
+                }
+            }
+        }
         // Shut again: its model and collision go back up where its layer
         // has it (as OpenGate took them down).
         Command::CloseGate(guid) => {

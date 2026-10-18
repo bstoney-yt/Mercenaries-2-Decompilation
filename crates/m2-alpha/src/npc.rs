@@ -278,6 +278,11 @@ pub struct FightClips {
     /// the tables were read; Jennifer's own take-offs come first.
     pub swim: Option<usize>,
     pub swim_out: Option<usize>,
+    /// Knocked down (lying, looped), getting up, and subdued (looped)
+    /// ([`FightClips::KNOCKED`]).
+    pub knocked: Option<usize>,
+    pub getup: Option<usize>,
+    pub subdued: Option<usize>,
 }
 
 /// How far apart a clip's hands get over the whole clip, for its hip
@@ -342,6 +347,12 @@ impl FightClips {
     /// The swim stroke and the climb-out (see [`FightClips::swim`]).
     pub const SWIM: u32 = 0xc846_e6fd;
     pub const SWIM_OUT: u32 = 0x97c8_40ed;
+    /// Down on the ground, getting up, and subdued: the on-foot tables'
+    /// `KnockedDown` `Idle` (handle 8cf722a8), `KnockedDown` `Getup`
+    /// (ade601a9) and `Subdued` `Idle` (dbd4f17d), from samples.
+    pub const KNOCKED: u32 = 0xbe25_dc0c;
+    pub const GETUP: u32 = 0xaeb6_c9bd;
+    pub const SUBDUED: u32 = 0xf550_757d;
     /// Jennifer's running take-offs (0.93 s, 3.6 m/s), then the
     /// resident's; standing (0.37 s).
     pub const TAKEOFF: [u32; 4] = [0xdaf7_966f, 0x4fdb_3497, 0x0e18_b683, 0x47af_6321];
@@ -420,6 +431,9 @@ impl FightClips {
             bash_low: by_event(Self::BASH_LOW),
             swim: find(Self::SWIM),
             swim_out: find(Self::SWIM_OUT),
+            knocked: find(Self::KNOCKED),
+            getup: find(Self::GETUP),
+            subdued: find(Self::SUBDUED),
         }
     }
 
@@ -796,6 +810,8 @@ pub struct Npc {
     /// Put out of a vehicle's seat ([`People::put_out`]): no spawn keeps
     /// them, so they go once out of range.
     put_out: bool,
+    /// Down on the ground, subdued or carried ([`Down`]): none stands.
+    pub down: Option<Down>,
     brain: Brain,
     /// The aim and fall clips in this person's rig.
     clips: FightClips,
@@ -851,6 +867,44 @@ fn shooter_number(at: Vec3, facing: f32) -> u32 {
         .fold(0x811c_9dc5_u32, |h, b| {
             (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
         })
+}
+
+/// Someone down ([`Npc::down`]), as the human state table has it (from
+/// samples, `ece70371`): bashed, they fall (`Upright.KnockDown`) and lie
+/// (`KnockedDown.Idle`), then get up (`KnockedDown.Getup`, `Upright.Idle`)
+/// unless subdued first (the `Subdue` action: `KnockedDown.SubdueDefender`,
+/// then `Subdued.Idle`, for good); a subdued one can be carried
+/// (`Carried.Idle`) and put down again. The seconds each step lasts are
+/// invented; the clips are the on-foot tables' ([`FightClips::KNOCKED`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Down {
+    Falling(f32),
+    Knocked(f32),
+    GettingUp(f32),
+    Subduing(f32),
+    Subdued,
+    Carried,
+}
+
+/// Seconds a fall takes, someone lies knocked down, gets up, and is
+/// subdued (all invented).
+const FALL_SECONDS: f32 = 1.0;
+const KNOCKED_SECONDS: f32 = 10.0;
+const GETUP_SECONDS: f32 = 1.5;
+const SUBDUE_SECONDS: f32 = 1.0;
+
+impl Down {
+    /// The human state (`Stance.Action`) it is.
+    pub fn state(self) -> &'static str {
+        match self {
+            Down::Falling(_) => "Upright.KnockDown",
+            Down::Knocked(_) => "KnockedDown.Idle",
+            Down::GettingUp(_) => "KnockedDown.Getup",
+            Down::Subduing(_) => "KnockedDown.SubdueDefender",
+            Down::Subdued => "Subdued.Idle",
+            Down::Carried => "Carried.Idle",
+        }
+    }
 }
 
 impl Npc {
@@ -916,6 +970,7 @@ impl Npc {
             since_shot: f32::INFINITY,
             flee: None,
             put_out: false,
+            down: None,
             brain,
             spun: 0.0,
             route_near: f32::INFINITY,
@@ -950,6 +1005,84 @@ impl Npc {
             }
         }
         !self.alive
+    }
+
+    /// The human state they are in, as the scripts' `HumanStateTransition`
+    /// events read it.
+    pub fn human_state(&self) -> &'static str {
+        self.down.map_or("Upright.Idle", Down::state)
+    }
+
+    /// Bashed and still alive: they fall and lie a while ([`Down`]).
+    /// Someone already down stays as they are.
+    pub fn knock_down(&mut self) {
+        if !self.alive || self.down.is_some() {
+            return;
+        }
+        self.down = Some(Down::Falling(FALL_SECONDS));
+        self.alert = false;
+        self.flee = None;
+        self.rig.animator.set_upper(None);
+        self.rig.two_handed = false;
+        if let Some(c) = self.clips.die.or(self.clips.knocked) {
+            self.rig.animator.play_once(c);
+        }
+    }
+
+    /// Subdued where they lie (the player's `Subdue`): false if they
+    /// aren't down to be.
+    pub fn subdue(&mut self) -> bool {
+        if !matches!(self.down, Some(Down::Falling(_) | Down::Knocked(_))) {
+            return false;
+        }
+        self.down = Some(Down::Subduing(SUBDUE_SECONDS));
+        true
+    }
+
+    /// Picked up (true) or put down again, if subdued (or carried).
+    pub fn carry(&mut self, on: bool) -> bool {
+        match (self.down, on) {
+            (Some(Down::Subdued), true) => self.down = Some(Down::Carried),
+            (Some(Down::Carried), false) => {
+                self.down = Some(Down::Subdued);
+                self.landed = false;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// A step of being down: the fall, lying, getting up, the subdue.
+    fn update_down(&mut self, dt: f32) {
+        let Some(d) = self.down else { return };
+        let clips = self.clips;
+        self.down = match d {
+            Down::Falling(t) if t - dt <= 0.0 => {
+                if let Some(c) = clips.knocked {
+                    self.rig.animator.play(c);
+                }
+                Some(Down::Knocked(KNOCKED_SECONDS))
+            }
+            Down::Falling(t) => Some(Down::Falling(t - dt)),
+            Down::Knocked(t) if t - dt <= 0.0 => {
+                if let Some(c) = clips.getup {
+                    self.rig.animator.play_once(c);
+                }
+                Some(Down::GettingUp(GETUP_SECONDS))
+            }
+            Down::Knocked(t) => Some(Down::Knocked(t - dt)),
+            Down::GettingUp(t) if t - dt <= 0.0 => None,
+            Down::GettingUp(t) => Some(Down::GettingUp(t - dt)),
+            Down::Subduing(t) if t - dt <= 0.0 => {
+                if let Some(c) = clips.subdued {
+                    self.rig.animator.play(c);
+                }
+                Some(Down::Subdued)
+            }
+            Down::Subduing(t) => Some(Down::Subduing(t - dt)),
+            other => Some(other),
+        };
+        self.rig.advance(dt);
     }
 
     /// Runs from `danger` (those who don't fight, but story characters
@@ -1440,6 +1573,10 @@ impl Npc {
         if !self.alive {
             self.dead_for += dt;
             self.rig.advance(dt);
+            return;
+        }
+        if self.down.is_some() {
+            self.update_down(dt);
             return;
         }
         self.since_shot += dt;

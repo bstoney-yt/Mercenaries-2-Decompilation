@@ -309,6 +309,12 @@ struct Options {
     /// With `--mission --after-contract`: visit a faction's soldiers (`All`,
     /// `Oil`...) and hurt one, logging their sides (faction-check lines).
     visit_faction: Option<String>,
+    /// `--bash-target <s>`: that long after the contract, bash the person
+    /// the scripts' first marker is over.
+    bash_target: Option<f32>,
+    /// `--bash-target <s>k`: knock them down instead (as a bash does a
+    /// boss it doesn't hurt), to try the capture on anyone.
+    knock_target: bool,
     /// With `--mission --autoplay --after-contract`: the Enter pressed
     /// every four seconds after the contract jumps too, as the pad's A
     /// does; where she is while the scripts hold her controls is logged
@@ -520,6 +526,11 @@ fn parse_args() -> anyhow::Result<Options> {
             "--dialog-keys" => o.dialog_keys = Some(value()?),
             "--medevac" => o.medevac = Some(value()?.parse()?),
             "--visit-faction" => o.visit_faction = Some(value()?),
+            "--bash-target" => {
+                let v = value()?;
+                o.knock_target = v.ends_with('k');
+                o.bash_target = Some(v.trim_end_matches('k').parse()?);
+            }
             "--jump-with-enter" => o.jump_with_enter = true,
             "--props-check" => {
                 let v = value()?;
@@ -3207,6 +3218,51 @@ fn mission_for_screenshot(
                 && game.scene.player.as_ref().is_some_and(|p| p.landed);
             if cc.step(game, &mut link, ashore, tick) {
                 break;
+            }
+        }
+        // `--bash-target <s>`: that long after the contract, she is put
+        // 1.2 m from the person the first of the scripts' markers is over,
+        // facing them, and bashes them the tick after (verify-check lines).
+        if let (Some(at), Some(done)) = (options.bash_target, contract_done) {
+            let t = i.saturating_sub(done) as f32 * tick;
+            if (t - at).abs() < tick / 2.0 {
+                let target = link.marks().into_iter().find_map(|m| {
+                    let n = game
+                        .scene
+                        .people
+                        .npcs
+                        .iter()
+                        .find(|n| n.alive && n.spawn == Some(m.target))?;
+                    Some((m.target, n.character.position))
+                });
+                match (target, game.scene.player.as_mut()) {
+                    (Some((g, there)), Some(p)) => {
+                        let her = p.character.position;
+                        let back = (her - there).with_y(0.0).normalize_or(m2_math::glam::Vec3::X);
+                        p.drop_at(there + back * 1.2);
+                        p.facing = (-back.x).atan2(-back.z);
+                        eprintln!("verify-check: put 1.2 m from {g:#x} at {there:.1}");
+                    }
+                    _ => eprintln!("verify-check: no marked person to bash"),
+                }
+            }
+            if (t - at - 1.0).abs() < tick / 2.0 {
+                if options.knock_target {
+                    let marked: Vec<u32> = link.marks().iter().map(|m| m.target).collect();
+                    if let Some(n) = game
+                        .scene
+                        .people
+                        .npcs
+                        .iter_mut()
+                        .find(|n| n.alive && n.spawn.is_some_and(|s| marked.contains(&s)))
+                    {
+                        eprintln!("verify-check: {:?} is knocked down", n.spawn);
+                        n.knock_down();
+                    }
+                } else {
+                    eprintln!("verify-check: she bashes");
+                    intent.trigger.melee = true;
+                }
             }
         }
         game.step(intent, tick);
