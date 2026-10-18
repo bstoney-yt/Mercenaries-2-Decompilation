@@ -1662,6 +1662,9 @@ impl MissionLink {
                 if let Err(e) = mission.run(TRESPASS, "trespass") {
                     self.write([format!("trespass: {e}")]);
                 }
+                if let Err(e) = mission.run(RESTORED_SUPPORT, "restored support") {
+                    self.write([format!("restored support: {e}")]);
+                }
                 for (name, code) in std::mem::take(&mut self.drivers) {
                     if let Err(e) = mission.run(&code, &name) {
                         self.write([format!("{name}: {e}")]);
@@ -2655,6 +2658,92 @@ function __m2_unlock_all(f)
 end
 "#;
 
+/// Lua that adds cut content back to the support catalogue (see
+/// `m2_engine::standin`), each item built as the game's own of its kind:
+///
+/// - the V-22 Osprey, flown in as the helicopters are
+///   (`mrxsupportcopterdelivery` with its `V22 (Delivery)` template, which
+///   the game keeps), under its own PDA icon `vehicles_plane_v22`;
+/// - `DLC_M1A1`, slung under the Mi-26 as the M1A2 is, under the M1A2's
+///   icon;
+/// - the cut hand weapons, each in its supply crate
+///   (`m2_engine::standin::SUPPLY_DROPS`), dropped as the game's crates
+///   are, under the icon of the crate each is shaped as.
+///
+/// The game has no strings for them, so names and descriptions are
+/// written here; the prices are invented, near the game's for their
+/// kind (the Endriago's 45,000 and 140 fuel, the M1A2's 425,000 and 240,
+/// a weapon crate's 10,000 and 40).
+const RESTORED_SUPPORT: &str = r#"
+local data = MrxSupportData and MrxSupportData.tSupportData
+local function lookup(name)
+    return (MrxSupportData and MrxSupportData[name]) or rawget(_G, name)
+end
+local copter, crates = lookup("mrxsupportcopterdelivery"), lookup("mrxcratedelivery")
+local function add(key, item, support)
+    if data and support and not data[key] then
+        item.nMaxStock = 99
+        item.oSupport = support
+        data[key] = item
+    end
+end
+if copter then
+    local o = copter:Create()
+    o:SetDeliveryVehicle("V22 (Delivery)")
+    add("v22osprey", {
+        sName = "V-22 Osprey",
+        sDescription = "Tiltrotor transport, cut from the game and flown back in.",
+        sIcon = "vehicles_plane_v22", nCashCost = 150000, nFuelCost = 200, sType = "Heli",
+    }, o)
+end
+if crates then
+    local o = crates:Create()
+    o:SetCargo("DLC_M1A1")
+    o:SetDeliveryVehicle("Mi26 (PMC) (Driver)")
+    add("dlcm1a1", {
+        sName = "M1A1 Abrams",
+        sDescription = "The cut M1A1, slung in under a Mi-26.",
+        sIcon = "vehicles_tank_m1a2", nCashCost = 400000, nFuelCost = 240, sType = "Heavy",
+    }, o)
+    for _, w in ipairs({
+        { "coilgun", "Supply Drop (Coilgun)", "Coilgun", "supplies_sniper_kit", 25000 },
+        { "riotgun", "Supply Drop (Riot Gun)", "Riot Gun", "supplies_cqb", 10000 },
+        { "cheatrpg", "Supply Drop (Cheat RPG)", "Cheat RPG", "supplies_rpg", 50000 },
+        { "dlc50cal", "Supply Drop (50 Cal)", ".50 Cal", "supplies_light_mg", 15000 },
+    }) do
+        local o = crates:Create()
+        o:SetCargo(w[2])
+        o:SetCareless(true)
+        add(w[1], {
+            sName = w[3] .. " crate",
+            sDescription = "A cut weapon, dropped in its own crate.",
+            sIcon = w[4], nCashCost = w[5], nFuelCost = 40, sType = "Supply",
+        }, o)
+    end
+end
+-- Who sells them: the Osprey Universal Petroleum alone (Brendan's call,
+-- 2026-10-18), the M1A1 the Allies as they sell the M1A2, the weapons'
+-- crates your PMC (invented). A shop lists what `MrxRewardData`'s rewards
+-- name for its faction (`GetAllPotentialShopItems`, cached in
+-- `gtAllSupport`); each is unlocked there from the start. The Cheat RPG's
+-- crate is sold nowhere: the cheat menu and `--support` call it.
+local rewards = MrxRewardData and MrxRewardData._tRewards
+if data and rewards and not rewards.__m2_restored then
+    local sold = { { "v22osprey", "Oil" }, { "dlcm1a1", "All" },
+        { "coilgun", "Pmc" }, { "riotgun", "Pmc" }, { "dlc50cal", "Pmc" } }
+    local listed = {}
+    for _, s in ipairs(sold) do
+        local item = data[s[1]]
+        if item then
+            item.tUnlockStatus = { [s[2]] = 2 }
+            table.insert(listed, s)
+        end
+    end
+    rewards.__m2_restored = { tSupport = listed }
+    MrxRewardData.gtAllSupport = nil
+end
+"#;
+
 /// A shop as the player sees it: her cash, and each thing on sale.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ShopView {
@@ -3437,14 +3526,24 @@ pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
             ..Leaves::default()
         });
     }
-    // A gun of the templates' with its model (of several, the lowest).
-    let gun = model.and_then(|m| {
-        templates
-            .arms
-            .weapons
-            .values()
-            .filter(|w| w.class.is_some() && w.model == Some(m))
-            .min_by_key(|w| w.template)
+    // The pickup itself, when it is a gun with that model (the restored
+    // crates' `Cheat RPG`, which shares its model with the `Fuel-Air
+    // RPG`); else a gun of the templates' with its model (of several,
+    // the lowest).
+    let own = templates
+        .arms
+        .weapons
+        .get(&id)
+        .filter(|w| w.class.is_some() && model.is_some() && w.model == model);
+    let gun = own.or_else(|| {
+        model.and_then(|m| {
+            templates
+                .arms
+                .weapons
+                .values()
+                .filter(|w| w.class.is_some() && w.model == Some(m))
+                .min_by_key(|w| w.template)
+        })
     });
     if let Some(spec) = gun {
         let slot = combat::Rifle::from_spec(spec).slot();

@@ -2023,6 +2023,11 @@ impl Scene {
         let tx = self.requests.0.clone();
         std::thread::spawn(move || {
             let result = (|| -> anyhow::Result<()> {
+                if m2_engine::osprey::is_osprey(hash) {
+                    let (cpu, rest, rotors) = m2_engine::osprey::flight();
+                    let _ = tx.send(Loaded::Flight(hash, cpu, rest, rotors));
+                    return Ok(());
+                }
                 let mut source = install.open_world()?;
                 let data = source.model(hash)?;
                 let model = data.parse()?;
@@ -2106,6 +2111,12 @@ impl Scene {
             let result = (|| -> anyhow::Result<()> {
                 let mut source = install.open_world()?;
                 for e in &models {
+                    // The cut Osprey has no model to read: it is built.
+                    if m2_engine::osprey::is_osprey(e.model) {
+                        let (spec, cpu) = m2_engine::osprey::vehicle(e);
+                        let _ = tx.send(make(spec, cpu));
+                        return Ok(());
+                    }
                     let data = source.model(e.model)?;
                     let model = data.parse()?;
                     if let Some(spec) = VehicleSpec::from_model(e, &model) {
@@ -2583,6 +2594,11 @@ impl Scene {
                 v.spec
                     .lift_wheels(&mut nodes, &world.physics.vehicle_wheel_lift(id));
                 v.spec.spin_rotors(&mut nodes, v.rolled);
+                if !v.spec.tilts.is_empty() {
+                    let speed = world.physics.vehicle_rolling(id);
+                    v.spec
+                        .tilt_parts(&mut nodes, m2_engine::osprey::tilt_at(speed));
+                }
                 for &(i, m) in &v.hijack_nodes {
                     if let Some(n) = nodes.get_mut(i) {
                         *n = m;

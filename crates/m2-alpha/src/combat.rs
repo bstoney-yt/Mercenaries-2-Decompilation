@@ -5555,6 +5555,7 @@ mod tests {
             hull,
             turret_box: None,
             rotors: Vec::new(),
+            tilts: Vec::new(),
             damage: None,
             tuning: VehicleTuning {
                 gun: Some(gun),

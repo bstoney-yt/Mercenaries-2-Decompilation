@@ -2203,6 +2203,7 @@ mod tests {
             hull,
             turret_box: None,
             rotors: Vec::new(),
+            tilts: Vec::new(),
             damage: None,
             tuning: Default::default(),
         };
