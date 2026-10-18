@@ -2687,8 +2687,10 @@ impl Scene {
             let (nodes, skin) = n.rig.posed();
             let body = n.model_matrix();
             model.draw_posed_as(backend, queue, body, &nodes, &skin, outfit)?;
+            // Swimming, their gun is away (as hers is).
             if (n.soldier || n.faction.is_some())
                 && n.alive
+                && !n.swimming()
                 && let Some(w) = self.arsenal.npc_gun(n.gun)
                 && let Some(at) =
                     self.arsenal

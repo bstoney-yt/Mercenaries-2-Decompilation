@@ -3283,6 +3283,10 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             if let Some(world) = &mut scene.world
                 && *op != LayerOp::Load
             {
+                let before = scene
+                    .player
+                    .as_ref()
+                    .and_then(|p| p.floor_under(&world.physics));
                 scene
                     .props
                     .hide(&mut world.physics, entities.iter().copied());
@@ -3290,18 +3294,25 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 // (playtest 7: the villa garage's, as PmcCon001 ended and
                 // put her out of the tank; she fell to y -55.7 and stayed):
                 // she waits there for what the next layers put in its
-                // place, and lands on it.
+                // place, and lands on it ([`Player::layer_went`]).
                 if let Some(p) = scene.player.as_mut()
                     && p.driving.is_none()
                 {
-                    let feet = p.character.position + Vec3::Y * 0.5;
-                    if world.physics.cast_ray(feet, -Vec3::Y, 1.5).is_none() {
+                    let after = p.floor_under(&world.physics);
+                    if p.layer_went(before, after) {
                         eprintln!(
                             "layer {name}: the floor under her at {:.1?} went with it: she \
                              waits for what comes in its place",
                             p.character.position.to_array()
                         );
-                        p.floor_went();
+                    } else if let Some(b) = before
+                        && p.character.position.y - b > 0.3
+                    {
+                        eprintln!(
+                            "layer {name}: she is {:.2} m over her floor, which stays: she \
+                             comes down on it",
+                            p.character.position.y - b
+                        );
                     }
                 }
             }

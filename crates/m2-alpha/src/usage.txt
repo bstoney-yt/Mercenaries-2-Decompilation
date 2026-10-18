@@ -53,6 +53,10 @@ m2-alpha [options]
                          (default 3), logging each second where she is, how
                          deep the sea is over her feet and whether she swims
                          (walk lines)
+  --npc-swim <metres>    with --gait on the island: put the nearest soldier
+                         this far ahead of her in the water at the start,
+                         logging each second whether he swims (npc-swim
+                         lines)
   --config <file>        settings file (default m2-alpha.toml)
   --size <w>x<h>         window size
   --vsync on|off
@@ -187,6 +191,9 @@ m2-alpha [options]
                          keys its stick)
   --hijack               with --screenshot --drive: hijack the vehicle
                          (--vehicle's) instead, answering every prompt
+                         (with --mission: the vehicle an objective's action
+                         marker is on, with pictures -hijack1 to -hijack8
+                         1.5 s apart while it runs)
   --placed-check         with --mission: every 5 s, try each pickup, crate and
                          emplaced gun the layers have put out (logged as
                          placed-check lines), for testing
