@@ -1386,6 +1386,11 @@ pub struct Combat {
     /// The scripts made her invincible (while the screen fades, at the
     /// fanfare): nothing hurts her.
     pub invincible: bool,
+    /// Seconds before a vehicle can hurt her again by running into her
+    /// ([`crate::npc::RAM_GAP`]).
+    pub rammed: f32,
+    /// Vehicles that ran into her, and the health they took.
+    pub run_overs: (u32, f32),
     /// The scripts keep her from dying (`Player.SetHealthClamp`): her
     /// health stops at [`CLAMP_FLOOR`] for their survival system.
     pub health_clamp: bool,
@@ -1652,6 +1657,8 @@ impl Default for Combat {
             weapon: Weapon::Rifle,
             down: 0.0,
             invincible: false,
+            rammed: 0.0,
+            run_overs: (0, 0.0),
             health_clamp: false,
             scripted_health: false,
             revived: false,
@@ -2939,6 +2946,54 @@ impl Combat {
             explosives: &mut [],
         };
         self.npc_shoot(&mut f, 0, target);
+    }
+
+    /// Vehicles running into her on foot: one moving faster than
+    /// [`crate::npc::RUN_OVER`] whose hull (padded as a person's is,
+    /// [`crate::npc::People::traffic`]) holds her hurts her by its ram times
+    /// the damage table's cell for her row, `Hero`, and its ram's kind,
+    /// `Car` ([`m2_engine::durability::run_over`]: the `Hero` row takes a
+    /// fifth of a `Car`'s; from the data), at most once a
+    /// [`crate::npc::RAM_GAP`]. What she takes is the table's; when the
+    /// ram counts, its size and the gap are invented, as for people.
+    pub fn vehicles_hit_her(&mut self, f: &mut Field<'_>, dt: f32) {
+        self.rammed -= dt;
+        if self.rammed > 0.0 {
+            return;
+        }
+        let hero = m2_assets::name_hash("Hero");
+        let kind = m2_assets::name_hash(m2_engine::durability::RAM_KIND);
+        let her = f.player.character.position + Vec3::Y * 0.9;
+        let mut hit = None;
+        for v in f.vehicles.iter() {
+            let Some(id) = v.id else { continue };
+            let Some(at) = f.physics.vehicle_transform(id) else {
+                continue;
+            };
+            let velocity = f.physics.vehicle_velocity(id);
+            let speed = velocity.length();
+            if speed < crate::npc::RUN_OVER {
+                continue;
+            }
+            let (lo, hi) = v.spec.hull;
+            if crate::npc::in_ram(at.inverse().transform_point3(her), (lo, hi)) {
+                let damage = self
+                    .damage_table
+                    .as_ref()
+                    .map_or(m2_engine::durability::ram(v.spec.mass, speed), |t| {
+                        m2_engine::durability::run_over(t, hero, kind, v.spec.mass, speed)
+                    });
+                hit = Some((damage, at.transform_point3((lo + hi) * 0.5)));
+                break;
+            }
+        }
+        if let Some((damage, from)) = hit {
+            let lost = self.hurt_player(f, damage, Some(from));
+            self.rammed = crate::npc::RAM_GAP;
+            self.run_overs.0 += 1;
+            self.run_overs.1 += lost;
+            eprintln!("run over: a vehicle ran into her for {damage:.1} ({lost:.1} health lost)");
+        }
     }
 
     /// `damage` done to her from `from`: the health she lost.
