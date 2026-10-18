@@ -1198,7 +1198,12 @@ fn take_for_screenshot(
             render(backend, game, fov, aspect, None)?;
         }
     }
-    let seated = game.scene.riders.iter().filter(|r| r.vehicle == i).count();
+    let seated = game
+        .scene
+        .riders
+        .iter()
+        .filter(|r| r.prop.is_none() && r.vehicle == i)
+        .count();
     for n in &game.scene.people.npcs[before..] {
         let p = n.character.position;
         eprintln!(
@@ -3089,8 +3094,19 @@ fn mission_for_screenshot(
         }
         game.step(intent, tick);
         link.tick(game, tick);
-        if let Some(want) = &options.context {
+        // `--context exit,enter,talk`: each in turn, once the last is done.
+        if let Some(want) = options
+            .context
+            .as_deref()
+            .and_then(|c| c.split(',').nth(context.step))
+        {
             context_check(game, &link, want, &mut context, tick);
+            if context.logged.contains(&10.0) || context.logged.contains(&0.0) {
+                context = ContextCheck {
+                    step: context.step + 1,
+                    ..ContextCheck::default()
+                };
+            }
         }
         // The saves the scripts ask for are written, as in play.
         for slot in link.take_saves() {
@@ -3759,8 +3775,10 @@ fn hijack_for_screenshot(
 struct ContextCheck {
     put: Option<f32>,
     taken: Option<(f32, m2_math::glam::Vec3)>,
-    /// Her place was logged this long after taking it.
+    /// Her place was logged this long after taking it (0: never offered).
     logged: Vec<f32>,
+    /// Which of the comma-separated actions asked for this is.
+    step: usize,
 }
 
 /// With `--context`: once the scripts offer a context action whose prompt
@@ -3796,7 +3814,12 @@ fn context_check(
     match &mut c.put {
         None => {
             if let Some(p) = game.scene.player.as_mut() {
-                p.character.position = at + Vec3::new(0.5, 0.0, 0.0);
+                // 1.5 m short of it, from where she stands: a starter sits at
+                // a desk she would be put into.
+                let from = (p.character.position - at)
+                    .with_y(0.0)
+                    .normalize_or(Vec3::X);
+                p.character.position = at + from * 1.5;
                 p.character.velocity = Vec3::ZERO;
             }
             eprintln!("context-check: {want:?} offered at {g:#x} ({at:.1}): she is put by it");

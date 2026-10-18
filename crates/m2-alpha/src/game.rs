@@ -3044,7 +3044,7 @@ fn put_out(
         let kind = people.rider_kind(&who, model);
         let outfit = riders
             .iter()
-            .find(|r| r.vehicle == i && Some(r.kind) == kind)
+            .find(|r| r.prop.is_none() && r.vehicle == i && Some(r.kind) == kind)
             .map(|r| r.outfit.clone());
         let stood = people.put_out(&who, model, outfit, door, her);
         eprintln!(

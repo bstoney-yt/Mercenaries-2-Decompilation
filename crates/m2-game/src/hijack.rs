@@ -243,6 +243,12 @@ impl HijackWorld {
         self.hardpoints.insert((guid, name), at);
     }
 
+    /// Where `guid`'s hardpoint `name` (by name hash) was last said to be
+    /// in the world, if it has been.
+    pub fn hardpoint(&self, guid: u32, name: u32) -> Option<[f32; 3]> {
+        self.hardpoints.get(&(guid, name)).copied()
+    }
+
     /// The player is holding `button` down since `at` (game seconds), or
     /// let it go (`None`).
     pub fn hold(&mut self, button: u32, at: Option<f64>) {

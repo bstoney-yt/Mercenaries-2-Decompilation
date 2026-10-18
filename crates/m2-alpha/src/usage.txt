@@ -183,9 +183,10 @@ m2-alpha [options]
                          emplaced gun the layers have put out (logged as
                          placed-check lines), for testing
   --context <text>       with --mission: once the scripts offer a context
-                         action whose prompt reads <text> (exit, talk), put
-                         her at it and take it with the use key, logging
-                         where she is after (context-check lines)
+                         action whose prompt reads <text> (exit, talk; a
+                         comma-separated list for each in turn), put her at
+                         it and take it with the use key, logging where she
+                         is after (context-check lines)
   --props-check <hit>    with --mission: once she is ashore (and inside
                          --props-area x0,z0,x1,z1 if given), hit every placed
                          prop there by <hit> (vehicle, gun or blast), log what

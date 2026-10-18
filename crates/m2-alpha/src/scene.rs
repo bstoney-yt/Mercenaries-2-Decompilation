@@ -818,8 +818,18 @@ pub struct Scene {
     pub ruins: std::collections::HashSet<u32>,
     /// The crews the mission scripts' layers seat in their vehicles, by
     /// guid ([`m2_game::mission::Mission::crew_of`]): an entity's own
-    /// riders (the HQ interior's Fiona) where its template has none.
+    /// riders where its template has none.
     pub mission_crews: std::collections::HashMap<u32, Vec<(String, String)>>,
+    /// The layers' props with a crew aboard, as the scripts last had them
+    /// ([`m2_game::mission::Mission::crews_aboard`]): each prop's guid and
+    /// its riders' (seat, guid, template). The PMC HQ's interior
+    /// (`HqInterior`, model 39af17dc) carries Fiona so, and the recruits'
+    /// interior pieces their recruits; [`crate::hijack`] seats them.
+    pub prop_crews: Vec<m2_game::mission::CrewAboard>,
+    /// Where those riders sit in the world now, and facing: (rider guid,
+    /// place, yaw), for the mission to tell the scripts (a starter's
+    /// `Talk` is offered by where she is).
+    pub prop_rider_spots: Vec<(u32, Vec3, f32)>,
     pub world: Option<World>,
     pub models: Vec<Placed>,
     pub materials: MaterialCache,
@@ -1485,6 +1495,8 @@ impl Scene {
         Ok(Self {
             ruins: Default::default(),
             mission_crews: Default::default(),
+            prop_crews: Vec::new(),
+            prop_rider_spots: Vec::new(),
             ground,
             world: None,
             models: Vec::new(),

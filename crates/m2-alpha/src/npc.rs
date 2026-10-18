@@ -1700,6 +1700,62 @@ impl People {
         None
     }
 
+    /// Someone of the scripts' own, `guid` (template `template`, its own
+    /// model `model`), stands at `at` facing `facing` as they have them:
+    /// the HQ's starter out of her seat for her briefing. Brought in
+    /// (in the looks `outfit`, if given) the first time; moved and turned
+    /// after. They don't fight or run (a story character). False when
+    /// their kind isn't in yet.
+    pub(crate) fn stand_scripted(
+        &mut self,
+        guid: u32,
+        template: &str,
+        model: Option<u32>,
+        outfit: Option<Vec<bool>>,
+        at: Vec3,
+        facing: f32,
+    ) -> bool {
+        if let Some(n) = self.npcs.iter_mut().find(|n| n.spawn == Some(guid)) {
+            if n.character.position.distance(at) > 0.25 || (n.facing - facing).abs() > 0.01 {
+                n.character.position = at;
+                n.character.velocity = Vec3::ZERO;
+                n.facing = facing;
+                n.brain = Brain::Post { facing };
+            }
+            return true;
+        }
+        let Some(kind) = self.rider_kind(template, model) else {
+            return false;
+        };
+        let mut n = Npc::new(
+            kind,
+            &self.kinds[kind].rig,
+            at,
+            facing,
+            Brain::Post { facing },
+            Some(guid),
+        );
+        n.outfit = outfit.unwrap_or_else(|| self.dress_as(kind, template));
+        n.held = true;
+        eprintln!("people: {template} ({guid:#x}) stands at {at:.1}, as the scripts have them");
+        self.npcs.push(n);
+        true
+    }
+
+    /// The scripts' own `guid` ([`People::stand_scripted`]) is no longer
+    /// on foot (back in a seat, or gone).
+    pub(crate) fn unstand_scripted(&mut self, physics: &mut Physics, guid: u32) {
+        self.npcs.retain(|n| {
+            if n.spawn != Some(guid) {
+                return true;
+            }
+            if let Some(doll) = n.ragdoll {
+                physics.remove_ragdoll(doll);
+            }
+            false
+        });
+    }
+
     /// A rider of template `template` (its own model `model`) put out of
     /// their seat at `at`: they stand there, in the looks their seat had
     /// (`outfit`), and run from `from` (invented: no car hijack in the

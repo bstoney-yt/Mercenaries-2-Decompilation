@@ -254,6 +254,16 @@ pub struct Entity {
     pub crew: Vec<(String, String)>,
 }
 
+/// An object of the layers with a crew of its own aboard
+/// ([`Mission::crews_aboard`]): its guid, and each rider's seat, guid and
+/// template.
+pub type CrewAboard = (u32, Vec<(String, u32, String)>);
+
+/// A rider of a layer's crew out of its seat ([`Mission::crews_on_foot`]):
+/// the rider's guid, what it came in on, its template, where it is and
+/// its yaw.
+pub type OnFoot = (u32, u32, String, [f32; 3], f32);
+
 /// What a mission session needs from the archives.
 #[derive(Debug, Default)]
 pub struct GameData {
@@ -1652,6 +1662,63 @@ end
             .unwrap_or_default()
     }
 
+    /// The layers' objects with a crew of their own still aboard, and who:
+    /// `(object, [(seat, rider, rider's template)])`, by object. Each
+    /// rider is matched to the first free seat of its `Rider` records
+    /// naming its template; those the scripts have taken out
+    /// (`Vehicle.Exit`) or killed are left out. The HQ interior is such
+    /// an object (`HqInterior`, a building): its starter, Fiona, rides
+    /// it, and `WifPmcInterior` finds her as `Vehicle.GetRiders(it)[1]`.
+    pub fn crews_aboard(&self) -> Vec<CrewAboard> {
+        let w = self.world.borrow();
+        let mut out: Vec<CrewAboard> = w
+            .crews
+            .iter()
+            .filter_map(|(&g, crew)| {
+                let mut riders: Vec<(u32, &String)> = w
+                    .objects
+                    .iter()
+                    .filter(|(r, o)| o.vehicle == Some(g) && o.alive && Some(**r) != w.player)
+                    .map(|(&r, o)| (r, &o.name))
+                    .collect();
+                riders.sort_unstable();
+                let mut free: Vec<&(String, String)> = crew.iter().collect();
+                let aboard: Vec<(String, u32, String)> = riders
+                    .into_iter()
+                    .filter_map(|(r, name)| {
+                        let i = free
+                            .iter()
+                            .position(|(_, t)| t.eq_ignore_ascii_case(name))?;
+                        let (seat, template) = free.remove(i);
+                        Some((seat.clone(), r, template.clone()))
+                    })
+                    .collect();
+                (!aboard.is_empty()).then_some((g, aboard))
+            })
+            .collect();
+        out.sort_unstable_by_key(|(g, _)| *g);
+        out
+    }
+
+    /// Riders of the layers' crews the scripts have out of their seats and
+    /// alive: `(rider, what it came in on, template, place, yaw)`. The HQ's
+    /// briefing takes its starter out of her seat (`Vehicle.Exit`) and puts
+    /// her at its briefing spot (`Object.SetTransformToObject`).
+    pub fn crews_on_foot(&self) -> Vec<OnFoot> {
+        let w = self.world.borrow();
+        let mut out: Vec<OnFoot> = w
+            .crew_riders
+            .iter()
+            .filter_map(|(&r, &from)| {
+                let o = w.objects.get(&r)?;
+                (o.alive && o.vehicle.is_none())
+                    .then(|| (r, from, o.name.clone(), o.position, o.yaw))
+            })
+            .collect();
+        out.sort_unstable_by_key(|e| e.0);
+        out
+    }
+
     /// The player took the context action offered beside `guid`, for the
     /// scripts' `ContextAction` events.
     pub fn take_context_action(&mut self, guid: u32) {
@@ -1893,12 +1960,15 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());
             }
-            seat_crew(&mut w, e.guid, e.at, &e.crew);
+            for r in seat_crew(&mut w, e.guid, e.at, &e.crew) {
+                w.crew_riders.insert(r, e.guid);
+            }
             if !e.crew.is_empty() {
                 w.crews.insert(e.guid, e.crew.clone());
             }
         } else {
             w.crews.remove(&e.guid);
+            w.crew_riders.retain(|_, v| *v != e.guid);
             w.objects.remove(&e.guid);
             w.regions.remove(&e.guid);
             // Its crew goes with it.
@@ -2442,6 +2512,46 @@ mod tests {
         }
         place(&world, std::slice::from_ref(&tank), false);
         assert!(world.borrow().objects.values().all(|o| o.vehicle.is_none()));
+    }
+
+    #[test]
+    fn the_hq_interiors_starter_is_aboard_until_the_scripts_take_her_out() {
+        // `HqInterior` (vz_state_pmcinterior 0xc73ad) is a building with
+        // one `Rider` record of its own: Fiona, in seat a651ff78.
+        let hq = Entity {
+            guid: 0xc73ad,
+            name: "HqInterior".into(),
+            at: [3750.0, 450.0, -3840.0],
+            crew: vec![("a651ff78".into(), "Fiona Taylor".into())],
+            ..villa_tank()
+        };
+        let mut data = GameData::default();
+        data.layers
+            .insert("vz_state_pmcinterior".into(), vec![hq.clone()]);
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        place(m.world(), std::slice::from_ref(&hq), true);
+        let aboard = m.crews_aboard();
+        assert_eq!(aboard.len(), 1);
+        let (g, crew) = &aboard[0];
+        assert_eq!(*g, 0xc73ad);
+        assert_eq!(crew.len(), 1);
+        assert_eq!(crew[0].0, "a651ff78");
+        assert_eq!(crew[0].2, "Fiona Taylor");
+        let fiona = crew[0].1;
+        // The scripts find her as the building's first rider.
+        m.run(
+            r#"__fiona = Vehicle.GetRiders(Pg.GetGuidByName("HqInterior"))[1]"#,
+            "riders",
+        )
+        .unwrap();
+        let found: Value = m.lua().globals().get("__fiona").unwrap();
+        assert_eq!(found, crate::events::guid_value(fiona));
+        m.run(
+            r#"Vehicle.Exit(Pg.GetGuidByName("HqInterior"), __fiona, true)"#,
+            "exit",
+        )
+        .unwrap();
+        assert!(m.crews_aboard().is_empty());
     }
 
     #[test]

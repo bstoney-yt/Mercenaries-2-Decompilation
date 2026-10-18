@@ -481,6 +481,10 @@ pub struct ScriptWorld {
     /// (the HQ interior's `HqInterior` seats Fiona, its PMC boss), else
     /// its template's.
     pub crews: HashMap<u32, Vec<(String, String)>>,
+    /// The riders those crews came in as, each with what it came in on: a
+    /// rider out of its seat is still known by it (the HQ's starter, out
+    /// of her seat for her briefing).
+    pub crew_riders: HashMap<u32, u32>,
     /// Strikes and designators under way.
     pub strikes: crate::airstrike::Strikes,
     /// Whether vehicle disguises work (`Player.SetVehicleDisguise`): the
@@ -1233,6 +1237,39 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // designator the game reports thrown has left them.
     add(&object, "IsAttached", |_, _, _| {
         values([Value::Boolean(false)])
+    })?;
+    // Object.SetTransformToObject(object, target[, hardpoint]): `object`
+    // goes where `target` (a guid, or an object's name: the sickbay's
+    // "Sickbay Hero Respawn 1") stands, turned as it is. From the scripts'
+    // 4 call sites: the HQ's briefings put the player and the starter at
+    // their `..._BriefingLoc` locators, the sickbay its hero at a respawn
+    // point, the teleport helper its hero at an object's hardpoint (where
+    // the game knows that hardpoint, else at the object itself).
+    add(&object, "SetTransformToObject", |w, _, a| {
+        let target = match a.get(1) {
+            Some(Value::String(s)) => w.by_name(&s.to_string_lossy()),
+            v => id(v),
+        };
+        let (Some(guid), Some(t)) = (id(a.first()), target) else {
+            return values([]);
+        };
+        let Some(to) = w.objects.get(&t).map(|o| (o.position, o.yaw)) else {
+            return values([]);
+        };
+        let hardpoint = match a.get(2) {
+            Some(Value::String(s)) => w
+                .hijack
+                .hardpoint(t, m2_assets::name_hash(&s.to_string_lossy())),
+            _ => None,
+        };
+        let (position, yaw) = (hardpoint.unwrap_or(to.0), to.1);
+        if let Some(o) = w.objects.get_mut(&guid) {
+            o.position = position;
+            o.yaw = yaw;
+        }
+        w.commands.push(Command::Move { guid, position });
+        w.commands.push(Command::Turn { guid, yaw });
+        values([])
     })?;
     // How far off an object goes to sleep (metres). The deliveries place
     // a helicopter's cargo by it, with 155 as their own fallback: that,
@@ -2715,6 +2752,54 @@ mod tests {
             world.borrow_mut().take_commands(),
             [Command::OpenGate(50), Command::OpenGate(50)]
         );
+    }
+
+    #[test]
+    fn set_transform_to_object_puts_one_where_another_stands() {
+        // The HQ's briefing: the hero to `..._BriefingLoc_Hero1`, by guid
+        // or by name; a hardpoint the game reported goes over the origin.
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            let mut spot = Object::new(
+                "PmcInterior_StarterFiona_BriefingLoc_Hero1",
+                [3.0, 4.0, 5.0],
+            );
+            spot.yaw = 1.5;
+            w.insert(60, spot);
+            w.hijack
+                .set_hardpoint(50, m2_assets::name_hash("hp_seat"), [7.0, 8.0, 9.0]);
+        }
+        host.lua()
+            .load(
+                "Object.SetTransformToObject(Player.GetAnyCharacter(), \
+                 'PmcInterior_StarterFiona_BriefingLoc_Hero1')",
+            )
+            .exec()
+            .unwrap();
+        {
+            let mut w = world.borrow_mut();
+            assert_eq!(w.objects[&1].position, [3.0, 4.0, 5.0]);
+            assert_eq!(w.objects[&1].yaw, 1.5);
+            assert_eq!(
+                w.take_commands(),
+                [
+                    Command::Move {
+                        guid: 1,
+                        position: [3.0, 4.0, 5.0]
+                    },
+                    Command::Turn { guid: 1, yaw: 1.5 }
+                ]
+            );
+        }
+        host.lua()
+            .load(
+                "Object.SetTransformToObject(Player.GetAnyCharacter(), \
+                 Pg.GetGuidByName('_global_veh_jeep 0x0001'), 'hp_seat')",
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(world.borrow().objects[&1].position, [7.0, 8.0, 9.0]);
     }
 
     #[test]

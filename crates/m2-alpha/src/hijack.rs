@@ -230,6 +230,11 @@ pub struct Hijacks {
     /// The riders' looks, by vehicle (index, model) and seat: kept while
     /// the vehicle is.
     rider_looks: HashMap<(usize, u32, u32), Vec<bool>>,
+    /// The seats of props' riders ([`Hijacks::seat_prop_riders`]), by
+    /// the prop's model, its template and the seat.
+    prop_seats: HashMap<(u32, u32, u32), Option<Seat>>,
+    /// The looks of props' riders, by the rider's guid.
+    prop_looks: HashMap<u32, Vec<bool>>,
     /// The latest riders' tally, and the last one written to the log.
     pub riders: RiderTally,
     told_riders: RiderTally,
@@ -246,8 +251,12 @@ const RIDER_DISTANCE: f32 = crate::npc::DRAW_DISTANCE;
 /// [`ParkedVehicle::crew`]: crate::scene::ParkedVehicle::crew
 #[derive(Clone, Debug)]
 pub struct Rider {
-    /// Index into the scene's vehicles.
+    /// Index into the scene's vehicles (unused for one on a prop).
     pub vehicle: usize,
+    /// The layer object they sit on instead of a vehicle (a building:
+    /// the PMC HQ interior's starter), by guid
+    /// ([`crate::scene::Scene::prop_crews`]).
+    pub prop: Option<u32>,
     /// The seat, by its name's hash (`seat_driver`).
     pub seat: u32,
     /// Index into the people's kinds: whom they are drawn as.
@@ -320,6 +329,8 @@ impl Hijacks {
             rider_clips: HashMap::new(),
             rider_unbound: Default::default(),
             rider_looks: HashMap::new(),
+            prop_seats: HashMap::new(),
+            prop_looks: HashMap::new(),
             riders: RiderTally::default(),
             told_riders: RiderTally::default(),
             active: None,
@@ -829,7 +840,9 @@ impl Hijacks {
                 }
             }
         }
-        riders.retain(|r| wanted.iter().any(|w| w.0 == r.vehicle && w.1 == r.seat));
+        riders.retain(|r| {
+            r.prop.is_some() || wanted.iter().any(|w| w.0 == r.vehicle && w.1 == r.seat)
+        });
         for (i, hash, who) in wanted {
             tally.seats += 1;
             let v = &game.scene.vehicles[i];
@@ -862,9 +875,9 @@ impl Hijacks {
                 tally.no_kind += 1;
                 continue;
             };
-            let place = riders
-                .iter()
-                .position(|r| r.vehicle == i && r.seat == hash && r.kind == kind);
+            let place = riders.iter().position(|r| {
+                r.prop.is_none() && r.vehicle == i && r.seat == hash && r.kind == kind
+            });
             let index = match place {
                 Some(p) => p,
                 None => {
@@ -907,9 +920,10 @@ impl Hijacks {
                             o
                         }
                     };
-                    riders.retain(|r| !(r.vehicle == i && r.seat == hash));
+                    riders.retain(|r| !(r.prop.is_none() && r.vehicle == i && r.seat == hash));
                     riders.push(Rider {
                         vehicle: i,
+                        prop: None,
                         seat: hash,
                         kind,
                         rig,
@@ -945,6 +959,138 @@ impl Hijacks {
         }
     }
 
+    /// Seats the riders of the layers' props near her
+    /// ([`Scene::prop_crews`]) as [`Hijacks::seat_riders`] seats a
+    /// vehicle's: on the seat the prop's template's `SeatLink` names, at
+    /// its hardpoint on the prop's model, playing the tables' `InVehicle`
+    /// `Idle` clip for the template's `VehicleAnimationSet`.
+    ///
+    /// From samples: the PMC HQ's interior (`HqInterior`, template
+    /// `pmchq_interior`) has one `Rider` record of its own, Fiona Taylor
+    /// in seat a651ff78, and its template one `SeatLink` for that seat,
+    /// hardpoint 7ce3f665; the three recruits' interior pieces
+    /// (`_pmcoutpost_interior_recruitheli`, `..mechanic`, `..jet`) each
+    /// carry their recruit the same way. The scripts find a starter as the
+    /// prop's first rider (`WifPmcInterior._EnableStarter`), and offer
+    /// her `Talk` by where she is: where she sits goes back to them
+    /// ([`Scene::prop_rider_spots`]).
+    ///
+    /// [`Scene::prop_crews`]: crate::scene::Scene::prop_crews
+    /// [`Scene::prop_rider_spots`]: crate::scene::Scene::prop_rider_spots
+    fn seat_prop_riders(&mut self, game: &mut Game, dt: f32) {
+        let State::Ready(loaded) = &self.state else {
+            return;
+        };
+        let here = game.focus();
+        let mut riders = std::mem::take(&mut game.scene.riders);
+        let mut wanted: Vec<(u32, u32, u32, String, Mat4, u32)> = Vec::new();
+        for (g, crew) in &game.scene.prop_crews {
+            let Some((p, _)) = game.scene.props.get(*g) else {
+                continue;
+            };
+            if p.wrecked || p.position.distance(here) > RIDER_DISTANCE {
+                continue;
+            }
+            let at = Mat4::from_rotation_translation(p.rotation, p.position);
+            for (seat, rider, who) in crew {
+                wanted.push((*g, *rider, seat_hash(seat), who.clone(), at, p.model));
+            }
+        }
+        riders.retain(|r| {
+            r.prop.is_none() || wanted.iter().any(|w| Some(w.0) == r.prop && w.2 == r.seat)
+        });
+        let mut spots = Vec::new();
+        for (g, rider, hash, who, at, model) in wanted {
+            let template = game.scene.props.get(g).map_or(0, |(p, _)| p.template);
+            let key = (model, template, hash);
+            if !self.prop_seats.contains_key(&key) {
+                let seat =
+                    find_prop_seat(game, &mut self.points, &loaded.clips, model, template, hash);
+                eprintln!("rider: prop {g:#x} model {model:08x} seat {hash:08x}: {seat:?}");
+                self.prop_seats.insert(key, seat);
+            }
+            let Some(seat) = self.prop_seats[&key] else {
+                continue;
+            };
+            let model_of = game
+                .scene
+                .world
+                .as_ref()
+                .and_then(|w| w.index.template_db.get(&who).and_then(|t| t.model));
+            let Some(kind) = game.scene.people.rider_kind(&who, model_of) else {
+                continue;
+            };
+            let index = match riders
+                .iter()
+                .position(|r| r.prop == Some(g) && r.seat == hash && r.kind == kind)
+            {
+                Some(i) => i,
+                None => {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        self.rider_clips.entry(seat.clip)
+                    {
+                        e.insert(load(game, seat.clip));
+                    }
+                    if self.rider_unbound.contains(&(seat.clip, kind)) {
+                        continue;
+                    }
+                    let k = &game.scene.people.kinds[kind];
+                    let Some(bound) = self.rider_clips[&seat.clip]
+                        .clone()
+                        .and_then(|c| bind_rider(seat.clip, c, &k.rig.skeleton, &k.role))
+                    else {
+                        self.rider_unbound.insert((seat.clip, kind));
+                        continue;
+                    };
+                    let mut rig = crate::scene::Rig {
+                        clips: std::sync::Arc::new(vec![bound]),
+                        locomotion: None,
+                        animator: Default::default(),
+                        cues: Vec::new(),
+                        aim: None,
+                        two_handed: false,
+                        ..k.rig.clone()
+                    };
+                    rig.animator.play(0);
+                    let outfit = match self.prop_looks.get(&rider) {
+                        Some(o) => o.clone(),
+                        None => {
+                            let o = game.scene.people.dress_as(kind, &who);
+                            self.prop_looks.insert(rider, o.clone());
+                            o
+                        }
+                    };
+                    eprintln!(
+                        "rider: {who} ({rider:#x}) sits on prop {g:#x}, clip {:08x}",
+                        seat.clip
+                    );
+                    riders.retain(|r| !(r.prop == Some(g) && r.seat == hash));
+                    riders.push(Rider {
+                        vehicle: usize::MAX,
+                        prop: Some(g),
+                        seat: hash,
+                        kind,
+                        rig,
+                        outfit,
+                        frame: Mat4::IDENTITY,
+                    });
+                    riders.len() - 1
+                }
+            };
+            let r = &mut riders[index];
+            r.rig.advance(dt);
+            r.frame = at * Mat4::from_translation(seat.at + seat_offset(&r.rig, 0));
+            let ahead = r.frame.transform_vector3(Vec3::Z);
+            spots.push((
+                rider,
+                r.frame.transform_point3(Vec3::ZERO),
+                ahead.x.atan2(ahead.z),
+            ));
+        }
+        game.scene.riders = riders;
+        game.scene.prop_rider_spots = spots;
+    }
+
     /// While she drives (and no hijack plays), she sits in the driver's
     /// seat, playing the clip the tables give that seat, turned and
     /// tilted with the vehicle. Runs after the game's tick, like
@@ -955,6 +1101,7 @@ impl Hijacks {
         };
         dress(game, &mut self.dressed, &loaded.clips);
         self.seat_riders(game, dt);
+        self.seat_prop_riders(game, dt);
         let State::Ready(loaded) = &self.state else {
             return;
         };
@@ -1533,6 +1680,55 @@ fn find_seat(
         clip,
         at,
         shown: !hatch,
+    })
+}
+
+/// The seat `seat` (name hash) of a prop of model `model` and template
+/// `template` (id), as [`find_seat`] finds a vehicle's: the template's
+/// `SeatLink` for it gives the hardpoint on the model, its
+/// `VehicleAnimationSet` the tables' `InVehicle` `Idle` clip. Always
+/// shown (no entrances to hide it).
+fn find_prop_seat(
+    game: &mut Game,
+    points: &mut HashMap<(u32, u32), Option<Vec3>>,
+    clips: &ClipTimes,
+    model: u32,
+    template: u32,
+    seat: u32,
+) -> Option<Seat> {
+    let scene = &mut game.scene;
+    let db = &scene.world.as_ref()?.index.template_db;
+    let name = db
+        .names
+        .get(&template)
+        .or_else(|| db.names.get(&(template ^ 0x8000_0000)))?
+        .to_ascii_lowercase();
+    let Some(&set) = clips.sets.get(&name) else {
+        eprintln!("seat: prop {name}: no VehicleAnimationSet: its rider is not drawn");
+        return None;
+    };
+    let Some(&(_, hardpoint)) = clips
+        .seats
+        .get(&name)
+        .and_then(|l| l.iter().find(|s| s.0 == seat))
+    else {
+        eprintln!("seat: prop {name}: no SeatLink for seat {seat:08x}: its rider is not drawn");
+        return None;
+    };
+    let at = hardpoint.and_then(|h| point(points, scene.source.as_mut(), model, h));
+    let clip = clips.tables.as_ref().and_then(|(actions, vehicles)| {
+        let row = |seat| {
+            animation_table::seat_clip_row(actions, vehicles, "InVehicle", "Idle", set, seat)
+        };
+        row(Some(seat)).or_else(|| row(None)).map(|(clip, _)| clip)
+    });
+    eprintln!(
+        "seat: prop {name}: seat {seat:08x} hardpoint {hardpoint:08x?} at {at:?}, clip {clip:08x?}"
+    );
+    Some(Seat {
+        clip: clip?,
+        at: at?,
+        shown: true,
     })
 }
 

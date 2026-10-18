@@ -979,6 +979,41 @@ impl MissionLink {
         if let Some(g) = game.context_taken.take() {
             mission.take_context_action(g);
         }
+        // Riders of the layers' props (the HQ interior's starter): drawn in
+        // their seats by `crate::hijack`, which says where those are; the
+        // scripts hear it, so what is offered by her (her `Talk`) is where
+        // she sits, not at the building's origin.
+        for (g, at, yaw) in std::mem::take(&mut game.scene.prop_rider_spots) {
+            mission.place(g, at.to_array(), yaw);
+        }
+        let props = &game.scene.props;
+        game.scene.prop_crews = mission
+            .crews_aboard()
+            .into_iter()
+            .filter(|(g, _)| props.get(*g).is_some())
+            .collect();
+        // Out of their seats (a starter at her briefing spot), they stand
+        // where the scripts have them; back in, they sit again.
+        let scene = &mut game.scene;
+        if let Some(world) = scene.world.as_mut() {
+            for (_, crew) in &scene.prop_crews {
+                for (_, rider, _) in crew {
+                    scene.people.unstand_scripted(&mut world.physics, *rider);
+                }
+            }
+            let here = scene.player.as_ref().map(|p| p.character.position);
+            for (rider, from, who, at, yaw) in mission.crews_on_foot() {
+                let at = Vec3::from(at);
+                let near = here.is_some_and(|h| h.distance(at) <= crate::npc::DRAW_DISTANCE);
+                if scene.props.get(from).is_none() || !near {
+                    continue;
+                }
+                let model = world.index.template_db.get(&who).and_then(|t| t.model);
+                scene
+                    .people
+                    .stand_scripted(rider, &who, model, None, at, yaw);
+            }
+        }
         let on_foot = game
             .scene
             .player
