@@ -2550,12 +2550,15 @@ impl Scene {
                 let Some(at) = world.physics.vehicle_transform(id) else {
                     continue;
                 };
+                v.model.braking = Some(world.physics.vehicle_braking(id));
                 let mut nodes = v.spec.posed_nodes(
                     &world.physics.vehicle_wheels(id),
                     v.rolled,
                     v.turret,
                     v.gun,
                 );
+                v.spec
+                    .lift_wheels(&mut nodes, &world.physics.vehicle_wheel_lift(id));
                 v.spec.spin_rotors(&mut nodes, v.rolled);
                 for &(i, m) in &v.hijack_nodes {
                     if let Some(n) = nodes.get_mut(i) {

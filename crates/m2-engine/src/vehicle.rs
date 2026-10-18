@@ -899,6 +899,22 @@ impl VehicleSpec {
             })
             .collect()
     }
+
+    /// Moves each wheel's nodes (from [`posed_nodes`](Self::posed_nodes))
+    /// up its spring by `lift` metres, model space, in wheel order
+    /// (`Physics::vehicle_wheel_lift`), so its tyre stays on the ground
+    /// as the body rides up and down on its springs. A tracked vehicle's
+    /// road wheels stay put: its made-up wheels aren't drawn.
+    pub fn lift_wheels(&self, nodes: &mut [Mat4], lift: &[f32]) {
+        if self.tracked {
+            return;
+        }
+        for (n, w) in nodes.iter_mut().zip(&self.node_wheel) {
+            if let Some(&up) = w.and_then(|i| lift.get(i)) {
+                *n = Mat4::from_translation(Vec3::Y * up) * *n;
+            }
+        }
+    }
 }
 
 /// The plane `h = a + b x + c z` closest (least squares) to `points`'
@@ -1138,6 +1154,23 @@ mod tests {
         // Turned a quarter (to +x) and raised: up and out to the side.
         let (at, _) = s.muzzle_pose(std::f32::consts::FRAC_PI_2, up).unwrap();
         assert!(at.y > trunnion.y + 1.0 && at.x > 3.0, "{at}");
+    }
+
+    #[test]
+    fn wheels_ride_up_and_down_their_springs() {
+        let s = spec();
+        let mut nodes = s.posed_nodes(&[(0.0, 0.0); 4], 0.0, 0.0, 0.0);
+        let before = nodes.clone();
+        s.lift_wheels(&mut nodes, &[0.05, -0.1, 0.0, 0.0]);
+        for (i, (a, b)) in before.iter().zip(&nodes).enumerate() {
+            let up = match s.node_wheel[i] {
+                Some(0) => 0.05,
+                Some(1) => -0.1,
+                _ => 0.0,
+            };
+            let moved = b.w_axis.truncate() - a.w_axis.truncate();
+            assert!(moved.abs_diff_eq(Vec3::Y * up, 1e-6), "{i}: {moved}");
+        }
     }
 
     #[test]

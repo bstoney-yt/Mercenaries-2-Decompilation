@@ -868,8 +868,56 @@ pub enum StaticKey {
     Entity(u32),
 }
 
-/// Suspension rest length and travel, metres. Invented.
+/// How far each wheel may rise above where its model has it, metres.
+/// Invented. Its spring is this much longer than that plus what the
+/// vehicle's weight squeezes it ([`preloads`]), so standing it sits as
+/// its model has it (inferred: the models' wheels rest on their floor)
+/// and its drawn wheels follow their springs
+/// ([`Physics::vehicle_wheel_lift`]). Before, all 113 wheeled template
+/// groups' tyres were drawn into the road, 9.3 cm on average and 36.5 cm
+/// at worst; now 0.2 cm at worst (susptest's `sunk` columns).
 const SUSPENSION: f32 = 0.3;
+/// How far each wheel's spring is squeezed by the vehicle's weight
+/// standing on level ground, metres, in spec order: the front (steering)
+/// and back axles carry it as its centre of mass (at `mass_z`, model
+/// space) lies between them, each axle's wheels alike, and a spring of
+/// strength `k` (per kilogram, as its template's) squeezed `c` pushes
+/// `k c` per kilogram. Both axles carry half each when they are not apart
+/// (a single axle, or every wheel steering).
+fn preloads(spec: &VehicleSpec, strength: impl Fn(bool) -> f32, mass_z: f32) -> Vec<f32> {
+    let axle = |front: bool| {
+        let z: Vec<f32> = spec
+            .wheels
+            .iter()
+            .filter(|w| w.steers == front)
+            .map(|w| w.centre.z)
+            .collect();
+        (z.len(), z.iter().sum::<f32>() / z.len().max(1) as f32)
+    };
+    let ((nf, zf), (nr, zr)) = (axle(true), axle(false));
+    let front_share = if nf == 0 {
+        0.0
+    } else if nr == 0 {
+        1.0
+    } else if zf - zr > 0.1 {
+        ((mass_z - zr) / (zf - zr)).clamp(0.1, 0.9)
+    } else {
+        0.5
+    };
+    spec.wheels
+        .iter()
+        .map(|w| {
+            let (share, n) = if w.steers {
+                (front_share, nf)
+            } else {
+                (1.0 - front_share, nr)
+            };
+            let k = strength(w.steers).max(1.0);
+            (GRAVITY * share / (n.max(1) as f32 * k)).min(1.0)
+        })
+        .collect()
+}
+
 /// Each wheel's spring and dampers (squeezed, stretched), per kilogram,
 /// for a vehicle whose template gives no `FrontWheelSuspStrength` and
 /// the rest ([`Handling`](crate::tuning::Handling)'s `spring` and
@@ -1025,6 +1073,9 @@ struct VehicleBody {
     /// clutch is still out changing to it, seconds.
     gear: usize,
     clutch: f32,
+    /// Its driver brakes: pulls against the way it rolls, or holds the
+    /// handbrake (not a parked vehicle's hold).
+    braking: bool,
     /// Its template's steering lock and brakes, on wheels.
     handling: Option<crate::tuning::Handling>,
     /// Where its front wheels point now, radians (left positive): they
@@ -1804,13 +1855,18 @@ impl Physics {
                 (k, (c, c))
             })
         };
-        for w in &spec.wheels {
+        let preload = preloads(spec, |front| spring(front).0, centre.z);
+        for (w, &preload) in spec.wheels.iter().zip(&preload) {
             let (stiffness, (squeezed, stretched)) = spring(w.steers);
+            // Its spring is longer than SUSPENSION by what its share of
+            // the weight squeezes it, so standing it sits as its model
+            // has it: tyres on the ground, wheels in their arches.
+            let rest = SUSPENSION + preload;
             let tuning = WheelTuning {
                 suspension_stiffness: stiffness,
                 suspension_compression: squeezed,
                 suspension_damping: stretched,
-                max_suspension_travel: SUSPENSION,
+                max_suspension_travel: rest,
                 side_friction_stiffness: 1.0,
                 friction_slip: grip(w.steers),
                 max_suspension_force: spec.mass * 40.0,
@@ -1820,7 +1876,7 @@ impl Physics {
                 -r::Vector::Y,
                 // Forward = up x axle = +z.
                 -r::Vector::X,
-                SUSPENSION,
+                rest,
                 w.radius,
                 &tuning,
             );
@@ -1873,6 +1929,7 @@ impl Physics {
             tracks: spec.tuning.tracks,
             gear: 0,
             clutch: 0.0,
+            braking: false,
             handling: spec.tuning.handling.filter(|_| !spec.tracked),
             steering: 0.0,
             wrecked: false,
@@ -1927,6 +1984,7 @@ impl Physics {
         let slowing = |decel: f32| v.mass * decel * dt / wheels;
         let throttle = controls.throttle.clamp(-1.0, 1.0);
         let against = speed.abs() > 0.5 && throttle * speed < 0.0;
+        v.braking = !controls.parked && (controls.brake || against);
         // Its gearbox changes up and down as its template's shift speeds
         // say, rolling forwards, and while its clutch is out its engine
         // drives nothing (the clutch's delay read so, inferred).
@@ -2144,6 +2202,34 @@ impl Physics {
             .unwrap_or_default()
     }
 
+    /// How far each of a vehicle's wheels sits above where its model has
+    /// it, chassis space, metres, in spec order: up as its spring squeezes
+    /// over a bump, down as it hangs off a ledge or in the air. Draw the
+    /// wheel this far up and its tyre stays on the ground it touches.
+    pub fn vehicle_wheel_lift(&self, id: VehicleId) -> Vec<f32> {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map(|v| {
+                v.controller
+                    .wheels()
+                    .iter()
+                    .map(|w| {
+                        let ray = w.raycast_info();
+                        let length = if ray.is_in_contact {
+                            ray.suspension_length
+                        } else {
+                            w.suspension_rest_length
+                        };
+                        // The model's wheel centre is SUSPENSION under its
+                        // spring's top (see `add_vehicle_turned`).
+                        SUSPENSION - length
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// How many of a vehicle's wheels touch the ground, of how many.
     pub fn vehicle_contacts(&self, id: VehicleId) -> (usize, usize) {
         self.vehicles
@@ -2349,6 +2435,16 @@ impl Physics {
         Some((v.gear, e.rpm_at(e.gears[v.gear], speed)))
     }
 
+    /// Whether a vehicle's driver is braking ([`drive`](Self::drive) last
+    /// had it pulling against the way it rolls, or on its handbrake): its
+    /// brake lamps glow. A wreck's never do.
+    pub fn vehicle_braking(&self, id: VehicleId) -> bool {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|v| v.braking && !v.wrecked)
+    }
+
     /// Makes a vehicle a wreck: burst tyres and bent axles no longer carry
     /// it, so it drops onto its rims and belly and scrapes to a stop
     /// instead of rolling on.
@@ -2360,7 +2456,7 @@ impl Physics {
         // How low the rims reach, chassis space.
         let mut rims = f32::INFINITY;
         for w in v.controller.wheels_mut() {
-            let centre = w.chassis_connection_point_cs.y - w.suspension_rest_length;
+            let centre = w.chassis_connection_point_cs.y - SUSPENSION;
             rims = rims.min(centre - w.radius * WRECK_RIM);
             w.max_suspension_force = 0.0;
             w.friction_slip = 0.0;
@@ -3306,7 +3402,11 @@ mod tests {
             "turned left"
         );
         assert!(m.transform_vector3(Vec3::X).y < -0.1, "leans left");
-        assert!(m.transform_vector3(Vec3::Y).y > 0.8, "still up");
+        // Up to 45 degrees over: standing at its model's height on its
+        // springs it leans 40 here (the island's bikes up to 45 at full
+        // lock, biketest).
+        let up = m.transform_vector3(Vec3::Y).y;
+        assert!(up > 0.7, "still up: {up}");
     }
 
     /// The Offroad Motorcycle (AL)'s `Bike*` fields, the weakest.
@@ -4270,6 +4370,82 @@ mod tests {
     // wheels of strength k it sits g / 4k down on them, and kicked
     // downwards bounces back past its settled height after half a swing
     // at sqrt(4k (1 - zeta^2)) rad/s, zeta = 4c / (2 sqrt(4k)).
+    // Standing, a car's springs are squeezed by its weight, but it sits
+    // where its model has it (its wheels' bottoms on the ground) and its
+    // wheels are drawn there, not sunk into the road by the squeeze.
+    #[test]
+    fn it_stands_with_its_tyres_on_the_ground() {
+        for k in [8.0, 25.0, 60.0] {
+            let mut spec = car();
+            spec.tuning.handling = Some(crate::tuning::Handling {
+                steer_lock: 0.7,
+                brake: (7.0, 6.0),
+                grip: (1.5, 1.5),
+                steer_speed: 0.6,
+                low_speed: 0.0,
+                low_steer_speed: 0.0,
+                spring: (k, k),
+                damping: (1.7, 1.7),
+            });
+            let mut p = Physics::new();
+            floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
+            p.step(DT);
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, spec.ride_height() + 0.1, -400.0), 0.0);
+            for _ in 0..240 {
+                p.step(DT);
+            }
+            let sag = p.vehicle_suspension(id);
+            assert!(
+                sag.iter().all(|&s| s > 0.9 * 9.81 / (8.0 * k)),
+                "{k}: {sag:?}"
+            );
+            let y = p.vehicle_transform(id).expect("car").w_axis.y;
+            assert!((y - spec.ride_height()).abs() < 0.02, "{k}: {y}");
+            let lift = p.vehicle_wheel_lift(id);
+            // Within 2 cm: Rapier's springs settle about 1% further down
+            // than k c = g says (1.3 cm at a strength of 8).
+            assert!(lift.iter().all(|l| l.abs() < 0.02), "{k}: {lift:?}");
+        }
+    }
+
+    // Its brake lamps glow while it is driven against the way it rolls or
+    // on its handbrake, and not as it drives on, coasts or stands parked.
+    #[test]
+    fn it_brakes_with_its_lamps_lit() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
+        p.step(DT);
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.5, -400.0), 0.0);
+        let run = |p: &mut Physics, c: VehicleControls, steps: usize| {
+            for _ in 0..steps {
+                p.drive(id, c);
+                p.step(DT);
+            }
+            p.vehicle_braking(id)
+        };
+        let go = VehicleControls {
+            throttle: 1.0,
+            ..VehicleControls::default()
+        };
+        assert!(!run(&mut p, go, 120));
+        let back = VehicleControls {
+            throttle: -1.0,
+            ..VehicleControls::default()
+        };
+        assert!(run(&mut p, back, 5));
+        assert!(!run(&mut p, VehicleControls::default(), 5));
+        let handbrake = VehicleControls {
+            brake: true,
+            ..VehicleControls::default()
+        };
+        assert!(run(&mut p, handbrake, 5));
+        let parked = VehicleControls {
+            parked: true,
+            ..VehicleControls::default()
+        };
+        assert!(!run(&mut p, parked, 5));
+    }
+
     #[test]
     fn springs_and_dampers_come_from_the_template() {
         let ride = |k: f32, c: f32| {
