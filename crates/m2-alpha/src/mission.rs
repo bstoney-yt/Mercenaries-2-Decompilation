@@ -1274,6 +1274,12 @@ impl MissionLink {
                 "mission: the faction manager is done with reporter {g:#x} (reported: {done})"
             );
         }
+        // A pursuit run out: the scripts read level 0 again.
+        let pursued = !game.scene.people.pursuit.is_empty();
+        if game.pursued && !pursued {
+            mission.pursuit_over();
+        }
+        game.pursued = pursued;
         // The factions' attitudes, once a second: whose soldiers fight her.
         game.attitude_wait -= dt;
         if game.attitude_wait <= 0.0 {
@@ -3205,6 +3211,13 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
+        // The scripts' pursuit: that army's soldiers fight her for a while,
+        // or until it is cleared.
+        Command::Pursuit { faction, seconds } => match crate::npc::faction_by_label(faction) {
+            Some(f) => game.scene.people.scripted_pursuit(f, *seconds),
+            None => eprintln!("mission: a pursuit by {faction}, not an army here"),
+        },
+        Command::PursuitClear => game.scene.people.clear_scripted_pursuit(),
         // Shut again: its model and collision go back up where its layer
         // has it (as OpenGate took them down).
         Command::CloseGate(guid) => {

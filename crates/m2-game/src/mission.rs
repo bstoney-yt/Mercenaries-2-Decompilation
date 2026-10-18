@@ -1116,6 +1116,14 @@ impl Mission {
         self.world.borrow_mut().reports.take_ended()
     }
 
+    /// The pursuit the scripts set ran out: `Pg.GetPursuitState` reads
+    /// level 0 again.
+    pub fn pursuit_over(&mut self) {
+        let mut w = self.world.borrow_mut();
+        w.pursuit.level = 0;
+        w.pursuit.faction = None;
+    }
+
     /// Whether character `guid` swims (`Human.IsSwimming`).
     pub fn set_swimming(&mut self, guid: u32, on: bool) {
         let mut w = self.world.borrow_mut();

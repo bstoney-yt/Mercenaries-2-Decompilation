@@ -3347,6 +3347,8 @@ fn mission_for_screenshot(
         // is in; 15 s on, she hurts the nearest of them; who stands with
         // which side is logged every 5 s from the visit.
         if let (Some(f), Some(done)) = (options.visit_faction.as_deref(), contract_done) {
+            // `Oil:watch`: she only watches, hurting nobody.
+            let (f, hurts) = f.strip_suffix(":watch").map_or((f, true), |f| (f, false));
             let t = i.saturating_sub(done) as f32 * tick;
             if visit.is_none() && t >= 30.0 {
                 let her = game.focus();
@@ -3387,7 +3389,7 @@ fn mission_for_screenshot(
             if let Some(v) = visit.as_mut().filter(|v| v.is_finite()) {
                 *v += tick;
                 let her = game.focus();
-                if (*v - 15.0).abs() < tick / 2.0 {
+                if hurts && (*v - 15.0).abs() < tick / 2.0 {
                     let near = game
                         .scene
                         .people
@@ -3429,6 +3431,14 @@ fn mission_for_screenshot(
                         game.scene.people.pursuit,
                         game.scene.people.hostile
                     );
+                }
+                // And a picture with the game's HUD (its faction meters)
+                // 40 s on.
+                if (*v - 40.0).abs() < tick / 2.0
+                    && let Some((hud, _)) = late_hud.as_mut()
+                {
+                    render(backend, game, fov, aspect, Some(hud))?;
+                    write_ppm(backend, &picture("faction40".into()))?;
                 }
             }
         }

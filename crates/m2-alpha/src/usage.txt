@@ -201,7 +201,9 @@ m2-alpha [options]
   --visit-faction <f>    with --mission --after-contract: 30 s after the
                          contract, put her by a soldier of faction <f> (All,
                          Chi, Gur, Oil, Pir, Vza), hurt one 15 s on, and log
-                         who fights her (faction-check lines)
+                         who fights her (faction-check lines); <f>:watch
+                         hurts nobody; a picture with the HUD 40 s on
+                         (-faction40)
   --props-check <hit>    with --mission: once she is ashore (and inside
                          --props-area x0,z0,x1,z1 if given), hit every placed
                          prop there by <hit> (vehicle, gun or blast), log what

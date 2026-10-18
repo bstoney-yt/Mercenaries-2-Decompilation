@@ -1701,6 +1701,21 @@ pub fn faction_label(f: &str) -> &'static str {
     }
 }
 
+/// The faction a faction template names (`OC`, as `Pg.GetGuidByName`
+/// takes it, in any case: templates are kept in lower case),
+/// the other way from [`faction_label`].
+pub fn faction_by_label(label: &str) -> Option<&'static str> {
+    Some(match label.to_ascii_lowercase().as_str() {
+        "allied" => "All",
+        "china" => "Chi",
+        "guerilla" => "Gur",
+        "oc" => "Oil",
+        "pirate" => "Pir",
+        "vz" => "Vza",
+        _ => return None,
+    })
+}
+
 /// Seconds the soldiers of a faction she provoked fight her: the first of
 /// the pursuit level times the faction manager sets
 /// (`Pg.SetPursuitLevelTimes(120, 300)`, from the scripts; which level is
@@ -1904,6 +1919,25 @@ impl People {
     /// What she did to the factions' people since the last call.
     pub fn take_infractions(&mut self) -> Vec<Infraction> {
         std::mem::take(&mut self.infractions)
+    }
+
+    /// The scripts set faction `f` pursuing her for `seconds`, or until
+    /// they clear it (`None`) ([`m2_game::api::Pursuit`]).
+    pub fn scripted_pursuit(&mut self, f: &'static str, seconds: Option<f32>) {
+        let left = seconds.unwrap_or(f32::INFINITY);
+        let e = self.pursuit.entry(f).or_insert(0.0);
+        *e = e.max(left);
+        eprintln!("people: the scripts set {f} pursuing her for {left:.0} s");
+        self.refresh_sides();
+    }
+
+    /// The scripts' locked pursuits end.
+    pub fn clear_scripted_pursuit(&mut self) {
+        let before = self.pursuit.len();
+        self.pursuit.retain(|_, left| left.is_finite());
+        if self.pursuit.len() != before {
+            self.refresh_sides();
+        }
     }
 
     /// The pursuits: a faction member she hurt starts one for their
@@ -2996,6 +3030,20 @@ pub(crate) mod tests {
             PURSUIT_SECONDS + 1.0,
         );
         assert!(people.pursuit.is_empty());
+        assert_eq!(him(&people), Some((false, false)));
+        // The scripts lock OC on her (`Pg.LockPursuit`, its template in
+        // lower case): they fight her however long, until it is cleared.
+        let oc = faction_by_label("oc").unwrap();
+        assert_eq!(faction_label(oc), "OC");
+        people.scripted_pursuit(oc, None);
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1000.0);
+        assert_eq!(him(&people), Some((true, false)));
+        people.clear_scripted_pursuit();
+        assert_eq!(him(&people), Some((false, false)));
+        // A timed one runs out by itself.
+        people.scripted_pursuit(oc, Some(120.0));
+        assert_eq!(him(&people), Some((true, false)));
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 121.0);
         assert_eq!(him(&people), Some((false, false)));
     }
 
