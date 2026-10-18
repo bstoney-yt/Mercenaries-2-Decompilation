@@ -119,6 +119,10 @@ pub struct Props {
     /// Those a vehicle broke some parts of, a part at a time (a hedge's
     /// sections, a gate's leaf): which parts, and the nodes that hides.
     parts_down: HashMap<u32, PartsDown>,
+    /// What each piece of a prop weighs once it breaks apart, kg, by
+    /// entity, where its template says ([`m2_engine::durability::piece_masses`]):
+    /// its model's pieces otherwise weigh as stone of their size.
+    piece_mass: HashMap<u32, f32>,
     /// Wrecked since [`take_fallen`](Self::take_fallen): what falls with
     /// them is brought down too (`DestructionLink`).
     fallen: Vec<u32>,
@@ -348,6 +352,9 @@ impl Props {
                     named: o.named,
                 },
             );
+            if let Some(&kg) = index.template_db.piece_masses.get(&o.template) {
+                self.piece_mass.insert(e, kg);
+            }
             added += 1;
             self.changed();
             match self.models.entry(o.model) {
@@ -589,7 +596,11 @@ impl Props {
             .shown
             .get(&entity)
             .and_then(|p| self.models.get(&p.model)?.as_ref()?.breakup.as_deref())
-            .map_or(0.0, |b| b.pieces.mass);
+            .map_or(0.0, |b| {
+                weighed(b, self.piece_mass.get(&entity).copied())
+                    .pieces
+                    .mass
+            });
         let (velocity, spin) = push(mass);
         self.wreck_by(physics, entity, Hit::Crash(velocity, spin))
     }
@@ -615,6 +626,7 @@ impl Props {
             if let Some(breakup) = m.breakup.as_deref()
                 && !self.knocked.contains_key(&entity)
             {
+                let breakup = &weighed(breakup, self.piece_mass.get(&entity).copied());
                 let pieces = match hit {
                     Hit::Blast(blast, scale) => throw(physics, breakup, placed, blast, scale),
                     Hit::Crash(velocity, spin) => {
@@ -1606,6 +1618,23 @@ fn throw(
 /// `velocity` (m/s) turning at `spin` (radians a second), as a vehicle
 /// sends on what it knocks loose: no blast throws them. Each is lifted out
 /// of the ground it starts in, as [`throw`] lifts them.
+/// `breakup` with each piece weighing `kg` (its template's debris, as
+/// [`Props::piece_mass`] holds it), or as it is.
+fn weighed(breakup: &Breakup, kg: Option<f32>) -> std::borrow::Cow<'_, Breakup> {
+    let Some(kg) = kg else {
+        return std::borrow::Cow::Borrowed(breakup);
+    };
+    let mut pieces = breakup.pieces.clone();
+    for p in &mut pieces.pieces {
+        p.mass = kg;
+    }
+    pieces.mass = kg * pieces.pieces.len() as f32;
+    std::borrow::Cow::Owned(Breakup {
+        pieces,
+        points: breakup.points.clone(),
+    })
+}
+
 fn knock_on(
     physics: &mut Physics,
     breakup: &Breakup,

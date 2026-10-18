@@ -690,7 +690,8 @@ impl World {
                 None => None,
             });
         }
-        let inland = inland_water(backend, &mut source, settings.sea_level)?;
+        let heights = water_heights(&mut source);
+        let inland = inland_water(backend, heights.as_ref(), settings.sea_level)?;
         drop(source);
         let loader = Loader::spawn(install, index.clone(), TextureLimits::default())?;
         let mut objects: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
@@ -741,6 +742,11 @@ impl World {
                 .map(m2_assets::name_hash)
                 .collect(),
         };
+        // People keep out of the deep water the heights give (pools,
+        // rivers), as out of the sea's.
+        if let Some(h) = heights {
+            world.physics.set_inland(std::sync::Arc::new(h));
+        }
         // Every tile, so the whole island shows from the start.
         let mut tiles: Vec<u32> = world.index.tiles.keys().copied().collect();
         tiles.sort_unstable();
@@ -2081,37 +2087,43 @@ impl SeaConstants {
     }
 }
 
+/// The game's water heights (its one `watr` asset), if it reads.
+fn water_heights<R: std::io::Read + std::io::Seek>(
+    source: &mut crate::assets::AssetSource<R>,
+) -> Option<WaterHeights> {
+    let index = source.archive().index();
+    let hash = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == WATER_TYPE)
+        .map(|a| a.name_hash)?;
+    match source
+        .asset(hash, WATER_TYPE)
+        .map(|d| WaterHeights::parse(&d))
+    {
+        Ok(Ok(w)) => Some(w),
+        Ok(Err(e)) => {
+            eprintln!("water heights {hash:08x}: {e}");
+            None
+        }
+        Err(e) => {
+            eprintln!("water heights {hash:08x}: {e}");
+            None
+        }
+    }
+}
+
 /// The water above the sea: a flat square at each point of the game's
 /// water heights ([`WaterHeights`]) whose surface lies above the sea,
 /// drawn as the sea is. Rivers, pools and lakes; the ground hides what
 /// lies under it. `None` without the heights.
-fn inland_water<R: std::io::Read + std::io::Seek>(
+fn inland_water(
     backend: &mut dyn RenderBackend,
-    source: &mut crate::assets::AssetSource<R>,
+    water: Option<&WaterHeights>,
     sea_level: f32,
 ) -> Result<Option<(VertexBufferHandle, IndexBufferHandle, u32)>, BackendError> {
-    let index = source.archive().index();
-    let Some(hash) = index
-        .assets()
-        .iter()
-        .find(|a| index.type_hash(a) == WATER_TYPE)
-        .map(|a| a.name_hash)
-    else {
+    let Some(water) = water else {
         return Ok(None);
-    };
-    let water = match source
-        .asset(hash, WATER_TYPE)
-        .map(|d| WaterHeights::parse(&d))
-    {
-        Ok(Ok(w)) => w,
-        Ok(Err(e)) => {
-            eprintln!("water heights {hash:08x}: {e}");
-            return Ok(None);
-        }
-        Err(e) => {
-            eprintln!("water heights {hash:08x}: {e}");
-            return Ok(None);
-        }
     };
     let mut vertices: Vec<f32> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();

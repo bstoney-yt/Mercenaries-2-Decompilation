@@ -70,6 +70,8 @@ m2-alpha [options]
                          just before the picture
   --bash                 with --screenshot on the island: a melee bash just
                          before the picture
+  --reload               with --screenshot on foot: change the rifle's clip
+                         --lead seconds before the picture
   --bash-clip <hash>     with --bash: bash with this clip (one of those the
                          "player meleebash clips:" line lists)
   --lead <s>             with --jump, --throw or --bash: seconds before the
@@ -119,7 +121,9 @@ m2-alpha [options]
   --weapon rifle|rpg|gl  with --screenshot on foot: the weapon she has up
                          (gl: the supply crate's grenade launcher)
   --switch               with --screenshot on foot: switch weapons --lead
-                         seconds before the picture (stow, then take up)
+                         seconds before the picture (stow, then take up);
+                         with --drive --fire: press the weapon switch (to
+                         the machine gun) before firing
   --pickup               with --screenshot on foot: pick a weapon up --lead
                          seconds before the picture
   --satellite <stage>    with --screenshot on foot: call a Satellite Guided
@@ -202,6 +206,10 @@ m2-alpha [options]
                          contract, put her by a soldier of faction <f> (All,
                          Chi, Gur, Oil, Pir, Vza), hurt one 15 s on, and log
                          who fights her (faction-check lines)
+  --jump-with-enter      with --mission --autoplay --after-contract: the
+                         Enter pressed after the contract jumps too, as the
+                         pad's A; where she is while the scripts hold her
+                         controls is logged (held lines)
   --props-check <hit>    with --mission: once she is ashore (and inside
                          --props-area x0,z0,x1,z1 if given), hit every placed
                          prop there by <hit> (vehicle, gun or blast), log what

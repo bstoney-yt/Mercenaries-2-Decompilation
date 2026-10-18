@@ -293,6 +293,9 @@ pub struct Player {
     pub speeds: [f32; 3],
     /// In a jump, until she has landed.
     leap: Leap,
+    /// Jump was pressed while she was landing: she jumps again as the
+    /// landing ends.
+    jump_queued: bool,
     /// Seconds into a grenade throw, while she throws.
     pub throwing: Option<f32>,
     /// A melee bash, while she bashes: she stands, facing the camera's
@@ -323,6 +326,9 @@ pub struct Player {
     pub binoculars: Option<Binoculars>,
     /// Picking a weapon up: the clip and seconds in (she stands).
     pub picking: Option<(usize, f32)>,
+    /// Changing the clip ([`Player::start_reload`]): the clip and seconds
+    /// in, over her upper body.
+    pub reloading: Option<(usize, f32)>,
     /// The scripts put her weapons away (`Human.DisableWeapons`): none is
     /// drawn or fired until `EnableWeapons`.
     pub holstered: bool,
@@ -456,6 +462,7 @@ impl Player {
             clips: FightClips::default(),
             speeds: SPEEDS,
             leap: Leap::No,
+            jump_queued: false,
             throwing: None,
             bashing: None,
             launcher: false,
@@ -467,6 +474,7 @@ impl Player {
             shown: InHand::default(),
             switching: None,
             picking: None,
+            reloading: None,
             binoculars: None,
             swim: None,
             holstered: false,
@@ -491,12 +499,17 @@ impl Player {
     pub fn set_body(&mut self, model: Option<(GpuModel, Rig)>, clips: FightClips, moves: Moves) {
         self.model = model;
         self.clips = clips;
+        if let Some((_, rig)) = &self.model {
+            self.clips.sprint = crate::npc::two_handed_sprint(rig, self.clips.run_low);
+        }
         self.moves = moves;
         self.leap = Leap::No;
+        self.jump_queued = false;
         self.throwing = None;
         self.bashing = None;
         self.switching = None;
         self.picking = None;
+        self.reloading = None;
         // The rifle's clips are the ones just given: another class held
         // takes its own.
         self.shown = InHand::default();
@@ -530,6 +543,9 @@ impl Player {
             let gait = rig.gait;
             rig.set_gait(gait);
         }
+        if let Some((_, rig)) = &self.model {
+            self.clips.sprint = crate::npc::two_handed_sprint(rig, self.clips.run_low);
+        }
     }
 
     /// Starts picking a weapon up off the ground (the whole body, once:
@@ -560,9 +576,11 @@ impl Player {
     /// a jump. Back on foot, `update` takes them up again.
     pub fn off_foot(&mut self) {
         self.leap = Leap::No;
+        self.jump_queued = false;
         self.throwing = None;
         self.bashing = None;
         self.picking = None;
+        self.reloading = None;
         // A switch under way is over: she holds what the fight has up.
         if self.switching.take().is_some() {
             let now = self.in_hand;
@@ -586,6 +604,24 @@ impl Player {
         self.model.as_ref()?;
         self.throwing = Some(0.0);
         Some(release)
+    }
+
+    /// Starts changing the clip of what she holds: its class's
+    /// `ReloadRun` on the move, else its `ReloadIdle` ([`crate::held`]),
+    /// over her upper body. The clip's seconds, or `None` without one or
+    /// without her body (nothing plays).
+    pub fn start_reload(&mut self) -> Option<f32> {
+        let running = self.character.velocity.with_y(0.0).length() > RUNNING_JUMP;
+        let clip = self.moves.of(self.shown.class)?.reload_clip(running)?;
+        let (_, rig) = self.model.as_ref()?;
+        let length = rig.clips.get(clip)?.info.duration;
+        eprintln!(
+            "anim: reload {:08x} ({length:.2} s{})",
+            rig.clips[clip].hash,
+            if running { ", running" } else { "" }
+        );
+        self.reloading = Some((clip, 0.0));
+        Some(length)
     }
 
     /// Whether she is free to bash: not throwing, bashing or in a jump.
@@ -735,7 +771,7 @@ impl Player {
         } else {
             direction * speed
         };
-        let jump = (intent.jump && self.character.grounded && !bashing).then_some(JUMP);
+        let jump = self.takes_off(intent.jump, bashing).then_some(JUMP);
         physics.move_character(&mut self.character, wanted, jump, dt);
 
         // Aiming, throwing or bashing, she turns the camera's way.
@@ -777,6 +813,16 @@ impl Player {
                 } else {
                     clips.takeoff_still.or(clips.takeoff)
                 };
+                // How the jump before it ended, for the log: in the air,
+                // landing (how far into the landing clip), or done.
+                let was = match self.leap {
+                    Leap::No => "on her feet".to_owned(),
+                    Leap::Air(t) => format!("in the air {t:.2} s"),
+                    Leap::Land(t, c) => {
+                        format!("landing {t:.2} of {:.2} s", rig.clips[c].info.duration)
+                    }
+                };
+                eprintln!("jump: take-off at {:.2} m/s, {was}", moved);
                 self.leap = Leap::Air(0.0);
                 if let Some(clip) = takeoff.or(clips.jump) {
                     // At the height she stands at, so the take-off's
@@ -898,6 +944,20 @@ impl Player {
                 (Some(_), ..) => self.throwing = None,
                 _ => {}
             }
+            // Changing the clip plays over the upper body too, where a
+            // switch or a throw doesn't (playtest 8: only its sound was
+            // heard).
+            if let Some((clip, t)) = &mut self.reloading {
+                *t += dt;
+                let busy = self.switching.is_some() || self.throwing.is_some() || !free;
+                match rig.upper.clone() {
+                    Some(mask) if *t < rig.clips[*clip].info.duration && !busy => {
+                        rig.animator.upper_at(*clip, mask, *t);
+                        rig.two_handed = false;
+                    }
+                    _ => self.reloading = None,
+                }
+            }
             // Aimed, the weapon points where the crosshair does; the
             // launcher at rest points level the way she faces.
             let (sf, cf) = self.facing.sin_cos();
@@ -919,6 +979,28 @@ impl Player {
             self.switching = None;
         }
         self.camera(physics);
+    }
+
+    /// Whether she takes off now, jump `pressed` this tick. A jump is a
+    /// whole-body action (the action table's `Upright` `JUMP` row is
+    /// `FullBody`): she takes off again only once the last one is over,
+    /// landing and all. Spammed, a press used to launch her again while
+    /// still on the ground 0.08 s into the jump (29 take-offs in 3 s on
+    /// the run), or a moment after touching down, cutting the landing
+    /// short (playtest 8). A press while she lands is kept for its end.
+    /// Inferred from the table and the clips; the 360 code was not read.
+    fn takes_off(&mut self, pressed: bool, bashing: bool) -> bool {
+        if pressed && matches!(self.leap, Leap::Land(..)) {
+            self.jump_queued = true;
+        }
+        let go = (pressed || self.jump_queued)
+            && self.leap == Leap::No
+            && self.character.grounded
+            && !bashing;
+        if go {
+            self.jump_queued = false;
+        }
+        go
     }
 
     fn look_at(&self) -> Vec3 {
@@ -1377,6 +1459,27 @@ mod tests {
         p.driving = None;
         let up = p.model_matrix().transform_vector3(Vec3::Y);
         assert!((up - Vec3::Y).length() < 1e-5, "{up}");
+    }
+
+    #[test]
+    fn a_spammed_jump_waits_for_the_last_landing() {
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        p.character.grounded = true;
+        assert!(p.takes_off(true, false), "on her feet she jumps");
+        // Still touching the ground just after take-off: no second launch.
+        p.leap = Leap::Air(0.08);
+        assert!(!p.takes_off(true, false));
+        // Landing: the press waits for the landing's end, then she goes.
+        p.leap = Leap::Land(0.0, 0);
+        assert!(!p.takes_off(true, false));
+        assert!(!p.takes_off(false, false));
+        p.leap = Leap::No;
+        assert!(p.takes_off(false, false), "the kept press jumps");
+        assert!(!p.takes_off(false, false), "once");
+        // Bashing or in the air off the ground, never.
+        assert!(!p.takes_off(true, true));
+        p.character.grounded = false;
+        assert!(!p.takes_off(true, false));
     }
 
     #[test]

@@ -561,6 +561,41 @@ impl Rig {
         })
     }
 
+    /// Its idle clip in words, and how far it turns on the spot; and the
+    /// one picked when a turning clip could be (for checking, playtest 8).
+    pub fn idle_line(&self) -> String {
+        let turn = |i: usize| {
+            let c = &self.clips[i];
+            format!("{:08x} (turns {:.0} deg)", c.hash, c.info.turn.to_degrees())
+        };
+        let Some(now) = self
+            .locomotion
+            .as_ref()
+            .and_then(|l| l.clips.get(&Gait::Idle))
+        else {
+            return "no idle clip".to_owned();
+        };
+        let any = Locomotion::choose_turning(&self.clips, |_| true, f32::INFINITY)
+            .and_then(|l| l.clips.get(&Gait::Idle).copied());
+        let held: Vec<String> = [crate::npc::FightClips::READY, crate::npc::FightClips::AIM]
+            .iter()
+            .filter_map(|&h| self.clips.iter().position(|c| c.hash == h))
+            .map(turn)
+            .collect();
+        let side_on = self
+            .clips
+            .iter()
+            .position(|c| c.hash == crate::npc::FightClips::AIM)
+            .and_then(|i| self.aim_offset(i));
+        format!(
+            "idle {}; with turning clips allowed, {}; rifle ready and aimed {}; aiming turns the body {} deg with her ahead",
+            turn(*now),
+            any.map_or("none".to_owned(), turn),
+            held.join(", "),
+            side_on.map_or("?".to_owned(), |d| format!("{d:.0}"))
+        )
+    }
+
     fn new(skeleton: Skeleton, clips: Vec<BoundClip>, gait: Gait) -> Self {
         let locomotion = Locomotion::choose(&clips);
         let mut rig = Self {
@@ -599,6 +634,7 @@ impl Rig {
             ..self.clone()
         };
         rig.set_gait(Gait::Idle);
+        eprintln!("people's rig: {}", rig.idle_line());
         rig
     }
 
@@ -621,7 +657,8 @@ impl Rig {
     /// Moves at `gait` holding a rifle as `carry` says. Aiming, it is
     /// shouldered: by the whole body standing, by the upper body over the
     /// legs' gait when moving. Running, it is held low across the body in
-    /// both hands; otherwise the plain gait carries it low in the right
+    /// both hands, and sprinting too (the player's [`npc::FightClips::sprint`]);
+    /// otherwise the plain gait carries it low in the right
     /// hand, except that a soldier at the ready standing holds it across
     /// the chest. Falls back to the plain gait without the clips.
     pub fn hold_rifle(&mut self, gait: Gait, clips: &npc::FightClips, carry: Carry) {
@@ -630,6 +667,7 @@ impl Rig {
             (_, Carry::Aim) => (None, clips.aim),
             (Gait::Idle, Carry::Ready) => (clips.ready, None),
             (Gait::Run, _) => (clips.run_low, None),
+            (Gait::Sprint, _) => (clips.sprint, None),
             _ => (None, None),
         };
         match whole {
@@ -721,6 +759,20 @@ impl Rig {
             turn,
             w.y.clamp(-1.0, 1.0).asin() - b.y.clamp(-1.0, 1.0).asin(),
         ))
+    }
+
+    /// How far the aim clip `clip`'s rifle points off the way the body
+    /// faces, degrees (the clip stands side-on): what the aim turns the
+    /// body by with her straight ahead.
+    pub fn aim_offset(&self, clip: usize) -> Option<f32> {
+        let forward = self
+            .locomotion
+            .as_ref()
+            .map_or(m2_math::glam::Vec2::Y, |l| l.forward);
+        let pose = self.clips[clip].sample(&self.skeleton, 0.0);
+        let ahead = Vec3::new(forward.x, 0.0, forward.y);
+        self.aim_error(&pose, ahead)
+            .map(|(yaw, _)| yaw.to_degrees())
     }
 
     /// Turns an aiming pose so the rifle points along `want` (model
@@ -910,6 +962,10 @@ pub struct ParkedVehicle {
     /// How far its turret is turned from straight ahead, radians
     /// (anticlockwise from above).
     pub turret: f32,
+    /// While a hijack plays on it: the nodes its hijack clip moves (the
+    /// hatch thrown open) and those under them, model space, over its
+    /// posed nodes ([`crate::hijack::Hijacks::place`]).
+    pub hijack_nodes: Vec<(usize, Mat4)>,
     /// How far its gun is raised, radians (down is negative).
     pub gun: f32,
     /// How far it has rolled, metres (backwards less), for turning a
@@ -2184,6 +2240,7 @@ impl Scene {
                 spot: None,
                 crew: Vec::new(),
                 turret: 0.0,
+                hijack_nodes: Vec::new(),
                 gun: 0.0,
                 rolled: 0.0,
                 fired: 0,
@@ -2215,6 +2272,7 @@ impl Scene {
                     spot: None,
                     crew,
                     turret: 0.0,
+                    hijack_nodes: Vec::new(),
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
@@ -2235,6 +2293,7 @@ impl Scene {
                     spot: Some((entity, at, yaw)),
                     crew,
                     turret: 0.0,
+                    hijack_nodes: Vec::new(),
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
@@ -2521,6 +2580,11 @@ impl Scene {
                     v.gun,
                 );
                 v.spec.spin_rotors(&mut nodes, v.rolled);
+                for &(i, m) in &v.hijack_nodes {
+                    if let Some(n) = nodes.get_mut(i) {
+                        *n = m;
+                    }
+                }
                 v.model.draw_posed(backend, queue, at, &nodes, &[])?;
             }
         }
