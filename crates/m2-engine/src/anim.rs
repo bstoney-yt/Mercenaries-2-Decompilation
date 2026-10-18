@@ -268,6 +268,10 @@ pub struct ClipInfo {
     pub pin: Vec2,
     /// The pelvis height on the first frame, metres.
     pub hips: f32,
+    /// The most the pelvis turns about the vertical from its first frame
+    /// at any time in the clip, radians: a turn on the spot (the root's
+    /// turn isn't taken out of the pose as its travel is).
+    pub turn: f32,
 }
 
 impl BoundClip {
@@ -333,6 +337,7 @@ impl BoundClip {
                 root_start: Vec2::ZERO,
                 pin: Vec2::ZERO,
                 hips: 0.0,
+                turn: 0.0,
             },
             first_rotations: Vec::new(),
         };
@@ -363,6 +368,23 @@ impl BoundClip {
         let pelvis_xz = pelvis.map_or(Vec2::new(a.x, a.z), |i| {
             Vec2::new(models[i].w_axis.x, models[i].w_axis.z)
         });
+        // How far the pelvis turns about the vertical from its first
+        // frame, ten looks a second (at least eight); only for clips that
+        // stay put standing, which idle is chosen from.
+        let still = travel.length() < 1e-3 && hips > 0.85 && hips < 1.3;
+        let turn = pelvis.filter(|_| still).map_or(0.0, |i| {
+            let start = models[i].to_scale_rotation_translation().1;
+            let looks = ((duration * 10.0).ceil() as usize).max(8);
+            (1..=looks)
+                .map(|k| {
+                    let pose = self.sample(skeleton, duration * k as f32 / looks as f32);
+                    let now = skeleton.model_matrices(&pose)[i]
+                        .to_scale_rotation_translation()
+                        .1;
+                    yaw_between(start, now)
+                })
+                .fold(0.0, f32::max)
+        });
         ClipInfo {
             duration,
             speed: if duration > 0.0 {
@@ -375,6 +397,7 @@ impl BoundClip {
             // Moving the root by -offset moves the pelvis to the origin.
             pin: Vec2::new(a.x, a.z) - pelvis_xz,
             hips: if hips.is_finite() { hips } else { 0.0 },
+            turn,
         }
     }
 
@@ -463,6 +486,18 @@ fn posture_distance(a: &[Quat], b: &[Quat]) -> f32 {
     a.iter().zip(b).map(|(x, y)| 1.0 - x.dot(*y).abs()).sum()
 }
 
+/// How far `to` is turned from `from` about the vertical (y), radians,
+/// 0 to pi: the twist of their difference about y.
+fn yaw_between(from: Quat, to: Quat) -> f32 {
+    let d = to * from.inverse();
+    let twist = 2.0 * d.y.atan2(d.w);
+    ((twist + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI).abs()
+}
+
+/// The most a clip chosen for standing idle may turn about the vertical,
+/// radians (20 degrees: a shift of weight, not a turn; invented).
+pub const IDLE_TURN: f32 = 0.35;
+
 /// Movement speeds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Gait {
@@ -505,6 +540,17 @@ impl Locomotion {
     /// As [`choose`](Self::choose), from the clips `keep` takes (by
     /// index) only.
     pub fn choose_where(clips: &[BoundClip], keep: impl Fn(usize) -> bool) -> Option<Self> {
+        Self::choose_turning(clips, keep, IDLE_TURN)
+    }
+
+    /// As [`choose_where`](Self::choose_where), with an idle clip that
+    /// turns up to `idle_turn` radians (for checking what was chosen
+    /// before [`IDLE_TURN`]: `f32::INFINITY`).
+    pub fn choose_turning(
+        clips: &[BoundClip],
+        keep: impl Fn(usize) -> bool,
+        idle_turn: f32,
+    ) -> Option<Self> {
         let movers: Vec<&ClipInfo> = clips
             .iter()
             .enumerate()
@@ -537,12 +583,16 @@ impl Locomotion {
         // height, the one whose first frame looks most like the walk's
         // (many still clips are sitting, lying or scripted poses).
         let walk = &clips[chosen[&Gait::Walk]];
+        // Not one that turns on the spot: the pose keeps the root's turn,
+        // so standing about they would spin round and snap back (playtest
+        // 8; inferred from the clips).
         let idle = clips
             .iter()
             .enumerate()
             .filter(|&(i, _)| keep(i))
             .filter(|(_, c)| c.info.speed * c.info.duration < 1e-3 && c.info.duration >= 1.0)
             .filter(|(_, c)| c.info.hips > 0.85 && c.info.hips < 1.3)
+            .filter(|(_, c)| c.info.turn < idle_turn)
             .map(|(i, c)| {
                 (
                     i,

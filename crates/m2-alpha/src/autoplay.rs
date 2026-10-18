@@ -1679,6 +1679,11 @@ impl Autoplay {
             game.scene.people.idle.line(),
             game.combat.shots_line()
         );
+        eprintln!(
+            "autoplay checks {:.1} s: {}",
+            self.clock,
+            game.scene.people.checks.line()
+        );
     }
 
     /// A summary for the end of the run.
