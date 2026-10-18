@@ -245,6 +245,10 @@ pub struct FightClips {
     pub ready: Option<usize>,
     /// Running with the rifle held low across the body in both hands.
     pub run_low: Option<usize>,
+    /// Sprinting with the rifle in both hands: her sprint gait's clip when
+    /// it holds the rifle so ([`two_handed_sprint`]), else the run above
+    /// (the player's alone: set by [`crate::player::Player`]).
+    pub sprint: Option<usize>,
     /// A jump: take-off and the air, ending off the ground (resident
     /// c846e6fd); the stand-in when the take-offs below aren't there.
     pub jump: Option<usize>,
@@ -267,6 +271,54 @@ pub struct FightClips {
     /// the one starting nearest the rifle held ready.
     pub bash: Option<(usize, f32)>,
     pub bash_low: Option<(usize, f32)>,
+}
+
+/// How far apart a clip's hands get over the whole clip, for its hip
+/// height: a rifle held in both hands keeps them close.
+pub fn hand_spread(rig: &Rig, c: &BoundClip) -> Option<f32> {
+    let (right, left) = crate::combat::hands(&rig.skeleton)?;
+    let last = c.clip.frame_count.saturating_sub(1).max(1) as f32;
+    let widest = (0..c.clip.frame_count)
+        .map(|f| {
+            let pose = c.sample(&rig.skeleton, c.info.duration * f as f32 / last);
+            let nodes = rig.skeleton.model_matrices(&pose);
+            (nodes[right].w_axis - nodes[left].w_axis)
+                .truncate()
+                .length()
+        })
+        .fold(0.0, f32::max);
+    (c.info.hips > 0.0).then(|| widest / c.info.hips)
+}
+
+/// What she sprints with a rifle in: her sprint gait's clip if its hands
+/// stay as close as a two-handed run's (nearer the spread of `run_low`,
+/// the rifle low across her in both hands, than of the run gait, arms
+/// free), else `run_low` itself. Playtest 8: the sprint clip's arms are
+/// free, and the rifle, hung from a hand held as she stands, dangled by
+/// her leg. From samples (the clips' hands); that the game sprints with
+/// it in both hands is inferred from its rifle run.
+pub fn two_handed_sprint(rig: &Rig, run_low: Option<usize>) -> Option<usize> {
+    let run_low = run_low?;
+    let sprint = rig.gait_clip(Gait::Sprint);
+    let spread = |i: usize| hand_spread(rig, &rig.clips[i]);
+    let both = spread(run_low);
+    let free = rig.gait_clip(Gait::Run).and_then(spread);
+    let s = sprint.and_then(spread);
+    let holds =
+        matches!((both, free, s), (Some(b), Some(f), Some(s)) if b < f && s < (b + f) * 0.5);
+    eprintln!(
+        "hero clips: sprint {}: hands {} apart for the hips (two-handed run {}, run gait {}): {}",
+        sprint.map_or("none".to_owned(), |i| format!("{:08x}", rig.clips[i].hash)),
+        s.map_or("?".to_owned(), |s| format!("{s:.2}")),
+        both.map_or("?".to_owned(), |s| format!("{s:.2}")),
+        free.map_or("?".to_owned(), |s| format!("{s:.2}")),
+        if holds {
+            "it holds the rifle"
+        } else {
+            "the two-handed run plays"
+        },
+    );
+    if holds { sprint } else { Some(run_low) }
 }
 
 impl FightClips {
@@ -335,6 +387,7 @@ impl FightClips {
             aim: find(Self::AIM),
             ready,
             run_low: first(&Self::RUN_LOW),
+            sprint: None,
             jump: find(Self::JUMP),
             takeoff: first(&Self::TAKEOFF),
             takeoff_still: first(&Self::TAKEOFF_STILL),
@@ -553,23 +606,7 @@ impl FightClips {
         let forward = rig.locomotion.as_ref().map(|l| l.forward);
         let ahead = |c: &BoundClip| forward.is_some_and(|f| c.info.direction.dot(f) > 0.95);
         let standing = |c: &BoundClip| c.info.hips > 0.85;
-        // How far apart the hands get over the whole clip, for its hip
-        // height: a rifle held in both hands keeps them close.
-        let hands = crate::combat::hands(&rig.skeleton);
-        let spread = |c: &BoundClip| -> Option<f32> {
-            let (right, left) = hands?;
-            let last = c.clip.frame_count.saturating_sub(1).max(1) as f32;
-            let widest = (0..c.clip.frame_count)
-                .map(|f| {
-                    let pose = c.sample(&rig.skeleton, c.info.duration * f as f32 / last);
-                    let nodes = rig.skeleton.model_matrices(&pose);
-                    (nodes[right].w_axis - nodes[left].w_axis)
-                        .truncate()
-                        .length()
-                })
-                .fold(0.0, f32::max);
-            (c.info.hips > 0.0).then(|| widest / c.info.hips)
-        };
+        let spread = |c: &BoundClip| hand_spread(rig, c);
         // Two-handed: nearer the spread of the run picked by name (the
         // rifle low across the body in both hands) than that of the run
         // gait (the arms free). Without both, or with the gait's hands no
