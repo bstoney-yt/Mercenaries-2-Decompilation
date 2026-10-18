@@ -195,6 +195,9 @@ pub struct Game {
     pub save_icon: f32,
     /// Seconds before the factions' attitudes are asked of the scripts again.
     pub attitude_wait: f32,
+    /// Witnesses reporting her: guid, faction and seconds since they set
+    /// off ([`crate::mission`]).
+    pub reporters: Vec<(u32, &'static str, f32)>,
 }
 
 /// A camera shot the scripts asked for (`Camera.SetShot`): the engine's
@@ -343,6 +346,7 @@ impl Game {
             shot: None,
             save_icon: 0.0,
             attitude_wait: 0.0,
+            reporters: Vec::new(),
         }
     }
 

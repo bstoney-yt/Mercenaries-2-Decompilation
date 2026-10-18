@@ -1059,6 +1059,63 @@ impl Mission {
         self.world.borrow_mut().hijack.press(button, now);
     }
 
+    /// She did an infraction of `kind` (a [`crate::report::KINDS`] key) to
+    /// the faction labelled `faction` (`OC`, `Allied`): its next reporter
+    /// reports it.
+    pub fn record_infraction(&mut self, faction: &str, kind: &'static str) {
+        self.world.borrow_mut().reports.record(faction, kind);
+    }
+
+    /// Offers witness `reporter` of the faction labelled `faction` to the
+    /// faction manager as its reporter (with what the faction has against
+    /// her so far): true if he reports, false if it turned him down or no
+    /// manager listens.
+    pub fn begin_report(&mut self, reporter: u32, faction: &str) -> bool {
+        {
+            let mut w = self.world.borrow_mut();
+            if w.reports.callback.is_none() {
+                return false;
+            }
+            let seen = w.reports.seen.remove(faction).unwrap_or_default();
+            w.reports.reporting.insert(reporter, seen);
+        }
+        if let Err(e) = crate::report::tell(&self.world, reporter, 0) {
+            self.world.borrow_mut().printed.push(format!("report: {e}"));
+        }
+        self.world
+            .borrow()
+            .reports
+            .reporting
+            .contains_key(&reporter)
+    }
+
+    /// Reporter `reporter` got through and is reporting (state 1): the
+    /// faction manager starts its reporting display, whose timer ends it
+    /// (`FinishedReporting`, then `Report.Completed`).
+    pub fn report_through(&mut self, reporter: u32) {
+        if let Err(e) = crate::report::tell(&self.world, reporter, 1) {
+            self.world.borrow_mut().printed.push(format!("report: {e}"));
+        }
+    }
+
+    /// Reporter `reporter` was stopped (killed) before the manager was
+    /// done with him (state 2): his report is lost.
+    pub fn stop_report(&mut self, reporter: u32) {
+        if let Err(e) = crate::report::tell(&self.world, reporter, 2) {
+            self.world.borrow_mut().printed.push(format!("report: {e}"));
+        }
+        let mut w = self.world.borrow_mut();
+        if w.reports.reporting.remove(&reporter).is_some() {
+            w.reports.ended.push((reporter, false));
+        }
+    }
+
+    /// Reporters the manager finished with since the last call, each with
+    /// whether he reported.
+    pub fn take_report_ends(&mut self) -> Vec<(u32, bool)> {
+        self.world.borrow_mut().reports.take_ended()
+    }
+
     /// Whether character `guid` swims (`Human.IsSwimming`).
     pub fn set_swimming(&mut self, guid: u32, on: bool) {
         let mut w = self.world.borrow_mut();
@@ -2562,6 +2619,62 @@ mod tests {
         )
         .unwrap();
         assert!(m.crews_aboard().is_empty());
+    }
+
+    #[test]
+    fn a_witness_reports_what_his_faction_saw_and_the_manager_settles_it() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        // No manager yet: nobody reports.
+        assert!(!m.begin_report(7, "OC"));
+        // As `MrxFactionManager` does: turn down reporter 8; for one that
+        // gets through (state 1) start a timer whose end (`__finish` here,
+        // the HUD's `FactionDisplay` timer there) settles his report.
+        m.run(
+            r#"__heard = {}
+            Report.Init({ Callback = function(g, state)
+              __heard[#__heard + 1] = state
+              if state == 0 and g == Sys.StringToGuid('0x8') then Report.Failed(g) end
+              if state == 1 then
+                __finish = function()
+                  local t = Report.GetInfractions(g)
+                  __hurt, __killed = t.DamagePerson[2], t.DestroyPerson[2]
+                  Report.Completed(g)
+                end
+              end
+            end })"#,
+            "init",
+        )
+        .unwrap();
+        m.record_infraction("OC", "DamagePerson");
+        m.record_infraction("OC", "DamagePerson");
+        m.record_infraction("OC", "DestroyPerson");
+        m.record_infraction("Allied", "DamagePerson");
+        assert!(!m.begin_report(8, "OC"));
+        assert_eq!(m.take_report_ends(), vec![(8, false)]);
+        // 8 took OC's tally with him; it starts again for 7.
+        m.record_infraction("OC", "DamagePerson");
+        assert!(m.begin_report(7, "OC"));
+        m.report_through(7);
+        assert!(m.take_report_ends().is_empty());
+        m.run("__finish()", "finish").unwrap();
+        assert_eq!(m.take_report_ends(), vec![(7, true)]);
+        // One stopped before he is done loses his report.
+        m.record_infraction("OC", "Hijack");
+        assert!(m.begin_report(9, "OC"));
+        m.stop_report(9);
+        assert_eq!(m.take_report_ends(), vec![(9, false)]);
+        let g = m.lua().globals();
+        assert_eq!(g.get::<i64>("__hurt").unwrap(), 1);
+        assert_eq!(g.get::<i64>("__killed").unwrap(), 0);
+        let heard: Vec<i64> = g
+            .get::<Table>("__heard")
+            .unwrap()
+            .sequence_values()
+            .map(|v| v.unwrap())
+            .collect();
+        assert_eq!(heard, vec![0, 0, 1, 0, 2]);
+        // Allied's tally waits for an Allied reporter.
+        assert_eq!(m.world.borrow().reports.seen["Allied"]["DamagePerson"], 1);
     }
 
     #[test]

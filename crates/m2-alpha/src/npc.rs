@@ -692,6 +692,8 @@ pub struct Npc {
     pub faction: Option<&'static str>,
     /// She hurt them: they fight her while her pursuit lasts.
     pub provoked: bool,
+    /// Their death was taken as an infraction already.
+    pub reported_dead: bool,
     /// Hurt since the last look ([`People::pursue`]).
     pub hurt_by_her: bool,
     /// A story character (placed by a layer, not fighting: `Carmona`):
@@ -832,6 +834,7 @@ impl Npc {
             faction: None,
             provoked: false,
             hurt_by_her: false,
+            reported_dead: false,
             gun: None,
             hp: 100.0,
             most_hp: 100.0,
@@ -1561,6 +1564,9 @@ pub struct People {
     /// Factions she provoked (hurt one of theirs): their soldiers fight her
     /// for this many seconds more ([`PURSUIT_SECONDS`]).
     pub pursuit: HashMap<&'static str, f32>,
+    /// What she did to the factions' people since the mission last took
+    /// them ([`People::take_infractions`]), for their reporters.
+    pub infractions: Vec<Infraction>,
 }
 
 /// Soldier-seconds near her, by what the soldiers were at (for checking
@@ -1665,6 +1671,34 @@ pub fn faction_of(name: &str) -> Option<&'static str> {
     ]
     .into_iter()
     .find_map(|(prefix, f)| n.starts_with(prefix).then_some(f))
+}
+
+/// Something she did to one of a faction's people, for its witnesses to
+/// report ([`m2_game::report`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Infraction {
+    /// The faction, as [`faction_of`] has it.
+    pub faction: &'static str,
+    /// `DamagePerson` or `DestroyPerson` (a [`m2_game::report::KINDS`] key).
+    pub kind: &'static str,
+    /// Where the victim was.
+    pub at: Vec3,
+    /// The victim's spawn entity, if a layer's.
+    pub victim: Option<u32>,
+}
+
+/// The faction's label as the faction manager names it (`Object.HasLabel`
+/// with its `sFactionTemplate`: `OC`, `Allied`) from [`faction_of`]'s
+/// abbreviation.
+pub fn faction_label(f: &str) -> &'static str {
+    match f {
+        "All" => "Allied",
+        "Chi" => "China",
+        "Gur" => "Guerilla",
+        "Oil" => "OC",
+        "Pir" => "Pirate",
+        _ => "VZ",
+    }
 }
 
 /// Seconds the soldiers of a faction she provoked fight her: the first of
@@ -1867,15 +1901,36 @@ impl People {
         }
     }
 
+    /// What she did to the factions' people since the last call.
+    pub fn take_infractions(&mut self) -> Vec<Infraction> {
+        std::mem::take(&mut self.infractions)
+    }
+
     /// The pursuits: a faction member she hurt starts one for their
     /// faction ([`PURSUIT_SECONDS`]), and each runs down by `dt`.
     fn pursue(&mut self, dt: f32) {
         let mut started = Vec::new();
         for n in &mut self.npcs {
-            if let Some(f) = n.faction
-                && std::mem::take(&mut n.hurt_by_her)
-                && !n.provoked
-            {
+            let Some(f) = n.faction else { continue };
+            let hurt = std::mem::take(&mut n.hurt_by_her);
+            if hurt {
+                // What a witness of theirs reports: hurt, or killed.
+                let kind = if n.alive {
+                    "DamagePerson"
+                } else {
+                    "DestroyPerson"
+                };
+                if n.alive || !n.reported_dead {
+                    n.reported_dead |= !n.alive;
+                    self.infractions.push(Infraction {
+                        faction: f,
+                        kind,
+                        at: n.character.position,
+                        victim: n.spawn,
+                    });
+                }
+            }
+            if hurt && !n.provoked {
                 n.provoked = true;
                 started.push(f);
             }

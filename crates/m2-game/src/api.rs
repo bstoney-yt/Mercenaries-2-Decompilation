@@ -519,6 +519,9 @@ pub struct ScriptWorld {
     pub cinematic: bool,
     /// Characters swimming, as the game last said (`Human.IsSwimming`).
     pub swimming: HashSet<u32>,
+    /// Witnesses reporting her, and what each faction has against her
+    /// (`Report`, [`crate::report`]).
+    pub reports: crate::report::Reports,
     /// Strikes and designators under way.
     pub strikes: crate::airstrike::Strikes,
     /// Whether vehicle disguises work (`Player.SetVehicleDisguise`): the
@@ -1033,7 +1036,7 @@ pub const SUPPORT_EARS: &str = "__m2_support";
 /// missing (or stubs, with `ScriptHost::stub_missing_globals`).
 /// The engine's libraries (the rest of the globals scripts use are their
 /// own modules); see `ScriptHost::complete_libraries`.
-pub const LIBRARIES: [&str; 27] = [
+pub const LIBRARIES: [&str; 28] = [
     "Ai",
     "Airstrike",
     "Camera",
@@ -1054,6 +1057,7 @@ pub const LIBRARIES: [&str; 27] = [
     "Pda",
     "Pg",
     "Player",
+    "Report",
     "Sound",
     "String",
     "Sys",
@@ -1426,6 +1430,37 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([guid_value(Some(w.template(&name)))])
     })?;
 
+    // The witnesses' reports ([`crate::report`]).
+    let report = lib("Report")?;
+    add(&report, "Init", |w, _, a| {
+        if let Some(Value::Table(t)) = a.first() {
+            w.reports.callback = t.get::<Option<Function>>("Callback").ok().flatten();
+        }
+        values([])
+    })?;
+    add(&report, "Failed", |w, _, a| {
+        if let Some(g) = id(a.first())
+            && w.reports.reporting.remove(&g).is_some()
+        {
+            w.reports.ended.push((g, false));
+        }
+        values([])
+    })?;
+    add(&report, "Completed", |w, _, a| {
+        if let Some(g) = id(a.first())
+            && w.reports.reporting.remove(&g).is_some()
+        {
+            w.reports.ended.push((g, true));
+        }
+        values([])
+    })?;
+    add(&report, "GetInfractions", |w, lua, a| {
+        let g = id(a.first()).unwrap_or(0);
+        values([Value::Table(w.reports.infractions(lua, g)?)])
+    })?;
+    // (reporter, seconds): a reporter kept from reporting for a while (the
+    // faction manager delays a disabled one by 3 s); not used yet.
+    add(&report, "SetDelay", |_, _, _| values([]))?;
     // Weapons as objects: a loadout of templates, each weapon with its own
     // reserve of ammunition.
     let human = lib("Human")?;

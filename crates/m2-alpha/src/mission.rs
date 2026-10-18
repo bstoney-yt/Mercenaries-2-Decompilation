@@ -485,6 +485,14 @@ fn choice_code(seq: u64, picked: i64) -> String {
 /// People this near a marker's target are listed with it, metres; story
 /// characters' spawns this near the player.
 const MARK_NEAR: f32 = 6.0;
+/// A witness this near what she did reports it, metres; he gets through
+/// this many seconds after he is offered (his call-in line, measured at
+/// 3.7 s for `OCSoldier01.Reporting.CallIn03`), and is given up on after
+/// this many if the faction manager hasn't finished with him (invented:
+/// the game's own choice of reporter and his call aren't read).
+const REPORT_WITNESS: f32 = 80.0;
+const REPORT_CALL_IN: f32 = 4.0;
+const REPORT_GIVE_UP: f32 = 30.0;
 const STORY_REACH: f32 = 450.0;
 
 /// A marker the scripts put up, over one of their objects.
@@ -1196,6 +1204,75 @@ impl MissionLink {
         // the one she stands at is offered, and taken with the use key.
         if let Some(g) = game.context_taken.take() {
             mission.take_context_action(g);
+        }
+        // Her infractions against the factions, for their witnesses to
+        // report: the first one of a faction not already reporting, a
+        // witness of theirs near it (not the victim) is offered to the
+        // faction manager ([`m2_game::report`]).
+        for inf in game.scene.people.take_infractions() {
+            let label = crate::npc::faction_label(inf.faction);
+            mission.record_infraction(label, inf.kind);
+            if inf.faction == "Vza" || game.reporters.iter().any(|r| r.1 == inf.faction) {
+                continue;
+            }
+            let witness = game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .filter(|n| n.alive && n.faction == Some(inf.faction) && n.spawn != inf.victim)
+                .filter_map(|n| {
+                    let d = n.character.position.distance(inf.at);
+                    (d <= REPORT_WITNESS).then_some((d, n.spawn?))
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, g)| g);
+            if let Some(g) = witness {
+                if mission.begin_report(g, label) {
+                    eprintln!(
+                        "mission: {g:#x} of {label} goes to report her ({})",
+                        inf.kind
+                    );
+                    game.reporters.push((g, inf.faction, 0.0));
+                } else {
+                    eprintln!("mission: {g:#x} of {label} was turned down as a reporter");
+                }
+            }
+        }
+        // Reporters: each calls in, then gets through (state 1) and the
+        // faction manager's own timer finishes his report; one killed
+        // first, or that it never finishes with, is stopped (state 2).
+        let mut through = Vec::new();
+        let mut stopped = Vec::new();
+        for (g, _, t) in &mut game.reporters {
+            let before = *t;
+            *t += dt;
+            let alive = game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .any(|n| n.spawn == Some(*g) && n.alive);
+            if !alive || *t >= REPORT_GIVE_UP {
+                stopped.push(*g);
+            } else if before < REPORT_CALL_IN && *t >= REPORT_CALL_IN {
+                through.push(*g);
+            }
+        }
+        for g in through {
+            eprintln!("mission: reporter {g:#x} got through");
+            mission.report_through(g);
+        }
+        for g in stopped {
+            eprintln!("mission: reporter {g:#x} was stopped before he reported");
+            mission.stop_report(g);
+            game.reporters.retain(|r| r.0 != g);
+        }
+        for (g, done) in mission.take_report_ends() {
+            game.reporters.retain(|r| r.0 != g);
+            eprintln!(
+                "mission: the faction manager is done with reporter {g:#x} (reported: {done})"
+            );
         }
         // The factions' attitudes, once a second: whose soldiers fight her.
         game.attitude_wait -= dt;
