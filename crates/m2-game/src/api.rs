@@ -1810,6 +1810,24 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    add(&player, "RemoveBoundary", |w, _, a| {
+        if let Some(b) = id(a.get(1)) {
+            w.boundaries.retain(|&x| x != b);
+        }
+        values([])
+    })?;
+    add(&player, "RemoveAllBoundary", |w, _, _| {
+        w.boundaries.clear();
+        values([])
+    })?;
+    // (player, out): sets whether she is out of the play area, without the
+    // callback hearing it: `WifVzBoundary`'s interior mode (the HQ) and the
+    // tether's end clear it (false) once they took the boundaries away, so
+    // that coming back is no "exit".
+    add(&player, "SetOutBoundary", |w, _, a| {
+        w.outside = matches!(a.get(1), Some(Value::Boolean(true)));
+        values([])
+    })?;
     // A character's camera: the game's one camera looks over the player,
     // so it is named by her guid, and its yaw is hers (`Camera.GetYaw`:
     // the carpet bomb's heading).

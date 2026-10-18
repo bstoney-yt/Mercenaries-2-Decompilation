@@ -963,12 +963,21 @@ impl Mission {
             {
                 return;
             }
-            let found: Vec<bool> = w
-                .boundaries
-                .iter()
-                .filter_map(|&b| crate::events::World::inside(&*w, PLAYER, b))
-                .collect();
-            let out = !found.is_empty() && !found.contains(&true);
+            // An exclusion region (`WifVzBoundary.EnableExclusionBoundary`:
+            // `Boundary_ALHQ_Exclusion`, the Allied HQ while it is shut to
+            // her) is out of bounds inside it, the others outside them.
+            let (mut found, mut excluded) = (Vec::new(), false);
+            for &b in &w.boundaries {
+                let Some(inside) = crate::events::World::inside(&*w, PLAYER, b) else {
+                    continue;
+                };
+                if w.objects.get(&b).is_some_and(|o| is_exclusion(&o.name)) {
+                    excluded |= inside;
+                } else {
+                    found.push(inside);
+                }
+            }
+            let out = excluded || (!found.is_empty() && !found.contains(&true));
             if out == w.outside {
                 return;
             }
@@ -2124,6 +2133,14 @@ pub fn first_lines(s: &str) -> String {
     s.lines().take(4).collect::<Vec<_>>().join(" | ")
 }
 
+/// Whether a boundary region is one she must keep out of: from samples,
+/// the two regions with a `BoundaryData` record are the HQs' exclusions
+/// (`Boundary_ALHQ_Exclusion`, `Boundary_CHHQ_Exclusion`), the only ones
+/// so named; the record itself isn't decoded.
+fn is_exclusion(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with("_exclusion")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2629,6 +2646,78 @@ mod tests {
         assert!(m.crews_aboard().is_empty());
     }
 
+    #[test]
+    fn leaving_the_play_area_or_entering_an_exclusion_tells_the_boundary_callback() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let square = |half: f32| m2_assets::Region {
+            flags: 0,
+            unk_0x04: 0,
+            corners: vec![[-half, -half], [half, -half], [half, half], [-half, half]],
+        };
+        {
+            let mut w = m.world.borrow_mut();
+            w.insert(100, crate::api::Object::new("Boundary00", [0.0; 3]));
+            w.regions.insert(100, square(100.0));
+            w.insert(
+                101,
+                crate::api::Object::new("Boundary_ALHQ_Exclusion", [50.0, 0.0, 50.0]),
+            );
+            w.regions.insert(101, square(10.0));
+        }
+        m.run(
+            r#"__heard = {}
+            Player.SetBoundaryCallback(nil, function(_, zone, event)
+              __heard[#__heard + 1] = zone .. ' ' .. event
+            end)
+            Player.AddBoundary(nil, Sys.StringToGuid('0x64'))
+            Player.AddBoundary(nil, Sys.StringToGuid('0x65'))"#,
+            "boundaries",
+        )
+        .unwrap();
+        let at = |m: &mut Mission, p: [f32; 3]| {
+            m.world
+                .borrow_mut()
+                .objects
+                .get_mut(&PLAYER)
+                .unwrap()
+                .position = p;
+            m.tick(0.1);
+        };
+        at(&mut m, [10.0, 0.0, 10.0]);
+        // Out past the play area's edge, and back.
+        at(&mut m, [150.0, 0.0, 0.0]);
+        at(&mut m, [10.0, 0.0, 10.0]);
+        // Into the exclusion, inside the play area, and out of it again.
+        at(&mut m, [52.0, 0.0, 48.0]);
+        at(&mut m, [10.0, 0.0, 10.0]);
+        // The HQ's interior mode takes the boundaries away and clears her
+        // being out: no "exit" when she comes back.
+        at(&mut m, [150.0, 0.0, 0.0]);
+        m.run(
+            "Player.RemoveAllBoundary(nil)\nPlayer.SetOutBoundary(nil, false)",
+            "interior",
+        )
+        .unwrap();
+        at(&mut m, [10.0, 0.0, 10.0]);
+        let heard: Vec<String> = m
+            .lua()
+            .globals()
+            .get::<Table>("__heard")
+            .unwrap()
+            .sequence_values()
+            .map(|v| v.unwrap())
+            .collect();
+        assert_eq!(
+            heard,
+            [
+                "out enter",
+                "out exit",
+                "out enter",
+                "out exit",
+                "out enter"
+            ]
+        );
+    }
     #[test]
     fn a_witness_reports_what_his_faction_saw_and_the_manager_settles_it() {
         let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
