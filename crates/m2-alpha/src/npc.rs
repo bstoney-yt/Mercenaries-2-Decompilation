@@ -77,6 +77,9 @@ const CLEAR: f32 = 6.0;
 const FIGHT_RANGE: f32 = 80.0;
 const FIRE_RANGE: f32 = 70.0;
 const FIRE_ARC: f32 = 0.3;
+/// He aims (the aim pose, turned onto her) only while she is within this
+/// of the way he faces, radians (60 degrees; invented, playtest 8).
+const AIM_ARC: f32 = 1.05;
 /// How far a soldier with `Vision` 1 sees, metres (inferred: the range
 /// they fight in), from how high (his head), and how often he looks,
 /// seconds.
@@ -1166,9 +1169,15 @@ impl Npc {
         } else {
             Gait::Walk
         };
-        let carry = if seen { Carry::Aim } else { Carry::Ready };
+        // He aims only at her before him: the aim turns his whole drawn body
+        // onto her, and with her behind him that turn wrapped between
+        // +180 and -180 degrees tick by tick, so soldiers she drove round
+        // stood flipping about (playtest 8, his clip at 14:00). Behind him,
+        // he turns round with the rifle ready first.
+        let ahead = seen && off < AIM_ARC;
+        let carry = if ahead { Carry::Aim } else { Carry::Ready };
         self.rig.hold_rifle(gait, &clips, carry);
-        if seen {
+        if ahead {
             self.rig.aim_along(self.facing, Some(threat - self.chest()));
         }
         self.cooldown -= dt;
@@ -1725,6 +1734,10 @@ const ROUTE_STALL: f32 = 1.5;
 pub struct Checks {
     pub spinning: f32,
     pub spinners: HashSet<u32>,
+    /// Aiming at her behind him, the drawn body flipping (person-seconds,
+    /// and who).
+    pub aim_behind: f32,
+    pub aimed_behind: HashSet<u32>,
     pub wet: f32,
     pub wetted: HashSet<u32>,
     /// Runners sent along a route, those who got to its end, and those
@@ -1738,9 +1751,11 @@ impl Checks {
     /// The tally in a line.
     pub fn line(&self) -> String {
         format!(
-            "people checks: spinning {:.1} s ({} people), in water {:.1} s ({} people); runners {} sent, {} at their route's end, {} stuck on the way",
+            "people checks: spinning {:.1} s ({} people), aiming behind {:.1} s ({} people), in water {:.1} s ({} people); runners {} sent, {} at their route's end, {} stuck on the way",
             self.spinning,
             self.spinners.len(),
+            self.aim_behind,
+            self.aimed_behind.len(),
             self.wet,
             self.wetted.len(),
             self.sent.len(),
@@ -1764,6 +1779,24 @@ impl Checks {
             let turn = (n.facing - facing + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
                 - std::f32::consts::PI;
             n.spun += turn.abs();
+        }
+        // Aiming at her behind him (more than a right angle off the way he
+        // faces): the aim pose turns his drawn body onto her, which flips
+        // there (his clip at 14:00).
+        if let Some(aim) = n.rig.aim {
+            let ahead = n.rig.locomotion.as_ref().map_or(Vec2::Y, |l| l.forward);
+            let off = (aim.x.atan2(aim.z) - ahead.x.atan2(ahead.y) + std::f32::consts::PI)
+                .rem_euclid(std::f32::consts::TAU)
+                - std::f32::consts::PI;
+            if off.abs() > std::f32::consts::FRAC_PI_2 {
+                self.aim_behind += dt;
+                if self.aimed_behind.insert(id) {
+                    eprintln!(
+                        "people check: {id:08x} aims at her behind him at {:.1}",
+                        n.character.position
+                    );
+                }
+            }
         }
         if n.spun > std::f32::consts::TAU {
             self.spinning += dt;
@@ -3858,5 +3891,36 @@ pub(crate) mod tests {
             "{}",
             npc.character.position
         );
+    }
+
+    // Playtest 8 (his clip at 14:00): soldiers stood flipping about as she
+    // drove round them, the aim turning their whole drawn body onto her
+    // behind them. With her behind him a soldier holds the rifle ready and
+    // turns; he aims once she is before him.
+    #[test]
+    fn a_soldier_aims_only_at_her_before_him() {
+        let physics = ground();
+        let mut rng = Rng::default();
+        let mut npc = Npc::new(
+            0,
+            &rig(),
+            Vec3::new(0.0, 1.0, 0.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(3),
+        );
+        npc.soldier = true;
+        npc.update(&physics, &mut rng, None, 1.0 / 60.0);
+        assert!(npc.landed);
+        npc.alert = true;
+        // Behind him (he faces +z).
+        let behind = Vec3::new(0.0, 1.3, -20.0);
+        npc.update(&physics, &mut rng, Some(behind), 1.0 / 60.0);
+        assert!(npc.rig.aim.is_none());
+        // Turned round to her (half a turn at his rate takes about 0.5 s).
+        for _ in 0..60 {
+            npc.update(&physics, &mut rng, Some(behind), 1.0 / 60.0);
+        }
+        assert!(npc.rig.aim.is_some());
     }
 }

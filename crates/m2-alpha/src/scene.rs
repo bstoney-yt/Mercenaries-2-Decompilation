@@ -582,11 +582,17 @@ impl Rig {
             .filter_map(|&h| self.clips.iter().position(|c| c.hash == h))
             .map(turn)
             .collect();
+        let side_on = self
+            .clips
+            .iter()
+            .position(|c| c.hash == crate::npc::FightClips::AIM)
+            .and_then(|i| self.aim_offset(i));
         format!(
-            "idle {}; with turning clips allowed, {}; rifle ready and aimed {}",
+            "idle {}; with turning clips allowed, {}; rifle ready and aimed {}; aiming turns the body {} deg with her ahead",
             turn(*now),
             any.map_or("none".to_owned(), turn),
-            held.join(", ")
+            held.join(", "),
+            side_on.map_or("?".to_owned(), |d| format!("{d:.0}"))
         )
     }
 
@@ -751,6 +757,20 @@ impl Rig {
             turn,
             w.y.clamp(-1.0, 1.0).asin() - b.y.clamp(-1.0, 1.0).asin(),
         ))
+    }
+
+    /// How far the aim clip `clip`'s rifle points off the way the body
+    /// faces, degrees (the clip stands side-on): what the aim turns the
+    /// body by with her straight ahead.
+    pub fn aim_offset(&self, clip: usize) -> Option<f32> {
+        let forward = self
+            .locomotion
+            .as_ref()
+            .map_or(m2_math::glam::Vec2::Y, |l| l.forward);
+        let pose = self.clips[clip].sample(&self.skeleton, 0.0);
+        let ahead = Vec3::new(forward.x, 0.0, forward.y);
+        self.aim_error(&pose, ahead)
+            .map(|(yaw, _)| yaw.to_degrees())
     }
 
     /// Turns an aiming pose so the rifle points along `want` (model
