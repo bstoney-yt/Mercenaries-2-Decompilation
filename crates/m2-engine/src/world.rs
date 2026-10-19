@@ -288,6 +288,8 @@ pub struct Templates {
     pub explosions: HashMap<u32, crate::durability::Explosion>,
     /// How the templates that can be hijacked are, by id.
     pub hijack: HashMap<u32, Vec<crate::hijack::HijackEntrance>>,
+    /// Each hero template's grappling hook, by id ([`crate::grapple`]).
+    pub grapple: HashMap<u32, crate::grapple::Grapple>,
     /// Where each template's entrances are got in by (`DriverHatch`), by
     /// id ([`crate::hijack::entrance_points`]).
     pub entrance_points: HashMap<u32, Vec<u32>>,
@@ -761,6 +763,7 @@ impl Templates {
             durability: crate::durability::read(&db),
             explosions: crate::durability::explosions(&db),
             hijack: crate::hijack::read(&db),
+            grapple: crate::grapple::read(&db),
             entrance_points: crate::hijack::entrance_points(&db),
             ordnance: crate::ordnance::read(&db),
             effects: crate::particles::template_effects(&db),

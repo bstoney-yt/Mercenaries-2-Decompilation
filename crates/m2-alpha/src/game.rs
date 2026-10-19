@@ -203,6 +203,11 @@ pub struct Game {
     /// (`Player.SetOutfit`: the wardrobe), till it is put on her
     /// ([`Game::dress`]).
     pub outfit_wanted: Option<String>,
+    /// Her grappling hook ([`crate::grapple`]).
+    pub grapple: crate::grapple::Grappler,
+    /// The grapple pulled her to a helicopter's entrance: its hijack is
+    /// to start as the use key starts it ([`crate::hijack`]).
+    pub grapple_handoff: bool,
     /// Seconds before the factions' attitudes are asked of the scripts again.
     pub attitude_wait: f32,
     /// Witnesses reporting her: guid, faction and seconds since they set
@@ -357,6 +362,8 @@ impl Game {
             save_icon: 0.0,
             raw: crate::raw::RawClips::default(),
             outfit_wanted: None,
+            grapple: crate::grapple::Grappler::default(),
+            grapple_handoff: false,
             attitude_wait: 0.0,
             reporters: Vec::new(),
             scripts_seated: false,
@@ -1299,7 +1306,31 @@ impl Game {
         split("game: effects");
         self.scene.tick(dt);
         self.raw.tick(&mut self.scene, dt);
+        self.grapple_tick(dt);
         split("game: scene");
+    }
+
+    /// The grappling hook's line: the hook flies, or she is pulled in; on
+    /// arrival the helicopter's hijack is handed the start.
+    fn grapple_tick(&mut self, dt: f32) {
+        if let Some(world) = &self.scene.world
+            && let Some(&g) = world.index.template_db.grapple.values().next()
+        {
+            self.grapple.params = g;
+        }
+        let mut grapple = std::mem::take(&mut self.grapple);
+        match grapple.tick(self, dt) {
+            Some(crate::grapple::Outcome::Hooked { seconds, metres }) => {
+                eprintln!("grapple: hooked {metres:.1} m away after {seconds:.2} s")
+            }
+            Some(crate::grapple::Outcome::Missed) => eprintln!("grapple: the hook missed"),
+            Some(crate::grapple::Outcome::Arrived { seconds }) => {
+                eprintln!("grapple: pulled to the entrance in {seconds:.2} s");
+                self.grapple_handoff = true;
+            }
+            None => {}
+        }
+        self.grapple = grapple;
     }
 
     /// Puts the player in the model the scripts last dressed her in

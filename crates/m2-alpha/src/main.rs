@@ -53,6 +53,7 @@ mod flights;
 mod flow;
 mod game;
 mod gamehud;
+mod grapple;
 mod held;
 mod hero;
 mod hijack;
@@ -290,6 +291,10 @@ struct Options {
     /// With `--screenshot --drive`: hijack the vehicle instead of getting
     /// in, answering every prompt at once.
     hijack: bool,
+    /// `--grapple`: she may grapple without the scripts' leave (testing;
+    /// with `--screenshot --drive --hijack`, she grapples to the nearest
+    /// crewed helicopter from 40 m and hijacks it).
+    grapple: bool,
     /// With `--mission`: try every placed pickup, crate and emplaced gun
     /// as the layers put them out ([`placed::check`]), for testing.
     placed_check: bool,
@@ -516,6 +521,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--no-fx" => o.no_fx = true,
             "--hijack-crew" => o.hijack_crew = Some(value()?),
             "--hijack" => o.hijack = true,
+            "--grapple" => o.grapple = true,
             "--placed-check" => o.placed_check = true,
             "--context" => o.context = Some(value()?),
             "--dialog-keys" => o.dialog_keys = Some(value()?),
@@ -843,6 +849,7 @@ fn main() -> anyhow::Result<()> {
         // The whole game plays as it launches, without the developer's
         // keys, unless asked for; the test launches keep them.
         dev: options.dev || options.fly || !options.alpha,
+        grapple: options.grapple,
         mission: options.mission,
         mission_drivers: options.mission_drivers.clone(),
         old_hud: options.old_hud,
@@ -3962,6 +3969,11 @@ fn hijack_for_screenshot(
         hijacks.tick(game, &mut input, tick);
         game.step(Intent::default(), tick);
     }
+    // `--grapple`: from 40 m off, facing it, she hooks the helicopter and
+    // is pulled to its entrance, which starts its hijack.
+    if options.grapple && !grapple_in(game, &mut hijacks, &mut input, i, tick) {
+        return Ok(());
+    }
     let Some(view) = hijacks.view() else {
         eprintln!(
             "hijack: no prompt beside the {}",
@@ -4095,6 +4107,93 @@ fn dialog_button(code: KeyCode) -> Option<&'static str> {
         KeyCode::Escape | KeyCode::Backspace => "BUTTON_PAD2_R",
         _ => return None,
     })
+}
+
+/// `--grapple` with `--screenshot --drive --hijack`: puts her 40 m from
+/// helicopter `i`'s entrance, lets her land, fires the grappling hook at
+/// it as if aimed and keyed, and runs the line until the helicopter's
+/// hijack starts (logging the hook's flight, the pull and the hand-off).
+/// False if it never starts.
+fn grapple_in(
+    game: &mut Game,
+    hijacks: &mut hijack::Hijacks,
+    input: &mut Input,
+    i: usize,
+    tick: f32,
+) -> bool {
+    use m2_math::glam::Vec3;
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let Some(door) = grapple::entrance(game, i) else {
+        eprintln!("grapple: the {label} is no helicopter");
+        return false;
+    };
+    if let Some(p) = game.scene.player.as_mut() {
+        let here = p.character.position;
+        let away = (here - door).with_y(0.0).normalize_or(Vec3::X);
+        p.character.position = (door + away * 40.0).with_y(here.y);
+        p.character.velocity = Vec3::ZERO;
+        p.landed = false;
+    }
+    for _ in 0..90 {
+        hijacks.tick(game, input, tick);
+        game.step(Intent::default(), tick);
+    }
+    let Some(her) = game.scene.player.as_ref().map(|p| p.character.position) else {
+        return false;
+    };
+    eprintln!(
+        "grapple: {:.1} m from the {label}'s entrance ({:.1} m up)",
+        her.distance(door),
+        door.y - her.y
+    );
+    let mut g = std::mem::take(&mut game.grapple);
+    g.enabled = true;
+    g.aim(game, door - her);
+    let fired = g.fire();
+    game.grapple = g;
+    if !fired {
+        eprintln!("grapple: the {label} is not in her sights within reach");
+        return false;
+    }
+    eprintln!("grapple: hook fired at the {label}");
+    for _ in 0..(20.0 / tick) as usize {
+        hijacks.tick(game, input, tick);
+        if hijacks.running() {
+            eprintln!("grapple: the {label}'s hijack started");
+            return true;
+        }
+        game.step(Intent::default(), tick);
+    }
+    eprintln!("grapple: no hijack started in 20 s");
+    false
+}
+
+/// The grappling hook's keys, each frame on foot ([`grapple`]): with the
+/// grapple `allowed`, the helicopter in her sights is picked; the use key
+/// fires the hook at it, or, on the line, lets go ("Stop grappling").
+fn grapple_keys(game: &mut Game, input: &mut Input, allowed: bool) {
+    let mut g = std::mem::take(&mut game.grapple);
+    g.enabled = allowed;
+    if g.grappling() {
+        if input.take_pressed(Action::Use) {
+            eprintln!("grapple: she lets go of the line");
+            g.release();
+        }
+    } else {
+        let yaw = game.view_heading();
+        g.aim(game, m2_math::glam::Vec3::new(yaw.sin(), 0.0, yaw.cos()));
+        if g.target.is_some() && input.take_pressed(Action::Use) {
+            let label = g
+                .target
+                .and_then(|i| game.scene.vehicles.get(i))
+                .map(|v| v.spec.label.clone())
+                .unwrap_or_default();
+            if g.fire() {
+                eprintln!("grapple: hook fired at the {label}");
+            }
+        }
+    }
+    game.grapple = g;
 }
 
 /// With `--context`: once the scripts offer a context action whose prompt
@@ -5790,6 +5889,8 @@ struct Running {
     dialog_keys: Vec<&'static str>,
     /// The developer's keys work ([`App::dev`]).
     dev: bool,
+    /// `--grapple`: the grappling hook without the scripts' leave.
+    grapple: bool,
     /// The cheat menu's god mode and infinite ammo ([`cheats::keep_up`]).
     cheats: cheats::Toggles,
     /// The letters typed in play, for the cheat menu's code ([`cheats::CODE`]).
@@ -5813,6 +5914,8 @@ struct App {
     /// it, and a quick load puts the world back without the scripts'
     /// state.
     dev: bool,
+    /// `--grapple`: the grappling hook without the scripts' leave.
+    grapple: bool,
     /// Run the mission scripts.
     mission: bool,
     /// Lua to run before they start (`--mission-driver`).
@@ -5943,6 +6046,7 @@ impl App {
             buttons: Vec::new(),
             dialog_keys: Vec::new(),
             dev: self.dev,
+            grapple: self.grapple,
             cheats: cheats::Toggles::default(),
             cheat_code: cheats::CodeWatch::default(),
             cheat_typed: false,
@@ -6726,6 +6830,14 @@ impl Running {
             spans::time("hijacks", || {
                 h.tick(&mut self.game, &mut self.input, TICK.as_secs_f32())
             });
+        }
+        // The grappling hook: on once the scripts allow it (or with
+        // `--grapple`); the use key fires it at the helicopter in her
+        // sights, or lets go of the line.
+        let allowed = self.grapple || self.mission.as_ref().is_some_and(|m| m.grapple_enabled());
+        grapple_keys(&mut self.game, &mut self.input, allowed);
+        if let Some(m) = &mut self.mission {
+            m.set_grappling(self.game.grapple.grappling());
         }
         spans::time("game", || {
             self.game.tick(
