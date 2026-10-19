@@ -827,6 +827,8 @@ pub struct Npc {
     route_stall: f32,
     /// Got to the end of a route the scripts gave (for checking).
     reached: bool,
+    /// Got there, not yet told the scripts ([`People::take_route_ends`]).
+    ended: bool,
     /// On such a route, going over or through what stopped them to its
     /// next point ([`ROUTE_STALL`]).
     through: bool,
@@ -921,6 +923,7 @@ impl Npc {
             route_near: f32::INFINITY,
             route_stall: 0.0,
             reached: false,
+            ended: false,
             through: false,
         }
     }
@@ -1583,6 +1586,7 @@ impl Npc {
                 facing: self.facing,
             };
             self.reached = true;
+            self.ended = true;
         }
         match glide {
             Some(point) => {
@@ -2619,6 +2623,18 @@ impl People {
             n.brain = Brain::Post { facing: n.facing };
         }
         eprintln!("people: the scripts put {entity:08x} at {at:.1}");
+    }
+
+    /// The people who got to the end of a route the scripts sent them
+    /// along since the last call: spawn entity, and where they stand. The
+    /// scripts hear their goal is done (an outpost's rushers at its flag).
+    pub fn take_route_ends(&mut self) -> Vec<(u32, Vec3)> {
+        self.npcs
+            .iter_mut()
+            .filter_map(|n| {
+                std::mem::take(&mut n.ended).then_some((n.spawn?, n.character.position))
+            })
+            .collect()
     }
 
     /// The scripts send the person of spawn `entity` along `route`

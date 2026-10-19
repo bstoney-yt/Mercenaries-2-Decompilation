@@ -467,6 +467,15 @@ pub struct ScriptWorld {
     pub subtitles_off: bool,
     /// The player has the tutorial tips off (`Sys.TutorialsEnabled`).
     pub tutorials_off: bool,
+    /// The developer's skip-to-mission switch (`Sys.GetSkipMission`, read
+    /// from the game's INI in the original): the bootstrap's new game
+    /// hands it to `MrxCheatBootstrap.EnableSkipMode`, and the mission
+    /// flow then completes each story contract it unlocks until this one
+    /// (read from the game's own scripts, `MrxMissionFlow.UnlockMission`).
+    pub skip_mission: Option<String>,
+    /// With [`skip_mission`](Self::skip_mission), whether it stops at the
+    /// contract's briefing (`Sys.GetINIBriefing`).
+    pub skip_briefing: bool,
     /// The score.
     pub music: crate::music::Music,
     /// Why each object is invincible (`Object.SetInvincible` reasons).
@@ -2139,6 +2148,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         };
         let target = id(t.raw_get::<Value>("Target").ok().as_ref());
         let haste = num(t.raw_get::<Value>("Haste").ok().as_ref());
+        // A new goal replaces the person's last (inferred): an outpost's
+        // rusher calls send the same soldiers again every 20 s, and each
+        // callback kept holds Lua references until the scripts' state runs
+        // out of them (found by the China contracts' thread: after about
+        // 400 s).
+        w.goal_callbacks.retain(|(g, _, _)| *g != guid);
         if let Value::Function(f) = t.raw_get::<Value>("Callback")? {
             let data = t.raw_get::<Option<Table>>("CallbackData")?;
             w.goal_callbacks.push((guid, f, data));
@@ -2454,16 +2469,28 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         vo.set(name, i as i64)?;
     }
 
-    // Developer switches (skip to a mission, force a briefing): all off.
+    // Developer switches: skip to a mission (off unless asked for), and
+    // force a new game (off).
     let sys = lib("Sys")?;
     // The game shows its tutorial tips, unless the player turned them off.
     add(&sys, "TutorialsEnabled", |w, _, _| {
         values([Value::Boolean(!w.tutorials_off)])
     })?;
-    for name in ["GetSkipMission", "GetINIBriefing", "GetForceNewGame"] {
-        add(&sys, name, |_, _, _| values([Value::Nil]))?;
-    }
-    add(&sys, "SetSkipMission", |_, _, _| values([]))?;
+    add(&sys, "GetSkipMission", |w, lua, _| {
+        values([match &w.skip_mission {
+            Some(m) => Value::String(lua.create_string(m)?),
+            None => Value::Nil,
+        }])
+    })?;
+    // The bootstrap clears it (`""`) once it has taken it.
+    add(&sys, "SetSkipMission", |w, _, args| {
+        w.skip_mission = category(args.first()).filter(|m| !m.is_empty());
+        values([])
+    })?;
+    add(&sys, "GetINIBriefing", |w, _, _| {
+        values([Value::Boolean(w.skip_briefing)])
+    })?;
+    add(&sys, "GetForceNewGame", |_, _, _| values([Value::Nil]))?;
     // `WifMissionFlow.Autosave` asks this after a contract (with whether
     // a mission is on, the last contract, the time played and the share
     // of the game done): the game saves.

@@ -196,9 +196,11 @@ return true
 "#;
 
 /// Puts `MrxCheatBootstrap.IsSkipModeEnabled` back as the scripts had it
-/// before [`Mission::start`] turned skip mode on, if that answers no; else
-/// (none, an error, or yes) one that answers no. Returns what the scripts'
-/// own answered.
+/// before [`Mission::start`] turned skip mode on, if that answers no, or
+/// yes while a skip to a mission is under way
+/// ([`Mission::set_skip_mission`]: the scripts end it themselves once the
+/// contract is reached); else (none, an error, or yes) one that answers
+/// no. Returns what the scripts' own answered.
 const END_SKIP_MODE: &str = r#"
 local cheat = rawget(_G, "MrxCheatBootstrap")
 if type(cheat) ~= "table" then return "no MrxCheatBootstrap" end
@@ -207,7 +209,9 @@ local said = "none"
 if type(own) == "function" then
     local ok, on = pcall(own)
     said = ok and tostring(on) or ("error: " .. tostring(on))
-    if ok and not on then
+    local skipping = type(cheat.GetMissionSkipData) == "function"
+        and cheat.GetMissionSkipData() ~= nil
+    if ok and (not on or skipping) then
         cheat.IsSkipModeEnabled = own
         return said
     end
@@ -1204,14 +1208,13 @@ impl Mission {
         self.flown = true;
     }
 
-    /// Reports that `guid` (a delivery's pilot) reached `at`: its cargo is
-    /// let go there and the scripts hear of it ([`api::arrived`]); what
-    /// they do about it is carried out at once.
+    /// Reports that `guid` (a delivery's pilot, a person sent somewhere,
+    /// the player) reached `at`, its AI goal's place: any cargo is let go
+    /// there and the scripts hear of it ([`api::arrived`]); what they do
+    /// about it is carried out at once.
     pub fn arrived(&mut self, guid: u32, at: [f32; 3]) {
-        self.log.push(format!(
-            "t={:.1} delivery by {guid} arrived at {at:?}",
-            self.now
-        ));
+        self.log
+            .push(format!("t={:.1} {guid:#x} arrived at {at:?}", self.now));
         for e in api::arrived(&self.world, guid, at) {
             self.log
                 .push(format!("  goal callback: {}", first_lines(&e.to_string())));
@@ -1613,6 +1616,17 @@ impl Mission {
     /// (`Sys.TutorialsEnabled`; on unless told).
     pub fn set_tutorials(&mut self, on: bool) {
         self.world.borrow_mut().tutorials_off = !on;
+    }
+
+    /// Skips the story to a contract the developer's way (`Sys.
+    /// GetSkipMission`): set before [`start`](Self::start), the new game
+    /// turns on the scripts' skip mode with it, and the flow completes
+    /// each story contract it unlocks until it unlocks this one, which
+    /// then starts as in play (at its briefing with `briefing`).
+    pub fn set_skip_mission(&mut self, mission: &str, briefing: bool) {
+        let mut w = self.world.borrow_mut();
+        w.skip_mission = Some(mission.to_owned());
+        w.skip_briefing = briefing;
     }
 
     /// The subtitles of the movie [`take_movie`](Self::take_movie) gave,
@@ -2144,6 +2158,23 @@ mod tests {
         m.set_subtitles(false);
         m.set_tutorials(true);
         assert_eq!(ask(&m), [false, true]);
+    }
+
+    #[test]
+    fn the_skip_to_mission_switch_reaches_the_bootstrap_once() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let ask = |m: &Mission| {
+            m.lua()
+                .load("return Sys.GetSkipMission(), Sys.GetINIBriefing()")
+                .eval::<(Option<String>, bool)>()
+                .unwrap()
+        };
+        assert_eq!(ask(&m), (None, false));
+        m.set_skip_mission("GurCon053", true);
+        assert_eq!(ask(&m), (Some("GurCon053".into()), true));
+        // The bootstrap clears it once taken, as the engine's INI switch.
+        m.lua().load("Sys.SetSkipMission('')").exec().unwrap();
+        assert_eq!(ask(&m).0, None);
     }
 
     #[test]

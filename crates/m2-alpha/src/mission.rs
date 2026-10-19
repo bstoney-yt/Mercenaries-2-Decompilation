@@ -508,6 +508,19 @@ pub struct Mark {
     pub at: Vec3,
     /// The object is alive (not yet destroyed).
     pub alive: bool,
+    /// The mission it is for, when the scripts say: the marker's
+    /// (`"GurCon053"`), else that of an objective on the PDA about the
+    /// same object.
+    pub mission: Option<MarkFor>,
+}
+
+/// The mission a [`Mark`] is for, as the scripts name it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MarkFor {
+    /// A marker's mission id (`"GurCon053"`).
+    Id(String),
+    /// A PDA objective's index in the mission data.
+    Index(i64),
 }
 
 enum State {
@@ -539,6 +552,12 @@ pub struct MissionLink {
     /// The newest objective message, its text readable, and its age.
     message: Option<(ObjectiveMessage, String, f32)>,
     drivers: Vec<(String, String)>,
+    /// The story skipped to this contract (`--skip-to`), and whether to
+    /// its briefing ([`Mission::set_skip_mission`]).
+    skip_to: Option<(String, bool)>,
+    /// Skipped there: ticks left to find where the scripts' new game
+    /// spawns her ([`spawn_point`]) and put her there.
+    spawn_tries: u32,
     /// The scripts put the player somewhere the island has no way to hold
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
@@ -631,6 +650,10 @@ struct Fleet {
     ///
     /// [`reenter`]: Self::reenter
     boarding: u32,
+    /// The place the scripts sent her to (`Ai.Goal` `MoveTo` on the
+    /// player: an outpost counts her among its rushers), and where it is:
+    /// her goal is done once she stands within [`GOAL_REACH`] of it.
+    player_goal: Option<(u32, Vec3)>,
 }
 
 impl std::fmt::Debug for MissionLink {
@@ -683,6 +706,8 @@ impl MissionLink {
             log,
             message: None,
             drivers,
+            skip_to: None,
+            spawn_tries: 0,
             ashore: 0,
             blasts: Vec::new(),
             tutorial: None,
@@ -908,6 +933,13 @@ impl MissionLink {
             m.set_subtitles(subtitles);
             m.set_tutorials(tutorials);
         }
+    }
+
+    /// Skips the story to this contract as the game's developer switch
+    /// does (`--skip-to`): every story contract before it is completed as
+    /// the flow unlocks it.
+    pub fn with_skip_to(self, skip_to: Option<(String, bool)>) -> Self {
+        Self { skip_to, ..self }
     }
 
     /// Stocks and calls in these support items once the scripts run.
@@ -1151,6 +1183,38 @@ impl MissionLink {
                 }
             );
             mission.kill(g);
+        }
+        // People the scripts sent somewhere got there, and she got where
+        // they sent her: their goals are done.
+        for (spawn, at) in game.scene.people.take_route_ends() {
+            mission.arrived(spawn, at.to_array());
+        }
+        if let Some((to, at)) = self.vehicles.player_goal
+            && game.scene.player.as_ref().is_some_and(|p| {
+                p.driving.is_none() && p.character.position.distance(at) < GOAL_REACH
+            })
+        {
+            self.vehicles.player_goal = None;
+            eprintln!("mission: she got to {to:#x}, where the scripts sent her");
+            mission.arrived(PLAYER, at.to_array());
+        }
+        // Skipped to a later contract: the world opened at the first
+        // contract's start, but the scripts' new game spawns her where
+        // they name (the contract's start, or by the PMC's offices); there
+        // once that point has loaded.
+        if self.spawn_tries > 0 {
+            self.spawn_tries -= 1;
+            if let Some((name, at)) = spawn_point(mission)
+                && let Some(p) = game.scene.player.as_mut()
+            {
+                self.spawn_tries = 0;
+                if p.character.position.distance(at) > SPAWN_NEAR {
+                    p.drop_at(at);
+                    p.driving = None;
+                    p.chase_target = None;
+                    eprintln!("mission: she starts at the scripts' spawn point {name} ({at:.1})");
+                }
+            }
         }
         // The vehicle she was seated in never came: ashore instead.
         if self.vehicles.boarding > 0 {
@@ -1672,6 +1736,11 @@ impl MissionLink {
                 }
                 mission.set_subtitles(self.subtitles);
                 mission.set_tutorials(self.tutorials);
+                if let Some((to, briefing)) = &self.skip_to {
+                    mission.set_skip_mission(to, *briefing);
+                    self.write([format!("skip to: {to} (briefing {briefing})")]);
+                    self.spawn_tries = ASHORE_TRIES;
+                }
                 mission.start();
                 if self.movies && self.end_skip {
                     // The movies wait for the game, so the scripts' skip
@@ -1929,7 +1998,14 @@ impl MissionLink {
             return Vec::new();
         };
         let w = mission.world().borrow();
-        let mark = |g: u32, kind: &str| {
+        let on_pda = |g: u32| {
+            w.hud
+                .objectives
+                .values()
+                .find(|o| o.target == Some(g))
+                .map(|o| MarkFor::Index(o.mission))
+        };
+        let mark = |g: u32, kind: &str, for_mission: Option<MarkFor>| {
             let o = w.objects.get(&g)?;
             Some(Mark {
                 target: g,
@@ -1937,13 +2013,20 @@ impl MissionLink {
                 name: o.name.clone(),
                 at: Vec3::from(o.position),
                 alive: o.alive,
+                mission: for_mission.or_else(|| on_pda(g)),
             })
         };
         let mut out: Vec<Mark> = w
             .hud
             .markers
             .values()
-            .filter_map(|m| mark(m.target?, m.icon.trim_start_matches("HUD_objective_")))
+            .filter_map(|m| {
+                mark(
+                    m.target?,
+                    m.icon.trim_start_matches("HUD_objective_"),
+                    (m.mission != "nil").then(|| MarkFor::Id(m.mission.clone())),
+                )
+            })
             .collect();
         let others = w
             .hud
@@ -1959,12 +2042,54 @@ impl MissionLink {
             );
         for (g, kind) in others {
             if !out.iter().any(|m| m.target == g)
-                && let Some(m) = mark(g, kind)
+                && let Some(m) = mark(g, kind, None)
             {
                 out.push(m);
             }
         }
         out
+    }
+
+    /// The contract she is on (`MrxPlayState.GetCurrentMission`, its id
+    /// without `Mission`) and its index in the mission data, if any.
+    pub fn contract(&self) -> Option<(String, i64)> {
+        let State::Running(mission) = &self.state else {
+            return None;
+        };
+        mission
+            .lua()
+            .load(CURRENT_CONTRACT)
+            .set_name("=current contract")
+            .eval::<(Option<String>, Option<i64>)>()
+            .ok()
+            .and_then(|(id, index)| Some((id?, index?)))
+    }
+
+    /// The marks ([`marks`](Self::marks)) a player on the contract goes
+    /// for: the objectives' (not the map's icons over the faction HQs'
+    /// doors, `HUD_Outpost_GR`); of those, the contract's own while any
+    /// is still to be done. (The jobs the flow unlocks put up markers of
+    /// their own all over the island, which a player on a contract
+    /// passes by.)
+    pub fn contract_marks(&self) -> Vec<Mark> {
+        let marks: Vec<Mark> = self
+            .marks()
+            .into_iter()
+            .filter(|m| !m.kind.starts_with("HUD_"))
+            .collect();
+        let Some((id, index)) = self.contract() else {
+            return marks;
+        };
+        let ours = |m: &Mark| match &m.mission {
+            Some(MarkFor::Id(i)) => i.eq_ignore_ascii_case(&id),
+            Some(MarkFor::Index(i)) => *i == index,
+            None => false,
+        };
+        if marks.iter().any(|m| m.alive && ours(m)) {
+            marks.into_iter().filter(ours).collect()
+        } else {
+            marks
+        }
     }
 
     /// The names of the events the scripts wait for the game to post
@@ -2437,6 +2562,44 @@ const LANDING: f64 = 3.0;
 /// around her to load.
 const ASHORE_TRIES: u32 = 600;
 
+/// The contract she is on and its index in the mission data, from the
+/// scripts' own modules (`MrxPlayState`, `WifMissionData`).
+const CURRENT_CONTRACT: &str = r#"
+local ps, data = rawget(_G, "MrxPlayState"), rawget(_G, "WifMissionData")
+if type(ps) ~= "table" or type(data) ~= "table" then return nil end
+local m = ps.GetCurrentMission and ps.GetCurrentMission()
+if type(m) ~= "table" or type(m.GetName) ~= "function" then return nil end
+local id = string.gsub(m:GetName(), "Mission$", "")
+local index = data.GetMissionIndexFromId and data.GetMissionIndexFromId(id)
+if type(index) ~= "number" then return nil end
+return id, index
+"#;
+
+/// She has got where the scripts sent her within this, metres (invented:
+/// the autoplay's and the people's own arrival distance).
+const GOAL_REACH: f32 = 2.5;
+
+/// Further than this from the scripts' spawn point (metres), she is put
+/// there ([`spawn_point`]).
+const SPAWN_NEAR: f32 = 20.0;
+
+/// Where the scripts' new game spawns the player: the first of
+/// `MrxPlayer.SetSpawnLocations`' points (from the scripts: the
+/// bootstrap names the contract skipped to's start, else
+/// `Starter_Pmc_Start1`), once a layer has placed it.
+fn spawn_point(mission: &Mission) -> Option<(String, Vec3)> {
+    let name: String = mission
+        .lua()
+        .load(
+            "local p = rawget(_G, 'MrxPlayer')              local t = type(p) == 'table' and rawget(p, '_tSpawnLocations')              return type(t) == 'table' and t[1] or nil",
+        )
+        .eval::<Option<String>>()
+        .ok()??;
+    let w = mission.world().borrow();
+    let at = w.objects.get(&w.by_name(&name)?)?.position;
+    Some((name, Vec3::from(at)))
+}
+
 /// Ticks a vehicle the scripts seat her in gets to load and be placed:
 /// about 30 seconds.
 const BOARDING: u32 = 1800;
@@ -2502,9 +2665,10 @@ fn follow_markers(
         }
         if logged.insert(handle) {
             eprintln!(
-                "mission: marker {} on {:?} ({g:#x}): colour {:?}, {} m up, shown {}..{} m, sizes {:?}, 2D only {}{}",
+                "mission: marker {} on {:?} ({g:#x}) for {}: colour {:?}, {} m up, shown {}..{} m, sizes {:?}, 2D only {}{}",
                 m.icon,
                 w.objects.get(&g).map_or("?", |o| o.name.as_str()),
+                m.mission,
                 m.colour,
                 m.height,
                 m.near,
@@ -3077,6 +3241,28 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                     }
                     _ => {}
                 }
+            }
+            return false;
+        }
+        // Sent somewhere herself (an outpost's rushers, those near its flag,
+        // include the player): her goal is done when she gets there.
+        Command::Goal {
+            guid,
+            goal,
+            target: Some(to),
+            ..
+        } if goal == "MoveTo" && *guid == PLAYER => {
+            let at = mission
+                .world()
+                .borrow()
+                .objects
+                .get(to)
+                .map(|o| Vec3::from(o.position));
+            if let Some(at) = at
+                && fleet.player_goal.is_none_or(|g| g.0 != *to)
+            {
+                eprintln!("mission: the scripts send her to {to:#x} at {at:.1}");
+                fleet.player_goal = Some((*to, at));
             }
             return false;
         }
