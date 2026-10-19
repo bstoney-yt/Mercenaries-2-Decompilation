@@ -6788,6 +6788,8 @@ impl Running {
             return;
         }
         let driving = self.game.driving().is_some();
+        let rumble = std::mem::take(&mut self.game.rumble);
+        self.pad.rumble(rumble);
         let keys = self.pad.poll(&mut self.input, driving, dt);
         for key in keys {
             use pad::MenuKey;
@@ -6941,6 +6943,7 @@ impl Running {
         self.set_volumes([o.sfx_volume, o.music_volume, o.dialog_volume]);
         self.pad.look = Some(pause::pad_scale(o.pad_sensitivity));
         self.pad.invert = o.invert_pad;
+        self.pad.rumble_on = o.rumble;
         if let Some(m) = &mut self.mission {
             m.set_options(o.subtitles, o.tutorials);
         }

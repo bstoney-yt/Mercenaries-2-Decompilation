@@ -1,4 +1,12 @@
-//! Prints each boat template's `_BoatPhysics` steering fields.
+//! Prints each distinct `_BoatPhysics` record's steering and inertia
+//! fields beside its `MaxSpeed` (gap-list sweep: `Steering` rises with
+//! the boat's size, so it is no turn rate; see `m2_engine::tuning::BoatTuning`).
+//!
+//! ```text
+//! cargo run --release -p m2-engine --example boatsteer -- "<install dir>"
+//! ```
+//!
+//! Prints numbers and template names only.
 use std::collections::BTreeMap;
 use std::path::Path;
 

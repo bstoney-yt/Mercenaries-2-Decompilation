@@ -215,6 +215,9 @@ pub struct Game {
     pub reporters: Vec<(u32, &'static str, f32)>,
     /// Whether an army pursued her last frame.
     pub pursued: bool,
+    /// Seconds the scripts asked her pad to shake (`Pg.Rumble`), for the
+    /// pad to take.
+    pub rumble: f64,
     /// Keyed actions the scripts asked for (`Human.DoAction`: the player's
     /// verify photo `VerifyCamera`), each with its seconds left, ended for the
     /// scripts' `HumanActionComplete` ([`crate::mission`]).
@@ -373,6 +376,7 @@ impl Game {
             attitude_wait: 0.0,
             reporters: Vec::new(),
             pursued: false,
+            rumble: 0.0,
             actions: Vec::new(),
             scripts_seated: false,
         }

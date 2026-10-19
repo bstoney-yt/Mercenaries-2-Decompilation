@@ -106,7 +106,17 @@ pub struct FlightTuning {
 /// Named but not read here: `Steering`, `LowSpeedSteering`,
 /// `LowSpeedLimit`, `SteerInertia`, `EngineInertia`, `HullFriction`,
 /// `RollInertia`, `PitchUpSpeed`, `PitchDownInertia`, `HandbrakeInertia`,
-/// `HandbrakeSteerBoost`; some 45 fields are still unnamed.
+/// `HandbrakeSteerBoost`; some 45 fields are still unnamed. The steering
+/// fields are not a turn rate (gap-list sweep, `boatsteer` over the 25
+/// distinct records): `Steering` rises with the boat's size, 0.3 on the
+/// Jetski and the Dinghy to 4 on the LCUR landing craft and the PR's
+/// Salton Seahorse, so as radians a second a landing craft would turn 13
+/// times as fast as a jetski. It reads as a push whose scale needs the
+/// hull's inertia, which no named field gives, so the alpha's one
+/// invented turn rate stays. `LowSpeedLimit` (10 to 130, km/h as
+/// `MaxSpeed` is, inferred) splits `Steering` from `LowSpeedSteering`
+/// (0 on 7 records: no steering slow, inferred); `SteerInertia` (0 to
+/// 0.98) and the other `*Inertia` read as a share kept each step.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BoatTuning {
     /// Top speed backing up, m/s (`MaxSpeedReverse`, km/h as `MaxSpeed`
