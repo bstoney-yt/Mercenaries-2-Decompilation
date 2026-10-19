@@ -395,6 +395,9 @@ pub struct WeaponSpec {
     /// How far its aim is helped onto a target (`HumanCameraModifier`),
     /// if its template says.
     pub assist: Option<AimAssist>,
+    /// How it sets her camera (`HumanCameraModifier`), if its template
+    /// says.
+    pub camera: Option<CameraFeel>,
 }
 
 /// A gun's aim assist, from its `HumanCameraModifier`: the named fields
@@ -455,6 +458,27 @@ impl AimAssist {
         }
         to
     }
+}
+
+/// How a gun sets her camera, from its `HumanCameraModifier` (names found
+/// by hashing, gap round 1; values from samples, gap-list sweep: 44
+/// records, 14 distinct). `FOV` is 1 on every one; `CrouchFov` 0.4 (the
+/// Combat Rifle, the Laser Designator) to 0.9 (the Machine Pistol), the
+/// sniper rifles 0.5. Read as shares of the lens' field of view standing
+/// and aiming (inferred: "crouch" is the game's word for the aimed stance,
+/// the pad layout's LT, and the scoped guns narrow most). The look speeds
+/// (`YawSpeed`, `PitchSpeed`; `CrouchYawSpeed`, `CrouchPitchSpeed`), 0.35
+/// (RPG) to 1.5 (pistols) standing and 0.25 to 0.95 aiming, read as
+/// shares of her turning speed (inferred). `CameraShakeScale` is 1 on
+/// every record and `RotationSpeed` a whole 3: not read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraFeel {
+    /// The lens' share standing and aiming (`FOV`, `CrouchFov`).
+    pub fov: f32,
+    pub aim_fov: f32,
+    /// Turning speed shares, sideways and up, standing and aiming.
+    pub look: [f32; 2],
+    pub aim_look: [f32; 2],
 }
 
 /// `HumanCameraModifier`'s aim-assist fields ([`AimAssist`]).
@@ -991,6 +1015,15 @@ pub fn read(db: &Layer<'_>) -> Arms {
             far: [f(ASSIST_FAR[0])?, f(ASSIST_FAR[1])?],
         })
     };
+    let camera_of = |id: u32| {
+        let f = |name: &str| Parts::float(&camera, id, name_hash(name)).filter(|v| *v > 0.0);
+        Some(CameraFeel {
+            fov: f("FOV")?,
+            aim_fov: f("CrouchFov")?,
+            look: [f("YawSpeed")?, f("PitchSpeed")?],
+            aim_look: [f("CrouchYawSpeed")?, f("CrouchPitchSpeed")?],
+        })
+    };
     let name_of = |id: u32| names.get(&id).map_or(String::new(), |n| (*n).to_owned());
     let model_of = |id: u32| parts.models.get(&id).copied().filter(|&m| m != 0);
     let class_of = |id: u32| Parts::first(&equipment, id, CLASS).filter(|&c| c != 0);
@@ -1058,6 +1091,7 @@ pub fn read(db: &Layer<'_>) -> Arms {
                         })
                     })(),
                     assist: assist_of(id),
+                    camera: camera_of(id),
                 },
             ))
         })
@@ -1366,6 +1400,7 @@ mod tests {
                 hint: None,
                 ui: None,
                 assist: None,
+                camera: None,
             },
             nodes: vec![Some(0)],
         }
@@ -1526,6 +1561,7 @@ mod tests {
             hint: None,
             ui: None,
             assist: None,
+            camera: None,
         };
         let arms = Arms {
             weapons: HashMap::from([(7, spec)]),

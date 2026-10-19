@@ -187,6 +187,9 @@ pub struct Rifle {
     pub ui: Option<m2_engine::weapons::GunUi>,
     /// Its aim assist (`HumanCameraModifier`), if its template says.
     pub assist: Option<m2_engine::weapons::AimAssist>,
+    /// How it sets her camera (`HumanCameraModifier`), if its template
+    /// says.
+    pub camera: Option<m2_engine::weapons::CameraFeel>,
 }
 
 impl Default for Rifle {
@@ -209,6 +212,7 @@ impl Default for Rifle {
             feel: Feel::default(),
             ui: None,
             assist: None,
+            camera: None,
         }
     }
 }
@@ -262,6 +266,7 @@ impl Rifle {
             feel: spec.feel,
             ui: spec.ui,
             assist: spec.assist,
+            camera: spec.camera,
         }
     }
 
@@ -2197,6 +2202,15 @@ impl Combat {
                     .unwrap_or_else(|| m2_assets::name_hash("rocket")),
                 side: Side::Left,
             },
+        }
+    }
+
+    /// How the weapon up in her hands sets her camera
+    /// (`HumanCameraModifier`), if its template says.
+    pub fn camera_feel(&self) -> Option<m2_engine::weapons::CameraFeel> {
+        match self.weapon {
+            Weapon::Rifle => self.rifle.camera,
+            _ => self.launcher.camera,
         }
     }
 

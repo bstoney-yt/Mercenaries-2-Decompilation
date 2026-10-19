@@ -4647,6 +4647,7 @@ mod tests {
             hint: None,
             ui: None,
             assist: None,
+            camera: None,
         };
         let db = Templates {
             infos: HashMap::from([(

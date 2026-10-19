@@ -37,6 +37,9 @@ struct Spot<'a> {
     yaw: f32,
 }
 
+/// How quickly her lens eases to its gun's share aiming and back, a second
+/// (invented).
+const LENS_EASE: f32 = 8.0;
 /// How fast a flown helicopter's rotors turn, radians a second (about five
 /// turns; invented, the rotor blur hides it).
 const ROTOR_SPIN: f32 = 30.0;
@@ -627,6 +630,7 @@ impl Game {
                 self.step(intent, dt);
                 return;
             }
+            self.aim_lens(&mut intent, dt);
             let driving = self
                 .scene
                 .player
@@ -652,6 +656,24 @@ impl Game {
             }
             self.camera.update(input, config, mouse_look, dt);
             self.step(Intent::default(), dt);
+        }
+    }
+
+    /// Her gun's lens ([`m2_engine::weapons::CameraFeel`]): aiming on foot,
+    /// the view narrows to its `CrouchFov` share and her look slows to its
+    /// `CrouchYawSpeed` and `CrouchPitchSpeed`; else it widens back to its
+    /// `FOV` (1 on every gun). The lens eases there at [`LENS_EASE`] a
+    /// second (invented).
+    fn aim_lens(&mut self, intent: &mut Intent, dt: f32) {
+        let feel = self.combat.camera_feel();
+        let Some(player) = self.scene.player.as_mut() else {
+            return;
+        };
+        let aiming = player.aiming && player.driving.is_none();
+        player.lens = lens_step(player.lens, feel, aiming, dt);
+        if let Some(f) = feel.filter(|_| aiming) {
+            intent.look.x *= f.aim_look[0];
+            intent.look.y *= f.aim_look[1];
         }
     }
 
@@ -3608,5 +3630,49 @@ mod tests {
         assert!(!blown_loose(&db, 2));
         // One the data gives no damage table row: thrown, as before.
         assert!(blown_loose(&db, 3));
+    }
+}
+
+/// Her lens' share of the field of view after `dt` seconds from `lens`,
+/// easing to her gun's share: `CrouchFov` aiming, `FOV` else, 1 for a gun
+/// whose template says neither.
+fn lens_step(
+    lens: f32,
+    feel: Option<m2_engine::weapons::CameraFeel>,
+    aiming: bool,
+    dt: f32,
+) -> f32 {
+    let want = match feel {
+        Some(f) if aiming => f.aim_fov,
+        Some(f) => f.fov,
+        None => 1.0,
+    };
+    lens + (want - lens) * (LENS_EASE * dt).min(1.0)
+}
+
+#[cfg(test)]
+mod lens_tests {
+    use super::*;
+
+    // The sniper rifle's record: its view narrows to half aiming, and
+    // widens back to the whole lens when she lowers it.
+    #[test]
+    fn aiming_narrows_the_lens_to_its_guns_share() {
+        let sniper = m2_engine::weapons::CameraFeel {
+            fov: 1.0,
+            aim_fov: 0.5,
+            look: [0.8, 0.8],
+            aim_look: [0.5, 0.5],
+        };
+        let mut lens = 1.0;
+        for _ in 0..60 {
+            lens = lens_step(lens, Some(sniper), true, 1.0 / 60.0);
+        }
+        assert!((lens - 0.5).abs() < 0.01, "{lens}");
+        for _ in 0..60 {
+            lens = lens_step(lens, Some(sniper), false, 1.0 / 60.0);
+        }
+        assert!((lens - 1.0).abs() < 0.01, "{lens}");
+        assert_eq!(lens_step(0.7, None, true, 1.0), 1.0);
     }
 }

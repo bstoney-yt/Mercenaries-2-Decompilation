@@ -1,0 +1,83 @@
+//! Prints the named fields of one template-database component for every
+//! distinct record, with the templates sharing it: a survey for deciding
+//! what a field means from its values.
+//!
+//! ```text
+//! cargo run --release -p m2-engine --example fields -- "<install dir>" <component> <field>...
+//! ```
+//!
+//! A field the component lacks prints `-`. Values print as floats, and as
+//! whole numbers too when the word is not a normal float. Prints numbers
+//! and template names only.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use m2_assets::layer::{Layer, TEMPLATE_DB_TYPE};
+use m2_assets::name_hash;
+use m2_engine::Install;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let [root, component, fields @ ..] = args.as_slice() else {
+        return Err("usage: fields <install dir> <component> <field>...".into());
+    };
+    let install = Install::find(Path::new(root))?;
+    let mut source = install.open_world()?;
+    let db_hash = {
+        let index = source.archive().index();
+        index
+            .assets()
+            .iter()
+            .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+            .map(|a| a.name_hash)
+            .ok_or("no template database")?
+    };
+    let data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&data)?;
+    let names = db.names();
+    let c = db.component(component).ok_or("no such component")?;
+    let at: Vec<Option<usize>> = fields
+        .iter()
+        .map(|n| {
+            c.fields
+                .iter()
+                .find(|f| f.name_hash == name_hash(n))
+                .map(|f| usize::from(f.offset))
+        })
+        .collect();
+    for (n, a) in fields.iter().zip(&at) {
+        println!("# {n} @{}", a.map_or("-".to_owned(), |a| format!("{a:#x}")));
+    }
+    let mut groups: BTreeMap<Vec<u8>, Vec<&str>> = BTreeMap::new();
+    for (id, r) in c.records().unwrap_or_default() {
+        groups
+            .entry(r.to_vec())
+            .or_default()
+            .push(names.get(&id).copied().unwrap_or("?"));
+    }
+    println!(
+        "records {}, distinct {}",
+        c.records().unwrap_or_default().len(),
+        groups.len()
+    );
+    println!("first template\tcount\t{}", fields.join("\t"));
+    for (r, ids) in &groups {
+        let vals: Vec<String> = at
+            .iter()
+            .map(|a| {
+                a.and_then(|a| r.get(a..a + 4)).map_or("-".into(), |b| {
+                    let w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    let f = f32::from_bits(w);
+                    if f.is_normal() || w == 0 {
+                        format!("{f:.3}")
+                    } else {
+                        format!("#{w}")
+                    }
+                })
+            })
+            .collect();
+        println!("{}\t{}\t{}", ids[0], ids.len(), vals.join("\t"));
+    }
+    Ok(())
+}

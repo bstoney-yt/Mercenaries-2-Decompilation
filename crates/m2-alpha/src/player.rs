@@ -292,6 +292,9 @@ pub struct Player {
     pub driving: Option<usize>,
     /// Aiming: she faces the camera's way with the rifle shouldered.
     pub aiming: bool,
+    /// Her lens' share of the field of view (her gun's, aiming:
+    /// [`crate::game::Game`]'s `aim_lens`), 1 at rest.
+    pub lens: f32,
     /// Her rifle, jump, throw and fall clips.
     pub clips: FightClips,
     /// Walking, running and sprinting speeds, m/s.
@@ -464,6 +467,7 @@ impl Player {
             model,
             driving: None,
             aiming: false,
+            lens: 1.0,
             clips: FightClips::default(),
             speeds: SPEEDS,
             leap: Leap::No,
@@ -1202,7 +1206,7 @@ impl Player {
         View::perspective(
             self.eye(),
             self.camera_forward(),
-            fov_degrees.to_radians(),
+            (fov_degrees * self.lens.clamp(0.1, 2.0)).to_radians(),
             aspect,
             0.1,
             10_000.0,
