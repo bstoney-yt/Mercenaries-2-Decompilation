@@ -315,6 +315,9 @@ struct Options {
     /// `--bash-target <s>k`: knock them down instead (as a bash does a
     /// boss it doesn't hurt), to try the capture on anyone.
     knock_target: bool,
+    /// `--call-extraction <s>`: that long after the contract, call in the
+    /// extraction helicopter and go to it once it is down.
+    call_extraction: Option<f32>,
     /// With `--mission --autoplay --after-contract`: the Enter pressed
     /// every four seconds after the contract jumps too, as the pad's A
     /// does; where she is while the scripts hold her controls is logged
@@ -526,6 +529,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--dialog-keys" => o.dialog_keys = Some(value()?),
             "--medevac" => o.medevac = Some(value()?.parse()?),
             "--visit-faction" => o.visit_faction = Some(value()?),
+            "--call-extraction" => o.call_extraction = Some(value()?.parse()?),
             "--bash-target" => {
                 let v = value()?;
                 o.knock_target = v.ends_with('k');
@@ -3139,6 +3143,9 @@ fn mission_for_screenshot(
     let (mut dialog_up, mut dialog_pressed) = (0.0f32, 0usize);
     let (mut medevac_done, mut medevac_from) = (false, None::<(f32, m2_math::glam::Vec3)>);
     let mut visit: Option<f32> = None;
+    // `--call-extraction`: its step (0 waiting, 1 menu up, 2 calling, 3 by
+    // it), the designator's tap, and seconds the helicopter has been about.
+    let (mut extraction, mut extraction_tap, mut extraction_seen) = (0u8, false, 0.0f32);
     let (mut locked_was, mut locked_for) = (false, 0.0f32);
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
@@ -3225,36 +3232,92 @@ fn mission_for_screenshot(
         // facing them, and bashes them the tick after (verify-check lines).
         if let (Some(at), Some(done)) = (options.bash_target, contract_done) {
             let t = i.saturating_sub(done) as f32 * tick;
+            // 20 s before: out of the HQ, onto the PMC villa's grounds below
+            // it, where the layers place people (a VZ soldier by the road,
+            // from earlier runs), so there is someone to try it on.
+            if (t - (at - 20.0)).abs() < tick / 2.0
+                && let Some(p) = game.scene.player.as_mut()
+                && p.character.position.y > 300.0
+            {
+                p.drop_at(m2_math::glam::Vec3::new(2362.0, 0.0, -1150.0));
+                eprintln!("verify-check: out of the HQ, onto the villa's grounds");
+            }
+            // 10 s before: the nearest placed person to her is named to the
+            // scripts as `__m2_test_target` (a test driver gives them a
+            // verify objective), unless a driver named one already.
+            if (t - (at - 10.0)).abs() < tick / 2.0
+                && link.global_guid("__m2_test_target").is_none()
+                && let Some(her) = game.scene.player.as_ref().map(|p| p.character.position)
+            {
+                let nearest = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .filter(|n| n.alive && n.landed && !n.held)
+                    // A layer's person, not one the scripts made (a
+                    // starter out of her seat: guids from 0x40000000).
+                    .filter_map(|n| {
+                        Some((
+                            n.spawn.filter(|&s| s < 0x4000_0000)?,
+                            n.character.position.distance(her),
+                        ))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                match nearest {
+                    Some((g, d)) => {
+                        eprintln!("verify-check: names {g:#x} ({d:.0} m off) the test target");
+                        link.run_lua(&format!("__m2_test_target = Sys.StringToGuid('{g:#x}')"));
+                    }
+                    None => eprintln!("verify-check: nobody placed near her to name"),
+                }
+            }
+            // A test driver's target (`__m2_test_target`), else the
+            // markers' people.
+            let wanted: Vec<u32> = link
+                .global_guid("__m2_test_target")
+                .map(|g| vec![g])
+                .unwrap_or_else(|| link.marks().iter().map(|m| m.target).collect());
             if (t - at).abs() < tick / 2.0 {
-                let target = link.marks().into_iter().find_map(|m| {
+                let target = wanted.iter().find_map(|&g| {
                     let n = game
                         .scene
                         .people
                         .npcs
                         .iter()
-                        .find(|n| n.alive && n.spawn == Some(m.target))?;
-                    Some((m.target, n.character.position))
+                        .find(|n| n.alive && n.spawn == Some(g))?;
+                    Some((g, n.character.position))
                 });
                 match (target, game.scene.player.as_mut()) {
                     (Some((g, there)), Some(p)) => {
                         let her = p.character.position;
-                        let back = (her - there).with_y(0.0).normalize_or(m2_math::glam::Vec3::X);
+                        let back = (her - there)
+                            .with_y(0.0)
+                            .normalize_or(m2_math::glam::Vec3::X);
                         p.drop_at(there + back * 1.2);
                         p.facing = (-back.x).atan2(-back.z);
                         eprintln!("verify-check: put 1.2 m from {g:#x} at {there:.1}");
                     }
-                    _ => eprintln!("verify-check: no marked person to bash"),
+                    _ => eprintln!(
+                        "verify-check: none of {wanted:x?} is a person here (people's guids: {:x?})",
+                        game.scene
+                            .people
+                            .npcs
+                            .iter()
+                            .filter_map(|n| n.spawn)
+                            .filter(|s| *s >= 0x4000_0000)
+                            .collect::<Vec<_>>()
+                    ),
                 }
             }
             if (t - at - 1.0).abs() < tick / 2.0 {
                 if options.knock_target {
-                    let marked: Vec<u32> = link.marks().iter().map(|m| m.target).collect();
                     if let Some(n) = game
                         .scene
                         .people
                         .npcs
                         .iter_mut()
-                        .find(|n| n.alive && n.spawn.is_some_and(|s| marked.contains(&s)))
+                        .find(|n| n.alive && n.spawn.is_some_and(|s| wanted.contains(&s)))
                     {
                         eprintln!("verify-check: {:?} is knocked down", n.spawn);
                         n.knock_down();
@@ -3263,6 +3326,85 @@ fn mission_for_screenshot(
                     eprintln!("verify-check: she bashes");
                     intent.trigger.melee = true;
                 }
+            }
+        }
+        // `--call-extraction <s>`: that long after the contract, the
+        // support menu's extraction helicopter (the verify objective's
+        // free `Extraction_*` item) is called in as a player would, its
+        // designator thrown; once the helicopter has been down a while she
+        // is put by it (verify-check lines).
+        if let (Some(at), Some(done)) = (options.call_extraction, contract_done) {
+            use crate::support::{Aim, Entry, Phase};
+            let t = i.saturating_sub(done) as f32 * tick;
+            match extraction {
+                0 if t >= at => {
+                    let index = game.support.entries().iter().position(
+                        |e| matches!(e, Entry::Stocked(s) if s.key.starts_with("Extraction")),
+                    );
+                    match index {
+                        Some(k) => {
+                            eprintln!("verify-check: she calls in the extraction helicopter");
+                            game.support.selected = k;
+                            intent.trigger.support = true;
+                            extraction = 1;
+                        }
+                        None => {
+                            eprintln!("verify-check: no extraction helicopter in the support menu");
+                            extraction = 9;
+                        }
+                    }
+                }
+                // The menu up: her pick. Her PDA open keeps it shut (closed
+                // first, as `--shop-check` does), and it is asked again
+                // each second till it opens.
+                1 => {
+                    extraction_seen += tick;
+                    if game.support.phase == Phase::Menu {
+                        intent.use_pressed = true;
+                        extraction = 2;
+                        extraction_seen = 0.0;
+                    } else if game.support.pda {
+                        extraction_tap = !extraction_tap;
+                        intent.trigger.pda = extraction_tap;
+                    } else if extraction_seen >= 1.0 {
+                        eprintln!(
+                            "verify-check: the support menu is {:?}; asked again",
+                            game.support.phase
+                        );
+                        intent.trigger.support = true;
+                        extraction_seen = 0.0;
+                    }
+                }
+                2 => {
+                    if game.combat.to_throw {
+                        intent.trigger.throw = true;
+                    }
+                    if let Phase::Designating { aim, .. } = game.support.phase {
+                        extraction_tap = !extraction_tap;
+                        intent.trigger.fire = match aim {
+                            Aim::Satellite => extraction_tap,
+                            Aim::Laser => true,
+                        };
+                    }
+                    if let Some((heli, there)) =
+                        link.labelled("ExtractionHelicopter").first().copied()
+                    {
+                        extraction_seen += tick;
+                        if extraction_seen >= 45.0
+                            && let Some(p) = game.scene.player.as_mut()
+                        {
+                            let back = (p.character.position - there)
+                                .with_y(0.0)
+                                .normalize_or(m2_math::glam::Vec3::X);
+                            p.drop_at(there + back * 5.0);
+                            eprintln!(
+                                "verify-check: put 5 m from the extraction helicopter {heli:#x} at {there:.1}"
+                            );
+                            extraction = 3;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         game.step(intent, tick);

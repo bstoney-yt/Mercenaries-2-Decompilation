@@ -1599,6 +1599,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Weapons as objects: a loadout of templates, each weapon with its own
     // reserve of ammunition.
     let human = lib("Human")?;
+    // Human.SetAllowCorpseCleanup(character, allow): whether the game may
+    // clear its body away (the verify objective keeps a target's until it
+    // is photographed). The verify objective prints what it answers; true
+    // here (inferred), and bodies are never cleared yet.
+    add(&human, "SetAllowCorpseCleanup", |_, _, _| {
+        values([Value::Boolean(true)])
+    })?;
     // Human.DoAction(character, action): a keyed action of the human state
     // table (`VerifyCamera`, the verify's photo; `Cower`), played once;
     // `HumanActionComplete` fires as it ends.

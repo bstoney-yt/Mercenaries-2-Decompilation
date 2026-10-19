@@ -1235,6 +1235,26 @@ impl Mission {
         }
     }
 
+    /// Character `guid` is put in vehicle `vehicle` (a prisoner loaded
+    /// into the extraction helicopter): seat events fire on the next tick.
+    pub fn seat_in(&mut self, guid: u32, vehicle: u32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            o.vehicle = Some(vehicle);
+            o.seated_instantly = false;
+        }
+    }
+
+    /// The objects carrying label `label` (`ExtractionHelicopter`), and
+    /// where each is.
+    pub fn labelled(&self, label: &str) -> Vec<(u32, [f32; 3])> {
+        use crate::events::World;
+        let w = self.world.borrow();
+        w.labelled(label)
+            .into_iter()
+            .filter_map(|g| Some((g, w.objects.get(&g)?.position)))
+            .collect()
+    }
+
     /// The points of path entity `guid` in the world ([`Entity::path`]),
     /// of whichever layer names it; empty if none does.
     pub fn path(&self, guid: u32) -> &[[f32; 3]] {

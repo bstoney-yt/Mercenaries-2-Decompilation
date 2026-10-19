@@ -4390,6 +4390,49 @@ pub(crate) mod tests {
         assert!(checks.spinning > 1.0, "{}", checks.spinning);
     }
 
+    #[test]
+    fn a_bashed_target_falls_lies_and_gets_up_unless_subdued_and_carried() {
+        let physics = ground();
+        let mut rng = Rng::default();
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(5),
+        );
+        let step = |n: &mut Npc, seconds: f32, rng: &mut Rng| {
+            for _ in 0..(seconds * 60.0) as usize {
+                n.update(&physics, rng, None, 1.0 / 60.0);
+            }
+        };
+        step(&mut n, 0.5, &mut rng);
+        assert_eq!(n.human_state(), "Upright.Idle");
+        // Knocked down: the fall, lying, then up again.
+        n.knock_down();
+        assert_eq!(n.human_state(), "Upright.KnockDown");
+        step(&mut n, FALL_SECONDS + 0.1, &mut rng);
+        assert_eq!(n.human_state(), "KnockedDown.Idle");
+        step(&mut n, KNOCKED_SECONDS + 0.1, &mut rng);
+        assert_eq!(n.human_state(), "KnockedDown.Getup");
+        step(&mut n, GETUP_SECONDS + 0.1, &mut rng);
+        assert_eq!(n.human_state(), "Upright.Idle");
+        // Standing, he can't be subdued; down, he can, for good.
+        assert!(!n.subdue());
+        n.knock_down();
+        step(&mut n, FALL_SECONDS + 0.1, &mut rng);
+        assert!(n.subdue());
+        assert_eq!(n.human_state(), "KnockedDown.SubdueDefender");
+        step(&mut n, SUBDUE_SECONDS + KNOCKED_SECONDS + 1.0, &mut rng);
+        assert_eq!(n.human_state(), "Subdued.Idle");
+        // Carried, and put down again.
+        assert!(n.carry(true));
+        assert_eq!(n.human_state(), "Carried.Idle");
+        assert!(n.carry(false));
+        assert_eq!(n.human_state(), "Subdued.Idle");
+    }
+
     // Playtest 8 (his clip at 16:57): a soldier stood in the villa
     // garden's pool, water the game's heights give but the sea isn't.
     // Nobody lands in it nor walks into it.

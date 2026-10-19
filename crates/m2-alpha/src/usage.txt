@@ -214,6 +214,10 @@ m2-alpha [options]
                          contract, put her by the person the scripts' first
                          marker is over and bash them (verify-check lines);
                          <s>k knocks them down instead
+  --call-extraction <s>  with --mission --after-contract: this long after the
+                         contract, call in the extraction helicopter from the
+                         support menu, and once it has been about 45 s put her
+                         5 m from it (verify-check lines)
   --jump-with-enter      with --mission --autoplay --after-contract: the
                          Enter pressed after the contract jumps too, as the
                          pad's A; where she is while the scripts hold her

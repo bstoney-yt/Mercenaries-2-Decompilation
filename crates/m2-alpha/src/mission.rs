@@ -588,6 +588,9 @@ const STORY_REACH: f32 = 450.0;
 /// how long an action without a clip lasts (invented).
 const VERIFY_CLIPS: [u32; 3] = [0x5ae2_cef2, 0x0053_81c4, 0xb448_382e];
 const ACTION_SECONDS: f32 = 2.0;
+/// How near the extraction helicopter she loads a prisoner, metres
+/// (invented).
+const LOAD_REACH: f32 = 8.0;
 
 /// A marker the scripts put up, over one of their objects.
 #[derive(Clone, Debug, PartialEq)]
@@ -1310,7 +1313,13 @@ impl MissionLink {
             // subdues a knocked-down target, and picks a subdued one up
             // (from the scripts: `MrxTaskObjectiveVerify` offers them and
             // waits on the states; who acts on them is inferred).
-            if let Some(n) = game.scene.people.npcs.iter_mut().find(|n| n.spawn == Some(g)) {
+            if let Some(n) = game
+                .scene
+                .people
+                .npcs
+                .iter_mut()
+                .find(|n| n.spawn == Some(g))
+            {
                 if text.eq_ignore_ascii_case("[ContextAction.Subdue]") && n.subdue() {
                     eprintln!("mission: she subdues {g:#x}");
                 } else if text.eq_ignore_ascii_case("[ContextAction.Carry]") && n.carry(true) {
@@ -1334,12 +1343,40 @@ impl MissionLink {
                 n.facing = facing + std::f32::consts::PI;
             }
         }
+        // Carrying a prisoner to the extraction helicopter (the verify
+        // objective's `ExtractionHelicopter`, landed for her): within
+        // [`LOAD_REACH`] of it she loads them aboard, the seat event the
+        // objective waits on (`ObjectInSeat { target, "ExtractionHelicopter",
+        // "a", "e" }`), and they leave with it. Inferred: no script seats
+        // the prisoner, so the engine does it; the reach is invented.
+        if let Some(her) = game.scene.player.as_ref().map(|p| p.character.position)
+            && let Some(k) = game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .position(|n| n.down == Some(crate::npc::Down::Carried))
+            && let Some(g) = game.scene.people.npcs[k].spawn
+            && let Some((heli, _)) = mission
+                .labelled("ExtractionHelicopter")
+                .into_iter()
+                .find(|(_, at)| Vec3::from(*at).distance(her) <= LOAD_REACH)
+        {
+            eprintln!("mission: she loads {g:#x} into the extraction helicopter {heli:#x}");
+            game.scene.people.npcs.remove(k);
+            // Gone with it: their spawn places nobody again.
+            game.scene.people.killed.insert(g);
+            mission.set_human_state(g, "InVehicle.Subdued");
+            self.states.insert(g, "InVehicle.Subdued");
+            mission.seat_in(g, heli);
+        }
         // Keyed actions run out: `HumanActionComplete` fires.
         for a in &mut game.actions {
             a.2 -= dt;
         }
-        let (done, left): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut game.actions).into_iter().partition(|a| a.2 <= 0.0);
+        let (done, left): (Vec<_>, Vec<_>) = std::mem::take(&mut game.actions)
+            .into_iter()
+            .partition(|a| a.2 <= 0.0);
         game.actions = left;
         for (g, action, _) in done {
             eprintln!("mission: {g:#x}'s {action} ends");
@@ -2094,6 +2131,36 @@ impl MissionLink {
         }
         out.push(format!("props: {}", game.scene.props.counts()));
         out
+    }
+
+    /// The scripts' objects carrying label `label`, and where each is.
+    pub fn labelled(&self, label: &str) -> Vec<(u32, Vec3)> {
+        let State::Running(m) = &self.state else {
+            return Vec::new();
+        };
+        m.labelled(label)
+            .into_iter()
+            .map(|(g, at)| (g, Vec3::from(at)))
+            .collect()
+    }
+
+    /// Runs `code` in the mission's scripts (a test harness's line).
+    pub fn run_lua(&mut self, code: &str) {
+        if let State::Running(m) = &mut self.state
+            && let Err(e) = m.run(code, "harness")
+        {
+            eprintln!("mission: harness code failed: {e}");
+        }
+    }
+
+    /// A guid the scripts keep in global `name` (a test driver's
+    /// `__m2_test_target`), if the mission runs and it is one.
+    pub fn global_guid(&self, name: &str) -> Option<u32> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        let v: mlua::Value = m.lua().globals().raw_get(name).ok()?;
+        m2_game::events::as_guid(&v)
     }
 
     /// The markers the scripts have up, with what they are over; then the
@@ -2877,7 +2944,9 @@ fn shop_view(m: &Mission) -> ShopView {
 fn stocked(m: &Mission) -> Vec<support::Stocked> {
     m.support_items()
         .into_iter()
-        .filter(|i| i.stock > 0 || i.free > 0)
+        .filter(|i| i.stock > 0 || i.free > 0 || i.active)
+        // The free Satellite Guided Bomb is her own item ([`Kind`]).
+        .filter(|i| Kind::from_freebie(&i.key).is_none())
         .map(|i| support::Stocked {
             name: {
                 let shown = m.text(&i.name);
@@ -2888,8 +2957,10 @@ fn stocked(m: &Mission) -> Vec<support::Stocked> {
                 }
             },
             method: i.designator.trim_end_matches(" Designator").to_owned(),
-            count: u32::try_from(i.stock.max(0) + i.free.max(0)).unwrap_or(0),
-            free: i.free > 0,
+            count: u32::try_from(i.stock.max(0) + i.free.max(0))
+                .unwrap_or(0)
+                .max(u32::from(i.active)),
+            free: i.free > 0 || i.active,
             key: i.key,
         })
         .collect()
