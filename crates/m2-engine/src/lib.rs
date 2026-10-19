@@ -14,6 +14,7 @@
 //! game's data directly (see `docs/alpha-roadmap.md`).
 
 pub mod ai;
+pub mod ambience;
 pub mod anim;
 pub mod assets;
 pub mod atmosphere;
@@ -32,7 +33,9 @@ pub mod particles;
 pub mod physics;
 pub mod pickup;
 pub mod population;
+pub mod reverb;
 pub mod scatter;
+pub mod sound_regions;
 pub mod standin;
 pub mod stream;
 pub mod surface;

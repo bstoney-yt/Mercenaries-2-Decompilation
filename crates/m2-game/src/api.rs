@@ -308,6 +308,9 @@ pub enum Command {
     /// Play a music cue (`mu_fac_pmc_explore_01`), looped unless it is a
     /// one-shot, in place of what plays; `None` stops the music.
     Music(Option<String>),
+    /// Run the world's sounds through this reverb, or none
+    /// (`Sound.SetReverb`, `Sound.SetReverbPreset`).
+    Reverb(Option<m2_engine::reverb::ReverbPreset>),
     /// Play a sound cue by name (`Sound.CueSound`):
     /// `"ui_HUD_Objective_New"`; `at` the object it sounds from (`None`:
     /// flat, as the interface's sounds).
@@ -530,6 +533,8 @@ pub struct ScriptWorld {
     pub tutorials_off: bool,
     /// The score.
     pub music: crate::music::Music,
+    /// The environmental reverb.
+    pub reverb: crate::reverb::Reverb,
     /// Why each object is invincible (`Object.SetInvincible` reasons).
     pub invincible: HashMap<u32, std::collections::BTreeSet<String>>,
     /// The play area's boundaries (`Player.AddBoundary`: story-stage
@@ -2587,6 +2592,44 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
 
+    // The reverb (see `reverb`): `DefineReverbPreset(index, name, the
+    // twelve I3DL2 numbers, three more)`, `SetReverbPreset(name or
+    // index)`, `SetReverb(1 or 0)`.
+    add(&sound, "DefineReverbPreset", |w, _, a| {
+        let (Some(index), Some(Value::String(name))) = (num(a.first()), a.get(1)) else {
+            return values([]);
+        };
+        let index = index as i64;
+        let numbers: Vec<f32> = a[2..].iter().map_while(|v| num(Some(v))).collect();
+        if let Some(p) =
+            m2_engine::reverb::ReverbPreset::from_args(&name.to_string_lossy(), &numbers)
+            && let Some(c) = w.reverb.define(index, p)
+        {
+            w.commands.push(c);
+        }
+        values([])
+    })?;
+    add(&sound, "SetReverbPreset", |w, _, a| {
+        use crate::reverb::PresetName;
+        let name = match a.first() {
+            Some(Value::String(s)) => PresetName::Name(s.to_string_lossy()),
+            Some(Value::Integer(i)) => PresetName::Index(*i),
+            Some(Value::Number(n)) => PresetName::Index(*n as i64),
+            _ => return values([Value::Boolean(false)]),
+        };
+        let (found, c) = w.reverb.choose(&name);
+        w.commands.extend(c);
+        values([Value::Boolean(found)])
+    })?;
+    add(&sound, "SetReverb", |w, _, a| {
+        let on = match a.first() {
+            Some(Value::Boolean(b)) => *b,
+            v => num(v).is_some_and(|n| n != 0.0),
+        };
+        w.commands.extend(w.reverb.set_on(on));
+        values([])
+    })?;
+
     // The score (see `music`): factions, bindings and states.
     add(&sound, "SetFactionMusic", |w, _, a| {
         if let Some(Value::String(f)) = a.first() {
@@ -2601,7 +2644,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
     add(&sound, "ActivateFactionRegionMusic", |w, _, _| {
-        w.music.activate_region();
+        if let Some(c) = w.music.activate_region() {
+            w.commands.push(c);
+        }
         values([])
     })?;
     add(&sound, "BindMusicCue", |w, _, a| {
@@ -2647,7 +2692,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
     add(&sound, "LockFactionMusic", |w, _, a| {
-        w.music.locked = matches!(a.first(), Some(Value::Boolean(true)));
+        if let Some(c) = w
+            .music
+            .lock(matches!(a.first(), Some(Value::Boolean(true))))
+        {
+            w.commands.push(c);
+        }
         values([])
     })?;
     add(&sound, "IsFactionLockedMusic", |w, _, _| {

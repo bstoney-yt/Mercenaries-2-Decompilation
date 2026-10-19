@@ -669,6 +669,10 @@ pub struct MissionLink {
     /// The human state each placed person was last told to the scripts
     /// in ([`crate::npc::Down`]), by guid.
     states: HashMap<u32, &'static str>,
+    /// The reverb to switch to, if the scripts changed it.
+    reverb: Option<Option<m2_engine::reverb::ReverbPreset>>,
+    /// The music region she was last in, by entity (`Some(None)`: none).
+    music_region: Option<Option<u32>>,
     /// Support items to stock and call in once the scripts run
     /// (`--support`).
     support: Vec<String>,
@@ -803,6 +807,8 @@ impl MissionLink {
             music: None,
             radio: Radio::default(),
             states: HashMap::new(),
+            reverb: None,
+            music_region: None,
             support: Vec::new(),
             ashore_for: 0.0,
             marked: HashMap::new(),
@@ -1204,8 +1210,25 @@ impl MissionLink {
         let State::Running(mission) = &mut self.state else {
             return;
         };
-        // Deliveries fly on; the scripts hear of each load let go.
         let focus = game.focus();
+        // The music region she is in: the free-play score follows it.
+        if let Some(world) = &game.scene.world {
+            let region =
+                m2_engine::sound_regions::music_at(&world.index.sound_regions, focus.x, focus.z);
+            let entity = region.map(|r| r.entity);
+            if self.music_region != Some(entity) {
+                self.music_region = Some(entity);
+                mission.music_region(region.and_then(|r| r.faction));
+                eprintln!(
+                    "music: region {} at ({:.0}, {:.0}), score {}",
+                    region.map_or("none", |r| r.name.as_str()),
+                    focus.x,
+                    focus.z,
+                    mission.music_faction()
+                );
+            }
+        }
+        // Deliveries fly on; the scripts hear of each load let go.
         let scene = &mut game.scene;
         if let Some(world) = &mut scene.world {
             for r in scene
@@ -1802,6 +1825,7 @@ impl MissionLink {
                             self.music = Some(cue.clone());
                         }
                     }
+                    Command::Reverb(preset) => self.reverb = Some(preset.clone()),
                     Command::Invincible { guid, on } if *guid == PLAYER => {
                         game.combat.invincible = *on;
                     }
@@ -1991,6 +2015,11 @@ impl MissionLink {
     /// The music cue to switch to, if the scripts changed it.
     pub fn take_music(&mut self) -> Option<Option<String>> {
         self.music.take()
+    }
+
+    /// The reverb to switch to, if the scripts changed it.
+    pub fn take_reverb(&mut self) -> Option<Option<m2_engine::reverb::ReverbPreset>> {
+        self.reverb.take()
     }
 
     /// Scripted line `id` lasts `seconds`.
