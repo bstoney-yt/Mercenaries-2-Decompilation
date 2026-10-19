@@ -1752,16 +1752,25 @@ end
     /// it, and `WifPmcInterior` finds her as `Vehicle.GetRiders(it)[1]`.
     pub fn crews_aboard(&self) -> Vec<CrewAboard> {
         let w = self.world.borrow();
+        // Who rides what, in one pass over the objects: once the story
+        // has moved on (`--skip-to`) the layers hold thousands of crews,
+        // and a pass over every object for each crew stalled each tick
+        // for minutes.
+        let mut by_vehicle: HashMap<u32, Vec<(u32, &String)>> = HashMap::new();
+        for (&r, o) in &w.objects {
+            if let Some(v) = o.vehicle
+                && o.alive
+                && Some(r) != w.player
+                && w.crews.contains_key(&v)
+            {
+                by_vehicle.entry(v).or_default().push((r, &o.name));
+            }
+        }
         let mut out: Vec<CrewAboard> = w
             .crews
             .iter()
             .filter_map(|(&g, crew)| {
-                let mut riders: Vec<(u32, &String)> = w
-                    .objects
-                    .iter()
-                    .filter(|(r, o)| o.vehicle == Some(g) && o.alive && Some(**r) != w.player)
-                    .map(|(&r, o)| (r, &o.name))
-                    .collect();
+                let mut riders = by_vehicle.remove(&g).unwrap_or_default();
                 riders.sort_unstable();
                 let mut free: Vec<&(String, String)> = crew.iter().collect();
                 let aboard: Vec<(String, u32, String)> = riders
