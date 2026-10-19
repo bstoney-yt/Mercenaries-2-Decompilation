@@ -1093,6 +1093,8 @@ pub struct ShellNews {
     /// What its menus asked of the game: settings kept, a save to load
     /// or delete, leaving ([`crate::shell::Native::take_news`]).
     pub news: crate::pause::News,
+    /// The press-start screen is behind ([`crate::shell::Native::started`]).
+    pub started: bool,
 }
 
 /// What a [`GameHud`] thread runs.
@@ -2845,6 +2847,7 @@ impl Thread {
                 under,
                 new_game,
                 news: self.native.take_news(),
+                started: self.native.started(),
             }),
             pause: Box::default(),
         }

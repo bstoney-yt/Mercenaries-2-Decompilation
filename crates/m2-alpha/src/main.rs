@@ -3113,12 +3113,27 @@ fn front_end_offscreen(
     };
     eprintln!("front end: {} saves listed", settings.saves.len());
     let mut chosen = None;
+    // `M2_SHELL_PRESS_START`: start the shell from its press-start
+    // screen first, the keys counting from then.
+    let mut waiting_start = std::env::var_os("M2_SHELL_PRESS_START").is_some();
     loop {
         t += step;
         let since = up_at.map(|u| t - u);
         // Keys at 3 s, 5 s...; pictures 1.5 s before each and after the
         // last.
         let mut pressed = Vec::new();
+        // Up, the menus wait at their press-start screen: Enter each
+        // second until it takes, and the keys count from then (the legal
+        // screen before it takes a varying while).
+        if waiting_start && shell.ready() {
+            if shell.shell().started {
+                waiting_start = false;
+                eprintln!("front end: started from press-start at {t:.1} s");
+                up_at = Some(t);
+            } else if (t / 1.0).fract() < step {
+                pressed.extend([(13, true), (13, false)]);
+            }
+        }
         let mut picture = false;
         let mut pointer = None;
         let mut clicked = Vec::new();
@@ -3165,7 +3180,7 @@ fn front_end_offscreen(
             if since > 4.0 + 2.0 * keys.len() as f64 {
                 break;
             }
-        } else if t > 60.0 {
+        } else if t > if waiting_start { 180.0 } else { 60.0 } {
             eprintln!("front end: the menus did not come up in a minute");
             break;
         }
@@ -3197,7 +3212,11 @@ fn front_end_offscreen(
         let input = ui::headless_input(w, h, t);
         let state = gamehud::HudState {
             size: [w as f32, h as f32],
-            dt: if up_at.is_some() { step } else { 0.0 },
+            dt: if up_at.is_some() || (waiting_start && shell.ready()) {
+                step
+            } else {
+                0.0
+            },
             keys: pressed,
             pause_settings: settings.clone(),
             pointer,
@@ -3239,7 +3258,7 @@ fn front_end_offscreen(
                 shell.paint_over(&painter);
             }
         });
-        if up_at.is_none() && shell.ready() {
+        if up_at.is_none() && shell.ready() && !waiting_start {
             eprintln!("front end: the menus are up after {t:.1} s");
             up_at = Some(t);
         }

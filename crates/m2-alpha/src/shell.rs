@@ -163,6 +163,8 @@ pub struct Native {
     /// The press-start screen is up (`pressStartEnabled`), waiting for a
     /// key.
     press_start: bool,
+    /// A key has started the shell from it ([`Native::started`]).
+    started: bool,
     /// Calls to make at the next frame.
     pending: Vec<Call>,
     /// The save operation waiting on the profile's save.
@@ -369,9 +371,15 @@ impl Native {
     pub fn key(&mut self, code: i32) -> Vec<Call> {
         if self.press_start && code == 13 {
             self.press_start = false;
+            self.started = true;
             return vec![("startShell", Vec::new())];
         }
         Vec::new()
+    }
+
+    /// The press-start screen is behind: the shell has been started.
+    pub fn started(&self) -> bool {
+        self.started
     }
 
     /// The key or mouse button pressed while the keyboard table waited
