@@ -266,7 +266,7 @@ impl Hud {
         info: &HudInfo,
         size: (u32, u32),
         seconds: f64,
-        keys: &[i32],
+        (keys, clicks): (&[i32], &[(usize, [f32; 2])]),
         typed: bool,
         timeout: Duration,
     ) {
@@ -315,9 +315,24 @@ impl Hud {
             }
             // Held from half way to the last step (the PDA's map moves
             // while its keys are held).
+            state.pointer = None;
+            state.clicks.clear();
             state.keys = if typed {
                 const GAP: usize = 10;
                 match i.checked_sub(steps / 4) {
+                    // A click (key -1): the pointer there, then the
+                    // button down and up.
+                    Some(j) if j / GAP < keys.len() && keys[j / GAP] == -1 => {
+                        if let Some(&(_, p)) = clicks.iter().find(|(n, _)| *n == j / GAP)
+                            && j % GAP < 3
+                        {
+                            state.pointer = Some(p);
+                            if j % GAP > 0 {
+                                state.clicks.push(j % GAP == 1);
+                            }
+                        }
+                        Vec::new()
+                    }
                     Some(j) if j / GAP < keys.len() && j % GAP < 2 => {
                         vec![(keys[j / GAP], j % GAP == 0)]
                     }

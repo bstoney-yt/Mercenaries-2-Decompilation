@@ -2239,6 +2239,30 @@ impl Game {
     }
 }
 
+/// How far the world is drawn for the menus' View Distance (10 to 100, as
+/// their setters clamp it): placed models, props and ground scatter out
+/// to their usual reach at 100, a quarter of it at 10, in a line between
+/// (invented: the game's own distances for it are not known).
+pub fn view_distance_scale(v: f64) -> f32 {
+    let t = (v.clamp(10.0, 100.0) - 10.0) / 90.0;
+    (0.25 + 0.75 * t) as f32
+}
+
+impl Game {
+    /// Draws the world as far as the menus' View Distance says
+    /// ([`view_distance_scale`]).
+    pub fn set_view_distance(&mut self, v: f64) {
+        let scale = view_distance_scale(v);
+        let usual = m2_engine::WorldSettings::default();
+        if let Some(world) = &mut self.scene.world {
+            let s = &mut world.settings;
+            s.object_distance = usual.object_distance * scale;
+            s.prop_distance = usual.prop_distance * scale;
+            s.scatter_distance = usual.scatter_distance * scale;
+        }
+    }
+}
+
 /// The menus' picture options as the frame takes them: Brightness (0 to
 /// 100, 50 as the game is lit) and the advanced video screen's shadows.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3645,6 +3669,15 @@ mod tests {
 #[cfg(test)]
 mod picture_tests {
     use super::Picture;
+
+    #[test]
+    fn view_distance_draws_a_quarter_to_all_of_the_usual_reach() {
+        use super::view_distance_scale;
+        assert_eq!(view_distance_scale(100.0), 1.0);
+        assert_eq!(view_distance_scale(10.0), 0.25);
+        assert_eq!(view_distance_scale(0.0), 0.25);
+        assert_eq!(view_distance_scale(55.0), 0.625);
+    }
 
     #[test]
     fn brightness_is_a_stop_either_way_and_shadows_can_go() {

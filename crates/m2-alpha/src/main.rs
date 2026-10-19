@@ -264,6 +264,9 @@ struct Options {
     /// contract, 87 W to move the map) half way through the HUD's run and
     /// held to its end.
     pda_keys: Vec<i32>,
+    /// Clicks among them (`--pda-click x,y`, screen pixels): the key slot
+    /// each takes, and where.
+    pda_clicks: Vec<(usize, [f32; 2])>,
     /// With `--mission --screenshot`: take the picture from this far from
     /// the nearest marker, looking at it.
     mission_look: Option<f32>,
@@ -697,6 +700,15 @@ fn parse_args() -> anyhow::Result<Options> {
                     .parse()
                     .context("--pda-key expects a Flash key code")?,
             ),
+            "--pda-click" => {
+                let v = value()?;
+                let (x, y) = v
+                    .split_once(',')
+                    .and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))
+                    .context("--pda-click expects x,y")?;
+                o.pda_clicks.push((o.pda_keys.len(), [x, y]));
+                o.pda_keys.push(CLICK);
+            }
             "--behind" => o.behind = true,
             "--slung" => {
                 o.slung = Some(match value()?.as_str() {
@@ -1088,6 +1100,17 @@ fn loading_screen(install: Option<&Install>) -> Option<loading::LoadingScreen> {
 /// Writes the game to `path`, with her cash, fuel and support stock and
 /// the scripts' own save data as the scripts hold them. Whether it was
 /// written.
+/// The world's aspect ratio in a `w` x `h` picture: the picture's, or
+/// 4:3 with the video screen's Aspect Ratio at 4:3 (the world as on a
+/// 4:3 screen, stretched over the picture).
+fn view_aspect(window: &config::WindowConfig, w: u32, h: u32) -> f32 {
+    if window.wide {
+        w as f32 / h.max(1) as f32
+    } else {
+        4.0 / 3.0
+    }
+}
+
 /// `--shell-click`'s place among the `--shell-key`s.
 const CLICK: i32 = -1;
 
@@ -1488,7 +1511,7 @@ fn screenshot(
         game.on_foot = false;
     }
     let fov = config.camera.fov;
-    let aspect = w as f32 / h as f32;
+    let mut aspect = w as f32 / h as f32;
     let tick = TICK.as_secs_f32();
     // Characters a little way into their clip, mid-stride when moving.
     game.scene.tick(0.4);
@@ -2121,7 +2144,7 @@ fn screenshot(
             &info,
             (w, h),
             seconds,
-            &options.pda_keys,
+            (&options.pda_keys, &options.pda_clicks),
             options.pause,
             Duration::from_secs(120),
         );
@@ -2144,6 +2167,25 @@ fn screenshot(
                         Some(_) => "fullscreen at that mode",
                         None => "resized to it",
                     }
+                );
+            }
+            // What play would do with it: the settings kept go into the
+            // settings file and the picture; Quit goes back to the front
+            // end.
+            if let Some(s) = &news.settings {
+                settings.keep_menu_settings(s);
+                game.picture.brightness = s.brightness;
+                game.set_view_distance(s.view_distance);
+                aspect = view_aspect(&settings.window, w, h);
+                eprintln!(
+                    "pause: settings kept: brightness {}, view distance {}, wide {}, subtitles {}",
+                    s.brightness, s.view_distance, s.wide, s.subtitles
+                );
+            }
+            if news.quit {
+                eprintln!(
+                    "pause: Quit: the alpha would start again with {:?}",
+                    args_front_end(std::env::args().skip(1))
                 );
             }
             if news != pause::News::default() {
@@ -6971,7 +7013,7 @@ impl Running {
             &mut self.backend,
             &mut self.game,
             config.camera.fov,
-            w as f32 / h as f32,
+            view_aspect(&config.window, w, h),
             Some(&mut self.hud),
         )?;
         self.fps.1 += 1;
@@ -7111,10 +7153,8 @@ impl Running {
     /// The player's options as the game's pause menu shows them, with the
     /// window as it is and the saves there are.
     fn pause_settings(&self, config: &Config) -> pause::Settings {
-        let size = self.window.inner_size();
         pause::Settings {
             profile: self.game.scene.hero.full_name().into(),
-            wide: size.width * 2 > size.height * 3,
             video: display::current(&self.window),
             modes: display::modes(self.window.current_monitor().as_ref()),
             saves: pause_saves(self.game.scene.hero),
@@ -7153,6 +7193,7 @@ impl Running {
             brightness: o.brightness,
             shadows: o.advanced_video[3] != 0.0,
         };
+        self.game.set_view_distance(o.view_distance);
         if let Some(m) = &mut self.mission {
             m.set_options(o.subtitles, o.tutorials);
         }
@@ -7970,6 +8011,14 @@ mod tests {
             args_loading(args, std::path::Path::new("new.toml")),
             ["--alpha", "--mission", "--load", "new.toml"]
         );
+    }
+
+    #[test]
+    fn four_by_three_keeps_its_shape_on_any_window() {
+        let mut w = config::WindowConfig::default();
+        assert_eq!(view_aspect(&w, 1920, 1080), 1920.0 / 1080.0);
+        w.wide = false;
+        assert_eq!(view_aspect(&w, 1920, 1080), 4.0 / 3.0);
     }
 
     #[test]

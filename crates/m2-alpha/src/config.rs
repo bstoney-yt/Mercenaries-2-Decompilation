@@ -120,6 +120,9 @@ pub struct WindowConfig {
     /// Refresh Rate); 0 is the monitor's own mode, borderless.
     pub refresh: u32,
     pub vsync: bool,
+    /// The video screen's Aspect Ratio: wide, or 4:3 (the world seen as
+    /// on a 4:3 screen, filling the window).
+    pub wide: bool,
 }
 
 impl Default for WindowConfig {
@@ -130,6 +133,7 @@ impl Default for WindowConfig {
             fullscreen: false,
             refresh: 0,
             vsync: true,
+            wide: true,
         }
     }
 }
@@ -195,6 +199,7 @@ impl Config {
             pad: o.pad_sensitivity,
             rumble: o.rumble,
             vsync: self.window.vsync,
+            wide: self.window.wide,
             brightness: o.brightness,
             view_distance: o.view_distance,
             sfx: o.sfx_volume,
@@ -227,6 +232,7 @@ impl Config {
         self.camera.invert_y = s.invert_mouse;
         self.camera.mouse_sensitivity = crate::pause::mouse_radians(s.mouse);
         self.window.vsync = s.vsync;
+        self.window.wide = s.wide;
     }
 
     /// Writes the settings to the settings file ([`Config::default_path`]),

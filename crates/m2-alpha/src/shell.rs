@@ -432,9 +432,12 @@ impl Native {
                 }
                 Err(_) => false,
             },
-            // Its aspect ratio (16:9 or 4:3): the movie keeps which; the
-            // alpha draws to the window's shape either way.
-            "LTIVideoSwitchMode" => true,
+            // Its Aspect Ratio switched between wide and 4:3: kept with
+            // the rest on Accept.
+            "LTIVideoSwitchMode" => {
+                self.editing.wide = !self.editing.wide;
+                true
+            }
             // Accept: the Resolution and Refresh Rate stepped, and the
             // screen's other items as reported.
             n if n == VIDEO_ACCEPT => {
@@ -709,6 +712,11 @@ impl Native {
         vec![
             ("LTIVideoSetRes", vec![text(&video.resolution_text())]),
             ("LTIVideoSetRefresh", vec![text(&video.refresh_text())]),
+            // 1 is wide (`videoWidescreen = Number(val) == 1`).
+            (
+                "LTIVideoSetMode",
+                vec![Value::Number(f64::from(u8::from(s.wide)))],
+            ),
             (
                 "LTIVideoSetGamma",
                 vec![Value::Number(s.brightness.round())],
@@ -1077,6 +1085,7 @@ mod tests {
         assert_eq!(
             shown(n.calls(&s))[2..],
             [
+                "LTIVideoSetMode 1",
                 "LTIVideoSetGamma 70",
                 "LTIVideoSetVideoViewDistance 40",
                 "LTIVideoSetVSync 0",

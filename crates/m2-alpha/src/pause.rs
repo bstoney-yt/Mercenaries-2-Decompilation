@@ -406,8 +406,10 @@ pub struct Native {
     /// The keyboard table's screen.
     table: KeyScreen,
     /// The video screen's Resolution and Refresh Rate as the player has
-    /// stepped them, applied when the changes are kept.
+    /// stepped them, and its Aspect Ratio (wide), applied when the changes
+    /// are kept.
     video: Video,
+    wide: bool,
 }
 
 impl Native {
@@ -425,6 +427,7 @@ impl Native {
         if !std::mem::replace(&mut self.set_up, true) {
             self.settings = settings.clone();
             self.video = settings.video;
+            self.wide = settings.wide;
             calls.extend([
                 ("setPlatform", vec![text("PC")]),
                 ("setTerritory", vec![text("EN")]),
@@ -489,9 +492,13 @@ impl Native {
                 self.pending.extend(self.video_calls().into_iter().skip(1));
                 true
             }
-            // Its aspect ratio (16:9 or 4:3) switched: the movie keeps
-            // which; the alpha draws to the window's shape either way.
-            "LTIVideoSwitchMode" => true,
+            // Its Aspect Ratio switched between wide and 4:3: the movie
+            // keeps which, and reports nothing; the engine keeps it too,
+            // kept with the rest on `pauseSave`.
+            "LTIVideoSwitchMode" => {
+                self.wide = !self.wide;
+                true
+            }
             "LTIInputGeneralEnter" => {
                 self.pending.extend(self.controls_calls());
                 true
@@ -532,6 +539,7 @@ impl Native {
                 // Its `applyChanges` reports no Resolution or Refresh
                 // Rate: the engine's own stepping is what is kept.
                 self.settings.video = self.video;
+                self.settings.wide = self.wide;
                 self.news.video = Some(self.video);
                 self.news.settings = Some(self.settings.clone());
                 true
@@ -539,6 +547,7 @@ impl Native {
             "pauseCancel" => {
                 // Back as they were, sliders heard included.
                 self.video = self.settings.video;
+                self.wide = self.settings.wide;
                 self.news.settings = Some(self.settings.clone());
                 self.news.volumes =
                     Some([self.settings.sfx, self.settings.music, self.settings.dialog]);
@@ -683,12 +692,11 @@ impl Native {
     }
 
     fn video_calls(&self) -> Vec<Call> {
-        let s = &self.settings;
         vec![
             // 1 is wide (`videoModeVar = val == 1`, its WIDE button).
             (
                 "LTIVideoSetMode",
-                vec![Value::Number(f64::from(u8::from(s.wide)))],
+                vec![Value::Number(f64::from(u8::from(self.wide)))],
             ),
             (
                 "LTIVideoSetResolution",
