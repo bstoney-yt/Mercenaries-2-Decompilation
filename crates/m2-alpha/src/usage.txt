@@ -196,7 +196,8 @@ m2-alpha [options]
                          it and take it with the use key, logging where she
                          is after (context-check lines)
   --dialog-keys <keys>   with --mission --after-contract: the keys pressed in a
-                         dialog box the scripts put up (up, down, accept,
+                         dialog box the scripts put up (up, down, left,
+                         right, accept,
                          back; comma-separated), the first 3 s after it
                          opens and each 2 s on (dialog-check lines)
   --medevac <s>          with --mission --after-contract: this long after the
