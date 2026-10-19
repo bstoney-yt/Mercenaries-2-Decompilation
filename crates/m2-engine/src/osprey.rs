@@ -47,7 +47,40 @@ const LEFT_NACELLE: u16 = 1;
 const LEFT_ROTOR: u16 = 2;
 const RIGHT_NACELLE: u16 = 3;
 const RIGHT_ROTOR: u16 = 4;
-const NODES: usize = 5;
+/// Markers with no geometry: the pilot's weapons' hardpoints, a missile
+/// rail under each stub wing and a gun each side of the chin.
+const MISSILE_L: u16 = 5;
+const MISSILE_R: u16 = 6;
+const GUN_L: u16 = 7;
+const GUN_R: u16 = 8;
+const NODES: usize = 9;
+/// The nodes that carry geometry.
+#[cfg(test)]
+const DRAWN: usize = 5;
+/// Seconds between one bomb and the next from its bay (invented).
+const BOMB_GAP: f32 = 1.0;
+
+/// The hardpoints' node names, which its armament
+/// ([`crate::standin`]) mounts its weapons at: the left and right missile
+/// rails, then the left and right guns.
+pub fn hardpoints() -> [u32; 4] {
+    [
+        name_hash("v22_hp_missile_l"),
+        name_hash("v22_hp_missile_r"),
+        name_hash("v22_hp_gun_l"),
+        name_hash("v22_hp_gun_r"),
+    ]
+}
+
+/// The Osprey's bomb bay, under the middle of its fuselage, dropping
+/// bombs that burst as `blast` does.
+pub fn bomb_bay(blast: Option<crate::weapons::Blast>) -> crate::vehicle::BombBay {
+    crate::vehicle::BombBay {
+        at: layout().bay,
+        blast,
+        gap: BOMB_GAP,
+    }
+}
 
 /// How far the nacelles tilt forward at full speed, radians (80°), and
 /// the forward speed that brings them there, m/s (invented).
@@ -131,6 +164,7 @@ pub fn vehicle(entry: &CatalogueEntry) -> (VehicleSpec, CpuModel) {
         tuning: VehicleTuning::default(),
         rotors: rotor_specs(&rest),
         tilts: tilt_specs(&rest),
+        bomb_bay: None,
         damage: None,
         rest,
     };
@@ -161,12 +195,17 @@ pub fn tilt_at(speed: f32) -> f32 {
 }
 
 fn node_names() -> [u32; NODES] {
+    let [ml, mr, gl, gr] = hardpoints();
     [
         name_hash("v22_body"),
         name_hash("v22_nacelle_l"),
         name_hash("v22_proprotor_l"),
         name_hash("v22_nacelle_r"),
         name_hash("v22_proprotor_r"),
+        ml,
+        mr,
+        gl,
+        gr,
     ]
 }
 
@@ -338,6 +377,8 @@ struct Layout {
     door: Vec3,
     /// The tail fins' boxes, for the logos.
     fins: Vec<(Vec3, Vec3)>,
+    /// Where bombs leave its belly.
+    bay: Vec3,
 }
 
 /// The turn standing a nacelle up from the file's forward-flight pose:
@@ -389,6 +430,19 @@ fn layout() -> &'static Layout {
             rest[usize::from(rotor)] = Mat4::from_translation(hub + lift);
         }
         let (lo, hi) = (flo, fhi);
+        // The missile rails under the stub wings' outer ends, the guns
+        // either side of the chin.
+        for (node, left) in [(MISSILE_L, true), (MISSILE_R, false)] {
+            let (plo, phi) = bounds_of(side(&named("Short_pylon"), left));
+            let at = Vec3::new(if left { plo.x } else { phi.x }, plo.y, phi.z);
+            rest[usize::from(node)] = Mat4::from_translation(at + lift);
+        }
+        let (nlo, nhi) = bounds_of(named("Cockpit_nose"));
+        // Below the cockpit's nose, at the fuselage's belly.
+        let chin = Vec3::new((nlo.x + nhi.x) * 0.5, lo.y + 0.4, nhi.z - 0.8);
+        let spread = Vec3::X * (nhi.x - nlo.x) * 0.3;
+        rest[usize::from(GUN_L)] = Mat4::from_translation(chin - spread + lift);
+        rest[usize::from(GUN_R)] = Mat4::from_translation(chin + spread + lift);
         let glazing = named("Cockpit_side_glazing");
         let cockpit = centroid(glazing.iter().copied());
         let (glo, ghi) = bounds_of(glazing);
@@ -415,6 +469,7 @@ fn layout() -> &'static Layout {
             // Outside the cabin door, on the ground.
             door: Vec3::new(door.x + lift.x + (door.x + lift.x).signum(), 0.0, door.z),
             fins,
+            bay: Vec3::new((lo.x + hi.x) * 0.5, lo.y - 0.4, (lo.z + hi.z) * 0.5) + lift,
         }
     })
 }
@@ -661,7 +716,7 @@ mod tests {
     #[test]
     fn the_osprey_has_a_body_two_nacelles_and_two_proprotors() {
         let cpu = model();
-        assert_eq!(cpu.pieces.len(), NODES);
+        assert_eq!(cpu.pieces.len(), DRAWN);
         assert_eq!(cpu.materials.len(), MATERIALS);
         for p in &cpu.pieces {
             let stride = p.vertex_desc.layout.stride() as usize;
@@ -710,6 +765,24 @@ mod tests {
             "{seat}"
         );
         assert!(spec.door.is_some());
+    }
+
+    #[test]
+    fn its_weapons_sit_on_its_stub_wings_and_chin_and_its_bombs_under_it() {
+        let (spec, _) = osprey();
+        let at = |n: u16| spec.rest[usize::from(n)].w_axis.truncate();
+        let (lo, hi) = spec.hull;
+        // A missile rail each side, out past the fuselage.
+        assert!(at(MISSILE_L).x < 0.0 && at(MISSILE_R).x > 0.0);
+        assert!(at(MISSILE_R).x > hi.x * 0.8, "{} {hi}", at(MISSILE_R));
+        // The guns in the nose, low.
+        for g in [GUN_L, GUN_R] {
+            assert!(at(g).z > lo.z + (hi.z - lo.z) * 0.75, "{}", at(g));
+            assert!(at(g).y < (lo.y + hi.y) * 0.5);
+        }
+        let bay = bomb_bay(None);
+        assert!(bay.at.y < lo.y && bay.at.y > 0.0, "{} {lo}", bay.at);
+        assert_eq!(&spec.node_names[5..], &hardpoints());
     }
 
     #[test]

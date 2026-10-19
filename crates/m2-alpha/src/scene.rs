@@ -2238,7 +2238,13 @@ impl Scene {
             };
             let t = db.tuning_for(&spec.label, spec.model);
             let arm = db.armament_for(&spec.label, spec.model);
-            spec.tuned(t).armed_with(arm, &db.arms)
+            let mut spec = spec.tuned(t).armed_with(arm, &db.arms);
+            // The Osprey drops the bombing run's bombs from its bay.
+            if m2_engine::osprey::is_osprey(spec.model) {
+                let blast = m2_engine::standin::bomb_blast(db);
+                spec.bomb_bay = Some(m2_engine::osprey::bomb_bay(blast));
+            }
+            spec
         };
         match loaded {
             Loaded::Catalogue(_) | Loaded::NoPerson(..) => {}

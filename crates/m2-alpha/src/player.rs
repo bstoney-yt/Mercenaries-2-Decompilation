@@ -1215,6 +1215,7 @@ mod tests {
             turret_box: None,
             rotors: Vec::new(),
             tilts: Vec::new(),
+            bomb_bay: None,
             damage: None,
             tuning: Default::default(),
         };

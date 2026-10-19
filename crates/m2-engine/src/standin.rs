@@ -27,8 +27,122 @@
 
 use std::collections::HashSet;
 
+use m2_assets::name_hash;
+
 use crate::osprey;
+use crate::weapons::{Armament, Blast, Mount};
 use crate::world::Templates;
+
+/// The Osprey's templates.
+pub const OSPREY_TEMPLATES: [&str; 3] = ["V22 (Delivery)", "V22 (Driver)", "V22 - DO NOT USE"];
+
+/// Whose damage the Osprey takes as: the Ka-29, the island's other
+/// armed troop transport (`Health` 300, burning below 60, light armour),
+/// in place of the V22 templates' own 100 and no damage key. Brendan's
+/// call (2026-10-18): a Mercs 2 aircraft's, not another game's.
+const DAMAGE_DONOR: &str = "Ka29b (Driver)";
+
+/// The weapons its pilot fires, the game's own Allied helicopter weapons
+/// (the Coanda Gunship's): homing AT missiles on Fire, the remote
+/// miniguns on Aim. Which mounts and where are invented.
+const MISSILE: &str = "Mounted AT Missile (1) (hp_barreltip_missileL_a)";
+const GUN: &str = "Mounted Minigun (Remote) (AL)";
+
+/// What its bomb bay drops: the bombing run's own bomb.
+const BOMB: &str = "Dumb Bomb Projectile";
+
+/// Arms the Osprey's templates and has them take damage as
+/// [`DAMAGE_DONOR`] does, keeping their own flight handling.
+pub fn arm_the_osprey(templates: &mut Templates) {
+    let donor = templates.id(DAMAGE_DONOR);
+    let armament = osprey_armament(templates);
+    for name in OSPREY_TEMPLATES {
+        for id in templates.ids(name) {
+            if let Some(a) = &armament {
+                templates.arms.armaments.insert(id, a.clone());
+            }
+            let Some(d) = donor else { continue };
+            if let Some(dt) = templates.tuning.get(&d).copied() {
+                let t = templates.tuning.entry(id).or_default();
+                t.health = dt.health;
+                t.armour = dt.armour;
+                t.blast_scale = dt.blast_scale;
+                t.burns_below = dt.burns_below;
+                t.rounds = dt.rounds;
+                t.key = dt.key;
+            }
+            if let Some(&h) = templates.health.get(&d) {
+                templates.health.insert(id, h);
+            }
+            if let Some(&m) = templates.modifiers.get(&d) {
+                templates.modifiers.insert(id, m);
+            }
+            if let Some(dur) = templates.durability.get(&d).cloned() {
+                templates.durability.insert(id, dur);
+            }
+        }
+    }
+}
+
+/// The pilot's armament: missiles alternating between the rails, guns
+/// between the chin mounts; `None` if the database lacks the weapons.
+fn osprey_armament(templates: &Templates) -> Option<Armament> {
+    let (missile, gun) = (templates.id(MISSILE)?, templates.id(GUN)?);
+    let [ml, mr, gl, gr] = osprey::hardpoints();
+    let link = |n: &str| name_hash(n);
+    let mounts = vec![
+        Mount {
+            link: link("v22_missile_l"),
+            weapon: missile,
+            hardpoint: ml,
+        },
+        Mount {
+            link: link("v22_missile_r"),
+            weapon: missile,
+            hardpoint: mr,
+        },
+        Mount {
+            link: link("v22_gun_l"),
+            weapon: gun,
+            hardpoint: gl,
+        },
+        Mount {
+            link: link("v22_gun_r"),
+            weapon: gun,
+            hardpoint: gr,
+        },
+    ];
+    Some(Armament {
+        mounts,
+        couplings: vec![
+            (link("v22_missile_l"), link("v22_missile_r")),
+            (link("v22_gun_l"), link("v22_gun_r")),
+        ],
+        seats: vec![(
+            name_hash("seat_driver"),
+            vec![link("v22_missile_l"), link("v22_gun_l")],
+        )],
+    })
+}
+
+/// What the Osprey's bombs do where they land: the blast the database's
+/// [`BOMB`] leaves (its reach, damage and push). Its `DamageKey` is not
+/// kept with the ordnance, so the blast is taken in full by all it
+/// reaches.
+pub fn bomb_blast(templates: &Templates) -> Option<Blast> {
+    let bomb = templates.id(BOMB)?;
+    let o = &templates.ordnance;
+    let blast = *o.blasts_of(bomb).first()?;
+    let b = o.blasts.get(&blast)?;
+    Some(Blast {
+        template: blast,
+        radius: b.radius,
+        damage: b.damage,
+        min_damage: b.min_damage,
+        max_force: b.force,
+        key: None,
+    })
+}
 
 /// Template models no archive holds, and the archive model drawn in their
 /// place.
@@ -163,6 +277,89 @@ mod tests {
         // Run twice, nothing doubles.
         add_supply_drops(&mut t);
         assert_eq!(t.ids("Supply Drop (Coilgun)").len(), 1);
+    }
+
+    #[test]
+    fn the_osprey_fires_missiles_and_guns_and_takes_damage_as_the_ka29() {
+        use crate::tuning::VehicleTuning;
+        let mut t = Templates::default();
+        let (v22, ka29, missile, gun) = (0x8000_75e9, 0x8000_81ff, 0x8000_9523, 0x8000_38e6);
+        for (id, name) in [
+            (v22, "V22 (Driver)"),
+            (ka29, DAMAGE_DONOR),
+            (missile, MISSILE),
+            (gun, GUN),
+        ] {
+            t.names.insert(id, name.into());
+        }
+        t.tuning.insert(
+            ka29,
+            VehicleTuning {
+                health: Some(300.0),
+                burns_below: Some(60.0),
+                armour: Some(2),
+                ..VehicleTuning::default()
+            },
+        );
+        t.tuning.insert(
+            v22,
+            VehicleTuning {
+                health: Some(100.0),
+                mass: Some(9.0),
+                ..VehicleTuning::default()
+            },
+        );
+        t.health.insert(ka29, 300.0);
+        arm_the_osprey(&mut t);
+        // The Ka-29's damage, its own handling.
+        let tuned = t.tuning[&v22];
+        assert_eq!(tuned.health, Some(300.0));
+        assert_eq!(tuned.burns_below, Some(60.0));
+        assert_eq!(tuned.armour, Some(2));
+        assert_eq!(tuned.mass, Some(9.0));
+        assert_eq!(t.health[&v22], 300.0);
+        // Missiles on Fire, guns on Aim, each pair fired in turn from the
+        // Osprey's own hardpoints.
+        let a = &t.arms.armaments[&v22];
+        let fired = a.of_seat(name_hash("seat_driver"));
+        assert_eq!(fired.len(), 2);
+        let first = a.group(fired[0]);
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|m| m.weapon == missile));
+        assert!(a.group(fired[1]).iter().all(|m| m.weapon == gun));
+        let points: Vec<u32> = a.mounts.iter().map(|m| m.hardpoint).collect();
+        assert_eq!(points, osprey::hardpoints());
+    }
+
+    #[test]
+    fn the_bombs_burst_as_the_bombing_runs_do() {
+        use crate::ordnance::{BlastInfo, ProjectileInfo};
+        let mut t = Templates::default();
+        let (bomb, boom) = (0x8000_0100, 0x8000_0101);
+        t.names.insert(bomb, BOMB.into());
+        t.ordnance.projectiles.insert(
+            bomb,
+            ProjectileInfo {
+                leaves: vec![boom],
+                ..ProjectileInfo::default()
+            },
+        );
+        t.ordnance.blasts.insert(
+            boom,
+            BlastInfo {
+                radius: 12.0,
+                damage: 400.0,
+                min_damage: 100.0,
+                force: 5.0,
+                ..BlastInfo::default()
+            },
+        );
+        let b = bomb_blast(&t).expect("a blast");
+        assert_eq!(
+            (b.template, b.radius, b.damage, b.min_damage),
+            (boom, 12.0, 400.0, 100.0)
+        );
+        assert!(bomb_blast(&Templates::default()).is_none());
     }
 
     #[test]

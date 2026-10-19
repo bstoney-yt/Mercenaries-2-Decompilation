@@ -784,6 +784,7 @@ impl Templates {
             damage,
         };
         crate::standin::add_supply_drops(&mut templates);
+        crate::standin::arm_the_osprey(&mut templates);
         (templates, atmosphere)
     }
 }

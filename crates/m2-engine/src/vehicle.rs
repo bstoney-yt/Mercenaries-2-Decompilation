@@ -262,6 +262,8 @@ pub struct VehicleSpec {
     pub rotors: Vec<RotorSpec>,
     /// Parts that tilt with speed (none but the Osprey's nacelles).
     pub tilts: Vec<TiltSpec>,
+    /// A bomb bay its driver drops bombs from (none but the Osprey's).
+    pub bomb_bay: Option<BombBay>,
     /// What its parts do as they are damaged, if its model says
     /// ([`crate::vehicle_damage`]).
     pub damage: Option<std::sync::Arc<crate::vehicle_damage::DamageModel>>,
@@ -297,6 +299,15 @@ pub struct RotorSpec {
     pub nodes: Vec<bool>,
     pub centre: Vec3,
     pub axis: Vec3,
+}
+
+/// A bomb bay: where its bombs leave it, model space, what they do where
+/// they land, and how long between one and the next.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BombBay {
+    pub at: Vec3,
+    pub blast: Option<crate::weapons::Blast>,
+    pub gap: f32,
 }
 
 /// Parts that tilt together about a pivot as the vehicle speeds up (the
@@ -649,6 +660,7 @@ impl VehicleSpec {
                 Vec::new()
             },
             tilts: Vec::new(),
+            bomb_bay: None,
         })
     }
 
@@ -1079,6 +1091,7 @@ mod tests {
             turret_box: None,
             rotors: Vec::new(),
             tilts: Vec::new(),
+            bomb_bay: None,
             damage: None,
             tuning: VehicleTuning::default(),
         }
