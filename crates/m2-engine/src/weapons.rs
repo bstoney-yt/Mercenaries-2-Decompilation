@@ -531,7 +531,20 @@ pub struct FireHint {
     /// `BurstOffCloseLength` 0.75); below 0, as far off.
     pub on_close: f32,
     pub off_close: f32,
+    /// How well it does against a target of no, light, medium and heavy
+    /// armour, 0 to 3 (`ArmorNone`, `ArmorLight`, `ArmorMedium`,
+    /// `ArmorHeavy`: four 2-bit fields of one word, names found by hashing,
+    /// gap-list sweep). The carbine's 3, 1, 0, 0; the pistol's 2, 0, 0, 0;
+    /// the AT rocket's 1, 3, 3, 3; the Stinger's 1, 3, 2, 0. Read as the
+    /// AI's rating of the gun by its target (inferred from the names and
+    /// the values: rifles against people, launchers against armour). Not
+    /// used: which armour class a vehicle or a person is has not been
+    /// read.
+    pub against: [u32; 4],
 }
+
+/// `WeaponHint`'s armour ratings ([`FireHint::against`]).
+const AGAINST: [&str; 4] = ["ArmorNone", "ArmorLight", "ArmorMedium", "ArmorHeavy"];
 
 impl FireHint {
     /// Within this of its target, metres, a soldier fires the close
@@ -550,6 +563,7 @@ impl FireHint {
             off: f("BurstOffLength")?,
             on_close: f("BurstOnCloseLength")?,
             off_close: f("BurstOffCloseLength")?,
+            against: AGAINST.map(|n| hint.word(r, name_hash(n)).unwrap_or(0)),
         })
     }
 
@@ -1486,6 +1500,16 @@ mod tests {
         assert_eq!(SCATTER_FIELDS[0], name_hash("LowSkillScatter"));
     }
 
+    // The armour ratings' names hash as the fields of `WeaponHint`'s word
+    // at 8 (bits 0, 2, 4 and 6).
+    #[test]
+    fn the_armour_ratings_are_named() {
+        assert_eq!(
+            AGAINST.map(name_hash),
+            [0xa421_1ea4, 0x1e14_e116, 0xccdc_6fc3, 0x3fc0_56f3]
+        );
+    }
+
     // The carbine's and the minigun's bursts (their `WeaponHint`s).
     #[test]
     fn bursts_follow_the_hint() {
@@ -1497,6 +1521,7 @@ mod tests {
             off: 4.5,
             on_close: -1.0,
             off_close: 0.75,
+            against: [3, 1, 0, 0],
         };
         let gap = 60.0 / 562.0;
         // 0.3 s at 562 a minute: rounds at 0, 0.107 and 0.214 s.

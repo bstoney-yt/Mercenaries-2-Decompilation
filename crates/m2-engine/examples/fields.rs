@@ -6,7 +6,7 @@
 //! cargo run --release -p m2-engine --example fields -- "<install dir>" <component> <field>...
 //! ```
 //!
-//! A field the component lacks prints `-`. Values print as floats, and as
+//! A field the component lacks prints `-`; a bit field prints its bits. Values print as floats, and as
 //! whole numbers too when the word is not a normal float. Prints numbers
 //! and template names only.
 
@@ -37,17 +37,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Layer::parse(&data)?;
     let names = db.names();
     let c = db.component(component).ok_or("no such component")?;
-    let at: Vec<Option<usize>> = fields
+    let at: Vec<Option<(usize, u8, u8)>> = fields
         .iter()
         .map(|n| {
             c.fields
                 .iter()
                 .find(|f| f.name_hash == name_hash(n))
-                .map(|f| usize::from(f.offset))
+                .map(|f| (usize::from(f.offset), f.bit_shift, f.bit_width))
         })
         .collect();
     for (n, a) in fields.iter().zip(&at) {
-        println!("# {n} @{}", a.map_or("-".to_owned(), |a| format!("{a:#x}")));
+        println!(
+            "# {n} @{}",
+            a.map_or("-".to_owned(), |(a, shift, width)| {
+                if (1..32).contains(&width) {
+                    format!("{a:#x} bits {shift}..{}", shift + width)
+                } else {
+                    format!("{a:#x}")
+                }
+            })
+        );
     }
     let mut groups: BTreeMap<Vec<u8>, Vec<&str>> = BTreeMap::new();
     for (id, r) in c.records().unwrap_or_default() {
@@ -66,15 +75,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let vals: Vec<String> = at
             .iter()
             .map(|a| {
-                a.and_then(|a| r.get(a..a + 4)).map_or("-".into(), |b| {
-                    let w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                    let f = f32::from_bits(w);
-                    if f.is_normal() || w == 0 {
-                        format!("{f:.3}")
-                    } else {
-                        format!("#{w}")
-                    }
-                })
+                a.and_then(|(a, shift, width)| Some((r.get(a..a + 4)?, shift, width)))
+                    .map_or("-".into(), |(b, shift, width)| {
+                        let w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                        if (1..32).contains(&width) {
+                            return format!("#{}", (w >> shift) & ((1 << width) - 1));
+                        }
+                        let f = f32::from_bits(w);
+                        if f.is_normal() || w == 0 {
+                            format!("{f:.3}")
+                        } else {
+                            format!("#{w}")
+                        }
+                    })
             })
             .collect();
         println!("{}\t{}\t{}", ids[0], ids.len(), vals.join("\t"));

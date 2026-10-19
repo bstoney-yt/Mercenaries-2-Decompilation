@@ -119,6 +119,7 @@ const STAND_IN: FireHint = FireHint {
     off: 9.0,
     on_close: 0.8,
     off_close: 1.5,
+    against: [3, 1, 0, 0],
 };
 /// Each pause is this much longer or shorter at random, so soldiers who
 /// see her together don't fire together (invented).

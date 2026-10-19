@@ -1208,6 +1208,12 @@ mod tests {
             ("PitchDownInertia", 0xe125_7555),
             ("HandbrakeInertia", 0x83d7_b1ab),
             ("HandbrakeSteerBoost", 0x8572_4b6b),
+            // `_CarPhysicsV2`'s @108 and @170 (gap-list sweep, by hashing;
+            // unused): `GravityFactor` 1 to 3 (2 and 1.7 on 46 records
+            // each), `CanCrush` 1 on the Monster Trucks, the EXT (monster)
+            // and the WZ551 only, 0 on the rest.
+            ("GravityFactor", 0x49e4_fde4),
+            ("CanCrush", 0x711b_067a),
             // `_CarPhysicsV2`'s bike fields (gap round 18); the
             // wheelie's named, unused.
             ("BikeRollStabilityStrength", 0x215f_7ff3),
