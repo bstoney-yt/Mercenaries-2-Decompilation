@@ -135,6 +135,9 @@ const RIDE_NEAR: f32 = 40.0;
 /// One of the scripts' vehicles she hasn't driven is taken from this far,
 /// metres: they brought it for her.
 const RIDE_FRESH: f32 = 150.0;
+/// Driving, she gets out this near an outpost's flag (metres), to walk
+/// the rest.
+const FLAG_ON_FOOT: f32 = 15.0;
 /// Out of a vehicle without a cannon this far from a target, metres.
 const GET_OUT: f32 = 40.0;
 /// Within this far of a vehicle's door she presses to get in, metres;
@@ -245,6 +248,9 @@ enum Goal {
     /// Call in the scripts' support item `key` she holds (a soldier
     /// delivery, by an outpost): the support menu, then its designator.
     Deliver(String),
+    /// Get out of the vehicle she is driving, by the place she is after
+    /// (an outpost's flag).
+    GetOut,
 }
 
 impl Goal {
@@ -257,6 +263,7 @@ impl Goal {
             (Goal::Open(a), Goal::Open(b)) => a == b,
             (Goal::Take(a), Goal::Take(b)) => a == b,
             (Goal::Deliver(a), Goal::Deliver(b)) => a == b,
+            (Goal::GetOut, Goal::GetOut) => true,
             _ => false,
         }
     }
@@ -501,6 +508,13 @@ impl Autoplay {
             Some(Goal::Open(target)) => self.open(game, target, dt),
             Some(Goal::Take(key)) => self.take(game, key, dt),
             Some(Goal::Deliver(key)) => self.deliver(game, &key),
+            Some(Goal::GetOut) => match game.scene.player.as_ref().and_then(|p| p.driving) {
+                Some(i) => {
+                    let speed = vehicle_state(game, i).map_or(0.0, |s| s.1);
+                    self.press(speed)
+                }
+                None => self.idle(game),
+            },
         }
     }
 
@@ -884,6 +898,15 @@ impl Autoplay {
                     ),
                 ));
             }
+        }
+        // An outpost's flag is taken standing by it: the scripts count
+        // those who get there as its rushers (inferred: the outpost's
+        // rusher check asks whether each is in a seat).
+        if driving.is_some() && m.kind == "outpost" && m.at.distance(here) < FLAG_ON_FOOT {
+            return Some((
+                Goal::GetOut,
+                format!("getting out by {}, to take it on foot", m.name),
+            ));
         }
         Some((
             Goal::Reach {
