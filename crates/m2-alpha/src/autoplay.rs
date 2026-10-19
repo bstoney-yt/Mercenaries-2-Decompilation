@@ -112,6 +112,9 @@ const GET_OUT: f32 = 40.0;
 /// Within this far of a vehicle's door she presses to get in, metres;
 /// presses are this far apart, seconds (a press gets her in or out).
 const DOOR: f32 = 2.5;
+/// Within this of a crewed vehicle's middle she starts its hijack,
+/// metres (invented; m2-alpha's `HIJACK_REACH` is 6).
+const HIJACK_NEAR: f32 = 5.0;
 const PRESS_GAP: f32 = 1.5;
 /// Fallen this far under the ground (metres: a hole where the island
 /// hadn't streamed in yet), she is put back on it.
@@ -1351,6 +1354,16 @@ impl Autoplay {
         );
         let here = p.character.position;
         if (door - here).with_y(0.0).length() < DOOR {
+            return self.press(0.0);
+        }
+        // Crewed and taken only by its hijack (PmcCon001's villa tank):
+        // the key anywhere close by starts it, door or not (round 4 stood
+        // 3 m off its door for minutes, the way to it blocked).
+        let v = &game.scene.vehicles[i];
+        if game.hijack_only.contains(&v.spec.model)
+            && !v.crew.is_empty()
+            && (m.w_axis.truncate() - here).length() < HIJACK_NEAR
+        {
             return self.press(0.0);
         }
         self.walk(game, door, 1.0, dt)
