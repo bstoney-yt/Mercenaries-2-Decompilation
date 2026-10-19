@@ -12,6 +12,7 @@
 use std::path::Path;
 
 use m2_assets::layer::{LAYER_TYPE, Layer, TEMPLATE_DB_TYPE};
+use m2_assets::name_hash;
 use m2_engine::Install;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,6 +37,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
     let db = Layer::parse(&data)?;
+    // `damage`: the damage table's kinds of damage (its columns), as name
+    // hashes, with the `Car` row's scale for each.
+    if args.get(1).map(String::as_str) == Some("damage") {
+        let bytes = source.asset(
+            name_hash(m2_engine::tuning::DAMAGE_TABLE),
+            m2_engine::tuning::DAMAGE_TABLE_TYPE,
+        )?;
+        let table = m2_engine::tuning::DamageTable::parse(&bytes).ok_or("no damage table")?;
+        let (rows, columns) = table.keys();
+        println!("{} rows, {} columns", rows.len(), columns.len());
+        for &c in columns {
+            println!(
+                "column {c:08x}\tCar {:?}\tTank {:?}",
+                table.scale(name_hash("Car"), c),
+                table.scale(name_hash("Tank"), c)
+            );
+        }
+        return Ok(());
+    }
     // `hijack`: the templates a hijack script takes (their entrances), of
     // those with a `_HelicopterPhysics` record: the helicopters the hook
     // can end in a hijack of.

@@ -1122,6 +1122,21 @@ impl Game {
                 &mut self.destruction,
                 self.scene.install.as_ref(),
             );
+            // Vehicles running into each other hurt each other and the
+            // parts where they met.
+            for (struck, other, closing, damage) in self
+                .combat
+                .vehicle_crashes(&mut world.physics, &mut self.scene.vehicles)
+            {
+                let v = &self.scene.vehicles[struck];
+                eprintln!(
+                    "crash: the {} hit by the {} at {closing:.1} m/s takes {damage:.1} ({:.0} of {:.0} left)",
+                    v.spec.label,
+                    self.scene.vehicles[other].spec.label,
+                    (v.most_health() - v.damage).max(0.0),
+                    v.most_health()
+                );
+            }
             // What came down (to a vehicle, the traffic's too, or a blast
             // last tick) comes down whether she is on foot or the free
             // camera flies: its island copy has lost its collision already.
