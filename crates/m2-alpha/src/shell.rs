@@ -377,6 +377,12 @@ impl Native {
         Vec::new()
     }
 
+    /// The video screen's Aspect Ratio as the movie has it now (its
+    /// `videoWidescreen`, true for wide), kept with the rest on Accept.
+    pub fn set_wide(&mut self, wide: bool) {
+        self.editing.wide = wide;
+    }
+
     /// The press-start screen is behind: the shell has been started.
     pub fn started(&self) -> bool {
         self.started
@@ -440,12 +446,10 @@ impl Native {
                 }
                 Err(_) => false,
             },
-            // Its Aspect Ratio switched between wide and 4:3: kept with
-            // the rest on Accept.
-            "LTIVideoSwitchMode" => {
-                self.editing.wide = !self.editing.wide;
-                true
-            }
+            // Its Aspect Ratio switched between wide and 4:3: which it is
+            // now the host reads from the movie ([`Native::set_wide`]);
+            // kept with the rest on Accept.
+            "LTIVideoSwitchMode" => true,
             // Accept: the Resolution and Refresh Rate stepped, and the
             // screen's other items as reported.
             n if n == VIDEO_ACCEPT => {

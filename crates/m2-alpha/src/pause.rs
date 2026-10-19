@@ -413,6 +413,12 @@ pub struct Native {
 }
 
 impl Native {
+    /// The video screen's Aspect Ratio as the movie has it now (its
+    /// `videoModeVar`, true for wide), kept with the rest on `pauseSave`.
+    pub fn set_wide(&mut self, wide: bool) {
+        self.wide = wide;
+    }
+
     /// A movie (re)started: it is set up again.
     pub fn reset(&mut self) {
         self.set_up = false;
@@ -492,13 +498,10 @@ impl Native {
                 self.pending.extend(self.video_calls().into_iter().skip(1));
                 true
             }
-            // Its Aspect Ratio switched between wide and 4:3: the movie
-            // keeps which, and reports nothing; the engine keeps it too,
+            // Its Aspect Ratio switched between wide and 4:3: which it is
+            // now the host reads from the movie ([`Native::set_wide`]),
             // kept with the rest on `pauseSave`.
-            "LTIVideoSwitchMode" => {
-                self.wide = !self.wide;
-                true
-            }
+            "LTIVideoSwitchMode" => true,
             "LTIInputGeneralEnter" => {
                 self.pending.extend(self.controls_calls());
                 true
@@ -850,10 +853,16 @@ impl Settings {
             ("gameInvertVar", _) => self.invert_pad = on,
             ("gameRumbleVar", _) => self.rumble = on,
             ("videoVsyncVar", _) => self.vsync = on,
+            // The advanced screen's Shadows (the front end's fourth
+            // option).
+            ("advvideoEnableShadowsVar", _) => self.advanced[3] = f64::from(u8::from(on)),
             ("controlsMouseSensVar", Some(v)) => self.mouse = v,
             ("gameSensitivityVar", Some(v)) => self.pad = v,
             ("videoGammaVar", Some(v)) => self.brightness = v,
-            ("videoViewDistance" | "videoViewDistanceVar", Some(v)) => self.view_distance = v,
+            // Reported 10 less than it is (`videoViewDistance = val - 10` in
+            // the setters): 10 to 100.
+            ("videoViewDistance", Some(v)) => self.view_distance = (v + 10.0).min(100.0),
+            ("videoViewDistanceVar", Some(v)) => self.view_distance = v.max(10.0),
             ("audioSFXVolumeVar", Some(v)) => self.sfx = v,
             ("audioMusicVolumeVar", Some(v)) => self.music = v,
             ("audioDialogVolumeVar", Some(v)) => self.dialog = v,

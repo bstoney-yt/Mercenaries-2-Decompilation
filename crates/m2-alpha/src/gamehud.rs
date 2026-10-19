@@ -2770,6 +2770,13 @@ impl Thread {
         }
         let video = state.pause_settings.video;
         for (name, arg) in take_library_calls(self.mission.lua()) {
+            // As the pause menu's: which Aspect Ratio is the movie's own
+            // `videoWidescreen`.
+            if name == "LTIVideoSwitchMode"
+                && let Some(wide) = self.movie_bool(crate::shell::MOVIE, "videoWidescreen")
+            {
+                self.native.set_wide(wide);
+            }
             let answered = self
                 .native
                 .library(&name, &arg, video, &state.pause_settings.modes);
@@ -2902,6 +2909,16 @@ impl Thread {
         }
     }
 
+    /// The variable `name` on movie `swf`'s root, if it is a boolean.
+    fn movie_bool(&mut self, swf: &str, name: &str) -> Option<bool> {
+        let m = self.flash.values_mut().find(|m| m.swf == swf)?;
+        let root = flash::avm1::Value::Object(m.rt.avm.clip_object(m.rt.player.root));
+        match m.rt.avm.get(&mut m.rt.player, &root, name) {
+            flash::avm1::Value::Bool(b) => Some(b),
+            _ => None,
+        }
+    }
+
     /// A fanfare movie is playing (`fanfare_mission`...).
     fn fanfare_up(&self) -> bool {
         self.flash.values().any(|m| m.swf.contains("fanfare"))
@@ -2943,6 +2960,14 @@ impl Thread {
     /// pause movie's commands no script heard, for the engine.
     fn pause_answers(&mut self, log: &mut Vec<String>) {
         for (name, arg) in take_library_calls(self.mission.lua()) {
+            // Its Aspect Ratio says only that it switched (as the item is
+            // clicked, and again as the changes are kept): which it is
+            // now is the movie's own `videoModeVar`.
+            if name == "LTIVideoSwitchMode"
+                && let Some(wide) = self.movie_bool(PAUSE_MOVIE, "videoModeVar")
+            {
+                self.pause_native.set_wide(wide);
+            }
             let answered = self.pause_native.library(&name, &arg);
             log.push(format!(
                 "pause: LTILibName.{name}({arg}){}",
