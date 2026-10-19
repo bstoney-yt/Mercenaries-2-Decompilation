@@ -554,6 +554,9 @@ pub struct ScriptWorld {
     /// layers that aren't in, and scripts measure to them.
     pub entities: HashMap<u32, [f32; 3]>,
     pub entity_names: HashMap<String, u32>,
+    /// A save's script data to load, as Lua text ([`crate::savedata`]):
+    /// while it is here `Pg.LoadGame` answers that a save is loading.
+    pub saved: Option<String>,
     /// `Player.SetHealthClamp` and `Player.SetSurvivalMode`, as last set.
     pub health_clamp: bool,
     pub survival_mode: bool,
@@ -2496,11 +2499,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&pg, "LoadIsRetry", |_, _, _| {
         values([Value::Boolean(false)])
     })?;
-    // No saves yet: every load is a new game, which the bootstrap starts
-    // itself (`LoadSingleton(nil)`) when this answers false.
+    // The bootstrap's `Init` asks (`Pg.LoadGame("InitialSaveData")`)
+    // whether a save is loading. Answered false, it starts a new game
+    // itself (`LoadSingleton(nil)`); answered true it doesn't, and is
+    // handed the save's data (`LoadSingleton(data)`) by the engine, here
+    // by `Mission::start` (from the bootstrap's bytecode; the engine's
+    // side is not read).
     add(&pg, "LoadGame", |w, _, _| {
         w.commands.push(Command::Notify("Pg.LoadGame".into()));
-        values([Value::Boolean(false)])
+        values([Value::Boolean(w.saved.is_some())])
     })?;
 
     // The game's ears on the scripts' support items: `MrxSupportData`'s
@@ -4152,6 +4159,20 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn load_game_says_a_save_loads_only_while_one_is_pending() {
+        let (host, world) = setup();
+        let ask = || -> bool {
+            host.lua()
+                .load(r#"return Pg.LoadGame("InitialSaveData")"#)
+                .eval()
+                .unwrap()
+        };
+        assert!(!ask(), "a new game");
+        world.borrow_mut().saved = Some("{}".into());
+        assert!(ask(), "a save to load");
     }
 
     #[test]

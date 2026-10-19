@@ -353,6 +353,15 @@ struct Options {
     /// contracts (the first, then the story's next ones) before she stops
     /// (`--contracts`, default 1).
     contracts: u32,
+    /// A save to start from (`--load`): her place, the world's wrecks
+    /// and, with the scripts, their own data.
+    load: Option<save::SaveGame>,
+    /// Seconds into play to load the player's own save, as the pause menu does
+    /// (`--load-at`).
+    load_at: Option<f32>,
+    /// With `--screenshot`, where to write a save once the run ends
+    /// (`--save-to`).
+    save_to: Option<PathBuf>,
     /// The whole game as it launches: the boot movies, the front end, the
     /// first contract with its movies, then on (also with no options).
     alpha: bool,
@@ -577,6 +586,9 @@ fn parse_args() -> anyhow::Result<Options> {
                 );
             }
             "--seated" => o.seated = true,
+            "--load" => o.load = Some(save::SaveGame::read(&PathBuf::from(value()?))?),
+            "--save-to" => o.save_to = Some(value()?.into()),
+            "--load-at" => o.load_at = Some(value()?.parse().context("--load-at expects seconds")?),
             "--mission-driver" => {
                 let path = value()?;
                 let code =
@@ -901,6 +913,8 @@ fn main() -> anyhow::Result<()> {
         no_boot: options.no_boot,
         skip_mode_off: options.skip_mode_off,
         guns: options.guns.clone(),
+        load: options.load.clone(),
+        load_at: options.load_at,
         state: None,
         error: None,
     };
@@ -1100,12 +1114,44 @@ fn write_save(game: &Game, mission: Option<&mission::MissionLink>, path: &std::p
                 s.pmc.as_ref().map_or(0.0, |p| p.cash),
                 s.scripts.as_ref().map_or(0, String::len)
             );
+            if let Some(c) = mission.and_then(mission::MissionLink::contracts) {
+                eprintln!("game saved with {c}");
+            }
             true
         }
         Err(e) => {
             eprintln!("could not save: {e:#}");
             false
         }
+    }
+}
+
+/// The launch's arguments `args` with `--load save` in place of any
+/// `--load` they had, and without `--load-at` (which would load again).
+fn args_loading(args: impl IntoIterator<Item = String>, save: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(a) = args.next() {
+        if a == "--load" || a == "--load-at" {
+            args.next();
+        } else {
+            out.push(a);
+        }
+    }
+    out.extend(["--load".to_owned(), save.display().to_string()]);
+    out
+}
+
+/// Starts the alpha again as it was launched, from the save at `save`
+/// (`--load`): loading a save with the scripts' data starts the world
+/// and the scripts afresh, as the game does. The caller then closes.
+fn relaunch(save: &std::path::Path) {
+    let args = args_loading(std::env::args().skip(1), save);
+    match std::env::current_exe()
+        .and_then(|exe| std::process::Command::new(exe).args(&args).spawn())
+    {
+        Ok(_) => eprintln!("load: started again with --load {}", save.display()),
+        Err(e) => eprintln!("load: could not start again: {e}"),
     }
 }
 
@@ -1572,6 +1618,12 @@ fn screenshot(
             aspect,
             out,
         )?);
+    } else if let Some(s) = &options.load {
+        // Without the scripts only the world's part loads.
+        game.load(s.clone());
+    }
+    if let Some(path) = &options.save_to {
+        write_save(&game, link.as_ref(), path);
     }
     if options.gates {
         if let Some(install) = install {
@@ -3187,6 +3239,7 @@ fn mission_for_screenshot(
 ) -> anyhow::Result<mission::MissionLink> {
     let tick = TICK.as_secs_f32();
     let mut link = mission::MissionLink::start(install, options.mission_drivers.clone())
+        .with_save(options.load.clone())
         .with_support(options.support.clone())
         .with_movies(options.movies)
         .with_skip_mode_off(options.skip_mode_off);
@@ -6384,6 +6437,12 @@ struct Running {
     cheat_code: cheats::CodeWatch,
     /// The code was typed: the cheat menu comes up on the next frame.
     cheat_typed: bool,
+    /// A load asked to start the scripts again from this save: the alpha
+    /// starts afresh with it ([`relaunch`]).
+    relaunch: Option<std::path::PathBuf>,
+    /// When to load the player's own save as the pause menu does (`--load-at`):
+    /// a test of loading in play.
+    load_at: Option<Instant>,
 }
 
 struct App {
@@ -6421,6 +6480,10 @@ struct App {
     skip_mode_off: bool,
     /// Weapons to start with (`--gun`).
     guns: Vec<String>,
+    /// A save to start from (`--load`).
+    load: Option<save::SaveGame>,
+    /// Seconds into play to load the player's own save (`--load-at`).
+    load_at: Option<f32>,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -6507,6 +6570,7 @@ impl App {
             mission: match (&self.install, &self.mode) {
                 (Some(install), Mode::Island(_)) if self.mission => Some(
                     mission::MissionLink::start(install, self.mission_drivers.clone())
+                        .with_save(self.load.take())
                         .with_keys(self.config.keys.clone())
                         .with_support(self.support.clone())
                         .with_movies(self.alpha)
@@ -6537,6 +6601,10 @@ impl App {
             cheats: cheats::Toggles::default(),
             cheat_code: cheats::CodeWatch::default(),
             cheat_typed: false,
+            relaunch: None,
+            load_at: self
+                .load_at
+                .map(|s| Instant::now() + Duration::from_secs_f32(s)),
         };
         running.apply_options(&self.config);
         Ok(running)
@@ -7077,6 +7145,15 @@ impl Running {
     fn load_from(&mut self, path: &std::path::Path) {
         let path = path.to_path_buf();
         match save::SaveGame::read(&path) {
+            // The scripts' part loads only into scripts starting afresh,
+            // as the game loads a save into a world started again.
+            Ok(s) if s.scripts.is_some() && self.mission.is_some() => {
+                eprintln!(
+                    "load: {} has the scripts' data: the game starts again from it",
+                    path.display()
+                );
+                self.relaunch = Some(path);
+            }
             Ok(mut s) => {
                 let pmc = s.pmc.take();
                 self.game.load(s);
@@ -7292,6 +7369,12 @@ impl Running {
         if self.input.take_pressed(Action::QuickLoad) && dev {
             self.load_game();
         }
+        // `--load-at`: the same load, by the clock, to test it in a window.
+        if self.load_at.is_some_and(|at| Instant::now() >= at) {
+            self.load_at = None;
+            eprintln!("load: --load-at: loading as the pause menu does");
+            self.load_from(&save::SaveGame::default_path());
+        }
         if self.input.take_pressed(Action::ToggleMusic) {
             self.audio.toggle_music();
         }
@@ -7428,6 +7511,11 @@ impl ApplicationHandler for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        if let Some(path) = state.relaunch.take() {
+            relaunch(&path);
+            event_loop.exit();
+            return;
+        }
         // Alt+Enter toggles fullscreen, as F11 does (the PC convention),
         // in play and menus alike; its Enter goes no further.
         if let WindowEvent::ModifiersChanged(m) = &event {
@@ -7623,6 +7711,25 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn starting_again_from_a_save_keeps_the_launch_but_its_load() {
+        let args = [
+            "--alpha",
+            "--load",
+            "old.toml",
+            "--mission",
+            "--load",
+            "older.toml",
+            "--load-at",
+            "30",
+        ]
+        .map(String::from);
+        assert_eq!(
+            args_loading(args, std::path::Path::new("new.toml")),
+            ["--alpha", "--mission", "--load", "new.toml"]
+        );
+    }
 
     #[test]
     fn pace_logs_each_span_with_its_slowest_frame() {

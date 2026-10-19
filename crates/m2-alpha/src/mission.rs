@@ -55,6 +55,9 @@ use crate::support::{self, FALLBACK_AFTER, Impact, Kind};
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
+/// Seconds after the scripts start from a save that where the story
+/// stands is logged: by then they have taken the save in (invented).
+const LOAD_REPORT_SECONDS: f32 = 15.0;
 /// A scripted voice line to play: the mission's id for it, its cue, and
 /// where it is said (`None`: flat).
 pub type ScriptLine = (u32, String, Option<Vec3>);
@@ -636,6 +639,12 @@ pub struct MissionLink {
     /// The newest objective message, its text readable, and its age.
     message: Option<(ObjectiveMessage, String, f32)>,
     drivers: Vec<(String, String)>,
+    /// A save to start from ([`with_save`](Self::with_save)), until the
+    /// scripts start.
+    saved: Option<Box<crate::save::SaveGame>>,
+    /// Seconds since the scripts started from a save, until where the
+    /// story stands is logged ([`LOAD_REPORT_SECONDS`]).
+    since_load: Option<f32>,
     /// The scripts put the player somewhere the island has no way to hold
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
@@ -791,6 +800,8 @@ impl MissionLink {
             log,
             message: None,
             drivers,
+            saved: None,
+            since_load: None,
             ashore: 0,
             blasts: Vec::new(),
             tutorial: None,
@@ -944,6 +955,17 @@ impl MissionLink {
                 .map(|i| (i.key, i.stock))
                 .collect(),
         })
+    }
+
+    /// Where the story stands, once the scripts run
+    /// ([`Mission::contracts`]).
+    pub fn contracts(&self) -> Option<m2_game::savedata::Contracts> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        m.contracts()
+            .map_err(|e| eprintln!("mission: the contracts' states: {e}"))
+            .ok()
     }
 
     /// The scripts' own save data, to keep in a save
@@ -1120,6 +1142,31 @@ impl MissionLink {
         Self { movies, ..self }
     }
 
+    /// Starts the scripts from `save` rather than a new game, as loading
+    /// it does: her place, weapons and the world's wrecks and dead are put
+    /// back first, then the scripts are handed their own save data
+    /// ([`Mission::load_save`]): the contracts done and on offer, her PMC,
+    /// the factions. A save without script data (from before it was kept)
+    /// starts a new game with her cash and stock made up to the save's.
+    pub fn with_save(mut self, save: Option<crate::save::SaveGame>) -> Self {
+        if let Some(save) = save {
+            self.set_save(save);
+        }
+        self
+    }
+
+    /// As [`with_save`](Self::with_save), for a link already made whose
+    /// scripts have not started (a front end holding play until a game is
+    /// chosen). Whether it was taken: once the scripts run it is too late,
+    /// and the save is not taken.
+    pub fn set_save(&mut self, save: crate::save::SaveGame) -> bool {
+        if !matches!(self.state, State::Loading(_)) {
+            return false;
+        }
+        self.saved = Some(Box::new(save));
+        true
+    }
+
     /// Ends the scripts' skip mode once the start has run, when the movies
     /// wait for the game (unless `--skip-mode-on`).
     pub fn with_skip_mode_off(self, end_skip: bool) -> Self {
@@ -1205,6 +1252,21 @@ impl MissionLink {
             // Without the scripts, every state layer's people stand.
             if matches!(self.state, State::Failed(_)) {
                 game.scene.people.state_layers = None;
+            }
+        }
+        // The scripts take a save's data in as the world streams in: where
+        // the story stands, and where she is, is logged once they have.
+        if let Some(t) = &mut self.since_load {
+            *t += dt;
+            if *t >= LOAD_REPORT_SECONDS {
+                self.since_load = None;
+                if let Some(c) = self.contracts() {
+                    let at = game.focus();
+                    eprintln!(
+                        "load: {LOAD_REPORT_SECONDS} s on, the scripts hold {c}; she is at ({:.0}, {:.0}, {:.0})",
+                        at.x, at.y, at.z
+                    );
+                }
             }
         }
         let State::Running(mission) = &mut self.state else {
@@ -1950,6 +2012,20 @@ impl MissionLink {
                 }
                 mission.set_subtitles(self.subtitles);
                 mission.set_tutorials(self.tutorials);
+                let loaded = self.saved.is_some();
+                let pmc = self.saved.take().and_then(|save| {
+                    let mut save = *save;
+                    let pmc = save.pmc.take();
+                    let scripts = save.scripts.take();
+                    game.load(save);
+                    match scripts {
+                        Some(text) => {
+                            mission.load_save(text);
+                            None
+                        }
+                        None => pmc,
+                    }
+                });
                 mission.start();
                 if self.movies && self.end_skip {
                     // The movies wait for the game, so the scripts' skip
@@ -1966,6 +2042,12 @@ impl MissionLink {
                 }
                 self.write(lines);
                 self.state = State::Running(Box::new(mission));
+                if let Some(pmc) = pmc {
+                    self.restore(&pmc);
+                }
+                if loaded {
+                    self.since_load = Some(0.0);
+                }
             }
             Err(e) => self.fail(format!("could not start the scripts: {e}")),
         }

@@ -186,6 +186,14 @@ m2-alpha [options]
   --mission-driver <lua> Lua to run before the scripts start, to test them
                          (crates/m2-game/examples/drivers/vzacon001.lua
                          plays the first contract); repeatable
+  --load <save.toml>     start from a save rather than a new game: her place
+                         and the world's wrecks, and with --mission the
+                         scripts' own data (the contracts done and on offer,
+                         her PMC, the factions), as loading it in play does
+  --load-at <seconds>    load the player's own save that far into play, as
+                         the pause menu does (a test of loading in play)
+  --save-to <save.toml>  with --screenshot, write a save there once the run
+                         ends, as the pause menu's Save does
   --hijack-crew <name>   every hijackable vehicle without a driver is
                          driven by this human template, to test hijacking
                          (I/K/J/L are the pad's Y/A/X/B; the movement

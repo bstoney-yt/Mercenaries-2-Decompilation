@@ -28,7 +28,9 @@ pub struct SaveGame {
     #[serde(default)]
     pub pmc: Option<PmcSave>,
     /// The scripts' own save data, as Lua text
-    /// ([`m2_game::savedata`]): kept, not yet read back on loading.
+    /// ([`m2_game::savedata`]): loading hands it back to the scripts as
+    /// they start ([`MissionLink::with_save`](crate::mission::MissionLink::with_save)),
+    /// so the contracts done and on offer come back with it.
     #[serde(default)]
     pub scripts: Option<String>,
 }
