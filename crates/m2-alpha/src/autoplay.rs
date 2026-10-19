@@ -24,6 +24,11 @@ use crate::support::{Aim, PDA_CLOSE, PDA_OPEN, Phase};
 const TURN: f32 = 5.0;
 /// The camera's pitch while she runs or drives, radians.
 const CRUISE_PITCH: f32 = -0.2;
+/// With nothing to do, she looks at what the scripts wait for her to
+/// see if it is within this far (metres), from at least this far off
+/// (invented: the camera rides behind her).
+const LOOK_NEAR: f32 = 60.0;
+const LOOK_FROM: f32 = 6.0;
 /// Close enough to a place to be there, metres. Waiting there longer than
 /// this (seconds), she walks round it this far out: the scripts' region
 /// may lie to a side of their marker.
@@ -107,6 +112,9 @@ const GET_OUT: f32 = 40.0;
 /// Within this far of a vehicle's door she presses to get in, metres;
 /// presses are this far apart, seconds (a press gets her in or out).
 const DOOR: f32 = 2.5;
+/// Within this of a crewed vehicle's middle she starts its hijack,
+/// metres (invented; m2-alpha's `HIJACK_REACH` is 6).
+const HIJACK_NEAR: f32 = 5.0;
 const PRESS_GAP: f32 = 1.5;
 /// Fallen this far under the ground (metres: a hole where the island
 /// hadn't streamed in yet), she is put back on it.
@@ -216,6 +224,11 @@ struct Way {
 /// The player playing herself.
 #[derive(Debug, Default)]
 pub struct Autoplay {
+    /// What the scripts wait for her to see (`Event.ObjectIsVisible`:
+    /// PmcCon001's hall column, which brings the tank through the wall):
+    /// where each is, set each tick ([`crate::mission::MissionLink::
+    /// sight_targets`]).
+    pub sights: Vec<Vec3>,
     /// Seconds played.
     clock: f32,
     goal: Option<Goal>,
@@ -398,7 +411,7 @@ impl Autoplay {
             };
         }
         match self.goal.clone() {
-            None => self.idle(game),
+            None => self.idle(game, dt),
             Some(Goal::Reach { at, .. }) => self.travel(game, at, ARRIVE, dt),
             Some(Goal::Shoot(i)) => self.shoot(game, i, dt),
             Some(Goal::Blast { at, .. }) if striking => self.strike(game, at, dt),
@@ -776,10 +789,29 @@ impl Autoplay {
             // A rifle lying there is taken for its rounds ("Take Ammo"),
             // not taken up in place of hers ([`wanted`]).
             let templates = game.scene.world.as_ref().map(|w| &w.index.template_db);
-            let swap = p.what.weapon == Some(Weapon::Rifle)
-                && templates.is_none_or(|t| {
-                    crate::mission::offer(t, &game.combat, &p.what) == crate::mission::Offer::Equip
-                });
+            let equips = |q: &crate::flights::Pickup| {
+                q.what.weapon == Some(Weapon::Rifle)
+                    && templates.is_none_or(|t| {
+                        crate::mission::offer(t, &game.combat, &q.what)
+                            == crate::mission::Offer::Equip
+                    })
+            };
+            let swap = equips(&p);
+            // A gun lying within reach beside it would be taken up with
+            // the key instead, in place of hers (PmcCon001's villa: a
+            // dead soldier's grenade and rifle together, and she swapped
+            // rifles back and forth for minutes): left lying.
+            let beside = game.scene.flights.pickups().iter().any(|q| {
+                q.key() != key && (q.at - here).with_y(0.0).length() <= q.what.reach && equips(q)
+            });
+            if beside && !swap {
+                eprintln!(
+                    "autoplay {:.1} s: the {:#x} at {:.1} lies by a gun the key would take up                      in place of hers: left lying",
+                    self.clock, key.1, p.at
+                );
+                self.left_lying.push(key);
+                return Intent::default();
+            }
             return Intent {
                 use_pressed: press && !swap,
                 ..Intent::default()
@@ -789,12 +821,37 @@ impl Autoplay {
     }
 
     /// Nothing to do: stand, or stop the vehicle.
-    fn idle(&mut self, game: &Game) -> Intent {
+    fn idle(&mut self, game: &mut Game, dt: f32) -> Intent {
         let driving = game
             .scene
             .player
             .as_ref()
             .is_some_and(|p| p.driving.is_some());
+        // Nothing marked, and the scripts wait for her to look at
+        // something near: she looks at it, from a few metres off.
+        if !driving
+            && let Some(p) = game.scene.player.as_ref()
+            && let Some(at) = self
+                .sights
+                .iter()
+                .copied()
+                .filter(|s| s.distance(p.character.position) < LOOK_NEAR)
+                .min_by(|a, b| {
+                    let here = p.character.position;
+                    a.distance(here).total_cmp(&b.distance(here))
+                })
+        {
+            let here = p.character.position;
+            if (at - here).with_y(0.0).length() < LOOK_FROM {
+                let away = here + (here - at).with_y(0.0).normalize_or(Vec3::X) * LOOK_FROM;
+                return self.walk(game, away, 1.0, dt);
+            }
+            let (look, _) = aim(p, at, dt);
+            return Intent {
+                look,
+                ..Intent::default()
+            };
+        }
         Intent {
             hold_jump: driving,
             ..Intent::default()
@@ -1297,6 +1354,16 @@ impl Autoplay {
         );
         let here = p.character.position;
         if (door - here).with_y(0.0).length() < DOOR {
+            return self.press(0.0);
+        }
+        // Crewed and taken only by its hijack (PmcCon001's villa tank):
+        // the key anywhere close by starts it, door or not (round 4 stood
+        // 3 m off its door for minutes, the way to it blocked).
+        let v = &game.scene.vehicles[i];
+        if game.hijack_only.contains(&v.spec.model)
+            && !v.crew.is_empty()
+            && (m.w_axis.truncate() - here).length() < HIJACK_NEAR
+        {
             return self.press(0.0);
         }
         self.walk(game, door, 1.0, dt)
