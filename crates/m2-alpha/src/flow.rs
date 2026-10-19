@@ -440,6 +440,10 @@ impl Flow {
                 state.pause_settings = settings.clone();
             }
             state.pause_captured = std::mem::take(&mut self.captured);
+            // The menus take the mouse too.
+            (state.pointer, state.clicks) = ui
+                .ctx()
+                .input(|i| crate::gamehud::pointer_input(&i.events, i.pointer.latest_pos()));
             s.update(ui.ctx(), state);
         } else if let Some(s) = &mut self.shell {
             // Loading: told the size, so it draws once it is up.

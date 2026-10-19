@@ -264,6 +264,17 @@ pub struct Avm {
     /// The key last pressed (`Key.getCode`) and those held (`Key.isDown`).
     pub key_code: i32,
     pub keys_down: Vec<i32>,
+    /// `Mouse.addListener`'s objects, told of the mouse
+    /// ([`Runtime::mouse_move`], [`Runtime::mouse_down`],
+    /// [`Runtime::mouse_up`]).
+    pub mouse_listeners: Vec<Value>,
+    /// Where the mouse is, stage pixels (`_xmouse`, `_ymouse` and the
+    /// buttons under it).
+    pub mouse: [f32; 2],
+    /// The button under the mouse (an instance with `onRollOver`,
+    /// `onPress`... of its own), and the one pressed.
+    hover: Option<ClipId>,
+    pressed: Option<ClipId>,
 }
 
 #[derive(Default)]
@@ -315,6 +326,10 @@ impl Avm {
             stage: [0.0; 2],
             trace: false,
             key_listeners: Vec::new(),
+            mouse_listeners: Vec::new(),
+            mouse: [f32::MIN, f32::MIN],
+            hover: None,
+            pressed: None,
             key_code: 0,
             keys_down: Vec::new(),
         };
@@ -589,7 +604,14 @@ impl Avm {
                 };
                 return Some(Value::Object(self.clip_object(r)));
             }
-            "_xmouse" | "_ymouse" => Value::Number(0.0),
+            // The mouse in the instance's own space.
+            "_xmouse" | "_ymouse" => {
+                let at = player
+                    .world_matrix(id)
+                    .inverse()
+                    .map_or([0.0; 2], |m| m.apply(self.mouse));
+                Value::Number(f64::from(if lower == "_xmouse" { at[0] } else { at[1] }))
+            }
             "_width" | "_height" => {
                 let b = clip_bounds(player, id);
                 let v = b.map_or(0.0, |b| {
@@ -2148,6 +2170,66 @@ fn clip_bounds(player: &Player, id: ClipId) -> Option<[f32; 4]> {
     })
 }
 
+/// `hitTest(x, y, shapeFlag)`: whether stage point `at` is on what
+/// instance `id` draws (`shape`), or within its box.
+pub(super) fn hit_test(player: &Player, id: ClipId, at: [f32; 2], shape: bool) -> bool {
+    let mut tris = Vec::new();
+    collect(player, id, &player.world_matrix(id), &mut tris, 0);
+    if shape && !tris.is_empty() {
+        return tris.iter().any(|t| super::inside(at, t.corners));
+    }
+    world_bounds(player, id)
+        .is_some_and(|b| at[0] >= b[0] && at[0] <= b[2] && at[1] >= b[1] && at[1] <= b[3])
+}
+
+/// The box round what instance `id` draws (a text field: its box), stage
+/// pixels.
+pub(super) fn world_bounds(player: &Player, id: ClipId) -> Option<[f32; 4]> {
+    let c = player.clip(id)?;
+    let m = player.world_matrix(id);
+    let mut tris = Vec::new();
+    collect(player, id, &m, &mut tris, 0);
+    super::bounds(&tris).or_else(|| {
+        if matches!(c.kind, Kind::Text(..)) {
+            let b = c.text_def()?.bounds;
+            let p = [m.apply([b[0], b[1]]), m.apply([b[2], b[3]])];
+            Some([
+                p[0][0].min(p[1][0]),
+                p[0][1].min(p[1][1]),
+                p[0][0].max(p[1][0]),
+                p[0][1].max(p[1][1]),
+            ])
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether instance `id` and those it is in are all visible.
+fn shown(player: &Player, id: ClipId) -> bool {
+    let mut at = Some(id);
+    while let Some(i) = at {
+        let Some(c) = player.clip(i) else {
+            return false;
+        };
+        if !c.visible {
+            return false;
+        }
+        at = c.parent;
+    }
+    true
+}
+
+/// The handlers that make an instance a button (Flash's rule for movie
+/// clips: having any of them).
+const BUTTON_EVENTS: [&str; 5] = [
+    "onRollOver",
+    "onRollOut",
+    "onPress",
+    "onRelease",
+    "onReleaseOutside",
+];
+
 fn collect(player: &Player, id: ClipId, m: &Matrix, out: &mut Vec<Triangle>, nesting: usize) {
     let Some(c) = player.clip(id) else { return };
     if nesting > 32 {
@@ -2340,6 +2422,113 @@ impl Runtime {
 
     fn key_event(&mut self, name: &str) {
         for listener in self.avm.key_listeners.clone() {
+            let f = self.avm.get(&mut self.player, &listener, name);
+            if !matches!(f, Value::Undefined) {
+                self.avm.budget = 0;
+                self.avm.call_value(&mut self.player, &f, &listener, &[]);
+            }
+        }
+        self.run_due();
+    }
+
+    /// The mouse moves to stage point `at`: each instance's and `Mouse`
+    /// listener's `onMouseMove` runs, then the button under it, if that
+    /// changed, hears `onRollOut` (the old) and `onRollOver` (the new).
+    pub fn mouse_move(&mut self, at: [f32; 2]) {
+        if self.avm.mouse == at {
+            return;
+        }
+        self.avm.mouse = at;
+        self.mouse_event("onMouseMove");
+        self.roll();
+    }
+
+    /// The left button goes down: `onMouseDown` everywhere, then `onPress`
+    /// on the button under the mouse.
+    pub fn mouse_down(&mut self) {
+        self.mouse_event("onMouseDown");
+        self.roll();
+        if let Some(b) = self.avm.hover {
+            self.avm.pressed = Some(b);
+            self.button_event(b, "onPress");
+        }
+    }
+
+    /// The left button comes up: `onMouseUp` everywhere, then `onRelease`
+    /// on the button pressed if the mouse is still on it, else
+    /// `onReleaseOutside`.
+    pub fn mouse_up(&mut self) {
+        self.mouse_event("onMouseUp");
+        self.roll();
+        if let Some(b) = self.avm.pressed.take() {
+            let event = if self.avm.hover == Some(b) {
+                "onRelease"
+            } else {
+                "onReleaseOutside"
+            };
+            self.button_event(b, event);
+        }
+    }
+
+    /// The button under the mouse now: the topmost shown instance with a
+    /// button's handler whose drawing is under it.
+    pub fn button_at(&self, at: [f32; 2]) -> Option<ClipId> {
+        self.player.order().into_iter().rev().find(|&id| {
+            let Some(o) = self.avm.clips.get(&id) else {
+                return false;
+            };
+            let button = {
+                let o = o.borrow();
+                BUTTON_EVENTS
+                    .iter()
+                    .any(|e| matches!(o.own(e), Some(Value::Object(_))))
+            };
+            button && shown(&self.player, id) && hit_test(&self.player, id, at, true)
+        })
+    }
+
+    fn roll(&mut self) {
+        let now = self.button_at(self.avm.mouse);
+        if now == self.avm.hover {
+            return;
+        }
+        if let Some(old) = self.avm.hover.take() {
+            self.button_event(old, "onRollOut");
+        }
+        self.avm.hover = now;
+        if let Some(new) = now {
+            self.button_event(new, "onRollOver");
+        }
+    }
+
+    fn button_event(&mut self, id: ClipId, name: &str) {
+        let Some(o) = self.avm.clips.get(&id).cloned() else {
+            return;
+        };
+        let h = o.borrow().own(name);
+        if let Some(f @ Value::Object(_)) = h {
+            self.avm.budget = 0;
+            self.avm
+                .call_value(&mut self.player, &f, &Value::Object(o), &[]);
+        }
+        self.run_due();
+    }
+
+    /// `name` (`onMouseDown`...) on each instance that has it, in drawing
+    /// order, then on each `Mouse` listener.
+    fn mouse_event(&mut self, name: &str) {
+        for id in self.player.order() {
+            let Some(o) = self.avm.clips.get(&id).cloned() else {
+                continue;
+            };
+            let h = o.borrow().own(name);
+            if let Some(f @ Value::Object(_)) = h {
+                self.avm.budget = 0;
+                self.avm
+                    .call_value(&mut self.player, &f, &Value::Object(o), &[]);
+            }
+        }
+        for listener in self.avm.mouse_listeners.clone() {
             let f = self.avm.get(&mut self.player, &listener, name);
             if !matches!(f, Value::Undefined) {
                 self.avm.budget = 0;

@@ -370,8 +370,12 @@ struct Options {
     /// With `--screenshot`: the front end alone (the shell's menus),
     /// pictured as `--shell-key`s are pressed.
     front_end: bool,
-    /// Flash key codes pressed in the front end, two seconds apart.
+    /// Flash key codes pressed in the front end, two seconds apart
+    /// ([`CLICK`] for a click, at its place in `shell_clicks`).
     shell_keys: Vec<i32>,
+    /// Clicks in the front end (`--shell-click x,y`, screen pixels): the
+    /// key slot each takes, and where.
+    shell_clicks: Vec<(usize, [f32; 2])>,
     /// With `--mission --autoplay --screenshot`: seconds to play on after
     /// the contract is done.
     after_contract: f32,
@@ -545,6 +549,15 @@ fn parse_args() -> anyhow::Result<Options> {
                     .parse()
                     .context("--shell-key expects a Flash key code")?,
             ),
+            "--shell-click" => {
+                let v = value()?;
+                let (x, y) = v
+                    .split_once(',')
+                    .and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))
+                    .context("--shell-click expects x,y")?;
+                o.shell_clicks.push((o.shell_keys.len(), [x, y]));
+                o.shell_keys.push(CLICK);
+            }
             "--after-contract" => o.after_contract = value()?.parse()?,
             "--old-hud" => o.old_hud = true,
             "--old-fx" => o.old_fx = true,
@@ -884,7 +897,8 @@ fn main() -> anyhow::Result<()> {
     if let (Some(out), true, Some(install)) = (&options.screenshot, options.front_end, &install) {
         // Continue or Load Game picked: play starts from that save, as
         // `--load` starts it.
-        let Some(path) = front_end_offscreen(&config, install, &options.shell_keys, out)? else {
+        let input = (&options.shell_keys[..], &options.shell_clicks[..]);
+        let Some(path) = front_end_offscreen(&config, install, input, out)? else {
             return Ok(());
         };
         let s = save::SaveGame::read(&path)?;
@@ -1068,6 +1082,9 @@ fn loading_screen(install: Option<&Install>) -> Option<loading::LoadingScreen> {
 /// Writes the game to `path`, with her cash, fuel and support stock and
 /// the scripts' own save data as the scripts hold them. Whether it was
 /// written.
+/// `--shell-click`'s place among the `--shell-key`s.
+const CLICK: i32 = -1;
+
 /// The game's pause menu's save slots go up to this; slot 0 is the
 /// scripts' autosave.
 const PAUSE_SLOTS: u32 = 20;
@@ -2970,7 +2987,7 @@ fn probe_for_screenshot(game: &Game) {
 fn front_end_offscreen(
     config: &Config,
     install: &Install,
-    keys: &[i32],
+    (keys, clicks): (&[i32], &[(usize, [f32; 2])]),
     out: &std::path::Path,
 ) -> anyhow::Result<Option<PathBuf>> {
     let mut config = config.clone();
@@ -3025,17 +3042,39 @@ fn front_end_offscreen(
         // last.
         let mut pressed = Vec::new();
         let mut picture = false;
+        let mut pointer = None;
+        let mut clicked = Vec::new();
         if let Some(since) = since {
             for (i, &k) in keys.iter().enumerate() {
                 let at = 3.0 + 2.0 * i as f64;
+                let up = at + 0.2;
+                let (down_now, up_now) = (
+                    since < at && since + step >= at,
+                    since < up && since + step >= up,
+                );
+                if k == CLICK {
+                    // The pointer goes there a frame before the button.
+                    let Some(&(_, p)) = clicks.iter().find(|(n, _)| *n == i) else {
+                        continue;
+                    };
+                    if since + 2.0 * step >= at && since < up + step {
+                        pointer = Some(p);
+                    }
+                    if down_now || up_now {
+                        clicked.push(down_now);
+                        if down_now {
+                            eprintln!("front end: click at {p:?} at {t:.1} s");
+                        }
+                    }
+                    continue;
+                }
                 // Key 0 only waits.
-                if since < at && since + step >= at && k != 0 {
+                if down_now && k != 0 {
                     pressed.push((k, true));
                     eprintln!("front end: key {k} at {t:.1} s");
                 }
                 // Let go a fifth of a second on, as a hand does.
-                let up = at + 0.2;
-                if since < up && since + step >= up && k != 0 {
+                if up_now && k != 0 {
                     pressed.push((k, false));
                 }
             }
@@ -3083,6 +3122,8 @@ fn front_end_offscreen(
             dt: if up_at.is_some() { step } else { 0.0 },
             keys: pressed,
             pause_settings: settings.clone(),
+            pointer,
+            clicks: clicked,
             ..Default::default()
         };
         let _ = hud.build_screen(input, |ui| {
