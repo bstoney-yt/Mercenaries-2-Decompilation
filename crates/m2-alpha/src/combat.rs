@@ -525,6 +525,12 @@ const BLAST_ON_VEHICLE: (f32, f32, f32) = (200.0, 50.0, 5.0);
 /// Below its `TickDamage` health a vehicle burns down this fast, health a
 /// second (the template's 1 every 0.5 s, read as seconds).
 const BURN_DOWN: f32 = 2.0;
+
+/// Vehicles closing slower than this, m/s, meet without a crash (a nudge
+/// while parking). Invented: the props' least ram speed is 1 m/s; 2 keeps
+/// traffic queueing bumper to bumper out of it.
+const CRASH_SPEED: f32 = 2.0;
+
 /// How often the effects vehicles' parts keep going are kept up, seconds
 /// (well inside a held effect's life).
 const PART_FX_EVERY: f32 = 0.3;
@@ -1434,6 +1440,10 @@ pub struct Combat {
     reload: f32,
     /// Seconds until a tank's machine gun fires again.
     mg_reload: f32,
+    /// Seconds until a bomb bay drops again.
+    bomb_reload: f32,
+    /// Bombs dropped from a bomb bay, for the log.
+    pub bombs_dropped: u32,
     aim_left: f32,
     /// What her shots have added to her gun's cone
     /// ([`m2_engine::weapons::Bloom`]).
@@ -1527,6 +1537,9 @@ pub struct Combat {
     /// The game's damage table: what each kind of round and blast does to
     /// people and vehicles.
     pub damage_table: Option<DamageTable>,
+    /// Pairs of vehicles body to body last tick ([`Combat::vehicle_crashes`]):
+    /// a crash is counted as they meet, not while they stay pressed together.
+    pub bumping: std::collections::HashSet<(VehicleId, VehicleId)>,
     /// The thrown weapons she can carry, as their templates say: the
     /// grenade, C4 and the proximity mine; which she throws, and how many
     /// C4 charges and mines she has (grenades are
@@ -1697,6 +1710,8 @@ impl Default for Combat {
             quiet: 0.0,
             reload: 0.0,
             mg_reload: 0.0,
+            bomb_reload: 0.0,
+            bombs_dropped: 0,
             manned: None,
             aim_left: 0.0,
             bloom: m2_engine::weapons::Bloom::default(),
@@ -1738,6 +1753,7 @@ impl Default for Combat {
             rpg: Rifle::launcher(Weapon::Rpg),
             gl: Rifle::launcher(Weapon::GrenadeLauncher),
             damage_table: None,
+            bumping: Default::default(),
             throwables: Vec::new(),
             explosive: 0,
             charges: 0,
@@ -1965,6 +1981,15 @@ impl Combat {
         self.mines = 0;
         self.explosive = 0;
         self.weapon = Weapon::Rifle;
+    }
+
+    /// Hands her `rifle` in the rifle's place as the contract's scripts
+    /// give it (PmcCon001's `Assault Rifle`): one clip in, nothing in
+    /// reserve until the scripts give her some, and nothing else.
+    pub fn scripted_rifle(&mut self, rifle: Rifle) {
+        self.carbine_only();
+        self.rifle_rounds = Rounds::of(rifle.clip, rifle.clip);
+        self.rifle = rifle;
     }
 
     /// Has her carry her own rifle `rifle` (free roam), full: a clip in
@@ -2425,6 +2450,7 @@ impl Combat {
         self.effects.retain(|e| e.1 > 0.0);
         self.reload -= dt;
         self.mg_reload -= dt;
+        self.bomb_reload -= dt;
         self.aim_left -= dt;
         let feel = self.rifle.feel;
         self.bloom.settle(&feel, dt);
@@ -2574,6 +2600,14 @@ impl Combat {
             && !self.mounted_fire(f, i, 1)
         {
             self.vehicle_fire(f, i, true);
+        }
+        // A bomb bay's bomb on the throw key (her explosive's), one a gap.
+        if let Some(i) = f.player.driving
+            && self.down <= 0.0
+            && trigger.throw
+            && self.bomb_reload <= 0.0
+        {
+            self.drop_bomb(f, i);
         }
         self.fire_held = trigger.fire;
         self.track_lock(f, dt);
@@ -3231,6 +3265,29 @@ impl Combat {
         alarm(f.people, f.player.character.position);
     }
 
+    /// Drops a bomb from the bay of vehicle `i` she drives, if it has one:
+    /// it leaves with the vehicle's own velocity and bursts where it
+    /// lands, as a grenade launcher's round does.
+    fn drop_bomb(&mut self, f: &mut Field<'_>, i: usize) {
+        let Some(v) = f.vehicles.get(i) else { return };
+        let (Some(bay), Some(id), false) = (v.spec.bomb_bay, v.id, v.wrecked) else {
+            return;
+        };
+        let Some(body) = f.physics.vehicle_transform(id) else {
+            return;
+        };
+        self.bomb_reload = bay.gap;
+        self.bombs_dropped += 1;
+        let at = body.transform_point3(bay.at);
+        self.projectiles.push(Projectile::Round {
+            at,
+            velocity: f.physics.vehicle_velocity(id),
+            flown: 0.0,
+            blast: bay.blast,
+        });
+        eprintln!("bomb bay: bomb {} dropped at {at:.1}", self.bombs_dropped);
+    }
+
     /// Fires the gun on the turret of vehicle `i`, which she drives, at
     /// what the crosshair is on: a cannon (a tank's, the Stryker's) fires
     /// a shell that bursts like a rocket, anything else's a machine gun.
@@ -3575,6 +3632,74 @@ impl Combat {
         self.remarks.push(Remark::Wreck);
     }
 
+    /// Vehicles running into each other, body to body: as a pair meets,
+    /// each takes the other's ram ([`m2_engine::durability::ram`] of the
+    /// other's mass at the speed they closed at, before the step that
+    /// met) times the damage table's cell for its own `ModifierKey` row
+    /// and the rams' kind (`Car`, every vehicle's `DamageKey`): a `Car`
+    /// takes twice it, a `Tank` none. The part where they met takes the
+    /// unscaled ram, as a round's part takes the round's
+    /// ([`ParkedVehicle::hit_parts`]). Returns the crashes, for the log:
+    /// (struck vehicle, the other, closing speed, damage it took).
+    /// The table's cells are the data's; the ram's size is invented
+    /// (shared with the run-overs and the props'), and so is the
+    /// [`CRASH_SPEED`] threshold.
+    pub fn vehicle_crashes(
+        &mut self,
+        physics: &mut Physics,
+        vehicles: &mut [ParkedVehicle],
+    ) -> Vec<(usize, usize, f32, f32)> {
+        let mut now = std::collections::HashSet::new();
+        let mut met = Vec::new();
+        for (i, v) in vehicles.iter().enumerate() {
+            let Some(a) = v.id else { continue };
+            for (b, at) in physics.vehicle_bumps(a) {
+                let pair = if (a, b) < (b, a) { (a, b) } else { (b, a) };
+                if now.insert(pair)
+                    && !self.bumping.contains(&pair)
+                    && let Some(j) = vehicles.iter().position(|w| w.id == Some(b))
+                {
+                    met.push((i, j, at));
+                }
+            }
+        }
+        self.bumping = now;
+        let kind = m2_assets::name_hash(m2_engine::durability::RAM_KIND);
+        let mut out = Vec::new();
+        for (i, j, at) in met {
+            let (Some(a), Some(b)) = (vehicles[i].id, vehicles[j].id) else {
+                continue;
+            };
+            let closing =
+                (physics.vehicle_velocity_before(a) - physics.vehicle_velocity_before(b)).length();
+            if closing < CRASH_SPEED {
+                continue;
+            }
+            for (struck, other) in [(i, j), (j, i)] {
+                if vehicles[struck].wrecked {
+                    continue;
+                }
+                let ram = m2_engine::durability::ram(vehicles[other].spec.mass, closing);
+                let scale = match (self.damage_table.as_ref(), vehicles[struck].spec.tuning.key) {
+                    (Some(t), Some(row)) => t.scale(row, kind).unwrap_or(0.0),
+                    _ => 0.0,
+                };
+                let damage = ram * scale;
+                if damage <= 0.0 {
+                    out.push((struck, other, closing, 0.0));
+                    continue;
+                }
+                let v = &mut vehicles[struck];
+                if let Some(body) = v.id.and_then(|id| physics.vehicle_transform(id)) {
+                    v.hit_parts(body, at, ram);
+                }
+                self.hurt_vehicle(physics, v, struck, damage);
+                out.push((struck, other, closing, damage));
+            }
+        }
+        out
+    }
+
     /// Vehicle `i`, `v`, takes `damage`: wrecked once it has taken its
     /// health.
     fn hurt_vehicle(
@@ -3720,6 +3845,9 @@ impl Combat {
             if n.hurt(taken, push) && soldier {
                 self.remarks.push(Remark::Kill);
             }
+            // Still alive (a target the blow doesn't hurt, or one it
+            // doesn't fell): knocked down ([`crate::npc::Down`]).
+            n.knock_down();
             self.hits += 1;
         }
         // A vehicle on its side or roof in front of her: the blow rights it
@@ -5555,6 +5683,8 @@ mod tests {
             hull,
             turret_box: None,
             rotors: Vec::new(),
+            tilts: Vec::new(),
+            bomb_bay: None,
             damage: None,
             tuning: VehicleTuning {
                 gun: Some(gun),
@@ -6228,5 +6358,36 @@ mod tests {
         assert!(ray_capsule(Vec3::new(0.0, 2.5, 0.0), Vec3::Z, a, seg, 0.3).is_none());
         // Behind the shooter.
         assert!(ray_capsule(Vec3::new(0.0, 1.2, 20.0), Vec3::Z, a, seg, 0.3).is_none());
+    }
+    /// PmcCon001 hands her an Assault Rifle, not the first contract's
+    /// carbine: it is the gun in the rifle's place, one clip in and none
+    /// spare until the scripts give her its reserve; nothing else.
+    #[test]
+    fn scripted_rifle_replaces_the_carbine_with_one_clip() {
+        let mut combat = Combat {
+            carbine: Rifle {
+                name: "Carbine".to_owned(),
+                clip: 30,
+                ..Rifle::default()
+            },
+            grenades: 4,
+            ..Combat::default()
+        };
+        combat.scripted_rifle(Rifle {
+            name: "Assault Rifle".to_owned(),
+            clip: 25,
+            ..Rifle::default()
+        });
+        assert_eq!(combat.rifle.name, "Assault Rifle");
+        assert_eq!(
+            combat.rifle_rounds,
+            Rounds {
+                clip: 25,
+                stored: 0
+            }
+        );
+        assert_eq!(combat.grenades, 0);
+        assert_eq!(combat.weapon, Weapon::Rifle);
+        assert!(combat.second.is_none());
     }
 }
