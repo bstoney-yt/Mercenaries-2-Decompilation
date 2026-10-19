@@ -1166,6 +1166,42 @@ impl Mission {
         self.world.borrow_mut().hijack.hold(button, at);
     }
 
+    /// The prompt (`[ContextAction.Subdue]`) of the context action offered
+    /// beside `guid`, if one is.
+    pub fn context_text(&self, guid: u32) -> Option<String> {
+        self.world
+            .borrow()
+            .context_actions
+            .get(&guid)
+            .map(|a| a.text.clone())
+    }
+
+    /// Character `guid` is now in human state `state` (`Stance.Action`:
+    /// `KnockedDown.Idle`), for the scripts' `HumanStateTransition` events.
+    pub fn set_human_state(&mut self, guid: u32, state: &str) {
+        let mut w = self.world.borrow_mut();
+        let from = w
+            .human_states
+            .insert(guid, state.to_owned())
+            .unwrap_or_else(|| "Upright.Idle".to_owned());
+        if from != state {
+            w.state_changes
+                .push((self.now, guid, from, state.to_owned()));
+            let extra = w.state_changes.len().saturating_sub(32);
+            w.state_changes.drain(..extra);
+        }
+    }
+
+    /// Character `carrier` now carries `carried` (or nobody), for
+    /// `Human.IsCarrying`.
+    pub fn set_carrying(&mut self, carrier: u32, carried: Option<u32>) {
+        let mut w = self.world.borrow_mut();
+        match carried {
+            Some(c) => w.carrying.insert(carrier, c),
+            None => w.carrying.remove(&carrier),
+        };
+    }
+
     /// A character's action (a [`crate::hijack::HijackCommand::State`]
     /// key) played to its end.
     pub fn action_finished(&mut self, guid: u32) {
@@ -1197,6 +1233,26 @@ impl Mission {
             o.vehicle = vehicle;
             o.seated_instantly = false;
         }
+    }
+
+    /// Character `guid` is put in vehicle `vehicle` (a prisoner loaded
+    /// into the extraction helicopter): seat events fire on the next tick.
+    pub fn seat_in(&mut self, guid: u32, vehicle: u32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            o.vehicle = Some(vehicle);
+            o.seated_instantly = false;
+        }
+    }
+
+    /// The objects carrying label `label` (`ExtractionHelicopter`), and
+    /// where each is.
+    pub fn labelled(&self, label: &str) -> Vec<(u32, [f32; 3])> {
+        use crate::events::World;
+        let w = self.world.borrow();
+        w.labelled(label)
+            .into_iter()
+            .filter_map(|g| Some((g, w.objects.get(&g)?.position)))
+            .collect()
     }
 
     /// The points of path entity `guid` in the world ([`Entity::path`]),
@@ -2652,6 +2708,53 @@ mod tests {
         assert!(m.crews_aboard().is_empty());
     }
 
+    #[test]
+    fn a_targets_state_changes_and_actions_reach_the_verify_objectives_events() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.world
+            .borrow_mut()
+            .insert(9, crate::api::Object::new("Blanco", [5.0, 0.0, 0.0]));
+        // As `MrxTaskObjectiveVerify` waits: knocked down, then subdued,
+        // and up again; and the player's photo action ending.
+        m.run(
+            r#"__heard = {}
+            local function note(s) return function(g) __heard[#__heard + 1] = s end end
+            local t = Sys.StringToGuid('0x9')
+            Event.CreatePersistent(Event.HumanStateTransition, { t, "*", "KnockedDown.Idle" }, note("down"), {})
+            Event.CreatePersistent(Event.HumanStateTransition, { t, "*", "Subdued.Idle" }, note("subdued"), {})
+            Event.CreatePersistent(Event.HumanStateTransition, { t, "KnockedDown.*", "Upright.*" }, note("up"), {})
+            Human.DoAction(Player.GetAnyCharacter(), "VerifyCamera")
+            Event.Create(Event.HumanActionComplete, { Player.GetAnyCharacter() }, note("photo"), {})"#,
+            "events",
+        )
+        .unwrap();
+        let heard = |m: &Mission| -> Vec<String> {
+            m.lua()
+                .globals()
+                .get::<Table>("__heard")
+                .unwrap()
+                .sequence_values()
+                .map(|v| v.unwrap())
+                .collect()
+        };
+        m.tick(0.1);
+        assert!(heard(&m).is_empty());
+        m.set_human_state(9, "KnockedDown.Idle");
+        m.tick(0.1);
+        m.set_human_state(9, "KnockedDown.Getup");
+        m.tick(0.1);
+        m.set_human_state(9, "Upright.Idle");
+        m.tick(0.1);
+        m.set_human_state(9, "Subdued.Idle");
+        m.action_finished(PLAYER);
+        m.tick(0.1);
+        assert_eq!(heard(&m), ["down", "up", "subdued", "photo"]);
+        // And carrying, as `Human.IsCarrying` reads it.
+        m.set_carrying(PLAYER, Some(9));
+        m.run("__c = Human.IsCarrying(Player.GetAnyCharacter())", "carry")
+            .unwrap();
+        assert!(m.lua().globals().get::<bool>("__c").unwrap());
+    }
     #[test]
     fn leaving_the_play_area_or_entering_an_exclusion_tells_the_boundary_callback() {
         let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();

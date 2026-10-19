@@ -42,17 +42,27 @@ pub struct SupportItem {
     /// (`MrxPmc.GetFreebieQty`).
     pub stock: i64,
     pub free: i64,
+    /// A free item the support menu lists with no count of its own
+    /// (`bActive`: `AddFreebie` puts it on the menu even when it finds no
+    /// quantity, as for the verify objective's `Extraction_OC`, whose
+    /// `nFreebieQty` is nil).
+    pub active: bool,
 }
 
-/// Every item of `tSupportData`, by key.
+/// Every item of `tSupportData` (the shops'), then of `tFreebieData`
+/// (given free only: a verify objective's `Extraction_OC` helicopter), by
+/// key.
 pub fn items(lua: &Lua) -> mlua::Result<Vec<SupportItem>> {
     let globals = lua.globals();
     let Value::Table(data) = globals.get::<Value>("MrxSupportData")? else {
         return Ok(Vec::new());
     };
-    let Value::Table(all) = data.get::<Value>("tSupportData")? else {
-        return Ok(Vec::new());
-    };
+    let mut tables = Vec::new();
+    for name in ["tSupportData", "tFreebieData"] {
+        if let Value::Table(t) = data.get::<Value>(name)? {
+            tables.push(t);
+        }
+    }
     let pmc = globals.get::<Value>("MrxPmc")?;
     // `mlua::Integer` is i32 on 32-bit builds, i64 on 64-bit ones.
     #[allow(clippy::useless_conversion)]
@@ -68,9 +78,12 @@ pub fn items(lua: &Lua) -> mlua::Result<Vec<SupportItem>> {
             })
             .unwrap_or(0)
     };
-    let mut out = Vec::new();
-    for pair in all.pairs::<String, Table>() {
+    let mut out: Vec<SupportItem> = Vec::new();
+    for pair in tables.iter().flat_map(|t| t.pairs::<String, Table>()) {
         let Ok((key, item)) = pair else { continue };
+        if out.iter().any(|i| i.key == key) {
+            continue;
+        }
         let support = item.get::<Option<Table>>("oSupport").ok().flatten();
         let s = |t: Option<&Table>, k: &str| {
             t.and_then(|t| t.get::<Option<String>>(k).ok().flatten())
@@ -100,6 +113,7 @@ pub fn items(lua: &Lua) -> mlua::Result<Vec<SupportItem>> {
             cargo: s(support.as_ref(), "sCargoToDeliver"),
             stock: count("GetSupportQty", &key),
             free: count("GetFreebieQty", &key),
+            active: item.get::<Option<bool>>("bActive").ok().flatten() == Some(true),
             key,
         });
     }
@@ -115,6 +129,7 @@ pub fn items(lua: &Lua) -> mlua::Result<Vec<SupportItem>> {
 /// whether `Commence` took it.
 pub const CALL_IN: &str = r#"
 local item = MrxSupportData.tSupportData[__m2_key]
+    or (MrxSupportData.tFreebieData or {})[__m2_key]
 if not item or not item.oSupport then return false end
 local s = item.oSupport
 if type(s.uOwner) ~= "userdata" then s:SetOwner(__m2_owner) end

@@ -3720,6 +3720,9 @@ impl Combat {
             if n.hurt(taken, push) && soldier {
                 self.remarks.push(Remark::Kill);
             }
+            // Still alive (a target the blow doesn't hurt, or one it
+            // doesn't fell): knocked down ([`crate::npc::Down`]).
+            n.knock_down();
             self.hits += 1;
         }
         // A vehicle on its side or roof in front of her: the blow rights it

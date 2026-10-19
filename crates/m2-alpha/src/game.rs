@@ -203,6 +203,10 @@ pub struct Game {
     pub reporters: Vec<(u32, &'static str, f32)>,
     /// Whether an army pursued her last frame.
     pub pursued: bool,
+    /// Keyed actions the scripts asked for (`Human.DoAction`: the player's
+    /// verify photo `VerifyCamera`), each with its seconds left, ended for the
+    /// scripts' `HumanActionComplete` ([`crate::mission`]).
+    pub actions: Vec<(u32, String, f32)>,
 }
 
 /// A camera shot the scripts asked for (`Camera.SetShot`): the engine's
@@ -353,6 +357,7 @@ impl Game {
             attitude_wait: 0.0,
             reporters: Vec::new(),
             pursued: false,
+            actions: Vec::new(),
             scripts_seated: false,
         }
     }
