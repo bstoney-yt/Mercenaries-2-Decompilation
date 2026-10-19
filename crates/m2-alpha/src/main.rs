@@ -53,6 +53,7 @@ mod flights;
 mod flow;
 mod game;
 mod gamehud;
+mod grapple;
 mod held;
 mod hero;
 mod hijack;
@@ -71,6 +72,7 @@ mod pause;
 mod placed;
 mod player;
 mod props;
+mod raw;
 mod roads;
 mod route;
 mod save;
@@ -283,12 +285,20 @@ struct Options {
     /// `--cheat-check`: with `--mission`, every cheat of the menu tried
     /// once she is ashore ([`cheats::Check`]), for testing.
     cheat_check: bool,
+    /// `--bombs`: with `--mission --autoplay`, whenever she drives a
+    /// vehicle with a bomb bay, she drops a bomb every two seconds, for
+    /// testing.
+    bombs: bool,
     /// `--cheat-menu <page>`: with `--screenshot`, the cheat menu up at
     /// that page, over plain black.
     cheat_menu: Option<cheats::Tab>,
     /// With `--screenshot --drive`: hijack the vehicle instead of getting
     /// in, answering every prompt at once.
     hijack: bool,
+    /// `--grapple`: she may grapple without the scripts' leave (testing;
+    /// with `--screenshot --drive --hijack`, she grapples to the nearest
+    /// crewed helicopter from 40 m and hijacks it).
+    grapple: bool,
     /// With `--mission`: try every placed pickup, crate and emplaced gun
     /// as the layers put them out ([`placed::check`]), for testing.
     placed_check: bool,
@@ -303,12 +313,28 @@ struct Options {
     /// With `--screenshot` on foot and `--gait`: she goes on this long
     /// (seconds, default 3), logging where she is each second.
     walk_seconds: Option<f32>,
+    /// With `--screenshot` on foot and `--gait`: put the nearest soldier
+    /// this many metres ahead of her at the start, at the water's height
+    /// there, and log each second whether he swims (`npc-swim:` lines).
+    /// For testing.
+    npc_swim: Option<f32>,
     /// With `--mission --after-contract`: this many seconds after the
     /// contract, take the pause menu's Medevac (if the scripts allow it).
     medevac: Option<f32>,
     /// With `--mission --after-contract`: visit a faction's soldiers (`All`,
     /// `Oil`...) and hurt one, logging their sides (faction-check lines).
     visit_faction: Option<String>,
+    /// `--bash-target <s>`: that long after the contract, bash the person
+    /// the scripts' first marker is over.
+    bash_target: Option<f32>,
+    /// `--bash-target <s>k`: knock them down instead (as a bash does a
+    /// boss it doesn't hurt), to try the capture on anyone.
+    knock_target: bool,
+    /// `--bash-target <s>d`: kill them instead, to try the photo verify.
+    kill_target: bool,
+    /// `--call-extraction <s>`: that long after the contract, call in the
+    /// extraction helicopter and go to it once it is down.
+    call_extraction: Option<f32>,
     /// With `--mission --autoplay --after-contract`: the Enter pressed
     /// every four seconds after the contract jumps too, as the pad's A
     /// does; where she is while the scripts hold her controls is logged
@@ -323,6 +349,10 @@ struct Options {
     /// is seen sitting in the vehicle as she drives it.
     seated: bool,
     mission_seconds: f32,
+    /// With `--mission --autoplay`: she plays on through this many
+    /// contracts (the first, then the story's next ones) before she stops
+    /// (`--contracts`, default 1).
+    contracts: u32,
     /// The whole game as it launches: the boot movies, the front end, the
     /// first contract with its movies, then on (also with no options).
     alpha: bool,
@@ -515,11 +545,19 @@ fn parse_args() -> anyhow::Result<Options> {
             "--no-fx" => o.no_fx = true,
             "--hijack-crew" => o.hijack_crew = Some(value()?),
             "--hijack" => o.hijack = true,
+            "--grapple" => o.grapple = true,
             "--placed-check" => o.placed_check = true,
             "--context" => o.context = Some(value()?),
             "--dialog-keys" => o.dialog_keys = Some(value()?),
             "--medevac" => o.medevac = Some(value()?.parse()?),
             "--visit-faction" => o.visit_faction = Some(value()?),
+            "--call-extraction" => o.call_extraction = Some(value()?.parse()?),
+            "--bash-target" => {
+                let v = value()?;
+                o.knock_target = v.ends_with('k');
+                o.kill_target = v.ends_with('d');
+                o.bash_target = Some(v.trim_end_matches(['k', 'd']).parse()?);
+            }
             "--jump-with-enter" => o.jump_with_enter = true,
             "--props-check" => {
                 let v = value()?;
@@ -547,6 +585,7 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--support" => o.support.push(value()?),
             "--cheat-check" => o.cheat_check = true,
+            "--bombs" => o.bombs = true,
             "--cheat-menu" => {
                 let v = value()?;
                 o.cheat_menu = Some(cheats::Tab::named(&v).with_context(|| {
@@ -676,6 +715,12 @@ fn parse_args() -> anyhow::Result<Options> {
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
             "--gates" => o.gates = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
+            "--contracts" => {
+                o.contracts = value()?.parse().context("--contracts expects a count")?
+            }
+            "--npc-swim" => {
+                o.npc_swim = Some(value()?.parse().context("--npc-swim expects metres")?)
+            }
             "--mission-seconds" => {
                 o.mission_seconds = value()?
                     .parse()
@@ -745,6 +790,10 @@ const HURT_AT: f32 = 8.0;
 /// wall first (in the PC footage it bursts in 4 s before "Hijack tank" is
 /// added; inferred, not measured from the game).
 const HIJACK_WAIT: f32 = 8.0;
+/// With --autoplay --hijack: her use key starts a hijack within this of
+/// the marked vehicle's middle, metres (invented: a tank's hull is about
+/// 7 m long).
+const HIJACK_REACH: f32 = 6.0;
 
 /// With `--mission --placed-check`, how often what the layers put out is
 /// tried, seconds.
@@ -842,6 +891,7 @@ fn main() -> anyhow::Result<()> {
         // The whole game plays as it launches, without the developer's
         // keys, unless asked for; the test launches keep them.
         dev: options.dev || options.fly || !options.alpha,
+        grapple: options.grapple,
         mission: options.mission,
         mission_drivers: options.mission_drivers.clone(),
         old_hud: options.old_hud,
@@ -1591,6 +1641,8 @@ fn screenshot(
         let ticks = options
             .walk_seconds
             .map_or(180, |s| (s * 60.0).round() as usize);
+        // `--npc-swim`: the soldier put in the water.
+        let (mut swimmer, mut swim_gave_up): (Option<u32>, bool) = (None, false);
         for i in 0..ticks {
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
@@ -1660,6 +1712,74 @@ fn screenshot(
                 }),
                 ..combat::Trigger::default()
             };
+            // `--npc-swim`: once a soldier is in play, the nearest is put in
+            // the nearest water out of his depth (2 m deep) from `ahead`
+            // metres out, at its surface, and she 8 m back from him.
+            if let (Some(ahead), None, false) = (options.npc_swim, swimmer, swim_gave_up)
+                && game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .any(|n| n.soldier && n.alive && n.landed)
+                && let (Some(p), Some(w)) = (&game.scene.player, &game.scene.world)
+            {
+                let her = p.character.position;
+                let deep = |to: m2_math::glam::Vec3| {
+                    let s = w.physics.water_at(to.x, to.z)?;
+                    let (d, _) =
+                        w.physics
+                            .cast_ray(to.with_y(s + 30.0), -m2_math::glam::Vec3::Y, 400.0)?;
+                    (d - 30.0 > 2.0).then_some(s)
+                };
+                let found = (0..40).map(|r| ahead + r as f32 * 10.0).find_map(|r| {
+                    (0..16).find_map(|k| {
+                        let a = p.facing + k as f32 * std::f32::consts::TAU / 16.0;
+                        let way = m2_math::glam::Vec3::new(a.sin(), 0.0, a.cos());
+                        let to = her + way * r;
+                        deep(to).map(|s| (to.with_y(s), way))
+                    })
+                });
+                match found {
+                    Some((to, way)) => {
+                        let back = her + (to - her).with_y(0.0) - way * 8.0;
+                        let n = game
+                            .scene
+                            .people
+                            .npcs
+                            .iter_mut()
+                            .filter(|n| n.soldier && n.alive && n.landed)
+                            .min_by(|a, b| {
+                                let d = |n: &npc::Npc| n.character.position.distance_squared(her);
+                                d(a).total_cmp(&d(b))
+                            })
+                            .expect("a soldier is in play");
+                        eprintln!(
+                            "npc-swim: {:08x} put from {:.1} to {to:.1}, {:.0} m from where she was; she goes to {:.1}",
+                            n.spawn.unwrap_or(0),
+                            n.character.position,
+                            to.distance(her),
+                            back
+                        );
+                        n.character.position = to;
+                        n.character.velocity = m2_math::glam::Vec3::ZERO;
+                        n.alert = false;
+                        swimmer = n.spawn;
+                        if let Some(p) = game.scene.player.as_mut() {
+                            p.drop_at(back + m2_math::glam::Vec3::Y * 2.0);
+                            p.facing = way.x.atan2(way.z);
+                            p.yaw = p.facing;
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "npc-swim: no water out of his depth within {:.0} m",
+                            ahead + 390.0
+                        );
+                        swim_gave_up = true;
+                    }
+                }
+            }
             if options.pickup
                 && i == ticks - lead
                 && let Some(p) = game.scene.player.as_mut()
@@ -1694,6 +1814,50 @@ fn screenshot(
                     } else {
                         "on her feet"
                     }
+                );
+            }
+            // With `--npc-swim`, each second: where the soldier put in the
+            // water is, how deep it is over his feet, and what he does.
+            if options.npc_swim.is_some()
+                && i % 60 == 59
+                && let (Some(p), Some(w)) = (&game.scene.player, &game.scene.world)
+                && let Some(n) = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .find(|n| swimmer.is_some() && n.spawn == swimmer)
+            {
+                let at = n.character.position;
+                let water = w.physics.water_at(at.x, at.z);
+                let ground = w
+                    .physics
+                    .cast_ray(
+                        at.with_y(at.y.max(water.unwrap_or(at.y)) + 1.0),
+                        -m2_math::glam::Vec3::Y,
+                        400.0,
+                    )
+                    .map(|(d, _)| at.y.max(water.unwrap_or(at.y)) + 1.0 - d);
+                let clip = n
+                    .rig
+                    .animator
+                    .current()
+                    .map_or(0, |(c, _)| n.rig.clips[c].hash);
+                eprintln!(
+                    "npc-swim: {:.0} s {:08x} at {at:.2}, water {} over his feet, ground {} under the surface, {}, clip {clip:08x}, {:.1} m from her",
+                    (i + 1) as f32 / 60.0,
+                    n.spawn.unwrap_or(0),
+                    water.map_or("none".to_owned(), |s| format!("{:.2} m", s - at.y)),
+                    match (water, ground) {
+                        (Some(s), Some(g)) => format!("{:.2} m", s - g),
+                        _ => "-".to_owned(),
+                    },
+                    if n.swimming() {
+                        "swimming"
+                    } else {
+                        "on his feet"
+                    },
+                    at.distance(p.character.position)
                 );
             }
             if i % 30 == 0 {
@@ -3029,6 +3193,7 @@ fn mission_for_screenshot(
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
+        game.dress(backend);
         if options.movies {
             movies_offscreen(&mut link, install, out);
         }
@@ -3059,6 +3224,10 @@ fn mission_for_screenshot(
     };
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
     let mut contract_done: Option<u32> = None;
+    // With --contracts N, she plays on through the later contracts: the
+    // tick the Nth was done, and how many have been.
+    let mut play_done: Option<u32> = None;
+    let mut contracts_seen = 0;
     let mut late_hud: Option<(ui::Hud, Config)> = None;
     // The loading screen's steps over the scripts' fades until the late HUD
     // (which draws it) runs, logged.
@@ -3118,6 +3287,7 @@ fn mission_for_screenshot(
     let mut hijack_input = Input::default();
     let mut hijack_pad = hijack::Autopad::default();
     let (mut hijack_tries, mut hijack_use, mut hijack_t) = (0, None, 0.0);
+    let (mut hijack_running, mut hijack_shots) = (0.0f32, 0u32);
     let mut action_since: Option<u32> = None;
     let mut placed_tried = std::collections::HashSet::new();
     // Seconds she has been where --props-check hits the props.
@@ -3128,10 +3298,14 @@ fn mission_for_screenshot(
     let (mut dialog_up, mut dialog_pressed) = (0.0f32, 0usize);
     let (mut medevac_done, mut medevac_from) = (false, None::<(f32, m2_math::glam::Vec3)>);
     let mut visit: Option<f32> = None;
+    // `--call-extraction`: its step (0 waiting, 1 menu up, 2 calling, 3 by
+    // it), the designator's tap, and seconds the helicopter has been about.
+    let (mut extraction, mut extraction_tap, mut extraction_seen) = (0u8, false, 0.0f32);
     let (mut locked_was, mut locked_for) = (false, 0.0f32);
     for i in 0..(seconds / tick).round() as u32 {
-        let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
+        let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
             Some(a) => {
+                a.sights = link.sight_targets(game);
                 let marks = link.marks();
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)
@@ -3182,6 +3356,18 @@ fn mission_for_screenshot(
         if (!options.support.is_empty() || options.cheat_check) && game.combat.to_throw {
             intent.trigger.throw = true;
         }
+        // With --bombs she drops a bomb every two seconds from a bay.
+        let bomb_every = (2.0 / tick).round().max(1.0) as u32;
+        if options.bombs
+            && game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_some())
+            && i % bomb_every == 0
+        {
+            intent.trigger.throw = true;
+        }
         // With --shop-check she buys and calls in every support item.
         if let Some(sc) = &mut shop_check {
             let ashore = !link
@@ -3209,8 +3395,198 @@ fn mission_for_screenshot(
                 break;
             }
         }
+        // `--bash-target <s>`: that long after the contract, she is put
+        // 1.2 m from the person the first of the scripts' markers is over,
+        // facing them, and bashes them the tick after (verify-check lines).
+        if let (Some(at), Some(done)) = (options.bash_target, contract_done) {
+            let t = i.saturating_sub(done) as f32 * tick;
+            // 20 s before: out of the HQ, onto the PMC villa's grounds below
+            // it, where the layers place people (a VZ soldier by the road,
+            // from earlier runs), so there is someone to try it on.
+            if (t - (at - 20.0)).abs() < tick / 2.0
+                && let Some(p) = game.scene.player.as_mut()
+                && p.character.position.y > 300.0
+            {
+                p.drop_at(m2_math::glam::Vec3::new(2362.0, 0.0, -1150.0));
+                eprintln!("verify-check: out of the HQ, onto the villa's grounds");
+            }
+            // 10 s before: the nearest placed person to her is named to the
+            // scripts as `__m2_test_target` (a test driver gives them a
+            // verify objective), unless a driver named one already.
+            if (t - (at - 10.0)).abs() < tick / 2.0
+                && link.global_guid("__m2_test_target").is_none()
+                && let Some(her) = game.scene.player.as_ref().map(|p| p.character.position)
+            {
+                let nearest = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .filter(|n| n.alive && n.landed && !n.held)
+                    // A layer's person, not one the scripts made (a
+                    // starter out of her seat: guids from 0x40000000).
+                    .filter_map(|n| {
+                        Some((
+                            n.spawn.filter(|&s| s < 0x4000_0000)?,
+                            n.character.position.distance(her),
+                        ))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                match nearest {
+                    Some((g, d)) => {
+                        eprintln!("verify-check: names {g:#x} ({d:.0} m off) the test target");
+                        link.run_lua(&format!("__m2_test_target = Sys.StringToGuid('{g:#x}')"));
+                    }
+                    None => eprintln!("verify-check: nobody placed near her to name"),
+                }
+            }
+            // A test driver's target (`__m2_test_target`), else the
+            // markers' people.
+            let wanted: Vec<u32> = link
+                .global_guid("__m2_test_target")
+                .map(|g| vec![g])
+                .unwrap_or_else(|| link.marks().iter().map(|m| m.target).collect());
+            if (t - at).abs() < tick / 2.0 {
+                let target = wanted.iter().find_map(|&g| {
+                    let n = game
+                        .scene
+                        .people
+                        .npcs
+                        .iter()
+                        .find(|n| n.alive && n.spawn == Some(g))?;
+                    Some((g, n.character.position))
+                });
+                match (target, game.scene.player.as_mut()) {
+                    (Some((g, there)), Some(p)) => {
+                        let her = p.character.position;
+                        let back = (her - there)
+                            .with_y(0.0)
+                            .normalize_or(m2_math::glam::Vec3::X);
+                        p.drop_at(there + back * 1.2);
+                        p.facing = (-back.x).atan2(-back.z);
+                        eprintln!("verify-check: put 1.2 m from {g:#x} at {there:.1}");
+                    }
+                    _ => eprintln!(
+                        "verify-check: none of {wanted:x?} is a person here (people's guids: {:x?})",
+                        game.scene
+                            .people
+                            .npcs
+                            .iter()
+                            .filter_map(|n| n.spawn)
+                            .filter(|s| *s >= 0x4000_0000)
+                            .collect::<Vec<_>>()
+                    ),
+                }
+            }
+            if (t - at - 1.0).abs() < tick / 2.0 {
+                if options.knock_target || options.kill_target {
+                    if let Some(n) = game
+                        .scene
+                        .people
+                        .npcs
+                        .iter_mut()
+                        .find(|n| n.alive && n.spawn.is_some_and(|s| wanted.contains(&s)))
+                    {
+                        if options.kill_target {
+                            eprintln!("verify-check: {:?} is killed", n.spawn);
+                            n.hurt(f32::INFINITY, m2_math::glam::Vec3::ZERO);
+                        } else {
+                            eprintln!("verify-check: {:?} is knocked down", n.spawn);
+                            n.knock_down();
+                        }
+                    }
+                } else {
+                    eprintln!("verify-check: she bashes");
+                    // Her weapons, put away by the HQ, in hand again.
+                    if let Some(p) = game.scene.player.as_mut() {
+                        p.holstered = false;
+                    }
+                    intent.trigger.melee = true;
+                }
+            }
+        }
+        // `--call-extraction <s>`: that long after the contract, the
+        // support menu's extraction helicopter (the verify objective's
+        // free `Extraction_*` item) is called in as a player would, its
+        // designator thrown; once the helicopter has been down a while she
+        // is put by it (verify-check lines).
+        if let (Some(at), Some(done)) = (options.call_extraction, contract_done) {
+            use crate::support::{Aim, Entry, Phase};
+            let t = i.saturating_sub(done) as f32 * tick;
+            match extraction {
+                0 if t >= at => {
+                    let index = game.support.entries().iter().position(
+                        |e| matches!(e, Entry::Stocked(s) if s.key.starts_with("Extraction")),
+                    );
+                    match index {
+                        Some(k) => {
+                            eprintln!("verify-check: she calls in the extraction helicopter");
+                            game.support.selected = k;
+                            intent.trigger.support = true;
+                            extraction = 1;
+                        }
+                        None => {
+                            eprintln!("verify-check: no extraction helicopter in the support menu");
+                            extraction = 9;
+                        }
+                    }
+                }
+                // The menu up: her pick. Her PDA open keeps it shut (closed
+                // first, as `--shop-check` does), and it is asked again
+                // each second till it opens.
+                1 => {
+                    extraction_seen += tick;
+                    if game.support.phase == Phase::Menu {
+                        intent.use_pressed = true;
+                        extraction = 2;
+                        extraction_seen = 0.0;
+                    } else if game.support.pda {
+                        extraction_tap = !extraction_tap;
+                        intent.trigger.pda = extraction_tap;
+                    } else if extraction_seen >= 1.0 {
+                        eprintln!(
+                            "verify-check: the support menu is {:?}; asked again",
+                            game.support.phase
+                        );
+                        intent.trigger.support = true;
+                        extraction_seen = 0.0;
+                    }
+                }
+                2 => {
+                    if game.combat.to_throw {
+                        intent.trigger.throw = true;
+                    }
+                    if let Phase::Designating { aim, .. } = game.support.phase {
+                        extraction_tap = !extraction_tap;
+                        intent.trigger.fire = match aim {
+                            Aim::Satellite => extraction_tap,
+                            Aim::Laser => true,
+                        };
+                    }
+                    if let Some((heli, there)) =
+                        link.labelled("ExtractionHelicopter").first().copied()
+                    {
+                        extraction_seen += tick;
+                        if extraction_seen >= 45.0
+                            && let Some(p) = game.scene.player.as_mut()
+                        {
+                            let back = (p.character.position - there)
+                                .with_y(0.0)
+                                .normalize_or(m2_math::glam::Vec3::X);
+                            p.drop_at(there + back * 5.0);
+                            eprintln!(
+                                "verify-check: put 5 m from the extraction helicopter {heli:#x} at {there:.1}"
+                            );
+                            extraction = 3;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         game.step(intent, tick);
         link.tick(game, tick);
+        game.dress(backend);
         // `--context exit,enter,talk`: each in turn, once the last is done.
         if let Some(want) = options
             .context
@@ -3314,6 +3690,53 @@ fn mission_for_screenshot(
             if h.running() {
                 let prompts = h.view().map(|v| v.prompts).unwrap_or_default();
                 hijack_pad.answer(&prompts, &mut hijack_input, hijack_t);
+                // A picture each second and a half of the hijack (eight
+                // at most), with where she is in the vehicle.
+                hijack_running += tick;
+                if hijack_shots < 8 && hijack_running >= 1.5 * hijack_shots as f32 {
+                    hijack_shots += 1;
+                    render(backend, game, fov, aspect, None)?;
+                    let shot = out.with_file_name(format!("{stem}-hijack{hijack_shots}.ppm"));
+                    write_ppm(backend, &shot)?;
+                    eprintln!(
+                        "hijack shot {hijack_shots} at {hijack_running:.1} s: her in the vehicle {:.2?}",
+                        h.her_in_vehicle(game)
+                            .map(|(at, _, clip)| (at.to_array(), clip))
+                    );
+                }
+            } else if auto.is_some() {
+                // With --autoplay she walks up to it herself (her goal
+                // for a vehicle the scripts mark), and her use key there
+                // starts the hijack, as a player's does.
+                let near = |g: &Game| {
+                    let here = g.focus();
+                    let world = g.scene.world.as_ref()?;
+                    link.marks()
+                        .iter()
+                        .filter(|m| m.kind == "action" && m.alive)
+                        .filter_map(|m| g.scene.vehicles.iter().find(|v| v.guid == Some(m.target)))
+                        .filter_map(|v| {
+                            let at = world.physics.vehicle_transform(v.id?)?;
+                            let d = at
+                                .transform_point3(m2_math::glam::Vec3::ZERO)
+                                .distance(here);
+                            (d < HIJACK_REACH).then(|| (v.spec.label.clone(), d))
+                        })
+                        .next()
+                };
+                if !h.loading()
+                    && on_foot
+                    && intent.use_pressed
+                    && hijack_use.is_none_or(|u| i > u + (3.0 / tick) as u32)
+                    && let Some((label, d)) = near(&*game)
+                {
+                    hijack_tries += 1;
+                    hijack_use = Some(i + 1);
+                    eprintln!(
+                        "hijack: try {hijack_tries}: she presses use {d:.1} m from the {label}                          the action marker is on, {:.1} s in",
+                        i as f32 * tick
+                    );
+                }
             } else if !h.loading()
                 && on_foot
                 && hijack_tries < 5
@@ -3374,6 +3797,8 @@ fn mission_for_screenshot(
                     let b = match name {
                         "up" => Some("BUTTON_PAD1_U"),
                         "down" => Some("BUTTON_PAD1_D"),
+                        "left" => Some("BUTTON_PAD1_L"),
+                        "right" => Some("BUTTON_PAD1_R"),
                         "accept" => Some("BUTTON_PAD2_D"),
                         "back" => Some("BUTTON_PAD2_R"),
                         _ => None,
@@ -3421,10 +3846,23 @@ fn mission_for_screenshot(
         // is in; 15 s on, she hurts the nearest of them; who stands with
         // which side is logged every 5 s from the visit.
         if let (Some(f), Some(done)) = (options.visit_faction.as_deref(), contract_done) {
+            // `Oil:watch`: she only watches, hurting nobody.
+            let (f, hurts) = f.strip_suffix(":watch").map_or((f, true), |f| (f, false));
             let t = i.saturating_sub(done) as f32 * tick;
             if visit.is_none() && t >= 30.0 {
                 let her = game.focus();
+                // `Radio`: the nearest radio whose layer is in, 10 m off.
+                let radio = f == "Radio";
                 let spot = game.scene.world.as_ref().and_then(|w| {
+                    if radio {
+                        return w
+                            .index
+                            .music_sources
+                            .iter()
+                            .filter(|s| game.scene.people.layer_in(Some(s.layer)))
+                            .min_by(|a, b| a.at.distance(her).total_cmp(&b.at.distance(her)))
+                            .map(|s| (s.at, format!("radio {:#x}", s.entity)));
+                    }
                     w.index
                         .spawns
                         .iter()
@@ -3446,8 +3884,9 @@ fn mission_for_screenshot(
                 match (spot, game.scene.player.as_mut()) {
                     (Some((at, name)), Some(p)) => {
                         let away = (her - at).with_y(0.0).normalize_or(m2_math::glam::Vec3::X);
-                        p.drop_at(at + away * 25.0);
-                        eprintln!("faction-check: {f}: put 25 m from {name} at {at:.1}");
+                        let off = if radio { 10.0 } else { 25.0 };
+                        p.drop_at(at + away * off);
+                        eprintln!("faction-check: {f}: put {off:.0} m from {name} at {at:.1}");
                         visit = Some(0.0);
                     }
                     _ => {
@@ -3461,7 +3900,7 @@ fn mission_for_screenshot(
             if let Some(v) = visit.as_mut().filter(|v| v.is_finite()) {
                 *v += tick;
                 let her = game.focus();
-                if (*v - 15.0).abs() < tick / 2.0 {
+                if hurts && (*v - 15.0).abs() < tick / 2.0 {
                     let near = game
                         .scene
                         .people
@@ -3503,6 +3942,14 @@ fn mission_for_screenshot(
                         game.scene.people.pursuit,
                         game.scene.people.hostile
                     );
+                }
+                // And a picture with the game's HUD (its faction meters)
+                // 40 s on.
+                if (*v - 40.0).abs() < tick / 2.0
+                    && let Some((hud, _)) = late_hud.as_mut()
+                {
+                    render(backend, game, fov, aspect, Some(hud))?;
+                    write_ppm(backend, &picture("faction40".into()))?;
                 }
             }
         }
@@ -3792,16 +4239,21 @@ fn mission_for_screenshot(
                 }
             }
         }
-        if auto.is_some() && link.completed() && contract_done.is_none() {
+        if auto.is_some() && link.contracts_completed() > contracts_seen {
+            contracts_seen = link.contracts_completed();
             eprintln!(
-                "autoplay: contract completed after {:.1} s of play ({:.0} s here)",
+                "autoplay: contract {contracts_seen} completed after {:.1} s of play ({:.0} s here)",
                 i as f32 * tick,
                 played.elapsed().as_secs_f32()
             );
-            // She stops playing; the scripts go on (--after-contract).
-            contract_done = Some(i);
+            contract_done.get_or_insert(i);
+            // She stops playing once the last asked for is done; the
+            // scripts go on (--after-contract).
+            if contracts_seen >= options.contracts.max(1) {
+                play_done = Some(i);
+            }
         }
-        if contract_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
+        if play_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
             break;
         }
     }
@@ -3849,6 +4301,7 @@ fn mission_for_screenshot(
         }
         game.step(Intent::default(), tick);
         link.tick(game, tick);
+        game.dress(backend);
         render(backend, game, fov, aspect, None)?;
     }
     let view = link.view();
@@ -3957,6 +4410,11 @@ fn hijack_for_screenshot(
     for _ in 0..60 {
         hijacks.tick(game, &mut input, tick);
         game.step(Intent::default(), tick);
+    }
+    // `--grapple`: from 40 m off, facing it, she hooks the helicopter and
+    // is pulled to its entrance, which starts its hijack.
+    if options.grapple && !grapple_in(game, &mut hijacks, &mut input, i, tick) {
+        return Ok(());
     }
     let Some(view) = hijacks.view() else {
         eprintln!(
@@ -4080,17 +4538,108 @@ struct ContextCheck {
 
 /// The pad button a key stands for in a dialog box the scripts put up
 /// (`MrxGuiDialogBox._HandleInputEvent` reads the pad's d-pad or left
-/// stick up and down, A to take the option, B to back out): the arrows or
-/// W and S step, Enter, Space or E take, Escape or Backspace back out.
-/// Which keys is invented (the PC's bindings for the box aren't read).
+/// stick up and down, A to take the option, B to back out; the wager's
+/// `MrxGuiNumericBox` left and right too, between its digits and its
+/// buttons): the arrows or WASD step, Enter, Space or E take, Escape or
+/// Backspace back out. Which keys is invented (the PC's bindings for the
+/// boxes aren't read).
 fn dialog_button(code: KeyCode) -> Option<&'static str> {
     Some(match code {
         KeyCode::ArrowUp | KeyCode::KeyW => "BUTTON_PAD1_U",
         KeyCode::ArrowDown | KeyCode::KeyS => "BUTTON_PAD1_D",
+        KeyCode::ArrowLeft | KeyCode::KeyA => "BUTTON_PAD1_L",
+        KeyCode::ArrowRight | KeyCode::KeyD => "BUTTON_PAD1_R",
         KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space | KeyCode::KeyE => "BUTTON_PAD2_D",
         KeyCode::Escape | KeyCode::Backspace => "BUTTON_PAD2_R",
         _ => return None,
     })
+}
+
+/// `--grapple` with `--screenshot --drive --hijack`: puts her 40 m from
+/// helicopter `i`'s entrance, lets her land, fires the grappling hook at
+/// it as if aimed and keyed, and runs the line until the helicopter's
+/// hijack starts (logging the hook's flight, the pull and the hand-off).
+/// False if it never starts.
+fn grapple_in(
+    game: &mut Game,
+    hijacks: &mut hijack::Hijacks,
+    input: &mut Input,
+    i: usize,
+    tick: f32,
+) -> bool {
+    use m2_math::glam::Vec3;
+    let label = game.scene.vehicles[i].spec.label.clone();
+    let Some(door) = grapple::entrance(game, i) else {
+        eprintln!("grapple: the {label} is no helicopter");
+        return false;
+    };
+    if let Some(p) = game.scene.player.as_mut() {
+        let here = p.character.position;
+        let away = (here - door).with_y(0.0).normalize_or(Vec3::X);
+        p.character.position = (door + away * 40.0).with_y(here.y);
+        p.character.velocity = Vec3::ZERO;
+        p.landed = false;
+    }
+    for _ in 0..90 {
+        hijacks.tick(game, input, tick);
+        game.step(Intent::default(), tick);
+    }
+    let Some(her) = game.scene.player.as_ref().map(|p| p.character.position) else {
+        return false;
+    };
+    eprintln!(
+        "grapple: {:.1} m from the {label}'s entrance ({:.1} m up)",
+        her.distance(door),
+        door.y - her.y
+    );
+    let mut g = std::mem::take(&mut game.grapple);
+    g.enabled = true;
+    g.aim(game, door - her);
+    let fired = g.fire();
+    game.grapple = g;
+    if !fired {
+        eprintln!("grapple: the {label} is not in her sights within reach");
+        return false;
+    }
+    eprintln!("grapple: hook fired at the {label}");
+    for _ in 0..(20.0 / tick) as usize {
+        hijacks.tick(game, input, tick);
+        if hijacks.running() {
+            eprintln!("grapple: the {label}'s hijack started");
+            return true;
+        }
+        game.step(Intent::default(), tick);
+    }
+    eprintln!("grapple: no hijack started in 20 s");
+    false
+}
+
+/// The grappling hook's keys, each frame on foot ([`grapple`]): with the
+/// grapple `allowed`, the helicopter in her sights is picked; the use key
+/// fires the hook at it, or, on the line, lets go ("Stop grappling").
+fn grapple_keys(game: &mut Game, input: &mut Input, allowed: bool) {
+    let mut g = std::mem::take(&mut game.grapple);
+    g.enabled = allowed;
+    if g.grappling() {
+        if input.take_pressed(Action::Use) {
+            eprintln!("grapple: she lets go of the line");
+            g.release();
+        }
+    } else {
+        let yaw = game.view_heading();
+        g.aim(game, m2_math::glam::Vec3::new(yaw.sin(), 0.0, yaw.cos()));
+        if g.target.is_some() && input.take_pressed(Action::Use) {
+            let label = g
+                .target
+                .and_then(|i| game.scene.vehicles.get(i))
+                .map(|v| v.spec.label.clone())
+                .unwrap_or_default();
+            if g.fire() {
+                eprintln!("grapple: hook fired at the {label}");
+            }
+        }
+    }
+    game.grapple = g;
 }
 
 /// With `--context`: once the scripts offer a context action whose prompt
@@ -4232,6 +4781,47 @@ fn plough_at(game: &mut Game, kind: &str) -> bool {
             placed.template,
             spot.with_y(ground)
         );
+        return true;
+    }
+    // `car`: the nearest other vehicle parked (within 150 m), to crash
+    // into ([`crate::combat::Combat::vehicle_crashes`]).
+    if kind == "car" {
+        let Some((j, at)) = game
+            .scene
+            .vehicles
+            .iter()
+            .enumerate()
+            .filter(|&(j, v)| j != i && !v.wrecked)
+            .filter_map(|(j, v)| {
+                let at = world.physics.vehicle_transform(v.id?)?.w_axis.truncate();
+                Some((j, at))
+            })
+            .filter(|(_, at)| at.distance(here) < 150.0)
+            .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
+        else {
+            eprintln!("plough: no other vehicle within 150 m of {here:.1}");
+            return false;
+        };
+        let back = (here - at).with_y(0.0).normalize_or(Vec3::X);
+        let spot = at + back * 14.0;
+        let ground = world
+            .physics
+            .island_below(spot.with_y(spot.y + 200.0), 400.0)
+            .unwrap_or(spot.y);
+        let ahead = -back;
+        let turn = Quat::from_rotation_y(ahead.x.atan2(ahead.z));
+        world.physics.remove_vehicle(id);
+        let v = &mut game.scene.vehicles[i];
+        v.id = Some(
+            world
+                .physics
+                .add_vehicle_turned(&v.spec, spot.with_y(ground + 1.0), turn),
+        );
+        let (mine, theirs) = (
+            v.spec.label.clone(),
+            game.scene.vehicles[j].spec.label.clone(),
+        );
+        eprintln!("plough: the {mine} parked 14 m short of the {theirs} at {at:.1}, facing it");
         return true;
     }
     let wanted = |w: &m2_engine::World, o: usize| {
@@ -5786,6 +6376,8 @@ struct Running {
     dialog_keys: Vec<&'static str>,
     /// The developer's keys work ([`App::dev`]).
     dev: bool,
+    /// `--grapple`: the grappling hook without the scripts' leave.
+    grapple: bool,
     /// The cheat menu's god mode and infinite ammo ([`cheats::keep_up`]).
     cheats: cheats::Toggles,
     /// The letters typed in play, for the cheat menu's code ([`cheats::CODE`]).
@@ -5809,6 +6401,8 @@ struct App {
     /// it, and a quick load puts the world back without the scripts'
     /// state.
     dev: bool,
+    /// `--grapple`: the grappling hook without the scripts' leave.
+    grapple: bool,
     /// Run the mission scripts.
     mission: bool,
     /// Lua to run before they start (`--mission-driver`).
@@ -5939,6 +6533,7 @@ impl App {
             buttons: Vec::new(),
             dialog_keys: Vec::new(),
             dev: self.dev,
+            grapple: self.grapple,
             cheats: cheats::Toggles::default(),
             cheat_code: cheats::CodeWatch::default(),
             cheat_typed: false,
@@ -6723,6 +7318,14 @@ impl Running {
                 h.tick(&mut self.game, &mut self.input, TICK.as_secs_f32())
             });
         }
+        // The grappling hook: on once the scripts allow it (or with
+        // `--grapple`); the use key fires it at the helicopter in her
+        // sights, or lets go of the line.
+        let allowed = self.grapple || self.mission.as_ref().is_some_and(|m| m.grapple_enabled());
+        grapple_keys(&mut self.game, &mut self.input, allowed);
+        if let Some(m) = &mut self.mission {
+            m.set_grappling(self.game.grapple.grappling());
+        }
         spans::time("game", || {
             self.game.tick(
                 &mut self.input,
@@ -6738,6 +7341,7 @@ impl Running {
         }
         if let Some(m) = &mut self.mission {
             spans::time("scripts", || m.tick(&mut self.game, TICK.as_secs_f32()));
+            self.game.dress(&mut self.backend);
             let (lines, hushed) = m.take_lines();
             for (id, cue, at) in lines {
                 if let Some(seconds) = self.audio.say(id, &cue, at) {
@@ -6760,11 +7364,22 @@ impl Running {
             if let Some(cue) = m.take_music() {
                 self.audio.music_cue(cue.as_deref());
             }
+            if let Some(preset) = m.take_reverb() {
+                self.audio.set_reverb(preset);
+            }
         }
         self.answer_saves(config.options.autosave);
         let (ear, facing) = self.game.listener();
         self.audio.update(ear, facing);
-        if self.audio.ambient_due(TICK.as_secs_f32()) {
+        // The ambience region the listener is in plays its own bed and
+        // one-shots; until they are read, the town's or jungle's stand in.
+        let zone = self.game.scene.world.as_ref().and_then(|w| {
+            m2_engine::sound_regions::ambience_at(&w.index.sound_regions, ear.x, ear.z)
+                .and_then(|r| r.ambience)
+        });
+        if !self.audio.zone_ambience(zone, ear, TICK.as_secs_f32())
+            && self.audio.ambient_due(TICK.as_secs_f32())
+        {
             let town = self.game.near_town();
             self.audio.play_ambient(town, ear);
         }

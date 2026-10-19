@@ -196,11 +196,29 @@ pub struct Game {
     /// Seconds the HUD's save icon has left up after the game was saved
     /// ([`SAVE_ICON_SECONDS`]).
     pub save_icon: f32,
+    /// Clips the scripts hold characters in by name (a faction HQ's
+    /// briefing, [`crate::raw`]).
+    pub raw: crate::raw::RawClips,
+    /// The model the scripts last dressed the player in
+    /// (`Player.SetOutfit`: the wardrobe), till it is put on her
+    /// ([`Game::dress`]).
+    pub outfit_wanted: Option<String>,
+    /// Her grappling hook ([`crate::grapple`]).
+    pub grapple: crate::grapple::Grappler,
+    /// The grapple pulled her to a helicopter's entrance: its hijack is
+    /// to start as the use key starts it ([`crate::hijack`]).
+    pub grapple_handoff: bool,
     /// Seconds before the factions' attitudes are asked of the scripts again.
     pub attitude_wait: f32,
     /// Witnesses reporting her: guid, faction and seconds since they set
     /// off ([`crate::mission`]).
     pub reporters: Vec<(u32, &'static str, f32)>,
+    /// Whether an army pursued her last frame.
+    pub pursued: bool,
+    /// Keyed actions the scripts asked for (`Human.DoAction`: the player's
+    /// verify photo `VerifyCamera`), each with its seconds left, ended for the
+    /// scripts' `HumanActionComplete` ([`crate::mission`]).
+    pub actions: Vec<(u32, String, f32)>,
 }
 
 /// A camera shot the scripts asked for (`Camera.SetShot`): the engine's
@@ -348,8 +366,14 @@ impl Game {
             context_taken: None,
             shot: None,
             save_icon: 0.0,
+            raw: crate::raw::RawClips::default(),
+            outfit_wanted: None,
+            grapple: crate::grapple::Grappler::default(),
+            grapple_handoff: false,
             attitude_wait: 0.0,
             reporters: Vec::new(),
+            pursued: false,
+            actions: Vec::new(),
             scripts_seated: false,
         }
     }
@@ -1098,6 +1122,21 @@ impl Game {
                 &mut self.destruction,
                 self.scene.install.as_ref(),
             );
+            // Vehicles running into each other hurt each other and the
+            // parts where they met.
+            for (struck, other, closing, damage) in self
+                .combat
+                .vehicle_crashes(&mut world.physics, &mut self.scene.vehicles)
+            {
+                let v = &self.scene.vehicles[struck];
+                eprintln!(
+                    "crash: the {} hit by the {} at {closing:.1} m/s takes {damage:.1} ({:.0} of {:.0} left)",
+                    v.spec.label,
+                    self.scene.vehicles[other].spec.label,
+                    (v.most_health() - v.damage).max(0.0),
+                    v.most_health()
+                );
+            }
             // What came down (to a vehicle, the traffic's too, or a blast
             // last tick) comes down whether she is on foot or the free
             // camera flies: its island copy has lost its collision already.
@@ -1289,7 +1328,45 @@ impl Game {
         self.run_particles(dt);
         split("game: effects");
         self.scene.tick(dt);
+        self.raw.tick(&mut self.scene, dt);
+        self.grapple_tick(dt);
         split("game: scene");
+    }
+
+    /// The grappling hook's line: the hook flies, or she is pulled in; on
+    /// arrival the helicopter's hijack is handed the start.
+    fn grapple_tick(&mut self, dt: f32) {
+        if let Some(world) = &self.scene.world
+            && let Some(&g) = world.index.template_db.grapple.values().next()
+        {
+            self.grapple.params = g;
+        }
+        let mut grapple = std::mem::take(&mut self.grapple);
+        match grapple.tick(self, dt) {
+            Some(crate::grapple::Outcome::Hooked { seconds, metres }) => {
+                eprintln!("grapple: hooked {metres:.1} m away after {seconds:.2} s")
+            }
+            Some(crate::grapple::Outcome::Missed) => eprintln!("grapple: the hook missed"),
+            Some(crate::grapple::Outcome::Arrived { seconds }) => {
+                eprintln!("grapple: pulled to the entrance in {seconds:.2} s");
+                self.grapple_handoff = true;
+            }
+            None => {}
+        }
+        self.grapple = grapple;
+    }
+
+    /// Puts the player in the model the scripts last dressed her in
+    /// (`Player.SetOutfit`), if any is waiting: her body and clips
+    /// reloaded from it, her health, place and what she holds kept.
+    pub fn dress(&mut self, backend: &mut dyn m2_render::RenderBackend) {
+        let Some(model) = self.outfit_wanted.take() else {
+            return;
+        };
+        self.scene.outfit = Some(m2_assets::name_hash(&model));
+        eprintln!("outfit: {} dressed as {model}", self.scene.hero);
+        let hero = self.scene.hero;
+        self.scene.load_hero(backend, hero);
     }
 
     /// Sets off the game's effects the fight asked for and runs them.

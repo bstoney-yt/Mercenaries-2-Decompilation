@@ -183,7 +183,7 @@ return true
 /// `MrxGuiDialogBox` (its widgets, fonts and pad handling), or taken down.
 /// The option picked goes into `__m2_hud_choices` with the call's number,
 /// for the mission's callback ([`GameHud::take_choices`]).
-const DIALOG_CALL: &str = r#"
+const DIALOG_CALL: &str = r##"
 local method, data, seq = ...
 __m2_dialog_boxes = __m2_dialog_boxes or {}
 local m = rawget(_G, "MrxGuiDialogBox")
@@ -211,6 +211,29 @@ elseif method == "Scroll" and type(m.DisplayScrollingDialogBox) == "function" th
         {}, data.tOptions or {}, rest[1], rest[2], rest[3])
     __m2_dialog_boxes[seq] = box
     return box ~= nil
+elseif method == "Numeric" then
+    -- The wager's digit box: the value accepted, or -1 - the value for a
+    -- cancel (each callback's last argument is the value).
+    local nb = rawget(_G, "MrxGuiNumericBox")
+    if type(nb) ~= "table" or type(nb.DisplayNumericBox) ~= "function" then return false end
+    local p, r = data.tArgs or {}, data.tRest or {}
+    local function answer(v)
+        __m2_hud_choices = __m2_hud_choices or {}
+        table.insert(__m2_hud_choices, { seq, v })
+        __m2_dialog_boxes[seq] = nil
+    end
+    local function last(...)
+        local n = select("#", ...)
+        if n == 0 then return 0 end
+        return tonumber((select(n, ...))) or 0
+    end
+    local box = nb.DisplayNumericBox(Player.GetLocalPlayer(), p[1], p[2], p[3], p[4], p[5],
+        p[6], p[7], p[8], p[9], p[10],
+        function(...) answer(last(...)) end, {},
+        function(...) answer(-1 - last(...)) end, {},
+        r[1], r[2], r[3], r[4], r[5])
+    __m2_dialog_boxes[seq] = box
+    return box ~= nil
 elseif method == "Close" then
     local box = __m2_dialog_boxes[data.nBox]
     __m2_dialog_boxes[data.nBox] = nil
@@ -218,7 +241,7 @@ elseif method == "Close" then
     return true
 end
 return false
-"#;
+"##;
 
 /// The pause menu's Medevac (`MrxGuiPauseScreen` asks
 /// `MrxPlayer.CanMedEvac` to enable it, `GetMedEvacCost` for its message,
@@ -3154,7 +3177,27 @@ impl Thread {
                     Value::Table(t) => gui_runtime::fire(lua, "ControllerInput", t),
                     _ => Ok(0),
                 });
+            // Where the box's selection is now (the wager's digit box moves
+            // it with left and right): index and of how many.
+            let at: (Option<i64>, Option<i64>) = lua
+                .load(
+                    "for _, b in pairs(__m2_dialog_boxes or {}) do \
+                       local c = type(b) == 'table' and b.CustomData \
+                       if type(c) == 'table' and c.nSelectedIndex then \
+                         return c.nSelectedIndex, type(c.oSelectableList) == 'table' \
+                           and #c.oSelectableList or nil \
+                       end \
+                     end",
+                )
+                .eval()
+                .unwrap_or((None, None));
             log.push(match fired {
+                Ok(n) if at.0.is_some() => {
+                    format!(
+                        "dialog key {key}: {n} handlers, selection {:?} of {:?}",
+                        at.0, at.1
+                    )
+                }
                 Ok(n) => format!("dialog key {key}: {n} handlers"),
                 Err(e) => format!("dialog key {key}: {e}"),
             });

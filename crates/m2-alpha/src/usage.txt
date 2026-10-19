@@ -53,6 +53,10 @@ m2-alpha [options]
                          (default 3), logging each second where she is, how
                          deep the sea is over her feet and whether she swims
                          (walk lines)
+  --npc-swim <metres>    with --gait on the island: put the nearest soldier
+                         this far ahead of her in the water at the start,
+                         logging each second whether he swims (npc-swim
+                         lines)
   --config <file>        settings file (default m2-alpha.toml)
   --size <w>x<h>         window size
   --vsync on|off
@@ -94,7 +98,8 @@ m2-alpha [options]
                          until it comes down, at most n rockets, logging
                          its damage; pictures -before, -1s, -2s and -6s
   --plough <kind>        with --drive: park facing the nearest fence,
-                         plant, lamp or box (within 150 m) and drive
+                         plant, lamp, box or car (another vehicle, 14 m
+                         off) within 150 m and drive
                          straight through it
   --vehicle <name>       with --drive: get in the nearest vehicle whose
                          name holds this (stryker, m1a1, amx30, hmmwv...)
@@ -187,6 +192,9 @@ m2-alpha [options]
                          keys its stick)
   --hijack               with --screenshot --drive: hijack the vehicle
                          (--vehicle's) instead, answering every prompt
+                         (with --mission: the vehicle an objective's action
+                         marker is on, with pictures -hijack1 to -hijack8
+                         1.5 s apart while it runs)
   --placed-check         with --mission: every 5 s, try each pickup, crate and
                          emplaced gun the layers have put out (logged as
                          placed-check lines), for testing
@@ -196,7 +204,8 @@ m2-alpha [options]
                          it and take it with the use key, logging where she
                          is after (context-check lines)
   --dialog-keys <keys>   with --mission --after-contract: the keys pressed in a
-                         dialog box the scripts put up (up, down, accept,
+                         dialog box the scripts put up (up, down, left,
+                         right, accept,
                          back; comma-separated), the first 3 s after it
                          opens and each 2 s on (dialog-check lines)
   --medevac <s>          with --mission --after-contract: this long after the
@@ -204,8 +213,19 @@ m2-alpha [options]
                          the scripts allow it then (medevac-check lines)
   --visit-faction <f>    with --mission --after-contract: 30 s after the
                          contract, put her by a soldier of faction <f> (All,
-                         Chi, Gur, Oil, Pir, Vza), hurt one 15 s on, and log
-                         who fights her (faction-check lines)
+                         Chi, Gur, Oil, Pir, Vza; Radio: 10 m from the
+                         nearest radio), hurt one 15 s on, and log
+                         who fights her (faction-check lines); <f>:watch
+                         hurts nobody; a picture with the HUD 40 s on
+                         (-faction40)
+  --bash-target <s>      with --mission --after-contract: this long after the
+                         contract, put her by the person the scripts' first
+                         marker is over and bash them (verify-check lines);
+                         <s>k knocks them down instead, <s>d kills them
+  --call-extraction <s>  with --mission --after-contract: this long after the
+                         contract, call in the extraction helicopter from the
+                         support menu, and once it has been about 45 s put her
+                         5 m from it (verify-check lines)
   --jump-with-enter      with --mission --autoplay --after-contract: the
                          Enter pressed after the contract jumps too, as the
                          pad's A; where she is while the scripts hold her
@@ -226,6 +246,9 @@ m2-alpha [options]
   --cheat-menu <page>    with --screenshot: the F7 cheat menu up at that page
                          (weapons, vehicles, support, player), alone over
                          black
+  --bombs                with --mission --autoplay: while she drives a
+                         vehicle with a bomb bay (the Osprey), drop a bomb
+                         every two seconds
   --cheat-check          with --mission --autoplay: once she is ashore, try
                          the F7 cheat menu's cheats (every weapon, a few
                          vehicles of each kind, every support item, a
@@ -236,6 +259,9 @@ m2-alpha [options]
                          first and show her sitting in the vehicle
                          (also <stem>-seated.ppm before it moves)
   --mission-seconds <s>  with --screenshot: play this long instead of ten
+  --contracts <n>        with --mission --autoplay: play on through this
+                         many contracts in story order (the first, then
+                         PmcCon001, ...) before she stops (default 1)
   --look-pickup <m>      with --screenshot: take the picture from this far
                          off the pickup lying nearest her, looking at it
   --mission-look <m>     with --mission --screenshot: take the picture from
