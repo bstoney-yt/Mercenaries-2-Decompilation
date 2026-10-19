@@ -1985,6 +1985,18 @@ impl MissionLink {
         matches!(self.state, State::Running(_))
     }
 
+    /// Whether the scripts let her grapple (`Player.SetGrappleEnabled`).
+    pub fn grapple_enabled(&self) -> bool {
+        matches!(&self.state, State::Running(m) if m.grapple_enabled())
+    }
+
+    /// Tells the scripts whether she is on her grappling hook's line.
+    pub fn set_grappling(&mut self, on: bool) {
+        if let State::Running(m) = &mut self.state {
+            m.set_grappling(on);
+        }
+    }
+
     /// The scripts' vehicles in play: label, and where it stands if
     /// placed.
     pub fn vehicles(game: &Game) -> Vec<(String, Option<Vec3>)> {

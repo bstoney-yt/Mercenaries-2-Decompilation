@@ -581,6 +581,12 @@ pub struct ScriptWorld {
     /// The costume the player's profile keeps (`Player.GetProfileCostume`,
     /// `SetProfileCostume`: the wardrobe's pick, counted from 0).
     pub profile_costume: f64,
+    /// The scripts let the player grapple (`Player.SetGrappleEnabled`:
+    /// on once the PMC has a mechanic, 01a266d2).
+    pub grapple_enabled: bool,
+    /// The player is on her grappling hook's line (`Human.IsGrappling`),
+    /// as the game last said.
+    pub grappling: bool,
     /// The crews the layers' vehicles came into play with, by vehicle:
     /// (seat, rider template), as each entity's own `Rider` records say
     /// (the HQ interior's `HqInterior` seats Fiona, its PMC boss), else
@@ -1667,6 +1673,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // Human.IsGrappling(character): the player's, as the game says; no
+    // one else grapples.
+    add(&human, "IsGrappling", |w, _, a| {
+        let her = id(a.first()).is_some_and(|g| Some(g) == w.player);
+        values([Value::Boolean(her && w.grappling)])
+    })?;
     // Human.DisableWeapons(character) / EnableWeapons(character).
     add(&human, "DisableWeapons", |w, _, a| {
         if let Some(guid) = id(a.first()) {
@@ -2052,6 +2064,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             let model = model.to_string_lossy();
             w.commands.push(Command::Outfit { guid, model });
         }
+        values([])
+    })?;
+    // Player.SetGrappleEnabled(player, on): the one call site turns it on
+    // for each player as the mechanic joins the PMC.
+    add(&player, "SetGrappleEnabled", |w, _, a| {
+        w.grapple_enabled = !matches!(a.get(1), None | Some(Value::Nil | Value::Boolean(false)));
         values([])
     })?;
     add(&player, "GetFuel", |w, _, _| {
@@ -3276,6 +3294,25 @@ mod tests {
                 Command::PursuitClear,
             ]
         );
+    }
+
+    #[test]
+    fn the_scripts_turn_the_grapple_on_and_hear_whether_she_grapples() {
+        let (host, world) = setup();
+        let lua = host.lua();
+        // As the mechanic's joining does (01a266d2), then the HQ's checks.
+        lua.load("Player.SetGrappleEnabled(Player.GetAnyCharacter(), true)")
+            .exec()
+            .unwrap();
+        assert!(world.borrow().grapple_enabled);
+        let ask = "return Human.IsGrappling(Player.GetAnyCharacter())";
+        assert!(!lua.load(ask).eval::<bool>().unwrap());
+        world.borrow_mut().grappling = true;
+        assert!(lua.load(ask).eval::<bool>().unwrap());
+        lua.load("Player.SetGrappleEnabled(Player.GetAnyCharacter(), false)")
+            .exec()
+            .unwrap();
+        assert!(!world.borrow().grapple_enabled);
     }
 
     #[test]

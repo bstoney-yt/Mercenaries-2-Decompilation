@@ -1882,6 +1882,18 @@ end
         w.animation_events.drain(..extra);
     }
 
+    /// Whether the scripts let the player grapple
+    /// (`Player.SetGrappleEnabled`).
+    pub fn grapple_enabled(&self) -> bool {
+        self.world.borrow().grapple_enabled
+    }
+
+    /// The player is (no longer) on her grappling hook's line, for the
+    /// scripts' `Human.IsGrappling`.
+    pub fn set_grappling(&mut self, on: bool) {
+        self.world.borrow_mut().grappling = on;
+    }
+
     /// A clip the scripts played on `speaker` by name met a voice line
     /// (its `vo` events: the faction HQs' briefings are spoken by their
     /// clips, 806 lines over 258 clips, from samples): said as a scripted

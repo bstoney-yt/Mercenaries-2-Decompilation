@@ -525,8 +525,13 @@ impl Hijacks {
             if let Some(c) = &self.near {
                 let _ = crew_kind(game, &c.crew);
             }
-            if self.near.is_some() && input.take_pressed(Action::Use) {
+            // The use key, or the grappling hook having pulled her to a
+            // helicopter's entrance ([`crate::grapple`]).
+            let handed = std::mem::take(&mut game.grapple_handoff);
+            if self.near.is_some() && (handed || input.take_pressed(Action::Use)) {
                 self.begin(game);
+            } else if handed {
+                eprintln!("grapple: no hijack in reach at the entrance");
             }
         }
         let State::Ready(l) = &mut self.state else {
@@ -1631,7 +1636,12 @@ pub fn beside(game: &mut Game, hijacks: &mut Hijacks, want: Option<&str>) -> Opt
         .enumerate()
         .filter(|(_, v)| !v.wrecked && by_model.contains_key(&v.spec.model))
         .filter(|(_, v)| driver(&v.crew).is_some() || hijacks.crew.is_some())
-        .filter(|(_, v)| want.is_none_or(|w| v.spec.label.to_ascii_lowercase().contains(w)))
+        .filter(|(_, v)| {
+            want.is_none_or(|w| {
+                (w == "helicopter" && v.spec.is_helicopter())
+                    || v.spec.label.to_ascii_lowercase().contains(w)
+            })
+        })
         .filter_map(|(i, v)| Some((i, world.physics.vehicle_transform(v.id?)?)))
         .min_by(|a, b| {
             let d = |m: &m2_math::glam::Mat4| m.transform_point3(Vec3::ZERO).distance(here);
