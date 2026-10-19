@@ -4,6 +4,7 @@
 //! m2-alpha [--install <dir>] [--spawn <x>,<z>] [--model <hash>]... [--gait <gait>]
 //!          [--config <file>]
 //!          [--size <w>x<h>] [--vsync on|off] [--fullscreen] [--double-sided] [--fly]
+//!          [--display windowed|borderless|exclusive] [--refresh <hz>]
 //!          [--sea <metres>]
 //!          [--screenshot <out.ppm> [--drive | --fight]] [--write-config]
 //! ```
@@ -28,8 +29,8 @@
 //! instead, characters playing the game's locomotion clips in place (N
 //! steps through idle, walk, run and sprint; `--gait` picks the first).
 //! A click captures the mouse (F2 lets it go), F11 or Alt+Enter toggles
-//! fullscreen, F3 toggles back-face culling, Escape releases the mouse,
-//! then quits.
+//! fullscreen ([`display`]), F3 toggles back-face culling, Escape releases
+//! the mouse, then quits.
 //!
 //! `--screenshot` on the island waits for the ground, lands the player and,
 //! with `--gait walk|run|sprint`, runs her forward for three seconds before
@@ -100,7 +101,6 @@ use m2_engine::{Gait, Install, WorldSettings};
 use m2_render::gpu::WgpuBackend;
 use m2_render::{DrawQueue, RenderBackend};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -414,6 +414,10 @@ struct Options {
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
     fullscreen: bool,
+    /// `--display`: windowed, borderless or exclusive.
+    display: Option<display::DisplayMode>,
+    /// `--refresh`: exclusive fullscreen's rate.
+    refresh: Option<u32>,
     screenshot: Option<PathBuf>,
     write_config: bool,
 }
@@ -505,6 +509,14 @@ fn parse_args() -> anyhow::Result<Options> {
                 })
             }
             "--fullscreen" => o.fullscreen = true,
+            "--display" => {
+                o.display = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e: String| anyhow::anyhow!("--display {e}"))?,
+                )
+            }
+            "--refresh" => o.refresh = Some(value()?.parse().context("--refresh expects hertz")?),
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
             "--dev" => o.dev = true,
@@ -790,11 +802,13 @@ fn parse_args() -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 11] = [
+    const PLAIN: [&str; 13] = [
         "--install",
         "--config",
         "--size",
         "--fullscreen",
+        "--display",
+        "--refresh",
         "--vsync",
         "--no-boot",
         "--to-front-end",
@@ -878,7 +892,15 @@ fn main() -> anyhow::Result<()> {
     if let Some(v) = options.vsync {
         config.window.vsync = v;
     }
-    config.window.fullscreen |= options.fullscreen;
+    if options.fullscreen && config.window.mode == display::DisplayMode::Windowed {
+        config.window.mode = display::DisplayMode::Borderless;
+    }
+    if let Some(mode) = options.display {
+        config.window.mode = mode;
+    }
+    if let Some(hz) = options.refresh {
+        config.window.refresh = hz;
+    }
     if let Some(sea) = options.sea {
         config.world.sea_level = sea;
     }
@@ -6649,6 +6671,8 @@ struct Running {
     focused: bool,
     /// Alt is held (Alt+Enter toggles fullscreen).
     alt: bool,
+    /// What F11 and Alt+Enter toggle between.
+    display: display::Display,
     /// The pause menu's keyboard table waits for a key or mouse button:
     /// the next one pressed goes to it, not to play.
     capturing: bool,
@@ -6742,17 +6766,18 @@ struct App {
 impl App {
     fn start(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<Running> {
         let w = &self.config.window;
-        let mut attributes = Window::default_attributes()
+        let monitor = event_loop.primary_monitor();
+        // Windowed, no larger than the monitor; fullscreen as the
+        // settings keep it ([`display`]).
+        let (full, how) =
+            display::fullscreen_for(monitor.clone(), w.mode, (w.width, w.height), w.refresh);
+        let attributes = Window::default_attributes()
             .with_title("Mercenaries 2 (alpha)")
-            .with_inner_size(PhysicalSize::new(w.width, w.height));
-        if w.fullscreen {
-            // At the kept mode (the pause menu's video screen), or
-            // borderless at the monitor's own.
-            let full =
-                display::fullscreen_at(event_loop.primary_monitor(), w.width, w.height, w.refresh);
-            attributes = attributes.with_fullscreen(Some(full));
-        }
+            .with_inner_size(display::fit((w.width, w.height), monitor.as_ref()))
+            .with_fullscreen(full);
         let window = Arc::new(event_loop.create_window(attributes)?);
+        let display = display::Display::new(w);
+        eprintln!("display: start {how}: {}", display::describe(&window));
         let size = window.inner_size();
         let mut backend =
             WgpuBackend::for_window(window.clone(), size.width, size.height, w.vsync)?;
@@ -6796,6 +6821,7 @@ impl App {
                 adapter.name, adapter.backend
             ),
             window,
+            display,
             backend,
             game,
             audio: {
@@ -7227,16 +7253,12 @@ impl Running {
         if v == display::current(window) {
             return;
         }
-        let how = display::apply(window, v);
+        let how = display::apply(window, v, &mut config.window);
         eprintln!(
             "{menu}: video kept: {}, {}: {how}",
             v.resolution_text(),
             v.refresh_text()
         );
-        let w = &mut config.window;
-        (w.width, w.height) = (v.width, v.height);
-        w.fullscreen = v.fullscreen.is_some();
-        w.refresh = v.fullscreen.unwrap_or(0);
     }
 
     /// Applies the player's options that live outside the settings file's
@@ -7698,7 +7720,8 @@ impl Running {
             self.released = self.mouse_look;
         }
         if self.input.take_pressed(Action::Fullscreen) {
-            display::toggle(&self.window);
+            let how = self.display.toggle(&self.window, &mut config.window);
+            eprintln!("display: F11: {how}");
         }
         // The developer's keys are taken either way, and do nothing
         // without `--dev` in the whole game's launch.
@@ -7877,7 +7900,8 @@ impl ApplicationHandler for App {
             )
         {
             if key.state == ElementState::Pressed && !key.repeat {
-                display::toggle(&state.window);
+                let how = state.display.toggle(&state.window, &mut self.config.window);
+                eprintln!("display: Alt+Enter: {how}");
             }
             return;
         }
@@ -7897,7 +7921,15 @@ impl ApplicationHandler for App {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => state.backend.resize(size.width, size.height),
+            WindowEvent::Resized(size) => {
+                state.backend.resize(size.width, size.height);
+                state.display.resized(&state.window, size);
+                let (sw, sh) = state.backend.size();
+                eprintln!(
+                    "display: resized: {}, swapchain {sw}x{sh}",
+                    display::describe(&state.window)
+                );
+            }
             WindowEvent::Focused(focused) => {
                 // Keys pressed or released elsewhere never reach us, so start
                 // clean either way.
