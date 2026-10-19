@@ -1115,6 +1115,7 @@ impl GameAudio {
             };
             let tables = held_tables(&tables, &mut source);
             let (mut found, mut bytes) = (0, 0);
+            let mut missing = Vec::new();
             for &key in &keys {
                 let sounds = KeySounds::resolve(&mut source, &tables, key);
                 if let Some(k) = &sounds {
@@ -1124,14 +1125,17 @@ impl GameAudio {
                         .iter()
                         .map(|(s, _)| s.samples.len() * 2)
                         .sum::<usize>();
+                } else {
+                    missing.push(format!("{key:08x}"));
                 }
                 drop(tx.send((key, sounds)));
             }
             eprintln!(
-                "sound: read {found} of {} gun firing cues ahead ({:.1} MB) in {:.2} s",
+                "sound: read {found} of {} gun firing cues ahead ({:.1} MB) in {:.2} s; none for [{}]",
                 keys.len(),
                 bytes as f32 / 1e6,
-                started.elapsed().as_secs_f32()
+                started.elapsed().as_secs_f32(),
+                missing.join(", ")
             );
         });
     }
