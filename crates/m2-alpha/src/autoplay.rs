@@ -28,6 +28,23 @@ const CRUISE_PITCH: f32 = -0.2;
 /// this (seconds), she walks round it this far out: the scripts' region
 /// may lie to a side of their marker.
 const ARRIVE: f32 = 2.5;
+/// An action objective's mark (`MrxTaskObjectiveAction`): she goes this
+/// close (metres, flat; invented, inside the 2 m reach the scripts put its
+/// prompt on with), and takes its prompt again after this long (seconds)
+/// while it is still offered.
+const ACTION_KIND: &str = "action";
+const ACTION_ARRIVE: f32 = 1.0;
+const ACTION_AGAIN: f32 = 5.0;
+/// Further above or below its object than this (metres; the alpha's
+/// `CONTEXT_RISE`, a floor's height) an action's prompt isn't offered.
+const ACTION_RISE: f32 = 2.5;
+/// Riding in the scripts' helicopter, she gets out once it has stood still
+/// this long (seconds; invented, longer than the transit's fade) and her
+/// next place is elsewhere.
+const RIDE_STILL: f32 = 20.0;
+/// Still marked this long after she got in (seconds; invented), she gets
+/// out and in again.
+const RIDE_AGAIN: f32 = 10.0;
 const CIRCLE_AFTER: f32 = 4.0;
 const CIRCLE: f32 = 6.0;
 /// At a place this long (seconds) with nothing happening, she takes one
@@ -282,6 +299,14 @@ pub struct Autoplay {
     pda_since: Option<f32>,
     pda_pressed: f32,
     pda_asked: Option<f32>,
+    /// The action objective's object whose prompt she last took, and
+    /// when; and the one she was last logged at without its prompt.
+    acted: Option<(u32, f32)>,
+    short_logged: Option<u32>,
+    /// The helicopter she rides in, where it stood still and since when.
+    ride_still: Option<(u32, Vec3, f32)>,
+    /// The helicopter she got into, and when.
+    boarded: Option<(u32, f32)>,
 }
 
 impl Autoplay {
@@ -397,8 +422,62 @@ impl Autoplay {
                 ..Intent::default()
             };
         }
+        // Riding in the scripts' helicopter (the Lucky Lady): she sits
+        // until it has stood still a while and what she is after is
+        // elsewhere, then gets out.
+        if let Some(h) = game.aboard {
+            let here = game.focus();
+            let since = match self.ride_still {
+                Some((g, at, t)) if g == h && at.distance(here) < 1.0 => t,
+                _ => {
+                    self.ride_still = Some((h, here, self.clock));
+                    self.clock
+                }
+            };
+            let after_it = matches!(&self.goal, Some(Goal::Reach { target, .. }) if *target == h);
+            // Still marked a while after she got in: the objective that
+            // waits for her getting in came after she did (PmcCon003's
+            // comes with Ewan's last line, round 4): out, and in again.
+            let boarded = match self.boarded {
+                Some(b) if b.0 == h => b,
+                _ => *self.boarded.insert((h, self.clock)),
+            };
+            if after_it && self.clock - boarded.1 > RIDE_AGAIN && game.context_taken.is_none() {
+                eprintln!(
+                    "autoplay {:.1} s: {h:#x} still marked {RIDE_AGAIN:.0} s after getting in: out and in again",
+                    self.clock
+                );
+                game.context_taken = Some(h);
+                self.boarded = None;
+                self.acted = Some((h, self.clock));
+                return Intent::default();
+            }
+            if !after_it && self.clock - since > RIDE_STILL && game.context_taken.is_none() {
+                eprintln!(
+                    "autoplay {:.1} s: {h:#x} still for {RIDE_STILL:.0} s at {here:.1}: getting out",
+                    self.clock
+                );
+                game.context_taken = Some(h);
+                self.ride_still = None;
+                self.boarded = None;
+            }
+            return Intent::default();
+        }
+        let acting = match &self.goal {
+            Some(Goal::Reach { target, .. }) => marks
+                .iter()
+                .find(|m| m.target == *target && m.kind == ACTION_KIND)
+                .map(|m| (m.target, m.at)),
+            _ => None,
+        };
+        if let Some((target, at)) = acting {
+            self.act(game, target, at);
+        }
         match self.goal.clone() {
             None => self.idle(game),
+            Some(Goal::Reach { at, .. }) if acting.is_some() => {
+                self.travel(game, at, ACTION_ARRIVE, dt)
+            }
             Some(Goal::Reach { at, .. }) => self.travel(game, at, ARRIVE, dt),
             Some(Goal::Shoot(i)) => self.shoot(game, i, dt),
             Some(Goal::Blast { at, .. }) if striking => self.strike(game, at, dt),
@@ -406,6 +485,42 @@ impl Autoplay {
             Some(Goal::Board(i)) => self.board(game, i, dt),
             Some(Goal::Open(target)) => self.open(game, target, dt),
             Some(Goal::Take(key)) => self.take(game, key, dt),
+        }
+    }
+
+    /// At an action objective's object `target` (`MrxTaskObjectiveAction`:
+    /// "Enter office", "Board the Lucky Lady"), the prompt the scripts put
+    /// on it (`Pg.AddContextAction`) is taken with the use key, as a player
+    /// would; again after [`ACTION_AGAIN`] while it is still offered. There
+    /// and not offered it (above or below her), she says so once.
+    fn act(&mut self, game: &mut Game, target: u32, at: Vec3) {
+        let offered = game.context.as_ref().is_some_and(|(g, _)| *g == target);
+        let again = self
+            .acted
+            .is_none_or(|(g, t)| g != target || self.clock - t > ACTION_AGAIN);
+        if offered && again && !game.input_locked && game.context_taken.is_none() {
+            eprintln!(
+                "autoplay {:.1} s: taking the prompt at {target:#x}",
+                self.clock
+            );
+            game.context_taken = Some(target);
+            self.acted = Some((target, self.clock));
+        } else if !offered && self.arrived.is_some() && self.short_logged != Some(target) {
+            let here = game.focus();
+            eprintln!(
+                "autoplay {:.1} s: at {target:#x} ({at:.1}) from {here:.1}, no prompt offered",
+                self.clock
+            );
+            self.short_logged = Some(target);
+            // Under or over it (the oil rig's office, a deck 43 m over
+            // the ground she walked to: round 3), with no way up found:
+            // she hops onto its floor, as a stuck way does.
+            if (at.y - here.y).abs() > ACTION_RISE {
+                let still = self.since_moved();
+                self.hop(game, at, still);
+                self.arrived = None;
+                self.fresh_headway();
+            }
         }
     }
 

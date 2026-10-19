@@ -1267,7 +1267,13 @@ impl MissionLink {
         // The scripts' context actions (the HQ's exits, a starter's talk):
         // the one she stands at is offered, and taken with the use key.
         if let Some(g) = game.context_taken.take() {
-            mission.take_context_action(g);
+            if game.aboard == Some(g) {
+                leave_ride(game, mission, g);
+            } else if rides(game, mission).iter().any(|r| r.0 == g) {
+                board_ride(game, mission, g);
+            } else {
+                mission.take_context_action(g);
+            }
         }
         // Her infractions against the factions, for their witnesses to
         // report: the first one of a faction not already reporting, a
@@ -1412,8 +1418,40 @@ impl MissionLink {
             .as_ref()
             .filter(|p| p.driving.is_none())
             .map(|p| p.character.position);
-        let offered = on_foot.and_then(|at| nearest_context(&mission.context_actions(), at));
-        let offered = offered.map(|(g, id)| (g, mission.text(&id)));
+        // Riding in a scripts' helicopter its pilot flies: she is where
+        // it is, and the use key takes her out again.
+        if let Some(g) = game.aboard {
+            let at = mission
+                .world()
+                .borrow()
+                .objects
+                .get(&g)
+                .filter(|o| o.alive)
+                .map(|o| Vec3::from(o.position));
+            match (at, game.scene.player.as_mut()) {
+                (Some(at), Some(p)) => {
+                    p.character.position = at;
+                    p.character.velocity = Vec3::ZERO;
+                }
+                _ => leave_ride(game, mission, g),
+            }
+        }
+        let offered = match game.aboard {
+            Some(g) => Some((g, RIDE_OUT.to_owned())),
+            None => on_foot
+                .and_then(|at| nearest_context(&mission.context_actions(), at))
+                .map(|(g, id)| (g, mission.text(&id)))
+                .or_else(|| {
+                    let at = on_foot?;
+                    rides(game, mission)
+                        .into_iter()
+                        .find(|(_, p)| {
+                            p.with_y(0.0).distance(at.with_y(0.0)) <= RIDE_REACH
+                                && (p.y - at.y).abs() <= CONTEXT_RISE
+                        })
+                        .map(|(g, _)| (g, RIDE_IN.to_owned()))
+                }),
+        };
         if offered != game.context {
             match &offered {
                 Some((g, text)) => eprintln!("context: {text:?} offered at {g:#x}"),
@@ -2235,6 +2273,60 @@ fn nearest_context(
         })
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, &g, text)| (g, text.clone()))
+}
+
+/// A scripts' helicopter with its own pilot that an action objective's
+/// marker is over (PmcCon003's "Board the Lucky Lady",
+/// `MrxTaskObjectiveEnterVehicle` with `bUseAnySeat`; from the scripts) is
+/// boarded within this far of it, flat, metres, with this prompt; aboard,
+/// the use key gets her out with the second. The reach and both prompts
+/// are invented: the game's own entering is not known.
+const RIDE_REACH: f32 = 4.0;
+const RIDE_IN: &str = "Get in";
+const RIDE_OUT: &str = "Get out";
+
+/// The scripts' helicopters with their own pilot ([`ai_flown`]) that an
+/// action objective's marker is over, and where they are: hers to board
+/// as a passenger ([`board_ride`]).
+fn rides(game: &Game, mission: &Mission) -> Vec<(u32, Vec3)> {
+    let Some(catalogue) = &game.scene.catalogue else {
+        return Vec::new();
+    };
+    let island = game.scene.world.as_ref();
+    let w = mission.world().borrow();
+    w.hud
+        .markers
+        .values()
+        .filter(|m| m.icon == "HUD_objective_action")
+        .filter_map(|m| m.target)
+        .filter_map(|g| {
+            let o = w.objects.get(&g).filter(|o| o.alive)?;
+            let models = object_models(g, &o.name, island, &catalogue.vehicles);
+            ai_flown(&w, g, &models).then(|| (g, Vec3::from(o.position)))
+        })
+        .collect()
+}
+
+/// She gets into the scripts' helicopter `g` its pilot flies, as a
+/// passenger: the scripts are told (their seat events fire), and she is
+/// kept where it is until she gets out ([`leave_ride`]). It is not one of
+/// hers: the alpha shows it only while it flies a delivery.
+fn board_ride(game: &mut Game, mission: &mut Mission, g: u32) {
+    eprintln!("mission: she boards {g:#x} as a passenger");
+    mission.ride(Some(g));
+    game.aboard = Some(g);
+}
+
+/// She gets out of the helicopter `g` she rode in: onto the floor beside
+/// it (3 m off, invented), and the scripts are told.
+fn leave_ride(game: &mut Game, mission: &mut Mission, g: u32) {
+    eprintln!("mission: she gets out of {g:#x}");
+    game.aboard = None;
+    mission.ride(None);
+    if let Some(p) = game.scene.player.as_mut() {
+        let at = p.character.position + Vec3::new(3.0, 0.0, 0.0);
+        p.drop_at(at);
+    }
 }
 
 pub fn set_hero(mission: &mut Mission, hero: Hero, max: f32, who: &str) {
@@ -3121,9 +3213,22 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 .catalogue
                 .as_ref()
                 .map_or(&[][..], |c| c.vehicles.as_slice());
+            let models = w
+                .objects
+                .get(vehicle)
+                .map(|o| object_models(*vehicle, &o.name, game.scene.world.as_ref(), catalogue));
+            // A helicopter its pilot flies (the scripts' transit seats her
+            // in the Lucky Lady again, "p"): she rides in it.
+            if models.as_ref().is_some_and(|m| ai_flown(&w, *vehicle, m)) {
+                drop(w);
+                if game.aboard != Some(*vehicle) {
+                    eprintln!("mission: the scripts seat her in {vehicle:#x} as a passenger");
+                    game.aboard = Some(*vehicle);
+                }
+                return false;
+            }
             if let Some(o) = w.objects.get(vehicle)
-                && !object_models(*vehicle, &o.name, game.scene.world.as_ref(), catalogue)
-                    .is_empty()
+                && models.is_some_and(|m| !m.is_empty())
             {
                 let at = Vec3::from(o.position);
                 drop(w);
@@ -3172,6 +3277,13 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         }
         Command::ExitVehicle(guid) if *guid == PLAYER => {
             fleet.reenter = None;
+            if let Some(g) = game.aboard.take() {
+                eprintln!("mission: the scripts take her out of {g:#x}");
+                if let Some(p) = game.scene.player.as_mut() {
+                    p.drop_at(p.character.position + Vec3::new(3.0, 0.0, 0.0));
+                }
+                return false;
+            }
             let (Some(world), Some(p)) = (&game.scene.world, game.scene.player.as_mut()) else {
                 return false;
             };

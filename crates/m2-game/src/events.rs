@@ -1104,20 +1104,26 @@ fn check(
         // starter's talk). Passes who took it: the wardrobe's callback
         // (`WifPmcInterior._SelectOutfit(who)`, made with no data) opens only
         // for the primary character.
-        "ContextAction" => match guid(&p.params, 2) {
-            Some(g) => {
-                let taken = world
-                    .context_presses()
-                    .iter()
-                    .any(|(t, o)| *o == g && *t >= p.last && (*t > p.last || !p.persistent));
-                if taken {
-                    Check::Fire(world.player().map(id).into_iter().collect())
-                } else {
-                    no
+        // `{ 0, filter }` (an action objective's targets,
+        // `MrxTaskObjectiveAction`) fires for whichever of the filter's
+        // objects she takes it at, and passes that object after her: its
+        // callback `_TargetActioned(self, who, target)` completes that
+        // target (from the scripts).
+        "ContextAction" => {
+            let targets = match guid(&p.params, 2) {
+                Some(g) => vec![g],
+                None => objects(&p.params, 2, world),
+            };
+            let taken = world.context_presses().iter().find(|(t, o)| {
+                targets.contains(o) && *t >= p.last && (*t > p.last || !p.persistent)
+            });
+            match taken {
+                Some(&(_, o)) => {
+                    Check::Fire(world.player().map(id).into_iter().chain([id(o)]).collect())
                 }
+                None => no,
             }
-            None => no,
-        },
+        }
         "Button" => match text(&p.params, 2) {
             Some(button) => {
                 let pressed = world
@@ -1360,6 +1366,31 @@ mod tests {
         events.update(0.5, &world);
         events.update(0.5, &world);
         assert_eq!(log(&host), ["exit A", "exit A", "outfit true"]);
+    }
+
+    #[test]
+    fn a_context_action_on_a_filter_passes_the_object_taken_at() {
+        let (host, events) = setup();
+        // As an action objective waits on its targets
+        // (`MrxTaskObjectiveAction`: PmcCon002's "Enter office").
+        host.lua()
+            .load(
+                "Event.CreatePersistent(Event.ContextAction, { 0, { objs = { 11, 12 } } }, \
+                 function(d, who, target) table.insert(log, d .. ' ' .. tostring(who ~= nil) \
+                 .. ' ' .. tostring(target)) end, { 'office' })",
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld {
+            context: vec![(0.25, 13)],
+            ..TestWorld::default()
+        };
+        events.update(0.5, &world);
+        assert!(log(&host).is_empty());
+        world.context.push((0.75, 12));
+        events.update(0.5, &world);
+        events.update(0.5, &world);
+        assert_eq!(log(&host), ["office true userdata: 000000000000000C"]);
     }
 
     #[test]
