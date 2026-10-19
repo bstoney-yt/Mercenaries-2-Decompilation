@@ -355,7 +355,7 @@ impl Player {
         self.swimming() || self.holstered
     }
 
-    /// Swims her when the sea under her is out of her depth
+    /// Swims her when the water under her is out of her depth
     /// ([`SWIM_START`]), `direction` the way she is told to go: she floats
     /// at the surface ([`SWIM_FLOAT`]), goes at [`SWIM_SPEED`] and plays
     /// the stroke, her weapon away. Where it shallows again
@@ -367,15 +367,15 @@ impl Player {
     /// handle (cca02d6b) gives the looped stroke c846e6fd, which the
     /// transition table enters from any handle; `Upright` `ExitSwim`
     /// (e5653a8b) gives the climb-out 97c840ed. The depths, speed and
-    /// the stroke's rate when still are invented. Only the sea is water
-    /// here (the inland water's heights are drawn, not yet given to
-    /// physics).
+    /// the stroke's rate when still are invented. The water is the sea or,
+    /// higher, the game's water heights there (rivers, pools, lakes:
+    /// [`Physics::water_at`]).
     fn update_swim(&mut self, physics: &Physics, direction: Vec3, dt: f32) -> bool {
-        let Some(water) = physics.water() else {
+        let at = self.character.position;
+        let Some(water) = physics.water_at(at.x, at.z) else {
             self.swim = None;
             return false;
         };
-        let at = self.character.position;
         let top = at.y.max(water) + 1.0;
         let ground = physics
             .cast_ray(at.with_y(top), Vec3::NEG_Y, 400.0)
@@ -1331,6 +1331,33 @@ mod tests {
         physics.set_water(11.0);
         p.update(&physics, forward, dt);
         assert!(!p.swimming());
+    }
+
+    #[test]
+    fn she_swims_in_a_river_or_pool_the_water_heights_give() {
+        // No sea; a pool over the ground's middle (x, z -16..16), its
+        // surface 2 m over the ground at y 10.
+        let mut physics = ground();
+        physics.set_inland(std::sync::Arc::new(m2_assets::water::WaterHeights {
+            columns: 2,
+            rows: 2,
+            cell: 32.0,
+            origin: [-16.0, -16.0],
+            heights: vec![12.0; 4],
+            wet: Vec::new(),
+        }));
+        let mut p = Player::new(0.0, 0.0, std::f32::consts::FRAC_PI_2, None);
+        let dt = 1.0 / 60.0;
+        for _ in 0..usize::from(SETTLED) {
+            p.update(&physics, Intent::default(), dt);
+        }
+        let forward = Intent {
+            movement: Vec2::Y,
+            ..Intent::default()
+        };
+        p.update(&physics, forward, dt);
+        assert!(p.swimming());
+        assert!((p.character.position.y - (12.0 - SWIM_FLOAT)).abs() < 1e-3);
     }
 
     // A pillar 2 m behind her, its side 0.1 m off the line from her head
