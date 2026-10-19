@@ -776,10 +776,29 @@ impl Autoplay {
             // A rifle lying there is taken for its rounds ("Take Ammo"),
             // not taken up in place of hers ([`wanted`]).
             let templates = game.scene.world.as_ref().map(|w| &w.index.template_db);
-            let swap = p.what.weapon == Some(Weapon::Rifle)
-                && templates.is_none_or(|t| {
-                    crate::mission::offer(t, &game.combat, &p.what) == crate::mission::Offer::Equip
-                });
+            let equips = |q: &crate::flights::Pickup| {
+                q.what.weapon == Some(Weapon::Rifle)
+                    && templates.is_none_or(|t| {
+                        crate::mission::offer(t, &game.combat, &q.what)
+                            == crate::mission::Offer::Equip
+                    })
+            };
+            let swap = equips(&p);
+            // A gun lying within reach beside it would be taken up with
+            // the key instead, in place of hers (PmcCon001's villa: a
+            // dead soldier's grenade and rifle together, and she swapped
+            // rifles back and forth for minutes): left lying.
+            let beside = game.scene.flights.pickups().iter().any(|q| {
+                q.key() != key && (q.at - here).with_y(0.0).length() <= q.what.reach && equips(q)
+            });
+            if beside && !swap {
+                eprintln!(
+                    "autoplay {:.1} s: the {:#x} at {:.1} lies by a gun the key would take up                      in place of hers: left lying",
+                    self.clock, key.1, p.at
+                );
+                self.left_lying.push(key);
+                return Intent::default();
+            }
             return Intent {
                 use_pressed: press && !swap,
                 ..Intent::default()

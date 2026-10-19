@@ -1967,6 +1967,15 @@ impl Combat {
         self.weapon = Weapon::Rifle;
     }
 
+    /// Hands her `rifle` in the rifle's place as the contract's scripts
+    /// give it (PmcCon001's `Assault Rifle`): one clip in, nothing in
+    /// reserve until the scripts give her some, and nothing else.
+    pub fn scripted_rifle(&mut self, rifle: Rifle) {
+        self.carbine_only();
+        self.rifle_rounds = Rounds::of(rifle.clip, rifle.clip);
+        self.rifle = rifle;
+    }
+
     /// Has her carry her own rifle `rifle` (free roam), full: a clip in
     /// and its template's spare clips.
     pub fn take_own_rifle(&mut self, rifle: Rifle) {

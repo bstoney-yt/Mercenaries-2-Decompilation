@@ -551,6 +551,8 @@ pub struct MissionLink {
     vehicles: Fleet,
     /// Seconds since the scripts said the contract was completed.
     completed: Option<f32>,
+    /// How many times the scripts have said a contract was completed.
+    contracts: u32,
     /// The speed of the vehicle she drives, held a little (m/s).
     speed: f32,
     /// The keys tutorial lines name.
@@ -689,6 +691,7 @@ impl MissionLink {
             bombs: Vec::new(),
             vehicles: Fleet::default(),
             completed: None,
+            contracts: 0,
             speed: 0.0,
             keys: Default::default(),
             lines: Vec::new(),
@@ -1587,7 +1590,24 @@ impl MissionLink {
                              start at 0 until the scripts give them a reserve (the explosives \
                              box shows 0 till then)"
                         );
-                        game.combat.carbine_only();
+                        // The first weapon named is the gun in the
+                        // rifle's place (the first contract's `Carbine`,
+                        // PmcCon001's `Assault Rifle`), as its template
+                        // says; else the carbine.
+                        let gun = weapons
+                            .first()
+                            .and_then(|w| game.scene.arms()?.named(w))
+                            .map(|spec| game.combat.stock(spec));
+                        match gun {
+                            Some(rifle) => {
+                                eprintln!(
+                                    "mission: her gun is the {} ({} a clip)",
+                                    rifle.name, rifle.clip
+                                );
+                                game.combat.scripted_rifle(rifle);
+                            }
+                            None => game.combat.carbine_only(),
+                        }
                         game.combat.scripted_loadout = true;
                     }
                     Command::Reserve {
@@ -1601,6 +1621,13 @@ impl MissionLink {
                             game.combat.grenades = (*rounds).min(combat::MAX_GRENADES);
                         } else if weapon.eq_ignore_ascii_case("C4") {
                             game.combat.charges = *rounds;
+                        } else if weapon.eq_ignore_ascii_case(&game.combat.rifle.name)
+                            && !weapon.eq_ignore_ascii_case(CARBINE)
+                        {
+                            // Clips of the gun she was handed (`Weapon.
+                            // SetReserveAmmo` of `GetMaxReserveAmmo`: the
+                            // Assault Rifle's 7), as for the carbine.
+                            game.combat.rifle_rounds.stored = *rounds * game.combat.rifle.clip;
                         } else if weapon.eq_ignore_ascii_case(CARBINE) {
                             game.combat.rifle_rounds.stored =
                                 (*rounds * combat::RIFLE_CLIP).min(combat::RIFLE_SPARE);
@@ -1623,6 +1650,7 @@ impl MissionLink {
                 }
                 if c == Command::Notify("Pg.ContractCompleted".into()) {
                     self.completed = Some(0.0);
+                    self.contracts += 1;
                 }
             }
             if let Some(line) = tutorial(mission) {
@@ -1979,6 +2007,11 @@ impl MissionLink {
     /// The scripts have said the contract is completed.
     pub fn completed(&self) -> bool {
         self.completed.is_some()
+    }
+
+    /// How many contracts the scripts have said are completed.
+    pub fn contracts_completed(&self) -> u32 {
+        self.contracts
     }
 
     /// The newest of the scripts' fanfare calls (`Hud.Fanfare`) whose

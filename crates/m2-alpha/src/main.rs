@@ -323,6 +323,10 @@ struct Options {
     /// is seen sitting in the vehicle as she drives it.
     seated: bool,
     mission_seconds: f32,
+    /// With `--mission --autoplay`: she plays on through this many
+    /// contracts (the first, then the story's next ones) before she stops
+    /// (`--contracts`, default 1).
+    contracts: u32,
     /// The whole game as it launches: the boot movies, the front end, the
     /// first contract with its movies, then on (also with no options).
     alpha: bool,
@@ -676,6 +680,9 @@ fn parse_args() -> anyhow::Result<Options> {
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
             "--gates" => o.gates = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
+            "--contracts" => {
+                o.contracts = value()?.parse().context("--contracts expects a count")?
+            }
             "--mission-seconds" => {
                 o.mission_seconds = value()?
                     .parse()
@@ -745,6 +752,10 @@ const HURT_AT: f32 = 8.0;
 /// wall first (in the PC footage it bursts in 4 s before "Hijack tank" is
 /// added; inferred, not measured from the game).
 const HIJACK_WAIT: f32 = 8.0;
+/// With --autoplay --hijack: her use key starts a hijack within this of
+/// the marked vehicle's middle, metres (invented: a tank's hull is about
+/// 7 m long).
+const HIJACK_REACH: f32 = 6.0;
 
 /// With `--mission --placed-check`, how often what the layers put out is
 /// tried, seconds.
@@ -3059,6 +3070,10 @@ fn mission_for_screenshot(
     };
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
     let mut contract_done: Option<u32> = None;
+    // With --contracts N, she plays on through the later contracts: the
+    // tick the Nth was done, and how many have been.
+    let mut play_done: Option<u32> = None;
+    let mut contracts_seen = 0;
     let mut late_hud: Option<(ui::Hud, Config)> = None;
     // The loading screen's steps over the scripts' fades until the late HUD
     // (which draws it) runs, logged.
@@ -3130,7 +3145,7 @@ fn mission_for_screenshot(
     let mut visit: Option<f32> = None;
     let (mut locked_was, mut locked_for) = (false, 0.0f32);
     for i in 0..(seconds / tick).round() as u32 {
-        let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
+        let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
             Some(a) => {
                 let marks = link.marks();
                 let objectives = link.view().objectives;
@@ -3314,6 +3329,39 @@ fn mission_for_screenshot(
             if h.running() {
                 let prompts = h.view().map(|v| v.prompts).unwrap_or_default();
                 hijack_pad.answer(&prompts, &mut hijack_input, hijack_t);
+            } else if auto.is_some() {
+                // With --autoplay she walks up to it herself (her goal
+                // for a vehicle the scripts mark), and her use key there
+                // starts the hijack, as a player's does.
+                let near = |g: &Game| {
+                    let here = g.focus();
+                    let world = g.scene.world.as_ref()?;
+                    link.marks()
+                        .iter()
+                        .filter(|m| m.kind == "action" && m.alive)
+                        .filter_map(|m| g.scene.vehicles.iter().find(|v| v.guid == Some(m.target)))
+                        .filter_map(|v| {
+                            let at = world.physics.vehicle_transform(v.id?)?;
+                            let d = at
+                                .transform_point3(m2_math::glam::Vec3::ZERO)
+                                .distance(here);
+                            (d < HIJACK_REACH).then(|| (v.spec.label.clone(), d))
+                        })
+                        .next()
+                };
+                if !h.loading()
+                    && on_foot
+                    && intent.use_pressed
+                    && hijack_use.is_none_or(|u| i > u + (3.0 / tick) as u32)
+                    && let Some((label, d)) = near(&*game)
+                {
+                    hijack_tries += 1;
+                    hijack_use = Some(i + 1);
+                    eprintln!(
+                        "hijack: try {hijack_tries}: she presses use {d:.1} m from the {label}                          the action marker is on, {:.1} s in",
+                        i as f32 * tick
+                    );
+                }
             } else if !h.loading()
                 && on_foot
                 && hijack_tries < 5
@@ -3792,16 +3840,21 @@ fn mission_for_screenshot(
                 }
             }
         }
-        if auto.is_some() && link.completed() && contract_done.is_none() {
+        if auto.is_some() && link.contracts_completed() > contracts_seen {
+            contracts_seen = link.contracts_completed();
             eprintln!(
-                "autoplay: contract completed after {:.1} s of play ({:.0} s here)",
+                "autoplay: contract {contracts_seen} completed after {:.1} s of play ({:.0} s here)",
                 i as f32 * tick,
                 played.elapsed().as_secs_f32()
             );
-            // She stops playing; the scripts go on (--after-contract).
-            contract_done = Some(i);
+            contract_done.get_or_insert(i);
+            // She stops playing once the last asked for is done; the
+            // scripts go on (--after-contract).
+            if contracts_seen >= options.contracts.max(1) {
+                play_done = Some(i);
+            }
         }
-        if contract_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
+        if play_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
             break;
         }
     }
