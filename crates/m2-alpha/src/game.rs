@@ -196,6 +196,13 @@ pub struct Game {
     /// Seconds the HUD's save icon has left up after the game was saved
     /// ([`SAVE_ICON_SECONDS`]).
     pub save_icon: f32,
+    /// Clips the scripts hold characters in by name (a faction HQ's
+    /// briefing, [`crate::raw`]).
+    pub raw: crate::raw::RawClips,
+    /// The model the scripts last dressed the player in
+    /// (`Player.SetOutfit`: the wardrobe), till it is put on her
+    /// ([`Game::dress`]).
+    pub outfit_wanted: Option<String>,
     /// Seconds before the factions' attitudes are asked of the scripts again.
     pub attitude_wait: f32,
     /// Witnesses reporting her: guid, faction and seconds since they set
@@ -348,6 +355,8 @@ impl Game {
             context_taken: None,
             shot: None,
             save_icon: 0.0,
+            raw: crate::raw::RawClips::default(),
+            outfit_wanted: None,
             attitude_wait: 0.0,
             reporters: Vec::new(),
             scripts_seated: false,
@@ -1289,7 +1298,21 @@ impl Game {
         self.run_particles(dt);
         split("game: effects");
         self.scene.tick(dt);
+        self.raw.tick(&mut self.scene, dt);
         split("game: scene");
+    }
+
+    /// Puts the player in the model the scripts last dressed her in
+    /// (`Player.SetOutfit`), if any is waiting: her body and clips
+    /// reloaded from it, her health, place and what she holds kept.
+    pub fn dress(&mut self, backend: &mut dyn m2_render::RenderBackend) {
+        let Some(model) = self.outfit_wanted.take() else {
+            return;
+        };
+        self.scene.outfit = Some(m2_assets::name_hash(&model));
+        eprintln!("outfit: {} dressed as {model}", self.scene.hero);
+        let hero = self.scene.hero;
+        self.scene.load_hero(backend, hero);
     }
 
     /// Sets off the game's effects the fight asked for and runs them.

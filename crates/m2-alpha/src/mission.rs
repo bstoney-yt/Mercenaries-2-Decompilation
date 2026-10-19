@@ -1205,6 +1205,17 @@ impl MissionLink {
         if let Some(g) = game.context_taken.take() {
             mission.take_context_action(g);
         }
+        // What the clips the scripts hold people in met: their events
+        // (a briefing frame's start and end) and their voice lines.
+        for (g, met) in game.raw.take_met() {
+            match met {
+                crate::raw::Met::Event(e) => {
+                    eprintln!("raw-clip: {g:#x} meets {e}");
+                    mission.animation_event(g, &e);
+                }
+                crate::raw::Met::Line(cue) => mission.clip_line(g, &cue),
+            }
+        }
         // Her infractions against the factions, for their witnesses to
         // report: the first one of a faction not already reporting, a
         // witness of theirs near it (not the victim) is offered to the
@@ -3004,6 +3015,26 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             if !on && game.shot.take().is_some() {
                 eprintln!("mission: the scene ends; the camera is hers again");
             }
+            if !on && game.raw.held() > 0 {
+                eprintln!(
+                    "raw-clip: the scene ends; {} let go of their clips",
+                    game.raw.held()
+                );
+                game.raw.release(&mut game.scene);
+            }
+            return false;
+        }
+        // A briefing frame's clip for one of its actors, by name.
+        Command::RawClip { guid, clip } => {
+            match game.raw.start(&mut game.scene, *guid, clip) {
+                Ok(length) => eprintln!("raw-clip: {guid:#x} plays {clip} ({length:.2} s)"),
+                Err(why) => eprintln!("raw-clip: {guid:#x} cannot play {clip}: {why}"),
+            }
+            return false;
+        }
+        // The wardrobe's pick: put on her before the next frame.
+        Command::Outfit { guid, model } if *guid == PLAYER => {
+            game.outfit_wanted = Some(model.clone());
             return false;
         }
         Command::ExitVehicle(guid) if *guid == PLAYER => {

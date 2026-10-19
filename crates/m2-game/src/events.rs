@@ -105,6 +105,11 @@ pub trait World {
     fn context_presses(&self) -> &[(f64, u32)] {
         &[]
     }
+    /// Events met in clips the scripts played by name, by who played
+    /// them, each with its game time, for `AnimationEvent` events.
+    fn animation_events(&self) -> &[(f64, u32, String)] {
+        &[]
+    }
 }
 
 /// The kinds the scripts use, by how often.
@@ -1118,6 +1123,24 @@ fn check(
             }
             None => no,
         },
+        // { who, event }: as a clip the scripts played on `who` by name
+        // (`Human.PlayRawAnimation`) meets the named event; who 0 is
+        // anyone. The HQ briefings' frames wait on `{ 0, "CinematicStart"
+        // }` to fade in and `{ actor, "CinematicEnd" }` to go on, events
+        // 252 of their 258 clips carry (from samples).
+        "AnimationEvent" => match text(&p.params, 2) {
+            Some(event) => {
+                let who = guid(&p.params, 1).filter(|&g| g != 0);
+                let met = world.animation_events().iter().any(|(t, g, e)| {
+                    who.is_none_or(|w| w == *g)
+                        && e.eq_ignore_ascii_case(&event)
+                        && *t >= p.last
+                        && (*t > p.last || !p.persistent)
+                });
+                if met { Check::Fire(Vec::new()) } else { no }
+            }
+            None => no,
+        },
         "Button" => match text(&p.params, 2) {
             Some(button) => {
                 let pressed = world
@@ -1214,6 +1237,8 @@ mod tests {
         visible: Vec<u32>,
         /// Context actions taken: (game time, object).
         context: Vec<(f64, u32)>,
+        /// Clip events met: (game time, who, event).
+        anims: Vec<(f64, u32, String)>,
     }
 
     impl World for TestWorld {
@@ -1237,6 +1262,9 @@ mod tests {
         }
         fn context_presses(&self) -> &[(f64, u32)] {
             &self.context
+        }
+        fn animation_events(&self) -> &[(f64, u32, String)] {
+            &self.anims
         }
         fn inside(&self, _: u32, _: u32) -> Option<bool> {
             None
@@ -1360,6 +1388,38 @@ mod tests {
         events.update(0.5, &world);
         events.update(0.5, &world);
         assert_eq!(log(&host), ["exit A", "exit A", "outfit true"]);
+    }
+
+    #[test]
+    fn a_clip_event_fires_for_its_actor_or_anyone() {
+        let (host, events) = setup();
+        // As WifHq._NextCinematicFrame waits: the first frame's fade on
+        // anyone's start, the frame's end on its OnComplete actor's.
+        host.lua()
+            .load(
+                "Event.Create(Event.AnimationEvent, { 0, 'CinematicStart' }, \
+                 function(d) table.insert(log, 'start ' .. d) end, { 'fade' }) \
+                 Event.Create(Event.AnimationEvent, { 1, 'CinematicEnd' }, \
+                 function(d) table.insert(log, 'end ' .. d) end, { 1 })",
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld {
+            // Another actor's end, and one met before it was waited for.
+            anims: vec![
+                (-1.0, 1, "CinematicEnd".into()),
+                (0.25, 5, "CinematicEnd".into()),
+            ],
+            ..TestWorld::default()
+        };
+        events.update(0.5, &world);
+        assert!(log(&host).is_empty());
+        world.anims.push((0.75, 5, "CinematicStart".into()));
+        world.anims.push((0.75, 1, "CinematicEnd".into()));
+        events.update(0.5, &world);
+        events.update(0.5, &world);
+        assert_eq!(log(&host), ["start fade", "end 1"]);
+        assert!(events.take_unhandled().is_empty());
     }
 
     #[test]
