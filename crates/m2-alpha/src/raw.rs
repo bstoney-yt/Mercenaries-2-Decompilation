@@ -86,12 +86,21 @@ fn rig_of(scene: &mut Scene, guid: u32) -> Option<&mut Rig> {
     if guid == PLAYER {
         return scene.player.as_mut()?.model.as_mut().map(|(_, rig)| rig);
     }
-    scene
+    if let Some(n) = scene
         .people
         .npcs
         .iter_mut()
         .find(|n| n.spawn == Some(guid) && n.alive)
-        .map(|n| &mut n.rig)
+    {
+        return Some(&mut n.rig);
+    }
+    // Seated on a prop (the PMC HQ's starter at her desk): posed in her
+    // seat.
+    scene
+        .riders
+        .iter_mut()
+        .find(|r| r.guid == Some(guid))
+        .map(|r| &mut r.rig)
 }
 
 /// The clip named `name` bound to `rig`'s skeleton: every track on a

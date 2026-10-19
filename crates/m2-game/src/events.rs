@@ -1159,7 +1159,12 @@ fn check(
         // The scripts write "hibernated" (25 calls in vz.wad: PmcCon001's
         // gate opener waits for its front door to sleep, then to wake
         // again); "hibernate" reads the same. Anything else is awake.
-        "ObjectHibernation" => match guid(&p.params, 1) {
+        // `ObjectIsReady` (10 scripts: the wardrobe's `{ who, "awake", 0 }`
+        // after dressing her, the HQ waiting for a player, props'
+        // destroyed states) takes the same parameters and is read the
+        // same: ready as awake is inferred, the engine's own test is not
+        // seen.
+        "ObjectHibernation" | "ObjectIsReady" => match guid(&p.params, 1) {
             Some(g) => {
                 let want_awake = !text(&p.params, 2).is_some_and(|t| t.starts_with("hibernat"));
                 Check::Holds(world.is_awake(g) == want_awake, vec![id(g)])
@@ -1388,6 +1393,26 @@ mod tests {
         events.update(0.5, &world);
         events.update(0.5, &world);
         assert_eq!(log(&host), ["exit A", "exit A", "outfit true"]);
+    }
+
+    #[test]
+    fn object_is_ready_fires_once_it_is_awake() {
+        let (host, events) = setup();
+        // As the wardrobe waits after dressing her (_CompleteChangeOutfit).
+        host.lua()
+            .load(
+                "Event.Create(Event.ObjectIsReady, { 3, 'awake', 0 }, \
+                 function(d) table.insert(log, 'ready ' .. d) end, { 'preen' })",
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        events.update(0.5, &world);
+        assert!(log(&host).is_empty());
+        world.positions.insert(3, [0.0; 3]);
+        events.update(0.5, &world);
+        assert_eq!(log(&host), ["ready preen"]);
+        assert!(events.take_unhandled().is_empty());
     }
 
     #[test]
