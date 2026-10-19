@@ -423,6 +423,26 @@ mod tests {
         assert_eq!(shot_gain(0.9, 0.0), 0.9);
     }
 
+    // A cue's users: the tail shared by two sets, a reload, a variant.
+    #[test]
+    fn a_cues_users_are_its_sets_and_events() {
+        let (minigun, carbine, ak) = (0x624c_0986, 0x01b4_7c45, 0x7473_fe68);
+        let tail = name_hash(FIRE_TAIL);
+        assert_eq!(tail, 0x4504_59d9);
+        let cues = GunCues::from_rows([
+            [minigun, tail, ANY, 0x0bb3_1676],
+            [carbine, tail, ANY, 0x0bb3_1676],
+            [ANY, name_hash(RELOAD), carbine, 0x176b_614b],
+            [ak, name_hash(FIRE_NPC), variant_key(1), 0x33a0_71cc],
+        ]);
+        let mut both = vec![(carbine, tail), (minigun, tail)];
+        both.sort_unstable();
+        assert_eq!(cues.uses_of(0x0bb3_1676), both);
+        assert_eq!(cues.uses_of(0x176b_614b), [(carbine, name_hash(RELOAD))]);
+        assert_eq!(cues.uses_of(0x33a0_71cc), [(ak, name_hash(FIRE_NPC))]);
+        assert!(cues.uses_of(1).is_empty());
+    }
+
     // What is read ahead: every firing event's cue, the NPC variants and
     // the reloads, once each; not the dry fire.
     #[test]
