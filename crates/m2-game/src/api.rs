@@ -218,6 +218,20 @@ pub enum Command {
     },
     /// Character `guid` puts down whom it carries (`Human.Drop`).
     Drop(u32),
+    /// Play the clip named `clip` once on character `guid`, holding them
+    /// in it (`Human.PlayRawAnimation`: the faction HQs' animated
+    /// briefings); the game reports the clip's events back
+    /// ([`crate::mission::Mission::animation_event`]).
+    RawClip {
+        guid: u32,
+        clip: String,
+    },
+    /// Character `guid` wears model `model` from now on
+    /// (`Player.SetOutfit`: the wardrobe's pick, `pmc_hum_jen_v3`).
+    Outfit {
+        guid: u32,
+        model: String,
+    },
     /// Seat a character in a vehicle (seat as the scripts name it, `"d"`
     /// for the driver); `instant` skips the climb-in.
     EnterVehicle {
@@ -559,6 +573,14 @@ pub struct ScriptWorld {
     pub human_states: HashMap<u32, String>,
     pub state_changes: Vec<crate::events::StateChange>,
     pub carrying: HashMap<u32, u32>,
+    /// Events met in the clips the scripts play by name
+    /// (`Human.PlayRawAnimation`: the briefings' `CinematicStart` and
+    /// `CinematicEnd`), by who plays them, with their game time
+    /// ([`crate::events::World::animation_events`]).
+    pub animation_events: Vec<(f64, u32, String)>,
+    /// The costume the player's profile keeps (`Player.GetProfileCostume`,
+    /// `SetProfileCostume`: the wardrobe's pick, counted from 0).
+    pub profile_costume: f64,
     /// The crews the layers' vehicles came into play with, by vehicle:
     /// (seat, rider template), as each entity's own `Rider` records say
     /// (the HQ interior's `HqInterior` seats Fiona, its PMC boss), else
@@ -913,6 +935,10 @@ impl World for ScriptWorld {
 
     fn state_changes(&self) -> &[crate::events::StateChange] {
         &self.state_changes
+    }
+
+    fn animation_events(&self) -> &[(f64, u32, String)] {
+        &self.animation_events
     }
 
     fn hijack_held_since(&self, button: u32) -> Option<f64> {
@@ -1630,6 +1656,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // Human.PlayRawAnimation(character, clip, false, false, -1, true,
+    // true): the one call site (WifHq._NextCinematicFrame) plays each
+    // actor's clip of a briefing frame by name; the other five arguments
+    // are the same every time and not read.
+    add(&human, "PlayRawAnimation", |w, _, a| {
+        if let (Some(guid), Some(Value::String(clip))) = (id(a.first()), a.get(1)) {
+            let clip = clip.to_string_lossy();
+            w.commands.push(Command::RawClip { guid, clip });
+        }
+        values([])
+    })?;
     // Human.DisableWeapons(character) / EnableWeapons(character).
     add(&human, "DisableWeapons", |w, _, a| {
         if let Some(guid) = id(a.first()) {
@@ -1997,6 +2034,26 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // The wardrobe (WifPmcInterior._CompleteChangeOutfit): the pick's
+    // number, counted from 0, kept in the profile, then the character
+    // dressed in the pick's model. The profile's number is what a player
+    // joining reads back (`iCostume`, 8d35cf13), 0 until set.
+    add(&player, "GetProfileCostume", |w, _, _| {
+        values([Value::Number(w.profile_costume)])
+    })?;
+    add(&player, "SetProfileCostume", |w, _, a| {
+        if let Some(n) = num(a.first()) {
+            w.profile_costume = f64::from(n);
+        }
+        values([])
+    })?;
+    add(&player, "SetOutfit", |w, _, a| {
+        if let (Some(guid), Some(Value::String(model))) = (id(a.first()), a.get(1)) {
+            let model = model.to_string_lossy();
+            w.commands.push(Command::Outfit { guid, model });
+        }
+        values([])
+    })?;
     add(&player, "GetFuel", |w, _, _| {
         let fuel = w
             .player
@@ -2217,6 +2274,18 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let ai = lib("Ai")?;
+    // Ai.SetInfractionMultiplier(faction, m), the faction as its
+    // template's guid (`Pg.GetGuidByName("OC")`): see
+    // [`crate::report::Reports::multipliers`].
+    add(&ai, "SetInfractionMultiplier", |w, _, a| {
+        let name = id(a.first())
+            .and_then(|g| w.objects.get(&g))
+            .map(|o| o.name.to_ascii_lowercase());
+        if let (Some(name), Some(m)) = (name, num(a.get(1))) {
+            w.reports.multipliers.insert(name, m);
+        }
+        values([])
+    })?;
     add(&ai, "GetFactionGuid", |w, _, a| {
         let faction = id(a.first()).and_then(|g| w.objects.get(&g)?.faction);
         values([guid_value(faction)])
@@ -3205,6 +3274,44 @@ mod tests {
                 pursuit("oc", Some(300.0)),
                 pursuit("allied", None),
                 Command::PursuitClear,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_wardrobe_dresses_her_and_briefing_clips_reach_the_game() {
+        let (host, world) = setup();
+        let lua = host.lua();
+        // WifPmcInterior._CompleteChangeOutfit's calls, then a briefing
+        // frame's clip for the player.
+        let before: f64 = lua
+            .load("return Player.GetProfileCostume()")
+            .eval()
+            .unwrap();
+        lua.load(
+            "Player.SetProfileCostume(3)\n\
+             Player.SetOutfit(Player.GetAnyCharacter(), 'pmc_hum_jen_v2')\n\
+             Human.PlayRawAnimation(Player.GetAnyCharacter(), \
+                'ALL01_Contract_Briefing_Jennifer', false, false, -1, true, true)",
+        )
+        .exec()
+        .unwrap();
+        let after: f64 = lua
+            .load("return Player.GetProfileCostume()")
+            .eval()
+            .unwrap();
+        assert_eq!((before, after), (0.0, 3.0));
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [
+                Command::Outfit {
+                    guid: 1,
+                    model: "pmc_hum_jen_v2".into()
+                },
+                Command::RawClip {
+                    guid: 1,
+                    clip: "ALL01_Contract_Briefing_Jennifer".into()
+                },
             ]
         );
     }

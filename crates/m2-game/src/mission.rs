@@ -1085,8 +1085,7 @@ impl Mission {
             if w.reports.callback.is_none() {
                 return false;
             }
-            let seen = w.reports.seen.remove(faction).unwrap_or_default();
-            w.reports.reporting.insert(reporter, seen);
+            w.reports.offer(reporter, faction);
         }
         if let Err(e) = crate::report::tell(&self.world, reporter, 0) {
             self.world.borrow_mut().printed.push(format!("report: {e}"));
@@ -1872,6 +1871,26 @@ end
         w.context_presses.push((self.now, guid));
         let extra = w.context_presses.len().saturating_sub(16);
         w.context_presses.drain(..extra);
+    }
+
+    /// A clip the scripts played on `guid` by name met `event`, for the
+    /// scripts' `AnimationEvent` events (the latest 32 are kept).
+    pub fn animation_event(&mut self, guid: u32, event: &str) {
+        let mut w = self.world.borrow_mut();
+        w.animation_events.push((self.now, guid, event.to_owned()));
+        let extra = w.animation_events.len().saturating_sub(32);
+        w.animation_events.drain(..extra);
+    }
+
+    /// A clip the scripts played on `speaker` by name met a voice line
+    /// (its `vo` events: the faction HQs' briefings are spoken by their
+    /// clips, 806 lines over 258 clips, from samples): said as a scripted
+    /// line with no callback, its subtitle up if the player has them on.
+    pub fn clip_line(&mut self, speaker: u32, cue: &str) {
+        let mut w = self.world.borrow_mut();
+        let subtitled = !w.subtitles_off;
+        let say = w.vo.cue(Some(speaker), cue.to_owned(), None, subtitled);
+        w.commands.push(say);
     }
 
     /// Everything the scripts asked the game to do since the last call.
@@ -2881,6 +2900,41 @@ mod tests {
         assert_eq!(heard, vec![0, 0, 1, 0, 2]);
         // Allied's tally waits for an Allied reporter.
         assert_eq!(m.world.borrow().reports.seen["Allied"]["DamagePerson"], 1);
+    }
+
+    #[test]
+    fn a_factions_infraction_multiplier_scales_what_its_witnesses_report() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        // As a faction contract's start does (2f0b1589), and a mission
+        // that lets the Guerillas' witnesses see nothing (08dcd9af).
+        m.run(
+            r#"Report.Init({ Callback = function() end })
+            Ai.SetInfractionMultiplier(Pg.GetGuidByName("OC"), 0.2)
+            Ai.SetInfractionMultiplier(Pg.GetGuidByName("Guerilla"), 0)"#,
+            "init",
+        )
+        .unwrap();
+        for _ in 0..5 {
+            m.record_infraction("OC", "DamagePerson");
+        }
+        m.record_infraction("Guerilla", "DestroyPerson");
+        m.record_infraction("Allied", "DamagePerson");
+        assert!(m.begin_report(7, "OC"));
+        assert!(m.begin_report(8, "Guerilla"));
+        assert!(m.begin_report(9, "Allied"));
+        m.run(
+            r#"__oc = Report.GetInfractions(Sys.StringToGuid('0x7')).DamagePerson[2]
+            __gur = Report.GetInfractions(Sys.StringToGuid('0x8')).DestroyPerson[2]
+            __all = Report.GetInfractions(Sys.StringToGuid('0x9')).DamagePerson[2]"#,
+            "ask",
+        )
+        .unwrap();
+        let g = m.lua().globals();
+        let oc: f64 = g.get("__oc").unwrap();
+        assert!((oc - 1.0).abs() < 1e-6, "5 x 0.2, got {oc}");
+        assert_eq!(g.get::<f64>("__gur").unwrap(), 0.0);
+        // Never set: as seen.
+        assert_eq!(g.get::<i64>("__all").unwrap(), 1);
     }
 
     #[test]

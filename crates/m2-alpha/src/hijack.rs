@@ -326,6 +326,9 @@ pub struct Rider {
     /// the PMC HQ interior's starter), by guid
     /// ([`crate::scene::Scene::prop_crews`]).
     pub prop: Option<u32>,
+    /// The scripts' guid for the rider, when known (a prop's crew: Fiona,
+    /// whom a briefing's clips play on, [`crate::raw`]).
+    pub guid: Option<u32>,
     /// The seat, by its name's hash (`seat_driver`).
     pub seat: u32,
     /// Index into the people's kinds: whom they are drawn as.
@@ -1054,6 +1057,7 @@ impl Hijacks {
                     riders.push(Rider {
                         vehicle: i,
                         prop: None,
+                        guid: None,
                         seat: hash,
                         kind,
                         rig,
@@ -1198,6 +1202,7 @@ impl Hijacks {
                     riders.push(Rider {
                         vehicle: usize::MAX,
                         prop: Some(g),
+                        guid: Some(rider),
                         seat: hash,
                         kind,
                         rig,
@@ -1848,6 +1853,7 @@ fn draw_hijackee(a: &mut Active, game: &mut Game, dt: f32) {
         outfit: h.outfit.clone(),
         frame: at * Mat4::from_translation(off),
         prop: None,
+        guid: None,
     });
 }
 

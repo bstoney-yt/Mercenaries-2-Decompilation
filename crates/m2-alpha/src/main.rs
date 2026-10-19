@@ -71,6 +71,7 @@ mod pause;
 mod placed;
 mod player;
 mod props;
+mod raw;
 mod roads;
 mod route;
 mod save;
@@ -3047,6 +3048,7 @@ fn mission_for_screenshot(
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
+        game.dress(backend);
         if options.movies {
             movies_offscreen(&mut link, install, out);
         }
@@ -3421,6 +3423,7 @@ fn mission_for_screenshot(
         }
         game.step(intent, tick);
         link.tick(game, tick);
+        game.dress(backend);
         // `--context exit,enter,talk`: each in turn, once the last is done.
         if let Some(want) = options
             .context
@@ -4083,6 +4086,7 @@ fn mission_for_screenshot(
         }
         game.step(Intent::default(), tick);
         link.tick(game, tick);
+        game.dress(backend);
         render(backend, game, fov, aspect, None)?;
     }
     let view = link.view();
@@ -6976,6 +6980,7 @@ impl Running {
         }
         if let Some(m) = &mut self.mission {
             spans::time("scripts", || m.tick(&mut self.game, TICK.as_secs_f32()));
+            self.game.dress(&mut self.backend);
             let (lines, hushed) = m.take_lines();
             for (id, cue, at) in lines {
                 if let Some(seconds) = self.audio.say(id, &cue, at) {

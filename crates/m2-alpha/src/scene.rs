@@ -102,6 +102,11 @@ pub struct Rig {
     /// (rear hand to front): not with a pistol up, held in one hand
     /// (round 13: turned so, the one-handed aim bent her double).
     pub barrel: bool,
+    /// A clip the scripts hold this character in by name
+    /// (`Human.PlayRawAnimation`: a briefing's), and how far in, seconds:
+    /// posed from it over whatever else the character would play
+    /// ([`crate::raw`]).
+    pub scripted: Option<(Arc<m2_engine::anim::BoundClip>, f32)>,
 }
 
 /// Most clip events a rig keeps for the taking (older ones are dropped:
@@ -556,6 +561,7 @@ impl Rig {
             foreign: Default::default(),
             aim_clip: None,
             barrel: true,
+            scripted: None,
             gait: Gait::Idle,
             cues: Vec::new(),
         })
@@ -614,6 +620,7 @@ impl Rig {
             foreign: Default::default(),
             aim_clip: None,
             barrel: true,
+            scripted: None,
         };
         rig.set_gait(gait);
         rig
@@ -628,6 +635,7 @@ impl Rig {
             foreign: Default::default(),
             aim_clip: None,
             barrel: true,
+            scripted: None,
             hands: Default::default(),
             animator: Animator::default(),
             cues: Vec::new(),
@@ -830,9 +838,16 @@ impl Rig {
 
     /// Posed node matrices and skinning matrices, model space.
     pub fn posed(&self) -> (Vec<Mat4>, Vec<Mat4>) {
-        let pose = self
-            .aimed_pose()
-            .unwrap_or_else(|| self.animator.pose(&self.skeleton, &self.clips));
+        let pose = match &self.scripted {
+            Some((clip, at)) => {
+                let mut pose = clip.sample(&self.skeleton, at.min(clip.info.duration));
+                pose.strip_root_motion(self.skeleton.root(), clip.info.pin);
+                pose
+            }
+            None => self
+                .aimed_pose()
+                .unwrap_or_else(|| self.animator.pose(&self.skeleton, &self.clips)),
+        };
         let nodes = self.skeleton.model_matrices(&pose);
         let skin = nodes
             .iter()
@@ -892,6 +907,10 @@ pub struct Scene {
     pub player: Option<Player>,
     /// Who the player is.
     pub hero: Hero,
+    /// The model the scripts dressed the hero in (`Player.SetOutfit`:
+    /// the wardrobe's pick, `pmc_hum_jen_v3`), by name hash, worn in
+    /// place of the hero template's; dropped when another hero is played.
+    pub outfit: Option<u32>,
     /// What the people's rigs are made from, whoever the hero is:
     /// Jennifer's skeleton and every clip that fits it, with the gaits
     /// everyone's clips give ([`Rig::shared`]). Made once: switching hero
@@ -1561,6 +1580,7 @@ impl Scene {
             focus: (Vec3::new(0.0, 2.0, 6.0), Vec3::new(0.0, 1.0, 0.0)),
             player: None,
             hero: Hero::default(),
+            outfit: None,
             people_rig: None,
             vehicles: Vec::new(),
             park: true,
@@ -1821,6 +1841,9 @@ impl Scene {
     /// clip group give, in place of whoever was played (where they stand
     /// and what they hold stay). Without a model the player walks unseen.
     pub fn load_hero(&mut self, backend: &mut dyn RenderBackend, hero: Hero) {
+        if self.hero != hero {
+            self.outfit = None;
+        }
         self.hero = hero;
         let Some(source) = self.source.as_mut() else {
             return;
@@ -1830,6 +1853,9 @@ impl Scene {
             .as_ref()
             .and_then(|w| w.index.template_db.get(hero.template()))
             .and_then(|t| t.model);
+        // The wardrobe's model, if the scripts dressed the hero in one
+        // (its clips are the hero's own, by the hero's clip group).
+        let template = self.outfit.or(template);
         let hash = template.unwrap_or(DEFAULT_MODEL);
         eprintln!(
             "hero: {hero}, model {hash:08x}{}",
