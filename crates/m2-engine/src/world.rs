@@ -534,14 +534,28 @@ impl Templates {
     }
 
     /// The rifle template id `id`'s `EquipmentLink`s hand it, as
-    /// [`own_rifle`](Self::own_rifle) finds it by name.
+    /// [`own_rifle`](Self::own_rifle) finds it by name. A template handed
+    /// no gun that fires while the trigger is held gets the first that
+    /// fires rounds one shot a pull (gap-list sweep: 64 of the 257 people
+    /// with an `Accuracy` carry only a pistol, the shotgun or a sniper
+    /// rifle, and were played with the stand-in Assault Rifle); the
+    /// heroes' lists all start with their rifle, so theirs is unchanged.
     pub fn rifle_of(&self, id: u32) -> Option<(&str, HandGun)> {
-        let gun = self
-            .equipment
-            .get(&id)?
+        let list = self.equipment.get(&id)?;
+        let gun = list
             .iter()
-            .find_map(|t| self.guns.get(t))?;
-        Some((self.names.get(&gun.template)?.as_str(), *gun))
+            .find_map(|t| self.guns.get(t).copied())
+            .or_else(|| {
+                list.iter()
+                    .filter_map(|t| self.arms.weapons.get(t))
+                    .find(|w| {
+                        w.semi
+                            && w.rate_of_fire > 0.0
+                            && w.flight() == crate::weapons::Flight::Round
+                    })
+                    .map(HandGun::from_spec)
+            })?;
+        Some((self.names.get(&gun.template)?.as_str(), gun))
     }
 
     /// The gun template `name` (`Carbine`), whatever its case.
@@ -2646,6 +2660,76 @@ pub fn low_res_tile<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gun(template: u32, semi: bool, blast: bool) -> crate::weapons::WeaponSpec {
+        let b = crate::weapons::Blast {
+            template: 99,
+            radius: 2.0,
+            damage: 40.0,
+            min_damage: 0.0,
+            max_force: 0.0,
+            key: None,
+        };
+        crate::weapons::WeaponSpec {
+            template,
+            name: format!("gun {template}"),
+            model: Some(template + 100),
+            class: None,
+            semi,
+            rate_of_fire: 150.0,
+            clip: 8,
+            reserve_clips: 4,
+            pellets: 1,
+            rounds_per_reload: 0,
+            scatter: 1.0,
+            ammo: crate::weapons::Ammo {
+                template: template + 200,
+                velocity: 42.5,
+                max_velocity: 300.0,
+                human_boost: 8.0,
+                gravity: 0.0,
+                damage: 10.0,
+                damage_min: 5.0,
+                falloff: (15.0, 50.0),
+                hero: 1.0,
+                key: Some(7),
+                blast: blast.then_some(b),
+                timer: None,
+                timer_blast: None,
+                homing: None,
+                model: None,
+                sticky: false,
+            },
+            lock_on: None,
+            pickup: None,
+            feel: Default::default(),
+            hint: None,
+            ui: None,
+            assist: None,
+        }
+    }
+
+    // A soldier listed only a launcher and a pistol carries the pistol;
+    // one listed a rifle as well carries the rifle, whatever comes first.
+    #[test]
+    fn a_soldier_without_a_rifle_carries_his_pistol() {
+        let mut t = Templates::default();
+        for (id, name) in [(1, "RPG"), (2, "Pistol"), (3, "Assault Rifle")] {
+            t.names.insert(id, name.to_owned());
+        }
+        t.arms.weapons.insert(1, gun(1, true, true));
+        t.arms.weapons.insert(2, gun(2, true, false));
+        let rifle = HandGun::from_spec(&gun(3, false, false));
+        t.guns.insert(3, rifle);
+        t.equipment.insert(10, vec![1, 2]);
+        t.equipment.insert(11, vec![2, 3]);
+        t.equipment.insert(12, vec![1]);
+        let (name, pistol) = t.rifle_of(10).unwrap();
+        assert_eq!((name, pistol.template, pistol.damage), ("Pistol", 2, 10.0));
+        assert_eq!(pistol.damage_key, Some(7));
+        assert_eq!(t.rifle_of(11).map(|g| g.0), Some("Assault Rifle"));
+        assert_eq!(t.rifle_of(12), None);
+    }
 
     #[test]
     fn blockers_for_the_ai_alone_go_by_their_name() {

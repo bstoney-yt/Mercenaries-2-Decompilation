@@ -762,6 +762,23 @@ pub struct HandGun {
     pub hint: Option<crate::weapons::FireHint>,
 }
 
+impl HandGun {
+    /// The same fields of a gun as [`crate::weapons::read`] gives it: for
+    /// one shot a pull (`FireType` 1), which [`hand_guns`] leaves out.
+    pub fn from_spec(w: &crate::weapons::WeaponSpec) -> Self {
+        Self {
+            template: w.template,
+            model: w.model,
+            rate_of_fire: w.rate_of_fire,
+            clip: w.clip,
+            reserve_clips: w.reserve_clips,
+            damage: w.ammo.damage,
+            damage_key: w.ammo.key,
+            hint: w.hint,
+        }
+    }
+}
+
 /// Every hand-held gun that fires rounds ([`HandGun`]), by template id.
 pub fn hand_guns(db: &Layer<'_>) -> HashMap<u32, HandGun> {
     let weapon = Table::new(db, "WeaponProjectileBase");

@@ -49,8 +49,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter_map(|t| arms.weapons.get(t))
             .find(|w| w.flight() == Flight::Round)
         {
-            *semi.entry(w.name.clone()).or_default() += 1;
-            "one shot a pull, rounds (played as the Assault Rifle)"
+            *semi
+                .entry(format!(
+                    "{} ({:.0} a minute, {} a round, WeaponHint {})",
+                    w.name,
+                    w.rate_of_fire,
+                    w.ammo.damage,
+                    if w.hint.is_some() { "yes" } else { "no" }
+                ))
+                .or_default() += 1;
+            "one shot a pull, rounds (played as its own since the gap-list sweep; the Assault Rifle before)"
         } else if list.iter().any(|t| arms.weapons.contains_key(t)) {
             "launcher only (played as the Assault Rifle)"
         } else {
