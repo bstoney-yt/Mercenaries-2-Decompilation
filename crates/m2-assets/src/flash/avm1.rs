@@ -42,7 +42,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use super::player::{ClipId, Kind, Player};
-use super::{ColourTransform, Matrix, Triangle, fill_triangles, push_clipped};
+use super::{Matrix, Triangle, fill_triangles, push_clipped};
 
 /// A value.
 #[derive(Clone, Default)]
@@ -2235,18 +2235,19 @@ fn collect(player: &Player, id: ClipId, m: &Matrix, out: &mut Vec<Triangle>, nes
     if nesting > 32 {
         return;
     }
+    // The shape's whole area, see-through fills too: Flash's bounds and
+    // hit areas count them (the menus' buttons are fully transparent
+    // shapes), though drawing leaves them out.
     if let Kind::Shape(s) = c.kind
-        && let Some((shape, mesh)) = c.lib.shapes.get(&s)
+        && let Some((_, mesh)) = c.lib.shapes.get(&s)
     {
-        super::draw_shape(
-            shape,
-            mesh,
-            &c.lib.images,
-            m,
-            &ColourTransform::IDENTITY,
-            None,
-            out,
-        );
+        out.extend(mesh.iter().map(|t| Triangle {
+            corners: t.corners.map(|p| m.apply(p)),
+            uv: [[0.0; 2]; 3],
+            colour: [1.0; 4],
+            texture: None,
+            multiply: false,
+        }));
     }
     for t in &c.drawing {
         out.push(Triangle {
@@ -2485,6 +2486,31 @@ impl Runtime {
             };
             button && shown(&self.player, id) && hit_test(&self.player, id, at, true)
         })
+    }
+
+    /// Each instance with a button's handlers: its path, whether it is
+    /// shown and the box round what it draws (for finding why a click
+    /// missed).
+    pub fn buttons(&self) -> Vec<(String, bool, Option<[f32; 4]>)> {
+        self.player
+            .order()
+            .into_iter()
+            .filter(|id| {
+                self.avm.clips.get(id).is_some_and(|o| {
+                    let o = o.borrow();
+                    BUTTON_EVENTS
+                        .iter()
+                        .any(|e| matches!(o.own(e), Some(Value::Object(_))))
+                })
+            })
+            .map(|id| {
+                (
+                    target_path(&self.player, id),
+                    shown(&self.player, id),
+                    world_bounds(&self.player, id),
+                )
+            })
+            .collect()
     }
 
     fn roll(&mut self) {

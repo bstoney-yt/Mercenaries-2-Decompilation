@@ -2883,6 +2883,14 @@ impl Thread {
                 m.rt.button_at(at)
                     .map(|b| flash::avm1::target_path(&m.rt.player, b))
             ));
+            // `M2_MOUSE_TRACE`: the buttons there are, when a press finds
+            // none under the pointer.
+            if down && m.rt.button_at(at).is_none() && std::env::var_os("M2_MOUSE_TRACE").is_some()
+            {
+                for (path, shown, b) in m.rt.buttons() {
+                    log.push(format!("  button {path} shown {shown} box {b:?}"));
+                }
+            }
             if down {
                 m.rt.mouse_down();
             } else {
