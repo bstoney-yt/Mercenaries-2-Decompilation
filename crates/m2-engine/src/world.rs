@@ -558,6 +558,17 @@ impl Templates {
         Some((self.names.get(&gun.template)?.as_str(), gun))
     }
 
+    /// The first launcher template id `id`'s `EquipmentLink`s hand it
+    /// ([`crate::weapons::NpcLauncher`]): 33 of the 257 people with an
+    /// `Accuracy` carry one.
+    pub fn launcher_of(&self, id: u32) -> Option<crate::weapons::NpcLauncher> {
+        self.equipment
+            .get(&id)?
+            .iter()
+            .filter_map(|t| self.arms.weapons.get(t))
+            .find_map(crate::weapons::NpcLauncher::of)
+    }
+
     /// The gun template `name` (`Carbine`), whatever its case.
     pub fn gun(&self, name: &str) -> Option<HandGun> {
         self.ids(name)
@@ -962,6 +973,9 @@ pub struct SpawnPoint {
     /// The rifle its template's `EquipmentLink`s hand it
     /// ([`Templates::rifle_of`]); `None` when they hand it none.
     pub gun: Option<HandGun>,
+    /// A launcher its `EquipmentLink`s hand it as well
+    /// ([`Templates::launcher_of`]).
+    pub launcher: Option<crate::weapons::NpcLauncher>,
     /// For a spawner: its `SecondsPerCycle`, how long after its last one
     /// fell it sends another.
     pub cycle: Option<f32>,
@@ -1645,6 +1659,7 @@ impl WorldIndex {
                 list: people_of(id, p),
                 ai,
                 gun: templates.rifle_of(p.parent).map(|(_, g)| g),
+                launcher: templates.launcher_of(p.parent),
                 cycle: own_spawners
                     .get(&id)
                     .or_else(|| templates.population.spawners.get(&p.parent))
@@ -3113,6 +3128,7 @@ impl WorldIndex {
                     list: list.clone(),
                     ai: None,
                     gun: None,
+                    launcher: None,
                     cycle: None,
                 });
             }

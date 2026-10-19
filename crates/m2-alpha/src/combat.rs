@@ -2645,6 +2645,9 @@ impl Combat {
             if std::mem::take(&mut f.people.npcs[i].fires) {
                 self.npc_shoot(f, i, target);
             }
+            if std::mem::take(&mut f.people.npcs[i].launches) {
+                self.npc_launch(f, i, target);
+            }
             if let Some(at) = f.people.npcs[i].throws.take() {
                 self.npc_throw(f, i, at);
             }
@@ -2945,6 +2948,52 @@ impl Combat {
             self.remarks.push(Remark::Kill);
         }
         alarm(f.people, f.player.character.position);
+    }
+
+    /// A soldier's rocket from his launcher at her ([`crate::npc::Npc::launcher`]):
+    /// from over his shoulder, at its template's speed from a person's
+    /// hands, bursting as its round says. His aim strays by his
+    /// `Accuracy` as his rounds do ([`SoldierSpread`], with the launcher's
+    /// own cone taken as none: inferred). A homing one is not locked on
+    /// (invented: no lock is read for soldiers).
+    fn npc_launch(&mut self, f: &mut Field<'_>, i: usize, target: Option<Vec3>) {
+        let Some(aim) = target else { return };
+        let n = &f.people.npcs[i];
+        let Some(l) = n.launcher else { return };
+        let from = n.chest() + Vec3::Y * 0.4;
+        let distance = from.distance(aim);
+        let spread = SoldierSpread::new(distance, n.accuracy(), 0.0);
+        let (a, b) = (self.random(), self.random());
+        let dir = spread.stray((aim - from).normalize_or(Vec3::Z), a, b);
+        let speed = Some(l.ammo.human_speed())
+            .filter(|&v| v > 0.0)
+            .unwrap_or(ROCKET_SPEED);
+        eprintln!(
+            "rocket: a soldier fires his {:#x} at {distance:.0} m",
+            l.template
+        );
+        self.projectiles.push(Projectile::Rocket {
+            at: from,
+            velocity: dir * speed,
+            flown: 0.0,
+            shell: false,
+            owner: None,
+            blast: l.ammo.burst(),
+            homing: None,
+            key: l.ammo.key,
+        });
+        self.effect(
+            Effect::Flash {
+                at: from,
+                dir,
+                size: RPG_FLASH,
+            },
+            FLASH_TIME * 1.6,
+        );
+        self.sounds.push(Sound::Launch {
+            at: from,
+            set: l.feel.sound_set,
+        });
     }
 
     /// A soldier's grenade lobbed from over his head down onto `at` (as

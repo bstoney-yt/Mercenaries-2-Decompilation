@@ -543,6 +543,33 @@ pub struct FireHint {
     pub against: [u32; 4],
 }
 
+/// A launcher a soldier carries beside his gun (an `EquipmentLink` to a
+/// weapon firing rockets or missiles: the AT soldiers' `AT Rocket`), and
+/// how he fires it: its `WeaponHint` (when to reach for it, by the
+/// [`FireHint::against`] ratings) and its round.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NpcLauncher {
+    pub template: u32,
+    pub hint: FireHint,
+    pub ammo: Ammo,
+    /// Its shots' sound set and flash.
+    pub feel: Feel,
+}
+
+impl NpcLauncher {
+    /// Gun `w`'s, if it fires rockets flying straight or homing and its
+    /// template gives a `WeaponHint`.
+    pub fn of(w: &WeaponSpec) -> Option<Self> {
+        matches!(w.flight(), Flight::Straight | Flight::Homing).then_some(())?;
+        Some(Self {
+            template: w.template,
+            hint: w.hint?,
+            ammo: w.ammo,
+            feel: w.feel,
+        })
+    }
+}
+
 /// `WeaponHint`'s armour ratings ([`FireHint::against`]).
 const AGAINST: [&str; 4] = ["ArmorNone", "ArmorLight", "ArmorMedium", "ArmorHeavy"];
 

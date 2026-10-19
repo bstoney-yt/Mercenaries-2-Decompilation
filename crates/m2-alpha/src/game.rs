@@ -1185,6 +1185,15 @@ impl Game {
             .player
             .as_ref()
             .and_then(|p| self.combat.target(p, self.on_foot));
+        // What she is in, for soldiers whose guns are no use against it.
+        self.scene.people.target_armour = self
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| self.scene.vehicles.get(i))
+            .and_then(|v| v.spec.tuning.armour)
+            .unwrap_or(1);
         if let Some(world) = &mut self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {
