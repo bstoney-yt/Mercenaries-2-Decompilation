@@ -6289,6 +6289,7 @@ mod tests {
             damage: 0.0,
             damage_min: 0.0,
             falloff: (0.0, 0.0),
+            dropoff: 1.0,
             hero: 1.0,
             key: None,
             blast: None,

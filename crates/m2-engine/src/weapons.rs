@@ -40,11 +40,13 @@ use crate::tuning::Table;
 const LINK: u32 = 0x5470_4554;
 /// `ControllerVelocity`'s multiple of `Velocity` when a person fires it.
 const HUMAN_BOOST: u32 = 0xf3f6_f0a9;
-/// `ProjectilePhysics`' least damage, and the ranges (metres) over which
-/// a round's damage falls from `Damage` to it: unnamed, read as such by
-/// their values (the carbine round's 15 and 50 m, the shotgun's 5 and 50,
-/// the heavy machine gun's 20 and 300); inferred.
+/// `ProjectilePhysics`' `DamageMinimum`, `DamageDropoffStart` and
+/// `DamageDropoffStop` (metres: the carbine round's 15 and 50 m, the
+/// shotgun's 5 and 50, the heavy machine gun's 20 and 300) and
+/// `DamageDropoff` (names found by hashing, gap-list sweep; before, read
+/// by their values alone). See [`Ammo::damage_at`].
 const DAMAGE_MINIMUM: u32 = 0x33f1_fb12;
+const DAMAGE_DROPOFF: u32 = 0xd698_8c68;
 /// `ProjectilePhysics`' `HeroMultiplier` (name found by hashing guesses,
 /// round 19): the carbine's, rifles', pistols' and machine guns' rounds 3,
 /// the automatic rifle's and light machine gun's 2, the RPG's 1.5, the
@@ -297,6 +299,11 @@ pub struct Ammo {
     pub damage: f32,
     pub damage_min: f32,
     pub falloff: (f32, f32),
+    /// `DamageDropoff`: the share of `Damage` lost over the falloff range
+    /// (the carbine round's 0.1, the shotgun's 0.5, the tank shells' 1;
+    /// 0 on the sniper and anti-material rifles' rounds and every
+    /// rocket).
+    pub dropoff: f32,
     /// `HeroMultiplier`: what the hero's rounds of it do, times `Damage`
     /// (1 where the template gives none).
     pub hero: f32,
@@ -334,15 +341,22 @@ impl Ammo {
         self.blast.or(self.timer_blast)
     }
 
-    /// Its damage at `distance` metres: `Damage` up to the near range,
-    /// `DamageMinimum` from the far one, a straight fall between.
+    /// Its damage at `distance` metres: `Damage` up to
+    /// `DamageDropoffStart`, then falling straight by its `DamageDropoff`
+    /// share of `Damage` by `DamageDropoffStop`, never below
+    /// `DamageMinimum` (nor above `Damage`). Inferred from the names and
+    /// values (gap-list sweep): the carbine round's 6 falls to 5.4 at 50 m
+    /// (it fell to its minimum 3 before), the shotgun's 15 to 7.5, a tank
+    /// shell's 100 to its minimum 50 as before, and a sniper round (0)
+    /// keeps its 60 (it fell to 15 at 100 m before).
     pub fn damage_at(&self, distance: f32) -> f32 {
         let (near, far) = self.falloff;
         if far <= near || distance <= near {
             return self.damage;
         }
         let t = ((distance - near) / (far - near)).clamp(0.0, 1.0);
-        self.damage + (self.damage_min.min(self.damage) - self.damage) * t
+        let floor = self.damage_min.min(self.damage);
+        (self.damage * (1.0 - self.dropoff.clamp(0.0, 1.0) * t)).max(floor)
     }
 }
 
@@ -1008,6 +1022,7 @@ impl Parts<'_> {
                 p(FALLOFF_NEAR).unwrap_or(0.0),
                 p(FALLOFF_FAR).unwrap_or(0.0),
             ),
+            dropoff: p(DAMAGE_DROPOFF).unwrap_or(1.0),
             hero: p(HERO_MULTIPLIER).filter(|m| *m > 0.0).unwrap_or(1.0),
             key: self.damage_key(id),
             blast,
@@ -1407,6 +1422,7 @@ mod tests {
             damage,
             damage_min: min,
             falloff,
+            dropoff: 1.0,
             hero: 1.0,
             key: None,
             blast: None,
@@ -1473,14 +1489,35 @@ mod tests {
         assert_eq!(machine_gun(&[]), MachineGun::StandIn);
     }
 
-    // The carbine round: 6 out to 15 m, 3 from 50 m; 340 m/s from her
-    // hands, under its 300 m/s most.
+    // The carbine round: 6 out to 15 m, a tenth less by 50 m; 340 m/s
+    // from her hands, under its 300 m/s most. A round whose dropoff is
+    // whole falls to its minimum; one of 0 keeps its damage.
     #[test]
     fn a_round_falls_off_with_range_and_flies_at_its_human_speed() {
-        let a = ammo(6.0, 3.0, (15.0, 50.0));
+        assert_eq!(
+            [DAMAGE_DROPOFF, DAMAGE_MINIMUM, FALLOFF_NEAR, FALLOFF_FAR],
+            [
+                "DamageDropoff",
+                "DamageMinimum",
+                "DamageDropoffStart",
+                "DamageDropoffStop"
+            ]
+            .map(name_hash)
+        );
+        let a = Ammo {
+            dropoff: 0.1,
+            ..ammo(6.0, 3.0, (15.0, 50.0))
+        };
         assert_eq!(a.damage_at(10.0), 6.0);
-        assert!((a.damage_at(32.5) - 4.5).abs() < 1e-4);
-        assert_eq!(a.damage_at(80.0), 3.0);
+        assert!((a.damage_at(32.5) - 5.7).abs() < 1e-4);
+        assert!((a.damage_at(80.0) - 5.4).abs() < 1e-4);
+        let shell = ammo(100.0, 50.0, (25.0, 300.0));
+        assert_eq!(shell.damage_at(300.0), 50.0);
+        let sniper = Ammo {
+            dropoff: 0.0,
+            ..ammo(60.0, 15.0, (50.0, 100.0))
+        };
+        assert_eq!(sniper.damage_at(100.0), 60.0);
         assert_eq!(a.human_speed(), 300.0);
     }
 

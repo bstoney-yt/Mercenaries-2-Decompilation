@@ -2706,6 +2706,7 @@ mod tests {
                 damage: 10.0,
                 damage_min: 5.0,
                 falloff: (15.0, 50.0),
+                dropoff: 1.0,
                 hero: 1.0,
                 key: Some(7),
                 blast: blast.then_some(b),
