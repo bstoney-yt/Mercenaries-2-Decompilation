@@ -201,6 +201,16 @@ pub enum Command {
     /// The player's fuel goes up by this (`Player.AddFuel`: a fuel
     /// pickup's script), up to the tanks' capacity.
     AddFuel(f32),
+    /// The soldiers of faction `faction` (its template's name: `OC`,
+    /// `Allied`) pursue the player for `seconds`, or until the scripts
+    /// clear it (`None`: `Pg.LockPursuit`, a custom pursuit of -1 s).
+    Pursuit {
+        faction: String,
+        seconds: Option<f32>,
+    },
+    /// A locked or custom pursuit ends (`Pg.ClearPursuitLock`,
+    /// `Pg.ClearCustomPursuit`).
+    PursuitClear,
     /// Seat a character in a vehicle (seat as the scripts name it, `"d"`
     /// for the driver); `instant` skips the climb-in.
     EnterVehicle {
@@ -411,6 +421,36 @@ pub struct ContextAction {
 /// Reach (metres) for a context action whose call gives none (invented).
 pub const CONTEXT_REACH: f32 = 2.0;
 
+/// The pursuit (`Pg.SetPursuit`, `LockPursuit`, `SetCustomPursuit`,
+/// `GetPursuitState`): the faction manager raises its level by one each
+/// time a faction at its lowest standing reports her (`IncrementPursuit`,
+/// at most 3), and the story locks one for a scene (ChiCon003's Allied, a
+/// VZ chase).
+///
+/// From the scripts: the calls and their arguments, the level read back as
+/// `GetPursuitState().Level`, and the level times (`SetPursuitLevelTimes(120,
+/// 300)`). Inferred: that a level below 3 lasts the first time and level 3
+/// the second. Invented: what `SetPursuitSeconds` (5 s, the HUD gauge's own
+/// fill time) does to it (nothing here), and the times when no script set
+/// them.
+#[derive(Debug, Default)]
+pub struct Pursuit {
+    /// Seconds a pursuit lasts below level 3 and at it, once set.
+    pub times: Option<(f32, f32)>,
+    /// The level under way (0: none).
+    pub level: i64,
+    /// The faction pursuing (its template's guid).
+    pub faction: Option<u32>,
+}
+
+impl Pursuit {
+    /// Seconds a pursuit of `level` lasts.
+    pub fn seconds(&self, level: i64) -> f32 {
+        let (low, high) = self.times.unwrap_or((120.0, 300.0));
+        if level >= 3 { high } else { low }
+    }
+}
+
 /// The scripts' view of the game, and what they asked of it.
 #[derive(Debug, Default)]
 pub struct ScriptWorld {
@@ -522,6 +562,8 @@ pub struct ScriptWorld {
     /// Witnesses reporting her, and what each faction has against her
     /// (`Report`, [`crate::report`]).
     pub reports: crate::report::Reports,
+    /// The pursuit as the scripts set it ([`Pursuit`]).
+    pub pursuit: Pursuit,
     /// Strikes and designators under way.
     pub strikes: crate::airstrike::Strikes,
     /// Whether vehicle disguises work (`Player.SetVehicleDisguise`): the
@@ -1128,6 +1170,82 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let pg = lib("Pg")?;
+    // The pursuit ([`Pursuit`]).
+    add(&pg, "SetPursuitLevelTimes", |w, _, a| {
+        if let (Some(low), Some(high)) = (num(a.first()), num(a.get(1))) {
+            w.pursuit.times = Some((low, high));
+        }
+        values([])
+    })?;
+    add(&pg, "GetPursuitState", |w, lua, _| {
+        let t = lua.create_table()?;
+        t.set("Level", w.pursuit.level)?;
+        if let Some(f) = w.pursuit.faction {
+            t.set("Faction", guid_value(Some(f)))?;
+        }
+        values([Value::Table(t)])
+    })?;
+    // (faction, level, _) for a while; (faction, level) locked.
+    fn pursue(w: &mut ScriptWorld, a: &[Value], locked: bool) {
+        let Some(f) = id(a.first()) else { return };
+        let level = num(a.get(1)).map_or(1, |l| l as i64).clamp(1, 3);
+        let Some(name) = w
+            .templates
+            .iter()
+            .find(|(_, g)| **g == f)
+            .map(|(n, _)| n.clone())
+        else {
+            return;
+        };
+        w.pursuit.level = level;
+        w.pursuit.faction = Some(f);
+        let seconds = (!locked).then(|| w.pursuit.seconds(level));
+        w.commands.push(Command::Pursuit {
+            faction: name,
+            seconds,
+        });
+    }
+    add(&pg, "SetPursuit", |w, _, a| {
+        pursue(w, a, false);
+        values([])
+    })?;
+    add(&pg, "LockPursuit", |w, _, a| {
+        pursue(w, a, true);
+        values([])
+    })?;
+    // (faction, seconds, levels): -1 s until cleared.
+    add(&pg, "SetCustomPursuit", |w, _, a| {
+        let forever = num(a.get(1)).is_none_or(|s| s < 0.0);
+        let Some(f) = id(a.first()) else {
+            return values([]);
+        };
+        let Some(name) = w
+            .templates
+            .iter()
+            .find(|(_, g)| **g == f)
+            .map(|(n, _)| n.clone())
+        else {
+            return values([]);
+        };
+        w.pursuit.level = w.pursuit.level.max(1);
+        w.pursuit.faction = Some(f);
+        let seconds = (!forever).then(|| num(a.get(1)).unwrap_or(0.0));
+        w.commands.push(Command::Pursuit {
+            faction: name,
+            seconds,
+        });
+        values([])
+    })?;
+    for clear in ["ClearPursuitLock", "ClearCustomPursuit"] {
+        add(&pg, clear, |w, _, _| {
+            w.pursuit.level = 0;
+            w.pursuit.faction = None;
+            w.commands.push(Command::PursuitClear);
+            values([])
+        })?;
+    }
+    // (faction, seconds, _): see [`Pursuit`].
+    add(&pg, "SetPursuitSeconds", |_, _, _| values([]))?;
     // The objects of a kind within a radius of a point (x, y, z, radius),
     // as a list: what the strikes hit (the bunker buster's buildings, the
     // tank buster's tanks, the air patrol's aircraft). Which labels make
@@ -1690,6 +1808,24 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         {
             w.boundaries.push(b);
         }
+        values([])
+    })?;
+    add(&player, "RemoveBoundary", |w, _, a| {
+        if let Some(b) = id(a.get(1)) {
+            w.boundaries.retain(|&x| x != b);
+        }
+        values([])
+    })?;
+    add(&player, "RemoveAllBoundary", |w, _, _| {
+        w.boundaries.clear();
+        values([])
+    })?;
+    // (player, out): sets whether she is out of the play area, without the
+    // callback hearing it: `WifVzBoundary`'s interior mode (the HQ) and the
+    // tether's end clear it (false) once they took the boundaries away, so
+    // that coming back is no "exit".
+    add(&player, "SetOutBoundary", |w, _, a| {
+        w.outside = matches!(a.get(1), Some(Value::Boolean(true)));
         values([])
     })?;
     // A character's camera: the game's one camera looks over the player,
@@ -2945,6 +3081,37 @@ mod tests {
         );
         // Up to the tanks' capacity.
         assert_eq!(w.objects[&1].fuel, 50.0);
+    }
+
+    #[test]
+    fn the_scripts_pursuit_calls_reach_the_game_and_read_back_their_level() {
+        let (host, world) = setup();
+        let run = |code: &str| host.lua().load(code).exec().unwrap();
+        run("Pg.SetPursuitLevelTimes(120, 300)\n\
+             __before = Pg.GetPursuitState().Level\n\
+             Pg.SetPursuit(Pg.GetGuidByName('OC'), 1, true)\n\
+             __one = Pg.GetPursuitState().Level\n\
+             Pg.SetPursuit(Pg.GetGuidByName('OC'), 3, true)\n\
+             Pg.LockPursuit(Pg.GetGuidByName('Allied'), 2)\n\
+             Pg.ClearPursuitLock(true)\n\
+             __after = Pg.GetPursuitState().Level");
+        let g = host.lua().globals();
+        assert_eq!(g.get::<i64>("__before").unwrap(), 0);
+        assert_eq!(g.get::<i64>("__one").unwrap(), 1);
+        assert_eq!(g.get::<i64>("__after").unwrap(), 0);
+        let pursuit = |faction: &str, seconds| Command::Pursuit {
+            faction: faction.into(),
+            seconds,
+        };
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [
+                pursuit("oc", Some(120.0)),
+                pursuit("oc", Some(300.0)),
+                pursuit("allied", None),
+                Command::PursuitClear,
+            ]
+        );
     }
 
     #[test]

@@ -201,6 +201,8 @@ pub struct Game {
     /// Witnesses reporting her: guid, faction and seconds since they set
     /// off ([`crate::mission`]).
     pub reporters: Vec<(u32, &'static str, f32)>,
+    /// Whether an army pursued her last frame.
+    pub pursued: bool,
 }
 
 /// A camera shot the scripts asked for (`Camera.SetShot`): the engine's
@@ -350,6 +352,7 @@ impl Game {
             save_icon: 0.0,
             attitude_wait: 0.0,
             reporters: Vec::new(),
+            pursued: false,
             scripts_seated: false,
         }
     }
