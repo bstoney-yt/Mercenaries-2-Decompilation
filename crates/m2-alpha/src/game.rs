@@ -1694,6 +1694,7 @@ impl Game {
             .collect();
         Some(SaveGame {
             version: save::VERSION,
+            hero: Some(self.scene.hero),
             player: PlayerSave {
                 position: at.to_array(),
                 facing: player.facing,

@@ -1061,8 +1061,9 @@ pub struct ShellNews {
     /// A new game was started, as this character (`MrxGuiShellBootstrap.
     /// GetSelectedCharacter`: `Chris`, `Jen` or `mattias`).
     pub new_game: Option<String>,
-    /// The Resolution and Refresh Rate its video screen kept.
-    pub video: Option<crate::pause::Video>,
+    /// What its menus asked of the game: settings kept, a save to load
+    /// or delete, leaving ([`crate::shell::Native::take_news`]).
+    pub news: crate::pause::News,
 }
 
 /// What a [`GameHud`] thread runs.
@@ -1205,10 +1206,9 @@ impl GameHud {
         self.shell.new_game.take()
     }
 
-    /// The Resolution and Refresh Rate the front end's video screen kept,
-    /// once.
-    pub fn take_video(&mut self) -> Option<crate::pause::Video> {
-        self.shell.video.take()
+    /// What the front end's menus asked of the game since last taken.
+    pub fn take_shell_news(&mut self) -> crate::pause::News {
+        std::mem::take(&mut self.shell.news)
     }
 
     /// Logs to `path` instead of `m2-alpha-hud.log` (a second HUD in one
@@ -1349,10 +1349,11 @@ impl GameHud {
                     return;
                 }
                 let new_game = self.shell.new_game.take().or(shell.new_game);
-                let video = shell.video.or(self.shell.video.take());
+                let mut news = std::mem::take(&mut self.shell.news);
+                news.merge(shell.news);
                 self.shell = ShellNews {
                     new_game,
-                    video,
+                    news,
                     ..shell
                 };
                 self.dropped_fanfare |= log.iter().any(|l| fanfare_failed(l));
@@ -2677,7 +2678,11 @@ impl Thread {
         // the keys it waits for itself.
         let mut calls = Vec::new();
         if self.flash.values().any(|m| m.swf == crate::shell::MOVIE) {
-            calls.extend(self.native.calls());
+            for &c in &state.pause_captured {
+                log.push(format!("shell: the keyboard table takes {c:?}"));
+                self.native.captured(c);
+            }
+            calls.extend(self.native.calls(&state.pause_settings));
             for &(code, down) in &state.keys {
                 if down {
                     calls.extend(self.native.key(code));
@@ -2732,7 +2737,7 @@ impl Thread {
         for (name, arg) in take_library_calls(self.mission.lua()) {
             let answered = self
                 .native
-                .library(&name, video, &state.pause_settings.modes);
+                .library(&name, &arg, video, &state.pause_settings.modes);
             log.push(format!(
                 "shell: LTILibName.{name}({arg}){}",
                 if answered { "" } else { " not answered" }
@@ -2806,7 +2811,7 @@ impl Thread {
                 movie,
                 under,
                 new_game,
-                video: self.native.take_video(),
+                news: self.native.take_news(),
             },
             pause: Box::default(),
         }

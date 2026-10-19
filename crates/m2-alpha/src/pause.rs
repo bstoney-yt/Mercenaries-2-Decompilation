@@ -128,7 +128,20 @@ pub struct Settings {
     pub saves: Vec<SaveEntry>,
     /// The keyboard and mouse table ([`crate::keytable`]).
     pub keys: KeyTable,
+    /// The front end's video screen's Graphic Detail (0 to 2), and its
+    /// advanced screen's eight options in its setters' order
+    /// (`LTIVideoSetSwitchOpt1` to `8`: the first, two detail levels,
+    /// shadows, two more levels, shaders, motion blur; on is 1): kept and
+    /// shown again, nothing in the alpha's drawing follows them.
+    pub detail: f64,
+    pub advanced: [f64; 8],
 }
+
+/// The front end movie's own starting values for its Graphic Detail and
+/// advanced options (`videoVideoDetailVar = 2`, `advvideooption1 = false`,
+/// `advvideooption2 = 3`...).
+pub const DETAIL: f64 = 2.0;
+pub const ADVANCED: [f64; 8] = [0.0, 3.0, 1.0, 1.0, 2.0, 2.0, 1.0, 1.0];
 
 impl Default for Settings {
     fn default() -> Self {
@@ -153,6 +166,8 @@ impl Default for Settings {
             modes: Vec::new(),
             saves: Vec::new(),
             keys: KeyTable::default(),
+            detail: DETAIL,
+            advanced: ADVANCED,
         }
     }
 }
@@ -348,6 +363,10 @@ pub struct News {
     /// _HandleMedEvacEvent` calls `MrxPlayer.MedEvac`): the mission's own
     /// scripts run it (to the sickbay, for its cost).
     pub medevac: bool,
+    /// The front end's Continue: load the newest save.
+    pub continue_game: bool,
+    /// Delete the save in this slot (the front end's load screen).
+    pub delete: Option<u32>,
 }
 
 impl News {
@@ -366,6 +385,8 @@ impl News {
         self.keys = later.keys.or(self.keys.take());
         self.video = later.video.or(self.video);
         self.medevac |= later.medevac;
+        self.continue_game |= later.continue_game;
+        self.delete = later.delete.or(self.delete);
     }
 }
 
@@ -382,10 +403,8 @@ pub struct Native {
     /// The movie's settings play has nothing for (online, advanced
     /// video...), as it last reported them.
     other: std::collections::BTreeMap<String, String>,
-    /// The keyboard table as the movie shows it, and the cell (row,
-    /// column) waiting for a key.
-    keys: KeyTable,
-    waiting: Option<(usize, usize)>,
+    /// The keyboard table's screen.
+    table: KeyScreen,
     /// The video screen's Resolution and Refresh Rate as the player has
     /// stepped them, applied when the changes are kept.
     video: Video,
@@ -396,7 +415,7 @@ impl Native {
     pub fn reset(&mut self) {
         self.set_up = false;
         self.pending.clear();
-        self.stop_waiting();
+        self.table.stop_waiting(&mut self.news);
     }
 
     /// What to call in the movie now, `settings` being play's: set up as
@@ -418,8 +437,8 @@ impl Native {
             // (`_FinishPauseOpen` restarts it) may not ask again.
             calls.extend(self.setting_calls());
             // The keyboard table, filled before its screen counts the rows.
-            self.keys = settings.keys.clone();
-            calls.extend(self.key_calls());
+            self.table = KeyScreen::new(settings.keys.clone());
+            calls.extend(self.table.fill());
         }
         calls.append(&mut self.pending);
         calls
@@ -477,96 +496,24 @@ impl Native {
                 self.pending.extend(self.controls_calls());
                 true
             }
-            "LTIInputKMEnter" | "LTIInputKMExit" => {
-                // As last accepted: what was changed and not accepted goes.
-                self.stop_waiting();
-                self.keys = self.settings.keys.clone();
-                self.pending.extend(self.key_calls());
-                self.pending.push(("LTIInputKMUpdateTable", Vec::new()));
-                true
-            }
-            "LTIInputKMChangeInput" => {
-                let Ok(cell) = arg.trim().parse::<usize>() else {
-                    return false;
-                };
-                let (row, column) = (cell % 100, cell / 100);
-                if row >= ROWS.len() || column > 1 {
-                    return false;
+            _ => match self
+                .table
+                .library(name, arg, &mut self.pending, &mut self.news)
+            {
+                Some(answered) => {
+                    self.settings.keys = self.table.kept.clone();
+                    answered
                 }
-                self.waiting = Some((row, column));
-                self.news.capture = Some(true);
-                true
-            }
-            "LTIInputKMCancelInput" => {
-                self.stop_waiting();
-                true
-            }
-            "LTIInputKMDefault" => {
-                self.stop_waiting();
-                self.keys = KeyTable::default();
-                self.pending.extend(self.key_calls());
-                self.pending.push(("LTIInputKMUpdateTable", Vec::new()));
-                true
-            }
-            "LTIInputKMApplyChanges" => {
-                self.stop_waiting();
-                self.settings.keys = self.keys.clone();
-                self.news.keys = Some(self.keys.clone());
-                true
-            }
-            _ => false,
+                None => false,
+            },
         }
     }
 
     /// The key or mouse button pressed while the keyboard table waited
     /// for one: into its cell, or, Escape, the wait called off.
     pub fn captured(&mut self, control: Control) {
-        let Some((row, column)) = self.waiting.take() else {
-            return;
-        };
-        self.news.capture = Some(false);
-        if control == Control::Key(winit::keyboard::KeyCode::Escape) {
-            self.pending.push(("LTIInputKMCancel", Vec::new()));
-            return;
-        }
-        for r in self.keys.set(row, column, control.into()) {
-            self.pending.extend(self.row_calls(r).into_iter().skip(1));
-        }
-        self.pending
-            .push(("LTIFinishedGettingInput", vec![Value::Bool(false)]));
-        self.pending.push(("LTIInputKMUpdateTable", Vec::new()));
-    }
-
-    /// The keyboard table no longer waits for a key.
-    fn stop_waiting(&mut self) {
-        if self.waiting.take().is_some() {
-            self.news.capture = Some(false);
-        }
-    }
-
-    /// Row `row` of the keyboard table, into the movie: its name, then its
-    /// primary and secondary keys.
-    fn row_calls(&self, row: usize) -> [Call; 3] {
-        let n = Value::Number(row as f64);
-        [
-            (
-                "LTIInputKMSetActionName",
-                vec![n.clone(), text(ROWS[row].name)],
-            ),
-            (
-                "LTIInputKMKeyMap",
-                vec![n.clone(), Value::Bool(false), text(&self.keys.text(row, 0))],
-            ),
-            (
-                "LTIInputKMKeyMap",
-                vec![n, Value::Bool(true), text(&self.keys.text(row, 1))],
-            ),
-        ]
-    }
-
-    /// The whole keyboard table, into the movie.
-    fn key_calls(&self) -> Vec<Call> {
-        (0..ROWS.len()).flat_map(|r| self.row_calls(r)).collect()
+        self.table
+            .captured(control, &mut self.pending, &mut self.news);
     }
 
     fn item_changed(&mut self, arg: &str) -> bool {
@@ -752,10 +699,135 @@ impl Native {
     }
 }
 
+/// The keyboard and mouse table's screen (Controls, Keyboard/Mouse), as
+/// both menus' movies run it: the pause menu's and the front end's make
+/// the same calls. Filled as the movie starts, rebound a cell at a time,
+/// kept on Accept ([`crate::keytable`]).
+#[derive(Debug, Default)]
+pub struct KeyScreen {
+    /// The table as last accepted.
+    pub kept: KeyTable,
+    /// The table as the movie shows it.
+    keys: KeyTable,
+    /// The cell (row, column) waiting for a key.
+    waiting: Option<(usize, usize)>,
+}
+
+impl KeyScreen {
+    pub fn new(kept: KeyTable) -> Self {
+        Self {
+            keys: kept.clone(),
+            kept,
+            waiting: None,
+        }
+    }
+
+    /// The whole table, into the movie.
+    pub fn fill(&self) -> Vec<Call> {
+        (0..ROWS.len()).flat_map(|r| self.row_calls(r)).collect()
+    }
+
+    /// A call to the PC's library: `Some` whether it is answered, if it
+    /// is the table's. Its calls into the movie go to `pending`.
+    pub fn library(
+        &mut self,
+        name: &str,
+        arg: &str,
+        pending: &mut Vec<Call>,
+        news: &mut News,
+    ) -> Option<bool> {
+        Some(match name {
+            "LTIInputKMEnter" | "LTIInputKMExit" => {
+                // As last accepted: what was changed and not accepted goes.
+                self.stop_waiting(news);
+                self.keys = self.kept.clone();
+                pending.extend(self.fill());
+                pending.push(("LTIInputKMUpdateTable", Vec::new()));
+                true
+            }
+            "LTIInputKMChangeInput" => {
+                let Ok(cell) = arg.trim().parse::<usize>() else {
+                    return Some(false);
+                };
+                let (row, column) = (cell % 100, cell / 100);
+                if row >= ROWS.len() || column > 1 {
+                    return Some(false);
+                }
+                self.waiting = Some((row, column));
+                news.capture = Some(true);
+                true
+            }
+            "LTIInputKMCancelInput" => {
+                self.stop_waiting(news);
+                true
+            }
+            "LTIInputKMDefault" => {
+                self.stop_waiting(news);
+                self.keys = KeyTable::default();
+                pending.extend(self.fill());
+                pending.push(("LTIInputKMUpdateTable", Vec::new()));
+                true
+            }
+            "LTIInputKMApplyChanges" => {
+                self.stop_waiting(news);
+                self.kept = self.keys.clone();
+                news.keys = Some(self.keys.clone());
+                true
+            }
+            _ => return None,
+        })
+    }
+
+    /// The key or mouse button pressed while the table waited for one:
+    /// into its cell, or, Escape, the wait called off.
+    pub fn captured(&mut self, control: Control, pending: &mut Vec<Call>, news: &mut News) {
+        let Some((row, column)) = self.waiting.take() else {
+            return;
+        };
+        news.capture = Some(false);
+        if control == Control::Key(winit::keyboard::KeyCode::Escape) {
+            pending.push(("LTIInputKMCancel", Vec::new()));
+            return;
+        }
+        for r in self.keys.set(row, column, control.into()) {
+            pending.extend(self.row_calls(r).into_iter().skip(1));
+        }
+        pending.push(("LTIFinishedGettingInput", vec![Value::Bool(false)]));
+        pending.push(("LTIInputKMUpdateTable", Vec::new()));
+    }
+
+    /// The table no longer waits for a key.
+    pub fn stop_waiting(&mut self, news: &mut News) {
+        if self.waiting.take().is_some() {
+            news.capture = Some(false);
+        }
+    }
+
+    /// Row `row`, into the movie: its name, then its primary and
+    /// secondary keys.
+    fn row_calls(&self, row: usize) -> [Call; 3] {
+        let n = Value::Number(row as f64);
+        [
+            (
+                "LTIInputKMSetActionName",
+                vec![n.clone(), text(ROWS[row].name)],
+            ),
+            (
+                "LTIInputKMKeyMap",
+                vec![n.clone(), Value::Bool(false), text(&self.keys.text(row, 0))],
+            ),
+            (
+                "LTIInputKMKeyMap",
+                vec![n, Value::Bool(true), text(&self.keys.text(row, 1))],
+            ),
+        ]
+    }
+}
+
 impl Settings {
     /// Sets the movie's variable `name` to `value` (`"true"`, `"80"`):
     /// whether play has it.
-    fn set(&mut self, name: &str, value: &str) -> bool {
+    pub fn set(&mut self, name: &str, value: &str) -> bool {
         let on = matches!(value.trim(), "true" | "1");
         let level = value
             .trim()
@@ -812,7 +884,7 @@ fn text(s: &str) -> Value {
 
 /// `addSaveGame(number, Timestamp, Character, Money, Oil, TimePlayed,
 /// LastMission, AutoSave, Percentage, Corrupt)`.
-fn save_args(s: &SaveEntry) -> Vec<Value> {
+pub fn save_args(s: &SaveEntry) -> Vec<Value> {
     vec![
         Value::Number(f64::from(s.number)),
         text(&s.timestamp),

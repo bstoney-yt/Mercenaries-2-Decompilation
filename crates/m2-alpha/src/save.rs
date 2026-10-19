@@ -19,6 +19,10 @@ pub const FILE_NAME: &str = "m2-alpha-save.toml";
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SaveGame {
     pub version: u32,
+    /// Who she is; saves from before had none (the settings' hero
+    /// stands in).
+    #[serde(default)]
+    pub hero: Option<crate::hero::Hero>,
     pub player: PlayerSave,
     pub vehicles: Vec<VehicleSave>,
     /// Spawn entities of the soldiers killed.
@@ -163,6 +167,7 @@ mod tests {
     fn save() -> SaveGame {
         SaveGame {
             version: VERSION,
+            hero: Some(crate::hero::Hero::Jennifer),
             player: PlayerSave {
                 position: [450.0, -32.5, -1950.0],
                 facing: 1.0,
@@ -216,8 +221,8 @@ weapon = "rpg"
 "#;
         let s = SaveGame::from_toml(old).unwrap();
         assert_eq!((s.player.second.as_str(), s.player.launcher), ("rpg", None));
-        // From before money: none kept.
-        assert_eq!((s.pmc, s.scripts), (None, None));
+        // From before money and heroes: none kept.
+        assert_eq!((s.pmc, s.scripts, s.hero), (None, None, None));
     }
 
     #[test]
