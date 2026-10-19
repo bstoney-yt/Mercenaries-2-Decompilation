@@ -206,6 +206,64 @@ pub struct Trespass {
     pub faction: Option<String>,
 }
 
+/// The radios ([`m2_engine::music_source`]): within a radio's reach (one
+/// whose layer is in and whose playlist the scripts filled) its playlist
+/// plays over the score, a song per visit in the playlist's order; out of
+/// reach the score comes back. Invented: the song per visit (the engine's
+/// own playlist order and its blend are not read) and the cut from the
+/// score to it.
+#[derive(Debug, Default)]
+struct Radio {
+    /// The score's cue as the scripts last set it.
+    score: Option<String>,
+    /// The radio playing over it (its entity and cue).
+    playing: Option<(u32, String)>,
+    /// How many radio songs started.
+    turn: usize,
+}
+
+impl Radio {
+    /// What the music changes to, when it does.
+    fn update(&mut self, game: &Game, mission: &Mission) -> Option<Option<String>> {
+        let her = game.focus();
+        let near = game.scene.world.as_ref().and_then(|w| {
+            w.index
+                .music_sources
+                .iter()
+                .filter(|s| game.scene.people.layer_in(Some(s.layer)))
+                .map(|s| (s, s.at.distance(her)))
+                .filter(|(s, d)| *d <= s.reach)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(s, _)| *s)
+        });
+        let playing = self.playing.as_ref().map(|r| r.0);
+        match near {
+            Some(s) if playing != Some(s.entity) => {
+                let list = mission.playlist(s.playlist);
+                if list.is_empty() {
+                    return None;
+                }
+                let cue = list[self.turn % list.len()].clone();
+                self.turn += 1;
+                eprintln!(
+                    "mission: radio {:#x} at {:.0} plays {cue} ({} in its playlist)",
+                    s.entity,
+                    s.at,
+                    list.len()
+                );
+                self.playing = Some((s.entity, cue.clone()));
+                Some(Some(cue))
+            }
+            None if playing.is_some() => {
+                eprintln!("mission: out of the radio's reach, the score again");
+                self.playing = None;
+                Some(self.score.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Seconds the contract's completion stays up.
 const BANNER_TIME: f32 = 10.0;
 
@@ -565,6 +623,8 @@ pub struct MissionLink {
     fades: Vec<crate::sound::CategoryChange>,
     /// The music cue the scripts last switched to (`Some(None)`: none).
     music: Option<Option<String>>,
+    /// The radios near her ([`Radio`]).
+    radio: Radio,
     /// Support items to stock and call in once the scripts run
     /// (`--support`).
     support: Vec<String>,
@@ -696,6 +756,7 @@ impl MissionLink {
             sounds: Vec::new(),
             fades: Vec::new(),
             music: None,
+            radio: Radio::default(),
             support: Vec::new(),
             ashore_for: 0.0,
             marked: HashMap::new(),
@@ -1274,6 +1335,10 @@ impl MissionLink {
                 "mission: the faction manager is done with reporter {g:#x} (reported: {done})"
             );
         }
+        // The radios near her play over the score.
+        if let Some(cue) = self.radio.update(game, mission) {
+            self.music = Some(cue);
+        }
         // A pursuit run out: the scripts read level 0 again.
         let pursued = !game.scene.people.pursuit.is_empty();
         if game.pursued && !pursued {
@@ -1581,7 +1646,13 @@ impl MissionLink {
                         );
                         game.combat.hp = health.clamp(0.0, game.combat.max_hp);
                     }
-                    Command::Music(cue) => self.music = Some(cue.clone()),
+                    // The score, unless a radio near her plays over it.
+                    Command::Music(cue) => {
+                        self.radio.score = cue.clone();
+                        if self.radio.playing.is_none() {
+                            self.music = Some(cue.clone());
+                        }
+                    }
                     Command::Invincible { guid, on } if *guid == PLAYER => {
                         game.combat.invincible = *on;
                     }

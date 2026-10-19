@@ -1054,16 +1054,19 @@ impl GameAudio {
     /// `None` stops the music.
     pub fn music_cue(&mut self, cue: Option<&str>) {
         self.ui_loaded();
+        // A cue the music's table doesn't have (some radio songs, kept in
+        // no table this reads) leaves what plays playing.
+        let found = cue.map(|c| (c, self.ui.as_ref().and_then(|u| u.music(c))));
+        if let Some((cue, None)) = found {
+            eprintln!("music: {cue} not found, what plays goes on");
+            return;
+        }
         if let Some(id) = self.music.take() {
             self.out.with(|m| m.stop(id));
         }
         self.music_wanted = None;
-        let Some(cue) = cue else {
+        let Some((cue, Some((stream, looped)))) = found else {
             eprintln!("music: stopped");
-            return;
-        };
-        let Some((stream, looped)) = self.ui.as_ref().and_then(|u| u.music(cue)) else {
-            eprintln!("music: {cue} not found");
             return;
         };
         let hash = self

@@ -3426,7 +3426,18 @@ fn mission_for_screenshot(
             let t = i.saturating_sub(done) as f32 * tick;
             if visit.is_none() && t >= 30.0 {
                 let her = game.focus();
+                // `Radio`: the nearest radio whose layer is in, 10 m off.
+                let radio = f == "Radio";
                 let spot = game.scene.world.as_ref().and_then(|w| {
+                    if radio {
+                        return w
+                            .index
+                            .music_sources
+                            .iter()
+                            .filter(|s| game.scene.people.layer_in(Some(s.layer)))
+                            .min_by(|a, b| a.at.distance(her).total_cmp(&b.at.distance(her)))
+                            .map(|s| (s.at, format!("radio {:#x}", s.entity)));
+                    }
                     w.index
                         .spawns
                         .iter()
@@ -3448,8 +3459,9 @@ fn mission_for_screenshot(
                 match (spot, game.scene.player.as_mut()) {
                     (Some((at, name)), Some(p)) => {
                         let away = (her - at).with_y(0.0).normalize_or(m2_math::glam::Vec3::X);
-                        p.drop_at(at + away * 25.0);
-                        eprintln!("faction-check: {f}: put 25 m from {name} at {at:.1}");
+                        let off = if radio { 10.0 } else { 25.0 };
+                        p.drop_at(at + away * off);
+                        eprintln!("faction-check: {f}: put {off:.0} m from {name} at {at:.1}");
                         visit = Some(0.0);
                     }
                     _ => {

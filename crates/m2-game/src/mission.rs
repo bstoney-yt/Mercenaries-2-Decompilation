@@ -1125,6 +1125,12 @@ impl Mission {
         self.world.borrow_mut().reports.take_ended()
     }
 
+    /// The cues of the radio playlist with name hash `hash`, as the
+    /// scripts filled it ([`crate::music::Music::playlist`]).
+    pub fn playlist(&self, hash: u32) -> Vec<String> {
+        self.world.borrow().music.playlist(hash).to_vec()
+    }
+
     /// The pursuit the scripts set ran out: `Pg.GetPursuitState` reads
     /// level 0 again.
     pub fn pursuit_over(&mut self) {

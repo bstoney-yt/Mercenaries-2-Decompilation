@@ -23,6 +23,7 @@ pub mod gun_sounds;
 pub mod hijack;
 pub mod model;
 pub mod motion;
+pub mod music_source;
 pub mod ordnance;
 pub mod particles;
 pub mod physics;
