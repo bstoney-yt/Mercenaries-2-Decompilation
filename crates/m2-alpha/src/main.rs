@@ -4337,6 +4337,47 @@ fn plough_at(game: &mut Game, kind: &str) -> bool {
         );
         return true;
     }
+    // `car`: the nearest other vehicle parked (within 150 m), to crash
+    // into ([`crate::combat::Combat::vehicle_crashes`]).
+    if kind == "car" {
+        let Some((j, at)) = game
+            .scene
+            .vehicles
+            .iter()
+            .enumerate()
+            .filter(|&(j, v)| j != i && !v.wrecked)
+            .filter_map(|(j, v)| {
+                let at = world.physics.vehicle_transform(v.id?)?.w_axis.truncate();
+                Some((j, at))
+            })
+            .filter(|(_, at)| at.distance(here) < 150.0)
+            .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
+        else {
+            eprintln!("plough: no other vehicle within 150 m of {here:.1}");
+            return false;
+        };
+        let back = (here - at).with_y(0.0).normalize_or(Vec3::X);
+        let spot = at + back * 14.0;
+        let ground = world
+            .physics
+            .island_below(spot.with_y(spot.y + 200.0), 400.0)
+            .unwrap_or(spot.y);
+        let ahead = -back;
+        let turn = Quat::from_rotation_y(ahead.x.atan2(ahead.z));
+        world.physics.remove_vehicle(id);
+        let v = &mut game.scene.vehicles[i];
+        v.id = Some(
+            world
+                .physics
+                .add_vehicle_turned(&v.spec, spot.with_y(ground + 1.0), turn),
+        );
+        let (mine, theirs) = (
+            v.spec.label.clone(),
+            game.scene.vehicles[j].spec.label.clone(),
+        );
+        eprintln!("plough: the {mine} parked 14 m short of the {theirs} at {at:.1}, facing it");
+        return true;
+    }
     let wanted = |w: &m2_engine::World, o: usize| {
         let t = w.index.objects[o].template;
         let crash = w.index.template_db.crashable.get(&t).map(|c| c.how);

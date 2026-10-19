@@ -94,7 +94,8 @@ m2-alpha [options]
                          until it comes down, at most n rockets, logging
                          its damage; pictures -before, -1s, -2s and -6s
   --plough <kind>        with --drive: park facing the nearest fence,
-                         plant, lamp or box (within 150 m) and drive
+                         plant, lamp, box or car (another vehicle, 14 m
+                         off) within 150 m and drive
                          straight through it
   --vehicle <name>       with --drive: get in the nearest vehicle whose
                          name holds this (stryker, m1a1, amx30, hmmwv...)
