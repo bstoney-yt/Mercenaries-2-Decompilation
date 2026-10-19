@@ -36,6 +36,13 @@
 //! by it; that she stands and does not fire while they are up. What the
 //! reticle is on (`sFocusName`, `uFocusGuid`) is not told yet: its name
 //! line stays blank.
+//!
+//! Aiming a gun with a scope (`WeaponScope`: the sniper rifles', the
+//! anti-material rifle's) shows the same screen with `bSniper` set, its
+//! "Sniper Scope" tree, at the scope's magnification (its
+//! `MinZoomLevel` to `MaxZoomLevel`; [`magnified`]), and she can fire
+//! through it (gap-list sweep; the screen's sniper tree not compared with
+//! footage: none found).
 
 /// The zoom levels the zoom meter spans.
 pub const MIN_ZOOM: u8 = 1;
@@ -85,10 +92,19 @@ impl Binoculars {
     }
 }
 
+/// The lens, degrees, for `fov` (the plain view's) magnified `zoom`
+/// times: what is seen is `zoom` times as large.
+pub fn magnified(fov: f32, zoom: f32) -> f32 {
+    let half = (fov.to_radians() * 0.5).tan() / zoom.max(1.0);
+    (2.0 * half.atan()).to_degrees()
+}
+
 /// What the binocular screen is told each frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct View {
     pub zoom: u8,
+    /// Her gun's scope, not her binoculars (`bSniper`).
+    pub sniper: bool,
     /// Degrees, growing turning left, -180..180 ([`wrap_degrees`]).
     pub heading: f32,
     /// Degrees up from the horizon.

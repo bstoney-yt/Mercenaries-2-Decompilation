@@ -881,11 +881,16 @@ impl HudState {
             saving: game.save_icon > 0.0,
             hero: Some((game.scene.hero, game.combat.max_hp)),
             binoculars: game.walking().and_then(|p| {
-                p.binoculars.map(|b| binoculars::View {
-                    zoom: b.zoom,
-                    heading: binoculars::wrap_degrees(game.view_heading().to_degrees()),
-                    pitch: p.pitch.to_degrees(),
-                })
+                let scope = p.scope.map(|z| (z.round().clamp(1.0, 255.0) as u8, true));
+                p.binoculars
+                    .map(|b| (b.zoom, false))
+                    .or(scope)
+                    .map(|(zoom, sniper)| binoculars::View {
+                        zoom,
+                        sniper,
+                        heading: binoculars::wrap_degrees(game.view_heading().to_degrees()),
+                        pitch: p.pitch.to_degrees(),
+                    })
             }),
             ..Self::default()
         }
@@ -3640,9 +3645,9 @@ impl Thread {
             Ok(t)
         };
         match (was, s.binoculars) {
-            (None, Some(_)) => {
+            (None, Some(v)) => {
                 let t = event("BinocularsEnter")?;
-                t.set("bSniper", false)?;
+                t.set("bSniper", v.sniper)?;
                 let n = gui_runtime::fire(lua, "BinocularsEnter", t)?;
                 log.push(format!("binoculars: up ({n} handlers)"));
             }

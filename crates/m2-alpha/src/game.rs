@@ -630,7 +630,7 @@ impl Game {
                 self.step(intent, dt);
                 return;
             }
-            self.aim_lens(&mut intent, dt);
+            self.aim_lens(&mut intent, zoom, dt);
             let driving = self
                 .scene
                 .player
@@ -663,13 +663,20 @@ impl Game {
     /// the view narrows to its `CrouchFov` share and her look slows to its
     /// `CrouchYawSpeed` and `CrouchPitchSpeed`; else it widens back to its
     /// `FOV` (1 on every gun). The lens eases there at [`LENS_EASE`] a
-    /// second (invented).
-    fn aim_lens(&mut self, intent: &mut Intent, dt: f32) {
+    /// second (invented). A gun with a scope (`WeaponScope`) looks through
+    /// it instead, aiming: at its least magnification, the wheel stepping
+    /// it a level a notch up to its most (the steps invented), with the
+    /// game's scope screen up (the binocular screen with `bSniper`).
+    pub fn aim_lens(&mut self, intent: &mut Intent, zoom: i32, dt: f32) {
         let feel = self.combat.camera_feel();
+        let scope = self.combat.scope();
         let Some(player) = self.scene.player.as_mut() else {
             return;
         };
         let aiming = player.aiming && player.driving.is_none();
+        player.scope = scope
+            .filter(|_| aiming)
+            .map(|(least, most)| scope_step(player.scope, zoom, least, most));
         player.lens = lens_step(player.lens, feel, aiming, dt);
         if let Some(f) = feel.filter(|_| aiming) {
             intent.look.x *= f.aim_look[0];
@@ -3645,6 +3652,12 @@ mod tests {
     }
 }
 
+/// Her scope's magnification `was` (`None`: just raised, at `least`)
+/// stepped `zoom` levels, held between `least` and `most`.
+fn scope_step(was: Option<f32>, zoom: i32, least: f32, most: f32) -> f32 {
+    (was.unwrap_or(least) + zoom as f32).clamp(least, most.max(least))
+}
+
 /// Her lens' share of the field of view after `dt` seconds from `lens`,
 /// easing to her gun's share: `CrouchFov` aiming, `FOV` else, 1 for a gun
 /// whose template says neither.
@@ -3686,6 +3699,19 @@ mod lens_tests {
         }
         assert!((lens - 1.0).abs() < 0.01, "{lens}");
         assert_eq!(lens_step(0.7, None, true, 1.0), 1.0);
+    }
+
+    // The sniper rifle's scope: raised at 4x, the wheel up to 8x and no
+    // further, down to 4x and no further.
+    #[test]
+    fn the_scope_steps_between_its_magnifications() {
+        let mut z = scope_step(None, 0, 4.0, 8.0);
+        assert_eq!(z, 4.0);
+        for _ in 0..6 {
+            z = scope_step(Some(z), 1, 4.0, 8.0);
+        }
+        assert_eq!(z, 8.0);
+        assert_eq!(scope_step(Some(z), -9, 4.0, 8.0), 4.0);
     }
 
     // Taking up a gun with the use key cues its set's `equip_pickup`;

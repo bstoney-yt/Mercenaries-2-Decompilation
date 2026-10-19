@@ -1787,15 +1787,15 @@ fn screenshot(
             {
                 eprintln!("--pickup: she has no pickup clip, or is busy");
             }
-            game.step(
-                Intent {
-                    jump,
-                    hold_jump: jump,
-                    trigger,
-                    ..intent
-                },
-                tick,
-            );
+            let mut intent = Intent {
+                jump,
+                hold_jump: jump,
+                trigger,
+                ..intent
+            };
+            // Her gun's lens and scope as she aims (as play does).
+            game.aim_lens(&mut intent, 0, tick);
+            game.step(intent, tick);
             // With `--walk-seconds`, where she is each second: how deep the
             // sea is over her feet, and whether she swims.
             if options.walk_seconds.is_some()

@@ -190,6 +190,8 @@ pub struct Rifle {
     /// How it sets her camera (`HumanCameraModifier`), if its template
     /// says.
     pub camera: Option<m2_engine::weapons::CameraFeel>,
+    /// Its scope's least and most magnification (`WeaponScope`).
+    pub scope: Option<(f32, f32)>,
 }
 
 impl Default for Rifle {
@@ -213,6 +215,7 @@ impl Default for Rifle {
             ui: None,
             assist: None,
             camera: None,
+            scope: None,
         }
     }
 }
@@ -267,6 +270,7 @@ impl Rifle {
             ui: spec.ui,
             assist: spec.assist,
             camera: spec.camera,
+            scope: spec.scope,
         }
     }
 
@@ -2221,6 +2225,15 @@ impl Combat {
         match self.weapon {
             Weapon::Rifle => self.rifle.camera,
             _ => self.launcher.camera,
+        }
+    }
+
+    /// The scope of the weapon up in her hands, if it has one: its least
+    /// and most magnification.
+    pub fn scope(&self) -> Option<(f32, f32)> {
+        match self.weapon {
+            Weapon::Rifle => self.rifle.scope,
+            _ => self.launcher.scope,
         }
     }
 

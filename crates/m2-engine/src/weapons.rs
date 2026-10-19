@@ -412,6 +412,11 @@ pub struct WeaponSpec {
     /// How it sets her camera (`HumanCameraModifier`), if its template
     /// says.
     pub camera: Option<CameraFeel>,
+    /// Its scope's magnifications, least and most (`WeaponScope`'s
+    /// `MinZoomLevel` and `MaxZoomLevel`, names found by hashing, gap-list
+    /// sweep: the sniper rifles' 4 and 8, the anti-material rifle's 5 and
+    /// 10; no other gun has a scope).
+    pub scope: Option<(f32, f32)>,
 }
 
 /// A gun's aim assist, from its `HumanCameraModifier`: the named fields
@@ -1068,6 +1073,11 @@ pub fn read(db: &Layer<'_>) -> Arms {
     let sound = Table::new(db, "SoundEffect");
     let ui = Table::new(db, "WeaponUI");
     let camera = Table::new(db, "HumanCameraModifier");
+    let scope = Table::new(db, "WeaponScope");
+    let scope_of = |id: u32| {
+        let f = |name: &str| Parts::float(&scope, id, name_hash(name)).filter(|v| *v > 0.0);
+        Some((f("MinZoomLevel")?, f("MaxZoomLevel")?))
+    };
     let assist_of = |id: u32| {
         let f = |name: &str| Parts::float(&camera, id, name_hash(name));
         Some(AimAssist {
@@ -1153,6 +1163,7 @@ pub fn read(db: &Layer<'_>) -> Arms {
                     })(),
                     assist: assist_of(id),
                     camera: camera_of(id),
+                    scope: scope_of(id),
                 },
             ))
         })
@@ -1463,6 +1474,7 @@ mod tests {
                 ui: None,
                 assist: None,
                 camera: None,
+                scope: None,
             },
             nodes: vec![Some(0)],
         }
@@ -1657,6 +1669,7 @@ mod tests {
             ui: None,
             assist: None,
             camera: None,
+            scope: None,
         };
         let arms = Arms {
             weapons: HashMap::from([(7, spec)]),

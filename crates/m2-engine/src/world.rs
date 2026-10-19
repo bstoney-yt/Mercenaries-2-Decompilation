@@ -2723,6 +2723,7 @@ mod tests {
             ui: None,
             assist: None,
             camera: None,
+            scope: None,
         }
     }
 
