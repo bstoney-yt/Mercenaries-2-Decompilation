@@ -2971,32 +2971,50 @@ impl Combat {
         let cone = gun
             .and_then(|g| self.feels.get(&g.template))
             .map_or(NPC_CONE, |f| f.scatter[0]);
-        let spread = SoldierSpread::new(distance, n.accuracy(), cone);
-        let (a, b) = (self.random(), self.random());
-        let dir = spread.stray((aim - from).normalize_or(Vec3::Z), a, b);
-        let hit = cast_shot(
-            f.physics,
-            f.people,
-            from,
-            dir,
-            distance + 2.0,
-            Some(i),
-            None,
-        );
-        let end = hit.map_or(from + dir * (distance + 2.0), |h| from + dir * h.0);
-        self.effect(Effect::Tracer { from, to: end }, 0.07);
+        let accuracy = n.accuracy();
+        let ahead = (aim - from).normalize_or(Vec3::Z);
+        // A gun firing several rounds a shot (the shotgun's
+        // `iBulletsPerShot` 10): his miss aims the shot, and each round
+        // strays from that within the gun's cone (inferred: the cone as
+        // the pellets' spread, as it is for her own shotgun).
+        let pellets = gun.map_or(1, |g| g.pellets.max(1));
+        let (spread, aimed) = if pellets > 1 {
+            let (a, b) = (self.random(), self.random());
+            let shot = SoldierSpread::new(distance, accuracy, 0.0).stray(ahead, a, b);
+            let c = cone.max(0.0).to_radians();
+            (SoldierSpread { side: c, up: c }, shot)
+        } else {
+            (SoldierSpread::new(distance, accuracy, cone), ahead)
+        };
         let feel = gun.and_then(|g| self.feels.get(&g.template).copied());
-        self.gun_fired(feel, (from, case), dir, RIFLE_FLASH, Some(shooter));
-        let closest = from + dir * (aim - from).dot(dir).max(0.0);
-        let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
-        if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
-            let damage = self.npc_round(gun);
-            let lost = self.hurt_player(f, damage, Some(from));
-            self.tally.taken_rounds += lost;
-            self.tally.rounds_on_her += u32::from(lost > 0.0);
-        }
-        if let Some((t, None)) = hit {
-            self.round_on_vehicle(f, (from, dir, t), RIFLE_ON_VEHICLE, None);
+        for k in 0..pellets {
+            let (a, b) = (self.random(), self.random());
+            let dir = spread.stray(aimed, a, b);
+            let hit = cast_shot(
+                f.physics,
+                f.people,
+                from,
+                dir,
+                distance + 2.0,
+                Some(i),
+                None,
+            );
+            let end = hit.map_or(from + dir * (distance + 2.0), |h| from + dir * h.0);
+            self.effect(Effect::Tracer { from, to: end }, 0.07);
+            if k == 0 {
+                self.gun_fired(feel, (from, case), dir, RIFLE_FLASH, Some(shooter));
+            }
+            let closest = from + dir * (aim - from).dot(dir).max(0.0);
+            let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
+            if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
+                let damage = self.npc_round(gun);
+                let lost = self.hurt_player(f, damage, Some(from));
+                self.tally.taken_rounds += lost;
+                self.tally.rounds_on_her += u32::from(lost > 0.0);
+            }
+            if let Some((t, None)) = hit {
+                self.round_on_vehicle(f, (from, dir, t), RIFLE_ON_VEHICLE, None);
+            }
         }
     }
 
@@ -3008,6 +3026,7 @@ impl Combat {
         people: &mut People,
         arsenal: &Arsenal,
         vehicles: &mut [ParkedVehicle],
+        gun: Option<m2_engine::tuning::HandGun>,
     ) {
         let target = self.target(player, true);
         people.npcs.clear();
@@ -3019,6 +3038,7 @@ impl Combat {
             crate::npc::Brain::Post { facing: 0.0 },
             Some(1),
         ));
+        people.npcs[0].gun = gun;
         let mut f = Field {
             physics,
             player,
@@ -5840,6 +5860,48 @@ mod tests {
         assert!(!field.explosives[2].gone);
     }
 
+    // The shotgun's 10 rounds a shot: ten rounds go out, as many tracers.
+    #[test]
+    fn a_soldiers_shotgun_fires_its_rounds_a_shot() {
+        let mut physics = ground();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        for _ in 0..3 {
+            player.update(&physics, Default::default(), 1.0 / 60.0);
+        }
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let tracers = |c: &Combat| {
+            c.effects
+                .iter()
+                .filter(|e| matches!(e.0, Effect::Tracer { .. }))
+                .count()
+        };
+        for (pellets, want) in [(1, 1), (10, 10)] {
+            let gun = m2_engine::tuning::HandGun {
+                template: 1,
+                model: None,
+                rate_of_fire: 90.0,
+                clip: 6,
+                reserve_clips: 4,
+                damage: 15.0,
+                damage_key: None,
+                hint: None,
+                pellets,
+            };
+            let mut combat = Combat::default();
+            combat.npc_shoot_at_for_test(
+                &mut physics,
+                &mut player,
+                &mut people,
+                &arsenal,
+                &mut vehicles,
+                Some(gun),
+            );
+            assert_eq!(tracers(&combat), want);
+        }
+    }
+
     #[test]
     fn soldiers_shots_wear_her_down() {
         let mut physics = ground();
@@ -5859,6 +5921,7 @@ mod tests {
                 &mut people,
                 &arsenal,
                 &mut vehicles,
+                None,
             );
         }
         assert!(combat.hp < 100.0);
@@ -5914,6 +5977,7 @@ mod tests {
             damage: 12.0,
             damage_key: None,
             hint: None,
+            pellets: 1,
         };
         assert_eq!(combat.npc_round(Some(gun)), 3.0);
         assert_eq!(combat.npc_round(None), NPC_DAMAGE);
@@ -5982,6 +6046,7 @@ mod tests {
             damage: 8.0,
             damage_key: Some(m2_assets::name_hash("Bullet")),
             hint: None,
+            pellets: 1,
         };
         let rifle = Rifle::of("Bullpup Rifle", &bullpup);
         assert_eq!((rifle.model, rifle.clip, rifle.spare), ("bullpup", 30, 210));

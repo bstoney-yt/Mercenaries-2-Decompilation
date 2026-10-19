@@ -3790,6 +3790,7 @@ pub(crate) mod tests {
             damage: 9.0,
             damage_key: None,
             hint: None,
+            pellets: 1,
         };
         people.add_kind(kind("Carmona", true));
         people.add_kind(PersonKind {
@@ -4011,6 +4012,7 @@ pub(crate) mod tests {
             damage: 8.0,
             damage_key: None,
             hint: None,
+            pellets: 1,
         }
     }
 

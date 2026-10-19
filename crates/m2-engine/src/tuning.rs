@@ -760,6 +760,8 @@ pub struct HandGun {
     pub damage_key: Option<u32>,
     /// How soldiers fire it (`WeaponHint`, [`crate::weapons::FireHint`]).
     pub hint: Option<crate::weapons::FireHint>,
+    /// Rounds a shot (`iBulletsPerShot`: the shotgun's 10, else 1).
+    pub pellets: u32,
 }
 
 impl HandGun {
@@ -775,6 +777,7 @@ impl HandGun {
             damage: w.ammo.damage,
             damage_key: w.ammo.key,
             hint: w.hint,
+            pellets: w.pellets,
         }
     }
 }
@@ -810,6 +813,10 @@ pub fn hand_guns(db: &Layer<'_>) -> HashMap<u32, HandGun> {
                         .first()
                         .and_then(|k| key.word(k, name_hash("DamageKey"))),
                     hint: crate::weapons::FireHint::read(&hint, id),
+                    pellets: weapon
+                        .word(r, name_hash("iBulletsPerShot"))
+                        .map_or(1, |c| c & 0xff)
+                        .max(1),
                 },
             ))
         })
