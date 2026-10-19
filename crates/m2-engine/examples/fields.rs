@@ -6,7 +6,8 @@
 //! cargo run --release -p m2-engine --example fields -- "<install dir>" <component> <field>...
 //! ```
 //!
-//! A field the component lacks prints `-`; a bit field prints its bits. Values print as floats, and as
+//! A field not yet named is given as `#` and its hash (`#d6988c68`). A
+//! field the component lacks prints `-`; a bit field prints its bits. Values print as floats, and as
 //! whole numbers too when the word is not a normal float. Prints numbers
 //! and template names only.
 
@@ -16,6 +17,14 @@ use std::path::Path;
 use m2_assets::layer::{Layer, TEMPLATE_DB_TYPE};
 use m2_assets::name_hash;
 use m2_engine::Install;
+
+/// A field's name hash: `#` and eight hex digits for a field not yet
+/// named, else the name's.
+fn field_hash(name: &str) -> u32 {
+    name.strip_prefix('#')
+        .and_then(|h| u32::from_str_radix(h, 16).ok())
+        .unwrap_or_else(|| name_hash(name))
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -42,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|n| {
             c.fields
                 .iter()
-                .find(|f| f.name_hash == name_hash(n))
+                .find(|f| f.name_hash == field_hash(n))
                 .map(|f| (usize::from(f.offset), f.bit_shift, f.bit_width))
         })
         .collect();

@@ -556,6 +556,11 @@ pub struct FireHint {
     /// read.
     pub against: [u32; 4],
 }
+// Also in `WeaponHint`, named by hashing (gap-list sweep) and not read:
+// `SingleShotWeapon` (@20: 1 on the 31 records whose `BurstOnLength` is
+// 0 but the rocket pod's, so already one round a burst). Unnamed: the
+// small whole numbers at @0 (1 to 3), @4 (1 to 3) and @24 (1 on the
+// guided missiles only).
 
 /// A launcher a soldier carries beside his gun (an `EquipmentLink` to a
 /// weapon firing rockets or missiles: the AT soldiers' `AT Rocket`), and
@@ -1572,6 +1577,7 @@ mod tests {
             AGAINST.map(name_hash),
             [0xa421_1ea4, 0x1e14_e116, 0xccdc_6fc3, 0x3fc0_56f3]
         );
+        assert_eq!(name_hash("SingleShotWeapon"), 0xdfd7_d1dd);
     }
 
     // The carbine's and the minigun's bursts (their `WeaponHint`s).
