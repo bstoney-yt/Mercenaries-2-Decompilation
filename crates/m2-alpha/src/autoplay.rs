@@ -169,6 +169,9 @@ const LOG_WAY: f32 = 30.0;
 /// 100 m up the beach before it lands (from the recordings; she still
 /// fights back first when they're within [`DEFEND`]).
 const OPEN_NEAR: f32 = 250.0;
+/// With the launcher empty, rockets lying within this far (metres) are
+/// fetched, those the layers placed too. Invented.
+const RESTOCK_NEAR: f32 = 150.0;
 const OPEN_FROM: f32 = 0.9;
 const OPEN_FACING: f32 = 0.2;
 const OPEN_FOR: f32 = 45.0;
@@ -488,6 +491,9 @@ impl Autoplay {
             .world
             .as_ref()
             .map_or(&none, |w| &w.index.template_db);
+        let rockets_out = game.combat.second == Some(Weapon::Rpg)
+            && game.combat.launcher_rounds.is_none_or(|r| r.total() == 0)
+            && live.iter().any(|m| m.kind == "destroy");
         if driving.is_none()
             && let Some((from, d)) = game
                 .scene
@@ -497,14 +503,18 @@ impl Autoplay {
                 // What the layers place she leaves to the player: going out
                 // of her way for each would keep her from the contract.
                 // (Cheapest first: there are hundreds placed.)
+                // Except rockets with the launcher empty and something
+                // left to blow up (round 4's AllCon002: the boats).
                 .filter(|p| {
-                    !game.placed.is_pickup(p.from)
-                        && p.at.distance(here) < OPEN_NEAR
+                    let d = p.at.distance(here);
+                    let restock = rockets_out
+                        && d < RESTOCK_NEAR
+                        && crate::mission::refill(templates, &game.combat, &p.what).launcher > 0;
+                    (restock || (!game.placed.is_pickup(p.from) && d < OPEN_NEAR))
                         && !self.left_lying.contains(&p.key())
                         && wanted(templates, &game.combat, p)
                 })
                 .map(|p| (p.key(), p.at.distance(here)))
-                .filter(|&(_, d)| d < OPEN_NEAR)
                 .min_by(|a, b| a.1.total_cmp(&b.1))
         {
             return Some((
@@ -562,6 +572,22 @@ impl Autoplay {
             } else {
                 "blowing up"
             };
+            // Far off, on foot, with a ride close: driven there (round
+            // 4's AllCon002 walked 600 m to the boats while Caracas fell).
+            if driving.is_none()
+                && at.distance(here) > RIDE_FOR
+                && let Some(i) = self.ride_near(game, here)
+            {
+                return Some((
+                    Goal::Board(i),
+                    format!(
+                        "taking the {} for {} ({:.0} m off)",
+                        vehicles[i].spec.label,
+                        m.name,
+                        at.distance(here)
+                    ),
+                ));
+            }
             return Some((
                 Goal::Blast {
                     target: m.target,
@@ -637,28 +663,8 @@ impl Autoplay {
             .collect();
         let m = nearest(places, here)?;
         if driving.is_none() {
-            // Far, with a ride close: the scripts' vehicle they brought
-            // last that she hasn't driven (the tank delivered for the next
-            // leg), else hers from before or another of theirs.
-            let near = |i: usize, within: f32| {
-                vehicles
-                    .get(i)
-                    .is_some_and(|v| !v.wrecked && !v.spec.is_boat())
-                    && vehicle_at(game, i)
-                        .is_some_and(|t| t.w_axis.truncate().distance(here) < within)
-            };
-            let fresh = (0..vehicles.len())
-                .rev()
-                .filter(|&i| vehicles[i].guid.is_some() && !self.ridden.contains(&i))
-                .find(|&i| near(i, RIDE_FRESH));
-            let known = || {
-                self.ride
-                    .into_iter()
-                    .chain((0..vehicles.len()).filter(|&i| vehicles[i].guid.is_some()))
-                    .find(|&i| near(i, RIDE_NEAR))
-            };
             if m.at.distance(here) > RIDE_FOR
-                && let Some(i) = fresh.or_else(known)
+                && let Some(i) = self.ride_near(game, here)
             {
                 return Some((
                     Goal::Board(i),
@@ -707,6 +713,29 @@ impl Autoplay {
                 m.at.distance(here)
             ),
         ))
+    }
+
+    /// A ride close to `here`, for somewhere far: the scripts' vehicle
+    /// they brought last that she hasn't driven (the tank delivered for
+    /// the next leg), else hers from before or another of theirs.
+    fn ride_near(&self, game: &Game, here: Vec3) -> Option<usize> {
+        let vehicles = &game.scene.vehicles;
+        let near = |i: usize, within: f32| {
+            vehicles
+                .get(i)
+                .is_some_and(|v| !v.wrecked && !v.spec.is_boat())
+                && vehicle_at(game, i).is_some_and(|t| t.w_axis.truncate().distance(here) < within)
+        };
+        (0..vehicles.len())
+            .rev()
+            .filter(|&i| vehicles[i].guid.is_some() && !self.ridden.contains(&i))
+            .find(|&i| near(i, RIDE_FRESH))
+            .or_else(|| {
+                self.ride
+                    .into_iter()
+                    .chain((0..vehicles.len()).filter(|&i| vehicles[i].guid.is_some()))
+                    .find(|&i| near(i, RIDE_NEAR))
+            })
     }
 
     /// Opening supply crate `target`: to its side, turned to it, and a
@@ -1872,13 +1901,11 @@ fn wanted(templates: &Templates, combat: &Combat, p: &crate::flights::Pickup) ->
     }
 }
 
-/// Vehicle `vehicles[i]`'s model to world, if placed.
-/// A spot she can stand on and see `target` from: on rings round it, with
-/// ground under it and nothing between eye height there and `short` of
-/// the target,
-/// not within a few metres of one already `tried`; of the nearest ring
-/// with any, the one closest to `from`, preferring ground about as high
-/// as hers.
+/// A spot she can stand on and see `target` from: on `rings` round it,
+/// with ground under it and nothing between eye height there and `short`
+/// of the target, not within a few metres of one already `tried`; of the
+/// nearest ring with any, the one closest to `from`, preferring ground
+/// about as high as hers.
 fn vantage(
     physics: &Physics,
     target: Vec3,
@@ -1919,6 +1946,7 @@ fn vantage(
     best.map(|(_, s)| s)
 }
 
+/// Vehicle `vehicles[i]`'s model to world, if placed.
 fn vehicle_at(game: &Game, i: usize) -> Option<Mat4> {
     let id = game.scene.vehicles.get(i)?.id?;
     game.scene.world.as_ref()?.physics.vehicle_transform(id)
