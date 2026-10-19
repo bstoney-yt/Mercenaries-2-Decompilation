@@ -1147,9 +1147,10 @@ fn check(
         // event was made (persistent: after it last fired).
         // { 0, object }: as the player takes the context action offered
         // beside the object (`Pg.AddContextAction`: the HQ's exits, a
-        // starter's talk). Passes who took it: the wardrobe's callback
-        // (`WifPmcInterior._SelectOutfit(who)`, made with no data) opens only
-        // for the primary character.
+        // starter's talk). Passes who took it and the object: the wardrobe's
+        // callback (`WifPmcInterior._SelectOutfit(who)`, made with no data)
+        // opens only for the primary character, and the verify objective's
+        // `_TargetActioned(self, who, target)` turns her to the target.
         "ContextAction" => match guid(&p.params, 2) {
             Some(g) => {
                 let taken = world
@@ -1157,7 +1158,7 @@ fn check(
                     .iter()
                     .any(|(t, o)| *o == g && *t >= p.last && (*t > p.last || !p.persistent));
                 if taken {
-                    Check::Fire(world.player().map(id).into_iter().collect())
+                    Check::Fire(world.player().map(id).into_iter().chain([id(g)]).collect())
                 } else {
                     no
                 }

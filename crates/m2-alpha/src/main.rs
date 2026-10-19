@@ -315,6 +315,8 @@ struct Options {
     /// `--bash-target <s>k`: knock them down instead (as a bash does a
     /// boss it doesn't hurt), to try the capture on anyone.
     knock_target: bool,
+    /// `--bash-target <s>d`: kill them instead, to try the photo verify.
+    kill_target: bool,
     /// `--call-extraction <s>`: that long after the contract, call in the
     /// extraction helicopter and go to it once it is down.
     call_extraction: Option<f32>,
@@ -533,7 +535,8 @@ fn parse_args() -> anyhow::Result<Options> {
             "--bash-target" => {
                 let v = value()?;
                 o.knock_target = v.ends_with('k');
-                o.bash_target = Some(v.trim_end_matches('k').parse()?);
+                o.kill_target = v.ends_with('d');
+                o.bash_target = Some(v.trim_end_matches(['k', 'd']).parse()?);
             }
             "--jump-with-enter" => o.jump_with_enter = true,
             "--props-check" => {
@@ -3311,7 +3314,7 @@ fn mission_for_screenshot(
                 }
             }
             if (t - at - 1.0).abs() < tick / 2.0 {
-                if options.knock_target {
+                if options.knock_target || options.kill_target {
                     if let Some(n) = game
                         .scene
                         .people
@@ -3319,11 +3322,20 @@ fn mission_for_screenshot(
                         .iter_mut()
                         .find(|n| n.alive && n.spawn.is_some_and(|s| wanted.contains(&s)))
                     {
-                        eprintln!("verify-check: {:?} is knocked down", n.spawn);
-                        n.knock_down();
+                        if options.kill_target {
+                            eprintln!("verify-check: {:?} is killed", n.spawn);
+                            n.hurt(f32::INFINITY, m2_math::glam::Vec3::ZERO);
+                        } else {
+                            eprintln!("verify-check: {:?} is knocked down", n.spawn);
+                            n.knock_down();
+                        }
                     }
                 } else {
                     eprintln!("verify-check: she bashes");
+                    // Her weapons, put away by the HQ, in hand again.
+                    if let Some(p) = game.scene.player.as_mut() {
+                        p.holstered = false;
+                    }
                     intent.trigger.melee = true;
                 }
             }

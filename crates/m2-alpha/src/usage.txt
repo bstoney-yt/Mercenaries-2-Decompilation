@@ -213,7 +213,7 @@ m2-alpha [options]
   --bash-target <s>      with --mission --after-contract: this long after the
                          contract, put her by the person the scripts' first
                          marker is over and bash them (verify-check lines);
-                         <s>k knocks them down instead
+                         <s>k knocks them down instead, <s>d kills them
   --call-extraction <s>  with --mission --after-contract: this long after the
                          contract, call in the extraction helicopter from the
                          support menu, and once it has been about 45 s put her
