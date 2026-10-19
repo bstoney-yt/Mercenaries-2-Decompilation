@@ -1181,3 +1181,104 @@ fn a_wrapped_centred_line_keeps_its_break_space() {
     let (w, h) = text::measure(&def, "A A A", &font);
     assert_eq!((w, h), (36.0, 50.0));
 }
+
+fn bump(avm: &mut super::avm1::Avm, name: &str) {
+    let g = Rc::clone(&avm.global);
+    let n = match g.borrow().own(name) {
+        Some(Value::Number(n)) => n,
+        _ => 0.0,
+    };
+    g.borrow_mut().set(name, Value::Number(n + 1.0));
+}
+
+fn count(rt: &mut Runtime, name: &str) -> f64 {
+    match rt.avm.global.borrow().own(name) {
+        Some(Value::Number(n)) => n,
+        _ => 0.0,
+    }
+}
+
+#[test]
+fn the_mouse_rolls_over_presses_and_releases_buttons() {
+    // A 20 px square at (10, 10): a button by its handlers.
+    let lib = library(
+        vec![vec![put(1, 2, at(10.0, 10.0), "btn")]],
+        sprite_frames(),
+    );
+    let mut rt = Runtime::new(Player::new(lib));
+    let btn = rt.player.child(rt.player.root, "btn").unwrap();
+    let o = rt.avm.clip_object(btn);
+    let handlers: [(&str, super::avm1::Native); 5] = [
+        ("onRollOver", |avm, _, _, _| {
+            bump(avm, "over");
+            Value::Undefined
+        }),
+        ("onRollOut", |avm, _, _, _| {
+            bump(avm, "out");
+            Value::Undefined
+        }),
+        ("onPress", |avm, _, _, _| {
+            bump(avm, "press");
+            Value::Undefined
+        }),
+        ("onRelease", |avm, _, _, _| {
+            bump(avm, "release");
+            Value::Undefined
+        }),
+        ("onReleaseOutside", |avm, _, _, _| {
+            bump(avm, "outside");
+            Value::Undefined
+        }),
+    ];
+    for (name, f) in handlers {
+        let f = Object::new(ObjKind::Native(f), None);
+        o.borrow_mut().set(name, Value::Object(f));
+    }
+    // An instance hears every mouse down, button or not.
+    let root = rt.avm.clip_object(rt.player.root);
+    let down = Object::new(
+        ObjKind::Native(|avm, _, _, _| {
+            bump(avm, "down");
+            Value::Undefined
+        }),
+        None,
+    );
+    root.borrow_mut().set("onMouseDown", Value::Object(down));
+    assert_eq!(rt.button_at([15.0, 15.0]), Some(btn));
+    assert_eq!(rt.button_at([5.0, 5.0]), None);
+    rt.mouse_move([15.0, 15.0]);
+    assert_eq!(count(&mut rt, "over"), 1.0);
+    // `_xmouse` is in the instance's own space.
+    let v = Value::Object(Rc::clone(&o));
+    assert_eq!(number(&rt.avm.get(&mut rt.player, &v, "_xmouse")), 5.0);
+    rt.mouse_down();
+    rt.mouse_up();
+    assert_eq!(
+        [
+            count(&mut rt, "press"),
+            count(&mut rt, "release"),
+            count(&mut rt, "down")
+        ],
+        [1.0, 1.0, 1.0]
+    );
+    // Pressed, then let go off it.
+    rt.mouse_down();
+    rt.mouse_move([60.0, 60.0]);
+    assert_eq!(count(&mut rt, "out"), 1.0);
+    rt.mouse_up();
+    assert_eq!(
+        (count(&mut rt, "outside"), count(&mut rt, "release")),
+        (1.0, 1.0)
+    );
+    // hitTest: on its square, by shape and by box.
+    let hit = rt.avm.get(&mut rt.player, &v, "hitTest");
+    let at =
+        |x: f64, y: f64, shape: bool| vec![Value::Number(x), Value::Number(y), Value::Bool(shape)];
+    for (x, y, want) in [(20.0, 20.0, true), (40.0, 20.0, false)] {
+        let r = rt.avm.call_value(&mut rt.player, &hit, &v, &at(x, y, true));
+        assert!(matches!(r, Value::Bool(b) if b == want), "({x}, {y})");
+    }
+    // Hidden, it is no button.
+    rt.player.clip_mut(btn).unwrap().visible = false;
+    assert_eq!(rt.button_at([15.0, 15.0]), None);
+}

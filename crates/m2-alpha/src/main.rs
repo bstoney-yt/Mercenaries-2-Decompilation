@@ -264,6 +264,9 @@ struct Options {
     /// contract, 87 W to move the map) half way through the HUD's run and
     /// held to its end.
     pda_keys: Vec<i32>,
+    /// Clicks among them (`--pda-click x,y`, screen pixels): the key slot
+    /// each takes, and where.
+    pda_clicks: Vec<(usize, [f32; 2])>,
     /// With `--mission --screenshot`: take the picture from this far from
     /// the nearest marker, looking at it.
     mission_look: Option<f32>,
@@ -367,14 +370,21 @@ struct Options {
     alpha: bool,
     /// `--alpha` without the boot movies and front end.
     no_boot: bool,
+    /// Starts at the front end, without the boot movies (`--to-front-end`:
+    /// what the pause menu's Quit starts the alpha again with).
+    to_front_end: bool,
     /// With `--mission --screenshot`: the scripts' movies wait for the
     /// game, which opens each, decodes a few frames and pictures one.
     movies: bool,
     /// With `--screenshot`: the front end alone (the shell's menus),
     /// pictured as `--shell-key`s are pressed.
     front_end: bool,
-    /// Flash key codes pressed in the front end, two seconds apart.
+    /// Flash key codes pressed in the front end, two seconds apart
+    /// ([`CLICK`] for a click, at its place in `shell_clicks`).
     shell_keys: Vec<i32>,
+    /// Clicks in the front end (`--shell-click x,y`, screen pixels): the
+    /// key slot each takes, and where.
+    shell_clicks: Vec<(usize, [f32; 2])>,
     /// With `--mission --autoplay --screenshot`: seconds to play on after
     /// the contract is done.
     after_contract: f32,
@@ -541,6 +551,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--mission" => o.mission = true,
             "--alpha" => o.alpha = true,
             "--no-boot" => o.no_boot = true,
+            "--to-front-end" => o.to_front_end = true,
             "--movies" => o.movies = true,
             "--front-end" => o.front_end = true,
             "--shell-key" => o.shell_keys.push(
@@ -548,6 +559,15 @@ fn parse_args() -> anyhow::Result<Options> {
                     .parse()
                     .context("--shell-key expects a Flash key code")?,
             ),
+            "--shell-click" => {
+                let v = value()?;
+                let (x, y) = v
+                    .split_once(',')
+                    .and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))
+                    .context("--shell-click expects x,y")?;
+                o.shell_clicks.push((o.shell_keys.len(), [x, y]));
+                o.shell_keys.push(CLICK);
+            }
             "--after-contract" => o.after_contract = value()?.parse()?,
             "--old-hud" => o.old_hud = true,
             "--old-fx" => o.old_fx = true,
@@ -684,6 +704,15 @@ fn parse_args() -> anyhow::Result<Options> {
                     .parse()
                     .context("--pda-key expects a Flash key code")?,
             ),
+            "--pda-click" => {
+                let v = value()?;
+                let (x, y) = v
+                    .split_once(',')
+                    .and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))
+                    .context("--pda-click expects x,y")?;
+                o.pda_clicks.push((o.pda_keys.len(), [x, y]));
+                o.pda_keys.push(CLICK);
+            }
             "--behind" => o.behind = true,
             "--slung" => {
                 o.slung = Some(match value()?.as_str() {
@@ -750,13 +779,14 @@ fn parse_args() -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 10] = [
+    const PLAIN: [&str; 11] = [
         "--install",
         "--config",
         "--size",
         "--fullscreen",
         "--vsync",
         "--no-boot",
+        "--to-front-end",
         "--smarter-ai",
         "--dev",
         "--skip-mode-off",
@@ -817,7 +847,7 @@ const PROPS_CHECK_AFTER: f32 = 20.0;
 
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
-    let options = parse_args()?;
+    let mut options = parse_args()?;
     combat::use_attach_frame(!options.hands_grip);
     let config_path = options
         .config_path
@@ -886,7 +916,26 @@ fn main() -> anyhow::Result<()> {
     };
 
     if let (Some(out), true, Some(install)) = (&options.screenshot, options.front_end, &install) {
-        return front_end_offscreen(&config, install, &options.shell_keys, out);
+        // Continue or Load Game picked: play starts from that save, as
+        // `--load` starts it.
+        let input = (&options.shell_keys[..], &options.shell_clicks[..]);
+        let Some(path) = front_end_offscreen(&config, install, input, out)? else {
+            return Ok(());
+        };
+        let s = save::SaveGame::read(&path)?;
+        config.hero = s.hero.unwrap_or(config.hero);
+        eprintln!(
+            "front end: play starts from {} as {}",
+            path.display(),
+            config.hero
+        );
+        options.load = Some(s);
+        let out = out.with_file_name(format!(
+            "{}-play.ppm",
+            out.file_stem()
+                .map_or("shot".into(), |s| s.to_string_lossy())
+        ));
+        return screenshot(&config, Some(install), &mode, &options, &out);
     }
     if let Some(out) = &options.screenshot {
         return screenshot(&config, install.as_ref(), &mode, &options, out);
@@ -911,6 +960,7 @@ fn main() -> anyhow::Result<()> {
         support: options.support.clone(),
         alpha: options.alpha,
         no_boot: options.no_boot,
+        to_front_end: options.to_front_end,
         skip_mode_off: options.skip_mode_off,
         guns: options.guns.clone(),
         load: options.load.clone(),
@@ -1055,9 +1105,37 @@ fn loading_screen(install: Option<&Install>) -> Option<loading::LoadingScreen> {
 /// Writes the game to `path`, with her cash, fuel and support stock and
 /// the scripts' own save data as the scripts hold them. Whether it was
 /// written.
+/// The world's aspect ratio in a `w` x `h` picture: the picture's, or
+/// 4:3 with the video screen's Aspect Ratio at 4:3 (the world as on a
+/// 4:3 screen, stretched over the picture).
+fn view_aspect(window: &config::WindowConfig, w: u32, h: u32) -> f32 {
+    if window.wide {
+        w as f32 / h.max(1) as f32
+    } else {
+        4.0 / 3.0
+    }
+}
+
+/// `--shell-click`'s place among the `--shell-key`s.
+const CLICK: i32 = -1;
+
 /// The game's pause menu's save slots go up to this; slot 0 is the
 /// scripts' autosave.
 const PAUSE_SLOTS: u32 = 20;
+
+/// The slot of the newest save there is (what the front end's Continue
+/// loads), by when its file was written.
+fn newest_save() -> Option<u32> {
+    (0..=PAUSE_SLOTS)
+        .filter_map(|n| {
+            let when = std::fs::metadata(pause_save_path(n))
+                .and_then(|m| m.modified())
+                .ok()?;
+            Some((when, n))
+        })
+        .max()
+        .map(|(_, n)| n)
+}
 
 /// Where the pause menu's save slot `n` is: the scripts' autosave for 0.
 fn pause_save_path(n: u32) -> std::path::PathBuf {
@@ -1068,8 +1146,8 @@ fn pause_save_path(n: u32) -> std::path::PathBuf {
     }
 }
 
-/// The saves there are, as the pause menu's save screen lists them, as
-/// `hero`'s (a save doesn't say whose it is).
+/// The saves there are, as the menus' save screens list them: each as its
+/// hero's, `hero`'s if it doesn't say whose it is (saves from before).
 fn pause_saves(hero: Hero) -> Vec<pause::SaveEntry> {
     (0..=PAUSE_SLOTS)
         .filter_map(|n| {
@@ -1083,7 +1161,7 @@ fn pause_saves(hero: Hero) -> Vec<pause::SaveEntry> {
             Some(pause::SaveEntry {
                 number: n,
                 timestamp: pause::timestamp(secs),
-                character: match hero {
+                character: match s.hero.unwrap_or(hero) {
                     Hero::Mattias => 1,
                     Hero::Chris => 2,
                     Hero::Jennifer => 3,
@@ -1140,6 +1218,36 @@ fn args_loading(args: impl IntoIterator<Item = String>, save: &std::path::Path) 
     }
     out.extend(["--load".to_owned(), save.display().to_string()]);
     out
+}
+
+/// The launch's arguments `args` to start again at the front end: without
+/// any `--load`, with `--to-front-end`.
+fn args_front_end(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--load" => {
+                args.next();
+            }
+            "--to-front-end" => {}
+            _ => out.push(a),
+        }
+    }
+    out.push("--to-front-end".to_owned());
+    out
+}
+
+/// Starts the alpha again at its front end, as the game goes back to its
+/// main menu (the pause menu's Quit). The caller then closes.
+fn relaunch_front_end() {
+    let args = args_front_end(std::env::args().skip(1));
+    match std::env::current_exe()
+        .and_then(|exe| std::process::Command::new(exe).args(&args).spawn())
+    {
+        Ok(_) => eprintln!("quit: started again at the front end"),
+        Err(e) => eprintln!("quit: could not start again: {e}"),
+    }
 }
 
 /// Starts the alpha again as it was launched, from the save at `save`
@@ -1408,7 +1516,7 @@ fn screenshot(
         game.on_foot = false;
     }
     let fov = config.camera.fov;
-    let aspect = w as f32 / h as f32;
+    let mut aspect = w as f32 / h as f32;
     let tick = TICK.as_secs_f32();
     // Characters a little way into their clip, mid-stride when moving.
     game.scene.tick(0.4);
@@ -2041,7 +2149,7 @@ fn screenshot(
             &info,
             (w, h),
             seconds,
-            &options.pda_keys,
+            (&options.pda_keys, &options.pda_clicks),
             options.pause,
             Duration::from_secs(120),
         );
@@ -2064,6 +2172,25 @@ fn screenshot(
                         Some(_) => "fullscreen at that mode",
                         None => "resized to it",
                     }
+                );
+            }
+            // What play would do with it: the settings kept go into the
+            // settings file and the picture; Quit goes back to the front
+            // end.
+            if let Some(s) = &news.settings {
+                settings.keep_menu_settings(s);
+                game.picture.brightness = s.brightness;
+                game.set_view_distance(s.view_distance);
+                aspect = view_aspect(&settings.window, w, h);
+                eprintln!(
+                    "pause: settings kept: brightness {}, view distance {}, wide {}, subtitles {}",
+                    s.brightness, s.view_distance, s.wide, s.subtitles
+                );
+            }
+            if news.quit {
+                eprintln!(
+                    "pause: Quit: the alpha would start again with {:?}",
+                    args_front_end(std::env::args().skip(1))
                 );
             }
             if news != pause::News::default() {
@@ -2943,9 +3070,10 @@ fn probe_for_screenshot(game: &Game) {
 fn front_end_offscreen(
     config: &Config,
     install: &Install,
-    keys: &[i32],
+    (keys, clicks): (&[i32], &[(usize, [f32; 2])]),
     out: &std::path::Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<PathBuf>> {
+    let mut config = config.clone();
     let (w, h) = (config.window.width, config.window.height);
     let mut backend = WgpuBackend::headless(w, h)?;
     let mut game = build_scene(
@@ -2974,24 +3102,77 @@ fn front_end_offscreen(
     let step = 1.0 / 30.0;
     let (mut t, mut up_at) = (0.0f64, None::<f64>);
     let mut pictured = 0usize;
+    // The player's settings and saves, as the menus show them, with the
+    // video screen as for a window of the picture's size, its lists the
+    // primary monitor's modes.
+    let settings = pause::Settings {
+        profile: config.hero.full_name().into(),
+        video: pause::Video {
+            width: w,
+            height: h,
+            fullscreen: None,
+        },
+        modes: modes.clone(),
+        saves: pause_saves(config.hero),
+        ..config.menu_settings()
+    };
+    eprintln!("front end: {} saves listed", settings.saves.len());
+    let mut chosen = None;
+    // `M2_SHELL_PRESS_START`: start the shell from its press-start
+    // screen first, the keys counting from then.
+    let mut waiting_start = std::env::var_os("M2_SHELL_PRESS_START").is_some();
     loop {
         t += step;
         let since = up_at.map(|u| t - u);
         // Keys at 3 s, 5 s...; pictures 1.5 s before each and after the
         // last.
         let mut pressed = Vec::new();
+        // Up, the menus wait at their press-start screen: Enter each
+        // second until it takes, and the keys count from then (the legal
+        // screen before it takes a varying while).
+        if waiting_start && shell.ready() {
+            if shell.shell().started {
+                waiting_start = false;
+                eprintln!("front end: started from press-start at {t:.1} s");
+                up_at = Some(t);
+            } else if (t / 1.0).fract() < step {
+                pressed.extend([(13, true), (13, false)]);
+            }
+        }
         let mut picture = false;
+        let mut pointer = None;
+        let mut clicked = Vec::new();
         if let Some(since) = since {
             for (i, &k) in keys.iter().enumerate() {
                 let at = 3.0 + 2.0 * i as f64;
+                let up = at + 0.2;
+                let (down_now, up_now) = (
+                    since < at && since + step >= at,
+                    since < up && since + step >= up,
+                );
+                if k == CLICK {
+                    // The pointer goes there a frame before the button.
+                    let Some(&(_, p)) = clicks.iter().find(|(n, _)| *n == i) else {
+                        continue;
+                    };
+                    if since + 2.0 * step >= at && since < up + step {
+                        pointer = Some(p);
+                    }
+                    if down_now || up_now {
+                        clicked.push(down_now);
+                        if down_now {
+                            eprintln!("front end: click at {p:?} at {t:.1} s");
+                        }
+                    }
+                    continue;
+                }
                 // Key 0 only waits.
-                if since < at && since + step >= at && k != 0 {
+                if down_now && k != 0 {
                     pressed.push((k, true));
                     eprintln!("front end: key {k} at {t:.1} s");
                 }
                 // Let go a fifth of a second on, as a hand does.
-                let up = at + 0.2;
-                if since < up && since + step >= up && k != 0 {
+                if up_now && k != 0 {
                     pressed.push((k, false));
                 }
             }
@@ -3004,7 +3185,7 @@ fn front_end_offscreen(
             if since > 4.0 + 2.0 * keys.len() as f64 {
                 break;
             }
-        } else if t > 60.0 {
+        } else if t > if waiting_start { 180.0 } else { 60.0 } {
             eprintln!("front end: the menus did not come up in a minute");
             break;
         }
@@ -3034,20 +3215,19 @@ fn front_end_offscreen(
             }
         }
         let input = ui::headless_input(w, h, t);
-        let mut state = gamehud::HudState {
+        let state = gamehud::HudState {
             size: [w as f32, h as f32],
-            dt: if up_at.is_some() { step } else { 0.0 },
+            dt: if up_at.is_some() || (waiting_start && shell.ready()) {
+                step
+            } else {
+                0.0
+            },
             keys: pressed,
+            pause_settings: settings.clone(),
+            pointer,
+            clicks: clicked,
             ..Default::default()
         };
-        // The video screen as for a window of the picture's size, its
-        // lists the primary monitor's modes.
-        state.pause_settings.video = pause::Video {
-            width: w,
-            height: h,
-            fullscreen: None,
-        };
-        state.pause_settings.modes = modes.clone();
         let _ = hud.build_screen(input, |ui| {
             let ctx = ui.ctx().clone();
             shell.update_and_wait(&ctx, state.clone(), Duration::from_secs(5));
@@ -3083,11 +3263,12 @@ fn front_end_offscreen(
                 shell.paint_over(&painter);
             }
         });
-        if up_at.is_none() && shell.ready() {
+        if up_at.is_none() && shell.ready() && !waiting_start {
             eprintln!("front end: the menus are up after {t:.1} s");
             up_at = Some(t);
         }
-        if let Some(v) = shell.take_video() {
+        let news = shell.take_shell_news();
+        if let Some(v) = news.video {
             eprintln!(
                 "front end: video kept: {}, {} (a window would now be {})",
                 v.resolution_text(),
@@ -3098,6 +3279,43 @@ fn front_end_offscreen(
                     "resized to it"
                 }
             );
+        }
+        for unused in &news.unused {
+            eprintln!("front end: {unused} kept in the menu; the alpha has nothing for it");
+        }
+        if let Some(s) = &news.settings {
+            config.keep_menu_settings(s);
+            config.save("front end");
+        }
+        if let Some(table) = news.keys {
+            table.apply(&mut config.keys);
+            config.save("front end");
+        }
+        if let Some(n) = news.delete {
+            let path = pause_save_path(n);
+            match std::fs::remove_file(&path) {
+                Ok(()) => eprintln!("front end: save {n} deleted ({})", path.display()),
+                Err(e) => eprintln!("front end: could not delete {}: {e}", path.display()),
+            }
+        }
+        let load = if news.continue_game {
+            newest_save()
+        } else {
+            news.load
+        };
+        if let Some(n) = load {
+            eprintln!(
+                "front end: {} slot {n}",
+                if news.continue_game {
+                    "Continue:"
+                } else {
+                    "Load Game:"
+                }
+            );
+            chosen = Some(pause_save_path(n));
+        }
+        if news.quit {
+            eprintln!("front end: Exit");
         }
         if let Some(who) = shell.take_new_game() {
             eprintln!(
@@ -3136,9 +3354,12 @@ fn front_end_offscreen(
             eprintln!("front end: pictured {}", path.display());
             pictured += 1;
         }
+        if chosen.is_some() {
+            break;
+        }
     }
     eprintln!("front end: done after {t:.1} s");
-    Ok(())
+    Ok(chosen)
 }
 
 /// Offscreen, the movies the scripts are waiting on (`--movies`): each is
@@ -6440,6 +6661,9 @@ struct Running {
     /// A load asked to start the scripts again from this save: the alpha
     /// starts afresh with it ([`relaunch`]).
     relaunch: Option<std::path::PathBuf>,
+    /// The pause menu's Quit: the alpha starts again at its front end
+    /// ([`relaunch_front_end`]).
+    to_front_end: bool,
     /// When to load the player's own save as the pause menu does (`--load-at`):
     /// a test of loading in play.
     load_at: Option<Instant>,
@@ -6475,6 +6699,8 @@ struct App {
     /// `no_boot`), front end, the scripts' movies.
     alpha: bool,
     no_boot: bool,
+    /// Start at the front end, without the boot movies (`--to-front-end`).
+    to_front_end: bool,
     /// End the scripts' skip mode after their start (unless
     /// `--skip-mode-on`).
     skip_mode_off: bool,
@@ -6588,7 +6814,8 @@ impl App {
             flow: match &self.install {
                 Some(install) if self.alpha => Some(flow::Flow::new(
                     install.clone(),
-                    !self.no_boot,
+                    !self.no_boot || self.to_front_end,
+                    !self.to_front_end,
                     self.config.hero,
                     self.config.options.subtitles,
                 )),
@@ -6602,6 +6829,7 @@ impl App {
             cheat_code: cheats::CodeWatch::default(),
             cheat_typed: false,
             relaunch: None,
+            to_front_end: false,
             load_at: self
                 .load_at
                 .map(|s| Instant::now() + Duration::from_secs_f32(s)),
@@ -6817,7 +7045,7 @@ impl Running {
             &mut self.backend,
             &mut self.game,
             config.camera.fov,
-            w as f32 / h as f32,
+            view_aspect(&config.window, w, h),
             Some(&mut self.hud),
         )?;
         self.fps.1 += 1;
@@ -6957,29 +7185,12 @@ impl Running {
     /// The player's options as the game's pause menu shows them, with the
     /// window as it is and the saves there are.
     fn pause_settings(&self, config: &Config) -> pause::Settings {
-        let o = &config.options;
-        let size = self.window.inner_size();
         pause::Settings {
             profile: self.game.scene.hero.full_name().into(),
-            subtitles: o.subtitles,
-            tutorials: o.tutorials,
-            autosave: o.autosave,
-            invert_mouse: config.camera.invert_y,
-            mouse: pause::mouse_slider(config.camera.mouse_sensitivity),
-            invert_pad: o.invert_pad,
-            pad: o.pad_sensitivity,
-            rumble: o.rumble,
-            vsync: config.window.vsync,
-            brightness: o.brightness,
-            view_distance: o.view_distance,
-            sfx: o.sfx_volume,
-            music: o.music_volume,
-            dialog: o.dialog_volume,
-            wide: size.width * 2 > size.height * 3,
             video: display::current(&self.window),
             modes: display::modes(self.window.current_monitor().as_ref()),
             saves: pause_saves(self.game.scene.hero),
-            keys: keytable::KeyTable::of(&config.keys),
+            ..config.menu_settings()
         }
     }
 
@@ -7009,6 +7220,12 @@ impl Running {
         self.set_volumes([o.sfx_volume, o.music_volume, o.dialog_volume]);
         self.pad.look = Some(pause::pad_scale(o.pad_sensitivity));
         self.pad.invert = o.invert_pad;
+        // The advanced video screen's fourth option is shadows.
+        self.game.picture = game::Picture {
+            brightness: o.brightness,
+            shadows: o.advanced_video[3] != 0.0,
+        };
+        self.game.set_view_distance(o.view_distance);
         if let Some(m) = &mut self.mission {
             m.set_options(o.subtitles, o.tutorials);
         }
@@ -7061,32 +7278,7 @@ impl Running {
             }
         }
         if let Some(s) = news.settings {
-            let o = &mut config.options;
-            o.subtitles = s.subtitles;
-            o.tutorials = s.tutorials;
-            o.autosave = s.autosave;
-            o.invert_pad = s.invert_pad;
-            o.pad_sensitivity = s.pad;
-            o.rumble = s.rumble;
-            o.brightness = s.brightness;
-            o.view_distance = s.view_distance;
-            o.sfx_volume = s.sfx;
-            o.music_volume = s.music;
-            o.dialog_volume = s.dialog;
-            config.camera.invert_y = s.invert_mouse;
-            config.camera.mouse_sensitivity = pause::mouse_radians(s.mouse);
-            config.window.vsync = s.vsync;
-            // The video screen's Resolution and Refresh Rate, as kept
-            // (only on keeping: dropped changes leave the window be).
-            if let Some(v) = news.video {
-                Self::keep_video(&self.window, "pause", v, config);
-            }
-            self.apply_options(config);
-            let path = config::Config::default_path();
-            match std::fs::write(&path, config.to_toml()) {
-                Ok(()) => eprintln!("pause: settings kept, saved to {}", path.display()),
-                Err(e) => eprintln!("pause: could not save {}: {e}", path.display()),
-            }
+            self.keep_settings(&s, news.video, "pause", config);
         }
         if let Some(n) = news.save {
             let path = pause_save_path(n);
@@ -7099,12 +7291,138 @@ impl Running {
             self.close_menu();
         }
         if news.quit {
-            // The game goes back to its main menu; the alpha can't start
-            // play again from its front end yet, so it closes.
-            eprintln!("pause: Quit: the alpha closes (the game goes back to its main menu)");
-            event_loop.exit();
+            // The game goes back to its main menu: with the front end
+            // (the whole game as it launches), the alpha starts again at
+            // it; without, it closes.
+            if self.flow.is_some() {
+                eprintln!("pause: Quit: back to the front end");
+                self.to_front_end = true;
+            } else {
+                eprintln!("pause: Quit: the alpha closes (it has no front end up)");
+                event_loop.exit();
+            }
         } else if news.resume && self.hud.menu {
             self.close_menu();
+        }
+    }
+
+    /// The settings a menu (`menu`: the pause menu's or the front end's)
+    /// kept: into the settings file, which is written (as the game saves
+    /// its profile), and applied; `video` is its video screen's
+    /// Resolution and Refresh Rate, if they were kept.
+    fn keep_settings(
+        &mut self,
+        s: &pause::Settings,
+        video: Option<pause::Video>,
+        menu: &str,
+        config: &mut Config,
+    ) {
+        config.keep_menu_settings(s);
+        // The video screen's Resolution and Refresh Rate, as kept (only on
+        // keeping: dropped changes leave the window be).
+        if let Some(v) = video {
+            Self::keep_video(&self.window, menu, v, config);
+        }
+        self.apply_options(config);
+        config.save(menu);
+    }
+
+    /// Does what the front end's menus asked: their settings kept, their
+    /// sounds, a save deleted, leaving, and Continue or Load Game: play
+    /// starts from that save ([`Running::start_from`]).
+    fn shell_news(&mut self, news: pause::News, config: &mut Config, event_loop: &ActiveEventLoop) {
+        for cue in &news.stops {
+            self.audio.stop_ui_sound(cue);
+        }
+        for cue in &news.sounds {
+            self.audio.ui_sound(cue);
+        }
+        if let Some(v) = news.volumes {
+            self.set_volumes(v);
+        }
+        for unused in &news.unused {
+            eprintln!("front end: {unused} kept in the menu; the alpha has nothing for it");
+        }
+        if let Some(c) = news.capture {
+            self.capturing = c;
+        }
+        if let Some(table) = news.keys {
+            table.apply(&mut config.keys);
+            let path = config::Config::default_path();
+            match std::fs::write(&path, config.to_toml()) {
+                Ok(()) => eprintln!("front end: keys kept, saved to {}", path.display()),
+                Err(e) => eprintln!("front end: could not save {}: {e}", path.display()),
+            }
+        }
+        if let Some(s) = news.settings {
+            self.keep_settings(&s, news.video, "front end", config);
+        } else if let Some(v) = news.video {
+            Self::keep_video(&self.window, "front end", v, config);
+        }
+        if let Some(n) = news.delete {
+            let path = pause_save_path(n);
+            match std::fs::remove_file(&path) {
+                Ok(()) => eprintln!("front end: save {n} deleted ({})", path.display()),
+                Err(e) => eprintln!("front end: could not delete {}: {e}", path.display()),
+            }
+        }
+        if news.continue_game {
+            match newest_save() {
+                Some(n) => {
+                    eprintln!("front end: Continue: slot {n}");
+                    self.start_from(&pause_save_path(n), config);
+                }
+                None => eprintln!("front end: Continue: no saves"),
+            }
+        } else if let Some(n) = news.load {
+            eprintln!("front end: Load Game: slot {n}");
+            self.start_from(&pause_save_path(n), config);
+        }
+        if news.quit {
+            eprintln!("front end: Exit");
+            event_loop.exit();
+        }
+    }
+
+    /// Starts play from the save at `path`, play not having started (the
+    /// front end's Continue and Load Game): as its hero, with the world
+    /// and the scripts' data from it as the scripts start
+    /// ([`mission::MissionLink::set_save`]).
+    fn start_from(&mut self, path: &std::path::Path, config: &mut Config) {
+        let s = match save::SaveGame::read(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("front end: could not load: {e:#}");
+                return;
+            }
+        };
+        let hero = s.hero.unwrap_or(config.hero);
+        config.hero = hero;
+        if hero != self.game.scene.hero {
+            eprintln!("hero: playing as {hero}");
+            self.set_hero(hero);
+        }
+        let taken = self.mission.as_mut().is_some_and(|m| m.set_save(s));
+        eprintln!(
+            "front end: play starts from {}{}",
+            path.display(),
+            if taken {
+                ""
+            } else {
+                " (world only: the scripts already run)"
+            }
+        );
+        if !taken {
+            self.load_from(path);
+        }
+    }
+
+    /// The key or button a menu's keyboard table waited for: the front
+    /// end's while it is up, else the pause menu's.
+    fn captured(&mut self, control: input::Control) {
+        match &mut self.flow {
+            Some(flow) if flow.in_menus() => flow.captured(control),
+            _ => self.hud.pause_captured.push(control),
         }
     }
 
@@ -7289,29 +7607,28 @@ impl Running {
         }
     }
 
-    fn tick(&mut self, config: &mut Config, _event_loop: &ActiveEventLoop) {
+    fn tick(&mut self, config: &mut Config, event_loop: &ActiveEventLoop) {
+        // The front end's option screens and save list: the player's
+        // settings and saves (asked once), and the window as it is.
+        let settings = self
+            .flow
+            .as_ref()
+            .is_some_and(flow::Flow::wants_settings)
+            .then(|| self.pause_settings(config));
         if let Some(flow) = &mut self.flow {
-            // The front end's video screen: the window as it is, and the
-            // monitor's modes (asked once).
-            let modes = flow
-                .wants_window()
-                .then(|| display::modes(self.window.current_monitor().as_ref()));
-            flow.window(display::current(&self.window), modes);
+            if let Some(s) = settings {
+                flow.settings(s);
+            }
+            flow.window(display::current(&self.window));
             if let Ok(mut mixer) = self.audio.out.mixer.lock() {
                 flow.tick(self.mission.as_mut(), &mut mixer);
             }
-            if let Some(v) = flow.take_video() {
-                Self::keep_video(&self.window, "front end", v, config);
-                let path = config::Config::default_path();
-                match std::fs::write(&path, config.to_toml()) {
-                    Ok(()) => eprintln!("front end: settings saved to {}", path.display()),
-                    Err(e) => eprintln!("front end: could not save {}: {e}", path.display()),
-                }
-            }
+            let news = flow.take_news();
             // The hero picked in the front end, before the scripts start;
             // the pause menu offers them as the settings' hero.
             let picked = flow.take_pick();
             let holds = flow.holds();
+            self.shell_news(news, config, event_loop);
             if let Some(hero) = picked {
                 config.hero = hero;
                 if hero != self.game.scene.hero {
@@ -7516,6 +7833,11 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
+        if std::mem::take(&mut state.to_front_end) {
+            relaunch_front_end();
+            event_loop.exit();
+            return;
+        }
         // Alt+Enter toggles fullscreen, as F11 does (the PC convention),
         // in play and menus alike; its Enter goes no further.
         if let WindowEvent::ModifiersChanged(m) = &event {
@@ -7565,7 +7887,7 @@ impl ApplicationHandler for App {
                     && !event.repeat
                 {
                     state.capturing = false;
-                    state.hud.pause_captured.push(code.into());
+                    state.captured(code.into());
                 }
             }
             WindowEvent::MouseInput {
@@ -7581,12 +7903,12 @@ impl ApplicationHandler for App {
                 };
                 if let Some(c) = control {
                     state.capturing = false;
-                    state.hud.pause_captured.push(c.into());
+                    state.captured(c.into());
                 }
             }
             WindowEvent::MouseWheel { .. } if state.focused && state.capturing => {
                 state.capturing = false;
-                state.hud.pause_captured.push(input::Mouse::WheelUp.into());
+                state.captured(input::Mouse::WheelUp.into());
             }
             WindowEvent::KeyboardInput { event, .. }
                 if state.focused && state.flow.as_ref().is_some_and(flow::Flow::holds) =>
@@ -7729,6 +8051,24 @@ mod tests {
             args_loading(args, std::path::Path::new("new.toml")),
             ["--alpha", "--mission", "--load", "new.toml"]
         );
+    }
+
+    #[test]
+    fn four_by_three_keeps_its_shape_on_any_window() {
+        let mut w = config::WindowConfig::default();
+        assert_eq!(view_aspect(&w, 1920, 1080), 1920.0 / 1080.0);
+        w.wide = false;
+        assert_eq!(view_aspect(&w, 1920, 1080), 4.0 / 3.0);
+    }
+
+    #[test]
+    fn quitting_to_the_front_end_keeps_the_launch_but_its_load() {
+        let args = ["--load", "old.toml", "--size", "1280x720", "--to-front-end"].map(String::from);
+        assert_eq!(
+            args_front_end(args),
+            ["--size", "1280x720", "--to-front-end"]
+        );
+        assert_eq!(args_front_end(Vec::new()), ["--to-front-end"]);
     }
 
     #[test]
