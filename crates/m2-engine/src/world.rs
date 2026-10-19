@@ -218,7 +218,8 @@ pub enum VehicleKind {
 /// What the template database says of one template.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TemplateInfo {
-    /// Its `ModelName`, when that is a model the archive holds.
+    /// Its `ModelName`, when that is a model the archive holds, or its
+    /// stand-in ([`crate::standin`]).
     pub model: Option<u32>,
     /// Its physics component's kind, when it has one.
     pub vehicle: Option<VehicleKind>,
@@ -724,7 +725,10 @@ impl Templates {
                 (
                     id,
                     TemplateInfo {
-                        model: model_of.get(&id).copied().filter(|m| models.contains(m)),
+                        // Cut models come back as their stand-ins.
+                        model: model_of
+                            .get(&id)
+                            .and_then(|&m| crate::standin::resolve(m, models)),
                         vehicle,
                         engine: engines.get(&id).copied(),
                         person: humans.contains(&id) || (minds.contains(&id) && vehicle.is_none()),
@@ -738,7 +742,7 @@ impl Templates {
         let mut order: Vec<(u32, &str)> = names.iter().map(|(&id, &n)| (id, n)).collect();
         order.sort_unstable_by_key(|&(id, _)| std::cmp::Reverse(id));
         let profiles = db.hashes("ModelMixerProfile");
-        let templates = Self {
+        let mut templates = Self {
             by_name: order
                 .iter()
                 .map(|&(id, name)| (name.to_ascii_lowercase(), infos[&id]))
@@ -786,6 +790,8 @@ impl Templates {
             localized: localized_names(&db),
             damage,
         };
+        crate::standin::add_supply_drops(&mut templates);
+        crate::standin::arm_the_osprey(&mut templates);
         (templates, atmosphere)
     }
 }

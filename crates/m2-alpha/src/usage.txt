@@ -239,6 +239,9 @@ m2-alpha [options]
   --cheat-menu <page>    with --screenshot: the F7 cheat menu up at that page
                          (weapons, vehicles, support, player), alone over
                          black
+  --bombs                with --mission --autoplay: while she drives a
+                         vehicle with a bomb bay (the Osprey), drop a bomb
+                         every two seconds
   --cheat-check          with --mission --autoplay: once she is ashore, try
                          the F7 cheat menu's cheats (every weapon, a few
                          vehicles of each kind, every support item, a

@@ -260,6 +260,10 @@ pub struct VehicleSpec {
     pub tuning: VehicleTuning,
     /// A helicopter's rotors (none for others).
     pub rotors: Vec<RotorSpec>,
+    /// Parts that tilt with speed (none but the Osprey's nacelles).
+    pub tilts: Vec<TiltSpec>,
+    /// A bomb bay its driver drops bombs from (none but the Osprey's).
+    pub bomb_bay: Option<BombBay>,
     /// What its parts do as they are damaged, if its model says
     /// ([`crate::vehicle_damage`]).
     pub damage: Option<std::sync::Arc<crate::vehicle_damage::DamageModel>>,
@@ -294,6 +298,25 @@ pub const HELICOPTER: &str = "helicopter";
 pub struct RotorSpec {
     pub nodes: Vec<bool>,
     pub centre: Vec3,
+    pub axis: Vec3,
+}
+
+/// A bomb bay: where its bombs leave it, model space, what they do where
+/// they land, and how long between one and the next.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BombBay {
+    pub at: Vec3,
+    pub blast: Option<crate::weapons::Blast>,
+    pub gap: f32,
+}
+
+/// Parts that tilt together about a pivot as the vehicle speeds up (the
+/// Osprey's nacelles, [`crate::osprey`]): the nodes, the pivot and the
+/// axis, model space at rest.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TiltSpec {
+    pub nodes: Vec<bool>,
+    pub pivot: Vec3,
     pub axis: Vec3,
 }
 
@@ -636,6 +659,8 @@ impl VehicleSpec {
             } else {
                 Vec::new()
             },
+            tilts: Vec::new(),
+            bomb_bay: None,
         })
     }
 
@@ -683,6 +708,22 @@ impl VehicleSpec {
     /// Whether it is a helicopter: it flies and has no wheels.
     pub fn is_helicopter(&self) -> bool {
         self.kind == HELICOPTER
+    }
+
+    /// Tilts its tilting parts by `angle` radians about their pivots (do
+    /// it after [`spin_rotors`](Self::spin_rotors), so a rotor spins
+    /// about its own tilted axis).
+    pub fn tilt_parts(&self, nodes: &mut [Mat4], angle: f32) {
+        for t in &self.tilts {
+            let turn = Mat4::from_translation(t.pivot)
+                * Mat4::from_axis_angle(t.axis, angle)
+                * Mat4::from_translation(-t.pivot);
+            for (m, &on) in nodes.iter_mut().zip(&t.nodes) {
+                if on {
+                    *m = turn * *m;
+                }
+            }
+        }
     }
 
     /// Spins its rotors' nodes in `nodes` (as [`posed_nodes`] gives them)
@@ -1049,6 +1090,8 @@ mod tests {
             hull: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2)),
             turret_box: None,
             rotors: Vec::new(),
+            tilts: Vec::new(),
+            bomb_bay: None,
             damage: None,
             tuning: VehicleTuning::default(),
         }

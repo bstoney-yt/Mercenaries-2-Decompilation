@@ -1440,6 +1440,10 @@ pub struct Combat {
     reload: f32,
     /// Seconds until a tank's machine gun fires again.
     mg_reload: f32,
+    /// Seconds until a bomb bay drops again.
+    bomb_reload: f32,
+    /// Bombs dropped from a bomb bay, for the log.
+    pub bombs_dropped: u32,
     aim_left: f32,
     /// What her shots have added to her gun's cone
     /// ([`m2_engine::weapons::Bloom`]).
@@ -1706,6 +1710,8 @@ impl Default for Combat {
             quiet: 0.0,
             reload: 0.0,
             mg_reload: 0.0,
+            bomb_reload: 0.0,
+            bombs_dropped: 0,
             manned: None,
             aim_left: 0.0,
             bloom: m2_engine::weapons::Bloom::default(),
@@ -2444,6 +2450,7 @@ impl Combat {
         self.effects.retain(|e| e.1 > 0.0);
         self.reload -= dt;
         self.mg_reload -= dt;
+        self.bomb_reload -= dt;
         self.aim_left -= dt;
         let feel = self.rifle.feel;
         self.bloom.settle(&feel, dt);
@@ -2593,6 +2600,14 @@ impl Combat {
             && !self.mounted_fire(f, i, 1)
         {
             self.vehicle_fire(f, i, true);
+        }
+        // A bomb bay's bomb on the throw key (her explosive's), one a gap.
+        if let Some(i) = f.player.driving
+            && self.down <= 0.0
+            && trigger.throw
+            && self.bomb_reload <= 0.0
+        {
+            self.drop_bomb(f, i);
         }
         self.fire_held = trigger.fire;
         self.track_lock(f, dt);
@@ -3248,6 +3263,29 @@ impl Combat {
             set: self.launcher.feel.sound_set,
         });
         alarm(f.people, f.player.character.position);
+    }
+
+    /// Drops a bomb from the bay of vehicle `i` she drives, if it has one:
+    /// it leaves with the vehicle's own velocity and bursts where it
+    /// lands, as a grenade launcher's round does.
+    fn drop_bomb(&mut self, f: &mut Field<'_>, i: usize) {
+        let Some(v) = f.vehicles.get(i) else { return };
+        let (Some(bay), Some(id), false) = (v.spec.bomb_bay, v.id, v.wrecked) else {
+            return;
+        };
+        let Some(body) = f.physics.vehicle_transform(id) else {
+            return;
+        };
+        self.bomb_reload = bay.gap;
+        self.bombs_dropped += 1;
+        let at = body.transform_point3(bay.at);
+        self.projectiles.push(Projectile::Round {
+            at,
+            velocity: f.physics.vehicle_velocity(id),
+            flown: 0.0,
+            blast: bay.blast,
+        });
+        eprintln!("bomb bay: bomb {} dropped at {at:.1}", self.bombs_dropped);
     }
 
     /// Fires the gun on the turret of vehicle `i`, which she drives, at
@@ -5645,6 +5683,8 @@ mod tests {
             hull,
             turret_box: None,
             rotors: Vec::new(),
+            tilts: Vec::new(),
+            bomb_bay: None,
             damage: None,
             tuning: VehicleTuning {
                 gun: Some(gun),

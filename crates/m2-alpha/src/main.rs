@@ -285,6 +285,10 @@ struct Options {
     /// `--cheat-check`: with `--mission`, every cheat of the menu tried
     /// once she is ashore ([`cheats::Check`]), for testing.
     cheat_check: bool,
+    /// `--bombs`: with `--mission --autoplay`, whenever she drives a
+    /// vehicle with a bomb bay, she drops a bomb every two seconds, for
+    /// testing.
+    bombs: bool,
     /// `--cheat-menu <page>`: with `--screenshot`, the cheat menu up at
     /// that page, over plain black.
     cheat_menu: Option<cheats::Tab>,
@@ -576,6 +580,7 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--support" => o.support.push(value()?),
             "--cheat-check" => o.cheat_check = true,
+            "--bombs" => o.bombs = true,
             "--cheat-menu" => {
                 let v = value()?;
                 o.cheat_menu = Some(cheats::Tab::named(&v).with_context(|| {
@@ -3226,6 +3231,18 @@ fn mission_for_screenshot(
             }
         }
         if (!options.support.is_empty() || options.cheat_check) && game.combat.to_throw {
+            intent.trigger.throw = true;
+        }
+        // With --bombs she drops a bomb every two seconds from a bay.
+        let bomb_every = (2.0 / tick).round().max(1.0) as u32;
+        if options.bombs
+            && game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_some())
+            && i % bomb_every == 0
+        {
             intent.trigger.throw = true;
         }
         // With --shop-check she buys and calls in every support item.
