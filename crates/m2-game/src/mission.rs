@@ -849,6 +849,10 @@ impl Mission {
         if saved.is_some() {
             self.world.borrow_mut().saved = None;
             let _ = self.host.lua().globals().set("__m2_saved", Value::Nil);
+            // A save has no intro movies to skip, and in skip mode the
+            // scripts don't move her to the save's place
+            // (`MrxUtil.TeleportHeroesToLocations` only calls back).
+            self.end_skip_mode();
         }
     }
 

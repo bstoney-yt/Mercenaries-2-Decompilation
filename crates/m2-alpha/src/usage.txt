@@ -190,6 +190,8 @@ m2-alpha [options]
                          and the world's wrecks, and with --mission the
                          scripts' own data (the contracts done and on offer,
                          her PMC, the factions), as loading it in play does
+  --load-at <seconds>    load the player's own save that far into play, as
+                         the pause menu does (a test of loading in play)
   --save-to <save.toml>  with --screenshot, write a save there once the run
                          ends, as the pause menu's Save does
   --hijack-crew <name>   every hijackable vehicle without a driver is

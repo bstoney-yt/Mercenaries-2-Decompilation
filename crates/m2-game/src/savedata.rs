@@ -71,15 +71,16 @@ pub fn generate(lua: &Lua, bootstrap: u32) -> mlua::Result<String> {
 /// Lua that says where the story stands: `WifMissionFlow.GetMissionStates`
 /// (each contract `"complete"` or `"incomplete"`, by whether the flow
 /// holds its key, then the one playing as `"active"`) and the contracts
-/// the flow has unlocked (`_tActiveMissions`, which its `SaveSingleton`
-/// keeps), each list sorted. From the scripts' bytecode.
+/// the flow has unlocked (`tActiveMissions` of its `SaveSingleton`, as a
+/// save keeps them), each list sorted. From the scripts' bytecode.
 pub const CONTRACTS: &str = r#"
 local done, active, offered = {}, {}, {}
 for _, s in ipairs(WifMissionFlow.GetMissionStates() or {}) do
     if s[2] == "complete" then done[#done + 1] = s[1]
     elseif s[2] == "active" then active[#active + 1] = s[1] end
 end
-for k in pairs(rawget(WifMissionFlow, "_tActiveMissions") or {}) do
+local flow = WifMissionFlow.SaveSingleton() or {}
+for k in pairs(flow.tActiveMissions or {}) do
     offered[#offered + 1] = tostring(k)
 end
 table.sort(done) table.sort(active) table.sort(offered)
@@ -127,7 +128,9 @@ mod tests {
         lua.load(
             r#"
             WifMissionFlow = {
-                _tActiveMissions = { PmcCon001 = {}, AllCon001 = {} },
+                SaveSingleton = function()
+                    return { tActiveMissions = { PmcCon001 = {}, AllCon001 = {} } }
+                end,
                 GetMissionStates = function()
                     return { { "VzaCon001", "complete" }, { "PmcCon001", "incomplete" },
                         { "AllCon001", "incomplete" }, { "PmcCon001", "active" } }

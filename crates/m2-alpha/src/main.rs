@@ -356,6 +356,9 @@ struct Options {
     /// A save to start from (`--load`): her place, the world's wrecks
     /// and, with the scripts, their own data.
     load: Option<save::SaveGame>,
+    /// Seconds into play to load the player's own save, as the pause menu does
+    /// (`--load-at`).
+    load_at: Option<f32>,
     /// With `--screenshot`, where to write a save once the run ends
     /// (`--save-to`).
     save_to: Option<PathBuf>,
@@ -585,6 +588,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--seated" => o.seated = true,
             "--load" => o.load = Some(save::SaveGame::read(&PathBuf::from(value()?))?),
             "--save-to" => o.save_to = Some(value()?.into()),
+            "--load-at" => o.load_at = Some(value()?.parse().context("--load-at expects seconds")?),
             "--mission-driver" => {
                 let path = value()?;
                 let code =
@@ -910,6 +914,7 @@ fn main() -> anyhow::Result<()> {
         skip_mode_off: options.skip_mode_off,
         guns: options.guns.clone(),
         load: options.load.clone(),
+        load_at: options.load_at,
         state: None,
         error: None,
     };
@@ -1122,12 +1127,12 @@ fn write_save(game: &Game, mission: Option<&mission::MissionLink>, path: &std::p
 }
 
 /// The launch's arguments `args` with `--load save` in place of any
-/// `--load` they had.
+/// `--load` they had, and without `--load-at` (which would load again).
 fn args_loading(args: impl IntoIterator<Item = String>, save: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
-        if a == "--load" {
+        if a == "--load" || a == "--load-at" {
             args.next();
         } else {
             out.push(a);
@@ -6435,6 +6440,9 @@ struct Running {
     /// A load asked to start the scripts again from this save: the alpha
     /// starts afresh with it ([`relaunch`]).
     relaunch: Option<std::path::PathBuf>,
+    /// When to load the player's own save as the pause menu does (`--load-at`):
+    /// a test of loading in play.
+    load_at: Option<Instant>,
 }
 
 struct App {
@@ -6474,6 +6482,8 @@ struct App {
     guns: Vec<String>,
     /// A save to start from (`--load`).
     load: Option<save::SaveGame>,
+    /// Seconds into play to load the player's own save (`--load-at`).
+    load_at: Option<f32>,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -6592,6 +6602,9 @@ impl App {
             cheat_code: cheats::CodeWatch::default(),
             cheat_typed: false,
             relaunch: None,
+            load_at: self
+                .load_at
+                .map(|s| Instant::now() + Duration::from_secs_f32(s)),
         };
         running.apply_options(&self.config);
         Ok(running)
@@ -7356,6 +7369,12 @@ impl Running {
         if self.input.take_pressed(Action::QuickLoad) && dev {
             self.load_game();
         }
+        // `--load-at`: the same load, by the clock, to test it in a window.
+        if self.load_at.is_some_and(|at| Instant::now() >= at) {
+            self.load_at = None;
+            eprintln!("load: --load-at: loading as the pause menu does");
+            self.load_from(&save::SaveGame::default_path());
+        }
         if self.input.take_pressed(Action::ToggleMusic) {
             self.audio.toggle_music();
         }
@@ -7702,6 +7721,8 @@ mod tests {
             "--mission",
             "--load",
             "older.toml",
+            "--load-at",
+            "30",
         ]
         .map(String::from);
         assert_eq!(

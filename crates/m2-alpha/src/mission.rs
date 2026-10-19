@@ -55,6 +55,9 @@ use crate::support::{self, FALLBACK_AFTER, Impact, Kind};
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
+/// Seconds after the scripts start from a save that where the story
+/// stands is logged: by then they have taken the save in (invented).
+const LOAD_REPORT_SECONDS: f32 = 15.0;
 /// A scripted voice line to play: the mission's id for it, its cue, and
 /// where it is said (`None`: flat).
 pub type ScriptLine = (u32, String, Option<Vec3>);
@@ -639,6 +642,9 @@ pub struct MissionLink {
     /// A save to start from ([`with_save`](Self::with_save)), until the
     /// scripts start.
     saved: Option<Box<crate::save::SaveGame>>,
+    /// Seconds since the scripts started from a save, until where the
+    /// story stands is logged ([`LOAD_REPORT_SECONDS`]).
+    since_load: Option<f32>,
     /// The scripts put the player somewhere the island has no way to hold
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
@@ -795,6 +801,7 @@ impl MissionLink {
             message: None,
             drivers,
             saved: None,
+            since_load: None,
             ashore: 0,
             blasts: Vec::new(),
             tutorial: None,
@@ -1245,6 +1252,21 @@ impl MissionLink {
             // Without the scripts, every state layer's people stand.
             if matches!(self.state, State::Failed(_)) {
                 game.scene.people.state_layers = None;
+            }
+        }
+        // The scripts take a save's data in as the world streams in: where
+        // the story stands, and where she is, is logged once they have.
+        if let Some(t) = &mut self.since_load {
+            *t += dt;
+            if *t >= LOAD_REPORT_SECONDS {
+                self.since_load = None;
+                if let Some(c) = self.contracts() {
+                    let at = game.focus();
+                    eprintln!(
+                        "load: {LOAD_REPORT_SECONDS} s on, the scripts hold {c}; she is at ({:.0}, {:.0}, {:.0})",
+                        at.x, at.y, at.z
+                    );
+                }
             }
         }
         let State::Running(mission) = &mut self.state else {
@@ -2023,8 +2045,8 @@ impl MissionLink {
                 if let Some(pmc) = pmc {
                     self.restore(&pmc);
                 }
-                if loaded && let Some(c) = self.contracts() {
-                    eprintln!("load: the scripts carry on with {c}");
+                if loaded {
+                    self.since_load = Some(0.0);
                 }
             }
             Err(e) => self.fail(format!("could not start the scripts: {e}")),

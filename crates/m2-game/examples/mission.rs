@@ -13,6 +13,8 @@
 //!   --driver file.lua  Lua to run before play starts (repeatable), such
 //!                      as examples/drivers/vzacon001.lua
 //!   --run <lua>        the same, inline (repeatable)
+//!   --load save.toml   start from an m2-alpha save's scripts' data
+//!                      (`scripts = "..."`) instead of a new game
 //!   --no-start         don't start play (the bootstrap's Init and the
 //!                      "GUI loaded" step); only set the modules up
 //!   --teleport t,x,y,z move the player at time t (repeatable)
@@ -60,6 +62,8 @@ struct Options {
     hero: String,
     /// Code to run before play starts: a name for errors, and the code.
     run: Vec<(String, String)>,
+    /// A save of the alpha's to start from (`--load`): its scripts' data.
+    load: Option<String>,
     start: bool,
     teleports: Vec<(f64, [f32; 3])>,
     seconds: f64,
@@ -125,6 +129,7 @@ fn options() -> Result<Options> {
                 let n = o.run.len() + 1;
                 o.run.push((format!("run {n}"), value()?));
             }
+            "--load" => o.load = Some(value()?),
             "--no-start" => o.start = false,
             "--hero" => o.hero = value()?,
             "--teleport" => {
@@ -162,6 +167,14 @@ fn options() -> Result<Options> {
     Ok(o)
 }
 
+/// The scripts' data of an m2-alpha save: its `scripts = "..."` line, a
+/// TOML basic string, read as the Lua string literal it also is (the
+/// escapes the writer uses, `\\`, `\"` and `\n`, mean the same in both).
+fn saved_scripts(toml: &str) -> Option<String> {
+    let value = toml.lines().find_map(|l| l.strip_prefix("scripts = "))?;
+    mlua::Lua::new().load(format!("return {value}")).eval().ok()
+}
+
 fn print(mission: &mut Mission) {
     for line in mission.take_log() {
         println!("{line}");
@@ -190,6 +203,12 @@ fn run(o: &Options) -> Result<()> {
             println!("  error: {e}");
         }
         print(&mut mission);
+    }
+    if let Some(path) = &o.load {
+        let text = saved_scripts(&std::fs::read_to_string(path)?)
+            .ok_or_else(|| format!("{path} has no scripts' data"))?;
+        println!("loading {path}: the scripts' data, {} bytes", text.len());
+        mission.load_save(text);
     }
     if o.start {
         println!();
