@@ -7,9 +7,10 @@
 //! second time on the way down, are left out.
 //!
 //! The engine's own save format is not followed (it isn't read); the data
-//! is the scripts'. Loading it back into the scripts
-//! (`LoadSingleton(data)` on a load instead of a new game) is not done
-//! yet.
+//! is the scripts'. Loading it hands it back to the bootstrap
+//! (`LoadSingleton(data)` instead of a new game's `LoadSingleton(nil)`:
+//! [`Mission::load_save`](crate::mission::Mission::load_save)), which
+//! gives each module its part as the game does.
 
 use mlua::Lua;
 
@@ -67,9 +68,89 @@ pub fn generate(lua: &Lua, bootstrap: u32) -> mlua::Result<String> {
     .eval()
 }
 
+/// Lua that says where the story stands: `WifMissionFlow.GetMissionStates`
+/// (each contract `"complete"` or `"incomplete"`, by whether the flow
+/// holds its key, then the one playing as `"active"`) and the contracts
+/// the flow has unlocked (`_tActiveMissions`, which its `SaveSingleton`
+/// keeps), each list sorted. From the scripts' bytecode.
+pub const CONTRACTS: &str = r#"
+local done, active, offered = {}, {}, {}
+for _, s in ipairs(WifMissionFlow.GetMissionStates() or {}) do
+    if s[2] == "complete" then done[#done + 1] = s[1]
+    elseif s[2] == "active" then active[#active + 1] = s[1] end
+end
+for k in pairs(rawget(WifMissionFlow, "_tActiveMissions") or {}) do
+    offered[#offered + 1] = tostring(k)
+end
+table.sort(done) table.sort(active) table.sort(offered)
+return done, active, offered
+"#;
+
+/// Where the story stands ([`CONTRACTS`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Contracts {
+    pub done: Vec<String>,
+    pub active: Vec<String>,
+    pub offered: Vec<String>,
+}
+
+impl std::fmt::Display for Contracts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} done [{}], active [{}], on offer [{}]",
+            self.done.len(),
+            self.done.join(" "),
+            self.active.join(" "),
+            self.offered.join(" ")
+        )
+    }
+}
+
+/// Where the story stands now ([`CONTRACTS`]).
+pub fn contracts(lua: &Lua) -> mlua::Result<Contracts> {
+    let (done, active, offered) = lua.load(CONTRACTS).set_name("=m2-contracts").eval()?;
+    Ok(Contracts {
+        done,
+        active,
+        offered,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contracts_are_read_from_the_flows_states_and_unlocks() {
+        let lua = Lua::new();
+        lua.load(
+            r#"
+            WifMissionFlow = {
+                _tActiveMissions = { PmcCon001 = {}, AllCon001 = {} },
+                GetMissionStates = function()
+                    return { { "VzaCon001", "complete" }, { "PmcCon001", "incomplete" },
+                        { "AllCon001", "incomplete" }, { "PmcCon001", "active" } }
+                end,
+            }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let c = contracts(&lua).unwrap();
+        assert_eq!(
+            c,
+            Contracts {
+                done: vec!["VzaCon001".into()],
+                active: vec!["PmcCon001".into()],
+                offered: vec!["AllCon001".into(), "PmcCon001".into()],
+            }
+        );
+        assert_eq!(
+            c.to_string(),
+            "1 done [VzaCon001], active [PmcCon001], on offer [AllCon001 PmcCon001]"
+        );
+    }
 
     #[test]
     fn save_data_written_reads_back_the_same() {
