@@ -185,6 +185,15 @@ impl Music {
         Some(Command::Music(cue))
     }
 
+    /// Cue `cue` now plays (or nothing does) because other scripts said
+    /// so: the pause menu's own (`MrxSound.EnterPauseState` and
+    /// `ExitPauseState`, run by the HUD's scripts). A later transition
+    /// here starts its state's piece again, not keeping a piece that no
+    /// longer plays.
+    pub fn heard(&mut self, cue: Option<String>) {
+        self.playing = cue;
+    }
+
     /// The state the scripts last asked for.
     pub fn state(&self) -> &str {
         &self.state
@@ -218,6 +227,21 @@ mod tests {
         assert_eq!(m.transition("none"), Some(Command::Music(None)));
         assert_eq!(m.transition("silence"), None);
         assert_eq!(m.state(), "silence");
+    }
+
+    #[test]
+    fn after_the_pause_menus_silence_the_state_plays_again() {
+        let mut m = Music::default();
+        m.set_faction("pmc");
+        m.bind("mu_fac_pmc_explore_01", "explore");
+        assert!(m.transition("explore").is_some());
+        // The HUD's scripts: `pause` (`mu_shell_01`), then `silence`.
+        m.heard(Some("mu_shell_01".into()));
+        m.heard(None);
+        assert_eq!(
+            m.transition("explore"),
+            Some(Command::Music(Some("mu_fac_pmc_explore_01".into())))
+        );
     }
 
     #[test]

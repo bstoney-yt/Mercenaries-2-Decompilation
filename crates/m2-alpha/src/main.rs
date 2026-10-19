@@ -6978,6 +6978,12 @@ impl Running {
         {
             m.medevac();
         }
+        if let Some(cue) = news.music {
+            self.audio.music_cue(cue.as_deref());
+            if let Some(m) = &mut self.mission {
+                m.music_heard(cue);
+            }
+        }
         for unused in &news.unused {
             eprintln!("pause: {unused} kept in the menu; the alpha has nothing for it");
         }

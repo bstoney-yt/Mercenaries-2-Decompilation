@@ -1631,6 +1631,12 @@ impl Mission {
         }
     }
 
+    /// The score changed under the HUD's scripts (the pause menu's
+    /// music): see [`crate::music::Music::heard`].
+    pub fn music_heard(&mut self, cue: Option<String>) {
+        self.world.borrow_mut().music.heard(cue);
+    }
+
     /// The faction the score plays now (`freeplay_city`, `pmc`, ...).
     pub fn music_faction(&self) -> String {
         self.world.borrow().music.faction().to_owned()

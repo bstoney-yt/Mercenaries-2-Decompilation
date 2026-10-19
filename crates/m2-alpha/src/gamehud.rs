@@ -2326,6 +2326,12 @@ impl Thread {
                 Command::StopSound { at: None, cue } => {
                     self.pause_native.command("Sound.Stop", &cue);
                 }
+                // The pause menu's music (`MrxSound.EnterPauseState`) and
+                // the silence after it (`ExitPauseState`).
+                Command::Music(cue) => {
+                    log.push(format!("pause: the scripts' score {cue:?}"));
+                    self.pause_native.music(cue);
+                }
                 _ => {}
             }
         }

@@ -1099,6 +1099,17 @@ impl MissionLink {
         self.write([line]);
     }
 
+    /// The pause menu's scripts changed the score (its `mu_shell_01`, then
+    /// silence on leaving): the mission's scripts start their state's
+    /// piece again at their next transition, and a radio going quiet
+    /// comes back to this.
+    pub fn music_heard(&mut self, cue: Option<String>) {
+        self.radio.score.clone_from(&cue);
+        if let State::Running(m) = &mut self.state {
+            m.music_heard(cue);
+        }
+    }
+
     /// Whether a dialog box the scripts put up ([`DIALOG_BOXES`]) is still
     /// waiting for a pick: the menu keys go to it, not to her.
     pub fn dialog_open(&self) -> bool {

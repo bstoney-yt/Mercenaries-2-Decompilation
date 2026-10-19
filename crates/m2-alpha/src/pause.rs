@@ -53,6 +53,13 @@
 //! - Leaving: its Resume (`closePause`) and Quit (`quitGame`) run the
 //!   scripts' handlers, which ask for the `ingame` and `unloading` game
 //!   states ([`News`]).
+//! - Its music: entering, the HUD's scripts run `MrxSound.EnterPauseState`
+//!   (`TransitionMusic("pause")`, which `MrxSound`'s bindings tie to
+//!   `mu_shell_01` for every faction); leaving, `ExitPauseState`
+//!   (`TransitionMusic("silence")`). Both reach the score ([`News::music`]);
+//!   the mission's scripts bring their piece back at their next
+//!   transition (from the scripts; the engine's dynamic music, which
+//!   `_RestoreDynamicMusic` turns back on, is not done).
 //!
 //! # Provenance
 //!
@@ -348,6 +355,10 @@ pub struct News {
     /// _HandleMedEvacEvent` calls `MrxPlayer.MedEvac`): the mission's own
     /// scripts run it (to the sickbay, for its cost).
     pub medevac: bool,
+    /// The HUD's scripts changed the score: `MrxSound.EnterPauseState`
+    /// goes to the `pause` state (`mu_shell_01`, bound for every faction
+    /// in `MrxSound`'s bindings), `ExitPauseState` to `silence` (`None`).
+    pub music: Option<Option<String>>,
 }
 
 impl News {
@@ -366,6 +377,7 @@ impl News {
         self.keys = later.keys.or(self.keys.take());
         self.video = later.video.or(self.video);
         self.medevac |= later.medevac;
+        self.music = later.music.or(self.music.take());
     }
 }
 
@@ -428,6 +440,11 @@ impl Native {
     /// What play should do, since last asked.
     pub fn take_news(&mut self) -> News {
         std::mem::take(&mut self.news)
+    }
+
+    /// The HUD's scripts changed the score to `cue` (`None`: silence).
+    pub fn music(&mut self, cue: Option<String>) {
+        self.news.music = Some(cue);
     }
 
     /// The game state the scripts asked for.
@@ -842,6 +859,19 @@ mod tests {
                 _ => String::new(),
             })
             .collect()
+    }
+
+    #[test]
+    fn the_pause_states_music_reaches_play_last_one_kept() {
+        let mut n = Native::default();
+        n.music(Some("mu_shell_01".into()));
+        let mut news = n.take_news();
+        assert_eq!(news.music, Some(Some("mu_shell_01".into())));
+        n.music(None);
+        news.merge(n.take_news());
+        assert_eq!(news.music, Some(None));
+        news.merge(News::default());
+        assert_eq!(news.music, Some(None));
     }
 
     #[test]
