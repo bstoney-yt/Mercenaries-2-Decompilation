@@ -3147,6 +3147,7 @@ fn mission_for_screenshot(
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
             Some(a) => {
+                a.sights = link.sight_targets(game);
                 let marks = link.marks();
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)

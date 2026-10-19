@@ -24,6 +24,11 @@ use crate::support::{Aim, PDA_CLOSE, PDA_OPEN, Phase};
 const TURN: f32 = 5.0;
 /// The camera's pitch while she runs or drives, radians.
 const CRUISE_PITCH: f32 = -0.2;
+/// With nothing to do, she looks at what the scripts wait for her to
+/// see if it is within this far (metres), from at least this far off
+/// (invented: the camera rides behind her).
+const LOOK_NEAR: f32 = 60.0;
+const LOOK_FROM: f32 = 6.0;
 /// Close enough to a place to be there, metres. Waiting there longer than
 /// this (seconds), she walks round it this far out: the scripts' region
 /// may lie to a side of their marker.
@@ -216,6 +221,11 @@ struct Way {
 /// The player playing herself.
 #[derive(Debug, Default)]
 pub struct Autoplay {
+    /// What the scripts wait for her to see (`Event.ObjectIsVisible`:
+    /// PmcCon001's hall column, which brings the tank through the wall):
+    /// where each is, set each tick ([`crate::mission::MissionLink::
+    /// sight_targets`]).
+    pub sights: Vec<Vec3>,
     /// Seconds played.
     clock: f32,
     goal: Option<Goal>,
@@ -398,7 +408,7 @@ impl Autoplay {
             };
         }
         match self.goal.clone() {
-            None => self.idle(game),
+            None => self.idle(game, dt),
             Some(Goal::Reach { at, .. }) => self.travel(game, at, ARRIVE, dt),
             Some(Goal::Shoot(i)) => self.shoot(game, i, dt),
             Some(Goal::Blast { at, .. }) if striking => self.strike(game, at, dt),
@@ -808,12 +818,37 @@ impl Autoplay {
     }
 
     /// Nothing to do: stand, or stop the vehicle.
-    fn idle(&mut self, game: &Game) -> Intent {
+    fn idle(&mut self, game: &mut Game, dt: f32) -> Intent {
         let driving = game
             .scene
             .player
             .as_ref()
             .is_some_and(|p| p.driving.is_some());
+        // Nothing marked, and the scripts wait for her to look at
+        // something near: she looks at it, from a few metres off.
+        if !driving
+            && let Some(p) = game.scene.player.as_ref()
+            && let Some(at) = self
+                .sights
+                .iter()
+                .copied()
+                .filter(|s| s.distance(p.character.position) < LOOK_NEAR)
+                .min_by(|a, b| {
+                    let here = p.character.position;
+                    a.distance(here).total_cmp(&b.distance(here))
+                })
+        {
+            let here = p.character.position;
+            if (at - here).with_y(0.0).length() < LOOK_FROM {
+                let away = here + (here - at).with_y(0.0).normalize_or(Vec3::X) * LOOK_FROM;
+                return self.walk(game, away, 1.0, dt);
+            }
+            let (look, _) = aim(p, at, dt);
+            return Intent {
+                look,
+                ..Intent::default()
+            };
+        }
         Intent {
             hold_jump: driving,
             ..Intent::default()

@@ -6238,4 +6238,35 @@ mod tests {
         // Behind the shooter.
         assert!(ray_capsule(Vec3::new(0.0, 1.2, 20.0), Vec3::Z, a, seg, 0.3).is_none());
     }
+    /// PmcCon001 hands her an Assault Rifle, not the first contract's
+    /// carbine: it is the gun in the rifle's place, one clip in and none
+    /// spare until the scripts give her its reserve; nothing else.
+    #[test]
+    fn scripted_rifle_replaces_the_carbine_with_one_clip() {
+        let mut combat = Combat {
+            carbine: Rifle {
+                name: "Carbine".to_owned(),
+                clip: 30,
+                ..Rifle::default()
+            },
+            grenades: 4,
+            ..Combat::default()
+        };
+        combat.scripted_rifle(Rifle {
+            name: "Assault Rifle".to_owned(),
+            clip: 25,
+            ..Rifle::default()
+        });
+        assert_eq!(combat.rifle.name, "Assault Rifle");
+        assert_eq!(
+            combat.rifle_rounds,
+            Rounds {
+                clip: 25,
+                stored: 0
+            }
+        );
+        assert_eq!(combat.grenades, 0);
+        assert_eq!(combat.weapon, Weapon::Rifle);
+        assert!(combat.second.is_none());
+    }
 }

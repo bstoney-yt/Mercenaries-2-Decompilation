@@ -1995,6 +1995,27 @@ impl MissionLink {
         out
     }
 
+    /// Where the things are that the scripts wait for her to see
+    /// (`Event.ObjectIsVisible`), as the game looks at them.
+    pub fn sight_targets(&self, game: &Game) -> Vec<Vec3> {
+        let State::Running(m) = &self.state else {
+            return Vec::new();
+        };
+        let w = m.world().borrow();
+        m.sight_watched()
+            .into_iter()
+            .filter_map(|g| {
+                let o = w.objects.get(&g)?;
+                Some(
+                    game.scene
+                        .props
+                        .centre(g)
+                        .unwrap_or(Vec3::from(o.position) + Vec3::Y * SIGHT_HEIGHT),
+                )
+            })
+            .collect()
+    }
+
     /// The names of the events the scripts wait for the game to post
     /// (`"PDA Open"`).
     pub fn awaited(&self) -> Vec<String> {
