@@ -82,6 +82,9 @@ const BLAST_BODY: f32 = 6.0;
 const PLANT_FROM: f32 = 4.0;
 const PLANT_SAFE: f32 = 18.0;
 const PLANT_AWAY: f32 = 12.0;
+/// A prompt at her goal is taken again after this long (seconds) if it is
+/// still offered. Invented.
+const PRESS_AGAIN: f32 = 3.0;
 const VANTAGE_CLIMB: f32 = 3.0;
 /// Driving: she eases off within this far of a place (metres) above this
 /// speed (m/s); stuck this long (seconds), she backs out for this long.
@@ -278,6 +281,8 @@ pub struct Autoplay {
     /// With the launcher empty, the C4 she set on what she is blowing up
     /// and when, while she gets clear to set it off.
     planted: Option<f32>,
+    /// When she last took a prompt of the scripts' at her goal.
+    context_pressed: f32,
     /// Sidestepping (-1 left, 1 right), seconds left.
     sidestep: Option<(f32, f32)>,
     /// Which way the next sidestep goes.
@@ -413,6 +418,19 @@ impl Autoplay {
             self.way = None;
         }
         self.goal = chosen.map(|c| c.0);
+        // The scripts' prompt on what she went to (a verify on a body, a
+        // starter's talk) is taken with the use key, as a player would.
+        if let (Some(Goal::Reach { target, .. }), Some((g, text))) = (&self.goal, &game.context)
+            && g == target
+            && self.clock - self.context_pressed > PRESS_AGAIN
+        {
+            eprintln!(
+                "autoplay {:.1} s: taking {text:?} at {}",
+                self.clock, self.what
+            );
+            self.context_pressed = self.clock;
+            game.context_taken = Some(*g);
+        }
         if let (Some(Goal::Reach { target, .. }), Some(t)) = (&self.goal, self.arrived)
             && self.waiting.is_none_or(|w| w.0 != *target)
         {
@@ -537,6 +555,38 @@ impl Autoplay {
                     from.1, from.0
                 ),
             ));
+        }
+        // A person to verify (AllCon003's General Peng): shot down once
+        // she is near (a ride first if far), then she goes to the body,
+        // where the scripts offer their verify prompt (taken in `step`).
+        let verify: Vec<&Mark> = live
+            .iter()
+            .copied()
+            .filter(|m| m.kind == "verify")
+            .collect();
+        if let Some(m) = nearest(verify, here)
+            && let Some(i) = npcs.iter().position(|n| n.spawn == Some(m.target))
+        {
+            let at = npcs[i].character.position;
+            let d = at.distance(here);
+            if npcs[i].alive && d < RIDE_FOR {
+                return Some((
+                    Goal::Shoot(i),
+                    format!(
+                        "shooting {} ({:#x}) to verify, {d:.0} m off",
+                        m.name, m.target
+                    ),
+                ));
+            }
+            if !npcs[i].alive {
+                return Some((
+                    Goal::Reach {
+                        target: m.target,
+                        at,
+                    },
+                    format!("verifying {} ({:#x}), {d:.0} m off", m.name, m.target),
+                ));
+            }
         }
         // What to destroy, nearest first: soldiers are shot, things blown up.
         let destroy: Vec<&Mark> = live
