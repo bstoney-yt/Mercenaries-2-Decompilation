@@ -61,6 +61,22 @@ const DEFEND: f32 = 30.0;
 /// lower than she stands by more than this if she can (metres).
 const BLOCKED: f32 = 4.0;
 const VANTAGE_RINGS: [f32; 5] = [6.0, 10.0, 15.0, 20.0, 26.0];
+/// Blowing something up, in range this long (seconds) without a shot
+/// (something in the way, or her aim never settling), she goes where she
+/// can fire from: on rings this far out (metres), inside the rockets' and
+/// the grenades' ranges. Invented.
+const BLAST_BLOCKED: f32 = 8.0;
+const BLAST_RINGS: [f32; 4] = [20.0, 26.0, 32.0, 38.0];
+const LOB_RINGS: [f32; 3] = [16.0, 22.0, 28.0];
+/// A shot meeting something within this of what she is blowing up meets
+/// the thing itself (metres; a truck's half length and more). Invented.
+const BLAST_BODY: f32 = 6.0;
+/// Out of rockets, she sets C4 on what she is blowing up: thrown from
+/// within this (metres), set off from at least this far (metres) or once
+/// she has been going this long (seconds). Invented.
+const PLANT_FROM: f32 = 4.0;
+const PLANT_SAFE: f32 = 18.0;
+const PLANT_AWAY: f32 = 12.0;
 const VANTAGE_CLIMB: f32 = 3.0;
 /// Driving: she eases off within this far of a place (metres) above this
 /// speed (m/s); stuck this long (seconds), she backs out for this long.
@@ -240,6 +256,12 @@ pub struct Autoplay {
     /// spot), and the spots that turned out no better.
     vantage: Option<(usize, Vec3)>,
     tried: Vec<Vec3>,
+    /// Where she goes to fire at what she is blowing up (its object, the
+    /// spot); the spots no better go in `tried` too.
+    blast_spot: Option<(u32, Vec3)>,
+    /// With the launcher empty, the C4 she set on what she is blowing up
+    /// and when, while she gets clear to set it off.
+    planted: Option<f32>,
     /// Sidestepping (-1 left, 1 right), seconds left.
     sidestep: Option<(f32, f32)>,
     /// Which way the next sidestep goes.
@@ -402,7 +424,7 @@ impl Autoplay {
             Some(Goal::Reach { at, .. }) => self.travel(game, at, ARRIVE, dt),
             Some(Goal::Shoot(i)) => self.shoot(game, i, dt),
             Some(Goal::Blast { at, .. }) if striking => self.strike(game, at, dt),
-            Some(Goal::Blast { at, .. }) => self.blast(game, at, dt),
+            Some(Goal::Blast { target, at }) => self.blast(game, target, at, dt),
             Some(Goal::Board(i)) => self.board(game, i, dt),
             Some(Goal::Open(target)) => self.open(game, target, dt),
             Some(Goal::Take(key)) => self.take(game, key, dt),
@@ -989,7 +1011,9 @@ impl Autoplay {
                     .scene
                     .world
                     .as_ref()
-                    .and_then(|w| vantage(&w.physics, target, here, &self.tried))
+                    .and_then(|w| {
+                        vantage(&w.physics, target, here, &self.tried, &VANTAGE_RINGS, 1.0)
+                    })
                     .map(|s| (i, s));
                 eprintln!(
                     "autoplay {:.1} s: no clear shot at {} from {here:.1}: {}",
@@ -1032,7 +1056,7 @@ impl Autoplay {
     /// Blowing up what stands at `at` with what she carries in the
     /// launcher's place: rockets from between [`BLAST_RANGE`], grenades
     /// from between [`LOB_RANGE`]; from a tank, with its cannon.
-    fn blast(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
+    fn blast(&mut self, game: &mut Game, target: u32, at: Vec3, dt: f32) -> Intent {
         if let Some(v) = game.scene.player.as_ref().and_then(|p| p.driving) {
             return self.at_target_driving(game, v, at, dt);
         }
@@ -1043,6 +1067,24 @@ impl Autoplay {
         let d = at.distance(here);
         let lobbing = game.combat.second == Some(Weapon::GrenadeLauncher);
         let (near, far) = if lobbing { LOB_RANGE } else { BLAST_RANGE };
+        if self.blast_spot.is_some_and(|(t, _)| t != target) {
+            self.blast_spot = None;
+            self.tried.clear();
+            self.blocked = 0.0;
+        }
+        // Out of rockets (round 3's AllCon003: four for four AA guns, two
+        // left standing): C4 instead, while she carries any.
+        let rockets = game.combat.launcher_rounds.map_or(0, |r| r.total());
+        if !lobbing && rockets == 0 && (game.combat.charges > 0 || self.planted.is_some()) {
+            return self.plant(game, at, dt);
+        }
+        // Going where she can fire from (in range, nothing in the way).
+        if let Some((_, spot)) = self.blast_spot
+            && spot.with_y(0.0).distance(here.with_y(0.0)) >= ARRIVE
+        {
+            self.arrived = None;
+            return self.walk(game, spot, 1.0, dt);
+        }
         if d > far {
             return self.walk(game, at, far - 5.0, dt);
         }
@@ -1053,16 +1095,56 @@ impl Autoplay {
         }
         let (look, error) = aim(p, at, dt);
         let reach = at.distance(p.pivot());
+        let (from, dir) = Combat::aim_ray(p);
+        // What the shot meets first: nothing, something past or near the
+        // target, or its own body (a big vehicle's, round 3's MLRS, is hit
+        // well short of its middle).
         let clear = game.scene.world.as_ref().is_some_and(|w| {
             Combat::aim_probe(&w.physics, &game.scene.people, p)
-                .is_none_or(|(t, _)| t > reach - 4.0)
+                .is_none_or(|(t, _)| t > reach - 4.0 || (from + dir * t).distance(at) < BLAST_BODY)
         });
         self.steady = if error < ON_TARGET {
             self.steady + dt
         } else {
             0.0
         };
-        let movement = if !clear && self.steady > 1.0 {
+        // In range a while with no shot (round 2's AllCon002: she stood
+        // 2400 s aimed at the hilltop MLRS): from somewhere else on a ring
+        // round it, another if that is no better.
+        if clear && error < ON_TARGET {
+            self.blocked = 0.0;
+        } else {
+            self.blocked += dt;
+        }
+        if self.blocked > BLAST_BLOCKED {
+            if let Some((_, s)) = self.blast_spot {
+                self.tried.push(s);
+            }
+            self.blocked = 0.0;
+            self.fresh_headway();
+            let rings: &[f32] = if lobbing { &LOB_RINGS } else { &BLAST_RINGS };
+            self.blast_spot = game
+                .scene
+                .world
+                .as_ref()
+                .and_then(|w| vantage(&w.physics, at, here, &self.tried, rings, BLAST_BODY))
+                .map(|s| (target, s));
+            eprintln!(
+                "autoplay {:.1} s: no shot at {} from {here:.1} ({}, aim off {error:.3}): {}",
+                self.clock,
+                self.what,
+                if clear {
+                    "clear"
+                } else {
+                    "something in the way"
+                },
+                self.blast_spot
+                    .map_or("nowhere better to fire from".to_owned(), |(_, s)| {
+                        format!("going to {s:.1}")
+                    })
+            );
+        }
+        let movement = if !clear && self.steady > 1.0 && self.blast_spot.is_none() {
             Vec2::Y
         } else {
             Vec2::ZERO
@@ -1081,6 +1163,72 @@ impl Autoplay {
                 select: (Some(game.combat.weapon) != game.combat.second).then_some(Weapon::Rpg),
                 ..Trigger::default()
             },
+            ..Intent::default()
+        }
+    }
+
+    /// C4 on what stands at `at`, as a player out of rockets would: up to
+    /// within [`PLANT_FROM`], the C4 taken up and thrown at it, then off
+    /// to [`PLANT_SAFE`] away (or [`PLANT_AWAY`] seconds on) and set off.
+    /// Again while it stands and she has C4.
+    fn plant(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
+        let Some(p) = game.scene.player.as_ref() else {
+            return Intent::default();
+        };
+        let here = p.character.position;
+        let d = (at - here).with_y(0.0).length();
+        if let Some(since) = self.planted {
+            if d >= PLANT_SAFE || self.clock - since > PLANT_AWAY {
+                eprintln!(
+                    "autoplay {:.1} s: setting off the C4 on {} from {d:.0} m",
+                    self.clock, self.what
+                );
+                self.planted = None;
+                return Intent {
+                    trigger: Trigger {
+                        detonate: true,
+                        ..Trigger::default()
+                    },
+                    ..Intent::default()
+                };
+            }
+            let away = at + (here - at).with_y(0.0).normalize_or(Vec3::X) * (PLANT_SAFE + 4.0);
+            self.arrived = None;
+            return self.walk(game, away, 1.0, dt);
+        }
+        if d > PLANT_FROM {
+            return self.walk(game, at, PLANT_FROM - 1.0, dt);
+        }
+        // The C4 taken up (the throwables go round: grenades, C4, mines).
+        if game.combat.explosive != 1 {
+            return Intent {
+                trigger: Trigger {
+                    next_explosive: self.tap(),
+                    ..Trigger::default()
+                },
+                ..Intent::default()
+            };
+        }
+        let (look, error) = aim(p, at, dt);
+        if error < ON_TARGET * 4.0 && self.tap() {
+            eprintln!(
+                "autoplay {:.1} s: C4 thrown at {} from {d:.1} m ({} left)",
+                self.clock,
+                self.what,
+                game.combat.charges.saturating_sub(1)
+            );
+            self.planted = Some(self.clock);
+            return Intent {
+                look,
+                trigger: Trigger {
+                    throw: true,
+                    ..Trigger::default()
+                },
+                ..Intent::default()
+            };
+        }
+        Intent {
+            look,
             ..Intent::default()
         }
     }
@@ -1726,13 +1874,21 @@ fn wanted(templates: &Templates, combat: &Combat, p: &crate::flights::Pickup) ->
 
 /// Vehicle `vehicles[i]`'s model to world, if placed.
 /// A spot she can stand on and see `target` from: on rings round it, with
-/// ground under it and nothing between eye height there and the target,
+/// ground under it and nothing between eye height there and `short` of
+/// the target,
 /// not within a few metres of one already `tried`; of the nearest ring
 /// with any, the one closest to `from`, preferring ground about as high
 /// as hers.
-fn vantage(physics: &Physics, target: Vec3, from: Vec3, tried: &[Vec3]) -> Option<Vec3> {
+fn vantage(
+    physics: &Physics,
+    target: Vec3,
+    from: Vec3,
+    tried: &[Vec3],
+    rings: &[f32],
+    short: f32,
+) -> Option<Vec3> {
     let mut best: Option<(f32, Vec3)> = None;
-    for r in VANTAGE_RINGS {
+    for &r in rings {
         for k in 0..24 {
             let a = k as f32 * std::f32::consts::TAU / 24.0;
             let (x, z) = (target.x + r * a.sin(), target.z + r * a.cos());
@@ -1747,7 +1903,7 @@ fn vantage(physics: &Physics, target: Vec3, from: Vec3, tried: &[Vec3]) -> Optio
             let eye = spot + Vec3::Y * 1.6;
             let (dir, len) = ((target - eye).normalize_or_zero(), target.distance(eye));
             // Short of the target's own body.
-            if physics.cast_ray(eye, dir, (len - 1.0).max(0.0)).is_some() {
+            if physics.cast_ray(eye, dir, (len - short).max(0.0)).is_some() {
                 continue;
             }
             let climb = (spot.y - from.y).abs();
@@ -2131,12 +2287,61 @@ mod tests {
         p.add_static(StaticKey::Cell(2), &wall, Vec3::ZERO, Quat::IDENTITY);
         p.step(1.0 / 60.0);
         let target = Vec3::new(0.0, 1.3, 4.0);
-        let spot = vantage(&p, target, Vec3::ZERO, &[]).expect("somewhere to see it from");
+        let spot = vantage(&p, target, Vec3::ZERO, &[], &VANTAGE_RINGS, 1.0)
+            .expect("somewhere to see it from");
         assert!(spot.z > 2.0, "still behind the wall at {spot}");
         assert!(spot.y.abs() < 0.1, "not on the ground: {spot}");
         // Not the same spot twice.
-        let next = vantage(&p, target, Vec3::ZERO, &[spot]).expect("another");
+        let next = vantage(&p, target, Vec3::ZERO, &[spot], &VANTAGE_RINGS, 1.0).expect("another");
         assert!(next.distance(spot) >= 4.0, "{next} is {spot} again");
+    }
+
+    // A truck-sized box round what she is blowing up (round 3's MLRS):
+    // every line to its middle meets its own sides metres short, so only
+    // stopping BLAST_BODY short finds her a spot to fire from.
+    #[test]
+    fn blast_spots_see_past_the_targets_own_body() {
+        use m2_engine::{CollisionShape, StaticKey};
+        let mut p = Physics::new();
+        let quad = |a: Vec3, b: Vec3, c: Vec3, d: Vec3| {
+            CollisionShape::mesh(&[a, b, c, d], &[[0, 1, 2], [0, 2, 3]]).unwrap()
+        };
+        let ground = quad(
+            Vec3::new(-60.0, 0.0, -60.0),
+            Vec3::new(60.0, 0.0, -60.0),
+            Vec3::new(60.0, 0.0, 60.0),
+            Vec3::new(-60.0, 0.0, 60.0),
+        );
+        p.add_static(StaticKey::Cell(1), &ground, Vec3::ZERO, Quat::IDENTITY);
+        // The box's four sides, 8 m by 3 m, 3 m high.
+        let (x, z, h) = (4.0, 1.5, 3.0);
+        let corners = [(-x, -z), (x, -z), (x, z), (-x, z)];
+        for k in 0..4 {
+            let (a, b) = (corners[k], corners[(k + 1) % 4]);
+            let side = quad(
+                Vec3::new(a.0, 0.0, a.1),
+                Vec3::new(b.0, 0.0, b.1),
+                Vec3::new(b.0, h, b.1),
+                Vec3::new(a.0, h, a.1),
+            );
+            p.add_static(
+                StaticKey::Cell(2 + k as u32),
+                &side,
+                Vec3::ZERO,
+                Quat::IDENTITY,
+            );
+        }
+        p.step(1.0 / 60.0);
+        let target = Vec3::new(0.0, 1.3, 0.0);
+        let from = Vec3::new(30.0, 0.0, 0.0);
+        assert_eq!(vantage(&p, target, from, &[], &BLAST_RINGS, 1.0), None);
+        let spot = vantage(&p, target, from, &[], &BLAST_RINGS, BLAST_BODY)
+            .expect("somewhere to fire from");
+        let d = spot.with_y(0.0).distance(target.with_y(0.0));
+        assert!(
+            (BLAST_RANGE.0..BLAST_RANGE.1).contains(&d),
+            "{spot} is {d:.1} m off"
+        );
     }
 
     // A wall across the way with a gap to its left: the driver steers
