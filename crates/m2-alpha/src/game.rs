@@ -107,6 +107,8 @@ fn arrived(t: f32, in_place: bool) -> bool {
 pub struct Game {
     pub scene: Scene,
     pub camera: FlyCamera,
+    /// The menus' Brightness and shadows ([`Picture`]).
+    pub picture: Picture,
     /// Playing as Jennifer rather than flying the camera.
     pub on_foot: bool,
     /// Seconds to the next look for parking spots.
@@ -327,6 +329,7 @@ impl Game {
             combat.hero_damage
         );
         Self {
+            picture: Picture::default(),
             scene,
             camera,
             on_foot,
@@ -2231,7 +2234,38 @@ impl Game {
         if self.support.looking().is_some() {
             satellite_look(&mut view.lighting);
         }
+        self.picture.apply(&mut view.lighting);
         view
+    }
+}
+
+/// The menus' picture options as the frame takes them: Brightness (0 to
+/// 100, 50 as the game is lit) and the advanced video screen's shadows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Picture {
+    pub brightness: f64,
+    pub shadows: bool,
+}
+
+impl Default for Picture {
+    fn default() -> Self {
+        Self {
+            brightness: 50.0,
+            shadows: true,
+        }
+    }
+}
+
+impl Picture {
+    /// Brightness scales the finished frame's light, a stop down at 0 and
+    /// up at 100 (invented: the game's gamma curve is not known); shadows
+    /// off, the sun casts none.
+    pub fn apply(&self, lighting: &mut m2_render::Lighting) {
+        let stops = (self.brightness.clamp(0.0, 100.0) - 50.0) / 50.0;
+        lighting.grade *= 2f32.powf(stops as f32);
+        if !self.shadows {
+            lighting.shadow_distance = 0.0;
+        }
     }
 }
 
@@ -3605,5 +3639,33 @@ mod tests {
         assert!(!blown_loose(&db, 2));
         // One the data gives no damage table row: thrown, as before.
         assert!(blown_loose(&db, 3));
+    }
+}
+
+#[cfg(test)]
+mod picture_tests {
+    use super::Picture;
+
+    #[test]
+    fn brightness_is_a_stop_either_way_and_shadows_can_go() {
+        let lit = |p: Picture| {
+            let mut l = m2_render::Lighting {
+                shadow_distance: 120.0,
+                ..Default::default()
+            };
+            p.apply(&mut l);
+            (l.grade.x, l.shadow_distance)
+        };
+        assert_eq!(lit(Picture::default()), (1.0, 120.0));
+        let bright = Picture {
+            brightness: 100.0,
+            ..Picture::default()
+        };
+        assert_eq!(lit(bright).0, 2.0);
+        let dark = Picture {
+            brightness: 0.0,
+            shadows: false,
+        };
+        assert_eq!(lit(dark), (0.5, 0.0));
     }
 }

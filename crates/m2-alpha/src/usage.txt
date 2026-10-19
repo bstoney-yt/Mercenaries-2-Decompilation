@@ -30,6 +30,8 @@ m2-alpha [options]
   --shell-key <code>     a Flash key code pressed in --front-end (13 Enter,
                          37/39 left/right, 38/40 up/down, 27 Escape;
                          0 presses nothing)
+  --to-front-end         start at the front end, without the boot movies
+                         (what the pause menu's Quit starts again with)
   --shell-click <x,y>    a left click there (screen pixels) in --front-end,
                          in its turn among the --shell-keys
   --after-contract <s>   with --mission --autoplay --screenshot: play on

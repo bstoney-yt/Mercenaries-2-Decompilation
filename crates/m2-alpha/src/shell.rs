@@ -607,12 +607,13 @@ impl Native {
         self.news.settings = Some(self.settings.clone());
     }
 
-    /// The movie's setters, with the settings: each screen's.
+    /// The movie's setters, with the settings: each screen's (the video
+    /// screens' Graphic Detail and advanced options come as they open: the
+    /// movie defines their setters on those frames).
     fn setting_calls(&self) -> Vec<Call> {
         let mut calls = self.game_calls();
         calls.extend(self.audio_calls());
         calls.extend(self.controls_calls());
-        calls.extend(self.advanced_calls());
         let s = &self.settings;
         calls.extend([
             (
@@ -627,7 +628,6 @@ impl Native {
                 "LTIVideoSetVSync",
                 vec![Value::Number(f64::from(u8::from(s.vsync)))],
             ),
-            ("LTISetGraphicDetail", vec![Value::Number(s.detail)]),
         ]);
         calls
     }
@@ -721,6 +721,7 @@ impl Native {
                 "LTIVideoSetVSync",
                 vec![Value::Number(f64::from(u8::from(s.vsync)))],
             ),
+            ("LTISetGraphicDetail", vec![Value::Number(s.detail)]),
         ]
     }
 
@@ -1078,7 +1079,8 @@ mod tests {
             [
                 "LTIVideoSetGamma 70",
                 "LTIVideoSetVideoViewDistance 40",
-                "LTIVideoSetVSync 0"
+                "LTIVideoSetVSync 0",
+                "LTISetGraphicDetail 2"
             ]
         );
     }

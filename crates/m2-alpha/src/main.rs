@@ -364,6 +364,9 @@ struct Options {
     alpha: bool,
     /// `--alpha` without the boot movies and front end.
     no_boot: bool,
+    /// Starts at the front end, without the boot movies (`--to-front-end`:
+    /// what the pause menu's Quit starts the alpha again with).
+    to_front_end: bool,
     /// With `--mission --screenshot`: the scripts' movies wait for the
     /// game, which opens each, decodes a few frames and pictures one.
     movies: bool,
@@ -542,6 +545,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--mission" => o.mission = true,
             "--alpha" => o.alpha = true,
             "--no-boot" => o.no_boot = true,
+            "--to-front-end" => o.to_front_end = true,
             "--movies" => o.movies = true,
             "--front-end" => o.front_end = true,
             "--shell-key" => o.shell_keys.push(
@@ -759,13 +763,14 @@ fn parse_args() -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 10] = [
+    const PLAIN: [&str; 11] = [
         "--install",
         "--config",
         "--size",
         "--fullscreen",
         "--vsync",
         "--no-boot",
+        "--to-front-end",
         "--smarter-ai",
         "--dev",
         "--skip-mode-off",
@@ -939,6 +944,7 @@ fn main() -> anyhow::Result<()> {
         support: options.support.clone(),
         alpha: options.alpha,
         no_boot: options.no_boot,
+        to_front_end: options.to_front_end,
         skip_mode_off: options.skip_mode_off,
         guns: options.guns.clone(),
         load: options.load.clone(),
@@ -1184,6 +1190,36 @@ fn args_loading(args: impl IntoIterator<Item = String>, save: &std::path::Path) 
     }
     out.extend(["--load".to_owned(), save.display().to_string()]);
     out
+}
+
+/// The launch's arguments `args` to start again at the front end: without
+/// any `--load`, with `--to-front-end`.
+fn args_front_end(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--load" => {
+                args.next();
+            }
+            "--to-front-end" => {}
+            _ => out.push(a),
+        }
+    }
+    out.push("--to-front-end".to_owned());
+    out
+}
+
+/// Starts the alpha again at its front end, as the game goes back to its
+/// main menu (the pause menu's Quit). The caller then closes.
+fn relaunch_front_end() {
+    let args = args_front_end(std::env::args().skip(1));
+    match std::env::current_exe()
+        .and_then(|exe| std::process::Command::new(exe).args(&args).spawn())
+    {
+        Ok(_) => eprintln!("quit: started again at the front end"),
+        Err(e) => eprintln!("quit: could not start again: {e}"),
+    }
 }
 
 /// Starts the alpha again as it was launched, from the save at `save`
@@ -6559,6 +6595,9 @@ struct Running {
     /// A load asked to start the scripts again from this save: the alpha
     /// starts afresh with it ([`relaunch`]).
     relaunch: Option<std::path::PathBuf>,
+    /// The pause menu's Quit: the alpha starts again at its front end
+    /// ([`relaunch_front_end`]).
+    to_front_end: bool,
 }
 
 struct App {
@@ -6591,6 +6630,8 @@ struct App {
     /// `no_boot`), front end, the scripts' movies.
     alpha: bool,
     no_boot: bool,
+    /// Start at the front end, without the boot movies (`--to-front-end`).
+    to_front_end: bool,
     /// End the scripts' skip mode after their start (unless
     /// `--skip-mode-on`).
     skip_mode_off: bool,
@@ -6702,7 +6743,8 @@ impl App {
             flow: match &self.install {
                 Some(install) if self.alpha => Some(flow::Flow::new(
                     install.clone(),
-                    !self.no_boot,
+                    !self.no_boot || self.to_front_end,
+                    !self.to_front_end,
                     self.config.hero,
                     self.config.options.subtitles,
                 )),
@@ -6716,6 +6758,7 @@ impl App {
             cheat_code: cheats::CodeWatch::default(),
             cheat_typed: false,
             relaunch: None,
+            to_front_end: false,
         };
         running.apply_options(&self.config);
         Ok(running)
@@ -7105,6 +7148,11 @@ impl Running {
         self.set_volumes([o.sfx_volume, o.music_volume, o.dialog_volume]);
         self.pad.look = Some(pause::pad_scale(o.pad_sensitivity));
         self.pad.invert = o.invert_pad;
+        // The advanced video screen's fourth option is shadows.
+        self.game.picture = game::Picture {
+            brightness: o.brightness,
+            shadows: o.advanced_video[3] != 0.0,
+        };
         if let Some(m) = &mut self.mission {
             m.set_options(o.subtitles, o.tutorials);
         }
@@ -7170,10 +7218,16 @@ impl Running {
             self.close_menu();
         }
         if news.quit {
-            // The game goes back to its main menu; the alpha can't start
-            // play again from its front end yet, so it closes.
-            eprintln!("pause: Quit: the alpha closes (the game goes back to its main menu)");
-            event_loop.exit();
+            // The game goes back to its main menu: with the front end
+            // (the whole game as it launches), the alpha starts again at
+            // it; without, it closes.
+            if self.flow.is_some() {
+                eprintln!("pause: Quit: back to the front end");
+                self.to_front_end = true;
+            } else {
+                eprintln!("pause: Quit: the alpha closes (it has no front end up)");
+                event_loop.exit();
+            }
         } else if news.resume && self.hud.menu {
             self.close_menu();
         }
@@ -7700,6 +7754,11 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
+        if std::mem::take(&mut state.to_front_end) {
+            relaunch_front_end();
+            event_loop.exit();
+            return;
+        }
         // Alt+Enter toggles fullscreen, as F11 does (the PC convention),
         // in play and menus alike; its Enter goes no further.
         if let WindowEvent::ModifiersChanged(m) = &event {
@@ -7911,6 +7970,16 @@ mod tests {
             args_loading(args, std::path::Path::new("new.toml")),
             ["--alpha", "--mission", "--load", "new.toml"]
         );
+    }
+
+    #[test]
+    fn quitting_to_the_front_end_keeps_the_launch_but_its_load() {
+        let args = ["--load", "old.toml", "--size", "1280x720", "--to-front-end"].map(String::from);
+        assert_eq!(
+            args_front_end(args),
+            ["--size", "1280x720", "--to-front-end"]
+        );
+        assert_eq!(args_front_end(Vec::new()), ["--to-front-end"]);
     }
 
     #[test]

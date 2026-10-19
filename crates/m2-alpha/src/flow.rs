@@ -87,10 +87,10 @@ pub struct Flow {
 }
 
 impl Flow {
-    /// Starts with the boot movies, or (`boot` false) straight in play;
-    /// the front end offers `hero` first; `subtitles` is the player's
-    /// option.
-    pub fn new(install: Install, boot: bool, hero: Hero, subtitles: bool) -> Self {
+    /// Starts with the boot movies (`movies`; else straight at the front
+    /// end), or (`boot` false) straight in play; the front end offers
+    /// `hero` first; `subtitles` is the player's option.
+    pub fn new(install: Install, boot: bool, movies: bool, hero: Hero, subtitles: bool) -> Self {
         let ffmpeg = crate::movie::ffmpeg();
         match &ffmpeg {
             Some(p) => eprintln!("movies: decoding with {}", p.display()),
@@ -102,7 +102,7 @@ impl Flow {
             stage: if boot { Stage::Boot } else { Stage::Game },
             install,
             ffmpeg,
-            boot: if boot {
+            boot: if boot && movies {
                 BOOT_MOVIES.into_iter().collect()
             } else {
                 VecDeque::new()
