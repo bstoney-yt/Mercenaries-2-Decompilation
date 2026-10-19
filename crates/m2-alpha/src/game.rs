@@ -2416,6 +2416,7 @@ fn take_up(
         (None, Weapon::Rpg) => combat.rpg.clone(),
         (None, Weapon::Rifle) => combat.carbine.clone(),
     };
+    let set = gun.feel.sound_set;
     let left = combat
         .equip_gun(gun, rounds)
         .map(|(g, n)| (g.slot(), n, g.template, g.model_hash, g.name));
@@ -2424,6 +2425,8 @@ fn take_up(
     if !walked {
         player.start_pickup();
     }
+    // Its sound set's `equip_pickup` cue.
+    combat.cue_sound(crate::combat::Sound::Pickup { set });
     eprintln!(
         "pickup: she takes up the {} ({:#x}) at {:.1} with {rounds} rounds{}",
         spec.map_or(format!("{weapon:?}"), |s| s.name.clone()),
@@ -3674,5 +3677,41 @@ mod lens_tests {
         }
         assert!((lens - 1.0).abs() < 0.01, "{lens}");
         assert_eq!(lens_step(0.7, None, true, 1.0), 1.0);
+    }
+
+    // Taking up a gun with the use key cues its set's `equip_pickup`;
+    // walking over it (its rounds only) cues none.
+    #[test]
+    fn a_gun_taken_up_cues_its_pickup_sound() {
+        let templates = m2_engine::Templates::default();
+        let mut flights = crate::flights::Flights::default();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        for walked in [true, false] {
+            let mut combat = Combat::default();
+            let pickup = crate::flights::Pickup {
+                from: 0,
+                what: crate::flights::Leaves {
+                    weapon: Some(crate::combat::Weapon::Rpg),
+                    gives: Some((crate::combat::Weapon::Rpg, 2)),
+                    ..Default::default()
+                },
+                at: Vec3::ZERO,
+                yaw: 0.0,
+            };
+            take_up(
+                &mut combat,
+                &mut flights,
+                &templates,
+                &mut player,
+                pickup,
+                walked,
+            );
+            let cued = combat
+                .take_sounds()
+                .iter()
+                .filter(|s| matches!(s, crate::combat::Sound::Pickup { .. }))
+                .count();
+            assert_eq!(cued, usize::from(!walked));
+        }
     }
 }

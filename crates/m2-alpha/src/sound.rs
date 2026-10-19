@@ -1714,7 +1714,14 @@ impl GameAudio {
                     continue;
                 }
                 Sound::Reload { set } => {
-                    self.play_reload(set);
+                    let cue = set.and_then(|s| self.gun_cues.reload(s));
+                    self.play_flat("reload", set, cue);
+                    continue;
+                }
+                Sound::Pickup { set } => {
+                    let cue =
+                        set.and_then(|s| self.gun_cues.cue(s, m2_engine::gun_sounds::EQUIP_PICKUP));
+                    self.play_flat("pickup", set, cue);
                     continue;
                 }
             };
@@ -1816,11 +1823,12 @@ impl GameAudio {
         false
     }
 
-    /// Her gun of sound set `set` reloaded: its reload cue
-    /// ([`GunCues::reload`]), heard as her own (flat), at its volume. A
-    /// cue not yet read is read on a thread and this reload goes unheard.
-    fn play_reload(&mut self, set: Option<u32>) {
-        let Some(cue) = set.and_then(|s| self.gun_cues.reload(s)) else {
+    /// A sound of her gun of sound set `set` heard as her own (flat), at
+    /// its volume: its reload cue ([`GunCues::reload`]) or the cue it plays
+    /// taken up (`equip_pickup`), `what` saying which. A cue not yet read
+    /// is read on a thread and this one goes unheard.
+    fn play_flat(&mut self, what: &str, set: Option<u32>, cue: Option<u32>) {
+        let Some(cue) = cue else {
             return;
         };
         match self.keys.get(&cue) {
@@ -1830,7 +1838,7 @@ impl GameAudio {
                 if let Some(buffer) = found.pick(pick).cloned() {
                     if self.shots_heard.insert(cue) {
                         eprintln!(
-                            "sound: reload, set {:08x}, cue {cue:08x}: sound {:08x} ({:.2} s)",
+                            "sound: {what}, set {:08x}, cue {cue:08x}: sound {:08x} ({:.2} s)",
                             set.unwrap_or(0),
                             buffer.hash,
                             buffer.seconds()

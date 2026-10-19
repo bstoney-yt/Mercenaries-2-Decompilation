@@ -17,8 +17,10 @@
 //! (`weapon_fire_tail`, a row most sets have) when it stops. The grapple's
 //! set answers its own events (`grapple_fire`, `grapple_attach`,
 //! `grapple_reel`, `grapple_reel_loop`, `grapple_loop`,
-//! `grapple_release`); [`GRAPPLE_FIRE`] is its shot. One event
-//! (`a639af36`, a cue of the `ui_hud` bank on most sets) is not named.
+//! `grapple_release`); [`GRAPPLE_FIRE`] is its shot. [`EQUIP_PICKUP`]
+//! (`a639af36`, a cue of the `ui_hud` bank on most sets) plays as the gun
+//! is taken up (name found by hashing guesses, gap-list sweep: one hit in
+//! 22,243 tries).
 //! `Param` is [`ANY`] on most rows. The assault rifles' NPC shot (set
 //! `7473fe68`, which hashes as `assaultrifle`) has six rows keyed
 //! `variant_1` to `variant_6` instead, giving three cues (records 11, 12
@@ -72,6 +74,9 @@ pub const GRAPPLE_FIRE: &str = "grapple_fire";
 /// Its gun reloaded: a row of the [`ANY`] set's, keyed by the set in
 /// `Param` ([`GunCues::reload`]).
 pub const RELOAD: &str = "reload";
+/// Its gun taken up off the ground: an interface sound (a cue of the
+/// `ui_hud` bank on most sets; named by hashing, gap-list sweep).
+pub const EQUIP_PICKUP: &str = "equip_pickup";
 
 /// Each sound set's cue per event.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -284,13 +289,21 @@ impl GunCues {
     }
 
     /// Every cue a gun plays as it fires (shots, the NPC shot's variants,
-    /// loops and tails) and reloads, each once, in order: what to read ahead so that
+    /// loops and tails), is taken up and reloads, each once, in order: what to read ahead so that
     /// no first shot waits on its cue.
     pub fn firing_cues(&self) -> Vec<u32> {
-        let events: Vec<u32> = [FIRE, FIRE_NPC, LOOP, LOOP_NPC, FIRE_TAIL, GRAPPLE_FIRE]
-            .iter()
-            .map(|e| name_hash(e))
-            .collect();
+        let events: Vec<u32> = [
+            FIRE,
+            FIRE_NPC,
+            LOOP,
+            LOOP_NPC,
+            FIRE_TAIL,
+            GRAPPLE_FIRE,
+            EQUIP_PICKUP,
+        ]
+        .iter()
+        .map(|e| name_hash(e))
+        .collect();
         let mut out: Vec<u32> = self
             .cues
             .iter()

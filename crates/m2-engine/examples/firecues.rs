@@ -44,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         g::FIRE_TAIL,
         g::GRAPPLE_FIRE,
         g::RELOAD,
+        g::EQUIP_PICKUP,
     ]
     .iter()
     .map(|e| (name_hash(e), *e))

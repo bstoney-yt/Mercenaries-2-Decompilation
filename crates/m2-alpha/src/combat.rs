@@ -1188,6 +1188,11 @@ pub enum Sound {
     Reload {
         set: Option<u32>,
     },
+    /// A gun taken up off the ground (heard as her own, flat): its sound
+    /// set, whose `equip_pickup` cue the `Sounds` table gives.
+    Pickup {
+        set: Option<u32>,
+    },
     /// The satellite-guided bomb landing.
     Bomb(Vec3),
     /// A building the bomb brought down coming apart.
@@ -2203,6 +2208,11 @@ impl Combat {
                 side: Side::Left,
             },
         }
+    }
+
+    /// Cues `s` to be heard with the fight's sounds.
+    pub fn cue_sound(&mut self, s: Sound) {
+        self.sounds.push(s);
     }
 
     /// How the weapon up in her hands sets her camera
