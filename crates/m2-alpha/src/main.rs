@@ -313,6 +313,11 @@ struct Options {
     /// With `--screenshot` on foot and `--gait`: she goes on this long
     /// (seconds, default 3), logging where she is each second.
     walk_seconds: Option<f32>,
+    /// With `--screenshot` on foot and `--gait`: put the nearest soldier
+    /// this many metres ahead of her at the start, at the water's height
+    /// there, and log each second whether he swims (`npc-swim:` lines).
+    /// For testing.
+    npc_swim: Option<f32>,
     /// With `--mission --after-contract`: this many seconds after the
     /// contract, take the pause menu's Medevac (if the scripts allow it).
     medevac: Option<f32>,
@@ -712,6 +717,9 @@ fn parse_args() -> anyhow::Result<Options> {
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
             "--contracts" => {
                 o.contracts = value()?.parse().context("--contracts expects a count")?
+            }
+            "--npc-swim" => {
+                o.npc_swim = Some(value()?.parse().context("--npc-swim expects metres")?)
             }
             "--mission-seconds" => {
                 o.mission_seconds = value()?
@@ -1633,6 +1641,8 @@ fn screenshot(
         let ticks = options
             .walk_seconds
             .map_or(180, |s| (s * 60.0).round() as usize);
+        // `--npc-swim`: the soldier put in the water.
+        let (mut swimmer, mut swim_gave_up): (Option<u32>, bool) = (None, false);
         for i in 0..ticks {
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
@@ -1702,6 +1712,74 @@ fn screenshot(
                 }),
                 ..combat::Trigger::default()
             };
+            // `--npc-swim`: once a soldier is in play, the nearest is put in
+            // the nearest water out of his depth (2 m deep) from `ahead`
+            // metres out, at its surface, and she 8 m back from him.
+            if let (Some(ahead), None, false) = (options.npc_swim, swimmer, swim_gave_up)
+                && game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .any(|n| n.soldier && n.alive && n.landed)
+                && let (Some(p), Some(w)) = (&game.scene.player, &game.scene.world)
+            {
+                let her = p.character.position;
+                let deep = |to: m2_math::glam::Vec3| {
+                    let s = w.physics.water_at(to.x, to.z)?;
+                    let (d, _) =
+                        w.physics
+                            .cast_ray(to.with_y(s + 30.0), -m2_math::glam::Vec3::Y, 400.0)?;
+                    (d - 30.0 > 2.0).then_some(s)
+                };
+                let found = (0..40).map(|r| ahead + r as f32 * 10.0).find_map(|r| {
+                    (0..16).find_map(|k| {
+                        let a = p.facing + k as f32 * std::f32::consts::TAU / 16.0;
+                        let way = m2_math::glam::Vec3::new(a.sin(), 0.0, a.cos());
+                        let to = her + way * r;
+                        deep(to).map(|s| (to.with_y(s), way))
+                    })
+                });
+                match found {
+                    Some((to, way)) => {
+                        let back = her + (to - her).with_y(0.0) - way * 8.0;
+                        let n = game
+                            .scene
+                            .people
+                            .npcs
+                            .iter_mut()
+                            .filter(|n| n.soldier && n.alive && n.landed)
+                            .min_by(|a, b| {
+                                let d = |n: &npc::Npc| n.character.position.distance_squared(her);
+                                d(a).total_cmp(&d(b))
+                            })
+                            .expect("a soldier is in play");
+                        eprintln!(
+                            "npc-swim: {:08x} put from {:.1} to {to:.1}, {:.0} m from where she was; she goes to {:.1}",
+                            n.spawn.unwrap_or(0),
+                            n.character.position,
+                            to.distance(her),
+                            back
+                        );
+                        n.character.position = to;
+                        n.character.velocity = m2_math::glam::Vec3::ZERO;
+                        n.alert = false;
+                        swimmer = n.spawn;
+                        if let Some(p) = game.scene.player.as_mut() {
+                            p.drop_at(back + m2_math::glam::Vec3::Y * 2.0);
+                            p.facing = way.x.atan2(way.z);
+                            p.yaw = p.facing;
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "npc-swim: no water out of his depth within {:.0} m",
+                            ahead + 390.0
+                        );
+                        swim_gave_up = true;
+                    }
+                }
+            }
             if options.pickup
                 && i == ticks - lead
                 && let Some(p) = game.scene.player.as_mut()
@@ -1736,6 +1814,50 @@ fn screenshot(
                     } else {
                         "on her feet"
                     }
+                );
+            }
+            // With `--npc-swim`, each second: where the soldier put in the
+            // water is, how deep it is over his feet, and what he does.
+            if options.npc_swim.is_some()
+                && i % 60 == 59
+                && let (Some(p), Some(w)) = (&game.scene.player, &game.scene.world)
+                && let Some(n) = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .find(|n| swimmer.is_some() && n.spawn == swimmer)
+            {
+                let at = n.character.position;
+                let water = w.physics.water_at(at.x, at.z);
+                let ground = w
+                    .physics
+                    .cast_ray(
+                        at.with_y(at.y.max(water.unwrap_or(at.y)) + 1.0),
+                        -m2_math::glam::Vec3::Y,
+                        400.0,
+                    )
+                    .map(|(d, _)| at.y.max(water.unwrap_or(at.y)) + 1.0 - d);
+                let clip = n
+                    .rig
+                    .animator
+                    .current()
+                    .map_or(0, |(c, _)| n.rig.clips[c].hash);
+                eprintln!(
+                    "npc-swim: {:.0} s {:08x} at {at:.2}, water {} over his feet, ground {} under the surface, {}, clip {clip:08x}, {:.1} m from her",
+                    (i + 1) as f32 / 60.0,
+                    n.spawn.unwrap_or(0),
+                    water.map_or("none".to_owned(), |s| format!("{:.2} m", s - at.y)),
+                    match (water, ground) {
+                        (Some(s), Some(g)) => format!("{:.2} m", s - g),
+                        _ => "-".to_owned(),
+                    },
+                    if n.swimming() {
+                        "swimming"
+                    } else {
+                        "on his feet"
+                    },
+                    at.distance(p.character.position)
                 );
             }
             if i % 30 == 0 {
@@ -3165,6 +3287,7 @@ fn mission_for_screenshot(
     let mut hijack_input = Input::default();
     let mut hijack_pad = hijack::Autopad::default();
     let (mut hijack_tries, mut hijack_use, mut hijack_t) = (0, None, 0.0);
+    let (mut hijack_running, mut hijack_shots) = (0.0f32, 0u32);
     let mut action_since: Option<u32> = None;
     let mut placed_tried = std::collections::HashSet::new();
     // Seconds she has been where --props-check hits the props.
@@ -3567,6 +3690,20 @@ fn mission_for_screenshot(
             if h.running() {
                 let prompts = h.view().map(|v| v.prompts).unwrap_or_default();
                 hijack_pad.answer(&prompts, &mut hijack_input, hijack_t);
+                // A picture each second and a half of the hijack (eight
+                // at most), with where she is in the vehicle.
+                hijack_running += tick;
+                if hijack_shots < 8 && hijack_running >= 1.5 * hijack_shots as f32 {
+                    hijack_shots += 1;
+                    render(backend, game, fov, aspect, None)?;
+                    let shot = out.with_file_name(format!("{stem}-hijack{hijack_shots}.ppm"));
+                    write_ppm(backend, &shot)?;
+                    eprintln!(
+                        "hijack shot {hijack_shots} at {hijack_running:.1} s: her in the vehicle {:.2?}",
+                        h.her_in_vehicle(game)
+                            .map(|(at, _, clip)| (at.to_array(), clip))
+                    );
+                }
             } else if auto.is_some() {
                 // With --autoplay she walks up to it herself (her goal
                 // for a vehicle the scripts mark), and her use key there

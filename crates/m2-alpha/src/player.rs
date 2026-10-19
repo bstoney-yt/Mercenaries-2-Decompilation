@@ -41,6 +41,11 @@ const TURN_RATE: f32 = 10.0;
 /// [`SWIM_STOP`]; between the two she keeps doing what she did, so the
 /// shore's slope doesn't flick her in and out. Invented: the game's own
 /// depth isn't read.
+/// When a state layer goes: how far under her feet her floor is looked
+/// for, and how near the floor after must be to the floor before for it
+/// to be the same one, metres. Invented.
+const FLOOR_LOOK: f32 = 60.0;
+const FLOOR_SAME: f32 = 0.25;
 pub const SWIM_START: f32 = 1.4;
 pub const SWIM_STOP: f32 = 1.15;
 /// How far her model's origin hangs under the surface while she swims,
@@ -48,13 +53,13 @@ pub const SWIM_STOP: f32 = 1.15;
 /// over its hips, from samples) about a third of a metre over the origin,
 /// so her back is at the waterline. Invented, by eye (at 0.9 m she was
 /// all under the water in the picture).
-const SWIM_FLOAT: f32 = 0.35;
+pub const SWIM_FLOAT: f32 = 0.35;
 /// Swimming speed, m/s: the stroke's own root speed (0.81 m/s, from
 /// samples) played at twice its rate. Invented.
-const SWIM_SPEED: f32 = 1.6;
+pub const SWIM_SPEED: f32 = 1.6;
 /// The stroke's rate while she floats still (the `Swim` stance's `Idle`
 /// gives no clip of its own). Invented.
-const SWIM_STILL_RATE: f32 = 0.35;
+pub const SWIM_STILL_RATE: f32 = 0.35;
 /// Camera: eye height looked at, distance behind, and closest it gets
 /// when something is in the way.
 const LOOK_HEIGHT: f32 = 1.6;
@@ -674,6 +679,49 @@ impl Player {
     pub fn floor_went(&mut self) {
         self.drop_at(self.character.position);
         self.floor_gone = true;
+        // She waits standing: not held in a jump's pose (the rig doesn't
+        // run while she waits).
+        self.leap = Leap::No;
+        if let Some((_, rig)) = &mut self.model {
+            rig.set_gait(Gait::Idle);
+            rig.advance(0.3);
+        }
+    }
+
+    /// The height of the floor or ground under her feet, within
+    /// [`FLOOR_LOOK`] metres.
+    pub fn floor_under(&self, physics: &Physics) -> Option<f32> {
+        let feet = self.character.position + Vec3::Y * 0.5;
+        physics
+            .cast_ray(feet, -Vec3::Y, FLOOR_LOOK)
+            .map(|(d, _)| feet.y - d)
+    }
+
+    /// A state layer went: the floor under her was at `before` with its
+    /// models and is at `after` without ([`floor_under`](Self::floor_under)).
+    /// If what was under her went with it she waits where her floor was
+    /// for what the next layers put there ([`floor_went`](Self::floor_went));
+    /// true if so. In the air over a floor that stays (a jump, playtest
+    /// 8: the pad's A that closed PmcCon001's fanfare jumped her as the
+    /// villa's layers went, and she hung in the jump's pose till black),
+    /// nothing changes.
+    pub fn layer_went(&mut self, before: Option<f32>, after: Option<f32>) -> bool {
+        let at = self.character.position.y;
+        let went = match (before, after) {
+            (Some(b), Some(a)) if (a - b).abs() < FLOOR_SAME => false,
+            (Some(_), _) => true,
+            // Nothing under her before either (put down on what hasn't
+            // come yet): as she stands, nothing within a step.
+            (None, a) => a.is_none_or(|a| at - a > 1.0),
+        };
+        if !went {
+            return false;
+        }
+        self.floor_went();
+        if let Some(b) = before.filter(|&b| at > b) {
+            self.character.position.y = b + 0.05;
+        }
+        true
     }
 
     /// One fixed tick of `dt` seconds.
@@ -1303,6 +1351,35 @@ mod tests {
         // The camera is behind her and above.
         let eye = p.eye();
         assert!(eye.x < at.x && eye.y > at.y, "{eye}");
+    }
+
+    // Playtest 8: the pad's A that closed the contract's fanfare jumped
+    // her as the villa's layers went, and the 1.5 m look under her feet
+    // found nothing: she hung in the jump's pose until black. In the air
+    // over a floor that stays she comes down; if it went, she waits where
+    // it was, standing.
+    #[test]
+    fn a_layer_going_while_she_jumps_over_her_floor_leaves_her_jumping() {
+        let physics = ground();
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        let dt = 1.0 / 60.0;
+        for _ in 0..usize::from(SETTLED) {
+            p.update(&physics, Intent::default(), dt);
+        }
+        assert!(p.landed);
+        let floor = p.floor_under(&physics).unwrap();
+        p.character.position.y = floor + 1.6;
+        let before = p.floor_under(&physics);
+        assert!(!p.layer_went(before, p.floor_under(&physics)));
+        assert!(p.landed);
+        for _ in 0..90 {
+            p.update(&physics, Intent::default(), dt);
+        }
+        assert!((p.character.position.y - floor).abs() < 0.2, "came down");
+        p.character.position.y = floor + 1.6;
+        assert!(p.layer_went(Some(floor), None));
+        assert!(!p.landed);
+        assert!((p.character.position.y - floor).abs() < 0.1, "waits on it");
     }
 
     #[test]
