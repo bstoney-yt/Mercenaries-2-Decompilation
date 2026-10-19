@@ -40,6 +40,16 @@
 //! cues; how the game numbers a shooter's variant is invented here (a
 //! number of theirs, modulo the variants the set has). Not checked
 //! against the game's code.
+//!
+//! 7 of the 66 firing and reload cues the table names find no sound
+//! (gap-list sweep, `firecues` example): no cue table in `vz.wad`,
+//! `shell.wad`, `English.wad` or `Loading.wad` has a record for them.
+//! They are two `weapon_fire_tail` cues shared by 27 sets (272 guns), the
+//! miniguns' `weapon_loop_npc`, the RPG family's and the shotgun's
+//! `reload`, and the shots of two sets no weapon template uses. In the
+//! data they sound of nothing; the alpha plays nothing for them either
+//! (a shot of theirs would fall back to the rifle's, but no gun fires
+//! those two sets).
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
@@ -244,6 +254,33 @@ impl GunCues {
 
     pub fn is_empty(&self) -> bool {
         self.cues.is_empty()
+    }
+
+    /// The sets and events (name hashes) that play cue `cue`, sorted; a
+    /// reload's event is [`RELOAD`]'s.
+    pub fn uses_of(&self, cue: u32) -> Vec<(u32, u32)> {
+        let reload = name_hash(RELOAD);
+        let mut out: Vec<(u32, u32)> = self
+            .cues
+            .iter()
+            .filter(|(_, c)| **c == cue)
+            .map(|(&k, _)| k)
+            .chain(
+                self.variants
+                    .iter()
+                    .filter(|(_, v)| v.contains(&cue))
+                    .map(|(&k, _)| k),
+            )
+            .chain(
+                self.reloads
+                    .iter()
+                    .filter(|(_, c)| **c == cue)
+                    .map(|(&set, _)| (set, reload)),
+            )
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Every cue a gun plays as it fires (shots, the NPC shot's variants,
