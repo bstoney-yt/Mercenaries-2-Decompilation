@@ -203,6 +203,14 @@ pub enum Command {
         haste: Option<f32>,
     },
     ExitVehicle(u32),
+    /// A person keeps near `target` (`Ai.Role` `Follow`: a VIP being
+    /// delivered, `MrxFollow`), within `near` metres (its
+    /// `MoveDistance`); `None`: no longer following (another role).
+    Follow {
+        guid: u32,
+        target: Option<u32>,
+        near: f32,
+    },
     /// Open a gate or door (`Object.OpenGate`): PmcCon001's villa doors
     /// as the player comes near them.
     OpenGate(u32),
@@ -2486,6 +2494,27 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // role (all but the driver for passengers) step out beside it, and
     // the callback runs on the next tick with its data unpacked (when the
     // engine calls it, and with what more, is inferred).
+    // Ai.Role{ AIGuid, Role, Target, MinDistance, MoveDistance,
+    // MaxDistance, ... }: "Follow" keeps them near the target (the game's
+    // follower: `MrxFollow`'s VIP); another role ("Idle") ends it. The
+    // rest of a role (its priorities, the callback when cancelled) is not
+    // kept.
+    add(&ai, "Role", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([]);
+        };
+        let Some(guid) = id(t.raw_get::<Value>("AIGuid").ok().as_ref()) else {
+            return values([]);
+        };
+        let follow = matches!(
+            t.raw_get::<Value>("Role")?,
+            Value::String(s) if s.as_bytes().eq_ignore_ascii_case(b"follow")
+        );
+        let target = id(t.raw_get::<Value>("Target").ok().as_ref()).filter(|_| follow);
+        let near = num(t.raw_get::<Value>("MoveDistance").ok().as_ref()).unwrap_or(4.0);
+        w.commands.push(Command::Follow { guid, target, near });
+        values([Value::Boolean(true)])
+    })?;
     add(&ai, "Deploy", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([]);
@@ -3174,9 +3203,24 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         end
         function F.RemoveObject(f, g)
             if not ok(f) then return end
+            -- A list of them (`Player.GetAllCharacters()`): each.
+            if type(g) == "table" then
+                for _, one in ipairs(g) do F.RemoveObject(f, one) end
+                return
+            end
             for i, v in ipairs(f.objs) do
                 if v == g then table.remove(f.objs, i) return end
             end
+        end
+        -- A copy to change on its own (the release objective's targets
+        -- still far from her, `MrxTaskObjectiveRelease`).
+        function F.Copy(f)
+            if not ok(f) then return F.Create() end
+            local c = F.Create()
+            for i, v in ipairs(f.objs) do c.objs[i] = v end
+            for k, v in pairs(f.ex) do c.ex[k] = v end
+            c.players, c.label = f.players, f.label
+            return c
         end
         function F.GetObjects(f)
             local r = {}
@@ -4418,6 +4462,59 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((china, all, same, other), (1, 2, true, false));
+    }
+
+    #[test]
+    fn a_follow_role_reaches_the_game_and_another_role_ends_it() {
+        // `MrxFollow` gives a released VIP `Follow` on her, and `Idle`
+        // when it lets him go.
+        let (host, world) = setup();
+        host.lua()
+            .load(
+                r#"Ai.Role({ AIGuid = Sys.StringToGuid("0x70"), Role = "Follow",
+                    Target = Sys.StringToGuid("0x1"), MinDistance = 2, MoveDistance = 4,
+                    MaxDistance = 30 })
+                Ai.Role({ AIGuid = Sys.StringToGuid("0x70"), Role = "Idle" })"#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [
+                Command::Follow {
+                    guid: 0x70,
+                    target: Some(1),
+                    near: 4.0
+                },
+                Command::Follow {
+                    guid: 0x70,
+                    target: None,
+                    near: 4.0
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_copied_object_filter_changes_on_its_own() {
+        // `MrxTaskObjectiveRelease` copies its targets' filter, takes the
+        // players out of the copy (a list of them), and drops each target
+        // from it as she comes near.
+        let (host, _) = setup();
+        let (orig, copy, players): (i64, i64, bool) = host
+            .lua()
+            .load(
+                r#"local f = ObjectFilter.Create()
+                ObjectFilter.AddObject(f, Sys.StringToGuid("0x70"))
+                ObjectFilter.AddObject(f, Sys.StringToGuid("0x71"))
+                ObjectFilter.UsePlayers(f, true)
+                local c = ObjectFilter.Copy(f)
+                ObjectFilter.RemoveObject(c, { Sys.StringToGuid("0x70") })
+                return #f.objs, #c.objs, c.players"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((orig, copy, players), (2, 1, true));
     }
 
     #[test]
