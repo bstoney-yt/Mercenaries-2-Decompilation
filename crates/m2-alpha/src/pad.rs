@@ -41,8 +41,16 @@
 //!
 //! In the front end and the menus, A is Enter, B Escape and the d-pad the
 //! arrows ([`MenuKey`]).
+//!
+//! On Android there is no XInput: a controller (an Xbox pad over
+//! Bluetooth, or any the phone takes as a gamepad) arrives as window
+//! events, gathered by [`Events`] into the same [`PadState`]. Its buttons
+//! are Android's `KEYCODE_BUTTON_*` keys and its sticks, triggers and hat
+//! `AXIS_*` motions (Android's published numbers; the axes the Xbox pad
+//! uses, from Android's controller documentation, not checked on the
+//! phone yet).
 
-use m2_sys::xinput::{PadState, buttons as xb};
+use m2_sys::xinput::{LEFT_DEAD_ZONE, PadState, RIGHT_DEAD_ZONE, buttons as xb};
 
 use crate::input::{Action, Input};
 
@@ -190,6 +198,8 @@ pub struct Pad {
     /// swapped.
     pub look: Option<f64>,
     pub invert: bool,
+    /// The controller the window's events report (Android's).
+    pub events: Events,
 }
 
 impl Pad {
@@ -197,11 +207,11 @@ impl Pad {
     /// picks the layout; `dt` is the seconds since the last read. Answers
     /// the menu keys pressed since then ([`Pad::menu_keys`]).
     pub fn poll(&mut self, input: &mut Input, driving: bool, dt: f64) -> Vec<MenuKey> {
-        let state = m2_sys::xinput::poll();
+        let state = m2_sys::xinput::poll().or_else(|| self.events.state());
         if state.is_some() != self.connected {
             self.connected = state.is_some();
             eprintln!(
-                "pad: Xbox controller {}",
+                "pad: controller {}",
                 if self.connected {
                     "connected"
                 } else {
@@ -280,6 +290,128 @@ impl Pad {
         .filter(|(b, _)| b.held(now) && !b.held(before))
         .map(|(_, k)| k)
         .collect()
+    }
+}
+
+/// Android's `MotionEvent.AXIS_*` numbers the pad reads.
+mod axis {
+    pub const X: u32 = 0;
+    pub const Y: u32 = 1;
+    pub const Z: u32 = 11;
+    pub const RZ: u32 = 14;
+    pub const HAT_X: u32 = 15;
+    pub const HAT_Y: u32 = 16;
+    pub const LTRIGGER: u32 = 17;
+    pub const RTRIGGER: u32 = 18;
+    pub const GAS: u32 = 22;
+    pub const BRAKE: u32 = 23;
+    /// One past the highest.
+    pub const COUNT: usize = 24;
+}
+
+/// Android's `KeyEvent.KEYCODE_BUTTON_*` numbers, with the XInput bit each
+/// stands for (`None`: the digital triggers, L2 and R2).
+const KEYS: [(u32, Option<u16>); 12] = [
+    (96, Some(xb::A)),
+    (97, Some(xb::B)),
+    (99, Some(xb::X)),
+    (100, Some(xb::Y)),
+    (102, Some(xb::LEFT_SHOULDER)),
+    (103, Some(xb::RIGHT_SHOULDER)),
+    (104, None),
+    (105, None),
+    (106, Some(xb::LEFT_THUMB)),
+    (107, Some(xb::RIGHT_THUMB)),
+    (108, Some(xb::START)),
+    (109, Some(xb::BACK)),
+];
+const KEY_L2: u32 = 104;
+/// Android's guide button (the Xbox button): taken, so the phone doesn't
+/// act on it, and otherwise unused, as on the PC.
+const KEY_MODE: u32 = 110;
+
+/// A controller reported as window events (Android's): its buttons as
+/// they go down and up, and its axes as they move.
+#[derive(Debug, Default)]
+pub struct Events {
+    /// Any of its events seen: a controller is there.
+    seen: bool,
+    buttons: u16,
+    /// L2 and R2 as buttons, for pads whose triggers have no axis.
+    digital_triggers: [bool; 2],
+    axes: [f32; axis::COUNT],
+}
+
+impl Events {
+    /// A key event with Android key code `code`: true when it is the
+    /// pad's (and so taken).
+    pub fn key(&mut self, code: u32, pressed: bool) -> bool {
+        if code == KEY_MODE {
+            self.seen = true;
+            return true;
+        }
+        let Some(&(_, bit)) = KEYS.iter().find(|(c, _)| *c == code) else {
+            return false;
+        };
+        self.seen = true;
+        match bit {
+            Some(bit) if pressed => self.buttons |= bit,
+            Some(bit) => self.buttons &= !bit,
+            None => self.digital_triggers[usize::from(code != KEY_L2)] = pressed,
+        }
+        true
+    }
+
+    /// Axis `id` (Android's number) moved to `value`.
+    pub fn axis(&mut self, id: u32, value: f32) {
+        if let Some(slot) = self.axes.get_mut(id as usize) {
+            *slot = value;
+            self.seen = true;
+        }
+    }
+
+    /// The pad as the events left it, in XInput's terms (the same dead
+    /// zones and trigger threshold); `None` before any event.
+    pub fn state(&self) -> Option<PadState> {
+        if !self.seen {
+            return None;
+        }
+        let a = |id: u32| self.axes[id as usize];
+        // Android's sticks are -1..=1 with down positive; XInput's raw
+        // axes are -32768..=32767 with up positive.
+        let raw = |v: f32| (v.clamp(-1.0, 1.0) * 32767.0) as i16;
+        let stick = |x: u32, y: u32, dead| m2_sys::xinput::stick(raw(a(x)), raw(-a(y)), dead);
+        let trigger = |analog: f32, digital: bool| {
+            if digital {
+                1.0
+            } else {
+                m2_sys::xinput::trigger((analog.clamp(0.0, 1.0) * 255.0) as u8)
+            }
+        };
+        let mut buttons = self.buttons;
+        for (held, bit) in [
+            (a(axis::HAT_Y) < -0.5, xb::DPAD_UP),
+            (a(axis::HAT_Y) > 0.5, xb::DPAD_DOWN),
+            (a(axis::HAT_X) < -0.5, xb::DPAD_LEFT),
+            (a(axis::HAT_X) > 0.5, xb::DPAD_RIGHT),
+        ] {
+            if held {
+                buttons |= bit;
+            }
+        }
+        Some(PadState {
+            buttons,
+            left: stick(axis::X, axis::Y, LEFT_DEAD_ZONE),
+            right: stick(axis::Z, axis::RZ, RIGHT_DEAD_ZONE),
+            left_trigger: trigger(
+                a(axis::LTRIGGER).max(a(axis::BRAKE)),
+                self.digital_triggers[0],
+            ),
+            right_trigger: trigger(
+                a(axis::RTRIGGER).max(a(axis::GAS)),
+                self.digital_triggers[1],
+            ),
+        })
     }
 }
 
@@ -469,6 +601,54 @@ mod tests {
             [MenuKey::Enter, MenuKey::Down]
         );
         assert!(Pad::menu_keys(&press(xb::B), &press(xb::B)).is_empty());
+    }
+
+    #[test]
+    fn android_events_make_the_same_pad_state() {
+        let mut ev = Events::default();
+        assert_eq!(ev.state(), None, "no controller before its events");
+        // Android's KEYCODE_BUTTON_A down, then up; a keyboard's key isn't
+        // the pad's.
+        assert!(ev.key(96, true));
+        assert!(!ev.key(29, true), "KEYCODE_A, a letter");
+        assert!(ev.state().unwrap().held(xb::A));
+        assert!(ev.key(96, false));
+        assert!(!ev.state().unwrap().held(xb::A));
+        assert!(ev.key(110, true), "the guide button is taken");
+        // The left stick pushed up (Android's Y negative) and right; the
+        // right stick (Z, RZ) inside its dead zone.
+        ev.axis(axis::X, 1.0);
+        ev.axis(axis::Y, -1.0);
+        ev.axis(axis::Z, 0.1);
+        let s = ev.state().unwrap();
+        assert!((s.left[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3);
+        assert!((s.left[1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3);
+        assert_eq!(s.right, [0.0, 0.0]);
+        // The hat is the d-pad; the brake axis the left trigger.
+        ev.axis(axis::HAT_Y, 1.0);
+        ev.axis(axis::HAT_X, -1.0);
+        ev.axis(axis::BRAKE, 1.0);
+        let s = ev.state().unwrap();
+        assert!(s.held(xb::DPAD_DOWN) && s.held(xb::DPAD_LEFT) && !s.held(xb::DPAD_UP));
+        assert_eq!(s.left_trigger, 1.0);
+        assert_eq!(s.right_trigger, 0.0);
+        // R2 as a button pulls the right trigger all the way.
+        assert!(ev.key(105, true));
+        assert_eq!(ev.state().unwrap().right_trigger, 1.0);
+        // An axis Android has but the pad doesn't know is ignored.
+        ev.axis(200, 1.0);
+    }
+
+    #[test]
+    fn android_events_feed_the_layout() {
+        let mut ev = Events::default();
+        ev.key(103, true);
+        ev.axis(axis::RTRIGGER, 0.9);
+        let mut pad = Pad::default();
+        let mut input = Input::default();
+        pad.feed(&mut input, ev.state().unwrap(), false, 0.016);
+        assert!(input.held(Action::Fire));
+        assert!(input.take_pressed(Action::SwitchWeapon));
     }
 
     #[test]

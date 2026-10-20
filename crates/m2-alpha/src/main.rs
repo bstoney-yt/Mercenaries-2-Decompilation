@@ -38,6 +38,8 @@
 //! `--fight` she shoots the nearest soldier, fires a rocket at a vehicle and
 //! throws a grenade.
 
+#[cfg(target_os = "android")]
+mod android;
 mod autoplay;
 mod binoculars;
 mod breakables;
@@ -104,7 +106,9 @@ use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, Window, WindowId};
+#[cfg(not(target_os = "android"))]
+use winit::window::CursorGrabMode;
+use winit::window::{Window, WindowId};
 
 use camera::FlyCamera;
 use config::Config;
@@ -431,12 +435,12 @@ enum SatelliteShot {
 /// A `--satellite` call's spot lies this far ahead of her, metres.
 const SATELLITE_AHEAD: f32 = 45.0;
 
-fn parse_args() -> anyhow::Result<Options> {
+fn parse_args(given: &[String]) -> anyhow::Result<Options> {
     let mut o = Options {
         skip_mode_off: true,
         ..Options::default()
     };
-    let mut args = std::env::args().skip(1);
+    let mut args = given.iter().cloned();
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
         match arg.as_str() {
@@ -792,8 +796,8 @@ fn parse_args() -> anyhow::Result<Options> {
         "--skip-mode-off",
         "--skip-mode-on",
     ];
-    if std::env::args()
-        .skip(1)
+    if given
+        .iter()
         .all(|a| !a.starts_with("--") || PLAIN.contains(&a.as_str()))
     {
         o.alpha = true;
@@ -845,9 +849,21 @@ const PLACED_CHECK_EVERY: f32 = 5.0;
 /// are hit before they are, seconds: for the contract's layers to be in.
 const PROPS_CHECK_AFTER: f32 = 20.0;
 
+// The Android build's entry point is `android::android_main`.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
-    let mut options = parse_args()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    run(&args, EventLoop::new)
+}
+
+/// The game, given its arguments and how to make its event loop (the
+/// Android build hands over the activity's).
+fn run(
+    args: &[String],
+    event_loop: impl FnOnce() -> Result<EventLoop<()>, winit::error::EventLoopError>,
+) -> anyhow::Result<()> {
+    let mut options = parse_args(args)?;
     combat::use_attach_frame(!options.hands_grip);
     let config_path = options
         .config_path
@@ -941,7 +957,7 @@ fn main() -> anyhow::Result<()> {
         return screenshot(&config, install.as_ref(), &mode, &options, out);
     }
 
-    let event_loop = EventLoop::new()?;
+    let event_loop = event_loop()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
         config,
@@ -6847,6 +6863,13 @@ impl App {
 
 impl Running {
     fn set_mouse_look(&mut self, on: bool) {
+        // winit has no grab on Android: the activity captures the pointer.
+        #[cfg(target_os = "android")]
+        let grab = {
+            android::capture_pointer(on);
+            Ok::<(), ()>(())
+        };
+        #[cfg(not(target_os = "android"))]
         let grab = if on {
             self.window
                 .set_cursor_grab(CursorGrabMode::Locked)
@@ -7838,6 +7861,18 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
+        // A game controller's buttons: Android reports them as keys of its
+        // own, which go to the pad and nowhere else.
+        if let WindowEvent::KeyboardInput { event: key, .. } = &event
+            && let PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Android(code)) =
+                key.physical_key
+            && state
+                .pad
+                .events
+                .key(code, key.state == ElementState::Pressed)
+        {
+            return;
+        }
         // Alt+Enter toggles fullscreen, as F11 does (the PC convention),
         // in play and menus alike; its Enter goes no further.
         if let WindowEvent::ModifiersChanged(m) = &event {
@@ -8018,8 +8053,27 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
-        if let (Some(state), DeviceEvent::MouseMotion { delta }) = (self.state.as_mut(), event) {
-            state.input.mouse_motion(delta.0, delta.1);
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        match event {
+            DeviceEvent::MouseMotion { delta } => state.input.mouse_motion(delta.0, delta.1),
+            // A game controller's sticks, triggers and hat (Android's AXIS_*
+            // numbers, from the patched winit of the Android build).
+            DeviceEvent::Motion { axis, value } if cfg!(target_os = "android") => {
+                state.pad.events.axis(axis, value as f32);
+            }
+            _ => {}
+        }
+    }
+
+    /// Android takes the window away when the app goes to the background;
+    /// the renderer can't follow it to a new one yet, so the game closes.
+    #[cfg(target_os = "android")]
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_some() {
+            eprintln!("sent to the background: closing");
+            event_loop.exit();
         }
     }
 

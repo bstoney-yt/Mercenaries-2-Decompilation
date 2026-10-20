@@ -264,7 +264,8 @@ impl Config {
     /// beside the executable.
     pub fn file_beside(name: &str) -> PathBuf {
         let settings = Self::default_path();
-        if settings.is_file() {
+        // Android: the game's folder, the working directory.
+        if settings.is_file() || cfg!(target_os = "android") {
             return settings.with_file_name(name);
         }
         std::env::current_exe()
