@@ -1893,16 +1893,24 @@ end
     /// it, and `WifPmcInterior` finds her as `Vehicle.GetRiders(it)[1]`.
     pub fn crews_aboard(&self) -> Vec<CrewAboard> {
         let w = self.world.borrow();
+        // Who rides what, in one pass over the objects: asked of every
+        // object per crew, this ran each tick over the whole island's
+        // objects for each crewed one, and play on a phone at 1 fps.
+        let mut by_vehicle: HashMap<u32, Vec<(u32, &String)>> = HashMap::new();
+        for (&r, o) in &w.objects {
+            if let Some(g) = o.vehicle
+                && o.alive
+                && Some(r) != w.player
+                && w.crews.contains_key(&g)
+            {
+                by_vehicle.entry(g).or_default().push((r, &o.name));
+            }
+        }
         let mut out: Vec<CrewAboard> = w
             .crews
             .iter()
             .filter_map(|(&g, crew)| {
-                let mut riders: Vec<(u32, &String)> = w
-                    .objects
-                    .iter()
-                    .filter(|(r, o)| o.vehicle == Some(g) && o.alive && Some(**r) != w.player)
-                    .map(|(&r, o)| (r, &o.name))
-                    .collect();
+                let mut riders = by_vehicle.remove(&g)?;
                 riders.sort_unstable();
                 let mut free: Vec<&(String, String)> = crew.iter().collect();
                 let aboard: Vec<(String, u32, String)> = riders
@@ -2814,6 +2822,50 @@ mod tests {
         )
         .unwrap();
         assert!(m.crews_aboard().is_empty());
+    }
+
+    #[test]
+    fn each_crew_aboard_is_its_own_objects_riders_by_object() {
+        // Two crewed objects at once (the HQ's starter and the villa's
+        // tank): each lists only its own riders, the objects in guid
+        // order, with others (the island's) about that ride nothing.
+        let hq = Entity {
+            guid: 0xc73ad,
+            name: "HqInterior".into(),
+            crew: vec![("a651ff78".into(), "Fiona Taylor".into())],
+            ..villa_tank()
+        };
+        let tank = villa_tank();
+        let mut data = GameData::default();
+        data.layers
+            .insert("layers".into(), vec![tank.clone(), hq.clone()]);
+        let m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        for g in 0x1000..0x1400 {
+            m.world()
+                .borrow_mut()
+                .insert(g, crate::api::Object::new("VZ Soldier", [0.0; 3]));
+        }
+        place(m.world(), &[tank, hq], true);
+        let aboard = m.crews_aboard();
+        let objects: Vec<u32> = aboard.iter().map(|a| a.0).collect();
+        assert_eq!(objects, [0xc73ad, 0xfaa53]);
+        let seats = |i: usize| -> Vec<(String, String)> {
+            let mut s: Vec<_> = aboard[i]
+                .1
+                .iter()
+                .map(|(seat, _, t)| (seat.clone(), t.clone()))
+                .collect();
+            s.sort();
+            s
+        };
+        assert_eq!(seats(0), [("a651ff78".into(), "Fiona Taylor".into())]);
+        assert_eq!(
+            seats(1),
+            [
+                ("seat_driver".into(), "VZ Tank Commander".into()),
+                ("seat_gunner".into(), "VZ Soldier".into()),
+            ]
+        );
     }
 
     #[test]
