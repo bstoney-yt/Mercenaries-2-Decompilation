@@ -941,7 +941,14 @@ impl Autoplay {
                 && let Some(i) = vehicles
                     .iter()
                     .enumerate()
-                    .filter(|(_, v)| v.guid.is_some() && !v.wrecked && !v.spec.is_boat())
+                    // Not one she brought goods there in: that is the
+                    // delivery, done by leaving it (PirCon002 round 46).
+                    .filter(|&(i, v)| {
+                        v.guid.is_some()
+                            && !v.wrecked
+                            && !v.spec.is_boat()
+                            && !game.scene.props.carrying(i)
+                    })
                     .filter_map(|(i, _)| {
                         let d = vehicle_at(game, i)?.w_axis.truncate().distance(m.at);
                         (d < TAKE_NEAR).then_some((i, d))
