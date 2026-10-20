@@ -135,6 +135,12 @@ const RIDE_NEAR: f32 = 40.0;
 /// One of the scripts' vehicles she hasn't driven is taken from this far,
 /// metres: they brought it for her.
 const RIDE_FRESH: f32 = 150.0;
+/// A vehicle coming the other way within this far ahead (metres) and this
+/// far either side of her line (metres) has her swerve this far to the
+/// right of her way (radians) and ease off (invented).
+const ONCOMING_AHEAD: f32 = 35.0;
+const ONCOMING_SIDE: f32 = 3.0;
+const SWERVE: f32 = 0.35;
 /// Waiting this long (seconds) in a vehicle she drove to a place to
 /// deliver, she gets out of it.
 const EXIT_AFTER: f32 = 4.0;
@@ -1295,8 +1301,17 @@ impl Autoplay {
             (Some(w), Some((id, hull))) => clear_way(&w.physics, id, m, hull, angle, speed),
             _ => angle,
         };
+        // Another vehicle coming the other way in her lane: she keeps to
+        // the right of it and eases off, as a driver would (PirCon002's
+        // laden truck met a car head-on at 22 m/s closing, round 58).
+        let oncoming = oncoming(game, i, m);
+        let angle = if oncoming {
+            angle.max(0.0) + SWERVE
+        } else {
+            angle
+        };
         let mut steer = (angle * 2.0).clamp(-1.0, 1.0);
-        let mut throttle = 1.0;
+        let mut throttle = if oncoming { 0.3 } else { 1.0 };
         if (d < SLOW_NEAR && speed > SLOW) || (angle.abs() > 0.8 && speed > SLOW) {
             throttle = 0.2;
         }
@@ -2470,6 +2485,25 @@ fn vehicle_state(game: &Game, i: usize) -> Option<(Mat4, f32)> {
 
 /// How far `at` lies off the heading of a vehicle at `m` (radians,
 /// positive to its right), and how far away (metres).
+/// Whether a vehicle other than `i` (whose place is `m`) is ahead of it
+/// within [`ONCOMING_AHEAD`] metres, within [`ONCOMING_SIDE`] of its line,
+/// heading the other way.
+fn oncoming(game: &Game, i: usize, m: Mat4) -> bool {
+    let to_local = m.inverse();
+    let forward = m.transform_vector3(Vec3::Z).with_y(0.0).normalize_or_zero();
+    (0..game.scene.vehicles.len())
+        .filter(|&j| j != i)
+        .filter_map(|j| vehicle_at(game, j))
+        .any(|t| {
+            let l = to_local.transform_point3(t.w_axis.truncate());
+            let theirs = t.transform_vector3(Vec3::Z).with_y(0.0).normalize_or_zero();
+            l.z > 0.0
+                && l.z < ONCOMING_AHEAD
+                && l.x.abs() < ONCOMING_SIDE
+                && theirs.dot(forward) < -0.5
+        })
+}
+
 fn heading_to(m: Mat4, at: Vec3) -> (f32, f32) {
     let f = m
         .transform_vector3(Vec3::Z)
