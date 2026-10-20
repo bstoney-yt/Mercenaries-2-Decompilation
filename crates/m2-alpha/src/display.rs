@@ -237,14 +237,27 @@ pub fn current(window: &Window) -> Video {
     }
 }
 
-/// `size` no larger than `monitor` (whose own mode a window can't
-/// exceed), nor smaller than 320 x 200.
+/// A window of `size` that fits on `monitor` with its frame: no more
+/// than nine tenths of the monitor's own mode either way (scaled down
+/// whole, keeping its shape), nor smaller than 320 x 200.
 pub fn fit(size: (u32, u32), monitor: Option<&MonitorHandle>) -> PhysicalSize<u32> {
-    let (mw, mh) = monitor.map_or((u32::MAX, u32::MAX), |m| (m.size().width, m.size().height));
-    PhysicalSize::new(
-        size.0.clamp(320.min(mw), mw.max(1)),
-        size.1.clamp(200.min(mh), mh.max(1)),
-    )
+    let room = monitor.map(|m| (m.size().width * 9 / 10, m.size().height * 9 / 10));
+    let (w, h) = fit_in(size, room);
+    PhysicalSize::new(w, h)
+}
+
+fn fit_in((w, h): (u32, u32), room: Option<(u32, u32)>) -> (u32, u32) {
+    let (w, h) = (w.max(320), h.max(200));
+    match room {
+        Some((rw, rh)) if rw > 0 && rh > 0 && (w > rw || h > rh) => {
+            let scale = (f64::from(rw) / f64::from(w)).min(f64::from(rh) / f64::from(h));
+            (
+                ((f64::from(w) * scale) as u32).max(1),
+                ((f64::from(h) * scale) as u32).max(1),
+            )
+        }
+        _ => (w, h),
+    }
 }
 
 /// The mode a kept [`Video`] means, from `now` (the window's): a window;
@@ -276,26 +289,53 @@ pub fn apply(window: &Window, video: Video, config: &mut WindowConfig) -> String
     } else {
         0
     };
-    show(window, mode, (video.width, video.height), rate)
+    show(window, mode, (video.width, video.height), rate).0
 }
 
 /// Puts `window` into `mode` (a window of `size`, or exclusive at `size`
-/// and `rate`); what it did, for the log.
-fn show(window: &Window, mode: DisplayMode, size: (u32, u32), rate: u32) -> String {
+/// and `rate`); what it did, for the log, and the window's size asked.
+fn show(
+    window: &Window,
+    mode: DisplayMode,
+    size: (u32, u32),
+    rate: u32,
+) -> (String, Option<(u32, u32)>) {
     let monitor = window.current_monitor();
     let (full, how) = fullscreen_for(monitor.clone(), mode, size, rate);
     match full {
         Some(full) => {
+            set_pending(None);
             window.set_fullscreen(Some(full));
-            how
+            (how, None)
         }
         None => {
+            // Out of exclusive, the monitor is still at its mode, not
+            // the desktop's a window fits on: the size was fitted when
+            // it was a window, or at the start.
+            let size = if self::mode(window) == DisplayMode::Exclusive {
+                size
+            } else {
+                let s = fit(size, monitor.as_ref());
+                (s.width, s.height)
+            };
             window.set_fullscreen(None);
             window.set_maximized(false);
-            let size = fit(size, monitor.as_ref());
-            let _ = window.request_inner_size(size);
-            format!("a {}x{} window", size.width, size.height)
+            let _ = window.request_inner_size(PhysicalSize::new(size.0, size.1));
+            set_pending(Some((size, 3)));
+            (format!("a {}x{} window", size.0, size.1), Some(size))
         }
+    }
+}
+
+/// Back to a window: the size asked for, and how many more times to ask.
+/// Leaving fullscreen, Windows puts back the place the window had before
+/// it, which can come after our size and undo it (a window created
+/// fullscreen had no place but its first). One window a process.
+static PENDING: std::sync::Mutex<Option<((u32, u32), u8)>> = std::sync::Mutex::new(None);
+
+fn set_pending(p: Option<((u32, u32), u8)>) {
+    if let Ok(mut pending) = PENDING.lock() {
+        *pending = p;
     }
 }
 
@@ -346,9 +386,21 @@ impl Display {
         let plain = window.fullscreen().is_none()
             && !window.is_maximized()
             && window.is_minimized() != Some(true);
-        if plain && size.width > 0 && size.height > 0 {
-            self.windowed = (size.width, size.height);
+        if !plain || size.width == 0 || size.height == 0 {
+            return;
         }
+        let now = (size.width, size.height);
+        let pending = PENDING.lock().ok().and_then(|p| *p);
+        match pending {
+            Some((asked, tries)) if asked != now && tries > 0 => {
+                set_pending(Some((asked, tries - 1)));
+                let _ = window.request_inner_size(PhysicalSize::new(asked.0, asked.1));
+                return;
+            }
+            Some(_) => set_pending(None),
+            None => {}
+        }
+        self.windowed = now;
     }
 
     /// F11 or Alt+Enter: a window to the fullscreen kind last used, or
@@ -393,7 +445,8 @@ impl Display {
             DisplayMode::Borderless => (self.windowed, 0),
             DisplayMode::Exclusive => ((self.exclusive.0, self.exclusive.1), self.exclusive.2),
         };
-        let how = show(window, mode, size, rate);
+        let (how, asked) = show(window, mode, size, rate);
+        let size = asked.unwrap_or(size);
         config.mode = mode;
         if mode == DisplayMode::Exclusive {
             // The mode it took (a size it asked for may not be offered).
@@ -471,6 +524,18 @@ mod tests {
         // Nothing at all: borderless.
         assert_eq!(pick(&[], (1600, 900, 60), OWN), None);
         assert_eq!(pick(&o[3..], (1600, 900, 60), OWN), None);
+    }
+
+    #[test]
+    fn a_window_fits_on_the_monitor_with_its_frame() {
+        let room = Some((2304, 1296)); // nine tenths of 2560 x 1440
+        assert_eq!(fit_in((1280, 720), room), (1280, 720));
+        assert_eq!(fit_in((2304, 1296), room), (2304, 1296));
+        // Too big: scaled down whole, its shape kept.
+        assert_eq!(fit_in((2560, 1440), room), (2304, 1296));
+        assert_eq!(fit_in((4000, 3000), room), (1728, 1296));
+        assert_eq!(fit_in((10, 10), room), (320, 200));
+        assert_eq!(fit_in((4000, 3000), None), (4000, 3000));
     }
 
     #[test]
