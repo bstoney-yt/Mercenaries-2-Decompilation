@@ -1763,6 +1763,27 @@ impl MissionLink {
             {
                 mission.put_player(at.to_array());
             }
+            // The scripts' vehicles' load beds, where they count the goods
+            // on them (`Object.GetHardpointPosition(truck, "HP_Truckbed")`).
+            if let Some(world) = game.scene.world.as_ref() {
+                for v in &game.scene.vehicles {
+                    if let (Some(g), Some(id)) = (v.guid, v.id)
+                        && let Some(bed) = game.bed(v.spec.model)
+                        && let Some(t) = world.physics.vehicle_transform(id)
+                    {
+                        mission.set_hardpoint(
+                            g,
+                            m2_assets::name_hash(crate::game::BED_NODE),
+                            t.transform_point3(bed).to_array(),
+                        );
+                    }
+                }
+            }
+            // What rides on a vehicle is where it rides, for the scripts
+            // that count it there (`Pg.GetObjectsInArea`).
+            for (g, at, yaw) in game.scene.props.cargo_places() {
+                mission.place(g, at.to_array(), yaw);
+            }
             for (g, at, yaw) in game.scene.flights.places(&game.scene.vehicles) {
                 mission.place(g, at.to_array(), yaw);
             }

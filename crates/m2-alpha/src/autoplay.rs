@@ -135,6 +135,12 @@ const RIDE_NEAR: f32 = 40.0;
 /// One of the scripts' vehicles she hasn't driven is taken from this far,
 /// metres: they brought it for her.
 const RIDE_FRESH: f32 = 150.0;
+/// Waiting this long (seconds) in a vehicle she drove to a place to
+/// deliver, she gets out of it.
+const EXIT_AFTER: f32 = 4.0;
+/// With goods riding on her vehicle she drives no faster than this, m/s
+/// (invented: about 40 km/h).
+const LADEN_SPEED: f32 = 11.0;
 /// She takes an action the scripts offer within this of its object,
 /// metres (a context action's reach is a few metres; within 1.5 m she
 /// stalled against the body, GurCon002 round 14).
@@ -952,6 +958,21 @@ impl Autoplay {
                 ));
             }
         }
+        // Driven to a place to deliver it and nothing comes of it: the
+        // scripts want her out of it there (`MrxTaskObjectiveDeliver`'s
+        // `bStop` delivery of a vehicle shows "[objective.Deliver.
+        // vehicleExit]" while she sits in it: PirCon002's rum truck).
+        if driving.is_some()
+            && m.kind == "deliverable"
+            && self
+                .waiting
+                .is_some_and(|(g, since)| g == m.target && self.clock - since > EXIT_AFTER)
+        {
+            return Some((
+                Goal::GetOut,
+                format!("getting out at {}, to deliver what she drove there", m.name),
+            ));
+        }
         // An outpost's flag is taken standing by it: the scripts count
         // those who get there as its rushers (inferred: the outpost's
         // rusher check asks whether each is in a seat).
@@ -1271,6 +1292,12 @@ impl Autoplay {
         let mut throttle = 1.0;
         if (d < SLOW_NEAR && speed > SLOW) || (angle.abs() > 0.8 && speed > SLOW) {
             throttle = 0.2;
+        }
+        // Goods riding on her truck (PirCon002's rum): no faster than a
+        // careful driver goes, so a crash costs less of them.
+        let laden = game.scene.props.carrying(i);
+        if laden && speed > LADEN_SPEED {
+            throttle = 0.0;
         }
         // Stuck against something: back out, turning towards the way on.
         if throttle > 0.5 && speed.abs() < 1.0 && self.reversing.is_none() {
@@ -2093,11 +2120,15 @@ impl Autoplay {
         }
         let still = self.since_moved();
         if still > HOP_AFTER {
-            // Stuck driving close to the place: on foot from here.
+            // Stuck driving close to the place: on foot from here. Not
+            // with goods riding on her vehicle: they are what she brings
+            // there (PirCon002's rum, left 162 m short in round 43); the
+            // vehicle hops on with them instead.
             let driving = game.scene.player.as_ref().and_then(|p| p.driving);
             let near = (at - game.focus()).with_y(0.0).length() < RIDE_FOR;
             if let Some(i) = driving
                 && near
+                && !game.scene.props.carrying(i)
                 && game
                     .scene
                     .world

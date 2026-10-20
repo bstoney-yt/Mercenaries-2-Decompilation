@@ -26,6 +26,10 @@ use m2_engine::{
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{DrawQueue, RenderBackend};
 
+/// A vehicle whose up axis leans further than this from the vertical
+/// (its height, of 1) has tipped: what rides on it comes off (invented).
+const TIPPED: f32 = 0.5;
+
 /// One shown.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Prop {
@@ -88,6 +92,11 @@ pub struct Props {
     reach: f32,
     /// Those knocked loose: their pieces, in [`Loose`] order.
     knocked: HashMap<u32, Vec<DebrisId>>,
+    /// Those riding on a vehicle's load bed (PirCon002's rum jugs on its
+    /// truck): the vehicle (its index among the scene's, which stays when
+    /// it is placed afresh), and where on it, in its space
+    /// ([`Props::load`]).
+    cargo: HashMap<u32, (usize, Mat4)>,
     /// Those broken apart: their pieces, in their [`Breakup`]'s order.
     broken: HashMap<u32, Vec<DebrisId>>,
     /// Those wrecked by a blast: their intact parts going down into the
@@ -488,6 +497,89 @@ impl Props {
             false => self.loose_mass(physics, entity),
         };
         mass.is_some() && self.fling(physics, entity, velocity, spin)
+    }
+
+    /// Puts `entity` on the load bed of vehicle `index` (placed as `id`)
+    /// where it stands, raised to at least `floor` (the bed's height in
+    /// the vehicle's space): it rides there ([`carry`](Self::carry)) until
+    /// the vehicle tips over. Its standing collision goes while it rides.
+    /// False unless both are in play.
+    pub fn load(
+        &mut self,
+        physics: &mut Physics,
+        entity: u32,
+        (index, id): (usize, m2_engine::VehicleId),
+        floor: f32,
+    ) -> bool {
+        let (Some(p), Some(t)) = (self.shown.get(&entity), physics.vehicle_transform(id)) else {
+            return false;
+        };
+        let mut local = t.inverse() * Mat4::from_rotation_translation(p.rotation, p.position);
+        local.w_axis.y = local.w_axis.y.max(floor);
+        physics.remove_static(StaticKey::Entity(entity));
+        self.cargo.insert(entity, (index, local));
+        true
+    }
+
+    /// Whether anything rides on vehicle `index`.
+    pub fn carrying(&self, index: usize) -> bool {
+        self.cargo.values().any(|(v, _)| *v == index)
+    }
+
+    /// Whether `entity` rides on a vehicle ([`load`](Self::load)).
+    pub fn is_cargo(&self, entity: u32) -> bool {
+        self.cargo.contains_key(&entity)
+    }
+
+    /// Moves what rides on vehicles with them (`placed`: each vehicle's
+    /// physics id, by index, while it is placed). What rides on one
+    /// tipped past [`TIPPED`] comes off: returned, with where it is, to be
+    /// knocked loose. One not placed for the moment (being placed afresh)
+    /// keeps its load.
+    pub fn carry(
+        &mut self,
+        physics: &Physics,
+        placed: &[Option<m2_engine::VehicleId>],
+    ) -> Vec<(u32, Vec3)> {
+        let mut off = Vec::new();
+        for (&e, &(v, local)) in &self.cargo {
+            let Some(t) = placed
+                .get(v)
+                .copied()
+                .flatten()
+                .and_then(|id| physics.vehicle_transform(id))
+            else {
+                continue;
+            };
+            if t.y_axis.y > TIPPED {
+                let (_, rotation, position) = (t * local).to_scale_rotation_translation();
+                if let Some(p) = self.shown.get_mut(&e) {
+                    p.position = position;
+                    p.rotation = rotation;
+                }
+            } else {
+                off.push((e, self.shown.get(&e).map_or(Vec3::ZERO, |p| p.position)));
+            }
+        }
+        for (e, _) in &off {
+            self.cargo.remove(e);
+        }
+        if !self.cargo.is_empty() {
+            self.changes += 1;
+        }
+        off
+    }
+
+    /// Where each prop riding on a vehicle is, and its heading.
+    pub fn cargo_places(&self) -> Vec<(u32, Vec3, f32)> {
+        self.cargo
+            .keys()
+            .filter_map(|e| {
+                let p = self.shown.get(e)?;
+                let f = p.rotation * Vec3::Z;
+                Some((*e, p.position, f.x.atan2(f.z)))
+            })
+            .collect()
     }
 
     /// Whether `entity` was knocked loose (`None` if not): broken into
