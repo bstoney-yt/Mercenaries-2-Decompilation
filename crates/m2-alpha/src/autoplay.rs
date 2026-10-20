@@ -58,6 +58,9 @@ const SHOOT_RANGE: f32 = 35.0;
 const BLAST_RANGE: (f32, f32) = (15.0, 45.0);
 /// With the grenade launcher, whose rounds reach about 40 m.
 const LOB_RANGE: (f32, f32) = (12.0, 32.0);
+/// Aimed at something to blow up with no clear shot this long (seconds;
+/// invented), she goes closer instead.
+const BLAST_BLOCKED: f32 = 15.0;
 /// What only a support strike brings down (the first contract's gates)
 /// she calls the bomb on from between these (metres): out of its frag's
 /// reach, and near enough that the satellite's view (5 m/s) is soon over
@@ -394,6 +397,7 @@ impl Autoplay {
             self.fresh_headway();
             self.arrived = None;
             self.steady = 0.0;
+            self.blocked = 0.0;
             self.sidestep = None;
             self.reversing = None;
             self.stalled = 0.0;
@@ -615,20 +619,27 @@ impl Autoplay {
             .filter(|m| m.kind == "destroy")
             .collect();
         if let Some(m) = nearest(destroy, here) {
-            if let Some(i) = npcs
-                .iter()
-                .position(|n| n.spawn == Some(m.target) && n.alive)
+            // A vehicle to destroy is blown up, not its crew shot: the
+            // crew aboard come into play under its guid (PmcCon003's
+            // AMX30s: round 8 aimed at a tank's commander inside it,
+            // with never a clear shot, for 1900 s).
+            let a_vehicle = vehicles.iter().any(|v| v.guid == Some(m.target));
+            if !a_vehicle
+                && let Some(i) = npcs
+                    .iter()
+                    .position(|n| n.spawn == Some(m.target) && n.alive)
             {
                 return Some((
                     Goal::Shoot(i),
                     format!("shooting {} ({:#x})", m.name, m.target),
                 ));
             }
-            let spawn = game
-                .scene
-                .world
-                .as_ref()
-                .is_some_and(|w| w.index.spawns.iter().any(|s| s.entity == m.target));
+            let spawn = !a_vehicle
+                && game
+                    .scene
+                    .world
+                    .as_ref()
+                    .is_some_and(|w| w.index.spawns.iter().any(|s| s.entity == m.target));
             if spawn {
                 return Some((
                     Goal::Reach {
@@ -1177,6 +1188,21 @@ impl Autoplay {
         } else {
             0.0
         };
+        // Aimed long with a wall in the way (round 10: a concrete pit by
+        // the PMC's gate, 43 m from the last tank, for 2000 s): she goes
+        // closer along her way, which hops her out if she is stuck.
+        if clear {
+            self.blocked = 0.0;
+        } else if error < ON_TARGET {
+            self.blocked += dt;
+        }
+        // Close enough: aiming again from here.
+        if d < near + 3.0 {
+            self.blocked = self.blocked.min(BLAST_BLOCKED);
+        }
+        if self.blocked > BLAST_BLOCKED {
+            return self.walk(game, at, near + 2.0, dt);
+        }
         let movement = if !clear && self.steady > 1.0 {
             Vec2::Y
         } else {

@@ -1616,6 +1616,15 @@ impl WorldIndex {
                 let Some(p) = placements.get(&id) else {
                     continue;
                 };
+                // A vehicle on patrol (PmcCon003's `PMC003_AMX_01`, an
+                // `AMX30 Elite (Driver)` with an `AiPatrol`) is a vehicle
+                // of the layer's, not a person standing in for it.
+                let vehicle = templates
+                    .by_id(p.parent)
+                    .is_some_and(|(_, t)| t.vehicle.is_some());
+                if component != "PopulationSimpleSpawner" && vehicle {
+                    continue;
+                }
                 if !seen.insert(id) {
                     continue;
                 }
