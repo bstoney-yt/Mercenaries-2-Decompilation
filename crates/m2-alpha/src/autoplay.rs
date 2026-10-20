@@ -88,6 +88,12 @@ const PRESS_AGAIN: f32 = 3.0;
 /// A spot to fire from more than this above or below her once she is
 /// over it is one she can't get to (metres). Invented.
 const SPOT_RISE: f32 = 2.5;
+/// Rings (metres) round her looked on for a way out of the water.
+/// Invented.
+const LANDING_RINGS: [f32; 6] = [6.0, 12.0, 24.0, 48.0, 96.0, 192.0];
+/// Ground this far (metres) below her feet a step ahead is a drop she
+/// doesn't step closer over. Invented.
+const LEDGE_DROP: f32 = 3.0;
 /// A vehicle's cannon in range of her goal this long (seconds) without
 /// bringing it down, she gets out. Invented.
 const CANNON_GIVE_UP: f32 = 30.0;
@@ -306,6 +312,8 @@ pub struct Autoplay {
     /// Where she goes to fire at what she is blowing up (its object, the
     /// spot); the spots no better go in `tried` too.
     blast_spot: Option<(u32, Vec3)>,
+    /// Where she is swimming to climb out of the water (see [`landing`]).
+    landing: Option<Vec3>,
     /// With the launcher empty, the C4 she set on what she is blowing up
     /// and when, while she gets clear to set it off.
     planted: Option<f32>,
@@ -1382,6 +1390,27 @@ impl Autoplay {
         if !lobbing && rockets == 0 && (game.combat.charges > 0 || self.planted.is_some()) {
             return self.plant(game, at, dt);
         }
+        // In the water she can't fire: out where she can climb, first.
+        if p.swimming() {
+            let out = game
+                .scene
+                .world
+                .as_ref()
+                .and_then(|w| landing(&w.physics, here, at));
+            if let Some(out) = out {
+                if self.landing.is_none_or(|l| l.distance(out) > 4.0) {
+                    eprintln!(
+                        "autoplay {:.1} s: in the water at {here:.1}: out at {out:.1}",
+                        self.clock
+                    );
+                }
+                self.landing = Some(out);
+                self.blast_spot = None;
+                self.blocked = 0.0;
+                return self.walk(game, out, 1.0, dt);
+            }
+        }
+        self.landing = None;
         // Going where she can fire from (in range, nothing in the way).
         if let Some((_, spot)) = self.blast_spot {
             if spot.with_y(0.0).distance(here.with_y(0.0)) >= ARRIVE {
@@ -1462,7 +1491,15 @@ impl Autoplay {
                     })
             );
         }
-        let movement = if !clear && self.steady > 1.0 && self.blast_spot.is_none() {
+        // Not over a drop, though (round 27's AllCon002: aimed at a boat
+        // from the top of a bank, she stepped off it into the river).
+        let ahead = here + (at - here).with_y(0.0).normalize_or_zero() * 2.0;
+        let ledge = game.scene.world.as_ref().is_none_or(|w| {
+            w.physics
+                .cast_ray(ahead + Vec3::Y * 1.0, Vec3::NEG_Y, 1.0 + LEDGE_DROP)
+                .is_none()
+        });
+        let movement = if !clear && self.steady > 1.0 && self.blast_spot.is_none() && !ledge {
             Vec2::Y
         } else {
             Vec2::ZERO
@@ -2320,6 +2357,29 @@ fn vantage(
     best.map(|(_, s)| s)
 }
 
+/// Where she can climb out of the water nearest `at`: ground on
+/// [`LANDING_RINGS`] round her, flat enough, no deeper than she can stand
+/// in and no more than [`SPOT_RISE`] over the water (round 27's AllCon002:
+/// in the river under a bank 18 m high, she swam there 2000 s). Of the
+/// nearest ring with any, the one closest to `toward`.
+fn landing(physics: &Physics, at: Vec3, toward: Vec3) -> Option<Vec3> {
+    LANDING_RINGS.iter().find_map(|&r| {
+        (0..24)
+            .filter_map(|k| {
+                let a = k as f32 * std::f32::consts::TAU / 24.0;
+                let (x, z) = (at.x + r * a.sin(), at.z + r * a.cos());
+                let water = physics.water_at(x, z).unwrap_or(WATERLINE).max(WATERLINE);
+                let top = Vec3::new(x, water + 30.0, z);
+                let (d, n) = physics.cast_ray(top, Vec3::NEG_Y, 60.0)?;
+                let spot = Vec3::new(x, top.y - d, z);
+                let rise = spot.y - water;
+                (n.y >= 0.7 && rise <= SPOT_RISE && rise > -crate::player::SWIM_STOP * 0.8)
+                    .then_some(spot)
+            })
+            .min_by(|a, b| a.distance(toward).total_cmp(&b.distance(toward)))
+    })
+}
+
 /// Vehicle `vehicles[i]`'s model to world, if placed.
 fn vehicle_at(game: &Game, i: usize) -> Option<Mat4> {
     let id = game.scene.vehicles.get(i)?.id?;
@@ -2721,6 +2781,66 @@ mod tests {
             vantage(&p, target, target, &[], &BLAST_RINGS, BLAST_BODY),
             None
         );
+    }
+
+    // In a river with a bank 18 m high close by and a beach further off
+    // (round 27's AllCon002): out at the beach, not under the bank.
+    #[test]
+    fn out_of_the_water_where_she_can_climb() {
+        use m2_engine::{CollisionShape, StaticKey};
+        let mut p = Physics::new();
+        let flat = |x0: f32, x1: f32, y: f32| {
+            CollisionShape::mesh(
+                &[
+                    Vec3::new(x0, y, -80.0),
+                    Vec3::new(x1, y, -80.0),
+                    Vec3::new(x1, y, 80.0),
+                    Vec3::new(x0, y, 80.0),
+                ],
+                &[[0, 1, 2], [0, 2, 3]],
+            )
+            .unwrap()
+        };
+        let w = WATERLINE;
+        p.add_static(
+            StaticKey::Cell(1),
+            &flat(-30.0, 20.0, w - 4.0),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        p.add_static(
+            StaticKey::Cell(2),
+            &flat(20.0, 80.0, w + 18.0),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        p.add_static(
+            StaticKey::Cell(3),
+            &flat(-80.0, -30.0, w + 0.5),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        p.step(1.0 / 60.0);
+        let here = Vec3::new(10.0, w - 0.3, 0.0);
+        let out = landing(&p, here, Vec3::new(30.0, w + 18.0, 0.0)).expect("a way out");
+        assert!(out.x < -30.0, "not on the beach: {out}");
+        assert!((out.y - (w + 0.5)).abs() < 0.1, "{out}");
+        // No beach at all: nowhere.
+        let mut q = Physics::new();
+        q.add_static(
+            StaticKey::Cell(1),
+            &flat(-300.0, 20.0, w - 4.0),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        q.add_static(
+            StaticKey::Cell(2),
+            &flat(20.0, 300.0, w + 18.0),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        q.step(1.0 / 60.0);
+        assert_eq!(landing(&q, here, here), None);
     }
 
     // A truck-sized box round what she is blowing up (round 3's MLRS):
