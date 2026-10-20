@@ -7012,6 +7012,7 @@ impl Running {
                 .and_then(mission::MissionLink::medevac_state);
             state.gui_calls = gui_calls;
             state.pad = self.input.pad();
+            state.stick = self.input.stick();
             info.game = Some(state);
         }
         if self.pad.touch.used {
