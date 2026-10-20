@@ -1273,6 +1273,7 @@ impl MissionLink {
             return;
         };
         let focus = game.focus();
+        let mut lap = crate::spans::Lap::new();
         // The music region she is in: the free-play score follows it.
         if let Some(world) = &game.scene.world {
             let region =
@@ -1290,6 +1291,7 @@ impl MissionLink {
                 );
             }
         }
+        lap.mark("scripts: music");
         // Deliveries fly on; the scripts hear of each load let go.
         let scene = &mut game.scene;
         if let Some(world) = &mut scene.world {
@@ -1305,6 +1307,7 @@ impl MissionLink {
                 self.counts.arrived += 1;
             }
         }
+        lap.mark("scripts: deliveries");
         // A crate she broke open is destroyed for the scripts too (what
         // it held, it leaves of itself: no script spawns it).
         for (g, at) in scene.flights.take_broken() {
@@ -1344,6 +1347,7 @@ impl MissionLink {
             );
             mission.kill(g);
         }
+        lap.mark("scripts: crates");
         // The vehicle she was seated in never came: ashore instead.
         if self.vehicles.boarding > 0 {
             self.vehicles.boarding -= 1;
@@ -1372,6 +1376,7 @@ impl MissionLink {
                     Vec3::new(at.x, game.focus().y, at.y)
                 }),
         );
+        lap.mark("scripts: blasts");
         // The support's steps (the satellite's, the PDA's), posted as the
         // game's interface posts them, for the scripts waiting on them
         // (the first contract's).
@@ -1392,6 +1397,7 @@ impl MissionLink {
         // beeps, its correct and failed presses).
         self.sounds
             .extend(game.support.cues.iter().map(|&c| (c.to_owned(), false)));
+        lap.mark("scripts: posts");
         // The scripts' context actions (the HQ's exits, a starter's talk):
         // the one she stands at is offered, and taken with the use key.
         if let Some(g) = game.context_taken.take() {
@@ -1415,6 +1421,7 @@ impl MissionLink {
                 }
             }
         }
+        lap.mark("scripts: context taken");
         // Whom she carries rides her shoulder (invented: over her right
         // shoulder, facing behind her).
         if let Some(p) = game.scene.player.as_ref() {
@@ -1458,6 +1465,7 @@ impl MissionLink {
             self.states.insert(g, "InVehicle.Subdued");
             mission.seat_in(g, heli);
         }
+        lap.mark("scripts: carry");
         // Keyed actions run out: `HumanActionComplete` fires.
         for a in &mut game.actions {
             a.2 -= dt;
@@ -1479,6 +1487,7 @@ impl MissionLink {
             .find(|n| n.down == Some(crate::npc::Down::Carried))
             .and_then(|n| n.spawn);
         mission.set_carrying(PLAYER, carried);
+        lap.mark("scripts: actions");
         // The placed people's human states, as they change, for the
         // scripts' `HumanStateTransition` events.
         for n in &game.scene.people.npcs {
@@ -1500,6 +1509,7 @@ impl MissionLink {
                 crate::raw::Met::Line(cue) => mission.clip_line(g, &cue),
             }
         }
+        lap.mark("scripts: states");
         // Her infractions against the factions, for their witnesses to
         // report: the first one of a faction not already reporting, a
         // witness of theirs near it (not the victim) is offered to the
@@ -1534,6 +1544,7 @@ impl MissionLink {
                 }
             }
         }
+        lap.mark("scripts: infractions");
         // Reporters: each calls in, then gets through (state 1) and the
         // faction manager's own timer finishes his report; one killed
         // first, or that it never finishes with, is stopped (state 2).
@@ -1579,6 +1590,7 @@ impl MissionLink {
             mission.pursuit_over();
         }
         game.pursued = pursued;
+        lap.mark("scripts: reporters");
         // The factions' attitudes, once a second: whose soldiers fight her.
         game.attitude_wait -= dt;
         if game.attitude_wait <= 0.0 {
@@ -1602,6 +1614,7 @@ impl MissionLink {
                 shot.place(b, t);
             }
         }
+        lap.mark("scripts: attitudes");
         // The dialog boxes, as the scripts may have imported their module
         // afresh ([`DIALOG_BOXES`]).
         if let Ok(Some(wrap)) = mission
@@ -1612,6 +1625,7 @@ impl MissionLink {
         {
             eprintln!("mission: dialog boxes: {e}");
         }
+        lap.mark("scripts: dialog wrap");
         // Riders of the layers' props (the HQ interior's starter): drawn in
         // their seats by `crate::hijack`, which says where those are; the
         // scripts hear it, so what is offered by her (her `Talk`) is where
@@ -1625,6 +1639,7 @@ impl MissionLink {
             .into_iter()
             .filter(|(g, _)| props.get(*g).is_some())
             .collect();
+        lap.mark("scripts: crews aboard");
         // Out of their seats (a starter at her briefing spot), they stand
         // where the scripts have them; back in, they sit again.
         let scene = &mut game.scene;
@@ -1647,6 +1662,7 @@ impl MissionLink {
                     .stand_scripted(rider, &who, model, None, at, yaw);
             }
         }
+        lap.mark("scripts: crews on foot");
         let on_foot = game
             .scene
             .player
@@ -1662,6 +1678,7 @@ impl MissionLink {
             }
             game.context = offered;
         }
+        lap.mark("scripts: context offer");
         self.lag += dt;
         let mut lines = Vec::new();
         while self.lag >= STEP {
