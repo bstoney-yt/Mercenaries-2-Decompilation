@@ -2096,11 +2096,17 @@ impl Autoplay {
         let flat = (at - from).with_y(0.0);
         // Not onto what she is blowing up (round 20's AllCon003: hopped onto
         // the last AA gun, too close to fire and stuck on it 2000 s).
-        let keep = match self.goal {
-            Some(Goal::Blast { .. }) => BLAST_RANGE.0 + 5.0,
-            _ => 0.0,
+        // Kept off the thing itself, not off the point of her way hopped to
+        // (round 29's AllCon002: a point 15 m on, 376 m from the boat, and
+        // 56 hops of 0 m).
+        let room = match self.goal {
+            Some(Goal::Blast { at: t, .. }) => {
+                (t - from).with_y(0.0).length() - (BLAST_RANGE.0 + 5.0)
+            }
+            _ => f32::INFINITY,
         };
-        let mut to = from + flat.normalize_or_zero() * (flat.length() - keep).clamp(0.0, HOP);
+        let step = flat.length().min(HOP).min(room.max(0.0));
+        let mut to = from + flat.normalize_or_zero() * step;
         let (Some(world), Some(p)) = (&mut game.scene.world, &mut game.scene.player) else {
             return;
         };
