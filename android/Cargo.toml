@@ -59,6 +59,8 @@ build_targets = ["aarch64-linux-android"]
 strip = "strip"
 # The launcher icon (res/mipmap-*): drawn for the alpha, not the game's art.
 resources = "res"
+# The movies' FFmpeg, built by build-ffmpeg.sh (lib/arm64-v8a/libffmpeg.so).
+runtime_libs = "target/runtime-libs"
 
 [package.metadata.android.sdk]
 # Old enough for any Vulkan phone; new enough for pointer capture.

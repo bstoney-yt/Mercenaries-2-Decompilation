@@ -70,3 +70,14 @@ controller's sticks as touches), makes a signing key at
 compile it. Its library is `crates\m2-alpha\src\main.rs`; the Android entry
 point is `crates\m2-alpha\src\android.rs`. When m2-alpha gains a
 dependency, add it to `android\Cargo.toml` too.
+
+## Movies (the menu's backdrop and music)
+
+The game's movies are Bink files, played through a small FFmpeg the APK
+carries as `lib/arm64-v8a/libffmpeg.so` (Bink in, raw pictures and sound
+out; LGPL parts only). Build it once from an FFmpeg release tarball, from
+Git Bash, before `build-apk.ps1`:
+
+    sh android/build-ffmpeg.sh <ffmpeg-7.1.1 source folder>
+
+Without it the APK still builds (with a warning) and skips movies.

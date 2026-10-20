@@ -12,8 +12,10 @@
 //! and crash reports are kept beside the game; the log (`m2-alpha.log`) goes
 //! to the downloads.
 //! Arguments the desktop takes on its command line can go in
-//! `m2-alpha-args.txt` there. Movies are skipped: they need `ffmpeg`, which
-//! the phone doesn't have.
+//! `m2-alpha-args.txt` there. Movies (the front end's backdrop and music,
+//! the cut-scenes) play through the small FFmpeg the APK carries
+//! (`libffmpeg.so`, built by android/build-ffmpeg.sh); an APK built without
+//! it skips them.
 
 use std::path::Path;
 
@@ -70,6 +72,7 @@ fn android_main(app: AndroidApp) {
     // Textures a mip smaller than the desktop's: a quarter of the memory
     // and memory traffic, which a phone runs short of first.
     m2_engine::model::set_texture_drop(1);
+    find_ffmpeg();
     eprintln!("all files access: {access:?}");
     match &found {
         Some(dir) => eprintln!("game found in {}", dir.display()),
@@ -152,6 +155,48 @@ fn all_files_access() -> jni::errors::Result<bool> {
         )?
         .z()
     })
+}
+
+/// The folder Android unpacks the APK's native libraries to, the one an
+/// app may run programs from (`ApplicationInfo.nativeLibraryDir`).
+fn native_library_dir() -> jni::errors::Result<std::path::PathBuf> {
+    with_activity(|env, activity| {
+        let info = env
+            .call_method(
+                activity,
+                "getApplicationInfo",
+                "()Landroid/content/pm/ApplicationInfo;",
+                &[],
+            )?
+            .l()?;
+        let dir = env
+            .get_field(&info, "nativeLibraryDir", "Ljava/lang/String;")?
+            .l()?;
+        let dir: String = env.get_string(&dir.into())?.into();
+        Ok(dir.into())
+    })
+}
+
+/// Points the movies at the FFmpeg the APK carries (`libffmpeg.so`, built
+/// by android/build-ffmpeg.sh), unless `M2_FFMPEG` already names one.
+fn find_ffmpeg() {
+    if std::env::var_os("M2_FFMPEG").is_some() {
+        return;
+    }
+    match native_library_dir() {
+        Ok(dir) => {
+            let ffmpeg = dir.join("libffmpeg.so");
+            if ffmpeg.is_file() {
+                eprintln!("movies: ffmpeg {}", ffmpeg.display());
+                // SAFETY: set while the app starts, before the game (or
+                // anything else that reads the environment) runs threads.
+                unsafe { std::env::set_var("M2_FFMPEG", &ffmpeg) };
+            } else {
+                eprintln!("movies: this APK carries no ffmpeg; they are skipped");
+            }
+        }
+        Err(e) => eprintln!("movies: no native library folder ({e})"),
+    }
 }
 
 /// Opens the app's "all files access" settings page.

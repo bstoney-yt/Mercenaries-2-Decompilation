@@ -60,6 +60,14 @@ if (-not (Test-Path $keystore)) {
 $env:CARGO_APK_RELEASE_KEYSTORE = $keystore
 $env:CARGO_APK_RELEASE_KEYSTORE_PASSWORD = 'android'
 
+# The movies' FFmpeg (build-ffmpeg.sh), packed beside the game's library
+# when built; without it movies are skipped on the phone, as before.
+$runtimeLibs = Join-Path $here 'target\runtime-libs\arm64-v8a'
+New-Item -ItemType Directory -Force $runtimeLibs | Out-Null
+if (-not (Test-Path (Join-Path $runtimeLibs 'libffmpeg.so'))) {
+    Write-Warning 'no target\runtime-libs\arm64-v8a\libffmpeg.so (see build-ffmpeg.sh): movies and the menu music are skipped on the phone'
+}
+
 Push-Location $here
 try {
     Invoke-Tool { cargo apk build --release }
