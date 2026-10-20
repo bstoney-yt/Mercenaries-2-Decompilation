@@ -74,7 +74,8 @@ pub struct Marker {
     /// The call's last argument ("2D only"), as given; what it changes
     /// isn't known yet.
     pub flat: bool,
-    /// The call's twelfth argument, the mission it is for, as given.
+    /// The call's twelfth argument, the mission it is for, as given (of a
+    /// list, the first).
     pub mission: String,
 }
 
@@ -364,7 +365,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 far: f(9, 175.0),
                 sizes: [f(2, 0.0), f(10, 0.0)],
                 flat: matches!(a.get(12), Some(Value::Boolean(true))),
-                mission: a.get(11).map_or_else(|| "nil".to_owned(), shown),
+                // A list of missions (a race's gates pass one) gives its
+                // first.
+                mission: match a.get(11) {
+                    Some(Value::Table(t)) => shown(&t.raw_get::<Value>(1).unwrap_or(Value::Nil)),
+                    Some(v) => shown(v),
+                    None => "nil".to_owned(),
+                },
             },
         );
         Ok(MultiValue::from_vec(vec![guid_value(handle)]))
