@@ -2495,7 +2495,12 @@ impl MissionLink {
             Some(MarkFor::Index(i)) => *i == index,
             None => false,
         };
-        if marks.iter().any(|m| m.alive && ours(m)) {
+        // A verify marker stays to do once its person is dead: the body is
+        // verified (round 13: General Peng shot, then left for the jobs).
+        if marks
+            .iter()
+            .any(|m| (m.alive || m.kind == "verify") && ours(m))
+        {
             marks.into_iter().filter(ours).collect()
         } else {
             marks
