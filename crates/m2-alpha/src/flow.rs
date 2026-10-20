@@ -134,9 +134,10 @@ impl Flow {
     }
 
     /// Whether the front end's menus want the player's settings
-    /// ([`Flow::settings`]): up, and not yet told.
+    /// ([`Flow::settings`]): not yet told (from the start, as the menu
+    /// movie is set up while it loads, before the front end is up).
     pub fn wants_settings(&self) -> bool {
-        self.stage == Stage::FrontEnd && self.settings.is_none()
+        self.stage != Stage::Game && self.settings.is_none()
     }
 
     /// The player's settings and saves (with the monitor's modes), for
@@ -459,9 +460,11 @@ impl Flow {
                 .input(|i| crate::gamehud::pointer_input(&i.events, i.pointer.latest_pos()));
             s.update(ui.ctx(), state);
         } else if let Some(s) = &mut self.shell {
-            // Loading: told the size, so it draws once it is up.
+            // Loading: told the size, so it draws once it is up, and the
+            // settings and saves, which the movie is set up with.
             let state = HudState {
                 size: [screen.width(), screen.height()],
+                pause_settings: self.settings.clone().unwrap_or_default(),
                 ..HudState::default()
             };
             s.update(ui.ctx(), state);

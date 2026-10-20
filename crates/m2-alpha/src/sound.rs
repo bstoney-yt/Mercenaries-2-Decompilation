@@ -299,25 +299,43 @@ fn held_tables(
 const KEY_FRESH: Duration = Duration::from_millis(750);
 
 /// The interface's sound bank, `ui_hud`: its cue table (cue name hash to
-/// record, record to the bank's sound) and its sounds; and the music's cue
-/// table (records name streams of `music.pws`).
+/// record, record to the bank's sound) and its sounds; the front end's,
+/// `ui_shell` (in `shell.wad`: the menus' clicks and whooshes, which
+/// `ui_hud` doesn't have); and the music's cue table (records name
+/// streams of `music.pws`).
 #[derive(Debug, Default)]
 pub struct UiSounds {
     cues: Option<m2_assets::CueTable>,
     sounds: Vec<SoundBuffer>,
+    shell_cues: Option<m2_assets::CueTable>,
+    shell_sounds: Vec<SoundBuffer>,
     music: Option<m2_assets::CueTable>,
+}
+
+/// A bank's cue table and sounds, from `source`, by the bank's name.
+fn ui_bank<R: std::io::Read + std::io::Seek>(
+    source: &mut m2_engine::AssetSource<R>,
+    name: &str,
+) -> (Option<m2_assets::CueTable>, Vec<SoundBuffer>) {
+    let bank = m2_assets::name_hash(name);
+    let cues = source
+        .asset(bank, m2_assets::voice::CUE_TABLE_TYPE)
+        .ok()
+        .and_then(|d| m2_assets::CueTable::parse(&d).ok());
+    let library = SoundLibrary::load_banks(source, &[bank]);
+    let sounds = library
+        .bank_hash(bank)
+        .map(|(_, s)| s.to_vec())
+        .unwrap_or_default();
+    (cues, sounds)
 }
 
 impl UiSounds {
     fn load(install: &Install) -> Self {
-        let bank = m2_assets::name_hash("ui_hud");
         let Ok(mut source) = install.open_world() else {
             return Self::default();
         };
-        let cues = source
-            .asset(bank, m2_assets::voice::CUE_TABLE_TYPE)
-            .ok()
-            .and_then(|d| m2_assets::CueTable::parse(&d).ok());
+        let (cues, sounds) = ui_bank(&mut source, "ui_hud");
         let music = source
             .asset(
                 m2_assets::name_hash("music"),
@@ -325,14 +343,16 @@ impl UiSounds {
             )
             .ok()
             .and_then(|d| m2_assets::CueTable::parse(&d).ok());
-        let library = SoundLibrary::load_banks(&mut source, &[bank]);
-        let sounds = library
-            .bank_hash(bank)
-            .map(|(_, s)| s.to_vec())
+        let (shell_cues, shell_sounds) = std::fs::File::open(install.data.join("shell.wad"))
+            .ok()
+            .and_then(|f| m2_engine::AssetSource::new(std::io::BufReader::new(f)).ok())
+            .map(|mut shell| ui_bank(&mut shell, "ui_shell"))
             .unwrap_or_default();
         Self {
             cues,
             sounds,
+            shell_cues,
+            shell_sounds,
             music,
         }
     }
@@ -349,17 +369,21 @@ impl UiSounds {
     /// The sound cue `cue` plays and its volume (the first of its
     /// record's variants that is this bank's).
     /// and whether it loops.
+    /// Looks in `ui_hud`, then the front end's `ui_shell`.
     fn find(&self, cue: &str) -> Option<(SoundBuffer, f32, bool)> {
-        let table = self.cues.as_ref()?;
         let hash = m2_assets::name_hash(cue);
-        let record = table.cue_record(hash)?;
-        let &(_, index, _) = record.variants.iter().find(|v| v.0 == table.hash)?;
-        let looped = table.plain_cue(hash).is_some_and(|c| c.seconds < 0.0);
-        Some((
-            self.sounds.get(index as usize)?.clone(),
-            record.volume,
-            looped,
-        ))
+        [
+            (&self.cues, &self.sounds),
+            (&self.shell_cues, &self.shell_sounds),
+        ]
+        .into_iter()
+        .find_map(|(cues, sounds)| {
+            let table = cues.as_ref()?;
+            let record = table.cue_record(hash)?;
+            let &(_, index, _) = record.variants.iter().find(|v| v.0 == table.hash)?;
+            let looped = table.plain_cue(hash).is_some_and(|c| c.seconds < 0.0);
+            Some((sounds.get(index as usize)?.clone(), record.volume, looped))
+        })
     }
 }
 
@@ -1068,9 +1092,11 @@ impl GameAudio {
                 std::thread::spawn(move || {
                     let ui = UiSounds::load(&install);
                     eprintln!(
-                        "ui sounds: {} cues, {} sounds; music: {} cues",
+                        "ui sounds: {} cues, {} sounds; front end's: {} cues, {} sounds; music: {} cues",
                         ui.cues.as_ref().map_or(0, |c| c.cues.len()),
                         ui.sounds.len(),
+                        ui.shell_cues.as_ref().map_or(0, |c| c.cues.len()),
+                        ui.shell_sounds.len(),
                         ui.music.as_ref().map_or(0, |c| c.cues.len())
                     );
                     let _ = tx.send(ui);
