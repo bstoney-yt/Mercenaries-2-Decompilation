@@ -612,6 +612,10 @@ pub struct Mark {
     /// (`"GurCon053"`), else that of an objective on the PDA about the
     /// same object.
     pub mission: Option<MarkFor>,
+    /// Its marker is drawn in the secondary objectives' colour
+    /// (`MrxUtil.GetSecondaryObjectiveRgb`: the jobs' and bounties'),
+    /// not the primary ones' (a contract's).
+    pub secondary: bool,
 }
 
 /// The mission a [`Mark`] is for, as the scripts name it.
@@ -2453,7 +2457,15 @@ impl MissionLink {
                 .find(|o| o.target == Some(g))
                 .map(|o| MarkFor::Index(o.mission))
         };
-        let mark = |g: u32, kind: &str, for_mission: Option<MarkFor>| {
+        let secondary = mission
+            .lua()
+            .load(
+                "local u = rawget(_G, 'MrxUtil')                  if type(u) ~= 'table' or type(u.GetSecondaryObjectiveRgb) ~= 'function' then return nil end                  return u.GetSecondaryObjectiveRgb()",
+            )
+            .eval::<(Option<f64>, Option<f64>, Option<f64>)>()
+            .ok()
+            .and_then(|(r, g, b)| Some([r? as u8, g? as u8, b? as u8]));
+        let mark = |g: u32, kind: &str, for_mission: Option<MarkFor>, colour: Option<[u8; 3]>| {
             let o = w.objects.get(&g)?;
             Some(Mark {
                 target: g,
@@ -2462,6 +2474,7 @@ impl MissionLink {
                 at: Vec3::from(o.position),
                 alive: o.alive,
                 mission: for_mission.or_else(|| on_pda(g)),
+                secondary: colour.is_some() && colour == secondary,
             })
         };
         let mut out: Vec<Mark> = w
@@ -2473,6 +2486,7 @@ impl MissionLink {
                     m.target?,
                     m.icon.trim_start_matches("HUD_objective_"),
                     (m.mission != "nil").then(|| MarkFor::Id(m.mission.clone())),
+                    Some([m.colour[0], m.colour[1], m.colour[2]]),
                 )
             })
             .collect();
@@ -2490,7 +2504,7 @@ impl MissionLink {
             );
         for (g, kind) in others {
             if !out.iter().any(|m| m.target == g)
-                && let Some(m) = mark(g, kind, None)
+                && let Some(m) = mark(g, kind, None, None)
             {
                 out.push(m);
             }
@@ -2539,7 +2553,13 @@ impl MissionLink {
             .iter()
             .any(|m| (m.alive || m.kind == "verify") && ours(m))
         {
-            marks.into_iter().filter(ours).collect()
+            return marks.into_iter().filter(ours).collect();
+        }
+        // None named for it (a race's jetski, whose marker's mission
+        // the scripts give as a list): the primary objectives' marks.
+        let primary: Vec<Mark> = marks.iter().filter(|m| !m.secondary).cloned().collect();
+        if primary.iter().any(|m| m.alive) {
+            primary
         } else {
             marks
         }

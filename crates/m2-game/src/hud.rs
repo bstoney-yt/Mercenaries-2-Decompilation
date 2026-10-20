@@ -368,7 +368,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 // A list of missions (a race's gates pass one) gives its
                 // first.
                 mission: match a.get(11) {
-                    Some(Value::Table(t)) => shown(&t.raw_get::<Value>(1).unwrap_or(Value::Nil)),
+                    Some(Value::Table(t)) => t
+                        .clone()
+                        .pairs::<Value, Value>()
+                        .filter_map(Result::ok)
+                        .map(|(k, v)| format!("{}={}", shown(&k), shown(&v)))
+                        .collect::<Vec<_>>()
+                        .join(","),
                     Some(v) => shown(v),
                     None => "nil".to_owned(),
                 },
