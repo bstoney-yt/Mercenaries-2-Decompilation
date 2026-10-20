@@ -1720,7 +1720,23 @@ impl MissionLink {
             .as_ref()
             .filter(|p| p.driving.is_none())
             .map(|p| p.character.position);
-        let offered = on_foot.and_then(|at| nearest_context(&mission.context_actions(), at));
+        // A person's action (a verified HVT's) is where they lie in play,
+        // not where the scripts last placed them.
+        let actions: Vec<_> = mission
+            .context_actions()
+            .into_iter()
+            .map(|(g, at, text, reach)| {
+                let person = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .find(|n| n.spawn == Some(g))
+                    .map(|n| n.character.position.to_array());
+                (g, person.or(at), text, reach)
+            })
+            .collect();
+        let offered = on_foot.and_then(|at| nearest_context(&actions, at));
         let offered = offered.map(|(g, id)| (g, mission.text(&id)));
         if offered != game.context {
             match &offered {
