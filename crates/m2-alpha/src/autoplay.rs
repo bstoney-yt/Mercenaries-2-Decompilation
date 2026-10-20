@@ -151,6 +151,10 @@ const AVOID_LARGEST: f32 = 40.0;
 /// kept out of on her ways (invented).
 const PARKED_SPEED: f32 = 1.0;
 const PARKED_NEAR: f32 = 400.0;
+/// With goods on board she gives way to a vehicle coming within this of
+/// hers, metres, within this many seconds (invented).
+const CROSS_CLOSE: f32 = 5.0;
+const CROSS_SECONDS: f32 = 3.0;
 /// Soldiers fighting her within this of a truck with goods on it, itself
 /// within [`CARGO_NEAR`] of her on foot, are dealt with before she drives
 /// it, metres (invented).
@@ -1357,6 +1361,12 @@ impl Autoplay {
         let laden = game.scene.props.carrying(i);
         if laden && speed > LADEN_SPEED {
             throttle = 0.0;
+        }
+        // And she gives way to a vehicle on course to cross ahead of her
+        // (PirCon004 round 72: a car crossing her road at speed wrecked
+        // the organ truck, 35.9 m/s closing).
+        if laden && crossing(game, i, m) {
+            throttle = if speed > 1.0 { -1.0 } else { 0.0 };
         }
         // Stuck against something: back out, turning towards the way on.
         if throttle > 0.5 && speed.abs() < 1.0 && self.reversing.is_none() {
@@ -2583,6 +2593,39 @@ fn parked_near(game: &Game, i: usize, pos: Vec3) -> Vec<(Vec2, Vec2)> {
             ))
         })
         .collect()
+}
+
+/// Whether a vehicle other than `i` (whose place is `m`) going faster
+/// than [`PARKED_SPEED`] comes within [`CROSS_CLOSE`] of it in the next
+/// [`CROSS_SECONDS`], each going on as it goes, where it would meet it
+/// ahead of it.
+fn crossing(game: &Game, i: usize, m: Mat4) -> bool {
+    let Some(physics) = game.scene.world.as_ref().map(|w| &w.physics) else {
+        return false;
+    };
+    let Some(mine) = game.scene.vehicles.get(i).and_then(|v| v.id) else {
+        return false;
+    };
+    let here = m.w_axis.truncate().with_y(0.0);
+    let v_mine = physics.vehicle_velocity(mine).with_y(0.0);
+    let forward = m.transform_vector3(Vec3::Z).with_y(0.0).normalize_or_zero();
+    game.scene.vehicles.iter().enumerate().any(|(j, v)| {
+        let Some(id) = v.id.filter(|_| j != i) else {
+            return false;
+        };
+        let Some(t) = physics.vehicle_transform(id) else {
+            return false;
+        };
+        let theirs = physics.vehicle_velocity(id).with_y(0.0);
+        if theirs.length() < PARKED_SPEED {
+            return false;
+        }
+        let d = t.w_axis.truncate().with_y(0.0) - here;
+        let closing = theirs - v_mine;
+        let when = (-d.dot(closing) / closing.length_squared().max(1e-3)).clamp(0.0, CROSS_SECONDS);
+        let meet = d + closing * when;
+        when > 0.0 && meet.length() < CROSS_CLOSE && (d + theirs * when).dot(forward) > 0.0
+    })
 }
 
 fn vehicle_at(game: &Game, i: usize) -> Option<Mat4> {
