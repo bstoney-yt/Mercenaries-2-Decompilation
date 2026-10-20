@@ -143,6 +143,11 @@ const ONCOMING_AHEAD: f32 = 35.0;
 /// on it, metres (invented: past a soldier's grenade thrown at her
 /// landing a few metres off).
 const CARGO_CLEAR: f32 = 15.0;
+/// Soldiers fighting her within this of a truck with goods on it, itself
+/// within [`CARGO_NEAR`] of her on foot, are dealt with before she drives
+/// it, metres (invented).
+const CARGO_GUARD: f32 = 60.0;
+const CARGO_NEAR: f32 = 100.0;
 const ONCOMING_SIDE: f32 = 3.0;
 const SWERVE: f32 = 0.35;
 /// Waiting this long (seconds) in a vehicle she drove to a place to
@@ -616,14 +621,31 @@ impl Autoplay {
         let npcs = &game.scene.people.npcs;
         let vehicles = &game.scene.vehicles;
         let driving = p.driving;
-        // Soldiers fighting her close by, while she's on foot.
+        // Soldiers fighting her close by, while she's on foot; and those
+        // round a truck with goods on it near her, before she drives it
+        // off (PirCon003 round 61: three ran after the parrot truck and
+        // a grenade broke its boxes when it caught on a wall).
+        let guarded: Vec<Vec3> = (0..vehicles.len())
+            .filter(|&j| game.scene.props.carrying(j))
+            .filter_map(|j| vehicle_at(game, j))
+            .map(|t| t.w_axis.truncate())
+            .filter(|c| c.distance(here) < CARGO_NEAR)
+            .collect();
         if driving.is_none()
             && let Some((i, d)) = npcs
                 .iter()
                 .enumerate()
                 .filter(|(_, n)| n.alive && n.soldier && n.alert)
-                .map(|(i, n)| (i, n.character.position.distance(here)))
-                .filter(|&(_, d)| d < DEFEND)
+                .map(|(i, n)| {
+                    let at = n.character.position;
+                    (
+                        i,
+                        at.distance(here),
+                        guarded.iter().any(|c| c.distance(at) < CARGO_GUARD),
+                    )
+                })
+                .filter(|&(_, d, guard)| d < DEFEND || guard)
+                .map(|(i, d, _)| (i, d))
                 .min_by(|a, b| a.1.total_cmp(&b.1))
         {
             return Some((
