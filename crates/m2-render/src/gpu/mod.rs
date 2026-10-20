@@ -418,6 +418,9 @@ pub struct WgpuBackend {
     /// it): the world and its post passes draw that much smaller and are
     /// stretched to the window ([`set_render_scale`](Self::set_render_scale)).
     scale: f32,
+    /// The shadow cascades redrawn on the phone's lighter schedule
+    /// ([`shadow::refreshes_lightly`]).
+    light_shadows: bool,
     depth: DepthTargets,
     scene_layout: wgpu::BindGroupLayout,
 
@@ -961,6 +964,7 @@ impl WgpuBackend {
             width,
             height,
             scale: 1.0,
+            light_shadows: false,
             depth,
             scene_layout,
             draw_layout,
@@ -1343,6 +1347,13 @@ impl WgpuBackend {
             self.scale = scale;
             self.size_world();
         }
+    }
+
+    /// Redraws the far shadow cascades less often (`light`), as a phone
+    /// needs: under two shadow passes a frame for 2.75
+    /// ([`shadow::refreshes_lightly`]).
+    pub fn set_light_shadows(&mut self, light: bool) {
+        self.light_shadows = light;
     }
 
     /// The world's drawing size: the window's at the render scale.
@@ -1908,7 +1919,12 @@ impl WgpuBackend {
         let mut refresh = [true; shadow::CASCADES];
         if let (Some(c), Some(old)) = (&mut cascades, self.cascades.get()) {
             for (i, fresh) in refresh.iter_mut().enumerate() {
-                if !shadow::refreshes(i, self.frames) {
+                let due = if self.light_shadows {
+                    shadow::refreshes_lightly(i, self.frames)
+                } else {
+                    shadow::refreshes(i, self.frames)
+                };
+                if !due {
                     c.keep(&old, i);
                     *fresh = false;
                 }

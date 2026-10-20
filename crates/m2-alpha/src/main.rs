@@ -38,6 +38,7 @@
 //! `--fight` she shoots the nearest soldier, fires a rocket at a vehicle and
 //! throws a grenade.
 
+mod aim;
 #[cfg(target_os = "android")]
 mod android;
 mod autoplay;
@@ -6753,6 +6754,7 @@ impl App {
         let adapter = backend.adapter_summary();
         eprintln!("adapter: {adapter:?}");
         backend.set_render_scale(w.render_scale);
+        backend.set_light_shadows(cfg!(target_os = "android"));
         if w.render_scale < 1.0 {
             eprintln!(
                 "render scale: the world drawn at {:.2} of the window",
@@ -8145,11 +8147,28 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // In the background no frames are asked for: play waits.
-        if let Some(state) = self.state.as_ref().filter(|s| !s.background) {
-            state.window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        // In the background no frames are asked for, and the loop sleeps
+        // until something happens: play waits.
+        if state.background {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
         }
+        // With a frame rate cap (the phone's, for its battery), the loop
+        // sleeps out the rest of each frame's time.
+        let cap = self.config.window.max_fps;
+        if cap > 0 {
+            let due = state.last + Duration::from_secs_f64(1.0 / f64::from(cap));
+            if Instant::now() < due {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+                return;
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::Poll);
+        state.window.request_redraw();
     }
 }
 

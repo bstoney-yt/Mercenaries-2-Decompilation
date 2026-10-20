@@ -136,6 +136,19 @@ pub fn refreshes(i: usize, frame: u64) -> bool {
     }
 }
 
+/// [`refreshes`] for a phone ([`crate::gpu::WgpuBackend::set_light_shadows`]):
+/// the nearest every frame, the second every other, the third every fourth
+/// and the last every eighth, each on frames of its own: under two passes
+/// a frame for [`refreshes`]' 2.75. Invented, as [`refreshes`] is.
+pub fn refreshes_lightly(i: usize, frame: u64) -> bool {
+    match i {
+        0 => true,
+        1 => frame.is_multiple_of(2),
+        2 => frame % 4 == 1,
+        _ => frame % 8 == 3,
+    }
+}
+
 /// A bounding sphere (centre, radius) around the positions in `data`, laid
 /// out as `layout`; `None` without readable positions.
 pub fn bounds(layout: &VertexLayout, data: &[u8]) -> Option<(Vec3, f32)> {
@@ -193,6 +206,23 @@ pub fn transformed(world: Mat4, (centre, radius): (Vec3, f32)) -> (Vec3, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_phones_schedule_draws_under_two_cascades_a_frame_one_far_at_a_time() {
+        let passes: usize = (0..8u64)
+            .map(|f| (0..CASCADES).filter(|&i| refreshes_lightly(i, f)).count())
+            .sum();
+        assert_eq!(passes, 15);
+        let usual: usize = (0..8u64)
+            .map(|f| (0..CASCADES).filter(|&i| refreshes(i, f)).count())
+            .sum();
+        assert_eq!(usual, 22);
+        for f in 0..64u64 {
+            let far = (1..CASCADES).filter(|&i| refreshes_lightly(i, f)).count();
+            assert!(far <= 1, "frame {f}");
+            assert!(refreshes_lightly(0, f));
+        }
+    }
 
     fn view() -> View {
         View {

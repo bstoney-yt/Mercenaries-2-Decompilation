@@ -618,6 +618,25 @@ impl Game {
                 self.context_taken = Some(*g);
             }
             let mut intent = Intent::from_input(input, config, mouse_look);
+            // Aim assist on a pad or the touch controls (not the mouse):
+            // aiming or firing on foot draws the view to the hostile
+            // nearest the crosshair ([`crate::aim`]).
+            if input.pad()
+                && (intent.trigger.aim || intent.trigger.fire)
+                && let Some(p) = self.scene.player.as_ref().filter(|p| p.driving.is_none())
+            {
+                let people = &self.scene.people;
+                let targets = people
+                    .npcs
+                    .iter()
+                    .filter(|n| n.alive && n.faction.is_some_and(|f| people.fights_for(f)))
+                    .map(|n| {
+                        n.character.position + Vec3::Y * n.character.height * crate::aim::CHEST
+                    });
+                if let Some(turn) = crate::aim::assist(p.eye(), p.yaw, p.pitch, targets, dt) {
+                    intent.look += turn;
+                }
+            }
             let toggle = input.take_pressed(Action::Binoculars);
             let zoom = i32::from(input.take_pressed(Action::ZoomIn))
                 - i32::from(input.take_pressed(Action::ZoomOut));

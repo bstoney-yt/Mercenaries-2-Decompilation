@@ -128,7 +128,15 @@ pub struct WindowConfig {
     /// desktop, 0.6 on Android, where drawing every pixel of a phone's
     /// screen held play under 10 fps (an Adreno 830 at 2244x1080).
     pub render_scale: f32,
+    /// The most frames drawn a second (0: as many as the display takes);
+    /// between them the game sleeps. Invented: none on the desktop, 30 on
+    /// Android, where drawing as fast as it could ran the phone's battery
+    /// down fast.
+    pub max_fps: u32,
 }
+
+/// [`WindowConfig::max_fps`]'s default.
+pub const MAX_FPS: u32 = if cfg!(target_os = "android") { 30 } else { 0 };
 
 /// [`WindowConfig::render_scale`]'s default.
 pub const RENDER_SCALE: f32 = if cfg!(target_os = "android") {
@@ -147,6 +155,7 @@ impl Default for WindowConfig {
             vsync: true,
             wide: true,
             render_scale: RENDER_SCALE,
+            max_fps: MAX_FPS,
         }
     }
 }

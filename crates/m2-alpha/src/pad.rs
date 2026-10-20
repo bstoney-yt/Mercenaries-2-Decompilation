@@ -230,6 +230,12 @@ impl Pad {
         }
         let keys = Self::menu_keys(&self.last, &s);
         self.feed(input, s, driving, dt);
+        // The touch controls' sprint is switched on, not held: she sprints
+        // on foot whenever she moves while it is.
+        if self.touch.sprint {
+            let moving = s.left[0].hypot(s.left[1]) > 0.0;
+            input.set_pad_hold(Action::Sprint, !driving && moving);
+        }
         keys
     }
 

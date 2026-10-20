@@ -104,6 +104,9 @@ pub struct Touch {
     look: (f64, f64),
     /// A finger has touched the screen: the controls show from then on.
     pub used: bool,
+    /// Sprint, switched on and off by tapping its button (not held): she
+    /// sprints whenever she moves while it is on.
+    pub sprint: bool,
 }
 
 impl Touch {
@@ -133,6 +136,11 @@ impl Touch {
                 },
                 Role::Key,
             );
+        if let Role::Key(i) = role
+            && KEYS[i].press == Press::Button(xb::LEFT_THUMB)
+        {
+            self.sprint = !self.sprint;
+        }
         self.fingers.insert(id, Finger { role, at });
     }
 
@@ -176,6 +184,8 @@ impl Touch {
         for f in self.fingers.values() {
             match f.role {
                 Role::Key(i) => match KEYS[i].press {
+                    // Sprint is switched, not held ([`Touch::sprint`]).
+                    Press::Button(xb::LEFT_THUMB) => {}
                     Press::Button(bit) => s.buttons |= bit,
                     Press::LeftTrigger => s.left_trigger = 1.0,
                     Press::RightTrigger => s.right_trigger = 1.0,
@@ -240,7 +250,13 @@ impl Touch {
     /// This frame's [`Picture`].
     pub fn picture(&self) -> Picture {
         Picture {
-            held: std::array::from_fn(|i| self.held(i)),
+            held: std::array::from_fn(|i| {
+                if KEYS[i].press == Press::Button(xb::LEFT_THUMB) {
+                    self.sprint
+                } else {
+                    self.held(i)
+                }
+            }),
             stick: self.stick(),
         }
     }
@@ -344,6 +360,23 @@ mod tests {
         assert!(s.held(xb::A) && s.held(xb::Y));
         t.up(1);
         assert!(!t.state().held(xb::A));
+    }
+
+    #[test]
+    fn a_tap_on_sprint_switches_it_on_and_another_off() {
+        let mut t = touch();
+        let sprint = KEYS.iter().find(|k| k.label == "SPRINT").unwrap();
+        let at = [sprint.at[0] * 2000.0, sprint.at[1] * 1000.0];
+        t.down(1, at);
+        t.up(1);
+        assert!(t.sprint);
+        // Not a held stick press: the pad's own L3 latch stays out of it.
+        assert!(!t.state().held(xb::LEFT_THUMB));
+        let lit = KEYS.iter().position(|k| k.label == "SPRINT").unwrap();
+        assert!(t.picture().held[lit]);
+        t.down(2, at);
+        t.up(2);
+        assert!(!t.sprint);
     }
 
     #[test]
