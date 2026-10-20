@@ -88,6 +88,9 @@ const PRESS_AGAIN: f32 = 3.0;
 /// A spot to fire from more than this above or below her once she is
 /// over it is one she can't get to (metres). Invented.
 const SPOT_RISE: f32 = 2.5;
+/// A vehicle's cannon in range of her goal this long (seconds) without
+/// bringing it down, she gets out. Invented.
+const CANNON_GIVE_UP: f32 = 30.0;
 const VANTAGE_CLIMB: f32 = 3.0;
 /// Driving: she eases off within this far of a place (metres) above this
 /// speed (m/s); stuck this long (seconds), she backs out for this long.
@@ -286,6 +289,8 @@ pub struct Autoplay {
     planted: Option<f32>,
     /// When she last took a prompt of the scripts' at her goal.
     context_pressed: f32,
+    /// Seconds a vehicle's cannon has been in range of her goal.
+    gunning: f32,
     /// Sidestepping (-1 left, 1 right), seconds left.
     sidestep: Option<(f32, f32)>,
     /// Which way the next sidestep goes.
@@ -419,6 +424,7 @@ impl Autoplay {
             self.reversing = None;
             self.stalled = 0.0;
             self.way = None;
+            self.gunning = 0.0;
         }
         self.goal = chosen.map(|c| c.0);
         // The scripts' prompt on what she went to (a verify on a body, a
@@ -1573,6 +1579,18 @@ impl Autoplay {
         }
         if d > CANNON_RANGE {
             return self.drive(game, i, target, CANNON_RANGE - 10.0, dt);
+        }
+        // In range this long and the goal still there (round 8's tank
+        // below the hilltop MLRS, 34 m up: 250 s, its gun at its stop):
+        // out, to go on on foot.
+        self.gunning += dt;
+        if self.gunning > CANNON_GIVE_UP && self.can_leave(game, i) {
+            eprintln!(
+                "autoplay {:.1} s: the {} has had {} in range {:.0} s: getting out",
+                self.clock, v.spec.label, self.what, self.gunning
+            );
+            self.leave = true;
+            return self.press(speed);
         }
         let Some(p) = game.scene.player.as_ref() else {
             return Intent::default();
