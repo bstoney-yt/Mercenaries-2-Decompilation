@@ -1383,6 +1383,47 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&pg, "FastCollectHumans", |w, lua, a| {
         collect(w, lua, a, &["Human", "Soldier", "Civilian"], &[])
     })?;
+    // Pg.GetObjectsInArea(x, y, z, radius, name): the objects of that
+    // name (a template's label: PirCon002's `"RumJug"`s on its truck's
+    // bed, counted with `table.getn`) within the radius.
+    add(&pg, "GetObjectsInArea", |w, lua, a| {
+        let list = lua.create_table()?;
+        let (Some(x), Some(y), Some(z), Some(r), Some(Value::String(name))) = (
+            num(a.first()),
+            num(a.get(1)),
+            num(a.get(2)),
+            num(a.get(3)),
+            a.get(4),
+        ) else {
+            return values([Value::Table(list)]);
+        };
+        let name = name.to_string_lossy();
+        let label = [
+            m2_assets::name_hash(&name),
+            m2_assets::name_hash(&name.to_ascii_lowercase()),
+        ];
+        // By its label, or by its name (a layer's `RumJug 03`, or the
+        // template name a spawned one carries).
+        let mut found: Vec<u32> = w
+            .objects
+            .iter()
+            .filter(|(_, o)| !o.hidden && o.alive)
+            .filter(|(_, o)| {
+                o.all_labels().iter().any(|l| label.contains(l))
+                    || m2_engine::world::member_stem(&o.name).eq_ignore_ascii_case(&name)
+            })
+            .filter_map(|(&g, _)| {
+                let p = w.place_of(g)?;
+                let d = ((p[0] - x).powi(2) + (p[1] - y).powi(2) + (p[2] - z).powi(2)).sqrt();
+                (d <= r).then_some(g)
+            })
+            .collect();
+        found.sort_unstable();
+        for g in found {
+            list.raw_push(guid_value(Some(g)))?;
+        }
+        values([Value::Table(list)])
+    })?;
     add(&pg, "FastCollectTanks", |w, lua, a| {
         collect(w, lua, a, &["Tank"], &[])
     })?;
@@ -3756,6 +3797,23 @@ mod tests {
             w.take_commands(),
             [Command::Notify("Pg.ContractActivated".into())]
         );
+    }
+
+    #[test]
+    fn objects_in_an_area_are_found_by_name() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(10, Object::new("RumJug 01", [1.0, 0.0, 0.0]));
+            w.insert(11, Object::new("RumJug 02", [9.0, 0.0, 0.0]));
+            w.insert(12, Object::new("Crate 01", [0.5, 0.0, 0.0]));
+        }
+        let n: i64 = host
+            .lua()
+            .load("return table.getn(Pg.GetObjectsInArea(0, 0, 0, 2, 'RumJug'))")
+            .eval()
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
