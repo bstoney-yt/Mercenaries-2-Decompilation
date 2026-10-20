@@ -32,6 +32,9 @@ pub struct Setup {
     pub name: String,
     /// Through the internet (the public relay); off, only this network.
     pub relay: bool,
+    /// Hosting, put the invite link on the clipboard to paste to a
+    /// friend (not in test runs, which would overwrite it).
+    pub copy_link: bool,
 }
 
 /// Counts for the log and the end-of-run summary.
@@ -51,12 +54,14 @@ pub struct Coop {
     session: Session,
     playback: Playback,
     hero: Hero,
+    copy_link: bool,
     pub peer: Option<Hello>,
     pub invite: Option<Invite>,
-    since_send: f32,
+    /// When the last snapshot went, on the session's clock.
+    last_sent: f64,
     started: Instant,
     last_log: f64,
-    last_puppet: Option<m2_math::glam::Vec3>,
+    last_puppet: Option<(m2_math::glam::Vec3, f64)>,
     pub stats: Stats,
 }
 
@@ -109,9 +114,10 @@ impl Coop {
             session,
             playback: Playback::new(),
             hero,
+            copy_link: setup.copy_link,
             peer: None,
             invite: None,
-            since_send: 0.0,
+            last_sent: f64::NEG_INFINITY,
             started: Instant::now(),
             last_log: 0.0,
             last_puppet: None,
@@ -124,26 +130,30 @@ impl Coop {
         for e in self.session.poll() {
             self.event(e, game, backend);
         }
-        if self.peer.is_some() {
-            self.since_send += dt;
-            if self.since_send >= 1.0 / SEND_RATE {
-                self.since_send = 0.0;
-                if let Some(state) = hero_state(game, self.session.now()) {
-                    self.session.send_hero(state);
-                    self.stats.sent += 1;
-                }
+        // On the session's clock, not the game's: a slow frame still
+        // sends on time (at most one a frame).
+        let now = self.session.now();
+        let every = 1.0 / f64::from(SEND_RATE);
+        if self.peer.is_some() && now - self.last_sent >= every {
+            // Due a step on from the last, so frames a little faster
+            // than the rate still send it in full.
+            self.last_sent = (self.last_sent + every).max(now - every);
+            if let Some(state) = hero_state(game, now) {
+                self.session.send_hero(state);
+                self.stats.sent += 1;
             }
         }
         if let Some(p) = &mut game.scene.puppet
-            && let Some(pose) = self.playback.sample(self.session.now())
+            && let Some(pose) = self.playback.sample(now)
         {
             p.step(&pose, dt);
-            if let Some(last) = self.last_puppet
-                && dt > 0.0
+            if let Some((last, at)) = self.last_puppet
+                && now - at > 1e-4
             {
-                self.stats.speeds.push(last.distance(p.position) / dt);
+                let speed = last.distance(p.position) / (now - at) as f32;
+                self.stats.speeds.push(speed);
             }
-            self.last_puppet = Some(p.position);
+            self.last_puppet = Some((p.position, now));
         }
         let t = self.started.elapsed().as_secs_f64();
         if self.peer.is_some() && t - self.last_log >= 1.0 {
@@ -165,6 +175,9 @@ impl Coop {
                 // the same network.
                 eprintln!("coop: invite link {}", i.without_direct().link());
                 eprintln!("coop: invite code {i}");
+                if self.copy_link && m2_sys::clipboard::set_text(&i.without_direct().link()) {
+                    eprintln!("coop: the invite link is on the clipboard");
+                }
                 self.invite = Some(i);
             }
             Event::Connected(h) => {
@@ -360,7 +373,7 @@ pub fn offscreen(
         crate::render(backend, game, fov, aspect, None)?;
         if !mid && coop.peer.is_some() && start.elapsed().as_secs_f32() > seconds * 0.5 {
             mid = true;
-            crate::write_ppm(backend, &out.with_extension("mid.ppm"))?;
+            picture_with_puppet(backend, game, fov, aspect, &out.with_extension("mid.ppm"))?;
         }
         next += tick;
         if let Some(wait) = next.checked_duration_since(Instant::now()) {
@@ -370,11 +383,42 @@ pub fn offscreen(
             next = Instant::now();
         }
     }
-    crate::write_ppm(backend, out)?;
+    picture_with_puppet(backend, game, fov, aspect, out)?;
     eprintln!("{}", coop.summary());
     coop.leave();
     std::thread::sleep(Duration::from_millis(600));
     Ok(())
+}
+
+/// The picture with the camera turned (behind her) towards the other
+/// hero, so it is in it, logging where both are.
+fn picture_with_puppet(
+    backend: &mut m2_render::gpu::WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    let target = game
+        .scene
+        .puppet
+        .as_ref()
+        .filter(|p| p.shown)
+        .map(|p| p.position);
+    if let (Some(target), Some(player)) = (target, game.scene.player.as_mut()) {
+        let d = target - player.character.position;
+        player.yaw = d.x.atan2(d.z);
+        eprintln!(
+            "coop picture {}: the other hero {:.1} m off, at {:.1},{:.1},{:.1}",
+            out.display(),
+            d.length(),
+            target.x,
+            target.y,
+            target.z
+        );
+    }
+    crate::render(backend, game, fov, aspect, None)?;
+    crate::write_ppm(backend, out)
 }
 
 #[cfg(test)]

@@ -867,10 +867,22 @@ fn parse_args() -> anyhow::Result<Options> {
     if o.alpha {
         o.mission = true;
     }
+    if coop_role.is_none() && o.alpha {
+        // The join page copies `m2coop:<code>` before the download: the
+        // whole game, launched plain, joins it.
+        coop_role = m2_sys::clipboard::text()
+            .filter(|t| t.trim_start().starts_with("m2coop:"))
+            .and_then(|t| t.parse::<m2_net::Invite>().ok())
+            .map(|invite| {
+                eprintln!("coop: joining the invite on the clipboard");
+                coop::Role::Join(invite)
+            });
+    }
     o.coop = coop_role.map(|role| coop::Setup {
         role,
         name: coop_name.unwrap_or_else(|| "Player".into()),
         relay: !coop_local,
+        copy_link: o.screenshot.is_none(),
     });
     Ok(o)
 }

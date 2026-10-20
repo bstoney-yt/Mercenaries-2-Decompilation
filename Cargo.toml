@@ -43,6 +43,7 @@ mlua = { version = "0.11", features = ["lua51", "vendored"] }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D9",
+    "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Registry",

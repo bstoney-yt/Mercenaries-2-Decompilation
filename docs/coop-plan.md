@@ -67,6 +67,12 @@ link keeps working, and since anyone with the link can ask to join, the
 host's game asks the host to accept a new player. (Stage 1 makes a new
 key each session and lets the first player in.)
 
+Done ahead of stage 4 (approved): the join page is `docs/join/index.html`
+(served by GitHub Pages from `main`'s `docs/`); `.github/workflows/beta.yml`
+publishes the release on a `beta-*` tag; hosting puts the link on the
+clipboard; and the whole game, launched plain, joins an `m2coop:` invite
+it finds on the clipboard (the page copies one before the download).
+
 ## Finding the friend's install
 
 In order: `--install` or the settings' `install`; the usual Program Files
