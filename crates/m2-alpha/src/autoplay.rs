@@ -96,6 +96,11 @@ const LANDING_DRY: f32 = 0.3;
 /// How far (metres) short of a way out, towards her, the water must be
 /// shallow enough to stand in. Invented.
 const LANDING_WADE: f32 = 2.0;
+/// Ways out she doesn't get out at before she is hopped out. Invented.
+const STRANDED_HOP: u32 = 2;
+/// A thing to blow up lower than this (metres) over the waterline is on
+/// the water. Invented.
+const AFLOAT: f32 = 3.0;
 /// Ground this far (metres) below her feet a step ahead is a drop she
 /// doesn't step closer over. Invented.
 const LEDGE_DROP: f32 = 3.0;
@@ -330,6 +335,8 @@ pub struct Autoplay {
     /// things to blow up she passed over for now (object, until when).
     nowhere: u32,
     passed: Vec<(u32, f32)>,
+    /// Ways out of the water in a row she didn't get out at.
+    stranded: u32,
     /// With the launcher empty, the C4 she set on what she is blowing up
     /// and when, while she gets clear to set it off.
     planted: Option<f32>,
@@ -1402,6 +1409,7 @@ impl Autoplay {
             return Intent::default();
         };
         let here = p.character.position;
+        let swimming_now = p.swimming();
         let d = at.distance(here);
         let lobbing = game.combat.second == Some(Weapon::GrenadeLauncher);
         let (near, far) = if lobbing { LOB_RANGE } else { BLAST_RANGE };
@@ -1417,7 +1425,7 @@ impl Autoplay {
             return self.plant(game, at, dt);
         }
         // In the water she can't fire: out where she can climb, first.
-        if p.swimming() {
+        if swimming_now {
             let out = game
                 .scene
                 .world
@@ -1434,6 +1442,25 @@ impl Autoplay {
                 self.tried.push(l);
                 self.landing = None;
                 self.fresh_headway();
+                self.stranded += 1;
+                // Swimming she gets out at none of them (round 33's
+                // AllCon002: 11 banks in 2000 s): hopped out, as a hop
+                // anywhere she makes no headway, and logged with them.
+                if self.stranded >= STRANDED_HOP
+                    && let Some(p) = game.scene.player.as_mut()
+                {
+                    eprintln!(
+                        "autoplay {:.1} s: no headway for {:.0} s at {here:.1} ({}): hopped to {l:.1}",
+                        self.clock,
+                        SPOT_GIVE_UP * self.stranded as f32,
+                        self.what
+                    );
+                    p.character.position = l + Vec3::Y * 0.1;
+                    p.character.velocity = Vec3::ZERO;
+                    self.hops.push((here, l));
+                    self.stranded = 0;
+                    return Intent::default();
+                }
             }
             if let Some(out) = out {
                 if self.landing.is_none_or(|l| l.distance(out) > 4.0) {
@@ -1447,8 +1474,13 @@ impl Autoplay {
                 self.blocked = 0.0;
                 return self.walk(game, out, 1.0, dt);
             }
+        } else {
+            self.stranded = 0;
         }
         self.landing = None;
+        let Some(p) = game.scene.player.as_ref() else {
+            return Intent::default();
+        };
         // Going where she can fire from (in range, nothing in the way).
         if let Some((_, spot)) = self.blast_spot {
             if spot.with_y(0.0).distance(here.with_y(0.0)) >= ARRIVE {
@@ -1482,6 +1514,24 @@ impl Autoplay {
             }
         }
         if d > far {
+            // A boat: from a dry spot in range, not straight out at it into
+            // the river (rounds 30 to 33's AllCon002, 48 m short of the
+            // first boat, in the water from there on).
+            if self.blast_spot.is_none()
+                && at.y < WATERLINE + AFLOAT
+                && let Some(s) = game.scene.world.as_ref().and_then(|w| {
+                    let rings: &[f32] = if lobbing { &LOB_RINGS } else { &BLAST_RINGS };
+                    vantage(&w.physics, at, here, &self.tried, rings, BLAST_BODY)
+                })
+            {
+                eprintln!(
+                    "autoplay {:.1} s: {} is on the water: firing from {s:.1}",
+                    self.clock, self.what
+                );
+                self.blast_spot = Some((target, s));
+                self.fresh_headway();
+                return self.walk(game, s, 1.0, dt);
+            }
             return self.walk(game, at, far - 5.0, dt);
         }
         if d < near {
