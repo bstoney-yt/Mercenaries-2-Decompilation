@@ -2033,7 +2033,13 @@ impl Autoplay {
     fn hop(&mut self, game: &mut Game, at: Vec3, stuck: f32) {
         let from = game.focus();
         let flat = (at - from).with_y(0.0);
-        let mut to = from + flat.normalize_or_zero() * flat.length().min(HOP);
+        // Not onto what she is blowing up (round 20's AllCon003: hopped onto
+        // the last AA gun, too close to fire and stuck on it 2000 s).
+        let keep = match self.goal {
+            Some(Goal::Blast { .. }) => BLAST_RANGE.0 + 5.0,
+            _ => 0.0,
+        };
+        let mut to = from + flat.normalize_or_zero() * (flat.length() - keep).clamp(0.0, HOP);
         let (Some(world), Some(p)) = (&mut game.scene.world, &mut game.scene.player) else {
             return;
         };
