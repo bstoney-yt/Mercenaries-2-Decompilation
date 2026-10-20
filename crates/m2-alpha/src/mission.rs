@@ -3677,6 +3677,26 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
 /// or the layers they stream; true when it seated her in a vehicle the
 /// island doesn't show, so she stands where it is.
 fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> bool {
+    // A person the scripts make (`Pg.Spawn` of a person's template) stands
+    // as a layer's spawn would; one they take away goes.
+    match c {
+        Command::Spawn {
+            guid,
+            what,
+            position,
+            yaw,
+        } => {
+            if let Some(s) = game.scene.world.as_ref().and_then(|w| {
+                w.index
+                    .template_db
+                    .scripted_spawn(*guid, what, Vec3::from(*position), *yaw)
+            }) {
+                game.scene.people.scripted_spawn(s);
+            }
+        }
+        Command::Remove(guid) => game.scene.people.scripted_gone(*guid),
+        _ => {}
+    }
     let index = |guid: &u32| {
         game.scene
             .vehicles

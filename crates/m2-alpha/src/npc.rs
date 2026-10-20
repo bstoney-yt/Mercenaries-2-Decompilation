@@ -1967,6 +1967,9 @@ pub struct People {
     /// Where the scripts last sent people ([`People::walk`]), by spawn
     /// entity.
     routes: HashMap<u32, Vec<Vec3>>,
+    /// People the scripts made (`Pg.Spawn`: GurCon002's Mendez), standing
+    /// as a layer's would ([`People::scripted_spawn`]).
+    scripted: Vec<SpawnPoint>,
     active: HashSet<u32>,
     /// Spawners sending from a list, by entity: their `SecondsPerCycle`
     /// (filled on first use).
@@ -2836,6 +2839,11 @@ impl People {
         self.pursue(dt);
         self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
+        let scripted = std::mem::take(&mut self.scripted);
+        if !scripted.is_empty() {
+            self.populate(physics, &scripted, focus);
+        }
+        self.scripted = scripted;
         let mut callouts = Vec::new();
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
@@ -3017,6 +3025,22 @@ impl People {
             n.brain = Brain::Post { facing: n.facing };
         }
         eprintln!("people: the scripts put {entity:08x} at {at:.1}");
+    }
+
+    /// The scripts made a person (`Pg.Spawn` of a person's template): they
+    /// come into play as a layer's spawn does, once she is near.
+    pub fn scripted_spawn(&mut self, spawn: SpawnPoint) {
+        eprintln!(
+            "people: the scripts make {:?} ({:08x}) at {:.1}",
+            spawn.name, spawn.entity, spawn.position
+        );
+        self.scripted.retain(|s| s.entity != spawn.entity);
+        self.scripted.push(spawn);
+    }
+
+    /// The scripts took away a person they made: they don't come again.
+    pub fn scripted_gone(&mut self, entity: u32) {
+        self.scripted.retain(|s| s.entity != entity);
     }
 
     /// The people who got to the end of a route the scripts sent them

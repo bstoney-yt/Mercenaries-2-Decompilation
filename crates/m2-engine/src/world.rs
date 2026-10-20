@@ -458,6 +458,37 @@ impl Templates {
             .collect()
     }
 
+    /// A person the scripts make from template `name` (`Pg.Spawn`, as
+    /// GurCon002 makes Mendez) as entity `entity`, standing at `position`
+    /// facing `yaw` (about +y from +z, as the scripts give it), as a layer
+    /// would place one; `None` when the template isn't a person's.
+    pub fn scripted_spawn(
+        &self,
+        entity: u32,
+        name: &str,
+        position: Vec3,
+        yaw: f32,
+    ) -> Option<SpawnPoint> {
+        let id = *self.ids(name).first()?;
+        let (template, info) = self.by_id(id)?;
+        let model = info.model.filter(|_| info.human)?;
+        Some(SpawnPoint {
+            entity,
+            name: name.to_owned(),
+            template: Some(template.to_owned()),
+            position,
+            rotation: Quat::from_rotation_y(yaw),
+            route: Vec::new(),
+            layer: None,
+            static_layer: false,
+            model: Some(model),
+            list: Vec::new(),
+            ai: self.ai.get(&id).copied(),
+            gun: self.rifle_of(id).map(|(_, g)| g),
+            cycle: None,
+        })
+    }
+
     /// The template with id `id` (an entity's parent): its name, and what
     /// the database says of it.
     pub fn by_id(&self, id: u32) -> Option<(&str, &TemplateInfo)> {
