@@ -194,6 +194,19 @@ impl Flow {
         }
     }
 
+    /// A tap on the screen (a phone): skips the movie that is up, or starts
+    /// the shell from its press-start screen, as Enter does. Past that,
+    /// the shell's menus take taps as their pointer's clicks.
+    pub fn tap(&mut self) {
+        let at_press_start = self
+            .shell
+            .as_ref()
+            .is_some_and(|s| s.ready() && !s.shell().started);
+        if self.stage != Stage::FrontEnd || !self.shell_up() || at_press_start {
+            self.key(KeyCode::Enter);
+        }
+    }
+
     /// The shell's menus are up and take the keys.
     fn shell_up(&self) -> bool {
         self.shell.as_ref().is_some_and(GameHud::ready)

@@ -7945,6 +7945,13 @@ impl ApplicationHandler for App {
                 return;
             }
             state.pad.touch.clear();
+            // A tap skips a movie or presses start, as Enter does.
+            if t.phase == winit::event::TouchPhase::Started
+                && !state.hud.menu
+                && let Some(flow) = state.flow.as_mut().filter(|f| f.holds())
+            {
+                flow.tap();
+            }
         }
         // The menu takes the mouse and keys while it is open (Escape still
         // closes it).
