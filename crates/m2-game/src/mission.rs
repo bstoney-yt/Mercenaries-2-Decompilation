@@ -285,6 +285,10 @@ pub struct GameData {
     /// names them (`"AH1Z (Ewan)"`: `"Recruit Ewen Garret"`), by the
     /// template's name in lower case, for vehicles the scripts spawn.
     pub template_drivers: HashMap<String, String>,
+    /// Who else rides a template's vehicle, as its other `Rider` records
+    /// name them (`"Ka29b (Full)"`: the soldiers a soldier delivery
+    /// brings), by the template's name in lower case.
+    pub template_passengers: HashMap<String, Vec<String>>,
     /// Weapon templates' `MaxAmmoReserve` and which are thrown, by name in
     /// lower case ([`crate::inventory::read`]).
     pub max_reserve: HashMap<String, u32>,
@@ -489,6 +493,15 @@ impl GameData {
                 data.template_drivers
                     .insert(name.to_ascii_lowercase(), driver);
             }
+            let others: Vec<String> = crew_of(records)
+                .into_iter()
+                .filter(|(seat, _)| seat != "seat_driver")
+                .map(|(_, rider)| rider)
+                .collect();
+            if let (Some(name), false) = (named(template), others.is_empty()) {
+                data.template_passengers
+                    .insert(name.to_ascii_lowercase(), others);
+            }
         }
         for (layer, i, records) in own_riders {
             data.layers.get_mut(&layer).expect("indexed above")[i].crew = crew_of(&records);
@@ -593,6 +606,7 @@ impl Mission {
             strings,
             template_labels,
             template_drivers,
+            template_passengers,
             max_reserve,
             thrown,
         } = data;
@@ -613,6 +627,7 @@ impl Mission {
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
             w.template_drivers = template_drivers;
+            w.template_passengers = template_passengers;
             w.inventory.max_reserve = max_reserve;
             w.inventory.thrown = thrown;
             for e in layers.values().flatten() {

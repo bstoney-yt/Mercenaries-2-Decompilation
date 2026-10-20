@@ -17,7 +17,7 @@ use crate::game::{Game, can_get_out, get_out, place};
 use crate::mission::{Mark, WATERLINE};
 use crate::player::{Intent, Player};
 use crate::route::{Mover, Route};
-use crate::support::{Aim, PDA_CLOSE, PDA_OPEN, Phase};
+use crate::support::{Aim, Entry, PDA_CLOSE, PDA_OPEN, Phase};
 
 /// How fast she turns the camera, radians a second (a quick hand on the
 /// mouse).
@@ -209,6 +209,13 @@ const PDA_MOST: f32 = 15.0;
 const PDA_PROMPT: f32 = 3.0;
 /// Seconds between lines saying how she is getting on.
 const REPORT: f32 = 15.0;
+/// An outpost to capture (`HUD_objective_outpost` on its capture point):
+/// she goes within this far (metres) and calls in the soldier delivery
+/// she holds (the outpost gives her one of its attackers' free,
+/// `Outpost.GetFreebieName`), at most once in this long (seconds), and
+/// stands by while their soldiers take the point.
+const OUTPOST_NEAR: f32 = 20.0;
+const DELIVERY_AGAIN: f32 = 60.0;
 
 /// What she is after.
 #[derive(Clone, Debug, PartialEq)]
@@ -227,6 +234,9 @@ enum Goal {
     /// Take one thing a supply crate left (walking up to it), by its
     /// [`Pickup::key`](crate::flights::Pickup::key).
     Take((u32, u32)),
+    /// Call in the scripts' support item `key` she holds (a soldier
+    /// delivery, by an outpost): the support menu, then its designator.
+    Deliver(String),
 }
 
 impl Goal {
@@ -238,6 +248,7 @@ impl Goal {
             (Goal::Shoot(a), Goal::Shoot(b)) | (Goal::Board(a), Goal::Board(b)) => a == b,
             (Goal::Open(a), Goal::Open(b)) => a == b,
             (Goal::Take(a), Goal::Take(b)) => a == b,
+            (Goal::Deliver(a), Goal::Deliver(b)) => a == b,
             _ => false,
         }
     }
@@ -336,6 +347,8 @@ pub struct Autoplay {
     pda_since: Option<f32>,
     pda_pressed: f32,
     pda_asked: Option<f32>,
+    /// When she last called in a soldier delivery by an outpost.
+    delivered: Option<f32>,
 }
 
 impl Autoplay {
@@ -453,7 +466,8 @@ impl Autoplay {
             self.report(game);
         }
         let sturdy = |target: &u32| game.scene.props.sturdy.contains(target);
-        let striking = matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target));
+        let striking = matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target))
+            || matches!(self.goal, Some(Goal::Deliver(_)));
         // A call she is no longer after is put away: the designator goes
         // with a weapon taken up (twice from the satellite's view).
         if !striking && (game.support.busy() || game.support.holding()) {
@@ -474,7 +488,51 @@ impl Autoplay {
             Some(Goal::Board(i)) => self.board(game, i, dt),
             Some(Goal::Open(target)) => self.open(game, target, dt),
             Some(Goal::Take(key)) => self.take(game, key, dt),
+            Some(Goal::Deliver(key)) => self.deliver(game, &key),
         }
+    }
+
+    /// Calls in the support item `key` she holds, as a player does: her
+    /// PDA shut, the item chosen in the support menu and taken, its
+    /// designator thrown (or aimed and confirmed).
+    fn deliver(&mut self, game: &mut Game, key: &str) -> Intent {
+        let mut intent = Intent::default();
+        if game.support.pda {
+            self.tapped = !self.tapped;
+            intent.trigger.pda = self.tapped;
+            return intent;
+        }
+        if game.combat.to_throw {
+            intent.trigger.throw = true;
+            return intent;
+        }
+        match game.support.phase {
+            Phase::Idle => {
+                if let Some(i) = game
+                    .support
+                    .entries()
+                    .iter()
+                    .position(|e| matches!(e, Entry::Stocked(s) if s.key == key))
+                {
+                    game.support.selected = i;
+                    intent.trigger.support = true;
+                }
+            }
+            Phase::Menu => {
+                intent.use_pressed = true;
+                self.delivered = Some(self.clock);
+                eprintln!("autoplay {:.1} s: calling in {key}", self.clock);
+            }
+            Phase::Designating { aim, .. } => match aim {
+                Aim::Satellite => {
+                    self.tapped = !self.tapped;
+                    intent.trigger.fire = self.tapped;
+                }
+                Aim::Laser => intent.trigger.fire = true,
+            },
+            _ => {}
+        }
+        intent
     }
 
     /// What to do next, and words for the log.
@@ -503,6 +561,45 @@ impl Autoplay {
         fn nearest(ms: Vec<&Mark>, here: Vec3) -> Option<&Mark> {
             ms.into_iter()
                 .min_by(|a, b| a.at.distance(here).total_cmp(&b.at.distance(here)))
+        }
+        // An outpost to capture: there, the soldier delivery she holds
+        // called in (its soldiers take the point), then she stands by.
+        let outposts: Vec<&Mark> = live
+            .iter()
+            .copied()
+            .filter(|m| m.kind == "outpost")
+            .collect();
+        if let Some(m) = nearest(outposts, here) {
+            let d = m.at.distance(here);
+            let held = game.support.entries().into_iter().find_map(|e| match e {
+                Entry::Stocked(s) if s.key.starts_with("SoldierDelivery") => Some(s.key.clone()),
+                _ => None,
+            });
+            let again = self
+                .delivered
+                .is_none_or(|t| self.clock - t > DELIVERY_AGAIN);
+            if d < OUTPOST_NEAR
+                && driving.is_none()
+                && let Some(key) = held.filter(|_| again || game.support.phase != Phase::Idle)
+            {
+                return Some((
+                    Goal::Deliver(key.clone()),
+                    format!(
+                        "calling in {key} by the outpost {} ({:#x})",
+                        m.name, m.target
+                    ),
+                ));
+            }
+            return Some((
+                Goal::Reach {
+                    target: m.target,
+                    at: m.at,
+                },
+                format!(
+                    "taking the outpost {} ({:#x}), {d:.0} m off",
+                    m.name, m.target
+                ),
+            ));
         }
         // A supply crate down near her or marked (or the one she set out
         // to open): broken open first, for what is inside.

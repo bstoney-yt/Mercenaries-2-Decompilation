@@ -2467,6 +2467,44 @@ impl People {
         true
     }
 
+    /// A soldier of the scripts' own, `guid` (template `template`, its own
+    /// model `model`), on foot at `at`: a soldier delivery's, set down by
+    /// `Ai.Deploy`. Brought into play the first time as a soldier of their
+    /// template's faction, running any route the scripts already gave
+    /// them ([`People::walk`]: an outpost's rushers); moved after. False
+    /// when their kind isn't in yet.
+    pub(crate) fn bring_scripted(
+        &mut self,
+        guid: u32,
+        template: &str,
+        model: Option<u32>,
+        at: Vec3,
+    ) -> bool {
+        if let Some(n) = self.npcs.iter_mut().find(|n| n.spawn == Some(guid)) {
+            n.character.position = at;
+            n.character.velocity = Vec3::ZERO;
+            return true;
+        }
+        let Some(kind) = self.rider_kind(template, model) else {
+            return false;
+        };
+        let brain = match self.routes.get(&guid) {
+            Some(route) => Brain::Route {
+                route: route.clone(),
+                next: 0,
+            },
+            None => Brain::Post { facing: 0.0 },
+        };
+        let mut n = Npc::new(kind, &self.kinds[kind].rig, at, 0.0, brain, Some(guid));
+        n.outfit = self.dress_as(kind, template);
+        n.soldier = true;
+        n.faction = faction_of(template);
+        n.gun = self.kinds[kind].gun;
+        eprintln!("people: the scripts' {template} ({guid:#x}) comes into play at {at:.1}");
+        self.npcs.push(n);
+        true
+    }
+
     /// The scripts' own `guid` ([`People::stand_scripted`]) is no longer
     /// on foot (back in a seat, or gone).
     pub(crate) fn unstand_scripted(&mut self, physics: &mut Physics, guid: u32) {

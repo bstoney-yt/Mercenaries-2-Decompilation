@@ -118,6 +118,29 @@ impl Object {
         })
     }
 
+    /// The faction it belongs to, as a faction's guid: its own (a zone's),
+    /// else the faction its template's name begins with (`VZ Heavy (AA
+    /// Missile)`, `Chinese Soldier`): inferred from the layers' person
+    /// templates, as `m2-alpha`'s `npc::faction_of`; a template's own
+    /// faction link isn't read.
+    pub fn faction_guid(&self) -> Option<u32> {
+        self.faction.or_else(|| {
+            let n = self.name.to_ascii_lowercase();
+            [
+                ("vz ", "VZ"),
+                ("allied ", "Allied"),
+                ("chinese ", "China"),
+                ("china ", "China"),
+                ("guerilla ", "Guerilla"),
+                ("guerrilla ", "Guerilla"),
+                ("oc ", "OC"),
+                ("pirate ", "Pirate"),
+            ]
+            .into_iter()
+            .find_map(|(prefix, f)| n.starts_with(prefix).then(|| m2_assets::name_hash(f)))
+        })
+    }
+
     /// Its labels as name hashes: those scripts gave it and the data's.
     pub fn all_labels(&self) -> Vec<u32> {
         self.labels
@@ -558,6 +581,9 @@ pub struct ScriptWorld {
     /// `Rider` in the driver's seat names them: a vehicle spawned without
     /// "(Driver)" in its name comes with them ([`ScriptWorld::spawn`]).
     pub template_drivers: HashMap<String, String>,
+    /// Who else rides each template's vehicle (its other `Rider`
+    /// records): a `(Full)` vehicle spawned comes with them too.
+    pub template_passengers: HashMap<String, Vec<String>>,
     /// Every layer entity's place, and its guid by name in lower case,
     /// loaded or not: `Pg.GetGuidByName` finds markers (landing zones) of
     /// layers that aren't in, and scripts measure to them.
@@ -727,6 +753,39 @@ impl ScriptWorld {
                 seat: "d".into(),
                 instant: true,
             });
+        }
+        // A full one (`"Ka29b (Full)"`, a soldier delivery's) comes with its
+        // passengers too, as its other `Rider` records name them
+        // (inferred from the name: `MrxSoldierDelivery` takes them out with
+        // `Ai.Deploy` once it has landed).
+        if lower.contains("(full)") {
+            for rider in self
+                .template_passengers
+                .get(&lower)
+                .cloned()
+                .unwrap_or_default()
+            {
+                let g = self.spawn_guid();
+                let mut o = Object::new(&rider, position);
+                o.vehicle = Some(guid);
+                o.seated_instantly = true;
+                if let Some(l) = self.template_labels.get(&rider.to_ascii_lowercase()) {
+                    o.label_hashes.clone_from(l);
+                }
+                self.insert(g, o);
+                self.commands.push(Command::Spawn {
+                    guid: g,
+                    what: rider,
+                    position,
+                    yaw,
+                });
+                self.commands.push(Command::EnterVehicle {
+                    guid: g,
+                    vehicle: guid,
+                    seat: "p".into(),
+                    instant: true,
+                });
+            }
         }
         guid
     }
@@ -1104,6 +1163,22 @@ pub const FACTIONS: [&str; 9] = [
     "Allied", "China", "Civ", "Guerilla", "OC", "Pirate", "PMC", "VZ", "Police",
 ];
 
+/// The faction a guid names, lower case: a faction's (the hash of its
+/// name, as `Pg.GetGuidByName("OC")` answers), else a template's object
+/// (the guids a template name was given before factions had their own).
+fn faction_named(w: &ScriptWorld, g: u32) -> Option<String> {
+    FACTIONS
+        .iter()
+        .find(|f| m2_assets::name_hash(f) == g)
+        .map(|f| f.to_ascii_lowercase())
+        .or_else(|| {
+            w.templates
+                .iter()
+                .find(|(_, t)| **t == g)
+                .map(|(n, _)| n.clone())
+        })
+}
+
 /// [`Object.GetHibernationDistance`]'s answer, metres.
 const HIBERNATION_DISTANCE: f64 = 155.0;
 
@@ -1252,12 +1327,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     fn pursue(w: &mut ScriptWorld, a: &[Value], locked: bool) {
         let Some(f) = id(a.first()) else { return };
         let level = num(a.get(1)).map_or(1, |l| l as i64).clamp(1, 3);
-        let Some(name) = w
-            .templates
-            .iter()
-            .find(|(_, g)| **g == f)
-            .map(|(n, _)| n.clone())
-        else {
+        let Some(name) = faction_named(w, f) else {
             return;
         };
         w.pursuit.level = level;
@@ -1282,12 +1352,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let Some(f) = id(a.first()) else {
             return values([]);
         };
-        let Some(name) = w
-            .templates
-            .iter()
-            .find(|(_, g)| **g == f)
-            .map(|(n, _)| n.clone())
-        else {
+        let Some(name) = faction_named(w, f) else {
             return values([]);
         };
         w.pursuit.level = w.pursuit.level.max(1);
@@ -1364,6 +1429,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 let name = s.to_string_lossy();
                 w.by_name(&name)
                     .or_else(|| w.entity_names.get(&name.to_ascii_lowercase()).copied())
+                    // A faction (`"China"`, an outpost's `sAttackers`): its
+                    // guid, which `Ai.GetFactionGuid` gives its people.
+                    .or_else(|| {
+                        FACTIONS
+                            .iter()
+                            .find(|f| f.eq_ignore_ascii_case(&name))
+                            .map(|f| m2_assets::name_hash(f))
+                    })
                     .or_else(|| is_template(&name).then(|| w.template(&name)))
             }
             _ => None,
@@ -2210,6 +2283,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .map(|(&g, _)| g)
             .collect();
         riders.sort_unstable();
+        // `"p"`: the passengers, not the driver (the first rider, as
+        // `Vehicle.GetDriver` has it; a soldier delivery's soldiers).
+        if matches!(a.get(1), Some(Value::String(s)) if s.as_bytes() == b"p") && !riders.is_empty()
+        {
+            riders.remove(0);
+        }
         for r in riders {
             t.raw_push(crate::events::guid_value(r))?;
         }
@@ -2310,16 +2389,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // template's guid (`Pg.GetGuidByName("OC")`): see
     // [`crate::report::Reports::multipliers`].
     add(&ai, "SetInfractionMultiplier", |w, _, a| {
-        let name = id(a.first())
-            .and_then(|g| w.objects.get(&g))
-            .map(|o| o.name.to_ascii_lowercase());
+        let name = id(a.first()).and_then(|g| faction_named(w, g));
         if let (Some(name), Some(m)) = (name, num(a.get(1))) {
             w.reports.multipliers.insert(name, m);
         }
         values([])
     })?;
     add(&ai, "GetFactionGuid", |w, _, a| {
-        let faction = id(a.first()).and_then(|g| w.objects.get(&g)?.faction);
+        let faction = id(a.first()).and_then(|g| w.objects.get(&g)?.faction_guid());
         values([guid_value(faction)])
     })?;
     // How one faction's AI regards another, -100 (hostile) to 100
@@ -2401,6 +2478,52 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&pg, "RemoveContextAction", |w, _, a| {
         if let Some(guid) = id(a.first()) {
             w.context_actions.remove(&guid);
+        }
+        values([])
+    })?;
+    // A vehicle's riders get out (`Ai.Deploy{ Vehicle, Role = "Passenger",
+    // Callback, CallbackData }`: a soldier delivery, once landed, puts its
+    // soldiers down; its callback then has them follow her): those of the
+    // role (all but the driver for passengers) step out beside it, and
+    // the callback runs on the next tick with its data unpacked (when the
+    // engine calls it, and with what more, is inferred).
+    add(&ai, "Deploy", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([]);
+        };
+        let Some(vehicle) = id(t.raw_get::<Value>("Vehicle").ok().as_ref()) else {
+            return values([]);
+        };
+        let passengers = matches!(
+            t.raw_get::<Value>("Role")?,
+            Value::String(s) if s.as_bytes().eq_ignore_ascii_case(b"passenger")
+        );
+        let mut riders: Vec<u32> = w
+            .objects
+            .iter()
+            .filter(|(_, o)| o.vehicle == Some(vehicle))
+            .map(|(&g, _)| g)
+            .collect();
+        riders.sort_unstable();
+        if passengers && !riders.is_empty() {
+            riders.remove(0);
+        }
+        let at = w.objects.get(&vehicle).map_or([0.0; 3], |o| o.position);
+        for (i, g) in riders.into_iter().enumerate() {
+            // Round the vehicle, 4 m out, a step apart.
+            let a = i as f32 * 0.7;
+            let position = [at[0] + 4.0 * a.sin(), at[1], at[2] + 4.0 * a.cos()];
+            if let Some(o) = w.objects.get_mut(&g) {
+                o.vehicle = None;
+                o.seated_instantly = false;
+                o.position = position;
+            }
+            w.commands.push(Command::ExitVehicle(g));
+            w.commands.push(Command::Move { guid: g, position });
+        }
+        if let Value::Function(f) = t.raw_get::<Value>("Callback")? {
+            let data = t.raw_get::<Value>("CallbackData")?;
+            w.asset_loads.push((f, data));
         }
         values([])
     })?;
@@ -3132,10 +3255,27 @@ fn collect(
             .collect()
     };
     let (with, without) = (hashes(with), hashes(without));
+    // Then the factions to keep, by name: `"China"`, or several joined
+    // with `||` (an outpost's `"China||VZ"`); none keeps all.
+    let factions: Vec<u32> = a
+        .iter()
+        .skip(4)
+        .filter_map(|v| match v {
+            Value::String(s) => Some(s.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<String>()
+        .split("||")
+        .filter_map(|f| FACTIONS.iter().find(|x| x.eq_ignore_ascii_case(f.trim())))
+        .map(|f| m2_assets::name_hash(f))
+        .collect();
     let mut found: Vec<u32> = w
         .objects
         .iter()
         .filter(|(_, o)| !o.hidden)
+        .filter(|(_, o)| {
+            factions.is_empty() || o.faction_guid().is_some_and(|f| factions.contains(&f))
+        })
         .filter(|(_, o)| {
             let labels = o.all_labels();
             labels.iter().any(|l| with.contains(l)) && !labels.iter().any(|l| without.contains(l))
@@ -4230,6 +4370,34 @@ mod tests {
         // The tank and the jeep are ground vehicles; the far tank is out.
         assert_eq!((tanks, ground, flying), (1, 2, 0));
         assert!((d - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn an_outpost_tells_its_attackers_from_its_defenders() {
+        // `Outpost.CallForRushers` collects one side's people by the
+        // capture point; `RusherGoalFulfilled` then compares each one's
+        // faction with the outpost's `sAttackers` and `sDefenders`.
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            for (g, name) in [(70, "Chinese Soldier"), (71, "VZ Heavy (Light MG)")] {
+                let mut o = Object::new(name, [5.0, 0.0, 0.0]);
+                o.labels.push("Soldier".into());
+                w.insert(g, o);
+            }
+        }
+        let (china, all, same, other): (i64, i64, bool, bool) = host
+            .lua()
+            .load(
+                r#"local china = Pg.FastCollectHumans(0, 0, 0, 50, "China")
+                local all = Pg.FastCollectHumans(0, 0, 0, 50, "China||VZ")
+                local c = Ai.GetFactionGuid(china[1])
+                return #china, #all, c == Pg.GetGuidByName("China"),
+                    c == Pg.GetGuidByName("VZ")"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((china, all, same, other), (1, 2, true, false));
     }
 
     #[test]
