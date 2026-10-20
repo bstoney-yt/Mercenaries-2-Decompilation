@@ -93,6 +93,9 @@ const SPOT_RISE: f32 = 2.5;
 const LANDING_RINGS: [f32; 6] = [6.0, 12.0, 24.0, 48.0, 96.0, 192.0];
 /// Ground this far (metres) over the water is out of it. Invented.
 const LANDING_DRY: f32 = 0.3;
+/// How far (metres) short of a way out, towards her, the water must be
+/// shallow enough to stand in. Invented.
+const LANDING_WADE: f32 = 2.0;
 /// Ground this far (metres) below her feet a step ahead is a drop she
 /// doesn't step closer over. Invented.
 const LEDGE_DROP: f32 = 3.0;
@@ -1419,7 +1422,19 @@ impl Autoplay {
                 .scene
                 .world
                 .as_ref()
-                .and_then(|w| landing(&w.physics, here, at));
+                .and_then(|w| landing(&w.physics, here, at, &self.tried));
+            // One she swims at and can't climb out at: another.
+            if let Some(l) = self.landing
+                && self.since_moved() > SPOT_GIVE_UP
+            {
+                eprintln!(
+                    "autoplay {:.1} s: no way out at {l:.1} in {SPOT_GIVE_UP} s: another",
+                    self.clock
+                );
+                self.tried.push(l);
+                self.landing = None;
+                self.fresh_headway();
+            }
             if let Some(out) = out {
                 if self.landing.is_none_or(|l| l.distance(out) > 4.0) {
                     eprintln!(
@@ -2418,20 +2433,35 @@ fn vantage(
 /// in and no more than [`SPOT_RISE`] over the water (round 27's AllCon002:
 /// in the river under a bank 18 m high, she swam there 2000 s). Of the
 /// nearest ring with any, the one closest to `toward`.
-fn landing(physics: &Physics, at: Vec3, toward: Vec3) -> Option<Vec3> {
+fn landing(physics: &Physics, at: Vec3, toward: Vec3, tried: &[Vec3]) -> Option<Vec3> {
+    let ground = |x: f32, z: f32, water: f32| {
+        let top = Vec3::new(x, water + 30.0, z);
+        physics
+            .cast_ray(top, Vec3::NEG_Y, 60.0)
+            .map(|(d, n)| (top.y - d, n))
+    };
     LANDING_RINGS.iter().find_map(|&r| {
         (0..24)
             .filter_map(|k| {
                 let a = k as f32 * std::f32::consts::TAU / 24.0;
                 let (x, z) = (at.x + r * a.sin(), at.z + r * a.cos());
                 let water = physics.water_at(x, z).unwrap_or(WATERLINE).max(WATERLINE);
-                let top = Vec3::new(x, water + 30.0, z);
-                let (d, n) = physics.cast_ray(top, Vec3::NEG_Y, 60.0)?;
-                let spot = Vec3::new(x, top.y - d, z);
+                let (y, n) = ground(x, z, water)?;
+                let spot = Vec3::new(x, y, z);
                 let rise = spot.y - water;
                 // Dry: shallows she still swims in (round 30's AllCon002:
                 // 1900 s from one to the next) are no way out.
-                (n.y >= 0.7 && (LANDING_DRY..=SPOT_RISE).contains(&rise)).then_some(spot)
+                if n.y < 0.7
+                    || !(LANDING_DRY..=SPOT_RISE).contains(&rise)
+                    || tried.iter().any(|t| t.distance(spot) < 4.0)
+                {
+                    return None;
+                }
+                // And waded up to from her side, not a lip over deep water
+                // (round 32's AllCon002: 2900 tries at banks 1 m up).
+                let back = spot + (at - spot).with_y(0.0).normalize_or_zero() * LANDING_WADE;
+                let (by, _) = ground(back.x, back.z, water)?;
+                (water - by < crate::player::SWIM_STOP * 0.8).then_some(spot)
             })
             .min_by(|a, b| a.distance(toward).total_cmp(&b.distance(toward)))
     })
@@ -2886,7 +2916,7 @@ mod tests {
         );
         p.step(1.0 / 60.0);
         let here = Vec3::new(10.0, w - 0.3, 0.0);
-        let out = landing(&p, here, Vec3::new(30.0, w + 18.0, 0.0)).expect("a way out");
+        let out = landing(&p, here, Vec3::new(30.0, w + 18.0, 0.0), &[]).expect("a way out");
         assert!(out.x < -30.0, "not on the beach: {out}");
         assert!((out.y - (w + 0.5)).abs() < 0.1, "{out}");
         // No beach at all: nowhere.
@@ -2904,7 +2934,7 @@ mod tests {
             Quat::IDENTITY,
         );
         q.step(1.0 / 60.0);
-        assert_eq!(landing(&q, here, here), None);
+        assert_eq!(landing(&q, here, here, &[]), None);
     }
 
     // A truck-sized box round what she is blowing up (round 3's MLRS):
