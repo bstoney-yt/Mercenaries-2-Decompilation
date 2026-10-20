@@ -16,11 +16,17 @@ pub const PULL: f32 = 7.0;
 /// Where on a person the view is drawn to: this share of their height up
 /// from their feet (the chest).
 pub const CHEST: f32 = 0.65;
+/// While the player turns the view faster than this a tick (radians: 0.6
+/// a second at 60 ticks), the assist lets go: a deliberate swipe off a
+/// target isn't fought.
+pub const LET_GO: f32 = 0.01;
 
 /// The camera's turn (yaw, pitch, radians, as [`crate::player::Intent::look`])
-/// that draws the view from `eye`, turned `yaw` and `pitch`, towards the
-/// nearest of `targets` (points to aim at) to the crosshair, for `dt`
-/// seconds; `None` when none is within [`CONE`] and [`REACH`].
+/// that draws the crosshair, from `eye` along `yaw` and `pitch` (the
+/// crosshair's own, which sits above the camera's on foot), towards the
+/// nearest of `targets` (points to aim at) to it, for `dt` seconds;
+/// `None` when none is within [`CONE`] and [`REACH`]. The camera turns
+/// by as much as the crosshair does.
 pub fn assist(
     eye: Vec3,
     yaw: f32,

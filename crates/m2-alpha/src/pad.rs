@@ -223,6 +223,7 @@ impl Pad {
             );
         }
         let mut s = state.unwrap_or_default();
+        self.touch.set_driving(driving);
         if self.touch.used {
             s = crate::touch::merge(s, self.touch.state());
             let (dx, dy) = self.touch.take_look();

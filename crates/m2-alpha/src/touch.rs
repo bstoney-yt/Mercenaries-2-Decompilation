@@ -78,10 +78,28 @@ pub const KEYS: [Key; 16] = [
     key(Press::Button(xb::START), "PAUSE", 0.56, 0.07, 0.04),
 ];
 
+/// The buttons while she drives (the on-foot ones hide): the pad's driving
+/// layout ([`crate::pad`]): gas and reverse (A, X), the handbrake (the left
+/// trigger), fire (the right), get out (Y), switch gun (RB), right an
+/// overturned vehicle (R3), the next seat (the d-pad's up), the PDA and
+/// pause. The stick steers.
+pub const CAR_KEYS: [Key; 10] = [
+    key(Press::Button(xb::A), "GAS", 0.90, 0.74, 0.09),
+    key(Press::Button(xb::X), "REVERSE", 0.76, 0.84, 0.065),
+    key(Press::LeftTrigger, "BRAKE", 0.75, 0.62, 0.06),
+    key(Press::RightTrigger, "FIRE", 0.90, 0.46, 0.075),
+    key(Press::Button(xb::Y), "EXIT", 0.95, 0.22, 0.05),
+    key(Press::Button(xb::RIGHT_SHOULDER), "GUN", 0.82, 0.27, 0.05),
+    key(Press::Button(xb::RIGHT_THUMB), "FLIP", 0.62, 0.84, 0.045),
+    key(Press::Button(xb::DPAD_UP), "SEAT", 0.08, 0.33, 0.045),
+    key(Press::Button(xb::BACK), "PDA", 0.44, 0.07, 0.04),
+    key(Press::Button(xb::START), "PAUSE", 0.56, 0.07, 0.04),
+];
+
 /// What a finger is doing, from where it landed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Role {
-    /// Holds button `KEYS[i]`.
+    /// Holds button `i` of the layout it landed in ([`Touch::keys`]).
     Key(usize),
     /// Pushes the stick, centred where it landed.
     Stick { centre: [f32; 2] },
@@ -107,6 +125,8 @@ pub struct Touch {
     /// Sprint, switched on and off by tapping its button (not held): she
     /// sprints whenever she moves while it is on.
     pub sprint: bool,
+    /// She drives: the driving buttons show ([`CAR_KEYS`]).
+    driving: bool,
 }
 
 impl Touch {
@@ -115,11 +135,26 @@ impl Touch {
         self.size = [width as f32, height as f32];
     }
 
+    /// The buttons showing: on foot or driving.
+    pub fn keys(&self) -> &'static [Key] {
+        if self.driving { &CAR_KEYS } else { &KEYS }
+    }
+
+    /// She gets in (`driving`) or out: the buttons change, and fingers on
+    /// the old ones let go.
+    pub fn set_driving(&mut self, driving: bool) {
+        if driving != self.driving {
+            self.driving = driving;
+            self.fingers.retain(|_, f| !matches!(f.role, Role::Key(_)));
+        }
+    }
+
     /// Finger `id` landed at `at` (pixels).
     pub fn down(&mut self, id: u64, at: [f32; 2]) {
         self.used = true;
         let [w, h] = self.size;
-        let role = KEYS
+        let keys = self.keys();
+        let role = keys
             .iter()
             .position(|k| {
                 let c = [k.at[0] * w, k.at[1] * h];
@@ -137,7 +172,8 @@ impl Touch {
                 Role::Key,
             );
         if let Role::Key(i) = role
-            && KEYS[i].press == Press::Button(xb::LEFT_THUMB)
+            && !self.driving
+            && keys[i].press == Press::Button(xb::LEFT_THUMB)
         {
             self.sprint = !self.sprint;
         }
@@ -146,12 +182,13 @@ impl Touch {
 
     /// Finger `id` moved to `at`.
     pub fn moved(&mut self, id: u64, at: [f32; 2]) {
+        let keys = self.keys();
         let Some(f) = self.fingers.get_mut(&id) else {
             return;
         };
         let looks = match f.role {
             Role::Look => true,
-            Role::Key(i) => KEYS[i].press == Press::RightTrigger,
+            Role::Key(i) => keys[i].press == Press::RightTrigger,
             Role::Stick { .. } => false,
         };
         if looks {
@@ -181,11 +218,12 @@ impl Touch {
     pub fn state(&self) -> PadState {
         let mut s = PadState::default();
         let reach = STICK_REACH * self.size[1];
+        let keys = self.keys();
         for f in self.fingers.values() {
             match f.role {
-                Role::Key(i) => match KEYS[i].press {
-                    // Sprint is switched, not held ([`Touch::sprint`]).
-                    Press::Button(xb::LEFT_THUMB) => {}
+                Role::Key(i) => match keys[i].press {
+                    // On foot, sprint is switched, not held ([`Touch::sprint`]).
+                    Press::Button(xb::LEFT_THUMB) if !self.driving => {}
                     Press::Button(bit) => s.buttons |= bit,
                     Press::LeftTrigger => s.left_trigger = 1.0,
                     Press::RightTrigger => s.right_trigger = 1.0,
@@ -213,7 +251,7 @@ impl Touch {
         })
     }
 
-    /// Whether button `KEYS[i]` is held.
+    /// Whether button `i` of the buttons showing is held.
     pub fn held(&self, i: usize) -> bool {
         self.fingers.values().any(|f| f.role == Role::Key(i))
     }
@@ -242,20 +280,30 @@ pub fn merge(s: PadState, t: PadState) -> PadState {
 /// ([`paint`]): which buttons are held, and the stick where it is held.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Picture {
+    /// The driving buttons show, not the on-foot ones.
+    pub driving: bool,
+    /// By button of those showing (the rest unused).
     pub held: [bool; KEYS.len()],
     pub stick: Option<([f32; 2], [f32; 2])>,
+}
+
+impl Picture {
+    /// The buttons it shows.
+    pub fn keys(&self) -> &'static [Key] {
+        if self.driving { &CAR_KEYS } else { &KEYS }
+    }
 }
 
 impl Touch {
     /// This frame's [`Picture`].
     pub fn picture(&self) -> Picture {
+        let keys = self.keys();
         Picture {
-            held: std::array::from_fn(|i| {
-                if KEYS[i].press == Press::Button(xb::LEFT_THUMB) {
-                    self.sprint
-                } else {
-                    self.held(i)
-                }
+            driving: self.driving,
+            held: std::array::from_fn(|i| match keys.get(i) {
+                Some(k) if !self.driving && k.press == Press::Button(xb::LEFT_THUMB) => self.sprint,
+                Some(_) => self.held(i),
+                None => false,
             }),
             stick: self.stick(),
         }
@@ -268,7 +316,7 @@ pub fn paint(touch: &Picture, painter: &egui::Painter, rect: egui::Rect, pixels_
     use egui::{Align2, Color32, FontId, Stroke, pos2};
     let (w, h) = (rect.width(), rect.height());
     let line = Color32::from_rgba_unmultiplied(232, 208, 148, 150);
-    for (i, k) in KEYS.iter().enumerate() {
+    for (i, k) in touch.keys().iter().enumerate() {
         let c = pos2(rect.left() + k.at[0] * w, rect.top() + k.at[1] * h);
         let r = k.radius * h;
         let fill = if touch.held[i] {
@@ -377,6 +425,26 @@ mod tests {
         t.down(2, at);
         t.up(2);
         assert!(!t.sprint);
+    }
+
+    #[test]
+    fn driving_shows_the_car_buttons_and_lets_go_of_the_others() {
+        let mut t = touch();
+        let fire = KEYS.iter().find(|k| k.label == "FIRE").unwrap();
+        t.down(1, [fire.at[0] * 2000.0, fire.at[1] * 1000.0]);
+        assert_eq!(t.state().right_trigger, 1.0);
+        t.set_driving(true);
+        // The on-foot finger is let go; the picture is the car's.
+        assert_eq!(t.state().right_trigger, 0.0);
+        assert!(t.picture().driving);
+        assert_eq!(t.picture().keys().len(), CAR_KEYS.len());
+        let gas = CAR_KEYS.iter().find(|k| k.label == "GAS").unwrap();
+        t.down(2, [gas.at[0] * 2000.0, gas.at[1] * 1000.0]);
+        assert!(t.state().held(xb::A));
+        // Jump's spot is nothing while driving.
+        let jump = KEYS.iter().find(|k| k.label == "JUMP").unwrap();
+        t.down(3, [jump.at[0] * 2000.0, jump.at[1] * 1000.0]);
+        assert_eq!(t.state().buttons, xb::A);
     }
 
     #[test]

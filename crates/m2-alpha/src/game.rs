@@ -623,6 +623,7 @@ impl Game {
             // nearest the crosshair ([`crate::aim`]).
             if input.pad()
                 && (intent.trigger.aim || intent.trigger.fire)
+                && intent.look.length() < crate::aim::LET_GO
                 && let Some(p) = self.scene.player.as_ref().filter(|p| p.driving.is_none())
             {
                 let people = &self.scene.people;
@@ -633,7 +634,10 @@ impl Game {
                     .map(|n| {
                         n.character.position + Vec3::Y * n.character.height * crate::aim::CHEST
                     });
-                if let Some(turn) = crate::aim::assist(p.eye(), p.yaw, p.pitch, targets, dt) {
+                // The crosshair's pitch (above the camera's: shots fly
+                // along it, [`crate::player::Player::aim_forward`]).
+                let aim_pitch = p.aim_forward().y.clamp(-1.0, 1.0).asin();
+                if let Some(turn) = crate::aim::assist(p.eye(), p.yaw, aim_pitch, targets, dt) {
                     intent.look += turn;
                 }
             }
