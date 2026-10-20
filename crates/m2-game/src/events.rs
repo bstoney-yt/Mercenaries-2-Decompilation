@@ -1162,20 +1162,20 @@ fn check(
         // callback (`WifPmcInterior._SelectOutfit(who)`, made with no data)
         // opens only for the primary character, and the verify objective's
         // `_TargetActioned(self, who, target)` turns her to the target.
-        "ContextAction" => match guid(&p.params, 2) {
-            Some(g) => {
-                let taken = world
-                    .context_presses()
-                    .iter()
-                    .any(|(t, o)| *o == g && *t >= p.last && (*t > p.last || !p.persistent));
-                if taken {
-                    Check::Fire(world.player().map(id).into_iter().chain([id(g)]).collect())
-                } else {
-                    no
-                }
+        // { _, object or filter }: the player took its context action (an
+        // object filter: on any of its objects, as the action objectives'
+        // `{ 0, _uTgtObjFilter }`, a prisoner to release).
+        "ContextAction" => {
+            let targets = objects(&p.params, 2, world);
+            let taken = world.context_presses().iter().find_map(|(t, o)| {
+                (targets.contains(o) && *t >= p.last && (*t > p.last || !p.persistent))
+                    .then_some(*o)
+            });
+            match taken {
+                Some(g) => Check::Fire(world.player().map(id).into_iter().chain([id(g)]).collect()),
+                None => no,
             }
-            None => no,
-        },
+        }
         // { who, event }: as a clip the scripts played on `who` by name
         // (`Human.PlayRawAnimation`) meets the named event; who 0 is
         // anyone. The HQ briefings' frames wait on `{ 0, "CinematicStart"
@@ -1469,6 +1469,19 @@ mod tests {
         events.update(0.5, &world);
         events.update(0.5, &world);
         assert_eq!(log(&host), ["exit A", "exit A", "outfit true"]);
+        // On an object filter's object (a prisoner to release:
+        // `MrxTaskObjectiveAction`'s `{ 0, _uTgtObjFilter }`).
+        host.lua()
+            .load(
+                "Event.CreatePersistent(Event.ContextAction, { 0, { objs = { 11, 12 } } }, \
+                 function(d) table.insert(log, 'release ' .. d) end, { 'B' })",
+            )
+            .exec()
+            .unwrap();
+        world.context.push((3.25, 12));
+        events.update(0.5, &world);
+        events.update(0.5, &world);
+        assert_eq!(log(&host), ["exit A", "exit A", "outfit true", "release B"]);
     }
 
     #[test]

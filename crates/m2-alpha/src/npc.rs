@@ -226,6 +226,9 @@ pub(crate) enum Brain {
     /// Sent along a path by the scripts (`Ai.Goal` `PathMove`, `MoveTo`):
     /// running to point `next`, then at a post at its end.
     Route { route: Vec<Vec3>, next: usize },
+    /// Following her (`Ai.Role` `Follow`: a VIP being delivered): running
+    /// to her while further than `near` metres, else standing.
+    Follow { near: f32 },
 }
 
 /// A clip carrying an event: its index, when in it the event comes, and
@@ -843,6 +846,8 @@ pub struct Npc {
     route_stall: f32,
     /// Got to the end of a route the scripts gave (for checking).
     reached: bool,
+    /// Where the one they follow is ([`Brain::Follow`]).
+    follow_to: Vec3,
     /// Got there, not yet told the scripts ([`People::take_route_ends`]).
     ended: bool,
     /// On such a route, going over or through what stopped them to its
@@ -991,6 +996,7 @@ impl Npc {
             route_near: f32::INFINITY,
             route_stall: 0.0,
             reached: false,
+            follow_to: Vec3::ZERO,
             ended: false,
             through: false,
             swim: None,
@@ -1658,6 +1664,7 @@ impl Npc {
             Brain::Wander { wait, .. } if *wait > 0.0 => "pausing",
             Brain::Wander { .. } => "strolling",
             Brain::Route { .. } => "running where the scripts sent them",
+            Brain::Follow { .. } => "following her",
         }
     }
 
@@ -1814,6 +1821,17 @@ impl Npc {
                     }
                 }
             }
+            Brain::Follow { near } => {
+                let flat = (self.follow_to - at).with_y(0.0);
+                // Not off a ledge after her (the VIP on ChiCon001's roof
+                // died of it): they stop where the ground a step ahead
+                // falls away (invented).
+                let ahead = at + flat.normalize_or_zero() * 1.0 + Vec3::Y;
+                let drop = physics.cast_ray(ahead, -Vec3::Y, LEDGE + 1.0).is_none();
+                if flat.length() > *near && !drop {
+                    wanted = flat.normalize() * FLEE;
+                }
+            }
             Brain::Route { route, next } => {
                 let point = route[*next];
                 let flat = (point - at).with_y(0.0);
@@ -1900,7 +1918,7 @@ impl Npc {
                     *wait = 1.0;
                 }
                 (None, Brain::Patrol { wait, .. }) => *wait = 1.0,
-                (None, Brain::Post { .. } | Brain::Route { .. }) => {}
+                (None, Brain::Post { .. } | Brain::Route { .. } | Brain::Follow { .. }) => {}
             }
         }
         if wanted.length_squared() > 0.01 {
@@ -1929,6 +1947,9 @@ impl Npc {
         self.rig.advance(dt * rate);
     }
 }
+
+/// A follower keeps off a drop deeper than this (metres).
+const LEDGE: f32 = 3.0;
 
 /// Everyone on the island but the player.
 #[derive(Debug, Default)]
@@ -1967,6 +1988,12 @@ pub struct People {
     /// Where the scripts last sent people ([`People::walk`]), by spawn
     /// entity.
     routes: HashMap<u32, Vec<Vec3>>,
+    /// Those the scripts have following her, by spawn entity, and how near
+    /// they keep ([`People::follow`]).
+    following: HashMap<u32, f32>,
+    /// Followers riding her vehicle (`Vehicle.Enter` by `MrxFollow`): out
+    /// of play until they get out ([`People::board`]).
+    aboard: HashSet<u32>,
     active: HashSet<u32>,
     /// Spawners sending from a list, by entity: their `SecondsPerCycle`
     /// (filled on first use).
@@ -2488,12 +2515,13 @@ impl People {
         let Some(kind) = self.rider_kind(template, model) else {
             return false;
         };
-        let brain = match self.routes.get(&guid) {
-            Some(route) => Brain::Route {
+        let brain = match (self.following.get(&guid), self.routes.get(&guid)) {
+            (Some(&near), _) => Brain::Follow { near },
+            (None, Some(route)) => Brain::Route {
                 route: route.clone(),
                 next: 0,
             },
-            None => Brain::Post { facing: 0.0 },
+            (None, None) => Brain::Post { facing: 0.0 },
         };
         let mut n = Npc::new(kind, &self.kinds[kind].rig, at, 0.0, brain, Some(guid));
         n.outfit = self.dress_as(kind, template);
@@ -2693,7 +2721,8 @@ impl People {
     fn who(&mut self, s: &SpawnPoint, target: bool) -> Who {
         let names = [s.template.as_deref(), Some(s.name.as_str())];
         if let (Some(template), Some(model)) = (s.template.as_deref(), s.model) {
-            if left_out(s, target) {
+            // One the scripts have following her (a VIP released) stands.
+            if left_out(s, target) && !self.following.contains_key(&s.entity) {
                 return Who::Nobody;
             }
             let fights = target
@@ -2836,6 +2865,9 @@ impl People {
         self.pursue(dt);
         self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
+        for n in &mut self.npcs {
+            n.follow_to = focus;
+        }
         let mut callouts = Vec::new();
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
@@ -3031,6 +3063,106 @@ impl People {
             .collect()
     }
 
+    /// The scripts have the person of spawn `entity` follow her, keeping
+    /// within `near` metres (`Ai.Role` `Follow`), or stop (`None`: another
+    /// role). One not yet in play follows once they come.
+    pub fn follow(&mut self, entity: u32, near: Option<f32>) {
+        match near {
+            Some(near) => {
+                self.following.insert(entity, near);
+            }
+            None => {
+                self.following.remove(&entity);
+            }
+        }
+        for n in self.npcs.iter_mut().filter(|n| n.spawn == Some(entity)) {
+            n.flee = None;
+            n.brain = match near {
+                Some(near) => Brain::Follow { near },
+                None => Brain::Post { facing: n.facing },
+            };
+        }
+        eprintln!(
+            "people: {entity:08x} {}",
+            if near.is_some() {
+                "follows her"
+            } else {
+                "stops following her"
+            }
+        );
+    }
+
+    /// Those following her in play within `reach` metres (flat) of `at`,
+    /// by spawn entity.
+    pub fn followers_within(&self, at: Vec3, reach: f32) -> Vec<u32> {
+        self.npcs
+            .iter()
+            .filter(|n| n.alive && matches!(n.brain, Brain::Follow { .. }))
+            .filter(|n| n.character.position.with_y(0.0).distance(at.with_y(0.0)) <= reach)
+            .filter_map(|n| n.spawn)
+            .collect()
+    }
+
+    /// Those riding a vehicle out of play ([`People::board`]).
+    pub fn aboard(&self) -> Vec<u32> {
+        self.aboard.iter().copied().collect()
+    }
+
+    /// Where those following her are.
+    pub fn followers(&self) -> Vec<Vec3> {
+        self.npcs
+            .iter()
+            .filter(|n| n.alive && matches!(n.brain, Brain::Follow { .. }))
+            .map(|n| n.character.position)
+            .collect()
+    }
+
+    /// Those following her are put at `at` (a step apart): for the
+    /// autoplay's hops, which she makes past what the alpha can't climb
+    /// (a test driver's shortcut, logged as one). How many.
+    pub fn bring_followers(&mut self, at: Vec3) -> usize {
+        let mut k = 0;
+        for n in &mut self.npcs {
+            if matches!(n.brain, Brain::Follow { .. }) {
+                let a = k as f32 * 1.3 + 1.0;
+                n.character.position = at + Vec3::new(a.sin(), 0.2, a.cos()) * 1.5;
+                n.character.velocity = Vec3::ZERO;
+                n.landed = false;
+                k += 1;
+            }
+        }
+        k
+    }
+
+    /// The person of spawn `entity` gets into a vehicle (`aboard`: out of
+    /// play while they ride, `Vehicle.Enter` by `MrxFollow` as she drives)
+    /// or out of it at `at`. Whether they were in play or aboard.
+    pub fn board(&mut self, physics: &mut Physics, entity: u32, aboard: bool, at: Vec3) -> bool {
+        if aboard {
+            let mut was = false;
+            self.npcs.retain(|n| {
+                if n.spawn != Some(entity) {
+                    return true;
+                }
+                if let Some(doll) = n.ragdoll {
+                    physics.remove_ragdoll(doll);
+                }
+                was = true;
+                false
+            });
+            if was {
+                self.active.remove(&entity);
+                self.aboard.insert(entity);
+            }
+            was
+        } else if self.aboard.remove(&entity) {
+            self.moved.insert(entity, at);
+            true
+        } else {
+            false
+        }
+    }
+
     /// The scripts send the person of spawn `entity` along `route`
     /// (`Ai.Goal` `PathMove`, or `MoveTo` a point): they run it, then stand
     /// at its end. One not yet in play runs it when they come.
@@ -3169,7 +3301,10 @@ impl People {
         // People out of range, or whose layer went, go.
         let layers = self.state_layers.as_ref();
         let (active, killed) = (&mut self.active, &mut self.killed);
+        let following = &self.following;
         self.npcs.retain(|n| match n.spawn {
+            // Following her, they stay with her.
+            Some(id) if following.contains_key(&id) => true,
             Some(id)
                 if far(n.character.position, INACTIVE)
                     || n.layer
@@ -3248,6 +3383,7 @@ impl People {
             .filter(|&(s, moved)| {
                 !self.active.contains(&s.entity)
                     && !self.killed.contains(&s.entity)
+                    && !self.aboard.contains(&s.entity)
                     && !far(moved.unwrap_or(s.position), ACTIVE)
                     && self.layer_in(s.layer)
             })
@@ -3258,8 +3394,9 @@ impl People {
             .collect();
         // A mission's targets, and those the scripts sent somewhere (the
         // villa's waves, `Ai.Goal` `PathMove`), come first.
-        let (targets, routes) = (&self.mission_soldiers, &self.routes);
-        let wanted = |e: &u32| targets.contains(e) || routes.contains_key(e);
+        let (targets, routes, following) = (&self.mission_soldiers, &self.routes, &self.following);
+        let wanted =
+            |e: &u32| targets.contains(e) || routes.contains_key(e) || following.contains_key(e);
         near.sort_by(|a, b| {
             (!wanted(&a.1.entity))
                 .cmp(&!wanted(&b.1.entity))
@@ -3271,7 +3408,9 @@ impl People {
         let mut walker_room = self.walker_cap.min(MAX_WALKERS).saturating_sub(walkers);
         for (_, s, at) in near {
             let target = self.mission_soldiers.contains(&s.entity);
-            let sent = self.routes.contains_key(&s.entity);
+            // Sent somewhere, or following her (a VIP released).
+            let sent =
+                self.routes.contains_key(&s.entity) || self.following.contains_key(&s.entity);
             let room = if is_walker(s.entity) {
                 &mut walker_room
             } else {
@@ -3303,7 +3442,9 @@ impl People {
             *room = room.saturating_sub(1);
             let forward = s.rotation * Vec3::Z;
             let facing = forward.x.atan2(forward.z);
-            let brain = if let Some(route) = self.routes.get(&s.entity) {
+            let brain = if let Some(&near) = self.following.get(&s.entity) {
+                Brain::Follow { near }
+            } else if let Some(route) = self.routes.get(&s.entity) {
                 eprintln!(
                     "people: {:08x} comes in at {at:.1} to run the route the scripts gave",
                     s.entity

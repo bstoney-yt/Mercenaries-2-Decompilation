@@ -217,6 +217,21 @@ const PDA_MOST: f32 = 15.0;
 const PDA_PROMPT: f32 = 3.0;
 /// Seconds between lines saying how she is getting on.
 const REPORT: f32 = 15.0;
+/// Under the place she is after but this far below it (metres: a prisoner
+/// on a roof, ChiCon001's party official 56 m up), for this long
+/// (seconds), she hops up there, logged as a hop: a player would land a
+/// helicopter or grapple up.
+const UNDER_BY: f32 = 4.0;
+/// A building to destroy this near (metres, flat) under one she is to
+/// reach is left standing meanwhile.
+const HOLDS_UP: f32 = 20.0;
+/// One following her left this far behind (metres) this long (seconds)
+/// is brought to her: a test driver's shortcut, logged, for ways the
+/// alpha has no means of (a VIP off a roof, which a player lifts off by
+/// helicopter).
+const LEFT_BEHIND: f32 = 30.0;
+const LEFT_FOR: f32 = 20.0;
+const UNDER_FOR: f32 = 6.0;
 /// An outpost to capture (`HUD_objective_outpost` on its capture point):
 /// she goes within this far (metres) and calls in the soldier delivery
 /// she holds (the outpost gives her one of its attackers' free,
@@ -361,6 +376,8 @@ pub struct Autoplay {
     pda_asked: Option<f32>,
     /// When she last called in a soldier delivery by an outpost.
     delivered: Option<f32>,
+    /// Seconds one following her has been left behind.
+    left_behind: f32,
 }
 
 impl Autoplay {
@@ -407,6 +424,28 @@ impl Autoplay {
             None => self.leave = false,
         }
         self.ground(game);
+        // Those following her who fall behind (on foot, or while she
+        // drives): brought to her after a while (a test shortcut).
+        let here = game.focus();
+        let behind = game.scene.people.followers().iter().any(|f| {
+            f.with_y(0.0).distance(here.with_y(0.0)) > LEFT_BEHIND
+                || (f.y - here.y).abs() > UNDER_BY * 3.0
+        });
+        self.left_behind = if behind { self.left_behind + dt } else { 0.0 };
+        if self.left_behind > LEFT_FOR
+            && game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_none())
+        {
+            self.left_behind = 0.0;
+            let n = game.scene.people.bring_followers(here);
+            eprintln!(
+                "autoplay {:.1} s: {n} following her left behind: brought to her at {here:.1} (test shortcut)",
+                self.clock
+            );
+        }
         // The scripts wait for her to look at her PDA (the first contract,
         // at the first gate): she opens it, and shuts it again.
         let wants = |name: &str| awaited.iter().any(|a| a == name);
@@ -428,6 +467,21 @@ impl Autoplay {
         }
         if game.support.pda || asked {
             return self.pda(game.support.pda, wants(PDA_CLOSE));
+        }
+        // The scripts offer their context action on what a marker of
+        // theirs is on, and she stands at it (a prisoner to release,
+        // `[ContextAction.ReleasePrisoner]`): she takes it with the use key.
+        if let Some((g, text)) = game.context.clone()
+            && marks.iter().any(|m| m.alive && m.target == g)
+        {
+            // As the use key does in play (`Game::tick`, which her
+            // intents don't pass through), as `--context` does too.
+            if self.pressed > PRESS_GAP && !game.input_locked {
+                self.pressed = 0.0;
+                eprintln!("autoplay {:.1} s: taking {text:?} at {g:#x}", self.clock);
+                game.context_taken = Some(g);
+            }
+            return Intent::default();
         }
         let chosen = self.choose(game, marks);
         let changed = match (&chosen, &self.goal) {
@@ -711,10 +765,29 @@ impl Autoplay {
             }
         }
         // What to destroy, nearest first: soldiers are shot, things blown up.
+        // Not what someone she is to reach stands on (ChiCon001's party
+        // official on a rooftop, among the bonus objective's buildings): it
+        // waits until they are reached.
+        // Nor what one following her stands on (him, released), nor what
+        // she stands on herself (that roof, as she releases him).
+        // Nor anything a strike would bring down near one following her
+        // (the bomb's blast killed him, ChiCon001).
+        let followers = game.scene.people.followers();
+        let held_up = |m: &Mark| {
+            live.iter()
+                .filter(|n| matches!(n.kind.as_str(), "action" | "deliverable"))
+                .map(|n| n.at)
+                .chain(followers.iter().copied())
+                .chain([here])
+                .any(|at| at.y > m.at.y && at.with_y(0.0).distance(m.at.with_y(0.0)) < HOLDS_UP)
+                || followers.iter().any(|f| {
+                    f.with_y(0.0).distance(m.at.with_y(0.0)) < crate::combat::BOMB_FRAG.0 + HOLDS_UP
+                })
+        };
         let destroy: Vec<&Mark> = live
             .iter()
             .copied()
-            .filter(|m| m.kind == "destroy")
+            .filter(|m| m.kind == "destroy" && !held_up(m))
             .collect();
         if let Some(m) = nearest(destroy, here) {
             if let Some(i) = npcs
@@ -844,6 +917,9 @@ impl Autoplay {
         let places: Vec<&Mark> = live
             .iter()
             .copied()
+            // A thing to destroy left standing for now (under someone she
+            // is to reach) is no place to go.
+            .filter(|m| m.kind != "destroy")
             .filter(|m| Some(m.target) != riding && (!marked || !unmarked(m)))
             .collect();
         let m = nearest(places, here)?;
@@ -1126,6 +1202,11 @@ impl Autoplay {
         }
         if d < arrive || self.arrived.is_some() {
             let since = *self.arrived.get_or_insert(self.clock);
+            if d < arrive && at.y - here.y > UNDER_BY && self.clock - since > UNDER_FOR {
+                self.arrived = None;
+                self.hop(game, at, self.clock - since);
+                return Intent::default();
+            }
             if self.clock - since < CIRCLE_AFTER {
                 return Intent::default();
             }
@@ -2136,6 +2217,13 @@ impl Autoplay {
             "autoplay {:.1} s: no headway for {stuck:.0} s at {from:.1} ({}): hopped to {to:.1}",
             self.clock, self.what
         );
+        let brought = game.scene.people.bring_followers(to);
+        if brought > 0 {
+            eprintln!(
+                "autoplay {:.1} s: {brought} following her hopped with her",
+                self.clock
+            );
+        }
         self.hops.push((from, to));
         // A ride she couldn't get to is left (round 10's AllCon002 spent
         // 160 s after a WZ551 behind a wall): another or on foot.
