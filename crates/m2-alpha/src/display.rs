@@ -353,15 +353,6 @@ pub fn describe(window: &Window) -> String {
     )
 }
 
-/// `window` was just made from `config`: as a window, its size (fitted
-/// to the monitor) isn't the one to keep ([`Display::resized`]).
-pub fn started(window: &Window, config: &WindowConfig) {
-    if config.mode == DisplayMode::Windowed {
-        let s = window.inner_size();
-        set_pending(Some(((s.width, s.height), 0)));
-    }
-}
-
 /// What F11 and Alt+Enter go back and forth between.
 #[derive(Clone, Copy, Debug)]
 pub struct Display {
@@ -395,7 +386,10 @@ impl Display {
         let plain = window.fullscreen().is_none()
             && !window.is_maximized()
             && window.is_minimized() != Some(true);
-        if !plain || size.width == 0 || size.height == 0 {
+        // A `Resized` can carry a size the window has already left (on
+        // the way in or out of fullscreen); the window's own is the one.
+        let inner = window.inner_size();
+        if !plain || size != inner || size.width == 0 || size.height == 0 {
             return;
         }
         let now = (size.width, size.height);
@@ -409,7 +403,12 @@ impl Display {
             Some(_) => set_pending(None),
             None => {}
         }
-        self.windowed = now;
+        // Our own size fitted to a small monitor isn't the player's: the
+        // size asked for stays, to fit whole on a larger one next time.
+        let fitted = fit(self.windowed, window.current_monitor().as_ref());
+        if now != (fitted.width, fitted.height) {
+            self.windowed = now;
+        }
     }
 
     /// F11 or Alt+Enter: a window to the fullscreen kind last used, or
@@ -454,8 +453,7 @@ impl Display {
             DisplayMode::Borderless => (self.windowed, 0),
             DisplayMode::Exclusive => ((self.exclusive.0, self.exclusive.1), self.exclusive.2),
         };
-        let (how, asked) = show(window, mode, size, rate);
-        let size = asked.unwrap_or(size);
+        let (how, _) = show(window, mode, size, rate);
         config.mode = mode;
         if mode == DisplayMode::Exclusive {
             // The mode it took (a size it asked for may not be offered).

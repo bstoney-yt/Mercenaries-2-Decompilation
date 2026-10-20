@@ -6777,7 +6777,6 @@ impl App {
             .with_fullscreen(full);
         let window = Arc::new(event_loop.create_window(attributes)?);
         let display = display::Display::new(w);
-        display::started(&window, w);
         eprintln!("display: start {how}: {}", display::describe(&window));
         let size = window.inner_size();
         let mut backend =
