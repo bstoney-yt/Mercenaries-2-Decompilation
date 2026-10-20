@@ -99,6 +99,10 @@ const LEDGE_DROP: f32 = 3.0;
 /// Seconds with no headway towards a spot to fire from before she tries
 /// another (short of the hop's). Invented.
 const SPOT_GIVE_UP: f32 = 20.0;
+/// Searches finding nowhere to fire from before she goes for another of
+/// the things to blow up, and for how long (seconds). Invented.
+const PASS_AFTER: u32 = 3;
+const PASS_FOR: f32 = 180.0;
 /// A vehicle's cannon in range of her goal this long (seconds) without
 /// bringing it down, she gets out. Invented.
 const CANNON_GIVE_UP: f32 = 30.0;
@@ -319,6 +323,10 @@ pub struct Autoplay {
     blast_spot: Option<(u32, Vec3)>,
     /// Where she is swimming to climb out of the water (see [`landing`]).
     landing: Option<Vec3>,
+    /// Searches in a row for a spot to fire from that found none, and the
+    /// things to blow up she passed over for now (object, until when).
+    nowhere: u32,
+    passed: Vec<(u32, f32)>,
     /// With the launcher empty, the C4 she set on what she is blowing up
     /// and when, while she gets clear to set it off.
     planted: Option<f32>,
@@ -727,11 +735,21 @@ impl Autoplay {
             }
         }
         // What to destroy, nearest first: soldiers are shot, things blown up.
-        let destroy: Vec<&Mark> = live
+        let mut destroy: Vec<&Mark> = live
             .iter()
             .copied()
             .filter(|m| m.kind == "destroy")
             .collect();
+        // Not one she found nowhere to fire at for now, while others are
+        // left (round 31's AllCon002: the second boat under its bank).
+        let passed = |m: &&Mark| {
+            self.passed
+                .iter()
+                .any(|&(t, until)| t == m.target && self.clock < until)
+        };
+        if destroy.iter().any(|m| !passed(m)) {
+            destroy.retain(|m| !passed(m));
+        }
         if let Some(m) = nearest(destroy, here) {
             if let Some(i) = npcs
                 .iter()
@@ -1494,6 +1512,20 @@ impl Autoplay {
                 .as_ref()
                 .and_then(|w| vantage(&w.physics, at, here, &self.tried, rings, BLAST_BODY))
                 .map(|s| (target, s));
+            self.nowhere = if self.blast_spot.is_none() {
+                self.nowhere + 1
+            } else {
+                0
+            };
+            if self.nowhere >= PASS_AFTER {
+                eprintln!(
+                    "autoplay {:.1} s: nowhere to fire at {} from: another for {PASS_FOR} s",
+                    self.clock, self.what
+                );
+                self.passed.push((target, self.clock + PASS_FOR));
+                self.nowhere = 0;
+                self.tried.clear();
+            }
             eprintln!(
                 "autoplay {:.1} s: no shot at {} from {here:.1} ({}, aim off {error:.3}): {}",
                 self.clock,
