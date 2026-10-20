@@ -8067,6 +8067,14 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // The swapchain at the window's size now: going in and out
+                // of fullscreen, the `Resized` events come late and carry
+                // sizes on the way, so a frame could be drawn at a size the
+                // window has left, in a corner of it.
+                let size = state.window.inner_size();
+                if (size.width, size.height) != state.backend.size() {
+                    state.backend.resize(size.width, size.height);
+                }
                 if let Err(e) = state.frame(&mut self.config, event_loop) {
                     self.fail(event_loop, e);
                 }
