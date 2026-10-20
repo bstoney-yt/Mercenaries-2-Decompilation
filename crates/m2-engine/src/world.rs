@@ -899,6 +899,14 @@ const NOT_TEMPLATES: [&str; 16] = [
     "LandingZone",
 ];
 
+/// Whether a state layer's entity with component `c` (one of
+/// [`NOT_TEMPLATES`] or [`NOT_PROPS`]) is left out of its models for it:
+/// all are but a junction that blows up (`destructible`: it has a
+/// `DestructionLink`), a bridge's segment.
+fn leaves_out(c: &str, destructible: bool) -> bool {
+    !(c == "RoadIntersection" && destructible)
+}
+
 /// A place the game starts or puts the player: the static layers'
 /// `<name>_Start<n>` entities, such as each headquarters'
 /// `Starter_<hq>_Start1` and each contract's `<contract>_Start1`
@@ -2016,12 +2024,29 @@ impl WorldIndex {
         let placements = layer.placements();
         let models = layer.hashes("ModelName");
         let names = layer.names();
+        // A road piece that blows up is a model too: ChiCon002's three
+        // `_maracaibo_bridge_segmenta` (`RoadIntersection` and
+        // `DestructionLink`, the only 3 of the state layers' 32 junctions
+        // with a `DestructionLink`; from the install).
+        let destructible: HashSet<u32> = layer
+            .component("DestructionLink")
+            .map(|c| c.records().unwrap_or_default())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(entity, _)| entity)
+            .collect();
         let not_props: HashSet<u32> = NOT_TEMPLATES
             .iter()
             .chain(&NOT_PROPS)
-            .filter_map(|c| layer.component(c))
-            .flat_map(|c| c.records().unwrap_or_default())
-            .map(|(entity, _)| entity)
+            .filter_map(|c| layer.component(c).map(|r| (*c, r)))
+            .flat_map(|(c, r)| {
+                r.records()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(move |(entity, _)| (c, entity))
+            })
+            .filter(|&(c, entity)| leaves_out(c, destructible.contains(&entity)))
+            .map(|(_, entity)| entity)
             .collect();
         for (&entity, p) in &placements {
             if not_props.contains(&entity) || p.position[1] < HIDDEN_BELOW {
@@ -2729,6 +2754,16 @@ mod tests {
 
     // A soldier listed only a launcher and a pistol carries the pistol;
     // one listed a rifle as well carries the rifle, whatever comes first.
+    #[test]
+    fn a_bridge_segment_is_a_model_but_other_junctions_are_not() {
+        // ChiCon002's `_maracaibo_bridge_segmenta`: a junction that blows up.
+        assert!(!leaves_out("RoadIntersection", true));
+        assert!(leaves_out("RoadIntersection", false));
+        // Whatever else it has that isn't a prop still leaves it out.
+        assert!(leaves_out("Path", true));
+        assert!(leaves_out("Ai", true));
+    }
+
     #[test]
     fn a_soldier_without_a_rifle_carries_his_pistol() {
         let mut t = Templates::default();
