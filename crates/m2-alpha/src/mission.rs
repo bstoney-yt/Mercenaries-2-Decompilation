@@ -1814,19 +1814,20 @@ impl MissionLink {
             }
             // Her stock, cash and fuel as the scripts hold them.
             if self.stock_look == 0 {
-                game.support.stock = stocked(mission);
+                game.support.stock = crate::spans::time("scripts: stock", || stocked(mission));
                 self.resources = Some(mission.resources());
                 self.stock_look = STOCK_LOOK;
             }
             self.stock_look -= 1;
-            let (flown, burst) = report_strikes(game, mission);
+            let (flown, burst) =
+                crate::spans::time("scripts: strikes", || report_strikes(game, mission));
             self.counts.flown += flown;
             self.counts.burst += burst;
             mission.set_player_reserve("C4", game.combat.charges);
             let spare = game.combat.rifle_rounds.stored;
             mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
-            look(game, mission, &mut self.sighted);
-            mission.tick(f64::from(STEP));
+            crate::spans::time("scripts: look", || look(game, mission, &mut self.sighted));
+            crate::spans::time("scripts: lua", || mission.tick(f64::from(STEP)));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
                 match &c {
@@ -1965,8 +1966,10 @@ impl MissionLink {
             if let Some(line) = tutorial(mission) {
                 self.tutorial = line;
             }
-            follow_markers(game, mission, &mut self.marked, &mut self.markers_logged);
-            break_props(game, mission);
+            crate::spans::time("scripts: markers", || {
+                follow_markers(game, mission, &mut self.marked, &mut self.markers_logged);
+            });
+            crate::spans::time("scripts: props", || break_props(game, mission));
             let w = mission.world().borrow();
             if let Some(m) = w.hud.messages.last() {
                 self.message = Some((m.clone(), mission.text(&m.text), 0.0));

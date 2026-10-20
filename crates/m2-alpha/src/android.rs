@@ -24,6 +24,12 @@ use winit::event_loop::EventLoop;
 use winit::platform::android::EventLoopBuilderExtAndroid;
 use winit::platform::android::activity::AndroidApp;
 
+/// mimalloc in place of Android's own allocator (scudo), which is far
+/// slower at the scripts' many small allocations: Lua's strings and tables
+/// are allocated through Rust's global allocator.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const ARGS_FILE: &str = "m2-alpha-args.txt";
 const LOG_FILE: &str = "m2-alpha.log";
 /// The top of the phone's shared storage.

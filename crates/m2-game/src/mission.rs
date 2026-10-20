@@ -576,6 +576,8 @@ pub struct Mission {
     movie_out: bool,
     /// How black `MrxGui`'s fade has the screen ([`FADE`]), 0 to 1.
     black: f32,
+    /// [`FADE`], compiled once (on the first tick) rather than every tick.
+    fade: Option<mlua::Function>,
 }
 
 impl Mission {
@@ -716,6 +718,7 @@ impl Mission {
             flown: false,
             movie_out: false,
             black: 0.0,
+            fade: None,
         };
         mission.settle("set-up");
         Ok(mission)
@@ -958,13 +961,23 @@ impl Mission {
                 ),
             });
         }
-        match self
-            .host
-            .lua()
-            .load(FADE)
-            .set_name("=m2 fade")
-            .call::<f32>((dt, FADE_WIPE))
-        {
+        if self.fade.is_none() {
+            match self
+                .host
+                .lua()
+                .load(FADE)
+                .set_name("=m2 fade")
+                .into_function()
+            {
+                Ok(f) => self.fade = Some(f),
+                Err(e) => self.log.push(format!(
+                    "  t={now:.1} fade: {}",
+                    first_lines(&e.to_string())
+                )),
+            }
+        }
+        let faded = self.fade.as_ref().map(|f| f.call::<f32>((dt, FADE_WIPE)));
+        match faded.unwrap_or(Ok(self.black)) {
             Ok(b) => {
                 if (b >= 1.0) != (self.black >= 1.0) {
                     self.log.push(format!(

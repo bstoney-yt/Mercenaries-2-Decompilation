@@ -39,6 +39,7 @@ cpal = "0.18"
 cpal = "0.18"
 jni = "0.21"
 libc = "0.2"
+mimalloc = { version = "0.1", default-features = false }
 ndk-context = "0.1"
 winit = { workspace = true, features = ["serde", "android-native-activity"] }
 
