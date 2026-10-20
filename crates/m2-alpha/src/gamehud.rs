@@ -2415,11 +2415,13 @@ impl Thread {
             }
             Some(keep)
         } else if state.binoculars.is_some() {
-            // Through the binoculars only their screen shows: the scripts
-            // put the HUD to sleep (`ToggleHud(owner, false, "scope")`),
-            // which leaves some of it awake here.
+            // Through the binoculars (or her gun's scope) only their screen
+            // shows: the scripts put the HUD to sleep (`ToggleHud(owner,
+            // false, "scope")`), which leaves some of it awake here. The
+            // layout's two trees answer the same events, "Binoculars" and,
+            // with `bSniper`, "Sniper Scope" (`MrxGuiSniperScope`).
             Some(widgets_under(&screen.borrow(), &names, |n| {
-                n == "Binoculars"
+                n == "Binoculars" || n == "Sniper Scope"
             }))
         } else {
             state.support.satellite.map(|_| {
