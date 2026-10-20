@@ -94,6 +94,9 @@ const LANDING_RINGS: [f32; 6] = [6.0, 12.0, 24.0, 48.0, 96.0, 192.0];
 /// Ground this far (metres) below her feet a step ahead is a drop she
 /// doesn't step closer over. Invented.
 const LEDGE_DROP: f32 = 3.0;
+/// Seconds with no headway towards a spot to fire from before she tries
+/// another (short of the hop's). Invented.
+const SPOT_GIVE_UP: f32 = 20.0;
 /// A vehicle's cannon in range of her goal this long (seconds) without
 /// bringing it down, she gets out. Invented.
 const CANNON_GIVE_UP: f32 = 30.0;
@@ -1414,8 +1417,21 @@ impl Autoplay {
         // Going where she can fire from (in range, nothing in the way).
         if let Some((_, spot)) = self.blast_spot {
             if spot.with_y(0.0).distance(here.with_y(0.0)) >= ARRIVE {
-                self.arrived = None;
-                return self.walk(game, spot, 1.0, dt);
+                // One she gets no nearer to (round 28's AllCon002: 6 m short
+                // of it, 2000 s of hops on the spot): another.
+                if self.since_moved() > SPOT_GIVE_UP {
+                    eprintln!(
+                        "autoplay {:.1} s: no nearer the spot {spot:.1} in {SPOT_GIVE_UP} s: another",
+                        self.clock
+                    );
+                    self.tried.push(spot);
+                    self.blast_spot = None;
+                    self.blocked = BLAST_BLOCKED;
+                    self.fresh_headway();
+                } else {
+                    self.arrived = None;
+                    return self.walk(game, spot, 1.0, dt);
+                }
             }
             // Under it or over it (round 6's AllCon002: a roof by the
             // river, and she fell in under it): one she can't get to.
