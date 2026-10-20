@@ -8,7 +8,7 @@
 //! no headway for a while she hops ahead (logged too): the run goes on to
 //! the later objectives, and the hops show where the way is blocked.
 
-use m2_engine::physics::FLOAT_DEPTH;
+use m2_engine::physics::{FLOAT_DEPTH, StaticKey};
 use m2_engine::{Physics, Templates, VehicleControls, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 
@@ -143,6 +143,10 @@ const ONCOMING_AHEAD: f32 = 35.0;
 /// on it, metres (invented: past a soldier's grenade thrown at her
 /// landing a few metres off).
 const CARGO_CLEAR: f32 = 15.0;
+/// What a vehicle stuck on is kept out of with this much room round it,
+/// metres; not what is wider than this (a building's whole batch).
+const AVOID_ROOM: f32 = 2.0;
+const AVOID_LARGEST: f32 = 40.0;
 /// Soldiers fighting her within this of a truck with goods on it, itself
 /// within [`CARGO_NEAR`] of her on foot, are dealt with before she drives
 /// it, metres (invented).
@@ -374,6 +378,9 @@ pub struct Autoplay {
     leave: bool,
     /// The way she is going, and when a roundabout one was last logged.
     way: Option<Way>,
+    /// What her vehicles stuck on (each box's least and most corner, x
+    /// and z, with room round it), kept out of on the ways she drives.
+    avoid: Vec<(Vec2, Vec2)>,
     way_logged: f32,
     /// Hops: from, to.
     pub hops: Vec<(Vec3, Vec3)>,
@@ -1384,6 +1391,27 @@ impl Autoplay {
                     game.focus(),
                     stuck_report(w, id, v.spec.hull, false)
                 );
+                // What holds her is kept out of from here on (PirCon003
+                // rounds 61-62: the way out of the parrots' base ran over
+                // a bank its truck caught on, again each time planned).
+                for (key, _, (lo, hi)) in w.physics.vehicle_touching(id) {
+                    let (lo, hi) = (
+                        Vec2::new(lo.x, lo.z) - Vec2::splat(AVOID_ROOM),
+                        Vec2::new(hi.x, hi.z) + Vec2::splat(AVOID_ROOM),
+                    );
+                    if matches!(key, Some(k) if !matches!(k, StaticKey::Cell(_)))
+                        && (hi - lo).max_element() < AVOID_LARGEST
+                        && !self.avoid.contains(&(lo, hi))
+                    {
+                        eprintln!(
+                            "autoplay {:.1} s: keeping out of {} ({lo:.0} to {hi:.0}) from now on",
+                            self.clock,
+                            crate::static_name(w, key)
+                        );
+                        self.avoid.push((lo, hi));
+                        self.way = None;
+                    }
+                }
             }
             // A boat run aground near the place: out, into the shallows
             // (further off, it backs off the rocks). Not when the place
@@ -2047,7 +2075,8 @@ impl Autoplay {
                 },
             };
             let sea = world.settings.sea_level.max(WATERLINE);
-            let route = Route::plan(&world.physics, mover, pos, at, sea);
+            let avoid: &[(Vec2, Vec2)] = if driving.is_some() { &self.avoid } else { &[] };
+            let route = Route::plan_avoiding(&world.physics, mover, (pos, at), sea, avoid);
             if (!route.reaches || route.length() > straight * ROUNDABOUT)
                 && self.clock - self.way_logged > LOG_WAY
             {
