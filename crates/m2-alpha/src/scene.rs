@@ -2759,6 +2759,7 @@ impl Scene {
         {
             let (nodes, skin) = rig.posed();
             model.draw_posed(backend, queue, p.model_matrix(), &nodes, &skin)?;
+            p.drawn.set(p.drawn.get() + 1);
         }
         for n in &self.people.npcs {
             if !n.landed || n.character.position.distance(eye) > npc::DRAW_DISTANCE {

@@ -385,6 +385,10 @@ pub fn offscreen(
     }
     picture_with_puppet(backend, game, fov, aspect, out)?;
     eprintln!("{}", coop.summary());
+    eprintln!(
+        "coop: the other hero was drawn in {} frames",
+        game.scene.puppet.as_ref().map_or(0, |p| p.drawn.get())
+    );
     coop.leave();
     std::thread::sleep(Duration::from_millis(600));
     Ok(())
@@ -407,7 +411,8 @@ fn picture_with_puppet(
         .map(|p| p.position);
     if let (Some(target), Some(player)) = (target, game.scene.player.as_mut()) {
         let d = target - player.character.position;
-        player.yaw = d.x.atan2(d.z);
+        // A little to one side, so she doesn't stand in front of it.
+        player.yaw = d.x.atan2(d.z) + 0.35;
         eprintln!(
             "coop picture {}: the other hero {:.1} m off, at {:.1},{:.1},{:.1}",
             out.display(),

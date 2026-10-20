@@ -26,6 +26,8 @@ pub struct Puppet {
     pub facing: f32,
     /// Whether a snapshot has placed it, and it is on foot.
     pub shown: bool,
+    /// Frames it was drawn in (for the test runs' log).
+    pub drawn: std::cell::Cell<u32>,
 }
 
 impl std::fmt::Debug for Puppet {
@@ -48,6 +50,7 @@ impl Puppet {
             position: Vec3::ZERO,
             facing: 0.0,
             shown: false,
+            drawn: Default::default(),
         }
     }
 
