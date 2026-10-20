@@ -353,6 +353,15 @@ pub fn describe(window: &Window) -> String {
     )
 }
 
+/// `window` was just made from `config`: as a window, its size (fitted
+/// to the monitor) isn't the one to keep ([`Display::resized`]).
+pub fn started(window: &Window, config: &WindowConfig) {
+    if config.mode == DisplayMode::Windowed {
+        let s = window.inner_size();
+        set_pending(Some(((s.width, s.height), 0)));
+    }
+}
+
 /// What F11 and Alt+Enter go back and forth between.
 #[derive(Clone, Copy, Debug)]
 pub struct Display {
