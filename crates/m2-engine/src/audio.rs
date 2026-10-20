@@ -411,6 +411,10 @@ pub struct Mixer {
     volumes: [f32; Category::ALL],
     /// Most voices played at once; the quietest are dropped past it.
     pub max_voices: usize,
+    /// The environmental reverb the sounds placed in the world go
+    /// through ([`crate::reverb`]), and its send.
+    reverb: Option<crate::reverb::Reverb>,
+    send: Vec<f32>,
 }
 
 impl Mixer {
@@ -427,11 +431,24 @@ impl Mixer {
             pitches: [Glide::ONE; Category::ALL],
             volumes: [1.0; Category::ALL],
             max_voices: 64,
+            reverb: None,
+            send: Vec::new(),
         }
     }
 
     pub fn rate(&self) -> u32 {
         self.rate
+    }
+
+    /// Runs the world's placed sounds through `preset` (`Sound.SetReverb`),
+    /// or through none.
+    pub fn set_reverb(&mut self, preset: Option<crate::reverb::ReverbPreset>) {
+        self.reverb = preset.map(|p| crate::reverb::Reverb::new(p, self.rate));
+    }
+
+    /// The reverb preset playing, if any.
+    pub fn reverb(&self) -> Option<&crate::reverb::ReverbPreset> {
+        self.reverb.as_ref().map(|r| &r.preset)
     }
 
     /// Glides `category`'s sounds to `level` over `seconds`
@@ -568,7 +585,15 @@ impl Mixer {
         }
         let pitches = self.pitches.map(|g| g.now);
         let gains: Vec<(f32, f32)> = self.voices.iter().map(|v| self.gains(&v.play)).collect();
+        let reverb = self.reverb.is_some();
+        self.send.clear();
+        self.send.resize(if reverb { frames } else { 0 }, 0.0);
         for (v, target) in self.voices.iter_mut().zip(gains) {
+            // Sounds placed in the world (not music, dialogue or the
+            // interface, which play flat) go to the reverb too.
+            let sends = reverb
+                && v.play.position.is_some()
+                && matches!(v.play.category, Category::World | Category::Chatter);
             let len = v.play.buffer.frames();
             if len == 0 {
                 v.cursor = f64::MAX;
@@ -603,14 +628,21 @@ impl Mixer {
                     gl += dl;
                     gr += dr;
                 }
-                out[f * 2] += (a.0 + (b.0 - a.0) * t) * gl;
-                out[f * 2 + 1] += (a.1 + (b.1 - a.1) * t) * gr;
+                let (sl, sr) = ((a.0 + (b.0 - a.0) * t) * gl, (a.1 + (b.1 - a.1) * t) * gr);
+                out[f * 2] += sl;
+                out[f * 2 + 1] += sr;
+                if sends {
+                    self.send[f] += (sl + sr) * 0.5;
+                }
                 v.cursor += step;
             }
             v.current = target;
         }
         self.voices
             .retain(|v| v.play.looping || v.cursor < v.play.buffer.frames() as f64);
+        if let Some(r) = &mut self.reverb {
+            r.process(&self.send, out);
+        }
         for s in out.iter_mut() {
             *s = s.clamp(-1.0, 1.0);
         }
@@ -1534,6 +1566,31 @@ mod tests {
         assert_eq!(alike.pick(0.1).map(|s| s.hash), Some(1));
         assert_eq!(alike.pick(0.9).map(|s| s.hash), Some(2));
         assert!(KeySounds::default().pick(0.5).is_none());
+    }
+
+    #[test]
+    fn placed_sounds_ring_in_the_reverb_and_music_stays_dry() {
+        let rate = 48_000;
+        let ringing = |play: Play| {
+            let mut m = Mixer::new(rate);
+            m.set_reverb(Some(crate::reverb::ReverbPreset::city_light_reflections()));
+            m.play(play);
+            let mut out = vec![0.0; 2 * rate as usize / 5];
+            m.mix(&mut out);
+            // After the 10 ms sound: what rings on from 20 ms.
+            out[2 * 960..].iter().map(|s| s * s).sum::<f32>()
+        };
+        let placed = Play::at(tone(rate, 480), Vec3::new(0.0, 0.0, 2.0));
+        assert!(ringing(placed) > 1e-3);
+        let music = Play::flat(tone(rate, 480)).category(Category::Music);
+        assert_eq!(ringing(music), 0.0);
+        let mut m = Mixer::new(rate);
+        assert!(m.reverb().is_none());
+        m.set_reverb(Some(crate::reverb::ReverbPreset::city_light_reflections()));
+        assert_eq!(
+            m.reverb().map(|p| p.name.as_str()),
+            Some("CITY_KG_LIGHT_REFLECTIONS")
+        );
     }
 
     #[test]

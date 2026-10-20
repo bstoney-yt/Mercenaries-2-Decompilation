@@ -105,10 +105,39 @@ pub trait World {
     fn context_presses(&self) -> &[(f64, u32)] {
         &[]
     }
+    /// Characters' state changes (`Stance.Action`, as the human state
+    /// table names them: `Upright.Idle` to `KnockedDown.Idle`), each with
+    /// its game time, for `HumanStateTransition` events.
+    fn state_changes(&self) -> &[StateChange] {
+        &[]
+    }
+    /// Events met in clips the scripts played by name, by who played
+    /// them, each with its game time, for `AnimationEvent` events.
+    fn animation_events(&self) -> &[(f64, u32, String)] {
+        &[]
+    }
 }
 
+/// A character's state change: game time, character, from, to.
+pub type StateChange = (f64, u32, String, String);
+
+/// Whether a state (`KnockedDown.Idle`) matches a `HumanStateTransition`
+/// pattern: `*` any, `KnockedDown.*` any of that stance, else the same
+/// (case aside).
+pub fn state_matches(pattern: &str, state: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    match pattern.strip_suffix(".*") {
+        Some(stance) => state
+            .split('.')
+            .next()
+            .is_some_and(|s| s.eq_ignore_ascii_case(stance)),
+        None => pattern.eq_ignore_ascii_case(state),
+    }
+}
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 18] = [
+pub const KINDS: [&str; 19] = [
     "TimerRelative",
     // Every update, in the mission's scripts too: the support manager's
     // recruit cooldowns count with it (`SupportTimer`, which takes
@@ -131,6 +160,7 @@ pub const KINDS: [&str; 18] = [
     "ObjectWinched",
     "ObjectIsVisible",
     "ObjectDelete",
+    "HumanStateTransition",
 ];
 
 /// Kinds the game delivers itself through `Event.__m2_fire` (besides
@@ -1095,6 +1125,27 @@ fn check(
             }
             no
         }
+        // { character (or filter), from, to }: as one of them goes from a
+        // state matching `from` to one matching `to` ([`state_matches`]:
+        // the verify objective's `{ target, "*", "KnockedDown.Idle" }`),
+        // after the event was made. Passes the character.
+        "HumanStateTransition" => {
+            let (Some(from), Some(to)) = (text(&p.params, 2), text(&p.params, 3)) else {
+                return no;
+            };
+            let who = objects(&p.params, 1, world);
+            let hit = world.state_changes().iter().find(|(t, g, a, b)| {
+                *t >= p.last
+                    && (*t > p.last || !p.persistent)
+                    && who.contains(g)
+                    && state_matches(&from, a)
+                    && state_matches(&to, b)
+            });
+            match hit {
+                Some((_, g, _, _)) => Check::Fire(vec![id(*g)]),
+                None => no,
+            }
+        }
         // { character }: when the action `Human.SetState` gave it has
         // played to its end.
         "HumanActionComplete" => match guid(&p.params, 1) {
@@ -1107,9 +1158,10 @@ fn check(
         // event was made (persistent: after it last fired).
         // { 0, object }: as the player takes the context action offered
         // beside the object (`Pg.AddContextAction`: the HQ's exits, a
-        // starter's talk). Passes who took it: the wardrobe's callback
-        // (`WifPmcInterior._SelectOutfit(who)`, made with no data) opens only
-        // for the primary character.
+        // starter's talk). Passes who took it and the object: the wardrobe's
+        // callback (`WifPmcInterior._SelectOutfit(who)`, made with no data)
+        // opens only for the primary character, and the verify objective's
+        // `_TargetActioned(self, who, target)` turns her to the target.
         "ContextAction" => match guid(&p.params, 2) {
             Some(g) => {
                 let taken = world
@@ -1117,10 +1169,28 @@ fn check(
                     .iter()
                     .any(|(t, o)| *o == g && *t >= p.last && (*t > p.last || !p.persistent));
                 if taken {
-                    Check::Fire(world.player().map(id).into_iter().collect())
+                    Check::Fire(world.player().map(id).into_iter().chain([id(g)]).collect())
                 } else {
                     no
                 }
+            }
+            None => no,
+        },
+        // { who, event }: as a clip the scripts played on `who` by name
+        // (`Human.PlayRawAnimation`) meets the named event; who 0 is
+        // anyone. The HQ briefings' frames wait on `{ 0, "CinematicStart"
+        // }` to fade in and `{ actor, "CinematicEnd" }` to go on, events
+        // 252 of their 258 clips carry (from samples).
+        "AnimationEvent" => match text(&p.params, 2) {
+            Some(event) => {
+                let who = guid(&p.params, 1).filter(|&g| g != 0);
+                let met = world.animation_events().iter().any(|(t, g, e)| {
+                    who.is_none_or(|w| w == *g)
+                        && e.eq_ignore_ascii_case(&event)
+                        && *t >= p.last
+                        && (*t > p.last || !p.persistent)
+                });
+                if met { Check::Fire(Vec::new()) } else { no }
             }
             None => no,
         },
@@ -1142,7 +1212,12 @@ fn check(
         // The scripts write "hibernated" (25 calls in vz.wad: PmcCon001's
         // gate opener waits for its front door to sleep, then to wake
         // again); "hibernate" reads the same. Anything else is awake.
-        "ObjectHibernation" => match guid(&p.params, 1) {
+        // `ObjectIsReady` (10 scripts: the wardrobe's `{ who, "awake", 0 }`
+        // after dressing her, the HQ waiting for a player, props'
+        // destroyed states) takes the same parameters and is read the
+        // same: ready as awake is inferred, the engine's own test is not
+        // seen.
+        "ObjectHibernation" | "ObjectIsReady" => match guid(&p.params, 1) {
             Some(g) => {
                 let want_awake = !text(&p.params, 2).is_some_and(|t| t.starts_with("hibernat"));
                 Check::Holds(world.is_awake(g) == want_awake, vec![id(g)])
@@ -1223,6 +1298,8 @@ mod tests {
         visible: Vec<u32>,
         /// Context actions taken: (game time, object).
         context: Vec<(f64, u32)>,
+        /// Clip events met: (game time, who, event).
+        anims: Vec<(f64, u32, String)>,
     }
 
     impl World for TestWorld {
@@ -1246,6 +1323,9 @@ mod tests {
         }
         fn context_presses(&self) -> &[(f64, u32)] {
             &self.context
+        }
+        fn animation_events(&self) -> &[(f64, u32, String)] {
+            &self.anims
         }
         fn inside(&self, _: u32, _: u32) -> Option<bool> {
             None
@@ -1389,6 +1469,58 @@ mod tests {
         events.update(0.5, &world);
         events.update(0.5, &world);
         assert_eq!(log(&host), ["exit A", "exit A", "outfit true"]);
+    }
+
+    #[test]
+    fn object_is_ready_fires_once_it_is_awake() {
+        let (host, events) = setup();
+        // As the wardrobe waits after dressing her (_CompleteChangeOutfit).
+        host.lua()
+            .load(
+                "Event.Create(Event.ObjectIsReady, { 3, 'awake', 0 }, \
+                 function(d) table.insert(log, 'ready ' .. d) end, { 'preen' })",
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        events.update(0.5, &world);
+        assert!(log(&host).is_empty());
+        world.positions.insert(3, [0.0; 3]);
+        events.update(0.5, &world);
+        assert_eq!(log(&host), ["ready preen"]);
+        assert!(events.take_unhandled().is_empty());
+    }
+
+    #[test]
+    fn a_clip_event_fires_for_its_actor_or_anyone() {
+        let (host, events) = setup();
+        // As WifHq._NextCinematicFrame waits: the first frame's fade on
+        // anyone's start, the frame's end on its OnComplete actor's.
+        host.lua()
+            .load(
+                "Event.Create(Event.AnimationEvent, { 0, 'CinematicStart' }, \
+                 function(d) table.insert(log, 'start ' .. d) end, { 'fade' }) \
+                 Event.Create(Event.AnimationEvent, { 1, 'CinematicEnd' }, \
+                 function(d) table.insert(log, 'end ' .. d) end, { 1 })",
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld {
+            // Another actor's end, and one met before it was waited for.
+            anims: vec![
+                (-1.0, 1, "CinematicEnd".into()),
+                (0.25, 5, "CinematicEnd".into()),
+            ],
+            ..TestWorld::default()
+        };
+        events.update(0.5, &world);
+        assert!(log(&host).is_empty());
+        world.anims.push((0.75, 5, "CinematicStart".into()));
+        world.anims.push((0.75, 1, "CinematicEnd".into()));
+        events.update(0.5, &world);
+        events.update(0.5, &world);
+        assert_eq!(log(&host), ["start fade", "end 1"]);
+        assert!(events.take_unhandled().is_empty());
     }
 
     #[test]

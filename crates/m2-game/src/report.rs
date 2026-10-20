@@ -53,6 +53,16 @@ pub struct Reports {
     pub seen: HashMap<String, HashMap<&'static str, u32>>,
     /// Reporters reporting, each with what they report.
     pub reporting: HashMap<u32, HashMap<&'static str, u32>>,
+    /// How much of what a faction's witnesses saw they report, by the
+    /// faction's label in lower case (`Ai.SetInfractionMultiplier`: 0.2
+    /// for a faction while the PMC holds a contract of theirs, 0.1 or 0
+    /// in three missions); 1 if never set. Read as a scale on the counts
+    /// `GetInfractions` answers: inferred from the name and the values,
+    /// the engine's use of it is not seen.
+    pub multipliers: HashMap<String, f32>,
+    /// The scale each reporter's counts are answered with (his
+    /// faction's multiplier when he was offered).
+    pub scale: HashMap<u32, f32>,
     /// Reporters the manager said were done or turned down, since the
     /// game last asked ([`Reports::take_ended`]): whether completed.
     pub ended: Vec<(u32, bool)>,
@@ -78,11 +88,26 @@ impl Reports {
     pub fn infractions(&self, lua: &Lua, reporter: u32) -> mlua::Result<Table> {
         let t = lua.create_table()?;
         let seen = self.reporting.get(&reporter);
+        let scale = self.scale.get(&reporter).copied().unwrap_or(1.0);
         for kind in KINDS {
             let n = seen.and_then(|s| s.get(kind)).copied().unwrap_or(0);
-            t.set(kind, lua.create_sequence_from([0, i64::from(n)])?)?;
+            let count = if scale == 1.0 {
+                Value::Integer(i64::from(n))
+            } else {
+                Value::Number(f64::from(n) * f64::from(scale))
+            };
+            t.set(kind, lua.create_sequence_from([Value::Integer(0), count])?)?;
         }
         Ok(t)
+    }
+
+    /// Reporter `reporter` of the faction labelled `faction` is offered
+    /// with what it has seen; his counts are scaled by its multiplier.
+    pub fn offer(&mut self, reporter: u32, faction: &str) {
+        let seen = self.seen.remove(faction).unwrap_or_default();
+        self.reporting.insert(reporter, seen);
+        let m = self.multipliers.get(&faction.to_ascii_lowercase());
+        self.scale.insert(reporter, m.copied().unwrap_or(1.0));
     }
 }
 

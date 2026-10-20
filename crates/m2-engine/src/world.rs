@@ -218,7 +218,8 @@ pub enum VehicleKind {
 /// What the template database says of one template.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TemplateInfo {
-    /// Its `ModelName`, when that is a model the archive holds.
+    /// Its `ModelName`, when that is a model the archive holds, or its
+    /// stand-in ([`crate::standin`]).
     pub model: Option<u32>,
     /// Its physics component's kind, when it has one.
     pub vehicle: Option<VehicleKind>,
@@ -288,6 +289,11 @@ pub struct Templates {
     pub explosions: HashMap<u32, crate::durability::Explosion>,
     /// How the templates that can be hijacked are, by id.
     pub hijack: HashMap<u32, Vec<crate::hijack::HijackEntrance>>,
+    /// The radio templates' playlist and reach, by id
+    /// ([`crate::music_source`]).
+    pub music_sources: HashMap<u32, (u32, f32)>,
+    /// Each hero template's grappling hook, by id ([`crate::grapple`]).
+    pub grapple: HashMap<u32, crate::grapple::Grapple>,
     /// Where each template's entrances are got in by (`DriverHatch`), by
     /// id ([`crate::hijack::entrance_points`]).
     pub entrance_points: HashMap<u32, Vec<u32>>,
@@ -719,7 +725,10 @@ impl Templates {
                 (
                     id,
                     TemplateInfo {
-                        model: model_of.get(&id).copied().filter(|m| models.contains(m)),
+                        // Cut models come back as their stand-ins.
+                        model: model_of
+                            .get(&id)
+                            .and_then(|&m| crate::standin::resolve(m, models)),
                         vehicle,
                         engine: engines.get(&id).copied(),
                         person: humans.contains(&id) || (minds.contains(&id) && vehicle.is_none()),
@@ -733,7 +742,7 @@ impl Templates {
         let mut order: Vec<(u32, &str)> = names.iter().map(|(&id, &n)| (id, n)).collect();
         order.sort_unstable_by_key(|&(id, _)| std::cmp::Reverse(id));
         let profiles = db.hashes("ModelMixerProfile");
-        let templates = Self {
+        let mut templates = Self {
             by_name: order
                 .iter()
                 .map(|&(id, name)| (name.to_ascii_lowercase(), infos[&id]))
@@ -761,6 +770,8 @@ impl Templates {
             durability: crate::durability::read(&db),
             explosions: crate::durability::explosions(&db),
             hijack: crate::hijack::read(&db),
+            music_sources: crate::music_source::read(&db),
+            grapple: crate::grapple::read(&db),
             entrance_points: crate::hijack::entrance_points(&db),
             ordnance: crate::ordnance::read(&db),
             effects: crate::particles::template_effects(&db),
@@ -779,6 +790,8 @@ impl Templates {
             localized: localized_names(&db),
             damage,
         };
+        crate::standin::add_supply_drops(&mut templates);
+        crate::standin::arm_the_osprey(&mut templates);
         (templates, atmosphere)
     }
 }
@@ -963,6 +976,9 @@ pub struct WorldIndex {
     pub cells: HashMap<u32, Vec3>,
     /// Low-resolution tile asset hash to tile centre.
     pub tiles: HashMap<u32, Vec3>,
+    /// The radios ([`crate::music_source`]): placed with a record of their
+    /// own, or as a template that has one (the HQ's `Dance Radio`).
+    pub music_sources: Vec<crate::music_source::MusicSource>,
     /// Models placed by the static layers (the world as it always is,
     /// without mission states).
     pub objects: Vec<ObjectPlacement>,
@@ -987,6 +1003,9 @@ pub struct WorldIndex {
     pub atmosphere: Option<Atmosphere>,
     /// The regions whose light differs from it (`vz_atmosphere_regions`).
     pub atmosphere_regions: Vec<AtmosphereRegion>,
+    /// Where the free-play score is the jungle's or the water's, and which
+    /// ambience plays where (`vz_sfx_ambience`).
+    pub sound_regions: Vec<crate::sound_regions::SoundRegion>,
     /// How the placed props that move on their own move, by entity (state
     /// layers' and static layers' alike).
     pub motions: HashMap<u32, PropMotion>,
@@ -1311,6 +1330,16 @@ impl WorldIndex {
                     world
                         .atmosphere_regions
                         .extend(crate::atmosphere::read_regions(&layer, |h| {
+                            let data = source.asset(h, m2_assets::region::REGION_TYPE).ok()?;
+                            Some(m2_assets::Region::parse(&data).ok()?.corners)
+                        }));
+                }
+                if layer.component("MusicRegion").is_some()
+                    || layer.component("SoundAmbience").is_some()
+                {
+                    world
+                        .sound_regions
+                        .extend(crate::sound_regions::read_regions(&layer, |h| {
                             let data = source.asset(h, m2_assets::region::REGION_TYPE).ok()?;
                             Some(m2_assets::Region::parse(&data).ok()?.corners)
                         }));
@@ -1782,6 +1811,22 @@ impl WorldIndex {
         for (entity, asset) in layer.hashes("LowResTerrainObject") {
             if let Some(p) = at(entity) {
                 self.tiles.insert(asset, Vec3::from(p.position));
+            }
+        }
+        // Radios: a record of the entity's own, else its template's.
+        let own = crate::music_source::read(layer);
+        for (&entity, p) in &placements {
+            let source = own
+                .get(&entity)
+                .or_else(|| assets.templates.music_sources.get(&p.parent));
+            if let Some(&(playlist, reach)) = source {
+                self.music_sources.push(crate::music_source::MusicSource {
+                    entity,
+                    layer: layer_hash,
+                    at: Vec3::from(p.position),
+                    playlist,
+                    reach,
+                });
             }
         }
         if !is_static {

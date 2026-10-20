@@ -55,6 +55,9 @@ use crate::support::{self, FALLBACK_AFTER, Impact, Kind};
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
+/// Seconds after the scripts start from a save that where the story
+/// stands is logged: by then they have taken the save in (invented).
+const LOAD_REPORT_SECONDS: f32 = 15.0;
 /// A scripted voice line to play: the mission's id for it, its cue, and
 /// where it is said (`None`: flat).
 pub type ScriptLine = (u32, String, Option<Vec3>);
@@ -206,6 +209,64 @@ pub struct Trespass {
     pub faction: Option<String>,
 }
 
+/// The radios ([`m2_engine::music_source`]): within a radio's reach (one
+/// whose layer is in and whose playlist the scripts filled) its playlist
+/// plays over the score, a song per visit in the playlist's order; out of
+/// reach the score comes back. Invented: the song per visit (the engine's
+/// own playlist order and its blend are not read) and the cut from the
+/// score to it.
+#[derive(Debug, Default)]
+struct Radio {
+    /// The score's cue as the scripts last set it.
+    score: Option<String>,
+    /// The radio playing over it (its entity and cue).
+    playing: Option<(u32, String)>,
+    /// How many radio songs started.
+    turn: usize,
+}
+
+impl Radio {
+    /// What the music changes to, when it does.
+    fn update(&mut self, game: &Game, mission: &Mission) -> Option<Option<String>> {
+        let her = game.focus();
+        let near = game.scene.world.as_ref().and_then(|w| {
+            w.index
+                .music_sources
+                .iter()
+                .filter(|s| game.scene.people.layer_in(Some(s.layer)))
+                .map(|s| (s, s.at.distance(her)))
+                .filter(|(s, d)| *d <= s.reach)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(s, _)| *s)
+        });
+        let playing = self.playing.as_ref().map(|r| r.0);
+        match near {
+            Some(s) if playing != Some(s.entity) => {
+                let list = mission.playlist(s.playlist);
+                if list.is_empty() {
+                    return None;
+                }
+                let cue = list[self.turn % list.len()].clone();
+                self.turn += 1;
+                eprintln!(
+                    "mission: radio {:#x} at {:.0} plays {cue} ({} in its playlist)",
+                    s.entity,
+                    s.at,
+                    list.len()
+                );
+                self.playing = Some((s.entity, cue.clone()));
+                Some(Some(cue))
+            }
+            None if playing.is_some() => {
+                eprintln!("mission: out of the radio's reach, the score again");
+                self.playing = None;
+                Some(self.score.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Seconds the contract's completion stays up.
 const BANNER_TIME: f32 = 10.0;
 
@@ -350,7 +411,9 @@ end
 /// menus this way (`MrxBriefing`'s `[Briefing.Bribe]`, `[Generic.Exit]`
 /// list after `LTILibName.ChangeShellState(true)`), and the contract's
 /// description with its Accept and Decline
-/// (`MrxGuiDialogBox.DisplayScrollingDialogBox`, method `Scroll`).
+/// (`MrxGuiDialogBox.DisplayScrollingDialogBox`, method `Scroll`), and a
+/// recruit's wager its digit box (`MrxGui.DisplayNumericBox`, method
+/// `Numeric`, with an accept and a cancel callback).
 const DIALOG_BOXES: &str = r##"
 __m2_dialog_wrapped = __m2_dialog_wrapped or setmetatable({}, { __mode = "k" })
 local function plain(v)
@@ -399,8 +462,32 @@ local function scrolling(owner, text, callback, args, options, ...)
     return open("Scroll", { sText = plain(text) or "", tOptions = texts(options),
         tRest = rest(...) }, callback, args)
 end
+-- DisplayNumericBox(owner, title, text, prefix, suffix, start, min, max,
+-- _, _, _, accept, accept args, cancel, cancel args, ...): the HQ's wager
+-- (`[Briefing.ChangeWagerQuery]`). The HUD answers the value accepted, or
+-- -1 - the value for a cancel; each callback gets its args and the value.
+local function numeric(owner, ...)
+    local a, n = { ... }, select("#", ...)
+    local accept, aargs, cancel, cargs = a[11], a[12], a[13], a[14]
+    local p = {}
+    for i = 1, 10 do p[i] = plain(a[i]) end
+    local tail = {}
+    for i = 15, n do tail[i - 14] = plain(a[i]) end
+    local function answer(v)
+        local f, args = accept, aargs
+        if v < 0 then f, args, v = cancel, cargs, -1 - v end
+        local call = {}
+        if type(args) == "table" then
+            for i = 1, table.getn(args) do call[i] = args[i] end
+        end
+        table.insert(call, v)
+        if type(f) == "function" then f(unpack(call)) end
+    end
+    return open("Numeric", { tArgs = p, nArgs = 10, tRest = tail, nRest = n - 14 }, answer, {})
+end
 __m2_dialog_wrapped[display] = true
 __m2_dialog_wrapped[scrolling] = true
+__m2_dialog_wrapped[numeric] = true
 local function close(box)
     if type(box) == "table" and type(box.Close) == "function" and box.__m2_dialog then
         box.Close(box)
@@ -422,6 +509,12 @@ function __m2_wrap_dialogs()
     if type(g) == "table" then
         wrap(g, "DisplayDialogBox", display)
         wrap(g, "CloseDialogBox", close)
+        wrap(g, "DisplayNumericBox", numeric)
+    end
+    local nb = rawget(_G, "MrxGuiNumericBox")
+    if type(nb) == "table" then
+        wrap(nb, "DisplayNumericBox", numeric)
+        wrap(nb, "Close", close)
     end
 end
 __m2_wrap_dialogs()
@@ -494,6 +587,13 @@ const REPORT_WITNESS: f32 = 80.0;
 const REPORT_CALL_IN: f32 = 4.0;
 const REPORT_GIVE_UP: f32 = 30.0;
 const STORY_REACH: f32 = 450.0;
+/// The player's verify photo clips, by hero ([`Command::DoAction`]), and
+/// how long an action without a clip lasts (invented).
+const VERIFY_CLIPS: [u32; 3] = [0x5ae2_cef2, 0x0053_81c4, 0xb448_382e];
+const ACTION_SECONDS: f32 = 2.0;
+/// How near the extraction helicopter she loads a prisoner, metres
+/// (invented).
+const LOAD_REACH: f32 = 8.0;
 
 /// A marker the scripts put up, over one of their objects.
 #[derive(Clone, Debug, PartialEq)]
@@ -558,6 +658,12 @@ pub struct MissionLink {
     /// Skipped there: ticks left to find where the scripts' new game
     /// spawns her ([`spawn_point`]) and put her there.
     spawn_tries: u32,
+    /// A save to start from ([`with_save`](Self::with_save)), until the
+    /// scripts start.
+    saved: Option<Box<crate::save::SaveGame>>,
+    /// Seconds since the scripts started from a save, until where the
+    /// story stands is logged ([`LOAD_REPORT_SECONDS`]).
+    since_load: Option<f32>,
     /// The scripts put the player somewhere the island has no way to hold
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
@@ -570,6 +676,8 @@ pub struct MissionLink {
     vehicles: Fleet,
     /// Seconds since the scripts said the contract was completed.
     completed: Option<f32>,
+    /// How many times the scripts have said a contract was completed.
+    contracts: u32,
     /// The speed of the vehicle she drives, held a little (m/s).
     speed: f32,
     /// The keys tutorial lines name.
@@ -584,6 +692,15 @@ pub struct MissionLink {
     fades: Vec<crate::sound::CategoryChange>,
     /// The music cue the scripts last switched to (`Some(None)`: none).
     music: Option<Option<String>>,
+    /// The radios near her ([`Radio`]).
+    radio: Radio,
+    /// The human state each placed person was last told to the scripts
+    /// in ([`crate::npc::Down`]), by guid.
+    states: HashMap<u32, &'static str>,
+    /// The reverb to switch to, if the scripts changed it.
+    reverb: Option<Option<m2_engine::reverb::ReverbPreset>>,
+    /// The music region she was last in, by entity (`Some(None)`: none).
+    music_region: Option<Option<u32>>,
     /// Support items to stock and call in once the scripts run
     /// (`--support`).
     support: Vec<String>,
@@ -708,12 +825,15 @@ impl MissionLink {
             drivers,
             skip_to: None,
             spawn_tries: 0,
+            saved: None,
+            since_load: None,
             ashore: 0,
             blasts: Vec::new(),
             tutorial: None,
             bombs: Vec::new(),
             vehicles: Fleet::default(),
             completed: None,
+            contracts: 0,
             speed: 0.0,
             keys: Default::default(),
             lines: Vec::new(),
@@ -721,6 +841,10 @@ impl MissionLink {
             sounds: Vec::new(),
             fades: Vec::new(),
             music: None,
+            radio: Radio::default(),
+            states: HashMap::new(),
+            reverb: None,
+            music_region: None,
             support: Vec::new(),
             ashore_for: 0.0,
             marked: HashMap::new(),
@@ -856,6 +980,17 @@ impl MissionLink {
                 .map(|i| (i.key, i.stock))
                 .collect(),
         })
+    }
+
+    /// Where the story stands, once the scripts run
+    /// ([`Mission::contracts`]).
+    pub fn contracts(&self) -> Option<m2_game::savedata::Contracts> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        m.contracts()
+            .map_err(|e| eprintln!("mission: the contracts' states: {e}"))
+            .ok()
     }
 
     /// The scripts' own save data, to keep in a save
@@ -1039,6 +1174,31 @@ impl MissionLink {
         Self { movies, ..self }
     }
 
+    /// Starts the scripts from `save` rather than a new game, as loading
+    /// it does: her place, weapons and the world's wrecks and dead are put
+    /// back first, then the scripts are handed their own save data
+    /// ([`Mission::load_save`]): the contracts done and on offer, her PMC,
+    /// the factions. A save without script data (from before it was kept)
+    /// starts a new game with her cash and stock made up to the save's.
+    pub fn with_save(mut self, save: Option<crate::save::SaveGame>) -> Self {
+        if let Some(save) = save {
+            self.set_save(save);
+        }
+        self
+    }
+
+    /// As [`with_save`](Self::with_save), for a link already made whose
+    /// scripts have not started (a front end holding play until a game is
+    /// chosen). Whether it was taken: once the scripts run it is too late,
+    /// and the save is not taken.
+    pub fn set_save(&mut self, save: crate::save::SaveGame) -> bool {
+        if !matches!(self.state, State::Loading(_)) {
+            return false;
+        }
+        self.saved = Some(Box::new(save));
+        true
+    }
+
     /// Ends the scripts' skip mode once the start has run, when the movies
     /// wait for the game (unless `--skip-mode-on`).
     pub fn with_skip_mode_off(self, end_skip: bool) -> Self {
@@ -1126,11 +1286,43 @@ impl MissionLink {
                 game.scene.people.state_layers = None;
             }
         }
+        // The scripts take a save's data in as the world streams in: where
+        // the story stands, and where she is, is logged once they have.
+        if let Some(t) = &mut self.since_load {
+            *t += dt;
+            if *t >= LOAD_REPORT_SECONDS {
+                self.since_load = None;
+                if let Some(c) = self.contracts() {
+                    let at = game.focus();
+                    eprintln!(
+                        "load: {LOAD_REPORT_SECONDS} s on, the scripts hold {c}; she is at ({:.0}, {:.0}, {:.0})",
+                        at.x, at.y, at.z
+                    );
+                }
+            }
+        }
         let State::Running(mission) = &mut self.state else {
             return;
         };
-        // Deliveries fly on; the scripts hear of each load let go.
         let focus = game.focus();
+        // The music region she is in: the free-play score follows it.
+        if let Some(world) = &game.scene.world {
+            let region =
+                m2_engine::sound_regions::music_at(&world.index.sound_regions, focus.x, focus.z);
+            let entity = region.map(|r| r.entity);
+            if self.music_region != Some(entity) {
+                self.music_region = Some(entity);
+                mission.music_region(region.and_then(|r| r.faction));
+                eprintln!(
+                    "music: region {} at ({:.0}, {:.0}), score {}",
+                    region.map_or("none", |r| r.name.as_str()),
+                    focus.x,
+                    focus.z,
+                    mission.music_faction()
+                );
+            }
+        }
+        // Deliveries fly on; the scripts hear of each load let go.
         let scene = &mut game.scene;
         if let Some(world) = &mut scene.world {
             for r in scene
@@ -1270,7 +1462,110 @@ impl MissionLink {
         // The scripts' context actions (the HQ's exits, a starter's talk):
         // the one she stands at is offered, and taken with the use key.
         if let Some(g) = game.context_taken.take() {
+            let text = mission.context_text(g).unwrap_or_default();
             mission.take_context_action(g);
+            // The verify objective's prompts no script answers: the engine
+            // subdues a knocked-down target, and picks a subdued one up
+            // (from the scripts: `MrxTaskObjectiveVerify` offers them and
+            // waits on the states; who acts on them is inferred).
+            if let Some(n) = game
+                .scene
+                .people
+                .npcs
+                .iter_mut()
+                .find(|n| n.spawn == Some(g))
+            {
+                if text.eq_ignore_ascii_case("[ContextAction.Subdue]") && n.subdue() {
+                    eprintln!("mission: she subdues {g:#x}");
+                } else if text.eq_ignore_ascii_case("[ContextAction.Carry]") && n.carry(true) {
+                    eprintln!("mission: she picks {g:#x} up");
+                }
+            }
+        }
+        // Whom she carries rides her shoulder (invented: over her right
+        // shoulder, facing behind her).
+        if let Some(p) = game.scene.player.as_ref() {
+            let (at, facing) = (p.character.position, p.facing);
+            for n in game
+                .scene
+                .people
+                .npcs
+                .iter_mut()
+                .filter(|n| n.down == Some(crate::npc::Down::Carried))
+            {
+                let right = Vec3::new(facing.cos(), 0.0, -facing.sin());
+                n.character.position = at + right * 0.25 + Vec3::Y * 1.3;
+                n.facing = facing + std::f32::consts::PI;
+            }
+        }
+        // Carrying a prisoner to the extraction helicopter (the verify
+        // objective's `ExtractionHelicopter`, landed for her): within
+        // [`LOAD_REACH`] of it she loads them aboard, the seat event the
+        // objective waits on (`ObjectInSeat { target, "ExtractionHelicopter",
+        // "a", "e" }`), and they leave with it. Inferred: no script seats
+        // the prisoner, so the engine does it; the reach is invented.
+        if let Some(her) = game.scene.player.as_ref().map(|p| p.character.position)
+            && let Some(k) = game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .position(|n| n.down == Some(crate::npc::Down::Carried))
+            && let Some(g) = game.scene.people.npcs[k].spawn
+            && let Some((heli, _)) = mission
+                .labelled("ExtractionHelicopter")
+                .into_iter()
+                .find(|(_, at)| Vec3::from(*at).distance(her) <= LOAD_REACH)
+        {
+            eprintln!("mission: she loads {g:#x} into the extraction helicopter {heli:#x}");
+            game.scene.people.npcs.remove(k);
+            // Gone with it: their spawn places nobody again.
+            game.scene.people.killed.insert(g);
+            mission.set_human_state(g, "InVehicle.Subdued");
+            self.states.insert(g, "InVehicle.Subdued");
+            mission.seat_in(g, heli);
+        }
+        // Keyed actions run out: `HumanActionComplete` fires.
+        for a in &mut game.actions {
+            a.2 -= dt;
+        }
+        let (done, left): (Vec<_>, Vec<_>) = std::mem::take(&mut game.actions)
+            .into_iter()
+            .partition(|a| a.2 <= 0.0);
+        game.actions = left;
+        for (g, action, _) in done {
+            eprintln!("mission: {g:#x}'s {action} ends");
+            mission.action_finished(g);
+        }
+        // Whom she carries, for `Human.IsCarrying`.
+        let carried = game
+            .scene
+            .people
+            .npcs
+            .iter()
+            .find(|n| n.down == Some(crate::npc::Down::Carried))
+            .and_then(|n| n.spawn);
+        mission.set_carrying(PLAYER, carried);
+        // The placed people's human states, as they change, for the
+        // scripts' `HumanStateTransition` events.
+        for n in &game.scene.people.npcs {
+            let Some(g) = n.spawn else { continue };
+            let state = n.human_state();
+            if self.states.get(&g).copied().unwrap_or("Upright.Idle") != state {
+                self.states.insert(g, state);
+                mission.set_human_state(g, state);
+            }
+        }
+        // What the clips the scripts hold people in met: their events
+        // (a briefing frame's start and end) and their voice lines.
+        for (g, met) in game.raw.take_met() {
+            match met {
+                crate::raw::Met::Event(e) => {
+                    eprintln!("raw-clip: {g:#x} meets {e}");
+                    mission.animation_event(g, &e);
+                }
+                crate::raw::Met::Line(cue) => mission.clip_line(g, &cue),
+            }
         }
         // Her infractions against the factions, for their witnesses to
         // report: the first one of a faction not already reporting, a
@@ -1341,6 +1636,16 @@ impl MissionLink {
                 "mission: the faction manager is done with reporter {g:#x} (reported: {done})"
             );
         }
+        // The radios near her play over the score.
+        if let Some(cue) = self.radio.update(game, mission) {
+            self.music = Some(cue);
+        }
+        // A pursuit run out: the scripts read level 0 again.
+        let pursued = !game.scene.people.pursuit.is_empty();
+        if game.pursued && !pursued {
+            mission.pursuit_over();
+        }
+        game.pursued = pursued;
         // The factions' attitudes, once a second: whose soldiers fight her.
         game.attitude_wait -= dt;
         if game.attitude_wait <= 0.0 {
@@ -1642,7 +1947,14 @@ impl MissionLink {
                         );
                         game.combat.hp = health.clamp(0.0, game.combat.max_hp);
                     }
-                    Command::Music(cue) => self.music = Some(cue.clone()),
+                    // The score, unless a radio near her plays over it.
+                    Command::Music(cue) => {
+                        self.radio.score = cue.clone();
+                        if self.radio.playing.is_none() {
+                            self.music = Some(cue.clone());
+                        }
+                    }
+                    Command::Reverb(preset) => self.reverb = Some(preset.clone()),
                     Command::Invincible { guid, on } if *guid == PLAYER => {
                         game.combat.invincible = *on;
                     }
@@ -1654,7 +1966,24 @@ impl MissionLink {
                              start at 0 until the scripts give them a reserve (the explosives \
                              box shows 0 till then)"
                         );
-                        game.combat.carbine_only();
+                        // The first weapon named is the gun in the
+                        // rifle's place (the first contract's `Carbine`,
+                        // PmcCon001's `Assault Rifle`), as its template
+                        // says; else the carbine.
+                        let gun = weapons
+                            .first()
+                            .and_then(|w| game.scene.arms()?.named(w))
+                            .map(|spec| game.combat.stock(spec));
+                        match gun {
+                            Some(rifle) => {
+                                eprintln!(
+                                    "mission: her gun is the {} ({} a clip)",
+                                    rifle.name, rifle.clip
+                                );
+                                game.combat.scripted_rifle(rifle);
+                            }
+                            None => game.combat.carbine_only(),
+                        }
                         game.combat.scripted_loadout = true;
                     }
                     Command::Reserve {
@@ -1668,6 +1997,13 @@ impl MissionLink {
                             game.combat.grenades = (*rounds).min(combat::MAX_GRENADES);
                         } else if weapon.eq_ignore_ascii_case("C4") {
                             game.combat.charges = *rounds;
+                        } else if weapon.eq_ignore_ascii_case(&game.combat.rifle.name)
+                            && !weapon.eq_ignore_ascii_case(CARBINE)
+                        {
+                            // Clips of the gun she was handed (`Weapon.
+                            // SetReserveAmmo` of `GetMaxReserveAmmo`: the
+                            // Assault Rifle's 7), as for the carbine.
+                            game.combat.rifle_rounds.stored = *rounds * game.combat.rifle.clip;
                         } else if weapon.eq_ignore_ascii_case(CARBINE) {
                             game.combat.rifle_rounds.stored =
                                 (*rounds * combat::RIFLE_CLIP).min(combat::RIFLE_SPARE);
@@ -1690,6 +2026,7 @@ impl MissionLink {
                 }
                 if c == Command::Notify("Pg.ContractCompleted".into()) {
                     self.completed = Some(0.0);
+                    self.contracts += 1;
                 }
             }
             if let Some(line) = tutorial(mission) {
@@ -1729,6 +2066,9 @@ impl MissionLink {
                 if let Err(e) = mission.run(TRESPASS, "trespass") {
                     self.write([format!("trespass: {e}")]);
                 }
+                if let Err(e) = mission.run(RESTORED_SUPPORT, "restored support") {
+                    self.write([format!("restored support: {e}")]);
+                }
                 for (name, code) in std::mem::take(&mut self.drivers) {
                     if let Err(e) = mission.run(&code, &name) {
                         self.write([format!("{name}: {e}")]);
@@ -1744,6 +2084,20 @@ impl MissionLink {
                     self.write([format!("skip to: {to} (briefing {briefing})")]);
                     self.spawn_tries = ASHORE_TRIES;
                 }
+                let loaded = self.saved.is_some();
+                let pmc = self.saved.take().and_then(|save| {
+                    let mut save = *save;
+                    let pmc = save.pmc.take();
+                    let scripts = save.scripts.take();
+                    game.load(save);
+                    match scripts {
+                        Some(text) => {
+                            mission.load_save(text);
+                            None
+                        }
+                        None => pmc,
+                    }
+                });
                 mission.start();
                 if self.movies && self.end_skip {
                     // The movies wait for the game, so the scripts' skip
@@ -1760,6 +2114,12 @@ impl MissionLink {
                 }
                 self.write(lines);
                 self.state = State::Running(Box::new(mission));
+                if let Some(pmc) = pmc {
+                    self.restore(&pmc);
+                }
+                if loaded {
+                    self.since_load = Some(0.0);
+                }
             }
             Err(e) => self.fail(format!("could not start the scripts: {e}")),
         }
@@ -1811,6 +2171,11 @@ impl MissionLink {
         self.music.take()
     }
 
+    /// The reverb to switch to, if the scripts changed it.
+    pub fn take_reverb(&mut self) -> Option<Option<m2_engine::reverb::ReverbPreset>> {
+        self.reverb.take()
+    }
+
     /// Scripted line `id` lasts `seconds`.
     pub fn line_length(&mut self, id: u32, seconds: f32) {
         if let State::Running(m) = &mut self.state {
@@ -1832,6 +2197,18 @@ impl MissionLink {
     /// The scripts are running (not still loading, not failed).
     pub fn running(&self) -> bool {
         matches!(self.state, State::Running(_))
+    }
+
+    /// Whether the scripts let her grapple (`Player.SetGrappleEnabled`).
+    pub fn grapple_enabled(&self) -> bool {
+        matches!(&self.state, State::Running(m) if m.grapple_enabled())
+    }
+
+    /// Tells the scripts whether she is on her grappling hook's line.
+    pub fn set_grappling(&mut self, on: bool) {
+        if let State::Running(m) = &mut self.state {
+            m.set_grappling(on);
+        }
     }
 
     /// The scripts' vehicles in play: label, and where it stands if
@@ -1993,6 +2370,36 @@ impl MissionLink {
         out
     }
 
+    /// The scripts' objects carrying label `label`, and where each is.
+    pub fn labelled(&self, label: &str) -> Vec<(u32, Vec3)> {
+        let State::Running(m) = &self.state else {
+            return Vec::new();
+        };
+        m.labelled(label)
+            .into_iter()
+            .map(|(g, at)| (g, Vec3::from(at)))
+            .collect()
+    }
+
+    /// Runs `code` in the mission's scripts (a test harness's line).
+    pub fn run_lua(&mut self, code: &str) {
+        if let State::Running(m) = &mut self.state
+            && let Err(e) = m.run(code, "harness")
+        {
+            eprintln!("mission: harness code failed: {e}");
+        }
+    }
+
+    /// A guid the scripts keep in global `name` (a test driver's
+    /// `__m2_test_target`), if the mission runs and it is one.
+    pub fn global_guid(&self, name: &str) -> Option<u32> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        let v: mlua::Value = m.lua().globals().raw_get(name).ok()?;
+        m2_game::events::as_guid(&v)
+    }
+
     /// The markers the scripts have up, with what they are over; then the
     /// targets of the objectives on the map (`"objective"`) and of the
     /// radar's blips (`"radar"`) no marker is over.
@@ -2095,6 +2502,27 @@ impl MissionLink {
         }
     }
 
+    /// Where the things are that the scripts wait for her to see
+    /// (`Event.ObjectIsVisible`), as the game looks at them.
+    pub fn sight_targets(&self, game: &Game) -> Vec<Vec3> {
+        let State::Running(m) = &self.state else {
+            return Vec::new();
+        };
+        let w = m.world().borrow();
+        m.sight_watched()
+            .into_iter()
+            .filter_map(|g| {
+                let o = w.objects.get(&g)?;
+                Some(
+                    game.scene
+                        .props
+                        .centre(g)
+                        .unwrap_or(Vec3::from(o.position) + Vec3::Y * SIGHT_HEIGHT),
+                )
+            })
+            .collect()
+    }
+
     /// The names of the events the scripts wait for the game to post
     /// (`"PDA Open"`).
     pub fn awaited(&self) -> Vec<String> {
@@ -2107,6 +2535,11 @@ impl MissionLink {
     /// The scripts have said the contract is completed.
     pub fn completed(&self) -> bool {
         self.completed.is_some()
+    }
+
+    /// How many contracts the scripts have said are completed.
+    pub fn contracts_completed(&self) -> u32 {
+        self.contracts
     }
 
     /// The newest of the scripts' fanfare calls (`Hud.Fanfare`) whose
@@ -2841,6 +3274,92 @@ function __m2_unlock_all(f)
 end
 "#;
 
+/// Lua that adds cut content back to the support catalogue (see
+/// `m2_engine::standin`), each item built as the game's own of its kind:
+///
+/// - the V-22 Osprey, flown in as the helicopters are
+///   (`mrxsupportcopterdelivery` with its `V22 (Delivery)` template, which
+///   the game keeps), under its own PDA icon `vehicles_plane_v22`;
+/// - `DLC_M1A1`, slung under the Mi-26 as the M1A2 is, under the M1A2's
+///   icon;
+/// - the cut hand weapons, each in its supply crate
+///   (`m2_engine::standin::SUPPLY_DROPS`), dropped as the game's crates
+///   are, under the icon of the crate each is shaped as.
+///
+/// The game has no strings for them, so names and descriptions are
+/// written here; the prices are invented, near the game's for their
+/// kind (the Endriago's 45,000 and 140 fuel, the M1A2's 425,000 and 240,
+/// a weapon crate's 10,000 and 40).
+const RESTORED_SUPPORT: &str = r#"
+local data = MrxSupportData and MrxSupportData.tSupportData
+local function lookup(name)
+    return (MrxSupportData and MrxSupportData[name]) or rawget(_G, name)
+end
+local copter, crates = lookup("mrxsupportcopterdelivery"), lookup("mrxcratedelivery")
+local function add(key, item, support)
+    if data and support and not data[key] then
+        item.nMaxStock = 99
+        item.oSupport = support
+        data[key] = item
+    end
+end
+if copter then
+    local o = copter:Create()
+    o:SetDeliveryVehicle("V22 (Delivery)")
+    add("v22osprey", {
+        sName = "V-22 Osprey",
+        sDescription = "Tiltrotor transport, cut from the game and flown back in.",
+        sIcon = "vehicles_plane_v22", nCashCost = 150000, nFuelCost = 200, sType = "Heli",
+    }, o)
+end
+if crates then
+    local o = crates:Create()
+    o:SetCargo("DLC_M1A1")
+    o:SetDeliveryVehicle("Mi26 (PMC) (Driver)")
+    add("dlcm1a1", {
+        sName = "M1A1 Abrams",
+        sDescription = "The cut M1A1, slung in under a Mi-26.",
+        sIcon = "vehicles_tank_m1a2", nCashCost = 400000, nFuelCost = 240, sType = "Heavy",
+    }, o)
+    for _, w in ipairs({
+        { "coilgun", "Supply Drop (Coilgun)", "Coilgun", "supplies_sniper_kit", 25000 },
+        { "riotgun", "Supply Drop (Riot Gun)", "Riot Gun", "supplies_cqb", 10000 },
+        { "cheatrpg", "Supply Drop (Cheat RPG)", "Cheat RPG", "supplies_rpg", 50000 },
+        { "dlc50cal", "Supply Drop (50 Cal)", ".50 Cal", "supplies_light_mg", 15000 },
+    }) do
+        local o = crates:Create()
+        o:SetCargo(w[2])
+        o:SetCareless(true)
+        add(w[1], {
+            sName = w[3] .. " crate",
+            sDescription = "A cut weapon, dropped in its own crate.",
+            sIcon = w[4], nCashCost = w[5], nFuelCost = 40, sType = "Supply",
+        }, o)
+    end
+end
+-- Who sells them: the Osprey Universal Petroleum alone (Brendan's call,
+-- 2026-10-18), the M1A1 the Allies as they sell the M1A2, the weapons'
+-- crates your PMC (invented). A shop lists what `MrxRewardData`'s rewards
+-- name for its faction (`GetAllPotentialShopItems`, cached in
+-- `gtAllSupport`); each is unlocked there from the start. The Cheat RPG's
+-- crate is sold nowhere: the cheat menu and `--support` call it.
+local rewards = MrxRewardData and MrxRewardData._tRewards
+if data and rewards and not rewards.__m2_restored then
+    local sold = { { "v22osprey", "Oil" }, { "dlcm1a1", "All" },
+        { "coilgun", "Pmc" }, { "riotgun", "Pmc" }, { "dlc50cal", "Pmc" } }
+    local listed = {}
+    for _, s in ipairs(sold) do
+        local item = data[s[1]]
+        if item then
+            item.tUnlockStatus = { [s[2]] = 2 }
+            table.insert(listed, s)
+        end
+    end
+    rewards.__m2_restored = { tSupport = listed }
+    MrxRewardData.gtAllSupport = nil
+end
+"#;
+
 /// A shop as the player sees it: her cash, and each thing on sale.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ShopView {
@@ -2888,10 +3407,9 @@ fn shop_view(m: &Mission) -> ShopView {
 fn stocked(m: &Mission) -> Vec<support::Stocked> {
     m.support_items()
         .into_iter()
-        .filter(|i| i.stock > 0 || i.free > 0)
-        // Free ones the game carries out itself (the first contract's
-        // satellite bomb) are her own items in the menu.
-        .filter(|i| support::Kind::from_freebie(&i.key).is_none())
+        .filter(|i| i.stock > 0 || i.free > 0 || i.active)
+        // The free Satellite Guided Bomb is her own item ([`Kind`]).
+        .filter(|i| Kind::from_freebie(&i.key).is_none())
         .map(|i| support::Stocked {
             name: {
                 let shown = m.text(&i.name);
@@ -2902,8 +3420,10 @@ fn stocked(m: &Mission) -> Vec<support::Stocked> {
                 }
             },
             method: i.designator.trim_end_matches(" Designator").to_owned(),
-            count: u32::try_from(i.stock.max(0) + i.free.max(0)).unwrap_or(0),
-            free: i.free > 0,
+            count: u32::try_from(i.stock.max(0) + i.free.max(0))
+                .unwrap_or(0)
+                .max(u32::from(i.active)),
+            free: i.free > 0 || i.active,
             key: i.key,
         })
         .collect()
@@ -3201,6 +3721,26 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             if !on && game.shot.take().is_some() {
                 eprintln!("mission: the scene ends; the camera is hers again");
             }
+            if !on && game.raw.held() > 0 {
+                eprintln!(
+                    "raw-clip: the scene ends; {} let go of their clips",
+                    game.raw.held()
+                );
+                game.raw.release(&mut game.scene);
+            }
+            return false;
+        }
+        // A briefing frame's clip for one of its actors, by name.
+        Command::RawClip { guid, clip } => {
+            match game.raw.start(&mut game.scene, *guid, clip) {
+                Ok(length) => eprintln!("raw-clip: {guid:#x} plays {clip} ({length:.2} s)"),
+                Err(why) => eprintln!("raw-clip: {guid:#x} cannot play {clip}: {why}"),
+            }
+            return false;
+        }
+        // The wardrobe's pick: put on her before the next frame.
+        Command::Outfit { guid, model } if *guid == PLAYER => {
+            game.outfit_wanted = Some(model.clone());
             return false;
         }
         Command::ExitVehicle(guid) if *guid == PLAYER => {
@@ -3436,6 +3976,46 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
+        // The scripts' pursuit: that army's soldiers fight her for a while,
+        // or until it is cleared.
+        Command::Pursuit { faction, seconds } => match crate::npc::faction_by_label(faction) {
+            Some(f) => game.scene.people.scripted_pursuit(f, *seconds),
+            None => eprintln!("mission: a pursuit by {faction}, not an army here"),
+        },
+        Command::PursuitClear => game.scene.people.clear_scripted_pursuit(),
+        // A keyed action: the player's verify photo plays her hero's
+        // `VerifyCamera` clip (the on-foot tables' handle fe0ead5a: rifle
+        // 5ae2cef2 Jennifer's, 005381c4 Mattias's, b448382e Chris's, from
+        // samples) and ends with it; anyone else's ends at once (no clip
+        // is looked up for theirs yet).
+        Command::DoAction { guid, action } if *guid == PLAYER => {
+            let mut seconds = ACTION_SECONDS;
+            if action.eq_ignore_ascii_case("VerifyCamera")
+                && let Some(p) = game.scene.player.as_mut()
+                && let Some((_, rig)) = p.model.as_mut()
+                && let Some(i) = VERIFY_CLIPS.iter().find_map(|&h| {
+                    rig.clips
+                        .iter()
+                        .position(|c| c.hash == h && !rig.foreign.contains(&h))
+                })
+            {
+                seconds = rig.clips[i].info.duration;
+                rig.animator.play_once(i);
+            }
+            eprintln!("mission: she plays {action} ({seconds:.1} s)");
+            game.actions.push((*guid, action.clone(), seconds));
+        }
+        Command::DoAction { guid, action } => {
+            eprintln!("mission: {guid:#x} plays {action}");
+            game.actions.push((*guid, action.clone(), 0.0));
+        }
+        Command::Drop(guid) => {
+            for n in &mut game.scene.people.npcs {
+                if n.carry(false) {
+                    eprintln!("mission: {guid:#x} puts down {:?}", n.spawn);
+                }
+            }
+        }
         // Shut again: its model and collision go back up where its layer
         // has it (as OpenGate took them down).
         Command::CloseGate(guid) => {
@@ -3508,6 +4088,10 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             if let Some(world) = &mut scene.world
                 && *op != LayerOp::Load
             {
+                let before = scene
+                    .player
+                    .as_ref()
+                    .and_then(|p| p.floor_under(&world.physics));
                 scene
                     .props
                     .hide(&mut world.physics, entities.iter().copied());
@@ -3515,18 +4099,25 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 // (playtest 7: the villa garage's, as PmcCon001 ended and
                 // put her out of the tank; she fell to y -55.7 and stayed):
                 // she waits there for what the next layers put in its
-                // place, and lands on it.
+                // place, and lands on it ([`Player::layer_went`]).
                 if let Some(p) = scene.player.as_mut()
                     && p.driving.is_none()
                 {
-                    let feet = p.character.position + Vec3::Y * 0.5;
-                    if world.physics.cast_ray(feet, -Vec3::Y, 1.5).is_none() {
+                    let after = p.floor_under(&world.physics);
+                    if p.layer_went(before, after) {
                         eprintln!(
                             "layer {name}: the floor under her at {:.1?} went with it: she \
                              waits for what comes in its place",
                             p.character.position.to_array()
                         );
-                        p.floor_went();
+                    } else if let Some(b) = before
+                        && p.character.position.y - b > 0.3
+                    {
+                        eprintln!(
+                            "layer {name}: she is {:.2} m over her floor, which stays: she \
+                             comes down on it",
+                            p.character.position.y - b
+                        );
                     }
                 }
             }
@@ -3662,14 +4253,24 @@ pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
             ..Leaves::default()
         });
     }
-    // A gun of the templates' with its model (of several, the lowest).
-    let gun = model.and_then(|m| {
-        templates
-            .arms
-            .weapons
-            .values()
-            .filter(|w| w.class.is_some() && w.model == Some(m))
-            .min_by_key(|w| w.template)
+    // The pickup itself, when it is a gun with that model (the restored
+    // crates' `Cheat RPG`, which shares its model with the `Fuel-Air
+    // RPG`); else a gun of the templates' with its model (of several,
+    // the lowest).
+    let own = templates
+        .arms
+        .weapons
+        .get(&id)
+        .filter(|w| w.class.is_some() && model.is_some() && w.model == model);
+    let gun = own.or_else(|| {
+        model.and_then(|m| {
+            templates
+                .arms
+                .weapons
+                .values()
+                .filter(|w| w.class.is_some() && w.model == Some(m))
+                .min_by_key(|w| w.template)
+        })
     });
     if let Some(spec) = gun {
         let slot = combat::Rifle::from_spec(spec).slot();
@@ -4151,6 +4752,35 @@ mod tests {
         let calls = hud_calls(&lua);
         let methods: Vec<&str> = calls.iter().map(|c| c.method.as_str()).collect();
         assert_eq!(methods, ["Display", "Scroll", "Close"]);
+        // The wager's digit box, as the HQ's `_ChangeWager` calls it: the
+        // HUD answers the value, or -1 - the value for a cancel.
+        lua.load(
+            r#"MrxGui.DisplayNumericBox = function() error("drawn here") end
+            __m2_wrap_dialogs()
+            local function n(...) MrxGui.DisplayNumericBox(1, "[Briefing.ChangeWagerQuery]", "",
+                "$", ".0 K", 20000, 10000, 50000, 5, 3, 5,
+                function(tag, v) picked = { tag, v } end, { "accept" },
+                function(tag, v) picked = { tag, v } end, { "cancel" },
+                48, 36, "right", "bottom", false) end
+            n() n()"#,
+        )
+        .exec()
+        .unwrap();
+        let calls = hud_calls(&lua);
+        let numeric: Vec<u64> = calls
+            .iter()
+            .filter(|c| c.method == "Numeric")
+            .map(|c| c.seq)
+            .collect();
+        assert_eq!(numeric.len(), 2);
+        let answer = |seq, v| {
+            lua.load(choice_code(seq, v)).exec().unwrap();
+            lua.load("return picked[1], picked[2]")
+                .eval::<(String, i64)>()
+                .unwrap()
+        };
+        assert_eq!(answer(numeric[0], 30000), ("accept".into(), 30000));
+        assert_eq!(answer(numeric[1], -1 - 20000), ("cancel".into(), 20000));
     }
 
     #[test]

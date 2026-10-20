@@ -107,6 +107,8 @@ fn arrived(t: f32, in_place: bool) -> bool {
 pub struct Game {
     pub scene: Scene,
     pub camera: FlyCamera,
+    /// The menus' Brightness and shadows ([`Picture`]).
+    pub picture: Picture,
     /// Playing as Jennifer rather than flying the camera.
     pub on_foot: bool,
     /// Seconds to the next look for parking spots.
@@ -196,11 +198,29 @@ pub struct Game {
     /// Seconds the HUD's save icon has left up after the game was saved
     /// ([`SAVE_ICON_SECONDS`]).
     pub save_icon: f32,
+    /// Clips the scripts hold characters in by name (a faction HQ's
+    /// briefing, [`crate::raw`]).
+    pub raw: crate::raw::RawClips,
+    /// The model the scripts last dressed the player in
+    /// (`Player.SetOutfit`: the wardrobe), till it is put on her
+    /// ([`Game::dress`]).
+    pub outfit_wanted: Option<String>,
+    /// Her grappling hook ([`crate::grapple`]).
+    pub grapple: crate::grapple::Grappler,
+    /// The grapple pulled her to a helicopter's entrance: its hijack is
+    /// to start as the use key starts it ([`crate::hijack`]).
+    pub grapple_handoff: bool,
     /// Seconds before the factions' attitudes are asked of the scripts again.
     pub attitude_wait: f32,
     /// Witnesses reporting her: guid, faction and seconds since they set
     /// off ([`crate::mission`]).
     pub reporters: Vec<(u32, &'static str, f32)>,
+    /// Whether an army pursued her last frame.
+    pub pursued: bool,
+    /// Keyed actions the scripts asked for (`Human.DoAction`: the player's
+    /// verify photo `VerifyCamera`), each with its seconds left, ended for the
+    /// scripts' `HumanActionComplete` ([`crate::mission`]).
+    pub actions: Vec<(u32, String, f32)>,
 }
 
 /// A camera shot the scripts asked for (`Camera.SetShot`): the engine's
@@ -309,6 +329,7 @@ impl Game {
             combat.hero_damage
         );
         Self {
+            picture: Picture::default(),
             scene,
             camera,
             on_foot,
@@ -348,8 +369,14 @@ impl Game {
             context_taken: None,
             shot: None,
             save_icon: 0.0,
+            raw: crate::raw::RawClips::default(),
+            outfit_wanted: None,
+            grapple: crate::grapple::Grappler::default(),
+            grapple_handoff: false,
             attitude_wait: 0.0,
             reporters: Vec::new(),
+            pursued: false,
+            actions: Vec::new(),
             scripts_seated: false,
         }
     }
@@ -1098,6 +1125,21 @@ impl Game {
                 &mut self.destruction,
                 self.scene.install.as_ref(),
             );
+            // Vehicles running into each other hurt each other and the
+            // parts where they met.
+            for (struck, other, closing, damage) in self
+                .combat
+                .vehicle_crashes(&mut world.physics, &mut self.scene.vehicles)
+            {
+                let v = &self.scene.vehicles[struck];
+                eprintln!(
+                    "crash: the {} hit by the {} at {closing:.1} m/s takes {damage:.1} ({:.0} of {:.0} left)",
+                    v.spec.label,
+                    self.scene.vehicles[other].spec.label,
+                    (v.most_health() - v.damage).max(0.0),
+                    v.most_health()
+                );
+            }
             // What came down (to a vehicle, the traffic's too, or a blast
             // last tick) comes down whether she is on foot or the free
             // camera flies: its island copy has lost its collision already.
@@ -1289,7 +1331,45 @@ impl Game {
         self.run_particles(dt);
         split("game: effects");
         self.scene.tick(dt);
+        self.raw.tick(&mut self.scene, dt);
+        self.grapple_tick(dt);
         split("game: scene");
+    }
+
+    /// The grappling hook's line: the hook flies, or she is pulled in; on
+    /// arrival the helicopter's hijack is handed the start.
+    fn grapple_tick(&mut self, dt: f32) {
+        if let Some(world) = &self.scene.world
+            && let Some(&g) = world.index.template_db.grapple.values().next()
+        {
+            self.grapple.params = g;
+        }
+        let mut grapple = std::mem::take(&mut self.grapple);
+        match grapple.tick(self, dt) {
+            Some(crate::grapple::Outcome::Hooked { seconds, metres }) => {
+                eprintln!("grapple: hooked {metres:.1} m away after {seconds:.2} s")
+            }
+            Some(crate::grapple::Outcome::Missed) => eprintln!("grapple: the hook missed"),
+            Some(crate::grapple::Outcome::Arrived { seconds }) => {
+                eprintln!("grapple: pulled to the entrance in {seconds:.2} s");
+                self.grapple_handoff = true;
+            }
+            None => {}
+        }
+        self.grapple = grapple;
+    }
+
+    /// Puts the player in the model the scripts last dressed her in
+    /// (`Player.SetOutfit`), if any is waiting: her body and clips
+    /// reloaded from it, her health, place and what she holds kept.
+    pub fn dress(&mut self, backend: &mut dyn m2_render::RenderBackend) {
+        let Some(model) = self.outfit_wanted.take() else {
+            return;
+        };
+        self.scene.outfit = Some(m2_assets::name_hash(&model));
+        eprintln!("outfit: {} dressed as {model}", self.scene.hero);
+        let hero = self.scene.hero;
+        self.scene.load_hero(backend, hero);
     }
 
     /// Sets off the game's effects the fight asked for and runs them.
@@ -1617,6 +1697,7 @@ impl Game {
             .collect();
         Some(SaveGame {
             version: save::VERSION,
+            hero: Some(self.scene.hero),
             player: PlayerSave {
                 position: at.to_array(),
                 facing: player.facing,
@@ -2153,7 +2234,62 @@ impl Game {
         if self.support.looking().is_some() {
             satellite_look(&mut view.lighting);
         }
+        self.picture.apply(&mut view.lighting);
         view
+    }
+}
+
+/// How far the world is drawn for the menus' View Distance (10 to 100, as
+/// their setters clamp it): placed models, props and ground scatter out
+/// to their usual reach at 100, a quarter of it at 10, in a line between
+/// (invented: the game's own distances for it are not known).
+pub fn view_distance_scale(v: f64) -> f32 {
+    let t = (v.clamp(10.0, 100.0) - 10.0) / 90.0;
+    (0.25 + 0.75 * t) as f32
+}
+
+impl Game {
+    /// Draws the world as far as the menus' View Distance says
+    /// ([`view_distance_scale`]).
+    pub fn set_view_distance(&mut self, v: f64) {
+        let scale = view_distance_scale(v);
+        let usual = m2_engine::WorldSettings::default();
+        if let Some(world) = &mut self.scene.world {
+            let s = &mut world.settings;
+            s.object_distance = usual.object_distance * scale;
+            s.prop_distance = usual.prop_distance * scale;
+            s.scatter_distance = usual.scatter_distance * scale;
+        }
+    }
+}
+
+/// The menus' picture options as the frame takes them: Brightness (0 to
+/// 100, 50 as the game is lit) and the advanced video screen's shadows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Picture {
+    pub brightness: f64,
+    pub shadows: bool,
+}
+
+impl Default for Picture {
+    fn default() -> Self {
+        Self {
+            brightness: 50.0,
+            shadows: true,
+        }
+    }
+}
+
+impl Picture {
+    /// Brightness scales the finished frame's light, a stop down at 0 and
+    /// up at 100 (invented: the game's gamma curve is not known); shadows
+    /// off, the sun casts none.
+    pub fn apply(&self, lighting: &mut m2_render::Lighting) {
+        let stops = (self.brightness.clamp(0.0, 100.0) - 50.0) / 50.0;
+        lighting.grade *= 2f32.powf(stops as f32);
+        if !self.shadows {
+            lighting.shadow_distance = 0.0;
+        }
     }
 }
 
@@ -3527,5 +3663,42 @@ mod tests {
         assert!(!blown_loose(&db, 2));
         // One the data gives no damage table row: thrown, as before.
         assert!(blown_loose(&db, 3));
+    }
+}
+
+#[cfg(test)]
+mod picture_tests {
+    use super::Picture;
+
+    #[test]
+    fn view_distance_draws_a_quarter_to_all_of_the_usual_reach() {
+        use super::view_distance_scale;
+        assert_eq!(view_distance_scale(100.0), 1.0);
+        assert_eq!(view_distance_scale(10.0), 0.25);
+        assert_eq!(view_distance_scale(0.0), 0.25);
+        assert_eq!(view_distance_scale(55.0), 0.625);
+    }
+
+    #[test]
+    fn brightness_is_a_stop_either_way_and_shadows_can_go() {
+        let lit = |p: Picture| {
+            let mut l = m2_render::Lighting {
+                shadow_distance: 120.0,
+                ..Default::default()
+            };
+            p.apply(&mut l);
+            (l.grade.x, l.shadow_distance)
+        };
+        assert_eq!(lit(Picture::default()), (1.0, 120.0));
+        let bright = Picture {
+            brightness: 100.0,
+            ..Picture::default()
+        };
+        assert_eq!(lit(bright).0, 2.0);
+        let dark = Picture {
+            brightness: 0.0,
+            shadows: false,
+        };
+        assert_eq!(lit(dark), (0.5, 0.0));
     }
 }

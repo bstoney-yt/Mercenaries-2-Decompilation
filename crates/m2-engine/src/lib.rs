@@ -14,21 +14,29 @@
 //! game's data directly (see `docs/alpha-roadmap.md`).
 
 pub mod ai;
+pub mod ambience;
 pub mod anim;
 pub mod assets;
 pub mod atmosphere;
 pub mod audio;
 pub mod durability;
+pub mod grapple;
 pub mod gun_sounds;
 pub mod hijack;
 pub mod model;
 pub mod motion;
+pub mod music_source;
 pub mod ordnance;
+pub mod osprey;
+pub mod osprey_mesh;
 pub mod particles;
 pub mod physics;
 pub mod pickup;
 pub mod population;
+pub mod reverb;
 pub mod scatter;
+pub mod sound_regions;
+pub mod standin;
 pub mod stream;
 pub mod surface;
 pub mod technique;
