@@ -107,6 +107,8 @@ fn arrived(t: f32, in_place: bool) -> bool {
 pub struct Game {
     pub scene: Scene,
     pub camera: FlyCamera,
+    /// The menus' Brightness and shadows ([`Picture`]).
+    pub picture: Picture,
     /// Playing as Jennifer rather than flying the camera.
     pub on_foot: bool,
     /// Seconds to the next look for parking spots.
@@ -327,6 +329,7 @@ impl Game {
             combat.hero_damage
         );
         Self {
+            picture: Picture::default(),
             scene,
             camera,
             on_foot,
@@ -1694,6 +1697,7 @@ impl Game {
             .collect();
         Some(SaveGame {
             version: save::VERSION,
+            hero: Some(self.scene.hero),
             player: PlayerSave {
                 position: at.to_array(),
                 facing: player.facing,
@@ -2230,7 +2234,62 @@ impl Game {
         if self.support.looking().is_some() {
             satellite_look(&mut view.lighting);
         }
+        self.picture.apply(&mut view.lighting);
         view
+    }
+}
+
+/// How far the world is drawn for the menus' View Distance (10 to 100, as
+/// their setters clamp it): placed models, props and ground scatter out
+/// to their usual reach at 100, a quarter of it at 10, in a line between
+/// (invented: the game's own distances for it are not known).
+pub fn view_distance_scale(v: f64) -> f32 {
+    let t = (v.clamp(10.0, 100.0) - 10.0) / 90.0;
+    (0.25 + 0.75 * t) as f32
+}
+
+impl Game {
+    /// Draws the world as far as the menus' View Distance says
+    /// ([`view_distance_scale`]).
+    pub fn set_view_distance(&mut self, v: f64) {
+        let scale = view_distance_scale(v);
+        let usual = m2_engine::WorldSettings::default();
+        if let Some(world) = &mut self.scene.world {
+            let s = &mut world.settings;
+            s.object_distance = usual.object_distance * scale;
+            s.prop_distance = usual.prop_distance * scale;
+            s.scatter_distance = usual.scatter_distance * scale;
+        }
+    }
+}
+
+/// The menus' picture options as the frame takes them: Brightness (0 to
+/// 100, 50 as the game is lit) and the advanced video screen's shadows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Picture {
+    pub brightness: f64,
+    pub shadows: bool,
+}
+
+impl Default for Picture {
+    fn default() -> Self {
+        Self {
+            brightness: 50.0,
+            shadows: true,
+        }
+    }
+}
+
+impl Picture {
+    /// Brightness scales the finished frame's light, a stop down at 0 and
+    /// up at 100 (invented: the game's gamma curve is not known); shadows
+    /// off, the sun casts none.
+    pub fn apply(&self, lighting: &mut m2_render::Lighting) {
+        let stops = (self.brightness.clamp(0.0, 100.0) - 50.0) / 50.0;
+        lighting.grade *= 2f32.powf(stops as f32);
+        if !self.shadows {
+            lighting.shadow_distance = 0.0;
+        }
     }
 }
 
@@ -3604,5 +3663,42 @@ mod tests {
         assert!(!blown_loose(&db, 2));
         // One the data gives no damage table row: thrown, as before.
         assert!(blown_loose(&db, 3));
+    }
+}
+
+#[cfg(test)]
+mod picture_tests {
+    use super::Picture;
+
+    #[test]
+    fn view_distance_draws_a_quarter_to_all_of_the_usual_reach() {
+        use super::view_distance_scale;
+        assert_eq!(view_distance_scale(100.0), 1.0);
+        assert_eq!(view_distance_scale(10.0), 0.25);
+        assert_eq!(view_distance_scale(0.0), 0.25);
+        assert_eq!(view_distance_scale(55.0), 0.625);
+    }
+
+    #[test]
+    fn brightness_is_a_stop_either_way_and_shadows_can_go() {
+        let lit = |p: Picture| {
+            let mut l = m2_render::Lighting {
+                shadow_distance: 120.0,
+                ..Default::default()
+            };
+            p.apply(&mut l);
+            (l.grade.x, l.shadow_distance)
+        };
+        assert_eq!(lit(Picture::default()), (1.0, 120.0));
+        let bright = Picture {
+            brightness: 100.0,
+            ..Picture::default()
+        };
+        assert_eq!(lit(bright).0, 2.0);
+        let dark = Picture {
+            brightness: 0.0,
+            shadows: false,
+        };
+        assert_eq!(lit(dark), (0.5, 0.0));
     }
 }

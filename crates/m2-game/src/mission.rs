@@ -43,6 +43,9 @@ pub const LAND: &str = "HeliLand";
 /// scripts: the hero module's `OnActivate` (healing, the survival
 /// system's one rescue, her inventory), which goes on once she is awake.
 const HERO_ACTIVATE: &str = "Hero.OnActivate(Player.GetCharacter(1))";
+/// The pending save's script data (`__m2_saved`, Lua text from
+/// [`crate::savedata::generate`]) read back into a table.
+const LOAD_SAVED: &str = "assert(loadstring('return ' .. __m2_saved, '=m2-saved'))()";
 
 /// The scripts' free support items (`MrxSupportData.AddFreebie`, as the
 /// first contract gives its Satellite Guided Bomb) reach the game too:
@@ -807,12 +810,31 @@ impl Mission {
         Ok(result?)
     }
 
+    /// Has [`start`](Self::start) load a save: `text` is the scripts' save
+    /// data as [`save_data`](Self::save_data) wrote it. The scripts then
+    /// carry on from it (the contracts done and on offer, her PMC, the
+    /// factions...) instead of starting a new game.
+    pub fn load_save(&mut self, text: String) {
+        self.world.borrow_mut().saved = Some(text);
+    }
+
     /// Starts play as the engine does: intro movies skipped, the
-    /// bootstrap's `Init` (which starts a new game when there is no save),
+    /// bootstrap's `Init` (which starts a new game when there is no save,
+    /// and is otherwise handed the save's data: [`load_save`](Self::load_save)),
     /// then the step the engine runs once the GUI has loaded. The first
-    /// contract's mission is then waiting at its start.
+    /// contract's mission, or the save's next, is then waiting.
     pub fn start(&mut self) {
         self.follow_freebies();
+        let saved = self.world.borrow().saved.clone();
+        if let Some(text) = &saved {
+            if let Err(e) = self.host.lua().globals().set("__m2_saved", text.as_str()) {
+                self.log.push(format!("  load save: {e}"));
+            }
+            self.log.push(format!(
+                "save: loading the scripts' save data, {} bytes",
+                text.len()
+            ));
+        }
         let steps = [
             (
                 "skip mode",
@@ -821,15 +843,35 @@ impl Mission {
                     .to_owned(),
             ),
             ("bootstrap", format!("Scripts[\"{BOOTSTRAP:08x}\"].Init()")),
+            // What the engine does when `Pg.LoadGame` said a save loads.
+            (
+                "load save",
+                if saved.is_some() {
+                    format!("Scripts[\"{BOOTSTRAP:08x}\"].LoadSingleton({LOAD_SAVED})")
+                } else {
+                    String::new()
+                },
+            ),
             // The callback MrxGuiBootstrap.SetOnGuiLoadedFunc registers.
             ("gui loaded", "MrxBootstrap._GuiLoaded()".to_owned()),
             ("hero activated", HERO_ACTIVATE.to_owned()),
         ];
         for (name, code) in steps {
+            if code.is_empty() {
+                continue;
+            }
             if let Err(e) = self.run(&code, name) {
                 self.log
                     .push(format!("  {name}: {}", first_lines(&e.to_string())));
             }
+        }
+        if saved.is_some() {
+            self.world.borrow_mut().saved = None;
+            let _ = self.host.lua().globals().set("__m2_saved", Value::Nil);
+            // A save has no intro movies to skip, and in skip mode the
+            // scripts don't move her to the save's place
+            // (`MrxUtil.TeleportHeroesToLocations` only calls back).
+            self.end_skip_mode();
         }
     }
 
@@ -1356,6 +1398,13 @@ impl Mission {
     /// ([`crate::savedata::generate`]).
     pub fn save_data(&self) -> Result<String, MissionError> {
         Ok(crate::savedata::generate(self.host.lua(), BOOTSTRAP)?)
+    }
+
+    /// Where the story stands, as the scripts say
+    /// ([`crate::savedata::CONTRACTS`]): the contracts done, the one
+    /// active, and those on offer.
+    pub fn contracts(&self) -> Result<crate::savedata::Contracts, MissionError> {
+        Ok(crate::savedata::contracts(self.host.lua())?)
     }
 
     /// Opens faction `faction`'s shop (`MrxFactionManager`'s keys: `"All"`,

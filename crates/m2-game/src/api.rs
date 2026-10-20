@@ -118,27 +118,28 @@ impl Object {
         })
     }
 
-    /// The faction it belongs to, as a faction's guid: its own (a zone's),
-    /// else the faction its template's name begins with (`VZ Heavy (AA
+    /// The faction it belongs to, by its template's name (`"VZ"`): its own
+    /// (a zone's), else the faction its template's name begins with (`VZ Heavy (AA
     /// Missile)`, `Chinese Soldier`): inferred from the layers' person
     /// templates, as `m2-alpha`'s `npc::faction_of`; a template's own
     /// faction link isn't read.
-    pub fn faction_guid(&self) -> Option<u32> {
-        self.faction.or_else(|| {
-            let n = self.name.to_ascii_lowercase();
-            [
-                ("vz ", "VZ"),
-                ("allied ", "Allied"),
-                ("chinese ", "China"),
-                ("china ", "China"),
-                ("guerilla ", "Guerilla"),
-                ("guerrilla ", "Guerilla"),
-                ("oc ", "OC"),
-                ("pirate ", "Pirate"),
-            ]
-            .into_iter()
-            .find_map(|(prefix, f)| n.starts_with(prefix).then(|| m2_assets::name_hash(f)))
-        })
+    pub fn faction_name(&self) -> Option<&'static str> {
+        if let Some(h) = self.faction {
+            return FACTIONS.into_iter().find(|f| m2_assets::name_hash(f) == h);
+        }
+        let n = self.name.to_ascii_lowercase();
+        [
+            ("vz ", "VZ"),
+            ("allied ", "Allied"),
+            ("chinese ", "China"),
+            ("china ", "China"),
+            ("guerilla ", "Guerilla"),
+            ("guerrilla ", "Guerilla"),
+            ("oc ", "OC"),
+            ("pirate ", "Pirate"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, f)| n.starts_with(prefix).then_some(f))
     }
 
     /// Its labels as name hashes: those scripts gave it and the data's.
@@ -589,6 +590,9 @@ pub struct ScriptWorld {
     /// layers that aren't in, and scripts measure to them.
     pub entities: HashMap<u32, [f32; 3]>,
     pub entity_names: HashMap<String, u32>,
+    /// A save's script data to load, as Lua text ([`crate::savedata`]):
+    /// while it is here `Pg.LoadGame` answers that a save is loading.
+    pub saved: Option<String>,
     /// `Player.SetHealthClamp` and `Player.SetSurvivalMode`, as last set.
     pub health_clamp: bool,
     pub survival_mode: bool,
@@ -1163,22 +1167,6 @@ pub const FACTIONS: [&str; 9] = [
     "Allied", "China", "Civ", "Guerilla", "OC", "Pirate", "PMC", "VZ", "Police",
 ];
 
-/// The faction a guid names, lower case: a faction's (the hash of its
-/// name, as `Pg.GetGuidByName("OC")` answers), else a template's object
-/// (the guids a template name was given before factions had their own).
-fn faction_named(w: &ScriptWorld, g: u32) -> Option<String> {
-    FACTIONS
-        .iter()
-        .find(|f| m2_assets::name_hash(f) == g)
-        .map(|f| f.to_ascii_lowercase())
-        .or_else(|| {
-            w.templates
-                .iter()
-                .find(|(_, t)| **t == g)
-                .map(|(n, _)| n.clone())
-        })
-}
-
 /// [`Object.GetHibernationDistance`]'s answer, metres.
 const HIBERNATION_DISTANCE: f64 = 155.0;
 
@@ -1327,7 +1315,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     fn pursue(w: &mut ScriptWorld, a: &[Value], locked: bool) {
         let Some(f) = id(a.first()) else { return };
         let level = num(a.get(1)).map_or(1, |l| l as i64).clamp(1, 3);
-        let Some(name) = faction_named(w, f) else {
+        let Some(name) = w
+            .templates
+            .iter()
+            .find(|(_, g)| **g == f)
+            .map(|(n, _)| n.clone())
+        else {
             return;
         };
         w.pursuit.level = level;
@@ -1352,7 +1345,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let Some(f) = id(a.first()) else {
             return values([]);
         };
-        let Some(name) = faction_named(w, f) else {
+        let Some(name) = w
+            .templates
+            .iter()
+            .find(|(_, g)| **g == f)
+            .map(|(n, _)| n.clone())
+        else {
             return values([]);
         };
         w.pursuit.level = w.pursuit.level.max(1);
@@ -1429,14 +1427,6 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 let name = s.to_string_lossy();
                 w.by_name(&name)
                     .or_else(|| w.entity_names.get(&name.to_ascii_lowercase()).copied())
-                    // A faction (`"China"`, an outpost's `sAttackers`): its
-                    // guid, which `Ai.GetFactionGuid` gives its people.
-                    .or_else(|| {
-                        FACTIONS
-                            .iter()
-                            .find(|f| f.eq_ignore_ascii_case(&name))
-                            .map(|f| m2_assets::name_hash(f))
-                    })
                     .or_else(|| is_template(&name).then(|| w.template(&name)))
             }
             _ => None,
@@ -2389,14 +2379,23 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // template's guid (`Pg.GetGuidByName("OC")`): see
     // [`crate::report::Reports::multipliers`].
     add(&ai, "SetInfractionMultiplier", |w, _, a| {
-        let name = id(a.first()).and_then(|g| faction_named(w, g));
+        let name = id(a.first())
+            .and_then(|g| w.objects.get(&g))
+            .map(|o| o.name.to_ascii_lowercase());
         if let (Some(name), Some(m)) = (name, num(a.get(1))) {
             w.reports.multipliers.insert(name, m);
         }
         values([])
     })?;
     add(&ai, "GetFactionGuid", |w, _, a| {
-        let faction = id(a.first()).and_then(|g| w.objects.get(&g)?.faction_guid());
+        // A zone's own; a person's, their faction's template (as
+        // `Pg.GetGuidByName("China")` has it: an outpost compares the two).
+        let o = id(a.first()).and_then(|g| w.objects.get(&g));
+        let faction = match o.map(|o| (o.faction, o.faction_name())) {
+            Some((Some(own), _)) => Some(own),
+            Some((None, Some(name))) => Some(w.template(name)),
+            _ => None,
+        };
         values([guid_value(faction)])
     })?;
     // How one faction's AI regards another, -100 (hostile) to 100
@@ -2634,11 +2633,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&pg, "LoadIsRetry", |_, _, _| {
         values([Value::Boolean(false)])
     })?;
-    // No saves yet: every load is a new game, which the bootstrap starts
-    // itself (`LoadSingleton(nil)`) when this answers false.
+    // The bootstrap's `Init` asks (`Pg.LoadGame("InitialSaveData")`)
+    // whether a save is loading. Answered false, it starts a new game
+    // itself (`LoadSingleton(nil)`); answered true it doesn't, and is
+    // handed the save's data (`LoadSingleton(data)`) by the engine, here
+    // by `Mission::start` (from the bootstrap's bytecode; the engine's
+    // side is not read).
     add(&pg, "LoadGame", |w, _, _| {
         w.commands.push(Command::Notify("Pg.LoadGame".into()));
-        values([Value::Boolean(false)])
+        values([Value::Boolean(w.saved.is_some())])
     })?;
 
     // The game's ears on the scripts' support items: `MrxSupportData`'s
@@ -3257,7 +3260,7 @@ fn collect(
     let (with, without) = (hashes(with), hashes(without));
     // Then the factions to keep, by name: `"China"`, or several joined
     // with `||` (an outpost's `"China||VZ"`); none keeps all.
-    let factions: Vec<u32> = a
+    let factions: Vec<&str> = a
         .iter()
         .skip(4)
         .filter_map(|v| match v {
@@ -3266,15 +3269,18 @@ fn collect(
         })
         .collect::<String>()
         .split("||")
-        .filter_map(|f| FACTIONS.iter().find(|x| x.eq_ignore_ascii_case(f.trim())))
-        .map(|f| m2_assets::name_hash(f))
+        .filter_map(|f| {
+            FACTIONS
+                .into_iter()
+                .find(|x| x.eq_ignore_ascii_case(f.trim()))
+        })
         .collect();
     let mut found: Vec<u32> = w
         .objects
         .iter()
         .filter(|(_, o)| !o.hidden)
         .filter(|(_, o)| {
-            factions.is_empty() || o.faction_guid().is_some_and(|f| factions.contains(&f))
+            factions.is_empty() || o.faction_name().is_some_and(|f| factions.contains(&f))
         })
         .filter(|(_, o)| {
             let labels = o.all_labels();
@@ -4319,6 +4325,20 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn load_game_says_a_save_loads_only_while_one_is_pending() {
+        let (host, world) = setup();
+        let ask = || -> bool {
+            host.lua()
+                .load(r#"return Pg.LoadGame("InitialSaveData")"#)
+                .eval()
+                .unwrap()
+        };
+        assert!(!ask(), "a new game");
+        world.borrow_mut().saved = Some("{}".into());
+        assert!(ask(), "a save to load");
     }
 
     #[test]
