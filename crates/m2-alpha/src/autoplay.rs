@@ -197,6 +197,9 @@ const RESTOCK_NEAR: f32 = 150.0;
 /// come with the key is left. Invented.
 const BUSY_NEAR: f32 = 30.0;
 const TAKE_AT: f32 = 10.0;
+/// A vehicle she goes for and hasn't got into in this long (seconds) is
+/// left. Invented.
+const BOARD_FOR: f32 = 90.0;
 const OPEN_FROM: f32 = 0.9;
 const OPEN_FACING: f32 = 0.2;
 const OPEN_FOR: f32 = 45.0;
@@ -310,6 +313,10 @@ pub struct Autoplay {
     context_pressed: f32,
     /// Seconds a vehicle's cannon has been in range of her goal.
     gunning: f32,
+    /// The vehicle she is going for and since when, and those she gave up
+    /// going for.
+    boarding: Option<(usize, f32)>,
+    left_rides: Vec<usize>,
     /// Sidestepping (-1 left, 1 right), seconds left.
     sidestep: Option<(f32, f32)>,
     /// Which way the next sidestep goes.
@@ -902,6 +909,7 @@ impl Autoplay {
             vehicles
                 .get(i)
                 .is_some_and(|v| !v.wrecked && !v.spec.is_boat())
+                && !self.left_rides.contains(&i)
                 && vehicle_at(game, i).is_some_and(|t| t.w_axis.truncate().distance(here) < within)
         };
         // The one she set out for while it is still close (round 6 turned
@@ -1766,6 +1774,23 @@ impl Autoplay {
             let speed = vehicle_state(game, other).map_or(0.0, |s| s.1);
             return self.press(speed);
         }
+        // Going for it this long without getting in (round 19's AllCon001:
+        // 1330 s after a semi 320 m off, her way round replanned each time
+        // so she never hopped): left, on foot or another.
+        let since = match self.boarding {
+            Some((j, t)) if j == i => t,
+            _ => {
+                self.boarding = Some((i, self.clock));
+                self.clock
+            }
+        };
+        if self.clock - since > BOARD_FOR && !self.left_rides.contains(&i) {
+            eprintln!(
+                "autoplay {:.1} s: the {} not reached in {BOARD_FOR:.0} s: left",
+                self.clock, game.scene.vehicles[i].spec.label
+            );
+            self.left_rides.push(i);
+        }
         let Some(m) = vehicle_at(game, i) else {
             return Intent::default();
         };
@@ -2109,9 +2134,9 @@ impl Autoplay {
         // A ride she couldn't get to is left (round 10's AllCon002 spent
         // 160 s after a WZ551 behind a wall): another or on foot.
         if let Some(Goal::Board(i)) = self.goal
-            && !self.ridden.contains(&i)
+            && !self.left_rides.contains(&i)
         {
-            self.ridden.push(i);
+            self.left_rides.push(i);
         }
         self.fresh_headway();
         self.sidestep = None;
