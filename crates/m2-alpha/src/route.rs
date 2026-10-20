@@ -57,9 +57,12 @@ const OVER_SEA: f32 = 30.0;
 const UNDER_SEA: f32 = 300.0;
 /// A boat goes up a beach at most this far over the sea, metres (the
 /// first contract's landing place is 1 m up), and its rays from cell to
-/// cell run this high over the sea.
+/// cell run this high over the sea (low enough to meet what stands out
+/// of it by a hand's breadth: PirCon001's jetski course runs past an
+/// object, model a0d50e54, whose top a 0.5 m ray passed over, and she
+/// stuck on it there).
 const BEACH: f32 = 1.5;
-const BOW: f32 = 0.5;
+const BOW: f32 = 0.2;
 /// A boat's way costs this many times as much next to the shallows.
 const OFF_SHORE: f32 = 3.0;
 /// The eight cells round a cell.
@@ -431,9 +434,21 @@ impl Grid<'_> {
                 && z < self.size[1]
                 && matches!(self.ground([x, z], self.sea), Ground::At(y, _) if y > self.sea - depth)
         });
+        // Next to something standing out of the sea (a rock, a pier) as
+        // next to the shore: a way along its very edge has her hull clip
+        // its corner (PirCon001's jetski, round 28).
+        let by_wall = !shallow
+            && !shore
+            && AROUND.iter().any(|&(dx, dz)| {
+                let (Some(x), Some(z)) = (b[0].checked_add_signed(dx), b[1].checked_add_signed(dz))
+                else {
+                    return false;
+                };
+                x < self.size[0] && z < self.size[1] && self.walled(b, [x, z])
+            });
         let k = if shallow {
             STEEP
-        } else if shore {
+        } else if shore || by_wall {
             OFF_SHORE
         } else {
             1.0

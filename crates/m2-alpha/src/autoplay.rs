@@ -1285,8 +1285,25 @@ impl Autoplay {
             if let (Some(w), Some(v)) = (game.scene.world.as_ref(), game.scene.vehicles.get(i))
                 && let Some(id) = v.id
             {
+                let way = self.way.as_ref().map_or_else(
+                    || "none".to_owned(),
+                    |w| {
+                        let n = w.route.points.len();
+                        format!(
+                            "{n} points over {:.0} m, {}",
+                            w.route.length(),
+                            w.route
+                                .points
+                                .iter()
+                                .take(4)
+                                .map(|p| format!("{p:.0}"))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        )
+                    },
+                );
                 eprintln!(
-                    "autoplay {:.1} s: stalled driving the {} at {:.1}: {}",
+                    "autoplay {:.1} s: stalled driving the {} at {:.1}: {}; her way: {way}",
                     self.clock,
                     v.spec.label,
                     game.focus(),
@@ -1294,8 +1311,16 @@ impl Autoplay {
                 );
             }
             // A boat run aground near the place: out, into the shallows
-            // (further off, it backs off the rocks).
-            if d < RIDE_FOR && self.can_leave(game, i) {
+            // (further off, it backs off the rocks). Not when the place
+            // lies on open water (a race's checkpoint: she would lose
+            // the race leaving her jetski, PirCon001 round 24).
+            let place_afloat = game.scene.world.as_ref().is_some_and(|w| {
+                let v = &game.scene.vehicles[i];
+                v.id.is_some_and(|id| {
+                    afloat_near(&w.physics, &v.spec, id, at - Vec3::X * 0.5, at, 0.0).is_some()
+                })
+            });
+            if d < RIDE_FOR && !place_afloat && self.can_leave(game, i) {
                 eprintln!(
                     "autoplay {:.1} s: the {} is aground {d:.0} m off: getting out",
                     self.clock, game.scene.vehicles[i].spec.label
@@ -1304,6 +1329,10 @@ impl Autoplay {
                 return self.press(speed);
             }
             self.reversing = Some((-angle.signum(), REVERSE));
+            // And the way is planned again from where she backs out to:
+            // the old one led her onto what holds her (PirCon001's jetski
+            // cut a rock's corner each time round).
+            self.way = None;
         }
         if let Some((s, left)) = &mut self.reversing {
             steer = *s;
