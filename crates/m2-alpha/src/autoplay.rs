@@ -568,11 +568,7 @@ impl Autoplay {
         // A person to verify (AllCon003's General Peng): shot down once
         // she is near (a ride first if far), then she goes to the body,
         // where the scripts offer their verify prompt (taken in `step`).
-        let verify: Vec<&Mark> = live
-            .iter()
-            .copied()
-            .filter(|m| m.kind == "verify")
-            .collect();
+        let verify: Vec<&Mark> = marks.iter().filter(|m| m.kind == "verify").collect();
         if let Some(m) = nearest(verify, here)
             && let Some(i) = npcs.iter().position(|n| n.spawn == Some(m.target))
         {
