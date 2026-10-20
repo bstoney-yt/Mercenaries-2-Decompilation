@@ -3607,6 +3607,7 @@ fn mission_for_screenshot(
                 }
                 a.sights = link.sight_targets(game);
                 let marks = link.contract_marks();
+                a.offers = link.offers(game);
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)
             }

@@ -135,6 +135,9 @@ const RIDE_NEAR: f32 = 40.0;
 /// One of the scripts' vehicles she hasn't driven is taken from this far,
 /// metres: they brought it for her.
 const RIDE_FRESH: f32 = 150.0;
+/// She takes an action the scripts offer within this of its object,
+/// metres (a context action's reach is a few metres).
+const USE_FROM: f32 = 1.5;
 /// Driving, she gets out this near an outpost's flag (metres), to walk
 /// the rest.
 const FLAG_ON_FOOT: f32 = 15.0;
@@ -251,6 +254,9 @@ enum Goal {
     /// Get out of the vehicle she is driving, by the place she is after
     /// (an outpost's flag).
     GetOut,
+    /// Take the action the scripts offer on their object `target` (a
+    /// verified HVT's body), standing at `at`.
+    Use { target: u32, at: Vec3 },
 }
 
 impl Goal {
@@ -264,6 +270,7 @@ impl Goal {
             (Goal::Take(a), Goal::Take(b)) => a == b,
             (Goal::Deliver(a), Goal::Deliver(b)) => a == b,
             (Goal::GetOut, Goal::GetOut) => true,
+            (Goal::Use { target: a, .. }, Goal::Use { target: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -286,6 +293,9 @@ pub struct Autoplay {
     /// where each is, set each tick ([`crate::mission::MissionLink::
     /// sight_targets`]).
     pub sights: Vec<Vec3>,
+    /// The actions the scripts offer: on what, and where it is (set each
+    /// tick before [`step`](Self::step)).
+    pub offers: Vec<(u32, Vec3)>,
     /// Seconds played.
     clock: f32,
     goal: Option<Goal>,
@@ -508,6 +518,18 @@ impl Autoplay {
             Some(Goal::Open(target)) => self.open(game, target, dt),
             Some(Goal::Take(key)) => self.take(game, key, dt),
             Some(Goal::Deliver(key)) => self.deliver(game, &key),
+            Some(Goal::Use { at, .. }) => {
+                let here = game.focus();
+                let driving = game.scene.player.as_ref().and_then(|p| p.driving);
+                if driving.is_none() && here.with_y(0.0).distance(at.with_y(0.0)) < USE_FROM {
+                    let speed = 0.0;
+                    let mut intent = self.press(speed);
+                    intent.hold_jump = false;
+                    intent
+                } else {
+                    self.travel(game, at, USE_FROM * 0.6, dt)
+                }
+            }
             Some(Goal::GetOut) => match game.scene.player.as_ref().and_then(|p| p.driving) {
                 Some(i) => {
                     let speed = vehicle_state(game, i).map_or(0.0, |s| s.1);
@@ -725,10 +747,31 @@ impl Autoplay {
             }
         }
         // What to destroy, nearest first: soldiers are shot, things blown up.
+        // An HVT to verify, once down: the scripts offer an action on the
+        // body a few seconds on (`MrxTaskObjectiveVerify._SetupVerify`),
+        // which she takes there.
+        if let Some(&(target, at)) = self
+            .offers
+            .iter()
+            .find(|(g, _)| marks.iter().any(|m| m.target == *g && m.kind == "verify"))
+        {
+            return Some((
+                Goal::Use { target, at },
+                format!(
+                    "verifying {target:#x}: the action at {at:.1}, {:.0} m off",
+                    at.distance(here)
+                ),
+            ));
+        }
+        // What to destroy, and HVTs to verify still standing: shot first.
         let destroy: Vec<&Mark> = live
             .iter()
             .copied()
-            .filter(|m| m.kind == "destroy")
+            .filter(|m| {
+                m.kind == "destroy"
+                    || (m.kind == "verify"
+                        && npcs.iter().any(|n| n.spawn == Some(m.target) && n.alive))
+            })
             .collect();
         if let Some(m) = nearest(destroy, here) {
             if let Some(i) = npcs

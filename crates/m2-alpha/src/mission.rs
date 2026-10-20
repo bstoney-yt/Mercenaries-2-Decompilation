@@ -2131,6 +2131,28 @@ impl MissionLink {
         self.state = State::Failed(why);
     }
 
+    /// The context actions on offer: on what, and where it stands (a
+    /// person where they are in play, else where the scripts have them).
+    pub fn offers(&self, game: &Game) -> Vec<(u32, Vec3)> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        mission
+            .context_actions()
+            .into_iter()
+            .filter_map(|(g, at, _, _)| {
+                let person = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .find(|n| n.spawn == Some(g))
+                    .map(|n| n.character.position);
+                Some((g, person.or_else(|| at.map(Vec3::from))?))
+            })
+            .collect()
+    }
+
     /// The first context action on offer whose prompt reads `text` (as
     /// shown, any case): its object and where that stands. For
     /// `--context`.
