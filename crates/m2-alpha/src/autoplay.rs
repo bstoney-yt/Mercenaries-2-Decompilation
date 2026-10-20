@@ -91,6 +91,9 @@ const SPOT_RISE: f32 = 2.5;
 /// A vehicle's cannon in range of her goal this long (seconds) without
 /// bringing it down, she gets out. Invented.
 const CANNON_GIVE_UP: f32 = 30.0;
+/// Sooner (seconds) when the gun is at its stop with the goal beyond it.
+/// Invented.
+const CANNON_BEYOND: f32 = 4.0;
 const VANTAGE_CLIMB: f32 = 3.0;
 /// Driving: she eases off within this far of a place (metres) above this
 /// speed (m/s); stuck this long (seconds), she backs out for this long.
@@ -1576,18 +1579,6 @@ impl Autoplay {
         if d > CANNON_RANGE {
             return self.drive(game, i, target, CANNON_RANGE - 10.0, dt);
         }
-        // In range this long and the goal still there (round 8's tank
-        // below the hilltop MLRS, 34 m up: 250 s, its gun at its stop):
-        // out, to go on on foot.
-        self.gunning += dt;
-        if self.gunning > CANNON_GIVE_UP && self.may_get_out(game, i) {
-            eprintln!(
-                "autoplay {:.1} s: the {} has had {} in range {:.0} s: getting out",
-                self.clock, v.spec.label, self.what, self.gunning
-            );
-            self.leave = true;
-            return self.press(speed);
-        }
         let Some(p) = game.scene.player.as_ref() else {
             return Intent::default();
         };
@@ -1603,6 +1594,34 @@ impl Autoplay {
             let stopped = v.gun <= down + 0.01 || v.gun >= up - 0.01;
             stopped || (target - at).normalize_or(dir).angle_between(dir) < TURRET_ON
         });
+        // Its gun at its stop with the goal past it (round 14's AMX30 under
+        // the hilltop MLRS): out soon. In range this long and the goal
+        // still there anyway (round 8's tank sat 250 s): out too, to go on
+        // on foot.
+        let beyond = v
+            .spec
+            .muzzle_pose(v.turret, v.gun)
+            .is_some_and(|(at, dir)| {
+                let (at, dir) = (m.transform_point3(at), m.transform_vector3(dir));
+                let (down, up) = v.spec.elevation;
+                let want = (target - at).normalize_or(dir);
+                (v.gun >= up - 0.01 && want.y > dir.y + 0.05)
+                    || (v.gun <= down + 0.01 && want.y < dir.y - 0.05)
+            });
+        self.gunning += dt;
+        let give_up = if beyond {
+            CANNON_BEYOND
+        } else {
+            CANNON_GIVE_UP
+        };
+        if self.gunning > give_up && self.may_get_out(game, i) {
+            eprintln!(
+                "autoplay {:.1} s: the {} has had {} in range {:.0} s: getting out",
+                self.clock, v.spec.label, self.what, self.gunning
+            );
+            self.leave = true;
+            return self.press(speed);
+        }
         self.steady = if error < ON_TARGET && off < TURRET_ON && laid {
             self.steady + dt
         } else {
