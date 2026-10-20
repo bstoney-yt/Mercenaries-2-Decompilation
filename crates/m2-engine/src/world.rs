@@ -489,6 +489,40 @@ impl Templates {
         })
     }
 
+    /// A prop the scripts make (`Pg.Spawn` of a template with a model that
+    /// neither drives nor walks: PirCon004's `_global_containertransplant`
+    /// organ boxes, put on its truck): placed as `entity`, at `position`
+    /// turned `yaw`.
+    pub fn scripted_prop(
+        &self,
+        entity: u32,
+        name: &str,
+        position: Vec3,
+        yaw: f32,
+    ) -> Option<ObjectPlacement> {
+        // By its whole name too: a prop's template names start with `_`,
+        // which an entity's stem drops.
+        let id = self.id(name).or_else(|| {
+            (self.names.iter())
+                .filter(|(_, n)| n.eq_ignore_ascii_case(name))
+                .map(|(&id, _)| id)
+                .min()
+        })?;
+        let (_, info) = self.by_id(id)?;
+        let model = info
+            .model
+            .filter(|_| info.vehicle.is_none() && !info.person && !info.human)?;
+        Some(ObjectPlacement {
+            entity,
+            model,
+            position,
+            rotation: Quat::from_rotation_y(yaw),
+            named: false,
+            fade: None,
+            template: id,
+        })
+    }
+
     /// The template with id `id` (an entity's parent): its name, and what
     /// the database says of it.
     pub fn by_id(&self, id: u32) -> Option<(&str, &TemplateInfo)> {
@@ -2724,6 +2758,45 @@ mod tests {
         assert_eq!(db.engine_for_model(1), Some(0xaa));
         assert_eq!(db.engine_for_model(2), None);
         assert_eq!(db.engine_for_model(3), None);
+    }
+
+    // PirCon004's scripts spawn its organ boxes (a prop's template) onto
+    // its truck: put up as props, where they say; a person's or a
+    // vehicle's template is no prop.
+    #[test]
+    fn a_prop_the_scripts_spawn_is_placed_where_they_say() {
+        let t = |model, vehicle, human| TemplateInfo {
+            model: Some(model),
+            vehicle,
+            engine: None,
+            person: human,
+            human,
+        };
+        let db = Templates {
+            infos: HashMap::from([
+                (0x8000_0001, t(7, None, false)),
+                (0x8000_0002, t(8, None, true)),
+                (0x8000_0003, t(9, Some(VehicleKind::Car), false)),
+            ]),
+            names: HashMap::from([
+                (0x8000_0001, "_global_containertransplant".to_owned()),
+                (0x8000_0002, "Pirate Thug".to_owned()),
+                (0x8000_0003, "T300 (empty)".to_owned()),
+            ]),
+            ..Templates::default()
+        };
+        let at = Vec3::new(676.6, -7.9, 1285.6);
+        let o = db
+            .scripted_prop(0x1234, "_global_containertransplant", at, 0.5)
+            .unwrap();
+        assert_eq!(
+            (o.entity, o.model, o.position, o.template),
+            (0x1234, 7, at, 0x8000_0001)
+        );
+        assert!(o.rotation.abs_diff_eq(Quat::from_rotation_y(0.5), 1e-6));
+        assert!(db.scripted_prop(1, "Pirate Thug", at, 0.0).is_none());
+        assert!(db.scripted_prop(1, "T300 (empty)", at, 0.0).is_none());
+        assert!(db.scripted_prop(1, "nothing", at, 0.0).is_none());
     }
 
     // Round 93's crate rockets gave her nothing: found by name, the RPG's

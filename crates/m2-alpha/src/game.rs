@@ -124,6 +124,9 @@ pub struct Game {
     /// Each vehicle model's load bed, its `HP_Truckbed` node in its own
     /// space, by model (`None`: it has none), as looked up.
     beds: HashMap<u32, Option<Vec3>>,
+    /// The scripts' vehicles whose load bed's goods were logged (taken up,
+    /// or what stood near and why not), by index.
+    beds_told: HashSet<usize>,
     /// Layer entities of the island's vehicles asked for so far.
     fetched: HashSet<u32>,
     /// The island's traffic spawners and what they have out.
@@ -342,6 +345,7 @@ impl Game {
             combat,
             destruction: Destruction::default(),
             beds: HashMap::new(),
+            beds_told: HashSet::new(),
             fetched: HashSet::new(),
             traffic: crate::traffic::Traffic::default(),
             paths: crate::paths::PathMoves::default(),
@@ -1143,7 +1147,7 @@ impl Game {
                 world,
                 &mut self.scene.props,
                 &self.scene.vehicles,
-                &beds,
+                (&beds, &mut self.beds_told),
                 &mut self.destruction,
                 self.scene.install.as_ref(),
             );
@@ -2759,6 +2763,9 @@ type Carrier = ((usize, m2_engine::VehicleId), Vec3);
 /// the goods on it there: PirCon002's `GetHardpointPosition(truck,
 /// "HP_Truckbed")`).
 pub(crate) const BED_NODE: &str = "HP_Truckbed";
+/// The props within this of a scripts' vehicle's load bed are logged
+/// once, metres.
+const TOLD_REACH: f32 = 6.0;
 
 /// Props up to this far under the bed node, or this far over it
 /// (metres), count as on it, over the vehicle's footprint (invented:
@@ -2794,7 +2801,7 @@ fn knock_loose(
     world: &mut World,
     props: &mut Props,
     vehicles: &[ParkedVehicle],
-    beds: &[Option<Vec3>],
+    (beds, told): (&[Option<Vec3>], &mut HashSet<usize>),
     destruction: &mut Destruction,
     install: Option<&Install>,
 ) {
@@ -2835,6 +2842,20 @@ fn knock_loose(
             ));
             near.sort_unstable();
             near.dedup();
+            // Once the props round it have loaded: what stands round the
+            // bed, and how, for the log.
+            let bed_at = place.transform_point3(*b);
+            if !told.contains(&index) {
+                let round = props.told_near(bed_at, TOLD_REACH);
+                if !round.is_empty() && round.iter().all(|t| !t.contains("(not ")) {
+                    told.insert(index);
+                    eprintln!(
+                        "cargo: by the {} (bed at {bed_at:.2}): {}",
+                        v.spec.label,
+                        round.join("; ")
+                    );
+                }
+            }
             for e in near {
                 if !props.is_cargo(e)
                     && on_bed(props, &standing, *b, e)

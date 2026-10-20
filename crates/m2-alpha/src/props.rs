@@ -19,9 +19,10 @@ use std::time::{Duration, Instant};
 use m2_assets::model::ModelInfo;
 use m2_engine::model::MODEL_TEXTURE_WIDTH;
 use m2_engine::stream::PROP_SIZES;
+use m2_engine::world::ObjectPlacement;
 use m2_engine::{
     AssetSource, Breakup, CollisionShape, CpuModel, DebrisId, Frustum, GpuModel, Install, Loose,
-    MaterialCache, Physics, StaticKey, WorldIndex,
+    MaterialCache, Physics, StaticKey, Templates, WorldIndex,
 };
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{DrawQueue, RenderBackend};
@@ -346,44 +347,62 @@ impl Props {
             let Some(o) = index.state_objects.get(&e) else {
                 continue;
             };
-            if self.shown.contains_key(&e) {
-                continue;
-            }
-            self.shown.insert(
-                e,
-                Prop {
-                    model: o.model,
-                    position: o.position,
-                    rotation: o.rotation,
-                    // A ruin stands as its model's wreck from the start.
-                    wrecked: index.ruined.contains(&e),
-                    template: o.template,
-                    named: o.named,
-                },
-            );
-            if let Some(&kg) = index.template_db.piece_masses.get(&o.template) {
-                self.piece_mass.insert(e, kg);
-            }
-            added += 1;
-            self.changed();
-            match self.models.entry(o.model) {
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(None);
-                    self.waiting.insert(o.model);
-                }
-                // Its model is in already: its collision goes up at the
-                // next update (round 6b found barricades and crates put up
-                // again by a later layer standing with none).
-                std::collections::hash_map::Entry::Occupied(m) if m.get().is_some() => {
-                    self.unwalled.insert(e);
-                }
-                std::collections::hash_map::Entry::Occupied(_) => {}
+            // A ruin stands as its model's wreck from the start.
+            if self.put_up(&index.template_db, o, index.ruined.contains(&e)) {
+                added += 1;
             }
         }
         if !self.waiting.is_empty() && self.loaders.is_none() {
             self.loaders = Some(Loaders::start(install));
         }
         added
+    }
+
+    /// Puts up a prop the scripts make (`Pg.Spawn`), placed as `o` says,
+    /// as a layer's would be ([`show`](Self::show)). False if it is up.
+    pub fn show_spawned(&mut self, install: &Install, db: &Templates, o: &ObjectPlacement) -> bool {
+        let up = self.put_up(db, o, false);
+        if !self.waiting.is_empty() && self.loaders.is_none() {
+            self.loaders = Some(Loaders::start(install));
+        }
+        up
+    }
+
+    /// Puts up `o` (as its entity), its model asked for. False if it is up.
+    fn put_up(&mut self, db: &Templates, o: &ObjectPlacement, wrecked: bool) -> bool {
+        let e = o.entity;
+        if self.shown.contains_key(&e) {
+            return false;
+        }
+        self.shown.insert(
+            e,
+            Prop {
+                model: o.model,
+                position: o.position,
+                rotation: o.rotation,
+                wrecked,
+                template: o.template,
+                named: o.named,
+            },
+        );
+        if let Some(&kg) = db.piece_masses.get(&o.template) {
+            self.piece_mass.insert(e, kg);
+        }
+        self.changed();
+        match self.models.entry(o.model) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(None);
+                self.waiting.insert(o.model);
+            }
+            // Its model is in already: its collision goes up at the
+            // next update (round 6b found barricades and crates put up
+            // again by a later layer standing with none).
+            std::collections::hash_map::Entry::Occupied(m) if m.get().is_some() => {
+                self.unwalled.insert(e);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+        }
+        true
     }
 
     /// Puts up one of the island's placed objects as a prop under `key`
@@ -600,6 +619,50 @@ impl Props {
     /// far as its box's middle less half its size): not the
     /// [`sturdy`](Self::sturdy) (a mission's gates fall to its scripts),
     /// nor the island's objects put up to come down.
+    /// Every prop shown whose place is within `reach` of `at`, with
+    /// words on why [`standing_near`](Self::standing_near) might pass it
+    /// over (for the log).
+    pub fn told_near(&self, at: Vec3, reach: f32) -> Vec<String> {
+        self.shown
+            .iter()
+            .filter(|(_, p)| p.position.distance(at) <= reach)
+            .map(|(&e, p)| {
+                let model = match self.models.get(&p.model) {
+                    Some(Some(m)) if !m.members.is_empty() => "a merged batch",
+                    Some(Some(_)) => "loaded",
+                    Some(None) => "not loaded",
+                    None => "not asked for",
+                };
+                format!(
+                    "{e:#x} model {:08x} at {:.2} ({model}{}{}{}{}{})",
+                    p.model,
+                    p.position,
+                    if p.wrecked { ", wrecked" } else { "" },
+                    if crate::destruct::adopted(e) {
+                        ", adopted"
+                    } else {
+                        ""
+                    },
+                    if self.sturdy.contains(&e) {
+                        ", sturdy"
+                    } else {
+                        ""
+                    },
+                    if self.knocked.contains_key(&e) {
+                        ", knocked"
+                    } else {
+                        ""
+                    },
+                    if self.broken.contains_key(&e) {
+                        ", broken"
+                    } else {
+                        ""
+                    },
+                )
+            })
+            .collect()
+    }
+
     pub fn standing_near(&self, at: Vec3, reach: f32) -> Vec<u32> {
         // Asked every tick for every vehicle going: those too far for any
         // model to reach are passed over first, cheaply.

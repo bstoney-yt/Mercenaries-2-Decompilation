@@ -3750,8 +3750,28 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }) {
                 game.scene.people.scripted_spawn(s);
             }
+            // A prop of theirs (PirCon004's organ boxes) stands as a
+            // layer's would.
+            if let (Some(w), Some(install)) =
+                (game.scene.world.as_ref(), game.scene.install.as_ref())
+                && let Some(o) =
+                    w.index
+                        .template_db
+                        .scripted_prop(*guid, what, Vec3::from(*position), *yaw)
+                && game
+                    .scene
+                    .props
+                    .show_spawned(install, &w.index.template_db, &o)
+            {
+                eprintln!("mission: {what} put up as {guid:#x} at {:.1?}", position);
+            }
         }
-        Command::Remove(guid) => game.scene.people.scripted_gone(*guid),
+        Command::Remove(guid) => {
+            game.scene.people.scripted_gone(*guid);
+            if let Some(w) = game.scene.world.as_mut() {
+                game.scene.props.hide(&mut w.physics, [*guid]);
+            }
+        }
         _ => {}
     }
     let index = |guid: &u32| {
