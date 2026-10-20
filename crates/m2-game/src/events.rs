@@ -137,8 +137,14 @@ pub fn state_matches(pattern: &str, state: &str) -> bool {
     }
 }
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 17] = [
+pub const KINDS: [&str; 19] = [
     "TimerRelative",
+    // Every update, in the mission's scripts too: the support manager's
+    // recruit cooldowns count with it (`SupportTimer`, which takes
+    // `GuiGameTimer`, there being one), and a soldier delivery's crew is
+    // free for the next call 12 s after she calls it.
+    "GuiUpdate",
+    "GuiGameTimer",
     "ObjectHibernation",
     "Boundary",
     "ObjectDeath",
@@ -1256,6 +1262,9 @@ fn check(
                 None => no,
             }
         }
+        // { }: every update, passing the seconds since it last fired
+        // (`SupportTimer._EventCallback(self, dt)` adds them up).
+        "GuiUpdate" | "GuiGameTimer" => Check::Fire(vec![Value::Number(now - p.last)]),
         // The game's own (the GUI's): fired by `Event.__m2_fire`.
         kind if kind.starts_with("Gui") || ENGINE_FIRED.contains(&kind) => no,
         // Not simulated yet: never fires, and is reported.
@@ -1378,6 +1387,26 @@ mod tests {
         events.update(5.0, &world);
         assert_eq!(log(&host), ["timer a"]);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn gui_updates_pass_the_time_since_the_last() {
+        // The support manager's `SupportTimer` adds them up for a
+        // recruit's cooldown.
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                "total = 0 Event.CreatePersistent(Event.GuiGameTimer, {}, \
+                 function(self, dt) total = total + dt end, { 'timer' })",
+            )
+            .exec()
+            .unwrap();
+        let world = TestWorld::default();
+        for _ in 0..4 {
+            events.update(0.5, &world);
+        }
+        let total: f64 = host.lua().globals().get("total").unwrap();
+        assert!((total - 2.0).abs() < 1e-9, "{total}");
     }
 
     #[test]

@@ -27,6 +27,9 @@ pub struct Objective {
     pub text: String,
     /// The game's icon index.
     pub icon: i64,
+    /// The mission it is for: its index in the mission data
+    /// (`WifMissionData.GetMissionIndexFromId`; VzaCon001 is 36).
+    pub mission: i64,
 }
 
 /// A blip on the radar.
@@ -71,6 +74,8 @@ pub struct Marker {
     /// The call's last argument ("2D only"), as given; what it changes
     /// isn't known yet.
     pub flat: bool,
+    /// The call's twelfth argument, the mission it is for, as given.
+    pub mission: String,
 }
 
 /// What the scripts want shown.
@@ -291,6 +296,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 target: guid(a.get(1)),
                 text: text(a.get(2)),
                 icon: int(a.get(3)),
+                mission: int(a.get(4)),
             },
         );
         Ok(MultiValue::new())
@@ -358,6 +364,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 far: f(9, 175.0),
                 sizes: [f(2, 0.0), f(10, 0.0)],
                 flat: matches!(a.get(12), Some(Value::Boolean(true))),
+                mission: a.get(11).map_or_else(|| "nil".to_owned(), shown),
             },
         );
         Ok(MultiValue::from_vec(vec![guid_value(handle)]))

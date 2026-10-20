@@ -118,6 +118,30 @@ impl Object {
         })
     }
 
+    /// The faction it belongs to, by its template's name (`"VZ"`): its own
+    /// (a zone's), else the faction its template's name begins with (`VZ Heavy (AA
+    /// Missile)`, `Chinese Soldier`): inferred from the layers' person
+    /// templates, as `m2-alpha`'s `npc::faction_of`; a template's own
+    /// faction link isn't read.
+    pub fn faction_name(&self) -> Option<&'static str> {
+        if let Some(h) = self.faction {
+            return FACTIONS.into_iter().find(|f| m2_assets::name_hash(f) == h);
+        }
+        let n = self.name.to_ascii_lowercase();
+        [
+            ("vz ", "VZ"),
+            ("allied ", "Allied"),
+            ("chinese ", "China"),
+            ("china ", "China"),
+            ("guerilla ", "Guerilla"),
+            ("guerrilla ", "Guerilla"),
+            ("oc ", "OC"),
+            ("pirate ", "Pirate"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, f)| n.starts_with(prefix).then_some(f))
+    }
+
     /// Its labels as name hashes: those scripts gave it and the data's.
     pub fn all_labels(&self) -> Vec<u32> {
         self.labels
@@ -531,6 +555,15 @@ pub struct ScriptWorld {
     pub subtitles_off: bool,
     /// The player has the tutorial tips off (`Sys.TutorialsEnabled`).
     pub tutorials_off: bool,
+    /// The developer's skip-to-mission switch (`Sys.GetSkipMission`, read
+    /// from the game's INI in the original): the bootstrap's new game
+    /// hands it to `MrxCheatBootstrap.EnableSkipMode`, and the mission
+    /// flow then completes each story contract it unlocks until this one
+    /// (read from the game's own scripts, `MrxMissionFlow.UnlockMission`).
+    pub skip_mission: Option<String>,
+    /// With [`skip_mission`](Self::skip_mission), whether it stops at the
+    /// contract's briefing (`Sys.GetINIBriefing`).
+    pub skip_briefing: bool,
     /// The score.
     pub music: crate::music::Music,
     /// The environmental reverb.
@@ -549,6 +582,9 @@ pub struct ScriptWorld {
     /// `Rider` in the driver's seat names them: a vehicle spawned without
     /// "(Driver)" in its name comes with them ([`ScriptWorld::spawn`]).
     pub template_drivers: HashMap<String, String>,
+    /// Who else rides each template's vehicle (its other `Rider`
+    /// records): a `(Full)` vehicle spawned comes with them too.
+    pub template_passengers: HashMap<String, Vec<String>>,
     /// Every layer entity's place, and its guid by name in lower case,
     /// loaded or not: `Pg.GetGuidByName` finds markers (landing zones) of
     /// layers that aren't in, and scripts measure to them.
@@ -721,6 +757,39 @@ impl ScriptWorld {
                 seat: "d".into(),
                 instant: true,
             });
+        }
+        // A full one (`"Ka29b (Full)"`, a soldier delivery's) comes with its
+        // passengers too, as its other `Rider` records name them
+        // (inferred from the name: `MrxSoldierDelivery` takes them out with
+        // `Ai.Deploy` once it has landed).
+        if lower.contains("(full)") {
+            for rider in self
+                .template_passengers
+                .get(&lower)
+                .cloned()
+                .unwrap_or_default()
+            {
+                let g = self.spawn_guid();
+                let mut o = Object::new(&rider, position);
+                o.vehicle = Some(guid);
+                o.seated_instantly = true;
+                if let Some(l) = self.template_labels.get(&rider.to_ascii_lowercase()) {
+                    o.label_hashes.clone_from(l);
+                }
+                self.insert(g, o);
+                self.commands.push(Command::Spawn {
+                    guid: g,
+                    what: rider,
+                    position,
+                    yaw,
+                });
+                self.commands.push(Command::EnterVehicle {
+                    guid: g,
+                    vehicle: guid,
+                    seat: "p".into(),
+                    instant: true,
+                });
+            }
         }
         guid
     }
@@ -2204,6 +2273,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .map(|(&g, _)| g)
             .collect();
         riders.sort_unstable();
+        // `"p"`: the passengers, not the driver (the first rider, as
+        // `Vehicle.GetDriver` has it; a soldier delivery's soldiers).
+        if matches!(a.get(1), Some(Value::String(s)) if s.as_bytes() == b"p") && !riders.is_empty()
+        {
+            riders.remove(0);
+        }
         for r in riders {
             t.raw_push(crate::events::guid_value(r))?;
         }
@@ -2313,7 +2388,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
     add(&ai, "GetFactionGuid", |w, _, a| {
-        let faction = id(a.first()).and_then(|g| w.objects.get(&g)?.faction);
+        // A zone's own; a person's, their faction's template (as
+        // `Pg.GetGuidByName("China")` has it: an outpost compares the two).
+        let o = id(a.first()).and_then(|g| w.objects.get(&g));
+        let faction = match o.map(|o| (o.faction, o.faction_name())) {
+            Some((Some(own), _)) => Some(own),
+            Some((None, Some(name))) => Some(w.template(name)),
+            _ => None,
+        };
         values([guid_value(faction)])
     })?;
     // How one faction's AI regards another, -100 (hostile) to 100
@@ -2398,6 +2480,52 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // A vehicle's riders get out (`Ai.Deploy{ Vehicle, Role = "Passenger",
+    // Callback, CallbackData }`: a soldier delivery, once landed, puts its
+    // soldiers down; its callback then has them follow her): those of the
+    // role (all but the driver for passengers) step out beside it, and
+    // the callback runs on the next tick with its data unpacked (when the
+    // engine calls it, and with what more, is inferred).
+    add(&ai, "Deploy", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([]);
+        };
+        let Some(vehicle) = id(t.raw_get::<Value>("Vehicle").ok().as_ref()) else {
+            return values([]);
+        };
+        let passengers = matches!(
+            t.raw_get::<Value>("Role")?,
+            Value::String(s) if s.as_bytes().eq_ignore_ascii_case(b"passenger")
+        );
+        let mut riders: Vec<u32> = w
+            .objects
+            .iter()
+            .filter(|(_, o)| o.vehicle == Some(vehicle))
+            .map(|(&g, _)| g)
+            .collect();
+        riders.sort_unstable();
+        if passengers && !riders.is_empty() {
+            riders.remove(0);
+        }
+        let at = w.objects.get(&vehicle).map_or([0.0; 3], |o| o.position);
+        for (i, g) in riders.into_iter().enumerate() {
+            // Round the vehicle, 4 m out, a step apart.
+            let a = i as f32 * 0.7;
+            let position = [at[0] + 4.0 * a.sin(), at[1], at[2] + 4.0 * a.cos()];
+            if let Some(o) = w.objects.get_mut(&g) {
+                o.vehicle = None;
+                o.seated_instantly = false;
+                o.position = position;
+            }
+            w.commands.push(Command::ExitVehicle(g));
+            w.commands.push(Command::Move { guid: g, position });
+        }
+        if let Value::Function(f) = t.raw_get::<Value>("Callback")? {
+            let data = t.raw_get::<Value>("CallbackData")?;
+            w.asset_loads.push((f, data));
+        }
+        values([])
+    })?;
     add(&ai, "Goal", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([]);
@@ -2418,6 +2546,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         };
         let target = id(t.raw_get::<Value>("Target").ok().as_ref());
         let haste = num(t.raw_get::<Value>("Haste").ok().as_ref());
+        // A new goal replaces the person's last (inferred): an outpost's
+        // rusher calls send the same soldiers again every 20 s, and each
+        // callback kept holds Lua references until the scripts' state runs
+        // out of them (found by the China contracts' thread: after about
+        // 400 s).
+        w.goal_callbacks.retain(|(g, _, _)| *g != guid);
         if let Value::Function(f) = t.raw_get::<Value>("Callback")? {
             let data = t.raw_get::<Option<Table>>("CallbackData")?;
             w.goal_callbacks.push((guid, f, data));
@@ -2803,16 +2937,28 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         vo.set(name, i as i64)?;
     }
 
-    // Developer switches (skip to a mission, force a briefing): all off.
+    // Developer switches: skip to a mission (off unless asked for), and
+    // force a new game (off).
     let sys = lib("Sys")?;
     // The game shows its tutorial tips, unless the player turned them off.
     add(&sys, "TutorialsEnabled", |w, _, _| {
         values([Value::Boolean(!w.tutorials_off)])
     })?;
-    for name in ["GetSkipMission", "GetINIBriefing", "GetForceNewGame"] {
-        add(&sys, name, |_, _, _| values([Value::Nil]))?;
-    }
-    add(&sys, "SetSkipMission", |_, _, _| values([]))?;
+    add(&sys, "GetSkipMission", |w, lua, _| {
+        values([match &w.skip_mission {
+            Some(m) => Value::String(lua.create_string(m)?),
+            None => Value::Nil,
+        }])
+    })?;
+    // The bootstrap clears it (`""`) once it has taken it.
+    add(&sys, "SetSkipMission", |w, _, args| {
+        w.skip_mission = category(args.first()).filter(|m| !m.is_empty());
+        values([])
+    })?;
+    add(&sys, "GetINIBriefing", |w, _, _| {
+        values([Value::Boolean(w.skip_briefing)])
+    })?;
+    add(&sys, "GetForceNewGame", |_, _, _| values([Value::Nil]))?;
     // `WifMissionFlow.Autosave` asks this after a contract (with whether
     // a mission is on, the last contract, the time played and the share
     // of the game done): the game saves.
@@ -3112,10 +3258,30 @@ fn collect(
             .collect()
     };
     let (with, without) = (hashes(with), hashes(without));
+    // Then the factions to keep, by name: `"China"`, or several joined
+    // with `||` (an outpost's `"China||VZ"`); none keeps all.
+    let factions: Vec<&str> = a
+        .iter()
+        .skip(4)
+        .filter_map(|v| match v {
+            Value::String(s) => Some(s.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<String>()
+        .split("||")
+        .filter_map(|f| {
+            FACTIONS
+                .into_iter()
+                .find(|x| x.eq_ignore_ascii_case(f.trim()))
+        })
+        .collect();
     let mut found: Vec<u32> = w
         .objects
         .iter()
         .filter(|(_, o)| !o.hidden)
+        .filter(|(_, o)| {
+            factions.is_empty() || o.faction_name().is_some_and(|f| factions.contains(&f))
+        })
         .filter(|(_, o)| {
             let labels = o.all_labels();
             labels.iter().any(|l| with.contains(l)) && !labels.iter().any(|l| without.contains(l))
@@ -4224,6 +4390,34 @@ mod tests {
         // The tank and the jeep are ground vehicles; the far tank is out.
         assert_eq!((tanks, ground, flying), (1, 2, 0));
         assert!((d - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn an_outpost_tells_its_attackers_from_its_defenders() {
+        // `Outpost.CallForRushers` collects one side's people by the
+        // capture point; `RusherGoalFulfilled` then compares each one's
+        // faction with the outpost's `sAttackers` and `sDefenders`.
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            for (g, name) in [(70, "Chinese Soldier"), (71, "VZ Heavy (Light MG)")] {
+                let mut o = Object::new(name, [5.0, 0.0, 0.0]);
+                o.labels.push("Soldier".into());
+                w.insert(g, o);
+            }
+        }
+        let (china, all, same, other): (i64, i64, bool, bool) = host
+            .lua()
+            .load(
+                r#"local china = Pg.FastCollectHumans(0, 0, 0, 50, "China")
+                local all = Pg.FastCollectHumans(0, 0, 0, 50, "China||VZ")
+                local c = Ai.GetFactionGuid(china[1])
+                return #china, #all, c == Pg.GetGuidByName("China"),
+                    c == Pg.GetGuidByName("VZ")"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((china, all, same, other), (1, 2, true, false));
     }
 
     #[test]

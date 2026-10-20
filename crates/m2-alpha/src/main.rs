@@ -150,6 +150,9 @@ struct Options {
     /// skips the fade before the villa's closing movie and the move into
     /// the PMC HQ, and Fiona's Talk never comes.
     skip_mode_off: bool,
+    /// With `--mission`: the story skipped to this contract the game's
+    /// developer way, and whether to its briefing (`--skip-to <id>[,briefing]`).
+    skip_to: Option<(String, bool)>,
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
@@ -508,6 +511,14 @@ fn parse_args() -> anyhow::Result<Options> {
             // The default since round 25; kept so old launch lines work.
             "--skip-mode-off" => o.skip_mode_off = true,
             "--skip-mode-on" => o.skip_mode_off = false,
+            "--skip-to" => {
+                let v = value()?;
+                o.skip_to = Some(match v.split_once(',') {
+                    Some((id, "briefing")) => (id.to_owned(), true),
+                    Some(_) => bail!("--skip-to expects <contract>[,briefing], not {v}"),
+                    None => (v, false),
+                });
+            }
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
@@ -962,6 +973,7 @@ fn main() -> anyhow::Result<()> {
         no_boot: options.no_boot,
         to_front_end: options.to_front_end,
         skip_mode_off: options.skip_mode_off,
+        skip_to: options.skip_to.clone(),
         guns: options.guns.clone(),
         load: options.load.clone(),
         load_at: options.load_at,
@@ -3463,7 +3475,8 @@ fn mission_for_screenshot(
         .with_save(options.load.clone())
         .with_support(options.support.clone())
         .with_movies(options.movies)
-        .with_skip_mode_off(options.skip_mode_off);
+        .with_skip_mode_off(options.skip_mode_off)
+        .with_skip_to(options.skip_to.clone());
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -3576,11 +3589,21 @@ fn mission_for_screenshot(
     // it), the designator's tap, and seconds the helicopter has been about.
     let (mut extraction, mut extraction_tap, mut extraction_seen) = (0u8, false, 0.0f32);
     let (mut locked_was, mut locked_for) = (false, 0.0f32);
+    let mut on_contract: Option<(String, i64)> = None;
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
             Some(a) => {
+                let contract = link.contract();
+                if contract != on_contract {
+                    eprintln!(
+                        "autoplay {:.1} s: on contract {:?}",
+                        i as f32 * tick,
+                        contract
+                    );
+                    on_contract = contract;
+                }
                 a.sights = link.sight_targets(game);
-                let marks = link.marks();
+                let marks = link.contract_marks();
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)
             }
@@ -6704,6 +6727,8 @@ struct App {
     /// End the scripts' skip mode after their start (unless
     /// `--skip-mode-on`).
     skip_mode_off: bool,
+    /// The story skipped to this contract (`--skip-to`).
+    skip_to: Option<(String, bool)>,
     /// Weapons to start with (`--gun`).
     guns: Vec<String>,
     /// A save to start from (`--load`).
@@ -6801,6 +6826,7 @@ impl App {
                         .with_support(self.support.clone())
                         .with_movies(self.alpha)
                         .with_skip_mode_off(self.skip_mode_off)
+                        .with_skip_to(self.skip_to.clone())
                         .with_subtitles(self.config.options.subtitles),
                 ),
                 _ => None,

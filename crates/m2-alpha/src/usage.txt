@@ -21,6 +21,12 @@ m2-alpha [options]
                          has run (the default; --skip-mode-off is still
                          taken). Left on, the flow skips its fades and the
                          move into the PMC HQ
+  --skip-to <id>[,briefing]
+                         with --mission: skip the story to this contract
+                         (GurCon053, PirCon001...) as the game's developer
+                         switch does: the flow completes each story
+                         contract it unlocks before it, then this one
+                         starts as in play (at its briefing with ,briefing)
   --movies               with --mission --screenshot: the scripts' movies
                          wait; each is decoded offscreen and pictured
                          (<out>-movie-<name>.ppm)
