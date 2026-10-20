@@ -776,3 +776,39 @@ fn shallow_water_shows_the_bed_beneath() {
     eprintln!("shallow {s:?}, deep {d:?}");
     assert!(s[0] > s[1] && s[0] > d[0] + 40, "shallow {s:?}, deep {d:?}");
 }
+
+// The overlay draws in gamma: its view is the frame's non-sRGB twin, so a
+// grey of 0.5 lands as 128, not as the 188 an sRGB view would store, and
+// see-through overlay colours blend in gamma as the game's interface does.
+#[test]
+fn overlays_draw_in_gamma() {
+    use m2_render::gpu::wgpu;
+    let Some(mut backend) = backend() else { return };
+    backend.begin_frame(&view()).unwrap();
+    backend
+        .end_frame_with(&mut |t| {
+            assert!(!t.format.is_srgb(), "{:?}", t.format);
+            let _pass = t.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: t.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.5,
+                            g: 0.5,
+                            b: 0.5,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+        })
+        .unwrap();
+    let pixels = backend.read_pixels().unwrap();
+    let p = pixel(&pixels, SIZE / 2, SIZE / 2);
+    assert!((i32::from(p[0]) - 128).abs() <= 1, "{p:?}");
+}
