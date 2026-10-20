@@ -7896,8 +7896,19 @@ impl ApplicationHandler for App {
         }
         // Alt+Enter toggles fullscreen, as F11 does (the PC convention),
         // in play and menus alike; its Enter goes no further.
-        if let WindowEvent::ModifiersChanged(m) = &event {
-            state.alt = m.state().alt_key();
+        // Alt from the modifiers and from the Alt keys themselves: a
+        // ModifiersChanged can come before the Focused that would clear it.
+        match &event {
+            WindowEvent::ModifiersChanged(m) => state.alt = m.state().alt_key(),
+            WindowEvent::KeyboardInput { event: key, .. }
+                if matches!(
+                    key.physical_key,
+                    PhysicalKey::Code(KeyCode::AltLeft | KeyCode::AltRight)
+                ) =>
+            {
+                state.alt = key.state == ElementState::Pressed;
+            }
+            _ => {}
         }
         if let WindowEvent::KeyboardInput { event: key, .. } = &event
             && state.alt
@@ -7942,7 +7953,9 @@ impl ApplicationHandler for App {
                 // Keys pressed or released elsewhere never reach us, so start
                 // clean either way.
                 state.focused = focused;
-                state.alt = false;
+                if !focused {
+                    state.alt = false;
+                }
                 state.input.clear();
                 state.keep_mouse();
             }
