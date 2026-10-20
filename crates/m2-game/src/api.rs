@@ -2754,7 +2754,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         use crate::reverb::PresetName;
         let name = match a.first() {
             Some(Value::String(s)) => PresetName::Name(s.to_string_lossy()),
-            Some(Value::Integer(i)) => PresetName::Index(*i),
+            Some(Value::Integer(i)) => PresetName::Index(lua_int(*i)),
             Some(Value::Number(n)) => PresetName::Index(*n as i64),
             _ => return values([Value::Boolean(false)]),
         };
@@ -3307,6 +3307,16 @@ fn notifier(lua: &Lua, world: &Shared, call: String) -> mlua::Result<Function> {
         w.borrow_mut().commands.push(Command::Notify(call.clone()));
         Ok(MultiValue::new())
     })
+}
+
+/// A Lua integer as an `i64`: `mlua::Integer` is `i64` on 64-bit hosts and
+/// `i32` on the 32-bit game target.
+#[allow(
+    clippy::useless_conversion,
+    reason = "an identity conversion on 64-bit hosts, a widening one on i686"
+)]
+fn lua_int(i: mlua::Integer) -> i64 {
+    i.into()
 }
 
 #[cfg(test)]

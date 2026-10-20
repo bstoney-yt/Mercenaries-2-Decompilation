@@ -92,7 +92,7 @@ impl Reports {
         for kind in KINDS {
             let n = seen.and_then(|s| s.get(kind)).copied().unwrap_or(0);
             let count = if scale == 1.0 {
-                Value::Integer(i64::from(n))
+                Value::Integer(n as mlua::Integer)
             } else {
                 Value::Number(f64::from(n) * f64::from(scale))
             };
@@ -118,7 +118,7 @@ pub fn tell(world: &crate::api::Shared, reporter: u32, state: i64) -> mlua::Resu
     if let Some(f) = callback {
         f.call::<()>(MultiValue::from_vec(vec![
             crate::events::guid_value(reporter),
-            Value::Integer(state),
+            Value::Integer(state as mlua::Integer),
         ]))?;
     }
     Ok(())
