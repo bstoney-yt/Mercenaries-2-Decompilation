@@ -7087,6 +7087,11 @@ impl Running {
                 eprintln!("hero: playing as {hero}");
                 self.set_hero(hero);
             }
+            Some(ui::MenuAction::Display(mode)) => {
+                let how = self.display.set(&self.window, mode, &mut config.window);
+                eprintln!("pause: display: {how}");
+                config.save("pause");
+            }
             Some(ui::MenuAction::Quit) => event_loop.exit(),
             Some(ui::MenuAction::Shop(a)) => self.shop_action(a, config),
             Some(ui::MenuAction::Cheat(a)) => self.cheat_action(a),
@@ -7406,6 +7411,7 @@ impl Running {
             self.keep_settings(&s, news.video, "front end", config);
         } else if let Some(v) = news.video {
             Self::keep_video(&self.window, "front end", v, config);
+            config.save("front end");
         }
         if let Some(n) = news.delete {
             let path = pause_save_path(n);
@@ -7722,6 +7728,7 @@ impl Running {
         if self.input.take_pressed(Action::Fullscreen) {
             let how = self.display.toggle(&self.window, &mut config.window);
             eprintln!("display: F11: {how}");
+            config.save("display");
         }
         // The developer's keys are taken either way, and do nothing
         // without `--dev` in the whole game's launch.
@@ -7902,6 +7909,7 @@ impl ApplicationHandler for App {
             if key.state == ElementState::Pressed && !key.repeat {
                 let how = state.display.toggle(&state.window, &mut self.config.window);
                 eprintln!("display: Alt+Enter: {how}");
+                self.config.save("display");
             }
             return;
         }
