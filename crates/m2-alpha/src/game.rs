@@ -2816,9 +2816,27 @@ fn knock_loose(
                 velocity: Vec3::ZERO,
                 mass: v.spec.mass,
             };
-            for k in world.physics.statics_in_box(place, v.model.bounds) {
-                if let StaticKey::Entity(e) = k
-                    && !props.is_cargo(e)
+            // What stands in its box with collision, and what has none
+            // (PirCon004's organ boxes: none rode, and the truck left
+            // them standing where it was parked).
+            let (lo, hi) = v.model.bounds;
+            let mut near: Vec<u32> = world
+                .physics
+                .statics_in_box(place, v.model.bounds)
+                .into_iter()
+                .filter_map(|k| match k {
+                    StaticKey::Entity(e) => Some(e),
+                    _ => None,
+                })
+                .collect();
+            near.extend(props.standing_near(
+                place.transform_point3((lo + hi) * 0.5),
+                (hi - lo).length() * 0.5,
+            ));
+            near.sort_unstable();
+            near.dedup();
+            for e in near {
+                if !props.is_cargo(e)
                     && on_bed(props, &standing, *b, e)
                     && props.load(&mut world.physics, e, (index, id), b.y)
                 {

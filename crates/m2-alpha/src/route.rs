@@ -111,11 +111,12 @@ impl Route {
     /// sea at `sea`: within [`MARGIN`] of the straight way, else within
     /// [`WIDE_MARGIN`]. Straight there, not reaching, if no way gets any
     /// closer.
+    #[cfg(test)]
     pub fn plan(physics: &Physics, mover: Mover, from: Vec3, to: Vec3, sea: f32) -> Self {
         Self::plan_avoiding(physics, mover, (from, to), sea, &[])
     }
 
-    /// [`plan`](Self::plan), keeping out of the boxes `avoid` (each its
+    /// The way from `from` to `to` (as `plan` has it), keeping out of the boxes `avoid` (each its
     /// least and most corner, x and z: what a vehicle stuck on before).
     /// A way starting inside one goes straight out of it.
     pub fn plan_avoiding(
