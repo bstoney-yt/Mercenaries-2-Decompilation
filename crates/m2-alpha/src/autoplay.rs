@@ -414,7 +414,12 @@ impl Autoplay {
             self.report(game);
         }
         let sturdy = |target: &u32| game.scene.props.sturdy.contains(target);
-        let striking = matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target));
+        // Her launcher spent (round 13: three tanks took all her rockets,
+        // and she stood aimed at the fourth for 2100 s), a strike brings
+        // down what she would have blown up.
+        let spent = game.combat.launcher_rounds.is_some() && game.combat.launcher_empty();
+        let striking =
+            matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target) || spent);
         // A call she is no longer after is put away: the designator goes
         // with a weapon taken up (twice from the satellite's view).
         if !striking && (game.support.busy() || game.support.holding()) {
@@ -1188,12 +1193,13 @@ impl Autoplay {
         } else {
             0.0
         };
-        // Aimed long with a wall in the way (round 10: a concrete pit by
-        // the PMC's gate, 43 m from the last tank, for 2000 s): she goes
-        // closer along her way, which hops her out if she is stuck.
-        if clear {
+        // Long without a shot, a wall in the way or never steady on it
+        // (round 10: a concrete pit by the PMC's gate, 43 m from the last
+        // tank, for 2000 s; round 11: 44 m from the fourth, 1700 s): she
+        // goes closer along her way, which hops her out if she is stuck.
+        if clear && error < ON_TARGET {
             self.blocked = 0.0;
-        } else if error < ON_TARGET {
+        } else {
             self.blocked += dt;
         }
         // Close enough: aiming again from here.
@@ -1821,9 +1827,13 @@ impl Autoplay {
             game.combat.shots_line()
         );
         eprintln!(
-            "autoplay checks {:.1} s: {}",
+            "autoplay checks {:.1} s: {}; arrived {:?}, blocked {:.1} s, steady {:.1} s, landed {}",
             self.clock,
-            game.scene.people.checks.line()
+            game.scene.people.checks.line(),
+            self.arrived.map(|t| self.clock - t),
+            self.blocked,
+            self.steady,
+            p.landed
         );
     }
 

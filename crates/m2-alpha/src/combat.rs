@@ -3081,6 +3081,14 @@ impl Combat {
 
     /// Takes a round from the launcher's clip, loading the next clip from
     /// the stored rounds once it is spent: false with none to fire.
+    /// Whether her launcher has nothing left to fire, loaded or stored
+    /// (or she carries none).
+    pub fn launcher_empty(&self) -> bool {
+        self.launcher_rounds
+            .as_ref()
+            .is_none_or(|r| r.clip == 0 && r.stored == 0)
+    }
+
     fn spend_launcher_round(&mut self) -> bool {
         let clip = self.launcher.clip.max(1);
         let Some(rounds) = self.launcher_rounds.as_mut() else {
