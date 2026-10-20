@@ -1132,7 +1132,7 @@ impl Autoplay {
             if held
                 && !self.leave
                 && target.distance(game.focus()) < SHOOT_RANGE * 2.0
-                && self.can_leave(game, v)
+                && self.may_get_out(game, v)
             {
                 eprintln!(
                     "autoplay {:.1} s: {} near: getting out to go on foot",
@@ -1584,7 +1584,7 @@ impl Autoplay {
         // below the hilltop MLRS, 34 m up: 250 s, its gun at its stop):
         // out, to go on on foot.
         self.gunning += dt;
-        if self.gunning > CANNON_GIVE_UP && self.can_leave(game, i) {
+        if self.gunning > CANNON_GIVE_UP && self.may_get_out(game, i) {
             eprintln!(
                 "autoplay {:.1} s: the {} has had {} in range {:.0} s: getting out",
                 self.clock, v.spec.label, self.what, self.gunning
@@ -1788,6 +1788,16 @@ impl Autoplay {
             hold_jump: true,
             ..Intent::default()
         }
+    }
+
+    /// Whether she can get out of vehicle `i` where it is: anything on
+    /// land, a boat not over deep water ([`Self::can_leave`]).
+    fn may_get_out(&self, game: &Game, i: usize) -> bool {
+        game.scene
+            .vehicles
+            .get(i)
+            .is_some_and(|v| !v.spec.is_boat())
+            || self.can_leave(game, i)
     }
 
     /// Whether vehicle `i` is a boat she can get out of where it is (not
