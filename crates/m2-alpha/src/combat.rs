@@ -187,6 +187,11 @@ pub struct Rifle {
     pub ui: Option<m2_engine::weapons::GunUi>,
     /// Its aim assist (`HumanCameraModifier`), if its template says.
     pub assist: Option<m2_engine::weapons::AimAssist>,
+    /// How it sets her camera (`HumanCameraModifier`), if its template
+    /// says.
+    pub camera: Option<m2_engine::weapons::CameraFeel>,
+    /// Its scope's least and most magnification (`WeaponScope`).
+    pub scope: Option<(f32, f32)>,
 }
 
 impl Default for Rifle {
@@ -209,6 +214,8 @@ impl Default for Rifle {
             feel: Feel::default(),
             ui: None,
             assist: None,
+            camera: None,
+            scope: None,
         }
     }
 }
@@ -262,6 +269,8 @@ impl Rifle {
             feel: spec.feel,
             ui: spec.ui,
             assist: spec.assist,
+            camera: spec.camera,
+            scope: spec.scope,
         }
     }
 
@@ -1181,6 +1190,11 @@ pub enum Sound {
     /// Her gun reloaded (heard as her own, flat): its template's sound set, whose
     /// reload cue the `Sounds` table gives ([`m2_engine::gun_sounds::GunCues::reload`]).
     Reload {
+        set: Option<u32>,
+    },
+    /// A gun taken up off the ground (heard as her own, flat): its sound
+    /// set, whose `equip_pickup` cue the `Sounds` table gives.
+    Pickup {
         set: Option<u32>,
     },
     /// The satellite-guided bomb landing.
@@ -2200,6 +2214,29 @@ impl Combat {
         }
     }
 
+    /// Cues `s` to be heard with the fight's sounds.
+    pub fn cue_sound(&mut self, s: Sound) {
+        self.sounds.push(s);
+    }
+
+    /// How the weapon up in her hands sets her camera
+    /// (`HumanCameraModifier`), if its template says.
+    pub fn camera_feel(&self) -> Option<m2_engine::weapons::CameraFeel> {
+        match self.weapon {
+            Weapon::Rifle => self.rifle.camera,
+            _ => self.launcher.camera,
+        }
+    }
+
+    /// The scope of the weapon up in her hands, if it has one: its least
+    /// and most magnification.
+    pub fn scope(&self) -> Option<(f32, f32)> {
+        match self.weapon {
+            Weapon::Rifle => self.rifle.scope,
+            _ => self.launcher.scope,
+        }
+    }
+
     /// Whether the weapon in the launcher's place can fire: the RPG
     /// always, a grenade launcher with rounds left.
     pub fn second_loaded(&self) -> bool {
@@ -2621,6 +2658,9 @@ impl Combat {
             if std::mem::take(&mut f.people.npcs[i].fires) {
                 self.npc_shoot(f, i, target);
             }
+            if std::mem::take(&mut f.people.npcs[i].launches) {
+                self.npc_launch(f, i, target);
+            }
             if let Some(at) = f.people.npcs[i].throws.take() {
                 self.npc_throw(f, i, at);
             }
@@ -2923,6 +2963,52 @@ impl Combat {
         alarm(f.people, f.player.character.position);
     }
 
+    /// A soldier's rocket from his launcher at her ([`crate::npc::Npc::launcher`]):
+    /// from over his shoulder, at its template's speed from a person's
+    /// hands, bursting as its round says. His aim strays by his
+    /// `Accuracy` as his rounds do ([`SoldierSpread`], with the launcher's
+    /// own cone taken as none: inferred). A homing one is not locked on
+    /// (invented: no lock is read for soldiers).
+    fn npc_launch(&mut self, f: &mut Field<'_>, i: usize, target: Option<Vec3>) {
+        let Some(aim) = target else { return };
+        let n = &f.people.npcs[i];
+        let Some(l) = n.launcher else { return };
+        let from = n.chest() + Vec3::Y * 0.4;
+        let distance = from.distance(aim);
+        let spread = SoldierSpread::new(distance, n.accuracy(), 0.0);
+        let (a, b) = (self.random(), self.random());
+        let dir = spread.stray((aim - from).normalize_or(Vec3::Z), a, b);
+        let speed = Some(l.ammo.human_speed())
+            .filter(|&v| v > 0.0)
+            .unwrap_or(ROCKET_SPEED);
+        eprintln!(
+            "rocket: a soldier fires his {:#x} at {distance:.0} m",
+            l.template
+        );
+        self.projectiles.push(Projectile::Rocket {
+            at: from,
+            velocity: dir * speed,
+            flown: 0.0,
+            shell: false,
+            owner: None,
+            blast: l.ammo.burst(),
+            homing: None,
+            key: l.ammo.key,
+        });
+        self.effect(
+            Effect::Flash {
+                at: from,
+                dir,
+                size: RPG_FLASH,
+            },
+            FLASH_TIME * 1.6,
+        );
+        self.sounds.push(Sound::Launch {
+            at: from,
+            set: l.feel.sound_set,
+        });
+    }
+
     /// A soldier's grenade lobbed from over his head down onto `at` (as
     /// hard as she throws), or as far as it goes that way.
     fn npc_throw(&mut self, f: &mut Field<'_>, i: usize, at: Vec3) {
@@ -2971,32 +3057,50 @@ impl Combat {
         let cone = gun
             .and_then(|g| self.feels.get(&g.template))
             .map_or(NPC_CONE, |f| f.scatter[0]);
-        let spread = SoldierSpread::new(distance, n.accuracy(), cone);
-        let (a, b) = (self.random(), self.random());
-        let dir = spread.stray((aim - from).normalize_or(Vec3::Z), a, b);
-        let hit = cast_shot(
-            f.physics,
-            f.people,
-            from,
-            dir,
-            distance + 2.0,
-            Some(i),
-            None,
-        );
-        let end = hit.map_or(from + dir * (distance + 2.0), |h| from + dir * h.0);
-        self.effect(Effect::Tracer { from, to: end }, 0.07);
+        let accuracy = n.accuracy();
+        let ahead = (aim - from).normalize_or(Vec3::Z);
+        // A gun firing several rounds a shot (the shotgun's
+        // `iBulletsPerShot` 10): his miss aims the shot, and each round
+        // strays from that within the gun's cone (inferred: the cone as
+        // the pellets' spread, as it is for her own shotgun).
+        let pellets = gun.map_or(1, |g| g.pellets.max(1));
+        let (spread, aimed) = if pellets > 1 {
+            let (a, b) = (self.random(), self.random());
+            let shot = SoldierSpread::new(distance, accuracy, 0.0).stray(ahead, a, b);
+            let c = cone.max(0.0).to_radians();
+            (SoldierSpread { side: c, up: c }, shot)
+        } else {
+            (SoldierSpread::new(distance, accuracy, cone), ahead)
+        };
         let feel = gun.and_then(|g| self.feels.get(&g.template).copied());
-        self.gun_fired(feel, (from, case), dir, RIFLE_FLASH, Some(shooter));
-        let closest = from + dir * (aim - from).dot(dir).max(0.0);
-        let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
-        if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
-            let damage = self.npc_round(gun);
-            let lost = self.hurt_player(f, damage, Some(from));
-            self.tally.taken_rounds += lost;
-            self.tally.rounds_on_her += u32::from(lost > 0.0);
-        }
-        if let Some((t, None)) = hit {
-            self.round_on_vehicle(f, (from, dir, t), RIFLE_ON_VEHICLE, None);
+        for k in 0..pellets {
+            let (a, b) = (self.random(), self.random());
+            let dir = spread.stray(aimed, a, b);
+            let hit = cast_shot(
+                f.physics,
+                f.people,
+                from,
+                dir,
+                distance + 2.0,
+                Some(i),
+                None,
+            );
+            let end = hit.map_or(from + dir * (distance + 2.0), |h| from + dir * h.0);
+            self.effect(Effect::Tracer { from, to: end }, 0.07);
+            if k == 0 {
+                self.gun_fired(feel, (from, case), dir, RIFLE_FLASH, Some(shooter));
+            }
+            let closest = from + dir * (aim - from).dot(dir).max(0.0);
+            let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
+            if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
+                let damage = self.npc_round(gun);
+                let lost = self.hurt_player(f, damage, Some(from));
+                self.tally.taken_rounds += lost;
+                self.tally.rounds_on_her += u32::from(lost > 0.0);
+            }
+            if let Some((t, None)) = hit {
+                self.round_on_vehicle(f, (from, dir, t), RIFLE_ON_VEHICLE, None);
+            }
         }
     }
 
@@ -3008,6 +3112,7 @@ impl Combat {
         people: &mut People,
         arsenal: &Arsenal,
         vehicles: &mut [ParkedVehicle],
+        gun: Option<m2_engine::tuning::HandGun>,
     ) {
         let target = self.target(player, true);
         people.npcs.clear();
@@ -3019,6 +3124,7 @@ impl Combat {
             crate::npc::Brain::Post { facing: 0.0 },
             Some(1),
         ));
+        people.npcs[0].gun = gun;
         let mut f = Field {
             physics,
             player,
@@ -5840,6 +5946,48 @@ mod tests {
         assert!(!field.explosives[2].gone);
     }
 
+    // The shotgun's 10 rounds a shot: ten rounds go out, as many tracers.
+    #[test]
+    fn a_soldiers_shotgun_fires_its_rounds_a_shot() {
+        let mut physics = ground();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        for _ in 0..3 {
+            player.update(&physics, Default::default(), 1.0 / 60.0);
+        }
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let tracers = |c: &Combat| {
+            c.effects
+                .iter()
+                .filter(|e| matches!(e.0, Effect::Tracer { .. }))
+                .count()
+        };
+        for (pellets, want) in [(1, 1), (10, 10)] {
+            let gun = m2_engine::tuning::HandGun {
+                template: 1,
+                model: None,
+                rate_of_fire: 90.0,
+                clip: 6,
+                reserve_clips: 4,
+                damage: 15.0,
+                damage_key: None,
+                hint: None,
+                pellets,
+            };
+            let mut combat = Combat::default();
+            combat.npc_shoot_at_for_test(
+                &mut physics,
+                &mut player,
+                &mut people,
+                &arsenal,
+                &mut vehicles,
+                Some(gun),
+            );
+            assert_eq!(tracers(&combat), want);
+        }
+    }
+
     #[test]
     fn soldiers_shots_wear_her_down() {
         let mut physics = ground();
@@ -5859,6 +6007,7 @@ mod tests {
                 &mut people,
                 &arsenal,
                 &mut vehicles,
+                None,
             );
         }
         assert!(combat.hp < 100.0);
@@ -5914,6 +6063,7 @@ mod tests {
             damage: 12.0,
             damage_key: None,
             hint: None,
+            pellets: 1,
         };
         assert_eq!(combat.npc_round(Some(gun)), 3.0);
         assert_eq!(combat.npc_round(None), NPC_DAMAGE);
@@ -5982,6 +6132,7 @@ mod tests {
             damage: 8.0,
             damage_key: Some(m2_assets::name_hash("Bullet")),
             hint: None,
+            pellets: 1,
         };
         let rifle = Rifle::of("Bullpup Rifle", &bullpup);
         assert_eq!((rifle.model, rifle.clip, rifle.spare), ("bullpup", 30, 210));
@@ -6151,6 +6302,7 @@ mod tests {
             damage: 0.0,
             damage_min: 0.0,
             falloff: (0.0, 0.0),
+            dropoff: 1.0,
             hero: 1.0,
             key: None,
             blast: None,

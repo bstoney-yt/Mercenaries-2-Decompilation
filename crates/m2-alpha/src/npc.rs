@@ -42,7 +42,7 @@
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::tuning::HandGun;
-use m2_engine::weapons::FireHint;
+use m2_engine::weapons::{FireHint, NpcLauncher};
 use m2_engine::world::{SpawnPoint, is_walker};
 use m2_engine::{AiProfile, BoundClip, Character, Gait, GpuModel, Physics, RagdollId};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
@@ -119,7 +119,11 @@ const STAND_IN: FireHint = FireHint {
     off: 9.0,
     on_close: 0.8,
     off_close: 1.5,
+    against: [3, 1, 0, 0],
 };
+/// The least pause between a soldier's rockets, seconds, where his
+/// launcher's `BurstOffLength` is shorter (invented).
+const LAUNCHER_GAP: f32 = 4.0;
 /// Each pause is this much longer or shorter at random, so soldiers who
 /// see her together don't fire together (invented).
 const PAUSE_JITTER: f32 = 0.25;
@@ -761,6 +765,15 @@ pub struct Npc {
     /// The gun their template hands them (`None`: the AK47's "Assault
     /// Rifle" stands in): what they draw, and how fast and hard it fires.
     pub gun: Option<HandGun>,
+    /// A launcher their template hands them as well (the AT soldiers'):
+    /// they reach for it when it rates what she is in higher than their
+    /// gun does ([`Npc::fight`]).
+    pub launcher: Option<NpcLauncher>,
+    /// Set by a tick when a soldier fires his launcher; the fight takes
+    /// the shot ([`crate::combat`]).
+    pub launches: bool,
+    /// Seconds before he fires his launcher again.
+    launcher_wait: f32,
     pub hp: f32,
     /// The health they started with (their template's for a soldier, 100
     /// for a civilian): the HUD's target arc shows a share of it.
@@ -794,6 +807,9 @@ pub struct Npc {
     grenade_wait: f32,
     /// The smarter soldiers' settings (off: the original's).
     pub smart: SmarterAi,
+    /// The armour class of what she is in (`ObjectHint`'s `Armor`, 1 to
+    /// 4; 1 on foot), from [`People::target_armour`].
+    pub target_armour: u32,
     /// Saw her this tick for the first time in the fight (smarter: he
     /// calls it out).
     spotted: bool,
@@ -964,6 +980,9 @@ impl Npc {
             hurt_by_her: false,
             reported_dead: false,
             gun: None,
+            launcher: None,
+            launches: false,
+            launcher_wait: 0.0,
             hp: 100.0,
             most_hp: 100.0,
             alive: true,
@@ -981,6 +1000,7 @@ impl Npc {
             outfit: Vec::new(),
             grenade_wait: 0.0,
             smart: SmarterAi::default(),
+            target_armour: 1,
             spotted: false,
             cover: None,
             hit: false,
@@ -1513,8 +1533,25 @@ impl Npc {
             self.rig.aim_along(self.facing, Some(threat - self.chest()));
         }
         self.cooldown -= dt;
+        self.launcher_wait -= dt;
         let hint = self.fire_hint();
-        if seen
+        // His launcher, when it rates what she is in higher than his gun
+        // does (an AT rocket's 3 against a tank's class, the rifle's 0),
+        // within its range, once its pause since the last is out.
+        if let Some(l) = self.launcher.filter(|_| self.reaches_for_launcher()) {
+            if seen
+                && off < FIRE_ARC
+                && self.launcher_wait <= 0.0
+                && distance < l.hint.range
+                && distance >= l.hint.min_range
+            {
+                self.launches = true;
+                self.since_shot = 0.0;
+                let pause = l.hint.off.max(LAUNCHER_GAP);
+                self.launcher_wait = pause * rng.range(1.0 - PAUSE_JITTER, 1.0 + PAUSE_JITTER);
+            }
+        } else if seen
+            && self.rates_target()
             && self.cooldown <= 0.0
             && off < FIRE_ARC
             && distance < hint.range
@@ -1547,6 +1584,23 @@ impl Npc {
         self.gun
             .filter(|g| g.rate_of_fire > 0.0)
             .map_or(BURST_GAP, |g| 60.0 / g.rate_of_fire)
+    }
+
+    /// Whether his gun is any use against what she is in: its
+    /// `WeaponHint` rating for her armour class is above 0 (a rifle's 0
+    /// against an APC or a tank; inferred from the ratings' names and
+    /// values, gap-list sweep). He still faces and aims at her.
+    pub fn rates_target(&self) -> bool {
+        let class = self.target_armour.clamp(1, 4) as usize - 1;
+        self.fire_hint().against[class] > 0
+    }
+
+    /// Whether he fires his launcher rather than his gun at what she is
+    /// in: it rates her armour class higher than the gun does.
+    pub fn reaches_for_launcher(&self) -> bool {
+        let class = self.target_armour.clamp(1, 4) as usize - 1;
+        self.launcher
+            .is_some_and(|l| l.hint.against[class] > self.fire_hint().against[class])
     }
 
     /// How he fires his gun: its `WeaponHint`, else the "Assault
@@ -2006,6 +2060,12 @@ pub struct People {
     rng: Rng,
     /// The enhanced, smarter soldiers' settings (off: the original's).
     pub smarter: SmarterAi,
+    /// The armour class of what she is in, 1 to 4 (`ObjectHint`'s
+    /// `Armor`: 1 on foot or in a car, 2 a helicopter or a light truck, 3
+    /// the APCs, 4 the tanks): a soldier whose gun's `WeaponHint` rates it
+    /// 0 against that class holds his fire ([`Npc::rates_target`]). 0
+    /// (unset) is taken as 1.
+    pub target_armour: u32,
     /// What soldiers near her have been at (for checking).
     pub idle: IdleTally,
     /// What shouldn't happen to anyone (for checking).
@@ -2871,6 +2931,7 @@ impl People {
         let mut callouts = Vec::new();
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
+            npc.target_armour = self.target_armour.max(1);
             npc.rammed = (npc.rammed - dt).max(0.0);
             let facing = npc.facing;
             npc.update(physics, &mut self.rng, threat, dt);
@@ -3498,6 +3559,7 @@ impl People {
             } else {
                 s.gun.or(self.kinds[kind].gun)
             };
+            npc.launcher = if listed { None } else { s.launcher };
             npc.outfit = self.dress(kind, s);
             self.tell(s, &npc);
             self.npcs.push(npc);
@@ -3985,6 +4047,7 @@ pub(crate) mod tests {
             damage: 9.0,
             damage_key: None,
             hint: None,
+            pellets: 1,
         };
         people.add_kind(kind("Carmona", true));
         people.add_kind(PersonKind {
@@ -4196,6 +4259,94 @@ pub(crate) mod tests {
     }
 
     /// A rifle as a template's `EquipmentLink`s hand it.
+    // A rifleman holds his fire at her in an APC or a tank (his gun rated
+    // 0 against them), not on foot or in a helicopter; an AT rocket man
+    // fires at all of them.
+    #[test]
+    fn soldiers_hold_fire_where_their_gun_is_no_use() {
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(1),
+        );
+        let rated = |n: &mut Npc, class| {
+            n.target_armour = class;
+            n.rates_target()
+        };
+        assert_eq!(
+            [1, 2, 3, 4].map(|c| rated(&mut n, c)),
+            [true, true, false, false]
+        );
+        let rocket = FireHint {
+            against: [1, 3, 3, 3],
+            ..STAND_IN
+        };
+        n.gun = Some(HandGun {
+            hint: Some(rocket),
+            ..rifle()
+        });
+        assert_eq!([1, 2, 3, 4].map(|c| rated(&mut n, c)), [true; 4]);
+    }
+
+    // A rifleman with the RPG (rated 1 against every class) fires the
+    // rifle at her on foot and the RPG at her in a tank; with a Stinger
+    // (1, 3, 2, 0), at her in a helicopter, not in a tank.
+    #[test]
+    fn soldiers_reach_for_the_launcher_that_rates_her_higher() {
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(1),
+        );
+        let launcher = |against| NpcLauncher {
+            template: 7,
+            hint: FireHint {
+                against,
+                ..STAND_IN
+            },
+            ammo: m2_engine::weapons::Ammo {
+                template: 8,
+                velocity: 25.0,
+                max_velocity: 0.0,
+                human_boost: 2.0,
+                gravity: 0.0,
+                damage: 0.0,
+                damage_min: 0.0,
+                falloff: (0.0, 0.0),
+                dropoff: 1.0,
+                hero: 1.0,
+                key: None,
+                blast: None,
+                timer: None,
+                timer_blast: None,
+                homing: None,
+                model: None,
+                sticky: false,
+            },
+            feel: Default::default(),
+        };
+        let reaches = |n: &mut Npc, class| {
+            n.target_armour = class;
+            n.reaches_for_launcher()
+        };
+        n.launcher = Some(launcher([1, 1, 1, 1]));
+        assert_eq!(
+            [1, 2, 3, 4].map(|c| reaches(&mut n, c)),
+            [false, false, true, true]
+        );
+        n.launcher = Some(launcher([1, 3, 2, 0]));
+        assert_eq!(
+            [1, 2, 3, 4].map(|c| reaches(&mut n, c)),
+            [false, true, true, false]
+        );
+    }
+
     fn rifle() -> HandGun {
         HandGun {
             template: 0x8000_0456,
@@ -4206,6 +4357,7 @@ pub(crate) mod tests {
             damage: 8.0,
             damage_key: None,
             hint: None,
+            pellets: 1,
         }
     }
 
@@ -4236,6 +4388,7 @@ pub(crate) mod tests {
             list: Vec::new(),
             ai: None,
             gun: None,
+            launcher: None,
             cycle: None,
         }
     }

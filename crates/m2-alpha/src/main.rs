@@ -1959,15 +1959,15 @@ fn screenshot(
             {
                 eprintln!("--pickup: she has no pickup clip, or is busy");
             }
-            game.step(
-                Intent {
-                    jump,
-                    hold_jump: jump,
-                    trigger,
-                    ..intent
-                },
-                tick,
-            );
+            let mut intent = Intent {
+                jump,
+                hold_jump: jump,
+                trigger,
+                ..intent
+            };
+            // Her gun's lens and scope as she aims (as play does).
+            game.aim_lens(&mut intent, 0, tick);
+            game.step(intent, tick);
             // With `--walk-seconds`, where she is each second: how deep the
             // sea is over her feet, and whether she swims.
             if options.walk_seconds.is_some()
@@ -7110,6 +7110,8 @@ impl Running {
             return;
         }
         let driving = self.game.driving().is_some();
+        let rumble = std::mem::take(&mut self.game.rumble);
+        self.pad.rumble(rumble);
         let keys = self.pad.poll(&mut self.input, driving, dt);
         for key in keys {
             use pad::MenuKey;
@@ -7246,6 +7248,7 @@ impl Running {
         self.set_volumes([o.sfx_volume, o.music_volume, o.dialog_volume]);
         self.pad.look = Some(pause::pad_scale(o.pad_sensitivity));
         self.pad.invert = o.invert_pad;
+        self.pad.rumble_on = o.rumble;
         // The advanced video screen's fourth option is shadows.
         self.game.picture = game::Picture {
             brightness: o.brightness,
@@ -7288,6 +7291,12 @@ impl Running {
             && let Some(m) = &mut self.mission
         {
             m.medevac();
+        }
+        if let Some(cue) = news.music {
+            self.audio.music_cue(cue.as_deref());
+            if let Some(m) = &mut self.mission {
+                m.music_heard(cue);
+            }
         }
         for unused in &news.unused {
             eprintln!("pause: {unused} kept in the menu; the alpha has nothing for it");

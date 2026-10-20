@@ -106,7 +106,17 @@ pub struct FlightTuning {
 /// Named but not read here: `Steering`, `LowSpeedSteering`,
 /// `LowSpeedLimit`, `SteerInertia`, `EngineInertia`, `HullFriction`,
 /// `RollInertia`, `PitchUpSpeed`, `PitchDownInertia`, `HandbrakeInertia`,
-/// `HandbrakeSteerBoost`; some 45 fields are still unnamed.
+/// `HandbrakeSteerBoost`; some 45 fields are still unnamed. The steering
+/// fields are not a turn rate (gap-list sweep, `boatsteer` over the 25
+/// distinct records): `Steering` rises with the boat's size, 0.3 on the
+/// Jetski and the Dinghy to 4 on the LCUR landing craft and the PR's
+/// Salton Seahorse, so as radians a second a landing craft would turn 13
+/// times as fast as a jetski. It reads as a push whose scale needs the
+/// hull's inertia, which no named field gives, so the alpha's one
+/// invented turn rate stays. `LowSpeedLimit` (10 to 130, km/h as
+/// `MaxSpeed` is, inferred) splits `Steering` from `LowSpeedSteering`
+/// (0 on 7 records: no steering slow, inferred); `SteerInertia` (0 to
+/// 0.98) and the other `*Inertia` read as a share kept each step.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BoatTuning {
     /// Top speed backing up, m/s (`MaxSpeedReverse`, km/h as `MaxSpeed`
@@ -750,6 +760,26 @@ pub struct HandGun {
     pub damage_key: Option<u32>,
     /// How soldiers fire it (`WeaponHint`, [`crate::weapons::FireHint`]).
     pub hint: Option<crate::weapons::FireHint>,
+    /// Rounds a shot (`iBulletsPerShot`: the shotgun's 10, else 1).
+    pub pellets: u32,
+}
+
+impl HandGun {
+    /// The same fields of a gun as [`crate::weapons::read`] gives it: for
+    /// one shot a pull (`FireType` 1), which [`hand_guns`] leaves out.
+    pub fn from_spec(w: &crate::weapons::WeaponSpec) -> Self {
+        Self {
+            template: w.template,
+            model: w.model,
+            rate_of_fire: w.rate_of_fire,
+            clip: w.clip,
+            reserve_clips: w.reserve_clips,
+            damage: w.ammo.damage,
+            damage_key: w.ammo.key,
+            hint: w.hint,
+            pellets: w.pellets,
+        }
+    }
 }
 
 /// Every hand-held gun that fires rounds ([`HandGun`]), by template id.
@@ -783,6 +813,10 @@ pub fn hand_guns(db: &Layer<'_>) -> HashMap<u32, HandGun> {
                         .first()
                         .and_then(|k| key.word(k, name_hash("DamageKey"))),
                     hint: crate::weapons::FireHint::read(&hint, id),
+                    pellets: weapon
+                        .word(r, name_hash("iBulletsPerShot"))
+                        .map_or(1, |c| c & 0xff)
+                        .max(1),
                 },
             ))
         })
@@ -1174,6 +1208,12 @@ mod tests {
             ("PitchDownInertia", 0xe125_7555),
             ("HandbrakeInertia", 0x83d7_b1ab),
             ("HandbrakeSteerBoost", 0x8572_4b6b),
+            // `_CarPhysicsV2`'s @108 and @170 (gap-list sweep, by hashing;
+            // unused): `GravityFactor` 1 to 3 (2 and 1.7 on 46 records
+            // each), `CanCrush` 1 on the Monster Trucks, the EXT (monster)
+            // and the WZ551 only, 0 on the rest.
+            ("GravityFactor", 0x49e4_fde4),
+            ("CanCrush", 0x711b_067a),
             // `_CarPhysicsV2`'s bike fields (gap round 18); the
             // wheelie's named, unused.
             ("BikeRollStabilityStrength", 0x215f_7ff3),
