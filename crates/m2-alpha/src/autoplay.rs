@@ -139,6 +139,10 @@ const RIDE_FRESH: f32 = 150.0;
 /// far either side of her line (metres) has her swerve this far to the
 /// right of her way (radians) and ease off (invented).
 const ONCOMING_AHEAD: f32 = 35.0;
+/// On foot she fights no nearer than this to a vehicle with goods riding
+/// on it, metres (invented: past a soldier's grenade thrown at her
+/// landing a few metres off).
+const CARGO_CLEAR: f32 = 15.0;
 const ONCOMING_SIDE: f32 = 3.0;
 const SWERVE: f32 = 0.35;
 /// Waiting this long (seconds) in a vehicle she drove to a place to
@@ -1428,7 +1432,15 @@ impl Autoplay {
         let Some(p) = game.scene.player.as_ref() else {
             return Intent::default();
         };
-        let d = target.distance(p.character.position);
+        // Fighting beside a truck with goods on it draws the soldiers'
+        // grenades onto them (PirCon003 round 60: one grenade broke all
+        // 42 parrot boxes): away from it first.
+        let here = p.character.position;
+        if let Some(c) = cargo_near(game, here) {
+            let away = (here - c).with_y(0.0).normalize_or(Vec3::X);
+            return self.walk(game, c + away * (CARGO_CLEAR + 3.0), 1.0, dt);
+        }
+        let d = target.distance(here);
         if d > SHOOT_RANGE {
             return self.walk(game, target, SHOOT_RANGE - 5.0, dt);
         }
@@ -1451,7 +1463,6 @@ impl Autoplay {
         }
         // Aimed a while with a wall in the way: from where she can see
         // the target; another spot if that one was no better.
-        let here = p.character.position;
         if self.blocked > BLOCKED {
             let at_spot = self
                 .vantage
@@ -2485,6 +2496,16 @@ fn vehicle_state(game: &Game, i: usize) -> Option<(Mat4, f32)> {
 
 /// How far `at` lies off the heading of a vehicle at `m` (radians,
 /// positive to its right), and how far away (metres).
+/// Where a vehicle with goods riding on it is, within [`CARGO_CLEAR`] of
+/// `at` (on the ground), if one is.
+fn cargo_near(game: &Game, at: Vec3) -> Option<Vec3> {
+    (0..game.scene.vehicles.len())
+        .filter(|&j| game.scene.props.carrying(j))
+        .filter_map(|j| vehicle_at(game, j))
+        .map(|t| t.w_axis.truncate())
+        .find(|c| c.with_y(0.0).distance(at.with_y(0.0)) < CARGO_CLEAR)
+}
+
 /// Whether a vehicle other than `i` (whose place is `m`) is ahead of it
 /// within [`ONCOMING_AHEAD`] metres, within [`ONCOMING_SIDE`] of its line,
 /// heading the other way.
