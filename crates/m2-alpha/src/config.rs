@@ -67,6 +67,11 @@ pub struct GameOptions {
     pub sfx_volume: f64,
     pub music_volume: f64,
     pub dialog_volume: f64,
+    /// The front end's Graphic Detail and advanced video options (see
+    /// [`crate::pause::Settings::advanced`]): kept for the menus, not
+    /// used by the alpha's drawing.
+    pub video_detail: f64,
+    pub advanced_video: [f64; 8],
 }
 
 impl Default for GameOptions {
@@ -83,6 +88,8 @@ impl Default for GameOptions {
             sfx_volume: 100.0,
             music_volume: 100.0,
             dialog_volume: 100.0,
+            video_detail: crate::pause::DETAIL,
+            advanced_video: crate::pause::ADVANCED,
         }
     }
 }
@@ -113,6 +120,9 @@ pub struct WindowConfig {
     /// Refresh Rate); 0 is the monitor's own mode, borderless.
     pub refresh: u32,
     pub vsync: bool,
+    /// The video screen's Aspect Ratio: wide, or 4:3 (the world seen as
+    /// on a 4:3 screen, filling the window).
+    pub wide: bool,
 }
 
 impl Default for WindowConfig {
@@ -123,6 +133,7 @@ impl Default for WindowConfig {
             fullscreen: false,
             refresh: 0,
             vsync: true,
+            wide: true,
         }
     }
 }
@@ -171,6 +182,67 @@ impl Config {
 
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).expect("config serialises")
+    }
+
+    /// The settings as the game's menus show them (their option screens'
+    /// items: [`crate::pause::Settings`]); the profile's name, the window,
+    /// its monitor's modes and the saves are the caller's to fill.
+    pub fn menu_settings(&self) -> crate::pause::Settings {
+        let o = &self.options;
+        crate::pause::Settings {
+            subtitles: o.subtitles,
+            tutorials: o.tutorials,
+            autosave: o.autosave,
+            invert_mouse: self.camera.invert_y,
+            mouse: crate::pause::mouse_slider(self.camera.mouse_sensitivity),
+            invert_pad: o.invert_pad,
+            pad: o.pad_sensitivity,
+            rumble: o.rumble,
+            vsync: self.window.vsync,
+            wide: self.window.wide,
+            brightness: o.brightness,
+            view_distance: o.view_distance,
+            sfx: o.sfx_volume,
+            music: o.music_volume,
+            dialog: o.dialog_volume,
+            keys: crate::keytable::KeyTable::of(&self.keys),
+            detail: o.video_detail,
+            advanced: o.advanced_video,
+            ..crate::pause::Settings::default()
+        }
+    }
+
+    /// Takes the settings a menu kept ([`Config::menu_settings`]'s items;
+    /// the key table and the window are kept on their own).
+    pub fn keep_menu_settings(&mut self, s: &crate::pause::Settings) {
+        let o = &mut self.options;
+        o.subtitles = s.subtitles;
+        o.tutorials = s.tutorials;
+        o.autosave = s.autosave;
+        o.invert_pad = s.invert_pad;
+        o.pad_sensitivity = s.pad;
+        o.rumble = s.rumble;
+        o.brightness = s.brightness;
+        o.view_distance = s.view_distance;
+        o.sfx_volume = s.sfx;
+        o.music_volume = s.music;
+        o.dialog_volume = s.dialog;
+        o.video_detail = s.detail;
+        o.advanced_video = s.advanced;
+        self.camera.invert_y = s.invert_mouse;
+        self.camera.mouse_sensitivity = crate::pause::mouse_radians(s.mouse);
+        self.window.vsync = s.vsync;
+        self.window.wide = s.wide;
+    }
+
+    /// Writes the settings to the settings file ([`Config::default_path`]),
+    /// as the game saves its profile; `who` names the menu in the log.
+    pub fn save(&self, who: &str) {
+        let path = Self::default_path();
+        match std::fs::write(&path, self.to_toml()) {
+            Ok(()) => eprintln!("{who}: settings kept, saved to {}", path.display()),
+            Err(e) => eprintln!("{who}: could not save {}: {e}", path.display()),
+        }
     }
 
     /// Where to look for the settings file: the working directory, then
@@ -247,6 +319,37 @@ mod tests {
         assert!(smart.enabled);
         assert_eq!(smart.callout_range, 60.0);
         assert!(smart.flank, "the rest keep their defaults");
+    }
+
+    #[test]
+    fn the_menus_settings_round_trip_through_the_file() {
+        let mut config = Config::default();
+        let mut s = config.menu_settings();
+        assert_eq!(
+            s.mouse,
+            crate::pause::mouse_slider(config.camera.mouse_sensitivity)
+        );
+        (s.subtitles, s.vsync, s.music, s.view_distance) = (false, false, 30.0, 40.0);
+        (s.invert_mouse, s.pad, s.rumble, s.detail) = (true, 80.0, false, 1.0);
+        s.advanced[7] = 0.0;
+        config.keep_menu_settings(&s);
+        let back: Config = toml::from_str(&config.to_toml()).unwrap();
+        let again = back.menu_settings();
+        assert_eq!(
+            (
+                again.subtitles,
+                again.vsync,
+                again.music,
+                again.view_distance
+            ),
+            (false, false, 30.0, 40.0)
+        );
+        assert_eq!(
+            (again.invert_mouse, again.pad, again.rumble),
+            (true, 80.0, false)
+        );
+        assert_eq!((again.detail, again.advanced[7]), (1.0, 0.0));
+        assert!((again.mouse - s.mouse).abs() <= 1.0);
     }
 
     #[test]

@@ -205,6 +205,14 @@ impl Hud {
         state.pause = self.menu && self.shop.is_none();
         state.pause_settings = self.pause_settings.clone();
         state.pause_captured = std::mem::take(&mut self.pause_captured);
+        // The pause menu takes the mouse.
+        if state.pause {
+            let at = input.events.iter().rev().find_map(|e| match e {
+                egui::Event::PointerMoved(p) => Some(*p),
+                _ => None,
+            });
+            (state.pointer, state.clicks) = crate::gamehud::pointer_input(&input.events, at);
+        }
         let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
         state.messages.extend(game.message(message));
         state.blips = blips(info);
@@ -258,7 +266,7 @@ impl Hud {
         info: &HudInfo,
         size: (u32, u32),
         seconds: f64,
-        keys: &[i32],
+        (keys, clicks): (&[i32], &[(usize, [f32; 2])]),
         typed: bool,
         timeout: Duration,
     ) {
@@ -307,9 +315,24 @@ impl Hud {
             }
             // Held from half way to the last step (the PDA's map moves
             // while its keys are held).
+            state.pointer = None;
+            state.clicks.clear();
             state.keys = if typed {
                 const GAP: usize = 10;
                 match i.checked_sub(steps / 4) {
+                    // A click (key -1): the pointer there, then the
+                    // button down and up.
+                    Some(j) if j / GAP < keys.len() && keys[j / GAP] == -1 => {
+                        if let Some(&(_, p)) = clicks.iter().find(|(n, _)| *n == j / GAP)
+                            && j % GAP < 3
+                        {
+                            state.pointer = Some(p);
+                            if j % GAP > 0 {
+                                state.clicks.push(j % GAP == 1);
+                            }
+                        }
+                        Vec::new()
+                    }
                     Some(j) if j / GAP < keys.len() && j % GAP < 2 => {
                         vec![(keys[j / GAP], j % GAP == 0)]
                     }

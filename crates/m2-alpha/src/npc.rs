@@ -859,6 +859,8 @@ pub struct Npc {
     route_stall: f32,
     /// Got to the end of a route the scripts gave (for checking).
     reached: bool,
+    /// Got there, not yet told the scripts ([`People::take_route_ends`]).
+    ended: bool,
     /// On such a route, going over or through what stopped them to its
     /// next point ([`ROUTE_STALL`]).
     through: bool,
@@ -1009,6 +1011,7 @@ impl Npc {
             route_near: f32::INFINITY,
             route_stall: 0.0,
             reached: false,
+            ended: false,
             through: false,
             swim: None,
             climbing: 0.0,
@@ -1911,6 +1914,7 @@ impl Npc {
                 facing: self.facing,
             };
             self.reached = true;
+            self.ended = true;
         }
         match glide {
             Some(point) => {
@@ -2523,6 +2527,44 @@ impl People {
         true
     }
 
+    /// A soldier of the scripts' own, `guid` (template `template`, its own
+    /// model `model`), on foot at `at`: a soldier delivery's, set down by
+    /// `Ai.Deploy`. Brought into play the first time as a soldier of their
+    /// template's faction, running any route the scripts already gave
+    /// them ([`People::walk`]: an outpost's rushers); moved after. False
+    /// when their kind isn't in yet.
+    pub(crate) fn bring_scripted(
+        &mut self,
+        guid: u32,
+        template: &str,
+        model: Option<u32>,
+        at: Vec3,
+    ) -> bool {
+        if let Some(n) = self.npcs.iter_mut().find(|n| n.spawn == Some(guid)) {
+            n.character.position = at;
+            n.character.velocity = Vec3::ZERO;
+            return true;
+        }
+        let Some(kind) = self.rider_kind(template, model) else {
+            return false;
+        };
+        let brain = match self.routes.get(&guid) {
+            Some(route) => Brain::Route {
+                route: route.clone(),
+                next: 0,
+            },
+            None => Brain::Post { facing: 0.0 },
+        };
+        let mut n = Npc::new(kind, &self.kinds[kind].rig, at, 0.0, brain, Some(guid));
+        n.outfit = self.dress_as(kind, template);
+        n.soldier = true;
+        n.faction = faction_of(template);
+        n.gun = self.kinds[kind].gun;
+        eprintln!("people: the scripts' {template} ({guid:#x}) comes into play at {at:.1}");
+        self.npcs.push(n);
+        true
+    }
+
     /// The scripts' own `guid` ([`People::stand_scripted`]) is no longer
     /// on foot (back in a seat, or gone).
     pub(crate) fn unstand_scripted(&mut self, physics: &mut Physics, guid: u32) {
@@ -3036,6 +3078,18 @@ impl People {
             n.brain = Brain::Post { facing: n.facing };
         }
         eprintln!("people: the scripts put {entity:08x} at {at:.1}");
+    }
+
+    /// The people who got to the end of a route the scripts sent them
+    /// along since the last call: spawn entity, and where they stand. The
+    /// scripts hear their goal is done (an outpost's rushers at its flag).
+    pub fn take_route_ends(&mut self) -> Vec<(u32, Vec3)> {
+        self.npcs
+            .iter_mut()
+            .filter_map(|n| {
+                std::mem::take(&mut n.ended).then_some((n.spawn?, n.character.position))
+            })
+            .collect()
     }
 
     /// The scripts send the person of spawn `entity` along `route`

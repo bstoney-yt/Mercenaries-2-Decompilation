@@ -689,9 +689,35 @@ pub struct HudState {
     /// Keys and mouse buttons pressed while the pause menu's keyboard
     /// table waited for one ([`crate::pause::News::capture`]).
     pub pause_captured: Vec<crate::input::Control>,
+    /// The mouse pointer (screen points), while the menus show it, and the
+    /// left button going down (true) and up since the last frame: for the
+    /// menu movies' buttons (the front end's, the pause menu's).
+    pub pointer: Option<[f32; 2]>,
+    pub clicks: Vec<bool>,
     /// Her binoculars are up: what their screen shows
     /// ([`crate::binoculars`]).
     pub binoculars: Option<binoculars::View>,
+}
+
+/// The pointer (`at`, screen points) and the left button's presses (true)
+/// and releases among `events`, for the menu movies
+/// ([`HudState::pointer`]).
+pub fn pointer_input(
+    events: &[egui::Event],
+    at: Option<egui::Pos2>,
+) -> (Option<[f32; 2]>, Vec<bool>) {
+    let clicks = events
+        .iter()
+        .filter_map(|e| match e {
+            egui::Event::PointerButton {
+                button: egui::PointerButton::Primary,
+                pressed,
+                ..
+            } => Some(*pressed),
+            _ => None,
+        })
+        .collect();
+    (at.map(|p| [p.x, p.y]), clicks)
 }
 
 /// Flash's key code (the PC's virtual-key code) of `key`, for the keys
@@ -913,6 +939,8 @@ impl HudState {
         dialog_keys.extend(later.dialog_keys.iter().copied());
         let mut pause_captured = std::mem::take(&mut self.pause_captured);
         pause_captured.extend(later.pause_captured.iter().copied());
+        let mut clicks = std::mem::take(&mut self.clicks);
+        clicks.extend(later.clicks.iter().copied());
         hurts.extend(later.hurts.iter().copied());
         messages.extend(later.messages.iter().cloned());
         hud_calls.extend(later.hud_calls.iter().cloned());
@@ -926,6 +954,7 @@ impl HudState {
             buttons,
             dialog_keys,
             pause_captured,
+            clicks,
             ..later
         };
     }
@@ -1039,7 +1068,7 @@ enum Output {
         /// The mission's dialog boxes closed, each with the option picked.
         choices: Vec<(u64, i64)>,
         /// The front end's news (nothing for the HUD).
-        shell: ShellNews,
+        shell: Box<ShellNews>,
         /// The pause menu's (nothing for the front end).
         pause: Box<PauseOut>,
     },
@@ -1066,8 +1095,11 @@ pub struct ShellNews {
     /// A new game was started, as this character (`MrxGuiShellBootstrap.
     /// GetSelectedCharacter`: `Chris`, `Jen` or `mattias`).
     pub new_game: Option<String>,
-    /// The Resolution and Refresh Rate its video screen kept.
-    pub video: Option<crate::pause::Video>,
+    /// What its menus asked of the game: settings kept, a save to load
+    /// or delete, leaving ([`crate::shell::Native::take_news`]).
+    pub news: crate::pause::News,
+    /// The press-start screen is behind ([`crate::shell::Native::started`]).
+    pub started: bool,
 }
 
 /// What a [`GameHud`] thread runs.
@@ -1210,10 +1242,9 @@ impl GameHud {
         self.shell.new_game.take()
     }
 
-    /// The Resolution and Refresh Rate the front end's video screen kept,
-    /// once.
-    pub fn take_video(&mut self) -> Option<crate::pause::Video> {
-        self.shell.video.take()
+    /// What the front end's menus asked of the game since last taken.
+    pub fn take_shell_news(&mut self) -> crate::pause::News {
+        std::mem::take(&mut self.shell.news)
     }
 
     /// Logs to `path` instead of `m2-alpha-hud.log` (a second HUD in one
@@ -1344,7 +1375,7 @@ impl GameHud {
             } => {
                 self.callbacks.extend(callbacks);
                 self.choices.extend(choices);
-                let pause = *pause;
+                let (pause, shell) = (*pause, *shell);
                 self.pause_news.merge(pause.news);
                 self.pause_available = pause.available;
                 // Handed over already (a frame queued before it in this
@@ -1354,10 +1385,11 @@ impl GameHud {
                     return;
                 }
                 let new_game = self.shell.new_game.take().or(shell.new_game);
-                let video = shell.video.or(self.shell.video.take());
+                let mut news = std::mem::take(&mut self.shell.news);
+                news.merge(shell.news);
                 self.shell = ShellNews {
                     new_game,
-                    video,
+                    news,
                     ..shell
                 };
                 self.dropped_fanfare |= log.iter().any(|l| fanfare_failed(l));
@@ -2269,6 +2301,9 @@ impl Thread {
             self.pause_native.captured(c);
         }
         self.pause_calls(state, &mut log);
+        if self.pause_up() {
+            self.mouse(PAUSE_MOVIE, state, &mut log);
+        }
         self.play_flash(dt, &mut log);
         self.pause_answers(&mut log);
         let Some(screen) = gui_runtime::screen(self.mission.lua()) else {
@@ -2605,7 +2640,7 @@ impl Thread {
             log,
             callbacks,
             choices,
-            shell: ShellNews::default(),
+            shell: Box::default(),
             pause: Box::new(PauseOut {
                 news: self.pause_native.take_news(),
                 available: names.values().any(|n| n == PAUSE_LAYOUT),
@@ -2690,7 +2725,11 @@ impl Thread {
         // the keys it waits for itself.
         let mut calls = Vec::new();
         if self.flash.values().any(|m| m.swf == crate::shell::MOVIE) {
-            calls.extend(self.native.calls());
+            for &c in &state.pause_captured {
+                log.push(format!("shell: the keyboard table takes {c:?}"));
+                self.native.captured(c);
+            }
+            calls.extend(self.native.calls(&state.pause_settings));
             for &(code, down) in &state.keys {
                 if down {
                     calls.extend(self.native.key(code));
@@ -2707,6 +2746,7 @@ impl Thread {
                 m.rt.call(name, &args);
             }
         }
+        self.mouse(crate::shell::MOVIE, state, &mut log);
         self.play_flash(dt, &mut log);
         // `M2_SHELL_PROBE=x,y`: once a second, what covers that stage
         // point in the menu movie.
@@ -2743,9 +2783,16 @@ impl Thread {
         }
         let video = state.pause_settings.video;
         for (name, arg) in take_library_calls(self.mission.lua()) {
+            // As the pause menu's: which Aspect Ratio is the movie's own
+            // `videoWidescreen`.
+            if name == "LTIVideoSwitchMode"
+                && let Some(wide) = self.movie_bool(crate::shell::MOVIE, "videoWidescreen")
+            {
+                self.native.set_wide(wide);
+            }
             let answered = self
                 .native
-                .library(&name, video, &state.pause_settings.modes);
+                .library(&name, &arg, video, &state.pause_settings.modes);
             log.push(format!(
                 "shell: LTILibName.{name}({arg}){}",
                 if answered { "" } else { " not answered" }
@@ -2815,12 +2862,13 @@ impl Thread {
             log,
             callbacks: Vec::new(),
             choices: Vec::new(),
-            shell: ShellNews {
+            shell: Box::new(ShellNews {
                 movie,
                 under,
                 new_game,
-                video: self.native.take_video(),
-            },
+                news: self.native.take_news(),
+                started: self.native.started(),
+            }),
             pause: Box::default(),
         }
     }
@@ -2829,6 +2877,61 @@ impl Thread {
     /// scripts set (`SetFlashSwfFile`, again on `RestartFlash`), hands
     /// them the scripts' calls (`CallActionScriptCallback`), steps those
     /// not paused, and hands their `fscommand`s back to the scripts.
+    /// The mouse, to the menu movie `swf` (as Scaleform passes it on):
+    /// the pointer from the screen to its stage, through the box it was
+    /// last drawn in, then the left button's presses and releases.
+    fn mouse(&mut self, swf: &str, state: &HudState, log: &mut Vec<String>) {
+        let Some(m) = self.flash.values_mut().find(|m| m.swf == swf) else {
+            return;
+        };
+        let Some(r) = m.drawn.get() else {
+            return;
+        };
+        let [w, h] = m.rt.player.lib.size;
+        let (bw, bh) = (r[2] - r[0], r[3] - r[1]);
+        if bw <= 0.0 || bh <= 0.0 {
+            return;
+        }
+        if let Some(p) = state.pointer {
+            let at = [(p[0] - r[0]) * w / bw, (p[1] - r[1]) * h / bh];
+            m.rt.mouse_move(at);
+        }
+        for &down in &state.clicks {
+            let at = m.rt.avm.mouse;
+            log.push(format!(
+                "{swf}: mouse {} at [{:.0}, {:.0}], over {:?}",
+                if down { "down" } else { "up" },
+                at[0],
+                at[1],
+                m.rt.button_at(at)
+                    .map(|b| flash::avm1::target_path(&m.rt.player, b))
+            ));
+            // `M2_MOUSE_TRACE`: the buttons there are, when a press finds
+            // none under the pointer.
+            if down && m.rt.button_at(at).is_none() && std::env::var_os("M2_MOUSE_TRACE").is_some()
+            {
+                for (path, shown, b) in m.rt.buttons() {
+                    log.push(format!("  button {path} shown {shown} box {b:?}"));
+                }
+            }
+            if down {
+                m.rt.mouse_down();
+            } else {
+                m.rt.mouse_up();
+            }
+        }
+    }
+
+    /// The variable `name` on movie `swf`'s root, if it is a boolean.
+    fn movie_bool(&mut self, swf: &str, name: &str) -> Option<bool> {
+        let m = self.flash.values_mut().find(|m| m.swf == swf)?;
+        let root = flash::avm1::Value::Object(m.rt.avm.clip_object(m.rt.player.root));
+        match m.rt.avm.get(&mut m.rt.player, &root, name) {
+            flash::avm1::Value::Bool(b) => Some(b),
+            _ => None,
+        }
+    }
+
     /// A fanfare movie is playing (`fanfare_mission`...).
     fn fanfare_up(&self) -> bool {
         self.flash.values().any(|m| m.swf.contains("fanfare"))
@@ -2870,6 +2973,14 @@ impl Thread {
     /// pause movie's commands no script heard, for the engine.
     fn pause_answers(&mut self, log: &mut Vec<String>) {
         for (name, arg) in take_library_calls(self.mission.lua()) {
+            // Its Aspect Ratio says only that it switched (as the item is
+            // clicked, and again as the changes are kept): which it is
+            // now is the movie's own `videoModeVar`.
+            if name == "LTIVideoSwitchMode"
+                && let Some(wide) = self.movie_bool(PAUSE_MOVIE, "videoModeVar")
+            {
+                self.pause_native.set_wide(wide);
+            }
             let answered = self.pause_native.library(&name, &arg);
             log.push(format!(
                 "pause: LTILibName.{name}({arg}){}",
@@ -2972,6 +3083,7 @@ impl Thread {
                     seen: None,
                     since_status: f64::INFINITY,
                     levels: Vec::new(),
+                    drawn: std::cell::Cell::new(None),
                 },
             );
         }
@@ -3121,7 +3233,12 @@ impl Thread {
                 Some((r, fit)) => {
                     let mut out = Vec::new();
                     let mut want = Vec::new();
-                    flash_prims(m, &movies, r, fit, &mut out, &mut want);
+                    let r = if fit {
+                        show_all(r, m.rt.player.lib.size)
+                    } else {
+                        r
+                    };
+                    flash_prims(m, &movies, r, &mut out, &mut want);
                     out.len()
                 }
                 None => 0,
@@ -4039,7 +4156,13 @@ impl Thread {
                     // across (the PC footage: its 850 x 720 stage spans
                     // the 1280 x 720 picture, 1.5 times wider than high).
                     let fit = *fullscreen && m.swf != PAUSE_MOVIE;
-                    flash_prims(m, &self.movies.borrow(), *rect, fit, out, want);
+                    let rect = if fit {
+                        show_all(*rect, m.rt.player.lib.size)
+                    } else {
+                        *rect
+                    };
+                    m.drawn.set(Some(rect));
+                    flash_prims(m, &self.movies.borrow(), rect, out, want);
                 }
             }
             // Not drawn yet (see the module docs).
@@ -4473,6 +4596,9 @@ struct FlashMovie {
     /// The movies on other levels, by their roots, as last seen: one
     /// loaded (topbar's map) needs the PDA's blips again.
     levels: Vec<(i32, flash::ClipId)>,
+    /// The box its stage was last drawn in (screen points): where the
+    /// mouse is on it ([`GameHud::mouse`]).
+    drawn: std::cell::Cell<Option<[f32; 4]>>,
 }
 
 /// A movie's state, once a second while it plays: its root's frame,
@@ -4581,14 +4707,13 @@ fn movie_name(file: &str) -> String {
 
 /// A movie's triangles stretched over the widget's box `rect` (screen
 /// points), as Scaleform fits a movie to its widget; each a quad with its
-/// last corner doubled. A `fit` movie (a fullscreen widget's, `rect` the
-/// whole screen) keeps its stage's shape, centred, as Scaleform's default
-/// "show all" scale mode does.
+/// last corner doubled. A fullscreen widget's movie (but the pause menu's)
+/// is drawn in [`show_all`]'s box, keeping its stage's shape, centred, as
+/// Scaleform's default "show all" scale mode does.
 fn flash_prims(
     m: &FlashMovie,
     movies: &Movies,
     rect: [f32; 4],
-    fit: bool,
     out: &mut Vec<Prim>,
     want: &mut Vec<u32>,
 ) {
@@ -4596,7 +4721,6 @@ fn flash_prims(
     if mw <= 0.0 || mh <= 0.0 {
         return;
     }
-    let rect = if fit { show_all(rect, [mw, mh]) } else { rect };
     let matrix = flash::Matrix {
         a: (rect[2] - rect[0]) / mw,
         b: 0.0,
@@ -6064,7 +6188,7 @@ mod paint_tests {
             log: log.iter().map(|l| (*l).to_owned()).collect(),
             callbacks: Vec::new(),
             choices: Vec::new(),
-            shell: ShellNews::default(),
+            shell: Box::default(),
             pause: Box::default(),
         }
     }

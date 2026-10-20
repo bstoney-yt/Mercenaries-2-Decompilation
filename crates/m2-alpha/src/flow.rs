@@ -76,18 +76,21 @@ pub struct Flow {
     shell_keys: Vec<(i32, bool)>,
     /// The box the backdrop up plays in, when the shell put it there.
     backdrop: Option<[f32; 4]>,
-    /// How the window is shown and the monitor's modes, for the shell's
-    /// video screen ([`Flow::window`]).
-    window: Option<(crate::pause::Video, Vec<crate::pause::Mode>)>,
-    /// The Resolution and Refresh Rate that screen kept, not yet taken.
-    video: Option<crate::pause::Video>,
+    /// The player's settings and saves for the shell's option screens and
+    /// save list, with the window as it is and the monitor's modes
+    /// ([`Flow::settings`], [`Flow::window`]).
+    settings: Option<crate::pause::Settings>,
+    /// Keys and buttons for the shell's keyboard table, waiting for one.
+    captured: Vec<crate::input::Control>,
+    /// What the shell's menus asked of the game, not yet taken.
+    news: crate::pause::News,
 }
 
 impl Flow {
-    /// Starts with the boot movies, or (`boot` false) straight in play;
-    /// the front end offers `hero` first; `subtitles` is the player's
-    /// option.
-    pub fn new(install: Install, boot: bool, hero: Hero, subtitles: bool) -> Self {
+    /// Starts with the boot movies (`movies`; else straight at the front
+    /// end), or (`boot` false) straight in play; the front end offers
+    /// `hero` first; `subtitles` is the player's option.
+    pub fn new(install: Install, boot: bool, movies: bool, hero: Hero, subtitles: bool) -> Self {
         let ffmpeg = crate::movie::ffmpeg();
         match &ffmpeg {
             Some(p) => eprintln!("movies: decoding with {}", p.display()),
@@ -99,7 +102,7 @@ impl Flow {
             stage: if boot { Stage::Boot } else { Stage::Game },
             install,
             ffmpeg,
-            boot: if boot {
+            boot: if boot && movies {
                 BOOT_MOVIES.into_iter().collect()
             } else {
                 VecDeque::new()
@@ -118,8 +121,9 @@ impl Flow {
             shell: None,
             shell_keys: Vec::new(),
             backdrop: None,
-            window: None,
-            video: None,
+            settings: None,
+            captured: Vec::new(),
+            news: crate::pause::News::default(),
         }
     }
 
@@ -129,25 +133,36 @@ impl Flow {
         self.stage != Stage::Game || self.movie.is_some()
     }
 
-    /// Whether the front end's menus want the window's modes
-    /// ([`Flow::window`]): up, and not yet told.
-    pub fn wants_window(&self) -> bool {
-        self.stage == Stage::FrontEnd && self.window.is_none()
+    /// Whether the front end's menus want the player's settings
+    /// ([`Flow::settings`]): up, and not yet told.
+    pub fn wants_settings(&self) -> bool {
+        self.stage == Stage::FrontEnd && self.settings.is_none()
     }
 
-    /// How the window is shown (`video`) and the modes its monitor offers,
-    /// for the front end's video screen.
-    pub fn window(&mut self, video: crate::pause::Video, modes: Option<Vec<crate::pause::Mode>>) {
-        let modes = modes
-            .or_else(|| self.window.take().map(|(_, m)| m))
-            .unwrap_or_default();
-        self.window = Some((video, modes));
+    /// The player's settings and saves (with the monitor's modes), for
+    /// the front end's option screens and save list.
+    pub fn settings(&mut self, settings: crate::pause::Settings) {
+        self.settings = Some(settings);
     }
 
-    /// The Resolution and Refresh Rate the front end's video screen kept,
-    /// once.
-    pub fn take_video(&mut self) -> Option<crate::pause::Video> {
-        self.video.take()
+    /// How the window is shown now, for the front end's video screen.
+    pub fn window(&mut self, video: crate::pause::Video) {
+        if let Some(s) = &mut self.settings {
+            s.video = video;
+        }
+    }
+
+    /// A key or button for the front end's keyboard table, which waits
+    /// for one (its news said so: [`crate::pause::News::capture`]).
+    pub fn captured(&mut self, control: crate::input::Control) {
+        self.captured.push(control);
+    }
+
+    /// What the front end's menus asked of the game since last taken:
+    /// settings kept, a save to load (play starts from it) or delete,
+    /// leaving.
+    pub fn take_news(&mut self) -> crate::pause::News {
+        std::mem::take(&mut self.news)
     }
 
     /// The hero a new game was started as in the front end, once.
@@ -260,8 +275,18 @@ impl Flow {
                 if let Some(shell) = &mut self.shell
                     && shell.ready()
                 {
-                    if let Some(v) = shell.take_video() {
-                        self.video = Some(v);
+                    let news = shell.take_shell_news();
+                    let load = news.continue_game || news.load.is_some();
+                    self.news.merge(news);
+                    if load {
+                        // The scripts have left their menus for a save:
+                        // play starts from it (the game's hero is the
+                        // save's, set as it is taken).
+                        self.shell = None;
+                        self.close(mixer);
+                        self.stage = Stage::Game;
+                        eprintln!("flow: the shell loads a save");
+                        return;
                     }
                     if let Some(who) = shell.take_new_game() {
                         // The scripts have left their menus: a character
@@ -411,10 +436,14 @@ impl Flow {
                 keys: std::mem::take(&mut self.shell_keys),
                 ..HudState::default()
             };
-            if let Some((video, modes)) = &self.window {
-                state.pause_settings.video = *video;
-                state.pause_settings.modes = modes.clone();
+            if let Some(settings) = &self.settings {
+                state.pause_settings = settings.clone();
             }
+            state.pause_captured = std::mem::take(&mut self.captured);
+            // The menus take the mouse too.
+            (state.pointer, state.clicks) = ui
+                .ctx()
+                .input(|i| crate::gamehud::pointer_input(&i.events, i.pointer.latest_pos()));
             s.update(ui.ctx(), state);
         } else if let Some(s) = &mut self.shell {
             // Loading: told the size, so it draws once it is up.

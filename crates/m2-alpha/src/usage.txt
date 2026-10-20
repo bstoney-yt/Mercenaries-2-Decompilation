@@ -21,6 +21,12 @@ m2-alpha [options]
                          has run (the default; --skip-mode-off is still
                          taken). Left on, the flow skips its fades and the
                          move into the PMC HQ
+  --skip-to <id>[,briefing]
+                         with --mission: skip the story to this contract
+                         (GurCon053, PirCon001...) as the game's developer
+                         switch does: the flow completes each story
+                         contract it unlocks before it, then this one
+                         starts as in play (at its briefing with ,briefing)
   --movies               with --mission --screenshot: the scripts' movies
                          wait; each is decoded offscreen and pictured
                          (<out>-movie-<name>.ppm)
@@ -30,6 +36,10 @@ m2-alpha [options]
   --shell-key <code>     a Flash key code pressed in --front-end (13 Enter,
                          37/39 left/right, 38/40 up/down, 27 Escape;
                          0 presses nothing)
+  --to-front-end         start at the front end, without the boot movies
+                         (what the pause menu's Quit starts again with)
+  --shell-click <x,y>    a left click there (screen pixels) in --front-end,
+                         in its turn among the --shell-keys
   --after-contract <s>   with --mission --autoplay --screenshot: play on
                          this long after the contract is done, logging
                          where she is (Enter pressed every 4 s)
@@ -163,6 +173,8 @@ m2-alpha [options]
   --pda                  with --screenshot: the picture with her PDA open
   --binoculars <zoom>    with --screenshot: the picture through her
                          binoculars at zoom 1..7, their screen up
+  --pda-click <x,y>      a left click there (screen pixels) among the
+                         --pda-keys typed into the pause menu
   --pause                with --screenshot: the picture with the game's
                          pause menu open, --pda-key's keys typed into it
                          one by one (a third of a second apart)
@@ -186,6 +198,14 @@ m2-alpha [options]
   --mission-driver <lua> Lua to run before the scripts start, to test them
                          (crates/m2-game/examples/drivers/vzacon001.lua
                          plays the first contract); repeatable
+  --load <save.toml>     start from a save rather than a new game: her place
+                         and the world's wrecks, and with --mission the
+                         scripts' own data (the contracts done and on offer,
+                         her PMC, the factions), as loading it in play does
+  --load-at <seconds>    load the player's own save that far into play, as
+                         the pause menu does (a test of loading in play)
+  --save-to <save.toml>  with --screenshot, write a save there once the run
+                         ends, as the pause menu's Save does
   --hijack-crew <name>   every hijackable vehicle without a driver is
                          driven by this human template, to test hijacking
                          (I/K/J/L are the pad's Y/A/X/B; the movement
