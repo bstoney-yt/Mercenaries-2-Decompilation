@@ -123,7 +123,19 @@ pub struct WindowConfig {
     /// The video screen's Aspect Ratio: wide, or 4:3 (the world seen as
     /// on a 4:3 screen, filling the window).
     pub wide: bool,
+    /// The world drawn at this share of the window's size (0.25 to 1) and
+    /// stretched to it; the HUD keeps the window's. Invented: 1 on the
+    /// desktop, 0.6 on Android, where drawing every pixel of a phone's
+    /// screen held play under 10 fps (an Adreno 830 at 2244x1080).
+    pub render_scale: f32,
 }
+
+/// [`WindowConfig::render_scale`]'s default.
+pub const RENDER_SCALE: f32 = if cfg!(target_os = "android") {
+    0.6
+} else {
+    1.0
+};
 
 impl Default for WindowConfig {
     fn default() -> Self {
@@ -134,6 +146,7 @@ impl Default for WindowConfig {
             refresh: 0,
             vsync: true,
             wide: true,
+            render_scale: RENDER_SCALE,
         }
     }
 }

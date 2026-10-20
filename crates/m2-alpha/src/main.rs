@@ -6749,6 +6749,13 @@ impl App {
             WgpuBackend::for_window(window.clone(), size.width, size.height, w.vsync)?;
         let adapter = backend.adapter_summary();
         eprintln!("adapter: {adapter:?}");
+        backend.set_render_scale(w.render_scale);
+        if w.render_scale < 1.0 {
+            eprintln!(
+                "render scale: the world drawn at {:.2} of the window",
+                w.render_scale
+            );
+        }
         let mut game = build_scene(
             &mut backend,
             self.install.as_ref(),

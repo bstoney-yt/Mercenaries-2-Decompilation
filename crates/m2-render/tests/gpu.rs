@@ -118,6 +118,20 @@ fn clears_to_the_sky_colour() {
 }
 
 #[test]
+fn a_world_drawn_at_half_scale_fills_the_whole_frame() {
+    let Some(mut b) = backend() else { return };
+    b.set_render_scale(0.5);
+    b.begin_frame(&view()).unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    // The window's size still, the sky stretched to every corner.
+    assert_eq!(rgba.len(), (SIZE * SIZE * 4) as usize);
+    for (x, y) in [(1, 1), (SIZE - 2, 1), (1, SIZE - 2), (SIZE - 2, SIZE - 2)] {
+        assert_eq!(pixel(&rgba, x, y), [0, 0, 255, 255], "({x}, {y})");
+    }
+}
+
+#[test]
 fn draws_a_textured_unlit_quad() {
     let Some(mut b) = backend() else { return };
     let (vb, ib) = quad(&mut b);

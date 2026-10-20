@@ -409,6 +409,10 @@ pub struct WgpuBackend {
     target: Target,
     width: u32,
     height: u32,
+    /// The world's drawing size as a share of the window's (1: all of
+    /// it): the world and its post passes draw that much smaller and are
+    /// stretched to the window ([`set_render_scale`](Self::set_render_scale)).
+    scale: f32,
     depth: DepthTargets,
     scene_layout: wgpu::BindGroupLayout,
 
@@ -947,6 +951,7 @@ impl WgpuBackend {
             target,
             width,
             height,
+            scale: 1.0,
             depth,
             scene_layout,
             draw_layout,
@@ -1268,13 +1273,37 @@ impl WgpuBackend {
         }
         self.width = width;
         self.height = height;
-        self.depth = Self::depth_targets(&self.device, &self.scene_layout, width, height);
-        self.post.resize(&self.device, width, height);
+        self.size_world();
         if let Target::Window { surface, config } = &mut self.target {
             config.width = width;
             config.height = height;
             surface.configure(&self.device, config);
         }
+    }
+
+    /// Draws the world at `scale` (0.25 to 1) of the window's size, as a
+    /// phone needs: the world's passes and its post passes run on that
+    /// many fewer pixels and the last pass stretches them to the window
+    /// (it samples by position, filtered). The HUD stays sharp.
+    pub fn set_render_scale(&mut self, scale: f32) {
+        let scale = scale.clamp(0.25, 1.0);
+        if scale != self.scale {
+            self.scale = scale;
+            self.size_world();
+        }
+    }
+
+    /// The world's drawing size: the window's at the render scale.
+    fn world_size(&self) -> (u32, u32) {
+        let scaled = |n: u32| ((n as f32 * self.scale).round() as u32).max(1);
+        (scaled(self.width), scaled(self.height))
+    }
+
+    /// Remakes the world's targets at [`Self::world_size`].
+    fn size_world(&mut self) {
+        let (w, h) = self.world_size();
+        self.depth = Self::depth_targets(&self.device, &self.scene_layout, w, h);
+        self.post.resize(&self.device, w, h);
     }
 
     /// Switches vertical sync (window targets only).

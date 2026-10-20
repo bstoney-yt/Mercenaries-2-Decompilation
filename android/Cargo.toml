@@ -57,6 +57,8 @@ package = "com.bstoney.m2alpha"
 apk_name = "Mercenaries2Alpha"
 build_targets = ["aarch64-linux-android"]
 strip = "strip"
+# The launcher icon (res/mipmap-*): drawn for the alpha, not the game's art.
+resources = "res"
 
 [package.metadata.android.sdk]
 # Old enough for any Vulkan phone; new enough for pointer capture.
@@ -65,6 +67,7 @@ target_sdk_version = 34
 
 [package.metadata.android.application]
 label = "Mercenaries 2 Alpha"
+icon = "@mipmap/ic_launcher"
 
 [package.metadata.android.application.activity]
 orientation = "landscape"

@@ -67,6 +67,9 @@ fn android_main(app: AndroidApp) {
         }
     }
     super::keep_crash_reports();
+    // Textures a mip smaller than the desktop's: a quarter of the memory
+    // and memory traffic, which a phone runs short of first.
+    m2_engine::model::set_texture_drop(1);
     eprintln!("all files access: {access:?}");
     match &found {
         Some(dir) => eprintln!("game found in {}", dir.display()),
