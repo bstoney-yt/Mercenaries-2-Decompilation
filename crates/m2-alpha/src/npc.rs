@@ -42,7 +42,7 @@
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::tuning::HandGun;
-use m2_engine::weapons::FireHint;
+use m2_engine::weapons::{FireHint, NpcLauncher};
 use m2_engine::world::{SpawnPoint, is_walker};
 use m2_engine::{AiProfile, BoundClip, Character, Gait, GpuModel, Physics, RagdollId};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
@@ -119,7 +119,11 @@ const STAND_IN: FireHint = FireHint {
     off: 9.0,
     on_close: 0.8,
     off_close: 1.5,
+    against: [3, 1, 0, 0],
 };
+/// The least pause between a soldier's rockets, seconds, where his
+/// launcher's `BurstOffLength` is shorter (invented).
+const LAUNCHER_GAP: f32 = 4.0;
 /// Each pause is this much longer or shorter at random, so soldiers who
 /// see her together don't fire together (invented).
 const PAUSE_JITTER: f32 = 0.25;
@@ -226,6 +230,9 @@ pub(crate) enum Brain {
     /// Sent along a path by the scripts (`Ai.Goal` `PathMove`, `MoveTo`):
     /// running to point `next`, then at a post at its end.
     Route { route: Vec<Vec3>, next: usize },
+    /// Following her (`Ai.Role` `Follow`: a VIP being delivered): running
+    /// to her while further than `near` metres, else standing.
+    Follow { near: f32 },
 }
 
 /// A clip carrying an event: its index, when in it the event comes, and
@@ -758,6 +765,15 @@ pub struct Npc {
     /// The gun their template hands them (`None`: the AK47's "Assault
     /// Rifle" stands in): what they draw, and how fast and hard it fires.
     pub gun: Option<HandGun>,
+    /// A launcher their template hands them as well (the AT soldiers'):
+    /// they reach for it when it rates what she is in higher than their
+    /// gun does ([`Npc::fight`]).
+    pub launcher: Option<NpcLauncher>,
+    /// Set by a tick when a soldier fires his launcher; the fight takes
+    /// the shot ([`crate::combat`]).
+    pub launches: bool,
+    /// Seconds before he fires his launcher again.
+    launcher_wait: f32,
     pub hp: f32,
     /// The health they started with (their template's for a soldier, 100
     /// for a civilian): the HUD's target arc shows a share of it.
@@ -791,6 +807,9 @@ pub struct Npc {
     grenade_wait: f32,
     /// The smarter soldiers' settings (off: the original's).
     pub smart: SmarterAi,
+    /// The armour class of what she is in (`ObjectHint`'s `Armor`, 1 to
+    /// 4; 1 on foot), from [`People::target_armour`].
+    pub target_armour: u32,
     /// Saw her this tick for the first time in the fight (smarter: he
     /// calls it out).
     spotted: bool,
@@ -843,6 +862,10 @@ pub struct Npc {
     route_stall: f32,
     /// Got to the end of a route the scripts gave (for checking).
     reached: bool,
+    /// Where the one they follow is ([`Brain::Follow`]).
+    follow_to: Vec3,
+    /// Got there, not yet told the scripts ([`People::take_route_ends`]).
+    ended: bool,
     /// On such a route, going over or through what stopped them to its
     /// next point ([`ROUTE_STALL`]).
     through: bool,
@@ -957,6 +980,9 @@ impl Npc {
             hurt_by_her: false,
             reported_dead: false,
             gun: None,
+            launcher: None,
+            launches: false,
+            launcher_wait: 0.0,
             hp: 100.0,
             most_hp: 100.0,
             alive: true,
@@ -974,6 +1000,7 @@ impl Npc {
             outfit: Vec::new(),
             grenade_wait: 0.0,
             smart: SmarterAi::default(),
+            target_armour: 1,
             spotted: false,
             cover: None,
             hit: false,
@@ -989,6 +1016,8 @@ impl Npc {
             route_near: f32::INFINITY,
             route_stall: 0.0,
             reached: false,
+            follow_to: Vec3::ZERO,
+            ended: false,
             through: false,
             swim: None,
             climbing: 0.0,
@@ -1504,8 +1533,25 @@ impl Npc {
             self.rig.aim_along(self.facing, Some(threat - self.chest()));
         }
         self.cooldown -= dt;
+        self.launcher_wait -= dt;
         let hint = self.fire_hint();
-        if seen
+        // His launcher, when it rates what she is in higher than his gun
+        // does (an AT rocket's 3 against a tank's class, the rifle's 0),
+        // within its range, once its pause since the last is out.
+        if let Some(l) = self.launcher.filter(|_| self.reaches_for_launcher()) {
+            if seen
+                && off < FIRE_ARC
+                && self.launcher_wait <= 0.0
+                && distance < l.hint.range
+                && distance >= l.hint.min_range
+            {
+                self.launches = true;
+                self.since_shot = 0.0;
+                let pause = l.hint.off.max(LAUNCHER_GAP);
+                self.launcher_wait = pause * rng.range(1.0 - PAUSE_JITTER, 1.0 + PAUSE_JITTER);
+            }
+        } else if seen
+            && self.rates_target()
             && self.cooldown <= 0.0
             && off < FIRE_ARC
             && distance < hint.range
@@ -1538,6 +1584,23 @@ impl Npc {
         self.gun
             .filter(|g| g.rate_of_fire > 0.0)
             .map_or(BURST_GAP, |g| 60.0 / g.rate_of_fire)
+    }
+
+    /// Whether his gun is any use against what she is in: its
+    /// `WeaponHint` rating for her armour class is above 0 (a rifle's 0
+    /// against an APC or a tank; inferred from the ratings' names and
+    /// values, gap-list sweep). He still faces and aims at her.
+    pub fn rates_target(&self) -> bool {
+        let class = self.target_armour.clamp(1, 4) as usize - 1;
+        self.fire_hint().against[class] > 0
+    }
+
+    /// Whether he fires his launcher rather than his gun at what she is
+    /// in: it rates her armour class higher than the gun does.
+    pub fn reaches_for_launcher(&self) -> bool {
+        let class = self.target_armour.clamp(1, 4) as usize - 1;
+        self.launcher
+            .is_some_and(|l| l.hint.against[class] > self.fire_hint().against[class])
     }
 
     /// How he fires his gun: its `WeaponHint`, else the "Assault
@@ -1655,6 +1718,7 @@ impl Npc {
             Brain::Wander { wait, .. } if *wait > 0.0 => "pausing",
             Brain::Wander { .. } => "strolling",
             Brain::Route { .. } => "running where the scripts sent them",
+            Brain::Follow { .. } => "following her",
         }
     }
 
@@ -1811,6 +1875,17 @@ impl Npc {
                     }
                 }
             }
+            Brain::Follow { near } => {
+                let flat = (self.follow_to - at).with_y(0.0);
+                // Not off a ledge after her (the VIP on ChiCon001's roof
+                // died of it): they stop where the ground a step ahead
+                // falls away (invented).
+                let ahead = at + flat.normalize_or_zero() * 1.0 + Vec3::Y;
+                let drop = physics.cast_ray(ahead, -Vec3::Y, LEDGE + 1.0).is_none();
+                if flat.length() > *near && !drop {
+                    wanted = flat.normalize() * FLEE;
+                }
+            }
             Brain::Route { route, next } => {
                 let point = route[*next];
                 let flat = (point - at).with_y(0.0);
@@ -1857,6 +1932,7 @@ impl Npc {
                 facing: self.facing,
             };
             self.reached = true;
+            self.ended = true;
         }
         match glide {
             Some(point) => {
@@ -1896,7 +1972,7 @@ impl Npc {
                     *wait = 1.0;
                 }
                 (None, Brain::Patrol { wait, .. }) => *wait = 1.0,
-                (None, Brain::Post { .. } | Brain::Route { .. }) => {}
+                (None, Brain::Post { .. } | Brain::Route { .. } | Brain::Follow { .. }) => {}
             }
         }
         if wanted.length_squared() > 0.01 {
@@ -1925,6 +2001,9 @@ impl Npc {
         self.rig.advance(dt * rate);
     }
 }
+
+/// A follower keeps off a drop deeper than this (metres).
+const LEDGE: f32 = 3.0;
 
 /// Everyone on the island but the player.
 #[derive(Debug, Default)]
@@ -1963,6 +2042,12 @@ pub struct People {
     /// Where the scripts last sent people ([`People::walk`]), by spawn
     /// entity.
     routes: HashMap<u32, Vec<Vec3>>,
+    /// Those the scripts have following her, by spawn entity, and how near
+    /// they keep ([`People::follow`]).
+    following: HashMap<u32, f32>,
+    /// Followers riding her vehicle (`Vehicle.Enter` by `MrxFollow`): out
+    /// of play until they get out ([`People::board`]).
+    aboard: HashSet<u32>,
     active: HashSet<u32>,
     /// Spawners sending from a list, by entity: their `SecondsPerCycle`
     /// (filled on first use).
@@ -1975,6 +2060,12 @@ pub struct People {
     rng: Rng,
     /// The enhanced, smarter soldiers' settings (off: the original's).
     pub smarter: SmarterAi,
+    /// The armour class of what she is in, 1 to 4 (`ObjectHint`'s
+    /// `Armor`: 1 on foot or in a car, 2 a helicopter or a light truck, 3
+    /// the APCs, 4 the tanks): a soldier whose gun's `WeaponHint` rates it
+    /// 0 against that class holds his fire ([`Npc::rates_target`]). 0
+    /// (unset) is taken as 1.
+    pub target_armour: u32,
     /// What soldiers near her have been at (for checking).
     pub idle: IdleTally,
     /// What shouldn't happen to anyone (for checking).
@@ -2463,6 +2554,45 @@ impl People {
         true
     }
 
+    /// A soldier of the scripts' own, `guid` (template `template`, its own
+    /// model `model`), on foot at `at`: a soldier delivery's, set down by
+    /// `Ai.Deploy`. Brought into play the first time as a soldier of their
+    /// template's faction, running any route the scripts already gave
+    /// them ([`People::walk`]: an outpost's rushers); moved after. False
+    /// when their kind isn't in yet.
+    pub(crate) fn bring_scripted(
+        &mut self,
+        guid: u32,
+        template: &str,
+        model: Option<u32>,
+        at: Vec3,
+    ) -> bool {
+        if let Some(n) = self.npcs.iter_mut().find(|n| n.spawn == Some(guid)) {
+            n.character.position = at;
+            n.character.velocity = Vec3::ZERO;
+            return true;
+        }
+        let Some(kind) = self.rider_kind(template, model) else {
+            return false;
+        };
+        let brain = match (self.following.get(&guid), self.routes.get(&guid)) {
+            (Some(&near), _) => Brain::Follow { near },
+            (None, Some(route)) => Brain::Route {
+                route: route.clone(),
+                next: 0,
+            },
+            (None, None) => Brain::Post { facing: 0.0 },
+        };
+        let mut n = Npc::new(kind, &self.kinds[kind].rig, at, 0.0, brain, Some(guid));
+        n.outfit = self.dress_as(kind, template);
+        n.soldier = true;
+        n.faction = faction_of(template);
+        n.gun = self.kinds[kind].gun;
+        eprintln!("people: the scripts' {template} ({guid:#x}) comes into play at {at:.1}");
+        self.npcs.push(n);
+        true
+    }
+
     /// The scripts' own `guid` ([`People::stand_scripted`]) is no longer
     /// on foot (back in a seat, or gone).
     pub(crate) fn unstand_scripted(&mut self, physics: &mut Physics, guid: u32) {
@@ -2651,7 +2781,8 @@ impl People {
     fn who(&mut self, s: &SpawnPoint, target: bool) -> Who {
         let names = [s.template.as_deref(), Some(s.name.as_str())];
         if let (Some(template), Some(model)) = (s.template.as_deref(), s.model) {
-            if left_out(s, target) {
+            // One the scripts have following her (a VIP released) stands.
+            if left_out(s, target) && !self.following.contains_key(&s.entity) {
                 return Who::Nobody;
             }
             let fights = target
@@ -2794,9 +2925,13 @@ impl People {
         self.pursue(dt);
         self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
+        for n in &mut self.npcs {
+            n.follow_to = focus;
+        }
         let mut callouts = Vec::new();
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
+            npc.target_armour = self.target_armour.max(1);
             npc.rammed = (npc.rammed - dt).max(0.0);
             let facing = npc.facing;
             npc.update(physics, &mut self.rng, threat, dt);
@@ -2977,6 +3112,118 @@ impl People {
         eprintln!("people: the scripts put {entity:08x} at {at:.1}");
     }
 
+    /// The people who got to the end of a route the scripts sent them
+    /// along since the last call: spawn entity, and where they stand. The
+    /// scripts hear their goal is done (an outpost's rushers at its flag).
+    pub fn take_route_ends(&mut self) -> Vec<(u32, Vec3)> {
+        self.npcs
+            .iter_mut()
+            .filter_map(|n| {
+                std::mem::take(&mut n.ended).then_some((n.spawn?, n.character.position))
+            })
+            .collect()
+    }
+
+    /// The scripts have the person of spawn `entity` follow her, keeping
+    /// within `near` metres (`Ai.Role` `Follow`), or stop (`None`: another
+    /// role). One not yet in play follows once they come.
+    pub fn follow(&mut self, entity: u32, near: Option<f32>) {
+        match near {
+            Some(near) => {
+                self.following.insert(entity, near);
+            }
+            None => {
+                self.following.remove(&entity);
+            }
+        }
+        for n in self.npcs.iter_mut().filter(|n| n.spawn == Some(entity)) {
+            n.flee = None;
+            n.brain = match near {
+                Some(near) => Brain::Follow { near },
+                None => Brain::Post { facing: n.facing },
+            };
+        }
+        eprintln!(
+            "people: {entity:08x} {}",
+            if near.is_some() {
+                "follows her"
+            } else {
+                "stops following her"
+            }
+        );
+    }
+
+    /// Those following her in play within `reach` metres (flat) of `at`,
+    /// by spawn entity.
+    pub fn followers_within(&self, at: Vec3, reach: f32) -> Vec<u32> {
+        self.npcs
+            .iter()
+            .filter(|n| n.alive && matches!(n.brain, Brain::Follow { .. }))
+            .filter(|n| n.character.position.with_y(0.0).distance(at.with_y(0.0)) <= reach)
+            .filter_map(|n| n.spawn)
+            .collect()
+    }
+
+    /// Those riding a vehicle out of play ([`People::board`]).
+    pub fn aboard(&self) -> Vec<u32> {
+        self.aboard.iter().copied().collect()
+    }
+
+    /// Where those following her are.
+    pub fn followers(&self) -> Vec<Vec3> {
+        self.npcs
+            .iter()
+            .filter(|n| n.alive && matches!(n.brain, Brain::Follow { .. }))
+            .map(|n| n.character.position)
+            .collect()
+    }
+
+    /// Those following her are put at `at` (a step apart): for the
+    /// autoplay's hops, which she makes past what the alpha can't climb
+    /// (a test driver's shortcut, logged as one). How many.
+    pub fn bring_followers(&mut self, at: Vec3) -> usize {
+        let mut k = 0;
+        for n in &mut self.npcs {
+            if matches!(n.brain, Brain::Follow { .. }) {
+                let a = k as f32 * 1.3 + 1.0;
+                n.character.position = at + Vec3::new(a.sin(), 0.2, a.cos()) * 1.5;
+                n.character.velocity = Vec3::ZERO;
+                n.landed = false;
+                k += 1;
+            }
+        }
+        k
+    }
+
+    /// The person of spawn `entity` gets into a vehicle (`aboard`: out of
+    /// play while they ride, `Vehicle.Enter` by `MrxFollow` as she drives)
+    /// or out of it at `at`. Whether they were in play or aboard.
+    pub fn board(&mut self, physics: &mut Physics, entity: u32, aboard: bool, at: Vec3) -> bool {
+        if aboard {
+            let mut was = false;
+            self.npcs.retain(|n| {
+                if n.spawn != Some(entity) {
+                    return true;
+                }
+                if let Some(doll) = n.ragdoll {
+                    physics.remove_ragdoll(doll);
+                }
+                was = true;
+                false
+            });
+            if was {
+                self.active.remove(&entity);
+                self.aboard.insert(entity);
+            }
+            was
+        } else if self.aboard.remove(&entity) {
+            self.moved.insert(entity, at);
+            true
+        } else {
+            false
+        }
+    }
+
     /// The scripts send the person of spawn `entity` along `route`
     /// (`Ai.Goal` `PathMove`, or `MoveTo` a point): they run it, then stand
     /// at its end. One not yet in play runs it when they come.
@@ -3115,7 +3362,10 @@ impl People {
         // People out of range, or whose layer went, go.
         let layers = self.state_layers.as_ref();
         let (active, killed) = (&mut self.active, &mut self.killed);
+        let following = &self.following;
         self.npcs.retain(|n| match n.spawn {
+            // Following her, they stay with her.
+            Some(id) if following.contains_key(&id) => true,
             Some(id)
                 if far(n.character.position, INACTIVE)
                     || n.layer
@@ -3194,6 +3444,7 @@ impl People {
             .filter(|&(s, moved)| {
                 !self.active.contains(&s.entity)
                     && !self.killed.contains(&s.entity)
+                    && !self.aboard.contains(&s.entity)
                     && !far(moved.unwrap_or(s.position), ACTIVE)
                     && self.layer_in(s.layer)
             })
@@ -3204,8 +3455,9 @@ impl People {
             .collect();
         // A mission's targets, and those the scripts sent somewhere (the
         // villa's waves, `Ai.Goal` `PathMove`), come first.
-        let (targets, routes) = (&self.mission_soldiers, &self.routes);
-        let wanted = |e: &u32| targets.contains(e) || routes.contains_key(e);
+        let (targets, routes, following) = (&self.mission_soldiers, &self.routes, &self.following);
+        let wanted =
+            |e: &u32| targets.contains(e) || routes.contains_key(e) || following.contains_key(e);
         near.sort_by(|a, b| {
             (!wanted(&a.1.entity))
                 .cmp(&!wanted(&b.1.entity))
@@ -3217,7 +3469,9 @@ impl People {
         let mut walker_room = self.walker_cap.min(MAX_WALKERS).saturating_sub(walkers);
         for (_, s, at) in near {
             let target = self.mission_soldiers.contains(&s.entity);
-            let sent = self.routes.contains_key(&s.entity);
+            // Sent somewhere, or following her (a VIP released).
+            let sent =
+                self.routes.contains_key(&s.entity) || self.following.contains_key(&s.entity);
             let room = if is_walker(s.entity) {
                 &mut walker_room
             } else {
@@ -3249,7 +3503,9 @@ impl People {
             *room = room.saturating_sub(1);
             let forward = s.rotation * Vec3::Z;
             let facing = forward.x.atan2(forward.z);
-            let brain = if let Some(route) = self.routes.get(&s.entity) {
+            let brain = if let Some(&near) = self.following.get(&s.entity) {
+                Brain::Follow { near }
+            } else if let Some(route) = self.routes.get(&s.entity) {
                 eprintln!(
                     "people: {:08x} comes in at {at:.1} to run the route the scripts gave",
                     s.entity
@@ -3303,6 +3559,7 @@ impl People {
             } else {
                 s.gun.or(self.kinds[kind].gun)
             };
+            npc.launcher = if listed { None } else { s.launcher };
             npc.outfit = self.dress(kind, s);
             self.tell(s, &npc);
             self.npcs.push(npc);
@@ -3790,6 +4047,7 @@ pub(crate) mod tests {
             damage: 9.0,
             damage_key: None,
             hint: None,
+            pellets: 1,
         };
         people.add_kind(kind("Carmona", true));
         people.add_kind(PersonKind {
@@ -4001,6 +4259,94 @@ pub(crate) mod tests {
     }
 
     /// A rifle as a template's `EquipmentLink`s hand it.
+    // A rifleman holds his fire at her in an APC or a tank (his gun rated
+    // 0 against them), not on foot or in a helicopter; an AT rocket man
+    // fires at all of them.
+    #[test]
+    fn soldiers_hold_fire_where_their_gun_is_no_use() {
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(1),
+        );
+        let rated = |n: &mut Npc, class| {
+            n.target_armour = class;
+            n.rates_target()
+        };
+        assert_eq!(
+            [1, 2, 3, 4].map(|c| rated(&mut n, c)),
+            [true, true, false, false]
+        );
+        let rocket = FireHint {
+            against: [1, 3, 3, 3],
+            ..STAND_IN
+        };
+        n.gun = Some(HandGun {
+            hint: Some(rocket),
+            ..rifle()
+        });
+        assert_eq!([1, 2, 3, 4].map(|c| rated(&mut n, c)), [true; 4]);
+    }
+
+    // A rifleman with the RPG (rated 1 against every class) fires the
+    // rifle at her on foot and the RPG at her in a tank; with a Stinger
+    // (1, 3, 2, 0), at her in a helicopter, not in a tank.
+    #[test]
+    fn soldiers_reach_for_the_launcher_that_rates_her_higher() {
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(1),
+        );
+        let launcher = |against| NpcLauncher {
+            template: 7,
+            hint: FireHint {
+                against,
+                ..STAND_IN
+            },
+            ammo: m2_engine::weapons::Ammo {
+                template: 8,
+                velocity: 25.0,
+                max_velocity: 0.0,
+                human_boost: 2.0,
+                gravity: 0.0,
+                damage: 0.0,
+                damage_min: 0.0,
+                falloff: (0.0, 0.0),
+                dropoff: 1.0,
+                hero: 1.0,
+                key: None,
+                blast: None,
+                timer: None,
+                timer_blast: None,
+                homing: None,
+                model: None,
+                sticky: false,
+            },
+            feel: Default::default(),
+        };
+        let reaches = |n: &mut Npc, class| {
+            n.target_armour = class;
+            n.reaches_for_launcher()
+        };
+        n.launcher = Some(launcher([1, 1, 1, 1]));
+        assert_eq!(
+            [1, 2, 3, 4].map(|c| reaches(&mut n, c)),
+            [false, false, true, true]
+        );
+        n.launcher = Some(launcher([1, 3, 2, 0]));
+        assert_eq!(
+            [1, 2, 3, 4].map(|c| reaches(&mut n, c)),
+            [false, true, true, false]
+        );
+    }
+
     fn rifle() -> HandGun {
         HandGun {
             template: 0x8000_0456,
@@ -4011,6 +4357,7 @@ pub(crate) mod tests {
             damage: 8.0,
             damage_key: None,
             hint: None,
+            pellets: 1,
         }
     }
 
@@ -4041,6 +4388,7 @@ pub(crate) mod tests {
             list: Vec::new(),
             ai: None,
             gun: None,
+            launcher: None,
             cycle: None,
         }
     }

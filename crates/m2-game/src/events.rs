@@ -137,8 +137,14 @@ pub fn state_matches(pattern: &str, state: &str) -> bool {
     }
 }
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 17] = [
+pub const KINDS: [&str; 19] = [
     "TimerRelative",
+    // Every update, in the mission's scripts too: the support manager's
+    // recruit cooldowns count with it (`SupportTimer`, which takes
+    // `GuiGameTimer`, there being one), and a soldier delivery's crew is
+    // free for the next call 12 s after she calls it.
+    "GuiUpdate",
+    "GuiGameTimer",
     "ObjectHibernation",
     "Boundary",
     "ObjectDeath",
@@ -1156,20 +1162,20 @@ fn check(
         // callback (`WifPmcInterior._SelectOutfit(who)`, made with no data)
         // opens only for the primary character, and the verify objective's
         // `_TargetActioned(self, who, target)` turns her to the target.
-        "ContextAction" => match guid(&p.params, 2) {
-            Some(g) => {
-                let taken = world
-                    .context_presses()
-                    .iter()
-                    .any(|(t, o)| *o == g && *t >= p.last && (*t > p.last || !p.persistent));
-                if taken {
-                    Check::Fire(world.player().map(id).into_iter().chain([id(g)]).collect())
-                } else {
-                    no
-                }
+        // { _, object or filter }: the player took its context action (an
+        // object filter: on any of its objects, as the action objectives'
+        // `{ 0, _uTgtObjFilter }`, a prisoner to release).
+        "ContextAction" => {
+            let targets = objects(&p.params, 2, world);
+            let taken = world.context_presses().iter().find_map(|(t, o)| {
+                (targets.contains(o) && *t >= p.last && (*t > p.last || !p.persistent))
+                    .then_some(*o)
+            });
+            match taken {
+                Some(g) => Check::Fire(world.player().map(id).into_iter().chain([id(g)]).collect()),
+                None => no,
             }
-            None => no,
-        },
+        }
         // { who, event }: as a clip the scripts played on `who` by name
         // (`Human.PlayRawAnimation`) meets the named event; who 0 is
         // anyone. The HQ briefings' frames wait on `{ 0, "CinematicStart"
@@ -1256,6 +1262,9 @@ fn check(
                 None => no,
             }
         }
+        // { }: every update, passing the seconds since it last fired
+        // (`SupportTimer._EventCallback(self, dt)` adds them up).
+        "GuiUpdate" | "GuiGameTimer" => Check::Fire(vec![Value::Number(now - p.last)]),
         // The game's own (the GUI's): fired by `Event.__m2_fire`.
         kind if kind.starts_with("Gui") || ENGINE_FIRED.contains(&kind) => no,
         // Not simulated yet: never fires, and is reported.
@@ -1381,6 +1390,26 @@ mod tests {
     }
 
     #[test]
+    fn gui_updates_pass_the_time_since_the_last() {
+        // The support manager's `SupportTimer` adds them up for a
+        // recruit's cooldown.
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                "total = 0 Event.CreatePersistent(Event.GuiGameTimer, {}, \
+                 function(self, dt) total = total + dt end, { 'timer' })",
+            )
+            .exec()
+            .unwrap();
+        let world = TestWorld::default();
+        for _ in 0..4 {
+            events.update(0.5, &world);
+        }
+        let total: f64 = host.lua().globals().get("total").unwrap();
+        assert!((total - 2.0).abs() < 1e-9, "{total}");
+    }
+
+    #[test]
     fn persistent_events_repeat_until_deleted() {
         let (host, events) = setup();
         host.lua()
@@ -1440,6 +1469,19 @@ mod tests {
         events.update(0.5, &world);
         events.update(0.5, &world);
         assert_eq!(log(&host), ["exit A", "exit A", "outfit true"]);
+        // On an object filter's object (a prisoner to release:
+        // `MrxTaskObjectiveAction`'s `{ 0, _uTgtObjFilter }`).
+        host.lua()
+            .load(
+                "Event.CreatePersistent(Event.ContextAction, { 0, { objs = { 11, 12 } } }, \
+                 function(d) table.insert(log, 'release ' .. d) end, { 'B' })",
+            )
+            .exec()
+            .unwrap();
+        world.context.push((3.25, 12));
+        events.update(0.5, &world);
+        events.update(0.5, &world);
+        assert_eq!(log(&host), ["exit A", "exit A", "outfit true", "release B"]);
     }
 
     #[test]

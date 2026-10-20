@@ -2,7 +2,7 @@ m2-alpha: Mercenaries 2 on a native Rust engine, from your own install.
 
 m2-alpha [options]
   (no options, or only --install/--config/--size/--vsync/--fullscreen/
-  --no-boot/--smarter-ai/--dev/--skip-mode-on: the whole game, as --alpha)
+  --display/--refresh/--no-boot/--smarter-ai/--dev/--skip-mode-on: the whole game, as --alpha)
   --alpha                the game as it launches: the boot movies (EA,
                          Pandemic), the front end (Enter starts), the first
                          contract with its movies, then on to free roam.
@@ -21,6 +21,12 @@ m2-alpha [options]
                          has run (the default; --skip-mode-off is still
                          taken). Left on, the flow skips its fades and the
                          move into the PMC HQ
+  --skip-to <id>[,briefing]
+                         with --mission: skip the story to this contract
+                         (GurCon053, PirCon001...) as the game's developer
+                         switch does: the flow completes each story
+                         contract it unlocks before it, then this one
+                         starts as in play (at its briefing with ,briefing)
   --movies               with --mission --screenshot: the scripts' movies
                          wait; each is decoded offscreen and pictured
                          (<out>-movie-<name>.ppm)
@@ -64,7 +70,16 @@ m2-alpha [options]
   --config <file>        settings file (default m2-alpha.toml)
   --size <w>x<h>         window size
   --vsync on|off
-  --fullscreen           start fullscreen (at the mode the pause menu kept)
+  --display windowed|borderless|exclusive
+                         how the window is shown ([window] mode): a window
+                         of --size; fullscreen at the monitor's own mode;
+                         or fullscreen with the monitor switched to --size
+                         at --refresh (a mode it lacks: the nearest rate,
+                         then its own mode). F11 or Alt+Enter toggles a
+                         window and the last fullscreen kind
+  --refresh <hz>         exclusive fullscreen's rate (0: the monitor's own)
+  --fullscreen           start fullscreen: as --display borderless, unless
+                         the settings keep exclusive
   --sea <metres>         sea level (default -36, the game's water shader)
   --double-sided         start with back-face culling off (as F3)
   --screenshot <out.ppm> render one frame offscreen and exit
@@ -342,12 +357,14 @@ the scripts' own data); putting the scripts back from it on loading is
 not done yet.
 The contract done, Enter closes its fanfare and the flow goes on.
 M music on/off, a click captures the mouse (F2 lets it go), F11 or
-Alt+Enter fullscreen,
+Alt+Enter switches between a window and fullscreen (borderless, or the
+exclusive mode last used),
 Escape opens the game's own pause menu (its movie, once the HUD's scripts
 run; up/down through it, left/right a setting, Enter): resume, save,
 options (game, video, audio, controls) and quit. Video's Resolution and
 Refresh Rate step through the monitor's modes; a rate is fullscreen at
-that mode, Windowed a window of that size. Its kept settings go to the
+that mode (exclusive; the monitor's own mode keeps the fullscreen kind in
+use), Windowed a window of that size. Its kept settings go to the
 settings file. The alpha's own settings (hero, field of view, mouse,
 vsync, quit to desktop) fold in the top right. Escape closes it.
 An Xbox pad (One, Series or 360) plays as the game's own layout has it:

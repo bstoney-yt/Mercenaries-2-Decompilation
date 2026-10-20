@@ -199,9 +199,11 @@ return true
 "#;
 
 /// Puts `MrxCheatBootstrap.IsSkipModeEnabled` back as the scripts had it
-/// before [`Mission::start`] turned skip mode on, if that answers no; else
-/// (none, an error, or yes) one that answers no. Returns what the scripts'
-/// own answered.
+/// before [`Mission::start`] turned skip mode on, if that answers no, or
+/// yes while a skip to a mission is under way
+/// ([`Mission::set_skip_mission`]: the scripts end it themselves once the
+/// contract is reached); else (none, an error, or yes) one that answers
+/// no. Returns what the scripts' own answered.
 const END_SKIP_MODE: &str = r#"
 local cheat = rawget(_G, "MrxCheatBootstrap")
 if type(cheat) ~= "table" then return "no MrxCheatBootstrap" end
@@ -210,7 +212,9 @@ local said = "none"
 if type(own) == "function" then
     local ok, on = pcall(own)
     said = ok and tostring(on) or ("error: " .. tostring(on))
-    if ok and not on then
+    local skipping = type(cheat.GetMissionSkipData) == "function"
+        and cheat.GetMissionSkipData() ~= nil
+    if ok and (not on or skipping) then
         cheat.IsSkipModeEnabled = own
         return said
     end
@@ -284,6 +288,10 @@ pub struct GameData {
     /// names them (`"AH1Z (Ewan)"`: `"Recruit Ewen Garret"`), by the
     /// template's name in lower case, for vehicles the scripts spawn.
     pub template_drivers: HashMap<String, String>,
+    /// Who else rides a template's vehicle, as its other `Rider` records
+    /// name them (`"Ka29b (Full)"`: the soldiers a soldier delivery
+    /// brings), by the template's name in lower case.
+    pub template_passengers: HashMap<String, Vec<String>>,
     /// Weapon templates' `MaxAmmoReserve` and which are thrown, by name in
     /// lower case ([`crate::inventory::read`]).
     pub max_reserve: HashMap<String, u32>,
@@ -488,6 +496,15 @@ impl GameData {
                 data.template_drivers
                     .insert(name.to_ascii_lowercase(), driver);
             }
+            let others: Vec<String> = crew_of(records)
+                .into_iter()
+                .filter(|(seat, _)| seat != "seat_driver")
+                .map(|(_, rider)| rider)
+                .collect();
+            if let (Some(name), false) = (named(template), others.is_empty()) {
+                data.template_passengers
+                    .insert(name.to_ascii_lowercase(), others);
+            }
         }
         for (layer, i, records) in own_riders {
             data.layers.get_mut(&layer).expect("indexed above")[i].crew = crew_of(&records);
@@ -594,6 +611,7 @@ impl Mission {
             strings,
             template_labels,
             template_drivers,
+            template_passengers,
             max_reserve,
             thrown,
         } = data;
@@ -614,6 +632,7 @@ impl Mission {
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
             w.template_drivers = template_drivers;
+            w.template_passengers = template_passengers;
             w.inventory.max_reserve = max_reserve;
             w.inventory.thrown = thrown;
             for e in layers.values().flatten() {
@@ -1298,6 +1317,15 @@ impl Mission {
         }
     }
 
+    /// Character `guid` gets out of whatever they ride (a follower out of
+    /// her vehicle).
+    pub fn unseat(&mut self, guid: u32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            o.vehicle = None;
+            o.seated_instantly = false;
+        }
+    }
+
     /// The objects carrying label `label` (`ExtractionHelicopter`), and
     /// where each is.
     pub fn labelled(&self, label: &str) -> Vec<(u32, [f32; 3])> {
@@ -1337,14 +1365,13 @@ impl Mission {
         self.flown = true;
     }
 
-    /// Reports that `guid` (a delivery's pilot) reached `at`: its cargo is
-    /// let go there and the scripts hear of it ([`api::arrived`]); what
-    /// they do about it is carried out at once.
+    /// Reports that `guid` (a delivery's pilot, a person sent somewhere,
+    /// the player) reached `at`, its AI goal's place: any cargo is let go
+    /// there and the scripts hear of it ([`api::arrived`]); what they do
+    /// about it is carried out at once.
     pub fn arrived(&mut self, guid: u32, at: [f32; 3]) {
-        self.log.push(format!(
-            "t={:.1} delivery by {guid} arrived at {at:?}",
-            self.now
-        ));
+        self.log
+            .push(format!("t={:.1} {guid:#x} arrived at {at:?}", self.now));
         for e in api::arrived(&self.world, guid, at) {
             self.log
                 .push(format!("  goal callback: {}", first_lines(&e.to_string())));
@@ -1693,6 +1720,12 @@ impl Mission {
         }
     }
 
+    /// The score changed under the HUD's scripts (the pause menu's
+    /// music): see [`crate::music::Music::heard`].
+    pub fn music_heard(&mut self, cue: Option<String>) {
+        self.world.borrow_mut().music.heard(cue);
+    }
+
     /// The faction the score plays now (`freeplay_city`, `pmc`, ...).
     pub fn music_faction(&self) -> String {
         self.world.borrow().music.faction().to_owned()
@@ -1768,6 +1801,17 @@ impl Mission {
     /// (`Sys.TutorialsEnabled`; on unless told).
     pub fn set_tutorials(&mut self, on: bool) {
         self.world.borrow_mut().tutorials_off = !on;
+    }
+
+    /// Skips the story to a contract the developer's way (`Sys.
+    /// GetSkipMission`): set before [`start`](Self::start), the new game
+    /// turns on the scripts' skip mode with it, and the flow completes
+    /// each story contract it unlocks until it unlocks this one, which
+    /// then starts as in play (at its briefing with `briefing`).
+    pub fn set_skip_mission(&mut self, mission: &str, briefing: bool) {
+        let mut w = self.world.borrow_mut();
+        w.skip_mission = Some(mission.to_owned());
+        w.skip_briefing = briefing;
     }
 
     /// The subtitles of the movie [`take_movie`](Self::take_movie) gave,
@@ -1893,24 +1937,25 @@ end
     /// it, and `WifPmcInterior` finds her as `Vehicle.GetRiders(it)[1]`.
     pub fn crews_aboard(&self) -> Vec<CrewAboard> {
         let w = self.world.borrow();
-        // Who rides what, in one pass over the objects: asked of every
-        // object per crew, this ran each tick over the whole island's
-        // objects for each crewed one, and play on a phone at 1 fps.
+        // Who rides what, in one pass over the objects: once the story
+        // has moved on (`--skip-to`) the layers hold thousands of crews,
+        // and a pass over every object for each crew stalled each tick
+        // for minutes.
         let mut by_vehicle: HashMap<u32, Vec<(u32, &String)>> = HashMap::new();
         for (&r, o) in &w.objects {
-            if let Some(g) = o.vehicle
+            if let Some(v) = o.vehicle
                 && o.alive
                 && Some(r) != w.player
-                && w.crews.contains_key(&g)
+                && w.crews.contains_key(&v)
             {
-                by_vehicle.entry(g).or_default().push((r, &o.name));
+                by_vehicle.entry(v).or_default().push((r, &o.name));
             }
         }
         let mut out: Vec<CrewAboard> = w
             .crews
             .iter()
             .filter_map(|(&g, crew)| {
-                let mut riders = by_vehicle.remove(&g)?;
+                let mut riders = by_vehicle.remove(&g).unwrap_or_default();
                 riders.sort_unstable();
                 let mut free: Vec<&(String, String)> = crew.iter().collect();
                 let aboard: Vec<(String, u32, String)> = riders
@@ -2347,6 +2392,23 @@ mod tests {
         m.set_subtitles(false);
         m.set_tutorials(true);
         assert_eq!(ask(&m), [false, true]);
+    }
+
+    #[test]
+    fn the_skip_to_mission_switch_reaches_the_bootstrap_once() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let ask = |m: &Mission| {
+            m.lua()
+                .load("return Sys.GetSkipMission(), Sys.GetINIBriefing()")
+                .eval::<(Option<String>, bool)>()
+                .unwrap()
+        };
+        assert_eq!(ask(&m), (None, false));
+        m.set_skip_mission("GurCon053", true);
+        assert_eq!(ask(&m), (Some("GurCon053".into()), true));
+        // The bootstrap clears it once taken, as the engine's INI switch.
+        m.lua().load("Sys.SetSkipMission('')").exec().unwrap();
+        assert_eq!(ask(&m).0, None);
     }
 
     #[test]

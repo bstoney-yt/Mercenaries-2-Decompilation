@@ -4,6 +4,7 @@
 //! m2-alpha [--install <dir>] [--spawn <x>,<z>] [--model <hash>]... [--gait <gait>]
 //!          [--config <file>]
 //!          [--size <w>x<h>] [--vsync on|off] [--fullscreen] [--double-sided] [--fly]
+//!          [--display windowed|borderless|exclusive] [--refresh <hz>]
 //!          [--sea <metres>]
 //!          [--screenshot <out.ppm> [--drive | --fight]] [--write-config]
 //! ```
@@ -28,8 +29,8 @@
 //! instead, characters playing the game's locomotion clips in place (N
 //! steps through idle, walk, run and sprint; `--gait` picks the first).
 //! A click captures the mouse (F2 lets it go), F11 or Alt+Enter toggles
-//! fullscreen, F3 toggles back-face culling, Escape releases the mouse,
-//! then quits.
+//! fullscreen ([`display`]), F3 toggles back-face culling, Escape releases
+//! the mouse, then quits.
 //!
 //! `--screenshot` on the island waits for the ground, lands the player and,
 //! with `--gait walk|run|sprint`, runs her forward for three seconds before
@@ -104,7 +105,6 @@ use m2_engine::{Gait, Install, WorldSettings};
 use m2_render::gpu::WgpuBackend;
 use m2_render::{DrawQueue, RenderBackend};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -156,6 +156,9 @@ struct Options {
     /// skips the fade before the villa's closing movie and the move into
     /// the PMC HQ, and Fiona's Talk never comes.
     skip_mode_off: bool,
+    /// With `--mission`: the story skipped to this contract the game's
+    /// developer way, and whether to its briefing (`--skip-to <id>[,briefing]`).
+    skip_to: Option<(String, bool)>,
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
@@ -417,6 +420,10 @@ struct Options {
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
     fullscreen: bool,
+    /// `--display`: windowed, borderless or exclusive.
+    display: Option<display::DisplayMode>,
+    /// `--refresh`: exclusive fullscreen's rate.
+    refresh: Option<u32>,
     screenshot: Option<PathBuf>,
     write_config: bool,
 }
@@ -508,12 +515,28 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 })
             }
             "--fullscreen" => o.fullscreen = true,
+            "--display" => {
+                o.display = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e: String| anyhow::anyhow!("--display {e}"))?,
+                )
+            }
+            "--refresh" => o.refresh = Some(value()?.parse().context("--refresh expects hertz")?),
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
             "--dev" => o.dev = true,
             // The default since round 25; kept so old launch lines work.
             "--skip-mode-off" => o.skip_mode_off = true,
             "--skip-mode-on" => o.skip_mode_off = false,
+            "--skip-to" => {
+                let v = value()?;
+                o.skip_to = Some(match v.split_once(',') {
+                    Some((id, "briefing")) => (id.to_owned(), true),
+                    Some(_) => bail!("--skip-to expects <contract>[,briefing], not {v}"),
+                    None => (v, false),
+                });
+            }
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
@@ -785,11 +808,13 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 11] = [
+    const PLAIN: [&str; 13] = [
         "--install",
         "--config",
         "--size",
         "--fullscreen",
+        "--display",
+        "--refresh",
         "--vsync",
         "--no-boot",
         "--to-front-end",
@@ -885,7 +910,15 @@ fn run(
     if let Some(v) = options.vsync {
         config.window.vsync = v;
     }
-    config.window.fullscreen |= options.fullscreen;
+    if options.fullscreen && config.window.mode == display::DisplayMode::Windowed {
+        config.window.mode = display::DisplayMode::Borderless;
+    }
+    if let Some(mode) = options.display {
+        config.window.mode = mode;
+    }
+    if let Some(hz) = options.refresh {
+        config.window.refresh = hz;
+    }
     if let Some(sea) = options.sea {
         config.world.sea_level = sea;
     }
@@ -980,6 +1013,7 @@ fn run(
         no_boot: options.no_boot,
         to_front_end: options.to_front_end,
         skip_mode_off: options.skip_mode_off,
+        skip_to: options.skip_to.clone(),
         guns: options.guns.clone(),
         load: options.load.clone(),
         load_at: options.load_at,
@@ -1965,15 +1999,15 @@ fn screenshot(
             {
                 eprintln!("--pickup: she has no pickup clip, or is busy");
             }
-            game.step(
-                Intent {
-                    jump,
-                    hold_jump: jump,
-                    trigger,
-                    ..intent
-                },
-                tick,
-            );
+            let mut intent = Intent {
+                jump,
+                hold_jump: jump,
+                trigger,
+                ..intent
+            };
+            // Her gun's lens and scope as she aims (as play does).
+            game.aim_lens(&mut intent, 0, tick);
+            game.step(intent, tick);
             // With `--walk-seconds`, where she is each second: how deep the
             // sea is over her feet, and whether she swims.
             if options.walk_seconds.is_some()
@@ -3481,7 +3515,8 @@ fn mission_for_screenshot(
         .with_save(options.load.clone())
         .with_support(options.support.clone())
         .with_movies(options.movies)
-        .with_skip_mode_off(options.skip_mode_off);
+        .with_skip_mode_off(options.skip_mode_off)
+        .with_skip_to(options.skip_to.clone());
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -3594,11 +3629,21 @@ fn mission_for_screenshot(
     // it), the designator's tap, and seconds the helicopter has been about.
     let (mut extraction, mut extraction_tap, mut extraction_seen) = (0u8, false, 0.0f32);
     let (mut locked_was, mut locked_for) = (false, 0.0f32);
+    let mut on_contract: Option<(String, i64)> = None;
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
             Some(a) => {
+                let contract = link.contract();
+                if contract != on_contract {
+                    eprintln!(
+                        "autoplay {:.1} s: on contract {:?}",
+                        i as f32 * tick,
+                        contract
+                    );
+                    on_contract = contract;
+                }
                 a.sights = link.sight_targets(game);
-                let marks = link.marks();
+                let marks = link.contract_marks();
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)
             }
@@ -6644,6 +6689,8 @@ struct Running {
     focused: bool,
     /// Alt is held (Alt+Enter toggles fullscreen).
     alt: bool,
+    /// What F11 and Alt+Enter toggle between.
+    display: display::Display,
     /// The pause menu's keyboard table waits for a key or mouse button:
     /// the next one pressed goes to it, not to play.
     capturing: bool,
@@ -6724,6 +6771,8 @@ struct App {
     /// End the scripts' skip mode after their start (unless
     /// `--skip-mode-on`).
     skip_mode_off: bool,
+    /// The story skipped to this contract (`--skip-to`).
+    skip_to: Option<(String, bool)>,
     /// Weapons to start with (`--gun`).
     guns: Vec<String>,
     /// A save to start from (`--load`).
@@ -6737,17 +6786,18 @@ struct App {
 impl App {
     fn start(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<Running> {
         let w = &self.config.window;
-        let mut attributes = Window::default_attributes()
+        let monitor = event_loop.primary_monitor();
+        // Windowed, no larger than the monitor; fullscreen as the
+        // settings keep it ([`display`]).
+        let (full, how) =
+            display::fullscreen_for(monitor.clone(), w.mode, (w.width, w.height), w.refresh);
+        let attributes = Window::default_attributes()
             .with_title("Mercenaries 2 (alpha)")
-            .with_inner_size(PhysicalSize::new(w.width, w.height));
-        if w.fullscreen {
-            // At the kept mode (the pause menu's video screen), or
-            // borderless at the monitor's own.
-            let full =
-                display::fullscreen_at(event_loop.primary_monitor(), w.width, w.height, w.refresh);
-            attributes = attributes.with_fullscreen(Some(full));
-        }
+            .with_inner_size(display::fit((w.width, w.height), monitor.as_ref()))
+            .with_fullscreen(full);
         let window = Arc::new(event_loop.create_window(attributes)?);
+        let display = display::Display::new(w);
+        eprintln!("display: start {how}: {}", display::describe(&window));
         let size = window.inner_size();
         let mut backend =
             WgpuBackend::for_window(window.clone(), size.width, size.height, w.vsync)?;
@@ -6799,6 +6849,7 @@ impl App {
                 adapter.name, adapter.backend
             ),
             window,
+            display,
             backend,
             game,
             audio: {
@@ -6834,6 +6885,7 @@ impl App {
                         .with_support(self.support.clone())
                         .with_movies(self.alpha)
                         .with_skip_mode_off(self.skip_mode_off)
+                        .with_skip_to(self.skip_to.clone())
                         .with_subtitles(self.config.options.subtitles),
                 ),
                 _ => None,
@@ -7082,6 +7134,11 @@ impl Running {
                 eprintln!("hero: playing as {hero}");
                 self.set_hero(hero);
             }
+            Some(ui::MenuAction::Display(mode)) => {
+                let how = self.display.set(&self.window, mode, &mut config.window);
+                eprintln!("pause: display: {how}");
+                config.save("pause");
+            }
             Some(ui::MenuAction::Quit) => event_loop.exit(),
             Some(ui::MenuAction::Shop(a)) => self.shop_action(a, config),
             Some(ui::MenuAction::Cheat(a)) => self.cheat_action(a),
@@ -7131,6 +7188,8 @@ impl Running {
             return;
         }
         let driving = self.game.driving().is_some();
+        let rumble = std::mem::take(&mut self.game.rumble);
+        self.pad.rumble(rumble);
         let keys = self.pad.poll(&mut self.input, driving, dt);
         for key in keys {
             use pad::MenuKey;
@@ -7248,16 +7307,12 @@ impl Running {
         if v == display::current(window) {
             return;
         }
-        let how = display::apply(window, v);
+        let how = display::apply(window, v, &mut config.window);
         eprintln!(
             "{menu}: video kept: {}, {}: {how}",
             v.resolution_text(),
             v.refresh_text()
         );
-        let w = &mut config.window;
-        (w.width, w.height) = (v.width, v.height);
-        w.fullscreen = v.fullscreen.is_some();
-        w.refresh = v.fullscreen.unwrap_or(0);
     }
 
     /// Applies the player's options that live outside the settings file's
@@ -7267,6 +7322,7 @@ impl Running {
         self.set_volumes([o.sfx_volume, o.music_volume, o.dialog_volume]);
         self.pad.look = Some(pause::pad_scale(o.pad_sensitivity));
         self.pad.invert = o.invert_pad;
+        self.pad.rumble_on = o.rumble;
         // The advanced video screen's fourth option is shadows.
         self.game.picture = game::Picture {
             brightness: o.brightness,
@@ -7309,6 +7365,12 @@ impl Running {
             && let Some(m) = &mut self.mission
         {
             m.medevac();
+        }
+        if let Some(cue) = news.music {
+            self.audio.music_cue(cue.as_deref());
+            if let Some(m) = &mut self.mission {
+                m.music_heard(cue);
+            }
         }
         for unused in &news.unused {
             eprintln!("pause: {unused} kept in the menu; the alpha has nothing for it");
@@ -7405,6 +7467,7 @@ impl Running {
             self.keep_settings(&s, news.video, "front end", config);
         } else if let Some(v) = news.video {
             Self::keep_video(&self.window, "front end", v, config);
+            config.save("front end");
         }
         if let Some(n) = news.delete {
             let path = pause_save_path(n);
@@ -7719,7 +7782,9 @@ impl Running {
             self.released = self.mouse_look;
         }
         if self.input.take_pressed(Action::Fullscreen) {
-            display::toggle(&self.window);
+            let how = self.display.toggle(&self.window, &mut config.window);
+            eprintln!("display: F11: {how}");
+            config.save("display");
         }
         // The developer's keys are taken either way, and do nothing
         // without `--dev` in the whole game's launch.
@@ -7916,8 +7981,19 @@ impl ApplicationHandler for App {
         }
         // Alt+Enter toggles fullscreen, as F11 does (the PC convention),
         // in play and menus alike; its Enter goes no further.
-        if let WindowEvent::ModifiersChanged(m) = &event {
-            state.alt = m.state().alt_key();
+        // Alt from the modifiers and from the Alt keys themselves: a
+        // ModifiersChanged can come before the Focused that would clear it.
+        match &event {
+            WindowEvent::ModifiersChanged(m) => state.alt = m.state().alt_key(),
+            WindowEvent::KeyboardInput { event: key, .. }
+                if matches!(
+                    key.physical_key,
+                    PhysicalKey::Code(KeyCode::AltLeft | KeyCode::AltRight)
+                ) =>
+            {
+                state.alt = key.state == ElementState::Pressed;
+            }
+            _ => {}
         }
         if let WindowEvent::KeyboardInput { event: key, .. } = &event
             && state.alt
@@ -7927,7 +8003,9 @@ impl ApplicationHandler for App {
             )
         {
             if key.state == ElementState::Pressed && !key.repeat {
-                display::toggle(&state.window);
+                let how = state.display.toggle(&state.window, &mut self.config.window);
+                eprintln!("display: Alt+Enter: {how}");
+                self.config.save("display");
             }
             return;
         }
@@ -7975,12 +8053,20 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 state.backend.resize(size.width, size.height);
                 state.pad.touch.resize(size.width, size.height);
+                state.display.resized(&state.window, size);
+                let (sw, sh) = state.backend.size();
+                eprintln!(
+                    "display: resized: {}, swapchain {sw}x{sh}",
+                    display::describe(&state.window)
+                );
             }
             WindowEvent::Focused(focused) => {
                 // Keys pressed or released elsewhere never reach us, so start
                 // clean either way.
                 state.focused = focused;
-                state.alt = false;
+                if !focused {
+                    state.alt = false;
+                }
                 state.input.clear();
                 state.keep_mouse();
             }
@@ -8113,6 +8199,14 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // The swapchain at the window's size now: going in and out
+                // of fullscreen, the `Resized` events come late and carry
+                // sizes on the way, so a frame could be drawn at a size the
+                // window has left, in a corner of it.
+                let size = state.window.inner_size();
+                if (size.width, size.height) != state.backend.size() {
+                    state.backend.resize(size.width, size.height);
+                }
                 if let Err(e) = state.frame(&mut self.config, event_loop) {
                     self.fail(event_loop, e);
                 }

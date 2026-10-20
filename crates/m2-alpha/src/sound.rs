@@ -1163,6 +1163,7 @@ impl GameAudio {
             };
             let tables = held_tables(&tables, &mut source);
             let (mut found, mut bytes) = (0, 0);
+            let mut missing = Vec::new();
             for &key in &keys {
                 let sounds = KeySounds::resolve(&mut source, &tables, key);
                 if let Some(k) = &sounds {
@@ -1172,14 +1173,17 @@ impl GameAudio {
                         .iter()
                         .map(|(s, _)| s.samples.len() * 2)
                         .sum::<usize>();
+                } else {
+                    missing.push(format!("{key:08x}"));
                 }
                 drop(tx.send((key, sounds)));
             }
             eprintln!(
-                "sound: read {found} of {} gun firing cues ahead ({:.1} MB) in {:.2} s",
+                "sound: read {found} of {} gun firing cues ahead ({:.1} MB) in {:.2} s; none for [{}]",
                 keys.len(),
                 bytes as f32 / 1e6,
-                started.elapsed().as_secs_f32()
+                started.elapsed().as_secs_f32(),
+                missing.join(", ")
             );
         });
     }
@@ -1758,7 +1762,14 @@ impl GameAudio {
                     continue;
                 }
                 Sound::Reload { set } => {
-                    self.play_reload(set);
+                    let cue = set.and_then(|s| self.gun_cues.reload(s));
+                    self.play_flat("reload", set, cue);
+                    continue;
+                }
+                Sound::Pickup { set } => {
+                    let cue =
+                        set.and_then(|s| self.gun_cues.cue(s, m2_engine::gun_sounds::EQUIP_PICKUP));
+                    self.play_flat("pickup", set, cue);
                     continue;
                 }
             };
@@ -1860,11 +1871,12 @@ impl GameAudio {
         false
     }
 
-    /// Her gun of sound set `set` reloaded: its reload cue
-    /// ([`GunCues::reload`]), heard as her own (flat), at its volume. A
-    /// cue not yet read is read on a thread and this reload goes unheard.
-    fn play_reload(&mut self, set: Option<u32>) {
-        let Some(cue) = set.and_then(|s| self.gun_cues.reload(s)) else {
+    /// A sound of her gun of sound set `set` heard as her own (flat), at
+    /// its volume: its reload cue ([`GunCues::reload`]) or the cue it plays
+    /// taken up (`equip_pickup`), `what` saying which. A cue not yet read
+    /// is read on a thread and this one goes unheard.
+    fn play_flat(&mut self, what: &str, set: Option<u32>, cue: Option<u32>) {
+        let Some(cue) = cue else {
             return;
         };
         match self.keys.get(&cue) {
@@ -1874,7 +1886,7 @@ impl GameAudio {
                 if let Some(buffer) = found.pick(pick).cloned() {
                     if self.shots_heard.insert(cue) {
                         eprintln!(
-                            "sound: reload, set {:08x}, cue {cue:08x}: sound {:08x} ({:.2} s)",
+                            "sound: {what}, set {:08x}, cue {cue:08x}: sound {:08x} ({:.2} s)",
                             set.unwrap_or(0),
                             buffer.hash,
                             buffer.seconds()
