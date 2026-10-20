@@ -317,6 +317,8 @@ pub struct Autoplay {
     /// going for.
     boarding: Option<(usize, f32)>,
     left_rides: Vec<usize>,
+    /// Hops she has had driving to the goal she is after.
+    drive_hops: u32,
     /// Sidestepping (-1 left, 1 right), seconds left.
     sidestep: Option<(f32, f32)>,
     /// Which way the next sidestep goes.
@@ -453,6 +455,7 @@ impl Autoplay {
             self.stalled = 0.0;
             self.way = None;
             self.gunning = 0.0;
+            self.drive_hops = 0;
         }
         self.goal = chosen.map(|c| c.0);
         // The scripts' prompt on what she went to (a verify on a body, a
@@ -1988,11 +1991,13 @@ impl Autoplay {
         }
         let still = self.since_moved();
         if still > HOP_AFTER {
-            // Stuck driving close to the place: on foot from here.
+            // Stuck driving close to the place, or stuck driving a second
+            // time on the way there (round 26: a truck hopped a few metres
+            // at a time for 370 s, 165 m off): on foot from here.
             let driving = game.scene.player.as_ref().and_then(|p| p.driving);
             let near = (at - game.focus()).with_y(0.0).length() < RIDE_FOR;
             if let Some(i) = driving
-                && near
+                && (near || self.drive_hops > 0)
                 && game
                     .scene
                     .world
@@ -2017,6 +2022,9 @@ impl Autoplay {
                 .map(|w| w.route.steer(from, HOP).0)
                 .filter(|to| (*to - from).with_y(0.0).length() >= HOP_LEAST)
                 .unwrap_or(at);
+            if driving.is_some() {
+                self.drive_hops += 1;
+            }
             self.hop(game, to, still);
             return true;
         }
