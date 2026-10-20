@@ -53,6 +53,11 @@ pub fn items(lua: &Lua) -> mlua::Result<Vec<SupportItem>> {
     let Value::Table(all) = data.get::<Value>("tSupportData")? else {
         return Ok(Vec::new());
     };
+    // The free items the scripts hand out (`MrxSupportData.AddFreebie`:
+    // an outpost's soldier delivery, `SoldierDelivery_CH`) are their own
+    // table, `tFreebieData`, each with its own support object; how many
+    // she holds is kept under its `sName` (`MrxPmc.GetFreebieQty`).
+    let freebies = data.get::<Option<Table>>("tFreebieData")?;
     let pmc = globals.get::<Value>("MrxPmc")?;
     // `mlua::Integer` is i32 on 32-bit builds, i64 on 64-bit ones.
     #[allow(clippy::useless_conversion)]
@@ -69,8 +74,17 @@ pub fn items(lua: &Lua) -> mlua::Result<Vec<SupportItem>> {
             .unwrap_or(0)
     };
     let mut out = Vec::new();
-    for pair in all.pairs::<String, Table>() {
+    let tables = std::iter::once((all, false)).chain(freebies.map(|f| (f, true)));
+    for (pair, free) in tables.flat_map(|(t, free)| {
+        t.pairs::<String, Table>()
+            .map(move |p| (p, free))
+            .collect::<Vec<_>>()
+    }) {
         let Ok((key, item)) = pair else { continue };
+        // A catalogue item of the same key is listed already.
+        if free && out.iter().any(|i: &SupportItem| i.key == key) {
+            continue;
+        }
         let support = item.get::<Option<Table>>("oSupport").ok().flatten();
         let s = |t: Option<&Table>, k: &str| {
             t.and_then(|t| t.get::<Option<String>>(k).ok().flatten())
@@ -98,8 +112,22 @@ pub fn items(lua: &Lua) -> mlua::Result<Vec<SupportItem>> {
             designator: s(designator.as_ref(), "sDesignationType"),
             vehicle: s(support.as_ref(), "sDeliveryVehicle"),
             cargo: s(support.as_ref(), "sCargoToDeliver"),
-            stock: count("GetSupportQty", &key),
-            free: count("GetFreebieQty", &key),
+            stock: if free {
+                0
+            } else {
+                count("GetSupportQty", &key)
+            },
+            // One with no count of its own (an outpost's soldier delivery:
+            // `AddFreebie` without a quantity, and none in its data) is on
+            // the support menu while `bActive`, until taken back
+            // (`RemoveFreebie`): read from the scripts, `_AddFreebie`.
+            free: if free {
+                let n = count("GetFreebieQty", &s(Some(&item), "sName"));
+                let active = item.get::<Option<bool>>("bActive").ok().flatten() == Some(true);
+                if n == 0 && active { 1 } else { n }
+            } else {
+                count("GetFreebieQty", &key)
+            },
             key,
         });
     }
@@ -115,6 +143,7 @@ pub fn items(lua: &Lua) -> mlua::Result<Vec<SupportItem>> {
 /// whether `Commence` took it.
 pub const CALL_IN: &str = r#"
 local item = MrxSupportData.tSupportData[__m2_key]
+    or (MrxSupportData.tFreebieData or {})[__m2_key]
 if not item or not item.oSupport then return false end
 local s = item.oSupport
 if type(s.uOwner) ~= "userdata" then s:SetOwner(__m2_owner) end

@@ -1144,6 +1144,9 @@ impl MissionLink {
                 mission.arrived(r.pilot, r.to.to_array());
                 self.counts.arrived += 1;
             }
+            for (pilot, home) in scene.flights.take_home() {
+                mission.arrived(pilot, home.to_array());
+            }
         }
         // A crate she broke open is destroyed for the scripts too (what
         // it held, it leaves of itself: no script spawns it).
@@ -2646,6 +2649,25 @@ fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
     world.index.spawns.iter().any(|s| s.entity == guid)
 }
 
+/// One of the scripts' own people on foot (spawned by them, not placed by
+/// a layer: a soldier delivery's soldiers): their template's name, and
+/// its model. People by their `Human` label, as `Pg.FastCollectHumans`
+/// finds them.
+fn scripted_person(
+    mission: &Mission,
+    templates: &Templates,
+    guid: u32,
+) -> Option<(String, Option<u32>)> {
+    let w = mission.world().borrow();
+    let o = w.objects.get(&guid)?;
+    let human = [m2_assets::name_hash("human"), m2_assets::name_hash("Human")];
+    if o.vehicle.is_some() || !o.all_labels().iter().any(|l| human.contains(l)) {
+        return None;
+    }
+    let model = templates.get(&o.name).and_then(|t| t.model);
+    Some((o.name.clone(), model))
+}
+
 /// Where the soldiers stand whom the markers' spawn targets placed (the
 /// first contract's "destroy" markers are on spawns, and the scripts'
 /// world keeps the spawn's place while he moves), by target; and each new
@@ -2867,6 +2889,9 @@ fn stocked(m: &Mission) -> Vec<support::Stocked> {
     m.support_items()
         .into_iter()
         .filter(|i| i.stock > 0 || i.free > 0)
+        // Free ones the game carries out itself (the first contract's
+        // satellite bomb) are her own items in the menu.
+        .filter(|i| support::Kind::from_freebie(&i.key).is_none())
         .map(|i| support::Stocked {
             name: {
                 let shown = m.text(&i.name);
@@ -2963,13 +2988,14 @@ fn break_props(game: &mut Game, mission: &Mission) {
 /// delivery whose helicopter the scripts don't have arrives at once.
 ///
 /// A support helicopter's landing ([`m2_game::mission::LAND`]) is flown
-/// the same way, with nothing on the winch, down to the mark: its goal's
-/// location is 50 m over the mark (the copter delivery's script adds 50
-/// to the mark's height). Once down its pilot gets out and walks off, and
+/// the same way, with nothing on the winch, down to the ground under its
+/// goal's location: the copter delivery's is 50 m over the mark (its
+/// script adds 50 to the mark's height), a soldier delivery's is the
+/// mark itself (`MrxSoldierDelivery`; landed 50 m under it, its soldiers
+/// came down underground). Once down its pilot gets out and walks off, and
 /// the helicopter stays: its pilot's `MoveTo` doesn't send it home
 /// (`landed`). It can't be flown in this game yet.
 fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Command) {
-    const LAND_ABOVE: f32 = 50.0;
     match c {
         Command::Goal {
             guid,
@@ -2979,7 +3005,7 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
         } if goal == "Deliver" || goal == m2_game::mission::LAND => {
             let to = &if goal == m2_game::mission::LAND {
                 landed.insert(*guid);
-                [to[0], to[1] - LAND_ABOVE, to[2]]
+                ground_under(game, Vec3::from(*to)).to_array()
             } else {
                 *to
             };
@@ -3082,7 +3108,14 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
             goal,
             location: Some(to),
             ..
-        } if goal == "MoveTo" && game.scene.flights.flying(*guid) && !landed.contains(guid) => {
+        } if goal == "MoveTo"
+            && game.scene.flights.flying(*guid)
+            // Landed, it stays once its pilot is out (a copter delivery's);
+            // with the pilot still aboard (a soldier delivery's, once its
+            // soldiers are down: `MrxSupport.GoHome`) it goes, freeing the
+            // support's recruit for the next call.
+            && (!landed.contains(guid) || mission.world().borrow().vehicle_of(*guid).is_some()) =>
+        {
             game.scene.flights.send_home(*guid, Vec3::from(*to));
         }
         Command::Remove(guid) => game
@@ -3231,9 +3264,15 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                         let at = Vec3::from(*position);
                         scene.props.put(&mut world.physics, *guid, at);
                         // A person the layers place (a story character):
-                        // there they stand.
+                        // there they stand. One of the scripts' own on
+                        // foot (a soldier delivery's, set down): brought
+                        // into play there.
                         if is_spawn(world, *guid) {
                             scene.people.put(*guid, at);
+                        } else if let Some((template, model)) =
+                            scripted_person(mission, &world.index.template_db, *guid)
+                        {
+                            scene.people.bring_scripted(*guid, &template, model, at);
                         }
                     }
                     _ if is_spawn(world, *guid) => {
@@ -3267,18 +3306,18 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             return false;
         }
         // A person on foot sent to a place (PmcCon001's beaten soldiers
-        // running for `loc_EntourageFleePoint`): they run there.
+        // running for `loc_EntourageFleePoint`, an outpost's rushers for its
+        // flag, the scripts' own soldiers too): they run there.
         Command::Goal {
             guid,
             goal,
             target: Some(to),
             ..
         } if goal == "MoveTo"
-            && game
-                .scene
-                .world
-                .as_ref()
-                .is_some_and(|w| is_spawn(w, *guid)) =>
+            && game.scene.world.as_ref().is_some_and(|w| {
+                is_spawn(w, *guid)
+                    || scripted_person(mission, &w.index.template_db, *guid).is_some()
+            }) =>
         {
             let at = mission
                 .world()
