@@ -1119,6 +1119,25 @@ impl Autoplay {
             return Intent::default();
         };
         if let Some(v) = game.scene.player.as_ref().and_then(|p| p.driving) {
+            // A story character (AllCon003's General Peng): out, and on foot
+            // with the rifle once near (round 7's APC sat 79 m off his
+            // bunker 1500 s, its gun never reaching him).
+            let held = game.scene.people.npcs.get(i).is_some_and(|n| n.held);
+            if held
+                && !self.leave
+                && target.distance(game.focus()) < SHOOT_RANGE * 2.0
+                && self.can_leave(game, v)
+            {
+                eprintln!(
+                    "autoplay {:.1} s: {} near: getting out to go on foot",
+                    self.clock, self.what
+                );
+                self.leave = true;
+            }
+            if self.leave {
+                let speed = vehicle_state(game, v).map_or(0.0, |(_, s)| s);
+                return self.press(speed);
+            }
             return self.at_target_driving(game, v, target, dt);
         }
         let Some(p) = game.scene.player.as_ref() else {
