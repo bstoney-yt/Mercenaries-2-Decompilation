@@ -2847,7 +2847,10 @@ fn knock_loose(
             let bed_at = place.transform_point3(*b);
             if !told.contains(&index) {
                 let round = props.told_near(bed_at, TOLD_REACH);
-                if !round.is_empty() && round.iter().all(|t| !t.contains("(not ")) {
+                if !round.is_empty()
+                    && (round.iter().all(|t| !t.contains("(not "))
+                        || round.iter().any(|t| t.starts_with("0x4")))
+                {
                     told.insert(index);
                     eprintln!(
                         "cargo: by the {} (bed at {bed_at:.2}): {}",

@@ -57,6 +57,11 @@ const FULL_LOCK: f32 = 0.6;
 /// They brake for her or a vehicle this near ahead, metres, for at most
 /// this long, seconds, then go on (round her, or into what is there).
 const CLEAR_AHEAD: f32 = 12.0;
+/// And as far ahead as it goes in this long, seconds, within this of its
+/// line, metres (invented: room to stop, and a truck's half width more
+/// than its own).
+const STOP_SECONDS: f32 = 1.8;
+const CLEAR_SIDE: f32 = 3.5;
 const MOST_WAIT: f32 = 3.0;
 /// One stuck this long, seconds, at least this far from her, metres, is
 /// taken back and comes again elsewhere (invented).
@@ -399,10 +404,14 @@ impl RoadTraffic {
             let forward = flat(at.transform_vector3(Vec3::Z)).normalize_or_zero();
             let top = v.spec.tuning.max_speed.unwrap_or(DEFAULT_TOP);
             let speed = physics.vehicle_speed(id);
+            // Further ahead the faster it goes, to stop short of it (a
+            // van at 10 m/s ran into her organ truck crossing its road:
+            // PirCon004 round 68).
+            let reach = CLEAR_AHEAD.max(speed * STOP_SECONDS);
             let mut blocked = places.iter().any(|&p| {
                 let d = flat(p - here);
                 let ahead = d.dot(forward);
-                ahead > 1.0 && ahead < CLEAR_AHEAD && d.perp_dot(forward).abs() < 2.5
+                ahead > 1.0 && ahead < reach && d.perp_dot(forward).abs() < CLEAR_SIDE
             });
             car.waited = if blocked { car.waited + dt } else { 0.0 };
             car.stuck = if speed.abs() < 0.5 {
