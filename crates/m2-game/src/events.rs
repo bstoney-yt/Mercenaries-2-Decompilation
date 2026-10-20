@@ -826,17 +826,19 @@ fn objects(t: &Table, i: i64, world: &dyn World) -> Vec<u32> {
         }
         // An object filter (see `api`): its objects, the player when it
         // uses players, and objects with its label, less those excluded.
+        // A plain list of objects (`Player.GetAllCharacters()`, which
+        // `MrxTaskObjectiveEnterVehicle` waits on: PmcCon003's "Board the
+        // Lucky Lady") is its objects.
         Ok(Value::Table(f)) => {
-            let mut out: Vec<u32> = f
-                .raw_get::<Option<Table>>("objs")
-                .ok()
-                .flatten()
-                .map(|t| {
-                    t.sequence_values::<Value>()
-                        .filter_map(|v| as_id(&v.ok()?))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let ids = |t: Table| -> Vec<u32> {
+                t.sequence_values::<Value>()
+                    .filter_map(|v| as_id(&v.ok()?))
+                    .collect()
+            };
+            let mut out: Vec<u32> = match f.raw_get::<Option<Table>>("objs").ok().flatten() {
+                Some(t) => ids(t),
+                None => ids(f.clone()),
+            };
             if f.raw_get::<bool>("players").unwrap_or(false) {
                 out.extend(world.player());
             }
@@ -1366,6 +1368,26 @@ mod tests {
         events.update(0.5, &world);
         events.update(0.5, &world);
         assert_eq!(log(&host), ["exit A", "exit A", "outfit true"]);
+    }
+
+    #[test]
+    fn a_seat_event_on_a_list_of_characters_fires_as_one_gets_in() {
+        let (host, events) = setup();
+        // As `MrxTaskObjectiveEnterVehicle` waits on
+        // `Player.GetAllCharacters()` (PmcCon003's "Board the Lucky Lady").
+        host.lua()
+            .load(
+                "Event.Create(Event.ObjectInSeat, { { 1 }, 99, 'a', 'ei' }, \
+                 function(d) table.insert(log, 'in ' .. d) end, { 'lady' })",
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        events.update(0.1, &world);
+        assert!(log(&host).is_empty());
+        world.seats.insert(1, 99);
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["in lady"]);
     }
 
     #[test]

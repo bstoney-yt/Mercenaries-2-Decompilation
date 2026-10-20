@@ -84,3 +84,17 @@ local function prompts(what, f)
 end
 Pg.AddContextAction = prompts('Add', Pg.AddContextAction)
 Pg.RemoveContextAction = prompts('Remove', Pg.RemoveContextAction)
+
+-- Every second, as it changes: the vehicle the scripts see her in
+-- (SEAT lines).
+local lastSeat
+local function seat()
+  local ok, v = pcall(function() return Vehicle.GetFromRider(Player.GetAnyCharacter()) end)
+  local s = tostring(ok and v)
+  if s ~= lastSeat then
+    say('>>> SEAT ' .. s)
+    lastSeat = s
+  end
+  Event.Create(Event.TimerRelative, { 1 }, seat, {})
+end
+Event.Create(Event.TimerRelative, { 1 }, seat, {})
