@@ -6646,6 +6646,8 @@ struct Running {
     /// the next one pressed goes to it, not to play.
     capturing: bool,
     culling: bool,
+    /// In the background (Android): no surface to draw to, and play waits.
+    background: bool,
     last: Instant,
     lag: Duration,
     fps: (Instant, u32),
@@ -6810,6 +6812,7 @@ impl App {
             alt: false,
             capturing: false,
             culling: !self.double_sided,
+            background: false,
             last: Instant::now(),
             lag: Duration::ZERO,
             fps: (Instant::now(), 0),
@@ -6939,6 +6942,9 @@ impl Running {
     /// Advances the simulation by whole ticks (none while the menu is
     /// open) and draws a frame with the HUD.
     fn frame(&mut self, config: &mut Config, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
+        if self.background {
+            return Ok(());
+        }
         let now = Instant::now();
         let dt = (now - self.last).min(MAX_FRAME).as_secs_f64();
         self.read_pad(dt);
@@ -7845,7 +7851,24 @@ impl Running {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
+        // Back from the background: a new surface for the window, and play
+        // goes on from where it waited.
+        if let Some(state) = self.state.as_mut() {
+            if std::mem::take(&mut state.background) {
+                let size = state.window.inner_size();
+                match state
+                    .backend
+                    .resume(state.window.clone(), size.width, size.height)
+                {
+                    Ok(()) => eprintln!("back from the background"),
+                    Err(e) => {
+                        eprintln!("back from the background: no surface ({e}); closing");
+                        event_loop.exit();
+                    }
+                }
+                state.last = Instant::now();
+                state.audio.out.set_paused(false);
+            }
             return;
         }
         match self.start(event_loop) {
@@ -8074,18 +8097,21 @@ impl ApplicationHandler for App {
         }
     }
 
-    /// Android takes the window away when the app goes to the background;
-    /// the renderer can't follow it to a new one yet, so the game closes.
-    #[cfg(target_os = "android")]
-    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
-            eprintln!("sent to the background: closing");
-            event_loop.exit();
+    /// Android takes the window's surface away when the app goes to the
+    /// background: the renderer lets it go and keeps all else, and play
+    /// waits (no ticks, no sound) until [`resumed`](Self::resumed).
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = self.state.as_mut() {
+            eprintln!("sent to the background: play waits");
+            state.backend.suspend();
+            state.background = true;
+            state.audio.out.set_paused(true);
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = &self.state {
+        // In the background no frames are asked for: play waits.
+        if let Some(state) = self.state.as_ref().filter(|s| !s.background) {
             state.window.request_redraw();
         }
     }

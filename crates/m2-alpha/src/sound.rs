@@ -64,6 +64,28 @@ impl AudioOut {
         }
     }
 
+    /// Stops the device playing (`paused`) or starts it again, as the app
+    /// goes to the background and comes back. Nothing without a device.
+    pub fn set_paused(&self, paused: bool) {
+        #[cfg(any(windows, target_os = "android"))]
+        if let Some(stream) = &self._stream {
+            use cpal::traits::StreamTrait as _;
+            let done = if paused {
+                stream.pause()
+            } else {
+                stream.play()
+            };
+            if let Err(e) = done {
+                eprintln!(
+                    "sound: could not {}: {e}",
+                    if paused { "pause" } else { "play" }
+                );
+            }
+        }
+        #[cfg(not(any(windows, target_os = "android")))]
+        let _ = paused;
+    }
+
     /// Runs `f` on the mixer (a poisoned lock is taken anyway: the mixer
     /// holds no invariants a panic could break).
     pub fn with<T>(&self, f: impl FnOnce(&mut Mixer) -> T) -> T {

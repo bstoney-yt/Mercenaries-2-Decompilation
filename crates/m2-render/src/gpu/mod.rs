@@ -383,8 +383,13 @@ struct DepthTargets {
 #[derive(Debug)]
 enum Target {
     Window {
-        surface: wgpu::Surface<'static>,
+        /// None while the app is in the background (Android takes the
+        /// window's surface away; [`WgpuBackend::suspend`]).
+        surface: Option<wgpu::Surface<'static>>,
         config: wgpu::SurfaceConfiguration,
+        /// To make the surface again on coming back
+        /// ([`WgpuBackend::resume`]).
+        instance: wgpu::Instance,
     },
     Offscreen {
         texture: wgpu::Texture,
@@ -579,7 +584,11 @@ impl WgpuBackend {
             adapter,
             device,
             queue,
-            Target::Window { surface, config },
+            Target::Window {
+                surface: Some(surface),
+                config,
+                instance,
+            },
             width.max(1),
             height.max(1),
         ))
@@ -1274,11 +1283,54 @@ impl WgpuBackend {
         self.width = width;
         self.height = height;
         self.size_world();
-        if let Target::Window { surface, config } = &mut self.target {
+        if let Target::Window {
+            surface, config, ..
+        } = &mut self.target
+        {
             config.width = width;
             config.height = height;
-            surface.configure(&self.device, config);
+            if let Some(surface) = surface {
+                surface.configure(&self.device, config);
+            }
         }
+    }
+
+    /// Lets the window's surface go, as Android takes it when the app goes
+    /// to the background: every texture, buffer and pipeline stays, and
+    /// frames are skipped until [`resume`](Self::resume).
+    pub fn suspend(&mut self) {
+        if let Target::Window { surface, .. } = &mut self.target {
+            *surface = None;
+        }
+    }
+
+    /// Makes the window's surface again for `window` (the same window, its
+    /// new native surface) at `width` x `height`, coming back from the
+    /// background.
+    pub fn resume<W>(&mut self, window: W, width: u32, height: u32) -> Result<(), BackendError>
+    where
+        W: wgpu::WindowHandle + wgpu::rwh::HasDisplayHandle + Send + Sync + 'static,
+    {
+        let Target::Window {
+            surface,
+            config,
+            instance,
+        } = &mut self.target
+        else {
+            return Ok(());
+        };
+        let made = instance.create_surface(window).map_err(device_error)?;
+        config.width = width.max(1);
+        config.height = height.max(1);
+        made.configure(&self.device, config);
+        *surface = Some(made);
+        let (w, h) = (config.width, config.height);
+        if (w, h) != (self.width, self.height) {
+            self.width = w;
+            self.height = h;
+            self.size_world();
+        }
+        Ok(())
     }
 
     /// Draws the world at `scale` (0.25 to 1) of the window's size, as a
@@ -1308,13 +1360,18 @@ impl WgpuBackend {
 
     /// Switches vertical sync (window targets only).
     pub fn set_vsync(&mut self, vsync: bool) {
-        if let Target::Window { surface, config } = &mut self.target {
+        if let Target::Window {
+            surface, config, ..
+        } = &mut self.target
+        {
             config.present_mode = if vsync {
                 wgpu::PresentMode::AutoVsync
             } else {
                 wgpu::PresentMode::AutoNoVsync
             };
-            surface.configure(&self.device, config);
+            if let Some(surface) = surface {
+                surface.configure(&self.device, config);
+            }
         }
     }
 
@@ -2511,7 +2568,13 @@ impl WgpuBackend {
                 let overlay = over(&target, &mut overlay);
                 self.queue.submit(std::iter::once(commands).chain(overlay));
             }
-            Target::Window { surface, config } => {
+            // In the background: nothing to draw to.
+            Target::Window { surface: None, .. } => {}
+            Target::Window {
+                surface: Some(surface),
+                config,
+                ..
+            } => {
                 let frame = match surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(f)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
