@@ -200,6 +200,9 @@ pub struct Pad {
     pub invert: bool,
     /// The controller the window's events report (Android's).
     pub events: Events,
+    /// The on-screen pad (a phone without a controller), read with the
+    /// controller's.
+    pub touch: crate::touch::Touch,
 }
 
 impl Pad {
@@ -219,7 +222,12 @@ impl Pad {
                 }
             );
         }
-        let s = state.unwrap_or_default();
+        let mut s = state.unwrap_or_default();
+        if self.touch.used {
+            s = crate::touch::merge(s, self.touch.state());
+            let (dx, dy) = self.touch.take_look();
+            input.pad_look(dx, if self.invert { -dy } else { dy });
+        }
         let keys = Self::menu_keys(&self.last, &s);
         self.feed(input, s, driving, dt);
         keys

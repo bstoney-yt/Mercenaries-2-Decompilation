@@ -87,6 +87,7 @@ mod startup;
 mod strikes;
 mod subtitles;
 mod support;
+mod touch;
 mod traffic;
 mod ui;
 
@@ -6805,7 +6806,11 @@ impl App {
             },
             was_driving: false,
             input: Input::default(),
-            pad: pad::Pad::default(),
+            pad: {
+                let mut pad = pad::Pad::default();
+                pad.touch.resize(size.width, size.height);
+                pad
+            },
             mouse_look: false,
             released: false,
             focused,
@@ -7006,6 +7011,9 @@ impl Running {
             state.gui_calls = gui_calls;
             state.pad = self.input.pad();
             info.game = Some(state);
+        }
+        if self.pad.touch.used {
+            info.touch = Some(self.pad.touch.picture());
         }
         let (action, output) = spans::time("hud", || self.hud.build(input, &info, config));
         self.platform_output(output);
@@ -7920,6 +7928,24 @@ impl ApplicationHandler for App {
             }
             return;
         }
+        // Fingers on the screen in play are the touch controls'; in the
+        // menus and the front end they are egui's (taps as clicks), and
+        // whatever the controls held is let go.
+        if let WindowEvent::Touch(t) = &event {
+            let playing = !state.hud.menu && state.flow.as_ref().is_none_or(|f| !f.holds());
+            if playing {
+                let at = [t.location.x as f32, t.location.y as f32];
+                match t.phase {
+                    winit::event::TouchPhase::Started => state.pad.touch.down(t.id, at),
+                    winit::event::TouchPhase::Moved => state.pad.touch.moved(t.id, at),
+                    winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled => {
+                        state.pad.touch.up(t.id);
+                    }
+                }
+                return;
+            }
+            state.pad.touch.clear();
+        }
         // The menu takes the mouse and keys while it is open (Escape still
         // closes it).
         let to_menu = state.hud.menu
@@ -7936,7 +7962,10 @@ impl ApplicationHandler for App {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => state.backend.resize(size.width, size.height),
+            WindowEvent::Resized(size) => {
+                state.backend.resize(size.width, size.height);
+                state.pad.touch.resize(size.width, size.height);
+            }
             WindowEvent::Focused(focused) => {
                 // Keys pressed or released elsewhere never reach us, so start
                 // clean either way.

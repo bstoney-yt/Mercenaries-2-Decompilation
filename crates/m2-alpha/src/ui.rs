@@ -63,6 +63,9 @@ pub struct HudInfo {
     pub mission: Option<MissionView>,
     /// World to clip, for placing markers.
     pub view_proj: Option<Mat4>,
+    /// The on-screen touch controls to draw over play, once a finger has
+    /// touched the screen ([`crate::touch`]).
+    pub touch: Option<crate::touch::Picture>,
     /// What the game's HUD is told, if it runs.
     pub game: Option<HudState>,
     /// Her support: the item ready, the designator, the satellite's view,
@@ -386,6 +389,14 @@ impl Hud {
             .is_some_and(crate::loading::LoadingScreen::showing);
         let output = self.ctx.run_ui(input, |ui| {
             hud(ui, info, game, covered);
+            if let (false, false, Some(touch)) = (menu, covered, &info.touch) {
+                let ctx = ui.ctx().clone();
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    "touch controls".into(),
+                ));
+                crate::touch::paint(touch, &painter, ctx.content_rect(), ctx.pixels_per_point());
+            }
             if let Some(screen) = loading.as_deref_mut() {
                 let ctx = ui.ctx().clone();
                 let painter = ctx.layer_painter(egui::LayerId::new(
