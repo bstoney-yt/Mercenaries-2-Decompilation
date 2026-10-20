@@ -2399,7 +2399,7 @@ fn landing(physics: &Physics, at: Vec3, toward: Vec3) -> Option<Vec3> {
                 let rise = spot.y - water;
                 // Dry: shallows she still swims in (round 30's AllCon002:
                 // 1900 s from one to the next) are no way out.
-                (n.y >= 0.7 && rise <= SPOT_RISE && rise >= LANDING_DRY).then_some(spot)
+                (n.y >= 0.7 && (LANDING_DRY..=SPOT_RISE).contains(&rise)).then_some(spot)
             })
             .min_by(|a, b| a.distance(toward).total_cmp(&b.distance(toward)))
     })
