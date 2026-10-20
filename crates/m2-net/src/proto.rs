@@ -7,16 +7,27 @@
 //!
 //! Two channels carry them:
 //! - the reliable stream (in order, never lost): [`Msg::Hello`],
-//!   [`Msg::Welcome`], [`Msg::Bye`], each framed by a `u16` length;
-//! - datagrams (latest wins, may be lost or reordered): [`Msg::Hero`],
-//!   sent many times a second, each one whole, so a lost one is simply
-//!   replaced by the next.
+//!   [`Msg::Welcome`], [`Msg::Bye`], [`Msg::Kind`], [`Msg::PersonIn`],
+//!   [`Msg::PersonOut`], each framed by a `u16` length;
+//! - datagrams (latest wins, may be lost or reordered): [`Msg::Hero`]
+//!   and [`Msg::People`], sent many times a second, each one whole, so a
+//!   lost one is simply replaced by the next.
+//!
+//! The host's people reach the friend in three steps: a kind (which
+//! model, by the template's name and the model's hash, never the host's
+//! own list index) once, then each person as they come near the friend
+//! (`PersonIn`, with their look), then their place many times a second
+//! (`People`) until they go (`PersonOut`).
 
 use thiserror::Error;
 
 /// Bumped whenever a message changes shape. Games that differ refuse
 /// each other in the handshake rather than misreading.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
+
+/// The most people one [`Msg::People`] datagram carries (a datagram
+/// must fit a packet: 40 of 22 bytes is 880).
+pub const PEOPLE_PER_DATAGRAM: usize = 40;
 
 /// The longest string a message may carry (names), bytes.
 pub const MAX_STRING: usize = 64;
@@ -31,6 +42,65 @@ pub enum Msg {
     Bye(String),
     /// Where a player's hero is now.
     Hero(HeroState),
+    /// Host: a kind of person, which [`PersonIn`]s name by `id`.
+    Kind(KindInfo),
+    /// Host: a person now shared with the friend.
+    PersonIn(PersonIn),
+    /// Host: a person no longer shared (gone, or far from the friend).
+    PersonOut(u32),
+    /// Host: where the shared people are now.
+    People(PeopleBatch),
+}
+
+/// A kind of person as the host has loaded it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KindInfo {
+    /// The host's number for it, only to name it in [`PersonIn`].
+    pub id: u16,
+    /// The template's name (`named`), else the catalogue role
+    /// (`vz_hum_soldier`).
+    pub name: String,
+    /// The model's name hash.
+    pub model: u32,
+    pub named: bool,
+}
+
+/// A person the friend's game should show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonIn {
+    /// The host's id for this person for the session.
+    pub net_id: u32,
+    pub kind: u16,
+    /// Which of the model's nodes are hidden (their outfit, picked at
+    /// random on the host), one bit each, low bit first.
+    pub outfit: Vec<bool>,
+    /// Holds a gun.
+    pub armed: bool,
+}
+
+/// One person's place, in a [`PeopleBatch`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PersonState {
+    pub net_id: u32,
+    pub position: [f32; 3],
+    pub facing: f32,
+    pub gait: Gait,
+    pub flags: u8,
+}
+
+impl PersonState {
+    pub const ALIVE: u8 = 1;
+    pub const AIMING: u8 = 2;
+    pub const DOWN: u8 = 4;
+    pub const SWIMMING: u8 = 8;
+}
+
+/// Where some of the shared people are, at the host's `time` (the
+/// session clock, as [`HeroState::time`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PeopleBatch {
+    pub time: f64,
+    pub people: Vec<PersonState>,
 }
 
 /// Who a player is: the build they run, the hero they play, their name.
@@ -112,6 +182,12 @@ const TAG_HELLO: u8 = 1;
 const TAG_WELCOME: u8 = 2;
 const TAG_BYE: u8 = 3;
 const TAG_HERO: u8 = 4;
+const TAG_KIND: u8 = 5;
+const TAG_PERSON_IN: u8 = 6;
+const TAG_PERSON_OUT: u8 = 7;
+const TAG_PEOPLE: u8 = 8;
+/// The most nodes an outfit mask may name.
+const MAX_OUTFIT: usize = 1024;
 
 impl Msg {
     pub fn encode(&self) -> Vec<u8> {
@@ -141,6 +217,46 @@ impl Msg {
                 w.extend_from_slice(&s.facing.to_le_bytes());
                 w.push(s.gait as u8);
                 w.push(s.flags);
+            }
+            Msg::Kind(k) => {
+                w.push(TAG_KIND);
+                w.extend_from_slice(&k.id.to_le_bytes());
+                put_str(&mut w, &k.name);
+                w.extend_from_slice(&k.model.to_le_bytes());
+                w.push(k.named as u8);
+            }
+            Msg::PersonIn(p) => {
+                w.push(TAG_PERSON_IN);
+                w.extend_from_slice(&p.net_id.to_le_bytes());
+                w.extend_from_slice(&p.kind.to_le_bytes());
+                let n = p.outfit.len().min(MAX_OUTFIT);
+                w.extend_from_slice(&(n as u16).to_le_bytes());
+                for chunk in p.outfit[..n].chunks(8) {
+                    let byte = chunk
+                        .iter()
+                        .enumerate()
+                        .fold(0u8, |b, (i, &on)| b | (u8::from(on) << i));
+                    w.push(byte);
+                }
+                w.push(p.armed as u8);
+            }
+            Msg::PersonOut(id) => {
+                w.push(TAG_PERSON_OUT);
+                w.extend_from_slice(&id.to_le_bytes());
+            }
+            Msg::People(b) => {
+                w.push(TAG_PEOPLE);
+                w.extend_from_slice(&b.time.to_le_bytes());
+                let n = b.people.len().min(PEOPLE_PER_DATAGRAM);
+                w.push(n as u8);
+                for p in &b.people[..n] {
+                    w.extend_from_slice(&p.net_id.to_le_bytes());
+                    for v in p.position.iter().chain([&p.facing]) {
+                        w.extend_from_slice(&v.to_le_bytes());
+                    }
+                    w.push(p.gait as u8);
+                    w.push(p.flags);
+                }
             }
         }
         w
@@ -185,6 +301,65 @@ impl Msg {
                     gait,
                     flags,
                 })
+            }
+            TAG_KIND => Msg::Kind(KindInfo {
+                id: r.u16()?,
+                name: r.string()?,
+                model: r.u32()?,
+                named: r.u8()? != 0,
+            }),
+            TAG_PERSON_IN => {
+                let net_id = r.u32()?;
+                let kind = r.u16()?;
+                let n = r.u16()? as usize;
+                if n > MAX_OUTFIT {
+                    return Err(DecodeError::Bad("outfit"));
+                }
+                let mut outfit = Vec::with_capacity(n);
+                for _ in 0..n.div_ceil(8) {
+                    let byte = r.u8()?;
+                    for i in 0..8 {
+                        if outfit.len() < n {
+                            outfit.push(byte & (1 << i) != 0);
+                        }
+                    }
+                }
+                Msg::PersonIn(PersonIn {
+                    net_id,
+                    kind,
+                    outfit,
+                    armed: r.u8()? != 0,
+                })
+            }
+            TAG_PERSON_OUT => Msg::PersonOut(r.u32()?),
+            TAG_PEOPLE => {
+                let time = r.f64()?;
+                let n = r.u8()? as usize;
+                if n > PEOPLE_PER_DATAGRAM {
+                    return Err(DecodeError::Bad("people count"));
+                }
+                let mut people = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let net_id = r.u32()?;
+                    let position = [r.f32()?, r.f32()?, r.f32()?];
+                    let facing = r.f32()?;
+                    let gait = Gait::from_u8(r.u8()?)?;
+                    let flags = r.u8()?;
+                    if !(position.iter().all(|v| v.is_finite()) && facing.is_finite()) {
+                        return Err(DecodeError::Bad("number"));
+                    }
+                    people.push(PersonState {
+                        net_id,
+                        position,
+                        facing,
+                        gait,
+                        flags,
+                    });
+                }
+                if !time.is_finite() {
+                    return Err(DecodeError::Bad("number"));
+                }
+                Msg::People(PeopleBatch { time, people })
             }
             tag => return Err(DecodeError::Tag(tag)),
         };
@@ -268,6 +443,32 @@ mod tests {
             Msg::Welcome(hello),
             Msg::Bye("host quit".into()),
             Msg::Hero(hero()),
+            Msg::Kind(KindInfo {
+                id: 3,
+                name: "vz_hum_soldier".into(),
+                model: 0x1234_5678,
+                named: false,
+            }),
+            Msg::PersonIn(PersonIn {
+                net_id: 77,
+                kind: 3,
+                outfit: (0..19).map(|i| i % 3 == 0).collect(),
+                armed: true,
+            }),
+            Msg::PersonOut(77),
+            Msg::People(PeopleBatch {
+                time: 3.5,
+                people: vec![
+                    PersonState {
+                        net_id: 77,
+                        position: [1.0, 2.0, 3.0],
+                        facing: 0.5,
+                        gait: Gait::Walk,
+                        flags: PersonState::ALIVE | PersonState::AIMING,
+                    };
+                    2
+                ],
+            }),
         ] {
             assert_eq!(Msg::decode(&msg.encode()), Ok(msg));
         }
@@ -278,6 +479,18 @@ mod tests {
         // Tag, seq, time, six floats, facing, gait, flags: small enough
         // that 30 a second is about 1.3 KB/s each way.
         assert_eq!(Msg::Hero(hero()).encode().len(), 1 + 4 + 8 + 24 + 4 + 2);
+    }
+
+    #[test]
+    fn a_full_people_datagram_fits_a_packet() {
+        let full = Msg::People(PeopleBatch {
+            time: 1.0,
+            people: vec![PersonState::default(); PEOPLE_PER_DATAGRAM + 5],
+        })
+        .encode();
+        // Tag, time, count, then 22 bytes each; the extra five left out.
+        assert_eq!(full.len(), 1 + 8 + 1 + 22 * PEOPLE_PER_DATAGRAM);
+        assert!(full.len() < 1100);
     }
 
     #[test]

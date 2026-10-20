@@ -2758,8 +2758,17 @@ impl Scene {
             && let Some((model, rig)) = &p.body
         {
             let (nodes, skin) = rig.posed();
-            model.draw_posed(backend, queue, p.model_matrix(), &nodes, &skin)?;
+            let body = p.model_matrix();
+            model.draw_posed(backend, queue, body, &nodes, &skin)?;
             p.drawn.set(p.drawn.get() + 1);
+            // A rifle in hand (which gun they hold isn't sent yet).
+            if let Some(w) = self.arsenal.rifle.as_ref()
+                && let Some(at) =
+                    self.arsenal
+                        .in_hand(w, body, &nodes, (p.hand, p.attach), rig.two_handed)
+            {
+                w.model.draw(queue, at);
+            }
         }
         for n in &self.people.npcs {
             if !n.landed || n.character.position.distance(eye) > npc::DRAW_DISTANCE {

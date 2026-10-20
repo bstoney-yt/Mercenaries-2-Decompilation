@@ -1204,7 +1204,10 @@ impl Game {
             .and_then(|i| self.scene.vehicles.get(i))
             .and_then(|v| v.spec.tuning.armour)
             .unwrap_or(1);
+        // Joined to a co-op host, the host's people stand in for ours
+        // (`crate::coop`): none are spawned, thought for or run over here.
         if let Some(world) = &mut self.scene.world
+            && !self.scene.people.mirror
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {
             self.scene

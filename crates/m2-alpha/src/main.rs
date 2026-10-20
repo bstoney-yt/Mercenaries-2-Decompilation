@@ -80,6 +80,7 @@ mod roads;
 mod route;
 mod save;
 mod scene;
+mod shared;
 mod shell;
 mod shopcheck;
 mod sound;

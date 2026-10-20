@@ -17,7 +17,7 @@ use iroh::{Endpoint, RelayMode, SecretKey};
 use tokio::sync::mpsc as tmpsc;
 
 use crate::invite::Invite;
-use crate::proto::{Hello, HeroState, Msg, VERSION};
+use crate::proto::{Hello, HeroState, Msg, PeopleBatch, VERSION};
 
 /// The protocol the two games agree on in the QUIC handshake.
 pub const ALPN: &[u8] = b"m2-alpha/coop/1";
@@ -39,6 +39,10 @@ pub enum Event {
     Connected(Hello),
     /// The other player's hero, and when it arrived ([`Session::now`]).
     Hero(HeroState, f64),
+    /// The host's people's places, and when they arrived.
+    People(PeopleBatch, f64),
+    /// Any other message from the other game (on the reliable stream).
+    Message(Msg),
     /// How the link is doing.
     Link {
         rtt: Duration,
@@ -70,6 +74,8 @@ pub struct Options {
 #[derive(Debug)]
 enum Cmd {
     Hero(HeroState),
+    /// Any other message: on the reliable stream, or as a datagram.
+    Send(Msg, bool),
     Leave,
 }
 
@@ -137,6 +143,12 @@ impl Session {
     /// Sends this player's hero (dropped if no one is connected).
     pub fn send_hero(&self, state: HeroState) {
         let _ = self.cmds.send(Cmd::Hero(state));
+    }
+
+    /// Sends `msg` in order and for sure (`reliable`), or as a datagram
+    /// that may be lost. Dropped if no one is connected.
+    pub fn send(&self, msg: Msg, reliable: bool) {
+        let _ = self.cmds.send(Cmd::Send(msg, reliable));
     }
 
     /// Says goodbye to the other player and stops.
@@ -219,7 +231,7 @@ async fn host(
             },
             cmd = cmds.recv() => match cmd {
                 None | Some(Cmd::Leave) => break,
-                Some(Cmd::Hero(_)) => continue,
+                Some(Cmd::Hero(_) | Cmd::Send(..)) => continue,
             },
         };
         let conn = match incoming.accept() {
@@ -325,6 +337,7 @@ async fn play(
             d = conn.read_datagram() => match d {
                 Ok(bytes) => match Msg::decode(&bytes) {
                     Ok(Msg::Hero(s)) => out.send(Event::Hero(s, out.now())),
+                    Ok(Msg::People(b)) => out.send(Event::People(b, out.now())),
                     Ok(other) => eprintln!("coop: unexpected datagram {other:?}"),
                     Err(e) => eprintln!("coop: bad datagram: {e}"),
                 },
@@ -338,7 +351,7 @@ async fn play(
                     out.send(Event::Disconnected(why));
                     break true;
                 }
-                Some(Ok(other)) => eprintln!("coop: unexpected message {other:?}"),
+                Some(Ok(other)) => out.send(Event::Message(other)),
                 Some(Err(e)) => {
                     out.send(Event::Disconnected(e));
                     break true;
@@ -355,6 +368,17 @@ async fn play(
                     seq_out += 1;
                     s.seq = seq_out;
                     if let Err(e) = conn.send_datagram(Msg::Hero(s).encode().into()) {
+                        eprintln!("coop: could not send: {e}");
+                    }
+                }
+                Some(Cmd::Send(msg, true)) => {
+                    if let Err(e) = write_frame(&mut send, &msg).await {
+                        out.send(Event::Disconnected(format!("lost the connection: {e}")));
+                        break true;
+                    }
+                }
+                Some(Cmd::Send(msg, false)) => {
+                    if let Err(e) = conn.send_datagram(msg.encode().into()) {
                         eprintln!("coop: could not send: {e}");
                     }
                 }

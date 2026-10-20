@@ -9,11 +9,22 @@
 //!
 //! `--local` keeps to direct addresses (no relay). Prints `invite:` when
 //! hosting, then a `peer:` line each second: snapshots received, the
-//! link's round trip and whether it goes through the relay.
+//! link's round trip and whether it goes through the relay, and what of
+//! the host's people came (kinds, people in and out, places).
+//!
+//! `--people N` sends N soldiers of its own as a host's game would,
+//! walking circles round the other hero, to test a joining game's
+//! mirror of the host's people.
 
 use std::time::{Duration, Instant};
 
-use m2_net::{Event, Gait, Hello, HeroState, Invite, Options, Session};
+use std::collections::HashSet;
+
+use m2_net::proto::PEOPLE_PER_DATAGRAM;
+use m2_net::{
+    Event, Gait, Hello, HeroState, Invite, KindInfo, Msg, Options, PeopleBatch, PersonIn,
+    PersonState, Session,
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -24,6 +35,7 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+    let people: u32 = value("--people").map_or(0, |s| s.parse().expect("--people"));
     let seconds: f64 = value("--seconds").map_or(30.0, |s| s.parse().expect("--seconds"));
     // Round this point, or round the other hero where it first is.
     let mut centre: Option<[f32; 3]> = value("--at").map(|s| {
@@ -57,6 +69,10 @@ fn main() {
     let mut received = 0u32;
     let mut last_log = 0.0;
     let mut link = String::from("-");
+    let (mut kinds, mut ins, mut outs, mut states) = (0u32, 0u32, 0u32, 0u32);
+    let mut seen = HashSet::new();
+    let mut announced = false;
+    let mut last_people = 0.0;
     while started.elapsed().as_secs_f64() < seconds {
         for e in session.poll() {
             match e {
@@ -87,6 +103,20 @@ fn main() {
                         if relayed { "relayed" } else { "direct" }
                     );
                 }
+                Event::People(b, _) => {
+                    states += b.people.len() as u32;
+                    seen.extend(b.people.iter().map(|p| p.net_id));
+                }
+                Event::Message(Msg::Kind(k)) => {
+                    kinds += 1;
+                    println!(
+                        "kind {}: {} {:08x} named {}",
+                        k.id, k.name, k.model, k.named
+                    );
+                }
+                Event::Message(Msg::PersonIn(_)) => ins += 1,
+                Event::Message(Msg::PersonOut(_)) => outs += 1,
+                Event::Message(m) => println!("message: {m:?}"),
                 Event::Disconnected(why) => println!("disconnected: {why}"),
                 Event::Failed(why) => {
                     println!("failed: {why}");
@@ -112,11 +142,64 @@ fn main() {
                 gait: Gait::Run,
                 ..Default::default()
             });
+            if people > 0 && !announced {
+                announced = true;
+                session.send(
+                    Msg::Kind(KindInfo {
+                        id: 0,
+                        name: "vz_hum_soldier".into(),
+                        model: 0,
+                        named: false,
+                    }),
+                    true,
+                );
+                for id in 1..=people {
+                    session.send(
+                        Msg::PersonIn(PersonIn {
+                            net_id: id,
+                            kind: 0,
+                            outfit: Vec::new(),
+                            armed: true,
+                        }),
+                        true,
+                    );
+                }
+            }
+            if people > 0 && t - last_people >= 0.1 {
+                last_people = t;
+                // Each walks its own circle, 3 m out and 1.5 m more each,
+                // the other way round at 1.4 m/s.
+                let all: Vec<PersonState> = (1..=people)
+                    .map(|id| {
+                        let r = 3.0 + 1.5 * id as f32;
+                        let a = -(t as f32) * 1.4 / r + id as f32;
+                        PersonState {
+                            net_id: id,
+                            position: [centre[0] + r * a.cos(), centre[1], centre[2] + r * a.sin()],
+                            facing: (a.sin()).atan2(-a.cos()),
+                            gait: Gait::Walk,
+                            flags: PersonState::ALIVE,
+                        }
+                    })
+                    .collect();
+                for chunk in all.chunks(PEOPLE_PER_DATAGRAM) {
+                    session.send(
+                        Msg::People(PeopleBatch {
+                            time: t,
+                            people: chunk.to_vec(),
+                        }),
+                        false,
+                    );
+                }
+            }
         }
         let t = started.elapsed().as_secs_f64();
         if connected_at.is_some() && t - last_log >= 1.0 {
             last_log = t;
-            println!("peer: t {t:.0} s, received {received}, {link}");
+            println!(
+                "peer: t {t:.0} s, received {received}, {link}; people: {kinds} kinds, {ins} in, {outs} out, {states} places of {} people",
+                seen.len()
+            );
         }
         std::thread::sleep(Duration::from_millis(33));
     }

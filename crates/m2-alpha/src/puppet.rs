@@ -28,6 +28,10 @@ pub struct Puppet {
     pub shown: bool,
     /// Frames it was drawn in (for the test runs' log).
     pub drawn: std::cell::Cell<u32>,
+    /// Its skeleton's right hand and attach point, where its rifle is
+    /// held (as each person's are found).
+    pub hand: Option<usize>,
+    pub attach: Option<usize>,
 }
 
 impl std::fmt::Debug for Puppet {
@@ -42,6 +46,9 @@ impl std::fmt::Debug for Puppet {
 
 impl Puppet {
     pub fn new(hero: Hero, name: String, body: Option<(GpuModel, Rig)>, clips: FightClips) -> Self {
+        let rig = body.as_ref().map(|(_, rig)| rig);
+        let hand = rig.and_then(Rig::rifle_hand);
+        let attach = rig.and_then(|r| crate::combat::right_attach(&r.skeleton));
         Self {
             hero,
             name,
@@ -51,6 +58,8 @@ impl Puppet {
             facing: 0.0,
             shown: false,
             drawn: Default::default(),
+            hand,
+            attach,
         }
     }
 

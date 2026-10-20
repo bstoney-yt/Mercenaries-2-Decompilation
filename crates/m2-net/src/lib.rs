@@ -16,5 +16,5 @@ pub mod session;
 
 pub use interp::{Playback, Pose};
 pub use invite::{Invite, InviteError};
-pub use proto::{Gait, Hello, HeroState, Msg};
+pub use proto::{Gait, Hello, HeroState, KindInfo, Msg, PeopleBatch, PersonIn, PersonState};
 pub use session::{Event, Options, Session};

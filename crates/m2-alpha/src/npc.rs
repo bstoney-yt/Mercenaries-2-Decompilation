@@ -873,6 +873,9 @@ pub struct Npc {
     pub swim: Option<NpcSwim>,
     /// Standing up out of the water: the climb-out's seconds left.
     climbing: f32,
+    /// This person's id in online co-op: the host's own (from
+    /// [`next_net_id`]), or on a friend's game the host's for them.
+    pub net_id: u32,
 }
 
 /// Someone swimming: how long they have been in, and the shore they make
@@ -882,6 +885,14 @@ pub struct NpcSwim {
     pub since: f32,
     pub shore: Option<Vec3>,
     look: f32,
+}
+
+/// Counts up for each person made, so co-op can name them to the other
+/// game (indices shift as people come and go).
+static NET_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn next_net_id() -> u32 {
+    NET_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// What a person shouts.
@@ -1021,6 +1032,7 @@ impl Npc {
             through: false,
             swim: None,
             climbing: 0.0,
+            net_id: next_net_id(),
         }
     }
 
@@ -1131,6 +1143,30 @@ impl Npc {
         };
         self.rig.advance(dt * rate);
         true
+    }
+
+    /// Online co-op, on a friend's game: plays the clips for how the host
+    /// says they move (`gait`, aiming), at the rate their speed `moved`
+    /// sets, as [`Npc::update`]'s own tail does; the dead play their fall
+    /// on. Their place is set from outside.
+    pub(crate) fn mirror_step(&mut self, gait: Gait, aiming: bool, moved: f32, dt: f32) {
+        if !self.alive {
+            self.dead_for += dt;
+            self.rig.advance(dt);
+            return;
+        }
+        if self.gun.is_some() || self.soldier {
+            let carry = if aiming { Carry::Aim } else { Carry::Ready };
+            self.rig.hold_rifle(gait, &self.clips, carry);
+        } else {
+            self.rig.set_gait(gait);
+        }
+        self.rig.aim_along(self.facing, None);
+        let rate = match self.rig.gait_speed(gait) {
+            Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
+            _ => 1.0,
+        };
+        self.rig.advance(dt * rate);
     }
 
     /// Takes `damage`; at no health left, falls: true if it killed.
@@ -2066,6 +2102,9 @@ pub struct People {
     /// 0 against that class holds his fire ([`Npc::rates_target`]). 0
     /// (unset) is taken as 1.
     pub target_armour: u32,
+    /// Joined to an online co-op host: these are the host's people,
+    /// placed by `crate::coop`, not spawned or moved here.
+    pub mirror: bool,
     /// What soldiers near her have been at (for checking).
     pub idle: IdleTally,
     /// What shouldn't happen to anyone (for checking).

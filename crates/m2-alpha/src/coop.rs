@@ -63,6 +63,10 @@ pub struct Coop {
     last_log: f64,
     last_puppet: Option<(m2_math::glam::Vec3, f64)>,
     pub stats: Stats,
+    /// Hosting: the people shared with the friend.
+    pub share: Option<crate::shared::HostShare>,
+    /// Joined: the host's people, shown here.
+    pub mirror: Option<crate::shared::Mirror>,
 }
 
 impl std::fmt::Debug for Coop {
@@ -122,6 +126,8 @@ impl Coop {
             last_log: 0.0,
             last_puppet: None,
             stats: Stats::default(),
+            share: matches!(setup.role, Role::Host).then(Default::default),
+            mirror: matches!(setup.role, Role::Join(_)).then(Default::default),
         }
     }
 
@@ -154,6 +160,17 @@ impl Coop {
                 self.stats.speeds.push(speed);
             }
             self.last_puppet = Some((p.position, now));
+        }
+        if self.peer.is_some()
+            && let Some(share) = &mut self.share
+            && let Some(friend) = game.scene.puppet.as_ref().filter(|p| p.shown)
+        {
+            share.tick(game, friend.position, &self.session, now);
+        }
+        if self.peer.is_some()
+            && let Some(mirror) = &mut self.mirror
+        {
+            mirror.tick(game, now, dt);
         }
         let t = self.started.elapsed().as_secs_f64();
         if self.peer.is_some() && t - self.last_log >= 1.0 {
@@ -202,6 +219,15 @@ impl Coop {
                 self.stats.rtt_ms.push(rtt.as_secs_f64() * 1e3);
                 self.stats.relayed = Some(relayed);
             }
+            Event::People(b, at) => {
+                if let Some(m) = &mut self.mirror {
+                    m.batch(b, at);
+                }
+            }
+            Event::Message(msg) => match &mut self.mirror {
+                Some(m) => m.message(msg),
+                None => eprintln!("coop: unexpected message {msg:?}"),
+            },
             Event::Disconnected(why) => {
                 eprintln!("coop: the other player is gone: {why}");
                 self.peer = None;
@@ -253,6 +279,32 @@ impl Coop {
                 .as_ref()
                 .map_or(0.0, |p| p.position.distance(me)),
         );
+        if let Some(s) = &self.share {
+            eprintln!(
+                "coop: sharing {} people near the friend (most {}; {} in, {} out)",
+                s.shared, s.most, s.sent_in, s.sent_out
+            );
+        }
+        if let Some(m) = &self.mirror {
+            let stood = game.scene.people.npcs.len();
+            let me = game.scene.player.as_ref().map(|p| p.character.position);
+            let nearest = me.and_then(|me| {
+                game.scene
+                    .people
+                    .npcs
+                    .iter()
+                    .map(|n| n.character.position.distance(me))
+                    .reduce(f32::min)
+            });
+            eprintln!(
+                "coop: the host's people: {} known, {stood} stood (most {}), {} made, {} places; nearest {}",
+                m.known(),
+                m.most,
+                m.made,
+                m.places,
+                nearest.map_or("-".to_owned(), |d| format!("{d:.1} m")),
+            );
+        }
     }
 
     /// The run's numbers in one line.
