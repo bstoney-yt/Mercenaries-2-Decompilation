@@ -160,6 +160,8 @@ const CROSS_SECONDS: f32 = 3.0;
 /// it, metres (invented).
 const CARGO_GUARD: f32 = 60.0;
 const CARGO_NEAR: f32 = 100.0;
+/// She clears them for at most this long, seconds (invented).
+const GUARD_MOST: f32 = 90.0;
 const ONCOMING_SIDE: f32 = 3.0;
 const SWERVE: f32 = 0.35;
 /// Waiting this long (seconds) in a vehicle she drove to a place to
@@ -389,6 +391,9 @@ pub struct Autoplay {
     /// What her vehicles stuck on (each box's least and most corner, x
     /// and z, with room round it), kept out of on the ways she drives.
     avoid: Vec<(Vec2, Vec2)>,
+    /// Until when (her clock) she clears the soldiers round a truck with
+    /// goods on it before driving it ([`CARGO_GUARD`]), once begun.
+    guard_until: std::cell::Cell<Option<f32>>,
     way_logged: f32,
     /// Hops: from, to.
     pub hops: Vec<(Vec3, Vec3)>,
@@ -640,7 +645,15 @@ impl Autoplay {
         // round a truck with goods on it near her, before she drives it
         // off (PirCon003 round 61: three ran after the parrot truck and
         // a grenade broke its boxes when it caught on a wall).
+        // For at most [`GUARD_MOST`]: a base keeps sending more
+        // (PirCon004 round 75: 1000 s went on its soldiers and their
+        // drops before she took the truck).
+        let guarding = self
+            .guard_until
+            .get()
+            .is_none_or(|until| self.clock < until);
         let guarded: Vec<Vec3> = (0..vehicles.len())
+            .filter(|_| guarding)
             .filter(|&j| game.scene.props.carrying(j))
             .filter_map(|j| vehicle_at(game, j))
             .map(|t| t.w_axis.truncate())
@@ -660,6 +673,11 @@ impl Autoplay {
                     )
                 })
                 .filter(|&(_, d, guard)| d < DEFEND || guard)
+                .inspect(|&(_, d, _)| {
+                    if d >= DEFEND && self.guard_until.get().is_none() {
+                        self.guard_until.set(Some(self.clock + GUARD_MOST));
+                    }
+                })
                 .map(|(i, d, _)| (i, d))
                 .min_by(|a, b| a.1.total_cmp(&b.1))
         {
