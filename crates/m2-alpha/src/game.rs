@@ -2804,6 +2804,28 @@ fn knock_loose(
         .enumerate()
     {
         let Some(id) = v.id else { continue };
+        // The scripts' vehicles with a load bed take up what stands on it
+        // as soon as they are placed, standing or not: the scripts count
+        // the goods on the bed from then on (PirCon002 counted none, and
+        // gave up, while the truck stood with its jugs still the layer's).
+        if let (Some(_), Some(b), Some(place)) = (v.guid, bed, world.physics.vehicle_transform(id))
+        {
+            let standing = Crasher {
+                place,
+                bounds: v.model.bounds,
+                velocity: Vec3::ZERO,
+                mass: v.spec.mass,
+            };
+            for k in world.physics.statics_in_box(place, v.model.bounds) {
+                if let StaticKey::Entity(e) = k
+                    && !props.is_cargo(e)
+                    && on_bed(props, &standing, *b, e)
+                    && props.load(&mut world.physics, e, (index, id), b.y)
+                {
+                    eprintln!("cargo: {e:#x} rides on the {}", v.spec.label);
+                }
+            }
+        }
         let before = world.physics.vehicle_velocity_before(id);
         let mut speed = before.length();
         if world.physics.vehicle_pulling(id) {
