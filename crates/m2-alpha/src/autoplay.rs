@@ -85,6 +85,9 @@ const PLANT_AWAY: f32 = 12.0;
 /// A prompt at her goal is taken again after this long (seconds) if it is
 /// still offered. Invented.
 const PRESS_AGAIN: f32 = 3.0;
+/// A spot to fire from more than this above or below her once she is
+/// over it is one she can't get to (metres). Invented.
+const SPOT_RISE: f32 = 2.5;
 const VANTAGE_CLIMB: f32 = 3.0;
 /// Driving: she eases off within this far of a place (metres) above this
 /// speed (m/s); stuck this long (seconds), she backs out for this long.
@@ -789,9 +792,21 @@ impl Autoplay {
                 .is_some_and(|v| !v.wrecked && !v.spec.is_boat())
                 && vehicle_at(game, i).is_some_and(|t| t.w_axis.truncate().distance(here) < within)
         };
+        // The one she set out for while it is still close (round 6 turned
+        // from vehicle to vehicle of the Chinese camp as she passed them).
+        if let Some(Goal::Board(i)) = self.goal
+            && near(i, RIDE_FRESH)
+        {
+            return Some(i);
+        }
         (0..vehicles.len())
             .rev()
-            .filter(|&i| vehicles[i].guid.is_some() && !self.ridden.contains(&i))
+            // Not one with its own crew aboard (the enemy's).
+            .filter(|&i| {
+                vehicles[i].guid.is_some()
+                    && vehicles[i].crew.is_empty()
+                    && !self.ridden.contains(&i)
+            })
             .find(|&i| near(i, RIDE_FRESH))
             .or_else(|| {
                 self.ride
@@ -1215,11 +1230,23 @@ impl Autoplay {
             return self.plant(game, at, dt);
         }
         // Going where she can fire from (in range, nothing in the way).
-        if let Some((_, spot)) = self.blast_spot
-            && spot.with_y(0.0).distance(here.with_y(0.0)) >= ARRIVE
-        {
-            self.arrived = None;
-            return self.walk(game, spot, 1.0, dt);
+        if let Some((_, spot)) = self.blast_spot {
+            if spot.with_y(0.0).distance(here.with_y(0.0)) >= ARRIVE {
+                self.arrived = None;
+                return self.walk(game, spot, 1.0, dt);
+            }
+            // Under it or over it (round 6's AllCon002: a roof by the
+            // river, and she fell in under it): one she can't get to.
+            if (spot.y - here.y).abs() > SPOT_RISE {
+                eprintln!(
+                    "autoplay {:.1} s: the spot {spot:.1} is {:.0} m from her height: another",
+                    self.clock,
+                    spot.y - here.y
+                );
+                self.tried.push(spot);
+                self.blast_spot = None;
+                self.blocked = BLAST_BLOCKED;
+            }
         }
         if d > far {
             return self.walk(game, at, far - 5.0, dt);
@@ -1247,7 +1274,9 @@ impl Autoplay {
         // In range a while with no shot (round 2's AllCon002: she stood
         // 2400 s aimed at the hilltop MLRS): from somewhere else on a ring
         // round it, another if that is no better.
-        if clear && error < ON_TARGET {
+        // Swimming she can't fire either.
+        let swimming = game.scene.player.as_ref().is_some_and(|p| p.swimming());
+        if clear && error < ON_TARGET && !swimming {
             self.blocked = 0.0;
         } else {
             self.blocked += dt;
@@ -2041,7 +2070,9 @@ fn vantage(
                 continue;
             };
             let spot = Vec3::new(x, top.y - d, z);
-            if n.y < 0.7 || tried.iter().any(|t| t.distance(spot) < 4.0) {
+            // Flat enough, out of the water, and not one tried.
+            if n.y < 0.7 || spot.y < WATERLINE + 0.3 || tried.iter().any(|t| t.distance(spot) < 4.0)
+            {
                 continue;
             }
             let eye = spot + Vec3::Y * 1.6;
@@ -2439,6 +2470,31 @@ mod tests {
         // Not the same spot twice.
         let next = vantage(&p, target, Vec3::ZERO, &[spot], &VANTAGE_RINGS, 1.0).expect("another");
         assert!(next.distance(spot) >= 4.0, "{next} is {spot} again");
+    }
+
+    // Ground under the sea (round 6's riverbed): no spot to fire from.
+    #[test]
+    fn no_spot_is_under_the_water() {
+        use m2_engine::{CollisionShape, StaticKey};
+        let mut p = Physics::new();
+        let y = WATERLINE - 4.0;
+        let bed = CollisionShape::mesh(
+            &[
+                Vec3::new(-60.0, y, -60.0),
+                Vec3::new(60.0, y, -60.0),
+                Vec3::new(60.0, y, 60.0),
+                Vec3::new(-60.0, y, 60.0),
+            ],
+            &[[0, 1, 2], [0, 2, 3]],
+        )
+        .unwrap();
+        p.add_static(StaticKey::Cell(1), &bed, Vec3::ZERO, Quat::IDENTITY);
+        p.step(1.0 / 60.0);
+        let target = Vec3::new(0.0, y + 1.0, 0.0);
+        assert_eq!(
+            vantage(&p, target, target, &[], &BLAST_RINGS, BLAST_BODY),
+            None
+        );
     }
 
     // A truck-sized box round what she is blowing up (round 3's MLRS):
