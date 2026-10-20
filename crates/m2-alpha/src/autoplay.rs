@@ -136,8 +136,9 @@ const RIDE_NEAR: f32 = 40.0;
 /// metres: they brought it for her.
 const RIDE_FRESH: f32 = 150.0;
 /// She takes an action the scripts offer within this of its object,
-/// metres (a context action's reach is a few metres).
-const USE_FROM: f32 = 1.5;
+/// metres (a context action's reach is a few metres; within 1.5 m she
+/// stalled against the body, GurCon002 round 14).
+const USE_FROM: f32 = 2.5;
 /// Driving, she gets out this near an outpost's flag (metres), to walk
 /// the rest.
 const FLAG_ON_FOOT: f32 = 15.0;
@@ -518,14 +519,23 @@ impl Autoplay {
             Some(Goal::Open(target)) => self.open(game, target, dt),
             Some(Goal::Take(key)) => self.take(game, key, dt),
             Some(Goal::Deliver(key)) => self.deliver(game, &key),
-            Some(Goal::Use { at, .. }) => {
+            Some(Goal::Use { target, at }) => {
                 let here = game.focus();
                 let driving = game.scene.player.as_ref().and_then(|p| p.driving);
                 if driving.is_none() && here.with_y(0.0).distance(at.with_y(0.0)) < USE_FROM {
-                    let speed = 0.0;
-                    let mut intent = self.press(speed);
-                    intent.hold_jump = false;
-                    intent
+                    // The action the game offers her there is taken with
+                    // the use key, as the keyboard's use key takes it
+                    // (`Game::tick`), a press at a time.
+                    let offered = game.context.as_ref().is_some_and(|c| c.0 == target);
+                    if offered && self.pressed > PRESS_GAP {
+                        self.pressed = 0.0;
+                        eprintln!(
+                            "autoplay {:.1} s: taking the action at {target:#x}",
+                            self.clock
+                        );
+                        game.context_taken = Some(target);
+                    }
+                    Intent::default()
                 } else {
                     self.travel(game, at, USE_FROM * 0.6, dt)
                 }
