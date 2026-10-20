@@ -1963,6 +1963,13 @@ impl Autoplay {
             self.clock, self.what
         );
         self.hops.push((from, to));
+        // A ride she couldn't get to is left (round 10's AllCon002 spent
+        // 160 s after a WZ551 behind a wall): another or on foot.
+        if let Some(Goal::Board(i)) = self.goal
+            && !self.ridden.contains(&i)
+        {
+            self.ridden.push(i);
+        }
         self.fresh_headway();
         self.sidestep = None;
         self.reversing = None;
