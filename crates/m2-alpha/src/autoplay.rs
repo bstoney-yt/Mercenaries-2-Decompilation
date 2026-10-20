@@ -147,6 +147,10 @@ const CARGO_CLEAR: f32 = 15.0;
 /// metres; not what is wider than this (a building's whole batch).
 const AVOID_ROOM: f32 = 2.0;
 const AVOID_LARGEST: f32 = 40.0;
+/// Vehicles going slower than this, m/s, within this of her, metres, are
+/// kept out of on her ways (invented).
+const PARKED_SPEED: f32 = 1.0;
+const PARKED_NEAR: f32 = 400.0;
 /// Soldiers fighting her within this of a truck with goods on it, itself
 /// within [`CARGO_NEAR`] of her on foot, are dealt with before she drives
 /// it, metres (invented).
@@ -2075,8 +2079,23 @@ impl Autoplay {
                 },
             };
             let sea = world.settings.sea_level.max(WATERLINE);
-            let avoid: &[(Vec2, Vec2)] = if driving.is_some() { &self.avoid } else { &[] };
-            let route = Route::plan_avoiding(&world.physics, mover, (pos, at), sea, avoid);
+            // Driving, she keeps out of what she stuck on, and round the
+            // vehicles standing near (PirCon004 rounds 63-70: her way ran
+            // through a parked fuel trailer, which wrecked her truck).
+            let avoid: Vec<(Vec2, Vec2)> = match driving {
+                Some(i) => self
+                    .avoid
+                    .iter()
+                    .copied()
+                    .chain(parked_near(game, i, pos).into_iter().filter(|&(lo, hi)| {
+                        // Not one standing where she is going.
+                        let goal = Vec2::new(at.x, at.z);
+                        !(goal.cmpge(lo).all() && goal.cmple(hi).all())
+                    }))
+                    .collect(),
+                None => Vec::new(),
+            };
+            let route = Route::plan_avoiding(&world.physics, mover, (pos, at), sea, &avoid);
             if (!route.reaches || route.length() > straight * ROUNDABOUT)
                 && self.clock - self.way_logged > LOG_WAY
             {
@@ -2533,6 +2552,39 @@ fn vantage(
 }
 
 /// Vehicle `vehicles[i]`'s model to world, if placed.
+/// The ground boxes (least and most corner, x and z, with [`AVOID_ROOM`]
+/// round them) of the vehicles other than `i` standing still within
+/// [`PARKED_NEAR`] of `pos`.
+fn parked_near(game: &Game, i: usize, pos: Vec3) -> Vec<(Vec2, Vec2)> {
+    (0..game.scene.vehicles.len())
+        .filter(|&j| j != i)
+        .filter_map(|j| {
+            let (m, speed) = vehicle_state(game, j)?;
+            let centre = m.w_axis.truncate();
+            if speed.abs() > PARKED_SPEED || centre.distance(pos) > PARKED_NEAR {
+                return None;
+            }
+            let (lo, hi) = game.scene.vehicles[j].model.bounds;
+            let corners = [
+                Vec3::new(lo.x, 0.0, lo.z),
+                Vec3::new(lo.x, 0.0, hi.z),
+                Vec3::new(hi.x, 0.0, lo.z),
+                Vec3::new(hi.x, 0.0, hi.z),
+            ]
+            .map(|c| {
+                let w = m.transform_point3(c);
+                Vec2::new(w.x, w.z)
+            });
+            let least = corners.iter().fold(Vec2::splat(f32::MAX), |a, &c| a.min(c));
+            let most = corners.iter().fold(Vec2::splat(f32::MIN), |a, &c| a.max(c));
+            Some((
+                least - Vec2::splat(AVOID_ROOM),
+                most + Vec2::splat(AVOID_ROOM),
+            ))
+        })
+        .collect()
+}
+
 fn vehicle_at(game: &Game, i: usize) -> Option<Mat4> {
     let id = game.scene.vehicles.get(i)?.id?;
     game.scene.world.as_ref()?.physics.vehicle_transform(id)
