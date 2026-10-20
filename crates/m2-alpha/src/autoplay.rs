@@ -91,6 +91,8 @@ const SPOT_RISE: f32 = 2.5;
 /// Rings (metres) round her looked on for a way out of the water.
 /// Invented.
 const LANDING_RINGS: [f32; 6] = [6.0, 12.0, 24.0, 48.0, 96.0, 192.0];
+/// Ground this far (metres) over the water is out of it. Invented.
+const LANDING_DRY: f32 = 0.3;
 /// Ground this far (metres) below her feet a step ahead is a drop she
 /// doesn't step closer over. Invented.
 const LEDGE_DROP: f32 = 3.0;
@@ -2395,8 +2397,9 @@ fn landing(physics: &Physics, at: Vec3, toward: Vec3) -> Option<Vec3> {
                 let (d, n) = physics.cast_ray(top, Vec3::NEG_Y, 60.0)?;
                 let spot = Vec3::new(x, top.y - d, z);
                 let rise = spot.y - water;
-                (n.y >= 0.7 && rise <= SPOT_RISE && rise > -crate::player::SWIM_STOP * 0.8)
-                    .then_some(spot)
+                // Dry: shallows she still swims in (round 30's AllCon002:
+                // 1900 s from one to the next) are no way out.
+                (n.y >= 0.7 && rise <= SPOT_RISE && rise >= LANDING_DRY).then_some(spot)
             })
             .min_by(|a, b| a.distance(toward).total_cmp(&b.distance(toward)))
     })
@@ -2826,7 +2829,14 @@ mod tests {
         let w = WATERLINE;
         p.add_static(
             StaticKey::Cell(1),
-            &flat(-30.0, 20.0, w - 4.0),
+            &flat(-30.0, 0.0, w - 4.0),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        // Shallows nearer than the beach: still in the water.
+        p.add_static(
+            StaticKey::Cell(4),
+            &flat(0.0, 20.0, w - 0.3),
             Vec3::ZERO,
             Quat::IDENTITY,
         );
