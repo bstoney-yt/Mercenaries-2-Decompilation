@@ -545,7 +545,7 @@ impl Autoplay {
                     let speed = vehicle_state(game, i).map_or(0.0, |s| s.1);
                     self.press(speed)
                 }
-                None => self.idle(game),
+                None => self.idle(game, dt),
             },
         }
     }

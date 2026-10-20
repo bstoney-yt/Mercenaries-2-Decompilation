@@ -4966,6 +4966,8 @@ fn grapple_keys(game: &mut Game, input: &mut Input, allowed: bool) {
         }
     }
     game.grapple = g;
+}
+
 /// How long the message box shows a message (its call's `nDuration`,
 /// seconds; 5 when not given, as the objectives' messages ask).
 fn message_seconds(data: &gamehud::Plain) -> f32 {
