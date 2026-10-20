@@ -192,6 +192,11 @@ const OPEN_NEAR: f32 = 250.0;
 /// With the launcher empty, rockets lying within this far (metres) are
 /// fetched, those the layers placed too. Invented.
 const RESTOCK_NEAR: f32 = 150.0;
+/// With things still to blow up, other pickups are fetched only within
+/// this (metres); one she stands over this long (seconds) that doesn't
+/// come with the key is left. Invented.
+const BUSY_NEAR: f32 = 30.0;
+const TAKE_AT: f32 = 10.0;
 const OPEN_FROM: f32 = 0.9;
 const OPEN_FACING: f32 = 0.2;
 const OPEN_FOR: f32 = 45.0;
@@ -631,6 +636,7 @@ impl Autoplay {
             .world
             .as_ref()
             .map_or(&none, |w| &w.index.template_db);
+        let destroying = live.iter().any(|m| m.kind == "destroy");
         let rockets_out = game.combat.second == Some(Weapon::Rpg)
             && game.combat.launcher_rounds.is_none_or(|r| r.total() == 0)
             && live.iter().any(|m| m.kind == "destroy");
@@ -650,7 +656,11 @@ impl Autoplay {
                     let restock = rockets_out
                         && d < RESTOCK_NEAR
                         && crate::mission::refill(templates, &game.combat, &p.what).launcher > 0;
-                    (restock || (!game.placed.is_pickup(p.from) && d < OPEN_NEAR))
+                    // With the contract's things still to blow up, only
+                    // what lies close is worth the detour (round 16's
+                    // AllCon002 lost the boats' race to pickups).
+                    let reach = if destroying { BUSY_NEAR } else { OPEN_NEAR };
+                    (restock || (!game.placed.is_pickup(p.from) && d < reach))
                         && !self.left_lying.contains(&p.key())
                         && wanted(templates, &game.combat, p)
                 })
@@ -999,7 +1009,18 @@ impl Autoplay {
             .player
             .as_ref()
             .map_or(p.at, |pl| pl.character.position);
-        if (p.at - here).with_y(0.0).length() <= p.what.reach * 0.8 {
+        let close = (p.at - here).with_y(0.0).length();
+        // Over it a while and it never goes (round 16's AllCon002: 45 s
+        // stood 1.2 m from one while the boats went by): left lying.
+        if close <= p.what.reach && self.clock - since > TAKE_AT {
+            eprintln!(
+                "autoplay {:.1} s: the {:#x} at {:.1} doesn't come with the key: left lying",
+                self.clock, key.1, p.at
+            );
+            self.left_lying.push(key);
+            return Intent::default();
+        }
+        if close <= p.what.reach * 0.8 {
             let press = self.pressed > PRESS_GAP;
             if press {
                 self.pressed = 0.0;
