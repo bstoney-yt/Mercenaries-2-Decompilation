@@ -1812,6 +1812,15 @@ impl MissionLink {
                     None => mission.kill(guid),
                 }
             }
+            // The scripts' objects for the dead lie where their bodies do:
+            // a verify prompt is offered over the object (a job's targets
+            // run from their spawns before they fall; jobs round 3 found
+            // the prompt left at the spawn, out of her reach).
+            for n in game.scene.people.npcs.iter().filter(|n| !n.alive) {
+                if let Some(g) = n.spawn {
+                    mission.place(g, n.character.position.to_array(), n.facing);
+                }
+            }
             // Targets to destroy: soldiers stand at those that are spawns,
             // and blasts close to the rest (gates, buildings) destroy them.
             let targets: Vec<(u32, Vec3)> = {
