@@ -2,7 +2,7 @@
 stands in where autoplay can't play it the way a player would: the timed
 race, the tank waves still standing after 600 s (killed), and the walk to
 the bunker if she is stuck on the hillside 600 s (put 150 m short of it).
-For the race: Autoplay
+For the race: autoplay
 drives the 5.7 km back from the bunker through the jungle too slowly for
 the scripts' 600 s timer (round 7: the contract was cancelled at "Time
 UP!"), so once "Race back to the base in time!" is active this puts her
