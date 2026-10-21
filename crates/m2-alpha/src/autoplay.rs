@@ -172,6 +172,12 @@ const ONCOMING_SECONDS: f32 = 3.0;
 /// In a boat, as far as she goes in this long, and what goes slower than
 /// this (m/s) counts as standing (invented).
 const BOAT_AHEAD_SECONDS: f32 = 5.0;
+/// A boat steering for a point within this (metres) more than this far
+/// off its bow (radians) coasts down to this speed (m/s) before turning
+/// (invented).
+const ORBIT_NEAR: f32 = 15.0;
+const ORBIT_ANGLE: f32 = 1.0;
+const ORBIT_SPEED: f32 = 4.0;
 const CRAWLING: f32 = 3.0;
 /// She steers round a vehicle standing within this ahead, metres
 /// (invented).
@@ -1514,12 +1520,16 @@ impl Autoplay {
         } else {
             1.0
         };
-        // Not slowing for a race's checkpoint, only passed through: each
-        // gate's time is short (PirCon001 round 92 had 12.6 s for 157 m;
-        // easing off near each cost the race).
-        let racing = self.what.contains("checkpoint") || self.what.contains("_gate_");
-        if (!racing && d < SLOW_NEAR && speed > SLOW) || (angle.abs() > 0.8 && speed > SLOW) {
+        if (d < SLOW_NEAR && speed > SLOW) || (angle.abs() > 0.8 && speed > SLOW) {
             throttle = throttle.min(0.2);
+        }
+        // A boat with the point it steers for close by and well off its
+        // bow coasts until slow enough to turn onto it, not circling it
+        // (PirCon001 round 92: 10 s round a point 7 m off at 10 m/s, and
+        // the gate's time ran out).
+        let near = (toward - pos).with_y(0.0).length();
+        if boat && near < ORBIT_NEAR && angle.abs() > ORBIT_ANGLE && speed > ORBIT_SPEED {
+            throttle = throttle.min(0.0);
         }
         // Goods riding on her truck (PirCon002's rum): no faster than a
         // careful driver goes, so a crash costs less of them.
