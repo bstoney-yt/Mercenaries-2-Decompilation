@@ -1779,7 +1779,7 @@ impl MissionLink {
             self.vehicles.sync(
                 game,
                 mission,
-                self.job.as_ref().map_or(&[][..], |j| &j.quarry),
+                self.job.as_ref().map_or(&[][..], |j| j.bounty_quarry()),
             );
             ride_along(game, mission, self.vehicles.riding, &mut self.out_for, STEP);
             // Those she killed die by her hand: a job's hero-only bounty
@@ -1806,10 +1806,15 @@ impl MissionLink {
                         Some((g, Vec3::from(o.position)))
                     })
                     // And a bounty's quarry, marked for her as these are.
-                    .chain(self.job.iter().flat_map(|j| &j.quarry).filter_map(|&g| {
-                        let o = w.objects.get(&g).filter(|o| o.alive)?;
-                        Some((g, Vec3::from(o.position)))
-                    }))
+                    .chain(
+                        self.job
+                            .iter()
+                            .flat_map(|j| j.bounty_quarry())
+                            .filter_map(|&g| {
+                                let o = w.objects.get(&g).filter(|o| o.alive)?;
+                                Some((g, Vec3::from(o.position)))
+                            }),
+                    )
                     .collect()
             };
             game.scene.people.mission_soldiers = targets.iter().map(|t| t.0).collect();

@@ -36,6 +36,9 @@ pub struct JobRun {
 
 /// Seconds between choosing the quarry again (invented).
 const CHOOSE_EVERY: f32 = 2.0;
+/// She picks up what a collection is over from this near, metres
+/// (invented: a pickup's reach).
+const PICK_UP: f32 = 3.0;
 
 impl JobRun {
     /// The job `--skip-to` names, if it names one.
@@ -44,6 +47,21 @@ impl JobRun {
             id: id.to_owned(),
             ..Self::default()
         })
+    }
+
+    /// A collection: what it is over is walked up to and picked up.
+    pub fn is_collection(&self) -> bool {
+        self.view.class.as_deref() == Some("MrxTaskJobCollectType")
+    }
+
+    /// What she destroys for the job without its being marked by the
+    /// scripts: a bounty's quarry (a collection's is picked up).
+    pub fn bounty_quarry(&self) -> &[u32] {
+        if self.view.is_bounty() {
+            &self.quarry
+        } else {
+            &[]
+        }
     }
 
     /// Done: a set job or a collection completed, or a bounty paid once
@@ -89,6 +107,30 @@ impl JobRun {
             near.sort_by(|a, b| a.1.total_cmp(&b.1));
             self.quarry = near.into_iter().take(QUARRY).map(|q| q.0).collect();
         }
+        // A collection's things she walks up to, she picks up: gone, as
+        // her picking one up takes it from play (inferred: the job counts
+        // each one's death, `MrxTaskJobCollectType` over
+        // `MrxTaskObjectiveDestroy`).
+        if self.is_collection() {
+            let hero = mission.world().borrow().player;
+            let reached: Vec<(u32, String)> = {
+                let w = mission.world().borrow();
+                self.quarry
+                    .iter()
+                    .filter_map(|&g| {
+                        let o = w.objects.get(&g).filter(|o| o.alive)?;
+                        (Vec3::from(o.position).distance(her) <= PICK_UP)
+                            .then(|| (g, o.name.clone()))
+                    })
+                    .collect()
+            };
+            for (g, name) in reached {
+                if let Some(h) = hero {
+                    mission.kill_by(g, h);
+                    lines.push(format!("jobs: she picks up {name} ({g:#x})"));
+                }
+            }
+        }
         let now = (self.view.counted, self.view.completed);
         if now != self.said {
             lines.push(format!(
@@ -104,7 +146,8 @@ impl JobRun {
     }
 
     /// Of `marks`, those for this job: its targets' (a verify mark stays
-    /// on a body), else marks made for her quarry (`destroy`).
+    /// on a body), else marks made for her quarry: to destroy, or to go
+    /// to and pick up (`deliverable`).
     pub fn marks(&self, marks: Vec<Mark>, mission: &Mission) -> Vec<Mark> {
         if !self.view.targets.is_empty() {
             return marks
@@ -119,7 +162,11 @@ impl JobRun {
                 let o = w.objects.get(&g)?;
                 Some(Mark {
                     target: g,
-                    kind: "destroy".into(),
+                    kind: if self.is_collection() {
+                        "deliverable".into()
+                    } else {
+                        "destroy".into()
+                    },
                     name: o.name.clone(),
                     at: Vec3::from(o.position),
                     alive: o.alive,
