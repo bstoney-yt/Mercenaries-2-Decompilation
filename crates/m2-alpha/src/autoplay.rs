@@ -116,8 +116,10 @@ const STUCK: f32 = 3.0;
 const SIDESTEP: f32 = 1.2;
 const HOP_AFTER: f32 = 25.0;
 const HOP_AFTER_BOAT: f32 = 8.0;
-/// A place more than this over the sea is ashore, for a boat, metres.
+/// A place more than this over the sea is ashore, for a boat, which goes
+/// for the water this far short of it, metres (invented).
 const ASHORE: f32 = 1.5;
+const SHORT_OF_SHORE: f32 = 6.0;
 const HOP: f32 = 25.0;
 /// Coming closer counts towards the hop only once she has also gone this
 /// far (metres) from where she last did: the way's length wobbles by a
@@ -2257,10 +2259,11 @@ impl Autoplay {
         at: Vec3,
         speed: f32,
     ) -> Vec3 {
-        let straight = (at - pos).with_y(0.0).length();
-        // Near, straight at it; not in a boat for a place up out of the
-        // sea (PirCon001's checkpoint 30 stands on a dock 4 m up: her jetski
-        // ran into the dock, and lost the gate): its way keeps to the water.
+        // In a boat, a place up out of the sea (PirCon001's checkpoint 30
+        // stands on a dock 4 m up: her jetski ran into the dock, and lost
+        // the gate) is gone for on the water short of it, on her side: a
+        // race's checkpoint is passed within 10 m (`MrxTaskRace`'s
+        // `fWidth`).
         let boat = driving
             .and_then(|i| game.scene.vehicles.get(i))
             .is_some_and(|v| v.spec.is_boat());
@@ -2269,7 +2272,14 @@ impl Autoplay {
             .world
             .as_ref()
             .map_or(WATERLINE, |w| w.settings.sea_level.max(WATERLINE));
-        if straight < PLAN_FROM && !(boat && at.y > sea + ASHORE) {
+        let at = if boat && at.y > sea + ASHORE {
+            let back = (pos - at).with_y(0.0).normalize_or_zero();
+            (at + back * SHORT_OF_SHORE).with_y(sea)
+        } else {
+            at
+        };
+        let straight = (at - pos).with_y(0.0).length();
+        if straight < PLAN_FROM {
             self.way = None;
             return at;
         }
