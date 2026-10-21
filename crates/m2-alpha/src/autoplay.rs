@@ -115,6 +115,7 @@ const REVERSE: f32 = 1.5;
 const STUCK: f32 = 3.0;
 const SIDESTEP: f32 = 1.2;
 const HOP_AFTER: f32 = 25.0;
+const HOP_AFTER_BOAT: f32 = 8.0;
 const HOP: f32 = 25.0;
 /// Coming closer counts towards the hop only once she has also gone this
 /// far (metres) from where she last did: the way's length wobbles by a
@@ -2398,7 +2399,17 @@ impl Autoplay {
             return false;
         }
         let still = self.since_moved();
-        if still > HOP_AFTER {
+        // A boat aground hops sooner: a race's gate waits no 25 s
+        // (GurCon003 round 85 ran aground on a sandbar; its timer ran out
+        // 16 s on).
+        let afloat = game
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| game.scene.vehicles.get(i))
+            .is_some_and(|v| v.spec.is_boat());
+        if still > if afloat { HOP_AFTER_BOAT } else { HOP_AFTER } {
             // Stuck driving close to the place: on foot from here. Not
             // with goods riding on her vehicle: they are what she brings
             // there (PirCon002's rum, left 162 m short in round 43); the
