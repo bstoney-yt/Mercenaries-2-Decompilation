@@ -428,6 +428,8 @@ pub struct Autoplay {
     /// Until when (her clock) she clears the soldiers round a truck with
     /// goods on it before driving it ([`CARGO_GUARD`]), once begun.
     guard_until: std::cell::Cell<Option<f32>>,
+    /// When the vehicles near her boat were last logged.
+    near_logged: f32,
     way_logged: f32,
     /// Hops: from, to.
     pub hops: Vec<(Vec3, Vec3)>,
@@ -1472,7 +1474,27 @@ impl Autoplay {
         // And round a vehicle standing in her way, to the side it isn't
         // on (PirCon004 round 78: her truck ran into a parked pickup and
         // a trailer by the drop-off, close by the way planned round them).
-        let standing = standing_ahead(game, i, m, speed);
+        let standing = standing_ahead(game, i, m, speed, toward);
+        // In a boat: the nearest other vehicle, where in her frame and how
+        // fast, each second (what she gives way to, or doesn't).
+        if game.scene.vehicles[i].spec.is_boat() && self.clock - self.near_logged > 1.0 {
+            self.near_logged = self.clock;
+            let to_local = m.inverse();
+            if let Some((j, l, s)) = (0..game.scene.vehicles.len())
+                .filter(|&j| j != i)
+                .filter_map(|j| {
+                    let (t, s) = vehicle_state(game, j)?;
+                    Some((j, to_local.transform_point3(t.w_axis.truncate()), s))
+                })
+                .min_by(|a, b| a.1.length().total_cmp(&b.1.length()))
+                .filter(|(_, l, _)| l.length() < 200.0)
+            {
+                eprintln!(
+                    "autoplay {:.1} s: boat at {speed:.1} m/s; nearest the {} at {l:.1} (her frame), {s:.1} m/s; standing ahead {standing:?}",
+                    self.clock, game.scene.vehicles[j].spec.label
+                );
+            }
+        }
         // A boat, with no brakes, turns away harder and backs its engine
         // (GurCon003 round 84: her race boat met a moored fishing boat by
         // a gate at 31 m/s, easing off).
@@ -2755,7 +2777,7 @@ fn vantage(
 /// going `speed`), or as far as it goes in [`ONCOMING_SECONDS`], and
 /// within [`ONCOMING_SIDE`] of her line is, if one is (GurCon003 round 83:
 /// her race boat ran into a fishing boat turning on its path at 23 m/s).
-fn standing_ahead(game: &Game, i: usize, m: Mat4, speed: f32) -> Option<f32> {
+fn standing_ahead(game: &Game, i: usize, m: Mat4, speed: f32, toward: Vec3) -> Option<f32> {
     // A boat, slow to stop, looks further, and takes one crawling for
     // standing (GurCon003 rounds 84 and 86: a fishing boat at 1 to 3 m/s
     // on its path, met at 31 m/s).
@@ -2766,15 +2788,33 @@ fn standing_ahead(game: &Game, i: usize, m: Mat4, speed: f32) -> Option<f32> {
         (ONCOMING_SECONDS, PARKED_SPEED)
     };
     let reach = AHEAD_STANDING.max(speed.abs() * seconds);
-    let to_local = m.inverse();
+    // Along her heading, and along the line she turns onto, towards
+    // where she steers (GurCon003 round 88: the fishing boat lay 19 m to
+    // her side as she turned for the next gate, into it): (ahead, to her
+    // left) of each.
+    let here = m.w_axis.truncate().with_y(0.0);
+    let forward = m
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    let turning = (toward - here).with_y(0.0).normalize_or(forward);
+    let frame = |dir: Vec3, p: Vec3| {
+        let d = p.with_y(0.0) - here;
+        (d.dot(dir), d.dot(Vec3::new(dir.z, 0.0, -dir.x)))
+    };
+    let in_way = |(z, x): (f32, f32)| z > 0.0 && z < reach && x.abs() < ONCOMING_SIDE;
     (0..game.scene.vehicles.len())
         .filter(|&j| j != i)
         .filter_map(|j| vehicle_state(game, j))
         .filter(|(_, speed)| speed.abs() <= still)
-        .map(|(t, _)| to_local.transform_point3(t.w_axis.truncate()))
-        .filter(|l| l.z > 0.0 && l.z < reach && l.x.abs() < ONCOMING_SIDE)
-        .min_by(|a, b| a.z.total_cmp(&b.z))
-        .map(|l| l.x)
+        .filter_map(|(t, _)| {
+            let p = t.w_axis.truncate();
+            [frame(turning, p), frame(forward, p)]
+                .into_iter()
+                .find(|&l| in_way(l))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, x)| x)
 }
 
 /// The vehicles other than `i` standing still within `reach` of `pos`.
