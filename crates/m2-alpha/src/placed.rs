@@ -279,6 +279,22 @@ impl Placed {
             .min_by(|a, b| flat(*a, to).total_cmp(&flat(*b, to)))
     }
 
+    /// How many emplaced guns are known, and the nearest to `at` that
+    /// stands as a prop (entity and flat distance), for the log.
+    pub fn emplaced_nearest(&self, props: &Props, at: Vec3) -> (usize, Option<(u32, f32)>) {
+        let known: Vec<u32> = self
+            .known
+            .iter()
+            .filter(|(_, k)| k.0 == Kind::Emplaced)
+            .map(|(&e, _)| e)
+            .collect();
+        let nearest = known
+            .iter()
+            .filter_map(|&e| Some((e, (props.get(e)?.0.position - at).with_y(0.0).length())))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        (known.len(), nearest)
+    }
+
     /// The emplaced gun nearest `at` within [`MAN_REACH`], as she would
     /// man it: its weapon (the template's first `PhysicalLink`ed one the
     /// arsenal knows), its turn and tilt (its `Turret`), all its rounds.

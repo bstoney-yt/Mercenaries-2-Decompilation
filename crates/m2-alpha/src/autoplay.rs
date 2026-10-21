@@ -422,6 +422,8 @@ pub struct Autoplay {
     /// Where she goes to fire at what she is blowing up (its object, the
     /// spot); the spots no better go in `tried` too.
     blast_spot: Option<(u32, Vec3)>,
+    /// The target last logged as one she has nothing to blow up with.
+    no_gun_logged: Option<u32>,
     /// With the launcher empty, the C4 she set on what she is blowing up
     /// and when, while she gets clear to set it off.
     planted: Option<f32>,
@@ -766,6 +768,18 @@ impl Autoplay {
         if let Some((target, at)) = acting {
             self.act(game, target, at);
         }
+        // A place to get herself to (a delivery of her, on foot) is gone
+        // to as close as an action's: its distance can be under her own
+        // arrival's (PmcCon033 round 7: 2.3 m from the scripts, and she
+        // stood 450 s 3 m off the pistol range's point).
+        let close = game
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.driving.is_none())
+            && matches!(&self.goal, Some(Goal::Reach { target, .. }) if marks
+                .iter()
+                .any(|m| m.target == *target && m.kind == "deliverable"));
         // Manning an emplaced gun, with nothing left for it to fire on:
         // off it (the use key again), to go on.
         if game.combat.manned.is_some() && !matches!(self.goal, Some(Goal::Blast { .. })) {
@@ -776,7 +790,7 @@ impl Autoplay {
         }
         match self.goal.clone() {
             None => self.idle(game, dt),
-            Some(Goal::Reach { at, .. }) if acting.is_some() => {
+            Some(Goal::Reach { at, .. }) if acting.is_some() || close => {
                 self.travel(game, at, ACTION_ARRIVE, dt)
             }
             Some(Goal::Reach { at, .. }) => self.travel(game, at, ARRIVE, dt),
@@ -2052,6 +2066,16 @@ impl Autoplay {
                     use_pressed: true,
                     ..Intent::default()
                 };
+            }
+            if self.no_gun_logged != Some(target) {
+                self.no_gun_logged = Some(target);
+                let (n, nearest) = game.placed.emplaced_nearest(&game.scene.props, here);
+                eprintln!(
+                    "autoplay {:.1} s: nothing to blow up {target:#x} with (rockets {rockets}, \
+                     weapons away {holstered}) and no emplaced gun in reach: {n} known, nearest \
+                     {nearest:x?}",
+                    self.clock
+                );
             }
         }
         // Going where she can fire from (in range, nothing in the way).
