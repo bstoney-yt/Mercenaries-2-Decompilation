@@ -522,6 +522,29 @@ impl Autoplay {
             self.context_pressed = self.clock;
             game.context_taken = Some(*g);
         }
+        // At a body to verify still driving: out, as the scripts offer the
+        // prompt on foot (ChiCon003's HVT, shot from the M1A2: she sat on
+        // him 1,400 s, the prompt never offered).
+        if let (Some(Goal::Reach { target, .. }), Some(_)) = (&self.goal, self.arrived)
+            && !self.leave
+            && game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_some())
+            && game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .any(|n| n.spawn == Some(*target) && !n.alive)
+        {
+            eprintln!(
+                "autoplay {:.1} s: at the body to verify, driving: getting out",
+                self.clock
+            );
+            self.leave = true;
+        }
         if let (Some(Goal::Reach { target, .. }), Some(t)) = (&self.goal, self.arrived)
             && self.waiting.is_none_or(|w| w.0 != *target)
         {

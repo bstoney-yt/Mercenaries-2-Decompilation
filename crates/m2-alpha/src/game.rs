@@ -3374,8 +3374,13 @@ fn nearest(
         // 5: the villa's tank, whose scripts make it usable by the hijack
         // alone, `Vehicle.Usable(tank, false)`, was got into at a press).
         .filter(|(_, v)| !(hijack_only.contains(&v.spec.model) && has_driver(&v.crew)))
-        // Kept by the scripts for themselves (`Vehicle.Usable(v, false)`).
-        .filter(|(_, v)| !v.guid.is_some_and(|g| unusable.contains(&g)))
+        // Kept by the scripts for themselves (`Vehicle.Usable(v, false)`)
+        // while crewed: an empty one is still got into (ChiCon009 makes
+        // its empty ZBD2000 unusable, then asks her to get into it; the
+        // villa's crewed tank is the hijack's alone). From those two
+        // samples, the only `Usable(false)` vehicles in the runs; the 360
+        // code not checked.
+        .filter(|(_, v)| !(v.guid.is_some_and(|g| unusable.contains(&g)) && has_driver(&v.crew)))
         // One with someone in the driver's seat is taken from them: the
         // action hijacks (tanks, helicopters) took the key first if near
         // ([`crate::hijack`]); cars, bikes and jeeps have none in the data
