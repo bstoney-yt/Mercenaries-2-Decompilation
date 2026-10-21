@@ -1090,13 +1090,32 @@ fn run(
         guns: options.guns.clone(),
         load: options.load.clone(),
         load_at: options.load_at,
+        successor: None,
         state: None,
         error: None,
     };
     event_loop.run_app(&mut app)?;
-    match app.error {
+    let successor = app.successor.take();
+    let error = app.error.take();
+    // The window, the world and the GPU go before waiting.
+    drop(app);
+    if let Some(child) = successor {
+        wait_for_successor(child);
+    }
+    match error {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+/// Waits for the alpha started again in this one's place. Started from a
+/// console (the launcher's), it shares that console, which closes, taking
+/// it with it, once the process the console was opened for (this one)
+/// ends: so this one stays, windowless, until it is done.
+fn wait_for_successor(mut child: std::process::Child) {
+    match child.wait() {
+        Ok(status) => eprintln!("quit: the alpha started again ended ({status})"),
+        Err(e) => eprintln!("quit: could not wait for the alpha started again: {e}"),
     }
 }
 
@@ -1364,27 +1383,41 @@ fn args_front_end(args: impl IntoIterator<Item = String>) -> Vec<String> {
 }
 
 /// Starts the alpha again at its front end, as the game goes back to its
-/// main menu (the pause menu's Quit). The caller then closes.
-fn relaunch_front_end() {
+/// main menu (the pause menu's Quit). The caller then closes and waits for
+/// it ([`wait_for_successor`]).
+fn relaunch_front_end() -> Option<std::process::Child> {
     let args = args_front_end(std::env::args().skip(1));
     match std::env::current_exe()
         .and_then(|exe| std::process::Command::new(exe).args(&args).spawn())
     {
-        Ok(_) => eprintln!("quit: started again at the front end"),
-        Err(e) => eprintln!("quit: could not start again: {e}"),
+        Ok(child) => {
+            eprintln!("quit: started again at the front end");
+            Some(child)
+        }
+        Err(e) => {
+            eprintln!("quit: could not start again: {e}");
+            None
+        }
     }
 }
 
 /// Starts the alpha again as it was launched, from the save at `save`
 /// (`--load`): loading a save with the scripts' data starts the world
-/// and the scripts afresh, as the game does. The caller then closes.
-fn relaunch(save: &std::path::Path) {
+/// and the scripts afresh, as the game does. The caller then closes and
+/// waits for it ([`wait_for_successor`]).
+fn relaunch(save: &std::path::Path) -> Option<std::process::Child> {
     let args = args_loading(std::env::args().skip(1), save);
     match std::env::current_exe()
         .and_then(|exe| std::process::Command::new(exe).args(&args).spawn())
     {
-        Ok(_) => eprintln!("load: started again with --load {}", save.display()),
-        Err(e) => eprintln!("load: could not start again: {e}"),
+        Ok(child) => {
+            eprintln!("load: started again with --load {}", save.display());
+            Some(child)
+        }
+        Err(e) => {
+            eprintln!("load: could not start again: {e}");
+            None
+        }
     }
 }
 
@@ -6961,6 +6994,9 @@ struct App {
     load: Option<save::SaveGame>,
     /// Seconds into play to load the player's own save (`--load-at`).
     load_at: Option<f32>,
+    /// The alpha started again (the pause menu's Quit, loading a save),
+    /// which this one waits for once its window is closed.
+    successor: Option<std::process::Child>,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -8147,12 +8183,12 @@ impl ApplicationHandler for App {
             return;
         };
         if let Some(path) = state.relaunch.take() {
-            relaunch(&path);
+            self.successor = relaunch(&path);
             event_loop.exit();
             return;
         }
         if std::mem::take(&mut state.to_front_end) {
-            relaunch_front_end();
+            self.successor = relaunch_front_end();
             event_loop.exit();
             return;
         }
