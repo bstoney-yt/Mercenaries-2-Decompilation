@@ -133,3 +133,29 @@ local function tasks()
   Event.Create(Event.TimerRelative, { 15 }, tasks, {})
 end
 Event.Create(Event.TimerRelative, { 15 }, tasks, {})
+
+-- The GUI's movie calls (MOVIE lines): a cutscene's movie playing, and its
+-- end callback being set.
+local G = rawget(_G, '_GuiInternal')
+if type(G) == 'table' then
+  for _, k in ipairs({ 'CreateMovieWidget', 'SetMovieFile', 'SetMovie', 'PlayMovie', 'PauseMovie', 'StopMovie', 'SetMovieEndCallback' }) do
+    local f = rawget(G, k) or G[k]
+    if type(f) == 'function' then
+      G[k] = function(w, ...)
+        say('>>> MOVIE ' .. k .. ' ' .. tostring(w) .. ' ' .. tostring((...)))
+        return f(w, ...)
+      end
+    end
+  end
+end
+
+-- Once, 5 s in: what a few names the PMC contracts target resolve to
+-- (NAME lines).
+Event.Create(Event.TimerRelative, { 5 }, function()
+  for _, n in ipairs({ 'PlayerLocation_PMC', 'PMC002_Office', 'PMC003_EwanTaxi' }) do
+    local g = Pg.GetGuidByName(n)
+    local x, y, z
+    if g then x, y, z = Object.GetPosition(g) end
+    say('>>> NAME ' .. n .. ' ' .. tostring(g) .. ' at ' .. tostring(x) .. ',' .. tostring(y) .. ',' .. tostring(z))
+  end
+end, {})
