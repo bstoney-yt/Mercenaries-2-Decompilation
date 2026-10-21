@@ -2450,11 +2450,7 @@ impl MissionLink {
                 mark(
                     m.target?,
                     m.icon.trim_start_matches("HUD_objective_"),
-                    // The scripts pass their contract's `GetMissionId()`
-                    // (`_RefreshTargetDisplay`); a table there (ChiCon008's
-                    // race tank) names none, so the objectives decide.
-                    (m.mission != "nil" && m.mission != "table")
-                        .then(|| MarkFor::Id(m.mission.clone())),
+                    (m.mission != "nil").then(|| MarkFor::Id(m.mission.clone())),
                 )
             })
             .collect();
