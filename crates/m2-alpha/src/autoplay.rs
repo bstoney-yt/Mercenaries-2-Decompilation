@@ -115,7 +115,7 @@ const REVERSE: f32 = 1.5;
 const STUCK: f32 = 3.0;
 const SIDESTEP: f32 = 1.2;
 const HOP_AFTER: f32 = 25.0;
-const HOP_AFTER_BOAT: f32 = 8.0;
+const HOP_AFTER_BOAT: f32 = 4.0;
 const HOP: f32 = 25.0;
 /// Coming closer counts towards the hop only once she has also gone this
 /// far (metres) from where she last did: the way's length wobbles by a
