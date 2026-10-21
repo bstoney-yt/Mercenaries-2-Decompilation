@@ -581,7 +581,7 @@ const ALLIES_HEAR: f32 = 20.0;
 /// you honk your horn"; `Tutorial.VehicleHorn.Attract`: "Press [cancel]
 /// to call allies into your vehicle"); that they take the seats with a
 /// gun ([`crate::combat::armed_seats`] but the driver's) is inferred, the
-/// reach invented. Riding, they don't fire yet.
+/// reach invented. Riding, they man the guns ([`crate::combat`]'s gunners).
 fn call_allies(game: &mut Game, mission: &mut Mission, riding: Option<u32>) {
     let Some(p) = game.scene.player.as_ref() else {
         return;
@@ -591,7 +591,7 @@ fn call_allies(game: &mut Game, mission: &mut Mission, riding: Option<u32>) {
         return;
     };
     let free =
-        (crate::combat::armed_seats(v).len() - 1).saturating_sub(game.scene.people.aboard().len());
+        (crate::combat::armed_seats(v).len() - 1).saturating_sub(game.scene.people.gunners());
     if free == 0 {
         return;
     }
@@ -619,6 +619,7 @@ fn call_allies(game: &mut Game, mission: &mut Mission, riding: Option<u32>) {
             if let Some(v) = riding {
                 mission.seat_in(g, v);
             }
+            game.scene.people.man_guns(g);
             eprintln!("people: {g:08x} hears her horn and jumps in her vehicle");
         }
     }

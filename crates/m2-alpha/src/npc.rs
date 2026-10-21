@@ -2048,6 +2048,9 @@ pub struct People {
     /// Followers riding her vehicle (`Vehicle.Enter` by `MrxFollow`): out
     /// of play until they get out ([`People::board`]).
     aboard: HashSet<u32>,
+    /// Those aboard who came at her horn, to man her vehicle's guns
+    /// ([`People::man_guns`]).
+    gunners: HashSet<u32>,
     active: HashSet<u32>,
     /// Spawners sending from a list, by entity: their `SecondsPerCycle`
     /// (filled on first use).
@@ -3182,6 +3185,18 @@ impl People {
             .collect()
     }
 
+    /// Person `entity`, aboard, mans one of her vehicle's guns.
+    pub fn man_guns(&mut self, entity: u32) {
+        if self.aboard.contains(&entity) {
+            self.gunners.insert(entity);
+        }
+    }
+
+    /// How many aboard man her vehicle's guns.
+    pub fn gunners(&self) -> usize {
+        self.gunners.len()
+    }
+
     /// Those riding a vehicle out of play ([`People::board`]).
     pub fn aboard(&self) -> Vec<u32> {
         self.aboard.iter().copied().collect()
@@ -3235,6 +3250,7 @@ impl People {
             }
             was
         } else if self.aboard.remove(&entity) {
+            self.gunners.remove(&entity);
             self.moved.insert(entity, at);
             true
         } else {
@@ -3903,6 +3919,19 @@ pub(crate) mod tests {
         assert_eq!(sent.len(), 1);
         // Not a Venezuelan: doesn't fight, nor is he a story character.
         assert!(!sent[0].soldier && !sent[0].held);
+    }
+
+    #[test]
+    fn only_those_aboard_man_her_guns_till_they_get_out() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.man_guns(7);
+        assert_eq!(people.gunners(), 0);
+        people.aboard.insert(7);
+        people.man_guns(7);
+        assert_eq!(people.gunners(), 1);
+        assert!(people.board(&mut physics, 7, false, Vec3::ZERO));
+        assert_eq!(people.gunners(), 0);
     }
 
     #[test]
