@@ -67,6 +67,11 @@ pub struct GameOptions {
     pub sfx_volume: f64,
     pub music_volume: f64,
     pub dialog_volume: f64,
+    /// The front end's Graphic Detail and advanced video options (see
+    /// [`crate::pause::Settings::advanced`]): kept for the menus, not
+    /// used by the alpha's drawing.
+    pub video_detail: f64,
+    pub advanced_video: [f64; 8],
 }
 
 impl Default for GameOptions {
@@ -83,6 +88,8 @@ impl Default for GameOptions {
             sfx_volume: 100.0,
             music_volume: 100.0,
             dialog_volume: 100.0,
+            video_detail: crate::pause::DETAIL,
+            advanced_video: crate::pause::ADVANCED,
         }
     }
 }
@@ -102,17 +109,76 @@ impl Default for WorldConfig {
     }
 }
 
+/// How the window is shown (`[window] mode`, or `--display`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayMode {
+    /// A window with a frame, `width` x `height`.
+    #[default]
+    Windowed,
+    /// Fullscreen over the monitor at its own (desktop) mode: no mode
+    /// change, so switching in and out is quick.
+    Borderless,
+    /// Fullscreen with the monitor switched to `width` x `height` at
+    /// `refresh` hertz (0: the monitor's own rate).
+    Exclusive,
+}
+
+impl DisplayMode {
+    pub const ALL: [Self; 3] = [Self::Windowed, Self::Borderless, Self::Exclusive];
+
+    /// The name in the settings file and on the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Windowed => "windowed",
+            Self::Borderless => "borderless",
+            Self::Exclusive => "exclusive",
+        }
+    }
+
+    /// A menu's text for it (invented: the game's video screen has no
+    /// such item).
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Windowed => "Windowed",
+            Self::Borderless => "Borderless Fullscreen",
+            Self::Exclusive => "Fullscreen",
+        }
+    }
+
+    pub fn is_fullscreen(self) -> bool {
+        self != Self::Windowed
+    }
+}
+
+impl std::str::FromStr for DisplayMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|m| m.name().eq_ignore_ascii_case(s))
+            .ok_or_else(|| format!("{s}: expected windowed, borderless or exclusive"))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WindowConfig {
-    /// The window's size; fullscreen, the mode's.
+    /// Windowed, the window's size; exclusive, the mode's.
     pub width: u32,
     pub height: u32,
-    pub fullscreen: bool,
-    /// Fullscreen, the mode's refresh rate in hertz (the pause menu's
-    /// Refresh Rate); 0 is the monitor's own mode, borderless.
+    pub mode: DisplayMode,
+    /// Exclusive, the mode's refresh rate in hertz (the pause menu's
+    /// Refresh Rate); 0 is the monitor's own rate.
     pub refresh: u32,
     pub vsync: bool,
+    /// The video screen's Aspect Ratio: wide, or 4:3 (the world seen as
+    /// on a 4:3 screen, filling the window).
+    pub wide: bool,
+    /// The settings files from before `mode`: `true` reads as borderless
+    /// (refresh 0) or exclusive (a rate), and isn't written back.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fullscreen: bool,
 }
 
 impl Default for WindowConfig {
@@ -120,9 +186,24 @@ impl Default for WindowConfig {
         Self {
             width: 1600,
             height: 900,
-            fullscreen: false,
+            mode: DisplayMode::Windowed,
             refresh: 0,
             vsync: true,
+            wide: true,
+            fullscreen: false,
+        }
+    }
+}
+
+impl WindowConfig {
+    /// Reads an old `fullscreen = true` into `mode`.
+    pub fn upgrade(&mut self) {
+        if std::mem::take(&mut self.fullscreen) && self.mode == DisplayMode::Windowed {
+            self.mode = if self.refresh == 0 {
+                DisplayMode::Borderless
+            } else {
+                DisplayMode::Exclusive
+            };
         }
     }
 }
@@ -162,6 +243,7 @@ impl Config {
                 for (action, keys) in Bindings::default().0 {
                     config.keys.0.entry(action).or_insert(keys);
                 }
+                config.window.upgrade();
                 Ok(config)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -171,6 +253,67 @@ impl Config {
 
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).expect("config serialises")
+    }
+
+    /// The settings as the game's menus show them (their option screens'
+    /// items: [`crate::pause::Settings`]); the profile's name, the window,
+    /// its monitor's modes and the saves are the caller's to fill.
+    pub fn menu_settings(&self) -> crate::pause::Settings {
+        let o = &self.options;
+        crate::pause::Settings {
+            subtitles: o.subtitles,
+            tutorials: o.tutorials,
+            autosave: o.autosave,
+            invert_mouse: self.camera.invert_y,
+            mouse: crate::pause::mouse_slider(self.camera.mouse_sensitivity),
+            invert_pad: o.invert_pad,
+            pad: o.pad_sensitivity,
+            rumble: o.rumble,
+            vsync: self.window.vsync,
+            wide: self.window.wide,
+            brightness: o.brightness,
+            view_distance: o.view_distance,
+            sfx: o.sfx_volume,
+            music: o.music_volume,
+            dialog: o.dialog_volume,
+            keys: crate::keytable::KeyTable::of(&self.keys),
+            detail: o.video_detail,
+            advanced: o.advanced_video,
+            ..crate::pause::Settings::default()
+        }
+    }
+
+    /// Takes the settings a menu kept ([`Config::menu_settings`]'s items;
+    /// the key table and the window are kept on their own).
+    pub fn keep_menu_settings(&mut self, s: &crate::pause::Settings) {
+        let o = &mut self.options;
+        o.subtitles = s.subtitles;
+        o.tutorials = s.tutorials;
+        o.autosave = s.autosave;
+        o.invert_pad = s.invert_pad;
+        o.pad_sensitivity = s.pad;
+        o.rumble = s.rumble;
+        o.brightness = s.brightness;
+        o.view_distance = s.view_distance;
+        o.sfx_volume = s.sfx;
+        o.music_volume = s.music;
+        o.dialog_volume = s.dialog;
+        o.video_detail = s.detail;
+        o.advanced_video = s.advanced;
+        self.camera.invert_y = s.invert_mouse;
+        self.camera.mouse_sensitivity = crate::pause::mouse_radians(s.mouse);
+        self.window.vsync = s.vsync;
+        self.window.wide = s.wide;
+    }
+
+    /// Writes the settings to the settings file ([`Config::default_path`]),
+    /// as the game saves its profile; `who` names the menu in the log.
+    pub fn save(&self, who: &str) {
+        let path = Self::default_path();
+        match std::fs::write(&path, self.to_toml()) {
+            Ok(()) => eprintln!("{who}: settings kept, saved to {}", path.display()),
+            Err(e) => eprintln!("{who}: could not save {}: {e}", path.display()),
+        }
     }
 
     /// Where to look for the settings file: the working directory, then
@@ -214,6 +357,52 @@ mod tests {
     }
 
     #[test]
+    fn display_modes_read_and_write_by_name() {
+        for mode in DisplayMode::ALL {
+            assert_eq!(mode.name().parse::<DisplayMode>(), Ok(mode));
+            let config = Config {
+                window: WindowConfig {
+                    mode,
+                    ..WindowConfig::default()
+                },
+                ..Config::default()
+            };
+            let text = config.to_toml();
+            assert!(
+                text.contains(&format!("mode = \"{}\"", mode.name())),
+                "{text}"
+            );
+            assert!(!text.contains("fullscreen = false"), "{text}");
+            assert_eq!(toml::from_str::<Config>(&text).unwrap(), config);
+        }
+        assert_eq!("Exclusive".parse(), Ok(DisplayMode::Exclusive));
+        assert!("full".parse::<DisplayMode>().is_err());
+        assert!(!DisplayMode::Windowed.is_fullscreen());
+        assert!(DisplayMode::Borderless.is_fullscreen());
+    }
+
+    #[test]
+    fn old_fullscreen_files_read_as_a_mode() {
+        let path = std::env::temp_dir().join(format!("m2-alpha-old-{}.toml", std::process::id()));
+        for (text, mode) in [
+            ("fullscreen = true", DisplayMode::Borderless),
+            ("fullscreen = true\nrefresh = 144", DisplayMode::Exclusive),
+            ("fullscreen = false\nrefresh = 144", DisplayMode::Windowed),
+            (
+                "fullscreen = true\nmode = \"exclusive\"",
+                DisplayMode::Exclusive,
+            ),
+        ] {
+            std::fs::write(&path, format!("[window]\n{text}\n")).unwrap();
+            let config = Config::load(&path).unwrap();
+            assert_eq!(config.window.mode, mode, "{text}");
+            assert!(!config.window.fullscreen);
+            assert!(!config.to_toml().contains("fullscreen = true"));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn partial_files_keep_defaults() {
         let config: Config = toml::from_str(
             r#"
@@ -247,6 +436,37 @@ mod tests {
         assert!(smart.enabled);
         assert_eq!(smart.callout_range, 60.0);
         assert!(smart.flank, "the rest keep their defaults");
+    }
+
+    #[test]
+    fn the_menus_settings_round_trip_through_the_file() {
+        let mut config = Config::default();
+        let mut s = config.menu_settings();
+        assert_eq!(
+            s.mouse,
+            crate::pause::mouse_slider(config.camera.mouse_sensitivity)
+        );
+        (s.subtitles, s.vsync, s.music, s.view_distance) = (false, false, 30.0, 40.0);
+        (s.invert_mouse, s.pad, s.rumble, s.detail) = (true, 80.0, false, 1.0);
+        s.advanced[7] = 0.0;
+        config.keep_menu_settings(&s);
+        let back: Config = toml::from_str(&config.to_toml()).unwrap();
+        let again = back.menu_settings();
+        assert_eq!(
+            (
+                again.subtitles,
+                again.vsync,
+                again.music,
+                again.view_distance
+            ),
+            (false, false, 30.0, 40.0)
+        );
+        assert_eq!(
+            (again.invert_mouse, again.pad, again.rumble),
+            (true, 80.0, false)
+        );
+        assert_eq!((again.detail, again.advanced[7]), (1.0, 0.0));
+        assert!((again.mouse - s.mouse).abs() <= 1.0);
     }
 
     #[test]

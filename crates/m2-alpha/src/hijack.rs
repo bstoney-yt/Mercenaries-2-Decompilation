@@ -326,6 +326,9 @@ pub struct Rider {
     /// the PMC HQ interior's starter), by guid
     /// ([`crate::scene::Scene::prop_crews`]).
     pub prop: Option<u32>,
+    /// The scripts' guid for the rider, when known (a prop's crew: Fiona,
+    /// whom a briefing's clips play on, [`crate::raw`]).
+    pub guid: Option<u32>,
     /// The seat, by its name's hash (`seat_driver`).
     pub seat: u32,
     /// Index into the people's kinds: whom they are drawn as.
@@ -522,8 +525,13 @@ impl Hijacks {
             if let Some(c) = &self.near {
                 let _ = crew_kind(game, &c.crew);
             }
-            if self.near.is_some() && input.take_pressed(Action::Use) {
+            // The use key, or the grappling hook having pulled her to a
+            // helicopter's entrance ([`crate::grapple`]).
+            let handed = std::mem::take(&mut game.grapple_handoff);
+            if self.near.is_some() && (handed || input.take_pressed(Action::Use)) {
                 self.begin(game);
+            } else if handed {
+                eprintln!("grapple: no hijack in reach at the entrance");
             }
         }
         let State::Ready(l) = &mut self.state else {
@@ -1054,6 +1062,7 @@ impl Hijacks {
                     riders.push(Rider {
                         vehicle: i,
                         prop: None,
+                        guid: None,
                         seat: hash,
                         kind,
                         rig,
@@ -1198,6 +1207,7 @@ impl Hijacks {
                     riders.push(Rider {
                         vehicle: usize::MAX,
                         prop: Some(g),
+                        guid: Some(rider),
                         seat: hash,
                         kind,
                         rig,
@@ -1558,6 +1568,11 @@ fn follow(
                 }
                 over = true;
             }
+            // A missed press shakes her pad (`Pg.Rumble(hijacker, s)`).
+            HijackCommand::Rumble { guid, seconds } if guid == a.hero => {
+                eprintln!("hijack: pad shakes {seconds:.1} s");
+                game.rumble = game.rumble.max(f64::from(seconds));
+            }
             _ => {}
         }
     }
@@ -1626,7 +1641,12 @@ pub fn beside(game: &mut Game, hijacks: &mut Hijacks, want: Option<&str>) -> Opt
         .enumerate()
         .filter(|(_, v)| !v.wrecked && by_model.contains_key(&v.spec.model))
         .filter(|(_, v)| driver(&v.crew).is_some() || hijacks.crew.is_some())
-        .filter(|(_, v)| want.is_none_or(|w| v.spec.label.to_ascii_lowercase().contains(w)))
+        .filter(|(_, v)| {
+            want.is_none_or(|w| {
+                (w == "helicopter" && v.spec.is_helicopter())
+                    || v.spec.label.to_ascii_lowercase().contains(w)
+            })
+        })
         .filter_map(|(i, v)| Some((i, world.physics.vehicle_transform(v.id?)?)))
         .min_by(|a, b| {
             let d = |m: &m2_math::glam::Mat4| m.transform_point3(Vec3::ZERO).distance(here);
@@ -1848,6 +1868,7 @@ fn draw_hijackee(a: &mut Active, game: &mut Game, dt: f32) {
         outfit: h.outfit.clone(),
         frame: at * Mat4::from_translation(off),
         prop: None,
+        guid: None,
     });
 }
 

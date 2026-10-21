@@ -17,13 +17,18 @@ use crate::game::{Game, can_get_out, get_out, place};
 use crate::mission::{Mark, WATERLINE};
 use crate::player::{Intent, Player};
 use crate::route::{Mover, Route};
-use crate::support::{Aim, PDA_CLOSE, PDA_OPEN, Phase};
+use crate::support::{Aim, Entry, PDA_CLOSE, PDA_OPEN, Phase};
 
 /// How fast she turns the camera, radians a second (a quick hand on the
 /// mouse).
 const TURN: f32 = 5.0;
 /// The camera's pitch while she runs or drives, radians.
 const CRUISE_PITCH: f32 = -0.2;
+/// With nothing to do, she looks at what the scripts wait for her to
+/// see if it is within this far (metres), from at least this far off
+/// (invented: the camera rides behind her).
+const LOOK_NEAR: f32 = 60.0;
+const LOOK_FROM: f32 = 6.0;
 /// Close enough to a place to be there, metres. Waiting there longer than
 /// this (seconds), she walks round it this far out: the scripts' region
 /// may lie to a side of their marker.
@@ -58,9 +63,6 @@ const SHOOT_RANGE: f32 = 35.0;
 const BLAST_RANGE: (f32, f32) = (15.0, 45.0);
 /// With the grenade launcher, whose rounds reach about 40 m.
 const LOB_RANGE: (f32, f32) = (12.0, 32.0);
-/// Aimed at something to blow up with no clear shot this long (seconds;
-/// invented), she goes closer instead.
-const BLAST_BLOCKED: f32 = 15.0;
 /// What only a support strike brings down (the first contract's gates)
 /// she calls the bomb on from between these (metres): out of its frag's
 /// reach, and near enough that the satellite's view (5 m/s) is soon over
@@ -81,6 +83,34 @@ const DEFEND: f32 = 30.0;
 /// lower than she stands by more than this if she can (metres).
 const BLOCKED: f32 = 4.0;
 const VANTAGE_RINGS: [f32; 5] = [6.0, 10.0, 15.0, 20.0, 26.0];
+/// Blowing something up, in range this long (seconds) without a shot
+/// (something in the way, or her aim never settling), she goes where she
+/// can fire from: on rings this far out (metres), inside the rockets' and
+/// the grenades' ranges. Invented.
+const BLAST_BLOCKED: f32 = 8.0;
+const BLAST_RINGS: [f32; 4] = [20.0, 26.0, 32.0, 38.0];
+const LOB_RINGS: [f32; 3] = [16.0, 22.0, 28.0];
+/// A shot meeting something within this of what she is blowing up meets
+/// the thing itself (metres; a truck's half length and more). Invented.
+const BLAST_BODY: f32 = 6.0;
+/// Out of rockets, she sets C4 on what she is blowing up: thrown from
+/// within this (metres), set off from at least this far (metres) or once
+/// she has been going this long (seconds). Invented.
+const PLANT_FROM: f32 = 4.0;
+const PLANT_SAFE: f32 = 18.0;
+const PLANT_AWAY: f32 = 12.0;
+/// A prompt at her goal is taken again after this long (seconds) if it is
+/// still offered. Invented.
+const PRESS_AGAIN: f32 = 3.0;
+/// A spot to fire from more than this above or below her once she is
+/// over it is one she can't get to (metres). Invented.
+const SPOT_RISE: f32 = 2.5;
+/// A vehicle's cannon in range of her goal this long (seconds) without
+/// bringing it down, she gets out. Invented.
+const CANNON_GIVE_UP: f32 = 30.0;
+/// Sooner (seconds) when the gun is at its stop with the goal beyond it.
+/// Invented.
+const CANNON_BEYOND: f32 = 4.0;
 const VANTAGE_CLIMB: f32 = 3.0;
 /// Driving: she eases off within this far of a place (metres) above this
 /// speed (m/s); stuck this long (seconds), she backs out for this long.
@@ -127,6 +157,9 @@ const GET_OUT: f32 = 40.0;
 /// Within this far of a vehicle's door she presses to get in, metres;
 /// presses are this far apart, seconds (a press gets her in or out).
 const DOOR: f32 = 2.5;
+/// Within this of a crewed vehicle's middle she starts its hijack,
+/// metres (invented; m2-alpha's `HIJACK_REACH` is 6).
+const HIJACK_NEAR: f32 = 5.0;
 const PRESS_GAP: f32 = 1.5;
 /// Fallen this far under the ground (metres: a hole where the island
 /// hadn't streamed in yet), she is put back on it.
@@ -173,6 +206,17 @@ const LOG_WAY: f32 = 30.0;
 /// 100 m up the beach before it lands (from the recordings; she still
 /// fights back first when they're within [`DEFEND`]).
 const OPEN_NEAR: f32 = 250.0;
+/// With the launcher empty, rockets lying within this far (metres) are
+/// fetched, those the layers placed too. Invented.
+const RESTOCK_NEAR: f32 = 150.0;
+/// With things still to blow up, other pickups are fetched only within
+/// this (metres); one she stands over this long (seconds) that doesn't
+/// come with the key is left. Invented.
+const BUSY_NEAR: f32 = 30.0;
+const TAKE_AT: f32 = 10.0;
+/// A vehicle she goes for and hasn't got into in this long (seconds) is
+/// left. Invented.
+const BOARD_FOR: f32 = 90.0;
 const OPEN_FROM: f32 = 0.9;
 const OPEN_FACING: f32 = 0.2;
 const OPEN_FOR: f32 = 45.0;
@@ -190,6 +234,28 @@ const PDA_MOST: f32 = 15.0;
 const PDA_PROMPT: f32 = 3.0;
 /// Seconds between lines saying how she is getting on.
 const REPORT: f32 = 15.0;
+/// Under the place she is after but this far below it (metres: a prisoner
+/// on a roof, ChiCon001's party official 56 m up), for this long
+/// (seconds), she hops up there, logged as a hop: a player would land a
+/// helicopter or grapple up.
+const UNDER_BY: f32 = 4.0;
+/// A building to destroy this near (metres, flat) under one she is to
+/// reach is left standing meanwhile.
+const HOLDS_UP: f32 = 20.0;
+/// One following her left this far behind (metres) this long (seconds)
+/// is brought to her: a test driver's shortcut, logged, for ways the
+/// alpha has no means of (a VIP off a roof, which a player lifts off by
+/// helicopter).
+const LEFT_BEHIND: f32 = 30.0;
+const LEFT_FOR: f32 = 20.0;
+const UNDER_FOR: f32 = 6.0;
+/// An outpost to capture (`HUD_objective_outpost` on its capture point):
+/// she goes within this far (metres) and calls in the soldier delivery
+/// she holds (the outpost gives her one of its attackers' free,
+/// `Outpost.GetFreebieName`), at most once in this long (seconds), and
+/// stands by while their soldiers take the point.
+const OUTPOST_NEAR: f32 = 20.0;
+const DELIVERY_AGAIN: f32 = 60.0;
 
 /// What she is after.
 #[derive(Clone, Debug, PartialEq)]
@@ -208,6 +274,9 @@ enum Goal {
     /// Take one thing a supply crate left (walking up to it), by its
     /// [`Pickup::key`](crate::flights::Pickup::key).
     Take((u32, u32)),
+    /// Call in the scripts' support item `key` she holds (a soldier
+    /// delivery, by an outpost): the support menu, then its designator.
+    Deliver(String),
 }
 
 impl Goal {
@@ -219,6 +288,7 @@ impl Goal {
             (Goal::Shoot(a), Goal::Shoot(b)) | (Goal::Board(a), Goal::Board(b)) => a == b,
             (Goal::Open(a), Goal::Open(b)) => a == b,
             (Goal::Take(a), Goal::Take(b)) => a == b,
+            (Goal::Deliver(a), Goal::Deliver(b)) => a == b,
             _ => false,
         }
     }
@@ -236,6 +306,11 @@ struct Way {
 /// The player playing herself.
 #[derive(Debug, Default)]
 pub struct Autoplay {
+    /// What the scripts wait for her to see (`Event.ObjectIsVisible`:
+    /// PmcCon001's hall column, which brings the tank through the wall):
+    /// where each is, set each tick ([`crate::mission::MissionLink::
+    /// sight_targets`]).
+    pub sights: Vec<Vec3>,
     /// Seconds played.
     clock: f32,
     goal: Option<Goal>,
@@ -260,6 +335,20 @@ pub struct Autoplay {
     /// spot), and the spots that turned out no better.
     vantage: Option<(usize, Vec3)>,
     tried: Vec<Vec3>,
+    /// Where she goes to fire at what she is blowing up (its object, the
+    /// spot); the spots no better go in `tried` too.
+    blast_spot: Option<(u32, Vec3)>,
+    /// With the launcher empty, the C4 she set on what she is blowing up
+    /// and when, while she gets clear to set it off.
+    planted: Option<f32>,
+    /// When she last took a prompt of the scripts' at her goal.
+    context_pressed: f32,
+    /// Seconds a vehicle's cannon has been in range of her goal.
+    gunning: f32,
+    /// The vehicle she is going for and since when, and those she gave up
+    /// going for.
+    boarding: Option<(usize, f32)>,
+    left_rides: Vec<usize>,
     /// Sidestepping (-1 left, 1 right), seconds left.
     sidestep: Option<(f32, f32)>,
     /// Which way the next sidestep goes.
@@ -310,6 +399,10 @@ pub struct Autoplay {
     ride_still: Option<(u32, Vec3, f32)>,
     /// The helicopter she got into, and when.
     boarded: Option<(u32, f32)>,
+    /// When she last called in a soldier delivery by an outpost.
+    delivered: Option<f32>,
+    /// Seconds one following her has been left behind.
+    left_behind: f32,
 }
 
 impl Autoplay {
@@ -356,6 +449,28 @@ impl Autoplay {
             None => self.leave = false,
         }
         self.ground(game);
+        // Those following her who fall behind (on foot, or while she
+        // drives): brought to her after a while (a test shortcut).
+        let here = game.focus();
+        let behind = game.scene.people.followers().iter().any(|f| {
+            f.with_y(0.0).distance(here.with_y(0.0)) > LEFT_BEHIND
+                || (f.y - here.y).abs() > UNDER_BY * 3.0
+        });
+        self.left_behind = if behind { self.left_behind + dt } else { 0.0 };
+        if self.left_behind > LEFT_FOR
+            && game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_none())
+        {
+            self.left_behind = 0.0;
+            let n = game.scene.people.bring_followers(here);
+            eprintln!(
+                "autoplay {:.1} s: {n} following her left behind: brought to her at {here:.1} (test shortcut)",
+                self.clock
+            );
+        }
         // The scripts wait for her to look at her PDA (the first contract,
         // at the first gate): she opens it, and shuts it again.
         let wants = |name: &str| awaited.iter().any(|a| a == name);
@@ -377,6 +492,21 @@ impl Autoplay {
         }
         if game.support.pda || asked {
             return self.pda(game.support.pda, wants(PDA_CLOSE));
+        }
+        // The scripts offer their context action on what a marker of
+        // theirs is on, and she stands at it (a prisoner to release,
+        // `[ContextAction.ReleasePrisoner]`): she takes it with the use key.
+        if let Some((g, text)) = game.context.clone()
+            && marks.iter().any(|m| m.alive && m.target == g)
+        {
+            // As the use key does in play (`Game::tick`, which her
+            // intents don't pass through), as `--context` does too.
+            if self.pressed > PRESS_GAP && !game.input_locked {
+                self.pressed = 0.0;
+                eprintln!("autoplay {:.1} s: taking {text:?} at {g:#x}", self.clock);
+                game.context_taken = Some(g);
+            }
+            return Intent::default();
         }
         let chosen = self.choose(game, marks);
         let changed = match (&chosen, &self.goal) {
@@ -402,8 +532,22 @@ impl Autoplay {
             self.reversing = None;
             self.stalled = 0.0;
             self.way = None;
+            self.gunning = 0.0;
         }
         self.goal = chosen.map(|c| c.0);
+        // The scripts' prompt on what she went to (a verify on a body, a
+        // starter's talk) is taken with the use key, as a player would.
+        if let (Some(Goal::Reach { target, .. }), Some((g, text))) = (&self.goal, &game.context)
+            && g == target
+            && self.clock - self.context_pressed > PRESS_AGAIN
+        {
+            eprintln!(
+                "autoplay {:.1} s: taking {text:?} at {}",
+                self.clock, self.what
+            );
+            self.context_pressed = self.clock;
+            game.context_taken = Some(*g);
+        }
         if let (Some(Goal::Reach { target, .. }), Some(t)) = (&self.goal, self.arrived)
             && self.waiting.is_none_or(|w| w.0 != *target)
         {
@@ -418,8 +562,8 @@ impl Autoplay {
         // and she stood aimed at the fourth for 2100 s), a strike brings
         // down what she would have blown up.
         let spent = game.combat.launcher_rounds.is_some() && game.combat.launcher_empty();
-        let striking =
-            matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target) || spent);
+        let striking = matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target) || spent)
+            || matches!(self.goal, Some(Goal::Deliver(_)));
         // A call she is no longer after is put away: the designator goes
         // with a weapon taken up (twice from the satellite's view).
         if !striking && (game.support.busy() || game.support.holding()) {
@@ -483,17 +627,18 @@ impl Autoplay {
             self.act(game, target, at);
         }
         match self.goal.clone() {
-            None => self.idle(game),
+            None => self.idle(game, dt),
             Some(Goal::Reach { at, .. }) if acting.is_some() => {
                 self.travel(game, at, ACTION_ARRIVE, dt)
             }
             Some(Goal::Reach { at, .. }) => self.travel(game, at, ARRIVE, dt),
             Some(Goal::Shoot(i)) => self.shoot(game, i, dt),
             Some(Goal::Blast { at, .. }) if striking => self.strike(game, at, dt),
-            Some(Goal::Blast { at, .. }) => self.blast(game, at, dt),
+            Some(Goal::Blast { target, at }) => self.blast(game, target, at, dt),
             Some(Goal::Board(i)) => self.board(game, i, dt),
             Some(Goal::Open(target)) => self.open(game, target, dt),
             Some(Goal::Take(key)) => self.take(game, key, dt),
+            Some(Goal::Deliver(key)) => self.deliver(game, &key),
         }
     }
 
@@ -533,6 +678,49 @@ impl Autoplay {
         }
     }
 
+    /// Calls in the support item `key` she holds, as a player does: her
+    /// PDA shut, the item chosen in the support menu and taken, its
+    /// designator thrown (or aimed and confirmed).
+    fn deliver(&mut self, game: &mut Game, key: &str) -> Intent {
+        let mut intent = Intent::default();
+        if game.support.pda {
+            self.tapped = !self.tapped;
+            intent.trigger.pda = self.tapped;
+            return intent;
+        }
+        if game.combat.to_throw {
+            intent.trigger.throw = true;
+            return intent;
+        }
+        match game.support.phase {
+            Phase::Idle => {
+                if let Some(i) = game
+                    .support
+                    .entries()
+                    .iter()
+                    .position(|e| matches!(e, Entry::Stocked(s) if s.key == key))
+                {
+                    game.support.selected = i;
+                    intent.trigger.support = true;
+                }
+            }
+            Phase::Menu => {
+                intent.use_pressed = true;
+                self.delivered = Some(self.clock);
+                eprintln!("autoplay {:.1} s: calling in {key}", self.clock);
+            }
+            Phase::Designating { aim, .. } => match aim {
+                Aim::Satellite => {
+                    self.tapped = !self.tapped;
+                    intent.trigger.fire = self.tapped;
+                }
+                Aim::Laser => intent.trigger.fire = true,
+            },
+            _ => {}
+        }
+        intent
+    }
+
     /// What to do next, and words for the log.
     fn choose(&self, game: &Game, marks: &[Mark]) -> Option<(Goal, String)> {
         let p = game.scene.player.as_ref()?;
@@ -559,6 +747,45 @@ impl Autoplay {
         fn nearest(ms: Vec<&Mark>, here: Vec3) -> Option<&Mark> {
             ms.into_iter()
                 .min_by(|a, b| a.at.distance(here).total_cmp(&b.at.distance(here)))
+        }
+        // An outpost to capture: there, the soldier delivery she holds
+        // called in (its soldiers take the point), then she stands by.
+        let outposts: Vec<&Mark> = live
+            .iter()
+            .copied()
+            .filter(|m| m.kind == "outpost")
+            .collect();
+        if let Some(m) = nearest(outposts, here) {
+            let d = m.at.distance(here);
+            let held = game.support.entries().into_iter().find_map(|e| match e {
+                Entry::Stocked(s) if s.key.starts_with("SoldierDelivery") => Some(s.key.clone()),
+                _ => None,
+            });
+            let again = self
+                .delivered
+                .is_none_or(|t| self.clock - t > DELIVERY_AGAIN);
+            if d < OUTPOST_NEAR
+                && driving.is_none()
+                && let Some(key) = held.filter(|_| again || game.support.phase != Phase::Idle)
+            {
+                return Some((
+                    Goal::Deliver(key.clone()),
+                    format!(
+                        "calling in {key} by the outpost {} ({:#x})",
+                        m.name, m.target
+                    ),
+                ));
+            }
+            return Some((
+                Goal::Reach {
+                    target: m.target,
+                    at: m.at,
+                },
+                format!(
+                    "taking the outpost {} ({:#x}), {d:.0} m off",
+                    m.name, m.target
+                ),
+            ));
         }
         // A supply crate down near her or marked (or the one she set out
         // to open): broken open first, for what is inside.
@@ -590,6 +817,10 @@ impl Autoplay {
             .world
             .as_ref()
             .map_or(&none, |w| &w.index.template_db);
+        let destroying = live.iter().any(|m| m.kind == "destroy");
+        let rockets_out = game.combat.second == Some(Weapon::Rpg)
+            && game.combat.launcher_rounds.is_none_or(|r| r.total() == 0)
+            && live.iter().any(|m| m.kind == "destroy");
         if driving.is_none()
             && let Some((from, d)) = game
                 .scene
@@ -599,14 +830,22 @@ impl Autoplay {
                 // What the layers place she leaves to the player: going out
                 // of her way for each would keep her from the contract.
                 // (Cheapest first: there are hundreds placed.)
+                // Except rockets with the launcher empty and something
+                // left to blow up (round 4's AllCon002: the boats).
                 .filter(|p| {
-                    !game.placed.is_pickup(p.from)
-                        && p.at.distance(here) < OPEN_NEAR
+                    let d = p.at.distance(here);
+                    let restock = rockets_out
+                        && d < RESTOCK_NEAR
+                        && crate::mission::refill(templates, &game.combat, &p.what).launcher > 0;
+                    // With the contract's things still to blow up, only
+                    // what lies close is worth the detour (round 16's
+                    // AllCon002 lost the boats' race to pickups).
+                    let reach = if destroying { BUSY_NEAR } else { OPEN_NEAR };
+                    (restock || (!game.placed.is_pickup(p.from) && d < reach))
                         && !self.left_lying.contains(&p.key())
                         && wanted(templates, &game.combat, p)
                 })
                 .map(|p| (p.key(), p.at.distance(here)))
-                .filter(|&(_, d)| d < OPEN_NEAR)
                 .min_by(|a, b| a.1.total_cmp(&b.1))
         {
             return Some((
@@ -617,11 +856,58 @@ impl Autoplay {
                 ),
             ));
         }
+        // A person to verify (AllCon003's General Peng): shot down once
+        // she is near (a ride first if far), then she goes to the body,
+        // where the scripts offer their verify prompt (taken in `step`).
+        let verify: Vec<&Mark> = marks.iter().filter(|m| m.kind == "verify").collect();
+        if let Some(m) = nearest(verify, here)
+            && let Some(i) = npcs.iter().position(|n| n.spawn == Some(m.target))
+        {
+            let at = npcs[i].character.position;
+            let d = at.distance(here);
+            if npcs[i].alive && d < RIDE_FOR {
+                return Some((
+                    Goal::Shoot(i),
+                    format!(
+                        "shooting {} ({:#x}) to verify, {d:.0} m off",
+                        m.name, m.target
+                    ),
+                ));
+            }
+            if !npcs[i].alive {
+                return Some((
+                    Goal::Reach {
+                        target: m.target,
+                        at,
+                    },
+                    format!("verifying {} ({:#x}), {d:.0} m off", m.name, m.target),
+                ));
+            }
+        }
         // What to destroy, nearest first: soldiers are shot, things blown up.
+        // Not what someone she is to reach stands on (ChiCon001's party
+        // official on a rooftop, among the bonus objective's buildings): it
+        // waits until they are reached.
+        // Nor what one following her stands on (him, released), nor what
+        // she stands on herself (that roof, as she releases him).
+        // Nor anything a strike would bring down near one following her
+        // (the bomb's blast killed him, ChiCon001).
+        let followers = game.scene.people.followers();
+        let held_up = |m: &Mark| {
+            live.iter()
+                .filter(|n| matches!(n.kind.as_str(), "action" | "deliverable"))
+                .map(|n| n.at)
+                .chain(followers.iter().copied())
+                .chain([here])
+                .any(|at| at.y > m.at.y && at.with_y(0.0).distance(m.at.with_y(0.0)) < HOLDS_UP)
+                || followers.iter().any(|f| {
+                    f.with_y(0.0).distance(m.at.with_y(0.0)) < crate::combat::BOMB_FRAG.0 + HOLDS_UP
+                })
+        };
         let destroy: Vec<&Mark> = live
             .iter()
             .copied()
-            .filter(|m| m.kind == "destroy")
+            .filter(|m| m.kind == "destroy" && !held_up(m))
             .collect();
         if let Some(m) = nearest(destroy, here) {
             // A vehicle to destroy is blown up, not its crew shot: the
@@ -671,6 +957,22 @@ impl Autoplay {
             } else {
                 "blowing up"
             };
+            // Far off, on foot, with a ride close: driven there (round
+            // 4's AllCon002 walked 600 m to the boats while Caracas fell).
+            if driving.is_none()
+                && at.distance(here) > RIDE_FOR
+                && let Some(i) = self.ride_near(game, here)
+            {
+                return Some((
+                    Goal::Board(i),
+                    format!(
+                        "taking the {} for {} ({:.0} m off)",
+                        vehicles[i].spec.label,
+                        m.name,
+                        at.distance(here)
+                    ),
+                ));
+            }
             return Some((
                 Goal::Blast {
                     target: m.target,
@@ -742,32 +1044,15 @@ impl Autoplay {
         let places: Vec<&Mark> = live
             .iter()
             .copied()
+            // A thing to destroy left standing for now (under someone she
+            // is to reach) is no place to go.
+            .filter(|m| m.kind != "destroy")
             .filter(|m| Some(m.target) != riding && (!marked || !unmarked(m)))
             .collect();
         let m = nearest(places, here)?;
         if driving.is_none() {
-            // Far, with a ride close: the scripts' vehicle they brought
-            // last that she hasn't driven (the tank delivered for the next
-            // leg), else hers from before or another of theirs.
-            let near = |i: usize, within: f32| {
-                vehicles
-                    .get(i)
-                    .is_some_and(|v| !v.wrecked && !v.spec.is_boat())
-                    && vehicle_at(game, i)
-                        .is_some_and(|t| t.w_axis.truncate().distance(here) < within)
-            };
-            let fresh = (0..vehicles.len())
-                .rev()
-                .filter(|&i| vehicles[i].guid.is_some() && !self.ridden.contains(&i))
-                .find(|&i| near(i, RIDE_FRESH));
-            let known = || {
-                self.ride
-                    .into_iter()
-                    .chain((0..vehicles.len()).filter(|&i| vehicles[i].guid.is_some()))
-                    .find(|&i| near(i, RIDE_NEAR))
-            };
             if m.at.distance(here) > RIDE_FOR
-                && let Some(i) = fresh.or_else(known)
+                && let Some(i) = self.ride_near(game, here)
             {
                 return Some((
                     Goal::Board(i),
@@ -816,6 +1101,42 @@ impl Autoplay {
                 m.at.distance(here)
             ),
         ))
+    }
+
+    /// A ride close to `here`, for somewhere far: the scripts' vehicle
+    /// they brought last that she hasn't driven (the tank delivered for
+    /// the next leg), else hers from before or another of theirs.
+    fn ride_near(&self, game: &Game, here: Vec3) -> Option<usize> {
+        let vehicles = &game.scene.vehicles;
+        let near = |i: usize, within: f32| {
+            vehicles
+                .get(i)
+                .is_some_and(|v| !v.wrecked && !v.spec.is_boat())
+                && !self.left_rides.contains(&i)
+                && vehicle_at(game, i).is_some_and(|t| t.w_axis.truncate().distance(here) < within)
+        };
+        // The one she set out for while it is still close (round 6 turned
+        // from vehicle to vehicle of the Chinese camp as she passed them).
+        if let Some(Goal::Board(i)) = self.goal
+            && near(i, RIDE_FRESH)
+        {
+            return Some(i);
+        }
+        (0..vehicles.len())
+            .rev()
+            // Not one with its own crew aboard (the enemy's).
+            .filter(|&i| {
+                vehicles[i].guid.is_some()
+                    && vehicles[i].crew.is_empty()
+                    && !self.ridden.contains(&i)
+            })
+            .find(|&i| near(i, RIDE_FRESH))
+            .or_else(|| {
+                self.ride
+                    .into_iter()
+                    .chain((0..vehicles.len()).filter(|&i| vehicles[i].guid.is_some()))
+                    .find(|&i| near(i, RIDE_NEAR))
+            })
     }
 
     /// Opening supply crate `target`: to its side, turned to it, and a
@@ -899,7 +1220,18 @@ impl Autoplay {
             .player
             .as_ref()
             .map_or(p.at, |pl| pl.character.position);
-        if (p.at - here).with_y(0.0).length() <= p.what.reach * 0.8 {
+        let close = (p.at - here).with_y(0.0).length();
+        // Over it a while and it never goes (round 16's AllCon002: 45 s
+        // stood 1.2 m from one while the boats went by): left lying.
+        if close <= p.what.reach && self.clock - since > TAKE_AT {
+            eprintln!(
+                "autoplay {:.1} s: the {:#x} at {:.1} doesn't come with the key: left lying",
+                self.clock, key.1, p.at
+            );
+            self.left_lying.push(key);
+            return Intent::default();
+        }
+        if close <= p.what.reach * 0.8 {
             let press = self.pressed > PRESS_GAP;
             if press {
                 self.pressed = 0.0;
@@ -907,10 +1239,29 @@ impl Autoplay {
             // A rifle lying there is taken for its rounds ("Take Ammo"),
             // not taken up in place of hers ([`wanted`]).
             let templates = game.scene.world.as_ref().map(|w| &w.index.template_db);
-            let swap = p.what.weapon == Some(Weapon::Rifle)
-                && templates.is_none_or(|t| {
-                    crate::mission::offer(t, &game.combat, &p.what) == crate::mission::Offer::Equip
-                });
+            let equips = |q: &crate::flights::Pickup| {
+                q.what.weapon == Some(Weapon::Rifle)
+                    && templates.is_none_or(|t| {
+                        crate::mission::offer(t, &game.combat, &q.what)
+                            == crate::mission::Offer::Equip
+                    })
+            };
+            let swap = equips(&p);
+            // A gun lying within reach beside it would be taken up with
+            // the key instead, in place of hers (PmcCon001's villa: a
+            // dead soldier's grenade and rifle together, and she swapped
+            // rifles back and forth for minutes): left lying.
+            let beside = game.scene.flights.pickups().iter().any(|q| {
+                q.key() != key && (q.at - here).with_y(0.0).length() <= q.what.reach && equips(q)
+            });
+            if beside && !swap {
+                eprintln!(
+                    "autoplay {:.1} s: the {:#x} at {:.1} lies by a gun the key would take up                      in place of hers: left lying",
+                    self.clock, key.1, p.at
+                );
+                self.left_lying.push(key);
+                return Intent::default();
+            }
             return Intent {
                 use_pressed: press && !swap,
                 ..Intent::default()
@@ -920,12 +1271,37 @@ impl Autoplay {
     }
 
     /// Nothing to do: stand, or stop the vehicle.
-    fn idle(&mut self, game: &Game) -> Intent {
+    fn idle(&mut self, game: &mut Game, dt: f32) -> Intent {
         let driving = game
             .scene
             .player
             .as_ref()
             .is_some_and(|p| p.driving.is_some());
+        // Nothing marked, and the scripts wait for her to look at
+        // something near: she looks at it, from a few metres off.
+        if !driving
+            && let Some(p) = game.scene.player.as_ref()
+            && let Some(at) = self
+                .sights
+                .iter()
+                .copied()
+                .filter(|s| s.distance(p.character.position) < LOOK_NEAR)
+                .min_by(|a, b| {
+                    let here = p.character.position;
+                    a.distance(here).total_cmp(&b.distance(here))
+                })
+        {
+            let here = p.character.position;
+            if (at - here).with_y(0.0).length() < LOOK_FROM {
+                let away = here + (here - at).with_y(0.0).normalize_or(Vec3::X) * LOOK_FROM;
+                return self.walk(game, away, 1.0, dt);
+            }
+            let (look, _) = aim(p, at, dt);
+            return Intent {
+                look,
+                ..Intent::default()
+            };
+        }
         Intent {
             hold_jump: driving,
             ..Intent::default()
@@ -953,6 +1329,11 @@ impl Autoplay {
         }
         if d < arrive || self.arrived.is_some() {
             let since = *self.arrived.get_or_insert(self.clock);
+            if d < arrive && at.y - here.y > UNDER_BY && self.clock - since > UNDER_FOR {
+                self.arrived = None;
+                self.hop(game, at, self.clock - since);
+                return Intent::default();
+            }
             if self.clock - since < CIRCLE_AFTER {
                 return Intent::default();
             }
@@ -1077,6 +1458,25 @@ impl Autoplay {
             return Intent::default();
         };
         if let Some(v) = game.scene.player.as_ref().and_then(|p| p.driving) {
+            // A story character (AllCon003's General Peng): out, and on foot
+            // with the rifle once near (round 7's APC sat 79 m off his
+            // bunker 1500 s, its gun never reaching him).
+            let held = game.scene.people.npcs.get(i).is_some_and(|n| n.held);
+            if held
+                && !self.leave
+                && target.distance(game.focus()) < SHOOT_RANGE * 2.0
+                && self.may_get_out(game, v)
+            {
+                eprintln!(
+                    "autoplay {:.1} s: {} near: getting out to go on foot",
+                    self.clock, self.what
+                );
+                self.leave = true;
+            }
+            if self.leave {
+                let speed = vehicle_state(game, v).map_or(0.0, |(_, s)| s);
+                return self.press(speed);
+            }
             return self.at_target_driving(game, v, target, dt);
         }
         let Some(p) = game.scene.player.as_ref() else {
@@ -1120,7 +1520,9 @@ impl Autoplay {
                     .scene
                     .world
                     .as_ref()
-                    .and_then(|w| vantage(&w.physics, target, here, &self.tried))
+                    .and_then(|w| {
+                        vantage(&w.physics, target, here, &self.tried, &VANTAGE_RINGS, 1.0)
+                    })
                     .map(|s| (i, s));
                 eprintln!(
                     "autoplay {:.1} s: no clear shot at {} from {here:.1}: {}",
@@ -1163,7 +1565,7 @@ impl Autoplay {
     /// Blowing up what stands at `at` with what she carries in the
     /// launcher's place: rockets from between [`BLAST_RANGE`], grenades
     /// from between [`LOB_RANGE`]; from a tank, with its cannon.
-    fn blast(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
+    fn blast(&mut self, game: &mut Game, target: u32, at: Vec3, dt: f32) -> Intent {
         if let Some(v) = game.scene.player.as_ref().and_then(|p| p.driving) {
             return self.at_target_driving(game, v, at, dt);
         }
@@ -1174,6 +1576,36 @@ impl Autoplay {
         let d = at.distance(here);
         let lobbing = game.combat.second == Some(Weapon::GrenadeLauncher);
         let (near, far) = if lobbing { LOB_RANGE } else { BLAST_RANGE };
+        if self.blast_spot.is_some_and(|(t, _)| t != target) {
+            self.blast_spot = None;
+            self.tried.clear();
+            self.blocked = 0.0;
+        }
+        // Out of rockets (round 3's AllCon003: four for four AA guns, two
+        // left standing): C4 instead, while she carries any.
+        let rockets = game.combat.launcher_rounds.map_or(0, |r| r.total());
+        if !lobbing && rockets == 0 && (game.combat.charges > 0 || self.planted.is_some()) {
+            return self.plant(game, at, dt);
+        }
+        // Going where she can fire from (in range, nothing in the way).
+        if let Some((_, spot)) = self.blast_spot {
+            if spot.with_y(0.0).distance(here.with_y(0.0)) >= ARRIVE {
+                self.arrived = None;
+                return self.walk(game, spot, 1.0, dt);
+            }
+            // Under it or over it (round 6's AllCon002: a roof by the
+            // river, and she fell in under it): one she can't get to.
+            if (spot.y - here.y).abs() > SPOT_RISE {
+                eprintln!(
+                    "autoplay {:.1} s: the spot {spot:.1} is {:.0} m from her height: another",
+                    self.clock,
+                    spot.y - here.y
+                );
+                self.tried.push(spot);
+                self.blast_spot = None;
+                self.blocked = BLAST_BLOCKED;
+            }
+        }
         if d > far {
             return self.walk(game, at, far - 5.0, dt);
         }
@@ -1184,32 +1616,58 @@ impl Autoplay {
         }
         let (look, error) = aim(p, at, dt);
         let reach = at.distance(p.pivot());
+        let (from, dir) = Combat::aim_ray(p);
+        // What the shot meets first: nothing, something past or near the
+        // target, or its own body (a big vehicle's, round 3's MLRS, is hit
+        // well short of its middle).
         let clear = game.scene.world.as_ref().is_some_and(|w| {
             Combat::aim_probe(&w.physics, &game.scene.people, p)
-                .is_none_or(|(t, _)| t > reach - 4.0)
+                .is_none_or(|(t, _)| t > reach - 4.0 || (from + dir * t).distance(at) < BLAST_BODY)
         });
         self.steady = if error < ON_TARGET {
             self.steady + dt
         } else {
             0.0
         };
-        // Long without a shot, a wall in the way or never steady on it
-        // (round 10: a concrete pit by the PMC's gate, 43 m from the last
-        // tank, for 2000 s; round 11: 44 m from the fourth, 1700 s): she
-        // goes closer along her way, which hops her out if she is stuck.
-        if clear && error < ON_TARGET {
+        // In range a while with no shot (round 2's AllCon002: she stood
+        // 2400 s aimed at the hilltop MLRS): from somewhere else on a ring
+        // round it, another if that is no better.
+        // Swimming she can't fire either.
+        let swimming = game.scene.player.as_ref().is_some_and(|p| p.swimming());
+        if clear && error < ON_TARGET && !swimming {
             self.blocked = 0.0;
         } else {
             self.blocked += dt;
         }
-        // Close enough: aiming again from here.
-        if d < near + 3.0 {
-            self.blocked = self.blocked.min(BLAST_BLOCKED);
-        }
         if self.blocked > BLAST_BLOCKED {
-            return self.walk(game, at, near + 2.0, dt);
+            if let Some((_, s)) = self.blast_spot {
+                self.tried.push(s);
+            }
+            self.blocked = 0.0;
+            self.fresh_headway();
+            let rings: &[f32] = if lobbing { &LOB_RINGS } else { &BLAST_RINGS };
+            self.blast_spot = game
+                .scene
+                .world
+                .as_ref()
+                .and_then(|w| vantage(&w.physics, at, here, &self.tried, rings, BLAST_BODY))
+                .map(|s| (target, s));
+            eprintln!(
+                "autoplay {:.1} s: no shot at {} from {here:.1} ({}, aim off {error:.3}): {}",
+                self.clock,
+                self.what,
+                if clear {
+                    "clear"
+                } else {
+                    "something in the way"
+                },
+                self.blast_spot
+                    .map_or("nowhere better to fire from".to_owned(), |(_, s)| {
+                        format!("going to {s:.1}")
+                    })
+            );
         }
-        let movement = if !clear && self.steady > 1.0 {
+        let movement = if !clear && self.steady > 1.0 && self.blast_spot.is_none() {
             Vec2::Y
         } else {
             Vec2::ZERO
@@ -1228,6 +1686,72 @@ impl Autoplay {
                 select: (Some(game.combat.weapon) != game.combat.second).then_some(Weapon::Rpg),
                 ..Trigger::default()
             },
+            ..Intent::default()
+        }
+    }
+
+    /// C4 on what stands at `at`, as a player out of rockets would: up to
+    /// within [`PLANT_FROM`], the C4 taken up and thrown at it, then off
+    /// to [`PLANT_SAFE`] away (or [`PLANT_AWAY`] seconds on) and set off.
+    /// Again while it stands and she has C4.
+    fn plant(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
+        let Some(p) = game.scene.player.as_ref() else {
+            return Intent::default();
+        };
+        let here = p.character.position;
+        let d = (at - here).with_y(0.0).length();
+        if let Some(since) = self.planted {
+            if d >= PLANT_SAFE || self.clock - since > PLANT_AWAY {
+                eprintln!(
+                    "autoplay {:.1} s: setting off the C4 on {} from {d:.0} m",
+                    self.clock, self.what
+                );
+                self.planted = None;
+                return Intent {
+                    trigger: Trigger {
+                        detonate: true,
+                        ..Trigger::default()
+                    },
+                    ..Intent::default()
+                };
+            }
+            let away = at + (here - at).with_y(0.0).normalize_or(Vec3::X) * (PLANT_SAFE + 4.0);
+            self.arrived = None;
+            return self.walk(game, away, 1.0, dt);
+        }
+        if d > PLANT_FROM {
+            return self.walk(game, at, PLANT_FROM - 1.0, dt);
+        }
+        // The C4 taken up (the throwables go round: grenades, C4, mines).
+        if game.combat.explosive != 1 {
+            return Intent {
+                trigger: Trigger {
+                    next_explosive: self.tap(),
+                    ..Trigger::default()
+                },
+                ..Intent::default()
+            };
+        }
+        let (look, error) = aim(p, at, dt);
+        if error < ON_TARGET * 4.0 && self.tap() {
+            eprintln!(
+                "autoplay {:.1} s: C4 thrown at {} from {d:.1} m ({} left)",
+                self.clock,
+                self.what,
+                game.combat.charges.saturating_sub(1)
+            );
+            self.planted = Some(self.clock);
+            return Intent {
+                look,
+                trigger: Trigger {
+                    throw: true,
+                    ..Trigger::default()
+                },
+                ..Intent::default()
+            };
+        }
+        Intent {
+            look,
             ..Intent::default()
         }
     }
@@ -1404,6 +1928,34 @@ impl Autoplay {
             let stopped = v.gun <= down + 0.01 || v.gun >= up - 0.01;
             stopped || (target - at).normalize_or(dir).angle_between(dir) < TURRET_ON
         });
+        // Its gun at its stop with the goal past it (round 14's AMX30 under
+        // the hilltop MLRS): out soon. In range this long and the goal
+        // still there anyway (round 8's tank sat 250 s): out too, to go on
+        // on foot.
+        let beyond = v
+            .spec
+            .muzzle_pose(v.turret, v.gun)
+            .is_some_and(|(at, dir)| {
+                let (at, dir) = (m.transform_point3(at), m.transform_vector3(dir));
+                let (down, up) = v.spec.elevation;
+                let want = (target - at).normalize_or(dir);
+                (v.gun >= up - 0.01 && want.y > dir.y + 0.05)
+                    || (v.gun <= down + 0.01 && want.y < dir.y - 0.05)
+            });
+        self.gunning += dt;
+        let give_up = if beyond {
+            CANNON_BEYOND
+        } else {
+            CANNON_GIVE_UP
+        };
+        if self.gunning > give_up && self.may_get_out(game, i) {
+            eprintln!(
+                "autoplay {:.1} s: the {} has had {} in range {:.0} s: getting out",
+                self.clock, v.spec.label, self.what, self.gunning
+            );
+            self.leave = true;
+            return self.press(speed);
+        }
         self.steady = if error < ON_TARGET && off < TURRET_ON && laid {
             self.steady + dt
         } else {
@@ -1430,6 +1982,23 @@ impl Autoplay {
             let speed = vehicle_state(game, other).map_or(0.0, |s| s.1);
             return self.press(speed);
         }
+        // Going for it this long without getting in (round 19's AllCon001:
+        // 1330 s after a semi 320 m off, her way round replanned each time
+        // so she never hopped): left, on foot or another.
+        let since = match self.boarding {
+            Some((j, t)) if j == i => t,
+            _ => {
+                self.boarding = Some((i, self.clock));
+                self.clock
+            }
+        };
+        if self.clock - since > BOARD_FOR && !self.left_rides.contains(&i) {
+            eprintln!(
+                "autoplay {:.1} s: the {} not reached in {BOARD_FOR:.0} s: left",
+                self.clock, game.scene.vehicles[i].spec.label
+            );
+            self.left_rides.push(i);
+        }
         let Some(m) = vehicle_at(game, i) else {
             return Intent::default();
         };
@@ -1444,6 +2013,16 @@ impl Autoplay {
         );
         let here = p.character.position;
         if (door - here).with_y(0.0).length() < DOOR {
+            return self.press(0.0);
+        }
+        // Crewed and taken only by its hijack (PmcCon001's villa tank):
+        // the key anywhere close by starts it, door or not (round 4 stood
+        // 3 m off its door for minutes, the way to it blocked).
+        let v = &game.scene.vehicles[i];
+        if game.hijack_only.contains(&v.spec.model)
+            && !v.crew.is_empty()
+            && (m.w_axis.truncate() - here).length() < HIJACK_NEAR
+        {
             return self.press(0.0);
         }
         self.walk(game, door, 1.0, dt)
@@ -1577,6 +2156,16 @@ impl Autoplay {
         }
     }
 
+    /// Whether she can get out of vehicle `i` where it is: anything on
+    /// land, a boat not over deep water ([`Self::can_leave`]).
+    fn may_get_out(&self, game: &Game, i: usize) -> bool {
+        game.scene
+            .vehicles
+            .get(i)
+            .is_some_and(|v| !v.spec.is_boat())
+            || self.can_leave(game, i)
+    }
+
     /// Whether vehicle `i` is a boat she can get out of where it is (not
     /// over deep water).
     fn can_leave(&self, game: &Game, i: usize) -> bool {
@@ -1652,7 +2241,13 @@ impl Autoplay {
     fn hop(&mut self, game: &mut Game, at: Vec3, stuck: f32) {
         let from = game.focus();
         let flat = (at - from).with_y(0.0);
-        let mut to = from + flat.normalize_or_zero() * flat.length().min(HOP);
+        // Not onto what she is blowing up (round 20's AllCon003: hopped onto
+        // the last AA gun, too close to fire and stuck on it 2000 s).
+        let keep = match self.goal {
+            Some(Goal::Blast { .. }) => BLAST_RANGE.0 + 5.0,
+            _ => 0.0,
+        };
+        let mut to = from + flat.normalize_or_zero() * (flat.length() - keep).clamp(0.0, HOP);
         let (Some(world), Some(p)) = (&mut game.scene.world, &mut game.scene.player) else {
             return;
         };
@@ -1749,7 +2344,21 @@ impl Autoplay {
             "autoplay {:.1} s: no headway for {stuck:.0} s at {from:.1} ({}): hopped to {to:.1}",
             self.clock, self.what
         );
+        let brought = game.scene.people.bring_followers(to);
+        if brought > 0 {
+            eprintln!(
+                "autoplay {:.1} s: {brought} following her hopped with her",
+                self.clock
+            );
+        }
         self.hops.push((from, to));
+        // A ride she couldn't get to is left (round 10's AllCon002 spent
+        // 160 s after a WZ551 behind a wall): another or on foot.
+        if let Some(Goal::Board(i)) = self.goal
+            && !self.left_rides.contains(&i)
+        {
+            self.left_rides.push(i);
+        }
         self.fresh_headway();
         self.sidestep = None;
         self.reversing = None;
@@ -1875,15 +2484,21 @@ fn wanted(templates: &Templates, combat: &Combat, p: &crate::flights::Pickup) ->
     }
 }
 
-/// Vehicle `vehicles[i]`'s model to world, if placed.
-/// A spot she can stand on and see `target` from: on rings round it, with
-/// ground under it and nothing between eye height there and the target,
-/// not within a few metres of one already `tried`; of the nearest ring
-/// with any, the one closest to `from`, preferring ground about as high
-/// as hers.
-fn vantage(physics: &Physics, target: Vec3, from: Vec3, tried: &[Vec3]) -> Option<Vec3> {
+/// A spot she can stand on and see `target` from: on `rings` round it,
+/// with ground under it and nothing between eye height there and `short`
+/// of the target, not within a few metres of one already `tried`; of the
+/// nearest ring with any, the one closest to `from`, preferring ground
+/// about as high as hers.
+fn vantage(
+    physics: &Physics,
+    target: Vec3,
+    from: Vec3,
+    tried: &[Vec3],
+    rings: &[f32],
+    short: f32,
+) -> Option<Vec3> {
     let mut best: Option<(f32, Vec3)> = None;
-    for r in VANTAGE_RINGS {
+    for &r in rings {
         for k in 0..24 {
             let a = k as f32 * std::f32::consts::TAU / 24.0;
             let (x, z) = (target.x + r * a.sin(), target.z + r * a.cos());
@@ -1892,13 +2507,15 @@ fn vantage(physics: &Physics, target: Vec3, from: Vec3, tried: &[Vec3]) -> Optio
                 continue;
             };
             let spot = Vec3::new(x, top.y - d, z);
-            if n.y < 0.7 || tried.iter().any(|t| t.distance(spot) < 4.0) {
+            // Flat enough, out of the water, and not one tried.
+            if n.y < 0.7 || spot.y < WATERLINE + 0.3 || tried.iter().any(|t| t.distance(spot) < 4.0)
+            {
                 continue;
             }
             let eye = spot + Vec3::Y * 1.6;
             let (dir, len) = ((target - eye).normalize_or_zero(), target.distance(eye));
             // Short of the target's own body.
-            if physics.cast_ray(eye, dir, (len - 1.0).max(0.0)).is_some() {
+            if physics.cast_ray(eye, dir, (len - short).max(0.0)).is_some() {
                 continue;
             }
             let climb = (spot.y - from.y).abs();
@@ -1914,6 +2531,7 @@ fn vantage(physics: &Physics, target: Vec3, from: Vec3, tried: &[Vec3]) -> Optio
     best.map(|(_, s)| s)
 }
 
+/// Vehicle `vehicles[i]`'s model to world, if placed.
 fn vehicle_at(game: &Game, i: usize) -> Option<Mat4> {
     let id = game.scene.vehicles.get(i)?.id?;
     game.scene.world.as_ref()?.physics.vehicle_transform(id)
@@ -2282,12 +2900,86 @@ mod tests {
         p.add_static(StaticKey::Cell(2), &wall, Vec3::ZERO, Quat::IDENTITY);
         p.step(1.0 / 60.0);
         let target = Vec3::new(0.0, 1.3, 4.0);
-        let spot = vantage(&p, target, Vec3::ZERO, &[]).expect("somewhere to see it from");
+        let spot = vantage(&p, target, Vec3::ZERO, &[], &VANTAGE_RINGS, 1.0)
+            .expect("somewhere to see it from");
         assert!(spot.z > 2.0, "still behind the wall at {spot}");
         assert!(spot.y.abs() < 0.1, "not on the ground: {spot}");
         // Not the same spot twice.
-        let next = vantage(&p, target, Vec3::ZERO, &[spot]).expect("another");
+        let next = vantage(&p, target, Vec3::ZERO, &[spot], &VANTAGE_RINGS, 1.0).expect("another");
         assert!(next.distance(spot) >= 4.0, "{next} is {spot} again");
+    }
+
+    // Ground under the sea (round 6's riverbed): no spot to fire from.
+    #[test]
+    fn no_spot_is_under_the_water() {
+        use m2_engine::{CollisionShape, StaticKey};
+        let mut p = Physics::new();
+        let y = WATERLINE - 4.0;
+        let bed = CollisionShape::mesh(
+            &[
+                Vec3::new(-60.0, y, -60.0),
+                Vec3::new(60.0, y, -60.0),
+                Vec3::new(60.0, y, 60.0),
+                Vec3::new(-60.0, y, 60.0),
+            ],
+            &[[0, 1, 2], [0, 2, 3]],
+        )
+        .unwrap();
+        p.add_static(StaticKey::Cell(1), &bed, Vec3::ZERO, Quat::IDENTITY);
+        p.step(1.0 / 60.0);
+        let target = Vec3::new(0.0, y + 1.0, 0.0);
+        assert_eq!(
+            vantage(&p, target, target, &[], &BLAST_RINGS, BLAST_BODY),
+            None
+        );
+    }
+
+    // A truck-sized box round what she is blowing up (round 3's MLRS):
+    // every line to its middle meets its own sides metres short, so only
+    // stopping BLAST_BODY short finds her a spot to fire from.
+    #[test]
+    fn blast_spots_see_past_the_targets_own_body() {
+        use m2_engine::{CollisionShape, StaticKey};
+        let mut p = Physics::new();
+        let quad = |a: Vec3, b: Vec3, c: Vec3, d: Vec3| {
+            CollisionShape::mesh(&[a, b, c, d], &[[0, 1, 2], [0, 2, 3]]).unwrap()
+        };
+        let ground = quad(
+            Vec3::new(-60.0, 0.0, -60.0),
+            Vec3::new(60.0, 0.0, -60.0),
+            Vec3::new(60.0, 0.0, 60.0),
+            Vec3::new(-60.0, 0.0, 60.0),
+        );
+        p.add_static(StaticKey::Cell(1), &ground, Vec3::ZERO, Quat::IDENTITY);
+        // The box's four sides, 8 m by 3 m, 3 m high.
+        let (x, z, h) = (4.0, 1.5, 3.0);
+        let corners = [(-x, -z), (x, -z), (x, z), (-x, z)];
+        for k in 0..4 {
+            let (a, b) = (corners[k], corners[(k + 1) % 4]);
+            let side = quad(
+                Vec3::new(a.0, 0.0, a.1),
+                Vec3::new(b.0, 0.0, b.1),
+                Vec3::new(b.0, h, b.1),
+                Vec3::new(a.0, h, a.1),
+            );
+            p.add_static(
+                StaticKey::Cell(2 + k as u32),
+                &side,
+                Vec3::ZERO,
+                Quat::IDENTITY,
+            );
+        }
+        p.step(1.0 / 60.0);
+        let target = Vec3::new(0.0, 1.3, 0.0);
+        let from = Vec3::new(30.0, 0.0, 0.0);
+        assert_eq!(vantage(&p, target, from, &[], &BLAST_RINGS, 1.0), None);
+        let spot = vantage(&p, target, from, &[], &BLAST_RINGS, BLAST_BODY)
+            .expect("somewhere to fire from");
+        let d = spot.with_y(0.0).distance(target.with_y(0.0));
+        assert!(
+            (BLAST_RANGE.0..BLAST_RANGE.1).contains(&d),
+            "{spot} is {d:.1} m off"
+        );
     }
 
     // A wall across the way with a gap to its left: the driver steers
@@ -2354,6 +3046,8 @@ mod tests {
             hull,
             turret_box: None,
             rotors: Vec::new(),
+            tilts: Vec::new(),
+            bomb_bay: None,
             damage: None,
             tuning: Default::default(),
         };

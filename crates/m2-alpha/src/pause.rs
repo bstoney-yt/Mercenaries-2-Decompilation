@@ -53,6 +53,13 @@
 //! - Leaving: its Resume (`closePause`) and Quit (`quitGame`) run the
 //!   scripts' handlers, which ask for the `ingame` and `unloading` game
 //!   states ([`News`]).
+//! - Its music: entering, the HUD's scripts run `MrxSound.EnterPauseState`
+//!   (`TransitionMusic("pause")`, which `MrxSound`'s bindings tie to
+//!   `mu_shell_01` for every faction); leaving, `ExitPauseState`
+//!   (`TransitionMusic("silence")`). Both reach the score ([`News::music`]);
+//!   the mission's scripts bring their piece back at their next
+//!   transition (from the scripts; the engine's dynamic music, which
+//!   `_RestoreDynamicMusic` turns back on, is not done).
 //!
 //! # Provenance
 //!
@@ -128,7 +135,20 @@ pub struct Settings {
     pub saves: Vec<SaveEntry>,
     /// The keyboard and mouse table ([`crate::keytable`]).
     pub keys: KeyTable,
+    /// The front end's video screen's Graphic Detail (0 to 2), and its
+    /// advanced screen's eight options in its setters' order
+    /// (`LTIVideoSetSwitchOpt1` to `8`: the first, two detail levels,
+    /// shadows, two more levels, shaders, motion blur; on is 1): kept and
+    /// shown again, nothing in the alpha's drawing follows them.
+    pub detail: f64,
+    pub advanced: [f64; 8],
 }
+
+/// The front end movie's own starting values for its Graphic Detail and
+/// advanced options (`videoVideoDetailVar = 2`, `advvideooption1 = false`,
+/// `advvideooption2 = 3`...).
+pub const DETAIL: f64 = 2.0;
+pub const ADVANCED: [f64; 8] = [0.0, 3.0, 1.0, 1.0, 2.0, 2.0, 1.0, 1.0];
 
 impl Default for Settings {
     fn default() -> Self {
@@ -153,6 +173,8 @@ impl Default for Settings {
             modes: Vec::new(),
             saves: Vec::new(),
             keys: KeyTable::default(),
+            detail: DETAIL,
+            advanced: ADVANCED,
         }
     }
 }
@@ -348,6 +370,14 @@ pub struct News {
     /// _HandleMedEvacEvent` calls `MrxPlayer.MedEvac`): the mission's own
     /// scripts run it (to the sickbay, for its cost).
     pub medevac: bool,
+    /// The HUD's scripts changed the score: `MrxSound.EnterPauseState`
+    /// goes to the `pause` state (`mu_shell_01`, bound for every faction
+    /// in `MrxSound`'s bindings), `ExitPauseState` to `silence` (`None`).
+    pub music: Option<Option<String>>,
+    /// The front end's Continue: load the newest save.
+    pub continue_game: bool,
+    /// Delete the save in this slot (the front end's load screen).
+    pub delete: Option<u32>,
 }
 
 impl News {
@@ -366,6 +396,9 @@ impl News {
         self.keys = later.keys.or(self.keys.take());
         self.video = later.video.or(self.video);
         self.medevac |= later.medevac;
+        self.music = later.music.or(self.music.take());
+        self.continue_game |= later.continue_game;
+        self.delete = later.delete.or(self.delete);
     }
 }
 
@@ -382,21 +415,27 @@ pub struct Native {
     /// The movie's settings play has nothing for (online, advanced
     /// video...), as it last reported them.
     other: std::collections::BTreeMap<String, String>,
-    /// The keyboard table as the movie shows it, and the cell (row,
-    /// column) waiting for a key.
-    keys: KeyTable,
-    waiting: Option<(usize, usize)>,
+    /// The keyboard table's screen.
+    table: KeyScreen,
     /// The video screen's Resolution and Refresh Rate as the player has
-    /// stepped them, applied when the changes are kept.
+    /// stepped them, and its Aspect Ratio (wide), applied when the changes
+    /// are kept.
     video: Video,
+    wide: bool,
 }
 
 impl Native {
+    /// The video screen's Aspect Ratio as the movie has it now (its
+    /// `videoModeVar`, true for wide), kept with the rest on `pauseSave`.
+    pub fn set_wide(&mut self, wide: bool) {
+        self.wide = wide;
+    }
+
     /// A movie (re)started: it is set up again.
     pub fn reset(&mut self) {
         self.set_up = false;
         self.pending.clear();
-        self.stop_waiting();
+        self.table.stop_waiting(&mut self.news);
     }
 
     /// What to call in the movie now, `settings` being play's: set up as
@@ -406,6 +445,7 @@ impl Native {
         if !std::mem::replace(&mut self.set_up, true) {
             self.settings = settings.clone();
             self.video = settings.video;
+            self.wide = settings.wide;
             calls.extend([
                 ("setPlatform", vec![text("PC")]),
                 ("setTerritory", vec![text("EN")]),
@@ -418,8 +458,8 @@ impl Native {
             // (`_FinishPauseOpen` restarts it) may not ask again.
             calls.extend(self.setting_calls());
             // The keyboard table, filled before its screen counts the rows.
-            self.keys = settings.keys.clone();
-            calls.extend(self.key_calls());
+            self.table = KeyScreen::new(settings.keys.clone());
+            calls.extend(self.table.fill());
         }
         calls.append(&mut self.pending);
         calls
@@ -428,6 +468,11 @@ impl Native {
     /// What play should do, since last asked.
     pub fn take_news(&mut self) -> News {
         std::mem::take(&mut self.news)
+    }
+
+    /// The HUD's scripts changed the score to `cue` (`None`: silence).
+    pub fn music(&mut self, cue: Option<String>) {
+        self.news.music = Some(cue);
     }
 
     /// The game state the scripts asked for.
@@ -470,103 +515,32 @@ impl Native {
                 self.pending.extend(self.video_calls().into_iter().skip(1));
                 true
             }
-            // Its aspect ratio (16:9 or 4:3) switched: the movie keeps
-            // which; the alpha draws to the window's shape either way.
+            // Its Aspect Ratio switched between wide and 4:3: which it is
+            // now the host reads from the movie ([`Native::set_wide`]),
+            // kept with the rest on `pauseSave`.
             "LTIVideoSwitchMode" => true,
             "LTIInputGeneralEnter" => {
                 self.pending.extend(self.controls_calls());
                 true
             }
-            "LTIInputKMEnter" | "LTIInputKMExit" => {
-                // As last accepted: what was changed and not accepted goes.
-                self.stop_waiting();
-                self.keys = self.settings.keys.clone();
-                self.pending.extend(self.key_calls());
-                self.pending.push(("LTIInputKMUpdateTable", Vec::new()));
-                true
-            }
-            "LTIInputKMChangeInput" => {
-                let Ok(cell) = arg.trim().parse::<usize>() else {
-                    return false;
-                };
-                let (row, column) = (cell % 100, cell / 100);
-                if row >= ROWS.len() || column > 1 {
-                    return false;
+            _ => match self
+                .table
+                .library(name, arg, &mut self.pending, &mut self.news)
+            {
+                Some(answered) => {
+                    self.settings.keys = self.table.kept.clone();
+                    answered
                 }
-                self.waiting = Some((row, column));
-                self.news.capture = Some(true);
-                true
-            }
-            "LTIInputKMCancelInput" => {
-                self.stop_waiting();
-                true
-            }
-            "LTIInputKMDefault" => {
-                self.stop_waiting();
-                self.keys = KeyTable::default();
-                self.pending.extend(self.key_calls());
-                self.pending.push(("LTIInputKMUpdateTable", Vec::new()));
-                true
-            }
-            "LTIInputKMApplyChanges" => {
-                self.stop_waiting();
-                self.settings.keys = self.keys.clone();
-                self.news.keys = Some(self.keys.clone());
-                true
-            }
-            _ => false,
+                None => false,
+            },
         }
     }
 
     /// The key or mouse button pressed while the keyboard table waited
     /// for one: into its cell, or, Escape, the wait called off.
     pub fn captured(&mut self, control: Control) {
-        let Some((row, column)) = self.waiting.take() else {
-            return;
-        };
-        self.news.capture = Some(false);
-        if control == Control::Key(winit::keyboard::KeyCode::Escape) {
-            self.pending.push(("LTIInputKMCancel", Vec::new()));
-            return;
-        }
-        for r in self.keys.set(row, column, control.into()) {
-            self.pending.extend(self.row_calls(r).into_iter().skip(1));
-        }
-        self.pending
-            .push(("LTIFinishedGettingInput", vec![Value::Bool(false)]));
-        self.pending.push(("LTIInputKMUpdateTable", Vec::new()));
-    }
-
-    /// The keyboard table no longer waits for a key.
-    fn stop_waiting(&mut self) {
-        if self.waiting.take().is_some() {
-            self.news.capture = Some(false);
-        }
-    }
-
-    /// Row `row` of the keyboard table, into the movie: its name, then its
-    /// primary and secondary keys.
-    fn row_calls(&self, row: usize) -> [Call; 3] {
-        let n = Value::Number(row as f64);
-        [
-            (
-                "LTIInputKMSetActionName",
-                vec![n.clone(), text(ROWS[row].name)],
-            ),
-            (
-                "LTIInputKMKeyMap",
-                vec![n.clone(), Value::Bool(false), text(&self.keys.text(row, 0))],
-            ),
-            (
-                "LTIInputKMKeyMap",
-                vec![n, Value::Bool(true), text(&self.keys.text(row, 1))],
-            ),
-        ]
-    }
-
-    /// The whole keyboard table, into the movie.
-    fn key_calls(&self) -> Vec<Call> {
-        (0..ROWS.len()).flat_map(|r| self.row_calls(r)).collect()
+        self.table
+            .captured(control, &mut self.pending, &mut self.news);
     }
 
     fn item_changed(&mut self, arg: &str) -> bool {
@@ -585,6 +559,7 @@ impl Native {
                 // Its `applyChanges` reports no Resolution or Refresh
                 // Rate: the engine's own stepping is what is kept.
                 self.settings.video = self.video;
+                self.settings.wide = self.wide;
                 self.news.video = Some(self.video);
                 self.news.settings = Some(self.settings.clone());
                 true
@@ -592,6 +567,7 @@ impl Native {
             "pauseCancel" => {
                 // Back as they were, sliders heard included.
                 self.video = self.settings.video;
+                self.wide = self.settings.wide;
                 self.news.settings = Some(self.settings.clone());
                 self.news.volumes =
                     Some([self.settings.sfx, self.settings.music, self.settings.dialog]);
@@ -736,12 +712,11 @@ impl Native {
     }
 
     fn video_calls(&self) -> Vec<Call> {
-        let s = &self.settings;
         vec![
             // 1 is wide (`videoModeVar = val == 1`, its WIDE button).
             (
                 "LTIVideoSetMode",
-                vec![Value::Number(f64::from(u8::from(s.wide)))],
+                vec![Value::Number(f64::from(u8::from(self.wide)))],
             ),
             (
                 "LTIVideoSetResolution",
@@ -752,10 +727,135 @@ impl Native {
     }
 }
 
+/// The keyboard and mouse table's screen (Controls, Keyboard/Mouse), as
+/// both menus' movies run it: the pause menu's and the front end's make
+/// the same calls. Filled as the movie starts, rebound a cell at a time,
+/// kept on Accept ([`crate::keytable`]).
+#[derive(Debug, Default)]
+pub struct KeyScreen {
+    /// The table as last accepted.
+    pub kept: KeyTable,
+    /// The table as the movie shows it.
+    keys: KeyTable,
+    /// The cell (row, column) waiting for a key.
+    waiting: Option<(usize, usize)>,
+}
+
+impl KeyScreen {
+    pub fn new(kept: KeyTable) -> Self {
+        Self {
+            keys: kept.clone(),
+            kept,
+            waiting: None,
+        }
+    }
+
+    /// The whole table, into the movie.
+    pub fn fill(&self) -> Vec<Call> {
+        (0..ROWS.len()).flat_map(|r| self.row_calls(r)).collect()
+    }
+
+    /// A call to the PC's library: `Some` whether it is answered, if it
+    /// is the table's. Its calls into the movie go to `pending`.
+    pub fn library(
+        &mut self,
+        name: &str,
+        arg: &str,
+        pending: &mut Vec<Call>,
+        news: &mut News,
+    ) -> Option<bool> {
+        Some(match name {
+            "LTIInputKMEnter" | "LTIInputKMExit" => {
+                // As last accepted: what was changed and not accepted goes.
+                self.stop_waiting(news);
+                self.keys = self.kept.clone();
+                pending.extend(self.fill());
+                pending.push(("LTIInputKMUpdateTable", Vec::new()));
+                true
+            }
+            "LTIInputKMChangeInput" => {
+                let Ok(cell) = arg.trim().parse::<usize>() else {
+                    return Some(false);
+                };
+                let (row, column) = (cell % 100, cell / 100);
+                if row >= ROWS.len() || column > 1 {
+                    return Some(false);
+                }
+                self.waiting = Some((row, column));
+                news.capture = Some(true);
+                true
+            }
+            "LTIInputKMCancelInput" => {
+                self.stop_waiting(news);
+                true
+            }
+            "LTIInputKMDefault" => {
+                self.stop_waiting(news);
+                self.keys = KeyTable::default();
+                pending.extend(self.fill());
+                pending.push(("LTIInputKMUpdateTable", Vec::new()));
+                true
+            }
+            "LTIInputKMApplyChanges" => {
+                self.stop_waiting(news);
+                self.kept = self.keys.clone();
+                news.keys = Some(self.keys.clone());
+                true
+            }
+            _ => return None,
+        })
+    }
+
+    /// The key or mouse button pressed while the table waited for one:
+    /// into its cell, or, Escape, the wait called off.
+    pub fn captured(&mut self, control: Control, pending: &mut Vec<Call>, news: &mut News) {
+        let Some((row, column)) = self.waiting.take() else {
+            return;
+        };
+        news.capture = Some(false);
+        if control == Control::Key(winit::keyboard::KeyCode::Escape) {
+            pending.push(("LTIInputKMCancel", Vec::new()));
+            return;
+        }
+        for r in self.keys.set(row, column, control.into()) {
+            pending.extend(self.row_calls(r).into_iter().skip(1));
+        }
+        pending.push(("LTIFinishedGettingInput", vec![Value::Bool(false)]));
+        pending.push(("LTIInputKMUpdateTable", Vec::new()));
+    }
+
+    /// The table no longer waits for a key.
+    pub fn stop_waiting(&mut self, news: &mut News) {
+        if self.waiting.take().is_some() {
+            news.capture = Some(false);
+        }
+    }
+
+    /// Row `row`, into the movie: its name, then its primary and
+    /// secondary keys.
+    fn row_calls(&self, row: usize) -> [Call; 3] {
+        let n = Value::Number(row as f64);
+        [
+            (
+                "LTIInputKMSetActionName",
+                vec![n.clone(), text(ROWS[row].name)],
+            ),
+            (
+                "LTIInputKMKeyMap",
+                vec![n.clone(), Value::Bool(false), text(&self.keys.text(row, 0))],
+            ),
+            (
+                "LTIInputKMKeyMap",
+                vec![n, Value::Bool(true), text(&self.keys.text(row, 1))],
+            ),
+        ]
+    }
+}
+
 impl Settings {
     /// Sets the movie's variable `name` to `value` (`"true"`, `"80"`):
     /// whether play has it.
-    fn set(&mut self, name: &str, value: &str) -> bool {
+    pub fn set(&mut self, name: &str, value: &str) -> bool {
         let on = matches!(value.trim(), "true" | "1");
         let level = value
             .trim()
@@ -770,10 +870,16 @@ impl Settings {
             ("gameInvertVar", _) => self.invert_pad = on,
             ("gameRumbleVar", _) => self.rumble = on,
             ("videoVsyncVar", _) => self.vsync = on,
+            // The advanced screen's Shadows (the front end's fourth
+            // option).
+            ("advvideoEnableShadowsVar", _) => self.advanced[3] = f64::from(u8::from(on)),
             ("controlsMouseSensVar", Some(v)) => self.mouse = v,
             ("gameSensitivityVar", Some(v)) => self.pad = v,
             ("videoGammaVar", Some(v)) => self.brightness = v,
-            ("videoViewDistance" | "videoViewDistanceVar", Some(v)) => self.view_distance = v,
+            // Reported 10 less than it is (`videoViewDistance = val - 10` in
+            // the setters): 10 to 100.
+            ("videoViewDistance", Some(v)) => self.view_distance = (v + 10.0).min(100.0),
+            ("videoViewDistanceVar", Some(v)) => self.view_distance = v.max(10.0),
             ("audioSFXVolumeVar", Some(v)) => self.sfx = v,
             ("audioMusicVolumeVar", Some(v)) => self.music = v,
             ("audioDialogVolumeVar", Some(v)) => self.dialog = v,
@@ -812,7 +918,7 @@ fn text(s: &str) -> Value {
 
 /// `addSaveGame(number, Timestamp, Character, Money, Oil, TimePlayed,
 /// LastMission, AutoSave, Percentage, Corrupt)`.
-fn save_args(s: &SaveEntry) -> Vec<Value> {
+pub fn save_args(s: &SaveEntry) -> Vec<Value> {
     vec![
         Value::Number(f64::from(s.number)),
         text(&s.timestamp),
@@ -842,6 +948,19 @@ mod tests {
                 _ => String::new(),
             })
             .collect()
+    }
+
+    #[test]
+    fn the_pause_states_music_reaches_play_last_one_kept() {
+        let mut n = Native::default();
+        n.music(Some("mu_shell_01".into()));
+        let mut news = n.take_news();
+        assert_eq!(news.music, Some(Some("mu_shell_01".into())));
+        n.music(None);
+        news.merge(n.take_news());
+        assert_eq!(news.music, Some(None));
+        news.merge(News::default());
+        assert_eq!(news.music, Some(None));
     }
 
     #[test]

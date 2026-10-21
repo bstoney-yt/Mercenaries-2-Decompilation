@@ -1039,7 +1039,7 @@ const BIKE_LEAN: f32 = 0.785;
 const FUSELAGE_HALF: f32 = 1.6;
 
 /// A vehicle in the physics world.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VehicleId(usize);
 
 /// What the driver does.
@@ -2303,6 +2303,67 @@ impl Physics {
         out
     }
 
+    /// The other vehicles a vehicle's body is in contact with, body to
+    /// body, each once, with the deepest point of contact (world space).
+    pub fn vehicle_bumps(&self, id: VehicleId) -> Vec<(VehicleId, Vec3)> {
+        let chassis = |v: &VehicleId| {
+            self.vehicles
+                .get(v.0)
+                .and_then(Option::as_ref)
+                .map(|v| v.controller.chassis)
+        };
+        let Some(own) = chassis(&id) else {
+            return Vec::new();
+        };
+        let Some(body) = self.world.bodies.get(own) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(VehicleId, Vec3)> = Vec::new();
+        for &c in body.colliders() {
+            let Some(mine) = self.world.colliders.get(c) else {
+                continue;
+            };
+            for pair in self.world.narrow_phase.contact_pairs_with(c) {
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let first = pair.collider1 == c;
+                let other = if first {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                let Some(parent) = self.world.colliders.get(other).and_then(|o| o.parent()) else {
+                    continue;
+                };
+                let Some(them) = (0..self.vehicles.len())
+                    .map(VehicleId)
+                    .find(|v| *v != id && chassis(v) == Some(parent))
+                else {
+                    continue;
+                };
+                if out.iter().any(|(v, _)| *v == them) {
+                    continue;
+                }
+                let Some(deepest) = pair
+                    .manifolds()
+                    .iter()
+                    .flat_map(|m| &m.points)
+                    .min_by(|a, b| a.dist.total_cmp(&b.dist))
+                else {
+                    continue;
+                };
+                let local = if first {
+                    deepest.local_p1
+                } else {
+                    deepest.local_p2
+                };
+                out.push((them, vec3(mine.position().transform_point(local))));
+            }
+        }
+        out
+    }
+
     /// The statics a vehicle's body is in contact with (its wheels'
     /// contacts aside), each once: what it ran into.
     pub fn vehicle_statics(&self, id: VehicleId) -> Vec<StaticKey> {
@@ -3277,6 +3338,8 @@ mod tests {
             hull: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2)),
             turret_box: None,
             rotors: Vec::new(),
+            tilts: Vec::new(),
+            bomb_bay: None,
             damage: None,
             tuning: crate::VehicleTuning::default(),
         }
@@ -4177,6 +4240,34 @@ mod tests {
         assert!((track_pull(curve, 0.5) - 0.375).abs() < 1e-5);
         assert!((track_pull(curve, 1.0) - 0.1).abs() < 1e-5);
         assert!((track_pull(curve, 2.0) - 0.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_car_driven_into_another_bumps_it_body_to_body() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        p.step(DT);
+        let a = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        let b = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 10.0), 0.0);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        assert!(p.vehicle_bumps(a).is_empty(), "apart, they don't touch");
+        let up = p.vehicle_velocity(a).y;
+        p.set_vehicle_velocity(a, Vec3::new(0.0, up, 10.0));
+        let mut met = None;
+        for i in 0..120 {
+            p.step(DT);
+            if let Some(&(other, at)) = p.vehicle_bumps(a).first() {
+                met = Some((i, other, at));
+                break;
+            }
+        }
+        let (_, other, at) = met.expect("they never met");
+        assert_eq!(other, b);
+        // Where its front bumper meets the other's rear one, 7.8 m on.
+        assert!((at.z - 7.8).abs() < 0.5, "met at {at:?}");
+        assert_eq!(p.vehicle_bumps(b).first().map(|m| m.0), Some(a));
     }
 
     #[test]

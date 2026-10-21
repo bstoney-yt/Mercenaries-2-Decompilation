@@ -13,6 +13,7 @@ pub mod library;
 pub mod mission;
 pub mod music;
 pub mod report;
+pub mod reverb;
 pub mod savedata;
 pub mod script;
 pub mod shop;

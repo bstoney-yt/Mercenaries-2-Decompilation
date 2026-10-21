@@ -43,6 +43,9 @@ pub const LAND: &str = "HeliLand";
 /// scripts: the hero module's `OnActivate` (healing, the survival
 /// system's one rescue, her inventory), which goes on once she is awake.
 const HERO_ACTIVATE: &str = "Hero.OnActivate(Player.GetCharacter(1))";
+/// The pending save's script data (`__m2_saved`, Lua text from
+/// [`crate::savedata::generate`]) read back into a table.
+const LOAD_SAVED: &str = "assert(loadstring('return ' .. __m2_saved, '=m2-saved'))()";
 
 /// The scripts' free support items (`MrxSupportData.AddFreebie`, as the
 /// first contract gives its Satellite Guided Bomb) reach the game too:
@@ -285,6 +288,10 @@ pub struct GameData {
     /// names them (`"AH1Z (Ewan)"`: `"Recruit Ewen Garret"`), by the
     /// template's name in lower case, for vehicles the scripts spawn.
     pub template_drivers: HashMap<String, String>,
+    /// Who else rides a template's vehicle, as its other `Rider` records
+    /// name them (`"Ka29b (Full)"`: the soldiers a soldier delivery
+    /// brings), by the template's name in lower case.
+    pub template_passengers: HashMap<String, Vec<String>>,
     /// Weapon templates' `MaxAmmoReserve` and which are thrown, by name in
     /// lower case ([`crate::inventory::read`]).
     pub max_reserve: HashMap<String, u32>,
@@ -489,6 +496,15 @@ impl GameData {
                 data.template_drivers
                     .insert(name.to_ascii_lowercase(), driver);
             }
+            let others: Vec<String> = crew_of(records)
+                .into_iter()
+                .filter(|(seat, _)| seat != "seat_driver")
+                .map(|(_, rider)| rider)
+                .collect();
+            if let (Some(name), false) = (named(template), others.is_empty()) {
+                data.template_passengers
+                    .insert(name.to_ascii_lowercase(), others);
+            }
         }
         for (layer, i, records) in own_riders {
             data.layers.get_mut(&layer).expect("indexed above")[i].crew = crew_of(&records);
@@ -593,6 +609,7 @@ impl Mission {
             strings,
             template_labels,
             template_drivers,
+            template_passengers,
             max_reserve,
             thrown,
         } = data;
@@ -613,6 +630,7 @@ impl Mission {
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
             w.template_drivers = template_drivers;
+            w.template_passengers = template_passengers;
             w.inventory.max_reserve = max_reserve;
             w.inventory.thrown = thrown;
             for e in layers.values().flatten() {
@@ -792,12 +810,31 @@ impl Mission {
         Ok(result?)
     }
 
+    /// Has [`start`](Self::start) load a save: `text` is the scripts' save
+    /// data as [`save_data`](Self::save_data) wrote it. The scripts then
+    /// carry on from it (the contracts done and on offer, her PMC, the
+    /// factions...) instead of starting a new game.
+    pub fn load_save(&mut self, text: String) {
+        self.world.borrow_mut().saved = Some(text);
+    }
+
     /// Starts play as the engine does: intro movies skipped, the
-    /// bootstrap's `Init` (which starts a new game when there is no save),
+    /// bootstrap's `Init` (which starts a new game when there is no save,
+    /// and is otherwise handed the save's data: [`load_save`](Self::load_save)),
     /// then the step the engine runs once the GUI has loaded. The first
-    /// contract's mission is then waiting at its start.
+    /// contract's mission, or the save's next, is then waiting.
     pub fn start(&mut self) {
         self.follow_freebies();
+        let saved = self.world.borrow().saved.clone();
+        if let Some(text) = &saved {
+            if let Err(e) = self.host.lua().globals().set("__m2_saved", text.as_str()) {
+                self.log.push(format!("  load save: {e}"));
+            }
+            self.log.push(format!(
+                "save: loading the scripts' save data, {} bytes",
+                text.len()
+            ));
+        }
         let steps = [
             (
                 "skip mode",
@@ -806,15 +843,35 @@ impl Mission {
                     .to_owned(),
             ),
             ("bootstrap", format!("Scripts[\"{BOOTSTRAP:08x}\"].Init()")),
+            // What the engine does when `Pg.LoadGame` said a save loads.
+            (
+                "load save",
+                if saved.is_some() {
+                    format!("Scripts[\"{BOOTSTRAP:08x}\"].LoadSingleton({LOAD_SAVED})")
+                } else {
+                    String::new()
+                },
+            ),
             // The callback MrxGuiBootstrap.SetOnGuiLoadedFunc registers.
             ("gui loaded", "MrxBootstrap._GuiLoaded()".to_owned()),
             ("hero activated", HERO_ACTIVATE.to_owned()),
         ];
         for (name, code) in steps {
+            if code.is_empty() {
+                continue;
+            }
             if let Err(e) = self.run(&code, name) {
                 self.log
                     .push(format!("  {name}: {}", first_lines(&e.to_string())));
             }
+        }
+        if saved.is_some() {
+            self.world.borrow_mut().saved = None;
+            let _ = self.host.lua().globals().set("__m2_saved", Value::Nil);
+            // A save has no intro movies to skip, and in skip mode the
+            // scripts don't move her to the save's place
+            // (`MrxUtil.TeleportHeroesToLocations` only calls back).
+            self.end_skip_mode();
         }
     }
 
@@ -967,12 +1024,21 @@ impl Mission {
             {
                 return;
             }
-            let found: Vec<bool> = w
-                .boundaries
-                .iter()
-                .filter_map(|&b| crate::events::World::inside(&*w, PLAYER, b))
-                .collect();
-            let out = !found.is_empty() && !found.contains(&true);
+            // An exclusion region (`WifVzBoundary.EnableExclusionBoundary`:
+            // `Boundary_ALHQ_Exclusion`, the Allied HQ while it is shut to
+            // her) is out of bounds inside it, the others outside them.
+            let (mut found, mut excluded) = (Vec::new(), false);
+            for &b in &w.boundaries {
+                let Some(inside) = crate::events::World::inside(&*w, PLAYER, b) else {
+                    continue;
+                };
+                if w.objects.get(&b).is_some_and(|o| is_exclusion(&o.name)) {
+                    excluded |= inside;
+                } else {
+                    found.push(inside);
+                }
+            }
+            let out = excluded || (!found.is_empty() && !found.contains(&true));
             if out == w.outside {
                 return;
             }
@@ -1080,8 +1146,7 @@ impl Mission {
             if w.reports.callback.is_none() {
                 return false;
             }
-            let seen = w.reports.seen.remove(faction).unwrap_or_default();
-            w.reports.reporting.insert(reporter, seen);
+            w.reports.offer(reporter, faction);
         }
         if let Err(e) = crate::report::tell(&self.world, reporter, 0) {
             self.world.borrow_mut().printed.push(format!("report: {e}"));
@@ -1120,6 +1185,20 @@ impl Mission {
         self.world.borrow_mut().reports.take_ended()
     }
 
+    /// The cues of the radio playlist with name hash `hash`, as the
+    /// scripts filled it ([`crate::music::Music::playlist`]).
+    pub fn playlist(&self, hash: u32) -> Vec<String> {
+        self.world.borrow().music.playlist(hash).to_vec()
+    }
+
+    /// The pursuit the scripts set ran out: `Pg.GetPursuitState` reads
+    /// level 0 again.
+    pub fn pursuit_over(&mut self) {
+        let mut w = self.world.borrow_mut();
+        w.pursuit.level = 0;
+        w.pursuit.faction = None;
+    }
+
     /// Whether character `guid` swims (`Human.IsSwimming`).
     pub fn set_swimming(&mut self, guid: u32, on: bool) {
         let mut w = self.world.borrow_mut();
@@ -1145,6 +1224,42 @@ impl Mission {
     pub fn hold(&mut self, button: u32, down: bool) {
         let at = down.then_some(self.now);
         self.world.borrow_mut().hijack.hold(button, at);
+    }
+
+    /// The prompt (`[ContextAction.Subdue]`) of the context action offered
+    /// beside `guid`, if one is.
+    pub fn context_text(&self, guid: u32) -> Option<String> {
+        self.world
+            .borrow()
+            .context_actions
+            .get(&guid)
+            .map(|a| a.text.clone())
+    }
+
+    /// Character `guid` is now in human state `state` (`Stance.Action`:
+    /// `KnockedDown.Idle`), for the scripts' `HumanStateTransition` events.
+    pub fn set_human_state(&mut self, guid: u32, state: &str) {
+        let mut w = self.world.borrow_mut();
+        let from = w
+            .human_states
+            .insert(guid, state.to_owned())
+            .unwrap_or_else(|| "Upright.Idle".to_owned());
+        if from != state {
+            w.state_changes
+                .push((self.now, guid, from, state.to_owned()));
+            let extra = w.state_changes.len().saturating_sub(32);
+            w.state_changes.drain(..extra);
+        }
+    }
+
+    /// Character `carrier` now carries `carried` (or nobody), for
+    /// `Human.IsCarrying`.
+    pub fn set_carrying(&mut self, carrier: u32, carried: Option<u32>) {
+        let mut w = self.world.borrow_mut();
+        match carried {
+            Some(c) => w.carrying.insert(carrier, c),
+            None => w.carrying.remove(&carrier),
+        };
     }
 
     /// A character's action (a [`crate::hijack::HijackCommand::State`]
@@ -1178,6 +1293,35 @@ impl Mission {
             o.vehicle = vehicle;
             o.seated_instantly = false;
         }
+    }
+
+    /// Character `guid` is put in vehicle `vehicle` (a prisoner loaded
+    /// into the extraction helicopter): seat events fire on the next tick.
+    pub fn seat_in(&mut self, guid: u32, vehicle: u32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            o.vehicle = Some(vehicle);
+            o.seated_instantly = false;
+        }
+    }
+
+    /// Character `guid` gets out of whatever they ride (a follower out of
+    /// her vehicle).
+    pub fn unseat(&mut self, guid: u32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            o.vehicle = None;
+            o.seated_instantly = false;
+        }
+    }
+
+    /// The objects carrying label `label` (`ExtractionHelicopter`), and
+    /// where each is.
+    pub fn labelled(&self, label: &str) -> Vec<(u32, [f32; 3])> {
+        use crate::events::World;
+        let w = self.world.borrow();
+        w.labelled(label)
+            .into_iter()
+            .filter_map(|g| Some((g, w.objects.get(&g)?.position)))
+            .collect()
     }
 
     /// The points of path entity `guid` in the world ([`Entity::path`]),
@@ -1263,6 +1407,13 @@ impl Mission {
     /// ([`crate::savedata::generate`]).
     pub fn save_data(&self) -> Result<String, MissionError> {
         Ok(crate::savedata::generate(self.host.lua(), BOOTSTRAP)?)
+    }
+
+    /// Where the story stands, as the scripts say
+    /// ([`crate::savedata::CONTRACTS`]): the contracts done, the one
+    /// active, and those on offer.
+    pub fn contracts(&self) -> Result<crate::savedata::Contracts, MissionError> {
+        Ok(crate::savedata::contracts(self.host.lua())?)
     }
 
     /// Opens faction `faction`'s shop (`MrxFactionManager`'s keys: `"All"`,
@@ -1546,6 +1697,27 @@ impl Mission {
         }
     }
 
+    /// The player is in the music region naming faction `faction` (name
+    /// hash; `None`: in none): the free-play score follows it
+    /// ([`crate::music::Music::enter_region`]).
+    pub fn music_region(&mut self, faction: Option<u32>) {
+        let mut w = self.world.borrow_mut();
+        if let Some(c) = w.music.enter_region(faction) {
+            w.commands.push(c);
+        }
+    }
+
+    /// The score changed under the HUD's scripts (the pause menu's
+    /// music): see [`crate::music::Music::heard`].
+    pub fn music_heard(&mut self, cue: Option<String>) {
+        self.world.borrow_mut().music.heard(cue);
+    }
+
+    /// The faction the score plays now (`freeplay_city`, `pmc`, ...).
+    pub fn music_faction(&self) -> String {
+        self.world.borrow().music.faction().to_owned()
+    }
+
     /// The game spent or picked up ammunition: the player's weapon of
     /// template `weapon` now has `rounds` in reserve, as scripts read it
     /// (`Weapon.GetReserveAmmo`).
@@ -1816,6 +1988,38 @@ end
         w.context_presses.push((self.now, guid));
         let extra = w.context_presses.len().saturating_sub(16);
         w.context_presses.drain(..extra);
+    }
+
+    /// A clip the scripts played on `guid` by name met `event`, for the
+    /// scripts' `AnimationEvent` events (the latest 32 are kept).
+    pub fn animation_event(&mut self, guid: u32, event: &str) {
+        let mut w = self.world.borrow_mut();
+        w.animation_events.push((self.now, guid, event.to_owned()));
+        let extra = w.animation_events.len().saturating_sub(32);
+        w.animation_events.drain(..extra);
+    }
+
+    /// Whether the scripts let the player grapple
+    /// (`Player.SetGrappleEnabled`).
+    pub fn grapple_enabled(&self) -> bool {
+        self.world.borrow().grapple_enabled
+    }
+
+    /// The player is (no longer) on her grappling hook's line, for the
+    /// scripts' `Human.IsGrappling`.
+    pub fn set_grappling(&mut self, on: bool) {
+        self.world.borrow_mut().grappling = on;
+    }
+
+    /// A clip the scripts played on `speaker` by name met a voice line
+    /// (its `vo` events: the faction HQs' briefings are spoken by their
+    /// clips, 806 lines over 258 clips, from samples): said as a scripted
+    /// line with no callback, its subtitle up if the player has them on.
+    pub fn clip_line(&mut self, speaker: u32, cue: &str) {
+        let mut w = self.world.borrow_mut();
+        let subtitled = !w.subtitles_off;
+        let say = w.vo.cue(Some(speaker), cue.to_owned(), None, subtitled);
+        w.commands.push(say);
     }
 
     /// Everything the scripts asked the game to do since the last call.
@@ -2137,6 +2341,14 @@ fn activate(lua: &mlua::Lua, entities: &[Entity], load: bool) -> Vec<String> {
 /// The first lines of a (Lua) error, on one line.
 pub fn first_lines(s: &str) -> String {
     s.lines().take(4).collect::<Vec<_>>().join(" | ")
+}
+
+/// Whether a boundary region is one she must keep out of: from samples,
+/// the two regions with a `BoundaryData` record are the HQs' exclusions
+/// (`Boundary_ALHQ_Exclusion`, `Boundary_CHHQ_Exclusion`), the only ones
+/// so named; the record itself isn't decoded.
+fn is_exclusion(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with("_exclusion")
 }
 
 #[cfg(test)]
@@ -2662,6 +2874,125 @@ mod tests {
     }
 
     #[test]
+    fn a_targets_state_changes_and_actions_reach_the_verify_objectives_events() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.world
+            .borrow_mut()
+            .insert(9, crate::api::Object::new("Blanco", [5.0, 0.0, 0.0]));
+        // As `MrxTaskObjectiveVerify` waits: knocked down, then subdued,
+        // and up again; and the player's photo action ending.
+        m.run(
+            r#"__heard = {}
+            local function note(s) return function(g) __heard[#__heard + 1] = s end end
+            local t = Sys.StringToGuid('0x9')
+            Event.CreatePersistent(Event.HumanStateTransition, { t, "*", "KnockedDown.Idle" }, note("down"), {})
+            Event.CreatePersistent(Event.HumanStateTransition, { t, "*", "Subdued.Idle" }, note("subdued"), {})
+            Event.CreatePersistent(Event.HumanStateTransition, { t, "KnockedDown.*", "Upright.*" }, note("up"), {})
+            Human.DoAction(Player.GetAnyCharacter(), "VerifyCamera")
+            Event.Create(Event.HumanActionComplete, { Player.GetAnyCharacter() }, note("photo"), {})"#,
+            "events",
+        )
+        .unwrap();
+        let heard = |m: &Mission| -> Vec<String> {
+            m.lua()
+                .globals()
+                .get::<Table>("__heard")
+                .unwrap()
+                .sequence_values()
+                .map(|v| v.unwrap())
+                .collect()
+        };
+        m.tick(0.1);
+        assert!(heard(&m).is_empty());
+        m.set_human_state(9, "KnockedDown.Idle");
+        m.tick(0.1);
+        m.set_human_state(9, "KnockedDown.Getup");
+        m.tick(0.1);
+        m.set_human_state(9, "Upright.Idle");
+        m.tick(0.1);
+        m.set_human_state(9, "Subdued.Idle");
+        m.action_finished(PLAYER);
+        m.tick(0.1);
+        assert_eq!(heard(&m), ["down", "up", "subdued", "photo"]);
+        // And carrying, as `Human.IsCarrying` reads it.
+        m.set_carrying(PLAYER, Some(9));
+        m.run("__c = Human.IsCarrying(Player.GetAnyCharacter())", "carry")
+            .unwrap();
+        assert!(m.lua().globals().get::<bool>("__c").unwrap());
+    }
+    #[test]
+    fn leaving_the_play_area_or_entering_an_exclusion_tells_the_boundary_callback() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let square = |half: f32| m2_assets::Region {
+            flags: 0,
+            unk_0x04: 0,
+            corners: vec![[-half, -half], [half, -half], [half, half], [-half, half]],
+        };
+        {
+            let mut w = m.world.borrow_mut();
+            w.insert(100, crate::api::Object::new("Boundary00", [0.0; 3]));
+            w.regions.insert(100, square(100.0));
+            w.insert(
+                101,
+                crate::api::Object::new("Boundary_ALHQ_Exclusion", [50.0, 0.0, 50.0]),
+            );
+            w.regions.insert(101, square(10.0));
+        }
+        m.run(
+            r#"__heard = {}
+            Player.SetBoundaryCallback(nil, function(_, zone, event)
+              __heard[#__heard + 1] = zone .. ' ' .. event
+            end)
+            Player.AddBoundary(nil, Sys.StringToGuid('0x64'))
+            Player.AddBoundary(nil, Sys.StringToGuid('0x65'))"#,
+            "boundaries",
+        )
+        .unwrap();
+        let at = |m: &mut Mission, p: [f32; 3]| {
+            m.world
+                .borrow_mut()
+                .objects
+                .get_mut(&PLAYER)
+                .unwrap()
+                .position = p;
+            m.tick(0.1);
+        };
+        at(&mut m, [10.0, 0.0, 10.0]);
+        // Out past the play area's edge, and back.
+        at(&mut m, [150.0, 0.0, 0.0]);
+        at(&mut m, [10.0, 0.0, 10.0]);
+        // Into the exclusion, inside the play area, and out of it again.
+        at(&mut m, [52.0, 0.0, 48.0]);
+        at(&mut m, [10.0, 0.0, 10.0]);
+        // The HQ's interior mode takes the boundaries away and clears her
+        // being out: no "exit" when she comes back.
+        at(&mut m, [150.0, 0.0, 0.0]);
+        m.run(
+            "Player.RemoveAllBoundary(nil)\nPlayer.SetOutBoundary(nil, false)",
+            "interior",
+        )
+        .unwrap();
+        at(&mut m, [10.0, 0.0, 10.0]);
+        let heard: Vec<String> = m
+            .lua()
+            .globals()
+            .get::<Table>("__heard")
+            .unwrap()
+            .sequence_values()
+            .map(|v| v.unwrap())
+            .collect();
+        assert_eq!(
+            heard,
+            [
+                "out enter",
+                "out exit",
+                "out enter",
+                "out exit",
+                "out enter"
+            ]
+        );
+    }
+    #[test]
     fn a_witness_reports_what_his_faction_saw_and_the_manager_settles_it() {
         let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
         // No manager yet: nobody reports.
@@ -2715,6 +3046,41 @@ mod tests {
         assert_eq!(heard, vec![0, 0, 1, 0, 2]);
         // Allied's tally waits for an Allied reporter.
         assert_eq!(m.world.borrow().reports.seen["Allied"]["DamagePerson"], 1);
+    }
+
+    #[test]
+    fn a_factions_infraction_multiplier_scales_what_its_witnesses_report() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        // As a faction contract's start does (2f0b1589), and a mission
+        // that lets the Guerillas' witnesses see nothing (08dcd9af).
+        m.run(
+            r#"Report.Init({ Callback = function() end })
+            Ai.SetInfractionMultiplier(Pg.GetGuidByName("OC"), 0.2)
+            Ai.SetInfractionMultiplier(Pg.GetGuidByName("Guerilla"), 0)"#,
+            "init",
+        )
+        .unwrap();
+        for _ in 0..5 {
+            m.record_infraction("OC", "DamagePerson");
+        }
+        m.record_infraction("Guerilla", "DestroyPerson");
+        m.record_infraction("Allied", "DamagePerson");
+        assert!(m.begin_report(7, "OC"));
+        assert!(m.begin_report(8, "Guerilla"));
+        assert!(m.begin_report(9, "Allied"));
+        m.run(
+            r#"__oc = Report.GetInfractions(Sys.StringToGuid('0x7')).DamagePerson[2]
+            __gur = Report.GetInfractions(Sys.StringToGuid('0x8')).DestroyPerson[2]
+            __all = Report.GetInfractions(Sys.StringToGuid('0x9')).DamagePerson[2]"#,
+            "ask",
+        )
+        .unwrap();
+        let g = m.lua().globals();
+        let oc: f64 = g.get("__oc").unwrap();
+        assert!((oc - 1.0).abs() < 1e-6, "5 x 0.2, got {oc}");
+        assert_eq!(g.get::<f64>("__gur").unwrap(), 0.0);
+        // Never set: as seen.
+        assert_eq!(g.get::<i64>("__all").unwrap(), 1);
     }
 
     #[test]

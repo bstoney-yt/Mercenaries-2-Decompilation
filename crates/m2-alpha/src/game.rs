@@ -37,6 +37,9 @@ struct Spot<'a> {
     yaw: f32,
 }
 
+/// How quickly her lens eases to its gun's share aiming and back, a second
+/// (invented).
+const LENS_EASE: f32 = 8.0;
 /// How fast a flown helicopter's rotors turn, radians a second (about five
 /// turns; invented, the rotor blur hides it).
 const ROTOR_SPIN: f32 = 30.0;
@@ -107,6 +110,8 @@ fn arrived(t: f32, in_place: bool) -> bool {
 pub struct Game {
     pub scene: Scene,
     pub camera: FlyCamera,
+    /// The menus' Brightness and shadows ([`Picture`]).
+    pub picture: Picture,
     /// Playing as Jennifer rather than flying the camera.
     pub on_foot: bool,
     /// Seconds to the next look for parking spots.
@@ -200,11 +205,32 @@ pub struct Game {
     /// Seconds the HUD's save icon has left up after the game was saved
     /// ([`SAVE_ICON_SECONDS`]).
     pub save_icon: f32,
+    /// Clips the scripts hold characters in by name (a faction HQ's
+    /// briefing, [`crate::raw`]).
+    pub raw: crate::raw::RawClips,
+    /// The model the scripts last dressed the player in
+    /// (`Player.SetOutfit`: the wardrobe), till it is put on her
+    /// ([`Game::dress`]).
+    pub outfit_wanted: Option<String>,
+    /// Her grappling hook ([`crate::grapple`]).
+    pub grapple: crate::grapple::Grappler,
+    /// The grapple pulled her to a helicopter's entrance: its hijack is
+    /// to start as the use key starts it ([`crate::hijack`]).
+    pub grapple_handoff: bool,
     /// Seconds before the factions' attitudes are asked of the scripts again.
     pub attitude_wait: f32,
     /// Witnesses reporting her: guid, faction and seconds since they set
     /// off ([`crate::mission`]).
     pub reporters: Vec<(u32, &'static str, f32)>,
+    /// Whether an army pursued her last frame.
+    pub pursued: bool,
+    /// Seconds the scripts asked her pad to shake (`Pg.Rumble`), for the
+    /// pad to take.
+    pub rumble: f64,
+    /// Keyed actions the scripts asked for (`Human.DoAction`: the player's
+    /// verify photo `VerifyCamera`), each with its seconds left, ended for the
+    /// scripts' `HumanActionComplete` ([`crate::mission`]).
+    pub actions: Vec<(u32, String, f32)>,
 }
 
 /// A camera shot the scripts asked for (`Camera.SetShot`): the engine's
@@ -313,6 +339,7 @@ impl Game {
             combat.hero_damage
         );
         Self {
+            picture: Picture::default(),
             scene,
             camera,
             on_foot,
@@ -353,8 +380,15 @@ impl Game {
             aboard: None,
             shot: None,
             save_icon: 0.0,
+            raw: crate::raw::RawClips::default(),
+            outfit_wanted: None,
+            grapple: crate::grapple::Grappler::default(),
+            grapple_handoff: false,
             attitude_wait: 0.0,
             reporters: Vec::new(),
+            pursued: false,
+            rumble: 0.0,
+            actions: Vec::new(),
             scripts_seated: false,
         }
     }
@@ -604,6 +638,7 @@ impl Game {
                 self.step(intent, dt);
                 return;
             }
+            self.aim_lens(&mut intent, zoom, dt);
             let driving = self
                 .scene
                 .player
@@ -629,6 +664,31 @@ impl Game {
             }
             self.camera.update(input, config, mouse_look, dt);
             self.step(Intent::default(), dt);
+        }
+    }
+
+    /// Her gun's lens ([`m2_engine::weapons::CameraFeel`]): aiming on foot,
+    /// the view narrows to its `CrouchFov` share and her look slows to its
+    /// `CrouchYawSpeed` and `CrouchPitchSpeed`; else it widens back to its
+    /// `FOV` (1 on every gun). The lens eases there at [`LENS_EASE`] a
+    /// second (invented). A gun with a scope (`WeaponScope`) looks through
+    /// it instead, aiming: at its least magnification, the wheel stepping
+    /// it a level a notch up to its most (the steps invented), with the
+    /// game's scope screen up (the binocular screen with `bSniper`).
+    pub fn aim_lens(&mut self, intent: &mut Intent, zoom: i32, dt: f32) {
+        let feel = self.combat.camera_feel();
+        let scope = self.combat.scope();
+        let Some(player) = self.scene.player.as_mut() else {
+            return;
+        };
+        let aiming = player.aiming && player.driving.is_none();
+        player.scope = scope
+            .filter(|_| aiming)
+            .map(|(least, most)| scope_step(player.scope, zoom, least, most));
+        player.lens = lens_step(player.lens, feel, aiming, dt);
+        if let Some(f) = feel.filter(|_| aiming) {
+            intent.look.x *= f.aim_look[0];
+            intent.look.y *= f.aim_look[1];
         }
     }
 
@@ -1103,6 +1163,21 @@ impl Game {
                 &mut self.destruction,
                 self.scene.install.as_ref(),
             );
+            // Vehicles running into each other hurt each other and the
+            // parts where they met.
+            for (struck, other, closing, damage) in self
+                .combat
+                .vehicle_crashes(&mut world.physics, &mut self.scene.vehicles)
+            {
+                let v = &self.scene.vehicles[struck];
+                eprintln!(
+                    "crash: the {} hit by the {} at {closing:.1} m/s takes {damage:.1} ({:.0} of {:.0} left)",
+                    v.spec.label,
+                    self.scene.vehicles[other].spec.label,
+                    (v.most_health() - v.damage).max(0.0),
+                    v.most_health()
+                );
+            }
             // What came down (to a vehicle, the traffic's too, or a blast
             // last tick) comes down whether she is on foot or the free
             // camera flies: its island copy has lost its collision already.
@@ -1125,6 +1200,15 @@ impl Game {
             .player
             .as_ref()
             .and_then(|p| self.combat.target(p, self.on_foot));
+        // What she is in, for soldiers whose guns are no use against it.
+        self.scene.people.target_armour = self
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| self.scene.vehicles.get(i))
+            .and_then(|v| v.spec.tuning.armour)
+            .unwrap_or(1);
         if let Some(world) = &mut self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {
@@ -1294,7 +1378,45 @@ impl Game {
         self.run_particles(dt);
         split("game: effects");
         self.scene.tick(dt);
+        self.raw.tick(&mut self.scene, dt);
+        self.grapple_tick(dt);
         split("game: scene");
+    }
+
+    /// The grappling hook's line: the hook flies, or she is pulled in; on
+    /// arrival the helicopter's hijack is handed the start.
+    fn grapple_tick(&mut self, dt: f32) {
+        if let Some(world) = &self.scene.world
+            && let Some(&g) = world.index.template_db.grapple.values().next()
+        {
+            self.grapple.params = g;
+        }
+        let mut grapple = std::mem::take(&mut self.grapple);
+        match grapple.tick(self, dt) {
+            Some(crate::grapple::Outcome::Hooked { seconds, metres }) => {
+                eprintln!("grapple: hooked {metres:.1} m away after {seconds:.2} s")
+            }
+            Some(crate::grapple::Outcome::Missed) => eprintln!("grapple: the hook missed"),
+            Some(crate::grapple::Outcome::Arrived { seconds }) => {
+                eprintln!("grapple: pulled to the entrance in {seconds:.2} s");
+                self.grapple_handoff = true;
+            }
+            None => {}
+        }
+        self.grapple = grapple;
+    }
+
+    /// Puts the player in the model the scripts last dressed her in
+    /// (`Player.SetOutfit`), if any is waiting: her body and clips
+    /// reloaded from it, her health, place and what she holds kept.
+    pub fn dress(&mut self, backend: &mut dyn m2_render::RenderBackend) {
+        let Some(model) = self.outfit_wanted.take() else {
+            return;
+        };
+        self.scene.outfit = Some(m2_assets::name_hash(&model));
+        eprintln!("outfit: {} dressed as {model}", self.scene.hero);
+        let hero = self.scene.hero;
+        self.scene.load_hero(backend, hero);
     }
 
     /// Sets off the game's effects the fight asked for and runs them.
@@ -1622,6 +1744,7 @@ impl Game {
             .collect();
         Some(SaveGame {
             version: save::VERSION,
+            hero: Some(self.scene.hero),
             player: PlayerSave {
                 position: at.to_array(),
                 facing: player.facing,
@@ -2158,7 +2281,62 @@ impl Game {
         if self.support.looking().is_some() {
             satellite_look(&mut view.lighting);
         }
+        self.picture.apply(&mut view.lighting);
         view
+    }
+}
+
+/// How far the world is drawn for the menus' View Distance (10 to 100, as
+/// their setters clamp it): placed models, props and ground scatter out
+/// to their usual reach at 100, a quarter of it at 10, in a line between
+/// (invented: the game's own distances for it are not known).
+pub fn view_distance_scale(v: f64) -> f32 {
+    let t = (v.clamp(10.0, 100.0) - 10.0) / 90.0;
+    (0.25 + 0.75 * t) as f32
+}
+
+impl Game {
+    /// Draws the world as far as the menus' View Distance says
+    /// ([`view_distance_scale`]).
+    pub fn set_view_distance(&mut self, v: f64) {
+        let scale = view_distance_scale(v);
+        let usual = m2_engine::WorldSettings::default();
+        if let Some(world) = &mut self.scene.world {
+            let s = &mut world.settings;
+            s.object_distance = usual.object_distance * scale;
+            s.prop_distance = usual.prop_distance * scale;
+            s.scatter_distance = usual.scatter_distance * scale;
+        }
+    }
+}
+
+/// The menus' picture options as the frame takes them: Brightness (0 to
+/// 100, 50 as the game is lit) and the advanced video screen's shadows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Picture {
+    pub brightness: f64,
+    pub shadows: bool,
+}
+
+impl Default for Picture {
+    fn default() -> Self {
+        Self {
+            brightness: 50.0,
+            shadows: true,
+        }
+    }
+}
+
+impl Picture {
+    /// Brightness scales the finished frame's light, a stop down at 0 and
+    /// up at 100 (invented: the game's gamma curve is not known); shadows
+    /// off, the sun casts none.
+    pub fn apply(&self, lighting: &mut m2_render::Lighting) {
+        let stops = (self.brightness.clamp(0.0, 100.0) - 50.0) / 50.0;
+        lighting.grade *= 2f32.powf(stops as f32);
+        if !self.shadows {
+            lighting.shadow_distance = 0.0;
+        }
     }
 }
 
@@ -2318,6 +2496,7 @@ fn take_up(
         (None, Weapon::Rpg) => combat.rpg.clone(),
         (None, Weapon::Rifle) => combat.carbine.clone(),
     };
+    let set = gun.feel.sound_set;
     let left = combat
         .equip_gun(gun, rounds)
         .map(|(g, n)| (g.slot(), n, g.template, g.model_hash, g.name));
@@ -2326,6 +2505,8 @@ fn take_up(
     if !walked {
         player.start_pickup();
     }
+    // Its sound set's `equip_pickup` cue.
+    combat.cue_sound(crate::combat::Sound::Pickup { set });
     eprintln!(
         "pickup: she takes up the {} ({:#x}) at {:.1} with {rounds} rounds{}",
         spec.map_or(format!("{weapon:?}"), |s| s.name.clone()),
@@ -3532,5 +3713,141 @@ mod tests {
         assert!(!blown_loose(&db, 2));
         // One the data gives no damage table row: thrown, as before.
         assert!(blown_loose(&db, 3));
+    }
+}
+
+/// Her scope's magnification `was` (`None`: just raised, at `least`)
+/// stepped `zoom` levels, held between `least` and `most`.
+fn scope_step(was: Option<f32>, zoom: i32, least: f32, most: f32) -> f32 {
+    (was.unwrap_or(least) + zoom as f32).clamp(least, most.max(least))
+}
+
+/// Her lens' share of the field of view after `dt` seconds from `lens`,
+/// easing to her gun's share: `CrouchFov` aiming, `FOV` else, 1 for a gun
+/// whose template says neither.
+fn lens_step(
+    lens: f32,
+    feel: Option<m2_engine::weapons::CameraFeel>,
+    aiming: bool,
+    dt: f32,
+) -> f32 {
+    let want = match feel {
+        Some(f) if aiming => f.aim_fov,
+        Some(f) => f.fov,
+        None => 1.0,
+    };
+    lens + (want - lens) * (LENS_EASE * dt).min(1.0)
+}
+
+#[cfg(test)]
+mod lens_tests {
+    use super::*;
+
+    // The sniper rifle's record: its view narrows to half aiming, and
+    // widens back to the whole lens when she lowers it.
+    #[test]
+    fn aiming_narrows_the_lens_to_its_guns_share() {
+        let sniper = m2_engine::weapons::CameraFeel {
+            fov: 1.0,
+            aim_fov: 0.5,
+            look: [0.8, 0.8],
+            aim_look: [0.5, 0.5],
+        };
+        let mut lens = 1.0;
+        for _ in 0..60 {
+            lens = lens_step(lens, Some(sniper), true, 1.0 / 60.0);
+        }
+        assert!((lens - 0.5).abs() < 0.01, "{lens}");
+        for _ in 0..60 {
+            lens = lens_step(lens, Some(sniper), false, 1.0 / 60.0);
+        }
+        assert!((lens - 1.0).abs() < 0.01, "{lens}");
+        assert_eq!(lens_step(0.7, None, true, 1.0), 1.0);
+    }
+
+    // The sniper rifle's scope: raised at 4x, the wheel up to 8x and no
+    // further, down to 4x and no further.
+    #[test]
+    fn the_scope_steps_between_its_magnifications() {
+        let mut z = scope_step(None, 0, 4.0, 8.0);
+        assert_eq!(z, 4.0);
+        for _ in 0..6 {
+            z = scope_step(Some(z), 1, 4.0, 8.0);
+        }
+        assert_eq!(z, 8.0);
+        assert_eq!(scope_step(Some(z), -9, 4.0, 8.0), 4.0);
+    }
+
+    // Taking up a gun with the use key cues its set's `equip_pickup`;
+    // walking over it (its rounds only) cues none.
+    #[test]
+    fn a_gun_taken_up_cues_its_pickup_sound() {
+        let templates = m2_engine::Templates::default();
+        let mut flights = crate::flights::Flights::default();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        for walked in [true, false] {
+            let mut combat = Combat::default();
+            let pickup = crate::flights::Pickup {
+                from: 0,
+                what: crate::flights::Leaves {
+                    weapon: Some(crate::combat::Weapon::Rpg),
+                    gives: Some((crate::combat::Weapon::Rpg, 2)),
+                    ..Default::default()
+                },
+                at: Vec3::ZERO,
+                yaw: 0.0,
+            };
+            take_up(
+                &mut combat,
+                &mut flights,
+                &templates,
+                &mut player,
+                pickup,
+                walked,
+            );
+            let cued = combat
+                .take_sounds()
+                .iter()
+                .filter(|s| matches!(s, crate::combat::Sound::Pickup { .. }))
+                .count();
+            assert_eq!(cued, usize::from(!walked));
+        }
+    }
+}
+
+#[cfg(test)]
+mod picture_tests {
+    use super::Picture;
+
+    #[test]
+    fn view_distance_draws_a_quarter_to_all_of_the_usual_reach() {
+        use super::view_distance_scale;
+        assert_eq!(view_distance_scale(100.0), 1.0);
+        assert_eq!(view_distance_scale(10.0), 0.25);
+        assert_eq!(view_distance_scale(0.0), 0.25);
+        assert_eq!(view_distance_scale(55.0), 0.625);
+    }
+
+    #[test]
+    fn brightness_is_a_stop_either_way_and_shadows_can_go() {
+        let lit = |p: Picture| {
+            let mut l = m2_render::Lighting {
+                shadow_distance: 120.0,
+                ..Default::default()
+            };
+            p.apply(&mut l);
+            (l.grade.x, l.shadow_distance)
+        };
+        assert_eq!(lit(Picture::default()), (1.0, 120.0));
+        let bright = Picture {
+            brightness: 100.0,
+            ..Picture::default()
+        };
+        assert_eq!(lit(bright).0, 2.0);
+        let dark = Picture {
+            brightness: 0.0,
+            shadows: false,
+        };
+        assert_eq!(lit(dark), (0.5, 0.0));
     }
 }

@@ -393,9 +393,23 @@ pub fn install(avm: &mut Avm) {
     });
     g.borrow_mut().set("Key", Value::Object(key));
     let mouse = avm.object();
-    for n in ["hide", "show", "addListener", "removeListener"] {
+    for n in ["hide", "show"] {
         def(avm, &mouse, n, |_, _, _, _| Value::Undefined);
     }
+    def(avm, &mouse, "addListener", |avm, _, _, a| {
+        let l = arg(a, 0);
+        if matches!(l, Value::Object(_)) && !avm.mouse_listeners.iter().any(|k| same_object(k, &l))
+        {
+            avm.mouse_listeners.push(l);
+        }
+        Value::Undefined
+    });
+    def(avm, &mouse, "removeListener", |avm, _, _, a| {
+        let l = arg(a, 0);
+        let before = avm.mouse_listeners.len();
+        avm.mouse_listeners.retain(|k| !same_object(k, &l));
+        Value::Bool(avm.mouse_listeners.len() != before)
+    });
     g.borrow_mut().set("Mouse", Value::Object(mouse));
     let stage = avm.object();
     def(avm, &stage, "addListener", |_, _, _, _| Value::Undefined);
@@ -1164,7 +1178,26 @@ fn install_clip(avm: &mut Avm) {
         }
         Value::Undefined
     });
-    def(avm, &cp, "hitTest", |_, _, _, _| Value::Bool(false));
+    // `hitTest(x, y, shapeFlag)` (stage pixels) or `hitTest(target)`: the
+    // two boxes overlap.
+    def(avm, &cp, "hitTest", |avm, player, this, a| {
+        let Some(id) = this_clip(this) else {
+            return Value::Bool(false);
+        };
+        if a.len() >= 2 {
+            let x = num(avm, player, a, 0) as f32;
+            let y = num(avm, player, a, 1) as f32;
+            let shape = a.get(2).is_some_and(|v| avm.truthy(v));
+            return Value::Bool(super::hit_test(player, id, [x, y], shape));
+        }
+        let other = clip_id(&arg(a, 0));
+        let boxes =
+            other.and_then(|o| super::world_bounds(player, o).zip(super::world_bounds(player, id)));
+        Value::Bool(
+            boxes
+                .is_some_and(|(p, q)| p[0] <= q[2] && q[0] <= p[2] && p[1] <= q[3] && q[1] <= p[3]),
+        )
+    });
     def(avm, &cp, "getBounds", |avm, player, this, _| {
         let o = avm.object();
         let b = this_clip(this).and_then(|id| {

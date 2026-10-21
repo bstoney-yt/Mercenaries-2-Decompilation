@@ -118,6 +118,30 @@ impl Object {
         })
     }
 
+    /// The faction it belongs to, by its template's name (`"VZ"`): its own
+    /// (a zone's), else the faction its template's name begins with (`VZ Heavy (AA
+    /// Missile)`, `Chinese Soldier`): inferred from the layers' person
+    /// templates, as `m2-alpha`'s `npc::faction_of`; a template's own
+    /// faction link isn't read.
+    pub fn faction_name(&self) -> Option<&'static str> {
+        if let Some(h) = self.faction {
+            return FACTIONS.into_iter().find(|f| m2_assets::name_hash(f) == h);
+        }
+        let n = self.name.to_ascii_lowercase();
+        [
+            ("vz ", "VZ"),
+            ("allied ", "Allied"),
+            ("chinese ", "China"),
+            ("china ", "China"),
+            ("guerilla ", "Guerilla"),
+            ("guerrilla ", "Guerilla"),
+            ("oc ", "OC"),
+            ("pirate ", "Pirate"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, f)| n.starts_with(prefix).then_some(f))
+    }
+
     /// Its labels as name hashes: those scripts gave it and the data's.
     pub fn all_labels(&self) -> Vec<u32> {
         self.labels
@@ -179,6 +203,14 @@ pub enum Command {
         haste: Option<f32>,
     },
     ExitVehicle(u32),
+    /// A person keeps near `target` (`Ai.Role` `Follow`: a VIP being
+    /// delivered, `MrxFollow`), within `near` metres (its
+    /// `MoveDistance`); `None`: no longer following (another role).
+    Follow {
+        guid: u32,
+        target: Option<u32>,
+        near: f32,
+    },
     /// Open a gate or door (`Object.OpenGate`): PmcCon001's villa doors
     /// as the player comes near them.
     OpenGate(u32),
@@ -201,6 +233,37 @@ pub enum Command {
     /// The player's fuel goes up by this (`Player.AddFuel`: a fuel
     /// pickup's script), up to the tanks' capacity.
     AddFuel(f32),
+    /// The soldiers of faction `faction` (its template's name: `OC`,
+    /// `Allied`) pursue the player for `seconds`, or until the scripts
+    /// clear it (`None`: `Pg.LockPursuit`, a custom pursuit of -1 s).
+    Pursuit {
+        faction: String,
+        seconds: Option<f32>,
+    },
+    /// A locked or custom pursuit ends (`Pg.ClearPursuitLock`,
+    /// `Pg.ClearCustomPursuit`).
+    PursuitClear,
+    /// Character `guid` plays keyed action `action` (`Human.DoAction`).
+    DoAction {
+        guid: u32,
+        action: String,
+    },
+    /// Character `guid` puts down whom it carries (`Human.Drop`).
+    Drop(u32),
+    /// Play the clip named `clip` once on character `guid`, holding them
+    /// in it (`Human.PlayRawAnimation`: the faction HQs' animated
+    /// briefings); the game reports the clip's events back
+    /// ([`crate::mission::Mission::animation_event`]).
+    RawClip {
+        guid: u32,
+        clip: String,
+    },
+    /// Character `guid` wears model `model` from now on
+    /// (`Player.SetOutfit`: the wardrobe's pick, `pmc_hum_jen_v3`).
+    Outfit {
+        guid: u32,
+        model: String,
+    },
     /// Seat a character in a vehicle (seat as the scripts name it, `"d"`
     /// for the driver); `instant` skips the climb-in.
     EnterVehicle {
@@ -277,6 +340,9 @@ pub enum Command {
     /// Play a music cue (`mu_fac_pmc_explore_01`), looped unless it is a
     /// one-shot, in place of what plays; `None` stops the music.
     Music(Option<String>),
+    /// Run the world's sounds through this reverb, or none
+    /// (`Sound.SetReverb`, `Sound.SetReverbPreset`).
+    Reverb(Option<m2_engine::reverb::ReverbPreset>),
     /// Play a sound cue by name (`Sound.CueSound`):
     /// `"ui_HUD_Objective_New"`; `at` the object it sounds from (`None`:
     /// flat, as the interface's sounds).
@@ -411,6 +477,36 @@ pub struct ContextAction {
 /// Reach (metres) for a context action whose call gives none (invented).
 pub const CONTEXT_REACH: f32 = 2.0;
 
+/// The pursuit (`Pg.SetPursuit`, `LockPursuit`, `SetCustomPursuit`,
+/// `GetPursuitState`): the faction manager raises its level by one each
+/// time a faction at its lowest standing reports her (`IncrementPursuit`,
+/// at most 3), and the story locks one for a scene (ChiCon003's Allied, a
+/// VZ chase).
+///
+/// From the scripts: the calls and their arguments, the level read back as
+/// `GetPursuitState().Level`, and the level times (`SetPursuitLevelTimes(120,
+/// 300)`). Inferred: that a level below 3 lasts the first time and level 3
+/// the second. Invented: what `SetPursuitSeconds` (5 s, the HUD gauge's own
+/// fill time) does to it (nothing here), and the times when no script set
+/// them.
+#[derive(Debug, Default)]
+pub struct Pursuit {
+    /// Seconds a pursuit lasts below level 3 and at it, once set.
+    pub times: Option<(f32, f32)>,
+    /// The level under way (0: none).
+    pub level: i64,
+    /// The faction pursuing (its template's guid).
+    pub faction: Option<u32>,
+}
+
+impl Pursuit {
+    /// Seconds a pursuit of `level` lasts.
+    pub fn seconds(&self, level: i64) -> f32 {
+        let (low, high) = self.times.unwrap_or((120.0, 300.0));
+        if level >= 3 { high } else { low }
+    }
+}
+
 /// The scripts' view of the game, and what they asked of it.
 #[derive(Debug, Default)]
 pub struct ScriptWorld {
@@ -478,6 +574,8 @@ pub struct ScriptWorld {
     pub skip_briefing: bool,
     /// The score.
     pub music: crate::music::Music,
+    /// The environmental reverb.
+    pub reverb: crate::reverb::Reverb,
     /// Why each object is invincible (`Object.SetInvincible` reasons).
     pub invincible: HashMap<u32, std::collections::BTreeSet<String>>,
     /// The play area's boundaries (`Player.AddBoundary`: story-stage
@@ -492,11 +590,17 @@ pub struct ScriptWorld {
     /// `Rider` in the driver's seat names them: a vehicle spawned without
     /// "(Driver)" in its name comes with them ([`ScriptWorld::spawn`]).
     pub template_drivers: HashMap<String, String>,
+    /// Who else rides each template's vehicle (its other `Rider`
+    /// records): a `(Full)` vehicle spawned comes with them too.
+    pub template_passengers: HashMap<String, Vec<String>>,
     /// Every layer entity's place, and its guid by name in lower case,
     /// loaded or not: `Pg.GetGuidByName` finds markers (landing zones) of
     /// layers that aren't in, and scripts measure to them.
     pub entities: HashMap<u32, [f32; 3]>,
     pub entity_names: HashMap<String, u32>,
+    /// A save's script data to load, as Lua text ([`crate::savedata`]):
+    /// while it is here `Pg.LoadGame` answers that a save is loading.
+    pub saved: Option<String>,
     /// `Player.SetHealthClamp` and `Player.SetSurvivalMode`, as last set.
     pub health_clamp: bool,
     pub survival_mode: bool,
@@ -515,6 +619,26 @@ pub struct ScriptWorld {
     /// The player's latest takings of a context action, by object, with
     /// their game time ([`crate::events::World::context_presses`]).
     pub context_presses: Vec<(f64, u32)>,
+    /// Characters' human states (`Stance.Action`; `Upright.Idle` when
+    /// none is set), their changes for `HumanStateTransition` events, and
+    /// who carries whom (`Human.IsCarrying`) ([`crate::mission::Mission::set_human_state`]).
+    pub human_states: HashMap<u32, String>,
+    pub state_changes: Vec<crate::events::StateChange>,
+    pub carrying: HashMap<u32, u32>,
+    /// Events met in the clips the scripts play by name
+    /// (`Human.PlayRawAnimation`: the briefings' `CinematicStart` and
+    /// `CinematicEnd`), by who plays them, with their game time
+    /// ([`crate::events::World::animation_events`]).
+    pub animation_events: Vec<(f64, u32, String)>,
+    /// The costume the player's profile keeps (`Player.GetProfileCostume`,
+    /// `SetProfileCostume`: the wardrobe's pick, counted from 0).
+    pub profile_costume: f64,
+    /// The scripts let the player grapple (`Player.SetGrappleEnabled`:
+    /// on once the PMC has a mechanic, 01a266d2).
+    pub grapple_enabled: bool,
+    /// The player is on her grappling hook's line (`Human.IsGrappling`),
+    /// as the game last said.
+    pub grappling: bool,
     /// The crews the layers' vehicles came into play with, by vehicle:
     /// (seat, rider template), as each entity's own `Rider` records say
     /// (the HQ interior's `HqInterior` seats Fiona, its PMC boss), else
@@ -531,6 +655,8 @@ pub struct ScriptWorld {
     /// Witnesses reporting her, and what each faction has against her
     /// (`Report`, [`crate::report`]).
     pub reports: crate::report::Reports,
+    /// The pursuit as the scripts set it ([`Pursuit`]).
+    pub pursuit: Pursuit,
     /// Strikes and designators under way.
     pub strikes: crate::airstrike::Strikes,
     /// Whether vehicle disguises work (`Player.SetVehicleDisguise`): the
@@ -639,6 +765,39 @@ impl ScriptWorld {
                 seat: "d".into(),
                 instant: true,
             });
+        }
+        // A full one (`"Ka29b (Full)"`, a soldier delivery's) comes with its
+        // passengers too, as its other `Rider` records name them
+        // (inferred from the name: `MrxSoldierDelivery` takes them out with
+        // `Ai.Deploy` once it has landed).
+        if lower.contains("(full)") {
+            for rider in self
+                .template_passengers
+                .get(&lower)
+                .cloned()
+                .unwrap_or_default()
+            {
+                let g = self.spawn_guid();
+                let mut o = Object::new(&rider, position);
+                o.vehicle = Some(guid);
+                o.seated_instantly = true;
+                if let Some(l) = self.template_labels.get(&rider.to_ascii_lowercase()) {
+                    o.label_hashes.clone_from(l);
+                }
+                self.insert(g, o);
+                self.commands.push(Command::Spawn {
+                    guid: g,
+                    what: rider,
+                    position,
+                    yaw,
+                });
+                self.commands.push(Command::EnterVehicle {
+                    guid: g,
+                    vehicle: guid,
+                    seat: "p".into(),
+                    instant: true,
+                });
+            }
         }
         guid
     }
@@ -863,6 +1022,14 @@ impl World for ScriptWorld {
 
     fn context_presses(&self) -> &[(f64, u32)] {
         &self.context_presses
+    }
+
+    fn state_changes(&self) -> &[crate::events::StateChange] {
+        &self.state_changes
+    }
+
+    fn animation_events(&self) -> &[(f64, u32, String)] {
+        &self.animation_events
     }
 
     fn hijack_held_since(&self, button: u32) -> Option<f64> {
@@ -1137,6 +1304,82 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let pg = lib("Pg")?;
+    // The pursuit ([`Pursuit`]).
+    add(&pg, "SetPursuitLevelTimes", |w, _, a| {
+        if let (Some(low), Some(high)) = (num(a.first()), num(a.get(1))) {
+            w.pursuit.times = Some((low, high));
+        }
+        values([])
+    })?;
+    add(&pg, "GetPursuitState", |w, lua, _| {
+        let t = lua.create_table()?;
+        t.set("Level", w.pursuit.level)?;
+        if let Some(f) = w.pursuit.faction {
+            t.set("Faction", guid_value(Some(f)))?;
+        }
+        values([Value::Table(t)])
+    })?;
+    // (faction, level, _) for a while; (faction, level) locked.
+    fn pursue(w: &mut ScriptWorld, a: &[Value], locked: bool) {
+        let Some(f) = id(a.first()) else { return };
+        let level = num(a.get(1)).map_or(1, |l| l as i64).clamp(1, 3);
+        let Some(name) = w
+            .templates
+            .iter()
+            .find(|(_, g)| **g == f)
+            .map(|(n, _)| n.clone())
+        else {
+            return;
+        };
+        w.pursuit.level = level;
+        w.pursuit.faction = Some(f);
+        let seconds = (!locked).then(|| w.pursuit.seconds(level));
+        w.commands.push(Command::Pursuit {
+            faction: name,
+            seconds,
+        });
+    }
+    add(&pg, "SetPursuit", |w, _, a| {
+        pursue(w, a, false);
+        values([])
+    })?;
+    add(&pg, "LockPursuit", |w, _, a| {
+        pursue(w, a, true);
+        values([])
+    })?;
+    // (faction, seconds, levels): -1 s until cleared.
+    add(&pg, "SetCustomPursuit", |w, _, a| {
+        let forever = num(a.get(1)).is_none_or(|s| s < 0.0);
+        let Some(f) = id(a.first()) else {
+            return values([]);
+        };
+        let Some(name) = w
+            .templates
+            .iter()
+            .find(|(_, g)| **g == f)
+            .map(|(n, _)| n.clone())
+        else {
+            return values([]);
+        };
+        w.pursuit.level = w.pursuit.level.max(1);
+        w.pursuit.faction = Some(f);
+        let seconds = (!forever).then(|| num(a.get(1)).unwrap_or(0.0));
+        w.commands.push(Command::Pursuit {
+            faction: name,
+            seconds,
+        });
+        values([])
+    })?;
+    for clear in ["ClearPursuitLock", "ClearCustomPursuit"] {
+        add(&pg, clear, |w, _, _| {
+            w.pursuit.level = 0;
+            w.pursuit.faction = None;
+            w.commands.push(Command::PursuitClear);
+            values([])
+        })?;
+    }
+    // (faction, seconds, _): see [`Pursuit`].
+    add(&pg, "SetPursuitSeconds", |_, _, _| values([]))?;
     // The objects of a kind within a radius of a point (x, y, z, radius),
     // as a list: what the strikes hit (the bunker buster's buildings, the
     // tank buster's tanks, the air patrol's aircraft). Which labels make
@@ -1473,6 +1716,54 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Weapons as objects: a loadout of templates, each weapon with its own
     // reserve of ammunition.
     let human = lib("Human")?;
+    // Human.SetAllowCorpseCleanup(character, allow): whether the game may
+    // clear its body away (the verify objective keeps a target's until it
+    // is photographed). The verify objective prints what it answers; true
+    // here (inferred), and bodies are never cleared yet.
+    add(&human, "SetAllowCorpseCleanup", |_, _, _| {
+        values([Value::Boolean(true)])
+    })?;
+    // Human.DoAction(character, action): a keyed action of the human state
+    // table (`VerifyCamera`, the verify's photo; `Cower`), played once;
+    // `HumanActionComplete` fires as it ends.
+    add(&human, "DoAction", |w, _, a| {
+        if let (Some(guid), Some(Value::String(action))) = (id(a.first()), a.get(1)) {
+            let action = action.to_string_lossy();
+            w.hijack.start_action(guid, &action);
+            w.commands.push(Command::DoAction { guid, action });
+        }
+        values([])
+    })?;
+    add(&human, "IsCarrying", |w, _, a| {
+        let carrying = id(a.first()).is_some_and(|g| w.carrying.contains_key(&g));
+        values([Value::Boolean(carrying)])
+    })?;
+    // Human.Drop(character): puts down whom it carries.
+    add(&human, "Drop", |w, _, a| {
+        if let Some(guid) = id(a.first())
+            && w.carrying.contains_key(&guid)
+        {
+            w.commands.push(Command::Drop(guid));
+        }
+        values([])
+    })?;
+    // Human.PlayRawAnimation(character, clip, false, false, -1, true,
+    // true): the one call site (WifHq._NextCinematicFrame) plays each
+    // actor's clip of a briefing frame by name; the other five arguments
+    // are the same every time and not read.
+    add(&human, "PlayRawAnimation", |w, _, a| {
+        if let (Some(guid), Some(Value::String(clip))) = (id(a.first()), a.get(1)) {
+            let clip = clip.to_string_lossy();
+            w.commands.push(Command::RawClip { guid, clip });
+        }
+        values([])
+    })?;
+    // Human.IsGrappling(character): the player's, as the game says; no
+    // one else grapples.
+    add(&human, "IsGrappling", |w, _, a| {
+        let her = id(a.first()).is_some_and(|g| Some(g) == w.player);
+        values([Value::Boolean(her && w.grappling)])
+    })?;
     // Human.DisableWeapons(character) / EnableWeapons(character).
     add(&human, "DisableWeapons", |w, _, a| {
         if let Some(guid) = id(a.first()) {
@@ -1701,6 +1992,24 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    add(&player, "RemoveBoundary", |w, _, a| {
+        if let Some(b) = id(a.get(1)) {
+            w.boundaries.retain(|&x| x != b);
+        }
+        values([])
+    })?;
+    add(&player, "RemoveAllBoundary", |w, _, _| {
+        w.boundaries.clear();
+        values([])
+    })?;
+    // (player, out): sets whether she is out of the play area, without the
+    // callback hearing it: `WifVzBoundary`'s interior mode (the HQ) and the
+    // tether's end clear it (false) once they took the boundaries away, so
+    // that coming back is no "exit".
+    add(&player, "SetOutBoundary", |w, _, a| {
+        w.outside = matches!(a.get(1), Some(Value::Boolean(true)));
+        values([])
+    })?;
     // A character's camera: the game's one camera looks over the player,
     // so it is named by her guid, and its yaw is hers (`Camera.GetYaw`:
     // the carpet bomb's heading).
@@ -1820,6 +2129,32 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             }
             w.commands.push(Command::AddFuel(n));
         }
+        values([])
+    })?;
+    // The wardrobe (WifPmcInterior._CompleteChangeOutfit): the pick's
+    // number, counted from 0, kept in the profile, then the character
+    // dressed in the pick's model. The profile's number is what a player
+    // joining reads back (`iCostume`, 8d35cf13), 0 until set.
+    add(&player, "GetProfileCostume", |w, _, _| {
+        values([Value::Number(w.profile_costume)])
+    })?;
+    add(&player, "SetProfileCostume", |w, _, a| {
+        if let Some(n) = num(a.first()) {
+            w.profile_costume = f64::from(n);
+        }
+        values([])
+    })?;
+    add(&player, "SetOutfit", |w, _, a| {
+        if let (Some(guid), Some(Value::String(model))) = (id(a.first()), a.get(1)) {
+            let model = model.to_string_lossy();
+            w.commands.push(Command::Outfit { guid, model });
+        }
+        values([])
+    })?;
+    // Player.SetGrappleEnabled(player, on): the one call site turns it on
+    // for each player as the mechanic joins the PMC.
+    add(&player, "SetGrappleEnabled", |w, _, a| {
+        w.grapple_enabled = !matches!(a.get(1), None | Some(Value::Nil | Value::Boolean(false)));
         values([])
     })?;
     add(&player, "GetFuel", |w, _, _| {
@@ -1946,6 +2281,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .map(|(&g, _)| g)
             .collect();
         riders.sort_unstable();
+        // `"p"`: the passengers, not the driver (the first rider, as
+        // `Vehicle.GetDriver` has it; a soldier delivery's soldiers).
+        if matches!(a.get(1), Some(Value::String(s)) if s.as_bytes() == b"p") && !riders.is_empty()
+        {
+            riders.remove(0);
+        }
         for r in riders {
             t.raw_push(crate::events::guid_value(r))?;
         }
@@ -2042,8 +2383,27 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let ai = lib("Ai")?;
+    // Ai.SetInfractionMultiplier(faction, m), the faction as its
+    // template's guid (`Pg.GetGuidByName("OC")`): see
+    // [`crate::report::Reports::multipliers`].
+    add(&ai, "SetInfractionMultiplier", |w, _, a| {
+        let name = id(a.first())
+            .and_then(|g| w.objects.get(&g))
+            .map(|o| o.name.to_ascii_lowercase());
+        if let (Some(name), Some(m)) = (name, num(a.get(1))) {
+            w.reports.multipliers.insert(name, m);
+        }
+        values([])
+    })?;
     add(&ai, "GetFactionGuid", |w, _, a| {
-        let faction = id(a.first()).and_then(|g| w.objects.get(&g)?.faction);
+        // A zone's own; a person's, their faction's template (as
+        // `Pg.GetGuidByName("China")` has it: an outpost compares the two).
+        let o = id(a.first()).and_then(|g| w.objects.get(&g));
+        let faction = match o.map(|o| (o.faction, o.faction_name())) {
+            Some((Some(own), _)) => Some(own),
+            Some((None, Some(name))) => Some(w.template(name)),
+            _ => None,
+        };
         values([guid_value(faction)])
     })?;
     // How one faction's AI regards another, -100 (hostile) to 100
@@ -2128,6 +2488,73 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         if let Some(guid) = id(a.first()) {
             w.context_actions.remove(&guid);
             return values([Value::Boolean(true)]);
+        }
+        values([])
+    })?;
+    // A vehicle's riders get out (`Ai.Deploy{ Vehicle, Role = "Passenger",
+    // Callback, CallbackData }`: a soldier delivery, once landed, puts its
+    // soldiers down; its callback then has them follow her): those of the
+    // role (all but the driver for passengers) step out beside it, and
+    // the callback runs on the next tick with its data unpacked (when the
+    // engine calls it, and with what more, is inferred).
+    // Ai.Role{ AIGuid, Role, Target, MinDistance, MoveDistance,
+    // MaxDistance, ... }: "Follow" keeps them near the target (the game's
+    // follower: `MrxFollow`'s VIP); another role ("Idle") ends it. The
+    // rest of a role (its priorities, the callback when cancelled) is not
+    // kept.
+    add(&ai, "Role", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([]);
+        };
+        let Some(guid) = id(t.raw_get::<Value>("AIGuid").ok().as_ref()) else {
+            return values([]);
+        };
+        let follow = matches!(
+            t.raw_get::<Value>("Role")?,
+            Value::String(s) if s.as_bytes().eq_ignore_ascii_case(b"follow")
+        );
+        let target = id(t.raw_get::<Value>("Target").ok().as_ref()).filter(|_| follow);
+        let near = num(t.raw_get::<Value>("MoveDistance").ok().as_ref()).unwrap_or(4.0);
+        w.commands.push(Command::Follow { guid, target, near });
+        values([Value::Boolean(true)])
+    })?;
+    add(&ai, "Deploy", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([]);
+        };
+        let Some(vehicle) = id(t.raw_get::<Value>("Vehicle").ok().as_ref()) else {
+            return values([]);
+        };
+        let passengers = matches!(
+            t.raw_get::<Value>("Role")?,
+            Value::String(s) if s.as_bytes().eq_ignore_ascii_case(b"passenger")
+        );
+        let mut riders: Vec<u32> = w
+            .objects
+            .iter()
+            .filter(|(_, o)| o.vehicle == Some(vehicle))
+            .map(|(&g, _)| g)
+            .collect();
+        riders.sort_unstable();
+        if passengers && !riders.is_empty() {
+            riders.remove(0);
+        }
+        let at = w.objects.get(&vehicle).map_or([0.0; 3], |o| o.position);
+        for (i, g) in riders.into_iter().enumerate() {
+            // Round the vehicle, 4 m out, a step apart.
+            let a = i as f32 * 0.7;
+            let position = [at[0] + 4.0 * a.sin(), at[1], at[2] + 4.0 * a.cos()];
+            if let Some(o) = w.objects.get_mut(&g) {
+                o.vehicle = None;
+                o.seated_instantly = false;
+                o.position = position;
+            }
+            w.commands.push(Command::ExitVehicle(g));
+            w.commands.push(Command::Move { guid: g, position });
+        }
+        if let Value::Function(f) = t.raw_get::<Value>("Callback")? {
+            let data = t.raw_get::<Value>("CallbackData")?;
+            w.asset_loads.push((f, data));
         }
         values([])
     })?;
@@ -2238,11 +2665,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&pg, "LoadIsRetry", |_, _, _| {
         values([Value::Boolean(false)])
     })?;
-    // No saves yet: every load is a new game, which the bootstrap starts
-    // itself (`LoadSingleton(nil)`) when this answers false.
+    // The bootstrap's `Init` asks (`Pg.LoadGame("InitialSaveData")`)
+    // whether a save is loading. Answered false, it starts a new game
+    // itself (`LoadSingleton(nil)`); answered true it doesn't, and is
+    // handed the save's data (`LoadSingleton(data)`) by the engine, here
+    // by `Mission::start` (from the bootstrap's bytecode; the engine's
+    // side is not read).
     add(&pg, "LoadGame", |w, _, _| {
         w.commands.push(Command::Notify("Pg.LoadGame".into()));
-        values([Value::Boolean(false)])
+        values([Value::Boolean(w.saved.is_some())])
     })?;
 
     // The game's ears on the scripts' support items: `MrxSupportData`'s
@@ -2334,6 +2765,44 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
 
+    // The reverb (see `reverb`): `DefineReverbPreset(index, name, the
+    // twelve I3DL2 numbers, three more)`, `SetReverbPreset(name or
+    // index)`, `SetReverb(1 or 0)`.
+    add(&sound, "DefineReverbPreset", |w, _, a| {
+        let (Some(index), Some(Value::String(name))) = (num(a.first()), a.get(1)) else {
+            return values([]);
+        };
+        let index = index as i64;
+        let numbers: Vec<f32> = a[2..].iter().map_while(|v| num(Some(v))).collect();
+        if let Some(p) =
+            m2_engine::reverb::ReverbPreset::from_args(&name.to_string_lossy(), &numbers)
+            && let Some(c) = w.reverb.define(index, p)
+        {
+            w.commands.push(c);
+        }
+        values([])
+    })?;
+    add(&sound, "SetReverbPreset", |w, _, a| {
+        use crate::reverb::PresetName;
+        let name = match a.first() {
+            Some(Value::String(s)) => PresetName::Name(s.to_string_lossy()),
+            Some(Value::Integer(i)) => PresetName::Index(lua_int(*i)),
+            Some(Value::Number(n)) => PresetName::Index(*n as i64),
+            _ => return values([Value::Boolean(false)]),
+        };
+        let (found, c) = w.reverb.choose(&name);
+        w.commands.extend(c);
+        values([Value::Boolean(found)])
+    })?;
+    add(&sound, "SetReverb", |w, _, a| {
+        let on = match a.first() {
+            Some(Value::Boolean(b)) => *b,
+            v => num(v).is_some_and(|n| n != 0.0),
+        };
+        w.commands.extend(w.reverb.set_on(on));
+        values([])
+    })?;
+
     // The score (see `music`): factions, bindings and states.
     add(&sound, "SetFactionMusic", |w, _, a| {
         if let Some(Value::String(f)) = a.first() {
@@ -2348,7 +2817,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
     add(&sound, "ActivateFactionRegionMusic", |w, _, _| {
-        w.music.activate_region();
+        if let Some(c) = w.music.activate_region() {
+            w.commands.push(c);
+        }
         values([])
     })?;
     add(&sound, "BindMusicCue", |w, _, a| {
@@ -2372,8 +2843,34 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // The radios' playlists ([`crate::music::Music::playlist`]):
+    // (name, _), (name, cue), (name).
+    add(&sound, "AddMusicSourcePlaylist", |w, _, a| {
+        if let Some(Value::String(name)) = a.first() {
+            w.music.add_playlist(&name.to_string_lossy());
+        }
+        values([])
+    })?;
+    add(&sound, "AddCueToMusicSourcePlaylist", |w, _, a| {
+        if let (Some(Value::String(name)), Some(Value::String(cue))) = (a.first(), a.get(1)) {
+            w.music
+                .add_to_playlist(&name.to_string_lossy(), &cue.to_string_lossy());
+        }
+        values([])
+    })?;
+    add(&sound, "ClearMusicSourcePlaylist", |w, _, a| {
+        if let Some(Value::String(name)) = a.first() {
+            w.music.clear_playlist(&name.to_string_lossy());
+        }
+        values([])
+    })?;
     add(&sound, "LockFactionMusic", |w, _, a| {
-        w.music.locked = matches!(a.first(), Some(Value::Boolean(true)));
+        if let Some(c) = w
+            .music
+            .lock(matches!(a.first(), Some(Value::Boolean(true))))
+        {
+            w.commands.push(c);
+        }
         values([])
     })?;
     add(&sound, "IsFactionLockedMusic", |w, _, _| {
@@ -2709,9 +3206,24 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         end
         function F.RemoveObject(f, g)
             if not ok(f) then return end
+            -- A list of them (`Player.GetAllCharacters()`): each.
+            if type(g) == "table" then
+                for _, one in ipairs(g) do F.RemoveObject(f, one) end
+                return
+            end
             for i, v in ipairs(f.objs) do
                 if v == g then table.remove(f.objs, i) return end
             end
+        end
+        -- A copy to change on its own (the release objective's targets
+        -- still far from her, `MrxTaskObjectiveRelease`).
+        function F.Copy(f)
+            if not ok(f) then return F.Create() end
+            local c = F.Create()
+            for i, v in ipairs(f.objs) do c.objs[i] = v end
+            for k, v in pairs(f.ex) do c.ex[k] = v end
+            c.players, c.label = f.players, f.label
+            return c
         end
         function F.GetObjects(f)
             local r = {}
@@ -2793,10 +3305,30 @@ fn collect(
             .collect()
     };
     let (with, without) = (hashes(with), hashes(without));
+    // Then the factions to keep, by name: `"China"`, or several joined
+    // with `||` (an outpost's `"China||VZ"`); none keeps all.
+    let factions: Vec<&str> = a
+        .iter()
+        .skip(4)
+        .filter_map(|v| match v {
+            Value::String(s) => Some(s.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<String>()
+        .split("||")
+        .filter_map(|f| {
+            FACTIONS
+                .into_iter()
+                .find(|x| x.eq_ignore_ascii_case(f.trim()))
+        })
+        .collect();
     let mut found: Vec<u32> = w
         .objects
         .iter()
         .filter(|(_, o)| !o.hidden)
+        .filter(|(_, o)| {
+            factions.is_empty() || o.faction_name().is_some_and(|f| factions.contains(&f))
+        })
         .filter(|(_, o)| {
             let labels = o.all_labels();
             labels.iter().any(|l| with.contains(l)) && !labels.iter().any(|l| without.contains(l))
@@ -2822,6 +3354,16 @@ fn notifier(lua: &Lua, world: &Shared, call: String) -> mlua::Result<Function> {
         w.borrow_mut().commands.push(Command::Notify(call.clone()));
         Ok(MultiValue::new())
     })
+}
+
+/// A Lua integer as an `i64`: `mlua::Integer` is `i64` on 64-bit hosts and
+/// `i32` on the 32-bit game target.
+#[allow(
+    clippy::useless_conversion,
+    reason = "an identity conversion on 64-bit hosts, a widening one on i686"
+)]
+fn lua_int(i: mlua::Integer) -> i64 {
+    i.into()
 }
 
 #[cfg(test)]
@@ -2975,6 +3517,120 @@ mod tests {
         );
         // Up to the tanks' capacity.
         assert_eq!(w.objects[&1].fuel, 50.0);
+    }
+
+    #[test]
+    fn the_scripts_radio_playlists_are_kept_by_name_hash() {
+        let (host, world) = setup();
+        host.lua()
+            .load(
+                "Sound.AddMusicSourcePlaylist('mu_src_radio', 0)\n\
+                 Sound.AddCueToMusicSourcePlaylist('mu_src_radio', 'MU_SRC_PMC_HQ_01')\n\
+                 Sound.AddCueToMusicSourcePlaylist('mu_src_radio', 'MU_SRC_PMC_HQ_02')\n\
+                 Sound.AddMusicSourcePlaylist('mu_src_civ', 0)\n\
+                 Sound.AddCueToMusicSourcePlaylist('mu_src_civ', 'mu_src_civ')\n\
+                 Sound.ClearMusicSourcePlaylist('mu_src_civ')",
+            )
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        assert_eq!(
+            w.music.playlist(m2_assets::name_hash("mu_src_radio")),
+            ["MU_SRC_PMC_HQ_01", "MU_SRC_PMC_HQ_02"]
+        );
+        assert!(
+            w.music
+                .playlist(m2_assets::name_hash("mu_src_civ"))
+                .is_empty()
+        );
+        assert!(w.music.playlist(0x1234).is_empty());
+    }
+    #[test]
+    fn the_scripts_pursuit_calls_reach_the_game_and_read_back_their_level() {
+        let (host, world) = setup();
+        let run = |code: &str| host.lua().load(code).exec().unwrap();
+        run("Pg.SetPursuitLevelTimes(120, 300)\n\
+             __before = Pg.GetPursuitState().Level\n\
+             Pg.SetPursuit(Pg.GetGuidByName('OC'), 1, true)\n\
+             __one = Pg.GetPursuitState().Level\n\
+             Pg.SetPursuit(Pg.GetGuidByName('OC'), 3, true)\n\
+             Pg.LockPursuit(Pg.GetGuidByName('Allied'), 2)\n\
+             Pg.ClearPursuitLock(true)\n\
+             __after = Pg.GetPursuitState().Level");
+        let g = host.lua().globals();
+        assert_eq!(g.get::<i64>("__before").unwrap(), 0);
+        assert_eq!(g.get::<i64>("__one").unwrap(), 1);
+        assert_eq!(g.get::<i64>("__after").unwrap(), 0);
+        let pursuit = |faction: &str, seconds| Command::Pursuit {
+            faction: faction.into(),
+            seconds,
+        };
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [
+                pursuit("oc", Some(120.0)),
+                pursuit("oc", Some(300.0)),
+                pursuit("allied", None),
+                Command::PursuitClear,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_scripts_turn_the_grapple_on_and_hear_whether_she_grapples() {
+        let (host, world) = setup();
+        let lua = host.lua();
+        // As the mechanic's joining does (01a266d2), then the HQ's checks.
+        lua.load("Player.SetGrappleEnabled(Player.GetAnyCharacter(), true)")
+            .exec()
+            .unwrap();
+        assert!(world.borrow().grapple_enabled);
+        let ask = "return Human.IsGrappling(Player.GetAnyCharacter())";
+        assert!(!lua.load(ask).eval::<bool>().unwrap());
+        world.borrow_mut().grappling = true;
+        assert!(lua.load(ask).eval::<bool>().unwrap());
+        lua.load("Player.SetGrappleEnabled(Player.GetAnyCharacter(), false)")
+            .exec()
+            .unwrap();
+        assert!(!world.borrow().grapple_enabled);
+    }
+
+    #[test]
+    fn the_wardrobe_dresses_her_and_briefing_clips_reach_the_game() {
+        let (host, world) = setup();
+        let lua = host.lua();
+        // WifPmcInterior._CompleteChangeOutfit's calls, then a briefing
+        // frame's clip for the player.
+        let before: f64 = lua
+            .load("return Player.GetProfileCostume()")
+            .eval()
+            .unwrap();
+        lua.load(
+            "Player.SetProfileCostume(3)\n\
+             Player.SetOutfit(Player.GetAnyCharacter(), 'pmc_hum_jen_v2')\n\
+             Human.PlayRawAnimation(Player.GetAnyCharacter(), \
+                'ALL01_Contract_Briefing_Jennifer', false, false, -1, true, true)",
+        )
+        .exec()
+        .unwrap();
+        let after: f64 = lua
+            .load("return Player.GetProfileCostume()")
+            .eval()
+            .unwrap();
+        assert_eq!((before, after), (0.0, 3.0));
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [
+                Command::Outfit {
+                    guid: 1,
+                    model: "pmc_hum_jen_v2".into()
+                },
+                Command::RawClip {
+                    guid: 1,
+                    clip: "ALL01_Contract_Briefing_Jennifer".into()
+                },
+            ]
+        );
     }
 
     #[test]
@@ -3729,6 +4385,20 @@ mod tests {
     }
 
     #[test]
+    fn load_game_says_a_save_loads_only_while_one_is_pending() {
+        let (host, world) = setup();
+        let ask = || -> bool {
+            host.lua()
+                .load(r#"return Pg.LoadGame("InitialSaveData")"#)
+                .eval()
+                .unwrap()
+        };
+        assert!(!ask(), "a new game");
+        world.borrow_mut().saved = Some("{}".into());
+        assert!(ask(), "a save to load");
+    }
+
+    #[test]
     fn a_goal_callback_hears_who_had_the_goal_and_that_it_was_done() {
         let (host, world) = setup();
         host.lua()
@@ -3777,6 +4447,87 @@ mod tests {
         // The tank and the jeep are ground vehicles; the far tank is out.
         assert_eq!((tanks, ground, flying), (1, 2, 0));
         assert!((d - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn an_outpost_tells_its_attackers_from_its_defenders() {
+        // `Outpost.CallForRushers` collects one side's people by the
+        // capture point; `RusherGoalFulfilled` then compares each one's
+        // faction with the outpost's `sAttackers` and `sDefenders`.
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            for (g, name) in [(70, "Chinese Soldier"), (71, "VZ Heavy (Light MG)")] {
+                let mut o = Object::new(name, [5.0, 0.0, 0.0]);
+                o.labels.push("Soldier".into());
+                w.insert(g, o);
+            }
+        }
+        let (china, all, same, other): (i64, i64, bool, bool) = host
+            .lua()
+            .load(
+                r#"local china = Pg.FastCollectHumans(0, 0, 0, 50, "China")
+                local all = Pg.FastCollectHumans(0, 0, 0, 50, "China||VZ")
+                local c = Ai.GetFactionGuid(china[1])
+                return #china, #all, c == Pg.GetGuidByName("China"),
+                    c == Pg.GetGuidByName("VZ")"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((china, all, same, other), (1, 2, true, false));
+    }
+
+    #[test]
+    fn a_follow_role_reaches_the_game_and_another_role_ends_it() {
+        // `MrxFollow` gives a released VIP `Follow` on her, and `Idle`
+        // when it lets him go.
+        let (host, world) = setup();
+        host.lua()
+            .load(
+                r#"Ai.Role({ AIGuid = Sys.StringToGuid("0x70"), Role = "Follow",
+                    Target = Sys.StringToGuid("0x1"), MinDistance = 2, MoveDistance = 4,
+                    MaxDistance = 30 })
+                Ai.Role({ AIGuid = Sys.StringToGuid("0x70"), Role = "Idle" })"#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [
+                Command::Follow {
+                    guid: 0x70,
+                    target: Some(1),
+                    near: 4.0
+                },
+                Command::Follow {
+                    guid: 0x70,
+                    target: None,
+                    near: 4.0
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_copied_object_filter_changes_on_its_own() {
+        // `MrxTaskObjectiveRelease` copies its targets' filter, takes the
+        // players out of the copy (a list of them), and drops each target
+        // from it as she comes near.
+        let (host, _) = setup();
+        let (orig, copy, players): (i64, i64, bool) = host
+            .lua()
+            .load(
+                r#"local f = ObjectFilter.Create()
+                ObjectFilter.AddObject(f, Sys.StringToGuid("0x70"))
+                ObjectFilter.AddObject(f, Sys.StringToGuid("0x71"))
+                ObjectFilter.UsePlayers(f, true)
+                local c = ObjectFilter.Copy(f)
+                ObjectFilter.RemoveObject(c, { Sys.StringToGuid("0x70") })
+                return #f.objs, #c.objs, c.players"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((orig, copy, players), (2, 1, true));
     }
 
     #[test]

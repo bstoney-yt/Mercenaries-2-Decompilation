@@ -243,6 +243,9 @@ pub struct Release {
 #[derive(Default)]
 pub struct Flights {
     flights: Vec<Flight>,
+    /// Pilots sent home (`MrxSupport.GoHome`) whose helicopter has flown
+    /// out of sight, and where home is ([`Flights::take_home`]).
+    home: Vec<(u32, Vec3)>,
     crates: Vec<Crate>,
     /// By hash: `None` while it loads (or if it failed to).
     models: HashMap<u32, Option<FlightModel>>,
@@ -333,6 +336,15 @@ impl Flights {
     /// A model asked for has loaded.
     pub fn loaded(&mut self, hash: u32, model: FlightModel) {
         self.models.insert(hash, Some(model));
+    }
+
+    /// The pilots sent home whose helicopters are now out of sight: there,
+    /// as far as the scripts know (their `MoveTo` home is done, and the
+    /// support's recruit free for the next call: a soldier delivery's
+    /// pilot, `MrxSupportManager.IsRecruitAvailable`). Inferred: the
+    /// game flies them all the way.
+    pub fn take_home(&mut self) -> Vec<(u32, Vec3)> {
+        std::mem::take(&mut self.home)
     }
 
     /// The pilot of a delivery that has let go is sent `to` (home).
@@ -770,9 +782,14 @@ impl Flights {
                 }
             }
         }
+        let home = &mut self.home;
         self.flights.retain(|f| {
-            f.phase != Phase::Leaving
-                || (f.clock < LEAVE_TIME && f.at.with_y(0.0).distance(focus.with_y(0.0)) < VANISH)
+            let stays = f.phase != Phase::Leaving
+                || (f.clock < LEAVE_TIME && f.at.with_y(0.0).distance(focus.with_y(0.0)) < VANISH);
+            if !stays && let Some(h) = f.home {
+                home.push((f.pilot, h));
+            }
+            stays
         });
         releases
     }

@@ -42,7 +42,7 @@
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::tuning::HandGun;
-use m2_engine::weapons::FireHint;
+use m2_engine::weapons::{FireHint, NpcLauncher};
 use m2_engine::world::{SpawnPoint, is_walker};
 use m2_engine::{AiProfile, BoundClip, Character, Gait, GpuModel, Physics, RagdollId};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
@@ -119,7 +119,11 @@ const STAND_IN: FireHint = FireHint {
     off: 9.0,
     on_close: 0.8,
     off_close: 1.5,
+    against: [3, 1, 0, 0],
 };
+/// The least pause between a soldier's rockets, seconds, where his
+/// launcher's `BurstOffLength` is shorter (invented).
+const LAUNCHER_GAP: f32 = 4.0;
 /// Each pause is this much longer or shorter at random, so soldiers who
 /// see her together don't fire together (invented).
 const PAUSE_JITTER: f32 = 0.25;
@@ -226,6 +230,9 @@ pub(crate) enum Brain {
     /// Sent along a path by the scripts (`Ai.Goal` `PathMove`, `MoveTo`):
     /// running to point `next`, then at a post at its end.
     Route { route: Vec<Vec3>, next: usize },
+    /// Following her (`Ai.Role` `Follow`: a VIP being delivered): running
+    /// to her while further than `near` metres, else standing.
+    Follow { near: f32 },
 }
 
 /// A clip carrying an event: its index, when in it the event comes, and
@@ -278,6 +285,11 @@ pub struct FightClips {
     /// the tables were read; Jennifer's own take-offs come first.
     pub swim: Option<usize>,
     pub swim_out: Option<usize>,
+    /// Knocked down (lying, looped), getting up, and subdued (looped)
+    /// ([`FightClips::KNOCKED`]).
+    pub knocked: Option<usize>,
+    pub getup: Option<usize>,
+    pub subdued: Option<usize>,
 }
 
 /// How far apart a clip's hands get over the whole clip, for its hip
@@ -342,6 +354,12 @@ impl FightClips {
     /// The swim stroke and the climb-out (see [`FightClips::swim`]).
     pub const SWIM: u32 = 0xc846_e6fd;
     pub const SWIM_OUT: u32 = 0x97c8_40ed;
+    /// Down on the ground, getting up, and subdued: the on-foot tables'
+    /// `KnockedDown` `Idle` (handle 8cf722a8), `KnockedDown` `Getup`
+    /// (ade601a9) and `Subdued` `Idle` (dbd4f17d), from samples.
+    pub const KNOCKED: u32 = 0xbe25_dc0c;
+    pub const GETUP: u32 = 0xaeb6_c9bd;
+    pub const SUBDUED: u32 = 0xf550_757d;
     /// Jennifer's running take-offs (0.93 s, 3.6 m/s), then the
     /// resident's; standing (0.37 s).
     pub const TAKEOFF: [u32; 4] = [0xdaf7_966f, 0x4fdb_3497, 0x0e18_b683, 0x47af_6321];
@@ -420,6 +438,9 @@ impl FightClips {
             bash_low: by_event(Self::BASH_LOW),
             swim: find(Self::SWIM),
             swim_out: find(Self::SWIM_OUT),
+            knocked: find(Self::KNOCKED),
+            getup: find(Self::GETUP),
+            subdued: find(Self::SUBDUED),
         }
     }
 
@@ -744,6 +765,15 @@ pub struct Npc {
     /// The gun their template hands them (`None`: the AK47's "Assault
     /// Rifle" stands in): what they draw, and how fast and hard it fires.
     pub gun: Option<HandGun>,
+    /// A launcher their template hands them as well (the AT soldiers'):
+    /// they reach for it when it rates what she is in higher than their
+    /// gun does ([`Npc::fight`]).
+    pub launcher: Option<NpcLauncher>,
+    /// Set by a tick when a soldier fires his launcher; the fight takes
+    /// the shot ([`crate::combat`]).
+    pub launches: bool,
+    /// Seconds before he fires his launcher again.
+    launcher_wait: f32,
     pub hp: f32,
     /// The health they started with (their template's for a soldier, 100
     /// for a civilian): the HUD's target arc shows a share of it.
@@ -777,6 +807,9 @@ pub struct Npc {
     grenade_wait: f32,
     /// The smarter soldiers' settings (off: the original's).
     pub smart: SmarterAi,
+    /// The armour class of what she is in (`ObjectHint`'s `Armor`, 1 to
+    /// 4; 1 on foot), from [`People::target_armour`].
+    pub target_armour: u32,
     /// Saw her this tick for the first time in the fight (smarter: he
     /// calls it out).
     spotted: bool,
@@ -796,6 +829,8 @@ pub struct Npc {
     /// Put out of a vehicle's seat ([`People::put_out`]): no spawn keeps
     /// them, so they go once out of range.
     put_out: bool,
+    /// Down on the ground, subdued or carried ([`Down`]): none stands.
+    pub down: Option<Down>,
     brain: Brain,
     /// The aim and fall clips in this person's rig.
     clips: FightClips,
@@ -827,11 +862,26 @@ pub struct Npc {
     route_stall: f32,
     /// Got to the end of a route the scripts gave (for checking).
     reached: bool,
+    /// Where the one they follow is ([`Brain::Follow`]).
+    follow_to: Vec3,
     /// Got there, not yet told the scripts ([`People::take_route_ends`]).
     ended: bool,
     /// On such a route, going over or through what stopped them to its
     /// next point ([`ROUTE_STALL`]).
     through: bool,
+    /// In the water out of their depth: they swim ([`NpcSwim`]).
+    pub swim: Option<NpcSwim>,
+    /// Standing up out of the water: the climb-out's seconds left.
+    climbing: f32,
+}
+
+/// Someone swimming: how long they have been in, and the shore they make
+/// for with the seconds before they look for it again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NpcSwim {
+    pub since: f32,
+    pub shore: Option<Vec3>,
+    look: f32,
 }
 
 /// What a person shouts.
@@ -853,6 +903,44 @@ fn shooter_number(at: Vec3, facing: f32) -> u32 {
         .fold(0x811c_9dc5_u32, |h, b| {
             (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
         })
+}
+
+/// Someone down ([`Npc::down`]), as the human state table has it (from
+/// samples, `ece70371`): bashed, they fall (`Upright.KnockDown`) and lie
+/// (`KnockedDown.Idle`), then get up (`KnockedDown.Getup`, `Upright.Idle`)
+/// unless subdued first (the `Subdue` action: `KnockedDown.SubdueDefender`,
+/// then `Subdued.Idle`, for good); a subdued one can be carried
+/// (`Carried.Idle`) and put down again. The seconds each step lasts are
+/// invented; the clips are the on-foot tables' ([`FightClips::KNOCKED`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Down {
+    Falling(f32),
+    Knocked(f32),
+    GettingUp(f32),
+    Subduing(f32),
+    Subdued,
+    Carried,
+}
+
+/// Seconds a fall takes, someone lies knocked down, gets up, and is
+/// subdued (all invented).
+const FALL_SECONDS: f32 = 1.0;
+const KNOCKED_SECONDS: f32 = 10.0;
+const GETUP_SECONDS: f32 = 1.5;
+const SUBDUE_SECONDS: f32 = 1.0;
+
+impl Down {
+    /// The human state (`Stance.Action`) it is.
+    pub fn state(self) -> &'static str {
+        match self {
+            Down::Falling(_) => "Upright.KnockDown",
+            Down::Knocked(_) => "KnockedDown.Idle",
+            Down::GettingUp(_) => "KnockedDown.Getup",
+            Down::Subduing(_) => "KnockedDown.SubdueDefender",
+            Down::Subdued => "Subdued.Idle",
+            Down::Carried => "Carried.Idle",
+        }
+    }
 }
 
 impl Npc {
@@ -892,6 +980,9 @@ impl Npc {
             hurt_by_her: false,
             reported_dead: false,
             gun: None,
+            launcher: None,
+            launches: false,
+            launcher_wait: 0.0,
             hp: 100.0,
             most_hp: 100.0,
             alive: true,
@@ -909,6 +1000,7 @@ impl Npc {
             outfit: Vec::new(),
             grenade_wait: 0.0,
             smart: SmarterAi::default(),
+            target_armour: 1,
             spotted: false,
             cover: None,
             hit: false,
@@ -918,14 +1010,127 @@ impl Npc {
             since_shot: f32::INFINITY,
             flee: None,
             put_out: false,
+            down: None,
             brain,
             spun: 0.0,
             route_near: f32::INFINITY,
             route_stall: 0.0,
             reached: false,
+            follow_to: Vec3::ZERO,
             ended: false,
             through: false,
+            swim: None,
+            climbing: 0.0,
         }
+    }
+
+    /// Whether they swim.
+    pub fn swimming(&self) -> bool {
+        self.swim.is_some()
+    }
+
+    /// Swims them where the water under them is out of their depth, as
+    /// the player does ([`crate::player::SWIM_START`]): they float with
+    /// their back at the surface, play the stroke with their gun away
+    /// (no firing, aiming or grenades), and make for the nearest water
+    /// shallow enough to stand in ([`shore`]). There they stand up with
+    /// the climb-out. True while they swim or climb out: the rest of the
+    /// tick (the fight, the brain's walking) is left out.
+    ///
+    /// From samples: the stroke and the climb-out are the on-foot tables'
+    /// (see [`FightClips::swim`]). Invented: the depths, float and speed
+    /// are the player's, and making for the shore (the game's swimming AI
+    /// isn't read).
+    fn update_swim(&mut self, physics: &Physics, dt: f32) -> bool {
+        if self.climbing > 0.0 {
+            self.climbing -= dt;
+            self.character.velocity = Vec3::ZERO;
+            self.rig.advance(dt);
+            return true;
+        }
+        let at = self.character.position;
+        let Some(water) = physics.water_at(at.x, at.z) else {
+            self.swim = None;
+            return false;
+        };
+        let (depth, ground) = depth_under(physics, at, water);
+        // Nothing under them, but ground over them: under the island (put
+        // there, or through it), not out at sea.
+        if ground.is_none() && physics.cast_ray(at, Vec3::Y, 400.0).is_some() {
+            self.swim = None;
+            return false;
+        }
+        match self.swim {
+            None if depth > crate::player::SWIM_START => {
+                eprintln!(
+                    "people: {:08x} out of their depth ({depth:.1} m) at {at:.1}: swims",
+                    self.spawn.unwrap_or(u32::MAX)
+                );
+                self.swim = Some(NpcSwim {
+                    since: 0.0,
+                    shore: None,
+                    look: 0.0,
+                });
+                self.flee = None;
+                self.step = None;
+                self.cover = None;
+                self.detour = None;
+                self.through = false;
+            }
+            Some(_) if depth < crate::player::SWIM_STOP => {
+                eprintln!(
+                    "people: {:08x} in their depth ({depth:.1} m) at {at:.1}: stands",
+                    self.spawn.unwrap_or(u32::MAX)
+                );
+                self.swim = None;
+                if let Some(g) = ground {
+                    self.character.position.y = self.character.position.y.max(g);
+                }
+                self.character.velocity = Vec3::ZERO;
+                if let Some(clip) = self.clips.swim_out {
+                    self.rig.animator.play_once(clip);
+                    self.climbing = self.rig.clips[clip].info.duration;
+                    return true;
+                }
+                return false;
+            }
+            _ => {}
+        }
+        let Some(swim) = &mut self.swim else {
+            return false;
+        };
+        swim.since += dt;
+        swim.look -= dt;
+        if swim.look <= 0.0 {
+            swim.look = SHORE_LOOK_EVERY;
+            swim.shore = shore(physics, at);
+        }
+        let wanted = swim.shore.map_or(Vec3::ZERO, |s| {
+            (s - at).with_y(0.0).normalize_or_zero() * crate::player::SWIM_SPEED
+        });
+        physics.move_character(&mut self.character, wanted, None, dt);
+        self.character.position.y = water - crate::player::SWIM_FLOAT;
+        self.character.velocity.y = 0.0;
+        if wanted.length_squared() > 0.01 {
+            self.turn_to(wanted.x.atan2(wanted.z), dt);
+        }
+        self.fires = false;
+        self.throws = None;
+        self.burst = 0;
+        self.rig.aim = None;
+        self.rig.animator.set_upper(None);
+        self.rig.two_handed = false;
+        let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
+        let rate = match self.clips.swim {
+            Some(clip) => {
+                self.rig.animator.play(clip);
+                let own = self.rig.clips[clip].info.speed.max(0.1);
+                (moved / own).clamp(crate::player::SWIM_STILL_RATE, 2.5)
+            }
+            None => 1.0,
+        };
+        self.rig.advance(dt * rate);
+        true
     }
 
     /// Takes `damage`; at no health left, falls: true if it killed.
@@ -953,6 +1158,84 @@ impl Npc {
             }
         }
         !self.alive
+    }
+
+    /// The human state they are in, as the scripts' `HumanStateTransition`
+    /// events read it.
+    pub fn human_state(&self) -> &'static str {
+        self.down.map_or("Upright.Idle", Down::state)
+    }
+
+    /// Bashed and still alive: they fall and lie a while ([`Down`]).
+    /// Someone already down stays as they are.
+    pub fn knock_down(&mut self) {
+        if !self.alive || self.down.is_some() {
+            return;
+        }
+        self.down = Some(Down::Falling(FALL_SECONDS));
+        self.alert = false;
+        self.flee = None;
+        self.rig.animator.set_upper(None);
+        self.rig.two_handed = false;
+        if let Some(c) = self.clips.die.or(self.clips.knocked) {
+            self.rig.animator.play_once(c);
+        }
+    }
+
+    /// Subdued where they lie (the player's `Subdue`): false if they
+    /// aren't down to be.
+    pub fn subdue(&mut self) -> bool {
+        if !matches!(self.down, Some(Down::Falling(_) | Down::Knocked(_))) {
+            return false;
+        }
+        self.down = Some(Down::Subduing(SUBDUE_SECONDS));
+        true
+    }
+
+    /// Picked up (true) or put down again, if subdued (or carried).
+    pub fn carry(&mut self, on: bool) -> bool {
+        match (self.down, on) {
+            (Some(Down::Subdued), true) => self.down = Some(Down::Carried),
+            (Some(Down::Carried), false) => {
+                self.down = Some(Down::Subdued);
+                self.landed = false;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// A step of being down: the fall, lying, getting up, the subdue.
+    fn update_down(&mut self, dt: f32) {
+        let Some(d) = self.down else { return };
+        let clips = self.clips;
+        self.down = match d {
+            Down::Falling(t) if t - dt <= 0.0 => {
+                if let Some(c) = clips.knocked {
+                    self.rig.animator.play(c);
+                }
+                Some(Down::Knocked(KNOCKED_SECONDS))
+            }
+            Down::Falling(t) => Some(Down::Falling(t - dt)),
+            Down::Knocked(t) if t - dt <= 0.0 => {
+                if let Some(c) = clips.getup {
+                    self.rig.animator.play_once(c);
+                }
+                Some(Down::GettingUp(GETUP_SECONDS))
+            }
+            Down::Knocked(t) => Some(Down::Knocked(t - dt)),
+            Down::GettingUp(t) if t - dt <= 0.0 => None,
+            Down::GettingUp(t) => Some(Down::GettingUp(t - dt)),
+            Down::Subduing(t) if t - dt <= 0.0 => {
+                if let Some(c) = clips.subdued {
+                    self.rig.animator.play(c);
+                }
+                Some(Down::Subdued)
+            }
+            Down::Subduing(t) => Some(Down::Subduing(t - dt)),
+            other => Some(other),
+        };
+        self.rig.advance(dt);
     }
 
     /// Runs from `danger` (those who don't fight, but story characters
@@ -997,7 +1280,10 @@ impl Npc {
                         .cast_ray(at + Vec3::Y, -Vec3::Y, SEA_LOOK + WET + 1.0)
                         .is_some_and(|(d, _)| at.y + 1.0 - d < water - WET))
         };
-        if deep(now) && !deep(before) {
+        // In it already, they walk out, not further in (stood up from a
+        // swim, they went back out of their depth and swam again).
+        let deeper = deep(before) && now.y < before.y - 0.01;
+        if deep(now) && (!deep(before) || deeper) {
             self.character.position = before;
             self.character.velocity = Vec3::ZERO;
         }
@@ -1247,8 +1533,25 @@ impl Npc {
             self.rig.aim_along(self.facing, Some(threat - self.chest()));
         }
         self.cooldown -= dt;
+        self.launcher_wait -= dt;
         let hint = self.fire_hint();
-        if seen
+        // His launcher, when it rates what she is in higher than his gun
+        // does (an AT rocket's 3 against a tank's class, the rifle's 0),
+        // within its range, once its pause since the last is out.
+        if let Some(l) = self.launcher.filter(|_| self.reaches_for_launcher()) {
+            if seen
+                && off < FIRE_ARC
+                && self.launcher_wait <= 0.0
+                && distance < l.hint.range
+                && distance >= l.hint.min_range
+            {
+                self.launches = true;
+                self.since_shot = 0.0;
+                let pause = l.hint.off.max(LAUNCHER_GAP);
+                self.launcher_wait = pause * rng.range(1.0 - PAUSE_JITTER, 1.0 + PAUSE_JITTER);
+            }
+        } else if seen
+            && self.rates_target()
             && self.cooldown <= 0.0
             && off < FIRE_ARC
             && distance < hint.range
@@ -1281,6 +1584,23 @@ impl Npc {
         self.gun
             .filter(|g| g.rate_of_fire > 0.0)
             .map_or(BURST_GAP, |g| 60.0 / g.rate_of_fire)
+    }
+
+    /// Whether his gun is any use against what she is in: its
+    /// `WeaponHint` rating for her armour class is above 0 (a rifle's 0
+    /// against an APC or a tank; inferred from the ratings' names and
+    /// values, gap-list sweep). He still faces and aims at her.
+    pub fn rates_target(&self) -> bool {
+        let class = self.target_armour.clamp(1, 4) as usize - 1;
+        self.fire_hint().against[class] > 0
+    }
+
+    /// Whether he fires his launcher rather than his gun at what she is
+    /// in: it rates her armour class higher than the gun does.
+    pub fn reaches_for_launcher(&self) -> bool {
+        let class = self.target_armour.clamp(1, 4) as usize - 1;
+        self.launcher
+            .is_some_and(|l| l.hint.against[class] > self.fire_hint().against[class])
     }
 
     /// How he fires his gun: its `WeaponHint`, else the "Assault
@@ -1398,6 +1718,7 @@ impl Npc {
             Brain::Wander { wait, .. } if *wait > 0.0 => "pausing",
             Brain::Wander { .. } => "strolling",
             Brain::Route { .. } => "running where the scripts sent them",
+            Brain::Follow { .. } => "following her",
         }
     }
 
@@ -1437,12 +1758,26 @@ impl Npc {
             if let Some(y) = hit.filter(|&y| dry(y)) {
                 self.character.position.y = y + 0.05;
                 self.landed = true;
+            } else if self.put_out && hit.is_some() {
+                // Put out of a boat over deep water: into it, to swim
+                // (the next tick finds them out of their depth).
+                if let Some(w) = physics.water_at(p.x, p.z) {
+                    self.character.position.y = w - crate::player::SWIM_FLOAT;
+                    self.landed = true;
+                }
             }
             return;
         }
         if !self.alive {
             self.dead_for += dt;
             self.rig.advance(dt);
+            return;
+        }
+        if self.down.is_some() {
+            self.update_down(dt);
+            return;
+        }
+        if self.update_swim(physics, dt) {
             return;
         }
         self.since_shot += dt;
@@ -1540,6 +1875,17 @@ impl Npc {
                     }
                 }
             }
+            Brain::Follow { near } => {
+                let flat = (self.follow_to - at).with_y(0.0);
+                // Not off a ledge after her (the VIP on ChiCon001's roof
+                // died of it): they stop where the ground a step ahead
+                // falls away (invented).
+                let ahead = at + flat.normalize_or_zero() * 1.0 + Vec3::Y;
+                let drop = physics.cast_ray(ahead, -Vec3::Y, LEDGE + 1.0).is_none();
+                if flat.length() > *near && !drop {
+                    wanted = flat.normalize() * FLEE;
+                }
+            }
             Brain::Route { route, next } => {
                 let point = route[*next];
                 let flat = (point - at).with_y(0.0);
@@ -1626,7 +1972,7 @@ impl Npc {
                     *wait = 1.0;
                 }
                 (None, Brain::Patrol { wait, .. }) => *wait = 1.0,
-                (None, Brain::Post { .. } | Brain::Route { .. }) => {}
+                (None, Brain::Post { .. } | Brain::Route { .. } | Brain::Follow { .. }) => {}
             }
         }
         if wanted.length_squared() > 0.01 {
@@ -1655,6 +2001,9 @@ impl Npc {
         self.rig.advance(dt * rate);
     }
 }
+
+/// A follower keeps off a drop deeper than this (metres).
+const LEDGE: f32 = 3.0;
 
 /// Everyone on the island but the player.
 #[derive(Debug, Default)]
@@ -1693,6 +2042,12 @@ pub struct People {
     /// Where the scripts last sent people ([`People::walk`]), by spawn
     /// entity.
     routes: HashMap<u32, Vec<Vec3>>,
+    /// Those the scripts have following her, by spawn entity, and how near
+    /// they keep ([`People::follow`]).
+    following: HashMap<u32, f32>,
+    /// Followers riding her vehicle (`Vehicle.Enter` by `MrxFollow`): out
+    /// of play until they get out ([`People::board`]).
+    aboard: HashSet<u32>,
     active: HashSet<u32>,
     /// Spawners sending from a list, by entity: their `SecondsPerCycle`
     /// (filled on first use).
@@ -1705,6 +2060,12 @@ pub struct People {
     rng: Rng,
     /// The enhanced, smarter soldiers' settings (off: the original's).
     pub smarter: SmarterAi,
+    /// The armour class of what she is in, 1 to 4 (`ObjectHint`'s
+    /// `Armor`: 1 on foot or in a car, 2 a helicopter or a light truck, 3
+    /// the APCs, 4 the tanks): a soldier whose gun's `WeaponHint` rates it
+    /// 0 against that class holds his fire ([`Npc::rates_target`]). 0
+    /// (unset) is taken as 1.
+    pub target_armour: u32,
     /// What soldiers near her have been at (for checking).
     pub idle: IdleTally,
     /// What shouldn't happen to anyone (for checking).
@@ -1797,6 +2158,45 @@ const WET: f32 = 1.0;
 /// How high above the sea someone looks down for deep water under them
 /// before a step, metres.
 const SEA_LOOK: f32 = 8.0;
+/// Seconds a swimmer goes before looking for the shore again, and how
+/// far they look (rings of [`SHORE_WAYS`] points at these radii, metres).
+/// Invented.
+const SHORE_LOOK_EVERY: f32 = 2.0;
+const SHORE_RINGS: [f32; 6] = [3.0, 6.0, 12.0, 24.0, 48.0, 96.0];
+const SHORE_WAYS: usize = 16;
+/// How far over the water the shore's ground is looked down for, metres.
+const SHORE_LOOK_HIGH: f32 = 30.0;
+
+/// How deep the water at `water` is over the ground under `at`, metres
+/// (infinite with no ground under), and the ground's height.
+fn depth_under(physics: &Physics, at: Vec3, water: f32) -> (f32, Option<f32>) {
+    let top = at.y.max(water) + 1.0;
+    let ground = physics
+        .cast_ray(at.with_y(top), Vec3::NEG_Y, 400.0)
+        .map(|(d, _)| top - d);
+    (ground.map_or(f32::INFINITY, |g| water - g), ground)
+}
+
+/// The nearest point to `at` where the water is shallow enough to stand
+/// in (under [`crate::player::SWIM_STOP`], or dry ground), looking out
+/// ring by ring ([`SHORE_RINGS`]); within a ring, the first found going
+/// round from +z. `None` if there is none within the last ring.
+fn shore(physics: &Physics, at: Vec3) -> Option<Vec3> {
+    SHORE_RINGS.iter().find_map(|&r| {
+        (0..SHORE_WAYS).find_map(|k| {
+            let a = k as f32 / SHORE_WAYS as f32 * std::f32::consts::TAU;
+            let p = at + Vec3::new(a.sin(), 0.0, a.cos()) * r;
+            // Looked down on from well above (a bank higher than the
+            // water).
+            let shallow = physics.water_at(p.x, p.z).is_none_or(|w| {
+                let (depth, ground) = depth_under(physics, p.with_y(w + SHORE_LOOK_HIGH), w);
+                ground.is_some() && depth < crate::player::SWIM_STOP * 0.8
+            });
+            shallow.then_some(p)
+        })
+    })
+}
+
 /// Seconds without getting nearer the next point of a route the scripts
 /// gave before a runner counts as stuck.
 const STALL: f32 = 3.0;
@@ -1818,6 +2218,10 @@ pub struct Checks {
     pub aimed_behind: HashSet<u32>,
     pub wet: f32,
     pub wetted: HashSet<u32>,
+    /// Swimming (person-seconds, and who): out of their depth, not stood
+    /// in it.
+    pub swum: f32,
+    pub swimmers: HashSet<u32>,
     /// Runners sent along a route, those who got to its end, and those
     /// who stuck on the way (once each).
     pub sent: HashSet<u32>,
@@ -1829,13 +2233,15 @@ impl Checks {
     /// The tally in a line.
     pub fn line(&self) -> String {
         format!(
-            "people checks: spinning {:.1} s ({} people), aiming behind {:.1} s ({} people), in water {:.1} s ({} people); runners {} sent, {} at their route's end, {} stuck on the way",
+            "people checks: spinning {:.1} s ({} people), aiming behind {:.1} s ({} people), in water {:.1} s ({} people), swimming {:.1} s ({} people); runners {} sent, {} at their route's end, {} stuck on the way",
             self.spinning,
             self.spinners.len(),
             self.aim_behind,
             self.aimed_behind.len(),
             self.wet,
             self.wetted.len(),
+            self.swum,
+            self.swimmers.len(),
             self.sent.len(),
             self.arrived.len(),
             self.stuck.len()
@@ -1886,7 +2292,10 @@ impl Checks {
                 );
             }
         }
-        if sea.is_some_and(|s| n.character.position.y < s - WET) {
+        if n.swimming() {
+            self.swum += dt;
+            self.swimmers.insert(id);
+        } else if n.climbing <= 0.0 && sea.is_some_and(|s| n.character.position.y < s - WET) {
             self.wet += dt;
             if self.wetted.insert(id) {
                 eprintln!(
@@ -1990,6 +2399,21 @@ pub fn faction_label(f: &str) -> &'static str {
         "Pir" => "Pirate",
         _ => "VZ",
     }
+}
+
+/// The faction a faction template names (`OC`, as `Pg.GetGuidByName`
+/// takes it, in any case: templates are kept in lower case),
+/// the other way from [`faction_label`].
+pub fn faction_by_label(label: &str) -> Option<&'static str> {
+    Some(match label.to_ascii_lowercase().as_str() {
+        "allied" => "All",
+        "china" => "Chi",
+        "guerilla" => "Gur",
+        "oc" => "Oil",
+        "pirate" => "Pir",
+        "vz" => "Vza",
+        _ => return None,
+    })
 }
 
 /// Seconds the soldiers of a faction she provoked fight her: the first of
@@ -2130,6 +2554,45 @@ impl People {
         true
     }
 
+    /// A soldier of the scripts' own, `guid` (template `template`, its own
+    /// model `model`), on foot at `at`: a soldier delivery's, set down by
+    /// `Ai.Deploy`. Brought into play the first time as a soldier of their
+    /// template's faction, running any route the scripts already gave
+    /// them ([`People::walk`]: an outpost's rushers); moved after. False
+    /// when their kind isn't in yet.
+    pub(crate) fn bring_scripted(
+        &mut self,
+        guid: u32,
+        template: &str,
+        model: Option<u32>,
+        at: Vec3,
+    ) -> bool {
+        if let Some(n) = self.npcs.iter_mut().find(|n| n.spawn == Some(guid)) {
+            n.character.position = at;
+            n.character.velocity = Vec3::ZERO;
+            return true;
+        }
+        let Some(kind) = self.rider_kind(template, model) else {
+            return false;
+        };
+        let brain = match (self.following.get(&guid), self.routes.get(&guid)) {
+            (Some(&near), _) => Brain::Follow { near },
+            (None, Some(route)) => Brain::Route {
+                route: route.clone(),
+                next: 0,
+            },
+            (None, None) => Brain::Post { facing: 0.0 },
+        };
+        let mut n = Npc::new(kind, &self.kinds[kind].rig, at, 0.0, brain, Some(guid));
+        n.outfit = self.dress_as(kind, template);
+        n.soldier = true;
+        n.faction = faction_of(template);
+        n.gun = self.kinds[kind].gun;
+        eprintln!("people: the scripts' {template} ({guid:#x}) comes into play at {at:.1}");
+        self.npcs.push(n);
+        true
+    }
+
     /// The scripts' own `guid` ([`People::stand_scripted`]) is no longer
     /// on foot (back in a seat, or gone).
     pub(crate) fn unstand_scripted(&mut self, physics: &mut Physics, guid: u32) {
@@ -2195,6 +2658,25 @@ impl People {
     /// What she did to the factions' people since the last call.
     pub fn take_infractions(&mut self) -> Vec<Infraction> {
         std::mem::take(&mut self.infractions)
+    }
+
+    /// The scripts set faction `f` pursuing her for `seconds`, or until
+    /// they clear it (`None`) ([`m2_game::api::Pursuit`]).
+    pub fn scripted_pursuit(&mut self, f: &'static str, seconds: Option<f32>) {
+        let left = seconds.unwrap_or(f32::INFINITY);
+        let e = self.pursuit.entry(f).or_insert(0.0);
+        *e = e.max(left);
+        eprintln!("people: the scripts set {f} pursuing her for {left:.0} s");
+        self.refresh_sides();
+    }
+
+    /// The scripts' locked pursuits end.
+    pub fn clear_scripted_pursuit(&mut self) {
+        let before = self.pursuit.len();
+        self.pursuit.retain(|_, left| left.is_finite());
+        if self.pursuit.len() != before {
+            self.refresh_sides();
+        }
     }
 
     /// The pursuits: a faction member she hurt starts one for their
@@ -2299,7 +2781,8 @@ impl People {
     fn who(&mut self, s: &SpawnPoint, target: bool) -> Who {
         let names = [s.template.as_deref(), Some(s.name.as_str())];
         if let (Some(template), Some(model)) = (s.template.as_deref(), s.model) {
-            if left_out(s, target) {
+            // One the scripts have following her (a VIP released) stands.
+            if left_out(s, target) && !self.following.contains_key(&s.entity) {
                 return Who::Nobody;
             }
             let fights = target
@@ -2442,9 +2925,13 @@ impl People {
         self.pursue(dt);
         self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
+        for n in &mut self.npcs {
+            n.follow_to = focus;
+        }
         let mut callouts = Vec::new();
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
+            npc.target_armour = self.target_armour.max(1);
             npc.rammed = (npc.rammed - dt).max(0.0);
             let facing = npc.facing;
             npc.update(physics, &mut self.rng, threat, dt);
@@ -2637,6 +3124,106 @@ impl People {
             .collect()
     }
 
+    /// The scripts have the person of spawn `entity` follow her, keeping
+    /// within `near` metres (`Ai.Role` `Follow`), or stop (`None`: another
+    /// role). One not yet in play follows once they come.
+    pub fn follow(&mut self, entity: u32, near: Option<f32>) {
+        match near {
+            Some(near) => {
+                self.following.insert(entity, near);
+            }
+            None => {
+                self.following.remove(&entity);
+            }
+        }
+        for n in self.npcs.iter_mut().filter(|n| n.spawn == Some(entity)) {
+            n.flee = None;
+            n.brain = match near {
+                Some(near) => Brain::Follow { near },
+                None => Brain::Post { facing: n.facing },
+            };
+        }
+        eprintln!(
+            "people: {entity:08x} {}",
+            if near.is_some() {
+                "follows her"
+            } else {
+                "stops following her"
+            }
+        );
+    }
+
+    /// Those following her in play within `reach` metres (flat) of `at`,
+    /// by spawn entity.
+    pub fn followers_within(&self, at: Vec3, reach: f32) -> Vec<u32> {
+        self.npcs
+            .iter()
+            .filter(|n| n.alive && matches!(n.brain, Brain::Follow { .. }))
+            .filter(|n| n.character.position.with_y(0.0).distance(at.with_y(0.0)) <= reach)
+            .filter_map(|n| n.spawn)
+            .collect()
+    }
+
+    /// Those riding a vehicle out of play ([`People::board`]).
+    pub fn aboard(&self) -> Vec<u32> {
+        self.aboard.iter().copied().collect()
+    }
+
+    /// Where those following her are.
+    pub fn followers(&self) -> Vec<Vec3> {
+        self.npcs
+            .iter()
+            .filter(|n| n.alive && matches!(n.brain, Brain::Follow { .. }))
+            .map(|n| n.character.position)
+            .collect()
+    }
+
+    /// Those following her are put at `at` (a step apart): for the
+    /// autoplay's hops, which she makes past what the alpha can't climb
+    /// (a test driver's shortcut, logged as one). How many.
+    pub fn bring_followers(&mut self, at: Vec3) -> usize {
+        let mut k = 0;
+        for n in &mut self.npcs {
+            if matches!(n.brain, Brain::Follow { .. }) {
+                let a = k as f32 * 1.3 + 1.0;
+                n.character.position = at + Vec3::new(a.sin(), 0.2, a.cos()) * 1.5;
+                n.character.velocity = Vec3::ZERO;
+                n.landed = false;
+                k += 1;
+            }
+        }
+        k
+    }
+
+    /// The person of spawn `entity` gets into a vehicle (`aboard`: out of
+    /// play while they ride, `Vehicle.Enter` by `MrxFollow` as she drives)
+    /// or out of it at `at`. Whether they were in play or aboard.
+    pub fn board(&mut self, physics: &mut Physics, entity: u32, aboard: bool, at: Vec3) -> bool {
+        if aboard {
+            let mut was = false;
+            self.npcs.retain(|n| {
+                if n.spawn != Some(entity) {
+                    return true;
+                }
+                if let Some(doll) = n.ragdoll {
+                    physics.remove_ragdoll(doll);
+                }
+                was = true;
+                false
+            });
+            if was {
+                self.active.remove(&entity);
+                self.aboard.insert(entity);
+            }
+            was
+        } else if self.aboard.remove(&entity) {
+            self.moved.insert(entity, at);
+            true
+        } else {
+            false
+        }
+    }
+
     /// The scripts send the person of spawn `entity` along `route`
     /// (`Ai.Goal` `PathMove`, or `MoveTo` a point): they run it, then stand
     /// at its end. One not yet in play runs it when they come.
@@ -2775,7 +3362,10 @@ impl People {
         // People out of range, or whose layer went, go.
         let layers = self.state_layers.as_ref();
         let (active, killed) = (&mut self.active, &mut self.killed);
+        let following = &self.following;
         self.npcs.retain(|n| match n.spawn {
+            // Following her, they stay with her.
+            Some(id) if following.contains_key(&id) => true,
             Some(id)
                 if far(n.character.position, INACTIVE)
                     || n.layer
@@ -2854,6 +3444,7 @@ impl People {
             .filter(|&(s, moved)| {
                 !self.active.contains(&s.entity)
                     && !self.killed.contains(&s.entity)
+                    && !self.aboard.contains(&s.entity)
                     && !far(moved.unwrap_or(s.position), ACTIVE)
                     && self.layer_in(s.layer)
             })
@@ -2864,8 +3455,9 @@ impl People {
             .collect();
         // A mission's targets, and those the scripts sent somewhere (the
         // villa's waves, `Ai.Goal` `PathMove`), come first.
-        let (targets, routes) = (&self.mission_soldiers, &self.routes);
-        let wanted = |e: &u32| targets.contains(e) || routes.contains_key(e);
+        let (targets, routes, following) = (&self.mission_soldiers, &self.routes, &self.following);
+        let wanted =
+            |e: &u32| targets.contains(e) || routes.contains_key(e) || following.contains_key(e);
         near.sort_by(|a, b| {
             (!wanted(&a.1.entity))
                 .cmp(&!wanted(&b.1.entity))
@@ -2877,7 +3469,9 @@ impl People {
         let mut walker_room = self.walker_cap.min(MAX_WALKERS).saturating_sub(walkers);
         for (_, s, at) in near {
             let target = self.mission_soldiers.contains(&s.entity);
-            let sent = self.routes.contains_key(&s.entity);
+            // Sent somewhere, or following her (a VIP released).
+            let sent =
+                self.routes.contains_key(&s.entity) || self.following.contains_key(&s.entity);
             let room = if is_walker(s.entity) {
                 &mut walker_room
             } else {
@@ -2909,7 +3503,9 @@ impl People {
             *room = room.saturating_sub(1);
             let forward = s.rotation * Vec3::Z;
             let facing = forward.x.atan2(forward.z);
-            let brain = if let Some(route) = self.routes.get(&s.entity) {
+            let brain = if let Some(&near) = self.following.get(&s.entity) {
+                Brain::Follow { near }
+            } else if let Some(route) = self.routes.get(&s.entity) {
                 eprintln!(
                     "people: {:08x} comes in at {at:.1} to run the route the scripts gave",
                     s.entity
@@ -2963,6 +3559,7 @@ impl People {
             } else {
                 s.gun.or(self.kinds[kind].gun)
             };
+            npc.launcher = if listed { None } else { s.launcher };
             npc.outfit = self.dress(kind, s);
             self.tell(s, &npc);
             self.npcs.push(npc);
@@ -3177,6 +3774,7 @@ pub(crate) mod tests {
             foreign: Default::default(),
             aim_clip: None,
             barrel: true,
+            scripted: None,
         }
     }
 
@@ -3338,6 +3936,20 @@ pub(crate) mod tests {
         );
         assert!(people.pursuit.is_empty());
         assert_eq!(him(&people), Some((false, false)));
+        // The scripts lock OC on her (`Pg.LockPursuit`, its template in
+        // lower case): they fight her however long, until it is cleared.
+        let oc = faction_by_label("oc").unwrap();
+        assert_eq!(faction_label(oc), "OC");
+        people.scripted_pursuit(oc, None);
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1000.0);
+        assert_eq!(him(&people), Some((true, false)));
+        people.clear_scripted_pursuit();
+        assert_eq!(him(&people), Some((false, false)));
+        // A timed one runs out by itself.
+        people.scripted_pursuit(oc, Some(120.0));
+        assert_eq!(him(&people), Some((true, false)));
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 121.0);
+        assert_eq!(him(&people), Some((false, false)));
     }
 
     #[test]
@@ -3435,6 +4047,7 @@ pub(crate) mod tests {
             damage: 9.0,
             damage_key: None,
             hint: None,
+            pellets: 1,
         };
         people.add_kind(kind("Carmona", true));
         people.add_kind(PersonKind {
@@ -3646,6 +4259,94 @@ pub(crate) mod tests {
     }
 
     /// A rifle as a template's `EquipmentLink`s hand it.
+    // A rifleman holds his fire at her in an APC or a tank (his gun rated
+    // 0 against them), not on foot or in a helicopter; an AT rocket man
+    // fires at all of them.
+    #[test]
+    fn soldiers_hold_fire_where_their_gun_is_no_use() {
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(1),
+        );
+        let rated = |n: &mut Npc, class| {
+            n.target_armour = class;
+            n.rates_target()
+        };
+        assert_eq!(
+            [1, 2, 3, 4].map(|c| rated(&mut n, c)),
+            [true, true, false, false]
+        );
+        let rocket = FireHint {
+            against: [1, 3, 3, 3],
+            ..STAND_IN
+        };
+        n.gun = Some(HandGun {
+            hint: Some(rocket),
+            ..rifle()
+        });
+        assert_eq!([1, 2, 3, 4].map(|c| rated(&mut n, c)), [true; 4]);
+    }
+
+    // A rifleman with the RPG (rated 1 against every class) fires the
+    // rifle at her on foot and the RPG at her in a tank; with a Stinger
+    // (1, 3, 2, 0), at her in a helicopter, not in a tank.
+    #[test]
+    fn soldiers_reach_for_the_launcher_that_rates_her_higher() {
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(1),
+        );
+        let launcher = |against| NpcLauncher {
+            template: 7,
+            hint: FireHint {
+                against,
+                ..STAND_IN
+            },
+            ammo: m2_engine::weapons::Ammo {
+                template: 8,
+                velocity: 25.0,
+                max_velocity: 0.0,
+                human_boost: 2.0,
+                gravity: 0.0,
+                damage: 0.0,
+                damage_min: 0.0,
+                falloff: (0.0, 0.0),
+                dropoff: 1.0,
+                hero: 1.0,
+                key: None,
+                blast: None,
+                timer: None,
+                timer_blast: None,
+                homing: None,
+                model: None,
+                sticky: false,
+            },
+            feel: Default::default(),
+        };
+        let reaches = |n: &mut Npc, class| {
+            n.target_armour = class;
+            n.reaches_for_launcher()
+        };
+        n.launcher = Some(launcher([1, 1, 1, 1]));
+        assert_eq!(
+            [1, 2, 3, 4].map(|c| reaches(&mut n, c)),
+            [false, false, true, true]
+        );
+        n.launcher = Some(launcher([1, 3, 2, 0]));
+        assert_eq!(
+            [1, 2, 3, 4].map(|c| reaches(&mut n, c)),
+            [false, true, true, false]
+        );
+    }
+
     fn rifle() -> HandGun {
         HandGun {
             template: 0x8000_0456,
@@ -3656,6 +4357,7 @@ pub(crate) mod tests {
             damage: 8.0,
             damage_key: None,
             hint: None,
+            pellets: 1,
         }
     }
 
@@ -3686,6 +4388,7 @@ pub(crate) mod tests {
             list: Vec::new(),
             ai: None,
             gun: None,
+            launcher: None,
             cycle: None,
         }
     }
@@ -4187,6 +4890,76 @@ pub(crate) mod tests {
         assert!(p.y >= -1.0 - WET && p.z < 6.0, "{p}");
     }
 
+    // Soldiers walked the sea bed instead of swimming. Out of their depth
+    // they float at the surface, fire nothing, make for the shore and
+    // stand up where it shallows; one put out of a boat over deep water
+    // swims too.
+    #[test]
+    fn out_of_their_depth_they_swim_to_the_shore_and_stand_up() {
+        // Dry ground at 0 for z < 5, a shelf 0.8 m under the sea to z 10,
+        // the sea bed 2 m under beyond; the sea at -1.
+        let mut physics = Physics::new();
+        let floor = |p: &mut Physics, key: u32, z0: f32, z1: f32, y: f32| {
+            let v = [
+                Vec3::new(-50.0, y, z0),
+                Vec3::new(50.0, y, z0),
+                Vec3::new(50.0, y, z1),
+                Vec3::new(-50.0, y, z1),
+            ];
+            let shape = CollisionShape::mesh(&v, &[[0, 2, 1], [0, 3, 2]]).unwrap();
+            p.add_static(StaticKey::Cell(key), &shape, Vec3::ZERO, Quat::IDENTITY);
+        };
+        floor(&mut physics, 1, -50.0, 5.0, 0.0);
+        floor(&mut physics, 2, 5.0, 10.0, -1.8);
+        floor(&mut physics, 3, 10.0, 60.0, -3.0);
+        physics.step(1.0 / 60.0);
+        physics.set_water(-1.0);
+        let mut rng = Rng::default();
+        let dt = 1.0 / 60.0;
+        let mut npc = Npc::new(
+            0,
+            &rig(),
+            Vec3::new(0.0, -1.3, 25.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(1),
+        );
+        npc.landed = true;
+        npc.alert = true;
+        for _ in 0..30 {
+            npc.update(&physics, &mut rng, Some(Vec3::new(0.0, 0.0, 0.0)), dt);
+            assert!(!npc.fires);
+        }
+        assert!(npc.swimming());
+        let p = npc.character.position;
+        assert!(
+            (p.y - (-1.0 - crate::player::SWIM_FLOAT)).abs() < 1e-3,
+            "{p}"
+        );
+        assert!(p.z < 25.0, "makes for the shore: {p}");
+        for _ in 0..60 * 15 {
+            npc.update(&physics, &mut rng, None, dt);
+        }
+        assert!(!npc.swimming());
+        let p = npc.character.position;
+        assert!(p.z < 10.0 && p.y > -1.9, "{p}");
+
+        // Put out of a boat 20 m out: into the water, swimming.
+        let mut npc = Npc::new(
+            0,
+            &rig(),
+            Vec3::new(0.0, 0.5, 30.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            None,
+        );
+        npc.put_out = true;
+        for _ in 0..3 {
+            npc.update(&physics, &mut rng, None, dt);
+        }
+        assert!(npc.landed && npc.swimming());
+    }
+
     // Playtest 8: soldiers turning on the spot. Facing a new way each tick
     // while standing still counts as spinning; one turn to face her
     // doesn't.
@@ -4219,6 +4992,49 @@ pub(crate) mod tests {
         }
         assert!(checks.spinners.contains(&7));
         assert!(checks.spinning > 1.0, "{}", checks.spinning);
+    }
+
+    #[test]
+    fn a_bashed_target_falls_lies_and_gets_up_unless_subdued_and_carried() {
+        let physics = ground();
+        let mut rng = Rng::default();
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(5),
+        );
+        let step = |n: &mut Npc, seconds: f32, rng: &mut Rng| {
+            for _ in 0..(seconds * 60.0) as usize {
+                n.update(&physics, rng, None, 1.0 / 60.0);
+            }
+        };
+        step(&mut n, 0.5, &mut rng);
+        assert_eq!(n.human_state(), "Upright.Idle");
+        // Knocked down: the fall, lying, then up again.
+        n.knock_down();
+        assert_eq!(n.human_state(), "Upright.KnockDown");
+        step(&mut n, FALL_SECONDS + 0.1, &mut rng);
+        assert_eq!(n.human_state(), "KnockedDown.Idle");
+        step(&mut n, KNOCKED_SECONDS + 0.1, &mut rng);
+        assert_eq!(n.human_state(), "KnockedDown.Getup");
+        step(&mut n, GETUP_SECONDS + 0.1, &mut rng);
+        assert_eq!(n.human_state(), "Upright.Idle");
+        // Standing, he can't be subdued; down, he can, for good.
+        assert!(!n.subdue());
+        n.knock_down();
+        step(&mut n, FALL_SECONDS + 0.1, &mut rng);
+        assert!(n.subdue());
+        assert_eq!(n.human_state(), "KnockedDown.SubdueDefender");
+        step(&mut n, SUBDUE_SECONDS + KNOCKED_SECONDS + 1.0, &mut rng);
+        assert_eq!(n.human_state(), "Subdued.Idle");
+        // Carried, and put down again.
+        assert!(n.carry(true));
+        assert_eq!(n.human_state(), "Carried.Idle");
+        assert!(n.carry(false));
+        assert_eq!(n.human_state(), "Subdued.Idle");
     }
 
     // Playtest 8 (his clip at 16:57): a soldier stood in the villa

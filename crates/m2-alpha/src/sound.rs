@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use std::time::{Duration, Instant};
 
+use m2_engine::ambience::{AmbiencePlan, Layers};
 use m2_engine::audio::{EngineSounds, Falloff, KeySounds, Play, SoundLibrary};
 use m2_engine::gun_sounds::GunCues;
 use m2_engine::{Category, Install, Mixer, SoundBuffer, Streams, VoiceId, Voices};
@@ -170,6 +171,17 @@ pub struct GameAudio {
     silent: HashSet<u32>,
     /// Seconds to the next one.
     ambient_wait: f32,
+    /// The regions' ambience, once read (on a thread); it takes over from
+    /// the town and jungle one-shots.
+    zone_sounds: Option<Arc<ZoneSounds>>,
+    zone_loading: Option<Receiver<Option<ZoneSounds>>>,
+    /// The region cue playing (`None`: in no ambience region), and what
+    /// it plays.
+    zone_cue: Option<u32>,
+    zone: Option<Zone>,
+    /// Beds fading: voice, its gain now and where it goes (out: 0, then
+    /// stopped).
+    zone_fades: Vec<(VoiceId, f32, f32)>,
     seed: u64,
     /// The characters' voices, once read (on a thread: `English.wad`).
     voices: Option<Arc<Voices>>,
@@ -328,6 +340,65 @@ impl UiSounds {
         ))
     }
 }
+
+/// The zone ambience's sounds: the `ambience` cue table, which says what
+/// each region's cue plays ([`AmbiencePlan`]), and the banks its one-shots
+/// come from.
+#[derive(Debug)]
+pub struct ZoneSounds {
+    table: m2_assets::CueTable,
+    banks: HashMap<u32, Vec<SoundBuffer>>,
+}
+
+impl ZoneSounds {
+    fn load(install: &Install) -> Option<Self> {
+        let mut source = install.open_world().ok()?;
+        let data = source
+            .asset(
+                m2_assets::name_hash("ambience"),
+                m2_assets::voice::CUE_TABLE_TYPE,
+            )
+            .ok()?;
+        let table = m2_assets::CueTable::parse(&data).ok()?;
+        let mut hashes: Vec<u32> = table
+            .records
+            .iter()
+            .flat_map(|r| r.variants.iter().map(|v| v.0))
+            .filter(|&b| b != table.hash)
+            .collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        let library = SoundLibrary::load_banks(&mut source, &hashes);
+        let banks = hashes
+            .iter()
+            .filter_map(|&h| library.bank_hash(h).map(|(_, s)| (h, s.to_vec())))
+            .collect();
+        Some(Self { table, banks })
+    }
+
+    /// What region cue `cue` plays.
+    fn plan(&self, cue: u32) -> Option<AmbiencePlan> {
+        AmbiencePlan::of(&self.table, cue)
+    }
+
+    fn sound(&self, bank: u32, index: u32) -> Option<&SoundBuffer> {
+        self.banks.get(&bank)?.get(index as usize)
+    }
+}
+
+/// The zone ambience playing: the region's cue and plan, when its layers
+/// fire, and its bed's voice once decoded.
+#[derive(Debug)]
+struct Zone {
+    plan: AmbiencePlan,
+    layers: Layers,
+    /// The bed stream asked for (by hash), until it plays.
+    bed_wanted: Option<u32>,
+    bed: Option<VoiceId>,
+}
+
+/// Seconds a bed fades in and out over as the region changes (invented).
+const ZONE_FADE: f32 = 2.0;
 
 /// How loud the music plays.
 const MUSIC_GAIN: f32 = 0.6;
@@ -907,6 +978,31 @@ impl GameAudio {
             rotors: HashMap::new(),
             silent: HashSet::new(),
             ambient_wait: 3.0,
+            zone_sounds: None,
+            zone_loading: install.map(|install| {
+                let install = install.clone();
+                let (tx, rx) = channel();
+                std::thread::spawn(move || {
+                    let zone = ZoneSounds::load(&install);
+                    match &zone {
+                        Some(z) => eprintln!(
+                            "ambience: table of {} cues and {} mixes, {} banks, {} sounds",
+                            z.table.cues.len(),
+                            z.table.mixes.len(),
+                            z.banks.len(),
+                            z.banks.values().map(Vec::len).sum::<usize>()
+                        ),
+                        None => {
+                            eprintln!("ambience: no ambience cue table; town and jungle sounds")
+                        }
+                    }
+                    let _ = tx.send(zone);
+                });
+                rx
+            }),
+            zone_cue: None,
+            zone: None,
+            zone_fades: Vec::new(),
             seed: 0x9e37_79b9_7f4a_7c15,
             voices: None,
             voices_loading: install.map(|install| {
@@ -1019,6 +1115,7 @@ impl GameAudio {
             };
             let tables = held_tables(&tables, &mut source);
             let (mut found, mut bytes) = (0, 0);
+            let mut missing = Vec::new();
             for &key in &keys {
                 let sounds = KeySounds::resolve(&mut source, &tables, key);
                 if let Some(k) = &sounds {
@@ -1028,14 +1125,17 @@ impl GameAudio {
                         .iter()
                         .map(|(s, _)| s.samples.len() * 2)
                         .sum::<usize>();
+                } else {
+                    missing.push(format!("{key:08x}"));
                 }
                 drop(tx.send((key, sounds)));
             }
             eprintln!(
-                "sound: read {found} of {} gun firing cues ahead ({:.1} MB) in {:.2} s",
+                "sound: read {found} of {} gun firing cues ahead ({:.1} MB) in {:.2} s; none for [{}]",
                 keys.len(),
                 bytes as f32 / 1e6,
-                started.elapsed().as_secs_f32()
+                started.elapsed().as_secs_f32(),
+                missing.join(", ")
             );
         });
     }
@@ -1049,21 +1149,44 @@ impl GameAudio {
         }
     }
 
+    /// Runs the world's placed sounds through the scripts' reverb preset
+    /// (the bootstrap's `CITY_KG_LIGHT_REFLECTIONS`), or none.
+    pub fn set_reverb(&mut self, preset: Option<m2_engine::reverb::ReverbPreset>) {
+        match &preset {
+            Some(p) => eprintln!(
+                "sound: reverb {} (room {} mB, decay {} s, reflections {} mB at {} s, \
+                 reverb {} mB {} s later)",
+                p.name,
+                p.room,
+                p.decay_time,
+                p.reflections,
+                p.reflections_delay,
+                p.reverb,
+                p.reverb_delay
+            ),
+            None => eprintln!("sound: reverb off"),
+        }
+        self.out.with(|m| m.set_reverb(preset));
+    }
+
     /// Plays the scripts' music cue `cue` (`mu_fac_pmc_explore_01`) in
     /// place of what plays, looped unless it is a one-shot (a fanfare);
     /// `None` stops the music.
     pub fn music_cue(&mut self, cue: Option<&str>) {
         self.ui_loaded();
+        // A cue the music's table doesn't have (some radio songs, kept in
+        // no table this reads) leaves what plays playing.
+        let found = cue.map(|c| (c, self.ui.as_ref().and_then(|u| u.music(c))));
+        if let Some((cue, None)) = found {
+            eprintln!("music: {cue} not found, what plays goes on");
+            return;
+        }
         if let Some(id) = self.music.take() {
             self.out.with(|m| m.stop(id));
         }
         self.music_wanted = None;
-        let Some(cue) = cue else {
+        let Some((cue, Some((stream, looped)))) = found else {
             eprintln!("music: stopped");
-            return;
-        };
-        let Some((stream, looped)) = self.ui.as_ref().and_then(|u| u.music(cue)) else {
-            eprintln!("music: {cue} not found");
             return;
         };
         let hash = self
@@ -1352,6 +1475,138 @@ impl GameAudio {
         (self.seed >> 40) as f32 / (1u64 << 24) as f32
     }
 
+    /// The regions' ambience, once read: plays region cue `cue` (`None`:
+    /// in no ambience region, where none plays) around `listener` for `dt`
+    /// seconds. False until the ambience is read (or when it can't be),
+    /// for the town and jungle one-shots to stand in.
+    pub fn zone_ambience(&mut self, cue: Option<u32>, listener: Vec3, dt: f32) -> bool {
+        if let Some(rx) = &self.zone_loading
+            && let Ok(z) = rx.try_recv()
+        {
+            self.zone_sounds = z.map(Arc::new);
+            self.zone_loading = None;
+        }
+        let Some(sounds) = self.zone_sounds.clone() else {
+            return false;
+        };
+        // Beds fading in or out.
+        let step = dt / ZONE_FADE;
+        let mut stopped = Vec::new();
+        for (voice, now, goal) in &mut self.zone_fades {
+            let rate = step * goal.max(*now).max(1e-3);
+            *now += (*goal - *now).clamp(-rate, rate);
+            let (v, g) = (*voice, *now);
+            self.out.with(|m| m.set_gain(v, g));
+            if g <= 0.0 {
+                stopped.push(v);
+            }
+        }
+        for v in &stopped {
+            self.out.with(|m| m.stop(*v));
+        }
+        self.zone_fades
+            .retain(|(v, now, goal)| !stopped.contains(v) && (now - goal).abs() > 1e-4);
+        if cue != self.zone_cue {
+            self.zone_cue = cue;
+            if let Some(old) = self.zone.take()
+                && let Some(v) = old.bed
+            {
+                let now = old.plan.bed.map_or(0.0, |b| b.volume);
+                self.zone_fades.retain(|f| f.0 != v);
+                self.zone_fades.push((v, now, 0.0));
+            }
+            let plan = cue.and_then(|c| sounds.plan(c));
+            match (&plan, cue) {
+                (Some(p), Some(c)) => eprintln!(
+                    "ambience: cue {c:08x}: bed {}, {} layers of {} sounds",
+                    p.bed.map_or("none".to_owned(), |b| format!(
+                        "stream {} at {:.2}",
+                        b.stream, b.volume
+                    )),
+                    p.layers.len(),
+                    p.layers.iter().map(|l| l.sounds.len()).sum::<usize>()
+                ),
+                (None, Some(c)) => eprintln!("ambience: cue {c:08x} not in the table"),
+                _ => eprintln!("ambience: none here"),
+            }
+            if let Some(plan) = plan {
+                let bed_wanted = plan.bed.and_then(|b| {
+                    let hash = self
+                        .streams
+                        .as_ref()
+                        .and_then(|s| s.ambience.streams.get(b.stream))
+                        .map(|s| s.hash)?;
+                    self.decode("ambience", b.stream);
+                    Some(hash)
+                });
+                let mut seed = self.seed;
+                let layers = Layers::new(&plan, || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 40) as f32 / (1u64 << 24) as f32
+                });
+                self.seed = seed;
+                self.zone = Some(Zone {
+                    plan,
+                    layers,
+                    bed_wanted,
+                    bed: None,
+                });
+            }
+        }
+        let Some(mut zone) = self.zone.take() else {
+            return true;
+        };
+        let fire = {
+            let mut seed = self.seed;
+            let fire = zone.layers.step(&zone.plan, dt, || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 40) as f32 / (1u64 << 24) as f32
+            });
+            self.seed = seed;
+            fire
+        };
+        for i in fire {
+            let layer = &zone.plan.layers[i];
+            let Some((bank, index)) = layer.pick(self.random()) else {
+                continue;
+            };
+            let Some(buffer) = sounds.sound(bank, index).cloned() else {
+                continue;
+            };
+            let angle = self.random() * std::f32::consts::TAU;
+            let distance = 10.0 + self.random() * 30.0;
+            let at = listener + Vec3::new(angle.cos() * distance, 2.0, angle.sin() * distance);
+            let falloff =
+                Falloff::of_record(layer.min_distance, layer.max_distance).unwrap_or_default();
+            let play = Play::at(buffer, at).gain(layer.volume).falloff(falloff);
+            self.out.with(|m| m.play(play));
+        }
+        self.zone = Some(zone);
+        true
+    }
+
+    /// A decoded ambience stream: the zone's bed, if it is the one asked
+    /// for (else it was overtaken, and is dropped).
+    fn bed_decoded(&mut self, buffer: SoundBuffer) {
+        let Some(zone) = &mut self.zone else {
+            return;
+        };
+        if zone.bed_wanted != Some(buffer.hash) {
+            return;
+        }
+        zone.bed_wanted = None;
+        let volume = zone.plan.bed.map_or(0.0, |b| b.volume);
+        let voice = self
+            .out
+            .with(|m| m.play(Play::flat(buffer).looped().gain(0.0)));
+        zone.bed = Some(voice);
+        self.zone_fades.push((voice, 0.0, volume));
+    }
+
     /// Counts down to the next ambient sound: true when one is due.
     pub fn ambient_due(&mut self, dt: f32) -> bool {
         self.ambient_wait -= dt;
@@ -1459,7 +1714,14 @@ impl GameAudio {
                     continue;
                 }
                 Sound::Reload { set } => {
-                    self.play_reload(set);
+                    let cue = set.and_then(|s| self.gun_cues.reload(s));
+                    self.play_flat("reload", set, cue);
+                    continue;
+                }
+                Sound::Pickup { set } => {
+                    let cue =
+                        set.and_then(|s| self.gun_cues.cue(s, m2_engine::gun_sounds::EQUIP_PICKUP));
+                    self.play_flat("pickup", set, cue);
                     continue;
                 }
             };
@@ -1561,11 +1823,12 @@ impl GameAudio {
         false
     }
 
-    /// Her gun of sound set `set` reloaded: its reload cue
-    /// ([`GunCues::reload`]), heard as her own (flat), at its volume. A
-    /// cue not yet read is read on a thread and this reload goes unheard.
-    fn play_reload(&mut self, set: Option<u32>) {
-        let Some(cue) = set.and_then(|s| self.gun_cues.reload(s)) else {
+    /// A sound of her gun of sound set `set` heard as her own (flat), at
+    /// its volume: its reload cue ([`GunCues::reload`]) or the cue it plays
+    /// taken up (`equip_pickup`), `what` saying which. A cue not yet read
+    /// is read on a thread and this one goes unheard.
+    fn play_flat(&mut self, what: &str, set: Option<u32>, cue: Option<u32>) {
+        let Some(cue) = cue else {
             return;
         };
         match self.keys.get(&cue) {
@@ -1575,7 +1838,7 @@ impl GameAudio {
                 if let Some(buffer) = found.pick(pick).cloned() {
                     if self.shots_heard.insert(cue) {
                         eprintln!(
-                            "sound: reload, set {:08x}, cue {cue:08x}: sound {:08x} ({:.2} s)",
+                            "sound: {what}, set {:08x}, cue {cue:08x}: sound {:08x} ({:.2} s)",
                             set.unwrap_or(0),
                             buffer.hash,
                             buffer.seconds()
@@ -1969,8 +2232,7 @@ impl GameAudio {
                 self.music = Some(self.out.with(|m| m.play(play)));
                 continue;
             }
-            self.out
-                .with(|m| m.play(Play::flat(buffer).looped().gain(0.5)));
+            self.bed_decoded(buffer);
         }
         self.out.with(|m| m.set_listener(listener, forward));
     }
