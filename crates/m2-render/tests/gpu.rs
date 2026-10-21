@@ -12,11 +12,44 @@ use m2_render::*;
 
 const SIZE: u32 = 64;
 
-fn backend() -> Option<WgpuBackend> {
+/// One test at a time on the GPU: several headless devices made and
+/// driven at once from the test threads hung the debug build's run (CI's
+/// and locally, with every test passing alone), so each test holds this
+/// lock for as long as it holds its backend.
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A headless backend, and the GPU to itself while it lives.
+struct Gpu {
+    backend: WgpuBackend,
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for Gpu {
+    type Target = WgpuBackend;
+    fn deref(&self) -> &WgpuBackend {
+        &self.backend
+    }
+}
+
+impl std::ops::DerefMut for Gpu {
+    fn deref_mut(&mut self) -> &mut WgpuBackend {
+        &mut self.backend
+    }
+}
+
+fn backend() -> Option<Gpu> {
+    // A test that failed holding the lock poisons it; the GPU is still
+    // free to use.
+    let turn = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match WgpuBackend::headless(SIZE, SIZE) {
         Ok(b) => {
             eprintln!("adapter: {:?}", b.adapter_summary());
-            Some(b)
+            Some(Gpu {
+                backend: b,
+                _turn: turn,
+            })
         }
         Err(e) => {
             eprintln!("skipping: no GPU adapter ({e})");
