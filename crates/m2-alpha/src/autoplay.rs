@@ -1625,6 +1625,22 @@ impl Autoplay {
                 self.fresh_headway();
                 return self.walk(game, s, 1.0, dt);
             }
+            // On the water with no dry ground in range of it (rounds 30 to
+            // 37's first boat: she went in after it every time): another
+            // for now, this one once the rest are done.
+            if self.blast_spot.is_none()
+                && at.y < WATERLINE + AFLOAT
+                && !self
+                    .passed
+                    .iter()
+                    .any(|&(t, until)| t == target && self.clock < until)
+            {
+                eprintln!(
+                    "autoplay {:.1} s: no dry ground in range of {}: another for {PASS_FOR} s",
+                    self.clock, self.what
+                );
+                self.passed.push((target, self.clock + PASS_FOR));
+            }
             return self.walk(game, at, far - 5.0, dt);
         }
         if d < near {
