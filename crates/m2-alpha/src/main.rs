@@ -39,6 +39,9 @@
 //! `--fight` she shoots the nearest soldier, fires a rocket at a vehicle and
 //! throws a grenade.
 
+mod aim;
+#[cfg(target_os = "android")]
+mod android;
 mod autoplay;
 mod binoculars;
 mod breakables;
@@ -47,7 +50,9 @@ mod camera;
 mod cheats;
 mod combat;
 mod config;
+mod coop;
 mod destruct;
+mod disguise;
 mod display;
 mod drops;
 mod flights;
@@ -59,6 +64,7 @@ mod held;
 mod hero;
 mod hijack;
 mod input;
+mod jobs;
 mod keytable;
 mod loading;
 mod mission;
@@ -73,7 +79,9 @@ mod pause;
 mod placed;
 mod player;
 mod props;
+mod puppet;
 mod raw;
+mod reinforce;
 mod roads;
 mod route;
 mod save;
@@ -86,6 +94,7 @@ mod startup;
 mod strikes;
 mod subtitles;
 mod support;
+mod touch;
 mod traffic;
 mod ui;
 
@@ -104,7 +113,9 @@ use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, Window, WindowId};
+#[cfg(not(target_os = "android"))]
+use winit::window::CursorGrabMode;
+use winit::window::{Window, WindowId};
 
 use camera::FlyCamera;
 use config::Config;
@@ -135,6 +146,12 @@ struct Options {
     spawn: Option<(f32, f32)>,
     /// Who to play (`--hero`), over the settings'.
     hero: Option<Hero>,
+    /// Online co-op (`--host`, `--join <invite>`), with `--coop-local`
+    /// and `--name`.
+    coop: Option<coop::Setup>,
+    /// With `--screenshot` and co-op: seconds of play together before
+    /// the picture (default 30).
+    coop_seconds: f32,
     /// Weapons to start with, by template name (`--gun`, repeated:
     /// `Shotgun`, `Stinger`, `C4`).
     guns: Vec<String>,
@@ -153,6 +170,9 @@ struct Options {
     /// With `--mission`: the story skipped to this contract the game's
     /// developer way, and whether to its briefing (`--skip-to <id>[,briefing]`).
     skip_to: Option<(String, bool)>,
+    /// With `--skip-to` a job: she is put this far from its nearest
+    /// target once it is tracked (`--job-near <m>`, a test shortcut).
+    job_near: Option<f32>,
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
@@ -401,6 +421,10 @@ struct Options {
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
     hurt: Option<f32>,
+    /// With `--mission`: driving, the horn is held half a second every
+    /// this many seconds (to hear it, and what the gates, the disguise
+    /// and friendly soldiers make of it).
+    honk_every: Option<f32>,
     /// With `--mission --screenshot`: she plays the mission herself, by
     /// its markers, until it is done or the seconds are up.
     autoplay: bool,
@@ -438,12 +462,27 @@ enum SatelliteShot {
 /// A `--satellite` call's spot lies this far ahead of her, metres.
 const SATELLITE_AHEAD: f32 = 45.0;
 
-fn parse_args() -> anyhow::Result<Options> {
+/// The install its installer recorded in the registry (`Install Dir`,
+/// seen on one real install; whether every edition's installer writes
+/// it is not checked), for a game put somewhere other than Program Files.
+fn registry_install() -> Option<Install> {
+    const KEYS: [&str; 2] = [
+        r"SOFTWARE\WOW6432Node\EA Games\Mercenaries 2 World in Flames",
+        r"SOFTWARE\EA Games\Mercenaries 2 World in Flames",
+    ];
+    KEYS.iter()
+        .filter_map(|k| m2_sys::registry::local_machine_string(k, "Install Dir"))
+        .find_map(|dir| Install::find(std::path::Path::new(&dir)).ok())
+}
+
+fn parse_args(given: &[String]) -> anyhow::Result<Options> {
     let mut o = Options {
         skip_mode_off: true,
+        coop_seconds: 30.0,
         ..Options::default()
     };
-    let mut args = std::env::args().skip(1);
+    let (mut coop_role, mut coop_local, mut coop_name) = (None, false, None);
+    let mut args = given.iter().cloned();
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
         match arg.as_str() {
@@ -476,6 +515,19 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--turn" => o.turn = value()?.parse().context("--turn expects degrees")?,
             "--gun" => o.guns.push(value()?),
+            "--host" => coop_role = Some(coop::Role::Host),
+            "--join" => {
+                let v = value()?;
+                let invite = v
+                    .parse::<m2_net::Invite>()
+                    .with_context(|| format!("--join expects an invite code or link, not {v}"))?;
+                coop_role = Some(coop::Role::Join(invite));
+            }
+            "--coop-local" => coop_local = true,
+            "--name" => coop_name = Some(value()?),
+            "--coop-seconds" => {
+                o.coop_seconds = value()?.parse().context("--coop-seconds expects seconds")?
+            }
             "--hero" => {
                 let v = value()?;
                 o.hero = Some(Hero::parse(&v).with_context(|| {
@@ -531,6 +583,7 @@ fn parse_args() -> anyhow::Result<Options> {
                     None => (v, false),
                 });
             }
+            "--job-near" => o.job_near = Some(value()?.parse()?),
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
@@ -777,6 +830,9 @@ fn parse_args() -> anyhow::Result<Options> {
             "--autoplay" => o.autoplay = true,
             "--smarter-ai" => o.smarter_ai = true,
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
+            "--honk-every" => {
+                o.honk_every = Some(value()?.parse().context("--honk-every expects seconds")?)
+            }
             "--gates" => o.gates = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
             "--contracts" => {
@@ -802,7 +858,7 @@ fn parse_args() -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 13] = [
+    const PLAIN: [&str; 17] = [
         "--install",
         "--config",
         "--size",
@@ -816,9 +872,14 @@ fn parse_args() -> anyhow::Result<Options> {
         "--dev",
         "--skip-mode-off",
         "--skip-mode-on",
+        // Co-op plays the whole game too.
+        "--host",
+        "--join",
+        "--coop-local",
+        "--name",
     ];
-    if std::env::args()
-        .skip(1)
+    if given
+        .iter()
         .all(|a| !a.starts_with("--") || PLAIN.contains(&a.as_str()))
     {
         o.alpha = true;
@@ -826,6 +887,23 @@ fn parse_args() -> anyhow::Result<Options> {
     if o.alpha {
         o.mission = true;
     }
+    if coop_role.is_none() && o.alpha {
+        // The join page copies `m2coop:<code>` before the download: the
+        // whole game, launched plain, joins it.
+        coop_role = m2_sys::clipboard::text()
+            .filter(|t| t.trim_start().starts_with("m2coop:"))
+            .and_then(|t| t.parse::<m2_net::Invite>().ok())
+            .map(|invite| {
+                eprintln!("coop: joining the invite on the clipboard");
+                coop::Role::Join(invite)
+            });
+    }
+    o.coop = coop_role.map(|role| coop::Setup {
+        role,
+        name: coop_name.unwrap_or_else(|| "Player".into()),
+        relay: !coop_local,
+        copy_link: o.screenshot.is_none(),
+    });
     Ok(o)
 }
 
@@ -870,9 +948,21 @@ const PLACED_CHECK_EVERY: f32 = 5.0;
 /// are hit before they are, seconds: for the contract's layers to be in.
 const PROPS_CHECK_AFTER: f32 = 20.0;
 
+// The Android build's entry point is `android::android_main`.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
-    let mut options = parse_args()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    run(&args, EventLoop::new)
+}
+
+/// The game, given its arguments and how to make its event loop (the
+/// Android build hands over the activity's).
+fn run(
+    args: &[String],
+    event_loop: impl FnOnce() -> Result<EventLoop<()>, winit::error::EventLoopError>,
+) -> anyhow::Result<()> {
+    let mut options = parse_args(args)?;
     combat::use_attach_frame(!options.hands_grip);
     let config_path = options
         .config_path
@@ -911,7 +1001,7 @@ fn main() -> anyhow::Result<()> {
     }
     let install = match &config.install {
         Some(dir) => Some(Install::find(dir)?),
-        None => match Install::detect() {
+        None => match Install::detect().or_else(registry_install) {
             Some(found) => {
                 eprintln!("found the game in {}", found.root.display());
                 Some(found)
@@ -974,7 +1064,7 @@ fn main() -> anyhow::Result<()> {
         return screenshot(&config, install.as_ref(), &mode, &options, out);
     }
 
-    let event_loop = EventLoop::new()?;
+    let event_loop = event_loop()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
         config,
@@ -988,6 +1078,7 @@ fn main() -> anyhow::Result<()> {
         grapple: options.grapple,
         mission: options.mission,
         mission_drivers: options.mission_drivers.clone(),
+        coop: options.coop.clone(),
         old_hud: options.old_hud,
         hijack_crew: options.hijack_crew.clone(),
         support: options.support.clone(),
@@ -1618,6 +1709,19 @@ fn screenshot(
         },
         started.elapsed().as_secs_f32()
     );
+    if let Some(setup) = &options.coop {
+        let walk = options.gait.filter(|_| game.on_foot);
+        return coop::offscreen(
+            &mut backend,
+            &mut game,
+            setup,
+            options.coop_seconds,
+            walk,
+            fov,
+            aspect,
+            out,
+        );
+    }
     // The last frames are timed: the frame rate here, for checking.
     // Where the time goes: the tick, streaming, building the draws, and
     // submitting the frame.
@@ -3498,7 +3602,8 @@ fn mission_for_screenshot(
         .with_support(options.support.clone())
         .with_movies(options.movies)
         .with_skip_mode_off(options.skip_mode_off)
-        .with_skip_to(options.skip_to.clone());
+        .with_skip_to(options.skip_to.clone())
+        .with_job_near(options.job_near);
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -3612,6 +3717,9 @@ fn mission_for_screenshot(
     let (mut extraction, mut extraction_tap, mut extraction_seen) = (0u8, false, 0.0f32);
     let (mut locked_was, mut locked_for) = (false, 0.0f32);
     let mut on_contract: Option<(String, i64)> = None;
+    // Message box calls with a callback, while the game's HUD isn't
+    // running: when each is due back, by call number; the last seen.
+    let (mut boxed, mut boxed_seen): (Vec<(f32, u64)>, u64) = (Vec::new(), 0);
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
             Some(a) => {
@@ -3626,6 +3734,7 @@ fn mission_for_screenshot(
                 }
                 a.sights = link.sight_targets(game);
                 let marks = link.contract_marks();
+                a.offers = link.offers(game);
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)
             }
@@ -3639,6 +3748,9 @@ fn mission_for_screenshot(
         }
         // With --support she throws the marker the scripts hand her.
         let mut intent = intent;
+        if let Some(n) = options.honk_every.filter(|n| *n > 0.0) {
+            intent.honk = (i as f32 * tick) % n < 0.5;
+        }
         // With --jump-with-enter, the Enter pressed after the contract (to
         // close a fanfare) is the pad's A, which jumps too.
         if options.jump_with_enter
@@ -4074,6 +4186,31 @@ fn mission_for_screenshot(
         }
         if options.movies {
             movies_offscreen(&mut link, install, out);
+        }
+        // Until the contract is done the game's HUD doesn't run here, so
+        // its message box can't call back as each message ends: an
+        // objective's added message, which the objective waits on before
+        // going on (`fOnInitialNotesComplete`: GurCon002's cathedral
+        // countdown). Each is called back once its `nDuration` is up
+        // (inferred: the box shows one at a time, which isn't kept).
+        if late_hud.is_none() {
+            let now = i as f32 * tick;
+            for c in link.view().hud_calls {
+                if c.seq <= boxed_seen {
+                    continue;
+                }
+                boxed_seen = c.seq;
+                if c.callback && c.group == "MessageBox" && c.method == "AddMessage" {
+                    boxed.push((now + message_seconds(&c.data), c.seq));
+                }
+            }
+            boxed.retain(|&(due, seq)| {
+                if due > now {
+                    return true;
+                }
+                link.hud_callback(seq);
+                false
+            });
         }
         if late_hud.is_none() {
             let wanted = screen_cycle.wanted(game.arrival.is_some(), link.black(), tick);
@@ -4572,6 +4709,27 @@ fn mission_for_screenshot(
                 play_done = Some(i);
             }
         }
+        // The job she was skipped to, done (a set job or a collection
+        // completed, a standing bounty paid): she stops as for a contract.
+        if auto.is_some()
+            && play_done.is_none()
+            && let Some(job) = link.job().filter(|j| j.finished())
+        {
+            eprintln!(
+                "autoplay: job {} done after {:.1} s of play ({:.0} s here): {} counted{}, cash {:.0}",
+                job.id,
+                i as f32 * tick,
+                played.elapsed().as_secs_f32(),
+                job.view.counted,
+                if job.view.completed {
+                    ", completed"
+                } else {
+                    ""
+                },
+                link.resources().unwrap_or_default().0
+            );
+            play_done = Some(i);
+        }
         if play_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
             break;
         }
@@ -4959,6 +5117,21 @@ fn grapple_keys(game: &mut Game, input: &mut Input, allowed: bool) {
         }
     }
     game.grapple = g;
+}
+
+/// How long the message box shows a message (its call's `nDuration`,
+/// seconds; 5 when not given, as the objectives' messages ask).
+fn message_seconds(data: &gamehud::Plain) -> f32 {
+    use gamehud::Plain;
+    let Plain::Table(t) = data else {
+        return 5.0;
+    };
+    t.iter()
+        .find_map(|(k, v)| match (k, v) {
+            (Plain::Text(k), Plain::Number(n)) if k == "nDuration" => Some(*n as f32),
+            _ => None,
+        })
+        .unwrap_or(5.0)
 }
 
 /// With `--context`: once the scripts offer a context action whose prompt
@@ -6656,6 +6829,8 @@ struct Running {
     backend: WgpuBackend,
     game: Game,
     audio: sound::GameAudio,
+    /// Online co-op, when hosting or joining.
+    coop: Option<coop::Coop>,
     /// Whether she was driving last tick (getting in is worth a word).
     was_driving: bool,
     input: Input,
@@ -6677,6 +6852,8 @@ struct Running {
     /// the next one pressed goes to it, not to play.
     capturing: bool,
     culling: bool,
+    /// In the background (Android): no surface to draw to, and play waits.
+    background: bool,
     last: Instant,
     lag: Duration,
     fps: (Instant, u32),
@@ -6737,6 +6914,8 @@ struct App {
     mission: bool,
     /// Lua to run before they start (`--mission-driver`).
     mission_drivers: Vec<(String, String)>,
+    /// Online co-op to host or join (`--host`, `--join`).
+    coop: Option<coop::Setup>,
     /// Our stand-in HUD instead of the game's own.
     old_hud: bool,
     hijack_crew: Option<String>,
@@ -6783,6 +6962,14 @@ impl App {
             WgpuBackend::for_window(window.clone(), size.width, size.height, w.vsync)?;
         let adapter = backend.adapter_summary();
         eprintln!("adapter: {adapter:?}");
+        backend.set_render_scale(w.render_scale);
+        backend.set_light_shadows(cfg!(target_os = "android"));
+        if w.render_scale < 1.0 {
+            eprintln!(
+                "render scale: the world drawn at {:.2} of the window",
+                w.render_scale
+            );
+        }
         let mut game = build_scene(
             &mut backend,
             self.install.as_ref(),
@@ -6829,15 +7016,24 @@ impl App {
                 audio.hero = self.config.hero;
                 audio
             },
+            coop: self
+                .coop
+                .as_ref()
+                .map(|s| coop::Coop::start(s, self.config.hero)),
             was_driving: false,
             input: Input::default(),
-            pad: pad::Pad::default(),
+            pad: {
+                let mut pad = pad::Pad::default();
+                pad.touch.resize(size.width, size.height);
+                pad
+            },
             mouse_look: false,
             released: false,
             focused,
             alt: false,
             capturing: false,
             culling: !self.double_sided,
+            background: false,
             last: Instant::now(),
             lag: Duration::ZERO,
             fps: (Instant::now(), 0),
@@ -6899,6 +7095,13 @@ impl App {
 
 impl Running {
     fn set_mouse_look(&mut self, on: bool) {
+        // winit has no grab on Android: the activity captures the pointer.
+        #[cfg(target_os = "android")]
+        let grab = {
+            android::capture_pointer(on);
+            Ok::<(), ()>(())
+        };
+        #[cfg(not(target_os = "android"))]
         let grab = if on {
             self.window
                 .set_cursor_grab(CursorGrabMode::Locked)
@@ -6961,6 +7164,9 @@ impl Running {
     /// Advances the simulation by whole ticks (none while the menu is
     /// open) and draws a frame with the HUD.
     fn frame(&mut self, config: &mut Config, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
+        if self.background {
+            return Ok(());
+        }
         let now = Instant::now();
         let dt = (now - self.last).min(MAX_FRAME).as_secs_f64();
         self.read_pad(dt);
@@ -7021,7 +7227,11 @@ impl Running {
                 .and_then(mission::MissionLink::medevac_state);
             state.gui_calls = gui_calls;
             state.pad = self.input.pad();
+            state.stick = self.input.stick();
             info.game = Some(state);
+        }
+        if self.pad.touch.used {
+            info.touch = Some(self.pad.touch.picture());
         }
         let (action, output) = spans::time("hud", || self.hud.build(input, &info, config));
         self.platform_output(output);
@@ -7800,6 +8010,9 @@ impl Running {
             );
         });
         cheats::keep_up(&mut self.game, self.cheats);
+        if let Some(c) = &mut self.coop {
+            c.tick(&mut self.game, &mut self.backend, TICK.as_secs_f32());
+        }
         if let Some(h) = &mut self.hijacks {
             h.place(&mut self.game);
             h.seat(&mut self.game, TICK.as_secs_f32());
@@ -7880,7 +8093,24 @@ impl Running {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
+        // Back from the background: a new surface for the window, and play
+        // goes on from where it waited.
+        if let Some(state) = self.state.as_mut() {
+            if std::mem::take(&mut state.background) {
+                let size = state.window.inner_size();
+                match state
+                    .backend
+                    .resume(state.window.clone(), size.width, size.height)
+                {
+                    Ok(()) => eprintln!("back from the background"),
+                    Err(e) => {
+                        eprintln!("back from the background: no surface ({e}); closing");
+                        event_loop.exit();
+                    }
+                }
+                state.last = Instant::now();
+                state.audio.out.set_paused(false);
+            }
             return;
         }
         match self.start(event_loop) {
@@ -7901,6 +8131,18 @@ impl ApplicationHandler for App {
         if std::mem::take(&mut state.to_front_end) {
             relaunch_front_end();
             event_loop.exit();
+            return;
+        }
+        // A game controller's buttons: Android reports them as keys of its
+        // own, which go to the pad and nowhere else.
+        if let WindowEvent::KeyboardInput { event: key, .. } = &event
+            && let PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Android(code)) =
+                key.physical_key
+            && state
+                .pad
+                .events
+                .key(code, key.state == ElementState::Pressed)
+        {
             return;
         }
         // Alt+Enter toggles fullscreen, as F11 does (the PC convention),
@@ -7933,6 +8175,31 @@ impl ApplicationHandler for App {
             }
             return;
         }
+        // Fingers on the screen in play are the touch controls'; in the
+        // menus and the front end they are egui's (taps as clicks), and
+        // whatever the controls held is let go.
+        if let WindowEvent::Touch(t) = &event {
+            let playing = !state.hud.menu && state.flow.as_ref().is_none_or(|f| !f.holds());
+            if playing {
+                let at = [t.location.x as f32, t.location.y as f32];
+                match t.phase {
+                    winit::event::TouchPhase::Started => state.pad.touch.down(t.id, at),
+                    winit::event::TouchPhase::Moved => state.pad.touch.moved(t.id, at),
+                    winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled => {
+                        state.pad.touch.up(t.id);
+                    }
+                }
+                return;
+            }
+            state.pad.touch.clear();
+            // A tap skips a movie or presses start, as Enter does.
+            if t.phase == winit::event::TouchPhase::Started
+                && !state.hud.menu
+                && let Some(flow) = state.flow.as_mut().filter(|f| f.holds())
+            {
+                flow.tap();
+            }
+        }
         // The menu takes the mouse and keys while it is open (Escape still
         // closes it).
         let to_menu = state.hud.menu
@@ -7951,6 +8218,7 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 state.backend.resize(size.width, size.height);
+                state.pad.touch.resize(size.width, size.height);
                 state.display.resized(&state.window, size);
                 let (sw, sh) = state.backend.size();
                 eprintln!(
@@ -8114,15 +8382,54 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
-        if let (Some(state), DeviceEvent::MouseMotion { delta }) = (self.state.as_mut(), event) {
-            state.input.mouse_motion(delta.0, delta.1);
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        match event {
+            DeviceEvent::MouseMotion { delta } => state.input.mouse_motion(delta.0, delta.1),
+            // A game controller's sticks, triggers and hat (Android's AXIS_*
+            // numbers, from the patched winit of the Android build).
+            DeviceEvent::Motion { axis, value } if cfg!(target_os = "android") => {
+                state.pad.events.axis(axis, value as f32);
+            }
+            _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = &self.state {
-            state.window.request_redraw();
+    /// Android takes the window's surface away when the app goes to the
+    /// background: the renderer lets it go and keeps all else, and play
+    /// waits (no ticks, no sound) until [`resumed`](Self::resumed).
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = self.state.as_mut() {
+            eprintln!("sent to the background: play waits");
+            state.backend.suspend();
+            state.background = true;
+            state.audio.out.set_paused(true);
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        // In the background no frames are asked for, and the loop sleeps
+        // until something happens: play waits.
+        if state.background {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        // With a frame rate cap (the phone's, for its battery), the loop
+        // sleeps out the rest of each frame's time.
+        let cap = self.config.window.max_fps;
+        if cap > 0 {
+            let due = state.last + Duration::from_secs_f64(1.0 / f64::from(cap));
+            if Instant::now() < due {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+                return;
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::Poll);
+        state.window.request_redraw();
     }
 }
 

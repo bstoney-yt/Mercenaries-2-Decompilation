@@ -478,6 +478,11 @@ impl Input {
         self.stick = stick;
     }
 
+    /// The left stick as last set, -1..=1 right and forward.
+    pub fn stick(&self) -> [f32; 2] {
+        self.stick
+    }
+
     /// The left stick pushes towards `action`'s way past half way (or
     /// not): a press as it gets there.
     pub fn set_stick_push(&mut self, action: Action, pushed: bool) {
