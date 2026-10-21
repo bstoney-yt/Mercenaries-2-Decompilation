@@ -565,6 +565,22 @@ impl Autoplay {
             self.next_report = self.clock + REPORT;
             self.report(game);
         }
+        // In a helicopter she can't fly (round 38's AllCon002: boarding at
+        // the HQ she got the Coanda by the tank, which climbed to 62 km):
+        // out, and not that one again.
+        if let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving)
+            && game.scene.vehicles[i].spec.is_helicopter()
+            && !self.leave
+        {
+            eprintln!(
+                "autoplay {:.1} s: in the {}, which she doesn't fly: getting out",
+                self.clock, game.scene.vehicles[i].spec.label
+            );
+            self.leave = true;
+            if !self.left_rides.contains(&i) {
+                self.left_rides.push(i);
+            }
+        }
         let sturdy = |target: &u32| game.scene.props.sturdy.contains(target);
         let striking = matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target))
             || matches!(self.goal, Some(Goal::Deliver(_)));
@@ -1028,7 +1044,7 @@ impl Autoplay {
         let near = |i: usize, within: f32| {
             vehicles
                 .get(i)
-                .is_some_and(|v| !v.wrecked && !v.spec.is_boat())
+                .is_some_and(|v| !v.wrecked && !v.spec.is_boat() && !v.spec.is_helicopter())
                 && !self.left_rides.contains(&i)
                 && vehicle_at(game, i).is_some_and(|t| t.w_axis.truncate().distance(here) < within)
         };
