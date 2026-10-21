@@ -688,7 +688,17 @@ impl Autoplay {
                         .is_some()
                 })
         };
-        let striking = matches!(&self.goal, Some(Goal::Blast { target, at }) if sturdy(target) || (spent && !gun(at)))
+        // Nor while she drives something with a cannon, which fires on it
+        // (PmcCon016 round 4: out of the race's Panhard to call a bomb on a
+        // pylon, and the race ran out).
+        let cannon = game
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| game.scene.vehicles.get(i))
+            .is_some_and(|v| v.spec.cannon());
+        let striking = matches!(&self.goal, Some(Goal::Blast { target, at }) if (sturdy(target) && !cannon) || (spent && !gun(at) && !cannon))
             || matches!(self.goal, Some(Goal::Deliver(_)));
         // A call she is no longer after is put away: the designator goes
         // with a weapon taken up (twice from the satellite's view).
