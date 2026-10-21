@@ -64,6 +64,9 @@ const BLAST_RANGE: (f32, f32) = (15.0, 45.0);
 /// With nothing to blow things up with, she mans an emplaced gun this
 /// near her (metres) that is this near the target (invented).
 const MAN_SEEK: f32 = 80.0;
+/// A sturdy target is shot at with her rifle this long (seconds) before
+/// a strike is called on it (invented).
+const RIFLE_TRY: f32 = 15.0;
 const MANNED_REACH: f32 = 90.0;
 /// With the grenade launcher, whose rounds reach about 40 m.
 const LOB_RANGE: (f32, f32) = (12.0, 32.0);
@@ -424,6 +427,9 @@ pub struct Autoplay {
     blast_spot: Option<(u32, Vec3)>,
     /// The target last logged as one she has nothing to blow up with.
     no_gun_logged: Option<u32>,
+    /// The sturdy target she last shot at with her rifle, and for how
+    /// long (seconds).
+    rifle_on: Option<(u32, f32)>,
     /// With the launcher empty, the C4 she set on what she is blowing up
     /// and when, while she gets clear to set it off.
     planted: Option<f32>,
@@ -704,7 +710,9 @@ impl Autoplay {
             .and_then(|p| p.driving)
             .and_then(|i| game.scene.vehicles.get(i))
             .is_some_and(|v| v.spec.cannon());
-        let striking = matches!(&self.goal, Some(Goal::Blast { target, at }) if (sturdy(target) && !cannon) || (spent && !gun(at) && !cannon))
+        let rifle = matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target) && self.rifle_first(game, *target));
+        let striking = !rifle
+            && matches!(&self.goal, Some(Goal::Blast { target, at }) if (sturdy(target) && !cannon) || (spent && !gun(at) && !cannon))
             || matches!(self.goal, Some(Goal::Deliver(_)));
         // A call she is no longer after is put away: the designator goes
         // with a weapon taken up (twice from the satellite's view).
@@ -795,6 +803,7 @@ impl Autoplay {
             }
             Some(Goal::Reach { at, .. }) => self.travel(game, at, ARRIVE, dt),
             Some(Goal::Shoot(i)) => self.shoot(game, i, dt),
+            Some(Goal::Blast { target, at }) if rifle => self.rifle_at(game, target, at, dt),
             Some(Goal::Blast { at, .. }) if striking => self.strike(game, at, dt),
             Some(Goal::Blast { target, at }) => self.blast(game, target, at, dt),
             Some(Goal::Board(i)) => self.board(game, i, dt),
@@ -1996,6 +2005,62 @@ impl Autoplay {
         }
     }
 
+    /// Whether a sturdy target is shot at with her rifle before a strike
+    /// is called on it: on foot, her weapons out, not yet tried for
+    /// [`RIFLE_TRY`] (the ranges' statues, PmcCon032/034, fall to rounds
+    /// in the game; a gate's doesn't, so the try is short).
+    fn rifle_first(&self, game: &Game, target: u32) -> bool {
+        let on_foot = game
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.driving.is_none() && !p.weapons_away());
+        on_foot
+            && game.combat.manned.is_none()
+            && self
+                .rifle_on
+                .is_none_or(|(t, spent)| t != target || spent < RIFLE_TRY)
+    }
+
+    /// Shooting what stands at `at` with her rifle, from within
+    /// [`SHOOT_RANGE`], once aimed a moment.
+    fn rifle_at(&mut self, game: &mut Game, target: u32, at: Vec3, dt: f32) -> Intent {
+        let Some(p) = game.scene.player.as_ref() else {
+            return Intent::default();
+        };
+        let here = p.character.position;
+        if at.distance(here) > SHOOT_RANGE {
+            return self.walk(game, at, SHOOT_RANGE - 5.0, dt);
+        }
+        let spent = match self.rifle_on {
+            Some((t, s)) if t == target => s + dt,
+            _ => {
+                eprintln!(
+                    "autoplay {:.1} s: shooting {target:#x} with her rifle before calling a strike",
+                    self.clock
+                );
+                dt
+            }
+        };
+        self.rifle_on = Some((target, spent));
+        let (look, error) = aim(p, at, dt);
+        self.steady = if error < ON_TARGET {
+            self.steady + dt
+        } else {
+            0.0
+        };
+        Intent {
+            look,
+            trigger: Trigger {
+                aim: true,
+                fire: self.steady > STEADY,
+                select: (game.combat.weapon != Weapon::Rifle).then_some(Weapon::Rifle),
+                ..Trigger::default()
+            },
+            ..Intent::default()
+        }
+    }
+
     /// Firing the emplaced gun she mans on what stands at `at`, once
     /// aimed a moment.
     fn fire_manned(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
@@ -2076,6 +2141,11 @@ impl Autoplay {
                      {nearest:x?}",
                     self.clock
                 );
+            }
+            // Her weapons out: rounds, which what breaks to them takes
+            // (the ranges' targets, from their damage rows).
+            if !holstered {
+                return self.rifle_at(game, target, at, dt);
             }
         }
         // Going where she can fire from (in range, nothing in the way).

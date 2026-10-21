@@ -2102,10 +2102,24 @@ impl MissionLink {
             // Those standing as models (the gates) fall only to a support
             // strike, which the scripts give her; should they not, one is
             // given her anyway after a while.
+            // Not those whose template's damage row takes rounds (the
+            // ranges' statues and targets, PmcCon032-034): they break to
+            // rounds as the data says, and that destroys them.
+            let fragile = |g: u32| {
+                let (Some((p, _)), Some(w)) = (game.scene.props.get(g), game.scene.world.as_ref())
+                else {
+                    return false;
+                };
+                let db = &w.index.template_db;
+                db.durability
+                    .get(&p.template)
+                    .is_some_and(|d| !d.invincible && d.health > 0.0)
+                    && crate::breakables::Makeup::of(db, p.template).bullet > 0.0
+            };
             let sturdy: HashSet<u32> = targets
                 .iter()
                 .map(|t| t.0)
-                .filter(|&g| game.scene.props.get(g).is_some())
+                .filter(|&g| game.scene.props.get(g).is_some() && !fragile(g))
                 .collect();
             if game
                 .support
@@ -2139,7 +2153,9 @@ impl MissionLink {
                 let blasted = !sturdy.contains(g)
                     && (self.blasts.iter().any(|&b| hit(b, BLAST_PAD))
                         || ram.is_some_and(|r| props.touches(*g, r, RAM_PAD) == Some(true)));
-                if bombed || blasted {
+                // Broken to its wreck (by rounds or a blast's wear).
+                let wrecked = props.get(*g).is_some_and(|(p, _)| p.wrecked);
+                if bombed || blasted || wrecked {
                     if bombed {
                         eprintln!("mission: {g:#x} falls to the bomb");
                     }
