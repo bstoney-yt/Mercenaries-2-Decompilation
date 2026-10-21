@@ -29,6 +29,12 @@
 //! tables tell apart); then, once press-start is up, Enter calls
 //! `startShell` (see [`Native`]).
 //!
+//! Left at the main menu for a minute, the scripts ask for the `attract`
+//! game state and hide their menus; the game plays the attract video over
+//! everything and then takes them back to `Shell` ([`ATTRACT_STATE`]).
+//! Before, nothing played or returned, so the menus stayed hidden behind
+//! black.
+//!
 //! `LTILibName` is the PC version's own library behind its options
 //! screens (video modes, key bindings, the profile): the engine's, not the
 //! scripts'. Its calls are queued for the engine ([`Native::library`]),
@@ -130,6 +136,24 @@ pub fn game_states(
         *state = Some(next.clone());
     }
     log
+}
+
+/// The front end's own game state, which the bootstrap asks for once its
+/// layout has loaded.
+pub const SHELL_STATE: &str = "Shell";
+/// The game state the shell's scripts ask for after a minute at the main
+/// menu with nothing pressed: they hide their menus (the menu movie is
+/// paused and not drawn) and wait for the engine to bring them back.
+pub const ATTRACT_STATE: &str = "attract";
+/// The video the game plays in the attract state (`Movies\attract.bik`).
+/// Inferred: the install's only movie of that name, and nothing else is
+/// drawn then. That the engine returns to `Shell` when it ends or a key
+/// or tap cuts it short is invented (no script asks for it).
+pub const ATTRACT_MOVIE: &str = "attract";
+
+/// Whether the shell's scripts are in the attract game state.
+pub fn in_attract(state: Option<&str>) -> bool {
+    state.is_some_and(|s| s.eq_ignore_ascii_case(ATTRACT_STATE))
 }
 
 /// The character a new game was started as since the last call
@@ -856,6 +880,14 @@ mod tests {
     }
 
     const NO_MODES: [Mode; 0] = [];
+
+    #[test]
+    fn the_attract_state_is_told_apart_from_the_shell() {
+        assert!(in_attract(Some("attract")));
+        assert!(in_attract(Some("Attract")));
+        assert!(!in_attract(Some(SHELL_STATE)));
+        assert!(!in_attract(None));
+    }
 
     #[test]
     fn the_movie_is_set_up_once_and_enter_starts_the_shell_from_press_start() {

@@ -84,6 +84,12 @@ pub struct Flow {
     captured: Vec<crate::input::Control>,
     /// What the shell's menus asked of the game, not yet taken.
     news: crate::pause::News,
+    /// The shell's scripts are in their attract state: its video is up
+    /// (or could not be), over everything.
+    attract: bool,
+    /// The attract video is over: the scripts are to go back to their
+    /// menus ([`HudState::shell_wake`]), with the next frame.
+    wake: bool,
 }
 
 impl Flow {
@@ -124,6 +130,8 @@ impl Flow {
             settings: None,
             captured: Vec::new(),
             news: crate::pause::News::default(),
+            attract: false,
+            wake: false,
         }
     }
 
@@ -174,6 +182,11 @@ impl Flow {
     /// Takes keys for itself (skipping a movie, picking the hero, leaving
     /// the front end).
     pub fn key(&mut self, code: KeyCode) {
+        if self.stage == Stage::FrontEnd && self.attract {
+            // Any key cuts the attract video short; the menus don't see it.
+            self.pressed = true;
+            return;
+        }
         if self.stage == Stage::FrontEnd && self.shell_up() {
             if let Some(c) = flash_code(code) {
                 self.shell_keys.extend([(c, true), (c, false)]);
@@ -203,7 +216,7 @@ impl Flow {
             .shell
             .as_ref()
             .is_some_and(|s| s.ready() && !s.shell().started);
-        if self.stage != Stage::FrontEnd || !self.shell_up() || at_press_start {
+        if self.stage != Stage::FrontEnd || !self.shell_up() || at_press_start || self.attract {
             self.key(KeyCode::Enter);
         }
     }
@@ -314,7 +327,32 @@ impl Flow {
                         eprintln!("flow: the shell starts a new game as {} ({who})", self.hero);
                         return;
                     }
+                    let attract = shell.shell().attract;
                     let wanted = shell.shell().movie.clone();
+                    if attract != self.attract {
+                        self.attract = attract;
+                        self.close(mixer);
+                        if attract {
+                            eprintln!("flow: the shell's menus wait: the attract video plays");
+                            // Letterboxed over everything, once; none to
+                            // play, the menus come straight back.
+                            self.wake = !self.open(crate::shell::ATTRACT_MOVIE, mixer);
+                        } else {
+                            self.wake = false;
+                            eprintln!("flow: the shell's menus are back");
+                        }
+                    }
+                    if self.attract {
+                        let over = self
+                            .movie
+                            .as_mut()
+                            .is_none_or(|m| pressed || m.update(|p| mixer.play(p)));
+                        if over && !self.wake {
+                            self.close(mixer);
+                            self.wake = true;
+                        }
+                        return;
+                    }
                     let up = self.movie.as_ref().map(|m| m.name.clone());
                     match wanted {
                         Some((name, rect)) => {
@@ -458,6 +496,17 @@ impl Flow {
             (state.pointer, state.clicks) = ui
                 .ctx()
                 .input(|i| crate::gamehud::pointer_input(&i.events, i.pointer.latest_pos()));
+            if self.attract {
+                // A click cuts the attract video short, as a key does; the
+                // menus don't see it. Until they are back they are told
+                // to wake each frame (heard only while they wait).
+                if state.clicks.contains(&true) {
+                    self.pressed = true;
+                }
+                state.clicks.clear();
+                state.pointer = None;
+                state.shell_wake = self.wake;
+            }
             s.update(ui.ctx(), state);
         } else if let Some(s) = &mut self.shell {
             // Loading: told the size, so it draws once it is up, and the

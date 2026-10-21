@@ -3259,6 +3259,7 @@ fn front_end_offscreen(
     // `M2_SHELL_PRESS_START`: start the shell from its press-start
     // screen first, the keys counting from then.
     let mut waiting_start = std::env::var_os("M2_SHELL_PRESS_START").is_some();
+    let (mut attract_seen, mut woken) = (false, false);
     loop {
         t += step;
         let since = up_at.map(|u| t - u);
@@ -3352,6 +3353,27 @@ fn front_end_offscreen(
                 }
             }
         }
+        // Left long enough, the menus wait in their attract state (see
+        // `shell::ATTRACT_STATE`): the next key (not 0) or click takes them
+        // back, and they don't see it.
+        let attract = shell.shell().attract;
+        if attract != attract_seen {
+            attract_seen = attract;
+            woken = false;
+            eprintln!(
+                "front end: {} at {t:.1} s",
+                if attract {
+                    "the menus wait in their attract state"
+                } else {
+                    "the menus are back"
+                }
+            );
+        }
+        if attract && (pressed.iter().any(|&(_, down)| down) || clicked.contains(&true)) {
+            woken = true;
+            pressed.clear();
+            clicked.clear();
+        }
         let input = ui::headless_input(w, h, t);
         let state = gamehud::HudState {
             size: [w as f32, h as f32],
@@ -3360,6 +3382,7 @@ fn front_end_offscreen(
             } else {
                 0.0
             },
+            shell_wake: woken,
             keys: pressed,
             pause_settings: settings.clone(),
             pointer,
