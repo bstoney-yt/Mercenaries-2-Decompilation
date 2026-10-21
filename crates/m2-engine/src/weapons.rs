@@ -40,11 +40,13 @@ use crate::tuning::Table;
 const LINK: u32 = 0x5470_4554;
 /// `ControllerVelocity`'s multiple of `Velocity` when a person fires it.
 const HUMAN_BOOST: u32 = 0xf3f6_f0a9;
-/// `ProjectilePhysics`' least damage, and the ranges (metres) over which
-/// a round's damage falls from `Damage` to it: unnamed, read as such by
-/// their values (the carbine round's 15 and 50 m, the shotgun's 5 and 50,
-/// the heavy machine gun's 20 and 300); inferred.
+/// `ProjectilePhysics`' `DamageMinimum`, `DamageDropoffStart` and
+/// `DamageDropoffStop` (metres: the carbine round's 15 and 50 m, the
+/// shotgun's 5 and 50, the heavy machine gun's 20 and 300) and
+/// `DamageDropoff` (names found by hashing, gap-list sweep; before, read
+/// by their values alone). See [`Ammo::damage_at`].
 const DAMAGE_MINIMUM: u32 = 0x33f1_fb12;
+const DAMAGE_DROPOFF: u32 = 0xd698_8c68;
 /// `ProjectilePhysics`' `HeroMultiplier` (name found by hashing guesses,
 /// round 19): the carbine's, rifles', pistols' and machine guns' rounds 3,
 /// the automatic rifle's and light machine gun's 2, the RPG's 1.5, the
@@ -297,6 +299,11 @@ pub struct Ammo {
     pub damage: f32,
     pub damage_min: f32,
     pub falloff: (f32, f32),
+    /// `DamageDropoff`: the share of `Damage` lost over the falloff range
+    /// (the carbine round's 0.1, the shotgun's 0.5, the tank shells' 1;
+    /// 0 on the sniper and anti-material rifles' rounds and every
+    /// rocket).
+    pub dropoff: f32,
     /// `HeroMultiplier`: what the hero's rounds of it do, times `Damage`
     /// (1 where the template gives none).
     pub hero: f32,
@@ -334,15 +341,22 @@ impl Ammo {
         self.blast.or(self.timer_blast)
     }
 
-    /// Its damage at `distance` metres: `Damage` up to the near range,
-    /// `DamageMinimum` from the far one, a straight fall between.
+    /// Its damage at `distance` metres: `Damage` up to
+    /// `DamageDropoffStart`, then falling straight by its `DamageDropoff`
+    /// share of `Damage` by `DamageDropoffStop`, never below
+    /// `DamageMinimum` (nor above `Damage`). Inferred from the names and
+    /// values (gap-list sweep): the carbine round's 6 falls to 5.4 at 50 m
+    /// (it fell to its minimum 3 before), the shotgun's 15 to 7.5, a tank
+    /// shell's 100 to its minimum 50 as before, and a sniper round (0)
+    /// keeps its 60 (it fell to 15 at 100 m before).
     pub fn damage_at(&self, distance: f32) -> f32 {
         let (near, far) = self.falloff;
         if far <= near || distance <= near {
             return self.damage;
         }
         let t = ((distance - near) / (far - near)).clamp(0.0, 1.0);
-        self.damage + (self.damage_min.min(self.damage) - self.damage) * t
+        let floor = self.damage_min.min(self.damage);
+        (self.damage * (1.0 - self.dropoff.clamp(0.0, 1.0) * t)).max(floor)
     }
 }
 
@@ -395,6 +409,14 @@ pub struct WeaponSpec {
     /// How far its aim is helped onto a target (`HumanCameraModifier`),
     /// if its template says.
     pub assist: Option<AimAssist>,
+    /// How it sets her camera (`HumanCameraModifier`), if its template
+    /// says.
+    pub camera: Option<CameraFeel>,
+    /// Its scope's magnifications, least and most (`WeaponScope`'s
+    /// `MinZoomLevel` and `MaxZoomLevel`, names found by hashing, gap-list
+    /// sweep: the sniper rifles' 4 and 8, the anti-material rifle's 5 and
+    /// 10; no other gun has a scope).
+    pub scope: Option<(f32, f32)>,
 }
 
 /// A gun's aim assist, from its `HumanCameraModifier`: the named fields
@@ -457,6 +479,27 @@ impl AimAssist {
     }
 }
 
+/// How a gun sets her camera, from its `HumanCameraModifier` (names found
+/// by hashing, gap round 1; values from samples, gap-list sweep: 44
+/// records, 14 distinct). `FOV` is 1 on every one; `CrouchFov` 0.4 (the
+/// Combat Rifle, the Laser Designator) to 0.9 (the Machine Pistol), the
+/// sniper rifles 0.5. Read as shares of the lens' field of view standing
+/// and aiming (inferred: "crouch" is the game's word for the aimed stance,
+/// the pad layout's LT, and the scoped guns narrow most). The look speeds
+/// (`YawSpeed`, `PitchSpeed`; `CrouchYawSpeed`, `CrouchPitchSpeed`), 0.35
+/// (RPG) to 1.5 (pistols) standing and 0.25 to 0.95 aiming, read as
+/// shares of her turning speed (inferred). `CameraShakeScale` is 1 on
+/// every record and `RotationSpeed` a whole 3: not read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraFeel {
+    /// The lens' share standing and aiming (`FOV`, `CrouchFov`).
+    pub fov: f32,
+    pub aim_fov: f32,
+    /// Turning speed shares, sideways and up, standing and aiming.
+    pub look: [f32; 2],
+    pub aim_look: [f32; 2],
+}
+
 /// `HumanCameraModifier`'s aim-assist fields ([`AimAssist`]).
 const ASSIST: &str = "AimAssist";
 const ASSIST_CLOSE: [&str; 2] = ["HorizontalAimAssistClose", "VerticalAimAssistClose"];
@@ -507,7 +550,52 @@ pub struct FireHint {
     /// `BurstOffCloseLength` 0.75); below 0, as far off.
     pub on_close: f32,
     pub off_close: f32,
+    /// How well it does against a target of no, light, medium and heavy
+    /// armour, 0 to 3 (`ArmorNone`, `ArmorLight`, `ArmorMedium`,
+    /// `ArmorHeavy`: four 2-bit fields of one word, names found by hashing,
+    /// gap-list sweep). The carbine's 3, 1, 0, 0; the pistol's 2, 0, 0, 0;
+    /// the AT rocket's 1, 3, 3, 3; the Stinger's 1, 3, 2, 0. Read as the
+    /// AI's rating of the gun by its target (inferred from the names and
+    /// the values: rifles against people, launchers against armour). Not
+    /// used: which armour class a vehicle or a person is has not been
+    /// read.
+    pub against: [u32; 4],
 }
+// Also in `WeaponHint`, named by hashing (gap-list sweep) and not read:
+// `SingleShotWeapon` (@20: 1 on the 31 records whose `BurstOnLength` is
+// 0 but the rocket pod's, so already one round a burst). Unnamed: the
+// small whole numbers at @0 (1 to 3), @4 (1 to 3) and @24 (1 on the
+// guided missiles only).
+
+/// A launcher a soldier carries beside his gun (an `EquipmentLink` to a
+/// weapon firing rockets or missiles: the AT soldiers' `AT Rocket`), and
+/// how he fires it: its `WeaponHint` (when to reach for it, by the
+/// [`FireHint::against`] ratings) and its round.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NpcLauncher {
+    pub template: u32,
+    pub hint: FireHint,
+    pub ammo: Ammo,
+    /// Its shots' sound set and flash.
+    pub feel: Feel,
+}
+
+impl NpcLauncher {
+    /// Gun `w`'s, if it fires rockets flying straight or homing and its
+    /// template gives a `WeaponHint`.
+    pub fn of(w: &WeaponSpec) -> Option<Self> {
+        matches!(w.flight(), Flight::Straight | Flight::Homing).then_some(())?;
+        Some(Self {
+            template: w.template,
+            hint: w.hint?,
+            ammo: w.ammo,
+            feel: w.feel,
+        })
+    }
+}
+
+/// `WeaponHint`'s armour ratings ([`FireHint::against`]).
+const AGAINST: [&str; 4] = ["ArmorNone", "ArmorLight", "ArmorMedium", "ArmorHeavy"];
 
 impl FireHint {
     /// Within this of its target, metres, a soldier fires the close
@@ -526,6 +614,7 @@ impl FireHint {
             off: f("BurstOffLength")?,
             on_close: f("BurstOnCloseLength")?,
             off_close: f("BurstOffCloseLength")?,
+            against: AGAINST.map(|n| hint.word(r, name_hash(n)).unwrap_or(0)),
         })
     }
 
@@ -943,6 +1032,7 @@ impl Parts<'_> {
                 p(FALLOFF_NEAR).unwrap_or(0.0),
                 p(FALLOFF_FAR).unwrap_or(0.0),
             ),
+            dropoff: p(DAMAGE_DROPOFF).unwrap_or(1.0),
             hero: p(HERO_MULTIPLIER).filter(|m| *m > 0.0).unwrap_or(1.0),
             key: self.damage_key(id),
             blast,
@@ -983,12 +1073,26 @@ pub fn read(db: &Layer<'_>) -> Arms {
     let sound = Table::new(db, "SoundEffect");
     let ui = Table::new(db, "WeaponUI");
     let camera = Table::new(db, "HumanCameraModifier");
+    let scope = Table::new(db, "WeaponScope");
+    let scope_of = |id: u32| {
+        let f = |name: &str| Parts::float(&scope, id, name_hash(name)).filter(|v| *v > 0.0);
+        Some((f("MinZoomLevel")?, f("MaxZoomLevel")?))
+    };
     let assist_of = |id: u32| {
         let f = |name: &str| Parts::float(&camera, id, name_hash(name));
         Some(AimAssist {
             level: Parts::first(&camera, id, name_hash(ASSIST))?,
             close: [f(ASSIST_CLOSE[0])?, f(ASSIST_CLOSE[1])?],
             far: [f(ASSIST_FAR[0])?, f(ASSIST_FAR[1])?],
+        })
+    };
+    let camera_of = |id: u32| {
+        let f = |name: &str| Parts::float(&camera, id, name_hash(name)).filter(|v| *v > 0.0);
+        Some(CameraFeel {
+            fov: f("FOV")?,
+            aim_fov: f("CrouchFov")?,
+            look: [f("YawSpeed")?, f("PitchSpeed")?],
+            aim_look: [f("CrouchYawSpeed")?, f("CrouchPitchSpeed")?],
         })
     };
     let name_of = |id: u32| names.get(&id).map_or(String::new(), |n| (*n).to_owned());
@@ -1058,6 +1162,8 @@ pub fn read(db: &Layer<'_>) -> Arms {
                         })
                     })(),
                     assist: assist_of(id),
+                    camera: camera_of(id),
+                    scope: scope_of(id),
                 },
             ))
         })
@@ -1332,6 +1438,7 @@ mod tests {
             damage,
             damage_min: min,
             falloff,
+            dropoff: 1.0,
             hero: 1.0,
             key: None,
             blast: None,
@@ -1366,6 +1473,8 @@ mod tests {
                 hint: None,
                 ui: None,
                 assist: None,
+                camera: None,
+                scope: None,
             },
             nodes: vec![Some(0)],
         }
@@ -1397,14 +1506,35 @@ mod tests {
         assert_eq!(machine_gun(&[]), MachineGun::StandIn);
     }
 
-    // The carbine round: 6 out to 15 m, 3 from 50 m; 340 m/s from her
-    // hands, under its 300 m/s most.
+    // The carbine round: 6 out to 15 m, a tenth less by 50 m; 340 m/s
+    // from her hands, under its 300 m/s most. A round whose dropoff is
+    // whole falls to its minimum; one of 0 keeps its damage.
     #[test]
     fn a_round_falls_off_with_range_and_flies_at_its_human_speed() {
-        let a = ammo(6.0, 3.0, (15.0, 50.0));
+        assert_eq!(
+            [DAMAGE_DROPOFF, DAMAGE_MINIMUM, FALLOFF_NEAR, FALLOFF_FAR],
+            [
+                "DamageDropoff",
+                "DamageMinimum",
+                "DamageDropoffStart",
+                "DamageDropoffStop"
+            ]
+            .map(name_hash)
+        );
+        let a = Ammo {
+            dropoff: 0.1,
+            ..ammo(6.0, 3.0, (15.0, 50.0))
+        };
         assert_eq!(a.damage_at(10.0), 6.0);
-        assert!((a.damage_at(32.5) - 4.5).abs() < 1e-4);
-        assert_eq!(a.damage_at(80.0), 3.0);
+        assert!((a.damage_at(32.5) - 5.7).abs() < 1e-4);
+        assert!((a.damage_at(80.0) - 5.4).abs() < 1e-4);
+        let shell = ammo(100.0, 50.0, (25.0, 300.0));
+        assert_eq!(shell.damage_at(300.0), 50.0);
+        let sniper = Ammo {
+            dropoff: 0.0,
+            ..ammo(60.0, 15.0, (50.0, 100.0))
+        };
+        assert_eq!(sniper.damage_at(100.0), 60.0);
         assert_eq!(a.human_speed(), 300.0);
     }
 
@@ -1451,6 +1581,17 @@ mod tests {
         assert_eq!(SCATTER_FIELDS[0], name_hash("LowSkillScatter"));
     }
 
+    // The armour ratings' names hash as the fields of `WeaponHint`'s word
+    // at 8 (bits 0, 2, 4 and 6).
+    #[test]
+    fn the_armour_ratings_are_named() {
+        assert_eq!(
+            AGAINST.map(name_hash),
+            [0xa421_1ea4, 0x1e14_e116, 0xccdc_6fc3, 0x3fc0_56f3]
+        );
+        assert_eq!(name_hash("SingleShotWeapon"), 0xdfd7_d1dd);
+    }
+
     // The carbine's and the minigun's bursts (their `WeaponHint`s).
     #[test]
     fn bursts_follow_the_hint() {
@@ -1462,6 +1603,7 @@ mod tests {
             off: 4.5,
             on_close: -1.0,
             off_close: 0.75,
+            against: [3, 1, 0, 0],
         };
         let gap = 60.0 / 562.0;
         // 0.3 s at 562 a minute: rounds at 0, 0.107 and 0.214 s.
@@ -1526,6 +1668,8 @@ mod tests {
             hint: None,
             ui: None,
             assist: None,
+            camera: None,
+            scope: None,
         };
         let arms = Arms {
             weapons: HashMap::from([(7, spec)]),

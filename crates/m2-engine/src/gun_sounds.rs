@@ -17,8 +17,10 @@
 //! (`weapon_fire_tail`, a row most sets have) when it stops. The grapple's
 //! set answers its own events (`grapple_fire`, `grapple_attach`,
 //! `grapple_reel`, `grapple_reel_loop`, `grapple_loop`,
-//! `grapple_release`); [`GRAPPLE_FIRE`] is its shot. One event
-//! (`a639af36`, a cue of the `ui_hud` bank on most sets) is not named.
+//! `grapple_release`); [`GRAPPLE_FIRE`] is its shot. [`EQUIP_PICKUP`]
+//! (`a639af36`, a cue of the `ui_hud` bank on most sets) plays as the gun
+//! is taken up (name found by hashing guesses, gap-list sweep: one hit in
+//! 22,243 tries).
 //! `Param` is [`ANY`] on most rows. The assault rifles' NPC shot (set
 //! `7473fe68`, which hashes as `assaultrifle`) has six rows keyed
 //! `variant_1` to `variant_6` instead, giving three cues (records 11, 12
@@ -40,6 +42,16 @@
 //! cues; how the game numbers a shooter's variant is invented here (a
 //! number of theirs, modulo the variants the set has). Not checked
 //! against the game's code.
+//!
+//! 7 of the 66 firing and reload cues the table names find no sound
+//! (gap-list sweep, `firecues` example): no cue table in `vz.wad`,
+//! `shell.wad`, `English.wad` or `Loading.wad` has a record for them.
+//! They are two `weapon_fire_tail` cues shared by 27 sets (272 guns), the
+//! miniguns' `weapon_loop_npc`, the RPG family's and the shotgun's
+//! `reload`, and the shots of two sets no weapon template uses. In the
+//! data they sound of nothing; the alpha plays nothing for them either
+//! (a shot of theirs would fall back to the rifle's, but no gun fires
+//! those two sets).
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
@@ -62,6 +74,9 @@ pub const GRAPPLE_FIRE: &str = "grapple_fire";
 /// Its gun reloaded: a row of the [`ANY`] set's, keyed by the set in
 /// `Param` ([`GunCues::reload`]).
 pub const RELOAD: &str = "reload";
+/// Its gun taken up off the ground: an interface sound (a cue of the
+/// `ui_hud` bank on most sets; named by hashing, gap-list sweep).
+pub const EQUIP_PICKUP: &str = "equip_pickup";
 
 /// Each sound set's cue per event.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -246,14 +261,49 @@ impl GunCues {
         self.cues.is_empty()
     }
 
+    /// The sets and events (name hashes) that play cue `cue`, sorted; a
+    /// reload's event is [`RELOAD`]'s.
+    pub fn uses_of(&self, cue: u32) -> Vec<(u32, u32)> {
+        let reload = name_hash(RELOAD);
+        let mut out: Vec<(u32, u32)> = self
+            .cues
+            .iter()
+            .filter(|(_, c)| **c == cue)
+            .map(|(&k, _)| k)
+            .chain(
+                self.variants
+                    .iter()
+                    .filter(|(_, v)| v.contains(&cue))
+                    .map(|(&k, _)| k),
+            )
+            .chain(
+                self.reloads
+                    .iter()
+                    .filter(|(_, c)| **c == cue)
+                    .map(|(&set, _)| (set, reload)),
+            )
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Every cue a gun plays as it fires (shots, the NPC shot's variants,
-    /// loops and tails) and reloads, each once, in order: what to read ahead so that
+    /// loops and tails), is taken up and reloads, each once, in order: what to read ahead so that
     /// no first shot waits on its cue.
     pub fn firing_cues(&self) -> Vec<u32> {
-        let events: Vec<u32> = [FIRE, FIRE_NPC, LOOP, LOOP_NPC, FIRE_TAIL, GRAPPLE_FIRE]
-            .iter()
-            .map(|e| name_hash(e))
-            .collect();
+        let events: Vec<u32> = [
+            FIRE,
+            FIRE_NPC,
+            LOOP,
+            LOOP_NPC,
+            FIRE_TAIL,
+            GRAPPLE_FIRE,
+            EQUIP_PICKUP,
+        ]
+        .iter()
+        .map(|e| name_hash(e))
+        .collect();
         let mut out: Vec<u32> = self
             .cues
             .iter()
@@ -384,6 +434,26 @@ mod tests {
         assert!((shot_gain(1.0, db(-18.4)) - 2.0).abs() < 1e-6);
         assert!((shot_gain(1.0, db(0.0)) - 0.5).abs() < 1e-6);
         assert_eq!(shot_gain(0.9, 0.0), 0.9);
+    }
+
+    // A cue's users: the tail shared by two sets, a reload, a variant.
+    #[test]
+    fn a_cues_users_are_its_sets_and_events() {
+        let (minigun, carbine, ak) = (0x624c_0986, 0x01b4_7c45, 0x7473_fe68);
+        let tail = name_hash(FIRE_TAIL);
+        assert_eq!(tail, 0x4504_59d9);
+        let cues = GunCues::from_rows([
+            [minigun, tail, ANY, 0x0bb3_1676],
+            [carbine, tail, ANY, 0x0bb3_1676],
+            [ANY, name_hash(RELOAD), carbine, 0x176b_614b],
+            [ak, name_hash(FIRE_NPC), variant_key(1), 0x33a0_71cc],
+        ]);
+        let mut both = vec![(carbine, tail), (minigun, tail)];
+        both.sort_unstable();
+        assert_eq!(cues.uses_of(0x0bb3_1676), both);
+        assert_eq!(cues.uses_of(0x176b_614b), [(carbine, name_hash(RELOAD))]);
+        assert_eq!(cues.uses_of(0x33a0_71cc), [(ak, name_hash(FIRE_NPC))]);
+        assert!(cues.uses_of(1).is_empty());
     }
 
     // What is read ahead: every firing event's cue, the NPC variants and

@@ -485,6 +485,7 @@ impl Templates {
             list: Vec::new(),
             ai: self.ai.get(&id).copied(),
             gun: self.rifle_of(id).map(|(_, g)| g),
+            launcher: self.launcher_of(id),
             cycle: None,
         })
     }
@@ -599,14 +600,39 @@ impl Templates {
     }
 
     /// The rifle template id `id`'s `EquipmentLink`s hand it, as
-    /// [`own_rifle`](Self::own_rifle) finds it by name.
+    /// [`own_rifle`](Self::own_rifle) finds it by name. A template handed
+    /// no gun that fires while the trigger is held gets the first that
+    /// fires rounds one shot a pull (gap-list sweep: 64 of the 257 people
+    /// with an `Accuracy` carry only a pistol, the shotgun or a sniper
+    /// rifle, and were played with the stand-in Assault Rifle); the
+    /// heroes' lists all start with their rifle, so theirs is unchanged.
     pub fn rifle_of(&self, id: u32) -> Option<(&str, HandGun)> {
-        let gun = self
-            .equipment
+        let list = self.equipment.get(&id)?;
+        let gun = list
+            .iter()
+            .find_map(|t| self.guns.get(t).copied())
+            .or_else(|| {
+                list.iter()
+                    .filter_map(|t| self.arms.weapons.get(t))
+                    .find(|w| {
+                        w.semi
+                            && w.rate_of_fire > 0.0
+                            && w.flight() == crate::weapons::Flight::Round
+                    })
+                    .map(HandGun::from_spec)
+            })?;
+        Some((self.names.get(&gun.template)?.as_str(), gun))
+    }
+
+    /// The first launcher template id `id`'s `EquipmentLink`s hand it
+    /// ([`crate::weapons::NpcLauncher`]): 33 of the 257 people with an
+    /// `Accuracy` carry one.
+    pub fn launcher_of(&self, id: u32) -> Option<crate::weapons::NpcLauncher> {
+        self.equipment
             .get(&id)?
             .iter()
-            .find_map(|t| self.guns.get(t))?;
-        Some((self.names.get(&gun.template)?.as_str(), *gun))
+            .filter_map(|t| self.arms.weapons.get(t))
+            .find_map(crate::weapons::NpcLauncher::of)
     }
 
     /// The gun template `name` (`Carbine`), whatever its case.
@@ -939,6 +965,14 @@ const NOT_TEMPLATES: [&str; 16] = [
     "LandingZone",
 ];
 
+/// Whether a state layer's entity with component `c` (one of
+/// [`NOT_TEMPLATES`] or [`NOT_PROPS`]) is left out of its models for it:
+/// all are but a junction that blows up (`destructible`: it has a
+/// `DestructionLink`), a bridge's segment.
+fn leaves_out(c: &str, destructible: bool) -> bool {
+    !(c == "RoadIntersection" && destructible)
+}
+
 /// A place the game starts or puts the player: the static layers'
 /// `<name>_Start<n>` entities, such as each headquarters'
 /// `Starter_<hq>_Start1` and each contract's `<contract>_Start1`
@@ -1013,6 +1047,9 @@ pub struct SpawnPoint {
     /// The rifle its template's `EquipmentLink`s hand it
     /// ([`Templates::rifle_of`]); `None` when they hand it none.
     pub gun: Option<HandGun>,
+    /// A launcher its `EquipmentLink`s hand it as well
+    /// ([`Templates::launcher_of`]).
+    pub launcher: Option<crate::weapons::NpcLauncher>,
     /// For a spawner: its `SecondsPerCycle`, how long after its last one
     /// fell it sends another.
     pub cycle: Option<f32>,
@@ -1696,6 +1733,7 @@ impl WorldIndex {
                 list: people_of(id, p),
                 ai,
                 gun: templates.rifle_of(p.parent).map(|(_, g)| g),
+                launcher: templates.launcher_of(p.parent),
                 cycle: own_spawners
                     .get(&id)
                     .or_else(|| templates.population.spawners.get(&p.parent))
@@ -2052,12 +2090,29 @@ impl WorldIndex {
         let placements = layer.placements();
         let models = layer.hashes("ModelName");
         let names = layer.names();
+        // A road piece that blows up is a model too: ChiCon002's three
+        // `_maracaibo_bridge_segmenta` (`RoadIntersection` and
+        // `DestructionLink`, the only 3 of the state layers' 32 junctions
+        // with a `DestructionLink`; from the install).
+        let destructible: HashSet<u32> = layer
+            .component("DestructionLink")
+            .map(|c| c.records().unwrap_or_default())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(entity, _)| entity)
+            .collect();
         let not_props: HashSet<u32> = NOT_TEMPLATES
             .iter()
             .chain(&NOT_PROPS)
-            .filter_map(|c| layer.component(c))
-            .flat_map(|c| c.records().unwrap_or_default())
-            .map(|(entity, _)| entity)
+            .filter_map(|c| layer.component(c).map(|r| (*c, r)))
+            .flat_map(|(c, r)| {
+                r.records()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(move |(entity, _)| (c, entity))
+            })
+            .filter(|&(c, entity)| leaves_out(c, destructible.contains(&entity)))
+            .map(|(_, entity)| entity)
             .collect();
         for (&entity, p) in &placements {
             if not_props.contains(&entity) || p.position[1] < HIDDEN_BELOW {
@@ -2712,6 +2767,89 @@ pub fn low_res_tile<R: Read + Seek>(
 mod tests {
     use super::*;
 
+    fn gun(template: u32, semi: bool, blast: bool) -> crate::weapons::WeaponSpec {
+        let b = crate::weapons::Blast {
+            template: 99,
+            radius: 2.0,
+            damage: 40.0,
+            min_damage: 0.0,
+            max_force: 0.0,
+            key: None,
+        };
+        crate::weapons::WeaponSpec {
+            template,
+            name: format!("gun {template}"),
+            model: Some(template + 100),
+            class: None,
+            semi,
+            rate_of_fire: 150.0,
+            clip: 8,
+            reserve_clips: 4,
+            pellets: 1,
+            rounds_per_reload: 0,
+            scatter: 1.0,
+            ammo: crate::weapons::Ammo {
+                template: template + 200,
+                velocity: 42.5,
+                max_velocity: 300.0,
+                human_boost: 8.0,
+                gravity: 0.0,
+                damage: 10.0,
+                damage_min: 5.0,
+                falloff: (15.0, 50.0),
+                dropoff: 1.0,
+                hero: 1.0,
+                key: Some(7),
+                blast: blast.then_some(b),
+                timer: None,
+                timer_blast: None,
+                homing: None,
+                model: None,
+                sticky: false,
+            },
+            lock_on: None,
+            pickup: None,
+            feel: Default::default(),
+            hint: None,
+            ui: None,
+            assist: None,
+            camera: None,
+            scope: None,
+        }
+    }
+
+    // A soldier listed only a launcher and a pistol carries the pistol;
+    // one listed a rifle as well carries the rifle, whatever comes first.
+    #[test]
+    fn a_bridge_segment_is_a_model_but_other_junctions_are_not() {
+        // ChiCon002's `_maracaibo_bridge_segmenta`: a junction that blows up.
+        assert!(!leaves_out("RoadIntersection", true));
+        assert!(leaves_out("RoadIntersection", false));
+        // Whatever else it has that isn't a prop still leaves it out.
+        assert!(leaves_out("Path", true));
+        assert!(leaves_out("Ai", true));
+    }
+
+    #[test]
+    fn a_soldier_without_a_rifle_carries_his_pistol() {
+        let mut t = Templates::default();
+        for (id, name) in [(1, "RPG"), (2, "Pistol"), (3, "Assault Rifle")] {
+            t.names.insert(id, name.to_owned());
+        }
+        t.arms.weapons.insert(1, gun(1, true, true));
+        t.arms.weapons.insert(2, gun(2, true, false));
+        let rifle = HandGun::from_spec(&gun(3, false, false));
+        t.guns.insert(3, rifle);
+        t.equipment.insert(10, vec![1, 2]);
+        t.equipment.insert(11, vec![2, 3]);
+        t.equipment.insert(12, vec![1]);
+        let (name, pistol) = t.rifle_of(10).unwrap();
+        assert_eq!((name, pistol.template, pistol.damage), ("Pistol", 2, 10.0));
+        assert_eq!(pistol.damage_key, Some(7));
+        assert_eq!(t.rifle_of(11).map(|g| g.0), Some("Assault Rifle"));
+        assert_eq!(t.rifle_of(12), None);
+    }
+
     #[test]
     fn blockers_for_the_ai_alone_go_by_their_name() {
         assert!(ai_collision("_marsh_bridgemid_AIcollision"));
@@ -3132,6 +3270,7 @@ impl WorldIndex {
                     list: list.clone(),
                     ai: None,
                     gun: None,
+                    launcher: None,
                     cycle: None,
                 });
             }

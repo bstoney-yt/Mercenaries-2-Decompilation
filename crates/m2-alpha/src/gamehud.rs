@@ -907,11 +907,16 @@ impl HudState {
             saving: game.save_icon > 0.0,
             hero: Some((game.scene.hero, game.combat.max_hp)),
             binoculars: game.walking().and_then(|p| {
-                p.binoculars.map(|b| binoculars::View {
-                    zoom: b.zoom,
-                    heading: binoculars::wrap_degrees(game.view_heading().to_degrees()),
-                    pitch: p.pitch.to_degrees(),
-                })
+                let scope = p.scope.map(|z| (z.round().clamp(1.0, 255.0) as u8, true));
+                p.binoculars
+                    .map(|b| (b.zoom, false))
+                    .or(scope)
+                    .map(|(zoom, sniper)| binoculars::View {
+                        zoom,
+                        sniper,
+                        heading: binoculars::wrap_degrees(game.view_heading().to_degrees()),
+                        pitch: p.pitch.to_degrees(),
+                    })
             }),
             ..Self::default()
         }
@@ -2361,6 +2366,12 @@ impl Thread {
                 Command::StopSound { at: None, cue } => {
                     self.pause_native.command("Sound.Stop", &cue);
                 }
+                // The pause menu's music (`MrxSound.EnterPauseState`) and
+                // the silence after it (`ExitPauseState`).
+                Command::Music(cue) => {
+                    log.push(format!("pause: the scripts' score {cue:?}"));
+                    self.pause_native.music(cue);
+                }
                 _ => {}
             }
         }
@@ -2439,11 +2450,13 @@ impl Thread {
             }
             Some(keep)
         } else if state.binoculars.is_some() {
-            // Through the binoculars only their screen shows: the scripts
-            // put the HUD to sleep (`ToggleHud(owner, false, "scope")`),
-            // which leaves some of it awake here.
+            // Through the binoculars (or her gun's scope) only their screen
+            // shows: the scripts put the HUD to sleep (`ToggleHud(owner,
+            // false, "scope")`), which leaves some of it awake here. The
+            // layout's two trees answer the same events, "Binoculars" and,
+            // with `bSniper`, "Sniper Scope" (`MrxGuiSniperScope`).
             Some(widgets_under(&screen.borrow(), &names, |n| {
-                n == "Binoculars"
+                n == "Binoculars" || n == "Sniper Scope"
             }))
         } else {
             state.support.satellite.map(|_| {
@@ -3751,9 +3764,9 @@ impl Thread {
             Ok(t)
         };
         match (was, s.binoculars) {
-            (None, Some(_)) => {
+            (None, Some(v)) => {
                 let t = event("BinocularsEnter")?;
-                t.set("bSniper", false)?;
+                t.set("bSniper", v.sniper)?;
                 let n = gui_runtime::fire(lua, "BinocularsEnter", t)?;
                 log.push(format!("binoculars: up ({n} handlers)"));
             }
