@@ -169,6 +169,10 @@ const CARGO_NEAR: f32 = 100.0;
 const GUARD_MOST: f32 = 90.0;
 const ONCOMING_SIDE: f32 = 3.0;
 const ONCOMING_SECONDS: f32 = 3.0;
+/// In a boat, as far as she goes in this long, and what goes slower than
+/// this (m/s) counts as standing (invented).
+const BOAT_AHEAD_SECONDS: f32 = 5.0;
+const CRAWLING: f32 = 3.0;
 /// She steers round a vehicle standing within this ahead, metres
 /// (invented).
 const AHEAD_STANDING: f32 = 20.0;
@@ -2752,12 +2756,21 @@ fn vantage(
 /// within [`ONCOMING_SIDE`] of her line is, if one is (GurCon003 round 83:
 /// her race boat ran into a fishing boat turning on its path at 23 m/s).
 fn standing_ahead(game: &Game, i: usize, m: Mat4, speed: f32) -> Option<f32> {
-    let reach = AHEAD_STANDING.max(speed.abs() * ONCOMING_SECONDS);
+    // A boat, slow to stop, looks further, and takes one crawling for
+    // standing (GurCon003 rounds 84 and 86: a fishing boat at 1 to 3 m/s
+    // on its path, met at 31 m/s).
+    let boat = game.scene.vehicles.get(i).is_some_and(|v| v.spec.is_boat());
+    let (seconds, still) = if boat {
+        (BOAT_AHEAD_SECONDS, CRAWLING)
+    } else {
+        (ONCOMING_SECONDS, PARKED_SPEED)
+    };
+    let reach = AHEAD_STANDING.max(speed.abs() * seconds);
     let to_local = m.inverse();
     (0..game.scene.vehicles.len())
         .filter(|&j| j != i)
         .filter_map(|j| vehicle_state(game, j))
-        .filter(|(_, speed)| speed.abs() <= PARKED_SPEED)
+        .filter(|(_, speed)| speed.abs() <= still)
         .map(|(t, _)| to_local.transform_point3(t.w_axis.truncate()))
         .filter(|l| l.z > 0.0 && l.z < reach && l.x.abs() < ONCOMING_SIDE)
         .min_by(|a, b| a.z.total_cmp(&b.z))
