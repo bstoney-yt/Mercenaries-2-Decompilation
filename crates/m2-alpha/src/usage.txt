@@ -27,6 +27,11 @@ m2-alpha [options]
                          switch does: the flow completes each story
                          contract it unlocks before it, then this one
                          starts as in play (at its briefing with ,briefing)
+                         A job (AllJob002...) is tracked on the PDA's map,
+                         and --autoplay keeps to it
+  --job-near <m>         with --skip-to a job: once it is tracked, she is
+                         put this far from its nearest target (a test
+                         shortcut past the drive across the island)
   --movies               with --mission --screenshot: the scripts' movies
                          wait; each is decoded offscreen and pictured
                          (<out>-movie-<name>.ppm)

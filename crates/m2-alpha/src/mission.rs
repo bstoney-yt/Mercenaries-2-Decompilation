@@ -1096,6 +1096,15 @@ impl MissionLink {
         self.job.as_ref()
     }
 
+    /// With a job to follow: she is put this far from its nearest target
+    /// once it is tracked (`--job-near`).
+    pub fn with_job_near(mut self, near: Option<f32>) -> Self {
+        if let Some(job) = &mut self.job {
+            job.near = near;
+        }
+        self
+    }
+
     /// Stocks and calls in these support items once the scripts run.
     pub fn with_support(self, support: Vec<String>) -> Self {
         Self { support, ..self }
@@ -1440,6 +1449,17 @@ impl MissionLink {
                     eprintln!("mission: she starts at the scripts' spawn point {name} ({at:.1})");
                 }
             }
+        }
+        // The job she follows, tracked: put near its nearest target once
+        // (`--job-near`, a test shortcut past the drive there).
+        if let Some(job) = &mut self.job
+            && let Some((name, at)) = job.start_near(mission, game.focus())
+            && let Some(p) = game.scene.player.as_mut()
+        {
+            p.drop_at(at);
+            p.driving = None;
+            p.chase_target = None;
+            eprintln!("jobs: test shortcut: she starts at {at:.1}, near {name}");
         }
         // The vehicle she was seated in never came: ashore instead.
         if self.vehicles.boarding > 0 {

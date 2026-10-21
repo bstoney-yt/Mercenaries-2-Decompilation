@@ -154,6 +154,9 @@ struct Options {
     /// With `--mission`: the story skipped to this contract the game's
     /// developer way, and whether to its briefing (`--skip-to <id>[,briefing]`).
     skip_to: Option<(String, bool)>,
+    /// With `--skip-to` a job: she is put this far from its nearest
+    /// target once it is tracked (`--job-near <m>`, a test shortcut).
+    job_near: Option<f32>,
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
@@ -532,6 +535,7 @@ fn parse_args() -> anyhow::Result<Options> {
                     None => (v, false),
                 });
             }
+            "--job-near" => o.job_near = Some(value()?.parse()?),
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
@@ -3499,7 +3503,8 @@ fn mission_for_screenshot(
         .with_support(options.support.clone())
         .with_movies(options.movies)
         .with_skip_mode_off(options.skip_mode_off)
-        .with_skip_to(options.skip_to.clone());
+        .with_skip_to(options.skip_to.clone())
+        .with_job_near(options.job_near);
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);

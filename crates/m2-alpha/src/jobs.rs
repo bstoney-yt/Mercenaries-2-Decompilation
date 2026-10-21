@@ -32,6 +32,10 @@ pub struct JobRun {
     said: (i64, bool),
     /// Seconds since the quarry was chosen.
     since_chosen: f32,
+    /// She is put this far from its nearest target once it is tracked
+    /// (`--job-near`, a test shortcut), and whether she has been.
+    pub near: Option<f32>,
+    placed: bool,
 }
 
 /// Seconds between choosing the quarry again (invented).
@@ -143,6 +147,34 @@ impl JobRun {
             self.said = now;
         }
         lines
+    }
+
+    /// Once it is tracked, with [`near`](Self::near) set: where to put
+    /// her, that far from its nearest target (or quarry) on her side of
+    /// it, and the target's name. Once only; not if she is that near
+    /// already.
+    pub fn start_near(&mut self, mission: &Mission, her: Vec3) -> Option<(String, Vec3)> {
+        let near = self.near?;
+        if self.placed || !self.tracked {
+            return None;
+        }
+        let w = mission.world().borrow();
+        let (name, at) = self
+            .view
+            .targets
+            .iter()
+            .chain(&self.quarry)
+            .filter_map(|g| {
+                let o = w.objects.get(g)?;
+                Some((o.name.clone(), Vec3::from(o.position)))
+            })
+            .min_by(|a, b| a.1.distance(her).total_cmp(&b.1.distance(her)))?;
+        self.placed = true;
+        let flat = (her - at).with_y(0.0);
+        if flat.length() <= near * 2.0 {
+            return None;
+        }
+        Some((name, at + flat.normalize() * near + Vec3::Y * 2.0))
     }
 
     /// Of `marks`, those for this job: its targets' (a verify mark stays
