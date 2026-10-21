@@ -600,6 +600,8 @@ pub struct Mission {
     movie_out: bool,
     /// How black `MrxGui`'s fade has the screen ([`FADE`]), 0 to 1.
     black: f32,
+    /// [`FADE`], compiled once (on the first tick) rather than every tick.
+    fade: Option<mlua::Function>,
 }
 
 impl Mission {
@@ -742,6 +744,7 @@ impl Mission {
             flown: false,
             movie_out: false,
             black: 0.0,
+            fade: None,
         };
         mission.settle("set-up");
         Ok(mission)
@@ -988,13 +991,23 @@ impl Mission {
                 ),
             });
         }
-        match self
-            .host
-            .lua()
-            .load(FADE)
-            .set_name("=m2 fade")
-            .call::<f32>((dt, FADE_WIPE))
-        {
+        if self.fade.is_none() {
+            match self
+                .host
+                .lua()
+                .load(FADE)
+                .set_name("=m2 fade")
+                .into_function()
+            {
+                Ok(f) => self.fade = Some(f),
+                Err(e) => self.log.push(format!(
+                    "  t={now:.1} fade: {}",
+                    first_lines(&e.to_string())
+                )),
+            }
+        }
+        let faded = self.fade.as_ref().map(|f| f.call::<f32>((dt, FADE_WIPE)));
+        match faded.unwrap_or(Ok(self.black)) {
             Ok(b) => {
                 if (b >= 1.0) != (self.black >= 1.0) {
                     self.log.push(format!(
@@ -2929,6 +2942,50 @@ mod tests {
         )
         .unwrap();
         assert!(m.crews_aboard().is_empty());
+    }
+
+    #[test]
+    fn each_crew_aboard_is_its_own_objects_riders_by_object() {
+        // Two crewed objects at once (the HQ's starter and the villa's
+        // tank): each lists only its own riders, the objects in guid
+        // order, with others (the island's) about that ride nothing.
+        let hq = Entity {
+            guid: 0xc73ad,
+            name: "HqInterior".into(),
+            crew: vec![("a651ff78".into(), "Fiona Taylor".into())],
+            ..villa_tank()
+        };
+        let tank = villa_tank();
+        let mut data = GameData::default();
+        data.layers
+            .insert("layers".into(), vec![tank.clone(), hq.clone()]);
+        let m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        for g in 0x1000..0x1400 {
+            m.world()
+                .borrow_mut()
+                .insert(g, crate::api::Object::new("VZ Soldier", [0.0; 3]));
+        }
+        place(m.world(), &[tank, hq], true);
+        let aboard = m.crews_aboard();
+        let objects: Vec<u32> = aboard.iter().map(|a| a.0).collect();
+        assert_eq!(objects, [0xc73ad, 0xfaa53]);
+        let seats = |i: usize| -> Vec<(String, String)> {
+            let mut s: Vec<_> = aboard[i]
+                .1
+                .iter()
+                .map(|(seat, _, t)| (seat.clone(), t.clone()))
+                .collect();
+            s.sort();
+            s
+        };
+        assert_eq!(seats(0), [("a651ff78".into(), "Fiona Taylor".into())]);
+        assert_eq!(
+            seats(1),
+            [
+                ("seat_driver".into(), "VZ Tank Commander".into()),
+                ("seat_gunner".into(), "VZ Soldier".into()),
+            ]
+        );
     }
 
     #[test]

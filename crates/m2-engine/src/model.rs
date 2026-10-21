@@ -549,12 +549,37 @@ fn alpha_holds_x(t: &DecodedTexture) -> bool {
     spread(3) > spread(0)
 }
 
+/// How many of a large texture's top mips [`upload_texture`] leaves out
+/// ([`set_texture_drop`]).
+static TEXTURE_DROP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Textures this size or smaller (both sides) keep every mip.
+pub const TEXTURE_DROP_ABOVE: u32 = 256;
+
+/// Has [`upload_texture`] leave out the top `mips` of each texture larger
+/// than [`TEXTURE_DROP_ABOVE`], as a phone needs: each mip left out
+/// quarters its memory and the memory traffic of drawing it (sampled by
+/// position, it maps the same, softer). Invented, not the game's.
+pub fn set_texture_drop(mips: u32) {
+    TEXTURE_DROP.store(mips, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many top mips of a `width` x `height` texture are left out with
+/// `drop` asked for: while it stays over [`TEXTURE_DROP_ABOVE`].
+fn mips_dropped(width: u32, height: u32, drop: u32) -> u32 {
+    let mut n = 0;
+    while n < drop && (width >> n).max(height >> n) > TEXTURE_DROP_ABOVE {
+        n += 1;
+    }
+    n
+}
+
 /// Uploads a decoded texture, generating any mips its chain lacks.
 pub fn upload_texture(
     backend: &mut dyn RenderBackend,
     t: &DecodedTexture,
 ) -> Result<(TextureHandle, bool), BackendError> {
-    let desc = TextureDesc {
+    let full = TextureDesc {
         width: t.width,
         height: t.height,
         format: if t.linear {
@@ -564,13 +589,27 @@ pub fn upload_texture(
         },
     };
     let generated;
-    let mips: Vec<&[u8]> = if t.mips.len() as u32 == desc.full_chain_len() {
+    let mips: Vec<&[u8]> = if t.mips.len() as u32 == full.full_chain_len() {
         t.mips.iter().map(Vec::as_slice).collect()
     } else {
         generated = generate_mips(t.width, t.height, &t.mips[0]);
         generated.iter().map(Vec::as_slice).collect()
     };
-    Ok((backend.create_texture(&desc, &mips)?, t.alpha))
+    let drop = mips_dropped(
+        t.width,
+        t.height,
+        TEXTURE_DROP.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    let (width, height) = full.mip_size(drop);
+    let desc = TextureDesc {
+        width,
+        height,
+        ..full
+    };
+    Ok((
+        backend.create_texture(&desc, &mips[drop as usize..])?,
+        t.alpha,
+    ))
 }
 
 /// One primitive group, ready to upload.
@@ -1658,6 +1697,31 @@ impl GpuModel {
 mod tests {
     use super::*;
     use m2_render::NullBackend;
+
+    #[test]
+    fn a_phone_drops_top_mips_only_while_the_texture_stays_over_256() {
+        assert_eq!(mips_dropped(1024, 1024, 0), 0);
+        assert_eq!(mips_dropped(1024, 1024, 1), 1);
+        assert_eq!(mips_dropped(1024, 512, 2), 2);
+        // 512 to 256, and no further.
+        assert_eq!(mips_dropped(512, 512, 3), 1);
+        assert_eq!(mips_dropped(256, 256, 1), 0);
+        assert_eq!(mips_dropped(64, 1024, 1), 1);
+        // What is left is a whole chain of the smaller size.
+        let full = TextureDesc {
+            width: 1024,
+            height: 512,
+            format: TextureFormat::Rgba8Srgb,
+        };
+        let (w, h) = full.mip_size(1);
+        let left = TextureDesc {
+            width: w,
+            height: h,
+            ..full
+        };
+        assert_eq!((w, h), (512, 256));
+        assert_eq!(left.full_chain_len(), full.full_chain_len() - 1);
+    }
 
     fn material(name_hash: u32, texture: u32) -> Material {
         Material {

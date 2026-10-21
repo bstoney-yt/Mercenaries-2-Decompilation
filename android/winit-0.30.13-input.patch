@@ -1,0 +1,134 @@
+diff -ru a/src/platform_impl/android/mod.rs b/src/platform_impl/android/mod.rs
+--- a/src/platform_impl/android/mod.rs
++++ b/src/platform_impl/android/mod.rs
+@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{mpsc, Arc, Mutex};
+ use std::time::{Duration, Instant};
+ 
+-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction};
++use android_activity::input::{
++    Axis, Button, InputEvent, KeyAction, Keycode, MotionAction, Source,
++};
+ use android_activity::{
+     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
+ };
+@@ -373,6 +375,119 @@ impl<T: 'static> EventLoop<T> {
+     {
+         let mut input_status = InputStatus::Handled;
+         match event {
++            // A mouse (a phone in DeX, a tablet with one paired): the
++            // cursor, its buttons and wheel, and its raw motion (the
++            // relative axes, or the event itself while the pointer is
++            // captured), as on the desktop. Upstream reports it as touches.
++            InputEvent::MotionEvent(motion_event)
++                if matches!(motion_event.source(), Source::Mouse | Source::MouseRelative) =>
++            {
++                let window_id = window::WindowId(WindowId);
++                let device_id = event::DeviceId(DeviceId(motion_event.device_id()));
++                let captured = motion_event.source() == Source::MouseRelative;
++                let pointer = motion_event.pointer_at_index(0);
++                match motion_event.action() {
++                    MotionAction::Move | MotionAction::HoverMove => {
++                        let (dx, dy) = if captured {
++                            (pointer.x(), pointer.y())
++                        } else {
++                            (pointer.axis_value(Axis::RelativeX), pointer.axis_value(Axis::RelativeY))
++                        };
++                        if dx != 0.0 || dy != 0.0 {
++                            let event = event::Event::DeviceEvent {
++                                device_id,
++                                event: event::DeviceEvent::MouseMotion {
++                                    delta: (dx as f64, dy as f64),
++                                },
++                            };
++                            callback(event, self.window_target());
++                        }
++                        if !captured {
++                            let event = event::Event::WindowEvent {
++                                window_id,
++                                event: event::WindowEvent::CursorMoved {
++                                    device_id,
++                                    position: PhysicalPosition {
++                                        x: pointer.x() as _,
++                                        y: pointer.y() as _,
++                                    },
++                                },
++                            };
++                            callback(event, self.window_target());
++                        }
++                    },
++                    action @ (MotionAction::ButtonPress | MotionAction::ButtonRelease) => {
++                        let button = match motion_event.action_button() {
++                            Button::Primary => Some(event::MouseButton::Left),
++                            Button::Secondary => Some(event::MouseButton::Right),
++                            Button::Tertiary => Some(event::MouseButton::Middle),
++                            Button::Back => Some(event::MouseButton::Back),
++                            Button::Forward => Some(event::MouseButton::Forward),
++                            _ => None,
++                        };
++                        if let Some(button) = button {
++                            let state = if action == MotionAction::ButtonPress {
++                                event::ElementState::Pressed
++                            } else {
++                                event::ElementState::Released
++                            };
++                            let event = event::Event::WindowEvent {
++                                window_id,
++                                event: event::WindowEvent::MouseInput { device_id, state, button },
++                            };
++                            callback(event, self.window_target());
++                        }
++                    },
++                    MotionAction::Scroll => {
++                        let event = event::Event::WindowEvent {
++                            window_id,
++                            event: event::WindowEvent::MouseWheel {
++                                device_id,
++                                delta: event::MouseScrollDelta::LineDelta(
++                                    pointer.axis_value(Axis::Hscroll),
++                                    pointer.axis_value(Axis::Vscroll),
++                                ),
++                                phase: event::TouchPhase::Moved,
++                            },
++                        };
++                        callback(event, self.window_target());
++                    },
++                    // Down and up come with a button press or release.
++                    _ => {},
++                }
++            },
++            // A game controller's sticks, triggers and hat: each axis as a
++            // device motion, its id Android's AXIS_* number (the buttons
++            // come as keys). Upstream reports them as touches.
++            InputEvent::MotionEvent(motion_event)
++                if motion_event.source().is_joystick_class() =>
++            {
++                let device_id = event::DeviceId(DeviceId(motion_event.device_id()));
++                let pointer = motion_event.pointer_at_index(0);
++                for axis in [
++                    Axis::X,
++                    Axis::Y,
++                    Axis::Z,
++                    Axis::Rz,
++                    Axis::Rx,
++                    Axis::Ry,
++                    Axis::HatX,
++                    Axis::HatY,
++                    Axis::Ltrigger,
++                    Axis::Rtrigger,
++                    Axis::Gas,
++                    Axis::Brake,
++                ] {
++                    let event = event::Event::DeviceEvent {
++                        device_id,
++                        event: event::DeviceEvent::Motion {
++                            axis: u32::from(axis),
++                            value: pointer.axis_value(axis) as f64,
++                        },
++                    };
++                    callback(event, self.window_target());
++                }
++            },
+             InputEvent::MotionEvent(motion_event) => {
+                 let window_id = window::WindowId(WindowId);
+                 let device_id = event::DeviceId(DeviceId(motion_event.device_id()));

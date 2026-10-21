@@ -39,6 +39,9 @@
 //! `--fight` she shoots the nearest soldier, fires a rocket at a vehicle and
 //! throws a grenade.
 
+mod aim;
+#[cfg(target_os = "android")]
+mod android;
 mod autoplay;
 mod binoculars;
 mod breakables;
@@ -90,6 +93,7 @@ mod startup;
 mod strikes;
 mod subtitles;
 mod support;
+mod touch;
 mod traffic;
 mod ui;
 
@@ -108,7 +112,9 @@ use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, Window, WindowId};
+#[cfg(not(target_os = "android"))]
+use winit::window::CursorGrabMode;
+use winit::window::{Window, WindowId};
 
 use camera::FlyCamera;
 use config::Config;
@@ -465,14 +471,14 @@ fn registry_install() -> Option<Install> {
         .find_map(|dir| Install::find(std::path::Path::new(&dir)).ok())
 }
 
-fn parse_args() -> anyhow::Result<Options> {
+fn parse_args(given: &[String]) -> anyhow::Result<Options> {
     let mut o = Options {
         skip_mode_off: true,
         coop_seconds: 30.0,
         ..Options::default()
     };
     let (mut coop_role, mut coop_local, mut coop_name) = (None, false, None);
-    let mut args = std::env::args().skip(1);
+    let mut args = given.iter().cloned();
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
         match arg.as_str() {
@@ -867,8 +873,8 @@ fn parse_args() -> anyhow::Result<Options> {
         "--coop-local",
         "--name",
     ];
-    if std::env::args()
-        .skip(1)
+    if given
+        .iter()
         .all(|a| !a.starts_with("--") || PLAIN.contains(&a.as_str()))
     {
         o.alpha = true;
@@ -937,9 +943,21 @@ const PLACED_CHECK_EVERY: f32 = 5.0;
 /// are hit before they are, seconds: for the contract's layers to be in.
 const PROPS_CHECK_AFTER: f32 = 20.0;
 
+// The Android build's entry point is `android::android_main`.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
-    let mut options = parse_args()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    run(&args, EventLoop::new)
+}
+
+/// The game, given its arguments and how to make its event loop (the
+/// Android build hands over the activity's).
+fn run(
+    args: &[String],
+    event_loop: impl FnOnce() -> Result<EventLoop<()>, winit::error::EventLoopError>,
+) -> anyhow::Result<()> {
+    let mut options = parse_args(args)?;
     combat::use_attach_frame(!options.hands_grip);
     let config_path = options
         .config_path
@@ -1041,7 +1059,7 @@ fn main() -> anyhow::Result<()> {
         return screenshot(&config, install.as_ref(), &mode, &options, out);
     }
 
-    let event_loop = EventLoop::new()?;
+    let event_loop = event_loop()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
         config,
@@ -6807,6 +6825,8 @@ struct Running {
     /// the next one pressed goes to it, not to play.
     capturing: bool,
     culling: bool,
+    /// In the background (Android): no surface to draw to, and play waits.
+    background: bool,
     last: Instant,
     lag: Duration,
     fps: (Instant, u32),
@@ -6915,6 +6935,14 @@ impl App {
             WgpuBackend::for_window(window.clone(), size.width, size.height, w.vsync)?;
         let adapter = backend.adapter_summary();
         eprintln!("adapter: {adapter:?}");
+        backend.set_render_scale(w.render_scale);
+        backend.set_light_shadows(cfg!(target_os = "android"));
+        if w.render_scale < 1.0 {
+            eprintln!(
+                "render scale: the world drawn at {:.2} of the window",
+                w.render_scale
+            );
+        }
         let mut game = build_scene(
             &mut backend,
             self.install.as_ref(),
@@ -6967,13 +6995,18 @@ impl App {
                 .map(|s| coop::Coop::start(s, self.config.hero)),
             was_driving: false,
             input: Input::default(),
-            pad: pad::Pad::default(),
+            pad: {
+                let mut pad = pad::Pad::default();
+                pad.touch.resize(size.width, size.height);
+                pad
+            },
             mouse_look: false,
             released: false,
             focused,
             alt: false,
             capturing: false,
             culling: !self.double_sided,
+            background: false,
             last: Instant::now(),
             lag: Duration::ZERO,
             fps: (Instant::now(), 0),
@@ -7035,6 +7068,13 @@ impl App {
 
 impl Running {
     fn set_mouse_look(&mut self, on: bool) {
+        // winit has no grab on Android: the activity captures the pointer.
+        #[cfg(target_os = "android")]
+        let grab = {
+            android::capture_pointer(on);
+            Ok::<(), ()>(())
+        };
+        #[cfg(not(target_os = "android"))]
         let grab = if on {
             self.window
                 .set_cursor_grab(CursorGrabMode::Locked)
@@ -7097,6 +7137,9 @@ impl Running {
     /// Advances the simulation by whole ticks (none while the menu is
     /// open) and draws a frame with the HUD.
     fn frame(&mut self, config: &mut Config, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
+        if self.background {
+            return Ok(());
+        }
         let now = Instant::now();
         let dt = (now - self.last).min(MAX_FRAME).as_secs_f64();
         self.read_pad(dt);
@@ -7157,7 +7200,11 @@ impl Running {
                 .and_then(mission::MissionLink::medevac_state);
             state.gui_calls = gui_calls;
             state.pad = self.input.pad();
+            state.stick = self.input.stick();
             info.game = Some(state);
+        }
+        if self.pad.touch.used {
+            info.touch = Some(self.pad.touch.picture());
         }
         let (action, output) = spans::time("hud", || self.hud.build(input, &info, config));
         self.platform_output(output);
@@ -8019,7 +8066,24 @@ impl Running {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
+        // Back from the background: a new surface for the window, and play
+        // goes on from where it waited.
+        if let Some(state) = self.state.as_mut() {
+            if std::mem::take(&mut state.background) {
+                let size = state.window.inner_size();
+                match state
+                    .backend
+                    .resume(state.window.clone(), size.width, size.height)
+                {
+                    Ok(()) => eprintln!("back from the background"),
+                    Err(e) => {
+                        eprintln!("back from the background: no surface ({e}); closing");
+                        event_loop.exit();
+                    }
+                }
+                state.last = Instant::now();
+                state.audio.out.set_paused(false);
+            }
             return;
         }
         match self.start(event_loop) {
@@ -8040,6 +8104,18 @@ impl ApplicationHandler for App {
         if std::mem::take(&mut state.to_front_end) {
             relaunch_front_end();
             event_loop.exit();
+            return;
+        }
+        // A game controller's buttons: Android reports them as keys of its
+        // own, which go to the pad and nowhere else.
+        if let WindowEvent::KeyboardInput { event: key, .. } = &event
+            && let PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Android(code)) =
+                key.physical_key
+            && state
+                .pad
+                .events
+                .key(code, key.state == ElementState::Pressed)
+        {
             return;
         }
         // Alt+Enter toggles fullscreen, as F11 does (the PC convention),
@@ -8072,6 +8148,31 @@ impl ApplicationHandler for App {
             }
             return;
         }
+        // Fingers on the screen in play are the touch controls'; in the
+        // menus and the front end they are egui's (taps as clicks), and
+        // whatever the controls held is let go.
+        if let WindowEvent::Touch(t) = &event {
+            let playing = !state.hud.menu && state.flow.as_ref().is_none_or(|f| !f.holds());
+            if playing {
+                let at = [t.location.x as f32, t.location.y as f32];
+                match t.phase {
+                    winit::event::TouchPhase::Started => state.pad.touch.down(t.id, at),
+                    winit::event::TouchPhase::Moved => state.pad.touch.moved(t.id, at),
+                    winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled => {
+                        state.pad.touch.up(t.id);
+                    }
+                }
+                return;
+            }
+            state.pad.touch.clear();
+            // A tap skips a movie or presses start, as Enter does.
+            if t.phase == winit::event::TouchPhase::Started
+                && !state.hud.menu
+                && let Some(flow) = state.flow.as_mut().filter(|f| f.holds())
+            {
+                flow.tap();
+            }
+        }
         // The menu takes the mouse and keys while it is open (Escape still
         // closes it).
         let to_menu = state.hud.menu
@@ -8090,6 +8191,7 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 state.backend.resize(size.width, size.height);
+                state.pad.touch.resize(size.width, size.height);
                 state.display.resized(&state.window, size);
                 let (sw, sh) = state.backend.size();
                 eprintln!(
@@ -8253,15 +8355,54 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
-        if let (Some(state), DeviceEvent::MouseMotion { delta }) = (self.state.as_mut(), event) {
-            state.input.mouse_motion(delta.0, delta.1);
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        match event {
+            DeviceEvent::MouseMotion { delta } => state.input.mouse_motion(delta.0, delta.1),
+            // A game controller's sticks, triggers and hat (Android's AXIS_*
+            // numbers, from the patched winit of the Android build).
+            DeviceEvent::Motion { axis, value } if cfg!(target_os = "android") => {
+                state.pad.events.axis(axis, value as f32);
+            }
+            _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = &self.state {
-            state.window.request_redraw();
+    /// Android takes the window's surface away when the app goes to the
+    /// background: the renderer lets it go and keeps all else, and play
+    /// waits (no ticks, no sound) until [`resumed`](Self::resumed).
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = self.state.as_mut() {
+            eprintln!("sent to the background: play waits");
+            state.backend.suspend();
+            state.background = true;
+            state.audio.out.set_paused(true);
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        // In the background no frames are asked for, and the loop sleeps
+        // until something happens: play waits.
+        if state.background {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        // With a frame rate cap (the phone's, for its battery), the loop
+        // sleeps out the rest of each frame's time.
+        let cap = self.config.window.max_fps;
+        if cap > 0 {
+            let due = state.last + Duration::from_secs_f64(1.0 / f64::from(cap));
+            if Instant::now() < due {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+                return;
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::Poll);
+        state.window.request_redraw();
     }
 }
 

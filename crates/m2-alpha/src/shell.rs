@@ -160,6 +160,9 @@ pub fn hero(character: &str) -> Option<crate::hero::Hero> {
 pub struct Native {
     /// The movie has been told the platform.
     set_up: bool,
+    /// The saves as the game last told them ([`Native::calls`]): told
+    /// others, they are listed again (the movie's own deletes aside).
+    told_saves: Vec<crate::pause::SaveEntry>,
     /// The press-start screen is up (`pressStartEnabled`), waiting for a
     /// key.
     press_start: bool,
@@ -218,6 +221,7 @@ impl Native {
     pub fn calls(&mut self, settings: &Settings) -> Vec<Call> {
         let mut calls = Vec::new();
         if !std::mem::replace(&mut self.set_up, true) {
+            self.told_saves = settings.saves.clone();
             self.settings = settings.clone();
             self.editing = settings.clone();
             self.table = KeyScreen::new(settings.keys.clone());
@@ -233,6 +237,17 @@ impl Native {
             calls.extend(self.setting_calls());
             calls.extend(self.save_calls());
             calls.extend(self.table.fill());
+        } else if settings.saves != self.told_saves {
+            // The saves came after the movie was set up (the front end's
+            // first frames run before they are told it), or changed (a
+            // game saved): listed again, so Continue and Load Game offer
+            // them. Set up with none, the menu greyed Continue for good.
+            // (Compared with what was told, not the movie's list: one it
+            // deleted stays gone while the game's list catches up.)
+            self.told_saves = settings.saves.clone();
+            self.settings.saves = settings.saves.clone();
+            self.editing.saves = settings.saves.clone();
+            calls.extend(self.save_calls());
         }
         calls.append(&mut self.pending);
         calls
@@ -956,6 +971,38 @@ mod tests {
         assert_eq!(names(n.calls(&s)), ["saveCompleteContinue"]);
         assert!(n.command("onlineSaveProfile", "true"));
         assert!(n.calls(&s).is_empty());
+    }
+
+    #[test]
+    fn saves_told_after_the_movie_is_set_up_are_listed_then() {
+        // The front end's first frames set the movie up before the saves
+        // are told (Continue stayed greyed: playtest on the phone).
+        let mut n = Native::default();
+        let none = Settings::default();
+        let first = names(n.calls(&none));
+        assert!(first.contains(&"clearSaveGames"));
+        assert!(!first.contains(&"addSaveGame"));
+        let told = Settings {
+            saves: vec![save(0, 3), save(1, 1)],
+            ..Settings::default()
+        };
+        assert_eq!(
+            names(n.calls(&told)),
+            ["clearSaveGames", "addSaveGame", "addSaveGame"]
+        );
+        // Once listed, not again while they stay the same.
+        assert!(names(n.calls(&told)).is_empty());
+        // And the movie's own load check lists them too.
+        assert!(n.command("preoperation", "load,continue"));
+        assert_eq!(
+            names(n.calls(&told)),
+            [
+                "clearSaveGames",
+                "addSaveGame",
+                "addSaveGame",
+                "preopComplete"
+            ]
+        );
     }
 
     #[test]
