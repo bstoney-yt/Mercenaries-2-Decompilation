@@ -1722,6 +1722,10 @@ impl MissionLink {
         let honks = game.take_honks();
         if honks > 0 {
             mission.honk();
+            eprintln!(
+                "horn: she honks; the faction gates hear her for {} s",
+                m2_game::api::HONK_HEARD
+            );
             call_allies(game, mission, self.vehicles.riding);
         }
         let riding = game.scene.player.as_ref().and_then(|p| p.driving);
