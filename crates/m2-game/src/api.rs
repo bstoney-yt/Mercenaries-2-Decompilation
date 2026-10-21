@@ -2513,7 +2513,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&pg, "UnloadAsset", |_, _, _| values([]))?;
     // Pg.AddContextAction(guid, text[, reach, ...]) and
-    // Pg.RemoveContextAction(guid): see [`ContextAction`].
+    // Pg.RemoveContextAction(guid): see [`ContextAction`]. Both return
+    // true for an object: an action objective ASSERTs what they return
+    // (`MrxTaskObjectiveAction`; inferred that they succeed).
     add(&pg, "AddContextAction", |w, _, a| {
         let (Some(guid), Some(Value::String(text))) = (id(a.first()), a.get(1)) else {
             return values([]);
@@ -2526,11 +2528,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 reach,
             },
         );
-        values([])
+        values([Value::Boolean(true)])
     })?;
     add(&pg, "RemoveContextAction", |w, _, a| {
         if let Some(guid) = id(a.first()) {
             w.context_actions.remove(&guid);
+            return values([Value::Boolean(true)]);
         }
         values([])
     })?;

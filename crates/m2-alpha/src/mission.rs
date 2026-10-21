@@ -636,6 +636,9 @@ enum State {
 /// The mission scripts and what they want shown.
 pub struct MissionLink {
     state: State,
+    /// The contract's unmarked action targets last logged
+    /// ([`contract_marks`](Self::contract_marks)).
+    acts_logged: std::cell::RefCell<Vec<u32>>,
     /// The flow's movies wait for the game to play them
     /// ([`Mission::hold_movies`]); otherwise they end at once.
     movies: bool,
@@ -823,6 +826,7 @@ impl MissionLink {
         Self {
             state: State::Loading(rx),
             movies: false,
+            acts_logged: Default::default(),
             end_skip: false,
             subtitles: true,
             tutorials: true,
@@ -1481,23 +1485,29 @@ impl MissionLink {
         // The scripts' context actions (the HQ's exits, a starter's talk):
         // the one she stands at is offered, and taken with the use key.
         if let Some(g) = game.context_taken.take() {
-            let text = mission.context_text(g).unwrap_or_default();
-            mission.take_context_action(g);
-            // The verify objective's prompts no script answers: the engine
-            // subdues a knocked-down target, and picks a subdued one up
-            // (from the scripts: `MrxTaskObjectiveVerify` offers them and
-            // waits on the states; who acts on them is inferred).
-            if let Some(n) = game
-                .scene
-                .people
-                .npcs
-                .iter_mut()
-                .find(|n| n.spawn == Some(g))
-            {
-                if text.eq_ignore_ascii_case("[ContextAction.Subdue]") && n.subdue() {
-                    eprintln!("mission: she subdues {g:#x}");
-                } else if text.eq_ignore_ascii_case("[ContextAction.Carry]") && n.carry(true) {
-                    eprintln!("mission: she picks {g:#x} up");
+            if game.aboard == Some(g) {
+                leave_ride(game, mission, g);
+            } else if rides(game, mission).iter().any(|r| r.0 == g) {
+                board_ride(game, mission, g);
+            } else {
+                let text = mission.context_text(g).unwrap_or_default();
+                mission.take_context_action(g);
+                // The verify objective's prompts no script answers: the engine
+                // subdues a knocked-down target, and picks a subdued one up
+                // (from the scripts: `MrxTaskObjectiveVerify` offers them and
+                // waits on the states; who acts on them is inferred).
+                if let Some(n) = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter_mut()
+                    .find(|n| n.spawn == Some(g))
+                {
+                    if text.eq_ignore_ascii_case("[ContextAction.Subdue]") && n.subdue() {
+                        eprintln!("mission: she subdues {g:#x}");
+                    } else if text.eq_ignore_ascii_case("[ContextAction.Carry]") && n.carry(true) {
+                        eprintln!("mission: she picks {g:#x} up");
+                    }
                 }
             }
         }
@@ -1755,8 +1765,40 @@ impl MissionLink {
                 (g, person.or(at), text, reach)
             })
             .collect();
-        let offered = on_foot.and_then(|at| nearest_context(&actions, at));
-        let offered = offered.map(|(g, id)| (g, mission.text(&id)));
+        // Riding in a scripts' helicopter its pilot flies: she is where
+        // it is, and the use key takes her out again.
+        if let Some(g) = game.aboard {
+            let at = mission
+                .world()
+                .borrow()
+                .objects
+                .get(&g)
+                .filter(|o| o.alive)
+                .map(|o| Vec3::from(o.position));
+            match (at, game.scene.player.as_mut()) {
+                (Some(at), Some(p)) => {
+                    p.character.position = at;
+                    p.character.velocity = Vec3::ZERO;
+                }
+                _ => leave_ride(game, mission, g),
+            }
+        }
+        let offered = match game.aboard {
+            Some(g) => Some((g, RIDE_OUT.to_owned())),
+            None => on_foot
+                .and_then(|at| nearest_context(&actions, at))
+                .map(|(g, id)| (g, mission.text(&id)))
+                .or_else(|| {
+                    let at = on_foot?;
+                    rides(game, mission)
+                        .into_iter()
+                        .find(|(_, p)| {
+                            p.with_y(0.0).distance(at.with_y(0.0)) <= RIDE_REACH
+                                && (p.y - at.y).abs() <= CONTEXT_RISE
+                        })
+                        .map(|(g, _)| (g, RIDE_IN.to_owned()))
+                }),
+        };
         if offered != game.context {
             match &offered {
                 Some((g, text)) => eprintln!("context: {text:?} offered at {g:#x}"),
@@ -1951,6 +1993,13 @@ impl MissionLink {
             mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
             look(game, mission, &mut self.sighted);
             mission.tick(f64::from(STEP));
+            // The scripts' own interface runs too: its animations finish
+            // and their callbacks run (`MrxGuiCinematic.ShowMovie` plays
+            // a cutscene's movie only once its fade-in animation is done,
+            // and the contract waits on the movie's end: PmcCon002's
+            // 10_BRV_J and PmcCon003's 12_CAR_J never ended, rounds 23
+            // and 28).
+            m2_game::gui_runtime::tick(mission.lua(), f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
                 match &c {
@@ -2584,12 +2633,56 @@ impl MissionLink {
             Some(MarkFor::Index(i)) => *i == index,
             None => false,
         };
+        // The markers put up for the contract by name come first. The
+        // objectives on the PDA count by the contract's index, which the
+        // jobs' objectives shown during it share (round 20: PmcCon003's
+        // "Get inside the PMC!" passed over for OilJob008's targets).
+        let named =
+            |m: &Mark| matches!(&m.mission, Some(MarkFor::Id(i)) if i.eq_ignore_ascii_case(&id));
         // A verify marker stays to do once its person is dead: the body is
         // verified (round 13: General Peng shot, then left for the jobs).
-        if marks
+        let to_do = |m: &Mark| m.alive || m.kind == "verify";
+        let acts = self.contract_actions();
+        if *self.acts_logged.borrow() != acts {
+            eprintln!("mission: {id}'s action targets now {acts:x?}");
+            *self.acts_logged.borrow_mut() = acts.clone();
+        }
+        if marks.iter().any(|m| to_do(m) && named(m)) {
+            return marks.into_iter().filter(named).collect();
+        }
+        // None up for the contract: its active action objectives' targets,
+        // which the scripts put no marker or blip over (PmcCon003's "Get
+        // inside the PMC!" on `PlayerLocation_PMC`, round 16: she went
+        // after the jobs' markers instead).
+        let State::Running(mission) = &self.state else {
+            return marks;
+        };
+        let w = mission.world().borrow();
+        let found: Vec<Mark> = acts
             .iter()
-            .any(|m| (m.alive || m.kind == "verify") && ours(m))
-        {
+            .filter_map(|&g| {
+                // An entity the layers name but don't place as an object
+                // (`PlayerLocation_PMC` in `vz_base`): at its entity's place.
+                let (name, at, alive) = match w.objects.get(&g) {
+                    Some(o) => (o.name.clone(), o.position, o.alive),
+                    None => (format!("{g:#x}"), *w.entities.get(&g)?, true),
+                };
+                Some(Mark {
+                    target: g,
+                    kind: "action".to_owned(),
+                    name,
+                    at: Vec3::from(at),
+                    alive,
+                    mission: Some(MarkFor::Index(index)),
+                    secondary: false,
+                })
+            })
+            .collect();
+        drop(w);
+        if !found.is_empty() {
+            return found;
+        }
+        if marks.iter().any(|m| to_do(m) && ours(m)) {
             return marks.into_iter().filter(ours).collect();
         }
         // None named for it (a race's jetski, whose marker's mission
@@ -2600,6 +2693,39 @@ impl MissionLink {
         } else {
             marks
         }
+    }
+
+    /// The targets of the current contract's active action objectives
+    /// (`MrxTaskObjectiveAction`, their `_uTgtObjFilter`), from the
+    /// scripts' own tasks.
+    fn contract_actions(&self) -> Vec<u32> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        let found = match mission
+            .lua()
+            .load(CONTRACT_ACTIONS)
+            .set_name("=contract actions")
+            .eval::<Option<mlua::Table>>()
+        {
+            Ok(found) => found,
+            Err(e) => {
+                eprintln!(
+                    "mission: contract actions: {}",
+                    m2_game::mission::first_lines(&e.to_string())
+                );
+                return Vec::new();
+            }
+        };
+        found
+            .into_iter()
+            .flat_map(|t| {
+                t.sequence_values::<mlua::Value>()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .filter_map(|v| m2_game::events::as_guid(&v))
+            .collect()
     }
 
     /// Where the things are that the scripts wait for her to see
@@ -2771,6 +2897,60 @@ fn nearest_context(
         })
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, &g, text)| (g, text.clone()))
+}
+
+/// A scripts' helicopter with its own pilot that an action objective's
+/// marker is over (PmcCon003's "Board the Lucky Lady",
+/// `MrxTaskObjectiveEnterVehicle` with `bUseAnySeat`; from the scripts) is
+/// boarded within this far of it, flat, metres, with this prompt; aboard,
+/// the use key gets her out with the second. The reach and both prompts
+/// are invented: the game's own entering is not known.
+const RIDE_REACH: f32 = 4.0;
+const RIDE_IN: &str = "Get in";
+const RIDE_OUT: &str = "Get out";
+
+/// The scripts' helicopters with their own pilot ([`ai_flown`]) that an
+/// action objective's marker is over, and where they are: hers to board
+/// as a passenger ([`board_ride`]).
+fn rides(game: &Game, mission: &Mission) -> Vec<(u32, Vec3)> {
+    let Some(catalogue) = &game.scene.catalogue else {
+        return Vec::new();
+    };
+    let island = game.scene.world.as_ref();
+    let w = mission.world().borrow();
+    w.hud
+        .markers
+        .values()
+        .filter(|m| m.icon == "HUD_objective_action")
+        .filter_map(|m| m.target)
+        .filter_map(|g| {
+            let o = w.objects.get(&g).filter(|o| o.alive)?;
+            let models = object_models(g, &o.name, island, &catalogue.vehicles);
+            ai_flown(&w, g, &models).then(|| (g, Vec3::from(o.position)))
+        })
+        .collect()
+}
+
+/// She gets into the scripts' helicopter `g` its pilot flies, as a
+/// passenger: the scripts are told (their seat events fire), and she is
+/// kept where it is until she gets out ([`leave_ride`]). It is not one of
+/// hers: the alpha shows it only while it flies a delivery.
+fn board_ride(game: &mut Game, mission: &mut Mission, g: u32) {
+    eprintln!("mission: she boards {g:#x} as a passenger");
+    mission.ride(Some(g));
+    game.aboard = Some(g);
+}
+
+/// She gets out of the helicopter `g` she rode in: onto the floor beside
+/// it (3 m off, invented), and the scripts are told.
+fn leave_ride(game: &mut Game, mission: &mut Mission, g: u32) {
+    eprintln!("mission: she gets out of {g:#x}");
+    game.aboard = None;
+    mission.ride(None);
+    if let Some(p) = game.scene.player.as_mut() {
+        let at = p.character.position + Vec3::new(3.0, 0.0, 0.0);
+        p.drop_at(at);
+    }
 }
 
 pub fn set_hero(mission: &mut Mission, hero: Hero, max: f32, who: &str) {
@@ -3109,6 +3289,35 @@ local id = string.gsub(m:GetName(), "Mission$", "")
 local index = data.GetMissionIndexFromId and data.GetMissionIndexFromId(id)
 if type(index) ~= "number" then return nil end
 return id, index
+"#;
+
+/// The targets of the current contract's active action objectives: its
+/// task's children, depth first, that are active and act on a target
+/// filter with an action prompt (`sActionLabel`).
+const CONTRACT_ACTIONS: &str = r#"
+local ps = rawget(_G, "MrxPlayState")
+if type(ps) ~= "table" or not ps.GetCurrentMission then return nil end
+local m = ps.GetCurrentMission()
+if type(m) ~= "table" then return nil end
+local out = {}
+local function walk(t, depth)
+    if depth > 6 or type(t) ~= "table" then return end
+    local ok, kids = pcall(function() return t:GetChildren() end)
+    if not ok or type(kids) ~= "table" then return end
+    for _, c in pairs(kids) do
+        local okActive, active = pcall(function() return c:IsActive() end)
+        active = okActive and active
+        local cfg = type(c.GetConfig) == "function" and c:GetConfig() or {}
+        if active and c._uTgtObjFilter and type(cfg) == "table" and cfg.sActionLabel then
+            for _, g in ipairs(ObjectFilter.GetObjects(c._uTgtObjFilter)) do
+                out[#out + 1] = g
+            end
+        end
+        walk(c, depth + 1)
+    end
+end
+walk(m, 0)
+return out
 "#;
 
 /// She has got where the scripts sent her within this, metres (invented:
@@ -3866,9 +4075,22 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 .catalogue
                 .as_ref()
                 .map_or(&[][..], |c| c.vehicles.as_slice());
+            let models = w
+                .objects
+                .get(vehicle)
+                .map(|o| object_models(*vehicle, &o.name, game.scene.world.as_ref(), catalogue));
+            // A helicopter its pilot flies (the scripts' transit seats her
+            // in the Lucky Lady again, "p"): she rides in it.
+            if models.as_ref().is_some_and(|m| ai_flown(&w, *vehicle, m)) {
+                drop(w);
+                if game.aboard != Some(*vehicle) {
+                    eprintln!("mission: the scripts seat her in {vehicle:#x} as a passenger");
+                    game.aboard = Some(*vehicle);
+                }
+                return false;
+            }
             if let Some(o) = w.objects.get(vehicle)
-                && !object_models(*vehicle, &o.name, game.scene.world.as_ref(), catalogue)
-                    .is_empty()
+                && models.is_some_and(|m| !m.is_empty())
             {
                 let at = Vec3::from(o.position);
                 drop(w);
@@ -3937,6 +4159,13 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         }
         Command::ExitVehicle(guid) if *guid == PLAYER => {
             fleet.reenter = None;
+            if let Some(g) = game.aboard.take() {
+                eprintln!("mission: the scripts take her out of {g:#x}");
+                if let Some(p) = game.scene.player.as_mut() {
+                    p.drop_at(p.character.position + Vec3::new(3.0, 0.0, 0.0));
+                }
+                return false;
+            }
             let (Some(world), Some(p)) = (&game.scene.world, game.scene.player.as_mut()) else {
                 return false;
             };

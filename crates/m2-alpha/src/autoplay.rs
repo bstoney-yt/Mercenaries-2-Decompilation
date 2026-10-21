@@ -33,6 +33,23 @@ const LOOK_FROM: f32 = 6.0;
 /// this (seconds), she walks round it this far out: the scripts' region
 /// may lie to a side of their marker.
 const ARRIVE: f32 = 2.5;
+/// An action objective's mark (`MrxTaskObjectiveAction`): she goes this
+/// close (metres, flat; invented, inside the 2 m reach the scripts put its
+/// prompt on with), and takes its prompt again after this long (seconds)
+/// while it is still offered.
+const ACTION_KIND: &str = "action";
+const ACTION_ARRIVE: f32 = 1.0;
+const ACTION_AGAIN: f32 = 5.0;
+/// Further above or below its object than this (metres; the alpha's
+/// `CONTEXT_RISE`, a floor's height) an action's prompt isn't offered.
+const ACTION_RISE: f32 = 2.5;
+/// Riding in the scripts' helicopter, she gets out once it has stood still
+/// this long (seconds; invented, longer than the transit's fade) and her
+/// next place is elsewhere.
+const RIDE_STILL: f32 = 20.0;
+/// Still marked this long after she got in (seconds; invented), she gets
+/// out and in again.
+const RIDE_AGAIN: f32 = 10.0;
 const CIRCLE_AFTER: f32 = 4.0;
 const CIRCLE: f32 = 6.0;
 /// At a place this long (seconds) with nothing happening, she takes one
@@ -470,6 +487,14 @@ pub struct Autoplay {
     pda_since: Option<f32>,
     pda_pressed: f32,
     pda_asked: Option<f32>,
+    /// The action objective's object whose prompt she last took, and
+    /// when; and the one she was last logged at without its prompt.
+    acted: Option<(u32, f32)>,
+    short_logged: Option<u32>,
+    /// The helicopter she rides in, where it stood still and since when.
+    ride_still: Option<(u32, Vec3, f32)>,
+    /// The helicopter she got into, and when.
+    boarded: Option<(u32, f32)>,
     /// When she last called in a soldier delivery by an outpost.
     delivered: Option<f32>,
     /// Seconds one following her has been left behind.
@@ -598,6 +623,7 @@ impl Autoplay {
             self.fresh_headway();
             self.arrived = None;
             self.steady = 0.0;
+            self.blocked = 0.0;
             self.sidestep = None;
             self.reversing = None;
             self.stalled = 0.0;
@@ -628,7 +654,11 @@ impl Autoplay {
             self.report(game);
         }
         let sturdy = |target: &u32| game.scene.props.sturdy.contains(target);
-        let striking = matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target))
+        // Her launcher spent (round 13: three tanks took all her rockets,
+        // and she stood aimed at the fourth for 2100 s), a strike brings
+        // down what she would have blown up.
+        let spent = game.combat.launcher_rounds.is_some() && game.combat.launcher_empty();
+        let striking = matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target) || spent)
             || matches!(self.goal, Some(Goal::Deliver(_)));
         // A call she is no longer after is put away: the designator goes
         // with a weapon taken up (twice from the satellite's view).
@@ -641,8 +671,62 @@ impl Autoplay {
                 ..Intent::default()
             };
         }
+        // Riding in the scripts' helicopter (the Lucky Lady): she sits
+        // until it has stood still a while and what she is after is
+        // elsewhere, then gets out.
+        if let Some(h) = game.aboard {
+            let here = game.focus();
+            let since = match self.ride_still {
+                Some((g, at, t)) if g == h && at.distance(here) < 1.0 => t,
+                _ => {
+                    self.ride_still = Some((h, here, self.clock));
+                    self.clock
+                }
+            };
+            let after_it = matches!(&self.goal, Some(Goal::Reach { target, .. }) if *target == h);
+            // Still marked a while after she got in: the objective that
+            // waits for her getting in came after she did (PmcCon003's
+            // comes with Ewan's last line, round 4): out, and in again.
+            let boarded = match self.boarded {
+                Some(b) if b.0 == h => b,
+                _ => *self.boarded.insert((h, self.clock)),
+            };
+            if after_it && self.clock - boarded.1 > RIDE_AGAIN && game.context_taken.is_none() {
+                eprintln!(
+                    "autoplay {:.1} s: {h:#x} still marked {RIDE_AGAIN:.0} s after getting in: out and in again",
+                    self.clock
+                );
+                game.context_taken = Some(h);
+                self.boarded = None;
+                self.acted = Some((h, self.clock));
+                return Intent::default();
+            }
+            if !after_it && self.clock - since > RIDE_STILL && game.context_taken.is_none() {
+                eprintln!(
+                    "autoplay {:.1} s: {h:#x} still for {RIDE_STILL:.0} s at {here:.1}: getting out",
+                    self.clock
+                );
+                game.context_taken = Some(h);
+                self.ride_still = None;
+                self.boarded = None;
+            }
+            return Intent::default();
+        }
+        let acting = match &self.goal {
+            Some(Goal::Reach { target, .. }) => marks
+                .iter()
+                .find(|m| m.target == *target && m.kind == ACTION_KIND)
+                .map(|m| (m.target, m.at)),
+            _ => None,
+        };
+        if let Some((target, at)) = acting {
+            self.act(game, target, at);
+        }
         match self.goal.clone() {
             None => self.idle(game, dt),
+            Some(Goal::Reach { at, .. }) if acting.is_some() => {
+                self.travel(game, at, ACTION_ARRIVE, dt)
+            }
             Some(Goal::Reach { at, .. }) => self.travel(game, at, ARRIVE, dt),
             Some(Goal::Shoot(i)) => self.shoot(game, i, dt),
             Some(Goal::Blast { at, .. }) if striking => self.strike(game, at, dt),
@@ -679,6 +763,42 @@ impl Autoplay {
                 }
                 None => self.idle(game, dt),
             },
+        }
+    }
+
+    /// At an action objective's object `target` (`MrxTaskObjectiveAction`:
+    /// "Enter office", "Board the Lucky Lady"), the prompt the scripts put
+    /// on it (`Pg.AddContextAction`) is taken with the use key, as a player
+    /// would; again after [`ACTION_AGAIN`] while it is still offered. There
+    /// and not offered it (above or below her), she says so once.
+    fn act(&mut self, game: &mut Game, target: u32, at: Vec3) {
+        let offered = game.context.as_ref().is_some_and(|(g, _)| *g == target);
+        let again = self
+            .acted
+            .is_none_or(|(g, t)| g != target || self.clock - t > ACTION_AGAIN);
+        if offered && again && !game.input_locked && game.context_taken.is_none() {
+            eprintln!(
+                "autoplay {:.1} s: taking the prompt at {target:#x}",
+                self.clock
+            );
+            game.context_taken = Some(target);
+            self.acted = Some((target, self.clock));
+        } else if !offered && self.arrived.is_some() && self.short_logged != Some(target) {
+            let here = game.focus();
+            eprintln!(
+                "autoplay {:.1} s: at {target:#x} ({at:.1}) from {here:.1}, no prompt offered",
+                self.clock
+            );
+            self.short_logged = Some(target);
+            // Under or over it (the oil rig's office, a deck 43 m over
+            // the ground she walked to: round 3), with no way up found:
+            // she hops onto its floor, as a stuck way does.
+            if (at.y - here.y).abs() > ACTION_RISE {
+                let still = self.since_moved();
+                self.hop(game, at, still);
+                self.arrived = None;
+                self.fresh_headway();
+            }
         }
     }
 
@@ -983,20 +1103,27 @@ impl Autoplay {
             })
             .collect();
         if let Some(m) = nearest(destroy, here) {
-            if let Some(i) = npcs
-                .iter()
-                .position(|n| n.spawn == Some(m.target) && n.alive)
+            // A vehicle to destroy is blown up, not its crew shot: the
+            // crew aboard come into play under its guid (PmcCon003's
+            // AMX30s: round 8 aimed at a tank's commander inside it,
+            // with never a clear shot, for 1900 s).
+            let a_vehicle = vehicles.iter().any(|v| v.guid == Some(m.target));
+            if !a_vehicle
+                && let Some(i) = npcs
+                    .iter()
+                    .position(|n| n.spawn == Some(m.target) && n.alive)
             {
                 return Some((
                     Goal::Shoot(i),
                     format!("shooting {} ({:#x})", m.name, m.target),
                 ));
             }
-            let spawn = game
-                .scene
-                .world
-                .as_ref()
-                .is_some_and(|w| w.index.spawns.iter().any(|s| s.entity == m.target));
+            let spawn = !a_vehicle
+                && game
+                    .scene
+                    .world
+                    .as_ref()
+                    .is_some_and(|w| w.index.spawns.iter().any(|s| s.entity == m.target));
             if spawn {
                 return Some((
                     Goal::Reach {
@@ -2840,9 +2967,13 @@ impl Autoplay {
             game.combat.shots_line()
         );
         eprintln!(
-            "autoplay checks {:.1} s: {}",
+            "autoplay checks {:.1} s: {}; arrived {:?}, blocked {:.1} s, steady {:.1} s, landed {}",
             self.clock,
-            game.scene.people.checks.line()
+            game.scene.people.checks.line(),
+            self.arrived.map(|t| self.clock - t),
+            self.blocked,
+            self.steady,
+            p.landed
         );
     }
 

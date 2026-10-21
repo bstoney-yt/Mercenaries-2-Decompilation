@@ -201,6 +201,10 @@ pub struct Game {
     /// The context action she took with the use key, for the mission to
     /// tell the scripts.
     pub context_taken: Option<u32>,
+    /// The scripts' helicopter she rides in as a passenger, its own pilot
+    /// flying it (PmcCon003's Lucky Lady): not one of hers to fly, so she is
+    /// kept where the scripts have it ([`crate::mission`]).
+    pub aboard: Option<u32>,
     /// The scripts' camera shot for a scene (the HQ's briefings), while
     /// it lasts: the frame is seen from it ([`Shot::view`]).
     pub shot: Option<Shot>,
@@ -381,6 +385,7 @@ impl Game {
             lens: (60.0, 16.0 / 9.0),
             context: None,
             context_taken: None,
+            aboard: None,
             shot: None,
             save_icon: 0.0,
             raw: crate::raw::RawClips::default(),

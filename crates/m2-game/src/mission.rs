@@ -39,6 +39,9 @@ pub const BOOTSTRAP: u32 = 0xb442_0059;
 /// The goal a support helicopter is given to land at her mark
 /// (`MrxSupportCopterDelivery._HeliReady`).
 pub const LAND: &str = "HeliLand";
+
+/// The base block's layer (`vz_base_P000_Q3.block`), always resident.
+const BASE_LAYER: &str = "vz_base";
 /// Activates the player's character as the engine does its object
 /// scripts: the hero module's `OnActivate` (healing, the survival
 /// system's one rescue, her inventory), which goes on once she is awake.
@@ -648,9 +651,13 @@ impl Mission {
             w.insert(PLAYER, player);
             w.player = Some(PLAYER);
         }
-        // The static layers are always in.
+        // The static layers are always in, and so is the base block's
+        // (`vz_base`, from samples: never loaded or unloaded by name). Its
+        // named locators are objects the scripts act on: PmcCon003's "Get
+        // inside the PMC!" prompts at `PlayerLocation_PMC` (round 26: with
+        // no object there its target filter came out empty).
         for (name, entities) in &layers {
-            if LayerState::is_static(name) {
+            if LayerState::is_static(name) || name.eq_ignore_ascii_case(BASE_LAYER) {
                 place(&world, entities, true);
                 world.borrow_mut().layers.loaded.insert(name.clone());
             }
@@ -1903,7 +1910,14 @@ end
         w.context_actions
             .iter()
             .map(|(&g, a)| {
-                let at = w.objects.get(&g).map(|o| o.position);
+                // A placed object's place, else its entity's, loaded or not
+                // (PmcCon003's `PlayerLocation_PMC`, a `vz_base` locator
+                // the action objective prompts at).
+                let at = w
+                    .objects
+                    .get(&g)
+                    .map(|o| o.position)
+                    .or_else(|| w.entities.get(&g).copied());
                 (g, at, a.text.clone(), a.reach)
             })
             .collect()
@@ -3095,6 +3109,37 @@ mod tests {
         assert_eq!(g.get::<f64>("__gur").unwrap(), 0.0);
         // Never set: as seen.
         assert_eq!(g.get::<i64>("__all").unwrap(), 1);
+    }
+
+    #[test]
+    fn the_base_blocks_locators_are_objects_from_the_start() {
+        // PmcCon003's "Get inside the PMC!" acts on `PlayerLocation_PMC`,
+        // a locator of the base block's layer; a state layer's stays out.
+        let at = |guid: u32, name: &str| Entity {
+            guid,
+            name: name.into(),
+            at: [7.0, 1.0, 9.0],
+            crew: Vec::new(),
+            ..villa_tank()
+        };
+        let mut data = GameData::default();
+        data.layers
+            .insert("vz_base".into(), vec![at(0x9f305, "PlayerLocation_PMC")]);
+        data.layers.insert(
+            "vz_state_pmccon002".into(),
+            vec![at(0xb639b, "PMC002_Office")],
+        );
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        m.run(
+            r#"local x, y, z = Object.GetPosition(Pg.GetGuidByName('PlayerLocation_PMC'))
+            __base = x
+            __state = Object.GetPosition(Pg.GetGuidByName('PMC002_Office'))"#,
+            "ask",
+        )
+        .unwrap();
+        let g = m.lua().globals();
+        assert_eq!(g.get::<f64>("__base").unwrap(), 7.0);
+        assert!(g.get::<Option<f64>>("__state").unwrap().is_none());
     }
 
     #[test]
