@@ -358,9 +358,19 @@ local methods = {
         "AddMeter", "StartTimer", "StartPursuit", "HideMeter", "RemoveMeter",
         "RemoveAllMeters" },
     Tutorial = { "SetText", "ShowTutorialForObject", "ShowTutorialOnscreen" },
+    -- The engine's `Pda` library goes to the HUD's `PdaInterface` the
+    -- same way: its database is the PDA's Info pages (the factions'
+    -- attitudes, the log, the people, the score).
+    ["Pda.Database"] = { "SetFactionAttitude", "AddLogEntry", "AddHelpEntry",
+        "AddDossierEntry", "AddStatisticCategory", "AddStatisticEntry" },
 }
 for group, names in pairs(methods) do
-    local g = Hud and Hud[group]
+    local g
+    if group:sub(1, 4) == "Pda." then
+        g = Pda and Pda[group:sub(5)]
+    else
+        g = Hud and Hud[group]
+    end
     if type(g) == "table" then
         for _, name in ipairs(names) do
             local f = g[name]
@@ -4986,6 +4996,31 @@ mod tests {
         };
         assert!(cash.contains(&(Plain::Text("vPlayer".into()), Plain::Guid(1))));
         assert_eq!(calls[1].method, "SetSlotToText");
+    }
+
+    #[test]
+    fn the_pdas_database_reaches_the_hud_as_pda_calls() {
+        let lua = mlua::Lua::new();
+        lua.load("Hud = {} Pda = { Database = {} }").exec().unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(
+            r#"Pda.Database:SetFactionAttitude({ sName = "China", sTexture = "t", nAttitude = 60 })
+            Pda.Database:AddLogEntry({ sText = "x" })"#,
+        )
+        .exec()
+        .unwrap();
+        let calls = hud_calls(&lua);
+        let names: Vec<(&str, &str)> = calls
+            .iter()
+            .map(|c| (c.group.as_str(), c.method.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Pda.Database", "SetFactionAttitude"),
+                ("Pda.Database", "AddLogEntry")
+            ]
+        );
     }
 
     #[test]
