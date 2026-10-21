@@ -2476,8 +2476,11 @@ impl Autoplay {
             // vehicle hops on with them instead.
             let driving = game.scene.player.as_ref().and_then(|p| p.driving);
             let near = (at - game.focus()).with_y(0.0).length() < RIDE_FOR;
+            // Nor in a boat: off it she is in the sea, and a race is lost
+            // (PirCon001 round 98 got off her jetski 58 m from a gate).
             if let Some(i) = driving
                 && near
+                && !afloat
                 && !game.scene.props.carrying(i)
                 && game
                     .scene

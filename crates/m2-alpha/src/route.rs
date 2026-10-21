@@ -63,8 +63,6 @@ const UNDER_SEA: f32 = 300.0;
 /// stuck on it there).
 const BEACH: f32 = 1.5;
 const BOW: f32 = 0.2;
-/// And again this high over the sea, metres: a boat's deck.
-const DECK: f32 = 0.8;
 /// A boat's way costs this many times as much next to the shallows.
 const OFF_SHORE: f32 = 3.0;
 /// The eight cells round a cell.
@@ -512,20 +510,11 @@ impl Grid<'_> {
         let (i, bit) = (self.index(a), 1u8 << k);
         if self.looked[i] & bit == 0 {
             let (pa, pb) = (self.at(a), self.at(b));
-            // A boat's also at its deck's height: a pier's edge stands
-            // clear of the sea by less than a hull (PirCon001: her jetski
-            // ran into one 0.8 m up, each round, on a way passing under).
-            let raises: &[f32] = if self.afloat.is_some() {
-                &[0.0, DECK - BOW]
-            } else {
-                &[0.0]
-            };
-            let hit = raises.iter().any(|&r| {
-                let from = Vec3::new(pa.x, ya + r, pa.y);
-                let to = Vec3::new(pb.x, yb + r, pb.y);
-                self.cast(from, to - from, from.distance(to))
-                    .is_some_and(|(_, n)| n.y.abs() < UPRIGHT)
-            });
+            let from = Vec3::new(pa.x, ya, pa.y);
+            let to = Vec3::new(pb.x, yb, pb.y);
+            let hit = self
+                .cast(from, to - from, from.distance(to))
+                .is_some_and(|(_, n)| n.y.abs() < UPRIGHT);
             self.looked[i] |= bit;
             if hit {
                 self.walled[i] |= bit;
@@ -869,37 +858,6 @@ mod tests {
             skip: None,
             afloat: Some(1.0),
         }
-    }
-
-    // A pier's edge across the way, from 0.5 m over the sea up (clear of
-    // the bow's ray, not of a deck), with open water to its side: round it
-    // (PirCon001's jetski ran into one each round, its way passing under).
-    #[test]
-    fn a_boat_goes_round_a_pier_not_under_it() {
-        let sea = -2.0;
-        let mut p = island(|_, _| -12.0);
-        let quad = |a: Vec3, b: Vec3, c: Vec3, d: Vec3| {
-            CollisionShape::mesh(&[a, b, c, d], &[[0, 1, 2], [0, 2, 3]]).unwrap()
-        };
-        let (lo, hi) = (sea + 0.5, sea + 3.0);
-        let edge = quad(
-            Vec3::new(-100.0, lo, 30.0),
-            Vec3::new(20.0, lo, 30.0),
-            Vec3::new(20.0, hi, 30.0),
-            Vec3::new(-100.0, hi, 30.0),
-        );
-        p.add_static(StaticKey::Cell(2), &edge, Vec3::ZERO, Quat::IDENTITY);
-        p.step(1.0 / 60.0);
-        let (from, to) = (Vec3::new(0.0, sea, 0.0), Vec3::new(0.0, sea, 60.0));
-        let route = Route::plan(&p, boat(), from, to, sea);
-        assert!(route.reaches, "{route:?}");
-        let crossing = route
-            .points
-            .windows(2)
-            .find(|w| w[0].z < 30.0 && w[1].z >= 30.0)
-            .map(|w| w[0].lerp(w[1], (30.0 - w[0].z) / (w[1].z - w[0].z)))
-            .expect("crosses the pier's line");
-        assert!(crossing.x > 20.0, "{crossing}: {route:?}");
     }
 
     // Round 88's start boat ran onto rocks standing out of the sea on its
