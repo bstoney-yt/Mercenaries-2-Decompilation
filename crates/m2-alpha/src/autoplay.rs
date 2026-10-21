@@ -163,6 +163,9 @@ const CARGO_NEAR: f32 = 100.0;
 /// She clears them for at most this long, seconds (invented).
 const GUARD_MOST: f32 = 90.0;
 const ONCOMING_SIDE: f32 = 3.0;
+/// She steers round a vehicle standing within this ahead, metres
+/// (invented).
+const AHEAD_STANDING: f32 = 20.0;
 const SWERVE: f32 = 0.35;
 /// Waiting this long (seconds) in a vehicle she drove to a place to
 /// deliver, she gets out of it.
@@ -1375,8 +1378,20 @@ impl Autoplay {
         } else {
             angle
         };
+        // And round a vehicle standing in her way, to the side it isn't
+        // on (PirCon004 round 78: her truck ran into a parked pickup and
+        // a trailer by the drop-off, close by the way planned round them).
+        let standing = standing_ahead(game, i, m);
+        let angle = match standing {
+            Some(x) => angle + if x > 0.0 { SWERVE } else { -SWERVE },
+            None => angle,
+        };
         let mut steer = (angle * 2.0).clamp(-1.0, 1.0);
-        let mut throttle = if oncoming { 0.3 } else { 1.0 };
+        let mut throttle = if oncoming || standing.is_some() {
+            0.3
+        } else {
+            1.0
+        };
         if (d < SLOW_NEAR && speed > SLOW) || (angle.abs() > 0.8 && speed > SLOW) {
             throttle = 0.2;
         }
@@ -2596,6 +2611,21 @@ fn vantage(
 }
 
 /// Vehicle `vehicles[i]`'s model to world, if placed.
+/// How far to the side (her left, +) the nearest vehicle standing still
+/// within [`AHEAD_STANDING`] ahead of vehicle `i` (whose place is `m`)
+/// and within [`ONCOMING_SIDE`] of her line is, if one is.
+fn standing_ahead(game: &Game, i: usize, m: Mat4) -> Option<f32> {
+    let to_local = m.inverse();
+    (0..game.scene.vehicles.len())
+        .filter(|&j| j != i)
+        .filter_map(|j| vehicle_state(game, j))
+        .filter(|(_, speed)| speed.abs() <= PARKED_SPEED)
+        .map(|(t, _)| to_local.transform_point3(t.w_axis.truncate()))
+        .filter(|l| l.z > 0.0 && l.z < AHEAD_STANDING && l.x.abs() < ONCOMING_SIDE)
+        .min_by(|a, b| a.z.total_cmp(&b.z))
+        .map(|l| l.x)
+}
+
 /// The vehicles other than `i` standing still within `reach` of `pos`.
 fn standing_near(game: &Game, i: usize, pos: Vec3, reach: f32) -> Vec<usize> {
     (0..game.scene.vehicles.len())
