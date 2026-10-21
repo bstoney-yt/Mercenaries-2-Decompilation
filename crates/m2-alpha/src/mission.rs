@@ -3017,7 +3017,7 @@ impl MissionLink {
     }
 
     /// The standing targets of the current contract's active destroy
-    /// objectives ([`CONTRACT_DESTROY`]) that no mark is over, as marks
+    /// objectives ([`CONTRACT_TARGETS`]) that no mark is over, as marks
     /// to destroy.
     fn unmarked_targets(&self, marks: &[Mark], index: i64) -> Vec<Mark> {
         let State::Running(mission) = &self.state else {
@@ -3280,6 +3280,7 @@ fn rides(game: &Game, mission: &Mission) -> Vec<(u32, Vec3)> {
         return Vec::new();
     };
     let island = game.scene.world.as_ref();
+    let enter = contract_targets(mission, "MrxTaskObjectiveEnterVehicle");
     let w = mission.world().borrow();
     w.hud
         .markers
@@ -3293,9 +3294,12 @@ fn rides(game: &Game, mission: &Mission) -> Vec<(u32, Vec3)> {
             // (PmcCon004's "Get Solano", the `Mi35 (Solano Hijack)` an
             // `MrxTaskObjectiveEnterVehicle` names: round 7 stood 1400 s by
             // it with nothing offered). Boarded the same way (inferred).
+            // (The Mi35's template matches no catalogue model, so it is
+            // known by the objective that names it.)
             let heli = models
                 .iter()
-                .any(|m| m.kind == m2_engine::vehicle::HELICOPTER);
+                .any(|m| m.kind == m2_engine::vehicle::HELICOPTER)
+                || enter.contains(&g);
             let hers = game.scene.vehicles.iter().any(|v| v.guid == Some(g));
             (ai_flown(&w, g, &models) || (heli && !hers)).then(|| (g, Vec3::from(o.position)))
         })
@@ -3735,9 +3739,11 @@ const UNMARKED_EVERY: f32 = 0.5;
 /// up on the way to it (invented).
 const RACE_TIMER_NEAR: f32 = 120.0;
 
-/// The targets of the current contract's active destroy objectives
-/// (`MrxTaskObjectiveDestroy`, their `_uTgtObjFilter`; from the scripts).
-const CONTRACT_DESTROY: &str = r#"
+/// The targets of the current contract's active objectives of module
+/// `sModule` (their `_uTgtObjFilter`; from the scripts), read with
+/// `sModule` set: `MrxTaskObjectiveDestroy`, `MrxTaskObjectiveEnterVehicle`.
+const CONTRACT_TARGETS: &str = r#"
+local sModule = ...
 local ps = rawget(_G, "MrxPlayState")
 if type(ps) ~= "table" or not ps.GetCurrentMission then return nil end
 local m = ps.GetCurrentMission()
@@ -3751,7 +3757,7 @@ local function walk(t, depth)
         local okActive, active = pcall(function() return c:IsActive() end)
         local cfg = type(c.GetConfig) == "function" and c:GetConfig() or {}
         if okActive and active and type(cfg) == "table"
-            and cfg.sModuleName == "MrxTaskObjectiveDestroy" and c._uTgtObjFilter then
+            and cfg.sModuleName == sModule and c._uTgtObjFilter then
             for _, g in ipairs(ObjectFilter.GetObjects(c._uTgtObjFilter)) do
                 out[#out + 1] = g
             end
@@ -3764,18 +3770,24 @@ return out
 "#;
 
 /// The targets of the current contract's active destroy objectives
-/// ([`CONTRACT_DESTROY`]), marked or not.
+/// ([`CONTRACT_TARGETS`]), marked or not.
 fn contract_destroy_targets(mission: &Mission) -> Vec<u32> {
+    contract_targets(mission, "MrxTaskObjectiveDestroy")
+}
+
+/// The targets of the current contract's active objectives of `module`
+/// ([`CONTRACT_TARGETS`]).
+fn contract_targets(mission: &Mission, module: &str) -> Vec<u32> {
     let found = match mission
         .lua()
-        .load(CONTRACT_DESTROY)
-        .set_name("=contract destroy")
-        .eval::<Option<mlua::Table>>()
+        .load(CONTRACT_TARGETS)
+        .set_name("=contract targets")
+        .call::<Option<mlua::Table>>(module)
     {
         Ok(found) => found,
         Err(e) => {
             eprintln!(
-                "mission: contract destroy: {}",
+                "mission: contract targets ({module}): {}",
                 m2_game::mission::first_lines(&e.to_string())
             );
             return Vec::new();
