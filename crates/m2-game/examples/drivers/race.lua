@@ -1,7 +1,7 @@
---[[ Test driver for PmcCon016 ("Highway to Hell", the PMC's timed race
-with pylons that add time): drives the course the way a player who knows
-it would. Autoplay follows the gate now up, but its route finder goes
-round the PMC compound's walls (round 3: 505 m to a gate 178 m off, the
+--[[ Test driver for the timed races (PmcCon016's "Highway to Hell",
+MecCon001's): drives the course the way a player who knows it would.
+Autoplay follows the gate now up, but its route finder goes round the
+PMC compound's walls (PmcCon016 round 3: 505 m to a gate 178 m off, the
 race lost at gate 3 of 27), so once a gate has been up for 6 s this puts
 her race car 12 m short of it, facing it, and she drives through. The
 pylons near the gate are left to autoplay. Logs what the contract
@@ -12,9 +12,9 @@ Load it next to pmc.lua:
 
   m2-alpha --install <dir> --mission --autoplay --mission-seconds 600 \
     --skip-to PmcCon016 --mission-driver .../pmc.lua \
-    --mission-driver crates/m2-game/examples/drivers/pmccon016.lua ]]
+    --mission-driver crates/m2-game/examples/drivers/race.lua ]]
 
-local function say(m) Debug.Printf('>>> PMC016 ' .. m) end
+local function say(m) Debug.Printf('>>> RACE ' .. m) end
 
 if type(MrxUtil) == 'table' and type(MrxUtil.SpawnObject) == 'function' then
   local spawn = MrxUtil.SpawnObject
