@@ -1,0 +1,18 @@
+[package]
+name = "m2-net"
+description = "Online co-op: the wire protocol, the invite and the peer-to-peer session."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes = "1"
+iroh = "1.4"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+thiserror.workspace = true
+
+[lints]
+workspace = true
+

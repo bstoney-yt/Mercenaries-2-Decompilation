@@ -21,6 +21,7 @@ m2-game = { path = "crates/m2-game" }
 m2-render = { path = "crates/m2-render" }
 m2-assets = { path = "crates/m2-assets" }
 m2-modapi = { path = "crates/m2-modapi" }
+m2-net = { path = "crates/m2-net" }
 
 anyhow = "1"
 bitflags = "2"
@@ -42,8 +43,10 @@ mlua = { version = "0.11", features = ["lua51", "vendored"] }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D9",
+    "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_Registry",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_UI_Input_XboxController",

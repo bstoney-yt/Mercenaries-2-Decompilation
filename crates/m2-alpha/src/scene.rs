@@ -916,6 +916,8 @@ pub struct Scene {
     /// everyone's clips give ([`Rig::shared`]). Made once: switching hero
     /// leaves the people be.
     people_rig: Option<Rig>,
+    /// Online co-op: the other player's hero ([`Scene::load_puppet`]).
+    pub puppet: Option<crate::puppet::Puppet>,
     /// Drivable vehicles near the spawn.
     pub vehicles: Vec<ParkedVehicle>,
     /// Whether up to [`PARKED`] of the catalogue's vehicles are parked by
@@ -1582,6 +1584,7 @@ impl Scene {
             hero: Hero::default(),
             outfit: None,
             people_rig: None,
+            puppet: None,
             vehicles: Vec::new(),
             park: true,
             people: People::default(),
@@ -2005,6 +2008,43 @@ impl Scene {
             player.set_body(model, clips, moves);
             player.speeds = speeds;
         }
+    }
+
+    /// Online co-op: loads the other player's hero, as [`Scene::load_hero`]
+    /// loads the player's body and on-foot clips (not the weapons, the
+    /// moves or the speeds: the other game moves it). Replaces any other.
+    pub fn load_puppet(&mut self, backend: &mut dyn RenderBackend, hero: Hero, name: String) {
+        let Some(source) = self.source.as_mut() else {
+            return;
+        };
+        let hash = self
+            .world
+            .as_ref()
+            .and_then(|w| w.index.template_db.get(hero.template()))
+            .and_then(|t| t.model)
+            .unwrap_or(DEFAULT_MODEL);
+        let model = GpuModel::load(backend, source, &mut self.materials, hash, 0)
+            .map_err(anyhow::Error::from)
+            .and_then(|gpu| Ok((gpu, Rig::load(source, hash, Gait::Idle, Some(hero))?)));
+        let (body, clips) = match model {
+            Ok((gpu, mut rig)) => {
+                let set = self
+                    .world
+                    .as_ref()
+                    .and_then(|w| w.index.template_db.animation_set(hero.template()));
+                let mut clips = npc::FightClips::find(&rig);
+                let from_table = table_clips(source, set, hero, &mut rig, &mut clips);
+                let clips = clips.own_group(&rig, &from_table.settled);
+                rig.set_aim_clip(clips.aim);
+                (Some((gpu, rig)), clips)
+            }
+            Err(e) => {
+                eprintln!("coop: the other hero's model: {e:#}");
+                (None, npc::FightClips::default())
+            }
+        };
+        eprintln!("coop: {name} plays {hero}, model {hash:08x}");
+        self.puppet = Some(crate::puppet::Puppet::new(hero, name, body, clips));
     }
 
     /// Loads a vehicle for the mission scripts' object `guid` on a thread:
@@ -2712,6 +2752,14 @@ impl Scene {
                     w.model.draw(queue, at);
                 }
             }
+        }
+        if let Some(p) = &self.puppet
+            && p.shown
+            && let Some((model, rig)) = &p.body
+        {
+            let (nodes, skin) = rig.posed();
+            model.draw_posed(backend, queue, p.model_matrix(), &nodes, &skin)?;
+            p.drawn.set(p.drawn.get() + 1);
         }
         for n in &self.people.npcs {
             if !n.landed || n.character.position.distance(eye) > npc::DRAW_DISTANCE {
