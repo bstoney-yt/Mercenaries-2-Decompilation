@@ -31,6 +31,15 @@
 //! (one texel; `BloomBlurRadius`, 0.55 in most records, may be it).
 //! `BloomThreshold` is read but no game shader applies a threshold.
 //! `M2_GRADE_BLUR=off` restores the bright pass (PC round grade27).
+//!
+//! Not done: the composite's motion blur (four taps along each pixel's
+//! movement since the last frame, from the depth map and
+//! `MotionBlurConstantX`/`Y`/`W`, scaled by `MotionBlurVelocityScale`) and
+//! its depth of field (`blurMap2` mixed in by depth under `dofParams`).
+//! The program sets those constants; no atmosphere field names them (none
+//! of `AtmosphereBase`'s 185 fields hashes to a motion, focus or depth of
+//! field name, gap-list renderer round), so their strength is not in the
+//! data.
 
 use std::cell::Cell;
 use std::time::Instant;
