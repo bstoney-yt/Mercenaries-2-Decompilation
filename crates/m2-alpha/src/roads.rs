@@ -57,6 +57,24 @@ const FULL_LOCK: f32 = 0.6;
 /// They brake for her or a vehicle this near ahead, metres, for at most
 /// this long, seconds, then go on (round her, or into what is there).
 const CLEAR_AHEAD: f32 = 12.0;
+
+/// Whether any of `places` is in the way of a vehicle at `here` facing
+/// `forward` (flat) going `speed`: ahead of it within [`CLEAR_AHEAD`], or
+/// as far as it goes in [`STOP_SECONDS`], and within [`CLEAR_SIDE`] of its
+/// line. Road and path traffic both stop for it.
+pub(crate) fn in_the_way(
+    here: Vec3,
+    forward: Vec2,
+    speed: f32,
+    places: impl IntoIterator<Item = Vec3>,
+) -> bool {
+    let reach = CLEAR_AHEAD.max(speed * STOP_SECONDS);
+    places.into_iter().any(|p| {
+        let d = flat(p - here);
+        let ahead = d.dot(forward);
+        ahead > 1.0 && ahead < reach && d.perp_dot(forward).abs() < CLEAR_SIDE
+    })
+}
 /// And as far ahead as it goes in this long, seconds, within this of its
 /// line, metres (invented: room to stop, and a truck's half width more
 /// than its own).
@@ -407,12 +425,7 @@ impl RoadTraffic {
             // Further ahead the faster it goes, to stop short of it (a
             // van at 10 m/s ran into her organ truck crossing its road:
             // PirCon004 round 68).
-            let reach = CLEAR_AHEAD.max(speed * STOP_SECONDS);
-            let mut blocked = places.iter().any(|&p| {
-                let d = flat(p - here);
-                let ahead = d.dot(forward);
-                ahead > 1.0 && ahead < reach && d.perp_dot(forward).abs() < CLEAR_SIDE
-            });
+            let mut blocked = in_the_way(here, forward, speed, places.iter().copied());
             car.waited = if blocked { car.waited + dt } else { 0.0 };
             car.stuck = if speed.abs() < 0.5 {
                 car.stuck + dt
@@ -639,6 +652,20 @@ fn next_point(points: &[Vec3], s: f32, forward: bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A boat on its path at 17 m/s sees her ahead of it in time to stop
+    // (GurCon003 round 82), not one beside its line or behind it; slow,
+    // only what is near.
+    #[test]
+    fn what_is_in_the_way_reaches_further_the_faster() {
+        let f = Vec2::new(0.0, 1.0);
+        let ahead = |z: f32, x: f32| [Vec3::new(x, 0.0, z)];
+        assert!(in_the_way(Vec3::ZERO, f, 17.0, ahead(28.0, 1.0)));
+        assert!(!in_the_way(Vec3::ZERO, f, 17.0, ahead(28.0, 5.0)));
+        assert!(!in_the_way(Vec3::ZERO, f, 17.0, ahead(-5.0, 0.0)));
+        assert!(!in_the_way(Vec3::ZERO, f, 2.0, ahead(28.0, 0.0)));
+        assert!(in_the_way(Vec3::ZERO, f, 2.0, ahead(10.0, 0.0)));
+    }
 
     fn road(entity: u32, points: &[(f32, f32)]) -> Road {
         Road {
