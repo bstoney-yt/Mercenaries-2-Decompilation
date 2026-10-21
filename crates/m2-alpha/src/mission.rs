@@ -2853,6 +2853,62 @@ impl MissionLink {
         // A verify marker stays to do once its person is dead: the body is
         // verified (round 13: General Peng shot, then left for the jobs).
         let to_do = |m: &Mark| m.alive || m.kind == "verify";
+        // A race running for the contract: its checkpoint now up, before
+        // the markers named for the contract (PmcCon016 round 1: she went
+        // for the pylons that only add time, and the race ran out at its
+        // first checkpoint).
+        if let Some(g) = self.contract_race() {
+            let gate = marks.iter().find(|m| m.target == g).cloned().or_else(|| {
+                let State::Running(mission) = &self.state else {
+                    return None;
+                };
+                let w = mission.world().borrow();
+                let o = w.objects.get(&g)?;
+                Some(Mark {
+                    target: g,
+                    kind: "deliverable".to_owned(),
+                    name: o.name.clone(),
+                    at: Vec3::from(o.position),
+                    alive: true,
+                    mission: Some(MarkFor::Index(index)),
+                    secondary: false,
+                })
+            });
+            if let Some(gate) = gate {
+                // The contract's timer targets near the gate are blown up
+                // on the way: each adds time, which the race's own start
+                // time doesn't cover (PmcCon016: 75 s for 27 gates, 15 s a
+                // pylon; from the scripts). The reach is invented.
+                let mut out: Vec<Mark> = marks
+                    .iter()
+                    .filter(|m| {
+                        m.kind == "timer"
+                            && m.alive
+                            && named(m)
+                            && m.at.distance(gate.at) < RACE_TIMER_NEAR
+                    })
+                    .map(|m| Mark {
+                        kind: "destroy".to_owned(),
+                        ..m.clone()
+                    })
+                    .collect();
+                out.push(gate);
+                return out;
+            }
+        }
+        // The contract's active destroy objectives' targets the scripts
+        // put no marker over, while what is named for it is only places
+        // (PmcCon031 round 1: she stood 880 s at `MGStatueLoc` while its
+        // 50 columns to bring down had no marker).
+        if !marks
+            .iter()
+            .any(|m| m.alive && named(m) && m.kind != "objective")
+        {
+            let found = self.unmarked_targets(&marks, index);
+            if !found.is_empty() {
+                return found;
+            }
+        }
         let acts = self.contract_actions();
         if *self.acts_logged.borrow() != acts {
             eprintln!("mission: {id}'s action targets now {acts:x?}");
@@ -2904,6 +2960,68 @@ impl MissionLink {
         } else {
             marks
         }
+    }
+
+    /// The standing targets of the current contract's active destroy
+    /// objectives ([`CONTRACT_DESTROY`]) that no mark is over, as marks
+    /// to destroy.
+    fn unmarked_targets(&self, marks: &[Mark], index: i64) -> Vec<Mark> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        let found = match mission
+            .lua()
+            .load(CONTRACT_DESTROY)
+            .set_name("=contract destroy")
+            .eval::<Option<mlua::Table>>()
+        {
+            Ok(found) => found,
+            Err(e) => {
+                eprintln!(
+                    "mission: contract destroy: {}",
+                    m2_game::mission::first_lines(&e.to_string())
+                );
+                return Vec::new();
+            }
+        };
+        let w = mission.world().borrow();
+        found
+            .into_iter()
+            .flat_map(|t| {
+                t.sequence_values::<mlua::Value>()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .filter_map(|v| m2_game::events::as_guid(&v))
+            .filter(|g| !marks.iter().any(|m| m.target == *g))
+            .filter_map(|g| {
+                let o = w.objects.get(&g).filter(|o| o.alive)?;
+                Some(Mark {
+                    target: g,
+                    kind: "destroy".to_owned(),
+                    name: o.name.clone(),
+                    at: Vec3::from(o.position),
+                    alive: true,
+                    mission: Some(MarkFor::Index(index)),
+                    secondary: false,
+                })
+            })
+            .collect()
+    }
+
+    /// The checkpoint of the current contract's running race
+    /// ([`CONTRACT_RACE`]), if one is running.
+    fn contract_race(&self) -> Option<u32> {
+        let State::Running(mission) = &self.state else {
+            return None;
+        };
+        let g = mission
+            .lua()
+            .load(CONTRACT_RACE)
+            .set_name("=contract race")
+            .eval::<mlua::Value>()
+            .ok()?;
+        m2_game::events::as_guid(&g)
     }
 
     /// The targets of the current contract's active action objectives
@@ -3520,6 +3638,64 @@ local function walk(t, depth)
         active = okActive and active
         local cfg = type(c.GetConfig) == "function" and c:GetConfig() or {}
         if active and c._uTgtObjFilter and type(cfg) == "table" and cfg.sActionLabel then
+            for _, g in ipairs(ObjectFilter.GetObjects(c._uTgtObjFilter)) do
+                out[#out + 1] = g
+            end
+        end
+        walk(c, depth + 1)
+    end
+end
+walk(m, 0)
+return out
+"#;
+
+/// The checkpoint the current contract's running race waits for: an
+/// active `MrxTaskRace` under its task (its `_tCourseLocs`, the course's
+/// location names, and `iCurLoc`, the one now up; from the scripts).
+const CONTRACT_RACE: &str = r#"
+local ps = rawget(_G, "MrxPlayState")
+if type(ps) ~= "table" or not ps.GetCurrentMission then return nil end
+local m = ps.GetCurrentMission()
+if type(m) ~= "table" then return nil end
+local function walk(t, depth)
+    if depth > 6 or type(t) ~= "table" then return nil end
+    local ok, kids = pcall(function() return t:GetChildren() end)
+    if not ok or type(kids) ~= "table" then return nil end
+    for _, c in pairs(kids) do
+        local okActive, active = pcall(function() return c:IsActive() end)
+        local locs, i = rawget(c, "_tCourseLocs"), rawget(c, "iCurLoc")
+        if okActive and active and type(locs) == "table" and type(i) == "number" and locs[i] then
+            return Pg.GetGuidByName(locs[i])
+        end
+        local g = walk(c, depth + 1)
+        if g then return g end
+    end
+    return nil
+end
+return walk(m, 0)
+"#;
+
+/// A race's timer targets this near its gate now up (metres) are blown
+/// up on the way to it (invented).
+const RACE_TIMER_NEAR: f32 = 120.0;
+
+/// The targets of the current contract's active destroy objectives
+/// (`MrxTaskObjectiveDestroy`, their `_uTgtObjFilter`; from the scripts).
+const CONTRACT_DESTROY: &str = r#"
+local ps = rawget(_G, "MrxPlayState")
+if type(ps) ~= "table" or not ps.GetCurrentMission then return nil end
+local m = ps.GetCurrentMission()
+if type(m) ~= "table" then return nil end
+local out = {}
+local function walk(t, depth)
+    if depth > 6 or type(t) ~= "table" then return end
+    local ok, kids = pcall(function() return t:GetChildren() end)
+    if not ok or type(kids) ~= "table" then return end
+    for _, c in pairs(kids) do
+        local okActive, active = pcall(function() return c:IsActive() end)
+        local cfg = type(c.GetConfig) == "function" and c:GetConfig() or {}
+        if okActive and active and type(cfg) == "table"
+            and cfg.sModuleName == "MrxTaskObjectiveDestroy" and c._uTgtObjFilter then
             for _, g in ipairs(ObjectFilter.GetObjects(c._uTgtObjFilter)) do
                 out[#out + 1] = g
             end
