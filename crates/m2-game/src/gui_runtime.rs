@@ -2225,12 +2225,20 @@ natives! {
         Ok(MultiValue::new())
     },
     // (widget, function, data).
+    // Set after its movie started (`MrxGuiCinematic.ShowMovie` sets it
+    // once the movie is up: PmcCon002's 10_BRV_J, round 5), the movie
+    // ends at the next tick all the same.
     "SetMovieEndCallback" => |s, l, a| {
         let cb = keep_callback(s, l, a.get(1), a.get(2))?;
+        let playing = s.widgets.get(&a.id(0)).is_some_and(|w| w.movie_playing);
         let old = match s.widgets.get_mut(&a.id(0)) {
+            Some(w) if playing => w.movie_end.take(),
             Some(w) => std::mem::replace(&mut w.movie_end, cb),
             None => cb,
         };
+        if playing && let Some(cb) = cb {
+            s.due.push((cb, Vec::new()));
+        }
         if let Some(old) = old {
             forget_callback(l, old)?;
         }
@@ -2872,6 +2880,24 @@ mod tests {
         tick(host.lua(), 0.1);
         tick(host.lua(), 0.1);
         assert_eq!(host.lua().globals().get::<i64>("ended").unwrap(), 2);
+    }
+
+    #[test]
+    fn a_movie_end_callback_set_after_it_started_runs_too() {
+        let (host, _screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            movie = G.CreateImageWidget()
+            ended = 0
+            G.PlayMovie(movie)
+            G.SetMovieEndCallback(movie, function(n) ended = ended + n end, { 3 })
+            "#,
+        );
+        tick(host.lua(), 0.1);
+        tick(host.lua(), 0.1);
+        assert_eq!(host.lua().globals().get::<i64>("ended").unwrap(), 3);
     }
 
     #[test]
