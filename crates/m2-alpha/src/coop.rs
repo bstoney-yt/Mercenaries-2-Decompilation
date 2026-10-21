@@ -280,9 +280,22 @@ impl Coop {
                 .map_or(0.0, |p| p.position.distance(me)),
         );
         if let Some(s) = &self.share {
+            let npcs = &game.scene.people.npcs;
+            let friend = game.scene.puppet.as_ref().map(|p| p.position);
+            let nearest = friend.and_then(|f| {
+                npcs.iter()
+                    .map(|n| n.character.position.distance(f))
+                    .reduce(f32::min)
+            });
             eprintln!(
-                "coop: sharing {} people near the friend (most {}; {} in, {} out)",
-                s.shared, s.most, s.sent_in, s.sent_out
+                "coop: sharing {} people near the friend (most {}; {} in, {} out) of {} here ({} landed), nearest {}",
+                s.shared,
+                s.most,
+                s.sent_in,
+                s.sent_out,
+                npcs.len(),
+                npcs.iter().filter(|n| n.landed).count(),
+                nearest.map_or("-".to_owned(), |d| format!("{d:.1} m")),
             );
         }
         if let Some(m) = &self.mirror {
