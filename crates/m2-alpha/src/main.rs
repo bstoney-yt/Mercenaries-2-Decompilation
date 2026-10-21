@@ -47,6 +47,7 @@ mod camera;
 mod cheats;
 mod combat;
 mod config;
+mod coop;
 mod destruct;
 mod disguise;
 mod display;
@@ -74,6 +75,7 @@ mod pause;
 mod placed;
 mod player;
 mod props;
+mod puppet;
 mod raw;
 mod reinforce;
 mod roads;
@@ -137,6 +139,12 @@ struct Options {
     spawn: Option<(f32, f32)>,
     /// Who to play (`--hero`), over the settings'.
     hero: Option<Hero>,
+    /// Online co-op (`--host`, `--join <invite>`), with `--coop-local`
+    /// and `--name`.
+    coop: Option<coop::Setup>,
+    /// With `--screenshot` and co-op: seconds of play together before
+    /// the picture (default 30).
+    coop_seconds: f32,
     /// Weapons to start with, by template name (`--gun`, repeated:
     /// `Shotgun`, `Stinger`, `C4`).
     guns: Vec<String>,
@@ -444,11 +452,26 @@ enum SatelliteShot {
 /// A `--satellite` call's spot lies this far ahead of her, metres.
 const SATELLITE_AHEAD: f32 = 45.0;
 
+/// The install its installer recorded in the registry (`Install Dir`,
+/// seen on one real install; whether every edition's installer writes
+/// it is not checked), for a game put somewhere other than Program Files.
+fn registry_install() -> Option<Install> {
+    const KEYS: [&str; 2] = [
+        r"SOFTWARE\WOW6432Node\EA Games\Mercenaries 2 World in Flames",
+        r"SOFTWARE\EA Games\Mercenaries 2 World in Flames",
+    ];
+    KEYS.iter()
+        .filter_map(|k| m2_sys::registry::local_machine_string(k, "Install Dir"))
+        .find_map(|dir| Install::find(std::path::Path::new(&dir)).ok())
+}
+
 fn parse_args() -> anyhow::Result<Options> {
     let mut o = Options {
         skip_mode_off: true,
+        coop_seconds: 30.0,
         ..Options::default()
     };
+    let (mut coop_role, mut coop_local, mut coop_name) = (None, false, None);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
@@ -482,6 +505,19 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--turn" => o.turn = value()?.parse().context("--turn expects degrees")?,
             "--gun" => o.guns.push(value()?),
+            "--host" => coop_role = Some(coop::Role::Host),
+            "--join" => {
+                let v = value()?;
+                let invite = v
+                    .parse::<m2_net::Invite>()
+                    .with_context(|| format!("--join expects an invite code or link, not {v}"))?;
+                coop_role = Some(coop::Role::Join(invite));
+            }
+            "--coop-local" => coop_local = true,
+            "--name" => coop_name = Some(value()?),
+            "--coop-seconds" => {
+                o.coop_seconds = value()?.parse().context("--coop-seconds expects seconds")?
+            }
             "--hero" => {
                 let v = value()?;
                 o.hero = Some(Hero::parse(&v).with_context(|| {
@@ -811,7 +847,7 @@ fn parse_args() -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 13] = [
+    const PLAIN: [&str; 17] = [
         "--install",
         "--config",
         "--size",
@@ -825,6 +861,11 @@ fn parse_args() -> anyhow::Result<Options> {
         "--dev",
         "--skip-mode-off",
         "--skip-mode-on",
+        // Co-op plays the whole game too.
+        "--host",
+        "--join",
+        "--coop-local",
+        "--name",
     ];
     if std::env::args()
         .skip(1)
@@ -835,6 +876,23 @@ fn parse_args() -> anyhow::Result<Options> {
     if o.alpha {
         o.mission = true;
     }
+    if coop_role.is_none() && o.alpha {
+        // The join page copies `m2coop:<code>` before the download: the
+        // whole game, launched plain, joins it.
+        coop_role = m2_sys::clipboard::text()
+            .filter(|t| t.trim_start().starts_with("m2coop:"))
+            .and_then(|t| t.parse::<m2_net::Invite>().ok())
+            .map(|invite| {
+                eprintln!("coop: joining the invite on the clipboard");
+                coop::Role::Join(invite)
+            });
+    }
+    o.coop = coop_role.map(|role| coop::Setup {
+        role,
+        name: coop_name.unwrap_or_else(|| "Player".into()),
+        relay: !coop_local,
+        copy_link: o.screenshot.is_none(),
+    });
     Ok(o)
 }
 
@@ -920,7 +978,7 @@ fn main() -> anyhow::Result<()> {
     }
     let install = match &config.install {
         Some(dir) => Some(Install::find(dir)?),
-        None => match Install::detect() {
+        None => match Install::detect().or_else(registry_install) {
             Some(found) => {
                 eprintln!("found the game in {}", found.root.display());
                 Some(found)
@@ -997,6 +1055,7 @@ fn main() -> anyhow::Result<()> {
         grapple: options.grapple,
         mission: options.mission,
         mission_drivers: options.mission_drivers.clone(),
+        coop: options.coop.clone(),
         old_hud: options.old_hud,
         hijack_crew: options.hijack_crew.clone(),
         support: options.support.clone(),
@@ -1627,6 +1686,19 @@ fn screenshot(
         },
         started.elapsed().as_secs_f32()
     );
+    if let Some(setup) = &options.coop {
+        let walk = options.gait.filter(|_| game.on_foot);
+        return coop::offscreen(
+            &mut backend,
+            &mut game,
+            setup,
+            options.coop_seconds,
+            walk,
+            fov,
+            aspect,
+            out,
+        );
+    }
     // The last frames are timed: the frame rate here, for checking.
     // Where the time goes: the tick, streaming, building the draws, and
     // submitting the frame.
@@ -6668,6 +6740,8 @@ struct Running {
     backend: WgpuBackend,
     game: Game,
     audio: sound::GameAudio,
+    /// Online co-op, when hosting or joining.
+    coop: Option<coop::Coop>,
     /// Whether she was driving last tick (getting in is worth a word).
     was_driving: bool,
     input: Input,
@@ -6749,6 +6823,8 @@ struct App {
     mission: bool,
     /// Lua to run before they start (`--mission-driver`).
     mission_drivers: Vec<(String, String)>,
+    /// Online co-op to host or join (`--host`, `--join`).
+    coop: Option<coop::Setup>,
     /// Our stand-in HUD instead of the game's own.
     old_hud: bool,
     hijack_crew: Option<String>,
@@ -6841,6 +6917,10 @@ impl App {
                 audio.hero = self.config.hero;
                 audio
             },
+            coop: self
+                .coop
+                .as_ref()
+                .map(|s| coop::Coop::start(s, self.config.hero)),
             was_driving: false,
             input: Input::default(),
             pad: pad::Pad::default(),
@@ -7812,6 +7892,9 @@ impl Running {
             );
         });
         cheats::keep_up(&mut self.game, self.cheats);
+        if let Some(c) = &mut self.coop {
+            c.tick(&mut self.game, &mut self.backend, TICK.as_secs_f32());
+        }
         if let Some(h) = &mut self.hijacks {
             h.place(&mut self.game);
             h.seat(&mut self.game, TICK.as_secs_f32());

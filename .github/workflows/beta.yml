@@ -1,0 +1,59 @@
+name: Beta release
+
+# Publishes the beta (the alpha's exe, which plays co-op) as a GitHub
+# Release, the download the co-op join page links to
+# (releases/latest/download/m2-beta-windows.zip). Run by pushing a tag
+# named beta-<something>, or by hand from the Actions tab.
+#
+# Our code only: the exe reads every game file from the player's own
+# install, and nothing of the game's is packed.
+on:
+  push:
+    tags: ['beta-*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create (beta-YYYYMMDD...)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish the beta
+    runs-on: [self-hosted, Windows, X64, m2-pc]
+    env:
+      CARGO_TERM_COLOR: always
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: cargo build --release -p m2-alpha --target i686-pc-windows-msvc
+      - name: Pack
+        shell: powershell
+        run: |
+          $dist = "target\beta"
+          Remove-Item -Recurse -Force $dist -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory $dist | Out-Null
+          Copy-Item target\i686-pc-windows-msvc\release\m2-alpha.exe "$dist\m2-beta.exe"
+          @"
+          Mercenaries 2 beta ($env:TAG)
+
+          A fan rebuild of Mercenaries 2: World in Flames. It needs your own
+          installed copy of the PC game, which it reads; it brings none of the
+          game's files.
+
+          Run m2-beta.exe. If a friend's invite link copied an invite, it joins
+          them. To host: run m2-beta.exe --host; once it is up, the invite
+          link is on your clipboard to paste to a friend.
+
+          Source: https://github.com/bstoney-yt/Mercenaries-2-Decompilation
+          "@ | Set-Content "$dist\README.txt"
+          Compress-Archive -Path "$dist\*" -DestinationPath target\m2-beta-windows.zip -Force
+      - name: Publish
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:TAG target\m2-beta-windows.zip --repo ${{ github.repository }} --target ${{ github.sha }} --title "Beta $env:TAG" --notes "Co-op beta. Needs your own install of Mercenaries 2 (PC). Download m2-beta-windows.zip, unzip, run m2-beta.exe."
