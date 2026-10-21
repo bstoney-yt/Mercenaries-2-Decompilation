@@ -1478,7 +1478,7 @@ impl Autoplay {
             None => angle,
         };
         let mut steer = (angle * 2.0).clamp(-1.0, 1.0);
-        let mut throttle = if boat && standing.is_some() && speed > SLOW {
+        let mut throttle: f32 = if boat && standing.is_some() && speed > SLOW {
             -1.0
         } else if oncoming || standing.is_some() {
             0.3
