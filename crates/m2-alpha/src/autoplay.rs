@@ -816,6 +816,14 @@ impl Autoplay {
             intent.trigger.pda = self.tapped;
             return intent;
         }
+        // The menu open again with the smoke already handed her (round 12
+        // reopened it the frame after the call, its item not yet taken off
+        // her stock, and stood 3300 s with the menu up and the smoke
+        // unthrown): a weapon taken up shuts it, then the throw.
+        if game.combat.to_throw && game.support.phase == Phase::Menu {
+            intent.trigger.select = Some(Weapon::Rifle);
+            return intent;
+        }
         if game.combat.to_throw {
             // Towards where it is to land, if that is known: a throw the
             // other way can fall outside a drop zone's reach.
@@ -831,6 +839,11 @@ impl Autoplay {
             return intent;
         }
         match game.support.phase {
+            // Not again while the call just made is answered.
+            Phase::Idle
+                if self
+                    .delivered
+                    .is_some_and(|t| self.clock - t < DESIGNATOR_WAIT) => {}
             Phase::Idle => {
                 if let Some(i) = game
                     .support
