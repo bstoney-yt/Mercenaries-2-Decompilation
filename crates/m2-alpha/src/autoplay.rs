@@ -203,6 +203,10 @@ const ON_FOOT: f32 = 40f32.to_radians();
 const ON_WHEELS: f32 = 22f32.to_radians();
 const ON_TRACKS: f32 = 27f32.to_radians();
 const REPLAN: f32 = 20.0;
+/// And when a vehicle comes to stand within this of her, metres, so long
+/// as this long has gone by, seconds (invented).
+const STANDING_FRESH: f32 = 150.0;
+const REPLAN_SOONEST: f32 = 2.0;
 const REPLAN_MOVED: f32 = 5.0;
 const STRAYED: f32 = 15.0;
 const LOOK_AHEAD: f32 = 5.0;
@@ -319,6 +323,8 @@ struct Way {
     route: Route,
     planned: f32,
     driving: bool,
+    /// The vehicles standing near her when it was planned (indices).
+    standing: Vec<usize>,
 }
 
 /// The player playing herself.
@@ -2084,10 +2090,19 @@ impl Autoplay {
             self.way = None;
             return at;
         }
+        // Driving, planned again as soon as a vehicle comes to stand near
+        // her (PirCon004 round 77: a fuel trailer the scripts put on her
+        // road, run into before the way was planned again).
+        let standing = match driving {
+            Some(i) => standing_near(game, i, pos, STANDING_FRESH),
+            None => Vec::new(),
+        };
         let stale = self.way.as_ref().is_none_or(|w| {
             w.driving != driving.is_some()
                 || w.route.goal.distance(at) > REPLAN_MOVED
                 || self.clock - w.planned > REPLAN
+                || (self.clock - w.planned > REPLAN_SOONEST
+                    && standing.iter().any(|j| !w.standing.contains(j)))
         });
         if stale && let Some(world) = game.scene.world.as_ref() {
             let mover = match driving.and_then(|i| game.scene.vehicles.get(i)) {
@@ -2159,6 +2174,7 @@ impl Autoplay {
                 route,
                 planned: self.clock,
                 driving: driving.is_some(),
+                standing,
             });
         }
         let Some(way) = &mut self.way else {
@@ -2580,6 +2596,18 @@ fn vantage(
 }
 
 /// Vehicle `vehicles[i]`'s model to world, if placed.
+/// The vehicles other than `i` standing still within `reach` of `pos`.
+fn standing_near(game: &Game, i: usize, pos: Vec3, reach: f32) -> Vec<usize> {
+    (0..game.scene.vehicles.len())
+        .filter(|&j| j != i)
+        .filter(|&j| {
+            vehicle_state(game, j).is_some_and(|(m, speed)| {
+                speed.abs() <= PARKED_SPEED && m.w_axis.truncate().distance(pos) <= reach
+            })
+        })
+        .collect()
+}
+
 /// The ground boxes (least and most corner, x and z, with [`AVOID_ROOM`]
 /// round them) of the vehicles other than `i` standing still within
 /// [`PARKED_NEAR`] of `pos`.
