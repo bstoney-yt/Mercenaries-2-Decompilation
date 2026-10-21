@@ -68,6 +68,29 @@ end
 return true
 "#;
 
+/// The PDA map's mission tracking: `MrxMissionFlow.Reset` hands the map
+/// `_TrackMission` (`Pda.Map:SetMissionTrackCallback{ fCallback = ... }`,
+/// which `MrxGuiInterface` passes on to the PDA widget). The widget calls
+/// it with the mission the player picks on the map
+/// (`MrxGuiPda._HandleTrackEvent`: the callback's data, then the mission
+/// id); a job marks its targets only while it is tracked. The PDA here is
+/// a stand-in, so the callback is kept in `__m2_track` for
+/// [`Mission::track_mission`] as well.
+const FOLLOW_TRACKING: &str = r#"
+local pda = rawget(_G, "Pda")
+local map = type(pda) == "table" and rawget(pda, "Map")
+if type(map) ~= "table" or type(map.SetMissionTrackCallback) ~= "function" then
+    return
+end
+local set = map.SetMissionTrackCallback
+map.SetMissionTrackCallback = function(self, config, ...)
+    if type(config) == "table" then
+        __m2_track = { config.fCallback, config.tCallbackData }
+    end
+    return set(self, config, ...)
+end
+"#;
+
 /// The flow's full-screen movies (`_PlayMovie{sMovie = "01_AOA_J",
 /// fCallback = ...}`, as `WifMissionFlow` plays the contracts' intro and
 /// closing movies) wait for the game instead of ending at once: each
@@ -835,6 +858,12 @@ impl Mission {
     /// contract's mission, or the save's next, is then waiting.
     pub fn start(&mut self) {
         self.follow_freebies();
+        if let Err(e) = self.run(FOLLOW_TRACKING, "follow tracking") {
+            self.log.push(format!(
+                "  mission tracking: {}",
+                first_lines(&e.to_string())
+            ));
+        }
         let saved = self.world.borrow().saved.clone();
         if let Some(text) = &saved {
             if let Err(e) = self.host.lua().globals().set("__m2_saved", text.as_str()) {
@@ -1730,6 +1759,53 @@ impl Mission {
         if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
             o.alive = false;
             o.health = 0.0;
+        }
+    }
+
+    /// As [`kill`](Self::kill), by `killer` (her character, for what her
+    /// shots, blasts and rams kill): the death event passes the killer
+    /// to the scripts, which pay a hero-only bounty for it.
+    pub fn kill_by(&mut self, guid: u32, killer: u32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            if o.alive {
+                o.killer = Some(killer);
+            }
+            o.alive = false;
+            o.health = 0.0;
+        }
+    }
+
+    /// The player picks mission `id` (`"AllJob002"`) to track on the PDA's
+    /// map: the callback the scripts gave the map
+    /// (`MrxMissionFlow._TrackMission`, [`FOLLOW_TRACKING`]) is called
+    /// with its data and the id, as the PDA widget calls it. False if the
+    /// scripts gave the map no callback.
+    pub fn track_mission(&mut self, id: &str) -> bool {
+        let code = r#"
+local id = ...
+local t = rawget(_G, "__m2_track")
+if type(t) ~= "table" or type(t[1]) ~= "function" then return false end
+local args = {}
+if type(t[2]) == "table" then
+    for _, v in ipairs(t[2]) do args[#args + 1] = v end
+end
+args[#args + 1] = id
+t[1](unpack(args))
+return true
+"#;
+        let tracked = self
+            .host
+            .lua()
+            .load(code)
+            .set_name("=m2 track mission")
+            .call::<bool>(id);
+        match tracked {
+            Ok(t) => t,
+            Err(e) => {
+                self.log
+                    .push(format!("  tracking {id}: {}", first_lines(&e.to_string())));
+                false
+            }
         }
     }
 

@@ -64,6 +64,7 @@ mod held;
 mod hero;
 mod hijack;
 mod input;
+mod jobs;
 mod keytable;
 mod loading;
 mod mission;
@@ -169,6 +170,9 @@ struct Options {
     /// With `--mission`: the story skipped to this contract the game's
     /// developer way, and whether to its briefing (`--skip-to <id>[,briefing]`).
     skip_to: Option<(String, bool)>,
+    /// With `--skip-to` a job: she is put this far from its nearest
+    /// target once it is tracked (`--job-near <m>`, a test shortcut).
+    job_near: Option<f32>,
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
@@ -579,6 +583,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                     None => (v, false),
                 });
             }
+            "--job-near" => o.job_near = Some(value()?.parse()?),
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
@@ -3597,7 +3602,8 @@ fn mission_for_screenshot(
         .with_support(options.support.clone())
         .with_movies(options.movies)
         .with_skip_mode_off(options.skip_mode_off)
-        .with_skip_to(options.skip_to.clone());
+        .with_skip_to(options.skip_to.clone())
+        .with_job_near(options.job_near);
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -4702,6 +4708,27 @@ fn mission_for_screenshot(
             if contracts_seen >= options.contracts.max(1) {
                 play_done = Some(i);
             }
+        }
+        // The job she was skipped to, done (a set job or a collection
+        // completed, a standing bounty paid): she stops as for a contract.
+        if auto.is_some()
+            && play_done.is_none()
+            && let Some(job) = link.job().filter(|j| j.finished())
+        {
+            eprintln!(
+                "autoplay: job {} done after {:.1} s of play ({:.0} s here): {} counted{}, cash {:.0}",
+                job.id,
+                i as f32 * tick,
+                played.elapsed().as_secs_f32(),
+                job.view.counted,
+                if job.view.completed {
+                    ", completed"
+                } else {
+                    ""
+                },
+                link.resources().unwrap_or_default().0
+            );
+            play_done = Some(i);
         }
         if play_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
             break;
