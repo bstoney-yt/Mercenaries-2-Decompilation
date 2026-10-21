@@ -1952,6 +1952,13 @@ impl MissionLink {
             mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
             look(game, mission, &mut self.sighted);
             mission.tick(f64::from(STEP));
+            // The scripts' own interface runs too: its animations finish
+            // and their callbacks run (`MrxGuiCinematic.ShowMovie` plays
+            // a cutscene's movie only once its fade-in animation is done,
+            // and the contract waits on the movie's end: PmcCon002's
+            // 10_BRV_J and PmcCon003's 12_CAR_J never ended, rounds 23
+            // and 28).
+            m2_game::gui_runtime::tick(mission.lua(), f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
                 match &c {

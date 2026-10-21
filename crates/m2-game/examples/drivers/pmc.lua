@@ -138,7 +138,7 @@ Event.Create(Event.TimerRelative, { 15 }, tasks, {})
 -- end callback being set.
 local G = rawget(_G, '_GuiInternal')
 if type(G) == 'table' then
-  for _, k in ipairs({ 'CreateMovieWidget', 'SetMovieFile', 'SetMovie', 'PlayMovie', 'PauseMovie', 'StopMovie', 'SetMovieEndCallback' }) do
+  for _, k in ipairs({ 'CreateMovieWidget', 'SetMovieFile', 'SetMovie', 'PlayMovie', 'PauseMovie', 'StopMovie', 'SetMovieEndCallback', 'PlayAnimation', 'SetAnimationPoint', 'AddAnimationPoint', 'HaltAnimation' }) do
     local f = rawget(G, k) or G[k]
     if type(f) == 'function' then
       G[k] = function(w, ...)
