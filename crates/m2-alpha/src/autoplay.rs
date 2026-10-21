@@ -302,6 +302,15 @@ const UNDER_FOR: f32 = 6.0;
 /// stands by while their soldiers take the point.
 const OUTPOST_NEAR: f32 = 20.0;
 const DELIVERY_AGAIN: f32 = 60.0;
+/// She throws a delivery's designator once facing where it is to land
+/// within this, radians. Invented.
+const FACE_THROW: f32 = 0.15;
+/// She calls in a delivery for a place this near it (its designator
+/// thrown from here lands well inside a 30 m drop zone), and keeps at the
+/// call while this near (round 5 walked 20 m off and dropped it), metres.
+/// Invented.
+const DELIVER_NEAR: f32 = 12.0;
+const DELIVER_KEEP: f32 = 40.0;
 
 /// What she is after.
 #[derive(Clone, Debug, PartialEq)]
@@ -432,6 +441,9 @@ pub struct Autoplay {
     /// Until when (her clock) she clears the soldiers round a truck with
     /// goods on it before driving it ([`CARGO_GUARD`]), once begun.
     guard_until: std::cell::Cell<Option<f32>>,
+    /// Where the scripts' delivery she calls in is to land (a deliverable
+    /// place): she faces it to throw the designator.
+    deliver_at: std::cell::Cell<Option<Vec3>>,
     /// When the vehicles near her boat were last logged.
     near_logged: f32,
     way_logged: f32,
@@ -638,7 +650,7 @@ impl Autoplay {
             Some(Goal::Board(i)) => self.board(game, i, dt),
             Some(Goal::Open(target)) => self.open(game, target, dt),
             Some(Goal::Take(key)) => self.take(game, key, dt),
-            Some(Goal::Deliver(key)) => self.deliver(game, &key),
+            Some(Goal::Deliver(key)) => self.deliver(game, &key, dt),
             Some(Goal::Use { target, at }) => {
                 let here = game.focus();
                 let driving = game.scene.player.as_ref().and_then(|p| p.driving);
@@ -673,7 +685,7 @@ impl Autoplay {
     /// Calls in the support item `key` she holds, as a player does: her
     /// PDA shut, the item chosen in the support menu and taken, its
     /// designator thrown (or aimed and confirmed).
-    fn deliver(&mut self, game: &mut Game, key: &str) -> Intent {
+    fn deliver(&mut self, game: &mut Game, key: &str, dt: f32) -> Intent {
         let mut intent = Intent::default();
         if game.support.pda {
             self.tapped = !self.tapped;
@@ -681,6 +693,16 @@ impl Autoplay {
             return intent;
         }
         if game.combat.to_throw {
+            // Towards where it is to land, if that is known: a throw the
+            // other way can fall outside a drop zone's reach.
+            if let (Some(at), Some(p)) = (self.deliver_at.get(), game.scene.player.as_ref()) {
+                let to = (at - p.character.position).with_y(0.0);
+                let yaw = to.x.atan2(to.z);
+                if wrap(yaw - p.yaw).abs() > FACE_THROW {
+                    intent.look = turn_to(p, yaw, CRUISE_PITCH, dt);
+                    return intent;
+                }
+            }
             intent.trigger.throw = true;
             return intent;
         }
@@ -738,7 +760,14 @@ impl Autoplay {
             .map(|t| t.w_axis.truncate())
             .filter(|c| c.distance(here) < CARGO_NEAR)
             .collect();
+        // Not while she swims: she can't fire (OilCon002 round 3), and
+        // getting on to dry ground is the way out.
+        // Nor with a delivery's smoke in her hand: thrown first, a second's
+        // work (else it is put away and the call is lost).
+        let throwing = matches!(self.goal, Some(Goal::Deliver(_))) && game.combat.to_throw;
         if driving.is_none()
+            && !p.swimming()
+            && !throwing
             && let Some((i, d)) = npcs
                 .iter()
                 .enumerate()
@@ -790,6 +819,7 @@ impl Autoplay {
                 && driving.is_none()
                 && let Some(key) = held.filter(|_| again || game.support.phase != Phase::Idle)
             {
+                self.deliver_at.set(None);
                 return Some((
                     Goal::Deliver(key.clone()),
                     format!(
@@ -1068,6 +1098,56 @@ impl Autoplay {
                     "waiting for the vehicle {load:#x} being brought to {drop:.0}, {:.0} m off",
                     drop.distance(here)
                 ),
+            ));
+        }
+        // A place to deliver to, with the scripts' delivery for it held
+        // (OilCon002's listening posts, "OilCon002_Delivery", given her by
+        // each location: its designator must land within 30 m of it, from
+        // `MrxOilCon002Delivery`'s drop-zone check): called in there, and
+        // kept at until the designator is thrown (round 4 called it in,
+        // then went for a truck and put the smoke away).
+        let calling = match &self.goal {
+            Some(Goal::Deliver(k))
+                if !k.starts_with("SoldierDelivery")
+                    && (game.support.phase != Phase::Idle || game.combat.to_throw) =>
+            {
+                Some(k.clone())
+            }
+            _ => None,
+        };
+        if driving.is_none()
+            && let Some(key) = calling.clone().or_else(|| {
+                game.support.entries().into_iter().find_map(|e| match e {
+                    Entry::Stocked(s)
+                        if s.key.ends_with("Delivery") && !s.key.starts_with("SoldierDelivery") =>
+                    {
+                        Some(s.key.clone())
+                    }
+                    _ => None,
+                })
+            })
+            && let Some(m) = nearest(
+                live.iter()
+                    .copied()
+                    .filter(|m| m.kind == "deliverable")
+                    .collect(),
+                here,
+            )
+            && m.at.distance(here)
+                < if calling.is_some() {
+                    DELIVER_KEEP
+                } else {
+                    DELIVER_NEAR
+                }
+            && (calling.is_some()
+                || self
+                    .delivered
+                    .is_none_or(|t| self.clock - t > DELIVERY_AGAIN))
+        {
+            self.deliver_at.set(Some(m.at));
+            return Some((
+                Goal::Deliver(key.clone()),
+                format!("calling in {key} at {} ({:#x})", m.name, m.target),
             ));
         }
         // Places to get to (not the vehicle she is in): those marked, else
@@ -1716,11 +1796,14 @@ impl Autoplay {
         } else {
             0.0
         };
+        // No clear shot counts whether or not her aim has settled: one she
+        // can't aim at never settles (OilCon002 round 1: 1700 s, 5 m from
+        // three soldiers a floor below, no round fired).
         if clear {
             self.blocked = 0.0;
             self.vantage = None;
             self.tried.clear();
-        } else if error < ON_TARGET {
+        } else {
             self.blocked += dt;
         }
         // Aimed a while with a wall in the way: from where she can see
@@ -2534,19 +2617,44 @@ impl Autoplay {
         };
         // Onto the ground by the way's height there (the floor under a
         // roof), else the highest there is.
-        let near = Vec3::new(to.x, at.y + HOP_ABOVE, to.z);
-        let high = Vec3::new(to.x, to.y.max(at.y) + 80.0, to.z);
-        if let Some(y) = world
-            .physics
-            .cast_ray(near, Vec3::NEG_Y, HOP_ABOVE + HOP_BELOW)
-            .map(|(t, _)| near.y - t)
-            .or_else(|| {
-                world
-                    .physics
-                    .cast_ray(high, Vec3::NEG_Y, 400.0)
-                    .map(|(t, _)| high.y - t)
-            })
+        let ground = |physics: &Physics, to: Vec3| {
+            let near = Vec3::new(to.x, at.y + HOP_ABOVE, to.z);
+            let high = Vec3::new(to.x, to.y.max(at.y) + 80.0, to.z);
+            physics
+                .cast_ray(near, Vec3::NEG_Y, HOP_ABOVE + HOP_BELOW)
+                .map(|(t, _)| near.y - t)
+                .or_else(|| {
+                    physics
+                        .cast_ray(high, Vec3::NEG_Y, 400.0)
+                        .map(|(t, _)| high.y - t)
+                })
+        };
+        // On foot, not into water out of her depth, where she can't fire
+        // (OilCon002 round 3: hopped into the harbour by the first post,
+        // then 1500 s swimming under three soldiers' fire): shorter, else
+        // as far again, to dry ground.
+        let wet = |physics: &Physics, to: Vec3, y: f32| {
+            physics
+                .water_at(to.x, to.z)
+                .is_some_and(|w| w - y > crate::player::SWIM_START)
+        };
+        if p.driving.is_none()
+            && let Some(y) = ground(&world.physics, to)
+            && wet(&world.physics, to, y)
         {
+            let dir = flat.normalize_or_zero();
+            let reach = (to - from).with_y(0.0).length();
+            let dry = (1..=8)
+                .map(|k| reach - 3.0 * k as f32)
+                .filter(|&l| l > 2.0)
+                .chain((1..=8).map(|k| reach + 3.0 * k as f32))
+                .map(|l| from + dir * l)
+                .find(|&t| ground(&world.physics, t).is_some_and(|y| !wet(&world.physics, t, y)));
+            if let Some(t) = dry {
+                to = t;
+            }
+        }
+        if let Some(y) = ground(&world.physics, to) {
             to.y = y;
         }
         let yaw = flat.x.atan2(flat.z);
@@ -2696,6 +2804,21 @@ impl Autoplay {
         }
         if game.support.busy() {
             holding += &format!("; support {:?}", game.support.phase);
+        }
+        // Why a fight goes on without rounds (OilCon002 rounds 1-2).
+        if self.blocked > 0.0 || self.steady > 0.0 || self.vantage.is_some() {
+            holding += &format!(
+                "; aim steady {:.1} s, blocked {:.1} s, vantage {:?}, {} tried",
+                self.steady,
+                self.blocked,
+                self.vantage.map(|(_, s)| s),
+                self.tried.len()
+            );
+            if let Some(Goal::Shoot(i)) = self.goal
+                && let Some(n) = game.scene.people.npcs.get(i)
+            {
+                holding += &format!(", target at {:.1}", n.character.position);
+            }
         }
         eprintln!(
             "autoplay {:.1} s: at {:.1}, {}, health {:.0}, {}; closest {:.0} m, {:.0} s ago; {} hops{holding}; {}",
