@@ -2272,13 +2272,18 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&player, "IsLocal", |_, _, a| {
         values([Value::Boolean(id(a.first()) == Some(1))])
     })?;
-    for name in ["GetAllPlayers", "GetCurrentPlayers"] {
-        add(&player, name, |_, lua, _| {
-            let t = lua.create_table()?;
-            t.raw_push(1)?;
-            values([Value::Table(t)])
-        })?;
-    }
+    // The players, a list the scripts go through (`pairs`, `ipairs`)...
+    add(&player, "GetAllPlayers", |_, lua, _| {
+        let t = lua.create_table()?;
+        t.raw_push(1)?;
+        values([Value::Table(t)])
+    })?;
+    // ...and how many there are, which they compare and count with
+    // (`nPlayers == 2`, `1 < n`; from the scripts' use: PirCon004 did
+    // sums on it and stopped short of its ending).
+    add(&player, "GetCurrentPlayers", |_, _, _| {
+        values([Value::Integer(1)])
+    })?;
 
     let vehicle = lib("Vehicle")?;
     add(&vehicle, "GetDriver", |w, _, a| {
@@ -3814,6 +3819,21 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    // The scripts count the players (`nPlayers == 2`, sums on it:
+    // PirCon004) and go through the list of them.
+    #[test]
+    fn one_player_is_counted_and_listed() {
+        let (host, _) = setup();
+        let (n, more, listed): (i64, bool, i64) = host
+            .lua()
+            .load(
+                "local n = Player.GetCurrentPlayers()                  return n * 2, 1 < n, table.getn(Player.GetAllPlayers())",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((n, more, listed), (2, false, 1));
     }
 
     #[test]
