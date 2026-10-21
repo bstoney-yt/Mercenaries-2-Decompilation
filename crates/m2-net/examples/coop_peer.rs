@@ -45,6 +45,7 @@ fn main() {
             .collect();
         [v[0], v[1], v[2]]
     });
+    let follow = centre.is_none();
     let options = Options {
         me: Hello {
             version: m2_net::proto::VERSION,
@@ -93,7 +94,10 @@ fn main() {
                     received += 1;
                     if received == 1 {
                         println!("first hero: {:?}", h.position);
-                        centre.get_or_insert(h.position);
+                    }
+                    // Without --at, round wherever the other hero is now.
+                    if follow {
+                        centre = Some(h.position);
                     }
                 }
                 Event::Link { rtt, relayed } => {

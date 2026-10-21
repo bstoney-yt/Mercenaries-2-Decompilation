@@ -35,6 +35,10 @@ pub struct Setup {
     /// Hosting, put the invite link on the clipboard to paste to a
     /// friend (not in test runs, which would overwrite it).
     pub copy_link: bool,
+    /// With `--screenshot`: once the friend is in, put her by the
+    /// nearest of the island's people (`--coop-visit`), so there are some
+    /// to share. For testing.
+    pub visit: bool,
 }
 
 /// Counts for the log and the end-of-run summary.
@@ -288,13 +292,14 @@ impl Coop {
                     .reduce(f32::min)
             });
             eprintln!(
-                "coop: sharing {} people near the friend (most {}; {} in, {} out) of {} here ({} landed), nearest {}",
+                "coop: sharing {} people near the friend (most {}; {} in, {} out) of {} here ({} landed, {} alive), nearest {}",
                 s.shared,
                 s.most,
                 s.sent_in,
                 s.sent_out,
                 npcs.len(),
                 npcs.iter().filter(|n| n.landed).count(),
+                npcs.iter().filter(|n| n.alive).count(),
                 nearest.map_or("-".to_owned(), |d| format!("{d:.1} m")),
             );
         }
@@ -423,7 +428,25 @@ pub fn offscreen(
     let start = Instant::now();
     let mut next = start;
     let mut mid = false;
+    let mut visited = !setup.visit;
     while start.elapsed().as_secs_f32() < seconds {
+        if !visited && coop.peer.is_some() {
+            visited = true;
+            let here = game.scene.player.as_ref().map(|p| p.character.position);
+            let near = here.and_then(|h| {
+                game.scene
+                    .people
+                    .npcs
+                    .iter()
+                    .filter(|n| n.landed)
+                    .map(|n| n.character.position)
+                    .min_by(|a, b| a.distance(h).total_cmp(&b.distance(h)))
+            });
+            if let (Some(at), Some(p)) = (near, game.scene.player.as_mut()) {
+                p.character.position = at + m2_math::glam::Vec3::new(4.0, 0.5, 4.0);
+                eprintln!("coop: put her by the people at {:.0},{:.0}", at.x, at.z);
+            }
+        }
         let intent = match walk {
             Some(g) if g != m2_engine::Gait::Idle && coop.peer.is_some() => crate::player::Intent {
                 movement: m2_math::glam::Vec2::Y,

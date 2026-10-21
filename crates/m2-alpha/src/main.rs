@@ -467,6 +467,7 @@ fn parse_args() -> anyhow::Result<Options> {
         ..Options::default()
     };
     let (mut coop_role, mut coop_local, mut coop_name) = (None, false, None);
+    let mut coop_visit = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
@@ -509,6 +510,7 @@ fn parse_args() -> anyhow::Result<Options> {
                 coop_role = Some(coop::Role::Join(invite));
             }
             "--coop-local" => coop_local = true,
+            "--coop-visit" => coop_visit = true,
             "--name" => coop_name = Some(value()?),
             "--coop-seconds" => {
                 o.coop_seconds = value()?.parse().context("--coop-seconds expects seconds")?
@@ -884,6 +886,7 @@ fn parse_args() -> anyhow::Result<Options> {
         name: coop_name.unwrap_or_else(|| "Player".into()),
         relay: !coop_local,
         copy_link: o.screenshot.is_none(),
+        visit: coop_visit,
     });
     Ok(o)
 }
