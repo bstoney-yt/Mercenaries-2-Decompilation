@@ -1628,7 +1628,23 @@ impl Autoplay {
             return self.walk(game, at, far - 5.0, dt);
         }
         if d < near {
-            // Too close for a rocket or a round: back off.
+            // Too close for a rocket or a round: back off, to a spot to
+            // fire from if there is one (round 36's AllCon002: in the river
+            // by the third boat, 1900 s getting no further off).
+            if self.blast_spot.is_none()
+                && let Some(s) = game.scene.world.as_ref().and_then(|w| {
+                    let rings: &[f32] = if lobbing { &LOB_RINGS } else { &BLAST_RINGS };
+                    vantage(&w.physics, at, here, &self.tried, rings, BLAST_BODY)
+                })
+            {
+                eprintln!(
+                    "autoplay {:.1} s: too close to {}: firing from {s:.1}",
+                    self.clock, self.what
+                );
+                self.blast_spot = Some((target, s));
+                self.fresh_headway();
+                return self.walk(game, s, 1.0, dt);
+            }
             let away = here + (here - at).with_y(0.0).normalize_or(Vec3::X) * 10.0;
             return self.walk(game, away, 1.0, dt);
         }
@@ -2299,6 +2315,13 @@ impl Autoplay {
         };
         let step = flat.length().min(HOP).min(room.max(0.0));
         let mut to = from + flat.normalize_or_zero() * step;
+        // Already nearer than that (round 36's AllCon002: 5 m from the third
+        // boat, hopped straight down to the riverbed 25 times): out to it.
+        if let Some(Goal::Blast { at: t, .. }) = self.goal
+            && room < 0.0
+        {
+            to = from + (from - t).with_y(0.0).normalize_or(Vec3::X) * (-room).min(HOP);
+        }
         let (Some(world), Some(p)) = (&mut game.scene.world, &mut game.scene.player) else {
             return;
         };
