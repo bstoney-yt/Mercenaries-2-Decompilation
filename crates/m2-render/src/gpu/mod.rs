@@ -577,6 +577,15 @@ impl WgpuBackend {
         if let Some(srgb) = caps.formats.iter().copied().find(|f| f.is_srgb()) {
             config.format = srgb;
         }
+        // The overlay draws through the frame's gamma (non-sRGB) view, where
+        // the adapter lets a surface have one ([`OverlayTarget`]).
+        if adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS)
+        {
+            config.view_formats = vec![config.format.remove_srgb_suffix()];
+        }
         config.present_mode = if vsync {
             wgpu::PresentMode::AutoVsync
         } else {
@@ -617,7 +626,7 @@ impl WgpuBackend {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+            view_formats: &[format.remove_srgb_suffix()],
         });
         Ok(Self::new(
             adapter,
@@ -1428,6 +1437,21 @@ impl WgpuBackend {
             out.extend_from_slice(&mapped[start..start + row as usize]);
         }
         Ok(out)
+    }
+
+    /// The format an overlay draws in: the frame's without sRGB where the
+    /// frame may be viewed so (always offscreen; a window's surface where
+    /// it was configured with that view format), else the frame's.
+    fn overlay_format(&self) -> wgpu::TextureFormat {
+        let format = self.color_format();
+        match &self.target {
+            Target::Window { config, .. }
+                if !config.view_formats.contains(&format.remove_srgb_suffix()) =>
+            {
+                format
+            }
+            _ => format.remove_srgb_suffix(),
+        }
     }
 
     fn color_format(&self) -> wgpu::TextureFormat {
@@ -2496,7 +2520,12 @@ impl RenderBackend for WgpuBackend {
 
 /// Where an overlay (a HUD, a menu) draws, after the world and before the
 /// frame is shown. The colour target holds the finished world; there is no
-/// depth.
+/// depth. The view is the frame's gamma (non-sRGB) one where it can be, so
+/// the overlay's see-through colours blend over the world in gamma, as the
+/// game's Direct3D 9 interface does: the pause menu's black at 192 of 255
+/// leaves a quarter of the world's brightness (footage, playtest 3 frames
+/// 52-56 at 1:42-1:50: 80 -> 17 over the top rows), where blending in
+/// linear light left half (gap-list renderer round).
 #[derive(Debug)]
 pub struct OverlayTarget<'a> {
     pub device: &'a wgpu::Device,
@@ -2561,7 +2590,7 @@ impl WgpuBackend {
                 .write_buffer(&self.palette_buffer, 0, bytemuck::cast_slice(&palette));
         }
         let size = self.size();
-        let format = self.color_format();
+        let format = self.overlay_format();
         let over = |target: &wgpu::TextureView,
                     overlay: &mut Option<&mut dyn FnMut(OverlayTarget<'_>)>| {
             overlay.as_mut().map(|f| {
@@ -2581,7 +2610,8 @@ impl WgpuBackend {
             Target::Offscreen { texture, .. } => {
                 let target = texture.create_view(&Default::default());
                 let commands = self.encode(&view, &draws, &target)?;
-                let overlay = over(&target, &mut overlay);
+                let gamma = overlay_view(texture, format);
+                let overlay = over(&gamma, &mut overlay);
                 self.queue.submit(std::iter::once(commands).chain(overlay));
             }
             // In the background: nothing to draw to.
@@ -2605,13 +2635,23 @@ impl WgpuBackend {
                 };
                 let target = frame.texture.create_view(&Default::default());
                 let commands = self.encode(&view, &draws, &target)?;
-                let overlay = over(&target, &mut overlay);
+                let gamma = overlay_view(&frame.texture, format);
+                let overlay = over(&gamma, &mut overlay);
                 self.queue.submit(std::iter::once(commands).chain(overlay));
                 self.queue.present(frame);
             }
         }
         Ok(())
     }
+}
+
+/// A view of `texture` in `format` (its own, or its non-sRGB twin for an
+/// overlay).
+fn overlay_view(texture: &wgpu::Texture, format: wgpu::TextureFormat) -> wgpu::TextureView {
+    texture.create_view(&wgpu::TextureViewDescriptor {
+        format: Some(format),
+        ..Default::default()
+    })
 }
 
 /// How much of the air between the eye and the cloud deck dims and tints

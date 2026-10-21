@@ -12,11 +12,44 @@ use m2_render::*;
 
 const SIZE: u32 = 64;
 
-fn backend() -> Option<WgpuBackend> {
+/// One test at a time on the GPU: several headless devices made and
+/// driven at once from the test threads hung the debug build's run (CI's
+/// and locally, with every test passing alone), so each test holds this
+/// lock for as long as it holds its backend.
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A headless backend, and the GPU to itself while it lives.
+struct Gpu {
+    backend: WgpuBackend,
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for Gpu {
+    type Target = WgpuBackend;
+    fn deref(&self) -> &WgpuBackend {
+        &self.backend
+    }
+}
+
+impl std::ops::DerefMut for Gpu {
+    fn deref_mut(&mut self) -> &mut WgpuBackend {
+        &mut self.backend
+    }
+}
+
+fn backend() -> Option<Gpu> {
+    // A test that failed holding the lock poisons it; the GPU is still
+    // free to use.
+    let turn = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match WgpuBackend::headless(SIZE, SIZE) {
         Ok(b) => {
             eprintln!("adapter: {:?}", b.adapter_summary());
-            Some(b)
+            Some(Gpu {
+                backend: b,
+                _turn: turn,
+            })
         }
         Err(e) => {
             eprintln!("skipping: no GPU adapter ({e})");
@@ -789,4 +822,40 @@ fn shallow_water_shows_the_bed_beneath() {
     let (s, d) = (pixel(&rgba, s.0, s.1), pixel(&rgba, d.0, d.1));
     eprintln!("shallow {s:?}, deep {d:?}");
     assert!(s[0] > s[1] && s[0] > d[0] + 40, "shallow {s:?}, deep {d:?}");
+}
+
+// The overlay draws in gamma: its view is the frame's non-sRGB twin, so a
+// grey of 0.5 lands as 128, not as the 188 an sRGB view would store, and
+// see-through overlay colours blend in gamma as the game's interface does.
+#[test]
+fn overlays_draw_in_gamma() {
+    use m2_render::gpu::wgpu;
+    let Some(mut backend) = backend() else { return };
+    backend.begin_frame(&view()).unwrap();
+    backend
+        .end_frame_with(&mut |t| {
+            assert!(!t.format.is_srgb(), "{:?}", t.format);
+            let _pass = t.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: t.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.5,
+                            g: 0.5,
+                            b: 0.5,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+        })
+        .unwrap();
+    let pixels = backend.read_pixels().unwrap();
+    let p = pixel(&pixels, SIZE / 2, SIZE / 2);
+    assert!((i32::from(p[0]) - 128).abs() <= 1, "{p:?}");
 }
