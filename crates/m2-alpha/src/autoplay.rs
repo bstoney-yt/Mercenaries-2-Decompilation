@@ -1566,7 +1566,11 @@ impl Autoplay {
         };
         // Going where she can fire from (in range, nothing in the way).
         if let Some((_, spot)) = self.blast_spot {
-            if spot.with_y(0.0).distance(here.with_y(0.0)) >= ARRIVE {
+            let off = spot.with_y(0.0).distance(here.with_y(0.0));
+            // Near enough once she gets no nearer (round 35's AllCon002:
+            // stopped 3 m off, each such spot given up as unreached).
+            let close = off < 2.0 * ARRIVE && self.since_moved() > SPOT_GIVE_UP;
+            if off >= ARRIVE && !close {
                 // One she gets no nearer to (round 28's AllCon002: 6 m short
                 // of it, 2000 s of hops on the spot): another.
                 if self.since_moved() > SPOT_GIVE_UP {
@@ -1606,8 +1610,11 @@ impl Autoplay {
                     let rings: &[f32] = if lobbing { &LOB_RINGS } else { &BLAST_RINGS };
                     // Else the dry ground nearest it (round 34's AllCon002:
                     // no spot in range saw it, and she went in again).
-                    vantage(&w.physics, at, here, &self.tried, rings, BLAST_BODY)
-                        .or_else(|| landing(&w.physics, at, here, &self.tried))
+                    // Within range of it (round 35's: spots 270 m off).
+                    vantage(&w.physics, at, here, &self.tried, rings, BLAST_BODY).or_else(|| {
+                        landing(&w.physics, at, here, &self.tried)
+                            .filter(|s| s.distance(at) < far - ARRIVE)
+                    })
                 })
             {
                 eprintln!(
