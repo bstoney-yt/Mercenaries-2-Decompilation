@@ -1468,18 +1468,25 @@ impl Autoplay {
         // on (PirCon004 round 78: her truck ran into a parked pickup and
         // a trailer by the drop-off, close by the way planned round them).
         let standing = standing_ahead(game, i, m, speed);
+        // A boat, with no brakes, turns away harder and backs its engine
+        // (GurCon003 round 84: her race boat met a moored fishing boat by
+        // a gate at 31 m/s, easing off).
+        let boat = game.scene.vehicles[i].spec.is_boat();
+        let swerve = if boat { 2.0 * SWERVE } else { SWERVE };
         let angle = match standing {
-            Some(x) => angle + if x > 0.0 { SWERVE } else { -SWERVE },
+            Some(x) => angle + if x > 0.0 { swerve } else { -swerve },
             None => angle,
         };
         let mut steer = (angle * 2.0).clamp(-1.0, 1.0);
-        let mut throttle = if oncoming || standing.is_some() {
+        let mut throttle = if boat && standing.is_some() && speed > SLOW {
+            -1.0
+        } else if oncoming || standing.is_some() {
             0.3
         } else {
             1.0
         };
         if (d < SLOW_NEAR && speed > SLOW) || (angle.abs() > 0.8 && speed > SLOW) {
-            throttle = 0.2;
+            throttle = throttle.min(0.2);
         }
         // Goods riding on her truck (PirCon002's rum): no faster than a
         // careful driver goes, so a crash costs less of them.
@@ -1491,7 +1498,6 @@ impl Autoplay {
         // (PirCon004 round 72: a car crossing her road at speed wrecked
         // the organ truck, 35.9 m/s closing); in a boat too (GurCon003
         // round 81: a pleasure boat wrecked her race boat, 34.8 m/s).
-        let boat = game.scene.vehicles[i].spec.is_boat();
         if (laden || boat) && crossing(game, i, m) {
             throttle = if speed > 1.0 { -1.0 } else { 0.0 };
         }
