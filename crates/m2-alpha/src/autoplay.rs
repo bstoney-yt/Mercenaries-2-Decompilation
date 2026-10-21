@@ -309,6 +309,10 @@ const UNDER_BY: f32 = 4.0;
 /// A building to destroy this near (metres, flat) under one she is to
 /// reach is left standing meanwhile.
 const HOLDS_UP: f32 = 20.0;
+/// ...when they stand this much higher than its foot, metres (invented:
+/// PmcCon033 round 5, she stood 0.1 m above the range's targets on the
+/// same floor and left them standing as if on their roof).
+const HOLDS_UP_RISE: f32 = 2.0;
 /// One following her left this far behind (metres) this long (seconds)
 /// is brought to her: a test driver's shortcut, logged, for ways the
 /// alpha has no means of (a VIP off a roof, which a player lifts off by
@@ -1117,7 +1121,10 @@ impl Autoplay {
                 .map(|n| n.at)
                 .chain(followers.iter().copied())
                 .chain([here])
-                .any(|at| at.y > m.at.y && at.with_y(0.0).distance(m.at.with_y(0.0)) < HOLDS_UP)
+                .any(|at| {
+                    at.y > m.at.y + HOLDS_UP_RISE
+                        && at.with_y(0.0).distance(m.at.with_y(0.0)) < HOLDS_UP
+                })
                 || followers.iter().any(|f| {
                     f.with_y(0.0).distance(m.at.with_y(0.0)) < crate::combat::BOMB_FRAG.0 + HOLDS_UP
                 })
