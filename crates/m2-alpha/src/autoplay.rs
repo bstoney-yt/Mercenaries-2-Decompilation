@@ -147,6 +147,10 @@ const CARGO_CLEAR: f32 = 15.0;
 /// metres; not what is wider than this (a building's whole batch).
 const AVOID_ROOM: f32 = 2.0;
 const AVOID_LARGEST: f32 = 40.0;
+/// Held by the ground alone, she keeps out of this square (half its side,
+/// metres) this far ahead of her vehicle's middle (invented).
+const TERRAIN_HALF: f32 = 3.0;
+const TERRAIN_AHEAD: f32 = 4.0;
 /// Vehicles going slower than this, m/s, within this of her, metres, are
 /// kept out of on her ways (invented).
 const PARKED_SPEED: f32 = 1.0;
@@ -1447,6 +1451,7 @@ impl Autoplay {
                 // What holds her is kept out of from here on (PirCon003
                 // rounds 61-62: the way out of the parrots' base ran over
                 // a bank its truck caught on, again each time planned).
+                let kept = self.avoid.len();
                 for (key, _, (lo, hi)) in w.physics.vehicle_touching(id) {
                     let (lo, hi) = (
                         Vec2::new(lo.x, lo.z) - Vec2::splat(AVOID_ROOM),
@@ -1464,6 +1469,28 @@ impl Autoplay {
                         self.avoid.push((lo, hi));
                         self.way = None;
                     }
+                }
+                // Held by the ground alone (a bank too steep: PirCon004
+                // rounds 71 and 79 stalled at one by a checkpoint, and a
+                // grenade followed): the ground just ahead is kept out of,
+                // unless that is where she is going. Not a boat's (the
+                // races' shallows are in the way only for a moment).
+                let ahead = m.transform_point3(Vec3::Z * TERRAIN_AHEAD);
+                let (lo, hi) = (
+                    Vec2::new(ahead.x, ahead.z) - Vec2::splat(TERRAIN_HALF),
+                    Vec2::new(ahead.x, ahead.z) + Vec2::splat(TERRAIN_HALF),
+                );
+                let goal = Vec2::new(at.x, at.z);
+                if self.avoid.len() == kept
+                    && !v.spec.is_boat()
+                    && !(goal.cmpge(lo).all() && goal.cmple(hi).all())
+                {
+                    eprintln!(
+                        "autoplay {:.1} s: keeping out of the ground ahead ({lo:.0} to {hi:.0}) from now on",
+                        self.clock
+                    );
+                    self.avoid.push((lo, hi));
+                    self.way = None;
                 }
             }
             // A boat run aground near the place: out, into the shallows
