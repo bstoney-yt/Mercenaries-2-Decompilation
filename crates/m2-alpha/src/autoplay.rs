@@ -328,6 +328,10 @@ const FACE_THROW: f32 = 0.15;
 /// Invented.
 const DELIVER_NEAR: f32 = 12.0;
 const DELIVER_KEEP: f32 = 40.0;
+/// After calling a delivery in, she waits this long for the scripts to
+/// hand her its designator (round 7: the call went out, and she walked off
+/// the frame after, the smoke not yet in her hand), seconds. Invented.
+const DESIGNATOR_WAIT: f32 = 3.0;
 
 /// What she is after.
 #[derive(Clone, Debug, PartialEq)]
@@ -884,7 +888,11 @@ impl Autoplay {
         // getting on to dry ground is the way out.
         // Nor with a delivery's smoke in her hand: thrown first, a second's
         // work (else it is put away and the call is lost).
-        let throwing = matches!(self.goal, Some(Goal::Deliver(_))) && game.combat.to_throw;
+        let throwing = matches!(self.goal, Some(Goal::Deliver(_)))
+            && (game.combat.to_throw
+                || self
+                    .delivered
+                    .is_some_and(|t| self.clock - t < DESIGNATOR_WAIT));
         if driving.is_none()
             && !p.swimming()
             && !throwing
@@ -989,7 +997,11 @@ impl Autoplay {
             .world
             .as_ref()
             .map_or(&none, |w| &w.index.template_db);
-        let destroying = live.iter().any(|m| m.kind == "destroy");
+        // Places to deliver to count too: OilCon002's last post has 15 minutes
+        // (round 11 went 240 m back for grenades and missed it by 30 s).
+        let destroying = live
+            .iter()
+            .any(|m| m.kind == "destroy" || m.kind == "deliverable");
         let rockets_out = game.combat.second == Some(Weapon::Rpg)
             && game.combat.launcher_rounds.is_none_or(|r| r.total() == 0)
             && live.iter().any(|m| m.kind == "destroy");
@@ -1236,7 +1248,11 @@ impl Autoplay {
         let calling = match &self.goal {
             Some(Goal::Deliver(k))
                 if !k.starts_with("SoldierDelivery")
-                    && (game.support.phase != Phase::Idle || game.combat.to_throw) =>
+                    && (game.support.phase != Phase::Idle
+                        || game.combat.to_throw
+                        || self
+                            .delivered
+                            .is_some_and(|t| self.clock - t < DESIGNATOR_WAIT)) =>
             {
                 Some(k.clone())
             }

@@ -1105,14 +1105,18 @@ fn check(
         }
         // { cargo, carrier, "Attach" or "Detach" }: when the cargo is
         // hooked onto (or let go from) a winch. Passes cargo and carrier.
+        // `MrxTaskObjectiveDeliver` waits on { cargo, 0, "any" } for cargo
+        // that reached its place still hanging (OilCon002's listening
+        // posts): carrier 0 is any; "any" is taken to hold once it is let
+        // go, the change that objective waits for (inferred from its
+        // `_OnObjectWinched` use, not checked against the game).
         "ObjectWinched" => {
-            let (Some(cargo), detach) = (
-                guid(&p.params, 1),
-                text(&p.params, 3).is_some_and(|t| t.eq_ignore_ascii_case("detach")),
-            ) else {
+            let Some(cargo) = guid(&p.params, 1) else {
                 return no;
             };
-            let carrier = guid(&p.params, 2);
+            let mode = text(&p.params, 3);
+            let detach = matches!(mode.as_deref(), Some("detach" | "any"));
+            let carrier = guid(&p.params, 2).filter(|&c| c != 0);
             let holds = match world.winch(cargo) {
                 Some(None) => detach,
                 Some(Some(c)) => !detach && carrier.is_none_or(|w| w == c),

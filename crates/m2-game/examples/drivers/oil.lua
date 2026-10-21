@@ -52,6 +52,23 @@ MrxTask._SetState = function(o, ...)
   return unpack(r, 1, table.maxn(r))
 end
 
+-- What a delivery objective makes of its cargo by the place (DELIVER
+-- lines): OilCon002's posts come in by helicopter.
+for _, f in ipairs({ '_FilterTargetAtDestination', '_DeliveryCheck', '_FilterTargetLeftDestination' }) do
+  local orig = MrxTaskObjectiveDeliver and MrxTaskObjectiveDeliver[f]
+  if orig then
+    MrxTaskObjectiveDeliver[f] = function(o, a, ...)
+      local r = { orig(o, a, ...) }
+      local okn, nm = pcall(function() return o:GetName() end)
+      say('>>> DELIVER ' .. f .. ' ' .. tostring(okn and nm) .. ' ' .. tostring(a)
+        .. ' winched=' .. tostring(Object.IsWinched(a)) .. ' -> ' .. tostring(r[1]))
+      return unpack(r, 1, table.maxn(r))
+    end
+  else
+    say('>>> DELIVER no ' .. f)
+  end
+end
+
 -- Every 15 s: the UP HQs' state, as `MrxHq.RefreshUiDisplay` decides
 -- whether a portal is open (a starter with briefings, not locked, she not
 -- inside).
@@ -69,6 +86,19 @@ local function hqs()
         .. ' global=' .. tostring(hq.bGloballyLocked) .. ' inside=' .. tostring(hq._bInside)
         .. ' starter=' .. tostring(st and st.GetName and st:GetName())
         .. ' briefings=' .. tostring(okb and nb))
+    end
+  end
+  -- OilCon002's posts: what carries the label its deliveries wait on
+  -- ("Listening Post", `MrxTaskObjectiveDeliver`'s label filter) by each
+  -- location.
+  for _, loc in ipairs({ 'oilcon002_loc_postA', 'oilcon002_loc_postB', 'oilcon002_loc_postC' }) do
+    local okp, n = pcall(function()
+      local g = Pg.GetGuidByName(loc)
+      local x, y, z = Object.GetPosition(g)
+      return table.getn(Pg.GetObjectsInArea(x, y, z, 10, 'Listening Post'))
+    end)
+    if okp and n and n > 0 then
+      say('>>> POSTS ' .. loc .. ' ' .. tostring(n))
     end
   end
   Event.Create(Event.TimerRelative, { 15 }, hqs, {})

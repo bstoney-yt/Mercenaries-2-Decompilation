@@ -4365,6 +4365,43 @@ mod tests {
     }
 
     #[test]
+    fn a_delivery_hears_its_cargo_let_go_by_any_carrier() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(80, Object::new("copter", [0.0, 100.0, 0.0]));
+            let mut pilot = Object::new("pilot", [0.0, 100.0, 0.0]);
+            pilot.vehicle = Some(80);
+            w.insert(81, pilot);
+            w.insert(82, Object::new("post", [0.0, 95.0, 0.0]));
+        }
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        // As `MrxTaskObjectiveDeliver` waits for cargo that reached its
+        // place still hanging (OilCon002's listening posts).
+        host.lua()
+            .load(
+                r#"
+                heard = nil
+                local copter, post = Sys.StringToGuid("80"), Sys.StringToGuid("82")
+                Object.AttachCargoToWinch(post, copter)
+                Event.Create(Event.ObjectWinched, {post, 0, "any"}, function(c)
+                    heard = Object.IsWinched(c)
+                end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        events.update_shared(0.1, &world);
+        let heard =
+            |host: &ScriptHost| -> Option<bool> { host.lua().globals().get("heard").unwrap() };
+        assert_eq!(heard(&host), None);
+        assert!(arrived(&world, 81, [50.0, 0.0, 60.0]).is_empty());
+        events.update_shared(0.1, &world);
+        assert_eq!(heard(&host), Some(false));
+    }
+
+    #[test]
     fn menus_build_widgets_and_math_has_the_basics() {
         let (host, _) = setup();
         let (a, b, w, m, kids, left, guid): (i64, i64, f64, f64, i64, i64, String) = host
