@@ -3270,7 +3270,15 @@ fn rides(game: &Game, mission: &Mission) -> Vec<(u32, Vec3)> {
         .filter_map(|g| {
             let o = w.objects.get(&g).filter(|o| o.alive)?;
             let models = object_models(g, &o.name, island, &catalogue.vehicles);
-            ai_flown(&w, g, &models).then(|| (g, Vec3::from(o.position)))
+            // Or one nobody is in that the alpha doesn't have as hers
+            // (PmcCon004's "Get Solano", the `Mi35 (Solano Hijack)` an
+            // `MrxTaskObjectiveEnterVehicle` names: round 7 stood 1400 s by
+            // it with nothing offered). Boarded the same way (inferred).
+            let heli = models
+                .iter()
+                .any(|m| m.kind == m2_engine::vehicle::HELICOPTER);
+            let hers = game.scene.vehicles.iter().any(|v| v.guid == Some(g));
+            (ai_flown(&w, g, &models) || (heli && !hers)).then(|| (g, Vec3::from(o.position)))
         })
         .collect()
 }
