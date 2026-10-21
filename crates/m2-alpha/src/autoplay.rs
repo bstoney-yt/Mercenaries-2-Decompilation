@@ -1959,11 +1959,14 @@ impl Autoplay {
         } else {
             0.0
         };
+        // No clear shot counts whether or not her aim has settled: one she
+        // can't aim at never settles (OilCon002 round 1: 1700 s, 5 m from
+        // three soldiers a floor below, no round fired).
         if clear {
             self.blocked = 0.0;
             self.vantage = None;
             self.tried.clear();
-        } else if error < ON_TARGET {
+        } else {
             self.blocked += dt;
         }
         // Aimed a while with a wall in the way: from where she can see
