@@ -2124,10 +2124,59 @@ impl MissionLink {
             None => false,
         };
         if marks.iter().any(|m| m.alive && ours(m)) {
-            marks.into_iter().filter(ours).collect()
-        } else {
-            marks
+            return marks.into_iter().filter(ours).collect();
         }
+        // None up for the contract: its active action objectives' targets,
+        // which the scripts put no marker or blip over (PmcCon003's "Get
+        // inside the PMC!" on `PlayerLocation_PMC`, round 16: she went
+        // after the jobs' markers instead).
+        let acts = self.contract_actions();
+        if acts.is_empty() {
+            return marks;
+        }
+        let State::Running(mission) = &self.state else {
+            return marks;
+        };
+        let w = mission.world().borrow();
+        acts.into_iter()
+            .filter_map(|g| {
+                let o = w.objects.get(&g)?;
+                Some(Mark {
+                    target: g,
+                    kind: "action".to_owned(),
+                    name: o.name.clone(),
+                    at: Vec3::from(o.position),
+                    alive: o.alive,
+                    mission: Some(MarkFor::Index(index)),
+                })
+            })
+            .collect()
+    }
+
+    /// The targets of the current contract's active action objectives
+    /// (`MrxTaskObjectiveAction`, their `_uTgtObjFilter`), from the
+    /// scripts' own tasks.
+    fn contract_actions(&self) -> Vec<u32> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        let Ok(found) = mission
+            .lua()
+            .load(CONTRACT_ACTIONS)
+            .set_name("=contract actions")
+            .eval::<Option<mlua::Table>>()
+        else {
+            return Vec::new();
+        };
+        found
+            .into_iter()
+            .flat_map(|t| {
+                t.sequence_values::<mlua::Value>()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .filter_map(|v| m2_game::events::as_guid(&v))
+            .collect()
     }
 
     /// The names of the events the scripts wait for the game to post
@@ -2665,6 +2714,35 @@ local id = string.gsub(m:GetName(), "Mission$", "")
 local index = data.GetMissionIndexFromId and data.GetMissionIndexFromId(id)
 if type(index) ~= "number" then return nil end
 return id, index
+"#;
+
+/// The targets of the current contract's active action objectives: its
+/// task's children, depth first, that are active and act on a target
+/// filter with an action prompt (`sActionLabel`).
+const CONTRACT_ACTIONS: &str = r#"
+local ps = rawget(_G, "MrxPlayState")
+if type(ps) ~= "table" or not ps.GetCurrentMission then return nil end
+local m = ps.GetCurrentMission()
+if type(m) ~= "table" then return nil end
+local out = {}
+local function walk(t, depth)
+    if depth > 6 or type(t) ~= "table" then return end
+    local ok, kids = pcall(function() return t:GetChildren() end)
+    if not ok or type(kids) ~= "table" then return end
+    for _, c in pairs(kids) do
+        local okActive, active = pcall(function() return c:IsActive() end)
+        active = okActive and active
+        local cfg = type(c.GetConfig) == "function" and c:GetConfig() or {}
+        if active and c._uTgtObjFilter and type(cfg) == "table" and cfg.sActionLabel then
+            for _, g in ipairs(ObjectFilter.GetObjects(c._uTgtObjFilter)) do
+                out[#out + 1] = g
+            end
+        end
+        walk(c, depth + 1)
+    end
+end
+walk(m, 0)
+return out
 "#;
 
 /// She has got where the scripts sent her within this, metres (invented:

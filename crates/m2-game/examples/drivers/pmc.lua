@@ -98,3 +98,34 @@ local function seat()
   Event.Create(Event.TimerRelative, { 1 }, seat, {})
 end
 Event.Create(Event.TimerRelative, { 1 }, seat, {})
+
+-- Every 15 s: the current contract's active tasks, and for each whether it
+-- has a target filter and an action prompt (TASKS lines).
+local lastTasks
+local function tasks()
+  local out = {}
+  local ok, m = pcall(function() return MrxPlayState.GetCurrentMission() end)
+  local function walk(t, depth)
+    if depth > 6 or type(t) ~= 'table' then return end
+    local okk, kids = pcall(function() return t:GetChildren() end)
+    if not okk or type(kids) ~= 'table' then return end
+    for _, c in pairs(kids) do
+      local oka, active = pcall(function() return c:IsActive() end)
+      if oka and active then
+        local okc, cfg = pcall(function() return c:GetConfig() end)
+        local nm = (pcall(function() return c:GetName() end)) and c:GetName() or '?'
+        table.insert(out, nm .. '[' .. tostring(cfg and okc and cfg.sModuleName) .. ','
+          .. tostring(c._uTgtObjFilter ~= nil) .. ',' .. tostring(okc and cfg and cfg.sActionLabel) .. ']')
+      end
+      walk(c, depth + 1)
+    end
+  end
+  if ok then walk(m, 0) end
+  local s = (ok and m and m.GetName and m:GetName() or tostring(m)) .. ': ' .. table.concat(out, ' ')
+  if s ~= lastTasks then
+    say('>>> TASKS ' .. s)
+    lastTasks = s
+  end
+  Event.Create(Event.TimerRelative, { 15 }, tasks, {})
+end
+Event.Create(Event.TimerRelative, { 15 }, tasks, {})
