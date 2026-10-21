@@ -1897,7 +1897,14 @@ end
         w.context_actions
             .iter()
             .map(|(&g, a)| {
-                let at = w.objects.get(&g).map(|o| o.position);
+                // A placed object's place, else its entity's, loaded or not
+                // (PmcCon003's `PlayerLocation_PMC`, a `vz_base` locator
+                // the action objective prompts at).
+                let at = w
+                    .objects
+                    .get(&g)
+                    .map(|o| o.position)
+                    .or_else(|| w.entities.get(&g).copied());
                 (g, at, a.text.clone(), a.reach)
             })
             .collect()

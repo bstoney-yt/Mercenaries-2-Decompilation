@@ -2562,6 +2562,11 @@ impl MissionLink {
         // A verify marker stays to do once its person is dead: the body is
         // verified (round 13: General Peng shot, then left for the jobs).
         let to_do = |m: &Mark| m.alive || m.kind == "verify";
+        let acts = self.contract_actions();
+        if *self.acts_logged.borrow() != acts {
+            eprintln!("mission: {id}'s action targets now {acts:x?}");
+            *self.acts_logged.borrow_mut() = acts.clone();
+        }
         if marks.iter().any(|m| to_do(m) && named(m)) {
             return marks.into_iter().filter(named).collect();
         }
@@ -2569,7 +2574,6 @@ impl MissionLink {
         // which the scripts put no marker or blip over (PmcCon003's "Get
         // inside the PMC!" on `PlayerLocation_PMC`, round 16: she went
         // after the jobs' markers instead).
-        let acts = self.contract_actions();
         let State::Running(mission) = &self.state else {
             return marks;
         };
@@ -2577,24 +2581,22 @@ impl MissionLink {
         let found: Vec<Mark> = acts
             .iter()
             .filter_map(|&g| {
-                let o = w.objects.get(&g)?;
+                // An entity the layers name but don't place as an object
+                // (`PlayerLocation_PMC` in `vz_base`): at its entity's place.
+                let (name, at, alive) = match w.objects.get(&g) {
+                    Some(o) => (o.name.clone(), o.position, o.alive),
+                    None => (format!("{g:#x}"), *w.entities.get(&g)?, true),
+                };
                 Some(Mark {
                     target: g,
                     kind: "action".to_owned(),
-                    name: o.name.clone(),
-                    at: Vec3::from(o.position),
-                    alive: o.alive,
+                    name,
+                    at: Vec3::from(at),
+                    alive,
                     mission: Some(MarkFor::Index(index)),
                 })
             })
             .collect();
-        if *self.acts_logged.borrow() != acts {
-            eprintln!(
-                "mission: no marker up for {id}: its action targets {acts:x?}, {} placed",
-                found.len()
-            );
-            *self.acts_logged.borrow_mut() = acts;
-        }
         drop(w);
         if !found.is_empty() {
             return found;
@@ -2612,13 +2614,20 @@ impl MissionLink {
         let State::Running(mission) = &self.state else {
             return Vec::new();
         };
-        let Ok(found) = mission
+        let found = match mission
             .lua()
             .load(CONTRACT_ACTIONS)
             .set_name("=contract actions")
             .eval::<Option<mlua::Table>>()
-        else {
-            return Vec::new();
+        {
+            Ok(found) => found,
+            Err(e) => {
+                eprintln!(
+                    "mission: contract actions: {}",
+                    m2_game::mission::first_lines(&e.to_string())
+                );
+                return Vec::new();
+            }
         };
         found
             .into_iter()

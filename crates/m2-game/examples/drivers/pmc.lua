@@ -115,7 +115,8 @@ local function tasks()
         local okc, cfg = pcall(function() return c:GetConfig() end)
         local nm = (pcall(function() return c:GetName() end)) and c:GetName() or '?'
         table.insert(out, nm .. '[' .. tostring(cfg and okc and cfg.sModuleName) .. ','
-          .. tostring(c._uTgtObjFilter ~= nil) .. ',' .. tostring(okc and cfg and cfg.sActionLabel) .. ']')
+          .. tostring(c._uTgtObjFilter ~= nil) .. ',' .. tostring(okc and cfg and cfg.sActionLabel) .. ','
+          .. tostring(c._uTgtObjFilter and #ObjectFilter.GetObjects(c._uTgtObjFilter)) .. ']')
       end
       walk(c, depth + 1)
     end
