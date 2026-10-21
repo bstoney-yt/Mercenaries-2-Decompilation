@@ -28,7 +28,7 @@ use m2_math::glam::Vec3;
 /// output: other platforms, or no sound device).
 pub struct AudioOut {
     pub mixer: Arc<Mutex<Mixer>>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     _stream: Option<cpal::Stream>,
 }
 
@@ -39,7 +39,7 @@ impl std::fmt::Debug for AudioOut {
 }
 
 impl AudioOut {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     pub fn start() -> Self {
         match open_device() {
             Ok((mixer, stream)) => Self {
@@ -56,12 +56,34 @@ impl AudioOut {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "android")))]
     pub fn start() -> Self {
         eprintln!("sound: no output on this platform yet; playing silently");
         Self {
             mixer: Arc::new(Mutex::new(Mixer::new(48_000))),
         }
+    }
+
+    /// Stops the device playing (`paused`) or starts it again, as the app
+    /// goes to the background and comes back. Nothing without a device.
+    pub fn set_paused(&self, paused: bool) {
+        #[cfg(any(windows, target_os = "android"))]
+        if let Some(stream) = &self._stream {
+            use cpal::traits::StreamTrait as _;
+            let done = if paused {
+                stream.pause()
+            } else {
+                stream.play()
+            };
+            if let Err(e) = done {
+                eprintln!(
+                    "sound: could not {}: {e}",
+                    if paused { "pause" } else { "play" }
+                );
+            }
+        }
+        #[cfg(not(any(windows, target_os = "android")))]
+        let _ = paused;
     }
 
     /// Runs `f` on the mixer (a poisoned lock is taken anyway: the mixer
@@ -72,7 +94,7 @@ impl AudioOut {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 fn open_device() -> anyhow::Result<(Arc<Mutex<Mixer>>, cpal::Stream)> {
     use anyhow::Context as _;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -165,6 +187,11 @@ pub struct GameAudio {
     install: Option<Install>,
     /// The engine running now.
     engine: Option<Engine>,
+    /// The horn sounding, and the resident bank's two horns (a car's and a
+    /// lorry's: [`load_horns`]), once read on a thread.
+    horn: Option<VoiceId>,
+    spare_horns: Option<SpareHorns>,
+    horns_loading: Option<Receiver<SpareHorns>>,
     /// The rotors heard, by helicopter: a voice per loop.
     rotors: HashMap<u32, Vec<VoiceId>>,
     /// Banks read and found to have no engine sounds.
@@ -277,25 +304,43 @@ fn held_tables(
 const KEY_FRESH: Duration = Duration::from_millis(750);
 
 /// The interface's sound bank, `ui_hud`: its cue table (cue name hash to
-/// record, record to the bank's sound) and its sounds; and the music's cue
-/// table (records name streams of `music.pws`).
+/// record, record to the bank's sound) and its sounds; the front end's,
+/// `ui_shell` (in `shell.wad`: the menus' clicks and whooshes, which
+/// `ui_hud` doesn't have); and the music's cue table (records name
+/// streams of `music.pws`).
 #[derive(Debug, Default)]
 pub struct UiSounds {
     cues: Option<m2_assets::CueTable>,
     sounds: Vec<SoundBuffer>,
+    shell_cues: Option<m2_assets::CueTable>,
+    shell_sounds: Vec<SoundBuffer>,
     music: Option<m2_assets::CueTable>,
+}
+
+/// A bank's cue table and sounds, from `source`, by the bank's name.
+fn ui_bank<R: std::io::Read + std::io::Seek>(
+    source: &mut m2_engine::AssetSource<R>,
+    name: &str,
+) -> (Option<m2_assets::CueTable>, Vec<SoundBuffer>) {
+    let bank = m2_assets::name_hash(name);
+    let cues = source
+        .asset(bank, m2_assets::voice::CUE_TABLE_TYPE)
+        .ok()
+        .and_then(|d| m2_assets::CueTable::parse(&d).ok());
+    let library = SoundLibrary::load_banks(source, &[bank]);
+    let sounds = library
+        .bank_hash(bank)
+        .map(|(_, s)| s.to_vec())
+        .unwrap_or_default();
+    (cues, sounds)
 }
 
 impl UiSounds {
     fn load(install: &Install) -> Self {
-        let bank = m2_assets::name_hash("ui_hud");
         let Ok(mut source) = install.open_world() else {
             return Self::default();
         };
-        let cues = source
-            .asset(bank, m2_assets::voice::CUE_TABLE_TYPE)
-            .ok()
-            .and_then(|d| m2_assets::CueTable::parse(&d).ok());
+        let (cues, sounds) = ui_bank(&mut source, "ui_hud");
         let music = source
             .asset(
                 m2_assets::name_hash("music"),
@@ -303,14 +348,16 @@ impl UiSounds {
             )
             .ok()
             .and_then(|d| m2_assets::CueTable::parse(&d).ok());
-        let library = SoundLibrary::load_banks(&mut source, &[bank]);
-        let sounds = library
-            .bank_hash(bank)
-            .map(|(_, s)| s.to_vec())
+        let (shell_cues, shell_sounds) = std::fs::File::open(install.data.join("shell.wad"))
+            .ok()
+            .and_then(|f| m2_engine::AssetSource::new(std::io::BufReader::new(f)).ok())
+            .map(|mut shell| ui_bank(&mut shell, "ui_shell"))
             .unwrap_or_default();
         Self {
             cues,
             sounds,
+            shell_cues,
+            shell_sounds,
             music,
         }
     }
@@ -327,17 +374,21 @@ impl UiSounds {
     /// The sound cue `cue` plays and its volume (the first of its
     /// record's variants that is this bank's).
     /// and whether it loops.
+    /// Looks in `ui_hud`, then the front end's `ui_shell`.
     fn find(&self, cue: &str) -> Option<(SoundBuffer, f32, bool)> {
-        let table = self.cues.as_ref()?;
         let hash = m2_assets::name_hash(cue);
-        let record = table.cue_record(hash)?;
-        let &(_, index, _) = record.variants.iter().find(|v| v.0 == table.hash)?;
-        let looped = table.plain_cue(hash).is_some_and(|c| c.seconds < 0.0);
-        Some((
-            self.sounds.get(index as usize)?.clone(),
-            record.volume,
-            looped,
-        ))
+        [
+            (&self.cues, &self.sounds),
+            (&self.shell_cues, &self.shell_sounds),
+        ]
+        .into_iter()
+        .find_map(|(cues, sounds)| {
+            let table = cues.as_ref()?;
+            let record = table.cue_record(hash)?;
+            let &(_, index, _) = record.variants.iter().find(|v| v.0 == table.hash)?;
+            let looped = table.plain_cue(hash).is_some_and(|c| c.seconds < 0.0);
+            Some((sounds.get(index as usize)?.clone(), record.volume, looped))
+        })
     }
 }
 
@@ -671,6 +722,50 @@ pub struct EngineInput {
     pub top: f32,
     /// The driver's throttle, -1 (reverse) to 1.
     pub throttle: f32,
+    /// The horn held.
+    pub horn: bool,
+    /// Heard with a lorry's horn rather than a car's where its bank holds
+    /// none of its own ([`load_horns`]).
+    pub heavy: bool,
+}
+
+/// The resident bank's horns: a car's, then a lorry's.
+type SpareHorns = [Option<SoundBuffer>; 2];
+
+/// How loud a horn is, as the engine is [`ENGINE_GAIN`] (invented).
+const HORN_GAIN: f32 = 0.6;
+
+/// The two horns the resident bank holds (`resident_P000_Q3`, always
+/// loaded), a car's and a lorry's: the same two recordings the banks that
+/// have a horn hold ([`m2_engine::audio::HORN_FRAMES`], in that order), so
+/// a vehicle whose own bank has none (a tank's, a boat's, an old car's) is
+/// heard with one of these (from samples; which one, by
+/// [`EngineInput::heavy`], is invented).
+pub fn load_horns(install: &Install) -> SpareHorns {
+    let library = install.open_world().and_then(|mut source| {
+        SoundLibrary::load_hashes(&mut source, &[m2_assets::name_hash("resident")])
+    });
+    let library = match library {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("sound: no resident horns ({e})");
+            return [None, None];
+        }
+    };
+    let sounds = library.bank("resident");
+    let horns = m2_engine::audio::HORN_FRAMES.map(|frames| {
+        sounds
+            .iter()
+            .find(|s| s.frames() == frames && s.is_tone())
+            .cloned()
+    });
+    let hash = |h: &Option<SoundBuffer>| h.as_ref().map(|s| format!("{:08x}", s.hash));
+    eprintln!(
+        "sound: resident horns: car {:?}, lorry {:?}",
+        hash(&horns[0]),
+        hash(&horns[1])
+    );
+    horns
 }
 
 /// A bank's engine sounds, read on a thread.
@@ -975,6 +1070,14 @@ impl GameAudio {
             engine_loads: channel(),
             install: install.cloned(),
             engine: None,
+            horn: None,
+            spare_horns: None,
+            horns_loading: install.map(|install| {
+                let install = install.clone();
+                let (tx, rx) = channel();
+                std::thread::spawn(move || drop(tx.send(load_horns(&install))));
+                rx
+            }),
             rotors: HashMap::new(),
             silent: HashSet::new(),
             ambient_wait: 3.0,
@@ -1046,9 +1149,11 @@ impl GameAudio {
                 std::thread::spawn(move || {
                     let ui = UiSounds::load(&install);
                     eprintln!(
-                        "ui sounds: {} cues, {} sounds; music: {} cues",
+                        "ui sounds: {} cues, {} sounds; front end's: {} cues, {} sounds; music: {} cues",
                         ui.cues.as_ref().map_or(0, |c| c.cues.len()),
                         ui.sounds.len(),
+                        ui.shell_cues.as_ref().map_or(0, |c| c.cues.len()),
+                        ui.shell_sounds.len(),
                         ui.music.as_ref().map_or(0, |c| c.cues.len())
                     );
                     let _ = tx.send(ui);
@@ -2010,6 +2115,7 @@ impl GameAudio {
     /// revs with speed and throttle, its start and stop sounds as it is
     /// got in and out of. A bank is read the first time it's driven.
     pub fn engine(&mut self, driving: Option<EngineInput>, dt: f32) {
+        self.sound_horn(driving);
         if self
             .engine
             .as_ref()
@@ -2067,6 +2173,53 @@ impl GameAudio {
                 m.set_pitch(*id, pitch);
             }
         });
+    }
+
+    /// Holds the horn of the vehicle driven while `driving` says it is
+    /// held: its bank's own ([`EngineSounds::horn`]), else the resident
+    /// bank's car's or lorry's, looped from the press to the release (each
+    /// recording is one note held level, so it loops without a seam).
+    fn sound_horn(&mut self, driving: Option<EngineInput>) {
+        if let Some(rx) = &self.horns_loading
+            && let Ok(h) = rx.try_recv()
+        {
+            self.spare_horns = Some(h);
+            self.horns_loading = None;
+        }
+        let Some(input) = driving.filter(|d| d.horn) else {
+            if let Some(id) = self.horn.take() {
+                self.out.with(|m| m.stop(id));
+            }
+            return;
+        };
+        if self.horn.is_some() {
+            return;
+        }
+        let own = self
+            .engine
+            .as_ref()
+            .filter(|e| e.bank == input.bank)
+            .and_then(|e| e.sounds.horn.clone());
+        let spare = self
+            .spare_horns
+            .as_ref()
+            .and_then(|h| h[usize::from(input.heavy)].clone());
+        let whose = if own.is_some() {
+            "its bank's"
+        } else if input.heavy {
+            "the resident lorry's"
+        } else {
+            "the resident car's"
+        };
+        if let Some(buffer) = own.or(spare) {
+            eprintln!(
+                "horn: {whose} ({:08x}, {:.2} s, looped)",
+                buffer.hash,
+                buffer.seconds()
+            );
+            let play = Play::flat(buffer).looped().gain(HORN_GAIN);
+            self.horn = Some(self.out.with(|m| m.play(play)));
+        }
     }
 
     /// Bank `bank`'s engine sounds, once read (`None` while they're read,

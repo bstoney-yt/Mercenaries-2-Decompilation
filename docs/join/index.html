@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Join a Mercenaries 2 co-op game</title>
+<style>
+  :root { --bg: #f4f1ea; --fg: #1d1b16; --muted: #5d574b; --card: #fffdf8; --line: #d9d2c3; --accent: #b4441f; --accent-fg: #fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #16140f; --fg: #eee8db; --muted: #a79f8e; --card: #201d17; --line: #3a352b; --accent: #e0683c; --accent-fg: #16140f; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.5 system-ui, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 32px 16px 48px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 20px; margin-bottom: 16px; }
+  ol { padding-left: 1.3em; margin: 0; }
+  li { margin: 8px 0; }
+  .button { display: inline-block; background: var(--accent); color: var(--accent-fg); border: 0; border-radius: 8px; padding: 12px 18px; font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; }
+  code { display: block; overflow-wrap: anywhere; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; font-size: 0.85rem; margin: 8px 0; }
+  .note { color: var(--muted); font-size: 0.9rem; }
+  .bad { border-color: var(--accent); }
+  [hidden] { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Join a Mercenaries 2 co-op game</h1>
+  <p class="sub">A friend has invited you to play with them in the beta, a fan rebuild of Mercenaries 2: World in Flames.</p>
+
+  <div class="card" id="good" hidden>
+    <ol>
+      <li>You need <strong>your own copy of Mercenaries 2: World in Flames (PC) installed</strong>. The beta plays it from your install; it brings no game files of its own.</li>
+      <li><button class="button" id="go">Copy the invite and download the beta</button></li>
+      <li>Unzip it anywhere and run <strong>m2-beta.exe</strong>. It finds the invite you copied and joins your friend.</li>
+    </ol>
+    <p class="note">If it doesn't join (say the copy was refused), run <em>m2-beta.exe --join</em> followed by this, from a command prompt in its folder:</p>
+    <code id="code"></code>
+    <p class="note" id="copied" hidden>Invite copied.</p>
+  </div>
+
+  <div class="card bad" id="bad" hidden>
+    <p>This link has no invite in it. Ask your friend to send the whole link their game gave them.</p>
+  </div>
+
+  <p class="note">Windows only. The beta is open source; only its own code is in the download. It connects straight to your friend's game, or through a relay server when your routers don't allow that; nothing about your game is kept anywhere.
+  <a href="https://github.com/bstoney-yt/Mercenaries-2-Decompilation">Source</a></p>
+</main>
+<script>
+  // The invite rides after the #, which the browser never sends to this site.
+  const code = decodeURIComponent(location.hash.slice(1)).trim();
+  const looksRight = /^[0-9a-z]{52,64}(@[A-Za-z0-9.-]+)?(\+\S+)*$/.test(code);
+  const download = "https://github.com/bstoney-yt/Mercenaries-2-Decompilation/releases/latest/download/m2-beta-windows.zip";
+  document.getElementById(looksRight ? "good" : "bad").hidden = false;
+  if (looksRight) {
+    document.getElementById("code").textContent = "m2coop:" + code;
+    document.getElementById("go").addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText("m2coop:" + code);
+        document.getElementById("copied").hidden = false;
+      } catch (e) {
+        // No clipboard here: the code above can be copied by hand.
+      }
+      location.href = download;
+    });
+  }
+</script>
+</body>
+</html>

@@ -383,8 +383,13 @@ struct DepthTargets {
 #[derive(Debug)]
 enum Target {
     Window {
-        surface: wgpu::Surface<'static>,
+        /// None while the app is in the background (Android takes the
+        /// window's surface away; [`WgpuBackend::suspend`]).
+        surface: Option<wgpu::Surface<'static>>,
         config: wgpu::SurfaceConfiguration,
+        /// To make the surface again on coming back
+        /// ([`WgpuBackend::resume`]).
+        instance: wgpu::Instance,
     },
     Offscreen {
         texture: wgpu::Texture,
@@ -409,6 +414,13 @@ pub struct WgpuBackend {
     target: Target,
     width: u32,
     height: u32,
+    /// The world's drawing size as a share of the window's (1: all of
+    /// it): the world and its post passes draw that much smaller and are
+    /// stretched to the window ([`set_render_scale`](Self::set_render_scale)).
+    scale: f32,
+    /// The shadow cascades redrawn on the phone's lighter schedule
+    /// ([`shadow::refreshes_lightly`]).
+    light_shadows: bool,
     depth: DepthTargets,
     scene_layout: wgpu::BindGroupLayout,
 
@@ -584,7 +596,11 @@ impl WgpuBackend {
             adapter,
             device,
             queue,
-            Target::Window { surface, config },
+            Target::Window {
+                surface: Some(surface),
+                config,
+                instance,
+            },
             width.max(1),
             height.max(1),
         ))
@@ -956,6 +972,8 @@ impl WgpuBackend {
             target,
             width,
             height,
+            scale: 1.0,
+            light_shadows: false,
             depth,
             scene_layout,
             draw_layout,
@@ -1277,24 +1295,103 @@ impl WgpuBackend {
         }
         self.width = width;
         self.height = height;
-        self.depth = Self::depth_targets(&self.device, &self.scene_layout, width, height);
-        self.post.resize(&self.device, width, height);
-        if let Target::Window { surface, config } = &mut self.target {
+        self.size_world();
+        if let Target::Window {
+            surface, config, ..
+        } = &mut self.target
+        {
             config.width = width;
             config.height = height;
-            surface.configure(&self.device, config);
+            if let Some(surface) = surface {
+                surface.configure(&self.device, config);
+            }
         }
+    }
+
+    /// Lets the window's surface go, as Android takes it when the app goes
+    /// to the background: every texture, buffer and pipeline stays, and
+    /// frames are skipped until [`resume`](Self::resume).
+    pub fn suspend(&mut self) {
+        if let Target::Window { surface, .. } = &mut self.target {
+            *surface = None;
+        }
+    }
+
+    /// Makes the window's surface again for `window` (the same window, its
+    /// new native surface) at `width` x `height`, coming back from the
+    /// background.
+    pub fn resume<W>(&mut self, window: W, width: u32, height: u32) -> Result<(), BackendError>
+    where
+        W: wgpu::WindowHandle + wgpu::rwh::HasDisplayHandle + Send + Sync + 'static,
+    {
+        let Target::Window {
+            surface,
+            config,
+            instance,
+        } = &mut self.target
+        else {
+            return Ok(());
+        };
+        let made = instance.create_surface(window).map_err(device_error)?;
+        config.width = width.max(1);
+        config.height = height.max(1);
+        made.configure(&self.device, config);
+        *surface = Some(made);
+        let (w, h) = (config.width, config.height);
+        if (w, h) != (self.width, self.height) {
+            self.width = w;
+            self.height = h;
+            self.size_world();
+        }
+        Ok(())
+    }
+
+    /// Draws the world at `scale` (0.25 to 1) of the window's size, as a
+    /// phone needs: the world's passes and its post passes run on that
+    /// many fewer pixels and the last pass stretches them to the window
+    /// (it samples by position, filtered). The HUD stays sharp.
+    pub fn set_render_scale(&mut self, scale: f32) {
+        let scale = scale.clamp(0.25, 1.0);
+        if scale != self.scale {
+            self.scale = scale;
+            self.size_world();
+        }
+    }
+
+    /// Redraws the far shadow cascades less often (`light`), as a phone
+    /// needs: under two shadow passes a frame for 2.75
+    /// ([`shadow::refreshes_lightly`]).
+    pub fn set_light_shadows(&mut self, light: bool) {
+        self.light_shadows = light;
+    }
+
+    /// The world's drawing size: the window's at the render scale.
+    fn world_size(&self) -> (u32, u32) {
+        let scaled = |n: u32| ((n as f32 * self.scale).round() as u32).max(1);
+        (scaled(self.width), scaled(self.height))
+    }
+
+    /// Remakes the world's targets at [`Self::world_size`].
+    fn size_world(&mut self) {
+        let (w, h) = self.world_size();
+        self.depth = Self::depth_targets(&self.device, &self.scene_layout, w, h);
+        self.post.resize(&self.device, w, h);
     }
 
     /// Switches vertical sync (window targets only).
     pub fn set_vsync(&mut self, vsync: bool) {
-        if let Target::Window { surface, config } = &mut self.target {
+        if let Target::Window {
+            surface, config, ..
+        } = &mut self.target
+        {
             config.present_mode = if vsync {
                 wgpu::PresentMode::AutoVsync
             } else {
                 wgpu::PresentMode::AutoNoVsync
             };
-            surface.configure(&self.device, config);
+            if let Some(surface) = surface {
+                surface.configure(&self.device, config);
+            }
         }
     }
 
@@ -1846,7 +1943,12 @@ impl WgpuBackend {
         let mut refresh = [true; shadow::CASCADES];
         if let (Some(c), Some(old)) = (&mut cascades, self.cascades.get()) {
             for (i, fresh) in refresh.iter_mut().enumerate() {
-                if !shadow::refreshes(i, self.frames) {
+                let due = if self.light_shadows {
+                    shadow::refreshes_lightly(i, self.frames)
+                } else {
+                    shadow::refreshes(i, self.frames)
+                };
+                if !due {
                     c.keep(&old, i);
                     *fresh = false;
                 }
@@ -2512,7 +2614,13 @@ impl WgpuBackend {
                 let overlay = over(&gamma, &mut overlay);
                 self.queue.submit(std::iter::once(commands).chain(overlay));
             }
-            Target::Window { surface, config } => {
+            // In the background: nothing to draw to.
+            Target::Window { surface: None, .. } => {}
+            Target::Window {
+                surface: Some(surface),
+                config,
+                ..
+            } => {
                 let frame = match surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(f)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
