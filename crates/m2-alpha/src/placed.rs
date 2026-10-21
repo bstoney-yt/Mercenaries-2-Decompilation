@@ -259,6 +259,26 @@ impl Placed {
         opened
     }
 
+    /// Where the emplaced gun stands that is nearest `to` of those within
+    /// `seek` metres of `from` and `reach` metres of `to` (flat
+    /// distances): one to man to fire on `to`.
+    pub fn emplacement_for(
+        &self,
+        props: &Props,
+        from: Vec3,
+        to: Vec3,
+        seek: f32,
+        reach: f32,
+    ) -> Option<Vec3> {
+        let flat = |a: Vec3, b: Vec3| (a - b).with_y(0.0).length();
+        self.known
+            .iter()
+            .filter(|(_, k)| k.0 == Kind::Emplaced)
+            .filter_map(|(&e, _)| Some(props.get(e)?.0.position))
+            .filter(|&p| flat(p, from) <= seek && flat(p, to) <= reach)
+            .min_by(|a, b| flat(*a, to).total_cmp(&flat(*b, to)))
+    }
+
     /// The emplaced gun nearest `at` within [`MAN_REACH`], as she would
     /// man it: its weapon (the template's first `PhysicalLink`ed one the
     /// arsenal knows), its turn and tilt (its `Turret`), all its rounds.

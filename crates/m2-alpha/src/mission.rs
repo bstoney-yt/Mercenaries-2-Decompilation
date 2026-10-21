@@ -3649,9 +3649,9 @@ walk(m, 0)
 return out
 "#;
 
-/// The checkpoint the current contract's running race waits for: an
-/// active `MrxTaskRace` under its task (its `_tCourseLocs`, the course's
-/// location names, and `iCurLoc`, the one now up; from the scripts).
+/// The checkpoint the current contract's running race waits for: under
+/// an active `MrxTaskRace` (it alone has `_tCourseLocs`), the active
+/// checkpoint objective's `vDestLoc` (from the scripts).
 const CONTRACT_RACE: &str = r#"
 local ps = rawget(_G, "MrxPlayState")
 if type(ps) ~= "table" or not ps.GetCurrentMission then return nil end
@@ -3663,9 +3663,19 @@ local function walk(t, depth)
     if not ok or type(kids) ~= "table" then return nil end
     for _, c in pairs(kids) do
         local okActive, active = pcall(function() return c:IsActive() end)
-        local locs, i = rawget(c, "_tCourseLocs"), rawget(c, "iCurLoc")
-        if okActive and active and type(locs) == "table" and type(i) == "number" and locs[i] then
-            return Pg.GetGuidByName(locs[i])
+        if okActive and active and type(rawget(c, "_tCourseLocs")) == "table" then
+            -- The gate up is its active checkpoint objective's place
+            -- (`iCurLoc` runs one ahead of it: round 2 went for gate 3).
+            local okGates, gates = pcall(function() return c:GetChildren() end)
+            for _, gate in pairs(okGates and gates or {}) do
+                local okUp, up = pcall(function() return gate:IsActive() end)
+                local gc = type(gate.GetConfig) == "function" and gate:GetConfig() or {}
+                if okUp and up and type(gc) == "table" and gc.vDestLoc then
+                    local d = gc.vDestLoc
+                    if type(d) == "string" then d = Pg.GetGuidByName(d) end
+                    return d
+                end
+            end
         end
         local g = walk(c, depth + 1)
         if g then return g end

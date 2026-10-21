@@ -61,6 +61,10 @@ const TAKE_NEAR: f32 = 40.0;
 /// from between these.
 const SHOOT_RANGE: f32 = 35.0;
 const BLAST_RANGE: (f32, f32) = (15.0, 45.0);
+/// With nothing to blow things up with, she mans an emplaced gun this
+/// near her (metres) that is this near the target (invented).
+const MAN_SEEK: f32 = 80.0;
+const MANNED_REACH: f32 = 90.0;
 /// With the grenade launcher, whose rounds reach about 40 m.
 const LOB_RANGE: (f32, f32) = (12.0, 32.0);
 /// What only a support strike brings down (the first contract's gates)
@@ -669,7 +673,22 @@ impl Autoplay {
         // and she stood aimed at the fourth for 2100 s), a strike brings
         // down what she would have blown up.
         let spent = game.combat.launcher_rounds.is_some() && game.combat.launcher_empty();
-        let striking = matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target) || spent)
+        // Unless an emplaced gun in reach of it does instead (`blast`).
+        let gun = |at: &Vec3| {
+            game.combat.manned.is_some()
+                || game.scene.player.as_ref().is_some_and(|p| {
+                    game.placed
+                        .emplacement_for(
+                            &game.scene.props,
+                            p.character.position,
+                            *at,
+                            MAN_SEEK,
+                            MANNED_REACH,
+                        )
+                        .is_some()
+                })
+        };
+        let striking = matches!(&self.goal, Some(Goal::Blast { target, at }) if sturdy(target) || (spent && !gun(at)))
             || matches!(self.goal, Some(Goal::Deliver(_)));
         // A call she is no longer after is put away: the designator goes
         // with a weapon taken up (twice from the satellite's view).
@@ -732,6 +751,14 @@ impl Autoplay {
         };
         if let Some((target, at)) = acting {
             self.act(game, target, at);
+        }
+        // Manning an emplaced gun, with nothing left for it to fire on:
+        // off it (the use key again), to go on.
+        if game.combat.manned.is_some() && !matches!(self.goal, Some(Goal::Blast { .. })) {
+            return Intent {
+                use_pressed: true,
+                ..Intent::default()
+            };
         }
         match self.goal.clone() {
             None => self.idle(game, dt),
@@ -1938,6 +1965,29 @@ impl Autoplay {
         }
     }
 
+    /// Firing the emplaced gun she mans on what stands at `at`, once
+    /// aimed a moment.
+    fn fire_manned(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
+        let Some(p) = game.scene.player.as_ref() else {
+            return Intent::default();
+        };
+        let (look, error) = aim(p, at, dt);
+        self.steady = if error < ON_TARGET {
+            self.steady + dt
+        } else {
+            0.0
+        };
+        Intent {
+            look,
+            trigger: Trigger {
+                aim: true,
+                fire: self.steady > STEADY,
+                ..Trigger::default()
+            },
+            ..Intent::default()
+        }
+    }
+
     /// Blowing up what stands at `at` with what she carries in the
     /// launcher's place: rockets from between [`BLAST_RANGE`], grenades
     /// from between [`LOB_RANGE`]; from a tank, with its cannon.
@@ -1962,6 +2012,28 @@ impl Autoplay {
         let rockets = game.combat.launcher_rounds.map_or(0, |r| r.total());
         if !lobbing && rockets == 0 && (game.combat.charges > 0 || self.planted.is_some()) {
             return self.plant(game, at, dt);
+        }
+        // Nothing to blow it up with: an emplaced gun in reach of it,
+        // manned and fired (PmcCon031 round 3: 50 columns to bring down,
+        // the scripts' "MoveToMG" first, and she stood 370 s at one with
+        // an empty launcher).
+        if !lobbing && rockets == 0 {
+            if game.combat.manned.is_some() {
+                return self.fire_manned(game, at, dt);
+            }
+            if let Some(gun) =
+                game.placed
+                    .emplacement_for(&game.scene.props, here, at, MAN_SEEK, MANNED_REACH)
+            {
+                if gun.with_y(0.0).distance(here.with_y(0.0)) > crate::placed::MAN_REACH * 0.75 {
+                    self.arrived = None;
+                    return self.walk(game, gun, 0.5, dt);
+                }
+                return Intent {
+                    use_pressed: true,
+                    ..Intent::default()
+                };
+            }
         }
         // Going where she can fire from (in range, nothing in the way).
         if let Some((_, spot)) = self.blast_spot {

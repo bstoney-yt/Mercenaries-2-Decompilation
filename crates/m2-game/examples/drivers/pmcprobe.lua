@@ -13,10 +13,55 @@ local names = {
 
 local function say(m) Debug.Printf('>>> PROBE ' .. m) end
 
+-- Deliver objectives' arrival and delivery checks, as they run.
+local D = rawget(_G, 'MrxTaskObjectiveDeliver')
+if type(D) == 'table' then
+  for _, f in ipairs({ '_TargetAtDestination', '_TargetLeftDestination', '_DeliveryCheck' }) do
+    local orig = rawget(D, f)
+    if type(orig) == 'function' then
+      rawset(D, f, function(o, t, ...)
+        local ok, nm = pcall(function() return o:GetName() end)
+        say(f .. ' ' .. tostring(ok and nm) .. ' target ' .. tostring(t))
+        return orig(o, t, ...)
+      end)
+    end
+  end
+else
+  say('no MrxTaskObjectiveDeliver at load')
+end
+
+-- The contract's active objectives: their config's delivery fields and
+-- the targets they track (`_tTargets`, with their events).
+local function objectives()
+  local m = MrxPlayState and MrxPlayState.GetCurrentMission and MrxPlayState.GetCurrentMission()
+  if type(m) ~= 'table' then return end
+  local ok, kids = pcall(function() return m:GetChildren() end)
+  for _, c in pairs(ok and kids or {}) do
+    local cfg = type(c.GetConfig) == 'function' and c:GetConfig() or {}
+    local line = c:GetName() .. ': dest ' .. tostring(cfg.vDestLoc) .. ' dist ' .. tostring(cfg.fDist)
+      .. ' stop ' .. tostring(cfg.bStop) .. ' xz ' .. tostring(cfg.bXZOnly) .. ' tgt ' .. tostring(cfg.vTgtInclude)
+    local tt = rawget(c, '_tTargets')
+    if type(tt) == 'table' then
+      for k, v in pairs(tt) do
+        local evs = {}
+        if type(v) == 'table' and type(v.tEvents) == 'table' then
+          for en, e in pairs(v.tEvents) do evs[#evs + 1] = tostring(en) .. '=' .. tostring(e) end
+        end
+        line = line .. ' | ' .. tostring(k) .. ' at ' .. tostring(type(v) == 'table' and v.bAtDestination)
+          .. ' {' .. table.concat(evs, ' ') .. '}'
+      end
+    else
+      line = line .. ' | no _tTargets'
+    end
+    say(line)
+  end
+end
+
 local n = 0
 Event.CreatePersistent(Event.TimerRelative, { 5 }, function()
   n = n + 1
   if n > 12 then return end
+  pcall(objectives)
   local p = Player.GetLocalCharacter()
   local px, py, pz = Object.GetPosition(p)
   say(string.format('t%d her %s any %s at %s, %s, %s', n * 5, tostring(p),
