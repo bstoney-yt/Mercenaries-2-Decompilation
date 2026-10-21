@@ -3578,6 +3578,14 @@ fn put_out(
 
 /// The vehicle nearest her within `reach` metres of its door marker (or its
 /// hull, for those without one).
+/// Whether a vehicle of catalogue kind `kind` has a seat to get into: not
+/// a trailer (ChiCon003's `civ_veh_trailer_flatbed`, kind `trailer`, was
+/// got into for the M2A3 it carries, and "driven" stuck for 3,200 s).
+/// Invented: the trailer's model has no seat the alpha reads.
+fn can_sit_in(kind: &str) -> bool {
+    kind != "trailer"
+}
+
 fn nearest(
     physics: &Physics,
     vehicles: &[ParkedVehicle],
@@ -3589,13 +3597,18 @@ fn nearest(
     vehicles
         .iter()
         .enumerate()
-        .filter(|(_, v)| !v.wrecked)
+        .filter(|(_, v)| !v.wrecked && can_sit_in(&v.spec.kind))
         // Crewed, one with an action hijack is taken only by it (playtest
         // 5: the villa's tank, whose scripts make it usable by the hijack
         // alone, `Vehicle.Usable(tank, false)`, was got into at a press).
         .filter(|(_, v)| !(hijack_only.contains(&v.spec.model) && has_driver(&v.crew)))
-        // Kept by the scripts for themselves (`Vehicle.Usable(v, false)`).
-        .filter(|(_, v)| !v.guid.is_some_and(|g| unusable.contains(&g)))
+        // Kept by the scripts for themselves (`Vehicle.Usable(v, false)`)
+        // while crewed: an empty one is still got into (ChiCon009's ZBD2000
+        // and ChiCon008's race tank, the only `Usable(false)` vehicles in
+        // the runs, are both made so and then to be got into; the villa's
+        // crewed tank is the hijack's alone). From those samples; the 360
+        // code not checked.
+        .filter(|(_, v)| !(v.guid.is_some_and(|g| unusable.contains(&g)) && has_driver(&v.crew)))
         // One with someone in the driver's seat is taken from them: the
         // action hijacks (tanks, helicopters) took the key first if near
         // ([`crate::hijack`]); cars, bikes and jeeps have none in the data
@@ -3729,6 +3742,13 @@ fn switch_weapon(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    #[test]
+    fn a_trailer_is_not_got_into() {
+        assert!(!super::can_sit_in("trailer"));
+        assert!(super::can_sit_in("tank"));
+        assert!(super::can_sit_in("car"));
+    }
 
     #[test]
     fn a_shoulder_shot_sees_the_target_from_behind_the_base() {
