@@ -759,6 +759,9 @@ pub struct Npc {
     pub reported_dead: bool,
     /// Hurt since the last look ([`People::pursue`]).
     pub hurt_by_her: bool,
+    /// She killed them (her shots, blasts or vehicle): the scripts hear
+    /// who killed them ([`People::her_kills`]).
+    pub killed_by_her: bool,
     /// A story character (placed by a layer, not fighting: `Carmona`):
     /// the scripts', they stay where they are put and never run.
     pub held: bool,
@@ -978,6 +981,7 @@ impl Npc {
             faction: None,
             provoked: false,
             hurt_by_her: false,
+            killed_by_her: false,
             reported_dead: false,
             gun: None,
             launcher: None,
@@ -1148,6 +1152,7 @@ impl Npc {
         if self.hp <= 0.0 {
             self.alive = false;
             self.died = true;
+            self.killed_by_her = true;
             self.alert = false;
             self.flee = None;
             self.rig.animator.set_upper(None);
@@ -3281,8 +3286,20 @@ impl People {
                 false
             });
         } else if let Some(n) = self.npcs.iter_mut().find(|n| n.spawn == Some(entity)) {
+            let hers = n.killed_by_her;
             n.hurt(f32::INFINITY, Vec3::ZERO);
+            // The scripts' doing, not hers.
+            n.killed_by_her = hers;
         }
+    }
+
+    /// The soldiers (by spawn entity) she killed herself.
+    pub fn her_kills(&self) -> HashSet<u32> {
+        self.npcs
+            .iter()
+            .filter(|n| !n.alive && n.killed_by_her)
+            .filter_map(|n| n.spawn)
+            .collect()
     }
 
     /// Starts over with these soldiers dead and nobody about (they come

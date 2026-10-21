@@ -59,6 +59,7 @@ mod held;
 mod hero;
 mod hijack;
 mod input;
+mod jobs;
 mod keytable;
 mod loading;
 mod mission;
@@ -4571,6 +4572,27 @@ fn mission_for_screenshot(
             if contracts_seen >= options.contracts.max(1) {
                 play_done = Some(i);
             }
+        }
+        // The job she was skipped to, done (a set job or a collection
+        // completed, a standing bounty paid): she stops as for a contract.
+        if auto.is_some()
+            && play_done.is_none()
+            && let Some(job) = link.job().filter(|j| j.finished())
+        {
+            eprintln!(
+                "autoplay: job {} done after {:.1} s of play ({:.0} s here): {} counted{}, cash {:.0}",
+                job.id,
+                i as f32 * tick,
+                played.elapsed().as_secs_f32(),
+                job.view.counted,
+                if job.view.completed {
+                    ", completed"
+                } else {
+                    ""
+                },
+                link.resources().unwrap_or_default().0
+            );
+            play_done = Some(i);
         }
         if play_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
             break;

@@ -655,6 +655,8 @@ pub struct MissionLink {
     /// The story skipped to this contract (`--skip-to`), and whether to
     /// its briefing ([`Mission::set_skip_mission`]).
     skip_to: Option<(String, bool)>,
+    /// The job `--skip-to` names, followed as she takes it on.
+    job: Option<crate::jobs::JobRun>,
     /// Skipped there: ticks left to find where the scripts' new game
     /// spawns her ([`spawn_point`]) and put her there.
     spawn_tries: u32,
@@ -827,6 +829,7 @@ impl MissionLink {
             message: None,
             drivers,
             skip_to: None,
+            job: None,
             spawn_tries: 0,
             saved: None,
             since_load: None,
@@ -1078,7 +1081,19 @@ impl MissionLink {
     /// does (`--skip-to`): every story contract before it is completed as
     /// the flow unlocks it.
     pub fn with_skip_to(self, skip_to: Option<(String, bool)>) -> Self {
-        Self { skip_to, ..self }
+        let job = skip_to
+            .as_ref()
+            .and_then(|(id, _)| crate::jobs::JobRun::for_skip(id));
+        Self {
+            skip_to,
+            job,
+            ..self
+        }
+    }
+
+    /// The job she was skipped to, and where it stands.
+    pub fn job(&self) -> Option<&crate::jobs::JobRun> {
+        self.job.as_ref()
     }
 
     /// Stocks and calls in these support items once the scripts run.
@@ -1761,10 +1776,21 @@ impl MissionLink {
             for (g, at, yaw) in game.scene.flights.places(&game.scene.vehicles) {
                 mission.place(g, at.to_array(), yaw);
             }
-            self.vehicles.sync(game, mission);
+            self.vehicles.sync(
+                game,
+                mission,
+                self.job.as_ref().map_or(&[][..], |j| &j.quarry),
+            );
             ride_along(game, mission, self.vehicles.riding, &mut self.out_for, STEP);
+            // Those she killed die by her hand: a job's hero-only bounty
+            // counts them.
+            let hero = mission.world().borrow().player;
+            let hers = game.scene.people.her_kills();
             for guid in game.scene.people.all_killed() {
-                mission.kill(guid);
+                match hero.filter(|_| hers.contains(&guid)) {
+                    Some(h) => mission.kill_by(guid, h),
+                    None => mission.kill(guid),
+                }
             }
             // Targets to destroy: soldiers stand at those that are spawns,
             // and blasts close to the rest (gates, buildings) destroy them.
@@ -1779,6 +1805,11 @@ impl MissionLink {
                         let o = w.objects.get(&g).filter(|o| o.alive)?;
                         Some((g, Vec3::from(o.position)))
                     })
+                    // And a bounty's quarry, marked for her as these are.
+                    .chain(self.job.iter().flat_map(|j| &j.quarry).filter_map(|&g| {
+                        let o = w.objects.get(&g).filter(|o| o.alive)?;
+                        Some((g, Vec3::from(o.position)))
+                    }))
                     .collect()
             };
             game.scene.people.mission_soldiers = targets.iter().map(|t| t.0).collect();
@@ -1826,7 +1857,11 @@ impl MissionLink {
                     if bombed {
                         eprintln!("mission: {g:#x} falls to the bomb");
                     }
-                    mission.kill(*g);
+                    // Her blast, ram or the bomb she called in.
+                    match hero {
+                        Some(h) => mission.kill_by(*g, h),
+                        None => mission.kill(*g),
+                    }
                 }
             }
             game.scene.props.sturdy = sturdy;
@@ -2049,6 +2084,12 @@ impl MissionLink {
                 self.tutorial = line;
             }
             follow_markers(game, mission, &mut self.marked, &mut self.markers_logged);
+            if let Some(job) = &mut self.job {
+                for line in job.update(mission, game.focus(), STEP) {
+                    eprintln!("{line}");
+                    lines.push(line);
+                }
+            }
             break_props(game, mission);
             let w = mission.world().borrow();
             if let Some(m) = w.hud.messages.last() {
@@ -2504,6 +2545,12 @@ impl MissionLink {
             .filter(|m| !m.kind.starts_with("HUD_"))
             .collect();
         let Some((id, index)) = self.contract() else {
+            // Off a contract, on the job she was skipped to: its marks.
+            if let (Some(job), State::Running(mission)) = (&self.job, &self.state)
+                && job.view.active
+            {
+                return job.marks(marks, mission);
+            }
             return marks;
         };
         let ours = |m: &Mark| match &m.mission {
@@ -2766,7 +2813,7 @@ impl Fleet {
     /// Keeps the scripts' vehicles and the island's in step: loads those
     /// near the player, places them where the scripts say, tells the
     /// scripts where they went, which one she is in, and which are wrecked.
-    fn sync(&mut self, game: &mut Game, mission: &mut Mission) {
+    fn sync(&mut self, game: &mut Game, mission: &mut Mission, quarry: &[u32]) {
         let Some(world) = &mut game.scene.world else {
             return;
         };
@@ -2824,7 +2871,14 @@ impl Fleet {
             };
             // A ruin stands wrecked from the start: nothing died.
             if v.wrecked && !game.scene.ruins.contains(&g) {
-                mission.kill(g);
+                // Her bounty's quarry wrecked: by her, who went for it
+                // (inferred: the wreck doesn't say who did it).
+                let hers = quarry.contains(&g);
+                let hero = mission.world().borrow().player.filter(|_| hers);
+                match hero {
+                    Some(h) => mission.kill_by(g, h),
+                    None => mission.kill(g),
+                }
             }
             if self.landing.contains_key(&g) {
                 continue;

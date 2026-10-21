@@ -31,6 +31,12 @@ pub trait World {
     fn position(&self, guid: u32) -> Option<[f32; 3]>;
     /// Whether an object exists and isn't dead or destroyed.
     fn is_alive(&self, guid: u32) -> bool;
+    /// Who killed an object, when known. The job scripts' hero-only
+    /// bounties (`MrxTaskObjectiveDestroy._TargetDestroyed`) count only
+    /// what a player's character killed.
+    fn killer(&self, _guid: u32) -> Option<u32> {
+        None
+    }
     /// The vehicle an object rides in, if any.
     fn vehicle_of(&self, guid: u32) -> Option<u32>;
     /// The player's character (scripts write it `"hero"`).
@@ -927,10 +933,21 @@ fn check(
         // { object }: when it dies or is removed; passes the object. A
         // filter or label names several, each firing as it dies (a
         // Destroy objective counts its targets this way).
+        // Passes the object, then (when the game knows who killed it) a
+        // nil and the killer: `MrxTaskObjectiveDestroy._TargetDestroyed(
+        // self, target, _, killer)` checks its fourth parameter against
+        // the players' characters for a hero-only bounty (from the
+        // scripts; what the second value is was not found).
         "ObjectDeath" => Check::Each(
             objects(&p.params, 1, world)
                 .into_iter()
-                .map(|g| (g, !world.is_alive(g), vec![id(g)]))
+                .map(|g| {
+                    let mut pass = vec![id(g)];
+                    if let Some(k) = world.killer(g) {
+                        pass.extend([Value::Nil, id(k)]);
+                    }
+                    (g, !world.is_alive(g), pass)
+                })
                 .collect(),
         ),
         // { object }: once it is gone from play (removed, or faded out):
@@ -1300,6 +1317,8 @@ mod tests {
         context: Vec<(f64, u32)>,
         /// Clip events met: (game time, who, event).
         anims: Vec<(f64, u32, String)>,
+        /// Who killed whom.
+        killers: HashMap<u32, u32>,
     }
 
     impl World for TestWorld {
@@ -1311,6 +1330,9 @@ mod tests {
         }
         fn is_alive(&self, guid: u32) -> bool {
             !self.dead.contains(&guid)
+        }
+        fn killer(&self, guid: u32) -> Option<u32> {
+            self.killers.get(&guid).copied()
         }
         fn vehicle_of(&self, guid: u32) -> Option<u32> {
             self.seats.get(&guid).copied()
@@ -1599,6 +1621,35 @@ mod tests {
             ["awake 3", "dead 7,7", "near 1", "posted x,y", "seat 1,99"]
         );
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_death_passes_its_killer_when_known() {
+        // As `MrxTaskObjectiveDestroy._TargetDestroyed(self, target, _,
+        // killer)` reads it for a hero-only bounty.
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                r##"
+                local function note(s) return function(...)
+                    local n = select("#", ...)
+                    local a, b, c = ...
+                    table.insert(log, s .. n .. " " .. tostring(gid(a)) .. " "
+                        .. tostring(b) .. " " .. tostring(c and gid(c)))
+                end end
+                Event.Create(Event.ObjectDeath, { 7 }, note("dead "), {})
+                Event.Create(Event.ObjectDeath, { 8 }, note("dead "), {})
+                "##,
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        world.dead.extend([7, 8]);
+        world.killers.insert(7, 1);
+        events.update(0.1, &world);
+        let mut got = log(&host);
+        got.sort();
+        assert_eq!(got, ["dead 1 8 nil nil", "dead 3 7 nil 1"]);
     }
 
     #[test]

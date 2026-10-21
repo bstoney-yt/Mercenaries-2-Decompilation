@@ -1,0 +1,160 @@
+//! The job she was skipped to (`--skip-to AllJob002`), followed as a
+//! player takes it on: once the scripts have it on, she tracks it on the
+//! PDA's map (which marks its targets), and goes for what it wants
+//! ([`m2_game::jobs`] has the four kinds).
+//!
+//! A set job's marks are its own targets only (the other jobs' markers
+//! stay up all over the island). A bounty or a collection names no
+//! targets: what it is over (its label's objects in play) is her quarry,
+//! the [`QUARRY`] nearest, marked for her as a destroy objective's
+//! targets are and destroyed by her blasts as they are.
+
+use m2_game::jobs::{JobView, is_job_id, read};
+use m2_game::mission::Mission;
+use m2_math::glam::Vec3;
+
+use crate::mission::{Mark, MarkFor};
+
+/// How many of a bounty's or a collection's objects she has in view at
+/// once, nearest first (invented).
+pub const QUARRY: usize = 6;
+
+/// The job followed, and where it stands.
+#[derive(Debug, Default)]
+pub struct JobRun {
+    pub id: String,
+    /// Tracked on the PDA's map.
+    pub tracked: bool,
+    pub view: JobView,
+    /// A bounty's or a collection's objects she goes for, by guid.
+    pub quarry: Vec<u32>,
+    /// What the log said last: targets counted, completed.
+    said: (i64, bool),
+    /// Seconds since the quarry was chosen.
+    since_chosen: f32,
+}
+
+/// Seconds between choosing the quarry again (invented).
+const CHOOSE_EVERY: f32 = 2.0;
+
+impl JobRun {
+    /// The job `--skip-to` names, if it names one.
+    pub fn for_skip(id: &str) -> Option<Self> {
+        is_job_id(id).then(|| Self {
+            id: id.to_owned(),
+            ..Self::default()
+        })
+    }
+
+    /// Done: a set job or a collection completed, or a bounty paid once
+    /// (it never completes).
+    pub fn finished(&self) -> bool {
+        self.view.completed || (self.view.is_bounty() && self.view.counted > 0)
+    }
+
+    /// Reads where it stands, tracks it once it is on, and chooses her
+    /// quarry near `her`. Lines for the log as it changes.
+    pub fn update(&mut self, mission: &mut Mission, her: Vec3, dt: f32) -> Vec<String> {
+        let mut lines = Vec::new();
+        self.view = read(mission, &self.id);
+        if self.view.active && !self.tracked {
+            self.tracked = mission.track_mission(&self.id);
+            lines.push(format!(
+                "jobs: {} is on ({}, {} targets, label {:?}); {}",
+                self.id,
+                self.view.class.as_deref().unwrap_or("?"),
+                self.view.targets.len(),
+                self.view.label,
+                if self.tracked {
+                    "tracked on the PDA's map"
+                } else {
+                    "the PDA's map can't track it"
+                }
+            ));
+        }
+        self.since_chosen += dt;
+        if self.view.active
+            && self.view.targets.is_empty()
+            && (self.since_chosen >= CHOOSE_EVERY || self.quarry.is_empty())
+            && let Some(label) = &self.view.label
+        {
+            self.since_chosen = 0.0;
+            let w = mission.world().borrow();
+            let mut near: Vec<(u32, f32)> = mission
+                .labelled(label)
+                .into_iter()
+                .filter(|(g, _)| w.objects.get(g).is_some_and(|o| o.alive && !o.hidden))
+                .map(|(g, at)| (g, Vec3::from(at).distance(her)))
+                .collect();
+            near.sort_by(|a, b| a.1.total_cmp(&b.1));
+            self.quarry = near.into_iter().take(QUARRY).map(|q| q.0).collect();
+        }
+        let now = (self.view.counted, self.view.completed);
+        if now != self.said {
+            lines.push(format!(
+                "jobs: {} counts {} target{}{}",
+                self.id,
+                now.0,
+                if now.0 == 1 { "" } else { "s" },
+                if now.1 { "; completed" } else { "" }
+            ));
+            self.said = now;
+        }
+        lines
+    }
+
+    /// Of `marks`, those for this job: its targets' (a verify mark stays
+    /// on a body), else marks made for her quarry (`destroy`).
+    pub fn marks(&self, marks: Vec<Mark>, mission: &Mission) -> Vec<Mark> {
+        if !self.view.targets.is_empty() {
+            return marks
+                .into_iter()
+                .filter(|m| self.view.targets.contains(&m.target))
+                .collect();
+        }
+        let w = mission.world().borrow();
+        self.quarry
+            .iter()
+            .filter_map(|&g| {
+                let o = w.objects.get(&g)?;
+                Some(Mark {
+                    target: g,
+                    kind: "destroy".into(),
+                    name: o.name.clone(),
+                    at: Vec3::from(o.position),
+                    alive: o.alive,
+                    mission: Some(MarkFor::Id(self.id.clone())),
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_job_is_followed() {
+        assert_eq!(
+            JobRun::for_skip("AllJob002").map(|j| j.id),
+            Some("AllJob002".into())
+        );
+        assert!(JobRun::for_skip("AllCon002").is_none());
+    }
+
+    #[test]
+    fn a_bounty_is_done_once_paid_a_set_job_once_complete() {
+        let mut j = JobRun::for_skip("AllJob003").unwrap();
+        j.view.class = Some("MrxTaskJobDestroyType".into());
+        assert!(!j.finished());
+        j.view.counted = 1;
+        assert!(j.finished(), "a standing bounty never completes");
+        let mut s = JobRun::for_skip("AllJob020").unwrap();
+        s.view.class = Some("MrxTaskJobDestroySet".into());
+        s.view.counted = 5;
+        assert!(!s.finished());
+        s.view.completed = true;
+        assert!(s.finished());
+    }
+}
