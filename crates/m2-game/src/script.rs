@@ -77,6 +77,10 @@ pub(crate) fn show_arg(v: &Value) -> String {
 /// Key in a stub table holding its name.
 const STUB_NAME: &str = "__m2_stub";
 
+/// Registry key of the set of names the scripts define
+/// ([`ScriptHost::script_names`]).
+const SCRIPT_NAMES: &str = "m2_script_names";
+
 impl ScriptHost {
     pub fn new() -> Result<Self, ScriptError> {
         // SAFETY: loading precompiled chunks needs the unsafe constructor.
@@ -216,6 +220,30 @@ impl ScriptHost {
         Ok(stub(&self.lua, name)?)
     }
 
+    /// Names the scripts define themselves (their modules' functions and
+    /// state, `SETGLOBAL` in their chunks): globals missing under these
+    /// read nil rather than a stub ([`stub_missing_globals`](Self::stub_missing_globals)).
+    pub fn script_names<I: IntoIterator<Item = String>>(
+        &self,
+        names: I,
+    ) -> Result<(), ScriptError> {
+        let t = match self
+            .lua
+            .named_registry_value::<Option<Table>>(SCRIPT_NAMES)?
+        {
+            Some(t) => t,
+            None => {
+                let t = self.lua.create_table()?;
+                self.lua.set_named_registry_value(SCRIPT_NAMES, &t)?;
+                t
+            }
+        };
+        for n in names {
+            t.raw_set(n, true)?;
+        }
+        Ok(())
+    }
+
     /// Makes every global the host doesn't define a stub, so a script runs
     /// past libraries not written yet; see `default_for` for the globals
     /// that get plain values instead.
@@ -236,6 +264,18 @@ impl ScriptHost {
                     // in the satellite designator) is no engine library:
                     // nil, as in plain Lua.
                     if name.bytes().all(|b| b.is_ascii_lowercase()) {
+                        return Ok(MultiValue::from_vec(vec![Value::Nil]));
+                    }
+                    // A name the scripts define in their own modules
+                    // ([`ScriptHost::script_names`]) is no engine library:
+                    // nil, as in the game. Classes fall back to the
+                    // globals, so a stub here would answer a method the
+                    // object lacks (`MecRace.GetMissionId`, which
+                    // `MrxTaskObjective.GetMissionAncestor` tests for).
+                    if let Ok(Some(defined)) =
+                        lua.named_registry_value::<Option<Table>>(SCRIPT_NAMES)
+                        && defined.raw_get::<bool>(name.as_str()).unwrap_or(false)
+                    {
                         return Ok(MultiValue::from_vec(vec![Value::Nil]));
                     }
                     let value = match default_for(&name) {
@@ -706,6 +746,22 @@ mod tests {
 
     /// See `m2-assets`' Lua tests for the source.
     const LUA51: &[u8] = include_bytes!("../../m2-assets/tests/data/mission51.luac");
+
+    #[test]
+    fn names_the_scripts_define_are_nil_not_stubs() {
+        let host = ScriptHost::new().unwrap();
+        host.stub_missing_globals().unwrap();
+        host.script_names(["GetMissionId".to_owned()]).unwrap();
+        let (method, library): (bool, bool) = host
+            .lua()
+            .load(
+                "local race = setmetatable({}, { __index = _G }) \
+                 return race.GetMissionId == nil, type(Pg) == 'table'",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((method, library), (true, true));
+    }
 
     #[test]
     fn runs_a_compiled_script_against_stubs() {
