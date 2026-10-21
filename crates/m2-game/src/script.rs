@@ -238,6 +238,13 @@ impl ScriptHost {
                     if name.bytes().all(|b| b.is_ascii_lowercase()) {
                         return Ok(MultiValue::from_vec(vec![Value::Nil]));
                     }
+                    // A contract's own global it reads before (or without)
+                    // setting it ([`ScriptHost::nil_globals`]).
+                    if let Ok(Value::Table(own)) = lua.named_registry_value::<Value>(NIL_GLOBALS)
+                        && own.contains_key(name.as_str()).unwrap_or(false)
+                    {
+                        return Ok(MultiValue::from_vec(vec![Value::Nil]));
+                    }
                     let value = match default_for(&name) {
                         Some(v) => v,
                         None => Value::Table(stub(lua, &name)?),
@@ -249,6 +256,27 @@ impl ScriptHost {
             })?,
         )?;
         self.lua.globals().set_metatable(Some(meta))?;
+        Ok(())
+    }
+
+    /// Makes globals `names` read nil while unset, under
+    /// [`stub_missing_globals`](Self::stub_missing_globals), not stubs:
+    /// the contracts' own globals, which one contract sets and another
+    /// reads without setting (PmcCon032 reads `PointDist`, which PmcCon031
+    /// and PmcCon033 set; a stub there made its "Move to sandbags"
+    /// delivery distance a table, and the delivery never came).
+    pub fn nil_globals<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), ScriptError> {
+        let own = match self.lua.named_registry_value::<Value>(NIL_GLOBALS)? {
+            Value::Table(t) => t,
+            _ => self.lua.create_table()?,
+        };
+        for n in names {
+            own.raw_set(n, true)?;
+        }
+        self.lua.set_named_registry_value(NIL_GLOBALS, own)?;
         Ok(())
     }
 
@@ -638,7 +666,7 @@ fn default_for(name: &str) -> Option<Value> {
 /// Whether `name` is a contract's or job's module name, as the mission
 /// flow names them: a faction's three letters, `Con` or `Job`, three
 /// digits (`OilCon020`, `VzaCon001`, `PmcJob001`).
-fn is_contract_module(name: &str) -> bool {
+pub fn is_contract_module(name: &str) -> bool {
     let b = name.as_bytes();
     b.len() == 9
         && b[0].is_ascii_uppercase()
@@ -646,6 +674,10 @@ fn is_contract_module(name: &str) -> bool {
         && matches!(&b[3..6], b"Con" | b"Job")
         && b[6..].iter().all(u8::is_ascii_digit)
 }
+
+/// The registry key of the globals that read nil while unset
+/// ([`ScriptHost::nil_globals`]).
+const NIL_GLOBALS: &str = "m2_nil_globals";
 
 /// Drops the "runtime error: " each nested call adds to a message.
 fn tidy(message: &str) -> &str {
@@ -706,6 +738,24 @@ mod tests {
 
     /// See `m2-assets`' Lua tests for the source.
     const LUA51: &[u8] = include_bytes!("../../m2-assets/tests/data/mission51.luac");
+
+    #[test]
+    fn a_contracts_own_global_reads_nil_until_set() {
+        let host = ScriptHost::new().unwrap();
+        host.stub_missing_globals().unwrap();
+        host.nil_globals(["PointDist"]).unwrap();
+        let lua = host.lua();
+        // PmcCon032 reads PointDist, which only PmcCon031 and 033 set.
+        assert!(lua.load("return PointDist == nil").eval::<bool>().unwrap());
+        // Other unknown names are still stubs, and a set one reads back.
+        assert!(
+            lua.load("return type(SomeLibrary) == 'table'")
+                .eval::<bool>()
+                .unwrap()
+        );
+        lua.load("PointDist = 2.5").exec().unwrap();
+        assert_eq!(lua.load("return PointDist").eval::<f64>().unwrap(), 2.5);
+    }
 
     #[test]
     fn runs_a_compiled_script_against_stubs() {
