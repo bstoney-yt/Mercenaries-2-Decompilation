@@ -1474,7 +1474,9 @@ impl Autoplay {
                 self.blocked = 0.0;
                 return self.walk(game, out, 1.0, dt);
             }
-        } else {
+        } else if here.y > WATERLINE + LANDING_DRY {
+            // Only once out on dry ground: in the shallows she is in and out
+            // of swimming (round 34's AllCon002: 12 ways out, never hopped).
             self.stranded = 0;
         }
         self.landing = None;
@@ -1521,7 +1523,10 @@ impl Autoplay {
                 && at.y < WATERLINE + AFLOAT
                 && let Some(s) = game.scene.world.as_ref().and_then(|w| {
                     let rings: &[f32] = if lobbing { &LOB_RINGS } else { &BLAST_RINGS };
+                    // Else the dry ground nearest it (round 34's AllCon002:
+                    // no spot in range saw it, and she went in again).
                     vantage(&w.physics, at, here, &self.tried, rings, BLAST_BODY)
+                        .or_else(|| landing(&w.physics, at, here, &self.tried))
                 })
             {
                 eprintln!(
