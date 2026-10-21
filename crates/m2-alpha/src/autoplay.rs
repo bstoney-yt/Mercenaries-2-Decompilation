@@ -825,7 +825,14 @@ impl Autoplay {
                 .map(|t| t.transform_point3(Vec3::Y))
                 .or_else(|| game.scene.props.centre(m.target))
                 .unwrap_or(m.at + Vec3::Y);
-            let how = if game.scene.props.sturdy.contains(&m.target) {
+            let sturdy = game.scene.props.sturdy.contains(&m.target);
+            // A satellite bomb is called on the ground: by the middle of a
+            // tall building (ChiCon003's Target04, 80 m up) no way is found.
+            let at = match game.scene.props.get(m.target) {
+                Some((prop, _)) if sturdy => at.with_y(prop.position.y),
+                _ => at,
+            };
+            let how = if sturdy {
                 "calling a satellite bomb on"
             } else {
                 "blowing up"
