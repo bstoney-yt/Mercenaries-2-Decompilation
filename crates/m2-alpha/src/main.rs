@@ -3684,6 +3684,9 @@ fn mission_for_screenshot(
     let (mut extraction, mut extraction_tap, mut extraction_seen) = (0u8, false, 0.0f32);
     let (mut locked_was, mut locked_for) = (false, 0.0f32);
     let mut on_contract: Option<(String, i64)> = None;
+    // Message box calls with a callback, while the game's HUD isn't
+    // running: when each is due back, by call number; the last seen.
+    let (mut boxed, mut boxed_seen): (Vec<(f32, u64)>, u64) = (Vec::new(), 0);
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
             Some(a) => {
@@ -3698,6 +3701,7 @@ fn mission_for_screenshot(
                 }
                 a.sights = link.sight_targets(game);
                 let marks = link.contract_marks();
+                a.offers = link.offers(game);
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)
             }
@@ -4146,6 +4150,31 @@ fn mission_for_screenshot(
         }
         if options.movies {
             movies_offscreen(&mut link, install, out);
+        }
+        // Until the contract is done the game's HUD doesn't run here, so
+        // its message box can't call back as each message ends: an
+        // objective's added message, which the objective waits on before
+        // going on (`fOnInitialNotesComplete`: GurCon002's cathedral
+        // countdown). Each is called back once its `nDuration` is up
+        // (inferred: the box shows one at a time, which isn't kept).
+        if late_hud.is_none() {
+            let now = i as f32 * tick;
+            for c in link.view().hud_calls {
+                if c.seq <= boxed_seen {
+                    continue;
+                }
+                boxed_seen = c.seq;
+                if c.callback && c.group == "MessageBox" && c.method == "AddMessage" {
+                    boxed.push((now + message_seconds(&c.data), c.seq));
+                }
+            }
+            boxed.retain(|&(due, seq)| {
+                if due > now {
+                    return true;
+                }
+                link.hud_callback(seq);
+                false
+            });
         }
         if late_hud.is_none() {
             let wanted = screen_cycle.wanted(game.arrival.is_some(), link.black(), tick);
@@ -5031,6 +5060,21 @@ fn grapple_keys(game: &mut Game, input: &mut Input, allowed: bool) {
         }
     }
     game.grapple = g;
+}
+
+/// How long the message box shows a message (its call's `nDuration`,
+/// seconds; 5 when not given, as the objectives' messages ask).
+fn message_seconds(data: &gamehud::Plain) -> f32 {
+    use gamehud::Plain;
+    let Plain::Table(t) = data else {
+        return 5.0;
+    };
+    t.iter()
+        .find_map(|(k, v)| match (k, v) {
+            (Plain::Text(k), Plain::Number(n)) if k == "nDuration" => Some(*n as f32),
+            _ => None,
+        })
+        .unwrap_or(5.0)
 }
 
 /// With `--context`: once the scripts offer a context action whose prompt
