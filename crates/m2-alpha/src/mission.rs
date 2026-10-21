@@ -774,6 +774,10 @@ pub struct MissionLink {
     /// Seconds she has been out of her vehicle with followers aboard
     /// ([`ride_along`]).
     out_for: f32,
+    /// The armies' pursuit helicopters ([`crate::reinforce`]), read from
+    /// the data once, and those under way.
+    squads: Option<HashMap<&'static str, crate::reinforce::Squad>>,
+    reinforcements: crate::reinforce::Reinforcements,
     /// Seconds since the scripts said the contract was completed.
     completed: Option<f32>,
     /// How many times the scripts have said a contract was completed.
@@ -933,6 +937,8 @@ impl MissionLink {
             bombs: Vec::new(),
             vehicles: Fleet::default(),
             out_for: 0.0,
+            squads: None,
+            reinforcements: crate::reinforce::Reinforcements::default(),
             completed: None,
             contracts: 0,
             speed: 0.0,
@@ -1434,13 +1440,14 @@ impl MissionLink {
                 );
             }
         }
-        // Deliveries fly on; the scripts hear of each load let go.
+        // Deliveries fly on; the scripts hear of each load let go (but the
+        // pursuits' helicopters', [`crate::reinforce`]).
         let scene = &mut game.scene;
         if let Some(world) = &mut scene.world {
-            for r in scene
+            let releases = scene
                 .flights
-                .step(dt, &mut world.physics, &mut scene.vehicles, focus)
-            {
+                .step(dt, &mut world.physics, &mut scene.vehicles, focus);
+            for r in self.reinforcements.take_releases(releases) {
                 for &g in &r.dropped {
                     self.vehicles.landing.insert(g, mission.now() + LANDING);
                 }
@@ -1794,6 +1801,47 @@ impl MissionLink {
         // The radios near her play over the score.
         if let Some(cue) = self.radio.update(game, mission) {
             self.music = Some(cue);
+        }
+        // A pursuit brings its army's helicopter with soldiers.
+        if self.squads.is_none()
+            && let Some(world) = &game.scene.world
+        {
+            let w = mission.world().borrow();
+            let squads = crate::reinforce::squads(
+                &w.template_passengers,
+                &w.template_drivers,
+                &world.index.template_db,
+            );
+            let mut names: Vec<String> = squads
+                .iter()
+                .map(|(f, s)| format!("{f} {} ({} soldiers)", s.template, s.soldiers.len()))
+                .collect();
+            names.sort();
+            eprintln!("reinforcements: pursuit helicopters {names:?}");
+            self.squads = Some(squads);
+        }
+        if let (Some(squads), Some(her)) = (
+            &self.squads,
+            game.scene.player.as_ref().map(|p| p.character.position),
+        ) {
+            let mut pursuing: Vec<&'static str> =
+                game.scene.people.pursuit.keys().copied().collect();
+            pursuing.sort_unstable();
+            let due = self
+                .reinforcements
+                .step(&pursuing, squads, &mut game.scene.flights, her, dt);
+            for (g, template, at) in due {
+                let model = game
+                    .scene
+                    .world
+                    .as_ref()
+                    .and_then(|w| w.index.template_db.get(&template))
+                    .and_then(|t| t.model);
+                let at = ground_under(game, at);
+                if game.scene.people.bring_scripted(g, &template, model, at) {
+                    self.reinforcements.brought(g);
+                }
+            }
         }
         // A pursuit run out: the scripts read level 0 again.
         let pursued = !game.scene.people.pursuit.is_empty();

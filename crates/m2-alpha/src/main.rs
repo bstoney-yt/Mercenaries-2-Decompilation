@@ -75,6 +75,7 @@ mod placed;
 mod player;
 mod props;
 mod raw;
+mod reinforce;
 mod roads;
 mod route;
 mod save;
