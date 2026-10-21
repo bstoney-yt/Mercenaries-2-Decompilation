@@ -1490,8 +1490,10 @@ impl Autoplay {
                 .filter(|(_, l, _)| l.length() < 200.0)
             {
                 eprintln!(
-                    "autoplay {:.1} s: boat at {speed:.1} m/s; nearest the {} at {l:.1} (her frame), {s:.1} m/s; standing ahead {standing:?}",
-                    self.clock, game.scene.vehicles[j].spec.label
+                    "autoplay {:.1} s: boat at {pos:.0}, {speed:.1} m/s, heading for {toward:.0} ({:+.0} deg off); nearest the {} at {l:.1} (her frame), {s:.1} m/s; standing ahead {standing:?}",
+                    self.clock,
+                    angle.to_degrees(),
+                    game.scene.vehicles[j].spec.label
                 );
             }
         }
@@ -1512,7 +1514,11 @@ impl Autoplay {
         } else {
             1.0
         };
-        if (d < SLOW_NEAR && speed > SLOW) || (angle.abs() > 0.8 && speed > SLOW) {
+        // Not slowing for a race's checkpoint, only passed through: each
+        // gate's time is short (PirCon001 round 92 had 12.6 s for 157 m;
+        // easing off near each cost the race).
+        let racing = self.what.contains("checkpoint") || self.what.contains("_gate_");
+        if (!racing && d < SLOW_NEAR && speed > SLOW) || (angle.abs() > 0.8 && speed > SLOW) {
             throttle = throttle.min(0.2);
         }
         // Goods riding on her truck (PirCon002's rum): no faster than a
