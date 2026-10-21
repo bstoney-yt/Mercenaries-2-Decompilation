@@ -1350,9 +1350,15 @@ impl Mission {
     /// Reports where an object is in play (a vehicle that was driven or
     /// pushed about).
     pub fn place(&mut self, guid: u32, at: [f32; 3], yaw: f32) {
-        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+        let mut w = self.world.borrow_mut();
+        if let Some(o) = w.objects.get_mut(&guid) {
             o.position = at;
             o.yaw = yaw;
+        } else if let Some(e) = w.entities.get_mut(&guid) {
+            // A layer's entity no script has made an object of yet (a
+            // truck's rum jugs riding on it): where the scripts' area
+            // searches find it.
+            *e = at;
         }
     }
 
@@ -2392,6 +2398,14 @@ mod tests {
         m.set_subtitles(false);
         m.set_tutorials(true);
         assert_eq!(ask(&m), [false, true]);
+    }
+
+    #[test]
+    fn a_layer_entity_is_placed_where_the_game_says() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.world.borrow_mut().entities.insert(5, [0.0; 3]);
+        m.place(5, [1.0, 2.0, 3.0], 0.0);
+        assert_eq!(m.world.borrow().entities[&5], [1.0, 2.0, 3.0]);
     }
 
     #[test]

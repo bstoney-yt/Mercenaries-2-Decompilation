@@ -612,6 +612,10 @@ pub struct Mark {
     /// (`"GurCon053"`), else that of an objective on the PDA about the
     /// same object.
     pub mission: Option<MarkFor>,
+    /// Its marker is drawn in the secondary objectives' colour
+    /// (`MrxUtil.GetSecondaryObjectiveRgb`: the jobs' and bounties'),
+    /// not the primary ones' (a contract's).
+    pub secondary: bool,
 }
 
 /// The mission a [`Mark`] is for, as the scripts name it.
@@ -1751,7 +1755,23 @@ impl MissionLink {
             .as_ref()
             .filter(|p| p.driving.is_none())
             .map(|p| p.character.position);
-        let offered = on_foot.and_then(|at| nearest_context(&mission.context_actions(), at));
+        // A person's action (a verified HVT's) is where they lie in play,
+        // not where the scripts last placed them.
+        let actions: Vec<_> = mission
+            .context_actions()
+            .into_iter()
+            .map(|(g, at, text, reach)| {
+                let person = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .find(|n| n.spawn == Some(g))
+                    .map(|n| n.character.position.to_array());
+                (g, person.or(at), text, reach)
+            })
+            .collect();
+        let offered = on_foot.and_then(|at| nearest_context(&actions, at));
         let offered = offered.map(|(g, id)| (g, mission.text(&id)));
         if offered != game.context {
             match &offered {
@@ -1774,6 +1794,27 @@ impl MissionLink {
                 && self.vehicles.reenter.is_none()
             {
                 mission.put_player(at.to_array());
+            }
+            // The scripts' vehicles' load beds, where they count the goods
+            // on them (`Object.GetHardpointPosition(truck, "HP_Truckbed")`).
+            if let Some(world) = game.scene.world.as_ref() {
+                for v in &game.scene.vehicles {
+                    if let (Some(g), Some(id)) = (v.guid, v.id)
+                        && let Some(bed) = game.bed(v.spec.model)
+                        && let Some(t) = world.physics.vehicle_transform(id)
+                    {
+                        mission.set_hardpoint(
+                            g,
+                            m2_assets::name_hash(crate::game::BED_NODE),
+                            t.transform_point3(bed).to_array(),
+                        );
+                    }
+                }
+            }
+            // What rides on a vehicle is where it rides, for the scripts
+            // that count it there (`Pg.GetObjectsInArea`).
+            for (g, at, yaw) in game.scene.props.cargo_places() {
+                mission.place(g, at.to_array(), yaw);
             }
             for (g, at, yaw) in game.scene.flights.places(&game.scene.vehicles) {
                 mission.place(g, at.to_array(), yaw);
@@ -2167,6 +2208,28 @@ impl MissionLink {
         self.state = State::Failed(why);
     }
 
+    /// The context actions on offer: on what, and where it stands (a
+    /// person where they are in play, else where the scripts have them).
+    pub fn offers(&self, game: &Game) -> Vec<(u32, Vec3)> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        mission
+            .context_actions()
+            .into_iter()
+            .filter_map(|(g, at, _, _)| {
+                let person = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .find(|n| n.spawn == Some(g))
+                    .map(|n| n.character.position);
+                Some((g, person.or_else(|| at.map(Vec3::from))?))
+            })
+            .collect()
+    }
+
     /// The first context action on offer whose prompt reads `text` (as
     /// shown, any case): its object and where that stands. For
     /// `--context`.
@@ -2451,7 +2514,15 @@ impl MissionLink {
                 .find(|o| o.target == Some(g))
                 .map(|o| MarkFor::Index(o.mission))
         };
-        let mark = |g: u32, kind: &str, for_mission: Option<MarkFor>| {
+        let secondary = mission
+            .lua()
+            .load(
+                "local u = rawget(_G, 'MrxUtil')                  if type(u) ~= 'table' or type(u.GetSecondaryObjectiveRgb) ~= 'function' then return nil end                  return u.GetSecondaryObjectiveRgb()",
+            )
+            .eval::<(Option<f64>, Option<f64>, Option<f64>)>()
+            .ok()
+            .and_then(|(r, g, b)| Some([r? as u8, g? as u8, b? as u8]));
+        let mark = |g: u32, kind: &str, for_mission: Option<MarkFor>, colour: Option<[u8; 3]>| {
             let o = w.objects.get(&g)?;
             Some(Mark {
                 target: g,
@@ -2460,6 +2531,7 @@ impl MissionLink {
                 at: Vec3::from(o.position),
                 alive: o.alive,
                 mission: for_mission.or_else(|| on_pda(g)),
+                secondary: colour.is_some() && colour == secondary,
             })
         };
         let mut out: Vec<Mark> = w
@@ -2471,6 +2543,7 @@ impl MissionLink {
                     m.target?,
                     m.icon.trim_start_matches("HUD_objective_"),
                     (m.mission != "nil").then(|| MarkFor::Id(m.mission.clone())),
+                    Some([m.colour[0], m.colour[1], m.colour[2]]),
                 )
             })
             .collect();
@@ -2488,7 +2561,7 @@ impl MissionLink {
             );
         for (g, kind) in others {
             if !out.iter().any(|m| m.target == g)
-                && let Some(m) = mark(g, kind, None)
+                && let Some(m) = mark(g, kind, None, None)
             {
                 out.push(m);
             }
@@ -2537,7 +2610,13 @@ impl MissionLink {
             .iter()
             .any(|m| (m.alive || m.kind == "verify") && ours(m))
         {
-            marks.into_iter().filter(ours).collect()
+            return marks.into_iter().filter(ours).collect();
+        }
+        // None named for it (a race's jetski, whose marker's mission
+        // the scripts give as a list): the primary objectives' marks.
+        let primary: Vec<Mark> = marks.iter().filter(|m| !m.secondary).cloned().collect();
+        if primary.iter().any(|m| m.alive) {
+            primary
         } else {
             marks
         }
@@ -3743,6 +3822,46 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
 /// or the layers they stream; true when it seated her in a vehicle the
 /// island doesn't show, so she stands where it is.
 fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> bool {
+    // A person the scripts make (`Pg.Spawn` of a person's template) stands
+    // as a layer's spawn would; one they take away goes.
+    match c {
+        Command::Spawn {
+            guid,
+            what,
+            position,
+            yaw,
+        } => {
+            if let Some(s) = game.scene.world.as_ref().and_then(|w| {
+                w.index
+                    .template_db
+                    .scripted_spawn(*guid, what, Vec3::from(*position), *yaw)
+            }) {
+                game.scene.people.scripted_spawn(s);
+            }
+            // A prop of theirs (PirCon004's organ boxes) stands as a
+            // layer's would.
+            if let (Some(w), Some(install)) =
+                (game.scene.world.as_ref(), game.scene.install.as_ref())
+                && let Some(o) =
+                    w.index
+                        .template_db
+                        .scripted_prop(*guid, what, Vec3::from(*position), *yaw)
+                && game
+                    .scene
+                    .props
+                    .show_spawned(install, &w.index.template_db, &o)
+            {
+                eprintln!("mission: {what} put up as {guid:#x} at {:.1?}", position);
+            }
+        }
+        Command::Remove(guid) => {
+            game.scene.people.scripted_gone(*guid);
+            if let Some(w) = game.scene.world.as_mut() {
+                game.scene.props.hide(&mut w.physics, [*guid]);
+            }
+        }
+        _ => {}
+    }
     let index = |guid: &u32| {
         game.scene
             .vehicles

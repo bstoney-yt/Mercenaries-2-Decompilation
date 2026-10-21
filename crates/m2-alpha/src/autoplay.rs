@@ -8,7 +8,7 @@
 //! no headway for a while she hops ahead (logged too): the run goes on to
 //! the later objectives, and the hops show where the way is blocked.
 
-use m2_engine::physics::FLOAT_DEPTH;
+use m2_engine::physics::{FLOAT_DEPTH, StaticKey};
 use m2_engine::{Physics, Templates, VehicleControls, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 
@@ -115,6 +115,11 @@ const REVERSE: f32 = 1.5;
 const STUCK: f32 = 3.0;
 const SIDESTEP: f32 = 1.2;
 const HOP_AFTER: f32 = 25.0;
+const HOP_AFTER_BOAT: f32 = 8.0;
+/// A place more than this over the sea is ashore, for a boat, which goes
+/// for the water this far short of it, metres (invented).
+const ASHORE: f32 = 1.5;
+const SHORT_OF_SHORE: f32 = 6.0;
 const HOP: f32 = 25.0;
 /// Coming closer counts towards the hop only once she has also gone this
 /// far (metres) from where she last did: the way's length wobbles by a
@@ -135,6 +140,60 @@ const RIDE_NEAR: f32 = 40.0;
 /// One of the scripts' vehicles she hasn't driven is taken from this far,
 /// metres: they brought it for her.
 const RIDE_FRESH: f32 = 150.0;
+/// A vehicle coming the other way within this far ahead (metres) and this
+/// far either side of her line (metres) has her swerve this far to the
+/// right of her way (radians) and ease off (invented).
+const ONCOMING_AHEAD: f32 = 35.0;
+/// On foot she fights no nearer than this to a vehicle with goods riding
+/// on it, metres (invented: past a soldier's grenade thrown at her
+/// landing a few metres off).
+const CARGO_CLEAR: f32 = 15.0;
+/// What a vehicle stuck on is kept out of with this much room round it,
+/// metres; not what is wider than this (a building's whole batch).
+const AVOID_ROOM: f32 = 2.0;
+const AVOID_LARGEST: f32 = 40.0;
+/// Held by the ground alone, she keeps out of this square (half its side,
+/// metres) this far ahead of her vehicle's middle (invented).
+const TERRAIN_HALF: f32 = 3.0;
+const TERRAIN_AHEAD: f32 = 4.0;
+/// Vehicles going slower than this, m/s, within this of her, metres, are
+/// kept out of on her ways (invented).
+const PARKED_SPEED: f32 = 1.0;
+const PARKED_NEAR: f32 = 400.0;
+/// With goods on board she gives way to a vehicle coming within this of
+/// hers, metres, within this many seconds (invented).
+const CROSS_CLOSE: f32 = 5.0;
+const CROSS_SECONDS: f32 = 3.0;
+/// Soldiers fighting her within this of a truck with goods on it, itself
+/// within [`CARGO_NEAR`] of her on foot, are dealt with before she drives
+/// it, metres (invented).
+const CARGO_GUARD: f32 = 60.0;
+const CARGO_NEAR: f32 = 100.0;
+/// She clears them for at most this long, seconds (invented).
+const GUARD_MOST: f32 = 90.0;
+const ONCOMING_SIDE: f32 = 3.0;
+const ONCOMING_SECONDS: f32 = 3.0;
+/// In a boat, as far as she goes in this long, and what goes slower than
+/// this (m/s) counts as standing (invented).
+const BOAT_AHEAD_SECONDS: f32 = 5.0;
+const CRAWLING: f32 = 3.0;
+/// She steers round a vehicle standing within this ahead, metres
+/// (invented).
+const AHEAD_STANDING: f32 = 20.0;
+const SWERVE: f32 = 0.35;
+/// Waiting this long (seconds) in a vehicle she drove to a place to
+/// deliver, she gets out of it.
+const EXIT_AFTER: f32 = 4.0;
+/// With goods riding on her vehicle she drives no faster than this, m/s
+/// (invented: about 40 km/h).
+const LADEN_SPEED: f32 = 11.0;
+/// She takes an action the scripts offer within this of its object,
+/// metres (a context action's reach is a few metres; within 1.5 m she
+/// stalled against the body, GurCon002 round 14).
+const USE_FROM: f32 = 2.5;
+/// Driving, she gets out this near an outpost's flag (metres), to walk
+/// the rest.
+const FLAG_ON_FOOT: f32 = 15.0;
 /// Out of a vehicle without a cannon this far from a target, metres.
 const GET_OUT: f32 = 40.0;
 /// Within this far of a vehicle's door she presses to get in, metres;
@@ -161,6 +220,10 @@ const ON_FOOT: f32 = 40f32.to_radians();
 const ON_WHEELS: f32 = 22f32.to_radians();
 const ON_TRACKS: f32 = 27f32.to_radians();
 const REPLAN: f32 = 20.0;
+/// And when a vehicle comes to stand within this of her, metres, so long
+/// as this long has gone by, seconds (invented).
+const STANDING_FRESH: f32 = 150.0;
+const REPLAN_SOONEST: f32 = 2.0;
 const REPLAN_MOVED: f32 = 5.0;
 const STRAYED: f32 = 15.0;
 const LOOK_AHEAD: f32 = 5.0;
@@ -260,6 +323,12 @@ enum Goal {
     /// Call in the scripts' support item `key` she holds (a soldier
     /// delivery, by an outpost): the support menu, then its designator.
     Deliver(String),
+    /// Get out of the vehicle she is driving, by the place she is after
+    /// (an outpost's flag).
+    GetOut,
+    /// Take the action the scripts offer on their object `target` (a
+    /// verified HVT's body), standing at `at`.
+    Use { target: u32, at: Vec3 },
 }
 
 impl Goal {
@@ -272,6 +341,8 @@ impl Goal {
             (Goal::Open(a), Goal::Open(b)) => a == b,
             (Goal::Take(a), Goal::Take(b)) => a == b,
             (Goal::Deliver(a), Goal::Deliver(b)) => a == b,
+            (Goal::GetOut, Goal::GetOut) => true,
+            (Goal::Use { target: a, .. }, Goal::Use { target: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -284,6 +355,8 @@ struct Way {
     route: Route,
     planned: f32,
     driving: bool,
+    /// The vehicles standing near her when it was planned (indices).
+    standing: Vec<usize>,
 }
 
 /// The player playing herself.
@@ -294,6 +367,9 @@ pub struct Autoplay {
     /// where each is, set each tick ([`crate::mission::MissionLink::
     /// sight_targets`]).
     pub sights: Vec<Vec3>,
+    /// The actions the scripts offer: on what, and where it is (set each
+    /// tick before [`step`](Self::step)).
+    pub offers: Vec<(u32, Vec3)>,
     /// Seconds played.
     clock: f32,
     goal: Option<Goal>,
@@ -350,6 +426,14 @@ pub struct Autoplay {
     leave: bool,
     /// The way she is going, and when a roundabout one was last logged.
     way: Option<Way>,
+    /// What her vehicles stuck on (each box's least and most corner, x
+    /// and z, with room round it), kept out of on the ways she drives.
+    avoid: Vec<(Vec2, Vec2)>,
+    /// Until when (her clock) she clears the soldiers round a truck with
+    /// goods on it before driving it ([`CARGO_GUARD`]), once begun.
+    guard_until: std::cell::Cell<Option<f32>>,
+    /// When the vehicles near her boat were last logged.
+    near_logged: f32,
     way_logged: f32,
     /// Hops: from, to.
     pub hops: Vec<(Vec3, Vec3)>,
@@ -555,6 +639,34 @@ impl Autoplay {
             Some(Goal::Open(target)) => self.open(game, target, dt),
             Some(Goal::Take(key)) => self.take(game, key, dt),
             Some(Goal::Deliver(key)) => self.deliver(game, &key),
+            Some(Goal::Use { target, at }) => {
+                let here = game.focus();
+                let driving = game.scene.player.as_ref().and_then(|p| p.driving);
+                if driving.is_none() && here.with_y(0.0).distance(at.with_y(0.0)) < USE_FROM {
+                    // The action the game offers her there is taken with
+                    // the use key, as the keyboard's use key takes it
+                    // (`Game::tick`), a press at a time.
+                    let offered = game.context.as_ref().is_some_and(|c| c.0 == target);
+                    if offered && self.pressed > PRESS_GAP {
+                        self.pressed = 0.0;
+                        eprintln!(
+                            "autoplay {:.1} s: taking the action at {target:#x}",
+                            self.clock
+                        );
+                        game.context_taken = Some(target);
+                    }
+                    Intent::default()
+                } else {
+                    self.travel(game, at, USE_FROM * 0.6, dt)
+                }
+            }
+            Some(Goal::GetOut) => match game.scene.player.as_ref().and_then(|p| p.driving) {
+                Some(i) => {
+                    let speed = vehicle_state(game, i).map_or(0.0, |s| s.1);
+                    self.press(speed)
+                }
+                None => self.idle(game, dt),
+            },
         }
     }
 
@@ -608,14 +720,44 @@ impl Autoplay {
         let npcs = &game.scene.people.npcs;
         let vehicles = &game.scene.vehicles;
         let driving = p.driving;
-        // Soldiers fighting her close by, while she's on foot.
+        // Soldiers fighting her close by, while she's on foot; and those
+        // round a truck with goods on it near her, before she drives it
+        // off (PirCon003 round 61: three ran after the parrot truck and
+        // a grenade broke its boxes when it caught on a wall).
+        // For at most [`GUARD_MOST`]: a base keeps sending more
+        // (PirCon004 round 75: 1000 s went on its soldiers and their
+        // drops before she took the truck).
+        let guarding = self
+            .guard_until
+            .get()
+            .is_none_or(|until| self.clock < until);
+        let guarded: Vec<Vec3> = (0..vehicles.len())
+            .filter(|_| guarding)
+            .filter(|&j| game.scene.props.carrying(j))
+            .filter_map(|j| vehicle_at(game, j))
+            .map(|t| t.w_axis.truncate())
+            .filter(|c| c.distance(here) < CARGO_NEAR)
+            .collect();
         if driving.is_none()
             && let Some((i, d)) = npcs
                 .iter()
                 .enumerate()
                 .filter(|(_, n)| n.alive && n.soldier && n.alert)
-                .map(|(i, n)| (i, n.character.position.distance(here)))
-                .filter(|&(_, d)| d < DEFEND)
+                .map(|(i, n)| {
+                    let at = n.character.position;
+                    (
+                        i,
+                        at.distance(here),
+                        guarded.iter().any(|c| c.distance(at) < CARGO_GUARD),
+                    )
+                })
+                .filter(|&(_, d, guard)| d < DEFEND || guard)
+                .inspect(|&(_, d, _)| {
+                    if d >= DEFEND && self.guard_until.get().is_none() {
+                        self.guard_until.set(Some(self.clock + GUARD_MOST));
+                    }
+                })
+                .map(|(i, d, _)| (i, d))
                 .min_by(|a, b| a.1.total_cmp(&b.1))
         {
             return Some((
@@ -765,6 +907,22 @@ impl Autoplay {
             }
         }
         // What to destroy, nearest first: soldiers are shot, things blown up.
+        // An HVT to verify, once down: the scripts offer an action on the
+        // body a few seconds on (`MrxTaskObjectiveVerify._SetupVerify`),
+        // which she takes there.
+        if let Some(&(target, at)) = self
+            .offers
+            .iter()
+            .find(|(g, _)| marks.iter().any(|m| m.target == *g && m.kind == "verify"))
+        {
+            return Some((
+                Goal::Use { target, at },
+                format!(
+                    "verifying {target:#x}: the action at {at:.1}, {:.0} m off",
+                    at.distance(here)
+                ),
+            ));
+        }
         // Not what someone she is to reach stands on (ChiCon001's party
         // official on a rooftop, among the bonus objective's buildings): it
         // waits until they are reached.
@@ -784,10 +942,15 @@ impl Autoplay {
                     f.with_y(0.0).distance(m.at.with_y(0.0)) < crate::combat::BOMB_FRAG.0 + HOLDS_UP
                 })
         };
+        // What to destroy, and HVTs to verify still standing: shot first.
         let destroy: Vec<&Mark> = live
             .iter()
             .copied()
-            .filter(|m| m.kind == "destroy" && !held_up(m))
+            .filter(|m| {
+                (m.kind == "destroy" && !held_up(m))
+                    || (m.kind == "verify"
+                        && npcs.iter().any(|n| n.spawn == Some(m.target) && n.alive))
+            })
             .collect();
         if let Some(m) = nearest(destroy, here) {
             if let Some(i) = npcs
@@ -944,7 +1107,14 @@ impl Autoplay {
                 && let Some(i) = vehicles
                     .iter()
                     .enumerate()
-                    .filter(|(_, v)| v.guid.is_some() && !v.wrecked && !v.spec.is_boat())
+                    // Not one she brought goods there in: that is the
+                    // delivery, done by leaving it (PirCon002 round 46).
+                    .filter(|&(i, v)| {
+                        v.guid.is_some()
+                            && !v.wrecked
+                            && !v.spec.is_boat()
+                            && !game.scene.props.carrying(i)
+                    })
                     .filter_map(|(i, _)| {
                         let d = vehicle_at(game, i)?.w_axis.truncate().distance(m.at);
                         (d < TAKE_NEAR).then_some((i, d))
@@ -960,6 +1130,30 @@ impl Autoplay {
                     ),
                 ));
             }
+        }
+        // Driven to a place to deliver it and nothing comes of it: the
+        // scripts want her out of it there (`MrxTaskObjectiveDeliver`'s
+        // `bStop` delivery of a vehicle shows "[objective.Deliver.
+        // vehicleExit]" while she sits in it: PirCon002's rum truck).
+        if driving.is_some()
+            && m.kind == "deliverable"
+            && self
+                .waiting
+                .is_some_and(|(g, since)| g == m.target && self.clock - since > EXIT_AFTER)
+        {
+            return Some((
+                Goal::GetOut,
+                format!("getting out at {}, to deliver what she drove there", m.name),
+            ));
+        }
+        // An outpost's flag is taken standing by it: the scripts count
+        // those who get there as its rushers (inferred: the outpost's
+        // rusher check asks whether each is in a seat).
+        if driving.is_some() && m.kind == "outpost" && m.at.distance(here) < FLAG_ON_FOOT {
+            return Some((
+                Goal::GetOut,
+                format!("getting out by {}, to take it on foot", m.name),
+            ));
         }
         Some((
             Goal::Reach {
@@ -1272,10 +1466,82 @@ impl Autoplay {
             (Some(w), Some((id, hull))) => clear_way(&w.physics, id, m, hull, angle, speed),
             _ => angle,
         };
+        // Another vehicle coming the other way in her lane: she keeps to
+        // the right of it and eases off, as a driver would (PirCon002's
+        // laden truck met a car head-on at 22 m/s closing, round 58).
+        let oncoming = oncoming(game, i, m, speed);
+        let angle = if oncoming {
+            angle.max(0.0) + SWERVE
+        } else {
+            angle
+        };
+        // And round a vehicle standing in her way, to the side it isn't
+        // on (PirCon004 round 78: her truck ran into a parked pickup and
+        // a trailer by the drop-off, close by the way planned round them).
+        let standing = standing_ahead(game, i, m, speed, toward);
+        // In a boat: the nearest other vehicle, where in her frame and how
+        // fast, each second (what she gives way to, or doesn't).
+        if game.scene.vehicles[i].spec.is_boat() && self.clock - self.near_logged > 1.0 {
+            self.near_logged = self.clock;
+            let to_local = m.inverse();
+            if let Some((j, l, s)) = (0..game.scene.vehicles.len())
+                .filter(|&j| j != i)
+                .filter_map(|j| {
+                    let (t, s) = vehicle_state(game, j)?;
+                    Some((j, to_local.transform_point3(t.w_axis.truncate()), s))
+                })
+                .min_by(|a, b| a.1.length().total_cmp(&b.1.length()))
+                .filter(|(_, l, _)| l.length() < 200.0)
+            {
+                eprintln!(
+                    "autoplay {:.1} s: boat at {pos:.0}, {speed:.1} m/s, heading for {toward:.0} ({:+.0} deg off); nearest the {} at {l:.1} (her frame), {s:.1} m/s; standing ahead {standing:?}",
+                    self.clock,
+                    angle.to_degrees(),
+                    game.scene.vehicles[j].spec.label
+                );
+            }
+        }
+        // A boat, with no brakes, turns away harder and backs its engine
+        // (GurCon003 round 84: her race boat met a moored fishing boat by
+        // a gate at 31 m/s, easing off).
+        let boat = game.scene.vehicles[i].spec.is_boat();
+        let swerve = if boat { 2.0 * SWERVE } else { SWERVE };
+        let angle = match standing {
+            Some(x) => angle + if x > 0.0 { swerve } else { -swerve },
+            None => angle,
+        };
         let mut steer = (angle * 2.0).clamp(-1.0, 1.0);
-        let mut throttle = 1.0;
+        let mut throttle: f32 = if boat && standing.is_some() && speed > SLOW {
+            -1.0
+        } else if oncoming || standing.is_some() {
+            0.3
+        } else {
+            1.0
+        };
         if (d < SLOW_NEAR && speed > SLOW) || (angle.abs() > 0.8 && speed > SLOW) {
-            throttle = 0.2;
+            throttle = throttle.min(0.2);
+        }
+        // Goods riding on her truck (PirCon002's rum): no faster than a
+        // careful driver goes, so a crash costs less of them.
+        let laden = game.scene.props.carrying(i);
+        if laden && speed > LADEN_SPEED {
+            throttle = 0.0;
+        }
+        // And she gives way to a vehicle on course to cross ahead of her
+        // (PirCon004 round 72: a car crossing her road at speed wrecked
+        // the organ truck, 35.9 m/s closing); in a boat too (GurCon003
+        // round 81: a pleasure boat wrecked her race boat, 34.8 m/s).
+        if (laden || boat)
+            && let Some(j) = crossing(game, i, m)
+        {
+            throttle = if speed > 1.0 { -1.0 } else { 0.0 };
+            if self.clock - self.near_logged > 1.0 {
+                self.near_logged = self.clock;
+                eprintln!(
+                    "autoplay {:.1} s: giving way to the {} crossing ahead",
+                    self.clock, game.scene.vehicles[j].spec.label
+                );
+            }
         }
         // Stuck against something: back out, turning towards the way on.
         if throttle > 0.5 && speed.abs() < 1.0 && self.reversing.is_none() {
@@ -1290,17 +1556,86 @@ impl Autoplay {
             if let (Some(w), Some(v)) = (game.scene.world.as_ref(), game.scene.vehicles.get(i))
                 && let Some(id) = v.id
             {
+                let way = self.way.as_ref().map_or_else(
+                    || "none".to_owned(),
+                    |w| {
+                        let n = w.route.points.len();
+                        format!(
+                            "{n} points over {:.0} m, {}",
+                            w.route.length(),
+                            w.route
+                                .points
+                                .iter()
+                                .take(4)
+                                .map(|p| format!("{p:.0}"))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        )
+                    },
+                );
                 eprintln!(
-                    "autoplay {:.1} s: stalled driving the {} at {:.1}: {}",
+                    "autoplay {:.1} s: stalled driving the {} at {:.1}: {}; her way: {way}",
                     self.clock,
                     v.spec.label,
                     game.focus(),
                     stuck_report(w, id, v.spec.hull, false)
                 );
+                // What holds her is kept out of from here on (PirCon003
+                // rounds 61-62: the way out of the parrots' base ran over
+                // a bank its truck caught on, again each time planned).
+                let kept = self.avoid.len();
+                for (key, _, (lo, hi)) in w.physics.vehicle_touching(id) {
+                    let (lo, hi) = (
+                        Vec2::new(lo.x, lo.z) - Vec2::splat(AVOID_ROOM),
+                        Vec2::new(hi.x, hi.z) + Vec2::splat(AVOID_ROOM),
+                    );
+                    if matches!(key, Some(k) if !matches!(k, StaticKey::Cell(_)))
+                        && (hi - lo).max_element() < AVOID_LARGEST
+                        && !self.avoid.contains(&(lo, hi))
+                    {
+                        eprintln!(
+                            "autoplay {:.1} s: keeping out of {} ({lo:.0} to {hi:.0}) from now on",
+                            self.clock,
+                            crate::static_name(w, key)
+                        );
+                        self.avoid.push((lo, hi));
+                        self.way = None;
+                    }
+                }
+                // Held by the ground alone (a bank too steep: PirCon004
+                // rounds 71 and 79 stalled at one by a checkpoint, and a
+                // grenade followed): the ground just ahead is kept out of,
+                // unless that is where she is going. Not a boat's (the
+                // races' shallows are in the way only for a moment).
+                let ahead = m.transform_point3(Vec3::Z * TERRAIN_AHEAD);
+                let (lo, hi) = (
+                    Vec2::new(ahead.x, ahead.z) - Vec2::splat(TERRAIN_HALF),
+                    Vec2::new(ahead.x, ahead.z) + Vec2::splat(TERRAIN_HALF),
+                );
+                let goal = Vec2::new(at.x, at.z);
+                if self.avoid.len() == kept
+                    && !v.spec.is_boat()
+                    && !(goal.cmpge(lo).all() && goal.cmple(hi).all())
+                {
+                    eprintln!(
+                        "autoplay {:.1} s: keeping out of the ground ahead ({lo:.0} to {hi:.0}) from now on",
+                        self.clock
+                    );
+                    self.avoid.push((lo, hi));
+                    self.way = None;
+                }
             }
             // A boat run aground near the place: out, into the shallows
-            // (further off, it backs off the rocks).
-            if d < RIDE_FOR && self.can_leave(game, i) {
+            // (further off, it backs off the rocks). Not when the place
+            // lies on open water (a race's checkpoint: she would lose
+            // the race leaving her jetski, PirCon001 round 24).
+            let place_afloat = game.scene.world.as_ref().is_some_and(|w| {
+                let v = &game.scene.vehicles[i];
+                v.id.is_some_and(|id| {
+                    afloat_near(&w.physics, &v.spec, id, at - Vec3::X * 0.5, at, 0.0).is_some()
+                })
+            });
+            if d < RIDE_FOR && !place_afloat && self.can_leave(game, i) {
                 eprintln!(
                     "autoplay {:.1} s: the {} is aground {d:.0} m off: getting out",
                     self.clock, game.scene.vehicles[i].spec.label
@@ -1309,6 +1644,10 @@ impl Autoplay {
                 return self.press(speed);
             }
             self.reversing = Some((-angle.signum(), REVERSE));
+            // And the way is planned again from where she backs out to:
+            // the old one led her onto what holds her (PirCon001's jetski
+            // cut a rock's corner each time round).
+            self.way = None;
         }
         if let Some((s, left)) = &mut self.reversing {
             steer = *s;
@@ -1355,7 +1694,15 @@ impl Autoplay {
         let Some(p) = game.scene.player.as_ref() else {
             return Intent::default();
         };
-        let d = target.distance(p.character.position);
+        // Fighting beside a truck with goods on it draws the soldiers'
+        // grenades onto them (PirCon003 round 60: one grenade broke all
+        // 42 parrot boxes): away from it first.
+        let here = p.character.position;
+        if let Some(c) = cargo_near(game, here) {
+            let away = (here - c).with_y(0.0).normalize_or(Vec3::X);
+            return self.walk(game, c + away * (CARGO_CLEAR + 3.0), 1.0, dt);
+        }
+        let d = target.distance(here);
         if d > SHOOT_RANGE {
             return self.walk(game, target, SHOOT_RANGE - 5.0, dt);
         }
@@ -1378,7 +1725,6 @@ impl Autoplay {
         }
         // Aimed a while with a wall in the way: from where she can see
         // the target; another spot if that one was no better.
-        let here = p.character.position;
         if self.blocked > BLOCKED {
             let at_spot = self
                 .vantage
@@ -1913,15 +2259,43 @@ impl Autoplay {
         at: Vec3,
         speed: f32,
     ) -> Vec3 {
+        // In a boat, a place up out of the sea (PirCon001's checkpoint 30
+        // stands on a dock 4 m up: her jetski ran into the dock, and lost
+        // the gate) is gone for on the water short of it, on her side: a
+        // race's checkpoint is passed within 10 m (`MrxTaskRace`'s
+        // `fWidth`).
+        let boat = driving
+            .and_then(|i| game.scene.vehicles.get(i))
+            .is_some_and(|v| v.spec.is_boat());
+        let sea = game
+            .scene
+            .world
+            .as_ref()
+            .map_or(WATERLINE, |w| w.settings.sea_level.max(WATERLINE));
+        let at = if boat && at.y > sea + ASHORE {
+            let back = (pos - at).with_y(0.0).normalize_or_zero();
+            (at + back * SHORT_OF_SHORE).with_y(sea)
+        } else {
+            at
+        };
         let straight = (at - pos).with_y(0.0).length();
         if straight < PLAN_FROM {
             self.way = None;
             return at;
         }
+        // Driving, planned again as soon as a vehicle comes to stand near
+        // her (PirCon004 round 77: a fuel trailer the scripts put on her
+        // road, run into before the way was planned again).
+        let standing = match driving {
+            Some(i) => standing_near(game, i, pos, STANDING_FRESH),
+            None => Vec::new(),
+        };
         let stale = self.way.as_ref().is_none_or(|w| {
             w.driving != driving.is_some()
                 || w.route.goal.distance(at) > REPLAN_MOVED
                 || self.clock - w.planned > REPLAN
+                || (self.clock - w.planned > REPLAN_SOONEST
+                    && standing.iter().any(|j| !w.standing.contains(j)))
         });
         if stale && let Some(world) = game.scene.world.as_ref() {
             let mover = match driving.and_then(|i| game.scene.vehicles.get(i)) {
@@ -1941,7 +2315,23 @@ impl Autoplay {
                 },
             };
             let sea = world.settings.sea_level.max(WATERLINE);
-            let route = Route::plan(&world.physics, mover, pos, at, sea);
+            // Driving, she keeps out of what she stuck on, and round the
+            // vehicles standing near (PirCon004 rounds 63-70: her way ran
+            // through a parked fuel trailer, which wrecked her truck).
+            let avoid: Vec<(Vec2, Vec2)> = match driving {
+                Some(i) => self
+                    .avoid
+                    .iter()
+                    .copied()
+                    .chain(parked_near(game, i, pos).into_iter().filter(|&(lo, hi)| {
+                        // Not one standing where she is going.
+                        let goal = Vec2::new(at.x, at.z);
+                        !(goal.cmpge(lo).all() && goal.cmple(hi).all())
+                    }))
+                    .collect(),
+                None => Vec::new(),
+            };
+            let route = Route::plan_avoiding(&world.physics, mover, (pos, at), sea, &avoid);
             if (!route.reaches || route.length() > straight * ROUNDABOUT)
                 && self.clock - self.way_logged > LOG_WAY
             {
@@ -1977,6 +2367,7 @@ impl Autoplay {
                 route,
                 planned: self.clock,
                 driving: driving.is_some(),
+                standing,
             });
         }
         let Some(way) = &mut self.way else {
@@ -2068,12 +2459,29 @@ impl Autoplay {
             return false;
         }
         let still = self.since_moved();
-        if still > HOP_AFTER {
-            // Stuck driving close to the place: on foot from here.
+        // A boat aground hops sooner: a race's gate waits no 25 s
+        // (GurCon003 round 85 ran aground on a sandbar; its timer ran out
+        // 16 s on).
+        let afloat = game
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| game.scene.vehicles.get(i))
+            .is_some_and(|v| v.spec.is_boat());
+        if still > if afloat { HOP_AFTER_BOAT } else { HOP_AFTER } {
+            // Stuck driving close to the place: on foot from here. Not
+            // with goods riding on her vehicle: they are what she brings
+            // there (PirCon002's rum, left 162 m short in round 43); the
+            // vehicle hops on with them instead.
             let driving = game.scene.player.as_ref().and_then(|p| p.driving);
             let near = (at - game.focus()).with_y(0.0).length() < RIDE_FOR;
+            // Nor in a boat: off it she is in the sea, and a race is lost
+            // (PirCon001 round 98 got off her jetski 58 m from a gate).
             if let Some(i) = driving
                 && near
+                && !afloat
+                && !game.scene.props.carrying(i)
                 && game
                     .scene
                     .world
@@ -2401,6 +2809,125 @@ fn vantage(
 }
 
 /// Vehicle `vehicles[i]`'s model to world, if placed.
+/// How far to the side (her left, +) the nearest vehicle standing still
+/// within [`AHEAD_STANDING`] ahead of vehicle `i` (whose place is `m`,
+/// going `speed`), or as far as it goes in [`ONCOMING_SECONDS`], and
+/// within [`ONCOMING_SIDE`] of her line is, if one is (GurCon003 round 83:
+/// her race boat ran into a fishing boat turning on its path at 23 m/s).
+fn standing_ahead(game: &Game, i: usize, m: Mat4, speed: f32, toward: Vec3) -> Option<f32> {
+    // A boat, slow to stop, looks further, and takes one crawling for
+    // standing (GurCon003 rounds 84 and 86: a fishing boat at 1 to 3 m/s
+    // on its path, met at 31 m/s).
+    let boat = game.scene.vehicles.get(i).is_some_and(|v| v.spec.is_boat());
+    let (seconds, still) = if boat {
+        (BOAT_AHEAD_SECONDS, CRAWLING)
+    } else {
+        (ONCOMING_SECONDS, PARKED_SPEED)
+    };
+    let reach = AHEAD_STANDING.max(speed.abs() * seconds);
+    // Along her heading, and along the line she turns onto, towards
+    // where she steers (GurCon003 round 88: the fishing boat lay 19 m to
+    // her side as she turned for the next gate, into it): (ahead, to her
+    // left) of each.
+    let here = m.w_axis.truncate().with_y(0.0);
+    let forward = m
+        .transform_vector3(Vec3::Z)
+        .with_y(0.0)
+        .normalize_or(Vec3::Z);
+    let turning = (toward - here).with_y(0.0).normalize_or(forward);
+    let frame = |dir: Vec3, p: Vec3| {
+        let d = p.with_y(0.0) - here;
+        (d.dot(dir), d.dot(Vec3::new(dir.z, 0.0, -dir.x)))
+    };
+    let in_way = |(z, x): (f32, f32)| z > 0.0 && z < reach && x.abs() < ONCOMING_SIDE;
+    (0..game.scene.vehicles.len())
+        .filter(|&j| j != i)
+        .filter_map(|j| vehicle_state(game, j))
+        .filter(|(_, speed)| speed.abs() <= still)
+        .filter_map(|(t, _)| {
+            let p = t.w_axis.truncate();
+            [frame(turning, p), frame(forward, p)]
+                .into_iter()
+                .find(|&l| in_way(l))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, x)| x)
+}
+
+/// The vehicles other than `i` standing still within `reach` of `pos`.
+fn standing_near(game: &Game, i: usize, pos: Vec3, reach: f32) -> Vec<usize> {
+    (0..game.scene.vehicles.len())
+        .filter(|&j| j != i)
+        .filter(|&j| {
+            vehicle_state(game, j).is_some_and(|(m, speed)| {
+                speed.abs() <= PARKED_SPEED && m.w_axis.truncate().distance(pos) <= reach
+            })
+        })
+        .collect()
+}
+
+/// The ground boxes (least and most corner, x and z, with [`AVOID_ROOM`]
+/// round them) of the vehicles other than `i` standing still within
+/// [`PARKED_NEAR`] of `pos`.
+fn parked_near(game: &Game, i: usize, pos: Vec3) -> Vec<(Vec2, Vec2)> {
+    (0..game.scene.vehicles.len())
+        .filter(|&j| j != i)
+        .filter_map(|j| {
+            let (m, speed) = vehicle_state(game, j)?;
+            let centre = m.w_axis.truncate();
+            if speed.abs() > PARKED_SPEED || centre.distance(pos) > PARKED_NEAR {
+                return None;
+            }
+            let (lo, hi) = game.scene.vehicles[j].model.bounds;
+            let corners = [
+                Vec3::new(lo.x, 0.0, lo.z),
+                Vec3::new(lo.x, 0.0, hi.z),
+                Vec3::new(hi.x, 0.0, lo.z),
+                Vec3::new(hi.x, 0.0, hi.z),
+            ]
+            .map(|c| {
+                let w = m.transform_point3(c);
+                Vec2::new(w.x, w.z)
+            });
+            let least = corners.iter().fold(Vec2::splat(f32::MAX), |a, &c| a.min(c));
+            let most = corners.iter().fold(Vec2::splat(f32::MIN), |a, &c| a.max(c));
+            Some((
+                least - Vec2::splat(AVOID_ROOM),
+                most + Vec2::splat(AVOID_ROOM),
+            ))
+        })
+        .collect()
+}
+
+/// Whether a vehicle other than `i` (whose place is `m`) going faster
+/// than [`PARKED_SPEED`] comes within [`CROSS_CLOSE`] of it in the next
+/// [`CROSS_SECONDS`], each going on as it goes, where it would meet it
+/// ahead of it.
+fn crossing(game: &Game, i: usize, m: Mat4) -> Option<usize> {
+    let physics = game.scene.world.as_ref().map(|w| &w.physics)?;
+    let mine = game.scene.vehicles.get(i).and_then(|v| v.id)?;
+    let here = m.w_axis.truncate().with_y(0.0);
+    let v_mine = physics.vehicle_velocity(mine).with_y(0.0);
+    let forward = m.transform_vector3(Vec3::Z).with_y(0.0).normalize_or_zero();
+    game.scene.vehicles.iter().enumerate().position(|(j, v)| {
+        let Some(id) = v.id.filter(|_| j != i) else {
+            return false;
+        };
+        let Some(t) = physics.vehicle_transform(id) else {
+            return false;
+        };
+        let theirs = physics.vehicle_velocity(id).with_y(0.0);
+        if theirs.length() < PARKED_SPEED {
+            return false;
+        }
+        let d = t.w_axis.truncate().with_y(0.0) - here;
+        let closing = theirs - v_mine;
+        let when = (-d.dot(closing) / closing.length_squared().max(1e-3)).clamp(0.0, CROSS_SECONDS);
+        let meet = d + closing * when;
+        when > 0.0 && meet.length() < CROSS_CLOSE && (d + theirs * when).dot(forward) > 0.0
+    })
+}
+
 fn vehicle_at(game: &Game, i: usize) -> Option<Mat4> {
     let id = game.scene.vehicles.get(i)?.id?;
     game.scene.world.as_ref()?.physics.vehicle_transform(id)
@@ -2415,6 +2942,34 @@ fn vehicle_state(game: &Game, i: usize) -> Option<(Mat4, f32)> {
 
 /// How far `at` lies off the heading of a vehicle at `m` (radians,
 /// positive to its right), and how far away (metres).
+/// Where a vehicle with goods riding on it is, within [`CARGO_CLEAR`] of
+/// `at` (on the ground), if one is.
+fn cargo_near(game: &Game, at: Vec3) -> Option<Vec3> {
+    (0..game.scene.vehicles.len())
+        .filter(|&j| game.scene.props.carrying(j))
+        .filter_map(|j| vehicle_at(game, j))
+        .map(|t| t.w_axis.truncate())
+        .find(|c| c.with_y(0.0).distance(at.with_y(0.0)) < CARGO_CLEAR)
+}
+
+/// Whether a vehicle other than `i` (whose place is `m`, going `speed`)
+/// is ahead of it within [`ONCOMING_AHEAD`] metres, or as far as it goes
+/// in [`ONCOMING_SECONDS`], within [`ONCOMING_SIDE`] of its line, heading
+/// the other way.
+fn oncoming(game: &Game, i: usize, m: Mat4, speed: f32) -> bool {
+    let reach = ONCOMING_AHEAD.max(speed.abs() * ONCOMING_SECONDS);
+    let to_local = m.inverse();
+    let forward = m.transform_vector3(Vec3::Z).with_y(0.0).normalize_or_zero();
+    (0..game.scene.vehicles.len())
+        .filter(|&j| j != i)
+        .filter_map(|j| vehicle_at(game, j))
+        .any(|t| {
+            let l = to_local.transform_point3(t.w_axis.truncate());
+            let theirs = t.transform_vector3(Vec3::Z).with_y(0.0).normalize_or_zero();
+            l.z > 0.0 && l.z < reach && l.x.abs() < ONCOMING_SIDE && theirs.dot(forward) < -0.5
+        })
+}
+
 fn heading_to(m: Mat4, at: Vec3) -> (f32, f32) {
     let f = m
         .transform_vector3(Vec3::Z)

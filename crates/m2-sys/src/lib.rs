@@ -4,6 +4,8 @@
 //! goes through this crate, so `unsafe` stays concentrated in one place.
 
 pub mod bink;
+pub mod clipboard;
+pub mod registry;
 pub mod xinput;
 
 #[cfg(windows)]

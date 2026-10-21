@@ -1,7 +1,7 @@
 //! What a tick does: the player on foot (or the free camera), physics and
 //! animation, and where the frame is seen from.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use m2_engine::atmosphere::AtmosphereMix;
 use m2_engine::durability::{CrashHow, Explosion};
@@ -124,6 +124,12 @@ pub struct Game {
     pub combat: Combat,
     /// The island's placed objects worn down and brought down by blasts.
     pub destruction: Destruction,
+    /// Each vehicle model's load bed, its `HP_Truckbed` node in its own
+    /// space, by model (`None`: it has none), as looked up.
+    beds: HashMap<u32, Option<Vec3>>,
+    /// The scripts' vehicles whose load bed's goods were logged (taken up,
+    /// or what stood near and why not), by index.
+    beds_told: HashSet<usize>,
     /// Layer entities of the island's vehicles asked for so far.
     fetched: HashSet<u32>,
     /// The island's traffic spawners and what they have out.
@@ -344,6 +350,8 @@ impl Game {
             restore: Vec::new(),
             combat,
             destruction: Destruction::default(),
+            beds: HashMap::new(),
+            beds_told: HashSet::new(),
             fetched: HashSet::new(),
             traffic: crate::traffic::Traffic::default(),
             paths: crate::paths::PathMoves::default(),
@@ -1098,6 +1106,23 @@ impl Game {
             }
         }
         split("game: player and physics");
+        // The vehicles' load beds, looked up once a model.
+        if let Some(source) = self.scene.source.as_mut() {
+            for v in &self.scene.vehicles {
+                self.beds.entry(v.spec.model).or_insert_with(|| {
+                    crate::hijack::nodes(source, v.spec.model)
+                        .into_iter()
+                        .find(|(n, _)| *n == m2_assets::name_hash(BED_NODE))
+                        .map(|(_, at)| at)
+                });
+            }
+        }
+        let beds: Vec<Option<Vec3>> = self
+            .scene
+            .vehicles
+            .iter()
+            .map(|v| self.beds.get(&v.spec.model).copied().flatten())
+            .collect();
         let focus = self.focus();
         if let Some(world) = &mut self.scene.world {
             let driven = self
@@ -1178,9 +1203,18 @@ impl Game {
                 world,
                 &mut self.scene.props,
                 &self.scene.vehicles,
+                (&beds, &mut self.beds_told),
                 &mut self.destruction,
                 self.scene.install.as_ref(),
             );
+            // What rides on a vehicle that tipped over falls off it.
+            let placed: Vec<_> = self.scene.vehicles.iter().map(|v| v.id).collect();
+            for (e, at) in self.scene.props.carry(&world.physics, &placed) {
+                eprintln!("cargo: {e:#x} falls off at {at:.1}");
+                self.scene
+                    .props
+                    .knock(&mut world.physics, e, Vec3::Y, Vec3::ZERO, false);
+            }
             // Vehicles running into each other hurt each other and the
             // parts where they met.
             for (struck, other, closing, damage) in self
@@ -2762,6 +2796,12 @@ impl Game {
         self.combat.went_off.clear();
     }
 
+    /// The load bed of vehicle model `model` (its `HP_Truckbed` node),
+    /// once looked up.
+    pub fn bed(&self, model: u32) -> Option<Vec3> {
+        self.beds.get(&model).copied().flatten()
+    }
+
     /// What a vehicle like `crasher` going at its velocity does to what
     /// its box meets, as one driven would ([`run_into`]): the props
     /// check's crashes ([`crate::breakables::check`]).
@@ -2778,9 +2818,44 @@ impl Game {
             scene.install.as_ref(),
             crasher,
             keys,
-            (crasher.velocity.length(), "props check's vehicle"),
+            (crasher.velocity.length(), "props check's vehicle", None),
         );
     }
+}
+
+/// A vehicle that may carry what stands on it: its index among the
+/// scene's and its physics id, and its load bed in its space.
+type Carrier = ((usize, m2_engine::VehicleId), Vec3);
+
+/// The node of a vehicle model that is its load bed (the scripts count
+/// the goods on it there: PirCon002's `GetHardpointPosition(truck,
+/// "HP_Truckbed")`).
+pub(crate) const BED_NODE: &str = "HP_Truckbed";
+/// The props within this of a scripts' vehicle's load bed are logged
+/// once, metres.
+const TOLD_REACH: f32 = 6.0;
+
+/// Props up to this far under the bed node, or this far over it
+/// (metres), count as on it, over the vehicle's footprint (invented:
+/// PirCon002's rum jugs stand 0.1 m above its wheels' bottom, about
+/// 1.5 m under the node, when the truck is put down).
+const BED_UNDER: f32 = 2.0;
+const BED_OVER: f32 = 1.0;
+
+/// Whether prop `entity` stands on `vehicle`'s load bed, whose node is at
+/// `bed` in its space: over its footprint, from [`BED_UNDER`] under the
+/// node's height to [`BED_OVER`] over it.
+fn on_bed(props: &Props, vehicle: &Crasher, bed: Vec3, entity: u32) -> bool {
+    let (lo, hi) = vehicle.bounds;
+    props.centre(entity).is_some_and(|c| {
+        let l = vehicle.place.inverse().transform_point3(c);
+        l.x > lo.x
+            && l.x < hi.x
+            && l.z > lo.z
+            && l.z < hi.z
+            && l.y > bed.y - BED_UNDER
+            && l.y < bed.y + BED_OVER
+    })
 }
 
 /// Vehicles knock loose what they hit that comes loose, with the weight
@@ -2794,11 +2869,73 @@ fn knock_loose(
     world: &mut World,
     props: &mut Props,
     vehicles: &[ParkedVehicle],
+    (beds, told): (&[Option<Vec3>], &mut HashSet<usize>),
     destruction: &mut Destruction,
     install: Option<&Install>,
 ) {
-    for v in vehicles {
+    for (index, (v, bed)) in vehicles
+        .iter()
+        .zip(beds.iter().chain(std::iter::repeat(&None)))
+        .enumerate()
+    {
         let Some(id) = v.id else { continue };
+        // The scripts' vehicles with a load bed take up what stands on it
+        // as soon as they are placed, standing or not: the scripts count
+        // the goods on the bed from then on (PirCon002 counted none, and
+        // gave up, while the truck stood with its jugs still the layer's).
+        if let (Some(_), Some(b), Some(place)) = (v.guid, bed, world.physics.vehicle_transform(id))
+        {
+            let standing = Crasher {
+                place,
+                bounds: v.model.bounds,
+                velocity: Vec3::ZERO,
+                mass: v.spec.mass,
+            };
+            // What stands in its box with collision, and what has none
+            // (PirCon004's organ boxes: none rode, and the truck left
+            // them standing where it was parked).
+            let (lo, hi) = v.model.bounds;
+            let mut near: Vec<u32> = world
+                .physics
+                .statics_in_box(place, v.model.bounds)
+                .into_iter()
+                .filter_map(|k| match k {
+                    StaticKey::Entity(e) => Some(e),
+                    _ => None,
+                })
+                .collect();
+            near.extend(props.standing_near(
+                place.transform_point3((lo + hi) * 0.5),
+                (hi - lo).length() * 0.5,
+            ));
+            near.sort_unstable();
+            near.dedup();
+            // Once the props round it have loaded: what stands round the
+            // bed, and how, for the log.
+            let bed_at = place.transform_point3(*b);
+            if !told.contains(&index) {
+                let round = props.told_near(bed_at, TOLD_REACH);
+                if !round.is_empty()
+                    && (round.iter().all(|t| !t.contains("(not "))
+                        || round.iter().any(|t| t.starts_with("0x4")))
+                {
+                    told.insert(index);
+                    eprintln!(
+                        "cargo: by the {} (bed at {bed_at:.2}): {}",
+                        v.spec.label,
+                        round.join("; ")
+                    );
+                }
+            }
+            for e in near {
+                if !props.is_cargo(e)
+                    && on_bed(props, &standing, *b, e)
+                    && props.load(&mut world.physics, e, (index, id), b.y)
+                {
+                    eprintln!("cargo: {e:#x} rides on the {}", v.spec.label);
+                }
+            }
+        }
         let before = world.physics.vehicle_velocity_before(id);
         let mut speed = before.length();
         if world.physics.vehicle_pulling(id) {
@@ -2825,7 +2962,7 @@ fn knock_loose(
             install,
             &crasher,
             keys,
-            (speed, &v.spec.label),
+            (speed, &v.spec.label, bed.map(|b| ((index, id), b))),
         );
         if shifted > 0.0 || ploughed {
             world
@@ -2841,7 +2978,8 @@ fn knock_loose(
 /// loose with the weight and `speed` for it ([`KNOCK_RATIO`]: as fast as
 /// it pushes, pulling against what holds it). Returns the mass it
 /// shifted (kg) and whether it ploughed on through something it broke.
-/// `label` names it for the log.
+/// `label` names it for the log; `carrier` is the vehicle (its index and
+/// id) and its load bed, for what stands on it to ride ([`on_bed`]).
 fn run_into(
     world: &mut World,
     props: &mut Props,
@@ -2849,7 +2987,7 @@ fn run_into(
     install: Option<&Install>,
     vehicle: &Crasher,
     mut keys: Vec<StaticKey>,
-    (speed, label): (f32, &str),
+    (speed, label, carrier): (f32, &str, Option<Carrier>),
 ) -> (f32, bool) {
     // A building of a merged batch touched is its own placed object (a
     // shanty town's shack), where it is placed by its own model too.
@@ -2879,8 +3017,38 @@ fn run_into(
             }
         }
     }
-    // What broke is not knocked loose as well.
-    keys.retain(|k| !down.contains(k));
+    // What broke is not knocked loose as well, nor what rides on a
+    // vehicle ([`Props::load`]). What stands on this one's load bed (a
+    // prop resting on top of it, inside its footprint: PirCon002's rum
+    // jugs) rides on it, not knocked loose by it (inferred: the game's
+    // goods ride a driven truck).
+    keys.retain(|k| match *k {
+        _ if down.contains(k) => false,
+        StaticKey::Entity(e) if props.is_cargo(e) => false,
+        StaticKey::Entity(e) => match carrier {
+            Some((carrier, bed))
+                if on_bed(props, vehicle, bed, e)
+                    && props.load(&mut world.physics, e, carrier, bed.y) =>
+            {
+                eprintln!("cargo: {e:#x} rides on the {label}");
+                false
+            }
+            Some(_) => {
+                if std::env::var_os("M2_CARGO_LOG").is_some() {
+                    let l = props
+                        .centre(e)
+                        .map(|c| vehicle.place.inverse().transform_point3(c));
+                    eprintln!(
+                        "cargo: {e:#x} at {l:?} of the {label}, box {:?}",
+                        vehicle.bounds
+                    );
+                }
+                true
+            }
+            None => true,
+        },
+        _ => true,
+    });
     for key in keys {
         let (loose, template) = match key {
             StaticKey::Object(i) => (world.loose_mass(i), world.index.objects[i].template),
