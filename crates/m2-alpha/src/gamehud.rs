@@ -1679,6 +1679,35 @@ const PDA_STICK_KEYS: [(i32, [f32; 2]); 8] = [
     (39, [1.0, 0.0]),
 ];
 
+/// The pad's buttons the PDA reads, by the keys that press them (Flash
+/// key codes) and the HUD's names for them (`MrxGuiBase.Joystick`'s): A
+/// (`BUTTON_PAD2_D`) takes, B goes back, X and Y the map's other two
+/// buttons (Detail, Browser, Beacon), the d-pad steps through the Info
+/// page's lists. Invented: which keys (the PC's PDA bindings aren't read;
+/// Q, the page switch, the movie hears itself); the arrows push the map's
+/// stick as well ([`PDA_STICK_KEYS`]), which moves only in map mode.
+const PDA_BUTTONS: [(i32, &str); 11] = [
+    (13, "BUTTON_PAD2_D"),
+    (32, "BUTTON_PAD2_D"),
+    (8, "BUTTON_PAD2_R"),
+    (66, "BUTTON_PAD2_R"),
+    (88, "BUTTON_PAD2_L"),
+    (89, "BUTTON_PAD2_U"),
+    (90, "BUTTON_PAD2_L"),
+    (38, "BUTTON_PAD1_U"),
+    (40, "BUTTON_PAD1_D"),
+    (37, "BUTTON_PAD1_L"),
+    (39, "BUTTON_PAD1_R"),
+];
+
+/// The pad button key `code` (a Flash key code) presses in the PDA.
+fn pda_button(code: i32) -> Option<&'static str> {
+    PDA_BUTTONS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, b)| *b)
+}
+
 /// The stick the PDA's movement keys `held` (Flash key codes) push.
 fn pda_stick(held: &HashSet<i32>) -> [f32; 2] {
     let mut stick = [0.0f32; 2];
@@ -2284,6 +2313,29 @@ impl Thread {
         }
         if !self.pda_shown {
             self.pda_held.clear();
+        }
+        // The pad's buttons, from their keys: each a `ControllerInput`
+        // event, which the PDA's widget (holding the control focus since
+        // `MrxGuiPda.Open`) takes in `_HandleInput` and hands its movie.
+        if self.pda_shown {
+            for &(code, down) in &state.keys {
+                let Some(name) = pda_button(code).filter(|_| down) else {
+                    continue;
+                };
+                let fired = self
+                    .mission
+                    .lua()
+                    .load(CONTROLLER_PRESS)
+                    .set_name("=m2-pda button")
+                    .call::<Value>(name)
+                    .and_then(|event| match event {
+                        Value::Table(t) => {
+                            gui_runtime::fire(self.mission.lua(), "ControllerInput", t)
+                        }
+                        _ => Ok(0),
+                    });
+                log.push(format!("pda: button {name} ({fired:?} took it)"));
+            }
         }
         let stick = pda_stick(&self.pda_held);
         if stick != [0.0; 2] || self.pda_stick != [0.0; 2] {
@@ -5510,6 +5562,18 @@ fn text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pdas_keys_press_the_pads_buttons_but_not_its_page_key() {
+        assert_eq!(pda_button(13), Some("BUTTON_PAD2_D"));
+        assert_eq!(pda_button(8), Some("BUTTON_PAD2_R"));
+        assert_eq!(pda_button(40), Some("BUTTON_PAD1_D"));
+        // Q switches the page in the movie itself; W only moves the map.
+        assert_eq!(pda_button(81), None);
+        assert_eq!(pda_button(87), None);
+        let codes: HashSet<i32> = PDA_BUTTONS.iter().map(|(c, _)| *c).collect();
+        assert_eq!(codes.len(), PDA_BUTTONS.len(), "a key presses one button");
+    }
     use crate::combat::RIFLE_CLIP;
 
     #[test]
