@@ -64,6 +64,9 @@ const BLAST_RANGE: (f32, f32) = (15.0, 45.0);
 /// With nothing to blow things up with, she mans an emplaced gun this
 /// near her (metres) that is this near the target (invented).
 const MAN_SEEK: f32 = 80.0;
+/// She keeps to the target she is blowing up unless another is this much
+/// nearer, metres (invented).
+const KEEP_TARGET_BY: f32 = 10.0;
 /// A sturdy target is shot at with her rifle this long (seconds) before
 /// a strike is called on it (invented).
 const RIFLE_TRY: f32 = 15.0;
@@ -1162,7 +1165,23 @@ impl Autoplay {
                         && npcs.iter().any(|n| n.spawn == Some(m.target) && n.alive))
             })
             .collect();
-        if let Some(m) = nearest(destroy, here) {
+        // The one she is on keeps her unless another is much nearer: of a
+        // range's targets side by side the nearest changed as she stepped,
+        // and she never fired (PmcCon033 round 8: five targets 20 m off,
+        // a new one each 0.2 s for 470 s).
+        let current = match &self.goal {
+            Some(Goal::Blast { target, .. }) => {
+                destroy.iter().copied().find(|m| m.target == *target)
+            }
+            _ => None,
+        };
+        let pick = match (current, nearest(destroy.clone(), here)) {
+            (Some(c), Some(n)) if n.at.distance(here) + KEEP_TARGET_BY >= c.at.distance(here) => {
+                Some(c)
+            }
+            (_, n) => n,
+        };
+        if let Some(m) = pick {
             // A vehicle to destroy is blown up, not its crew shot: the
             // crew aboard come into play under its guid (PmcCon003's
             // AMX30s: round 8 aimed at a tank's commander inside it,

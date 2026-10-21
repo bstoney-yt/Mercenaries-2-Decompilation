@@ -2078,7 +2078,19 @@ impl MissionLink {
             self.unmarked_for -= STEP;
             if self.unmarked_for <= 0.0 {
                 self.unmarked_for = UNMARKED_EVERY;
-                self.unmarked = contract_destroy_targets(mission);
+                let now = contract_destroy_targets(mission);
+                if now.len() != self.unmarked.len() {
+                    let w = mission.world().borrow();
+                    let alive = now
+                        .iter()
+                        .filter(|g| w.objects.get(g).is_some_and(|o| o.alive))
+                        .count();
+                    eprintln!(
+                        "mission: the contract's destroy targets now {} ({alive} standing)",
+                        now.len()
+                    );
+                }
+                self.unmarked = now;
             }
             let targets: Vec<(u32, Vec3)> = {
                 let w = mission.world().borrow();
