@@ -358,9 +358,19 @@ local methods = {
         "AddMeter", "StartTimer", "StartPursuit", "HideMeter", "RemoveMeter",
         "RemoveAllMeters" },
     Tutorial = { "SetText", "ShowTutorialForObject", "ShowTutorialOnscreen" },
+    -- The engine's `Pda` library goes to the HUD's `PdaInterface` the
+    -- same way: its database is the PDA's Info pages (the factions'
+    -- attitudes, the log, the people, the score).
+    ["Pda.Database"] = { "SetFactionAttitude", "AddLogEntry", "AddHelpEntry",
+        "AddDossierEntry", "AddStatisticCategory", "AddStatisticEntry" },
 }
 for group, names in pairs(methods) do
-    local g = Hud and Hud[group]
+    local g
+    if group:sub(1, 4) == "Pda." then
+        g = Pda and Pda[group:sub(5)]
+    else
+        g = Hud and Hud[group]
+    end
     if type(g) == "table" then
         for _, name in ipairs(names) do
             local f = g[name]
@@ -525,6 +535,20 @@ __m2_wrap_dialogs()
 /// relations below -33 of -100..100, from the scripts' `_tAttitudes`),
 /// by the manager's abbreviations; `None` before the manager runs.
 fn hostile_factions(m: &Mission) -> Option<HashSet<&'static str>> {
+    let hostile = factions_at(m, "hostile")?
+        .into_iter()
+        .chain(["Vza"])
+        .collect();
+    // The Venezuelans always fight her (the faction manager leaves them
+    // out of reporting: "VZ, civilian, or reporting is disabled").
+    Some(hostile)
+}
+
+/// The factions whose attitude to the PMC the scripts have at `label`
+/// (`hostile`, `friendly`: `MrxFactionManager.GetAttitudeLabel(faction,
+/// "Pmc")`), by the manager's abbreviations; `None` before the manager
+/// runs.
+fn factions_at(m: &Mission, label: &str) -> Option<HashSet<&'static str>> {
     let labels: Option<mlua::Table> = m
         .lua()
         .load(
@@ -541,20 +565,103 @@ fn hostile_factions(m: &Mission) -> Option<HashSet<&'static str>> {
         .ok()
         .flatten();
     let labels = labels?;
-    let hostile = ["All", "Chi", "Gur", "Oil", "Pir", "Vza"]
-        .into_iter()
-        .filter(|f| {
-            labels
-                .get::<Option<String>>(*f)
-                .ok()
-                .flatten()
-                .is_some_and(|l| l.eq_ignore_ascii_case("hostile"))
+    Some(
+        ["All", "Chi", "Gur", "Oil", "Pir", "Vza"]
+            .into_iter()
+            .filter(|f| {
+                labels
+                    .get::<Option<String>>(*f)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|l| l.eq_ignore_ascii_case(label))
+            })
+            .collect(),
+    )
+}
+
+/// How near her a friendly soldier hears her horn, metres (invented).
+const ALLIES_HEAR: f32 = 20.0;
+
+/// She honked: soldiers of the factions friendly to her (their attitude
+/// to the PMC `Friendly`, `MrxFactionManager.GetAttitudeLabel`) within
+/// [`ALLIES_HEAR`] jump into her vehicle's free gunner seats, nearest
+/// first, and ride with her (out of play, as followers do: getting out
+/// with her, [`ride_along`]). From the game's text ("Making a faction
+/// happy has benefits: Their faction units will jump in your vehicle if
+/// you honk your horn"; `Tutorial.VehicleHorn.Attract`: "Press [cancel]
+/// to call allies into your vehicle"); that they take the seats with a
+/// gun ([`crate::combat::armed_seats`] but the driver's) is inferred, the
+/// reach invented. Riding, they man the guns ([`crate::combat`]'s gunners).
+fn call_allies(game: &mut Game, mission: &mut Mission, riding: Option<u32>) {
+    let Some(p) = game.scene.player.as_ref() else {
+        return;
+    };
+    let her = p.character.position;
+    let Some(v) = p.driving.and_then(|i| game.scene.vehicles.get(i)) else {
+        return;
+    };
+    let free =
+        (crate::combat::armed_seats(v).len() - 1).saturating_sub(game.scene.people.gunners());
+    if free == 0 {
+        return;
+    }
+    let friends = factions_at(mission, "friendly").unwrap_or_default();
+    if friends.is_empty() {
+        return;
+    }
+    let mut near: Vec<(f32, u32)> = game
+        .scene
+        .people
+        .npcs
+        .iter()
+        .filter(|n| n.alive && !n.soldier && n.faction.is_some_and(|f| friends.contains(f)))
+        .filter_map(|n| {
+            let d = n.character.position.distance(her);
+            (d <= ALLIES_HEAR).then_some((d, n.spawn?))
         })
-        .chain(["Vza"])
         .collect();
-    // The Venezuelans always fight her (the faction manager leaves them
-    // out of reporting: "VZ, civilian, or reporting is disabled").
-    Some(hostile)
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let Some(world) = &mut game.scene.world else {
+        return;
+    };
+    for (_, g) in near.into_iter().take(free) {
+        if game.scene.people.board(&mut world.physics, g, true, her) {
+            if let Some(v) = riding {
+                mission.seat_in(g, v);
+            }
+            game.scene.people.man_guns(g);
+            eprintln!("people: {g:08x} hears her horn and jumps in her vehicle");
+        }
+    }
+}
+
+/// The faction of the vehicle she rides, by the faction manager's
+/// abbreviation (`MrxFactionManager.GetFactionAbbrev` of
+/// `MrxUtil.GetFaction(Vehicle.GetFromRider(her))`, as
+/// `GetPerceivedFaction` takes a disguised rider's): `None` on foot, in a
+/// civilian's or a PMC vehicle, or before the scripts run.
+fn vehicle_faction(m: &Mission) -> Option<&'static str> {
+    let abbrev: Option<String> = m
+        .lua()
+        .load(
+            "local u, f = rawget(_G, 'MrxUtil'), rawget(_G, 'MrxFactionManager') \
+             if type(u) ~= 'table' or type(f) ~= 'table' then return nil end \
+             local p = Player.GetLocalCharacter() \
+             local v = p and Vehicle.GetFromRider(p) \
+             if v == nil then return nil end \
+             local ok, faction = pcall(u.GetFaction, v) \
+             if not ok or faction == nil then return nil end \
+             local ok2, a = pcall(f.GetFactionAbbrev, faction) \
+             if ok2 and type(a) == 'string' then return a end \
+             return nil",
+        )
+        .eval()
+        .ok()
+        .flatten();
+    let abbrev = abbrev?;
+    ["All", "Chi", "Gur", "Oil", "Pir", "Vza"]
+        .into_iter()
+        .find(|f| f.eq_ignore_ascii_case(&abbrev))
 }
 
 /// Runs the callback of dialog box `seq` ([`DIALOG_BOXES`]) for option
@@ -681,6 +788,10 @@ pub struct MissionLink {
     /// Seconds she has been out of her vehicle with followers aboard
     /// ([`ride_along`]).
     out_for: f32,
+    /// The armies' pursuit helicopters ([`crate::reinforce`]), read from
+    /// the data once, and those under way.
+    squads: Option<HashMap<&'static str, crate::reinforce::Squad>>,
+    reinforcements: crate::reinforce::Reinforcements,
     /// Seconds since the scripts said the contract was completed.
     completed: Option<f32>,
     /// How many times the scripts have said a contract was completed.
@@ -840,6 +951,8 @@ impl MissionLink {
             bombs: Vec::new(),
             vehicles: Fleet::default(),
             out_for: 0.0,
+            squads: None,
+            reinforcements: crate::reinforce::Reinforcements::default(),
             completed: None,
             contracts: 0,
             speed: 0.0,
@@ -1343,13 +1456,14 @@ impl MissionLink {
             }
         }
         lap.mark("scripts: music");
-        // Deliveries fly on; the scripts hear of each load let go.
+        // Deliveries fly on; the scripts hear of each load let go (but the
+        // pursuits' helicopters', [`crate::reinforce`]).
         let scene = &mut game.scene;
         if let Some(world) = &mut scene.world {
-            for r in scene
+            let releases = scene
                 .flights
-                .step(dt, &mut world.physics, &mut scene.vehicles, focus)
-            {
+                .step(dt, &mut world.physics, &mut scene.vehicles, focus);
+            for r in self.reinforcements.take_releases(releases) {
                 for &g in &r.dropped {
                     self.vehicles.landing.insert(g, mission.now() + LANDING);
                 }
@@ -1600,7 +1714,9 @@ impl MissionLink {
         // report: the first one of a faction not already reporting, a
         // witness of theirs near it (not the victim) is offered to the
         // faction manager ([`m2_game::report`]).
-        for inf in game.scene.people.take_infractions() {
+        let infractions = game.scene.people.take_infractions();
+        let hurt_someone = !infractions.is_empty();
+        for inf in infractions {
             let label = crate::npc::faction_label(inf.faction);
             mission.record_infraction(label, inf.kind);
             if inf.faction == "Vza" || game.reporters.iter().any(|r| r.1 == inf.faction) {
@@ -1631,6 +1747,47 @@ impl MissionLink {
             }
         }
         lap.mark("scripts: infractions");
+        // Her vehicle disguise ([`crate::disguise`]): the faction of the
+        // vehicle she rides, as the scripts have it; the faction's
+        // soldiers take her for one of theirs while it holds, and the
+        // scripts and the HUD's gauge hear how it stands.
+        let honks = game.take_honks();
+        if honks > 0 {
+            mission.honk();
+            eprintln!(
+                "horn: she honks; the faction gates hear her for {} s",
+                m2_game::api::HONK_HEARD
+            );
+            call_allies(game, mission, self.vehicles.riding);
+        }
+        let riding = game.scene.player.as_ref().and_then(|p| p.driving);
+        let faction = riding.and_then(|_| vehicle_faction(mission));
+        let her = game.scene.player.as_ref().map(|p| p.character.position);
+        let near = match (faction, her) {
+            (Some(f), Some(at)) => game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .filter(|n| n.alive && n.faction == Some(f))
+                .filter(|n| n.character.position.distance(at) <= crate::disguise::NEAR)
+                .count(),
+            _ => 0,
+        };
+        let enabled = mission.world().borrow().vehicle_disguise;
+        let state = game.disguise.update(
+            crate::disguise::Tick {
+                enabled,
+                vehicle: riding,
+                faction,
+                honks,
+                near,
+                hurt_someone: hurt_someone && riding.is_some(),
+            },
+            dt,
+        );
+        mission.world().borrow_mut().disguise = state;
+        game.scene.people.set_disguise(game.disguise.holds());
         // Reporters: each calls in, then gets through (state 1) and the
         // faction manager's own timer finishes his report; one killed
         // first, or that it never finishes with, is stopped (state 2).
@@ -1669,6 +1826,47 @@ impl MissionLink {
         // The radios near her play over the score.
         if let Some(cue) = self.radio.update(game, mission) {
             self.music = Some(cue);
+        }
+        // A pursuit brings its army's helicopter with soldiers.
+        if self.squads.is_none()
+            && let Some(world) = &game.scene.world
+        {
+            let w = mission.world().borrow();
+            let squads = crate::reinforce::squads(
+                &w.template_passengers,
+                &w.template_drivers,
+                &world.index.template_db,
+            );
+            let mut names: Vec<String> = squads
+                .iter()
+                .map(|(f, s)| format!("{f} {} ({} soldiers)", s.template, s.soldiers.len()))
+                .collect();
+            names.sort();
+            eprintln!("reinforcements: pursuit helicopters {names:?}");
+            self.squads = Some(squads);
+        }
+        if let (Some(squads), Some(her)) = (
+            &self.squads,
+            game.scene.player.as_ref().map(|p| p.character.position),
+        ) {
+            let mut pursuing: Vec<&'static str> =
+                game.scene.people.pursuit.keys().copied().collect();
+            pursuing.sort_unstable();
+            let due = self
+                .reinforcements
+                .step(&pursuing, squads, &mut game.scene.flights, her, dt);
+            for (g, template, at) in due {
+                let model = game
+                    .scene
+                    .world
+                    .as_ref()
+                    .and_then(|w| w.index.template_db.get(&template))
+                    .and_then(|t| t.model);
+                let at = ground_under(game, at);
+                if game.scene.people.bring_scripted(g, &template, model, at) {
+                    self.reinforcements.brought(g);
+                }
+            }
         }
         // A pursuit run out: the scripts read level 0 again.
         let pursued = !game.scene.people.pursuit.is_empty();
@@ -4937,6 +5135,31 @@ mod tests {
         };
         assert!(cash.contains(&(Plain::Text("vPlayer".into()), Plain::Guid(1))));
         assert_eq!(calls[1].method, "SetSlotToText");
+    }
+
+    #[test]
+    fn the_pdas_database_reaches_the_hud_as_pda_calls() {
+        let lua = mlua::Lua::new();
+        lua.load("Hud = {} Pda = { Database = {} }").exec().unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(
+            r#"Pda.Database:SetFactionAttitude({ sName = "China", sTexture = "t", nAttitude = 60 })
+            Pda.Database:AddLogEntry({ sText = "x" })"#,
+        )
+        .exec()
+        .unwrap();
+        let calls = hud_calls(&lua);
+        let names: Vec<(&str, &str)> = calls
+            .iter()
+            .map(|c| (c.group.as_str(), c.method.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Pda.Database", "SetFactionAttitude"),
+                ("Pda.Database", "AddLogEntry")
+            ]
+        );
     }
 
     #[test]

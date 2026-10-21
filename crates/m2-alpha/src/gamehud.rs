@@ -142,8 +142,9 @@ return c.sColor .. tag .. " [objective." .. c.sPrefix .. c.sStatus .. "]" .. " "
     c.nPriority or 1
 "#;
 /// A mission's call to the HUD's interface, as the engine hands it on:
-/// `HudInterface.<group>.<method>(HudInterface.<group>, data)`. Answers
-/// whether the HUD has that method.
+/// `HudInterface.<group>.<method>(HudInterface.<group>, data)`, or for a
+/// `Pda.` group (`Pda.Database`), `PdaInterface`'s. Answers whether the
+/// HUD has that method.
 ///
 /// `HudInterface` is a global of `MrxGuiInterface`'s script, which runs in
 /// its own environment like every module: its globals are the module's
@@ -160,8 +161,9 @@ if seq then
     end
 end
 local module = rawget(_G, "MrxGuiInterface")
-local hud = type(module) == "table" and module.HudInterface
-local g = type(hud) == "table" and hud[group]
+local pda = group:sub(1, 4) == "Pda."
+local hud = type(module) == "table" and (pda and module.PdaInterface or module.HudInterface)
+local g = type(hud) == "table" and hud[pda and group:sub(5) or group]
 local f = type(g) == "table" and g[method]
 if type(f) ~= "function" then return false end
 -- Message ids: the mission knows a message by its call's number

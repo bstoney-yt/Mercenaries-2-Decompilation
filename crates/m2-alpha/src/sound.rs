@@ -187,6 +187,11 @@ pub struct GameAudio {
     install: Option<Install>,
     /// The engine running now.
     engine: Option<Engine>,
+    /// The horn sounding, and the resident bank's two horns (a car's and a
+    /// lorry's: [`load_horns`]), once read on a thread.
+    horn: Option<VoiceId>,
+    spare_horns: Option<SpareHorns>,
+    horns_loading: Option<Receiver<SpareHorns>>,
     /// The rotors heard, by helicopter: a voice per loop.
     rotors: HashMap<u32, Vec<VoiceId>>,
     /// Banks read and found to have no engine sounds.
@@ -717,6 +722,50 @@ pub struct EngineInput {
     pub top: f32,
     /// The driver's throttle, -1 (reverse) to 1.
     pub throttle: f32,
+    /// The horn held.
+    pub horn: bool,
+    /// Heard with a lorry's horn rather than a car's where its bank holds
+    /// none of its own ([`load_horns`]).
+    pub heavy: bool,
+}
+
+/// The resident bank's horns: a car's, then a lorry's.
+type SpareHorns = [Option<SoundBuffer>; 2];
+
+/// How loud a horn is, as the engine is [`ENGINE_GAIN`] (invented).
+const HORN_GAIN: f32 = 0.6;
+
+/// The two horns the resident bank holds (`resident_P000_Q3`, always
+/// loaded), a car's and a lorry's: the same two recordings the banks that
+/// have a horn hold ([`m2_engine::audio::HORN_FRAMES`], in that order), so
+/// a vehicle whose own bank has none (a tank's, a boat's, an old car's) is
+/// heard with one of these (from samples; which one, by
+/// [`EngineInput::heavy`], is invented).
+pub fn load_horns(install: &Install) -> SpareHorns {
+    let library = install.open_world().and_then(|mut source| {
+        SoundLibrary::load_hashes(&mut source, &[m2_assets::name_hash("resident")])
+    });
+    let library = match library {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("sound: no resident horns ({e})");
+            return [None, None];
+        }
+    };
+    let sounds = library.bank("resident");
+    let horns = m2_engine::audio::HORN_FRAMES.map(|frames| {
+        sounds
+            .iter()
+            .find(|s| s.frames() == frames && s.is_tone())
+            .cloned()
+    });
+    let hash = |h: &Option<SoundBuffer>| h.as_ref().map(|s| format!("{:08x}", s.hash));
+    eprintln!(
+        "sound: resident horns: car {:?}, lorry {:?}",
+        hash(&horns[0]),
+        hash(&horns[1])
+    );
+    horns
 }
 
 /// A bank's engine sounds, read on a thread.
@@ -1021,6 +1070,14 @@ impl GameAudio {
             engine_loads: channel(),
             install: install.cloned(),
             engine: None,
+            horn: None,
+            spare_horns: None,
+            horns_loading: install.map(|install| {
+                let install = install.clone();
+                let (tx, rx) = channel();
+                std::thread::spawn(move || drop(tx.send(load_horns(&install))));
+                rx
+            }),
             rotors: HashMap::new(),
             silent: HashSet::new(),
             ambient_wait: 3.0,
@@ -2058,6 +2115,7 @@ impl GameAudio {
     /// revs with speed and throttle, its start and stop sounds as it is
     /// got in and out of. A bank is read the first time it's driven.
     pub fn engine(&mut self, driving: Option<EngineInput>, dt: f32) {
+        self.sound_horn(driving);
         if self
             .engine
             .as_ref()
@@ -2115,6 +2173,53 @@ impl GameAudio {
                 m.set_pitch(*id, pitch);
             }
         });
+    }
+
+    /// Holds the horn of the vehicle driven while `driving` says it is
+    /// held: its bank's own ([`EngineSounds::horn`]), else the resident
+    /// bank's car's or lorry's, looped from the press to the release (each
+    /// recording is one note held level, so it loops without a seam).
+    fn sound_horn(&mut self, driving: Option<EngineInput>) {
+        if let Some(rx) = &self.horns_loading
+            && let Ok(h) = rx.try_recv()
+        {
+            self.spare_horns = Some(h);
+            self.horns_loading = None;
+        }
+        let Some(input) = driving.filter(|d| d.horn) else {
+            if let Some(id) = self.horn.take() {
+                self.out.with(|m| m.stop(id));
+            }
+            return;
+        };
+        if self.horn.is_some() {
+            return;
+        }
+        let own = self
+            .engine
+            .as_ref()
+            .filter(|e| e.bank == input.bank)
+            .and_then(|e| e.sounds.horn.clone());
+        let spare = self
+            .spare_horns
+            .as_ref()
+            .and_then(|h| h[usize::from(input.heavy)].clone());
+        let whose = if own.is_some() {
+            "its bank's"
+        } else if input.heavy {
+            "the resident lorry's"
+        } else {
+            "the resident car's"
+        };
+        if let Some(buffer) = own.or(spare) {
+            eprintln!(
+                "horn: {whose} ({:08x}, {:.2} s, looped)",
+                buffer.hash,
+                buffer.seconds()
+            );
+            let play = Play::flat(buffer).looped().gain(HORN_GAIN);
+            self.horn = Some(self.out.with(|m| m.play(play)));
+        }
     }
 
     /// Bank `bank`'s engine sounds, once read (`None` while they're read,
