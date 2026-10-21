@@ -121,7 +121,10 @@ local function tasks()
     end
   end
   if ok then walk(m, 0) end
-  local s = (ok and m and m.GetName and m:GetName() or tostring(m)) .. ': ' .. table.concat(out, ' ')
+  local name = ok and m and m.GetName and m:GetName() or tostring(m)
+  local id = type(name) == 'string' and (string.gsub(name, 'Mission$', '')) or '?'
+  local oki, index = pcall(function() return WifMissionData.GetMissionIndexFromId(id) end)
+  local s = name .. ' (index ' .. tostring(oki and index) .. '): ' .. table.concat(out, ' ')
   if s ~= lastTasks then
     say('>>> TASKS ' .. s)
     lastTasks = s

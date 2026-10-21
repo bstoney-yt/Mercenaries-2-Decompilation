@@ -56,3 +56,40 @@ Event.CreatePersistent(Event.TimerRelative, { 1 }, function()
     end
   end
 end, {})
+
+-- The PMC's two tank waves ("Clear out the VZ forces attacking the PMC!"):
+-- autoplay goes for them first; any tank still alive 600 s after its
+-- wave's objective came up is killed, so a run gets on to "Get inside the
+-- PMC!" (autoplay took 1900 s on one moving tank in round 14 and never
+-- finished the second wave in round 19).
+local tanks = {
+  'PMC003_AMX_01', 'PMC003_AMX_02', 'PMC003_AMX_03', 'PMC003_AMX_04',
+  'OBJ_Wave02_Tank01', 'OBJ_Wave02_Tank02', 'OBJ_Wave02_Tank03', 'OBJ_Wave02_Tank04',
+}
+local clearing, waited = false, 0
+local setState2 = MrxTask._SetState
+MrxTask._SetState = function(o, ...)
+  local r = { setState2(o, ...) }
+  local ok, nm = pcall(function() return o:GetName() end)
+  if ok and type(nm) == 'string' and nm:find('Clear out the VZ forces', 1, true) then
+    clearing = o:IsActive()
+    waited = 0
+    Debug.Printf('>>> drive clear: ' .. tostring(o:IsActive()))
+  end
+  return unpack(r, 1, table.maxn(r))
+end
+Event.CreatePersistent(Event.TimerRelative, { 10 }, function()
+  if not clearing then
+    waited = 0
+    return
+  end
+  waited = waited + 10
+  if waited < 600 then return end
+  for _, k in ipairs(tanks) do
+    local g = Pg.GetGuidByName(k)
+    if g and Object.IsAlive(g) then
+      Debug.Printf('>>> drive clear: kill ' .. k .. ' after ' .. waited .. ' s')
+      Object.Kill(g)
+    end
+  end
+end, {})

@@ -632,6 +632,9 @@ enum State {
 /// The mission scripts and what they want shown.
 pub struct MissionLink {
     state: State,
+    /// The contract's unmarked action targets last logged
+    /// ([`contract_marks`](Self::contract_marks)).
+    acts_logged: std::cell::RefCell<Vec<u32>>,
     /// The flow's movies wait for the game to play them
     /// ([`Mission::hold_movies`]); otherwise they end at once.
     movies: bool,
@@ -819,6 +822,7 @@ impl MissionLink {
         Self {
             state: State::Loading(rx),
             movies: false,
+            acts_logged: Default::default(),
             end_skip: false,
             subtitles: true,
             tutorials: true,
@@ -2549,28 +2553,30 @@ impl MissionLink {
             Some(MarkFor::Index(i)) => *i == index,
             None => false,
         };
+        // The markers put up for the contract by name come first. The
+        // objectives on the PDA count by the contract's index, which the
+        // jobs' objectives shown during it share (round 20: PmcCon003's
+        // "Get inside the PMC!" passed over for OilJob008's targets).
+        let named =
+            |m: &Mark| matches!(&m.mission, Some(MarkFor::Id(i)) if i.eq_ignore_ascii_case(&id));
         // A verify marker stays to do once its person is dead: the body is
         // verified (round 13: General Peng shot, then left for the jobs).
-        if marks
-            .iter()
-            .any(|m| (m.alive || m.kind == "verify") && ours(m))
-        {
-            return marks.into_iter().filter(ours).collect();
+        let to_do = |m: &Mark| m.alive || m.kind == "verify";
+        if marks.iter().any(|m| to_do(m) && named(m)) {
+            return marks.into_iter().filter(named).collect();
         }
         // None up for the contract: its active action objectives' targets,
         // which the scripts put no marker or blip over (PmcCon003's "Get
         // inside the PMC!" on `PlayerLocation_PMC`, round 16: she went
         // after the jobs' markers instead).
         let acts = self.contract_actions();
-        if acts.is_empty() {
-            return marks;
-        }
         let State::Running(mission) = &self.state else {
             return marks;
         };
         let w = mission.world().borrow();
-        acts.into_iter()
-            .filter_map(|g| {
+        let found: Vec<Mark> = acts
+            .iter()
+            .filter_map(|&g| {
                 let o = w.objects.get(&g)?;
                 Some(Mark {
                     target: g,
@@ -2581,7 +2587,22 @@ impl MissionLink {
                     mission: Some(MarkFor::Index(index)),
                 })
             })
-            .collect()
+            .collect();
+        if *self.acts_logged.borrow() != acts {
+            eprintln!(
+                "mission: no marker up for {id}: its action targets {acts:x?}, {} placed",
+                found.len()
+            );
+            *self.acts_logged.borrow_mut() = acts;
+        }
+        drop(w);
+        if !found.is_empty() {
+            return found;
+        }
+        if marks.iter().any(|m| to_do(m) && ours(m)) {
+            return marks.into_iter().filter(ours).collect();
+        }
+        marks
     }
 
     /// The targets of the current contract's active action objectives
