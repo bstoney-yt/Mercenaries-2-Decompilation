@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant};
 
 use m2_net::proto::{Hello, HeroState, VERSION};
-use m2_net::{Event, Invite, Options, Playback, Session};
+use m2_net::{Event, Invite, Msg, Options, Playback, Session};
 use m2_render::RenderBackend;
 
 use crate::game::Game;
@@ -39,6 +39,10 @@ pub struct Setup {
     /// nearest of the island's people (`--coop-visit`), so there are some
     /// to share. For testing.
     pub visit: bool,
+    /// With `--screenshot`, joined: hurt the nearest of the host's people
+    /// three times, as a shot would (`--coop-shoot`), to test hits going
+    /// to the host. For testing.
+    pub shoot: bool,
 }
 
 /// Counts for the log and the end-of-run summary.
@@ -174,7 +178,9 @@ impl Coop {
         if self.peer.is_some()
             && let Some(mirror) = &mut self.mirror
         {
-            mirror.tick(game, now, dt);
+            for hit in mirror.tick(game, now, dt) {
+                self.session.send(hit, true);
+            }
         }
         let t = self.started.elapsed().as_secs_f64();
         if self.peer.is_some() && t - self.last_log >= 1.0 {
@@ -226,6 +232,11 @@ impl Coop {
             Event::People(b, at) => {
                 if let Some(m) = &mut self.mirror {
                     m.batch(b, at);
+                }
+            }
+            Event::Message(Msg::Hit { net_id, damage }) => {
+                if let Some(s) = &mut self.share {
+                    s.hit(game, net_id, damage);
                 }
             }
             Event::Message(msg) => match &mut self.mirror {
@@ -292,11 +303,13 @@ impl Coop {
                     .reduce(f32::min)
             });
             eprintln!(
-                "coop: sharing {} people near the friend (most {}; {} in, {} out) of {} here ({} landed, {} alive), nearest {}",
+                "coop: sharing {} people near the friend (most {}; {} in, {} out; the friend hit them {} times, killed {}) of {} here ({} landed, {} alive), nearest {}",
                 s.shared,
                 s.most,
                 s.sent_in,
                 s.sent_out,
+                s.hits,
+                s.kills,
                 npcs.len(),
                 npcs.iter().filter(|n| n.landed).count(),
                 npcs.iter().filter(|n| n.alive).count(),
@@ -315,11 +328,12 @@ impl Coop {
                     .reduce(f32::min)
             });
             eprintln!(
-                "coop: the host's people: {} known, {stood} stood (most {}), {} made, {} places; nearest {}",
+                "coop: the host's people: {} known, {stood} stood (most {}), {} made, {} places, {} hits sent; nearest {}",
                 m.known(),
                 m.most,
                 m.made,
                 m.places,
+                m.hits,
                 nearest.map_or("-".to_owned(), |d| format!("{d:.1} m")),
             );
         }
@@ -429,6 +443,8 @@ pub fn offscreen(
     let mut next = start;
     let mut mid = false;
     let mut visited = !setup.visit;
+    let mut shots = if setup.shoot { 3 } else { 0 };
+    let mut next_shot = 0.0;
     while start.elapsed().as_secs_f32() < seconds {
         if !visited && coop.peer.is_some() {
             visited = true;
@@ -456,6 +472,32 @@ pub fn offscreen(
             },
             _ => crate::player::Intent::default(),
         };
+        let t = start.elapsed().as_secs_f32();
+        if shots > 0 && coop.peer.is_some() && t >= next_shot && t > 15.0 {
+            let here = game.scene.player.as_ref().map(|p| p.character.position);
+            if let Some(h) = here
+                && let Some(n) = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter_mut()
+                    .filter(|n| n.alive)
+                    .min_by(|a, b| {
+                        a.character
+                            .position
+                            .distance(h)
+                            .total_cmp(&b.character.position.distance(h))
+                    })
+            {
+                shots -= 1;
+                next_shot = t + 2.0;
+                n.hurt(40.0, m2_math::glam::Vec3::ZERO);
+                eprintln!(
+                    "coop: shot one of the host's ({}), {:.0} health left",
+                    n.net_id, n.hp
+                );
+            }
+        }
         game.step(intent, tick.as_secs_f32());
         coop.tick(game, backend, tick.as_secs_f32());
         crate::render(backend, game, fov, aspect, None)?;

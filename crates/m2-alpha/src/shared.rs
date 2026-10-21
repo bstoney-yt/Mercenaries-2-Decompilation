@@ -37,9 +37,31 @@ pub struct HostShare {
     pub most: usize,
     pub sent_in: u32,
     pub sent_out: u32,
+    /// The friend's hits on ours, and those that killed.
+    pub hits: u32,
+    pub kills: u32,
 }
 
 impl HostShare {
+    /// The friend's game hurt one of ours: the same harm here, so the
+    /// host's game (which decides) agrees. Not pushed: the friend's game
+    /// threw its own copy already.
+    pub fn hit(&mut self, game: &mut Game, net_id: u32, damage: f32) {
+        self.hits += 1;
+        if let Some(n) = game
+            .scene
+            .people
+            .npcs
+            .iter_mut()
+            .find(|n| n.net_id == net_id)
+            && n.alive
+            && n.hurt(damage, Vec3::ZERO)
+        {
+            self.kills += 1;
+            eprintln!("coop: the friend killed one of ours ({net_id})");
+        }
+    }
+
     /// Shares the people near `friend` (the other hero), at most
     /// [`SHARE_RATE`] times a second.
     pub fn tick(&mut self, game: &Game, friend: Vec3, session: &Session, now: f64) {
@@ -129,6 +151,9 @@ struct Mirrored {
     playback: Playback,
     /// Where it was last placed, and when (its speed sets the clips').
     last: Option<(Vec3, f64)>,
+    /// Its health after the last frame: less now means this game's
+    /// player hurt it, which the host is told.
+    hp: Option<f32>,
 }
 
 /// The friend's side: the host's people, stood in for the game's own.
@@ -141,6 +166,8 @@ pub struct Mirror {
     pub made: u32,
     pub places: u32,
     pub most: usize,
+    /// Hits on the host's people sent to the host.
+    pub hits: u32,
     /// Kinds asked for whose model this game didn't have (logged once).
     missing: HashSet<u16>,
 }
@@ -165,6 +192,7 @@ impl Mirror {
                         info: p,
                         playback: Playback::new(),
                         last: None,
+                        hp: None,
                     },
                 );
             }
@@ -200,8 +228,10 @@ impl Mirror {
     }
 
     /// Stands the host's people where they are now (`now` on the session
-    /// clock) and plays their clips on by `dt`.
-    pub fn tick(&mut self, game: &mut Game, now: f64, dt: f32) {
+    /// clock) and plays their clips on by `dt`. Returns the hits this
+    /// game's player made on them since, for the host.
+    pub fn tick(&mut self, game: &mut Game, now: f64, dt: f32) -> Vec<Msg> {
+        let mut hits = Vec::new();
         let people = &mut game.scene.people;
         if !self.started {
             // Our own people go: the host's stand in for them.
@@ -265,6 +295,14 @@ impl Mirror {
                 }
             };
             let n = &mut people.npcs[i];
+            if let Some(hp) = m.hp
+                && n.hp < hp - 0.01
+            {
+                hits.push(Msg::Hit {
+                    net_id: *id,
+                    damage: hp - n.hp,
+                });
+            }
             n.character.position = at;
             n.facing = pose.facing;
             if pose.flags & PersonState::ALIVE == 0 && n.alive {
@@ -280,8 +318,11 @@ impl Mirror {
             m.last = Some((at, now));
             let gait = crate::puppet::gait(pose.gait);
             n.mirror_step(gait, pose.flags & PersonState::AIMING != 0, moved, dt);
+            m.hp = Some(n.hp);
         }
         self.most = self.most.max(people.npcs.len());
+        self.hits += hits.len() as u32;
+        hits
     }
 
     /// The host's people known now (whether stood yet or not).

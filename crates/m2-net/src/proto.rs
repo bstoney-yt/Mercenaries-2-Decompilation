@@ -8,7 +8,7 @@
 //! Two channels carry them:
 //! - the reliable stream (in order, never lost): [`Msg::Hello`],
 //!   [`Msg::Welcome`], [`Msg::Bye`], [`Msg::Kind`], [`Msg::PersonIn`],
-//!   [`Msg::PersonOut`], each framed by a `u16` length;
+//!   [`Msg::PersonOut`], [`Msg::Hit`], each framed by a `u16` length;
 //! - datagrams (latest wins, may be lost or reordered): [`Msg::Hero`]
 //!   and [`Msg::People`], sent many times a second, each one whole, so a
 //!   lost one is simply replaced by the next.
@@ -23,7 +23,7 @@ use thiserror::Error;
 
 /// Bumped whenever a message changes shape. Games that differ refuse
 /// each other in the handshake rather than misreading.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 /// The most people one [`Msg::People`] datagram carries (a datagram
 /// must fit a packet: 40 of 22 bytes is 880).
@@ -50,6 +50,9 @@ pub enum Msg {
     PersonOut(u32),
     /// Host: where the shared people are now.
     People(PeopleBatch),
+    /// Friend: the friend's game hurt one of the host's people (by
+    /// `net_id`) this much; the host applies it.
+    Hit { net_id: u32, damage: f32 },
 }
 
 /// A kind of person as the host has loaded it.
@@ -186,6 +189,7 @@ const TAG_KIND: u8 = 5;
 const TAG_PERSON_IN: u8 = 6;
 const TAG_PERSON_OUT: u8 = 7;
 const TAG_PEOPLE: u8 = 8;
+const TAG_HIT: u8 = 9;
 /// The most nodes an outfit mask may name.
 const MAX_OUTFIT: usize = 1024;
 
@@ -239,6 +243,11 @@ impl Msg {
                     w.push(byte);
                 }
                 w.push(p.armed as u8);
+            }
+            Msg::Hit { net_id, damage } => {
+                w.push(TAG_HIT);
+                w.extend_from_slice(&net_id.to_le_bytes());
+                w.extend_from_slice(&damage.to_le_bytes());
             }
             Msg::PersonOut(id) => {
                 w.push(TAG_PERSON_OUT);
@@ -332,6 +341,14 @@ impl Msg {
                 })
             }
             TAG_PERSON_OUT => Msg::PersonOut(r.u32()?),
+            TAG_HIT => {
+                let net_id = r.u32()?;
+                let damage = r.f32()?;
+                if !damage.is_finite() || damage < 0.0 {
+                    return Err(DecodeError::Bad("damage"));
+                }
+                Msg::Hit { net_id, damage }
+            }
             TAG_PEOPLE => {
                 let time = r.f64()?;
                 let n = r.u8()? as usize;
@@ -456,6 +473,10 @@ mod tests {
                 armed: true,
             }),
             Msg::PersonOut(77),
+            Msg::Hit {
+                net_id: 77,
+                damage: 35.5,
+            },
             Msg::People(PeopleBatch {
                 time: 3.5,
                 people: vec![

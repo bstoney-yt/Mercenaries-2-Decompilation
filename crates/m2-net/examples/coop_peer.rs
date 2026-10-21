@@ -72,6 +72,7 @@ fn main() {
     let mut link = String::from("-");
     let (mut kinds, mut ins, mut outs, mut states) = (0u32, 0u32, 0u32, 0u32);
     let mut seen = HashSet::new();
+    let mut hits = 0u32;
     let mut announced = false;
     let mut last_people = 0.0;
     while started.elapsed().as_secs_f64() < seconds {
@@ -120,6 +121,10 @@ fn main() {
                 }
                 Event::Message(Msg::PersonIn(_)) => ins += 1,
                 Event::Message(Msg::PersonOut(_)) => outs += 1,
+                Event::Message(Msg::Hit { net_id, damage }) => {
+                    hits += 1;
+                    println!("hit: {net_id} for {damage:.1}");
+                }
                 Event::Message(m) => println!("message: {m:?}"),
                 Event::Disconnected(why) => println!("disconnected: {why}"),
                 Event::Failed(why) => {
@@ -201,7 +206,7 @@ fn main() {
         if connected_at.is_some() && t - last_log >= 1.0 {
             last_log = t;
             println!(
-                "peer: t {t:.0} s, received {received}, {link}; people: {kinds} kinds, {ins} in, {outs} out, {states} places of {} people",
+                "peer: t {t:.0} s, received {received}, {link}; people: {kinds} kinds, {ins} in, {outs} out, {states} places of {} people; {hits} hits",
                 seen.len()
             );
         }
