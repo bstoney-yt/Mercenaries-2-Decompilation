@@ -30,7 +30,8 @@ m2-alpha [options]
                          A job (AllJob002...) is tracked on the PDA's map,
                          and --autoplay keeps to it
   --job-near <m>         with --skip-to a job: once it is tracked, she is
-                         put this far from its nearest target (a test
+                         put this far from its nearest target, and again
+                         after each target it counts (a test
                          shortcut past the drive across the island)
   --movies               with --mission --screenshot: the scripts' movies
                          wait; each is decoded offscreen and pictured

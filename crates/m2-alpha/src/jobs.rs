@@ -144,6 +144,10 @@ impl JobRun {
                 if now.0 == 1 { "" } else { "s" },
                 if now.1 { "; completed" } else { "" }
             ));
+            // A target done: with `--job-near` she is put by the next.
+            if now.0 > self.said.0 {
+                self.placed = false;
+            }
             self.said = now;
         }
         lines
@@ -151,7 +155,8 @@ impl JobRun {
 
     /// Once it is tracked, with [`near`](Self::near) set: where to put
     /// her, that far from its nearest target (or quarry) on her side of
-    /// it, and the target's name. Once only; not if she is that near
+    /// it, and the target's name. Once, and again after each target
+    /// done; not if she is that near
     /// already.
     pub fn start_near(&mut self, mission: &Mission, her: Vec3) -> Option<(String, Vec3)> {
         let near = self.near?;
