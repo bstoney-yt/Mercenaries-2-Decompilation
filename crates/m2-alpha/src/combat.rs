@@ -388,6 +388,11 @@ const MG_GAP: f32 = 0.09;
 const TANK_MG_GAP: f32 = 60.0 / 450.0;
 const MG_DAMAGE: f32 = 45.0;
 const MG_RANGE: f32 = 500.0;
+
+/// How far gunners riding with her shoot, metres, and how far off they
+/// aim, as a share of the distance (both invented).
+const GUNNER_RANGE: f32 = 120.0;
+const GUNNER_SPREAD: f32 = 0.02;
 /// Gunfire puts soldiers this close on alert and sends civilians running.
 const ALERT_RANGE: f32 = 60.0;
 const PANIC_RANGE: f32 = 40.0;
@@ -1577,6 +1582,9 @@ pub struct Combat {
     /// (`Switch_Primary`).
     pub vehicle_gun: usize,
     ripple: usize,
+    /// Seconds until each gunner riding with her fires again
+    /// ([`Combat::gunners_fire`]).
+    gunner_wait: Vec<f32>,
     seed: u64,
     /// What she has fired, for the HUD's ammo counters.
     pub fired: Fired,
@@ -1777,6 +1785,7 @@ impl Default for Combat {
             seat: 0,
             vehicle_gun: 0,
             ripple: 0,
+            gunner_wait: Vec::new(),
             seed: 0x2545_f491_4f6c_dd1d,
             fired: Fired::default(),
             shots: std::collections::BTreeMap::new(),
@@ -2619,6 +2628,9 @@ impl Combat {
         if f.player.driving.is_none() {
             self.vehicle_gun = 0;
         }
+        if self.down <= 0.0 {
+            self.gunners_fire(f, dt);
+        }
         // Fire fires the gun chosen with the switch: the main gun, or the
         // machine gun (as Aim does too).
         let mg = self.vehicle_gun == 1;
@@ -3405,30 +3417,50 @@ impl Combat {
     /// tank's driver fires its cannon as [`Combat::vehicle_fire`] does.
     /// False if that seat has no such weapon.
     fn mounted_fire(&mut self, f: &mut Field<'_>, i: usize, priority: usize) -> bool {
-        let Some(v) = f.vehicles.get(i) else {
+        let Some(gap) = self.fire_mount(f, i, self.seat, priority, None) else {
             return false;
         };
-        let seats = armed_seats(v);
-        let Some(&seat) = seats.get(self.seat) else {
-            return false;
-        };
-        if self.seat == 0 && v.spec.cannon() {
-            return false;
+        if priority == 0 {
+            self.reload = gap;
+        } else {
+            self.mg_reload = gap;
         }
-        let Some(m) = v
+        true
+    }
+
+    /// Fires vehicle `i`'s weapon of `priority` for armed seat `seat`
+    /// ([`armed_seats`]' index) at `goal`, else at her crosshair: rounds
+    /// or rockets from its hardpoints in turn, by its weapon's and
+    /// ammunition's templates. The seconds until it may fire again; `None`
+    /// if that seat has no such weapon (or is a tank driver's, whose
+    /// cannon [`Combat::vehicle_fire`] fires).
+    fn fire_mount(
+        &mut self,
+        f: &mut Field<'_>,
+        i: usize,
+        seat: usize,
+        priority: usize,
+        goal: Option<Vec3>,
+    ) -> Option<f32> {
+        let v = f.vehicles.get(i)?;
+        let seats = armed_seats(v);
+        let seat_ix = seat;
+        let &seat = seats.get(seat_ix)?;
+        if seat_ix == 0 && v.spec.cannon() {
+            return None;
+        }
+        let m = v
             .spec
             .armed
             .iter()
             .find(|m| m.seat == seat && m.priority == priority)
-            .cloned()
-        else {
-            return false;
-        };
+            .cloned()?;
+        let gap = m.weapon.gap();
         let (Some(id), false) = (v.id, v.wrecked) else {
-            return true;
+            return Some(gap);
         };
         let Some(body) = f.physics.vehicle_transform(id) else {
-            return true;
+            return Some(gap);
         };
         // Its hardpoints in turn, where the model has them (on the turret,
         // turned with it); else the gun's muzzle, else its nose.
@@ -3454,7 +3486,7 @@ impl Combat {
                 .map_or(Vec3::new(0.0, (lo.y + hi.y) * 0.5, hi.z), |(p, _)| p),
         };
         let from = body.transform_point3(local);
-        let goal = Self::aim_point(f.physics, f.people, f.player, Some(id));
+        let goal = goal.unwrap_or_else(|| Self::aim_point(f.physics, f.people, f.player, Some(id)));
         let forward = body.transform_vector3(Vec3::Z).normalize_or(Vec3::Z);
         let aim = (goal - from).normalize_or(forward);
         let w = &m.weapon;
@@ -3468,12 +3500,6 @@ impl Combat {
                 w.ammo.velocity,
                 w.ammo.burst().map(|b| (b.radius, b.damage))
             );
-        }
-        let gap = w.gap();
-        if priority == 0 {
-            self.reload = gap;
-        } else {
-            self.mg_reload = gap;
         }
         let ammo = w.ammo;
         match w.flight() {
@@ -3548,7 +3574,58 @@ impl Combat {
             }
         }
         alarm(f.people, from);
-        true
+        Some(gap)
+    }
+
+    /// Those riding with her in vehicle `i`'s gunner seats (friendly
+    /// soldiers she called in with the horn: [`People::man_guns`], one to a
+    /// seat with a gun, after the driver's) fire their seat's first weapon
+    /// at the nearest of those fighting her within [`GUNNER_RANGE`], each at
+    /// its weapon's rate ([`m2_engine::weapons::WeaponSpec::gap`]) and
+    /// [`GUNNER_SPREAD`] off (both invented: the text says only that they
+    /// get in, "Get in the gunner's seat").
+    fn gunners_fire(&mut self, f: &mut Field<'_>, dt: f32) {
+        let Some(v) = f
+            .player
+            .driving
+            .and_then(|i| f.vehicles.get(i).map(|v| (i, v)))
+        else {
+            self.gunner_wait.clear();
+            return;
+        };
+        let (i, v) = v;
+        let riders = f
+            .people
+            .gunners()
+            .min(armed_seats(v).len().saturating_sub(1));
+        self.gunner_wait.resize(riders, 0.0);
+        let Some(body) = v.id.and_then(|id| f.physics.vehicle_transform(id)) else {
+            return;
+        };
+        let centre = body.transform_point3(Vec3::ZERO);
+        let target = f
+            .people
+            .npcs
+            .iter()
+            .filter(|n| n.alive && n.soldier)
+            .map(|n| n.character.position + Vec3::Y * 1.2)
+            .filter(|p| p.distance(centre) <= GUNNER_RANGE)
+            .min_by(|a, b| a.distance(centre).total_cmp(&b.distance(centre)));
+        for k in 0..riders {
+            self.gunner_wait[k] -= dt;
+            let seat = k + 1;
+            if self.gunner_wait[k] > 0.0 || seat == self.seat {
+                continue;
+            }
+            let Some(at) = target else {
+                continue;
+            };
+            let off = at.distance(centre) * GUNNER_SPREAD;
+            let aim = at + Vec3::new(self.random(), self.random(), self.random()) * 2.0 * off;
+            if let Some(gap) = self.fire_mount(f, i, seat, 0, Some(aim)) {
+                self.gunner_wait[k] = gap;
+            }
+        }
     }
 
     fn vehicle_fire(&mut self, f: &mut Field<'_>, i: usize, coax: bool) {
