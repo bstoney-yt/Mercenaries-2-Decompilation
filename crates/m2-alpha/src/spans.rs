@@ -28,6 +28,30 @@ pub fn add(name: &'static str, took: Duration) {
     });
 }
 
+/// Times a run of code in sections: each [`mark`](Self::mark) adds the
+/// time since the last (or since [`new`](Self::new)) to its name's.
+#[derive(Debug)]
+pub struct Lap(Instant);
+
+impl Lap {
+    pub fn new() -> Self {
+        Self(Instant::now())
+    }
+
+    /// Ends the section `name` and starts the next.
+    pub fn mark(&mut self, name: &'static str) {
+        let now = Instant::now();
+        add(name, now - self.0);
+        self.0 = now;
+    }
+}
+
+impl Default for Lap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The times summed since last taken, longest first.
 pub fn take() -> Vec<(&'static str, Duration)> {
     let mut spent = SPENT.with_borrow_mut(std::mem::take);

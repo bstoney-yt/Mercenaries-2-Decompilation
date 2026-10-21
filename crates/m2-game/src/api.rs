@@ -511,6 +511,11 @@ impl Pursuit {
     }
 }
 
+/// How long after a honk the friendly faction gates know she is there,
+/// seconds (invented: the gate script needs her within 20 m to judge
+/// her, and the game's text says only that she must honk).
+pub const HONK_HEARD: f32 = 3.0;
+
 /// The scripts' view of the game, and what they asked of it.
 #[derive(Debug, Default)]
 pub struct ScriptWorld {
@@ -671,6 +676,13 @@ pub struct ScriptWorld {
     /// disguises on: how much is left (0..=100) and whether it holds.
     /// `None` out of one.
     pub disguise: Option<(f32, bool)>,
+    /// The friendly faction gates in play: objects the engine runs
+    /// `friendlygate` on ([`crate::mission::OBJECT_SCRIPTS`]).
+    pub gates: HashSet<u32>,
+    /// Seconds the gates still hear her last honk ([`HONK_HEARD`]): until
+    /// then they know her for who she is, and she is a candidate for
+    /// their opening as their script judges her.
+    pub honk_heard: f32,
     /// The player's camera as the game last fed it; `None` until it has.
     pub camera: Option<Camera>,
     /// Objects the game found behind something solid from the camera at
@@ -996,15 +1008,21 @@ impl World for ScriptWorld {
         self.winch.get(&cargo).copied()
     }
     fn labelled(&self, label: &str) -> Vec<u32> {
-        let terms = crate::events::class_terms(label);
+        let alternatives = crate::events::class_alternatives(label);
         let mut out: Vec<u32> = self
             .objects
             .iter()
-            .filter(|(_, o)| o.is_of(&terms))
+            .filter(|(_, o)| alternatives.iter().any(|terms| o.is_of(terms)))
             .map(|(&g, _)| g)
             .collect();
         out.sort_unstable();
         out
+    }
+    fn unheard_at_gate(&self, a: u32, gate: u32) -> bool {
+        let hers = self
+            .player
+            .is_some_and(|p| a == p || self.vehicle_of(p) == Some(a));
+        hers && self.gates.contains(&gate) && self.honk_heard <= 0.0
     }
 
     fn game_state(&self) -> Option<String> {
@@ -1397,6 +1415,47 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&pg, "FastCollectHumans", |w, lua, a| {
         collect(w, lua, a, &["Human", "Soldier", "Civilian"], &[])
+    })?;
+    // Pg.GetObjectsInArea(x, y, z, radius, name): the objects of that
+    // name (a template's label: PirCon002's `"RumJug"`s on its truck's
+    // bed, counted with `table.getn`) within the radius.
+    add(&pg, "GetObjectsInArea", |w, lua, a| {
+        let list = lua.create_table()?;
+        let (Some(x), Some(y), Some(z), Some(r), Some(Value::String(name))) = (
+            num(a.first()),
+            num(a.get(1)),
+            num(a.get(2)),
+            num(a.get(3)),
+            a.get(4),
+        ) else {
+            return values([Value::Table(list)]);
+        };
+        let name = name.to_string_lossy();
+        let label = [
+            m2_assets::name_hash(&name),
+            m2_assets::name_hash(&name.to_ascii_lowercase()),
+        ];
+        // By its label, or by its name (a layer's `RumJug 03`, or the
+        // template name a spawned one carries).
+        let mut found: Vec<u32> = w
+            .objects
+            .iter()
+            .filter(|(_, o)| !o.hidden && o.alive)
+            .filter(|(_, o)| {
+                o.all_labels().iter().any(|l| label.contains(l))
+                    || m2_engine::world::member_stem(&o.name).eq_ignore_ascii_case(&name)
+            })
+            .filter_map(|(&g, _)| {
+                let p = w.place_of(g)?;
+                let d = ((p[0] - x).powi(2) + (p[1] - y).powi(2) + (p[2] - z).powi(2)).sqrt();
+                (d <= r).then_some(g)
+            })
+            .collect();
+        found.sort_unstable();
+        for g in found {
+            list.raw_push(guid_value(Some(g)))?;
+        }
+        values([Value::Table(list)])
     })?;
     add(&pg, "FastCollectTanks", |w, lua, a| {
         collect(w, lua, a, &["Tank"], &[])
@@ -2246,13 +2305,18 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&player, "IsLocal", |_, _, a| {
         values([Value::Boolean(id(a.first()) == Some(1))])
     })?;
-    for name in ["GetAllPlayers", "GetCurrentPlayers"] {
-        add(&player, name, |_, lua, _| {
-            let t = lua.create_table()?;
-            t.raw_push(1)?;
-            values([Value::Table(t)])
-        })?;
-    }
+    // The players, a list the scripts go through (`pairs`, `ipairs`)...
+    add(&player, "GetAllPlayers", |_, lua, _| {
+        let t = lua.create_table()?;
+        t.raw_push(1)?;
+        values([Value::Table(t)])
+    })?;
+    // ...and how many there are, which they compare and count with
+    // (`nPlayers == 2`, `1 < n`; from the scripts' use: PirCon004 did
+    // sums on it and stopped short of its ending).
+    add(&player, "GetCurrentPlayers", |_, _, _| {
+        values([Value::Integer(1)])
+    })?;
 
     let vehicle = lib("Vehicle")?;
     add(&vehicle, "GetDriver", |w, _, a| {
@@ -3820,6 +3884,38 @@ mod tests {
     }
 
     #[test]
+    fn objects_in_an_area_are_found_by_name() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(10, Object::new("RumJug 01", [1.0, 0.0, 0.0]));
+            w.insert(11, Object::new("RumJug 02", [9.0, 0.0, 0.0]));
+            w.insert(12, Object::new("Crate 01", [0.5, 0.0, 0.0]));
+        }
+        let n: i64 = host
+            .lua()
+            .load("return table.getn(Pg.GetObjectsInArea(0, 0, 0, 2, 'RumJug'))")
+            .eval()
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    // The scripts count the players (`nPlayers == 2`, sums on it:
+    // PirCon004) and go through the list of them.
+    #[test]
+    fn one_player_is_counted_and_listed() {
+        let (host, _) = setup();
+        let (n, more, listed): (i64, bool, i64) = host
+            .lua()
+            .load(
+                "local n = Player.GetCurrentPlayers()                  return n * 2, 1 < n, table.getn(Player.GetAllPlayers())",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((n, more, listed), (2, false, 1));
+    }
+
+    #[test]
     fn atmosphere_calls_reach_the_game_and_the_rest_are_stubs() {
         let (host, world) = setup();
         host.complete_libraries(&LIBRARIES).unwrap();
@@ -4166,6 +4262,36 @@ mod tests {
         ask("Player.SetVehicleDisguise(false)");
         assert_eq!(world.borrow().disguise, None);
         assert_eq!(ask("return Player.GetVehicleDisguiseState({})"), Value::Nil);
+    }
+
+    #[test]
+    fn a_label_expression_takes_alternatives_in_brackets() {
+        let (_host, world) = setup();
+        let mut w = world.borrow_mut();
+        w.objects.get_mut(&1).unwrap().labels.push("Hero".into());
+        let mut allied = Object::new("al_veh_m151", [0.0; 3]);
+        allied.labels.extend(["Allied".into(), "Vehicle".into()]);
+        w.insert(60, allied);
+        let mut soldier = Object::new("al_soldier", [0.0; 3]);
+        soldier.labels.push("Allied".into());
+        w.insert(61, soldier);
+        // The friendly gates' filter: the hero, or an Allied vehicle.
+        assert_eq!(w.labelled("Hero||(Allied&&Vehicle)"), vec![1, 60]);
+        assert_eq!(w.labelled("Allied && !Vehicle"), vec![61]);
+    }
+
+    #[test]
+    fn friendly_gates_know_her_only_as_she_honks() {
+        let (_host, world) = setup();
+        let mut w = world.borrow_mut();
+        w.gates.insert(70);
+        w.objects.get_mut(&1).unwrap().vehicle = Some(50);
+        // She and her jeep go unheard by the gate, not by anything else;
+        // others are seen as ever.
+        assert!(w.unheard_at_gate(1, 70) && w.unheard_at_gate(50, 70));
+        assert!(!w.unheard_at_gate(1, 71) && !w.unheard_at_gate(99, 70));
+        w.honk_heard = HONK_HEARD;
+        assert!(!w.unheard_at_gate(1, 70) && !w.unheard_at_gate(50, 70));
     }
 
     #[test]

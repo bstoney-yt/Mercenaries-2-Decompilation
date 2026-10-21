@@ -374,6 +374,7 @@ impl GameData {
         // Entities' templates, to give them their templates' labels.
         let mut templated: Vec<(String, usize, u32)> = Vec::new();
         let mut template_labels: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut template_scripts: HashMap<u32, u32> = HashMap::new();
         // Faction zones' faction templates, and every template's name.
         let mut zone_factions: Vec<(String, usize, u32)> = Vec::new();
         let mut template_names: HashMap<u32, String> = HashMap::new();
@@ -411,6 +412,7 @@ impl GameData {
                     && let Ok(db) = Layer::parse(asset)
                 {
                     template_labels = labels_of(db.component("Label"));
+                    template_scripts = db.hashes("ObjectScript");
                     template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
                     template_names = db
@@ -473,9 +475,14 @@ impl GameData {
             }
         }
         for (layer, i, template) in &templated {
+            let e = &mut data.layers.get_mut(layer).expect("indexed above")[*i];
             if let Some(l) = template_labels.get(template) {
-                let e = &mut data.layers.get_mut(layer).expect("indexed above")[*i];
                 e.labels.extend(l.iter().copied());
+            }
+            // An entity without a script of its own runs its template's:
+            // the faction gates' (`_ocoutpost_wallgate`, `friendlygate`).
+            if e.script.is_none() {
+                e.script = template_scripts.get(template).copied();
             }
         }
         for (layer, i, template) in zone_factions {
@@ -616,6 +623,8 @@ pub struct Mission {
     movie_out: bool,
     /// How black `MrxGui`'s fade has the screen ([`FADE`]), 0 to 1.
     black: f32,
+    /// [`FADE`], compiled once (on the first tick) rather than every tick.
+    fade: Option<mlua::Function>,
 }
 
 impl Mission {
@@ -758,6 +767,7 @@ impl Mission {
             flown: false,
             movie_out: false,
             black: 0.0,
+            fade: None,
         };
         mission.settle("set-up");
         Ok(mission)
@@ -944,6 +954,10 @@ impl Mission {
     pub fn tick(&mut self, dt: f64) {
         self.now += dt;
         let now = self.now;
+        {
+            let mut w = self.world.borrow_mut();
+            w.honk_heard = (w.honk_heard - dt as f32).max(0.0);
+        }
         // Streaming is instant here: a waiting state ends a second after
         // it was asked for, and the scripts hear that it did.
         {
@@ -1006,13 +1020,23 @@ impl Mission {
                 ),
             });
         }
-        match self
-            .host
-            .lua()
-            .load(FADE)
-            .set_name("=m2 fade")
-            .call::<f32>((dt, FADE_WIPE))
-        {
+        if self.fade.is_none() {
+            match self
+                .host
+                .lua()
+                .load(FADE)
+                .set_name("=m2 fade")
+                .into_function()
+            {
+                Ok(f) => self.fade = Some(f),
+                Err(e) => self.log.push(format!(
+                    "  t={now:.1} fade: {}",
+                    first_lines(&e.to_string())
+                )),
+            }
+        }
+        let faded = self.fade.as_ref().map(|f| f.call::<f32>((dt, FADE_WIPE)));
+        match faded.unwrap_or(Ok(self.black)) {
             Ok(b) => {
                 if (b >= 1.0) != (self.black >= 1.0) {
                     self.log.push(format!(
@@ -1363,12 +1387,24 @@ impl Mission {
             .map_or(&[], |e| e.path.as_slice())
     }
 
+    /// She honked: the friendly faction gates hear it for
+    /// [`api::HONK_HEARD`] seconds.
+    pub fn honk(&mut self) {
+        self.world.borrow_mut().honk_heard = api::HONK_HEARD;
+    }
+
     /// Reports where an object is in play (a vehicle that was driven or
     /// pushed about).
     pub fn place(&mut self, guid: u32, at: [f32; 3], yaw: f32) {
-        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+        let mut w = self.world.borrow_mut();
+        if let Some(o) = w.objects.get_mut(&guid) {
             o.position = at;
             o.yaw = yaw;
+        } else if let Some(e) = w.entities.get_mut(&guid) {
+            // A layer's entity no script has made an object of yet (a
+            // truck's rum jugs riding on it): where the scripts' area
+            // searches find it.
+            *e = at;
         }
     }
 
@@ -2327,6 +2363,9 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             o.label_hashes.clone_from(&e.labels);
             o.faction = e.faction;
             w.insert(e.guid, o);
+            if e.script == Some(FRIENDLY_GATE) {
+                w.gates.insert(e.guid);
+            }
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());
             }
@@ -2338,6 +2377,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             }
         } else {
             w.crews.remove(&e.guid);
+            w.gates.remove(&e.guid);
             w.crew_riders.retain(|_, v| *v != e.guid);
             w.objects.remove(&e.guid);
             w.regions.remove(&e.guid);
@@ -2384,7 +2424,23 @@ fn seat_crew(
 /// `FactionZone` makes each zone an instance that enables itself: the zone
 /// on the radar and PDA map, and a watch on the player crossing it that
 /// tells the HUD (`TrespassStateChange`).
-pub const OBJECT_SCRIPTS: [(&str, u32); 1] = [("FactionZone", 0x6726_7cc1)];
+/// `friendlygate` makes each faction base gate open and shut by itself:
+/// within 20 m of it, the hero (taken for the faction of the vehicle
+/// she is disguised in, else the PMC's) or one of its faction's
+/// vehicles; open while one is there whom the gate's faction is at
+/// least `Friendly` to (the PMC only while the faction's attitude to it
+/// can change, at least `Neutral`), unless a script locked it (its
+/// `_TestAttitude`, `_EvaluateCandidates`, `LockGate`), and shut as the
+/// last goes 40 m off. Opening, a soldier of its faction within 25 m
+/// says his `GateYes01` line. The engine tells it of her only after she
+/// honks ([`crate::api::ScriptWorld::honk_heard`]).
+pub const OBJECT_SCRIPTS: [(&str, u32); 2] = [
+    ("FactionZone", 0x6726_7cc1),
+    ("friendlygate", FRIENDLY_GATE),
+];
+
+/// `friendlygate`'s module hash.
+pub const FRIENDLY_GATE: u32 = 0x6d4f_9301;
 
 /// Runs the object scripts of `entities` (see [`OBJECT_SCRIPTS`]) as their
 /// layer comes in (`load`) or goes. Returns what failed.
@@ -2432,6 +2488,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_object_scripts_are_named_by_their_hash() {
+        for (name, hash) in OBJECT_SCRIPTS {
+            assert_eq!(name_hash(name), hash, "{name}");
+        }
+    }
+
+    #[test]
     fn landing_zones_come_from_names() {
         assert_eq!(landing_zone("01_pmc_hq_lz_playerone"), Some((1, 1)));
         assert_eq!(landing_zone("30_chi_hqb_lz_PlayerTwo"), Some((30, 2)));
@@ -2455,6 +2518,14 @@ mod tests {
         m.set_subtitles(false);
         m.set_tutorials(true);
         assert_eq!(ask(&m), [false, true]);
+    }
+
+    #[test]
+    fn a_layer_entity_is_placed_where_the_game_says() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.world.borrow_mut().entities.insert(5, [0.0; 3]);
+        m.place(5, [1.0, 2.0, 3.0], 0.0);
+        assert_eq!(m.world.borrow().entities[&5], [1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -2947,6 +3018,50 @@ mod tests {
         )
         .unwrap();
         assert!(m.crews_aboard().is_empty());
+    }
+
+    #[test]
+    fn each_crew_aboard_is_its_own_objects_riders_by_object() {
+        // Two crewed objects at once (the HQ's starter and the villa's
+        // tank): each lists only its own riders, the objects in guid
+        // order, with others (the island's) about that ride nothing.
+        let hq = Entity {
+            guid: 0xc73ad,
+            name: "HqInterior".into(),
+            crew: vec![("a651ff78".into(), "Fiona Taylor".into())],
+            ..villa_tank()
+        };
+        let tank = villa_tank();
+        let mut data = GameData::default();
+        data.layers
+            .insert("layers".into(), vec![tank.clone(), hq.clone()]);
+        let m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        for g in 0x1000..0x1400 {
+            m.world()
+                .borrow_mut()
+                .insert(g, crate::api::Object::new("VZ Soldier", [0.0; 3]));
+        }
+        place(m.world(), &[tank, hq], true);
+        let aboard = m.crews_aboard();
+        let objects: Vec<u32> = aboard.iter().map(|a| a.0).collect();
+        assert_eq!(objects, [0xc73ad, 0xfaa53]);
+        let seats = |i: usize| -> Vec<(String, String)> {
+            let mut s: Vec<_> = aboard[i]
+                .1
+                .iter()
+                .map(|(seat, _, t)| (seat.clone(), t.clone()))
+                .collect();
+            s.sort();
+            s
+        };
+        assert_eq!(seats(0), [("a651ff78".into(), "Fiona Taylor".into())]);
+        assert_eq!(
+            seats(1),
+            [
+                ("seat_driver".into(), "VZ Tank Commander".into()),
+                ("seat_gunner".into(), "VZ Soldier".into()),
+            ]
+        );
     }
 
     #[test]

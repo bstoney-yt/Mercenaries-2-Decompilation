@@ -208,6 +208,7 @@ impl JobRun {
                     at: Vec3::from(o.position),
                     alive: o.alive,
                     mission: Some(MarkFor::Id(self.id.clone())),
+                    secondary: true,
                 })
             })
             .collect()
