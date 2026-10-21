@@ -787,6 +787,10 @@ pub struct MissionLink {
     /// Blasts since the scripts last ran, and support strikes' bombs.
     blasts: Vec<Vec3>,
     bombs: Vec<Vec3>,
+    /// The contract's destroy objectives' targets, marked or not, and when
+    /// they are next read again (seconds).
+    unmarked: Vec<u32>,
+    unmarked_for: f32,
     vehicles: Fleet,
     /// Seconds she has been out of her vehicle with followers aboard
     /// ([`ride_along`]).
@@ -953,6 +957,8 @@ impl MissionLink {
             blasts: Vec::new(),
             tutorial: None,
             bombs: Vec::new(),
+            unmarked: Vec::new(),
+            unmarked_for: 0.0,
             vehicles: Fleet::default(),
             out_for: 0.0,
             squads: None,
@@ -2066,14 +2072,27 @@ impl MissionLink {
             }
             // Targets to destroy: soldiers stand at those that are spawns,
             // and blasts close to the rest (gates, buildings) destroy them.
+            // Those the contract's destroy objectives name with no marker
+            // over them count too (PmcCon031's 50 columns), checked a few
+            // times a second: the query walks the scripts' tasks.
+            self.unmarked_for -= STEP;
+            if self.unmarked_for <= 0.0 {
+                self.unmarked_for = UNMARKED_EVERY;
+                self.unmarked = contract_destroy_targets(mission);
+            }
             let targets: Vec<(u32, Vec3)> = {
                 let w = mission.world().borrow();
-                w.hud
+                let marked = w
+                    .hud
                     .markers
                     .values()
                     .filter(|m| m.icon.contains("destroy"))
-                    .filter_map(|m| {
-                        let g = m.target?;
+                    .filter_map(|m| m.target);
+                let mut seen = HashSet::new();
+                marked
+                    .chain(self.unmarked.iter().copied())
+                    .filter(|g| seen.insert(*g))
+                    .filter_map(|g| {
                         let o = w.objects.get(&g).filter(|o| o.alive)?;
                         Some((g, Vec3::from(o.position)))
                     })
@@ -2969,30 +2988,10 @@ impl MissionLink {
         let State::Running(mission) = &self.state else {
             return Vec::new();
         };
-        let found = match mission
-            .lua()
-            .load(CONTRACT_DESTROY)
-            .set_name("=contract destroy")
-            .eval::<Option<mlua::Table>>()
-        {
-            Ok(found) => found,
-            Err(e) => {
-                eprintln!(
-                    "mission: contract destroy: {}",
-                    m2_game::mission::first_lines(&e.to_string())
-                );
-                return Vec::new();
-            }
-        };
+        let found = contract_destroy_targets(mission);
         let w = mission.world().borrow();
         found
             .into_iter()
-            .flat_map(|t| {
-                t.sequence_values::<mlua::Value>()
-                    .flatten()
-                    .collect::<Vec<_>>()
-            })
-            .filter_map(|v| m2_game::events::as_guid(&v))
             .filter(|g| !marks.iter().any(|m| m.target == *g))
             .filter_map(|g| {
                 let o = w.objects.get(&g).filter(|o| o.alive)?;
@@ -3685,6 +3684,10 @@ end
 return walk(m, 0)
 "#;
 
+/// How often the contract's destroy targets are read again (seconds;
+/// invented).
+const UNMARKED_EVERY: f32 = 0.5;
+
 /// A race's timer targets this near its gate now up (metres) are blown
 /// up on the way to it (invented).
 const RACE_TIMER_NEAR: f32 = 120.0;
@@ -3716,6 +3719,35 @@ end
 walk(m, 0)
 return out
 "#;
+
+/// The targets of the current contract's active destroy objectives
+/// ([`CONTRACT_DESTROY`]), marked or not.
+fn contract_destroy_targets(mission: &Mission) -> Vec<u32> {
+    let found = match mission
+        .lua()
+        .load(CONTRACT_DESTROY)
+        .set_name("=contract destroy")
+        .eval::<Option<mlua::Table>>()
+    {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!(
+                "mission: contract destroy: {}",
+                m2_game::mission::first_lines(&e.to_string())
+            );
+            return Vec::new();
+        }
+    };
+    found
+        .into_iter()
+        .flat_map(|t| {
+            t.sequence_values::<mlua::Value>()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|v| m2_game::events::as_guid(&v))
+        .collect()
+}
 
 /// She has got where the scripts sent her within this, metres (invented:
 /// the autoplay's and the people's own arrival distance).
