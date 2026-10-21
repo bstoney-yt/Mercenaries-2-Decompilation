@@ -2675,6 +2675,7 @@ impl MissionLink {
                     eprintln!(
                         "mission: contract done: its pursuits end, their helicopters turn back"
                     );
+                    log_recruits(mission, "contract completed");
                 }
             }
             if let Some(line) = tutorial(mission) {
@@ -4412,6 +4413,28 @@ fn ground_under(game: &Game, at: Vec3) -> Vec3 {
         .as_ref()
         .and_then(|w| w.physics.cast_ray(top, Vec3::NEG_Y, ABOVE * 2.0))
         .map_or(at, |(d, _)| top - Vec3::Y * d)
+}
+
+/// Logs who has joined her PMC and what they let her call in
+/// ([`m2_game::support::recruits`]), saying when.
+fn log_recruits(mission: &Mission, when: &str) {
+    match mission.recruits() {
+        Ok(r) => eprintln!(
+            "mission: recruits ({when}): copter {}, mechanic {}, pilot {}; starters {:?}; \
+             support items she may call in {}, refused for a missing recruit {}",
+            r.copter, r.mechanic, r.pilot, r.starters, r.equippable, r.refused
+        ),
+        Err(e) => eprintln!("mission: recruits ({when}): {e}"),
+    }
+}
+
+impl MissionLink {
+    /// Logs who has joined her PMC now ([`log_recruits`]).
+    pub fn log_recruits(&self, when: &str) {
+        if let State::Running(m) = &self.state {
+            log_recruits(m, when);
+        }
+    }
 }
 
 /// The factions whose contacts keep a shop, as the scripts name them

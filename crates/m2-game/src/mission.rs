@@ -707,6 +707,14 @@ impl Mission {
 
         let host = ScriptHost::new()?;
         host.stub_missing_globals()?;
+        host.script_names(library.scripts().iter().flat_map(|s| {
+            s.chunk
+                .main
+                .names(s.chunk.version)
+                .into_iter()
+                .filter(|(u, _)| *u == m2_assets::lua::NameUse::SetGlobal)
+                .map(|(_, n)| n)
+        }))?;
         api::install(host.lua(), &world)?;
         host.complete_libraries(&api::LIBRARIES)?;
         let events = Events::default();
@@ -1464,6 +1472,12 @@ impl Mission {
     /// of each item ([`crate::support`]).
     pub fn support_items(&self) -> Vec<crate::support::SupportItem> {
         crate::support::items(self.host.lua()).unwrap_or_default()
+    }
+
+    /// Who has joined her PMC and what that lets her call in
+    /// ([`crate::support::recruits`]).
+    pub fn recruits(&self) -> mlua::Result<crate::support::Recruits> {
+        crate::support::recruits(self.host.lua())
     }
 
     /// Her cash and fuel as the scripts hold them (`MrxPmc.GetCashQty`,

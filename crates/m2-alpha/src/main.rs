@@ -4879,6 +4879,9 @@ fn mission_for_screenshot(
             rows.join(", ")
         );
     }
+    if auto.is_some() {
+        link.log_recruits("at the end");
+    }
     if let Some(a) = &auto {
         eprintln!(
             "autoplay: {}{}",

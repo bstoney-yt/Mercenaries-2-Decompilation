@@ -4754,6 +4754,17 @@ mod tests {
     }
 
     #[test]
+    fn the_current_players_are_a_count_and_all_players_a_list() {
+        let (host, _world) = setup();
+        let (more, n): (bool, usize) = host
+            .lua()
+            .load("return 1 < Player.GetCurrentPlayers(), #Player.GetAllPlayers()")
+            .eval()
+            .unwrap();
+        assert_eq!((more, n), (false, 1));
+    }
+
+    #[test]
     fn the_scripts_save_requests_reach_the_game_with_their_slots() {
         let (host, world) = setup();
         host.lua()
