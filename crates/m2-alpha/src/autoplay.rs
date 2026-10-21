@@ -167,6 +167,7 @@ const CARGO_NEAR: f32 = 100.0;
 /// She clears them for at most this long, seconds (invented).
 const GUARD_MOST: f32 = 90.0;
 const ONCOMING_SIDE: f32 = 3.0;
+const ONCOMING_SECONDS: f32 = 3.0;
 /// She steers round a vehicle standing within this ahead, metres
 /// (invented).
 const AHEAD_STANDING: f32 = 20.0;
@@ -1376,7 +1377,7 @@ impl Autoplay {
         // Another vehicle coming the other way in her lane: she keeps to
         // the right of it and eases off, as a driver would (PirCon002's
         // laden truck met a car head-on at 22 m/s closing, round 58).
-        let oncoming = oncoming(game, i, m);
+        let oncoming = oncoming(game, i, m, speed);
         let angle = if oncoming {
             angle.max(0.0) + SWERVE
         } else {
@@ -1407,8 +1408,10 @@ impl Autoplay {
         }
         // And she gives way to a vehicle on course to cross ahead of her
         // (PirCon004 round 72: a car crossing her road at speed wrecked
-        // the organ truck, 35.9 m/s closing).
-        if laden && crossing(game, i, m) {
+        // the organ truck, 35.9 m/s closing); in a boat too (GurCon003
+        // round 81: a pleasure boat wrecked her race boat, 34.8 m/s).
+        let boat = game.scene.vehicles[i].spec.is_boat();
+        if (laden || boat) && crossing(game, i, m) {
             throttle = if speed > 1.0 { -1.0 } else { 0.0 };
         }
         // Stuck against something: back out, turning towards the way on.
@@ -2755,10 +2758,12 @@ fn cargo_near(game: &Game, at: Vec3) -> Option<Vec3> {
         .find(|c| c.with_y(0.0).distance(at.with_y(0.0)) < CARGO_CLEAR)
 }
 
-/// Whether a vehicle other than `i` (whose place is `m`) is ahead of it
-/// within [`ONCOMING_AHEAD`] metres, within [`ONCOMING_SIDE`] of its line,
-/// heading the other way.
-fn oncoming(game: &Game, i: usize, m: Mat4) -> bool {
+/// Whether a vehicle other than `i` (whose place is `m`, going `speed`)
+/// is ahead of it within [`ONCOMING_AHEAD`] metres, or as far as it goes
+/// in [`ONCOMING_SECONDS`], within [`ONCOMING_SIDE`] of its line, heading
+/// the other way.
+fn oncoming(game: &Game, i: usize, m: Mat4, speed: f32) -> bool {
+    let reach = ONCOMING_AHEAD.max(speed.abs() * ONCOMING_SECONDS);
     let to_local = m.inverse();
     let forward = m.transform_vector3(Vec3::Z).with_y(0.0).normalize_or_zero();
     (0..game.scene.vehicles.len())
@@ -2767,10 +2772,7 @@ fn oncoming(game: &Game, i: usize, m: Mat4) -> bool {
         .any(|t| {
             let l = to_local.transform_point3(t.w_axis.truncate());
             let theirs = t.transform_vector3(Vec3::Z).with_y(0.0).normalize_or_zero();
-            l.z > 0.0
-                && l.z < ONCOMING_AHEAD
-                && l.x.abs() < ONCOMING_SIDE
-                && theirs.dot(forward) < -0.5
+            l.z > 0.0 && l.z < reach && l.x.abs() < ONCOMING_SIDE && theirs.dot(forward) < -0.5
         })
 }
 
