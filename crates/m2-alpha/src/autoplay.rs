@@ -1467,7 +1467,7 @@ impl Autoplay {
         // And round a vehicle standing in her way, to the side it isn't
         // on (PirCon004 round 78: her truck ran into a parked pickup and
         // a trailer by the drop-off, close by the way planned round them).
-        let standing = standing_ahead(game, i, m);
+        let standing = standing_ahead(game, i, m, speed);
         let angle = match standing {
             Some(x) => angle + if x > 0.0 { SWERVE } else { -SWERVE },
             None => angle,
@@ -2730,16 +2730,19 @@ fn vantage(
 
 /// Vehicle `vehicles[i]`'s model to world, if placed.
 /// How far to the side (her left, +) the nearest vehicle standing still
-/// within [`AHEAD_STANDING`] ahead of vehicle `i` (whose place is `m`)
-/// and within [`ONCOMING_SIDE`] of her line is, if one is.
-fn standing_ahead(game: &Game, i: usize, m: Mat4) -> Option<f32> {
+/// within [`AHEAD_STANDING`] ahead of vehicle `i` (whose place is `m`,
+/// going `speed`), or as far as it goes in [`ONCOMING_SECONDS`], and
+/// within [`ONCOMING_SIDE`] of her line is, if one is (GurCon003 round 83:
+/// her race boat ran into a fishing boat turning on its path at 23 m/s).
+fn standing_ahead(game: &Game, i: usize, m: Mat4, speed: f32) -> Option<f32> {
+    let reach = AHEAD_STANDING.max(speed.abs() * ONCOMING_SECONDS);
     let to_local = m.inverse();
     (0..game.scene.vehicles.len())
         .filter(|&j| j != i)
         .filter_map(|j| vehicle_state(game, j))
         .filter(|(_, speed)| speed.abs() <= PARKED_SPEED)
         .map(|(t, _)| to_local.transform_point3(t.w_axis.truncate()))
-        .filter(|l| l.z > 0.0 && l.z < AHEAD_STANDING && l.x.abs() < ONCOMING_SIDE)
+        .filter(|l| l.z > 0.0 && l.z < reach && l.x.abs() < ONCOMING_SIDE)
         .min_by(|a, b| a.z.total_cmp(&b.z))
         .map(|l| l.x)
 }
