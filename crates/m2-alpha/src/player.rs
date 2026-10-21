@@ -172,6 +172,10 @@ pub struct Intent {
     pub use_pressed: bool,
     /// Turn an overturned vehicle back up.
     pub right_vehicle: bool,
+    /// The horn held, driving: the melee's key, which the game's texts
+    /// name `[honk]` as they name it `[bash]` (both the B button,
+    /// [`m2_game::gui_runtime::button_glyph`]).
+    pub honk: bool,
     /// Camera turn, radians: (yaw, pitch).
     pub look: Vec2,
     /// Weapons.
@@ -200,6 +204,7 @@ impl Intent {
             lower: input.held(Action::MoveDown),
             use_pressed: input.take_pressed(Action::Use),
             right_vehicle: input.take_pressed(Action::Reset),
+            honk: input.held(Action::Melee),
             look,
             trigger: Trigger {
                 fire: input.held(Action::Fire),

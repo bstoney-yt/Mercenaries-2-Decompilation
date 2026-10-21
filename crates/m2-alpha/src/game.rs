@@ -220,6 +220,12 @@ pub struct Game {
     pub reporters: Vec<(u32, &'static str, f32)>,
     /// Whether an army pursued her last frame.
     pub pursued: bool,
+    /// The horn held this tick (driving), and its presses not yet taken
+    /// ([`Game::take_honks`]).
+    pub honking: bool,
+    honks: u32,
+    /// Her vehicle disguise ([`crate::disguise`]).
+    pub disguise: crate::disguise::Disguise,
     /// Seconds the scripts asked her pad to shake (`Pg.Rumble`), for the
     /// pad to take.
     pub rumble: f64,
@@ -382,6 +388,9 @@ impl Game {
             attitude_wait: 0.0,
             reporters: Vec::new(),
             pursued: false,
+            honking: false,
+            honks: 0,
+            disguise: crate::disguise::Disguise::default(),
             rumble: 0.0,
             actions: Vec::new(),
             scripts_seated: false,
@@ -976,6 +985,7 @@ impl Game {
                     .and_then(|i| scene.vehicles.get(i))
                     .and_then(|v| v.id.map(|id| (id, v)));
                 self.throttle = 0.0;
+                let was_honking = std::mem::take(&mut self.honking);
                 // In a gunner's seat nobody drives: it stops.
                 let gunner = self.combat.seat > 0;
                 if let Some((id, v)) = id
@@ -995,6 +1005,11 @@ impl Game {
                     && !v.wrecked
                 {
                     self.throttle = intent.movement.y;
+                    // The horn, as long as it is held; each press counts.
+                    self.honking = intent.honk;
+                    if self.honking && !was_honking {
+                        self.honks += 1;
+                    }
                     physics.drive(
                         id,
                         VehicleControls {
@@ -2120,7 +2135,15 @@ impl Game {
                 .max_speed
                 .unwrap_or(if v.spec.tracked { 14.0 } else { 32.0 }),
             throttle: self.throttle,
+            horn: self.honking,
+            heavy: heavy_horn(&v.spec.kind, &v.spec.label, v.spec.tracked),
         })
+    }
+
+    /// The horn presses since the last call (the faction gates, the
+    /// disguise and the friendly soldiers hear each one).
+    pub fn take_honks(&mut self) -> u32 {
+        std::mem::take(&mut self.honks)
     }
 
     /// Switches between walking and flying (a developer's aid, `--dev`).
@@ -3263,6 +3286,20 @@ fn log_floor(props: &Props, physics: &Physics, at: Vec3) {
     }
 }
 
+/// Whether a vehicle of `kind` named `label` whose bank holds no horn is
+/// heard with the lorry's (tracked ones, lorries, buses, the APCs), not
+/// the car's (invented: which spare horn the game gives such a vehicle,
+/// if any, is not in the data).
+pub fn heavy_horn(kind: &str, label: &str, tracked: bool) -> bool {
+    let key = format!("{kind} {label}").to_lowercase();
+    tracked
+        || [
+            "truck", "lorry", "bus", "semi", "apc", "lav", "stryker", "tank",
+        ]
+        .iter()
+        .any(|w| key.contains(w))
+}
+
 /// Whether someone sits in the driver's seat of a crew.
 /// Whether getting into a vehicle whose template's physics is `kind`
 /// earns her vehicle remark ([`combat::Remark::Vehicle`]): her lines for
@@ -3553,6 +3590,15 @@ mod tests {
         let seat = |s: &str| (s.to_owned(), "VZ Tank Commander".to_owned());
         assert!(super::has_driver(&[seat("Gunner"), seat("seat_driver")]));
         assert!(!super::has_driver(&[seat("Gunner")]));
+    }
+
+    #[test]
+    fn heavy_vehicles_borrow_the_lorrys_horn_others_the_cars() {
+        assert!(super::heavy_horn("car", "Transport Truck", false));
+        assert!(super::heavy_horn("car", "LAV III (Base)", false));
+        assert!(super::heavy_horn("tank", "ZTZ98", true));
+        assert!(!super::heavy_horn("car", "Valiant (4door)", false));
+        assert!(!super::heavy_horn("boat", "RIB36", false));
         assert!(!super::has_driver(&[]));
     }
 

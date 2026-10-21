@@ -525,6 +525,20 @@ __m2_wrap_dialogs()
 /// relations below -33 of -100..100, from the scripts' `_tAttitudes`),
 /// by the manager's abbreviations; `None` before the manager runs.
 fn hostile_factions(m: &Mission) -> Option<HashSet<&'static str>> {
+    let hostile = factions_at(m, "hostile")?
+        .into_iter()
+        .chain(["Vza"])
+        .collect();
+    // The Venezuelans always fight her (the faction manager leaves them
+    // out of reporting: "VZ, civilian, or reporting is disabled").
+    Some(hostile)
+}
+
+/// The factions whose attitude to the PMC the scripts have at `label`
+/// (`hostile`, `friendly`: `MrxFactionManager.GetAttitudeLabel(faction,
+/// "Pmc")`), by the manager's abbreviations; `None` before the manager
+/// runs.
+fn factions_at(m: &Mission, label: &str) -> Option<HashSet<&'static str>> {
     let labels: Option<mlua::Table> = m
         .lua()
         .load(
@@ -541,20 +555,102 @@ fn hostile_factions(m: &Mission) -> Option<HashSet<&'static str>> {
         .ok()
         .flatten();
     let labels = labels?;
-    let hostile = ["All", "Chi", "Gur", "Oil", "Pir", "Vza"]
-        .into_iter()
-        .filter(|f| {
-            labels
-                .get::<Option<String>>(*f)
-                .ok()
-                .flatten()
-                .is_some_and(|l| l.eq_ignore_ascii_case("hostile"))
+    Some(
+        ["All", "Chi", "Gur", "Oil", "Pir", "Vza"]
+            .into_iter()
+            .filter(|f| {
+                labels
+                    .get::<Option<String>>(*f)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|l| l.eq_ignore_ascii_case(label))
+            })
+            .collect(),
+    )
+}
+
+/// How near her a friendly soldier hears her horn, metres (invented).
+const ALLIES_HEAR: f32 = 20.0;
+
+/// She honked: soldiers of the factions friendly to her (their attitude
+/// to the PMC `Friendly`, `MrxFactionManager.GetAttitudeLabel`) within
+/// [`ALLIES_HEAR`] jump into her vehicle's free gunner seats, nearest
+/// first, and ride with her (out of play, as followers do: getting out
+/// with her, [`ride_along`]). From the game's text ("Making a faction
+/// happy has benefits: Their faction units will jump in your vehicle if
+/// you honk your horn"; `Tutorial.VehicleHorn.Attract`: "Press [cancel]
+/// to call allies into your vehicle"); that they take the seats with a
+/// gun ([`crate::combat::armed_seats`] but the driver's) is inferred, the
+/// reach invented. Riding, they don't fire yet.
+fn call_allies(game: &mut Game, mission: &mut Mission, riding: Option<u32>) {
+    let Some(p) = game.scene.player.as_ref() else {
+        return;
+    };
+    let her = p.character.position;
+    let Some(v) = p.driving.and_then(|i| game.scene.vehicles.get(i)) else {
+        return;
+    };
+    let free =
+        (crate::combat::armed_seats(v).len() - 1).saturating_sub(game.scene.people.aboard().len());
+    if free == 0 {
+        return;
+    }
+    let friends = factions_at(mission, "friendly").unwrap_or_default();
+    if friends.is_empty() {
+        return;
+    }
+    let mut near: Vec<(f32, u32)> = game
+        .scene
+        .people
+        .npcs
+        .iter()
+        .filter(|n| n.alive && !n.soldier && n.faction.is_some_and(|f| friends.contains(f)))
+        .filter_map(|n| {
+            let d = n.character.position.distance(her);
+            (d <= ALLIES_HEAR).then_some((d, n.spawn?))
         })
-        .chain(["Vza"])
         .collect();
-    // The Venezuelans always fight her (the faction manager leaves them
-    // out of reporting: "VZ, civilian, or reporting is disabled").
-    Some(hostile)
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let Some(world) = &mut game.scene.world else {
+        return;
+    };
+    for (_, g) in near.into_iter().take(free) {
+        if game.scene.people.board(&mut world.physics, g, true, her) {
+            if let Some(v) = riding {
+                mission.seat_in(g, v);
+            }
+            eprintln!("people: {g:08x} hears her horn and jumps in her vehicle");
+        }
+    }
+}
+
+/// The faction of the vehicle she rides, by the faction manager's
+/// abbreviation (`MrxFactionManager.GetFactionAbbrev` of
+/// `MrxUtil.GetFaction(Vehicle.GetFromRider(her))`, as
+/// `GetPerceivedFaction` takes a disguised rider's): `None` on foot, in a
+/// civilian's or a PMC vehicle, or before the scripts run.
+fn vehicle_faction(m: &Mission) -> Option<&'static str> {
+    let abbrev: Option<String> = m
+        .lua()
+        .load(
+            "local u, f = rawget(_G, 'MrxUtil'), rawget(_G, 'MrxFactionManager') \
+             if type(u) ~= 'table' or type(f) ~= 'table' then return nil end \
+             local p = Player.GetLocalCharacter() \
+             local v = p and Vehicle.GetFromRider(p) \
+             if v == nil then return nil end \
+             local ok, faction = pcall(u.GetFaction, v) \
+             if not ok or faction == nil then return nil end \
+             local ok2, a = pcall(f.GetFactionAbbrev, faction) \
+             if ok2 and type(a) == 'string' then return a end \
+             return nil",
+        )
+        .eval()
+        .ok()
+        .flatten();
+    let abbrev = abbrev?;
+    ["All", "Chi", "Gur", "Oil", "Pir", "Vza"]
+        .into_iter()
+        .find(|f| f.eq_ignore_ascii_case(&abbrev))
 }
 
 /// Runs the callback of dialog box `seq` ([`DIALOG_BOXES`]) for option
@@ -1586,7 +1682,9 @@ impl MissionLink {
         // report: the first one of a faction not already reporting, a
         // witness of theirs near it (not the victim) is offered to the
         // faction manager ([`m2_game::report`]).
-        for inf in game.scene.people.take_infractions() {
+        let infractions = game.scene.people.take_infractions();
+        let hurt_someone = !infractions.is_empty();
+        for inf in infractions {
             let label = crate::npc::faction_label(inf.faction);
             mission.record_infraction(label, inf.kind);
             if inf.faction == "Vza" || game.reporters.iter().any(|r| r.1 == inf.faction) {
@@ -1616,6 +1714,43 @@ impl MissionLink {
                 }
             }
         }
+        // Her vehicle disguise ([`crate::disguise`]): the faction of the
+        // vehicle she rides, as the scripts have it; the faction's
+        // soldiers take her for one of theirs while it holds, and the
+        // scripts and the HUD's gauge hear how it stands.
+        let honks = game.take_honks();
+        if honks > 0 {
+            mission.honk();
+            call_allies(game, mission, self.vehicles.riding);
+        }
+        let riding = game.scene.player.as_ref().and_then(|p| p.driving);
+        let faction = riding.and_then(|_| vehicle_faction(mission));
+        let her = game.scene.player.as_ref().map(|p| p.character.position);
+        let near = match (faction, her) {
+            (Some(f), Some(at)) => game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .filter(|n| n.alive && n.faction == Some(f))
+                .filter(|n| n.character.position.distance(at) <= crate::disguise::NEAR)
+                .count(),
+            _ => 0,
+        };
+        let enabled = mission.world().borrow().vehicle_disguise;
+        let state = game.disguise.update(
+            crate::disguise::Tick {
+                enabled,
+                vehicle: riding,
+                faction,
+                honks,
+                near,
+                hurt_someone: hurt_someone && riding.is_some(),
+            },
+            dt,
+        );
+        mission.world().borrow_mut().disguise = state;
+        game.scene.people.set_disguise(game.disguise.holds());
         // Reporters: each calls in, then gets through (state 1) and the
         // faction manager's own timer finishes his report; one killed
         // first, or that it never finishes with, is stopped (state 2).

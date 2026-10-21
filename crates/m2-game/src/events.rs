@@ -67,6 +67,13 @@ pub trait World {
     fn winch(&self, _cargo: u32) -> Option<Option<u32>> {
         None
     }
+    /// Whether `gate`, a friendly faction gate (`friendlygate`), doesn't
+    /// know `a` is there: the player, or the vehicle she rides, when she
+    /// hasn't honked lately (the gates' tutorial: "The faction won't know
+    /// who you are or open their gate unless you honk your horn").
+    fn unheard_at_gate(&self, _a: u32, _gate: u32) -> bool {
+        false
+    }
     /// Whether it got into (or out of) its seat at once, put there by a
     /// script.
     fn seated_instantly(&self, _guid: u32) -> bool {
@@ -771,9 +778,19 @@ fn guid(t: &Table, i: i64) -> Option<u32> {
 /// Whether an object with `labels` is of class `expr`: labels joined by
 /// `&&`, each maybe negated with `!` (`"Tank && !APC"`), in any case.
 pub(crate) fn class_matches(expr: &str, labels: &[u32]) -> bool {
-    class_terms(expr)
+    class_alternatives(expr)
         .iter()
-        .all(|&(h, not)| labels.contains(&h) != not)
+        .any(|terms| terms.iter().all(|&(h, not)| labels.contains(&h) != not))
+}
+
+/// A class expression's alternatives, each as [`class_terms`] reads one:
+/// `||` between them, at the top or in brackets (the friendly gates'
+/// filter, `"Hero||(Allied&&Vehicle)"`: the hero, or an Allied
+/// vehicle).
+pub(crate) fn class_alternatives(expr: &str) -> Vec<Vec<(u32, bool)>> {
+    expr.split("||")
+        .map(|alt| class_terms(alt.trim().trim_start_matches('(').trim_end_matches(')')))
+        .collect()
 }
 
 /// A class expression's labels as name hashes, each with whether it is
@@ -958,14 +975,17 @@ fn check(
                 let Some(pa) = world.position(a) else {
                     return false;
                 };
-                bb.iter().filter_map(|&b| world.position(b)).any(|pb| {
-                    let d2: f32 = [0, 1, 2]
-                        .into_iter()
-                        .filter(|&i| !(flat && i == 1))
-                        .map(|i| (pa[i] - pb[i]).powi(2))
-                        .sum();
-                    (f64::from(d2) <= r * r) != beyond
-                })
+                bb.iter()
+                    .filter(|&&b| !world.unheard_at_gate(a, b))
+                    .filter_map(|&b| world.position(b))
+                    .any(|pb| {
+                        let d2: f32 = [0, 1, 2]
+                            .into_iter()
+                            .filter(|&i| !(flat && i == 1))
+                            .map(|i| (pa[i] - pb[i]).powi(2))
+                            .sum();
+                        (f64::from(d2) <= r * r) != beyond
+                    })
             };
             let near: Vec<u32> = aa.into_iter().filter(|&a| holds(a)).collect();
             if near.is_empty() {

@@ -2081,6 +2081,9 @@ pub struct People {
     /// ([`People::set_hostile`]); `None` before they have: then only the
     /// Venezuelans fight.
     pub hostile: Option<HashSet<&'static str>>,
+    /// The faction she passes for, disguised in its vehicle
+    /// ([`People::set_disguise`]).
+    pub disguised_as: Option<&'static str>,
     /// Factions she provoked (hurt one of theirs): their soldiers fight her
     /// for this many seconds more ([`PURSUIT_SECONDS`]).
     pub pursuit: HashMap<&'static str, f32>,
@@ -2611,6 +2614,11 @@ impl People {
     /// hostile to her (the scripts' attitudes; before they say, only the
     /// Venezuelans), or she provoked them a while ago ([`PURSUIT_SECONDS`]).
     pub fn fights_for(&self, f: &str) -> bool {
+        // Disguised as one of theirs, she is let be by a hostile faction
+        // too, but not by one she provoked.
+        if self.disguised_as == Some(f) && !self.pursuit.contains_key(f) {
+            return false;
+        }
         let hostile = match &self.hostile {
             Some(set) => set.contains(f),
             None => f == "Vza",
@@ -2625,6 +2633,16 @@ impl People {
         if self.hostile.as_ref() != Some(&hostile) {
             eprintln!("people: factions hostile to her now {hostile:?}");
             self.hostile = Some(hostile);
+            self.refresh_sides();
+        }
+    }
+
+    /// The faction she passes for in its vehicle ([`crate::disguise`]):
+    /// its soldiers stand down while it holds.
+    pub fn set_disguise(&mut self, faction: Option<&'static str>) {
+        if self.disguised_as != faction {
+            eprintln!("people: she passes for {faction:?}");
+            self.disguised_as = faction;
             self.refresh_sides();
         }
     }
@@ -3885,6 +3903,22 @@ pub(crate) mod tests {
         assert_eq!(sent.len(), 1);
         // Not a Venezuelan: doesn't fight, nor is he a story character.
         assert!(!sent[0].soldier && !sent[0].held);
+    }
+
+    #[test]
+    fn her_disguise_stands_down_its_faction_till_she_provokes_them() {
+        let mut people = People::default();
+        people.set_hostile(["Vza", "Oil"].into_iter().collect());
+        assert!(people.fights_for("Oil") && people.fights_for("Vza"));
+        // In an OC vehicle she passes for OC: they let her be, the rest not.
+        people.set_disguise(Some("Oil"));
+        assert!(!people.fights_for("Oil") && people.fights_for("Vza"));
+        // Provoked, they see through it.
+        people.pursuit.insert("Oil", 10.0);
+        assert!(people.fights_for("Oil"));
+        people.pursuit.clear();
+        people.set_disguise(None);
+        assert!(people.fights_for("Oil"));
     }
 
     #[test]

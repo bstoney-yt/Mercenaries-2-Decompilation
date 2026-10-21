@@ -351,6 +351,7 @@ impl GameData {
         // Entities' templates, to give them their templates' labels.
         let mut templated: Vec<(String, usize, u32)> = Vec::new();
         let mut template_labels: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut template_scripts: HashMap<u32, u32> = HashMap::new();
         // Faction zones' faction templates, and every template's name.
         let mut zone_factions: Vec<(String, usize, u32)> = Vec::new();
         let mut template_names: HashMap<u32, String> = HashMap::new();
@@ -388,6 +389,7 @@ impl GameData {
                     && let Ok(db) = Layer::parse(asset)
                 {
                     template_labels = labels_of(db.component("Label"));
+                    template_scripts = db.hashes("ObjectScript");
                     template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
                     template_names = db
@@ -450,9 +452,14 @@ impl GameData {
             }
         }
         for (layer, i, template) in &templated {
+            let e = &mut data.layers.get_mut(layer).expect("indexed above")[*i];
             if let Some(l) = template_labels.get(template) {
-                let e = &mut data.layers.get_mut(layer).expect("indexed above")[*i];
                 e.labels.extend(l.iter().copied());
+            }
+            // An entity without a script of its own runs its template's:
+            // the faction gates' (`_ocoutpost_wallgate`, `friendlygate`).
+            if e.script.is_none() {
+                e.script = template_scripts.get(template).copied();
             }
         }
         for (layer, i, template) in zone_factions {
@@ -915,6 +922,10 @@ impl Mission {
     pub fn tick(&mut self, dt: f64) {
         self.now += dt;
         let now = self.now;
+        {
+            let mut w = self.world.borrow_mut();
+            w.honk_heard = (w.honk_heard - dt as f32).max(0.0);
+        }
         // Streaming is instant here: a waiting state ends a second after
         // it was asked for, and the scripts hear that it did.
         {
@@ -1332,6 +1343,12 @@ impl Mission {
             .flatten()
             .find(|e| e.guid == guid && !e.path.is_empty())
             .map_or(&[], |e| e.path.as_slice())
+    }
+
+    /// She honked: the friendly faction gates hear it for
+    /// [`api::HONK_HEARD`] seconds.
+    pub fn honk(&mut self) {
+        self.world.borrow_mut().honk_heard = api::HONK_HEARD;
     }
 
     /// Reports where an object is in play (a vehicle that was driven or
@@ -2251,6 +2268,9 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             o.label_hashes.clone_from(&e.labels);
             o.faction = e.faction;
             w.insert(e.guid, o);
+            if e.script == Some(FRIENDLY_GATE) {
+                w.gates.insert(e.guid);
+            }
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());
             }
@@ -2262,6 +2282,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             }
         } else {
             w.crews.remove(&e.guid);
+            w.gates.remove(&e.guid);
             w.crew_riders.retain(|_, v| *v != e.guid);
             w.objects.remove(&e.guid);
             w.regions.remove(&e.guid);
@@ -2308,7 +2329,23 @@ fn seat_crew(
 /// `FactionZone` makes each zone an instance that enables itself: the zone
 /// on the radar and PDA map, and a watch on the player crossing it that
 /// tells the HUD (`TrespassStateChange`).
-pub const OBJECT_SCRIPTS: [(&str, u32); 1] = [("FactionZone", 0x6726_7cc1)];
+/// `friendlygate` makes each faction base gate open and shut by itself:
+/// within 20 m of it, the hero (taken for the faction of the vehicle
+/// she is disguised in, else the PMC's) or one of its faction's
+/// vehicles; open while one is there whom the gate's faction is at
+/// least `Friendly` to (the PMC only while the faction's attitude to it
+/// can change, at least `Neutral`), unless a script locked it (its
+/// `_TestAttitude`, `_EvaluateCandidates`, `LockGate`), and shut as the
+/// last goes 40 m off. Opening, a soldier of its faction within 25 m
+/// says his `GateYes01` line. The engine tells it of her only after she
+/// honks ([`crate::api::ScriptWorld::honk_heard`]).
+pub const OBJECT_SCRIPTS: [(&str, u32); 2] = [
+    ("FactionZone", 0x6726_7cc1),
+    ("friendlygate", FRIENDLY_GATE),
+];
+
+/// `friendlygate`'s module hash.
+pub const FRIENDLY_GATE: u32 = 0x6d4f_9301;
 
 /// Runs the object scripts of `entities` (see [`OBJECT_SCRIPTS`]) as their
 /// layer comes in (`load`) or goes. Returns what failed.
@@ -2354,6 +2391,13 @@ fn is_exclusion(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_object_scripts_are_named_by_their_hash() {
+        for (name, hash) in OBJECT_SCRIPTS {
+            assert_eq!(name_hash(name), hash, "{name}");
+        }
+    }
 
     #[test]
     fn landing_zones_come_from_names() {

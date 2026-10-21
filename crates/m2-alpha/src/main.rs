@@ -48,6 +48,7 @@ mod cheats;
 mod combat;
 mod config;
 mod destruct;
+mod disguise;
 mod display;
 mod drops;
 mod flights;
