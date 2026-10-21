@@ -1525,8 +1525,17 @@ impl Autoplay {
         // (PirCon004 round 72: a car crossing her road at speed wrecked
         // the organ truck, 35.9 m/s closing); in a boat too (GurCon003
         // round 81: a pleasure boat wrecked her race boat, 34.8 m/s).
-        if (laden || boat) && crossing(game, i, m) {
+        if (laden || boat)
+            && let Some(j) = crossing(game, i, m)
+        {
             throttle = if speed > 1.0 { -1.0 } else { 0.0 };
+            if self.clock - self.near_logged > 1.0 {
+                self.near_logged = self.clock;
+                eprintln!(
+                    "autoplay {:.1} s: giving way to the {} crossing ahead",
+                    self.clock, game.scene.vehicles[j].spec.label
+                );
+            }
         }
         // Stuck against something: back out, turning towards the way on.
         if throttle > 0.5 && speed.abs() < 1.0 && self.reversing.is_none() {
@@ -2866,17 +2875,13 @@ fn parked_near(game: &Game, i: usize, pos: Vec3) -> Vec<(Vec2, Vec2)> {
 /// than [`PARKED_SPEED`] comes within [`CROSS_CLOSE`] of it in the next
 /// [`CROSS_SECONDS`], each going on as it goes, where it would meet it
 /// ahead of it.
-fn crossing(game: &Game, i: usize, m: Mat4) -> bool {
-    let Some(physics) = game.scene.world.as_ref().map(|w| &w.physics) else {
-        return false;
-    };
-    let Some(mine) = game.scene.vehicles.get(i).and_then(|v| v.id) else {
-        return false;
-    };
+fn crossing(game: &Game, i: usize, m: Mat4) -> Option<usize> {
+    let physics = game.scene.world.as_ref().map(|w| &w.physics)?;
+    let mine = game.scene.vehicles.get(i).and_then(|v| v.id)?;
     let here = m.w_axis.truncate().with_y(0.0);
     let v_mine = physics.vehicle_velocity(mine).with_y(0.0);
     let forward = m.transform_vector3(Vec3::Z).with_y(0.0).normalize_or_zero();
-    game.scene.vehicles.iter().enumerate().any(|(j, v)| {
+    game.scene.vehicles.iter().enumerate().position(|(j, v)| {
         let Some(id) = v.id.filter(|_| j != i) else {
             return false;
         };
