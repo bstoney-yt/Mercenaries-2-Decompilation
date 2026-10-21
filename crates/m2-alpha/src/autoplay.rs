@@ -745,6 +745,21 @@ impl Autoplay {
         {
             let at = npcs[i].character.position;
             let d = at.distance(here);
+            // Out of a rifle's reach, she goes up to them first (jobs round
+            // 5: GurJob002's seventh stood 51 m off, and she aimed at him
+            // there for 700 s).
+            if npcs[i].alive && (SHOOT_RANGE..RIDE_FOR).contains(&d) {
+                return Some((
+                    Goal::Reach {
+                        target: m.target,
+                        at,
+                    },
+                    format!(
+                        "closing on {} ({:#x}) to verify, {d:.0} m off",
+                        m.name, m.target
+                    ),
+                ));
+            }
             if npcs[i].alive && d < RIDE_FOR {
                 return Some((
                     Goal::Shoot(i),
