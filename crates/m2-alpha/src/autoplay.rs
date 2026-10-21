@@ -40,6 +40,9 @@ const ARRIVE: f32 = 2.5;
 const ACTION_KIND: &str = "action";
 const ACTION_ARRIVE: f32 = 1.0;
 const ACTION_AGAIN: f32 = 5.0;
+/// Driving, she gets out within this of an action's object (metres, flat;
+/// invented).
+const ACTION_GET_OUT: f32 = 15.0;
 /// Further above or below its object than this (metres; the alpha's
 /// `CONTEXT_RISE`, a floor's height) an action's prompt isn't offered.
 const ACTION_RISE: f32 = 2.5;
@@ -624,6 +627,21 @@ impl Autoplay {
             _ => None,
         };
         if let Some((target, at)) = acting {
+            // Prompts are taken on foot: driving up to it she gets out
+            // (round 30 sat in a tank 6 m from PlayerLocation_PMC for
+            // 3700 s).
+            let driving = game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_some());
+            if driving && !self.leave && (at - game.focus()).with_y(0.0).length() < ACTION_GET_OUT {
+                eprintln!(
+                    "autoplay {:.1} s: by {target:#x}'s prompt in a vehicle: getting out",
+                    self.clock
+                );
+                self.leave = true;
+            }
             self.act(game, target, at);
         }
         match self.goal.clone() {
