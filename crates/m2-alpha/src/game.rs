@@ -37,6 +37,9 @@ struct Spot<'a> {
     yaw: f32,
 }
 
+/// How quickly her lens eases to its gun's share aiming and back, a second
+/// (invented).
+const LENS_EASE: f32 = 8.0;
 /// How fast a flown helicopter's rotors turn, radians a second (about five
 /// turns; invented, the rotor blur hides it).
 const ROTOR_SPIN: f32 = 30.0;
@@ -217,6 +220,9 @@ pub struct Game {
     pub reporters: Vec<(u32, &'static str, f32)>,
     /// Whether an army pursued her last frame.
     pub pursued: bool,
+    /// Seconds the scripts asked her pad to shake (`Pg.Rumble`), for the
+    /// pad to take.
+    pub rumble: f64,
     /// Keyed actions the scripts asked for (`Human.DoAction`: the player's
     /// verify photo `VerifyCamera`), each with its seconds left, ended for the
     /// scripts' `HumanActionComplete` ([`crate::mission`]).
@@ -376,6 +382,7 @@ impl Game {
             attitude_wait: 0.0,
             reporters: Vec::new(),
             pursued: false,
+            rumble: 0.0,
             actions: Vec::new(),
             scripts_seated: false,
         }
@@ -626,6 +633,7 @@ impl Game {
                 self.step(intent, dt);
                 return;
             }
+            self.aim_lens(&mut intent, zoom, dt);
             let driving = self
                 .scene
                 .player
@@ -651,6 +659,31 @@ impl Game {
             }
             self.camera.update(input, config, mouse_look, dt);
             self.step(Intent::default(), dt);
+        }
+    }
+
+    /// Her gun's lens ([`m2_engine::weapons::CameraFeel`]): aiming on foot,
+    /// the view narrows to its `CrouchFov` share and her look slows to its
+    /// `CrouchYawSpeed` and `CrouchPitchSpeed`; else it widens back to its
+    /// `FOV` (1 on every gun). The lens eases there at [`LENS_EASE`] a
+    /// second (invented). A gun with a scope (`WeaponScope`) looks through
+    /// it instead, aiming: at its least magnification, the wheel stepping
+    /// it a level a notch up to its most (the steps invented), with the
+    /// game's scope screen up (the binocular screen with `bSniper`).
+    pub fn aim_lens(&mut self, intent: &mut Intent, zoom: i32, dt: f32) {
+        let feel = self.combat.camera_feel();
+        let scope = self.combat.scope();
+        let Some(player) = self.scene.player.as_mut() else {
+            return;
+        };
+        let aiming = player.aiming && player.driving.is_none();
+        player.scope = scope
+            .filter(|_| aiming)
+            .map(|(least, most)| scope_step(player.scope, zoom, least, most));
+        player.lens = lens_step(player.lens, feel, aiming, dt);
+        if let Some(f) = feel.filter(|_| aiming) {
+            intent.look.x *= f.aim_look[0];
+            intent.look.y *= f.aim_look[1];
         }
     }
 
@@ -1162,6 +1195,15 @@ impl Game {
             .player
             .as_ref()
             .and_then(|p| self.combat.target(p, self.on_foot));
+        // What she is in, for soldiers whose guns are no use against it.
+        self.scene.people.target_armour = self
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| self.scene.vehicles.get(i))
+            .and_then(|v| v.spec.tuning.armour)
+            .unwrap_or(1);
         if let Some(world) = &mut self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {
@@ -2449,6 +2491,7 @@ fn take_up(
         (None, Weapon::Rpg) => combat.rpg.clone(),
         (None, Weapon::Rifle) => combat.carbine.clone(),
     };
+    let set = gun.feel.sound_set;
     let left = combat
         .equip_gun(gun, rounds)
         .map(|(g, n)| (g.slot(), n, g.template, g.model_hash, g.name));
@@ -2457,6 +2500,8 @@ fn take_up(
     if !walked {
         player.start_pickup();
     }
+    // Its sound set's `equip_pickup` cue.
+    combat.cue_sound(crate::combat::Sound::Pickup { set });
     eprintln!(
         "pickup: she takes up the {} ({:#x}) at {:.1} with {rounds} rounds{}",
         spec.map_or(format!("{weapon:?}"), |s| s.name.clone()),
@@ -3663,6 +3708,105 @@ mod tests {
         assert!(!blown_loose(&db, 2));
         // One the data gives no damage table row: thrown, as before.
         assert!(blown_loose(&db, 3));
+    }
+}
+
+/// Her scope's magnification `was` (`None`: just raised, at `least`)
+/// stepped `zoom` levels, held between `least` and `most`.
+fn scope_step(was: Option<f32>, zoom: i32, least: f32, most: f32) -> f32 {
+    (was.unwrap_or(least) + zoom as f32).clamp(least, most.max(least))
+}
+
+/// Her lens' share of the field of view after `dt` seconds from `lens`,
+/// easing to her gun's share: `CrouchFov` aiming, `FOV` else, 1 for a gun
+/// whose template says neither.
+fn lens_step(
+    lens: f32,
+    feel: Option<m2_engine::weapons::CameraFeel>,
+    aiming: bool,
+    dt: f32,
+) -> f32 {
+    let want = match feel {
+        Some(f) if aiming => f.aim_fov,
+        Some(f) => f.fov,
+        None => 1.0,
+    };
+    lens + (want - lens) * (LENS_EASE * dt).min(1.0)
+}
+
+#[cfg(test)]
+mod lens_tests {
+    use super::*;
+
+    // The sniper rifle's record: its view narrows to half aiming, and
+    // widens back to the whole lens when she lowers it.
+    #[test]
+    fn aiming_narrows_the_lens_to_its_guns_share() {
+        let sniper = m2_engine::weapons::CameraFeel {
+            fov: 1.0,
+            aim_fov: 0.5,
+            look: [0.8, 0.8],
+            aim_look: [0.5, 0.5],
+        };
+        let mut lens = 1.0;
+        for _ in 0..60 {
+            lens = lens_step(lens, Some(sniper), true, 1.0 / 60.0);
+        }
+        assert!((lens - 0.5).abs() < 0.01, "{lens}");
+        for _ in 0..60 {
+            lens = lens_step(lens, Some(sniper), false, 1.0 / 60.0);
+        }
+        assert!((lens - 1.0).abs() < 0.01, "{lens}");
+        assert_eq!(lens_step(0.7, None, true, 1.0), 1.0);
+    }
+
+    // The sniper rifle's scope: raised at 4x, the wheel up to 8x and no
+    // further, down to 4x and no further.
+    #[test]
+    fn the_scope_steps_between_its_magnifications() {
+        let mut z = scope_step(None, 0, 4.0, 8.0);
+        assert_eq!(z, 4.0);
+        for _ in 0..6 {
+            z = scope_step(Some(z), 1, 4.0, 8.0);
+        }
+        assert_eq!(z, 8.0);
+        assert_eq!(scope_step(Some(z), -9, 4.0, 8.0), 4.0);
+    }
+
+    // Taking up a gun with the use key cues its set's `equip_pickup`;
+    // walking over it (its rounds only) cues none.
+    #[test]
+    fn a_gun_taken_up_cues_its_pickup_sound() {
+        let templates = m2_engine::Templates::default();
+        let mut flights = crate::flights::Flights::default();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        for walked in [true, false] {
+            let mut combat = Combat::default();
+            let pickup = crate::flights::Pickup {
+                from: 0,
+                what: crate::flights::Leaves {
+                    weapon: Some(crate::combat::Weapon::Rpg),
+                    gives: Some((crate::combat::Weapon::Rpg, 2)),
+                    ..Default::default()
+                },
+                at: Vec3::ZERO,
+                yaw: 0.0,
+            };
+            take_up(
+                &mut combat,
+                &mut flights,
+                &templates,
+                &mut player,
+                pickup,
+                walked,
+            );
+            let cued = combat
+                .take_sounds()
+                .iter()
+                .filter(|s| matches!(s, crate::combat::Sound::Pickup { .. }))
+                .count();
+            assert_eq!(cued, usize::from(!walked));
+        }
     }
 }
 

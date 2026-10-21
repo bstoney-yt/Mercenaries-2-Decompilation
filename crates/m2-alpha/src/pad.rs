@@ -190,9 +190,43 @@ pub struct Pad {
     /// swapped.
     pub look: Option<f64>,
     pub invert: bool,
+    /// The pause menu's Vibration (`gameRumbleVar`): off, [`Pad::rumble`]
+    /// shakes nothing.
+    pub rumble_on: bool,
+    /// Seconds of shaking left ([`Pad::rumble`]).
+    shaking: f64,
+    /// The motors are running.
+    motors: bool,
 }
 
+/// How hard the motors run while the scripts shake the pad, left (heavy)
+/// and right (light), 0 to 1 (invented: `Pg.Rumble` names only who and
+/// for how long).
+pub const RUMBLE: [f32; 2] = [0.6, 0.6];
+
 impl Pad {
+    /// The scripts shake the player's pad for `seconds` (`Pg.Rumble`, the
+    /// hijack scripts' failed press: 0.3 s and 1 s); a longer shake
+    /// already going keeps going.
+    pub fn rumble(&mut self, seconds: f64) {
+        if self.rumble_on && seconds > 0.0 {
+            self.shaking = self.shaking.max(seconds);
+        }
+    }
+
+    /// The motors' speeds for the next `dt` seconds, and the shake's
+    /// count down: [`RUMBLE`] while shaking, else stopped.
+    fn shake(&mut self, dt: f64) -> [f32; 2] {
+        if !self.rumble_on {
+            self.shaking = 0.0;
+        }
+        if self.shaking > 0.0 {
+            self.shaking = (self.shaking - dt).max(0.0);
+            RUMBLE
+        } else {
+            [0.0; 2]
+        }
+    }
     /// Reads the pad and feeds `input` (a no-op without one). `driving`
     /// picks the layout; `dt` is the seconds since the last read. Answers
     /// the menu keys pressed since then ([`Pad::menu_keys`]).
@@ -210,6 +244,12 @@ impl Pad {
             );
         }
         let s = state.unwrap_or_default();
+        let [left, right] = self.shake(dt);
+        let on = left > 0.0 || right > 0.0;
+        if self.connected && on != self.motors {
+            let took = m2_sys::xinput::vibrate(left, right);
+            self.motors = on && took;
+        }
         let keys = Self::menu_keys(&self.last, &s);
         self.feed(input, s, driving, dt);
         keys
@@ -304,6 +344,24 @@ fn reached(layout: &[(Button, Action)]) -> Vec<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scripts_shake_runs_its_seconds_and_only_with_vibration_on() {
+        let mut p = Pad::default();
+        p.rumble(1.0);
+        assert_eq!(p.shake(0.1), [0.0; 2]);
+        p.rumble_on = true;
+        p.rumble(0.3);
+        p.rumble(1.0);
+        p.rumble(0.3);
+        for _ in 0..4 {
+            assert_eq!(p.shake(0.25), RUMBLE);
+        }
+        assert_eq!(p.shake(0.25), [0.0; 2]);
+        p.rumble(1.0);
+        p.rumble_on = false;
+        assert_eq!(p.shake(0.1), [0.0; 2]);
+    }
 
     fn press(buttons: u16) -> PadState {
         PadState {

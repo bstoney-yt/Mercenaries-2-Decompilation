@@ -674,6 +674,9 @@ pub struct MissionLink {
     blasts: Vec<Vec3>,
     bombs: Vec<Vec3>,
     vehicles: Fleet,
+    /// Seconds she has been out of her vehicle with followers aboard
+    /// ([`ride_along`]).
+    out_for: f32,
     /// Seconds since the scripts said the contract was completed.
     completed: Option<f32>,
     /// How many times the scripts have said a contract was completed.
@@ -832,6 +835,7 @@ impl MissionLink {
             tutorial: None,
             bombs: Vec::new(),
             vehicles: Fleet::default(),
+            out_for: 0.0,
             completed: None,
             contracts: 0,
             speed: 0.0,
@@ -1151,6 +1155,17 @@ impl MissionLink {
         };
         eprintln!("mission: {line}");
         self.write([line]);
+    }
+
+    /// The pause menu's scripts changed the score (its `mu_shell_01`, then
+    /// silence on leaving): the mission's scripts start their state's
+    /// piece again at their next transition, and a radio going quiet
+    /// comes back to this.
+    pub fn music_heard(&mut self, cue: Option<String>) {
+        self.radio.score.clone_from(&cue);
+        if let State::Running(m) = &mut self.state {
+            m.music_heard(cue);
+        }
     }
 
     /// Whether a dialog box the scripts put up ([`DIALOG_BOXES`]) is still
@@ -1747,6 +1762,7 @@ impl MissionLink {
                 mission.place(g, at.to_array(), yaw);
             }
             self.vehicles.sync(game, mission);
+            ride_along(game, mission, self.vehicles.riding, &mut self.out_for, STEP);
             for guid in game.scene.people.all_killed() {
                 mission.kill(guid);
             }
@@ -3087,6 +3103,58 @@ fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
     world.index.spawns.iter().any(|s| s.entity == guid)
 }
 
+/// Those following her ride with her (inferred: the engine's `Follow`
+/// role boards the leader's vehicle; the scripts board a follower only
+/// for the transit helicopter, `MrxFollow` on `transitStart`): one within
+/// [`BOARD_REACH`] gets in as she drives, rides out of play where she is
+/// (the scripts' delivery checks see them there), and gets out with her.
+///
+/// Out of a vehicle, they stay aboard [`OUT_AFTER`] seconds first, and go
+/// on with her if she gets into another meanwhile (invented: the autoplay
+/// swaps a stuck vehicle for another, and ChiCon001's VIP, out in a fight
+/// meanwhile, was shot).
+fn ride_along(
+    game: &mut Game,
+    mission: &mut Mission,
+    riding: Option<u32>,
+    out_for: &mut f32,
+    dt: f32,
+) {
+    const BOARD_REACH: f32 = 6.0;
+    const OUT_AFTER: f32 = 15.0;
+    let Some(p) = game.scene.player.as_ref() else {
+        return;
+    };
+    let (her, driving) = (p.character.position, p.driving.is_some());
+    let Some(world) = &mut game.scene.world else {
+        return;
+    };
+    let people = &mut game.scene.people;
+    if driving {
+        for g in people.followers_within(her, BOARD_REACH) {
+            if people.board(&mut world.physics, g, true, her) {
+                if let Some(v) = riding {
+                    mission.seat_in(g, v);
+                }
+                eprintln!("people: {g:08x} gets in her vehicle with her");
+            }
+        }
+        *out_for = 0.0;
+    } else if !people.aboard().is_empty() {
+        *out_for += dt;
+        if *out_for >= OUT_AFTER {
+            for g in people.aboard() {
+                people.board(&mut world.physics, g, false, her);
+                mission.unseat(g);
+                eprintln!("people: {g:08x} gets out with her at {her:.1}");
+            }
+        }
+    }
+    for g in people.aboard() {
+        mission.place(g, her.to_array(), 0.0);
+    }
+}
+
 /// One of the scripts' own people on foot (spawned by them, not placed by
 /// a layer: a soldier delivery's soldiers): their template's name, and
 /// its model. People by their `Human` label, as `Pg.FastCollectHumans`
@@ -3755,6 +3823,40 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             };
             if let Some(v) = p.driving.and_then(|i| game.scene.vehicles.get(i)) {
                 get_out(&world.physics, v, p);
+            }
+            return false;
+        }
+        // Someone following her (`Ai.Role` `Follow`: a VIP to deliver).
+        Command::Follow { guid, target, near } => {
+            game.scene
+                .people
+                .follow(*guid, target.is_some().then_some(*near));
+            return false;
+        }
+        // A follower gets into her vehicle (`MrxFollow`: `Vehicle.Enter(v,
+        // actor, "p")`) and rides it, out of play, or gets out beside her.
+        Command::EnterVehicle { guid, .. } | Command::ExitVehicle(guid) if *guid != PLAYER => {
+            let entering = matches!(c, Command::EnterVehicle { .. });
+            let at = game.focus();
+            if let Some(world) = &mut game.scene.world
+                && game
+                    .scene
+                    .people
+                    .board(&mut world.physics, *guid, entering, at)
+            {
+                eprintln!(
+                    "people: {guid:08x} {} her vehicle",
+                    if entering { "rides" } else { "gets out of" }
+                );
+                if !entering
+                    && !is_spawn(world, *guid)
+                    && let Some((template, model)) =
+                        scripted_person(mission, &world.index.template_db, *guid)
+                {
+                    game.scene
+                        .people
+                        .bring_scripted(*guid, &template, model, at);
+                }
             }
             return false;
         }
@@ -4930,6 +5032,7 @@ mod tests {
                 damage: 10.0,
                 damage_min: 10.0,
                 falloff: (0.0, 0.0),
+                dropoff: 1.0,
                 hero: 1.0,
                 key: None,
                 blast: None,
@@ -4945,6 +5048,8 @@ mod tests {
             hint: None,
             ui: None,
             assist: None,
+            camera: None,
+            scope: None,
         };
         let db = Templates {
             infos: HashMap::from([(

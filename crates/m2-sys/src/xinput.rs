@@ -100,6 +100,43 @@ pub fn poll() -> Option<PadState> {
     None
 }
 
+/// A motor's 0..=1 as XInput's 0..=65535.
+pub fn motor(v: f32) -> u16 {
+    (v.clamp(0.0, 1.0) * 65535.0).round() as u16
+}
+
+/// Sets the motors of the first connected pad (the one [`poll`] reads):
+/// the left (low, heavy) and right (high, light), 0..=1; 0 and 0 stop
+/// them. Answers whether a pad took it.
+#[cfg(windows)]
+pub fn vibrate(left: f32, right: f32) -> bool {
+    use windows::Win32::UI::Input::XboxController::{
+        XINPUT_STATE, XINPUT_VIBRATION, XInputGetState, XInputSetState,
+    };
+
+    (0..4).any(|user| {
+        let mut state = XINPUT_STATE::default();
+        // SAFETY: as in `poll`: a valid, writable XINPUT_STATE, written
+        // only for the call.
+        if unsafe { XInputGetState(user, &mut state) } != 0 {
+            return false;
+        }
+        let v = XINPUT_VIBRATION {
+            wLeftMotorSpeed: motor(left),
+            wRightMotorSpeed: motor(right),
+        };
+        // SAFETY: `v` is a valid XINPUT_VIBRATION for the call's length;
+        // XInputSetState reads it and keeps no pointer.
+        unsafe { XInputSetState(user, &v) == 0 }
+    })
+}
+
+/// No pads off Windows.
+#[cfg(not(windows))]
+pub fn vibrate(_left: f32, _right: f32) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +151,11 @@ mod tests {
         // Just past the dead zone starts near 0, not at its edge.
         let [x, _] = stick(LEFT_DEAD_ZONE + 100, 0, LEFT_DEAD_ZONE);
         assert!(x > 0.0 && x < 0.01);
+    }
+
+    #[test]
+    fn motors_span_xinputs_range() {
+        assert_eq!((motor(-1.0), motor(0.5), motor(2.0)), (0, 32768, 65535));
     }
 
     #[test]

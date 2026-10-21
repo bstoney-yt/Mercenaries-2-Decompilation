@@ -83,6 +83,8 @@ pub enum MenuAction {
     LoadGame,
     /// Play as another mercenary (also kept in the settings).
     Hero(crate::hero::Hero),
+    /// Show the window another way (also kept in the settings).
+    Display(crate::config::DisplayMode),
     Quit,
     /// Something done in the shop.
     Shop(ShopAction),
@@ -1810,6 +1812,15 @@ fn pause_menu(
         );
         ui.checkbox(&mut config.camera.invert_y, "Invert mouse Y");
         ui.checkbox(&mut config.window.vsync, "Vertical sync");
+        ui.horizontal(|ui| {
+            ui.label("Display");
+            let now = config.window.mode;
+            for mode in crate::config::DisplayMode::ALL {
+                if ui.selectable_label(now == mode, mode.text()).clicked() && now != mode {
+                    action = Some(MenuAction::Display(mode));
+                }
+            }
+        });
         if ui.button("Save settings").clicked() {
             action = Some(MenuAction::SaveSettings);
         }

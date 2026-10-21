@@ -292,6 +292,11 @@ pub struct Player {
     pub driving: Option<usize>,
     /// Aiming: she faces the camera's way with the rifle shouldered.
     pub aiming: bool,
+    /// Her lens' share of the field of view (her gun's, aiming:
+    /// [`crate::game::Game`]'s `aim_lens`), 1 at rest.
+    pub lens: f32,
+    /// Looking through her gun's scope, its magnification.
+    pub scope: Option<f32>,
     /// Her rifle, jump, throw and fall clips.
     pub clips: FightClips,
     /// Walking, running and sprinting speeds, m/s.
@@ -464,6 +469,8 @@ impl Player {
             model,
             driving: None,
             aiming: false,
+            lens: 1.0,
+            scope: None,
             clips: FightClips::default(),
             speeds: SPEEDS,
             leap: Leap::No,
@@ -1189,6 +1196,18 @@ impl Player {
     /// Her camera's view; through her binoculars, from the point the
     /// camera turns about above her head, with their narrower lens.
     pub fn view(&self, fov_degrees: f32, aspect: f32) -> View {
+        // Through her scope, from the camera's pivot as through her
+        // binoculars, magnified.
+        if let Some(z) = self.scope.filter(|_| self.driving.is_none()) {
+            return View::perspective(
+                self.look_at(),
+                self.camera_forward(),
+                crate::binoculars::magnified(fov_degrees, z).to_radians(),
+                aspect,
+                0.1,
+                10_000.0,
+            );
+        }
         if let Some(b) = self.binoculars.filter(|_| self.driving.is_none()) {
             return View::perspective(
                 self.look_at(),
@@ -1202,7 +1221,7 @@ impl Player {
         View::perspective(
             self.eye(),
             self.camera_forward(),
-            fov_degrees.to_radians(),
+            (fov_degrees * self.lens.clamp(0.1, 2.0)).to_radians(),
             aspect,
             0.1,
             10_000.0,

@@ -109,20 +109,76 @@ impl Default for WorldConfig {
     }
 }
 
+/// How the window is shown (`[window] mode`, or `--display`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayMode {
+    /// A window with a frame, `width` x `height`.
+    #[default]
+    Windowed,
+    /// Fullscreen over the monitor at its own (desktop) mode: no mode
+    /// change, so switching in and out is quick.
+    Borderless,
+    /// Fullscreen with the monitor switched to `width` x `height` at
+    /// `refresh` hertz (0: the monitor's own rate).
+    Exclusive,
+}
+
+impl DisplayMode {
+    pub const ALL: [Self; 3] = [Self::Windowed, Self::Borderless, Self::Exclusive];
+
+    /// The name in the settings file and on the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Windowed => "windowed",
+            Self::Borderless => "borderless",
+            Self::Exclusive => "exclusive",
+        }
+    }
+
+    /// A menu's text for it (invented: the game's video screen has no
+    /// such item).
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Windowed => "Windowed",
+            Self::Borderless => "Borderless Fullscreen",
+            Self::Exclusive => "Fullscreen",
+        }
+    }
+
+    pub fn is_fullscreen(self) -> bool {
+        self != Self::Windowed
+    }
+}
+
+impl std::str::FromStr for DisplayMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|m| m.name().eq_ignore_ascii_case(s))
+            .ok_or_else(|| format!("{s}: expected windowed, borderless or exclusive"))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WindowConfig {
-    /// The window's size; fullscreen, the mode's.
+    /// Windowed, the window's size; exclusive, the mode's.
     pub width: u32,
     pub height: u32,
-    pub fullscreen: bool,
-    /// Fullscreen, the mode's refresh rate in hertz (the pause menu's
-    /// Refresh Rate); 0 is the monitor's own mode, borderless.
+    pub mode: DisplayMode,
+    /// Exclusive, the mode's refresh rate in hertz (the pause menu's
+    /// Refresh Rate); 0 is the monitor's own rate.
     pub refresh: u32,
     pub vsync: bool,
     /// The video screen's Aspect Ratio: wide, or 4:3 (the world seen as
     /// on a 4:3 screen, filling the window).
     pub wide: bool,
+    /// The settings files from before `mode`: `true` reads as borderless
+    /// (refresh 0) or exclusive (a rate), and isn't written back.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fullscreen: bool,
 }
 
 impl Default for WindowConfig {
@@ -130,10 +186,24 @@ impl Default for WindowConfig {
         Self {
             width: 1600,
             height: 900,
-            fullscreen: false,
+            mode: DisplayMode::Windowed,
             refresh: 0,
             vsync: true,
             wide: true,
+            fullscreen: false,
+        }
+    }
+}
+
+impl WindowConfig {
+    /// Reads an old `fullscreen = true` into `mode`.
+    pub fn upgrade(&mut self) {
+        if std::mem::take(&mut self.fullscreen) && self.mode == DisplayMode::Windowed {
+            self.mode = if self.refresh == 0 {
+                DisplayMode::Borderless
+            } else {
+                DisplayMode::Exclusive
+            };
         }
     }
 }
@@ -173,6 +243,7 @@ impl Config {
                 for (action, keys) in Bindings::default().0 {
                     config.keys.0.entry(action).or_insert(keys);
                 }
+                config.window.upgrade();
                 Ok(config)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -283,6 +354,52 @@ mod tests {
         let config = Config::default();
         let back: Config = toml::from_str(&config.to_toml()).unwrap();
         assert_eq!(back, config);
+    }
+
+    #[test]
+    fn display_modes_read_and_write_by_name() {
+        for mode in DisplayMode::ALL {
+            assert_eq!(mode.name().parse::<DisplayMode>(), Ok(mode));
+            let config = Config {
+                window: WindowConfig {
+                    mode,
+                    ..WindowConfig::default()
+                },
+                ..Config::default()
+            };
+            let text = config.to_toml();
+            assert!(
+                text.contains(&format!("mode = \"{}\"", mode.name())),
+                "{text}"
+            );
+            assert!(!text.contains("fullscreen = false"), "{text}");
+            assert_eq!(toml::from_str::<Config>(&text).unwrap(), config);
+        }
+        assert_eq!("Exclusive".parse(), Ok(DisplayMode::Exclusive));
+        assert!("full".parse::<DisplayMode>().is_err());
+        assert!(!DisplayMode::Windowed.is_fullscreen());
+        assert!(DisplayMode::Borderless.is_fullscreen());
+    }
+
+    #[test]
+    fn old_fullscreen_files_read_as_a_mode() {
+        let path = std::env::temp_dir().join(format!("m2-alpha-old-{}.toml", std::process::id()));
+        for (text, mode) in [
+            ("fullscreen = true", DisplayMode::Borderless),
+            ("fullscreen = true\nrefresh = 144", DisplayMode::Exclusive),
+            ("fullscreen = false\nrefresh = 144", DisplayMode::Windowed),
+            (
+                "fullscreen = true\nmode = \"exclusive\"",
+                DisplayMode::Exclusive,
+            ),
+        ] {
+            std::fs::write(&path, format!("[window]\n{text}\n")).unwrap();
+            let config = Config::load(&path).unwrap();
+            assert_eq!(config.window.mode, mode, "{text}");
+            assert!(!config.window.fullscreen);
+            assert!(!config.to_toml().contains("fullscreen = true"));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

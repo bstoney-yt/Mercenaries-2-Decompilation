@@ -1304,6 +1304,15 @@ impl Mission {
         }
     }
 
+    /// Character `guid` gets out of whatever they ride (a follower out of
+    /// her vehicle).
+    pub fn unseat(&mut self, guid: u32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            o.vehicle = None;
+            o.seated_instantly = false;
+        }
+    }
+
     /// The objects carrying label `label` (`ExtractionHelicopter`), and
     /// where each is.
     pub fn labelled(&self, label: &str) -> Vec<(u32, [f32; 3])> {
@@ -1696,6 +1705,12 @@ impl Mission {
         if let Some(c) = w.music.enter_region(faction) {
             w.commands.push(c);
         }
+    }
+
+    /// The score changed under the HUD's scripts (the pause menu's
+    /// music): see [`crate::music::Music::heard`].
+    pub fn music_heard(&mut self, cue: Option<String>) {
+        self.world.borrow_mut().music.heard(cue);
     }
 
     /// The faction the score plays now (`freeplay_city`, `pmc`, ...).
