@@ -2026,8 +2026,10 @@ impl Autoplay {
         // Nothing to blow it up with: an emplaced gun in reach of it,
         // manned and fired (PmcCon031 round 3: 50 columns to bring down,
         // the scripts' "MoveToMG" first, and she stood 370 s at one with
-        // an empty launcher).
-        if !lobbing && rockets == 0 {
+        // an empty launcher). So too with her weapons put away by the
+        // scripts (round 4: its range's).
+        let holstered = game.scene.player.as_ref().is_some_and(|p| p.weapons_away());
+        if (!lobbing && rockets == 0) || holstered {
             if game.combat.manned.is_some() {
                 return self.fire_manned(game, at, dt);
             }
