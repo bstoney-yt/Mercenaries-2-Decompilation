@@ -402,6 +402,10 @@ struct Options {
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
     hurt: Option<f32>,
+    /// With `--mission`: driving, the horn is held half a second every
+    /// this many seconds (to hear it, and what the gates, the disguise
+    /// and friendly soldiers make of it).
+    honk_every: Option<f32>,
     /// With `--mission --screenshot`: she plays the mission herself, by
     /// its markers, until it is done or the seconds are up.
     autoplay: bool,
@@ -778,6 +782,9 @@ fn parse_args() -> anyhow::Result<Options> {
             "--autoplay" => o.autoplay = true,
             "--smarter-ai" => o.smarter_ai = true,
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
+            "--honk-every" => {
+                o.honk_every = Some(value()?.parse().context("--honk-every expects seconds")?)
+            }
             "--gates" => o.gates = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
             "--contracts" => {
@@ -3640,6 +3647,9 @@ fn mission_for_screenshot(
         }
         // With --support she throws the marker the scripts hand her.
         let mut intent = intent;
+        if let Some(n) = options.honk_every.filter(|n| *n > 0.0) {
+            intent.honk = (i as f32 * tick) % n < 0.5;
+        }
         // With --jump-with-enter, the Enter pressed after the contract (to
         // close a fanfare) is the pad's A, which jumps too.
         if options.jump_with_enter

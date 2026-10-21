@@ -2156,7 +2156,19 @@ impl GameAudio {
             .spare_horns
             .as_ref()
             .and_then(|h| h[usize::from(input.heavy)].clone());
+        let whose = if own.is_some() {
+            "its bank's"
+        } else if input.heavy {
+            "the resident lorry's"
+        } else {
+            "the resident car's"
+        };
         if let Some(buffer) = own.or(spare) {
+            eprintln!(
+                "horn: {whose} ({:08x}, {:.2} s, looped)",
+                buffer.hash,
+                buffer.seconds()
+            );
             let play = Play::flat(buffer).looped().gain(HORN_GAIN);
             self.horn = Some(self.out.with(|m| m.play(play)));
         }

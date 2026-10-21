@@ -247,6 +247,8 @@ m2-alpha [options]
                          who fights her (faction-check lines); <f>:watch
                          hurts nobody; a picture with the HUD 40 s on
                          (-faction40)
+  --honk-every <s>       with --mission: driving, hold the horn half a second
+                         every <s> seconds (horn, gate and disguise lines)
   --bash-target <s>      with --mission --after-contract: this long after the
                          contract, put her by the person the scripts' first
                          marker is over and bash them (verify-check lines);
