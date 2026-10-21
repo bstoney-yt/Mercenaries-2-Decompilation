@@ -31,6 +31,7 @@ m2-assets = { path = "../crates/m2-assets" }
 m2-engine = { path = "../crates/m2-engine" }
 m2-game = { path = "../crates/m2-game" }
 m2-math = { path = "../crates/m2-math" }
+m2-net = { path = "../crates/m2-net" }
 m2-render = { path = "../crates/m2-render", features = ["wgpu"] }
 m2-sys = { path = "../crates/m2-sys" }
 mimalloc = { version = "0.1", default-features = false }
