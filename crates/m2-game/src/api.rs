@@ -516,6 +516,10 @@ impl Pursuit {
 /// her, and the game's text says only that she must honk).
 pub const HONK_HEARD: f32 = 3.0;
 
+/// The reserve that stands for infinite ammunition
+/// (`Object.SetInfiniteAmmo`), rounds (invented).
+pub const INFINITE_RESERVE: u32 = 999;
+
 /// The scripts' view of the game, and what they asked of it.
 #[derive(Debug, Default)]
 pub struct ScriptWorld {
@@ -1932,6 +1936,26 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .and_then(|g| w.inventory.carried.get(&g))
             .map(|c| c.reserve);
         values([n.map_or(Value::Nil, |n| Value::Number(f64::from(n)))])
+    })?;
+    // Object.SetInfiniteAmmo(character, on): her weapons don't run dry
+    // (PmcCon034's sniper tower, after handing her its rifle; from the
+    // scripts). Stood in for by a reserve no range empties (invented).
+    add(&object, "SetInfiniteAmmo", |w, _, a| {
+        let (Some(who), Some(Value::Boolean(true))) = (id(a.first()), a.get(1)) else {
+            return values([]);
+        };
+        for g in w.inventory.of(who).to_vec() {
+            let name = w.weapon_name(g);
+            if let (Some(c), Some(weapon)) = (w.inventory.carried.get_mut(&g), name) {
+                c.reserve = INFINITE_RESERVE;
+                w.commands.push(Command::Reserve {
+                    who,
+                    weapon,
+                    rounds: INFINITE_RESERVE,
+                });
+            }
+        }
+        values([])
     })?;
     add(&weapon, "SetReserveAmmo", |w, _, a| {
         let (Some(g), Some(rounds)) = (id(a.first()), num(a.get(1))) else {
@@ -3836,6 +3860,18 @@ mod tests {
         assert!(matches!(
             &world.borrow_mut().take_commands()[..],
             [Command::Loadout { weapons, .. }] if weapons == &["Carbine".to_owned()]
+        ));
+        // And it doesn't run dry when the scripts say so.
+        host.lua()
+            .load("Object.SetInfiniteAmmo(Player.GetLocalCharacter(), true)")
+            .exec()
+            .unwrap();
+        assert!(matches!(
+            &world.borrow_mut().take_commands()[..],
+            [Command::Reserve {
+                rounds: INFINITE_RESERVE,
+                ..
+            }]
         ));
     }
 
