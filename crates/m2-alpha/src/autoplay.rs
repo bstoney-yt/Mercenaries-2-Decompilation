@@ -1152,13 +1152,14 @@ impl Autoplay {
                 // left to blow up (round 4's AllCon002: the boats).
                 .filter(|p| {
                     let d = p.at.distance(here);
-                    let refill = crate::mission::refill(templates, &game.combat, &p.what);
                     // Her rifle empty too, with targets left that rounds
                     // break (PmcCon032 round 14: 13 of 21 statues, then
-                    // no rounds left).
-                    let restock = (rockets_out && refill.launcher > 0
-                        || rifle_out && refill.rifle > 0)
-                        && d < RESTOCK_NEAR;
+                    // no rounds left). (Looked up only then: there are
+                    // over a thousand pickups, and this runs each tick.)
+                    let restock = (rockets_out || rifle_out) && d < RESTOCK_NEAR && {
+                        let refill = crate::mission::refill(templates, &game.combat, &p.what);
+                        rockets_out && refill.launcher > 0 || rifle_out && refill.rifle > 0
+                    };
                     // With the contract's things still to blow up, only
                     // what lies close is worth the detour (round 16's
                     // AllCon002 lost the boats' race to pickups).
