@@ -67,6 +67,9 @@ const SHOOT_RANGE: f32 = 35.0;
 /// every so long (invented).
 const TAP_FOR: f32 = 0.12;
 const TAP_EVERY: f32 = 0.5;
+/// A target still standing after this long of her rifle (seconds, in
+/// reach) is blown up instead (invented).
+const RIFLE_TRY: f32 = 20.0;
 /// Targets that rounds break she shoots from within this far (metres;
 /// invented, the ranges' furthest statues from their towers).
 const SNIPE_RANGE: f32 = 130.0;
@@ -465,8 +468,11 @@ pub struct Autoplay {
     blast_spot: Option<(u32, Vec3)>,
     /// The target last logged as one she has nothing to blow up with.
     no_gun_logged: Option<u32>,
-    /// The target she last shot at with her rifle, for the log.
-    rifle_on: Option<u32>,
+    /// The target she last shot at with her rifle, and for how long
+    /// within reach (seconds).
+    rifle_on: Option<(u32, f32)>,
+    /// The templates of targets that stood through her rifle that long.
+    rifle_failed: std::collections::HashSet<u32>,
     /// With the launcher empty, the C4 she set on what she is blowing up
     /// and when, while she gets clear to set it off.
     planted: Option<f32>,
@@ -750,7 +756,31 @@ impl Autoplay {
         // (Not a sturdy one first: PmcCon031 round 11 tried her rifle on
         // each of its 50 columns in turn and brought none down.)
         let rifle = matches!(&self.goal, Some(Goal::Blast { target, .. })
-            if takes_rounds(game, *target) && Self::rifle_ready(game));
+            if takes_rounds(game, *target)
+                && Self::rifle_ready(game)
+                // Not one that has stood through her rounds a while: blown
+                // up instead (PmcCon031 round 14: its columns stood through
+                // 240 rounds from the MG platform).
+                // Nor any other of its kind after that.
+                && !game
+                    .scene
+                    .props
+                    .get(*target)
+                    .is_some_and(|(p, _)| self.rifle_failed.contains(&p.template))
+                && self
+                    .rifle_on
+                    .is_none_or(|(t, spent)| t != *target || spent < RIFLE_TRY));
+        if let Some((t, spent)) = self.rifle_on
+            && spent >= RIFLE_TRY
+            && let Some((p, _)) = game.scene.props.get(t)
+            && self.rifle_failed.insert(p.template)
+        {
+            eprintln!(
+                "autoplay {:.1} s: {t:#x} stood through {spent:.0} s of her rifle: its kind \
+                 ({:08x}) is blown up from now on",
+                self.clock, p.template
+            );
+        }
         let striking = !rifle
             && matches!(&self.goal, Some(Goal::Blast { target, at }) if (sturdy(target) && !cannon) || (spent && !gun(at) && !cannon))
             || matches!(self.goal, Some(Goal::Deliver(_)));
@@ -1105,6 +1135,10 @@ impl Autoplay {
         let rockets_out = game.combat.second == Some(Weapon::Rpg)
             && game.combat.launcher_rounds.is_none_or(|r| r.total() == 0)
             && live.iter().any(|m| m.kind == "destroy");
+        let rifle_out = game.combat.rifle_rounds.total() == 0
+            && live
+                .iter()
+                .any(|m| m.kind == "destroy" && takes_rounds(game, m.target));
         if driving.is_none()
             && let Some((from, d)) = game
                 .scene
@@ -1118,9 +1152,13 @@ impl Autoplay {
                 // left to blow up (round 4's AllCon002: the boats).
                 .filter(|p| {
                     let d = p.at.distance(here);
-                    let restock = rockets_out
-                        && d < RESTOCK_NEAR
-                        && crate::mission::refill(templates, &game.combat, &p.what).launcher > 0;
+                    let refill = crate::mission::refill(templates, &game.combat, &p.what);
+                    // Her rifle empty too, with targets left that rounds
+                    // break (PmcCon032 round 14: 13 of 21 statues, then
+                    // no rounds left).
+                    let restock = (rockets_out && refill.launcher > 0
+                        || rifle_out && refill.rifle > 0)
+                        && d < RESTOCK_NEAR;
                     // With the contract's things still to blow up, only
                     // what lies close is worth the detour (round 16's
                     // AllCon002 lost the boats' race to pickups).
@@ -2132,12 +2170,15 @@ impl Autoplay {
         if at.distance(here) > range {
             return self.walk(game, at, range - 5.0, dt);
         }
-        if self.rifle_on != Some(target) {
-            eprintln!(
-                "autoplay {:.1} s: shooting {target:#x} with her rifle",
-                self.clock
-            );
-            self.rifle_on = Some(target);
+        match &mut self.rifle_on {
+            Some((t, spent)) if *t == target => *spent += dt,
+            _ => {
+                eprintln!(
+                    "autoplay {:.1} s: shooting {target:#x} with her rifle",
+                    self.clock
+                );
+                self.rifle_on = Some((target, dt));
+            }
         }
         let (look, error) = aim(p, at, dt);
         self.steady = if error < ON_TARGET {
