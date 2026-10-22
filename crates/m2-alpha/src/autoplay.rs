@@ -146,6 +146,9 @@ const STUCK: f32 = 3.0;
 const SIDESTEP: f32 = 1.2;
 const HOP_AFTER: f32 = 25.0;
 const HOP_AFTER_BOAT: f32 = 8.0;
+/// On foot this near the place she is after (metres), she hops as soon as
+/// a boat does (invented).
+const HOP_NEAR: f32 = 40.0;
 /// A place more than this over the sea is ashore, for a boat, which goes
 /// for the water this far short of it, metres (invented).
 const ASHORE: f32 = 1.5;
@@ -2060,6 +2063,16 @@ impl Autoplay {
         }
     }
 
+    /// Where the place she is going to is, for a goal that is one.
+    fn goal_at(&self) -> Option<Vec3> {
+        match &self.goal {
+            Some(Goal::Reach { at, .. } | Goal::Blast { at, .. } | Goal::Use { at, .. }) => {
+                Some(*at)
+            }
+            _ => None,
+        }
+    }
+
     /// Whether a sturdy target is shot at with her rifle before a strike
     /// is called on it: on foot, her weapons out, not yet tried for
     /// [`RIFLE_TRY`] (the ranges' statues, PmcCon032/034, fall to rounds
@@ -2866,7 +2879,24 @@ impl Autoplay {
             .and_then(|p| p.driving)
             .and_then(|i| game.scene.vehicles.get(i))
             .is_some_and(|v| v.spec.is_boat());
-        if still > if afloat { HOP_AFTER_BOAT } else { HOP_AFTER } {
+        // So does one on foot stuck short of a place close by: the timed
+        // ranges' points lie behind their counters (PmcCon033 round 9: 31
+        // s of its 90 s lost 36 m short of the pistol range's second).
+        let near = game
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.driving.is_none())
+            && self
+                .goal_at()
+                .is_some_and(|at| at.distance(game.focus()) < HOP_NEAR);
+        if still
+            > if afloat || near {
+                HOP_AFTER_BOAT
+            } else {
+                HOP_AFTER
+            }
+        {
             // Stuck driving close to the place: on foot from here. Not
             // with goods riding on her vehicle: they are what she brings
             // there (PirCon002's rum, left 162 m short in round 43); the
