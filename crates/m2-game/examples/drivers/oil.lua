@@ -101,6 +101,12 @@ local function hqs()
       say('>>> POSTS ' .. loc .. ' ' .. tostring(n))
     end
   end
+  -- OilCon001's executive (layer guid 0x10001dac), as the scripts see him:
+  -- his delivery wants him within 6 m of `oc001.obj3.loc.dropoff`.
+  local okx, x, y, z = pcall(function() return Object.GetPosition(Sys.StringToGuid('268443052')) end)
+  if okx and x then
+    say('>>> EXEC at ' .. string.format('%.1f %.1f %.1f', x, y, z))
+  end
   Event.Create(Event.TimerRelative, { 15 }, hqs, {})
 end
 Event.Create(Event.TimerRelative, { 15 }, hqs, {})

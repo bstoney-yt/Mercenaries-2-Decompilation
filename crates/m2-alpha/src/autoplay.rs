@@ -1436,8 +1436,11 @@ impl Autoplay {
                 ));
             }
             // There a while and nothing happening: the scripts' vehicle
-            // standing by is hers.
+            // standing by is hers. Not with someone following her to a place
+            // to deliver them (OilCon001 round 23: in and out of the EXT 8 m
+            // from the drop-off 3400 s, the executive wanted within 6 m).
             if let Some((_, since)) = self.waiting.filter(|w| w.0 == m.target)
+                && !(m.kind == "deliverable" && !followers.is_empty())
                 && self.clock - since > TAKE_AFTER
                 && let Some(i) = vehicles
                     .iter()

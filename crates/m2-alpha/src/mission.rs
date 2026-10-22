@@ -2110,12 +2110,17 @@ impl MissionLink {
                     None => mission.kill(guid),
                 }
             }
-            // The scripts' objects for the dead lie where their bodies do:
-            // a verify prompt is offered over the object (a job's targets
-            // run from their spawns before they fall; jobs round 3 found
-            // the prompt left at the spawn, out of her reach).
-            for n in game.scene.people.npcs.iter().filter(|n| !n.alive) {
-                if let Some(g) = n.spawn {
+            // The scripts' people are where they stand in play: the dead where
+            // their bodies lie (a verify prompt is offered over the object; a
+            // job's targets run from their spawns before they fall: jobs round
+            // 3 found the prompt left at the spawn), the living where they went
+            // (OilCon001's executive, following her to his drop-off, stayed at
+            // his spawn for the scripts' delivery check: round 24).
+            for n in &game.scene.people.npcs {
+                // (The living by their own object only, not a spawner's place.)
+                if let Some(g) = n.spawn
+                    && (!n.alive || mission.world().borrow().objects.contains_key(&g))
+                {
                     mission.place(g, n.character.position.to_array(), n.facing);
                 }
             }
