@@ -207,6 +207,11 @@ const EXIT_AFTER: f32 = 4.0;
 /// With goods riding on her vehicle she drives no faster than this, m/s
 /// (invented: about 40 km/h).
 const LADEN_SPEED: f32 = 11.0;
+/// A vehicle of no more health than this is driven as if laden. Invented.
+const FRAIL: f32 = 60.0;
+/// And no faster than this in one, m/s: round 21 ran the 50-health
+/// Devastator into a UP truck at 11 m/s (62 damage). Invented.
+const FRAIL_SPEED: f32 = 6.0;
 /// She takes an action the scripts offer within this of its object,
 /// metres (a context action's reach is a few metres; within 1.5 m she
 /// stalled against the body, GurCon002 round 14).
@@ -1853,8 +1858,11 @@ impl Autoplay {
         }
         // Goods riding on her truck (PirCon002's rum): no faster than a
         // careful driver goes, so a crash costs less of them.
-        let laden = game.scene.props.carrying(i);
-        if laden && speed > LADEN_SPEED {
+        // So too in a frail vehicle (OilCon021's Devastator, a 50-health
+        // scooter: round 20 ran it into an EXT at 14 m/s and lost it).
+        let frail = game.scene.vehicles[i].most_health() <= FRAIL;
+        let laden = game.scene.props.carrying(i) || frail;
+        if laden && speed > if frail { FRAIL_SPEED } else { LADEN_SPEED } {
             throttle = 0.0;
         }
         // And she gives way to a vehicle on course to cross ahead of her
