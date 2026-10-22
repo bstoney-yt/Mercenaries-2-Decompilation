@@ -106,6 +106,9 @@ const ROUNDS_TAKEN: f32 = 0.5;
 /// nearer, metres (invented).
 const KEEP_TARGET_BY: f32 = 10.0;
 const MANNED_REACH: f32 = 90.0;
+/// An emplaced gun this near her (metres) is manned whatever she carries
+/// (invented).
+const GUN_BY: f32 = 8.0;
 /// With the grenade launcher, whose rounds reach about 40 m.
 const LOB_RANGE: (f32, f32) = (12.0, 32.0);
 /// What only a support strike brings down (the first contract's gates)
@@ -755,9 +758,15 @@ impl Autoplay {
             .is_some_and(|v| v.spec.cannon());
         // (Not a sturdy one first: PmcCon031 round 11 tried her rifle on
         // each of its 50 columns in turn and brought none down.)
-        let rifle = matches!(&self.goal, Some(Goal::Blast { target, .. })
+        let rifle = matches!(&self.goal, Some(Goal::Blast { target, at })
             if takes_rounds(game, *target)
                 && Self::rifle_ready(game)
+                // Not with an emplaced gun by her that reaches it (`blast`).
+                && !game.scene.player.as_ref().is_some_and(|p| {
+                    game.placed
+                        .emplacement_for(&game.scene.props, p.character.position, *at, GUN_BY, MANNED_REACH)
+                        .is_some()
+                })
                 // Not one that has stood through her rounds a while: blown
                 // up instead (PmcCon031 round 14: its columns stood through
                 // 240 rounds from the MG platform).
@@ -2263,7 +2272,14 @@ impl Autoplay {
         // an empty launcher). So too with her weapons put away by the
         // scripts (round 4: its range's).
         let holstered = game.scene.player.as_ref().is_some_and(|p| p.weapons_away());
-        if (!lobbing && rockets == 0) || holstered {
+        // An emplaced gun right by her that reaches it: manned whatever
+        // she carries (PmcCon031 round 17: at its grenade-launcher post she
+        // shot 20 s with her rifle, then walked off round the range).
+        let gun_by = game
+            .placed
+            .emplacement_for(&game.scene.props, here, at, GUN_BY, MANNED_REACH)
+            .is_some();
+        if (!lobbing && rockets == 0) || holstered || gun_by || game.combat.manned.is_some() {
             if game.combat.manned.is_some() {
                 return self.fire_manned(game, at, dt);
             }
