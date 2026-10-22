@@ -1968,6 +1968,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         };
         values([Value::Boolean(has)])
     })?;
+    // The host's own (not the game's): the objects carrying a label, for
+    // a label filter's `GetObjects` (below).
+    add(&object, "_M2Labelled", |w, lua, a| {
+        let list = match a.first() {
+            Some(Value::String(l)) => w.labelled(&l.to_string_lossy()),
+            _ => Vec::new(),
+        };
+        let t = lua.create_sequence_from(list.into_iter().map(crate::events::guid_value))?;
+        values([Value::Table(t)])
+    })?;
     add(&object, "AddLabel", |w, _, a| {
         if let (Some(o), Some(Value::String(l))) =
             (id(a.first()).and_then(|g| w.objects.get_mut(&g)), a.get(1))
@@ -3300,6 +3310,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             local r = {}
             if not ok(f) then return r end
             for _, v in ipairs(f.objs) do if not f.ex[v] then r[#r + 1] = v end end
+            -- A label filter's objects are those carrying it (PmcCon031's
+            -- grenade-launcher statues, `sTgtLabelFilter`: an objective
+            -- with none listed had nothing to count; inferred).
+            if f.label ~= nil and Object._M2Labelled then
+                for _, v in ipairs(Object._M2Labelled(f.label)) do
+                    if not f.ex[v] and not has(f, v) then r[#r + 1] = v end
+                end
+            end
             if f.players then
                 local p = Player.GetAnyCharacter()
                 if p ~= nil and not has(f, p) and not f.ex[p] then r[#r + 1] = p end
@@ -4265,6 +4283,27 @@ mod tests {
         ask("Player.SetVehicleDisguise(false)");
         assert_eq!(world.borrow().disguise, None);
         assert_eq!(ask("return Player.GetVehicleDisguiseState({})"), Value::Nil);
+    }
+
+    #[test]
+    fn a_label_filter_lists_the_objects_carrying_its_label() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            let mut statue = Object::new("_pmcoutpost_column", [0.0; 3]);
+            statue.labels.push("PMCCon031StatueGL".into());
+            w.insert(70, statue);
+            w.insert(71, Object::new("_pmcoutpost_column", [0.0; 3]));
+        }
+        let n: i64 = host
+            .lua()
+            .load(
+                "local f = ObjectFilter.Create() ObjectFilter.SetFilter(f, 'PMCCon031StatueGL') \
+                 return #ObjectFilter.GetObjects(f)",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
