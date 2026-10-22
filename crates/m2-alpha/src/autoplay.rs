@@ -67,6 +67,9 @@ const SHOOT_RANGE: f32 = 35.0;
 /// every so long (invented).
 const TAP_FOR: f32 = 0.12;
 const TAP_EVERY: f32 = 0.5;
+/// She fires on a target with her rifle once her crosshair is within this
+/// much of its middle, metres (invented: half a statue's width).
+const SNIPE_WIDTH: f32 = 0.4;
 /// A target still standing after this long of her rifle (seconds, in
 /// reach) is blown up instead (invented).
 const RIFLE_TRY: f32 = 20.0;
@@ -2414,11 +2417,11 @@ impl Autoplay {
             }
         }
         let (look, error) = aim(p, at, dt);
-        self.steady = if error < ON_TARGET {
-            self.steady + dt
-        } else {
-            0.0
-        };
+        // Far off, the crosshair is held on it closer: 0.03 rad is 3 m at
+        // 98 m, wider than a statue (PmcCon034 round 21: 20 anti-material
+        // rounds, none broke one). The width is invented.
+        let on = ON_TARGET.min(SNIPE_WIDTH / at.distance(p.eye()).max(1.0));
+        self.steady = if error < on { self.steady + dt } else { 0.0 };
         Intent {
             look,
             trigger: Trigger {
