@@ -1083,7 +1083,16 @@ impl Autoplay {
                     // what lies close is worth the detour (round 16's
                     // AllCon002 lost the boats' race to pickups).
                     let reach = if destroying { BUSY_NEAR } else { OPEN_NEAR };
+                    // Nor what lies out of her depth: she can't fight
+                    // swimming (OilCon002 round 17 swam 1100 s by the first
+                    // post after a dead soldier's rifle in the harbour).
+                    let sunk = game.scene.world.as_ref().is_some_and(|w| {
+                        w.physics
+                            .water_at(p.at.x, p.at.z)
+                            .is_some_and(|s| s - p.at.y > crate::player::SWIM_START)
+                    });
                     (restock || (!game.placed.is_pickup(p.from) && d < reach))
+                        && !sunk
                         && !self.left_lying.contains(&p.key())
                         && wanted(templates, &game.combat, p)
                 })
