@@ -761,11 +761,16 @@ impl Autoplay {
         let rifle = matches!(&self.goal, Some(Goal::Blast { target, at })
             if takes_rounds(game, *target)
                 && Self::rifle_ready(game)
-                // Not with an emplaced gun by her that reaches it (`blast`).
+                // Not with an emplaced gun by her whose rounds blow up and
+                // reach it (`blast`).
                 && !game.scene.player.as_ref().is_some_and(|p| {
                     game.placed
                         .emplacement_for(&game.scene.props, p.character.position, *at, GUN_BY, MANNED_REACH)
-                        .is_some()
+                        .is_some_and(|g| {
+                            game.scene.world.as_ref().is_some_and(|w| {
+                                game.placed.emplacement_explodes(&game.scene.props, &w.index.template_db, g)
+                            })
+                        })
                 })
                 // Not one that has stood through her rounds a while: blown
                 // up instead (PmcCon031 round 14: its columns stood through
@@ -2275,10 +2280,17 @@ impl Autoplay {
         // An emplaced gun right by her that reaches it: manned whatever
         // she carries (PmcCon031 round 17: at its grenade-launcher post she
         // shot 20 s with her rifle, then walked off round the range).
+        // (One whose rounds blow up: the heavy MG's 300 rounds left 031's
+        // columns standing, round 18.)
         let gun_by = game
             .placed
             .emplacement_for(&game.scene.props, here, at, GUN_BY, MANNED_REACH)
-            .is_some();
+            .is_some_and(|g| {
+                game.scene.world.as_ref().is_some_and(|w| {
+                    game.placed
+                        .emplacement_explodes(&game.scene.props, &w.index.template_db, g)
+                })
+            });
         if (!lobbing && rockets == 0) || holstered || gun_by || game.combat.manned.is_some() {
             if game.combat.manned.is_some() {
                 return self.fire_manned(game, at, dt);
