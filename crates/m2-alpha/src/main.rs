@@ -5220,6 +5220,15 @@ fn context_check(
     let Some((g, at)) = link.context_spot(want) else {
         return;
     };
+    // A person's action is where they stand in play (Fiona's starter is
+    // placed 45 m off her desk, over no floor).
+    let at = game
+        .scene
+        .people
+        .npcs
+        .iter()
+        .find(|n| n.spawn == Some(g))
+        .map_or(at, |n| n.character.position);
     match &mut c.put {
         None => {
             if let Some(p) = game.scene.player.as_mut() {
@@ -5238,7 +5247,9 @@ fn context_check(
         Some(t) => {
             *t += tick;
             let offered = game.context.as_ref().filter(|(o, _)| *o == g);
-            if *t >= 1.0
+            // Soon: put by a starter whose spot has no floor under it, she
+            // falls out of its reach within the second.
+            if *t >= 0.2
                 && let Some((_, text)) = offered
             {
                 eprintln!("context-check: the prompt reads {text:?}; she takes it");

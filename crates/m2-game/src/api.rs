@@ -1218,6 +1218,26 @@ fn is_template(name: &str) -> bool {
     name.starts_with(|c: char| c.is_ascii_uppercase()) && !name.contains('_')
 }
 
+/// The people of squad `squad` (an object's name, `oc001.obj1.vzsquad1`)
+/// among `objects` (guid, name): those placed as `oc001.obj1.vz1 0x...`,
+/// its name less `squad`, in guid order. Inferred from the layers' names.
+fn squad_members<'a>(squad: &str, objects: impl Iterator<Item = (u32, &'a str)>) -> Vec<u32> {
+    let squad = squad.rfind(" 0x").map_or(squad, |i| &squad[..i]);
+    let Some(i) = squad.rfind("squad") else {
+        return Vec::new();
+    };
+    let unit = format!("{}{}", &squad[..i], &squad[i + "squad".len()..]);
+    let mut out: Vec<u32> = objects
+        .filter(|(_, n)| {
+            n.strip_prefix(unit.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(" 0x"))
+        })
+        .map(|(g, _)| g)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
 fn guid_value(g: Option<u32>) -> Value {
     g.map_or(Value::Nil, crate::events::guid_value)
 }
@@ -2588,6 +2608,32 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let near = num(t.raw_get::<Value>("MoveDistance").ok().as_ref()).unwrap_or(4.0);
         w.commands.push(Command::Follow { guid, target, near });
         values([Value::Boolean(true)])
+    })?;
+    // `Ai.Squad{ SquadGuid, Action = "GetUnits" }`: the squad's people
+    // (OilCon001 waits on `oc001.obj1.vzsquad1`'s to fall). Inferred from
+    // the layer's names, not read from a link: a squad `<p>.<side>squad<n>`
+    // is the people placed as `<p>.<side><n> 0x...` (`vz_state_oilcon001_
+    // part1`: `oc001.obj1.vz1 0x10001d9b` ...). Other actions do nothing.
+    add(&ai, "Squad", |w, lua, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([]);
+        };
+        let get = matches!(
+            t.raw_get::<Value>("Action")?,
+            Value::String(s) if s.as_bytes().eq_ignore_ascii_case(b"getunits")
+        );
+        let squad = id(t.raw_get::<Value>("SquadGuid").ok().as_ref())
+            .and_then(|g| w.objects.get(&g))
+            .map(|o| o.name.clone());
+        let (true, Some(squad)) = (get, squad) else {
+            return values([]);
+        };
+        let units = squad_members(&squad, w.objects.iter().map(|(&g, o)| (g, o.name.as_str())));
+        let list = lua.create_table()?;
+        for (i, g) in units.into_iter().enumerate() {
+            list.raw_set(i + 1, guid_value(Some(g)))?;
+        }
+        values([Value::Table(list)])
     })?;
     add(&ai, "Deploy", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
@@ -4417,6 +4463,63 @@ mod tests {
         events.update_shared(0.1, &world);
         let dropped: String = host.lua().globals().get("dropped").unwrap();
         assert_eq!(dropped, "82");
+    }
+
+    #[test]
+    fn a_squad_is_the_people_placed_under_its_name() {
+        let objects = [
+            (0x1d96, "oc001.obj1.oc1 0x10001d96"),
+            (0x1d9e, "oc001.obj1.vz1 0x10001d9e"),
+            (0x1d9b, "oc001.obj1.vz1 0x10001d9b"),
+            (0x1daa, "M151 .50Cal (VZ) 0x10001daa"),
+            (0x1dab, "oc001.obj1.vz10 0x10001dab"),
+        ];
+        assert_eq!(
+            super::squad_members("oc001.obj1.vzsquad1", objects.into_iter()),
+            [0x1d9b, 0x1d9e]
+        );
+        assert_eq!(
+            super::squad_members("oc001.obj1.ocsquad1", objects.into_iter()),
+            [0x1d96]
+        );
+        assert!(super::squad_members("PirSquad", objects.into_iter()).is_empty());
+    }
+
+    #[test]
+    fn a_delivery_hears_its_cargo_let_go_by_any_carrier() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(80, Object::new("copter", [0.0, 100.0, 0.0]));
+            let mut pilot = Object::new("pilot", [0.0, 100.0, 0.0]);
+            pilot.vehicle = Some(80);
+            w.insert(81, pilot);
+            w.insert(82, Object::new("post", [0.0, 95.0, 0.0]));
+        }
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        // As `MrxTaskObjectiveDeliver` waits for cargo that reached its
+        // place still hanging (OilCon002's listening posts).
+        host.lua()
+            .load(
+                r#"
+                heard = nil
+                local copter, post = Sys.StringToGuid("80"), Sys.StringToGuid("82")
+                Object.AttachCargoToWinch(post, copter)
+                Event.Create(Event.ObjectWinched, {post, 0, "any"}, function(c)
+                    heard = Object.IsWinched(c)
+                end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        events.update_shared(0.1, &world);
+        let heard =
+            |host: &ScriptHost| -> Option<bool> { host.lua().globals().get("heard").unwrap() };
+        assert_eq!(heard(&host), None);
+        assert!(arrived(&world, 81, [50.0, 0.0, 60.0]).is_empty());
+        events.update_shared(0.1, &world);
+        assert_eq!(heard(&host), Some(false));
     }
 
     #[test]
