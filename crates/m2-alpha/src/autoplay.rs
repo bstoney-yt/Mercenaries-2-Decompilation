@@ -63,9 +63,15 @@ const TAKE_NEAR: f32 = 40.0;
 /// She shoots soldiers from within this far (metres), and blows things up
 /// from between these.
 const SHOOT_RANGE: f32 = 35.0;
+/// Shooting a target with her rifle she fires this long (seconds) of
+/// every so long (invented).
+const TAP_FOR: f32 = 0.12;
+const TAP_EVERY: f32 = 0.5;
 /// Targets that rounds break she shoots from within this far (metres;
 /// invented, the ranges' furthest statues from their towers).
 const SNIPE_RANGE: f32 = 130.0;
+/// Shooting a target with her rifle she fires this long (seconds) of
+/// every so long (invented). TAP_FOR: f32 = 0.12; TAP_EVERY: f32 = 0.5;
 const BLAST_RANGE: (f32, f32) = (15.0, 45.0);
 /// With nothing to blow things up with, she mans an emplaced gun this
 /// near her (metres) that is this near the target (invented).
@@ -2143,7 +2149,10 @@ impl Autoplay {
             look,
             trigger: Trigger {
                 aim: true,
-                fire: self.steady > STEADY,
+                // In short bursts, her spread settling between them (the
+                // weapons' bloom): held down, 240 rounds broke 8 of
+                // PmcCon032's 21 statues and her clips ran dry (round 13).
+                fire: self.steady > STEADY && self.clock.rem_euclid(TAP_EVERY) < TAP_FOR,
                 select: (game.combat.weapon != Weapon::Rifle).then_some(Weapon::Rifle),
                 ..Trigger::default()
             },
