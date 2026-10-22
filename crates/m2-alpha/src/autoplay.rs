@@ -54,6 +54,9 @@ const RIDE_STILL: f32 = 20.0;
 /// out and in again.
 const RIDE_AGAIN: f32 = 10.0;
 const CIRCLE_AFTER: f32 = 4.0;
+/// Driven to a delivery point and waiting there this long (seconds) with
+/// nothing happening, she gets out (invented).
+const DELIVER_AFTER: f32 = 5.0;
 const CIRCLE: f32 = 6.0;
 /// At a place this long (seconds) with nothing happening, she takes one
 /// of the scripts' vehicles standing within this far of it (metres): a
@@ -721,6 +724,27 @@ impl Autoplay {
             && self.waiting.is_none_or(|w| w.0 != *target)
         {
             self.waiting = Some((*target, t));
+        }
+        // Driven to a delivery point and nothing happens there: she gets
+        // out. A delivery of the vehicle itself counts as she leaves it
+        // (`MrxTaskObjectiveDeliver` hears her climb out; MecCon001's
+        // "Park inside the garage": round 6 sat in the truck at 0 m for
+        // 1500 s).
+        if let (Some(Goal::Reach { target, .. }), Some((w, since))) = (&self.goal, self.waiting)
+            && w == *target
+            && !self.leave
+            && self.clock - since > DELIVER_AFTER
+            && marks
+                .iter()
+                .any(|m| m.target == w && m.alive && m.kind == "deliverable")
+            && let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving)
+            && self.may_get_out(game, i)
+        {
+            eprintln!(
+                "autoplay {:.1} s: at {} in the {} with nothing happening: getting out",
+                self.clock, self.what, game.scene.vehicles[i].spec.label
+            );
+            self.leave = true;
         }
         if self.clock >= self.next_report {
             self.next_report = self.clock + REPORT;
