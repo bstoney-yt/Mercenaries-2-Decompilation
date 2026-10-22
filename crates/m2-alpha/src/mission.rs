@@ -1964,7 +1964,18 @@ impl MissionLink {
         // scripts hear it, so what is offered by her (her `Talk`) is where
         // she sits, not at the building's origin.
         for (g, at, yaw) in std::mem::take(&mut game.scene.prop_rider_spots) {
-            mission.place(g, at.to_array(), yaw);
+            // Taken out of the seat since the spot was found (a briefing's
+            // `Vehicle.Exit` and `SetTransformToObject`): the scripts' place
+            // stands, or Fiona went back to her desk for the talk.
+            let seated = mission
+                .world()
+                .borrow()
+                .objects
+                .get(&g)
+                .is_some_and(|o| o.vehicle.is_some());
+            if seated {
+                mission.place(g, at.to_array(), yaw);
+            }
         }
         let props = &game.scene.props;
         game.scene.prop_crews = mission
