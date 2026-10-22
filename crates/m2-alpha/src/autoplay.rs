@@ -108,6 +108,29 @@ const PRESS_AGAIN: f32 = 3.0;
 /// A spot to fire from more than this above or below her once she is
 /// over it is one she can't get to (metres). Invented.
 const SPOT_RISE: f32 = 2.5;
+/// Rings (metres) round her looked on for a way out of the water.
+/// Invented.
+const LANDING_RINGS: [f32; 6] = [6.0, 12.0, 24.0, 48.0, 96.0, 192.0];
+/// Ground this far (metres) over the water is out of it. Invented.
+const LANDING_DRY: f32 = 0.3;
+/// How far (metres) short of a way out, towards her, the water must be
+/// shallow enough to stand in. Invented.
+const LANDING_WADE: f32 = 2.0;
+/// Ways out she doesn't get out at before she is hopped out. Invented.
+const STRANDED_HOP: u32 = 2;
+/// A thing to blow up lower than this (metres) over the waterline is on
+/// the water. Invented.
+const AFLOAT: f32 = 3.0;
+/// Ground this far (metres) below her feet a step ahead is a drop she
+/// doesn't step closer over. Invented.
+const LEDGE_DROP: f32 = 3.0;
+/// Seconds with no headway towards a spot to fire from before she tries
+/// another (short of the hop's). Invented.
+const SPOT_GIVE_UP: f32 = 20.0;
+/// Searches finding nowhere to fire from before she goes for another of
+/// the things to blow up, and for how long (seconds). Invented.
+const PASS_AFTER: u32 = 3;
+const PASS_FOR: f32 = 180.0;
 /// A vehicle's cannon in range of her goal this long (seconds) without
 /// bringing it down, she gets out. Invented.
 const CANNON_GIVE_UP: f32 = 30.0;
@@ -417,6 +440,14 @@ pub struct Autoplay {
     /// Where she goes to fire at what she is blowing up (its object, the
     /// spot); the spots no better go in `tried` too.
     blast_spot: Option<(u32, Vec3)>,
+    /// Where she is swimming to climb out of the water (see [`landing`]).
+    landing: Option<Vec3>,
+    /// Searches in a row for a spot to fire from that found none, and the
+    /// things to blow up she passed over for now (object, until when).
+    nowhere: u32,
+    passed: Vec<(u32, f32)>,
+    /// Ways out of the water in a row she didn't get out at.
+    stranded: u32,
     /// With the launcher empty, the C4 she set on what she is blowing up
     /// and when, while she gets clear to set it off.
     planted: Option<f32>,
@@ -428,6 +459,8 @@ pub struct Autoplay {
     /// going for.
     boarding: Option<(usize, f32)>,
     left_rides: Vec<usize>,
+    /// Hops she has had driving to the goal she is after.
+    drive_hops: u32,
     /// Sidestepping (-1 left, 1 right), seconds left.
     sidestep: Option<(f32, f32)>,
     /// Which way the next sidestep goes.
@@ -620,6 +653,7 @@ impl Autoplay {
             self.stalled = 0.0;
             self.way = None;
             self.gunning = 0.0;
+            self.drive_hops = 0;
         }
         self.goal = chosen.map(|c| c.0);
         // The scripts' prompt on what she went to (a verify on a body, a
@@ -666,6 +700,22 @@ impl Autoplay {
         if self.clock >= self.next_report {
             self.next_report = self.clock + REPORT;
             self.report(game);
+        }
+        // In a helicopter she can't fly (round 38's AllCon002: boarding at
+        // the HQ she got the Coanda by the tank, which climbed to 62 km):
+        // out, and not that one again.
+        if let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving)
+            && game.scene.vehicles[i].spec.is_helicopter()
+            && !self.leave
+        {
+            eprintln!(
+                "autoplay {:.1} s: in the {}, which she doesn't fly: getting out",
+                self.clock, game.scene.vehicles[i].spec.label
+            );
+            self.leave = true;
+            if !self.left_rides.contains(&i) {
+                self.left_rides.push(i);
+            }
         }
         let sturdy = |target: &u32| game.scene.props.sturdy.contains(target);
         // Her launcher spent (round 13: three tanks took all her rockets,
@@ -1119,7 +1169,7 @@ impl Autoplay {
                 })
         };
         // What to destroy, and HVTs to verify still standing: shot first.
-        let destroy: Vec<&Mark> = live
+        let mut destroy: Vec<&Mark> = live
             .iter()
             .copied()
             .filter(|m| {
@@ -1128,6 +1178,16 @@ impl Autoplay {
                         && npcs.iter().any(|n| n.spawn == Some(m.target) && n.alive))
             })
             .collect();
+        // Not one she found nowhere to fire at for now, while others are
+        // left (round 31's AllCon002: the second boat under its bank).
+        let passed = |m: &&Mark| {
+            self.passed
+                .iter()
+                .any(|&(t, until)| t == m.target && self.clock < until)
+        };
+        if destroy.iter().any(|m| !passed(m)) {
+            destroy.retain(|m| !passed(m));
+        }
         if let Some(m) = nearest(destroy, here) {
             // A vehicle to destroy is blown up, not its crew shot: the
             // crew aboard come into play under its guid (PmcCon003's
@@ -1368,7 +1428,7 @@ impl Autoplay {
         let near = |i: usize, within: f32| {
             vehicles
                 .get(i)
-                .is_some_and(|v| !v.wrecked && !v.spec.is_boat())
+                .is_some_and(|v| !v.wrecked && !v.spec.is_boat() && !v.spec.is_helicopter())
                 && !self.left_rides.contains(&i)
                 && vehicle_at(game, i).is_some_and(|t| t.w_axis.truncate().distance(here) < within)
         };
@@ -1982,6 +2042,7 @@ impl Autoplay {
             return Intent::default();
         };
         let here = p.character.position;
+        let swimming_now = p.swimming();
         let d = at.distance(here);
         let lobbing = game.combat.second == Some(Weapon::GrenadeLauncher);
         let (near, far) = if lobbing { LOB_RANGE } else { BLAST_RANGE };
@@ -1996,11 +2057,87 @@ impl Autoplay {
         if !lobbing && rockets == 0 && (game.combat.charges > 0 || self.planted.is_some()) {
             return self.plant(game, at, dt);
         }
+        // In the water she can't fire: out where she can climb, first.
+        if swimming_now {
+            let out = game
+                .scene
+                .world
+                .as_ref()
+                .and_then(|w| landing(&w.physics, here, at, &self.tried));
+            // One she swims at and can't climb out at: another.
+            if let Some(l) = self.landing
+                && self.since_moved() > SPOT_GIVE_UP
+            {
+                eprintln!(
+                    "autoplay {:.1} s: no way out at {l:.1} in {SPOT_GIVE_UP} s: another",
+                    self.clock
+                );
+                self.tried.push(l);
+                self.landing = None;
+                self.fresh_headway();
+                self.stranded += 1;
+                // Swimming she gets out at none of them (round 33's
+                // AllCon002: 11 banks in 2000 s): hopped out, as a hop
+                // anywhere she makes no headway, and logged with them.
+                if self.stranded >= STRANDED_HOP
+                    && let Some(p) = game.scene.player.as_mut()
+                {
+                    eprintln!(
+                        "autoplay {:.1} s: no headway for {:.0} s at {here:.1} ({}): hopped to {l:.1}",
+                        self.clock,
+                        SPOT_GIVE_UP * self.stranded as f32,
+                        self.what
+                    );
+                    p.character.position = l + Vec3::Y * 0.1;
+                    p.character.velocity = Vec3::ZERO;
+                    self.hops.push((here, l));
+                    self.stranded = 0;
+                    return Intent::default();
+                }
+            }
+            if let Some(out) = out {
+                if self.landing.is_none_or(|l| l.distance(out) > 4.0) {
+                    eprintln!(
+                        "autoplay {:.1} s: in the water at {here:.1}: out at {out:.1}",
+                        self.clock
+                    );
+                }
+                self.landing = Some(out);
+                self.blast_spot = None;
+                self.blocked = 0.0;
+                return self.walk(game, out, 1.0, dt);
+            }
+        } else if here.y > WATERLINE + LANDING_DRY {
+            // Only once out on dry ground: in the shallows she is in and out
+            // of swimming (round 34's AllCon002: 12 ways out, never hopped).
+            self.stranded = 0;
+        }
+        self.landing = None;
+        let Some(p) = game.scene.player.as_ref() else {
+            return Intent::default();
+        };
         // Going where she can fire from (in range, nothing in the way).
         if let Some((_, spot)) = self.blast_spot {
-            if spot.with_y(0.0).distance(here.with_y(0.0)) >= ARRIVE {
-                self.arrived = None;
-                return self.walk(game, spot, 1.0, dt);
+            let off = spot.with_y(0.0).distance(here.with_y(0.0));
+            // Near enough once she gets no nearer (round 35's AllCon002:
+            // stopped 3 m off, each such spot given up as unreached).
+            let close = off < 2.0 * ARRIVE && self.since_moved() > SPOT_GIVE_UP;
+            if off >= ARRIVE && !close {
+                // One she gets no nearer to (round 28's AllCon002: 6 m short
+                // of it, 2000 s of hops on the spot): another.
+                if self.since_moved() > SPOT_GIVE_UP {
+                    eprintln!(
+                        "autoplay {:.1} s: no nearer the spot {spot:.1} in {SPOT_GIVE_UP} s: another",
+                        self.clock
+                    );
+                    self.tried.push(spot);
+                    self.blast_spot = None;
+                    self.blocked = BLAST_BLOCKED;
+                    self.fresh_headway();
+                } else {
+                    self.arrived = None;
+                    return self.walk(game, spot, 1.0, dt);
+                }
             }
             // Under it or over it (round 6's AllCon002: a roof by the
             // river, and she fell in under it): one she can't get to.
@@ -2016,10 +2153,66 @@ impl Autoplay {
             }
         }
         if d > far {
+            // A boat: from a dry spot in range, not straight out at it into
+            // the river (rounds 30 to 33's AllCon002, 48 m short of the
+            // first boat, in the water from there on).
+            if self.blast_spot.is_none()
+                && at.y < WATERLINE + AFLOAT
+                && let Some(s) = game.scene.world.as_ref().and_then(|w| {
+                    let rings: &[f32] = if lobbing { &LOB_RINGS } else { &BLAST_RINGS };
+                    // Else the dry ground nearest it (round 34's AllCon002:
+                    // no spot in range saw it, and she went in again).
+                    // Within range of it (round 35's: spots 270 m off).
+                    vantage(&w.physics, at, here, &self.tried, rings, BLAST_BODY).or_else(|| {
+                        landing(&w.physics, at, here, &self.tried)
+                            .filter(|s| s.distance(at) < far - ARRIVE)
+                    })
+                })
+            {
+                eprintln!(
+                    "autoplay {:.1} s: {} is on the water: firing from {s:.1}",
+                    self.clock, self.what
+                );
+                self.blast_spot = Some((target, s));
+                self.fresh_headway();
+                return self.walk(game, s, 1.0, dt);
+            }
+            // On the water with no dry ground in range of it (rounds 30 to
+            // 37's first boat: she went in after it every time): another
+            // for now, this one once the rest are done.
+            if self.blast_spot.is_none()
+                && at.y < WATERLINE + AFLOAT
+                && !self
+                    .passed
+                    .iter()
+                    .any(|&(t, until)| t == target && self.clock < until)
+            {
+                eprintln!(
+                    "autoplay {:.1} s: no dry ground in range of {}: another for {PASS_FOR} s",
+                    self.clock, self.what
+                );
+                self.passed.push((target, self.clock + PASS_FOR));
+            }
             return self.walk(game, at, far - 5.0, dt);
         }
         if d < near {
-            // Too close for a rocket or a round: back off.
+            // Too close for a rocket or a round: back off, to a spot to
+            // fire from if there is one (round 36's AllCon002: in the river
+            // by the third boat, 1900 s getting no further off).
+            if self.blast_spot.is_none()
+                && let Some(s) = game.scene.world.as_ref().and_then(|w| {
+                    let rings: &[f32] = if lobbing { &LOB_RINGS } else { &BLAST_RINGS };
+                    vantage(&w.physics, at, here, &self.tried, rings, BLAST_BODY)
+                })
+            {
+                eprintln!(
+                    "autoplay {:.1} s: too close to {}: firing from {s:.1}",
+                    self.clock, self.what
+                );
+                self.blast_spot = Some((target, s));
+                self.fresh_headway();
+                return self.walk(game, s, 1.0, dt);
+            }
             let away = here + (here - at).with_y(0.0).normalize_or(Vec3::X) * 10.0;
             return self.walk(game, away, 1.0, dt);
         }
@@ -2061,6 +2254,20 @@ impl Autoplay {
                 .as_ref()
                 .and_then(|w| vantage(&w.physics, at, here, &self.tried, rings, BLAST_BODY))
                 .map(|s| (target, s));
+            self.nowhere = if self.blast_spot.is_none() {
+                self.nowhere + 1
+            } else {
+                0
+            };
+            if self.nowhere >= PASS_AFTER {
+                eprintln!(
+                    "autoplay {:.1} s: nowhere to fire at {} from: another for {PASS_FOR} s",
+                    self.clock, self.what
+                );
+                self.passed.push((target, self.clock + PASS_FOR));
+                self.nowhere = 0;
+                self.tried.clear();
+            }
             eprintln!(
                 "autoplay {:.1} s: no shot at {} from {here:.1} ({}, aim off {error:.3}): {}",
                 self.clock,
@@ -2076,7 +2283,15 @@ impl Autoplay {
                     })
             );
         }
-        let movement = if !clear && self.steady > 1.0 && self.blast_spot.is_none() {
+        // Not over a drop, though (round 27's AllCon002: aimed at a boat
+        // from the top of a bank, she stepped off it into the river).
+        let ahead = here + (at - here).with_y(0.0).normalize_or_zero() * 2.0;
+        let ledge = game.scene.world.as_ref().is_none_or(|w| {
+            w.physics
+                .cast_ray(ahead + Vec3::Y * 1.0, Vec3::NEG_Y, 1.0 + LEDGE_DROP)
+                .is_none()
+        });
+        let movement = if !clear && self.steady > 1.0 && self.blast_spot.is_none() && !ledge {
             Vec2::Y
         } else {
             Vec2::ZERO
@@ -2660,7 +2875,9 @@ impl Autoplay {
             .and_then(|i| game.scene.vehicles.get(i))
             .is_some_and(|v| v.spec.is_boat());
         if still > if afloat { HOP_AFTER_BOAT } else { HOP_AFTER } {
-            // Stuck driving close to the place: on foot from here. Not
+            // Stuck driving close to the place, or stuck driving a second
+            // time on the way there (round 26: a truck hopped a few metres
+            // at a time for 370 s, 165 m off): on foot from here. Not
             // with goods riding on her vehicle: they are what she brings
             // there (PirCon002's rum, left 162 m short in round 43); the
             // vehicle hops on with them instead.
@@ -2669,7 +2886,7 @@ impl Autoplay {
             // Nor in a boat: off it she is in the sea, and a race is lost
             // (PirCon001 round 98 got off her jetski 58 m from a gate).
             if let Some(i) = driving
-                && near
+                && (near || self.drive_hops > 0)
                 && !afloat
                 && !game.scene.props.carrying(i)
                 && game
@@ -2696,6 +2913,9 @@ impl Autoplay {
                 .map(|w| w.route.steer(from, HOP).0)
                 .filter(|to| (*to - from).with_y(0.0).length() >= HOP_LEAST)
                 .unwrap_or(at);
+            if driving.is_some() {
+                self.drive_hops += 1;
+            }
             self.hop(game, to, still);
             return true;
         }
@@ -2714,11 +2934,24 @@ impl Autoplay {
         let flat = (at - from).with_y(0.0);
         // Not onto what she is blowing up (round 20's AllCon003: hopped onto
         // the last AA gun, too close to fire and stuck on it 2000 s).
-        let keep = match self.goal {
-            Some(Goal::Blast { .. }) => BLAST_RANGE.0 + 5.0,
-            _ => 0.0,
+        // Kept off the thing itself, not off the point of her way hopped to
+        // (round 29's AllCon002: a point 15 m on, 376 m from the boat, and
+        // 56 hops of 0 m).
+        let room = match self.goal {
+            Some(Goal::Blast { at: t, .. }) => {
+                (t - from).with_y(0.0).length() - (BLAST_RANGE.0 + 5.0)
+            }
+            _ => f32::INFINITY,
         };
-        let mut to = from + flat.normalize_or_zero() * (flat.length() - keep).clamp(0.0, HOP);
+        let step = flat.length().min(HOP).min(room.max(0.0));
+        let mut to = from + flat.normalize_or_zero() * step;
+        // Already nearer than that (round 36's AllCon002: 5 m from the third
+        // boat, hopped straight down to the riverbed 25 times): out to it.
+        if let Some(Goal::Blast { at: t, .. }) = self.goal
+            && room < 0.0
+        {
+            to = from + (from - t).with_y(0.0).normalize_or(Vec3::X) * (-room).min(HOP);
+        }
         let (Some(world), Some(p)) = (&mut game.scene.world, &mut game.scene.player) else {
             return;
         };
@@ -3000,6 +3233,45 @@ fn vantage(
         }
     }
     best.map(|(_, s)| s)
+}
+
+/// Where she can climb out of the water nearest `at`: ground on
+/// [`LANDING_RINGS`] round her, flat enough, no deeper than she can stand
+/// in and no more than [`SPOT_RISE`] over the water (round 27's AllCon002:
+/// in the river under a bank 18 m high, she swam there 2000 s). Of the
+/// nearest ring with any, the one closest to `toward`.
+fn landing(physics: &Physics, at: Vec3, toward: Vec3, tried: &[Vec3]) -> Option<Vec3> {
+    let ground = |x: f32, z: f32, water: f32| {
+        let top = Vec3::new(x, water + 30.0, z);
+        physics
+            .cast_ray(top, Vec3::NEG_Y, 60.0)
+            .map(|(d, n)| (top.y - d, n))
+    };
+    LANDING_RINGS.iter().find_map(|&r| {
+        (0..24)
+            .filter_map(|k| {
+                let a = k as f32 * std::f32::consts::TAU / 24.0;
+                let (x, z) = (at.x + r * a.sin(), at.z + r * a.cos());
+                let water = physics.water_at(x, z).unwrap_or(WATERLINE).max(WATERLINE);
+                let (y, n) = ground(x, z, water)?;
+                let spot = Vec3::new(x, y, z);
+                let rise = spot.y - water;
+                // Dry: shallows she still swims in (round 30's AllCon002:
+                // 1900 s from one to the next) are no way out.
+                if n.y < 0.7
+                    || !(LANDING_DRY..=SPOT_RISE).contains(&rise)
+                    || tried.iter().any(|t| t.distance(spot) < 4.0)
+                {
+                    return None;
+                }
+                // And waded up to from her side, not a lip over deep water
+                // (round 32's AllCon002: 2900 tries at banks 1 m up).
+                let back = spot + (at - spot).with_y(0.0).normalize_or_zero() * LANDING_WADE;
+                let (by, _) = ground(back.x, back.z, water)?;
+                (water - by < crate::player::SWIM_STOP * 0.8).then_some(spot)
+            })
+            .min_by(|a, b| a.distance(toward).total_cmp(&b.distance(toward)))
+    })
 }
 
 /// Vehicle `vehicles[i]`'s model to world, if placed.
@@ -3550,6 +3822,73 @@ mod tests {
             vantage(&p, target, target, &[], &BLAST_RINGS, BLAST_BODY),
             None
         );
+    }
+
+    // In a river with a bank 18 m high close by and a beach further off
+    // (round 27's AllCon002): out at the beach, not under the bank.
+    #[test]
+    fn out_of_the_water_where_she_can_climb() {
+        use m2_engine::{CollisionShape, StaticKey};
+        let mut p = Physics::new();
+        let flat = |x0: f32, x1: f32, y: f32| {
+            CollisionShape::mesh(
+                &[
+                    Vec3::new(x0, y, -80.0),
+                    Vec3::new(x1, y, -80.0),
+                    Vec3::new(x1, y, 80.0),
+                    Vec3::new(x0, y, 80.0),
+                ],
+                &[[0, 1, 2], [0, 2, 3]],
+            )
+            .unwrap()
+        };
+        let w = WATERLINE;
+        p.add_static(
+            StaticKey::Cell(1),
+            &flat(-30.0, 0.0, w - 4.0),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        // Shallows nearer than the beach: still in the water.
+        p.add_static(
+            StaticKey::Cell(4),
+            &flat(0.0, 20.0, w - 0.3),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        p.add_static(
+            StaticKey::Cell(2),
+            &flat(20.0, 80.0, w + 18.0),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        p.add_static(
+            StaticKey::Cell(3),
+            &flat(-80.0, -30.0, w + 0.5),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        p.step(1.0 / 60.0);
+        let here = Vec3::new(10.0, w - 0.3, 0.0);
+        let out = landing(&p, here, Vec3::new(30.0, w + 18.0, 0.0), &[]).expect("a way out");
+        assert!(out.x < -30.0, "not on the beach: {out}");
+        assert!((out.y - (w + 0.5)).abs() < 0.1, "{out}");
+        // No beach at all: nowhere.
+        let mut q = Physics::new();
+        q.add_static(
+            StaticKey::Cell(1),
+            &flat(-300.0, 20.0, w - 4.0),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        q.add_static(
+            StaticKey::Cell(2),
+            &flat(20.0, 300.0, w + 18.0),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        q.step(1.0 / 60.0);
+        assert_eq!(landing(&q, here, here, &[]), None);
     }
 
     // A truck-sized box round what she is blowing up (round 3's MLRS):
