@@ -4123,7 +4123,7 @@ pub(crate) fn steer_round(physics: &Physics, id: VehicleId, hull: (Vec3, Vec3)) 
     })
 }
 
-/// An angle wrapped to -Ï€..Ï€.
+/// An angle wrapped to -π..π.
 fn wrap(a: f32) -> f32 {
     let mut a = a.rem_euclid(std::f32::consts::TAU);
     if a > std::f32::consts::PI {
