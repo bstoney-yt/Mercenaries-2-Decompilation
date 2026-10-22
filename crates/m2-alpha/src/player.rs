@@ -439,11 +439,16 @@ impl Player {
         if let Some((_, rig)) = &mut self.model {
             rig.animator.set_upper(None);
             rig.two_handed = false;
-            let rate = match self.clips.swim {
-                Some(clip) => {
+            let rate = match self.clips.swim_clip(rig, moved) {
+                Some((clip, rate)) => {
+                    if rig.animator.current().map(|c| c.0) != Some(clip) {
+                        eprintln!(
+                            "player: swims with clip {:08x} at {rate:.2}x ({moved:.1} m/s)",
+                            rig.clips[clip].hash
+                        );
+                    }
                     rig.animator.play(clip);
-                    let own = rig.clips[clip].info.speed.max(0.1);
-                    (moved / own).clamp(SWIM_STILL_RATE, 2.5)
+                    rate
                 }
                 None => 1.0,
             };

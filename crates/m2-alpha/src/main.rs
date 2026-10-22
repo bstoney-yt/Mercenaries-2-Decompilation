@@ -6944,6 +6944,8 @@ struct Running {
     /// The pause menu's Quit: the alpha starts again at its front end
     /// ([`relaunch_front_end`]).
     to_front_end: bool,
+    /// A menu is up and the world's sounds are held ([`m2_engine::Mixer::hold`]).
+    sound_held: bool,
     /// When to load the player's own save as the pause menu does (`--load-at`):
     /// a test of loading in play.
     load_at: Option<Instant>,
@@ -7137,6 +7139,7 @@ impl App {
             cheat_typed: false,
             relaunch: None,
             to_front_end: false,
+            sound_held: false,
             load_at: self
                 .load_at
                 .map(|s| Instant::now() + Duration::from_secs_f32(s)),
@@ -7994,8 +7997,21 @@ impl Running {
         if (self.input.take_pressed(Action::Cheats) && self.dev || typed) && !self.hud.menu {
             self.show_cheats();
         }
+        if self.hud.menu != self.sound_held {
+            // Paused, the world's sounds, the dialogue and the music playing
+            // wait with the world; the menu's own sounds and music play.
+            self.sound_held = self.hud.menu;
+            self.audio.out.with(|m| {
+                if self.sound_held {
+                    use m2_engine::Category::{Chatter, Music, Vo, World};
+                    m.hold(&[World, Chatter, Vo, Music], &[World, Chatter, Vo]);
+                } else {
+                    m.release();
+                }
+            });
+        }
         if self.hud.menu {
-            // Paused: the world waits, sound carries on.
+            // Paused: the world waits.
             let (ear, facing) = self.game.listener();
             self.audio.update(ear, facing);
             return;
@@ -8099,7 +8115,7 @@ impl Running {
                 }
             }
             if let Some(cue) = m.take_music() {
-                self.audio.music_cue(cue.as_deref());
+                self.audio.music_cue_at(cue.as_deref(), m.music_at());
             }
             if let Some(preset) = m.take_reverb() {
                 self.audio.set_reverb(preset);

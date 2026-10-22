@@ -285,6 +285,9 @@ pub struct FightClips {
     /// the tables were read; Jennifer's own take-offs come first.
     pub swim: Option<usize>,
     pub swim_out: Option<usize>,
+    /// The swim gaits, slowest first: floating still, then the strokes
+    /// ([`FightClips::SWIM_GAITS`]).
+    pub swim_gaits: [Option<usize>; 4],
     /// Knocked down (lying, looped), getting up, and subdued (looped)
     /// ([`FightClips::KNOCKED`]).
     pub knocked: Option<usize>,
@@ -354,6 +357,40 @@ impl FightClips {
     /// The swim stroke and the climb-out (see [`FightClips::swim`]).
     pub const SWIM: u32 = 0xc846_e6fd;
     pub const SWIM_OUT: u32 = 0x97c8_40ed;
+    /// The swim gaits: the on-foot tables' rows beside the swim rows that
+    /// no actions table names (handles 82c3b8c6, 410aacbc, 980da78a and
+    /// 65a19525), as the upright gaits are. From samples: their root
+    /// speeds, 0, 0.67, 1.00 and 2.00 m/s, the body near the waterline in
+    /// each; which is which (float, slow, forward, fast) is inferred from
+    /// those speeds, the handles' names not being known.
+    pub const SWIM_GAITS: [u32; 4] = [0x64b3_cc44, 0x1b69_9e96, 0x2c6f_a0f0, 0x03bd_0113];
+
+    /// The swim clip for moving at `moved` m/s and its rate: the gait
+    /// whose own root speed is nearest, played to match it (within a
+    /// quarter either way); floating still, the still one at its own rate.
+    /// Without the gaits, the old stroke ([`Self::swim`]), slowed still.
+    pub fn swim_clip(&self, rig: &Rig, moved: f32) -> Option<(usize, f32)> {
+        let speed = |i: usize| rig.clips[i].info.speed;
+        let Some(&gait) = self.swim_gaits.iter().flatten().min_by(|&&a, &&b| {
+            (speed(a) - moved)
+                .abs()
+                .total_cmp(&(speed(b) - moved).abs())
+        }) else {
+            let clip = self.swim?;
+            let own = speed(clip).max(0.1);
+            return Some((
+                clip,
+                (moved / own).clamp(crate::player::SWIM_STILL_RATE, 2.5),
+            ));
+        };
+        let own = speed(gait);
+        let rate = if own > 0.1 {
+            (moved / own).clamp(0.75, 1.25)
+        } else {
+            1.0
+        };
+        Some((gait, rate))
+    }
     /// Down on the ground, getting up, and subdued: the on-foot tables'
     /// `KnockedDown` `Idle` (handle 8cf722a8), `KnockedDown` `Getup`
     /// (ade601a9) and `Subdued` `Idle` (dbd4f17d), from samples.
@@ -438,6 +475,7 @@ impl FightClips {
             bash_low: by_event(Self::BASH_LOW),
             swim: find(Self::SWIM),
             swim_out: find(Self::SWIM_OUT),
+            swim_gaits: Self::SWIM_GAITS.map(find),
             knocked: find(Self::KNOCKED),
             getup: find(Self::GETUP),
             subdued: find(Self::SUBDUED),
@@ -1125,11 +1163,10 @@ impl Npc {
         self.rig.animator.set_upper(None);
         self.rig.two_handed = false;
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
-        let rate = match self.clips.swim {
-            Some(clip) => {
+        let rate = match self.clips.swim_clip(&self.rig, moved) {
+            Some((clip, rate)) => {
                 self.rig.animator.play(clip);
-                let own = self.rig.clips[clip].info.speed.max(0.1);
-                (moved / own).clamp(crate::player::SWIM_STILL_RATE, 2.5)
+                rate
             }
             None => 1.0,
         };

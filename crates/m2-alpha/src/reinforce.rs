@@ -98,6 +98,9 @@ struct Sent {
     soldiers: Vec<(u32, String)>,
     /// Where they are set down, once it hovers there, and seconds since.
     down: Option<(Vec3, f32)>,
+    /// Called off in flight ([`Reinforcements::call_off`]): it sets
+    /// nobody down.
+    called_off: bool,
 }
 
 /// The reinforcements under way.
@@ -179,6 +182,7 @@ impl Reinforcements {
                 faction: f,
                 soldiers,
                 down: None,
+                called_off: false,
             });
         }
         let mut out = Vec::new();
@@ -192,9 +196,28 @@ impl Reinforcements {
                 out.push((*g, t.clone(), *at + Vec3::new(a.sin(), 0.0, a.cos()) * 2.5));
             }
         }
-        self.sent
-            .retain(|s| s.down.is_none_or(|(_, t)| t < BRING_FOR) && !s.soldiers.is_empty());
+        // One called off stays till its release is taken (it is not the
+        // scripts' to hear of).
+        self.sent.retain(|s| {
+            if s.called_off {
+                s.down.is_none()
+            } else {
+                s.down.is_none_or(|(_, t)| t < BRING_FOR) && !s.soldiers.is_empty()
+            }
+        });
         out
+    }
+
+    /// The contract is over: nothing more is sent, and the helicopters
+    /// still flying set nobody down. Invented: the game's own pursuit
+    /// helicopters are not read; ours landed soldiers in the villa she had
+    /// just taken.
+    pub fn call_off(&mut self) {
+        self.waiting.clear();
+        for s in self.sent.iter_mut().filter(|s| s.down.is_none()) {
+            s.called_off = true;
+            s.soldiers.clear();
+        }
     }
 
     /// Takes the releases that are its helicopters' (their soldiers are
@@ -206,6 +229,14 @@ impl Reinforcements {
                 let Some(s) = self.sent.iter_mut().find(|s| s.pilot == r.pilot) else {
                     return true;
                 };
+                if s.called_off {
+                    eprintln!(
+                        "reinforcements: the {} helicopter was called off",
+                        s.faction
+                    );
+                    s.down = Some((r.to, BRING_FOR));
+                    return false;
+                }
                 eprintln!(
                     "reinforcements: the {} helicopter sets its soldiers down at {:.1}",
                     s.faction, r.to
@@ -324,5 +355,28 @@ mod tests {
         }
         assert_eq!(r.brought, 2);
         assert!(r.step(&["Vza"], &squads, &mut flights, her, 0.1).is_empty());
+    }
+
+    #[test]
+    fn one_called_off_in_flight_sets_nobody_down_and_keeps_its_release() {
+        let squads = squads_of_two();
+        let mut r = Reinforcements::default();
+        let mut flights = Flights::default();
+        let her = Vec3::new(100.0, 5.0, 100.0);
+        r.step(&["Vza"], &squads, &mut flights, her, DELAY + 0.5);
+        assert_eq!(r.flown, 1);
+        let pilot = r.sent[0].pilot;
+        r.call_off();
+        // Still about till it hovers, so its release is not the scripts'.
+        assert!(r.step(&[], &squads, &mut flights, her, 0.1).is_empty());
+        let left = r.take_releases(vec![Release {
+            pilot,
+            to: her,
+            dropped: Vec::new(),
+        }]);
+        assert!(left.is_empty());
+        assert!(r.step(&[], &squads, &mut flights, her, 0.1).is_empty());
+        assert!(r.sent.is_empty());
+        assert_eq!(r.brought, 0);
     }
 }
