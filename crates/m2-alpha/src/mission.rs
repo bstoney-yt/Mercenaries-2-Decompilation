@@ -2179,19 +2179,20 @@ impl MissionLink {
             // Those standing as models (the gates) fall only to a support
             // strike, which the scripts give her; should they not, one is
             // given her anyway after a while.
-            // Not those whose template's damage row takes rounds (the
-            // ranges' statues and targets, PmcCon032-034): they break to
-            // rounds as the data says, and that destroys them.
+            // Not those whose template's damage row takes rounds or blasts
+            // (the ranges' statues, targets and columns, PmcCon031-034):
+            // they wear down as the data says, and breaking destroys them.
             let fragile = |g: u32| {
                 let (Some((p, _)), Some(w)) = (game.scene.props.get(g), game.scene.world.as_ref())
                 else {
                     return false;
                 };
                 let db = &w.index.template_db;
+                let makeup = crate::breakables::Makeup::of(db, p.template);
                 db.durability
                     .get(&p.template)
                     .is_some_and(|d| !d.invincible && d.health > 0.0)
-                    && crate::breakables::Makeup::of(db, p.template).bullet > 0.0
+                    && (makeup.bullet > 0.0 || makeup.explosion > 0.0)
             };
             let sturdy: HashSet<u32> = targets
                 .iter()

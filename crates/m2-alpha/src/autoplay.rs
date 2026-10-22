@@ -84,8 +84,14 @@ fn takes_rounds(game: &Game, g: u32) -> bool {
             .durability
             .get(&p.template)
             .is_some_and(|d| !d.invincible && d.health > 0.0)
-        && crate::breakables::Makeup::of(db, p.template).bullet > 0.0
+        && crate::breakables::Makeup::of(db, p.template).bullet >= ROUNDS_TAKEN
 }
+
+/// A target takes at least this much of a `Bullet`'s damage for her to
+/// shoot it rather than blow it up (invented: PmcCon031's columns take a
+/// little of rounds and stood through 240 s of her rifle, round 12; the
+/// pistol range's targets take all of them).
+const ROUNDS_TAKEN: f32 = 0.5;
 
 /// She keeps to the target she is blowing up unless another is this much
 /// nearer, metres (invented).
