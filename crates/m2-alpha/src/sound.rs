@@ -172,6 +172,9 @@ pub struct GameAudio {
     /// The music stream asked for (by hash) and whether it loops: a
     /// decoded stream that is not it was overtaken and is dropped.
     music_wanted: Option<(u32, bool)>,
+    /// Where the music asked for plays from: a radio's place and reach
+    /// ([`GameAudio::music_cue_at`]).
+    music_place: Option<(Vec3, f32)>,
     next_track: usize,
     decoded: (Sender<Decoded>, Receiver<Decoded>),
     /// Rifle shot, rocket launch, explosion, tank gun, grenade launcher,
@@ -453,6 +456,15 @@ const ZONE_FADE: f32 = 2.0;
 
 /// How loud the music plays.
 const MUSIC_GAIN: f32 = 0.6;
+
+/// How a radio's song carries ([`GameAudio::music_cue_at`]): full within
+/// a quarter of its `reach`, silent at it.
+fn radio_falloff(reach: f32) -> Falloff {
+    Falloff {
+        near: (reach * 0.25).max(1.0),
+        far: reach.max(2.0),
+    }
+}
 
 /// Banks the clips' sound events are found in, by name: the resident
 /// foley (`fol_rustle_human_02`, `fol_grenade_sidethrow_01`, ...).
@@ -1062,6 +1074,7 @@ impl GameAudio {
             streams,
             music: None,
             music_wanted: None,
+            music_place: None,
             next_track: 0,
             decoded: channel(),
             fight,
@@ -1278,7 +1291,16 @@ impl GameAudio {
     /// place of what plays, looped unless it is a one-shot (a fanfare);
     /// `None` stops the music.
     pub fn music_cue(&mut self, cue: Option<&str>) {
+        self.music_cue_at(cue, None);
+    }
+
+    /// [`Self::music_cue`], played from `at` (a radio's place and reach)
+    /// when given: full within a quarter of its reach, fading to silence at
+    /// it, and panned. Invented: the curve (the game's radio emitter is not
+    /// read); flat at full level, the radios drowned everything near them.
+    pub fn music_cue_at(&mut self, cue: Option<&str>, at: Option<(Vec3, f32)>) {
         self.ui_loaded();
+        self.music_place = at;
         // A cue the music's table doesn't have (some radio songs, kept in
         // no table this reads) leaves what plays playing.
         let found = cue.map(|c| (c, self.ui.as_ref().and_then(|u| u.music(c))));
@@ -2375,9 +2397,12 @@ impl GameAudio {
                     continue;
                 }
                 self.music_wanted = None;
-                let play = Play::flat(buffer)
-                    .gain(MUSIC_GAIN)
-                    .category(Category::Music);
+                let play = match self.music_place {
+                    Some((at, reach)) => Play::at(buffer, at).falloff(radio_falloff(reach)),
+                    None => Play::flat(buffer),
+                }
+                .gain(MUSIC_GAIN)
+                .category(Category::Music);
                 let play = if looped { play.looped() } else { play };
                 if let Some(old) = self.music.take() {
                     self.out.with(|m| m.stop(old));
@@ -2394,6 +2419,14 @@ impl GameAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_radio_is_full_close_by_and_silent_at_its_reach() {
+        let f = radio_falloff(25.0);
+        assert_eq!(f.gain(5.0), 1.0);
+        assert!(f.gain(15.0) < 1.0 && f.gain(15.0) > 0.0);
+        assert_eq!(f.gain(25.0), 0.0);
+    }
 
     #[test]
     fn a_heard_engine_runs_between_its_heard_pitches() {
