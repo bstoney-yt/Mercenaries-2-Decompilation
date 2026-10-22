@@ -327,14 +327,18 @@ const DELIVERY_AGAIN: f32 = 60.0;
 const FACE_THROW: f32 = 0.15;
 /// She calls in a delivery for a place this near it (its designator
 /// thrown from here lands well inside a 30 m drop zone), and keeps at the
-/// call while this near (round 5 walked 20 m off and dropped it), metres.
-/// Invented.
-const DELIVER_NEAR: f32 = 12.0;
+/// call while this near (round 5 walked 20 m off and dropped it), metres:
+/// facing it, a smoke thrown from 12 m landed 1.7 m off, and post C's spot
+/// lies in a crate she stops 23 m short of (round 16). Invented.
+const DELIVER_NEAR: f32 = 25.0;
 const DELIVER_KEEP: f32 = 40.0;
 /// After calling a delivery in, she waits this long for the scripts to
 /// hand her its designator (round 7: the call went out, and she walked off
 /// the frame after, the smoke not yet in her hand), seconds. Invented.
 const DESIGNATOR_WAIT: f32 = 3.0;
+/// Driving, she drives up to within this of a scripts' vehicle she is to
+/// get into before getting out for it, metres. Invented.
+const BOARD_DRIVE: f32 = 25.0;
 
 /// What she is after.
 #[derive(Clone, Debug, PartialEq)]
@@ -1277,6 +1281,24 @@ impl Autoplay {
             };
             if driving == Some(i) {
                 continue;
+            }
+            // Driving, and it far off: driven up to first (OilCon002 round
+            // 13 got out 250 m short of the armoured truck to hijack, and
+            // its timer ran out with her on foot).
+            let at = vehicle_at(game, i).map_or(m.at, |t| t.w_axis.truncate());
+            if driving.is_some() && vehicles[i].id.is_some() && at.distance(here) > BOARD_DRIVE {
+                return Some((
+                    Goal::Reach {
+                        target: m.target,
+                        at,
+                    },
+                    format!(
+                        "driving up to {} ({}), {:.0} m off",
+                        m.name,
+                        vehicles[i].spec.label,
+                        at.distance(here)
+                    ),
+                ));
             }
             return Some(if vehicles[i].id.is_some() {
                 (
