@@ -1346,7 +1346,7 @@ impl Autoplay {
             // 4's AllCon002 walked 600 m to the boats while Caracas fell).
             if driving.is_none()
                 && at.distance(here) > RIDE_FOR
-                && let Some(i) = self.ride_near(game, here)
+                && let Some(i) = self.ride_near(game, here, &live)
             {
                 return Some((
                     Goal::Board(i),
@@ -1372,7 +1372,9 @@ impl Autoplay {
             ));
         }
         // The scripts' vehicles they mark: in, or by where it will be.
-        for m in &live {
+        // (Not one marked to destroy: PmcCon031 round 16 got into the
+        // car she was blowing up.)
+        for m in live.iter().filter(|m| m.kind != "destroy") {
             let Some(i) = vehicles
                 .iter()
                 .position(|v| v.guid == Some(m.target) && !v.wrecked)
@@ -1437,7 +1439,7 @@ impl Autoplay {
         let m = nearest(places, here)?;
         if driving.is_none() {
             if m.at.distance(here) > RIDE_FOR
-                && let Some(i) = self.ride_near(game, here)
+                && let Some(i) = self.ride_near(game, here, &live)
             {
                 return Some((
                     Goal::Board(i),
@@ -1522,13 +1524,18 @@ impl Autoplay {
     /// A ride close to `here`, for somewhere far: the scripts' vehicle
     /// they brought last that she hasn't driven (the tank delivered for
     /// the next leg), else hers from before or another of theirs.
-    fn ride_near(&self, game: &Game, here: Vec3) -> Option<usize> {
+    fn ride_near(&self, game: &Game, here: Vec3, live: &[&Mark]) -> Option<usize> {
         let vehicles = &game.scene.vehicles;
         let near = |i: usize, within: f32| {
             vehicles
                 .get(i)
                 .is_some_and(|v| !v.wrecked && !v.spec.is_boat())
                 && !self.left_rides.contains(&i)
+                // Not one she is to destroy (PmcCon031's flung cars: she
+                // drove off in its targets, round 16).
+                && !vehicles[i].guid.is_some_and(|g| {
+                    live.iter().any(|m| m.target == g && m.kind == "destroy")
+                })
                 && vehicle_at(game, i).is_some_and(|t| t.w_axis.truncate().distance(here) < within)
         };
         // The one she set out for while it is still close (round 6 turned

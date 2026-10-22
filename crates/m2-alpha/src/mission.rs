@@ -3089,12 +3089,20 @@ impl MissionLink {
             return marks.into_iter().filter(ours).collect();
         }
         // None for it at all (a race's jetski, whose marker's mission the
-        // scripts give as a list): the primary objectives' marks.
-        let primary: Vec<Mark> = marks.iter().filter(|m| !m.secondary).cloned().collect();
+        // scripts give as a list): the primary objectives' marks. Not
+        // those the scripts put up for no mission (the jobs' and the
+        // island's treasures): between a contract's stages she went off
+        // after `_global_treasures 97`, 230 m away (PmcCon031/032 round
+        // 16), and the contract's timer ran out.
+        let primary: Vec<Mark> = marks
+            .iter()
+            .filter(|m| !m.secondary && m.mission.is_some())
+            .cloned()
+            .collect();
         if primary.iter().any(|m| m.alive) {
             primary
         } else {
-            marks
+            marks.into_iter().filter(|m| m.mission.is_some()).collect()
         }
     }
 
