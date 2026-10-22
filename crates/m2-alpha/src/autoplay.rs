@@ -63,6 +63,9 @@ const TAKE_NEAR: f32 = 40.0;
 /// She shoots soldiers from within this far (metres), and blows things up
 /// from between these.
 const SHOOT_RANGE: f32 = 35.0;
+/// Targets that rounds break she shoots from within this far (metres;
+/// invented, the ranges' furthest statues from their towers).
+const SNIPE_RANGE: f32 = 130.0;
 const BLAST_RANGE: (f32, f32) = (15.0, 45.0);
 /// With nothing to blow things up with, she mans an emplaced gun this
 /// near her (metres) that is this near the target (invented).
@@ -2116,8 +2119,16 @@ impl Autoplay {
             return Intent::default();
         };
         let here = p.character.position;
-        if at.distance(here) > SHOOT_RANGE {
-            return self.walk(game, at, SHOOT_RANGE - 5.0, dt);
+        // What rounds break is shot at from further: from her sniper
+        // tower, which she may not leave (PmcCon034 round 8: she walked
+        // off it for a statue 98 m off, and left the contract's bounds).
+        let range = if takes_rounds(game, target) {
+            SNIPE_RANGE
+        } else {
+            SHOOT_RANGE
+        };
+        if at.distance(here) > range {
+            return self.walk(game, at, range - 5.0, dt);
         }
         let spent = match self.rifle_on {
             Some((t, s)) if t == target => s + dt,
@@ -2222,10 +2233,11 @@ impl Autoplay {
             if self.no_gun_logged != Some(target) {
                 self.no_gun_logged = Some(target);
                 let (n, nearest) = game.placed.emplaced_nearest(&game.scene.props, here);
+                let swimming = game.scene.player.as_ref().is_some_and(|p| p.swimming());
                 eprintln!(
                     "autoplay {:.1} s: nothing to blow up {target:#x} with (rockets {rockets}, \
-                     weapons away {holstered}) and no emplaced gun in reach: {n} known, nearest \
-                     {nearest:x?}",
+                     weapons away {holstered}, swimming {swimming}) and no emplaced gun in \
+                     reach: {n} known, nearest {nearest:x?}",
                     self.clock
                 );
             }
@@ -2234,6 +2246,11 @@ impl Autoplay {
             if !holstered {
                 return self.rifle_at(game, target, at, dt);
             }
+            // Her weapons away and no gun to man: she stays where the
+            // scripts put her until they give them back (PmcCon034 round
+            // 8: she walked off its tower and the contract was cancelled
+            // for leaving its bounds).
+            return Intent::default();
         }
         // Going where she can fire from (in range, nothing in the way).
         if let Some((_, spot)) = self.blast_spot {
