@@ -39,6 +39,9 @@
 //! `--fight` she shoots the nearest soldier, fires a rocket at a vehicle and
 //! throws a grenade.
 
+mod aim;
+#[cfg(target_os = "android")]
+mod android;
 mod autoplay;
 mod binoculars;
 mod breakables;
@@ -49,6 +52,7 @@ mod combat;
 mod config;
 mod coop;
 mod destruct;
+mod disguise;
 mod display;
 mod drops;
 mod flights;
@@ -60,6 +64,7 @@ mod held;
 mod hero;
 mod hijack;
 mod input;
+mod jobs;
 mod keytable;
 mod loading;
 mod mission;
@@ -76,6 +81,7 @@ mod player;
 mod props;
 mod puppet;
 mod raw;
+mod reinforce;
 mod roads;
 mod route;
 mod save;
@@ -88,6 +94,7 @@ mod startup;
 mod strikes;
 mod subtitles;
 mod support;
+mod touch;
 mod traffic;
 mod ui;
 
@@ -106,7 +113,9 @@ use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, Window, WindowId};
+#[cfg(not(target_os = "android"))]
+use winit::window::CursorGrabMode;
+use winit::window::{Window, WindowId};
 
 use camera::FlyCamera;
 use config::Config;
@@ -161,6 +170,9 @@ struct Options {
     /// With `--mission`: the story skipped to this contract the game's
     /// developer way, and whether to its briefing (`--skip-to <id>[,briefing]`).
     skip_to: Option<(String, bool)>,
+    /// With `--skip-to` a job: she is put this far from its nearest
+    /// target once it is tracked (`--job-near <m>`, a test shortcut).
+    job_near: Option<f32>,
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
@@ -409,6 +421,10 @@ struct Options {
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
     hurt: Option<f32>,
+    /// With `--mission`: driving, the horn is held half a second every
+    /// this many seconds (to hear it, and what the gates, the disguise
+    /// and friendly soldiers make of it).
+    honk_every: Option<f32>,
     /// With `--mission --screenshot`: she plays the mission herself, by
     /// its markers, until it is done or the seconds are up.
     autoplay: bool,
@@ -459,14 +475,14 @@ fn registry_install() -> Option<Install> {
         .find_map(|dir| Install::find(std::path::Path::new(&dir)).ok())
 }
 
-fn parse_args() -> anyhow::Result<Options> {
+fn parse_args(given: &[String]) -> anyhow::Result<Options> {
     let mut o = Options {
         skip_mode_off: true,
         coop_seconds: 30.0,
         ..Options::default()
     };
     let (mut coop_role, mut coop_local, mut coop_name) = (None, false, None);
-    let mut args = std::env::args().skip(1);
+    let mut args = given.iter().cloned();
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
         match arg.as_str() {
@@ -567,6 +583,7 @@ fn parse_args() -> anyhow::Result<Options> {
                     None => (v, false),
                 });
             }
+            "--job-near" => o.job_near = Some(value()?.parse()?),
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
@@ -813,6 +830,9 @@ fn parse_args() -> anyhow::Result<Options> {
             "--autoplay" => o.autoplay = true,
             "--smarter-ai" => o.smarter_ai = true,
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
+            "--honk-every" => {
+                o.honk_every = Some(value()?.parse().context("--honk-every expects seconds")?)
+            }
             "--gates" => o.gates = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
             "--contracts" => {
@@ -858,8 +878,8 @@ fn parse_args() -> anyhow::Result<Options> {
         "--coop-local",
         "--name",
     ];
-    if std::env::args()
-        .skip(1)
+    if given
+        .iter()
         .all(|a| !a.starts_with("--") || PLAIN.contains(&a.as_str()))
     {
         o.alpha = true;
@@ -928,9 +948,21 @@ const PLACED_CHECK_EVERY: f32 = 5.0;
 /// are hit before they are, seconds: for the contract's layers to be in.
 const PROPS_CHECK_AFTER: f32 = 20.0;
 
+// The Android build's entry point is `android::android_main`.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
-    let mut options = parse_args()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    run(&args, EventLoop::new)
+}
+
+/// The game, given its arguments and how to make its event loop (the
+/// Android build hands over the activity's).
+fn run(
+    args: &[String],
+    event_loop: impl FnOnce() -> Result<EventLoop<()>, winit::error::EventLoopError>,
+) -> anyhow::Result<()> {
+    let mut options = parse_args(args)?;
     combat::use_attach_frame(!options.hands_grip);
     let config_path = options
         .config_path
@@ -1032,7 +1064,7 @@ fn main() -> anyhow::Result<()> {
         return screenshot(&config, install.as_ref(), &mode, &options, out);
     }
 
-    let event_loop = EventLoop::new()?;
+    let event_loop = event_loop()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
         config,
@@ -3227,6 +3259,7 @@ fn front_end_offscreen(
     // `M2_SHELL_PRESS_START`: start the shell from its press-start
     // screen first, the keys counting from then.
     let mut waiting_start = std::env::var_os("M2_SHELL_PRESS_START").is_some();
+    let (mut attract_seen, mut woken) = (false, false);
     loop {
         t += step;
         let since = up_at.map(|u| t - u);
@@ -3320,6 +3353,27 @@ fn front_end_offscreen(
                 }
             }
         }
+        // Left long enough, the menus wait in their attract state (see
+        // `shell::ATTRACT_STATE`): the next key (not 0) or click takes them
+        // back, and they don't see it.
+        let attract = shell.shell().attract;
+        if attract != attract_seen {
+            attract_seen = attract;
+            woken = false;
+            eprintln!(
+                "front end: {} at {t:.1} s",
+                if attract {
+                    "the menus wait in their attract state"
+                } else {
+                    "the menus are back"
+                }
+            );
+        }
+        if attract && (pressed.iter().any(|&(_, down)| down) || clicked.contains(&true)) {
+            woken = true;
+            pressed.clear();
+            clicked.clear();
+        }
         let input = ui::headless_input(w, h, t);
         let state = gamehud::HudState {
             size: [w as f32, h as f32],
@@ -3328,6 +3382,7 @@ fn front_end_offscreen(
             } else {
                 0.0
             },
+            shell_wake: woken,
             keys: pressed,
             pause_settings: settings.clone(),
             pointer,
@@ -3570,7 +3625,8 @@ fn mission_for_screenshot(
         .with_support(options.support.clone())
         .with_movies(options.movies)
         .with_skip_mode_off(options.skip_mode_off)
-        .with_skip_to(options.skip_to.clone());
+        .with_skip_to(options.skip_to.clone())
+        .with_job_near(options.job_near);
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -3715,6 +3771,9 @@ fn mission_for_screenshot(
         }
         // With --support she throws the marker the scripts hand her.
         let mut intent = intent;
+        if let Some(n) = options.honk_every.filter(|n| *n > 0.0) {
+            intent.honk = (i as f32 * tick) % n < 0.5;
+        }
         // With --jump-with-enter, the Enter pressed after the contract (to
         // close a fanfare) is the pad's A, which jumps too.
         if options.jump_with_enter
@@ -4672,6 +4731,27 @@ fn mission_for_screenshot(
             if contracts_seen >= options.contracts.max(1) {
                 play_done = Some(i);
             }
+        }
+        // The job she was skipped to, done (a set job or a collection
+        // completed, a standing bounty paid): she stops as for a contract.
+        if auto.is_some()
+            && play_done.is_none()
+            && let Some(job) = link.job().filter(|j| j.finished())
+        {
+            eprintln!(
+                "autoplay: job {} done after {:.1} s of play ({:.0} s here): {} counted{}, cash {:.0}",
+                job.id,
+                i as f32 * tick,
+                played.elapsed().as_secs_f32(),
+                job.view.counted,
+                if job.view.completed {
+                    ", completed"
+                } else {
+                    ""
+                },
+                link.resources().unwrap_or_default().0
+            );
+            play_done = Some(i);
         }
         if play_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
             break;
@@ -6795,6 +6875,8 @@ struct Running {
     /// the next one pressed goes to it, not to play.
     capturing: bool,
     culling: bool,
+    /// In the background (Android): no surface to draw to, and play waits.
+    background: bool,
     last: Instant,
     lag: Duration,
     fps: (Instant, u32),
@@ -6903,6 +6985,14 @@ impl App {
             WgpuBackend::for_window(window.clone(), size.width, size.height, w.vsync)?;
         let adapter = backend.adapter_summary();
         eprintln!("adapter: {adapter:?}");
+        backend.set_render_scale(w.render_scale);
+        backend.set_light_shadows(cfg!(target_os = "android"));
+        if w.render_scale < 1.0 {
+            eprintln!(
+                "render scale: the world drawn at {:.2} of the window",
+                w.render_scale
+            );
+        }
         let mut game = build_scene(
             &mut backend,
             self.install.as_ref(),
@@ -6955,13 +7045,18 @@ impl App {
                 .map(|s| coop::Coop::start(s, self.config.hero)),
             was_driving: false,
             input: Input::default(),
-            pad: pad::Pad::default(),
+            pad: {
+                let mut pad = pad::Pad::default();
+                pad.touch.resize(size.width, size.height);
+                pad
+            },
             mouse_look: false,
             released: false,
             focused,
             alt: false,
             capturing: false,
             culling: !self.double_sided,
+            background: false,
             last: Instant::now(),
             lag: Duration::ZERO,
             fps: (Instant::now(), 0),
@@ -7023,6 +7118,13 @@ impl App {
 
 impl Running {
     fn set_mouse_look(&mut self, on: bool) {
+        // winit has no grab on Android: the activity captures the pointer.
+        #[cfg(target_os = "android")]
+        let grab = {
+            android::capture_pointer(on);
+            Ok::<(), ()>(())
+        };
+        #[cfg(not(target_os = "android"))]
         let grab = if on {
             self.window
                 .set_cursor_grab(CursorGrabMode::Locked)
@@ -7085,6 +7187,9 @@ impl Running {
     /// Advances the simulation by whole ticks (none while the menu is
     /// open) and draws a frame with the HUD.
     fn frame(&mut self, config: &mut Config, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
+        if self.background {
+            return Ok(());
+        }
         let now = Instant::now();
         let dt = (now - self.last).min(MAX_FRAME).as_secs_f64();
         self.read_pad(dt);
@@ -7145,7 +7250,11 @@ impl Running {
                 .and_then(mission::MissionLink::medevac_state);
             state.gui_calls = gui_calls;
             state.pad = self.input.pad();
+            state.stick = self.input.stick();
             info.game = Some(state);
+        }
+        if self.pad.touch.used {
+            info.touch = Some(self.pad.touch.picture());
         }
         let (action, output) = spans::time("hud", || self.hud.build(input, &info, config));
         self.platform_output(output);
@@ -8007,7 +8116,24 @@ impl Running {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
+        // Back from the background: a new surface for the window, and play
+        // goes on from where it waited.
+        if let Some(state) = self.state.as_mut() {
+            if std::mem::take(&mut state.background) {
+                let size = state.window.inner_size();
+                match state
+                    .backend
+                    .resume(state.window.clone(), size.width, size.height)
+                {
+                    Ok(()) => eprintln!("back from the background"),
+                    Err(e) => {
+                        eprintln!("back from the background: no surface ({e}); closing");
+                        event_loop.exit();
+                    }
+                }
+                state.last = Instant::now();
+                state.audio.out.set_paused(false);
+            }
             return;
         }
         match self.start(event_loop) {
@@ -8028,6 +8154,18 @@ impl ApplicationHandler for App {
         if std::mem::take(&mut state.to_front_end) {
             relaunch_front_end();
             event_loop.exit();
+            return;
+        }
+        // A game controller's buttons: Android reports them as keys of its
+        // own, which go to the pad and nowhere else.
+        if let WindowEvent::KeyboardInput { event: key, .. } = &event
+            && let PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Android(code)) =
+                key.physical_key
+            && state
+                .pad
+                .events
+                .key(code, key.state == ElementState::Pressed)
+        {
             return;
         }
         // Alt+Enter toggles fullscreen, as F11 does (the PC convention),
@@ -8060,6 +8198,31 @@ impl ApplicationHandler for App {
             }
             return;
         }
+        // Fingers on the screen in play are the touch controls'; in the
+        // menus and the front end they are egui's (taps as clicks), and
+        // whatever the controls held is let go.
+        if let WindowEvent::Touch(t) = &event {
+            let playing = !state.hud.menu && state.flow.as_ref().is_none_or(|f| !f.holds());
+            if playing {
+                let at = [t.location.x as f32, t.location.y as f32];
+                match t.phase {
+                    winit::event::TouchPhase::Started => state.pad.touch.down(t.id, at),
+                    winit::event::TouchPhase::Moved => state.pad.touch.moved(t.id, at),
+                    winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled => {
+                        state.pad.touch.up(t.id);
+                    }
+                }
+                return;
+            }
+            state.pad.touch.clear();
+            // A tap skips a movie or presses start, as Enter does.
+            if t.phase == winit::event::TouchPhase::Started
+                && !state.hud.menu
+                && let Some(flow) = state.flow.as_mut().filter(|f| f.holds())
+            {
+                flow.tap();
+            }
+        }
         // The menu takes the mouse and keys while it is open (Escape still
         // closes it).
         let to_menu = state.hud.menu
@@ -8078,6 +8241,7 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 state.backend.resize(size.width, size.height);
+                state.pad.touch.resize(size.width, size.height);
                 state.display.resized(&state.window, size);
                 let (sw, sh) = state.backend.size();
                 eprintln!(
@@ -8241,15 +8405,54 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
-        if let (Some(state), DeviceEvent::MouseMotion { delta }) = (self.state.as_mut(), event) {
-            state.input.mouse_motion(delta.0, delta.1);
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        match event {
+            DeviceEvent::MouseMotion { delta } => state.input.mouse_motion(delta.0, delta.1),
+            // A game controller's sticks, triggers and hat (Android's AXIS_*
+            // numbers, from the patched winit of the Android build).
+            DeviceEvent::Motion { axis, value } if cfg!(target_os = "android") => {
+                state.pad.events.axis(axis, value as f32);
+            }
+            _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = &self.state {
-            state.window.request_redraw();
+    /// Android takes the window's surface away when the app goes to the
+    /// background: the renderer lets it go and keeps all else, and play
+    /// waits (no ticks, no sound) until [`resumed`](Self::resumed).
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = self.state.as_mut() {
+            eprintln!("sent to the background: play waits");
+            state.backend.suspend();
+            state.background = true;
+            state.audio.out.set_paused(true);
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        // In the background no frames are asked for, and the loop sleeps
+        // until something happens: play waits.
+        if state.background {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        // With a frame rate cap (the phone's, for its battery), the loop
+        // sleeps out the rest of each frame's time.
+        let cap = self.config.window.max_fps;
+        if cap > 0 {
+            let due = state.last + Duration::from_secs_f64(1.0 / f64::from(cap));
+            if Instant::now() < due {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+                return;
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::Poll);
+        state.window.request_redraw();
     }
 }
 

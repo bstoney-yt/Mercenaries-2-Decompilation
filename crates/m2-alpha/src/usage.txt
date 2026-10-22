@@ -27,6 +27,12 @@ m2-alpha [options]
                          switch does: the flow completes each story
                          contract it unlocks before it, then this one
                          starts as in play (at its briefing with ,briefing)
+                         A job (AllJob002...) is tracked on the PDA's map,
+                         and --autoplay keeps to it
+  --job-near <m>         with --skip-to a job: once it is tracked, she is
+                         put this far from its nearest target, and again
+                         after each target it counts (a test
+                         shortcut past the drive across the island)
   --movies               with --mission --screenshot: the scripts' movies
                          wait; each is decoded offscreen and pictured
                          (<out>-movie-<name>.ppm)
@@ -260,6 +266,8 @@ m2-alpha [options]
                          who fights her (faction-check lines); <f>:watch
                          hurts nobody; a picture with the HUD 40 s on
                          (-faction40)
+  --honk-every <s>       with --mission: driving, hold the horn half a second
+                         every <s> seconds (horn, gate and disguise lines)
   --bash-target <s>      with --mission --after-contract: this long after the
                          contract, put her by the person the scripts' first
                          marker is over and bash them (verify-check lines);
@@ -343,7 +351,8 @@ can be rebound in the settings' [keys], with "MouseLeft", "MouseRight",
 On foot: WASD runs, Left Shift sprints, hold Left Ctrl to walk, Space
 jumps, hold C to crouch and aim (B too, for now), I/J/K/L look.
 E gets in or out of a vehicle (a row is parked ahead of where you start).
-Driving: W/S throttle and reverse, A/D steer, Space brakes, R rights it.
+Driving: W/S throttle and reverse, A/D steer, Space brakes, R rights it,
+hold F (or the middle button) to sound the horn.
 Fighting (mouse captured): left button fires, Tab or the wheel switches
 weapon, R reloads, right button or G throws a grenade, V picks the next
 explosive, F or the middle button bashes (a supply crate breaks open),
@@ -384,7 +393,7 @@ An Xbox pad (One, Series or 360) plays as the game's own layout has it:
 left stick move (L3 sprint), right stick look, A jump, B melee, X reload,
 Y get in/use, RT fire, LT crouch, LB throw, RB switch weapon, R3 aim,
 d-pad up/down support, left next explosive, right detonate, Back PDA,
-Start menu. Driving: A forward, X reverse, LT handbrake, Y out. In the
+Start menu. Driving: A forward, X reverse, LT handbrake, Y out, B horn. In the
 menus A is Enter, B back, the d-pad moves. While the pad is used, the
 HUD's prompts show its buttons.
 The developer's keys (--dev, or any launch but the whole game's): F4

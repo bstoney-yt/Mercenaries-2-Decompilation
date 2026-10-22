@@ -40,6 +40,9 @@ const ARRIVE: f32 = 2.5;
 const ACTION_KIND: &str = "action";
 const ACTION_ARRIVE: f32 = 1.0;
 const ACTION_AGAIN: f32 = 5.0;
+/// Driving, she gets out within this of an action's object (metres, flat;
+/// invented).
+const ACTION_GET_OUT: f32 = 15.0;
 /// Further above or below its object than this (metres; the alpha's
 /// `CONTEXT_RISE`, a floor's height) an action's prompt isn't offered.
 const ACTION_RISE: f32 = 2.5;
@@ -648,6 +651,29 @@ impl Autoplay {
             self.context_pressed = self.clock;
             game.context_taken = Some(*g);
         }
+        // At a body to verify still driving: out, as the scripts offer the
+        // prompt on foot (ChiCon003's HVT, shot from the M1A2: she sat on
+        // him 1,400 s, the prompt never offered).
+        if let (Some(Goal::Reach { target, .. }), Some(_)) = (&self.goal, self.arrived)
+            && !self.leave
+            && game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_some())
+            && game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .any(|n| n.spawn == Some(*target) && !n.alive)
+        {
+            eprintln!(
+                "autoplay {:.1} s: at the body to verify, driving: getting out",
+                self.clock
+            );
+            self.leave = true;
+        }
         if let (Some(Goal::Reach { target, .. }), Some(t)) = (&self.goal, self.arrived)
             && self.waiting.is_none_or(|w| w.0 != *target)
         {
@@ -724,6 +750,21 @@ impl Autoplay {
             _ => None,
         };
         if let Some((target, at)) = acting {
+            // Prompts are taken on foot: driving up to it she gets out
+            // (round 30 sat in a tank 6 m from PlayerLocation_PMC for
+            // 3700 s).
+            let driving = game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_some());
+            if driving && !self.leave && (at - game.focus()).with_y(0.0).length() < ACTION_GET_OUT {
+                eprintln!(
+                    "autoplay {:.1} s: by {target:#x}'s prompt in a vehicle: getting out",
+                    self.clock
+                );
+                self.leave = true;
+            }
             self.act(game, target, at);
         }
         match self.goal.clone() {
@@ -1062,6 +1103,21 @@ impl Autoplay {
         {
             let at = npcs[i].character.position;
             let d = at.distance(here);
+            // Out of a rifle's reach, she goes up to them first (jobs round
+            // 5: GurJob002's seventh stood 51 m off, and she aimed at him
+            // there for 700 s).
+            if npcs[i].alive && (SHOOT_RANGE..RIDE_FOR).contains(&d) {
+                return Some((
+                    Goal::Reach {
+                        target: m.target,
+                        at,
+                    },
+                    format!(
+                        "closing on {} ({:#x}) to verify, {d:.0} m off",
+                        m.name, m.target
+                    ),
+                ));
+            }
             if npcs[i].alive && d < RIDE_FOR {
                 return Some((
                     Goal::Shoot(i),
@@ -1170,7 +1226,14 @@ impl Autoplay {
                 .map(|t| t.transform_point3(Vec3::Y))
                 .or_else(|| game.scene.props.centre(m.target))
                 .unwrap_or(m.at + Vec3::Y);
-            let how = if game.scene.props.sturdy.contains(&m.target) {
+            let sturdy = game.scene.props.sturdy.contains(&m.target);
+            // A satellite bomb is called on the ground: by the middle of a
+            // tall building (ChiCon003's Target04, 80 m up) no way is found.
+            let at = match game.scene.props.get(m.target) {
+                Some((prop, _)) if sturdy => at.with_y(prop.position.y),
+                _ => at,
+            };
+            let how = if sturdy {
                 "calling a satellite bomb on"
             } else {
                 "blowing up"

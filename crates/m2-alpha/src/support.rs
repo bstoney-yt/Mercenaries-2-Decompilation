@@ -53,8 +53,10 @@ const SAT_NEAR: f32 = 5.0;
 const SAT_FAR: f32 = 3000.0;
 /// The view moves this fast with the keys or the stick (m/s), and no
 /// further than this from her (metres). The mouse leaves it be: on the PC
-/// it moves with W A S D (the owner's play of the PC game).
-const VIEW_SPEED: f32 = 5.0;
+/// it moves with W A S D (the owner's play of the PC game). Invented: 5
+/// was found too slow to call strikes with (playtest on the phone), 20
+/// crosses its reach in five seconds.
+const VIEW_SPEED: f32 = 20.0;
 pub const VIEW_REACH: f32 = 100.0;
 /// The designator comes up this long before the view opens (seconds; the
 /// videos: a moment, up to a second).
@@ -1032,7 +1034,7 @@ mod tests {
         assert_eq!(posts, [TARGETTING_START]);
         assert!(s.busy());
         assert_eq!(s.looking(), Some(Vec2::new(her.x, her.z)));
-        // Steered over the gate, up the screen (north), at 5 m/s.
+        // Steered over the gate, up the screen (north), at 20 m/s.
         let mut seconds = 0.0;
         for _ in 0..1000 {
             let at = s.looking().unwrap();
@@ -1050,7 +1052,7 @@ mod tests {
             seconds += DT;
         }
         assert!(s.looking().unwrap().distance(gate) < 1.0);
-        assert!((12.0..14.0).contains(&seconds), "{seconds}");
+        assert!((3.0..3.6).contains(&seconds), "{seconds}");
         press_fire(&mut s, her, &mut posts);
         assert!(matches!(s.phase, Phase::Timing { .. }));
         // The wheel opens with its needle at the top: presses don't count

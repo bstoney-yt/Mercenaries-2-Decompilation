@@ -105,6 +105,10 @@ pub struct Object {
     /// The faction it belongs to (`Ai.GetFactionGuid`): the name hash of
     /// the faction's template (`"VZ"`), as the HUD's faction guids are.
     pub faction: Option<u32>,
+    /// Who killed or destroyed it, when the game knows (her, for what her
+    /// shots, blasts and rams kill): `ObjectDeath` passes it on
+    /// ([`crate::events::World::killer`]).
+    pub killer: Option<u32>,
 }
 
 impl Object {
@@ -507,6 +511,11 @@ impl Pursuit {
     }
 }
 
+/// How long after a honk the friendly faction gates know she is there,
+/// seconds (invented: the gate script needs her within 20 m to judge
+/// her, and the game's text says only that she must honk).
+pub const HONK_HEARD: f32 = 3.0;
+
 /// The scripts' view of the game, and what they asked of it.
 #[derive(Debug, Default)]
 pub struct ScriptWorld {
@@ -667,6 +676,13 @@ pub struct ScriptWorld {
     /// disguises on: how much is left (0..=100) and whether it holds.
     /// `None` out of one.
     pub disguise: Option<(f32, bool)>,
+    /// The friendly faction gates in play: objects the engine runs
+    /// `friendlygate` on ([`crate::mission::OBJECT_SCRIPTS`]).
+    pub gates: HashSet<u32>,
+    /// Seconds the gates still hear her last honk ([`HONK_HEARD`]): until
+    /// then they know her for who she is, and she is a candidate for
+    /// their opening as their script judges her.
+    pub honk_heard: f32,
     /// The player's camera as the game last fed it; `None` until it has.
     pub camera: Option<Camera>,
     /// Objects the game found behind something solid from the camera at
@@ -940,6 +956,9 @@ impl World for ScriptWorld {
     fn is_alive(&self, guid: u32) -> bool {
         self.objects.get(&guid).is_some_and(|o| o.alive)
     }
+    fn killer(&self, guid: u32) -> Option<u32> {
+        self.objects.get(&guid)?.killer
+    }
     fn vehicle_of(&self, guid: u32) -> Option<u32> {
         self.objects.get(&guid)?.vehicle
     }
@@ -989,15 +1008,21 @@ impl World for ScriptWorld {
         self.winch.get(&cargo).copied()
     }
     fn labelled(&self, label: &str) -> Vec<u32> {
-        let terms = crate::events::class_terms(label);
+        let alternatives = crate::events::class_alternatives(label);
         let mut out: Vec<u32> = self
             .objects
             .iter()
-            .filter(|(_, o)| o.is_of(&terms))
+            .filter(|(_, o)| alternatives.iter().any(|terms| o.is_of(terms)))
             .map(|(&g, _)| g)
             .collect();
         out.sort_unstable();
         out
+    }
+    fn unheard_at_gate(&self, a: u32, gate: u32) -> bool {
+        let hers = self
+            .player
+            .is_some_and(|p| a == p || self.vehicle_of(p) == Some(a));
+        hers && self.gates.contains(&gate) && self.honk_heard <= 0.0
     }
 
     fn game_state(&self) -> Option<String> {
@@ -4240,6 +4265,36 @@ mod tests {
         ask("Player.SetVehicleDisguise(false)");
         assert_eq!(world.borrow().disguise, None);
         assert_eq!(ask("return Player.GetVehicleDisguiseState({})"), Value::Nil);
+    }
+
+    #[test]
+    fn a_label_expression_takes_alternatives_in_brackets() {
+        let (_host, world) = setup();
+        let mut w = world.borrow_mut();
+        w.objects.get_mut(&1).unwrap().labels.push("Hero".into());
+        let mut allied = Object::new("al_veh_m151", [0.0; 3]);
+        allied.labels.extend(["Allied".into(), "Vehicle".into()]);
+        w.insert(60, allied);
+        let mut soldier = Object::new("al_soldier", [0.0; 3]);
+        soldier.labels.push("Allied".into());
+        w.insert(61, soldier);
+        // The friendly gates' filter: the hero, or an Allied vehicle.
+        assert_eq!(w.labelled("Hero||(Allied&&Vehicle)"), vec![1, 60]);
+        assert_eq!(w.labelled("Allied && !Vehicle"), vec![61]);
+    }
+
+    #[test]
+    fn friendly_gates_know_her_only_as_she_honks() {
+        let (_host, world) = setup();
+        let mut w = world.borrow_mut();
+        w.gates.insert(70);
+        w.objects.get_mut(&1).unwrap().vehicle = Some(50);
+        // She and her jeep go unheard by the gate, not by anything else;
+        // others are seen as ever.
+        assert!(w.unheard_at_gate(1, 70) && w.unheard_at_gate(50, 70));
+        assert!(!w.unheard_at_gate(1, 71) && !w.unheard_at_gate(99, 70));
+        w.honk_heard = HONK_HEARD;
+        assert!(!w.unheard_at_gate(1, 70) && !w.unheard_at_gate(50, 70));
     }
 
     #[test]

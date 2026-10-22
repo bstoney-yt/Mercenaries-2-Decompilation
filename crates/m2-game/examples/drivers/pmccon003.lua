@@ -1,5 +1,8 @@
 --[[ Test driver for PmcCon003 (Solano's bunker, then back to the PMC):
-plays its timed race the way a player with a fast ride would. Autoplay
+stands in where autoplay can't play it the way a player would: the timed
+race, the tank waves still standing after 600 s (killed), and the walk to
+the bunker if she is stuck on the hillside 600 s (put 150 m short of it).
+For the race: autoplay
 drives the 5.7 km back from the bunker through the jungle too slowly for
 the scripts' 600 s timer (round 7: the contract was cancelled at "Time
 UP!"), so once "Race back to the base in time!" is active this puts her
@@ -58,38 +61,84 @@ Event.CreatePersistent(Event.TimerRelative, { 1 }, function()
 end, {})
 
 -- The PMC's two tank waves ("Clear out the VZ forces attacking the PMC!"):
--- autoplay goes for them first; any tank still alive 600 s after its
--- wave's objective came up is killed, so a run gets on to "Get inside the
+-- autoplay goes for them first; any tank still alive 600 s into its
+-- wave (polled every 10 s) is killed, so a run gets on to "Get inside the
 -- PMC!" (autoplay took 1900 s on one moving tank in round 14 and never
 -- finished the second wave in round 19).
 local tanks = {
   'PMC003_AMX_01', 'PMC003_AMX_02', 'PMC003_AMX_03', 'PMC003_AMX_04',
   'OBJ_Wave02_Tank01', 'OBJ_Wave02_Tank02', 'OBJ_Wave02_Tank03', 'OBJ_Wave02_Tank04',
 }
-local clearing, waited = false, 0
-local setState2 = MrxTask._SetState
-MrxTask._SetState = function(o, ...)
-  local r = { setState2(o, ...) }
-  local ok, nm = pcall(function() return o:GetName() end)
-  if ok and type(nm) == 'string' and nm:find('Clear out the VZ forces', 1, true) then
-    clearing = o:IsActive()
-    waited = 0
-    Debug.Printf('>>> drive clear: ' .. tostring(o:IsActive()))
+-- Whether a task whose name holds `name` is active under the current contract
+-- (polled: a task module re-imported for the second wave no longer goes
+-- through a wrapped MrxTask._SetState, round 29).
+local function active(name)
+  local ok, m = pcall(function() return MrxPlayState.GetCurrentMission() end)
+  local found = false
+  local function walk(t, depth)
+    if found or depth > 6 or type(t) ~= 'table' then return end
+    local okk, kids = pcall(function() return t:GetChildren() end)
+    if not okk or type(kids) ~= 'table' then return end
+    for _, c in pairs(kids) do
+      local okn, nm = pcall(function() return c:GetName() end)
+      local oka, act = pcall(function() return c:IsActive() end)
+      if okn and oka and act and type(nm) == 'string' and nm:find(name, 1, true) then
+        found = true
+        return
+      end
+      walk(c, depth + 1)
+    end
   end
-  return unpack(r, 1, table.maxn(r))
+  if ok then walk(m, 0) end
+  return found
 end
+
+local waited = 0
 Event.CreatePersistent(Event.TimerRelative, { 10 }, function()
-  if not clearing then
+  local alive = {}
+  for _, k in ipairs(tanks) do
+    local g = Pg.GetGuidByName(k)
+    if g and Object.IsAlive(g) then table.insert(alive, { k, g }) end
+  end
+  local on = active('Clear out the VZ forces')
+  if waited % 60 == 0 and (on or #alive > 0) then
+    Debug.Printf('>>> drive clear: ' .. #alive .. ' alive, wave ' .. tostring(on) .. ', ' .. waited .. ' s')
+  end
+  if #alive == 0 or not on then
     waited = 0
     return
   end
   waited = waited + 10
   if waited < 600 then return end
-  for _, k in ipairs(tanks) do
-    local g = Pg.GetGuidByName(k)
-    if g and Object.IsAlive(g) then
-      Debug.Printf('>>> drive clear: kill ' .. k .. ' after ' .. waited .. ' s')
-      Object.Kill(g)
-    end
+  for _, a in ipairs(alive) do
+    Debug.Printf('>>> drive clear: kill ' .. a[1] .. ' after ' .. waited .. ' s')
+    Object.Kill(a[2])
   end
+  waited = 0
+end, {})
+
+-- "Deploy Bunker Buster on Solano's Bunker.": autoplay walks from the
+-- Lucky Lady's drop-off up to the bunker to call its strike, and some runs
+-- stick on the hillside on the way (rounds 25 and 32: over 120 hops). Still
+-- active 600 s on, she is put 150 m short of the bunker, on her side of it.
+local busting = 0
+Event.CreatePersistent(Event.TimerRelative, { 10 }, function()
+  if not active('Deploy Bunker Buster') then
+    busting = 0
+    return
+  end
+  busting = busting + 10
+  if busting ~= 600 then return end
+  local b = Pg.GetGuidByName('Solano_Bunker')
+  local p = Player.GetLocalCharacter()
+  if not b or not p then return end
+  local bx, by, bz = Object.GetPosition(b)
+  local px, _, pz = Object.GetPosition(p)
+  if not bx or not px then return end
+  local dx, dz = px - bx, pz - bz
+  local d = math.sqrt(dx * dx + dz * dz)
+  if d < 160 then return end
+  local x, z = bx + dx / d * 150, bz + dz / d * 150
+  Debug.Printf('>>> drive bunker: put 150 m short of Solano_Bunker after ' .. busting .. ' s')
+  put(x, by + 5, z)
 end, {})

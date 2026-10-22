@@ -230,6 +230,12 @@ pub struct Game {
     pub reporters: Vec<(u32, &'static str, f32)>,
     /// Whether an army pursued her last frame.
     pub pursued: bool,
+    /// The horn held this tick (driving), and its presses not yet taken
+    /// ([`Game::take_honks`]).
+    pub honking: bool,
+    honks: u32,
+    /// Her vehicle disguise ([`crate::disguise`]).
+    pub disguise: crate::disguise::Disguise,
     /// Seconds the scripts asked her pad to shake (`Pg.Rumble`), for the
     /// pad to take.
     pub rumble: f64,
@@ -395,6 +401,9 @@ impl Game {
             attitude_wait: 0.0,
             reporters: Vec::new(),
             pursued: false,
+            honking: false,
+            honks: 0,
+            disguise: crate::disguise::Disguise::default(),
             rumble: 0.0,
             actions: Vec::new(),
             scripts_seated: false,
@@ -638,6 +647,29 @@ impl Game {
                 self.context_taken = Some(*g);
             }
             let mut intent = Intent::from_input(input, config, mouse_look);
+            // Aim assist on a pad or the touch controls (not the mouse):
+            // aiming or firing on foot draws the view to the hostile
+            // nearest the crosshair ([`crate::aim`]).
+            if input.pad()
+                && (intent.trigger.aim || intent.trigger.fire)
+                && intent.look.length() < crate::aim::LET_GO
+                && let Some(p) = self.scene.player.as_ref().filter(|p| p.driving.is_none())
+            {
+                let people = &self.scene.people;
+                let targets = people
+                    .npcs
+                    .iter()
+                    .filter(|n| n.alive && n.faction.is_some_and(|f| people.fights_for(f)))
+                    .map(|n| {
+                        n.character.position + Vec3::Y * n.character.height * crate::aim::CHEST
+                    });
+                // The crosshair's pitch (above the camera's: shots fly
+                // along it, [`crate::player::Player::aim_forward`]).
+                let aim_pitch = p.aim_forward().y.clamp(-1.0, 1.0).asin();
+                if let Some(turn) = crate::aim::assist(p.eye(), p.yaw, aim_pitch, targets, dt) {
+                    intent.look += turn;
+                }
+            }
             let toggle = input.take_pressed(Action::Binoculars);
             let zoom = i32::from(input.take_pressed(Action::ZoomIn))
                 - i32::from(input.take_pressed(Action::ZoomOut));
@@ -989,6 +1021,7 @@ impl Game {
                     .and_then(|i| scene.vehicles.get(i))
                     .and_then(|v| v.id.map(|id| (id, v)));
                 self.throttle = 0.0;
+                let was_honking = std::mem::take(&mut self.honking);
                 // In a gunner's seat nobody drives: it stops.
                 let gunner = self.combat.seat > 0;
                 if let Some((id, v)) = id
@@ -1008,6 +1041,11 @@ impl Game {
                     && !v.wrecked
                 {
                     self.throttle = intent.movement.y;
+                    // The horn, as long as it is held; each press counts.
+                    self.honking = intent.honk;
+                    if self.honking && !was_honking {
+                        self.honks += 1;
+                    }
                     physics.drive(
                         id,
                         VehicleControls {
@@ -2159,7 +2197,15 @@ impl Game {
                 .max_speed
                 .unwrap_or(if v.spec.tracked { 14.0 } else { 32.0 }),
             throttle: self.throttle,
+            horn: self.honking,
+            heavy: heavy_horn(&v.spec.kind, &v.spec.label, v.spec.tracked),
         })
+    }
+
+    /// The horn presses since the last call (the faction gates, the
+    /// disguise and the friendly soldiers hear each one).
+    pub fn take_honks(&mut self) -> u32 {
+        std::mem::take(&mut self.honks)
     }
 
     /// Switches between walking and flying (a developer's aid, `--dev`).
@@ -3436,6 +3482,20 @@ fn log_floor(props: &Props, physics: &Physics, at: Vec3) {
     }
 }
 
+/// Whether a vehicle of `kind` named `label` whose bank holds no horn is
+/// heard with the lorry's (tracked ones, lorries, buses, the APCs), not
+/// the car's (invented: which spare horn the game gives such a vehicle,
+/// if any, is not in the data).
+pub fn heavy_horn(kind: &str, label: &str, tracked: bool) -> bool {
+    let key = format!("{kind} {label}").to_lowercase();
+    tracked
+        || [
+            "truck", "lorry", "bus", "semi", "apc", "lav", "stryker", "tank",
+        ]
+        .iter()
+        .any(|w| key.contains(w))
+}
+
 /// Whether someone sits in the driver's seat of a crew.
 /// Whether getting into a vehicle whose template's physics is `kind`
 /// earns her vehicle remark ([`combat::Remark::Vehicle`]): her lines for
@@ -3523,6 +3583,14 @@ fn put_out(
 
 /// The vehicle nearest her within `reach` metres of its door marker (or its
 /// hull, for those without one).
+/// Whether a vehicle of catalogue kind `kind` has a seat to get into: not
+/// a trailer (ChiCon003's `civ_veh_trailer_flatbed`, kind `trailer`, was
+/// got into for the M2A3 it carries, and "driven" stuck for 3,200 s).
+/// Invented: the trailer's model has no seat the alpha reads.
+fn can_sit_in(kind: &str) -> bool {
+    kind != "trailer"
+}
+
 fn nearest(
     physics: &Physics,
     vehicles: &[ParkedVehicle],
@@ -3534,13 +3602,18 @@ fn nearest(
     vehicles
         .iter()
         .enumerate()
-        .filter(|(_, v)| !v.wrecked)
+        .filter(|(_, v)| !v.wrecked && can_sit_in(&v.spec.kind))
         // Crewed, one with an action hijack is taken only by it (playtest
         // 5: the villa's tank, whose scripts make it usable by the hijack
         // alone, `Vehicle.Usable(tank, false)`, was got into at a press).
         .filter(|(_, v)| !(hijack_only.contains(&v.spec.model) && has_driver(&v.crew)))
-        // Kept by the scripts for themselves (`Vehicle.Usable(v, false)`).
-        .filter(|(_, v)| !v.guid.is_some_and(|g| unusable.contains(&g)))
+        // Kept by the scripts for themselves (`Vehicle.Usable(v, false)`)
+        // while crewed: an empty one is still got into (ChiCon009's ZBD2000
+        // and ChiCon008's race tank, the only `Usable(false)` vehicles in
+        // the runs, are both made so and then to be got into; the villa's
+        // crewed tank is the hijack's alone). From those samples; the 360
+        // code not checked.
+        .filter(|(_, v)| !(v.guid.is_some_and(|g| unusable.contains(&g)) && has_driver(&v.crew)))
         // One with someone in the driver's seat is taken from them: the
         // action hijacks (tanks, helicopters) took the key first if near
         // ([`crate::hijack`]); cars, bikes and jeeps have none in the data
@@ -3676,6 +3749,13 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn a_trailer_is_not_got_into() {
+        assert!(!super::can_sit_in("trailer"));
+        assert!(super::can_sit_in("tank"));
+        assert!(super::can_sit_in("car"));
+    }
+
+    #[test]
     fn a_shoulder_shot_sees_the_target_from_behind_the_base() {
         // Jennifer at the origin facing Fiona 2 m up +z.
         let mut shot = super::Shot {
@@ -3726,6 +3806,15 @@ mod tests {
         let seat = |s: &str| (s.to_owned(), "VZ Tank Commander".to_owned());
         assert!(super::has_driver(&[seat("Gunner"), seat("seat_driver")]));
         assert!(!super::has_driver(&[seat("Gunner")]));
+    }
+
+    #[test]
+    fn heavy_vehicles_borrow_the_lorrys_horn_others_the_cars() {
+        assert!(super::heavy_horn("car", "Transport Truck", false));
+        assert!(super::heavy_horn("car", "LAV III (Base)", false));
+        assert!(super::heavy_horn("tank", "ZTZ98", true));
+        assert!(!super::heavy_horn("car", "Valiant (4door)", false));
+        assert!(!super::heavy_horn("boat", "RIB36", false));
         assert!(!super::has_driver(&[]));
     }
 
