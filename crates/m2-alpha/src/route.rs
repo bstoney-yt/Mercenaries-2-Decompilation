@@ -57,9 +57,12 @@ const OVER_SEA: f32 = 30.0;
 const UNDER_SEA: f32 = 300.0;
 /// A boat goes up a beach at most this far over the sea, metres (the
 /// first contract's landing place is 1 m up), and its rays from cell to
-/// cell run this high over the sea.
+/// cell run this high over the sea (low enough to meet what stands out
+/// of it by a hand's breadth: PirCon001's jetski course runs past an
+/// object, model a0d50e54, whose top a 0.5 m ray passed over, and she
+/// stuck on it there).
 const BEACH: f32 = 1.5;
-const BOW: f32 = 0.5;
+const BOW: f32 = 0.2;
 /// A boat's way costs this many times as much next to the shallows.
 const OFF_SHORE: f32 = 3.0;
 /// The eight cells round a cell.
@@ -108,12 +111,26 @@ impl Route {
     /// sea at `sea`: within [`MARGIN`] of the straight way, else within
     /// [`WIDE_MARGIN`]. Straight there, not reaching, if no way gets any
     /// closer.
+    #[cfg(test)]
     pub fn plan(physics: &Physics, mover: Mover, from: Vec3, to: Vec3, sea: f32) -> Self {
-        let route = Self::plan_within(physics, mover, from, to, sea, MARGIN);
+        Self::plan_avoiding(physics, mover, (from, to), sea, &[])
+    }
+
+    /// The way from `from` to `to` (as `plan` has it), keeping out of the boxes `avoid` (each its
+    /// least and most corner, x and z: what a vehicle stuck on before).
+    /// A way starting inside one goes straight out of it.
+    pub fn plan_avoiding(
+        physics: &Physics,
+        mover: Mover,
+        (from, to): (Vec3, Vec3),
+        sea: f32,
+        avoid: &[(Vec2, Vec2)],
+    ) -> Self {
+        let route = Self::plan_within(physics, mover, (from, to), sea, MARGIN, avoid);
         if route.reaches {
             return route;
         }
-        let wide = Self::plan_within(physics, mover, from, to, sea, WIDE_MARGIN);
+        let wide = Self::plan_within(physics, mover, (from, to), sea, WIDE_MARGIN, avoid);
         if wide.reaches || wide.points.len() > 1 {
             wide
         } else {
@@ -124,10 +141,10 @@ impl Route {
     fn plan_within(
         physics: &Physics,
         mover: Mover,
-        from: Vec3,
-        to: Vec3,
+        (from, to): (Vec3, Vec3),
         sea: f32,
         margin: f32,
+        avoid: &[(Vec2, Vec2)],
     ) -> Self {
         let (a, b) = (flat(from), flat(to));
         let lo = a.min(b) - Vec2::splat(margin);
@@ -153,6 +170,7 @@ impl Route {
             afloat: mover.afloat,
             sea,
             level: from.y,
+            avoid,
         };
         let (start, goal) = (grid.cell_at(a), grid.cell_at(b));
         grid.ground(start, from.y);
@@ -314,6 +332,8 @@ struct Grid<'a> {
     /// The height it starts from, metres: the level of a cell with no
     /// ground found.
     level: f32,
+    /// Boxes kept out of ([`Route::plan_avoiding`]).
+    avoid: &'a [(Vec2, Vec2)],
 }
 
 impl Grid<'_> {
@@ -371,6 +391,17 @@ impl Grid<'_> {
         self.ground[i]
     }
 
+    /// Whether going from cell `a` on to `b` goes into a box kept out of,
+    /// or no further out of one it is in.
+    fn avoided(&self, a: [usize; 2], b: [usize; 2]) -> bool {
+        let (pa, pb) = (self.at(a), self.at(b));
+        self.avoid.iter().any(|&(lo, hi)| {
+            let inside = |p: Vec2| p.cmpge(lo).all() && p.cmple(hi).all();
+            let middle = (lo + hi) * 0.5;
+            inside(pb) && (!inside(pa) || pb.distance(middle) <= pa.distance(middle))
+        })
+    }
+
     /// The height of cell `c`'s ground, once looked at.
     fn height(&self, c: [usize; 2]) -> Option<f32> {
         match self.ground[self.index(c)] {
@@ -388,6 +419,9 @@ impl Grid<'_> {
             return self.sail(a, b, depth);
         }
         let run = self.at(a).distance(self.at(b));
+        if self.avoided(a, b) {
+            return None;
+        }
         let level = self.height(a).unwrap_or(self.level);
         let (ga, gb) = (self.ground(a, level), self.ground(b, level));
         let wet = matches!(gb, Ground::At(y, _) if y < self.sea + SHORE);
@@ -431,9 +465,21 @@ impl Grid<'_> {
                 && z < self.size[1]
                 && matches!(self.ground([x, z], self.sea), Ground::At(y, _) if y > self.sea - depth)
         });
+        // Next to something standing out of the sea (a rock, a pier) as
+        // next to the shore: a way along its very edge has her hull clip
+        // its corner (PirCon001's jetski, round 28).
+        let by_wall = !shallow
+            && !shore
+            && AROUND.iter().any(|&(dx, dz)| {
+                let (Some(x), Some(z)) = (b[0].checked_add_signed(dx), b[1].checked_add_signed(dz))
+                else {
+                    return false;
+                };
+                x < self.size[0] && z < self.size[1] && self.walled(b, [x, z])
+            });
         let k = if shallow {
             STEEP
-        } else if shore {
+        } else if shore || by_wall {
             OFF_SHORE
         } else {
             1.0
@@ -661,6 +707,34 @@ mod tests {
             skip: None,
             afloat: None,
         }
+    }
+
+    // On flat ground, a box kept out of across the straight way: the way
+    // goes round it; and from inside it, straight out first.
+    #[test]
+    fn a_way_keeps_out_of_what_is_avoided() {
+        let p = island(|_, _| 0.0);
+        let avoid = [(Vec2::new(-10.0, 20.0), Vec2::new(10.0, 30.0))];
+        let inside = |q: Vec3| q.x > -10.0 && q.x < 10.0 && q.z > 20.0 && q.z < 30.0;
+        let (from, to) = (Vec3::ZERO, Vec3::new(0.0, 0.0, 60.0));
+        let route = Route::plan_avoiding(&p, car(22.0), (from, to), -36.0, &avoid);
+        assert!(route.reaches, "{route:?}");
+        for w in route.points.windows(2) {
+            for k in 0..=20 {
+                let q = w[0].lerp(w[1], k as f32 / 20.0);
+                assert!(!inside(q), "{q} in the box: {route:?}");
+            }
+        }
+        let straight = Route::plan(&p, car(22.0), from, to, -36.0);
+        assert_eq!(straight.points.len(), 2, "{straight:?}");
+        let out = Route::plan_avoiding(
+            &p,
+            car(22.0),
+            (Vec3::new(0.0, 0.0, 25.0), to),
+            -36.0,
+            &avoid,
+        );
+        assert!(out.reaches, "{out:?}");
     }
 
     // A ridge 6 m high across the way, too steep for a car (31 degrees),

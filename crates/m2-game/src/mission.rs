@@ -39,6 +39,9 @@ pub const BOOTSTRAP: u32 = 0xb442_0059;
 /// The goal a support helicopter is given to land at her mark
 /// (`MrxSupportCopterDelivery._HeliReady`).
 pub const LAND: &str = "HeliLand";
+
+/// The base block's layer (`vz_base_P000_Q3.block`), always resident.
+const BASE_LAYER: &str = "vz_base";
 /// Activates the player's character as the engine does its object
 /// scripts: the hero module's `OnActivate` (healing, the survival
 /// system's one rescue, her inventory), which goes on once she is awake.
@@ -66,6 +69,29 @@ data.RemoveFreebie = function(...)
     if type(remove) == "function" then return remove(...) end
 end
 return true
+"#;
+
+/// The PDA map's mission tracking: `MrxMissionFlow.Reset` hands the map
+/// `_TrackMission` (`Pda.Map:SetMissionTrackCallback{ fCallback = ... }`,
+/// which `MrxGuiInterface` passes on to the PDA widget). The widget calls
+/// it with the mission the player picks on the map
+/// (`MrxGuiPda._HandleTrackEvent`: the callback's data, then the mission
+/// id); a job marks its targets only while it is tracked. The PDA here is
+/// a stand-in, so the callback is kept in `__m2_track` for
+/// [`Mission::track_mission`] as well.
+const FOLLOW_TRACKING: &str = r#"
+local pda = rawget(_G, "Pda")
+local map = type(pda) == "table" and rawget(pda, "Map")
+if type(map) ~= "table" or type(map.SetMissionTrackCallback) ~= "function" then
+    return
+end
+local set = map.SetMissionTrackCallback
+map.SetMissionTrackCallback = function(self, config, ...)
+    if type(config) == "table" then
+        __m2_track = { config.fCallback, config.tCallbackData }
+    end
+    return set(self, config, ...)
+end
 "#;
 
 /// The flow's full-screen movies (`_PlayMovie{sMovie = "01_AOA_J",
@@ -351,6 +377,7 @@ impl GameData {
         // Entities' templates, to give them their templates' labels.
         let mut templated: Vec<(String, usize, u32)> = Vec::new();
         let mut template_labels: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut template_scripts: HashMap<u32, u32> = HashMap::new();
         // Faction zones' faction templates, and every template's name.
         let mut zone_factions: Vec<(String, usize, u32)> = Vec::new();
         let mut template_names: HashMap<u32, String> = HashMap::new();
@@ -388,6 +415,7 @@ impl GameData {
                     && let Ok(db) = Layer::parse(asset)
                 {
                     template_labels = labels_of(db.component("Label"));
+                    template_scripts = db.hashes("ObjectScript");
                     template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
                     template_names = db
@@ -450,9 +478,14 @@ impl GameData {
             }
         }
         for (layer, i, template) in &templated {
+            let e = &mut data.layers.get_mut(layer).expect("indexed above")[*i];
             if let Some(l) = template_labels.get(template) {
-                let e = &mut data.layers.get_mut(layer).expect("indexed above")[*i];
                 e.labels.extend(l.iter().copied());
+            }
+            // An entity without a script of its own runs its template's:
+            // the faction gates' (`_ocoutpost_wallgate`, `friendlygate`).
+            if e.script.is_none() {
+                e.script = template_scripts.get(template).copied();
             }
         }
         for (layer, i, template) in zone_factions {
@@ -593,6 +626,8 @@ pub struct Mission {
     movie_out: bool,
     /// How black `MrxGui`'s fade has the screen ([`FADE`]), 0 to 1.
     black: f32,
+    /// [`FADE`], compiled once (on the first tick) rather than every tick.
+    fade: Option<mlua::Function>,
 }
 
 impl Mission {
@@ -648,9 +683,13 @@ impl Mission {
             w.insert(PLAYER, player);
             w.player = Some(PLAYER);
         }
-        // The static layers are always in.
+        // The static layers are always in, and so is the base block's
+        // (`vz_base`, from samples: never loaded or unloaded by name). Its
+        // named locators are objects the scripts act on: PmcCon003's "Get
+        // inside the PMC!" prompts at `PlayerLocation_PMC` (round 26: with
+        // no object there its target filter came out empty).
         for (name, entities) in &layers {
-            if LayerState::is_static(name) {
+            if LayerState::is_static(name) || name.eq_ignore_ascii_case(BASE_LAYER) {
                 place(&world, entities, true);
                 world.borrow_mut().layers.loaded.insert(name.clone());
             }
@@ -735,6 +774,7 @@ impl Mission {
             flown: false,
             movie_out: false,
             black: 0.0,
+            fade: None,
         };
         mission.settle("set-up");
         Ok(mission)
@@ -825,6 +865,12 @@ impl Mission {
     /// contract's mission, or the save's next, is then waiting.
     pub fn start(&mut self) {
         self.follow_freebies();
+        if let Err(e) = self.run(FOLLOW_TRACKING, "follow tracking") {
+            self.log.push(format!(
+                "  mission tracking: {}",
+                first_lines(&e.to_string())
+            ));
+        }
         let saved = self.world.borrow().saved.clone();
         if let Some(text) = &saved {
             if let Err(e) = self.host.lua().globals().set("__m2_saved", text.as_str()) {
@@ -915,6 +961,10 @@ impl Mission {
     pub fn tick(&mut self, dt: f64) {
         self.now += dt;
         let now = self.now;
+        {
+            let mut w = self.world.borrow_mut();
+            w.honk_heard = (w.honk_heard - dt as f32).max(0.0);
+        }
         // Streaming is instant here: a waiting state ends a second after
         // it was asked for, and the scripts hear that it did.
         {
@@ -977,13 +1027,23 @@ impl Mission {
                 ),
             });
         }
-        match self
-            .host
-            .lua()
-            .load(FADE)
-            .set_name("=m2 fade")
-            .call::<f32>((dt, FADE_WIPE))
-        {
+        if self.fade.is_none() {
+            match self
+                .host
+                .lua()
+                .load(FADE)
+                .set_name("=m2 fade")
+                .into_function()
+            {
+                Ok(f) => self.fade = Some(f),
+                Err(e) => self.log.push(format!(
+                    "  t={now:.1} fade: {}",
+                    first_lines(&e.to_string())
+                )),
+            }
+        }
+        let faded = self.fade.as_ref().map(|f| f.call::<f32>((dt, FADE_WIPE)));
+        match faded.unwrap_or(Ok(self.black)) {
             Ok(b) => {
                 if (b >= 1.0) != (self.black >= 1.0) {
                     self.log.push(format!(
@@ -1334,12 +1394,24 @@ impl Mission {
             .map_or(&[], |e| e.path.as_slice())
     }
 
+    /// She honked: the friendly faction gates hear it for
+    /// [`api::HONK_HEARD`] seconds.
+    pub fn honk(&mut self) {
+        self.world.borrow_mut().honk_heard = api::HONK_HEARD;
+    }
+
     /// Reports where an object is in play (a vehicle that was driven or
     /// pushed about).
     pub fn place(&mut self, guid: u32, at: [f32; 3], yaw: f32) {
-        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+        let mut w = self.world.borrow_mut();
+        if let Some(o) = w.objects.get_mut(&guid) {
             o.position = at;
             o.yaw = yaw;
+        } else if let Some(e) = w.entities.get_mut(&guid) {
+            // A layer's entity no script has made an object of yet (a
+            // truck's rum jugs riding on it): where the scripts' area
+            // searches find it.
+            *e = at;
         }
     }
 
@@ -1697,6 +1769,53 @@ impl Mission {
         }
     }
 
+    /// As [`kill`](Self::kill), by `killer` (her character, for what her
+    /// shots, blasts and rams kill): the death event passes the killer
+    /// to the scripts, which pay a hero-only bounty for it.
+    pub fn kill_by(&mut self, guid: u32, killer: u32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            if o.alive {
+                o.killer = Some(killer);
+            }
+            o.alive = false;
+            o.health = 0.0;
+        }
+    }
+
+    /// The player picks mission `id` (`"AllJob002"`) to track on the PDA's
+    /// map: the callback the scripts gave the map
+    /// (`MrxMissionFlow._TrackMission`, [`FOLLOW_TRACKING`]) is called
+    /// with its data and the id, as the PDA widget calls it. False if the
+    /// scripts gave the map no callback.
+    pub fn track_mission(&mut self, id: &str) -> bool {
+        let code = r#"
+local id = ...
+local t = rawget(_G, "__m2_track")
+if type(t) ~= "table" or type(t[1]) ~= "function" then return false end
+local args = {}
+if type(t[2]) == "table" then
+    for _, v in ipairs(t[2]) do args[#args + 1] = v end
+end
+args[#args + 1] = id
+t[1](unpack(args))
+return true
+"#;
+        let tracked = self
+            .host
+            .lua()
+            .load(code)
+            .set_name("=m2 track mission")
+            .call::<bool>(id);
+        match tracked {
+            Ok(t) => t,
+            Err(e) => {
+                self.log
+                    .push(format!("  tracking {id}: {}", first_lines(&e.to_string())));
+                false
+            }
+        }
+    }
+
     /// The player is in the music region naming faction `faction` (name
     /// hash; `None`: in none): the free-play score follows it
     /// ([`crate::music::Music::enter_region`]).
@@ -1897,7 +2016,14 @@ end
         w.context_actions
             .iter()
             .map(|(&g, a)| {
-                let at = w.objects.get(&g).map(|o| o.position);
+                // A placed object's place, else its entity's, loaded or not
+                // (PmcCon003's `PlayerLocation_PMC`, a `vz_base` locator
+                // the action objective prompts at).
+                let at = w
+                    .objects
+                    .get(&g)
+                    .map(|o| o.position)
+                    .or_else(|| w.entities.get(&g).copied());
                 (g, at, a.text.clone(), a.reach)
             })
             .collect()
@@ -2251,6 +2377,9 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             o.label_hashes.clone_from(&e.labels);
             o.faction = e.faction;
             w.insert(e.guid, o);
+            if e.script == Some(FRIENDLY_GATE) {
+                w.gates.insert(e.guid);
+            }
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());
             }
@@ -2262,6 +2391,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             }
         } else {
             w.crews.remove(&e.guid);
+            w.gates.remove(&e.guid);
             w.crew_riders.retain(|_, v| *v != e.guid);
             w.objects.remove(&e.guid);
             w.regions.remove(&e.guid);
@@ -2308,7 +2438,23 @@ fn seat_crew(
 /// `FactionZone` makes each zone an instance that enables itself: the zone
 /// on the radar and PDA map, and a watch on the player crossing it that
 /// tells the HUD (`TrespassStateChange`).
-pub const OBJECT_SCRIPTS: [(&str, u32); 1] = [("FactionZone", 0x6726_7cc1)];
+/// `friendlygate` makes each faction base gate open and shut by itself:
+/// within 20 m of it, the hero (taken for the faction of the vehicle
+/// she is disguised in, else the PMC's) or one of its faction's
+/// vehicles; open while one is there whom the gate's faction is at
+/// least `Friendly` to (the PMC only while the faction's attitude to it
+/// can change, at least `Neutral`), unless a script locked it (its
+/// `_TestAttitude`, `_EvaluateCandidates`, `LockGate`), and shut as the
+/// last goes 40 m off. Opening, a soldier of its faction within 25 m
+/// says his `GateYes01` line. The engine tells it of her only after she
+/// honks ([`crate::api::ScriptWorld::honk_heard`]).
+pub const OBJECT_SCRIPTS: [(&str, u32); 2] = [
+    ("FactionZone", 0x6726_7cc1),
+    ("friendlygate", FRIENDLY_GATE),
+];
+
+/// `friendlygate`'s module hash.
+pub const FRIENDLY_GATE: u32 = 0x6d4f_9301;
 
 /// Runs the object scripts of `entities` (see [`OBJECT_SCRIPTS`]) as their
 /// layer comes in (`load`) or goes. Returns what failed.
@@ -2356,6 +2502,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_object_scripts_are_named_by_their_hash() {
+        for (name, hash) in OBJECT_SCRIPTS {
+            assert_eq!(name_hash(name), hash, "{name}");
+        }
+    }
+
+    #[test]
     fn landing_zones_come_from_names() {
         assert_eq!(landing_zone("01_pmc_hq_lz_playerone"), Some((1, 1)));
         assert_eq!(landing_zone("30_chi_hqb_lz_PlayerTwo"), Some((30, 2)));
@@ -2379,6 +2532,14 @@ mod tests {
         m.set_subtitles(false);
         m.set_tutorials(true);
         assert_eq!(ask(&m), [false, true]);
+    }
+
+    #[test]
+    fn a_layer_entity_is_placed_where_the_game_says() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.world.borrow_mut().entities.insert(5, [0.0; 3]);
+        m.place(5, [1.0, 2.0, 3.0], 0.0);
+        assert_eq!(m.world.borrow().entities[&5], [1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -2874,6 +3035,50 @@ mod tests {
     }
 
     #[test]
+    fn each_crew_aboard_is_its_own_objects_riders_by_object() {
+        // Two crewed objects at once (the HQ's starter and the villa's
+        // tank): each lists only its own riders, the objects in guid
+        // order, with others (the island's) about that ride nothing.
+        let hq = Entity {
+            guid: 0xc73ad,
+            name: "HqInterior".into(),
+            crew: vec![("a651ff78".into(), "Fiona Taylor".into())],
+            ..villa_tank()
+        };
+        let tank = villa_tank();
+        let mut data = GameData::default();
+        data.layers
+            .insert("layers".into(), vec![tank.clone(), hq.clone()]);
+        let m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        for g in 0x1000..0x1400 {
+            m.world()
+                .borrow_mut()
+                .insert(g, crate::api::Object::new("VZ Soldier", [0.0; 3]));
+        }
+        place(m.world(), &[tank, hq], true);
+        let aboard = m.crews_aboard();
+        let objects: Vec<u32> = aboard.iter().map(|a| a.0).collect();
+        assert_eq!(objects, [0xc73ad, 0xfaa53]);
+        let seats = |i: usize| -> Vec<(String, String)> {
+            let mut s: Vec<_> = aboard[i]
+                .1
+                .iter()
+                .map(|(seat, _, t)| (seat.clone(), t.clone()))
+                .collect();
+            s.sort();
+            s
+        };
+        assert_eq!(seats(0), [("a651ff78".into(), "Fiona Taylor".into())]);
+        assert_eq!(
+            seats(1),
+            [
+                ("seat_driver".into(), "VZ Tank Commander".into()),
+                ("seat_gunner".into(), "VZ Soldier".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn a_targets_state_changes_and_actions_reach_the_verify_objectives_events() {
         let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
         m.world
@@ -3081,6 +3286,37 @@ mod tests {
         assert_eq!(g.get::<f64>("__gur").unwrap(), 0.0);
         // Never set: as seen.
         assert_eq!(g.get::<i64>("__all").unwrap(), 1);
+    }
+
+    #[test]
+    fn the_base_blocks_locators_are_objects_from_the_start() {
+        // PmcCon003's "Get inside the PMC!" acts on `PlayerLocation_PMC`,
+        // a locator of the base block's layer; a state layer's stays out.
+        let at = |guid: u32, name: &str| Entity {
+            guid,
+            name: name.into(),
+            at: [7.0, 1.0, 9.0],
+            crew: Vec::new(),
+            ..villa_tank()
+        };
+        let mut data = GameData::default();
+        data.layers
+            .insert("vz_base".into(), vec![at(0x9f305, "PlayerLocation_PMC")]);
+        data.layers.insert(
+            "vz_state_pmccon002".into(),
+            vec![at(0xb639b, "PMC002_Office")],
+        );
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        m.run(
+            r#"local x, y, z = Object.GetPosition(Pg.GetGuidByName('PlayerLocation_PMC'))
+            __base = x
+            __state = Object.GetPosition(Pg.GetGuidByName('PMC002_Office'))"#,
+            "ask",
+        )
+        .unwrap();
+        let g = m.lua().globals();
+        assert_eq!(g.get::<f64>("__base").unwrap(), 7.0);
+        assert!(g.get::<Option<f64>>("__state").unwrap().is_none());
     }
 
     #[test]

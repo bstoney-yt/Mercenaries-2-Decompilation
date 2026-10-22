@@ -31,6 +31,12 @@ pub trait World {
     fn position(&self, guid: u32) -> Option<[f32; 3]>;
     /// Whether an object exists and isn't dead or destroyed.
     fn is_alive(&self, guid: u32) -> bool;
+    /// Who killed an object, when known. The job scripts' hero-only
+    /// bounties (`MrxTaskObjectiveDestroy._TargetDestroyed`) count only
+    /// what a player's character killed.
+    fn killer(&self, _guid: u32) -> Option<u32> {
+        None
+    }
     /// The vehicle an object rides in, if any.
     fn vehicle_of(&self, guid: u32) -> Option<u32>;
     /// The player's character (scripts write it `"hero"`).
@@ -66,6 +72,13 @@ pub trait World {
     /// (`None` once let go).
     fn winch(&self, _cargo: u32) -> Option<Option<u32>> {
         None
+    }
+    /// Whether `gate`, a friendly faction gate (`friendlygate`), doesn't
+    /// know `a` is there: the player, or the vehicle she rides, when she
+    /// hasn't honked lately (the gates' tutorial: "The faction won't know
+    /// who you are or open their gate unless you honk your horn").
+    fn unheard_at_gate(&self, _a: u32, _gate: u32) -> bool {
+        false
     }
     /// Whether it got into (or out of) its seat at once, put there by a
     /// script.
@@ -188,6 +201,11 @@ struct Pending {
     held: bool,
     /// For conditions on each of several objects: those it held for.
     held_by: BTreeSet<u32>,
+    /// For seat events: the vehicle each rider was last seen in, passed
+    /// as they get out (the scripts look it up: `MrxTaskObjectiveDeliver.
+    /// _OnPlayerInVehicle(self, rider, vehicle)` erred on the 0 a rider
+    /// out of every vehicle has).
+    rode: std::collections::BTreeMap<u32, Value>,
     /// When it was made.
     made: f64,
     /// For minigames: how many of the player's presses it has read (none
@@ -310,6 +328,7 @@ impl Events {
                         last: now,
                         held: false,
                         held_by: BTreeSet::new(),
+                        rode: std::collections::BTreeMap::new(),
                         made: now,
                         read: None,
                         memo: None,
@@ -590,10 +609,17 @@ impl Events {
                         let any = mode.contains('a');
                         let mut fire = Vec::new();
                         let mut seated = BTreeSet::new();
-                        for (r, (inside, instantly), extra) in riders {
+                        for (r, (inside, instantly), mut extra) in riders {
                             let was = p.held_by.contains(&r);
                             if inside {
                                 seated.insert(r);
+                                if let Some(v) = extra.get(1) {
+                                    p.rode.insert(r, v.clone());
+                                }
+                            } else if let Some(v) = p.rode.remove(&r)
+                                && let Some(slot) = extra.get_mut(1)
+                            {
+                                *slot = v;
                             }
                             let (inn, out) = if instantly { ('i', 'o') } else { ('e', 'x') };
                             let got_in = inside && !was;
@@ -771,9 +797,19 @@ fn guid(t: &Table, i: i64) -> Option<u32> {
 /// Whether an object with `labels` is of class `expr`: labels joined by
 /// `&&`, each maybe negated with `!` (`"Tank && !APC"`), in any case.
 pub(crate) fn class_matches(expr: &str, labels: &[u32]) -> bool {
-    class_terms(expr)
+    class_alternatives(expr)
         .iter()
-        .all(|&(h, not)| labels.contains(&h) != not)
+        .any(|terms| terms.iter().all(|&(h, not)| labels.contains(&h) != not))
+}
+
+/// A class expression's alternatives, each as [`class_terms`] reads one:
+/// `||` between them, at the top or in brackets (the friendly gates'
+/// filter, `"Hero||(Allied&&Vehicle)"`: the hero, or an Allied
+/// vehicle).
+pub(crate) fn class_alternatives(expr: &str) -> Vec<Vec<(u32, bool)>> {
+    expr.split("||")
+        .map(|alt| class_terms(alt.trim().trim_start_matches('(').trim_end_matches(')')))
+        .collect()
 }
 
 /// A class expression's labels as name hashes, each with whether it is
@@ -862,17 +898,19 @@ fn objects(t: &Table, i: i64, world: &dyn World) -> Vec<u32> {
         }
         // An object filter (see `api`): its objects, the player when it
         // uses players, and objects with its label, less those excluded.
+        // A plain list of objects (`Player.GetAllCharacters()`, which
+        // `MrxTaskObjectiveEnterVehicle` waits on: PmcCon003's "Board the
+        // Lucky Lady") is its objects.
         Ok(Value::Table(f)) => {
-            let mut out: Vec<u32> = f
-                .raw_get::<Option<Table>>("objs")
-                .ok()
-                .flatten()
-                .map(|t| {
-                    t.sequence_values::<Value>()
-                        .filter_map(|v| as_id(&v.ok()?))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let ids = |t: Table| -> Vec<u32> {
+                t.sequence_values::<Value>()
+                    .filter_map(|v| as_id(&v.ok()?))
+                    .collect()
+            };
+            let mut out: Vec<u32> = match f.raw_get::<Option<Table>>("objs").ok().flatten() {
+                Some(t) => ids(t),
+                None => ids(f.clone()),
+            };
             if f.raw_get::<bool>("players").unwrap_or(false) {
                 out.extend(world.player());
             }
@@ -927,10 +965,21 @@ fn check(
         // { object }: when it dies or is removed; passes the object. A
         // filter or label names several, each firing as it dies (a
         // Destroy objective counts its targets this way).
+        // Passes the object, then (when the game knows who killed it) a
+        // nil and the killer: `MrxTaskObjectiveDestroy._TargetDestroyed(
+        // self, target, _, killer)` checks its fourth parameter against
+        // the players' characters for a hero-only bounty (from the
+        // scripts; what the second value is was not found).
         "ObjectDeath" => Check::Each(
             objects(&p.params, 1, world)
                 .into_iter()
-                .map(|g| (g, !world.is_alive(g), vec![id(g)]))
+                .map(|g| {
+                    let mut pass = vec![id(g)];
+                    if let Some(k) = world.killer(g) {
+                        pass.extend([Value::Nil, id(k)]);
+                    }
+                    (g, !world.is_alive(g), pass)
+                })
                 .collect(),
         ),
         // { object }: once it is gone from play (removed, or faded out):
@@ -958,14 +1007,17 @@ fn check(
                 let Some(pa) = world.position(a) else {
                     return false;
                 };
-                bb.iter().filter_map(|&b| world.position(b)).any(|pb| {
-                    let d2: f32 = [0, 1, 2]
-                        .into_iter()
-                        .filter(|&i| !(flat && i == 1))
-                        .map(|i| (pa[i] - pb[i]).powi(2))
-                        .sum();
-                    (f64::from(d2) <= r * r) != beyond
-                })
+                bb.iter()
+                    .filter(|&&b| !world.unheard_at_gate(a, b))
+                    .filter_map(|&b| world.position(b))
+                    .any(|pb| {
+                        let d2: f32 = [0, 1, 2]
+                            .into_iter()
+                            .filter(|&i| !(flat && i == 1))
+                            .map(|i| (pa[i] - pb[i]).powi(2))
+                            .sum();
+                        (f64::from(d2) <= r * r) != beyond
+                    })
             };
             let near: Vec<u32> = aa.into_iter().filter(|&a| holds(a)).collect();
             if near.is_empty() {
@@ -1300,6 +1352,8 @@ mod tests {
         context: Vec<(f64, u32)>,
         /// Clip events met: (game time, who, event).
         anims: Vec<(f64, u32, String)>,
+        /// Who killed whom.
+        killers: HashMap<u32, u32>,
     }
 
     impl World for TestWorld {
@@ -1311,6 +1365,9 @@ mod tests {
         }
         fn is_alive(&self, guid: u32) -> bool {
             !self.dead.contains(&guid)
+        }
+        fn killer(&self, guid: u32) -> Option<u32> {
+            self.killers.get(&guid).copied()
         }
         fn vehicle_of(&self, guid: u32) -> Option<u32> {
             self.seats.get(&guid).copied()
@@ -1537,6 +1594,51 @@ mod tests {
     }
 
     #[test]
+    fn a_seat_event_on_a_list_of_characters_fires_as_one_gets_in() {
+        let (host, events) = setup();
+        // As `MrxTaskObjectiveEnterVehicle` waits on
+        // `Player.GetAllCharacters()` (PmcCon003's "Board the Lucky Lady").
+        host.lua()
+            .load(
+                "Event.Create(Event.ObjectInSeat, { { 1 }, 99, 'a', 'ei' }, \
+                 function(d) table.insert(log, 'in ' .. d) end, { 'lady' })",
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        events.update(0.1, &world);
+        assert!(log(&host).is_empty());
+        world.seats.insert(1, 99);
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["in lady"]);
+    }
+
+    #[test]
+    fn a_context_action_on_a_filter_passes_the_object_taken_at() {
+        let (host, events) = setup();
+        // As an action objective waits on its targets
+        // (`MrxTaskObjectiveAction`: PmcCon002's "Enter office").
+        host.lua()
+            .load(
+                "Event.CreatePersistent(Event.ContextAction, { 0, { objs = { 11, 12 } } }, \
+                 function(d, who, target) table.insert(log, d .. ' ' .. tostring(who ~= nil) \
+                 .. ' ' .. tostring(target)) end, { 'office' })",
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld {
+            context: vec![(0.25, 13)],
+            ..TestWorld::default()
+        };
+        events.update(0.5, &world);
+        assert!(log(&host).is_empty());
+        world.context.push((0.75, 12));
+        events.update(0.5, &world);
+        events.update(0.5, &world);
+        assert_eq!(log(&host), ["office true userdata: 000000000000000C"]);
+    }
+
+    #[test]
     fn the_player_event_fires_once_she_is_on_foot() {
         let (host, events) = setup();
         host.lua()
@@ -1599,6 +1701,35 @@ mod tests {
             ["awake 3", "dead 7,7", "near 1", "posted x,y", "seat 1,99"]
         );
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_death_passes_its_killer_when_known() {
+        // As `MrxTaskObjectiveDestroy._TargetDestroyed(self, target, _,
+        // killer)` reads it for a hero-only bounty.
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                r##"
+                local function note(s) return function(...)
+                    local n = select("#", ...)
+                    local a, b, c = ...
+                    table.insert(log, s .. n .. " " .. tostring(gid(a)) .. " "
+                        .. tostring(b) .. " " .. tostring(c and gid(c)))
+                end end
+                Event.Create(Event.ObjectDeath, { 7 }, note("dead "), {})
+                Event.Create(Event.ObjectDeath, { 8 }, note("dead "), {})
+                "##,
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        world.dead.extend([7, 8]);
+        world.killers.insert(7, 1);
+        events.update(0.1, &world);
+        let mut got = log(&host);
+        got.sort();
+        assert_eq!(got, ["dead 1 8 nil nil", "dead 3 7 nil 1"]);
     }
 
     #[test]

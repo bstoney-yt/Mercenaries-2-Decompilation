@@ -126,6 +126,41 @@ impl SoundBuffer {
         p90 - p10 <= STEADY_WINDOWS
     }
 
+    /// Whether it is one note held level from end to end, as a horn is:
+    /// every 0.1 s of it repeats itself a period on almost exactly (a
+    /// self-likeness of at least [`TONE_ALIKE`] at some period between 60
+    /// and 1,500 Hz) and no tenth's level is more than [`TONE_LEVEL`] dB
+    /// off another's. Under 0.3 s is no note.
+    pub fn is_tone(&self) -> bool {
+        let w = (self.rate as usize / 10).max(1);
+        let n = self.frames() / w;
+        if n < 3 {
+            return false;
+        }
+        let levels: Vec<f32> = (0..n).map(|k| self.window_db(k * w, (k + 1) * w)).collect();
+        let (lo, hi) = levels
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), &d| (lo.min(d), hi.max(d)));
+        if hi - lo > TONE_LEVEL {
+            return false;
+        }
+        let lags = (self.rate as usize / 1500).max(1)..(self.rate as usize / 60).min(w / 2);
+        (0..n).all(|k| {
+            let x: Vec<f32> = (k * w..(k + 1) * w).map(|i| self.frame(i).0).collect();
+            let power = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+            power > 0.0
+                && lags.clone().any(|lag| {
+                    let c = x[..x.len() - lag]
+                        .iter()
+                        .zip(&x[lag..])
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                        / (x.len() - lag) as f32;
+                    c >= power * TONE_ALIKE
+                })
+        })
+    }
+
     /// Zero crossings a second, first channel: high for hiss and whine,
     /// low for a rumble.
     pub fn crossing_rate(&self) -> f32 {
@@ -386,6 +421,8 @@ struct Voice {
     cursor: f64,
     /// Gains last used, ramped towards each buffer to avoid clicks.
     current: (f32, f32),
+    /// Held where it is, silent ([`Mixer::hold`]).
+    held: bool,
 }
 
 /// Output frames over which a gain change glides.
@@ -415,6 +452,8 @@ pub struct Mixer {
     /// through ([`crate::reverb`]), and its send.
     reverb: Option<crate::reverb::Reverb>,
     send: Vec<f32>,
+    /// The categories whose sounds start held ([`Self::hold`]).
+    holding: [bool; Category::ALL],
 }
 
 impl Mixer {
@@ -433,7 +472,31 @@ impl Mixer {
             max_voices: 64,
             reverb: None,
             send: Vec::new(),
+            holding: [false; Category::ALL],
         }
+    }
+
+    /// Holds the sounds playing in `playing`'s categories where they are,
+    /// silent, and those starting from now on in `starting`'s, until
+    /// [`Self::release`] (a pause menu: the world's sounds wait with the
+    /// world, while the menu's own, and its music, play).
+    pub fn hold(&mut self, playing: &[Category], starting: &[Category]) {
+        for v in &mut self.voices {
+            if playing.contains(&v.play.category) {
+                v.held = true;
+            }
+        }
+        for c in starting {
+            self.holding[c.index()] = true;
+        }
+    }
+
+    /// Plays every held sound on from where it was held.
+    pub fn release(&mut self) {
+        for v in &mut self.voices {
+            v.held = false;
+        }
+        self.holding = [false; Category::ALL];
     }
 
     pub fn rate(&self) -> u32 {
@@ -492,11 +555,13 @@ impl Mixer {
         {
             self.voices.swap_remove(quietest);
         }
+        let held = self.holding[play.category.index()];
         self.voices.push(Voice {
             id,
             play,
             cursor: 0.0,
             current: (0.0, 0.0),
+            held,
         });
         id
     }
@@ -589,6 +654,11 @@ impl Mixer {
         self.send.clear();
         self.send.resize(if reverb { frames } else { 0 }, 0.0);
         for (v, target) in self.voices.iter_mut().zip(gains) {
+            if v.held {
+                // Silent where it is; it comes back in from silence.
+                v.current = (0.0, 0.0);
+                continue;
+            }
             // Sounds placed in the world (not music, dialogue or the
             // interface, which play flat) go to the reverb too.
             let sends = reverb
@@ -1131,6 +1201,26 @@ const LOOP_LONGEST: f32 = 8.5;
 /// windows) within them, where a rev or a gear change would show.
 const STEADY_TENTHS: f32 = 3.5;
 const STEADY_WINDOWS: f32 = 6.0;
+
+/// How alike each tenth of a second of a held note is to itself a period
+/// on, at least, and how far apart its tenths' levels may be, dB
+/// ([`SoundBuffer::is_tone`]). The horns measure 0.98 to 1.00 and 0.1 dB.
+const TONE_ALIKE: f32 = 0.95;
+const TONE_LEVEL: f32 = 1.5;
+
+/// A vehicle's horn, as its engine bank holds one: a held note exactly
+/// this many frames long at [`HORN_RATE`]. No name says so (no
+/// `<bank>_horn`, `_honk` or the like hashes to any sound or cue), but two
+/// recordings recur bank after bank, each one note held level for 0.83 s
+/// with nothing before or after it, as a horn played while held is: a
+/// car's (36,567 frames, in the banks of the jeep, the Ferrari, the dune
+/// buggy, the dirt bike and the newer four-cylinder cars) and a lorry's
+/// (36,597 frames, in the bus's, the semi's and both large diesels'). No
+/// other sound of either length is in any bank, and tanks, boats and
+/// helicopters hold neither (from samples: the 514 sounds of the 38
+/// vehicle banks measured; which the engine plays as the horn is inferred).
+pub const HORN_FRAMES: [usize; 2] = [36_567, 36_597];
+pub const HORN_RATE: u32 = 44_100;
 /// Most loops an engine crossfades between.
 const ENGINE_LOOPS: usize = 4;
 /// Engines heard in a playthrough, for banks that name no loops: the bank,
@@ -1260,9 +1350,29 @@ pub struct EngineSounds {
     /// playthrough ([`HEARD`]), or a bank's only named loop's
     /// ([`LONE_LOOP`]).
     pub heard: Option<(f32, f32)>,
+    /// Its horn, played for as long as it is held ([`Self::horn_of`]).
+    pub horn: Option<SoundBuffer>,
 }
 
 impl EngineSounds {
+    /// The engine sounds of `sounds`, bank `bank` (see [`Self::engine`]),
+    /// and the bank's horn ([`Self::horn_of`]).
+    pub fn pick(bank: &str, sounds: &[SoundBuffer]) -> Self {
+        Self {
+            horn: Self::horn_of(sounds),
+            ..Self::engine(bank, sounds)
+        }
+    }
+
+    /// The horn among a bank's sounds: the held note of a length
+    /// [`HORN_FRAMES`] gives.
+    pub fn horn_of(sounds: &[SoundBuffer]) -> Option<SoundBuffer> {
+        sounds
+            .iter()
+            .find(|s| s.rate == HORN_RATE && HORN_FRAMES.contains(&s.frames()) && s.is_tone())
+            .cloned()
+    }
+
     /// The engine sounds of `sounds`, bank `bank` (`veh_semi`): by name
     /// where the bank names them (`<bank>_idle_loop`, `_slow_loop`,
     /// `_med_loop`, `_fast_loop`, `_start`, `_stop`, or after the vehicle
@@ -1270,7 +1380,7 @@ impl EngineSounds {
     /// (no revs, sweeps or gear changes), the lowest pitched first, at
     /// most four spread from lowest to highest. Which unnamed one-shot
     /// starts or stops the engine can't be told by measuring: none.
-    pub fn pick(bank: &str, sounds: &[SoundBuffer]) -> Self {
+    fn engine(bank: &str, sounds: &[SoundBuffer]) -> Self {
         let after = NAMED_AFTER
             .iter()
             .find(|(b, _)| *b == bank)
@@ -1313,6 +1423,7 @@ impl EngineSounds {
                 stop: find(Part::Stop),
                 named: true,
                 heard: lone.then_some(LONE_LOOP),
+                horn: None,
             };
         }
         if let Some((s, pitch)) = HEARD.iter().find_map(|&(b, hash, pitch)| {
@@ -1327,6 +1438,7 @@ impl EngineSounds {
                 stop: None,
                 named: false,
                 heard: Some(pitch),
+                horn: None,
             };
         }
         let mut steady: Vec<(&SoundBuffer, Option<f32>)> = sounds
@@ -1359,6 +1471,7 @@ impl EngineSounds {
             stop: None,
             named: false,
             heard: None,
+            horn: None,
         }
     }
 }
@@ -1605,6 +1718,33 @@ mod tests {
         assert_eq!(out[2 * 80], out[2 * 80 + 1]);
         assert_eq!(out[2 * 150], 0.0, "finished");
         assert!(!m.is_playing(id));
+    }
+
+    #[test]
+    fn held_sounds_wait_silent_and_play_on_from_where_they_were() {
+        let mut m = Mixer::new(100);
+        m.master = 1.0;
+        let world = m.play(Play::flat(tone(100, 100)));
+        let music = m.play(Play::flat(tone(100, 1000)).category(Category::Music));
+        let ui = m.play(Play::flat(tone(100, 100)).ui());
+        let mut out = vec![0.0; 2 * 50];
+        m.mix(&mut out);
+        m.hold(&[Category::World, Category::Music], &[Category::World]);
+        // Started while held: the world's waits, new music plays.
+        let later = m.play(Play::flat(tone(100, 100)));
+        let piece = m.play(Play::flat(tone(100, 100)).category(Category::Music));
+        for _ in 0..4 {
+            m.mix(&mut out);
+        }
+        // The interface's sound and the new piece played out; the rest wait.
+        assert!(!m.is_playing(ui) && !m.is_playing(piece));
+        assert!(m.is_playing(world) && m.is_playing(music) && m.is_playing(later));
+        assert_eq!(out[2 * 49], 0.0, "held sounds are silent");
+        m.release();
+        m.mix(&mut out);
+        // The world's sound had 50 of its 100 frames left; `later`, all.
+        assert!(!m.is_playing(world) && m.is_playing(later));
+        assert!(out[2 * 49] > 0.0);
     }
 
     #[test]
@@ -1949,5 +2089,50 @@ mod tests {
         let half = mix_layers(9, &[(&mono, 0.0, 0.5)]).unwrap();
         assert_eq!(&*half.samples, &[50, 100]);
         assert!(mix_layers(9, &[]).is_none());
+    }
+
+    /// A note `frames` long at 44.1 kHz: a car horn's two tones, or
+    /// (`noise`) hiss of the same level.
+    fn note(hash: u32, frames: usize, noise: bool) -> SoundBuffer {
+        let mut seed = 7u32;
+        let samples = (0..frames)
+            .map(|i| {
+                let t = i as f32 / 44_100.0;
+                let v = if noise {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 16) as f32 / 32_768.0 - 1.0
+                } else {
+                    0.5 * ((t * 400.0 * TAU).sin() + (t * 500.0 * TAU).sin())
+                };
+                (v * 9_000.0) as i16
+            })
+            .collect();
+        SoundBuffer {
+            hash,
+            channels: 1,
+            rate: 44_100,
+            samples,
+        }
+    }
+
+    #[test]
+    fn a_banks_horn_is_its_held_note_of_a_horns_length() {
+        let car = note(1, HORN_FRAMES[0], false);
+        assert!(car.is_tone());
+        // Hiss isn't a note; a note of another length isn't the horn.
+        assert!(!note(2, HORN_FRAMES[0], true).is_tone());
+        let bank = [
+            note(2, HORN_FRAMES[0], true),
+            note(3, 30_000, false),
+            engine(4, 45.0, 3.0, 0.0, 0.0),
+        ];
+        assert_eq!(EngineSounds::horn_of(&bank), None);
+        let mut bank = bank.to_vec();
+        bank.push(note(5, HORN_FRAMES[1], false));
+        assert_eq!(EngineSounds::horn_of(&bank).map(|h| h.hash), Some(5));
+        // The engine's pick keeps it, and leaves it out of the loops.
+        let picked = EngineSounds::pick("veh_jeep", &bank);
+        assert_eq!(picked.horn.map(|h| h.hash), Some(5));
+        assert!(picked.loops.iter().all(|(l, _)| l.hash != 5));
     }
 }

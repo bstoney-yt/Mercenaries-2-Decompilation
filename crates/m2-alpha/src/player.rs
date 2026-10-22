@@ -172,6 +172,10 @@ pub struct Intent {
     pub use_pressed: bool,
     /// Turn an overturned vehicle back up.
     pub right_vehicle: bool,
+    /// The horn held, driving: the melee's key, which the game's texts
+    /// name `[honk]` as they name it `[bash]` (both the B button,
+    /// [`m2_game::gui_runtime::button_glyph`]).
+    pub honk: bool,
     /// Camera turn, radians: (yaw, pitch).
     pub look: Vec2,
     /// Weapons.
@@ -200,6 +204,7 @@ impl Intent {
             lower: input.held(Action::MoveDown),
             use_pressed: input.take_pressed(Action::Use),
             right_vehicle: input.take_pressed(Action::Reset),
+            honk: input.held(Action::Melee),
             look,
             trigger: Trigger {
                 fire: input.held(Action::Fire),
@@ -434,11 +439,16 @@ impl Player {
         if let Some((_, rig)) = &mut self.model {
             rig.animator.set_upper(None);
             rig.two_handed = false;
-            let rate = match self.clips.swim {
-                Some(clip) => {
+            let rate = match self.clips.swim_clip(rig, moved) {
+                Some((clip, rate)) => {
+                    if rig.animator.current().map(|c| c.0) != Some(clip) {
+                        eprintln!(
+                            "player: swims with clip {:08x} at {rate:.2}x ({moved:.1} m/s)",
+                            rig.clips[clip].hash
+                        );
+                    }
                     rig.animator.play(clip);
-                    let own = rig.clips[clip].info.speed.max(0.1);
-                    (moved / own).clamp(SWIM_STILL_RATE, 2.5)
+                    rate
                 }
                 None => 1.0,
             };

@@ -2499,7 +2499,10 @@ fn parent_to_model(
     m.node_to_model(n.parent?)
 }
 
-fn nodes(source: &mut m2_engine::AssetSource<BufReader<File>>, model: u32) -> Vec<(u32, Vec3)> {
+pub(crate) fn nodes(
+    source: &mut m2_engine::AssetSource<BufReader<File>>,
+    model: u32,
+) -> Vec<(u32, Vec3)> {
     let Ok(data) = source.model(model) else {
         return Vec::new();
     };

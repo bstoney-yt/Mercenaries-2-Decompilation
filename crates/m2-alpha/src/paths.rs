@@ -70,6 +70,13 @@ impl PathMoves {
         vehicles: &[ParkedVehicle],
         driven: Option<usize>,
     ) {
+        // Where every vehicle is, to stop short of (GurCon003 round 82: a
+        // fishing boat on its path ran into her race boat, 31 m/s).
+        let places: Vec<(usize, Vec3)> = vehicles
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| Some((i, physics.vehicle_transform(v.id?)?.w_axis.truncate())))
+            .collect();
         self.moves.retain(|&g, m| {
             let Some((i, v)) = vehicles.iter().enumerate().find(|(_, v)| v.guid == Some(g)) else {
                 return true;
@@ -124,6 +131,18 @@ impl PathMoves {
                 );
             }
             m.steps += 1;
+            let speed = physics.vehicle_speed(id);
+            let forward = flat(at.transform_vector3(Vec3::Z)).normalize_or_zero();
+            let others = places.iter().filter(|(j, _)| *j != i).map(|&(_, p)| p);
+            let controls = if crate::roads::in_the_way(here, forward, speed, others) {
+                VehicleControls {
+                    throttle: 0.0,
+                    brake: speed > 0.5,
+                    ..controls
+                }
+            } else {
+                controls
+            };
             physics.drive(id, controls);
             true
         });

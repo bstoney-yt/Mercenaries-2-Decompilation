@@ -29,6 +29,12 @@
 //! tables tell apart); then, once press-start is up, Enter calls
 //! `startShell` (see [`Native`]).
 //!
+//! Left at the main menu for a minute, the scripts ask for the `attract`
+//! game state and hide their menus; the game plays the attract video over
+//! everything and then takes them back to `Shell` ([`ATTRACT_STATE`]).
+//! Before, nothing played or returned, so the menus stayed hidden behind
+//! black.
+//!
 //! `LTILibName` is the PC version's own library behind its options
 //! screens (video modes, key bindings, the profile): the engine's, not the
 //! scripts'. Its calls are queued for the engine ([`Native::library`]),
@@ -132,6 +138,24 @@ pub fn game_states(
     log
 }
 
+/// The front end's own game state, which the bootstrap asks for once its
+/// layout has loaded.
+pub const SHELL_STATE: &str = "Shell";
+/// The game state the shell's scripts ask for after a minute at the main
+/// menu with nothing pressed: they hide their menus (the menu movie is
+/// paused and not drawn) and wait for the engine to bring them back.
+pub const ATTRACT_STATE: &str = "attract";
+/// The video the game plays in the attract state (`Movies\attract.bik`).
+/// Inferred: the install's only movie of that name, and nothing else is
+/// drawn then. That the engine returns to `Shell` when it ends or a key
+/// or tap cuts it short is invented (no script asks for it).
+pub const ATTRACT_MOVIE: &str = "attract";
+
+/// Whether the shell's scripts are in the attract game state.
+pub fn in_attract(state: Option<&str>) -> bool {
+    state.is_some_and(|s| s.eq_ignore_ascii_case(ATTRACT_STATE))
+}
+
 /// The character a new game was started as since the last call
 /// (`Chris`, `Jen` or `mattias`), if one was.
 pub fn take_new_game(lua: &Lua) -> Option<String> {
@@ -160,6 +184,9 @@ pub fn hero(character: &str) -> Option<crate::hero::Hero> {
 pub struct Native {
     /// The movie has been told the platform.
     set_up: bool,
+    /// The saves as the game last told them ([`Native::calls`]): told
+    /// others, they are listed again (the movie's own deletes aside).
+    told_saves: Vec<crate::pause::SaveEntry>,
     /// The press-start screen is up (`pressStartEnabled`), waiting for a
     /// key.
     press_start: bool,
@@ -218,6 +245,7 @@ impl Native {
     pub fn calls(&mut self, settings: &Settings) -> Vec<Call> {
         let mut calls = Vec::new();
         if !std::mem::replace(&mut self.set_up, true) {
+            self.told_saves = settings.saves.clone();
             self.settings = settings.clone();
             self.editing = settings.clone();
             self.table = KeyScreen::new(settings.keys.clone());
@@ -233,6 +261,17 @@ impl Native {
             calls.extend(self.setting_calls());
             calls.extend(self.save_calls());
             calls.extend(self.table.fill());
+        } else if settings.saves != self.told_saves {
+            // The saves came after the movie was set up (the front end's
+            // first frames run before they are told it), or changed (a
+            // game saved): listed again, so Continue and Load Game offer
+            // them. Set up with none, the menu greyed Continue for good.
+            // (Compared with what was told, not the movie's list: one it
+            // deleted stays gone while the game's list catches up.)
+            self.told_saves = settings.saves.clone();
+            self.settings.saves = settings.saves.clone();
+            self.editing.saves = settings.saves.clone();
+            calls.extend(self.save_calls());
         }
         calls.append(&mut self.pending);
         calls
@@ -843,6 +882,14 @@ mod tests {
     const NO_MODES: [Mode; 0] = [];
 
     #[test]
+    fn the_attract_state_is_told_apart_from_the_shell() {
+        assert!(in_attract(Some("attract")));
+        assert!(in_attract(Some("Attract")));
+        assert!(!in_attract(Some(SHELL_STATE)));
+        assert!(!in_attract(None));
+    }
+
+    #[test]
     fn the_movie_is_set_up_once_and_enter_starts_the_shell_from_press_start() {
         let mut n = Native::default();
         let s = Settings::default();
@@ -956,6 +1003,38 @@ mod tests {
         assert_eq!(names(n.calls(&s)), ["saveCompleteContinue"]);
         assert!(n.command("onlineSaveProfile", "true"));
         assert!(n.calls(&s).is_empty());
+    }
+
+    #[test]
+    fn saves_told_after_the_movie_is_set_up_are_listed_then() {
+        // The front end's first frames set the movie up before the saves
+        // are told (Continue stayed greyed: playtest on the phone).
+        let mut n = Native::default();
+        let none = Settings::default();
+        let first = names(n.calls(&none));
+        assert!(first.contains(&"clearSaveGames"));
+        assert!(!first.contains(&"addSaveGame"));
+        let told = Settings {
+            saves: vec![save(0, 3), save(1, 1)],
+            ..Settings::default()
+        };
+        assert_eq!(
+            names(n.calls(&told)),
+            ["clearSaveGames", "addSaveGame", "addSaveGame"]
+        );
+        // Once listed, not again while they stay the same.
+        assert!(names(n.calls(&told)).is_empty());
+        // And the movie's own load check lists them too.
+        assert!(n.command("preoperation", "load,continue"));
+        assert_eq!(
+            names(n.calls(&told)),
+            [
+                "clearSaveGames",
+                "addSaveGame",
+                "addSaveGame",
+                "preopComplete"
+            ]
+        );
     }
 
     #[test]

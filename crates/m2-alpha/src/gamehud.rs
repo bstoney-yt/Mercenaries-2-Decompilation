@@ -142,8 +142,9 @@ return c.sColor .. tag .. " [objective." .. c.sPrefix .. c.sStatus .. "]" .. " "
     c.nPriority or 1
 "#;
 /// A mission's call to the HUD's interface, as the engine hands it on:
-/// `HudInterface.<group>.<method>(HudInterface.<group>, data)`. Answers
-/// whether the HUD has that method.
+/// `HudInterface.<group>.<method>(HudInterface.<group>, data)`, or for a
+/// `Pda.` group (`Pda.Database`), `PdaInterface`'s. Answers whether the
+/// HUD has that method.
 ///
 /// `HudInterface` is a global of `MrxGuiInterface`'s script, which runs in
 /// its own environment like every module: its globals are the module's
@@ -160,8 +161,9 @@ if seq then
     end
 end
 local module = rawget(_G, "MrxGuiInterface")
-local hud = type(module) == "table" and module.HudInterface
-local g = type(hud) == "table" and hud[group]
+local pda = group:sub(1, 4) == "Pda."
+local hud = type(module) == "table" and (pda and module.PdaInterface or module.HudInterface)
+local g = type(hud) == "table" and hud[pda and group:sub(5) or group]
 local f = type(g) == "table" and g[method]
 if type(f) ~= "function" then return false end
 -- Message ids: the mission knows a message by its call's number
@@ -549,6 +551,9 @@ const DEFAULT_RANGE: f32 = 150.0;
 pub struct HudState {
     /// Screen size in points.
     pub size: [f32; 2],
+    /// The pad's (or the touch controls') left stick, x right and y up,
+    /// for the PDA's map.
+    pub stick: [f32; 2],
     /// Seconds since the last state.
     pub dt: f64,
     /// Health, 0..=100: hers, or the vehicle's she is in.
@@ -694,6 +699,10 @@ pub struct HudState {
     /// menu movies' buttons (the front end's, the pause menu's).
     pub pointer: Option<[f32; 2]>,
     pub clicks: Vec<bool>,
+    /// The front end's attract video is over (it ended, or a key or tap
+    /// cut it short): its scripts go back to the `Shell` game state
+    /// ([`ShellNews::attract`]).
+    pub shell_wake: bool,
     /// Her binoculars are up: what their screen shows
     /// ([`crate::binoculars`]).
     pub binoculars: Option<binoculars::View>,
@@ -1100,6 +1109,12 @@ pub struct ShellNews {
     pub news: crate::pause::News,
     /// The press-start screen is behind ([`crate::shell::Native::started`]).
     pub started: bool,
+    /// Its scripts are in the `attract` game state (asked for after a
+    /// minute at the main menu with nothing pressed): their menus are
+    /// hidden while the game plays the attract video
+    /// ([`crate::shell::ATTRACT_MOVIE`]) over everything, then
+    /// [`HudState::shell_wake`] takes them back.
+    pub attract: bool,
 }
 
 /// What a [`GameHud`] thread runs.
@@ -1676,6 +1691,10 @@ const PDA_STICK_KEYS: [(i32, [f32; 2]); 8] = [
     (40, [0.0, -1.0]),
     (39, [1.0, 0.0]),
 ];
+
+/// How much faster than the stick's own push the PDA's map moves under it.
+/// Invented: the map crawled at the push as given (playtest on the phone).
+const PDA_PAN: f32 = 2.5;
 
 /// The stick the PDA's movement keys `held` (Flash key codes) push.
 fn pda_stick(held: &HashSet<i32>) -> [f32; 2] {
@@ -2283,7 +2302,13 @@ impl Thread {
         if !self.pda_shown {
             self.pda_held.clear();
         }
-        let stick = pda_stick(&self.pda_held);
+        // The movement keys and the pad's stick together, sped up.
+        let keys = pda_stick(&self.pda_held);
+        let stick = if self.pda_shown {
+            [0, 1].map(|i| (keys[i] + state.stick[i]).clamp(-1.0, 1.0) * PDA_PAN)
+        } else {
+            [0.0; 2]
+        };
         if stick != [0.0; 2] || self.pda_stick != [0.0; 2] {
             let took = self
                 .mission
@@ -2842,7 +2867,12 @@ impl Thread {
         self.log_flash_shown(&items, &|_| true, &mut log);
         log.extend(screen.borrow_mut().take_log());
         log.extend(self.mission.take_log());
-        let commands = self.mission.take_commands();
+        let mut commands = self.mission.take_commands();
+        if state.shell_wake && crate::shell::in_attract(self.game_state.as_deref()) {
+            commands.push(m2_game::api::Command::GameState(
+                crate::shell::SHELL_STATE.into(),
+            ));
+        }
         log.extend(crate::shell::game_states(
             self.mission.lua(),
             &commands,
@@ -2868,6 +2898,7 @@ impl Thread {
                 new_game,
                 news: self.native.take_news(),
                 started: self.native.started(),
+                attract: crate::shell::in_attract(self.game_state.as_deref()),
             }),
             pause: Box::default(),
         }

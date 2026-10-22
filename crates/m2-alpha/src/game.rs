@@ -1,7 +1,7 @@
 //! What a tick does: the player on foot (or the free camera), physics and
 //! animation, and where the frame is seen from.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use m2_engine::atmosphere::AtmosphereMix;
 use m2_engine::durability::{CrashHow, Explosion};
@@ -124,6 +124,12 @@ pub struct Game {
     pub combat: Combat,
     /// The island's placed objects worn down and brought down by blasts.
     pub destruction: Destruction,
+    /// Each vehicle model's load bed, its `HP_Truckbed` node in its own
+    /// space, by model (`None`: it has none), as looked up.
+    beds: HashMap<u32, Option<Vec3>>,
+    /// The scripts' vehicles whose load bed's goods were logged (taken up,
+    /// or what stood near and why not), by index.
+    beds_told: HashSet<usize>,
     /// Layer entities of the island's vehicles asked for so far.
     fetched: HashSet<u32>,
     /// The island's traffic spawners and what they have out.
@@ -195,6 +201,10 @@ pub struct Game {
     /// The context action she took with the use key, for the mission to
     /// tell the scripts.
     pub context_taken: Option<u32>,
+    /// The scripts' helicopter she rides in as a passenger, its own pilot
+    /// flying it (PmcCon003's Lucky Lady): not one of hers to fly, so she is
+    /// kept where the scripts have it ([`crate::mission`]).
+    pub aboard: Option<u32>,
     /// The scripts' camera shot for a scene (the HQ's briefings), while
     /// it lasts: the frame is seen from it ([`Shot::view`]).
     pub shot: Option<Shot>,
@@ -220,6 +230,12 @@ pub struct Game {
     pub reporters: Vec<(u32, &'static str, f32)>,
     /// Whether an army pursued her last frame.
     pub pursued: bool,
+    /// The horn held this tick (driving), and its presses not yet taken
+    /// ([`Game::take_honks`]).
+    pub honking: bool,
+    honks: u32,
+    /// Her vehicle disguise ([`crate::disguise`]).
+    pub disguise: crate::disguise::Disguise,
     /// Seconds the scripts asked her pad to shake (`Pg.Rumble`), for the
     /// pad to take.
     pub rumble: f64,
@@ -344,6 +360,8 @@ impl Game {
             restore: Vec::new(),
             combat,
             destruction: Destruction::default(),
+            beds: HashMap::new(),
+            beds_told: HashSet::new(),
             fetched: HashSet::new(),
             traffic: crate::traffic::Traffic::default(),
             paths: crate::paths::PathMoves::default(),
@@ -373,6 +391,7 @@ impl Game {
             lens: (60.0, 16.0 / 9.0),
             context: None,
             context_taken: None,
+            aboard: None,
             shot: None,
             save_icon: 0.0,
             raw: crate::raw::RawClips::default(),
@@ -382,6 +401,9 @@ impl Game {
             attitude_wait: 0.0,
             reporters: Vec::new(),
             pursued: false,
+            honking: false,
+            honks: 0,
+            disguise: crate::disguise::Disguise::default(),
             rumble: 0.0,
             actions: Vec::new(),
             scripts_seated: false,
@@ -625,6 +647,29 @@ impl Game {
                 self.context_taken = Some(*g);
             }
             let mut intent = Intent::from_input(input, config, mouse_look);
+            // Aim assist on a pad or the touch controls (not the mouse):
+            // aiming or firing on foot draws the view to the hostile
+            // nearest the crosshair ([`crate::aim`]).
+            if input.pad()
+                && (intent.trigger.aim || intent.trigger.fire)
+                && intent.look.length() < crate::aim::LET_GO
+                && let Some(p) = self.scene.player.as_ref().filter(|p| p.driving.is_none())
+            {
+                let people = &self.scene.people;
+                let targets = people
+                    .npcs
+                    .iter()
+                    .filter(|n| n.alive && n.faction.is_some_and(|f| people.fights_for(f)))
+                    .map(|n| {
+                        n.character.position + Vec3::Y * n.character.height * crate::aim::CHEST
+                    });
+                // The crosshair's pitch (above the camera's: shots fly
+                // along it, [`crate::player::Player::aim_forward`]).
+                let aim_pitch = p.aim_forward().y.clamp(-1.0, 1.0).asin();
+                if let Some(turn) = crate::aim::assist(p.eye(), p.yaw, aim_pitch, targets, dt) {
+                    intent.look += turn;
+                }
+            }
             let toggle = input.take_pressed(Action::Binoculars);
             let zoom = i32::from(input.take_pressed(Action::ZoomIn))
                 - i32::from(input.take_pressed(Action::ZoomOut));
@@ -976,6 +1021,7 @@ impl Game {
                     .and_then(|i| scene.vehicles.get(i))
                     .and_then(|v| v.id.map(|id| (id, v)));
                 self.throttle = 0.0;
+                let was_honking = std::mem::take(&mut self.honking);
                 // In a gunner's seat nobody drives: it stops.
                 let gunner = self.combat.seat > 0;
                 if let Some((id, v)) = id
@@ -995,6 +1041,11 @@ impl Game {
                     && !v.wrecked
                 {
                     self.throttle = intent.movement.y;
+                    // The horn, as long as it is held; each press counts.
+                    self.honking = intent.honk;
+                    if self.honking && !was_honking {
+                        self.honks += 1;
+                    }
                     physics.drive(
                         id,
                         VehicleControls {
@@ -1075,6 +1126,23 @@ impl Game {
             }
         }
         split("game: player and physics");
+        // The vehicles' load beds, looked up once a model.
+        if let Some(source) = self.scene.source.as_mut() {
+            for v in &self.scene.vehicles {
+                self.beds.entry(v.spec.model).or_insert_with(|| {
+                    crate::hijack::nodes(source, v.spec.model)
+                        .into_iter()
+                        .find(|(n, _)| *n == m2_assets::name_hash(BED_NODE))
+                        .map(|(_, at)| at)
+                });
+            }
+        }
+        let beds: Vec<Option<Vec3>> = self
+            .scene
+            .vehicles
+            .iter()
+            .map(|v| self.beds.get(&v.spec.model).copied().flatten())
+            .collect();
         let focus = self.focus();
         if let Some(world) = &mut self.scene.world {
             let driven = self
@@ -1155,9 +1223,18 @@ impl Game {
                 world,
                 &mut self.scene.props,
                 &self.scene.vehicles,
+                (&beds, &mut self.beds_told),
                 &mut self.destruction,
                 self.scene.install.as_ref(),
             );
+            // What rides on a vehicle that tipped over falls off it.
+            let placed: Vec<_> = self.scene.vehicles.iter().map(|v| v.id).collect();
+            for (e, at) in self.scene.props.carry(&world.physics, &placed) {
+                eprintln!("cargo: {e:#x} falls off at {at:.1}");
+                self.scene
+                    .props
+                    .knock(&mut world.physics, e, Vec3::Y, Vec3::ZERO, false);
+            }
             // Vehicles running into each other hurt each other and the
             // parts where they met.
             for (struck, other, closing, damage) in self
@@ -2120,7 +2197,15 @@ impl Game {
                 .max_speed
                 .unwrap_or(if v.spec.tracked { 14.0 } else { 32.0 }),
             throttle: self.throttle,
+            horn: self.honking,
+            heavy: heavy_horn(&v.spec.kind, &v.spec.label, v.spec.tracked),
         })
+    }
+
+    /// The horn presses since the last call (the faction gates, the
+    /// disguise and the friendly soldiers hear each one).
+    pub fn take_honks(&mut self) -> u32 {
+        std::mem::take(&mut self.honks)
     }
 
     /// Switches between walking and flying (a developer's aid, `--dev`).
@@ -2739,6 +2824,12 @@ impl Game {
         self.combat.went_off.clear();
     }
 
+    /// The load bed of vehicle model `model` (its `HP_Truckbed` node),
+    /// once looked up.
+    pub fn bed(&self, model: u32) -> Option<Vec3> {
+        self.beds.get(&model).copied().flatten()
+    }
+
     /// What a vehicle like `crasher` going at its velocity does to what
     /// its box meets, as one driven would ([`run_into`]): the props
     /// check's crashes ([`crate::breakables::check`]).
@@ -2755,9 +2846,44 @@ impl Game {
             scene.install.as_ref(),
             crasher,
             keys,
-            (crasher.velocity.length(), "props check's vehicle"),
+            (crasher.velocity.length(), "props check's vehicle", None),
         );
     }
+}
+
+/// A vehicle that may carry what stands on it: its index among the
+/// scene's and its physics id, and its load bed in its space.
+type Carrier = ((usize, m2_engine::VehicleId), Vec3);
+
+/// The node of a vehicle model that is its load bed (the scripts count
+/// the goods on it there: PirCon002's `GetHardpointPosition(truck,
+/// "HP_Truckbed")`).
+pub(crate) const BED_NODE: &str = "HP_Truckbed";
+/// The props within this of a scripts' vehicle's load bed are logged
+/// once, metres.
+const TOLD_REACH: f32 = 6.0;
+
+/// Props up to this far under the bed node, or this far over it
+/// (metres), count as on it, over the vehicle's footprint (invented:
+/// PirCon002's rum jugs stand 0.1 m above its wheels' bottom, about
+/// 1.5 m under the node, when the truck is put down).
+const BED_UNDER: f32 = 2.0;
+const BED_OVER: f32 = 1.0;
+
+/// Whether prop `entity` stands on `vehicle`'s load bed, whose node is at
+/// `bed` in its space: over its footprint, from [`BED_UNDER`] under the
+/// node's height to [`BED_OVER`] over it.
+fn on_bed(props: &Props, vehicle: &Crasher, bed: Vec3, entity: u32) -> bool {
+    let (lo, hi) = vehicle.bounds;
+    props.centre(entity).is_some_and(|c| {
+        let l = vehicle.place.inverse().transform_point3(c);
+        l.x > lo.x
+            && l.x < hi.x
+            && l.z > lo.z
+            && l.z < hi.z
+            && l.y > bed.y - BED_UNDER
+            && l.y < bed.y + BED_OVER
+    })
 }
 
 /// Vehicles knock loose what they hit that comes loose, with the weight
@@ -2771,11 +2897,73 @@ fn knock_loose(
     world: &mut World,
     props: &mut Props,
     vehicles: &[ParkedVehicle],
+    (beds, told): (&[Option<Vec3>], &mut HashSet<usize>),
     destruction: &mut Destruction,
     install: Option<&Install>,
 ) {
-    for v in vehicles {
+    for (index, (v, bed)) in vehicles
+        .iter()
+        .zip(beds.iter().chain(std::iter::repeat(&None)))
+        .enumerate()
+    {
         let Some(id) = v.id else { continue };
+        // The scripts' vehicles with a load bed take up what stands on it
+        // as soon as they are placed, standing or not: the scripts count
+        // the goods on the bed from then on (PirCon002 counted none, and
+        // gave up, while the truck stood with its jugs still the layer's).
+        if let (Some(_), Some(b), Some(place)) = (v.guid, bed, world.physics.vehicle_transform(id))
+        {
+            let standing = Crasher {
+                place,
+                bounds: v.model.bounds,
+                velocity: Vec3::ZERO,
+                mass: v.spec.mass,
+            };
+            // What stands in its box with collision, and what has none
+            // (PirCon004's organ boxes: none rode, and the truck left
+            // them standing where it was parked).
+            let (lo, hi) = v.model.bounds;
+            let mut near: Vec<u32> = world
+                .physics
+                .statics_in_box(place, v.model.bounds)
+                .into_iter()
+                .filter_map(|k| match k {
+                    StaticKey::Entity(e) => Some(e),
+                    _ => None,
+                })
+                .collect();
+            near.extend(props.standing_near(
+                place.transform_point3((lo + hi) * 0.5),
+                (hi - lo).length() * 0.5,
+            ));
+            near.sort_unstable();
+            near.dedup();
+            // Once the props round it have loaded: what stands round the
+            // bed, and how, for the log.
+            let bed_at = place.transform_point3(*b);
+            if !told.contains(&index) {
+                let round = props.told_near(bed_at, TOLD_REACH);
+                if !round.is_empty()
+                    && (round.iter().all(|t| !t.contains("(not "))
+                        || round.iter().any(|t| t.starts_with("0x4")))
+                {
+                    told.insert(index);
+                    eprintln!(
+                        "cargo: by the {} (bed at {bed_at:.2}): {}",
+                        v.spec.label,
+                        round.join("; ")
+                    );
+                }
+            }
+            for e in near {
+                if !props.is_cargo(e)
+                    && on_bed(props, &standing, *b, e)
+                    && props.load(&mut world.physics, e, (index, id), b.y)
+                {
+                    eprintln!("cargo: {e:#x} rides on the {}", v.spec.label);
+                }
+            }
+        }
         let before = world.physics.vehicle_velocity_before(id);
         let mut speed = before.length();
         if world.physics.vehicle_pulling(id) {
@@ -2802,7 +2990,7 @@ fn knock_loose(
             install,
             &crasher,
             keys,
-            (speed, &v.spec.label),
+            (speed, &v.spec.label, bed.map(|b| ((index, id), b))),
         );
         if shifted > 0.0 || ploughed {
             world
@@ -2818,7 +3006,8 @@ fn knock_loose(
 /// loose with the weight and `speed` for it ([`KNOCK_RATIO`]: as fast as
 /// it pushes, pulling against what holds it). Returns the mass it
 /// shifted (kg) and whether it ploughed on through something it broke.
-/// `label` names it for the log.
+/// `label` names it for the log; `carrier` is the vehicle (its index and
+/// id) and its load bed, for what stands on it to ride ([`on_bed`]).
 fn run_into(
     world: &mut World,
     props: &mut Props,
@@ -2826,7 +3015,7 @@ fn run_into(
     install: Option<&Install>,
     vehicle: &Crasher,
     mut keys: Vec<StaticKey>,
-    (speed, label): (f32, &str),
+    (speed, label, carrier): (f32, &str, Option<Carrier>),
 ) -> (f32, bool) {
     // A building of a merged batch touched is its own placed object (a
     // shanty town's shack), where it is placed by its own model too.
@@ -2856,8 +3045,38 @@ fn run_into(
             }
         }
     }
-    // What broke is not knocked loose as well.
-    keys.retain(|k| !down.contains(k));
+    // What broke is not knocked loose as well, nor what rides on a
+    // vehicle ([`Props::load`]). What stands on this one's load bed (a
+    // prop resting on top of it, inside its footprint: PirCon002's rum
+    // jugs) rides on it, not knocked loose by it (inferred: the game's
+    // goods ride a driven truck).
+    keys.retain(|k| match *k {
+        _ if down.contains(k) => false,
+        StaticKey::Entity(e) if props.is_cargo(e) => false,
+        StaticKey::Entity(e) => match carrier {
+            Some((carrier, bed))
+                if on_bed(props, vehicle, bed, e)
+                    && props.load(&mut world.physics, e, carrier, bed.y) =>
+            {
+                eprintln!("cargo: {e:#x} rides on the {label}");
+                false
+            }
+            Some(_) => {
+                if std::env::var_os("M2_CARGO_LOG").is_some() {
+                    let l = props
+                        .centre(e)
+                        .map(|c| vehicle.place.inverse().transform_point3(c));
+                    eprintln!(
+                        "cargo: {e:#x} at {l:?} of the {label}, box {:?}",
+                        vehicle.bounds
+                    );
+                }
+                true
+            }
+            None => true,
+        },
+        _ => true,
+    });
     for key in keys {
         let (loose, template) = match key {
             StaticKey::Object(i) => (world.loose_mass(i), world.index.objects[i].template),
@@ -3263,6 +3482,20 @@ fn log_floor(props: &Props, physics: &Physics, at: Vec3) {
     }
 }
 
+/// Whether a vehicle of `kind` named `label` whose bank holds no horn is
+/// heard with the lorry's (tracked ones, lorries, buses, the APCs), not
+/// the car's (invented: which spare horn the game gives such a vehicle,
+/// if any, is not in the data).
+pub fn heavy_horn(kind: &str, label: &str, tracked: bool) -> bool {
+    let key = format!("{kind} {label}").to_lowercase();
+    tracked
+        || [
+            "truck", "lorry", "bus", "semi", "apc", "lav", "stryker", "tank",
+        ]
+        .iter()
+        .any(|w| key.contains(w))
+}
+
 /// Whether someone sits in the driver's seat of a crew.
 /// Whether getting into a vehicle whose template's physics is `kind`
 /// earns her vehicle remark ([`combat::Remark::Vehicle`]): her lines for
@@ -3350,6 +3583,14 @@ fn put_out(
 
 /// The vehicle nearest her within `reach` metres of its door marker (or its
 /// hull, for those without one).
+/// Whether a vehicle of catalogue kind `kind` has a seat to get into: not
+/// a trailer (ChiCon003's `civ_veh_trailer_flatbed`, kind `trailer`, was
+/// got into for the M2A3 it carries, and "driven" stuck for 3,200 s).
+/// Invented: the trailer's model has no seat the alpha reads.
+fn can_sit_in(kind: &str) -> bool {
+    kind != "trailer"
+}
+
 fn nearest(
     physics: &Physics,
     vehicles: &[ParkedVehicle],
@@ -3361,13 +3602,18 @@ fn nearest(
     vehicles
         .iter()
         .enumerate()
-        .filter(|(_, v)| !v.wrecked)
+        .filter(|(_, v)| !v.wrecked && can_sit_in(&v.spec.kind))
         // Crewed, one with an action hijack is taken only by it (playtest
         // 5: the villa's tank, whose scripts make it usable by the hijack
         // alone, `Vehicle.Usable(tank, false)`, was got into at a press).
         .filter(|(_, v)| !(hijack_only.contains(&v.spec.model) && has_driver(&v.crew)))
-        // Kept by the scripts for themselves (`Vehicle.Usable(v, false)`).
-        .filter(|(_, v)| !v.guid.is_some_and(|g| unusable.contains(&g)))
+        // Kept by the scripts for themselves (`Vehicle.Usable(v, false)`)
+        // while crewed: an empty one is still got into (ChiCon009's ZBD2000
+        // and ChiCon008's race tank, the only `Usable(false)` vehicles in
+        // the runs, are both made so and then to be got into; the villa's
+        // crewed tank is the hijack's alone). From those samples; the 360
+        // code not checked.
+        .filter(|(_, v)| !(v.guid.is_some_and(|g| unusable.contains(&g)) && has_driver(&v.crew)))
         // One with someone in the driver's seat is taken from them: the
         // action hijacks (tanks, helicopters) took the key first if near
         // ([`crate::hijack`]); cars, bikes and jeeps have none in the data
@@ -3503,6 +3749,13 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn a_trailer_is_not_got_into() {
+        assert!(!super::can_sit_in("trailer"));
+        assert!(super::can_sit_in("tank"));
+        assert!(super::can_sit_in("car"));
+    }
+
+    #[test]
     fn a_shoulder_shot_sees_the_target_from_behind_the_base() {
         // Jennifer at the origin facing Fiona 2 m up +z.
         let mut shot = super::Shot {
@@ -3553,6 +3806,15 @@ mod tests {
         let seat = |s: &str| (s.to_owned(), "VZ Tank Commander".to_owned());
         assert!(super::has_driver(&[seat("Gunner"), seat("seat_driver")]));
         assert!(!super::has_driver(&[seat("Gunner")]));
+    }
+
+    #[test]
+    fn heavy_vehicles_borrow_the_lorrys_horn_others_the_cars() {
+        assert!(super::heavy_horn("car", "Transport Truck", false));
+        assert!(super::heavy_horn("car", "LAV III (Base)", false));
+        assert!(super::heavy_horn("tank", "ZTZ98", true));
+        assert!(!super::heavy_horn("car", "Valiant (4door)", false));
+        assert!(!super::heavy_horn("boat", "RIB36", false));
         assert!(!super::has_driver(&[]));
     }
 

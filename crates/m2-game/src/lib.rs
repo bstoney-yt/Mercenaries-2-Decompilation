@@ -8,6 +8,7 @@ pub mod gui_runtime;
 pub mod hijack;
 pub mod hud;
 pub mod inventory;
+pub mod jobs;
 pub mod layers;
 pub mod library;
 pub mod mission;
