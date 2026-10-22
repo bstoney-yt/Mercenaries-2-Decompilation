@@ -1870,12 +1870,28 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([guid_value(id(a.first()).and_then(|who| w.held(who, 1)))])
     })?;
     add(&inventory, "SetAllWeapons", |w, _, a| {
-        let (Some(who), Some(Value::Table(list))) = (id(a.first()), a.get(1)) else {
+        let Some(who) = id(a.first()) else {
             return values([]);
         };
+        // A list, or one weapon alone: PmcCon034's sniper tower hands her
+        // `Pg.GetGuidByName("Anti-Material Rifle")` (from the scripts; a
+        // list only, she was left with nothing to break its statues with).
+        let items: Vec<Value> = match a.get(1) {
+            Some(Value::Table(list)) => list
+                .clone()
+                .sequence_values::<Value>()
+                .collect::<mlua::Result<_>>()?,
+            Some(
+                v @ (Value::String(_)
+                | Value::LightUserData(_)
+                | Value::Integer(_)
+                | Value::Number(_)),
+            ) => vec![v.clone()],
+            _ => return values([]),
+        };
         let mut templates = Vec::new();
-        for v in list.clone().sequence_values::<Value>() {
-            match v? {
+        for v in items {
+            match v {
                 Value::String(s) => templates.push(w.template(&s.to_string_lossy())),
                 v => templates.extend(id(Some(&v))),
             }
@@ -3800,6 +3816,27 @@ mod tests {
             }]
         );
         assert_eq!(w.printed, ["jeep moved"]);
+    }
+
+    #[test]
+    fn a_loadout_of_one_weapon_alone_is_given_too() {
+        let (host, world) = setup();
+        let name: String = host
+            .lua()
+            .load(
+                r#"
+                local hero = Player.GetLocalCharacter()
+                Human.Inventory.SetAllWeapons(hero, Pg.GetGuidByName("Carbine"))
+                return Object.GetName(Human.Inventory.GetPrimaryWeapon(hero))
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(name, "Carbine");
+        assert!(matches!(
+            &world.borrow_mut().take_commands()[..],
+            [Command::Loadout { weapons, .. }] if weapons == &["Carbine".to_owned()]
+        ));
     }
 
     #[test]
