@@ -67,6 +67,23 @@ const BLAST_RANGE: (f32, f32) = (15.0, 45.0);
 /// With nothing to blow things up with, she mans an emplaced gun this
 /// near her (metres) that is this near the target (invented).
 const MAN_SEEK: f32 = 80.0;
+/// Whether target `g` is a prop that rounds break (its template's damage
+/// row takes a `Bullet`, with health to wear: the ranges' targets): shot
+/// with her rifle rather than rockets or C4 (PmcCon033 round 11: C4 on
+/// each pistol-range target, 116 s against its 90 s to beat).
+fn takes_rounds(game: &Game, g: u32) -> bool {
+    let (Some((p, _)), Some(w)) = (game.scene.props.get(g), game.scene.world.as_ref()) else {
+        return false;
+    };
+    let db = &w.index.template_db;
+    !game.scene.props.sturdy.contains(&g)
+        && db
+            .durability
+            .get(&p.template)
+            .is_some_and(|d| !d.invincible && d.health > 0.0)
+        && crate::breakables::Makeup::of(db, p.template).bullet > 0.0
+}
+
 /// She keeps to the target she is blowing up unless another is this much
 /// nearer, metres (invented).
 const KEEP_TARGET_BY: f32 = 10.0;
@@ -719,7 +736,9 @@ impl Autoplay {
             .and_then(|p| p.driving)
             .and_then(|i| game.scene.vehicles.get(i))
             .is_some_and(|v| v.spec.cannon());
-        let rifle = matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target) && self.rifle_first(game, *target));
+        let rifle = matches!(&self.goal, Some(Goal::Blast { target, .. })
+            if (sturdy(target) && self.rifle_first(game, *target))
+                || (takes_rounds(game, *target) && self.rifle_first(game, u32::MAX)));
         let striking = !rifle
             && matches!(&self.goal, Some(Goal::Blast { target, at }) if (sturdy(target) && !cannon) || (spent && !gun(at) && !cannon))
             || matches!(self.goal, Some(Goal::Deliver(_)));
