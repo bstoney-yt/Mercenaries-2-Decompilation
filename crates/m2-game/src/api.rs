@@ -105,6 +105,10 @@ pub struct Object {
     /// The faction it belongs to (`Ai.GetFactionGuid`): the name hash of
     /// the faction's template (`"VZ"`), as the HUD's faction guids are.
     pub faction: Option<u32>,
+    /// Who killed or destroyed it, when the game knows (her, for what her
+    /// shots, blasts and rams kill): `ObjectDeath` passes it on
+    /// ([`crate::events::World::killer`]).
+    pub killer: Option<u32>,
 }
 
 impl Object {
@@ -951,6 +955,9 @@ impl World for ScriptWorld {
     }
     fn is_alive(&self, guid: u32) -> bool {
         self.objects.get(&guid).is_some_and(|o| o.alive)
+    }
+    fn killer(&self, guid: u32) -> Option<u32> {
+        self.objects.get(&guid)?.killer
     }
     fn vehicle_of(&self, guid: u32) -> Option<u32> {
         self.objects.get(&guid)?.vehicle
