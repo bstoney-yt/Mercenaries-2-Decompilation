@@ -219,8 +219,8 @@ pub struct Trespass {
 struct Radio {
     /// The score's cue as the scripts last set it.
     score: Option<String>,
-    /// The radio playing over it (its entity and cue).
-    playing: Option<(u32, String)>,
+    /// The radio playing over it (its entity, cue, place and reach).
+    playing: Option<(u32, String, Vec3, f32)>,
     /// How many radio songs started.
     turn: usize,
 }
@@ -254,7 +254,7 @@ impl Radio {
                     s.at,
                     list.len()
                 );
-                self.playing = Some((s.entity, cue.clone()));
+                self.playing = Some((s.entity, cue.clone(), s.at, s.reach));
                 Some(Some(cue))
             }
             None if playing.is_some() => {
@@ -819,6 +819,8 @@ pub struct MissionLink {
     fades: Vec<crate::sound::CategoryChange>,
     /// The music cue the scripts last switched to (`Some(None)`: none).
     music: Option<Option<String>>,
+    /// The radio it plays from, if a radio's ([`Self::music_at`]).
+    music_at: Option<(Vec3, f32)>,
     /// The radios near her ([`Radio`]).
     radio: Radio,
     /// The human state each placed person was last told to the scripts
@@ -975,6 +977,7 @@ impl MissionLink {
             sounds: Vec::new(),
             fades: Vec::new(),
             music: None,
+            music_at: None,
             radio: Radio::default(),
             states: HashMap::new(),
             reverb: None,
@@ -1874,9 +1877,10 @@ impl MissionLink {
                 "mission: the faction manager is done with reporter {g:#x} (reported: {done})"
             );
         }
-        // The radios near her play over the score.
+        // The radios near her play over the score, from where they stand.
         if let Some(cue) = self.radio.update(game, mission) {
             self.music = Some(cue);
+            self.music_at = self.radio.playing.as_ref().map(|r| (r.2, r.3));
         }
         // A pursuit brings its army's helicopter with soldiers.
         if self.squads.is_none()
@@ -1966,7 +1970,18 @@ impl MissionLink {
         // scripts hear it, so what is offered by her (her `Talk`) is where
         // she sits, not at the building's origin.
         for (g, at, yaw) in std::mem::take(&mut game.scene.prop_rider_spots) {
-            mission.place(g, at.to_array(), yaw);
+            // Taken out of the seat since the spot was found (a briefing's
+            // `Vehicle.Exit` and `SetTransformToObject`): the scripts' place
+            // stands, or Fiona went back to her desk for the talk.
+            let seated = mission
+                .world()
+                .borrow()
+                .objects
+                .get(&g)
+                .is_some_and(|o| o.vehicle.is_some());
+            if seated {
+                mission.place(g, at.to_array(), yaw);
+            }
         }
         let props = &game.scene.props;
         game.scene.prop_crews = mission
@@ -2116,12 +2131,17 @@ impl MissionLink {
                     None => mission.kill(guid),
                 }
             }
-            // The scripts' objects for the dead lie where their bodies do:
-            // a verify prompt is offered over the object (a job's targets
-            // run from their spawns before they fall; jobs round 3 found
-            // the prompt left at the spawn, out of her reach).
-            for n in game.scene.people.npcs.iter().filter(|n| !n.alive) {
-                if let Some(g) = n.spawn {
+            // The scripts' people are where they stand in play: the dead where
+            // their bodies lie (a verify prompt is offered over the object; a
+            // job's targets run from their spawns before they fall: jobs round
+            // 3 found the prompt left at the spawn), the living where they went
+            // (OilCon001's executive, following her to his drop-off, stayed at
+            // his spawn for the scripts' delivery check: round 24).
+            for n in &game.scene.people.npcs {
+                // (The living by their own object only, not a spawner's place.)
+                if let Some(g) = n.spawn
+                    && (!n.alive || mission.world().borrow().objects.contains_key(&g))
+                {
                     mission.place(g, n.character.position.to_array(), n.facing);
                 }
             }
@@ -2391,6 +2411,7 @@ impl MissionLink {
                         self.radio.score = cue.clone();
                         if self.radio.playing.is_none() {
                             self.music = Some(cue.clone());
+                            self.music_at = None;
                         }
                     }
                     Command::Reverb(preset) => self.reverb = Some(preset.clone()),
@@ -2466,6 +2487,14 @@ impl MissionLink {
                 if c == Command::Notify("Pg.ContractCompleted".into()) {
                     self.completed = Some(0.0);
                     self.contracts += 1;
+                    // The contract's locked pursuits end with it, and so do
+                    // the helicopters they sent (invented: they landed in
+                    // the villa she had just taken).
+                    game.scene.people.clear_scripted_pursuit();
+                    self.reinforcements.call_off();
+                    eprintln!(
+                        "mission: contract done: its pursuits end, their helicopters turn back"
+                    );
                 }
             }
             if let Some(line) = tutorial(mission) {
@@ -2638,6 +2667,12 @@ impl MissionLink {
     /// The music cue to switch to, if the scripts changed it.
     pub fn take_music(&mut self) -> Option<Option<String>> {
         self.music.take()
+    }
+
+    /// Where the music last switched to plays from, and how far it
+    /// carries: a radio's place and reach; `None` for the score.
+    pub fn music_at(&self) -> Option<(Vec3, f32)> {
+        self.music_at
     }
 
     /// The reverb to switch to, if the scripts changed it.

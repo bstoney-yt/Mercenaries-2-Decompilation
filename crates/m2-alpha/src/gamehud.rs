@@ -699,6 +699,10 @@ pub struct HudState {
     /// menu movies' buttons (the front end's, the pause menu's).
     pub pointer: Option<[f32; 2]>,
     pub clicks: Vec<bool>,
+    /// The front end's attract video is over (it ended, or a key or tap
+    /// cut it short): its scripts go back to the `Shell` game state
+    /// ([`ShellNews::attract`]).
+    pub shell_wake: bool,
     /// Her binoculars are up: what their screen shows
     /// ([`crate::binoculars`]).
     pub binoculars: Option<binoculars::View>,
@@ -1105,6 +1109,12 @@ pub struct ShellNews {
     pub news: crate::pause::News,
     /// The press-start screen is behind ([`crate::shell::Native::started`]).
     pub started: bool,
+    /// Its scripts are in the `attract` game state (asked for after a
+    /// minute at the main menu with nothing pressed): their menus are
+    /// hidden while the game plays the attract video
+    /// ([`crate::shell::ATTRACT_MOVIE`]) over everything, then
+    /// [`HudState::shell_wake`] takes them back.
+    pub attract: bool,
 }
 
 /// What a [`GameHud`] thread runs.
@@ -2857,7 +2867,12 @@ impl Thread {
         self.log_flash_shown(&items, &|_| true, &mut log);
         log.extend(screen.borrow_mut().take_log());
         log.extend(self.mission.take_log());
-        let commands = self.mission.take_commands();
+        let mut commands = self.mission.take_commands();
+        if state.shell_wake && crate::shell::in_attract(self.game_state.as_deref()) {
+            commands.push(m2_game::api::Command::GameState(
+                crate::shell::SHELL_STATE.into(),
+            ));
+        }
         log.extend(crate::shell::game_states(
             self.mission.lua(),
             &commands,
@@ -2883,6 +2898,7 @@ impl Thread {
                 new_game,
                 news: self.native.take_news(),
                 started: self.native.started(),
+                attract: crate::shell::in_attract(self.game_state.as_deref()),
             }),
             pause: Box::default(),
         }

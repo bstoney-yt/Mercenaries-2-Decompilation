@@ -421,6 +421,8 @@ struct Voice {
     cursor: f64,
     /// Gains last used, ramped towards each buffer to avoid clicks.
     current: (f32, f32),
+    /// Held where it is, silent ([`Mixer::hold`]).
+    held: bool,
 }
 
 /// Output frames over which a gain change glides.
@@ -450,6 +452,8 @@ pub struct Mixer {
     /// through ([`crate::reverb`]), and its send.
     reverb: Option<crate::reverb::Reverb>,
     send: Vec<f32>,
+    /// The categories whose sounds start held ([`Self::hold`]).
+    holding: [bool; Category::ALL],
 }
 
 impl Mixer {
@@ -468,7 +472,31 @@ impl Mixer {
             max_voices: 64,
             reverb: None,
             send: Vec::new(),
+            holding: [false; Category::ALL],
         }
+    }
+
+    /// Holds the sounds playing in `playing`'s categories where they are,
+    /// silent, and those starting from now on in `starting`'s, until
+    /// [`Self::release`] (a pause menu: the world's sounds wait with the
+    /// world, while the menu's own, and its music, play).
+    pub fn hold(&mut self, playing: &[Category], starting: &[Category]) {
+        for v in &mut self.voices {
+            if playing.contains(&v.play.category) {
+                v.held = true;
+            }
+        }
+        for c in starting {
+            self.holding[c.index()] = true;
+        }
+    }
+
+    /// Plays every held sound on from where it was held.
+    pub fn release(&mut self) {
+        for v in &mut self.voices {
+            v.held = false;
+        }
+        self.holding = [false; Category::ALL];
     }
 
     pub fn rate(&self) -> u32 {
@@ -527,11 +555,13 @@ impl Mixer {
         {
             self.voices.swap_remove(quietest);
         }
+        let held = self.holding[play.category.index()];
         self.voices.push(Voice {
             id,
             play,
             cursor: 0.0,
             current: (0.0, 0.0),
+            held,
         });
         id
     }
@@ -624,6 +654,11 @@ impl Mixer {
         self.send.clear();
         self.send.resize(if reverb { frames } else { 0 }, 0.0);
         for (v, target) in self.voices.iter_mut().zip(gains) {
+            if v.held {
+                // Silent where it is; it comes back in from silence.
+                v.current = (0.0, 0.0);
+                continue;
+            }
             // Sounds placed in the world (not music, dialogue or the
             // interface, which play flat) go to the reverb too.
             let sends = reverb
@@ -1683,6 +1718,33 @@ mod tests {
         assert_eq!(out[2 * 80], out[2 * 80 + 1]);
         assert_eq!(out[2 * 150], 0.0, "finished");
         assert!(!m.is_playing(id));
+    }
+
+    #[test]
+    fn held_sounds_wait_silent_and_play_on_from_where_they_were() {
+        let mut m = Mixer::new(100);
+        m.master = 1.0;
+        let world = m.play(Play::flat(tone(100, 100)));
+        let music = m.play(Play::flat(tone(100, 1000)).category(Category::Music));
+        let ui = m.play(Play::flat(tone(100, 100)).ui());
+        let mut out = vec![0.0; 2 * 50];
+        m.mix(&mut out);
+        m.hold(&[Category::World, Category::Music], &[Category::World]);
+        // Started while held: the world's waits, new music plays.
+        let later = m.play(Play::flat(tone(100, 100)));
+        let piece = m.play(Play::flat(tone(100, 100)).category(Category::Music));
+        for _ in 0..4 {
+            m.mix(&mut out);
+        }
+        // The interface's sound and the new piece played out; the rest wait.
+        assert!(!m.is_playing(ui) && !m.is_playing(piece));
+        assert!(m.is_playing(world) && m.is_playing(music) && m.is_playing(later));
+        assert_eq!(out[2 * 49], 0.0, "held sounds are silent");
+        m.release();
+        m.mix(&mut out);
+        // The world's sound had 50 of its 100 frames left; `later`, all.
+        assert!(!m.is_playing(world) && m.is_playing(later));
+        assert!(out[2 * 49] > 0.0);
     }
 
     #[test]
