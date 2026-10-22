@@ -90,9 +90,6 @@ fn takes_rounds(game: &Game, g: u32) -> bool {
 /// She keeps to the target she is blowing up unless another is this much
 /// nearer, metres (invented).
 const KEEP_TARGET_BY: f32 = 10.0;
-/// A sturdy target is shot at with her rifle this long (seconds) before
-/// a strike is called on it (invented).
-const RIFLE_TRY: f32 = 15.0;
 const MANNED_REACH: f32 = 90.0;
 /// With the grenade launcher, whose rounds reach about 40 m.
 const LOB_RANGE: (f32, f32) = (12.0, 32.0);
@@ -456,9 +453,8 @@ pub struct Autoplay {
     blast_spot: Option<(u32, Vec3)>,
     /// The target last logged as one she has nothing to blow up with.
     no_gun_logged: Option<u32>,
-    /// The sturdy target she last shot at with her rifle, and for how
-    /// long (seconds).
-    rifle_on: Option<(u32, f32)>,
+    /// The target she last shot at with her rifle, for the log.
+    rifle_on: Option<u32>,
     /// With the launcher empty, the C4 she set on what she is blowing up
     /// and when, while she gets clear to set it off.
     planted: Option<f32>,
@@ -739,9 +735,10 @@ impl Autoplay {
             .and_then(|p| p.driving)
             .and_then(|i| game.scene.vehicles.get(i))
             .is_some_and(|v| v.spec.cannon());
+        // (Not a sturdy one first: PmcCon031 round 11 tried her rifle on
+        // each of its 50 columns in turn and brought none down.)
         let rifle = matches!(&self.goal, Some(Goal::Blast { target, .. })
-            if (sturdy(target) && self.rifle_first(game, *target))
-                || (takes_rounds(game, *target) && self.rifle_first(game, u32::MAX)));
+            if takes_rounds(game, *target) && Self::rifle_ready(game));
         let striking = !rifle
             && matches!(&self.goal, Some(Goal::Blast { target, at }) if (sturdy(target) && !cannon) || (spent && !gun(at) && !cannon))
             || matches!(self.goal, Some(Goal::Deliver(_)));
@@ -2095,21 +2092,14 @@ impl Autoplay {
         }
     }
 
-    /// Whether a sturdy target is shot at with her rifle before a strike
-    /// is called on it: on foot, her weapons out, not yet tried for
-    /// [`RIFLE_TRY`] (the ranges' statues, PmcCon032/034, fall to rounds
-    /// in the game; a gate's doesn't, so the try is short).
-    fn rifle_first(&self, game: &Game, target: u32) -> bool {
-        let on_foot = game
-            .scene
+    /// Whether she can fire her rifle: on foot, her weapons out, no gun
+    /// manned.
+    fn rifle_ready(game: &Game) -> bool {
+        game.scene
             .player
             .as_ref()
-            .is_some_and(|p| p.driving.is_none() && !p.weapons_away());
-        on_foot
+            .is_some_and(|p| p.driving.is_none() && !p.weapons_away())
             && game.combat.manned.is_none()
-            && self
-                .rifle_on
-                .is_none_or(|(t, spent)| t != target || spent < RIFLE_TRY)
     }
 
     /// Shooting what stands at `at` with her rifle, from within
@@ -2130,17 +2120,13 @@ impl Autoplay {
         if at.distance(here) > range {
             return self.walk(game, at, range - 5.0, dt);
         }
-        let spent = match self.rifle_on {
-            Some((t, s)) if t == target => s + dt,
-            _ => {
-                eprintln!(
-                    "autoplay {:.1} s: shooting {target:#x} with her rifle before calling a strike",
-                    self.clock
-                );
-                dt
-            }
-        };
-        self.rifle_on = Some((target, spent));
+        if self.rifle_on != Some(target) {
+            eprintln!(
+                "autoplay {:.1} s: shooting {target:#x} with her rifle",
+                self.clock
+            );
+            self.rifle_on = Some(target);
+        }
         let (look, error) = aim(p, at, dt);
         self.steady = if error < ON_TARGET {
             self.steady + dt
