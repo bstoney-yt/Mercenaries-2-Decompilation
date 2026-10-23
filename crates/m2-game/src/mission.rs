@@ -273,6 +273,13 @@ pub struct Entity {
     pub labels: Vec<u32>,
     /// The script the engine runs on it (`ObjectScript`), by module hash.
     pub script: Option<u32>,
+    /// What the engine hands its script along with it (`OnActivate`'s
+    /// third argument): the `ObjectScript` record's second field
+    /// (#f85f27c8), its own or its template's. `Munitions` reads it as
+    /// the item's place in its table: 3 for `Munitions (Bunker Buster)`,
+    /// 21 for `Cash (Large)` (from the data: every munition template's
+    /// value is its item's place in that table).
+    pub script_data: Option<u32>,
     /// The faction a faction zone belongs to (`FactionZone`'s faction
     /// template), as its guid: the name hash of the template's name.
     pub faction: Option<u32>,
@@ -378,6 +385,7 @@ impl GameData {
         let mut templated: Vec<(String, usize, u32)> = Vec::new();
         let mut template_labels: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut template_scripts: HashMap<u32, u32> = HashMap::new();
+        let mut template_script_data: HashMap<u32, u32> = HashMap::new();
         // Faction zones' faction templates, and every template's name.
         let mut zone_factions: Vec<(String, usize, u32)> = Vec::new();
         let mut template_names: HashMap<u32, String> = HashMap::new();
@@ -416,6 +424,7 @@ impl GameData {
                 {
                     template_labels = labels_of(db.component("Label"));
                     template_scripts = db.hashes("ObjectScript");
+                    template_script_data = script_data(&db);
                     template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
                     template_names = db
@@ -436,6 +445,7 @@ impl GameData {
                     let list = data.layers.entry(name.clone()).or_default();
                     let lines = layer.hashes("LineRegion");
                     let scripts = layer.hashes("ObjectScript");
+                    let own_data = script_data(&layer);
                     let zones = layer.hashes("FactionZone");
                     let path_of = layer.hashes("Path");
                     let mut rides = layer
@@ -463,6 +473,7 @@ impl GameData {
                             region: None,
                             labels: own.remove(&guid).unwrap_or_default(),
                             script: scripts.get(&guid).copied(),
+                            script_data: own_data.get(&guid).copied(),
                             faction: None,
                             path: Vec::new(),
                             crew: Vec::new(),
@@ -486,6 +497,9 @@ impl GameData {
             // the faction gates' (`_ocoutpost_wallgate`, `friendlygate`).
             if e.script.is_none() {
                 e.script = template_scripts.get(template).copied();
+            }
+            if e.script_data.is_none() {
+                e.script_data = template_script_data.get(template).copied();
             }
         }
         for (layer, i, template) in zone_factions {
@@ -2462,10 +2476,33 @@ fn seat_crew(
 /// last goes 40 m off. Opening, a soldier of its faction within 25 m
 /// says his `GateYes01` line. The engine tells it of her only after she
 /// honks ([`crate::api::ScriptWorld::honk_heard`]).
-pub const OBJECT_SCRIPTS: [(&str, u32); 2] = [
+///
+/// `Munitions` is the script of the munitions, cash and fuel lying about
+/// (the `Munitions (...)` templates, 0xf71e9491): near one she is
+/// offered its context action (`[ContextAction.TagMunition:...]`), and
+/// taking it stocks the item and posts `MunitionsPickup`, which
+/// JetCon001 counts its three bunker busters by.
+pub const OBJECT_SCRIPTS: [(&str, u32); 3] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
+    ("Munitions", MUNITIONS),
 ];
+
+/// `Munitions`' module hash.
+pub const MUNITIONS: u32 = 0xf71e_9491;
+
+/// The second field of each `ObjectScript` record (#f85f27c8, after the
+/// script's hash), by entity: what the engine hands the script
+/// ([`Entity::script_data`]).
+fn script_data(layer: &Layer) -> HashMap<u32, u32> {
+    layer
+        .component("ObjectScript")
+        .and_then(|c| c.records())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(e, r)| Some((e, u32::from_le_bytes(r.get(4..8)?.try_into().ok()?))))
+        .collect()
+}
 
 /// `friendlygate`'s module hash.
 pub const FRIENDLY_GATE: u32 = 0x6d4f_9301;
@@ -2486,7 +2523,13 @@ fn activate(lua: &mlua::Lua, entities: &[Entity], load: bool) -> Vec<String> {
             .globals()
             .get::<mlua::Table>(*module)
             .and_then(|m| m.get::<mlua::Function>(call))
-            .and_then(|f| f.call::<()>(crate::events::guid_value(e.guid)));
+            .and_then(|f| {
+                f.call::<()>((
+                    crate::events::guid_value(e.guid),
+                    mlua::Value::Nil,
+                    e.script_data,
+                ))
+            });
         if let Err(err) = result {
             failed.push(format!(
                 "{module}.{call} {}: {}",
@@ -2965,6 +3008,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_object_script_is_handed_its_records_data() {
+        let lua = mlua::Lua::new();
+        lua.load("Munitions = { OnActivate = function(g, _, n) got = n end }")
+            .exec()
+            .unwrap();
+        let mut bb = villa_tank();
+        bb.script = Some(MUNITIONS);
+        bb.script_data = Some(3);
+        assert!(activate(&lua, &[bb], true).is_empty());
+        assert_eq!(lua.globals().get::<u32>("got").unwrap(), 3);
+    }
+
     fn villa_tank() -> Entity {
         Entity {
             guid: 0xfaa53,
@@ -2974,6 +3030,7 @@ mod tests {
             region: None,
             labels: Vec::new(),
             script: None,
+            script_data: None,
             faction: None,
             path: Vec::new(),
             crew: vec![
