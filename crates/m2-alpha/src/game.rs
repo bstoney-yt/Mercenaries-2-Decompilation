@@ -2485,6 +2485,11 @@ impl Game {
             satellite_look(&mut view.lighting);
         }
         self.picture.apply(&mut view.lighting);
+        // The effects' lights (a blast's flash, a fire), the nearest first.
+        if let Some(p) = &self.scene.particles {
+            let eye = view.view.inverse().w_axis.truncate();
+            view.lighting.point_lights = p.point_lights(eye);
+        }
         view
     }
 }
