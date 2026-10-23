@@ -275,6 +275,11 @@ pub struct Templates {
     pub names: HashMap<u32, String>,
     /// How the templates that say so handle and fight, by id.
     pub tuning: HashMap<u32, VehicleTuning>,
+    /// The light templates (an explosion's flash, a fire's glow),
+    /// by id ([`crate::lights`]).
+    pub lights: HashMap<u32, crate::lights::LightSpec>,
+    /// What each template sets off with it, and where ([`crate::lights::links`]).
+    pub links: HashMap<u32, Vec<crate::lights::Link>>,
     /// The templates whose props move on their own, by id.
     pub motions: HashMap<u32, PropMotion>,
     /// What templates leave when destroyed, and what pickups give.
@@ -852,6 +857,8 @@ impl Templates {
                 .map(|(id, name)| (id, name.to_owned()))
                 .collect(),
             tuning: crate::tuning::read(&db, damage.as_ref()),
+            lights: crate::lights::read(&db),
+            links: crate::lights::links(&db),
             part_healths: crate::vehicle_damage::read(&db),
             leavings: crate::pickup::read(&db),
             ruined: ruined(&db),

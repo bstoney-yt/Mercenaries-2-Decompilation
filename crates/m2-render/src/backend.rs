@@ -69,6 +69,22 @@ pub struct DrawCall {
     pub uv_offset: [f32; 2],
 }
 
+/// How many [`PointLight`]s a frame draws (the game's shaders take 8).
+pub const POINT_LIGHTS: usize = 8;
+
+/// A light at a point in the world: an explosion's flash, a fire, a lamp.
+/// Lit surfaces take `color` (linear RGB, brightness included) times the
+/// light's reach, 1 within `inner` metres falling to 0 at `outer` (the
+/// game's shaders: `saturate(d * a + b)` per light), times N.L. `outer`
+/// 0 is no light.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PointLight {
+    pub position: Vec3,
+    pub color: Vec3,
+    pub inner: f32,
+    pub outer: f32,
+}
+
 /// Light and atmosphere for a frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lighting {
@@ -110,6 +126,9 @@ pub struct Lighting {
     pub haze: Haze,
     /// Clouds over the sky.
     pub clouds: Clouds,
+    /// Lights placed in the world this frame (an explosion's flash, a
+    /// fire), the nearest first; those with `outer` 0 are none.
+    pub point_lights: [PointLight; POINT_LIGHTS],
     /// The water's colour and opacity by how much of it the eye looks
     /// through (the game's depth colour map): linear RGB and opacity at
     /// none, a third, two thirds and all of [`WATER_RAMP_DEPTH`]. `None`
@@ -321,6 +340,7 @@ impl Default for Lighting {
             saturation: 1.0,
             haze: Haze::default(),
             clouds: Clouds::default(),
+            point_lights: [PointLight::default(); POINT_LIGHTS],
             water_ramp: None,
             adaptation: None,
             tone_map: None,
