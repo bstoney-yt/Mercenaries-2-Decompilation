@@ -261,7 +261,8 @@ impl Placed {
 
     /// Where the emplaced gun stands that is nearest `to` of those within
     /// `seek` metres of `from` and `reach` metres of `to` (flat
-    /// distances): one to man to fire on `to`.
+    /// distances), of those standing where `keep` holds: one to man to fire
+    /// on `to`.
     pub fn emplacement_for(
         &self,
         props: &Props,
@@ -269,22 +270,15 @@ impl Placed {
         to: Vec3,
         seek: f32,
         reach: f32,
+        keep: impl Fn(Vec3) -> bool,
     ) -> Option<Vec3> {
         let flat = |a: Vec3, b: Vec3| (a - b).with_y(0.0).length();
         self.known
             .iter()
             .filter(|(_, k)| k.0 == Kind::Emplaced)
             .filter_map(|(&e, _)| Some(props.get(e)?.0.position))
-            .filter(|&p| flat(p, from) <= seek && flat(p, to) <= reach)
+            .filter(|&p| flat(p, from) <= seek && flat(p, to) <= reach && keep(p))
             .min_by(|a, b| flat(*a, to).total_cmp(&flat(*b, to)))
-    }
-
-    /// Whether the emplaced gun standing at `gun` fires rounds that blow
-    /// up (its weapon's ammunition has a `Blast`: the grenade launcher's,
-    /// the recoilless rifle's; not the heavy MG's).
-    pub fn emplacement_explodes(&self, props: &Props, templates: &Templates, gun: Vec3) -> bool {
-        self.emplacement_near(props, templates, gun)
-            .is_some_and(|m| m.weapon.ammo.blast.is_some())
     }
 
     /// How many emplaced guns are known, and the nearest to `at` that

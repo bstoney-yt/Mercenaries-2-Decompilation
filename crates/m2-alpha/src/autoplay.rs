@@ -70,9 +70,32 @@ const TAP_EVERY: f32 = 0.5;
 /// She fires on a target with her rifle once her crosshair is within this
 /// much of its middle, metres (invented: half a statue's width).
 const SNIPE_WIDTH: f32 = 0.4;
+/// Of spots to see a target from she tries this many, then passes it over
+/// for now (invented). (Going down off PmcCon031's MG platform to the
+/// columns below its rail, she was caught in its yard 180 s, round 31 of
+/// its thread.)
+const PERCH_TRIES: usize = 4;
+/// A target an emplaced gun's round that blows up flies at is left this
+/// long past its flight (seconds) before another at it (invented).
+const LANDS: f32 = 0.5;
+/// Nothing may stand this near an emplaced gun's muzzle (metres) on its
+/// way to a target, for a round that blows up (invented: past its blast).
+const MUZZLE_CLEAR: f32 = 8.0;
+/// From an emplaced gun she holds her aim within this of the target's
+/// middle, metres across (invented: a car's width).
+const MANNED_WIDTH: f32 = 1.0;
+/// An emplaced gun covers a target its turn and tilt bring within this
+/// (a cosine: about 1 degree).
+const COVERS: f32 = 0.9998;
+/// A gun fires this far under a target's top (metres), when it can't tilt
+/// to its middle (invented).
+const TOP_IN: f32 = 0.5;
 /// A target still standing after this long of her rifle (seconds, in
 /// reach) is blown up instead (invented).
 const RIFLE_TRY: f32 = 20.0;
+/// ...or this long, of a kind her rounds have broken before (invented:
+/// PmcCon031's columns break to about a second of them).
+const RIFLE_RETRY: f32 = 5.0;
 /// Targets that rounds break she shoots from within this far (metres;
 /// invented, the ranges' furthest statues from their towers: PmcCon034's
 /// Easy9, 151 m from where she shoots on the HQ's roof).
@@ -113,6 +136,10 @@ const MANNED_REACH: f32 = 90.0;
 /// An emplaced gun this near her (metres) is manned whatever she carries
 /// (invented).
 const GUN_BY: f32 = 8.0;
+/// ...if its rounds blow up and the target is this near it, metres
+/// (invented: PmcCon031's flung cars stand up to 150 m from its recoilless
+/// rifle, and she ran after them on foot, round 26 of its thread).
+const BLAST_GUN_REACH: f32 = 170.0;
 /// With the grenade launcher, whose rounds reach about 40 m.
 const LOB_RANGE: (f32, f32) = (12.0, 32.0);
 /// What only a support strike brings down (the first contract's gates)
@@ -224,6 +251,13 @@ const HEADWAY_MOVE: f32 = 4.0;
 /// A hop along her way goes at least this far, metres; a way ending
 /// nearer than that is passed over for the place itself.
 const HOP_LEAST: f32 = 8.0;
+/// On foot this long (seconds) without coming [`WANDER_NEARER`] metres
+/// nearer where she walks to, as the crow flies, she hops on, however much
+/// she walks meanwhile; a place that moves less than [`WANDER_SAME`] is
+/// the same place (invented).
+const WANDER: f32 = 20.0;
+const WANDER_NEARER: f32 = 3.0;
+const WANDER_SAME: f32 = 5.0;
 /// A hop lands on the ground found from this far above the way's height
 /// there, down to this far below it, metres; else on the highest there.
 const HOP_ABOVE: f32 = 3.0;
@@ -392,6 +426,9 @@ const HOLDS_UP: f32 = 20.0;
 /// PmcCon033 round 5, she stood 0.1 m above the range's targets on the
 /// same floor and left them standing as if on their roof).
 const HOLDS_UP_RISE: f32 = 2.0;
+/// She stands on a building to destroy when her feet are within this of
+/// its box, metres (invented).
+const STANDS_ON: f32 = 1.0;
 /// One following her left this far behind (metres) this long (seconds)
 /// is brought to her: a test driver's shortcut, logged, for ways the
 /// alpha has no means of (a VIP off a roof, which a player lifts off by
@@ -538,6 +575,17 @@ pub struct Autoplay {
     /// [`HEADWAY_MOVE`] from the time before, and when: the hop waits on
     /// this.
     moved: Option<(Vec3, f32)>,
+    /// On foot: where she walks to, the nearest she has been to it (flat),
+    /// and when she came that near ([`WANDER`]).
+    wander: Option<(Vec3, f32, f32)>,
+    /// The target the guns by her were last logged for.
+    gun_logged: Option<u32>,
+    /// Where the emplaced guns stand she fired dry (they are passed over).
+    dry_guns: Vec<Vec3>,
+    /// The rounds left in the emplaced gun she mans, as last seen.
+    manned_rounds: Option<u32>,
+    /// Targets an emplaced gun she manned couldn't turn to.
+    uncovered: std::collections::HashSet<u32>,
     /// When she got to the place she is after, if she has.
     arrived: Option<f32>,
     /// The place she waits at (the scripts' object), and since when:
@@ -561,6 +609,12 @@ pub struct Autoplay {
     rifle_on: Option<(u32, f32)>,
     /// The templates of targets that stood through her rifle that long.
     rifle_failed: std::collections::HashSet<u32>,
+    /// The templates of what she has broken with her rifle, and that of
+    /// what she shoots at now.
+    rifle_broke: std::collections::HashSet<u32>,
+    rifle_kind: Option<u32>,
+    /// The target whose shot she judges by her eye's line, not her aim's.
+    trust_sight: Option<u32>,
     /// Whether her rifle, last aimed, had no clear shot (and nowhere on
     /// her level to see the target from).
     blocked_logged: bool,
@@ -854,6 +908,7 @@ impl Autoplay {
         // down what she would have blown up.
         let spent = game.combat.launcher_rounds.is_some() && game.combat.launcher_empty();
         // Unless an emplaced gun in reach of it does instead (`blast`).
+        let dry = self.dry_guns.clone();
         let gun = |at: &Vec3| {
             game.combat.manned.is_some()
                 || game.scene.player.as_ref().is_some_and(|p| {
@@ -864,6 +919,11 @@ impl Autoplay {
                             *at,
                             MAN_SEEK,
                             MANNED_REACH,
+                            |g| {
+                                !dry.iter().any(|d| {
+                                    d.with_y(0.0).distance(g.with_y(0.0)) < crate::placed::MAN_REACH
+                                })
+                            },
                         )
                         .is_some()
                 })
@@ -885,15 +945,13 @@ impl Autoplay {
                 && Self::rifle_ready(game)
                 // Not with an emplaced gun by her whose rounds blow up and
                 // reach it (`blast`).
-                && !game.scene.player.as_ref().is_some_and(|p| {
-                    game.placed
-                        .emplacement_for(&game.scene.props, p.character.position, *at, GUN_BY, MANNED_REACH)
-                        .is_some_and(|g| {
-                            game.scene.world.as_ref().is_some_and(|w| {
-                                game.placed.emplacement_explodes(&game.scene.props, &w.index.template_db, g)
-                            })
-                        })
-                })
+                && !game
+                    .scene
+                    .player
+                    .as_ref()
+                    .is_some_and(|p| self.gun_by(game, p.character.position, *target, *at).is_some())
+                // Nor manning one (the last car out of its reach).
+                && game.combat.manned.is_none()
                 // Not one that has stood through her rounds a while: blown
                 // up instead (PmcCon031 round 14: its columns stood through
                 // 240 rounds from the MG platform).
@@ -905,8 +963,24 @@ impl Autoplay {
                     .is_some_and(|(p, _)| self.rifle_failed.contains(&p.template))
                 && self
                     .rifle_on
-                    .is_none_or(|(t, spent)| t != *target || spent < RIFLE_TRY));
+                    .is_none_or(|(t, spent)| t != *target || spent < self.rifle_try(game, t)));
+        // One of a kind her rounds have broken before is only passed over
+        // for now: the rest of its kind still fall to them (PmcCon031 round
+        // 28: one column of 50, behind the MG platform's rail, and she put
+        // her rockets into all the rest).
         if let Some((t, spent)) = self.rifle_on
+            && spent >= self.rifle_try(game, t)
+            && let Some((p, _)) = game.scene.props.get(t)
+            && self.rifle_broke.contains(&p.template)
+        {
+            eprintln!(
+                "autoplay {:.1} s: {t:#x} stood through {spent:.0} s of her rifle: passed over \
+                 for {KEEP_PASS:.0} s (her rounds broke others of its kind)",
+                self.clock
+            );
+            self.passed.push((t, self.clock + KEEP_PASS));
+            self.rifle_on = None;
+        } else if let Some((t, spent)) = self.rifle_on
             && spent >= RIFLE_TRY
             && let Some((p, _)) = game.scene.props.get(t)
             && self.rifle_failed.insert(p.template)
@@ -1009,9 +1083,28 @@ impl Autoplay {
             && matches!(&self.goal, Some(Goal::Reach { target, .. }) if marks
                 .iter()
                 .any(|m| m.target == *target && m.kind == "deliverable"));
+        // Its rounds spent: off it, for good (PmcCon031 round 27: she stood
+        // 190 s aimed at a column with the grenade launcher's 50 gone).
+        if let Some(m) = &game.combat.manned
+            && m.rounds == 0
+        {
+            if !self.fired_dry(m.pivot) {
+                eprintln!(
+                    "autoplay {:.1} s: the emplaced gun {:#x} is out of rounds: off it",
+                    self.clock, m.entity
+                );
+                self.dry_guns.push(m.pivot);
+            }
+            return Intent {
+                use_pressed: true,
+                ..Intent::default()
+            };
+        }
         // Manning an emplaced gun, with nothing left for it to fire on:
-        // off it (the use key again), to go on.
-        if game.combat.manned.is_some() && !matches!(self.goal, Some(Goal::Blast { .. })) {
+        // off it (the use key again), to go on. With nothing at all to do
+        // she stays on it: PmcCon031's cars come one at a time, up to 10 s
+        // apart, each to be hit within 9 s (from the scripts).
+        if game.combat.manned.is_some() && !matches!(self.goal, Some(Goal::Blast { .. }) | None) {
             return Intent {
                 use_pressed: true,
                 ..Intent::default()
@@ -1060,6 +1153,59 @@ impl Autoplay {
                 None => self.idle(game, dt),
             },
         }
+    }
+
+    /// The emplaced gun by `here` ([`GUN_BY`]) that breaks `target` (at
+    /// `at`): one whose rounds blow up, or any if rounds break it
+    /// ([`takes_rounds`]); that reaches and turns to it
+    /// ([`BLAST_GUN_REACH`]) and that she hasn't fired dry: where it stands.
+    /// (PmcCon031's heavy MG broke its last three columns in a second, her
+    /// rifle's 240 rounds spent on the rest, round 36 of its thread.)
+    fn gun_by(&self, game: &Game, here: Vec3, target: u32, at: Vec3) -> Option<Vec3> {
+        // Not for one a gun here couldn't turn to: the two heavy MGs on
+        // PmcCon031's platform stand 1.5 m apart, and she walked to one and
+        // manned the other, on and off it 5 times a tick (round 38).
+        if self.uncovered.contains(&target) {
+            return None;
+        }
+        let w = game.scene.world.as_ref()?;
+        let props = &game.scene.props;
+        let rounds = takes_rounds(game, target);
+        game.placed
+            .emplacement_for(props, here, at, GUN_BY, BLAST_GUN_REACH, |g| {
+                !self.fired_dry(g)
+                    && game
+                        .placed
+                        .emplacement_near(props, &w.index.template_db, g)
+                        .is_some_and(|m| {
+                            (rounds || m.weapon.ammo.blast.is_some())
+                                && gun_point(game, &m, target, at).is_some()
+                        })
+            })
+    }
+
+    /// How long (seconds, with a clear shot) she gives her rifle on
+    /// `target` before passing it over: less for a kind it has broken.
+    /// Only near: far off, her rounds take longer (PmcCon034's statues at
+    /// 150 m, passed over after 5 s, round 39 of PmcCon031's thread).
+    fn rifle_try(&self, game: &Game, target: u32) -> f32 {
+        let here = game.focus();
+        match game.scene.props.get(target) {
+            Some((p, _))
+                if self.rifle_broke.contains(&p.template)
+                    && p.position.distance(here) < SHOOT_RANGE =>
+            {
+                RIFLE_RETRY
+            }
+            _ => RIFLE_TRY,
+        }
+    }
+
+    /// Whether the emplaced gun standing at `g` is one she fired dry.
+    fn fired_dry(&self, g: Vec3) -> bool {
+        self.dry_guns
+            .iter()
+            .any(|d| d.with_y(0.0).distance(g.with_y(0.0)) < crate::placed::MAN_REACH)
     }
 
     /// At an action objective's object `target` (`MrxTaskObjectiveAction`:
@@ -1436,11 +1582,18 @@ impl Autoplay {
                 .filter(|n| matches!(n.kind.as_str(), "action" | "deliverable"))
                 .map(|n| n.at)
                 .chain(followers.iter().copied())
-                .chain([here])
                 .any(|at| {
                     at.y > m.at.y + HOLDS_UP_RISE
                         && at.with_y(0.0).distance(m.at.with_y(0.0)) < HOLDS_UP
                 })
+                // Herself only on it, her feet at its box: from PmcCon031's
+                // MG platform, 4 m over its columns, those within 20 m were
+                // passed over, and 12 stood (round 24 of its thread).
+                || game
+                    .scene
+                    .props
+                    .touches(m.target, here - Vec3::Y * STANDS_ON, STANDS_ON)
+                    .unwrap_or(false)
                 || followers.iter().any(|f| {
                     f.with_y(0.0).distance(m.at.with_y(0.0)) < crate::combat::BOMB_FRAG.0 + HOLDS_UP
                 })
@@ -1481,6 +1634,16 @@ impl Autoplay {
             }
             (_, n) => n,
         };
+        // On an emplaced gun with rounds left, what is out of its reach
+        // waits: between PmcCon031's flung cars she went off after a
+        // treasure 204 m away, and the next car came (round 29 of its
+        // thread).
+        if let Some(g) = &game.combat.manned
+            && g.rounds > 0
+            && pick.is_some_and(|m| m.at.distance(g.pivot) > BLAST_GUN_REACH)
+        {
+            return None;
+        }
         if let Some(m) = pick {
             // A vehicle to destroy is blown up, not its crew shot: the
             // crew aboard come into play under its guid (PmcCon003's
@@ -1541,9 +1704,12 @@ impl Autoplay {
             // Not within the scripts' bounds, where she shoots from where
             // she is (PmcCon034 round 9 of its thread: off the HQ's roof
             // for the Phoenix by it, statues 122 m off).
+            // Nor from an emplaced gun that blows it up (031's flung cars).
             if driving.is_none()
                 && self.keep.is_empty()
                 && at.distance(here) > RIDE_FOR
+                && game.combat.manned.is_none()
+                && self.gun_by(game, here, m.target, at).is_none()
                 && let Some(i) = self.ride_near(game, here, &live)
             {
                 return Some((
@@ -2023,6 +2189,35 @@ impl Autoplay {
         if self.headway(game, at, self.left_to_go(here, at)) {
             return Intent::default();
         }
+        // Walking all the while and no nearer it as the crow flies, her
+        // ways replanned round and round (PmcCon031 round 25: 200 s in the
+        // MG range's yard, 95 m from the car range's point): hopped on.
+        let wander = match self.wander {
+            Some((was, best, since)) if was.distance(at) < WANDER_SAME => {
+                if d < best - WANDER_NEARER {
+                    (at, d, self.clock)
+                } else {
+                    (was, best, since)
+                }
+            }
+            _ => (at, d, self.clock),
+        };
+        self.wander = Some(wander);
+        if d >= arrive.max(ARRIVE) * 2.0 && self.clock - wander.2 > WANDER {
+            let to = self
+                .way
+                .as_mut()
+                .map(|w| w.route.steer(here, HOP).0)
+                .filter(|to| (*to - here).with_y(0.0).length() >= HOP_LEAST)
+                .unwrap_or(at);
+            eprintln!(
+                "autoplay {:.1} s: no nearer {at:.0} in {WANDER:.0} s on foot ({d:.0} m off)",
+                self.clock
+            );
+            self.wander = None;
+            self.hop(game, to, WANDER);
+            return Intent::default();
+        }
         if d < arrive || self.arrived.is_some() {
             let since = *self.arrived.get_or_insert(self.clock);
             if d < arrive && at.y - here.y > UNDER_BY && self.clock - since > UNDER_FOR {
@@ -2466,7 +2661,7 @@ impl Autoplay {
         // statue 64 m off, she fell 15 m and the scripts took her weapons).
         let tried_out = self
             .rifle_on
-            .is_some_and(|(t, spent)| t == target && spent >= RIFLE_TRY);
+            .is_some_and(|(t, spent)| t == target && spent >= self.rifle_try(game, t));
         // Nor what her rounds don't wear (the bonus statues: each stood 20 s
         // of them, round 13), with the contract's clock running (90 s for
         // all 19 the first time, its `nTimeLimit`).
@@ -2518,7 +2713,10 @@ impl Autoplay {
             self.perch_tried.clear();
             self.blocked_logged = false;
         }
-        if self.steady > STEADY && self.perch.is_none() {
+        if self.trust_sight.is_some_and(|t| t != target) {
+            self.trust_sight = None;
+        }
+        if self.steady > STEADY && self.perch.is_none() && self.trust_sight != Some(target) {
             let was = self.blocked_logged;
             self.blocked_logged = game.scene.world.as_ref().is_some_and(|w| {
                 Combat::aim_probe(&w.physics, &game.scene.people, p).is_some_and(|(t, who)| {
@@ -2527,10 +2725,14 @@ impl Autoplay {
                 })
             });
             if self.blocked_logged && !was {
+                // A few spots tried, none better: no more of them (PmcCon031
+                // round 27: a new spot each 0.4 s for 10 s on the MG
+                // platform, each in sight of it by a ray and not by her aim).
                 let spot = game
                     .scene
                     .world
                     .as_ref()
+                    .filter(|_| self.perch_tried.len() < PERCH_TRIES)
                     .and_then(|w| perch(&w.physics, at, here, &self.perch_tried, &self.keep));
                 eprintln!(
                     "autoplay {:.1} s: no clear shot at {target:#x} from {here:.1}: {}",
@@ -2544,8 +2746,10 @@ impl Autoplay {
                 if let Some(s) = spot {
                     self.perch = Some((s, self.clock));
                     self.blocked_logged = false;
-                } else if !self.keep.is_empty() {
-                    // Nowhere within bounds to see it from: the others first.
+                } else {
+                    // Nowhere (within bounds) to see it from: the others
+                    // first. (PmcCon031's MG platform: its rail hid one
+                    // column, and she stood at it 20 s, round 25.)
                     self.passed.push((target, self.clock + KEEP_PASS));
                     self.rifle_on = None;
                     return Intent::default();
@@ -2573,20 +2777,45 @@ impl Autoplay {
             if !there {
                 self.perch_tried.push(spot);
             }
+            // In sight from where her aim was blocked, without a step: her
+            // eye's line is taken over her aim's, and she fires (PmcCon031
+            // round 34: 122 spots on the MG platform in 150 s, each in
+            // sight at once; the columns fall to her rounds from there).
+            if seen
+                && self
+                    .perch_tried
+                    .last()
+                    .is_some_and(|t| t.distance(here) < PERCH_ARRIVE)
+            {
+                self.trust_sight = Some(target);
+            }
             self.perch = None;
             self.steady = 0.0;
         }
+        // Only her time with a clear shot counts toward giving it up.
+        let short = self.blocked_logged;
         match &mut self.rifle_on {
-            Some((t, spent)) if *t == target => *spent += dt,
+            Some((t, spent)) if *t == target => {
+                if !short {
+                    *spent += dt;
+                }
+            }
             _ => {
+                // The last she shot at broke: her rounds break its kind.
+                if let Some((t, _)) = self.rifle_on
+                    && let Some(kind) = self.rifle_kind
+                    && (game.scene.props.broke_apart(t) || game.scene.props.get(t).is_none())
+                {
+                    self.rifle_broke.insert(kind);
+                }
+                self.rifle_kind = game.scene.props.get(target).map(|(p, _)| p.template);
                 eprintln!(
                     "autoplay {:.1} s: shooting {target:#x} with her rifle",
                     self.clock
                 );
-                self.rifle_on = Some((target, dt));
+                self.rifle_on = Some((target, 0.0));
             }
         }
-        let short = self.blocked_logged;
         Intent {
             look,
             walk: true,
@@ -2595,6 +2824,9 @@ impl Autoplay {
                 // In short bursts, her spread settling between them (the
                 // weapons' bloom): held down, 240 rounds broke 8 of
                 // PmcCon032's 21 statues and her clips ran dry (round 13).
+                // (So too PmcCon031's columns held down near, or in bursts
+                // twice as often: her 240 went on about 42 of its 50, rounds
+                // 33 and 36 of its thread.)
                 fire: !short && self.steady > STEADY && self.clock.rem_euclid(TAP_EVERY) < TAP_FOR,
                 select: (game.combat.weapon != Weapon::Rifle).then_some(Weapon::Rifle),
                 ..Trigger::default()
@@ -2605,21 +2837,68 @@ impl Autoplay {
 
     /// Firing the emplaced gun she mans on what stands at `at`, once
     /// aimed a moment.
-    fn fire_manned(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
+    fn fire_manned(&mut self, game: &mut Game, target: u32, at: Vec3, dt: f32) -> Intent {
         let Some(p) = game.scene.player.as_ref() else {
             return Intent::default();
         };
-        let (look, error) = aim(p, at, dt);
-        self.steady = if error < ON_TARGET {
-            self.steady + dt
-        } else {
-            0.0
+        // A round that blows up fired on it: the others meanwhile, while
+        // it flies (its flight taken as half again its straight-line time,
+        // invented). Held on one at a time, the grenade launcher's 50 went
+        // on 45 of PmcCon031's columns and 5 stood (round 27 of its
+        // thread); waiting on each, 6 fell in 25 s (round 29).
+        if let Some(m) = &game.combat.manned {
+            if self.manned_rounds.is_some_and(|r| m.rounds < r) && m.weapon.ammo.blast.is_some() {
+                let flight = at.distance(m.pivot) / m.weapon.ammo.velocity.max(1.0) * 1.5;
+                self.passed.push((target, self.clock + flight + LANDS));
+            }
+            self.manned_rounds = Some(m.rounds);
+        }
+        // Not into what stands right by the gun: a round that blows up
+        // there takes the gun with it (PmcCon031 round 32: a palm by its
+        // grenade launcher, and both its launchers went, which ends the
+        // contract). Another target meanwhile.
+        let muzzle_clear = game.combat.manned.as_ref().is_none_or(|m| {
+            m.weapon.ammo.blast.is_none()
+                || game.scene.world.as_ref().is_none_or(|w| {
+                    let dir = launch_dir(m, at);
+                    w.physics
+                        .cast_ray(m.pivot + dir * 0.9, dir, MUZZLE_CLEAR)
+                        .is_none()
+                })
+        });
+        if !muzzle_clear && self.steady > STEADY {
+            eprintln!(
+                "autoplay {:.1} s: something by the gun is in the way of {target:#x}: another \
+                 for {KEEP_PASS:.0} s",
+                self.clock
+            );
+            self.passed.push((target, self.clock + KEEP_PASS));
+            self.steady = 0.0;
+        }
+        // A round flying straight leaves the muzzle along her crosshair's
+        // line, not from her eye: that line is laid from the gun to it
+        // (`Combat::manned_fire`), else it passes by as far off as her eye
+        // is from the gun. (A lobbed one goes for where the crosshair
+        // falls, so at it.)
+        let sight = match &game.combat.manned {
+            Some(m) if m.weapon.flight() != m2_engine::weapons::Flight::Lobbed => {
+                p.eye() + (at - m.pivot)
+            }
+            _ => at,
         };
+        let (look, error) = aim(p, sight, dt);
+        // Far off, held closer on it: 0.03 rad is 4 m at 145 m, a car's
+        // length, and 30 recoilless rounds missed PmcCon031's cars there
+        // (round 32 of its thread).
+        let on = ON_TARGET.min(MANNED_WIDTH / at.distance(p.eye()).max(1.0));
+        self.steady = if error < on { self.steady + dt } else { 0.0 };
         Intent {
             look,
             trigger: Trigger {
                 aim: true,
-                fire: self.steady > STEADY,
+                fire: self.steady > STEADY
+                    && muzzle_clear
+                    && game.combat.manned.as_ref().is_none_or(|m| covers(m, at)),
                 ..Trigger::default()
             },
             ..Intent::default()
@@ -2649,7 +2928,14 @@ impl Autoplay {
         // Out of rockets (round 3's AllCon003: four for four AA guns, two
         // left standing): C4 instead, while she carries any.
         let rockets = game.combat.launcher_rounds.map_or(0, |r| r.total());
-        if !lobbing && rockets == 0 && (game.combat.charges > 0 || self.planted.is_some()) {
+        // Not by an emplaced gun that blows it up (PmcCon031 round 28: C4 on
+        // the flung cars from by the recoilless rifle, her rockets spent).
+        if !lobbing
+            && rockets == 0
+            && (game.combat.charges > 0 || self.planted.is_some())
+            && game.combat.manned.is_none()
+            && self.gun_by(game, here, target, at).is_none()
+        {
             return self.plant(game, at, dt);
         }
         // In the water she can't fire: out where she can climb, first.
@@ -2720,25 +3006,77 @@ impl Autoplay {
         // An emplaced gun right by her that reaches it: manned whatever
         // she carries (PmcCon031 round 17: at its grenade-launcher post she
         // shot 20 s with her rifle, then walked off round the range).
-        // (One whose rounds blow up: the heavy MG's 300 rounds left 031's
-        // columns standing, round 18.)
-        let gun_by = game
-            .placed
-            .emplacement_for(&game.scene.props, here, at, GUN_BY, MANNED_REACH)
-            .is_some_and(|g| {
-                game.scene.world.as_ref().is_some_and(|w| {
-                    game.placed
-                        .emplacement_explodes(&game.scene.props, &w.index.template_db, g)
-                })
-            });
-        if (!lobbing && rockets == 0) || holstered || gun_by || game.combat.manned.is_some() {
-            if game.combat.manned.is_some() {
-                return self.fire_manned(game, at, dt);
+        // (One that breaks it: `gun_by`.)
+        let by = self.gun_by(game, here, target, at);
+        if self.gun_logged != Some(target) {
+            self.gun_logged = Some(target);
+            let (n, nearest) = game.placed.emplaced_nearest(&game.scene.props, here);
+            eprintln!(
+                "autoplay {:.1} s: for {target:#x}, {:.0} m off: a gun by her that blows it up \
+                 {by:.1?}; nearest of {n} {nearest:x?}; manning {}",
+                self.clock,
+                at.distance(here),
+                game.combat.manned.is_some()
+            );
+        }
+        if (!lobbing && rockets == 0) || holstered || by.is_some() || game.combat.manned.is_some() {
+            if let Some(m) = &game.combat.manned {
+                let point = gun_point(game, m, target, at);
+                // One that can't turn to it, with another by her that can:
+                // off this one, for that.
+                if point.is_none()
+                    && by.is_some_and(|g| {
+                        g.with_y(0.0).distance(m.pivot.with_y(0.0)) > crate::placed::MAN_REACH
+                    })
+                {
+                    eprintln!(
+                        "autoplay {:.1} s: the emplaced gun {:#x} doesn't turn to {target:#x}: \
+                         to the one at {:.1}",
+                        self.clock,
+                        m.entity,
+                        by.unwrap_or_default()
+                    );
+                    return Intent {
+                        use_pressed: true,
+                        ..Intent::default()
+                    };
+                }
+                // Nor any gun by her: the others first, from this one; it
+                // again with nothing else left, off the gun, for her own
+                // weapons (PmcCon031 round 37: a column under the heavy MG's
+                // tilt, 210 s aimed at it with 20 more to bring down).
+                if point.is_none() {
+                    if self.uncovered.insert(target) {
+                        eprintln!(
+                            "autoplay {:.1} s: the emplaced gun {:#x} doesn't turn to \
+                             {target:#x}: the others first",
+                            self.clock, m.entity
+                        );
+                        self.passed.push((target, self.clock + PASS_FOR));
+                        return Intent::default();
+                    }
+                    eprintln!(
+                        "autoplay {:.1} s: the emplaced gun {:#x} doesn't turn to {target:#x}: \
+                         off it",
+                        self.clock, m.entity
+                    );
+                    return Intent {
+                        use_pressed: true,
+                        ..Intent::default()
+                    };
+                }
+                return self.fire_manned(game, target, point.unwrap_or(at), dt);
             }
-            if let Some(gun) =
-                game.placed
-                    .emplacement_for(&game.scene.props, here, at, MAN_SEEK, MANNED_REACH)
-            {
+            if let Some(gun) = by.or_else(|| {
+                game.placed.emplacement_for(
+                    &game.scene.props,
+                    here,
+                    at,
+                    MAN_SEEK,
+                    MANNED_REACH,
+                    |g| !self.fired_dry(g),
+                )
+            }) {
                 if gun.with_y(0.0).distance(here.with_y(0.0)) > crate::placed::MAN_REACH * 0.75 {
                     self.arrived = None;
                     return self.walk(game, gun, 0.5, dt);
@@ -4382,6 +4720,50 @@ pub(crate) fn steer_round(physics: &Physics, id: VehicleId, hull: (Vec3, Vec3)) 
     })
 }
 
+/// Whether the emplaced gun `m` turns and tilts far enough to fire at
+/// `at` (its rounds leave clamped to its turn and tilt,
+/// `Combat::manned_fire`).
+fn covers(m: &crate::combat::Manned, at: Vec3) -> bool {
+    let d = launch_dir(m, at);
+    m.clamp(d).dot(d) > COVERS
+}
+
+/// Where on `target` (its middle at `at`) the emplaced gun `m` fires at:
+/// its middle, else just under its top if the gun tilts down only that far
+/// (PmcCon031's two columns under its MG platform, past the heavy MG's
+/// 20 degrees at their middles, round 38 of its thread); `None` if
+/// neither.
+fn gun_point(game: &Game, m: &crate::combat::Manned, target: u32, at: Vec3) -> Option<Vec3> {
+    if covers(m, at) {
+        return Some(at);
+    }
+    let top = game.scene.props.top(target)? - Vec3::Y * TOP_IN;
+    covers(m, top).then_some(top)
+}
+
+/// The way the emplaced gun `m`'s round leaves its muzzle for `at`: a
+/// lobbed one on the lower of its arcs (as `Combat::manned_fire` fires it;
+/// 45 degrees up when out of its reach), else straight at it.
+fn launch_dir(m: &crate::combat::Manned, at: Vec3) -> Vec3 {
+    let d = at - m.pivot;
+    if m.weapon.flight() != m2_engine::weapons::Flight::Lobbed {
+        return d.normalize_or_zero();
+    }
+    let (g, v2) = (
+        m2_engine::physics::GRAVITY,
+        m.weapon.ammo.velocity.max(1.0).powi(2),
+    );
+    let flat = d.with_y(0.0);
+    let x = flat.length().max(0.1);
+    let room = v2 * v2 - g * (g * x * x + 2.0 * d.y * v2);
+    let up = if room < 0.0 {
+        std::f32::consts::FRAC_PI_4
+    } else {
+        ((v2 - room.sqrt()) / (g * x)).atan()
+    };
+    (flat / x * up.cos() + Vec3::Y * up.sin()).normalize_or_zero()
+}
+
 /// An angle wrapped to -π..π.
 fn wrap(a: f32) -> f32 {
     let mut a = a.rem_euclid(std::f32::consts::TAU);
@@ -4922,5 +5304,101 @@ mod tests {
             "{}",
             p.yaw
         );
+    }
+
+    /// An emplaced gun at the origin facing +z, turning +-90 and tilting
+    /// -20..30 degrees (PmcCon031's, from its log), firing rounds at
+    /// `speed` that blow up and fall as `gravity` says.
+    fn gun(speed: f32, gravity: f32) -> crate::combat::Manned {
+        use m2_engine::weapons::{Ammo, Blast, WeaponSpec};
+        let blast = Blast {
+            template: 1,
+            radius: 4.0,
+            damage: 100.0,
+            min_damage: 10.0,
+            max_force: 0.0,
+            key: None,
+        };
+        crate::combat::Manned {
+            entity: 1,
+            template: 2,
+            pivot: Vec3::ZERO,
+            facing: 0.0,
+            yaw: (-90f32.to_radians(), 90f32.to_radians()),
+            pitch: (-20f32.to_radians(), 30f32.to_radians()),
+            weapon: WeaponSpec {
+                template: 3,
+                name: "Mounted Grenade Launcher".into(),
+                model: None,
+                class: None,
+                semi: false,
+                rate_of_fire: 200.0,
+                clip: 50,
+                reserve_clips: 0,
+                pellets: 1,
+                rounds_per_reload: 0,
+                scatter: 0.0,
+                ammo: Ammo {
+                    template: 4,
+                    velocity: speed,
+                    max_velocity: 0.0,
+                    human_boost: 1.0,
+                    gravity,
+                    damage: 0.0,
+                    damage_min: 0.0,
+                    falloff: (0.0, 0.0),
+                    dropoff: 0.0,
+                    hero: 1.0,
+                    key: None,
+                    blast: Some(blast),
+                    timer: None,
+                    timer_blast: None,
+                    homing: None,
+                    model: None,
+                    sticky: false,
+                },
+                lock_on: None,
+                pickup: None,
+                feel: Default::default(),
+                hint: None,
+                ui: None,
+                assist: None,
+                camera: None,
+                scope: None,
+            },
+            rounds: 50,
+        }
+    }
+
+    #[test]
+    fn a_gun_covers_only_what_it_turns_and_tilts_to() {
+        let rocket = gun(100.0, 0.0);
+        // Ahead and level, and 80 degrees round: covered.
+        assert!(covers(&rocket, Vec3::new(0.0, 0.0, 50.0)));
+        assert!(covers(&rocket, Vec3::new(49.0, 0.0, 8.6)));
+        // Behind it: not.
+        assert!(!covers(&rocket, Vec3::new(0.0, 0.0, -50.0)));
+        // A column's middle 12 m off and 4.9 m down is past its 20 degrees
+        // down; one 2 m down is not (PmcCon031's MG platform).
+        assert!(!covers(&rocket, Vec3::new(0.0, -4.9, 12.0)));
+        assert!(covers(&rocket, Vec3::new(0.0, -2.0, 12.0)));
+    }
+
+    #[test]
+    fn a_lobbed_round_leaves_the_muzzle_above_its_target() {
+        // A grenade at 40 m/s for a column 60 m off and 4 m down: up, on
+        // the lower arc, and covered though the column is below the gun.
+        let gl = gun(40.0, 1.0);
+        let at = Vec3::new(0.0, -4.0, 60.0);
+        let d = launch_dir(&gl, at);
+        assert!(d.y > 0.0, "{d}");
+        assert!(d.y < 45f32.to_radians().sin(), "{d}");
+        assert!(covers(&gl, at));
+        // Out of its reach: 45 degrees up.
+        let far = launch_dir(&gl, Vec3::new(0.0, 0.0, 1000.0));
+        assert!((far.y - 45f32.to_radians().sin()).abs() < 1e-4, "{far}");
+        // A rocket goes straight at it.
+        let rocket = gun(100.0, 0.0);
+        assert!((launch_dir(&rocket, at) - at.normalize()).length() < 1e-5);
     }
 }
