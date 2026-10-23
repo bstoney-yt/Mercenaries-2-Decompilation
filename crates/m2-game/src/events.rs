@@ -80,6 +80,13 @@ pub trait World {
     fn unheard_at_gate(&self, _a: u32, _gate: u32) -> bool {
         false
     }
+    /// Whether a physics event of `object` holds: `"gateFullyClosed"`
+    /// while a gate the scripts shut (`Object.CloseGate`) stays shut,
+    /// `"gateStuck"` never (gates shut at once here, so none sticks);
+    /// `None` for one not known (`"VehicleSinking"`).
+    fn physics_event(&self, _object: u32, _name: &str) -> Option<bool> {
+        None
+    }
     /// Whether it got into (or out of) its seat at once, put there by a
     /// script.
     fn seated_instantly(&self, _guid: u32) -> bool {
@@ -150,7 +157,7 @@ pub fn state_matches(pattern: &str, state: &str) -> bool {
     }
 }
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 19] = [
+pub const KINDS: [&str; 20] = [
     "TimerRelative",
     // Every update, in the mission's scripts too: the support manager's
     // recruit cooldowns count with it (`SupportTimer`, which takes
@@ -174,6 +181,7 @@ pub const KINDS: [&str; 19] = [
     "ObjectIsVisible",
     "ObjectDelete",
     "HumanStateTransition",
+    "ObjectPhysicsEvent",
 ];
 
 /// Kinds the game delivers itself through `Event.__m2_fire` (besides
@@ -1147,6 +1155,26 @@ fn check(
         // posts): carrier 0 is any; "any" is taken to hold once it is let
         // go, the change that objective waits for (inferred from its
         // `_OnObjectWinched` use, not checked against the game).
+        // { object, name }: as the engine reports that physics event of the
+        // object (MecCon001 and the mechanic's garage wait for theirs:
+        // `{ garage, "gateFullyClosed" }` after `Object.CloseGate`, and
+        // `"gateStuck"`); passes the object and the name (inferred: no
+        // callback reads either).
+        "ObjectPhysicsEvent" => {
+            let (Some(object), Some(name)) = (guid(&p.params, 1), text(&p.params, 2)) else {
+                return no;
+            };
+            match world.physics_event(object, &name) {
+                Some(holds) => Check::Holds(
+                    holds,
+                    vec![
+                        id(object),
+                        p.params.raw_get::<Value>(2).unwrap_or(Value::Nil),
+                    ],
+                ),
+                None => Check::Unhandled,
+            }
+        }
         "ObjectWinched" => {
             let Some(cargo) = guid(&p.params, 1) else {
                 return no;
