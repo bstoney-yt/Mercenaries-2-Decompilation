@@ -504,6 +504,52 @@ local function close(box)
     end
 end
 __m2_dialog_wrapped[close] = true
+-- The transit map: `MrxTransit.OpenInterface` asks the PDA, a widget of the
+-- HUD's, to `OpenTransitInterface(zones, callback, data)`. Here it is a box
+-- of method `Transit` with the zones offered by number; the answer is the
+-- zone picked (0: shut), and the callback runs as the PDA's
+-- `_InvokeCallback` runs it: callback(zone, picked, unpack(data)).
+local function transit(pda, zones, callback, data)
+    -- One map at a time, as the PDA's own `bActive` has it: OilCon002's
+    -- seat event asks again each time it fires.
+    if __m2_transit_box and __m2_hud_callbacks[__m2_transit_box] then return end
+    local offered, list = {}, {}
+    if type(zones) == "table" then
+        for k, z in pairs(zones) do
+            if type(z) == "table" and type(k) == "number" then
+                offered[k] = { sName = plain(z.sName), nX = plain(z.nX), nY = plain(z.nY),
+                    nSortOrder = plain(z.nSortOrder) }
+                table.insert(list, k)
+            end
+        end
+    end
+    table.sort(list)
+    local function answer(v)
+        local call, n = { v, v ~= 0 }, 2
+        if type(data) == "table" then
+            for i = 1, table.maxn(data) do call[i + 2] = data[i] end
+            n = n + table.maxn(data)
+        end
+        if type(callback) == "function" then callback(unpack(call, 1, n)) end
+    end
+    local box = open("Transit", { tZones = offered, tOffered = list }, answer, {})
+    __m2_hud_callbacks[box.__m2_dialog].transit = list
+    __m2_transit_box = box.__m2_dialog
+end
+-- The PDA as the scripts find it (`MrxGui.GetWidgetByNameAndOwner("PDA",
+-- player)`): the HUD's, in its own Lua state, so a stand-in that opens the
+-- transit map and does nothing else.
+local pda = setmetatable({ OpenTransitInterface = transit },
+    { __index = function() return function() end end })
+local function lookup(original)
+    local f = function(name, ...)
+        local w = original(name, ...)
+        if w == nil and name == "PDA" then return pda end
+        return w
+    end
+    __m2_dialog_wrapped[f] = true
+    return f
+end
 local function wrap(m, name, f)
     local d = rawget(m, name)
     if d ~= nil and not __m2_dialog_wrapped[d] then rawset(m, name, f) end
@@ -520,6 +566,10 @@ function __m2_wrap_dialogs()
         wrap(g, "DisplayDialogBox", display)
         wrap(g, "CloseDialogBox", close)
         wrap(g, "DisplayNumericBox", numeric)
+        local o = rawget(g, "GetWidgetByNameAndOwner")
+        if type(o) == "function" and not __m2_dialog_wrapped[o] then
+            rawset(g, "GetWidgetByNameAndOwner", lookup(o))
+        end
     end
     local nb = rawget(_G, "MrxGuiNumericBox")
     if type(nb) == "table" then
@@ -1329,6 +1379,65 @@ impl MissionLink {
             )
             .eval::<bool>()
             .unwrap_or(false)
+    }
+
+    /// The transit map the scripts have open ([`DIALOG_BOXES`]' `Transit`
+    /// box), if any: its call's number and the zones it offers, each by
+    /// number with where its landing zone is (`MrxTransit`'s
+    /// `_tLandingZones`, its `uLocation1`).
+    pub fn transit_open(&self) -> Option<(u64, Vec<(i64, Vec3)>)> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        let (seq, zones) = m
+            .lua()
+            .load(
+                "for seq, t in pairs(__m2_hud_callbacks or {}) do \
+                   if type(t) == 'table' and type(t.transit) == 'table' then \
+                     local m = rawget(_G, 'MrxTransit') \
+                     local all = type(m) == 'table' and type(m._tLandingZones) == 'table' \
+                       and m._tLandingZones or {} \
+                     local out = {} \
+                     for _, k in ipairs(t.transit) do \
+                       local z, x, y, w = all[k], 0, 0, 0 \
+                       if type(z) == 'table' and z.uLocation1 then \
+                         x, y, w = Object.GetPosition(z.uLocation1) \
+                       end \
+                       table.insert(out, { k, x or 0, y or 0, w or 0 }) \
+                     end \
+                     return seq, out \
+                   end \
+                 end",
+            )
+            .eval::<(Option<u64>, Option<Vec<Vec<f32>>>)>()
+            .ok()?;
+        Some((
+            seq?,
+            zones?
+                .into_iter()
+                .filter_map(|z| {
+                    Some((
+                        *z.first()? as i64,
+                        Vec3::new(*z.get(1)?, *z.get(2)?, *z.get(3)?),
+                    ))
+                })
+                .collect(),
+        ))
+    }
+
+    /// Where the scripts' markers stand: on their targets.
+    pub fn marked_places(&self) -> Vec<Vec3> {
+        let State::Running(m) = &self.state else {
+            return Vec::new();
+        };
+        let w = m.world().borrow();
+        w.hud
+            .markers
+            .values()
+            .filter_map(|m| m.target)
+            .filter_map(|g| w.objects.get(&g))
+            .map(|o| Vec3::from(o.position))
+            .collect()
     }
 
     /// Has the scripts' movies (`01_AOA_J`, `02_AOB_J`) wait for the game:
@@ -2317,7 +2426,14 @@ impl MissionLink {
                         self.lines.push((*id, cue.clone(), at));
                     }
                     Command::Hush(id) => self.hushed.push(*id),
-                    Command::CueSound { at: None, cue } => self.sounds.push((cue.clone(), false)),
+                    Command::CueSound { at: None, cue } => {
+                        // The scripts' countdown ticks each minute (`MrxTimer`'s cue):
+                        // autoplay hurries while it runs.
+                        if cue.starts_with("ui_HUD_Timer_") && cue != "ui_HUD_Timer_End" {
+                            game.countdown_tick = true;
+                        }
+                        self.sounds.push((cue.clone(), false));
+                    }
                     Command::StopSound { at: None, cue } => self.sounds.push((cue.clone(), true)),
                     Command::FadeSound {
                         category,
@@ -4321,6 +4437,9 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
                     game.scene
                         .flights
                         .start(copter, loads, from, Vec3::from(*to));
+                    if goal == m2_game::mission::LAND {
+                        game.scene.flights.land(*guid);
+                    }
                 }
                 None => mission.arrived(*guid, *to),
             }

@@ -81,6 +81,17 @@ const ON_TARGET: f32 = 0.03;
 const TURRET_ON: f32 = 0.05;
 /// Soldiers fighting her within this far are dealt with first, metres.
 const DEFEND: f32 = 30.0;
+/// With a countdown of the scripts' running she fights back only within
+/// this (metres), and hurries this long after its last tick (seconds; the
+/// countdown cues a tick each minute, from the logs). Invented.
+const DEFEND_HURRIED: f32 = 12.0;
+/// Places to deliver to that she leaves until the others are done.
+/// OilCon002's posts: its 15 minutes start at the second, and post C, the
+/// nearest the kidnappers' vans, last beat them in every round (6 of 6);
+/// post B last lost them (round 5 here, 657 s on its leg). Invented: the
+/// order is hers to choose.
+const SAVE_FOR_LAST: &[&str] = &["oilcon002_loc_postC"];
+const HURRY_FOR: f32 = 65.0;
 /// Aimed this long (seconds) with something in the way, she goes where she
 /// can see her target from: on rings this far out (metres), no higher or
 /// lower than she stands by more than this if she can (metres).
@@ -510,6 +521,8 @@ pub struct Autoplay {
     /// Where the scripts' delivery she calls in is to land (a deliverable
     /// place): she faces it to throw the designator.
     deliver_at: std::cell::Cell<Option<Vec3>>,
+    /// Until when she hurries: a countdown of the scripts' ticked lately.
+    hurry_until: f32,
     /// When the vehicles near her boat were last logged.
     near_logged: f32,
     way_logged: f32,
@@ -563,6 +576,9 @@ impl Autoplay {
         dt: f32,
     ) -> Intent {
         self.clock += dt;
+        if std::mem::take(&mut game.countdown_tick) {
+            self.hurry_until = self.clock + HURRY_FOR;
+        }
         self.pressed += dt;
         self.pda_pressed += dt;
         if objectives != self.objectives.as_slice() {
@@ -974,6 +990,10 @@ impl Autoplay {
 
     /// What to do next, and words for the log.
     fn choose(&self, game: &Game, marks: &[Mark]) -> Option<(Goal, String)> {
+        // A countdown of the scripts' running (OilCon002's 15 minutes from
+        // the second post; rounds 16 and 18 lost it to fights and pickups on
+        // the way): only close fights, no detours for crates or pickups.
+        let hurry = self.clock < self.hurry_until;
         let p = game.scene.player.as_ref()?;
         let here = game.focus();
         let npcs = &game.scene.people.npcs;
@@ -1021,7 +1041,7 @@ impl Autoplay {
                         guarded.iter().any(|c| c.distance(at) < CARGO_GUARD),
                     )
                 })
-                .filter(|&(_, d, guard)| d < DEFEND || guard)
+                .filter(|&(_, d, guard)| d < if hurry { DEFEND_HURRIED } else { DEFEND } || guard)
                 .inspect(|&(_, d, _)| {
                     if d >= DEFEND && self.guard_until.get().is_none() {
                         self.guard_until.set(Some(self.clock + GUARD_MOST));
@@ -1035,7 +1055,14 @@ impl Autoplay {
                 format!("fighting back a soldier {d:.0} m off"),
             ));
         }
-        let live: Vec<&Mark> = marks.iter().filter(|m| m.alive).collect();
+        let mut live: Vec<&Mark> = marks.iter().filter(|m| m.alive).collect();
+        // A place saved for last waits while others to deliver to are open.
+        if live
+            .iter()
+            .any(|m| m.kind == "deliverable" && !SAVE_FOR_LAST.contains(&m.name.as_str()))
+        {
+            live.retain(|m| !SAVE_FOR_LAST.contains(&m.name.as_str()));
+        }
         fn nearest(ms: Vec<&Mark>, here: Vec3) -> Option<&Mark> {
             ms.into_iter()
                 .min_by(|a, b| a.at.distance(here).total_cmp(&b.at.distance(here)))
@@ -1093,7 +1120,7 @@ impl Autoplay {
                     let d = at.distance(here);
                     let wanted = live.iter().any(|m| m.target == g)
                         || self.opening.is_some_and(|o| o.0 == g)
-                        || d < OPEN_NEAR;
+                        || (!hurry && d < OPEN_NEAR);
                     wanted.then_some((g, d))
                 })
                 .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -1146,7 +1173,7 @@ impl Autoplay {
                             .water_at(p.at.x, p.at.z)
                             .is_some_and(|s| s - p.at.y > crate::player::SWIM_START)
                     });
-                    (restock || (!game.placed.is_pickup(p.from) && d < reach))
+                    (restock || (!hurry && !game.placed.is_pickup(p.from) && d < reach))
                         && !sunk
                         && !self.left_lying.contains(&p.key())
                         && wanted(templates, &game.combat, p)
@@ -1923,7 +1950,11 @@ impl Autoplay {
         // careful driver goes, so a crash costs less of them.
         // So too in a frail vehicle (OilCon021's Devastator, a 50-health
         // scooter: round 20 ran it into an EXT at 14 m/s and lost it).
-        let frail = game.scene.vehicles[i].most_health() <= FRAIL;
+        // And with someone riding along who doesn't man a gun (OilCon002's
+        // hostage: round 3 ran the 100-health bank truck into a tank at
+        // 20 m/s, 240 damage, and the blast killed him).
+        let frail = game.scene.vehicles[i].most_health() <= FRAIL
+            || game.scene.people.aboard().len() > game.scene.people.gunners();
         let laden = game.scene.props.carrying(i) || frail;
         if laden && speed > if frail { FRAIL_SPEED } else { LADEN_SPEED } {
             throttle = 0.0;

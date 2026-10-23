@@ -191,6 +191,9 @@ struct Flight {
     clock: f32,
     rotor: f32,
     released: bool,
+    /// A landing (the scripts' `HeliLand`), not a delivery: it sets down
+    /// on the drop point and stays there until sent home.
+    lands: bool,
 }
 
 /// A crate let go: falling, then lying where it landed, until broken
@@ -309,6 +312,7 @@ impl Flights {
             clock: 0.0,
             rotor: 0.0,
             released: false,
+            lands: false,
         });
     }
 
@@ -345,6 +349,15 @@ impl Flights {
     /// game flies them all the way.
     pub fn take_home(&mut self) -> Vec<(u32, Vec3)> {
         std::mem::take(&mut self.home)
+    }
+
+    /// The helicopter pilot `pilot` flies lands rather than delivers: it
+    /// sets down on its drop point and waits there until sent home
+    /// (Ewan's Lucky Lady on OilCon002's pad, for her to board).
+    pub fn land(&mut self, pilot: u32) {
+        for f in self.flights.iter_mut().filter(|f| f.pilot == pilot) {
+            f.lands = true;
+        }
     }
 
     /// The pilot of a delivery that has let go is sent `to` (home).
@@ -668,7 +681,11 @@ impl Flights {
                 }
                 Phase::Hovering => {
                     f.velocity = Vec3::ZERO;
-                    let bob = (f.clock * 1.7).sin() * 0.12;
+                    let bob = if f.lands {
+                        0.0
+                    } else {
+                        (f.clock * 1.7).sin() * 0.12
+                    };
                     f.at = Vec3::new(f.to.x, hover + bob, f.to.z);
                     if !f.released && f.clock >= HOVER {
                         f.released = true;
@@ -678,7 +695,7 @@ impl Flights {
                             dropped: Vec::new(),
                         });
                     }
-                    if f.clock >= HOVER + LINGER {
+                    if f.clock >= HOVER + LINGER && (!f.lands || f.home.is_some()) {
                         f.phase = Phase::Leaving;
                         f.clock = 0.0;
                     }
@@ -912,8 +929,12 @@ impl Flights {
     }
 
     /// The height it hovers at over its drop point: its loads' undersides
-    /// [`DROP`] metres over the ground.
+    /// [`DROP`] metres over the ground; one landing sits on it.
     fn hover_height(&self, f: &Flight, vehicles: &[ParkedVehicle]) -> f32 {
+        if f.lands {
+            // Its underside on the ground.
+            return f.to.y - self.hook(f).y;
+        }
         let tallest = f
             .loads
             .iter()
@@ -1020,6 +1041,29 @@ mod tests {
         let copter = flights.places(&[])[0].1;
         assert!(copter.with_y(0.0).distance(to) < 1.0, "over {copter}");
         // Then it flies off and is gone.
+        for _ in 0..(LEAVE_TIME as usize + 5) * 60 {
+            flights.step(dt, &mut physics, &mut [], Vec3::ZERO);
+        }
+        assert!(!flights.flying(2));
+    }
+
+    #[test]
+    fn a_landing_sets_down_on_its_pad_and_stays_until_sent_home() {
+        let mut physics = Physics::new();
+        let mut flights = Flights::default();
+        let to = Vec3::new(0.0, -33.6, 120.0);
+        flights.start(COPTER, Vec::new(), Vec3::new(0.0, 4.0, 0.0), to);
+        flights.land(2);
+        let dt = 1.0 / 60.0;
+        for _ in 0..120 * 60 {
+            flights.step(dt, &mut physics, &mut [], Vec3::ZERO);
+        }
+        // Down on the pad (not 8 m over it, where a delivery lets go),
+        // and still there two minutes on.
+        let copter = flights.places(&[])[0].1;
+        assert!(copter.distance(to) < 0.5, "at {copter}");
+        assert!(flights.flying(2));
+        flights.send_home(2, Vec3::new(500.0, 0.0, 0.0));
         for _ in 0..(LEAVE_TIME as usize + 5) * 60 {
             flights.step(dt, &mut physics, &mut [], Vec3::ZERO);
         }

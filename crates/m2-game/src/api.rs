@@ -2694,6 +2694,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => None,
         };
         let target = id(t.raw_get::<Value>("Target").ok().as_ref());
+        // A landing may name its pad as a Target instead of a Location
+        // (OilCon002's `UPHeliLand`: Ewan's Lucky Lady on
+        // "TransitHeli_Landing"): it lands where the pad is.
+        let location = location.or_else(|| {
+            (goal == crate::mission::LAND)
+                .then(|| target.and_then(|g| w.place_of(g)))
+                .flatten()
+        });
         let haste = num(t.raw_get::<Value>("Haste").ok().as_ref());
         // A new goal replaces the person's last (inferred): an outpost's
         // rusher calls send the same soldiers again every 20 s, and each
@@ -4632,6 +4640,25 @@ mod tests {
         assert!(!ask(), "a new game");
         world.borrow_mut().saved = Some("{}".into());
         assert!(ask(), "a save to load");
+    }
+
+    #[test]
+    fn a_landing_on_a_target_lands_where_the_target_is() {
+        let (host, world) = setup();
+        world
+            .borrow_mut()
+            .insert(60, Object::new("TransitHeli_Landing", [7.0, 8.0, 9.0]));
+        host.lua()
+            .load(
+                r#"Ai.Goal({ AIGuid = Sys.StringToGuid("0x1"), Goal = "HeliLand",
+                    Target = Pg.GetGuidByName("TransitHeli_Landing"), Haste = 0.3 })"#,
+            )
+            .exec()
+            .unwrap();
+        assert!(matches!(
+            world.borrow_mut().take_commands().last(),
+            Some(Command::Goal { location: Some(at), target: Some(60), .. }) if *at == [7.0, 8.0, 9.0]
+        ));
     }
 
     #[test]

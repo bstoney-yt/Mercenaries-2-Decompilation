@@ -3693,6 +3693,8 @@ fn mission_for_screenshot(
         10.0
     };
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
+    // How long the scripts' transit map has been up.
+    let mut transit_up = 0.0f32;
     let mut contract_done: Option<u32> = None;
     // With --contracts N, she plays on through the later contracts: the
     // tick the Nth was done, and how many have been.
@@ -4073,6 +4075,41 @@ fn mission_for_screenshot(
         }
         game.step(intent, tick);
         link.tick(game, tick);
+        // At the scripts' transit map, autoplay picks after a moment the
+        // zone a marker of theirs stands at (where the contract sends her),
+        // else the first offered (invented: how she chooses).
+        if auto.is_some() {
+            match link.transit_open() {
+                Some((seq, zones)) => {
+                    transit_up += tick;
+                    if transit_up > 3.0 {
+                        let marked = link.marked_places();
+                        let near = |at: m2_math::glam::Vec3| {
+                            marked
+                                .iter()
+                                .map(|m| m.distance(at))
+                                .fold(f32::MAX, f32::min)
+                        };
+                        let pick = zones
+                            .iter()
+                            .filter(|z| near(z.1) < 50.0)
+                            .min_by(|a, b| near(a.1).total_cmp(&near(b.1)))
+                            .or(zones.first())
+                            .map_or(0, |z| z.0);
+                        // Out of the helicopter by now (its transit done),
+                        // she shuts the map: 0.
+                        let pick = if game.aboard.is_some() { pick } else { 0 };
+                        eprintln!(
+                            "autoplay: at the transit map, of zones {:?} she picks {pick}",
+                            zones.iter().map(|z| z.0).collect::<Vec<_>>()
+                        );
+                        link.hud_choice(seq, pick);
+                        transit_up = 0.0;
+                    }
+                }
+                None => transit_up = 0.0,
+            }
+        }
         game.dress(backend);
         // `--context exit,enter,talk`: each in turn, once the last is done.
         if let Some(want) = options

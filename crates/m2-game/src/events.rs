@@ -234,6 +234,9 @@ struct Store {
     pending: Vec<Pending>,
     /// `Event.Post` calls not yet delivered: name and data.
     posted: Vec<(String, Value)>,
+    /// Events deleted since the last check began: what fired with them
+    /// in that check doesn't run ([`fire`]).
+    deleted: BTreeSet<u32>,
     /// With `M2_STUB_ARGS`: events made and deleted, for diagnostics.
     trace: Vec<String>,
     /// Game time, seconds.
@@ -356,6 +359,7 @@ impl Events {
                             gone.as_deref().unwrap_or("none")
                         ));
                     }
+                    s.deleted.insert(id);
                     s.pending.retain(|p| p.id != id);
                 }
                 Ok(MultiValue::new())
@@ -531,7 +535,7 @@ impl Events {
     pub fn update(&self, dt: f64, world: &dyn World) -> Vec<EventError> {
         let (accepted, mut errors) = self.filter_posts();
         let fired = self.due(dt, world, &accepted);
-        errors.extend(fire(fired));
+        errors.extend(fire(&self.store, fired));
         errors
     }
 
@@ -541,7 +545,7 @@ impl Events {
     pub fn update_shared<W: World>(&self, dt: f64, world: &RefCell<W>) -> Vec<EventError> {
         let (accepted, mut errors) = self.filter_posts();
         let fired = self.due(dt, &*world.borrow(), &accepted);
-        errors.extend(fire(fired));
+        errors.extend(fire(&self.store, fired));
         errors
     }
 
@@ -591,6 +595,7 @@ impl Events {
             s.now += dt;
             let now = s.now;
             let posted = std::mem::take(&mut s.posted);
+            s.deleted.clear();
             let mut fired = Vec::new();
             let mut keep = Vec::with_capacity(s.pending.len());
             for mut p in std::mem::take(&mut s.pending) {
@@ -716,7 +721,13 @@ impl Events {
                             };
                             let mut extra = vec![Value::String(text)];
                             extra.extend(value.map(Value::Number));
-                            fired.push((p.kind.clone(), p.callback.clone(), p.data.clone(), extra));
+                            fired.push((
+                                p.id,
+                                p.kind.clone(),
+                                p.callback.clone(),
+                                p.data.clone(),
+                                extra,
+                            ));
                         }
                         if !m.done {
                             keep.push(p);
@@ -727,7 +738,13 @@ impl Events {
                 match extra {
                     Some(extras) => {
                         for extra in extras {
-                            fired.push((p.kind.clone(), p.callback.clone(), p.data.clone(), extra));
+                            fired.push((
+                                p.id,
+                                p.kind.clone(),
+                                p.callback.clone(),
+                                p.data.clone(),
+                                extra,
+                            ));
                         }
                         if p.persistent {
                             p.last = now;
@@ -738,18 +755,47 @@ impl Events {
                 }
             }
             s.pending = keep;
+            // Proximities that hold at once go newest first: OilCon002's
+            // transit teleports her, and its arrival check (made as the
+            // trip began) is to end the trip before the older one that
+            // cancels it once she is 20 m from the helicopter (its
+            // `fOnComplete` deletes that one). Inferred from the scripts;
+            // the engine's own order is not read.
+            let slots: Vec<usize> = (0..fired.len())
+                .filter(|&i| fired[i].1 == "ObjectProximity")
+                .collect();
+            let mut near: Vec<Fired> = slots
+                .iter()
+                .map(|&i| {
+                    std::mem::replace(
+                        &mut fired[i],
+                        (0, String::new(), Value::Nil, None, Vec::new()),
+                    )
+                })
+                .collect();
+            near.sort_by_key(|f| std::cmp::Reverse(f.0));
+            for (slot, f) in slots.into_iter().zip(near) {
+                fired[slot] = f;
+            }
             fired
         }
     }
 }
 
-/// An event that fired: kind, callback, its data, and the values to pass
-/// after the data.
-type Fired = (String, Value, Option<Table>, Vec<Value>);
+/// An event that fired: its id, kind, callback, its data, and the values to
+/// pass after the data.
+type Fired = (u32, String, Value, Option<Table>, Vec<Value>);
 
-fn fire(fired: Vec<Fired>) -> Vec<EventError> {
+/// Runs the callbacks of the events that fired, in turn: one deleted by
+/// an earlier callback of the same pass doesn't run (OilCon002's transit:
+/// the trip cancelled at the teleport, its arrival check then ran on the
+/// cleaned-up objective).
+fn fire(store: &RefCell<Store>, fired: Vec<Fired>) -> Vec<EventError> {
     let mut errors = Vec::new();
-    for (kind, callback, data, extra) in fired {
+    for (id, kind, callback, data, extra) in fired {
+        if store.borrow().deleted.contains(&id) {
+            continue;
+        }
         let Value::Function(f) = callback else {
             continue;
         };
@@ -1818,6 +1864,35 @@ mod tests {
         world.positions.insert(5, [30.0, 0.0, 0.0]);
         events.update(0.1, &world);
         assert_eq!(log(&host), ["tank 4"]);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn the_newer_of_two_proximities_at_once_goes_first_and_can_delete_the_older() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                r#"
+                -- OilCon002's trip: cancelled 20 m from the helicopter (2),
+                -- done at the landing zone (3), made after.
+                away = Event.Create(Event.ObjectProximity, { "hero", 2, ">", 20, false, true },
+                    function() table.insert(log, "cancelled") end)
+                Event.Create(Event.ObjectProximity, { "hero", 3, "<", 10, false, true },
+                    function() table.insert(log, "arrived"); Event.Delete(away) end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        world.positions.insert(1, [0.0, 0.0, 0.0]);
+        world.positions.insert(2, [5.0, 0.0, 0.0]);
+        world.positions.insert(3, [2000.0, 0.0, 0.0]);
+        events.update(0.1, &world);
+        assert!(log(&host).is_empty());
+        // Teleported to the landing zone: both hold at once.
+        world.positions.insert(1, [2000.0, 0.0, 0.0]);
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["arrived"]);
         assert!(events.is_empty());
     }
 
