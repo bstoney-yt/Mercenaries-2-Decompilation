@@ -82,6 +82,7 @@ mod props;
 mod puppet;
 mod raw;
 mod reinforce;
+mod ridehijack;
 mod roads;
 mod route;
 mod save;
@@ -3765,6 +3766,9 @@ fn mission_for_screenshot(
     let mut hijack_input = Input::default();
     let mut hijack_pad = hijack::Autopad::default();
     let (mut hijack_tries, mut hijack_use, mut hijack_t) = (0, None, 0.0);
+    // The scripts' own hijacks ([`ridehijack`]), answered as --hijack's.
+    let (mut ride_input, mut ride_pad, mut ride_t) =
+        (Input::default(), hijack::Autopad::default(), 0.0f32);
     let (mut hijack_running, mut hijack_shots) = (0.0f32, 0u32);
     let mut action_since: Option<u32> = None;
     let mut placed_tried = std::collections::HashSet::new();
@@ -4197,6 +4201,16 @@ fn mission_for_screenshot(
             {
                 break;
             }
+        }
+        // A hijack the scripts play on a vehicle of theirs (PmcCon004's
+        // Mi35): with --autoplay its prompts are answered at once.
+        if auto.is_some()
+            && let Some(prompts) = link.hijack_prompts()
+        {
+            ride_t += tick;
+            ride_pad.answer(&prompts, &mut ride_input, ride_t);
+            let (pressed, held) = hijack::pad_buttons(&mut ride_input);
+            link.hijack_pad(&pressed, &held);
         }
         if let Some(h) = &mut hijacks {
             if hijack_use == Some(i) {
@@ -8159,6 +8173,13 @@ impl Running {
             spans::time("hijacks", || {
                 h.tick(&mut self.game, &mut self.input, TICK.as_secs_f32())
             });
+        }
+        // The pad, for a hijack the scripts play on a vehicle of theirs.
+        if let Some(m) = &mut self.mission
+            && m.hijack_prompts().is_some()
+        {
+            let (pressed, held) = hijack::pad_buttons(&mut self.input);
+            m.hijack_pad(&pressed, &held);
         }
         // The grappling hook: on once the scripts allow it (or with
         // `--grapple`); the use key fires it at the helicopter in her

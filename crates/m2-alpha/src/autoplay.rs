@@ -9,6 +9,7 @@
 //! the later objectives, and the hops show where the way is blocked.
 
 use m2_engine::physics::{FLOAT_DEPTH, StaticKey};
+use m2_engine::road_graph::RoadGraph;
 use m2_engine::{Physics, Templates, VehicleControls, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 
@@ -173,6 +174,12 @@ const HURRY_FOR: f32 = 65.0;
 /// lower than she stands by more than this if she can (metres).
 const BLOCKED: f32 = 4.0;
 const VANTAGE_RINGS: [f32; 5] = [6.0, 10.0, 15.0, 20.0, 26.0];
+/// A soldier she fought back with no clear shot and nowhere better to see
+/// them from is left be this long, seconds, as are those within this of
+/// where they stood, metres (round 3 here: 600 s aiming at one 21 m down a
+/// cliff from her). Invented.
+const LEAVE_UNSEEN: f32 = 60.0;
+const UNSEEN_NEAR: f32 = 3.0;
 /// Blowing something up, in range this long (seconds) without a shot
 /// (something in the way, or her aim never settling), she goes where she
 /// can fire from: on rings this far out (metres), inside the rockets' and
@@ -370,6 +377,16 @@ const REPLAN: f32 = 20.0;
 const STANDING_FRESH: f32 = 150.0;
 const REPLAN_SOONEST: f32 = 2.0;
 const REPLAN_MOVED: f32 = 5.0;
+/// A place farther than this, flat, is gone to by road, metres: she heads
+/// for a road point on the way ([`m2_engine::road_graph`]) this far ahead
+/// of her, getting on and off within the reach; the way is found again
+/// once the place moves or she strays this far (metres). PmcCon004's base
+/// is 4.6 km from the contract's start, over hills the ground's way never
+/// crossed (its ground way ended 1.7-2.2 km short). Invented numbers.
+const ROAD_FROM: f32 = 800.0;
+const ROAD_REACH: f32 = 400.0;
+const ROAD_AHEAD: f32 = 120.0;
+const ROAD_REPLAN: f32 = 250.0;
 const STRAYED: f32 = 15.0;
 const LOOK_AHEAD: f32 = 5.0;
 const LOOK_TIME: f32 = 0.6;
@@ -616,6 +633,10 @@ pub struct Autoplay {
     /// spot), and the spots that turned out no better.
     vantage: Option<(usize, Vec3)>,
     tried: Vec<Vec3>,
+    /// Soldiers she had no clear shot at and nowhere better to see from:
+    /// where they stood, and until when she leaves them be
+    /// ([`LEAVE_UNSEEN`]).
+    unseen: Vec<(Vec3, f32)>,
     /// Where she goes to fire at what she is blowing up (its object, the
     /// spot); the spots no better go in `tried` too.
     blast_spot: Option<(u32, Vec3)>,
@@ -692,6 +713,11 @@ pub struct Autoplay {
     /// When the vehicles near her boat were last logged.
     near_logged: f32,
     way_logged: f32,
+    /// The island's roads as one graph, made the first time a place is
+    /// far ([`Autoplay::by_road`]).
+    roads: Option<RoadGraph>,
+    /// The way by road to a far place: the place, and the road points.
+    road_way: Option<(Vec3, Vec<Vec3>)>,
     /// Hops: from, to.
     pub hops: Vec<(Vec3, Vec3)>,
     /// The objectives last logged.
@@ -1382,6 +1408,11 @@ impl Autoplay {
                 .iter()
                 .enumerate()
                 .filter(|(_, n)| n.alive && n.soldier && n.alert)
+                .filter(|(_, n)| {
+                    !self.unseen.iter().any(|&(at, until)| {
+                        until > self.clock && at.distance(n.character.position) < UNSEEN_NEAR
+                    })
+                })
                 .map(|(i, n)| {
                     let at = n.character.position;
                     (
@@ -2615,6 +2646,12 @@ impl Autoplay {
                         vantage(&w.physics, target, here, &self.tried, &VANTAGE_RINGS, 1.0)
                     })
                     .map(|s| (i, s));
+                // Fighting back one she can't see from anywhere near, she
+                // leaves them be a while and goes on.
+                if self.vantage.is_none() && self.what.starts_with("fighting back") {
+                    self.unseen.retain(|&(_, until)| until > self.clock);
+                    self.unseen.push((target, self.clock + LEAVE_UNSEEN));
+                }
                 eprintln!(
                     "autoplay {:.1} s: no clear shot at {} from {here:.1}: {}",
                     self.clock,
@@ -3686,6 +3723,58 @@ impl Autoplay {
         self.walk(game, door, 1.0, dt)
     }
 
+    /// Where to head for on her way by road to `at` from `pos`, once it is
+    /// farther than [`ROAD_FROM`]: a road point [`ROAD_AHEAD`] on along
+    /// the way, else `at` itself (no way by road, or near its end).
+    fn by_road(&mut self, game: &Game, pos: Vec3, at: Vec3) -> Vec3 {
+        let flat = |a: Vec3, b: Vec3| (a - b).with_y(0.0).length();
+        if flat(pos, at) < ROAD_FROM {
+            self.road_way = None;
+            return at;
+        }
+        let Some(world) = game.scene.world.as_ref() else {
+            return at;
+        };
+        let roads = self
+            .roads
+            .get_or_insert_with(|| RoadGraph::new(&world.index.roads));
+        let strayed = |way: &[Vec3]| way.iter().all(|&p| flat(p, pos) > ROAD_REPLAN);
+        let stale = self
+            .road_way
+            .as_ref()
+            .is_none_or(|(goal, way)| flat(*goal, at) > ROAD_REPLAN || strayed(way));
+        if stale {
+            let way = roads.way(pos, at, ROAD_REACH).unwrap_or_default();
+            let length: f32 = way.windows(2).map(|w| w[0].distance(w[1])).sum();
+            eprintln!(
+                "autoplay {:.1} s: by road to {} ({:.0} m off): {}",
+                self.clock,
+                self.what,
+                flat(pos, at),
+                if way.is_empty() {
+                    "no way".to_owned()
+                } else {
+                    format!("{} points, {length:.0} m", way.len())
+                }
+            );
+            self.road_way = Some((at, way));
+        }
+        let Some((_, way)) = &self.road_way else {
+            return at;
+        };
+        // From the road point nearest her, the first one far enough on.
+        let Some(here) =
+            (0..way.len()).min_by(|&a, &b| flat(way[a], pos).total_cmp(&flat(way[b], pos)))
+        else {
+            return at;
+        };
+        way[here..]
+            .iter()
+            .copied()
+            .find(|&p| flat(p, pos) >= ROAD_AHEAD)
+            .unwrap_or(at)
+    }
+
     /// Where to head for on her way to `at` from `pos` (driving vehicle
     /// `driving`, or on foot), going `speed` (m/s): along the way planned
     /// to it ([`Route`]), planned again as said at [`PLAN_FROM`]; straight
@@ -3716,6 +3805,12 @@ impl Autoplay {
             (at + back * SHORT_OF_SHORE).with_y(sea)
         } else {
             at
+        };
+        // Far, by road.
+        let at = if boat {
+            at
+        } else {
+            self.by_road(game, pos, at)
         };
         let straight = (at - pos).with_y(0.0).length();
         if straight < PLAN_FROM {
