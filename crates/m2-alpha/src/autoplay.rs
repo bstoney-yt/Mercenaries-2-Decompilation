@@ -353,6 +353,12 @@ const HOLDS_UP: f32 = 20.0;
 /// helicopter).
 const LEFT_BEHIND: f32 = 30.0;
 const LEFT_FOR: f32 = 20.0;
+/// And so is one this far off once she has waited at a place this long
+/// (metres, seconds): OilCon002's hostage, wanted within 15 m of the
+/// rescue site, stood 25 m back past a wall she hopped (round 8 here,
+/// 2300 s). Invented.
+const LEFT_AT_PLACE: f32 = 8.0;
+const WAITED_FOR: f32 = 10.0;
 const UNDER_FOR: f32 = 6.0;
 /// An outpost to capture (`HUD_objective_outpost` on its capture point):
 /// she goes within this far (metres) and calls in the soldier delivery
@@ -613,8 +619,13 @@ impl Autoplay {
         // Those following her who fall behind (on foot, or while she
         // drives): brought to her after a while (a test shortcut).
         let here = game.focus();
+        let waited = self
+            .waiting
+            .is_some_and(|(_, since)| self.clock - since > WAITED_FOR);
         let behind = game.scene.people.followers().iter().any(|f| {
-            f.with_y(0.0).distance(here.with_y(0.0)) > LEFT_BEHIND
+            let d = f.with_y(0.0).distance(here.with_y(0.0));
+            d > LEFT_BEHIND
+                || (waited && d > LEFT_AT_PLACE)
                 || (f.y - here.y).abs() > UNDER_BY * 3.0
         });
         self.left_behind = if behind { self.left_behind + dt } else { 0.0 };
