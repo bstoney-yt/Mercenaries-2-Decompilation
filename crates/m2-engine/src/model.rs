@@ -684,6 +684,10 @@ pub struct CpuModel {
     pub parts: Option<std::sync::Arc<ModelParts>>,
     /// The looks a person model's mixer can give it ([`Looks`]).
     pub looks: Option<std::sync::Arc<Looks>>,
+    /// A vehicle's lamp glow quads' nodes, by lamp ([`lamp_nodes`]):
+    /// hidden as the model's states start them, shown while the lamp is
+    /// lit ([`GpuModel::lamps`]).
+    pub lamp_nodes: [Vec<u16>; 3],
 }
 
 /// A person model's mixer with its node tree: the looks it can give (one
@@ -1007,6 +1011,7 @@ impl CpuModel {
             breakup: None,
             parts,
             looks,
+            lamp_nodes: lamp_nodes(&model.nodes),
         }
     }
 
@@ -1110,10 +1115,6 @@ struct Piece {
     /// model's coarser levels of detail aren't uploaded, so a cut-out LOD
     /// material isn't drawn with them.
     track: Vec<[f32; 2]>,
-    /// Per range, a brake lamp's material unlit (its glow off), drawn in
-    /// place of its own while the vehicle isn't braking
-    /// ([`GpuModel::braking`]); `None` for everything else.
-    unlit: Vec<Option<MaterialId>>,
     centre: Vec3,
     bones: Vec<u16>,
     node: Option<u16>,
@@ -1155,20 +1156,38 @@ pub struct GpuModel {
     /// The looks a person model can take ([`CpuModel::looks`]); each
     /// person's is drawn by [`draw_posed_as`](Self::draw_posed_as).
     pub looks: Option<std::sync::Arc<Looks>>,
-    /// A vehicle's brake lamps ([`m2_assets::vehicle::BRAKE_LAMP`]) glow
-    /// while it brakes and are dark otherwise; `None` draws them as the
-    /// data has them, glowing.
-    pub braking: Option<bool>,
+    /// A vehicle's lamps lit: its brake, reversing and head lamps' glow
+    /// quads ([`CpuModel::lamp_nodes`]) are shown while lit and hidden
+    /// otherwise, as the model's own states start them.
+    pub lamps: Lamps,
+    /// The nodes those lamps hang on ([`CpuModel::lamp_nodes`]).
+    lamp_nodes: [Vec<u16>; 3],
 }
 
-/// A brake lamp's material ([`m2_assets::vehicle::BRAKE_LAMP`]) with its
-/// glow off: its emissive colour (constants 9 to 11) zero, so it draws
-/// as its texture alone. `None` for any other material.
-fn unlit_lamp(m: &Material) -> Option<Material> {
-    (m.name_hash == m2_assets::vehicle::BRAKE_LAMP).then(|| {
-        let mut off = m.clone();
-        off.constants[9..12].fill(0.0);
-        off
+/// Which of a vehicle's lamps are lit ([`GpuModel::lamps`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Lamps {
+    pub brake: bool,
+    pub reverse: bool,
+    pub head: bool,
+}
+
+impl Lamps {
+    fn on(self) -> [bool; 3] {
+        [self.brake, self.reverse, self.head]
+    }
+}
+
+/// The nodes of `nodes` that carry a vehicle's lamp glow quads, by lamp
+/// ([`m2_assets::vehicle::LAMP_NODES`]).
+pub fn lamp_nodes(nodes: &[m2_assets::model::Node]) -> [Vec<u16>; 3] {
+    m2_assets::vehicle::LAMP_NODES.map(|names| {
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| names.contains(&n.name_hash))
+            .map(|(i, _)| i as u16)
+            .collect()
     })
 }
 
@@ -1277,15 +1296,8 @@ impl GpuModel {
         cpu: &CpuModel,
     ) -> Result<Self, BackendError> {
         let mut ids = Vec::with_capacity(cpu.materials.len());
-        // Each brake lamp also unlit: its emissive colour (constants 9 to
-        // 11) off.
-        let mut unlit = Vec::with_capacity(cpu.materials.len());
         for m in &cpu.materials {
             ids.push(materials.material(backend, m)?);
-            unlit.push(match unlit_lamp(m) {
-                Some(off) => Some(materials.material(backend, &off)?),
-                None => None,
-            });
         }
         // Which model draws a tinted material, as its textures may never
         // all load to log it by.
@@ -1351,11 +1363,6 @@ impl GpuModel {
                         }
                     })
                     .collect(),
-                unlit: p
-                    .ranges
-                    .iter()
-                    .map(|&(_, _, m)| unlit.get(m).copied().flatten())
-                    .collect(),
                 // Kept in geometry space, so any transform places it.
                 centre: p.local.inverse().transform_point3(p.centre),
                 bones: p.bones.clone(),
@@ -1378,7 +1385,8 @@ impl GpuModel {
             parts_hidden: None,
             forced: Vec::new(),
             looks: cpu.looks.clone(),
-            braking: None,
+            lamps: Lamps::default(),
+            lamp_nodes: cpu.lamp_nodes.clone(),
         })
     }
 
@@ -1569,6 +1577,8 @@ impl GpuModel {
         look: Option<&[bool]>,
     ) -> Result<(), BackendError> {
         let mut palette = Vec::new();
+        let lit = self.lamp_look(look);
+        let look = lit.as_deref().or(look);
         for piece in self.shown_as(self.wrecked, look) {
             let handle = if piece.bones.is_empty() {
                 if let Some(&m) = piece.node.and_then(|n| nodes.get(usize::from(n))) {
@@ -1594,6 +1604,31 @@ impl GpuModel {
     /// The pieces drawn as the model stands, intact or wrecked.
     fn shown(&self, wrecked: bool) -> impl Iterator<Item = &Piece> {
         self.shown_as(wrecked, None)
+    }
+
+    /// The look to draw in with the lit lamps' nodes shown
+    /// ([`Self::lamps`]): the given one, else the parts' or the intact
+    /// one, with those nodes unhidden. `None` when no lamp is lit (or the
+    /// model is wrecked), leaving the look as it was.
+    fn lamp_look(&self, look: Option<&[bool]>) -> Option<Vec<bool>> {
+        let on = self.lamps.on();
+        if self.wrecked || !on.iter().any(|&l| l) {
+            return None;
+        }
+        let base = look
+            .or(self.parts_hidden.as_deref())
+            .unwrap_or(&self.hidden[0]);
+        let mut mask = base.to_vec();
+        for (lit, nodes) in on.iter().zip(&self.lamp_nodes) {
+            if *lit {
+                for &n in nodes {
+                    if let Some(h) = mask.get_mut(usize::from(n)) {
+                        *h = false;
+                    }
+                }
+            }
+        }
+        Some(mask)
     }
 
     /// As [`shown`](Self::shown), in look `look` (per node, hidden) when
@@ -1645,10 +1680,6 @@ impl GpuModel {
             if !keep(k) {
                 continue;
             }
-            let material = match piece.unlit.get(k) {
-                Some(&Some(off)) if self.braking == Some(false) => off,
-                _ => material,
-            };
             queue.push(Primitive {
                 call: DrawCall {
                     material,
@@ -1732,6 +1763,41 @@ mod tests {
             technique: 0,
             surface: 0,
         }
+    }
+
+    /// The 68 Valiant's lamp nodes (57, 58, 62, 63, 71, 72 of 75) by
+    /// their hashes, sorted into brake, reversing and head lamps.
+    #[test]
+    fn lamp_nodes_are_found_by_their_hashes() {
+        let mut nodes: Vec<m2_assets::model::Node> = (0..75)
+            .map(|i| m2_assets::model::Node {
+                name_hash: i,
+                ..Default::default()
+            })
+            .collect();
+        for (i, h) in [
+            (57, 0xfa92_ee23),
+            (58, 0x4119_f5a8),
+            (62, 0xd871_b369),
+            (63, 0x98b7_6a82),
+            (71, 0x8bc2_1f85),
+            (72, 0xfe1f_4ea3),
+        ] {
+            nodes[i].name_hash = h;
+        }
+        assert_eq!(
+            lamp_nodes(&nodes),
+            [vec![58, 63], vec![57, 62], vec![71, 72]]
+        );
+        assert_eq!(
+            Lamps {
+                brake: true,
+                reverse: false,
+                head: true
+            }
+            .on(),
+            [true, false, true]
+        );
     }
 
     #[test]
@@ -1826,9 +1892,8 @@ mod tests {
         let glow = backend.material(m).emissive.unwrap();
         assert_eq!(glow.color, [4.0, 4.0, 2.5]);
         assert!(glow.map.is_some());
-        assert_eq!(unlit_lamp(&lamp), None);
-        // A brake lamp glows red as the data has it; unlit, not at all
-        // but drawn with its texture as before.
+        // A brake lamp glows red as the data has it (its node is shown
+        // only while braking: `lamp_look`).
         let mut brake = Material {
             name_hash: m2_assets::vehicle::BRAKE_LAMP,
             ..lamp.clone()
@@ -1839,12 +1904,6 @@ mod tests {
             backend.material(lit).emissive.unwrap().color,
             [3.0, 0.0, 0.0]
         );
-        let off = cache
-            .material(&mut backend, &unlit_lamp(&brake).unwrap())
-            .unwrap();
-        assert_ne!(off, lit);
-        assert!(backend.material(off).emissive.is_none());
-        assert_eq!(backend.material(off).texture, backend.material(lit).texture);
         // Paint: PgDiffSpecMetalNormFP mirrors by constant 14, weighted by
         // Fresnel from constant 15.
         let mut paint = Material {
