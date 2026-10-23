@@ -2528,6 +2528,21 @@ impl MissionLink {
                     }
                 });
                 mission.start();
+                // Her own interface, made in the scripts' state as the game
+                // makes it, one state for all its scripts: the HUD's
+                // layouts and the PDA, loaded as the GUI runtime ticks
+                // (`MrxGuiManager.CreateGui`, `PdaLoaded`). Not drawn from
+                // here (the game HUD's thread draws its own copy); the
+                // mission's scripts find them: `Munitions.PickupMunitions`
+                // updates the PDA's support page, and without one it
+                // stopped ("No PDA found") and JetCon001's bunker busters
+                // never counted.
+                if let Err(e) = mission.run(
+                    "MrxGuiManager.CreateGui(Player.GetLocalPlayer())",
+                    "create gui",
+                ) {
+                    eprintln!("mission: her interface: {e}");
+                }
                 if self.movies && self.end_skip {
                     // The movies wait for the game, so the scripts' skip
                     // mode has done its part.
