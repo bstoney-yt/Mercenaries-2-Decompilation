@@ -285,6 +285,9 @@ pub struct Entity {
     /// villa tank, `Scorpion90 (Driver) (PMC001)`, has a `VZ Tank
     /// Commander` in `seat_driver`). Empty for most.
     pub crew: Vec<(String, String)>,
+    /// The template it was placed as (`Mi35 (Solano)` for PmcCon004's
+    /// `Mi35 (Solano Hijack)`), by name, when the database names it.
+    pub template: Option<String>,
 }
 
 /// An object of the layers with a crew of its own aboard
@@ -465,6 +468,7 @@ impl GameData {
                             script: scripts.get(&guid).copied(),
                             faction: None,
                             path: Vec::new(),
+                            template: None,
                             crew: Vec::new(),
                         });
                         if let Some(r) = rides.remove(&guid) {
@@ -517,9 +521,11 @@ impl GameData {
             let records = template_riders
                 .get(template)
                 .or_else(|| template_riders.get(&(template & !TEMPLATE_BIT)));
+            let e = &mut data.layers.get_mut(layer).expect("indexed above")[*i];
             if let Some(r) = records {
-                data.layers.get_mut(layer).expect("indexed above")[*i].crew = crew_of(r);
+                e.crew = crew_of(r);
             }
+            e.template = named(*template);
         }
         for (&template, records) in &template_riders {
             let driver = crew_of(records)
@@ -2045,6 +2051,11 @@ end
             .collect()
     }
 
+    /// The template the layers' object `guid` was placed as, by name.
+    pub fn template_of(&self, guid: u32) -> Option<String> {
+        self.world.borrow().placed_as.get(&guid).cloned()
+    }
+
     /// Who a layer's vehicle `guid` came into play with: (seat, rider
     /// template), as its entity's own `Rider` records say, else its
     /// template's; empty for none.
@@ -2405,8 +2416,12 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             if !e.crew.is_empty() {
                 w.crews.insert(e.guid, e.crew.clone());
             }
+            if let Some(t) = &e.template {
+                w.placed_as.insert(e.guid, t.clone());
+            }
         } else {
             w.crews.remove(&e.guid);
+            w.placed_as.remove(&e.guid);
             w.gates.remove(&e.guid);
             w.crew_riders.retain(|_, v| *v != e.guid);
             w.objects.remove(&e.guid);
@@ -2978,6 +2993,7 @@ mod tests {
             script: None,
             faction: None,
             path: Vec::new(),
+            template: None,
             crew: vec![
                 ("seat_gunner".into(), "VZ Soldier".into()),
                 ("seat_driver".into(), "VZ Tank Commander".into()),
@@ -3018,6 +3034,7 @@ mod tests {
             guid: 0xc73ad,
             name: "HqInterior".into(),
             at: [3750.0, 450.0, -3840.0],
+            template: None,
             crew: vec![("a651ff78".into(), "Fiona Taylor".into())],
             ..villa_tank()
         };
@@ -3058,6 +3075,7 @@ mod tests {
         let hq = Entity {
             guid: 0xc73ad,
             name: "HqInterior".into(),
+            template: None,
             crew: vec![("a651ff78".into(), "Fiona Taylor".into())],
             ..villa_tank()
         };
@@ -3312,6 +3330,7 @@ mod tests {
             guid,
             name: name.into(),
             at: [7.0, 1.0, 9.0],
+            template: None,
             crew: Vec::new(),
             ..villa_tank()
         };
@@ -3340,6 +3359,7 @@ mod tests {
         let path = Entity {
             guid: 0x11a600,
             name: "Path_PMC001_GarageSmash".into(),
+            template: None,
             crew: Vec::new(),
             path: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 30.0]],
             ..villa_tank()

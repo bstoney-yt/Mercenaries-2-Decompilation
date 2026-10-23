@@ -799,6 +799,22 @@ impl Hijacks {
     }
 }
 
+/// The pad buttons (as the scripts number them, [`PAD`]) pressed since
+/// the last time, and those held now.
+pub fn pad_buttons(input: &mut Input) -> (Vec<u32>, Vec<u32>) {
+    let pressed = PAD
+        .iter()
+        .filter(|(a, _)| input.take_pressed(*a))
+        .map(|p| p.1)
+        .collect();
+    let held = PAD
+        .iter()
+        .filter(|(a, _)| input.held(*a))
+        .map(|p| p.1)
+        .collect();
+    (pressed, held)
+}
+
 /// The pad as a player who answers every prompt at once would work it
 /// (`--hijack-crew` with `--screenshot --drive`): presses the button a
 /// press asks for, holds a hold's, taps (or alternates) nine times a

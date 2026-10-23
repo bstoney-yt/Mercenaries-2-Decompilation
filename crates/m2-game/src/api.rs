@@ -661,6 +661,9 @@ pub struct ScriptWorld {
     /// rider out of its seat is still known by it (the HQ's starter, out
     /// of her seat for her briefing).
     pub crew_riders: HashMap<u32, u32>,
+    /// The template each of the layers' objects in play was placed as, by
+    /// object ([`crate::mission::Entity::template`]).
+    pub placed_as: HashMap<u32, String>,
     /// The player is in a scene of the scripts' (`Player.SetCinematicMode`).
     pub cinematic: bool,
     /// Characters swimming, as the game last said (`Human.IsSwimming`).

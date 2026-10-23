@@ -50,6 +50,7 @@ use crate::flights::{Copter, Leaves, Load};
 use crate::game::{Game, get_out, place};
 use crate::gamehud::{HudCall, Plain, RadarRegion};
 use crate::hero::Hero;
+use crate::ridehijack::{self, RideHijack};
 use crate::scene::NOT_DRIVABLE;
 use crate::support::{self, FALLBACK_AFTER, Impact, Kind};
 
@@ -834,6 +835,9 @@ pub struct MissionLink {
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
     ashore: u32,
+    /// The action hijack of a scripts' vehicle under way in the scripts
+    /// ([`crate::ridehijack`]).
+    hijack: Option<RideHijack>,
     /// The tutorial line up, with its key tokens.
     tutorial: Option<String>,
     /// Blasts since the scripts last ran, and support strikes' bombs.
@@ -1009,6 +1013,7 @@ impl MissionLink {
             saved: None,
             since_load: None,
             ashore: 0,
+            hijack: None,
             blasts: Vec::new(),
             tutorial: None,
             bombs: Vec::new(),
@@ -1542,6 +1547,27 @@ impl MissionLink {
         }
     }
 
+    /// The prompts of the hijack the scripts play on a vehicle of theirs
+    /// ([`crate::ridehijack`]), while one is under way.
+    pub fn hijack_prompts(&self) -> Option<Vec<m2_game::hijack::Minigame>> {
+        let (Some(_), State::Running(m)) = (&self.hijack, &self.state) else {
+            return None;
+        };
+        Some(RideHijack::prompts(m))
+    }
+
+    /// The pad during that hijack: the buttons ([`m2_game::hijack::BUTTONS`]
+    /// numbers) pressed since the last time, and those held.
+    pub fn hijack_pad(&mut self, pressed: &[u32], held: &[u32]) {
+        let (Some(h), State::Running(m)) = (&mut self.hijack, &mut self.state) else {
+            return;
+        };
+        for &b in pressed {
+            RideHijack::press(m, b);
+        }
+        h.hold(m, held);
+    }
+
     /// Advances the scripts by `dt` seconds of play: tells them where the
     /// player is and who died, and carries out what they ask of the
     /// player.
@@ -1761,7 +1787,17 @@ impl MissionLink {
             if game.aboard == Some(g) {
                 leave_ride(game, mission, g);
             } else if rides(game, mission).iter().any(|r| r.0 == g) {
-                board_ride(game, mission, g);
+                // One with an action hijack in the data is hijacked
+                // ([`crate::ridehijack`]), else boarded.
+                match ridehijack::entrance(game, mission, g)
+                    .and_then(|(t, e)| RideHijack::start(mission, g, &t, &e))
+                {
+                    Some(h) => {
+                        game.input_locked = true;
+                        self.hijack = Some(h);
+                    }
+                    None => board_ride(game, mission, g),
+                }
             } else {
                 let text = mission.context_text(g).unwrap_or_default();
                 mission.take_context_action(g);
@@ -2463,7 +2499,35 @@ impl MissionLink {
             // and 28).
             m2_game::gui_runtime::tick(mission.lua(), f64::from(STEP));
             lines.extend(mission.take_log());
-            for c in mission.take_commands() {
+            let commands = mission.take_commands();
+            if let Some(h) = &mut self.hijack
+                && !h.follow(game, mission, &commands)
+            {
+                self.hijack = None;
+                game.input_locked = false;
+            }
+            for c in commands {
+                // Seated by the scripts in the driver's seat of one of theirs
+                // with an action hijack (PmcCon004's `DockAttack`:
+                // `Vehicle.Enter(mi35, hero, "d")`, 50 m from it): the
+                // hijack plays ([`crate::ridehijack`]; inferred, the
+                // engine's own seating is not read).
+                if let Command::EnterVehicle {
+                    guid,
+                    vehicle,
+                    seat,
+                    ..
+                } = &c
+                    && *guid == PLAYER
+                    && seat.eq_ignore_ascii_case("d")
+                    && self.hijack.is_none()
+                    && let Some((t, e)) = ridehijack::entrance(game, mission, *vehicle)
+                    && let Some(h) = RideHijack::start(mission, *vehicle, &t, &e)
+                {
+                    game.input_locked = true;
+                    self.hijack = Some(h);
+                    continue;
+                }
                 match &c {
                     Command::Say { id, speaker, cue } => {
                         // The player's own lines (and the radio) are flat.

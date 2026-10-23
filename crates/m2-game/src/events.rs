@@ -1043,7 +1043,11 @@ fn check(
         // (`stopped` isn't followed yet). a and b are guids, "hero",
         // labels or filters. Passes the a's that hold: one guid as a
         // guid, a label's or filter's as a list (as WifTutorialTankHijack
-        // and the gate scripts read it).
+        // and the gate scripts read it), and "hero"'s as a list too
+        // (PmcCon004's `ProximityCallback(self, tGuid)` takes `tGuid[1]`
+        // as the hero near Solano's helicopter; the only other "hero"
+        // proximity, `MrxTaskObjectiveFlee.HeroProximity`, doesn't read
+        // it). From the scripts.
         "ObjectProximity" => {
             let r = number(&p.params, 4).unwrap_or(0.0);
             let beyond = text(&p.params, 3).is_some_and(|op| op.starts_with('>'));
@@ -1069,11 +1073,10 @@ fn check(
             if near.is_empty() {
                 return no;
             }
-            let one = match p.params.raw_get::<Value>(1) {
-                Ok(Value::String(s)) => s.to_string_lossy().eq_ignore_ascii_case("hero"),
-                Ok(Value::Table(_)) => false,
-                _ => true,
-            };
+            let one = !matches!(
+                p.params.raw_get::<Value>(1),
+                Ok(Value::String(_) | Value::Table(_))
+            );
             if one {
                 return Check::Holds(true, vec![id(near[0])]);
             }
@@ -1721,7 +1724,10 @@ mod tests {
                 r#"
                 local function note(s) return function(...)
                     local t = {}
-                    for i, v in ipairs({...}) do t[i] = tostring(gid(v)) end
+                    for i, v in ipairs({...}) do
+                        if type(v) == "table" then v = v[1] end
+                        t[i] = tostring(gid(v))
+                    end
                     table.insert(log, s .. table.concat(t, ","))
                 end end
                 Event.Create(Event.ObjectDeath, { 7 }, note("dead "), { 7 })
@@ -1894,6 +1900,27 @@ mod tests {
         events.update(0.1, &world);
         assert_eq!(log(&host), ["arrived"]);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_hero_proximity_passes_the_heroes_near_as_a_list() {
+        // As PmcCon004's `ProximityCallback(self, tGuid)` reads it:
+        // `tGuid[1]` is the hero by Solano's helicopter.
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                r#"
+                Event.Create(Event.ObjectProximity, { "hero", 2, "<", 50 },
+                    function(self, near) table.insert(log, type(near) .. " " .. tostring(gid(near[1]))) end, { {} })
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        world.positions.insert(1, [0.0, 0.0, 0.0]);
+        world.positions.insert(2, [30.0, 0.0, 0.0]);
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["table 1"]);
     }
 
     #[test]
