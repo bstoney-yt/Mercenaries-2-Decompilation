@@ -258,7 +258,8 @@ impl ColourKey {
 pub struct Emitter {
     /// `TRFM`: its place.
     pub transform: Vec<Attr>,
-    /// The `EMIT`'s `GEOM`, raw.
+    /// The `EMIT`'s `GEOM`, raw: `u16` shape index into
+    /// [`Effect::shapes`], `u16` triangle count ([`Emitter::shape`]).
     pub shape_ref: Vec<u8>,
     /// `PTYP`'s settings, in their stored order.
     pub particle: Vec<Attr>,
@@ -268,16 +269,75 @@ pub struct Emitter {
     pub textures: Vec<u32>,
 }
 
+impl Emitter {
+    /// The shape its particles start on: an index into
+    /// [`Effect::shapes`] and the triangle count stored with it (which
+    /// matches the shape's: every one of the 811 emitters with a 4-byte
+    /// reference, in the install). `None` for the 9 with none.
+    pub fn shape(&self) -> Option<(usize, usize)> {
+        let r: [u8; 4] = self.shape_ref.as_slice().try_into().ok()?;
+        Some((
+            usize::from(u16::from_le_bytes([r[0], r[1]])),
+            usize::from(u16::from_le_bytes([r[2], r[3]])),
+        ))
+    }
+}
+
+/// One triangle of an emitter shape: where its particles start.
+///
+/// Read from the install's 578 shapes (13,148 triangles): a 52-byte
+/// entry of 13 floats, the triangle's area (within 1% of the one its
+/// corners give), its unit normal (unit on every entry; a third point
+/// against the corners' winding, so stored, not derived) and its three
+/// corners, in the emitter's own space (metres: a grenade's ring of eight
+/// is 0.4 m across, the largest shapes hundreds).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Triangle {
+    pub area: f32,
+    pub normal: [f32; 3],
+    pub corners: [[f32; 3]; 3],
+}
+
+/// Bytes of one [`Triangle`] in an `EMTR` `GEOM` leaf.
+const TRIANGLE_LEN: usize = 52;
+
 /// A decoded effect.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Effect {
-    /// `EMTR`'s `GEOM` leaves, raw.
+    /// `EMTR`'s `GEOM` leaves, raw: a `u32` triangle count, then that many
+    /// [`Triangle`]s ([`Effect::shape_triangles`]).
     pub shapes: Vec<Vec<u8>>,
     pub emitters: Vec<Emitter>,
     /// `FRCE`s.
     pub forces: Vec<Vec<Attr>>,
     /// `TEXT` leaves straight under the effect (a few effects have one).
     pub textures: Vec<u32>,
+}
+
+impl Effect {
+    /// Shape `index`'s triangles; `None` when there is no such shape or
+    /// its bytes don't hold its count of them.
+    pub fn shape_triangles(&self, index: usize) -> Option<Vec<Triangle>> {
+        let raw = self.shapes.get(index)?;
+        let count = usize::try_from(u32::from_le_bytes(raw.get(..4)?.try_into().ok()?)).ok()?;
+        let body = raw.get(4..)?;
+        if body.len() != count.checked_mul(TRIANGLE_LEN)? {
+            return None;
+        }
+        Some(
+            body.chunks_exact(TRIANGLE_LEN)
+                .map(|c| {
+                    let f = |i: usize| f32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]);
+                    let v = |i: usize| [f(i), f(i + 4), f(i + 8)];
+                    Triangle {
+                        area: f(0),
+                        normal: v(4),
+                        corners: [v(16), v(28), v(40)],
+                    }
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Errors from decoding an effect.
@@ -625,6 +685,50 @@ mod tests {
             leaf(b"DICT", vec![0; 40]),
         ]);
         assert!(Atlas::parse(&short).is_err());
+    }
+
+    /// A shape of two triangles as the install stores them (count, then
+    /// area, normal, corners), and the emitter's reference to it.
+    #[test]
+    fn shapes_are_triangle_lists_and_emitters_point_at_them() {
+        let tri = |area: f32, n: [f32; 3], c: [[f32; 3]; 3]| -> Vec<u8> {
+            let mut out = area.to_le_bytes().to_vec();
+            for v in n.iter().chain(c.iter().flatten()) {
+                out.extend(v.to_le_bytes());
+            }
+            out
+        };
+        let mut raw = 2u32.to_le_bytes().to_vec();
+        raw.extend(tri(
+            0.5,
+            [0.0, 1.0, 0.0],
+            [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        ));
+        raw.extend(tri(
+            2.0,
+            [0.0, 0.0, -1.0],
+            [[1.0, 1.0, 0.0], [3.0, 1.0, 0.0], [1.0, 3.0, 0.0]],
+        ));
+        let fx = Effect {
+            shapes: vec![raw.clone(), vec![1, 0, 0, 0, 0]],
+            emitters: vec![
+                Emitter {
+                    shape_ref: vec![0, 0, 2, 0],
+                    ..Emitter::default()
+                },
+                Emitter::default(),
+            ],
+            ..Effect::default()
+        };
+        let t = fx.shape_triangles(0).unwrap();
+        assert_eq!(t.len(), 2);
+        assert_eq!((t[0].area, t[0].normal), (0.5, [0.0, 1.0, 0.0]));
+        assert_eq!(t[1].corners[2], [1.0, 3.0, 0.0]);
+        // A shape whose bytes don't hold its count, and a missing one.
+        assert_eq!(fx.shape_triangles(1), None);
+        assert_eq!(fx.shape_triangles(2), None);
+        assert_eq!(fx.emitters[0].shape(), Some((0, 2)));
+        assert_eq!(fx.emitters[1].shape(), None);
     }
 
     #[test]

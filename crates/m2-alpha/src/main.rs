@@ -6608,7 +6608,11 @@ fn blast_for_screenshot(
         game.combat.hp
     );
     if let Some(p) = &game.scene.particles {
-        eprintln!("blast: {} particles alive", p.live());
+        eprintln!(
+            "blast: {} particles alive, {:.2} m from the blast on average",
+            p.live(),
+            p.mean_distance(at)
+        );
     }
     for i in 0..(wait / tick) as usize {
         game.step(Intent::default(), tick);
@@ -6620,7 +6624,11 @@ fn blast_for_screenshot(
     game.step(Intent::default(), tick);
     render(backend, game, fov, aspect, None)?;
     if let Some(p) = &game.scene.particles {
-        eprintln!("blast: {} particles alive at the picture", p.live());
+        eprintln!(
+            "blast: {} particles alive at the picture, {:.2} m from the blast on average",
+            p.live(),
+            p.mean_distance(at)
+        );
     }
     Ok(())
 }

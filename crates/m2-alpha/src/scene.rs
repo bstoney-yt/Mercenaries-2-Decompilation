@@ -2638,7 +2638,8 @@ impl Scene {
             self.draw_ground(queue);
         }
         if let Some(world) = &self.world {
-            for v in &mut self.vehicles {
+            let driven = self.player.as_ref().and_then(|p| p.driving);
+            for (i, v) in self.vehicles.iter_mut().enumerate() {
                 // A wreck shows its wrecked body, turret and wheels; else
                 // its parts as they stand, once any has been hurt.
                 v.model.wrecked = v.wrecked;
@@ -2656,7 +2657,15 @@ impl Scene {
                 let Some(at) = world.physics.vehicle_transform(id) else {
                     continue;
                 };
-                v.model.braking = Some(world.physics.vehicle_braking(id));
+                let braking = world.physics.vehicle_braking(id);
+                if v.model.braking.is_some_and(|was| was != braking) && driven == Some(i) {
+                    eprintln!(
+                        "lamps: {} brake lamps {}",
+                        v.spec.label,
+                        if braking { "lit" } else { "off" }
+                    );
+                }
+                v.model.braking = Some(braking);
                 let mut nodes = v.spec.posed_nodes(
                     &world.physics.vehicle_wheels(id),
                     v.rolled,

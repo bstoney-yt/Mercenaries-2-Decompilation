@@ -245,6 +245,12 @@ impl ParticleDraw {
         self.sim.live()
     }
 
+    /// How far the particles sit from `centre` on average, metres
+    /// ([`Particles::mean_distance`]).
+    pub fn mean_distance(&self, centre: Vec3) -> f32 {
+        self.sim.mean_distance(centre)
+    }
+
     /// Queues every particle: writes this frame's squares and draws them
     /// in two batches.
     pub fn draw(
