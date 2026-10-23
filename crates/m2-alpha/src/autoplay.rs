@@ -54,6 +54,9 @@ const RIDE_STILL: f32 = 20.0;
 /// out and in again.
 const RIDE_AGAIN: f32 = 10.0;
 const CIRCLE_AFTER: f32 = 4.0;
+/// Driven to a delivery point and waiting there this long (seconds) with
+/// nothing happening, she gets out (invented).
+const DELIVER_AFTER: f32 = 5.0;
 const CIRCLE: f32 = 6.0;
 /// At a place this long (seconds) with nothing happening, she takes one
 /// of the scripts' vehicles standing within this far of it (metres): a
@@ -546,6 +549,9 @@ pub struct Autoplay {
     boarded: Option<(u32, f32)>,
     /// When she last called in a soldier delivery by an outpost.
     delivered: Option<f32>,
+    /// What she took the scripts' context action on (a munition tagged
+    /// for pickup): its action marker, left up, is done with.
+    tagged: std::collections::HashSet<u32>,
     /// Seconds one following her has been left behind.
     left_behind: f32,
 }
@@ -650,6 +656,7 @@ impl Autoplay {
                 self.pressed = 0.0;
                 eprintln!("autoplay {:.1} s: taking {text:?} at {g:#x}", self.clock);
                 game.context_taken = Some(g);
+                self.tagged.insert(g);
             }
             return Intent::default();
         }
@@ -693,6 +700,7 @@ impl Autoplay {
             );
             self.context_pressed = self.clock;
             game.context_taken = Some(*g);
+            self.tagged.insert(*g);
         }
         // At a body to verify still driving: out, as the scripts offer the
         // prompt on foot (ChiCon003's HVT, shot from the M1A2: she sat on
@@ -721,6 +729,27 @@ impl Autoplay {
             && self.waiting.is_none_or(|w| w.0 != *target)
         {
             self.waiting = Some((*target, t));
+        }
+        // Driven to a delivery point and nothing happens there: she gets
+        // out. A delivery of the vehicle itself counts as she leaves it
+        // (`MrxTaskObjectiveDeliver` hears her climb out; MecCon001's
+        // "Park inside the garage": round 6 sat in the truck at 0 m for
+        // 1500 s).
+        if let (Some(Goal::Reach { target, .. }), Some((w, since))) = (&self.goal, self.waiting)
+            && w == *target
+            && !self.leave
+            && self.clock - since > DELIVER_AFTER
+            && marks
+                .iter()
+                .any(|m| m.target == w && m.alive && m.kind == "deliverable")
+            && let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving)
+            && self.may_get_out(game, i)
+        {
+            eprintln!(
+                "autoplay {:.1} s: at {} in the {} with nothing happening: getting out",
+                self.clock, self.what, game.scene.vehicles[i].spec.label
+            );
+            self.leave = true;
         }
         if self.clock >= self.next_report {
             self.next_report = self.clock + REPORT;
@@ -1035,7 +1064,32 @@ impl Autoplay {
                 format!("fighting back a soldier {d:.0} m off"),
             ));
         }
-        let live: Vec<&Mark> = marks.iter().filter(|m| m.alive).collect();
+        let live: Vec<&Mark> = marks
+            .iter()
+            .filter(|m| m.alive && !(m.kind == "action" && self.tagged.contains(&m.target)))
+            .collect();
+        // Every munition marked for her tagged (JetCon001's three bunker
+        // busters, `Munitions.ActionTarget`): the pickup the tagging
+        // stocked her with (`MunitionsPickup`, the munitions helicopter)
+        // is called in, once a while (`DELIVERY_AGAIN`).
+        if driving.is_none()
+            && !live.iter().any(|m| m.kind == "action")
+            && marks
+                .iter()
+                .any(|m| m.kind == "action" && self.tagged.contains(&m.target))
+            && self
+                .delivered
+                .is_none_or(|t| self.clock - t > DELIVERY_AGAIN)
+            && let Some(key) = game.support.entries().into_iter().find_map(|e| match e {
+                Entry::Stocked(s) if s.key == "MunitionsPickup" => Some(s.key.clone()),
+                _ => None,
+            })
+        {
+            return Some((
+                Goal::Deliver(key),
+                "calling in the munitions pickup for what she tagged".to_owned(),
+            ));
+        }
         fn nearest(ms: Vec<&Mark>, here: Vec3) -> Option<&Mark> {
             ms.into_iter()
                 .min_by(|a, b| a.at.distance(here).total_cmp(&b.at.distance(here)))
