@@ -366,20 +366,27 @@ impl UiSounds {
     }
 
     /// The music stream cue `cue` plays, and whether it loops.
+    ///
+    /// A cue in the cue list (`mu_fac_pmc_explore_01`) loops when its
+    /// seconds are negative. 81 of the table's 156 records are in no cue
+    /// list entry, only a line's or a group's (the pause menu's
+    /// `mu_shell_01`: playtest 12 asked for it 16 times and heard nothing);
+    /// those are read by their record ([`CueTable::record_of`]) and loop
+    /// (inferred: the data says nothing, and a menu piece that ended in
+    /// silence would be odd).
     fn music(&self, cue: &str) -> Option<(usize, bool)> {
         let table = self.music.as_ref()?;
-        let plain = table.plain_cue(m2_assets::name_hash(cue))?;
-        let record = table.records.get(plain.record as usize)?;
+        let (record, looped) = cue_record(table, cue)?;
         let &(_, index, _) = record.variants.iter().find(|v| v.0 == table.hash)?;
-        Some((index as usize, plain.seconds < 0.0))
+        Some((index as usize, looped.unwrap_or(true)))
     }
 
-    /// The sound cue `cue` plays and its volume (the first of its
-    /// record's variants that is this bank's).
-    /// and whether it loops.
-    /// Looks in `ui_hud`, then the front end's `ui_shell`.
+    /// The sound cue `cue` plays, its volume (the first of its record's
+    /// variants that is this bank's) and whether it loops.
+    /// Looks in `ui_hud`, then the front end's `ui_shell`. A cue in no cue
+    /// list entry, only a group's (the PDA's `ui_SatDes_BG_Loop`), loops
+    /// when its name says so ([`named_loop`]).
     fn find(&self, cue: &str) -> Option<(SoundBuffer, f32, bool)> {
-        let hash = m2_assets::name_hash(cue);
         [
             (&self.cues, &self.sounds),
             (&self.shell_cues, &self.shell_sounds),
@@ -387,12 +394,38 @@ impl UiSounds {
         .into_iter()
         .find_map(|(cues, sounds)| {
             let table = cues.as_ref()?;
-            let record = table.cue_record(hash)?;
+            let (record, looped) = cue_record(table, cue)?;
             let &(_, index, _) = record.variants.iter().find(|v| v.0 == table.hash)?;
-            let looped = table.plain_cue(hash).is_some_and(|c| c.seconds < 0.0);
+            let looped = looped.unwrap_or_else(|| named_loop(cue));
             Some((sounds.get(index as usize)?.clone(), record.volume, looped))
         })
     }
+}
+
+/// The record cue `cue` plays in `table`, and whether it loops: through
+/// the cue list when the cue is in it (negative seconds loop), else by the
+/// record's own cue (a line's or a group's), which says nothing about
+/// looping (`None`).
+fn cue_record<'t>(
+    table: &'t m2_assets::CueTable,
+    cue: &str,
+) -> Option<(&'t m2_assets::voice::Record, Option<bool>)> {
+    let hash = m2_assets::name_hash(cue);
+    match table.plain_cue(hash) {
+        Some(plain) => Some((
+            table.records.get(plain.record as usize)?,
+            Some(plain.seconds < 0.0),
+        )),
+        None => Some((table.record_of(hash)?, None)),
+    }
+}
+
+/// Whether a cue's name says it loops (`ui_SatDes_BG_Loop`,
+/// `sfx_survival_lp`), for cues the cue list doesn't flag. Inferred from
+/// the names.
+fn named_loop(cue: &str) -> bool {
+    let lower = cue.to_ascii_lowercase();
+    lower.ends_with("loop") || lower.ends_with("_lp")
 }
 
 /// The zone ambience's sounds: the `ambience` cue table, which says what
@@ -2534,5 +2567,79 @@ mod tests {
         let one = engine(&[None]);
         assert_eq!(Engine::mix(&one, 0.0), vec![(1.0, 0.8)]);
         assert_eq!(Engine::mix(&one, 1.0), vec![(1.0, 1.5)]);
+    }
+
+    /// The music table as the install has it: `mu_fac_pmc_explore_01` is a
+    /// plain cue (looped, seconds -1) over record 1; `mu_shell_01` is only a
+    /// group over record 2 (stream 89).
+    fn music_table() -> m2_assets::CueTable {
+        use m2_assets::voice::{Group, PlainCue, Record};
+        let table = m2_assets::name_hash("music");
+        let record = |cue: &str, stream: u32| Record {
+            cue: m2_assets::name_hash(cue),
+            volume: 1.0,
+            min_distance: 10.0,
+            max_distance: 1000.0,
+            variants: vec![(table, stream, 1.0)],
+        };
+        m2_assets::CueTable {
+            hash: table,
+            lines: Vec::new(),
+            groups: vec![Group {
+                cue: m2_assets::name_hash("mu_shell_01"),
+                category: 0x9fe0_dcad,
+                volume: 1.0,
+                min_distance: 10.0,
+                max_distance: 1000.0,
+                streams: vec![(89, 1.0)],
+            }],
+            records: vec![
+                record("", 0),
+                record("mu_fac_pmc_explore_01", 32),
+                record("mu_shell_01", 89),
+                record("ui_SatDes_BG_Loop", 54),
+            ],
+            cues: vec![PlainCue {
+                cue: m2_assets::name_hash("mu_fac_pmc_explore_01"),
+                record: 1,
+                a: 0.5,
+                seconds: -1.0,
+            }],
+            mixes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_music_cue_in_no_cue_list_entry_plays_by_its_record_and_loops() {
+        let ui = UiSounds {
+            music: Some(music_table()),
+            ..Default::default()
+        };
+        assert_eq!(ui.music("mu_fac_pmc_explore_01"), Some((32, true)));
+        // The pause menu's piece: a group, no plain cue (playtest 12: not
+        // found, 16 times).
+        assert_eq!(ui.music("mu_shell_01"), Some((89, true)));
+        assert_eq!(ui.music("mu_src_civ"), None);
+    }
+
+    #[test]
+    fn a_ui_cue_in_no_cue_list_entry_plays_by_its_record_looping_by_its_name() {
+        let buffer = |hash: u32| SoundBuffer {
+            hash,
+            channels: 1,
+            rate: 22050,
+            samples: std::sync::Arc::from(vec![0i16; 2205]),
+        };
+        let ui = UiSounds {
+            cues: Some(music_table()),
+            sounds: (0..90).map(buffer).collect(),
+            ..Default::default()
+        };
+        let (b, volume, looped) = ui.find("ui_SatDes_BG_Loop").unwrap();
+        assert_eq!((b.hash, volume, looped), (54, 1.0, true));
+        let (b, _, looped) = ui.find("mu_shell_01").unwrap();
+        assert_eq!((b.hash, looped), (89, false));
+        assert!(ui.find("ui_signal_ding_up").is_none());
+        assert!(named_loop("sfx_survival_lp") && !named_loop("ui_HUD_Objective_New"));
     }
 }
