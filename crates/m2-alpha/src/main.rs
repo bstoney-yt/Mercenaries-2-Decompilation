@@ -7292,6 +7292,14 @@ impl Running {
             // The game's own prompt (`Hijack %s`); the buttons it asks
             // for are the HUD's to draw.
             info.prompt = (!v.running).then(|| format!("Hijack {}", v.vehicle));
+            // With the keyboard, which keys the arrow means (playtest 12:
+            // no tap of 9 rounds reached the scripts).
+            if v.running && !self.input.pad() {
+                info.hijack_keys = v
+                    .prompts
+                    .first()
+                    .and_then(|p| hijack::key_hint(p, &config.keys));
+            }
             info.can_enter = None;
         }
         // The hijack scripts' calls to the HUD, taken whether it runs or

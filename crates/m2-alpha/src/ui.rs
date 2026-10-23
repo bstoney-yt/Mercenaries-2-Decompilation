@@ -49,6 +49,10 @@ pub struct HudInfo {
     /// What the use key takes from within reach, as the game words it
     /// ("Equip Grenade Launcher").
     pub prompt: Option<String>,
+    /// A hijack's button prompt is up and the keyboard plays: the keys
+    /// that press it ("K or flick the mouse down"), under the game's arrow
+    /// ([`crate::hijack::key_hint`]).
+    pub hijack_keys: Option<String>,
     /// Driving: the vehicle's name and speed (m/s), and whether it is
     /// wrecked.
     pub driving: Option<(String, f32, bool)>,
@@ -748,6 +752,16 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
             text(at, Align2::CENTER_TOP, &format!("E: {what}"), 17.0, white);
         }
     };
+    if let Some(keys) = &info.hijack_keys {
+        // Under the game's own arrow (the HUD's `MrxGuiHudActionHijack`).
+        text(
+            screen.center() + vec2(0.0, 60.0),
+            Align2::CENTER_TOP,
+            keys,
+            17.0,
+            white,
+        );
+    }
     if let Some(prompt) = &info.prompt {
         use_prompt(prompt);
     } else if let Some(name) = &info.can_enter

@@ -2100,6 +2100,7 @@ impl Game {
                 .map(|(_, text)| text.clone())
                 .or(prompt)
                 .filter(|_| !self.support.busy()),
+            hijack_keys: None,
             driving,
             crosshair: crosshair.filter(|_| self.support.looking().is_none()),
             can_enter: can_enter.filter(|_| !self.support.busy()),
