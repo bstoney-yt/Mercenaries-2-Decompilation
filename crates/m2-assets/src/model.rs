@@ -375,7 +375,7 @@ impl ModelInfo {
 }
 
 /// One `HIER` node.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Node {
     pub name_hash: u32,
     pub flags: u16,

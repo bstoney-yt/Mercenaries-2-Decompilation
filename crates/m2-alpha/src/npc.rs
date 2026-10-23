@@ -3863,6 +3863,7 @@ pub(crate) mod tests {
             breakup: None,
             parts: None,
             looks: None,
+            lamp_nodes: Default::default(),
         };
         let mut backend = m2_render::NullBackend::default();
         let mut materials = m2_engine::MaterialCache::new();

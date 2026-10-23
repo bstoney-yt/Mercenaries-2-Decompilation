@@ -84,6 +84,21 @@ pub const PASSENGER_DOOR: u32 = 0x8869_e876;
 /// such as `brakelight_l` hashed to them); which lamp does what is read from colour and place.
 pub const BRAKE_LAMP: u32 = 0xd85e_d9a4;
 
+/// Node name hashes of the lamps' glow quads, by what the lamp does:
+/// `[brake, reversing, headlights]`, each its left and right node. The
+/// 68 Valiant's body part machine hides all six in its intact state
+/// (`acb51200`: node 4 shown, these six hidden), so a model drawn as its
+/// data stands shows no lamp; the game's code shows them (Brendan's
+/// footage at 31:33: the whole rear bar red while Fiona's car brakes).
+/// Which node does what is read from the material each carries
+/// ([`BRAKE_LAMP`] red at the back, white at the back, white at the
+/// front); the names behind the hashes are unread.
+pub const LAMP_NODES: [[u32; 2]; 3] = [
+    [0x98b7_6a82, 0x4119_f5a8],
+    [0xd871_b369, 0xfa92_ee23],
+    [0xfe1f_4ea3, 0x8bc2_1f85],
+];
+
 /// Node name hashes of a helicopter's main rotor: the blades and the blur
 /// disc (texture `global_veh_rotorblur`), both centred on the hub. Shared
 /// by the UH-1 and the Mi-26 (hub at y 3.55 and 8.16).

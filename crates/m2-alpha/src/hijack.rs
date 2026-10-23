@@ -91,10 +91,77 @@ const CAMERA_AHEAD: f32 = 0.6;
 /// How far above the vehicle's top (later her feet) the camera looks,
 /// metres.
 const CAMERA_LIFT: f32 = 1.0;
-/// Mouse counts in a tick that make a flick (`Hijacks::pad`). Invented.
+/// Mouse counts within [`FLICK_WINDOW`] that make a flick ([`Flick`]).
+/// Invented.
 const FLICK: f64 = 40.0;
+/// How long the mouse's motion adds up toward a flick, seconds. Counted
+/// per tick before (playtest 12: no tap of 9 rounds reached the scripts),
+/// a flick had to land its counts inside one frame: 6 ms at Brendan's
+/// 165 Hz, which an ordinary flick doesn't. Invented.
+const FLICK_WINDOW: f64 = 0.12;
+
+/// The mouse's motion of late, adding up toward a flick whatever the
+/// frame rate: the counts since the window began, and how long ago.
+#[derive(Debug, Default)]
+struct Flick {
+    dx: f64,
+    dy: f64,
+    seconds: f64,
+}
+
+impl Flick {
+    /// Adds a tick's motion (`dt` seconds): the button a flick presses
+    /// ([`m2_game::hijack::BUTTONS`]: up 5, down 6, left 7, right 8), with
+    /// its counts and how long they took, once per flick.
+    fn feed(&mut self, dx: f64, dy: f64, dt: f64) -> Option<(u32, f64, f64)> {
+        self.dx += dx;
+        self.dy += dy;
+        self.seconds += dt;
+        let (counts, button) = if self.dy.abs() > self.dx.abs() {
+            (self.dy.abs(), if self.dy < 0.0 { 5 } else { 6 })
+        } else {
+            (self.dx.abs(), if self.dx < 0.0 { 7 } else { 8 })
+        };
+        let flicked = counts > FLICK;
+        if flicked || self.seconds >= FLICK_WINDOW {
+            let seconds = self.seconds;
+            *self = Self::default();
+            if flicked {
+                return Some((button, counts, seconds));
+            }
+        }
+        None
+    }
+}
 /// How long an action lasts when its clip is unknown, seconds.
 const UNKNOWN_CLIP: f64 = 2.0;
+/// What the keyboard does for a hijack prompt ("K or flick the mouse
+/// down", "hold K", "J and L in turn"), for the HUD to write under the
+/// game's arrow, which on the PC names no key. `None` for a button no key
+/// has.
+pub fn key_hint(prompt: &Minigame, keys: &crate::input::Bindings) -> Option<String> {
+    let key = |button: u32| -> Option<String> {
+        let (action, _) = PAD.iter().find(|(_, b)| *b == button)?;
+        keys.key_name(*action)
+    };
+    let flick = |button: u32| match button {
+        5 => " or flick the mouse up",
+        6 => " or flick the mouse down",
+        7 => " or flick the mouse left",
+        8 => " or flick the mouse right",
+        _ => "",
+    };
+    let first = *prompt.buttons.first()?;
+    Some(match prompt.mode.as_str() {
+        "hold" => format!("hold {}", key(first)?),
+        "alternate" => {
+            let second = *prompt.buttons.get(1)?;
+            format!("{} and {} in turn", key(first)?, key(second)?)
+        }
+        _ => format!("{}{}", key(first)?, flick(first)),
+    })
+}
+
 /// The pad, as the scripts number its buttons
 /// ([`m2_game::hijack::BUTTONS`]).
 const PAD: [(Action, u32); 8] = [
@@ -193,8 +260,8 @@ struct Active {
     actions: Vec<(u32, f64)>,
     /// Pad buttons held, as the scripts were last told.
     held: Vec<u32>,
-    /// The mouse flicked last tick (a flick presses once).
-    flicked: bool,
+    /// The mouse's motion of late, for a flick.
+    flick: Flick,
     /// Her hijack clip playing (an index into her rig's clips).
     clip: Option<usize>,
     /// The entrance, in the world when it started: the camera looks at it.
@@ -516,7 +583,7 @@ impl Hijacks {
             self.by_model = Some(by_model);
         }
         if self.active.is_some() {
-            self.pad(input);
+            self.pad(input, dt);
         } else {
             drain(input);
             self.near = self.find(game);
@@ -564,7 +631,7 @@ impl Hijacks {
     }
 
     /// Feeds the pad's presses and holds to the scripts.
-    fn pad(&mut self, input: &mut Input) {
+    fn pad(&mut self, input: &mut Input, dt: f32) {
         let (State::Ready(l), Some(a)) = (&mut self.state, &mut self.active) else {
             return;
         };
@@ -572,19 +639,15 @@ impl Hijacks {
         // PC HUD draws the face buttons as arrows (see
         // [`crate::input::Bindings`]; inferred).
         let (dx, dy) = input.take_mouse();
-        let flick = if dy.abs() > dx.abs() {
-            (dy.abs() > FLICK).then_some(if dy < 0.0 { 5 } else { 6 })
-        } else {
-            (dx.abs() > FLICK).then_some(if dx < 0.0 { 7 } else { 8 })
-        };
-        if let Some(button) = flick
-            && !a.flicked
-        {
+        if let Some((button, counts, seconds)) = a.flick.feed(dx, dy, f64::from(dt)) {
+            eprintln!(
+                "hijack: button {button} by a mouse flick ({counts:.0} counts in {seconds:.2} s)"
+            );
             l.mission.press(button);
         }
-        a.flicked = flick.is_some();
         for (action, button) in PAD {
             if input.take_pressed(action) {
+                eprintln!("hijack: button {button} pressed ({action:?})");
                 l.mission.press(button);
             }
             let down = input.held(action);
@@ -754,7 +817,7 @@ impl Hijacks {
                 set,
                 actions: Vec::new(),
                 held: Vec::new(),
-                flicked: false,
+                flick: Flick::default(),
                 clip: None,
                 // Over the entrance at the top of the vehicle, where the
                 // hijack plays out (the M1A2's driver's hatch is low on
@@ -2604,5 +2667,56 @@ mod tests {
             let ours = PAD.iter().find(|(_, n)| *n == number);
             assert!(ours.is_some(), "{name} ({number}) has no key");
         }
+    }
+
+    /// The Scorpion's rounds: press right (8), then tap down (6); a hold
+    /// and an alternate of the face buttons; a stick push no key names.
+    #[test]
+    fn the_keyboard_hint_names_the_keys_the_arrows_mean() {
+        let keys = crate::input::Bindings::default();
+        let game = |mode: &str, buttons: &[u32]| Minigame {
+            mode: mode.into(),
+            buttons: buttons.to_vec(),
+            left: 2.0,
+            hold: None,
+        };
+        let hint = |mode: &str, buttons: &[u32]| key_hint(&game(mode, buttons), &keys);
+        assert_eq!(
+            hint("press", &[8]).as_deref(),
+            Some("L or flick the mouse right")
+        );
+        assert_eq!(
+            hint("tap", &[6]).as_deref(),
+            Some("K or flick the mouse down")
+        );
+        assert_eq!(hint("hold", &[5]).as_deref(), Some("hold I"));
+        assert_eq!(
+            hint("alternate", &[7, 8]).as_deref(),
+            Some("J and L in turn")
+        );
+        assert_eq!(hint("press", &[12]).as_deref(), Some("S"));
+        assert_eq!(hint("press", &[]), None);
+    }
+
+    /// A flick spread over frames at 165 Hz (12 counts a frame, 40 crossed
+    /// on the fourth) presses once, whatever any one frame holds; a drift of
+    /// the same counts over a second presses nothing.
+    #[test]
+    fn a_flick_adds_up_across_frames_and_presses_once() {
+        let tick = 1.0 / 165.0;
+        let mut f = Flick::default();
+        let mut pressed = Vec::new();
+        for _ in 0..5 {
+            if let Some((b, counts, _)) = f.feed(0.0, 12.0, tick) {
+                pressed.push((b, counts));
+            }
+        }
+        assert_eq!(pressed, vec![(6, 48.0)]);
+        // Right, and up, by their larger axis.
+        assert_eq!(f.feed(50.0, 10.0, tick).map(|p| p.0), Some(8));
+        assert_eq!(f.feed(-10.0, -50.0, tick).map(|p| p.0), Some(5));
+        let mut slow = Flick::default();
+        let drift: Vec<_> = (0..165).filter_map(|_| slow.feed(0.0, 0.4, tick)).collect();
+        assert!(drift.is_empty(), "{drift:?}");
     }
 }

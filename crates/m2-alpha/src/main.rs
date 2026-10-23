@@ -339,6 +339,10 @@ struct Options {
     /// With `--screenshot` on foot and `--gait`: she goes on this long
     /// (seconds, default 3), logging where she is each second.
     walk_seconds: Option<f32>,
+    /// In play (the window, not `--screenshot`): open the pause menu as
+    /// Escape would, this many seconds after play begins. For testing what
+    /// pausing asks of the sound (the pause music).
+    pause_at: Option<f32>,
     /// With `--screenshot` on foot and `--gait`: put the nearest soldier
     /// this many metres ahead of her at the start, at the water's height
     /// there, and log each second whether he swims (`npc-swim:` lines).
@@ -835,6 +839,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--gates" => o.gates = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
+            "--pause-at" => o.pause_at = Some(value()?.parse()?),
             "--contracts" => {
                 o.contracts = value()?.parse().context("--contracts expects a count")?
             }
@@ -1090,6 +1095,7 @@ fn run(
         guns: options.guns.clone(),
         load: options.load.clone(),
         load_at: options.load_at,
+        pause_at: options.pause_at,
         successor: None,
         state: None,
         error: None,
@@ -6639,7 +6645,11 @@ fn blast_for_screenshot(
         game.combat.hp
     );
     if let Some(p) = &game.scene.particles {
-        eprintln!("blast: {} particles alive", p.live());
+        eprintln!(
+            "blast: {} particles alive, {:.2} m from the blast on average",
+            p.live(),
+            p.mean_distance(at)
+        );
     }
     for i in 0..(wait / tick) as usize {
         game.step(Intent::default(), tick);
@@ -6651,7 +6661,11 @@ fn blast_for_screenshot(
     game.step(Intent::default(), tick);
     render(backend, game, fov, aspect, None)?;
     if let Some(p) = &game.scene.particles {
-        eprintln!("blast: {} particles alive at the picture", p.live());
+        eprintln!(
+            "blast: {} particles alive at the picture, {:.2} m from the blast on average",
+            p.live(),
+            p.mean_distance(at)
+        );
     }
     Ok(())
 }
@@ -6997,6 +7011,9 @@ struct Running {
     /// When to load the player's own save as the pause menu does (`--load-at`):
     /// a test of loading in play.
     load_at: Option<Instant>,
+    /// When to open the pause menu as Escape does (`--pause-at`): a test of
+    /// pausing in play (the pause music).
+    pause_at: Option<Instant>,
 }
 
 struct App {
@@ -7044,6 +7061,7 @@ struct App {
     load: Option<save::SaveGame>,
     /// Seconds into play to load the player's own save (`--load-at`).
     load_at: Option<f32>,
+    pause_at: Option<f32>,
     /// The alpha started again (the pause menu's Quit, loading a save),
     /// which this one waits for once its window is closed.
     successor: Option<std::process::Child>,
@@ -7191,6 +7209,9 @@ impl App {
             load_at: self
                 .load_at
                 .map(|s| Instant::now() + Duration::from_secs_f32(s)),
+            pause_at: self
+                .pause_at
+                .map(|s| Instant::now() + Duration::from_secs_f32(s)),
         };
         running.apply_options(&self.config);
         Ok(running)
@@ -7316,6 +7337,14 @@ impl Running {
             // The game's own prompt (`Hijack %s`); the buttons it asks
             // for are the HUD's to draw.
             info.prompt = (!v.running).then(|| format!("Hijack {}", v.vehicle));
+            // With the keyboard, which keys the arrow means (playtest 12:
+            // no tap of 9 rounds reached the scripts).
+            if v.running && !self.input.pad() {
+                info.hijack_keys = v
+                    .prompts
+                    .first()
+                    .and_then(|p| hijack::key_hint(p, &config.keys));
+            }
             info.can_enter = None;
         }
         // The hijack scripts' calls to the HUD, taken whether it runs or
@@ -8089,6 +8118,13 @@ impl Running {
             self.load_at = None;
             eprintln!("load: --load-at: loading as the pause menu does");
             self.load_from(&save::SaveGame::default_path());
+        }
+        // `--pause-at`: Escape, by the clock, to test pausing in a window.
+        if self.pause_at.is_some_and(|at| Instant::now() >= at) && !self.hud.menu {
+            self.pause_at = None;
+            eprintln!("pause: --pause-at: opening the pause menu as Escape does");
+            self.hud.pause_settings = self.pause_settings(config);
+            self.open_menu();
         }
         if self.input.take_pressed(Action::ToggleMusic) {
             self.audio.toggle_music();

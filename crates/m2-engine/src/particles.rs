@@ -39,8 +39,8 @@
 //! Invented (no data decides them yet): how particles move once given off
 //! ([`RISE`], [`DRAG`]: emitters' `FRCE` forces are decoded but not
 //! applied), how long a constant-rate emitter runs in a one-off effect
-//! ([`ONE_OFF`]), the emitter shapes (`EMTR`, not decoded: every particle
-//! starts at its emitter's place) and the particle budgets.
+//! ([`ONE_OFF`]), which way a particle leaves its shape (along its
+//! patch's normal; inferred) and the particle budgets.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
@@ -77,13 +77,31 @@ const EMITTER_BUDGET: usize = 400;
 /// Most particles in the world.
 const BUDGET: usize = 12_000;
 
+/// One patch of an emitter's shape ([`m2_assets::effect::Triangle`]),
+/// where its particles start: its corners and normal in the emitter's
+/// own space, and the shape's area up to and including it, for picking
+/// a patch by area.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Patch {
+    pub corners: [Vec3; 3],
+    pub normal: Vec3,
+    pub up_to: f32,
+}
+
 /// One emitter's settings, read once.
 #[derive(Debug, Clone)]
 pub struct EmitterSpec {
     /// Where it sits in the effect, metres.
     pub offset: Vec3,
+    /// Its turn (`TRFM`'s rotation), which its shape and axis follow.
+    pub pose: Quat,
     /// The way it points (its turn applied to up).
     pub axis: Vec3,
+    /// The shape its particles start on, as the effect's `EMTR` stores
+    /// it (from samples); empty for the 9 emitters without one, which
+    /// start at the emitter. That a particle flies out along its patch's
+    /// normal is inferred: the normals are stored per patch, not derived.
+    pub shape: Vec<Patch>,
     pub size: Attr,
     pub size_var: f32,
     pub life: Attr,
@@ -109,8 +127,23 @@ pub struct EmitterSpec {
 }
 
 impl EmitterSpec {
-    fn read(e: &effect::Emitter, atlas: &Atlas) -> Self {
+    fn read(e: &effect::Emitter, fx: &Effect, atlas: &Atlas) -> Self {
         let p = &e.particle;
+        let mut up_to = 0.0;
+        let shape: Vec<Patch> = e
+            .shape()
+            .and_then(|(index, _)| fx.shape_triangles(index))
+            .unwrap_or_default()
+            .iter()
+            .map(|t| {
+                up_to += t.area.max(0.0);
+                Patch {
+                    corners: t.corners.map(Vec3::from_array),
+                    normal: Vec3::from_array(t.normal),
+                    up_to,
+                }
+            })
+            .collect();
         let attr = |name| effect::find(p, name).cloned().unwrap_or_else(|| zero(name));
         let num = |name| effect::find(p, name).map_or(0.0, |a| a.at(0.0));
         let t = &e.transform;
@@ -128,7 +161,9 @@ impl EmitterSpec {
                 place(setting::POS_Y),
                 place(setting::POS_Z),
             ),
+            pose: turn,
             axis: turn * Vec3::Y,
+            shape,
             size: attr(setting::SIZE),
             size_var: num(setting::SIZE_VAR),
             life: attr(setting::LIFE),
@@ -194,7 +229,7 @@ impl EffectSpec {
             emitters: fx
                 .emitters
                 .iter()
-                .map(|e| EmitterSpec::read(e, atlas))
+                .map(|e| EmitterSpec::read(e, fx, atlas))
                 .collect(),
         }
     }
@@ -511,11 +546,18 @@ impl Particles {
         let sin = (1.0 - cos * cos).max(0.0).sqrt();
         let around = self.random() * std::f32::consts::TAU;
         let local = Vec3::new(sin * around.cos(), cos, sin * around.sin());
-        let dir = Quat::from_rotation_arc(Vec3::Y, e.axis.normalize_or(Vec3::Y)) * local;
+        // On its shape, flying out along the patch's normal (the patch's
+        // own space turned as the emitter is); with no shape, at the
+        // emitter, along its axis.
+        let (start, axis) = match self.on_shape(e) {
+            Some((p, n)) => (e.pose * p, e.pose * n),
+            None => (Vec3::ZERO, e.axis),
+        };
+        let dir = Quat::from_rotation_arc(Vec3::Y, axis.normalize_or(Vec3::Y)) * local;
         let speed = (e.speed.at(frame) + self.spread(e.speed_var)).max(0.0);
         let life = (e.life.at(frame) + self.spread(e.life_var)).max(0.05);
         Particle {
-            at: at + e.offset * scale,
+            at: at + (e.offset + start) * scale,
             velocity: dir * speed * scale,
             age: 0.0,
             life,
@@ -523,6 +565,43 @@ impl Particles {
             turn: self.spread(e.turn * 0.5).to_radians(),
             spin: e.spin.to_radians(),
             emitter,
+        }
+    }
+
+    /// A point on emitter `e`'s shape, in the shape's own space, and the
+    /// normal of the patch it is on: patches by their area, points evenly
+    /// within one. `None` for an emitter without a shape.
+    fn on_shape(&mut self, e: &EmitterSpec) -> Option<(Vec3, Vec3)> {
+        let total = e.shape.last()?.up_to;
+        let pick = self.random() * total;
+        let patch = e
+            .shape
+            .iter()
+            .find(|p| p.up_to >= pick)
+            .or(e.shape.last())?;
+        // Even over a triangle: the square root keeps the far corners
+        // from crowding.
+        let r1 = self.random().sqrt();
+        let r2 = self.random();
+        let [a, b, c] = patch.corners;
+        Some((
+            a * (1.0 - r1) + b * (r1 * (1.0 - r2)) + c * (r1 * r2),
+            patch.normal,
+        ))
+    }
+
+    /// How far the particles sit from `centre` on average, metres (0 with
+    /// none): a measure of an effect's spread, for the logs.
+    pub fn mean_distance(&self, centre: Vec3) -> f32 {
+        let all: Vec<f32> = self
+            .instances
+            .iter()
+            .flat_map(|i| i.particles.iter().map(|p| p.at.distance(centre)))
+            .collect();
+        if all.is_empty() {
+            0.0
+        } else {
+            all.iter().sum::<f32>() / all.len() as f32
         }
     }
 
@@ -606,7 +685,9 @@ mod tests {
     fn burst() -> EmitterSpec {
         EmitterSpec {
             offset: Vec3::Y,
+            pose: Quat::IDENTITY,
             axis: Vec3::Y,
+            shape: Vec::new(),
             size: keyed(&[(0.0, 1.0), (99.0, 3.0)]),
             size_var: 0.0,
             life: plain(1.0),
@@ -640,6 +721,69 @@ mod tests {
             by_template: HashMap::from([(0x8000_0001, vec![7, 99])]),
             ..Library::default()
         }
+    }
+
+    /// An emitter with a shape of two patches, one four times the other's
+    /// area and 10 m up, turned a quarter about Y: particles start on the
+    /// patches (turned), four in five on the big one, and fly out along
+    /// the patch's turned normal.
+    #[test]
+    fn particles_start_on_their_shape_by_area_and_leave_along_its_normal() {
+        let mut e = burst();
+        e.offset = Vec3::ZERO;
+        e.speed = plain(2.0);
+        e.pose = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        // The small patch lies in the XZ plane at the origin, normal +Y;
+        // the big one in the XY plane 10 m up, normal +Z.
+        e.shape = vec![
+            Patch {
+                corners: [Vec3::ZERO, Vec3::X, Vec3::Z],
+                normal: Vec3::Y,
+                up_to: 0.5,
+            },
+            Patch {
+                corners: [
+                    Vec3::new(0.0, 10.0, 0.0),
+                    Vec3::new(2.0, 10.0, 0.0),
+                    Vec3::new(0.0, 12.0, 0.0),
+                ],
+                normal: Vec3::Z,
+                up_to: 2.5,
+            },
+        ];
+        let lib = library(e);
+        let mut p = Particles::default();
+        p.spawn(&lib, 7, Vec3::new(100.0, 0.0, 0.0), 0.0, 1.0);
+        p.step(&lib, 0.1);
+        let (mut small, mut big) = (0, 0);
+        for q in &p.instances[0].particles {
+            let local = Vec3::new(100.0, 0.0, 0.0) - q.at;
+            if q.at.y < 1.0 {
+                small += 1;
+                // Turned a quarter about Y, the XZ patch stays in XZ,
+                // within its triangle's reach, flying up.
+                assert!(local.length() <= 1.0 + 1e-3, "{:?}", q.at);
+                assert!(
+                    q.velocity.abs_diff_eq(Vec3::Y * 2.0, 1e-3),
+                    "{:?}",
+                    q.velocity
+                );
+            } else {
+                big += 1;
+                // X turned onto -Z: the patch spans z in -2..0 and y in
+                // 10..12, and its +Z normal turned onto +X.
+                assert!((10.0..=12.0).contains(&q.at.y), "{:?}", q.at);
+                assert!((-2.0 - 1e-3..=1e-3).contains(&(q.at.z)), "{:?}", q.at);
+                assert!(
+                    q.velocity.abs_diff_eq(Vec3::X * 2.0, 1e-3),
+                    "{:?}",
+                    q.velocity
+                );
+            }
+        }
+        assert_eq!(small + big, 30);
+        assert!(big > 18 && small > 1, "{small} small, {big} big");
+        assert!(p.mean_distance(Vec3::new(100.0, 0.0, 0.0)) > 7.0);
     }
 
     #[test]

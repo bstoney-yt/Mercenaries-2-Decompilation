@@ -2638,7 +2638,8 @@ impl Scene {
             self.draw_ground(queue);
         }
         if let Some(world) = &self.world {
-            for v in &mut self.vehicles {
+            let driven = self.player.as_ref().and_then(|p| p.driving);
+            for (i, v) in self.vehicles.iter_mut().enumerate() {
                 // A wreck shows its wrecked body, turret and wheels; else
                 // its parts as they stand, once any has been hurt.
                 v.model.wrecked = v.wrecked;
@@ -2656,7 +2657,24 @@ impl Scene {
                 let Some(at) = world.physics.vehicle_transform(id) else {
                     continue;
                 };
-                v.model.braking = Some(world.physics.vehicle_braking(id));
+                // Its lamps: brake lamps while its driver brakes, reversing
+                // lamps while it rolls backwards (inferred: the game's
+                // lamp nodes are named only by their place and colour;
+                // headlights wait for a night).
+                let lamps = m2_engine::model::Lamps {
+                    brake: world.physics.vehicle_braking(id),
+                    reverse: world.physics.vehicle_rolling(id) < -0.3,
+                    head: false,
+                };
+                if lamps != v.model.lamps && driven == Some(i) {
+                    eprintln!(
+                        "lamps: {}: brake {}, reversing {}",
+                        v.spec.label,
+                        if lamps.brake { "lit" } else { "off" },
+                        if lamps.reverse { "lit" } else { "off" }
+                    );
+                }
+                v.model.lamps = lamps;
                 let mut nodes = v.spec.posed_nodes(
                     &world.physics.vehicle_wheels(id),
                     v.rolled,

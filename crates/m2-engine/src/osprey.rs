@@ -689,6 +689,7 @@ pub fn model() -> CpuModel {
         breakup: None,
         parts: None,
         looks: None,
+        lamp_nodes: Default::default(),
     }
 }
 
