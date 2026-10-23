@@ -3599,7 +3599,20 @@ impl Autoplay {
         }
         let mut intent = Intent::default();
         match support.phase {
-            Phase::Idle => intent.trigger.support = true,
+            Phase::Idle => {
+                // A bunker buster she holds goes on what only one brings
+                // down (JetCon001's bunker: the contract hands her three,
+                // `Munitions.PickupMunitions`); else the menu's line stands.
+                if let Some(i) = game
+                    .support
+                    .entries()
+                    .iter()
+                    .position(|e| matches!(e, Entry::Stocked(s) if s.key == "bunkerbuster"))
+                {
+                    game.support.selected = i;
+                }
+                intent.trigger.support = true;
+            }
             Phase::Menu => intent.use_pressed = true,
             // The view opens by itself.
             Phase::Holding { .. } => {}

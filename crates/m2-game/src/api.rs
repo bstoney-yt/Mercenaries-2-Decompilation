@@ -691,6 +691,13 @@ pub struct ScriptWorld {
     /// closing, so the `"gateFullyClosed"` physics event holds as soon as
     /// they are shut).
     pub shut: HashSet<u32>,
+    /// Objects the scripts removed (`Object.Remove`) while alive: gone,
+    /// not dead, so an `ObjectDeath` on them never fires (inferred:
+    /// JetCon001's death events on its bunker busters outlive their
+    /// pickup, `Event.Delete` being handed their names, and the
+    /// munitions taken up are removed; were removal a death, the
+    /// contract would cancel itself every time).
+    pub removed_alive: HashSet<u32>,
     /// Seconds the gates still hear her last honk ([`HONK_HEARD`]): until
     /// then they know her for who she is, and she is a candidate for
     /// their opening as their script judges her.
@@ -1035,6 +1042,9 @@ impl World for ScriptWorld {
             .player
             .is_some_and(|p| a == p || self.vehicle_of(p) == Some(a));
         hers && self.gates.contains(&gate) && self.honk_heard <= 0.0
+    }
+    fn died(&self, guid: u32) -> bool {
+        !self.is_alive(guid) && !self.removed_alive.contains(&guid)
     }
     fn physics_event(&self, object: u32, name: &str) -> Option<bool> {
         match name {
@@ -1750,7 +1760,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&object, "Remove", |w, _, a| {
         if let Some(guid) = id(a.first()) {
-            w.objects.remove(&guid);
+            if w.objects.remove(&guid).is_some_and(|o| o.alive) {
+                w.removed_alive.insert(guid);
+            }
             w.inventory.drop(guid);
             w.commands.push(Command::Remove(guid));
         }
@@ -2394,9 +2406,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([Value::Table(t)])
     })?;
-    // One player, numbered 1.
+    // One player, guid 1, as userdata (from the scripts:
+    // `MrxGuiBase.WidgetManager.GetWidgetByNameAndOwner` answers only for
+    // a userdata owner, so a number found none of her widgets, the PDA
+    // among them; the game HUD's thread answered the same already).
     for name in ["GetLocalPlayer", "GetPrimaryPlayer"] {
-        add(&player, name, |_, _, _| values([Value::Integer(1)]))?;
+        add(&player, name, |_, _, _| values([guid_value(Some(1))]))?;
     }
     add(&player, "GetSecondaryPlayer", |_, _, _| {
         values([Value::Nil])
@@ -2407,7 +2422,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // The players, a list the scripts go through (`pairs`, `ipairs`)...
     add(&player, "GetAllPlayers", |_, lua, _| {
         let t = lua.create_table()?;
-        t.raw_push(1)?;
+        t.raw_push(guid_value(Some(1)))?;
         values([Value::Table(t)])
     })?;
     // ...and how many there are, which they compare and count with
@@ -4824,6 +4839,22 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((more, n), (false, 1));
+    }
+
+    #[test]
+    fn an_object_removed_alive_is_gone_not_dead() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(80, Object::new("JetCon001_BunkerBuster03", [0.0; 3]));
+            w.insert(81, Object::new("VZ Soldier", [0.0; 3]));
+        }
+        host.lua()
+            .load("Object.Remove(Pg.GetGuidByName('JetCon001_BunkerBuster03')) Object.Kill(Pg.GetGuidByName('VZ Soldier'))")
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        assert_eq!((w.died(80), w.died(81)), (false, true));
     }
 
     #[test]

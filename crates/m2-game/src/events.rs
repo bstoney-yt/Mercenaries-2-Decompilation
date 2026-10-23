@@ -87,6 +87,11 @@ pub trait World {
     fn physics_event(&self, _object: u32, _name: &str) -> Option<bool> {
         None
     }
+    /// Whether it died: not alive, and not merely taken out of play
+    /// (`ObjectDeath` fires on this; see `ScriptWorld::removed_alive`).
+    fn died(&self, guid: u32) -> bool {
+        !self.is_alive(guid)
+    }
     /// Whether it got into (or out of) its seat at once, put there by a
     /// script.
     fn seated_instantly(&self, _guid: u32) -> bool {
@@ -1058,7 +1063,7 @@ fn check(
                     if let Some(k) = world.killer(g) {
                         pass.extend([Value::Nil, id(k)]);
                     }
-                    (g, !world.is_alive(g), pass)
+                    (g, world.died(g), pass)
                 })
                 .collect(),
         ),
