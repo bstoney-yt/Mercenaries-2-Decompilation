@@ -6625,9 +6625,11 @@ fn blast_for_screenshot(
     render(backend, game, fov, aspect, None)?;
     if let Some(p) = &game.scene.particles {
         eprintln!(
-            "blast: {} particles alive at the picture, {:.2} m from the blast on average",
+            "blast: {} particles alive at the picture, {:.2} m from the blast on average, {} draws, {} lights",
             p.live(),
-            p.mean_distance(at)
+            p.mean_distance(at),
+            p.draw_runs,
+            p.lights_lit()
         );
     }
     Ok(())

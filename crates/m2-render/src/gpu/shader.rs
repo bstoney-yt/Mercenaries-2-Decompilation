@@ -86,7 +86,37 @@ struct Frame {
     // y: scale on what it mirrors, z: how far it looks (metres; see
     // `scene_mirror`)
     mirror: vec4<f32>,
+    // Point lights, two rows each: xyz position, w inner reach; rgb
+    // colour (brightness included), a outer reach (0: none)
+    lights: array<vec4<f32>, 16>,
+    // x: how many of them
+    light_info: vec4<f32>,
 };
+
+// The point lights' light on a surface at `p` facing `n`, summed as the
+// game's shaders do: each light's colour times saturate(d * a + b) (1
+// within its inner reach, 0 at its outer) times N.L, in display values
+// when light is summed in them.
+fn point_lights(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    var sum = vec3<f32>(0.0);
+    let count = i32(frame.light_info.x);
+    for (var i = 0; i < count; i = i + 1) {
+        let a = frame.lights[i * 2];
+        let b = frame.lights[i * 2 + 1];
+        if b.a <= 0.0 {
+            continue;
+        }
+        let to = a.xyz - p;
+        let d = length(to);
+        let reach = clamp((b.a - d) / max(b.a - a.w, 1e-3), 0.0, 1.0);
+        if reach <= 0.0 {
+            continue;
+        }
+        let n_dot_l = max(dot(n, to / max(d, 1e-3)), 0.0);
+        sum = sum + light_to_display(b.rgb) * reach * n_dot_l;
+    }
+    return sum;
+}
 
 // The game lights surfaces in display values: the sun's colour times
 // N.L and shadow, plus the ambient light, summed there. With
@@ -814,9 +844,10 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
             surface_n = -surface_n;
         }
         let shade = sunlight(v.world_pos, surface_n);
+        let points = point_lights(v.world_pos, n);
         var lit: vec3<f32>;
         if ground {
-            let sun = light_to_display(surface_sun()) * max(n_dot_l, 0.0) * shade;
+            let sun = light_to_display(surface_sun()) * max(n_dot_l, 0.0) * shade + points;
             lit = rgb * light_from_display(sun + ambient_display(n));
         } else {
             var sun = light_to_display(surface_sun()) * max(n_dot_l, 0.0) * shade;
@@ -825,7 +856,9 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
                 // the side the sun doesn't reach.
                 sun = sun + light_to_display(frame.rim.rgb) * max(frame.rim.a - dot(n, view), 0.0) * (1.0 - max(n_dot_l, 0.0));
             }
-            let direct = clamp(sun, vec3<f32>(0.0), vec3<f32>(1.0));
+            // The point lights past the clamp: the game's shaders sum them
+            // unclamped (an explosion's flash, 12 times white, blows out).
+            let direct = clamp(sun, vec3<f32>(0.0), vec3<f32>(1.0)) + points;
             lit = rgb * light_from_display(direct * material.direct.rgb + ambient_display(n) * material.ambient.rgb);
         }
         var tint = vec3<f32>(1.0);

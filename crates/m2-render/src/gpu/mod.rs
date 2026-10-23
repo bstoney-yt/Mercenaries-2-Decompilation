@@ -26,7 +26,7 @@ use ::wgpu::util::DeviceExt;
 use m2_math::glam::{Mat4, Vec3};
 
 use crate::backend::{
-    BackendError, DrawCall, Geometry, LiveBuffers, RenderBackend, Topology, View,
+    BackendError, DrawCall, Geometry, LiveBuffers, POINT_LIGHTS, RenderBackend, Topology, View,
 };
 use crate::buffer::{
     IndexBufferDesc, IndexBufferHandle, IndexFormat, RawHandle, SkinHandle, VertexBufferDesc,
@@ -275,6 +275,11 @@ struct FrameUniforms {
     /// (`M2_SEA_MIRROR=<x>`, 1 by default), z the farthest it looks
     /// (metres).
     mirror: [f32; 4],
+    /// Point lights, two rows each: position and inner reach; colour and
+    /// outer reach ([`PointLight`]).
+    lights: [[f32; 4]; 2 * POINT_LIGHTS],
+    /// x: how many of them.
+    light_info: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -2094,6 +2099,20 @@ impl WgpuBackend {
                     0.0,
                 ]
             },
+            lights: {
+                let mut rows = [[0.0f32; 4]; 2 * POINT_LIGHTS];
+                for (i, p) in l.point_lights.iter().enumerate() {
+                    rows[i * 2] = p.position.extend(p.inner).to_array();
+                    rows[i * 2 + 1] = p.color.extend(p.outer).to_array();
+                }
+                rows
+            },
+            light_info: [
+                l.point_lights.iter().filter(|p| p.outer > 0.0).count() as f32,
+                0.0,
+                0.0,
+                0.0,
+            ],
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
