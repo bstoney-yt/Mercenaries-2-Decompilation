@@ -181,6 +181,9 @@ pub struct Game {
     pub placed: crate::placed::Placed,
     /// The scripts have turned her controls off (a loading fade).
     pub input_locked: bool,
+    /// The scripts' countdown ticked since autoplay last looked (a
+    /// `ui_HUD_Timer_` cue: OilCon002's 15 minutes).
+    pub countdown_tick: bool,
     /// Models taken only by their action hijack while crewed (an entrance
     /// in the data, [`crate::hijack`]): the use key doesn't get her in.
     pub hijack_only: HashSet<u32>,
@@ -385,6 +388,7 @@ impl Game {
             refused: std::collections::HashSet::new(),
             placed: crate::placed::Placed::default(),
             input_locked: false,
+            countdown_tick: false,
             hijack_only: HashSet::new(),
             unusable: HashSet::new(),
             support_hp: 0.0,
