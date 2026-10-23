@@ -121,6 +121,9 @@ const STRANDED_HOP: u32 = 2;
 /// A thing to blow up lower than this (metres) over the waterline is on
 /// the water. Invented.
 const AFLOAT: f32 = 3.0;
+/// Within this (metres) of a boat she can tell there is no dry ground in
+/// range of it: the ground round it is loaded. Invented.
+const DRY_JUDGED: f32 = 150.0;
 /// Ground this far (metres) below her feet a step ahead is a drop she
 /// doesn't step closer over. Invented.
 const LEDGE_DROP: f32 = 3.0;
@@ -2333,8 +2336,11 @@ impl Autoplay {
             }
             // On the water with no dry ground in range of it (rounds 30 to
             // 37's first boat: she went in after it every time): another
-            // for now, this one once the rest are done.
+            // for now, this one once the rest are done. Only judged from near
+            // enough for the ground round it to be in (round 39: all three
+            // boats passed over from 500 m, the third with dry ground by it).
             if self.blast_spot.is_none()
+                && d < DRY_JUDGED
                 && at.y < WATERLINE + AFLOAT
                 && !self
                     .passed
