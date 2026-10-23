@@ -2214,6 +2214,12 @@ end
         self.events.sight_watched(&*self.world.borrow())
     }
 
+    /// The regions pending `Boundary` events wait for something to leave
+    /// ([`crate::events::Events::exits_watched`]).
+    pub fn exits_watched(&self) -> Vec<u32> {
+        self.events.exits_watched(&*self.world.borrow())
+    }
+
     /// The objects the game found behind something solid from the camera
     /// (of those [`sight_watched`](Self::sight_watched) named): not on
     /// screen, though in view.

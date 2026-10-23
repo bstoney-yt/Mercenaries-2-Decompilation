@@ -74,8 +74,9 @@ const SNIPE_WIDTH: f32 = 0.4;
 /// reach) is blown up instead (invented).
 const RIFLE_TRY: f32 = 20.0;
 /// Targets that rounds break she shoots from within this far (metres;
-/// invented, the ranges' furthest statues from their towers).
-const SNIPE_RANGE: f32 = 130.0;
+/// invented, the ranges' furthest statues from their towers: PmcCon034's
+/// Easy9, 151 m from where she shoots on the HQ's roof).
+const SNIPE_RANGE: f32 = 170.0;
 /// Shooting a target with her rifle she fires this long (seconds) of
 /// every so long (invented). TAP_FOR: f32 = 0.12; TAP_EVERY: f32 = 0.5;
 const BLAST_RANGE: (f32, f32) = (15.0, 45.0);
@@ -479,9 +480,45 @@ struct Way {
     standing: Vec<usize>,
 }
 
+/// A region she must not leave (the scripts end the contract when she
+/// does): its outline, placed at `centre` (x, z) turned by `yaw`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Keep {
+    pub region: m2_assets::region::Region,
+    pub centre: [f32; 2],
+    pub yaw: f32,
+}
+
+impl Keep {
+    /// Whether `p` is within it (it has no height).
+    pub fn holds(&self, p: Vec3) -> bool {
+        self.region.contains(self.centre, self.yaw, p.x, p.z)
+    }
+}
+
+/// A round of hers that would strike something this much short of the
+/// target (metres) has no clear shot at it (invented: more than a
+/// statue's depth).
+const SHOT_SHORT: f32 = 3.0;
+/// Within the scripts' bounds, what she can't shoot from where she is is
+/// passed over for this long (seconds; invented: short of PmcCon034's
+/// 90 s for all its targets).
+const KEEP_PASS: f32 = 15.0;
+/// With no clear shot she looks for a spot to shoot from on rings this
+/// far round her (metres), on ground no more than this above or below
+/// hers (her roof), the way to it sampled this often (metres), and is
+/// there within this (all invented).
+const PERCH_RINGS: [f32; 8] = [3.0, 6.0, 9.0, 12.0, 16.0, 20.0, 25.0, 30.0];
+const PERCH_LEVEL: f32 = 1.5;
+const PERCH_STRIDE: f32 = 1.0;
+const PERCH_ARRIVE: f32 = 1.0;
+
 /// The player playing herself.
 #[derive(Debug, Default)]
 pub struct Autoplay {
+    /// The regions she must stay within (set each tick:
+    /// [`crate::mission::MissionLink::kept_within`]).
+    pub keep: Vec<Keep>,
     /// What the scripts wait for her to see (`Event.ObjectIsVisible`:
     /// PmcCon001's hall column, which brings the tank through the wall):
     /// where each is, set each tick ([`crate::mission::MissionLink::
@@ -524,6 +561,13 @@ pub struct Autoplay {
     rifle_on: Option<(u32, f32)>,
     /// The templates of targets that stood through her rifle that long.
     rifle_failed: std::collections::HashSet<u32>,
+    /// Whether her rifle, last aimed, had no clear shot (and nowhere on
+    /// her level to see the target from).
+    blocked_logged: bool,
+    /// Where she goes to shoot the target her rifle is on from (a spot on
+    /// her own level, [`perch`]), and since when; the spots no better.
+    perch: Option<(Vec3, f32)>,
+    perch_tried: Vec<Vec3>,
     /// Where she is swimming to climb out of the water (see [`landing`]).
     landing: Option<Vec3>,
     /// Searches in a row for a spot to fire from that found none, and the
@@ -1494,7 +1538,11 @@ impl Autoplay {
             };
             // Far off, on foot, with a ride close: driven there (round
             // 4's AllCon002 walked 600 m to the boats while Caracas fell).
+            // Not within the scripts' bounds, where she shoots from where
+            // she is (PmcCon034 round 9 of its thread: off the HQ's roof
+            // for the Phoenix by it, statues 122 m off).
             if driving.is_none()
+                && self.keep.is_empty()
                 && at.distance(here) > RIDE_FOR
                 && let Some(i) = self.ride_near(game, here, &live)
             {
@@ -2398,13 +2446,135 @@ impl Autoplay {
         // What rounds break is shot at from further: from her sniper
         // tower, which she may not leave (PmcCon034 round 8: she walked
         // off it for a statue 98 m off, and left the contract's bounds).
-        let range = if takes_rounds(game, target) {
+        // So too a vehicle to destroy (PmcCon034's Easy16-19 "statues" are
+        // L300 racing cars: she walked off the HQ's roof for one 97 m off,
+        // round 7 of its thread).
+        let a_vehicle = game
+            .scene
+            .vehicles
+            .iter()
+            .any(|v| v.guid == Some(target) && !v.wrecked);
+        // Within the scripts' bounds, anything from where she stands.
+        let range = if takes_rounds(game, target) || a_vehicle || !self.keep.is_empty() {
             SNIPE_RANGE
         } else {
             SHOOT_RANGE
         };
+        // Within bounds, what is out of her reach, or has stood through
+        // her rifle, is passed over for now rather than walked to
+        // (PmcCon034 round 8 of its thread: off the HQ's roof for a bonus
+        // statue 64 m off, she fell 15 m and the scripts took her weapons).
+        let tried_out = self
+            .rifle_on
+            .is_some_and(|(t, spent)| t == target && spent >= RIFLE_TRY);
+        // Nor what her rounds don't wear (the bonus statues: each stood 20 s
+        // of them, round 13), with the contract's clock running (90 s for
+        // all 19 the first time, its `nTimeLimit`).
+        let unworn = !takes_rounds(game, target) && !a_vehicle;
+        if !self.keep.is_empty() && (at.distance(here) > range || tried_out || unworn) {
+            let again = self
+                .passed
+                .iter()
+                .any(|&(t, until)| t == target && self.clock < until);
+            if again {
+                return Intent::default();
+            }
+            eprintln!(
+                "autoplay {:.1} s: passing over {target:#x} for now ({:.0} m off, {})",
+                self.clock,
+                at.distance(here),
+                if tried_out {
+                    "stood through her rifle"
+                } else if unworn {
+                    "her rounds don't wear it"
+                } else {
+                    "out of her reach"
+                }
+            );
+            self.passed.push((target, self.clock + KEEP_PASS));
+            self.rifle_on = None;
+            return Intent::default();
+        }
         if at.distance(here) > range {
             return self.walk(game, at, range - 5.0, dt);
+        }
+        // What of it she can see (its middle hidden, a side of it).
+        let at = visible_part(game, target, at, Combat::aim_ray(p).0).unwrap_or(at);
+        let (look, error) = aim(p, at, dt);
+        // Far off, the crosshair is held on it closer: 0.03 rad is 3 m at
+        // 98 m, wider than a statue (PmcCon034 round 21: 20 anti-material
+        // rounds, none broke one). The width is invented.
+        let on = ON_TARGET.min(SNIPE_WIDTH / at.distance(p.eye()).max(1.0));
+        self.steady = if error < on { self.steady + dt } else { 0.0 };
+        // Aimed, a round would strike something of the world's well short
+        // of it (PmcCon034 round 1 of its thread: all 24 anti-material
+        // rounds on the HQ's roof she stands on, 7 m off, the statue 98 m
+        // off and 35 m below): she goes to a spot on her own level she can
+        // see it from ([`perch`]), within the scripts' bounds; no round
+        // fired, nor her time with it counted, on the way. Judged once
+        // aimed.
+        if self.rifle_on.is_none_or(|(t, _)| t != target) {
+            self.perch = None;
+            self.perch_tried.clear();
+            self.blocked_logged = false;
+        }
+        if self.steady > STEADY && self.perch.is_none() {
+            let was = self.blocked_logged;
+            self.blocked_logged = game.scene.world.as_ref().is_some_and(|w| {
+                Combat::aim_probe(&w.physics, &game.scene.people, p).is_some_and(|(t, who)| {
+                    // From where her shot starts (in front of the camera).
+                    who.is_none() && t < at.distance(Combat::aim_ray(p).0) - SHOT_SHORT
+                })
+            });
+            if self.blocked_logged && !was {
+                let spot = game
+                    .scene
+                    .world
+                    .as_ref()
+                    .and_then(|w| perch(&w.physics, at, here, &self.perch_tried, &self.keep));
+                eprintln!(
+                    "autoplay {:.1} s: no clear shot at {target:#x} from {here:.1}: {}",
+                    self.clock,
+                    spot.map_or(
+                        "nowhere on her level to see it from".to_owned(),
+                        |s| format!("going to {s:.1}")
+                    )
+                );
+                self.perch_tried.push(here);
+                if let Some(s) = spot {
+                    self.perch = Some((s, self.clock));
+                    self.blocked_logged = false;
+                } else if !self.keep.is_empty() {
+                    // Nowhere within bounds to see it from: the others first.
+                    self.passed.push((target, self.clock + KEEP_PASS));
+                    self.rifle_on = None;
+                    return Intent::default();
+                }
+            }
+        }
+        if let Some((spot, since)) = self.perch {
+            // Or where she sees it from on the way (round 13: 20 s walking
+            // to a spot 2.6 m off, the statue in sight 1 m on).
+            let eye = Combat::aim_ray(p).0;
+            let seen = game.scene.world.as_ref().is_some_and(|w| {
+                let (dir, len) = ((at - eye).normalize_or_zero(), at.distance(eye));
+                w.physics
+                    .cast_ray(eye, dir, (len - SHOT_SHORT).max(0.0))
+                    .is_none()
+            });
+            let there = seen || spot.with_y(0.0).distance(here.with_y(0.0)) < PERCH_ARRIVE;
+            if !there && self.clock - since < SPOT_GIVE_UP {
+                // Not `arrived` where she stood (walk would keep her there).
+                self.arrived = None;
+                return self.walk(game, spot, PERCH_ARRIVE * 0.5, dt);
+            }
+            // There (or no nearer after a while): aimed again, she judges
+            // the shot from here.
+            if !there {
+                self.perch_tried.push(spot);
+            }
+            self.perch = None;
+            self.steady = 0.0;
         }
         match &mut self.rifle_on {
             Some((t, spent)) if *t == target => *spent += dt,
@@ -2416,20 +2586,16 @@ impl Autoplay {
                 self.rifle_on = Some((target, dt));
             }
         }
-        let (look, error) = aim(p, at, dt);
-        // Far off, the crosshair is held on it closer: 0.03 rad is 3 m at
-        // 98 m, wider than a statue (PmcCon034 round 21: 20 anti-material
-        // rounds, none broke one). The width is invented.
-        let on = ON_TARGET.min(SNIPE_WIDTH / at.distance(p.eye()).max(1.0));
-        self.steady = if error < on { self.steady + dt } else { 0.0 };
+        let short = self.blocked_logged;
         Intent {
             look,
+            walk: true,
             trigger: Trigger {
                 aim: true,
                 // In short bursts, her spread settling between them (the
                 // weapons' bloom): held down, 240 rounds broke 8 of
                 // PmcCon032's 21 statues and her clips ran dry (round 13).
-                fire: self.steady > STEADY && self.clock.rem_euclid(TAP_EVERY) < TAP_FOR,
+                fire: !short && self.steady > STEADY && self.clock.rem_euclid(TAP_EVERY) < TAP_FOR,
                 select: (game.combat.weapon != Weapon::Rifle).then_some(Weapon::Rifle),
                 ..Trigger::default()
             },
@@ -3780,6 +3946,70 @@ fn vantage(
     best.map(|(_, s)| s)
 }
 
+/// A spot on her own level she can shoot `target` from with her rifle:
+/// on [`PERCH_RINGS`] round `from`, with ground under it no more than
+/// [`PERCH_LEVEL`] above or below hers and all the way to it (no drop
+/// off her roof between), nothing in her way there, within every region
+/// of `keep`, not within 2 m of a spot `tried`, and nothing between eye
+/// height there and the target's own body. Of the nearest ring with any,
+/// the one nearest the target.
+fn perch(
+    physics: &Physics,
+    target: Vec3,
+    from: Vec3,
+    tried: &[Vec3],
+    keep: &[Keep],
+) -> Option<Vec3> {
+    // Her level's ground at (x, z), if there is some.
+    let ground = |x: f32, z: f32| {
+        let top = Vec3::new(x, from.y + PERCH_LEVEL + 0.5, z);
+        physics
+            .cast_ray(top, Vec3::NEG_Y, 2.0 * PERCH_LEVEL + 0.5)
+            .filter(|&(_, n)| n.y >= 0.7)
+            .map(|(d, _)| Vec3::new(x, top.y - d, z))
+    };
+    for &r in &PERCH_RINGS {
+        let mut best: Option<(f32, Vec3)> = None;
+        for k in 0..24 {
+            let a = k as f32 * std::f32::consts::TAU / 24.0;
+            let Some(spot) = ground(from.x + r * a.sin(), from.z + r * a.cos()) else {
+                continue;
+            };
+            if tried.iter().any(|t| t.distance(spot) < 2.0) || !keep.iter().all(|k| k.holds(spot)) {
+                continue;
+            }
+            // The way there: ground at every stride, nothing at her middle.
+            let steps = (r / PERCH_STRIDE).ceil() as usize;
+            let floor = (1..steps).all(|i| {
+                let q = from.lerp(spot, i as f32 / steps as f32);
+                ground(q.x, q.z).is_some()
+            });
+            let waist = from + Vec3::Y * 1.0;
+            let to = spot + Vec3::Y * 1.0;
+            if !floor
+                || physics
+                    .cast_ray(waist, (to - waist).normalize_or_zero(), waist.distance(to))
+                    .is_some()
+            {
+                continue;
+            }
+            let eye = spot + Vec3::Y * 1.6;
+            let (dir, len) = ((target - eye).normalize_or_zero(), target.distance(eye));
+            if physics.cast_ray(eye, dir, (len - 1.5).max(0.0)).is_some() {
+                continue;
+            }
+            let cost = spot.distance(target);
+            if best.is_none_or(|(c, _)| cost < c) {
+                best = Some((cost, spot));
+            }
+        }
+        if let Some((_, s)) = best {
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// Where she can climb out of the water nearest `at`: ground on
 /// [`LANDING_RINGS`] round her, flat enough, no deeper than she can stand
 /// in and no more than [`SPOT_RISE`] over the water (round 27's AllCon002:
@@ -3936,6 +4166,32 @@ fn crossing(game: &Game, i: usize, m: Mat4) -> Option<usize> {
         let when = (-d.dot(closing) / closing.length_squared().max(1e-3)).clamp(0.0, CROSS_SECONDS);
         let meet = d + closing * when;
         when > 0.0 && meet.length() < CROSS_CLOSE && (d + theirs * when).dot(forward) > 0.0
+    })
+}
+
+/// Of target `g` (a vehicle or a prop, standing at `at`), a point she can
+/// see from `eye`: its middle, else one of its sides or its top, inside
+/// its box (PmcCon034 round 10 of its thread: a palm tree hid the middle
+/// of the L300 she was to destroy from all her roof). `None` for none.
+fn visible_part(game: &Game, g: u32, at: Vec3, eye: Vec3) -> Option<Vec3> {
+    let w = game.scene.world.as_ref()?;
+    let placed = game
+        .scene
+        .vehicles
+        .iter()
+        .position(|v| v.guid == Some(g) && !v.wrecked)
+        .and_then(|i| Some((vehicle_at(game, i)?, game.scene.vehicles[i].model.bounds)))
+        .or_else(|| game.scene.props.placed_bounds(g));
+    let mut points = vec![at];
+    if let Some((m, (lo, hi))) = placed {
+        let (c, h) = ((lo + hi) * 0.5, (hi - lo) * 0.35);
+        for d in [Vec3::X, Vec3::NEG_X, Vec3::Z, Vec3::NEG_Z, Vec3::Y] {
+            points.push(m.transform_point3(c + d * h));
+        }
+    }
+    points.into_iter().find(|&p| {
+        let (dir, len) = ((p - eye).normalize_or_zero(), p.distance(eye));
+        w.physics.cast_ray(eye, dir, (len - 1.5).max(0.0)).is_none()
     })
 }
 
@@ -4342,6 +4598,61 @@ mod tests {
         // Not the same spot twice.
         let next = vantage(&p, target, Vec3::ZERO, &[spot], &VANTAGE_RINGS, 1.0).expect("another");
         assert!(next.distance(spot) >= 4.0, "{next} is {spot} again");
+    }
+
+    // PmcCon034: on a roof 20 m up, the target 60 m off on the ground is
+    // hidden by the roof's own edge from its middle; she shoots from by
+    // the edge, on the roof, unless that is out of the scripts' bounds.
+    #[test]
+    fn a_sniper_on_a_roof_shoots_from_by_its_edge_within_bounds() {
+        use m2_engine::{CollisionShape, StaticKey};
+        let mut p = Physics::new();
+        let quad = |a: Vec3, b: Vec3, c: Vec3, d: Vec3| {
+            CollisionShape::mesh(&[a, b, c, d], &[[0, 1, 2], [0, 2, 3]]).unwrap()
+        };
+        let square = |half: f32, y: f32| {
+            quad(
+                Vec3::new(-half, y, -half),
+                Vec3::new(half, y, -half),
+                Vec3::new(half, y, half),
+                Vec3::new(-half, y, half),
+            )
+        };
+        p.add_static(
+            StaticKey::Cell(1),
+            &square(100.0, 0.0),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        p.add_static(
+            StaticKey::Cell(2),
+            &square(10.0, 20.0),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+        );
+        p.step(1.0 / 60.0);
+        let (from, target) = (Vec3::new(0.0, 20.0, 0.0), Vec3::new(0.0, 1.0, 60.0));
+        let eye = from + Vec3::Y * 1.6;
+        let dir = (target - eye).normalize();
+        assert!(
+            p.cast_ray(eye, dir, eye.distance(target) - 1.5).is_some(),
+            "the roof hides it from its middle"
+        );
+        let spot = perch(&p, target, from, &[], &[]).expect("somewhere on the roof");
+        assert!(spot.z > 4.0 && spot.z < 10.0, "not by the edge: {spot}");
+        assert!((spot.y - 20.0).abs() < 0.1, "not on the roof: {spot}");
+        // Bounds that end short of where it can be seen from: nowhere.
+        let keep = Keep {
+            region: m2_assets::region::Region {
+                flags: 0,
+                unk_0x04: 0,
+                corners: vec![[-20.0, -20.0], [20.0, -20.0], [20.0, 4.0], [-20.0, 4.0]],
+            },
+            centre: [0.0, 0.0],
+            yaw: 0.0,
+        };
+        assert!(keep.holds(from) && !keep.holds(spot));
+        assert_eq!(perch(&p, target, from, &[], &[keep]), None);
     }
 
     // Ground under the sea (round 6's riverbed): no spot to fire from.
