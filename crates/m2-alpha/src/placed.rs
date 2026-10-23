@@ -259,6 +259,50 @@ impl Placed {
         opened
     }
 
+    /// Where the emplaced gun stands that is nearest `to` of those within
+    /// `seek` metres of `from` and `reach` metres of `to` (flat
+    /// distances): one to man to fire on `to`.
+    pub fn emplacement_for(
+        &self,
+        props: &Props,
+        from: Vec3,
+        to: Vec3,
+        seek: f32,
+        reach: f32,
+    ) -> Option<Vec3> {
+        let flat = |a: Vec3, b: Vec3| (a - b).with_y(0.0).length();
+        self.known
+            .iter()
+            .filter(|(_, k)| k.0 == Kind::Emplaced)
+            .filter_map(|(&e, _)| Some(props.get(e)?.0.position))
+            .filter(|&p| flat(p, from) <= seek && flat(p, to) <= reach)
+            .min_by(|a, b| flat(*a, to).total_cmp(&flat(*b, to)))
+    }
+
+    /// Whether the emplaced gun standing at `gun` fires rounds that blow
+    /// up (its weapon's ammunition has a `Blast`: the grenade launcher's,
+    /// the recoilless rifle's; not the heavy MG's).
+    pub fn emplacement_explodes(&self, props: &Props, templates: &Templates, gun: Vec3) -> bool {
+        self.emplacement_near(props, templates, gun)
+            .is_some_and(|m| m.weapon.ammo.blast.is_some())
+    }
+
+    /// How many emplaced guns are known, and the nearest to `at` that
+    /// stands as a prop (entity and flat distance), for the log.
+    pub fn emplaced_nearest(&self, props: &Props, at: Vec3) -> (usize, Option<(u32, f32)>) {
+        let known: Vec<u32> = self
+            .known
+            .iter()
+            .filter(|(_, k)| k.0 == Kind::Emplaced)
+            .map(|(&e, _)| e)
+            .collect();
+        let nearest = known
+            .iter()
+            .filter_map(|&e| Some((e, (props.get(e)?.0.position - at).with_y(0.0).length())))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        (known.len(), nearest)
+    }
+
     /// The emplaced gun nearest `at` within [`MAN_REACH`], as she would
     /// man it: its weapon (the template's first `PhysicalLink`ed one the
     /// arsenal knows), its turn and tilt (its `Turret`), all its rounds.

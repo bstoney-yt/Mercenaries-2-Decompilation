@@ -707,6 +707,22 @@ impl Mission {
         events.install(host.lua())?;
         crate::hijack::install(&host, &world)?;
         host.install_library(Rc::clone(&library), true)?;
+        // The contracts' own globals read nil while unset, as in the game,
+        // not stubs: every global a contract's or job's script assigns.
+        let contracts: std::collections::BTreeSet<&str> = library
+            .scripts()
+            .iter()
+            .flat_map(|s| s.chunk.main.strings())
+            .filter(|n| crate::script::is_contract_module(n))
+            .collect();
+        let own: std::collections::BTreeSet<String> = contracts
+            .iter()
+            .filter_map(|&n| library.resolve(n).map(|(s, _, _)| s))
+            .flat_map(|s| s.chunk.main.names(s.chunk.version))
+            .filter(|(u, _)| *u == m2_assets::lua::NameUse::SetGlobal)
+            .map(|(_, n)| n)
+            .collect();
+        host.nil_globals(own.iter().map(String::as_str))?;
 
         // Every module, by the name scripts spell it with, so code run
         // later can use any module as a global.

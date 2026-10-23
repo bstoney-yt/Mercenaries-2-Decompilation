@@ -1323,7 +1323,12 @@ impl Game {
                 // Her weapons away (swimming, or put away by the scripts):
                 // nothing to fire, aim or throw (the on-foot table's `Swim`
                 // stance has no firing or aiming rows).
-                let trigger = if field.player.weapons_away() {
+                // An emplaced gun she mans fires all the same (PmcCon031:
+                // the scripts put her weapons away for its shooting range,
+                // where the targets are brought down from its emplaced
+                // guns; inferred from the scripts).
+                let manning = self.combat.manned.is_some() && !field.player.swimming();
+                let trigger = if field.player.weapons_away() && !manning {
                     crate::combat::Trigger::default()
                 } else {
                     intent.trigger

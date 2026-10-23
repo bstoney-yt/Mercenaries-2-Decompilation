@@ -63,7 +63,55 @@ const TAKE_NEAR: f32 = 40.0;
 /// She shoots soldiers from within this far (metres), and blows things up
 /// from between these.
 const SHOOT_RANGE: f32 = 35.0;
+/// Shooting a target with her rifle she fires this long (seconds) of
+/// every so long (invented).
+const TAP_FOR: f32 = 0.12;
+const TAP_EVERY: f32 = 0.5;
+/// She fires on a target with her rifle once her crosshair is within this
+/// much of its middle, metres (invented: half a statue's width).
+const SNIPE_WIDTH: f32 = 0.4;
+/// A target still standing after this long of her rifle (seconds, in
+/// reach) is blown up instead (invented).
+const RIFLE_TRY: f32 = 20.0;
+/// Targets that rounds break she shoots from within this far (metres;
+/// invented, the ranges' furthest statues from their towers).
+const SNIPE_RANGE: f32 = 130.0;
+/// Shooting a target with her rifle she fires this long (seconds) of
+/// every so long (invented). TAP_FOR: f32 = 0.12; TAP_EVERY: f32 = 0.5;
 const BLAST_RANGE: (f32, f32) = (15.0, 45.0);
+/// With nothing to blow things up with, she mans an emplaced gun this
+/// near her (metres) that is this near the target (invented).
+const MAN_SEEK: f32 = 80.0;
+/// Whether target `g` is a prop that rounds break (its template's damage
+/// row takes a `Bullet`, with health to wear: the ranges' targets): shot
+/// with her rifle rather than rockets or C4 (PmcCon033 round 11: C4 on
+/// each pistol-range target, 116 s against its 90 s to beat).
+fn takes_rounds(game: &Game, g: u32) -> bool {
+    let (Some((p, _)), Some(w)) = (game.scene.props.get(g), game.scene.world.as_ref()) else {
+        return false;
+    };
+    let db = &w.index.template_db;
+    !game.scene.props.sturdy.contains(&g)
+        && db
+            .durability
+            .get(&p.template)
+            .is_some_and(|d| !d.invincible && d.health > 0.0)
+        && crate::breakables::Makeup::of(db, p.template).bullet >= ROUNDS_TAKEN
+}
+
+/// A target takes at least this much of a `Bullet`'s damage for her to
+/// shoot it rather than blow it up (invented: PmcCon031's columns take a
+/// little of rounds and stood through 240 s of her rifle, round 12; the
+/// pistol range's targets take all of them).
+const ROUNDS_TAKEN: f32 = 0.5;
+
+/// She keeps to the target she is blowing up unless another is this much
+/// nearer, metres (invented).
+const KEEP_TARGET_BY: f32 = 10.0;
+const MANNED_REACH: f32 = 90.0;
+/// An emplaced gun this near her (metres) is manned whatever she carries
+/// (invented).
+const GUN_BY: f32 = 8.0;
 /// With the grenade launcher, whose rounds reach about 40 m.
 const LOB_RANGE: (f32, f32) = (12.0, 32.0);
 /// What only a support strike brings down (the first contract's gates)
@@ -159,6 +207,9 @@ const STUCK: f32 = 3.0;
 const SIDESTEP: f32 = 1.2;
 const HOP_AFTER: f32 = 25.0;
 const HOP_AFTER_BOAT: f32 = 8.0;
+/// On foot this near the place she is after (metres), she hops as soon as
+/// a boat does (invented).
+const HOP_NEAR: f32 = 40.0;
 /// A place more than this over the sea is ashore, for a boat, which goes
 /// for the water this far short of it, metres (invented).
 const ASHORE: f32 = 1.5;
@@ -336,6 +387,10 @@ const UNDER_BY: f32 = 4.0;
 /// A building to destroy this near (metres, flat) under one she is to
 /// reach is left standing meanwhile.
 const HOLDS_UP: f32 = 20.0;
+/// ...when they stand this much higher than its foot, metres (invented:
+/// PmcCon033 round 5, she stood 0.1 m above the range's targets on the
+/// same floor and left them standing as if on their roof).
+const HOLDS_UP_RISE: f32 = 2.0;
 /// One following her left this far behind (metres) this long (seconds)
 /// is brought to her: a test driver's shortcut, logged, for ways the
 /// alpha has no means of (a VIP off a roof, which a player lifts off by
@@ -462,6 +517,13 @@ pub struct Autoplay {
     /// Where she goes to fire at what she is blowing up (its object, the
     /// spot); the spots no better go in `tried` too.
     blast_spot: Option<(u32, Vec3)>,
+    /// The target last logged as one she has nothing to blow up with.
+    no_gun_logged: Option<u32>,
+    /// The target she last shot at with her rifle, and for how long
+    /// within reach (seconds).
+    rifle_on: Option<(u32, f32)>,
+    /// The templates of targets that stood through her rifle that long.
+    rifle_failed: std::collections::HashSet<u32>,
     /// Where she is swimming to climb out of the water (see [`landing`]).
     landing: Option<Vec3>,
     /// Searches in a row for a spot to fire from that found none, and the
@@ -747,7 +809,72 @@ impl Autoplay {
         // and she stood aimed at the fourth for 2100 s), a strike brings
         // down what she would have blown up.
         let spent = game.combat.launcher_rounds.is_some() && game.combat.launcher_empty();
-        let striking = matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target) || spent)
+        // Unless an emplaced gun in reach of it does instead (`blast`).
+        let gun = |at: &Vec3| {
+            game.combat.manned.is_some()
+                || game.scene.player.as_ref().is_some_and(|p| {
+                    game.placed
+                        .emplacement_for(
+                            &game.scene.props,
+                            p.character.position,
+                            *at,
+                            MAN_SEEK,
+                            MANNED_REACH,
+                        )
+                        .is_some()
+                })
+        };
+        // Nor while she drives something with a cannon, which fires on it
+        // (PmcCon016 round 4: out of the race's Panhard to call a bomb on a
+        // pylon, and the race ran out).
+        let cannon = game
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| game.scene.vehicles.get(i))
+            .is_some_and(|v| v.spec.cannon());
+        // (Not a sturdy one first: PmcCon031 round 11 tried her rifle on
+        // each of its 50 columns in turn and brought none down.)
+        let rifle = matches!(&self.goal, Some(Goal::Blast { target, at })
+            if takes_rounds(game, *target)
+                && Self::rifle_ready(game)
+                // Not with an emplaced gun by her whose rounds blow up and
+                // reach it (`blast`).
+                && !game.scene.player.as_ref().is_some_and(|p| {
+                    game.placed
+                        .emplacement_for(&game.scene.props, p.character.position, *at, GUN_BY, MANNED_REACH)
+                        .is_some_and(|g| {
+                            game.scene.world.as_ref().is_some_and(|w| {
+                                game.placed.emplacement_explodes(&game.scene.props, &w.index.template_db, g)
+                            })
+                        })
+                })
+                // Not one that has stood through her rounds a while: blown
+                // up instead (PmcCon031 round 14: its columns stood through
+                // 240 rounds from the MG platform).
+                // Nor any other of its kind after that.
+                && !game
+                    .scene
+                    .props
+                    .get(*target)
+                    .is_some_and(|(p, _)| self.rifle_failed.contains(&p.template))
+                && self
+                    .rifle_on
+                    .is_none_or(|(t, spent)| t != *target || spent < RIFLE_TRY));
+        if let Some((t, spent)) = self.rifle_on
+            && spent >= RIFLE_TRY
+            && let Some((p, _)) = game.scene.props.get(t)
+            && self.rifle_failed.insert(p.template)
+        {
+            eprintln!(
+                "autoplay {:.1} s: {t:#x} stood through {spent:.0} s of her rifle: its kind \
+                 ({:08x}) is blown up from now on",
+                self.clock, p.template
+            );
+        }
+        let striking = !rifle
+            && matches!(&self.goal, Some(Goal::Blast { target, at }) if (sturdy(target) && !cannon) || (spent && !gun(at) && !cannon))
             || matches!(self.goal, Some(Goal::Deliver(_)));
         // A call she is no longer after is put away: the designator goes
         // with a weapon taken up (twice from the satellite's view).
@@ -826,13 +953,34 @@ impl Autoplay {
             }
             self.act(game, target, at);
         }
+        // A place to get herself to (a delivery of her, on foot) is gone
+        // to as close as an action's: its distance can be under her own
+        // arrival's (PmcCon033 round 7: 2.3 m from the scripts, and she
+        // stood 450 s 3 m off the pistol range's point).
+        let close = game
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.driving.is_none())
+            && matches!(&self.goal, Some(Goal::Reach { target, .. }) if marks
+                .iter()
+                .any(|m| m.target == *target && m.kind == "deliverable"));
+        // Manning an emplaced gun, with nothing left for it to fire on:
+        // off it (the use key again), to go on.
+        if game.combat.manned.is_some() && !matches!(self.goal, Some(Goal::Blast { .. })) {
+            return Intent {
+                use_pressed: true,
+                ..Intent::default()
+            };
+        }
         match self.goal.clone() {
             None => self.idle(game, dt),
-            Some(Goal::Reach { at, .. }) if acting.is_some() => {
+            Some(Goal::Reach { at, .. }) if acting.is_some() || close => {
                 self.travel(game, at, ACTION_ARRIVE, dt)
             }
             Some(Goal::Reach { at, .. }) => self.travel(game, at, ARRIVE, dt),
             Some(Goal::Shoot(i)) => self.shoot(game, i, dt),
+            Some(Goal::Blast { target, at }) if rifle => self.rifle_at(game, target, at, dt),
             Some(Goal::Blast { at, .. }) if striking => self.strike(game, at, dt),
             Some(Goal::Blast { target, at }) => self.blast(game, target, at, dt),
             Some(Goal::Board(i)) => self.board(game, i, dt),
@@ -1118,6 +1266,10 @@ impl Autoplay {
         let rockets_out = game.combat.second == Some(Weapon::Rpg)
             && game.combat.launcher_rounds.is_none_or(|r| r.total() == 0)
             && live.iter().any(|m| m.kind == "destroy");
+        let rifle_out = game.combat.rifle_rounds.total() == 0
+            && live
+                .iter()
+                .any(|m| m.kind == "destroy" && takes_rounds(game, m.target));
         if driving.is_none()
             && let Some((from, d)) = game
                 .scene
@@ -1131,9 +1283,14 @@ impl Autoplay {
                 // left to blow up (round 4's AllCon002: the boats).
                 .filter(|p| {
                     let d = p.at.distance(here);
-                    let restock = rockets_out
-                        && d < RESTOCK_NEAR
-                        && crate::mission::refill(templates, &game.combat, &p.what).launcher > 0;
+                    // Her rifle empty too, with targets left that rounds
+                    // break (PmcCon032 round 14: 13 of 21 statues, then
+                    // no rounds left). (Looked up only then: there are
+                    // over a thousand pickups, and this runs each tick.)
+                    let restock = (rockets_out || rifle_out) && d < RESTOCK_NEAR && {
+                        let refill = crate::mission::refill(templates, &game.combat, &p.what);
+                        rockets_out && refill.launcher > 0 || rifle_out && refill.rifle > 0
+                    };
                     // With the contract's things still to blow up, only
                     // what lies close is worth the detour (round 16's
                     // AllCon002 lost the boats' race to pickups).
@@ -1236,7 +1393,10 @@ impl Autoplay {
                 .map(|n| n.at)
                 .chain(followers.iter().copied())
                 .chain([here])
-                .any(|at| at.y > m.at.y && at.with_y(0.0).distance(m.at.with_y(0.0)) < HOLDS_UP)
+                .any(|at| {
+                    at.y > m.at.y + HOLDS_UP_RISE
+                        && at.with_y(0.0).distance(m.at.with_y(0.0)) < HOLDS_UP
+                })
                 || followers.iter().any(|f| {
                     f.with_y(0.0).distance(m.at.with_y(0.0)) < crate::combat::BOMB_FRAG.0 + HOLDS_UP
                 })
@@ -1261,7 +1421,23 @@ impl Autoplay {
         if destroy.iter().any(|m| !passed(m)) {
             destroy.retain(|m| !passed(m));
         }
-        if let Some(m) = nearest(destroy, here) {
+        // The one she is on keeps her unless another is much nearer: of a
+        // range's targets side by side the nearest changed as she stepped,
+        // and she never fired (PmcCon033 round 8: five targets 20 m off,
+        // a new one each 0.2 s for 470 s).
+        let current = match &self.goal {
+            Some(Goal::Blast { target, .. }) => {
+                destroy.iter().copied().find(|m| m.target == *target)
+            }
+            _ => None,
+        };
+        let pick = match (current, nearest(destroy.clone(), here)) {
+            (Some(c), Some(n)) if n.at.distance(here) + KEEP_TARGET_BY >= c.at.distance(here) => {
+                Some(c)
+            }
+            (_, n) => n,
+        };
+        if let Some(m) = pick {
             // A vehicle to destroy is blown up, not its crew shot: the
             // crew aboard come into play under its guid (PmcCon003's
             // AMX30s: round 8 aimed at a tank's commander inside it,
@@ -1320,7 +1496,7 @@ impl Autoplay {
             // 4's AllCon002 walked 600 m to the boats while Caracas fell).
             if driving.is_none()
                 && at.distance(here) > RIDE_FOR
-                && let Some(i) = self.ride_near(game, here)
+                && let Some(i) = self.ride_near(game, here, &live)
             {
                 return Some((
                     Goal::Board(i),
@@ -1346,7 +1522,9 @@ impl Autoplay {
             ));
         }
         // The scripts' vehicles they mark: in, or by where it will be.
-        for m in &live {
+        // (Not one marked to destroy: PmcCon031 round 16 got into the
+        // car she was blowing up.)
+        for m in live.iter().filter(|m| m.kind != "destroy") {
             let Some(i) = vehicles
                 .iter()
                 .position(|v| v.guid == Some(m.target) && !v.wrecked)
@@ -1483,7 +1661,7 @@ impl Autoplay {
         let m = nearest(places, here)?;
         if driving.is_none() {
             if m.at.distance(here) > RIDE_FOR
-                && let Some(i) = self.ride_near(game, here)
+                && let Some(i) = self.ride_near(game, here, &live)
             {
                 return Some((
                     Goal::Board(i),
@@ -1571,13 +1749,18 @@ impl Autoplay {
     /// A ride close to `here`, for somewhere far: the scripts' vehicle
     /// they brought last that she hasn't driven (the tank delivered for
     /// the next leg), else hers from before or another of theirs.
-    fn ride_near(&self, game: &Game, here: Vec3) -> Option<usize> {
+    fn ride_near(&self, game: &Game, here: Vec3, live: &[&Mark]) -> Option<usize> {
         let vehicles = &game.scene.vehicles;
         let near = |i: usize, within: f32| {
             vehicles
                 .get(i)
                 .is_some_and(|v| !v.wrecked && !v.spec.is_boat() && !v.spec.is_helicopter())
                 && !self.left_rides.contains(&i)
+                // Not one she is to destroy (PmcCon031's flung cars: she
+                // drove off in its targets, round 16).
+                && !vehicles[i].guid.is_some_and(|g| {
+                    live.iter().any(|m| m.target == g && m.kind == "destroy")
+                })
                 && vehicle_at(game, i).is_some_and(|t| t.w_axis.truncate().distance(here) < within)
         };
         // The one she set out for while it is still close (round 6 turned
@@ -2185,6 +2368,98 @@ impl Autoplay {
         }
     }
 
+    /// Where the place she is going to is, for a goal that is one.
+    fn goal_at(&self) -> Option<Vec3> {
+        match &self.goal {
+            Some(Goal::Reach { at, .. } | Goal::Blast { at, .. } | Goal::Use { at, .. }) => {
+                Some(*at)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether she can fire her rifle: on foot, her weapons out, no gun
+    /// manned.
+    fn rifle_ready(game: &Game) -> bool {
+        game.scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.driving.is_none() && !p.weapons_away())
+            && game.combat.manned.is_none()
+    }
+
+    /// Shooting what stands at `at` with her rifle, from within
+    /// [`SHOOT_RANGE`], once aimed a moment.
+    fn rifle_at(&mut self, game: &mut Game, target: u32, at: Vec3, dt: f32) -> Intent {
+        let Some(p) = game.scene.player.as_ref() else {
+            return Intent::default();
+        };
+        let here = p.character.position;
+        // What rounds break is shot at from further: from her sniper
+        // tower, which she may not leave (PmcCon034 round 8: she walked
+        // off it for a statue 98 m off, and left the contract's bounds).
+        let range = if takes_rounds(game, target) {
+            SNIPE_RANGE
+        } else {
+            SHOOT_RANGE
+        };
+        if at.distance(here) > range {
+            return self.walk(game, at, range - 5.0, dt);
+        }
+        match &mut self.rifle_on {
+            Some((t, spent)) if *t == target => *spent += dt,
+            _ => {
+                eprintln!(
+                    "autoplay {:.1} s: shooting {target:#x} with her rifle",
+                    self.clock
+                );
+                self.rifle_on = Some((target, dt));
+            }
+        }
+        let (look, error) = aim(p, at, dt);
+        // Far off, the crosshair is held on it closer: 0.03 rad is 3 m at
+        // 98 m, wider than a statue (PmcCon034 round 21: 20 anti-material
+        // rounds, none broke one). The width is invented.
+        let on = ON_TARGET.min(SNIPE_WIDTH / at.distance(p.eye()).max(1.0));
+        self.steady = if error < on { self.steady + dt } else { 0.0 };
+        Intent {
+            look,
+            trigger: Trigger {
+                aim: true,
+                // In short bursts, her spread settling between them (the
+                // weapons' bloom): held down, 240 rounds broke 8 of
+                // PmcCon032's 21 statues and her clips ran dry (round 13).
+                fire: self.steady > STEADY && self.clock.rem_euclid(TAP_EVERY) < TAP_FOR,
+                select: (game.combat.weapon != Weapon::Rifle).then_some(Weapon::Rifle),
+                ..Trigger::default()
+            },
+            ..Intent::default()
+        }
+    }
+
+    /// Firing the emplaced gun she mans on what stands at `at`, once
+    /// aimed a moment.
+    fn fire_manned(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
+        let Some(p) = game.scene.player.as_ref() else {
+            return Intent::default();
+        };
+        let (look, error) = aim(p, at, dt);
+        self.steady = if error < ON_TARGET {
+            self.steady + dt
+        } else {
+            0.0
+        };
+        Intent {
+            look,
+            trigger: Trigger {
+                aim: true,
+                fire: self.steady > STEADY,
+                ..Trigger::default()
+            },
+            ..Intent::default()
+        }
+    }
+
     /// Blowing up what stands at `at` with what she carries in the
     /// launcher's place: rockets from between [`BLAST_RANGE`], grenades
     /// from between [`LOB_RANGE`]; from a tank, with its cannon.
@@ -2270,6 +2545,65 @@ impl Autoplay {
         let Some(p) = game.scene.player.as_ref() else {
             return Intent::default();
         };
+        // Nothing to blow it up with: an emplaced gun in reach of it,
+        // manned and fired (PmcCon031 round 3: 50 columns to bring down,
+        // the scripts' "MoveToMG" first, and she stood 370 s at one with
+        // an empty launcher). So too with her weapons put away by the
+        // scripts (round 4: its range's).
+        let holstered = game.scene.player.as_ref().is_some_and(|p| p.weapons_away());
+        // An emplaced gun right by her that reaches it: manned whatever
+        // she carries (PmcCon031 round 17: at its grenade-launcher post she
+        // shot 20 s with her rifle, then walked off round the range).
+        // (One whose rounds blow up: the heavy MG's 300 rounds left 031's
+        // columns standing, round 18.)
+        let gun_by = game
+            .placed
+            .emplacement_for(&game.scene.props, here, at, GUN_BY, MANNED_REACH)
+            .is_some_and(|g| {
+                game.scene.world.as_ref().is_some_and(|w| {
+                    game.placed
+                        .emplacement_explodes(&game.scene.props, &w.index.template_db, g)
+                })
+            });
+        if (!lobbing && rockets == 0) || holstered || gun_by || game.combat.manned.is_some() {
+            if game.combat.manned.is_some() {
+                return self.fire_manned(game, at, dt);
+            }
+            if let Some(gun) =
+                game.placed
+                    .emplacement_for(&game.scene.props, here, at, MAN_SEEK, MANNED_REACH)
+            {
+                if gun.with_y(0.0).distance(here.with_y(0.0)) > crate::placed::MAN_REACH * 0.75 {
+                    self.arrived = None;
+                    return self.walk(game, gun, 0.5, dt);
+                }
+                return Intent {
+                    use_pressed: true,
+                    ..Intent::default()
+                };
+            }
+            if self.no_gun_logged != Some(target) {
+                self.no_gun_logged = Some(target);
+                let (n, nearest) = game.placed.emplaced_nearest(&game.scene.props, here);
+                let swimming = game.scene.player.as_ref().is_some_and(|p| p.swimming());
+                eprintln!(
+                    "autoplay {:.1} s: nothing to blow up {target:#x} with (rockets {rockets}, \
+                     weapons away {holstered}, swimming {swimming}) and no emplaced gun in \
+                     reach: {n} known, nearest {nearest:x?}",
+                    self.clock
+                );
+            }
+            // Her weapons out: rounds, which what breaks to them takes
+            // (the ranges' targets, from their damage rows).
+            if !holstered {
+                return self.rifle_at(game, target, at, dt);
+            }
+            // Her weapons away and no gun to man: she stays where the
+            // scripts put her until they give them back (PmcCon034 round
+            // 8: she walked off its tower and the contract was cancelled
+            // for leaving its bounds).
+            return Intent::default();
+        }
         // Going where she can fire from (in range, nothing in the way).
         if let Some((_, spot)) = self.blast_spot {
             let off = spot.with_y(0.0).distance(here.with_y(0.0));
@@ -3028,7 +3362,24 @@ impl Autoplay {
             .and_then(|p| p.driving)
             .and_then(|i| game.scene.vehicles.get(i))
             .is_some_and(|v| v.spec.is_boat());
-        if still > if afloat { HOP_AFTER_BOAT } else { HOP_AFTER } {
+        // So does one on foot stuck short of a place close by: the timed
+        // ranges' points lie behind their counters (PmcCon033 round 9: 31
+        // s of its 90 s lost 36 m short of the pistol range's second).
+        let near = game
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.driving.is_none())
+            && self
+                .goal_at()
+                .is_some_and(|at| at.distance(game.focus()) < HOP_NEAR);
+        if still
+            > if afloat || near {
+                HOP_AFTER_BOAT
+            } else {
+                HOP_AFTER
+            }
+        {
             // Stuck driving close to the place, or stuck driving a second
             // time on the way there (round 26: a truck hopped a few metres
             // at a time for 370 s, 165 m off): on foot from here. Not
