@@ -3797,6 +3797,14 @@ fn mission_for_screenshot(
                     on_contract = contract;
                 }
                 a.sights = link.sight_targets(game);
+                let keep = link.kept_within();
+                if keep.len() != a.keep.len() {
+                    eprintln!(
+                        "autoplay: kept within {} region(s) the scripts watch her leave",
+                        keep.len()
+                    );
+                }
+                a.keep = keep;
                 let marks = link.contract_marks();
                 a.offers = link.offers(game);
                 let objectives = link.view().objectives;

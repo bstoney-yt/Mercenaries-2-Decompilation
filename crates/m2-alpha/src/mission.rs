@@ -3353,6 +3353,27 @@ impl MissionLink {
             .collect()
     }
 
+    /// The regions she must not leave, as the scripts watch them
+    /// (`Event.Boundary` on "exit": PmcCon034's out-of-bounds, which
+    /// cancels it): each outline with where it is placed and its turn.
+    pub fn kept_within(&self) -> Vec<crate::autoplay::Keep> {
+        let State::Running(m) = &self.state else {
+            return Vec::new();
+        };
+        let w = m.world().borrow();
+        m.exits_watched()
+            .into_iter()
+            .filter_map(|g| {
+                let (r, o) = (w.regions.get(&g)?, w.objects.get(&g)?);
+                Some(crate::autoplay::Keep {
+                    region: r.clone(),
+                    centre: [o.position[0], o.position[2]],
+                    yaw: o.yaw,
+                })
+            })
+            .collect()
+    }
+
     /// The names of the events the scripts wait for the game to post
     /// (`"PDA Open"`).
     pub fn awaited(&self) -> Vec<String> {
