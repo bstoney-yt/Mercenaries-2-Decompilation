@@ -89,6 +89,20 @@ const DEFEND: f32 = 30.0;
 /// lower than she stands by more than this if she can (metres).
 const BLOCKED: f32 = 4.0;
 const VANTAGE_RINGS: [f32; 5] = [6.0, 10.0, 15.0, 20.0, 26.0];
+/// A laser-guided strike (the bunker buster) is called from a spot on
+/// these rings round its target (metres, out of the bomb's reach and
+/// within the call's), with a clear line to within this of the
+/// target's middle (metres, its own body), and not again sooner than
+/// this (seconds) after a call. Invented, as is [`LASER_WALK`].
+const LASER_RINGS: [f32; 4] = [30.0, 40.0, 55.0, 70.0];
+const LASER_SHORT: f32 = 6.0;
+const LASER_AGAIN: f32 = 20.0;
+/// How long she makes for one such spot before trying another (seconds).
+const LASER_WALK: f32 = 40.0;
+/// The laser counts as on its target within this of it (metres), and
+/// off it this long (seconds) she looks for another spot. Invented.
+const LASER_NEAR: f32 = 12.0;
+const LASER_OFF: f32 = 3.0;
 /// Blowing something up, in range this long (seconds) without a shot
 /// (something in the way, or her aim never settling), she goes where she
 /// can fire from: on rings this far out (metres), inside the rockets' and
@@ -552,6 +566,13 @@ pub struct Autoplay {
     /// What she took the scripts' context action on (a munition tagged
     /// for pickup): its action marker, left up, is done with.
     tagged: std::collections::HashSet<u32>,
+    /// When she last called a laser-guided item in, and the spot she
+    /// went to for a clear line to its target.
+    laser_called: Option<f32>,
+    laser_spot: Option<Vec3>,
+    laser_since: f32,
+    /// Seconds her laser has been off its target.
+    laser_off: f32,
     /// Seconds one following her has been left behind.
     left_behind: f32,
 }
@@ -2686,13 +2707,69 @@ impl Autoplay {
                 // A bunker buster she holds goes on what only one brings
                 // down (JetCon001's bunker: the contract hands her three,
                 // `Munitions.PickupMunitions`); else the menu's line stands.
+                // Its laser has to reach the target: from where nothing
+                // stands between (round 19 marked a wall 40 m short and
+                // spent all three), and not again while one is under way.
                 if let Some(i) = game
                     .support
                     .entries()
                     .iter()
                     .position(|e| matches!(e, Entry::Stocked(s) if s.key == "bunkerbuster"))
                 {
+                    if self
+                        .laser_called
+                        .is_some_and(|t| self.clock - t < LASER_AGAIN)
+                    {
+                        return intent;
+                    }
+                    let eye = here + Vec3::Y * 1.6;
+                    let seen = game.scene.world.as_ref().is_none_or(|w| {
+                        let (dir, len) = ((at - eye).normalize_or_zero(), at.distance(eye));
+                        w.physics
+                            .cast_ray(eye, dir, (len - LASER_SHORT).max(0.0))
+                            .is_none()
+                    });
+                    if !seen {
+                        let spot = self
+                            .laser_spot
+                            .filter(|s| s.distance(at) < CALL_FROM.1)
+                            .or_else(|| {
+                                game.scene.world.as_ref().and_then(|w| {
+                                    vantage(
+                                        &w.physics,
+                                        at,
+                                        here,
+                                        &self.tried,
+                                        &LASER_RINGS,
+                                        LASER_SHORT,
+                                    )
+                                })
+                            });
+                        if spot != self.laser_spot {
+                            self.laser_since = self.clock;
+                        }
+                        self.laser_spot = spot;
+                        // A spot she can't get to in a while (round 20 stood
+                        // 200 s short of one) is given up for the next.
+                        if let Some(spot) = spot
+                            && self.clock - self.laser_since > LASER_WALK
+                        {
+                            self.tried.push(spot);
+                            self.laser_spot = None;
+                            return intent;
+                        }
+                        if let Some(spot) = spot
+                            && spot.with_y(0.0).distance(here.with_y(0.0)) > ARRIVE
+                        {
+                            return self.walk(game, spot, ARRIVE, dt);
+                        }
+                        if let Some(spot) = spot {
+                            self.tried.push(spot);
+                            self.laser_spot = None;
+                        }
+                    }
                     game.support.selected = i;
+                    self.laser_called = Some(self.clock);
                 }
                 intent.trigger.support = true;
             }
@@ -2719,10 +2796,41 @@ impl Autoplay {
             Phase::Designating {
                 aim: Aim::Laser, ..
             } => {
+                // Held only while it lands on the target (the laser's own
+                // ray, from the camera: round 22 lased a building 40 m
+                // short three times); kept off it a while, she goes
+                // where she can see it from.
+                let lands = match (game.scene.world.as_ref(), game.scene.player.as_ref()) {
+                    (Some(w), Some(p)) => {
+                        Combat::aim_point(&w.physics, &game.scene.people, p, None).distance(at)
+                            < LASER_NEAR
+                    }
+                    _ => true,
+                };
+                if lands {
+                    self.laser_off = 0.0;
+                } else {
+                    self.laser_off += dt;
+                }
+                if self.laser_off > LASER_OFF {
+                    self.laser_off = 0.0;
+                    self.tried.push(here);
+                    self.laser_spot = game.scene.world.as_ref().and_then(|w| {
+                        vantage(&w.physics, at, here, &self.tried, &LASER_RINGS, LASER_SHORT)
+                    });
+                    self.laser_since = self.clock;
+                }
+                if !lands
+                    && let Some(spot) = self.laser_spot
+                    && spot.with_y(0.0).distance(here.with_y(0.0)) > ARRIVE
+                    && self.clock - self.laser_since < LASER_WALK
+                {
+                    return self.walk(game, spot, ARRIVE, dt);
+                }
                 if let Some(p) = game.scene.player.as_ref() {
                     intent.look = aim(p, at, dt).0;
                 }
-                intent.trigger.fire = true;
+                intent.trigger.fire = lands;
             }
         }
         intent
