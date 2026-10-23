@@ -463,6 +463,23 @@ impl Events {
         out
     }
 
+    /// The regions pending `Boundary` events wait for something to leave
+    /// (mode `"exit"`: PmcCon034's `PMCCon034OutOfBounds`, which cancels
+    /// the contract), for the autoplay to keep her within.
+    pub fn exits_watched(&self, world: &dyn World) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .store
+            .borrow()
+            .pending
+            .iter()
+            .filter(|p| p.kind == "Boundary" && text(&p.params, 3).as_deref() == Some("exit"))
+            .filter_map(|p| boundary_of(&p.params, world))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// How many events are pending.
     pub fn len(&self) -> usize {
         self.store.borrow().pending.len()
@@ -933,6 +950,15 @@ fn objects(t: &Table, i: i64, world: &dyn World) -> Vec<u32> {
     }
 }
 
+/// A `Boundary` event's region (its second parameter): a guid or the
+/// region's name.
+fn boundary_of(t: &Table, world: &dyn World) -> Option<u32> {
+    guid(t, 2).or_else(|| match t.raw_get::<Value>(2) {
+        Ok(Value::String(s)) => world.named(&s.to_string_lossy()),
+        _ => None,
+    })
+}
+
 fn text(t: &Table, i: i64) -> Option<String> {
     match t.raw_get::<Value>(i).ok()? {
         Value::String(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
@@ -1112,11 +1138,7 @@ fn check(
         }
         // { object, boundary, "enter" or "exit" }.
         "Boundary" => {
-            // The boundary is a guid or the region's name.
-            let boundary = guid(&p.params, 2).or_else(|| match p.params.raw_get::<Value>(2) {
-                Ok(Value::String(s)) => world.named(&s.to_string_lossy()),
-                _ => None,
-            });
+            let boundary = boundary_of(&p.params, world);
             let mode = text(&p.params, 3);
             // `"any"`: both ways, the callback told which (the faction
             // zones' trespass watch).

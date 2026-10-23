@@ -4329,6 +4329,42 @@ mod tests {
         assert_eq!(arrived, "1@70");
     }
 
+    // PmcCon034's out-of-bounds: the region an "exit" waits on is watched,
+    // one an "enter" waits on is not.
+    #[test]
+    fn regions_waited_on_for_an_exit_are_watched() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            let corners = vec![[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]];
+            for (g, name) in [(70, "OutOfBounds"), (71, "Checkpoint")] {
+                w.insert(g, Object::new(name, [100.0, 0.0, 100.0]));
+                w.regions.insert(
+                    g,
+                    m2_assets::Region {
+                        flags: 0x0004_0002,
+                        unk_0x04: 0,
+                        corners: corners.clone(),
+                    },
+                );
+            }
+        }
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                local f = ObjectFilter.Create()
+                ObjectFilter.UsePlayers(f, true)
+                Event.Create(Event.Boundary, {f, "OutOfBounds", "exit", true}, function() end)
+                Event.Create(Event.Boundary, {f, "Checkpoint", "enter", true}, function() end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(events.exits_watched(&*world.borrow()), vec![70]);
+    }
+
     #[test]
     fn an_any_boundary_tells_its_callback_each_way_she_crosses() {
         let (host, world) = setup();
