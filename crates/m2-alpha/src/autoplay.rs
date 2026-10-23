@@ -754,6 +754,9 @@ pub struct Autoplay {
     boarded: Option<(u32, f32)>,
     /// When she last called in a soldier delivery by an outpost.
     delivered: Option<f32>,
+    /// What she took the scripts' context action on (a munition tagged
+    /// for pickup): its action marker, left up, is done with.
+    tagged: std::collections::HashSet<u32>,
     /// Seconds one following her has been left behind.
     left_behind: f32,
 }
@@ -866,6 +869,7 @@ impl Autoplay {
                 self.pressed = 0.0;
                 eprintln!("autoplay {:.1} s: taking {text:?} at {g:#x}", self.clock);
                 game.context_taken = Some(g);
+                self.tagged.insert(g);
             }
             return Intent::default();
         }
@@ -909,6 +913,7 @@ impl Autoplay {
             );
             self.context_pressed = self.clock;
             game.context_taken = Some(*g);
+            self.tagged.insert(*g);
         }
         // At a body to verify still driving: out, as the scripts offer the
         // prompt on foot (ChiCon003's HVT, shot from the M1A2: she sat on
@@ -1459,13 +1464,38 @@ impl Autoplay {
                 format!("fighting back a soldier {d:.0} m off"),
             ));
         }
-        let mut live: Vec<&Mark> = marks.iter().filter(|m| m.alive).collect();
+        let mut live: Vec<&Mark> = marks
+            .iter()
+            .filter(|m| m.alive && !(m.kind == "action" && self.tagged.contains(&m.target)))
+            .collect();
         // A place saved for last waits while others to deliver to are open.
         if live
             .iter()
             .any(|m| m.kind == "deliverable" && !SAVE_FOR_LAST.contains(&m.name.as_str()))
         {
             live.retain(|m| !SAVE_FOR_LAST.contains(&m.name.as_str()));
+        }
+        // Every munition marked for her tagged (JetCon001's three bunker
+        // busters, `Munitions.ActionTarget`): the pickup the tagging
+        // stocked her with (`MunitionsPickup`, the munitions helicopter)
+        // is called in, once a while (`DELIVERY_AGAIN`).
+        if driving.is_none()
+            && !live.iter().any(|m| m.kind == "action")
+            && marks
+                .iter()
+                .any(|m| m.kind == "action" && self.tagged.contains(&m.target))
+            && self
+                .delivered
+                .is_none_or(|t| self.clock - t > DELIVERY_AGAIN)
+            && let Some(key) = game.support.entries().into_iter().find_map(|e| match e {
+                Entry::Stocked(s) if s.key == "MunitionsPickup" => Some(s.key.clone()),
+                _ => None,
+            })
+        {
+            return Some((
+                Goal::Deliver(key),
+                "calling in the munitions pickup for what she tagged".to_owned(),
+            ));
         }
         fn nearest(ms: Vec<&Mark>, here: Vec3) -> Option<&Mark> {
             ms.into_iter()

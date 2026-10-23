@@ -4403,6 +4403,10 @@ fn report_strikes(game: &mut Game, mission: &mut Mission) -> (u32, u32) {
     counts
 }
 
+/// How high over a munition the munitions helicopter hovers to take it
+/// up, metres (invented).
+const PICKUP_HOVER: f32 = 15.0;
+
 /// The ground under `at` (a satellite's mark is on the ground she stands
 /// on); `at` itself where nothing is found.
 fn ground_under(game: &Game, at: Vec3) -> Vec3 {
@@ -4718,6 +4722,41 @@ fn break_props(game: &mut Game, mission: &Mission) {
 /// (`landed`). It can't be flown in this game yet.
 fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Command) {
     match c {
+        // The munitions helicopter's `Pickup` of what she tagged
+        // (`MrxMunitionsPickup`: Ewan's UH1, its goal's target the
+        // munition): flown as a delivery with nothing on the winch, to
+        // over the munition; there its goal is done, and the scripts'
+        // callback takes every tagged munition up (`Munitions.
+        // PickupAllMunitions`, which posts `MunitionsPickup`). How high
+        // it hovers is invented, and nothing hangs from its winch.
+        Command::Goal {
+            guid,
+            goal,
+            location: None,
+            target: Some(t),
+            ..
+        } if goal == "Pickup" => {
+            let at = mission.world().borrow().objects.get(t).map(|o| o.position);
+            match at {
+                Some(p) => {
+                    eprintln!("mission: {guid:#x} flies to pick up {t:#x}");
+                    let to = [p[0], p[1] + PICKUP_HOVER, p[2]];
+                    fly(
+                        game,
+                        mission,
+                        landed,
+                        &Command::Goal {
+                            guid: *guid,
+                            goal: "Deliver".into(),
+                            location: Some(to),
+                            target: None,
+                            haste: None,
+                        },
+                    );
+                }
+                None => eprintln!("mission: {guid:#x} sent to pick up {t:#x}, not in the world"),
+            }
+        }
         Command::Goal {
             guid,
             goal,
