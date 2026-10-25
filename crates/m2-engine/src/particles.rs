@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek};
 
 use m2_assets::effect::{
-    self, ATLAS_DICT, ATLAS_TYPE, Atlas, Attr, ColourKey, EFFECT_TYPE, Effect, setting,
+    self, ATLAS_DICT, ATLAS_TYPE, Atlas, Attr, ColourKey, EFFECT_TYPE, Effect, ForceKind, setting,
 };
 use m2_assets::{Layer, name_hash};
 use m2_math::glam::{EulerRot, Quat, Vec3};
@@ -114,6 +114,10 @@ pub struct EmitterSpec {
     pub spread_var: f32,
     pub gravity: f32,
     pub drag: f32,
+    /// How much the effect's wind forces move it (`forcewind`), and its
+    /// mass (`mass`, 1 where unset), which drag is divided by.
+    pub wind: f32,
+    pub mass: f32,
     /// Starting turn's spread and turning speed, degrees (inferred).
     pub turn: f32,
     pub spin: f32,
@@ -176,6 +180,8 @@ impl EmitterSpec {
             spread_var: num(setting::SPREAD_VAR),
             gravity: num(setting::FORCE_GRAVITY),
             drag: num(setting::FORCE_DRAG),
+            wind: num(setting::FORCE_WIND),
+            mass: Some(num(setting::MASS)).filter(|m| *m > 0.0).unwrap_or(1.0),
             turn: num(setting::UNKNOWN_1B878602),
             spin: num(setting::UNKNOWN_35ACBAB7),
             textures: e.textures.len(),
@@ -220,6 +226,9 @@ fn zero(name: u32) -> Attr {
 pub struct EffectSpec {
     pub hash: u32,
     pub emitters: Vec<EmitterSpec>,
+    /// Its forces ([`ForceSpec`]); none on 24 of the 314 effects, whose
+    /// particles move as before ([`RISE`], [`DRAG`]).
+    pub forces: Vec<ForceSpec>,
 }
 
 impl EffectSpec {
@@ -231,6 +240,137 @@ impl EffectSpec {
                 .iter()
                 .map(|e| EmitterSpec::read(e, fx, atlas))
                 .collect(),
+            forces: fx.forces.iter().map(|f| ForceSpec::read(f)).collect(),
+        }
+    }
+}
+
+/// One of an effect's forces, its settings keyed over the effect's time.
+///
+/// From the 360 code (the per-frame setup, 0x821D9110): each frame every
+/// setting is evaluated at the effect's time; the force's place is its
+/// position and turn (degrees) on the effect's; a gravity pulls along its
+/// turn applied to (0, -1, 0) (the constant at 0x82de896c), every other
+/// kind points along its turn applied to up; a drag's strength is
+/// strength x pi x radius squared; a wind ignores its own settings and
+/// takes the world's wind (the alpha has none, so a wind does nothing).
+#[derive(Debug, Clone)]
+pub struct ForceSpec {
+    pub kind: ForceKind,
+    pub strength: Attr,
+    pub radius: Attr,
+    pub range: Attr,
+    pub decay: Attr,
+    pub radial: Attr,
+    pub position: [Attr; 3],
+    pub turn: [Attr; 3],
+}
+
+/// A force as one frame has it ([`ForceSpec::live`]): kind, place, the
+/// way it points, and its evaluated settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiveForce {
+    pub kind: ForceKind,
+    pub at: Vec3,
+    pub direction: Vec3,
+    pub strength: f32,
+    pub range: f32,
+    pub decay: f32,
+    pub radial: f32,
+}
+
+impl ForceSpec {
+    fn read(attrs: &[Attr]) -> Self {
+        let get = |name| {
+            effect::find(attrs, name)
+                .cloned()
+                .unwrap_or_else(|| zero(name))
+        };
+        Self {
+            kind: ForceKind::infer(attrs),
+            strength: get(setting::UNKNOWN_3DC3D9DF),
+            radius: get(setting::DRAG_RADIUS),
+            range: get(setting::RANGE),
+            decay: get(setting::DECAY),
+            radial: get(setting::RADIAL),
+            position: [setting::POS_X, setting::POS_Y, setting::POS_Z].map(get),
+            turn: [setting::ROT_X, setting::ROT_Y, setting::ROT_Z].map(get),
+        }
+    }
+
+    /// The force at `frame` (the effect's time in keyed frames), for an
+    /// effect at `origin` drawn `scale` times its size.
+    pub fn live(&self, frame: f32, origin: Vec3, scale: f32) -> LiveForce {
+        let v = |a: &Attr| a.at(frame);
+        let turn = Quat::from_euler(
+            EulerRot::YXZ,
+            v(&self.turn[1]).to_radians(),
+            v(&self.turn[0]).to_radians(),
+            v(&self.turn[2]).to_radians(),
+        );
+        let down = matches!(self.kind, ForceKind::Gravity);
+        let direction = turn * if down { Vec3::NEG_Y } else { Vec3::Y };
+        let mut strength = v(&self.strength);
+        if self.kind == ForceKind::Drag {
+            let r = v(&self.radius);
+            strength *= std::f32::consts::PI * r * r;
+        }
+        if self.kind == ForceKind::Wind {
+            strength = 0.0;
+        }
+        LiveForce {
+            kind: self.kind,
+            at: origin
+                + Vec3::new(
+                    v(&self.position[0]),
+                    v(&self.position[1]),
+                    v(&self.position[2]),
+                ) * scale,
+            direction,
+            strength,
+            range: v(&self.range) * scale,
+            decay: v(&self.decay),
+            radial: v(&self.radial),
+        }
+    }
+}
+
+impl LiveForce {
+    /// How the force changes a particle's velocity over `dt` seconds:
+    /// the particle at `at`, moving at `velocity`, its emitter `e`.
+    ///
+    /// Inferred, not yet traced in the 360 code (the per-particle step is
+    /// not found): a gravity accelerates along its direction by strength
+    /// x the particle's `forcegravity`; a drag takes off velocity x
+    /// strength x `forcedrag` / mass a second; an attractor pulls towards
+    /// its place and a vortex turns about its direction, each by strength
+    /// within its range, fading to nothing at the edge by `(1 - d /
+    /// range)` raised to its decay, a vortex also pulled in by its radial
+    /// share.
+    pub fn accelerate(&self, e: &EmitterSpec, at: Vec3, velocity: Vec3, dt: f32) -> Vec3 {
+        match self.kind {
+            ForceKind::Wind => Vec3::ZERO,
+            ForceKind::Gravity => self.direction * self.strength * e.gravity * dt,
+            ForceKind::Drag => {
+                let k = (self.strength * e.drag / e.mass * dt).clamp(0.0, 1.0);
+                -velocity * k
+            }
+            ForceKind::Attractor | ForceKind::Vortex => {
+                let to = self.at - at;
+                let d = to.length();
+                if self.range <= 0.0 || d >= self.range || d < 1e-4 {
+                    return Vec3::ZERO;
+                }
+                let fade = (1.0 - d / self.range).powf(self.decay.max(0.0));
+                let inward = to / d;
+                let pull = if self.kind == ForceKind::Attractor {
+                    inward
+                } else {
+                    let axis = self.direction.normalize_or(Vec3::Y);
+                    axis.cross(-inward).normalize_or_zero() + inward * self.radial
+                };
+                pull * self.strength * fade * dt
+            }
         }
     }
 }
@@ -552,17 +692,32 @@ impl Particles {
             };
             inst.age += dt;
             let frame = inst.age * FRAME;
-            // Move and age what is there.
+            // The effect's forces this frame ([`ForceSpec::live`]).
+            let live: Vec<LiveForce> = spec
+                .forces
+                .iter()
+                .map(|f| f.live(frame, inst.at, inst.scale))
+                .collect();
+            // Move and age what is there: by the effect's forces, or as
+            // before for an effect without any.
             for p in &mut inst.particles {
                 let e = &spec.emitters[usize::from(p.emitter)];
                 p.age += dt;
-                let lift = if e.glows() || p.life >= SMOKE_LIFE {
-                    RISE * e.gravity
+                if live.is_empty() {
+                    let lift = if e.glows() || p.life >= SMOKE_LIFE {
+                        RISE * e.gravity
+                    } else {
+                        -GRAVITY * e.gravity
+                    };
+                    p.velocity.y += lift * dt;
+                    p.velocity *= (1.0 - e.drag * DRAG * dt).max(0.0);
                 } else {
-                    -GRAVITY * e.gravity
-                };
-                p.velocity.y += lift * dt;
-                p.velocity *= (1.0 - e.drag * DRAG * dt).max(0.0);
+                    let dv: Vec3 = live
+                        .iter()
+                        .map(|f| f.accelerate(e, p.at, p.velocity, dt))
+                        .sum();
+                    p.velocity += dv;
+                }
                 p.at += p.velocity * dt;
                 p.turn += p.spin * dt;
             }
@@ -679,6 +834,13 @@ impl Particles {
         ))
     }
 
+    /// Every live particle's position, for measurements.
+    pub fn positions(&self) -> Vec<Vec3> {
+        self.instances
+            .iter()
+            .flat_map(|i| i.particles.iter().map(|p| p.at))
+            .collect()
+    }
     /// How far the particles sit from `centre` on average, metres (0 with
     /// none): a measure of an effect's spread, for the logs.
     pub fn mean_distance(&self, centre: Vec3) -> f32 {
@@ -789,6 +951,8 @@ mod tests {
             spread_var: 0.0,
             gravity: 0.0,
             drag: 0.0,
+            wind: 0.0,
+            mass: 1.0,
             turn: 0.0,
             spin: 0.0,
             frames: vec![[0.0, 0.0, 0.5, 0.5], [0.5, 0.0, 0.5, 0.5]],
@@ -799,12 +963,128 @@ mod tests {
     }
 
     fn library(e: EmitterSpec) -> Library {
+        library_with(e, Vec::new())
+    }
+
+    fn force(kind: ForceKind, strength: f32) -> ForceSpec {
+        ForceSpec {
+            kind,
+            strength: plain(strength),
+            radius: plain(0.0),
+            range: plain(0.0),
+            decay: plain(0.0),
+            radial: plain(0.0),
+            position: [plain(0.0), plain(0.0), plain(0.0)],
+            turn: [plain(0.0), plain(0.0), plain(0.0)],
+        }
+    }
+
+    /// The per-frame setup as the 360 code has it: a gravity points down
+    /// its frame (turned 90 degrees about z, along +x), others up; a drag's
+    /// strength is strength x pi x radius squared; a wind takes the
+    /// world's wind, of which the alpha has none.
+    #[test]
+    fn each_kinds_frame_setup_follows_the_360_code() {
+        let mut g = force(ForceKind::Gravity, 4.0);
+        let live = g.live(0.0, Vec3::new(1.0, 2.0, 3.0), 1.0);
+        assert!(live.direction.abs_diff_eq(Vec3::NEG_Y, 1e-5));
+        assert_eq!(live.at, Vec3::new(1.0, 2.0, 3.0));
+        g.turn[2] = plain(90.0);
+        assert!(
+            g.live(0.0, Vec3::ZERO, 1.0)
+                .direction
+                .abs_diff_eq(Vec3::X, 1e-5)
+        );
+        let up = force(ForceKind::Attractor, 1.0).live(0.0, Vec3::ZERO, 1.0);
+        assert!(up.direction.abs_diff_eq(Vec3::Y, 1e-5));
+        let mut d = force(ForceKind::Drag, 20.0);
+        d.radius = plain(0.1);
+        let k = d.live(0.0, Vec3::ZERO, 1.0).strength;
+        assert!((k - 20.0 * std::f32::consts::PI * 0.01).abs() < 1e-5, "{k}");
+        assert_eq!(
+            force(ForceKind::Wind, 5.0)
+                .live(0.0, Vec3::ZERO, 1.0)
+                .strength,
+            0.0
+        );
+        // Keyed settings are read at the effect's time.
+        let mut timed = force(ForceKind::Gravity, 0.0);
+        timed.strength = keyed(&[(0.0, 0.0), (10.0, 10.0)]);
+        assert!((timed.live(5.0, Vec3::ZERO, 1.0).strength - 5.0).abs() < 1e-5);
+    }
+
+    /// Each kind's pull on a particle (inferred: the per-particle step is
+    /// not yet traced): gravity by strength x forcegravity; drag by
+    /// strength x forcedrag / mass; an attractor towards its place and a
+    /// vortex about its axis, fading out at its range; wind nothing.
+    #[test]
+    fn each_kind_moves_a_particle() {
+        let mut e = burst();
+        e.gravity = 0.5;
+        e.drag = 1.0;
+        e.mass = 2.0;
+        let dt = 0.1;
+        let at = Vec3::new(2.0, 0.0, 0.0);
+        let v = Vec3::new(0.0, 0.0, 4.0);
+        let live = |f: ForceSpec| f.live(0.0, Vec3::ZERO, 1.0);
+        let g = live(force(ForceKind::Gravity, 10.0)).accelerate(&e, at, v, dt);
+        assert!(g.abs_diff_eq(Vec3::new(0.0, -0.5, 0.0), 1e-5), "{g}");
+        let mut drag = force(ForceKind::Drag, 20.0);
+        drag.radius = plain(1.0);
+        let k = 20.0 * std::f32::consts::PI * 1.0 / 2.0 * dt;
+        let dv = live(drag).accelerate(&e, at, v, dt);
+        assert!(dv.abs_diff_eq(-v * k.min(1.0), 1e-4), "{dv}");
+        let mut pull = force(ForceKind::Attractor, 3.0);
+        pull.range = plain(4.0);
+        pull.decay = plain(1.0);
+        // Half-way out: half the pull, towards the place.
+        let a = live(pull.clone()).accelerate(&e, at, v, dt);
+        assert!(a.abs_diff_eq(Vec3::new(-0.15, 0.0, 0.0), 1e-5), "{a}");
+        assert_eq!(
+            live(pull.clone()).accelerate(&e, Vec3::X * 5.0, v, dt),
+            Vec3::ZERO
+        );
+        let mut swirl = pull.clone();
+        swirl.kind = ForceKind::Vortex;
+        // About +y: at +x the turn is along -z, no inward share.
+        let s = live(swirl).accelerate(&e, at, v, dt);
+        assert!(s.abs_diff_eq(Vec3::new(0.0, 0.0, -0.15), 1e-5), "{s}");
+        assert_eq!(
+            live(force(ForceKind::Wind, 9.0)).accelerate(&e, at, v, dt),
+            Vec3::ZERO
+        );
+    }
+
+    /// An effect with forces moves by them alone; one without keeps the
+    /// earlier rise and fall.
+    #[test]
+    fn an_effect_with_forces_moves_by_them() {
+        let mut e = burst();
+        e.gravity = 1.0;
+        e.speed = plain(0.0);
+        let lib = library_with(e.clone(), vec![force(ForceKind::Gravity, -2.0)]);
+        let mut p = Particles::default();
+        p.spawn(&lib, 7, Vec3::ZERO, 0.0, 1.0);
+        for _ in 0..10 {
+            p.step(&lib, 0.05);
+        }
+        // Strength -2 along down: up at 2 m/s2.
+        let q = &p.instances[0].particles[0];
+        assert!(
+            q.velocity.y > 0.0 && (q.velocity.y - 2.0 * 0.5).abs() < 0.11,
+            "{:?}",
+            q.velocity
+        );
+    }
+
+    fn library_with(e: EmitterSpec, forces: Vec<ForceSpec>) -> Library {
         Library {
             effects: HashMap::from([(
                 7,
                 EffectSpec {
                     hash: 7,
                     emitters: vec![e],
+                    forces,
                 },
             )]),
             by_template: HashMap::from([(0x8000_0001, vec![7, 99])]),

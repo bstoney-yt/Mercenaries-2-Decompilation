@@ -104,6 +104,93 @@ pub mod setting {
     pub const RANGE: u32 = 0xe068_6a68;
     pub const DECAY: u32 = 0xc278_3a55;
     pub const RADIAL: u32 = 0xb46f_1f0c;
+    /// A drag force's radius (0.1 on all 255 that carry it): the 360 code
+    /// scales a drag's strength by pi times its square, drag by
+    /// cross-section area (from the 360 code, 0x821D9110). Its name is
+    /// unread.
+    pub const DRAG_RADIUS: u32 = 0x2f68_cd8f;
+}
+
+/// What a force does. The 360 effect format tags each `FRCE` with one of
+/// these names' hashes before its settings, and the 360 code reads them
+/// as kinds 0 to 4 (from the 360 code: the effect reader at 0x821E0C00,
+/// the per-frame setup at 0x821D9110). The PC export drops the tag: on
+/// the PC a force is only its `ATRB`s, so [`ForceKind::infer`] reads the
+/// kind from which settings it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForceKind {
+    /// The world's wind (the 360 code takes its direction and speed from
+    /// the world, not from the force's own settings).
+    Wind,
+    /// A pull along the force's down axis, by its strength.
+    Gravity,
+    /// Slowing, by strength x pi x radius squared.
+    Drag,
+    /// A pull towards the force's place, within its range.
+    Attractor,
+    /// A swirl about the force's axis, within its range.
+    Vortex,
+}
+
+impl ForceKind {
+    /// The kind's number in the 360 code (its runtime record's +0xa4).
+    pub const fn index(self) -> u32 {
+        match self {
+            Self::Wind => 0,
+            Self::Gravity => 1,
+            Self::Drag => 2,
+            Self::Attractor => 3,
+            Self::Vortex => 4,
+        }
+    }
+
+    /// The tag the 360 format stores: [`crate::name_hash`] of the kind's
+    /// name (wind, gravity, drag, attractor, vortex; matched against the
+    /// hashes the 360 reader compares).
+    pub const fn tag(self) -> u32 {
+        match self {
+            Self::Wind => 0xc9f7_a9d7,
+            Self::Gravity => 0x14bd_1bbd,
+            Self::Drag => 0xed79_1c4b,
+            Self::Attractor => 0xc235_456b,
+            Self::Vortex => 0xf4d8_5a49,
+        }
+    }
+
+    /// The kind a 360 tag names.
+    pub fn from_tag(tag: u32) -> Option<Self> {
+        [
+            Self::Wind,
+            Self::Gravity,
+            Self::Drag,
+            Self::Attractor,
+            Self::Vortex,
+        ]
+        .into_iter()
+        .find(|k| k.tag() == tag)
+    }
+
+    /// The kind of a PC force, from the settings it carries (inferred:
+    /// the PC data has no tag). A drag radius makes it a drag (255 forces);
+    /// a range with a radial share a vortex, a range without one an
+    /// attractor (137 carry range, decay and local, as the 360 code reads
+    /// for those two kinds); the rest (267) gravity: the 360 code reads
+    /// gravity's and wind's settings alike, and a wind ignores its own,
+    /// so the two can't be told apart here and gravity is taken.
+    pub fn infer(attrs: &[Attr]) -> Self {
+        let has = |name| find(attrs, name).is_some();
+        if has(setting::DRAG_RADIUS) {
+            Self::Drag
+        } else if has(setting::RANGE) {
+            if has(setting::RADIAL) {
+                Self::Vortex
+            } else {
+                Self::Attractor
+            }
+        } else {
+            Self::Gravity
+        }
+    }
 }
 
 /// The order of every `PTYP`'s 32 settings.
@@ -729,6 +816,41 @@ mod tests {
         assert_eq!(fx.shape_triangles(2), None);
         assert_eq!(fx.emitters[0].shape(), Some((0, 2)));
         assert_eq!(fx.emitters[1].shape(), None);
+    }
+
+    /// The five tags are the kinds' names hashed, numbered as the 360 code
+    /// numbers them; a PC force's kind follows the settings it carries.
+    #[test]
+    fn force_kinds_from_their_tags_and_settings() {
+        for (k, name, n) in [
+            (ForceKind::Wind, "wind", 0),
+            (ForceKind::Gravity, "gravity", 1),
+            (ForceKind::Drag, "drag", 2),
+            (ForceKind::Attractor, "attractor", 3),
+            (ForceKind::Vortex, "vortex", 4),
+        ] {
+            assert_eq!(k.tag(), name_hash(name), "{name}");
+            assert_eq!(ForceKind::from_tag(name_hash(name)), Some(k));
+            assert_eq!(k.index(), n);
+        }
+        assert_eq!(ForceKind::from_tag(0x1234_5678), None);
+        let a = |name: u32| Attr {
+            name: Some(name),
+            kind: 1,
+            flags: 0,
+            value: 1.0f32.to_le_bytes(),
+            keys: Vec::new(),
+        };
+        let base = vec![a(setting::UNKNOWN_3DC3D9DF), a(setting::POS_X)];
+        assert_eq!(ForceKind::infer(&base), ForceKind::Gravity);
+        let mut drag = base.clone();
+        drag.push(a(setting::DRAG_RADIUS));
+        assert_eq!(ForceKind::infer(&drag), ForceKind::Drag);
+        let mut attract = base.clone();
+        attract.extend([a(setting::LOCAL), a(setting::RANGE), a(setting::DECAY)]);
+        assert_eq!(ForceKind::infer(&attract), ForceKind::Attractor);
+        attract.push(a(setting::RADIAL));
+        assert_eq!(ForceKind::infer(&attract), ForceKind::Vortex);
     }
 
     #[test]
