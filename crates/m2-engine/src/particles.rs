@@ -393,7 +393,8 @@ impl LiveForce {
     /// - attractor: `r x strength x scale x fade / (d^3 + 1)` for a local
     ///   force, `r x strength x scale / (d^2 + 1)` otherwise; `fade` is
     ///   nothing past the range `R`, else `(1 - d/R)^decay` for a decay
-    ///   above 0 and `(d/R)^(1 - decay)` otherwise;
+    ///   above 0 and `(d/R)^-decay` otherwise (0 less the decay: the 360
+    ///   code subtracts from its zero register, 0x827DE134);
     /// - vortex, not local: `(radial x r / d + r x v) x strength x scale /
     ///   (d^3 + 1)`; local, in the force's own frame: `5 x radial` along
     ///   the particle's way out from the frame's x axis, plus `w x v`,
@@ -409,7 +410,7 @@ impl LiveForce {
             } else if self.decay > 0.0 {
                 (1.0 - d / self.range).powf(self.decay)
             } else {
-                (d / self.range).powf(1.0 - self.decay)
+                (d / self.range).powf(-self.decay)
             }
         };
         match self.kind {
@@ -1192,7 +1193,7 @@ mod tests {
         assert!(near(step(&[wind, live(light)], at), want));
         // A local attractor, strength 3, range 4, decay 1, 2 m off: pushed
         // out by r x 3 x (1 - 2/4) / (2^3 + 1); nothing past its range; a
-        // decay of -1 fades by (d/R)^2 instead.
+        // decay of -1 fades by (d/R)^1 = 0.5 instead (0 less the decay).
         let mut pull = force(ForceKind::Attractor, 3.0);
         pull.range = plain(4.0);
         pull.decay = plain(1.0);
@@ -1202,10 +1203,7 @@ mod tests {
         assert_eq!(step(&[live(pull.clone())], Vec3::X * 5.0), v);
         pull.decay = plain(-1.0);
         let a = step(&[live(pull.clone())], at);
-        assert!(
-            near(a, v + Vec3::X * (2.0 * 3.0 * 0.25 / 9.0 * 0.05)),
-            "{a}"
-        );
+        assert!(near(a, v + Vec3::X * (2.0 * 3.0 * 0.5 / 9.0 * 0.05)), "{a}");
         // Not local: r x 3 / (d^2 + 1), no range.
         pull.local = plain(0.0);
         let a = step(&[live(pull)], at);
