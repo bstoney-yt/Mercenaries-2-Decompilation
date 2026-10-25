@@ -27,9 +27,6 @@
 //!   (alpha under 0.1) the 182 emitters keyed below zero are painted black
 //!   (median brightness 0.01), as added textures are, while the 638 keyed
 //!   above zero carry colour there (median 0.37) that only blending hides;
-//! - the frame rate the keyed settings count in, 30 a second ([`FRAME`]):
-//!   at it a grenade gives off about 190 dirt chunks, at one a second
-//!   5,800;
 //! - `Size` as a particle's half-width in metres (the footage's small
 //!   fires stand 1 to 2 m tall; `Size` 0.5 to 1 as a full width drew them
 //!   a third of that), `Speed` in metres a second,
@@ -57,18 +54,20 @@ use m2_math::glam::{EulerRot, Quat, Vec3};
 use crate::assets::{AssetError, AssetSource};
 use crate::tuning::Table;
 
-/// The keyed settings' clock: frames a second (inferred).
-pub const FRAME: f32 = 30.0;
+/// The clock an effect's keyed settings count in: frames a second. From
+/// the 360 code: its curve reader (0x821DF920) takes the effect's time in
+/// seconds times the constant 60.0 at 0x82B7D884 (read, never written).
+pub const FRAME: f32 = 60.0;
 /// How long a constant-rate emitter gives off particles when its effect is
 /// set off once (an explosion's), seconds. Invented.
 pub const ONE_OFF: f32 = 0.5;
 /// How long a held effect runs past its source's last call, seconds
 /// (sources call every 0.3 to 0.4 s). Invented.
 pub const HOLD: f32 = 0.6;
-/// Most particles one emitter of one effect keeps.
-const EMITTER_BUDGET: usize = 400;
-/// Most particles in the world.
-const BUDGET: usize = 12_000;
+/// Most particles one emitter gives off in one step, and most in the world.
+/// From the 360 code (the spawn counts, 0x821DBE70 and 0x821DE7A0).
+const EMITTER_BUDGET: usize = 2_000;
+const BUDGET: usize = 15_000;
 
 /// One patch of an emitter's shape ([`m2_assets::effect::Triangle`]),
 /// where its particles start: its corners and normal in the emitter's
@@ -863,16 +862,13 @@ impl Particles {
                 };
                 let rate = (e.rate.at(clock) + self.spread(e.rate_var)).max(0.0);
                 inst.owed[k] += rate * dt;
-                let mine = inst
-                    .particles
-                    .iter()
-                    .filter(|p| usize::from(p.emitter) == k)
-                    .count();
+                let mut given = 0;
                 while inst.owed[k] >= 1.0 {
                     inst.owed[k] -= 1.0;
-                    if mine + 1 > EMITTER_BUDGET || total >= BUDGET {
+                    if given >= EMITTER_BUDGET || total >= BUDGET {
                         continue;
                     }
+                    given += 1;
                     let p = self.emit(e, k as u16, inst.at, inst.scale, frame);
                     inst.particles.push(p);
                     total += 1;
@@ -906,12 +902,14 @@ impl Particles {
         scale: f32,
         frame: f32,
     ) -> Particle {
-        let half = (e.spread.at(frame) + self.spread(e.spread_var))
-            .clamp(0.0, 180.0)
-            .to_radians();
-        // A direction within `half` of the axis, even over the cap.
-        let cos = 1.0 - self.random() * (1.0 - half.cos());
-        let sin = (1.0 - cos * cos).max(0.0).sqrt();
+        let half = (e.spread.at(frame) + self.spread(e.spread_var)).to_radians();
+        // A direction tilted from the axis by an angle even in 0 to `half`
+        // (so crowding the axis, not even over the cap), then turned about
+        // it by an even angle. From the 360 code (0x821D7880: two
+        // quaternions from its sine table, the tilt `random x spread`, the
+        // turn `random x 2 pi`).
+        let tilt = self.random() * half;
+        let (sin, cos) = tilt.sin_cos();
         let around = self.random() * std::f32::consts::TAU;
         let local = Vec3::new(sin * around.cos(), cos, sin * around.sin());
         // On its shape, flying out along the patch's normal (the patch's
@@ -922,8 +920,11 @@ impl Particles {
             None => (Vec3::ZERO, e.axis),
         };
         let dir = Quat::from_rotation_arc(Vec3::Y, axis.normalize_or(Vec3::Y)) * local;
-        let speed = (e.speed.at(frame) + self.spread(e.speed_var)).max(0.0);
-        let life = (e.life.at(frame) + self.spread(e.life_var)).max(0.05);
+        // Each a fresh draw on its spread, a speed not held above zero, a
+        // life held at or above zero (from the 360 code: 0x821DF920,
+        // 0x821DAE60).
+        let speed = e.speed.at(frame) + self.spread(e.speed_var);
+        let life = (e.life.at(frame) + self.spread(e.life_var)).max(0.0);
         Particle {
             at: at + (e.offset + start) * scale,
             velocity: dir * speed * scale,
@@ -1056,8 +1057,8 @@ mod tests {
         }
     }
 
-    /// A grenade-like burst: 300 a second for the first 3 frames, then
-    /// none; particles live 1 s.
+    /// A grenade-like burst: 300 a second for the first 6 frames (0.1 s at
+    /// [`FRAME`]), then none; particles live 1 s.
     fn burst() -> EmitterSpec {
         EmitterSpec {
             offset: Vec3::Y,
@@ -1068,7 +1069,7 @@ mod tests {
             size_var: 0.0,
             life: plain(1.0),
             life_var: 0.0,
-            rate: keyed(&[(0.0, 300.0), (3.0, 300.0), (3.0, 0.0)]),
+            rate: keyed(&[(0.0, 300.0), (6.0, 300.0), (6.0, 0.0)]),
             rate_var: 0.0,
             speed: plain(0.0),
             speed_var: 0.0,
@@ -1354,6 +1355,31 @@ mod tests {
         assert!(p.mean_distance(Vec3::new(100.0, 0.0, 0.0)) > 7.0);
     }
 
+    /// The 360 cone: the tilt from the axis is even in 0 to the spread, so
+    /// over a 90-degree spread it averages 45 degrees (even over the cap
+    /// it would average 57).
+    #[test]
+    fn particles_tilt_evenly_up_to_their_spread() {
+        let mut e = burst();
+        e.speed = plain(1.0);
+        e.spread = plain(90.0);
+        let mut p = Particles::default();
+        let n = 4000;
+        let mean: f32 = (0..n)
+            .map(|_| {
+                p.emit(&e, 0, Vec3::ZERO, 1.0, 0.0)
+                    .velocity
+                    .angle_between(Vec3::Y)
+            })
+            .sum::<f32>()
+            / n as f32;
+        assert!(
+            (mean.to_degrees() - 45.0).abs() < 1.5,
+            "{}",
+            mean.to_degrees()
+        );
+    }
+
     #[test]
     fn a_burst_gives_off_its_keyed_rate_then_ends() {
         let lib = library(burst());
@@ -1364,7 +1390,7 @@ mod tests {
         for _ in 0..12 {
             p.step(&lib, dt);
         }
-        // 300 a second over 3 frames (0.1 s), with one step's rounding.
+        // 300 a second over 6 frames (0.1 s), with one step's rounding.
         assert!((29..=31).contains(&p.live()), "{}", p.live());
         for _ in 0..80 {
             p.step(&lib, dt);

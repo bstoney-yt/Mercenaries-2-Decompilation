@@ -28,12 +28,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hashes.sort_unstable();
     let (mut n, mut rise_sum, mut spread_sum) = (0usize, 0.0f32, 0.0f32);
     let (mut up, mut down, mut level) = (0, 0, 0);
+    let (mut live_half, mut live_end) = (0usize, 0usize);
     for h in hashes {
         let mut p = Particles::default();
         p.spawn(&lib, h, Vec3::ZERO, 0.0, 1.0);
-        for _ in 0..60 {
+        for i in 0..60 {
             p.step(&lib, 1.0 / 30.0);
+            if i == 14 {
+                live_half += p.live();
+            }
         }
+        live_end += p.live();
         let at = p.positions();
         if at.is_empty() {
             continue;
@@ -52,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             level += 1;
         }
     }
+    println!("particles alive over every effect: {live_half} at 0.5 s, {live_end} at 2 s");
     println!(
         "{n} effects with particles at 2 s: mean rise {:.2} m, mean spread {:.2} m; rising {up}, falling {down}, level {level}",
         rise_sum / n.max(1) as f32,
