@@ -3,7 +3,9 @@ name: Beta release
 # Publishes the beta (the alpha's exe, which plays co-op) as a GitHub
 # Release, the download the co-op join page links to
 # (releases/latest/download/m2-beta-windows.zip). Run by pushing a tag
-# named beta-<something>, or by hand from the Actions tab.
+# named beta-<something>, or by hand from the Actions tab; by hand with
+# publish off, it only packs and checks the zip and keeps it as a run
+# artifact, so the packing can be tried without making a release.
 #
 # Our code only: the exe reads every game file from the player's own
 # install, and nothing of the game's is packed.
@@ -15,6 +17,10 @@ on:
       tag:
         description: 'Release tag to create (beta-YYYYMMDD...)'
         required: true
+      publish:
+        description: 'Create the GitHub Release (off: pack and check only)'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -26,34 +32,54 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    # The runner's service account may not run PowerShell scripts (its
+    # execution policy), so every step is a cmd command; the zip is made
+    # and listed with Windows' own tar.
+    defaults:
+      run:
+        shell: cmd
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
       - run: cargo build --release -p m2-alpha --target i686-pc-windows-msvc
       - name: Pack
-        shell: powershell
         run: |
-          $dist = "target\beta"
-          Remove-Item -Recurse -Force $dist -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory $dist | Out-Null
-          Copy-Item target\i686-pc-windows-msvc\release\m2-alpha.exe "$dist\m2-beta.exe"
-          @"
-          Mercenaries 2 beta ($env:TAG)
-
-          A fan rebuild of Mercenaries 2: World in Flames. It needs your own
-          installed copy of the PC game, which it reads; it brings none of the
-          game's files.
-
-          Run m2-beta.exe. If a friend's invite link copied an invite, it joins
-          them. To host: run m2-beta.exe --host; once it is up, the invite
-          link is on your clipboard to paste to a friend.
-
-          Source: https://github.com/bstoney-yt/Mercenaries-2-Decompilation
-          "@ | Set-Content "$dist\README.txt"
-          Compress-Archive -Path "$dist\*" -DestinationPath target\m2-beta-windows.zip -Force
+          set dist=target\beta
+          set zip=target\m2-beta-windows.zip
+          if exist %dist% rmdir /s /q %dist% || exit /b 1
+          if exist %zip% del /q %zip% || exit /b 1
+          mkdir %dist% || exit /b 1
+          copy /y target\i686-pc-windows-msvc\release\m2-alpha.exe %dist%\m2-beta.exe || exit /b 1
+          > %dist%\README.txt echo Mercenaries 2 beta (%TAG%)
+          >> %dist%\README.txt echo.
+          >> %dist%\README.txt echo A fan rebuild of Mercenaries 2: World in Flames. It needs your own
+          >> %dist%\README.txt echo installed copy of the PC game, which it reads; it brings none of the
+          >> %dist%\README.txt echo game's files.
+          >> %dist%\README.txt echo.
+          >> %dist%\README.txt echo Run m2-beta.exe. If a friend's invite link copied an invite, it joins
+          >> %dist%\README.txt echo them. To host: run m2-beta.exe --host; once it is up, the invite
+          >> %dist%\README.txt echo link is on your clipboard to paste to a friend.
+          >> %dist%\README.txt echo.
+          >> %dist%\README.txt echo Source: https://github.com/bstoney-yt/Mercenaries-2-Decompilation
+          tar -a -c -f %zip% -C %dist% m2-beta.exe README.txt || exit /b 1
+      # The zip holds exactly the exe and the README, and the exe isn't
+      # empty; anything else fails the run before a release is made.
+      - name: Check the zip
+        run: |
+          tar -t -f target\m2-beta-windows.zip > target\beta-list.txt || exit /b 1
+          type target\beta-list.txt
+          findstr /x /c:"m2-beta.exe" target\beta-list.txt > nul || (echo m2-beta.exe missing from the zip & exit /b 1)
+          findstr /x /c:"README.txt" target\beta-list.txt > nul || (echo README.txt missing from the zip & exit /b 1)
+          for /f %%n in ('find /c /v "" ^< target\beta-list.txt') do if not "%%n"=="2" (echo expected 2 files in the zip, found %%n & exit /b 1)
+          for %%f in (target\beta\m2-beta.exe) do if %%~zf LSS 1000000 (echo m2-beta.exe is only %%~zf bytes & exit /b 1)
+          echo zip checked: 2 files
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m2-beta-windows
+          path: target/m2-beta-windows.zip
+          retention-days: 7
       - name: Publish
-        shell: powershell
+        if: github.event_name == 'push' || inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create $env:TAG target\m2-beta-windows.zip --repo ${{ github.repository }} --target ${{ github.sha }} --title "Beta $env:TAG" --notes "Co-op beta. Needs your own install of Mercenaries 2 (PC). Download m2-beta-windows.zip, unzip, run m2-beta.exe."
+        run: gh release create %TAG% target\m2-beta-windows.zip --repo ${{ github.repository }} --target ${{ github.sha }} --title "Beta %TAG%" --notes "Co-op beta. Needs your own install of Mercenaries 2 (PC). Download m2-beta-windows.zip, unzip, run m2-beta.exe."
