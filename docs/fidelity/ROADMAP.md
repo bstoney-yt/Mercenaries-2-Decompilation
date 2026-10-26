@@ -17,11 +17,15 @@ unless the owner says otherwise.
   animation logic. Transitions use one fixed 0.25 s linear crossfade;
   playback rate uses an invented 0.6 to 1.4 clamp; the body split for aiming
   is derived from the skeleton; gait clips are found three different ways.
-  The game's own tables carry the missing data and are already in the
-  archives: the transition table (`ab8fe34b`), the state graph
-  (`ece70371`), and the `MinTimeScale`, `MaxTimeScale`, `PartitionMask`,
-  `ActionMask` and `LocomotionMask` columns. The clip decoder itself is
-  sound (all 4,232 clips, within 7.6e-6 of an independent decoder).
+  The archives very likely hold what is missing: a transition table
+  (`ab8fe34b`) and a state graph (`ece70371`), both located but not yet
+  decoded, and the `MinTimeScale`, `MaxTimeScale`, `PartitionMask`,
+  `ActionMask` and `LocomotionMask` columns, whose names are recovered but
+  whose values are not surveyed. How the engine consumes any of them is
+  not traced yet, so the first step is research, not a change. The clip
+  decoder reads the data soundly (all 4,232 clips agree with an
+  independent decoder within 7.6e-6; agreement between two decoders, not
+  verification against the original runtime).
 - **Character movement (M1, M2).** The controller is a conventional
   kinematic capsule: instant starts and stops, full air control, invented
   step, slope, jump and turn values. This feeds foot sliding as much as
@@ -46,7 +50,7 @@ XL (multi-thread or multi-week).
 | | |
 |---|---|
 | **Exists** | `m2_engine::Animator`: one clip with a crossfade, an optional upper-body clip, event cues, root pinning (`crates/m2-engine/src/anim.rs`) |
-| **Known about the original** | Clips are Havok 5.5 (recovered). Key-driven selection through action and clip tables (recovered for hijacks). Transition table and state graph exist (data), meaning unknown |
+| **Known about the original** | Clips are Havok 5.5 (recovered). Action and clip tables: data recovered, lookup order and precedence inferred (hijacks driven this way match footage). Transition table and state graph located, not decoded; their consumers not traced |
 | **Evidence** | Data in `vz.wad` (have parser for the table format); 360 code (consumers of the tables); PC and Xbox footage |
 | **Missing** | Transition data, time-scale limits, partition masks, state graph |
 | **Approximated** | Blend times and curve, rate clamp, upper-body mask |
@@ -61,7 +65,7 @@ XL (multi-thread or multi-week).
 | | |
 |---|---|
 | **Exists** | Tables `6802c321` / `e00b080c` / `182624e1` parsed and used for heroes, riders and hijacks; logs of each hero's picks |
-| **Known** | Action key to handle to clip, most-specific row wins (inferred) |
+| **Known** | Table data recovered; action key to handle to clip and most-specific row wins inferred; locomotion keys unknown |
 | **Evidence** | Data; 360 code for locomotion action keys |
 | **Missing** | Locomotion keys; a roster-wide coverage report |
 | **Approximated** | Gait handles inferred from speed; footage-matched picks |
@@ -76,7 +80,7 @@ XL (multi-thread or multi-week).
 | | |
 |---|---|
 | **Exists** | Node hierarchy from models; local = S·R·T (D3DX order); quaternions xyzw; skin matrices; clips bind by node name hash, with family rebinding |
-| **Known** | Format recovered from samples and checked by skinning every fitting clip (PR #8, static-mask order fix) |
+| **Known** | Format recovered from samples (data); checked by skinning every fitting clip and against an independent decoder (PR #8), not against the original runtime |
 | **Evidence** | Data |
 | **Missing** | 10 clips name nodes no model has; meaning of `trnm` signature |
 | **Approximated** | None found in this audit |
@@ -115,8 +119,8 @@ XL (multi-thread or multi-week).
 
 | | |
 |---|---|
-| **Exists** | Rapier ray-cast vehicle; engine, gearbox, clutch, brakes, per-axle springs and friction from templates; boats, helicopters, planes, bikes with their own blocks; many examples (`drivetest`, `handlingtest`, `susptest`, `steertest`, `biketest`, `boattest`, `wheelspin`) |
-| **Known** | Field names and values (recovered); their meaning (inferred); that the kit is Havok's (inferred from field names and Havok collision data) |
+| **Exists** | Rapier ray-cast vehicle; engine, gearbox, clutch, brakes, per-axle springs and friction from templates; boats, helicopters and motorbikes with their own blocks; many examples (`drivetest`, `handlingtest`, `susptest`, `steertest`, `biketest`, `boattest`, `wheelspin`) |
+| **Known** | Field values (recovered data); names matched by hash; their meaning (inferred); no consumer traced; that the kit is Havok's (inferred from field names and Havok collision data) |
 | **Evidence** | Data; 360 code; footage |
 | **Missing** | The step order, equations and constants of the original |
 | **Approximated** | Response shapes (easing, drag, climb help, track pull), every fallback constant |
@@ -131,7 +135,7 @@ XL (multi-thread or multi-week).
 | | |
 |---|---|
 | **Exists** | Damage falloff from templates for objects and parts; particle forces recovered from the 360 code (PR #161) |
-| **Known** | `Radius`, `Damage`, `MinDamage`, `MaxForce` per explosive (recovered) |
+| **Known** | `Radius`, `Damage`, `MinDamage`, `MaxForce` per explosive (recovered data, names matched by hash); consumer not traced |
 | **Missing** | How force is applied to rigid bodies and people |
 | **Approximated** | Fixed push velocities; vehicle blast falloff |
 | **Automatic validation** | Mass and distance sweep against an emulator |
@@ -153,7 +157,7 @@ XL (multi-thread or multi-week).
 | | |
 |---|---|
 | **Exists** | Own SWF parser, AVM1 interpreter and player; Scaleform texture fonts; the game's shell, pause, loading, PDA and HUD scripts running; native widget runtime with resolution correction; gamma-correct UI blending |
-| **Known** | Layout tables and correction rule (recovered from scripts); scale mode "show all" (inferred) |
+| **Known** | Layout tables and correction rule (recovered from the game's scripts; checked against footage at single resolutions); scale mode "show all" (inferred) |
 | **Evidence** | Data (the movies); footage |
 | **Missing** | Gradients, filters, blend modes beyond multiply, morph shapes, kerning, some HUD natives |
 | **Automatic validation** | Feature census; fixed-resolution screenshot harness across aspect ratios |
@@ -213,7 +217,7 @@ screen at all five resolutions.
 
 **F5: Vehicle model (P1, then P4).** The largest item. Research round to
 recover the vehicle step; a small emulator; then one vehicle class at a
-time (cars, then tanks, then bikes, boats, helicopters, planes), each
+time (cars, then tanks, then motorbikes, boats, helicopters), each
 gated on the race and vehicle contracts still completing.
 
 **Later:** ragdolls (A6), decoder residuals (A8), collision materials

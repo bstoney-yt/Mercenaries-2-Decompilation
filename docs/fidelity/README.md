@@ -31,21 +31,62 @@ From samples, From footage, Invented).
 
 | Level | Meaning | Module-doc tag |
 |---|---|---|
-| **Recovered** | Read directly from the original code or data | From the 360 code / From samples |
-| **Verified** | Matches an original-derived reference (an emulator of the 360 code, decoded data) numerically | From the 360 code, plus the test that pins it |
-| **Inferred** | Follows from several pieces of evidence but was not read directly | Inferred |
-| **Approximated** | Evidence is incomplete; values fitted to footage or measurements | Inferred (fitted) |
-| **Invented** | Original behavior unknown; chosen to work | Invented |
+| **Recovered** | Read directly from the original. Always say which kind: **recovered data** (a structure and its values, decoded from the game's files) or **recovered code** (a consumer traced in the 360 program: what the runtime does with the data) | From samples / From the 360 code |
+| **Verified** | Our Rust behavior matches a reference derived from recovered code (an emulator of the traced 360 function) on stated test cases, within a stated tolerance | From the 360 code, plus the test that pins it |
+| **Inferred** | Follows from several pieces of evidence, but nobody has read it directly | Inferred |
+| **Approximated** | The evidence is incomplete, so values were fitted to footage or measurements | Inferred (fitted) |
+| **Invented** | The original behavior is unknown, so we chose values that work | Invented |
 
-Matching an emulator of the 360 code is "Verified", not proof of hardware
-equivalence. Say which reference and tolerance were used.
+When the original behavior itself has not been established, the gap
+record says **Unknown** and names the research needed. Unknown describes
+the original. The five levels describe what we know about it.
+
+### What each step does and does not establish
+
+Recovery happens in separate steps. Each step proves only its own claim:
+
+1. **Data recovered.** We can parse a table, read its rows and name its
+   columns. This shows the structure and values exist. It does not show
+   how the runtime uses them. Example: decoding the transition table's
+   rows is recovered data.
+2. **Consumer traced.** We have found the 360 function that reads the data
+   and recovered what it computes: selection rules, equations, order,
+   defaults, how special values like -1 are handled. Only this step shows
+   how the original engine uses the data. Example: knowing how the engine
+   picks and applies a transition means tracing the code that reads the
+   transition table.
+3. **Reimplemented.** Our Rust code does what the traced consumer does.
+   This step is still unverified.
+4. **Verified.** A separate check compares our Rust against a reference
+   built from step 2, for example an emulator of the traced function, and
+   reports the error.
+
+Some evidence can look stronger than it is:
+
+- **Field names found by hash match.** The database keys fields by hash.
+  A name that hashes to a key (`MaxForce`, `GearOptRPM`) is a strong
+  match, but its meaning is still inferred until a consumer is traced.
+- **Agreement between two decoders.** If our decoder agrees with an
+  independent decoder, both read the data the same way. That is not
+  verification against the original runtime.
+- **Footage.** Footage is behavioral or visual evidence of what the player
+  saw. It can support Inferred or Approximated, and it can check a visible
+  result. It is never proof of the original's internal implementation.
+- **Working in play.** "It looks right" or "the contract completes" shows
+  the behavior is plausible. It does not show the behavior is recovered.
+
+Matching an emulator of the 360 code earns "Verified". It does not prove
+hardware equivalence (VMX128 rounding, denormals, operation order on the
+real CPU), and the record should say which reference and tolerance were
+used.
 
 ## Gap record
 
 Each gap in [GAPS.md](GAPS.md) has an id (`A` animation, `M` character
 movement, `P` physics, `U` UI), a class, a priority and these eight fields:
 
-1. **Original**: what the original game does (with its evidence level).
+1. **Original**: what the original game does, with its evidence level
+   (or Unknown), naming which step above each claim has reached.
 2. **Ours**: what the Rust implementation does now (file and line).
 3. **Difference**: what a player sees.
 4. **Likely cause**: the underlying cause, shared or local.
