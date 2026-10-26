@@ -3709,6 +3709,7 @@ fn mission_for_screenshot(
     let mut on_offer: Vec<String> = Vec::new();
     let mut box_up = 0.0f32;
     let mut accepting: Option<String> = None;
+    let mut offered_actions: Vec<u32> = Vec::new();
     let mut contract_done: Option<u32> = None;
     // With --contracts N, she plays on through the later contracts: the
     // tick the Nth was done, and how many have been.
@@ -3816,9 +3817,23 @@ fn mission_for_screenshot(
                     };
                     if offer != on_offer && !offer.is_empty() {
                         eprintln!("accept: on offer [{}]", offer.join(" "));
-                        for (g, shown, id, at) in link.context_list() {
-                            eprintln!("accept: context action {g:#x} {id:?} ({shown:?}) at {at:?}");
+                    }
+                    // While contracts are on offer, the context actions
+                    // offered, each time they change.
+                    let actions = if offer.is_empty() {
+                        Vec::new()
+                    } else {
+                        link.context_list()
+                    };
+                    let guids: Vec<u32> = actions.iter().map(|a| a.0).collect();
+                    if guids != offered_actions {
+                        for (g, shown, id, at) in &actions {
+                            eprintln!(
+                                "accept: {:.0} s: context action {g:#x} {id:?} ({shown:?}) at {at:?}",
+                                i as f32 * tick
+                            );
                         }
+                        offered_actions = guids;
                     }
                     on_offer = offer;
                 }
