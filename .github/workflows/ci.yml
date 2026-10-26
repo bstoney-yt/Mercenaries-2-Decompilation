@@ -30,6 +30,13 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# The runner's service account may not run PowerShell scripts (its
+# execution policy), and every step here is a plain command, so steps
+# run in cmd.
+defaults:
+  run:
+    shell: cmd
+
 jobs:
   host:
     name: Lint and test (host)
