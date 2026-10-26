@@ -448,6 +448,8 @@ pub struct WgpuBackend {
 
     shaders: HashMap<VertexLayout, wgpu::ShaderModule>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    /// The glow layer's pipelines for additive and translucent keys.
+    glow_pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     shadow_pipelines: HashMap<ShadowKey, wgpu::RenderPipeline>,
     /// When the backend started, for animated surfaces.
     started: std::time::Instant,
@@ -995,6 +997,7 @@ impl WgpuBackend {
             white,
             shaders: HashMap::new(),
             pipelines: HashMap::new(),
+            glow_pipelines: HashMap::new(),
             shadow_pipelines: HashMap::new(),
             cascades: std::cell::Cell::new(None),
             started: std::time::Instant::now(),
@@ -1527,58 +1530,87 @@ impl WgpuBackend {
             }),
             _ => None,
         };
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("standard"),
-            layout: Some(&self.pipeline_layout),
-            vertex: wgpu::VertexState {
-                module,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: u64::from(key.layout.stride()),
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &attributes,
-                })],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu_topology(key.topology)?,
-                strip_index_format: key.strip_index.map(wgpu_index_format),
-                // The game's triangles wind clockwise seen from their front in
-                // its right-handed world: anticlockwise on screen.
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: (!key.double_sided).then_some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(!translucent),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: Default::default(),
-                // Depth is reversed, so a positive bias is towards the camera.
-                bias: if key.depth_bias {
-                    wgpu::DepthBiasState {
-                        constant: 8,
-                        slope_scale: 1.0,
-                        clamp: 0.0,
-                    }
-                } else {
-                    Default::default()
+        let topology = wgpu_topology(key.topology)?;
+        let make = |entry: &str, blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&self.pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: u64::from(key.layout.stride()),
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &attributes,
+                    })],
                 },
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
-                    blend,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+                primitive: wgpu::PrimitiveState {
+                    topology,
+                    strip_index_format: key.strip_index.map(wgpu_index_format),
+                    // The game's triangles wind clockwise seen from their front in
+                    // its right-handed world: anticlockwise on screen.
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: (!key.double_sided).then_some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(!translucent),
+                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                    stencil: Default::default(),
+                    // Depth is reversed, so a positive bias is towards the camera.
+                    bias: if key.depth_bias {
+                        wgpu::DepthBiasState {
+                            constant: 8,
+                            slope_scale: 1.0,
+                            clamp: 0.0,
+                        }
+                    } else {
+                        Default::default()
+                    },
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        // The glow layer's (see `encode_glows`): a glow adds itself, by its
+        // alpha, in display values; a translucent surface hides what lies
+        // behind it by its alpha.
+        let glow = match key.blend {
+            BlendKind::Additive => Some(make("fs_glow", blend)),
+            BlendKind::Translucent => Some(make(
+                "fs_cover",
+                Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::Zero,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::Zero,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                }),
+            )),
+            _ => None,
+        };
+        let pipeline = make("fs_main", blend);
+        if let Some(glow) = glow {
+            self.glow_pipelines.insert(key.clone(), glow);
+        }
         self.pipelines.insert(key.clone(), pipeline);
         Ok(())
     }
@@ -1821,6 +1853,105 @@ impl WgpuBackend {
         })
     }
 
+    /// The frame's glows into the post pass's glow layer, in display
+    /// values, as the game adds them to its frame: its particle shaders
+    /// (346, 344) write the texture as stored times the vertex colour (a
+    /// key's colour times its brightness factor) times what the air keeps,
+    /// and its frame holds display values, so overlapping glows sum there,
+    /// past 1, until the composite (526) clips them white. The post pass
+    /// merges the layer into the world in display values first of all.
+    /// Every additive and translucent draw runs here in the world's order
+    /// against its depth: an additive one adds itself, a translucent one
+    /// hides the glows behind it by its alpha, as it hides them in the
+    /// game's frame.
+    fn encode_glows(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        draws: &[RecordedDraw],
+    ) -> Result<(), BackendError> {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("glows"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: self.post.glow_layer(),
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        // Nothing to add when the frame has no glow.
+        if !draws
+            .iter()
+            .any(|d| d.pipeline.blend == BlendKind::Additive)
+        {
+            return Ok(());
+        }
+        pass.set_bind_group(0, &self.frame_group, &[]);
+        pass.set_bind_group(3, &self.depth.group, &[]);
+        let mut pipeline_now: Option<&PipelineKey> = None;
+        let mut material_now = None;
+        let mut vertices_now = None;
+        let mut indices_now = None;
+        for (i, d) in draws.iter().enumerate() {
+            let Some(pipeline) = self.glow_pipelines.get(&d.pipeline) else {
+                continue;
+            };
+            if pipeline_now != Some(&d.pipeline) {
+                pass.set_pipeline(pipeline);
+                pipeline_now = Some(&d.pipeline);
+            }
+            pass.set_bind_group(1, &self.draw_group, &[(i as u64 * DRAW_STRIDE) as u32]);
+            if material_now != Some(d.material) {
+                let material = self
+                    .materials
+                    .get(&d.material)
+                    .map_or(&self.default_material, |m| &m.bind_group);
+                pass.set_bind_group(2, material, &[]);
+                material_now = Some(d.material);
+            }
+            if vertices_now != Some(d.vertex_buffer.0) {
+                let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
+                pass.set_vertex_buffer(0, vb.buffer.slice(..));
+                vertices_now = Some(d.vertex_buffer.0);
+            }
+            match d.geometry {
+                Geometry::Vertices { first, count } => {
+                    pass.draw(first..first + count, 0..d.instances);
+                }
+                Geometry::Indexed {
+                    buffer,
+                    first,
+                    count,
+                    base_vertex,
+                } => {
+                    if indices_now != Some(buffer.0) {
+                        let ib = self.index_buffers.get(buffer.0)?;
+                        pass.set_index_buffer(
+                            ib.buffer.slice(..),
+                            wgpu_index_format(ib.desc.format),
+                        );
+                        indices_now = Some(buffer.0);
+                    }
+                    pass.draw_indexed(first..first + count, base_vertex, 0..d.instances);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// One world pass over `draws`, the first of which is draw `first` of
     /// the frame. The first pass clears and draws the sky.
     fn encode_world(
@@ -1862,12 +1993,9 @@ impl WgpuBackend {
                     } else {
                         wgpu::LoadOp::Load
                     },
-                    // Kept for the copy water reads.
-                    store: if clear {
-                        wgpu::StoreOp::Store
-                    } else {
-                        wgpu::StoreOp::Discard
-                    },
+                    // Kept for the copy water reads and for the glows (see
+                    // `encode_glows`).
+                    store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
             }),
@@ -1890,6 +2018,10 @@ impl WgpuBackend {
         let mut vertices_now = None;
         let mut indices_now = None;
         for (i, d) in draws.iter().enumerate() {
+            // Glows draw into the glow layer instead (`encode_glows`).
+            if d.pipeline.blend == BlendKind::Additive {
+                continue;
+            }
             if pipeline_now != Some(&d.pipeline) {
                 pass.set_pipeline(&self.pipelines[&d.pipeline]);
                 pipeline_now = Some(&d.pipeline);
@@ -2160,6 +2292,7 @@ impl WgpuBackend {
                 false,
             )?;
         }
+        self.encode_glows(&mut encoder, draws)?;
         self.post.encode(&self.queue, &mut encoder, l, target);
         Ok(encoder.finish())
     }

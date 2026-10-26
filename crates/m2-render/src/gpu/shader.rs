@@ -671,8 +671,9 @@ fn layer_uv(i: u32, p: vec4<f32>) -> vec2<f32> {
     return vec2<f32>(dot(material.layer_uv[i * 2u], p), dot(material.layer_uv[i * 2u + 1u], p));
 }
 
-@fragment
-fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+// A surface's colour, light included, and its alpha, before the air it is
+// seen through.
+fn surface(v: Varyings, front: bool) -> vec4<f32> {
     let ground = material.maps.w > 0.5;
     let water = material.water.x > 0.5;
     // Water's map is its foam, drifting over world space.
@@ -896,15 +897,6 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         glow = glow * spec_texel;
     }
     rgb = rgb + glow;
-    if material.params.w > 0.5 {
-        // Per vertex as the game's, except over the sea's few huge
-        // triangles.
-        if water {
-            rgb = haze(rgb, v.world_pos);
-        } else {
-            rgb = through_air(rgb, v.haze);
-        }
-    }
     // Bright highlights make glass more opaque, as the game's shaders have it.
     var alpha = clamp(max(base.a, dot(spec_light, vec3<f32>(0.299, 0.587, 0.114))), 0.0, 1.0);
     if water {
@@ -918,6 +910,60 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         alpha = alpha * frame.surface.y;
     }
     return vec4<f32>(rgb, alpha);
+}
+
+@fragment
+fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    let s = surface(v, front);
+    var rgb = s.rgb;
+    if material.params.w > 0.5 {
+        // Per vertex as the game's, except over the sea's few huge
+        // triangles.
+        if material.water.x > 0.5 {
+            rgb = haze(rgb, v.world_pos);
+        } else {
+            rgb = through_air(rgb, v.haze);
+        }
+    }
+    return vec4<f32>(rgb, s.a);
+}
+
+// An additive surface (a glow) into the glow layer, in display values, as
+// the game adds its glows to its frame (its particle shaders, 346 and
+// 344: the texture as stored, times the vertex colour, times what the
+// air keeps; nothing scattered in). An unlit one with a vertex colour
+// (a particle) takes its texture as stored and its vertex colour as a
+// display value; any other is its colour turned to display values.
+@fragment
+fn fs_glow(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    let s = surface(v, front);
+    var rgb = pow(max(s.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+    if material.params.y < 0.5 && material.params.z > 0.5 {
+        let t = textureSample(base_map, base_sampler, v.uv);
+        rgb = srgb_encode(t.rgb) * material.color.rgb * v.color.rgb;
+    }
+    if material.params.w > 0.5 {
+        var keep = vec3<f32>(v.haze.a);
+        if frame.deck.y >= 0.0 {
+            keep = keep * frame.deck.yzw;
+        }
+        rgb = rgb * keep;
+    }
+    return vec4<f32>(rgb, s.a);
+}
+
+// A translucent surface over the glow layer: it hides what lies behind it
+// by its alpha, as it does the frame.
+@fragment
+fn fs_cover(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, surface(v, front).a);
+}
+
+// Light's stored (sRGB) value: undoes the decode a texture is sampled
+// through.
+fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
+    let x = max(c, vec3<f32>(0.0));
+    return select(1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055, x * 12.92, x <= vec3<f32>(0.0031308));
 }
 
 // Shadow casters with cut-out textures (leaves, fences) cut their shadow
@@ -1233,6 +1279,24 @@ mod tests {
         assert!(source(&layout).contains("out.color = v.a1.zyxw;"));
         let layout = VertexLayout::packed(&[(Position, Float3), (Color, UNorm4x8)]).unwrap();
         assert!(source(&layout).contains("out.color = v.a1;"));
+    }
+
+    /// Glows draw in display values: a particle's texture as stored times
+    /// its vertex colour, what the air keeps and nothing scattered in; a
+    /// translucent surface covers them by its alpha alone.
+    #[test]
+    fn glows_draw_in_display_values() {
+        let layout =
+            VertexLayout::packed(&[(Position, Float3), (TexCoord(0), Float2), (Color, Float4)])
+                .unwrap();
+        let src = source(&layout);
+        validate(&src);
+        assert!(src.contains("rgb = srgb_encode(t.rgb) * material.color.rgb * v.color.rgb;"));
+        assert!(src.contains("var keep = vec3<f32>(v.haze.a);"));
+        assert!(src.contains("return vec4<f32>(0.0, 0.0, 0.0, surface(v, front).a);"));
+        let glow = src.split("fn fs_glow").nth(1).unwrap();
+        let glow = glow.split("fn fs_cover").next().unwrap();
+        assert!(!glow.contains("through_air"));
     }
 
     #[test]

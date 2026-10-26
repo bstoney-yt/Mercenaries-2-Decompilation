@@ -32,6 +32,14 @@
 //! `BloomThreshold` is read but no game shader applies a threshold.
 //! `M2_GRADE_BLUR=off` restores the bright pass (PC round grade27).
 //!
+//! Glows: the world's additive surfaces draw into a glow layer of their own,
+//! in display values (the world shader's `fs_glow`), and the first pass
+//! merges it into the world in display values, as the game's frame holds
+//! them (its particle shaders 346 and 344 add glows to a frame of display
+//! values; its composite 526 then clips what passes the display range,
+//! which turns the overlapping glows of a big blast white). From the
+//! shaders. Its blur levels are held to the largest value its codec
+//! stores, as the game's are.//!
 //! Not done: the composite's motion blur (four taps along each pixel's
 //! movement since the last frame, from the depth map and
 //! `MotionBlurConstantX`/`Y`/`W`, scaled by `MotionBlurVelocityScale`) and
@@ -190,7 +198,27 @@ fn fs_game_down0(v: Screen) -> @location(0) vec4<f32> {
             c = c + to_game(s * exposure());
         }
     }
-    return vec4<f32>(pow(c * 0.25, vec3<f32>(2.5)), 1.0);
+    // The game stores the result in its codec (332 encodes it), which
+    // holds no more than its largest value.
+    return vec4<f32>(min(pow(c * 0.25, vec3<f32>(2.5)), vec3<f32>(codec_max())), 1.0);
+}
+
+// The largest value the game's HDR codec stores: its decode (see `packed`)
+// at 1.
+fn codec_max() -> f32 {
+    return 0.375 * 2.6667 + pow(0.625 * 255.0, 1.85);
+}
+
+// The world and the glow layer together, as the game's frame holds them:
+// its glows added in display values (see the world shader's `fs_glow`),
+// each channel held to 150 so its light (150^2.2, about 61,000) stays
+// within the half-float target.
+@fragment
+fn fs_merge(v: Screen) -> @location(0) vec4<f32> {
+    let c = textureSampleLevel(source, linear, v.uv, 0.0);
+    let g = textureSampleLevel(glow, linear, v.uv, 0.0).rgb;
+    let display = min(pow(max(c.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)) + g, vec3<f32>(150.0));
+    return vec4<f32>(pow(display, vec3<f32>(2.2)), c.a);
 }
 
 // Each level down: the average of 2 x 2 blocks of the one above.
@@ -403,10 +431,11 @@ struct Uniforms {
     blur: [f32; 4],
 }
 
-/// The passes, in order: bright, blur across, blur down, composite, then
-/// log luminance and its reductions down to one texel, adaptation, and
-/// the game's blur (see [`GAME_BLUR`]).
-const PASSES: usize = GAME_BLUR + 2 + 3 * LEVELS;
+/// The passes, by index: bright, blur across, blur down, composite, then
+/// log luminance and its reductions down to one texel, adaptation, the
+/// game's blur (see [`GAME_BLUR`]) and the merge of the glow layer
+/// ([`MERGE`]), which runs first.
+const PASSES: usize = GAME_BLUR + 3 + 3 * LEVELS;
 /// Side of each luminance image, from the frame's down to one texel.
 const LUMINANCE: [u32; 5] = [256, 64, 16, 4, 1];
 /// Pass indices.
@@ -417,7 +446,9 @@ const ADAPT: usize = LOG_LUMINANCE + LUMINANCE.len();
 /// The game's blur: the frame halved, then for each level halved again
 /// and blurred across and down, then the levels combined.
 const GAME_BLUR: usize = ADAPT + 1;
-const COMBINE: usize = PASSES - 1;
+const COMBINE: usize = GAME_BLUR + 1 + 3 * LEVELS;
+/// The glow layer merged into the world (see `fs_merge`), first of all.
+const MERGE: usize = PASSES - 1;
 /// The game's blur levels (its combine shader, 017, reads four).
 const LEVELS: usize = 4;
 /// What each of the game's blur levels divides the frame's sides by.
@@ -447,6 +478,7 @@ pub struct Post {
     game_down: wgpu::RenderPipeline,
     game_blur: wgpu::RenderPipeline,
     game_combine: wgpu::RenderPipeline,
+    merge: wgpu::RenderPipeline,
     uniforms: [wgpu::Buffer; PASSES],
     /// The world's floating-point target, and its texture (copied for
     /// water to mirror).
@@ -476,6 +508,10 @@ struct Images {
     half: wgpu::TextureView,
     levels: [[wgpu::TextureView; 2]; LEVELS],
     combined: wgpu::TextureView,
+    /// The world's glows in display values (the world shader's `fs_glow`),
+    /// and the world with them merged in, which every later pass reads.
+    glow_layer: wgpu::TextureView,
+    merged: wgpu::TextureView,
     /// Each pass's bind group, for each way round of `adapted`.
     groups: [[wgpu::BindGroup; PASSES]; 2],
 }
@@ -643,6 +679,7 @@ impl Post {
             game_down: pipeline("fs_game_down", HDR_FORMAT),
             game_blur: pipeline("fs_game_blur", HDR_FORMAT),
             game_combine: pipeline("fs_game_combine", HDR_FORMAT),
+            merge: pipeline("fs_merge", HDR_FORMAT),
             layout,
             sampler,
             uniforms,
@@ -692,6 +729,8 @@ impl Post {
         });
         let (cw, ch) = (width / LEVEL_DIVISORS[0], height / LEVEL_DIVISORS[0]);
         let combined = target(device, "blur", cw, ch);
+        let glow_layer = target(device, "glow layer", width, height);
+        let merged = target(device, "world and glows", width, height);
         let group = |i: usize, views: [&wgpu::TextureView; 5]| {
             let [source, glow, adapted, extra, extra2] = views;
             let view = |binding, view| wgpu::BindGroupEntry {
@@ -732,12 +771,13 @@ impl Post {
             let (before, now) = (&adapted[p], &adapted[1 - p]);
             let spare = &combined;
             std::array::from_fn(|i| match i {
-                BRIGHT => group(i, [&hdr, &glow[1], now, spare, spare]),
+                MERGE => group(i, [&hdr, &glow_layer, now, spare, spare]),
+                BRIGHT => group(i, [&merged, &glow[1], now, spare, spare]),
                 1 => group(i, [&glow[0], &hdr, now, spare, spare]),
                 2 => group(i, [&glow[1], &hdr, now, spare, spare]),
-                COMPOSITE => group(i, [&hdr, &glow[0], now, &combined, &half]),
+                COMPOSITE => group(i, [&merged, &glow[0], now, &combined, &half]),
                 ADAPT => group(i, [&luminance[last], &glow[0], before, spare, spare]),
-                GAME_BLUR => group(i, [&hdr, &glow[0], now, spare, spare]),
+                GAME_BLUR => group(i, [&merged, &glow[0], now, spare, spare]),
                 COMBINE => group(
                     i,
                     [
@@ -761,7 +801,7 @@ impl Post {
                 _ => {
                     let level = i - LOG_LUMINANCE;
                     let source = if level == 0 {
-                        &hdr
+                        &merged
                     } else {
                         &luminance[level - 1]
                     };
@@ -777,9 +817,17 @@ impl Post {
                 half,
                 levels,
                 combined,
+                glow_layer,
+                merged,
                 groups,
             },
         )
+    }
+
+    /// The layer the world's glows draw into, in display values (cleared
+    /// each frame by whoever draws them).
+    pub fn glow_layer(&self) -> &wgpu::TextureView {
+        &self.sized.glow_layer
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
@@ -957,6 +1005,7 @@ impl Post {
             pass.set_bind_group(0, group, &[]);
             pass.draw(0..3, 0..1);
         };
+        pass(&self.merge, &groups[MERGE], &self.sized.merged);
         if game || lighting.adaptation.is_some() {
             pass(
                 &self.log_luminance,
@@ -1007,6 +1056,22 @@ mod tests {
         .unwrap();
     }
 
+    /// The glow layer joins the world in display values, held to 150, and
+    /// the blur's first halving to the game codec's largest value.
+    #[test]
+    fn glows_merge_in_display_values() {
+        let s = super::SHADER;
+        assert!(s.contains(
+            "min(pow(max(c.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2)) + g, vec3<f32>(150.0))"
+        ));
+        assert!(s.contains("return vec4<f32>(pow(display, vec3<f32>(2.2)), c.a);"));
+        assert!(s.contains("min(pow(c * 0.25, vec3<f32>(2.5)), vec3<f32>(codec_max()))"));
+        // The codec's decode at 1: 1 + 159.375^1.85.
+        let max = 0.375f64 * 2.6667 + (0.625f64 * 255.0).powf(1.85);
+        assert!((max - 11_872.0).abs() < 2.0, "{max}");
+        assert!(150f64.powf(2.2) < 65_504.0);
+    }
+
     #[test]
     fn the_game_blur_passes_run_in_order_to_the_combine() {
         use super::*;
@@ -1017,8 +1082,10 @@ mod tests {
             }
         }
         seen.push(COMBINE);
-        let expected: Vec<usize> = (GAME_BLUR..PASSES).collect();
+        let expected: Vec<usize> = (GAME_BLUR..=COMBINE).collect();
         assert_eq!(seen, expected);
+        assert_eq!(MERGE, PASSES - 1);
+        assert_eq!(COMBINE + 1, MERGE);
         const { assert!(ADAPT < GAME_BLUR) };
         // Each level halves the one before.
         for pair in LEVEL_DIVISORS.windows(2) {

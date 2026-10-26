@@ -646,7 +646,9 @@ pub struct Sprite {
     pub turn: f32,
     /// Atlas rectangle: left, top, width, height.
     pub uv: [f32; 4],
-    /// Linear colour, brightness included, and alpha.
+    /// Colour, brightness included, and alpha: linear light for a blended
+    /// particle, display values for a glow (the renderer adds glows in
+    /// display values, as the game does).
     pub colour: [f32; 4],
     /// Added to the scene rather than blended over it.
     pub glow: bool,
@@ -1011,14 +1013,24 @@ fn sprite(e: &EmitterSpec, at: Vec3, t: f32, scale: f32, turn: f32) -> Option<Sp
         .get(((t * 99.0) as usize).min(e.colour.len().checked_sub(1)?))?;
     let [r, g, b, a] = key.rgba();
     let gain = key.intensity.abs();
-    let lin = |c: u8| srgb_to_linear(f32::from(c) / 255.0) * gain;
+    // A glow's colour stays a display value, as the game's particle shader
+    // takes it (346: the key's colour times its brightness factor): the
+    // renderer adds glows in display values (its glow layer).
+    let glow = key.intensity < 0.0;
+    let lin = |c: u8| {
+        if glow {
+            f32::from(c) / 255.0 * gain
+        } else {
+            srgb_to_linear(f32::from(c) / 255.0) * gain
+        }
+    };
     Some(Sprite {
         at,
         size,
         turn,
         uv,
         colour: [lin(r), lin(g), lin(b), f32::from(a) / 255.0],
-        glow: key.intensity < 0.0,
+        glow,
     })
 }
 
@@ -1408,10 +1420,11 @@ mod tests {
         assert_eq!(end.uv, [0.5, 0.0, 0.5, 0.5]);
         assert_eq!(start.size, 1.0);
         assert!((end.size - 2.98).abs() < 0.01);
-        // Negative brightness: a glow, its colour ten times over.
+        // Negative brightness: a glow, its colour ten times over, kept in
+        // display values.
         assert!(start.glow);
         assert!((start.colour[0] - 10.0).abs() < 1e-4);
-        assert!((start.colour[1] - 10.0 * srgb_to_linear(128.0 / 255.0)).abs() < 1e-4);
+        assert!((start.colour[1] - 10.0 * 128.0 / 255.0).abs() < 1e-4);
         assert_eq!(start.colour[3], 1.0);
         assert!(e.glows());
     }
