@@ -479,8 +479,17 @@ enum SatelliteShot {
     Bomb,
 }
 
-/// A `--satellite` call's spot lies this far ahead of her, metres.
+/// A `--satellite` call's spot lies this far ahead of her, metres
+/// (`M2_SAT_AHEAD=<m>` moves it, to measure the blast from nearer or
+/// farther).
 const SATELLITE_AHEAD: f32 = 45.0;
+
+fn satellite_ahead() -> f32 {
+    std::env::var("M2_SAT_AHEAD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SATELLITE_AHEAD)
+}
 
 /// The install its installer recorded in the registry (`Install Dir`,
 /// seen on one real install; whether every edition's installer writes
@@ -6869,7 +6878,7 @@ fn satellite_for_screenshot(
         return Ok(());
     };
     let her = p.character.position;
-    let spot = her + Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()) * SATELLITE_AHEAD;
+    let spot = her + Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()) * satellite_ahead();
     let goal = Vec2::new(spot.x, spot.z);
     game.support.grant(support::Kind::SatelliteBomb, 1, Some(1));
     let press = |game: &mut Game, intent: Intent| {
