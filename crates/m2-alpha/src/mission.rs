@@ -1451,6 +1451,20 @@ impl MissionLink {
             .collect()
     }
 
+    /// Every context action on offer, for the log: its object, its
+    /// prompt's text id and that text as shown, and where it stands (if
+    /// known).
+    pub fn context_list(&self) -> Vec<(u32, String, String, Option<Vec3>)> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        mission
+            .context_actions()
+            .into_iter()
+            .map(|(g, at, id, _)| (g, mission.text(&id), id, at.map(Vec3::from)))
+            .collect()
+    }
+
     /// The flow's contracts on offer now (not its jobs), in the scripts'
     /// order, while none is active: what a player off a contract goes to a
     /// starter for.

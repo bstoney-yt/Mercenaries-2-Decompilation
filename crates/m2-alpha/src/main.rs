@@ -3816,6 +3816,9 @@ fn mission_for_screenshot(
                     };
                     if offer != on_offer && !offer.is_empty() {
                         eprintln!("accept: on offer [{}]", offer.join(" "));
+                        for (g, shown, id, at) in link.context_list() {
+                            eprintln!("accept: context action {g:#x} {id:?} ({shown:?}) at {at:?}");
+                        }
                     }
                     on_offer = offer;
                 }
