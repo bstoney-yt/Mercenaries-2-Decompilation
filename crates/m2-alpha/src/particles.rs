@@ -511,7 +511,9 @@ fn sprite_light(lights: &[PointLight], at: Vec3) -> Vec3 {
 /// Sprite `s` as four vertices facing the camera (`right`, `up`).
 fn quad(out: &mut Vec<f32>, s: &Sprite, right: Vec3, up: Vec3, light: Vec3) {
     let (sin, cos) = s.turn.sin_cos();
-    let half = s.size;
+    // The corners at plus or minus half the width, as the game's particle
+    // vertex shaders put them (the PC's 346; the 360's PgFXVP).
+    let half = s.size * 0.5;
     let r = (right * cos + up * sin) * half;
     let u = (up * cos - right * sin) * half;
     let [l, t, w, h] = s.uv;
@@ -543,7 +545,7 @@ mod tests {
     fn a_quad_faces_the_camera_and_covers_its_atlas_cell() {
         let s = Sprite {
             at: Vec3::new(1.0, 2.0, 3.0),
-            size: 1.0,
+            size: 2.0,
             turn: 0.0,
             uv: [0.25, 0.5, 0.125, 0.25],
             colour: [2.0, 1.0, 0.5, 0.75],
@@ -552,7 +554,8 @@ mod tests {
         let mut v = Vec::new();
         quad(&mut v, &s, Vec3::X, Vec3::Y, Vec3::ZERO);
         assert_eq!(v.len(), 4 * VERTEX);
-        // Top left, then clockwise; 1 m each way from the middle.
+        // Top left, then clockwise; 1 m each way from the middle of a 2 m
+        // sprite.
         assert_eq!(&v[0..5], &[0.0, 3.0, 3.0, 0.25, 0.5]);
         assert_eq!(
             &v[2 * VERTEX..2 * VERTEX + 5],

@@ -31,18 +31,15 @@
 //!   `Spread` a cone's half angle in degrees about the emitter's up,
 //!   `life` in seconds, each `var` a plus-or-minus spread.
 //!
-//! From the 360 code (its sprite fill, 0x821E3F38): a sprite's size is its
-//! `Size` at its age (keys over 0 to 99) plus its `sizevar` times its own
-//! draw, in metres; its colour runs between neighbouring keys, its
-//! brightness factor that of the key below.
-//!
-//! Inferred against footage, not the code: the size is half the sprite's
-//! width. The PC's particle vertex shader (346) puts the corners at plus
-//! or minus half of what its vertex holds, and the 360's fill writes the
-//! size there unchanged, which would make it the full width; drawn so,
-//! the satellite bomb's fireball came out half the footage's and the
-//! small fires a third (the PC's own fill, which may double it, is not
-//! read).
+//! From the 360 code (its sprite fill, 0x821E3F38) and the particle vertex
+//! shaders (the PC's 346; the 360's PgFXVP, whose only corner constants
+//! are plus and minus 0.5): a sprite's width is its `Size` at its age
+//! (keys over 0 to 99) plus its `sizevar` times its own draw, in metres;
+//! its colour runs between neighbouring keys, its brightness factor that
+//! of the key below. (The alpha had taken `Size` as half the width,
+//! fitted to footage of small fires; drawn as the shaders have it, the
+//! satellite bomb's fireball is about half the size of Brendan's footage
+//! of one, which stays unexplained.)
 //!
 //! From the 360 code: how particles move once given off, by the effect's
 //! forces and their emitter's mass and per-kind scales ([`ForceSpec`],
@@ -651,7 +648,7 @@ pub fn template_runs(db: &Layer<'_>) -> HashMap<u32, Vec<EffectRun>> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sprite {
     pub at: Vec3,
-    /// Half its width, metres (see the module's provenance).
+    /// Its width, metres.
     pub size: f32,
     /// Turn about the view direction, radians.
     pub turn: f32,
