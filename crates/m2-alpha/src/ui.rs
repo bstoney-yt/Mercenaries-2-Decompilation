@@ -51,7 +51,7 @@ pub struct HudInfo {
     /// ("Equip Grenade Launcher").
     pub prompt: Option<String>,
     /// A hijack's button prompt is up and the keyboard plays: the keys
-    /// that press it ("K or flick the mouse down"), under the game's arrow
+    /// that press it ("Space"), under the game's icon
     /// ([`crate::hijack::key_hint`]).
     pub hijack_keys: Option<String>,
     /// Driving: the vehicle's name and speed (m/s), and whether it is
