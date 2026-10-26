@@ -26,14 +26,17 @@ const TURN: f32 = 5.0;
 /// The camera's pitch while she runs or drives, radians.
 const CRUISE_PITCH: f32 = -0.2;
 /// With nothing to do, she looks at what the scripts wait for her to
-/// see if it is within this far (metres), from at least this far off
-/// (invented: the camera rides behind her).
-const LOOK_NEAR: f32 = 60.0;
+/// see from within this far (metres), and from at least this far off
+/// (invented: the camera rides behind her). Looking from farther left
+/// the thing behind walls: in the story run's PmcCon001 she stood 60 m
+/// from the hall column, outside the villa, and looked at it 1,400 s
+/// without its coming on screen; it was seen from 8 m inside.
+const LOOK_NEAR: f32 = 15.0;
 const LOOK_FROM: f32 = 6.0;
 /// One farther than [`LOOK_NEAR`] but within this (metres) she walks back
-/// to first: in the story run's PmcCon001 the hall column's wait began
-/// while she stood 2 m from it, too near to see it, and she then took up
-/// ammo and fought her way 120 m off and stood there 1,400 s. Invented.
+/// to first, by the way round walls: in the story run's PmcCon001 the hall
+/// column's wait began while she stood 2 m from it, too near to see it,
+/// and she then took up ammo and fought her way 120 m off. Invented.
 const LOOK_SEEK: f32 = 300.0;
 /// Close enough to a place to be there, metres. Waiting there longer than
 /// this (seconds), she walks round it this far out: the scripts' region
@@ -2222,7 +2225,7 @@ impl Autoplay {
         {
             let here = p.character.position;
             return match sight_step(at, here) {
-                SightStep::Go => self.travel(game, at, LOOK_NEAR * 0.5, dt),
+                SightStep::Go => self.travel(game, at, LOOK_NEAR * 0.6, dt),
                 SightStep::BackOff => {
                     let away = here + (here - at).with_y(0.0).normalize_or(Vec3::X) * LOOK_FROM;
                     self.walk(game, away, 1.0, dt)
@@ -5052,8 +5055,8 @@ mod tests {
     use super::*;
 
     // A thing the scripts wait for her to see: the nearest within reach
-    // is chosen; too near she steps back, a few metres off she looks, far
-    // off she walks back to it, and beyond LOOK_SEEK she leaves it.
+    // is chosen; too near she steps back, a few metres off she looks, from
+    // 60 m or 120 m she walks back to it, and beyond LOOK_SEEK she leaves it.
     #[test]
     fn a_thing_to_see_is_gone_back_to_then_looked_at() {
         let here = Vec3::new(100.0, 0.0, 100.0);
@@ -5069,6 +5072,10 @@ mod tests {
         assert_eq!(
             sight_step(thing, thing + Vec3::new(8.0, -1.0, 0.0)),
             SightStep::Look
+        );
+        assert_eq!(
+            sight_step(thing, thing + Vec3::new(58.8, -1.0, -11.9)),
+            SightStep::Go
         );
         assert_eq!(
             sight_step(thing, thing + Vec3::new(120.0, -1.0, -8.0)),
