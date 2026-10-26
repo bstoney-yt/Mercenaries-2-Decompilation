@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 
 use m2_assets::layer::{LAYER_TYPE, Placement, TEMPLATE_DB_TYPE};
+use m2_assets::lua::SCRIPT_TYPE;
 use m2_assets::model::MODEL_TYPE;
 use m2_assets::model::Material;
 use m2_assets::path::PATH_TYPE;
@@ -292,6 +293,10 @@ pub struct Templates {
     pub durability: HashMap<u32, crate::durability::Durability>,
     /// The blasts of those with `Explosive`, by id.
     pub explosions: HashMap<u32, crate::durability::Explosion>,
+    /// The compiled script (`ObjectScript`) of those blasts that run one,
+    /// by id, as the archive holds it (the satellite bomb's sets the
+    /// light: `m2_game::atmosphere_script`).
+    pub blast_scripts: HashMap<u32, Vec<u8>>,
     /// How the templates that can be hijacked are, by id.
     pub hijack: HashMap<u32, Vec<crate::hijack::HijackEntrance>>,
     /// The radio templates' playlist and reach, by id
@@ -978,7 +983,15 @@ impl Templates {
             arms: crate::weapons::read(&db),
             localized: localized_names(&db),
             damage,
+            blast_scripts: HashMap::new(),
         };
+        for (id, script) in db.hashes("ObjectScript") {
+            if templates.explosions.contains_key(&id)
+                && let Ok(chunk) = source.asset(script, SCRIPT_TYPE)
+            {
+                templates.blast_scripts.insert(id, chunk);
+            }
+        }
         crate::standin::add_supply_drops(&mut templates);
         crate::standin::arm_the_osprey(&mut templates);
         (templates, atmosphere)

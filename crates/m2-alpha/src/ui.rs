@@ -650,7 +650,6 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
         painter.text(at, align, s, FontId::proportional(size), colour);
     };
     let white = Color32::from_gray(235);
-    flash(&ctx, screen, info.support.flash);
     // The scripts' fade to black (`MrxGui.GlobalFadeToBlack`), over all,
     // unless its movie (the loading screen) plays it.
     if let Some(black) = info
@@ -1029,23 +1028,6 @@ fn pda<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
         "P: close the PDA",
         14.0,
         Color32::from_gray(200),
-    );
-}
-
-/// The bomb's flash over everything, `strength` 1 at its brightest.
-fn flash(ctx: &egui::Context, screen: egui::Rect, strength: f32) {
-    if strength <= 0.0 {
-        return;
-    }
-    let alpha = (255.0 * strength.min(1.0)) as u8;
-    ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::new("flash"),
-    ))
-    .rect_filled(
-        screen,
-        0.0,
-        Color32::from_rgba_unmultiplied(255, 248, 220, alpha),
     );
 }
 
@@ -2117,7 +2099,6 @@ mod tests {
                     mark: Some(true),
                     size: 1.0,
                 }),
-                flash: 0.5,
                 ..SupportHud::default()
             },
             ..HudInfo::default()

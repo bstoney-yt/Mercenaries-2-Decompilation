@@ -6997,11 +6997,15 @@ fn satellite_for_screenshot(
     }
     eprintln!(
         "satellite: the bomb {}; her health {hp:.0} -> {:.0}, people standing {alive} -> {}, \
-         flash {:.2}, shaking {:.2} s",
+         script light {}, shaking {:.2} s",
         if landed { "landed" } else { "never landed" },
         game.combat.hp,
         game.scene.people.npcs.iter().filter(|n| n.alive).count(),
-        game.support.flash,
+        if game.sky.scripted() {
+            "showing"
+        } else {
+            "gone"
+        },
         game.support.shake.1
     );
     Ok(())
