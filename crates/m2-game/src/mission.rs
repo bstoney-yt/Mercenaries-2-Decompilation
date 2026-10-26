@@ -1030,7 +1030,11 @@ impl Mission {
                 }
             }
         }
-        self.world.borrow_mut().update_hibernation();
+        {
+            let mut w = self.world.borrow_mut();
+            w.update_hibernation();
+            w.tick_raw_clips(dt as f32);
+        }
         for t in self.events.take_trace() {
             self.log.push(format!("  t={:.1} event {t}", self.now));
         }
