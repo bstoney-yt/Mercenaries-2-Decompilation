@@ -1600,6 +1600,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             None => values([]),
         }
     })?;
+    // Object.SetPosition(object, x, y, z). What the scripts put somewhere
+    // starts there awake, as a spawn does ([`ScriptWorld::update_hibernation`]):
+    // `MrxUtil.SpawnActor` puts the HQs' `HqInterior` at their interior's
+    // anchor (3750, 450, -3840), kilometres from the faction's talkbox she
+    // stands at, and waits for it to be awake (`Event.ObjectHibernation`)
+    // before it loads the starter and teleports her inside (`MrxHq`'s
+    // `_OnInteriorLoad`; from the scripts). Story run B3: left asleep that
+    // far off, the UP HQ never let her in (inferred: the engine's own wake
+    // rule isn't read).
     add(&object, "SetPosition", |w, _, a| {
         if let (Some(guid), Some(x), Some(y), Some(z)) =
             (id(a.first()), num(a.get(1)), num(a.get(2)), num(a.get(3)))
@@ -1607,6 +1616,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             let position = [x, y, z];
             if let Some(o) = w.objects.get_mut(&guid) {
                 o.position = position;
+                o.awake = true;
+                w.fresh.push(guid);
             }
             w.commands.push(Command::Move { guid, position });
         }
@@ -3655,6 +3666,33 @@ mod tests {
         // After that look it sleeps as anything that far off does.
         w.update_hibernation();
         assert!(!w.is_awake(copter));
+    }
+
+    #[test]
+    fn what_the_scripts_put_far_off_is_awake_when_they_next_look() {
+        // The HQs' interior: `MrxUtil.SpawnActor` puts the `HqInterior`
+        // it finds at the interior's anchor, kilometres from her, and waits
+        // for it to be awake.
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.objects.get_mut(&1).unwrap().position = [0.0; 3];
+            w.objects.get_mut(&50).unwrap().position = [5000.0, 0.0, 0.0];
+            w.update_hibernation();
+            assert!(!w.is_awake(50));
+        }
+        host.lua()
+            .load(
+                "Object.SetPosition(Pg.GetGuidByName('_global_veh_jeep 0x0001'), 3750, 450, -3840)",
+            )
+            .exec()
+            .unwrap();
+        let mut w = world.borrow_mut();
+        w.update_hibernation();
+        assert!(w.is_awake(50));
+        // After that look it sleeps as anything that far off does.
+        w.update_hibernation();
+        assert!(!w.is_awake(50));
     }
 
     #[test]
