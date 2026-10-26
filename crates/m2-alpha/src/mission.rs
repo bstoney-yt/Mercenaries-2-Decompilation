@@ -3188,7 +3188,7 @@ impl MissionLink {
             {
                 return job.marks(marks, mission);
             }
-            return marks;
+            return unasked_off_contract(marks);
         };
         let ours = |m: &Mark| match &m.mission {
             Some(MarkFor::Id(i)) => i.eq_ignore_ascii_case(&id),
@@ -5857,9 +5857,50 @@ pub(crate) fn vehicle_models(name: &str, catalogue: &[CatalogueEntry]) -> Vec<Ca
     out
 }
 
+/// The marks a player off any contract, and on no job she was sent to,
+/// goes for: only those put up for a contract by name. The rest are the
+/// jobs' and collections' the flow has unlocked (PmcJob001's 100 treasures,
+/// marked for no mission, stand from the end of PmcCon001); a player picks
+/// a contract at a starter instead of running after them (story run B3:
+/// she called satellite bombs on treasures 2.5 km off from inside the PMC
+/// HQ).
+fn unasked_off_contract(marks: Vec<Mark>) -> Vec<Mark> {
+    marks
+        .into_iter()
+        .filter(|m| {
+            matches!(&m.mission, Some(MarkFor::Id(id))
+                if m2_game::script::is_contract_module(id) && id.get(3..6) == Some("Con"))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    // Off a contract, with no job asked for, she leaves the jobs' and
+    // collections' marks (named for a job, or for nothing) and keeps a
+    // contract's.
+    #[test]
+    fn off_a_contract_only_a_contracts_marks_are_followed() {
+        let mark = |name: &str, mission: Option<MarkFor>| Mark {
+            target: 1,
+            kind: "deliverable".into(),
+            name: name.into(),
+            at: Vec3::ZERO,
+            alive: true,
+            mission,
+            secondary: false,
+        };
+        let kept = unasked_off_contract(vec![
+            mark("treasure", None),
+            mark("job target", Some(MarkFor::Id("PmcJob001".into()))),
+            mark("objective", Some(MarkFor::Index(3))),
+            mark("contract", Some(MarkFor::Id("OilCon020".into()))),
+        ]);
+        let names: Vec<&str> = kept.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["contract"]);
+    }
 
     #[test]
     fn the_nearest_context_action_in_reach_is_offered() {
