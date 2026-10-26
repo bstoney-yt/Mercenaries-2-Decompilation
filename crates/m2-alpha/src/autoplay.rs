@@ -2218,15 +2218,7 @@ impl Autoplay {
         // looks at it from a few metres off.
         if !driving
             && let Some(p) = game.scene.player.as_ref()
-            && let Some(at) = self
-                .sights
-                .iter()
-                .copied()
-                .filter(|s| s.distance(p.character.position) < LOOK_SEEK)
-                .min_by(|a, b| {
-                    let here = p.character.position;
-                    a.distance(here).total_cmp(&b.distance(here))
-                })
+            && let Some(at) = nearest_sight(&self.sights, p.character.position)
         {
             let here = p.character.position;
             return match sight_step(at, here) {
@@ -5034,6 +5026,16 @@ enum SightStep {
     Look,
 }
 
+/// The nearest of the things the scripts wait for her to see that she
+/// will go back for (within [`LOOK_SEEK`] of `here`).
+fn nearest_sight(sights: &[Vec3], here: Vec3) -> Option<Vec3> {
+    sights
+        .iter()
+        .copied()
+        .filter(|s| s.distance(here) < LOOK_SEEK)
+        .min_by(|a, b| a.distance(here).total_cmp(&b.distance(here)))
+}
+
 /// What she does about a thing to see at `at` from `here`.
 fn sight_step(at: Vec3, here: Vec3) -> SightStep {
     if at.distance(here) >= LOOK_NEAR {
@@ -5049,21 +5051,27 @@ fn sight_step(at: Vec3, here: Vec3) -> SightStep {
 mod tests {
     use super::*;
 
-    // PmcCon001's hall column: 2 m off she steps back, 8 m off she looks,
-    // 120 m off she walks back to it.
+    // A thing the scripts wait for her to see: the nearest within reach
+    // is chosen; too near she steps back, a few metres off she looks, far
+    // off she walks back to it, and beyond LOOK_SEEK she leaves it.
     #[test]
     fn a_thing_to_see_is_gone_back_to_then_looked_at() {
-        let column = Vec3::new(2624.8, -12.8, -953.5);
+        let here = Vec3::new(100.0, 0.0, 100.0);
+        let near = here + Vec3::new(120.0, 2.0, 0.0);
+        let far = here + Vec3::new(LOOK_SEEK + 1.0, 0.0, 0.0);
+        assert_eq!(nearest_sight(&[far, near], here), Some(near));
+        assert_eq!(nearest_sight(&[far], here), None);
+        let thing = near;
         assert_eq!(
-            sight_step(column, column + Vec3::new(2.0, -1.0, 0.0)),
+            sight_step(thing, thing + Vec3::new(2.0, -1.0, 0.0)),
             SightStep::BackOff
         );
         assert_eq!(
-            sight_step(column, column + Vec3::new(8.0, -1.0, 0.0)),
+            sight_step(thing, thing + Vec3::new(8.0, -1.0, 0.0)),
             SightStep::Look
         );
         assert_eq!(
-            sight_step(column, column + Vec3::new(120.0, -1.0, -8.0)),
+            sight_step(thing, thing + Vec3::new(120.0, -1.0, -8.0)),
             SightStep::Go
         );
     }
