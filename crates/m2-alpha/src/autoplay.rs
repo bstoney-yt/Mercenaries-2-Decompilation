@@ -384,6 +384,12 @@ const REPLAN_MOVED: f32 = 5.0;
 /// is 4.6 km from the contract's start, over hills the ground's way never
 /// crossed (its ground way ended 1.7-2.2 km short). Invented numbers.
 const ROAD_FROM: f32 = 800.0;
+/// Once on her way by road, she keeps to it until the place is this near,
+/// flat, metres, so a place about [`ROAD_FROM`] off doesn't flip her
+/// between the road and the straight way each tick (PmcCon001 from the PMC's
+/// start, story run: 1,081 ways by road found in 2,900 s on a beach 796 to
+/// 800 m from the villa, and no headway). Invented.
+const ROAD_UNTIL: f32 = 500.0;
 const ROAD_REACH: f32 = 400.0;
 const ROAD_AHEAD: f32 = 120.0;
 const ROAD_REPLAN: f32 = 250.0;
@@ -3728,7 +3734,7 @@ impl Autoplay {
     /// the way, else `at` itself (no way by road, or near its end).
     fn by_road(&mut self, game: &Game, pos: Vec3, at: Vec3) -> Vec3 {
         let flat = |a: Vec3, b: Vec3| (a - b).with_y(0.0).length();
-        if flat(pos, at) < ROAD_FROM {
+        if !keeps_to_road(self.road_way.is_some(), flat(pos, at)) {
             self.road_way = None;
             return at;
         }
@@ -5015,9 +5021,26 @@ pub(crate) fn stuck_report(
     )
 }
 
+/// Whether she goes by road to a place `off` metres away, flat, when she
+/// is (`on_road`) or isn't on her way by road already.
+fn keeps_to_road(on_road: bool, off: f32) -> bool {
+    off >= if on_road { ROAD_UNTIL } else { ROAD_FROM }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // She takes to the road beyond ROAD_FROM and, once on it, keeps to it
+    // down to ROAD_UNTIL, so a place near ROAD_FROM can't flip her.
+    #[test]
+    fn the_road_is_kept_until_the_place_is_near() {
+        assert!(!keeps_to_road(false, 796.0));
+        assert!(keeps_to_road(false, 800.0));
+        assert!(keeps_to_road(true, 796.0));
+        assert!(keeps_to_road(true, ROAD_UNTIL));
+        assert!(!keeps_to_road(true, ROAD_UNTIL - 1.0));
+    }
 
     // A box of the carbine's rounds is wanted while it has room for them,
     // as walking over it takes it.
