@@ -445,13 +445,14 @@ frame rate in play. That needs a windowed run (`pace:` lines).
 | Frame rate per span | min 4, median 25, mean 29, max 60 fps; 17 of 31 spans under 30 fps |
 | Frames over 50 ms | 4,016 in 15.5 min (about 260 a minute) |
 | Stalls | 3 spans with a single frame over 1 s (worst 4,321 ms) |
+| Where each second went (mean of the 31 spans' `pace:` breakdown; spans nest, so parts overlap) | ticks 424 ms (game 212, scripts 203, of which Lua 118; player and physics 97; people 66; crews aboard 64), present 351 ms, draw 166 ms, stream 12 ms |
 
 So play then ran at about half the beta target and stuttered, while a
-single frame draws in under 8 ms at 720p. The gap may be per-frame work
-outside drawing (simulation, scripts, streaming hitches, or the window's
-present path). That is a hypothesis for R16 to measure with the timing
-breakdown (tick, scripts, streaming, draw, present) on the T12 route, not a
-finding, and no optimization should start before it.
+single frame draws in under 8 ms at 720p. The breakdown (on `main` since
+`18503c1`) shows two large costs: the fixed-step simulation (ticks) and
+present, which at 2560x1440 likely includes waiting on the GPU. That is
+uncontrolled evidence; R16 measures it on the T12 route at 1080p before
+any optimization.
 
 **Not yet measured:** the controlled 1080p benchmark (T12), a
 particle-heavy scene, a 60-minute session, and load time to the front end.

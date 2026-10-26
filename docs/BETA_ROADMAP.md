@@ -122,9 +122,13 @@ blocker for the co-op beta only.
   latest human playtest ran at a median 25 fps with about 260 frames over
   50 ms a minute and three stalls over 1 s, while a frame draws in 7.9 ms
   at 720p (BETA_READINESS.md, "Performance baseline"); neither figure is
-  controlled. First add per-part timings to the `pace:` line (tick,
-  scripts, streaming, draw, present); then run the controlled T12
-  benchmark (same hardware, 1920x1080, fixed settings, fixed route, warm-up,
+  controlled. The `pace:` line already carries per-part timings (ticks,
+  game, scripts, stream, draw, present; on `main` since `18503c1`), and
+  PR #165 adds the scripts' Lua memory. Averaged over playtest 12's 31
+  spans, each second spent 424 ms in ticks (game 212, scripts 203, Lua
+  118) and 351 ms in present, so both CPU simulation and present/GPU
+  matter [measured from its log; uncontrolled]. Next, run the controlled
+  T12 benchmark (same hardware, 1920x1080, fixed settings, fixed route, warm-up,
   duration) on the current `main` and fix the largest measured cost. No
   optimization before that measurement.
 

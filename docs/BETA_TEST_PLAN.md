@@ -381,7 +381,7 @@ running.
   points kept with the results).
 - **Timing:** 60 s warm-up after control of the hero (not measured), then
   10 minutes measured.
-- **Evidence:** `pace:` lines with the per-part breakdown from R16 (tick,
+- **Evidence:** `pace:` lines with their per-part breakdown (ticks, game,
   scripts, streaming, draw, present), CPU and GPU utilization and memory
   every 15 s.
 - **Pass:** median at least 60 fps; fewer than 60 frames over 50 ms per
