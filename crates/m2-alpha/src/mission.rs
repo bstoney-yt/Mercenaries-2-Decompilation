@@ -5966,8 +5966,10 @@ pub fn is_flow_contract(id: &str) -> bool {
 /// What a player taking a contract picks in a starter's box: in her menu
 /// (`Display`), the first option naming the title of a contract on
 /// `offered` (the HQ's reads `[yellow][shop.new] [white]"[OilCon020.Title]"`);
-/// in a contract's terms (`Scroll`, `[OilCon020.Terms.Summary]`) for one
-/// on offer, `[Generic.Accept]`. Options count from 1, as the scripts'
+/// in a contract's terms (`Scroll`, naming `[OilCon020.Terms.Summary]`)
+/// for one on offer, `[Generic.Accept]` (the first, when the box gives no
+/// options). Contracts are found by their localization tokens inside the
+/// shown text, whatever colour tags and quotes surround them. Options count from 1, as the scripts'
 /// callbacks get them. None: the box isn't one for taking a contract on
 /// offer.
 pub fn contract_pick(dialog: &OpenDialog, offered: &[String]) -> Option<(i64, String)> {
@@ -5984,13 +5986,21 @@ pub fn contract_pick(dialog: &OpenDialog, offered: &[String]) -> Option<(i64, St
             .iter()
             .enumerate()
             .find_map(|(i, o)| Some((number(i)?, names(o, ".Title]")?))),
+        // The terms box names the contract by its terms' token; with no
+        // options of its own it is the game's Accept and Decline, Accept
+        // first (a cancel picks 2: see [`DIALOG_BOXES`]).
         "Scroll" => {
-            let id = names(&dialog.text, ".")?;
-            let i = dialog
+            let id = names(&dialog.text, ".Terms")?;
+            let n = match dialog
                 .options
                 .iter()
-                .position(|o| o.contains("[Generic.Accept]"))?;
-            Some((number(i)?, id))
+                .position(|o| o.contains("[Generic.Accept]"))
+            {
+                Some(i) => number(i)?,
+                None if dialog.options.is_empty() => 1,
+                None => return None,
+            };
+            Some((n, id))
         }
         _ => None,
     }
@@ -6036,6 +6046,18 @@ mod tests {
         );
         assert_eq!(
             contract_pick(&terms, &offered),
+            Some((1, "OilCon020".into()))
+        );
+        // The terms box as the PMC HQ put it up in the story run (B3): no
+        // options of its own, so Accept is the first.
+        let real_terms = box_of(
+            "Scroll",
+            "\"[OilCon020.Title]\"\n\n[Briefing.Faction]: [flagpmc] [Generic.Factions.Pmc.Short]\n\n\
+             [OilCon020.Terms.Summary]\n\n[Generic.Rewards]:\n[OilCon020.Objectives.CustomReward]\n",
+            &[],
+        );
+        assert_eq!(
+            contract_pick(&real_terms, &offered),
             Some((1, "OilCon020".into()))
         );
         let other = box_of("Scroll", "[GurCon002.Terms.Summary]", &["[Generic.Accept]"]);
