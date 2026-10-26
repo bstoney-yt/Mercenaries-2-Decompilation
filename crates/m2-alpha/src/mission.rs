@@ -5964,32 +5964,33 @@ pub fn is_flow_contract(id: &str) -> bool {
 }
 
 /// What a player taking a contract picks in a starter's box: in her menu
-/// (`Display`), the first option that is the title of a contract on
-/// `offered` (`[OilCon020.Title]`); in a contract's terms (`Scroll`,
-/// `[OilCon020.Terms.Summary]`) for one on offer, `[Generic.Accept]`.
-/// Options count from 1, as the scripts' callbacks get them. None: the box
-/// isn't one for taking a contract on offer.
+/// (`Display`), the first option naming the title of a contract on
+/// `offered` (the HQ's reads `[yellow][shop.new] [white]"[OilCon020.Title]"`);
+/// in a contract's terms (`Scroll`, `[OilCon020.Terms.Summary]`) for one
+/// on offer, `[Generic.Accept]`. Options count from 1, as the scripts'
+/// callbacks get them. None: the box isn't one for taking a contract on
+/// offer.
 pub fn contract_pick(dialog: &OpenDialog, offered: &[String]) -> Option<(i64, String)> {
     let number = |i: usize| i64::try_from(i + 1).ok();
+    let names = |text: &str, tail: &str| {
+        offered
+            .iter()
+            .find(|c| text.contains(&format!("[{c}{tail}")))
+            .cloned()
+    };
     match dialog.method.as_str() {
-        "Display" => dialog.options.iter().enumerate().find_map(|(i, o)| {
-            let id = o.strip_prefix('[')?.strip_suffix(".Title]")?;
-            offered
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case(id))
-                .then(|| Some((number(i)?, id.to_owned())))
-                .flatten()
-        }),
+        "Display" => dialog
+            .options
+            .iter()
+            .enumerate()
+            .find_map(|(i, o)| Some((number(i)?, names(o, ".Title]")?))),
         "Scroll" => {
-            let id = dialog.text.strip_prefix('[')?.split('.').next()?;
-            if !offered.iter().any(|c| c.eq_ignore_ascii_case(id)) {
-                return None;
-            }
+            let id = names(&dialog.text, ".")?;
             let i = dialog
                 .options
                 .iter()
-                .position(|o| o.eq_ignore_ascii_case("[Generic.Accept]"))?;
-            Some((number(i)?, id.to_owned()))
+                .position(|o| o.contains("[Generic.Accept]"))?;
+            Some((number(i)?, id))
         }
         _ => None,
     }
@@ -6014,10 +6015,13 @@ mod tests {
         let menu = box_of(
             "Display",
             "[Briefing.RootMenuDialog]",
+            // As the PMC HQ's menu offered them in the story run (B3).
             &[
                 "[PmcJob001.Title]",
                 "[GurCon002.Title]",
-                "[OilCon020.Title]",
+                "[yellow][shop.new] [white]\"[OilCon020.Title]\"",
+                "[yellow][shop.new] [white]\"[PmcCon031.Title]\" ([Generic.Level] 1)",
+                "[Briefing.Hint]",
                 "[Generic.Exit]",
             ],
         );
