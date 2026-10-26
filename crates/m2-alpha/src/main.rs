@@ -5036,12 +5036,23 @@ fn mission_for_screenshot(
                 }
             }
         }
+        // The scripts' Lua memory every five minutes of play, so a long run
+        // shows whether it grows.
+        if i > 0
+            && i % (LUA_LOG_EVERY / tick).round().max(1.0) as u32 == 0
+            && let Some(kb) = link.lua_kb()
+        {
+            eprintln!("lua: {kb} KB after {:.0} s of play", i as f32 * tick);
+        }
         if auto.is_some() && link.contracts_completed() > contracts_seen {
             contracts_seen = link.contracts_completed();
             eprintln!(
-                "autoplay: contract {contracts_seen} completed after {:.1} s of play ({:.0} s here)",
+                "autoplay: contract {contracts_seen} completed after {:.1} s of play ({:.0} s here){}",
                 i as f32 * tick,
-                played.elapsed().as_secs_f32()
+                played.elapsed().as_secs_f32(),
+                link.lua_kb()
+                    .map(|kb| format!("; lua {kb} KB"))
+                    .unwrap_or_default()
             );
             contract_done.get_or_insert(i);
             // She stops playing once the last asked for is done; the
@@ -7485,6 +7496,9 @@ fn demolish_for_screenshot(
 /// Seconds between the frame-rate lines play logs ([`Pace`]).
 const PACE_EVERY: f32 = 30.0;
 
+/// Seconds of play between a headless run's `lua:` memory lines.
+const LUA_LOG_EVERY: f32 = 300.0;
+
 /// The frame rate in play, logged every [`PACE_EVERY`] seconds as a
 /// `pace:` line: frames a second, the slowest frame, and how many frames
 /// took over 50 ms (under 20 fps), so a playtest's log says where play
@@ -8069,8 +8083,12 @@ impl Running {
         if let Some((line, span)) = self.pace.frame(now, (w, h)) {
             let s = &self.game.scene;
             let p = self.game.focus();
+            let lua = match self.mission.as_ref().and_then(mission::MissionLink::lua_kb) {
+                Some(kb) => format!("; lua {kb} KB"),
+                None => String::new(),
+            };
             eprintln!(
-                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders; ms a second: {}",
+                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders; ms a second: {}{lua}",
                 p.x,
                 p.z,
                 s.vehicles.len(),

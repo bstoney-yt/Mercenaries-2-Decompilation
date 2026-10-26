@@ -3714,6 +3714,16 @@ impl MissionLink {
         self.contracts
     }
 
+    /// The kilobytes the scripts' Lua state holds, while they run: logged
+    /// with each `pace:` line so a long session shows whether it grows
+    /// (one run ran out of Lua reference slots).
+    pub fn lua_kb(&self) -> Option<usize> {
+        match &self.state {
+            State::Running(m) => Some(m.lua().used_memory() / 1024),
+            _ => None,
+        }
+    }
+
     /// The newest of the scripts' fanfare calls (`Hud.Fanfare`) whose
     /// callback is still to be called: the contract's, which the flow
     /// waits on until the fanfare's Enter closes it.
