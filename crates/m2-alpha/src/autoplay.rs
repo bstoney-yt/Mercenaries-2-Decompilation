@@ -30,6 +30,11 @@ const CRUISE_PITCH: f32 = -0.2;
 /// (invented: the camera rides behind her).
 const LOOK_NEAR: f32 = 60.0;
 const LOOK_FROM: f32 = 6.0;
+/// One farther than [`LOOK_NEAR`] but within this (metres) she walks back
+/// to first: in the story run's PmcCon001 the hall column's wait began
+/// while she stood 2 m from it, too near to see it, and she then took up
+/// ammo and fought her way 120 m off and stood there 1,400 s. Invented.
+const LOOK_SEEK: f32 = 300.0;
 /// Close enough to a place to be there, metres. Waiting there longer than
 /// this (seconds), she walks round it this far out: the scripts' region
 /// may lie to a side of their marker.
@@ -2209,28 +2214,31 @@ impl Autoplay {
             .as_ref()
             .is_some_and(|p| p.driving.is_some());
         // Nothing marked, and the scripts wait for her to look at
-        // something near: she looks at it, from a few metres off.
+        // something: she goes back near it if she has wandered off, then
+        // looks at it from a few metres off.
         if !driving
             && let Some(p) = game.scene.player.as_ref()
             && let Some(at) = self
                 .sights
                 .iter()
                 .copied()
-                .filter(|s| s.distance(p.character.position) < LOOK_NEAR)
+                .filter(|s| s.distance(p.character.position) < LOOK_SEEK)
                 .min_by(|a, b| {
                     let here = p.character.position;
                     a.distance(here).total_cmp(&b.distance(here))
                 })
         {
             let here = p.character.position;
-            if (at - here).with_y(0.0).length() < LOOK_FROM {
-                let away = here + (here - at).with_y(0.0).normalize_or(Vec3::X) * LOOK_FROM;
-                return self.walk(game, away, 1.0, dt);
-            }
-            let (look, _) = aim(p, at, dt);
-            return Intent {
-                look,
-                ..Intent::default()
+            return match sight_step(at, here) {
+                SightStep::Go => self.travel(game, at, LOOK_NEAR * 0.5, dt),
+                SightStep::BackOff => {
+                    let away = here + (here - at).with_y(0.0).normalize_or(Vec3::X) * LOOK_FROM;
+                    self.walk(game, away, 1.0, dt)
+                }
+                SightStep::Look => Intent {
+                    look: aim(p, at, dt).0,
+                    ..Intent::default()
+                },
             };
         }
         Intent {
@@ -5015,9 +5023,50 @@ pub(crate) fn stuck_report(
     )
 }
 
+/// What she does about something the scripts wait for her to see.
+#[derive(Debug, PartialEq)]
+enum SightStep {
+    /// Go back near it.
+    Go,
+    /// Step off: too near for the camera to see it.
+    BackOff,
+    /// Look at it.
+    Look,
+}
+
+/// What she does about a thing to see at `at` from `here`.
+fn sight_step(at: Vec3, here: Vec3) -> SightStep {
+    if at.distance(here) >= LOOK_NEAR {
+        SightStep::Go
+    } else if (at - here).with_y(0.0).length() < LOOK_FROM {
+        SightStep::BackOff
+    } else {
+        SightStep::Look
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PmcCon001's hall column: 2 m off she steps back, 8 m off she looks,
+    // 120 m off she walks back to it.
+    #[test]
+    fn a_thing_to_see_is_gone_back_to_then_looked_at() {
+        let column = Vec3::new(2624.8, -12.8, -953.5);
+        assert_eq!(
+            sight_step(column, column + Vec3::new(2.0, -1.0, 0.0)),
+            SightStep::BackOff
+        );
+        assert_eq!(
+            sight_step(column, column + Vec3::new(8.0, -1.0, 0.0)),
+            SightStep::Look
+        );
+        assert_eq!(
+            sight_step(column, column + Vec3::new(120.0, -1.0, -8.0)),
+            SightStep::Go
+        );
+    }
 
     // A box of the carbine's rounds is wanted while it has room for them,
     // as walking over it takes it.
