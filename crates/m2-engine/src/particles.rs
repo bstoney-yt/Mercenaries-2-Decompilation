@@ -27,11 +27,22 @@
 //!   (alpha under 0.1) the 182 emitters keyed below zero are painted black
 //!   (median brightness 0.01), as added textures are, while the 638 keyed
 //!   above zero carry colour there (median 0.37) that only blending hides;
-//! - `Size` as a particle's half-width in metres (the footage's small
-//!   fires stand 1 to 2 m tall; `Size` 0.5 to 1 as a full width drew them
-//!   a third of that), `Speed` in metres a second,
+//! - `Speed` in metres a second,
 //!   `Spread` a cone's half angle in degrees about the emitter's up,
 //!   `life` in seconds, each `var` a plus-or-minus spread.
+//!
+//! From the 360 code (its sprite fill, 0x821E3F38): a sprite's size is its
+//! `Size` at its age (keys over 0 to 99) plus its `sizevar` times its own
+//! draw, in metres; its colour runs between neighbouring keys, its
+//! brightness factor that of the key below.
+//!
+//! Inferred against footage, not the code: the size is half the sprite's
+//! width. The PC's particle vertex shader (346) puts the corners at plus
+//! or minus half of what its vertex holds, and the 360's fill writes the
+//! size there unchanged, which would make it the full width; drawn so,
+//! the satellite bomb's fireball came out half the footage's and the
+//! small fires a third (the PC's own fill, which may double it, is not
+//! read).
 //!
 //! From the 360 code: how particles move once given off, by the effect's
 //! forces and their emitter's mass and per-kind scales ([`ForceSpec`],
@@ -640,7 +651,7 @@ pub fn template_runs(db: &Layer<'_>) -> HashMap<u32, Vec<EffectRun>> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sprite {
     pub at: Vec3,
-    /// Half its width, metres.
+    /// Half its width, metres (see the module's provenance).
     pub size: f32,
     /// Turn about the view direction, radians.
     pub turn: f32,
@@ -660,7 +671,7 @@ struct Particle {
     velocity: Vec3,
     age: f32,
     life: f32,
-    /// Its own size factor (1 plus or minus the spread).
+    /// Its effect's scale.
     scale: f32,
     turn: f32,
     spin: f32,
@@ -932,7 +943,7 @@ impl Particles {
             velocity: dir * speed * scale,
             age: 0.0,
             life,
-            scale: (1.0 + self.spread(e.size_var)).max(0.05) * scale,
+            scale,
             turn: self.spread(e.turn * 0.5).to_radians(),
             spin: e.spin.to_radians(),
             emitter,
@@ -992,7 +1003,7 @@ impl Particles {
             };
             for p in &inst.particles {
                 let e = &spec.emitters[usize::from(p.emitter)];
-                if let Some(s) = sprite(e, p.at, p.age / p.life, p.scale, p.turn) {
+                if let Some(s) = sprite(e, p.at, p.age / p.life, p.scale, p.draw, p.turn) {
                     out.push(s);
                 }
             }
@@ -1000,18 +1011,30 @@ impl Particles {
     }
 }
 
-/// Emitter `e`'s particle `t` (0 to 1) through its life.
-fn sprite(e: &EmitterSpec, at: Vec3, t: f32, scale: f32, turn: f32) -> Option<Sprite> {
+/// Emitter `e`'s particle `t` (0 to 1) through its life, its draw `draw`,
+/// its effect drawn `scale` times its size.
+///
+/// From the 360 code (its sprite fill, 0x821E3F38): the width is the size
+/// keys at `99 t` plus the size spread times the particle's draw
+/// (0x821DFEF0); the colour runs between the key at `99 t` and the next
+/// by the fraction between, in steps of 1/255, the brightness factor
+/// that of the lower key (0x821E2C98).
+fn sprite(e: &EmitterSpec, at: Vec3, t: f32, scale: f32, draw: f32, turn: f32) -> Option<Sprite> {
     let t = t.clamp(0.0, 1.0);
     let n = e.frames.len();
     let uv = *e
         .frames
         .get(((t * n as f32) as usize).min(n.checked_sub(1)?))?;
-    let size = e.size.at(t * 99.0) * scale;
-    let key = e
-        .colour
-        .get(((t * 99.0) as usize).min(e.colour.len().checked_sub(1)?))?;
-    let [r, g, b, a] = key.rgba();
+    let size = (e.size.at(t * 99.0) + draw * e.size_var) * scale;
+    let last = e.colour.len().checked_sub(1)?;
+    let at99 = t * 99.0;
+    let i = (at99 as usize).min(last);
+    let key = e.colour.get(i)?;
+    let next = e.colour.get((i + 1).min(last))?;
+    let step = ((at99 - i as f32) * 255.0) as i32;
+    let blend = |a: u8, b: u8| ((((i32::from(b) - i32::from(a)) * step) >> 8) + i32::from(a)) as u8;
+    let ([r0, g0, b0, a0], [r1, g1, b1, a1]) = (key.rgba(), next.rgba());
+    let [r, g, b, a] = [blend(r0, r1), blend(g0, g1), blend(b0, b1), blend(a0, a1)];
     let gain = key.intensity.abs();
     // A glow's colour stays a display value, as the game's particle shader
     // takes it (346: the key's colour times its brightness factor): the
@@ -1411,11 +1434,38 @@ mod tests {
         assert_eq!(p.running(), 0);
     }
 
+    /// As the 360 fills a sprite (0x821E3F38): the size spread adds its
+    /// draw in metres; the colour runs between neighbouring keys, the
+    /// brightness factor that of the lower key.
+    #[test]
+    fn sprites_take_their_spread_in_metres_and_blend_their_keys() {
+        let mut e = burst();
+        e.size = plain(7.0);
+        e.size_var = 2.0;
+        e.colour = (0..100)
+            .map(|i| {
+                key(
+                    [if i % 2 == 0 { 0 } else { 200 }, 0, 0, 255],
+                    -(i as f32) - 1.0,
+                )
+            })
+            .collect();
+        let at = |t: f32, draw: f32| sprite(&e, Vec3::ZERO, t, 1.0, draw, 0.0).unwrap();
+        assert_eq!(at(0.0, 1.0).size, 9.0);
+        assert_eq!(at(0.0, -1.0).size, 5.0);
+        assert_eq!(at(0.0, 0.5).size, 8.0);
+        // Half-way from key 10 (red 0) to key 11 (red 200): 127 / 256 of
+        // the way, the factor key 10's (11).
+        let s = at(10.5 / 99.0, 0.0);
+        let red = (200 * 127 / 256) as f32 / 255.0 * 11.0;
+        assert!((s.colour[0] - red).abs() < 0.05, "{:?}", s.colour);
+    }
+
     #[test]
     fn sprites_flip_through_frames_and_follow_the_keys() {
         let e = burst();
-        let start = sprite(&e, Vec3::ZERO, 0.0, 1.0, 0.0).unwrap();
-        let end = sprite(&e, Vec3::ZERO, 0.99, 1.0, 0.0).unwrap();
+        let start = sprite(&e, Vec3::ZERO, 0.0, 1.0, 0.0, 0.0).unwrap();
+        let end = sprite(&e, Vec3::ZERO, 0.99, 1.0, 0.0, 0.0).unwrap();
         assert_eq!(start.uv, [0.0, 0.0, 0.5, 0.5]);
         assert_eq!(end.uv, [0.5, 0.0, 0.5, 0.5]);
         assert_eq!(start.size, 1.0);
@@ -1524,6 +1574,6 @@ mod tests {
     fn an_emitter_without_atlas_frames_draws_nothing() {
         let mut e = burst();
         e.frames.clear();
-        assert!(sprite(&e, Vec3::ZERO, 0.5, 1.0, 0.0).is_none());
+        assert!(sprite(&e, Vec3::ZERO, 0.5, 1.0, 0.0, 0.0).is_none());
     }
 }
