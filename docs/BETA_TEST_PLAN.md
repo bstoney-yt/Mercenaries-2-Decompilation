@@ -82,9 +82,12 @@ cargo build --release -p m2-alpha
 ```
 
 Pass: all exit 0 (E1), the CI workflow is green on the same commit (E2),
-and every platform named in the E3 decision passes its build and tests
-(Linux: `cargo test --workspace` on a Linux host, if supported). Record
-test totals.
+and the Windows x64 and i686 builds and tests pass (E3; Windows is the
+supported platform). A Linux `cargo test --workspace` is best-effort: run
+it when a Linux host is available and record the result, but it does not
+decide E3. Record test totals. For E2, record each PR merged in the 7 days
+before the candidate as "pass", "fail" or "skipped (paths)": a docs-only
+PR that the path filter skips is not a failure.
 
 ## T1. Fresh launch and start-up (E4) — SP
 
@@ -110,21 +113,29 @@ The end-to-end test. It starts from a new game with skip mode off and plays
 the story in order, saving and reloading at each boundary, until the final
 required story contract.
 
-**Boundaries.** The story order below is from the flow bindings and the
-2026-10-20 beta checklist [unverified as a played order]; the first run of
-T2b confirms it from the scripts and fixes this list.
+**Boundaries.** The story spine is the order of `WifMissionFlow`'s
+bindings [code: flow listing]: `Start`, VzaCon001, PmcCon001, OilCon020,
+OilCon021, OilJob011, PmcCon002 (with the mechanic and pilot intros and
+MecCon001 / JetCon001), PmcCon003, `AllChiIntro`, PmcCon004. Faction
+contracts unlock from their own bindings along the way.
 
 | Boundary | After | Check before saving |
 |---|---|---|
 | B0 | New game, control of the hero | No contract done; VzaCon001 active |
 | B1 | VzaCon001 | Villa consequence layers; PmcCon001 offered |
 | B2 | PmcCon001 | PMC HQ reached by the flow's move, not a teleport from skip; faction contracts offered as the flow unlocks them |
-| B3 | OilCon020, OilCon021 (UP introduction) | OilCon050, PmcCon013, PmcCon034 and the UP jobs unlocked |
-| B4 | PmcCon002 | Its consequences; next PMC contract offered |
-| B5 | PmcCon003 | Act change: state layers swapped, HQ moves as the flow says |
-| B6 | PmcCon004 | Its consequence removes unplayed AllCon001/002/003/008/050 as the scripts say; AllCon008 opens |
-| B7 | Each faction's last contract | That faction's HQ and starters as the flow leaves them |
-| B8 | The final required story contract | The ending's flow step runs |
+| B3 | OilCon020, OilCon021 (UP introduction) | OilCon050, PmcCon013, PmcCon034 and the UP jobs unlocked (`UnlockMission` in that step) |
+| B4 | PmcCon002, MecCon001, JetCon001 | Mechanic and pilot join; PmcCon018 unlocked when the pilot joins |
+| B5 | PmcCon003 | Its consequence: state layers swapped, HQ moves as the flow says |
+| B6 | `AllChiIntro` | Allied and China starters and their first contracts offered |
+| B7 | Every contract that PmcCon004's consequence destroys, plus the remaining faction contracts the run plays | AllCon001, 002, 003, 008, 050, ChiCon001, 002, 003, 008, 050 and GurCon003 done (they cannot be played after B8); `HasKey("PmcCon004")` true, so PmcCon004 is offered |
+| **B8** | **PmcCon004, the final story contract** | `Pg.ContractCompleted` for PmcCon004, then the `WifMissionFlow` binding `PmcCon004`'s consequence runs to its end: Solano verified, the ending movie `15_ACK_` plays, the credits widget shows, the forced autosave is written, and the game requests `unloading` and returns to the front end. After that, Continue from the autosave loads without error |
+
+B8 is the qualifying end: a T2b chain passes E6 only when B8's checks all
+pass. Contracts outside the spine that are not destroyed at B8 (the PMC
+challenges, races, outposts and jobs) are covered by E5 in isolation;
+whether the game lets them be played after the credits is not yet known
+[unverified] and is recorded at B8.
 
 **Automated chain.** One run per boundary, each loading the previous
 boundary's save:
@@ -272,7 +283,7 @@ started. "Story" is whether it completed in T2b (no contract has yet).
 | AllCon001 | - | 1 pass, 2485.6 s (#140) | no | `--skip-to` | no | - |
 | AllCon002 | - | never completed | - | `--skip-to` | no | MLRS race won in some runs; boats stage lost |
 | AllCon003 | - | 1 pass, 1141.5 s (#140) | no | `--skip-to` | no | - |
-| AllCon008 | - | never run | - | - | no | Opens after PmcCon004's consequence |
+| AllCon008 | - | never run | - | - | no | Unlocked after AllCon052 only before PmcCon004; destroyed by PmcCon004's consequence [code] |
 | AllCon050 | - | 1 pass, 646.8 s (#140) | no | `--skip-to` | no | - |
 | AllCon052 | - | 1 pass, 1405.4 s (#140) | no | `--skip-to` | no | - |
 | AllCon053 | - | 1 pass, 658.3 s (#140) | no | `--skip-to` | no | - |
@@ -320,10 +331,11 @@ story progression.
   dropouts or visual corruption with the time.
 - **Ledger (E8b):** every automated and human run on the candidate adds its
   wall-clock hours and its crash and hang count to one ledger. Pass: at
-  least 20 cumulative test-hours on the candidate and at most 1 crash or
-  hang per 10 hours. A crash in T9a fails E8a regardless of the aggregate.
+  least 20 cumulative test-hours on the candidate and at most 1 failure
+  per 10 hours, where a failure is a crash or a hang, counted together. A
+  crash or a hang in T9a fails E8a regardless of the aggregate.
 
-| Candidate | Runs | Test-hours | Crashes | Hangs | Rate per 10 h |
+| Candidate | Runs | Test-hours | Crashes | Hangs | (Crashes + hangs) per 10 h |
 |---|---|---|---|---|---|
 | (filled per candidate) | | | | | |
 
@@ -440,7 +452,7 @@ candidate ships only when every criterion of its target is pass or waived.
 |---|---|---|---|---|
 | E1 Clean build | SP | T0 | | |
 | E2 CI green | SP | T0 | | |
-| E3 Platform support (decision + tests) | SP | T0 | | |
+| E3 Platform support (Windows x64 and i686) | SP | T0 | | |
 | E4 Start-up, 20 cold launches | SP | T1 | | |
 | E5 Contracts in isolation, 52 at 2 of 3, no drivers | SP | T6 | | |
 | E6 Story progression without skip | SP | T2b | | |

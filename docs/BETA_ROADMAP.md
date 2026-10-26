@@ -30,8 +30,12 @@ blocker for the co-op beta only.
   since 2026-10-21 19:09 UTC and is installed as a console app, so it stops
   when its window or the PC session ends. Install it as a Windows service
   (the runner's own `config.cmd --runasservice`, or `svc.cmd install`) so
-  it survives restarts; then re-run CI on `main`. *Needs the owner: it
-  changes a service on the PC.* Done when: a CI run on `main` completes
+  it survives restarts; then re-run CI on `main`. Decided: a service with
+  automatic start and recovery, a low-privilege account (NETWORK SERVICE,
+  which has no password to store), the toolchain in the runner's own
+  folder, a read-only job token, and no code from forks' pull requests
+  (PR #164). *The install changes a service on the PC, so the owner runs
+  it* (a prepared script, kept on the test PC). Done when: a CI run on `main` completes
   (pass or fail) without manual action after a reboot. Status: still open.
 - **R2. Fix the platform-dependent userdata test** (SP; E2, E3; T0).
   `events.rs:1713` compares Lua's printed `%p` of a light userdata; it fails
@@ -43,18 +47,17 @@ blocker for the co-op beta only.
   and #153, #157, #158, #159, #160, #162 landed with no CI result. Once R1
   and R2 are in, a green `main` run covers them; any further failure is a
   must-fix. Status: still open.
-- **R4. Decide supported platforms** (SP; E3; T0). CI no longer builds
-  Linux. Either add a Linux job (a GitHub-hosted runner costs Actions
-  minutes the private repo no longer has) or state in the README that beta
-  supports Windows x64 only. i686 stays tested because CI tests it. A
-  decision, then a small PR. Status: undecided.
+- **R4. Windows-only beta** (SP; E3; T0). Decided 2026-10-26: the beta
+  supports Windows (x64 and the i686 build CI tests). Linux stays a
+  best-effort developer build until Linux CI and clean-package testing are
+  reliable. Remaining work: say so in the README and the release notes.
 
 ### Contracts in isolation (E5)
 
 - **R5. Retarget PR #161 to `main`** (process). Its base `claude/polish` was
   merged by #159. `main` merges into it cleanly, so no rebase is needed.
-  *Changing a PR's base is the owner's call or the polish thread's.*
-  Status: still open.
+  Status: done 2026-10-26 (owner's decision); checks on #161 merged with
+  `main` reported in the PR thread.
 - **R6. Merge or finish #152** (SP; E5; T6, T7). MecCon001 and JetCon001
   complete [PR], MecCon001 only with a race driver, which does not satisfy
   E5. Ready for review; waits on CI (R1). Status: fixed in an open PR.
@@ -73,8 +76,9 @@ blocker for the co-op beta only.
     slot); next step is the unrun round 45.
   - ChiCon002: 14 of 15 depot targets (bridge segments placed by #147).
   - ChiCon051, ChiCon053: not surveyed in any PR.
-  - AllCon008: opens only after PmcCon004's consequence; test it in
-    isolation with `--skip-to` and in the story run (R10).
+  - AllCon008: the flow unlocks it after AllCon052 only while PmcCon004
+    is not done, and PmcCon004's consequence destroys it [code]; test it in
+    isolation with `--skip-to` and before B8 in the story run (R10).
 - **R9. Make isolated completions repeatable** (SP; E5; T6). Run all 52 on
   one candidate commit, 3 runs each, no contract drivers (PmcCon004 needs
   its climb driver today; plain autoplay stalls in a gully 3.3 km out), and

@@ -43,8 +43,16 @@ subsystem furthest from done, this revision adds a smaller, explicit
 | **Single-player beta** | E1-E10, E12 (single-player sessions), E13 | Co-op of any kind (E11). The release notes and README say so; the join page and co-op menu entries are hidden or marked unsupported. |
 | **Co-op beta** (the 2026-10-23 definition) | Everything in the single-player beta, plus E11, plus a co-op session in E12 | Nothing beyond the "can wait" list below. |
 
-E11 is not weakened: the co-op beta needs it in full. Which target ships
-first is an open decision (see "Unresolved decisions"). The roadmap and
+E11 is not weakened: the co-op beta needs it in full.
+
+**Decided (2026-10-26):** the single-player beta ships first, with co-op
+hidden or clearly marked unsupported; the co-op beta is a later target that
+must satisfy every single-player criterion plus E11. The supported platform
+for the beta is Windows only (E3); Linux builds stay best-effort developer
+builds until Linux CI and clean-package testing are reliable. The CI runner
+runs as a Windows service with automatic start and recovery, under a
+low-privilege account, with a read-only job token and no code from forks'
+pull requests. The roadmap and
 test plan mark each item and test as **SP** (needed by both targets) or
 **Co-op** (needed by the co-op beta only).
 
@@ -89,7 +97,8 @@ reproducibility and end-to-end play, not feature count.**
   route comes first (R16, T12).
 - **Only Windows x64 is built and tested automatically.** Linux is not built
   anywhere (CI moved to a self-hosted Windows runner); Android has a build
-  script but no CI. Supported platforms are an open decision (R4).
+  script but no CI. The beta is Windows-only (decided 2026-10-26); Linux
+  stays a best-effort developer build (R4).
 
 A realistic estimate, given the pace of the last two weeks (about 4 to 8
 contracts closed per working day across parallel threads, plus rework):
@@ -113,14 +122,14 @@ recorded in the test plan's release checklist.
 | # | Target | Criterion | Measure | Tests | Roadmap | Now |
 |---|---|---|---|---|---|---|
 | E1 | SP | Clean build | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo xtask symbols`, release build: all pass on Windows x64 | T0 | - | Pass [measured]: 1,064 tests, 0 failed |
-| E2 | SP | CI green | The CI workflow passes on `main` for the release commit, and on every PR merged in the 7 days before it | T0 | R1, R3 | **Fail**: no CI pass since 2026-10-21 [measured] |
-| E3 | SP | Platform support | A written decision of supported platforms; for each, its build and tests pass (Windows i686 `m2-game` tests always, because CI runs them; Linux if supported) | T0 | R2, R4 | **Fail**: i686 `m2-game` 172 pass, 1 fail [measured]; Linux 1 failure, not in CI [reported]; no decision |
+| E2 | SP | CI green | The CI workflow passes on `main` for the release commit, and on every CI-applicable, code-changing PR merged in the 7 days before it. A docs-only PR that the workflow's path filter skips is recorded as "skipped (paths)", not as a failure | T0 | R1, R3 | **Fail**: no CI pass since 2026-10-21 [measured] |
+| E3 | SP | Platform support | Supported platform: Windows (decided 2026-10-26). The Windows x64 and i686 builds and the CI's tests pass; Linux is best-effort and not a criterion | T0 | R2, R4 | **Fail on `main`**: i686 `m2-game` 172 pass, 1 fail [measured]; fixed in open PR #164 (173 pass on x64 and i686) [measured] |
 | E4 | SP | Start-up | 20 of 20 cold launches reach the front end in under 60 s; new game reaches control of the hero | T1 | - | Not measured as a series |
 | E5 | SP | Contracts in isolation | Each of the 52 flow contracts reaches `Pg.ContractCompleted` in at least 2 of 3 autoplay runs with `--skip-to` on the release commit, with no contract-specific driver | T6 | R6-R9 | 35 driver-free at least once [PR]; 0 with a 3-run record on one commit; 13 never |
-| E6 | SP | Story progression | One playthrough from a new game with developer skip off follows normal progression to the final required story contract: contracts appear when the flow unlocks them, consequences apply, act changes and HQ moves happen, through save and reload at each boundary (T2b) | T2b | R10-R12 | **Never attempted** |
+| E6 | SP | Story progression | One playthrough from a new game with developer skip off follows normal progression to B8, the final story contract PmcCon004 and its `WifMissionFlow` consequence (ending movie, credits, return to the front end): contracts appear when the flow unlocks them, consequences apply, act changes and HQ moves happen, through save and reload at each boundary (T2b) | T2b | R10-R12 | **Never attempted** |
 | E7 | SP | Save and load | At every T2b boundary, a save loads in a fresh launch with the same contracts done, the same active and available contracts, the same act, and the hero where the save says | T8, T2b | R10 | Verified for VzaCon001 only [PR #138] |
 | E8a | SP | Session stability | A single 60-minute session (contract, then free roam) with no crash and no hang (no frame for 10 s) | T9 | R13-R15 | Not run; hangs not detectable yet |
-| E8b | SP | Aggregate crash rate | At most 1 crash per 10 test-hours across the release test series, with at least 20 cumulative test-hours on the candidate | T9 (ledger) | R13-R15 | Harness: 1 panic in 772 runs since 2026-10-19 [measured]; test-hours not tracked |
+| E8b | SP | Aggregate stability | At most 1 failure (a crash or a hang, counted together) per 10 test-hours across the release test series, with at least 20 cumulative test-hours on the candidate | T9 (ledger) | R13-R15 | Harness: 1 panic in 772 runs since 2026-10-19 [measured]; hangs not detected; test-hours not tracked |
 | E9 | SP | Performance | Controlled benchmark (T12: fixed hardware, 1920x1080, fixed settings, fixed route, 60 s warm-up, 10 min measured): median at least 60 fps; fewer than 60 frames over 50 ms per minute; memory growth under 10 % between minute 10 and minute 60 of T9 | T12, T9 | R16, R25 | **Fail** in the latest human playtest (uncontrolled): median 25 fps at 2560x1440 [measured from its log]; memory flat over 11 min headless [measured] |
 | E10 | SP | Controls | Every action in the keyboard/mouse map and the pad layout works in each context (on foot, vehicle, aircraft, boat, menus, PDA) per the T10 checklist | T10 | - | Maps on `main` [code]; no checklist run |
 | E11 | Co-op | Co-op | Two PCs host and join, see each other, and play one contract together for 30 minutes without position desync or a crash | T11 | R24 | Stage 1 only on `main` (see each other) [PR #145] |
@@ -147,7 +156,26 @@ checked for this revision). The three previously unsurveyed ids:
 | PmcCon015 | `UnlockMission("PmcCon015")` behind `HasKey("PmcCon016")` | `StartRace`, `CourseUnfinished`, `VehicleDeath`, `LoadAssets` | Race |
 | PmcCon018 | `UnlockMission("PmcCon018")` when Misha joins (after JetCon001) | `Complete`, `AirStrikes`, `AirStrikeVO`, `CurPoints`, `CoinToss` | Airstrike challenge |
 
-All three are playable contracts, so the definition stays at 52. The
+All three are playable contracts, so the definition stays at 52.
+
+**The story's end, and what it removes** [code: `WifMissionFlow`, the
+`PmcCon004` binding, script lines 605-716]. PmcCon004 is the final story
+contract: its prerequisite is `HasKey("PmcCon004")`, and its consequence
+(`fConseq`) verifies Solano, plays the ending movie (`15_ACK_`) and the
+credits, forces an autosave, then requests the `unloading` game state and
+quits to the front end. The same consequence calls `DestroyMission` on
+AllCon001, AllCon002, AllCon003, AllCon008, AllCon050, ChiCon001, ChiCon002,
+ChiCon003, ChiCon008, ChiCon050 and GurCon003, and destroys the Allied and
+China starters. Two consequences:
+
+- Those 11 contracts must be completed **before** PmcCon004 in a story run,
+  or they are gone. E5 still tests them in isolation.
+- AllCon008 is unlocked (after AllCon052) **only while PmcCon004 is not
+  done** (`HasKey("PmcCon004")` guards the `UnlockMission`). The earlier
+  note that it "opens only after PmcCon004" (from the 2026-10-20 beta
+  checklist) was wrong and is corrected here.
+
+The
 per-contract table (passes out of three, driver, skip, story run,
 outstanding failure) is kept in BETA_TEST_PLAN.md, T6.
 
@@ -159,10 +187,11 @@ PR heads unchanged (#152 `5f6f101`, #161 `8914cca`, #54 `d69a1a1`, #43
 
 | Finding | Status |
 |---|---|
-| CI runner offline, console app not a service | Still open |
-| `events.rs:1713` userdata test fails on i686 and Linux | Still open |
+| CI runner offline, console app not a service | Still open (install script prepared; needs the owner) |
+| `events.rs:1713` userdata test fails on i686 and Linux | Fixed in an open PR (#164) |
 | No CI pass on `main` since 2026-10-21 | Still open |
-| #161 targets the merged `claude/polish`; needs retargeting to `main` (clean merge, no rebase) | Still open |
+| #161 targets the merged `claude/polish`; needs retargeting to `main` (clean merge, no rebase) | Fixed: retargeted 2026-10-26; checks in progress |
+| AllCon008 "opens only after PmcCon004" | Superseded: the flow unlocks it only before PmcCon004 [code] |
 | #54 and #43 superseded | Superseded (by `main` and #135); still open as PRs |
 | 37 contracts completed once on `main` | Needs remeasurement (T6 on one commit) |
 | MecCon001 and JetCon001 complete | Fixed in an open PR (#152) |
@@ -360,10 +389,11 @@ abandoned hook-DLL plan (see `docs/alpha-roadmap.md`). No beta impact.
 | PR | Branch → base | State | Finding |
 |---|---|---|---|
 | #152 Recruits (MecCon001, JetCon001) | `claude/recruits` → `main` | ready for review, 8 ahead, 0 behind, merges cleanly | MecCon001 uses a race test driver (not a normal-play pass). CI queued, cannot run (runner offline). |
-| #161 Polish 2 (explosions, forces, glow, bomb) | `claude/polish-2` → `claude/polish` | draft, 12 ahead, 10 behind `main` | **Needs retargeting to `main`.** Its base `claude/polish` is fully merged (PR #159, merge `2d400cf`), so merging #161 as is would land in a dead branch. A merge of `main` into it is clean (`git merge-tree`), so no rebase is needed, only the base change. |
+| #161 Polish 2 (explosions, forces, glow, bomb) | `claude/polish-2` → `main` (retargeted 2026-10-26; was `claude/polish`) | draft, 12 ahead, 10 behind `main` | **Retargeted.** Diff against `main` unchanged: 12 commits, 28 files, +3,268 -417. Before: Its base `claude/polish` is fully merged (PR #159, merge `2d400cf`), so merging #161 as is would land in a dead branch. A merge of `main` into it is clean (`git merge-tree`), so no rebase is needed, only the base change. |
 | #54 Xbox controller | → `claude/button-glyphs` | draft, 480 behind | Superseded; close. |
 | #43 Android | → `claude/project-thread-puymzh` | draft, 642 behind | Superseded by #135; close. |
 | #163 This assessment | `claude/beta-plan` → `main` | draft | Docs only. |
+| #164 CI fixes | `claude/userdata-test` → `main` | draft | R2 test fix and CI hardening (R1). |
 
 ## Baseline measurements
 
@@ -426,12 +456,20 @@ finding, and no optimization should start before it.
 **Not yet measured:** the controlled 1080p benchmark (T12), a
 particle-heavy scene, a 60-minute session, and load time to the front end.
 
-## Unresolved decisions
+## Decisions
 
-1. **Which release target first:** single-player beta, then co-op beta
-   (recommended), or co-op beta only (the 2026-10-23 definition).
-2. **Supported platforms (E3):** Windows x64 only, or also Linux (needs a CI
-   job and Actions minutes) and i686.
-3. **CI runner as a Windows service** (R1): a change to the PC.
-4. **Retarget #161 to `main`; close #54 and #43;** rename the
-   `beta-20261021` release.
+Taken 2026-10-26: single-player beta first; Windows-only beta; CI runner as
+a low-privilege Windows service with automatic start and recovery; #161
+retargeted to `main` (done, 13:3x UTC; diff unchanged at 12 commits, 28
+files).
+
+Still open: closing #54 and #43; renaming the `beta-20261021` release; the
+repository's fork-PR approval policy (see below).
+
+**Security note.** The repository is public (`visibility: public`), and its
+fork pull-request approval policy is `first_time_contributors`, so a
+contributor's second fork PR would run without approval on the self-hosted
+runner. PR #164 makes the CI jobs skip pull requests whose branch is not in
+this repository and sets the job token to read-only. Setting the policy to
+"all outside collaborators" in the repository's Actions settings closes it
+at the source as well (an owner's setting).
