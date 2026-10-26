@@ -1375,7 +1375,7 @@ impl Autoplay {
         // wait: the contract comes first (story run B3: she called
         // satellite bombs on PmcJob001's treasures from the PMC HQ).
         let kept: Vec<Mark>;
-        let marks = if self.starter.is_some() {
+        let marks = if !self.on_offer.is_empty() {
             kept = marks
                 .iter()
                 .filter(|m| for_a_contract(m))

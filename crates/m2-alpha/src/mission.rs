@@ -1438,6 +1438,22 @@ impl MissionLink {
             .context_actions()
             .into_iter()
             .filter(|(_, _, text, _)| text.eq_ignore_ascii_case(TALK_PROMPT))
+            // A starter riding a prop (the HQ's, at her desk) is where the
+            // scripts last put her until the game seats her in play
+            // (`crate::hijack`, which loads ~50 s after a save in headless
+            // runs); till then her talk is at the building's origin, over
+            // no floor (story run B3: she walked there and fell).
+            .filter(|(g, _, _, _)| {
+                let rides_prop = mission
+                    .world()
+                    .borrow()
+                    .objects
+                    .get(g)
+                    .and_then(|o| o.vehicle)
+                    .is_some_and(|v| game.scene.props.get(v).is_some());
+                let seated_in_play = game.scene.riders.iter().any(|r| r.guid == Some(*g));
+                talk_ready(rides_prop, seated_in_play)
+            })
             .filter_map(|(g, at, _, _)| {
                 let person = game
                     .scene
@@ -5957,6 +5973,12 @@ pub struct OpenDialog {
     pub options: Vec<String>,
 }
 
+/// Whether a starter's talk can be gone to: one riding a prop only once
+/// the game has seated her in play ([`MissionLink::talk_offers`]).
+pub fn talk_ready(rides_prop: bool, seated_in_play: bool) -> bool {
+    !rides_prop || seated_in_play
+}
+
 /// Whether `id` names one of the flow's contracts (`OilCon020`), not a
 /// job (`PmcJob001`).
 pub fn is_flow_contract(id: &str) -> bool {
@@ -6102,6 +6124,15 @@ mod tests {
             (method.as_str(), title.as_str(), first.as_str()),
             ("Display", "[Briefing.RootMenuDialog]", "[OilCon020.Title]")
         );
+    }
+
+    // A starter on a prop is gone to only once she is seated in play;
+    // one on foot at once.
+    #[test]
+    fn a_seated_starter_is_gone_to_once_seated_in_play() {
+        assert!(talk_ready(false, false));
+        assert!(!talk_ready(true, false));
+        assert!(talk_ready(true, true));
     }
 
     // The flow's contracts are told from its jobs by their ids.
