@@ -2664,6 +2664,15 @@ impl MissionLink {
                 if obey(game, mission, &mut self.vehicles, &c) {
                     self.ashore = ASHORE_TRIES;
                 }
+                // A bunker buster's blasts (`MrxBunkerBuster` spawns
+                // "Explosion (Bunker Buster Stage 1)" and "Stage 2" where
+                // it lands) bring down what only a bomb does, as the
+                // satellite's bomb does: JetCon001's bunker.
+                if let Command::Spawn { what, position, .. } = &c
+                    && what.starts_with("Explosion (Bunker Buster")
+                {
+                    self.bombs.push(Vec3::from(*position));
+                }
                 if c == Command::Notify("Pg.ContractCompleted".into()) {
                     self.completed = Some(0.0);
                     self.contracts += 1;

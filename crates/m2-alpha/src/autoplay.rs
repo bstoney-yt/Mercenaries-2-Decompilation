@@ -189,7 +189,7 @@ const UNSEEN_NEAR: f32 = 3.0;
 /// target's middle (metres, its own body), and not again sooner than
 /// this (seconds) after a call. Invented, as is [`LASER_WALK`].
 const LASER_RINGS: [f32; 4] = [30.0, 40.0, 55.0, 70.0];
-const LASER_SHORT: f32 = 6.0;
+const LASER_SHORT: f32 = LASER_NEAR;
 const LASER_AGAIN: f32 = 20.0;
 /// How long she makes for one such spot before trying another (seconds).
 const LASER_WALK: f32 = 40.0;
@@ -197,6 +197,7 @@ const LASER_WALK: f32 = 40.0;
 /// off it this long (seconds) she looks for another spot. Invented.
 const LASER_NEAR: f32 = 12.0;
 const LASER_OFF: f32 = 3.0;
+const LASER_TRIES: u32 = 3;
 /// Blowing something up, in range this long (seconds) without a shot
 /// (something in the way, or her aim never settling), she goes where she
 /// can fire from: on rings this far out (metres), inside the rockets' and
@@ -778,6 +779,9 @@ pub struct Autoplay {
     laser_since: f32,
     /// Seconds her laser has been off its target.
     laser_off: f32,
+    /// Spots for a clear line she gave up on; after [`LASER_TRIES`] she
+    /// calls from where she is (the laser is held only while it lands).
+    laser_failed: u32,
     /// Seconds one following her has been left behind.
     left_behind: f32,
 }
@@ -3646,7 +3650,7 @@ impl Autoplay {
                             .cast_ray(eye, dir, (len - LASER_SHORT).max(0.0))
                             .is_none()
                     });
-                    if !seen {
+                    if !seen && self.laser_failed < LASER_TRIES {
                         let spot = self
                             .laser_spot
                             .filter(|s| s.distance(at) < CALL_FROM.1)
@@ -3664,6 +3668,13 @@ impl Autoplay {
                             });
                         if spot != self.laser_spot {
                             self.laser_since = self.clock;
+                            eprintln!(
+                                "autoplay {:.1} s: no clear line for the laser from {here:.1}: {}",
+                                self.clock,
+                                spot.map_or("calling it anyway".to_owned(), |s| format!(
+                                    "going to {s:.1}"
+                                ))
+                            );
                         }
                         self.laser_spot = spot;
                         // A spot she can't get to in a while (round 20 stood
@@ -3673,6 +3684,7 @@ impl Autoplay {
                         {
                             self.tried.push(spot);
                             self.laser_spot = None;
+                            self.laser_failed += 1;
                             return intent;
                         }
                         if let Some(spot) = spot
