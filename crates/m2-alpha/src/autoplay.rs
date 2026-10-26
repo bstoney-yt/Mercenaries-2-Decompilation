@@ -1371,6 +1371,20 @@ impl Autoplay {
 
     /// What to do next, and words for the log.
     fn choose(&self, game: &Game, marks: &[Mark]) -> Option<(Goal, String)> {
+        // Off a contract with one on offer, a job's or collection's marks
+        // wait: the contract comes first (story run B3: she called
+        // satellite bombs on PmcJob001's treasures from the PMC HQ).
+        let kept: Vec<Mark>;
+        let marks = if self.starter.is_some() {
+            kept = marks
+                .iter()
+                .filter(|m| for_a_contract(m))
+                .cloned()
+                .collect();
+            &kept[..]
+        } else {
+            marks
+        };
         // A countdown of the scripts' running (OilCon002's 15 minutes from
         // the second post; rounds 16 and 18 lost it to fights and pickups on
         // the way): only close fights, no detours for crates or pickups.
@@ -1951,13 +1965,7 @@ impl Autoplay {
         // contracts on offer: she goes to a starter and talks, as a player
         // takes a contract (her menu and its terms are answered by the
         // harness, [`crate::mission::contract_pick`]).
-        // A job's or collection's marks wait: a contract on offer comes
-        // first (story run B3: PmcJob001's treasures).
-        let for_a_contract = |m: &&Mark| {
-            matches!(&m.mission, Some(crate::mission::MarkFor::Id(id))
-                if crate::mission::is_flow_contract(id))
-        };
-        if !places.iter().any(for_a_contract)
+        if !places.iter().any(|m| for_a_contract(m))
             && let Some((target, at)) = self.starter
         {
             return Some((
@@ -5041,6 +5049,11 @@ pub(crate) fn stuck_report(
         rises.join(", "),
         touching.join("; ")
     )
+}
+
+/// Whether `m` was put up for one of the flow's contracts, by name.
+fn for_a_contract(m: &Mark) -> bool {
+    matches!(&m.mission, Some(crate::mission::MarkFor::Id(id)) if crate::mission::is_flow_contract(id))
 }
 
 /// The starter she goes to for a contract on offer: none unless a flow
