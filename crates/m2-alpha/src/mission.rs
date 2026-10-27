@@ -205,9 +205,9 @@ impl MarkerView {
     /// between `(far² - d²) / (far² - near²)`, linear in the squared
     /// distance `d²`. A `flat` marker leaves height out of `d`.
     ///
-    /// Inferred: `from` is her; the renderer measures from its view's
-    /// player position, which isn't established to be hers rather than
-    /// the camera's.
+    /// The game measures from the camera (from the 360 code: the
+    /// renderer reads its view's camera-to-world translation), so `from`
+    /// is the camera's position.
     pub fn alpha_from(&self, from: Vec3) -> f32 {
         let mut off = self.at - from;
         if self.flat {

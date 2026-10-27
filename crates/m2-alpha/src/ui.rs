@@ -690,7 +690,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
         if let (Some(m), Some(vp)) = (&info.mission, info.view_proj) {
             let here = info.game.as_ref().and_then(|s| s.position).map(Vec3::from);
             ground_discs(&painter, screen, vp, m, here);
-            world_markers(&painter, screen, vp, m, game, here);
+            world_markers(&painter, screen, vp, m, game);
         }
         game.paint(&painter);
         if std::env::var_os("M2_PAINT_TEST").is_some() {
@@ -1438,11 +1438,12 @@ fn ground_discs(
 
 /// The scripts' markers (`Marker.AddBlip`) over the world, under the
 /// game's HUD: each its icon (the HUD's texture) tinted its colour,
-/// centred on its point, its alpha scaled by its fade from her
-/// ([`MarkerView::alpha_from`]; inferred: from her rather than from the
-/// camera). Its size is taken as the HUD's 640x480 units (inferred: the
-/// call's units aren't known), and one off the screen isn't drawn (nor
-/// pinned to its edge).
+/// centred on its point, its alpha scaled by its fade from the camera
+/// ([`MarkerView::alpha_from`]; from the 360 code: the marker renderer
+/// measures from its view's camera position, the translation of the
+/// camera-to-world matrix the view keeps). Its size is taken as the HUD's
+/// 640x480 units (inferred: the call's units aren't known), and one off
+/// the screen isn't drawn (nor pinned to its edge).
 ///
 /// [`MarkerView::alpha_from`]: crate::mission::MarkerView::alpha_from
 fn world_markers(
@@ -1451,11 +1452,11 @@ fn world_markers(
     view_proj: Mat4,
     m: &MissionView,
     game: &GameHud,
-    here: Option<Vec3>,
 ) {
     let unit = screen.height() / m2_game::gui::VIRTUAL_SIZE.1;
+    let eye = camera_position(view_proj);
     for marker in &m.markers {
-        let fade = here.map_or(1.0, |h| marker.alpha_from(h));
+        let fade = eye.map_or(1.0, |e| marker.alpha_from(e));
         if fade <= 0.0 {
             continue;
         }
@@ -1501,6 +1502,13 @@ fn crosshair(painter: &egui::Painter, c: egui::Pos2) {
     ] {
         painter.line_segment([c + a, c + b], stroke);
     }
+}
+
+/// The camera's position, from its view-projection: the one point it maps
+/// to clip-space w = 0 with x = y = 0 (none for an orthographic one).
+fn camera_position(view_proj: Mat4) -> Option<Vec3> {
+    let eye = view_proj.inverse() * m2_math::glam::Vec4::Z;
+    (eye.w.abs() > f32::EPSILON).then(|| eye.truncate() / eye.w)
 }
 
 /// Where a world point lands on the screen, if in front of the camera.
@@ -1882,6 +1890,31 @@ mod tests {
         let p = to_screen(vp, Vec3::new(0.0, 0.0, -10.0), screen).unwrap();
         assert!((p.x - 400.0).abs() < 0.5 && (p.y - 300.0).abs() < 0.5);
         assert!(to_screen(vp, Vec3::new(0.0, 0.0, 10.0), screen).is_none());
+    }
+
+    #[test]
+    fn markers_fade_from_the_camera_not_from_her() {
+        // A chase camera 6 m behind and 3 m over her: the marker's fade is
+        // measured from the camera (from the 360 code), not from her.
+        let eye = Vec3::new(10.0, 5.0, 26.0);
+        let view = Mat4::look_at_rh(eye, Vec3::new(10.0, 2.0, 20.0), Vec3::Y);
+        let vp = Mat4::perspective_rh(1.0, 800.0 / 600.0, 0.1, 1000.0) * view;
+        let found = camera_position(vp).unwrap();
+        assert!(found.distance(eye) < 1e-3, "{found}");
+        let marker = crate::mission::MarkerView {
+            at: Vec3::new(10.0, 2.0, 15.0),
+            icon: "HUD_objective_destroy".into(),
+            colour: [255, 0, 0, 255],
+            near: 5.0,
+            far: 175.0,
+            flat: false,
+            size: 32.0,
+        };
+        // 5 m from her: opaque from her, but the camera is ~11.4 m off.
+        let her = Vec3::new(10.0, 2.0, 20.0);
+        assert_eq!(marker.alpha_from(her), 1.0);
+        assert!(marker.alpha_from(found) < 1.0);
+        assert!(camera_position(Mat4::orthographic_rh(-1.0, 1.0, -1.0, 1.0, 0.1, 10.0)).is_none());
     }
 
     #[test]
