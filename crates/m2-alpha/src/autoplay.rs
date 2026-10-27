@@ -2047,8 +2047,10 @@ impl Autoplay {
                     ));
                 }
                 found => {
+                    // No delivery read for the place is a failure of the
+                    // reading, said so, not passed off as a delivery made.
                     let inside = found.map_or_else(
-                        || "no delivery read".to_owned(),
+                        || "DELIVERY READ FAILED: none read for this place; old rule".to_owned(),
                         |d| format!("{} off, inside", d.describe()),
                     );
                     return Some((
@@ -5113,6 +5115,24 @@ impl Delivery {
         } else {
             p.distance(self.at)
         }
+    }
+
+    /// What was read of it, for the log.
+    pub fn config(&self) -> String {
+        format!(
+            "place {:#x} at {:.1}, radius {}, {}, quota {} of {} targets {:?}",
+            self.dest,
+            self.at,
+            self.radius
+                .map_or_else(|| "none".to_owned(), |r| format!("{r:.0} m")),
+            if self.xz { "flat (bXZOnly)" } else { "in 3D" },
+            self.quota,
+            self.targets.len(),
+            self.targets
+                .iter()
+                .map(|t| format!("{:#x}", t.0))
+                .collect::<Vec<_>>()
+        )
     }
 
     /// How far its nearest target is from the place, against its radius.

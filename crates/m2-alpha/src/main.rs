@@ -3702,6 +3702,7 @@ fn mission_for_screenshot(
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
     // How long the scripts' transit map has been up.
     let mut transit_up = 0.0f32;
+    let mut delivery_key: Vec<(u32, usize, usize)> = Vec::new();
     let mut contract_done: Option<u32> = None;
     // With --contracts N, she plays on through the later contracts: the
     // tick the Nth was done, and how many have been.
@@ -3801,7 +3802,19 @@ fn mission_for_screenshot(
                     on_contract = contract;
                 }
                 a.sights = link.sight_targets(game);
-                a.deliveries = link.deliveries();
+                let deliveries = link.deliveries();
+                // Each delivery read, as it comes or changes.
+                let key: Vec<(u32, usize, usize)> = deliveries
+                    .iter()
+                    .map(|d| (d.dest, d.quota, d.targets.len()))
+                    .collect();
+                if key != delivery_key {
+                    for d in &deliveries {
+                        eprintln!("delivery: read {}", d.config());
+                    }
+                    delivery_key = key;
+                }
+                a.deliveries = deliveries;
                 let keep = link.kept_within();
                 if keep.len() != a.keep.len() {
                     eprintln!(
