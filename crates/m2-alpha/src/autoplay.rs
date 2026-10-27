@@ -1055,6 +1055,14 @@ impl Autoplay {
             .choose(game, marks)
             .map(|c| self.by_hq_exit(game.focus(), c));
         let changed = match (&chosen, &self.goal) {
+            // A hold for another reason (out of the HQ, then its own
+            // starter) is a new goal for the log (b3s logged the first
+            // reason for both).
+            // (By the reason, before its first comma: not what it is for,
+            // whose distance changes as she falls out of the interior.)
+            (Some((Goal::Hold, why)), Some(Goal::Hold)) => {
+                why.split(',').next() != self.what.split(',').next()
+            }
             (Some((a, _)), Some(b)) => !a.same(b),
             (None, None) => false,
             _ => true,
