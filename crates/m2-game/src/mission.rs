@@ -3145,6 +3145,58 @@ mod tests {
         );
     }
 
+    // A faction HQ's interior as `MrxUtil.SpawnActor` makes it: none found
+    // by name (the PMC's layer is out), so the HQ's template is spawned,
+    // named `HqInterior`, placed, and its awake callback (what loads the
+    // starter and teleports her in) runs. `MrxHq.Unload` removes it; the
+    // PMC's own stays its layer's, found again once that layer is in.
+    #[test]
+    fn a_spawned_interior_is_named_found_woken_and_removed_alone() {
+        let mut m = Mission::new(
+            pmc_interior_and_a_marker(),
+            "Mattias",
+            [3740.0, 450.0, -3830.0],
+        )
+        .unwrap();
+        m.run(
+            r#"local g = Pg.GetGuidByName("HqInterior")
+            if not g then
+                g = Pg.Spawn("_ocoutpost_exterior_job", 0, 0, 0, 0, false, true)
+                __spawned = g
+            end
+            Object.SetName(g, "HqInterior")
+            Object.SetPosition(g, 3750, 450, -3840)
+            Event.Create(Event.ObjectHibernation, { g, "awake" },
+                function(o) __awake = o end, {})"#,
+            "spawn actor",
+        )
+        .unwrap();
+        m.tick(0.1);
+        m.run(r#"__found = Pg.GetGuidByName("HqInterior")"#, "find")
+            .unwrap();
+        let g = m.lua().globals();
+        let spawned: Value = g.get("__spawned").unwrap();
+        assert_ne!(spawned, Value::Nil, "the PMC's interior stood in");
+        assert_ne!(spawned, crate::events::guid_value(0xc73ad));
+        assert_eq!(g.get::<Value>("__found").unwrap(), spawned);
+        assert_eq!(g.get::<Value>("__awake").unwrap(), spawned);
+        m.run(
+            r#"Object.Remove(Pg.GetGuidByName("HqInterior"))
+            __gone = Pg.GetGuidByName("HqInterior") == nil"#,
+            "unload",
+        )
+        .unwrap();
+        assert!(g.get::<bool>("__gone").unwrap());
+        assert!(m.world().borrow().entities.contains_key(&0xc73ad));
+        assert_eq!(m.preload("pmcinterior"), ["vz_state_pmcinterior"]);
+        m.run(r#"__pmc = Pg.GetGuidByName("HqInterior")"#, "pmc")
+            .unwrap();
+        assert_eq!(
+            g.get::<Value>("__pmc").unwrap(),
+            crate::events::guid_value(0xc73ad)
+        );
+    }
+
     #[test]
     fn each_crew_aboard_is_its_own_objects_riders_by_object() {
         // Two crewed objects at once (the HQ's starter and the villa's

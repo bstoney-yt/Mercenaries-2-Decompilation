@@ -1622,6 +1622,20 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // Object.SetName(object, name): what it is called from now on, so
+    // `Pg.GetGuidByName(name)` finds it. `MrxUtil.SpawnActor` names a
+    // faction HQ's spawned interior `HqInterior` this way; the HQ then
+    // finds it by that name to teleport her in and, leaving, to remove it
+    // (from the scripts: MrxUtil's `SpawnActor`, MrxHq's `_LoadInterior`
+    // and `Unload`).
+    add(&object, "SetName", |w, _, a| {
+        if let (Some(g), Some(Value::String(name))) = (id(a.first()), a.get(1))
+            && let Some(o) = w.objects.get_mut(&g)
+        {
+            o.name = name.to_string_lossy();
+        }
+        values([])
+    })?;
     add(&object, "GetYaw", |w, _, a| {
         let yaw = id(a.first()).and_then(|g| w.objects.get(&g)).map(|o| o.yaw);
         values([yaw.map_or(Value::Nil, |y| Value::Number(f64::from(y)))])
