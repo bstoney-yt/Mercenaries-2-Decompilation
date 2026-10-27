@@ -3801,6 +3801,7 @@ fn mission_for_screenshot(
                     on_contract = contract;
                 }
                 a.sights = link.sight_targets(game);
+                a.deliveries = link.deliveries();
                 let keep = link.kept_within();
                 if keep.len() != a.keep.len() {
                     eprintln!(

@@ -595,6 +595,12 @@ pub struct Autoplay {
     /// where each is, set each tick ([`crate::mission::MissionLink::
     /// sight_targets`]).
     pub sights: Vec<Vec3>,
+    /// The current contract's active deliveries (set each tick:
+    /// [`crate::mission::MissionLink::deliveries`]).
+    pub deliveries: Vec<Delivery>,
+    /// The delivery she last got out at, and when: getting back into a
+    /// vehicle while it still stands is a failed delivery, logged.
+    pub delivery_exit: Option<(u32, f32)>,
     /// The actions the scripts offer: on what, and where it is (set each
     /// tick before [`step`](Self::step)).
     pub offers: Vec<(u32, Vec3)>,
@@ -894,6 +900,28 @@ impl Autoplay {
             self.drive_hops = 0;
         }
         self.goal = chosen.map(|c| c.0);
+        // Got out to deliver; back into a vehicle while the delivery still
+        // stands is a delivery that failed (b3i: 1,985 times), logged.
+        if changed {
+            let standing = |g: u32| self.deliveries.iter().any(|d| d.dest == g);
+            if matches!(self.goal, Some(Goal::GetOut))
+                && let Some((g, _)) = self.waiting
+                && standing(g)
+            {
+                self.delivery_exit = Some((g, self.clock));
+            } else if self.what.starts_with("getting into")
+                && let Some((g, at)) = self.delivery_exit.take()
+                && standing(g)
+            {
+                eprintln!(
+                    "autoplay {:.1} s: delivery failed: got out at {g:#x} {:.1} s ago and it still \
+                     stands: {}",
+                    self.clock,
+                    self.clock - at,
+                    self.what
+                );
+            }
+        }
         // The scripts' prompt on what she went to (a verify on a body, a
         // starter's talk) is taken with the use key, as a player would.
         if let (Some(Goal::Reach { target, .. }), Some((g, text))) = (&self.goal, &game.context)
@@ -1993,17 +2021,38 @@ impl Autoplay {
         // Driven to a place to deliver it and nothing comes of it: the
         // scripts want her out of it there (`MrxTaskObjectiveDeliver`'s
         // `bStop` delivery of a vehicle shows "[objective.Deliver.
-        // vehicleExit]" while she sits in it: PirCon002's rum truck).
+        // vehicleExit]" while she sits in it: PirCon002's rum truck). Only
+        // once what she brings is inside its destination, by the
+        // delivery's own region or radius ([`Delivery::arrived`]); short of
+        // it she drives on in (story run b3i: stopped 15 m from OilCon020's
+        // gun drop, its radius 15 m, she got out and back in 1,939 times).
         if driving.is_some()
             && m.kind == "deliverable"
             && self
                 .waiting
                 .is_some_and(|(g, since)| g == m.target && self.clock - since > EXIT_AFTER)
         {
-            return Some((
-                Goal::GetOut,
-                format!("getting out at {}, to deliver what she drove there", m.name),
-            ));
+            match self.deliveries.iter().find(|d| d.dest == m.target) {
+                Some(d) if !d.arrived() => {
+                    return Some((
+                        Goal::Reach {
+                            target: m.target,
+                            at: d.at,
+                        },
+                        format!(
+                            "delivery: what she brings is {} from {}, outside it: driving on in",
+                            d.describe(),
+                            m.name
+                        ),
+                    ));
+                }
+                _ => {
+                    return Some((
+                        Goal::GetOut,
+                        format!("getting out at {}, to deliver what she drove there", m.name),
+                    ));
+                }
+            }
         }
         // An outpost's flag is taken standing by it: the scripts count
         // those who get there as its rushers (inferred: the outpost's
@@ -5015,9 +5064,107 @@ pub(crate) fn stuck_report(
     )
 }
 
+/// One of the contract's active deliveries (`MrxTaskObjectiveDeliver`):
+/// its destination place (`dest`, at `at`), its drop-off radius and
+/// whether flat, how many targets must be there, and its targets with
+/// where they are and, where it has a region, whether inside it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Delivery {
+    pub dest: u32,
+    pub at: Vec3,
+    pub radius: Option<f32>,
+    pub xz: bool,
+    pub quota: usize,
+    pub targets: Vec<(u32, Vec3, Option<bool>)>,
+}
+
+impl Delivery {
+    /// Whether at least its quota of targets is at the destination: inside
+    /// its region where the scripts' region test answers, else within its
+    /// radius of its place (flat where it says). With nothing known to
+    /// measure by, it counts as there (the old behaviour).
+    pub fn arrived(&self) -> bool {
+        let Some(radius) = self.radius else {
+            if self.targets.iter().all(|t| t.2.is_none()) {
+                return true;
+            }
+            return self.targets.iter().filter(|t| t.2 == Some(true)).count() >= self.quota;
+        };
+        let there = |&(_, p, inside): &(u32, Vec3, Option<bool>)| match inside {
+            Some(i) => i,
+            None => self.off(p) <= radius,
+        };
+        if self.targets.is_empty() {
+            return true;
+        }
+        self.targets.iter().filter(|t| there(t)).count() >= self.quota
+    }
+
+    fn off(&self, p: Vec3) -> f32 {
+        if self.xz {
+            (p - self.at).with_y(0.0).length()
+        } else {
+            p.distance(self.at)
+        }
+    }
+
+    /// How far its nearest target is from the place, against its radius.
+    pub fn describe(&self) -> String {
+        let near = self
+            .targets
+            .iter()
+            .map(|t| self.off(t.1))
+            .fold(f32::INFINITY, f32::min);
+        match self.radius {
+            Some(r) => format!("{near:.1} m (radius {r:.0} m)"),
+            None => format!("{near:.1} m"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // OilCon020's gun drop: a place and 15 m, flat, 1 pickup of those on
+    // the truck. b3i stopped just outside (the crates 15.6 m off); b3c 7 m
+    // nearer, inside.
+    #[test]
+    fn a_delivery_is_there_only_inside_its_radius_or_region() {
+        let at = Vec3::new(2510.0, -34.0, 1555.0);
+        let gun = |off: f32| (7, at + Vec3::new(0.0, 3.0, -off), None);
+        let d = |targets| Delivery {
+            dest: 0xfa748,
+            at,
+            radius: Some(15.0),
+            xz: true,
+            quota: 1,
+            targets,
+        };
+        // Just outside, entering, inside.
+        assert!(!d(vec![gun(15.6)]).arrived());
+        assert!(d(vec![gun(15.0)]).arrived());
+        assert!(d(vec![gun(7.0)]).arrived());
+        // Flat: 3 m up doesn't count.
+        assert!(d(vec![gun(14.9)]).arrived());
+        // A quota of 2 needs two there.
+        let two = Delivery {
+            quota: 2,
+            ..d(vec![gun(7.0), gun(20.0)])
+        };
+        assert!(!two.arrived());
+        // A region answers for itself, whatever the radius says.
+        let region = Delivery {
+            radius: None,
+            ..d(vec![(7, at + Vec3::new(0.0, 0.0, -40.0), Some(true))])
+        };
+        assert!(region.arrived());
+        let outside = Delivery {
+            radius: None,
+            ..d(vec![(7, at, Some(false))])
+        };
+        assert!(!outside.arrived());
+    }
 
     // A box of the carbine's rounds is wanted while it has room for them,
     // as walking over it takes it.

@@ -3363,6 +3363,58 @@ impl MissionLink {
         m2_game::events::as_guid(&g)
     }
 
+    /// The current contract's active deliveries, each with whether what
+    /// it waits for is at its destination now ([`CONTRACT_DELIVERIES`]):
+    /// by its region where it has one (the scripts' own test,
+    /// `World::inside`), else within its radius of its place.
+    pub fn deliveries(&self) -> Vec<crate::autoplay::Delivery> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        let Ok(found) = mission
+            .lua()
+            .load(CONTRACT_DELIVERIES)
+            .set_name("=contract deliveries")
+            .eval::<mlua::Table>()
+        else {
+            return Vec::new();
+        };
+        let w = mission.world().borrow();
+        let place = |g: u32| w.objects.get(&g).map(|o| Vec3::from(o.position));
+        found
+            .sequence_values::<mlua::Table>()
+            .flatten()
+            .filter_map(|d| {
+                let dest = d.get::<Option<u32>>("dest").ok().flatten();
+                let region = d.get::<Option<u32>>("region").ok().flatten();
+                let targets: Vec<u32> = d
+                    .get::<Option<Vec<u32>>>("targets")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let at = dest.and_then(place)?;
+                let radius = d.get::<Option<f32>>("dist").ok().flatten();
+                let xz = d.get::<bool>("xz").unwrap_or(false);
+                let quota = d.get::<Option<usize>>("quota").ok().flatten().unwrap_or(1);
+                let placed: Vec<(u32, Vec3, Option<bool>)> = targets
+                    .iter()
+                    .filter_map(|&t| {
+                        let inside = region.and_then(|r| w.inside(t, r));
+                        Some((t, place(t)?, inside))
+                    })
+                    .collect();
+                Some(crate::autoplay::Delivery {
+                    dest: dest?,
+                    at,
+                    radius,
+                    xz,
+                    quota,
+                    targets: placed,
+                })
+            })
+            .collect()
+    }
+
     /// The targets of the current contract's active action objectives
     /// (`MrxTaskObjectiveAction`, their `_uTgtObjFilter`), from the
     /// scripts' own tasks.
@@ -4062,6 +4114,49 @@ local function walk(t, depth)
     return nil
 end
 return walk(m, 0)
+"#;
+
+/// The current contract's active deliveries (`MrxTaskObjectiveDeliver`,
+/// from their configs): each one's destination place (`vDestLoc`) and
+/// region (`vDestRegion`) as guids, its drop-off radius (`fDist`), whether
+/// it is measured flat (`bXZOnly`), how many of its targets must be there
+/// (`nQuota`) and those targets (`vTgtInclude`). OilCon020's guns: a place
+/// and 15 m, flat, 1 of its pickups, no region (from the scripts).
+const CONTRACT_DELIVERIES: &str = r#"
+local ps = rawget(_G, "MrxPlayState")
+if type(ps) ~= "table" or not ps.GetCurrentMission then return {} end
+local m = ps.GetCurrentMission()
+if type(m) ~= "table" then return {} end
+local function guid(v)
+    if type(v) == "string" then return Pg.GetGuidByName(v) end
+    return v
+end
+local out = {}
+local function walk(t, depth)
+    if depth > 6 or type(t) ~= "table" then return end
+    local ok, kids = pcall(function() return t:GetChildren() end)
+    if not ok or type(kids) ~= "table" then return end
+    for _, c in pairs(kids) do
+        local okActive, active = pcall(function() return c:IsActive() end)
+        local gc = type(c.GetConfig) == "function" and c:GetConfig() or {}
+        if okActive and active and type(gc) == "table"
+            and gc.sModuleName == "MrxTaskObjectiveDeliver" then
+            local targets = {}
+            local inc = gc.vTgtInclude
+            if type(inc) == "table" then
+                for _, v in pairs(inc) do table.insert(targets, guid(v)) end
+            elseif inc ~= nil then
+                table.insert(targets, guid(inc))
+            end
+            table.insert(out, { dest = guid(gc.vDestLoc), region = guid(gc.vDestRegion),
+                dist = gc.fDist, xz = gc.bXZOnly == true, quota = gc.nQuota or 1,
+                targets = targets })
+        end
+        walk(c, depth + 1)
+    end
+end
+walk(m, 0)
+return out
 "#;
 
 /// How often the contract's destroy targets are read again (seconds;
