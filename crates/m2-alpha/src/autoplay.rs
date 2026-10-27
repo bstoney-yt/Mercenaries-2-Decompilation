@@ -2046,10 +2046,17 @@ impl Autoplay {
                         ),
                     ));
                 }
-                _ => {
+                found => {
+                    let inside = found.map_or_else(
+                        || "no delivery read".to_owned(),
+                        |d| format!("{} off, inside", d.describe()),
+                    );
                     return Some((
                         Goal::GetOut,
-                        format!("getting out at {}, to deliver what she drove there", m.name),
+                        format!(
+                            "getting out at {}, to deliver what she drove there ({inside})",
+                            m.name
+                        ),
                     ));
                 }
             }
