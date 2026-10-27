@@ -179,9 +179,13 @@ pub struct MarkerView {
     pub icon: String,
     /// RGBA.
     pub colour: [u8; 4],
-    /// Shown from `near` to `far` metres away.
+    /// Its fade, metres: opaque within `near`, gone beyond `far` (see
+    /// [`MarkerView::alpha_from`]).
     pub near: f32,
     pub far: f32,
+    /// Its fade measures the distance over the ground only (the call's
+    /// "2D only").
+    pub flat: bool,
     /// Its size as the scripts ask (the call's first size, 32 in the first
     /// contract's).
     pub size: f32,
@@ -196,9 +200,28 @@ impl MarkerView {
             .replace('_', " ")
     }
 
-    /// Whether it shows to someone at `from`: `near` to `far` metres away.
-    pub fn shown_from(&self, from: Vec3) -> bool {
-        (self.near..=self.far).contains(&self.at.distance(from))
+    /// How opaque it shows to someone at `from`, 0 to 1 (from the 360
+    /// code, the marker renderer): 1 within `near`, 0 beyond `far`, and in
+    /// between `(far² - d²) / (far² - near²)`, linear in the squared
+    /// distance `d²`. A `flat` marker leaves height out of `d`.
+    ///
+    /// Inferred: `from` is her; the renderer measures from its view's
+    /// player position, which isn't established to be hers rather than
+    /// the camera's.
+    pub fn alpha_from(&self, from: Vec3) -> f32 {
+        let mut off = self.at - from;
+        if self.flat {
+            off.y = 0.0;
+        }
+        let d2 = off.length_squared();
+        let (near2, far2) = (self.near * self.near, self.far * self.far);
+        if d2 > far2 {
+            0.0
+        } else if d2 <= near2 {
+            1.0
+        } else {
+            (far2 - d2) / (far2 - near2)
+        }
     }
 }
 
@@ -3529,6 +3552,7 @@ impl MissionLink {
                     colour: m.colour,
                     near: m.near,
                     far: m.far,
+                    flat: m.flat,
                     size: m.sizes[0],
                 })
             })
@@ -4298,7 +4322,7 @@ fn follow_markers(
         }
         if logged.insert(handle) {
             eprintln!(
-                "mission: marker {} on {:?} ({g:#x}) for {}: colour {:?}, {} m up, shown {}..{} m, sizes {:?}, 2D only {}{}",
+                "mission: marker {} on {:?} ({g:#x}) for {}: colour {:?}, {} m up, fades {}..{} m, sizes {:?}, 2D only {}{}",
                 m.icon,
                 w.objects.get(&g).map_or("?", |o| o.name.as_str()),
                 m.mission,
@@ -6595,20 +6619,58 @@ mod tests {
     }
 
     #[test]
-    fn markers_show_from_near_to_far() {
-        // The first contract's: 2 m over its target, from 5 m to 175 m.
-        let m = MarkerView {
+    fn markers_fade_from_near_to_far() {
+        // The first contract's: 2 m over its target, fading 5 m to 175 m.
+        let mut m = MarkerView {
             at: Vec3::new(0.0, 2.0, 0.0),
             icon: "HUD_objective_deliverable".into(),
             colour: [255, 200, 0, 255],
             near: 5.0,
             far: 175.0,
+            flat: false,
             size: 32.0,
         };
         assert_eq!(m.label(), "deliverable");
-        assert!(!m.shown_from(Vec3::new(3.0, 0.0, 0.0)));
-        assert!(m.shown_from(Vec3::new(0.0, 0.0, 20.0)));
-        assert!(m.shown_from(Vec3::new(0.0, 2.0, 175.0)));
-        assert!(!m.shown_from(Vec3::new(0.0, 0.0, 200.0)));
+        // Close by it shows in full: the beta hid it within `near`.
+        assert_eq!(m.alpha_from(Vec3::new(3.0, 2.0, 0.0)), 1.0);
+        assert_eq!(m.alpha_from(Vec3::new(0.0, 2.0, 0.0)), 1.0);
+        assert_eq!(m.alpha_from(Vec3::new(0.0, 2.0, 5.0)), 1.0);
+        // Between, linear in the squared distance: at 100 m,
+        // (175² - 100²) / (175² - 5²).
+        let mid = m.alpha_from(Vec3::new(0.0, 2.0, 100.0));
+        assert!((mid - 20_625.0 / 30_600.0).abs() < 1e-6, "{mid}");
+        // Not linear in the distance itself (that would be 75/170).
+        assert!((mid - 75.0 / 170.0).abs() > 0.1);
+        // It thins further out, and is gone beyond `far`.
+        assert!(m.alpha_from(Vec3::new(0.0, 2.0, 150.0)) < mid);
+        assert_eq!(m.alpha_from(Vec3::new(0.0, 2.0, 175.0)), 0.0);
+        assert_eq!(m.alpha_from(Vec3::new(0.0, 2.0, 175.5)), 0.0);
+        assert_eq!(m.alpha_from(Vec3::new(0.0, 0.0, 200.0)), 0.0);
+        // Height counts, unless it is "2D only".
+        let above = Vec3::new(0.0, 202.0, 3.0);
+        assert_eq!(m.alpha_from(above), 0.0);
+        m.flat = true;
+        assert_eq!(m.alpha_from(above), 1.0);
+    }
+
+    #[test]
+    fn markers_without_a_fade_show_to_200_m_and_fade_out_by_300() {
+        let m = MarkerView {
+            at: Vec3::ZERO,
+            icon: "HUD_objective_destroy".into(),
+            colour: [255, 0, 0, 255],
+            near: m2_game::hud::MARKER_NEAR,
+            far: m2_game::hud::MARKER_FAR,
+            flat: false,
+            size: 32.0,
+        };
+        // 5 m off: shown (the beta's 5 m default hid it there).
+        assert_eq!(m.alpha_from(Vec3::new(3.0, 0.0, 0.0)), 1.0);
+        assert_eq!(m.alpha_from(Vec3::new(200.0, 0.0, 0.0)), 1.0);
+        let a = m.alpha_from(Vec3::new(250.0, 0.0, 0.0));
+        assert!((a - 27_500.0 / 50_000.0).abs() < 1e-6, "{a}");
+        // Shown at 200 to 300 m, where the beta's 175 m hid it.
+        assert!(m.alpha_from(Vec3::new(290.0, 0.0, 0.0)) > 0.0);
+        assert_eq!(m.alpha_from(Vec3::new(301.0, 0.0, 0.0)), 0.0);
     }
 }

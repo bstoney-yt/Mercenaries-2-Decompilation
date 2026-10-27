@@ -1438,10 +1438,13 @@ fn ground_discs(
 
 /// The scripts' markers (`Marker.AddBlip`) over the world, under the
 /// game's HUD: each its icon (the HUD's texture) tinted its colour,
-/// centred on its point while she is within its `near` to `far` metres
-/// (inferred: from her rather than from the camera). Its size is taken
-/// as the HUD's 640x480 units (inferred: the call's units aren't known),
-/// and one off the screen isn't drawn (nor pinned to its edge).
+/// centred on its point, its alpha scaled by its fade from her
+/// ([`MarkerView::alpha_from`]; inferred: from her rather than from the
+/// camera). Its size is taken as the HUD's 640x480 units (inferred: the
+/// call's units aren't known), and one off the screen isn't drawn (nor
+/// pinned to its edge).
+///
+/// [`MarkerView::alpha_from`]: crate::mission::MarkerView::alpha_from
 fn world_markers(
     painter: &egui::Painter,
     screen: egui::Rect,
@@ -1452,7 +1455,8 @@ fn world_markers(
 ) {
     let unit = screen.height() / m2_game::gui::VIRTUAL_SIZE.1;
     for marker in &m.markers {
-        if here.is_some_and(|h| !marker.shown_from(h)) {
+        let fade = here.map_or(1.0, |h| marker.alpha_from(h));
+        if fade <= 0.0 {
             continue;
         }
         let Some(p) = project(view_proj, marker.at, screen) else {
@@ -1460,6 +1464,7 @@ fn world_markers(
         };
         let rect = Rect::from_center_size(p, vec2(marker.size, marker.size) * unit);
         let [r, g, b, a] = marker.colour;
+        let a = (f32::from(a) * fade).round() as u8;
         let colour = Color32::from_rgba_unmultiplied(r, g, b, a);
         game.paint_texture(painter, &marker.icon, rect, colour);
     }
@@ -1919,6 +1924,7 @@ mod tests {
                     colour: [255, 200, 0, 255],
                     near: 5.0,
                     far: 175.0,
+                    flat: false,
                     size: 32.0,
                 }],
                 message: Some((false, "VzaCon001 objective 1".into())),
