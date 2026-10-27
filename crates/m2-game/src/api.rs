@@ -599,6 +599,10 @@ pub struct ScriptWorld {
     pub outside: bool,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Every template the template database names, in lower case: the
+    /// names `Pg.GetGuidByName` answers with a template's guid
+    /// ([`ScriptWorld::is_template`]).
+    pub template_names: std::collections::HashSet<String>,
     /// Who drives each template's vehicle, by name in lower case, as its
     /// `Rider` in the driver's seat names them: a vehicle spawned without
     /// "(Driver)" in its name comes with them ([`ScriptWorld::spawn`]).
@@ -722,6 +726,14 @@ impl ScriptWorld {
             .get(&guid)
             .map(|o| o.position)
             .or_else(|| self.entities.get(&guid).copied())
+    }
+
+    /// Whether `name` is an object template's: one the template database
+    /// names (`"Supply Drop (GL)"`, `"AMX30"`, the factions' `"OC"`). A
+    /// name that only looks like one is not: `"HqInterior"`, which the
+    /// HQ scripts give the interiors they spawn.
+    pub fn is_template(&self, name: &str) -> bool {
+        self.template_names.contains(&name.to_ascii_lowercase())
     }
 
     /// Takes the commands issued since the last call.
@@ -1218,13 +1230,6 @@ fn num(v: Option<&Value>) -> Option<f32> {
     }
 }
 
-/// Whether a name no object has is an object template's: templates are
-/// named in words (`"Supply Drop (GL)"`, `"AMX30"`), layer objects in
-/// snake case (`vza001_gate`). A guess from the names scripts use.
-fn is_template(name: &str) -> bool {
-    name.starts_with(|c: char| c.is_ascii_uppercase()) && !name.contains('_')
-}
-
 /// The people of squad `squad` (an object's name, `oc001.obj1.vzsquad1`)
 /// among `objects` (guid, name): those placed as `oc001.obj1.vz1 0x...`,
 /// its name less `squad`, in guid order. Inferred from the layers' names.
@@ -1528,7 +1533,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 let name = s.to_string_lossy();
                 w.by_name(&name)
                     .or_else(|| w.entity_names.get(&name.to_ascii_lowercase()).copied())
-                    .or_else(|| is_template(&name).then(|| w.template(&name)))
+                    .or_else(|| w.is_template(&name).then(|| w.template(&name)))
             }
             _ => None,
         };
@@ -1767,7 +1772,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             return values([guid_value(Some(c.template))]);
         }
         let name = match w.objects.get(&g) {
-            Some(o) if is_template(&o.name) && !w.templates.values().any(|&t| t == g) => {
+            Some(o) if w.is_template(&o.name) && !w.templates.values().any(|&t| t == g) => {
                 o.name.clone()
             }
             _ => return values([Value::Nil]),
@@ -3569,6 +3574,10 @@ mod tests {
             let mut jeep = Object::new("_global_veh_jeep 0x0001", [0.0, 0.0, 0.0]);
             jeep.labels.push("Vehicle".into());
             w.insert(50, jeep);
+            // The template database's templates the tests' scripts name.
+            w.template_names = ["carbine", "grenade", "supply drop (gl)", "oc", "allied"]
+                .map(String::from)
+                .into();
         }
         install(host.lua(), &world).unwrap();
         (host, world)
@@ -4536,6 +4545,28 @@ mod tests {
         events.update_shared(0.1, &world);
         let dead: Vec<String> = host.lua().globals().get("dead").unwrap();
         assert_eq!(dead, ["60", "61"]);
+    }
+
+    // Only the template database's names are templates: `HqInterior`
+    // looks like one but is the name the HQ scripts give the interiors
+    // they spawn, and with none about it is nil, so `MrxUtil.SpawnActor`
+    // spawns one.
+    #[test]
+    fn only_the_databases_names_are_templates() {
+        let (host, world) = setup();
+        assert!(world.borrow().is_template("Supply Drop (GL)"));
+        assert!(world.borrow().is_template("oc"));
+        assert!(!world.borrow().is_template("HqInterior"));
+        let (interior, drop): (bool, bool) = host
+            .lua()
+            .load(
+                r#"return Pg.GetGuidByName("HqInterior") == nil,
+                    Pg.GetGuidByName("Supply Drop (GL)") ~= nil"#,
+            )
+            .eval()
+            .unwrap();
+        assert!(interior && drop);
+        assert!(world.borrow().by_name("HqInterior").is_none());
     }
 
     #[test]

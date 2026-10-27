@@ -313,6 +313,9 @@ pub struct GameData {
     /// Templates' labels (name hashes) by the template's name in lower
     /// case, for objects the scripts spawn.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Every template's name in the template database, in lower case:
+    /// the names scripts look templates up by (`Pg.GetGuidByName("OC")`).
+    pub template_names: std::collections::HashSet<String>,
     /// Who drives a template's vehicle as its `Rider` in `seat_driver`
     /// names them (`"AH1Z (Ewan)"`: `"Recruit Ewen Garret"`), by the
     /// template's name in lower case, for vehicles the scripts spawn.
@@ -425,6 +428,10 @@ impl GameData {
                         .names()
                         .into_iter()
                         .map(|(id, n)| (id, n.to_owned()))
+                        .collect();
+                    data.template_names = template_names
+                        .values()
+                        .map(|n| n.to_ascii_lowercase())
                         .collect();
                     for (id, name) in db.names() {
                         if let Some(l) = template_labels.get(&id) {
@@ -649,6 +656,7 @@ impl Mission {
             shapes,
             strings,
             template_labels,
+            template_names,
             template_drivers,
             template_passengers,
             max_reserve,
@@ -670,6 +678,7 @@ impl Mission {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
+            w.template_names = template_names;
             w.template_drivers = template_drivers;
             w.template_passengers = template_passengers;
             w.inventory.max_reserve = max_reserve;
@@ -3295,7 +3304,11 @@ mod tests {
 
     #[test]
     fn a_factions_infraction_multiplier_scales_what_its_witnesses_report() {
-        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let data = GameData {
+            template_names: ["oc", "guerilla"].map(String::from).into(),
+            ..GameData::default()
+        };
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
         // As a faction contract's start does (2f0b1589), and a mission
         // that lets the Guerillas' witnesses see nothing (08dcd9af).
         m.run(
