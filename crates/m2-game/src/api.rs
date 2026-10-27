@@ -610,9 +610,14 @@ pub struct ScriptWorld {
     /// Who else rides each template's vehicle (its other `Rider`
     /// records): a `(Full)` vehicle spawned comes with them too.
     pub template_passengers: HashMap<String, Vec<String>>,
-    /// Every layer entity's place, and its guid by name in lower case,
-    /// loaded or not: `Pg.GetGuidByName` finds markers (landing zones) of
-    /// layers that aren't in, and scripts measure to them.
+    /// Every layer entity's place, loaded or not; and the layers' markers'
+    /// guids by name in lower case ([`crate::mission::Entity::is_marker`]):
+    /// `Pg.GetGuidByName` finds markers (landing zones) of layers that
+    /// aren't in, and scripts measure to them. Any other object of a layer
+    /// that isn't in is not found by name: from samples, the shipped HQ
+    /// scripts spawn each faction's interior when no `HqInterior` exists
+    /// (`MrxUtil.SpawnActor`), so the PMC's, of its own layer, must not
+    /// stand in for it once that layer is out.
     pub entities: HashMap<u32, [f32; 3]>,
     pub entity_names: HashMap<String, u32>,
     /// A save's script data to load, as Lua text ([`crate::savedata`]):

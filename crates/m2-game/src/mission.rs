@@ -290,6 +290,24 @@ pub struct Entity {
     pub template: Option<String>,
 }
 
+impl Entity {
+    /// Whether it is a marker: a region, or a place marked with no
+    /// template or a location's (`location`, `Paradrop Location (CH)`,
+    /// `Landing Zone (player 1)`), not an object with a body. A marker of
+    /// a layer that isn't in is still found by name (the HQs' landing
+    /// zones a delivery helicopter flies home to); an object is not (the
+    /// PMC's `HqInterior`, of `vz_state_pmcinterior`, once that layer is
+    /// out). From the data: 1280 of the layers' unlabelled entities are
+    /// placed as `location` and 1179 with no template.
+    pub fn is_marker(&self) -> bool {
+        self.region.is_some()
+            || self.template.as_deref().is_none_or(|t| {
+                let t = t.to_ascii_lowercase();
+                t.contains("location") || t.starts_with("landing zone")
+            })
+    }
+}
+
 /// An object of the layers with a crew of its own aboard
 /// ([`Mission::crews_aboard`]): its guid, and each rider's seat, guid and
 /// template.
@@ -685,9 +703,11 @@ impl Mission {
             w.inventory.thrown = thrown;
             for e in layers.values().flatten() {
                 w.entities.insert(e.guid, e.at);
-                w.entity_names
-                    .entry(e.name.to_ascii_lowercase())
-                    .or_insert(e.guid);
+                if e.is_marker() {
+                    w.entity_names
+                        .entry(e.name.to_ascii_lowercase())
+                        .or_insert(e.guid);
+                }
             }
             w.landing_zones.insert(1, one);
             w.landing_zones.insert(2, two);
@@ -3080,6 +3100,49 @@ mod tests {
         )
         .unwrap();
         assert!(m.crews_aboard().is_empty());
+    }
+
+    /// The PMC's `HqInterior` as its layer places it (vz_state_pmcinterior
+    /// 0xc73ad, template `PmcHq_Interior`) and a landing zone marker of a
+    /// layer that isn't in either.
+    fn pmc_interior_and_a_marker() -> GameData {
+        let hq = Entity {
+            guid: 0xc73ad,
+            name: "HqInterior".into(),
+            at: [3750.0, 450.0, -3840.0],
+            template: Some("PmcHq_Interior".into()),
+            crew: vec![("a651ff78".into(), "Fiona Taylor".into())],
+            ..villa_tank()
+        };
+        let lz = Entity {
+            guid: 0xd78ea,
+            name: "01_pmc_hq_lz_playerone".into(),
+            at: [3700.0, 450.0, -3800.0],
+            template: Some("Landing Zone (player 1)".into()),
+            crew: Vec::new(),
+            ..villa_tank()
+        };
+        let mut data = GameData::default();
+        data.layers.insert("vz_state_pmcinterior".into(), vec![hq]);
+        data.layers.insert("vz_pmc_markers".into(), vec![lz]);
+        data
+    }
+
+    #[test]
+    fn an_object_of_a_layer_not_in_has_no_guid_by_name_but_a_marker_has() {
+        let mut m = Mission::new(pmc_interior_and_a_marker(), "Mattias", [0.0; 3]).unwrap();
+        m.run(
+            r#"__hq = Pg.GetGuidByName("HqInterior")
+            __lz = Pg.GetGuidByName("01_pmc_hq_lz_playerone")"#,
+            "names",
+        )
+        .unwrap();
+        let g = m.lua().globals();
+        assert_eq!(g.get::<Value>("__hq").unwrap(), Value::Nil);
+        assert_eq!(
+            g.get::<Value>("__lz").unwrap(),
+            crate::events::guid_value(0xd78ea)
+        );
     }
 
     #[test]
