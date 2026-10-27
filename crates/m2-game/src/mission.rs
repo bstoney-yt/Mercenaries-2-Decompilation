@@ -2031,6 +2031,20 @@ end
         w.buttons.drain(..extra);
     }
 
+    /// Whether the player is inside an HQ, as the scripts have it: from
+    /// `MrxHq.GlobalEnter`, which makes each player's character
+    /// invincible for the reason "HQ" (both the PMC's `WifPmcInterior` and
+    /// the factions' `MrxHq` call it on entering), until `MrxHq.GlobalExit`
+    /// takes that away, which `WifPmcInterior._ExitEnd` calls only once the
+    /// layers are removed, the heroes teleported out and the assets
+    /// unloaded (from the scripts).
+    pub fn in_hq(&self) -> bool {
+        let w = self.world.borrow();
+        w.player
+            .and_then(|p| w.invincible.get(&p))
+            .is_some_and(|r| r.contains("HQ"))
+    }
+
     /// The context actions on offer (`Pg.AddContextAction`): each one's
     /// object, where it stands (if known), its prompt's text id and reach.
     pub fn context_actions(&self) -> Vec<(u32, Option<[f32; 3]>, String, f32)> {
@@ -2616,6 +2630,21 @@ mod tests {
         assert_eq!(talk(&m), None);
     }
 
+    // In an HQ as the scripts have it: from `MrxHq.GlobalEnter`'s
+    // invincibility for "HQ" on her character to `GlobalExit` taking it
+    // away; other reasons don't count.
+    #[test]
+    fn in_an_hq_from_global_enter_to_global_exit() {
+        let m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let run = |code: &str| m.lua().load(code).exec().unwrap();
+        assert!(!m.in_hq());
+        run(r#"Object.SetInvincible(Player.GetCharacter(1), true, "Cinematic")"#);
+        assert!(!m.in_hq());
+        run(r#"Object.SetInvincible(Player.GetCharacter(1), true, "HQ")"#);
+        assert!(m.in_hq());
+        run(r#"Object.SetInvincible(Player.GetCharacter(1), false, "HQ")"#);
+        assert!(!m.in_hq());
+    }
     #[test]
     fn the_skip_to_mission_switch_reaches_the_bootstrap_once() {
         let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();

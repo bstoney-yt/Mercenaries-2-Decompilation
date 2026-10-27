@@ -525,6 +525,9 @@ enum Goal {
     /// Get out of the vehicle she is driving, by the place she is after
     /// (an outpost's flag).
     GetOut,
+    /// Stay put (inside an HQ while the scripts take her out: its exits
+    /// are gone and she isn't out yet).
+    Hold,
     /// Take the action the scripts offer on their object `target` (a
     /// verified HVT's body), standing at `at`, offered within `reach`.
     Use { target: u32, at: Vec3, reach: f32 },
@@ -551,6 +554,41 @@ enum UseStep {
 /// within its reach (less a margin) she waits for the game to offer it;
 /// short of that she walks on in, so a stop just outside the reach is
 /// never taken for being there.
+/// Within this of her (metres, flat) a goal is taken to be inside the HQ
+/// she is in, else outside it (invented: the HQ interiors stand at one
+/// anchor, the PMC's rooms within 100 m of it, the island far off).
+const HQ_SPAN: f32 = 150.0;
+
+/// How she gets to a goal at goal_at from here, given whether she is
+/// in an HQ (`in_hq`) and its exits on offer (`exits`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HqLeg {
+    /// Straight there: not in an HQ, or the goal is inside it.
+    Go,
+    /// By the nearest exit the game offers: its action is taken as any
+    /// other ([`UseStep`]).
+    Exit(ActionAt),
+    /// In the HQ with no exit on offer (the scripts took them away as she
+    /// went out, `_EnableInteriorPortals(false)`, and she is not out until
+    /// `MrxHq.GlobalExit`): she waits for the way out to finish.
+    Wait,
+}
+
+fn hq_leg(in_hq: bool, here: Vec3, goal_at: Option<Vec3>, exits: &[ActionAt]) -> HqLeg {
+    let flat = |a: Vec3| a.with_y(0.0).distance(here.with_y(0.0));
+    let Some(at) = goal_at.filter(|_| in_hq) else {
+        return HqLeg::Go;
+    };
+    if flat(at) <= HQ_SPAN {
+        return HqLeg::Go;
+    }
+    exits
+        .iter()
+        .copied()
+        .min_by(|a, b| flat(a.1).total_cmp(&flat(b.1)))
+        .map_or(HqLeg::Wait, HqLeg::Exit)
+}
+
 fn use_step(flat: f32, reach: f32, offered: bool) -> UseStep {
     let near = USE_FROM.min(reach * USE_INSIDE);
     if offered {
@@ -572,7 +610,7 @@ impl Goal {
             (Goal::Open(a), Goal::Open(b)) => a == b,
             (Goal::Take(a), Goal::Take(b)) => a == b,
             (Goal::Deliver(a), Goal::Deliver(b)) => a == b,
-            (Goal::GetOut, Goal::GetOut) => true,
+            (Goal::GetOut, Goal::GetOut) | (Goal::Hold, Goal::Hold) => true,
             (Goal::Use { target: a, .. }, Goal::Use { target: b, .. }) => a == b,
             _ => false,
         }
@@ -643,6 +681,12 @@ pub struct Autoplay {
     /// The actions the scripts offer: on what, where it is and its reach
     /// (set each tick before [`step`](Self::step)).
     pub offers: Vec<ActionAt>,
+    /// Whether she is inside an HQ as the scripts have it, and the HQ's
+    /// exits on offer (`[ContextAction.Exit]`): set each tick
+    /// ([`crate::mission::MissionLink::in_hq`],
+    /// [`crate::mission::MissionLink::exit_offers`]).
+    pub in_hq: bool,
+    pub exits: Vec<ActionAt>,
     /// Seconds played.
     clock: f32,
     goal: Option<Goal>,
@@ -911,7 +955,9 @@ impl Autoplay {
             }
             return Intent::default();
         }
-        let chosen = self.choose(game, marks);
+        let chosen = self
+            .choose(game, marks)
+            .map(|c| self.by_hq_exit(game.focus(), c));
         let changed = match (&chosen, &self.goal) {
             (Some((a, _)), Some(b)) => !a.same(b),
             (None, None) => false,
@@ -1250,6 +1296,7 @@ impl Autoplay {
                     UseStep::CloseIn(arrive) => self.travel(game, at, arrive, dt),
                 }
             }
+            Some(Goal::Hold) => Intent::default(),
             Some(Goal::GetOut) => match game.scene.player.as_ref().and_then(|p| p.driving) {
                 Some(i) => {
                     let speed = vehicle_state(game, i).map_or(0.0, |s| s.1);
@@ -1416,6 +1463,29 @@ impl Autoplay {
     }
 
     /// What to do next, and words for the log.
+    /// The goal chosen (`chosen`), by way of the HQ's exit when she is in
+    /// an HQ and it is outside ([`hq_leg`]).
+    fn by_hq_exit(&self, here: Vec3, chosen: (Goal, String)) -> (Goal, String) {
+        let at = match &chosen.0 {
+            Goal::Reach { at, .. } | Goal::Blast { at, .. } | Goal::Use { at, .. } => Some(*at),
+            _ => None,
+        };
+        match hq_leg(self.in_hq, here, at, &self.exits) {
+            HqLeg::Go => chosen,
+            HqLeg::Exit((target, at, reach)) => (
+                Goal::Use { target, at, reach },
+                format!("leaving the HQ by its exit {target:#x} for {}", chosen.1),
+            ),
+            HqLeg::Wait => (
+                Goal::Hold,
+                format!(
+                    "in the HQ with no exit offered, waiting to be out, for {}",
+                    chosen.1
+                ),
+            ),
+        }
+    }
+
     fn choose(&self, game: &Game, marks: &[Mark]) -> Option<(Goal, String)> {
         // Off a contract with one on offer, a job's or collection's marks
         // wait: the contract comes first (story run B3: she called
@@ -5165,6 +5235,60 @@ mod tests {
         assert_eq!(use_step(0.0, reach, false), UseStep::Wait);
     }
 
+    // b3k: in the PMC HQ with the UP entrance's talk 5.5 km off, she
+    // walked at it and stood inside. Now: in an HQ with an outside goal she
+    // goes by the nearest exit the game offers, as a Use of its action;
+    // with no exit on offer (the scripts taking her out) she holds; once
+    // out (not in the HQ) she goes straight for it.
+    #[test]
+    fn an_outside_goal_from_an_hq_goes_by_its_exit() {
+        let here = Vec3::new(3796.6, 450.0, -3852.6);
+        let entrance = Some(Vec3::new(2542.9, -33.8, 1498.8));
+        let exits = [
+            (0x143918, Vec3::new(3794.0, 450.8, -3913.8), 2.0),
+            (0x143917, Vec3::new(3794.0, 450.0, -3820.6), 2.0),
+        ];
+        assert_eq!(hq_leg(false, here, entrance, &exits), HqLeg::Go);
+        assert_eq!(hq_leg(true, here, entrance, &exits), HqLeg::Exit(exits[1]));
+        assert_eq!(hq_leg(true, here, entrance, &[]), HqLeg::Wait);
+        // Out: the island near the HQ's door, nothing of the HQ offered.
+        let out = Vec3::new(2600.0, -30.0, 1400.0);
+        assert_eq!(hq_leg(false, out, entrance, &[]), HqLeg::Go);
+        // A goal inside the HQ (its starter at her desk) is gone to.
+        let fiona = Some(Vec3::new(3750.0, 450.0, -3840.0));
+        assert_eq!(hq_leg(true, here, fiona, &exits), HqLeg::Go);
+    }
+
+    // The exit is taken as any action: a Use of the game's own exit
+    // action, pressed only once the game offers it ([`use_step`]); her
+    // goal is still the outside one, named, and the starter's talk goal
+    // itself is unchanged out of an HQ (#176).
+    #[test]
+    fn the_hq_exit_is_a_use_of_the_offered_exit_action() {
+        let mut a = Autoplay::default();
+        let here = Vec3::new(3796.6, 450.0, -3852.6);
+        let talk = (
+            Goal::Use {
+                target: 0x142aed,
+                at: Vec3::new(2542.9, -33.8, 1498.8),
+                reach: 2.0,
+            },
+            "going to the starter".to_owned(),
+        );
+        let (g, what) = a.by_hq_exit(here, talk.clone());
+        assert!(g.same(&talk.0));
+        assert_eq!(what, talk.1);
+        a.in_hq = true;
+        a.exits = vec![(0x143917, Vec3::new(3794.0, 450.0, -3820.6), 2.0)];
+        let (g, what) = a.by_hq_exit(here, talk.clone());
+        assert!(matches!(g, Goal::Use { target: 0x143917, reach, .. } if reach == 2.0));
+        assert!(what.contains("going to the starter"));
+        assert_eq!(use_step(1.0, 2.0, false), UseStep::Wait);
+        a.exits.clear();
+        assert!(matches!(a.by_hq_exit(here, talk.clone()).0, Goal::Hold));
+        a.in_hq = false;
+        assert!(a.by_hq_exit(here, talk.clone()).0.same(&talk.0));
+    }
     // Ordinary actions are unchanged: a reach of USE_FROM or more is
     // waited on from 2.5 m, as before, and an offer far off (a person
     // walking) is still taken.
