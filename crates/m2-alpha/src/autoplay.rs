@@ -593,9 +593,13 @@ fn hq_leg(in_hq: bool, here: Vec3, goal_at: Option<Vec3>, exits: &[ActionAt]) ->
         .map_or(HqLeg::Wait, HqLeg::Exit)
 }
 
-fn use_step(flat: f32, reach: f32, offered: bool) -> UseStep {
+fn use_step(flat: f32, reach: f32, offered: bool, locked: bool) -> UseStep {
     let near = USE_FROM.min(reach * USE_INSIDE);
-    if offered {
+    if locked {
+        // Her controls off (a briefing's cinematic): the use key does
+        // nothing for a player then (`Game::tick`), nor for her.
+        UseStep::Wait
+    } else if offered {
         UseStep::Press
     } else if flat <= near {
         UseStep::Wait
@@ -693,6 +697,8 @@ pub struct Autoplay {
     pub exits: Vec<ActionAt>,
     /// The HQ state and exits last logged.
     hq_seen: Option<(bool, Vec<u32>)>,
+    /// Whether her controls were off when last logged.
+    locked_seen: bool,
     /// Seconds played.
     clock: f32,
     goal: Option<Goal>,
@@ -887,6 +893,28 @@ impl Autoplay {
                 game.focus()
             );
             self.hq_seen = Some((self.in_hq, exits));
+        }
+        // While the game has her controls off (the scripts' input switch,
+        // `Command::InputEnabled(false)`: a briefing's cheap cinematic, from
+        // its `GlobalEnter`), she neither moves, hops nor presses, as a
+        // player can't: story run b3m walked (by hops) to the PMC HQ's exit
+        // and took it through PmcCon031's briefing, which then unloaded the
+        // interior under it; the briefing went on outside, put her back at
+        // its seat in the gone interior (y 345) and its wait never ended.
+        if game.input_locked != self.locked_seen {
+            eprintln!(
+                "autoplay {:.1} s: controls {}",
+                self.clock,
+                if game.input_locked {
+                    "off: waiting"
+                } else {
+                    "on"
+                }
+            );
+            self.locked_seen = game.input_locked;
+        }
+        if game.input_locked {
+            return Intent::default();
         }
         let Some(p) = &game.scene.player else {
             return Intent::default();
@@ -1302,7 +1330,7 @@ impl Autoplay {
                 // counts, never being near.
                 let offered = game.context.as_ref().is_some_and(|c| c.0 == target);
                 let flat = here.with_y(0.0).distance(at.with_y(0.0));
-                match use_step(flat, reach, offered) {
+                match use_step(flat, reach, offered, game.input_locked) {
                     UseStep::Press => {
                         if self.pressed > PRESS_GAP {
                             self.pressed = 0.0;
@@ -5247,14 +5275,18 @@ mod tests {
     #[test]
     fn a_stop_just_outside_the_reach_walks_on_in() {
         let reach = 2.0;
-        match use_step(2.46, reach, false) {
+        match use_step(2.46, reach, false, false) {
             UseStep::CloseIn(arrive) => assert!(arrive < reach),
             other => panic!("expected to close in, got {other:?}"),
         }
-        assert_eq!(use_step(1.5, reach, false), UseStep::Wait);
-        assert_eq!(use_step(1.5, reach, true), UseStep::Press);
+        assert_eq!(use_step(1.5, reach, false, false), UseStep::Wait);
+        assert_eq!(use_step(1.5, reach, true, false), UseStep::Press);
         // Being near is never taking it: at the object, not offered, waits.
-        assert_eq!(use_step(0.0, reach, false), UseStep::Wait);
+        assert_eq!(use_step(0.0, reach, false, false), UseStep::Wait);
+        // Nor offered with her controls off (b3m: the HQ exit taken
+        // through PmcCon031's briefing): she waits for them back.
+        assert_eq!(use_step(0.0, reach, true, true), UseStep::Wait);
+        assert_eq!(use_step(2.46, reach, false, true), UseStep::Wait);
     }
 
     // b3k: in the PMC HQ with the UP entrance's talk 5.5 km off, she
@@ -5315,7 +5347,7 @@ mod tests {
         let (g, what) = a.by_hq_exit(here, talk.clone());
         assert!(matches!(g, Goal::Use { target: 0x143917, reach, .. } if reach == 2.0));
         assert!(what.contains("going to the starter"));
-        assert_eq!(use_step(1.0, 2.0, false), UseStep::Wait);
+        assert_eq!(use_step(1.0, 2.0, false, false), UseStep::Wait);
         a.exits.clear();
         assert!(matches!(a.by_hq_exit(here, talk.clone()).0, Goal::Hold));
         a.in_hq = false;
@@ -5326,12 +5358,12 @@ mod tests {
     // walking) is still taken.
     #[test]
     fn ordinary_reaches_keep_their_use_distance() {
-        assert_eq!(use_step(2.4, 4.0, false), UseStep::Wait);
-        assert_eq!(use_step(2.4, 4.0, true), UseStep::Press);
+        assert_eq!(use_step(2.4, 4.0, false, false), UseStep::Wait);
+        assert_eq!(use_step(2.4, 4.0, true, false), UseStep::Press);
         assert!(
-            matches!(use_step(3.0, 4.0, false), UseStep::CloseIn(a) if (a - USE_FROM * 0.6).abs() < 1e-6)
+            matches!(use_step(3.0, 4.0, false, false), UseStep::CloseIn(a) if (a - USE_FROM * 0.6).abs() < 1e-6)
         );
-        assert_eq!(use_step(3.5, 4.0, true), UseStep::Press);
+        assert_eq!(use_step(3.5, 4.0, true, false), UseStep::Press);
     }
 
     // A box of the carbine's rounds is wanted while it has room for them,
