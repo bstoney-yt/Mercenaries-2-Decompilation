@@ -204,6 +204,9 @@ struct Options {
     plough: Option<String>,
     /// With `--drive`: wreck it at speed at the end and watch it stop.
     wreck: bool,
+    /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
+    /// walk to the fuel can it left and take it (testing).
+    fuel_check: bool,
     /// With `--drive`: stop and put this many rifle rounds into its parts.
     shoot_up: Option<u32>,
     /// With `--drive`: fire from the next seat with a weapon.
@@ -615,6 +618,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
             "--wreck" => o.wreck = true,
+            "--fuel-check" => o.fuel_check = true,
             "--shoot-up" => {
                 o.shoot_up = Some(
                     value()?
@@ -5889,6 +5893,9 @@ fn drive_for_screenshot(
     if let Some(rounds) = options.shoot_up {
         shoot_up(game, rounds, tick);
     }
+    if options.fuel_check {
+        fuel_check(game, tick);
+    }
     if options.look != 0.0 || options.fire {
         // Stop, then swing the camera and watch the turret follow.
         let brake = Intent {
@@ -6094,6 +6101,59 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
         v.health(),
         v.wrecked
     );
+}
+
+/// With `--fuel-check`: out of the wreck she drove, to the pickups its
+/// death left, and logs what each gave (`fuel-check:` lines).
+fn fuel_check(game: &mut Game, tick: f32) {
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("fuel-check: not driving");
+        return;
+    };
+    let v = &game.scene.vehicles[i];
+    let (label, wrecked) = (v.spec.label.clone(), v.wrecked);
+    let from = v.guid.unwrap_or(0x4000_0000 | i as u32);
+    for _ in 0..30 {
+        game.step(Intent::default(), tick);
+    }
+    let left: Vec<_> = game
+        .scene
+        .flights
+        .pickups()
+        .iter()
+        .filter(|p| p.from == from)
+        .copied()
+        .collect();
+    eprintln!(
+        "fuel-check: {label} wrecked {wrecked}: left {} pickups: {:?}",
+        left.len(),
+        left.iter()
+            .map(|p| (p.what.template, p.what.fuel, p.at))
+            .collect::<Vec<_>>()
+    );
+    if let (Some(world), Some(player)) = (game.scene.world.as_ref(), game.scene.player.as_mut()) {
+        game::get_out(&world.physics, &game.scene.vehicles[i], player);
+    }
+    for p in left {
+        let before = game.earned.iter().map(|e| e.1).sum::<u32>();
+        if let Some(player) = game.scene.player.as_mut() {
+            player.drop_at(p.at + m2_math::glam::Vec3::Y * 0.5);
+        }
+        for _ in 0..60 {
+            game.step(Intent::default(), tick);
+        }
+        let gone = !game
+            .scene
+            .flights
+            .pickups()
+            .iter()
+            .any(|q| q.key() == p.key());
+        let fuel = game.earned.iter().map(|e| e.1).sum::<u32>() - before;
+        eprintln!(
+            "fuel-check: at {:.1}: taken {gone}, fuel earned {fuel}",
+            p.at
+        );
+    }
 }
 
 /// Wrecks the vehicle she drives, as it goes, and logs how it comes to

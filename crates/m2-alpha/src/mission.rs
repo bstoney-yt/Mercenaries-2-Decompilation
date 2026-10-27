@@ -5614,6 +5614,12 @@ pub(crate) enum Offer {
 /// is "Equip Assault Rifle" (3:14, 14:20, 15:24); one she carries, and an
 /// ammunition box without health (`Ammo Pickup (Bullet)`, the rockets),
 /// "Take Ammo" (9:00, 9:42, 15:38, 16:36).
+///
+/// The 360 code differs: there every pickup without a `Weapon` record
+/// (`Type` 2) is taken walking over it, ammunition boxes too, and only a
+/// weapon lying there is a context action (8228F5E8, 8228F450, 82432F68).
+/// That looks like a platform difference; the PC footage's use key is kept
+/// until PC evidence says otherwise (Brendan, 2026-10-27).
 pub(crate) fn offer(templates: &Templates, combat: &combat::Combat, what: &Leaves) -> Offer {
     // Money is walked over, whatever she carries (inferred: its record
     // names nothing to choose, and no prompt for it was seen).
