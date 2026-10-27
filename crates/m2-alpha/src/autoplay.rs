@@ -387,6 +387,20 @@ const ROAD_FROM: f32 = 800.0;
 const ROAD_REACH: f32 = 400.0;
 const ROAD_AHEAD: f32 = 120.0;
 const ROAD_REPLAN: f32 = 250.0;
+/// With no road within [`ROAD_REACH`] of her, the way by road is looked
+/// for again with roads this far off (metres): its first road point is
+/// then reached by the ground's way (story runs b3f/b3h: 0 roads within
+/// 400 m of (3219, -2005) on the PMC HQ's hillside, and a way with its
+/// first point 317 m off from where she stalled). Invented.
+const ROAD_REACH_WIDE: f32 = 1500.0;
+/// She has come to the road point she heads for this near it (metres);
+/// till then it stays hers. Invented.
+const ROAD_ARRIVE: f32 = 40.0;
+/// A hop that would put her back within this of where her last hop
+/// started (metres), from within this of where it ended, is the two of
+/// them hopping her to and fro (story run b3h: 297 hops between (2872,
+/// -1493) and (2851, -1507) for 3000 s). Invented.
+const OSCILLATE_NEAR: f32 = 5.0;
 const STRAYED: f32 = 15.0;
 const LOOK_AHEAD: f32 = 5.0;
 const LOOK_TIME: f32 = 0.6;
@@ -716,8 +730,11 @@ pub struct Autoplay {
     /// The island's roads as one graph, made the first time a place is
     /// far ([`Autoplay::by_road`]).
     roads: Option<RoadGraph>,
-    /// The way by road to a far place: the place, and the road points.
-    road_way: Option<(Vec3, Vec<Vec3>)>,
+    /// The way by road to a far place ([`RoadWay`]).
+    road_way: Option<RoadWay>,
+    /// The road point she headed for proved out of reach (her hops went
+    /// to and fro): the next one on is hers ([`Autoplay::hop`]).
+    road_skip: bool,
     /// Hops: from, to.
     pub hops: Vec<(Vec3, Vec3)>,
     /// The objectives last logged.
@@ -2284,6 +2301,9 @@ impl Autoplay {
                 self.clock
             );
             self.wander = None;
+            if self.pass_road_point("the ground's way") {
+                return Intent::default();
+            }
             self.hop(game, to, WANDER);
             return Intent::default();
         }
@@ -3730,6 +3750,7 @@ impl Autoplay {
         let flat = |a: Vec3, b: Vec3| (a - b).with_y(0.0).length();
         if flat(pos, at) < ROAD_FROM {
             self.road_way = None;
+            self.road_skip = false;
             return at;
         }
         let Some(world) = game.scene.world.as_ref() else {
@@ -3738,13 +3759,14 @@ impl Autoplay {
         let roads = self
             .roads
             .get_or_insert_with(|| RoadGraph::new(&world.index.roads));
-        let strayed = |way: &[Vec3]| way.iter().all(|&p| flat(p, pos) > ROAD_REPLAN);
-        let stale = self
-            .road_way
-            .as_ref()
-            .is_none_or(|(goal, way)| flat(*goal, at) > ROAD_REPLAN || strayed(way));
+        let stale = self.road_way.as_ref().is_none_or(|w| w.stale(at, pos));
         if stale {
-            let way = roads.way(pos, at, ROAD_REACH).unwrap_or_default();
+            // No road near her: one farther off, got onto by the ground's
+            // way.
+            let way = roads
+                .way(pos, at, ROAD_REACH)
+                .or_else(|| roads.way(pos, at, ROAD_REACH_WIDE))
+                .unwrap_or_default();
             let length: f32 = way.windows(2).map(|w| w[0].distance(w[1])).sum();
             eprintln!(
                 "autoplay {:.1} s: by road to {} ({:.0} m off): {}",
@@ -3757,21 +3779,31 @@ impl Autoplay {
                     format!("{} points, {length:.0} m", way.len())
                 }
             );
-            self.road_way = Some((at, way));
+            self.road_way = Some(RoadWay {
+                goal: at,
+                points: way,
+                head: None,
+                planned_at: pos,
+            });
         }
-        let Some((_, way)) = &self.road_way else {
+        let skip = std::mem::take(&mut self.road_skip);
+        let Some(road) = &mut self.road_way else {
             return at;
         };
-        // From the road point nearest her, the first one far enough on.
-        let Some(here) =
-            (0..way.len()).min_by(|&a, &b| flat(way[a], pos).total_cmp(&flat(way[b], pos)))
-        else {
-            return at;
-        };
-        way[here..]
-            .iter()
+        let was = road.head;
+        road.head = Some(next_head(&road.points, pos, road.head, skip));
+        if skip && road.head != was {
+            eprintln!(
+                "autoplay {:.1} s: road point {} of {} out of reach: heading for point {}",
+                self.clock,
+                was.map_or(0, |i| i + 1),
+                road.points.len(),
+                road.head.map_or(0, |i| i + 1)
+            );
+        }
+        road.head
+            .and_then(|i| road.points.get(i))
             .copied()
-            .find(|&p| flat(p, pos) >= ROAD_AHEAD)
             .unwrap_or(at)
     }
 
@@ -4059,6 +4091,10 @@ impl Autoplay {
                 .map(|w| w.route.steer(from, HOP).0)
                 .filter(|to| (*to - from).with_y(0.0).length() >= HOP_LEAST)
                 .unwrap_or(at);
+            if self.pass_road_point("no headway") {
+                self.fresh_headway();
+                return true;
+            }
             if driving.is_some() {
                 self.drive_hops += 1;
             }
@@ -4075,8 +4111,44 @@ impl Autoplay {
     /// Moves her (and what she drives) up to [`HOP`] metres towards `at`,
     /// onto the ground there; a boat, onto water deep enough near there
     /// (else she gets out of it, onto the ground).
+    /// Heading for a road point on her way by road that she can't get to
+    /// (`why`): the next one on is hers instead of a hop, while one is
+    /// left. Whether she passed one over.
+    fn pass_road_point(&mut self, why: &str) -> bool {
+        let Some(road) = &self.road_way else {
+            return false;
+        };
+        let Some(i) = road.head.filter(|&i| i < road.points.len()) else {
+            return false;
+        };
+        eprintln!(
+            "autoplay {:.1} s: {why}: road point {} of {} out of reach from here: the next one on",
+            self.clock,
+            i + 1,
+            road.points.len()
+        );
+        self.road_skip = true;
+        true
+    }
+
     fn hop(&mut self, game: &mut Game, at: Vec3, stuck: f32) {
         let from = game.focus();
+        // Not back where the last hop started from where it ended: the
+        // way she heads for can't be got to from here, so the next road
+        // point is hers instead of a hop.
+        let flat_to = from
+            + (at - from).with_y(0.0).normalize_or_zero()
+                * (at - from).with_y(0.0).length().min(HOP);
+        if let Some((a, b)) = oscillation(&self.hops, from, flat_to) {
+            eprintln!(
+                "autoplay {:.1} s: stalled: oscillating between {a:.1} and {b:.1} ({} hops): no hop back; the next road point instead",
+                self.clock,
+                self.hops.len()
+            );
+            self.road_skip = true;
+            self.fresh_headway();
+            return;
+        }
         let flat = (at - from).with_y(0.0);
         // Not onto what she is blowing up (round 20's AllCon003: hopped onto
         // the last AA gun, too close to fire and stuck on it 2000 s).
@@ -5015,9 +5087,186 @@ pub(crate) fn stuck_report(
     )
 }
 
+/// The way by road to a far place: the place, the road points, the one
+/// she heads for, and where she was when it was found.
+#[derive(Debug)]
+struct RoadWay {
+    goal: Vec3,
+    points: Vec<Vec3>,
+    head: Option<usize>,
+    planned_at: Vec3,
+}
+
+impl RoadWay {
+    /// Found again: the place has moved [`ROAD_REPLAN`], or she has strayed
+    /// that much farther from its points than she was when it was found; a way of no points (no road found)
+    /// only once she has moved that far from where it was looked for, not
+    /// every tick (story run b3h: 125,426 "no way" plans).
+    fn stale(&self, at: Vec3, pos: Vec3) -> bool {
+        let flat = |a: Vec3, b: Vec3| (a - b).with_y(0.0).length();
+        if flat(self.goal, at) > ROAD_REPLAN {
+            return true;
+        }
+        if self.points.is_empty() {
+            return flat(self.planned_at, pos) > ROAD_REPLAN;
+        }
+        // Strayed: that much farther from the way than she was when it
+        // was found (its first point can lie farther than that, reached
+        // over the ground: b3h's, 317 m off).
+        let off = |at: Vec3| {
+            self.points
+                .iter()
+                .map(|&p| flat(p, at))
+                .fold(f32::INFINITY, f32::min)
+        };
+        off(pos) > off(self.planned_at) + ROAD_REPLAN
+    }
+}
+
+/// The road point (by index) she heads for on `way` from `pos`: the one
+/// she had (`head`) until she is within [`ROAD_ARRIVE`] of it; then, or
+/// at first, the first one at least [`ROAD_AHEAD`] on from the nearest
+/// not behind it; `skip` (the one she had out of reach): the next one on.
+/// `way.len()` when none is left: the place itself.
+fn next_head(way: &[Vec3], pos: Vec3, head: Option<usize>, skip: bool) -> usize {
+    let flat = |a: Vec3, b: Vec3| (a - b).with_y(0.0).length();
+    let from = head.unwrap_or(0);
+    match head {
+        Some(i) if skip => (i + 1).min(way.len()),
+        Some(i) if way.get(i).is_some_and(|&p| flat(p, pos) >= ROAD_ARRIVE) => i,
+        _ => {
+            let here = (from..way.len())
+                .min_by(|&a, &b| flat(way[a], pos).total_cmp(&flat(way[b], pos)))
+                .unwrap_or(from);
+            (here..way.len())
+                .find(|&i| flat(way[i], pos) >= ROAD_AHEAD)
+                .unwrap_or(way.len())
+        }
+    }
+}
+
+/// Whether a hop from `from` to `to` would undo the last one (`hops`:
+/// from, to): back within [`OSCILLATE_NEAR`] of where it started, from
+/// within that of where it ended. The two places, if so.
+fn oscillation(hops: &[(Vec3, Vec3)], from: Vec3, to: Vec3) -> Option<(Vec3, Vec3)> {
+    let flat = |a: Vec3, b: Vec3| (a - b).with_y(0.0).length();
+    let &(a, b) = hops.last()?;
+    (flat(to, a) < OSCILLATE_NEAR && flat(from, b) < OSCILLATE_NEAR).then_some((a, b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // b3h: no road within reach gives a way of no points; it is not found
+    // again every tick, only once she has moved ROAD_REPLAN or the place
+    // has.
+    #[test]
+    fn an_empty_road_way_is_kept_until_she_moves_on() {
+        let goal = Vec3::new(2543.0, -34.0, 1499.0);
+        let planned_at = Vec3::new(3219.7, 128.5, -2005.6);
+        let w = RoadWay {
+            goal,
+            points: Vec::new(),
+            head: None,
+            planned_at,
+        };
+        assert!(!w.stale(goal, planned_at));
+        assert!(!w.stale(goal, planned_at + Vec3::new(50.0, 0.0, 50.0)));
+        assert!(w.stale(goal, planned_at + Vec3::new(ROAD_REPLAN + 1.0, 0.0, 0.0)));
+        assert!(w.stale(goal + Vec3::new(ROAD_REPLAN + 1.0, 0.0, 0.0), planned_at));
+        // A way with points: stale only once she has strayed from all.
+        let road = vec![
+            Vec3::new(2891.0, -25.0, -1192.0),
+            Vec3::new(2819.0, -34.0, 1276.0),
+        ];
+        let w = RoadWay {
+            goal,
+            points: road,
+            head: None,
+            planned_at,
+        };
+        let w = RoadWay {
+            planned_at: Vec3::new(2851.3, 18.3, -1506.9),
+            ..w
+        };
+        assert!(!w.stale(goal, Vec3::new(2872.4, 16.3, -1493.4)));
+        assert!(w.stale(goal, Vec3::new(2851.3, 18.3, -1506.9 - ROAD_REPLAN - 60.0)));
+    }
+
+    // The road point she heads for stays hers while she is short of it
+    // (b3f/b3h: 317 m from the first); once there, the next one on.
+    #[test]
+    fn the_road_point_headed_for_is_kept_until_reached() {
+        let way = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 300.0),
+            Vec3::new(0.0, 0.0, 600.0),
+            Vec3::new(0.0, 0.0, 900.0),
+        ];
+        let start = Vec3::new(0.0, 0.0, -317.0);
+        let first = next_head(&way, start, None, false);
+        assert_eq!(first, 0);
+        // Wandering about short of it, never nearer than 40 m: still it.
+        for p in [Vec3::new(30.0, 0.0, -100.0), Vec3::new(-25.0, 0.0, -60.0)] {
+            assert_eq!(next_head(&way, p, Some(first), false), first);
+        }
+        // There: the first point at least ROAD_AHEAD on.
+        assert_eq!(
+            next_head(&way, Vec3::new(0.0, 0.0, -10.0), Some(first), false),
+            1
+        );
+        // Out of reach (her hops went to and fro): the next one, though she
+        // is nowhere near it.
+        assert_eq!(next_head(&way, start, Some(first), true), 1);
+        // Past the last: the place itself.
+        assert_eq!(next_head(&way, start, Some(3), true), way.len());
+    }
+
+    // b3f/b3h: the first road point, 317 m off over the ground, can't be
+    // got to. Instead of a hop, the next road point becomes hers; once
+    // none is left, hopping is back to the old recovery.
+    #[test]
+    fn an_unreachable_first_road_point_is_passed_over_not_hopped_to() {
+        let mut auto = Autoplay::default();
+        assert!(!auto.pass_road_point("test"));
+        let stall = Vec3::new(2851.3, 18.3, -1506.9);
+        let points = vec![
+            Vec3::new(2891.0, -25.0, -1192.0),
+            Vec3::new(2880.0, -30.0, -900.0),
+            Vec3::new(2819.0, -34.0, 1276.0),
+        ];
+        let mut road = RoadWay {
+            goal: Vec3::new(2543.0, -34.0, 1499.0),
+            points,
+            head: Some(0),
+            planned_at: stall,
+        };
+        road.head = Some(next_head(&road.points, stall, road.head, false));
+        assert_eq!(road.head, Some(0));
+        auto.road_way = Some(road);
+        assert!(auto.pass_road_point("test"));
+        assert!(auto.road_skip);
+        let road = auto.road_way.as_mut().unwrap();
+        road.head = Some(next_head(&road.points, stall, road.head, true));
+        assert_eq!(road.head, Some(1));
+        road.head = Some(road.points.len());
+        assert!(!auto.pass_road_point("test"));
+    }
+
+    // b3h's hops: (2872.4, -1493.4) -> (2851.3, -1506.9), then back. The
+    // hop back is the oscillation; a hop on elsewhere isn't.
+    #[test]
+    fn a_hop_back_where_the_last_started_is_an_oscillation() {
+        let a = Vec3::new(2872.4, 16.3, -1493.4);
+        let b = Vec3::new(2851.3, 18.3, -1506.9);
+        let hops = [(a, b)];
+        assert_eq!(oscillation(&hops, b, a), Some((a, b)));
+        assert_eq!(oscillation(&hops, b, b + Vec3::new(0.0, 0.0, 25.0)), None);
+        assert_eq!(oscillation(&[], b, a), None);
+        // From somewhere else, back to A: not the same to and fro.
+        assert_eq!(oscillation(&hops, b + Vec3::new(30.0, 0.0, 0.0), a), None);
+    }
 
     // A box of the carbine's rounds is wanted while it has room for them,
     // as walking over it takes it.
