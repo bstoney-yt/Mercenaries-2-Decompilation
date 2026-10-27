@@ -687,6 +687,8 @@ pub struct Autoplay {
     /// [`crate::mission::MissionLink::exit_offers`]).
     pub in_hq: bool,
     pub exits: Vec<ActionAt>,
+    /// The HQ state and exits last logged.
+    hq_seen: Option<(bool, Vec<u32>)>,
     /// Seconds played.
     clock: f32,
     goal: Option<Goal>,
@@ -865,6 +867,22 @@ impl Autoplay {
         if objectives != self.objectives.as_slice() {
             eprintln!("autoplay {:.1} s: objectives {objectives:?}", self.clock);
             self.objectives = objectives.to_vec();
+        }
+        // The HQ state and its exits on offer, logged as they change.
+        let exits: Vec<u32> = self.exits.iter().map(|e| e.0).collect();
+        if self.hq_seen.as_ref() != Some(&(self.in_hq, exits.clone())) {
+            eprintln!(
+                "autoplay {:.1} s: HQ state: {}, exits offered [{}], at {:.1}",
+                self.clock,
+                if self.in_hq { "inside" } else { "outside" },
+                self.exits
+                    .iter()
+                    .map(|(g, at, r)| format!("{g:#x} at {at:.1} reach {r}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                game.focus()
+            );
+            self.hq_seen = Some((self.in_hq, exits));
         }
         let Some(p) = &game.scene.player else {
             return Intent::default();
@@ -1285,7 +1303,7 @@ impl Autoplay {
                         if self.pressed > PRESS_GAP {
                             self.pressed = 0.0;
                             eprintln!(
-                                "autoplay {:.1} s: taking the action at {target:#x}",
+                                "autoplay {:.1} s: taking the action at {target:#x}, offered, {flat:.2} m off flat (reach {reach})",
                                 self.clock
                             );
                             game.context_taken = Some(target);
