@@ -582,10 +582,14 @@ fn hq_leg(in_hq: bool, here: Vec3, goal_at: Option<Vec3>, exits: &[ActionAt]) ->
     if flat(at) <= HQ_SPAN {
         return HqLeg::Go;
     }
+    // Nearest in three dimensions: the PMC HQ's upper-floor exit
+    // (0x143919, 8 m up) stands over the lower one (0x143918); by flat
+    // distance she went for the one above and waited under it for an
+    // offer the game made for the other (story run b3m, 56 s).
     exits
         .iter()
         .copied()
-        .min_by(|a, b| flat(a.1).total_cmp(&flat(b.1)))
+        .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
         .map_or(HqLeg::Wait, HqLeg::Exit)
 }
 
@@ -5275,6 +5279,16 @@ mod tests {
         // A goal inside the HQ (its starter at her desk) is gone to.
         let fiona = Some(Vec3::new(3750.0, 450.0, -3840.0));
         assert_eq!(hq_leg(true, here, fiona, &exits), HqLeg::Go);
+        // Of two exits one over the other, the one on her floor.
+        let by_stairs = Vec3::new(3794.0, 450.8, -3911.0);
+        let stacked = [
+            (0x143919, Vec3::new(3794.0, 458.5, -3913.3), 2.0),
+            (0x143918, Vec3::new(3794.0, 450.8, -3913.8), 2.0),
+        ];
+        assert_eq!(
+            hq_leg(true, by_stairs, entrance, &stacked),
+            HqLeg::Exit(stacked[1])
+        );
     }
 
     // The exit is taken as any action: a Use of the game's own exit
