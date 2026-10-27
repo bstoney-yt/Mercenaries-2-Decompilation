@@ -537,6 +537,10 @@ enum Goal {
 /// the reach (metres) it is offered within.
 pub type ActionAt = (u32, Vec3, f32);
 
+/// The HQ state last logged: inside, the exits offered, the HQ's own
+/// starters on offer and the talks in play.
+type HqSeen = (bool, Vec<u32>, Vec<Option<u32>>, Vec<u32>);
+
 /// What she does about an action she is to take, `flat` metres from its
 /// object, offered within `reach` ([`USE_FROM`], [`USE_INSIDE`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -609,13 +613,16 @@ fn hq_leg(
 }
 
 /// Whether the HQ's own starter is still to come into play: a contract
-/// on offer is the HQ's own (`own_starter`) and none of the talks in play
-/// (`talks`) stands within the HQ, [`HQ_SPAN`] of `here`.
-fn starter_pending(own_starter: bool, here: Vec3, talks: &[ActionAt]) -> bool {
-    own_starter
-        && !talks
+/// on offer has one (`own`, the objects their talks are on, `None` while
+/// unset) and none of their talks is among those in play (`talks`). Only
+/// the contract's own starter counts: another of the HQ's talks (a
+/// recruit's) in play doesn't end the wait.
+fn starter_pending(own: &[Option<u32>], talks: &[ActionAt]) -> bool {
+    !own.is_empty()
+        && !own
             .iter()
-            .any(|t| t.1.with_y(0.0).distance(here.with_y(0.0)) <= HQ_SPAN)
+            .flatten()
+            .any(|g| talks.iter().any(|t| t.0 == *g))
 }
 
 fn use_step(flat: f32, reach: f32, offered: bool, locked: bool) -> UseStep {
@@ -721,13 +728,13 @@ pub struct Autoplay {
     pub in_hq: bool,
     pub exits: Vec<ActionAt>,
     /// The starters' talks ready in play ([`starter_for`]'s choice is
-    /// among them), and whether a contract on offer is the HQ's own, its
-    /// starter inside the HQ she is in (set each tick:
-    /// [`crate::mission::MissionLink::own_hq_starter`]).
+    /// among them), and the HQ's own starters of the contracts on offer:
+    /// the object each one's talk is on, once the scripts set it (set
+    /// each tick: [`crate::mission::MissionLink::own_hq_starters`]).
     pub talks: Vec<ActionAt>,
-    pub own_starter: bool,
+    pub own_starters: Vec<Option<u32>>,
     /// The HQ state and exits last logged.
-    hq_seen: Option<(bool, Vec<u32>, bool, Vec<u32>)>,
+    hq_seen: Option<HqSeen>,
     /// Whether her controls were off when last logged.
     locked_seen: bool,
     /// Seconds played.
@@ -912,10 +919,10 @@ impl Autoplay {
         // The HQ state and its exits on offer, logged as they change.
         let exits: Vec<u32> = self.exits.iter().map(|e| e.0).collect();
         let talks: Vec<u32> = self.talks.iter().map(|t| t.0).collect();
-        let seen = (self.in_hq, exits, self.own_starter, talks);
+        let seen = (self.in_hq, exits, self.own_starters.clone(), talks);
         if self.hq_seen.as_ref() != Some(&seen) {
             eprintln!(
-                "autoplay {:.1} s: HQ state: {}, exits offered [{}], own starter on offer {}, talks in play [{}], at {:.1}",
+                "autoplay {:.1} s: HQ state: {}, exits offered [{}], own starters on offer {:x?}, talks in play [{}], at {:.1}",
                 self.clock,
                 if self.in_hq { "inside" } else { "outside" },
                 self.exits
@@ -923,7 +930,7 @@ impl Autoplay {
                     .map(|(g, at, r)| format!("{g:#x} at {at:.1} reach {r}"))
                     .collect::<Vec<_>>()
                     .join(", "),
-                self.own_starter,
+                seen.2,
                 seen.3
                     .iter()
                     .map(|g| format!("{g:#x}"))
@@ -1559,7 +1566,7 @@ impl Autoplay {
             Goal::Reach { at, .. } | Goal::Blast { at, .. } | Goal::Use { at, .. } => Some(*at),
             _ => None,
         };
-        let pending = starter_pending(self.own_starter, here, &self.talks);
+        let pending = starter_pending(&self.own_starters, &self.talks);
         match hq_leg(self.in_hq, here, at, &self.exits, pending) {
             HqLeg::Go => chosen,
             HqLeg::Exit((target, at, reach)) => (
@@ -5374,11 +5381,11 @@ mod tests {
     }
 
     // b3p: loaded into the PMC HQ with PmcCon031 on offer from Fiona (its
-    // starter PmcBoss is the PMC's) and the UP entrance's talk outside, she
+    // starter PmcBoss is the HQ's) and the UP entrance's talk outside, she
     // took the exit at 18 s, before Fiona was seated and her talk in play.
-    // Now: the HQ's own starter pending, she waits inside; once a talk
-    // within the HQ is in play she isn't pending (and goes to it, the
-    // nearest); a contract whose starter is outside keeps the exit.
+    // Now: the HQ's own starter pending, she waits inside, and only that
+    // starter's talk ends the wait (a recruit's in play doesn't); a
+    // contract whose starter is outside keeps the exit.
     #[test]
     fn the_hqs_own_starter_is_waited_for_inside() {
         let here = Vec3::new(3794.0, 450.8, -3911.0);
@@ -5386,24 +5393,26 @@ mod tests {
         let exits = [(0x143918, Vec3::new(3794.0, 450.8, -3913.8), 2.0)];
         let up = (0x142aed, Vec3::new(2542.9, -33.8, 1498.8), 2.0);
         let fiona = (0x400001f7, Vec3::new(3795.6, 450.0, -3854.1), 4.0);
-        assert!(starter_pending(true, here, &[up]));
-        assert_eq!(
-            hq_leg(
-                true,
-                here,
-                entrance,
-                &exits,
-                starter_pending(true, here, &[up])
-            ),
-            HqLeg::WaitStarter
-        );
-        assert!(!starter_pending(true, here, &[up, fiona]));
-        assert_eq!(
-            starter_for(&["PmcCon031".to_owned()], &[up, fiona], here),
-            Some(fiona)
-        );
+        let recruit = (0xc73ec, Vec3::new(3790.0, 450.0, -3900.0), 4.0);
+        // Fiona's object not set yet, or set but her talk not in play.
+        for own in [vec![None], vec![Some(fiona.0)]] {
+            assert!(starter_pending(&own, &[up]));
+            assert!(starter_pending(&own, &[up, recruit]));
+            assert_eq!(
+                hq_leg(
+                    true,
+                    here,
+                    entrance,
+                    &exits,
+                    starter_pending(&own, &[up, recruit])
+                ),
+                HqLeg::WaitStarter
+            );
+        }
+        // Her talk in play: no longer pending.
+        assert!(!starter_pending(&[Some(fiona.0)], &[up, recruit, fiona]));
         // Not the HQ's own (OilCon021 alone): the exit, as before.
-        assert!(!starter_pending(false, here, &[up]));
+        assert!(!starter_pending(&[], &[up]));
         assert_eq!(
             hq_leg(true, here, entrance, &exits, false),
             HqLeg::Exit(exits[0])

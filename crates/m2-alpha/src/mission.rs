@@ -1433,10 +1433,14 @@ impl MissionLink {
         matches!(&self.state, State::Running(m) if m.in_hq())
     }
 
-    /// Whether a contract of `on_offer` is offered by a starter of the HQ
-    /// she is in ([`m2_game::mission::Mission::own_hq_starter`]).
-    pub fn own_hq_starter(&self, on_offer: &[String]) -> bool {
-        matches!(&self.state, State::Running(m) if m.own_hq_starter(on_offer))
+    /// The starters of the HQ she is in that offer a contract of
+    /// `on_offer`: the object each one's talk is on, once set
+    /// ([`m2_game::mission::Mission::own_hq_starters`]).
+    pub fn own_hq_starters(&self, on_offer: &[String]) -> Vec<Option<u32>> {
+        match &self.state {
+            State::Running(m) => m.own_hq_starters(on_offer),
+            _ => Vec::new(),
+        }
     }
 
     /// The HQ's exits on offer (the context actions whose prompt is
