@@ -1202,11 +1202,17 @@ fn check(
             let (Some(b), exit) = (boundary, mode.as_deref() == Some("exit")) else {
                 return no;
             };
+            // The callback is also told the direction it waited on, after
+            // the boundary, as the "any" path above does. From samples: the
+            // shipped scripts read the direction as the callback's argument
+            // after the boundary (`WifVzAtmosphere.CrossedBoundary`
+            // concatenates it). The 360's argument order is not yet traced.
+            let direction = p.params.raw_get::<Value>(3).unwrap_or(Value::Nil);
             for o in objects(&p.params, 1, world) {
                 if let Some(inside) = world.inside(o, b)
                     && inside != exit
                 {
-                    return Check::Holds(true, vec![id(o), id(b)]);
+                    return Check::Holds(true, vec![id(o), id(b), direction]);
                 }
             }
             no

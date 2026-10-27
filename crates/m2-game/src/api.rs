@@ -4427,6 +4427,61 @@ mod tests {
         assert_eq!(crossed(), ["zone enter", "zone exit", "zone enter"]);
     }
 
+    // MC-16: WifVzAtmosphere's { char, region, "enter" | "exit", false }
+    // boundaries read the direction after the boundary (its line 79).
+    #[test]
+    fn an_enter_or_exit_boundary_tells_its_callback_the_direction() {
+        for mode in ["enter", "exit"] {
+            let (host, world) = setup();
+            {
+                let mut w = world.borrow_mut();
+                w.insert(70, Object::new("rgn_atmo_Caracas", [100.0, 0.0, 100.0]));
+                let corners = vec![[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]];
+                w.regions.insert(
+                    70,
+                    m2_assets::Region {
+                        flags: 0x0004_0002,
+                        unk_0x04: 0,
+                        corners,
+                    },
+                );
+                if mode == "exit" {
+                    w.objects.get_mut(&1).unwrap().position = [101.0, 0.0, 101.0];
+                }
+            }
+            let events = crate::events::Events::default();
+            events.install(host.lua()).unwrap();
+            host.lua().globals().set("mode", mode).unwrap();
+            host.lua()
+                .load(
+                    r#"
+                    crossed = nil
+                    local region = Pg.GetGuidByName("rgn_atmo_Caracas")
+                    Event.Create(Event.Boundary,
+                        {Player.GetLocalCharacter(), region, mode, false},
+                        function(tag, who, where, how)
+                            crossed = tag .. " " .. Sys.GuidToString(who) .. "@"
+                                .. Sys.GuidToString(where) .. " " .. how
+                        end, {"zone"})
+                    "#,
+                )
+                .exec()
+                .unwrap();
+            assert!(events.update_shared(0.1, &world).is_empty());
+            let crossed: Option<String> = host.lua().globals().get("crossed").unwrap();
+            assert_eq!(crossed, None, "{mode}");
+            let to = if mode == "enter" {
+                [103.0, 0.0, 98.0]
+            } else {
+                [120.0, 0.0, 99.0]
+            };
+            world.borrow_mut().objects.get_mut(&1).unwrap().position = to;
+            assert!(events.update_shared(0.1, &world).is_empty());
+            let crossed: String = host.lua().globals().get("crossed").unwrap();
+            assert_eq!(crossed, format!("zone 1@70 {mode}"));
+        }
+    }
+
     #[test]
     fn vehicle_disguises_work_once_a_script_turns_them_on() {
         let (host, world) = setup();
