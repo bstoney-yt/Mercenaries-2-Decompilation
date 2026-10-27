@@ -19,6 +19,7 @@ pub mod anim;
 pub mod assets;
 pub mod atmosphere;
 pub mod audio;
+pub mod blend;
 pub mod durability;
 pub mod grapple;
 pub mod gun_sounds;

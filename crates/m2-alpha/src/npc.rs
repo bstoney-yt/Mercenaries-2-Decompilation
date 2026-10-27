@@ -1261,7 +1261,10 @@ impl Npc {
             Down::Falling(t) => Some(Down::Falling(t - dt)),
             Down::Knocked(t) if t - dt <= 0.0 => {
                 if let Some(c) = clips.getup {
-                    self.rig.animator.play_once(c);
+                    // `KnockedDown.Getup`: the original snaps into it.
+                    self.rig
+                        .animator
+                        .play_action(c, true, m2_engine::blend::action::GETUP);
                 }
                 Some(Down::GettingUp(GETUP_SECONDS))
             }
