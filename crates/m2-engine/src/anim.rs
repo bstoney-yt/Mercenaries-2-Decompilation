@@ -721,6 +721,14 @@ impl Animator {
             .take()
             .filter(|t| *t >= 0.0)
             .unwrap_or_else(|| blend::time(previous, action));
+        // The changes the original blends specially, for play checks.
+        if self.fade_time != blend::DEFAULT && previous.is_some() {
+            eprintln!(
+                "anim: blend {:08x} -> {action:08x} over {:.4} s (clip {clip})",
+                previous.unwrap_or_default(),
+                self.fade_time
+            );
+        }
         self.action = Some(action);
         self.previous = self.current;
         self.current = Some(Playing {
