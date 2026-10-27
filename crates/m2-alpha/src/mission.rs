@@ -1433,6 +1433,12 @@ impl MissionLink {
         matches!(&self.state, State::Running(m) if m.in_hq())
     }
 
+    /// Whether a contract of `on_offer` is offered by a starter of the HQ
+    /// she is in ([`m2_game::mission::Mission::own_hq_starter`]).
+    pub fn own_hq_starter(&self, on_offer: &[String]) -> bool {
+        matches!(&self.state, State::Running(m) if m.own_hq_starter(on_offer))
+    }
+
     /// The HQ's exits on offer (the context actions whose prompt is
     /// [`EXIT_PROMPT`], added by its portals while she is inside): each
     /// one's object, where it stands and its reach.

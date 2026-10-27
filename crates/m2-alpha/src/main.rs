@@ -3837,7 +3837,10 @@ fn mission_for_screenshot(
                     }
                     on_offer = offer;
                 }
-                a.starter = autoplay::starter_for(&on_offer, &link.talk_offers(game), game.focus());
+                let talks = link.talk_offers(game);
+                a.starter = autoplay::starter_for(&on_offer, &talks, game.focus());
+                a.talks = talks;
+                a.own_starter = link.own_hq_starter(&on_offer);
                 a.on_offer.clone_from(&on_offer);
                 let keep = link.kept_within();
                 if keep.len() != a.keep.len() {
