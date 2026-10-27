@@ -2370,6 +2370,15 @@ impl Scene {
             };
             let t = db.tuning_for(&spec.label, spec.model);
             let arm = db.armament_for(&spec.label, spec.model);
+            let driver = db.driver_points_for(&spec.label, spec.model);
+            let markers = (spec.seat, spec.door);
+            let has = |h: u32| spec.node_names.contains(&h);
+            let found = driver.map(|p| (has(p.seat), p.door.map(has)));
+            let spec = spec.with_driver_points(driver);
+            eprintln!(
+                "driver: {}: seat {:?} door {:?} (seat data {driver:x?}, nodes found {found:?}; fixed markers {:?} {:?})",
+                spec.label, spec.seat, spec.door, markers.0, markers.1,
+            );
             let mut spec = spec.tuned(t).armed_with(arm, &db.arms);
             // The Osprey drops the bombing run's bombs from its bay.
             if m2_engine::osprey::is_osprey(spec.model) {

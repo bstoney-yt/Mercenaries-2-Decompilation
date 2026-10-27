@@ -37,6 +37,7 @@ pub mod population;
 pub mod reverb;
 pub mod road_graph;
 pub mod scatter;
+pub mod seats;
 pub mod sound_regions;
 pub mod standin;
 pub mod stream;
