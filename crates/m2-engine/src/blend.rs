@@ -38,6 +38,24 @@
 //! `transitions` animation table (`ab8fe34b`) has a `TransitionDuration`
 //! column but no reader was found, so it plays no part.
 //!
+//! # Verification
+//!
+//! Verified in play (m2-alpha shot runs on 2026-10-27, read from the
+//! `anim: blend` log lines): landings snapping after moving and standing
+//! take-offs, a landing settling into `Idle` over [`QUICK`], and the
+//! hijack actions (`ActionHijackHijackerA`, `ActionHijackHijackerB`)
+//! snapping. Take-offs logged no line, which fits [`DEFAULT`]; their time
+//! was not measured directly.
+//!
+//! **Not verified at runtime**, covered by unit tests only:
+//! - `Getup`, the NPC get-up (needs a mission run);
+//! - the air `Jump` (the beta plays it only when no take-off clip is
+//!   bound);
+//! - the staggers, `DieAnimatedRagdoll` and the vehicle exits (the beta
+//!   has no clips for them yet);
+//! - the script override (nothing calls it yet);
+//! - how any of it looks (no frame-stepped comparison with PC footage).
+//!
 //! Not from the original: the beta's clips are not all driven by human
 //! states. Locomotion within `Idle` (idle, walk, run, sprint) is blended by
 //! a separate original locomotion node not traced yet; the beta crossfades
