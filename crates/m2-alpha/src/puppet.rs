@@ -72,10 +72,9 @@ impl Puppet {
         rig.aim_along(self.facing, None);
         let moved = Vec2::new(pose.velocity[0], pose.velocity[2]).length();
         // As `Player::update` sets it: the clip's stride to the speed.
-        let rate = match rig.gait_speed(gait) {
-            Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
-            _ => 1.0,
-        };
+        // The hero's name hash stands in for the game's entity handle
+        // (invented).
+        let rate = rig.play_rate(gait, moved, m2_assets::name_hash(self.hero.name()));
         rig.advance(dt * rate);
     }
 

@@ -1046,10 +1046,12 @@ impl Player {
             rig.aim_along(self.facing, self.aiming.then_some(look).or(rest));
             // Play the clip at the speed she actually moves, so feet don't
             // slide (within reason: against a wall the legs keep going).
-            let rate = match rig.gait_speed(gait) {
-                _ if leaping => 1.0,
-                Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
-                _ => 1.0,
+            // Her number for the clips' table rates is 0 (invented: the
+            // game's entity handle is not known).
+            let rate = if leaping {
+                1.0
+            } else {
+                rig.play_rate(gait, moved, 0)
             };
             rig.advance(dt * rate);
         }
