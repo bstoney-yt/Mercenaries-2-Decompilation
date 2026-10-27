@@ -1430,7 +1430,7 @@ impl MissionLink {
     /// The starters' talks on offer (the context actions whose prompt is
     /// [`TALK_PROMPT`]): each one's object and where it stands, a person
     /// where one is that object, else its place.
-    pub fn talk_offers(&self, game: &Game) -> Vec<(u32, Vec3)> {
+    pub fn talk_offers(&self, game: &Game) -> Vec<crate::autoplay::ActionAt> {
         let State::Running(mission) = &self.state else {
             return Vec::new();
         };
@@ -1454,7 +1454,7 @@ impl MissionLink {
                 let seated_in_play = game.scene.riders.iter().any(|r| r.guid == Some(*g));
                 talk_ready(rides_prop, seated_in_play)
             })
-            .filter_map(|(g, at, _, _)| {
+            .filter_map(|(g, at, _, reach)| {
                 let person = game
                     .scene
                     .people
@@ -1462,7 +1462,7 @@ impl MissionLink {
                     .iter()
                     .find(|n| n.spawn == Some(g))
                     .map(|n| n.character.position);
-                Some((g, person.or_else(|| at.map(Vec3::from))?))
+                Some((g, person.or_else(|| at.map(Vec3::from))?, reach))
             })
             .collect()
     }
@@ -2892,14 +2892,14 @@ impl MissionLink {
 
     /// The context actions on offer: on what, and where it stands (a
     /// person where they are in play, else where the scripts have them).
-    pub fn offers(&self, game: &Game) -> Vec<(u32, Vec3)> {
+    pub fn offers(&self, game: &Game) -> Vec<crate::autoplay::ActionAt> {
         let State::Running(mission) = &self.state else {
             return Vec::new();
         };
         mission
             .context_actions()
             .into_iter()
-            .filter_map(|(g, at, _, _)| {
+            .filter_map(|(g, at, _, reach)| {
                 let person = game
                     .scene
                     .people
@@ -2907,7 +2907,7 @@ impl MissionLink {
                     .iter()
                     .find(|n| n.spawn == Some(g))
                     .map(|n| n.character.position);
-                Some((g, person.or_else(|| at.map(Vec3::from))?))
+                Some((g, person.or_else(|| at.map(Vec3::from))?, reach))
             })
             .collect()
     }

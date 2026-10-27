@@ -341,8 +341,15 @@ const FRAIL: f32 = 60.0;
 const FRAIL_SPEED: f32 = 6.0;
 /// She takes an action the scripts offer within this of its object,
 /// metres (a context action's reach is a few metres; within 1.5 m she
-/// stalled against the body, GurCon002 round 14).
+/// stalled against the body, GurCon002 round 14), and no farther than
+/// this share of the action's own reach: the game offers it only inside
+/// that reach (from the 360 code: the per-frame pick of context actions,
+/// 0x82207538, compares the squared distance to the object with the
+/// reach squared), so stopping between the two waits forever (story run
+/// b3j: 2.46 m from the UP HQ entrance, reach 2, for 80 minutes). The
+/// share is invented.
 const USE_FROM: f32 = 2.5;
+const USE_INSIDE: f32 = 0.8;
 /// Driving, she gets out this near an outpost's flag (metres), to walk
 /// the rest.
 const FLAG_ON_FOOT: f32 = 15.0;
@@ -519,8 +526,40 @@ enum Goal {
     /// (an outpost's flag).
     GetOut,
     /// Take the action the scripts offer on their object `target` (a
-    /// verified HVT's body), standing at `at`.
-    Use { target: u32, at: Vec3 },
+    /// verified HVT's body), standing at `at`, offered within `reach`.
+    Use { target: u32, at: Vec3, reach: f32 },
+}
+
+/// A context action the scripts offer: its object, where that stands and
+/// the reach (metres) it is offered within.
+pub type ActionAt = (u32, Vec3, f32);
+
+/// What she does about an action she is to take, `flat` metres from its
+/// object, offered within `reach` ([`USE_FROM`], [`USE_INSIDE`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum UseStep {
+    /// The game offers it to her: the use key takes it.
+    Press,
+    /// Close enough and not offered (its object not yet in play, or the
+    /// game offering another nearer one): she stays put and waits.
+    Wait,
+    /// Walk on in, to within this far.
+    CloseIn(f32),
+}
+
+/// Where she stands about an action ([`UseStep`]): offered, she takes it;
+/// within its reach (less a margin) she waits for the game to offer it;
+/// short of that she walks on in, so a stop just outside the reach is
+/// never taken for being there.
+fn use_step(flat: f32, reach: f32, offered: bool) -> UseStep {
+    let near = USE_FROM.min(reach * USE_INSIDE);
+    if offered {
+        UseStep::Press
+    } else if flat <= near {
+        UseStep::Wait
+    } else {
+        UseStep::CloseIn(near * 0.6)
+    }
 }
 
 impl Goal {
@@ -600,10 +639,10 @@ pub struct Autoplay {
     /// starter she goes to for one: the nearest talk the scripts offer
     /// ([`starter_for`]).
     pub on_offer: Vec<String>,
-    pub starter: Option<(u32, Vec3)>,
-    /// The actions the scripts offer: on what, and where it is (set each
-    /// tick before [`step`](Self::step)).
-    pub offers: Vec<(u32, Vec3)>,
+    pub starter: Option<ActionAt>,
+    /// The actions the scripts offer: on what, where it is and its reach
+    /// (set each tick before [`step`](Self::step)).
+    pub offers: Vec<ActionAt>,
     /// Seconds played.
     clock: f32,
     goal: Option<Goal>,
@@ -1183,25 +1222,32 @@ impl Autoplay {
             Some(Goal::Open(target)) => self.open(game, target, dt),
             Some(Goal::Take(key)) => self.take(game, key, dt),
             Some(Goal::Deliver(key)) => self.deliver(game, &key, dt),
-            Some(Goal::Use { target, at }) => {
+            Some(Goal::Use { target, at, reach }) => {
                 let here = game.focus();
                 let driving = game.scene.player.as_ref().and_then(|p| p.driving);
-                if driving.is_none() && here.with_y(0.0).distance(at.with_y(0.0)) < USE_FROM {
-                    // The action the game offers her there is taken with
-                    // the use key, as the keyboard's use key takes it
-                    // (`Game::tick`), a press at a time.
-                    let offered = game.context.as_ref().is_some_and(|c| c.0 == target);
-                    if offered && self.pressed > PRESS_GAP {
-                        self.pressed = 0.0;
-                        eprintln!(
-                            "autoplay {:.1} s: taking the action at {target:#x}",
-                            self.clock
-                        );
-                        game.context_taken = Some(target);
+                if driving.is_some() {
+                    return self.travel(game, at, USE_FROM * 0.6, dt);
+                }
+                // The action the game offers her there is taken with the
+                // use key, as the keyboard's use key takes it
+                // (`Game::tick`), a press at a time; only the game's offer
+                // counts, never being near.
+                let offered = game.context.as_ref().is_some_and(|c| c.0 == target);
+                let flat = here.with_y(0.0).distance(at.with_y(0.0));
+                match use_step(flat, reach, offered) {
+                    UseStep::Press => {
+                        if self.pressed > PRESS_GAP {
+                            self.pressed = 0.0;
+                            eprintln!(
+                                "autoplay {:.1} s: taking the action at {target:#x}",
+                                self.clock
+                            );
+                            game.context_taken = Some(target);
+                        }
+                        Intent::default()
                     }
-                    Intent::default()
-                } else {
-                    self.travel(game, at, USE_FROM * 0.6, dt)
+                    UseStep::Wait => Intent::default(),
+                    UseStep::CloseIn(arrive) => self.travel(game, at, arrive, dt),
                 }
             }
             Some(Goal::GetOut) => match game.scene.player.as_ref().and_then(|p| p.driving) {
@@ -1645,13 +1691,13 @@ impl Autoplay {
         // An HVT to verify, once down: the scripts offer an action on the
         // body a few seconds on (`MrxTaskObjectiveVerify._SetupVerify`),
         // which she takes there.
-        if let Some(&(target, at)) = self
+        if let Some(&(target, at, reach)) = self
             .offers
             .iter()
-            .find(|(g, _)| marks.iter().any(|m| m.target == *g && m.kind == "verify"))
+            .find(|(g, _, _)| marks.iter().any(|m| m.target == *g && m.kind == "verify"))
         {
             return Some((
-                Goal::Use { target, at },
+                Goal::Use { target, at, reach },
                 format!(
                     "verifying {target:#x}: the action at {at:.1}, {:.0} m off",
                     at.distance(here)
@@ -1966,10 +2012,10 @@ impl Autoplay {
         // takes a contract (her menu and its terms are answered by the
         // harness, [`crate::mission::contract_pick`]).
         if !places.iter().any(|m| for_a_contract(m))
-            && let Some((target, at)) = self.starter
+            && let Some((target, at, reach)) = self.starter
         {
             return Some((
-                Goal::Use { target, at },
+                Goal::Use { target, at, reach },
                 format!(
                     "accept: on offer [{}]; going to the starter {target:#x} to talk, {:.0} m off",
                     self.on_offer.join(" "),
@@ -5059,7 +5105,7 @@ fn for_a_contract(m: &Mark) -> bool {
 /// The starter she goes to for a contract on offer: none unless a flow
 /// contract is on offer, else the nearest of the talks offered (`talks`,
 /// [`crate::mission::MissionLink::talk_offers`]) to `here`.
-pub fn starter_for(on_offer: &[String], talks: &[(u32, Vec3)], here: Vec3) -> Option<(u32, Vec3)> {
+pub fn starter_for(on_offer: &[String], talks: &[ActionAt], here: Vec3) -> Option<ActionAt> {
     if on_offer.is_empty() {
         return None;
     }
@@ -5079,13 +5125,57 @@ mod tests {
     fn a_starter_is_gone_to_only_for_a_contract_on_offer() {
         let here = Vec3::ZERO;
         let talks = [
-            (7, Vec3::new(30.0, 0.0, 0.0)),
-            (9, Vec3::new(5.0, 0.0, 4.0)),
+            (7, Vec3::new(30.0, 0.0, 0.0), 2.0),
+            (9, Vec3::new(5.0, 0.0, 4.0), 2.0),
         ];
         assert_eq!(starter_for(&[], &talks, here), None);
         let offer = ["OilCon020".to_owned()];
         assert_eq!(starter_for(&offer, &talks, here), Some(talks[1]));
         assert_eq!(starter_for(&offer, &[], here), None);
+    }
+
+    // The scripts offer a starter's talk before its object is in play
+    // (no place for it yet, so `talk_offers` lists nothing): she has no
+    // starter to go to and waits; once the object is in play its talk is
+    // listed and she goes to it, with its reach.
+    #[test]
+    fn a_starter_is_gone_to_once_its_object_is_in_play() {
+        let offer = ["OilCon021".to_owned()];
+        let here = Vec3::new(2531.1, -34.0, 1539.1);
+        assert_eq!(starter_for(&offer, &[], here), None);
+        let entrance = (0x142aed, Vec3::new(2542.9, -33.8, 1498.8), 2.0);
+        assert_eq!(starter_for(&offer, &[entrance], here), Some(entrance));
+    }
+
+    // Story run b3j: 2.46 m flat from the UP HQ entrance, whose talk is
+    // offered within 2 m, she stopped (then within USE_FROM 2.5 m) and
+    // waited 80 minutes for an offer that could not come. Now she walks
+    // on in; within the reach she waits for the game's offer, and only
+    // the offer has her press.
+    #[test]
+    fn a_stop_just_outside_the_reach_walks_on_in() {
+        let reach = 2.0;
+        match use_step(2.46, reach, false) {
+            UseStep::CloseIn(arrive) => assert!(arrive < reach),
+            other => panic!("expected to close in, got {other:?}"),
+        }
+        assert_eq!(use_step(1.5, reach, false), UseStep::Wait);
+        assert_eq!(use_step(1.5, reach, true), UseStep::Press);
+        // Being near is never taking it: at the object, not offered, waits.
+        assert_eq!(use_step(0.0, reach, false), UseStep::Wait);
+    }
+
+    // Ordinary actions are unchanged: a reach of USE_FROM or more is
+    // waited on from 2.5 m, as before, and an offer far off (a person
+    // walking) is still taken.
+    #[test]
+    fn ordinary_reaches_keep_their_use_distance() {
+        assert_eq!(use_step(2.4, 4.0, false), UseStep::Wait);
+        assert_eq!(use_step(2.4, 4.0, true), UseStep::Press);
+        assert!(
+            matches!(use_step(3.0, 4.0, false), UseStep::CloseIn(a) if (a - USE_FROM * 0.6).abs() < 1e-6)
+        );
+        assert_eq!(use_step(3.5, 4.0, true), UseStep::Press);
     }
 
     // A box of the carbine's rounds is wanted while it has room for them,
