@@ -735,6 +735,9 @@ pub struct Autoplay {
     /// The road point she headed for proved out of reach (her hops went
     /// to and fro): the next one on is hers ([`Autoplay::hop`]).
     road_skip: bool,
+    /// Where she was when she last passed a road point over for want of
+    /// headway (cleared by a hop).
+    passed_at: Option<Vec3>,
     /// Hops: from, to.
     pub hops: Vec<(Vec3, Vec3)>,
     /// The objectives last logged.
@@ -4091,10 +4094,18 @@ impl Autoplay {
                 .map(|w| w.route.steer(from, HOP).0)
                 .filter(|to| (*to - from).with_y(0.0).length() >= HOP_LEAST)
                 .unwrap_or(at);
-            if self.pass_road_point("no headway") {
+            // The next road point instead of a hop, unless she hasn't
+            // moved since she last passed one over for want of headway:
+            // then what holds her is where she is, not the point (story
+            // run b3r: the Valiant against the PMC HQ's building at the
+            // B1 start, 40 points passed over in 1000 s without a hop).
+            let here = game.focus();
+            if passes_again(self.passed_at, here) && self.pass_road_point("no headway") {
+                self.passed_at = Some(here);
                 self.fresh_headway();
                 return true;
             }
+            self.passed_at = None;
             if driving.is_some() {
                 self.drive_hops += 1;
             }
@@ -5154,9 +5165,32 @@ fn oscillation(hops: &[(Vec3, Vec3)], from: Vec3, to: Vec3) -> Option<(Vec3, Vec
     (flat(to, a) < OSCILLATE_NEAR && flat(from, b) < OSCILLATE_NEAR).then_some((a, b))
 }
 
+/// Moved this far (metres, flat) since she last passed a road point over
+/// for want of headway, she may pass the next one over too; less, she
+/// hops instead (invented: more than a vehicle's length).
+const PASS_MOVED: f32 = 5.0;
+
+/// Whether she may pass a road point over for want of headway, `here`,
+/// having last done so at `last` ([`PASS_MOVED`]).
+fn passes_again(last: Option<Vec3>, here: Vec3) -> bool {
+    last.is_none_or(|p| p.with_y(0.0).distance(here.with_y(0.0)) > PASS_MOVED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // b3r: stuck driving against a building at the start, she passed 40
+    // road points over in 1000 s and never moved. A pass over is allowed
+    // once she has moved PASS_MOVED since the last; before, she hops.
+    #[test]
+    fn road_points_are_passed_over_only_after_moving() {
+        let stuck = Vec3::new(2771.7, -32.5, -1.9);
+        assert!(passes_again(None, stuck));
+        assert!(!passes_again(Some(stuck), stuck + Vec3::new(0.3, 0.0, 0.2)));
+        assert!(!passes_again(Some(stuck), stuck + Vec3::new(0.0, 4.0, 0.0)));
+        assert!(passes_again(Some(stuck), stuck + Vec3::new(6.0, 0.0, 0.0)));
+    }
 
     // b3h: no road within reach gives a way of no points; it is not found
     // again every tick, only once she has moved ROAD_REPLAN or the place
