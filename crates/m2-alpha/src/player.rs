@@ -889,13 +889,21 @@ impl Player {
                 };
                 eprintln!("jump: take-off at {:.2} m/s, {was}", moved);
                 self.leap = Leap::Air(0.0);
-                if let Some(clip) = takeoff.or(clips.jump) {
+                // The original's actions for the clip, for its blend: a
+                // take-off blends in, the air `Jump` snaps.
+                use m2_engine::blend::action;
+                let played = match takeoff {
+                    Some(c) if Some(c) == clips.takeoff => Some((c, action::JUMP_TAKEOFF_MOVING)),
+                    Some(c) => Some((c, action::JUMP_TAKEOFF_STATIONARY)),
+                    None => clips.jump.map(|c| (c, action::JUMP)),
+                };
+                if let Some((clip, act)) = played {
                     // At the height she stands at, so the take-off's
                     // crouch doesn't sink her.
                     let hips = rig
                         .gait_clip(Gait::Idle)
                         .map_or(1.0, |i| rig.clips[i].info.hips);
-                    rig.animator.play_leveled(clip, hips);
+                    rig.animator.play_leveled(clip, hips, act);
                 }
             } else {
                 self.leap = match self.leap {
@@ -907,7 +915,15 @@ impl Player {
                         };
                         match land {
                             Some(clip) => {
-                                rig.animator.play_once(clip);
+                                // Landings snap in, and the gait after
+                                // one settles in quickly (the original's
+                                // blend times).
+                                let act = if Some(clip) == clips.land {
+                                    m2_engine::blend::action::JUMP_LAND_MOVING
+                                } else {
+                                    m2_engine::blend::action::JUMP_LAND_STATIONARY
+                                };
+                                rig.animator.play_action(clip, true, act);
                                 Leap::Land(0.0, clip)
                             }
                             None => Leap::No,

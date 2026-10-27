@@ -1583,7 +1583,7 @@ fn follow(
                 if guid == a.hero
                     && let Some((hash, _)) = clip
                 {
-                    a.clip = play(game, hash);
+                    a.clip = play(game, hash, m2_assets::name_hash(&action));
                     started = true;
                 }
                 if guid == a.crewman
@@ -2492,11 +2492,13 @@ fn bind_rider(
     bound
 }
 
-/// Plays clip `hash` on her once; its index in her rig's clips.
-fn play(game: &mut Game, hash: u32) -> Option<usize> {
+/// Plays clip `hash` on her once for the script's `action` (its name
+/// hash, which sets the blend: the hijack actions snap); its index in her
+/// rig's clips.
+fn play(game: &mut Game, hash: u32, action: u32) -> Option<usize> {
     let index = bind(game, hash)?;
     let (_, rig) = game.scene.player.as_mut()?.model.as_mut()?;
-    rig.animator.play_once(index);
+    rig.animator.play_action(index, true, action);
     Some(index)
 }
 
