@@ -3385,12 +3385,24 @@ impl MissionLink {
             .sequence_values::<mlua::Table>()
             .flatten()
             .filter_map(|d| {
-                let dest = d.get::<Option<u32>>("dest").ok().flatten();
-                let region = d.get::<Option<u32>>("region").ok().flatten();
+                // Guids reach here as the scripts hold them: userdata.
+                let guid_of = |k: &str| {
+                    d.get::<mlua::Value>(k)
+                        .ok()
+                        .and_then(|v| m2_game::events::as_guid(&v))
+                };
+                let dest = guid_of("dest");
+                let region = guid_of("region");
                 let targets: Vec<u32> = d
-                    .get::<Option<Vec<u32>>>("targets")
+                    .get::<Option<mlua::Table>>("targets")
                     .ok()
                     .flatten()
+                    .map(|t| {
+                        t.sequence_values::<mlua::Value>()
+                            .flatten()
+                            .filter_map(|v| m2_game::events::as_guid(&v))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let at = dest.and_then(place)?;
                 let radius = d.get::<Option<f32>>("dist").ok().flatten();
@@ -5955,6 +5967,39 @@ pub(crate) fn vehicle_models(name: &str, catalogue: &[CatalogueEntry]) -> Vec<Ca
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    // The contract's active deliveries are read from their tasks' configs,
+    // found below the current mission (OilCon020's gun drop: a place and
+    // 15 m, flat, 1 of its pickups); inactive ones and other tasks aren't.
+    #[test]
+    fn active_deliveries_are_read_from_their_configs() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            Pg = { GetGuidByName = function(n) return ({ loc_GunDrop = 0xfa748 })[n] end }
+            local function task(cfg, active, kids)
+                return { GetConfig = function() return cfg end,
+                         IsActive = function() return active end,
+                         GetChildren = function() return kids or {} end }
+            end
+            local guns = task({ sModuleName = "MrxTaskObjectiveDeliver", vDestLoc = "loc_GunDrop",
+                vTgtInclude = { 0x101, 0x102 }, nQuota = 1, fDist = 15, bXZOnly = true }, true)
+            local old = task({ sModuleName = "MrxTaskObjectiveDeliver", vDestLoc = "loc_GunDrop" }, false)
+            local steal = task({ sModuleName = "MrxTaskObjectiveAction" }, true, { guns })
+            MrxPlayState = { GetCurrentMission = function() return task({}, true, { steal, old }) end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let found: mlua::Table = lua.load(CONTRACT_DELIVERIES).eval().unwrap();
+        assert_eq!(found.raw_len(), 1);
+        let d: mlua::Table = found.get(1).unwrap();
+        assert_eq!(d.get::<u32>("dest").unwrap(), 0xfa748);
+        assert_eq!(d.get::<f32>("dist").unwrap(), 15.0);
+        assert!(d.get::<bool>("xz").unwrap());
+        assert_eq!(d.get::<usize>("quota").unwrap(), 1);
+        assert_eq!(d.get::<mlua::Table>("targets").unwrap().raw_len(), 2);
+    }
 
     #[test]
     fn the_nearest_context_action_in_reach_is_offered() {
