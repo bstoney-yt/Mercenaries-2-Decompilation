@@ -3853,6 +3853,8 @@ fn mission_for_screenshot(
                 a.keep = keep;
                 let marks = link.contract_marks();
                 a.offers = link.offers(game);
+                a.in_hq = link.in_hq();
+                a.exits = link.exit_offers();
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)
             }
