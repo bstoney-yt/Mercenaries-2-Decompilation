@@ -26,10 +26,18 @@ const TURN: f32 = 5.0;
 /// The camera's pitch while she runs or drives, radians.
 const CRUISE_PITCH: f32 = -0.2;
 /// With nothing to do, she looks at what the scripts wait for her to
-/// see if it is within this far (metres), from at least this far off
-/// (invented: the camera rides behind her).
-const LOOK_NEAR: f32 = 60.0;
+/// see from within this far (metres), and from at least this far off
+/// (invented: the camera rides behind her). Looking from farther left
+/// the thing behind walls: in the story run's PmcCon001 she stood 60 m
+/// from the hall column, outside the villa, and looked at it 1,400 s
+/// without its coming on screen; it was seen from 8 m inside.
+const LOOK_NEAR: f32 = 15.0;
 const LOOK_FROM: f32 = 6.0;
+/// One farther than [`LOOK_NEAR`] but within this (metres) she walks back
+/// to first, by the way round walls: in the story run's PmcCon001 the hall
+/// column's wait began while she stood 2 m from it, too near to see it,
+/// and she then took up ammo and fought her way 120 m off. Invented.
+const LOOK_SEEK: f32 = 300.0;
 /// Close enough to a place to be there, metres. Waiting there longer than
 /// this (seconds), she walks round it this far out: the scripts' region
 /// may lie to a side of their marker.
@@ -2499,28 +2507,23 @@ impl Autoplay {
             .as_ref()
             .is_some_and(|p| p.driving.is_some());
         // Nothing marked, and the scripts wait for her to look at
-        // something near: she looks at it, from a few metres off.
+        // something: she goes back near it if she has wandered off, then
+        // looks at it from a few metres off.
         if !driving
             && let Some(p) = game.scene.player.as_ref()
-            && let Some(at) = self
-                .sights
-                .iter()
-                .copied()
-                .filter(|s| s.distance(p.character.position) < LOOK_NEAR)
-                .min_by(|a, b| {
-                    let here = p.character.position;
-                    a.distance(here).total_cmp(&b.distance(here))
-                })
+            && let Some(at) = nearest_sight(&self.sights, p.character.position)
         {
             let here = p.character.position;
-            if (at - here).with_y(0.0).length() < LOOK_FROM {
-                let away = here + (here - at).with_y(0.0).normalize_or(Vec3::X) * LOOK_FROM;
-                return self.walk(game, away, 1.0, dt);
-            }
-            let (look, _) = aim(p, at, dt);
-            return Intent {
-                look,
-                ..Intent::default()
+            return match sight_step(at, here) {
+                SightStep::Go => self.travel(game, at, LOOK_NEAR * 0.6, dt),
+                SightStep::BackOff => {
+                    let away = here + (here - at).with_y(0.0).normalize_or(Vec3::X) * LOOK_FROM;
+                    self.walk(game, away, 1.0, dt)
+                }
+                SightStep::Look => Intent {
+                    look: aim(p, at, dt).0,
+                    ..Intent::default()
+                },
             };
         }
         Intent {
@@ -5470,6 +5473,38 @@ fn keeps_to_road(on_road: bool, off: f32) -> bool {
     off >= if on_road { ROAD_UNTIL } else { ROAD_FROM }
 }
 
+/// What she does about something the scripts wait for her to see.
+#[derive(Debug, PartialEq)]
+enum SightStep {
+    /// Go back near it.
+    Go,
+    /// Step off: too near for the camera to see it.
+    BackOff,
+    /// Look at it.
+    Look,
+}
+
+/// The nearest of the things the scripts wait for her to see that she
+/// will go back for (within [`LOOK_SEEK`] of `here`).
+fn nearest_sight(sights: &[Vec3], here: Vec3) -> Option<Vec3> {
+    sights
+        .iter()
+        .copied()
+        .filter(|s| s.distance(here) < LOOK_SEEK)
+        .min_by(|a, b| a.distance(here).total_cmp(&b.distance(here)))
+}
+
+/// What she does about a thing to see at `at` from `here`.
+fn sight_step(at: Vec3, here: Vec3) -> SightStep {
+    if at.distance(here) >= LOOK_NEAR {
+        SightStep::Go
+    } else if (at - here).with_y(0.0).length() < LOOK_FROM {
+        SightStep::BackOff
+    } else {
+        SightStep::Look
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5775,6 +5810,35 @@ mod tests {
         assert!(keeps_to_road(true, 796.0));
         assert!(keeps_to_road(true, ROAD_UNTIL));
         assert!(!keeps_to_road(true, ROAD_UNTIL - 1.0));
+    }
+
+    // A thing the scripts wait for her to see: the nearest within reach
+    // is chosen; too near she steps back, a few metres off she looks, from
+    // 60 m or 120 m she walks back to it, and beyond LOOK_SEEK she leaves it.
+    #[test]
+    fn a_thing_to_see_is_gone_back_to_then_looked_at() {
+        let here = Vec3::new(100.0, 0.0, 100.0);
+        let near = here + Vec3::new(120.0, 2.0, 0.0);
+        let far = here + Vec3::new(LOOK_SEEK + 1.0, 0.0, 0.0);
+        assert_eq!(nearest_sight(&[far, near], here), Some(near));
+        assert_eq!(nearest_sight(&[far], here), None);
+        let thing = near;
+        assert_eq!(
+            sight_step(thing, thing + Vec3::new(2.0, -1.0, 0.0)),
+            SightStep::BackOff
+        );
+        assert_eq!(
+            sight_step(thing, thing + Vec3::new(8.0, -1.0, 0.0)),
+            SightStep::Look
+        );
+        assert_eq!(
+            sight_step(thing, thing + Vec3::new(58.8, -1.0, -11.9)),
+            SightStep::Go
+        );
+        assert_eq!(
+            sight_step(thing, thing + Vec3::new(120.0, -1.0, -8.0)),
+            SightStep::Go
+        );
     }
 
     // A box of the carbine's rounds is wanted while it has room for them,
