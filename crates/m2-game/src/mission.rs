@@ -2045,6 +2045,50 @@ end
             .is_some_and(|r| r.contains("HQ"))
     }
 
+    /// The starters of the HQ she is in that offer one of `contracts`, as
+    /// the scripts have them: she is inside the PMC's
+    /// (`WifPmcInterior._bInside`) and the contract's starter
+    /// (`WifMissionData.tMissionData[id].sStarter`) is one of its starters
+    /// (`WifPmcInterior._tStarters`: Fiona's `PmcBoss`, and the recruits
+    /// Ewen, Eva and Misha, each a rider of its own interior prop). Each is
+    /// the object its talk is on (`uStarter`, the rider: `None` while the
+    /// scripts haven't set it). A faction's starters name their HQ by
+    /// `WifStarterData[..].sHqName` instead (the UP entrance's
+    /// `OilStarter5`: `OilTalkbox`) and are not among these. From the
+    /// scripts; the factions' HQ interiors are not looked at.
+    pub fn own_hq_starters(&self, contracts: &[String]) -> Vec<Option<u32>> {
+        let Ok(ids) = self
+            .lua()
+            .create_sequence_from(contracts.iter().map(String::as_str))
+        else {
+            return Vec::new();
+        };
+        self.lua()
+            .load(
+                r#"
+                local ids = ...
+                local out = {}
+                local hq = WifPmcInterior
+                if not (hq and hq._bInside and hq._tStarters) then return out end
+                local missions = WifMissionData and WifMissionData.tMissionData or {}
+                for _, id in ipairs(ids) do
+                    local d = missions[id]
+                    local s = d and d.sStarter and hq._tStarters[d.sStarter]
+                    if s then out[#out + 1] = { s.uStarter or false } end
+                end
+                return out
+                "#,
+            )
+            .call::<Vec<mlua::Table>>(ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| {
+                t.raw_get::<mlua::Value>(1)
+                    .ok()
+                    .and_then(|v| crate::events::as_guid(&v))
+            })
+            .collect()
+    }
     /// The context actions on offer (`Pg.AddContextAction`): each one's
     /// object, where it stands (if known), its prompt's text id and reach.
     pub fn context_actions(&self) -> Vec<(u32, Option<[f32; 3]>, String, f32)> {
@@ -2644,6 +2688,46 @@ mod tests {
         assert!(m.in_hq());
         run(r#"Object.SetInvincible(Player.GetCharacter(1), false, "HQ")"#);
         assert!(!m.in_hq());
+    }
+    // A contract on offer is the HQ's own when she is inside the PMC's and
+    // its starter is one of the HQ's (PmcCon031's PmcBoss, Fiona): each
+    // gives the object its talk is on, once the scripts have set it. The
+    // UP entrance's OilStarter5 (OilCon021) is a faction HQ's, outside;
+    // another of the HQ's starters (a recruit) offers neither.
+    #[test]
+    fn a_contracts_starter_is_the_hqs_own_by_its_starters() {
+        let m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.lua()
+            .load(
+                r#"
+                WifPmcInterior = { _bInside = true, _tStarters = {
+                    PmcBoss = {},
+                    Recruit = { uStarter = 0xc73ec },
+                } }
+                WifMissionData = { tMissionData = {
+                    PmcCon031 = { sStarter = "PmcBoss" },
+                    OilCon021 = { sStarter = "OilStarter5" },
+                } }
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let both = ids(&["OilCon021", "PmcCon031"]);
+        // Fiona not set yet: her contract's starter is pending.
+        assert_eq!(m.own_hq_starters(&both), [None]);
+        m.lua()
+            .load("WifPmcInterior._tStarters.PmcBoss.uStarter = 0x400001f7")
+            .exec()
+            .unwrap();
+        assert_eq!(m.own_hq_starters(&both), [Some(0x400001f7)]);
+        assert!(m.own_hq_starters(&ids(&["OilCon021"])).is_empty());
+        assert!(m.own_hq_starters(&[]).is_empty());
+        m.lua()
+            .load("WifPmcInterior._bInside = false")
+            .exec()
+            .unwrap();
+        assert!(m.own_hq_starters(&ids(&["PmcCon031"])).is_empty());
     }
     #[test]
     fn the_skip_to_mission_switch_reaches_the_bootstrap_once() {

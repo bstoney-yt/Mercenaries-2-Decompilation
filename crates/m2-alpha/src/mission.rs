@@ -1456,6 +1456,16 @@ impl MissionLink {
         matches!(&self.state, State::Running(m) if m.in_hq())
     }
 
+    /// The starters of the HQ she is in that offer a contract of
+    /// `on_offer`: the object each one's talk is on, once set
+    /// ([`m2_game::mission::Mission::own_hq_starters`]).
+    pub fn own_hq_starters(&self, on_offer: &[String]) -> Vec<Option<u32>> {
+        match &self.state {
+            State::Running(m) => m.own_hq_starters(on_offer),
+            _ => Vec::new(),
+        }
+    }
+
     /// The HQ's exits on offer (the context actions whose prompt is
     /// [`EXIT_PROMPT`], added by its portals while she is inside): each
     /// one's object, where it stands and its reach.

@@ -3841,7 +3841,23 @@ fn mission_for_screenshot(
                     }
                     on_offer = offer;
                 }
-                a.starter = autoplay::starter_for(&on_offer, &link.talk_offers(game), game.focus());
+                let talks = link.talk_offers(game);
+                let own = link.own_hq_starters(&on_offer);
+                // The HQ's own starter of a contract on offer, in play, is
+                // gone to before any other talk (a recruit's nearer by).
+                let own_talks: Vec<_> = talks
+                    .iter()
+                    .copied()
+                    .filter(|t| own.contains(&Some(t.0)))
+                    .collect();
+                let choose = if own_talks.is_empty() {
+                    &talks
+                } else {
+                    &own_talks
+                };
+                a.starter = autoplay::starter_for(&on_offer, choose, game.focus());
+                a.talks = talks;
+                a.own_starters = own;
                 a.on_offer.clone_from(&on_offer);
                 let keep = link.kept_within();
                 if keep.len() != a.keep.len() {
