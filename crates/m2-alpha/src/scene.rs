@@ -167,10 +167,9 @@ const GAIT_KEYS: [(Gait, u32); 4] = [
 ///   `dt * speed / clip speed`, where the clip's speed (its node's +0x5c,
 ///   8280F650) already carries the clip's table rate (+0x34, set through
 ///   +0x50 by 82801A30), so that rate cancels and a moving gait follows
-///   the ground speed alone. The 0.6 to 1.4 clamp is invented (the game
-///   has none: it picks the gait by speed, so the ratio stays near 1);
-///   it keeps the legs going against a wall. Dropping it is a call for
-///   playtesting, not made here.
+///   the ground speed alone, with no clamp. Known runtime limitation: at
+///   speeds far from a clip's own, the feet may slide or the legs stall
+///   (against a wall the ratio is near 0); not yet assessed in play.
 /// - Standing: the table rate of the clip playing
 ///   ([`m2_assets::animation_table::clip_rate`] for `id`). From the 360
 ///   code: the standing locomotion (82809D60, state 0) advances its clips
@@ -184,7 +183,7 @@ pub fn gait_rate(
     id: u32,
 ) -> f32 {
     match clip_speed {
-        Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
+        Some(clip) if gait != Gait::Idle && clip > 0.1 => moved / clip,
         _ if gait != Gait::Idle => 1.0,
         _ => match playing {
             Some((hash, Some((min, max)))) => {
@@ -3685,9 +3684,11 @@ mod tests {
         let limits = Some((0x1234, Some((1.0, 1.5))));
         assert!((gait_rate(Gait::Run, Some(2.5), 3.0, limits, 9) - 1.2).abs() < 1e-6);
         assert!((gait_rate(Gait::Run, Some(2.5), 3.0, None, 9) - 1.2).abs() < 1e-6);
-        // The invented clamp, and no clip speed: 1.0.
-        assert_eq!(gait_rate(Gait::Walk, Some(1.0), 9.0, None, 0), 1.4);
-        assert_eq!(gait_rate(Gait::Walk, Some(1.0), 0.0, None, 0), 0.6);
+        // No clamp, as in the original: rates past the old 0.6 to 1.4 pass
+        // through; no clip speed: 1.0.
+        assert_eq!(gait_rate(Gait::Walk, Some(1.0), 9.0, None, 0), 9.0);
+        assert_eq!(gait_rate(Gait::Walk, Some(2.0), 0.5, None, 0), 0.25);
+        assert_eq!(gait_rate(Gait::Walk, Some(1.0), 0.0, None, 0), 0.0);
         assert_eq!(gait_rate(Gait::Walk, None, 3.0, limits, 0), 1.0);
     }
 
