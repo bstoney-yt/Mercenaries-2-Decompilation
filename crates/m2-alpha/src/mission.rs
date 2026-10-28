@@ -2269,7 +2269,11 @@ impl MissionLink {
             // prop stands, for `Object.SetTransformToObject(.., hardpoint)`,
             // which `MrxUtil.TeleportHeroesToHardpoints` moves her into an
             // HQ with.
-            for (g, at) in prop_hardpoints(game, &mut self.prop_nodes) {
+            let told = {
+                let w = mission.world().borrow();
+                prop_hardpoints(game, &mut self.prop_nodes, |g| w.objects.contains_key(&g))
+            };
+            for (g, at) in told {
                 for (name, place) in at {
                     mission.set_hardpoint(g, name, place);
                 }
@@ -5907,14 +5911,17 @@ type Hardpoints = Vec<(u32, [f32; 3])>;
 
 /// The props whose hardpoints the scripts are told: every prop they
 /// spawned (`Pg.Spawn`: a faction HQ's interior, which `MrxUtil.SpawnActor`
-/// makes from the HQ's template when no `HqInterior` exists), and those
-/// people sit on (the PMC's interior, its starter aboard). In guid order.
+/// makes from the HQ's template when no `HqInterior` exists), those
+/// `scripts_have` among the spawns' guids (not the destructibles the game
+/// adopts above them), and those people sit on (the PMC's interior, its
+/// starter aboard). In guid order.
 fn hardpoint_props(
     crewed: impl Iterator<Item = u32>,
     shown: impl Iterator<Item = u32>,
+    scripts_have: impl Fn(u32) -> bool,
 ) -> Vec<u32> {
     let mut out: Vec<u32> = crewed
-        .chain(shown.filter(|&g| g >= m2_game::api::FIRST_SPAWNED))
+        .chain(shown.filter(|&g| g >= m2_game::api::FIRST_SPAWNED && scripts_have(g)))
         .collect();
     out.sort_unstable();
     out.dedup();
@@ -5927,11 +5934,13 @@ fn hardpoint_props(
 fn prop_hardpoints(
     game: &mut Game,
     nodes: &mut HashMap<u32, Vec<(u32, Vec3)>>,
+    scripts_have: impl Fn(u32) -> bool,
 ) -> Vec<(u32, Hardpoints)> {
     let scene = &game.scene;
     let props: Vec<(u32, u32, m2_math::glam::Mat4)> = hardpoint_props(
         scene.prop_crews.iter().map(|(g, _)| *g),
         scene.props.shown().map(|(g, _)| g),
+        scripts_have,
     )
     .into_iter()
     .filter_map(|g| {
@@ -5985,9 +5994,13 @@ mod tests {
     #[test]
     fn spawned_and_crewed_props_have_their_hardpoints_told() {
         let spawned = m2_game::api::FIRST_SPAWNED + 7;
+        // The game's own above the spawns' guids (destructibles it adopts)
+        // aren't the scripts'.
+        let adopted = 0xa000_e67f;
         let props = hardpoint_props(
             [0xc73ad, 0xc73ad].into_iter(),
-            [0x1234, spawned, 0xc73ad].into_iter(),
+            [0x1234, spawned, adopted, 0xc73ad].into_iter(),
+            |g| g != adopted,
         );
         assert_eq!(props, [0xc73ad, spawned]);
     }
