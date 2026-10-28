@@ -2579,6 +2579,43 @@ mod tests {
         assert_eq!(m.world.borrow().entities[&5], [1.0, 2.0, 3.0]);
     }
 
+    // A starter's talk set up before its object is in play (the HQ
+    // entrance's `Starter_Oil5_Entrance`, a transform-only locator of
+    // `layers_static`) is on offer with no place, so nothing can be
+    // offered to her; once its layer's entity is in, the talk stands
+    // there with the scripts' reach, until the scripts take it away.
+    #[test]
+    fn a_talk_has_a_place_only_once_its_object_is_in_play() {
+        let m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.lua()
+            .load(
+                r#"Pg.AddContextAction(0x142aed, "[ContextAction.Talk]", 2, 0, 0, 255, 2, false)"#,
+            )
+            .exec()
+            .unwrap();
+        let talk = |m: &Mission| {
+            m.context_actions()
+                .into_iter()
+                .find(|(g, ..)| *g == 0x142aed)
+                .map(|(_, at, text, reach)| (at, text, reach))
+        };
+        assert_eq!(
+            talk(&m),
+            Some((None, "[ContextAction.Talk]".to_owned(), 2.0))
+        );
+        let entrance = [2542.9, -33.8, 1498.8];
+        m.world.borrow_mut().entities.insert(0x142aed, entrance);
+        assert_eq!(
+            talk(&m),
+            Some((Some(entrance), "[ContextAction.Talk]".to_owned(), 2.0))
+        );
+        m.lua()
+            .load("Pg.RemoveContextAction(0x142aed)")
+            .exec()
+            .unwrap();
+        assert_eq!(talk(&m), None);
+    }
+
     #[test]
     fn the_skip_to_mission_switch_reaches_the_bootstrap_once() {
         let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();

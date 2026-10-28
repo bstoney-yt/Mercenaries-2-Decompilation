@@ -478,7 +478,9 @@ pub struct ContextAction {
     pub reach: f32,
 }
 
-/// Reach (metres) for a context action whose call gives none (invented).
+/// Reach (metres) for a context action whose call gives none. From the
+/// 360 code: `Pg.AddContextAction` (0x823381E8) defaults its reach to the
+/// constant 2.0 at 0x820C77A4.
 pub const CONTEXT_REACH: f32 = 2.0;
 
 /// The pursuit (`Pg.SetPursuit`, `LockPursuit`, `SetCustomPursuit`,
