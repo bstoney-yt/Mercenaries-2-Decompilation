@@ -290,6 +290,24 @@ pub struct Entity {
     pub template: Option<String>,
 }
 
+impl Entity {
+    /// Whether it is a marker: a region, or a place marked with no
+    /// template or a location's (`location`, `Paradrop Location (CH)`,
+    /// `Landing Zone (player 1)`), not an object with a body. A marker of
+    /// a layer that isn't in is still found by name (the HQs' landing
+    /// zones a delivery helicopter flies home to); an object is not (the
+    /// PMC's `HqInterior`, of `vz_state_pmcinterior`, once that layer is
+    /// out). From the data: 1280 of the layers' unlabelled entities are
+    /// placed as `location` and 1179 with no template.
+    pub fn is_marker(&self) -> bool {
+        self.region.is_some()
+            || self.template.as_deref().is_none_or(|t| {
+                let t = t.to_ascii_lowercase();
+                t.contains("location") || t.starts_with("landing zone")
+            })
+    }
+}
+
 /// An object of the layers with a crew of its own aboard
 /// ([`Mission::crews_aboard`]): its guid, and each rider's seat, guid and
 /// template.
@@ -313,6 +331,9 @@ pub struct GameData {
     /// Templates' labels (name hashes) by the template's name in lower
     /// case, for objects the scripts spawn.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Every template's name in the template database, in lower case:
+    /// the names scripts look templates up by (`Pg.GetGuidByName("OC")`).
+    pub template_names: std::collections::HashSet<String>,
     /// Who drives a template's vehicle as its `Rider` in `seat_driver`
     /// names them (`"AH1Z (Ewan)"`: `"Recruit Ewen Garret"`), by the
     /// template's name in lower case, for vehicles the scripts spawn.
@@ -425,6 +446,10 @@ impl GameData {
                         .names()
                         .into_iter()
                         .map(|(id, n)| (id, n.to_owned()))
+                        .collect();
+                    data.template_names = template_names
+                        .values()
+                        .map(|n| n.to_ascii_lowercase())
                         .collect();
                     for (id, name) in db.names() {
                         if let Some(l) = template_labels.get(&id) {
@@ -649,6 +674,7 @@ impl Mission {
             shapes,
             strings,
             template_labels,
+            template_names,
             template_drivers,
             template_passengers,
             max_reserve,
@@ -670,15 +696,18 @@ impl Mission {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
+            w.template_names = template_names;
             w.template_drivers = template_drivers;
             w.template_passengers = template_passengers;
             w.inventory.max_reserve = max_reserve;
             w.inventory.thrown = thrown;
             for e in layers.values().flatten() {
                 w.entities.insert(e.guid, e.at);
-                w.entity_names
-                    .entry(e.name.to_ascii_lowercase())
-                    .or_insert(e.guid);
+                if e.is_marker() {
+                    w.entity_names
+                        .entry(e.name.to_ascii_lowercase())
+                        .or_insert(e.guid);
+                }
             }
             w.landing_zones.insert(1, one);
             w.landing_zones.insert(2, two);
@@ -2031,6 +2060,64 @@ end
         w.buttons.drain(..extra);
     }
 
+    /// Whether the player is inside an HQ, as the scripts have it: from
+    /// `MrxHq.GlobalEnter`, which makes each player's character
+    /// invincible for the reason "HQ" (both the PMC's `WifPmcInterior` and
+    /// the factions' `MrxHq` call it on entering), until `MrxHq.GlobalExit`
+    /// takes that away, which `WifPmcInterior._ExitEnd` calls only once the
+    /// layers are removed, the heroes teleported out and the assets
+    /// unloaded (from the scripts).
+    pub fn in_hq(&self) -> bool {
+        let w = self.world.borrow();
+        w.player
+            .and_then(|p| w.invincible.get(&p))
+            .is_some_and(|r| r.contains("HQ"))
+    }
+
+    /// The starters of the HQ she is in that offer one of `contracts`, as
+    /// the scripts have them: she is inside the PMC's
+    /// (`WifPmcInterior._bInside`) and the contract's starter
+    /// (`WifMissionData.tMissionData[id].sStarter`) is one of its starters
+    /// (`WifPmcInterior._tStarters`: Fiona's `PmcBoss`, and the recruits
+    /// Ewen, Eva and Misha, each a rider of its own interior prop). Each is
+    /// the object its talk is on (`uStarter`, the rider: `None` while the
+    /// scripts haven't set it). A faction's starters name their HQ by
+    /// `WifStarterData[..].sHqName` instead (the UP entrance's
+    /// `OilStarter5`: `OilTalkbox`) and are not among these. From the
+    /// scripts; the factions' HQ interiors are not looked at.
+    pub fn own_hq_starters(&self, contracts: &[String]) -> Vec<Option<u32>> {
+        let Ok(ids) = self
+            .lua()
+            .create_sequence_from(contracts.iter().map(String::as_str))
+        else {
+            return Vec::new();
+        };
+        self.lua()
+            .load(
+                r#"
+                local ids = ...
+                local out = {}
+                local hq = WifPmcInterior
+                if not (hq and hq._bInside and hq._tStarters) then return out end
+                local missions = WifMissionData and WifMissionData.tMissionData or {}
+                for _, id in ipairs(ids) do
+                    local d = missions[id]
+                    local s = d and d.sStarter and hq._tStarters[d.sStarter]
+                    if s then out[#out + 1] = { s.uStarter or false } end
+                end
+                return out
+                "#,
+            )
+            .call::<Vec<mlua::Table>>(ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| {
+                t.raw_get::<mlua::Value>(1)
+                    .ok()
+                    .and_then(|v| crate::events::as_guid(&v))
+            })
+            .collect()
+    }
     /// The context actions on offer (`Pg.AddContextAction`): each one's
     /// object, where it stands (if known), its prompt's text id and reach.
     pub fn context_actions(&self) -> Vec<(u32, Option<[f32; 3]>, String, f32)> {
@@ -2579,6 +2666,98 @@ mod tests {
         assert_eq!(m.world.borrow().entities[&5], [1.0, 2.0, 3.0]);
     }
 
+    // A starter's talk set up before its object is in play (the HQ
+    // entrance's `Starter_Oil5_Entrance`, a transform-only locator of
+    // `layers_static`) is on offer with no place, so nothing can be
+    // offered to her; once its layer's entity is in, the talk stands
+    // there with the scripts' reach, until the scripts take it away.
+    #[test]
+    fn a_talk_has_a_place_only_once_its_object_is_in_play() {
+        let m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.lua()
+            .load(
+                r#"Pg.AddContextAction(0x142aed, "[ContextAction.Talk]", 2, 0, 0, 255, 2, false)"#,
+            )
+            .exec()
+            .unwrap();
+        let talk = |m: &Mission| {
+            m.context_actions()
+                .into_iter()
+                .find(|(g, ..)| *g == 0x142aed)
+                .map(|(_, at, text, reach)| (at, text, reach))
+        };
+        assert_eq!(
+            talk(&m),
+            Some((None, "[ContextAction.Talk]".to_owned(), 2.0))
+        );
+        let entrance = [2542.9, -33.8, 1498.8];
+        m.world.borrow_mut().entities.insert(0x142aed, entrance);
+        assert_eq!(
+            talk(&m),
+            Some((Some(entrance), "[ContextAction.Talk]".to_owned(), 2.0))
+        );
+        m.lua()
+            .load("Pg.RemoveContextAction(0x142aed)")
+            .exec()
+            .unwrap();
+        assert_eq!(talk(&m), None);
+    }
+
+    // In an HQ as the scripts have it: from `MrxHq.GlobalEnter`'s
+    // invincibility for "HQ" on her character to `GlobalExit` taking it
+    // away; other reasons don't count.
+    #[test]
+    fn in_an_hq_from_global_enter_to_global_exit() {
+        let m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let run = |code: &str| m.lua().load(code).exec().unwrap();
+        assert!(!m.in_hq());
+        run(r#"Object.SetInvincible(Player.GetCharacter(1), true, "Cinematic")"#);
+        assert!(!m.in_hq());
+        run(r#"Object.SetInvincible(Player.GetCharacter(1), true, "HQ")"#);
+        assert!(m.in_hq());
+        run(r#"Object.SetInvincible(Player.GetCharacter(1), false, "HQ")"#);
+        assert!(!m.in_hq());
+    }
+    // A contract on offer is the HQ's own when she is inside the PMC's and
+    // its starter is one of the HQ's (PmcCon031's PmcBoss, Fiona): each
+    // gives the object its talk is on, once the scripts have set it. The
+    // UP entrance's OilStarter5 (OilCon021) is a faction HQ's, outside;
+    // another of the HQ's starters (a recruit) offers neither.
+    #[test]
+    fn a_contracts_starter_is_the_hqs_own_by_its_starters() {
+        let m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.lua()
+            .load(
+                r#"
+                WifPmcInterior = { _bInside = true, _tStarters = {
+                    PmcBoss = {},
+                    Recruit = { uStarter = 0xc73ec },
+                } }
+                WifMissionData = { tMissionData = {
+                    PmcCon031 = { sStarter = "PmcBoss" },
+                    OilCon021 = { sStarter = "OilStarter5" },
+                } }
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let both = ids(&["OilCon021", "PmcCon031"]);
+        // Fiona not set yet: her contract's starter is pending.
+        assert_eq!(m.own_hq_starters(&both), [None]);
+        m.lua()
+            .load("WifPmcInterior._tStarters.PmcBoss.uStarter = 0x400001f7")
+            .exec()
+            .unwrap();
+        assert_eq!(m.own_hq_starters(&both), [Some(0x400001f7)]);
+        assert!(m.own_hq_starters(&ids(&["OilCon021"])).is_empty());
+        assert!(m.own_hq_starters(&[]).is_empty());
+        m.lua()
+            .load("WifPmcInterior._bInside = false")
+            .exec()
+            .unwrap();
+        assert!(m.own_hq_starters(&ids(&["PmcCon031"])).is_empty());
+    }
     #[test]
     fn the_skip_to_mission_switch_reaches_the_bootstrap_once() {
         let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
@@ -3073,6 +3252,101 @@ mod tests {
         assert!(m.crews_aboard().is_empty());
     }
 
+    /// The PMC's `HqInterior` as its layer places it (vz_state_pmcinterior
+    /// 0xc73ad, template `PmcHq_Interior`) and a landing zone marker of a
+    /// layer that isn't in either.
+    fn pmc_interior_and_a_marker() -> GameData {
+        let hq = Entity {
+            guid: 0xc73ad,
+            name: "HqInterior".into(),
+            at: [3750.0, 450.0, -3840.0],
+            template: Some("PmcHq_Interior".into()),
+            crew: vec![("a651ff78".into(), "Fiona Taylor".into())],
+            ..villa_tank()
+        };
+        let lz = Entity {
+            guid: 0xd78ea,
+            name: "01_pmc_hq_lz_playerone".into(),
+            at: [3700.0, 450.0, -3800.0],
+            template: Some("Landing Zone (player 1)".into()),
+            crew: Vec::new(),
+            ..villa_tank()
+        };
+        let mut data = GameData::default();
+        data.layers.insert("vz_state_pmcinterior".into(), vec![hq]);
+        data.layers.insert("vz_pmc_markers".into(), vec![lz]);
+        data
+    }
+
+    #[test]
+    fn an_object_of_a_layer_not_in_has_no_guid_by_name_but_a_marker_has() {
+        let mut m = Mission::new(pmc_interior_and_a_marker(), "Mattias", [0.0; 3]).unwrap();
+        m.run(
+            r#"__hq = Pg.GetGuidByName("HqInterior")
+            __lz = Pg.GetGuidByName("01_pmc_hq_lz_playerone")"#,
+            "names",
+        )
+        .unwrap();
+        let g = m.lua().globals();
+        assert_eq!(g.get::<Value>("__hq").unwrap(), Value::Nil);
+        assert_eq!(
+            g.get::<Value>("__lz").unwrap(),
+            crate::events::guid_value(0xd78ea)
+        );
+    }
+
+    // A faction HQ's interior as `MrxUtil.SpawnActor` makes it: none found
+    // by name (the PMC's layer is out), so the HQ's template is spawned,
+    // named `HqInterior`, placed, and its awake callback (what loads the
+    // starter and teleports her in) runs. `MrxHq.Unload` removes it; the
+    // PMC's own stays its layer's, found again once that layer is in.
+    #[test]
+    fn a_spawned_interior_is_named_found_woken_and_removed_alone() {
+        let mut m = Mission::new(
+            pmc_interior_and_a_marker(),
+            "Mattias",
+            [3740.0, 450.0, -3830.0],
+        )
+        .unwrap();
+        m.run(
+            r#"local g = Pg.GetGuidByName("HqInterior")
+            if not g then
+                g = Pg.Spawn("_ocoutpost_exterior_job", 0, 0, 0, 0, false, true)
+                __spawned = g
+            end
+            Object.SetName(g, "HqInterior")
+            Object.SetPosition(g, 3750, 450, -3840)
+            Event.Create(Event.ObjectHibernation, { g, "awake" },
+                function(o) __awake = o end, {})"#,
+            "spawn actor",
+        )
+        .unwrap();
+        m.tick(0.1);
+        m.run(r#"__found = Pg.GetGuidByName("HqInterior")"#, "find")
+            .unwrap();
+        let g = m.lua().globals();
+        let spawned: Value = g.get("__spawned").unwrap();
+        assert_ne!(spawned, Value::Nil, "the PMC's interior stood in");
+        assert_ne!(spawned, crate::events::guid_value(0xc73ad));
+        assert_eq!(g.get::<Value>("__found").unwrap(), spawned);
+        assert_eq!(g.get::<Value>("__awake").unwrap(), spawned);
+        m.run(
+            r#"Object.Remove(Pg.GetGuidByName("HqInterior"))
+            __gone = Pg.GetGuidByName("HqInterior") == nil"#,
+            "unload",
+        )
+        .unwrap();
+        assert!(g.get::<bool>("__gone").unwrap());
+        assert!(m.world().borrow().entities.contains_key(&0xc73ad));
+        assert_eq!(m.preload("pmcinterior"), ["vz_state_pmcinterior"]);
+        m.run(r#"__pmc = Pg.GetGuidByName("HqInterior")"#, "pmc")
+            .unwrap();
+        assert_eq!(
+            g.get::<Value>("__pmc").unwrap(),
+            crate::events::guid_value(0xc73ad)
+        );
+    }
+
     #[test]
     fn each_crew_aboard_is_its_own_objects_riders_by_object() {
         // Two crewed objects at once (the HQ's starter and the villa's
@@ -3295,7 +3569,11 @@ mod tests {
 
     #[test]
     fn a_factions_infraction_multiplier_scales_what_its_witnesses_report() {
-        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let data = GameData {
+            template_names: ["oc", "guerilla"].map(String::from).into(),
+            ..GameData::default()
+        };
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
         // As a faction contract's start does (2f0b1589), and a mission
         // that lets the Guerillas' witnesses see nothing (08dcd9af).
         m.run(

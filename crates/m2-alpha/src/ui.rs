@@ -690,7 +690,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
         if let (Some(m), Some(vp)) = (&info.mission, info.view_proj) {
             let here = info.game.as_ref().and_then(|s| s.position).map(Vec3::from);
             ground_discs(&painter, screen, vp, m, here);
-            world_markers(&painter, screen, vp, m, game, here);
+            world_markers(&painter, screen, vp, m, game);
         }
         game.paint(&painter);
         if std::env::var_os("M2_PAINT_TEST").is_some() {
@@ -1438,21 +1438,26 @@ fn ground_discs(
 
 /// The scripts' markers (`Marker.AddBlip`) over the world, under the
 /// game's HUD: each its icon (the HUD's texture) tinted its colour,
-/// centred on its point while she is within its `near` to `far` metres
-/// (inferred: from her rather than from the camera). Its size is taken
-/// as the HUD's 640x480 units (inferred: the call's units aren't known),
-/// and one off the screen isn't drawn (nor pinned to its edge).
+/// centred on its point, its alpha scaled by its fade from the camera
+/// ([`MarkerView::alpha_from`]; from the 360 code: the marker renderer
+/// measures from its view's camera position, the translation of the
+/// camera-to-world matrix the view keeps). Its size is taken as the HUD's
+/// 640x480 units (inferred: the call's units aren't known), and one off
+/// the screen isn't drawn (nor pinned to its edge).
+///
+/// [`MarkerView::alpha_from`]: crate::mission::MarkerView::alpha_from
 fn world_markers(
     painter: &egui::Painter,
     screen: egui::Rect,
     view_proj: Mat4,
     m: &MissionView,
     game: &GameHud,
-    here: Option<Vec3>,
 ) {
     let unit = screen.height() / m2_game::gui::VIRTUAL_SIZE.1;
+    let eye = camera_position(view_proj);
     for marker in &m.markers {
-        if here.is_some_and(|h| !marker.shown_from(h)) {
+        let fade = eye.map_or(1.0, |e| marker.alpha_from(e));
+        if fade <= 0.0 {
             continue;
         }
         let Some(p) = project(view_proj, marker.at, screen) else {
@@ -1460,6 +1465,7 @@ fn world_markers(
         };
         let rect = Rect::from_center_size(p, vec2(marker.size, marker.size) * unit);
         let [r, g, b, a] = marker.colour;
+        let a = (f32::from(a) * fade).round() as u8;
         let colour = Color32::from_rgba_unmultiplied(r, g, b, a);
         game.paint_texture(painter, &marker.icon, rect, colour);
     }
@@ -1496,6 +1502,13 @@ fn crosshair(painter: &egui::Painter, c: egui::Pos2) {
     ] {
         painter.line_segment([c + a, c + b], stroke);
     }
+}
+
+/// The camera's position, from its view-projection: the one point it maps
+/// to clip-space w = 0 with x = y = 0 (none for an orthographic one).
+fn camera_position(view_proj: Mat4) -> Option<Vec3> {
+    let eye = view_proj.inverse() * m2_math::glam::Vec4::Z;
+    (eye.w.abs() > f32::EPSILON).then(|| eye.truncate() / eye.w)
 }
 
 /// Where a world point lands on the screen, if in front of the camera.
@@ -1880,6 +1893,31 @@ mod tests {
     }
 
     #[test]
+    fn markers_fade_from_the_camera_not_from_her() {
+        // A chase camera 6 m behind and 3 m over her: the marker's fade is
+        // measured from the camera (from the 360 code), not from her.
+        let eye = Vec3::new(10.0, 5.0, 26.0);
+        let view = Mat4::look_at_rh(eye, Vec3::new(10.0, 2.0, 20.0), Vec3::Y);
+        let vp = Mat4::perspective_rh(1.0, 800.0 / 600.0, 0.1, 1000.0) * view;
+        let found = camera_position(vp).unwrap();
+        assert!(found.distance(eye) < 1e-3, "{found}");
+        let marker = crate::mission::MarkerView {
+            at: Vec3::new(10.0, 2.0, 15.0),
+            icon: "HUD_objective_destroy".into(),
+            colour: [255, 0, 0, 255],
+            near: 5.0,
+            far: 175.0,
+            flat: false,
+            size: 32.0,
+        };
+        // 5 m from her: opaque from her, but the camera is ~11.4 m off.
+        let her = Vec3::new(10.0, 2.0, 20.0);
+        assert_eq!(marker.alpha_from(her), 1.0);
+        assert!(marker.alpha_from(found) < 1.0);
+        assert!(camera_position(Mat4::orthographic_rh(-1.0, 1.0, -1.0, 1.0, 0.1, 10.0)).is_none());
+    }
+
+    #[test]
     fn the_reticle_goes_where_she_aims() {
         let vp = Mat4::perspective_rh(1.0, 800.0 / 600.0, 0.1, 100.0);
         let mut info = HudInfo {
@@ -1919,6 +1957,7 @@ mod tests {
                     colour: [255, 200, 0, 255],
                     near: 5.0,
                     far: 175.0,
+                    flat: false,
                     size: 32.0,
                 }],
                 message: Some((false, "VzaCon001 objective 1".into())),

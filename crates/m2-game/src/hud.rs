@@ -65,14 +65,17 @@ pub struct Marker {
     pub colour: [u8; 4],
     /// Height above the target, metres.
     pub height: f32,
-    /// Shown from `near` to `far` metres away.
+    /// Its fade, metres (from the 360 code, `Gui._MarkerAdd` and the
+    /// marker renderer): opaque within `near`, gone beyond `far`, and in
+    /// between fading linearly in the squared distance. The call's own
+    /// values; [`MARKER_NEAR`] and [`MARKER_FAR`] when it gives none.
     pub near: f32,
     pub far: f32,
     /// The call's two sizes (its third and eleventh arguments: 32 and 32
     /// in the first contract's); which is for what isn't known yet.
     pub sizes: [f32; 2],
-    /// The call's last argument ("2D only"), as given; what it changes
-    /// isn't known yet.
+    /// The call's last argument ("2D only"): its fade measures the
+    /// distance over the ground, leaving height out (from the 360 code).
     pub flat: bool,
     /// The call's twelfth argument, the mission it is for, as given (of a
     /// list, the first).
@@ -121,6 +124,11 @@ impl ObjectiveMessage {
         self.kind.ends_with("cpl")
     }
 }
+
+/// A marker's fade when `Marker.AddBlip` gives none, metres (from the 360
+/// code: `Gui._MarkerAdd`'s defaults, 200 and 300).
+pub const MARKER_NEAR: f32 = 200.0;
+pub const MARKER_FAR: f32 = 300.0;
 
 /// Marker handles start here.
 const FIRST_MARKER: u32 = 0x5000_0000;
@@ -361,8 +369,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                     byte(a.get(6)),
                 ],
                 height: f(7, 0.0),
-                near: f(8, 5.0),
-                far: f(9, 175.0),
+                near: f(8, f64::from(MARKER_NEAR)),
+                far: f(9, f64::from(MARKER_FAR)),
                 sizes: [f(2, 0.0), f(10, 0.0)],
                 flat: matches!(a.get(12), Some(Value::Boolean(true))),
                 // A list of missions (a race's gates pass one) gives its
@@ -492,6 +500,29 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_without_a_fade_takes_the_games_defaults() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        api::install(host.lua(), &world).unwrap();
+        // Some scripts pass nil for near (and leave far out): the game's
+        // defaults, 200 and 300 m, not the beta's former 5 and 175.
+        host.lua()
+            .load(
+                r#"
+                local t = Sys.StringToGuid("734801")
+                Marker.AddBlip(t, "HUD_objective_destroy", 32, 255, 0, 0, 255, 2, nil)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        let m = w.hud.markers.values().next().unwrap();
+        assert_eq!((m.near, m.far), (MARKER_NEAR, MARKER_FAR));
+        assert_eq!((m.near, m.far), (200.0, 300.0));
+        assert!(!m.flat);
+    }
+
+    #[test]
     fn objectives_and_markers_come_and_go() {
         let host = ScriptHost::new().unwrap();
         let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
@@ -531,7 +562,9 @@ mod tests {
                 }]
             );
             let m = hud.markers.values().next().unwrap();
-            assert_eq!((m.target, m.height, m.far), (Some(734_801), 2.0, 175.0));
+            // The call's own fade is kept, not the defaults.
+            assert_eq!((m.target, m.height), (Some(734_801), 2.0));
+            assert_eq!((m.near, m.far), (5.0, 175.0));
             assert_eq!((m.sizes, m.flat), ([32.0, 32.0], false));
         }
         host.lua()
