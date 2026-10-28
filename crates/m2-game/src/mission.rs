@@ -290,6 +290,24 @@ pub struct Entity {
     pub template: Option<String>,
 }
 
+impl Entity {
+    /// Whether it is a marker: a region, or a place marked with no
+    /// template or a location's (`location`, `Paradrop Location (CH)`,
+    /// `Landing Zone (player 1)`), not an object with a body. A marker of
+    /// a layer that isn't in is still found by name (the HQs' landing
+    /// zones a delivery helicopter flies home to); an object is not (the
+    /// PMC's `HqInterior`, of `vz_state_pmcinterior`, once that layer is
+    /// out). From the data: 1280 of the layers' unlabelled entities are
+    /// placed as `location` and 1179 with no template.
+    pub fn is_marker(&self) -> bool {
+        self.region.is_some()
+            || self.template.as_deref().is_none_or(|t| {
+                let t = t.to_ascii_lowercase();
+                t.contains("location") || t.starts_with("landing zone")
+            })
+    }
+}
+
 /// An object of the layers with a crew of its own aboard
 /// ([`Mission::crews_aboard`]): its guid, and each rider's seat, guid and
 /// template.
@@ -313,6 +331,9 @@ pub struct GameData {
     /// Templates' labels (name hashes) by the template's name in lower
     /// case, for objects the scripts spawn.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Every template's name in the template database, in lower case:
+    /// the names scripts look templates up by (`Pg.GetGuidByName("OC")`).
+    pub template_names: std::collections::HashSet<String>,
     /// Who drives a template's vehicle as its `Rider` in `seat_driver`
     /// names them (`"AH1Z (Ewan)"`: `"Recruit Ewen Garret"`), by the
     /// template's name in lower case, for vehicles the scripts spawn.
@@ -425,6 +446,10 @@ impl GameData {
                         .names()
                         .into_iter()
                         .map(|(id, n)| (id, n.to_owned()))
+                        .collect();
+                    data.template_names = template_names
+                        .values()
+                        .map(|n| n.to_ascii_lowercase())
                         .collect();
                     for (id, name) in db.names() {
                         if let Some(l) = template_labels.get(&id) {
@@ -649,6 +674,7 @@ impl Mission {
             shapes,
             strings,
             template_labels,
+            template_names,
             template_drivers,
             template_passengers,
             max_reserve,
@@ -670,15 +696,18 @@ impl Mission {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
+            w.template_names = template_names;
             w.template_drivers = template_drivers;
             w.template_passengers = template_passengers;
             w.inventory.max_reserve = max_reserve;
             w.inventory.thrown = thrown;
             for e in layers.values().flatten() {
                 w.entities.insert(e.guid, e.at);
-                w.entity_names
-                    .entry(e.name.to_ascii_lowercase())
-                    .or_insert(e.guid);
+                if e.is_marker() {
+                    w.entity_names
+                        .entry(e.name.to_ascii_lowercase())
+                        .or_insert(e.guid);
+                }
             }
             w.landing_zones.insert(1, one);
             w.landing_zones.insert(2, two);
@@ -3223,6 +3252,101 @@ mod tests {
         assert!(m.crews_aboard().is_empty());
     }
 
+    /// The PMC's `HqInterior` as its layer places it (vz_state_pmcinterior
+    /// 0xc73ad, template `PmcHq_Interior`) and a landing zone marker of a
+    /// layer that isn't in either.
+    fn pmc_interior_and_a_marker() -> GameData {
+        let hq = Entity {
+            guid: 0xc73ad,
+            name: "HqInterior".into(),
+            at: [3750.0, 450.0, -3840.0],
+            template: Some("PmcHq_Interior".into()),
+            crew: vec![("a651ff78".into(), "Fiona Taylor".into())],
+            ..villa_tank()
+        };
+        let lz = Entity {
+            guid: 0xd78ea,
+            name: "01_pmc_hq_lz_playerone".into(),
+            at: [3700.0, 450.0, -3800.0],
+            template: Some("Landing Zone (player 1)".into()),
+            crew: Vec::new(),
+            ..villa_tank()
+        };
+        let mut data = GameData::default();
+        data.layers.insert("vz_state_pmcinterior".into(), vec![hq]);
+        data.layers.insert("vz_pmc_markers".into(), vec![lz]);
+        data
+    }
+
+    #[test]
+    fn an_object_of_a_layer_not_in_has_no_guid_by_name_but_a_marker_has() {
+        let mut m = Mission::new(pmc_interior_and_a_marker(), "Mattias", [0.0; 3]).unwrap();
+        m.run(
+            r#"__hq = Pg.GetGuidByName("HqInterior")
+            __lz = Pg.GetGuidByName("01_pmc_hq_lz_playerone")"#,
+            "names",
+        )
+        .unwrap();
+        let g = m.lua().globals();
+        assert_eq!(g.get::<Value>("__hq").unwrap(), Value::Nil);
+        assert_eq!(
+            g.get::<Value>("__lz").unwrap(),
+            crate::events::guid_value(0xd78ea)
+        );
+    }
+
+    // A faction HQ's interior as `MrxUtil.SpawnActor` makes it: none found
+    // by name (the PMC's layer is out), so the HQ's template is spawned,
+    // named `HqInterior`, placed, and its awake callback (what loads the
+    // starter and teleports her in) runs. `MrxHq.Unload` removes it; the
+    // PMC's own stays its layer's, found again once that layer is in.
+    #[test]
+    fn a_spawned_interior_is_named_found_woken_and_removed_alone() {
+        let mut m = Mission::new(
+            pmc_interior_and_a_marker(),
+            "Mattias",
+            [3740.0, 450.0, -3830.0],
+        )
+        .unwrap();
+        m.run(
+            r#"local g = Pg.GetGuidByName("HqInterior")
+            if not g then
+                g = Pg.Spawn("_ocoutpost_exterior_job", 0, 0, 0, 0, false, true)
+                __spawned = g
+            end
+            Object.SetName(g, "HqInterior")
+            Object.SetPosition(g, 3750, 450, -3840)
+            Event.Create(Event.ObjectHibernation, { g, "awake" },
+                function(o) __awake = o end, {})"#,
+            "spawn actor",
+        )
+        .unwrap();
+        m.tick(0.1);
+        m.run(r#"__found = Pg.GetGuidByName("HqInterior")"#, "find")
+            .unwrap();
+        let g = m.lua().globals();
+        let spawned: Value = g.get("__spawned").unwrap();
+        assert_ne!(spawned, Value::Nil, "the PMC's interior stood in");
+        assert_ne!(spawned, crate::events::guid_value(0xc73ad));
+        assert_eq!(g.get::<Value>("__found").unwrap(), spawned);
+        assert_eq!(g.get::<Value>("__awake").unwrap(), spawned);
+        m.run(
+            r#"Object.Remove(Pg.GetGuidByName("HqInterior"))
+            __gone = Pg.GetGuidByName("HqInterior") == nil"#,
+            "unload",
+        )
+        .unwrap();
+        assert!(g.get::<bool>("__gone").unwrap());
+        assert!(m.world().borrow().entities.contains_key(&0xc73ad));
+        assert_eq!(m.preload("pmcinterior"), ["vz_state_pmcinterior"]);
+        m.run(r#"__pmc = Pg.GetGuidByName("HqInterior")"#, "pmc")
+            .unwrap();
+        assert_eq!(
+            g.get::<Value>("__pmc").unwrap(),
+            crate::events::guid_value(0xc73ad)
+        );
+    }
+
     #[test]
     fn each_crew_aboard_is_its_own_objects_riders_by_object() {
         // Two crewed objects at once (the HQ's starter and the villa's
@@ -3445,7 +3569,11 @@ mod tests {
 
     #[test]
     fn a_factions_infraction_multiplier_scales_what_its_witnesses_report() {
-        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let data = GameData {
+            template_names: ["oc", "guerilla"].map(String::from).into(),
+            ..GameData::default()
+        };
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
         // As a faction contract's start does (2f0b1589), and a mission
         // that lets the Guerillas' witnesses see nothing (08dcd9af).
         m.run(

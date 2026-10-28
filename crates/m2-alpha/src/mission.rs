@@ -818,6 +818,9 @@ enum State {
 /// The mission scripts and what they want shown.
 pub struct MissionLink {
     state: State,
+    /// The nodes of the models of props with hardpoints the scripts use,
+    /// by model: name hash and place in the model ([`prop_hardpoints`]).
+    prop_nodes: HashMap<u32, Vec<(u32, Vec3)>>,
     /// The contract's unmarked action targets last logged
     /// ([`contract_marks`](Self::contract_marks)).
     acts_logged: std::cell::RefCell<Vec<u32>>,
@@ -1022,6 +1025,7 @@ impl MissionLink {
         };
         Self {
             state: State::Loading(rx),
+            prop_nodes: HashMap::new(),
             movies: false,
             acts_logged: Default::default(),
             end_skip: false,
@@ -2392,6 +2396,21 @@ impl MissionLink {
                 && self.vehicles.reenter.is_none()
             {
                 mission.put_player(at.to_array());
+            }
+            // The hardpoints of the props the scripts spawn (a faction
+            // HQ's `HqInterior`, whose model holds `hp_playerA_enter`) and
+            // of those people sit on: each node of the model where the
+            // prop stands, for `Object.SetTransformToObject(.., hardpoint)`,
+            // which `MrxUtil.TeleportHeroesToHardpoints` moves her into an
+            // HQ with.
+            let told = {
+                let w = mission.world().borrow();
+                prop_hardpoints(game, &mut self.prop_nodes, |g| w.objects.contains_key(&g))
+            };
+            for (g, at) in told {
+                for (name, place) in at {
+                    mission.set_hardpoint(g, name, place);
+                }
             }
             // The scripts' vehicles' load beds, where they count the goods
             // on them (`Object.GetHardpointPosition(truck, "HP_Truckbed")`).
@@ -6093,8 +6112,123 @@ pub fn contract_pick(dialog: &OpenDialog, offered: &[String]) -> Option<(i64, St
     }
 }
 
+/// A prop's hardpoints where it stands: name hash, place.
+type Hardpoints = Vec<(u32, [f32; 3])>;
+
+/// The props whose hardpoints the scripts are told: every prop they
+/// spawned (`Pg.Spawn`: a faction HQ's interior, which `MrxUtil.SpawnActor`
+/// makes from the HQ's template when no `HqInterior` exists), those
+/// `scripts_have` among the spawns' guids (not the destructibles the game
+/// adopts above them), and those people sit on (the PMC's interior, its
+/// starter aboard). In guid order.
+fn hardpoint_props(
+    crewed: impl Iterator<Item = u32>,
+    shown: impl Iterator<Item = u32>,
+    scripts_have: impl Fn(u32) -> bool,
+) -> Vec<u32> {
+    let mut out: Vec<u32> = crewed
+        .chain(shown.filter(|&g| g >= m2_game::api::FIRST_SPAWNED && scripts_have(g)))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Each prop of [`hardpoint_props`] that is shown, and its model's nodes
+/// where it stands (name hash, place); each model's nodes are read once
+/// (`nodes`, by model).
+fn prop_hardpoints(
+    game: &mut Game,
+    nodes: &mut HashMap<u32, Vec<(u32, Vec3)>>,
+    scripts_have: impl Fn(u32) -> bool,
+) -> Vec<(u32, Hardpoints)> {
+    let scene = &game.scene;
+    let props: Vec<(u32, u32, m2_math::glam::Mat4)> = hardpoint_props(
+        scene.prop_crews.iter().map(|(g, _)| *g),
+        scene.props.shown().map(|(g, _)| g),
+        scripts_have,
+    )
+    .into_iter()
+    .filter_map(|g| {
+        let (p, _) = scene.props.get(g)?;
+        Some((
+            g,
+            p.model,
+            m2_math::glam::Mat4::from_rotation_translation(p.rotation, p.position),
+        ))
+    })
+    .collect();
+    props
+        .into_iter()
+        .map(|(g, model, at)| {
+            let known = nodes.entry(model).or_insert_with(|| {
+                let found = game
+                    .scene
+                    .source
+                    .as_mut()
+                    .map(|s| crate::hijack::nodes(s, model))
+                    .unwrap_or_default();
+                let enter = found
+                    .iter()
+                    .any(|(n, _)| *n == name_hash("hp_playerA_enter"));
+                eprintln!(
+                    "hardpoints: prop {g:#x} model {model:08x}: {} nodes, hp_playerA_enter {}",
+                    found.len(),
+                    if enter { "found" } else { "not found" }
+                );
+                found
+            });
+            (g, hardpoints_at(known, at))
+        })
+        .collect()
+}
+
+/// Where a model's `nodes` (name hash, place in the model) stand with the
+/// model placed at `at`.
+fn hardpoints_at(nodes: &[(u32, Vec3)], at: m2_math::glam::Mat4) -> Hardpoints {
+    nodes
+        .iter()
+        .map(|&(name, local)| (name, at.transform_point3(local).to_array()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    // The props the scripts spawn have their hardpoints told, as do
+    // those people sit on (a faction HQ's spawned interior and the PMC's
+    // crewed one), each once; a layer's other props don't.
+    #[test]
+    fn spawned_and_crewed_props_have_their_hardpoints_told() {
+        let spawned = m2_game::api::FIRST_SPAWNED + 7;
+        // The game's own above the spawns' guids (destructibles it adopts)
+        // aren't the scripts'.
+        let adopted = 0xa000_e67f;
+        let props = hardpoint_props(
+            [0xc73ad, 0xc73ad].into_iter(),
+            [0x1234, spawned, adopted, 0xc73ad].into_iter(),
+            |g| g != adopted,
+        );
+        assert_eq!(props, [0xc73ad, spawned]);
+    }
+
+    // A prop's hardpoints are its model's nodes where the prop stands:
+    // turned and moved with it (a faction HQ's interior at its anchor).
+    #[test]
+    fn a_props_hardpoints_turn_and_move_with_it() {
+        use m2_math::glam::{Mat4, Quat};
+        let enter = name_hash("hp_playerA_enter");
+        let nodes = [(enter, Vec3::new(40.0, 0.0, -8.0))];
+        let at = Mat4::from_rotation_translation(
+            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            Vec3::new(3750.0, 450.0, -3840.0),
+        );
+        let placed = hardpoints_at(&nodes, at);
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].0, enter);
+        let p = Vec3::from(placed[0].1);
+        assert!(p.distance(Vec3::new(3742.0, 450.0, -3880.0)) < 1e-3, "{p}");
+    }
+
     use std::collections::HashMap;
 
     // A starter's menu: the first contract on offer among its options is
