@@ -200,7 +200,8 @@ pub struct VehicleSpec {
     pub wheels: Vec<WheelSpec>,
     /// Model-space bounds.
     pub bounds: (Vec3, Vec3),
-    /// Driver's seat and door markers, model space.
+    /// Driver's seat and door, model space: the template's seat data's
+    /// ([`VehicleSpec::with_driver_points`]) once tuned, else fixed markers.
     pub seat: Option<Vec3>,
     pub door: Option<Vec3>,
     /// Tracked vehicles (tanks, APCs without usable wheels) drive on four
@@ -677,6 +678,25 @@ impl VehicleSpec {
         self
     }
 
+    /// With its driver's seat and door where its template's seat data
+    /// puts them ([`crate::seats`]), at those hardpoints' nodes. A point
+    /// the data doesn't give, or whose node the model lacks, keeps the
+    /// fixed model marker (Invented stand-in: those markers are the front
+    /// right seat and door, see [`crate::seats`]).
+    pub fn with_driver_points(mut self, points: Option<crate::seats::DriverPoints>) -> Self {
+        let Some(p) = points else {
+            return self;
+        };
+        let node = |hash: u32| {
+            let i = self.node_names.iter().position(|&n| n == hash)?;
+            self.rest.get(i).map(|m| m.w_axis.truncate())
+        };
+        let (seat, door) = (node(p.seat), p.door.and_then(node));
+        self.seat = seat.or(self.seat);
+        self.door = door.or(self.door);
+        self
+    }
+
     /// With its template's tuning: its mass and how far its gun tilts.
     pub fn tuned(mut self, tuning: Option<VehicleTuning>) -> Self {
         let Some(t) = tuning else {
@@ -1047,6 +1067,33 @@ mod tests {
         assert_eq!(s.mass, 32_000.0);
         assert_eq!(s.elevation, (-0.14, 0.44));
         assert_eq!(spec().tuned(None), spec());
+    }
+
+    #[test]
+    fn the_driver_sits_and_gets_out_where_the_seat_data_says() {
+        use crate::seats::DriverPoints;
+        // The Valiant's nodes (round PR3): its fixed markers, the front
+        // right seat and door, at -x; the data's driver seat and door at +x.
+        let at = |x: f32| Mat4::from_translation(Vec3::new(x, 0.0, 0.4));
+        let mut s = spec();
+        s.node_names = vec![0xd6eb_e292, 0x688c_4858, 0xd721_fc8c, 0x8869_e876];
+        s.rest = vec![at(-0.42), at(-1.7), at(0.42), at(1.7)];
+        s.seat = Some(Vec3::new(-0.42, 0.0, 0.4));
+        s.door = Some(Vec3::new(-1.7, 0.0, 0.4));
+        let data = DriverPoints {
+            seat: 0xd721_fc8c,
+            door: Some(0x8869_e876),
+        };
+        let d = s.clone().with_driver_points(Some(data));
+        assert_eq!(d.seat, Some(Vec3::new(0.42, 0.0, 0.4)));
+        assert_eq!(d.door, Some(Vec3::new(1.7, 0.0, 0.4)));
+        // No seat data, or a node the model lacks: the fixed markers stay.
+        assert_eq!(s.clone().with_driver_points(None), s);
+        let missing = DriverPoints {
+            seat: 7,
+            door: Some(8),
+        };
+        assert_eq!(s.clone().with_driver_points(Some(missing)), s);
     }
 
     fn spec() -> VehicleSpec {

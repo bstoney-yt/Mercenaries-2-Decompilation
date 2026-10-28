@@ -1697,7 +1697,7 @@ mod tests {
             .load(
                 "Event.CreatePersistent(Event.ContextAction, { 0, { objs = { 11, 12 } } }, \
                  function(d, who, target) table.insert(log, d .. ' ' .. tostring(who ~= nil) \
-                 .. ' ' .. tostring(target)) end, { 'office' })",
+                 .. ' ' .. type(target) .. ' ' .. tostring(gid(target))) end, { 'office' })",
             )
             .exec()
             .unwrap();
@@ -1710,7 +1710,7 @@ mod tests {
         world.context.push((0.75, 12));
         events.update(0.5, &world);
         events.update(0.5, &world);
-        assert_eq!(log(&host), ["office true userdata: 000000000000000C"]);
+        assert_eq!(log(&host), ["office true userdata 12"]);
     }
 
     #[test]
