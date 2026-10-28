@@ -3706,6 +3706,14 @@ fn mission_for_screenshot(
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
     // How long the scripts' transit map has been up.
     let mut transit_up = 0.0f32;
+    // Taking a contract on offer (autoplay off a contract): the flow's
+    // contracts on offer, read each second; how long the scripts' box has
+    // been up; and the contract picked in it, until the scripts make it
+    // active.
+    let mut on_offer: Vec<String> = Vec::new();
+    let mut box_up = 0.0f32;
+    let mut accepting: Option<String> = None;
+    let mut offered_actions: Vec<u32> = Vec::new();
     let mut contract_done: Option<u32> = None;
     // With --contracts N, she plays on through the later contracts: the
     // tick the Nth was done, and how many have been.
@@ -3805,6 +3813,52 @@ fn mission_for_screenshot(
                     on_contract = contract;
                 }
                 a.sights = link.sight_targets(game);
+                if i % (1.0 / tick).round().max(1.0) as u32 == 0 {
+                    let offer = if link.contract().is_none() && link.job().is_none() {
+                        link.contracts_on_offer()
+                    } else {
+                        Vec::new()
+                    };
+                    if offer != on_offer && !offer.is_empty() {
+                        eprintln!("accept: on offer [{}]", offer.join(" "));
+                    }
+                    // While contracts are on offer, the context actions
+                    // offered, each time they change.
+                    let actions = if offer.is_empty() {
+                        Vec::new()
+                    } else {
+                        link.context_list()
+                    };
+                    let guids: Vec<u32> = actions.iter().map(|a| a.0).collect();
+                    if guids != offered_actions {
+                        for (g, shown, id, at) in &actions {
+                            eprintln!(
+                                "accept: {:.0} s: context action {g:#x} {id:?} ({shown:?}) at {at:?}",
+                                i as f32 * tick
+                            );
+                        }
+                        offered_actions = guids;
+                    }
+                    on_offer = offer;
+                }
+                let talks = link.talk_offers(game);
+                let own = link.own_hq_starters(&on_offer);
+                // The HQ's own starter of a contract on offer, in play, is
+                // gone to before any other talk (a recruit's nearer by).
+                let own_talks: Vec<_> = talks
+                    .iter()
+                    .copied()
+                    .filter(|t| own.contains(&Some(t.0)))
+                    .collect();
+                let choose = if own_talks.is_empty() {
+                    &talks
+                } else {
+                    &own_talks
+                };
+                a.starter = autoplay::starter_for(&on_offer, choose, game.focus());
+                a.talks = talks;
+                a.own_starters = own;
+                a.on_offer.clone_from(&on_offer);
                 let keep = link.kept_within();
                 if keep.len() != a.keep.len() {
                     eprintln!(
@@ -3815,6 +3869,8 @@ fn mission_for_screenshot(
                 a.keep = keep;
                 let marks = link.contract_marks();
                 a.offers = link.offers(game);
+                a.in_hq = link.in_hq();
+                a.exits = link.exit_offers();
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)
             }
@@ -4097,6 +4153,44 @@ fn mission_for_screenshot(
         }
         game.step(intent, tick);
         link.tick(game, tick);
+        // In a starter's box (her menu, then a contract's terms), autoplay
+        // picks after a moment the contract on offer and then Accept, as a
+        // player taking it would; the game's HUD answers the scripts' box
+        // the same way ([`mission::MissionLink::hud_choice`]).
+        if auto.is_some() {
+            match link.open_dialog() {
+                Some(d) => {
+                    box_up += tick;
+                    if box_up > 2.0 {
+                        box_up = 0.0;
+                        match mission::contract_pick(&d, &on_offer) {
+                            Some((n, id)) => {
+                                eprintln!(
+                                    "accept: in the box {:?} ({}) of {:?}, she picks {n} for {id}",
+                                    d.text, d.method, d.options
+                                );
+                                accepting = Some(id);
+                                link.hud_choice(d.seq, n);
+                            }
+                            None => eprintln!(
+                                "accept: the box {:?} ({}) of {:?} offers no contract on offer",
+                                d.text, d.method, d.options
+                            ),
+                        }
+                    }
+                }
+                None => box_up = 0.0,
+            }
+            if let (Some(id), Some((now, _))) = (&accepting, link.contract())
+                && now.eq_ignore_ascii_case(id)
+            {
+                eprintln!(
+                    "accept: {now} is active, taken from its starter after {:.1} s of play",
+                    i as f32 * tick
+                );
+                accepting = None;
+            }
+        }
         // At the scripts' transit map, autoplay picks after a moment the
         // zone a marker of theirs stands at (where the contract sends her),
         // else the first offered (invented: how she chooses).
