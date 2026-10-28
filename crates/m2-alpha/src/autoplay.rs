@@ -595,6 +595,12 @@ pub struct Autoplay {
     /// where each is, set each tick ([`crate::mission::MissionLink::
     /// sight_targets`]).
     pub sights: Vec<Vec3>,
+    /// Off a contract, the flow's contracts on offer (set each tick:
+    /// [`crate::mission::MissionLink::contracts_on_offer`]), and the
+    /// starter she goes to for one: the nearest talk the scripts offer
+    /// ([`starter_for`]).
+    pub on_offer: Vec<String>,
+    pub starter: Option<(u32, Vec3)>,
     /// The actions the scripts offer: on what, and where it is (set each
     /// tick before [`step`](Self::step)).
     pub offers: Vec<(u32, Vec3)>,
@@ -1365,6 +1371,20 @@ impl Autoplay {
 
     /// What to do next, and words for the log.
     fn choose(&self, game: &Game, marks: &[Mark]) -> Option<(Goal, String)> {
+        // Off a contract with one on offer, a job's or collection's marks
+        // wait: the contract comes first (story run B3: she called
+        // satellite bombs on PmcJob001's treasures from the PMC HQ).
+        let kept: Vec<Mark>;
+        let marks = if !self.on_offer.is_empty() {
+            kept = marks
+                .iter()
+                .filter(|m| for_a_contract(m))
+                .cloned()
+                .collect();
+            &kept[..]
+        } else {
+            marks
+        };
         // A countdown of the scripts' running (OilCon002's 15 minutes from
         // the second post; rounds 16 and 18 lost it to fights and pickups on
         // the way): only close fights, no detours for crates or pickups.
@@ -1941,6 +1961,22 @@ impl Autoplay {
             .filter(|m| m.kind != "destroy")
             .filter(|m| Some(m.target) != riding && (!marked || !unmarked(m)))
             .collect();
+        // Nothing marked for a contract, off one with the flow's
+        // contracts on offer: she goes to a starter and talks, as a player
+        // takes a contract (her menu and its terms are answered by the
+        // harness, [`crate::mission::contract_pick`]).
+        if !places.iter().any(|m| for_a_contract(m))
+            && let Some((target, at)) = self.starter
+        {
+            return Some((
+                Goal::Use { target, at },
+                format!(
+                    "accept: on offer [{}]; going to the starter {target:#x} to talk, {:.0} m off",
+                    self.on_offer.join(" "),
+                    at.distance(here)
+                ),
+            ));
+        }
         let m = nearest(places, here)?;
         if driving.is_none() {
             if m.at.distance(here) > RIDE_FOR
@@ -5015,9 +5051,42 @@ pub(crate) fn stuck_report(
     )
 }
 
+/// Whether `m` was put up for one of the flow's contracts, by name.
+fn for_a_contract(m: &Mark) -> bool {
+    matches!(&m.mission, Some(crate::mission::MarkFor::Id(id)) if crate::mission::is_flow_contract(id))
+}
+
+/// The starter she goes to for a contract on offer: none unless a flow
+/// contract is on offer, else the nearest of the talks offered (`talks`,
+/// [`crate::mission::MissionLink::talk_offers`]) to `here`.
+pub fn starter_for(on_offer: &[String], talks: &[(u32, Vec3)], here: Vec3) -> Option<(u32, Vec3)> {
+    if on_offer.is_empty() {
+        return None;
+    }
+    talks
+        .iter()
+        .copied()
+        .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Off a contract, the nearest starter's talk is gone to, and only while
+    // a flow contract is on offer.
+    #[test]
+    fn a_starter_is_gone_to_only_for_a_contract_on_offer() {
+        let here = Vec3::ZERO;
+        let talks = [
+            (7, Vec3::new(30.0, 0.0, 0.0)),
+            (9, Vec3::new(5.0, 0.0, 4.0)),
+        ];
+        assert_eq!(starter_for(&[], &talks, here), None);
+        let offer = ["OilCon020".to_owned()];
+        assert_eq!(starter_for(&offer, &talks, here), Some(talks[1]));
+        assert_eq!(starter_for(&offer, &[], here), None);
+    }
 
     // A box of the carbine's rounds is wanted while it has room for them,
     // as walking over it takes it.

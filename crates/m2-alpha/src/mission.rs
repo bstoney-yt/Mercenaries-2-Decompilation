@@ -466,7 +466,8 @@ end
 local function open(method, data, callback, args)
     __m2_hud_call_count = __m2_hud_call_count + 1
     local seq = __m2_hud_call_count
-    __m2_hud_callbacks[seq] = { fCallback = callback, tCallbackData = args, dialog = true }
+    __m2_hud_callbacks[seq] = { fCallback = callback, tCallbackData = args, dialog = true,
+        method = method, data = data }
     table.insert(__m2_hud_calls, { seq = seq, group = "DialogBox", method = method,
         data = data, callback = type(callback) == "function" })
     if #__m2_hud_calls > 64 then table.remove(__m2_hud_calls, 1) end
@@ -1413,6 +1414,108 @@ impl MissionLink {
             )
             .eval::<bool>()
             .unwrap_or(false)
+    }
+
+    /// The dialog box the scripts have up and waiting for a pick
+    /// ([`DIALOG_BOXES`]): its call's number, its kind (`Display` for a
+    /// menu, `Scroll` for a contract's terms with Accept), its title or
+    /// text, and its options as text ids.
+    pub fn open_dialog(&self) -> Option<OpenDialog> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        let (seq, method, text, options) = m
+            .lua()
+            .load(
+                "for seq, t in pairs(__m2_hud_callbacks or {}) do \
+                   if type(t) == 'table' and t.dialog and type(t.data) == 'table' then \
+                     local o = {} \
+                     for i, v in ipairs(t.data.tOptions or {}) do o[i] = tostring(v) end \
+                     return seq, t.method or '', t.data.sTitle or t.data.sText or '', o \
+                   end \
+                 end",
+            )
+            .eval::<(
+                Option<u64>,
+                Option<String>,
+                Option<String>,
+                Option<Vec<String>>,
+            )>()
+            .ok()?;
+        Some(OpenDialog {
+            seq: seq?,
+            method: method.unwrap_or_default(),
+            text: text.unwrap_or_default(),
+            options: options.unwrap_or_default(),
+        })
+    }
+
+    /// The starters' talks on offer (the context actions whose prompt is
+    /// [`TALK_PROMPT`]): each one's object and where it stands, a person
+    /// where one is that object, else its place.
+    pub fn talk_offers(&self, game: &Game) -> Vec<(u32, Vec3)> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        mission
+            .context_actions()
+            .into_iter()
+            .filter(|(_, _, text, _)| text.eq_ignore_ascii_case(TALK_PROMPT))
+            // A starter riding a prop (the HQ's, at her desk) is where the
+            // scripts last put her until the game seats her in play
+            // (`crate::hijack`, which loads ~50 s after a save in headless
+            // runs); till then her talk is at the building's origin, over
+            // no floor (story run B3: she walked there and fell).
+            .filter(|(g, _, _, _)| {
+                let rides_prop = mission
+                    .world()
+                    .borrow()
+                    .objects
+                    .get(g)
+                    .and_then(|o| o.vehicle)
+                    .is_some_and(|v| game.scene.props.get(v).is_some());
+                let seated_in_play = game.scene.riders.iter().any(|r| r.guid == Some(*g));
+                talk_ready(rides_prop, seated_in_play)
+            })
+            .filter_map(|(g, at, _, _)| {
+                let person = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .find(|n| n.spawn == Some(g))
+                    .map(|n| n.character.position);
+                Some((g, person.or_else(|| at.map(Vec3::from))?))
+            })
+            .collect()
+    }
+
+    /// Every context action on offer, for the log: its object, its
+    /// prompt's text id and that text as shown, and where it stands (if
+    /// known).
+    pub fn context_list(&self) -> Vec<(u32, String, String, Option<Vec3>)> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        mission
+            .context_actions()
+            .into_iter()
+            .map(|(g, at, id, _)| (g, mission.text(&id), id, at.map(Vec3::from)))
+            .collect()
+    }
+
+    /// The flow's contracts on offer now (not its jobs), in the scripts'
+    /// order, while none is active: what a player off a contract goes to a
+    /// starter for.
+    pub fn contracts_on_offer(&self) -> Vec<String> {
+        match self.contracts() {
+            Some(c) if c.active.is_empty() => c
+                .offered
+                .into_iter()
+                .filter(|id| is_flow_contract(id))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// The transit map the scripts have open ([`DIALOG_BOXES`]' `Transit`
@@ -5887,9 +5990,188 @@ pub(crate) fn vehicle_models(name: &str, catalogue: &[CatalogueEntry]) -> Vec<Ca
     out
 }
 
+/// A starter's talk, as the scripts' HQs offer it (`[ContextAction.Talk]`,
+/// `WifPmcInterior._EnableStarter`; from the scripts).
+pub const TALK_PROMPT: &str = "[ContextAction.Talk]";
+
+/// A dialog box the scripts have up ([`MissionLink::open_dialog`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenDialog {
+    pub seq: u64,
+    pub method: String,
+    pub text: String,
+    pub options: Vec<String>,
+}
+
+/// Whether a starter's talk can be gone to: one riding a prop only once
+/// the game has seated her in play ([`MissionLink::talk_offers`]).
+pub fn talk_ready(rides_prop: bool, seated_in_play: bool) -> bool {
+    !rides_prop || seated_in_play
+}
+
+/// Whether `id` names one of the flow's contracts (`OilCon020`), not a
+/// job (`PmcJob001`).
+pub fn is_flow_contract(id: &str) -> bool {
+    m2_game::script::is_contract_module(id) && id.get(3..6) == Some("Con")
+}
+
+/// What a player taking a contract picks in a starter's box: in her menu
+/// (`Display`), the first option naming the title of a contract on
+/// `offered` (the HQ's reads `[yellow][shop.new] [white]"[OilCon020.Title]"`);
+/// in a contract's terms (`Scroll`, naming `[OilCon020.Terms.Summary]`)
+/// for one on offer, `[Generic.Accept]` (the first, when the box gives no
+/// options). Contracts are found by their localization tokens inside the
+/// shown text, whatever colour tags and quotes surround them. Options count from 1, as the scripts'
+/// callbacks get them. None: the box isn't one for taking a contract on
+/// offer.
+pub fn contract_pick(dialog: &OpenDialog, offered: &[String]) -> Option<(i64, String)> {
+    let number = |i: usize| i64::try_from(i + 1).ok();
+    let names = |text: &str, tail: &str| {
+        offered
+            .iter()
+            .find(|c| text.contains(&format!("[{c}{tail}")))
+            .cloned()
+    };
+    match dialog.method.as_str() {
+        "Display" => dialog
+            .options
+            .iter()
+            .enumerate()
+            .find_map(|(i, o)| Some((number(i)?, names(o, ".Title]")?))),
+        // The terms box names the contract by its terms' token; with no
+        // options of its own it is the game's Accept and Decline, Accept
+        // first (a cancel picks 2: see [`DIALOG_BOXES`]).
+        "Scroll" => {
+            let id = names(&dialog.text, ".Terms")?;
+            let n = match dialog
+                .options
+                .iter()
+                .position(|o| o.contains("[Generic.Accept]"))
+            {
+                Some(i) => number(i)?,
+                None if dialog.options.is_empty() => 1,
+                None => return None,
+            };
+            Some((n, id))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    // A starter's menu: the first contract on offer among its options is
+    // picked (counting from 1); a job or a contract not on offer isn't.
+    // Its terms: Accept, for a contract on offer only. Other boxes: none.
+    #[test]
+    fn a_contract_on_offer_is_picked_then_accepted() {
+        let offered = ["OilCon020".to_owned(), "PmcCon031".to_owned()];
+        let box_of = |method: &str, text: &str, options: &[&str]| OpenDialog {
+            seq: 4,
+            method: method.into(),
+            text: text.into(),
+            options: options.iter().map(|o| (*o).to_owned()).collect(),
+        };
+        let menu = box_of(
+            "Display",
+            "[Briefing.RootMenuDialog]",
+            // As the PMC HQ's menu offered them in the story run (B3).
+            &[
+                "[PmcJob001.Title]",
+                "[GurCon002.Title]",
+                "[yellow][shop.new] [white]\"[OilCon020.Title]\"",
+                "[yellow][shop.new] [white]\"[PmcCon031.Title]\" ([Generic.Level] 1)",
+                "[Briefing.Hint]",
+                "[Generic.Exit]",
+            ],
+        );
+        assert_eq!(
+            contract_pick(&menu, &offered),
+            Some((3, "OilCon020".into()))
+        );
+        let terms = box_of(
+            "Scroll",
+            "[OilCon020.Terms.Summary]",
+            &["[Generic.Accept]", "[Generic.Decline]"],
+        );
+        assert_eq!(
+            contract_pick(&terms, &offered),
+            Some((1, "OilCon020".into()))
+        );
+        // The terms box as the PMC HQ put it up in the story run (B3): no
+        // options of its own, so Accept is the first.
+        let real_terms = box_of(
+            "Scroll",
+            "\"[OilCon020.Title]\"\n\n[Briefing.Faction]: [flagpmc] [Generic.Factions.Pmc.Short]\n\n\
+             [OilCon020.Terms.Summary]\n\n[Generic.Rewards]:\n[OilCon020.Objectives.CustomReward]\n",
+            &[],
+        );
+        assert_eq!(
+            contract_pick(&real_terms, &offered),
+            Some((1, "OilCon020".into()))
+        );
+        let other = box_of("Scroll", "[GurCon002.Terms.Summary]", &["[Generic.Accept]"]);
+        assert_eq!(contract_pick(&other, &offered), None);
+        let exit_only = box_of("Display", "[Briefing.RootMenuDialog]", &["[Generic.Exit]"]);
+        assert_eq!(contract_pick(&exit_only, &offered), None);
+        assert_eq!(contract_pick(&menu, &[]), None);
+    }
+
+    // The box's call keeps what it shows: its kind, title and options,
+    // which autoplay reads to pick a contract on offer.
+    #[test]
+    fn an_open_box_keeps_its_kind_title_and_options() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            Hud = {}
+            MrxGuiDialogBox = { DisplayDialogBox = function() end,
+                DisplayScrollingDialogBox = function() end, Close = function() end }
+            MrxGui = { DisplayDialogBox = MrxGuiDialogBox.DisplayDialogBox }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(DIALOG_BOXES).exec().unwrap();
+        lua.load(
+            r#"MrxGui.DisplayDialogBox(1, "[Briefing.RootMenuDialog]",
+                { "[OilCon020.Title]", "[Generic.Exit]" }, 1, function() end, {})"#,
+        )
+        .exec()
+        .unwrap();
+        let (method, title, first): (String, String, String) = lua
+            .load(
+                "for _, t in pairs(__m2_hud_callbacks) do \
+                   if type(t) == 'table' and t.dialog then \
+                     return t.method, t.data.sTitle, t.data.tOptions[1] end end",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(
+            (method.as_str(), title.as_str(), first.as_str()),
+            ("Display", "[Briefing.RootMenuDialog]", "[OilCon020.Title]")
+        );
+    }
+
+    // A starter on a prop is gone to only once she is seated in play;
+    // one on foot at once.
+    #[test]
+    fn a_seated_starter_is_gone_to_once_seated_in_play() {
+        assert!(talk_ready(false, false));
+        assert!(!talk_ready(true, false));
+        assert!(talk_ready(true, true));
+    }
+
+    // The flow's contracts are told from its jobs by their ids.
+    #[test]
+    fn flow_contracts_are_told_from_jobs() {
+        assert!(is_flow_contract("OilCon020"));
+        assert!(!is_flow_contract("PmcJob001"));
+        assert!(!is_flow_contract("OilCon20"));
+    }
 
     #[test]
     fn the_nearest_context_action_in_reach_is_offered() {
