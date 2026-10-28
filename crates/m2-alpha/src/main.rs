@@ -204,6 +204,9 @@ struct Options {
     plough: Option<String>,
     /// With `--drive`: wreck it at speed at the end and watch it stop.
     wreck: bool,
+    /// With `--drive` and `--wreck` or `--shoot-up`: get out of the wreck,
+    /// walk to the fuel can it left and take it (testing).
+    fuel_check: bool,
     /// With `--drive`: stop and put this many rifle rounds into its parts.
     shoot_up: Option<u32>,
     /// With `--drive`: fire from the next seat with a weapon.
@@ -615,6 +618,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
             "--wreck" => o.wreck = true,
+            "--fuel-check" => o.fuel_check = true,
             "--shoot-up" => {
                 o.shoot_up = Some(
                     value()?
@@ -3702,6 +3706,14 @@ fn mission_for_screenshot(
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
     // How long the scripts' transit map has been up.
     let mut transit_up = 0.0f32;
+    // Taking a contract on offer (autoplay off a contract): the flow's
+    // contracts on offer, read each second; how long the scripts' box has
+    // been up; and the contract picked in it, until the scripts make it
+    // active.
+    let mut on_offer: Vec<String> = Vec::new();
+    let mut box_up = 0.0f32;
+    let mut accepting: Option<String> = None;
+    let mut offered_actions: Vec<u32> = Vec::new();
     let mut contract_done: Option<u32> = None;
     // With --contracts N, she plays on through the later contracts: the
     // tick the Nth was done, and how many have been.
@@ -3801,6 +3813,52 @@ fn mission_for_screenshot(
                     on_contract = contract;
                 }
                 a.sights = link.sight_targets(game);
+                if i % (1.0 / tick).round().max(1.0) as u32 == 0 {
+                    let offer = if link.contract().is_none() && link.job().is_none() {
+                        link.contracts_on_offer()
+                    } else {
+                        Vec::new()
+                    };
+                    if offer != on_offer && !offer.is_empty() {
+                        eprintln!("accept: on offer [{}]", offer.join(" "));
+                    }
+                    // While contracts are on offer, the context actions
+                    // offered, each time they change.
+                    let actions = if offer.is_empty() {
+                        Vec::new()
+                    } else {
+                        link.context_list()
+                    };
+                    let guids: Vec<u32> = actions.iter().map(|a| a.0).collect();
+                    if guids != offered_actions {
+                        for (g, shown, id, at) in &actions {
+                            eprintln!(
+                                "accept: {:.0} s: context action {g:#x} {id:?} ({shown:?}) at {at:?}",
+                                i as f32 * tick
+                            );
+                        }
+                        offered_actions = guids;
+                    }
+                    on_offer = offer;
+                }
+                let talks = link.talk_offers(game);
+                let own = link.own_hq_starters(&on_offer);
+                // The HQ's own starter of a contract on offer, in play, is
+                // gone to before any other talk (a recruit's nearer by).
+                let own_talks: Vec<_> = talks
+                    .iter()
+                    .copied()
+                    .filter(|t| own.contains(&Some(t.0)))
+                    .collect();
+                let choose = if own_talks.is_empty() {
+                    &talks
+                } else {
+                    &own_talks
+                };
+                a.starter = autoplay::starter_for(&on_offer, choose, game.focus());
+                a.talks = talks;
+                a.own_starters = own;
+                a.on_offer.clone_from(&on_offer);
                 let keep = link.kept_within();
                 if keep.len() != a.keep.len() {
                     eprintln!(
@@ -3811,6 +3869,8 @@ fn mission_for_screenshot(
                 a.keep = keep;
                 let marks = link.contract_marks();
                 a.offers = link.offers(game);
+                a.in_hq = link.in_hq();
+                a.exits = link.exit_offers();
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)
             }
@@ -4093,6 +4153,44 @@ fn mission_for_screenshot(
         }
         game.step(intent, tick);
         link.tick(game, tick);
+        // In a starter's box (her menu, then a contract's terms), autoplay
+        // picks after a moment the contract on offer and then Accept, as a
+        // player taking it would; the game's HUD answers the scripts' box
+        // the same way ([`mission::MissionLink::hud_choice`]).
+        if auto.is_some() {
+            match link.open_dialog() {
+                Some(d) => {
+                    box_up += tick;
+                    if box_up > 2.0 {
+                        box_up = 0.0;
+                        match mission::contract_pick(&d, &on_offer) {
+                            Some((n, id)) => {
+                                eprintln!(
+                                    "accept: in the box {:?} ({}) of {:?}, she picks {n} for {id}",
+                                    d.text, d.method, d.options
+                                );
+                                accepting = Some(id);
+                                link.hud_choice(d.seq, n);
+                            }
+                            None => eprintln!(
+                                "accept: the box {:?} ({}) of {:?} offers no contract on offer",
+                                d.text, d.method, d.options
+                            ),
+                        }
+                    }
+                }
+                None => box_up = 0.0,
+            }
+            if let (Some(id), Some((now, _))) = (&accepting, link.contract())
+                && now.eq_ignore_ascii_case(id)
+            {
+                eprintln!(
+                    "accept: {now} is active, taken from its starter after {:.1} s of play",
+                    i as f32 * tick
+                );
+                accepting = None;
+            }
+        }
         // At the scripts' transit map, autoplay picks after a moment the
         // zone a marker of theirs stands at (where the contract sends her),
         // else the first offered (invented: how she chooses).
@@ -5889,6 +5987,9 @@ fn drive_for_screenshot(
     if let Some(rounds) = options.shoot_up {
         shoot_up(game, rounds, tick);
     }
+    if options.fuel_check {
+        fuel_check(game, tick);
+    }
     if options.look != 0.0 || options.fire {
         // Stop, then swing the camera and watch the turret follow.
         let brake = Intent {
@@ -6094,6 +6195,59 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
         v.health(),
         v.wrecked
     );
+}
+
+/// With `--fuel-check`: out of the wreck she drove, to the pickups its
+/// death left, and logs what each gave (`fuel-check:` lines).
+fn fuel_check(game: &mut Game, tick: f32) {
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("fuel-check: not driving");
+        return;
+    };
+    let v = &game.scene.vehicles[i];
+    let (label, wrecked) = (v.spec.label.clone(), v.wrecked);
+    let from = v.guid.unwrap_or(0x4000_0000 | i as u32);
+    for _ in 0..30 {
+        game.step(Intent::default(), tick);
+    }
+    let left: Vec<_> = game
+        .scene
+        .flights
+        .pickups()
+        .iter()
+        .filter(|p| p.from == from)
+        .copied()
+        .collect();
+    eprintln!(
+        "fuel-check: {label} wrecked {wrecked}: left {} pickups: {:?}",
+        left.len(),
+        left.iter()
+            .map(|p| (p.what.template, p.what.fuel, p.at))
+            .collect::<Vec<_>>()
+    );
+    if let (Some(world), Some(player)) = (game.scene.world.as_ref(), game.scene.player.as_mut()) {
+        game::get_out(&world.physics, &game.scene.vehicles[i], player);
+    }
+    for p in left {
+        let before = game.earned.iter().map(|e| e.1).sum::<u32>();
+        if let Some(player) = game.scene.player.as_mut() {
+            player.drop_at(p.at + m2_math::glam::Vec3::Y * 0.5);
+        }
+        for _ in 0..60 {
+            game.step(Intent::default(), tick);
+        }
+        let gone = !game
+            .scene
+            .flights
+            .pickups()
+            .iter()
+            .any(|q| q.key() == p.key());
+        let fuel = game.earned.iter().map(|e| e.1).sum::<u32>() - before;
+        eprintln!(
+            "fuel-check: at {:.1}: taken {gone}, fuel earned {fuel}",
+            p.at
+        );
+    }
 }
 
 /// Wrecks the vehicle she drives, as it goes, and logs how it comes to

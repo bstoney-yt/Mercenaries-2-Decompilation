@@ -341,8 +341,15 @@ const FRAIL: f32 = 60.0;
 const FRAIL_SPEED: f32 = 6.0;
 /// She takes an action the scripts offer within this of its object,
 /// metres (a context action's reach is a few metres; within 1.5 m she
-/// stalled against the body, GurCon002 round 14).
+/// stalled against the body, GurCon002 round 14), and no farther than
+/// this share of the action's own reach: the game offers it only inside
+/// that reach (from the 360 code: the per-frame pick of context actions,
+/// 0x82207538, compares the squared distance to the object with the
+/// reach squared), so stopping between the two waits forever (story run
+/// b3j: 2.46 m from the UP HQ entrance, reach 2, for 80 minutes). The
+/// share is invented.
 const USE_FROM: f32 = 2.5;
+const USE_INSIDE: f32 = 0.8;
 /// Driving, she gets out this near an outpost's flag (metres), to walk
 /// the rest.
 const FLAG_ON_FOOT: f32 = 15.0;
@@ -532,9 +539,119 @@ enum Goal {
     /// Get out of the vehicle she is driving, by the place she is after
     /// (an outpost's flag).
     GetOut,
+    /// Stay put (inside an HQ while the scripts take her out: its exits
+    /// are gone and she isn't out yet).
+    Hold,
     /// Take the action the scripts offer on their object `target` (a
-    /// verified HVT's body), standing at `at`.
-    Use { target: u32, at: Vec3 },
+    /// verified HVT's body), standing at `at`, offered within `reach`.
+    Use { target: u32, at: Vec3, reach: f32 },
+}
+
+/// A context action the scripts offer: its object, where that stands and
+/// the reach (metres) it is offered within.
+pub type ActionAt = (u32, Vec3, f32);
+
+/// The HQ state last logged: inside, the exits offered, the HQ's own
+/// starters on offer and the talks in play.
+type HqSeen = (bool, Vec<u32>, Vec<Option<u32>>, Vec<u32>);
+
+/// What she does about an action she is to take, `flat` metres from its
+/// object, offered within `reach` ([`USE_FROM`], [`USE_INSIDE`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum UseStep {
+    /// The game offers it to her: the use key takes it.
+    Press,
+    /// Close enough and not offered (its object not yet in play, or the
+    /// game offering another nearer one): she stays put and waits.
+    Wait,
+    /// Walk on in, to within this far.
+    CloseIn(f32),
+}
+
+/// Where she stands about an action ([`UseStep`]): offered, she takes it;
+/// within its reach (less a margin) she waits for the game to offer it;
+/// short of that she walks on in, so a stop just outside the reach is
+/// never taken for being there.
+/// Within this of her (metres, flat) a goal is taken to be inside the HQ
+/// she is in, else outside it (invented: the HQ interiors stand at one
+/// anchor, the PMC's rooms within 100 m of it, the island far off).
+const HQ_SPAN: f32 = 150.0;
+
+/// How she gets to a goal at goal_at from here, given whether she is
+/// in an HQ (`in_hq`) and its exits on offer (`exits`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HqLeg {
+    /// Straight there: not in an HQ, or the goal is inside it.
+    Go,
+    /// By the nearest exit the game offers: its action is taken as any
+    /// other ([`UseStep`]).
+    Exit(ActionAt),
+    /// In the HQ with no exit on offer (the scripts took them away as she
+    /// went out, `_EnableInteriorPortals(false)`, and she is not out until
+    /// `MrxHq.GlobalExit`): she waits for the way out to finish.
+    Wait,
+    /// In the HQ with a contract on offer from its own starter, whose talk
+    /// is not in play yet (Fiona, seated in the interior once her
+    /// building's model is in): she waits inside for it.
+    WaitStarter,
+}
+
+/// `starter_pending`: a contract on offer is the HQ's own and no talk
+/// within the HQ is in play yet ([`starter_pending`]).
+fn hq_leg(
+    in_hq: bool,
+    here: Vec3,
+    goal_at: Option<Vec3>,
+    exits: &[ActionAt],
+    starter_pending: bool,
+) -> HqLeg {
+    let flat = |a: Vec3| a.with_y(0.0).distance(here.with_y(0.0));
+    let Some(at) = goal_at.filter(|_| in_hq) else {
+        return HqLeg::Go;
+    };
+    if flat(at) <= HQ_SPAN {
+        return HqLeg::Go;
+    }
+    if starter_pending {
+        return HqLeg::WaitStarter;
+    }
+    // Nearest in three dimensions: the PMC HQ's upper-floor exit
+    // (0x143919, 8 m up) stands over the lower one (0x143918); by flat
+    // distance she went for the one above and waited under it for an
+    // offer the game made for the other (story run b3m, 56 s).
+    exits
+        .iter()
+        .copied()
+        .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
+        .map_or(HqLeg::Wait, HqLeg::Exit)
+}
+
+/// Whether the HQ's own starter is still to come into play: a contract
+/// on offer has one (`own`, the objects their talks are on, `None` while
+/// unset) and none of their talks is among those in play (`talks`). Only
+/// the contract's own starter counts: another of the HQ's talks (a
+/// recruit's) in play doesn't end the wait.
+fn starter_pending(own: &[Option<u32>], talks: &[ActionAt]) -> bool {
+    !own.is_empty()
+        && !own
+            .iter()
+            .flatten()
+            .any(|g| talks.iter().any(|t| t.0 == *g))
+}
+
+fn use_step(flat: f32, reach: f32, offered: bool, locked: bool) -> UseStep {
+    let near = USE_FROM.min(reach * USE_INSIDE);
+    if locked {
+        // Her controls off (a briefing's cinematic): the use key does
+        // nothing for a player then (`Game::tick`), nor for her.
+        UseStep::Wait
+    } else if offered {
+        UseStep::Press
+    } else if flat <= near {
+        UseStep::Wait
+    } else {
+        UseStep::CloseIn(near * 0.6)
+    }
 }
 
 impl Goal {
@@ -547,7 +664,7 @@ impl Goal {
             (Goal::Open(a), Goal::Open(b)) => a == b,
             (Goal::Take(a), Goal::Take(b)) => a == b,
             (Goal::Deliver(a), Goal::Deliver(b)) => a == b,
-            (Goal::GetOut, Goal::GetOut) => true,
+            (Goal::GetOut, Goal::GetOut) | (Goal::Hold, Goal::Hold) => true,
             (Goal::Use { target: a, .. }, Goal::Use { target: b, .. }) => a == b,
             _ => false,
         }
@@ -609,9 +726,31 @@ pub struct Autoplay {
     /// where each is, set each tick ([`crate::mission::MissionLink::
     /// sight_targets`]).
     pub sights: Vec<Vec3>,
-    /// The actions the scripts offer: on what, and where it is (set each
-    /// tick before [`step`](Self::step)).
-    pub offers: Vec<(u32, Vec3)>,
+    /// Off a contract, the flow's contracts on offer (set each tick:
+    /// [`crate::mission::MissionLink::contracts_on_offer`]), and the
+    /// starter she goes to for one: the nearest talk the scripts offer
+    /// ([`starter_for`]).
+    pub on_offer: Vec<String>,
+    pub starter: Option<ActionAt>,
+    /// The actions the scripts offer: on what, where it is and its reach
+    /// (set each tick before [`step`](Self::step)).
+    pub offers: Vec<ActionAt>,
+    /// Whether she is inside an HQ as the scripts have it, and the HQ's
+    /// exits on offer (`[ContextAction.Exit]`): set each tick
+    /// ([`crate::mission::MissionLink::in_hq`],
+    /// [`crate::mission::MissionLink::exit_offers`]).
+    pub in_hq: bool,
+    pub exits: Vec<ActionAt>,
+    /// The starters' talks ready in play ([`starter_for`]'s choice is
+    /// among them), and the HQ's own starters of the contracts on offer:
+    /// the object each one's talk is on, once the scripts set it (set
+    /// each tick: [`crate::mission::MissionLink::own_hq_starters`]).
+    pub talks: Vec<ActionAt>,
+    pub own_starters: Vec<Option<u32>>,
+    /// The HQ state and exits last logged.
+    hq_seen: Option<HqSeen>,
+    /// Whether her controls were off when last logged.
+    locked_seen: bool,
     /// Seconds played.
     clock: f32,
     goal: Option<Goal>,
@@ -794,6 +933,52 @@ impl Autoplay {
             eprintln!("autoplay {:.1} s: objectives {objectives:?}", self.clock);
             self.objectives = objectives.to_vec();
         }
+        // The HQ state and its exits on offer, logged as they change.
+        let exits: Vec<u32> = self.exits.iter().map(|e| e.0).collect();
+        let talks: Vec<u32> = self.talks.iter().map(|t| t.0).collect();
+        let seen = (self.in_hq, exits, self.own_starters.clone(), talks);
+        if self.hq_seen.as_ref() != Some(&seen) {
+            eprintln!(
+                "autoplay {:.1} s: HQ state: {}, exits offered [{}], own starters on offer {:x?}, talks in play [{}], at {:.1}",
+                self.clock,
+                if self.in_hq { "inside" } else { "outside" },
+                self.exits
+                    .iter()
+                    .map(|(g, at, r)| format!("{g:#x} at {at:.1} reach {r}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                seen.2,
+                seen.3
+                    .iter()
+                    .map(|g| format!("{g:#x}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                game.focus()
+            );
+            self.hq_seen = Some(seen);
+        }
+        // While the game has her controls off (the scripts' input switch,
+        // `Command::InputEnabled(false)`: a briefing's cheap cinematic, from
+        // its `GlobalEnter`), she neither moves, hops nor presses, as a
+        // player can't: story run b3m walked (by hops) to the PMC HQ's exit
+        // and took it through PmcCon031's briefing, which then unloaded the
+        // interior under it; the briefing went on outside, put her back at
+        // its seat in the gone interior (y 345) and its wait never ended.
+        if game.input_locked != self.locked_seen {
+            eprintln!(
+                "autoplay {:.1} s: controls {}",
+                self.clock,
+                if game.input_locked {
+                    "off: waiting"
+                } else {
+                    "on"
+                }
+            );
+            self.locked_seen = game.input_locked;
+        }
+        if game.input_locked {
+            return Intent::default();
+        }
         let Some(p) = &game.scene.player else {
             return Intent::default();
         };
@@ -883,8 +1068,18 @@ impl Autoplay {
             }
             return Intent::default();
         }
-        let chosen = self.choose(game, marks);
+        let chosen = self
+            .choose(game, marks)
+            .map(|c| self.by_hq_exit(game.focus(), c));
         let changed = match (&chosen, &self.goal) {
+            // A hold for another reason (out of the HQ, then its own
+            // starter) is a new goal for the log (b3s logged the first
+            // reason for both).
+            // (By the reason, before its first comma: not what it is for,
+            // whose distance changes as she falls out of the interior.)
+            (Some((Goal::Hold, why)), Some(Goal::Hold)) => {
+                why.split(',').next() != self.what.split(',').next()
+            }
             (Some((a, _)), Some(b)) => !a.same(b),
             (None, None) => false,
             _ => true,
@@ -1194,27 +1389,35 @@ impl Autoplay {
             Some(Goal::Open(target)) => self.open(game, target, dt),
             Some(Goal::Take(key)) => self.take(game, key, dt),
             Some(Goal::Deliver(key)) => self.deliver(game, &key, dt),
-            Some(Goal::Use { target, at }) => {
+            Some(Goal::Use { target, at, reach }) => {
                 let here = game.focus();
                 let driving = game.scene.player.as_ref().and_then(|p| p.driving);
-                if driving.is_none() && here.with_y(0.0).distance(at.with_y(0.0)) < USE_FROM {
-                    // The action the game offers her there is taken with
-                    // the use key, as the keyboard's use key takes it
-                    // (`Game::tick`), a press at a time.
-                    let offered = game.context.as_ref().is_some_and(|c| c.0 == target);
-                    if offered && self.pressed > PRESS_GAP {
-                        self.pressed = 0.0;
-                        eprintln!(
-                            "autoplay {:.1} s: taking the action at {target:#x}",
-                            self.clock
-                        );
-                        game.context_taken = Some(target);
+                if driving.is_some() {
+                    return self.travel(game, at, USE_FROM * 0.6, dt);
+                }
+                // The action the game offers her there is taken with the
+                // use key, as the keyboard's use key takes it
+                // (`Game::tick`), a press at a time; only the game's offer
+                // counts, never being near.
+                let offered = game.context.as_ref().is_some_and(|c| c.0 == target);
+                let flat = here.with_y(0.0).distance(at.with_y(0.0));
+                match use_step(flat, reach, offered, game.input_locked) {
+                    UseStep::Press => {
+                        if self.pressed > PRESS_GAP {
+                            self.pressed = 0.0;
+                            eprintln!(
+                                "autoplay {:.1} s: taking the action at {target:#x}, offered, {flat:.2} m off flat (reach {reach})",
+                                self.clock
+                            );
+                            game.context_taken = Some(target);
+                        }
+                        Intent::default()
                     }
-                    Intent::default()
-                } else {
-                    self.travel(game, at, USE_FROM * 0.6, dt)
+                    UseStep::Wait => Intent::default(),
+                    UseStep::CloseIn(arrive) => self.travel(game, at, arrive, dt),
                 }
             }
+            Some(Goal::Hold) => Intent::default(),
             Some(Goal::GetOut) => match game.scene.player.as_ref().and_then(|p| p.driving) {
                 Some(i) => {
                     let speed = vehicle_state(game, i).map_or(0.0, |s| s.1);
@@ -1381,7 +1584,52 @@ impl Autoplay {
     }
 
     /// What to do next, and words for the log.
+    /// The goal chosen (`chosen`), by way of the HQ's exit when she is in
+    /// an HQ and it is outside ([`hq_leg`]).
+    fn by_hq_exit(&self, here: Vec3, chosen: (Goal, String)) -> (Goal, String) {
+        let at = match &chosen.0 {
+            Goal::Reach { at, .. } | Goal::Blast { at, .. } | Goal::Use { at, .. } => Some(*at),
+            _ => None,
+        };
+        let pending = starter_pending(&self.own_starters, &self.talks);
+        match hq_leg(self.in_hq, here, at, &self.exits, pending) {
+            HqLeg::Go => chosen,
+            HqLeg::Exit((target, at, reach)) => (
+                Goal::Use { target, at, reach },
+                format!("leaving the HQ by its exit {target:#x} for {}", chosen.1),
+            ),
+            HqLeg::WaitStarter => (
+                Goal::Hold,
+                format!(
+                    "in the HQ with a contract of its own starter on offer, waiting for the starter's talk, not {}",
+                    chosen.1
+                ),
+            ),
+            HqLeg::Wait => (
+                Goal::Hold,
+                format!(
+                    "in the HQ with no exit offered, waiting to be out, for {}",
+                    chosen.1
+                ),
+            ),
+        }
+    }
+
     fn choose(&self, game: &Game, marks: &[Mark]) -> Option<(Goal, String)> {
+        // Off a contract with one on offer, a job's or collection's marks
+        // wait: the contract comes first (story run B3: she called
+        // satellite bombs on PmcJob001's treasures from the PMC HQ).
+        let kept: Vec<Mark>;
+        let marks = if !self.on_offer.is_empty() {
+            kept = marks
+                .iter()
+                .filter(|m| for_a_contract(m))
+                .cloned()
+                .collect();
+            &kept[..]
+        } else {
+            marks
+        };
         // A countdown of the scripts' running (OilCon002's 15 minutes from
         // the second post; rounds 16 and 18 lost it to fights and pickups on
         // the way): only close fights, no detours for crates or pickups.
@@ -1642,13 +1890,13 @@ impl Autoplay {
         // An HVT to verify, once down: the scripts offer an action on the
         // body a few seconds on (`MrxTaskObjectiveVerify._SetupVerify`),
         // which she takes there.
-        if let Some(&(target, at)) = self
+        if let Some(&(target, at, reach)) = self
             .offers
             .iter()
-            .find(|(g, _)| marks.iter().any(|m| m.target == *g && m.kind == "verify"))
+            .find(|(g, _, _)| marks.iter().any(|m| m.target == *g && m.kind == "verify"))
         {
             return Some((
-                Goal::Use { target, at },
+                Goal::Use { target, at, reach },
                 format!(
                     "verifying {target:#x}: the action at {at:.1}, {:.0} m off",
                     at.distance(here)
@@ -1958,6 +2206,22 @@ impl Autoplay {
             .filter(|m| m.kind != "destroy")
             .filter(|m| Some(m.target) != riding && (!marked || !unmarked(m)))
             .collect();
+        // Nothing marked for a contract, off one with the flow's
+        // contracts on offer: she goes to a starter and talks, as a player
+        // takes a contract (her menu and its terms are answered by the
+        // harness, [`crate::mission::contract_pick`]).
+        if !places.iter().any(|m| for_a_contract(m))
+            && let Some((target, at, reach)) = self.starter
+        {
+            return Some((
+                Goal::Use { target, at, reach },
+                format!(
+                    "accept: on offer [{}]; going to the starter {target:#x} to talk, {:.0} m off",
+                    self.on_offer.join(" "),
+                    at.distance(here)
+                ),
+            ));
+        }
         let m = nearest(places, here)?;
         if driving.is_none() {
             if m.at.distance(here) > RIDE_FOR
@@ -5087,6 +5351,24 @@ pub(crate) fn stuck_report(
     )
 }
 
+/// Whether `m` was put up for one of the flow's contracts, by name.
+fn for_a_contract(m: &Mark) -> bool {
+    matches!(&m.mission, Some(crate::mission::MarkFor::Id(id)) if crate::mission::is_flow_contract(id))
+}
+
+/// The starter she goes to for a contract on offer: none unless a flow
+/// contract is on offer, else the nearest of the talks offered (`talks`,
+/// [`crate::mission::MissionLink::talk_offers`]) to `here`.
+pub fn starter_for(on_offer: &[String], talks: &[ActionAt], here: Vec3) -> Option<ActionAt> {
+    if on_offer.is_empty() {
+        return None;
+    }
+    talks
+        .iter()
+        .copied()
+        .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
+}
+
 /// The way by road to a far place: the place, the road points, the one
 /// she heads for, and where she was when it was found.
 #[derive(Debug)]
@@ -5157,6 +5439,176 @@ fn oscillation(hops: &[(Vec3, Vec3)], from: Vec3, to: Vec3) -> Option<(Vec3, Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Off a contract, the nearest starter's talk is gone to, and only while
+    // a flow contract is on offer.
+    #[test]
+    fn a_starter_is_gone_to_only_for_a_contract_on_offer() {
+        let here = Vec3::ZERO;
+        let talks = [
+            (7, Vec3::new(30.0, 0.0, 0.0), 2.0),
+            (9, Vec3::new(5.0, 0.0, 4.0), 2.0),
+        ];
+        assert_eq!(starter_for(&[], &talks, here), None);
+        let offer = ["OilCon020".to_owned()];
+        assert_eq!(starter_for(&offer, &talks, here), Some(talks[1]));
+        assert_eq!(starter_for(&offer, &[], here), None);
+    }
+
+    // The scripts offer a starter's talk before its object is in play
+    // (no place for it yet, so `talk_offers` lists nothing): she has no
+    // starter to go to and waits; once the object is in play its talk is
+    // listed and she goes to it, with its reach.
+    #[test]
+    fn a_starter_is_gone_to_once_its_object_is_in_play() {
+        let offer = ["OilCon021".to_owned()];
+        let here = Vec3::new(2531.1, -34.0, 1539.1);
+        assert_eq!(starter_for(&offer, &[], here), None);
+        let entrance = (0x142aed, Vec3::new(2542.9, -33.8, 1498.8), 2.0);
+        assert_eq!(starter_for(&offer, &[entrance], here), Some(entrance));
+    }
+
+    // Story run b3j: 2.46 m flat from the UP HQ entrance, whose talk is
+    // offered within 2 m, she stopped (then within USE_FROM 2.5 m) and
+    // waited 80 minutes for an offer that could not come. Now she walks
+    // on in; within the reach she waits for the game's offer, and only
+    // the offer has her press.
+    #[test]
+    fn a_stop_just_outside_the_reach_walks_on_in() {
+        let reach = 2.0;
+        match use_step(2.46, reach, false, false) {
+            UseStep::CloseIn(arrive) => assert!(arrive < reach),
+            other => panic!("expected to close in, got {other:?}"),
+        }
+        assert_eq!(use_step(1.5, reach, false, false), UseStep::Wait);
+        assert_eq!(use_step(1.5, reach, true, false), UseStep::Press);
+        // Being near is never taking it: at the object, not offered, waits.
+        assert_eq!(use_step(0.0, reach, false, false), UseStep::Wait);
+        // Nor offered with her controls off (b3m: the HQ exit taken
+        // through PmcCon031's briefing): she waits for them back.
+        assert_eq!(use_step(0.0, reach, true, true), UseStep::Wait);
+        assert_eq!(use_step(2.46, reach, false, true), UseStep::Wait);
+    }
+
+    // b3k: in the PMC HQ with the UP entrance's talk 5.5 km off, she
+    // walked at it and stood inside. Now: in an HQ with an outside goal she
+    // goes by the nearest exit the game offers, as a Use of its action;
+    // with no exit on offer (the scripts taking her out) she holds; once
+    // out (not in the HQ) she goes straight for it.
+    #[test]
+    fn an_outside_goal_from_an_hq_goes_by_its_exit() {
+        let here = Vec3::new(3796.6, 450.0, -3852.6);
+        let entrance = Some(Vec3::new(2542.9, -33.8, 1498.8));
+        let exits = [
+            (0x143918, Vec3::new(3794.0, 450.8, -3913.8), 2.0),
+            (0x143917, Vec3::new(3794.0, 450.0, -3820.6), 2.0),
+        ];
+        assert_eq!(hq_leg(false, here, entrance, &exits, false), HqLeg::Go);
+        assert_eq!(
+            hq_leg(true, here, entrance, &exits, false),
+            HqLeg::Exit(exits[1])
+        );
+        assert_eq!(hq_leg(true, here, entrance, &[], false), HqLeg::Wait);
+        // Out: the island near the HQ's door, nothing of the HQ offered.
+        let out = Vec3::new(2600.0, -30.0, 1400.0);
+        assert_eq!(hq_leg(false, out, entrance, &[], false), HqLeg::Go);
+        // A goal inside the HQ (its starter at her desk) is gone to.
+        let fiona = Some(Vec3::new(3750.0, 450.0, -3840.0));
+        assert_eq!(hq_leg(true, here, fiona, &exits, false), HqLeg::Go);
+        // Of two exits one over the other, the one on her floor.
+        let by_stairs = Vec3::new(3794.0, 450.8, -3911.0);
+        let stacked = [
+            (0x143919, Vec3::new(3794.0, 458.5, -3913.3), 2.0),
+            (0x143918, Vec3::new(3794.0, 450.8, -3913.8), 2.0),
+        ];
+        assert_eq!(
+            hq_leg(true, by_stairs, entrance, &stacked, false),
+            HqLeg::Exit(stacked[1])
+        );
+    }
+
+    // b3p: loaded into the PMC HQ with PmcCon031 on offer from Fiona (its
+    // starter PmcBoss is the HQ's) and the UP entrance's talk outside, she
+    // took the exit at 18 s, before Fiona was seated and her talk in play.
+    // Now: the HQ's own starter pending, she waits inside, and only that
+    // starter's talk ends the wait (a recruit's in play doesn't); a
+    // contract whose starter is outside keeps the exit.
+    #[test]
+    fn the_hqs_own_starter_is_waited_for_inside() {
+        let here = Vec3::new(3794.0, 450.8, -3911.0);
+        let entrance = Some(Vec3::new(2542.9, -33.8, 1498.8));
+        let exits = [(0x143918, Vec3::new(3794.0, 450.8, -3913.8), 2.0)];
+        let up = (0x142aed, Vec3::new(2542.9, -33.8, 1498.8), 2.0);
+        let fiona = (0x400001f7, Vec3::new(3795.6, 450.0, -3854.1), 4.0);
+        let recruit = (0xc73ec, Vec3::new(3790.0, 450.0, -3900.0), 4.0);
+        // Fiona's object not set yet, or set but her talk not in play.
+        for own in [vec![None], vec![Some(fiona.0)]] {
+            assert!(starter_pending(&own, &[up]));
+            assert!(starter_pending(&own, &[up, recruit]));
+            assert_eq!(
+                hq_leg(
+                    true,
+                    here,
+                    entrance,
+                    &exits,
+                    starter_pending(&own, &[up, recruit])
+                ),
+                HqLeg::WaitStarter
+            );
+        }
+        // Her talk in play: no longer pending.
+        assert!(!starter_pending(&[Some(fiona.0)], &[up, recruit, fiona]));
+        // Not the HQ's own (OilCon021 alone): the exit, as before.
+        assert!(!starter_pending(&[], &[up]));
+        assert_eq!(
+            hq_leg(true, here, entrance, &exits, false),
+            HqLeg::Exit(exits[0])
+        );
+        // Out of the HQ, pending or not, she goes.
+        assert_eq!(hq_leg(false, here, entrance, &exits, true), HqLeg::Go);
+    }
+    // The exit is taken as any action: a Use of the game's own exit
+    // action, pressed only once the game offers it ([`use_step`]); her
+    // goal is still the outside one, named, and the starter's talk goal
+    // itself is unchanged out of an HQ (#176).
+    #[test]
+    fn the_hq_exit_is_a_use_of_the_offered_exit_action() {
+        let mut a = Autoplay::default();
+        let here = Vec3::new(3796.6, 450.0, -3852.6);
+        let talk = (
+            Goal::Use {
+                target: 0x142aed,
+                at: Vec3::new(2542.9, -33.8, 1498.8),
+                reach: 2.0,
+            },
+            "going to the starter".to_owned(),
+        );
+        let (g, what) = a.by_hq_exit(here, talk.clone());
+        assert!(g.same(&talk.0));
+        assert_eq!(what, talk.1);
+        a.in_hq = true;
+        a.exits = vec![(0x143917, Vec3::new(3794.0, 450.0, -3820.6), 2.0)];
+        let (g, what) = a.by_hq_exit(here, talk.clone());
+        assert!(matches!(g, Goal::Use { target: 0x143917, reach, .. } if reach == 2.0));
+        assert!(what.contains("going to the starter"));
+        assert_eq!(use_step(1.0, 2.0, false, false), UseStep::Wait);
+        a.exits.clear();
+        assert!(matches!(a.by_hq_exit(here, talk.clone()).0, Goal::Hold));
+        a.in_hq = false;
+        assert!(a.by_hq_exit(here, talk.clone()).0.same(&talk.0));
+    }
+    // Ordinary actions are unchanged: a reach of USE_FROM or more is
+    // waited on from 2.5 m, as before, and an offer far off (a person
+    // walking) is still taken.
+    #[test]
+    fn ordinary_reaches_keep_their_use_distance() {
+        assert_eq!(use_step(2.4, 4.0, false, false), UseStep::Wait);
+        assert_eq!(use_step(2.4, 4.0, true, false), UseStep::Press);
+        assert!(
+            matches!(use_step(3.0, 4.0, false, false), UseStep::CloseIn(a) if (a - USE_FROM * 0.6).abs() < 1e-6)
+        );
+        assert_eq!(use_step(3.5, 4.0, true, false), UseStep::Press);
+    }
 
     // b3h: no road within reach gives a way of no points; it is not found
     // again every tick, only once she has moved ROAD_REPLAN or the place

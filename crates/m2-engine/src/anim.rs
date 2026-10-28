@@ -21,6 +21,7 @@ use m2_assets::{BlockContents, Clip};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 
 use crate::assets::{AssetError, AssetSource};
+use crate::blend;
 
 /// One node's local transform.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -640,6 +641,11 @@ pub struct Animator {
     fade: f32,
     fade_time: f32,
     upper: Option<Upper>,
+    /// The action (its name hash) the playing clip stands for, which the
+    /// next blend time depends on ([`blend::time`]).
+    action: Option<u32>,
+    /// A blend time a script gave the next action change, used once.
+    next_blend: Option<f32>,
 }
 
 impl Default for Animator {
@@ -648,43 +654,82 @@ impl Default for Animator {
             current: None,
             previous: None,
             fade: 1.0,
-            fade_time: 0.25,
+            fade_time: blend::DEFAULT,
             upper: None,
+            action: None,
+            next_blend: None,
         }
     }
 }
 
 impl Animator {
     /// Switches to clip `index`, looped (no-op if it is already playing),
-    /// fading from the current one.
+    /// fading from the current one: locomotion, in the `Idle` action.
     pub fn play(&mut self, index: usize) {
-        self.start(index, false, None);
+        self.start(index, false, None, blend::action::IDLE);
     }
 
     /// Plays clip `index` once from the start and holds its last frame
-    /// (a fall, a reaction), fading quickly from the current one.
+    /// (a reaction, a pickup), fading from the current one as into an
+    /// action with no special blend.
     pub fn play_once(&mut self, index: usize) {
-        self.start(index, true, None);
-        self.fade_time = 0.1;
+        self.start(index, true, None, blend::action::UNNAMED);
     }
 
-    /// Plays clip `index` once like [`play_once`](Self::play_once), with
-    /// the pelvis held at `hips` metres (standing height): a jump whose
-    /// rise the physics already gives the character, and whose crouch
-    /// shouldn't sink her into the ground.
-    pub fn play_leveled(&mut self, index: usize, hips: f32) {
-        self.start(index, true, Some(hips));
-        self.fade_time = 0.1;
+    /// Plays clip `index` for the original action `action` (its name
+    /// hash, [`blend::action`]), looped or `once`, fading for as long as
+    /// the original does between the two actions ([`blend::time`]).
+    pub fn play_action(&mut self, index: usize, once: bool, action: u32) {
+        self.start(index, once, None, action);
     }
 
-    fn start(&mut self, clip: usize, once: bool, level: Option<f32>) {
+    /// Plays clip `index` once for `action` like
+    /// [`play_action`](Self::play_action), with the pelvis held at `hips`
+    /// metres (standing height): a jump whose rise the physics already
+    /// gives the character, and whose crouch shouldn't sink her into the
+    /// ground.
+    pub fn play_leveled(&mut self, index: usize, hips: f32, action: u32) {
+        self.start(index, true, Some(hips), action);
+    }
+
+    /// Makes the next clip change fade over `seconds` instead of the
+    /// original's time between the two actions, once (the original's
+    /// script override; see [`blend`]).
+    pub fn override_next_blend(&mut self, seconds: f32) {
+        self.next_blend = Some(seconds);
+    }
+
+    /// The fade time of the last clip change, seconds (0 for a snap).
+    pub fn fade_time(&self) -> f32 {
+        self.fade_time
+    }
+
+    fn start(&mut self, clip: usize, once: bool, level: Option<f32>, action: u32) {
         if self
             .current
             .is_some_and(|c| c.clip == clip && c.once == once && c.level == level)
         {
             return;
         }
-        self.fade_time = 0.25;
+        let previous = if self.current.is_some() {
+            self.action
+        } else {
+            None
+        };
+        self.fade_time = self
+            .next_blend
+            .take()
+            .filter(|t| *t >= 0.0)
+            .unwrap_or_else(|| blend::time(previous, action));
+        // The changes the original blends specially, for play checks.
+        if self.fade_time != blend::DEFAULT && previous.is_some() {
+            eprintln!(
+                "anim: blend {:08x} -> {action:08x} over {:.4} s (clip {clip})",
+                previous.unwrap_or_default(),
+                self.fade_time
+            );
+        }
+        self.action = Some(action);
         self.previous = self.current;
         self.current = Some(Playing {
             clip,
@@ -692,7 +737,12 @@ impl Animator {
             once,
             level,
         });
-        self.fade = if self.previous.is_some() { 0.0 } else { 1.0 };
+        self.fade = if self.previous.is_some() && self.fade_time >= blend::INSTANT {
+            0.0
+        } else {
+            self.previous = None;
+            1.0
+        };
     }
 
     /// The clip playing and how far in it is, seconds.
@@ -779,7 +829,11 @@ impl Animator {
         {
             c.time += dt;
         }
-        self.fade = (self.fade + dt / self.fade_time).min(1.0);
+        self.fade = if self.fade_time < blend::INSTANT {
+            1.0
+        } else {
+            (self.fade + dt / self.fade_time).min(1.0)
+        };
         if self.fade >= 1.0 {
             self.previous = None;
         }
@@ -920,12 +974,59 @@ mod tests {
         assert_eq!(anim.fade, 1.0);
         anim.play(1);
         assert_eq!(anim.fade, 0.0);
-        anim.advance(0.125);
+        // The original's 0.2 s, linear (the beta's was 0.25 s).
+        assert_eq!(anim.fade_time(), 0.2);
+        anim.advance(0.1);
         assert!((anim.fade - 0.5).abs() < 1e-6);
-        anim.advance(0.2);
+        anim.advance(0.1);
         assert!(anim.previous.is_none());
         // Without clips the rest pose comes back.
         assert_eq!(anim.pose(&skeleton(), &[]), skeleton().rest_pose());
+    }
+
+    #[test]
+    fn animator_blends_by_action() {
+        use crate::blend::action::*;
+        let mut anim = Animator::default();
+        // The first clip snaps in.
+        anim.play_action(0, false, IDLE);
+        assert_eq!((anim.fade, anim.fade_time()), (1.0, 0.0));
+        // A one-shot fades as long as a loop (the beta's was 0.1 s).
+        anim.play_once(1);
+        assert_eq!((anim.fade, anim.fade_time()), (0.0, 0.2));
+        // A jump snaps: nothing left to fade from.
+        anim.play_leveled(2, 1.0, JUMP);
+        assert_eq!(anim.fade, 1.0);
+        assert!(anim.previous.is_none());
+        // So does the landing, and Idle then settles in quickly.
+        anim.play_action(3, true, JUMP_LAND_MOVING);
+        assert_eq!(anim.fade, 1.0);
+        anim.play(0);
+        assert_eq!((anim.fade, anim.fade_time()), (0.0, crate::blend::QUICK));
+        anim.advance(crate::blend::QUICK / 2.0);
+        assert!((anim.fade - 0.5).abs() < 1e-4);
+        // A stagger blends quickly too.
+        anim.play_action(4, true, STAGGER_SHORT);
+        assert_eq!(anim.fade_time(), crate::blend::QUICK);
+        // Advancing a snap stays done.
+        anim.play_action(5, true, GETUP);
+        anim.advance(0.01);
+        assert_eq!(anim.fade, 1.0);
+    }
+
+    #[test]
+    fn a_script_overrides_the_next_blend_once() {
+        let mut anim = Animator::default();
+        anim.play(0);
+        anim.override_next_blend(0.5);
+        anim.play_once(1);
+        assert_eq!(anim.fade_time(), 0.5);
+        anim.play(0);
+        assert_eq!(anim.fade_time(), 0.2);
+        // A negative time is "none", as the original's -1.
+        anim.override_next_blend(-1.0);
+        anim.play_once(1);
+        assert_eq!(anim.fade_time(), 0.2);
     }
 
     #[test]
