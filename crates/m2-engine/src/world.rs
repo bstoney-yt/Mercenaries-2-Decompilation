@@ -297,6 +297,9 @@ pub struct Templates {
     /// Where each template's entrances are got in by (`DriverHatch`), by
     /// id ([`crate::hijack::entrance_points`]).
     pub entrance_points: HashMap<u32, Vec<u32>>,
+    /// Where each vehicle template's driver sits and gets out, by id
+    /// ([`crate::seats::read`]).
+    pub driver_points: HashMap<u32, crate::seats::DriverPoints>,
     /// How air strikes' ordnance flies and what its blasts do.
     pub ordnance: crate::ordnance::Ordnance,
     /// The effects each template shows, by id
@@ -660,6 +663,27 @@ impl Templates {
             .or_else(|| self.tuning_for_model(model))
     }
 
+    /// The driver's points of template `name` (a vehicle's own), else of
+    /// the first by name of `model`'s templates that give them.
+    pub fn driver_points_for(&self, name: &str, model: u32) -> Option<crate::seats::DriverPoints> {
+        if let Some(&p) = self
+            .ids(name)
+            .iter()
+            .find_map(|id| self.driver_points.get(id))
+        {
+            return Some(p);
+        }
+        let mut ids: Vec<(String, u32)> = self
+            .names
+            .iter()
+            .filter(|(_, n)| self.get(n).is_some_and(|t| t.model == Some(model)))
+            .map(|(&id, n)| (n.to_ascii_lowercase(), id))
+            .collect();
+        ids.sort();
+        ids.iter()
+            .find_map(|(_, id)| self.driver_points.get(id).copied())
+    }
+
     /// The parts' health of template `name` (a vehicle's own), else of
     /// the first by name of `model`'s templates that give them.
     pub fn part_healths_for(
@@ -864,6 +888,7 @@ impl Templates {
             music_sources: crate::music_source::read(&db),
             grapple: crate::grapple::read(&db),
             entrance_points: crate::hijack::entrance_points(&db),
+            driver_points: crate::seats::read(&db),
             ordnance: crate::ordnance::read(&db),
             effects: crate::particles::template_effects(&db),
             crashable: crate::durability::crashable(&db),

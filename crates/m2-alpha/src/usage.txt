@@ -214,6 +214,8 @@ m2-alpha [options]
                          stands hit (unseen walls, steps in the ground)
   --wreck                with --drive: wreck the vehicle at speed at the
                          end and log how it comes to rest
+  --fuel-check           with --drive and --wreck or --shoot-up: get out,
+                         walk to the fuel can the wreck left and take it
   --fire                 with --aim or --drive: fire just before the
                          picture
   --grip attach|hands    draw weapons on the hand's attach node as posed

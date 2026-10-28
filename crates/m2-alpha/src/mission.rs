@@ -179,9 +179,13 @@ pub struct MarkerView {
     pub icon: String,
     /// RGBA.
     pub colour: [u8; 4],
-    /// Shown from `near` to `far` metres away.
+    /// Its fade, metres: opaque within `near`, gone beyond `far` (see
+    /// [`MarkerView::alpha_from`]).
     pub near: f32,
     pub far: f32,
+    /// Its fade measures the distance over the ground only (the call's
+    /// "2D only").
+    pub flat: bool,
     /// Its size as the scripts ask (the call's first size, 32 in the first
     /// contract's).
     pub size: f32,
@@ -196,9 +200,28 @@ impl MarkerView {
             .replace('_', " ")
     }
 
-    /// Whether it shows to someone at `from`: `near` to `far` metres away.
-    pub fn shown_from(&self, from: Vec3) -> bool {
-        (self.near..=self.far).contains(&self.at.distance(from))
+    /// How opaque it shows to someone at `from`, 0 to 1 (from the 360
+    /// code, the marker renderer): 1 within `near`, 0 beyond `far`, and in
+    /// between `(far² - d²) / (far² - near²)`, linear in the squared
+    /// distance `d²`. A `flat` marker leaves height out of `d`.
+    ///
+    /// The game measures from the camera (from the 360 code: the
+    /// renderer reads its view's camera-to-world translation), so `from`
+    /// is the camera's position.
+    pub fn alpha_from(&self, from: Vec3) -> f32 {
+        let mut off = self.at - from;
+        if self.flat {
+            off.y = 0.0;
+        }
+        let d2 = off.length_squared();
+        let (near2, far2) = (self.near * self.near, self.far * self.far);
+        if d2 > far2 {
+            0.0
+        } else if d2 <= near2 {
+            1.0
+        } else {
+            (far2 - d2) / (far2 - near2)
+        }
     }
 }
 
@@ -443,7 +466,8 @@ end
 local function open(method, data, callback, args)
     __m2_hud_call_count = __m2_hud_call_count + 1
     local seq = __m2_hud_call_count
-    __m2_hud_callbacks[seq] = { fCallback = callback, tCallbackData = args, dialog = true }
+    __m2_hud_callbacks[seq] = { fCallback = callback, tCallbackData = args, dialog = true,
+        method = method, data = data }
     table.insert(__m2_hud_calls, { seq = seq, group = "DialogBox", method = method,
         data = data, callback = type(callback) == "function" })
     if #__m2_hud_calls > 64 then table.remove(__m2_hud_calls, 1) end
@@ -794,6 +818,9 @@ enum State {
 /// The mission scripts and what they want shown.
 pub struct MissionLink {
     state: State,
+    /// The nodes of the models of props with hardpoints the scripts use,
+    /// by model: name hash and place in the model ([`prop_hardpoints`]).
+    prop_nodes: HashMap<u32, Vec<(u32, Vec3)>>,
     /// The contract's unmarked action targets last logged
     /// ([`contract_marks`](Self::contract_marks)).
     acts_logged: std::cell::RefCell<Vec<u32>>,
@@ -998,6 +1025,7 @@ impl MissionLink {
         };
         Self {
             state: State::Loading(rx),
+            prop_nodes: HashMap::new(),
             movies: false,
             acts_logged: Default::default(),
             end_skip: false,
@@ -1390,6 +1418,139 @@ impl MissionLink {
             )
             .eval::<bool>()
             .unwrap_or(false)
+    }
+
+    /// The dialog box the scripts have up and waiting for a pick
+    /// ([`DIALOG_BOXES`]): its call's number, its kind (`Display` for a
+    /// menu, `Scroll` for a contract's terms with Accept), its title or
+    /// text, and its options as text ids.
+    pub fn open_dialog(&self) -> Option<OpenDialog> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        let (seq, method, text, options) = m
+            .lua()
+            .load(
+                "for seq, t in pairs(__m2_hud_callbacks or {}) do \
+                   if type(t) == 'table' and t.dialog and type(t.data) == 'table' then \
+                     local o = {} \
+                     for i, v in ipairs(t.data.tOptions or {}) do o[i] = tostring(v) end \
+                     return seq, t.method or '', t.data.sTitle or t.data.sText or '', o \
+                   end \
+                 end",
+            )
+            .eval::<(
+                Option<u64>,
+                Option<String>,
+                Option<String>,
+                Option<Vec<String>>,
+            )>()
+            .ok()?;
+        Some(OpenDialog {
+            seq: seq?,
+            method: method.unwrap_or_default(),
+            text: text.unwrap_or_default(),
+            options: options.unwrap_or_default(),
+        })
+    }
+
+    /// Whether she is inside an HQ, as the scripts have it
+    /// ([`m2_game::mission::Mission::in_hq`]).
+    pub fn in_hq(&self) -> bool {
+        matches!(&self.state, State::Running(m) if m.in_hq())
+    }
+
+    /// The starters of the HQ she is in that offer a contract of
+    /// `on_offer`: the object each one's talk is on, once set
+    /// ([`m2_game::mission::Mission::own_hq_starters`]).
+    pub fn own_hq_starters(&self, on_offer: &[String]) -> Vec<Option<u32>> {
+        match &self.state {
+            State::Running(m) => m.own_hq_starters(on_offer),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The HQ's exits on offer (the context actions whose prompt is
+    /// [`EXIT_PROMPT`], added by its portals while she is inside): each
+    /// one's object, where it stands and its reach.
+    pub fn exit_offers(&self) -> Vec<crate::autoplay::ActionAt> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        mission
+            .context_actions()
+            .into_iter()
+            .filter(|(_, _, text, _)| text.eq_ignore_ascii_case(EXIT_PROMPT))
+            .filter_map(|(g, at, _, reach)| Some((g, Vec3::from(at?), reach)))
+            .collect()
+    }
+
+    /// The starters' talks on offer (the context actions whose prompt is
+    /// [`TALK_PROMPT`]): each one's object and where it stands, a person
+    /// where one is that object, else its place.
+    pub fn talk_offers(&self, game: &Game) -> Vec<crate::autoplay::ActionAt> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        mission
+            .context_actions()
+            .into_iter()
+            .filter(|(_, _, text, _)| text.eq_ignore_ascii_case(TALK_PROMPT))
+            // A starter riding a prop (the HQ's, at her desk) is where the
+            // scripts last put her until the game seats her in play
+            // (`crate::hijack`, which loads ~50 s after a save in headless
+            // runs); till then her talk is at the building's origin, over
+            // no floor (story run B3: she walked there and fell).
+            .filter(|(g, _, _, _)| {
+                let rides_prop = mission
+                    .world()
+                    .borrow()
+                    .objects
+                    .get(g)
+                    .and_then(|o| o.vehicle)
+                    .is_some_and(|v| game.scene.props.get(v).is_some());
+                let seated_in_play = game.scene.riders.iter().any(|r| r.guid == Some(*g));
+                talk_ready(rides_prop, seated_in_play)
+            })
+            .filter_map(|(g, at, _, reach)| {
+                let person = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .find(|n| n.spawn == Some(g))
+                    .map(|n| n.character.position);
+                Some((g, person.or_else(|| at.map(Vec3::from))?, reach))
+            })
+            .collect()
+    }
+
+    /// Every context action on offer, for the log: its object, its
+    /// prompt's text id and that text as shown, and where it stands (if
+    /// known).
+    pub fn context_list(&self) -> Vec<(u32, String, String, Option<Vec3>)> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        mission
+            .context_actions()
+            .into_iter()
+            .map(|(g, at, id, _)| (g, mission.text(&id), id, at.map(Vec3::from)))
+            .collect()
+    }
+
+    /// The flow's contracts on offer now (not its jobs), in the scripts'
+    /// order, while none is active: what a player off a contract goes to a
+    /// starter for.
+    pub fn contracts_on_offer(&self) -> Vec<String> {
+        match self.contracts() {
+            Some(c) if c.active.is_empty() => c
+                .offered
+                .into_iter()
+                .filter(|id| is_flow_contract(id))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// The transit map the scripts have open ([`DIALOG_BOXES`]' `Transit`
@@ -2236,6 +2397,21 @@ impl MissionLink {
             {
                 mission.put_player(at.to_array());
             }
+            // The hardpoints of the props the scripts spawn (a faction
+            // HQ's `HqInterior`, whose model holds `hp_playerA_enter`) and
+            // of those people sit on: each node of the model where the
+            // prop stands, for `Object.SetTransformToObject(.., hardpoint)`,
+            // which `MrxUtil.TeleportHeroesToHardpoints` moves her into an
+            // HQ with.
+            let told = {
+                let w = mission.world().borrow();
+                prop_hardpoints(game, &mut self.prop_nodes, |g| w.objects.contains_key(&g))
+            };
+            for (g, at) in told {
+                for (name, place) in at {
+                    mission.set_hardpoint(g, name, place);
+                }
+            }
             // The scripts' vehicles' load beds, where they count the goods
             // on them (`Object.GetHardpointPosition(truck, "HP_Truckbed")`).
             if let Some(world) = game.scene.world.as_ref() {
@@ -2789,14 +2965,14 @@ impl MissionLink {
 
     /// The context actions on offer: on what, and where it stands (a
     /// person where they are in play, else where the scripts have them).
-    pub fn offers(&self, game: &Game) -> Vec<(u32, Vec3)> {
+    pub fn offers(&self, game: &Game) -> Vec<crate::autoplay::ActionAt> {
         let State::Running(mission) = &self.state else {
             return Vec::new();
         };
         mission
             .context_actions()
             .into_iter()
-            .filter_map(|(g, at, _, _)| {
+            .filter_map(|(g, at, _, reach)| {
                 let person = game
                     .scene
                     .people
@@ -2804,7 +2980,7 @@ impl MissionLink {
                     .iter()
                     .find(|n| n.spawn == Some(g))
                     .map(|n| n.character.position);
-                Some((g, person.or_else(|| at.map(Vec3::from))?))
+                Some((g, person.or_else(|| at.map(Vec3::from))?, reach))
             })
             .collect()
     }
@@ -3593,6 +3769,7 @@ impl MissionLink {
                     colour: m.colour,
                     near: m.near,
                     far: m.far,
+                    flat: m.flat,
                     size: m.sizes[0],
                 })
             })
@@ -4405,7 +4582,7 @@ fn follow_markers(
         }
         if logged.insert(handle) {
             eprintln!(
-                "mission: marker {} on {:?} ({g:#x}) for {}: colour {:?}, {} m up, shown {}..{} m, sizes {:?}, 2D only {}{}",
+                "mission: marker {} on {:?} ({g:#x}) for {}: colour {:?}, {} m up, fades {}..{} m, sizes {:?}, 2D only {}{}",
                 m.icon,
                 w.objects.get(&g).map_or("?", |o| o.name.as_str()),
                 m.mission,
@@ -5721,6 +5898,12 @@ pub(crate) enum Offer {
 /// is "Equip Assault Rifle" (3:14, 14:20, 15:24); one she carries, and an
 /// ammunition box without health (`Ammo Pickup (Bullet)`, the rockets),
 /// "Take Ammo" (9:00, 9:42, 15:38, 16:36).
+///
+/// The 360 code differs: there every pickup without a `Weapon` record
+/// (`Type` 2) is taken walking over it, ammunition boxes too, and only a
+/// weapon lying there is a context action (8228F5E8, 8228F450, 82432F68).
+/// That looks like a platform difference; the PC footage's use key is kept
+/// until PC evidence says otherwise (Brendan, 2026-10-27).
 pub(crate) fn offer(templates: &Templates, combat: &combat::Combat, what: &Leaves) -> Offer {
     // Money is walked over, whatever she carries (inferred: its record
     // names nothing to choose, and no prompt for it was seen).
@@ -5964,9 +6147,307 @@ pub(crate) fn vehicle_models(name: &str, catalogue: &[CatalogueEntry]) -> Vec<Ca
     out
 }
 
+/// A starter's talk, as the scripts' HQs offer it (`[ContextAction.Talk]`,
+/// `WifPmcInterior._EnableStarter`; from the scripts).
+pub const TALK_PROMPT: &str = "[ContextAction.Talk]";
+
+/// An HQ portal's way out (`WifPmcInterior`'s `_AddPortal` with `bIsAnExit`,
+/// from the scripts).
+pub const EXIT_PROMPT: &str = "[ContextAction.Exit]";
+
+/// A dialog box the scripts have up ([`MissionLink::open_dialog`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenDialog {
+    pub seq: u64,
+    pub method: String,
+    pub text: String,
+    pub options: Vec<String>,
+}
+
+/// Whether a starter's talk can be gone to: one riding a prop only once
+/// the game has seated her in play ([`MissionLink::talk_offers`]).
+pub fn talk_ready(rides_prop: bool, seated_in_play: bool) -> bool {
+    !rides_prop || seated_in_play
+}
+
+/// Whether `id` names one of the flow's contracts (`OilCon020`), not a
+/// job (`PmcJob001`).
+pub fn is_flow_contract(id: &str) -> bool {
+    m2_game::script::is_contract_module(id) && id.get(3..6) == Some("Con")
+}
+
+/// What a player taking a contract picks in a starter's box: in her menu
+/// (`Display`), the first option naming the title of a contract on
+/// `offered` (the HQ's reads `[yellow][shop.new] [white]"[OilCon020.Title]"`);
+/// in a contract's terms (`Scroll`, naming `[OilCon020.Terms.Summary]`)
+/// for one on offer, `[Generic.Accept]` (the first, when the box gives no
+/// options). Contracts are found by their localization tokens inside the
+/// shown text, whatever colour tags and quotes surround them. Options count from 1, as the scripts'
+/// callbacks get them. None: the box isn't one for taking a contract on
+/// offer.
+pub fn contract_pick(dialog: &OpenDialog, offered: &[String]) -> Option<(i64, String)> {
+    let number = |i: usize| i64::try_from(i + 1).ok();
+    let names = |text: &str, tail: &str| {
+        offered
+            .iter()
+            .find(|c| text.contains(&format!("[{c}{tail}")))
+            .cloned()
+    };
+    match dialog.method.as_str() {
+        "Display" => dialog
+            .options
+            .iter()
+            .enumerate()
+            .find_map(|(i, o)| Some((number(i)?, names(o, ".Title]")?))),
+        // The terms box names the contract by its terms' token; with no
+        // options of its own it is the game's Accept and Decline, Accept
+        // first (a cancel picks 2: see [`DIALOG_BOXES`]).
+        "Scroll" => {
+            let id = names(&dialog.text, ".Terms")?;
+            let n = match dialog
+                .options
+                .iter()
+                .position(|o| o.contains("[Generic.Accept]"))
+            {
+                Some(i) => number(i)?,
+                None if dialog.options.is_empty() => 1,
+                None => return None,
+            };
+            Some((n, id))
+        }
+        _ => None,
+    }
+}
+
+/// A prop's hardpoints where it stands: name hash, place.
+type Hardpoints = Vec<(u32, [f32; 3])>;
+
+/// The props whose hardpoints the scripts are told: every prop they
+/// spawned (`Pg.Spawn`: a faction HQ's interior, which `MrxUtil.SpawnActor`
+/// makes from the HQ's template when no `HqInterior` exists), those
+/// `scripts_have` among the spawns' guids (not the destructibles the game
+/// adopts above them), and those people sit on (the PMC's interior, its
+/// starter aboard). In guid order.
+fn hardpoint_props(
+    crewed: impl Iterator<Item = u32>,
+    shown: impl Iterator<Item = u32>,
+    scripts_have: impl Fn(u32) -> bool,
+) -> Vec<u32> {
+    let mut out: Vec<u32> = crewed
+        .chain(shown.filter(|&g| g >= m2_game::api::FIRST_SPAWNED && scripts_have(g)))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Each prop of [`hardpoint_props`] that is shown, and its model's nodes
+/// where it stands (name hash, place); each model's nodes are read once
+/// (`nodes`, by model).
+fn prop_hardpoints(
+    game: &mut Game,
+    nodes: &mut HashMap<u32, Vec<(u32, Vec3)>>,
+    scripts_have: impl Fn(u32) -> bool,
+) -> Vec<(u32, Hardpoints)> {
+    let scene = &game.scene;
+    let props: Vec<(u32, u32, m2_math::glam::Mat4)> = hardpoint_props(
+        scene.prop_crews.iter().map(|(g, _)| *g),
+        scene.props.shown().map(|(g, _)| g),
+        scripts_have,
+    )
+    .into_iter()
+    .filter_map(|g| {
+        let (p, _) = scene.props.get(g)?;
+        Some((
+            g,
+            p.model,
+            m2_math::glam::Mat4::from_rotation_translation(p.rotation, p.position),
+        ))
+    })
+    .collect();
+    props
+        .into_iter()
+        .map(|(g, model, at)| {
+            let known = nodes.entry(model).or_insert_with(|| {
+                let found = game
+                    .scene
+                    .source
+                    .as_mut()
+                    .map(|s| crate::hijack::nodes(s, model))
+                    .unwrap_or_default();
+                let enter = found
+                    .iter()
+                    .any(|(n, _)| *n == name_hash("hp_playerA_enter"));
+                eprintln!(
+                    "hardpoints: prop {g:#x} model {model:08x}: {} nodes, hp_playerA_enter {}",
+                    found.len(),
+                    if enter { "found" } else { "not found" }
+                );
+                found
+            });
+            (g, hardpoints_at(known, at))
+        })
+        .collect()
+}
+
+/// Where a model's `nodes` (name hash, place in the model) stand with the
+/// model placed at `at`.
+fn hardpoints_at(nodes: &[(u32, Vec3)], at: m2_math::glam::Mat4) -> Hardpoints {
+    nodes
+        .iter()
+        .map(|&(name, local)| (name, at.transform_point3(local).to_array()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    // The props the scripts spawn have their hardpoints told, as do
+    // those people sit on (a faction HQ's spawned interior and the PMC's
+    // crewed one), each once; a layer's other props don't.
+    #[test]
+    fn spawned_and_crewed_props_have_their_hardpoints_told() {
+        let spawned = m2_game::api::FIRST_SPAWNED + 7;
+        // The game's own above the spawns' guids (destructibles it adopts)
+        // aren't the scripts'.
+        let adopted = 0xa000_e67f;
+        let props = hardpoint_props(
+            [0xc73ad, 0xc73ad].into_iter(),
+            [0x1234, spawned, adopted, 0xc73ad].into_iter(),
+            |g| g != adopted,
+        );
+        assert_eq!(props, [0xc73ad, spawned]);
+    }
+
+    // A prop's hardpoints are its model's nodes where the prop stands:
+    // turned and moved with it (a faction HQ's interior at its anchor).
+    #[test]
+    fn a_props_hardpoints_turn_and_move_with_it() {
+        use m2_math::glam::{Mat4, Quat};
+        let enter = name_hash("hp_playerA_enter");
+        let nodes = [(enter, Vec3::new(40.0, 0.0, -8.0))];
+        let at = Mat4::from_rotation_translation(
+            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            Vec3::new(3750.0, 450.0, -3840.0),
+        );
+        let placed = hardpoints_at(&nodes, at);
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].0, enter);
+        let p = Vec3::from(placed[0].1);
+        assert!(p.distance(Vec3::new(3742.0, 450.0, -3880.0)) < 1e-3, "{p}");
+    }
+
     use std::collections::HashMap;
+
+    // A starter's menu: the first contract on offer among its options is
+    // picked (counting from 1); a job or a contract not on offer isn't.
+    // Its terms: Accept, for a contract on offer only. Other boxes: none.
+    #[test]
+    fn a_contract_on_offer_is_picked_then_accepted() {
+        let offered = ["OilCon020".to_owned(), "PmcCon031".to_owned()];
+        let box_of = |method: &str, text: &str, options: &[&str]| OpenDialog {
+            seq: 4,
+            method: method.into(),
+            text: text.into(),
+            options: options.iter().map(|o| (*o).to_owned()).collect(),
+        };
+        let menu = box_of(
+            "Display",
+            "[Briefing.RootMenuDialog]",
+            // As the PMC HQ's menu offered them in the story run (B3).
+            &[
+                "[PmcJob001.Title]",
+                "[GurCon002.Title]",
+                "[yellow][shop.new] [white]\"[OilCon020.Title]\"",
+                "[yellow][shop.new] [white]\"[PmcCon031.Title]\" ([Generic.Level] 1)",
+                "[Briefing.Hint]",
+                "[Generic.Exit]",
+            ],
+        );
+        assert_eq!(
+            contract_pick(&menu, &offered),
+            Some((3, "OilCon020".into()))
+        );
+        let terms = box_of(
+            "Scroll",
+            "[OilCon020.Terms.Summary]",
+            &["[Generic.Accept]", "[Generic.Decline]"],
+        );
+        assert_eq!(
+            contract_pick(&terms, &offered),
+            Some((1, "OilCon020".into()))
+        );
+        // The terms box as the PMC HQ put it up in the story run (B3): no
+        // options of its own, so Accept is the first.
+        let real_terms = box_of(
+            "Scroll",
+            "\"[OilCon020.Title]\"\n\n[Briefing.Faction]: [flagpmc] [Generic.Factions.Pmc.Short]\n\n\
+             [OilCon020.Terms.Summary]\n\n[Generic.Rewards]:\n[OilCon020.Objectives.CustomReward]\n",
+            &[],
+        );
+        assert_eq!(
+            contract_pick(&real_terms, &offered),
+            Some((1, "OilCon020".into()))
+        );
+        let other = box_of("Scroll", "[GurCon002.Terms.Summary]", &["[Generic.Accept]"]);
+        assert_eq!(contract_pick(&other, &offered), None);
+        let exit_only = box_of("Display", "[Briefing.RootMenuDialog]", &["[Generic.Exit]"]);
+        assert_eq!(contract_pick(&exit_only, &offered), None);
+        assert_eq!(contract_pick(&menu, &[]), None);
+    }
+
+    // The box's call keeps what it shows: its kind, title and options,
+    // which autoplay reads to pick a contract on offer.
+    #[test]
+    fn an_open_box_keeps_its_kind_title_and_options() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            Hud = {}
+            MrxGuiDialogBox = { DisplayDialogBox = function() end,
+                DisplayScrollingDialogBox = function() end, Close = function() end }
+            MrxGui = { DisplayDialogBox = MrxGuiDialogBox.DisplayDialogBox }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(DIALOG_BOXES).exec().unwrap();
+        lua.load(
+            r#"MrxGui.DisplayDialogBox(1, "[Briefing.RootMenuDialog]",
+                { "[OilCon020.Title]", "[Generic.Exit]" }, 1, function() end, {})"#,
+        )
+        .exec()
+        .unwrap();
+        let (method, title, first): (String, String, String) = lua
+            .load(
+                "for _, t in pairs(__m2_hud_callbacks) do \
+                   if type(t) == 'table' and t.dialog then \
+                     return t.method, t.data.sTitle, t.data.tOptions[1] end end",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(
+            (method.as_str(), title.as_str(), first.as_str()),
+            ("Display", "[Briefing.RootMenuDialog]", "[OilCon020.Title]")
+        );
+    }
+
+    // A starter on a prop is gone to only once she is seated in play;
+    // one on foot at once.
+    #[test]
+    fn a_seated_starter_is_gone_to_once_seated_in_play() {
+        assert!(talk_ready(false, false));
+        assert!(!talk_ready(true, false));
+        assert!(talk_ready(true, true));
+    }
+
+    // The flow's contracts are told from its jobs by their ids.
+    #[test]
+    fn flow_contracts_are_told_from_jobs() {
+        assert!(is_flow_contract("OilCon020"));
+        assert!(!is_flow_contract("PmcJob001"));
+        assert!(!is_flow_contract("OilCon20"));
+    }
 
     // The contract's active deliveries are read from their tasks' configs,
     // found below the current mission (OilCon020's gun drop: a place and
@@ -6735,20 +7216,58 @@ mod tests {
     }
 
     #[test]
-    fn markers_show_from_near_to_far() {
-        // The first contract's: 2 m over its target, from 5 m to 175 m.
-        let m = MarkerView {
+    fn markers_fade_from_near_to_far() {
+        // The first contract's: 2 m over its target, fading 5 m to 175 m.
+        let mut m = MarkerView {
             at: Vec3::new(0.0, 2.0, 0.0),
             icon: "HUD_objective_deliverable".into(),
             colour: [255, 200, 0, 255],
             near: 5.0,
             far: 175.0,
+            flat: false,
             size: 32.0,
         };
         assert_eq!(m.label(), "deliverable");
-        assert!(!m.shown_from(Vec3::new(3.0, 0.0, 0.0)));
-        assert!(m.shown_from(Vec3::new(0.0, 0.0, 20.0)));
-        assert!(m.shown_from(Vec3::new(0.0, 2.0, 175.0)));
-        assert!(!m.shown_from(Vec3::new(0.0, 0.0, 200.0)));
+        // Close by it shows in full: the beta hid it within `near`.
+        assert_eq!(m.alpha_from(Vec3::new(3.0, 2.0, 0.0)), 1.0);
+        assert_eq!(m.alpha_from(Vec3::new(0.0, 2.0, 0.0)), 1.0);
+        assert_eq!(m.alpha_from(Vec3::new(0.0, 2.0, 5.0)), 1.0);
+        // Between, linear in the squared distance: at 100 m,
+        // (175² - 100²) / (175² - 5²).
+        let mid = m.alpha_from(Vec3::new(0.0, 2.0, 100.0));
+        assert!((mid - 20_625.0 / 30_600.0).abs() < 1e-6, "{mid}");
+        // Not linear in the distance itself (that would be 75/170).
+        assert!((mid - 75.0 / 170.0).abs() > 0.1);
+        // It thins further out, and is gone beyond `far`.
+        assert!(m.alpha_from(Vec3::new(0.0, 2.0, 150.0)) < mid);
+        assert_eq!(m.alpha_from(Vec3::new(0.0, 2.0, 175.0)), 0.0);
+        assert_eq!(m.alpha_from(Vec3::new(0.0, 2.0, 175.5)), 0.0);
+        assert_eq!(m.alpha_from(Vec3::new(0.0, 0.0, 200.0)), 0.0);
+        // Height counts, unless it is "2D only".
+        let above = Vec3::new(0.0, 202.0, 3.0);
+        assert_eq!(m.alpha_from(above), 0.0);
+        m.flat = true;
+        assert_eq!(m.alpha_from(above), 1.0);
+    }
+
+    #[test]
+    fn markers_without_a_fade_show_to_200_m_and_fade_out_by_300() {
+        let m = MarkerView {
+            at: Vec3::ZERO,
+            icon: "HUD_objective_destroy".into(),
+            colour: [255, 0, 0, 255],
+            near: m2_game::hud::MARKER_NEAR,
+            far: m2_game::hud::MARKER_FAR,
+            flat: false,
+            size: 32.0,
+        };
+        // 5 m off: shown (the beta's 5 m default hid it there).
+        assert_eq!(m.alpha_from(Vec3::new(3.0, 0.0, 0.0)), 1.0);
+        assert_eq!(m.alpha_from(Vec3::new(200.0, 0.0, 0.0)), 1.0);
+        let a = m.alpha_from(Vec3::new(250.0, 0.0, 0.0));
+        assert!((a - 27_500.0 / 50_000.0).abs() < 1e-6, "{a}");
+        // Shown at 200 to 300 m, where the beta's 175 m hid it.
+        assert!(m.alpha_from(Vec3::new(290.0, 0.0, 0.0)) > 0.0);
+        assert_eq!(m.alpha_from(Vec3::new(301.0, 0.0, 0.0)), 0.0);
     }
 }
