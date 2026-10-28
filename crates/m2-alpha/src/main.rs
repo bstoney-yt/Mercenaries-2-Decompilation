@@ -3714,6 +3714,7 @@ fn mission_for_screenshot(
     let mut box_up = 0.0f32;
     let mut accepting: Option<String> = None;
     let mut offered_actions: Vec<u32> = Vec::new();
+    let mut delivery_key: Vec<(u32, usize, usize)> = Vec::new();
     let mut contract_done: Option<u32> = None;
     // With --contracts N, she plays on through the later contracts: the
     // tick the Nth was done, and how many have been.
@@ -3859,6 +3860,19 @@ fn mission_for_screenshot(
                 a.talks = talks;
                 a.own_starters = own;
                 a.on_offer.clone_from(&on_offer);
+                let deliveries = link.deliveries();
+                // Each delivery read, as it comes or changes.
+                let key: Vec<(u32, usize, usize)> = deliveries
+                    .iter()
+                    .map(|d| (d.dest, d.quota, d.targets.len()))
+                    .collect();
+                if key != delivery_key {
+                    for d in &deliveries {
+                        eprintln!("delivery: read {}", d.config());
+                    }
+                    delivery_key = key;
+                }
+                a.deliveries = deliveries;
                 let keep = link.kept_within();
                 if keep.len() != a.keep.len() {
                     eprintln!(
