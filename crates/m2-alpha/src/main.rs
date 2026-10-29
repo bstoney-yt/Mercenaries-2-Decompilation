@@ -933,6 +933,34 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
     Ok(o)
 }
 
+/// The options only the offscreen run (`--screenshot`) reads: the window
+/// has no autoplay, mission clock or scripted hijack.
+const SCREENSHOT_ONLY: &[&str] = &[
+    "--autoplay",
+    "--mission-seconds",
+    "--contracts",
+    "--after-contract",
+    "--hijack",
+    "--movies",
+];
+
+/// Those of [`SCREENSHOT_ONLY`] given without `--screenshot`, in the order
+/// given, each once.
+fn screenshot_only_ignored(given: &[String]) -> Vec<&'static str> {
+    if given.iter().any(|a| a == "--screenshot") {
+        return Vec::new();
+    }
+    let mut ignored = Vec::new();
+    for a in given {
+        if let Some(&flag) = SCREENSHOT_ONLY.iter().find(|f| **f == a.as_str())
+            && !ignored.contains(&flag)
+        {
+            ignored.push(flag);
+        }
+    }
+    ignored
+}
+
 /// Panics are also written to `m2-alpha-crash.log` (beside the settings
 /// file or the exe), with a backtrace, since a windowed game has no console
 /// to read.
@@ -989,6 +1017,13 @@ fn run(
     event_loop: impl FnOnce() -> Result<EventLoop<()>, winit::error::EventLoopError>,
 ) -> anyhow::Result<()> {
     let mut options = parse_args(args)?;
+    let ignored = screenshot_only_ignored(args);
+    if !ignored.is_empty() {
+        eprintln!(
+            "warning: {} only work with --screenshot (offscreen); ignored in the window",
+            ignored.join(" ")
+        );
+    }
     combat::use_attach_frame(!options.hands_grip);
     let config_path = options
         .config_path
@@ -8949,6 +8984,36 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshot_only_options_are_named_when_windowed() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let windowed = args(&[
+            "--mission",
+            "--movies",
+            "--autoplay",
+            "--contracts",
+            "1",
+            "--mission-seconds",
+            "300",
+            "--autoplay",
+            "--hijack",
+        ]);
+        assert_eq!(
+            screenshot_only_ignored(&windowed),
+            [
+                "--movies",
+                "--autoplay",
+                "--contracts",
+                "--mission-seconds",
+                "--hijack"
+            ]
+        );
+        let mut offscreen = windowed.clone();
+        offscreen.extend(args(&["--screenshot", "out.ppm"]));
+        assert!(screenshot_only_ignored(&offscreen).is_empty());
+        assert!(screenshot_only_ignored(&args(&["--mission", "--hijack-crew", "x"])).is_empty());
+    }
 
     #[test]
     fn starting_again_from_a_save_keeps_the_launch_but_its_load() {

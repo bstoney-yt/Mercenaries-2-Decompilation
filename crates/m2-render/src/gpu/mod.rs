@@ -2624,14 +2624,14 @@ impl WgpuBackend {
                 let frame = match surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(f)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-                    wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                        // Reconfigure and skip this frame.
-                        surface.configure(&self.device, config);
-                        return Ok(());
-                    }
-                    wgpu::CurrentSurfaceTexture::Timeout
-                    | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
-                    other => return Err(BackendError::Device(format!("{other:?}"))),
+                    other => match on_missed_frame(&other) {
+                        Missed::Reconfigure => {
+                            surface.configure(&self.device, config);
+                            return Ok(());
+                        }
+                        Missed::Skip => return Ok(()),
+                        Missed::Fail => return Err(BackendError::Device(format!("{other:?}"))),
+                    },
                 };
                 let target = frame.texture.create_view(&Default::default());
                 let commands = self.encode(&view, &draws, &target)?;
@@ -2642,6 +2642,34 @@ impl WgpuBackend {
             }
         }
         Ok(())
+    }
+}
+
+/// What a frame does when the window gives it no picture to draw to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Missed {
+    /// Configure the surface again and skip the frame.
+    Reconfigure,
+    /// Skip the frame and try the next.
+    Skip,
+    /// Stop with an error.
+    Fail,
+}
+
+/// [`Missed`] for a picture the surface didn't give. A disconnected
+/// remote session (the display swapped for a 640x480 stand-in) makes the
+/// acquire fail as `Validation`; that is treated like a lost surface, so a
+/// long unattended run carries on and draws again once the display is
+/// back, rather than ending the game.
+fn on_missed_frame(status: &wgpu::CurrentSurfaceTexture) -> Missed {
+    match status {
+        wgpu::CurrentSurfaceTexture::Outdated
+        | wgpu::CurrentSurfaceTexture::Lost
+        | wgpu::CurrentSurfaceTexture::Validation => Missed::Reconfigure,
+        wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+            Missed::Skip
+        }
+        _ => Missed::Fail,
     }
 }
 
@@ -2679,4 +2707,19 @@ fn skipped(blend: BlendKind) -> bool {
 /// The number an environment switch holds, if set.
 fn env_f32(name: &str) -> Option<f32> {
     std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
+}
+
+#[cfg(test)]
+mod missed_frame_tests {
+    use super::*;
+
+    #[test]
+    fn a_frame_the_window_did_not_give_is_retried_not_fatal() {
+        use wgpu::CurrentSurfaceTexture as S;
+        assert_eq!(on_missed_frame(&S::Validation), Missed::Reconfigure);
+        assert_eq!(on_missed_frame(&S::Lost), Missed::Reconfigure);
+        assert_eq!(on_missed_frame(&S::Outdated), Missed::Reconfigure);
+        assert_eq!(on_missed_frame(&S::Timeout), Missed::Skip);
+        assert_eq!(on_missed_frame(&S::Occluded), Missed::Skip);
+    }
 }
