@@ -331,6 +331,10 @@ impl Rifle {
         self.ammo.and_then(|a| a.burst())
     }
 }
+/// [`Combat::seat`] of a rider who fires none of the vehicle's weapons (a
+/// passenger, or a gunner whose seat has none).
+pub const NO_GUN: usize = usize::MAX;
+
 /// The seats of vehicle `v` whose riders fire something, the driver's
 /// first.
 pub fn armed_seats(v: &ParkedVehicle) -> Vec<u32> {
@@ -526,6 +530,41 @@ const BOMB_FINAL: (f32, f32) = (2.0, 500.0);
 const RIFLE_ON_VEHICLE: (f32, Round) = (9.0, Round::Bullet);
 const MG_ON_VEHICLE: (f32, Round) = (15.0, Round::BulletLarge);
 
+/// What a soldier's round does to a vehicle: their gun's bullet template's
+/// own `Damage` and `DamageKey` (a `BulletLarge` is one, any other a
+/// `Bullet`); without a gun read, [`RIFLE_ON_VEHICLE`].
+fn npc_round_on_vehicle(gun: Option<m2_engine::tuning::HandGun>) -> (f32, Round) {
+    let Some(g) = gun else {
+        return RIFLE_ON_VEHICLE;
+    };
+    let round = if g.damage_key == Some(m2_assets::name_hash("BulletLarge")) {
+        Round::BulletLarge
+    } else {
+        Round::Bullet
+    };
+    (g.damage, round)
+}
+
+/// What vehicle `v` takes of a blast of `DamageKey` `key`: the damage
+/// table's cell for its `ModifierKey` row and that key. From the 360 code
+/// (0x82291640: the blast's damage at its distance times the cell).
+/// Inferred: a blast of no key, or a vehicle or cell the table lacks,
+/// takes all of it.
+fn blast_cell(table: Option<&DamageTable>, v: &ParkedVehicle, key: Option<u32>) -> f32 {
+    match (table, v.spec.tuning.key, key) {
+        (Some(t), Some(row), Some(k)) => t.scale(row, k).unwrap_or(1.0),
+        _ => 1.0,
+    }
+}
+
+/// How hard a blast throws vehicle `v`, of its usual: its
+/// `ExplosionFudge`. From the 360 code (0x8215CA38: the blast's impulse
+/// is its strength times the fudge times its falloff), where the fudge
+/// scales the push, not the damage.
+fn fudge(v: &ParkedVehicle) -> f32 {
+    v.spec.tuning.blast_scale.unwrap_or(1.0)
+}
+
 /// A round's `DamageKey`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Round {
@@ -534,16 +573,11 @@ enum Round {
 }
 /// A blast's damage to vehicles (the "Explosion (Tank Shell)" and RPG's:
 /// 200 at its heart down to 50 at 5 m, nothing beyond), times the
-/// vehicle's `ExplosionFudge` (the AMX-30 takes a fifth).
+/// damage table's cell for the vehicle's row and `Explosion`.
 const BLAST_ON_VEHICLE: (f32, f32, f32) = (200.0, 50.0, 5.0);
 /// Below its `TickDamage` health a vehicle burns down this fast, health a
 /// second (the template's 1 every 0.5 s, read as seconds).
 const BURN_DOWN: f32 = 2.0;
-
-/// Vehicles closing slower than this, m/s, meet without a crash (a nudge
-/// while parking). Invented: the props' least ram speed is 1 m/s; 2 keeps
-/// traffic queueing bumper to bumper out of it.
-const CRASH_SPEED: f32 = 2.0;
 
 /// How often the effects vehicles' parts keep going are kept up, seconds
 /// (well inside a held effect's life).
@@ -1480,6 +1514,9 @@ pub struct Combat {
     /// Every gun's shots' sound set and muzzle flash, by template (for
     /// the guns people carry, [`arm`](Self::arm)).
     feels: std::collections::HashMap<u32, Feel>,
+    /// Every gun's round's blast and `DamageKey`, by template (a tank
+    /// gun's shell, [`arm`](Self::arm)).
+    shells: std::collections::HashMap<u32, (Option<Blast>, Option<u32>)>,
     /// Sounds made since the last call to [`take_sounds`](Self::take_sounds).
     sounds: Vec<Sound>,
     /// Wrecks smoke: (vehicle index, seconds to the next puff).
@@ -1640,6 +1677,12 @@ pub struct Manned {
 /// An emplaced gun's barrel above its place, metres (invented: the
 /// tripod's gun sits about a crouching soldier's shoulder high).
 pub const MANNED_PIVOT: f32 = 1.1;
+/// Where an emplaced gun's rounds start, metres along its aim from the
+/// pivot: clear of its own emplacement (sandbags, shield, the platform it
+/// stands on, a gun beside it). Invented: PmcCon031's grenade launcher
+/// burst its rounds on its sandbags 0.9 m out and brought its platform
+/// down; its MG beside another put 300 rounds into that one.
+pub const MANNED_MUZZLE: f32 = 2.4;
 
 impl Manned {
     /// `dir` held within its turn and tilt.
@@ -1743,6 +1786,7 @@ impl Default for Combat {
             effects: Vec::new(),
             game_fx: Vec::new(),
             feels: std::collections::HashMap::new(),
+            shells: std::collections::HashMap::new(),
             sounds: Vec::new(),
             wrecks: Vec::new(),
             part_fx_next: 0.0,
@@ -1949,6 +1993,11 @@ impl Combat {
     pub fn arm(&mut self, arms: &m2_engine::weapons::Arms, table: Option<DamageTable>) {
         self.damage_table = table;
         self.feels = arms.weapons.iter().map(|(&id, w)| (id, w.feel)).collect();
+        self.shells = arms
+            .weapons
+            .iter()
+            .map(|(&id, w)| (id, (w.ammo.burst(), w.ammo.key)))
+            .collect();
         if let Some(c) = arms.named("Carbine") {
             self.carbine = Rifle::from_spec(c);
             if !self.own_rifle {
@@ -2618,7 +2667,10 @@ impl Combat {
             }
         }
         match f.player.driving {
-            Some(i) if trigger.seat => {
+            // Of a vehicle without seat data (the game moves her over its
+            // seats' links otherwise, `crate::ride::transfer`): the next
+            // armed seat (Invented).
+            Some(i) if trigger.seat && self.seat != NO_GUN => {
                 let seats = f.vehicles.get(i).map_or(1, |v| armed_seats(v).len());
                 self.seat = (self.seat + 1) % seats.max(1);
             }
@@ -2634,7 +2686,10 @@ impl Combat {
         // Fire fires the gun chosen with the switch: the main gun, or the
         // machine gun (as Aim does too).
         let mg = self.vehicle_gun == 1;
+        // A passenger, or a gunner whose seat has no weapon, fires nothing.
+        let armed = self.seat != NO_GUN;
         if let Some(i) = f.player.driving
+            && armed
             && self.down <= 0.0
             && trigger.fire
             && (if mg { self.mg_reload } else { self.reload }) <= 0.0
@@ -2643,6 +2698,7 @@ impl Combat {
             self.vehicle_fire(f, i, mg);
         }
         if let Some(i) = f.player.driving
+            && armed
             && self.down <= 0.0
             && trigger.aim
             && self.mg_reload <= 0.0
@@ -2652,6 +2708,7 @@ impl Combat {
         }
         // A bomb bay's bomb on the throw key (her explosive's), one a gap.
         if let Some(i) = f.player.driving
+            && armed
             && self.down <= 0.0
             && trigger.throw
             && self.bomb_reload <= 0.0
@@ -2801,9 +2858,10 @@ impl Combat {
             return;
         }
         m.rounds -= 1;
+        let (gun, left) = (m.entity, m.rounds);
         let (_, dir) = Self::aim_ray(f.player);
         let aim = m.clamp(dir);
-        let from = m.pivot + aim * 0.9;
+        let from = m.pivot + aim * MANNED_MUZZLE;
         let w = &m.weapon;
         self.reload = w.gap();
         let feel = w.feel;
@@ -2869,6 +2927,16 @@ impl Combat {
             self.round_on_vehicle(f, (from, aim, t), (damage, round), None);
             self.hit_explosives_in(f.explosives, from + aim * t, on_props);
             let key = self.strike_world(f.physics, from, aim, t);
+            // What its rounds strike, now and then (PmcCon031: a gun
+            // whose 300 rounds brought down no column).
+            if left % 25 == 0 {
+                eprintln!(
+                    "manned: {:#x}'s round from {from:.1} strikes {:?} {t:.1} m on at {:.1}",
+                    gun,
+                    key,
+                    from + aim * t
+                );
+            }
             self.struck.push(Strike {
                 at: from + aim * t,
                 damage: on_props,
@@ -3030,11 +3098,18 @@ impl Combat {
         let gravity = m2_engine::physics::GRAVITY;
         let velocity =
             lob_velocity(from, at, THROW, gravity).unwrap_or_else(|| farthest(at - from, THROW));
+        // The grenade template's blast (inferred: the same `Grenade` as
+        // hers); without one read, the alpha's own blast.
+        let blast = self
+            .throwables
+            .first()
+            .and_then(Option::as_ref)
+            .and_then(|t| t.ammo.burst());
         self.projectiles.push(Projectile::Grenade {
             at: from,
             velocity,
             fuse: FUSE,
-            blast: None,
+            blast,
         });
     }
 
@@ -3111,7 +3186,7 @@ impl Combat {
                 self.tally.rounds_on_her += u32::from(lost > 0.0);
             }
             if let Some((t, None)) = hit {
-                self.round_on_vehicle(f, (from, dir, t), RIFLE_ON_VEHICLE, None);
+                self.round_on_vehicle(f, (from, dir, t), npc_round_on_vehicle(gun), None);
             }
         }
     }
@@ -3685,15 +3760,20 @@ impl Combat {
             self.reload = gun.map_or(CANNON_RELOAD, |g| 60.0 / g.rate_of_fire.max(1.0));
             let speed = gun.map_or(SHELL_SPEED, |g| g.velocity.max(1.0));
             let burn = gun.and_then(|g| g.flash).unwrap_or(CANNON_FLASH_TIME);
+            // Its gun template's round's blast and kind (a tank shell's
+            // explosion); without one, the alpha's own blast.
+            let (blast, key) = gun
+                .and_then(|g| self.shells.get(&g.weapon).copied())
+                .unwrap_or((None, None));
             self.projectiles.push(Projectile::Rocket {
                 at: from,
                 velocity: aim * speed,
                 flown: 0.0,
                 shell: true,
                 owner: Some(id),
-                blast: None,
+                blast,
                 homing: None,
-                key: None,
+                key,
             });
             if let Some(v) = f.vehicles.get_mut(i) {
                 v.fired += 1;
@@ -3824,17 +3904,20 @@ impl Combat {
     }
 
     /// Vehicles running into each other, body to body: as a pair meets,
-    /// each takes the other's ram ([`m2_engine::durability::ram`] of the
-    /// other's mass at the speed they closed at, before the step that
-    /// met) times the damage table's cell for its own `ModifierKey` row
-    /// and the rams' kind (`Car`, every vehicle's `DamageKey`): a `Car`
-    /// takes twice it, a `Tank` none. The part where they met takes the
-    /// unscaled ram, as a round's part takes the round's
-    /// ([`ParkedVehicle::hit_parts`]). Returns the crashes, for the log:
-    /// (struck vehicle, the other, closing speed, damage it took).
-    /// The table's cells are the data's; the ram's size is invented
-    /// (shared with the run-overs and the props'), and so is the
-    /// [`CRASH_SPEED`] threshold.
+    /// the crash's size is [`m2_engine::durability::crash_size`] of both
+    /// masses at the speed they closed at along the contact normal
+    /// (before the step that met), and each takes
+    /// [`m2_engine::durability::crash_damage`] of it with the damage
+    /// table's cell for its own `ModifierKey` row and the other's kind
+    /// (`Car`, every vehicle's `DamageKey`): a `Car` takes twice the
+    /// hundredth, a `Tank` none, and nothing under size 5 or past no more
+    /// than 1. The part where they met takes the same. Returns the
+    /// crashes, for the log: (struck vehicle, the other, closing speed,
+    /// damage it took). From the 360 code: the size, floor, hundredth and
+    /// cells (0x82162BB8, 0x82163758, 0x8228B5F0, 0x82287CF8). Inferred:
+    /// one crash per meeting (the 360 sends one for each new contact),
+    /// and the `DamageModifier` multiplier (a body landing on another
+    /// from above) is left out.
     pub fn vehicle_crashes(
         &mut self,
         physics: &mut Physics,
@@ -3844,45 +3927,49 @@ impl Combat {
         let mut met = Vec::new();
         for (i, v) in vehicles.iter().enumerate() {
             let Some(a) = v.id else { continue };
-            for (b, at) in physics.vehicle_bumps(a) {
+            for (b, at, normal) in physics.vehicle_bumps(a) {
                 let pair = if (a, b) < (b, a) { (a, b) } else { (b, a) };
                 if now.insert(pair)
                     && !self.bumping.contains(&pair)
                     && let Some(j) = vehicles.iter().position(|w| w.id == Some(b))
                 {
-                    met.push((i, j, at));
+                    met.push((i, j, at, normal));
                 }
             }
         }
         self.bumping = now;
         let kind = m2_assets::name_hash(m2_engine::durability::RAM_KIND);
         let mut out = Vec::new();
-        for (i, j, at) in met {
+        for (i, j, at, normal) in met {
             let (Some(a), Some(b)) = (vehicles[i].id, vehicles[j].id) else {
                 continue;
             };
-            let closing =
-                (physics.vehicle_velocity_before(a) - physics.vehicle_velocity_before(b)).length();
-            if closing < CRASH_SPEED {
+            let relative = physics.vehicle_velocity_before(a) - physics.vehicle_velocity_before(b);
+            let closing = relative.dot(normal).abs();
+            let size = m2_engine::durability::crash_size(
+                vehicles[i].spec.mass,
+                vehicles[j].spec.mass,
+                closing,
+            );
+            if size < m2_engine::durability::CRASH_FLOOR {
                 continue;
             }
             for (struck, other) in [(i, j), (j, i)] {
                 if vehicles[struck].wrecked {
                     continue;
                 }
-                let ram = m2_engine::durability::ram(vehicles[other].spec.mass, closing);
-                let scale = match (self.damage_table.as_ref(), vehicles[struck].spec.tuning.key) {
+                let cell = match (self.damage_table.as_ref(), vehicles[struck].spec.tuning.key) {
                     (Some(t), Some(row)) => t.scale(row, kind).unwrap_or(0.0),
                     _ => 0.0,
                 };
-                let damage = ram * scale;
+                let damage = m2_engine::durability::crash_damage(size, cell);
                 if damage <= 0.0 {
                     out.push((struck, other, closing, 0.0));
                     continue;
                 }
                 let v = &mut vehicles[struck];
                 if let Some(body) = v.id.and_then(|id| physics.vehicle_transform(id)) {
-                    v.hit_parts(body, at, ram);
+                    v.hit_parts(body, at, damage);
                 }
                 self.hurt_vehicle(physics, v, struck, damage);
                 out.push((struck, other, closing, damage));
@@ -4479,12 +4566,17 @@ impl Combat {
                     f.physics,
                     v,
                     i,
-                    damage * v.spec.tuning.blast_scale.unwrap_or(1.0),
+                    damage
+                        * blast_cell(
+                            self.damage_table.as_ref(),
+                            v,
+                            Some(m2_assets::name_hash("Explosion")),
+                        ),
                 );
                 // What it wrecks, it throws: off-centre, so it tumbles.
                 if v.wrecked {
                     let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
-                    let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass;
+                    let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * fudge(v);
                     f.physics
                         .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
                 }
@@ -4586,8 +4678,8 @@ impl Combat {
 
     /// Explosion template `blast` going off at `at`, by its own `Radius`,
     /// `Damage` and `MinDamage` and the damage table's scale for its
-    /// `DamageKey` (people's `Human` row, the hero's `Hero` row; vehicles
-    /// take their `ExplosionFudge` of it). Without one, the old blast
+    /// `DamageKey` (people's `Human` row, the hero's `Hero` row, vehicles' own row;
+    /// their `ExplosionFudge` scales only how far it throws them). Without one, the old blast
     /// ([`Combat::explode`]).
     fn explode_blast(&mut self, f: &mut Field<'_>, at: Vec3, blast: Option<Blast>) {
         self.explode_keyed(f, at, blast, None);
@@ -4668,12 +4760,13 @@ impl Combat {
                 if weak != 1.0 {
                     eprintln!("weak point: {} takes {weak:.1}x of the blast", v.spec.label);
                 }
-                let damage = b.damage_at(d) * v.spec.tuning.blast_scale.unwrap_or(1.0) * weak;
+                let damage =
+                    b.damage_at(d) * blast_cell(self.damage_table.as_ref(), v, b.key) * weak;
                 v.blast_parts(body, at, reach, |p| b.damage_at(p));
                 self.hurt_vehicle(f.physics, v, i, damage);
                 if v.wrecked {
                     let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
-                    let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass;
+                    let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * fudge(v);
                     f.physics
                         .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
                 }
@@ -4887,14 +4980,14 @@ impl Combat {
             if v.wrecked {
                 continue;
             }
-            let scale = v.spec.tuning.blast_scale.unwrap_or(1.0);
+            let cell = blast_cell(self.damage_table.as_ref(), v, key);
             if let Some(body) = f.physics.vehicle_transform(id) {
                 v.blast_parts(body, at, radius, |p| damage * (1.0 - p / radius));
             }
-            self.hurt_vehicle(f.physics, v, i, damage * near * scale);
+            self.hurt_vehicle(f.physics, v, i, damage * near * cell);
             if v.wrecked {
                 let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
-                let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * near.max(0.3);
+                let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * near.max(0.3) * fudge(v);
                 f.physics
                     .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
             }
@@ -5952,10 +6045,12 @@ mod tests {
         }
         assert_eq!(shots, 2);
         assert_eq!(vehicles[0].rounds(), Some(0));
-        // A tank's template: 125 health, heavy armour, a fifth of blasts.
+        // A tank's template: heavy armour, thrown a fifth as far by blasts
+        // (no damage table here, so a blast does all its damage: five
+        // times a tank's 125 health keeps the hit in range).
         let t = &mut vehicles[0].spec.tuning;
         (t.health, t.armour, t.blast_scale, t.burns_below) =
-            (Some(125.0), Some(4), Some(0.2), Some(30.0));
+            (Some(625.0), Some(4), Some(0.2), Some(150.0));
         // The damage table's `Tank` row: rounds do nothing.
         t.rounds = Some(RoundScale::default());
         assert_eq!(vehicles[0].health(), 100.0);
@@ -5985,7 +6080,7 @@ mod tests {
         combat.round_on_vehicle(&mut field, side, (6.0, Round::Bullet), None);
         assert!((field.vehicles[0].damage - before - 0.15).abs() < 1e-4);
         assert!(field.vehicles[0].health() < hit);
-        field.vehicles[0].damage = 100.0;
+        field.vehicles[0].damage = 600.0;
         for _ in 0..60 * 15 {
             combat.burn_vehicles(&mut field, dt);
         }

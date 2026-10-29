@@ -594,7 +594,7 @@ mod tests {
             walked: gives.clone(),
             gives,
             heals,
-            cue: None,
+            icon: None,
             effect: None,
         }
     }

@@ -76,12 +76,14 @@ mod pad;
 mod particles;
 mod paths;
 mod pause;
+mod pickup_marker;
 mod placed;
 mod player;
 mod props;
 mod puppet;
 mod raw;
 mod reinforce;
+mod ride;
 mod ridehijack;
 mod roads;
 mod route;
@@ -386,6 +388,9 @@ struct Options {
     /// door and get in and out with the use key, logging the entrance,
     /// seat and exit the rules give.
     board: bool,
+    /// With `--board`: the entrance she stands at, by name or hash
+    /// (`entrance_driver`, `8efe45f3`); else the front right one.
+    entrance: Option<u32>,
     mission_seconds: f32,
     /// With `--mission --autoplay`: she plays on through this many
     /// contracts (the first, then the story's next ones) before she stops
@@ -696,6 +701,13 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--seated" => o.seated = true,
             "--board" => o.board = true,
+            "--entrance" => {
+                let v = value()?;
+                o.entrance = Some(
+                    u32::from_str_radix(v.trim_start_matches("0x"), 16)
+                        .unwrap_or_else(|_| m2_assets::name_hash(&v)),
+                );
+            }
             "--load" => o.load = Some(save::SaveGame::read(&PathBuf::from(value()?))?),
             "--save-to" => o.save_to = Some(value()?.into()),
             "--load-at" => o.load_at = Some(value()?.parse().context("--load-at expects seconds")?),
@@ -922,6 +934,34 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
     Ok(o)
 }
 
+/// The options only the offscreen run (`--screenshot`) reads: the window
+/// has no autoplay, mission clock or scripted hijack.
+const SCREENSHOT_ONLY: &[&str] = &[
+    "--autoplay",
+    "--mission-seconds",
+    "--contracts",
+    "--after-contract",
+    "--hijack",
+    "--movies",
+];
+
+/// Those of [`SCREENSHOT_ONLY`] given without `--screenshot`, in the order
+/// given, each once.
+fn screenshot_only_ignored(given: &[String]) -> Vec<&'static str> {
+    if given.iter().any(|a| a == "--screenshot") {
+        return Vec::new();
+    }
+    let mut ignored = Vec::new();
+    for a in given {
+        if let Some(&flag) = SCREENSHOT_ONLY.iter().find(|f| **f == a.as_str())
+            && !ignored.contains(&flag)
+        {
+            ignored.push(flag);
+        }
+    }
+    ignored
+}
+
 /// Panics are also written to `m2-alpha-crash.log` (beside the settings
 /// file or the exe), with a backtrace, since a windowed game has no console
 /// to read.
@@ -978,6 +1018,13 @@ fn run(
     event_loop: impl FnOnce() -> Result<EventLoop<()>, winit::error::EventLoopError>,
 ) -> anyhow::Result<()> {
     let mut options = parse_args(args)?;
+    let ignored = screenshot_only_ignored(args);
+    if !ignored.is_empty() {
+        eprintln!(
+            "warning: {} only work with --screenshot (offscreen); ignored in the window",
+            ignored.join(" ")
+        );
+    }
     combat::use_attach_frame(!options.hands_grip);
     let config_path = options
         .config_path
@@ -1201,16 +1248,27 @@ fn build_scene(
     }
     let (eye, target) = scene.focus;
     let mut game = Game::new(scene, FlyCamera::looking_at(eye, target));
-    if let (Some(install), Mode::Island(_)) = (install, mode) {
+    if let (Some(_), Mode::Island(_)) = (install, mode) {
         // A state layer's people wait for the scripts to load it.
         game.scene.people.state_layers = Some(HashSet::new());
-        // Free roam: the island's vehicles stand where the game's start-up
-        // layers put them (with `--mission` the scripts' own layers do).
-        if !mission {
-            game.startup = Some(startup::Startup::start(install, game.scene.hero));
-        }
     }
     Ok(game)
+}
+
+/// Free roam: the island's vehicles, people and state layers are those
+/// the game's start-up layers hold (with `--mission` the scripts' own
+/// layers are). With `save` (`--load`) the start-up carries on from its
+/// campaign, so a mid-game save gets that act's layers.
+fn start_startup(
+    game: &mut Game,
+    install: Option<&Install>,
+    mode: &Mode,
+    mission: bool,
+    save: Option<&save::SaveGame>,
+) {
+    if let (Some(install), Mode::Island(_), false) = (install, mode, mission) {
+        game.startup = Some(startup::Startup::start(install, game.scene.hero, save));
+    }
 }
 
 /// Hands her the weapons `--gun` names.
@@ -1684,6 +1742,13 @@ fn screenshot(
         options.mission,
         config.hero,
     )?;
+    start_startup(
+        &mut game,
+        install,
+        mode,
+        options.mission,
+        options.load.as_ref(),
+    );
     game.scene.people.smarter = config.enhanced.smarter_ai;
     give_guns(&mut game, &options.guns);
     if options.fly {
@@ -2496,6 +2561,23 @@ fn look_at_pickup(game: &mut Game, reach: f32) {
             "not loaded"
         }
     );
+    // Its marker, if it shows one near her.
+    match flights
+        .marker_points(her, pickup_marker::NEAR_HER)
+        .into_iter()
+        .find(|(_, q)| q.key() == p.key())
+    {
+        Some((top, q)) => eprintln!(
+            "look-pickup: marker icon {:08x} over {top:.2}{}",
+            q.what.icon.unwrap_or(0),
+            if q.what.icon_flat { ", flat" } else { "" }
+        ),
+        None => eprintln!(
+            "look-pickup: no marker (icon {:?}, {:.0} m from her)",
+            p.what.icon,
+            p.at.distance(her)
+        ),
+    }
     let at = p.at + m2_math::glam::Vec3::Y * 0.2;
     // Who lies or stands by it (the soldier who left it).
     if let Some(n) = game
@@ -3890,6 +3972,7 @@ fn mission_for_screenshot(
                 a.offers = link.offers(game);
                 a.in_hq = link.in_hq();
                 a.exits = link.exit_offers();
+                a.enters = link.enter_offers();
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)
             }
@@ -6115,7 +6198,9 @@ fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Res
         return Ok(());
     };
     let spec = &game.scene.vehicles[i].spec;
-    let right = m2_assets::name_hash("entrance_front_right");
+    let right = options
+        .entrance
+        .unwrap_or_else(|| m2_assets::name_hash("entrance_front_right"));
     let Some(&(e, local)) = spec
         .entrances
         .iter()
@@ -6125,6 +6210,21 @@ fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Res
         return Ok(());
     };
     let label = spec.label.clone();
+    for s in spec.seating.iter().flat_map(|s| s.seats.iter()) {
+        eprintln!(
+            "board: seat {:08x} {:?} usable {} hijackable {} links {:x?} entrances {:x?}",
+            s.name,
+            s.role(),
+            s.player_use,
+            s.hijackable,
+            s.links,
+            s.rows
+                .iter()
+                .filter(|r| r.can_enter)
+                .map(|r| r.link_name)
+                .collect::<Vec<_>>()
+        );
+    }
     let (door, centre) = (at.transform_point3(local), at.transform_point3(Vec3::ZERO));
     let stand = door + (door - centre).with_y(0.0).normalize_or_zero() * 0.6;
     eprintln!(
@@ -6154,6 +6254,12 @@ fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Res
     eprintln!(
         "board: pressed use: in {:?}",
         driving.map(|d| &game.scene.vehicles[d].spec.label)
+    );
+    eprintln!(
+        "board: her seat {:x?}, armed seat {}, HUD {:?}",
+        game.ride.map(|r| r.1),
+        game.combat.seat,
+        game.hud_info(None).driving.map(|d| d.0)
     );
     for _ in 0..60 {
         game.step(Intent::default(), tick);
@@ -6337,7 +6443,7 @@ fn fuel_check(game: &mut Game, tick: f32) {
             .collect::<Vec<_>>()
     );
     if let (Some(world), Some(player)) = (game.scene.world.as_ref(), game.scene.player.as_mut()) {
-        game::get_out(&world.physics, &game.scene.vehicles[i], player);
+        game::get_out(&world.physics, &game.scene.vehicles[i], None, player);
     }
     for p in left {
         let before = game.earned.iter().map(|e| e.1).sum::<u32>();
@@ -7393,6 +7499,13 @@ impl App {
             self.mission,
             self.config.hero,
         )?;
+        start_startup(
+            &mut game,
+            self.install.as_ref(),
+            &self.mode,
+            self.mission,
+            self.load.as_ref(),
+        );
         game.scene.people.smarter = self.config.enhanced.smarter_ai;
         give_guns(&mut game, &self.guns);
         if self.fly {
@@ -8889,6 +9002,36 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshot_only_options_are_named_when_windowed() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let windowed = args(&[
+            "--mission",
+            "--movies",
+            "--autoplay",
+            "--contracts",
+            "1",
+            "--mission-seconds",
+            "300",
+            "--autoplay",
+            "--hijack",
+        ]);
+        assert_eq!(
+            screenshot_only_ignored(&windowed),
+            [
+                "--movies",
+                "--autoplay",
+                "--contracts",
+                "--mission-seconds",
+                "--hijack"
+            ]
+        );
+        let mut offscreen = windowed.clone();
+        offscreen.extend(args(&["--screenshot", "out.ppm"]));
+        assert!(screenshot_only_ignored(&offscreen).is_empty());
+        assert!(screenshot_only_ignored(&args(&["--mission", "--hijack-crew", "x"])).is_empty());
+    }
 
     #[test]
     fn starting_again_from_a_save_keeps_the_launch_but_its_load() {

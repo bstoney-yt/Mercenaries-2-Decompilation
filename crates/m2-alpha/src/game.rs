@@ -193,6 +193,10 @@ pub struct Game {
     /// The vehicle she last got into: the use key sticks to its entrances
     /// ([`entrance_pick`]).
     pub last_vehicle: Option<usize>,
+    /// The vehicle the use key seated her in and her seat's `SeatLink`
+    /// name ([`crate::ride`]); while she rides any other, or none is
+    /// given, she sits at the wheel.
+    pub ride: Option<(usize, u32)>,
     /// The field of view (degrees, bottom to top) and the screen's width
     /// over its height the last frame was drawn with: what the scripts'
     /// camera sees (`Event.ObjectIsVisible`).
@@ -395,6 +399,7 @@ impl Game {
             hijack_only: HashSet::new(),
             unusable: HashSet::new(),
             last_vehicle: None,
+            ride: None,
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
             context: None,
@@ -929,6 +934,34 @@ impl Game {
                     self.park_tries += 1;
                     park(physics, &mut scene.vehicles, player, self.park_tries);
                 }
+                // Out of the vehicle the use key seated her in, or in
+                // another one, her seat is forgotten.
+                if self.ride.is_some_and(|(i, _)| player.driving != Some(i)) {
+                    self.ride = None;
+                }
+                // The seat key: over her seat's link to a free one.
+                if intent.trigger.seat
+                    && let Some(i) = player.driving
+                    && let Some(v) = scene.vehicles.get(i)
+                    && v.spec.seating.is_some()
+                {
+                    let from = self.ride.map(|(_, s)| s);
+                    match crate::ride::transfer(crate::ride::Ride::of(v), from) {
+                        Some(to) => {
+                            self.ride = Some((i, to));
+                            self.combat.seat = crate::ride::armed_index(
+                                crate::ride::Ride::of(v),
+                                Some(to),
+                                &combat::armed_seats(v),
+                            );
+                            eprintln!(
+                                "seat: she moves over to {to:08x} ({:?})",
+                                crate::ride::Ride::of(v).role(Some(to))
+                            );
+                        }
+                        None => eprintln!("seat: no free seat linked to hers"),
+                    }
+                }
                 if intent.use_pressed {
                     // The emplaced gun she would man, if nothing nearer
                     // takes the key.
@@ -945,7 +978,11 @@ impl Game {
                     .flatten();
                     match player.driving {
                         // Out over deep water she swims (`Player::update_swim`).
-                        Some(i) => get_out(physics, &scene.vehicles[i], player),
+                        Some(i) => {
+                            let seat = self.ride.filter(|r| r.0 == i).map(|r| r.1);
+                            get_out(physics, &scene.vehicles[i], seat, player);
+                            self.ride = None;
+                        }
                         // Off the emplaced gun she mans.
                         None if self.combat.manned.is_some() => {
                             if let Some(m) = self.combat.manned.take() {
@@ -998,18 +1035,46 @@ impl Game {
                                 player,
                                 self.last_vehicle,
                             );
-                            player.driving = picked.map(|(i, _)| i);
-                            if let Some((i, entrance)) = picked {
-                                self.last_vehicle = Some(i);
-                                log_entry(physics, &scene.vehicles[i], player, entrance);
+                            let db = &world.index.template_db;
+                            // The seat the entrance gives her.
+                            let boarding = picked.and_then(|(i, entrance)| {
+                                let v = &scene.vehicles[i];
+                                let labels = db.vehicle_labels_for(&v.spec.label, v.spec.model);
+                                let b = crate::ride::board(
+                                    crate::ride::Ride::of(v),
+                                    entrance,
+                                    crate::ride::car_or_truck(&labels),
+                                    &scene.people,
+                                );
+                                log_entry(physics, v, player, entrance, b.as_ref());
+                                Some((i, b?))
+                            });
+                            player.driving = boarding.as_ref().map(|(i, _)| *i);
+                            if let Some((i, b)) = &boarding {
+                                self.last_vehicle = Some(*i);
+                                self.ride = b.seat.map(|s| (*i, s));
+                                let v = &scene.vehicles[*i];
+                                self.combat.seat = crate::ride::armed_index(
+                                    crate::ride::Ride::of(v),
+                                    b.seat,
+                                    &combat::armed_seats(v),
+                                );
                             }
                             // Seated: she no longer waits to land (people
                             // wait on that, and she may have hopped out and
                             // back in before the ground streamed).
-                            if let Some(i) = player.driving {
+                            if let Some((i, b)) = boarding {
                                 player.landed = true;
-                                let db = &world.index.template_db;
-                                let out = take_seat(&mut scene.vehicles[i])
+                                let v = &mut scene.vehicles[i];
+                                let out = crate::ride::empty_seats(&mut v.crew, &b.out);
+                                if !out.is_empty() {
+                                    eprintln!(
+                                        "hijack: she takes the {} from {} rider(s)",
+                                        v.spec.label,
+                                        out.len()
+                                    );
+                                }
+                                let out = out
                                     .into_iter()
                                     .map(|who| {
                                         let model = db.get(&who).and_then(|t| t.model);
@@ -1035,7 +1100,8 @@ impl Game {
                     .and_then(|v| v.id.map(|id| (id, v)));
                 self.throttle = 0.0;
                 let was_honking = std::mem::take(&mut self.honking);
-                // In a gunner's seat nobody drives: it stops.
+                // In a gunner's or passenger's seat (any but the driver's
+                // armed seat 0) nobody drives: it stops.
                 let gunner = self.combat.seat > 0;
                 if let Some((id, v)) = id
                     && !v.wrecked
@@ -1342,11 +1408,16 @@ impl Game {
                 // where the targets are brought down from its emplaced
                 // guns; inferred from the scripts).
                 let manning = self.combat.manned.is_some() && !field.player.swimming();
-                let trigger = if field.player.weapons_away() && !manning {
+                let mut trigger = if field.player.weapons_away() && !manning {
                     crate::combat::Trigger::default()
                 } else {
                     intent.trigger
                 };
+                // The seat key moved her over her seat's links already.
+                let seated = field.player.driving.and_then(|i| field.vehicles.get(i));
+                if seated.is_some_and(|v| v.spec.seating.is_some()) {
+                    trigger.seat = false;
+                }
                 self.combat.step(&mut field, trigger, dt);
             });
             crate::spans::time("on foot: vehicles hit her", || {
@@ -2001,9 +2072,10 @@ impl Game {
         let driving = player.and_then(|p| p.driving).and_then(|i| {
             let v = self.scene.vehicles.get(i)?;
             let speed = self.driving().map_or(0.0, |d| d.1);
-            // In a gunner's seat, so marked.
+            // In a gunner's or passenger's seat, so marked.
             let label = match self.combat.seat {
                 0 => v.spec.label.clone(),
+                combat::NO_GUN => format!("{} (passenger)", v.spec.label),
                 _ => format!("{} (gunner)", v.spec.label),
             };
             Some((label, speed, v.wrecked))
@@ -2123,6 +2195,20 @@ impl Game {
                 .support
                 .hud(player.map_or(self.camera.position.y, |p| p.character.position.y)),
             hero: self.scene.hero,
+            pickups: player.map_or_else(Vec::new, |p| {
+                self.scene
+                    .flights
+                    .marker_points(p.character.position, crate::pickup_marker::NEAR_HER)
+                    .into_iter()
+                    .filter_map(|(at, lying)| {
+                        Some(crate::pickup_marker::PickupMarker {
+                            at,
+                            icon: lying.what.icon?,
+                            flat: lying.what.icon_flat,
+                        })
+                    })
+                    .collect()
+            }),
             ..HudInfo::default()
         }
     }
@@ -2644,6 +2730,8 @@ fn take_up(
             weapon: Some(left),
             gun,
             gives: Some((left, kept)),
+            icon: template.and_then(|(id, info)| crate::mission::marker_icon(templates, *id, info)),
+            icon_flat: template.is_some_and(|(_, info)| info.marker_flat()),
             ..crate::flights::Leaves::default()
         },
         at: player.character.position + right * LEFT_BESIDE,
@@ -3616,14 +3704,11 @@ fn has_driver(crew: &[(String, String)]) -> bool {
 /// crew forgets them: playtest 4, no car could be taken from traffic).
 /// The templates of those put out.
 fn take_seat(v: &mut ParkedVehicle) -> Vec<String> {
-    let (out, kept) = std::mem::take(&mut v.crew)
-        .into_iter()
-        .partition(|(seat, _)| seat.to_ascii_lowercase().contains("driver"));
-    v.crew = kept;
+    let out = crate::ride::empty_seats(&mut v.crew, &[None]);
     if !out.is_empty() {
         eprintln!("hijack: she takes the {} from its driver", v.spec.label);
     }
-    out.into_iter().map(|(_, who)| who).collect()
+    out
 }
 
 /// Those put out of vehicle `v`'s (`vehicles[i]`) seats (`out`, by
@@ -3734,14 +3819,29 @@ fn entrance_pick(
 }
 
 /// Logs her getting into `v` by `entrance`: how far she stood from it and
-/// the seat the 360 would give her. The alpha seats her at the wheel
-/// whichever it is: from a car's or truck's passenger seat hero.lua's
-/// `EnterPassengerCallback` slides her over to a free driver's seat; a
-/// gunner's seat of her own is not modelled yet.
-fn log_entry(physics: &Physics, v: &ParkedVehicle, player: &Player, entrance: Option<u32>) {
+/// the seat [`crate::ride::board`] gave her (`None`: no way in).
+fn log_entry(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    player: &Player,
+    entrance: Option<u32>,
+    boarding: Option<&crate::ride::Boarding>,
+) {
     let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id)) else {
         return;
     };
+    match boarding {
+        Some(b) => eprintln!(
+            "seat: in the {}: {:x?} ({:?}){}{}",
+            v.spec.label,
+            b.seat,
+            b.role,
+            b.slid_from
+                .map_or(String::new(), |f| format!(", slid over from {f:08x}")),
+            b.stayed.map_or(String::new(), |w| format!(", stays: {w}"))
+        ),
+        None => eprintln!("seat: the {}'s entrance gives her no seat", v.spec.label),
+    }
     let her = at.inverse().transform_point3(player.character.position);
     let Some(e) = entrance else {
         eprintln!(
@@ -3760,12 +3860,11 @@ fn log_entry(physics: &Physics, v: &ParkedVehicle, player: &Player, entrance: Op
         .map_or(0.0, |(x, _)| x.params.use_distance);
     eprintln!(
         "enter: {} by entrance {e:#010x} at local {:.2?} (UseDistance {ud}), her local {:.2?}, \
-         {:.2} m; seat {:x?}",
+         {:.2} m",
         v.spec.label,
         place.to_array(),
         her.to_array(),
         her.distance(place),
-        seat_by(v, e)
     );
 }
 
@@ -3778,20 +3877,6 @@ fn reach_of(at: Mat4, spec: &VehicleSpec, her: Vec3) -> f32 {
         Some(door) => (local.xyz() - door).length(),
         None => (local.xyz().clamp(lo, hi) - local.xyz()).length(),
     }
-}
-
-/// The seat entrance `entrance` of `v` gives her (0x8229A1C8): the first
-/// free one she may use that it leads to; its `SeatLink` name.
-fn seat_by(v: &ParkedVehicle, entrance: u32) -> Option<u32> {
-    let s = v.spec.seating.as_ref()?;
-    let taken = |i: usize| {
-        let name = s.seats[i].name;
-        v.crew
-            .iter()
-            .any(|(seat, _)| m2_assets::name_hash(seat) == name)
-    };
-    let i = m2_engine::seats::seat_for_entrance(&s.seats, entrance, taken)?;
-    Some(s.seats[i].name)
 }
 
 /// The vehicles she may get into, with their indices: not wrecked, with a
@@ -3875,7 +3960,8 @@ pub(crate) fn can_get_out(physics: &Physics, v: &ParkedVehicle) -> bool {
 const WADE: f32 = 1.4;
 
 /// How and where she gets out of `v`, standing at `at` and moving at
-/// `velocity`, from the driver's seat ([`m2_engine::seats::exit_kind`]),
+/// `velocity`, from seat `her_seat` (its `SeatLink` name; `None`, the
+/// driver's) ([`m2_engine::seats::exit_kind`]),
 /// and where she lands, world space: the hardpoint of the seat's exit
 /// entrance at the hull's height (0x822A1B70 puts a ditching rider there;
 /// Invented for the animated exit, whose clip is not played), or beside
@@ -3885,13 +3971,16 @@ const WADE: f32 = 1.4;
 fn exit_plan(
     physics: &Physics,
     v: &ParkedVehicle,
+    her_seat: Option<u32>,
     at: Mat4,
     velocity: Vec3,
 ) -> (m2_engine::seats::ExitKind, Vec3) {
     use m2_engine::seats::{self, ExitKind};
     let seating = v.spec.seating.as_deref();
-    let seat = seating.and_then(|s| Some(&s.seats[s.driver()?]));
-    let exit = seating.and_then(|s| s.exit_of(s.driver()?));
+    // Her seat, else the driver's.
+    let index = seating.and_then(|s| her_seat.and_then(|n| s.seat(n)).or_else(|| s.driver()));
+    let seat = seating.zip(index).map(|(s, i)| &s.seats[i]);
+    let exit = seating.zip(index).and_then(|(s, i)| s.exit_of(i));
     let local = exit
         .and_then(|e| v.spec.entrance_at(e.name))
         .map(|p| Vec3::new(p.x, 0.0, p.z));
@@ -3926,14 +4015,19 @@ fn exit_plan(
 /// Gets her out of `v` as [`exit_plan`] has it, to drop to the ground
 /// there; ditching or tossed, she keeps the push off (a toss's own push,
 /// 0x822A1B70's passed speed, is not traced: it gets the ditch's).
-pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player) {
+pub(crate) fn get_out(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    seat: Option<u32>,
+    player: &mut Player,
+) {
     if let Some((id, at)) =
         v.id.and_then(|id| Some((id, physics.vehicle_transform(id)?)))
             .filter(|(_, at)| at.is_finite())
     {
         use m2_engine::seats::ExitKind;
         let velocity = physics.vehicle_velocity(id);
-        let (kind, place) = exit_plan(physics, v, at, velocity);
+        let (kind, place) = exit_plan(physics, v, seat, at, velocity);
         // At the hull's height: onto the ground by the door, not onto a
         // boulder or roof over it.
         player.drop_at(place);

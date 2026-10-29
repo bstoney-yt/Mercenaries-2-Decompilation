@@ -166,6 +166,9 @@ pub struct MissionView {
     pub vehicle_disguise: bool,
     /// Her disguise while one holds: how much is left and whether it holds.
     pub disguise: Option<(f32, bool)>,
+    /// The size and reach of the markers over pickups, as the scripts set
+    /// them ([`crate::pickup_marker`]).
+    pub pickup_markers: m2_game::hud::PickupMarkers,
 }
 
 /// A marker the scripts put over one of their objects (`Marker.AddBlip`),
@@ -1481,6 +1484,20 @@ impl MissionLink {
             .context_actions()
             .into_iter()
             .filter(|(_, _, text, _)| text.eq_ignore_ascii_case(EXIT_PROMPT))
+            .filter_map(|(g, at, _, reach)| Some((g, Vec3::from(at?), reach)))
+            .collect()
+    }
+
+    /// The HQs' ways in on offer (the context actions whose prompt is
+    /// [`ENTER_PROMPT`]): each one's object, where it stands and its reach.
+    pub fn enter_offers(&self) -> Vec<crate::autoplay::ActionAt> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        mission
+            .context_actions()
+            .into_iter()
+            .filter(|(_, _, text, _)| text.eq_ignore_ascii_case(ENTER_PROMPT))
             .filter_map(|(g, at, _, reach)| Some((g, Vec3::from(at?), reach)))
             .collect()
     }
@@ -3797,6 +3814,7 @@ impl MissionLink {
             trespass: trespass(mission.lua()),
             vehicle_disguise: w.vehicle_disguise,
             disguise: w.disguise,
+            pickup_markers: hud.pickup_markers,
         }
     }
 }
@@ -5058,7 +5076,8 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
                         };
                         if let Some(p) = game.scene.player.as_mut().filter(|p| p.driving == Some(i))
                         {
-                            get_out(&world.physics, &game.scene.vehicles[i], p);
+                            let seat = game.ride.filter(|r| r.0 == i).map(|r| r.1);
+                            get_out(&world.physics, &game.scene.vehicles[i], seat, p);
                         }
                         if let Some(id) = game.scene.vehicles[i].id.take() {
                             world.physics.remove_vehicle(id);
@@ -5273,8 +5292,11 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             let (Some(world), Some(p)) = (&game.scene.world, game.scene.player.as_mut()) else {
                 return false;
             };
-            if let Some(v) = p.driving.and_then(|i| game.scene.vehicles.get(i)) {
-                get_out(&world.physics, v, p);
+            if let Some(i) = p.driving
+                && let Some(v) = game.scene.vehicles.get(i)
+            {
+                let seat = game.ride.filter(|r| r.0 == i).map(|r| r.1);
+                get_out(&world.physics, v, seat, p);
             }
             return false;
         }
@@ -5799,6 +5821,38 @@ pub(crate) fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
 /// 100; `Ammo Pickup (Small)`: 3, beside its rounds).
 pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
     let info = templates.leavings.pickups.get(&id)?;
+    pickup_of(templates, id, info).map(|l| Leaves {
+        icon: marker_icon(templates, id, info),
+        icon_flat: info.marker_flat(),
+        ..l
+    })
+}
+
+/// The icon pickup template `id`'s marker shows: its `WeaponUI` texture
+/// if it has one (a gun lying there shows its HUD picture,
+/// `weapons_assault_rifle`), else its `Pickup` record's `TextureModel`.
+/// From the 360 code: the marker queue (82378890) looks the pickup up in
+/// the `WeaponUI` table (83652844, named at 823AD978) first; weapons'
+/// own `Pickup` records name no texture (PC data: the `Assault Rifle`).
+pub(crate) fn marker_icon(
+    templates: &Templates,
+    id: u32,
+    info: &m2_engine::pickup::PickupInfo,
+) -> Option<u32> {
+    templates
+        .arms
+        .weapons
+        .get(&id)
+        .and_then(|w| w.ui.as_ref())
+        .map(|ui| ui.icon)
+        .or(info.icon)
+}
+
+fn pickup_of(
+    templates: &Templates,
+    id: u32,
+    info: &m2_engine::pickup::PickupInfo,
+) -> Option<Leaves> {
     let model = templates.by_id(id).and_then(|(_, t)| t.model);
     // Money: cash or fuel, as much as its rounds field says.
     if matches!(info.kind, m2_engine::pickup::CASH | m2_engine::pickup::FUEL) {
@@ -6154,6 +6208,10 @@ pub const TALK_PROMPT: &str = "[ContextAction.Talk]";
 /// An HQ portal's way out (`WifPmcInterior`'s `_AddPortal` with `bIsAnExit`,
 /// from the scripts).
 pub const EXIT_PROMPT: &str = "[ContextAction.Exit]";
+
+/// An HQ portal's way in (`WifPmcInterior`'s `_AddPortal` outside, from
+/// the scripts; the story run's offered three by the PMC compound).
+pub const ENTER_PROMPT: &str = "[ContextAction.Enter]";
 
 /// A dialog box the scripts have up ([`MissionLink::open_dialog`]).
 #[derive(Clone, Debug, PartialEq)]
@@ -6781,7 +6839,7 @@ mod tests {
             walked: gives.clone(),
             gives,
             heals,
-            cue: None,
+            icon: None,
             effect: None,
         };
         // The PC data's `Health Pickup` (50), `Ammo Pickup (Small)` (3
@@ -6891,7 +6949,7 @@ mod tests {
                         gives: vec![(bullet, 8)],
                         walked: vec![(bullet, 8)],
                         heals: 0,
-                        cue: None,
+                        icon: None,
                         effect: None,
                     },
                 )]),
@@ -6934,6 +6992,16 @@ mod tests {
         // it lies.
         let (small, shotgun) = (0x8000_a286, 0x8000_56a0);
         let mut db = db;
+        // Its marker: none from its `Pickup` records; its HUD picture once
+        // it has a `WeaponUI` (the 360's marker queue looks there first).
+        assert_eq!(gun.icon, None);
+        let picture = name_hash("weapons_assault_rifle");
+        db.arms.weapons.get_mut(&ak).unwrap().ui = Some(m2_engine::weapons::GunUi {
+            icon: picture,
+            reticle: 1,
+            crosshair: true,
+        });
+        assert_eq!(pickup(&db, ak).unwrap().icon, Some(picture));
         let records = vec![(shotgun, 3), (bullet, 3)];
         db.leavings.pickups.insert(
             small,
@@ -6945,7 +7013,7 @@ mod tests {
                 gives: records.clone(),
                 walked: records,
                 heals: 3,
-                cue: None,
+                icon: None,
                 effect: None,
             },
         );
@@ -6991,7 +7059,7 @@ mod tests {
             gives: vec![(ammo, rounds)],
             walked: vec![(ammo, rounds)],
             heals: 0,
-            cue: None,
+            icon: None,
             effect: None,
         };
         let db = Templates {
@@ -7036,6 +7104,9 @@ mod tests {
                     reach: 1.0,
                     weapon: Some(Weapon::GrenadeLauncher),
                     gives: Some((Weapon::GrenadeLauncher, 18)),
+                    // Their records are ammunition's: markers fading by the
+                    // distance over the ground.
+                    icon_flat: true,
                     ..Leaves::default()
                 },
                 Leaves {
@@ -7043,6 +7114,7 @@ mod tests {
                     model: Some(0x8e77_a04d),
                     reach: 1.0,
                     weapon: None,
+                    icon_flat: true,
                     ..Leaves::default()
                 },
             ]

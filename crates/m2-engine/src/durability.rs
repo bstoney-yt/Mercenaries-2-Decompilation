@@ -311,6 +311,40 @@ pub fn ram(mass: f32, speed: f32) -> f32 {
     mass * speed / 1000.0
 }
 
+/// How hard two bodies of `mass_a` and `mass_b` (kg) meet when they close
+/// at `closing` (m/s, along the contact normal): a tenth of the closing
+/// speed times the sum of the masses' square roots, so a 2,000 kg car
+/// meeting a 6,000 kg truck at 2.6 m/s makes 31.8. Each side's factor
+/// for the other (1 for vehicles) multiplies it; a body with no mass (a
+/// fixed one) counts as [`FIXED_MASS`]. From the 360 code: the collision
+/// event's size, 0x82163758 (masses and factors) and 0x82162BB8 (the
+/// contacts' mean closing speed times it).
+pub fn crash_size(mass_a: f32, mass_b: f32, closing: f32) -> f32 {
+    let root = |m: f32| if m > 0.0 { m.sqrt() } else { FIXED_MASS.sqrt() };
+    closing.abs() * (root(mass_a) + root(mass_b)) * 0.1
+}
+
+/// The mass a fixed body counts as in [`crash_size`]. From the 360 code
+/// (0x82163758).
+pub const FIXED_MASS: f32 = 15_000.0;
+
+/// A crash smaller than this hurts neither side. From the 360 code
+/// (0x8228B5F0).
+pub const CRASH_FLOOR: f32 = 5.0;
+
+/// What a crash of `size` ([`crash_size`]) does to one side, whose
+/// `ModifierKey` row gives `cell` for the other side's `DamageKey`: a
+/// hundredth of the size times the cell, and nothing unless that is
+/// over 1. From the 360 code: 0x8228B5F0 (the floor and the hundredth),
+/// 0x82287CF8 (each side's cell, and the 1).
+pub fn crash_damage(size: f32, cell: f32) -> f32 {
+    if size < CRASH_FLOOR {
+        return 0.0;
+    }
+    let damage = size * 0.01 * cell;
+    if damage > 1.0 { damage } else { 0.0 }
+}
+
 /// A ram's kind of damage where its vehicle's template names none: `Car`,
 /// the damage table's column every vehicle template that names a
 /// `DamageKey` of its own names (survey `runover`).
@@ -427,6 +461,28 @@ pub fn explosions(db: &Layer<'_>) -> HashMap<u32, Explosion> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A crash's size is a tenth of the closing speed times the masses'
+    // roots summed; a fixed body counts as 15 t.
+    #[test]
+    fn a_crash_is_the_closing_speed_times_the_masses_roots() {
+        let size = crash_size(2_000.0, 6_000.0, 2.6);
+        assert!((size - 2.6 * (2_000f32.sqrt() + 6_000f32.sqrt()) * 0.1).abs() < 1e-4);
+        assert_eq!(crash_size(2_000.0, 6_000.0, -2.6), size, "either way round");
+        let fixed = crash_size(2_000.0, 0.0, 10.0);
+        assert!((fixed - 10.0 * (2_000f32.sqrt() + 15_000f32.sqrt()) * 0.1).abs() < 1e-3);
+    }
+
+    // Each side takes a hundredth of the size times its cell, only once a
+    // crash reaches 5 and only past 1 damage.
+    #[test]
+    fn a_crash_hurts_past_the_floor_and_past_one() {
+        assert_eq!(crash_damage(4.9, 100.0), 0.0, "under the floor");
+        assert_eq!(crash_damage(60.0, 1.0), 0.0, "0.6 is not past 1");
+        assert!((crash_damage(60.0, 2.0) - 1.2).abs() < 1e-5);
+        assert!((crash_damage(300.0, 2.0) - 6.0).abs() < 1e-4);
+        assert_eq!(crash_damage(300.0, 0.0), 0.0, "a cell of nothing");
+    }
 
     // A ram is a tonne a metre a second, times the table's cell for the
     // person's row and the vehicle's kind; a row the table lacks takes the

@@ -624,6 +624,9 @@ pub struct HudState {
     /// (`HUD_objective_deliverable`...), colour (RGBA). Their icons are
     /// read for the world's markers too ([`GameHud::paint_texture`]).
     pub blips: Vec<([f32; 3], String, [u8; 4])>,
+    /// Other textures the world's icons draw, by name hash: the pickups'
+    /// markers' ([`crate::pickup_marker`]).
+    pub textures: Vec<u32>,
     /// Where the reticle goes: the screen point her weapon (or her
     /// vehicle's gun) aims at, -1..=1 across and up the screen as
     /// `Gui.GetReticlePosition` answers. None hides it (down, or in a
@@ -1488,7 +1491,19 @@ impl GameHud {
         rect: egui::Rect,
         colour: Color32,
     ) -> bool {
-        let Some(Some(texture)) = self.textures.get(&texture_hash(name)) else {
+        self.paint_texture_hash(painter, texture_hash(name), rect, colour)
+    }
+
+    /// [`paint_texture`](Self::paint_texture) by the texture's name hash
+    /// (one of [`HudState::textures`]).
+    pub fn paint_texture_hash(
+        &self,
+        painter: &egui::Painter,
+        hash: u32,
+        rect: egui::Rect,
+        colour: Color32,
+    ) -> bool {
+        let Some(Some(texture)) = self.textures.get(&hash) else {
             return false;
         };
         let uv = egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
@@ -2592,6 +2607,7 @@ impl Thread {
         // The objective markers' icons, for the world's markers
         // ([`GameHud::paint_texture`]) whether or not the minimap is up.
         want.extend(state.blips.iter().map(|(_, icon, _)| name_hash(icon)));
+        want.extend(state.textures.iter().copied());
         // The pad's Y, for the use prompts with a pad (`crate::ui`).
         if state.pad {
             want.push(name_hash(crate::pad::Button::Y.texture()));
