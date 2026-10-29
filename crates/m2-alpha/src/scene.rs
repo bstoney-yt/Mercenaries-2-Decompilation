@@ -107,6 +107,10 @@ pub struct Rig {
     /// posed from it over whatever else the character would play
     /// ([`crate::raw`]).
     pub scripted: Option<(Arc<m2_engine::anim::BoundClip>, f32)>,
+    /// The on-foot table's rate limits of each clip that has them
+    /// ([`m2_assets::animation_table::clip_time_scales`]), for
+    /// [`Rig::play_rate`]. Empty when the table could not be read.
+    pub time_scales: Arc<HashMap<u32, (f32, f32)>>,
 }
 
 /// Most clip events a rig keeps for the taking (older ones are dropped:
@@ -152,6 +156,65 @@ const GAIT_KEYS: [(Gait, u32); 4] = [
     (Gait::Run, 0x1091_2665),
     (Gait::Sprint, 0x076a_6136),
 ];
+
+/// The rate a character's clip plays at, moving `moved` m/s at `gait`,
+/// whose clip travels `clip_speed` m/s; `playing` is the clip playing
+/// now (its hash) and its on-foot row's rate limits, if it has any.
+///
+/// - Moving (not [`Gait::Idle`]): the clip's stride to the speed,
+///   `moved / clip_speed`. From the 360 code: the locomotion update
+///   (82808468 forward, 82809468 backward) advances the gait clip by
+///   `dt * speed / clip speed`, where the clip's speed (its node's +0x5c,
+///   8280F650) already carries the clip's table rate (+0x34, set through
+///   +0x50 by 82801A30), so that rate cancels and a moving gait follows
+///   the ground speed alone, with no clamp. Known runtime limitation: at
+///   speeds far from a clip's own, the feet may slide or the legs stall
+///   (against a wall the ratio is near 0); not yet assessed in play.
+/// - Standing: the table rate of the clip playing
+///   ([`m2_assets::animation_table::clip_rate`] for `id`). From the 360
+///   code: the standing locomotion (82809D60, state 0) advances its clips
+///   by the plain `dt`, and a clip node plays at its rate (8280F398).
+///   1.0 for a clip without limits (the idle `01ca8a69`'s row has -1).
+pub fn gait_rate(
+    gait: Gait,
+    clip_speed: Option<f32>,
+    moved: f32,
+    playing: Option<(u32, Option<(f32, f32)>)>,
+    id: u32,
+) -> f32 {
+    match clip_speed {
+        Some(clip) if gait != Gait::Idle && clip > 0.1 => moved / clip,
+        _ if gait != Gait::Idle => 1.0,
+        _ => match playing {
+            Some((hash, Some((min, max)))) => {
+                m2_assets::animation_table::clip_rate(min, max, id, hash)
+            }
+            _ => 1.0,
+        },
+    }
+}
+
+/// The on-foot table's rate limits by clip
+/// ([`m2_assets::animation_table::clip_time_scales`]), logged: "clip
+/// rates: <n> clips with limits". Empty if the table can't be read.
+fn time_scales(source: &mut AssetSource<BufReader<File>>) -> HashMap<u32, (f32, f32)> {
+    use m2_assets::animation_table::{self as table, AnimationTable};
+    let read = source
+        .asset(table::CHARACTER_ANIMATIONS, table::ANIMATION_TABLE_TYPE)
+        .map_err(anyhow::Error::from)
+        .and_then(|a| Ok(AnimationTable::parse(&a)?));
+    match read {
+        Ok(t) => {
+            let s = table::clip_time_scales(&t);
+            eprintln!("clip rates: {} clips with limits", s.len());
+            s
+        }
+        Err(e) => {
+            eprintln!("clip rates: no on-foot table: {e:#}");
+            HashMap::new()
+        }
+    }
+}
 
 /// What the on-foot table settled for a hero ([`table_clips`]).
 #[derive(Debug, Default)]
@@ -450,7 +513,7 @@ impl Rig {
         let started = std::time::Instant::now();
         let skeleton = Skeleton::from_nodes(&source.model(hash)?.parse()?.nodes);
         let clips = load_clips(source, &skeleton, &[""])?;
-        let rig = match hero {
+        let mut rig = match hero {
             // Jennifer's gaits and clips were matched against her footage
             // from every clip (rounds 55-153): they stay as they were.
             Some(hero) if hero != Hero::Jennifer => {
@@ -472,6 +535,7 @@ impl Rig {
             }
             _ => Rig::new(skeleton, clips, gait),
         };
+        rig.time_scales = Arc::new(time_scales(source));
         eprintln!(
             "model {hash:08x}: {} bones, {} clips fit ({:.1} s), locomotion {}",
             rig.skeleton.len(),
@@ -502,6 +566,17 @@ impl Rig {
     pub fn gait_speed(&self, gait: Gait) -> Option<f32> {
         let &i = self.locomotion.as_ref()?.clips.get(&gait)?;
         Some(self.clips[i].info.speed)
+    }
+
+    /// The rate the clip playing now plays at, at `gait` moving `moved`
+    /// m/s, for the character numbered `id` ([`gait_rate`]).
+    pub fn play_rate(&self, gait: Gait, moved: f32, id: u32) -> f32 {
+        let playing = self
+            .animator
+            .current()
+            .map(|(i, _)| self.clips[i].hash)
+            .map(|h| (h, self.time_scales.get(&h).copied()));
+        gait_rate(gait, self.gait_speed(gait), moved, playing, id)
     }
 
     /// This rig's clips on another model's `skeleton`: shared when it has
@@ -564,6 +639,7 @@ impl Rig {
             scripted: None,
             gait: Gait::Idle,
             cues: Vec::new(),
+            time_scales: self.time_scales.clone(),
         })
     }
 
@@ -621,6 +697,7 @@ impl Rig {
             aim_clip: None,
             barrel: true,
             scripted: None,
+            time_scales: Default::default(),
         };
         rig.set_gait(gait);
         rig
@@ -3601,5 +3678,44 @@ mod tests {
         c.step(1.0, ground);
         assert_eq!(c.at, lying.at);
         assert!((c.age - 6.0).abs() < 1e-3);
+    }
+    #[test]
+    fn a_moving_gait_follows_the_ground_speed() {
+        // 3 m/s on a 2.5 m/s clip: 1.2, whatever the clip's table rate.
+        let limits = Some((0x1234, Some((1.0, 1.5))));
+        assert!((gait_rate(Gait::Run, Some(2.5), 3.0, limits, 9) - 1.2).abs() < 1e-6);
+        assert!((gait_rate(Gait::Run, Some(2.5), 3.0, None, 9) - 1.2).abs() < 1e-6);
+        // No clamp, as in the original: rates past the old 0.6 to 1.4 pass
+        // through; no clip speed: 1.0.
+        assert_eq!(gait_rate(Gait::Walk, Some(1.0), 9.0, None, 0), 9.0);
+        assert_eq!(gait_rate(Gait::Walk, Some(2.0), 0.5, None, 0), 0.25);
+        assert_eq!(gait_rate(Gait::Walk, Some(1.0), 0.0, None, 0), 0.0);
+        assert_eq!(gait_rate(Gait::Walk, None, 3.0, limits, 0), 1.0);
+    }
+
+    #[test]
+    fn standing_plays_the_clips_table_rate() {
+        use m2_assets::animation_table::clip_rate;
+        // No limits (-1 rows are not in the map) or no clip: 1.0.
+        assert_eq!(
+            gait_rate(Gait::Idle, Some(0.0), 0.0, Some((0x1234, None)), 3),
+            1.0
+        );
+        assert_eq!(gait_rate(Gait::Idle, Some(0.0), 0.0, None, 3), 1.0);
+        // With limits: the character's own rate, not the speed.
+        for id in 0..8 {
+            let r = gait_rate(
+                Gait::Idle,
+                Some(0.0),
+                2.0,
+                Some((0x1230, Some((1.0, 1.5)))),
+                id,
+            );
+            assert_eq!(r, clip_rate(1.0, 1.5, id, 0x1230));
+        }
+        assert_eq!(
+            gait_rate(Gait::Idle, None, 0.0, Some((0x1235, Some((1.0, 1.5)))), 0),
+            1.0
+        );
     }
 }
