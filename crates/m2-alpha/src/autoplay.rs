@@ -4611,7 +4611,7 @@ impl Autoplay {
                                 ..VehicleControls::default()
                             },
                         );
-                        get_out(&world.physics, v, p);
+                        get_out(&world.physics, v, None, p);
                         p.character.position = to + Vec3::Y * 0.1;
                         p.character.velocity = Vec3::ZERO;
                     }
