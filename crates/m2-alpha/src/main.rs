@@ -76,6 +76,7 @@ mod pad;
 mod particles;
 mod paths;
 mod pause;
+mod pickup_marker;
 mod placed;
 mod player;
 mod props;
@@ -2491,6 +2492,23 @@ fn look_at_pickup(game: &mut Game, reach: f32) {
             "not loaded"
         }
     );
+    // Its marker, if it shows one near her.
+    match flights
+        .marker_points(her, pickup_marker::NEAR_HER)
+        .into_iter()
+        .find(|(_, q)| q.key() == p.key())
+    {
+        Some((top, q)) => eprintln!(
+            "look-pickup: marker icon {:08x} over {top:.2}{}",
+            q.what.icon.unwrap_or(0),
+            if q.what.icon_flat { ", flat" } else { "" }
+        ),
+        None => eprintln!(
+            "look-pickup: no marker (icon {:?}, {:.0} m from her)",
+            p.what.icon,
+            p.at.distance(her)
+        ),
+    }
     let at = p.at + m2_math::glam::Vec3::Y * 0.2;
     // Who lies or stands by it (the soldier who left it).
     if let Some(n) = game

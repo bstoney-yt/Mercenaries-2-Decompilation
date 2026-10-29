@@ -166,6 +166,9 @@ pub struct MissionView {
     pub vehicle_disguise: bool,
     /// Her disguise while one holds: how much is left and whether it holds.
     pub disguise: Option<(f32, bool)>,
+    /// The size and reach of the markers over pickups, as the scripts set
+    /// them ([`crate::pickup_marker`]).
+    pub pickup_markers: m2_game::hud::PickupMarkers,
 }
 
 /// A marker the scripts put over one of their objects (`Marker.AddBlip`),
@@ -3797,6 +3800,7 @@ impl MissionLink {
             trespass: trespass(mission.lua()),
             vehicle_disguise: w.vehicle_disguise,
             disguise: w.disguise,
+            pickup_markers: hud.pickup_markers,
         }
     }
 }
@@ -5799,6 +5803,18 @@ pub(crate) fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
 /// 100; `Ammo Pickup (Small)`: 3, beside its rounds).
 pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
     let info = templates.leavings.pickups.get(&id)?;
+    pickup_of(templates, id, info).map(|l| Leaves {
+        icon: info.icon,
+        icon_flat: info.marker_flat(),
+        ..l
+    })
+}
+
+fn pickup_of(
+    templates: &Templates,
+    id: u32,
+    info: &m2_engine::pickup::PickupInfo,
+) -> Option<Leaves> {
     let model = templates.by_id(id).and_then(|(_, t)| t.model);
     // Money: cash or fuel, as much as its rounds field says.
     if matches!(info.kind, m2_engine::pickup::CASH | m2_engine::pickup::FUEL) {
@@ -6781,7 +6797,7 @@ mod tests {
             walked: gives.clone(),
             gives,
             heals,
-            cue: None,
+            icon: None,
             effect: None,
         };
         // The PC data's `Health Pickup` (50), `Ammo Pickup (Small)` (3
@@ -6891,7 +6907,7 @@ mod tests {
                         gives: vec![(bullet, 8)],
                         walked: vec![(bullet, 8)],
                         heals: 0,
-                        cue: None,
+                        icon: None,
                         effect: None,
                     },
                 )]),
@@ -6945,7 +6961,7 @@ mod tests {
                 gives: records.clone(),
                 walked: records,
                 heals: 3,
-                cue: None,
+                icon: None,
                 effect: None,
             },
         );
@@ -6991,7 +7007,7 @@ mod tests {
             gives: vec![(ammo, rounds)],
             walked: vec![(ammo, rounds)],
             heals: 0,
-            cue: None,
+            icon: None,
             effect: None,
         };
         let db = Templates {
@@ -7036,6 +7052,9 @@ mod tests {
                     reach: 1.0,
                     weapon: Some(Weapon::GrenadeLauncher),
                     gives: Some((Weapon::GrenadeLauncher, 18)),
+                    // Their records are ammunition's: markers fading by the
+                    // distance over the ground.
+                    icon_flat: true,
                     ..Leaves::default()
                 },
                 Leaves {
@@ -7043,6 +7062,7 @@ mod tests {
                     model: Some(0x8e77_a04d),
                     reach: 1.0,
                     weapon: None,
+                    icon_flat: true,
                     ..Leaves::default()
                 },
             ]
