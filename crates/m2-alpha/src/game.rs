@@ -2648,7 +2648,7 @@ fn take_up(
             weapon: Some(left),
             gun,
             gives: Some((left, kept)),
-            icon: template.and_then(|(_, info)| info.icon),
+            icon: template.and_then(|(id, info)| crate::mission::marker_icon(templates, *id, info)),
             icon_flat: template.is_some_and(|(_, info)| info.marker_flat()),
             ..crate::flights::Leaves::default()
         },

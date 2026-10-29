@@ -5804,10 +5804,30 @@ pub(crate) fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
 pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
     let info = templates.leavings.pickups.get(&id)?;
     pickup_of(templates, id, info).map(|l| Leaves {
-        icon: info.icon,
+        icon: marker_icon(templates, id, info),
         icon_flat: info.marker_flat(),
         ..l
     })
+}
+
+/// The icon pickup template `id`'s marker shows: its `WeaponUI` texture
+/// if it has one (a gun lying there shows its HUD picture,
+/// `weapons_assault_rifle`), else its `Pickup` record's `TextureModel`.
+/// From the 360 code: the marker queue (82378890) looks the pickup up in
+/// the `WeaponUI` table (83652844, named at 823AD978) first; weapons'
+/// own `Pickup` records name no texture (PC data: the `Assault Rifle`).
+pub(crate) fn marker_icon(
+    templates: &Templates,
+    id: u32,
+    info: &m2_engine::pickup::PickupInfo,
+) -> Option<u32> {
+    templates
+        .arms
+        .weapons
+        .get(&id)
+        .and_then(|w| w.ui.as_ref())
+        .map(|ui| ui.icon)
+        .or(info.icon)
 }
 
 fn pickup_of(
@@ -6950,6 +6970,16 @@ mod tests {
         // it lies.
         let (small, shotgun) = (0x8000_a286, 0x8000_56a0);
         let mut db = db;
+        // Its marker: none from its `Pickup` records; its HUD picture once
+        // it has a `WeaponUI` (the 360's marker queue looks there first).
+        assert_eq!(gun.icon, None);
+        let picture = name_hash("weapons_assault_rifle");
+        db.arms.weapons.get_mut(&ak).unwrap().ui = Some(m2_engine::weapons::GunUi {
+            icon: picture,
+            reticle: 1,
+            crosshair: true,
+        });
+        assert_eq!(pickup(&db, ak).unwrap().icon, Some(picture));
         let records = vec![(shotgun, 3), (bullet, 3)];
         db.leavings.pickups.insert(
             small,
