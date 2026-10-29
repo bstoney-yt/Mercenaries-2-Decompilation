@@ -73,13 +73,21 @@ pub fn generate(lua: &Lua, bootstrap: u32) -> mlua::Result<String> {
 /// holds its key, then the one playing as `"active"`) and the contracts
 /// the flow has unlocked (`tActiveMissions` of its `SaveSingleton`, as a
 /// save keeps them), each list sorted. From the scripts' bytecode.
+///
+/// `SaveSingleton` walks the flow's `_tActiveMissions`, which only its
+/// `Reset` creates; the game calls it at save time, after the bootstrap
+/// has reset the flow, but autoplay asks from the first frame the scripts
+/// run. Until then nothing is unlocked, so nothing is on offer.
 pub const CONTRACTS: &str = r#"
 local done, active, offered = {}, {}, {}
 for _, s in ipairs(WifMissionFlow.GetMissionStates() or {}) do
     if s[2] == "complete" then done[#done + 1] = s[1]
     elseif s[2] == "active" then active[#active + 1] = s[1] end
 end
-local flow = WifMissionFlow.SaveSingleton() or {}
+local flow = {}
+if getfenv(WifMissionFlow.SaveSingleton)._tActiveMissions ~= nil then
+    flow = WifMissionFlow.SaveSingleton() or {}
+end
 for k in pairs(flow.tActiveMissions or {}) do
     offered[#offered + 1] = tostring(k)
 end
@@ -127,6 +135,7 @@ mod tests {
         let lua = Lua::new();
         lua.load(
             r#"
+            _tActiveMissions = {}
             WifMissionFlow = {
                 SaveSingleton = function()
                     return { tActiveMissions = { PmcCon001 = {}, AllCon001 = {} } }
@@ -152,6 +161,43 @@ mod tests {
         assert_eq!(
             c.to_string(),
             "1 done [VzaCon001], active [PmcCon001], on offer [AllCon001 PmcCon001]"
+        );
+    }
+
+    #[test]
+    fn contracts_before_the_flow_is_reset_offer_nothing() {
+        let lua = Lua::new();
+        lua.load(
+            r#"
+            WifMissionFlow = {
+                SaveSingleton = function()
+                    local t = {}
+                    for k in pairs(_tActiveMissions) do t[k] = true end
+                    return { tActiveMissions = t }
+                end,
+                GetMissionStates = function()
+                    return { { "VzaCon001", "complete" }, { "PmcCon001", "active" } }
+                end,
+            }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let c = contracts(&lua).unwrap();
+        assert_eq!(
+            c,
+            Contracts {
+                done: vec!["VzaCon001".into()],
+                active: vec!["PmcCon001".into()],
+                offered: vec![],
+            }
+        );
+        lua.load("_tActiveMissions = { OilCon020 = {} }")
+            .exec()
+            .unwrap();
+        assert_eq!(
+            contracts(&lua).unwrap().offered,
+            vec!["OilCon020".to_string()]
         );
     }
 
