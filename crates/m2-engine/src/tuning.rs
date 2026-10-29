@@ -31,7 +31,7 @@ pub struct VehicleTuning {
     /// Its armour class (`ObjectHint`'s `Armor`): 1 none (cars, boats),
     /// 2 light (helicopters), 3 medium (the LAV III), 4 heavy (tanks).
     pub armour: Option<u32>,
-    /// What blasts do to it, of their damage (`ExplosionFudge`'s field
+    /// How hard blasts throw it, of their usual (`ExplosionFudge`'s field
     /// 6bcc541e: the AMX-30's 0.2, a truck's 0.4, a boat's 1.1).
     pub blast_scale: Option<f32>,
     /// Health below which it burns down by itself (`TickDamage`'s field

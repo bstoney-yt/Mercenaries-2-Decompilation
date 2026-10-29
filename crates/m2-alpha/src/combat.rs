@@ -545,6 +545,26 @@ fn npc_round_on_vehicle(gun: Option<m2_engine::tuning::HandGun>) -> (f32, Round)
     (g.damage, round)
 }
 
+/// What vehicle `v` takes of a blast of `DamageKey` `key`: the damage
+/// table's cell for its `ModifierKey` row and that key. From the 360 code
+/// (0x82291640: the blast's damage at its distance times the cell).
+/// Inferred: a blast of no key, or a vehicle or cell the table lacks,
+/// takes all of it.
+fn blast_cell(table: Option<&DamageTable>, v: &ParkedVehicle, key: Option<u32>) -> f32 {
+    match (table, v.spec.tuning.key, key) {
+        (Some(t), Some(row), Some(k)) => t.scale(row, k).unwrap_or(1.0),
+        _ => 1.0,
+    }
+}
+
+/// How hard a blast throws vehicle `v`, of its usual: its
+/// `ExplosionFudge`. From the 360 code (0x8215CA38: the blast's impulse
+/// is its strength times the fudge times its falloff), where the fudge
+/// scales the push, not the damage.
+fn fudge(v: &ParkedVehicle) -> f32 {
+    v.spec.tuning.blast_scale.unwrap_or(1.0)
+}
+
 /// A round's `DamageKey`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Round {
@@ -553,7 +573,7 @@ enum Round {
 }
 /// A blast's damage to vehicles (the "Explosion (Tank Shell)" and RPG's:
 /// 200 at its heart down to 50 at 5 m, nothing beyond), times the
-/// vehicle's `ExplosionFudge` (the AMX-30 takes a fifth).
+/// damage table's cell for the vehicle's row and `Explosion`.
 const BLAST_ON_VEHICLE: (f32, f32, f32) = (200.0, 50.0, 5.0);
 /// Below its `TickDamage` health a vehicle burns down this fast, health a
 /// second (the template's 1 every 0.5 s, read as seconds).
@@ -4508,12 +4528,17 @@ impl Combat {
                     f.physics,
                     v,
                     i,
-                    damage * v.spec.tuning.blast_scale.unwrap_or(1.0),
+                    damage
+                        * blast_cell(
+                            self.damage_table.as_ref(),
+                            v,
+                            Some(m2_assets::name_hash("Explosion")),
+                        ),
                 );
                 // What it wrecks, it throws: off-centre, so it tumbles.
                 if v.wrecked {
                     let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
-                    let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass;
+                    let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * fudge(v);
                     f.physics
                         .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
                 }
@@ -4615,8 +4640,8 @@ impl Combat {
 
     /// Explosion template `blast` going off at `at`, by its own `Radius`,
     /// `Damage` and `MinDamage` and the damage table's scale for its
-    /// `DamageKey` (people's `Human` row, the hero's `Hero` row; vehicles
-    /// take their `ExplosionFudge` of it). Without one, the old blast
+    /// `DamageKey` (people's `Human` row, the hero's `Hero` row, vehicles' own row;
+    /// their `ExplosionFudge` scales only how far it throws them). Without one, the old blast
     /// ([`Combat::explode`]).
     fn explode_blast(&mut self, f: &mut Field<'_>, at: Vec3, blast: Option<Blast>) {
         self.explode_keyed(f, at, blast, None);
@@ -4697,12 +4722,13 @@ impl Combat {
                 if weak != 1.0 {
                     eprintln!("weak point: {} takes {weak:.1}x of the blast", v.spec.label);
                 }
-                let damage = b.damage_at(d) * v.spec.tuning.blast_scale.unwrap_or(1.0) * weak;
+                let damage =
+                    b.damage_at(d) * blast_cell(self.damage_table.as_ref(), v, b.key) * weak;
                 v.blast_parts(body, at, reach, |p| b.damage_at(p));
                 self.hurt_vehicle(f.physics, v, i, damage);
                 if v.wrecked {
                     let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
-                    let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass;
+                    let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * fudge(v);
                     f.physics
                         .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
                 }
@@ -4916,14 +4942,14 @@ impl Combat {
             if v.wrecked {
                 continue;
             }
-            let scale = v.spec.tuning.blast_scale.unwrap_or(1.0);
+            let cell = blast_cell(self.damage_table.as_ref(), v, key);
             if let Some(body) = f.physics.vehicle_transform(id) {
                 v.blast_parts(body, at, radius, |p| damage * (1.0 - p / radius));
             }
-            self.hurt_vehicle(f.physics, v, i, damage * near * scale);
+            self.hurt_vehicle(f.physics, v, i, damage * near * cell);
             if v.wrecked {
                 let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
-                let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * near.max(0.3);
+                let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * near.max(0.3) * fudge(v);
                 f.physics
                     .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
             }
@@ -5981,10 +6007,12 @@ mod tests {
         }
         assert_eq!(shots, 2);
         assert_eq!(vehicles[0].rounds(), Some(0));
-        // A tank's template: 125 health, heavy armour, a fifth of blasts.
+        // A tank's template: heavy armour, thrown a fifth as far by blasts
+        // (no damage table here, so a blast does all its damage: five
+        // times a tank's 125 health keeps the hit in range).
         let t = &mut vehicles[0].spec.tuning;
         (t.health, t.armour, t.blast_scale, t.burns_below) =
-            (Some(125.0), Some(4), Some(0.2), Some(30.0));
+            (Some(625.0), Some(4), Some(0.2), Some(150.0));
         // The damage table's `Tank` row: rounds do nothing.
         t.rounds = Some(RoundScale::default());
         assert_eq!(vehicles[0].health(), 100.0);
@@ -6014,7 +6042,7 @@ mod tests {
         combat.round_on_vehicle(&mut field, side, (6.0, Round::Bullet), None);
         assert!((field.vehicles[0].damage - before - 0.15).abs() < 1e-4);
         assert!(field.vehicles[0].health() < hit);
-        field.vehicles[0].damage = 100.0;
+        field.vehicles[0].damage = 600.0;
         for _ in 0..60 * 15 {
             combat.burn_vehicles(&mut field, dt);
         }
