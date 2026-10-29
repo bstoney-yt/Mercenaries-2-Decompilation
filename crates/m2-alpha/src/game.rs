@@ -1298,6 +1298,7 @@ impl Game {
                 walking,
                 dt,
             );
+            run_over_pickups(world, &mut self.scene.flights, &self.scene.vehicles);
             knock_loose(
                 world,
                 &mut self.scene.props,
@@ -2880,6 +2881,7 @@ fn hit_world(
         }
     }
     blast_loose(world, props, &combat.went_off, combat::REACH, false);
+    blast_pickups(world, flights, &combat.went_off, combat::REACH);
     // What was worn down and blows up goes off a moment later.
     for (at, size) in destruction.set_off.drain(..) {
         combat.set_off(at, size);
@@ -3332,14 +3334,77 @@ fn blown_loose(db: &Templates, t: u32) -> bool {
     })
 }
 
+/// How a blast at `blast` with `reach` throws what comes loose at `at`,
+/// `d` metres off: out and up as people are thrown, harder the nearer,
+/// toppling away from it. Its velocity (m/s) and spin.
+pub(crate) fn thrown_by(blast: Vec3, at: Vec3, d: f32, reach: f32) -> (Vec3, Vec3) {
+    let near = (1.0 - d / reach).clamp(0.0, 1.0);
+    let away = (at - blast).with_y(0.0).normalize_or(Vec3::X);
+    let (out, up) = combat::BLAST_PUSH;
+    let velocity = away * (out * near + 1.0) + Vec3::Y * (up * near + 1.0);
+    (velocity, Vec3::Y.cross(away) * (TOPPLE * out * near))
+}
+
+/// What a pickup of template `t` weighs, if it is a physics prop
+/// (`_PropPhysics`): kilograms and its gravity scale.
+pub(crate) fn pickup_weight(db: &m2_engine::Templates, t: u32) -> Option<(f32, f32)> {
+    let p = db.prop_physics.get(&t)?;
+    Some((p.kg(), db.gravity_scales.get(&t).copied().unwrap_or(1.0)))
+}
+
+/// Vehicles on the move throw the physics props lying to be taken that
+/// they run into, as they knock props loose ([`flung`]).
+fn run_over_pickups(
+    world: &mut World,
+    flights: &mut crate::flights::Flights,
+    vehicles: &[ParkedVehicle],
+) {
+    for v in vehicles {
+        let Some(id) = v.id else { continue };
+        let Some(place) = world.physics.vehicle_transform(id) else {
+            continue;
+        };
+        let velocity = world.physics.vehicle_velocity(id);
+        let db = &world.index.template_db;
+        let threw = flights.run_over(
+            &mut world.physics,
+            (place, v.model.bounds, velocity, v.spec.mass),
+            |t| pickup_weight(db, t),
+            flung,
+        );
+        if threw > 0 {
+            eprintln!("pickups: the {} throws {threw}", v.spec.label);
+        }
+    }
+}
+
+/// Blasts throw the physics props lying to be taken (the weapons and
+/// grenades soldiers leave) within `reach`, as [`thrown_by`] throws what
+/// comes loose.
+fn blast_pickups(
+    world: &mut World,
+    flights: &mut crate::flights::Flights,
+    blasts: &[Vec3],
+    reach: f32,
+) {
+    if blasts.is_empty() {
+        return;
+    }
+    let db = &world.index.template_db;
+    let threw = flights.blow(
+        &mut world.physics,
+        blasts,
+        reach,
+        |t| pickup_weight(db, t),
+        |b, at, d| thrown_by(b, at, d, reach),
+    );
+    if threw > 0 {
+        eprintln!("pickups: a blast throws {threw}");
+    }
+}
+
 fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3], reach: f32, strike: bool) {
-    let thrown = |blast: Vec3, at: Vec3, d: f32| {
-        let near = (1.0 - d / reach).clamp(0.0, 1.0);
-        let away = (at - blast).with_y(0.0).normalize_or(Vec3::X);
-        let (out, up) = combat::BLAST_PUSH;
-        let velocity = away * (out * near + 1.0) + Vec3::Y * (up * near + 1.0);
-        (velocity, Vec3::Y.cross(away) * (TOPPLE * out * near))
-    };
+    let thrown = |blast: Vec3, at: Vec3, d: f32| thrown_by(blast, at, d, reach);
     for &at in blasts {
         for (i, d) in world.loose_near(at, reach) {
             let o = world.index.objects[i];

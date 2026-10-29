@@ -1628,7 +1628,20 @@ impl Physics {
         velocity: Vec3,
         spin: Vec3,
     ) -> DebrisId {
-        self.add_piece(
+        self.add_falling_debris(piece, at, (velocity, spin), 1.0)
+    }
+
+    /// As [`add_debris`](Self::add_debris), pulled by `gravity` times the
+    /// world's gravity (a weapon lying to be taken: its template's
+    /// `PhysicsPropertyGravityScaler`).
+    pub fn add_falling_debris(
+        &mut self,
+        piece: &LoosePiece,
+        at: Mat4,
+        (velocity, spin): (Vec3, Vec3),
+        gravity: f32,
+    ) -> DebrisId {
+        let id = self.add_piece(
             piece,
             at,
             velocity,
@@ -1638,7 +1651,13 @@ impl Physics {
                 r::Group::ALL.difference(DEBRIS).difference(VEHICLE),
                 r::InteractionTestMode::And,
             ),
-        )
+        );
+        if gravity != 1.0
+            && let Some(b) = self.debris[id.0].and_then(|h| self.world.bodies.get_mut(h))
+        {
+            b.set_gravity_scale(gravity, true);
+        }
+        id
     }
 
     /// As [`add_debris`](Self::add_debris), a piece a building broke

@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use m2_assets::vehicle::Rotor;
-use m2_engine::{CollisionShape, GpuModel, Physics, StaticKey};
+use m2_engine::{CollisionShape, DebrisId, GpuModel, LoosePiece, Physics, StaticKey};
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::DrawQueue;
 
@@ -264,6 +264,13 @@ pub struct Flights {
     broken: Vec<(u32, Vec3)>,
     /// What the crates broken open left, not yet taken.
     pickups: Vec<Pickup>,
+    /// Pickups thrown loose ([`fling`](Self::fling)), by key: each one's
+    /// body and its place as last stepped.
+    tumbling: HashMap<(u32, u32), (DebrisId, Mat4)>,
+    /// The boxes (model space) of the models loaded, by hash.
+    boxes: HashMap<u32, (Vec3, Vec3)>,
+    /// Bodies of pickups taken or gone, to take out of the physics.
+    gone_bodies: Vec<DebrisId>,
 }
 
 impl std::fmt::Debug for Flights {
@@ -345,7 +352,20 @@ impl Flights {
 
     /// A model asked for has loaded.
     pub fn loaded(&mut self, hash: u32, model: FlightModel) {
+        self.boxes.insert(hash, model.gpu.bounds);
         self.models.insert(hash, Some(model));
+    }
+
+    /// Gives model hash the box ounds (model space) without loading
+    /// it, for tests.
+    #[cfg(test)]
+    fn set_box(&mut self, hash: u32, bounds: (Vec3, Vec3)) {
+        self.boxes.insert(hash, bounds);
+    }
+
+    /// The box (model space) of what lies under p's model, once loaded.
+    fn box_of(&self, p: &Pickup) -> Option<(Vec3, Vec3)> {
+        self.boxes.get(&p.what.model?).copied()
     }
 
     /// The pilots sent home whose helicopters are now out of sight: there,
@@ -459,7 +479,11 @@ impl Flights {
                     .model
                     .and_then(|m| self.models.get(&m)?.as_ref())
                     .map_or(p.at + Vec3::Y * MARKER_RAISE, |m| {
-                        let place = lying(m.gpu.bounds, p.yaw, p.at);
+                        // Thrown, where its body is.
+                        let place = match self.tumbling.get(&p.key()) {
+                            Some(&(_, place)) => place,
+                            None => lying(m.gpu.bounds, p.yaw, p.at),
+                        };
                         let (lo, hi) = world_box(place, m.gpu.bounds);
                         Vec3::new((lo.x + hi.x) * 0.5, hi.y, (lo.z + hi.z) * 0.5)
                     });
@@ -510,13 +534,162 @@ impl Flights {
     /// Takes what lies under `key` ([`Pickup::key`]).
     pub fn take(&mut self, key: (u32, u32)) -> Option<Pickup> {
         let i = self.pickups.iter().position(|p| p.key() == key)?;
+        self.still(key);
         Some(self.pickups.remove(i))
     }
 
     /// Takes away what lies under `key` ([`Pickup::key`]) untaken: a
     /// placed pickup whose layer went out.
     pub fn forget(&mut self, key: (u32, u32)) {
+        self.still(key);
         self.pickups.retain(|p| p.key() != key);
+    }
+
+    /// Ends the tumbling of what lies under `key`, if it was thrown: its
+    /// body goes at the next step.
+    fn still(&mut self, key: (u32, u32)) {
+        if let Some((id, _)) = self.tumbling.remove(&key) {
+            self.gone_bodies.push(id);
+        }
+    }
+
+    /// Throws what lies under `key` loose at `velocity` (m/s), turning at
+    /// `spin` (radians a second about each axis): a box round its model
+    /// weighing `kg`, pulled by `gravity` times the world's gravity, from
+    /// where it lies (one already thrown, from where it is). It lies to be
+    /// taken where it comes to rest. False if its model isn't loaded.
+    ///
+    /// The weapons and grenades lying to be taken are physics props in
+    /// the data (`_PropPhysics` 50 kg, `PhysicsPropertyGravityScaler`
+    /// 1.5; from samples), as the 360's pickups are physics objects
+    /// (82289F40 sends what a death leaves off with a velocity; from the
+    /// 360 code).
+    pub fn fling(
+        &mut self,
+        physics: &mut Physics,
+        key: (u32, u32),
+        thrown: (Vec3, Vec3),
+        (kg, gravity): (f32, f32),
+    ) -> bool {
+        let Some(p) = self.pickups.iter().find(|p| p.key() == key) else {
+            return false;
+        };
+        let Some(bounds) = self.box_of(p) else {
+            return false;
+        };
+        let place = match self.tumbling.remove(&key) {
+            Some((id, place)) => {
+                physics.remove_debris(id);
+                place
+            }
+            None => lying(bounds, p.yaw, p.at),
+        };
+        let half = ((bounds.1 - bounds.0) * 0.5).max(Vec3::splat(THINNEST));
+        let piece = LoosePiece::block(None, (bounds.0 + bounds.1) * 0.5, half, kg);
+        let id = physics.add_falling_debris(&piece, place, thrown, gravity);
+        self.tumbling.insert(key, (id, place));
+        true
+    }
+
+    /// Throws what lies within `reach` of each of `blasts` and weighs
+    /// something (`weigh`: its template's mass, kg, and gravity scale; a
+    /// physics prop), at the velocity and spin `thrown` gives (blast,
+    /// where it lies, distance). Returns how many it threw.
+    pub fn blow(
+        &mut self,
+        physics: &mut Physics,
+        blasts: &[Vec3],
+        reach: f32,
+        weigh: impl Fn(u32) -> Option<(f32, f32)>,
+        thrown: impl Fn(Vec3, Vec3, f32) -> (Vec3, Vec3),
+    ) -> usize {
+        let mut threw = 0;
+        for &blast in blasts {
+            let hit: Vec<_> = self
+                .pickups
+                .iter()
+                .filter_map(|p| {
+                    let d = p.at.distance(blast);
+                    let w = weigh(p.what.template).filter(|_| d < reach)?;
+                    Some((p.key(), p.at, d, w))
+                })
+                .collect();
+            for (key, at, d, w) in hit {
+                threw += usize::from(self.fling(physics, key, thrown(blast, at, d), w));
+            }
+        }
+        threw
+    }
+
+    /// Throws what a moving vehicle runs into (its box, `place` and
+    /// `bounds`, meets what lies there, give or take [`RUN_PAD`]), at the
+    /// velocity and spin `flung` gives (its velocity, its mass, the
+    /// pickup's), when it goes at [`RUN_SPEED`] or more. What weighs
+    /// nothing (`weigh`), or is in flight already, stays. Returns how many
+    /// it threw.
+    pub fn run_over(
+        &mut self,
+        physics: &mut Physics,
+        (place, bounds, velocity, mass): (Mat4, (Vec3, Vec3), Vec3, f32),
+        weigh: impl Fn(u32) -> Option<(f32, f32)>,
+        flung: impl Fn(Vec3, f32, f32) -> (Vec3, Vec3),
+    ) -> usize {
+        if velocity.length() < RUN_SPEED {
+            return 0;
+        }
+        let into = place.inverse();
+        let (lo, hi) = (
+            bounds.0 - Vec3::splat(RUN_PAD),
+            bounds.1 + Vec3::splat(RUN_PAD),
+        );
+        let hit: Vec<_> = self
+            .pickups
+            .iter()
+            .filter_map(|p| {
+                let w = weigh(p.what.template)?;
+                let l = into.transform_point3(p.at + Vec3::Y * RUN_PAD);
+                (l.cmpge(lo).all() && l.cmple(hi).all() && !self.in_flight(physics, p.key()))
+                    .then_some((p.key(), w))
+            })
+            .collect();
+        let mut threw = 0;
+        for (key, w) in hit {
+            threw += usize::from(self.fling(physics, key, flung(velocity, mass, w.0), w));
+        }
+        threw
+    }
+
+    /// Whether what lies under `key` is in flight: thrown and still
+    /// moving faster than [`AT_REST`].
+    pub fn in_flight(&self, physics: &Physics, key: (u32, u32)) -> bool {
+        self.tumbling
+            .get(&key)
+            .and_then(|(id, _)| physics.debris_velocity(*id))
+            .is_some_and(|(v, _)| v.length() > AT_REST)
+    }
+
+    /// Moves what was thrown with its body: where it lies (its box's
+    /// lowest point, under its middle) and its heading follow it.
+    fn tumble(&mut self, physics: &mut Physics) {
+        for id in self.gone_bodies.drain(..) {
+            physics.remove_debris(id);
+        }
+        for (key, (id, place)) in &mut self.tumbling {
+            let Some(now) = physics.debris_place(*id) else {
+                continue;
+            };
+            *place = now;
+            let Some(p) = self.pickups.iter_mut().find(|p| p.key() == *key) else {
+                continue;
+            };
+            let Some(&bounds) = p.what.model.and_then(|m| self.boxes.get(&m)) else {
+                continue;
+            };
+            let (lo, hi) = world_box(now, bounds);
+            p.at = Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5);
+            let ahead = now.transform_vector3(Vec3::Z);
+            p.yaw = ahead.x.atan2(ahead.z);
+        }
     }
 
     /// Lays `p` down to be taken (a weapon she left for another), its
@@ -528,6 +701,7 @@ impl Flights {
             e.insert(None);
             self.wanted.push(m);
         }
+        self.still(p.key());
         self.pickups.retain(|q| q.key() != p.key());
         self.pickups.push(p);
     }
@@ -663,6 +837,7 @@ impl Flights {
                 .cast_ray(top, Vec3::NEG_Y, 900.0)
                 .map(|(t, _)| top.y - t)
         };
+        self.tumble(physics);
         let mut releases = Vec::new();
         for i in 0..self.flights.len() {
             // The drop point on the ground as it has loaded (the scripts'
@@ -912,7 +1087,11 @@ impl Flights {
                 .model
                 .and_then(|m| self.models.get(&m).and_then(Option::as_ref))
             {
-                m.gpu.draw(queue, lying(m.gpu.bounds, p.yaw, p.at));
+                let place = match self.tumbling.get(&p.key()) {
+                    Some(&(_, place)) => place,
+                    None => lying(m.gpu.bounds, p.yaw, p.at),
+                };
+                m.gpu.draw(queue, place);
             }
         }
         Hanging { cables, hung }
@@ -985,21 +1164,38 @@ fn wrap(a: f32) -> f32 {
     (a + std::f32::consts::PI).rem_euclid(tau) - std::f32::consts::PI
 }
 
+/// A thrown pickup's box is at least this thick each way, metres, and it
+/// is at rest (no longer in flight) under this speed, m/s (invented).
+const THINNEST: f32 = 0.02;
+const AT_REST: f32 = 0.5;
+/// A vehicle throws what lies in its box, give or take this much
+/// (metres), going at this speed or more (m/s; invented, as the props'
+/// knock speed, `crate::game`'s 1 m/s).
+const RUN_PAD: f32 = 0.15;
+const RUN_SPEED: f32 = 1.0;
+
 /// Where a thing left on the ground is drawn, its box (model space)
-/// resting on `at` turned to `yaw`: on its feet, unless it is taller than
-/// it is long and wide (a weapon, modelled barrel up as it is held), when
-/// it lies on its flattest side.
+/// resting on `at` turned to `yaw`: on its broadest side, its thinnest
+/// way up. A weapon, modelled barrel up as it is held, lies on its side;
+/// so does the ammunition box (`global_pickup_ammo`, 0.6 x 0.4 x 0.3 m,
+/// modelled standing 0.4 m tall: it lies 0.3 m tall) and the health pack
+/// (0.3 x 0.5 x 0.2 m: 0.2 m tall).
+///
+/// From the 360 code: what a death leaves is sent off with a velocity
+/// (82289F40), a physics object, to come to rest as it falls; a box
+/// thrown so comes to rest on a broad side (inferred), as the 360
+/// footage shows the ammunition box and health pack lying on their sides
+/// (Brendan's stills; footage thread, 00:21:29).
 fn lying(bounds: (Vec3, Vec3), yaw: f32, at: Vec3) -> Mat4 {
     let size = bounds.1 - bounds.0;
-    let down = if size.y > size.x.max(size.z) {
-        if size.x < size.z {
-            // Over onto its side: x goes up.
-            Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)
-        } else {
-            Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)
-        }
-    } else {
+    let down = if size.y <= size.x.min(size.z) {
         Quat::IDENTITY
+    } else if size.x < size.z {
+        // Over onto its side: x goes up.
+        Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)
+    } else {
+        // Over onto its back: z goes up.
+        Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)
     };
     let low = (0..8)
         .map(|i| {
@@ -1201,6 +1397,130 @@ mod tests {
             m.transform_point3(Vec3::new(0.5, 0.6, 0.5)),
             Vec3::new(0.5, 0.6, 0.5)
         );
+    }
+
+    #[test]
+    fn the_ammunition_box_and_health_pack_lie_on_their_sides() {
+        // Height lying, as `lying` puts each down.
+        let height = |b: (Vec3, Vec3)| {
+            let (lo, hi) = world_box(lying(b, 0.7, Vec3::ZERO), b);
+            assert!(lo.y.abs() < 1e-5, "resting on the ground: {lo}");
+            hi.y
+        };
+        // `global_pickup_ammo`: 0.6 x 0.4 x 0.3, modelled 0.4 tall.
+        let ammo = (Vec3::new(-0.3, 0.0, -0.15), Vec3::new(0.3, 0.4, 0.15));
+        assert!((height(ammo) - 0.3).abs() < 1e-5);
+        // `global_pickup_health`: 0.3 x 0.5 x 0.2.
+        let health = (Vec3::new(-0.15, 0.05, -0.1), Vec3::new(0.15, 0.55, 0.1));
+        assert!((height(health) - 0.2).abs() < 1e-5);
+    }
+
+    /// A floor, and a gun (`Assault Rifle`) and an ammunition box lying on
+    /// it, the gun at the origin.
+    fn lying_by_a_blast() -> (Physics, Flights) {
+        let mut physics = Physics::new();
+        let floor = CollisionShape::cuboid(Vec3::new(500.0, 1.0, 500.0));
+        physics.add_static(
+            StaticKey::Cell(1),
+            &floor,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let mut flights = Flights::default();
+        flights.set_box(1, (Vec3::new(-0.05, -0.3, -0.1), Vec3::new(0.05, 0.7, 0.1)));
+        flights.set_box(2, (Vec3::new(-0.3, 0.0, -0.15), Vec3::new(0.3, 0.4, 0.15)));
+        for (template, model, at) in [(0x8000_436f, 1, Vec3::ZERO), (0x8000_a286, 2, Vec3::X)] {
+            flights.leave(Pickup {
+                from: 7,
+                what: Leaves {
+                    template,
+                    model: Some(model),
+                    reach: 1.0,
+                    ..Leaves::default()
+                },
+                at,
+                yaw: 0.0,
+            });
+        }
+        (physics, flights)
+    }
+
+    /// The gun weighs 50 kg, pulled 1.5 times (its `_PropPhysics` and
+    /// gravity scale); the box isn't a physics prop.
+    fn weigh(t: u32) -> Option<(f32, f32)> {
+        (t == 0x8000_436f).then_some((50.0, 1.5))
+    }
+
+    #[test]
+    fn a_blast_throws_a_gun_lying_by_it_and_it_comes_to_rest_to_be_taken() {
+        let (mut physics, mut flights) = lying_by_a_blast();
+        let gun = (7, 0x8000_436f);
+        let thrown =
+            |_: Vec3, _: Vec3, _: f32| (Vec3::new(6.0, 5.0, 0.0), Vec3::new(0.0, 0.0, 3.0));
+        let threw = flights.blow(
+            &mut physics,
+            &[Vec3::new(-2.0, 0.0, 0.0)],
+            9.0,
+            weigh,
+            thrown,
+        );
+        // The gun, not the box.
+        assert_eq!(threw, 1);
+        assert!(flights.in_flight(&physics, gun));
+        let dt = 1.0 / 60.0;
+        let mut highest = 0.0f32;
+        for _ in 0..60 * 6 {
+            physics.step(dt);
+            flights.step(dt, &mut physics, &mut [], Vec3::ZERO);
+            let p = flights.pickups().iter().find(|p| p.key() == gun).unwrap();
+            highest = highest.max(p.at.y);
+        }
+        assert!(!flights.in_flight(&physics, gun), "at rest after 6 s");
+        let p = *flights.pickups().iter().find(|p| p.key() == gun).unwrap();
+        // Up in the air on the way (5 m/s up, 1.5 g: its middle about
+        // 0.85 m, less the air's drag; its lowest corner, turning, less),
+        // down well off where it lay, on the floor.
+        assert!(highest > 0.3, "rose {highest}");
+        assert!(p.at.x > 2.0, "landed at {}", p.at);
+        assert!(p.at.y.abs() < 0.1, "on the floor: {}", p.at);
+        // The box lies where it was.
+        let ammo = flights
+            .pickups()
+            .iter()
+            .find(|p| p.what.model == Some(2))
+            .unwrap();
+        assert_eq!(ammo.at, Vec3::X);
+        // Taken, its body goes.
+        assert!(flights.take(gun).is_some());
+        flights.step(dt, &mut physics, &mut [], Vec3::ZERO);
+        assert!(flights.tumbling.is_empty() && flights.gone_bodies.is_empty());
+    }
+
+    #[test]
+    fn a_vehicle_on_the_move_throws_a_gun_in_its_way() {
+        let (mut physics, mut flights) = lying_by_a_blast();
+        // A jeep's box over the gun, facing +x.
+        let jeep = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.8, 2.0));
+        let place = Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let flung = |v: Vec3, m: f32, kg: f32| (v * (m / (m + kg)) + Vec3::Y, Vec3::ZERO);
+        // Standing: nothing.
+        let still = (place, jeep, Vec3::ZERO, 1500.0);
+        assert_eq!(flights.run_over(&mut physics, still, weigh, flung), 0);
+        // At 8 m/s: the gun goes, ahead of it; the box (not a physics
+        // prop) stays.
+        let going = (place, jeep, Vec3::new(8.0, 0.0, 0.0), 1500.0);
+        assert_eq!(flights.run_over(&mut physics, going, weigh, flung), 1);
+        // In flight, it isn't thrown again.
+        assert_eq!(flights.run_over(&mut physics, going, weigh, flung), 0);
+        let (_, v) = physics_velocity(&physics, &flights, (7, 0x8000_436f));
+        assert!(v.x > 7.0, "flung at {v}");
+    }
+
+    fn physics_velocity(physics: &Physics, flights: &Flights, key: (u32, u32)) -> (Vec3, Vec3) {
+        let (id, _) = flights.tumbling[&key];
+        let (v, spin) = physics.debris_velocity(id).unwrap();
+        (spin, v)
     }
 
     #[test]
