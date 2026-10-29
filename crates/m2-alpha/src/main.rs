@@ -1212,16 +1212,27 @@ fn build_scene(
     }
     let (eye, target) = scene.focus;
     let mut game = Game::new(scene, FlyCamera::looking_at(eye, target));
-    if let (Some(install), Mode::Island(_)) = (install, mode) {
+    if let (Some(_), Mode::Island(_)) = (install, mode) {
         // A state layer's people wait for the scripts to load it.
         game.scene.people.state_layers = Some(HashSet::new());
-        // Free roam: the island's vehicles stand where the game's start-up
-        // layers put them (with `--mission` the scripts' own layers do).
-        if !mission {
-            game.startup = Some(startup::Startup::start(install, game.scene.hero));
-        }
     }
     Ok(game)
+}
+
+/// Free roam: the island's vehicles, people and state layers are those
+/// the game's start-up layers hold (with `--mission` the scripts' own
+/// layers are). With `save` (`--load`) the start-up carries on from its
+/// campaign, so a mid-game save gets that act's layers.
+fn start_startup(
+    game: &mut Game,
+    install: Option<&Install>,
+    mode: &Mode,
+    mission: bool,
+    save: Option<&save::SaveGame>,
+) {
+    if let (Some(install), Mode::Island(_), false) = (install, mode, mission) {
+        game.startup = Some(startup::Startup::start(install, game.scene.hero, save));
+    }
 }
 
 /// Hands her the weapons `--gun` names.
@@ -1695,6 +1706,13 @@ fn screenshot(
         options.mission,
         config.hero,
     )?;
+    start_startup(
+        &mut game,
+        install,
+        mode,
+        options.mission,
+        options.load.as_ref(),
+    );
     game.scene.people.smarter = config.enhanced.smarter_ai;
     give_guns(&mut game, &options.guns);
     if options.fly {
@@ -7428,6 +7446,13 @@ impl App {
             self.mission,
             self.config.hero,
         )?;
+        start_startup(
+            &mut game,
+            self.install.as_ref(),
+            &self.mode,
+            self.mission,
+            self.load.as_ref(),
+        );
         game.scene.people.smarter = self.config.enhanced.smarter_ai;
         give_guns(&mut game, &self.guns);
         if self.fly {
