@@ -382,6 +382,10 @@ struct Options {
     /// With `--screenshot --drive`: load the seats' clips first, so she
     /// is seen sitting in the vehicle as she drives it.
     seated: bool,
+    /// With `--screenshot --drive`: walk up to the vehicle's front right
+    /// door and get in and out with the use key, logging the entrance,
+    /// seat and exit the rules give.
+    board: bool,
     mission_seconds: f32,
     /// With `--mission --autoplay`: she plays on through this many
     /// contracts (the first, then the story's next ones) before she stops
@@ -691,6 +695,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 );
             }
             "--seated" => o.seated = true,
+            "--board" => o.board = true,
             "--load" => o.load = Some(save::SaveGame::read(&PathBuf::from(value()?))?),
             "--save-to" => o.save_to = Some(value()?.into()),
             "--load-at" => o.load_at = Some(value()?.parse().context("--load-at expects seconds")?),
@@ -5689,6 +5694,9 @@ fn drive_for_screenshot(
         }
         return Ok(());
     }
+    if options.board {
+        return board_for_check(game, options, tick);
+    }
     let entered = match &options.vehicle {
         Some(want) => {
             let here = game.focus();
@@ -6080,6 +6088,95 @@ fn drive_for_screenshot(
 
 /// Where the gun of the vehicle she drives fired from: its muzzle on the
 /// model, and where its flash is, on the model and in the world.
+/// `--board`: she is put 0.6 m out from the front right door of the
+/// parked vehicle nearest (of `--vehicle`'s, if given), looking at it,
+/// presses the use key, sits a second, and presses it again to get out.
+/// The game's log lines (`enter:`, `exit:`) say which entrance, seat and
+/// exit the rules chose.
+fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Result<()> {
+    use m2_math::glam::Vec3;
+    let want = options.vehicle.as_deref().unwrap_or("");
+    let here = game.focus();
+    let world = game.scene.world.as_ref();
+    let pick = game
+        .scene
+        .vehicles
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.spec.label.to_ascii_lowercase().contains(want))
+        .filter(|(_, v)| !v.spec.entrances.is_empty())
+        .filter_map(|(i, v)| {
+            let at = world?.physics.vehicle_transform(v.id?)?;
+            Some((i, at, at.transform_point3(Vec3::ZERO).distance(here)))
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2));
+    let Some((i, at, _)) = pick else {
+        eprintln!("board: no parked vehicle with entrance data");
+        return Ok(());
+    };
+    let spec = &game.scene.vehicles[i].spec;
+    let right = m2_assets::name_hash("entrance_front_right");
+    let Some(&(e, local)) = spec
+        .entrances
+        .iter()
+        .find(|(e, _)| e.name == right)
+        .or(spec.entrances.first())
+    else {
+        return Ok(());
+    };
+    let label = spec.label.clone();
+    let (door, centre) = (at.transform_point3(local), at.transform_point3(Vec3::ZERO));
+    let stand = door + (door - centre).with_y(0.0).normalize_or_zero() * 0.6;
+    eprintln!(
+        "board: the {label}: standing by entrance {:#010x} at local {:.2?}",
+        e.name,
+        local.to_array()
+    );
+    if let Some(p) = game.scene.player.as_mut() {
+        p.drop_at(stand + Vec3::Y);
+        let to = centre - stand;
+        p.yaw = to.x.atan2(to.z);
+        p.pitch = 0.0;
+        p.facing = p.yaw;
+    }
+    for _ in 0..600 {
+        if game.scene.player.as_ref().is_some_and(|p| p.landed) {
+            break;
+        }
+        game.step(Intent::default(), tick);
+    }
+    let use_key = Intent {
+        use_pressed: true,
+        ..Intent::default()
+    };
+    game.step(use_key, tick);
+    let driving = game.scene.player.as_ref().and_then(|p| p.driving);
+    eprintln!(
+        "board: pressed use: in {:?}",
+        driving.map(|d| &game.scene.vehicles[d].spec.label)
+    );
+    for _ in 0..60 {
+        game.step(Intent::default(), tick);
+    }
+    game.step(use_key, tick);
+    for _ in 0..120 {
+        game.step(Intent::default(), tick);
+    }
+    if let (Some(p), Some(w)) = (&game.scene.player, &game.scene.world)
+        && let Some(at) = game.scene.vehicles[i]
+            .id
+            .and_then(|id| w.physics.vehicle_transform(id))
+    {
+        let her = at.inverse().transform_point3(p.character.position);
+        eprintln!(
+            "board: pressed use again: driving {:?}, she stands at local {:.2?}",
+            p.driving,
+            her.to_array()
+        );
+    }
+    Ok(())
+}
+
 fn describe_vehicle_fire(game: &Game) {
     let Some(v) = game
         .scene

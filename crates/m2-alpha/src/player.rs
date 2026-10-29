@@ -1291,6 +1291,8 @@ mod tests {
             bounds: (Vec3::new(-1.8, 0.0, -3.3), Vec3::new(2.0, 4.2, 8.1)),
             seat: None,
             door: None,
+            seating: None,
+            entrances: Vec::new(),
             tracked: true,
             road_wheels: Vec::new(),
             rest: Vec::new(),

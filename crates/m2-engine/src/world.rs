@@ -300,6 +300,9 @@ pub struct Templates {
     /// Where each vehicle template's driver sits and gets out, by id
     /// ([`crate::seats::read`]).
     pub driver_points: HashMap<u32, crate::seats::DriverPoints>,
+    /// Each vehicle template's seats and entrances, by id
+    /// ([`crate::seats::read_vehicles`]).
+    pub vehicle_seats: HashMap<u32, std::sync::Arc<crate::seats::VehicleSeats>>,
     /// How air strikes' ordnance flies and what its blasts do.
     pub ordnance: crate::ordnance::Ordnance,
     /// The effects each template shows, by id
@@ -684,6 +687,32 @@ impl Templates {
             .find_map(|(_, id)| self.driver_points.get(id).copied())
     }
 
+    /// The seats and entrances of template `name` (a vehicle's own), else
+    /// of the first by name of `model`'s templates that give them (as
+    /// [`Self::driver_points_for`]).
+    pub fn vehicle_seats_for(
+        &self,
+        name: &str,
+        model: u32,
+    ) -> Option<std::sync::Arc<crate::seats::VehicleSeats>> {
+        if let Some(s) = self
+            .ids(name)
+            .iter()
+            .find_map(|id| self.vehicle_seats.get(id))
+        {
+            return Some(s.clone());
+        }
+        let mut ids: Vec<(String, u32)> = self
+            .names
+            .iter()
+            .filter(|(_, n)| self.get(n).is_some_and(|t| t.model == Some(model)))
+            .map(|(&id, n)| (n.to_ascii_lowercase(), id))
+            .collect();
+        ids.sort();
+        ids.iter()
+            .find_map(|(_, id)| self.vehicle_seats.get(id).cloned())
+    }
+
     /// The parts' health of template `name` (a vehicle's own), else of
     /// the first by name of `model`'s templates that give them.
     pub fn part_healths_for(
@@ -889,6 +918,10 @@ impl Templates {
             grapple: crate::grapple::read(&db),
             entrance_points: crate::hijack::entrance_points(&db),
             driver_points: crate::seats::read(&db),
+            vehicle_seats: crate::seats::read_vehicles(&db)
+                .into_iter()
+                .map(|(id, s)| (id, std::sync::Arc::new(s)))
+                .collect(),
             ordnance: crate::ordnance::read(&db),
             effects: crate::particles::template_effects(&db),
             crashable: crate::durability::crashable(&db),

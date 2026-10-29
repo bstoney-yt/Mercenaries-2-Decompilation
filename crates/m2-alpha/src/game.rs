@@ -190,6 +190,9 @@ pub struct Game {
     /// Vehicles (by guid) the scripts keep for themselves
     /// (`Vehicle.Usable(vehicle, false)`): the use key doesn't get her in.
     pub unusable: HashSet<u32>,
+    /// The vehicle she last got into: the use key sticks to its entrances
+    /// ([`entrance_pick`]).
+    pub last_vehicle: Option<usize>,
     /// The field of view (degrees, bottom to top) and the screen's width
     /// over its height the last frame was drawn with: what the scripts'
     /// camera sees (`Event.ObjectIsVisible`).
@@ -391,6 +394,7 @@ impl Game {
             countdown_tick: false,
             hijack_only: HashSet::new(),
             unusable: HashSet::new(),
+            last_vehicle: None,
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
             context: None,
@@ -987,13 +991,18 @@ impl Game {
                             self.combat.manned = Some(m);
                         }
                         None => {
-                            player.driving = nearest(
+                            let picked = entrance_pick(
                                 physics,
                                 &scene.vehicles,
                                 (&self.hijack_only, &self.unusable),
                                 player,
-                                REACH,
+                                self.last_vehicle,
                             );
+                            player.driving = picked.map(|(i, _)| i);
+                            if let Some((i, entrance)) = picked {
+                                self.last_vehicle = Some(i);
+                                log_entry(physics, &scene.vehicles[i], player, entrance);
+                            }
                             // Seated: she no longer waits to land (people
                             // wait on that, and she may have hopped out and
                             // back in before the ground streamed).
@@ -2015,14 +2024,14 @@ impl Game {
             _ => None,
         };
         let can_enter = match (&self.scene.world, player) {
-            (Some(w), Some(p)) if p.driving.is_none() && p.landed => nearest(
+            (Some(w), Some(p)) if p.driving.is_none() && p.landed => entrance_pick(
                 &w.physics,
                 &self.scene.vehicles,
                 (&self.hijack_only, &self.unusable),
                 p,
-                REACH,
+                self.last_vehicle,
             )
-            .map(|i| {
+            .map(|(i, _)| {
                 let spec = &self.scene.vehicles[i].spec;
                 vehicle_name(&w.index.template_db, strings, &spec.label, spec.model)
             }),
@@ -3591,8 +3600,6 @@ fn put_out(
     }
 }
 
-/// The vehicle nearest her within `reach` metres of its door marker (or its
-/// hull, for those without one).
 /// Whether a vehicle of catalogue kind `kind` has a seat to get into: not
 /// a trailer (ChiCon003's `civ_veh_trailer_flatbed`, kind `trailer`, was
 /// got into for the M2A3 it carries, and "driven" stuck for 3,200 s).
@@ -3601,17 +3608,137 @@ fn can_sit_in(kind: &str) -> bool {
     kind != "trailer"
 }
 
-fn nearest(
+/// The vehicle she gets into at a press of the use key, and the entrance
+/// she gets in by (`None` for a vehicle without entrance data), as the 360
+/// does ([`m2_engine::seats`]): of the entrances in front of the camera
+/// within their `UseDistance` + 1 m of her, the nearest, sticking to
+/// `last`, the vehicle she last got into. A vehicle without entrance
+/// data is reached at its door marker (or hull) within [`REACH`]
+/// (Invented stand-in, the beta's rule).
+fn entrance_pick(
     physics: &Physics,
     vehicles: &[ParkedVehicle],
-    (hijack_only, unusable): (&HashSet<u32>, &HashSet<u32>),
+    rules: (&HashSet<u32>, &HashSet<u32>),
     player: &Player,
-    reach: f32,
-) -> Option<usize> {
-    let p = player.character.position;
+    last: Option<usize>,
+) -> Option<(usize, Option<u32>)> {
+    use m2_engine::seats::{self, Candidate};
+    let her = player.character.position;
+    let (eye, aim) = (player.eye(), player.camera_forward());
+    let mut found: Vec<(Candidate, Option<u32>)> = Vec::new();
+    for (i, v) in usable(vehicles, rules) {
+        let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id)) else {
+            continue;
+        };
+        let upright = at.transform_vector3(Vec3::Y).normalize_or_zero().y >= seats::UPRIGHT_MIN_Y;
+        if v.spec.entrances.is_empty() {
+            let d = reach_of(at, &v.spec, her);
+            if d <= REACH {
+                let c = Candidate {
+                    vehicle: i,
+                    distance_sq: d * d,
+                    use_distance: REACH,
+                    upright,
+                    offered: true,
+                };
+                found.push((c, None));
+            }
+            continue;
+        }
+        for &(e, local) in &v.spec.entrances {
+            let place = at.transform_point3(local);
+            let p = e.params;
+            if seats::in_search(her, eye, aim, place, p.use_distance, seats::SEARCH_PAD) {
+                let c = Candidate {
+                    vehicle: i,
+                    distance_sq: her.distance_squared(place),
+                    use_distance: p.use_distance,
+                    upright,
+                    // The scripts' `Vehicle.Usable` stays the alpha's rule
+                    // ([`usable`]); ladders' seat paths are not checked.
+                    offered: seats::offered(&p, true),
+                };
+                found.push((c, Some(e.name)));
+            }
+        }
+    }
+    found.truncate(seats::LIST_CAP);
+    let cands: Vec<Candidate> = found.iter().map(|(c, _)| *c).collect();
+    let k = seats::pick(&cands, last)?;
+    Some((found[k].0.vehicle, found[k].1))
+}
+
+/// Logs her getting into `v` by `entrance`: how far she stood from it and
+/// the seat the 360 would give her. The alpha seats her at the wheel
+/// whichever it is: from a car's or truck's passenger seat hero.lua's
+/// `EnterPassengerCallback` slides her over to a free driver's seat; a
+/// gunner's seat of her own is not modelled yet.
+fn log_entry(physics: &Physics, v: &ParkedVehicle, player: &Player, entrance: Option<u32>) {
+    let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id)) else {
+        return;
+    };
+    let her = at.inverse().transform_point3(player.character.position);
+    let Some(e) = entrance else {
+        eprintln!(
+            "enter: {} by its door marker (no entrance data), her local {:.2?}",
+            v.spec.label,
+            her.to_array()
+        );
+        return;
+    };
+    let place = v.spec.entrance_at(e).unwrap_or(Vec3::ZERO);
+    let ud = v
+        .spec
+        .entrances
+        .iter()
+        .find(|(x, _)| x.name == e)
+        .map_or(0.0, |(x, _)| x.params.use_distance);
+    eprintln!(
+        "enter: {} by entrance {e:#010x} at local {:.2?} (UseDistance {ud}), her local {:.2?}, \
+         {:.2} m; seat {:x?}",
+        v.spec.label,
+        place.to_array(),
+        her.to_array(),
+        her.distance(place),
+        seat_by(v, e)
+    );
+}
+
+/// Her distance from vehicle `spec` standing at `at`: from its door marker,
+/// else its hull.
+fn reach_of(at: Mat4, spec: &VehicleSpec, her: Vec3) -> f32 {
+    let local = at.inverse() * her.extend(1.0);
+    let (lo, hi) = spec.bounds;
+    match spec.door {
+        Some(door) => (local.xyz() - door).length(),
+        None => (local.xyz().clamp(lo, hi) - local.xyz()).length(),
+    }
+}
+
+/// The seat entrance `entrance` of `v` gives her (0x8229A1C8): the first
+/// free one she may use that it leads to; its `SeatLink` name.
+fn seat_by(v: &ParkedVehicle, entrance: u32) -> Option<u32> {
+    let s = v.spec.seating.as_ref()?;
+    let taken = |i: usize| {
+        let name = s.seats[i].name;
+        v.crew
+            .iter()
+            .any(|(seat, _)| m2_assets::name_hash(seat) == name)
+    };
+    let i = m2_engine::seats::seat_for_entrance(&s.seats, entrance, taken)?;
+    Some(s.seats[i].name)
+}
+
+/// The vehicles she may get into, with their indices: not wrecked, with a
+/// seat, and not kept by the scripts or an action hijack while crewed.
+fn usable<'a>(
+    vehicles: &'a [ParkedVehicle],
+    (hijack_only, unusable): (&'a HashSet<u32>, &'a HashSet<u32>),
+) -> impl Iterator<Item = (usize, &'a ParkedVehicle)> + 'a {
     vehicles
         .iter()
         .enumerate()
+        .filter(|(_, v)| !v.wrecked && can_sit_in(&v.spec.kind))
         .filter(|(_, v)| !v.wrecked && can_sit_in(&v.spec.kind))
         // Crewed, one with an action hijack is taken only by it (playtest
         // 5: the villa's tank, whose scripts make it usable by the hijack
@@ -3624,18 +3751,22 @@ fn nearest(
         // crewed tank is the hijack's alone). From those samples; the 360
         // code not checked.
         .filter(|(_, v)| !(v.guid.is_some_and(|g| unusable.contains(&g)) && has_driver(&v.crew)))
-        // One with someone in the driver's seat is taken from them: the
-        // action hijacks (tanks, helicopters) took the key first if near
-        // ([`crate::hijack`]); cars, bikes and jeeps have none in the data
-        // and are got into, the driver put out ([`take_seat`]).
+}
+
+/// The vehicle nearest her within `reach` metres of its door marker (or its
+/// hull, for those without one): `--drive`'s pick, at any distance. One
+/// with someone in the driver's seat is taken from them ([`take_seat`]).
+fn nearest(
+    physics: &Physics,
+    vehicles: &[ParkedVehicle],
+    rules: (&HashSet<u32>, &HashSet<u32>),
+    player: &Player,
+    reach: f32,
+) -> Option<usize> {
+    let p = player.character.position;
+    usable(vehicles, rules)
         .filter_map(|(i, v)| {
-            let at = physics.vehicle_transform(v.id?)?;
-            let local = at.inverse() * p.extend(1.0);
-            let (lo, hi) = v.spec.bounds;
-            let d = match v.spec.door {
-                Some(door) => (local.xyz() - door).length(),
-                None => (local.xyz().clamp(lo, hi) - local.xyz()).length(),
-            };
+            let d = reach_of(physics.vehicle_transform(v.id?)?, &v.spec, p);
             (d <= reach).then_some((i, d))
         })
         .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -3678,18 +3809,83 @@ pub(crate) fn can_get_out(physics: &Physics, v: &ParkedVehicle) -> bool {
 /// The deepest water she gets out of a boat into, metres: chest deep.
 const WADE: f32 = 1.4;
 
-/// Gets her out on the driver's side, beside the hull, to drop to the
-/// ground there.
+/// How and where she gets out of `v`, standing at `at` and moving at
+/// `velocity`, from the driver's seat ([`m2_engine::seats::exit_kind`]),
+/// and where she lands, world space: the hardpoint of the seat's exit
+/// entrance at the hull's height (0x822A1B70 puts a ditching rider there;
+/// Invented for the animated exit, whose clip is not played), or beside
+/// the hull by the door when the way there is blocked (Invented stand-in
+/// for 0x822A13D0's clear point) or the hardpoint lies within the hull (a
+/// boat's driver gets out at the seat itself).
+fn exit_plan(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    at: Mat4,
+    velocity: Vec3,
+) -> (m2_engine::seats::ExitKind, Vec3) {
+    use m2_engine::seats::{self, ExitKind};
+    let seating = v.spec.seating.as_deref();
+    let seat = seating.and_then(|s| Some(&s.seats[s.driver()?]));
+    let exit = seating.and_then(|s| s.exit_of(s.driver()?));
+    let local = exit
+        .and_then(|e| v.spec.entrance_at(e.name))
+        .map(|p| Vec3::new(p.x, 0.0, p.z));
+    let (lo, hi) = v.spec.bounds;
+    let local = local.filter(|p| !(lo.x..=hi.x).contains(&p.x) || !(lo.z..=hi.z).contains(&p.z));
+    let place = local.map(|p| at.transform_point3(p));
+    // The 360 sweeps her capsule (0.4 m, 0.6 to 1.8 m up) from her seat to
+    // the hardpoint (0x8229AC90); here one ray at 1.2 m.
+    let blocked = place.zip(v.id).is_some_and(|(to, id)| {
+        let from = at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO)) + Vec3::Y * 1.2;
+        let way = to + Vec3::Y * 1.2 - from;
+        physics.cast_ray_past(from, way, way.length(), id).is_some()
+    });
+    let up_y = at.transform_vector3(Vec3::Y).normalize_or_zero().y;
+    // A helicopter's landed share is not modelled: it counts as landed
+    // (Invented; 0x822A2B60 ditches from one in the air).
+    let kind = seats::exit_kind(
+        seat,
+        exit.map(|e| &e.params),
+        velocity.length(),
+        false,
+        up_y,
+        blocked,
+    );
+    let place = match (kind, place) {
+        (ExitKind::Snap, _) | (_, None) => door_out(at, &v.spec),
+        (_, Some(p)) => p,
+    };
+    (kind, place)
+}
+
+/// Gets her out of `v` as [`exit_plan`] has it, to drop to the ground
+/// there; ditching or tossed, she keeps the push off (a toss's own push,
+/// 0x822A1B70's passed speed, is not traced: it gets the ditch's).
 pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player) {
-    if let Some(at) =
-        v.id.and_then(|id| physics.vehicle_transform(id))
-            .filter(|at| at.is_finite())
+    if let Some((id, at)) =
+        v.id.and_then(|id| Some((id, physics.vehicle_transform(id)?)))
+            .filter(|(_, at)| at.is_finite())
     {
+        use m2_engine::seats::ExitKind;
+        let velocity = physics.vehicle_velocity(id);
+        let (kind, place) = exit_plan(physics, v, at, velocity);
         // At the hull's height: onto the ground by the door, not onto a
         // boulder or roof over it.
-        player.drop_at(door_out(at, &v.spec));
+        player.drop_at(place);
+        if matches!(kind, ExitKind::Ditch | ExitKind::Toss) {
+            let out = place - at.transform_point3(Vec3::ZERO);
+            player.character.velocity =
+                m2_engine::seats::ditch_velocity(velocity, Vec3::new(out.x, 0.0, out.z));
+        }
         let f = at.transform_vector3(Vec3::Z);
         player.facing = f.x.atan2(f.z);
+        let local = at.inverse().transform_point3(place);
+        eprintln!(
+            "exit: {} {kind:?} at {:.1} m/s, out at local {:.2?}",
+            v.spec.label,
+            velocity.length(),
+            local.to_array()
+        );
     }
     player.driving = None;
     player.chase_target = None;

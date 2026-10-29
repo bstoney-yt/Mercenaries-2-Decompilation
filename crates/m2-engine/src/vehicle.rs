@@ -204,6 +204,12 @@ pub struct VehicleSpec {
     /// ([`VehicleSpec::with_driver_points`]) once tuned, else fixed markers.
     pub seat: Option<Vec3>,
     pub door: Option<Vec3>,
+    /// Its template's seats and entrances ([`crate::seats::VehicleSeats`]),
+    /// when the data gives them ([`VehicleSpec::with_seating`]).
+    pub seating: Option<std::sync::Arc<crate::seats::VehicleSeats>>,
+    /// Those entrances whose hardpoint node the model has, with that
+    /// node's place, model space.
+    pub entrances: Vec<(crate::seats::Entrance, Vec3)>,
     /// Tracked vehicles (tanks, APCs without usable wheels) drive on four
     /// made-up wheels; their road wheels turn with the ground covered.
     pub tracked: bool,
@@ -631,6 +637,8 @@ impl VehicleSpec {
             bounds,
             seat: marker(DRIVER_SEAT),
             door: marker(DRIVER_DOOR),
+            seating: None,
+            entrances: Vec::new(),
             tracked,
             road_wheels,
             rest,
@@ -695,6 +703,34 @@ impl VehicleSpec {
         self.seat = seat.or(self.seat);
         self.door = door.or(self.door);
         self
+    }
+
+    /// With its template's seats and entrances, each entrance placed at its
+    /// hardpoint's node (one whose node the model lacks is left out).
+    pub fn with_seating(
+        mut self,
+        seating: Option<std::sync::Arc<crate::seats::VehicleSeats>>,
+    ) -> Self {
+        let node = |hash: u32| {
+            let i = self.node_names.iter().position(|&n| n == hash)?;
+            self.rest.get(i).map(|m| m.w_axis.truncate())
+        };
+        self.entrances = seating.as_ref().map_or_else(Vec::new, |s| {
+            s.entrances
+                .iter()
+                .filter_map(|e| Some((*e, node(e.hardpoint?)?)))
+                .collect()
+        });
+        self.seating = seating;
+        self
+    }
+
+    /// The place, model space, of its entrance named `name`.
+    pub fn entrance_at(&self, name: u32) -> Option<Vec3> {
+        self.entrances
+            .iter()
+            .find(|(e, _)| e.name == name)
+            .map(|&(_, at)| at)
     }
 
     /// With its template's tuning: its mass and how far its gun tilts.
@@ -1118,6 +1154,8 @@ mod tests {
             bounds: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2)),
             seat: None,
             door: None,
+            seating: None,
+            entrances: Vec::new(),
             tracked: false,
             road_wheels: Vec::new(),
             rest: vec![

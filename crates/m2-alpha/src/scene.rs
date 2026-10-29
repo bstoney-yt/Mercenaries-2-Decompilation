@@ -2374,7 +2374,8 @@ impl Scene {
             let markers = (spec.seat, spec.door);
             let has = |h: u32| spec.node_names.contains(&h);
             let found = driver.map(|p| (has(p.seat), p.door.map(has)));
-            let spec = spec.with_driver_points(driver);
+            let seating = db.vehicle_seats_for(&spec.label, spec.model);
+            let spec = spec.with_driver_points(driver).with_seating(seating);
             eprintln!(
                 "driver: {}: seat {:?} door {:?} (seat data {driver:x?}, nodes found {found:?}; fixed markers {:?} {:?})",
                 spec.label, spec.seat, spec.door, markers.0, markers.1,
