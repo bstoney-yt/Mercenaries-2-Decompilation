@@ -274,6 +274,21 @@ pub fn prop_physics(db: &Layer<'_>) -> HashMap<u32, PropPhysics> {
         .collect()
 }
 
+/// Each template's `PhysicsPropertyGravityScaler` `Scale`, by id: how
+/// many times gravity pulls its objects (1.5 on the weapons and grenades
+/// that lie to be taken: the `Assault Rifle`, the `Grenade`; PC data,
+/// 2026-10-29; from samples).
+pub fn gravity_scales(db: &Layer<'_>) -> HashMap<u32, f32> {
+    let t = Table::new(db, "PhysicsPropertyGravityScaler");
+    let scale = name_hash("Scale");
+    t.templates()
+        .filter_map(|id| {
+            let s = t.float(t.of_template(id).first()?, scale)?;
+            (s.is_finite() && s > 0.0).then_some((id, s))
+        })
+        .collect()
+}
+
 /// Each template's `ModifierKey` (its field of that name, a name hash:
 /// `PropFragile`, `Prop`, `Fence`, `Shack`, `Car`, `Tank`, ...), by id:
 /// the damage table's row for what its objects take of each kind of
