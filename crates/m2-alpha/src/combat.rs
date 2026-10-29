@@ -530,6 +530,21 @@ const BOMB_FINAL: (f32, f32) = (2.0, 500.0);
 const RIFLE_ON_VEHICLE: (f32, Round) = (9.0, Round::Bullet);
 const MG_ON_VEHICLE: (f32, Round) = (15.0, Round::BulletLarge);
 
+/// What a soldier's round does to a vehicle: their gun's bullet template's
+/// own `Damage` and `DamageKey` (a `BulletLarge` is one, any other a
+/// `Bullet`); without a gun read, [`RIFLE_ON_VEHICLE`].
+fn npc_round_on_vehicle(gun: Option<m2_engine::tuning::HandGun>) -> (f32, Round) {
+    let Some(g) = gun else {
+        return RIFLE_ON_VEHICLE;
+    };
+    let round = if g.damage_key == Some(m2_assets::name_hash("BulletLarge")) {
+        Round::BulletLarge
+    } else {
+        Round::Bullet
+    };
+    (g.damage, round)
+}
+
 /// A round's `DamageKey`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Round {
@@ -543,11 +558,6 @@ const BLAST_ON_VEHICLE: (f32, f32, f32) = (200.0, 50.0, 5.0);
 /// Below its `TickDamage` health a vehicle burns down this fast, health a
 /// second (the template's 1 every 0.5 s, read as seconds).
 const BURN_DOWN: f32 = 2.0;
-
-/// Vehicles closing slower than this, m/s, meet without a crash (a nudge
-/// while parking). Invented: the props' least ram speed is 1 m/s; 2 keeps
-/// traffic queueing bumper to bumper out of it.
-const CRASH_SPEED: f32 = 2.0;
 
 /// How often the effects vehicles' parts keep going are kept up, seconds
 /// (well inside a held effect's life).
@@ -3123,7 +3133,7 @@ impl Combat {
                 self.tally.rounds_on_her += u32::from(lost > 0.0);
             }
             if let Some((t, None)) = hit {
-                self.round_on_vehicle(f, (from, dir, t), RIFLE_ON_VEHICLE, None);
+                self.round_on_vehicle(f, (from, dir, t), npc_round_on_vehicle(gun), None);
             }
         }
     }
@@ -3836,17 +3846,20 @@ impl Combat {
     }
 
     /// Vehicles running into each other, body to body: as a pair meets,
-    /// each takes the other's ram ([`m2_engine::durability::ram`] of the
-    /// other's mass at the speed they closed at, before the step that
-    /// met) times the damage table's cell for its own `ModifierKey` row
-    /// and the rams' kind (`Car`, every vehicle's `DamageKey`): a `Car`
-    /// takes twice it, a `Tank` none. The part where they met takes the
-    /// unscaled ram, as a round's part takes the round's
-    /// ([`ParkedVehicle::hit_parts`]). Returns the crashes, for the log:
-    /// (struck vehicle, the other, closing speed, damage it took).
-    /// The table's cells are the data's; the ram's size is invented
-    /// (shared with the run-overs and the props'), and so is the
-    /// [`CRASH_SPEED`] threshold.
+    /// the crash's size is [`m2_engine::durability::crash_size`] of both
+    /// masses at the speed they closed at along the contact normal
+    /// (before the step that met), and each takes
+    /// [`m2_engine::durability::crash_damage`] of it with the damage
+    /// table's cell for its own `ModifierKey` row and the other's kind
+    /// (`Car`, every vehicle's `DamageKey`): a `Car` takes twice the
+    /// hundredth, a `Tank` none, and nothing under size 5 or past no more
+    /// than 1. The part where they met takes the same. Returns the
+    /// crashes, for the log: (struck vehicle, the other, closing speed,
+    /// damage it took). From the 360 code: the size, floor, hundredth and
+    /// cells (0x82162BB8, 0x82163758, 0x8228B5F0, 0x82287CF8). Inferred:
+    /// one crash per meeting (the 360 sends one for each new contact),
+    /// and the `DamageModifier` multiplier (a body landing on another
+    /// from above) is left out.
     pub fn vehicle_crashes(
         &mut self,
         physics: &mut Physics,
@@ -3856,45 +3869,49 @@ impl Combat {
         let mut met = Vec::new();
         for (i, v) in vehicles.iter().enumerate() {
             let Some(a) = v.id else { continue };
-            for (b, at) in physics.vehicle_bumps(a) {
+            for (b, at, normal) in physics.vehicle_bumps(a) {
                 let pair = if (a, b) < (b, a) { (a, b) } else { (b, a) };
                 if now.insert(pair)
                     && !self.bumping.contains(&pair)
                     && let Some(j) = vehicles.iter().position(|w| w.id == Some(b))
                 {
-                    met.push((i, j, at));
+                    met.push((i, j, at, normal));
                 }
             }
         }
         self.bumping = now;
         let kind = m2_assets::name_hash(m2_engine::durability::RAM_KIND);
         let mut out = Vec::new();
-        for (i, j, at) in met {
+        for (i, j, at, normal) in met {
             let (Some(a), Some(b)) = (vehicles[i].id, vehicles[j].id) else {
                 continue;
             };
-            let closing =
-                (physics.vehicle_velocity_before(a) - physics.vehicle_velocity_before(b)).length();
-            if closing < CRASH_SPEED {
+            let relative = physics.vehicle_velocity_before(a) - physics.vehicle_velocity_before(b);
+            let closing = relative.dot(normal).abs();
+            let size = m2_engine::durability::crash_size(
+                vehicles[i].spec.mass,
+                vehicles[j].spec.mass,
+                closing,
+            );
+            if size < m2_engine::durability::CRASH_FLOOR {
                 continue;
             }
             for (struck, other) in [(i, j), (j, i)] {
                 if vehicles[struck].wrecked {
                     continue;
                 }
-                let ram = m2_engine::durability::ram(vehicles[other].spec.mass, closing);
-                let scale = match (self.damage_table.as_ref(), vehicles[struck].spec.tuning.key) {
+                let cell = match (self.damage_table.as_ref(), vehicles[struck].spec.tuning.key) {
                     (Some(t), Some(row)) => t.scale(row, kind).unwrap_or(0.0),
                     _ => 0.0,
                 };
-                let damage = ram * scale;
+                let damage = m2_engine::durability::crash_damage(size, cell);
                 if damage <= 0.0 {
                     out.push((struck, other, closing, 0.0));
                     continue;
                 }
                 let v = &mut vehicles[struck];
                 if let Some(body) = v.id.and_then(|id| physics.vehicle_transform(id)) {
-                    v.hit_parts(body, at, ram);
+                    v.hit_parts(body, at, damage);
                 }
                 self.hurt_vehicle(physics, v, struck, damage);
                 out.push((struck, other, closing, damage));

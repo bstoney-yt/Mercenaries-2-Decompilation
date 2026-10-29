@@ -2304,8 +2304,9 @@ impl Physics {
     }
 
     /// The other vehicles a vehicle's body is in contact with, body to
-    /// body, each once, with the deepest point of contact (world space).
-    pub fn vehicle_bumps(&self, id: VehicleId) -> Vec<(VehicleId, Vec3)> {
+    /// body, each once, with the deepest point of contact and the contact
+    /// normal from this one toward the other (world space).
+    pub fn vehicle_bumps(&self, id: VehicleId) -> Vec<(VehicleId, Vec3, Vec3)> {
         let chassis = |v: &VehicleId| {
             self.vehicles
                 .get(v.0)
@@ -2318,7 +2319,7 @@ impl Physics {
         let Some(body) = self.world.bodies.get(own) else {
             return Vec::new();
         };
-        let mut out: Vec<(VehicleId, Vec3)> = Vec::new();
+        let mut out: Vec<(VehicleId, Vec3, Vec3)> = Vec::new();
         for &c in body.colliders() {
             let Some(mine) = self.world.colliders.get(c) else {
                 continue;
@@ -2342,23 +2343,29 @@ impl Physics {
                 else {
                     continue;
                 };
-                if out.iter().any(|(v, _)| *v == them) {
+                if out.iter().any(|(v, ..)| *v == them) {
                     continue;
                 }
-                let Some(deepest) = pair
+                let Some((manifold, deepest)) = pair
                     .manifolds()
                     .iter()
-                    .flat_map(|m| &m.points)
-                    .min_by(|a, b| a.dist.total_cmp(&b.dist))
+                    .flat_map(|m| m.points.iter().map(move |p| (m, p)))
+                    .min_by(|a, b| a.1.dist.total_cmp(&b.1.dist))
                 else {
                     continue;
                 };
-                let local = if first {
-                    deepest.local_p1
+                // The manifold's normal points from its first collider
+                // toward its second.
+                let (local, normal) = if first {
+                    (deepest.local_p1, vec3(manifold.data.normal))
                 } else {
-                    deepest.local_p2
+                    (deepest.local_p2, -vec3(manifold.data.normal))
                 };
-                out.push((them, vec3(mine.position().transform_point(local))));
+                out.push((
+                    them,
+                    vec3(mine.position().transform_point(local)),
+                    normal.normalize_or_zero(),
+                ));
             }
         }
         out
@@ -4260,16 +4267,20 @@ mod tests {
         let mut met = None;
         for i in 0..120 {
             p.step(DT);
-            if let Some(&(other, at)) = p.vehicle_bumps(a).first() {
-                met = Some((i, other, at));
+            if let Some(&(other, at, normal)) = p.vehicle_bumps(a).first() {
+                met = Some((i, other, at, normal));
                 break;
             }
         }
-        let (_, other, at) = met.expect("they never met");
+        let (_, other, at, normal) = met.expect("they never met");
         assert_eq!(other, b);
         // Where its front bumper meets the other's rear one, 7.8 m on.
         assert!((at.z - 7.8).abs() < 0.5, "met at {at:?}");
-        assert_eq!(p.vehicle_bumps(b).first().map(|m| m.0), Some(a));
+        // The normal points from it toward the other: on along +z.
+        assert!(normal.z > 0.9, "normal {normal:?}");
+        let back = p.vehicle_bumps(b);
+        assert_eq!(back.first().map(|m| m.0), Some(a));
+        assert!(back[0].2.z < -0.9, "and back the other way");
     }
 
     #[test]
