@@ -30,30 +30,22 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup show
       - run: cargo build --release -p m2-alpha --target i686-pc-windows-msvc
+      # The runner's service account may not run PowerShell scripts (its
+      # execution policy), so these steps run in cmd. cmd carries on past a
+      # failed line, so each one exits on failure. The zip is made by the
+      # tar that ships with Windows.
       - name: Pack
-        shell: powershell
+        shell: cmd
         run: |
-          $dist = "target\beta"
-          Remove-Item -Recurse -Force $dist -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory $dist | Out-Null
-          Copy-Item target\i686-pc-windows-msvc\release\m2-alpha.exe "$dist\m2-beta.exe"
-          @"
-          Mercenaries 2 beta ($env:TAG)
-
-          A fan rebuild of Mercenaries 2: World in Flames. It needs your own
-          installed copy of the PC game, which it reads; it brings none of the
-          game's files.
-
-          Run m2-beta.exe. If a friend's invite link copied an invite, it joins
-          them. To host: run m2-beta.exe --host; once it is up, the invite
-          link is on your clipboard to paste to a friend.
-
-          Source: https://github.com/bstoney-yt/Mercenaries-2-Decompilation
-          "@ | Set-Content "$dist\README.txt"
-          Compress-Archive -Path "$dist\*" -DestinationPath target\m2-beta-windows.zip -Force
+          if exist target\beta rmdir /s /q target\beta || exit /b 1
+          mkdir target\beta || exit /b 1
+          copy /y target\i686-pc-windows-msvc\release\m2-alpha.exe target\beta\m2-beta.exe || exit /b 1
+          > target\beta\README.txt echo Mercenaries 2 beta (%TAG%)|| exit /b 1
+          type .github\beta\README.txt >> target\beta\README.txt || exit /b 1
+          if exist target\m2-beta-windows.zip del target\m2-beta-windows.zip || exit /b 1
+          tar -a -c -f target\m2-beta-windows.zip -C target\beta m2-beta.exe README.txt || exit /b 1
       - name: Publish
-        shell: powershell
+        shell: cmd
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create $env:TAG target\m2-beta-windows.zip --repo ${{ github.repository }} --target ${{ github.sha }} --title "Beta $env:TAG" --notes "Co-op beta. Needs your own install of Mercenaries 2 (PC). Download m2-beta-windows.zip, unzip, run m2-beta.exe."
+        run: gh release create "%TAG%" target\m2-beta-windows.zip --repo ${{ github.repository }} --target ${{ github.sha }} --title "Beta %TAG%" --notes "Co-op beta. Needs your own install of Mercenaries 2 (PC). Download m2-beta-windows.zip, unzip, run m2-beta.exe."
