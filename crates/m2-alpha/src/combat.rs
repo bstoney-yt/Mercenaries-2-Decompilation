@@ -331,6 +331,10 @@ impl Rifle {
         self.ammo.and_then(|a| a.burst())
     }
 }
+/// [`Combat::seat`] of a rider who fires none of the vehicle's weapons (a
+/// passenger, or a gunner whose seat has none).
+pub const NO_GUN: usize = usize::MAX;
+
 /// The seats of vehicle `v` whose riders fire something, the driver's
 /// first.
 pub fn armed_seats(v: &ParkedVehicle) -> Vec<u32> {
@@ -2618,7 +2622,10 @@ impl Combat {
             }
         }
         match f.player.driving {
-            Some(i) if trigger.seat => {
+            // Of a vehicle without seat data (the game moves her over its
+            // seats' links otherwise, `crate::ride::transfer`): the next
+            // armed seat (Invented).
+            Some(i) if trigger.seat && self.seat != NO_GUN => {
                 let seats = f.vehicles.get(i).map_or(1, |v| armed_seats(v).len());
                 self.seat = (self.seat + 1) % seats.max(1);
             }
@@ -2634,7 +2641,10 @@ impl Combat {
         // Fire fires the gun chosen with the switch: the main gun, or the
         // machine gun (as Aim does too).
         let mg = self.vehicle_gun == 1;
+        // A passenger, or a gunner whose seat has no weapon, fires nothing.
+        let armed = self.seat != NO_GUN;
         if let Some(i) = f.player.driving
+            && armed
             && self.down <= 0.0
             && trigger.fire
             && (if mg { self.mg_reload } else { self.reload }) <= 0.0
@@ -2643,6 +2653,7 @@ impl Combat {
             self.vehicle_fire(f, i, mg);
         }
         if let Some(i) = f.player.driving
+            && armed
             && self.down <= 0.0
             && trigger.aim
             && self.mg_reload <= 0.0
@@ -2652,6 +2663,7 @@ impl Combat {
         }
         // A bomb bay's bomb on the throw key (her explosive's), one a gap.
         if let Some(i) = f.player.driving
+            && armed
             && self.down <= 0.0
             && trigger.throw
             && self.bomb_reload <= 0.0

@@ -241,6 +241,11 @@ pub struct Seat {
     pub name: u32,
     pub hardpoint: Option<u32>,
     pub driver: bool,
+    /// `bIsGunnerSeat`: its rider fires the vehicle's weapons (a tank's
+    /// driver's seat is both).
+    pub gunner: bool,
+    /// `bIsHijackable`: its rider may be taken out of it.
+    pub hijackable: bool,
     /// `bCanPlayerUse` (default 1).
     pub player_use: bool,
     /// `TossSpeedChange`, m/s; at or below 0 the seat never tosses.
@@ -248,6 +253,31 @@ pub struct Seat {
     /// `MinDitchSpeed`, m/s.
     pub min_ditch_speed: f32,
     pub rows: Vec<EntranceToSeatRow>,
+    /// Its template's `SeatToSeat` rows' `SeatLinkName`s: the seats its
+    /// rider may move over to, in order.
+    pub links: Vec<u32>,
+}
+
+impl Seat {
+    /// What its rider does (`Vehicle.GetSeatByType`'s `d`, `g`, `p`): a
+    /// driver's seat drives, even when its rider also fires (a tank's).
+    pub fn role(&self) -> Role {
+        if self.driver {
+            Role::Driver
+        } else if self.gunner {
+            Role::Gunner
+        } else {
+            Role::Passenger
+        }
+    }
+}
+
+/// What a seat's rider does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Driver,
+    Gunner,
+    Passenger,
 }
 
 /// A vehicle template's seats and entrances, in link order. An entrance
@@ -261,6 +291,11 @@ pub struct VehicleSeats {
 impl VehicleSeats {
     pub fn entrance(&self, name: u32) -> Option<&Entrance> {
         self.entrances.iter().find(|e| e.name == name)
+    }
+
+    /// The seat whose `SeatLink` is named `name`.
+    pub fn seat(&self, name: u32) -> Option<usize> {
+        self.seats.iter().position(|s| s.name == name)
     }
 
     /// The driver's seat (0x8229C800: the first marked so).
@@ -353,6 +388,103 @@ pub fn seat_for_entrance(
     })
 }
 
+/// The seat she takes from its rider through entrance `entrance` when it
+/// leads to no free one and is not hijack-only (0x8229A3C0): the first in
+/// `SeatLink` order that is `bIsHijackable`, has a `CanEnter` row naming
+/// the entrance, and whose rider is of another faction than hers
+/// (`other_side`: occupied, and so; 0x82251E68). `None`: no way in.
+pub fn hijack_seat(
+    seats: &[Seat],
+    entrance: u32,
+    other_side: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    seats.iter().enumerate().position(|(i, s)| {
+        s.hijackable
+            && other_side(i)
+            && s.rows
+                .iter()
+                .any(|r| r.can_enter && r.link_name == entrance)
+    })
+}
+
+/// Whoever drives a vehicle, as hero.lua's `EnterPassengerCallback` asks
+/// of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DriverRider {
+    /// A player drives (`Object.IsPlayerControlled`).
+    pub player: bool,
+    /// Their relation to her is at least neutral (`Ai.GetRelation` >= 0).
+    pub friendly: bool,
+}
+
+/// What follows her sitting down in a passenger's or gunner's seat
+/// ([`slide_over`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlideOver {
+    /// She stays in her seat; why, as the script prints it.
+    Stay(&'static str),
+    /// She moves over to the driver's seat (index `to`), once its rider,
+    /// if any, has got out (`driver_out`).
+    Slide { to: usize, driver_out: bool },
+}
+
+/// hero.lua's `EnterPassengerCallback`, run when she sits down in seat
+/// `her` of a vehicle (labelled `Car` or `Truck`: `car_or_truck`) whose
+/// driver's seat holds `driver`: she moves over to drive when her seat
+/// has a `SeatToSeat` link to the driver's seat, in a car or truck whose
+/// driver is put out first, or in any vehicle with nobody driving. Not
+/// from a gunner's seat with nobody, or a friend, driving; not from a
+/// ladder (`ladder`, `Vehicle.IsSeatALadder`).
+pub fn slide_over(
+    seats: &[Seat],
+    her: usize,
+    car_or_truck: bool,
+    driver: Option<DriverRider>,
+    ladder: bool,
+) -> SlideOver {
+    let d = seats.iter().position(|s| s.driver);
+    if d == Some(her) {
+        return SlideOver::Stay("she drives");
+    }
+    if ladder {
+        return SlideOver::Stay("a ladder");
+    }
+    let gunner = seats.get(her).is_some_and(|s| s.role() == Role::Gunner);
+    match driver {
+        Some(r) if r.player => return SlideOver::Stay("Transfer aborted - Driver is a player"),
+        Some(_) if !car_or_truck => {
+            return SlideOver::Stay("Transfer failed - Unsupported vehicle type");
+        }
+        Some(r) if gunner && r.friendly => {
+            return SlideOver::Stay("Transfer aborted - In Gunner seat and driver is friendly");
+        }
+        None if gunner => return SlideOver::Stay("Transfer aborted - In gunner seat w/o driver"),
+        _ => {}
+    }
+    let Some(to) = d else {
+        return SlideOver::Stay("Transfer failed - No driver seat or drive seat is blocked");
+    };
+    if !seats[her].links.contains(&seats[to].name) {
+        return SlideOver::Stay("Transfer failed - No Link between driver seat and current seat");
+    }
+    SlideOver::Slide {
+        to,
+        driver_out: driver.is_some(),
+    }
+}
+
+/// The seat a rider of seat `from` moves to (0x822A6FF0, `TransferToSeat`,
+/// which fails for an occupied seat): the first of its `SeatToSeat` links
+/// naming another seat of the vehicle that is not `taken`.
+pub fn transfer_to(seats: &[Seat], from: usize, taken: impl Fn(usize) -> bool) -> Option<usize> {
+    seats
+        .get(from)?
+        .links
+        .iter()
+        .filter_map(|&n| seats.iter().position(|s| s.name == n))
+        .find(|&i| i != from && !taken(i))
+}
+
 /// How she leaves a seat (0x822A2B60's result).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitKind {
@@ -416,6 +548,7 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
     let seat_params = Table::new(db, "SeatParameters");
     let entrance_params = Table::new(db, "EntranceParameters");
     let to_seat = Table::new(db, "EntranceToSeat");
+    let seat_to_seat = Table::new(db, "SeatToSeat");
     let h = name_hash;
     let (hardpoint, name) = (h("Hardpoint"), h("Name"));
     let nonzero = |v: Option<u32>| v.filter(|&v| v != 0);
@@ -463,6 +596,8 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
                     name: seat_links.word(r, name).unwrap_or(0),
                     hardpoint: nonzero(seat_links.word(r, hardpoint)),
                     driver: p.is_some_and(|p| bit(&seat_params, p, "bIsDriverSeat")),
+                    gunner: p.is_some_and(|p| bit(&seat_params, p, "bIsGunnerSeat")),
+                    hijackable: p.is_some_and(|p| bit(&seat_params, p, "bIsHijackable")),
                     player_use: p.is_none_or(|p| {
                         seat_params
                             .word(p, h("bCanPlayerUse"))
@@ -471,6 +606,11 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
                     toss_speed: float("TossSpeedChange", -1.0),
                     min_ditch_speed: float("MinDitchSpeed", DEFAULT_DITCH_SPEED),
                     rows: rows_of(template),
+                    links: seat_to_seat
+                        .of_template(template)
+                        .iter()
+                        .filter_map(|r| nonzero(seat_to_seat.word(r, h("SeatLinkName"))))
+                        .collect(),
                 })
             })
             .collect();
@@ -689,6 +829,8 @@ mod tests {
             name: name_hash(name),
             hardpoint: Some(name_hash(name)),
             driver,
+            gunner: false,
+            hijackable: true,
             player_use: true,
             toss_speed: -1.0,
             min_ditch_speed: DEFAULT_DITCH_SPEED,
@@ -700,7 +842,131 @@ mod tests {
                     can_exit,
                 })
                 .collect(),
+            links: Vec::new(),
         }
+    }
+
+    /// The M151 .50 Cal's seats as read (round 1, `seats_by_vehicle`):
+    /// front right (linked over to the driver's), the rear gunner's, the
+    /// driver's.
+    fn m151() -> Vec<Seat> {
+        let mut right = seat(
+            "seat_front_right",
+            false,
+            &[("entrance_front_right", true, true)],
+        );
+        right.links = vec![name_hash("seat_driver")];
+        let mut gunner = seat(
+            "seat_gunner_rearcenter",
+            false,
+            &[("entrance_gunner", true, true)],
+        );
+        gunner.gunner = true;
+        gunner.hijackable = false;
+        let driver = seat("seat_driver", true, &[("entrance_driver", true, true)]);
+        vec![right, gunner, driver]
+    }
+
+    #[test]
+    fn a_seat_drives_guns_or_rides() {
+        let s = m151();
+        let roles: Vec<Role> = s.iter().map(Seat::role).collect();
+        assert_eq!(roles, [Role::Passenger, Role::Gunner, Role::Driver]);
+        // A tank's driver's seat is a gunner's too: it drives.
+        let mut tank = seat("seat_driver", true, &[]);
+        tank.gunner = true;
+        assert_eq!(tank.role(), Role::Driver);
+    }
+
+    #[test]
+    fn a_rider_of_another_side_is_hijacked_from_a_hijackable_seat() {
+        let s = m151();
+        let e = name_hash;
+        // The driver's door, its seat taken by a soldier of another side.
+        assert_eq!(hijack_seat(&s, e("entrance_driver"), |i| i == 2), Some(2));
+        // The same rider of her own side: no way in.
+        assert_eq!(hijack_seat(&s, e("entrance_driver"), |_| false), None);
+        // The rear gunner's seat isn't hijackable.
+        assert_eq!(hijack_seat(&s, e("entrance_gunner"), |_| true), None);
+    }
+
+    const HOSTILE: DriverRider = DriverRider {
+        player: false,
+        friendly: false,
+    };
+    const FRIEND: DriverRider = DriverRider {
+        player: false,
+        friendly: true,
+    };
+
+    #[test]
+    fn from_the_front_passenger_seat_she_slides_over_to_drive() {
+        let s = m151();
+        let slide = |driver_out| SlideOver::Slide { to: 2, driver_out };
+        assert_eq!(slide_over(&s, 0, true, None, false), slide(false));
+        // A driver, friend or foe, is put out first.
+        assert_eq!(slide_over(&s, 0, true, Some(HOSTILE), false), slide(true));
+        assert_eq!(slide_over(&s, 0, true, Some(FRIEND), false), slide(true));
+        // Not past another player, nor a driver of something not a car or
+        // truck; nobody driving, any vehicle.
+        let player = DriverRider {
+            player: true,
+            friendly: true,
+        };
+        assert!(matches!(
+            slide_over(&s, 0, true, Some(player), false),
+            SlideOver::Stay(_)
+        ));
+        assert!(matches!(
+            slide_over(&s, 0, false, Some(HOSTILE), false),
+            SlideOver::Stay(_)
+        ));
+        assert_eq!(slide_over(&s, 0, false, None, false), slide(false));
+        assert!(matches!(
+            slide_over(&s, 0, true, None, true),
+            SlideOver::Stay(_)
+        ));
+    }
+
+    #[test]
+    fn a_gunner_stays_at_the_gun_unless_a_foe_drives() {
+        let mut s = m151();
+        // Nobody driving, or a friend: she stays at the gun.
+        assert!(matches!(
+            slide_over(&s, 1, true, None, false),
+            SlideOver::Stay(_)
+        ));
+        assert!(matches!(
+            slide_over(&s, 1, true, Some(FRIEND), false),
+            SlideOver::Stay(_)
+        ));
+        // A foe driving: only over a link to the driver's seat, which the
+        // M151's gunner's seat hasn't.
+        assert!(matches!(
+            slide_over(&s, 1, true, Some(HOSTILE), false),
+            SlideOver::Stay(_)
+        ));
+        s[1].links = vec![name_hash("seat_driver")];
+        assert_eq!(
+            slide_over(&s, 1, true, Some(HOSTILE), false),
+            SlideOver::Slide {
+                to: 2,
+                driver_out: true
+            }
+        );
+        // At the wheel already, nothing.
+        assert!(matches!(
+            slide_over(&s, 2, true, None, false),
+            SlideOver::Stay(_)
+        ));
+    }
+
+    #[test]
+    fn a_transfer_goes_over_a_link_to_a_free_seat() {
+        let s = m151();
+        assert_eq!(transfer_to(&s, 0, |_| false), Some(2));
+        assert_eq!(transfer_to(&s, 0, |i| i == 2), None);
+        assert_eq!(transfer_to(&s, 1, |_| false), None);
     }
 
     #[test]

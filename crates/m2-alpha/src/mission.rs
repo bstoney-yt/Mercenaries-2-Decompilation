@@ -5058,7 +5058,8 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
                         };
                         if let Some(p) = game.scene.player.as_mut().filter(|p| p.driving == Some(i))
                         {
-                            get_out(&world.physics, &game.scene.vehicles[i], p);
+                            let seat = game.ride.filter(|r| r.0 == i).map(|r| r.1);
+                            get_out(&world.physics, &game.scene.vehicles[i], seat, p);
                         }
                         if let Some(id) = game.scene.vehicles[i].id.take() {
                             world.physics.remove_vehicle(id);
@@ -5273,8 +5274,11 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             let (Some(world), Some(p)) = (&game.scene.world, game.scene.player.as_mut()) else {
                 return false;
             };
-            if let Some(v) = p.driving.and_then(|i| game.scene.vehicles.get(i)) {
-                get_out(&world.physics, v, p);
+            if let Some(i) = p.driving
+                && let Some(v) = game.scene.vehicles.get(i)
+            {
+                let seat = game.ride.filter(|r| r.0 == i).map(|r| r.1);
+                get_out(&world.physics, v, seat, p);
             }
             return false;
         }
