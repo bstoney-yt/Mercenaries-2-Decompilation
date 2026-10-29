@@ -3393,7 +3393,11 @@ impl Autoplay {
                 || game.scene.world.as_ref().is_none_or(|w| {
                     let dir = launch_dir(m, at);
                     w.physics
-                        .cast_ray(m.pivot + dir * 0.9, dir, MUZZLE_CLEAR)
+                        .cast_ray(
+                            m.pivot + dir * crate::combat::MANNED_MUZZLE,
+                            dir,
+                            MUZZLE_CLEAR,
+                        )
                         .is_none()
                 })
         });

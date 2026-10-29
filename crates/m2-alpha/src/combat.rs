@@ -1514,6 +1514,9 @@ pub struct Combat {
     /// Every gun's shots' sound set and muzzle flash, by template (for
     /// the guns people carry, [`arm`](Self::arm)).
     feels: std::collections::HashMap<u32, Feel>,
+    /// Every gun's round's blast and `DamageKey`, by template (a tank
+    /// gun's shell, [`arm`](Self::arm)).
+    shells: std::collections::HashMap<u32, (Option<Blast>, Option<u32>)>,
     /// Sounds made since the last call to [`take_sounds`](Self::take_sounds).
     sounds: Vec<Sound>,
     /// Wrecks smoke: (vehicle index, seconds to the next puff).
@@ -1674,6 +1677,12 @@ pub struct Manned {
 /// An emplaced gun's barrel above its place, metres (invented: the
 /// tripod's gun sits about a crouching soldier's shoulder high).
 pub const MANNED_PIVOT: f32 = 1.1;
+/// Where an emplaced gun's rounds start, metres along its aim from the
+/// pivot: clear of its own emplacement (sandbags, shield, the platform it
+/// stands on, a gun beside it). Invented: PmcCon031's grenade launcher
+/// burst its rounds on its sandbags 0.9 m out and brought its platform
+/// down; its MG beside another put 300 rounds into that one.
+pub const MANNED_MUZZLE: f32 = 2.4;
 
 impl Manned {
     /// `dir` held within its turn and tilt.
@@ -1777,6 +1786,7 @@ impl Default for Combat {
             effects: Vec::new(),
             game_fx: Vec::new(),
             feels: std::collections::HashMap::new(),
+            shells: std::collections::HashMap::new(),
             sounds: Vec::new(),
             wrecks: Vec::new(),
             part_fx_next: 0.0,
@@ -1983,6 +1993,11 @@ impl Combat {
     pub fn arm(&mut self, arms: &m2_engine::weapons::Arms, table: Option<DamageTable>) {
         self.damage_table = table;
         self.feels = arms.weapons.iter().map(|(&id, w)| (id, w.feel)).collect();
+        self.shells = arms
+            .weapons
+            .iter()
+            .map(|(&id, w)| (id, (w.ammo.burst(), w.ammo.key)))
+            .collect();
         if let Some(c) = arms.named("Carbine") {
             self.carbine = Rifle::from_spec(c);
             if !self.own_rifle {
@@ -2843,9 +2858,10 @@ impl Combat {
             return;
         }
         m.rounds -= 1;
+        let (gun, left) = (m.entity, m.rounds);
         let (_, dir) = Self::aim_ray(f.player);
         let aim = m.clamp(dir);
-        let from = m.pivot + aim * 0.9;
+        let from = m.pivot + aim * MANNED_MUZZLE;
         let w = &m.weapon;
         self.reload = w.gap();
         let feel = w.feel;
@@ -2911,6 +2927,16 @@ impl Combat {
             self.round_on_vehicle(f, (from, aim, t), (damage, round), None);
             self.hit_explosives_in(f.explosives, from + aim * t, on_props);
             let key = self.strike_world(f.physics, from, aim, t);
+            // What its rounds strike, now and then (PmcCon031: a gun
+            // whose 300 rounds brought down no column).
+            if left % 25 == 0 {
+                eprintln!(
+                    "manned: {:#x}'s round from {from:.1} strikes {:?} {t:.1} m on at {:.1}",
+                    gun,
+                    key,
+                    from + aim * t
+                );
+            }
             self.struck.push(Strike {
                 at: from + aim * t,
                 damage: on_props,
@@ -3072,11 +3098,18 @@ impl Combat {
         let gravity = m2_engine::physics::GRAVITY;
         let velocity =
             lob_velocity(from, at, THROW, gravity).unwrap_or_else(|| farthest(at - from, THROW));
+        // The grenade template's blast (inferred: the same `Grenade` as
+        // hers); without one read, the alpha's own blast.
+        let blast = self
+            .throwables
+            .first()
+            .and_then(Option::as_ref)
+            .and_then(|t| t.ammo.burst());
         self.projectiles.push(Projectile::Grenade {
             at: from,
             velocity,
             fuse: FUSE,
-            blast: None,
+            blast,
         });
     }
 
@@ -3727,15 +3760,20 @@ impl Combat {
             self.reload = gun.map_or(CANNON_RELOAD, |g| 60.0 / g.rate_of_fire.max(1.0));
             let speed = gun.map_or(SHELL_SPEED, |g| g.velocity.max(1.0));
             let burn = gun.and_then(|g| g.flash).unwrap_or(CANNON_FLASH_TIME);
+            // Its gun template's round's blast and kind (a tank shell's
+            // explosion); without one, the alpha's own blast.
+            let (blast, key) = gun
+                .and_then(|g| self.shells.get(&g.weapon).copied())
+                .unwrap_or((None, None));
             self.projectiles.push(Projectile::Rocket {
                 at: from,
                 velocity: aim * speed,
                 flown: 0.0,
                 shell: true,
                 owner: Some(id),
-                blast: None,
+                blast,
                 homing: None,
-                key: None,
+                key,
             });
             if let Some(v) = f.vehicles.get_mut(i) {
                 v.fired += 1;

@@ -1322,13 +1322,16 @@ pub fn death_pickups(
     out
 }
 
-/// A vehicle's health where its template gives none.
-const VEHICLE_HEALTH: f32 = 500.0;
-
 impl ParkedVehicle {
     /// The damage it takes before it is wrecked: its template's health.
+    /// A template with no `Health` (3 of 779 with vehicle physics, all
+    /// props: survey `runover`) is never wrecked: in the 360 damage is
+    /// taken by the `Health` component, and it has none. Inferred.
     pub fn most_health(&self) -> f32 {
-        self.spec.tuning.health.unwrap_or(VEHICLE_HEALTH).max(1.0)
+        self.spec
+            .tuning
+            .health
+            .map_or(f32::INFINITY, |h| h.max(1.0))
     }
 
     /// Its health of 100, as the HUD's health box shows it: none once
