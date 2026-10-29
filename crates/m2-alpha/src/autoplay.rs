@@ -543,6 +543,42 @@ const DESIGNATOR_WAIT: f32 = 3.0;
 /// get into before getting out for it, metres. Invented.
 const BOARD_DRIVE: f32 = 25.0;
 
+/// On foot, a vehicle the scripts mark for her (not to destroy) within this
+/// of her is got into before she fights back, metres. Invented (autoplay
+/// tooling), not an original-game value: soldiers' grenades wrecked the
+/// marked ride while she fought beside it, which cancelled its contract.
+const BOARD_FIRST: f32 = 40.0;
+
+/// A vehicle as [`board_first`] sees it.
+struct Ride {
+    guid: Option<u32>,
+    /// Where it stands (`None` without a body in the physics).
+    at: Option<Vec3>,
+    /// Not wrecked, with a body, nobody aboard, and no goods on it.
+    usable: bool,
+}
+
+/// The nearest vehicle of `rides` that a live mark of `marks` is on, its
+/// mark not one to destroy, usable and within [`BOARD_FIRST`] of `here`:
+/// its index, mark and distance.
+fn board_first<'a>(
+    marks: &'a [Mark],
+    rides: &[Ride],
+    here: Vec3,
+) -> Option<(usize, &'a Mark, f32)> {
+    marks
+        .iter()
+        .filter(|m| m.alive && m.kind != "destroy")
+        .filter_map(|m| {
+            let i = rides
+                .iter()
+                .position(|r| r.usable && r.guid == Some(m.target))?;
+            let d = rides[i].at?.distance(here);
+            (d < BOARD_FIRST).then_some((i, m, d))
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+}
+
 /// What she is after.
 #[derive(Clone, Debug, PartialEq)]
 enum Goal {
@@ -1756,6 +1792,30 @@ impl Autoplay {
                 .map(|(i, d, _)| (i, d))
                 .min_by(|a, b| a.1.total_cmp(&b.1))
         {
+            // A ride the scripts mark for her close by: in it first, as a
+            // fight beside it can wreck it (a grenade did, and the
+            // contract was lost).
+            let rides: Vec<Ride> = vehicles
+                .iter()
+                .enumerate()
+                .map(|(j, v)| Ride {
+                    guid: v.guid,
+                    at: vehicle_at(game, j).map(|t| t.w_axis.truncate()),
+                    usable: !v.wrecked
+                        && v.id.is_some()
+                        && v.crew.is_empty()
+                        && !game.scene.props.carrying(j),
+                })
+                .collect();
+            if let Some((j, m, dj)) = board_first(marks, &rides, here) {
+                return Some((
+                    Goal::Board(j),
+                    format!(
+                        "getting into {} ({}), {dj:.0} m off, before fighting back a soldier {d:.0} m off",
+                        m.name, vehicles[j].spec.label
+                    ),
+                ));
+            }
             return Some((
                 Goal::Shoot(i),
                 format!("fighting back a soldier {d:.0} m off"),
@@ -6612,5 +6672,51 @@ mod tests {
         // A rocket goes straight at it.
         let rocket = gun(100.0, 0.0);
         assert!((launch_dir(&rocket, at) - at.normalize()).length() < 1e-5);
+    }
+
+    // On foot with a soldier fighting her, a ride the scripts mark close
+    // by is got into first; far off, wrecked, or marked to destroy, it is
+    // not (and she fights back as before).
+    #[test]
+    fn a_marked_ride_close_by_is_boarded_before_a_fight() {
+        let mark = |target: u32, kind: &str| Mark {
+            target,
+            kind: kind.to_owned(),
+            name: format!("ride {target}"),
+            at: Vec3::ZERO,
+            alive: true,
+            mission: None,
+            secondary: false,
+        };
+        let ride = |guid: u32, x: f32, usable: bool| Ride {
+            guid: Some(guid),
+            at: Some(Vec3::new(x, 0.0, 0.0)),
+            usable,
+        };
+        let here = Vec3::ZERO;
+        // Near: boarded (index 1, the marked one, not the unmarked car).
+        let marks = [mark(7, "action")];
+        let rides = [ride(5, 3.0, true), ride(7, 15.0, true)];
+        let (i, m, d) = board_first(&marks, &rides, here).expect("boarded first");
+        assert_eq!((i, m.target), (1, 7));
+        assert!((d - 15.0).abs() < 1e-4);
+        // Far: none, so the fight goes ahead.
+        let rides = [ride(7, BOARD_FIRST + 5.0, true)];
+        assert!(board_first(&marks, &rides, here).is_none());
+        // Wrecked (or otherwise unusable): none.
+        let rides = [ride(7, 15.0, false)];
+        assert!(board_first(&marks, &rides, here).is_none());
+        // Marked to destroy, or its mark gone: none.
+        let rides = [ride(7, 15.0, true)];
+        assert!(board_first(&[mark(7, "destroy")], &rides, here).is_none());
+        let gone = Mark {
+            alive: false,
+            ..mark(7, "action")
+        };
+        assert!(board_first(&[gone], &rides, here).is_none());
+        // Of two marked, the nearer.
+        let marks = [mark(7, "action"), mark(8, "deliverable")];
+        let rides = [ride(7, 30.0, true), ride(8, 10.0, true)];
+        assert_eq!(board_first(&marks, &rides, here).map(|r| r.0), Some(1));
     }
 }
