@@ -130,6 +130,12 @@ pub struct Leaves {
     /// give_resources`]).
     pub cash: u32,
     pub fuel: u32,
+    /// The icon its marker shows over it, by name hash (its template's
+    /// `TextureModel`, [`m2_engine::pickup::PickupInfo::icon`]), and
+    /// whether that marker fades by the distance over the ground only
+    /// ([`m2_engine::pickup::PickupInfo::marker_flat`]).
+    pub icon: Option<u32>,
+    pub icon_flat: bool,
 }
 
 impl Leaves {
@@ -434,6 +440,32 @@ impl Flights {
     /// What lies to be taken.
     pub fn pickups(&self) -> &[Pickup] {
         &self.pickups
+    }
+
+    /// The pickups lying within `reach` of `near` whose template shows a
+    /// marker, each with the point its marker hangs from: the top of its
+    /// box as it lies, over its middle (from the 360 code, 82378890: the
+    /// model's bounding centre in the world, raised by the bound's next
+    /// word, read as its half-height, inferred). Within `reach` of the
+    /// player (the 360 code's 100 m, by whole distance) before the HUD
+    /// measures its own fade from the camera.
+    pub fn marker_points(&self, near: Vec3, reach: f32) -> Vec<(Vec3, &Pickup)> {
+        self.pickups
+            .iter()
+            .filter(|p| p.what.icon.is_some() && p.at.distance_squared(near) < reach * reach)
+            .map(|p| {
+                let top = p
+                    .what
+                    .model
+                    .and_then(|m| self.models.get(&m)?.as_ref())
+                    .map_or(p.at + Vec3::Y * MARKER_RAISE, |m| {
+                        let place = lying(m.gpu.bounds, p.yaw, p.at);
+                        let (lo, hi) = world_box(place, m.gpu.bounds);
+                        Vec3::new((lo.x + hi.x) * 0.5, hi.y, (lo.z + hi.z) * 0.5)
+                    });
+                (top, p)
+            })
+            .collect()
     }
 
     /// Whether model `hash` (asked for) has loaded.
@@ -983,6 +1015,26 @@ fn lying(bounds: (Vec3, Vec3), yaw: f32, at: Vec3) -> Mat4 {
         Quat::from_rotation_y(yaw) * down,
         at + Vec3::Y * (-low).max(0.0),
     )
+}
+
+/// How high over where it lies a pickup's marker hangs when its model's
+/// box isn't known here (a placed pickup, which its prop draws), metres
+/// (invented: about a box's height).
+const MARKER_RAISE: f32 = 0.4;
+
+/// The world box of box `bounds` (model space) placed by `place`.
+fn world_box(place: Mat4, bounds: (Vec3, Vec3)) -> (Vec3, Vec3) {
+    (0..8)
+        .map(|i| {
+            place.transform_point3(Vec3::new(
+                if i & 1 == 0 { bounds.0.x } else { bounds.1.x },
+                if i & 2 == 0 { bounds.0.y } else { bounds.1.y },
+                if i & 4 == 0 { bounds.0.z } else { bounds.1.z },
+            ))
+        })
+        .fold((Vec3::INFINITY, Vec3::NEG_INFINITY), |(lo, hi), c| {
+            (lo.min(c), hi.max(c))
+        })
 }
 
 #[cfg(test)]

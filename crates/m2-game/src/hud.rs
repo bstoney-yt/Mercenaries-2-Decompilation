@@ -101,7 +101,44 @@ pub struct Hud {
     pub discs: BTreeMap<u32, Disc>,
     /// Objective messages not yet shown.
     pub messages: Vec<ObjectiveMessage>,
+    /// How the engine's markers over pickups are drawn, as the scripts
+    /// set them.
+    pub pickup_markers: PickupMarkers,
     next_marker: u32,
+}
+
+/// The size and reach of the markers over pickups, for each of the two
+/// views the engine keeps them for: `[0]` play, `[1]` the view its
+/// renderer calls mode 4 (unidentified). From the 360 code: the HUD's
+/// marker init (82374FB0) sets size 12 and reach 20 m and 100 m;
+/// `Gui.SetPickupMarkerSize(n, view)` (8231C350) and
+/// `Gui.SetPickupMarkerVisibleDistance(m, view)` (8231C3E0) set one view's,
+/// `view` a boolean, true or left out the second.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PickupMarkers {
+    pub size: [f32; 2],
+    pub reach: [f32; 2],
+}
+
+impl Default for PickupMarkers {
+    fn default() -> Self {
+        Self {
+            size: [12.0, 12.0],
+            reach: [20.0, 100.0],
+        }
+    }
+}
+
+/// Which view a pickup marker call sets: its second argument, a boolean,
+/// true or left out the second (from the 360 code: it reads the argument
+/// as a byte, 1 if absent).
+fn pickup_view(v: Option<&Value>) -> usize {
+    match v {
+        Some(Value::Boolean(false)) => 0,
+        Some(Value::Integer(0)) => 0,
+        Some(Value::Number(n)) if *n == 0.0 => 0,
+        _ => 1,
+    }
 }
 
 /// An objective message as the scripts send it
@@ -350,6 +387,21 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         net.set(name, safe_function(lua, move |_, _| none())?)?;
     }
 
+    let gui = lib("Gui")?;
+    // (size, view): the size as a byte, 32 if not given (8231C350).
+    add(&gui, "SetPickupMarkerSize", |hud, _, a| {
+        let size = number(a.first()).map_or(32, |n| n as i64 as u8);
+        hud.pickup_markers.size[pickup_view(a.get(1))] = f32::from(size);
+        Ok(MultiValue::new())
+    })?;
+    // (metres, view): nothing without a distance (8231C3E0).
+    add(&gui, "SetPickupMarkerVisibleDistance", |hud, _, a| {
+        if let Some(reach) = number(a.first()) {
+            hud.pickup_markers.reach[pickup_view(a.get(1))] = reach as f32;
+        }
+        Ok(MultiValue::new())
+    })?;
+
     let marker = lib("Marker")?;
     // (target, icon, size, r, g, b, a, height, near, far, size, mission,
     // 2D only): returns the marker's handle.
@@ -520,6 +572,30 @@ mod tests {
         assert_eq!((m.near, m.far), (MARKER_NEAR, MARKER_FAR));
         assert_eq!((m.near, m.far), (200.0, 300.0));
         assert!(!m.flat);
+    }
+
+    #[test]
+    fn the_scripts_set_each_views_pickup_markers() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        api::install(host.lua(), &world).unwrap();
+        assert_eq!(world.borrow().hud.pickup_markers, PickupMarkers::default());
+        host.lua()
+            .load(
+                r#"
+                Gui.SetPickupMarkerSize(18, false)
+                Gui.SetPickupMarkerSize(24)
+                Gui.SetPickupMarkerVisibleDistance(30, false)
+                Gui.SetPickupMarkerVisibleDistance(nil, true)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let p = world.borrow().hud.pickup_markers;
+        // Left out, the view is the second; a size is a byte.
+        assert_eq!(p.size, [18.0, 24.0]);
+        // No distance, no change.
+        assert_eq!(p.reach, [30.0, 100.0]);
     }
 
     #[test]

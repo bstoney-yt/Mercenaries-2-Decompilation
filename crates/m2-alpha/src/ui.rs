@@ -22,6 +22,7 @@ use crate::combat::Weapon;
 use crate::config::Config;
 use crate::gamehud::{GameHud, HudState, flash_key};
 use crate::mission::MissionView;
+use crate::pickup_marker::PickupMarker;
 use crate::support::{SupportHud, WheelHud};
 
 /// What the HUD shows this frame.
@@ -77,6 +78,8 @@ pub struct HudInfo {
     pub support: SupportHud,
     /// The hero she is (the pause menu marks them).
     pub hero: crate::hero::Hero,
+    /// The markers over the pickups lying near her.
+    pub pickups: Vec<PickupMarker>,
 }
 
 /// What the pause menu asked for.
@@ -225,6 +228,7 @@ impl Hud {
         let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
         state.messages.extend(game.message(message));
         state.blips = blips(info);
+        state.textures = marker_textures(info);
         state.reticle = reticle(info);
         state.support = info.support.clone();
         state.cash = info.mission.as_ref().and_then(|m| m.cash);
@@ -287,6 +291,7 @@ impl Hud {
         let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
         state.messages.extend(game.message(message));
         state.blips = blips(info);
+        state.textures = marker_textures(info);
         state.reticle = reticle(info);
         state.support = info.support.clone();
         state.cash = info.mission.as_ref().and_then(|m| m.cash);
@@ -598,6 +603,20 @@ fn reticle(info: &HudInfo) -> Option<[f32; 2]> {
 }
 
 /// The mission's markers, for the game HUD's minimap.
+/// The textures the pickups' markers draw: the backing, and each icon.
+fn marker_textures(info: &HudInfo) -> Vec<u32> {
+    if info.pickups.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![m2_assets::name_hash(crate::pickup_marker::BACKGROUND)];
+    for p in &info.pickups {
+        if !out.contains(&p.icon) {
+            out.push(p.icon);
+        }
+    }
+    out
+}
+
 fn blips(info: &HudInfo) -> Vec<([f32; 3], String, [u8; 4])> {
     info.mission.as_ref().map_or_else(Vec::new, |m| {
         m.markers
@@ -686,7 +705,15 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
     if info.playing
         && let Some(game) = game
     {
-        // The scripts' markers in the world, under the HUD.
+        // The engine's markers over pickups, then the scripts' markers in
+        // the world, under the HUD.
+        if let Some(vp) = info.view_proj {
+            let style = info
+                .mission
+                .as_ref()
+                .map_or_else(Default::default, |m| m.pickup_markers);
+            pickup_markers(&painter, screen, vp, &info.pickups, style, game);
+        }
         if let (Some(m), Some(vp)) = (&info.mission, info.view_proj) {
             let here = info.game.as_ref().and_then(|s| s.position).map(Vec3::from);
             ground_discs(&painter, screen, vp, m, here);
@@ -1468,6 +1495,41 @@ fn world_markers(
         let a = (f32::from(a) * fade).round() as u8;
         let colour = Color32::from_rgba_unmultiplied(r, g, b, a);
         game.paint_texture(painter, &marker.icon, rect, colour);
+    }
+}
+
+/// The engine's markers over pickups ([`crate::pickup_marker`]): for each
+/// within reach of the camera (play's: `style`'s first view), the backing
+/// and over it the pickup's icon, white at its fade, sized as on the 360's
+/// 720 lines and scaled to the window's. One whose point is off
+/// the screen isn't drawn (from the 360 code: the renderer skips a point
+/// outside -1..1).
+fn pickup_markers(
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    view_proj: Mat4,
+    pickups: &[PickupMarker],
+    style: m2_game::hud::PickupMarkers,
+    game: &GameHud,
+) {
+    let Some(eye) = camera_position(view_proj) else {
+        return;
+    };
+    // The 360's picture is 720 lines high.
+    let unit = screen.height() / 720.0;
+    let backing = m2_assets::name_hash(crate::pickup_marker::BACKGROUND);
+    for p in pickups {
+        let fade = p.alpha_from(eye, style.reach[0]);
+        if fade <= 0.0 {
+            continue;
+        }
+        let Some(at) = project(view_proj, p.at, screen).filter(|at| screen.contains(*at)) else {
+            continue;
+        };
+        let (under, over) = crate::pickup_marker::squares(at, style.size[0], unit);
+        let colour = Color32::from_white_alpha((fade * 255.0).round() as u8);
+        game.paint_texture_hash(painter, backing, under, colour);
+        game.paint_texture_hash(painter, p.icon, over, colour);
     }
 }
 

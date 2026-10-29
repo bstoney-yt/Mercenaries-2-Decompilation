@@ -6192,7 +6192,7 @@ mod tests {
                         gives: vec![(round, 3)],
                         walked: vec![(round, 3)],
                         heals: 0,
-                        cue: None,
+                        icon: None,
                         effect: None,
                     },
                 )]),

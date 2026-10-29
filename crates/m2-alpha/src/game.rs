@@ -2194,6 +2194,20 @@ impl Game {
                 .support
                 .hud(player.map_or(self.camera.position.y, |p| p.character.position.y)),
             hero: self.scene.hero,
+            pickups: player.map_or_else(Vec::new, |p| {
+                self.scene
+                    .flights
+                    .marker_points(p.character.position, crate::pickup_marker::NEAR_HER)
+                    .into_iter()
+                    .filter_map(|(at, lying)| {
+                        Some(crate::pickup_marker::PickupMarker {
+                            at,
+                            icon: lying.what.icon?,
+                            flat: lying.what.icon_flat,
+                        })
+                    })
+                    .collect()
+            }),
             ..HudInfo::default()
         }
     }
@@ -2715,6 +2729,8 @@ fn take_up(
             weapon: Some(left),
             gun,
             gives: Some((left, kept)),
+            icon: template.and_then(|(id, info)| crate::mission::marker_icon(templates, *id, info)),
+            icon_flat: template.is_some_and(|(_, info)| info.marker_flat()),
             ..crate::flights::Leaves::default()
         },
         at: player.character.position + right * LEFT_BESIDE,
