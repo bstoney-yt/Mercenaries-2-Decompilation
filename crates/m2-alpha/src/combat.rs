@@ -5858,6 +5858,8 @@ mod tests {
             bounds: hull,
             seat: None,
             door: None,
+            seating: None,
+            entrances: Vec::new(),
             tracked: true,
             road_wheels: Vec::new(),
             rest: Vec::new(),

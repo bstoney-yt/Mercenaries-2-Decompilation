@@ -366,6 +366,19 @@ const GET_OUT: f32 = 40.0;
 /// Within this far of a vehicle's door she presses to get in, metres;
 /// presses are this far apart, seconds (a press gets her in or out).
 const DOOR: f32 = 2.5;
+
+/// How near (flat) her vehicle's door she presses to get in: within the
+/// door entrance's reach, `UseDistance` + 1 m ([`m2_engine::seats`]), less
+/// 0.6 m for her height over the hardpoint; [`DOOR`] for a vehicle without
+/// entrance data.
+fn door_reach(spec: &m2_engine::vehicle::VehicleSpec) -> f32 {
+    spec.entrances
+        .iter()
+        .find(|(_, at)| spec.door.is_some_and(|d| at.distance(d) < 0.01))
+        .map_or(DOOR, |(e, _)| {
+            (e.params.use_distance + m2_engine::seats::SEARCH_PAD - 0.6).clamp(0.3, DOOR)
+        })
+}
 /// Within this of a crewed vehicle's middle she starts its hijack,
 /// metres (invented; m2-alpha's `HIJACK_REACH` is 6).
 const HIJACK_NEAR: f32 = 5.0;
@@ -4061,7 +4074,7 @@ impl Autoplay {
             |d| m.transform_point3(d),
         );
         let here = p.character.position;
-        if (door - here).with_y(0.0).length() < DOOR {
+        if (door - here).with_y(0.0).length() < door_reach(spec) {
             return self.press(0.0);
         }
         // Crewed and taken only by its hijack (PmcCon001's villa tank):
@@ -6358,6 +6371,8 @@ mod tests {
             bounds: hull,
             seat: None,
             door: None,
+            seating: None,
+            entrances: Vec::new(),
             tracked: false,
             road_wheels: Vec::new(),
             rest: Vec::new(),
