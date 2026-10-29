@@ -768,6 +768,9 @@ pub struct Autoplay {
     /// [`crate::mission::MissionLink::exit_offers`]).
     pub in_hq: bool,
     pub exits: Vec<ActionAt>,
+    /// The HQs' ways in on offer (`[ContextAction.Enter]`, set each tick:
+    /// [`crate::mission::MissionLink::enter_offers`]).
+    pub enters: Vec<ActionAt>,
     /// The starters' talks ready in play ([`starter_for`]'s choice is
     /// among them), and the HQ's own starters of the contracts on offer:
     /// the object each one's talk is on, once the scripts set it (set
@@ -2275,6 +2278,28 @@ impl Autoplay {
                 Goal::Use { target, at, reach },
                 format!(
                     "accept: on offer [{}]; going to the starter {target:#x} to talk, {:.0} m off",
+                    self.on_offer.join(" "),
+                    at.distance(here)
+                ),
+            ));
+        }
+        // No starter's talk in play (theirs are in an HQ, out of play
+        // while she is outside it): in by the nearest HQ door, as a player
+        // goes back for a contract that failed (story run: 2,575 s stood
+        // idle after OilCon020 failed, three doors offered).
+        if !places.iter().any(|m| for_a_contract(m))
+            && let Some((target, at, reach)) = hq_door(
+                &self.on_offer,
+                self.starter.is_some(),
+                self.in_hq,
+                &self.enters,
+                here,
+            )
+        {
+            return Some((
+                Goal::Use { target, at, reach },
+                format!(
+                    "accept: on offer [{}], no starter's talk in play; going in by the HQ door {target:#x}, {:.0} m off",
                     self.on_offer.join(" "),
                     at.distance(here)
                 ),
@@ -5460,6 +5485,27 @@ pub fn starter_for(on_offer: &[String], talks: &[ActionAt], here: Vec3) -> Optio
         .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
 }
 
+/// The HQ door she goes in by for a contract on offer: none unless one is
+/// on offer (`on_offer`), no starter's talk is in play (`starter`) and she
+/// is outside (`in_hq`), else the nearest of the doors offered (`enters`)
+/// to `here`. Invented: the scripts don't say which HQ's starter holds
+/// which contract until she is inside, so the nearest door is tried.
+fn hq_door(
+    on_offer: &[String],
+    starter: bool,
+    in_hq: bool,
+    enters: &[ActionAt],
+    here: Vec3,
+) -> Option<ActionAt> {
+    if on_offer.is_empty() || starter || in_hq {
+        return None;
+    }
+    enters
+        .iter()
+        .copied()
+        .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
+}
+
 /// The way by road to a far place: the place, the road points, the one
 /// she heads for, and where she was when it was found.
 #[derive(Debug)]
@@ -5746,6 +5792,24 @@ mod tests {
     // b3p: loaded into the PMC HQ with PmcCon031 on offer from Fiona (its
     // starter PmcBoss is the HQ's) and the UP entrance's talk outside, she
     // took the exit at 18 s, before Fiona was seated and her talk in play.
+    // A contract on offer with no starter's talk in play (the story run's
+    // OilCon020, failed, its starter inside the PMC HQ): she goes in by
+    // the nearest HQ door; not with a talk in play, nothing on offer, or
+    // already inside.
+    #[test]
+    fn a_contract_on_offer_with_no_talk_goes_in_by_the_nearest_door() {
+        let here = Vec3::new(2707.8, -1.9, 343.9);
+        let doors = [
+            (0x14391b, Vec3::new(2562.2, -13.2, -928.1), 2.0),
+            (0x14391d, Vec3::new(2595.4, -4.9, -920.2), 2.0),
+        ];
+        let offer = ["OilCon020".to_owned(), "PmcCon031".to_owned()];
+        assert_eq!(hq_door(&offer, false, false, &doors, here), Some(doors[1]));
+        assert_eq!(hq_door(&offer, true, false, &doors, here), None);
+        assert_eq!(hq_door(&[], false, false, &doors, here), None);
+        assert_eq!(hq_door(&offer, false, true, &doors, here), None);
+        assert_eq!(hq_door(&offer, false, false, &[], here), None);
+    }
     // Now: the HQ's own starter pending, she waits inside, and only that
     // starter's talk ends the wait (a recruit's in play doesn't); a
     // contract whose starter is outside keeps the exit.

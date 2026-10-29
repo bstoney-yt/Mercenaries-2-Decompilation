@@ -3901,6 +3901,7 @@ fn mission_for_screenshot(
                 a.offers = link.offers(game);
                 a.in_hq = link.in_hq();
                 a.exits = link.exit_offers();
+                a.enters = link.enter_offers();
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)
             }

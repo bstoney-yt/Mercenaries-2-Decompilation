@@ -1485,6 +1485,20 @@ impl MissionLink {
             .collect()
     }
 
+    /// The HQs' ways in on offer (the context actions whose prompt is
+    /// [`ENTER_PROMPT`]): each one's object, where it stands and its reach.
+    pub fn enter_offers(&self) -> Vec<crate::autoplay::ActionAt> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        mission
+            .context_actions()
+            .into_iter()
+            .filter(|(_, _, text, _)| text.eq_ignore_ascii_case(ENTER_PROMPT))
+            .filter_map(|(g, at, _, reach)| Some((g, Vec3::from(at?), reach)))
+            .collect()
+    }
+
     /// The starters' talks on offer (the context actions whose prompt is
     /// [`TALK_PROMPT`]): each one's object and where it stands, a person
     /// where one is that object, else its place.
@@ -6158,6 +6172,10 @@ pub const TALK_PROMPT: &str = "[ContextAction.Talk]";
 /// An HQ portal's way out (`WifPmcInterior`'s `_AddPortal` with `bIsAnExit`,
 /// from the scripts).
 pub const EXIT_PROMPT: &str = "[ContextAction.Exit]";
+
+/// An HQ portal's way in (`WifPmcInterior`'s `_AddPortal` outside, from
+/// the scripts; the story run's offered three by the PMC compound).
+pub const ENTER_PROMPT: &str = "[ContextAction.Enter]";
 
 /// A dialog box the scripts have up ([`MissionLink::open_dialog`]).
 #[derive(Clone, Debug, PartialEq)]
