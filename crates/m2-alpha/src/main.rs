@@ -1536,7 +1536,7 @@ fn render(
     spans::time("draw", || -> anyhow::Result<()> {
         backend.begin_frame(&view)?;
         game.scene.draw(backend, &mut queue, &view, &game.combat)?;
-        queue.flush(&view, backend)?;
+        spans::drawn(queue.flush(&view, backend)?.draws);
         Ok(())
     })?;
     spans::time("present", || match hud {
@@ -7482,6 +7482,9 @@ fn demolish_for_screenshot(
     Ok(())
 }
 
+/// A frame this long logs a `hitch:` line with its parts' times.
+const HITCH: Duration = Duration::from_millis(100);
+
 /// Seconds between the frame-rate lines play logs ([`Pace`]).
 const PACE_EVERY: f32 = 30.0;
 
@@ -8066,16 +8069,34 @@ impl Running {
             ));
             self.fps = (now, 0);
         }
+        // A hitch's frame logs what it spent its time on, which the
+        // pace line's sums over its span can't tell apart.
+        let took = now.elapsed();
+        let parts = spans::take_frame();
+        if took >= HITCH {
+            eprintln!(
+                "hitch: {:.0} ms frame; ms: {}",
+                took.as_secs_f32() * 1000.0,
+                spans::describe(&parts, 1.0, 10)
+            );
+        }
         if let Some((line, span)) = self.pace.frame(now, (w, h)) {
             let s = &self.game.scene;
             let p = self.game.focus();
+            let objects = self
+                .mission
+                .as_ref()
+                .and_then(mission::MissionLink::object_counts)
+                .map(|(n, l)| format!(", {n} script objects ({l} labelled)"))
+                .unwrap_or_default();
             eprintln!(
-                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders; ms a second: {}",
+                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders{objects}, {} draws a frame; ms a second: {}",
                 p.x,
                 p.z,
                 s.vehicles.len(),
                 s.people.npcs.len(),
                 s.riders.len(),
+                spans::take_draws(),
                 spans::describe(&spans::take(), span, 12)
             );
         }
