@@ -31,7 +31,7 @@ use std::path::Path;
 
 use m2_assets::layer::{Layer, TEMPLATE_DB_TYPE};
 use m2_assets::name_hash;
-use m2_engine::tuning::{DAMAGE_TABLE, DAMAGE_TABLE_TYPE, DamageTable};
+use m2_engine::tuning::{DAMAGE_TABLE, DAMAGE_TABLE_TYPE, DamageTable, Springs};
 use m2_engine::{
     CatalogueEntry, CollisionShape, Install, Physics, StaticKey, VehicleControls, VehicleId,
     VehicleSpec,
@@ -94,7 +94,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "template\tcount\twheels\tk front\tk rear\tc front\tc rear\t\
          sag m\tdata Hz\tdata damped Hz\tHz\tdata zeta\tzeta\t\
-         data r front\tr front\tdata r rear\tr rear\tsunk max m\tsunk mean m"
+         data r front\tr front\tdata r rear\tr rear\tsunk max m\tsunk mean m\t\
+         exp front\texp rear\tcmp front\tcmp rear\textra\tgravity\tdata sag m\tdrop m"
     );
     let (mut driven, mut skipped) = (0, 0);
     for ((model, record), ids) in &groups {
@@ -156,6 +157,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             radius(false)
         );
         row += &format!("\t{:.3}\t{:.3}", sunk.0, sunk.1);
+        // Its springs' lengths and gravity factor, the sag they give if
+        // every spring squeezed alike, and how far its wheels stand
+        // below where its model has them (mean).
+        let s = spec.tuning.springs.unwrap_or(Springs::DEFAULT);
+        row += &format!(
+            "\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.3}\t{:.3}",
+            s.stretch.0,
+            s.stretch.1,
+            s.squeeze.0,
+            s.squeeze.1,
+            s.extra,
+            s.gravity_factor,
+            s.gravity_factor * 9.81 / (front * kf + rear * kr),
+            sunk.2
+        );
         println!("{row}");
     }
     println!("driven {driven}, skipped {skipped}");
@@ -188,11 +204,12 @@ fn start(spec: &VehicleSpec) -> (Physics, VehicleId) {
 
 /// How far below the plane each wheel's tyre is drawn once settled, m
 /// (deepest and mean over its wheels; negative: above it): the lowest
-/// point of each wheel's circle as drawn, in the world.
-fn sunk(spec: &VehicleSpec) -> (f32, f32) {
+/// point of each wheel's circle as drawn, in the world; and how far its
+/// wheels stand above where its model has them, mean (negative: below).
+fn sunk(spec: &VehicleSpec) -> (f32, f32, f32) {
     let (p, id) = start(spec);
     let Some(m) = p.vehicle_transform(id) else {
-        return (f32::NAN, f32::NAN);
+        return (f32::NAN, f32::NAN, f32::NAN);
     };
     // `SUNK_AT_MODEL=1`: the wheels where the model has them, as the
     // alpha drew them before its wheels followed their springs.
@@ -218,6 +235,7 @@ fn sunk(spec: &VehicleSpec) -> (f32, f32) {
     (
         deepest,
         depths.iter().sum::<f32>() / depths.len().max(1) as f32,
+        p.vehicle_wheel_lift(id).iter().sum::<f32>() / spec.wheels.len().max(1) as f32,
     )
 }
 

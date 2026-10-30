@@ -12,8 +12,12 @@
 //! # Provenance
 //!
 //! Clean-room. The kinds, wheels and markers come from the game's data as
-//! `m2_assets::vehicle` describes; the masses, engine forces, suspension
-//! and grip are invented arcade tuning, as in the browser viewer.
+//! `m2_assets::vehicle` describes. The masses, engines, brakes, grip and
+//! springs come from each template's `_CarPhysicsV2`
+//! ([`VehicleTuning`]); how a wheeled vehicle's
+//! springs hang and push, and its gravity factor, are from the Xbox 360
+//! code ([`Springs`](crate::tuning::Springs)); how the rest of the data
+//! drives it is still the alpha's reading (`physics.rs` says which).
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
