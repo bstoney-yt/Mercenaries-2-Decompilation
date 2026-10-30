@@ -216,21 +216,16 @@ pub struct BikeTuning {
     pub air: (f32, f32),
 }
 
-/// A wheeled vehicle's engine and gearbox, from its `_CarPhysicsV2`
-/// (names found by hash, round 18 of the playtest fixes; the M151's
-/// values in brackets). The fields are those of a Havok vehicle's
-/// engine and transmission (`minRPM`, `optRPM`, `maxRPM`, upshift and
-/// downshift RPM, primary ratio, a ratio a gear), so the game's own top
-/// speeds come out of them: the M151 in fifth at its optimum 3,000 rpm
-/// runs at 84 km/h against its `MaxSpeed` of 85.
+/// A wheeled vehicle's engine and gearbox, from its `_CarPhysicsV2` (the
+/// M151's values in brackets), as the Xbox 360 code runs them (from the
+/// 360 code, driving round 6: the gearbox and engine at 0x821A0528, the
+/// push at 0x8219C518; [`EngineTuning::step`]). A field the record
+/// leaves out takes the code's default (0x823EB210,
+/// [`EngineTuning::DEFAULT`]).
 ///
-/// Not read: `GearSlipRPM` (0, 1,000 or 2,000; Havok's clutch slip,
-/// meaning here unchecked), and the six fields after `GearRatio5`
-/// (@bc to @d0, unnamed: no name tried hashes to them). Five of the six
-/// are 1 in every record, so a factor of them changes nothing; the
-/// first is 0.5 on the Sidecar Motorcycle and the Sportbike, 1.5 on the
-/// Phoenix and the RTR and 0.7 on the Garbage Truck (31 of 454
-/// records), its meaning unknown.
+/// Not read: `GearTorqueMultiReverse` and `GearTorqueMulti1`..`5` (the
+/// six fields after `GearRatio5`; 1 in every record but the
+/// `...Reverse` of 31: 0.5 to 1.5), which the step doesn't use.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EngineTuning {
     /// Most torque, newton-metres (`EngineTorque` 130).
@@ -239,13 +234,11 @@ pub struct EngineTuning {
     /// (`GearMinRPM` 900, `GearOptRPM` 3,000, `GearMaxRPM` 12,000).
     pub rpm: (f32, f32, f32),
     /// It changes up a gear above this, rpm (`GearUpshiftRPM` 4,000),
-    /// and down one below this (`GearDownshiftRPM` 2,500; 1,500 to
-    /// 5,500 over the 454 records).
+    /// and down one below this (`GearDownshiftRPM` 2,500).
     pub upshift: f32,
     pub downshift: f32,
-    /// How long a change of gear takes, seconds, the engine driving
-    /// nothing meanwhile (`ClutchDelayTime` 0; 0 in 307 of the 454
-    /// records, up to 1.75).
+    /// How long after a change of gear it may change again, seconds
+    /// (`ClutchDelayTime` 0; up to 1.75): the engine drives on meanwhile.
     pub clutch_delay: f32,
     /// The final drive's ratio (`GearRatioPrimary` 3.5), each forward
     /// gear's (`GearRatio1`..`5`: 4, 3.1, 2.4, 2, 1.5; a 0 is no gear)
@@ -253,16 +246,22 @@ pub struct EngineTuning {
     pub primary: f32,
     pub gears: [f32; 5],
     pub reverse: f32,
-    /// The driven wheels' radius, metres (`RearWheelRadius` 0.39).
+    /// The rear wheels' radius, metres (`RearWheelRadius` 0.39).
     pub radius: f32,
     /// Of its most torque, what it gives at idle and at its most rpm
-    /// (`TorqueFactorAtMinRPM` 0.8 and `TorqueFactorAtMaxRPM` 1.0; 0.5 to
-    /// 1 both; names found by hash, gap round 24, as Havok's engine
-    /// names them; between idle, the optimum and the most rpm read as
-    /// straight lines, inferred).
+    /// (`TorqueFactorAtMinRPM` 0.8 and `TorqueFactorAtMaxRPM` 1.0).
     pub torque_at: (f32, f32),
-    /// Top speed backing up, m/s (`ReverseMaxSpeed`, km/h: 55).
+    /// Top speed backing up, m/s (`ReverseMaxSpeed`, km/h: 55). The
+    /// 360's push fades by `MaxSpeed` alone; where this is used isn't
+    /// traced.
     pub reverse_speed: f32,
+    /// How far over idle the engine runs as the clutch slips at a crawl,
+    /// rpm, at full throttle (`GearSlipRPM`; 0, 1,000 or 2,000).
+    pub slip: f32,
+    /// The rear wheels' share of the drive (`RearToFrontTorqueDistrib`,
+    /// default 1): each rear wheel weighs twice that over their number
+    /// in the engine's speed, the front the rest (0x821A0390).
+    pub split: f32,
 }
 
 /// How a wheeled vehicle steers, from its `_CarPhysicsV2` (the M151's
@@ -653,81 +652,145 @@ impl Tyres {
     }
 }
 
+/// A wheeled vehicle's gearbox as it runs (the 360's at the vehicle's
+/// 0x94).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gearbox {
+    /// 0 reverse, 1 to 5 the forward gears.
+    pub gear: usize,
+    /// Until it may change gear again, seconds (below 0: it may).
+    pub clutch: f32,
+    /// How fast the engine turns, rpm.
+    pub rpm: f32,
+    /// The pedals' pull towards reverse or out of it, seconds, -0.1 to
+    /// 0.1 (the vehicle's 0x274).
+    pub reversing: f32,
+}
+
+impl Default for Gearbox {
+    fn default() -> Self {
+        Gearbox {
+            gear: 1,
+            clutch: 0.0,
+            rpm: 0.0,
+            reversing: 0.0,
+        }
+    }
+}
+
 impl EngineTuning {
-    /// How many forward gears it has.
-    pub fn gear_count(&self) -> usize {
-        self.gears.iter().take_while(|&&g| g > 0.0).count().max(1)
-    }
+    /// The 360 code's defaults, for a vehicle with no `_CarPhysicsV2`.
+    pub const DEFAULT: EngineTuning = EngineTuning {
+        torque: 500.0,
+        rpm: (1000.0, 5000.0, 8000.0),
+        upshift: 7000.0,
+        downshift: 2000.0,
+        clutch_delay: 0.5,
+        primary: 8.0,
+        gears: [3.0, 2.25, 1.5, 0.75, 0.4],
+        reverse: 1.0,
+        radius: 0.42,
+        torque_at: (1.0, 1.0),
+        reverse_speed: 50.0 / 3.6,
+        slip: 2000.0,
+        split: 1.0,
+    };
 
-    /// How fast the engine turns, rpm, in a gear of `ratio` at `speed`
-    /// m/s.
-    pub fn rpm_at(&self, ratio: f32, speed: f32) -> f32 {
-        speed.abs() / self.radius * self.primary * ratio * 60.0 / std::f32::consts::TAU
-    }
-
-    /// The gear it settles in at `speed` m/s (0 is first): the lowest
-    /// that keeps the engine below its upshift speed, else its top gear.
-    /// What it drives in as it goes is [`shift`](Self::shift)'s.
-    pub fn gear(&self, speed: f32) -> usize {
-        let n = self.gear_count();
-        (0..n)
-            .find(|&g| self.rpm_at(self.gears[g], speed) <= self.upshift)
-            .unwrap_or(n - 1)
-    }
-
-    /// The gear it changes to from `gear` at `speed` m/s: up one once
-    /// the engine turns faster than its upshift speed (short of its top
-    /// gear), down one once slower than its downshift speed (short of
-    /// first), else the same. Read as a Havok gearbox's upshift and
-    /// downshift RPM are, one gear at a time (inferred: the names are
-    /// Havok's, and in all 454 records a change up lands the engine
-    /// above the next gear's downshift speed, so it never changes
-    /// straight back).
-    pub fn shift(&self, gear: usize, speed: f32) -> usize {
-        let n = self.gear_count();
-        let gear = gear.min(n - 1);
-        let rpm = self.rpm_at(self.gears[gear], speed);
-        if rpm > self.upshift && gear + 1 < n {
-            gear + 1
-        } else if rpm < self.downshift && gear > 0 {
-            gear - 1
-        } else {
-            gear
-        }
-    }
-
-    /// Of its most torque, what the engine gives at `rpm`: rising from
-    /// idle to the optimum, falling from there to its most, nothing
-    /// beyond.
-    pub fn torque_factor(&self, rpm: f32) -> f32 {
-        let (min, opt, max) = self.rpm;
-        let rpm = rpm.max(min);
-        let along = |a: f32, b: f32| ((rpm - a) / (b - a).max(1.0)).clamp(0.0, 1.0);
-        if rpm <= opt {
-            self.torque_at.0 + (1.0 - self.torque_at.0) * along(min, opt)
-        } else if rpm <= max {
-            1.0 + (self.torque_at.1 - 1.0) * along(opt, max)
-        } else {
-            0.0
-        }
-    }
-
-    /// How hard the driven wheels push flat out at `speed` m/s, newtons,
-    /// forwards or backing up, in the gear it settles in there.
-    pub fn push(&self, speed: f32, backwards: bool) -> f32 {
-        self.push_in(self.gear(speed), speed, backwards)
-    }
-
-    /// How hard the driven wheels push flat out at `speed` m/s in `gear`
-    /// (0 is first), newtons, or backing up in reverse.
-    pub fn push_in(&self, gear: usize, speed: f32, backwards: bool) -> f32 {
-        let ratio = if backwards {
-            self.reverse
-        } else {
-            self.gears[gear.min(self.gear_count() - 1)]
+    /// A gear's ratio, final drive included (0 reverse, backwards; a gear
+    /// it hasn't, 0).
+    pub fn ratio(&self, gear: usize) -> f32 {
+        let r = match gear {
+            0 => -self.reverse,
+            g => self.gears.get(g - 1).copied().unwrap_or(0.0),
         };
-        let rpm = self.rpm_at(ratio, speed);
-        self.torque * self.torque_factor(rpm) * self.primary * ratio / self.radius
+        r * self.primary
+    }
+
+    /// One step of its gearbox and engine as the 360 code runs them
+    /// (0x821A0528), `dt` s on with the throttle open `throttle` (0 to
+    /// 1), its driven wheels turning at `wheels` rpm (weighted by their
+    /// shares of the drive, [`split`](Self::split)) and the driver asking
+    /// for reverse or not: the torque it pushes with, newton-metres,
+    /// backwards in reverse.
+    ///
+    /// - Once its clutch delay has run out, it goes into reverse from
+    ///   first when asked, back to first when not; else up a gear above
+    ///   its upshift speed (short of fifth) and down one below its
+    ///   downshift speed (short of first), the delay starting again.
+    /// - The engine turns at the wheels' speed through the gear; under
+    ///   idle the clutch slips, holding it at idle plus the throttle's
+    ///   share of its slip, from half idle up eased in towards the
+    ///   wheels'.
+    /// - Its torque is its most times a factor falling from 1 at the
+    ///   optimum to its torque factor at idle (or at its most rpm) as
+    ///   the square of the way there; it drags with a tenth of its most
+    ///   at the optimum, rising by a twentieth to idle and a fifth to its
+    ///   most rpm, three tenths there (nothing pushing), scaled down
+    ///   with the speed below idle. It pushes with the throttle's share
+    ///   of the one less the other.
+    ///
+    /// A gear whose ratio is 0 isn't changed up into (the 360 would).
+    pub fn step(&self, g: &mut Gearbox, dt: f32, throttle: f32, wheels: f32, reverse: bool) -> f32 {
+        g.clutch -= dt;
+        if g.clutch < 0.0 {
+            if reverse && g.gear == 1 {
+                g.gear = 0;
+            }
+            let rpm = self.ratio(g.gear) * wheels;
+            if g.gear == 0 {
+                if !reverse {
+                    g.gear = 1;
+                }
+            } else {
+                if rpm < self.downshift && g.gear > 1 {
+                    g.clutch = self.clutch_delay;
+                    g.gear -= 1;
+                }
+                if rpm > self.upshift && g.gear < 5 && self.ratio(g.gear + 1) != 0.0 {
+                    g.gear += 1;
+                    g.clutch = self.clutch_delay;
+                }
+            }
+        }
+        let (min, opt, max) = self.rpm;
+        let ratio = self.ratio(g.gear);
+        let turning = ratio * wheels;
+        let throttle = throttle.clamp(0.0, 1.0);
+        g.rpm = turning;
+        if turning < min {
+            let half = min * 0.5;
+            g.rpm = if turning >= half {
+                (turning - half) * (self.slip * throttle) / (min - half) + min
+            } else {
+                min + self.slip * throttle
+            };
+        }
+        let past = g.rpm - opt;
+        let (push, drag) = if past >= 0.0 {
+            if g.rpm >= max {
+                g.rpm = max;
+                (0.0, 0.3 * self.torque)
+            } else {
+                let f = 1.0 / (max - opt);
+                (
+                    ((self.torque_at.1 - 1.0) * f * f * past * past + 1.0) * self.torque,
+                    (0.2 * f * past + 0.1) * self.torque,
+                )
+            }
+        } else {
+            let f = 1.0 / (opt - min);
+            let drag = (-0.05 * f * past + 0.1) * self.torque;
+            (
+                ((self.torque_at.0 - 1.0) * f * f * past * past + 1.0) * self.torque,
+                if turning < min {
+                    drag / min * turning
+                } else {
+                    drag
+                },
+            )
+        };
+        let torque = push * throttle - drag;
+        if ratio < 0.0 { -torque } else { torque }
     }
 }
 
@@ -1301,6 +1364,12 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         radius: f("RearWheelRadius")?,
                         torque_at: (f("TorqueFactorAtMinRPM")?, f("TorqueFactorAtMaxRPM")?),
                         reverse_speed: f("ReverseMaxSpeed")? / 3.6,
+                        slip: f("GearSlipRPM")
+                            .unwrap_or(EngineTuning::DEFAULT.slip)
+                            .max(0.0),
+                        split: f("RearToFrontTorqueDistrib")
+                            .unwrap_or(EngineTuning::DEFAULT.split)
+                            .clamp(0.0, 1.0),
                     };
                     (e.torque > 0.0
                         && e.primary > 0.0
@@ -1638,69 +1707,75 @@ mod tests {
             radius: 0.39,
             torque_at: (0.8, 1.0),
             reverse_speed: 55.0 / 3.6,
+            slip: 1000.0,
+            split: 1.0,
         }
     }
 
-    // Its top gear at its optimum rpm is its template's `MaxSpeed`, 85
-    // km/h, near enough.
+    // Its torque as the 360 code works it out (0x821A0528): its most at
+    // the optimum less a tenth dragging; at idle 0.8 of it less 0.15;
+    // at its most rpm nothing but 0.3 dragging.
     #[test]
-    fn the_m151_tops_out_in_fifth_near_its_max_speed() {
+    fn the_engine_gives_its_torque_as_the_360s() {
         let e = m151();
-        assert_eq!(e.gear_count(), 5);
-        let kmh = 3000.0 / (e.primary * 1.5) * std::f32::consts::TAU / 60.0 * e.radius * 3.6;
-        assert!((kmh - 85.0).abs() < 2.0, "{kmh}");
-        assert_eq!(e.gear(85.0 / 3.6), 4);
-        assert!((e.rpm_at(1.5, 85.0 / 3.6) - 3034.0).abs() < 5.0);
+        let at = |rpm: f32, throttle: f32| {
+            let mut g = Gearbox {
+                clutch: 1.0,
+                ..Gearbox::default()
+            };
+            e.step(&mut g, 0.0, throttle, rpm / e.ratio(1), false)
+        };
+        let close = |a: f32, b: f32| assert!((a - b).abs() < 0.01, "{a} {b}");
+        close(at(3000.0, 1.0), 130.0 - 13.0);
+        close(at(900.0, 1.0), 0.8 * 130.0 - 0.15 * 130.0);
+        close(at(12_000.0, 1.0), -0.3 * 130.0);
+        // Off the throttle it only drags: a tenth at the optimum.
+        close(at(3000.0, 0.0), -13.0);
+        // Halfway from the optimum to idle: 1 - 0.2 / 4 of it.
+        close(at(1950.0, 1.0), 0.95 * 130.0 - 0.125 * 130.0);
     }
 
-    // It pulls away in first at its idle torque (0.8 of 130 Nm through
-    // 3.5 x 4 on 0.39 m wheels: 3.7 kN) and changes up as it goes.
+    // Under idle the clutch slips: standing, the engine turns at idle plus
+    // the throttle's share of its slip.
     #[test]
-    fn the_engine_pulls_through_its_gears() {
+    fn the_clutch_slips_under_idle() {
         let e = m151();
-        assert_eq!(e.gear(0.0), 0);
-        assert!((e.push(0.0, false) - 3733.0).abs() < 2.0);
-        let gears: Vec<usize> = (0..25).map(|v| e.gear(v as f32)).collect();
-        assert!(gears.windows(2).all(|w| w[1] >= w[0]), "{gears:?}");
-        assert_eq!(gears[24], 4);
-        // Harder in first than in fifth; nothing past its most rpm.
-        assert!(e.push(5.0, false) > e.push(23.0, false));
-        assert_eq!(e.torque_factor(12_001.0), 0.0);
-        assert_eq!(e.torque_factor(3000.0), 1.0);
-        assert!((e.torque_factor(500.0) - 0.8).abs() < 1e-6);
-        // Backing up in reverse's ratio.
-        assert!((e.push(0.0, true) - 130.0 * 0.8 * 3.5 * 3.7 / 0.39).abs() < 2.0);
+        let mut g = Gearbox::default();
+        e.step(&mut g, 1.0 / 60.0, 0.5, 0.0, false);
+        assert!((g.rpm - 1400.0).abs() < 1e-3, "{}", g.rpm);
     }
 
-    // Gap round 24: it changes up at its 4,000 rpm and back down only
-    // below its 2,500, one gear at a time, so it never changes straight
-    // back (by speed alone it changed down at 4,000 rpm in the gear
-    // below, and the garbage truck hunted between gears 225 times in a
-    // run).
+    // It changes up above its 4,000 rpm and down below its 2,500, one gear
+    // at a time; into reverse from first when asked, pushing backwards,
+    // and back to first when not.
     #[test]
-    fn the_gearbox_changes_up_and_down_at_its_shift_speeds() {
+    fn the_gearbox_changes_as_the_360s() {
         let e = m151();
-        let at = |gear: usize, rpm: f32| rpm / e.rpm_at(e.gears[gear], 1.0);
-        assert_eq!(e.shift(0, at(0, 3990.0)), 0);
-        assert_eq!(e.shift(0, at(0, 4010.0)), 1);
-        // Just changed up: 4,010 x 3.1 / 4 = 3,108 rpm in second.
-        assert_eq!(e.shift(1, at(0, 4010.0)), 1);
-        assert_eq!(e.shift(1, at(1, 2510.0)), 1);
-        assert_eq!(e.shift(1, at(1, 2490.0)), 0);
-        // Its top gear and first are the ends.
-        assert_eq!(e.shift(4, 60.0), 4);
-        assert_eq!(e.shift(0, 0.0), 0);
-        // Rolling at 1,500 rpm in fifth it changes down one at a time,
-        // to second (3,100 rpm there).
-        let mut gear = 4;
-        let mut seen = vec![gear];
-        for _ in 0..5 {
-            gear = e.shift(gear, at(4, 1500.0));
-            seen.push(gear);
-        }
-        assert_eq!(seen, [4, 3, 2, 1, 1, 1]);
-        // It pulls harder in a lower gear.
-        assert!(e.push_in(0, 5.0, false) > e.push_in(1, 5.0, false));
+        let mut g = Gearbox::default();
+        let first = |rpm: f32| rpm / e.ratio(1);
+        e.step(&mut g, 0.01, 1.0, first(3990.0), false);
+        assert_eq!(g.gear, 1);
+        e.step(&mut g, 0.01, 1.0, first(4010.0), false);
+        assert_eq!(g.gear, 2);
+        // In second that is 3,108 rpm: it stays.
+        e.step(&mut g, 0.01, 1.0, first(4010.0), false);
+        assert_eq!(g.gear, 2);
+        e.step(&mut g, 0.01, 1.0, 2490.0 / e.ratio(2), false);
+        assert_eq!(g.gear, 1);
+        let back = e.step(&mut g, 0.01, 1.0, 0.0, true);
+        assert_eq!(g.gear, 0);
+        assert!(back < 0.0, "{back}");
+        e.step(&mut g, 0.01, 1.0, 0.0, false);
+        assert_eq!(g.gear, 1);
+        // Its clutch delay holds the gear it changed to.
+        let slow = EngineTuning {
+            clutch_delay: 0.5,
+            ..e
+        };
+        let mut g = Gearbox::default();
+        slow.step(&mut g, 0.01, 1.0, first(4010.0), false);
+        slow.step(&mut g, 0.01, 1.0, 5000.0 / e.ratio(2), false);
+        assert_eq!(g.gear, 2);
     }
 
     // A gearbox with fewer than five gears stops at its last.
@@ -1710,8 +1785,12 @@ mod tests {
             gears: [3.0, 2.0, 1.0, 0.0, 0.0],
             ..m151()
         };
-        assert_eq!(e.gear_count(), 3);
-        assert_eq!(e.gear(60.0), 2);
+        let mut g = Gearbox {
+            gear: 3,
+            ..Gearbox::default()
+        };
+        e.step(&mut g, 0.01, 1.0, 9000.0 / e.ratio(3), false);
+        assert_eq!(g.gear, 3);
     }
 
     // A table laid out as the game's: two targets, three kinds of damage.
