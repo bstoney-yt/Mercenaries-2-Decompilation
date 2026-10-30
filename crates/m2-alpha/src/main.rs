@@ -2836,6 +2836,17 @@ fn gates_for_screenshot(
         game.scene.props.skip = None;
         // The bomb goes off on its top.
         let blast = top - Vec3::Y * 0.2;
+        // Pushing the pieces as the bomb's blasts do.
+        let push = game
+            .scene
+            .world
+            .as_ref()
+            .and_then(|w| {
+                crate::game::bomb_blasts(&w.index.template_db, blast)
+                    .first()
+                    .map(|b| b.push)
+            })
+            .unwrap_or(m2_engine::durability::BlastPush::none(blast));
         for (t, &(scale, alone)) in GATE_TRIES.iter().enumerate() {
             if alone && let Some(world) = &mut game.scene.world {
                 // Everything else mostly in its box taken down, and the
@@ -2881,7 +2892,7 @@ fn gates_for_screenshot(
             if !game
                 .scene
                 .props
-                .wreck_scaled(&mut world.physics, gate, Some(blast), scale)
+                .wreck_scaled(&mut world.physics, gate, Some(push), scale)
             {
                 eprintln!("gate {n}: it would not break");
                 break;

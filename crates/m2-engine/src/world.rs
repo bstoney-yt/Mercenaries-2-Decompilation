@@ -320,6 +320,10 @@ pub struct Templates {
     /// What each piece of a template's objects weighs once broken off,
     /// kg, by id ([`crate::durability::piece_masses`]).
     pub piece_masses: HashMap<u32, f32>,
+    /// How hard blasts push each template's objects, of their push
+    /// (`ExplosionFudge`), by id, where it says
+    /// ([`crate::durability::explosion_fudges`]).
+    pub explosion_fudges: HashMap<u32, f32>,
     /// The templates that stand already destroyed, by id: those whose
     /// `Health` is 0. All 201 such are ruins (`_marsh_bridgemid_ruined`,
     /// `AMX30_RUIN`), each with the model of its intact twin, whose
@@ -923,6 +927,7 @@ impl Templates {
                 .collect(),
             infos,
             piece_masses: crate::durability::piece_masses(&db, &names),
+            explosion_fudges: crate::durability::explosion_fudges(&db),
             names: names
                 .into_iter()
                 .map(|(id, name)| (id, name.to_owned()))
