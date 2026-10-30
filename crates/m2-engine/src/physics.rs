@@ -4607,6 +4607,42 @@ mod tests {
         assert!(up < -3.0, "drove {up} m up 50 degrees");
     }
 
+    /// Playtest (Android, a controller): the gearbox goes into reverse
+    /// only with the brake pedal all but floored (over 0.9), so a pedal
+    /// that shares its push with the steering (0.71 at full lock, as the
+    /// alpha's pad once gave it) never backs up. The whole pedal does,
+    /// steering or not.
+    #[test]
+    fn a_floored_pedal_backs_up_at_full_lock() {
+        let backed = |throttle: f32, steer: f32| {
+            let mut p = Physics::new();
+            floor(&mut p, 1, 0.0, 0.0, 0.0, 600.0);
+            p.step(DT);
+            let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+            for _ in 0..(3.0 / DT) as usize {
+                p.drive(
+                    id,
+                    VehicleControls {
+                        throttle,
+                        steer,
+                        ..Default::default()
+                    },
+                );
+                p.step(DT);
+            }
+            (
+                p.vehicle_gear(id).expect("an engine").0,
+                p.vehicle_speed(id),
+            )
+        };
+        let shared = backed(-std::f32::consts::FRAC_1_SQRT_2, 1.0);
+        assert_eq!(shared.0, 1, "{shared:?}");
+        assert!(shared.1.abs() < 0.5, "{shared:?}");
+        let floored = backed(-1.0, 1.0);
+        assert_eq!(floored.0, 0, "{floored:?}");
+        assert!(floored.1 < -2.0, "{floored:?}");
+    }
+
     // Round 18: with the M151's engine and gearbox it reaches its
     // template's 85 km/h in seconds and holds there (it used to level
     // off at 60% of it), and backs up no faster than its 55 km/h.
