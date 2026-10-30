@@ -61,13 +61,10 @@ pub struct Blast {
 }
 
 impl Blast {
-    /// The damage at `d` metres from its heart: none past its reach.
+    /// The damage at `d` metres from its heart: none past its reach
+    /// ([`m2_engine::durability::blast_damage`]).
     pub fn at_distance(&self, d: f32) -> f32 {
-        if d > self.radius {
-            return 0.0;
-        }
-        let k = (d / self.radius.max(0.01)).clamp(0.0, 1.0);
-        self.damage + (self.least - self.damage) * k
+        m2_engine::durability::blast_damage(self.damage, self.least, self.radius, d)
     }
 }
 
@@ -1165,6 +1162,7 @@ mod tests {
                 radius: 6.0,
                 damage: 300.0,
                 least: 0.0,
+                force: 500.0,
                 kind: 0,
             },
         );

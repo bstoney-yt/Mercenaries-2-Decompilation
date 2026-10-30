@@ -35,6 +35,46 @@ pub struct Durability {
     pub invincible: bool,
     /// A building's collapse, if it has one.
     pub collapse: Option<Collapse>,
+    /// How it burns down once worn low (`TickDamage`), if it does.
+    pub burn: Option<BurnDown>,
+}
+
+/// How an object worn below a health burns itself down (`TickDamage`:
+/// `DamageThresh`, `Damage`, `TickLength`). From the 360 code: damage
+/// that carries its health from above `below` to under it starts a timer
+/// (0x822889F8) that adds each frame's time and, each time it reaches
+/// `every`, has it take `damage` and starts again less `every`
+/// (0x8240ADF8), until it is destroyed. `below` is a whole number
+/// (`DamageThresh` is read as one, 0x823F4300), and the burning is armed
+/// only when both `damage` and `every` are above 0 (0x823FCB98). The fuel
+/// tanks': below 465 of their 500, 50 every half second.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BurnDown {
+    pub below: f32,
+    pub damage: f32,
+    pub every: f32,
+}
+
+impl BurnDown {
+    /// Seconds it burns with `health` left until it is destroyed, with
+    /// nothing else hurting it: a tick of `damage` each `every`, the first
+    /// `every` after it caught.
+    pub fn seconds_to_burn_out(&self, health: f32) -> f32 {
+        (health / self.damage).ceil() * self.every
+    }
+}
+
+/// What a blast does `d` metres from its heart: `damage` falling off with
+/// the distance to none at `radius`, but never less than `least` (the 360
+/// code's 0x82291640: `max(least, damage * clamp(1 - d / radius, 0, 1))`,
+/// before the damage table's cell). What lies past `radius` it does not
+/// reach.
+pub fn blast_damage(damage: f32, least: f32, radius: f32, d: f32) -> f32 {
+    if d > radius {
+        return 0.0;
+    }
+    let falloff = (1.0 - d / radius.max(0.01)).clamp(0.0, 1.0);
+    (damage * falloff).max(least)
 }
 
 /// How a building sinks and leans as it comes down
@@ -55,6 +95,12 @@ pub struct Collapse {
 pub fn read(db: &Layer<'_>) -> HashMap<u32, Durability> {
     let health = Table::new(db, "Health");
     let anim = Table::new(db, "BuildingCollapseAnim");
+    let tick = Table::new(db, "TickDamage");
+    let (below, damage, every) = (
+        name_hash("DamageThresh"),
+        name_hash("Damage"),
+        name_hash("TickLength"),
+    );
     let invincible = name_hash("Invincible");
     let (kind, sink) = (name_hash("Type"), name_hash("SinkAccel"));
     health
@@ -76,6 +122,14 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, Durability> {
                     health: health.float(r, AMOUNT).unwrap_or(0.0),
                     invincible: health.word(r, invincible) == Some(1),
                     collapse,
+                    burn: tick.of_template(id).first().and_then(|t| {
+                        let b = BurnDown {
+                            below: tick.word(t, below)? as f32,
+                            damage: tick.float(t, damage)?,
+                            every: tick.float(t, every)?,
+                        };
+                        (b.damage > 0.0 && b.every > 0.0).then_some(b)
+                    }),
                 },
             ))
         })
@@ -387,6 +441,9 @@ pub struct Explosion {
     pub damage: f32,
     /// At its edge (`minDamage`).
     pub least: f32,
+    /// Its push at its heart (`MaxForce`; 500 where the template gives
+    /// none, the schema's default, 0x823EF9F0).
+    pub force: f32,
     /// Its template's `DamageKey` (name hash; 0 for none): the damage
     /// table's column for what each thing it reaches takes of it (the
     /// RPG's blast `Explosion`, its frag `Bullet`, the air strike's bomb
@@ -451,6 +508,7 @@ pub fn explosions(db: &Layer<'_>) -> HashMap<u32, Explosion> {
                     radius: t.float(r, radius).unwrap_or(0.0),
                     damage: t.float(r, damage).unwrap_or(0.0),
                     least: t.float(r, least).unwrap_or(0.0),
+                    force: t.float(r, name_hash("MaxForce")).unwrap_or(500.0),
                     kind: keys.get(&id).copied().unwrap_or(0),
                 },
             ))
@@ -461,6 +519,24 @@ pub fn explosions(db: &Layer<'_>) -> HashMap<u32, Explosion> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A blast falls off with the distance to none at its edge, but never
+    // under its least within reach (`fx_Explosion_HugeOil`'s 400, 95, 8 m).
+    #[test]
+    fn a_blast_falls_off_to_its_least_within_reach() {
+        assert_eq!(blast_damage(400.0, 95.0, 8.0, 0.0), 400.0);
+        assert_eq!(blast_damage(400.0, 95.0, 8.0, 4.0), 200.0);
+        assert_eq!(blast_damage(400.0, 95.0, 8.0, 7.0), 95.0);
+        assert_eq!(blast_damage(400.0, 95.0, 8.0, 8.5), 0.0);
+        // A fuel tank burning from just under 465 by 50 a half second
+        // burns out in 10 ticks.
+        let b = BurnDown {
+            below: 465.0,
+            damage: 50.0,
+            every: 0.5,
+        };
+        assert_eq!(b.seconds_to_burn_out(464.5), 5.0);
+    }
 
     // A crash's size is a tenth of the closing speed times the masses'
     // roots summed; a fixed body counts as 15 t.
