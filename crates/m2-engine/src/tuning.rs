@@ -50,6 +50,8 @@ pub struct VehicleTuning {
     pub engine: Option<EngineTuning>,
     /// A wheeled vehicle's steering, brakes and grip (`_CarPhysicsV2`).
     pub handling: Option<Handling>,
+    /// A wheeled vehicle's springs (`_CarPhysicsV2`).
+    pub springs: Option<Springs>,
     /// A tracked vehicle's pull at a standstill, a third, two thirds and
     /// all of its top speed, of its most (`_TankPhysics`'s
     /// `EngineTorqueRatio0`..`3`, names found by hash: the AMX-30's 1,
@@ -292,20 +294,6 @@ pub struct Handling {
     /// the 454 records).
     pub low_speed: f32,
     pub low_steer_speed: f32,
-    /// Each axle's springs, front and back (`FrontWheelSuspStrength`
-    /// 25, `RearWheelSuspStrength` 25; 4.5 to 80 and 8 to 80; gap round
-    /// 16): the push of each wheel's spring per metre it is compressed,
-    /// per kilogram the vehicle weighs (read per unit of mass, as a
-    /// Havok or Bullet ray-cast suspension takes it, inferred: the
-    /// 11-tonne Escort's is 13, the 200 kg scooter's 70, so it does not
-    /// grow with the weight). The body bounces at the square root of
-    /// their sum, rad/s: an M151's 25 x 4 at 1.6 Hz.
-    pub spring: (f32, f32),
-    /// Each axle's dampers (`FrontWheelSuspDamp` 1.7,
-    /// `RearWheelSuspDamp` 1.7; 0.8 to 10 and 0.4 to 10), per kilogram
-    /// as the springs are, the same squeezed or stretched (one field
-    /// each; inferred).
-    pub damping: (f32, f32),
 }
 
 impl Handling {
@@ -317,6 +305,81 @@ impl Handling {
         } else {
             self.steer_speed
         }
+    }
+}
+
+/// A wheeled vehicle's springs, from its `_CarPhysicsV2` (the M151's
+/// values in brackets), as the Xbox 360 code builds and drives each
+/// wheel (from the 360 code, driving round 1: the wheel set-up at
+/// 0x8219EF90 and the wheel step at 0x8219F510):
+///
+/// - Each wheel's spring hangs from a point its `*WheelSuspCmpLength`
+///   above where the model has the wheel's centre, and is
+///   `ExtraInvisibleSpringLength + *WheelSuspExpLength +
+///   *WheelSuspCmpLength` long unloaded ([`Springs::length`]). The
+///   wheel is cast down that far plus its radius; fully stretched it
+///   hangs `ExtraInvisibleSpringLength + *WheelSuspExpLength` below the
+///   model's wheel, squeezed flat `*WheelSuspCmpLength` above it.
+/// - Touching the ground, it pushes the chassis along the contact's
+///   normal with mass x (strength x squeeze - damp x stretching speed),
+///   newtons, where squeeze is how much shorter than unloaded it is and
+///   the stretching speed its length's change over the step: one damp,
+///   squeezed or stretched.
+/// - With more than half its wheels on the ground the chassis is pulled
+///   down by (`GravityFactor` - 1) x its weight more (at 0x8219EE14).
+///
+/// A field the record leaves out takes the 360 code's own default
+/// (0x823EB210): 40.1 and 3 for a spring's strength and damp, 0.2 m
+/// for each of its lengths, 0 extra, a `GravityFactor` of 2.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Springs {
+    /// Each axle's spring, front and back (`FrontWheelSuspStrength` 25,
+    /// `RearWheelSuspStrength` 25; 4.5 to 80 and 8 to 80): its push per
+    /// metre squeezed, per kilogram the vehicle weighs.
+    pub strength: (f32, f32),
+    /// Each axle's damp (`FrontWheelSuspDamp` 1.7, `RearWheelSuspDamp`
+    /// 1.7), per kilogram as the strength is.
+    pub damping: (f32, f32),
+    /// How far each axle's spring stretches below the model's wheel and
+    /// squeezes above it, metres (`*WheelSuspExpLength`,
+    /// `*WheelSuspCmpLength`).
+    pub stretch: (f32, f32),
+    pub squeeze: (f32, f32),
+    /// Unloaded length every spring has besides those, metres
+    /// (`ExtraInvisibleSpringLength`).
+    pub extra: f32,
+    /// Its weight on the ground, of its plain weight (`GravityFactor`).
+    pub gravity_factor: f32,
+}
+
+impl Springs {
+    /// The 360 code's defaults, for a vehicle with no `_CarPhysicsV2`.
+    pub const DEFAULT: Springs = Springs {
+        strength: (40.1, 40.1),
+        damping: (3.0, 3.0),
+        stretch: (0.2, 0.2),
+        squeeze: (0.2, 0.2),
+        extra: 0.0,
+        gravity_factor: 2.0,
+    };
+
+    /// One axle's (front, the steering one, or back) strength, damp,
+    /// unloaded length and how far its spring's top sits above the
+    /// model's wheel centre, metres.
+    pub fn axle(&self, front: bool) -> (f32, f32, f32, f32) {
+        let pick = |p: (f32, f32)| if front { p.0 } else { p.1 };
+        let squeeze = pick(self.squeeze);
+        (
+            pick(self.strength),
+            pick(self.damping),
+            self.extra + pick(self.stretch) + squeeze,
+            squeeze,
+        )
+    }
+
+    /// An axle's spring's unloaded length, metres.
+    pub fn length(&self, front: bool) -> f32 {
+        self.axle(front).2
     }
 }
 
@@ -988,8 +1051,36 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         steer_speed: f("SteerSpeed")?,
                         low_speed: low.map_or(0.0, |l| l.0),
                         low_steer_speed: low.map_or(0.0, |l| l.1),
-                        spring: (f("FrontWheelSuspStrength")?, f("RearWheelSuspStrength")?),
-                        damping: (f("FrontWheelSuspDamp")?, f("RearWheelSuspDamp")?),
+                    })
+                })(),
+                springs: (|| {
+                    let r = *car.of_template(id).first()?;
+                    let d = Springs::DEFAULT;
+                    let f = |name, or: f32| car.float(r, name_hash(name)).unwrap_or(or);
+                    let pair = |front, rear, or: (f32, f32)| (f(front, or.0), f(rear, or.1));
+                    let length = |front, rear, or| {
+                        let (a, b) = pair(front, rear, or);
+                        (a.max(0.0), b.max(0.0))
+                    };
+                    Some(Springs {
+                        strength: pair(
+                            "FrontWheelSuspStrength",
+                            "RearWheelSuspStrength",
+                            d.strength,
+                        ),
+                        damping: pair("FrontWheelSuspDamp", "RearWheelSuspDamp", d.damping),
+                        stretch: length(
+                            "FrontWheelSuspExpLength",
+                            "RearWheelSuspExpLength",
+                            d.stretch,
+                        ),
+                        squeeze: length(
+                            "FrontWheelSuspCmpLength",
+                            "RearWheelSuspCmpLength",
+                            d.squeeze,
+                        ),
+                        extra: f("ExtraInvisibleSpringLength", d.extra).max(0.0),
+                        gravity_factor: f("GravityFactor", d.gravity_factor),
                     })
                 })(),
                 tracks: (|| {
