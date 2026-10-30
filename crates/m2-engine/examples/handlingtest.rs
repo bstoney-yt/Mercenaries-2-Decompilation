@@ -1,4 +1,4 @@
-//! Brakes and steers every wheeled vehicle template on a level plane, as
+//! Tyres and steers every wheeled vehicle template on a level plane, as
 //! the alpha's physics drives it, and prints how it stops and turns:
 //! from 50 km/h (or 90% of its top speed, if lower), braking with the
 //! throttle against the motion, the time and distance to a stop and the
@@ -28,6 +28,8 @@ const DT: f32 = 1.0 / 60.0;
 /// The speed it brakes from and turns at, m/s.
 const BRAKE_FROM: f32 = 50.0 / 3.6;
 const TURN_AT: f32 = 20.0 / 3.6;
+/// The faster speed it also turns at, m/s (or 90% of its top speed).
+const TURN_FAST: f32 = 60.0 / 3.6;
 
 type Driven = (u32, Vec<u8>);
 
@@ -92,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         driven += ids.len();
         let handling = spec.tuning.handling;
         let lock = handling.map_or("-".to_owned(), |h| format!("{:.2}", h.steer_lock));
-        let brakes = spec.tuning.brakes.map_or("-".to_owned(), |b| {
+        let brakes = spec.tuning.tyres.map_or("-".to_owned(), |b| {
             format!("{:.1}/{:.1}", b.brake.0, b.brake.1)
         });
         let from = spec
@@ -100,10 +102,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .max_speed
             .map_or(BRAKE_FROM, |top| BRAKE_FROM.min(0.9 * top));
         let stop = brake(&spec, from);
-        let turn = turn(&spec);
+        let turn = turn(&spec, TURN_AT);
+        let fast = turn_fast(&spec);
         let f = |v: Option<f32>, p: usize| v.map_or("-".to_owned(), |v| format!("{v:.p$}"));
         println!(
-            "{name}\t{}\t{:.0}\t{lock}\t{brakes}\t{:.0}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{name}\t{}\t{:.0}\t{lock}\t{brakes}\t{:.0}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             ids.len(),
             spec.mass,
             from * 3.6,
@@ -113,6 +116,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             f(turn.map(|t| t.0 * 3.6), 0),
             f(turn.map(|t| t.1), 1),
             turn.is_some_and(|t| t.2),
+            f(fast.map(|t| t.0 * 3.6), 0),
+            f(fast.map(|t| t.1), 1),
+            f(fast.map(|t| t.3), 1),
+            fast.is_some_and(|t| t.2),
         );
     }
     println!("driven {driven}, skipped {skipped}");
@@ -180,17 +187,19 @@ fn brake(spec: &VehicleSpec, from: f32) -> Option<(f32, f32, f32)> {
     Some((t, d, v0 / t.max(DT)))
 }
 
-/// Held near [`TURN_AT`] at full left lock for 8 s: the speed it holds,
+/// Held near `at` m/s at full left lock for 8 s: the speed it holds,
 /// the radius it turns on over the last 4 s (speed over yaw rate), and
-/// whether it rolled over (its roof below level).
-fn turn(spec: &VehicleSpec) -> Option<(f32, f32, bool)> {
+/// whether it rolled over (its roof below level), and its mean sideslip
+/// over the last 4 s (degrees between its heading and its way).
+fn turn(spec: &VehicleSpec, at: f32) -> Option<(f32, f32, bool, f32)> {
     let (mut p, id) = start(spec);
     let mut heading = Vec::new();
     let mut speeds = Vec::new();
+    let mut slips = Vec::new();
     let mut rolled = false;
     for i in 0..(10.0 / DT) as usize {
         let v = p.vehicle_speed(id);
-        let throttle = ((TURN_AT - v) * 0.5).clamp(-1.0, 1.0);
+        let throttle = ((at - v) * 0.5).clamp(-1.0, 1.0);
         // Straight until it is up to speed, then full lock.
         let steer = if i as f32 * DT < 2.0 { 0.0 } else { 1.0 };
         p.drive(
@@ -208,6 +217,11 @@ fn turn(spec: &VehicleSpec) -> Option<(f32, f32, bool)> {
             let ahead = m.z_axis.truncate();
             heading.push(ahead.x.atan2(ahead.z));
             speeds.push(v);
+            let vel = p.vehicle_velocity(id).with_y(0.0);
+            let flat = ahead.with_y(0.0);
+            if vel.length() > 0.5 && flat.length() > 0.1 {
+                slips.push(vel.angle_between(flat).to_degrees());
+            }
         }
     }
     let mut yaw = 0.0;
@@ -223,5 +237,15 @@ fn turn(spec: &VehicleSpec) -> Option<(f32, f32, bool)> {
     let secs = (heading.len().max(2) - 1) as f32 * DT;
     let rate = (yaw / secs).abs();
     let speed = speeds.iter().sum::<f32>() / speeds.len().max(1) as f32;
-    (rate > 1e-3).then_some((speed, speed / rate, rolled))
+    let slip = slips.iter().sum::<f32>() / slips.len().max(1) as f32;
+    (rate > 1e-3).then_some((speed, speed / rate, rolled, slip))
+}
+
+/// As [`turn`], at [`TURN_FAST`] (or 90% of its top speed, if lower).
+fn turn_fast(spec: &VehicleSpec) -> Option<(f32, f32, bool, f32)> {
+    let at = spec
+        .tuning
+        .max_speed
+        .map_or(TURN_FAST, |top| TURN_FAST.min(0.9 * top));
+    turn(spec, at)
 }
