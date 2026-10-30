@@ -52,6 +52,8 @@ pub struct VehicleTuning {
     pub handling: Option<Handling>,
     /// A wheeled vehicle's springs (`_CarPhysicsV2`).
     pub springs: Option<Springs>,
+    /// How a wheeled vehicle's tyres slow it along (`_CarPhysicsV2`).
+    pub brakes: Option<Brakes>,
     /// A tracked vehicle's pull at a standstill, a third, two thirds and
     /// all of its top speed, of its most (`_TankPhysics`'s
     /// `EngineTorqueRatio0`..`3`, names found by hash: the AMX-30's 1,
@@ -272,12 +274,6 @@ pub struct Handling {
     /// to 1.1, 29 to 63 degrees; radians inferred, as the database gives
     /// the helicopters' and cameras' angles in them too).
     pub steer_lock: f32,
-    /// Each axle's brake, front and back (`FrontBrake` 7, `RearBrake` 6;
-    /// 2.5 to 11 and 1 to 13). Read as the slowing it gives the whole
-    /// vehicle, m/s², if every wheel braked as that axle's do (inferred:
-    /// the heavy trucks' are the lowest, the garbage truck's 4 and 1, the
-    /// light cars' and bikes' the highest).
-    pub brake: (f32, f32),
     /// Each axle's sideways grip (`FrontWheelFrictionSide` 1.5,
     /// `RearWheelFrictionSide` 1.5; 0.5 to 3 and 0.7 to 5), read as the
     /// tyres' friction coefficient (inferred).
@@ -380,6 +376,105 @@ impl Springs {
     /// An axle's spring's unloaded length, metres.
     pub fn length(&self, front: bool) -> f32 {
         self.axle(front).2
+    }
+}
+
+/// How a wheeled vehicle's tyres slow it along the way they roll, from
+/// its `_CarPhysicsV2` (the M151's values in brackets), as the Xbox 360
+/// code works it out (from the 360 code, driving round 2: each wheel's
+/// coefficients at 0x8219FB08, summed by axle at 0x8219FE80 and averaged
+/// at 0x8219AF38, the axle's push at 0x821A08D8, applied per axle at
+/// 0x8219C118):
+///
+/// - Each axle pushes against the chassis' velocity along its wheels
+///   with mass x its coefficient ([`Brakes::slowing`], m/s²) x that
+///   velocity clamped to +-1 m/s: so the axles' coefficients add up to the
+///   vehicle's slowing, every axle's on its own.
+/// - Each wheel's coefficient is scaled by the share of the vehicle's
+///   wheels on the ground; an axle's is its wheels' mean, a wheel off the
+///   ground giving none.
+///
+/// A field the record leaves out takes the 360 code's own default
+/// (0x823EB210).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Brakes {
+    /// Each axle's rolling friction, front and back
+    /// (`FrontWheelFrictionFwd`, `RearWheelFrictionFwd`; default 0.5).
+    pub rolling: (f32, f32),
+    /// Each axle's brake (`FrontBrake` 7, `RearBrake` 6; default 2).
+    pub brake: (f32, f32),
+    /// Each axle's handbrake (`FrontEmergencyBrake`,
+    /// `RearEmergencyBrake`; default 1): up to 1, the share of its
+    /// sideways grip it keeps on the handbrake; above, its slowing.
+    pub emergency: (f32, f32),
+    /// Each axle's sideways grip (`FrontWheelFrictionSide` 1.5,
+    /// `RearWheelFrictionSide` 1.5; default 1.5), which the handbrake
+    /// slows it with.
+    pub side: (f32, f32),
+    /// Below this speed, m/s, it rolls harder (`LowSpeedLimit`, km/h,
+    /// as the code compares it with its speed in km/h: default 30).
+    pub low_speed: f32,
+}
+
+impl Brakes {
+    /// The 360 code's defaults, for a vehicle with no `_CarPhysicsV2`.
+    pub const DEFAULT: Brakes = Brakes {
+        rolling: (0.5, 0.5),
+        brake: (2.0, 2.0),
+        emergency: (1.0, 1.0),
+        side: (1.5, 1.5),
+        low_speed: 30.0 / 3.6,
+    };
+
+    /// One axle's coefficient (the front, steering one, or the back),
+    /// m/s², at `speed` m/s with the throttle open `throttle` (0 to 1),
+    /// the brake pressed `brake` (0 to 1), the handbrake on `handbrake`
+    /// (0 to 1) and the stick steering `steer` (-1 to 1):
+    ///
+    /// - rolling: its rolling friction less what the throttle opens,
+    ///   three times as hard at a standstill, easing to once at its low
+    ///   speed limit;
+    /// - braking: from that to its brake as the brake is pressed;
+    /// - else on the handbrake: from that to its sideways grip times
+    ///   0.33 + 0.67 x its handbrake x (1 - 0.55 |steer| front, 0.75
+    ///   back) (a handbrake over 1: that itself).
+    ///
+    /// Not here: a reversing or spun wheel's `*Rev180FrictionMulti`, and
+    /// the coefficients' easing from step to step.
+    pub fn slowing(
+        &self,
+        front: bool,
+        speed: f32,
+        throttle: f32,
+        brake: f32,
+        handbrake: f32,
+        steer: f32,
+    ) -> f32 {
+        let pick = |p: (f32, f32)| if front { p.0 } else { p.1 };
+        let low = if self.low_speed > 0.0 {
+            1.0 - (speed.abs() / self.low_speed).min(1.0)
+        } else {
+            0.0
+        };
+        let rolling =
+            (low * 3.0 + (1.0 - low)) * (1.0 - throttle.clamp(0.0, 1.0)) * pick(self.rolling);
+        let brake = brake.clamp(0.0, 1.0);
+        let handbrake = handbrake.clamp(0.0, 1.0);
+        if brake > 0.0 {
+            (1.0 - brake) * rolling + brake * pick(self.brake)
+        } else if handbrake > 0.01 {
+            let emergency = pick(self.emergency);
+            let held = if emergency <= 1.0 {
+                let turn = if front { 0.55 } else { 0.75 };
+                let keep = (1.0 - steer.abs() * turn) * emergency * 0.67 + 0.33;
+                pick(self.side) * (handbrake * keep + (1.0 - handbrake))
+            } else {
+                emergency
+            };
+            (1.0 - handbrake) * rolling + handbrake * held
+        } else {
+            rolling
+        }
     }
 }
 
@@ -1046,7 +1141,6 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                     let low = (|| Some((f("LowSpeedLimit")? / 3.6, f("LowSpeedSteerSpeed")?)))();
                     Some(Handling {
                         steer_lock: f("SteerMaxAngle").filter(|a| *a < 1.5)?,
-                        brake: (f("FrontBrake")?, f("RearBrake")?),
                         grip: (f("FrontWheelFrictionSide")?, f("RearWheelFrictionSide")?),
                         steer_speed: f("SteerSpeed")?,
                         low_speed: low.map_or(0.0, |l| l.0),
@@ -1081,6 +1175,19 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         ),
                         extra: f("ExtraInvisibleSpringLength", d.extra).max(0.0),
                         gravity_factor: f("GravityFactor", d.gravity_factor),
+                    })
+                })(),
+                brakes: (|| {
+                    let r = *car.of_template(id).first()?;
+                    let d = Brakes::DEFAULT;
+                    let f = |name, or: f32| car.float(r, name_hash(name)).unwrap_or(or).max(0.0);
+                    let pair = |front, rear, or: (f32, f32)| (f(front, or.0), f(rear, or.1));
+                    Some(Brakes {
+                        rolling: pair("FrontWheelFrictionFwd", "RearWheelFrictionFwd", d.rolling),
+                        brake: pair("FrontBrake", "RearBrake", d.brake),
+                        emergency: pair("FrontEmergencyBrake", "RearEmergencyBrake", d.emergency),
+                        side: pair("FrontWheelFrictionSide", "RearWheelFrictionSide", d.side),
+                        low_speed: f("LowSpeedLimit", d.low_speed * 3.6) / 3.6,
                     })
                 })(),
                 tracks: (|| {
@@ -1479,5 +1586,38 @@ mod tests {
         // A tank takes no round at all: nothing to scale.
         assert_eq!(t.weak_point(tank, weak, bullet), None);
         assert_eq!(t.weak_point(tank, name_hash("Car"), rocket), None);
+    }
+
+    // An axle's slowing as the 360 code works it out (0x8219FB08).
+    #[test]
+    fn brakes_slow_as_the_360_code_has_them() {
+        let b = Brakes {
+            rolling: (0.5, 0.4),
+            brake: (7.0, 6.0),
+            emergency: (0.5, 1.5),
+            side: (1.5, 1.2),
+            low_speed: 30.0 / 3.6,
+        };
+        let close = |a: f32, b: f32| assert!((a - b).abs() < 1e-5, "{a} {b}");
+        // Rolling: three times as hard standing, once from its low speed
+        // limit up, none at full throttle.
+        close(b.slowing(true, 0.0, 0.0, 0.0, 0.0, 0.0), 1.5);
+        close(b.slowing(true, 15.0 / 3.6, 0.0, 0.0, 0.0, 0.0), 1.0);
+        close(b.slowing(false, 20.0, 0.0, 0.0, 0.0, 0.0), 0.4);
+        close(b.slowing(true, 20.0, 1.0, 0.0, 0.0, 0.0), 0.0);
+        // Braking: from rolling to its brake.
+        close(b.slowing(true, 20.0, 0.0, 1.0, 0.0, 0.0), 7.0);
+        close(b.slowing(false, 20.0, 0.0, 0.5, 0.0, 0.0), 3.2);
+        // The handbrake: its sideways grip times 0.33 + 0.67 x 0.5 x (1 -
+        // 0.55 |steer|) at the front; a handbrake over 1 is itself.
+        close(
+            b.slowing(true, 20.0, 0.0, 0.0, 1.0, 0.0),
+            1.5 * (0.33 + 0.335),
+        );
+        close(
+            b.slowing(true, 20.0, 0.0, 0.0, 1.0, 1.0),
+            1.5 * (0.33 + 0.335 * 0.45),
+        );
+        close(b.slowing(false, 20.0, 0.0, 0.0, 1.0, 0.0), 1.5);
     }
 }

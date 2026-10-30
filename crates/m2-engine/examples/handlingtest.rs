@@ -92,8 +92,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         driven += ids.len();
         let handling = spec.tuning.handling;
         let lock = handling.map_or("-".to_owned(), |h| format!("{:.2}", h.steer_lock));
-        let brakes = handling.map_or("-".to_owned(), |h| {
-            format!("{:.1}/{:.1}", h.brake.0, h.brake.1)
+        let brakes = spec.tuning.brakes.map_or("-".to_owned(), |b| {
+            format!("{:.1}/{:.1}", b.brake.0, b.brake.1)
         });
         let from = spec
             .tuning

@@ -31,7 +31,7 @@ use rapier3d::control::{
     KinematicCharacterController, WheelTuning,
 };
 
-use crate::tuning::{BikeTuning, BoatTuning, FlightTuning, Springs};
+use crate::tuning::{BikeTuning, BoatTuning, Brakes, FlightTuning, Springs};
 use crate::vehicle::VehicleSpec;
 use rapier3d::prelude as r;
 
@@ -925,10 +925,10 @@ const DAMPING: (f32, f32) = (2.0, 3.0);
 /// gives none (its `SteerMaxAngle` otherwise,
 /// [`Handling`](crate::tuning::Handling)). Invented.
 const MAX_STEER: f32 = 0.6;
-/// Braking with the throttle against the motion (for a vehicle whose
-/// template gives no `FrontBrake` and `RearBrake`), the handbrake (on
-/// the wheels that don't steer), rolling with no throttle, and holding
-/// still, m/s² (as if all wheels braked so). Invented.
+/// A tank's braking with the throttle against the motion, its handbrake
+/// (on the wheels that don't steer), rolling with no throttle, and
+/// holding still, m/s² (as if all wheels braked so). Invented: a wheeled
+/// vehicle's tyres slow it as its template's [`Brakes`] say.
 const SERVICE_BRAKE: f32 = 8.0;
 /// The tyres' friction coefficient, for a vehicle whose template gives
 /// no `FrontWheelFrictionSide` and `RearWheelFrictionSide`. Invented.
@@ -936,7 +936,7 @@ const GRIP: f32 = 2.0;
 const HANDBRAKE: f32 = 9.0;
 const ROLLING: f32 = 0.6;
 const HOLD: f32 = 3.0;
-/// Left to itself, a vehicle rolling faster than this (m/s) slows at
+/// Left to itself, a tank rolling faster than this (m/s) slows at
 /// [`HOLD`], then holds with every wheel as hard as the handbrake.
 const PARKED_FAST: f32 = 3.0;
 /// How far a ragdoll's limb may drift off its joint before it is put
@@ -1058,6 +1058,8 @@ struct VehicleBody {
     /// How far each wheel's spring's top sits above where the model has
     /// the wheel's centre, metres, in wheel order.
     tops: Vec<f32>,
+    /// How its tyres slow it along ([`Brakes`]; a tank's are invented).
+    brakes: Option<Brakes>,
     /// Its weight on the ground, of its plain weight ([`Springs`]'s
     /// `gravity_factor`; 1 for a tank).
     gravity_factor: f32,
@@ -1969,6 +1971,7 @@ impl Physics {
             mass: spec.mass,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
             tops,
+            brakes: (!spec.tracked).then(|| spec.tuning.brakes.unwrap_or(Brakes::DEFAULT)),
             gravity_factor,
             tracked: spec.tracked,
             bike: spec.is_bike().then(|| Bike {
@@ -2078,14 +2081,39 @@ impl Physics {
         // up to its steepest hill (tracks hold it by their grip).
         let most = if v.tracked { 0.0 } else { CLIMB };
         let uphill = (nose * throttle.signum()).clamp(0.0, most.sin());
-        // Braking against the motion: each axle as its template's brake
-        // says (else 8 m/s²), the front's on the wheels that steer.
-        let service = |front: bool| {
-            let decel = v
-                .handling
-                .map_or(SERVICE_BRAKE, |h| if front { h.brake.0 } else { h.brake.1 });
-            slowing(decel * throttle.abs())
-        };
+        // A tank's braking against the motion (invented).
+        let service = |_front: bool| slowing(SERVICE_BRAKE * throttle.abs());
+        // A wheeled vehicle's tyres slow it as the 360 code has them
+        // ([`Brakes`]): each axle by its coefficient, scaled by the share
+        // of its wheels on the ground, over the axle's wheels (a wheel's
+        // brake here is the most it may take off a step, so an axle's
+        // grounded wheels take off its whole share between them).
+        // Throttle against the motion is the brake pressed that hard. A
+        // parked one (nobody at the wheel) still holds as a tank does:
+        // what the 360 does with an empty car isn't traced, and on its
+        // handbrake (3 m/s² by the defaults) it would slide down a hill.
+        let tyres = v.brakes.filter(|_| !controls.parked).map(|b| {
+            let all = v.controller.wheels();
+            let down = all
+                .iter()
+                .filter(|w| w.raycast_info().is_in_contact)
+                .count();
+            let share = down as f32 / all.len().max(1) as f32;
+            let on_axle =
+                |front: bool| v.steers.iter().filter(|&&s| s == front).count().max(1) as f32;
+            let (open, pressed) = if against {
+                (0.0, throttle.abs())
+            } else {
+                (throttle.abs(), 0.0)
+            };
+            let held = if controls.brake { 1.0 } else { 0.0 };
+            let steer = controls.steer;
+            let impulse = |front: bool| {
+                let c = b.slowing(front, speed, open, pressed, held, steer);
+                v.mass * c * share * dt / on_axle(front)
+            };
+            (impulse(true), impulse(false))
+        });
         let (force, brake) = if controls.parked {
             let hard = if speed.abs() > PARKED_FAST {
                 HOLD
@@ -2129,7 +2157,9 @@ impl Physics {
             let front = v.steers.get(i).copied().unwrap_or(false);
             w.engine_force = force;
             w.steering = if front { steer } else { 0.0 };
-            w.brake = if controls.brake && !front {
+            w.brake = if let Some((ahead, behind)) = tyres {
+                if front { ahead } else { behind }
+            } else if controls.brake && !front {
                 slowing(HANDBRAKE)
             } else if brake < 0.0 {
                 service(front)
@@ -3994,7 +4024,13 @@ mod tests {
             Quat::from_rotation_x(-slope),
         );
         p.step(DT);
-        let spec = car();
+        // An M151's brakes: by the defaults (2 an axle) one rolled back at
+        // the start can't stop on a 20 degree hill at its gravity factor.
+        let mut spec = car();
+        spec.tuning.brakes = Some(Brakes {
+            brake: (7.0, 6.0),
+            ..Brakes::DEFAULT
+        });
         let ground = |at: Vec3| {
             p.cast_ray(Vec3::new(at.x, 80.0, at.z), Vec3::NEG_Y, 200.0)
                 .map(|(d, _)| 80.0 - d)
@@ -4425,16 +4461,19 @@ mod tests {
         assert!(p.vehicle_transform(id).is_none());
     }
 
-    // A car whose template gives its brakes and lock slows as its brakes
-    // say (the mean of its axles' m/s²) and turns its front wheels as
-    // far as its lock, not the invented 8 m/s² and 0.6 rad.
+    // A car whose template gives its brakes and lock slows as the 360
+    // code has its brakes slow it (each axle's m/s², added up) and turns
+    // its front wheels as far as its lock, not the invented 0.6 rad.
     #[test]
     fn brakes_and_lock_come_from_the_template() {
         let slowing = |brake: (f32, f32), lock: f32| {
             let mut spec = car();
+            spec.tuning.brakes = Some(Brakes {
+                brake,
+                ..Brakes::DEFAULT
+            });
             spec.tuning.handling = Some(crate::tuning::Handling {
                 steer_lock: lock,
-                brake,
                 grip: (1.5, 1.5),
                 steer_speed: 100.0,
                 low_speed: 0.0,
@@ -4483,10 +4522,10 @@ mod tests {
         };
         let (lock, soft) = slowing((3.0, 1.0), 1.0);
         assert!((lock - 1.0).abs() < 0.05, "{lock}");
-        assert!((soft - 2.0).abs() < 0.4, "{soft}");
+        assert!((soft - 4.0).abs() < 0.4, "{soft}");
         let (lock, hard) = slowing((9.0, 7.0), 0.5);
         assert!((lock - 0.5).abs() < 0.05, "{lock}");
-        assert!((hard - 8.0).abs() < 1.0, "{hard}");
+        assert!((hard - 16.0).abs() < 1.5, "{hard}");
     }
 
     // Its front wheels swing towards full lock as quickly as its template
@@ -4497,7 +4536,6 @@ mod tests {
         let mut spec = car();
         spec.tuning.handling = Some(crate::tuning::Handling {
             steer_lock: 0.7,
-            brake: (7.0, 6.0),
             grip: (1.5, 1.5),
             steer_speed: 0.6,
             low_speed: 35.0 / 3.6,
