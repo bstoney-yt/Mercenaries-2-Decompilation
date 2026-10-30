@@ -650,6 +650,34 @@ mod tests {
         assert_eq!(input.axis(Action::MoveBack, Action::MoveForward), 0.0);
     }
 
+    /// Playtest: at full lock the pedals stay whole (they used to share
+    /// one push with the steering, 0.71 each, too little for reverse);
+    /// on foot a diagonal is still no faster than straight.
+    #[test]
+    fn the_pedals_dont_share_a_push_with_the_steering() {
+        let config = crate::config::CameraConfig::default();
+        let mut pad = Pad::default();
+        let mut input = Input::default();
+        let lock = |buttons| PadState {
+            buttons,
+            left: [-1.0, -0.3],
+            ..PadState::default()
+        };
+        pad.feed(&mut input, lock(xb::X), true, 0.016);
+        let i = crate::player::Intent::from_input(&mut input, &config, false);
+        assert_eq!(i.movement, m2_math::glam::Vec2::new(-1.0, -1.0));
+        pad.feed(&mut input, lock(xb::A), true, 0.016);
+        let i = crate::player::Intent::from_input(&mut input, &config, false);
+        assert_eq!(i.movement, m2_math::glam::Vec2::new(-1.0, 1.0));
+        let s = PadState {
+            left: [1.0, 1.0],
+            ..PadState::default()
+        };
+        pad.feed(&mut input, s, false, 0.016);
+        let i = crate::player::Intent::from_input(&mut input, &config, false);
+        assert!((i.walking().length() - 1.0).abs() < 1e-6);
+    }
+
     #[test]
     fn l3_latches_sprint_until_the_stick_rests() {
         let mut pad = Pad::default();

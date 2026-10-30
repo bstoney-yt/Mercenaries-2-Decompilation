@@ -159,7 +159,10 @@ const LAND_REACH: f32 = 60.0;
 /// What the player asks for this tick.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Intent {
-    /// Camera-relative: x right, y forward; length at most 1.
+    /// Camera-relative: x right, y forward, each -1..=1 on its own: at
+    /// the wheel the steering and the pedals, which don't share a push
+    /// (the 360's car takes its throttle, brake and steering as separate
+    /// inputs); on foot she walks the way it points ([`Intent::walking`]).
     pub movement: Vec2,
     pub sprint: bool,
     pub walk: bool,
@@ -183,6 +186,12 @@ pub struct Intent {
 }
 
 impl Intent {
+    /// The way she walks: [`movement`](Self::movement) no longer than a
+    /// full push (a diagonal of the keys is no faster than straight).
+    pub fn walking(&self) -> Vec2 {
+        self.movement.clamp_length_max(1.0)
+    }
+
     pub fn from_input(input: &mut Input, config: &CameraConfig, mouse_look: bool) -> Self {
         let (dx, dy) = input.take_look(mouse_look);
         let invert = if config.invert_y { -1.0 } else { 1.0 };
@@ -195,8 +204,7 @@ impl Intent {
             movement: Vec2::new(
                 input.axis(Action::MoveLeft, Action::MoveRight),
                 input.axis(Action::MoveBack, Action::MoveForward),
-            )
-            .clamp_length_max(1.0),
+            ),
             sprint: input.held(Action::Sprint),
             walk: input.held(Action::Walk),
             jump: input.take_pressed(Action::MoveUp),
@@ -815,7 +823,8 @@ impl Player {
         let forward = Vec3::new(s, 0.0, c);
         // Right-handed, +y up: right is forward turned clockwise from above.
         let right = Vec3::new(-c, 0.0, s);
-        let direction = forward * intent.movement.y + right * intent.movement.x;
+        let walking = intent.walking();
+        let direction = forward * walking.y + right * walking.x;
 
         if self.update_swim(physics, direction, dt) {
             self.camera(physics);

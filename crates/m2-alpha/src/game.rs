@@ -1732,7 +1732,7 @@ impl Game {
                 // the texts' `[confirm]` shows) confirms as well.
                 use_pressed: intent.use_pressed || (intent.jump && self.support.busy()),
                 fire: intent.trigger.fire,
-                steer: intent.movement,
+                steer: intent.walking(),
                 select: intent.trigger.select.is_some(),
                 hurt: hp < self.support_hp,
                 pda: intent.trigger.pda,
