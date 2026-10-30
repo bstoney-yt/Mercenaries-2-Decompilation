@@ -119,6 +119,16 @@ fn bind(scene: &mut Scene, skeleton: &Skeleton, name: &str) -> Result<BoundClip,
         .ok_or_else(|| format!("{found} of {tracks} tracks on a bone"))
 }
 
+/// How long the clip named `name` runs (seconds), read from the archive
+/// whether or not anyone is drawn to play it.
+pub fn length(scene: &mut Scene, name: &str) -> Option<f32> {
+    let source = scene.source.as_mut()?;
+    let bytes = source
+        .asset(m2_assets::name_hash(name), ANIMATION_TYPE)
+        .ok()?;
+    Some(Clip::parse(&bytes).ok()?.header.duration)
+}
+
 impl RawClips {
     /// Plays clip `name` once on character `guid`, from its start; its
     /// length, or why not.

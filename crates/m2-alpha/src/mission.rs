@@ -5281,10 +5281,24 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             return false;
         }
         // A briefing frame's clip for one of its actors, by name.
+        // The scripts hear how long it runs, drawn or not (`Event.
+        // HumanAnimationNearlyCompleted`: the briefings' spiel lines).
         Command::RawClip { guid, clip } => {
-            match game.raw.start(&mut game.scene, *guid, clip) {
-                Ok(length) => eprintln!("raw-clip: {guid:#x} plays {clip} ({length:.2} s)"),
-                Err(why) => eprintln!("raw-clip: {guid:#x} cannot play {clip}: {why}"),
+            let length = match game.raw.start(&mut game.scene, *guid, clip) {
+                Ok(length) => {
+                    eprintln!("raw-clip: {guid:#x} plays {clip} ({length:.2} s)");
+                    Some(length)
+                }
+                Err(why) => {
+                    let length = crate::raw::length(&mut game.scene, clip);
+                    eprintln!(
+                        "raw-clip: {guid:#x} cannot play {clip}: {why}; it runs {length:?} s"
+                    );
+                    length
+                }
+            };
+            if let Some(seconds) = length {
+                mission.world().borrow_mut().raw_clip_length(*guid, seconds);
             }
             return false;
         }
