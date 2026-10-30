@@ -1796,10 +1796,12 @@ impl Game {
                 Impact::Bomb(_) => {
                     eprintln!("support: the bomb lands at {at:.1}");
                     self.combat.bomb(&mut field, at);
-                    blast_loose(world, &mut scene.props, &[at], combat::BOMB.0, true);
+                    let blasts = bomb_blasts(&world.index.template_db, at);
+                    self.combat.last_push = blasts.first().map(|b| b.push);
+                    let pushes: Vec<BlastPush> =
+                        blasts.first().map(|b| b.push).into_iter().collect();
+                    blast_loose(world, &mut scene.props, &pushes, true);
                     if let Some(install) = &scene.install {
-                        let blasts = bomb_blasts(&world.index.template_db, at);
-                        self.combat.last_push = blasts.first().map(|b| b.push);
                         for blast in blasts {
                             self.destruction
                                 .blast(world, &mut scene.props, Some(install), blast);
@@ -1827,13 +1829,23 @@ impl Game {
         let fresh: Vec<_> = scene.strikes.burst[before..].to_vec();
         for (_, template, at) in fresh {
             let ordnance = &world.index.template_db.ordnance;
-            let blasts: Vec<(f32, f32)> = template
+            let infos: Vec<_> = template
                 .map(|t| ordnance.blasts_of(t))
                 .unwrap_or_default()
                 .iter()
                 .filter_map(|b| ordnance.blasts.get(b))
-                .map(|b| (b.radius, b.damage))
                 .collect();
+            let blasts: Vec<(f32, f32)> = infos.iter().map(|b| (b.radius, b.damage)).collect();
+            // The strongest push of those going off together
+            // ([`crate::destruct::together`]).
+            let push = infos
+                .iter()
+                .max_by(|a, b| a.force.total_cmp(&b.force))
+                .map(|b| BlastPush {
+                    at,
+                    radius: b.radius,
+                    force: b.force,
+                });
             let mut field = Field {
                 physics: &mut world.physics,
                 player,
@@ -1850,14 +1862,8 @@ impl Game {
             for &(radius, damage) in blasts.iter().skip(1) {
                 self.combat.harm_at(&mut field, at, radius, damage);
             }
-            if let Some(reach) = blasts.iter().map(|b| b.0).reduce(f32::max) {
-                blast_loose(
-                    world,
-                    &mut scene.props,
-                    &[at],
-                    reach,
-                    reach >= combat::BOMB.0,
-                );
+            if let (Some(reach), Some(push)) = (blasts.iter().map(|b| b.0).reduce(f32::max), push) {
+                blast_loose(world, &mut scene.props, &[push], reach >= combat::BOMB.0);
             }
             world
                 .destroyed
@@ -2867,15 +2873,17 @@ fn hit_world(
             destruction.wear(world, props, install, key, (s.round, s.kind, 0.0), s.at);
         }
     }
+    let mut pushes = Vec::new();
     for at in combat.went_off.clone() {
         let blasts = rocket_blasts(&world.index.template_db, at);
         combat.last_push = blasts.first().map(|b| b.push);
+        pushes.extend(combat.last_push);
         for blast in blasts {
             destruction.blast(world, props, install, blast);
         }
     }
-    blast_loose(world, props, &combat.went_off, combat::REACH, false);
-    blast_pickups(world, flights, &combat.went_off, combat::REACH);
+    blast_loose(world, props, &pushes, false);
+    blast_pickups(world, flights, &pushes);
     // What was worn down and blows up goes off a moment later.
     for (at, size) in destruction.set_off.drain(..) {
         combat.set_off(at, size);
@@ -3372,17 +3380,6 @@ fn blown_loose(db: &Templates, t: u32) -> bool {
     })
 }
 
-/// How a blast at `blast` with `reach` throws what comes loose at `at`,
-/// `d` metres off: out and up as people are thrown, harder the nearer,
-/// toppling away from it. Its velocity (m/s) and spin.
-pub(crate) fn thrown_by(blast: Vec3, at: Vec3, d: f32, reach: f32) -> (Vec3, Vec3) {
-    let near = (1.0 - d / reach).clamp(0.0, 1.0);
-    let away = (at - blast).with_y(0.0).normalize_or(Vec3::X);
-    let (out, up) = combat::BLAST_PUSH;
-    let velocity = away * (out * near + 1.0) + Vec3::Y * (up * near + 1.0);
-    (velocity, Vec3::Y.cross(away) * (TOPPLE * out * near))
-}
-
 /// What a pickup of template `t` weighs, if it is a physics prop
 /// (`_PropPhysics`): kilograms and its gravity scale.
 pub(crate) fn pickup_weight(db: &m2_engine::Templates, t: u32) -> Option<(f32, f32)> {
@@ -3417,49 +3414,58 @@ fn run_over_pickups(
 }
 
 /// Blasts throw the physics props lying to be taken (the weapons and
-/// grenades soldiers leave) within `reach`, as [`thrown_by`] throws what
-/// comes loose.
-fn blast_pickups(
-    world: &mut World,
-    flights: &mut crate::flights::Flights,
-    blasts: &[Vec3],
-    reach: f32,
-) {
-    if blasts.is_empty() {
-        return;
-    }
+/// grenades soldiers leave) within each one's reach, as it pushes them
+/// ([`BlastPush::throw`], each taken as a point: none is anywhere near
+/// the 2 m³ the push is full up to).
+fn blast_pickups(world: &mut World, flights: &mut crate::flights::Flights, pushes: &[BlastPush]) {
     let db = &world.index.template_db;
-    let threw = flights.blow(
-        &mut world.physics,
-        blasts,
-        reach,
-        |t| pickup_weight(db, t),
-        |b, at, d| thrown_by(b, at, d, reach),
-    );
-    if threw > 0 {
-        eprintln!("pickups: a blast throws {threw}");
+    for push in pushes {
+        let threw = flights.blow(
+            &mut world.physics,
+            &[push.at],
+            push.radius,
+            |t| pickup_weight(db, t),
+            |_, at, _| push.throw(at, at, 1.0),
+        );
+        if threw > 0 {
+            eprintln!("pickups: a blast throws {threw}");
+        }
     }
 }
 
-fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3], reach: f32, strike: bool) {
-    let thrown = |blast: Vec3, at: Vec3, d: f32| thrown_by(blast, at, d, reach);
-    for &at in blasts {
-        for (i, d) in world.loose_near(at, reach) {
+/// What `pushes` knock loose within each one's reach (what comes loose:
+/// a lamp, a fence, a chair) flies as the blast pushes it, by its own
+/// box and its template's `ExplosionFudge` ([`BlastPush::throw`], the 360
+/// code's push on what moves, 0x8215CBC8). An ordinary blast knocks loose
+/// only what [`blown_loose`] says; a `strike` (an air strike's) all of it.
+fn blast_loose(world: &mut World, props: &mut Props, pushes: &[BlastPush], strike: bool) {
+    let fudge = |db: &Templates, t: u32| db.explosion_fudges.get(&t).copied().unwrap_or(1.0);
+    for push in pushes {
+        for (i, _) in world.loose_near(push.at, push.radius) {
             let o = world.index.objects[i];
-            if !strike && !blown_loose(&world.index.template_db, o.template) {
+            let db = &world.index.template_db;
+            if !strike && !blown_loose(db, o.template) {
                 continue;
             }
-            let (velocity, spin) = thrown(at, o.position, d);
+            let placed = Mat4::from_rotation_translation(o.rotation, o.position);
+            let (lo, hi) = world.object_model(i).map_or((o.position, o.position), |m| {
+                crate::props::box_around(placed, m.bounds)
+            });
+            let (velocity, spin) = push.throw(lo, hi, fudge(db, o.template));
             world.knock(i, velocity, spin);
         }
-        for (e, d) in props.loose_near(&world.physics, at, reach, strike) {
+        for (e, _) in props.loose_near(&world.physics, push.at, push.radius, strike) {
             let Some((p, template)) = props.get(e).map(|(p, _)| (p.position, p.template)) else {
                 continue;
             };
-            if !strike && !blown_loose(&world.index.template_db, template) {
+            let db = &world.index.template_db;
+            if !strike && !blown_loose(db, template) {
                 continue;
             }
-            let (velocity, spin) = thrown(at, p, d);
+            let (lo, hi) = props
+                .placed_bounds(e)
+                .map_or((p, p), |(at, bounds)| crate::props::box_around(at, bounds));
+            let (velocity, spin) = push.throw(lo, hi, fudge(db, template));
             props.knock(&mut world.physics, e, velocity, spin, strike);
         }
     }

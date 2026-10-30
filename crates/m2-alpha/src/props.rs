@@ -1796,7 +1796,7 @@ fn corners(at: Mat4, piece: &m2_engine::LoosePiece) -> [Vec3; 8] {
 }
 
 /// The world box round the model box `lo` to `hi` placed at `at`.
-fn box_around(at: Mat4, (lo, hi): (Vec3, Vec3)) -> (Vec3, Vec3) {
+pub(crate) fn box_around(at: Mat4, (lo, hi): (Vec3, Vec3)) -> (Vec3, Vec3) {
     (0..8)
         .map(|i| {
             at.transform_point3(Vec3::new(
