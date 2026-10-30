@@ -3730,9 +3730,18 @@ impl MissionLink {
         let message = recent.map(|(m, text, _)| (m.done(), text.clone()));
         let game_message = recent.map(|(m, ..)| m.clone());
         let mission = match &self.state {
+            // Until the scripts run, the screen stays black under the
+            // loading screen: they place her and start the contract's
+            // opening (its fade and movie), and before they do she stands
+            // where the island put her, swimming off the start (playtest:
+            // the hero swam a moment before the first cutscene). The
+            // game's load covers the scripts' start as well as the
+            // island's (inferred from the footage, which never shows the
+            // world before the opening).
             State::Loading(_) => {
                 return MissionView {
                     status: Some("Reading the mission scripts...".into()),
+                    black: 1.0,
                     ..MissionView::default()
                 };
             }
@@ -6363,6 +6372,22 @@ fn hardpoints_at(nodes: &[(u32, Vec3)], at: m2_math::glam::Mat4) -> Hardpoints {
 
 #[cfg(test)]
 mod tests {
+    // Playtest: while the scripts are still being read the screen stays
+    // black (she would be seen swimming off the start before the
+    // opening's movie); once they run, theirs is the fade.
+    #[test]
+    fn the_screen_is_black_until_the_scripts_run() {
+        let nowhere = std::env::temp_dir().join("m2-alpha-no-install");
+        let install = m2_engine::Install {
+            root: nowhere.clone(),
+            data: nowhere,
+        };
+        let link = super::MissionLink::start(&install, Vec::new());
+        let view = link.view();
+        assert_eq!(view.black, 1.0);
+        assert!(view.status.is_some());
+    }
+
     // The props the scripts spawn have their hardpoints told, as do
     // those people sit on (a faction HQ's spawned interior and the PMC's
     // crewed one), each once; a layer's other props don't.
