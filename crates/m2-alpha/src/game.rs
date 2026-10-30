@@ -2224,13 +2224,18 @@ impl Game {
                     .collect()
             }),
             entrance_markers: match (&self.scene.world, player) {
-                (Some(w), Some(p)) if p.driving.is_none() => entrance_markers(
-                    &w.physics,
-                    &w.index.template_db,
-                    &self.scene,
-                    (&self.hijack_only, &self.unusable),
-                    p.character.position,
-                ),
+                // None while she rides anything: a hijack has her in the
+                // vehicle's `InVehicle` stance with the controls off, and
+                // the 360 queues none then (82376A48).
+                (Some(w), Some(p)) if p.driving.is_none() && !self.input_locked => {
+                    entrance_markers(
+                        &w.physics,
+                        &w.index.template_db,
+                        &self.scene,
+                        (&self.hijack_only, &self.unusable),
+                        p.character.position,
+                    )
+                }
                 _ => Vec::new(),
             },
             ..HudInfo::default()
