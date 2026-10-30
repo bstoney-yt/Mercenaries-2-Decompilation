@@ -49,6 +49,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let name = db.names.get(&o.template).cloned().unwrap_or_default();
         by_template.entry(name).or_insert((o.template, 0)).1 += 1;
     }
+    // Templates named on the command line (`_global_explosivebarrel`), by
+    // name, wherever they are placed: as the rest, with what a `Bullet`
+    // and an `Explosion` do to them.
+    for want in &args[1..] {
+        for (&t, name) in &db.names {
+            if !name
+                .to_ascii_lowercase()
+                .contains(&want.to_ascii_lowercase())
+            {
+                continue;
+            }
+            let row = db.modifiers.get(&t).copied();
+            let cell = |k: &str| {
+                row.zip(db.damage.as_ref())
+                    .and_then(|(r, d)| d.scale(r, name_hash(k)))
+            };
+            println!(
+                "named {name}: health {:?} burn {:?} row {row:08x?} Bullet {:?} BulletLarge {:?} Explosion {:?} blast {:?}",
+                db.durability.get(&t).map(|d| d.health),
+                db.durability.get(&t).and_then(|d| d.burn),
+                cell("Bullet"),
+                cell("BulletLarge"),
+                cell("Explosion"),
+                blast(t).map(|(_, e)| (e.radius, e.damage, e.least)),
+            );
+        }
+    }
     let by_data: usize = by_template.values().map(|v| v.1).sum();
     println!("by model list: {by_model}; by template data: {by_data} ({listed_too} in both)");
     for (name, (t, n)) in &by_template {

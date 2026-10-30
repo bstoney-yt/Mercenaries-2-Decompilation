@@ -1333,6 +1333,12 @@ impl Game {
             // What came down (to a vehicle, the traffic's too, or a blast
             // last tick) comes down whether she is on foot or the free
             // camera flies: its island copy has lost its collision already.
+            self.destruction.burn(
+                world,
+                &mut self.scene.props,
+                self.scene.install.as_ref(),
+                dt,
+            );
             self.destruction.update(
                 world,
                 &mut self.scene.props,

@@ -4144,10 +4144,11 @@ impl Combat {
                 scale = own;
             }
             if damage * scale > 0.0 {
-                // The part it struck takes the round's own damage (the
-                // table's scale is the whole vehicle's; invented).
+                // The part it struck takes it as the whole does: the
+                // 360 posts one damage message, the table's cell already
+                // applied, naming the node struck (0x8228BFA8, 0x82287CF8).
                 if let Some(body) = body {
-                    v.hit_parts(body, at, damage);
+                    v.hit_parts(body, at, damage * scale);
                 }
                 self.hurt_vehicle(f.physics, v, i, damage * scale);
             }
@@ -4739,7 +4740,14 @@ impl Combat {
             let (heart, edge, radius) = BLAST_ON_VEHICLE;
             if d < radius && !v.wrecked {
                 let damage = heart + (edge - heart) * d / radius;
-                v.blast_parts(body, at, radius, |p| heart + (edge - heart) * p / radius);
+                let cell = blast_cell(
+                    self.damage_table.as_ref(),
+                    v,
+                    Some(m2_assets::name_hash("Explosion")),
+                );
+                v.blast_parts(body, at, radius, |p| {
+                    (heart + (edge - heart) * p / radius) * cell
+                });
                 self.hurt_vehicle(
                     f.physics,
                     v,
@@ -4934,7 +4942,8 @@ impl Combat {
                 }
                 let damage =
                     b.damage_at(d) * blast_cell(self.damage_table.as_ref(), v, b.key) * weak;
-                v.blast_parts(body, at, reach, |p| b.damage_at(p));
+                let cell = blast_cell(self.damage_table.as_ref(), v, b.key) * weak;
+                v.blast_parts(body, at, reach, |p| b.damage_at(p) * cell);
                 self.hurt_vehicle(f.physics, v, i, damage);
                 if v.wrecked {
                     let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
@@ -5154,7 +5163,7 @@ impl Combat {
             }
             let cell = blast_cell(self.damage_table.as_ref(), v, key);
             if let Some(body) = f.physics.vehicle_transform(id) {
-                v.blast_parts(body, at, radius, |p| damage * (1.0 - p / radius));
+                v.blast_parts(body, at, radius, |p| damage * (1.0 - p / radius) * cell);
             }
             self.hurt_vehicle(f.physics, v, i, damage * near * cell);
             if v.wrecked {

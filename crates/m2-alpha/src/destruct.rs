@@ -327,6 +327,13 @@ pub struct Destruction {
     heard: Vec<(Vec3, u32)>,
     /// Damage the physics props have taken so far ([`wear`](Self::wear)).
     worn: HashMap<StaticKey, f32>,
+    /// The state layers' props that blow up, worn under their template's
+    /// `TickDamage` health and burning down ([`burn`](Self::burn)): the
+    /// seconds into the current tick.
+    burning: HashMap<StaticKey, f32>,
+    /// What those that caught alight show, for the fight to start
+    /// ([`update`](Self::update)): their model's `DamageState`'s effects.
+    alight: Vec<Shows>,
     /// Worn down and blowing up, to be set off by the fight
     /// ([`crate::combat::Combat::set_off`]): where, its template, and
     /// what its model's `CollapseState` starts (effect name hash, where).
@@ -353,6 +360,48 @@ impl Destruction {
     /// The damage placed object `i` has taken.
     pub fn damage(&self, i: usize) -> f32 {
         self.taken.get(&i).copied().unwrap_or(0.0)
+    }
+
+    /// Burns the state layers' props alight on by `dt` seconds: each
+    /// `TickDamage` `TickLength` one takes its `Damage` in full (the
+    /// tick's damage carries no kind, as the island's explosives' does),
+    /// until it is destroyed and blows up (0x8240ADF8).
+    pub fn burn(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        install: Option<&Install>,
+        dt: f32,
+    ) {
+        let keys: Vec<StaticKey> = self.burning.keys().copied().collect();
+        for key in keys {
+            let StaticKey::Entity(e) = key else {
+                continue;
+            };
+            let burn = props
+                .get(e)
+                .and_then(|(p, _)| world.index.template_db.durability.get(&p.template))
+                .and_then(|d| d.burn);
+            let (Some(b), Some(t)) = (burn, self.burning.get_mut(&key)) else {
+                self.burning.remove(&key);
+                continue;
+            };
+            *t += dt;
+            let mut ticks = 0;
+            while *t >= b.every {
+                *t -= b.every;
+                ticks += 1;
+            }
+            let at = props.centre(e).unwrap_or(Vec3::ZERO);
+            for _ in 0..ticks {
+                let cause = Cause::Blast(BlastPush::none(at));
+                if !self.burning.contains_key(&key)
+                    || self.wear_by(world, props, install, key, (b.damage, 0, 1.0), cause)
+                {
+                    break;
+                }
+            }
+        }
     }
 
     /// Wears down what `key` is (the island's placed object or a state
@@ -470,11 +519,34 @@ impl Destruction {
             StaticKey::Object(i) => self.taken.entry(i).or_default(),
             _ => self.worn.entry(key).or_default(),
         };
+        let before = *taken;
         *taken += hit;
-        if *taken < health {
+        let taken = *taken;
+        if taken < health {
+            // A state layer's prop that blows up, carried from above its
+            // `TickDamage` health to under it, catches alight and burns
+            // down (0x822889F8, 0x8240ADF8; as the island's explosives,
+            // [`crate::combat::Explosive`]): a `_global_explosivebarrel`
+            // (50 health, alight under 49) after seven carbine rounds.
+            if let (StaticKey::Entity(e), Some(b)) = (key, durability.burn)
+                && explodes(db, template)
+                && health - before > b.below
+                && health - taken < b.below
+                && !self.burning.contains_key(&key)
+            {
+                eprintln!(
+                    "destruct: {key:?} caught alight at {:.0} of {health:.0} health, burns out \
+                     in {:.1} s",
+                    health - taken,
+                    b.seconds_to_burn_out(health - taken)
+                );
+                self.burning.insert(key, 0.0);
+                self.alight
+                    .push(props.state_effects(e, m2_engine::StateFx::DAMAGE));
+            }
             return false;
         }
-        let taken = *taken;
+        self.burning.remove(&key);
         let name = db.names.get(&template).map_or("?", String::as_str);
         eprintln!(
             "destruct: {key:?} ({name}) broken at {at:.1}: {taken:.0} of {health:.0} health, last \
@@ -929,6 +1001,9 @@ impl Destruction {
         self.fall_linked(world, props, install);
         for (at, key) in self.heard.drain(..) {
             combat.broke(at, key);
+        }
+        for shows in self.alight.drain(..) {
+            combat.state_shows(shows);
         }
         // The island's objects broken a part at a time whose props have
         // loaded: the island's copy and its collision go, the prop stands

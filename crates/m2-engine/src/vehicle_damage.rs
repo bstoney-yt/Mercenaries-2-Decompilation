@@ -31,9 +31,13 @@
 //! - That a message's handler stays set in later states until a state
 //!   sets it again (the dented door's state sets only `DamageMsg`, to
 //!   nothing; its `DestroyMsg` still throws the door off).
-//! - How much of a hit a part takes: the hit's own damage (a rifle round's
-//!   9) times the part's scale, nearest part to where it struck (within
-//!   [`HIT_SLACK`], invented). A blast hurts each part in reach by its
+//! - How much of a hit a part takes: the hit's damage times the part's
+//!   scale, nearest part to where it struck (within [`HIT_SLACK`],
+//!   invented). From the 360 code (playtest round): the hit's damage is
+//!   what the whole vehicle takes, the damage table's cell already
+//!   applied, as the one damage message posted for a round names the
+//!   node struck along with it (0x8228BFA8, 0x82287CF8); so a tank's
+//!   parts take nothing of a rifle round, as the tank doesn't. A blast hurts each part in reach by its
 //!   own distance from the heart, by the explosion template's fall from
 //!   `Damage` to `MinDamage` (round 21; before, a straight fall to
 //!   nothing, invented).
