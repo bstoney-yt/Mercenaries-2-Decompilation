@@ -55,6 +55,7 @@ mod destruct;
 mod disguise;
 mod display;
 mod drops;
+mod entrance_marker;
 mod flights;
 mod flow;
 mod game;
@@ -6238,6 +6239,14 @@ fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Res
                 .collect::<Vec<_>>()
         );
     }
+    for (e, p) in &spec.entrances {
+        eprintln!(
+            "board: entrance {:08x} at local {:.2?} hijack-only {}",
+            e.name,
+            p.to_array(),
+            e.params.hijack_only
+        );
+    }
     let (door, centre) = (at.transform_point3(local), at.transform_point3(Vec3::ZERO));
     let stand = door + (door - centre).with_y(0.0).normalize_or_zero() * 0.6;
     eprintln!(
@@ -6258,6 +6267,15 @@ fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Res
         }
         game.step(Intent::default(), tick);
     }
+    let marks = game.hud_info(None).entrance_markers;
+    eprintln!(
+        "board: {} entrance markers: {:?}",
+        marks.len(),
+        marks
+            .iter()
+            .map(|m| (m.role, at.inverse().transform_point3(m.at).to_array()))
+            .collect::<Vec<_>>()
+    );
     let use_key = Intent {
         use_pressed: true,
         ..Intent::default()
@@ -6274,9 +6292,45 @@ fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Res
         game.combat.seat,
         game.hud_info(None).driving.map(|d| d.0)
     );
-    for _ in 0..60 {
-        game.step(Intent::default(), tick);
+    // Fire with each of the guns the switch gives, and drive ahead: what
+    // her seat lets her do.
+    let start = game
+        .scene
+        .world
+        .as_ref()
+        .zip(game.scene.vehicles[i].id)
+        .and_then(|(w, id)| w.physics.vehicle_transform(id))
+        .map(|m| m.w_axis.truncate());
+    for gun in 0..2 {
+        let fired = |g: &Game| {
+            let v = &g.scene.vehicles[i];
+            (v.fired, v.mg_fired, g.combat.shots.values().sum::<u32>())
+        };
+        let before = fired(game);
+        let mut pull = Intent::default();
+        pull.trigger.fire = true;
+        pull.movement.y = 1.0;
+        for _ in 0..120 {
+            game.step(pull, tick);
+        }
+        eprintln!(
+            "board: gun {gun} ({}): fired (cannon, mg, shots) {:?} -> {:?}",
+            game.combat.vehicle_gun,
+            before,
+            fired(game)
+        );
+        game.combat.vehicle_gun = (game.combat.vehicle_gun + 1) % 2;
     }
+    let moved = game
+        .scene
+        .world
+        .as_ref()
+        .zip(game.scene.vehicles[i].id)
+        .and_then(|(w, id)| w.physics.vehicle_transform(id))
+        .map(|m| m.w_axis.truncate())
+        .zip(start)
+        .map(|(a, b)| a.distance(b));
+    eprintln!("board: 4 s on the pedal moved it {moved:.2?} m");
     game.step(use_key, tick);
     for _ in 0..120 {
         game.step(Intent::default(), tick);

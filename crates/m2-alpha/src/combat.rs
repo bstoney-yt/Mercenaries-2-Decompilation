@@ -2788,12 +2788,18 @@ impl Combat {
         let mg = self.vehicle_gun == 1;
         // A passenger, or a gunner whose seat has no weapon, fires nothing.
         let armed = self.seat != NO_GUN;
+        // The driver's guns (a tank's cannon and the machine gun beside
+        // it) are the driver's alone: a gunner fires only her seat's
+        // (playtest: in a tank's gunner's seat the switch offered the
+        // cannon, and the other gun fired the driver's machine gun).
+        let drives = self.seat == 0;
         if let Some(i) = f.player.driving
             && armed
             && self.down <= 0.0
             && trigger.fire
             && (if mg { self.mg_reload } else { self.reload }) <= 0.0
             && !self.mounted_fire(f, i, usize::from(mg))
+            && drives
         {
             self.vehicle_fire(f, i, mg);
         }
@@ -2803,6 +2809,7 @@ impl Combat {
             && trigger.aim
             && self.mg_reload <= 0.0
             && !self.mounted_fire(f, i, 1)
+            && drives
         {
             self.vehicle_fire(f, i, true);
         }

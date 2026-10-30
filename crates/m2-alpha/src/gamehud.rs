@@ -905,9 +905,13 @@ impl HudState {
                         .localized_keys(&v.spec.label, v.spec.model)
                 })
                 .unwrap_or_default(),
-            cannon: vehicle.and_then(|v| Some((v.rounds()?, v.spec.tuning.gun?.rounds))),
+            // The driver's guns' counts, only in the driver's seat (a
+            // gunner fires her seat's own).
+            cannon: vehicle
+                .filter(|_| game.combat.seat == 0)
+                .and_then(|v| Some((v.rounds()?, v.spec.tuning.gun?.rounds))),
             machine_gun: vehicle
-                .filter(|_| game.combat.vehicle_gun == 1)
+                .filter(|_| game.combat.seat == 0 && game.combat.vehicle_gun == 1)
                 .and_then(|v| v.machine_gun())
                 .and_then(|(w, left)| Some((w.ui?, left, w.clip))),
             heading: game.view_heading().to_degrees(),

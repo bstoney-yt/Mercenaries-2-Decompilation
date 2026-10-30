@@ -2210,6 +2210,16 @@ impl Game {
                     })
                     .collect()
             }),
+            entrance_markers: match (&self.scene.world, player) {
+                (Some(w), Some(p)) if p.driving.is_none() => entrance_markers(
+                    &w.physics,
+                    &w.index.template_db,
+                    &self.scene,
+                    (&self.hijack_only, &self.unusable),
+                    p.character.position,
+                ),
+                _ => Vec::new(),
+            },
             ..HudInfo::default()
         }
     }
@@ -3894,6 +3904,56 @@ fn entrance_pick(
     let cands: Vec<Candidate> = found.iter().map(|(c, _)| *c).collect();
     let k = seats::pick(&cands, last)?;
     Some((found[k].0.vehicle, found[k].1))
+}
+
+/// The markers over the entrances near her, standing at `her` on foot
+/// ([`crate::entrance_marker`]): of each vehicle she may get into within
+/// [`NEAR_VEHICLE`](crate::entrance_marker::NEAR_VEHICLE), each entrance
+/// offered for plain entry within the markers' reach that gives her a
+/// seat ([`crate::ride::board`]'s first seat, before any slide over: the
+/// 360 marks the seat 0x82299D68 gives).
+fn entrance_markers(
+    physics: &Physics,
+    db: &Templates,
+    scene: &Scene,
+    rules: (&HashSet<u32>, &HashSet<u32>),
+    her: Vec3,
+) -> Vec<crate::entrance_marker::EntranceMarker> {
+    use crate::entrance_marker::{EntranceMarker, LIFT, NEAR_VEHICLE, REACH};
+    let mut out = Vec::new();
+    for (_, v) in usable(&scene.vehicles, rules) {
+        let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id)) else {
+            continue;
+        };
+        if at.w_axis.truncate().distance_squared(her) >= NEAR_VEHICLE * NEAR_VEHICLE {
+            continue;
+        }
+        let labels = db.vehicle_labels_for(&v.spec.label, v.spec.model);
+        for &(e, local) in &v.spec.entrances {
+            let place = at.transform_point3(local);
+            if e.params.use_distance <= 0.0
+                || !m2_engine::seats::offered(&e.params, true)
+                || place.distance_squared(her) >= REACH * REACH
+            {
+                continue;
+            }
+            let Some(b) = crate::ride::board(
+                crate::ride::Ride::of(v),
+                Some(e.name),
+                crate::ride::car_or_truck(&labels),
+                &scene.people,
+            ) else {
+                continue;
+            };
+            // The seat the entrance gives, not the one she slides to.
+            let seat = b.slid_from.or(b.seat);
+            out.push(EntranceMarker {
+                at: place + Vec3::Y * LIFT,
+                role: crate::ride::Ride::of(v).role(seat),
+            });
+        }
+    }
+    out
 }
 
 /// Logs her getting into `v` by `entrance`: how far she stood from it and
