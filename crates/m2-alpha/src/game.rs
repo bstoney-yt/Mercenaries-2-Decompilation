@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::atmosphere::AtmosphereMix;
-use m2_engine::durability::{CrashHow, Explosion};
+use m2_engine::durability::{BlastPush, CrashHow, Explosion};
 use m2_engine::physics::FLOAT_DEPTH;
 use m2_engine::{
     CatalogueEntry, Install, Physics, StaticKey, Templates, VehicleControls, VehicleSpec, World,
@@ -1798,17 +1798,9 @@ impl Game {
                     self.combat.bomb(&mut field, at);
                     blast_loose(world, &mut scene.props, &[at], combat::BOMB.0, true);
                     if let Some(install) = &scene.install {
-                        for (name, (radius, damage)) in
-                            [(BOMB_BLAST, combat::BOMB), (BOMB_FRAG, combat::BOMB_FRAG)]
-                        {
-                            let e = explosion(&world.index.template_db, &[name]);
-                            let blast = Blast {
-                                at,
-                                radius: e.map_or(radius, |e| e.radius),
-                                damage: e.map_or(damage, |e| e.damage),
-                                least: e.map_or(0.0, |e| e.least),
-                                kind: e.map_or(0, |e| e.kind),
-                            };
+                        let blasts = bomb_blasts(&world.index.template_db, at);
+                        self.combat.last_push = blasts.first().map(|b| b.push);
+                        for blast in blasts {
                             self.destruction
                                 .blast(world, &mut scene.props, Some(install), blast);
                         }
@@ -2875,8 +2867,10 @@ fn hit_world(
             destruction.wear(world, props, install, key, (s.round, s.kind, 0.0), s.at);
         }
     }
-    for &at in &combat.went_off {
-        for blast in rocket_blasts(&world.index.template_db, at) {
+    for at in combat.went_off.clone() {
+        let blasts = rocket_blasts(&world.index.template_db, at);
+        combat.last_push = blasts.first().map(|b| b.push);
+        for blast in blasts {
             destruction.blast(world, props, install, blast);
         }
     }
@@ -3279,25 +3273,20 @@ const ROCKET_HIT: f32 = 0.5;
 /// doesn't give are left out; with none, combat's own reach and 100 to
 /// nothing.
 pub(crate) fn rocket_blasts(db: &Templates, at: Vec3) -> Vec<Blast> {
-    let of = |e: Explosion| Blast {
-        at,
-        radius: e.radius,
-        damage: e.damage,
-        least: e.least,
-        kind: e.kind,
-    };
     let mut out: Vec<Blast> = [explosion(db, &ROCKET_BLASTS), explosion(db, &[ROCKET_FRAG])]
         .into_iter()
         .flatten()
-        .map(of)
+        .map(|e| of_explosion(e, at))
         .collect();
     if let Some(p) = db.id(ROCKET).and_then(|id| db.projectiles.get(&id)) {
+        // The rocket itself pushes nothing: a projectile, no `Explosive`.
         out.push(Blast {
             at,
             radius: ROCKET_HIT,
             damage: p.damage,
             least: p.damage,
             kind: p.kind,
+            push: BlastPush::none(at),
         });
     }
     if out.is_empty() {
@@ -3308,9 +3297,58 @@ pub(crate) fn rocket_blasts(db: &Templates, at: Vec3) -> Vec<Blast> {
             damage,
             least,
             kind: 0,
+            push: BlastPush {
+                at,
+                radius,
+                force: EXPLOSIVE_FORCE,
+            },
         });
     }
-    out
+    crate::destruct::together(out)
+}
+
+/// The air strike bomb's blasts going off at `at`: its explosion and its
+/// frag, as the data has them (combat's own where it hasn't).
+pub(crate) fn bomb_blasts(db: &Templates, at: Vec3) -> Vec<Blast> {
+    let blasts = [(BOMB_BLAST, combat::BOMB), (BOMB_FRAG, combat::BOMB_FRAG)].map(
+        |(name, (radius, damage))| match explosion(db, &[name]) {
+            Some(e) => of_explosion(e, at),
+            None => Blast {
+                at,
+                radius,
+                damage,
+                least: 0.0,
+                kind: 0,
+                push: BlastPush {
+                    at,
+                    radius,
+                    force: EXPLOSIVE_FORCE,
+                },
+            },
+        },
+    );
+    crate::destruct::together(blasts.to_vec())
+}
+
+/// The `MaxForce` an `Explosive` has when its template gives none (the
+/// schema's default, 0x823EF9F0), for a blast not found in the data.
+const EXPLOSIVE_FORCE: f32 = 500.0;
+
+/// Explosion `e` going off at `at` as a blast that wears things down and
+/// pushes what it breaks.
+fn of_explosion(e: Explosion, at: Vec3) -> Blast {
+    Blast {
+        at,
+        radius: e.radius,
+        damage: e.damage,
+        least: e.least,
+        kind: e.kind,
+        push: BlastPush {
+            at,
+            radius: e.radius,
+            force: e.force,
+        },
+    }
 }
 
 /// Whether an ordinary blast throws loose what template `t`'s objects

@@ -25,7 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use m2_engine::durability::{Crash, CrashHow};
+use m2_engine::durability::{BlastPush, Crash, CrashHow};
 use m2_engine::{Install, StaticKey, World};
 use m2_math::glam::{Mat4, Vec3};
 
@@ -58,6 +58,27 @@ pub struct Blast {
     pub least: f32,
     /// Its `DamageKey` (name hash; 0 for none, taken in full).
     pub kind: u32,
+    /// What it pushes what it breaks with: its own `MaxForce` over its
+    /// reach, or the strongest of the blasts going off with it (an RPG's
+    /// explosion pushes nothing, its frag 500 over 15 m): the 360 code
+    /// adds a push only where it is the stronger, axis by axis
+    /// (0x8215CBC8), so the strongest is what shows.
+    pub push: BlastPush,
+}
+
+/// `blasts` going off together, each pushing what it breaks with the
+/// strongest of their pushes ([`Blast::push`]).
+pub fn together(mut blasts: Vec<Blast>) -> Vec<Blast> {
+    if let Some(strongest) = blasts
+        .iter()
+        .map(|b| b.push)
+        .max_by(|a, b| a.force.total_cmp(&b.force))
+    {
+        for b in &mut blasts {
+            b.push = strongest;
+        }
+    }
+    blasts
 }
 
 impl Blast {
@@ -272,36 +293,27 @@ pub enum Crashed {
 /// has loaded.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Cause {
-    /// A blast that went off here: its pieces thrown from there, heard
-    /// and seen coming down.
-    Blast(Vec3),
+    /// A blast, or a hit with no push (a round, a `DestructionLink`
+    /// fall): its pieces pushed as it pushes them, heard and seen coming
+    /// down.
+    Blast(BlastPush),
     /// A vehicle of `mass` (kg) running into it at `velocity` (m/s): its
     /// pieces knocked on as the vehicle knocks loose what it hits.
     Crash { velocity: Vec3, mass: f32 },
 }
 
-/// How fast a prop broken by a blast with nothing to show broken goes
-/// flying away from it, and up, m/s (invented).
-const FLY_AWAY: (f32, f32) = (5.0, 4.0);
-
 impl Cause {
     /// How what it brought down of `mass` (kg), standing at `at`, flies
     /// when it has no wreck to show but comes loose: on with the vehicle
-    /// ([`crate::game::flung`]), or away from the blast and up.
+    /// ([`crate::game::flung`]), or as the blast pushes it (taken as a
+    /// point: the loose props are all under the 2 m³ the push is full up
+    /// to).
     fn flings(&self, at: Vec3, mass: f32) -> (Vec3, Vec3) {
         match *self {
             Cause::Crash { velocity, mass: by } => crate::game::flung(velocity, by, mass),
-            Cause::Blast(from) => blown(from, at),
+            Cause::Blast(push) => push.throw(at, at, 1.0),
         }
     }
-}
-
-/// How something at `at` flies from a blast at `from`: away and up
-/// ([`FLY_AWAY`]), turning over the way it goes.
-pub fn blown(from: Vec3, at: Vec3) -> (Vec3, Vec3) {
-    let away = (at - from).with_y(0.0).normalize_or(Vec3::X);
-    let (out, up) = FLY_AWAY;
-    (away * out + Vec3::Y * up, Vec3::Y.cross(away) * 3.0)
 }
 
 /// The damage done to the island's placed objects, and those coming down.
@@ -356,7 +368,8 @@ impl Destruction {
     /// all of a `Bullet`, half of an `Explosion`; a `Prop` box and a
     /// `Building` wall nothing of either), or `unrowed` of it for a
     /// template with no row. At its `Health` it breaks: its wreck if its
-    /// model has one, else it goes flying ([`blown`]). Only what has
+    /// model has one, else it comes loose where it stood (a hit pushes
+    /// nothing; a blast pushes, [`blast`](Self::blast)). Only what has
     /// something to show broken (a wreck, or a model that comes loose)
     /// is worn, and not what the scripts or the pickups bring down (a
     /// mission's gates, crates). True if it broke.
@@ -369,7 +382,14 @@ impl Destruction {
         hit: (f32, u32, f32),
         at: Vec3,
     ) -> bool {
-        self.wear_by(world, props, install, key, hit, Cause::Blast(at))
+        self.wear_by(
+            world,
+            props,
+            install,
+            key,
+            hit,
+            Cause::Blast(BlastPush::none(at)),
+        )
     }
 
     /// [`wear`](Self::wear) by `cause`: what breaks with nothing to show
@@ -385,7 +405,7 @@ impl Destruction {
         cause: Cause,
     ) -> bool {
         let at = match cause {
-            Cause::Blast(at) => at,
+            Cause::Blast(push) => push.at,
             Cause::Crash { .. } => match key {
                 StaticKey::Object(i) => world
                     .index
@@ -557,14 +577,8 @@ impl Destruction {
         }
         for (key, d) in reached {
             let damage = blast.at_distance(d);
-            self.wear(
-                world,
-                props,
-                install,
-                key,
-                (damage, blast.kind, 1.0),
-                blast.at,
-            );
+            let hit = (damage, blast.kind, 1.0);
+            self.wear_by(world, props, install, key, hit, Cause::Blast(blast.push));
         }
     }
 
@@ -879,7 +893,7 @@ impl Destruction {
                 if props.get(t).is_some_and(|(p, _)| !p.wrecked) {
                     eprintln!("destruct: {t:#x} falls with {e:#x} (DestructionLink)");
                     let at = props.centre(t);
-                    props.wreck(&mut world.physics, t, at);
+                    props.wreck(&mut world.physics, t, at.map(BlastPush::none));
                     fallen.extend(props.take_fallen());
                 } else if let Some(i) = world.index.objects.iter().position(|o| o.entity == t)
                     && !self.destroyed.contains(&i)
@@ -887,7 +901,7 @@ impl Destruction {
                 {
                     eprintln!("destruct: object {i} ({t:#x}) falls with {e:#x} (DestructionLink)");
                     let at = world.index.objects[i].position;
-                    self.bring_down(world, props, install, i, Cause::Blast(at));
+                    self.bring_down(world, props, install, i, Cause::Blast(BlastPush::none(at)));
                     self.linked.insert(i);
                     fallen.push(t);
                 }
@@ -1142,12 +1156,31 @@ mod tests {
 
     #[test]
     fn what_a_blast_breaks_with_no_wreck_flies_away_and_up() {
-        let (velocity, spin) = blown(Vec3::ZERO, Vec3::new(3.0, 0.5, 0.0));
-        assert!(velocity.x > 0.0 && velocity.y > 0.0 && velocity.z.abs() < 1e-5);
-        assert!(spin.length() > 0.0);
-        // Right on top of it: still away (along x) and up.
-        let (velocity, _) = blown(Vec3::ONE, Vec3::ONE);
-        assert!(velocity.x > 0.0 && velocity.y > 0.0);
+        let push = BlastPush {
+            at: Vec3::ZERO,
+            radius: 5.0,
+            force: 500.0,
+        };
+        let cause = Cause::Blast(push);
+        let (velocity, spin) = cause.flings(Vec3::new(3.0, 0.5, 0.0), 50.0);
+        // 3.04 m off of 5: 0.39 of its push; out as much as up.
+        let d = Vec3::new(3.0, 0.5, 0.0).length();
+        let each = 7.5 * 500.0 * (1.0 - d / 5.0) * 0.004;
+        assert!((velocity.x - each).abs() < 1e-3 && (velocity.y - each).abs() < 1e-3);
+        assert!(
+            velocity.z.abs() < 1e-5 && spin == Vec3::ZERO,
+            "a point has no height"
+        );
+        // Right on top of it: straight up.
+        let (velocity, _) = Cause::Blast(BlastPush {
+            at: Vec3::ONE,
+            ..push
+        })
+        .flings(Vec3::ONE, 1.0);
+        assert!(velocity.x == 0.0 && velocity.z == 0.0 && velocity.y > 0.0);
+        // A round's hit pushes nothing.
+        let (velocity, _) = Cause::Blast(BlastPush::none(Vec3::ZERO)).flings(Vec3::X, 1.0);
+        assert_eq!(velocity, Vec3::ZERO);
     }
 
     #[test]

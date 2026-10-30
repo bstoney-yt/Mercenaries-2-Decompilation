@@ -1529,8 +1529,10 @@ pub struct Combat {
     /// People shot and blasts set off, for the screenshot check.
     pub hits: u32,
     pub blasts: u32,
-    /// Where the last one went off.
+    /// Where the last one went off, and what it pushes what it breaks
+    /// with, where known.
     pub last_blast: Option<Vec3>,
+    pub last_push: Option<m2_engine::durability::BlastPush>,
     /// Where blasts went off in the last step.
     pub went_off: Vec<Vec3>,
     /// Blows and rounds that struck the world in the last step.
@@ -1796,6 +1798,7 @@ impl Default for Combat {
             hits: 0,
             blasts: 0,
             last_blast: None,
+            last_push: None,
             went_off: Vec::new(),
             struck: Vec::new(),
             picked: Picked::default(),

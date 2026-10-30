@@ -4942,7 +4942,12 @@ fn support_item(game: &mut Game, c: &Command) {
 /// Breaks the state layers' models whose objects the scripts' world has
 /// dead (a gate blown up), and takes down those it no longer has.
 fn break_props(game: &mut Game, mission: &Mission) {
-    let blast = game.combat.last_blast;
+    // The last blast's push where it is known (it broke them), else
+    // none: they come down where they stood.
+    let blast = match (game.combat.last_blast, game.combat.last_push) {
+        (Some(at), Some(push)) if push.at == at => Some(push),
+        (at, _) => at.map(m2_engine::durability::BlastPush::none),
+    };
     let scene = &mut game.scene;
     let Some(world) = &mut scene.world else {
         return;
@@ -5514,7 +5519,8 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 && scene.props.get(*guid).is_some()
             {
                 let centre = scene.props.centre(*guid);
-                let broke = scene.props.wreck(&mut world.physics, *guid, centre);
+                let push = centre.map(m2_engine::durability::BlastPush::none);
+                let broke = scene.props.wreck(&mut world.physics, *guid, push);
                 eprintln!(
                     "mission: the scripts killed prop {guid:#x}: {}",
                     if broke { "broken" } else { "already broken" }

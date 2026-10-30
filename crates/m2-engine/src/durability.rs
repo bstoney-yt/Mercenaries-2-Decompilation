@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 
 use m2_assets::{Layer, name_hash};
+use m2_math::glam::Vec3;
 
 use crate::tuning::Table;
 
@@ -75,6 +76,86 @@ pub fn blast_damage(damage: f32, least: f32, radius: f32, d: f32) -> f32 {
     }
     let falloff = (1.0 - d / radius.max(0.01)).clamp(0.0, 1.0);
     (damage * falloff).max(least)
+}
+
+/// How hard a blast pushes, by the size (m³) of what it pushes: up to
+/// each size, of its push (the 360 code's table at 0x82DE88F0, read by
+/// 0x8215CBC8): all of it up to 2 m³, half up to 60, 0.3 up to 200, a
+/// tenth beyond.
+const PUSH_BY_SIZE: [(f32, f32); 12] = [
+    (0.02, 1.0),
+    (0.05, 1.0),
+    (0.5, 1.0),
+    (1.5, 1.0),
+    (2.0, 1.0),
+    (5.0, 0.5),
+    (10.0, 0.5),
+    (25.0, 0.5),
+    (40.0, 0.5),
+    (60.0, 0.5),
+    (200.0, 0.3),
+    (f32::MAX, 0.1),
+];
+
+/// The least of its push a blast gives what it reaches, however far
+/// (`MinForceFalloff`: 0.3 on every `Explosive` in the data, as the
+/// schema's default, 0x823EF9F0).
+pub const LEAST_PUSH: f32 = 0.3;
+
+/// What a blast pushes broken pieces with: where it went off, its reach
+/// (`Radius`, metres) and its push (`MaxForce`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlastPush {
+    pub at: Vec3,
+    pub radius: f32,
+    pub force: f32,
+}
+
+impl BlastPush {
+    /// No push at all, from `at`: what breaks with no blast (a round, a
+    /// `DestructionLink` fall) comes down where it stood.
+    pub fn none(at: Vec3) -> Self {
+        Self {
+            at,
+            radius: 1.0,
+            force: 0.0,
+        }
+    }
+
+    /// The velocity (m/s) and spin (radians a second) it gives a broken
+    /// piece whose world box is `lo` to `hi`, `fudge` its template's
+    /// `ExplosionFudge` (1 without one). From the 360 code (0x8215CBC8):
+    /// the push falls off with the distance from the blast to the box, as
+    /// `max(1 - d / radius, LEAST_PUSH)`, and is [`PUSH_BY_SIZE`] of
+    /// `force` for the box's size, times 0.004 and the fudge; it is given
+    /// five times, at the bottom of the box, a quarter, half and three
+    /// quarters up and at its top, 1, 1.25, 1.5, 1.75 and 2 times as hard,
+    /// each away from the blast across the ground and as much up, and
+    /// each times the piece's mass, so the piece goes as fast whatever it
+    /// weighs: 7.5 times the push out and as much up, its top pushed
+    /// hardest, tipping it away from the blast. The spin is that of a
+    /// solid box (inferred: the 360 leaves it to its physics), about the
+    /// level axis across the way it is pushed.
+    pub fn throw(&self, lo: Vec3, hi: Vec3, fudge: f32) -> (Vec3, Vec3) {
+        let centre = (lo + hi) * 0.5;
+        let d = self.at.clamp(lo, hi).distance(self.at);
+        let falloff = (1.0 - d / self.radius.max(0.01)).max(LEAST_PUSH);
+        let extent = hi - lo;
+        let size = extent.x * extent.y * extent.z;
+        let by_size = PUSH_BY_SIZE
+            .iter()
+            .find(|&&(most, _)| size < most)
+            .map_or(0.0, |&(_, k)| k);
+        let push = self.force * by_size * falloff * 0.004 * fudge;
+        let away = (centre - self.at).with_y(0.0).normalize_or_zero();
+        let velocity = (away + Vec3::Y) * (7.5 * push);
+        // Its height, and its depth the way it is pushed.
+        let height = extent.y;
+        let depth = (extent.x * away.x).abs() + (extent.z * away.z).abs();
+        let spin = Vec3::new(away.z, 0.0, -away.x)
+            * (7.5 * push * height / (height * height + depth * depth).max(0.01));
+        (velocity, spin)
+    }
 }
 
 /// How a building sinks and leans as it comes down
@@ -241,6 +322,17 @@ pub fn sound_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
 /// `OSMParameter`'s value field (name unknown): with `Name` `PropTemplate`
 /// or `DebrisTemplate`, the name hash of a template.
 const OSM_VALUE: u32 = 0x255f_12c0;
+
+/// Each template's `ExplosionFudge` (field 6bcc541e, name unknown), by
+/// id: how hard blasts push its objects, of their push (322 templates,
+/// all vehicles but the port's containers, 0.8, and the large fuel
+/// pickup; the 360 code takes 1 for the rest, 0x8215CBC8).
+pub fn explosion_fudges(db: &Layer<'_>) -> HashMap<u32, f32> {
+    let t = Table::new(db, "ExplosionFudge");
+    t.templates()
+        .filter_map(|id| Some((id, t.float(t.of_template(id).first()?, 0x6bcc_541e)?)))
+        .collect()
+}
 
 /// What each piece of a template's objects weighs once broken off (kg),
 /// by id: the `_DebrisPhysics` `Mass` of the template its `OSMParameter`
