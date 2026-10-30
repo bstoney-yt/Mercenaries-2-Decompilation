@@ -265,39 +265,146 @@ pub struct EngineTuning {
     pub reverse_speed: f32,
 }
 
-/// How a wheeled vehicle steers, brakes and holds the road, from its
-/// `_CarPhysicsV2` (names found by hash, gap round 4; the M151's values
-/// in brackets, the range over the 454 records after them).
+/// How a wheeled vehicle steers, from its `_CarPhysicsV2` (the M151's
+/// values in brackets, the range over the 454 records after them), as
+/// the Xbox 360 code turns its front wheels (from the 360 code, driving
+/// round 4: each front wheel's angle at 0x821A020C, in the wheel step;
+/// the record's defaults at 0x823EB210).
+///
+/// Each step the wheels' angle heads for the stick's share of the lock,
+/// the lock shrinking with speed ([`Handling::range`]). With
+/// `SteeringInertia` below 0 (the default, -1) the angle moves there at
+/// most its swing speed, which also shrinks with speed; let go of the
+/// stick, or pushed the other way, it first eases back towards straight
+/// by `SteerNoInputInertia` or `SteerDiffSignInertia`. With
+/// `SteeringInertia` 0 or more, it eases to where the stick asks by that
+/// (or those two). Easing keeps that share of the way left each 1/60 s
+/// ([`ease`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Handling {
     /// How far its front wheels turn, radians (`SteerMaxAngle` 0.7; 0.5
-    /// to 1.1, 29 to 63 degrees; radians inferred, as the database gives
-    /// the helicopters' and cameras' angles in them too).
+    /// to 1.1, 29 to 63 degrees; the wheels take it as it is).
     pub steer_lock: f32,
     /// How quickly its front wheels swing towards where the driver
-    /// steers, radians a second (`SteerSpeed` 0.6; 0.1 to 10; gap round
-    /// 14, the unit inferred, as the lock's is radians).
+    /// steers, radians a second (`SteerSpeed` 0.6; 0.1 to 10).
     pub steer_speed: f32,
-    /// Below this speed, m/s, they swing at `low_steer_speed` instead
-    /// (`LowSpeedLimit` 35 and `LowSpeedSteerSpeed` 0.9; 0 to 80 and 0
-    /// to 6). The limit read as km/h, as its `MaxSpeed` is (inferred);
-    /// the pair read as the helicopters' `LowSpeedLimit` and
-    /// `LowSpeedYawSpeed` are. 0 when its template gives no limit (7 of
-    /// the 454 records).
+    /// At a standstill they swing at `low_steer_speed` instead, easing to
+    /// `steer_speed` at this speed, m/s (`LowSpeedLimit` 35 km/h and
+    /// `LowSpeedSteerSpeed` 0.9; 0 to 80 and 0 to 6). 0: no low speed.
     pub low_speed: f32,
     pub low_steer_speed: f32,
+    /// At its top speed its lock and swing are this much less
+    /// (`HighSpeedSteerLoss`, default 0.1), times `loss_braking`
+    /// braking (`HighSpeedSteerLossBrakeMulti`, 0.5) or `loss_coasting`
+    /// off the throttle (`HighSpeedSteerLossNoThrottleMulti`, 0.8).
+    pub high_speed_loss: f32,
+    pub loss_braking: f32,
+    pub loss_coasting: f32,
+    /// How its wheels ease to where the stick asks (`SteeringInertia`,
+    /// default -1: below 0, they swing at the swing speed instead), back
+    /// to straight with the stick let go (`SteerNoInputInertia`, 0) and
+    /// back to straight when steered the other way
+    /// (`SteerDiffSignInertia`, 0.9).
+    pub inertia: f32,
+    pub no_input_inertia: f32,
+    pub diff_sign_inertia: f32,
 }
 
 impl Handling {
-    /// How quickly its front wheels swing at `speed` m/s, radians a
-    /// second.
-    pub fn swing(&self, speed: f32) -> f32 {
-        if speed.abs() < self.low_speed {
-            self.low_steer_speed
+    /// The 360 code's defaults, for a vehicle with no `_CarPhysicsV2`.
+    pub const DEFAULT: Handling = Handling {
+        steer_lock: 1.0,
+        steer_speed: 10.0,
+        low_speed: 30.0 / 3.6,
+        low_steer_speed: 5.0,
+        high_speed_loss: 0.1,
+        loss_braking: 0.5,
+        loss_coasting: 0.8,
+        inertia: -1.0,
+        no_input_inertia: 0.0,
+        diff_sign_inertia: 0.9,
+    };
+
+    /// Its lock's (and swing's) share left at `fast` (its speed's share
+    /// of its `MaxSpeed`), with the throttle open or the brake on.
+    pub fn range(&self, fast: f32, throttle: f32, brake: f32) -> f32 {
+        let multi = if throttle >= 1e-4 {
+            1.0
+        } else if brake >= 1e-4 {
+            self.loss_braking
         } else {
-            self.steer_speed
-        }
+            self.loss_coasting
+        };
+        1.0 - self.high_speed_loss * multi * fast.clamp(0.0, 1.0)
     }
+
+    /// How quickly its front wheels swing at `speed` m/s, radians a
+    /// second (before [`range`](Self::range)).
+    pub fn swing(&self, speed: f32) -> f32 {
+        let low = if self.low_speed > 0.0 {
+            1.0 - (speed.abs() / self.low_speed).min(1.0)
+        } else {
+            0.0
+        };
+        self.steer_speed + (self.low_steer_speed - self.steer_speed) * low
+    }
+
+    /// Its front wheels' angle after `dt` s from `angle`, radians, with
+    /// the stick at `steer` (-1 to 1), at `speed` m/s, `fast` its share
+    /// of its `MaxSpeed`, the throttle and brake as [`range`] takes them.
+    ///
+    /// [`range`]: Self::range
+    #[allow(clippy::too_many_arguments)]
+    pub fn steer(
+        &self,
+        angle: f32,
+        steer: f32,
+        speed: f32,
+        fast: f32,
+        throttle: f32,
+        brake: f32,
+        dt: f32,
+    ) -> f32 {
+        let range = self.range(fast, throttle, brake);
+        let want = self.steer_lock * range * steer;
+        let back = if steer == 0.0 {
+            Some(self.no_input_inertia)
+        } else if angle * steer < 0.0 {
+            Some(self.diff_sign_inertia)
+        } else {
+            None
+        };
+        if self.inertia >= 0.0 {
+            return ease(angle, want, back.unwrap_or(self.inertia), dt);
+        }
+        let angle = back.map_or(angle, |keep| ease(angle, 0.0, keep, dt));
+        let most = self.swing(speed) * range * dt;
+        angle + (want - angle).clamp(-most, most)
+    }
+}
+
+/// Eases `from` towards `to` over `dt` s as the 360 code does (from the
+/// 360 code, 0x824BB050): each 1/60 s it keeps `keep` of the way left,
+/// the rest of a 1/60 s a share of a step; done when the way left is
+/// under `keep` x 1e-5. Over 16.7 s, there at once unless `keep` is over
+/// 0.9999.
+pub fn ease(from: f32, to: f32, keep: f32, dt: f32) -> f32 {
+    const TICK: f32 = 1.0 / 60.0;
+    if dt > 1000.0 * TICK {
+        return if keep <= 0.9999 { to } else { from };
+    }
+    let (mut at, mut left) = (from, dt);
+    while left > TICK {
+        let way = to - at;
+        if way * way < (keep * 1e-5) * (keep * 1e-5) {
+            return to;
+        }
+        left -= TICK;
+        at += way * (1.0 - keep);
+    }
+    let share = left * 60.0;
+    let next = at + (to - at) * (1.0 - keep);
+    next * share + (1.0 - share) * at
 }
 
 /// A wheeled vehicle's springs, from its `_CarPhysicsV2` (the M151's
@@ -1186,11 +1293,19 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                     let r = *car.of_template(id).first()?;
                     let f = |name| car.float(r, name_hash(name)).filter(|v| *v > 0.0);
                     let low = (|| Some((f("LowSpeedLimit")? / 3.6, f("LowSpeedSteerSpeed")?)))();
+                    let d = Handling::DEFAULT;
+                    let or = |name, or: f32| car.float(r, name_hash(name)).unwrap_or(or);
                     Some(Handling {
                         steer_lock: f("SteerMaxAngle").filter(|a| *a < 1.5)?,
                         steer_speed: f("SteerSpeed")?,
                         low_speed: low.map_or(0.0, |l| l.0),
                         low_steer_speed: low.map_or(0.0, |l| l.1),
+                        high_speed_loss: or("HighSpeedSteerLoss", d.high_speed_loss),
+                        loss_braking: or("HighSpeedSteerLossBrakeMulti", d.loss_braking),
+                        loss_coasting: or("HighSpeedSteerLossNoThrottleMulti", d.loss_coasting),
+                        inertia: or("SteeringInertia", d.inertia),
+                        no_input_inertia: or("SteerNoInputInertia", d.no_input_inertia),
+                        diff_sign_inertia: or("SteerDiffSignInertia", d.diff_sign_inertia),
                     })
                 })(),
                 springs: (|| {
@@ -1634,6 +1749,18 @@ mod tests {
         // A tank takes no round at all: nothing to scale.
         assert_eq!(t.weak_point(tank, weak, bullet), None);
         assert_eq!(t.weak_point(tank, name_hash("Car"), rocket), None);
+    }
+
+    // Easing keeps its share of the way left each 1/60 s, a share of a
+    // step for the rest (0x824BB050).
+    #[test]
+    fn ease_keeps_its_share_each_sixtieth() {
+        let close = |a: f32, b: f32| assert!((a - b).abs() < 1e-5, "{a} {b}");
+        close(ease(1.0, 0.0, 0.9, 1.0 / 60.0), 0.9);
+        close(ease(1.0, 0.0, 0.9, 3.0 / 60.0), 0.729);
+        close(ease(1.0, 0.0, 0.9, 1.5 / 60.0), 0.9 - 0.5 * 0.09);
+        close(ease(1.0, 0.0, 0.0, 1.0 / 60.0), 0.0);
+        close(ease(1.0, 0.0, 0.5, 20.0), 0.0);
     }
 
     // An axle's slowing as the 360 code works it out (0x8219FB08).

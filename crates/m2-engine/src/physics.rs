@@ -31,7 +31,7 @@ use rapier3d::control::{
     KinematicCharacterController, WheelTuning,
 };
 
-use crate::tuning::{BikeTuning, BoatTuning, FlightTuning, Springs, Tyres};
+use crate::tuning::{BikeTuning, BoatTuning, FlightTuning, Handling, Springs, Tyres};
 use crate::vehicle::VehicleSpec;
 use rapier3d::prelude as r;
 
@@ -921,10 +921,6 @@ fn preloads(spec: &VehicleSpec, strength: impl Fn(bool) -> f32, mass_z: f32) -> 
 /// stretched), per kilogram. Invented.
 const SPRING: f32 = 40.0;
 const DAMPING: (f32, f32) = (2.0, 3.0);
-/// Steering lock at a standstill, radians, for a vehicle whose template
-/// gives none (its `SteerMaxAngle` otherwise,
-/// [`Handling`](crate::tuning::Handling)). Invented.
-const MAX_STEER: f32 = 0.6;
 /// A tank's braking with the throttle against the motion, its handbrake
 /// (on the wheels that don't steer), rolling with no throttle, and
 /// holding still, m/s² (as if all wheels braked so). Invented: a wheeled
@@ -2274,18 +2270,25 @@ impl Physics {
         } else {
             (0.0, slowing(ROLLING))
         };
-        // Its template's lock at a standstill, less as it speeds up (the
-        // fall with speed invented); the wheels swing there as quickly
-        // as its template says at this speed (else at once).
-        let lock = v.handling.map_or(MAX_STEER, |h| h.steer_lock);
-        let want = controls.steer.clamp(-1.0, 1.0) * lock / (1.0 + speed.abs() * 0.04);
-        let want = if v.tracked { 0.0 } else { want };
-        v.steering = match v.handling {
-            Some(h) => {
-                let most = h.swing(speed) * dt;
-                v.steering + (want - v.steering).clamp(-most, most)
-            }
-            None => want,
+        // Its front wheels turn as the 360 code turns them ([`Handling`];
+        // its defaults without a template); a tank's wheels don't.
+        v.steering = if v.tracked {
+            0.0
+        } else {
+            let (open, pressed) = if against {
+                (0.0, throttle.abs())
+            } else {
+                (throttle.abs(), 0.0)
+            };
+            v.handling.unwrap_or(Handling::DEFAULT).steer(
+                v.steering,
+                controls.steer.clamp(-1.0, 1.0),
+                speed,
+                fast,
+                open,
+                pressed,
+                dt,
+            )
         };
         let steer = v.steering;
         let tracked = v
@@ -4631,6 +4634,7 @@ mod tests {
                 steer_speed: 100.0,
                 low_speed: 0.0,
                 low_steer_speed: 0.0,
+                ..crate::tuning::Handling::DEFAULT
             });
             let mut p = Physics::new();
             floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
@@ -4682,8 +4686,11 @@ mod tests {
     }
 
     // Its front wheels swing towards full lock as quickly as its template
-    // says (radians a second): `LowSpeedSteerSpeed` below its
-    // `LowSpeedLimit`, `SteerSpeed` above it; and back as quickly.
+    // says (radians a second): `LowSpeedSteerSpeed` at a standstill,
+    // easing to `SteerSpeed` at its `LowSpeedLimit`; let go, back straight
+    // at once (`SteerNoInputInertia` 0); at its top speed its lock and
+    // swing a tenth less (`HighSpeedSteerLoss`), times 0.5 braking and
+    // 0.8 coasting.
     #[test]
     fn wheels_swing_at_the_templates_steer_speed() {
         let mut spec = car();
@@ -4692,6 +4699,7 @@ mod tests {
             steer_speed: 0.6,
             low_speed: 35.0 / 3.6,
             low_steer_speed: 0.9,
+            ..crate::tuning::Handling::DEFAULT
         });
         let mut p = Physics::new();
         floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
@@ -4714,17 +4722,20 @@ mod tests {
             p.vehicle_wheels(id)[0].0
         };
         // At a standstill: 0.9 rad/s, so 0.45 rad after half a second,
-        // full lock (0.7) by 0.8 s, and straight again 0.8 s later.
+        // full lock (0.7) by 0.8 s, and straight again a step after.
         let half = steer(&mut p, 1.0, 0.5);
         assert!((half - 0.45).abs() < 0.03, "{half}");
         let full = steer(&mut p, 1.0, 0.5);
         assert!((full - 0.7).abs() < 0.01, "{full}");
-        let back = steer(&mut p, 0.0, 0.8);
-        assert!(back.abs() < 0.01, "{back}");
-        // Above 35 km/h: 0.6 rad/s.
+        let back = steer(&mut p, 0.0, DT);
+        assert!(back.abs() < 1e-6, "{back}");
+        // Halfway to 35 km/h: 0.75 rad/s; above it 0.6.
         let h = spec.tuning.handling.expect("set");
-        assert_eq!(h.swing(5.0), 0.9);
+        assert!((h.swing(17.5 / 3.6) - 0.75).abs() < 1e-5);
         assert_eq!(h.swing(-12.0), 0.6);
+        assert!((h.range(1.0, 1.0, 0.0) - 0.9).abs() < 1e-6);
+        assert!((h.range(1.0, 0.0, 1.0) - 0.95).abs() < 1e-6);
+        assert!((h.range(1.0, 0.0, 0.0) - 0.92).abs() < 1e-6);
     }
 
     // Its springs hang as the 360 code hangs them: from their squeeze
