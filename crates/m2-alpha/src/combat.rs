@@ -1672,10 +1672,21 @@ pub struct Manned {
     pub weapon: m2_engine::weapons::WeaponSpec,
     /// Rounds left: its clip and reserve clips together.
     pub rounds: u32,
+    /// Its model and the hardpoint its weapon hangs from (its
+    /// `PhysicalLink`'s), name hash.
+    pub model: u32,
+    pub hardpoint: u32,
+    /// Where its rounds start, once its models are read: the hardpoint
+    /// (world) and the weapon model's `Muzzle` node from its origin
+    /// (weapon model space, +z along the barrel). `None` until then, or
+    /// where either model lacks its node ([`MANNED_PIVOT`],
+    /// [`MANNED_MUZZLE`]).
+    pub barrel: Option<(Vec3, Vec3)>,
 }
 
-/// An emplaced gun's barrel above its place, metres (invented: the
-/// tripod's gun sits about a crouching soldier's shoulder high).
+/// An emplaced gun's barrel above its place, metres, where its model's
+/// hardpoint isn't known (invented: the tripod's gun sits about a
+/// crouching soldier's shoulder high).
 pub const MANNED_PIVOT: f32 = 1.1;
 /// Where an emplaced gun's rounds start, metres along its aim from the
 /// pivot: clear of its own emplacement (sandbags, shield, the platform it
@@ -1688,6 +1699,21 @@ impl Manned {
     /// `dir` held within its turn and tilt.
     pub fn clamp(&self, dir: Vec3) -> Vec3 {
         turret_clamp(dir, self.facing, self.yaw, self.pitch)
+    }
+
+    /// Where a round aimed along `aim` (held within its turn) leaves it:
+    /// its weapon's `Muzzle` node, the weapon hung from its hardpoint and
+    /// turned to `aim` ([`Manned::barrel`]), else [`MANNED_MUZZLE`] out
+    /// from the pivot. From samples: the two models' nodes. Inferred:
+    /// the weapon turns about its hardpoint, as a vehicle's gun about its
+    /// mount.
+    pub fn muzzle(&self, aim: Vec3) -> Vec3 {
+        match self.barrel {
+            Some((mount, muzzle)) => {
+                mount + Quat::from_rotation_arc(Vec3::Z, aim.normalize_or(Vec3::Z)) * muzzle
+            }
+            None => self.pivot + aim * MANNED_MUZZLE,
+        }
     }
 }
 
@@ -2861,7 +2887,7 @@ impl Combat {
         let (gun, left) = (m.entity, m.rounds);
         let (_, dir) = Self::aim_ray(f.player);
         let aim = m.clamp(dir);
-        let from = m.pivot + aim * MANNED_MUZZLE;
+        let from = m.muzzle(aim);
         let w = &m.weapon;
         self.reload = w.gap();
         let feel = w.feel;
