@@ -89,17 +89,6 @@ impl Blast {
     }
 }
 
-/// How much damage a vehicle of `mass` (kg) running into something at
-/// `speed` (m/s) does to it, before its `ModifierKey` row scales it by the
-/// vehicle's `DamageKey` (`Car`, the AMX30's as the jeeps'): a tonne at a
-/// metre a second does 1, so a 1,000 kg jeep at 10 m/s does 10 and a
-/// 32,000 kg tank at 8 m/s 256. Invented: the data gives the kind of a
-/// ram's damage (the vehicles' `DamageKey`) and what each thing takes of
-/// it (the damage table's `Car` column: a shack twice it, vegetation ten
-/// times, a building or a tree's canopy none), not its size.
-/// The same ram hurts people ([`m2_engine::durability::run_over`]).
-pub use m2_engine::durability::ram;
-
 /// A ram's kind of damage: the vehicles' own `DamageKey` (`Car` on 520
 /// vehicle templates, none on 259, nothing else; survey `runover`).
 use m2_engine::durability::RAM_KIND;
@@ -468,7 +457,13 @@ impl Destruction {
             _ => unrowed,
         };
         let hit = damage * scale;
-        if hit <= 0.0 {
+        // A crash counts only past 1 once the cell has scaled it (the 360's
+        // 0x82287CF8, as [`m2_engine::durability::crash_damage`]).
+        let least = match cause {
+            Cause::Crash { .. } => 1.0,
+            Cause::Blast(_) => 0.0,
+        };
+        if hit <= least {
             return false;
         }
         let taken = match key {
@@ -525,12 +520,17 @@ impl Destruction {
 
     /// What `vehicle` does ramming what its body touched and its
     /// template says no vehicle breaks running into it, nor comes loose
-    /// (a shack, a large jungle tree): it wears it down by its ram
-    /// ([`ram`], of the vehicles' kind, `Car`), as its row of the damage
-    /// table takes of that (a shack twice it, a big tree's `Vegetation`
-    /// ten times, a building or a canopy tree none). Only going at
-    /// [`RAM_SPEED`] or faster: a vehicle pushing on against what it
-    /// stopped at wears nothing more. True if it broke.
+    /// (a shack, a large jungle tree): it wears it down by the crash
+    /// ([`m2_engine::durability::crash_size`] of its mass against a fixed
+    /// body's, at its speed, and a hundredth of that), of the vehicles'
+    /// kind, `Car`, as its row of the damage table takes of that (a shack
+    /// twice it, a big tree's `Vegetation` ten times, a building or a
+    /// canopy tree none), counting only past 1. From the 360 code: the
+    /// same crash path as vehicle against vehicle (0x82162BB8,
+    /// 0x82163758, 0x8228B5F0, 0x82287CF8; props and fixed bodies take
+    /// part with a factor of 1, as vehicles). Inferred: its whole speed
+    /// as the closing speed (the contact normal isn't kept here). Only
+    /// going at [`RAM_SPEED`] or faster. True if it broke.
     fn rammed(
         &mut self,
         world: &mut World,
@@ -547,8 +547,9 @@ impl Destruction {
             velocity: vehicle.velocity,
             mass: vehicle.mass,
         };
+        let size = m2_engine::durability::crash_size(vehicle.mass, 0.0, speed);
         let hit = (
-            ram(vehicle.mass, speed),
+            m2_engine::durability::crash_base(size),
             m2_assets::name_hash(RAM_KIND),
             0.0,
         );
@@ -1148,12 +1149,17 @@ mod tests {
     }
 
     #[test]
-    fn a_ram_grows_with_mass_and_speed() {
-        // A jeep at 10 m/s, a tank at 8.
-        assert_eq!(ram(1000.0, 10.0), 10.0);
-        assert_eq!(ram(32_000.0, 8.0), 256.0);
-        // Twice the speed, twice the ram.
-        assert_eq!(ram(32_000.0, 16.0), 2.0 * ram(32_000.0, 8.0));
+    fn a_ram_into_something_fixed_is_the_360s_crash() {
+        use m2_engine::durability::{crash_base, crash_size};
+        // A jeep at 10 m/s, a tank at 8, against a fixed body (15 t).
+        let jeep = crash_base(crash_size(1000.0, 0.0, 10.0));
+        let tank = crash_base(crash_size(32_000.0, 0.0, 8.0));
+        assert!((jeep - 1.541).abs() < 1e-3, "{jeep}");
+        assert!((tank - 2.411).abs() < 1e-3, "{tank}");
+        // Twice the speed, twice the crash; nothing at a crawl.
+        let fast = crash_base(crash_size(32_000.0, 0.0, 16.0));
+        assert!((fast - 2.0 * tank).abs() < 1e-3);
+        assert_eq!(crash_base(crash_size(1000.0, 0.0, 0.3)), 0.0);
     }
 
     #[test]

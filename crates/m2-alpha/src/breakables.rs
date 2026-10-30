@@ -188,11 +188,19 @@ pub fn expected(m: &Makeup, hit: HitKind, hits: &Hits<'_>) -> &'static [Reaction
                     &[Break, Move]
                 }
                 None if m.physics.is_some() => &[Move],
-                // Fixed, worn down by the ram ([`crate::destruct::ram`]:
-                // its size invented, its kind the data's): broken once it
-                // takes its `Health`, else it stands.
+                // Fixed, worn down by the crash (the 360's crash path:
+                // `crash_size` against a fixed body, its cell the `Car`
+                // column): broken once it takes its `Health`, else it
+                // stands.
                 None => match m.health {
-                    Some(h) if crate::destruct::ram(mass, speed) * m.crash_damage >= h => &[Break],
+                    Some(h)
+                        if m2_engine::durability::crash_damage(
+                            m2_engine::durability::crash_size(mass, 0.0, speed),
+                            m.crash_damage,
+                        ) >= h =>
+                    {
+                        &[Break]
+                    }
                     _ => &[Block],
                 },
             }
@@ -845,16 +853,27 @@ mod tests {
             ..Makeup::default()
         };
         assert_eq!(expected(&palm, HitKind::Tank, &h), &[Reaction::Break]);
-        // `_village_bld_shacksmall02`: no crash property, Shack row (the
-        // `Car` column twice), 50 health: the tank's ram (256) breaks it,
-        // a jeep's (10) leaves it standing.
+        // `_village_bld_shacksmall02`: no crash property, `Car` row (the
+        // `Car` column twice), 50 health: one crash of the tank's
+        // (8 * (178.9 + 122.5) * 0.1 = 241, 2.41 * 2 = 4.8) or a jeep's
+        // (3.1) wears it but leaves it standing; a 25-health one goes to a
+        // tank at 45 m/s.
         let shack = Makeup {
             health: Some(50.0),
             crash_damage: 2.0,
             ..Makeup::default()
         };
         assert!(shack.is_crushable() && !shack.is_prop());
-        assert_eq!(expected(&shack, HitKind::Tank, &h), &[Reaction::Break]);
+        assert_eq!(expected(&shack, HitKind::Tank, &h), &[Reaction::Block]);
+        let fast = Hits {
+            tank: (32_000.0, 45.0),
+            ..h
+        };
+        let shed = Makeup {
+            health: Some(25.0),
+            ..shack
+        };
+        assert_eq!(expected(&shed, HitKind::Tank, &fast), &[Reaction::Break]);
         assert_eq!(expected(&shack, HitKind::Vehicle, &h), &[Reaction::Block]);
         // `_jungle_env_treemedium03`: Canopy row (none of `Car`), no
         // crash property: it stands.
@@ -865,7 +884,7 @@ mod tests {
         assert!(!tree.is_crushable());
         assert_eq!(expected(&tree, HitKind::Tank, &h), &[Reaction::Block]);
         // `_jungle_env_largecanopy01`: Vegetation (ten times `Car`),
-        // 4,000 health: 2,560 at 8 m/s, it stands.
+        // 4,000 health: a crash of 24 at 8 m/s, it stands.
         let big = Makeup {
             health: Some(4000.0),
             crash_damage: 10.0,
