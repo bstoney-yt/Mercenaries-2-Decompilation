@@ -131,6 +131,10 @@ m2-alpha [options]
                          rocket's blast)
   --blast                with --screenshot on the island: fire a rocket at
                          the fuel tank or barrel nearest where she starts
+                         (with --vehicle <name>: rockets at that vehicle
+                         until it is down to 80 health, six at most)
+  --blast-rifle          as --blast, with the rifle, at a state layer's
+                         red barrel if one is shown
   --demolish <n>         with --screenshot on foot: rocket the nearest
                          building (health and a collapse in its template)
                          until it comes down, at most n rockets, logging

@@ -198,6 +198,8 @@ struct Options {
     fight: bool,
     /// With `--screenshot`: rocket the nearest fuel tank or barrel.
     blast: bool,
+    /// With `--blast`: shoot it with the rifle instead.
+    blast_rifle: bool,
     /// With `--screenshot`: rocket the nearest building until it comes
     /// down, at most this many rockets.
     demolish: Option<u32>,
@@ -619,6 +621,10 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--lead" => o.lead = Some(value()?.parse().context("--lead expects seconds")?),
             "--fight" => o.fight = true,
             "--blast" => o.blast = true,
+            "--blast-rifle" => {
+                o.blast = true;
+                o.blast_rifle = true;
+            }
             "--demolish" => {
                 o.demolish = Some(
                     value()?
@@ -2015,7 +2021,7 @@ fn screenshot(
     {
         demolish_for_screenshot(&mut backend, &mut game, fov, aspect, rockets, out)?;
     } else if options.blast && game.on_foot && game.scene.player.is_some() {
-        blast_for_screenshot(&mut backend, &mut game, fov, aspect, options.fight_wait)?;
+        blast_for_screenshot(&mut backend, &mut game, fov, aspect, options)?;
     } else if options.drive && game.on_foot && game.scene.player.is_some() {
         drive_for_screenshot(&mut backend, &mut game, fov, aspect, options, install)?;
     } else if game.on_foot && game.scene.player.is_some() {
@@ -7000,18 +7006,57 @@ fn blast_for_screenshot(
     game: &mut Game,
     fov: f32,
     aspect: f32,
-    wait: f32,
+    options: &Options,
 ) -> anyhow::Result<()> {
     use combat::{Trigger, Weapon};
+    let wait = options.fight_wait;
     let tick = TICK.as_secs_f32();
     let here = game.focus();
-    let Some(at) = game
-        .scene
-        .explosives
-        .iter()
-        .map(|e| e.at)
-        .min_by(|a, b| a.distance(here).total_cmp(&b.distance(here)))
-    else {
+    // With the rifle, a state layer's prop that blows up (a red barrel)
+    // if one is shown, else the island's nearest explosive.
+    let barrel = options
+        .blast_rifle
+        .then(|| {
+            let db = &game.scene.world.as_ref()?.index.template_db;
+            let props = &game.scene.props;
+            let found: Vec<(u32, m2_math::glam::Vec3)> = props
+                .shown()
+                .filter(|(_, p)| destruct::explodes(db, p.template))
+                .filter(|(_, p)| {
+                    db.names
+                        .get(&p.template)
+                        .is_some_and(|n| n.to_ascii_lowercase().contains("barrel"))
+                })
+                .filter_map(|(e, _)| Some((e, props.centre(e)?)))
+                .collect();
+            eprintln!("blast: {} props shown that blow up", found.len());
+            found
+                .into_iter()
+                .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
+                .map(|(_, at)| at)
+        })
+        .flatten();
+    // With --vehicle, the nearest such vehicle.
+    let vehicle = options.vehicle.as_deref().and_then(|want| {
+        let w = game.scene.world.as_ref()?;
+        game.scene
+            .vehicles
+            .iter()
+            .filter(|v| v.spec.label.to_ascii_lowercase().contains(want))
+            .filter_map(|v| {
+                let m = w.physics.vehicle_transform(v.id?)?;
+                let (lo, hi) = v.spec.bounds;
+                Some(m.transform_point3((lo + hi) * 0.5))
+            })
+            .min_by(|a, b| a.distance(here).total_cmp(&b.distance(here)))
+    });
+    let Some(at) = vehicle.or(barrel).or_else(|| {
+        game.scene
+            .explosives
+            .iter()
+            .map(|e| e.at)
+            .min_by(|a, b| a.distance(here).total_cmp(&b.distance(here)))
+    }) else {
         eprintln!("blast: no explosives");
         return Ok(());
     };
@@ -7077,12 +7122,79 @@ fn blast_for_screenshot(
         },
         ..Intent::default()
     };
-    game.step(aim(false, Some(Weapon::Rpg)), tick);
-    for _ in 0..30 {
-        aim_at(game, at);
-        game.step(aim(false, None), tick);
+    if options.blast_rifle {
+        // The rifle, held on it for up to 6 s, logging its health.
+        let hp = |game: &Game| {
+            game.scene
+                .explosives
+                .iter()
+                .find(|e| e.at == at)
+                .map(|e| (e.hp, e.gone))
+        };
+        game.step(aim(false, Some(Weapon::Rifle)), tick);
+        for _ in 0..30 {
+            aim_at(game, at);
+            game.step(aim(false, None), tick);
+        }
+        eprintln!("blast: rifle on it, health {:?}", hp(game));
+        let before = game.combat.fired.rifle;
+        for i in 0..360 {
+            aim_at(game, at);
+            game.step(aim(true, None), tick);
+            if i % 60 == 59 {
+                eprintln!(
+                    "blast: {} rounds, health {:?}",
+                    game.combat.fired.rifle - before,
+                    hp(game)
+                );
+            }
+            if hp(game).is_some_and(|h| h.1) {
+                break;
+            }
+        }
+    } else if options.vehicle.is_some() {
+        // Rockets at the vehicle until it is down to 80 health (six at
+        // most), logging its health and its parts' effects after each.
+        let seen = |game: &Game| {
+            let w = game.scene.world.as_ref()?;
+            game.scene.vehicles.iter().find_map(|v| {
+                let m = w.physics.vehicle_transform(v.id?)?;
+                let (lo, hi) = v.spec.bounds;
+                (m.transform_point3((lo + hi) * 0.5).distance(at) < 0.5).then(|| {
+                    let fx = v
+                        .parts
+                        .as_ref()
+                        .zip(v.spec.damage.as_deref())
+                        .map_or(0, |(p, dm)| p.emitters(dm).len());
+                    (v.health(), fx)
+                })
+            })
+        };
+        game.step(aim(false, Some(Weapon::Rpg)), tick);
+        for k in 0..6 {
+            for _ in 0..30 {
+                aim_at(game, at);
+                game.step(aim(false, None), tick);
+            }
+            game.step(aim(true, None), tick);
+            for _ in 0..180 {
+                aim_at(game, at);
+                game.step(aim(false, None), tick);
+            }
+            let s = seen(game);
+            eprintln!("blast: rocket {}: (health, part effects) {s:?}", k + 1);
+            if s.is_none_or(|s| s.0 <= 80.0) {
+                break;
+            }
+        }
+    } else {
+        game.step(aim(false, Some(Weapon::Rpg)), tick);
+        for _ in 0..30 {
+            aim_at(game, at);
+            game.step(aim(false, None), tick);
+        }
+        game.step(aim(true, None), tick);
     }
-    game.step(aim(true, None), tick);
     eprintln!(
         "blast: rocket from {:.1?} towards {:.1?}",
         game.combat.last_launch.map(|l| l.0),
@@ -7125,6 +7237,28 @@ fn blast_for_screenshot(
             "blast: {} particles alive at the picture, {:.2} m from the blast on average",
             p.live(),
             p.mean_distance(at)
+        );
+    }
+    // The vehicles it was at: their health and what their parts run.
+    let world = game.scene.world.as_ref();
+    for v in &game.scene.vehicles {
+        let Some(c) = world
+            .zip(v.id)
+            .and_then(|(w, id)| w.physics.vehicle_transform(id))
+            .map(|m| m.w_axis.truncate())
+            .filter(|c| c.distance(at) < 8.0)
+        else {
+            continue;
+        };
+        let fx = v
+            .parts
+            .as_ref()
+            .zip(v.spec.damage.as_deref())
+            .map_or(0, |(p, dm)| p.emitters(dm).len());
+        eprintln!(
+            "blast: the {} at {c:.1}: health {:.0}, {fx} part effects running",
+            v.spec.label,
+            v.health()
         );
     }
     Ok(())
