@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use m2_engine::atmosphere::AtmosphereMix;
+use m2_engine::atmosphere::{AtmosphereMix, ScriptAtmosphere};
 use m2_engine::durability::{BlastPush, CrashHow, Explosion};
 use m2_engine::physics::FLOAT_DEPTH;
 use m2_engine::{
@@ -161,6 +161,9 @@ pub struct Game {
     spray_wait: f32,
     /// The light of the atmosphere region the player is in.
     pub sky: AtmosphereMix,
+    /// Lights blasts' scripts set, seconds before each comes in
+    /// ([`m2_game::atmosphere_script`]).
+    script_lights: Vec<(f32, ScriptAtmosphere)>,
     /// Props that move on their own.
     moving: MovingProps,
     /// Her support: the items she holds and the call under way; her
@@ -387,6 +390,7 @@ impl Game {
             throttle: 0.0,
             spray_wait: 0.0,
             sky: AtmosphereMix::default(),
+            script_lights: Vec::new(),
             moving: MovingProps::default(),
             support: Support::default(),
             earned: Vec::new(),
@@ -1807,6 +1811,9 @@ impl Game {
                     self.combat.bomb(&mut field, at);
                     let blasts = bomb_blasts(&world.index.template_db, at);
                     self.combat.last_push = blasts.first().map(|b| b.push);
+                    if let Some(light) = blast_light(&world.index.template_db, BOMB_BLAST) {
+                        self.script_lights.push(light);
+                    }
                     let pushes: Vec<BlastPush> =
                         blasts.first().map(|b| b.push).into_iter().collect();
                     blast_loose(world, &mut scene.props, &pushes, true);
@@ -2376,6 +2383,17 @@ impl Game {
             return;
         };
         let regions = &world.index.atmosphere_regions;
+        for (left, light) in &mut self.script_lights {
+            *left -= dt;
+            if *left <= 0.0 {
+                let unused = self.sky.script(default, light);
+                eprintln!(
+                    "atmosphere: a blast's script sets the light (restored over {:?} s; not drawn: {unused:?})",
+                    light.restore
+                );
+            }
+        }
+        self.script_lights.retain(|(left, _)| *left > 0.0);
         if let Some(now) = self.sky.update(default, regions, focus, dt) {
             match now {
                 Some((r, s)) => {
@@ -2485,6 +2503,11 @@ impl Game {
             satellite_look(&mut view.lighting);
         }
         self.picture.apply(&mut view.lighting);
+        // The effects' lights (a blast's flash, a fire), the nearest first.
+        if let Some(p) = &self.scene.particles {
+            let eye = view.view.inverse().w_axis.truncate();
+            view.lighting.point_lights = p.point_lights(eye);
+        }
         view
     }
 }
@@ -3276,6 +3299,24 @@ const ROCKET_BLASTS: [&str; 4] = [
 ];
 const BOMB_BLAST: &str = "Explosion (Airstike Bomb)";
 const BOMB_FRAG: &str = "Explosion (Airstrike Frag)";
+
+/// What the script of the blast `name` does to the light, if it does
+/// ([`m2_game::atmosphere_script`]): seconds until, and the light.
+fn blast_light(db: &Templates, name: &str) -> Option<(f32, ScriptAtmosphere)> {
+    // `M2_BLAST_LIGHT=off` leaves the light alone (to measure against).
+    if std::env::var("M2_BLAST_LIGHT").is_ok_and(|v| v == "off") {
+        return None;
+    }
+    let bytes = db.blast_scripts.get(&db.id(name)?)?;
+    let chunk = m2_assets::lua::Chunk::from_asset(bytes).ok()?;
+    match m2_game::atmosphere_script::activation_light(&chunk) {
+        Ok(light) => light,
+        Err(e) => {
+            eprintln!("atmosphere: {name}'s script did not run: {e}");
+            None
+        }
+    }
+}
 
 /// The first of `names` the template database gives a blast.
 fn explosion(db: &Templates, names: &[&str]) -> Option<Explosion> {

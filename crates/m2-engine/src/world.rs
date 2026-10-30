@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 
 use m2_assets::layer::{LAYER_TYPE, Placement, TEMPLATE_DB_TYPE};
+use m2_assets::lua::SCRIPT_TYPE;
 use m2_assets::model::MODEL_TYPE;
 use m2_assets::model::Material;
 use m2_assets::path::PATH_TYPE;
@@ -275,6 +276,11 @@ pub struct Templates {
     pub names: HashMap<u32, String>,
     /// How the templates that say so handle and fight, by id.
     pub tuning: HashMap<u32, VehicleTuning>,
+    /// The light templates (an explosion's flash, a fire's glow),
+    /// by id ([`crate::lights`]).
+    pub lights: HashMap<u32, crate::lights::LightSpec>,
+    /// What each template sets off with it, and where ([`crate::lights::links`]).
+    pub links: HashMap<u32, Vec<crate::lights::Link>>,
     /// The templates whose props move on their own, by id.
     pub motions: HashMap<u32, PropMotion>,
     /// What templates leave when destroyed, and what pickups give.
@@ -287,6 +293,10 @@ pub struct Templates {
     pub durability: HashMap<u32, crate::durability::Durability>,
     /// The blasts of those with `Explosive`, by id.
     pub explosions: HashMap<u32, crate::durability::Explosion>,
+    /// The compiled script (`ObjectScript`) of those blasts that run one,
+    /// by id, as the archive holds it (the satellite bomb's sets the
+    /// light: `m2_game::atmosphere_script`).
+    pub blast_scripts: HashMap<u32, Vec<u8>>,
     /// How the templates that can be hijacked are, by id.
     pub hijack: HashMap<u32, Vec<crate::hijack::HijackEntrance>>,
     /// The radio templates' playlist and reach, by id
@@ -936,6 +946,8 @@ impl Templates {
                 .map(|(id, name)| (id, name.to_owned()))
                 .collect(),
             tuning: crate::tuning::read(&db, damage.as_ref()),
+            lights: crate::lights::read(&db),
+            links: crate::lights::links(&db),
             part_healths: crate::vehicle_damage::read(&db),
             leavings: crate::pickup::read(&db),
             ruined: ruined(&db),
@@ -971,7 +983,15 @@ impl Templates {
             arms: crate::weapons::read(&db),
             localized: localized_names(&db),
             damage,
+            blast_scripts: HashMap::new(),
         };
+        for (id, script) in db.hashes("ObjectScript") {
+            if templates.explosions.contains_key(&id)
+                && let Ok(chunk) = source.asset(script, SCRIPT_TYPE)
+            {
+                templates.blast_scripts.insert(id, chunk);
+            }
+        }
         crate::standin::add_supply_drops(&mut templates);
         crate::standin::arm_the_osprey(&mut templates);
         (templates, atmosphere)
