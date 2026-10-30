@@ -1506,6 +1506,13 @@ impl Game {
                         p,
                         walked,
                     );
+                    // "Take Ammo" is the weapon's context action as
+                    // "Equip" is: the 360 posts `PickupWeapon` (8768c3b1)
+                    // to her for either before the pickup is settled
+                    // (8228FE58), so she picks it up off the ground too.
+                    if near.is_some_and(|n| n.0 == Offer::TakeAmmo) {
+                        player.start_pickup();
+                    }
                 }
                 // A placed one's prop comes down with it.
                 if self.placed.is_pickup(from) {
