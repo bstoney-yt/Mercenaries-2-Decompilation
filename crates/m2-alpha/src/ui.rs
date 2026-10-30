@@ -80,6 +80,8 @@ pub struct HudInfo {
     pub hero: crate::hero::Hero,
     /// The markers over the pickups lying near her.
     pub pickups: Vec<PickupMarker>,
+    /// The markers over the vehicles' entrances near her, on foot.
+    pub entrance_markers: Vec<crate::entrance_marker::EntranceMarker>,
 }
 
 /// What the pause menu asked for.
@@ -605,13 +607,17 @@ fn reticle(info: &HudInfo) -> Option<[f32; 2]> {
 /// The mission's markers, for the game HUD's minimap.
 /// The textures the pickups' markers draw: the backing, and each icon.
 fn marker_textures(info: &HudInfo) -> Vec<u32> {
-    if info.pickups.is_empty() {
-        return Vec::new();
+    let mut out = Vec::new();
+    if !info.pickups.is_empty() {
+        out.push(m2_assets::name_hash(crate::pickup_marker::BACKGROUND));
     }
-    let mut out = vec![m2_assets::name_hash(crate::pickup_marker::BACKGROUND)];
-    for p in &info.pickups {
-        if !out.contains(&p.icon) {
-            out.push(p.icon);
+    let entrances = info
+        .entrance_markers
+        .iter()
+        .map(|m| m2_assets::name_hash(crate::entrance_marker::texture(m.role)));
+    for icon in info.pickups.iter().map(|p| p.icon).chain(entrances) {
+        if !out.contains(&icon) {
+            out.push(icon);
         }
     }
     out
@@ -713,6 +719,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
                 .as_ref()
                 .map_or_else(Default::default, |m| m.pickup_markers);
             pickup_markers(&painter, screen, vp, &info.pickups, style, game);
+            entrance_markers(&painter, screen, vp, &info.entrance_markers, game);
         }
         if let (Some(m), Some(vp)) = (&info.mission, info.view_proj) {
             let here = info.game.as_ref().and_then(|s| s.position).map(Vec3::from);
@@ -1530,6 +1537,45 @@ fn pickup_markers(
         let colour = Color32::from_white_alpha((fade * 255.0).round() as u8);
         game.paint_texture_hash(painter, backing, under, colour);
         game.paint_texture_hash(painter, p.icon, over, colour);
+    }
+}
+
+/// The engine's markers over vehicles' entrances
+/// ([`crate::entrance_marker`]): each within its reach of the camera, its
+/// seat's icon white at the pickups' fade, sized as on the 360's 720
+/// lines and scaled to the window's; one off the screen isn't drawn.
+fn entrance_markers(
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    view_proj: Mat4,
+    markers: &[crate::entrance_marker::EntranceMarker],
+    game: &GameHud,
+) {
+    use crate::entrance_marker::{REACH, square, texture};
+    let Some(eye) = camera_position(view_proj) else {
+        return;
+    };
+    let unit = screen.height() / 720.0;
+    for m in markers {
+        let fade = PickupMarker {
+            at: m.at,
+            icon: 0,
+            flat: false,
+        }
+        .alpha_from(eye, REACH);
+        if fade <= 0.0 {
+            continue;
+        }
+        let Some(at) = project(view_proj, m.at, screen).filter(|at| screen.contains(*at)) else {
+            continue;
+        };
+        let colour = Color32::from_white_alpha((fade * 255.0).round() as u8);
+        game.paint_texture_hash(
+            painter,
+            m2_assets::name_hash(texture(m.role)),
+            square(at, unit),
+            colour,
+        );
     }
 }
 
