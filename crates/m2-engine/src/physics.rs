@@ -31,7 +31,7 @@ use rapier3d::control::{
     KinematicCharacterController, WheelTuning,
 };
 
-use crate::tuning::{BikeTuning, BoatTuning, Brakes, FlightTuning, Springs};
+use crate::tuning::{BikeTuning, BoatTuning, FlightTuning, Springs, Tyres};
 use crate::vehicle::VehicleSpec;
 use rapier3d::prelude as r;
 
@@ -928,7 +928,7 @@ const MAX_STEER: f32 = 0.6;
 /// A tank's braking with the throttle against the motion, its handbrake
 /// (on the wheels that don't steer), rolling with no throttle, and
 /// holding still, m/s² (as if all wheels braked so). Invented: a wheeled
-/// vehicle's tyres slow it as its template's [`Brakes`] say.
+/// vehicle's tyres slow it as its template's [`Tyres`] say.
 const SERVICE_BRAKE: f32 = 8.0;
 /// The tyres' friction coefficient, for a vehicle whose template gives
 /// no `FrontWheelFrictionSide` and `RearWheelFrictionSide`. Invented.
@@ -1058,8 +1058,12 @@ struct VehicleBody {
     /// How far each wheel's spring's top sits above where the model has
     /// the wheel's centre, metres, in wheel order.
     tops: Vec<f32>,
-    /// How its tyres slow it along ([`Brakes`]; a tank's are invented).
-    brakes: Option<Brakes>,
+    /// How its tyres hold it ([`Tyres`]; a tank's are Rapier's, invented).
+    tyres: Option<Tyres>,
+    /// What its driver asks of its front and back axles' tyres now
+    /// ([`Physics::drive`]), which they push it with each step
+    /// ([`push_axles`]).
+    axles: [Axle; 2],
     /// Its weight on the ground, of its plain weight ([`Springs`]'s
     /// `gravity_factor`; 1 for a tank).
     gravity_factor: f32,
@@ -1104,6 +1108,35 @@ struct Rotorcraft {
     controls: VehicleControls,
     /// Up (1) or down (-1).
     lift: f32,
+}
+
+/// One axle's tyres as its driver works them ([`Tyres`]): its coefficient
+/// along, m/s², and across, per second, as the 360 code works them out,
+/// and the push its engine gives each of its wheels on the ground,
+/// newtons.
+#[derive(Clone, Copy, Debug, Default)]
+struct Axle {
+    along: f32,
+    across: f32,
+    drive: f32,
+    /// Parked: it holds still, up to its coefficients (along, and across
+    /// as though sliding at 1 m/s), as a tank does (invented).
+    hold: bool,
+}
+
+impl Axle {
+    /// Front and back, standing with nobody at the wheel.
+    fn standing(tyres: &Option<Tyres>) -> [Axle; 2] {
+        let axle = |front| {
+            tyres.map_or(Axle::default(), |t| Axle {
+                along: t.slowing(front, 0.0, 0.0, 0.0, 0.0, 0.0),
+                across: t.grip(front, 0.0, 0.0, 0.0, 0.0),
+                drive: 0.0,
+                hold: false,
+            })
+        };
+        [axle(true), axle(false)]
+    }
 }
 
 /// A motorbike's balance: its template's (else [`BIKE`]), and its body's
@@ -1239,6 +1272,89 @@ fn balance(
         w += axis * (to - spin);
     }
     w
+}
+
+/// Pushes a wheeled vehicle along and across with each of its axles as
+/// the 360 code does ([`Tyres`]; from the 360 code, at 0x8219C118 and
+/// 0x821A08D8): at the mean, over its wheels on the ground, of a point
+/// [`Tyres::sway`] of the way from each spring's top to its contact, by
+/// mass x step x (its coefficient along x the velocity there along its
+/// wheels clamped to +-1 m/s, along them, plus its coefficient across x
+/// the level velocity across them, across them, level), both against the
+/// motion and scaled by the share of the vehicle's wheels on the ground
+/// and of the axle's. Its engine's pull (the alpha's, along its wheels,
+/// for each wheel on the ground) is pushed there too. The front axle's
+/// wheels point as they steer.
+fn push_axles(v: &VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
+    let Some(tyres) = v.tyres else {
+        return;
+    };
+    let Some(body) = bodies.get_mut(v.controller.chassis) else {
+        return;
+    };
+    let wheels = v.controller.wheels();
+    let down = wheels
+        .iter()
+        .filter(|w| w.raycast_info().is_in_contact)
+        .count();
+    if down == 0 {
+        return;
+    }
+    let share = down as f32 / wheels.len() as f32;
+    let turn = Quat::from_array(body.position().rotation.to_array());
+    let (side, ahead, up) = (turn * Vec3::X, turn * Vec3::Z, turn * Vec3::Y);
+    let fast = (vec3(body.linvel()).with_y(0.0).length() / v.top.max(0.1)).min(1.0);
+    let sway = tyres.sway(fast, side.y);
+    for (axle, front) in v.axles.iter().zip([true, false]) {
+        let on: Vec<_> = wheels
+            .iter()
+            .zip(&v.steers)
+            .filter(|(_, s)| **s == front)
+            .map(|(w, _)| w)
+            .collect();
+        let grounded: Vec<_> = on
+            .iter()
+            .filter(|w| w.raycast_info().is_in_contact)
+            .collect();
+        if grounded.is_empty() {
+            continue;
+        }
+        let at = grounded
+            .iter()
+            .map(|w| {
+                let ray = w.raycast_info();
+                let top = vec3(ray.hard_point_ws);
+                top + (vec3(ray.contact_point_ws) - top) * sway
+            })
+            .sum::<Vec3>()
+            / grounded.len() as f32;
+        let steered = if front {
+            Quat::from_axis_angle(up, v.steering)
+        } else {
+            Quat::IDENTITY
+        };
+        let (along, across) = (steered * ahead, steered * side);
+        let level = across.with_y(0.0);
+        let k = share * grounded.len() as f32 / on.len() as f32;
+        let velocity = vec3(body.velocity_at_point(vector(at)));
+        let (slow, slide) = if axle.hold {
+            // What stops it there (its axles sharing its mass), up to
+            // its coefficients.
+            let stop = |v: f32, most: f32| (v / (2.0 * dt)).clamp(-most, most);
+            (
+                stop(velocity.dot(along), axle.along * k),
+                stop(velocity.dot(level), axle.across * k),
+            )
+        } else {
+            (
+                axle.along * k * velocity.dot(along).clamp(-1.0, 1.0),
+                axle.across * k * velocity.dot(level),
+            )
+        };
+        let push = -(along * slow + level * slide) * v.mass * dt
+            + along * axle.drive * grounded.len() as f32 * dt;
+        body.apply_impulse_at_point(vector(push), vector(at), true);
+    }
 }
 
 /// Queries that see everything but ragdolls and rubble.
@@ -1449,6 +1565,9 @@ impl Physics {
                 filter,
             );
             v.controller.update_vehicle(dt, queries);
+            if !v.wrecked {
+                push_axles(v, &mut w.bodies, dt);
+            }
             // More than half its wheels down, it is pulled down by its
             // template's `GravityFactor` less one of its weight more
             // (from the 360 code, at 0x8219EE14; the global it multiplies
@@ -1882,10 +2001,10 @@ impl Physics {
         let mut controller = DynamicRayCastVehicleController::new(body);
         controller.index_up_axis = 1;
         controller.index_forward_axis = 2;
-        // Each axle's tyres grip as its template's side friction says (the
-        // steering axle's as the front's).
-        let handling = spec.tuning.handling.filter(|_| !spec.tracked);
-        let grip = |front: bool| handling.map_or(GRIP, |h| if front { h.grip.0 } else { h.grip.1 });
+        // A tank's tracks grip as Rapier's tyres, by an invented friction;
+        // a wheeled vehicle's give none there: its axles push it as the
+        // 360 code's do ([`Tyres`], `push_axles`).
+        let grip = if spec.tracked { GRIP } else { 0.0 };
         // A wheeled vehicle's springs as the 360 code builds them from its
         // template ([`Springs`], its defaults without one): each hangs
         // from its squeeze above the model's wheel, as long as all its
@@ -1923,7 +2042,7 @@ impl Physics {
                 suspension_damping: stretched,
                 max_suspension_travel: travel,
                 side_friction_stiffness: 1.0,
-                friction_slip: grip(w.steers),
+                friction_slip: grip,
                 max_suspension_force: spec.mass * 40.0,
             };
             controller.add_wheel(
@@ -1965,13 +2084,15 @@ impl Physics {
                 lift: 0.0,
             });
         let top = if boat { BOAT_TOP } else { TOP_SPEED };
+        let tyres = (!spec.tracked).then(|| spec.tuning.tyres.unwrap_or(Tyres::DEFAULT));
         let id = VehicleId(self.vehicles.len());
         self.vehicles.push(Some(VehicleBody {
             controller,
             mass: spec.mass,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
             tops,
-            brakes: (!spec.tracked).then(|| spec.tuning.brakes.unwrap_or(Brakes::DEFAULT)),
+            tyres,
+            axles: Axle::standing(&tyres),
             gravity_factor,
             tracked: spec.tracked,
             bike: spec.is_bike().then(|| Bike {
@@ -2042,7 +2163,14 @@ impl Physics {
         // this many m/s² over the whole vehicle.
         let slowing = |decel: f32| v.mass * decel * dt / wheels;
         let throttle = controls.throttle.clamp(-1.0, 1.0);
-        let against = speed.abs() > 0.5 && throttle * speed < 0.0;
+        // Throttle against the motion brakes. A wheeled vehicle's brake is
+        // the reverse pedal while it rolls ahead: the 360 code takes throttle
+        // and brake as two inputs (0x2C, 0x30), so the throttle while it
+        // rolls back is its engine (inferred: which pad input feeds which
+        // isn't traced). As a brake it would hold it creeping back down a
+        // hill, its tyres slowing it as little as it rolls slowly.
+        let against =
+            speed.abs() > 0.5 && throttle * speed < 0.0 && (v.tyres.is_none() || throttle < 0.0);
         v.braking = !controls.parked && (controls.brake || against);
         // Its gearbox changes up and down as its template's shift speeds
         // say, rolling forwards, and while its clutch is out its engine
@@ -2083,24 +2211,15 @@ impl Physics {
         let uphill = (nose * throttle.signum()).clamp(0.0, most.sin());
         // A tank's braking against the motion (invented).
         let service = |_front: bool| slowing(SERVICE_BRAKE * throttle.abs());
-        // A wheeled vehicle's tyres slow it as the 360 code has them
-        // ([`Brakes`]): each axle by its coefficient, scaled by the share
-        // of its wheels on the ground, over the axle's wheels (a wheel's
-        // brake here is the most it may take off a step, so an axle's
-        // grounded wheels take off its whole share between them).
-        // Throttle against the motion is the brake pressed that hard. A
-        // parked one (nobody at the wheel) still holds as a tank does:
-        // what the 360 does with an empty car isn't traced, and on its
-        // handbrake (3 m/s² by the defaults) it would slide down a hill.
-        let tyres = v.brakes.filter(|_| !controls.parked).map(|b| {
-            let all = v.controller.wheels();
-            let down = all
-                .iter()
-                .filter(|w| w.raycast_info().is_in_contact)
-                .count();
-            let share = down as f32 / all.len().max(1) as f32;
-            let on_axle =
-                |front: bool| v.steers.iter().filter(|&&s| s == front).count().max(1) as f32;
+        // A wheeled vehicle's axles' coefficients along and across as the
+        // 360 code works them out ([`Tyres`]), which [`push_axles`] pushes
+        // it with. Throttle against the motion is the brake pressed that
+        // hard. A parked one (nobody at the wheel) still holds as a tank
+        // does: what the 360 does with an empty car isn't traced, and on
+        // its handbrake (3 m/s² by the defaults) it would slide down a
+        // hill.
+        let fast = (speed.abs() / v.top.max(0.1)).min(1.0);
+        let tyres = v.tyres.map(|t| {
             let (open, pressed) = if against {
                 (0.0, throttle.abs())
             } else {
@@ -2108,11 +2227,33 @@ impl Physics {
             };
             let held = if controls.brake { 1.0 } else { 0.0 };
             let steer = controls.steer;
-            let impulse = |front: bool| {
-                let c = b.slowing(front, speed, open, pressed, held, steer);
-                v.mass * c * share * dt / on_axle(front)
+            let share = |front: bool| {
+                let on = v.steers.iter().filter(|&&s| s == front).count();
+                on as f32 / v.steers.len().max(1) as f32
             };
-            (impulse(true), impulse(false))
+            let axle = |front: bool| {
+                if controls.parked {
+                    let hard = if speed.abs() > PARKED_FAST {
+                        HOLD
+                    } else {
+                        HANDBRAKE
+                    };
+                    Axle {
+                        along: hard * share(front),
+                        across: t.grip(front, fast, 0.0, 0.0, 0.0),
+                        drive: 0.0,
+                        hold: true,
+                    }
+                } else {
+                    Axle {
+                        along: t.slowing(front, speed, open, pressed, held, steer),
+                        across: t.grip(front, fast, pressed, held, steer),
+                        drive: 0.0,
+                        hold: false,
+                    }
+                }
+            };
+            [axle(true), axle(false)]
         });
         let (force, brake) = if controls.parked {
             let hard = if speed.abs() > PARKED_FAST {
@@ -2153,12 +2294,20 @@ impl Physics {
         // Only the front axle steers: steering every wheel the same way
         // slides the vehicle sideways instead of turning it. The handbrake
         // locks the rest, so the back can slide out.
+        // A wheeled vehicle's axles push it with its engine's pull too, not
+        // Rapier's tyres (which give it no grip).
+        if let Some(mut axles) = tyres {
+            for a in &mut axles {
+                a.drive = force;
+            }
+            v.axles = axles;
+        }
         for (i, w) in v.controller.wheels_mut().iter_mut().enumerate() {
             let front = v.steers.get(i).copied().unwrap_or(false);
-            w.engine_force = force;
+            w.engine_force = if tyres.is_some() { 0.0 } else { force };
             w.steering = if front { steer } else { 0.0 };
-            w.brake = if let Some((ahead, behind)) = tyres {
-                if front { ahead } else { behind }
+            w.brake = if tyres.is_some() {
+                0.0
             } else if controls.brake && !front {
                 slowing(HANDBRAKE)
             } else if brake < 0.0 {
@@ -2537,7 +2686,10 @@ impl Physics {
         self.vehicles
             .get(id.0)
             .and_then(Option::as_ref)
-            .is_some_and(|v| v.controller.wheels().iter().any(|w| w.engine_force != 0.0))
+            .is_some_and(|v| {
+                v.axles.iter().any(|a| a.drive != 0.0)
+                    || v.controller.wheels().iter().any(|w| w.engine_force != 0.0)
+            })
     }
 
     /// A vehicle's velocity, m/s.
@@ -3562,11 +3714,11 @@ mod tests {
             "turned left"
         );
         assert!(m.transform_vector3(Vec3::X).y < -0.1, "leans left");
-        // Up to 45 degrees over: standing at its model's height on its
-        // springs it leans 40 here (the island's bikes up to 45 at full
-        // lock, biketest).
+        // About 45 degrees over at most (the island's bikes up to 45 at
+        // full lock, biketest; 46 here since the 360's tyres push its
+        // axles low, round 3 of the driving model).
         let up = m.transform_vector3(Vec3::Y).y;
-        assert!(up > 0.7, "still up: {up}");
+        assert!(up > 0.68, "still up: {up}");
     }
 
     /// The Offroad Motorcycle (AL)'s `Bike*` fields, the weakest.
@@ -3626,7 +3778,9 @@ mod tests {
         let at = m.transform_point3(Vec3::Y);
         p.push_vehicle(id, m.transform_vector3(Vec3::X) * 300.0 * 1.5, at);
         let mut most = 1.0f32;
-        for _ in 0..240 {
+        // Slower since the 360's tyres push its axles low (round 3 of the
+        // driving model; its own balance, 0x8219D800, isn't traced).
+        for _ in 0..420 {
             p.drive(id, ahead);
             p.step(DT);
             most = most.min(up(&p).y);
@@ -3634,7 +3788,7 @@ mod tests {
         assert!(most < 0.995, "the shove rolls it ({most})");
         assert!(most > 0.5, "without tipping it over ({most})");
         let end = up(&p).y;
-        assert!(end > 0.9986, "back up within 3 degrees in 4 s ({end})");
+        assert!(end > 0.9986, "back up within 3 degrees in 7 s ({end})");
     }
 
     #[test]
@@ -4027,9 +4181,9 @@ mod tests {
         // An M151's brakes: by the defaults (2 an axle) one rolled back at
         // the start can't stop on a 20 degree hill at its gravity factor.
         let mut spec = car();
-        spec.tuning.brakes = Some(Brakes {
+        spec.tuning.tyres = Some(Tyres {
             brake: (7.0, 6.0),
-            ..Brakes::DEFAULT
+            ..Tyres::DEFAULT
         });
         let ground = |at: Vec3| {
             p.cast_ray(Vec3::new(at.x, 80.0, at.z), Vec3::NEG_Y, 200.0)
@@ -4468,13 +4622,12 @@ mod tests {
     fn brakes_and_lock_come_from_the_template() {
         let slowing = |brake: (f32, f32), lock: f32| {
             let mut spec = car();
-            spec.tuning.brakes = Some(Brakes {
+            spec.tuning.tyres = Some(Tyres {
                 brake,
-                ..Brakes::DEFAULT
+                ..Tyres::DEFAULT
             });
             spec.tuning.handling = Some(crate::tuning::Handling {
                 steer_lock: lock,
-                grip: (1.5, 1.5),
                 steer_speed: 100.0,
                 low_speed: 0.0,
                 low_steer_speed: 0.0,
@@ -4536,7 +4689,6 @@ mod tests {
         let mut spec = car();
         spec.tuning.handling = Some(crate::tuning::Handling {
             steer_lock: 0.7,
-            grip: (1.5, 1.5),
             steer_speed: 0.6,
             low_speed: 35.0 / 3.6,
             low_steer_speed: 0.9,
@@ -4621,6 +4773,45 @@ mod tests {
                 "{k}: {y}"
             );
         }
+    }
+
+    // Sliding sideways, its tyres damp the slide as the 360 code's do: each
+    // axle by its sideways grip a second, so with 1.5 on both it slows as
+    // exp(-3 t), with no limit on how hard; on the handbrake (its
+    // `EmergencyBrake` 0.2) the axles keep 0.33 + 0.67 x 0.2 of it.
+    #[test]
+    fn its_tyres_damp_a_sideways_slide_as_the_360s_do() {
+        let slide = |handbrake: bool| {
+            let mut spec = car();
+            spec.tuning.tyres = Some(Tyres {
+                emergency: (0.2, 0.2),
+                ..Tyres::DEFAULT
+            });
+            let mut p = Physics::new();
+            floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
+            p.step(DT);
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, -400.0), 0.0);
+            let still = VehicleControls {
+                brake: handbrake,
+                ..Default::default()
+            };
+            for _ in 0..90 {
+                p.drive(id, still);
+                p.step(DT);
+            }
+            p.set_vehicle_velocity(id, Vec3::X * 4.0);
+            for _ in 0..15 {
+                p.drive(id, still);
+                p.step(DT);
+            }
+            p.vehicle_velocity(id).x
+        };
+        let gripped = slide(false);
+        let want = 4.0 * (-3.0f32 * 0.25).exp();
+        assert!((gripped - want).abs() < 0.15 * want, "{gripped} {want}");
+        let held = slide(true);
+        let want = 4.0 * (-3.0f32 * 0.25 * (0.33 + 0.67 * 0.2)).exp();
+        assert!((held - want).abs() < 0.15 * want, "{held} {want}");
     }
 
     // Its brake lamps glow while it is driven against the way it rolls or
