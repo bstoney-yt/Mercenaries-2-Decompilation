@@ -2910,10 +2910,12 @@ fn gates_for_screenshot(
             let first = t == 0;
             let tag = if alone { "-alone" } else { "" };
             if first {
-                // Burning where its break-up says, as in play.
-                for at in game.scene.props.breakup_points(gate) {
-                    game.combat.blaze(&world.physics, at);
-                }
+                // What its `CollapseState` starts, as in play.
+                let shows = game
+                    .scene
+                    .props
+                    .state_effects(gate, m2_engine::StateFx::COLLAPSE);
+                game.combat.state_shows(shows);
                 for (parts, name) in [
                     (props::Parts::Rest, "rest"),
                     (props::Parts::Pieces, "pieces"),

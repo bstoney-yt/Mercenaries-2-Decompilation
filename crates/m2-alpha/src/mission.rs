@@ -4971,17 +4971,15 @@ fn break_props(game: &mut Game, mission: &Mission) {
     let (mut fires, mut falling) = (Vec::new(), Vec::new());
     for e in dead {
         scene.props.wreck(&mut world.physics, e, blast);
-        fires.extend(scene.props.breakup_points(e));
+        fires.extend(scene.props.state_effects(e, m2_engine::StateFx::COLLAPSE));
         if scene.props.broke_apart(e) {
             falling.extend(scene.props.centre(e));
         }
     }
     scene.props.hide(&mut world.physics, gone);
-    // What broke apart burns where its break-up says, and is heard
-    // coming down.
-    for at in fires {
-        game.combat.blaze(&world.physics, at);
-    }
+    // What broke apart shows what its model's `CollapseState` starts
+    // (its smoke, the collapse's bits), and is heard coming down.
+    game.combat.state_shows(fires);
     for at in falling {
         game.combat.collapse(at);
     }

@@ -89,7 +89,8 @@ impl ParticleDraw {
         source: &mut AssetSource<BufReader<File>>,
         templates: &Templates,
     ) -> anyhow::Result<Self> {
-        let lib = Library::load(source, templates.effects.clone()).context("effects")?;
+        let mut lib = Library::load(source, templates.effects.clone()).context("effects")?;
+        lib.runs = templates.effect_runs.clone();
         let atlas = source
             .texture(ATLAS_TEXTURE, 2048)
             .context("the particle atlas")?;
@@ -227,10 +228,13 @@ impl ParticleDraw {
                     r.effects, r.emitters, r.textured, r.glowing
                 );
             }
-            for h in effects {
-                match fx.hold {
-                    Some(key) => self.sim.hold(&self.lib, key, h, fx.at, 1.0),
-                    None => self.sim.spawn(&self.lib, h, fx.at, 0.0, 1.0),
+            for (k, h) in effects.into_iter().enumerate() {
+                // Each as long as its template says (`RedEffectComponent`).
+                let run = id.and_then(|id| self.lib.run(id, k));
+                match (fx.hold, run) {
+                    (Some(key), _) => self.sim.hold(&self.lib, key, h, fx.at, 1.0),
+                    (None, Some(run)) => self.sim.spawn_run(&self.lib, h, fx.at, run, 1.0),
+                    (None, None) => self.sim.spawn(&self.lib, h, fx.at, 0.0, 1.0),
                 };
             }
         }

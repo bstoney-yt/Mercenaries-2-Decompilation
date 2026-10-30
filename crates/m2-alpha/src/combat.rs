@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use m2_engine::durability::BurnDown;
 use m2_engine::tuning::DamageTable;
 use m2_engine::weapons::{Ammo, Blast, Feel, Flight, SoldierSpread, Throwable, WeaponSpec};
-use m2_engine::{GpuModel, Physics, Skeleton, StaticKey, VehicleId};
+use m2_engine::{GpuModel, Physics, Skeleton, StateFx, StaticKey, VehicleId};
 use m2_math::glam::{Mat4, Quat, Vec3};
 
 use crate::npc::People;
@@ -1165,8 +1165,6 @@ pub enum Effect {
     Smoke { at: Vec3, size: f32 },
     /// A fireball, growing.
     Fire { at: Vec3, size: f32 },
-    /// Thick black smoke, growing and rising further than [`Smoke`](Self::Smoke).
-    Soot { at: Vec3, size: f32 },
     /// Spray thrown off a boat's hull: a white puff flying `drift` metres
     /// over its life, growing and then gone.
     Spray { at: Vec3, drift: Vec3, size: f32 },
@@ -1432,18 +1430,11 @@ pub mod fx {
         "global_particle_firemediumsmoke_vehicle_box_flame",
         "global_particle_firemediumsmoke_smoke_vehicle",
     ];
-    /// A building's blaze.
-    pub const BLAZE: [&str; 2] = [
-        "global_particle_firelargesmoke",
-        "global_particle_firelargesmoke_smoke",
-    ];
     /// A barrel or a bomb's fire burning on.
     pub const FIRE: [&str; 2] = [
         "global_particle_firesmall",
         "global_particle_firesmall_smoke",
     ];
-    /// A building coming apart.
-    pub const COLLAPSE: &str = "fx_CollapseCoverDust";
     /// A supply crate broken open.
     pub const CRATE: &str = "global_particle_impact_wood";
 }
@@ -1535,6 +1526,9 @@ pub struct Combat {
     pub last_push: Option<m2_engine::durability::BlastPush>,
     /// Where blasts went off in the last step.
     pub went_off: Vec<Vec3>,
+    /// The island's explosives whose models enter a state this step, to
+    /// show what it starts: (placed object, state name hash).
+    pub explosive_states: Vec<(usize, u32)>,
     /// Blows and rounds that struck the world in the last step.
     pub struck: Vec<Strike>,
     /// Rounds she has picked up, for the HUD's counters.
@@ -1580,9 +1574,6 @@ pub struct Combat {
     /// seconds left, and the blast its template leaves (none: the old
     /// blast, [`Combat::explode`]).
     fuses: Vec<(Vec3, f32, Option<Blast>)>,
-    /// What a building's break-up left burning: where, seconds left,
-    /// seconds to the next flame.
-    blazes: Vec<(Vec3, f32, f32)>,
     /// Spent explosives burning: where, how big, seconds left, seconds to
     /// the next flame.
     fires: Vec<(Vec3, f32, f32, f32)>,
@@ -1800,6 +1791,7 @@ impl Default for Combat {
             last_blast: None,
             last_push: None,
             went_off: Vec::new(),
+            explosive_states: Vec::new(),
             struck: Vec::new(),
             picked: Picked::default(),
             second: Some(Weapon::Rpg),
@@ -1817,7 +1809,6 @@ impl Default for Combat {
             throwing_designator: false,
             last_launch: None,
             fuses: Vec::new(),
-            blazes: Vec::new(),
             fires: Vec::new(),
             launcher: Rifle::launcher(Weapon::Rpg),
             carbine: Rifle::default(),
@@ -1892,9 +1883,26 @@ pub struct Explosive {
     pub burning: Option<f32>,
     /// The blast it leaves (`SpawnOnDeath`'s `Explosive`).
     pub blast: Option<Blast>,
+    /// The health at which its part is damaged (`NodeHealth`'s, 440 of
+    /// the fuel tanks' 500; none where it is 0, as it only breaks), and
+    /// whether it has come to it.
+    pub damaged_at: Option<f32>,
+    pub damaged: bool,
 }
 
 impl Explosive {
+    /// Whether it has just come to its damaged health (and is not
+    /// destroyed): its model's `DamageState` is entered then.
+    fn newly_damaged(&mut self) -> bool {
+        match self.damaged_at {
+            Some(at) if !self.damaged && !self.gone && self.hp <= at => {
+                self.damaged = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Takes `hit` off its health: true if that destroyed it. Carried
     /// from above its [`BurnDown`] health to under it, it starts burning
     /// (0x822889F8).
@@ -1945,14 +1953,25 @@ const FUEL_TANKS: (&str, f32) = ("fueltanks", 5.0);
 const EXPLOSIVE_SIZE: f32 = 1.0;
 /// How far past its size a round can land and still hit it, metres.
 const HIT_SLACK: f32 = 0.5;
-/// How long what is left of one burns, seconds (wrecks burn 20 s and
-/// more in the Xbox 360 game).
-const BURN: f32 = 25.0;
-/// How long a building's break-up burns, seconds (invented: the videos'
-/// fires burn on past the 25 s they show).
-const BLAZE_TIME: f32 = 40.0;
-/// How far above the ground its flames' middle is, metres.
-const BLAZE_LIFT: f32 = 1.2;
+
+/// The blast template `t`'s objects leave on dying: the first of its
+/// `SpawnOnDeath`s that is an `Explosive`.
+pub fn left_blast(db: &m2_engine::Templates, t: u32) -> Option<Blast> {
+    let (spawn, e) = db
+        .leavings
+        .spawns
+        .get(&t)?
+        .iter()
+        .find_map(|s| db.explosions.get(s).map(|e| (*s, e)))?;
+    Some(Blast {
+        template: spawn,
+        radius: e.radius,
+        damage: e.damage,
+        min_damage: e.least,
+        max_force: e.force,
+        key: (e.kind != 0).then_some(e.kind),
+    })
+}
 
 /// The island's explosives: its placed objects whose templates leave a
 /// blast on dying and have a `Health` that something can wear down.
@@ -1968,12 +1987,7 @@ pub fn explosives(index: &m2_engine::WorldIndex) -> Vec<Explosive> {
                 .durability
                 .get(&t)
                 .filter(|d| !d.invincible && d.health > 0.0)?;
-            let (spawn, e) = db
-                .leavings
-                .spawns
-                .get(&t)?
-                .iter()
-                .find_map(|s| db.explosions.get(s).map(|e| (*s, e)))?;
+            let blast = left_blast(db, t)?;
             let size = db
                 .names
                 .get(&t)
@@ -1988,14 +2002,14 @@ pub fn explosives(index: &m2_engine::WorldIndex) -> Vec<Explosive> {
                 row: db.modifiers.get(&t).copied(),
                 burn: durability.burn,
                 burning: None,
-                blast: Some(Blast {
-                    template: spawn,
-                    radius: e.radius,
-                    damage: e.damage,
-                    min_damage: e.least,
-                    max_force: e.force,
-                    key: (e.kind != 0).then_some(e.kind),
-                }),
+                blast: Some(blast),
+                damaged_at: db
+                    .part_healths
+                    .get(&t)
+                    .and_then(|p| p.parts.first())
+                    .map(|p| p.damaged_at)
+                    .filter(|&h| h > 0.0),
+                damaged: false,
             })
         })
         .collect()
@@ -2589,14 +2603,17 @@ impl Combat {
         });
     }
 
-    /// A fire burning on the ground under `at` for [`BLAZE_TIME`] with
-    /// thick black smoke, where a building broke apart (a gate a bomb
-    /// brought down: the videos' fires either side, smoke for many
-    /// seconds; its points are high on it, and it goes down into the
-    /// ground as it breaks).
-    pub fn blaze(&mut self, physics: &Physics, at: Vec3) {
-        let at = ground_under(physics, at).map_or(at, |g| g + Vec3::Y * BLAZE_LIFT);
-        self.blazes.push((at, BLAZE_TIME, 0.0));
+    /// Shows `shows`, what a model's part state starts (effect template
+    /// name hash, where: [`crate::props::Props::state_effects`]), each
+    /// running as long as its template says.
+    pub fn state_shows(&mut self, shows: Vec<(u32, Vec3)>) {
+        for (effect, at) in shows {
+            self.game_fx.push(GameFx {
+                template: FxTemplate::Hash(effect),
+                at,
+                hold: None,
+            });
+        }
     }
 
     /// A building the bomb brought down comes apart at `at`: heard.
@@ -4181,28 +4198,42 @@ impl Combat {
     }
 
     /// `e` takes `hit`: destroyed, its blast goes off where it stood;
-    /// caught alight, it is seen burning until it burns out.
+    /// come to its damaged health, its model's `DamageState` starts what
+    /// it shows (the fuel tanks' fire jets).
     fn wear_explosive(&mut self, e: &mut Explosive, hit: f32) {
         let was_burning = e.burning.is_some();
         if e.take(hit) {
             self.go_off(e);
-        } else if !was_burning && let (Some(b), Some(_)) = (e.burn, e.burning) {
-            let left = b.seconds_to_burn_out(e.hp);
+            return;
+        }
+        if !was_burning && let (Some(b), Some(_)) = (e.burn, e.burning) {
             eprintln!(
-                "explosive {}: caught alight at {:.0} health, burns out in {left:.1} s",
-                e.object, e.hp
+                "explosive {}: caught alight at {:.0} health, burns out in {:.1} s",
+                e.object,
+                e.hp,
+                b.seconds_to_burn_out(e.hp)
             );
-            self.fires.push((e.at, e.size * 0.5, left, 0.0));
+        }
+        self.damage_state(e);
+    }
+
+    /// Enters `e`'s model's `DamageState` if it has just come to its
+    /// damaged health.
+    fn damage_state(&mut self, e: &mut Explosive) {
+        if e.newly_damaged() {
+            self.explosive_states.push((e.object, StateFx::DAMAGE));
         }
     }
 
     /// Destroyed explosive `e`'s blast goes off at once (next step: the
-    /// blast it leaves wears down those around it in turn), and what is
-    /// left of it burns.
+    /// blast it leaves wears down those around it in turn), and its
+    /// model's `CollapseState` starts what it shows (the huge explosion,
+    /// its smoke, the collapse's bits), each for as long as its template
+    /// says.
     fn go_off(&mut self, e: &Explosive) {
         eprintln!("explosive {}: destroyed, its blast goes off", e.object);
         self.fuses.push((e.at, 0.0, e.blast));
-        self.fires.push((e.at, e.size, BURN, 0.0));
+        self.explosive_states.push((e.object, StateFx::COLLAPSE));
     }
 
     /// Her right hand's grip in the world as she is posed now (the hand's
@@ -4295,14 +4326,13 @@ impl Combat {
         }
     }
 
-    /// Sets off something that blows up where it stood, at `at` (`size`
-    /// metres about its middle): a state layer's explosive barrel worn
-    /// down ([`crate::destruct::Destruction::set_off`]). It goes off at
-    /// once (`SpawnOnDeath` has no delay) and burns, as the island's
-    /// explosives do.
-    pub fn set_off(&mut self, at: Vec3, size: f32) {
-        self.fuses.push((at, 0.0, None));
-        self.fires.push((at, size, BURN, 0.0));
+    /// Sets off something that blows up where it stood, at `at`, with the
+    /// blast its template leaves (`blast`; none: the old blast): a state
+    /// layer's explosive barrel worn down
+    /// ([`crate::destruct::Destruction::set_off`]). It goes off at once
+    /// (`SpawnOnDeath` has no delay), as the island's explosives do.
+    pub fn set_off(&mut self, at: Vec3, blast: Option<Blast>) {
+        self.fuses.push((at, 0.0, blast));
     }
 
     /// A round of her rifle's landing at `at` on `key`, as a shot of hers
@@ -4452,6 +4482,10 @@ impl Combat {
             if f.explosives[i].burn_on(dt) {
                 let e = f.explosives[i];
                 self.go_off(&e);
+            } else {
+                let mut e = f.explosives[i];
+                self.damage_state(&mut e);
+                f.explosives[i] = e;
             }
         }
         self.fuses.retain_mut(|(at, left, blast)| {
@@ -5214,29 +5248,6 @@ impl Combat {
             }
             *left > 0.0
         });
-        let mut blazing = Vec::new();
-        self.blazes.retain_mut(|(at, left, next)| {
-            *left -= dt;
-            *next -= dt;
-            if *next <= 0.0 {
-                *next = 0.35;
-                blazing.push(*at);
-            }
-            *left > 0.0
-        });
-        for at in blazing {
-            for name in fx::BLAZE {
-                self.hold_fx(name, at, place_key(4, at));
-            }
-            self.effect(Effect::Fire { at, size: 3.0 }, 0.7);
-            self.effect(
-                Effect::Soot {
-                    at: at + Vec3::Y * 3.0,
-                    size: 3.5,
-                },
-                6.0,
-            );
-        }
         for (at, size) in flames {
             let low = at.with_y(at.y - size.min(1.2) + 0.5);
             for name in fx::FIRE {
@@ -6263,6 +6274,8 @@ mod tests {
                 max_force: 450.0,
                 key: None,
             }),
+            damaged_at: Some(440.0),
+            damaged: false,
         };
         // Two tanks 4 m apart, a third well clear of both; the first all
         // but spent.
@@ -6295,7 +6308,16 @@ mod tests {
             combat.step(&mut field, Trigger::default(), dt);
         }
         assert!(field.explosives[1].gone, "the first tank sets off the next");
-        assert!(combat.fires.len() >= 2, "what is left of both burns");
+        // The first's model collapsed; the second, worn under its 440,
+        // was damaged first, then collapsed.
+        assert_eq!(
+            combat.explosive_states,
+            [
+                (0, StateFx::COLLAPSE),
+                (1, StateFx::DAMAGE),
+                (1, StateFx::COLLAPSE)
+            ]
+        );
         assert!(!field.explosives[2].gone);
         assert_eq!(field.explosives[2].hp, 500.0);
     }
@@ -6318,6 +6340,8 @@ mod tests {
             }),
             burning: None,
             blast: None,
+            damaged_at: None,
+            damaged: false,
         };
         assert!(!e.take(4.0));
         assert!(e.burning.is_none(), "still above 100");

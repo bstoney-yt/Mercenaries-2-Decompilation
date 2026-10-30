@@ -242,6 +242,9 @@ pub struct Library {
     pub atlas: Atlas,
     /// Template id to the effects its `RedEffectComponent`s name.
     pub by_template: HashMap<u32, Vec<u32>>,
+    /// How long each of those runs, in the same order ([`template_runs`]);
+    /// empty: each runs [`ONE_OFF`].
+    pub runs: HashMap<u32, Vec<EffectRun>>,
 }
 
 impl Library {
@@ -279,12 +282,18 @@ impl Library {
             effects,
             atlas,
             by_template,
+            runs: HashMap::new(),
         })
     }
 
     /// The effects template `id` shows.
     pub fn of_template(&self, id: u32) -> &[u32] {
         self.by_template.get(&id).map_or(&[], Vec::as_slice)
+    }
+
+    /// How long the `k`th effect template `id` shows runs, if known.
+    pub fn run(&self, id: u32, k: usize) -> Option<EffectRun> {
+        self.runs.get(&id)?.get(k).copied()
     }
 }
 
@@ -304,6 +313,49 @@ pub fn template_effects(db: &Layer<'_>) -> HashMap<u32, Vec<u32>> {
             (id, fx)
         })
         .filter(|(_, fx)| !fx.is_empty())
+        .collect()
+}
+
+/// How long one of a template's effects runs (its `RedEffectComponent`
+/// record's `Duration`, `DurationVar` and `AutoDelete`). From the 360
+/// code: an effect gives off particles while it is no older than its
+/// `Duration` (0x821DA9D8, the component's tick), and one that deletes
+/// itself lives `Duration` give or take up to `DurationVar`, evenly
+/// (0x821D7B10: `Duration + (0.5 - rand) * 2 * DurationVar`), and goes
+/// with the entity once that is up; one that doesn't stays, given off
+/// no more. `global_particle_firelarge` 25 s +-10, `fx_CollapseBits`
+/// 3 s, a wreck's `global_particle_blastdoors_ext_smoke` 100 s.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EffectRun {
+    pub duration: f32,
+    pub var: f32,
+    pub auto_delete: bool,
+}
+
+/// Each template's effects' runs, in [`template_effects`]' order.
+pub fn template_runs(db: &Layer<'_>) -> HashMap<u32, Vec<EffectRun>> {
+    let t = Table::new(db, "RedEffectComponent");
+    let (name, duration, var, auto) = (
+        name_hash("Name"),
+        name_hash("Duration"),
+        name_hash("DurationVar"),
+        name_hash("AutoDelete"),
+    );
+    t.templates()
+        .map(|id| {
+            let runs: Vec<EffectRun> = t
+                .of_template(id)
+                .iter()
+                .filter(|r| t.word(r, name).is_some_and(|h| h != 0))
+                .map(|r| EffectRun {
+                    duration: t.float(r, duration).unwrap_or(0.0),
+                    var: t.float(r, var).unwrap_or(0.0),
+                    auto_delete: t.word(r, auto).is_some_and(|w| w != 0),
+                })
+                .collect();
+            (id, runs)
+        })
+        .filter(|(_, runs)| !runs.is_empty())
         .collect()
 }
 
@@ -372,6 +424,37 @@ impl Particles {
         seconds: f32,
         scale: f32,
     ) -> bool {
+        self.start(
+            lib,
+            effect,
+            at,
+            if seconds > 0.0 { seconds } else { ONE_OFF },
+            scale,
+        )
+    }
+
+    /// Starts `effect` at `at`, `scale` times its size, for as long as its
+    /// template's record says ([`EffectRun`]): giving off particles for
+    /// its `Duration`, and for one that deletes itself no longer than its
+    /// own life, `Duration` give or take `DurationVar`.
+    pub fn spawn_run(
+        &mut self,
+        lib: &Library,
+        effect: u32,
+        at: Vec3,
+        run: EffectRun,
+        scale: f32,
+    ) -> bool {
+        let until = if run.auto_delete {
+            let life = run.duration + self.spread(run.var);
+            life.min(run.duration)
+        } else {
+            run.duration
+        };
+        self.start(lib, effect, at, until.max(0.0), scale)
+    }
+
+    fn start(&mut self, lib: &Library, effect: u32, at: Vec3, until: f32, scale: f32) -> bool {
         let Some(spec) = lib.effects.get(&effect) else {
             return false;
         };
@@ -382,7 +465,7 @@ impl Particles {
             at,
             scale,
             age: 0.0,
-            until: if seconds > 0.0 { seconds } else { ONE_OFF },
+            until,
             owed: vec![0.0; spec.emitters.len()],
             particles: Vec::new(),
         });
@@ -412,7 +495,9 @@ impl Particles {
         true
     }
 
-    /// Starts every effect template `id` shows; how many it started.
+    /// Starts every effect template `id` shows; how many it started. With
+    /// `seconds` 0, each runs as long as the template's record says
+    /// ([`spawn_run`](Self::spawn_run)), where the library knows it.
     pub fn spawn_template(
         &mut self,
         lib: &Library,
@@ -423,7 +508,11 @@ impl Particles {
     ) -> usize {
         let fx: Vec<u32> = lib.of_template(id).to_vec();
         fx.into_iter()
-            .filter(|&h| self.spawn(lib, h, at, seconds, scale))
+            .enumerate()
+            .filter(|&(k, h)| match lib.run(id, k).filter(|_| seconds <= 0.0) {
+                Some(run) => self.spawn_run(lib, h, at, run, scale),
+                None => self.spawn(lib, h, at, seconds, scale),
+            })
             .count()
     }
 
@@ -880,6 +969,33 @@ mod tests {
         assert_eq!(p.spawn_template(&lib, 0x8000_0001, Vec3::ZERO, 0.0, 1.0), 1);
         assert_eq!(p.spawn_template(&lib, 0x8000_0002, Vec3::ZERO, 0.0, 1.0), 0);
         assert_eq!(p.started.get(&7), Some(&1));
+    }
+
+    // A template's effect gives off for its `Duration`; one that deletes
+    // itself for no longer than its life, `Duration` give or take its
+    // `DurationVar`.
+    #[test]
+    fn a_templates_effect_runs_as_long_as_its_record_says() {
+        let mut lib = library(burst());
+        let run = |duration, var, auto_delete| EffectRun {
+            duration,
+            var,
+            auto_delete,
+        };
+        lib.runs = HashMap::from([(0x8000_0001, vec![run(25.0, 10.0, true)])]);
+        let mut p = Particles::default();
+        assert_eq!(lib.run(0x8000_0001, 0), Some(run(25.0, 10.0, true)));
+        for _ in 0..50 {
+            assert_eq!(p.spawn_template(&lib, 0x8000_0001, Vec3::ZERO, 0.0, 1.0), 1);
+        }
+        assert!(p.instances.iter().all(|i| (15.0..=25.0).contains(&i.until)));
+        assert!(p.instances.iter().any(|i| i.until < 24.0), "some die early");
+        // Kept, not deleting itself: its whole `Duration`.
+        assert!(p.spawn_run(&lib, 7, Vec3::ZERO, run(100.0, 0.0, false), 1.0));
+        assert_eq!(p.instances.last().map(|i| i.until), Some(100.0));
+        // Asked for a time, that time.
+        p.spawn_template(&lib, 0x8000_0001, Vec3::ZERO, 2.0, 1.0);
+        assert_eq!(p.instances.last().map(|i| i.until), Some(2.0));
     }
 
     #[test]

@@ -1583,6 +1583,9 @@ impl Game {
 
     /// Sets off the game's effects the fight asked for and runs them.
     fn run_particles(&mut self, dt: f32) {
+        if let Some(world) = self.scene.world.as_ref() {
+            state_effects(world, &mut self.combat);
+        }
         let asked = std::mem::take(&mut self.combat.game_fx);
         let scene = &mut self.scene;
         let (Some(p), Some(world)) = (scene.particles.as_mut(), scene.world.as_ref()) else {
@@ -2884,9 +2887,18 @@ fn hit_world(
     }
     blast_loose(world, props, &pushes, false);
     blast_pickups(world, flights, &pushes);
-    // What was worn down and blows up goes off a moment later.
-    for (at, size) in destruction.set_off.drain(..) {
-        combat.set_off(at, size);
+    // What was worn down and blows up goes off at once, with the blast
+    // its template leaves, and shows what its model's `CollapseState`
+    // starts.
+    for (at, template, shows) in destruction.set_off.drain(..) {
+        combat.set_off(at, combat::left_blast(&world.index.template_db, template));
+        for (effect, at) in shows {
+            combat.game_fx.push(combat::GameFx {
+                template: combat::FxTemplate::Hash(effect),
+                at,
+                hold: None,
+            });
+        }
     }
     let mut broken = flights.strike(&mut world.physics, &combat.struck, &combat.went_off);
     // The state layers' crates too ([`crate::placed`]).
@@ -3467,6 +3479,28 @@ fn blast_loose(world: &mut World, props: &mut Props, pushes: &[BlastPush], strik
                 .map_or((p, p), |(at, bounds)| crate::props::box_around(at, bounds));
             let (velocity, spin) = push.throw(lo, hi, fudge(db, template));
             props.knock(&mut world.physics, e, velocity, spin, strike);
+        }
+    }
+}
+
+/// What the island's explosives' models start on entering the states the
+/// fight put them in ([`Combat::explosive_states`]): each effect their
+/// part states start there (`StartEmitter`), on its node, or at the
+/// object for a locator the model doesn't carry (inferred), each running
+/// as long as its template says (the fuel tanks' fire jets 10 s, their
+/// wreck's smoke 100 s). Asked of the particles as the fight's own are.
+fn state_effects(world: &World, combat: &mut Combat) {
+    for (i, state) in std::mem::take(&mut combat.explosive_states) {
+        let (Some(o), Some(model)) = (world.index.objects.get(i), world.object_model(i)) else {
+            continue;
+        };
+        let placed = Mat4::from_rotation_translation(o.rotation, o.position);
+        for fx in model.state_fx.iter().filter(|fx| fx.state == state) {
+            combat.game_fx.push(combat::GameFx {
+                template: combat::FxTemplate::Hash(fx.effect),
+                at: fx.at.map_or(o.position, |at| placed.transform_point3(at)),
+                hold: None,
+            });
         }
     }
 }

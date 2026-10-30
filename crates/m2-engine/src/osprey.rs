@@ -690,6 +690,7 @@ pub fn model() -> CpuModel {
         sinks: Vec::new(),
         breakup: None,
         parts: None,
+        state_fx: Default::default(),
         looks: None,
         lamp_nodes: Default::default(),
     }

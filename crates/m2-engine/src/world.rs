@@ -308,6 +308,9 @@ pub struct Templates {
     /// The effects each template shows, by id
     /// ([`crate::particles::template_effects`]).
     pub effects: HashMap<u32, Vec<u32>>,
+    /// How long each of those runs, in the same order
+    /// ([`crate::particles::template_runs`]).
+    pub effect_runs: HashMap<u32, Vec<crate::particles::EffectRun>>,
     /// How vehicles break each template's objects running into them.
     pub crashable: HashMap<u32, crate::durability::Crash>,
     /// The parts of a template's objects vehicles break one at a time
@@ -952,6 +955,7 @@ impl Templates {
                 .collect(),
             ordnance: crate::ordnance::read(&db),
             effects: crate::particles::template_effects(&db),
+            effect_runs: crate::particles::template_runs(&db),
             crashable: crate::durability::crashable(&db),
             crash_parts: crate::durability::crash_parts(&db),
             sound_keys: crate::durability::sound_keys(&db),
