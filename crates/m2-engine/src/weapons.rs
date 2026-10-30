@@ -274,14 +274,11 @@ pub struct Blast {
 }
 
 impl Blast {
-    /// Its damage `distance` metres from its heart: from `damage` down to
-    /// `min_damage` at its edge, none past it.
+    /// Its damage `distance` metres from its heart: `damage` falling off
+    /// to none at its edge, but never under `min_damage`; none past it
+    /// ([`crate::durability::blast_damage`], from the 360 code).
     pub fn damage_at(&self, distance: f32) -> f32 {
-        if distance > self.radius {
-            return 0.0;
-        }
-        let t = (distance / self.radius.max(0.01)).clamp(0.0, 1.0);
-        self.damage + (self.min_damage - self.damage) * t
+        crate::durability::blast_damage(self.damage, self.min_damage, self.radius, distance)
     }
 }
 

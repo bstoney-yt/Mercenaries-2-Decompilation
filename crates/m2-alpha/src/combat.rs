@@ -9,6 +9,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use m2_engine::durability::BurnDown;
 use m2_engine::tuning::DamageTable;
 use m2_engine::weapons::{Ammo, Blast, Feel, Flight, SoldierSpread, Throwable, WeaponSpec};
 use m2_engine::{GpuModel, Physics, Skeleton, StaticKey, VehicleId};
@@ -1573,9 +1574,10 @@ pub struct Combat {
     throwing_designator: bool,
     /// The last rocket: from the launcher, towards what the crosshair was on.
     pub last_launch: Option<(Vec3, Vec3)>,
-    /// Blasts about to go off (something explosive caught): where, and
-    /// seconds left.
-    fuses: Vec<(Vec3, f32)>,
+    /// Blasts about to go off (something explosive destroyed): where,
+    /// seconds left, and the blast its template leaves (none: the old
+    /// blast, [`Combat::explode`]).
+    fuses: Vec<(Vec3, f32, Option<Blast>)>,
     /// What a building's break-up left burning: where, seconds left,
     /// seconds to the next flame.
     blazes: Vec<(Vec3, f32, f32)>,
@@ -1854,7 +1856,20 @@ pub struct Field<'a> {
     pub explosives: &'a mut [Explosive],
 }
 
-/// Something placed on the island that blows up: fuel tanks, barrels.
+/// Something placed on the island that blows up when destroyed: what its
+/// template leaves on dying (`SpawnOnDeath`) is a blast (`Explosive`).
+/// On the island: the fuel tanks, the propane tanks, the docks' pumps, a
+/// fuel trailer (77 objects; not the plain barrels, which have neither
+/// `Health` nor a blast to leave).
+///
+/// How it is worn down and goes off is the 360 code's: what hits it takes
+/// its `Health` down by the damage times its `ModifierKey` row's cell for
+/// the damage's kind (the tanks' row is `Car`: a rifle round a fortieth,
+/// a fuel tank's own blast all of it); taken below its `TickDamage`
+/// health it burns down by itself ([`BurnDown`]); at none it is destroyed
+/// and its blast goes off where it stood, with no delay
+/// (`SpawnOnDeath` has none: `SpawnGuid`, `Destroy`, `Align`), wearing
+/// down the explosives around it in turn.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Explosive {
     /// Its index among the island's placed objects.
@@ -1863,29 +1878,70 @@ pub struct Explosive {
     pub at: Vec3,
     /// About how far its sides are from its middle, metres.
     pub size: f32,
+    /// Its health left, of its template's `Health`.
     pub hp: f32,
     pub gone: bool,
+    /// Its template's `ModifierKey`: its row of the damage table.
+    pub row: Option<u32>,
+    /// How it burns down once worn low, and seconds into its burning's
+    /// current tick once it does.
+    pub burn: Option<BurnDown>,
+    pub burning: Option<f32>,
+    /// The blast it leaves (`SpawnOnDeath`'s `Explosive`).
+    pub blast: Option<Blast>,
 }
 
-/// Models that blow up when hit, by name (invented list, from what the
-/// bases hold).
-/// Sizes are guesses from how they look.
-const EXPLOSIVE_MODELS: [(&str, f32); 6] = [
-    ("vzoutpost_fueltanks", 5.0),
-    ("global_barrelb", 0.5),
-    ("global_barrelc", 0.5),
-    ("global_barreloil", 0.5),
-    ("global_barrel", 0.5),
-    ("global_barrela", 0.5),
-];
-/// How much rifle fire an explosive takes.
-const EXPLOSIVE_HP: f32 = 100.0;
-/// How near its side a blast sets one off, metres.
-const IGNITE: f32 = 4.0;
+impl Explosive {
+    /// Takes `hit` off its health: true if that destroyed it. Carried
+    /// from above its [`BurnDown`] health to under it, it starts burning
+    /// (0x822889F8).
+    fn take(&mut self, hit: f32) -> bool {
+        if self.gone || hit <= 0.0 {
+            return false;
+        }
+        let before = self.hp;
+        self.hp -= hit;
+        // Destroyed under a hundredth (0x822889F8's 0.01).
+        if self.hp < 0.01 {
+            self.gone = true;
+            self.burning = None;
+            return true;
+        }
+        if let Some(b) = self.burn
+            && before > b.below
+            && self.hp < b.below
+            && self.burning.is_none()
+        {
+            self.burning = Some(0.0);
+        }
+        false
+    }
+
+    /// Burns on `dt` seconds: each [`BurnDown::every`] it takes its
+    /// `damage` in full (the tick's damage carries no kind; inferred from
+    /// 0x8240ADF8's message). True if that destroyed it.
+    fn burn_on(&mut self, dt: f32) -> bool {
+        let (Some(b), Some(t)) = (self.burn, self.burning.as_mut()) else {
+            return false;
+        };
+        *t += dt;
+        let mut ticks = 0;
+        while *t >= b.every {
+            *t -= b.every;
+            ticks += 1;
+        }
+        (0..ticks).any(|_| self.take(b.damage))
+    }
+}
+
+/// Explosives whose template's name holds this are the bases' great fuel
+/// tanks, this far from their middles to their sides (metres; a guess
+/// from how they look, as is [`EXPLOSIVE_SIZE`]).
+const FUEL_TANKS: (&str, f32) = ("fueltanks", 5.0);
+/// How far the other explosives' sides are from their middles, metres.
+const EXPLOSIVE_SIZE: f32 = 1.0;
 /// How far past its size a round can land and still hit it, metres.
 const HIT_SLACK: f32 = 0.5;
-/// How long one burns before it goes, seconds.
-const CHAIN_DELAY: f32 = 0.3;
 /// How long what is left of one burns, seconds (wrecks burn 20 s and
 /// more in the Xbox 360 game).
 const BURN: f32 = 25.0;
@@ -1895,24 +1951,48 @@ const BLAZE_TIME: f32 = 40.0;
 /// How far above the ground its flames' middle is, metres.
 const BLAZE_LIFT: f32 = 1.2;
 
-/// The island's explosives.
+/// The island's explosives: its placed objects whose templates leave a
+/// blast on dying and have a `Health` that something can wear down.
 pub fn explosives(index: &m2_engine::WorldIndex) -> Vec<Explosive> {
-    let models: Vec<(u32, f32)> = EXPLOSIVE_MODELS
-        .iter()
-        .map(|&(n, size)| (m2_assets::name_hash(n), size))
-        .collect();
+    let db = &index.template_db;
     index
         .objects
         .iter()
         .enumerate()
         .filter_map(|(object, o)| {
-            let &(_, size) = models.iter().find(|m| m.0 == o.model)?;
+            let t = o.template;
+            let durability = db
+                .durability
+                .get(&t)
+                .filter(|d| !d.invincible && d.health > 0.0)?;
+            let (spawn, e) = db
+                .leavings
+                .spawns
+                .get(&t)?
+                .iter()
+                .find_map(|s| db.explosions.get(s).map(|e| (*s, e)))?;
+            let size = db
+                .names
+                .get(&t)
+                .filter(|n| n.to_ascii_lowercase().contains(FUEL_TANKS.0))
+                .map_or(EXPLOSIVE_SIZE, |_| FUEL_TANKS.1);
             Some(Explosive {
                 object,
                 at: o.position + Vec3::Y * size.min(1.2),
                 size,
-                hp: EXPLOSIVE_HP,
+                hp: durability.health,
                 gone: false,
+                row: db.modifiers.get(&t).copied(),
+                burn: durability.burn,
+                burning: None,
+                blast: Some(Blast {
+                    template: spawn,
+                    radius: e.radius,
+                    damage: e.damage,
+                    min_damage: e.least,
+                    max_force: e.force,
+                    key: (e.kind != 0).then_some(e.kind),
+                }),
             })
         })
         .collect()
@@ -4054,19 +4134,72 @@ impl Combat {
         }
     }
 
-    /// A round landing at `at` hurts the explosive it hits, which goes up
-    /// (after a moment) once spent.
+    /// A round landing at `at` hurts the explosive it hits, as its row of
+    /// the damage table takes a `Bullet` ([`Explosive::take`]).
     fn hit_explosives_in(&mut self, explosives: &mut [Explosive], at: Vec3, damage: f32) {
         for e in explosives.iter_mut() {
             if !e.gone && e.at.distance(at) < e.size + HIT_SLACK {
-                e.hp -= damage;
-                if e.hp <= 0.0 {
-                    e.gone = true;
-                    self.fuses.push((e.at, CHAIN_DELAY));
-                    self.fires.push((e.at, e.size, BURN, 0.0));
-                }
+                let hit = damage * self.on_explosive(e, None);
+                self.wear_explosive(e, hit);
             }
         }
+    }
+
+    /// A blast at `at` reaching `radius` metres wears down the explosives
+    /// it reaches by `damage` (of the distance to its side, metres) times
+    /// what each one's row takes of kind `key`.
+    fn blast_explosives(
+        &mut self,
+        explosives: &mut [Explosive],
+        at: Vec3,
+        radius: f32,
+        damage: impl Fn(f32) -> f32,
+        key: Option<u32>,
+    ) {
+        for e in explosives.iter_mut() {
+            let d = (e.at.distance(at) - e.size).max(0.0);
+            if !e.gone && d < radius {
+                let hit = damage(d) * self.on_explosive(e, key);
+                self.wear_explosive(e, hit);
+            }
+        }
+    }
+
+    /// What explosive `e` takes of damage of kind `key` (a round without
+    /// one is a `Bullet`): its row's cell; all of it without a row.
+    fn on_explosive(&self, e: &Explosive, key: Option<u32>) -> f32 {
+        let key = key
+            .filter(|&k| k != 0)
+            .unwrap_or_else(|| m2_assets::name_hash("Bullet"));
+        match (e.row, self.damage_table.as_ref()) {
+            (Some(row), Some(t)) => t.scale(row, key).unwrap_or(1.0),
+            _ => 1.0,
+        }
+    }
+
+    /// `e` takes `hit`: destroyed, its blast goes off where it stood;
+    /// caught alight, it is seen burning until it burns out.
+    fn wear_explosive(&mut self, e: &mut Explosive, hit: f32) {
+        let was_burning = e.burning.is_some();
+        if e.take(hit) {
+            self.go_off(e);
+        } else if !was_burning && let (Some(b), Some(_)) = (e.burn, e.burning) {
+            let left = b.seconds_to_burn_out(e.hp);
+            eprintln!(
+                "explosive {}: caught alight at {:.0} health, burns out in {left:.1} s",
+                e.object, e.hp
+            );
+            self.fires.push((e.at, e.size * 0.5, left, 0.0));
+        }
+    }
+
+    /// Destroyed explosive `e`'s blast goes off at once (next step: the
+    /// blast it leaves wears down those around it in turn), and what is
+    /// left of it burns.
+    fn go_off(&mut self, e: &Explosive) {
+        eprintln!("explosive {}: destroyed, its blast goes off", e.object);
+        self.fuses.push((e.at, 0.0, e.blast));
+        self.fires.push((e.at, e.size, BURN, 0.0));
     }
 
     /// Her right hand's grip in the world as she is posed now (the hand's
@@ -4161,10 +4294,11 @@ impl Combat {
 
     /// Sets off something that blows up where it stood, at `at` (`size`
     /// metres about its middle): a state layer's explosive barrel worn
-    /// down ([`crate::destruct::Destruction::set_off`]). It goes off a
-    /// moment later and burns, as the island's explosives do.
+    /// down ([`crate::destruct::Destruction::set_off`]). It goes off at
+    /// once (`SpawnOnDeath` has no delay) and burns, as the island's
+    /// explosives do.
     pub fn set_off(&mut self, at: Vec3, size: f32) {
-        self.fuses.push((at, CHAIN_DELAY));
+        self.fuses.push((at, 0.0, None));
         self.fires.push((at, size, BURN, 0.0));
     }
 
@@ -4310,10 +4444,17 @@ impl Combat {
 
     fn fly(&mut self, f: &mut Field<'_>, dt: f32) {
         let mut blasts: Vec<(Vec3, Option<Blast>, Option<u32>)> = Vec::new();
-        self.fuses.retain_mut(|(at, left)| {
+        // Explosives alight burn on; one burnt out goes off.
+        for i in 0..f.explosives.len() {
+            if f.explosives[i].burn_on(dt) {
+                let e = f.explosives[i];
+                self.go_off(&e);
+            }
+        }
+        self.fuses.retain_mut(|(at, left, blast)| {
             *left -= dt;
             if *left <= 0.0 {
-                blasts.push((*at, None, None));
+                blasts.push((*at, *blast, None));
             }
             *left > 0.0
         });
@@ -4533,14 +4674,14 @@ impl Combat {
                 n.panic(at);
             }
         }
-        // Fuel tanks and barrels near it catch and go off in turn.
-        for e in f.explosives.iter_mut() {
-            if !e.gone && e.at.distance(at) < e.size + IGNITE {
-                e.gone = true;
-                self.fuses.push((e.at, CHAIN_DELAY));
-                self.fires.push((e.at, e.size, BURN, 0.0));
-            }
-        }
+        // Fuel tanks and the like near it are worn down as people are.
+        self.blast_explosives(
+            f.explosives,
+            at,
+            REACH,
+            |d| 100.0 * (1.0 - d / REACH).max(0.0),
+            key,
+        );
         if f.player.driving.is_none() && f.player.landed {
             let d = (f.player.character.position + Vec3::Y).distance(at);
             if d < REACH {
@@ -4734,13 +4875,7 @@ impl Combat {
                 n.panic(at);
             }
         }
-        for e in f.explosives.iter_mut() {
-            if !e.gone && e.at.distance(at) < e.size + reach {
-                e.gone = true;
-                self.fuses.push((e.at, CHAIN_DELAY));
-                self.fires.push((e.at, e.size, BURN, 0.0));
-            }
-        }
+        self.blast_explosives(f.explosives, at, reach, |d| b.damage_at(d), b.key);
         if f.player.driving.is_none() && f.player.landed {
             let d = (f.player.character.position + Vec3::Y).distance(at);
             if d < reach {
@@ -4992,13 +5127,13 @@ impl Combat {
                     .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
             }
         }
-        for e in f.explosives.iter_mut() {
-            if !e.gone && e.at.distance(at) < e.size + radius {
-                e.gone = true;
-                self.fuses.push((e.at, CHAIN_DELAY));
-                self.fires.push((e.at, e.size, BURN, 0.0));
-            }
-        }
+        self.blast_explosives(
+            f.explosives,
+            at,
+            radius,
+            |d| damage * (1.0 - d / radius),
+            key,
+        );
         if let Some(d) = her {
             // For checking what hurts her (autoplay logs).
             eprintln!("blast: at {at:.1}, she takes {d:.0}");
@@ -6101,15 +6236,35 @@ mod tests {
         let arsenal = Arsenal::default();
         let mut vehicles = Vec::new();
         let mut combat = Combat::default();
+        // As `_vzoutpost_fueltanks`: 500 health, burning below 465 by 50
+        // each half second, leaving `fx_Explosion_HugeOil` (400 at its
+        // heart, never under 95 within 8 m).
         let tank = |object, x| Explosive {
             object,
             at: Vec3::new(x, 1.2, 40.0),
             size: 0.5,
-            hp: EXPLOSIVE_HP,
+            hp: 500.0,
             gone: false,
+            row: None,
+            burn: Some(BurnDown {
+                below: 465.0,
+                damage: 50.0,
+                every: 0.5,
+            }),
+            burning: None,
+            blast: Some(Blast {
+                template: 7,
+                radius: 8.0,
+                damage: 400.0,
+                min_damage: 95.0,
+                max_force: 450.0,
+                key: None,
+            }),
         };
-        // Two tanks 4 m apart, a third well clear of both.
+        // Two tanks 4 m apart, a third well clear of both; the first all
+        // but spent.
         let mut explosives = [tank(0, 0.0), tank(1, 4.0), tank(2, 30.0)];
+        explosives[0].hp = 1.0;
         let mut field = Field {
             physics: &mut physics,
             player: &mut player,
@@ -6118,14 +6273,58 @@ mod tests {
             arsenal: &arsenal,
             explosives: &mut explosives,
         };
-        combat.explode(&mut field, Vec3::new(-2.0, 1.0, 40.0));
-        assert!(field.explosives[0].gone && !field.explosives[1].gone);
-        for _ in 0..60 {
+        // A blast 6 m off the first, out of reach of the second.
+        combat.explode(&mut field, Vec3::new(-6.0, 1.0, 40.0));
+        assert!(field.explosives[0].gone);
+        assert_eq!(field.explosives[1].hp, 500.0);
+        // The first's own blast goes off at once: 3.5 m from the second's
+        // side it does 400 x (1 - 3.5 / 8) = 225, which sets it burning.
+        combat.step(&mut field, Trigger::default(), dt);
+        let second = field.explosives[1];
+        assert!((second.hp - 275.0).abs() < 1e-3, "{}", second.hp);
+        assert!(second.burning.is_some() && !second.gone);
+        // 50 each half second: 6 ticks, 3 s, before it goes.
+        for _ in 0..(2.9 / dt) as usize {
+            combat.step(&mut field, Trigger::default(), dt);
+        }
+        assert!(!field.explosives[1].gone, "{}", field.explosives[1].hp);
+        for _ in 0..(0.3 / dt) as usize {
             combat.step(&mut field, Trigger::default(), dt);
         }
         assert!(field.explosives[1].gone, "the first tank sets off the next");
-        assert_eq!(combat.fires.len(), 2, "what is left of both burns");
+        assert!(combat.fires.len() >= 2, "what is left of both burns");
         assert!(!field.explosives[2].gone);
+        assert_eq!(field.explosives[2].hp, 500.0);
+    }
+
+    // A round wears an explosive by its row's cell for a `Bullet`; taken
+    // below its burning health it catches, and burns down by itself.
+    #[test]
+    fn an_explosive_worn_below_its_burning_health_burns_down() {
+        let mut e = Explosive {
+            object: 0,
+            at: Vec3::ZERO,
+            size: 1.0,
+            hp: 105.0,
+            gone: false,
+            row: None,
+            burn: Some(BurnDown {
+                below: 100.0,
+                damage: 8.0,
+                every: 0.5,
+            }),
+            burning: None,
+            blast: None,
+        };
+        assert!(!e.take(4.0));
+        assert!(e.burning.is_none(), "still above 100");
+        assert!(!e.take(2.0));
+        assert_eq!(e.burning, Some(0.0), "99 of 105: alight");
+        // 99 / 8: 13 ticks, 6.5 s.
+        assert_eq!(e.burn.unwrap().seconds_to_burn_out(e.hp), 6.5);
+        assert!(!e.burn_on(6.4));
+        assert!(e.burn_on(0.1));
+        assert!(e.gone);
     }
 
     // The shotgun's 10 rounds a shot: ten rounds go out, as many tracers.

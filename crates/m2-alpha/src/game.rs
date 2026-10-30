@@ -4265,6 +4265,7 @@ mod tests {
             radius,
             damage,
             least,
+            force: 500.0,
             kind: key(kind),
         };
         let db = Templates {
@@ -4294,8 +4295,10 @@ mod tests {
         // The rocket only on what it lands on.
         assert_eq!(blasts[2].at_distance(0.2), 100.0);
         assert_eq!(blasts[2].at_distance(1.0), 0.0);
-        // The frag still bites at 10 m.
-        assert!(blasts[1].at_distance(10.0) > 100.0);
+        // The frag still bites at 10 m: 300 x (1 - 10 / 15), and never
+        // under its 40 within reach.
+        assert!((blasts[1].at_distance(10.0) - 100.0).abs() < 1e-3);
+        assert_eq!(blasts[1].at_distance(14.9), 40.0);
         // With none in the data: one blast of combat's own, taken in full.
         let none = rocket_blasts(&Templates::default(), at);
         assert_eq!(none.len(), 1);
