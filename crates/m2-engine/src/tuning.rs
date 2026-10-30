@@ -531,6 +531,11 @@ pub struct Tyres {
     /// How far from its wheels' spring tops towards their contacts its
     /// axles push, at a standstill (`SuspSteerSwayAmp`; default 1).
     pub sway: f32,
+    /// The steepest ground it stands and drives on, radians (`MaxSlope`:
+    /// 45 degrees for its first value, 60 for the others; from the 360 code,
+    /// 0x8219B740). From 20 degrees less its springs push it more and more
+    /// as the ground leans and its engine less ([`Tyres::footing`]).
+    pub max_slope: f32,
 }
 
 impl Tyres {
@@ -543,6 +548,7 @@ impl Tyres {
         low_speed: 30.0 / 3.6,
         high_speed_grip: 0.8,
         sway: 1.0,
+        max_slope: std::f32::consts::FRAC_PI_4,
     };
 
     /// One axle's coefficient (the front, steering one, or the back),
@@ -620,6 +626,21 @@ impl Tyres {
             side = self.held(front, handbrake, steer);
         }
         (self.high_speed_grip * fast + (1.0 - fast)) * side
+    }
+
+    /// How well it stands on ground leaning `tilt` radians (the mean of
+    /// its wheels' contacts' normals' lean; from the 360 code, 0x8219E020):
+    /// 1 up to 20 degrees under its [`max_slope`], falling straight to 0
+    /// at it. Its springs push it level by that share less of their
+    /// lean (0x8219C27C: on gentle ground they push straight up, so it
+    /// doesn't roll down), and its engine pulls by that share
+    /// (0x8219C6CC: beyond it, it can't drive on).
+    ///
+    /// [`max_slope`]: Self::max_slope
+    pub fn footing(&self, tilt: f32) -> f32 {
+        let ramp = 20f32.to_radians();
+        let past = (tilt - (self.max_slope - ramp)) / ramp;
+        1.0 - past.clamp(0.0, 1.0)
     }
 
     /// How far from its wheels' spring tops towards their contacts each
@@ -1351,6 +1372,10 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         low_speed: f("LowSpeedLimit", d.low_speed * 3.6) / 3.6,
                         high_speed_grip: f("HiSpeedGrip", d.high_speed_grip),
                         sway: f("SuspSteerSwayAmp", d.sway),
+                        max_slope: match car.word(r, name_hash("MaxSlope")) {
+                            Some(v) if v != 0 => 60f32.to_radians(),
+                            _ => d.max_slope,
+                        },
                     })
                 })(),
                 tracks: (|| {
@@ -1751,6 +1776,21 @@ mod tests {
         assert_eq!(t.weak_point(tank, name_hash("Car"), rocket), None);
     }
 
+    // Footing: whole up to 20 degrees under its steepest, none at it.
+    #[test]
+    fn footing_falls_over_the_last_20_degrees() {
+        let t = Tyres::DEFAULT;
+        let close = |a: f32, b: f32| assert!((a - b).abs() < 1e-5, "{a} {b}");
+        close(t.footing(20f32.to_radians()), 1.0);
+        close(t.footing(35f32.to_radians()), 0.5);
+        close(t.footing(50f32.to_radians()), 0.0);
+        let steep = Tyres {
+            max_slope: 60f32.to_radians(),
+            ..t
+        };
+        close(steep.footing(45f32.to_radians()), 0.75);
+    }
+
     // Easing keeps its share of the way left each 1/60 s, a share of a
     // step for the rest (0x824BB050).
     #[test]
@@ -1774,6 +1814,7 @@ mod tests {
             low_speed: 30.0 / 3.6,
             high_speed_grip: 0.8,
             sway: 1.0,
+            max_slope: std::f32::consts::FRAC_PI_4,
         };
         let close = |a: f32, b: f32| assert!((a - b).abs() < 1e-5, "{a} {b}");
         // Rolling: three times as hard standing, once from its low speed

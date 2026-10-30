@@ -993,11 +993,6 @@ const BOAT: BoatTuning = BoatTuning {
 pub const PLANE_SPEED: f32 = 12.0;
 const PLANE_RISE: f32 = 0.3;
 const PLANE_TRIM: f32 = 0.25;
-/// The steepest hill a wheeled vehicle takes about as fast as the flat,
-/// radians: uphill the engine pulls as a lower gear would
-/// (invented; the playthrough's jeep and tank take the hill roads at
-/// speed). Steeper than this, it slows and in the end slides back.
-const CLIMB: f32 = 0.52;
 /// Tracks grip: on the ground, a tracked vehicle's weight doesn't pull it
 /// down hills up to this steep, radians, so it climbs, turns and stands on
 /// them as on the flat (a play-tester: the game's tank "should be able to climb
@@ -1060,6 +1055,9 @@ struct VehicleBody {
     /// ([`Physics::drive`]), which they push it with each step
     /// ([`push_axles`]).
     axles: [Axle; 2],
+    /// How well it stands on the ground under it now ([`Tyres::footing`];
+    /// 1 on the flat).
+    footing: f32,
     /// Its weight on the ground, of its plain weight ([`Springs`]'s
     /// `gravity_factor`; 1 for a tank).
     gravity_factor: f32,
@@ -1270,6 +1268,48 @@ fn balance(
     w
 }
 
+/// Works out how well a wheeled vehicle stands on the ground under it
+/// ([`Tyres::footing`], from the lean of its wheels' contacts' mean
+/// normal) and takes that share of the level part off each spring's push
+/// (from the 360 code, 0x8219E020 and 0x8219C27C): on gentle ground its
+/// springs push it straight up, so it stands and drives as on the flat,
+/// and only nearing its steepest does the ground's lean push it down
+/// the hill. Rapier has pushed along the contact normal; this takes the
+/// share back at the same point.
+fn stand(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
+    let Some(tyres) = v.tyres else {
+        return;
+    };
+    let wheels = v.controller.wheels();
+    let normals: Vec<Vec3> = wheels
+        .iter()
+        .map(|w| w.raycast_info())
+        .filter(|r| r.is_in_contact)
+        .map(|r| vec3(r.contact_normal_ws))
+        .collect();
+    if normals.is_empty() {
+        v.footing = 0.0;
+        return;
+    }
+    let mean = normals.iter().sum::<Vec3>() / normals.len() as f32;
+    let tilt = (mean.with_y(0.0).length() / mean.length().max(1e-6))
+        .min(1.0)
+        .asin();
+    v.footing = tyres.footing(tilt);
+    let Some(body) = bodies.get_mut(v.controller.chassis) else {
+        return;
+    };
+    for w in wheels {
+        let ray = w.raycast_info();
+        if !ray.is_in_contact {
+            continue;
+        }
+        let push = w.wheel_suspension_force.min(w.max_suspension_force) * dt;
+        let level = vec3(ray.contact_normal_ws).with_y(0.0) * push * v.footing;
+        body.apply_impulse_at_point(vector(-level), ray.contact_point_ws, true);
+    }
+}
+
 /// Pushes a wheeled vehicle along and across with each of its axles as
 /// the 360 code does ([`Tyres`]; from the 360 code, at 0x8219C118 and
 /// 0x821A08D8): at the mean, over its wheels on the ground, of a point
@@ -1348,7 +1388,7 @@ fn push_axles(v: &VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
             )
         };
         let push = -(along * slow + level * slide) * v.mass * dt
-            + along * axle.drive * grounded.len() as f32 * dt;
+            + along * axle.drive * v.footing * grounded.len() as f32 * dt;
         body.apply_impulse_at_point(vector(push), vector(at), true);
     }
 }
@@ -1562,6 +1602,7 @@ impl Physics {
             );
             v.controller.update_vehicle(dt, queries);
             if !v.wrecked {
+                stand(v, &mut w.bodies, dt);
                 push_axles(v, &mut w.bodies, dt);
             }
             // More than half its wheels down, it is pulled down by its
@@ -2089,6 +2130,7 @@ impl Physics {
             tops,
             tyres,
             axles: Axle::standing(&tyres),
+            footing: 1.0,
             gravity_factor,
             tracked: spec.tracked,
             bike: spec.is_bike().then(|| Bike {
@@ -2149,12 +2191,6 @@ impl Physics {
         }
         let speed = v.controller.current_vehicle_speed;
         let wheels = v.controller.wheels().len().max(1) as f32;
-        // How steeply its nose points up (the sine).
-        let nose = self
-            .world
-            .bodies
-            .get(v.controller.chassis)
-            .map_or(0.0, |b| (b.position().rotation * r::Vector::Z).y);
         // A wheel's brake is the most impulse it may take off per step:
         // this many m/s² over the whole vehicle.
         let slowing = |decel: f32| v.mass * decel * dt / wheels;
@@ -2200,11 +2236,6 @@ impl Physics {
             (None, Some(curve)) => TRACK_PULL * track_pull(curve, 1.0 - headroom) * ease,
             (None, None) => TRACK_PULL * headroom,
         };
-        // Uphill (the way it is driven), the pull that holds it as on the
-        // flat against all its weight on the ground (its gravity factor's),
-        // up to its steepest hill (tracks hold it by their grip).
-        let most = if v.tracked { 0.0 } else { CLIMB };
-        let uphill = (nose * throttle.signum()).clamp(0.0, most.sin());
         // A tank's braking against the motion (invented).
         let service = |_front: bool| slowing(SERVICE_BRAKE * throttle.abs());
         // A wheeled vehicle's axles' coefficients along and across as the
@@ -2263,8 +2294,7 @@ impl Physics {
         } else if against {
             (0.0, -1.0)
         } else if throttle != 0.0 {
-            let pull = push + GRAVITY * v.gravity_factor * uphill;
-            (throttle * v.mass * pull / wheels, 0.0)
+            (throttle * v.mass * push / wheels, 0.0)
         } else if speed.abs() < 1.0 {
             (0.0, slowing(HOLD))
         } else {
@@ -4204,7 +4234,8 @@ mod tests {
             );
             p.step(DT);
         }
-        // It crawled at 2 m/s before the engine pulled harder uphill.
+        // Under its steepest less 20 degrees its springs push it straight
+        // up, so the hill holds it back no more than the flat.
         let speed = p.vehicle_speed(id);
         assert!(speed > 12.0, "{speed} m/s");
     }
@@ -4379,6 +4410,60 @@ mod tests {
             "tilted {} degrees",
             up.angle_between(Vec3::Y).to_degrees()
         );
+    }
+
+    // Let roll on a hill, a car stays put on one gentler than its steepest
+    // less 20 degrees (its springs push it straight up there, as the 360
+    // code's do) and rolls down one steeper than its steepest (45 by
+    // default), on which its engine can't drive it up either.
+    #[test]
+    fn it_stands_on_gentle_hills_and_rolls_down_steep_ones() {
+        let run = |degrees: f32, throttle: f32| {
+            let mut p = Physics::new();
+            let half = 100.0;
+            let v = [
+                Vec3::new(-half, 0.0, -half),
+                Vec3::new(half, 0.0, -half),
+                Vec3::new(half, 0.0, half),
+                Vec3::new(-half, 0.0, half),
+            ];
+            let shape = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+            let slope = degrees.to_radians();
+            p.add_static(
+                StaticKey::Cell(1),
+                &shape,
+                Vec3::ZERO,
+                Quat::from_rotation_z(slope),
+            );
+            p.step(DT);
+            let spec = car();
+            let yaw = std::f32::consts::FRAC_PI_2;
+            let ground = |at: Vec3| {
+                p.cast_ray(Vec3::new(at.x, 80.0, at.z), Vec3::NEG_Y, 200.0)
+                    .map(|(d, _)| 80.0 - d)
+            };
+            let rest = spec.rest_on(Vec3::new(5.0, 0.0, 0.0), yaw, ground).unwrap();
+            let id = p.add_vehicle_turned(&spec, rest.position + Vec3::Y * 0.3, rest.rotation);
+            let go = VehicleControls {
+                throttle,
+                ..Default::default()
+            };
+            for _ in 0..180 {
+                p.drive(id, go);
+                p.step(DT);
+            }
+            let at = p
+                .vehicle_transform(id)
+                .unwrap()
+                .transform_point3(Vec3::ZERO);
+            at.x - rest.position.x
+        };
+        let gentle = run(20.0, 0.0);
+        assert!(gentle.abs() < 0.3, "rolled {gentle} m on 20 degrees");
+        let steep = run(50.0, 0.0);
+        assert!(steep < -3.0, "rolled {steep} m on 50 degrees");
+        let up = run(50.0, 1.0);
+        assert!(up < -3.0, "drove {up} m up 50 degrees");
     }
 
     // Round 18: with the M151's engine and gearbox it reaches its
