@@ -877,28 +877,6 @@ impl Props {
         self.broken.contains_key(&entity)
     }
 
-    /// Where `entity`'s break-up names points (its fires), world space:
-    /// none unless it broke apart.
-    pub fn breakup_points(&self, entity: u32) -> Vec<Vec3> {
-        let Some(p) = self
-            .shown
-            .get(&entity)
-            .filter(|_| self.broken.contains_key(&entity))
-        else {
-            return Vec::new();
-        };
-        let Some(Some(m)) = self.models.get(&p.model) else {
-            return Vec::new();
-        };
-        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
-        m.breakup.as_ref().map_or_else(Vec::new, |b| {
-            b.points
-                .iter()
-                .map(|&x| placed.transform_point3(x))
-                .collect()
-        })
-    }
-
     /// Moves `entity` (the scripts placed it elsewhere).
     pub fn put(&mut self, physics: &mut Physics, entity: u32, position: Vec3) {
         let Some(p) = self.shown.get_mut(&entity) else {
@@ -939,6 +917,32 @@ impl Props {
 
     /// Where `entity` stands and its model's box (model space); `None`
     /// unless it is shown and its model has loaded.
+    /// What `entity`'s model starts on entering part state `state` (its
+    /// `StartEmitter`s, [`m2_engine::StateFx`]): each effect template's
+    /// name hash and where, in the world (at the prop for a locator the
+    /// model doesn't carry; inferred).
+    pub fn state_effects(&self, entity: u32, state: u32) -> Vec<(u32, Vec3)> {
+        let Some((placed, _)) = self.placed_bounds(entity) else {
+            return Vec::new();
+        };
+        let Some(m) = self
+            .shown
+            .get(&entity)
+            .and_then(|p| self.models.get(&p.model)?.as_ref())
+        else {
+            return Vec::new();
+        };
+        m.gpu
+            .state_fx
+            .iter()
+            .filter(|fx| fx.state == state)
+            .map(|fx| {
+                let at = fx.at.unwrap_or(Vec3::ZERO);
+                (fx.effect, placed.transform_point3(at))
+            })
+            .collect()
+    }
+
     pub fn placed_bounds(&self, entity: u32) -> Option<(Mat4, (Vec3, Vec3))> {
         let p = self.shown.get(&entity)?;
         let m = self.models.get(&p.model)?.as_ref()?;

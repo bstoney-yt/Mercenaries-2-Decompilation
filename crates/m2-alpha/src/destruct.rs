@@ -29,7 +29,7 @@ use m2_engine::durability::{BlastPush, Crash, CrashHow};
 use m2_engine::{Install, StaticKey, World};
 use m2_math::glam::{Mat4, Vec3};
 
-use crate::combat::{Combat, Effect};
+use crate::combat::Combat;
 use crate::props::Props;
 
 /// Keys the props put up for placed objects go under: entity ids of the
@@ -316,6 +316,10 @@ impl Cause {
     }
 }
 
+/// What a model's part state starts: effect template name hash, and
+/// where ([`Props::state_effects`]).
+pub type Shows = Vec<(u32, Vec3)>;
+
 /// The damage done to the island's placed objects, and those coming down.
 #[derive(Debug, Default)]
 pub struct Destruction {
@@ -335,8 +339,9 @@ pub struct Destruction {
     /// Damage the physics props have taken so far ([`wear`](Self::wear)).
     worn: HashMap<StaticKey, f32>,
     /// Worn down and blowing up, to be set off by the fight
-    /// ([`crate::combat::Combat::set_off`]): where, and how big.
-    pub set_off: Vec<(Vec3, f32)>,
+    /// ([`crate::combat::Combat::set_off`]): where, its template, and
+    /// what its model's `CollapseState` starts (effect name hash, where).
+    pub set_off: Vec<(Vec3, u32, Shows)>,
     /// The island's objects destroyed whose links were followed
     /// ([`fall_linked`](Self::fall_linked)).
     linked: HashSet<usize>,
@@ -489,12 +494,10 @@ impl Destruction {
             && explodes(db, template)
         {
             let centre = props.centre(e).unwrap_or(at);
-            let size = props
-                .placed_bounds(e)
-                .map_or(0.5, |(_, (lo, hi))| (hi - lo).length() * 0.5);
+            let shows = props.state_effects(e, m2_engine::StateFx::COLLAPSE);
             eprintln!("destruct: {key:?} blows up at {centre:.1}");
             props.hide(&mut world.physics, [e]);
-            self.set_off.push((centre, size));
+            self.set_off.push((centre, template, shows));
             return true;
         }
         match key {
@@ -971,10 +974,9 @@ impl Destruction {
                         if let Some(at) = props.centre(key) {
                             combat.collapse(at);
                         }
-                        for at in props.breakup_points(key) {
-                            combat.show(Effect::Smoke { at, size: 4.0 }, 6.0);
-                            combat.show_fx(crate::combat::fx::COLLAPSE, at);
-                        }
+                        // What its model's `CollapseState` starts (a gate's
+                        // smoke, the collapse's bits).
+                        combat.state_shows(props.state_effects(key, m2_engine::StateFx::COLLAPSE));
                     }
                 }
                 Cause::Crash { velocity, mass } => {

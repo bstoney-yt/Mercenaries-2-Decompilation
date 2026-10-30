@@ -3045,9 +3045,7 @@ impl Scene {
             // The game's own effects draw fire and smoke when they loaded.
             let standing_in = matches!(
                 effect,
-                combat::Effect::Fire { .. }
-                    | combat::Effect::Smoke { .. }
-                    | combat::Effect::Soot { .. }
+                combat::Effect::Fire { .. } | combat::Effect::Smoke { .. }
             );
             if standing_in && (self.particles.is_some() || self.hide_fx) {
                 continue;
@@ -3287,15 +3285,6 @@ impl Effects {
                     at + Vec3::Y * (age * size * 1.5),
                 ),
                 self.smoke,
-                true,
-            ),
-            Effect::Soot { at, size } => (
-                Mat4::from_scale_rotation_translation(
-                    Vec3::splat(size * (0.6 + 1.4 * age)),
-                    Quat::IDENTITY,
-                    at + Vec3::Y * (age * size * 4.0),
-                ),
-                self.soot,
                 true,
             ),
             // Out and up, falling back as it goes, gone at the end.
