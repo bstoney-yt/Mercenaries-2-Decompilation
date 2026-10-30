@@ -338,11 +338,16 @@ pub const CRASH_FLOOR: f32 = 5.0;
 /// over 1. From the 360 code: 0x8228B5F0 (the floor and the hundredth),
 /// 0x82287CF8 (each side's cell, and the 1).
 pub fn crash_damage(size: f32, cell: f32) -> f32 {
-    if size < CRASH_FLOOR {
-        return 0.0;
-    }
-    let damage = size * 0.01 * cell;
+    let damage = crash_base(size) * cell;
     if damage > 1.0 { damage } else { 0.0 }
+}
+
+/// A crash's damage before the damage table's cell: a hundredth of its
+/// `size` ([`crash_size`]), none under [`CRASH_FLOOR`]. From the 360 code
+/// (0x8228B5F0). What the cell makes of it counts only past 1
+/// ([`crash_damage`]).
+pub fn crash_base(size: f32) -> f32 {
+    if size < CRASH_FLOOR { 0.0 } else { size * 0.01 }
 }
 
 /// A ram's kind of damage where its vehicle's template names none: `Car`,
@@ -482,6 +487,8 @@ mod tests {
         assert!((crash_damage(60.0, 2.0) - 1.2).abs() < 1e-5);
         assert!((crash_damage(300.0, 2.0) - 6.0).abs() < 1e-4);
         assert_eq!(crash_damage(300.0, 0.0), 0.0, "a cell of nothing");
+        assert_eq!(crash_base(4.9), 0.0);
+        assert!((crash_base(60.0) - 0.6).abs() < 1e-6);
     }
 
     // A ram is a tonne a metre a second, times the table's cell for the
