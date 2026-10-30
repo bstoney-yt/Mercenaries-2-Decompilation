@@ -31,7 +31,9 @@ use rapier3d::control::{
     KinematicCharacterController, WheelTuning,
 };
 
-use crate::tuning::{BikeTuning, BoatTuning, FlightTuning, Handling, Springs, Tyres};
+use crate::tuning::{
+    BikeTuning, BoatTuning, EngineTuning, FlightTuning, Gearbox, Handling, Springs, Tyres,
+};
 use crate::vehicle::VehicleSpec;
 use rapier3d::prelude as r;
 
@@ -41,6 +43,10 @@ pub const STEP_HEIGHT: f32 = 0.5;
 pub const MAX_SLOPE: f32 = 50.0 * std::f32::consts::PI / 180.0;
 /// Downward acceleration, m/s².
 pub const GRAVITY: f32 = 9.81;
+/// The gravity the 360 car code pulls with where it works its own, m/s²
+/// (the constant at 0x82DE8C30, -10, that the gravity factor's pull at
+/// 0x8219EE4C and 14 other physics routines read).
+pub const GRAVITY_360: f32 = 10.0;
 /// Slowest a vehicle's wheels and tracks are seen to roll, m/s: under
 /// it a vehicle is settling, not driving
 /// ([`Physics::vehicle_rolling`]). Invented.
@@ -1068,14 +1074,19 @@ struct VehicleBody {
     /// Top speed forwards and backing up, m/s.
     top: f32,
     reverse_top: f32,
-    /// Its template's engine and gearbox, or its tracks' pull over its
-    /// speed ([`VehicleTuning`](crate::VehicleTuning)).
-    engine: Option<crate::tuning::EngineTuning>,
+    /// A wheeled vehicle's engine and gearbox (its template's, else the
+    /// 360 code's defaults), or a tank's tracks' pull over its speed
+    /// ([`VehicleTuning`](crate::VehicleTuning)).
+    engine: Option<EngineTuning>,
     tracks: Option<[f32; 4]>,
-    /// The forward gear its engine is in (0 is first), and how long its
-    /// clutch is still out changing to it, seconds.
-    gear: usize,
-    clutch: f32,
+    /// Its gearbox as it runs.
+    gearbox: Gearbox,
+    /// The torque its engine drives its wheels with now, newton-metres,
+    /// through its gear and eased by its top speed ([`drive_axles`]).
+    drive: f32,
+    /// Its driver has the throttle open (its engine driving it, or about
+    /// to once its clutch delay is out).
+    pulling: bool,
     /// Its driver brakes: pulls against the way it rolls, or holds the
     /// handbrake (not a parked vehicle's hold).
     braking: bool,
@@ -1105,14 +1116,11 @@ struct Rotorcraft {
 }
 
 /// One axle's tyres as its driver works them ([`Tyres`]): its coefficient
-/// along, m/s², and across, per second, as the 360 code works them out,
-/// and the push its engine gives each of its wheels on the ground,
-/// newtons.
+/// along, m/s², and across, per second, as the 360 code works them out.
 #[derive(Clone, Copy, Debug, Default)]
 struct Axle {
     along: f32,
     across: f32,
-    drive: f32,
     /// Parked: it holds still, up to its coefficients (along, and across
     /// as though sliding at 1 m/s), as a tank does (invented).
     hold: bool,
@@ -1125,7 +1133,6 @@ impl Axle {
             tyres.map_or(Axle::default(), |t| Axle {
                 along: t.slowing(front, 0.0, 0.0, 0.0, 0.0, 0.0),
                 across: t.grip(front, 0.0, 0.0, 0.0, 0.0),
-                drive: 0.0,
                 hold: false,
             })
         };
@@ -1268,6 +1275,45 @@ fn balance(
     w
 }
 
+/// How fast a wheeled vehicle's driven wheels turn, rpm, as its engine
+/// feels them (from the 360 code, 0x8219E678): each wheel's ground speed
+/// along it (the chassis' velocity at its contact, the front's turned as
+/// they steer) over its radius, weighted by its share of the drive: the
+/// back's `split` x 2 over their number, the front's the rest (0x821A0390;
+/// the shares add up to 2).
+fn driven_rpm(
+    body: &r::RigidBody,
+    wheels: &[rapier3d::control::Wheel],
+    steers: &[bool],
+    steering: f32,
+    split: f32,
+) -> f32 {
+    let turn = Quat::from_array(body.position().rotation.to_array());
+    let (ahead, up) = (turn * Vec3::Z, turn * Vec3::Y);
+    let count = |front: bool| steers.iter().filter(|&&s| s == front).count().max(1) as f32;
+    let share = |front: bool| {
+        if front {
+            (1.0 - split) * 2.0 / count(true)
+        } else {
+            split * 2.0 / count(false)
+        }
+    };
+    wheels
+        .iter()
+        .zip(steers)
+        .map(|(w, &front)| {
+            let along = if front {
+                Quat::from_axis_angle(up, steering) * ahead
+            } else {
+                ahead
+            };
+            let at = w.raycast_info().contact_point_ws;
+            let speed = vec3(body.velocity_at_point(at)).dot(along);
+            share(front) * speed / w.radius.max(0.05) * 60.0 / std::f32::consts::TAU
+        })
+        .sum()
+}
+
 /// Works out how well a wheeled vehicle stands on the ground under it
 /// ([`Tyres::footing`], from the lean of its wheels' contacts' mean
 /// normal) and takes that share of the level part off each spring's push
@@ -1387,8 +1433,59 @@ fn push_axles(v: &VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
                 axle.across * k * velocity.dot(level),
             )
         };
-        let push = -(along * slow + level * slide) * v.mass * dt
-            + along * axle.drive * v.footing * grounded.len() as f32 * dt;
+        let push = -(along * slow + level * slide) * v.mass * dt;
+        body.apply_impulse_at_point(vector(push), vector(at), true);
+    }
+}
+
+/// Drives a wheeled vehicle as its engine turns its wheels ([`Physics::drive`]
+/// sets the torque; from the 360 code, 0x8219CAE8 to 0x8219CDEC): each
+/// wheel on the ground pushes with its share of the torque over its
+/// radius, along the way it points; each axle sums its wheels' pushes and
+/// pushes along their mean way at their contacts' mean, by how well it
+/// stands ([`Tyres::footing`]).
+fn drive_axles(v: &VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
+    let Some(e) = v.engine.filter(|_| v.tyres.is_some() && v.drive != 0.0) else {
+        return;
+    };
+    let Some(body) = bodies.get_mut(v.controller.chassis) else {
+        return;
+    };
+    let turn = Quat::from_array(body.position().rotation.to_array());
+    let (ahead, up) = (turn * Vec3::Z, turn * Vec3::Y);
+    let count = |front: bool| v.steers.iter().filter(|&&s| s == front).count().max(1) as f32;
+    for front in [true, false] {
+        let share = if front {
+            (1.0 - e.split) * 2.0 / count(true)
+        } else {
+            e.split * 2.0 / count(false)
+        };
+        let way = if front {
+            Quat::from_axis_angle(up, v.steering) * ahead
+        } else {
+            ahead
+        };
+        let grounded: Vec<_> = v
+            .controller
+            .wheels()
+            .iter()
+            .zip(&v.steers)
+            .filter(|(w, s)| **s == front && w.raycast_info().is_in_contact)
+            .map(|(w, _)| w)
+            .collect();
+        if grounded.is_empty() || share == 0.0 {
+            continue;
+        }
+        let pull: f32 = grounded
+            .iter()
+            .map(|w| share * v.drive / w.radius.max(0.05))
+            .sum();
+        let at = grounded
+            .iter()
+            .map(|w| vec3(w.raycast_info().contact_point_ws))
+            .sum::<Vec3>()
+            / grounded.len() as f32;
+        let push = way * pull * v.footing * dt;
         body.apply_impulse_at_point(vector(push), vector(at), true);
     }
 }
@@ -1604,18 +1701,19 @@ impl Physics {
             if !v.wrecked {
                 stand(v, &mut w.bodies, dt);
                 push_axles(v, &mut w.bodies, dt);
+                drive_axles(v, &mut w.bodies, dt);
             }
             // More than half its wheels down, it is pulled down by its
             // template's `GravityFactor` less one of its weight more
-            // (from the 360 code, at 0x8219EE14; the global it multiplies
-            // by read as gravity, inferred).
+            // (from the 360 code, at 0x8219EE14, by its gravity of 10 m/s²,
+            // [`GRAVITY_360`]).
             let wheels = v.controller.wheels();
             let down = wheels
                 .iter()
                 .filter(|w| w.raycast_info().is_in_contact)
                 .count();
             if !v.wrecked && v.gravity_factor != 1.0 && down * 2 > wheels.len() {
-                let pull = (v.gravity_factor - 1.0) * v.mass * GRAVITY * dt;
+                let pull = (v.gravity_factor - 1.0) * v.mass * GRAVITY_360 * dt;
                 if let Some(b) = w.bodies.get_mut(v.controller.chassis) {
                     b.apply_impulse(r::Vector::new(0.0, -pull, 0.0), true);
                 }
@@ -2143,10 +2241,11 @@ impl Physics {
                 Some(e) if !spec.tracked => e.reverse_speed,
                 _ => (spec.tuning.max_speed.unwrap_or(top) * 0.5).min(REVERSE_SPEED),
             },
-            engine: spec.tuning.engine.filter(|_| !spec.tracked),
+            engine: (!spec.tracked).then(|| spec.tuning.engine.unwrap_or(EngineTuning::DEFAULT)),
             tracks: spec.tuning.tracks,
-            gear: 0,
-            clutch: 0.0,
+            gearbox: Gearbox::default(),
+            drive: 0.0,
+            pulling: false,
             braking: false,
             handling: spec.tuning.handling.filter(|_| !spec.tracked),
             steering: 0.0,
@@ -2195,34 +2294,75 @@ impl Physics {
         // this many m/s² over the whole vehicle.
         let slowing = |decel: f32| v.mass * decel * dt / wheels;
         let throttle = controls.throttle.clamp(-1.0, 1.0);
-        // Throttle against the motion brakes. A wheeled vehicle's brake is
-        // the reverse pedal while it rolls ahead: the 360 code takes throttle
-        // and brake as two inputs (0x2C, 0x30), so the throttle while it
-        // rolls back is its engine (inferred: which pad input feeds which
-        // isn't traced). As a brake it would hold it creeping back down a
-        // hill, its tyres slowing it as little as it rolls slowly.
-        let against =
-            speed.abs() > 0.5 && throttle * speed < 0.0 && (v.tyres.is_none() || throttle < 0.0);
-        v.braking = !controls.parked && (controls.brake || against);
-        // Its gearbox changes up and down as its template's shift speeds
-        // say, rolling forwards, and while its clutch is out its engine
-        // drives nothing (the clutch's delay read so, inferred).
+        // A tank's throttle against the motion brakes it.
+        let against = speed.abs() > 0.5 && throttle * speed < 0.0;
+        // A wheeled vehicle's pedals as the 360 code's two inputs, its
+        // throttle (0x2C) and brake (0x30): ahead the stick forward is the
+        // throttle and back the brake; in reverse they swap (inferred
+        // from 0x8219C540, which stays in reverse while the brake isn't
+        // held and leaves it when it is: which pad input feeds which isn't
+        // traced).
+        let (open, pressed) = match v.engine {
+            Some(_) => {
+                let t = if v.gearbox.gear == 0 {
+                    -throttle
+                } else {
+                    throttle
+                };
+                (t.max(0.0), (-t).max(0.0))
+            }
+            None if against => (0.0, throttle.abs()),
+            None => (throttle.abs(), 0.0),
+        };
+        v.braking = !controls.parked && (controls.brake || pressed > 0.0);
+        v.pulling = !controls.parked && !controls.brake && open > 0.0;
+        // Its engine drives its wheels as the 360 code's does
+        // ([`EngineTuning::step`]; the drive path at 0x8219C9EC): with at
+        // least half its wheels down, its torque through the gear it is in
+        // (nothing while its clutch delay runs) and off the handbrake,
+        // shared out to its wheels ([`push_axles`]), fading over the last
+        // twentieth of its `MaxSpeed` (`ReverseMaxSpeed` in reverse). Its
+        // gearbox goes into reverse once it is all but still (under 2
+        // km/h) with the brake held over 0.9 and the throttle under 0.1
+        // for a tenth of a second, and back out once that has stopped for
+        // as long (as the other drive path has it, 0x8219C490).
+        v.drive = 0.0;
         if let Some(e) = v.engine {
-            if v.clutch > 0.0 {
-                v.clutch -= dt;
+            let slow = speed.abs() * 3.6 < 2.0;
+            let asks = slow && pressed > 0.9 && open < 0.1;
+            let reversing = v.gearbox.gear == 0;
+            let gb = &mut v.gearbox;
+            gb.reversing = if asks != reversing {
+                (gb.reversing + dt).min(0.1)
             } else {
-                let next = e.shift(v.gear, speed.max(0.0));
-                if next != v.gear {
-                    v.gear = next;
-                    v.clutch = e.clutch_delay;
+                (gb.reversing - dt).max(-0.1)
+            };
+            let reverse = if gb.reversing >= 0.1 {
+                true
+            } else {
+                gb.reversing > -0.1 && reversing
+            };
+            let all = v.controller.wheels();
+            let down = all
+                .iter()
+                .filter(|w| w.raycast_info().is_in_contact)
+                .count();
+            if down >= all.len() / 2 {
+                let wheels = self
+                    .world
+                    .bodies
+                    .get(v.controller.chassis)
+                    .map_or(0.0, |b| driven_rpm(b, all, &v.steers, v.steering, e.split));
+                let torque = e.step(gb, dt, open, wheels, reverse);
+                let top = if gb.gear == 0 { e.reverse_speed } else { v.top };
+                let ease = ((top - speed.abs()) / (0.05 * top).max(1e-3)).clamp(0.0, 1.0);
+                if gb.clutch < 0.0 && !controls.brake {
+                    v.drive = e.ratio(gb.gear).abs() * torque * ease;
                 }
             }
         }
-        let declutched = v.clutch > 0.0 && throttle > 0.0;
-        // Pulls as its engine turns in the gear it is in, or as its
-        // tracks' curve says (else 4 m/s² falling to nothing at the
-        // top), up to its top speed; backs up to its reverse top speed
-        // (else half its top speed, at most 8 m/s).
+        // A tank pulls as its tracks' curve says (else 4 m/s² falling to
+        // nothing at the top), up to its top speed (all invented).
         let top = if throttle >= 0.0 {
             v.top
         } else {
@@ -2230,11 +2370,9 @@ impl Physics {
         };
         let headroom = (1.0 - speed.abs() / top).clamp(0.0, 1.0);
         let ease = ((top - speed.abs()) / TOP_EASE).clamp(0.0, 1.0);
-        let push = match (v.engine, v.tracks) {
-            (Some(_), _) if declutched => 0.0,
-            (Some(e), _) => e.push_in(v.gear, speed.abs(), throttle < 0.0) / v.mass * ease,
-            (None, Some(curve)) => TRACK_PULL * track_pull(curve, 1.0 - headroom) * ease,
-            (None, None) => TRACK_PULL * headroom,
+        let push = match v.tracks {
+            Some(curve) => TRACK_PULL * track_pull(curve, 1.0 - headroom) * ease,
+            None => TRACK_PULL * headroom,
         };
         // A tank's braking against the motion (invented).
         let service = |_front: bool| slowing(SERVICE_BRAKE * throttle.abs());
@@ -2247,11 +2385,6 @@ impl Physics {
         // hill.
         let fast = (speed.abs() / v.top.max(0.1)).min(1.0);
         let tyres = v.tyres.map(|t| {
-            let (open, pressed) = if against {
-                (0.0, throttle.abs())
-            } else {
-                (throttle.abs(), 0.0)
-            };
             let held = if controls.brake { 1.0 } else { 0.0 };
             let steer = controls.steer;
             let share = |front: bool| {
@@ -2268,14 +2401,12 @@ impl Physics {
                     Axle {
                         along: hard * share(front),
                         across: t.grip(front, fast, 0.0, 0.0, 0.0),
-                        drive: 0.0,
                         hold: true,
                     }
                 } else {
                     Axle {
                         along: t.slowing(front, speed, open, pressed, held, steer),
                         across: t.grip(front, fast, pressed, held, steer),
-                        drive: 0.0,
                         hold: false,
                     }
                 }
@@ -2305,11 +2436,6 @@ impl Physics {
         v.steering = if v.tracked {
             0.0
         } else {
-            let (open, pressed) = if against {
-                (0.0, throttle.abs())
-            } else {
-                (throttle.abs(), 0.0)
-            };
             v.handling.unwrap_or(Handling::DEFAULT).steer(
                 v.steering,
                 controls.steer.clamp(-1.0, 1.0),
@@ -2327,12 +2453,9 @@ impl Physics {
         // Only the front axle steers: steering every wheel the same way
         // slides the vehicle sideways instead of turning it. The handbrake
         // locks the rest, so the back can slide out.
-        // A wheeled vehicle's axles push it with its engine's pull too, not
-        // Rapier's tyres (which give it no grip).
-        if let Some(mut axles) = tyres {
-            for a in &mut axles {
-                a.drive = force;
-            }
+        // A wheeled vehicle's axles hold it, not Rapier's tyres (which give
+        // it no grip), and its engine pushes it ([`push_axles`]).
+        if let Some(axles) = tyres {
             v.axles = axles;
         }
         for (i, w) in v.controller.wheels_mut().iter_mut().enumerate() {
@@ -2720,7 +2843,7 @@ impl Physics {
             .get(id.0)
             .and_then(Option::as_ref)
             .is_some_and(|v| {
-                v.axles.iter().any(|a| a.drive != 0.0)
+                (v.tyres.is_some() && v.pulling)
                     || v.controller.wheels().iter().any(|w| w.engine_force != 0.0)
             })
     }
@@ -2766,14 +2889,12 @@ impl Physics {
         if along.abs() < ROLL_REST { 0.0 } else { along }
     }
 
-    /// The forward gear a wheeled vehicle's engine drives in (0 is first)
-    /// and how fast that engine turns in it, rpm; `None` without an
-    /// engine from its template.
+    /// The gear a wheeled vehicle's engine drives in (0 reverse, 1 first)
+    /// and how fast that engine turns, rpm; `None` for a tank.
     pub fn vehicle_gear(&self, id: VehicleId) -> Option<(usize, f32)> {
         let v = self.vehicles.get(id.0).and_then(Option::as_ref)?;
-        let e = v.engine?;
-        let speed = v.controller.current_vehicle_speed.abs();
-        Some((v.gear, e.rpm_at(e.gears[v.gear], speed)))
+        v.engine?;
+        Some((v.gearbox.gear, v.gearbox.rpm))
     }
 
     /// Whether a vehicle's driver is braking ([`drive`](Self::drive) last
@@ -3769,6 +3890,22 @@ mod tests {
         extra: 0.05,
         gravity_factor: 1.7,
     };
+    /// Its engine and gearbox, its record's.
+    const OFFROAD_ENGINE: EngineTuning = EngineTuning {
+        torque: 65.0,
+        rpm: (1000.0, 5000.0, 8000.0),
+        upshift: 7000.0,
+        downshift: 4000.0,
+        clutch_delay: 0.0,
+        primary: 5.0,
+        gears: [2.0, 1.35, 0.9, 0.6, 0.4],
+        reverse: 1.0,
+        radius: 0.32,
+        torque_at: (1.0, 1.0),
+        reverse_speed: 50.0 / 3.6,
+        slip: 0.0,
+        split: 0.5,
+    };
 
     #[test]
     fn the_weakest_bike_template_stands_back_up_after_a_shove() {
@@ -3796,6 +3933,10 @@ mod tests {
         };
         bike.tuning.bike = Some(OFFROAD);
         bike.tuning.springs = Some(OFFROAD_SPRINGS);
+        bike.tuning.engine = Some(OFFROAD_ENGINE);
+        // Held to 80 km/h (its record: 110): the alpha's own balance can't
+        // stand it back up at its top speed; the 360's, 0x8219D800, is next.
+        bike.tuning.max_speed = Some(80.0 / 3.6);
         let id = p.add_vehicle(&bike, Vec3::new(0.0, 0.2, 0.0), 0.0);
         let up = |p: &Physics| p.vehicle_transform(id).unwrap().transform_vector3(Vec3::Y);
         let ahead = VehicleControls {
@@ -3813,7 +3954,7 @@ mod tests {
         let mut most = 1.0f32;
         // Slower since the 360's tyres push its axles low (round 3 of the
         // driving model; its own balance, 0x8219D800, isn't traced).
-        for _ in 0..420 {
+        for _ in 0..600 {
             p.drive(id, ahead);
             p.step(DT);
             most = most.min(up(&p).y);
@@ -3821,7 +3962,7 @@ mod tests {
         assert!(most < 0.995, "the shove rolls it ({most})");
         assert!(most > 0.5, "without tipping it over ({most})");
         let end = up(&p).y;
-        assert!(end > 0.9986, "back up within 3 degrees in 7 s ({end})");
+        assert!(end > 0.9986, "back up within 3 degrees in 10 s ({end})");
     }
 
     #[test]
@@ -4483,6 +4624,8 @@ mod tests {
             radius: 0.39,
             torque_at: (0.8, 1.0),
             reverse_speed: 55.0 / 3.6,
+            slip: 1000.0,
+            split: 1.0,
         };
         let spec = VehicleSpec {
             mass: 1000.0,
@@ -4527,9 +4670,9 @@ mod tests {
         assert!(fastest < engine.reverse_speed * 1.03, "{fastest}");
     }
 
-    // Gap round 24: with its template's clutch delay, its gearbox changes
-    // up one gear at a time as it speeds up, and for that long after
-    // each change its engine drives nothing, so it gathers no speed.
+    // With its template's clutch delay, its gearbox changes up one gear at
+    // a time as it speeds up, no sooner than that long after the last
+    // change, its engine driving nothing meanwhile (0x821A0528).
     #[test]
     fn a_change_of_gear_takes_its_clutch_delay() {
         let engine = crate::tuning::EngineTuning {
@@ -4544,6 +4687,8 @@ mod tests {
             radius: 0.39,
             torque_at: (0.8, 1.0),
             reverse_speed: 55.0 / 3.6,
+            slip: 1000.0,
+            split: 1.0,
         };
         let spec = VehicleSpec {
             mass: 1000.0,
@@ -4573,14 +4718,22 @@ mod tests {
                 p.vehicle_speed(id),
             ));
         }
-        let first_change = steps.iter().position(|s| s.0 == 1).expect("changes up");
-        assert_eq!(steps[first_change - 1].0, 0);
-        // Over the delay that follows it gains next to nothing.
-        let after = steps[first_change + (0.4 / DT) as usize];
+        let first_change = steps.iter().position(|s| s.0 == 2).expect("changes up");
+        assert_eq!(steps[first_change - 1].0, 1);
+        // Over the delay that follows it stays in second, its engine
+        // driving nothing, so it gains next to nothing.
+        let after = steps[first_change + (0.45 / DT) as usize];
+        assert_eq!(after.0, 2);
         assert!(after.1 - steps[first_change].1 < 0.1, "{after:?}");
-        // Then it pulls again.
-        let later = steps[first_change + (1.0 / DT) as usize];
-        assert!(later.1 - after.1 > 0.5, "{later:?}");
+        let changes: Vec<usize> = (1..steps.len())
+            .filter(|&i| steps[i].0 != steps[i - 1].0)
+            .collect();
+        assert!(
+            changes
+                .windows(2)
+                .all(|w| (w[1] - w[0]) as f32 * DT >= 0.49),
+            "{changes:?}"
+        );
         // One gear at a time, never back down while it speeds up.
         assert!(
             steps
@@ -4762,12 +4915,14 @@ mod tests {
             }
             (steered, v0 / t)
         };
+        // Its engine drags it as well (the default engine's, off the
+        // throttle): the brakes add their sum on top of that.
         let (lock, soft) = slowing((3.0, 1.0), 1.0);
         assert!((lock - 1.0).abs() < 0.05, "{lock}");
-        assert!((soft - 4.0).abs() < 0.4, "{soft}");
+        assert!(soft > 3.8, "{soft}");
         let (lock, hard) = slowing((9.0, 7.0), 0.5);
         assert!((lock - 0.5).abs() < 0.05, "{lock}");
-        assert!((hard - 16.0).abs() < 1.5, "{hard}");
+        assert!(((hard - soft) - 12.0).abs() < 1.5, "{soft} {hard}");
     }
 
     // Its front wheels swing towards full lock as quickly as its template
