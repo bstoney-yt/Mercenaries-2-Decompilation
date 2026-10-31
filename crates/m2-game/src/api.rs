@@ -701,6 +701,18 @@ pub struct ScriptWorld {
     /// The friendly faction gates in play: objects the engine runs
     /// `friendlygate` on ([`crate::mission::OBJECT_SCRIPTS`]).
     pub gates: HashSet<u32>,
+    /// Gates the scripts shut (`Object.CloseGate`) and haven't opened
+    /// since: fully closed at once (inferred: the engine here plays no
+    /// closing, so the `"gateFullyClosed"` physics event holds as soon as
+    /// they are shut).
+    pub shut: HashSet<u32>,
+    /// Objects the scripts removed (`Object.Remove`) while alive: gone,
+    /// not dead, so an `ObjectDeath` on them never fires (inferred:
+    /// JetCon001's death events on its bunker busters outlive their
+    /// pickup, `Event.Delete` being handed their names, and the
+    /// munitions taken up are removed; were removal a death, the
+    /// contract would cancel itself every time).
+    pub removed_alive: HashSet<u32>,
     /// Seconds the gates still hear her last honk ([`HONK_HEARD`]): until
     /// then they know her for who she is, and she is a candidate for
     /// their opening as their script judges her.
@@ -1069,6 +1081,16 @@ impl World for ScriptWorld {
             .player
             .is_some_and(|p| a == p || self.vehicle_of(p) == Some(a));
         hers && self.gates.contains(&gate) && self.honk_heard <= 0.0
+    }
+    fn died(&self, guid: u32) -> bool {
+        !self.is_alive(guid) && !self.removed_alive.contains(&guid)
+    }
+    fn physics_event(&self, object: u32, name: &str) -> Option<bool> {
+        match name {
+            "gatefullyclosed" => Some(self.shut.contains(&object)),
+            "gatestuck" => Some(false),
+            _ => None,
+        }
     }
 
     fn game_state(&self) -> Option<String> {
@@ -1715,6 +1737,18 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // (object, boundary): whether the object (a rider: its vehicle) is
+    // inside the boundary, as the `Boundary` event judges it. From the 8
+    // call sites: an object and a region's guid, read as a truth
+    // (MecCon001 closes the garage once the truck is in
+    // `mechanicHQ.rgn.inside`, else hands the park objective out again).
+    add(&object, "InsideBoundary", |w, _, a| {
+        let inside = match (id(a.first()), id(a.get(1))) {
+            (Some(o), Some(b)) => w.inside(o, b).unwrap_or(false),
+            _ => false,
+        };
+        values([Value::Boolean(inside)])
+    })?;
     add(&object, "IsAlive", |w, _, a| {
         values([Value::Boolean(id(a.first()).is_some_and(|g| w.is_alive(g)))])
     })?;
@@ -1772,7 +1806,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&object, "Remove", |w, _, a| {
         if let Some(guid) = id(a.first()) {
-            w.objects.remove(&guid);
+            if w.objects.remove(&guid).is_some_and(|o| o.alive) {
+                w.removed_alive.insert(guid);
+            }
             w.inventory.drop(guid);
             w.commands.push(Command::Remove(guid));
         }
@@ -1787,6 +1823,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => None,
         });
         if let Some(guid) = gate {
+            w.shut.remove(&guid);
             w.commands.push(Command::OpenGate(guid));
         }
         values([])
@@ -1799,6 +1836,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => None,
         });
         if let Some(guid) = gate {
+            w.shut.insert(guid);
             w.commands.push(Command::CloseGate(guid));
         }
         values([])
@@ -2415,9 +2453,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([Value::Table(t)])
     })?;
-    // One player, numbered 1.
+    // One player, guid 1, as userdata (from the scripts:
+    // `MrxGuiBase.WidgetManager.GetWidgetByNameAndOwner` answers only for
+    // a userdata owner, so a number found none of her widgets, the PDA
+    // among them; the game HUD's thread answered the same already).
     for name in ["GetLocalPlayer", "GetPrimaryPlayer"] {
-        add(&player, name, |_, _, _| values([Value::Integer(1)]))?;
+        add(&player, name, |_, _, _| values([guid_value(Some(1))]))?;
     }
     add(&player, "GetSecondaryPlayer", |_, _, _| {
         values([Value::Nil])
@@ -2428,7 +2469,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // The players, a list the scripts go through (`pairs`, `ipairs`)...
     add(&player, "GetAllPlayers", |_, lua, _| {
         let t = lua.create_table()?;
-        t.raw_push(1)?;
+        t.raw_push(guid_value(Some(1)))?;
         values([Value::Table(t)])
     })?;
     // ...and how many there are, which they compare and count with
@@ -4401,6 +4442,42 @@ mod tests {
     }
 
     #[test]
+    fn inside_boundary_reads_the_region_round_an_object() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(
+                70,
+                Object::new("mechanicHQ.rgn.inside", [100.0, 0.0, 100.0]),
+            );
+            w.insert(71, Object::new("Monster Truck", [103.0, 0.0, 98.0]));
+            w.insert(
+                72,
+                Object::new("Offroad Motorcycle (GR)", [120.0, 0.0, 100.0]),
+            );
+            let corners = vec![[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]];
+            w.regions.insert(
+                70,
+                m2_assets::Region {
+                    flags: 0x0004_0002,
+                    unk_0x04: 0,
+                    corners,
+                },
+            );
+        }
+        let (truck, bike): (bool, bool) = host
+            .lua()
+            .load(
+                "local r = Pg.GetGuidByName('mechanicHQ.rgn.inside') \
+                 return Object.InsideBoundary(Pg.GetGuidByName('Monster Truck'), r), \
+                 Object.InsideBoundary(Pg.GetGuidByName('Offroad Motorcycle (GR)'), r)",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((truck, bike), (true, false));
+    }
+
+    #[test]
     fn entering_a_named_region_fires_boundary_events() {
         let (host, world) = setup();
         {
@@ -4929,6 +5006,46 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(pilot, "Recruit Ewen Garret");
+    }
+
+    #[test]
+    fn the_current_players_are_a_count_and_all_players_a_list() {
+        let (host, _world) = setup();
+        let (more, n): (bool, usize) = host
+            .lua()
+            .load("return 1 < Player.GetCurrentPlayers(), #Player.GetAllPlayers()")
+            .eval()
+            .unwrap();
+        assert_eq!((more, n), (false, 1));
+    }
+
+    #[test]
+    fn an_object_removed_alive_is_gone_not_dead() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(80, Object::new("JetCon001_BunkerBuster03", [0.0; 3]));
+            w.insert(81, Object::new("VZ Soldier", [0.0; 3]));
+        }
+        host.lua()
+            .load("Object.Remove(Pg.GetGuidByName('JetCon001_BunkerBuster03')) Object.Kill(Pg.GetGuidByName('VZ Soldier'))")
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        assert_eq!((w.died(80), w.died(81)), (false, true));
+    }
+
+    #[test]
+    fn a_gate_the_scripts_shut_is_fully_closed_until_opened() {
+        let (host, world) = setup();
+        let closed = |w: &Rc<RefCell<ScriptWorld>>| w.borrow().physics_event(7, "gatefullyclosed");
+        assert_eq!(closed(&world), Some(false));
+        host.lua().load("Object.CloseGate(7)").exec().unwrap();
+        assert_eq!(closed(&world), Some(true));
+        assert_eq!(world.borrow().physics_event(7, "gatestuck"), Some(false));
+        host.lua().load("Object.OpenGate(7)").exec().unwrap();
+        assert_eq!(closed(&world), Some(false));
+        assert_eq!(world.borrow().physics_event(7, "vehiclesinking"), None);
     }
 
     #[test]

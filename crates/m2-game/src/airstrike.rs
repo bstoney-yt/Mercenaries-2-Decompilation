@@ -16,7 +16,7 @@
 //! Flyby(vehicle, x1, z1, x2, z2, altitude, speed, callback, data) -> jet
 //! SpawnOrdnance(template, x, y, z, vx, vy, vz, fuse, fuse value, owner,
 //!               callback, data) -> ordnance
-//! SpawnTargettedOrdnance(template, x, y, z, tx, ty, tz, target, fuse,
+//! SpawnTargettedOrdnance(template, x, y, z, dx, dy, dz, target, fuse,
 //!               fuse value, owner, callback, data) -> ordnance
 //! ConeSpawn(template, x, y, z, dx, dy, dz, cone degrees, count, speed)
 //! SpawnCarpetBombLine(x, y, z, heading, owner, nil, count, spacing)
@@ -24,6 +24,12 @@
 //! SpawnDirectedObject(effect, x, y, z, dx, dy, dz) -> object
 //! EquipDesignator(owner, designation type) -> weapon
 //! ```
+//!
+//! `SpawnTargettedOrdnance`'s `dx, dy, dz` is its launch: every caller
+//! passes the unit way from the aircraft to the target (the cruise
+//! missile, the smart bomb), or that times 80 (the laser-guided bomb and
+//! the bunker buster), a speed then; it makes for `target`, the
+//! designator's mark, where that stands.
 //!
 //! What is inferred rather than read: a flyby starts at its altitude (the
 //! scripts give the start only as x and z); the daisy cutter puts a number
@@ -282,16 +288,35 @@ fn spawn_targetted(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<Mu
     let Some(what) = template_name(w, a.first()) else {
         return values([Value::Nil]);
     };
-    let (Some(at), Some(aim)) = (point(a, 1), point(a, 4)) else {
+    let (Some(at), Some(dir)) = (point(a, 1), point(a, 4)) else {
         return values([Value::Nil]);
     };
     let target = id(a.get(7));
+    // Where it makes for: the target object (the laser's mark) where it
+    // stands, else straight on 200 m (invented).
+    let aim = target
+        .and_then(|t| w.objects.get(&t))
+        .map(|o| o.position)
+        .or_else(|| {
+            unit(dir).map(|u| {
+                [
+                    at[0] + u[0] * 200.0,
+                    at[1] + u[1] * 200.0,
+                    at[2] + u[2] * 200.0,
+                ]
+            })
+        })
+        .unwrap_or(at);
     let (fuse, owner, callback) = after_launch(a.get(8..).unwrap_or_default());
     let guid = launch(
         w,
         what,
         at,
-        Launch::Along(unit(sub(aim, at)).unwrap_or([0.0, -1.0, 0.0])),
+        if dir.iter().map(|c| c * c).sum::<f32>() > 2.0 {
+            Launch::Velocity(dir)
+        } else {
+            Launch::Along(unit(dir).unwrap_or([0.0, -1.0, 0.0]))
+        },
         fuse,
         Some((target, aim)),
         owner,
@@ -425,10 +450,6 @@ fn point(a: &[Value], from: usize) -> Option<[f32; 3]> {
     ])
 }
 
-fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    std::array::from_fn(|i| a[i] - b[i])
-}
-
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
@@ -475,5 +496,29 @@ mod tests {
         );
         assert_eq!(Fuse::of(Some("distance"), Some(12.0)), Fuse::Distance(12.0));
         assert_eq!(Fuse::of(None, None), Fuse::Impact);
+    }
+
+    #[test]
+    fn targetted_ordnance_launches_along_its_way_at_its_mark() {
+        let lua = Lua::new();
+        let mut w = ScriptWorld::default();
+        w.insert(7, Object::new("laser mark", [10.0, 0.0, 300.0]));
+        let a = [
+            Value::String(lua.create_string("Bunker Buster Projectile").unwrap()),
+            Value::Number(0.0),
+            Value::Number(100.0),
+            Value::Number(0.0),
+            Value::Number(0.0),
+            Value::Number(-24.0),
+            Value::Number(76.3),
+            crate::events::guid_value(7),
+            Value::String(lua.create_string("impact").unwrap()),
+        ];
+        spawn_targetted(&mut w, &lua, &a).unwrap();
+        let Some(Command::Ordnance { launch, target, .. }) = w.commands.last() else {
+            panic!("no ordnance");
+        };
+        assert_eq!(*launch, Launch::Velocity([0.0, -24.0, 76.3]));
+        assert_eq!(*target, Some((Some(7), [10.0, 0.0, 300.0])));
     }
 }

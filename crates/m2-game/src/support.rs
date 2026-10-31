@@ -139,3 +139,110 @@ o:SetFuelCost(s:GetFuelCost())
 o:SetCashCost(s:GetCashCost())
 return o:Commence() ~= false
 "#;
+
+/// Who has joined her PMC, as the scripts hold it: the support
+/// catalogue's requirements (`MrxSupportData.tRequirementsObtained`:
+/// `Copter` for Ewan the helicopter pilot, `Mechanic` for Eva, `Pilot`
+/// for Misha the jet pilot; the story's start sets all three false and
+/// `MrxStarterManager.CreateStarter` sets each true as its recruit's
+/// `HelPmcBoss`, `MecPmcBoss` or `JetPmcBoss` starter comes to the PMC),
+/// those starters, and how many catalogue items the requirements let
+/// her call in (`MrxSupportData.IsSupportEquippable`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Recruits {
+    pub copter: bool,
+    pub mechanic: bool,
+    pub pilot: bool,
+    /// The PMC's recruit starters the starter manager holds, of
+    /// `HelPmcBoss`, `MecPmcBoss` and `JetPmcBoss`.
+    pub starters: Vec<String>,
+    /// Catalogue items (`tSupportData`) she may call in, and of them how
+    /// many a missing recruit refuses.
+    pub equippable: usize,
+    pub refused: usize,
+}
+
+/// [`Recruits`] now; all false and none where the modules aren't loaded.
+pub fn recruits(lua: &Lua) -> mlua::Result<Recruits> {
+    let code = r#"
+local d = MrxSupportData
+local r = d and d.tRequirementsObtained or {}
+local m = MrxStarterManager
+local starters = {}
+for _, name in ipairs({ "HelPmcBoss", "MecPmcBoss", "JetPmcBoss" }) do
+    if m and m.GetStarter and m.GetStarter(name) then starters[#starters + 1] = name end
+end
+local ok, refused = 0, 0
+if d and d.tSupportData and d.IsSupportEquippable then
+    for key, item in pairs(d.tSupportData) do
+        local yes = d.IsSupportEquippable(key)
+        if yes then ok = ok + 1
+        elseif item.oSupport and item.oSupport.GetRecruit and item.oSupport:GetRecruit() then
+            refused = refused + 1
+        end
+    end
+end
+return r.Copter == true, r.Mechanic == true, r.Pilot == true, starters, ok, refused
+"#;
+    let (copter, mechanic, pilot, starters, equippable, refused): (
+        bool,
+        bool,
+        bool,
+        Vec<String>,
+        usize,
+        usize,
+    ) = lua.load(code).set_name("recruits").eval()?;
+    Ok(Recruits {
+        copter,
+        mechanic,
+        pilot,
+        starters,
+        equippable,
+        refused,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recruits_read_the_requirements_the_starters_and_what_they_refuse() {
+        let lua = Lua::new();
+        lua.load(
+            r#"
+            local recruit = { GetRecruit = function(self) return self.r end }
+            recruit.__index = recruit
+            local function item(r) return { oSupport = setmetatable({ r = r }, recruit) } end
+            MrxSupportData = {
+                tRequirementsObtained = { Fiona = true, Copter = true, Mechanic = true, Pilot = false },
+                tSupportData = { crate = item(nil), mi35 = item("Copter"), mig = item("Pilot") },
+            }
+            function MrxSupportData.IsSupportEquippable(key)
+                local r = MrxSupportData.tSupportData[key].oSupport:GetRecruit()
+                return not r or MrxSupportData.tRequirementsObtained[r]
+            end
+            MrxStarterManager = { GetStarter = function(n) return n ~= "JetPmcBoss" or nil end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let r = recruits(&lua).unwrap();
+        assert_eq!(
+            r,
+            Recruits {
+                copter: true,
+                mechanic: true,
+                pilot: false,
+                starters: vec!["HelPmcBoss".into(), "MecPmcBoss".into()],
+                equippable: 2,
+                refused: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn recruits_are_none_before_the_modules_load() {
+        assert_eq!(recruits(&Lua::new()).unwrap(), Recruits::default());
+    }
+}
