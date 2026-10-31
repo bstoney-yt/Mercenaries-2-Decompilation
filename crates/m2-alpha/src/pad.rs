@@ -208,6 +208,9 @@ pub struct Pad {
     pub rumble_on: bool,
     /// Seconds of shaking left ([`Pad::rumble`]).
     shaking: f64,
+    /// The left stick's pushes up and down step a menu as the d-pad
+    /// does ([`Pad::stick_steps`]): set while a dialog box is up.
+    pub stick_menu: bool,
     /// The motors are running.
     motors: bool,
 }
@@ -269,7 +272,10 @@ impl Pad {
             let took = m2_sys::xinput::vibrate(left, right);
             self.motors = on && took;
         }
-        let keys = Self::menu_keys(&self.last, &s);
+        let mut keys = Self::menu_keys(&self.last, &s);
+        if self.stick_menu {
+            keys.extend(Self::stick_steps(&self.last, &s));
+        }
         self.feed(input, s, driving, dt);
         // The touch controls' sprint is switched on, not held: she sprints
         // on foot whenever she moves while it is.
@@ -328,6 +334,22 @@ impl Pad {
         let rate = LOOK_RATE * self.look.unwrap_or(1.0);
         input.pad_look(curve(rx) * rate * dt, -curve(ry) * rate * dt);
         self.last = s;
+    }
+
+    /// Up and down as the left stick is pushed past half way that way
+    /// going from `before` to `now`, once a push (a dialog box's
+    /// `_HandleInputEvent` steps on the stick as on the d-pad; the half
+    /// way is the hijacks' push, [`PUSH`]).
+    pub fn stick_steps(before: &PadState, now: &PadState) -> Vec<MenuKey> {
+        let (was, is) = (before.left[1], now.left[1]);
+        let mut out = Vec::new();
+        if is > PUSH && was <= PUSH {
+            out.push(MenuKey::Up);
+        }
+        if is < -PUSH && was >= -PUSH {
+            out.push(MenuKey::Down);
+        }
+        out
     }
 
     /// The menu keys pressed going from reading `before` to `now`: what
@@ -676,6 +698,28 @@ mod tests {
         pad.feed(&mut input, s, false, 0.016);
         let i = crate::player::Intent::from_input(&mut input, &config, false);
         assert!((i.walking().length() - 1.0).abs() < 1e-6);
+    }
+
+    /// Playtest: in Fiona's contract menu the stick steps the box, once a
+    /// push, up and down.
+    #[test]
+    fn the_stick_steps_a_dialog_box_once_a_push() {
+        let at = |y| PadState {
+            left: [0.0, y],
+            ..PadState::default()
+        };
+        assert_eq!(Pad::stick_steps(&at(0.0), &at(0.9)), [MenuKey::Up]);
+        assert!(Pad::stick_steps(&at(0.9), &at(1.0)).is_empty(), "held");
+        assert!(Pad::stick_steps(&at(0.0), &at(0.3)).is_empty(), "a nudge");
+        assert_eq!(Pad::stick_steps(&at(0.9), &at(-0.8)), [MenuKey::Down]);
+        // Polled with it set, the push comes with the menu keys.
+        let mut pad = Pad {
+            stick_menu: true,
+            ..Pad::default()
+        };
+        let mut input = Input::default();
+        pad.feed(&mut input, at(0.0), false, 0.016);
+        assert_eq!(Pad::stick_steps(&pad.last, &at(-0.9)), [MenuKey::Down]);
     }
 
     #[test]

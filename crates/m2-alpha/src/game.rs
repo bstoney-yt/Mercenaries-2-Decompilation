@@ -184,6 +184,10 @@ pub struct Game {
     pub placed: crate::placed::Placed,
     /// The scripts have turned her controls off (a loading fade).
     pub input_locked: bool,
+    /// A dialog box of the scripts is up (Fiona's contract menu): it
+    /// has the controls (`MrxGuiDialogBox._HandleInputEvent` takes the
+    /// pad's events), so she stands still and has no crosshair.
+    pub dialog_up: bool,
     /// The scripts' countdown ticked since autoplay last looked (a
     /// `ui_HUD_Timer_` cue: OilCon002's 15 minutes).
     pub countdown_tick: bool,
@@ -399,6 +403,7 @@ impl Game {
             refused: std::collections::HashSet::new(),
             placed: crate::placed::Placed::default(),
             input_locked: false,
+            dialog_up: false,
             countdown_tick: false,
             hijack_only: HashSet::new(),
             unusable: HashSet::new(),
@@ -880,7 +885,7 @@ impl Game {
         split("game: moving");
         self.fetch_world_vehicles(dt);
         self.arrive(dt);
-        let intent = if self.input_locked {
+        let intent = if self.input_locked || self.dialog_up {
             Intent::default()
         } else {
             intent
@@ -2096,7 +2101,7 @@ impl Game {
         });
         // What the crosshair is on: on foot, or in a vehicle with a gun.
         let crosshair = match (&self.scene.world, player) {
-            (Some(w), Some(p)) if self.combat.down <= 0.0 => match p.driving {
+            (Some(w), Some(p)) if self.combat.down <= 0.0 && !self.dialog_up => match p.driving {
                 Some(i) => self
                     .scene
                     .vehicles

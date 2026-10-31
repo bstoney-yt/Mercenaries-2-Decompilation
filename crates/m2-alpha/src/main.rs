@@ -8126,7 +8126,26 @@ impl Running {
         let driving = self.game.driving().is_some();
         let rumble = std::mem::take(&mut self.game.rumble);
         self.pad.rumble(rumble);
-        let keys = self.pad.poll(&mut self.input, driving, dt);
+        // A dialog box the scripts put up has the pad: its stick and
+        // buttons step and take the box, not move her (playtest: at
+        // Fiona's contract menu the stick walked her about).
+        let dialog = !self.hud.menu
+            && self
+                .mission
+                .as_ref()
+                .is_some_and(mission::MissionLink::dialog_open);
+        if dialog != self.game.dialog_up {
+            self.game.dialog_up = dialog;
+            self.input.clear();
+            eprintln!(
+                "dialog box {}: the pad steps it",
+                if dialog { "up" } else { "gone" }
+            );
+        }
+        self.pad.stick_menu = dialog;
+        let mut held = Input::default();
+        let target = if dialog { &mut held } else { &mut self.input };
+        let keys = self.pad.poll(target, driving, dt);
         for key in keys {
             use pad::MenuKey;
             if let Some(flow) = self.flow.as_mut().filter(|f| f.holds()) {
