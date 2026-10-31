@@ -3393,18 +3393,22 @@ impl Autoplay {
                 || game.scene.world.as_ref().is_none_or(|w| {
                     let dir = launch_dir(m, at);
                     w.physics
-                        .cast_ray(
-                            m.pivot + dir * crate::combat::MANNED_MUZZLE,
-                            dir,
-                            MUZZLE_CLEAR,
-                        )
+                        .cast_ray(m.muzzle(dir), dir, MUZZLE_CLEAR)
                         .is_none()
                 })
         });
         if !muzzle_clear && self.steady > STEADY {
+            let what = game.combat.manned.as_ref().and_then(|m| {
+                let w = game.scene.world.as_ref()?;
+                let dir = launch_dir(m, at);
+                let from = m.muzzle(dir);
+                w.physics
+                    .cast_ray_keyed(from, dir, MUZZLE_CLEAR)
+                    .map(|(t, _, key)| (key, from, dir, t))
+            });
             eprintln!(
-                "autoplay {:.1} s: something by the gun is in the way of {target:#x}: another \
-                 for {KEEP_PASS:.0} s",
+                "autoplay {:.1} s: something by the gun is in the way of {target:#x} ({what:?}): \
+                 another for {KEEP_PASS:.0} s",
                 self.clock
             );
             self.passed.push((target, self.clock + KEEP_PASS));
@@ -6643,6 +6647,9 @@ mod tests {
                 scope: None,
             },
             rounds: 50,
+            model: 0,
+            hardpoint: 0,
+            barrel: None,
         }
     }
 

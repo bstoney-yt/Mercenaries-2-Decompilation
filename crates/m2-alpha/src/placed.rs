@@ -96,6 +96,36 @@ fn yaw_of(rotation: Quat) -> f32 {
     f.x.atan2(f.z)
 }
 
+/// Where emplaced gun `m`'s rounds start ([`Manned::barrel`]): its
+/// `PhysicalLink`'s hardpoint on its own model, placed as its prop stands
+/// (world), and its weapon model's `Muzzle` node from that model's origin.
+/// From samples: both nodes (PmcCon031's launchers' hardpoint stands over
+/// their sandbags, the muzzle out along the weapon's +z).
+pub fn barrel<R: std::io::Read + std::io::Seek>(
+    source: Option<&mut m2_engine::AssetSource<R>>,
+    props: &Props,
+    m: &Manned,
+) -> Option<(Vec3, Vec3)> {
+    let source = source?;
+    let (p, _) = props.get(m.entity)?;
+    let mut node = |model: u32, name: u32| {
+        let data = source.model(model).ok()?;
+        let parsed = data.parse().ok()?;
+        m2_assets::vehicle::marker(&parsed, name).map(Vec3::from)
+    };
+    let mount = node(m.model, m.hardpoint);
+    let muzzle = m
+        .weapon
+        .model
+        .and_then(|w| node(w, m2_engine::vehicle::GUN_MUZZLE));
+    eprintln!(
+        "placed: emplaced gun {:#x} model {:08x}: hardpoint {:08x} at {mount:?}, weapon {:?} \
+         muzzle {muzzle:?}",
+        m.entity, m.model, m.hardpoint, m.weapon.model
+    );
+    Some((p.position + p.rotation * mount?, muzzle?))
+}
+
 /// How many of each are in play, for the log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
@@ -315,14 +345,14 @@ impl Placed {
             .filter(|&(.., d)| d <= MAN_REACH)
             .min_by(|a, b| a.3.total_cmp(&b.3))
             .map(|(e, t, p, _)| (e, t, *p))?;
-        let weapon = templates
+        let (weapon, hardpoint) = templates
             .arms
             .armaments
             .get(&t)?
             .mounts
             .iter()
-            .find_map(|m| templates.arms.weapons.get(&m.weapon))?
-            .clone();
+            .find_map(|m| Some((templates.arms.weapons.get(&m.weapon)?, m.hardpoint)))?;
+        let weapon = weapon.clone();
         let turret = templates.tuning.get(&t).and_then(|v| v.turret);
         let (lo, hi) = (-90f32.to_radians(), 90f32.to_radians());
         Some(Manned {
@@ -334,6 +364,9 @@ impl Placed {
             pitch: turret.map_or((-0.35, 0.5), |t| t.pitch),
             rounds: weapon.clip.max(1) * (1 + weapon.reserve_clips),
             weapon,
+            model: p.model,
+            hardpoint,
+            barrel: None,
         })
     }
 

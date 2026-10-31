@@ -984,7 +984,11 @@ impl Game {
                             player.character.position,
                         )
                     })
-                    .flatten();
+                    .flatten()
+                    .map(|mut m| {
+                        m.barrel = crate::placed::barrel(scene.source.as_mut(), &scene.props, &m);
+                        m
+                    });
                     match player.driving {
                         // Out over deep water she swims (`Player::update_swim`).
                         Some(i) => {
