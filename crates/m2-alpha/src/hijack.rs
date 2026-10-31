@@ -24,9 +24,9 @@
 //!
 //! Her clips, the crewman's and the vehicle's play together. The
 //! vehicle's clip moves its own nodes (the hatch thrown open). Her clips
-//! play from the vehicle's origin, lifted so that, holding the pistol at
-//! the hatch, she stands on the roof the hatch hinges in (the M1A2 0.9 m,
-//! the AMX30 2.1 m). The crewman (drawn as a rider is, on his kind's
+//! play from the driver's seat's point, all in one place: from the ground
+//! in front, up over the gun barrel (the line's caption: "climbing up
+//! tank barrel"), to the roof the hatch hinges in. The crewman (drawn as a rider is, on his kind's
 //! skeleton) plays his so that in his struggle loop his pelvis is at the
 //! hatch: half out of it. The camera sits close at her chest, from her
 //! side of the vehicle, as the footage's does. The scripts' own calls
@@ -34,13 +34,19 @@
 //! ([`Hijacks::take_gui_calls`]).
 //!
 //! Provenance: which clips play is the tables' (from samples; the
-//! crewman's by the driver's seat). Where they play is inferred from
-//! samples against the footage (the hijack video's M1A2: her on the
-//! turret roof, the crewman half out of the hatch): her clips sat 0.9 m
-//! (M1A2) to 2.1 m (AMX30) under that roof, his some 6 m behind the tank
-//! (his loop's pelvis then lands within 0.1 m of the hatch across and
-//! up, both tanks). How the game places them was not read from the 360
-//! code. The camera's distance and angle are from the footage.
+//! crewman's by the driver's seat). Her clips play at the driver's
+//! seat's point (from samples, playtest round): the scripts set her
+//! `InVehicle`, and her clips' roots run on from one to the next in one
+//! place whose origin is the seat's: put there, her feet start on the
+//! ground in front of the hull (0.43 m up on the M1A1, 0.17 m on the
+//! AMX30) and stand on the hatch's roof in her pistol loop (within
+//! 0.05 m of the fit to the footage, 0.9 m under that roof on the M1A2,
+//! 2.1 m on the AMX30), where the vehicle's origin had her first clip
+//! 0.5 m (M1A1) and 1.8 m (AMX30) underground. The 360 code's placing
+//! of a seated character was not traced. The crewman's clips play some
+//! 6 m behind the tank, moved so his loop's pelvis lands within 0.1 m of
+//! the hatch (both tanks; inferred against the footage). The camera's
+//! distance and angle are from the footage.
 //!
 //! [`ParkedVehicle::crew`]: crate::scene::ParkedVehicle::crew
 //!
@@ -941,11 +947,18 @@ impl Hijacks {
         let model_yaw = forward.x.atan2(forward.y);
         let ahead = at.transform_vector3(Vec3::Z);
         let yaw = ahead.x.atan2(ahead.z);
-        let origin = at.transform_point3(Vec3::ZERO);
+        // Her clips play in the driver's seat's place (the scripts set her
+        // `InVehicle`, the stance whose clips sit at the seat): one place
+        // for the whole hijack, the clips' roots running on from one to
+        // the next. Without the seat's point, the vehicle's origin with
+        // the lift fitted to the hatch's roof, the first clip on the
+        // ground (the old way).
+        let seat = scene.vehicles[a.vehicle].spec.seat;
+        let origin = at.transform_point3(seat.unwrap_or(Vec3::ZERO));
         let off = m2_math::glam::Quat::from_rotation_y(yaw)
             * Vec3::new(root.x - c.info.pin.x, 0.0, root.z - c.info.pin.y);
         p.facing = yaw + model_yaw;
-        let lift = if a.clip == a.first {
+        let lift = if seat.is_some() || a.clip == a.first {
             0.0
         } else {
             a.lift.unwrap_or(0.0)
