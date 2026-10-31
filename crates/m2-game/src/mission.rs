@@ -1413,10 +1413,7 @@ impl Mission {
     /// Character `guid` is put in vehicle `vehicle` (a prisoner loaded
     /// into the extraction helicopter): seat events fire on the next tick.
     pub fn seat_in(&mut self, guid: u32, vehicle: u32) {
-        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
-            o.vehicle = Some(vehicle);
-            o.seated_instantly = false;
-        }
+        self.world.borrow_mut().put_aboard(guid, vehicle, false);
     }
 
     /// Character `guid` gets out of whatever they ride (a follower out of
@@ -2171,9 +2168,16 @@ end
         // Who rides what, in one pass over the objects: once the story
         // has moved on (`--skip-to`) the layers hold thousands of crews,
         // and a pass over every object for each crew stalled each tick
-        // for minutes.
+        // for minutes. Only those who may ride something are looked at
+        // ([`ScriptWorld::riders`]).
+        let mut riders = w.riders.clone();
+        riders.sort_unstable();
+        riders.dedup();
         let mut by_vehicle: HashMap<u32, Vec<(u32, &String)>> = HashMap::new();
-        for (&r, o) in &w.objects {
+        for (r, o) in riders
+            .into_iter()
+            .filter_map(|r| Some((r, w.objects.get(&r)?)))
+        {
             if let Some(v) = o.vehicle
                 && o.alive
                 && Some(r) != w.player
@@ -2182,11 +2186,12 @@ end
                 by_vehicle.entry(v).or_default().push((r, &o.name));
             }
         }
-        let mut out: Vec<CrewAboard> = w
-            .crews
-            .iter()
-            .filter_map(|(&g, crew)| {
-                let mut riders = by_vehicle.remove(&g).unwrap_or_default();
+        // Only the crews with someone aboard: going over every crew (and
+        // copying each one's seats) cost more than the rest of a tick.
+        let mut out: Vec<CrewAboard> = by_vehicle
+            .into_iter()
+            .filter_map(|(g, mut riders)| {
+                let crew = w.crews.get(&g)?;
                 riders.sort_unstable();
                 let mut free: Vec<&(String, String)> = crew.iter().collect();
                 let aboard: Vec<(String, u32, String)> = riders

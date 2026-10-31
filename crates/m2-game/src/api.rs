@@ -540,6 +540,13 @@ pub struct ScriptWorld {
     /// the scripts' next look finds them awake wherever they are
     /// ([`Self::update_hibernation`]).
     fresh: Vec<u32>,
+    /// Who may ride something: those riding at the last pass over every
+    /// object ([`Self::update_hibernation`]) and those put aboard or
+    /// spawned aboard since (a few may have got out). Lets the crews
+    /// riding be found without going over every object each tick, which
+    /// with a contract's 76,000 objects cost a fifth of play's time (perf
+    /// round 1).
+    pub riders: Vec<u32>,
     /// What `Sys.GetAssetRequestMax` answers; scripts raise it while
     /// layers load and put it back.
     pub asset_request_max: u32,
@@ -716,7 +723,20 @@ pub struct ScriptWorld {
 impl ScriptWorld {
     /// Adds (or replaces) an object scripts can name.
     pub fn insert(&mut self, guid: u32, object: Object) {
+        if object.vehicle.is_some() {
+            self.riders.push(guid);
+        }
         self.objects.insert(guid, object);
+    }
+
+    /// Puts `guid` aboard `vehicle` (`seated_instantly` as `instant`), if
+    /// it is an object.
+    pub fn put_aboard(&mut self, guid: u32, vehicle: u32, instant: bool) {
+        if let Some(o) = self.objects.get_mut(&guid) {
+            o.vehicle = Some(vehicle);
+            o.seated_instantly = instant;
+            self.riders.push(guid);
+        }
     }
 
     /// The object called `name` (layer entity names are unique enough;
@@ -933,6 +953,19 @@ impl ScriptWorld {
         FIRST_SPAWNED + self.next_spawn
     }
 
+    /// The game says how long `guid`'s last raw clip is (seconds): it
+    /// runs out from now.
+    pub fn raw_clip_length(&mut self, guid: u32, seconds: f32) {
+        self.raw_clips.insert(guid, Some(seconds));
+    }
+
+    /// Moves the raw clips on by `dt` seconds.
+    pub fn tick_raw_clips(&mut self, dt: f32) {
+        for left in self.raw_clips.values_mut().flatten() {
+            *left -= dt;
+        }
+    }
+
     /// Wakes the objects the player has come within their hibernation
     /// distance of ([`HIBERNATION_DISTANCE`], every object's until the
     /// templates' own are read) and puts to sleep those she has left
@@ -953,27 +986,26 @@ impl ScriptWorld {
     /// from the drop zone); in the real game's recording that helicopter
     /// comes 4 s after the objective is shown, so it isn't waiting for her
     /// to come near (inferred from the scripts and the footage).
-    /// The game says how long `guid`'s last raw clip is (seconds): it
-    /// runs out from now.
-    pub fn raw_clip_length(&mut self, guid: u32, seconds: f32) {
-        self.raw_clips.insert(guid, Some(seconds));
-    }
-
-    /// Moves the raw clips on by `dt` seconds.
-    pub fn tick_raw_clips(&mut self, dt: f32) {
-        for left in self.raw_clips.values_mut().flatten() {
-            *left -= dt;
-        }
-    }
-
+    ///
+    /// The same pass finds who rides something, for [`Self::riders`].
     pub fn update_hibernation(&mut self) {
         let fresh = std::mem::take(&mut self.fresh);
+        self.riders.clear();
         let Some(her) = self.player.and_then(|p| self.objects.get(&p)) else {
+            self.riders.extend(
+                self.objects
+                    .iter()
+                    .filter(|(_, o)| o.vehicle.is_some())
+                    .map(|(&g, _)| g),
+            );
             return;
         };
         let (at, riding) = (Vec3::from(her.position), her.vehicle);
         let wake = HIBERNATION_DISTANCE as f32;
         for (g, o) in &mut self.objects {
+            if o.vehicle.is_some() {
+                self.riders.push(*g);
+            }
             if Some(*g) == self.player
                 || Some(*g) == riding
                 || (FIRST_TEMPLATE..FIRST_SPAWNED).contains(g)
@@ -1063,6 +1095,17 @@ impl World for ScriptWorld {
             .collect();
         out.sort_unstable();
         out
+    }
+    fn visit_labels(&self, visit: &mut dyn FnMut(u32, &mut dyn Iterator<Item = u32>)) -> bool {
+        for (&g, o) in &self.objects {
+            let mut labels = o
+                .labels
+                .iter()
+                .map(|l| m2_assets::name_hash(l))
+                .chain(o.label_hashes.iter().copied());
+            visit(g, &mut labels);
+        }
+        true
     }
     fn unheard_at_gate(&self, a: u32, gate: u32) -> bool {
         let hers = self
@@ -2508,10 +2551,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => String::new(),
         };
         let instant = matches!(a.get(3), Some(Value::Boolean(true)));
-        if let Some(o) = w.objects.get_mut(&guid) {
-            o.vehicle = Some(vehicle);
-            o.seated_instantly = instant;
-        }
+        w.put_aboard(guid, vehicle, instant);
         w.commands.push(Command::EnterVehicle {
             guid,
             vehicle,

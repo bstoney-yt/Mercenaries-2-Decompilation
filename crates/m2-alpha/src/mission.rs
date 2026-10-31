@@ -3076,6 +3076,22 @@ impl MissionLink {
         matches!(self.state, State::Running(_))
     }
 
+    /// How many objects the scripts' world holds, and how many of them
+    /// carry labels (the `pace:` line's: the scripts' per-tick passes
+    /// cost as many as there are).
+    pub fn object_counts(&self) -> Option<(usize, usize)> {
+        let State::Running(m) = &self.state else {
+            return None;
+        };
+        let w = m.world().borrow();
+        let labelled = w
+            .objects
+            .values()
+            .filter(|o| !o.labels.is_empty() || !o.label_hashes.is_empty())
+            .count();
+        Some((w.objects.len(), labelled))
+    }
+
     /// Whether the scripts let her grapple (`Player.SetGrappleEnabled`).
     pub fn grapple_enabled(&self) -> bool {
         matches!(&self.state, State::Running(m) if m.grapple_enabled())
