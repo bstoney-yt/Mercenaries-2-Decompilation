@@ -6,8 +6,9 @@
 //! where she stands, moves the view over the target and confirms. A timing
 //! wheel turns, and a press with its needle in each of its two grey wedges
 //! sends the bomb. About seven seconds later it lands where the view was
-//! confirmed: a flash that fills the screen, and a blast that brings the
-//! gate and its wall down.
+//! confirmed: a flash that fills the screen (the blast's own script
+//! whitening the light, [`m2_game::atmosphere_script`]), and a blast that
+//! brings the gate and its wall down.
 //!
 //! The scripts call it `mrxsatelliteguidedbomb`: the designator's script
 //! (`MrxSupportDesignatorSatellite`) runs the view, the satellite
@@ -87,11 +88,6 @@ const CHECK_SHOWS: f32 = 0.2;
 /// strike this long after (the template's TimerResponse).
 const FALL_TIME: f32 = 7.2;
 const FINAL_AFTER: f32 = 2.0;
-/// The flash fades over this long (seconds), and fills the screen out to
-/// this far from the bomb, fainter to this far (metres).
-const FLASH_TIME: f32 = 1.2;
-const FLASH_FULL: f32 = 60.0;
-const FLASH_REACH: f32 = 600.0;
 /// The template's camera shake (amplitude 10 for 1.7 s), as a turn of
 /// the camera this big (radians) close by, nothing from this far
 /// (metres).
@@ -343,8 +339,6 @@ pub struct SupportHud {
     pub wheel: Option<WheelHud>,
     /// Seconds until the bomb on its way lands.
     pub inbound: Option<f32>,
-    /// The impact's flash: 1 at its brightest.
-    pub flash: f32,
     /// The PDA is open.
     pub pda: bool,
 }
@@ -360,9 +354,7 @@ pub struct Support {
     finals: Vec<(Vec2, f32)>,
     /// Fire was held last tick: a press is fire going down.
     fire_was: bool,
-    /// The screen's flash (1 at its brightest), and the camera's shake:
-    /// how far it turns (radians) and seconds left.
-    pub flash: f32,
+    /// The camera's shake: how far it turns (radians) and seconds left.
     pub shake: (f32, f32),
     /// What came down in the last step.
     pub landed: Vec<Impact>,
@@ -614,7 +606,6 @@ impl Support {
         self.landed.clear();
         self.posts.clear();
         self.cues.clear();
-        self.flash = (self.flash - dt / FLASH_TIME).max(0.0);
         self.shake.1 = (self.shake.1 - dt).max(0.0);
         let fired = call.fire && !self.fire_was;
         self.fire_was = call.fire;
@@ -849,8 +840,6 @@ impl Support {
             if let Impact::Bomb(at) = impact {
                 self.finals.push((at, FINAL_AFTER));
                 let d = at.distance(here);
-                let flash = 1.0 - ((d - FLASH_FULL) / (FLASH_REACH - FLASH_FULL)).clamp(0.0, 1.0);
-                self.flash = self.flash.max(flash);
                 let turn = SHAKE_TURN * (1.0 - d / SHAKE_REACH).clamp(0.0, 1.0);
                 if turn > 0.0 {
                     self.shake = (
@@ -950,7 +939,6 @@ impl Support {
             satellite,
             wheel,
             inbound: self.inbound(),
-            flash: self.flash,
             pda: self.pda,
         }
     }
@@ -1129,8 +1117,6 @@ mod tests {
             (40..=41).contains(&(landed[1].0 - landed[0].0)),
             "{landed:?}"
         );
-        // She was 65 m off: a bright flash, faded by now.
-        assert_eq!(s.flash, 0.0);
         // Spent: none given while none is wanted.
         assert!(!s.fallback(Kind::SatelliteBomb, false, 100.0));
         assert_eq!(s.ready(), None);

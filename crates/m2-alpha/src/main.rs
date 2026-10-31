@@ -479,8 +479,17 @@ enum SatelliteShot {
     Bomb,
 }
 
-/// A `--satellite` call's spot lies this far ahead of her, metres.
+/// A `--satellite` call's spot lies this far ahead of her, metres
+/// (`M2_SAT_AHEAD=<m>` moves it, to measure the blast from nearer or
+/// farther).
 const SATELLITE_AHEAD: f32 = 45.0;
+
+fn satellite_ahead() -> f32 {
+    std::env::var("M2_SAT_AHEAD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SATELLITE_AHEAD)
+}
 
 /// The install its installer recorded in the registry (`Install Dir`,
 /// seen on one real install; whether every edition's installer writes
@@ -5036,12 +5045,23 @@ fn mission_for_screenshot(
                 }
             }
         }
+        // The scripts' Lua memory every five minutes of play, so a long run
+        // shows whether it grows.
+        if i > 0
+            && i % (LUA_LOG_EVERY / tick).round().max(1.0) as u32 == 0
+            && let Some(kb) = link.lua_kb()
+        {
+            eprintln!("lua: {kb} KB after {:.0} s of play", i as f32 * tick);
+        }
         if auto.is_some() && link.contracts_completed() > contracts_seen {
             contracts_seen = link.contracts_completed();
             eprintln!(
-                "autoplay: contract {contracts_seen} completed after {:.1} s of play ({:.0} s here)",
+                "autoplay: contract {contracts_seen} completed after {:.1} s of play ({:.0} s here){}",
                 i as f32 * tick,
-                played.elapsed().as_secs_f32()
+                played.elapsed().as_secs_f32(),
+                link.lua_kb()
+                    .map(|kb| format!("; lua {kb} KB"))
+                    .unwrap_or_default()
             );
             contract_done.get_or_insert(i);
             // She stops playing once the last asked for is done; the
@@ -6869,7 +6889,7 @@ fn satellite_for_screenshot(
         return Ok(());
     };
     let her = p.character.position;
-    let spot = her + Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()) * SATELLITE_AHEAD;
+    let spot = her + Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()) * satellite_ahead();
     let goal = Vec2::new(spot.x, spot.z);
     game.support.grant(support::Kind::SatelliteBomb, 1, Some(1));
     let press = |game: &mut Game, intent: Intent| {
@@ -6988,11 +7008,15 @@ fn satellite_for_screenshot(
     }
     eprintln!(
         "satellite: the bomb {}; her health {hp:.0} -> {:.0}, people standing {alive} -> {}, \
-         flash {:.2}, shaking {:.2} s",
+         script light {}, shaking {:.2} s",
         if landed { "landed" } else { "never landed" },
         game.combat.hp,
         game.scene.people.npcs.iter().filter(|n| n.alive).count(),
-        game.support.flash,
+        if game.sky.scripted() {
+            "showing"
+        } else {
+            "gone"
+        },
         game.support.shake.1
     );
     Ok(())
@@ -7234,9 +7258,11 @@ fn blast_for_screenshot(
     render(backend, game, fov, aspect, None)?;
     if let Some(p) = &game.scene.particles {
         eprintln!(
-            "blast: {} particles alive at the picture, {:.2} m from the blast on average",
+            "blast: {} particles alive at the picture, {:.2} m from the blast on average, {} draws, {} lights",
             p.live(),
-            p.mean_distance(at)
+            p.mean_distance(at),
+            p.draw_runs,
+            p.lights_lit()
         );
     }
     // The vehicles it was at: their health and what their parts run.
@@ -7487,6 +7513,9 @@ const HITCH: Duration = Duration::from_millis(100);
 
 /// Seconds between the frame-rate lines play logs ([`Pace`]).
 const PACE_EVERY: f32 = 30.0;
+
+/// Seconds of play between a headless run's `lua:` memory lines.
+const LUA_LOG_EVERY: f32 = 300.0;
 
 /// The frame rate in play, logged every [`PACE_EVERY`] seconds as a
 /// `pace:` line: frames a second, the slowest frame, and how many frames
@@ -8089,8 +8118,12 @@ impl Running {
                 .and_then(mission::MissionLink::object_counts)
                 .map(|(n, l)| format!(", {n} script objects ({l} labelled)"))
                 .unwrap_or_default();
+            let lua = match self.mission.as_ref().and_then(mission::MissionLink::lua_kb) {
+                Some(kb) => format!("; lua {kb} KB"),
+                None => String::new(),
+            };
             eprintln!(
-                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders{objects}, {} draws a frame; ms a second: {}",
+                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders{objects}, {} draws a frame; ms a second: {}{lua}",
                 p.x,
                 p.z,
                 s.vehicles.len(),
@@ -8114,7 +8147,26 @@ impl Running {
         let driving = self.game.driving().is_some();
         let rumble = std::mem::take(&mut self.game.rumble);
         self.pad.rumble(rumble);
-        let keys = self.pad.poll(&mut self.input, driving, dt);
+        // A dialog box the scripts put up has the pad: its stick and
+        // buttons step and take the box, not move her (playtest: at
+        // Fiona's contract menu the stick walked her about).
+        let dialog = !self.hud.menu
+            && self
+                .mission
+                .as_ref()
+                .is_some_and(mission::MissionLink::dialog_open);
+        if dialog != self.game.dialog_up {
+            self.game.dialog_up = dialog;
+            self.input.clear();
+            eprintln!(
+                "dialog box {}: the pad steps it",
+                if dialog { "up" } else { "gone" }
+            );
+        }
+        self.pad.stick_menu = dialog;
+        let mut held = Input::default();
+        let target = if dialog { &mut held } else { &mut self.input };
+        let keys = self.pad.poll(target, driving, dt);
         for key in keys {
             use pad::MenuKey;
             if let Some(flow) = self.flow.as_mut().filter(|f| f.holds()) {

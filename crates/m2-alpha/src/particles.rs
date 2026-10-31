@@ -10,14 +10,12 @@
 //! particles are drawn unlit, their colour keys' brightness times
 //! [`SHADE`] standing in for the sun (invented).
 //!
-//! The added batch always draws after the blended one, sorted in front of
-//! it ([`AHEAD`]), whatever its own centre: the draw queue orders
-//! translucent draws by depth alone, and a fireball sorted first was
-//! hidden under its own dust (playtest 5's satellite bomb: a near-black
-//! dome with a glowing rim). Drawing glows over the smoke is inferred
-//! from the footage's fireballs, which blow out to yellow-white rather
-//! than show through dust; the game's own particle draw order is not
-//! read.
+//! Every sprite is sorted back to front, whatever its blend, and drawn
+//! in runs of one blend: a fireball's smoke behind its glow where it is
+//! behind, over it where it is in front (the game's own particle draw
+//! order is not read; by depth is the plain reading). Before, every glow
+//! drew after every blended sprite, so no smoke ever crossed a fireball.
+//!
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -32,7 +30,7 @@ use m2_engine::world::Templates;
 use m2_math::glam::{Mat4, Vec3};
 use m2_render::{
     BlendMode, BufferUsage, DrawCall, DrawQueue, Geometry, IndexBufferDesc, IndexBufferHandle,
-    IndexFormat, Layer, MaterialDesc, MaterialId, Primitive, RenderBackend, Topology,
+    IndexFormat, Layer, MaterialDesc, MaterialId, PointLight, Primitive, RenderBackend, Topology,
     VertexBufferDesc, VertexBufferHandle, VertexFormat, VertexLayout, VertexSemantic, View,
 };
 
@@ -46,10 +44,6 @@ const VERTEX: usize = 3 + 2 + 4;
 /// lighting (invented: the keys' grey smoke read dark against the
 /// footage's at 1, washed out at 1.2).
 const SHADE: f32 = 0.85;
-/// How far nearer the eye the added batch is sorted than the blended one
-/// when its own centre isn't, metres (invented: any step the queue's
-/// 24-bit depth keeps apart will do).
-const AHEAD: f32 = 0.5;
 
 /// How a template's effects resolved, for the log and the round's
 /// numbers.
@@ -72,6 +66,8 @@ pub struct ParticleDraw {
     blended: MaterialId,
     glowing: MaterialId,
     sprites: Vec<Sprite>,
+    /// Draw calls the last frame took: the runs of one blend, for the logs.
+    pub draw_runs: usize,
     vertices: Vec<f32>,
     /// Templates asked for by name, resolved to ids.
     ids: HashMap<String, Option<u32>>,
@@ -79,6 +75,19 @@ pub struct ParticleDraw {
     by_hash: Option<HashMap<u32, u32>>,
     /// Per template asked for (its name, or its id in hex).
     pub resolved: HashMap<String, Resolved>,
+    /// The lights the effects lit ([`m2_engine::lights`]).
+    flashes: Vec<Flash>,
+}
+
+/// A light an effect lit: where, what, how old, and for a held effect
+/// (a fire) the source's key and how long since it last called.
+#[derive(Debug)]
+struct Flash {
+    at: Vec3,
+    spec: m2_engine::lights::LightSpec,
+    age: f32,
+    key: Option<u64>,
+    since_call: f32,
 }
 
 impl ParticleDraw {
@@ -169,10 +178,12 @@ impl ParticleDraw {
             blended,
             glowing,
             sprites: Vec::new(),
+            draw_runs: 0,
             vertices: Vec::new(),
             ids: HashMap::new(),
             by_hash: None,
             resolved: HashMap::new(),
+            flashes: Vec::new(),
         })
     }
 
@@ -224,8 +235,8 @@ impl ParticleDraw {
                     .filter(|e| e.glows())
                     .count();
                 eprintln!(
-                    "particles: {label} -> {} effects, {} emitters, {} textured, {} glowing",
-                    r.effects, r.emitters, r.textured, r.glowing
+                    "particles: {label} -> {} effects {:08x?}, {} emitters, {} textured, {} glowing",
+                    r.effects, effects, r.emitters, r.textured, r.glowing
                 );
             }
             for (k, h) in effects.into_iter().enumerate() {
@@ -237,11 +248,122 @@ impl ParticleDraw {
                     (None, None) => self.sim.spawn(&self.lib, h, fx.at, 0.0, 1.0),
                 };
             }
+            let Some(id) = id else { continue };
+            // What it sets off with it ([`m2_engine::lights::links`]): each
+            // child's effects and light at its offset, and its own
+            // children in turn (an explosion's flash and dirt effects, its
+            // frag explosion, its light 2 m up).
+            let tree = link_tree(id, &templates.links);
+            if first && tree.len() > 1 {
+                let named: Vec<String> = tree[1..]
+                    .iter()
+                    .map(|(c, at)| {
+                        let n = templates
+                            .names
+                            .get(c)
+                            .cloned()
+                            .unwrap_or(format!("{c:08x}"));
+                        format!("{n} at {:.1?}", at.to_array())
+                    })
+                    .collect();
+                eprintln!("links: {label} sets off {}", named.join(", "));
+            }
+            for (k, &(child, offset)) in tree.iter().enumerate() {
+                let at = fx.at + offset;
+                if k > 0 {
+                    for &h in self.lib.of_template(child) {
+                        match fx.hold {
+                            Some(key) => self.sim.hold(&self.lib, key, h, at, 1.0),
+                            None => self.sim.spawn(&self.lib, h, at, 0.0, 1.0),
+                        };
+                    }
+                }
+                // A light: a flash that runs its envelope, or a held fire's
+                // glow for as long as its source keeps calling.
+                let Some(spec) = templates.lights.get(&child) else {
+                    continue;
+                };
+                if first {
+                    eprintln!(
+                        "lights: {label} -> {:?} within {} m, gone at {} m, {:.1?} off, {}",
+                        spec.color,
+                        spec.inner,
+                        spec.outer,
+                        offset.to_array(),
+                        match spec.envelope {
+                            Some([a, b, c]) => format!("up {a} s, held {b} s, down {c} s"),
+                            None => "steady".into(),
+                        }
+                    );
+                }
+                let key = fx.hold.map(|k| k ^ u64::from(child));
+                match key.and_then(|key| self.flashes.iter_mut().find(|f| f.key == Some(key))) {
+                    Some(f) => {
+                        f.at = at;
+                        f.since_call = 0.0;
+                    }
+                    None => self.flashes.push(Flash {
+                        at,
+                        spec: spec.clone(),
+                        age: 0.0,
+                        key,
+                        since_call: 0.0,
+                    }),
+                }
+            }
         }
     }
 
     pub fn step(&mut self, dt: f32) {
         self.sim.step(&self.lib, dt);
+        for f in &mut self.flashes {
+            f.age += dt;
+            f.since_call += dt;
+        }
+        // A held one burns while its source calls; a flash runs its
+        // envelope; a steady light set off once (a rocket's contrail light,
+        // set off as it flies) goes out as a held one does when its source
+        // stops (inferred: the data gives it no time).
+        self.flashes.retain(|f| match (f.key, f.spec.ends()) {
+            (None, Some(end)) => f.age < end,
+            _ => f.since_call < m2_engine::particles::HOLD,
+        });
+    }
+
+    /// The lights burning now, the nearest `eye` first, as many as a
+    /// frame draws ([`m2_render::POINT_LIGHTS`]).
+    pub fn point_lights(&self, eye: Vec3) -> [PointLight; m2_render::POINT_LIGHTS] {
+        let mut lit: Vec<PointLight> = self
+            .flashes
+            .iter()
+            .filter_map(|f| {
+                let level = f.spec.level(f.age);
+                (level > 0.0).then(|| PointLight {
+                    position: f.at,
+                    color: f.spec.color * level,
+                    inner: f.spec.inner,
+                    outer: f.spec.outer,
+                })
+            })
+            .collect();
+        lit.sort_by(|a, b| {
+            a.position
+                .distance_squared(eye)
+                .total_cmp(&b.position.distance_squared(eye))
+        });
+        let mut out = [PointLight::default(); m2_render::POINT_LIGHTS];
+        for (slot, light) in out.iter_mut().zip(lit) {
+            *slot = light;
+        }
+        out
+    }
+
+    /// How many lights burn now.
+    pub fn lights_lit(&self) -> usize {
+        self.flashes
+            .iter()
+            .filter(|f| f.spec.level(f.age) > 0.0)
+            .count()
     }
 
     /// Particles alive.
@@ -269,12 +391,12 @@ impl ParticleDraw {
             return Ok(());
         }
         let eye = view.eye();
-        // Blended ones first, back to front; then the added ones.
+        // Back to front, whatever each one's blend: a fireball's smoke is
+        // drawn behind its glow where it is behind and over it where it
+        // is in front. The two blends then alternate in runs, each a draw.
         self.sprites.sort_by(|a, b| {
-            a.glow.cmp(&b.glow).then_with(|| {
-                b.at.distance_squared(eye)
-                    .total_cmp(&a.at.distance_squared(eye))
-            })
+            b.at.distance_squared(eye)
+                .total_cmp(&a.at.distance_squared(eye))
         });
         self.sprites.truncate(CAPACITY);
         let v = view.view;
@@ -282,42 +404,37 @@ impl ParticleDraw {
         let up = Vec3::new(v.x_axis.y, v.y_axis.y, v.z_axis.y);
         self.vertices.clear();
         self.vertices.reserve(self.sprites.len() * 4 * VERTEX);
+        // Smoke and dust take the effects' own lights (a blast's flash
+        // lights its smoke white and orange, as Brendan's footage of a
+        // satellite bomb shows), as a surface facing every way would:
+        // each light's colour times its reach, no N.L (inferred).
+        let lights = self.point_lights(eye);
         for s in &self.sprites {
-            quad(&mut self.vertices, s, right, up);
+            let light = if s.glow {
+                Vec3::ZERO
+            } else {
+                sprite_light(&lights, s.at)
+            };
+            quad(&mut self.vertices, s, right, up, light);
         }
         let bytes: Vec<u8> = self.vertices.iter().flat_map(|f| f.to_le_bytes()).collect();
         backend.write_vertex_buffer(self.vb, 0, &bytes)?;
-        let blended = self.sprites.iter().filter(|s| !s.glow).count();
-        let centre =
-            |range: &[Sprite]| range.iter().map(|s| s.at).sum::<Vec3>() / range.len().max(1) as f32;
-        let smoke = centre(&self.sprites[..blended]);
-        let glow = centre(&self.sprites[blended..]);
-        // The draw queue sorts translucent draws by their sort origins'
-        // depth alone, so the added batch is placed in front of the blended
-        // one: by its own centre it can sit a hair behind, and then the
-        // smoke drawn over it hides the fireball (playtest 5's black dome).
-        let glow = if blended > 0 {
-            in_front_of(view, smoke, glow)
-        } else {
-            glow
-        };
-        let batches = [
-            (self.blended, 0, blended, smoke),
-            (self.glowing, blended, self.sprites.len() - blended, glow),
-        ];
-        for (material, first, n, sort_origin) in batches {
-            if n == 0 {
-                continue;
-            }
+        // Each run of one blend is a draw, sorted by its nearest sprite:
+        // the draw queue orders translucent draws by their sort origins'
+        // depth alone, and every sprite of the next run is nearer than
+        // this run's nearest, so the runs keep their order through it.
+        let run_list = runs(&self.sprites);
+        self.draw_runs = run_list.len();
+        for (first, end, glow) in run_list {
             queue.push(Primitive {
                 call: DrawCall {
-                    material,
+                    material: if glow { self.glowing } else { self.blended },
                     topology: Topology::TriangleList,
                     vertex_buffer: self.vb,
                     geometry: Geometry::Indexed {
                         buffer: self.ib,
                         first: (first * 6) as u32,
-                        count: (n * 6) as u32,
+                        count: ((end - first) * 6) as u32,
                         base_vertex: 0,
                     },
                     world: Mat4::IDENTITY,
@@ -327,7 +444,7 @@ impl ParticleDraw {
                 },
                 layer: Layer::WORLD,
                 translucent: true,
-                sort_origin,
+                sort_origin: self.sprites[end - 1].at,
                 user: 0,
             });
         }
@@ -335,29 +452,79 @@ impl ParticleDraw {
     }
 }
 
-/// Where to sort a batch that must draw after one sorted at `behind`:
-/// `own` if that is already nearer in `view`'s depth, else `behind`
-/// brought [`AHEAD`] towards the eye.
-fn in_front_of(view: &View, behind: Vec3, own: Vec3) -> Vec3 {
-    let eye = view.eye();
-    let ahead = behind + (eye - behind).normalize_or_zero() * AHEAD;
-    if view.normalized_depth(own) < view.normalized_depth(ahead) {
-        own
-    } else {
-        ahead
+/// How deep a template's links are followed (an explosion, its frag
+/// explosion, that one's effects). Invented: no link chain in the data
+/// goes deeper than three on the explosions looked at.
+const LINK_DEPTH: usize = 3;
+
+/// Template `id` and everything its links set off, each with its offset
+/// from `id` (offsets add down the chain), `id` first, each template once.
+fn link_tree(id: u32, links: &HashMap<u32, Vec<m2_engine::lights::Link>>) -> Vec<(u32, Vec3)> {
+    let mut out = vec![(id, Vec3::ZERO)];
+    let mut level = vec![(id, Vec3::ZERO)];
+    for _ in 0..LINK_DEPTH {
+        let mut next = Vec::new();
+        for (t, at) in level {
+            for l in links.get(&t).map_or(&[][..], Vec::as_slice) {
+                if out.iter().all(|&(c, _)| c != l.child) {
+                    out.push((l.child, at + l.offset));
+                    next.push((l.child, at + l.offset));
+                }
+            }
+        }
+        level = next;
     }
+    out
+}
+
+/// The runs of one blend in `sprites` (sorted back to front): `(first,
+/// end, glow)` of each, in order; each is one draw.
+fn runs(sprites: &[Sprite]) -> Vec<(usize, usize, bool)> {
+    let mut out = Vec::new();
+    let mut first = 0;
+    while first < sprites.len() {
+        let glow = sprites[first].glow;
+        let mut end = first + 1;
+        while end < sprites.len() && sprites[end].glow == glow {
+            end += 1;
+        }
+        out.push((first, end, glow));
+        first = end;
+    }
+    out
+}
+
+/// The light `lights` throw on a point: each one's colour times its
+/// reach there (1 within `inner`, 0 at `outer`).
+fn sprite_light(lights: &[PointLight], at: Vec3) -> Vec3 {
+    lights
+        .iter()
+        .filter(|l| l.outer > 0.0)
+        .map(|l| {
+            let d = l.position.distance(at);
+            let reach = ((l.outer - d) / (l.outer - l.inner).max(1e-3)).clamp(0.0, 1.0);
+            l.color * reach
+        })
+        .sum()
 }
 
 /// Sprite `s` as four vertices facing the camera (`right`, `up`).
-fn quad(out: &mut Vec<f32>, s: &Sprite, right: Vec3, up: Vec3) {
+fn quad(out: &mut Vec<f32>, s: &Sprite, right: Vec3, up: Vec3, light: Vec3) {
     let (sin, cos) = s.turn.sin_cos();
-    let half = s.size;
+    // The corners at plus or minus half the width, as the game's particle
+    // vertex shaders put them (the PC's 346; the 360's PgFXVP).
+    let half = s.size * 0.5;
     let r = (right * cos + up * sin) * half;
     let u = (up * cos - right * sin) * half;
     let [l, t, w, h] = s.uv;
     let shade = if s.glow { 1.0 } else { SHADE };
     let [cr, cg, cb, ca] = s.colour;
-    let colour = [cr * shade, cg * shade, cb * shade, ca];
+    let colour = [
+        cr * (shade + light.x),
+        cg * (shade + light.y),
+        cb * (shade + light.z),
+        ca,
+    ];
     for (corner, uv) in [
         (-r + u, [l, t]),
         (r + u, [l + w, t]),
@@ -378,16 +545,17 @@ mod tests {
     fn a_quad_faces_the_camera_and_covers_its_atlas_cell() {
         let s = Sprite {
             at: Vec3::new(1.0, 2.0, 3.0),
-            size: 1.0,
+            size: 2.0,
             turn: 0.0,
             uv: [0.25, 0.5, 0.125, 0.25],
             colour: [2.0, 1.0, 0.5, 0.75],
             glow: true,
         };
         let mut v = Vec::new();
-        quad(&mut v, &s, Vec3::X, Vec3::Y);
+        quad(&mut v, &s, Vec3::X, Vec3::Y, Vec3::ZERO);
         assert_eq!(v.len(), 4 * VERTEX);
-        // Top left, then clockwise; 1 m each way from the middle.
+        // Top left, then clockwise; 1 m each way from the middle of a 2 m
+        // sprite.
         assert_eq!(&v[0..5], &[0.0, 3.0, 3.0, 0.25, 0.5]);
         assert_eq!(
             &v[2 * VERTEX..2 * VERTEX + 5],
@@ -396,36 +564,82 @@ mod tests {
         // A glow keeps its colour; a blended one is shaded.
         assert_eq!(&v[5..9], &[2.0, 1.0, 0.5, 0.75]);
         let mut b = Vec::new();
-        quad(&mut b, &Sprite { glow: false, ..s }, Vec3::X, Vec3::Y);
+        quad(
+            &mut b,
+            &Sprite { glow: false, ..s },
+            Vec3::X,
+            Vec3::Y,
+            Vec3::ZERO,
+        );
         assert_eq!(b[5], 2.0 * SHADE);
     }
 
-    /// Playtest 5's bomb: the fireball's centre a centimetre behind its
-    /// smoke's sorted it first, and the smoke drawn over it hid it.
+    /// Sorted back to front, a glow between two smokes makes three runs;
+    /// neighbours of one blend share a run.
+    /// `Explosion (Grenade)` (1) sets off its flash (2), its light 2 m up
+    /// (3) and its frag explosion (4), which links back to the flash and
+    /// on to its own debris 1 m along x (5): each once, offsets added.
     #[test]
-    fn the_added_batch_sorts_in_front_of_the_blended_one() {
-        let eye = Vec3::new(10.0, 2.0, 0.0);
-        let view = View::perspective(eye, Vec3::NEG_Z, 1.0, 16.0 / 9.0, 0.1, 4000.0);
-        let smoke = Vec3::new(10.0, 8.0, -45.0);
-        let behind = Vec3::new(10.0, 3.0, -45.01);
-        let at = in_front_of(&view, smoke, behind);
-        // Nearer by more than the queue's 24-bit depth step, many times over.
-        let step = 1.0 / (1u32 << 24) as f32;
-        assert!(
-            view.normalized_depth(smoke) - view.normalized_depth(at) > 100.0 * step,
-            "{at}"
-        );
-        // One already in front keeps its own centre.
-        let before = Vec3::new(9.0, 3.0, -30.0);
-        assert_eq!(in_front_of(&view, smoke, before), before);
-        // Seen from the side, depth is what counts, not distance.
-        let side = View::perspective(eye, Vec3::X, 1.0, 1.0, 0.1, 4000.0);
-        let ahead_on_axis = Vec3::new(40.0, 2.0, 0.0);
-        let off_to_one_side = Vec3::new(35.0, 2.0, -45.0);
-        assert!(off_to_one_side.distance(eye) > ahead_on_axis.distance(eye));
+    fn a_templates_links_set_off_a_tree_each_once() {
+        use m2_engine::lights::Link;
+        let link = |child, offset| Link { child, offset };
+        let links = HashMap::from([
+            (
+                1,
+                vec![
+                    link(2, Vec3::ZERO),
+                    link(3, Vec3::Y * 2.0),
+                    link(4, Vec3::ZERO),
+                ],
+            ),
+            (4, vec![link(2, Vec3::ZERO), link(5, Vec3::X)]),
+            (5, vec![link(1, Vec3::ZERO)]),
+        ]);
         assert_eq!(
-            in_front_of(&side, ahead_on_axis, off_to_one_side),
-            off_to_one_side
+            link_tree(1, &links),
+            vec![
+                (1, Vec3::ZERO),
+                (2, Vec3::ZERO),
+                (3, Vec3::Y * 2.0),
+                (4, Vec3::ZERO),
+                (5, Vec3::X),
+            ]
         );
+        assert_eq!(link_tree(9, &links), vec![(9, Vec3::ZERO)]);
+    }
+
+    /// A 12-times-white flash 6 m across lights smoke beside it fully,
+    /// half-way out by half, and none past its reach; an unlit slot adds
+    /// nothing.
+    #[test]
+    fn smoke_takes_the_flash_by_its_reach() {
+        let flash = PointLight {
+            position: Vec3::new(0.0, 2.0, 0.0),
+            color: Vec3::splat(12.0),
+            inner: 0.0,
+            outer: 6.0,
+        };
+        let lights = [flash, PointLight::default()];
+        assert_eq!(sprite_light(&lights, flash.position), Vec3::splat(12.0));
+        assert!((sprite_light(&lights, Vec3::new(3.0, 2.0, 0.0)).x - 6.0).abs() < 1e-4);
+        assert_eq!(sprite_light(&lights, Vec3::new(0.0, 9.0, 0.0)), Vec3::ZERO);
+    }
+
+    #[test]
+    fn runs_split_the_sorted_sprites_by_blend() {
+        let s = |glow: bool| Sprite {
+            at: Vec3::ZERO,
+            size: 1.0,
+            turn: 0.0,
+            uv: [0.0; 4],
+            colour: [1.0; 4],
+            glow,
+        };
+        let sprites = [s(false), s(false), s(true), s(false), s(true), s(true)];
+        assert_eq!(
+            runs(&sprites),
+            vec![(0, 2, false), (2, 3, true), (3, 4, false), (4, 6, true)]
+        );
+        assert!(runs(&[]).is_empty());
     }
 }

@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use m2_engine::atmosphere::AtmosphereMix;
+use m2_engine::atmosphere::{AtmosphereMix, ScriptAtmosphere};
 use m2_engine::durability::{BlastPush, CrashHow, Explosion};
 use m2_engine::physics::FLOAT_DEPTH;
 use m2_engine::{
@@ -161,6 +161,9 @@ pub struct Game {
     spray_wait: f32,
     /// The light of the atmosphere region the player is in.
     pub sky: AtmosphereMix,
+    /// Lights blasts' scripts set, seconds before each comes in
+    /// ([`m2_game::atmosphere_script`]).
+    script_lights: Vec<(f32, ScriptAtmosphere)>,
     /// Props that move on their own.
     moving: MovingProps,
     /// Her support: the items she holds and the call under way; her
@@ -181,6 +184,10 @@ pub struct Game {
     pub placed: crate::placed::Placed,
     /// The scripts have turned her controls off (a loading fade).
     pub input_locked: bool,
+    /// A dialog box of the scripts is up (Fiona's contract menu): it
+    /// has the controls (`MrxGuiDialogBox._HandleInputEvent` takes the
+    /// pad's events), so she stands still and has no crosshair.
+    pub dialog_up: bool,
     /// The scripts' countdown ticked since autoplay last looked (a
     /// `ui_HUD_Timer_` cue: OilCon002's 15 minutes).
     pub countdown_tick: bool,
@@ -387,6 +394,7 @@ impl Game {
             throttle: 0.0,
             spray_wait: 0.0,
             sky: AtmosphereMix::default(),
+            script_lights: Vec::new(),
             moving: MovingProps::default(),
             support: Support::default(),
             earned: Vec::new(),
@@ -395,6 +403,7 @@ impl Game {
             refused: std::collections::HashSet::new(),
             placed: crate::placed::Placed::default(),
             input_locked: false,
+            dialog_up: false,
             countdown_tick: false,
             hijack_only: HashSet::new(),
             unusable: HashSet::new(),
@@ -876,7 +885,7 @@ impl Game {
         split("game: moving");
         self.fetch_world_vehicles(dt);
         self.arrive(dt);
-        let intent = if self.input_locked {
+        let intent = if self.input_locked || self.dialog_up {
             Intent::default()
         } else {
             intent
@@ -1506,6 +1515,13 @@ impl Game {
                         p,
                         walked,
                     );
+                    // "Take Ammo" is the weapon's context action as
+                    // "Equip" is: the 360 posts `PickupWeapon` (8768c3b1)
+                    // to her for either before the pickup is settled
+                    // (8228FE58), so she picks it up off the ground too.
+                    if near.is_some_and(|n| n.0 == Offer::TakeAmmo) {
+                        player.start_pickup();
+                    }
                 }
                 // A placed one's prop comes down with it.
                 if self.placed.is_pickup(from) {
@@ -1807,6 +1823,9 @@ impl Game {
                     self.combat.bomb(&mut field, at);
                     let blasts = bomb_blasts(&world.index.template_db, at);
                     self.combat.last_push = blasts.first().map(|b| b.push);
+                    if let Some(light) = blast_light(&world.index.template_db, BOMB_BLAST) {
+                        self.script_lights.push(light);
+                    }
                     let pushes: Vec<BlastPush> =
                         blasts.first().map(|b| b.push).into_iter().collect();
                     blast_loose(world, &mut scene.props, &pushes, true);
@@ -2089,7 +2108,7 @@ impl Game {
         });
         // What the crosshair is on: on foot, or in a vehicle with a gun.
         let crosshair = match (&self.scene.world, player) {
-            (Some(w), Some(p)) if self.combat.down <= 0.0 => match p.driving {
+            (Some(w), Some(p)) if self.combat.down <= 0.0 && !self.dialog_up => match p.driving {
                 Some(i) => self
                     .scene
                     .vehicles
@@ -2376,6 +2395,17 @@ impl Game {
             return;
         };
         let regions = &world.index.atmosphere_regions;
+        for (left, light) in &mut self.script_lights {
+            *left -= dt;
+            if *left <= 0.0 {
+                let unused = self.sky.script(default, light);
+                eprintln!(
+                    "atmosphere: a blast's script sets the light (restored over {:?} s; not drawn: {unused:?})",
+                    light.restore
+                );
+            }
+        }
+        self.script_lights.retain(|(left, _)| *left > 0.0);
         if let Some(now) = self.sky.update(default, regions, focus, dt) {
             match now {
                 Some((r, s)) => {
@@ -2485,6 +2515,11 @@ impl Game {
             satellite_look(&mut view.lighting);
         }
         self.picture.apply(&mut view.lighting);
+        // The effects' lights (a blast's flash, a fire), the nearest first.
+        if let Some(p) = &self.scene.particles {
+            let eye = view.view.inverse().w_axis.truncate();
+            view.lighting.point_lights = p.point_lights(eye);
+        }
         view
     }
 }
@@ -3276,6 +3311,24 @@ const ROCKET_BLASTS: [&str; 4] = [
 ];
 const BOMB_BLAST: &str = "Explosion (Airstike Bomb)";
 const BOMB_FRAG: &str = "Explosion (Airstrike Frag)";
+
+/// What the script of the blast `name` does to the light, if it does
+/// ([`m2_game::atmosphere_script`]): seconds until, and the light.
+fn blast_light(db: &Templates, name: &str) -> Option<(f32, ScriptAtmosphere)> {
+    // `M2_BLAST_LIGHT=off` leaves the light alone (to measure against).
+    if std::env::var("M2_BLAST_LIGHT").is_ok_and(|v| v == "off") {
+        return None;
+    }
+    let bytes = db.blast_scripts.get(&db.id(name)?)?;
+    let chunk = m2_assets::lua::Chunk::from_asset(bytes).ok()?;
+    match m2_game::atmosphere_script::activation_light(&chunk) {
+        Ok(light) => light,
+        Err(e) => {
+            eprintln!("atmosphere: {name}'s script did not run: {e}");
+            None
+        }
+    }
+}
 
 /// The first of `names` the template database gives a blast.
 fn explosion(db: &Templates, names: &[&str]) -> Option<Explosion> {

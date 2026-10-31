@@ -3730,6 +3730,16 @@ impl MissionLink {
         self.contracts
     }
 
+    /// The kilobytes the scripts' Lua state holds, while they run: logged
+    /// with each `pace:` line so a long session shows whether it grows
+    /// (one run ran out of Lua reference slots).
+    pub fn lua_kb(&self) -> Option<usize> {
+        match &self.state {
+            State::Running(m) => Some(m.lua().used_memory() / 1024),
+            _ => None,
+        }
+    }
+
     /// The newest of the scripts' fanfare calls (`Hud.Fanfare`) whose
     /// callback is still to be called: the contract's, which the flow
     /// waits on until the fanfare's Enter closes it.
@@ -3746,9 +3756,18 @@ impl MissionLink {
         let message = recent.map(|(m, text, _)| (m.done(), text.clone()));
         let game_message = recent.map(|(m, ..)| m.clone());
         let mission = match &self.state {
+            // Until the scripts run, the screen stays black under the
+            // loading screen: they place her and start the contract's
+            // opening (its fade and movie), and before they do she stands
+            // where the island put her, swimming off the start (playtest:
+            // the hero swam a moment before the first cutscene). The
+            // game's load covers the scripts' start as well as the
+            // island's (inferred from the footage, which never shows the
+            // world before the opening).
             State::Loading(_) => {
                 return MissionView {
                     status: Some("Reading the mission scripts...".into()),
+                    black: 1.0,
                     ..MissionView::default()
                 };
             }
@@ -5287,10 +5306,24 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             return false;
         }
         // A briefing frame's clip for one of its actors, by name.
+        // The scripts hear how long it runs, drawn or not (`Event.
+        // HumanAnimationNearlyCompleted`: the briefings' spiel lines).
         Command::RawClip { guid, clip } => {
-            match game.raw.start(&mut game.scene, *guid, clip) {
-                Ok(length) => eprintln!("raw-clip: {guid:#x} plays {clip} ({length:.2} s)"),
-                Err(why) => eprintln!("raw-clip: {guid:#x} cannot play {clip}: {why}"),
+            let length = match game.raw.start(&mut game.scene, *guid, clip) {
+                Ok(length) => {
+                    eprintln!("raw-clip: {guid:#x} plays {clip} ({length:.2} s)");
+                    Some(length)
+                }
+                Err(why) => {
+                    let length = crate::raw::length(&mut game.scene, clip);
+                    eprintln!(
+                        "raw-clip: {guid:#x} cannot play {clip}: {why}; it runs {length:?} s"
+                    );
+                    length
+                }
+            };
+            if let Some(seconds) = length {
+                mission.world().borrow_mut().raw_clip_length(*guid, seconds);
             }
             return false;
         }
@@ -6379,6 +6412,22 @@ fn hardpoints_at(nodes: &[(u32, Vec3)], at: m2_math::glam::Mat4) -> Hardpoints {
 
 #[cfg(test)]
 mod tests {
+    // Playtest: while the scripts are still being read the screen stays
+    // black (she would be seen swimming off the start before the
+    // opening's movie); once they run, theirs is the fade.
+    #[test]
+    fn the_screen_is_black_until_the_scripts_run() {
+        let nowhere = std::env::temp_dir().join("m2-alpha-no-install");
+        let install = m2_engine::Install {
+            root: nowhere.clone(),
+            data: nowhere,
+        };
+        let link = super::MissionLink::start(&install, Vec::new());
+        let view = link.view();
+        assert_eq!(view.black, 1.0);
+        assert!(view.status.is_some());
+    }
+
     // The props the scripts spawn have their hardpoints told, as do
     // those people sit on (a faction HQ's spawned interior and the PMC's
     // crewed one), each once; a layer's other props don't.

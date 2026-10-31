@@ -526,6 +526,10 @@ pub const INFINITE_RESERVE: u32 = 999;
 #[derive(Debug, Default)]
 pub struct ScriptWorld {
     pub objects: HashMap<u32, Object>,
+    /// Each character's last raw clip (`Human.PlayRawAnimation`): seconds
+    /// left once the game has said its length ([`ScriptWorld::raw_clip_length`]),
+    /// `None` until then.
+    pub raw_clips: HashMap<u32, Option<f32>>,
     /// The player's character.
     pub player: Option<u32>,
     pub commands: Vec<Command>,
@@ -949,6 +953,19 @@ impl ScriptWorld {
         FIRST_SPAWNED + self.next_spawn
     }
 
+    /// The game says how long `guid`'s last raw clip is (seconds): it
+    /// runs out from now.
+    pub fn raw_clip_length(&mut self, guid: u32, seconds: f32) {
+        self.raw_clips.insert(guid, Some(seconds));
+    }
+
+    /// Moves the raw clips on by `dt` seconds.
+    pub fn tick_raw_clips(&mut self, dt: f32) {
+        for left in self.raw_clips.values_mut().flatten() {
+            *left -= dt;
+        }
+    }
+
     /// Wakes the objects the player has come within their hibernation
     /// distance of ([`HIBERNATION_DISTANCE`], every object's until the
     /// templates' own are read) and puts to sleep those she has left
@@ -1025,6 +1042,9 @@ impl World for ScriptWorld {
     }
     fn is_awake(&self, guid: u32) -> bool {
         self.objects.get(&guid).is_some_and(|o| o.awake)
+    }
+    fn raw_clip_left(&self, guid: u32) -> Option<f32> {
+        self.raw_clips.get(&guid).copied().flatten()
     }
     /// On screen: in play, not hidden (nor put under the island), its
     /// place (a rider's, its vehicle's) inside the camera's view, and not
@@ -1916,6 +1936,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&human, "PlayRawAnimation", |w, _, a| {
         if let (Some(guid), Some(Value::String(clip))) = (id(a.first()), a.get(1)) {
             let clip = clip.to_string_lossy();
+            w.raw_clips.insert(guid, None);
             w.commands.push(Command::RawClip { guid, clip });
         }
         values([])
@@ -4193,6 +4214,56 @@ mod tests {
                 (13, "[ContextAction.ChangeOutfit]", 1.0),
                 (14, "[ContextAction.Enter]", CONTEXT_REACH),
             ]
+        );
+    }
+
+    #[test]
+    fn a_raw_clip_nearly_done_fires_its_event_drawn_or_not() {
+        // WifHq's cheap cinematic plays a briefing line's named clip and
+        // waits for it to have 0.1 s left before the next line.
+        let (host, world) = setup();
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                done = nil
+                local her = Player.GetAnyCharacter()
+                Human.PlayRawAnimation(her, "all_starter03_job_briefing_spiel", true, true, 0.5, false, true)
+                Event.Create(Event.HumanAnimationNearlyCompleted, { her, 0.1 },
+                    function(who) done = who end, {})
+                "#,
+            )
+            .exec()
+            .unwrap();
+        // Its length unknown yet: it waits.
+        events.update_shared(0.5, &world);
+        assert!(
+            host.lua()
+                .globals()
+                .get::<Option<u32>>("done")
+                .unwrap()
+                .is_none()
+        );
+        // The game says it runs 1 s: not yet at 0.5 s, done once 0.1 s is left.
+        world.borrow_mut().raw_clip_length(1, 1.0);
+        world.borrow_mut().tick_raw_clips(0.5);
+        events.update_shared(0.5, &world);
+        assert!(
+            host.lua()
+                .globals()
+                .get::<Option<u32>>("done")
+                .unwrap()
+                .is_none()
+        );
+        world.borrow_mut().tick_raw_clips(0.45);
+        events.update_shared(0.45, &world);
+        assert!(
+            host.lua()
+                .globals()
+                .get::<Option<mlua::Value>>("done")
+                .unwrap()
+                .is_some()
         );
     }
 

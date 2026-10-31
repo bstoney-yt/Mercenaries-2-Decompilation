@@ -51,6 +51,12 @@ pub trait World {
     fn is_visible(&self, _guid: u32) -> Option<bool> {
         None
     }
+    /// Seconds left of the raw clip a character was last given
+    /// (`Human.PlayRawAnimation`), once the game has said how long it is;
+    /// `None` while unknown.
+    fn raw_clip_left(&self, _guid: u32) -> Option<f32> {
+        None
+    }
     /// Whether an object is inside a boundary object's area; `None` when
     /// the boundary's shape isn't known.
     fn inside(&self, guid: u32, boundary: u32) -> Option<bool>;
@@ -1485,6 +1491,20 @@ fn check(
         // destroyed states) takes the same parameters and is read the
         // same: ready as awake is inferred, the engine's own test is not
         // seen.
+        // { character, seconds }: once the raw clip she was last given has
+        // that little left (the briefings' named spiel clips: `WifHq`'s
+        // cheap cinematic waits on it with 0.1 before the next line; from
+        // the scripts). Passes the character.
+        "HumanAnimationNearlyCompleted" => match guid(&p.params, 1) {
+            Some(g) => {
+                let margin = p.params.raw_get::<f64>(2).unwrap_or(0.1) as f32;
+                match world.raw_clip_left(g) {
+                    Some(left) if left <= margin => Check::Holds(true, vec![id(g)]),
+                    _ => no,
+                }
+            }
+            None => no,
+        },
         "ObjectHibernation" | "ObjectIsReady" => match guid(&p.params, 1) {
             Some(g) => {
                 let want_awake = !text(&p.params, 2).is_some_and(|t| t.starts_with("hibernat"));

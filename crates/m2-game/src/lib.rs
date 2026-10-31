@@ -2,6 +2,7 @@
 
 pub mod airstrike;
 pub mod api;
+pub mod atmosphere_script;
 pub mod events;
 pub mod gui;
 pub mod gui_runtime;

@@ -8,7 +8,8 @@
 //! 0x10  u32      section count
 //! 0x14  section records, 20 bytes each:
 //!       [u8; 4]  fourcc
-//!       u32      offset from the end of the header (0xFFFFFFFF on containers)
+//!       u32      offset from the end of the header (0xFFFFFFFF on most
+//!                containers; some, an effect's `FRCE`, carry bytes of their own)
 //!       u32      length (0 on containers)
 //!       u32      number of siblings after this one at the same level
 //!       u32      number of records in this one's subtree (nonzero = container)
@@ -77,6 +78,11 @@ pub struct Section<'a> {
     pub descendants: u32,
     /// The section's bytes; `None` for containers.
     pub data: Option<&'a [u8]>,
+    /// A container's own bytes, where its record points at some inside the
+    /// payload (an effect's `FRCE` keeps its kind's tag and settings there,
+    /// beside its `ATRB` children; from samples); `None` for leaves and for
+    /// containers whose offset is 0xFFFFFFFF.
+    pub own: Option<&'a [u8]>,
 }
 
 /// A parsed `UCFX` container.
@@ -161,6 +167,7 @@ impl<'a> Ucfx<'a> {
                 level.1 = Some(raw.siblings_after.checked_sub(1).ok_or(bad_siblings)?);
             }
 
+            let mut own = None;
             let data = if raw.descendants == 0 {
                 let end = u64::from(raw.offset) + u64::from(raw.len);
                 if end > payload.len() as u64 {
@@ -177,6 +184,10 @@ impl<'a> Ucfx<'a> {
                     return Err(UcfxError::TooDeep);
                 }
                 levels.push((subtree_end, None));
+                let end = u64::from(raw.offset) + u64::from(raw.len);
+                if raw.offset != u32::MAX && end <= payload.len() as u64 {
+                    own = Some(&payload[raw.offset as usize..end as usize]);
+                }
                 None
             };
             sections.push(Section {
@@ -184,6 +195,7 @@ impl<'a> Ucfx<'a> {
                 depth,
                 descendants: raw.descendants,
                 data,
+                own,
             });
         }
         Ok(Self { sections, payload })
@@ -245,6 +257,22 @@ mod tests {
 
     fn leaf(cc: &[u8; 4], data: &[u8]) -> UcfxNode {
         UcfxNode::Leaf(*cc, data.to_vec())
+    }
+
+    /// A container whose record points at bytes keeps them as its own; one
+    /// at 0xFFFFFFFF and every leaf have none.
+    #[test]
+    fn keeps_a_container_s_own_bytes() {
+        let a = ucfx(&[
+            UcfxNode::Both(*b"FRCE", vec![1, 2, 3, 4], vec![leaf(b"ATRB", &[9; 12])]),
+            UcfxNode::Container(*b"EMIT", vec![leaf(b"TRFM", &[])]),
+        ]);
+        let u = Ucfx::parse(&a).unwrap();
+        let s = u.sections();
+        assert_eq!((s[0].own, s[0].data), (Some(&[1, 2, 3, 4][..]), None));
+        assert_eq!(s[1].own, None);
+        assert_eq!(s[1].data, Some(&[9; 12][..]));
+        assert_eq!((s[2].own, s[3].own), (None, None));
     }
 
     #[test]
