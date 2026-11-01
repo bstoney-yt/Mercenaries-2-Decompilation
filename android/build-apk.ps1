@@ -3,6 +3,10 @@
 # Needs (see README.md): ANDROID_HOME (an SDK with a platform and build-tools),
 # ANDROID_NDK_ROOT (an NDK), a JDK's keytool on PATH or under JAVA_HOME,
 # and cargo-apk (`cargo install cargo-apk`).
+#
+# -Install: the game install whose icon becomes the launcher icon (the
+# placeholder in res\ when it has none).
+param([string] $Install = $(if ($env:M2_INSTALL) { $env:M2_INSTALL } else { 'C:\Program Files (x86)\EA Games\Mercenaries 2 World in Flames' }))
 $ErrorActionPreference = 'Stop'
 # Native tools report progress on stderr, which 'Stop' would take for a
 # failure when the output is redirected: run them with 'Continue' and check
@@ -59,6 +63,34 @@ if (-not (Test-Path $keystore)) {
 }
 $env:CARGO_APK_RELEASE_KEYSTORE = $keystore
 $env:CARGO_APK_RELEASE_KEYSTORE_PASSWORD = 'android'
+
+# The launcher icon: the game's own mercs2.ico (one 64x64 picture, the same
+# one Mercenaries2.exe carries), scaled to each density into a copy of res\
+# under target\ so the game's art never enters the repo.
+$res = Join-Path $here 'target\res'
+if (Test-Path $res) { Remove-Item -Recurse -Force $res }
+Copy-Item -Recurse (Join-Path $here 'res') $res
+$ico = Join-Path $Install 'mercs2.ico'
+if (Test-Path $ico) {
+    Add-Type -AssemblyName System.Drawing
+    $icon = New-Object System.Drawing.Icon($ico, 64, 64)
+    $src = $icon.ToBitmap()
+    $densities = @{ 'mdpi' = 48; 'hdpi' = 72; 'xhdpi' = 96; 'xxhdpi' = 144; 'xxxhdpi' = 192 }
+    foreach ($d in $densities.Keys) {
+        $size = $densities[$d]
+        $bmp = New-Object System.Drawing.Bitmap($size, $size)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $g.DrawImage($src, 0, 0, $size, $size)
+        $g.Dispose()
+        $bmp.Save((Join-Path $res "mipmap-$d\ic_launcher.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Dispose()
+    }
+    $src.Dispose(); $icon.Dispose()
+} else {
+    Write-Warning "no $ico (pass -Install): the APK keeps the placeholder icon"
+}
 
 # The movies' FFmpeg (build-ffmpeg.sh), packed beside the game's library
 # when built; without it movies are skipped on the phone, as before.
