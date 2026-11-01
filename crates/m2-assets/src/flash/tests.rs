@@ -1283,6 +1283,67 @@ fn the_mouse_rolls_over_presses_and_releases_buttons() {
     assert_eq!(rt.button_at([15.0, 15.0]), None);
 }
 
+/// A reference to an instance stands for whatever is at its place once
+/// it is replaced, as the PDA's log page counts on: `old = attach b1;
+/// attach b1 again at its depth; old._y = 7` moves the new one.
+#[test]
+fn a_reference_to_a_replaced_instance_reaches_its_replacement() {
+    let attach = |a: &mut Asm| {
+        a.int(5)
+            .str("b1")
+            .str("box")
+            .int(3)
+            .str("this")
+            .op(0x1C)
+            .str("attachMovie")
+            .op(0x52);
+    };
+    let mut a = Asm::default();
+    a.set("old", attach);
+    attach(&mut a);
+    a.op(0x17);
+    a.str("old").op(0x1C).str("_y").int(7).op(0x4F);
+    a.set("square", |a| {
+        a.str("old").op(0x1C).str("square").op(0x4E);
+    });
+    let mut rt = run(&a, Vec::new());
+    let b1 = rt.player.child(rt.player.root, "b1").unwrap();
+    assert_eq!(rt.player.clip(b1).unwrap().matrix.ty, 7.0);
+    // Its children are the new one's.
+    assert!(matches!(var(&mut rt, "square"), Value::Object(_)));
+}
+
+/// The PDA's log: `t.wordWrap = true; t.autoSize = true` keeps the box's
+/// width and grows it down, though the field's definition doesn't wrap;
+/// and its parent's `_height` counts the box.
+#[test]
+fn word_wrap_set_by_a_script_wraps_and_the_box_counts_in_bounds() {
+    let mut a = Asm::default();
+    a.str("t")
+        .op(0x1C)
+        .str("wordWrap")
+        .act(0x96, &[5, 1])
+        .op(0x4F);
+    a.str("t")
+        .op(0x1C)
+        .str("autoSize")
+        .act(0x96, &[5, 1])
+        .op(0x4F);
+    a.set("high", |a| {
+        a.str("_root").op(0x1C).str("_height").op(0x4E);
+    });
+    let def = EditText {
+        bounds: [-2.0, -2.0, 100.0, 20.0],
+        height: 20.0,
+        ..EditText::default()
+    };
+    let (mut rt, t) = text_field(def, "abcd", a);
+    let c = rt.player.clip(t).unwrap();
+    assert_eq!(c.word_wrap, Some(true));
+    assert_eq!(c.text_box, Some([-2.0, -2.0, 100.0, 26.0]));
+    assert!(number(&var(&mut rt, "high")) >= 28.0);
+}
+
 /// A `DefineMorphShape` from a 10 px red square to a 20 px blue one.
 fn morph_square() -> MorphShape {
     let mut w = Writer::default();
