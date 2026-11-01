@@ -2361,6 +2361,11 @@ impl Thread {
         self.pause_calls(state, &mut log);
         if self.pause_up() {
             self.mouse(PAUSE_MOVIE, state, &mut log);
+        } else if self.pda_shown {
+            // The PC's PDA is a mouse screen too: its tabs and its
+            // buttons (Detail, Browser, Beacon) are the movies' own
+            // (`topbar`'s `onMove`/`onDown`, the map's on `_level1`).
+            self.mouse(PDA_MOVIES[0], state, &mut log);
         }
         self.play_flash(dt, &mut log);
         self.pause_answers(&mut log);
