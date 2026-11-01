@@ -63,7 +63,10 @@ Then run `android\build-apk.ps1`. It copies winit 0.30.13 from the cargo
 registry into `android\target\winit` and applies
 `winit-0.30.13-input.patch` (upstream winit reports an Android mouse and a
 controller's sticks as touches), makes a signing key at
-`%USERPROFILE%\.android\m2-alpha.keystore` if there is none, and builds
+`%USERPROFILE%\.android\m2-alpha.keystore` if there is none, scales your
+install's `mercs2.ico` into the launcher icons under `android\target\res`
+(pass `-Install <folder>` or set `M2_INSTALL` when the game is not in the
+default EA Games folder; without it the placeholder in `res\` is kept), and builds
 `android\target\release\apk\Mercenaries2Alpha.apk`.
 
 `android\` is its own Cargo workspace so the desktop builds and CI never
