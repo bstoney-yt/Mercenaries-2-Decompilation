@@ -74,8 +74,7 @@ pub struct VehicleTuning {
 /// 360 code's record, 0x823EBBE8, in its order; the AMX-30's values in
 /// brackets), as the 360 code runs it (step 0x821A49E8; see
 /// `physics::drive_tracks`). Fields the record leaves out take the 360
-/// record's defaults. Its springs (`SpringStrength`, `SpringDamp`,
-/// `SpringExpLength`, `SpringCmpLength`) are read but not yet used.
+/// record's defaults.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TankTuning {
     /// Top speed, m/s (`MaxSpeed` 45 km/h): the drive stops pushing at it.
@@ -119,6 +118,14 @@ pub struct TankTuning {
     /// and squeeze, metres (`SpringStrength` 20, `SpringDamp` 2.5,
     /// `SpringExpLength` 0.35, `SpringCmpLength` 0.7).
     pub springs: (f32, f32, f32, f32),
+}
+
+impl TankTuning {
+    /// How long each track point's spring is, metres: its stretch and
+    /// squeeze (its ray's length, 0x821A4A60).
+    pub fn spring_length(&self) -> f32 {
+        self.springs.2 + self.springs.3
+    }
 }
 
 /// How a helicopter flies, from its `_HelicopterPhysics` (names found by

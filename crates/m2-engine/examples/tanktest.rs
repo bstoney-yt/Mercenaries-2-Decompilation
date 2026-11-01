@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "template\tcount\tdata km/h\tkm/h\tto 20 s\tspin deg/s\tturn km/h\tturn deg/s\tstop m\thardpoints"
+        "template\tcount\tdata km/h\tkm/h\tto 20 s\tspin deg/s\tturn km/h\tturn deg/s\tstop m\trest cm\tslide 20 m\tslide 30 m\thardpoints"
     );
     for ((model, _), ids) in &groups {
         let mut ids = ids.clone();
@@ -114,8 +114,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let spin = spin(&spec);
         let (turn_speed, turn) = corner(&spec);
         let stop = stop(&spec);
+        let rest = rest(&spec) * 100.0;
+        let (slide20, slide30) = (slide(&spec, 20.0), slide(&spec, 30.0));
         println!(
-            "{name}\t{}\t{top:.0}\t{:.1}\t{to20:.2}\t{spin:.1}\t{:.1}\t{turn:.1}\t{stop:.1}\t{hardpoints}",
+            "{name}\t{}\t{top:.0}\t{:.1}\t{to20:.2}\t{spin:.1}\t{:.1}\t{turn:.1}\t{stop:.1}\t{rest:.0}\t{slide20:.2}\t{slide30:.2}\t{hardpoints}",
             ids.len(),
             fastest * 3.6,
             turn_speed * 3.6,
@@ -249,4 +251,42 @@ fn stop(spec: &VehicleSpec) -> f32 {
         }
     });
     went
+}
+
+/// Parked 10 s on the level: how high its model's floor (its origin)
+/// rides above the ground, metres.
+fn rest(spec: &VehicleSpec) -> f32 {
+    let (mut p, id) = start(spec);
+    ride(&mut p, id, 10.0, controls(0.0, 0.0, true), |_, _| {});
+    p.vehicle_transform(id).map_or(f32::NAN, |m| m.w_axis.y)
+}
+
+/// Parked 10 s facing up a plane tilted `degrees`: how far it slides,
+/// metres.
+fn slide(spec: &VehicleSpec, degrees: f32) -> f32 {
+    let mut p = Physics::new();
+    let half = 200.0;
+    let tilt = Quat::from_rotation_x(-degrees.to_radians());
+    let v = [
+        Vec3::new(-half, 0.0, -half),
+        Vec3::new(half, 0.0, -half),
+        Vec3::new(half, 0.0, half),
+        Vec3::new(-half, 0.0, half),
+    ];
+    let shape = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).expect("plane");
+    p.add_static(StaticKey::Cell(1), &shape, Vec3::ZERO, tilt);
+    p.step(DT);
+    let id = p.add_vehicle_turned(spec, tilt * Vec3::Y * 1.0, tilt);
+    for _ in 0..(2.0 / DT) as usize {
+        p.drive(id, controls(0.0, 0.0, true));
+        p.step(DT);
+    }
+    let from = p
+        .vehicle_transform(id)
+        .map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+    ride(&mut p, id, 10.0, controls(0.0, 0.0, true), |_, _| {});
+    let at = p
+        .vehicle_transform(id)
+        .map_or(Vec3::ZERO, |m| m.w_axis.truncate());
+    (at - from).length()
 }
