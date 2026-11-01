@@ -2290,9 +2290,8 @@ fn collect(player: &Player, id: ClipId, m: &Matrix, out: &mut Vec<Triangle>, nes
     // The shape's whole area, see-through fills too: Flash's bounds and
     // hit areas count them (the menus' buttons are fully transparent
     // shapes), though drawing leaves them out.
-    if let Kind::Shape(s) = c.kind
-        && let Some((_, mesh)) = c.lib.shapes.get(&s)
-    {
+    // A morph shape's, at its ratio (the PDA's buttons' highlights).
+    let whole = |mesh: &[super::ShapeTriangle], out: &mut Vec<Triangle>| {
         out.extend(mesh.iter().map(|t| Triangle {
             corners: t.corners.map(|p| m.apply(p)),
             uv: [[0.0; 2]; 3],
@@ -2300,6 +2299,19 @@ fn collect(player: &Player, id: ClipId, m: &Matrix, out: &mut Vec<Triangle>, nes
             texture: None,
             multiply: false,
         }));
+    };
+    match c.kind {
+        Kind::Shape(s) => {
+            if let Some((_, mesh)) = c.lib.shapes.get(&s) {
+                whole(mesh, out);
+            }
+        }
+        Kind::Morph(s) => {
+            if let Some(morphed) = c.lib.morph(s, c.ratio) {
+                whole(&morphed.1, out);
+            }
+        }
+        _ => {}
     }
     // A text field's box, as Flash counts it in its parents' bounds (the
     // PDA's log stacks its messages by their `_height`).

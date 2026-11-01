@@ -23,7 +23,7 @@
 //! A mask clips what it masks to its bounds (the masks of the game's
 //! screens are rectangles).
 //!
-//! Not drawn yet: gradients (drawn in their first colour), morph shapes,
+//! Not drawn yet: gradients (drawn in their first colour),
 //! text, buttons, filters and blend modes; nothing runs the movies'
 //! ActionScript, so a sprite shows its first frame whatever its script
 //! would make of it.
@@ -397,6 +397,212 @@ fn style_arrays(b: &mut Bits<'_>, version: u8, fills: &mut Vec<Fill>, lines: &mu
     }
 }
 
+/// A morph shape (`DefineMorphShape`, `DefineMorphShape2`): its start and
+/// end as shapes with the same style tables (the start's and the end's
+/// colours and widths) and their edges paired in order. A placement's
+/// ratio picks a shape between them ([`MorphShape::at`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MorphShape {
+    pub start: Shape,
+    pub end: Shape,
+}
+
+/// A morph fill style: the start's fill and the end's.
+fn morph_fill(b: &mut Bits<'_>) -> (Fill, Fill) {
+    match b.u8() {
+        0x00 => (Fill::Solid(b.colour(true)), Fill::Solid(b.colour(true))),
+        kind @ (0x10 | 0x12 | 0x13) => {
+            b.matrix();
+            b.matrix();
+            b.align();
+            let count = usize::from(b.u8() & 15);
+            let (mut first, mut last) = ([0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]);
+            for i in 0..count {
+                b.u8();
+                let s = b.colour(true);
+                b.u8();
+                let e = b.colour(true);
+                if i == 0 {
+                    (first, last) = (s, e);
+                }
+            }
+            if kind == 0x13 {
+                b.u16();
+                b.u16();
+            }
+            (Fill::Gradient(first), Fill::Gradient(last))
+        }
+        kind @ 0x40..=0x43 => {
+            let id = b.u16();
+            let repeat = kind == 0x40 || kind == 0x42;
+            let mut fill = || {
+                let m = b.matrix();
+                Fill::Bitmap {
+                    id,
+                    matrix: Matrix {
+                        a: m.a / TWIPS,
+                        b: m.b / TWIPS,
+                        c: m.c / TWIPS,
+                        d: m.d / TWIPS,
+                        ..m
+                    },
+                    repeat,
+                }
+            };
+            (fill(), fill())
+        }
+        _ => (Fill::Solid([0.0; 4]), Fill::Solid([0.0; 4])),
+    }
+}
+
+impl MorphShape {
+    /// Parses a `DefineMorphShape` (`two`: `DefineMorphShape2`) tag's body.
+    pub fn parse(data: &[u8], two: bool) -> (u16, MorphShape) {
+        let mut b = Bits::new(data);
+        let id = b.u16();
+        let start_bounds = b.rect();
+        let end_bounds = b.rect();
+        if two {
+            b.rect();
+            b.rect();
+            b.u8();
+        }
+        // The end edges' offset: they follow the start's anyway.
+        b.u16();
+        b.u16();
+        // Index 0 of each table is "none", at both ends.
+        let no_fill = vec![Fill::Solid([0.0; 4])];
+        let no_line = vec![Line {
+            width: 0.0,
+            colour: [0.0; 4],
+        }];
+        let mut fills = (no_fill.clone(), no_fill);
+        let mut lines = (no_line.clone(), no_line);
+        let mut n = usize::from(b.u8());
+        if n == 0xff {
+            n = usize::from(b.u16());
+        }
+        for _ in 0..n {
+            let (s, e) = morph_fill(&mut b);
+            fills.0.push(s);
+            fills.1.push(e);
+        }
+        let mut n = usize::from(b.u8());
+        if n == 0xff {
+            n = usize::from(b.u16());
+        }
+        for _ in 0..n {
+            let widths = [b.u16(), b.u16()].map(|w| (f32::from(w) / TWIPS).max(HAIRLINE));
+            let colours = if two {
+                let head = b.u8();
+                b.u8();
+                if (head >> 4) & 3 == 2 {
+                    b.u16();
+                }
+                if (head >> 3) & 1 == 1 {
+                    let (s, e) = morph_fill(&mut b);
+                    let colour = |f: Fill| match f {
+                        Fill::Solid(c) | Fill::Gradient(c) => c,
+                        Fill::Bitmap { .. } => [1.0; 4],
+                    };
+                    [colour(s), colour(e)]
+                } else {
+                    [b.colour(true), b.colour(true)]
+                }
+            } else {
+                [b.colour(true), b.colour(true)]
+            };
+            lines.0.push(Line {
+                width: widths[0],
+                colour: colours[0],
+            });
+            lines.1.push(Line {
+                width: widths[1],
+                colour: colours[1],
+            });
+        }
+        let mut start = Shape {
+            bounds: start_bounds,
+            fills: fills.0,
+            lines: lines.0,
+            edges: Vec::new(),
+        };
+        start.read_records(&mut b, 3);
+        let mut end = Shape {
+            bounds: end_bounds,
+            fills: fills.1,
+            lines: lines.1,
+            edges: Vec::new(),
+        };
+        end.read_records(&mut b, 3);
+        (id, MorphShape { start, end })
+    }
+
+    /// The shape at `ratio` (0 the start, 1 the end): edges, colours and
+    /// widths in between, the start's styles on each edge. A straight
+    /// edge paired with a curve bends as one with its control point
+    /// half way.
+    pub fn at(&self, ratio: f32) -> Shape {
+        let t = ratio.clamp(0.0, 1.0);
+        let mix = |a: [f32; 2], b: [f32; 2]| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        let mix4 = |a: [f32; 4], b: [f32; 4]| std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t);
+        let edges = self
+            .start
+            .edges
+            .iter()
+            .zip(&self.end.edges)
+            .map(|(s, e)| {
+                let control = match (s.control, e.control) {
+                    (None, None) => None,
+                    (sc, ec) => Some(mix(
+                        sc.unwrap_or(mix_half(s.from, s.to)),
+                        ec.unwrap_or(mix_half(e.from, e.to)),
+                    )),
+                };
+                Edge {
+                    from: mix(s.from, e.from),
+                    control,
+                    to: mix(s.to, e.to),
+                    ..*s
+                }
+            })
+            .collect();
+        let fills = self
+            .start
+            .fills
+            .iter()
+            .zip(&self.end.fills)
+            .map(|(s, e)| match (s, e) {
+                (Fill::Solid(a), Fill::Solid(b)) => Fill::Solid(mix4(*a, *b)),
+                (Fill::Gradient(a), Fill::Gradient(b)) => Fill::Gradient(mix4(*a, *b)),
+                _ => s.clone(),
+            })
+            .collect();
+        let lines = self
+            .start
+            .lines
+            .iter()
+            .zip(&self.end.lines)
+            .map(|(s, e)| Line {
+                width: s.width + (e.width - s.width) * t,
+                colour: mix4(s.colour, e.colour),
+            })
+            .collect();
+        let (s, e) = (self.start.bounds, self.end.bounds);
+        Shape {
+            bounds: mix4(s, e),
+            fills,
+            lines,
+            edges,
+        }
+    }
+}
+
+/// The point half way from `a` to `b`.
+fn mix_half(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0]
+}
+
 impl Shape {
     /// Parses a `DefineShape` (`version` 1 to 4) tag's body.
     pub fn parse(data: &[u8], version: u8) -> (u16, Shape) {
@@ -418,10 +624,18 @@ impl Shape {
         };
         let (mut fills, mut lines) = (Vec::new(), Vec::new());
         style_arrays(&mut b, version, &mut fills, &mut lines);
-        // Indices into the current tables count from these.
-        let (mut fill_base, mut line_base) = (shape.fills.len() - 1, shape.lines.len() - 1);
         shape.fills.extend(fills);
         shape.lines.extend(lines);
+        shape.read_records(&mut b, version);
+        (id, shape)
+    }
+
+    /// Reads a `SHAPE`'s bit counts and records into the edges, style
+    /// indices counting from the tables' first entries.
+    fn read_records(&mut self, b: &mut Bits<'_>, version: u8) {
+        let shape = self;
+        // Indices into the current tables count from these.
+        let (mut fill_base, mut line_base) = (0usize, 0usize);
         b.align();
         let mut fill_bits = b.ub(4) as usize;
         let mut line_bits = b.ub(4) as usize;
@@ -451,7 +665,7 @@ impl Shape {
                 }
                 if flags & 16 != 0 {
                     let (mut fills, mut lines) = (Vec::new(), Vec::new());
-                    style_arrays(&mut b, version, &mut fills, &mut lines);
+                    style_arrays(b, version, &mut fills, &mut lines);
                     fill_base = shape.fills.len() - 1;
                     line_base = shape.lines.len() - 1;
                     shape.fills.extend(fills);
@@ -495,7 +709,6 @@ impl Shape {
                 line: ln,
             });
         }
-        (id, shape)
     }
 
     /// The shape as triangles: each fill's region, then each stroke.
