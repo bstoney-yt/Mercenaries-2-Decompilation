@@ -5342,6 +5342,52 @@ mod tests {
     }
 
     #[test]
+    fn a_tank_point_springs_by_its_squeeze_squared_and_damps_only_stretching() {
+        let full = AMX30.spring_length();
+        let push = |t: &mut Tracks, length: f32| {
+            let at = Vec3::new(1.2, -1.0, 2.0);
+            let points = [Some(TrackContact {
+                at,
+                normal: Vec3::Y,
+                start: at + Vec3::Y * length,
+            })];
+            let f = TrackFooting {
+                turn: Quat::IDENTITY,
+                centre: Vec3::ZERO,
+                mass: 32000.0,
+                points: &points,
+                throttle: 0.0,
+                steer: 0.0,
+                held: false,
+            };
+            let mut spring = Vec3::ZERO;
+            drive_tracks(
+                t,
+                &f,
+                || (Vec3::ZERO, Vec3::ZERO),
+                |i, p| {
+                    if p == Some(at + Vec3::Y * length) {
+                        spring += i;
+                    }
+                },
+                DT,
+            );
+            spring
+        };
+        // Squeezed 0.3 m (from all its length): mass x 20 x 0.3 x 0.3,
+        // straight up while level; squeezing it is not damped.
+        let mut t = Tracks::new(AMX30, 1);
+        let up = push(&mut t, full - 0.3);
+        let want = 32000.0 * 20.0 * 0.3 * 0.3 * DT;
+        assert!((up.y - want).abs() < want * 1e-4, "{up}");
+        assert!(up.x.abs() < 1e-6 && up.z.abs() < 1e-6);
+        // Stretching back 0.01 m in a step: less damp 2.5 x 0.6 m/s.
+        let up = push(&mut t, full - 0.29);
+        let want = 32000.0 * (20.0 * 0.29 - 2.5 * 0.01 / DT) * 0.29 * DT;
+        assert!((up.y - want).abs() < want * 1e-3, "{up}");
+    }
+
+    #[test]
     fn tracks_push_along_their_curve() {
         // The AMX-30's: 1, 0.45, 0.3, 0.1 at 0, 0.4, 0.6, 1.
         let curve = [(0.0, 1.0), (0.4, 0.45), (0.6, 0.3), (1.0, 0.1)];
@@ -5375,9 +5421,21 @@ mod tests {
     /// One `drive_tracks` step of a still AMX-30 on six points at rest:
     /// the sum of its linear impulses and of their turn about its centre.
     fn tank_step(t: &mut Tracks, v: Vec3, throttle: f32, steer: f32) -> (Vec3, Vec3) {
-        let points: Vec<Option<(Vec3, Vec3)>> = [-1.2f32, 1.2]
+        // Each point's spring just touching (squeezed 0: it pushes
+        // nothing).
+        let full = AMX30.spring_length();
+        let points: Vec<Option<TrackContact>> = [-1.2f32, 1.2]
             .iter()
-            .flat_map(|&x| [-2.0f32, 0.0, 2.0].map(|z| Some((Vec3::new(x, -1.0, z), Vec3::Y))))
+            .flat_map(|&x| {
+                [-2.0f32, 0.0, 2.0].map(|z| {
+                    let at = Vec3::new(x, -1.0, z);
+                    Some(TrackContact {
+                        at,
+                        normal: Vec3::Y,
+                        start: at + Vec3::Y * full,
+                    })
+                })
+            })
             .collect();
         let f = TrackFooting {
             turn: Quat::IDENTITY,
