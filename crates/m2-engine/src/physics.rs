@@ -1432,28 +1432,6 @@ fn drive_tracks(
     }
 }
 
-/// The 360 code's frame-rate-free ease (0x824BB050): `from` moves
-/// towards `to` keeping `keep` of the gap each sixtieth of a second (all
-/// of it at once for `keep` 0), part steps in proportion; the last bit
-/// snaps.
-fn ease_towards(mut from: f32, to: f32, keep: f32, mut dt: f32) -> f32 {
-    const TICK: f32 = 1.0 / 60.0;
-    if dt > 1000.0 * TICK {
-        return if keep <= 0.9999 { to } else { from };
-    }
-    let take = 1.0 - keep;
-    while dt > TICK {
-        let gap = to - from;
-        if gap * gap < (keep * 1e-5) * (keep * 1e-5) {
-            return to;
-        }
-        dt -= TICK;
-        from += gap * take;
-    }
-    let next = from + (to - from) * take;
-    next * (dt * 60.0) + (1.0 - dt * 60.0) * from
-}
-
 /// A motorbike's balance for a step of `dt` s, as the 360 code holds it
 /// up (0x8219D800): it splits the step into sixtieths of a second (one
 /// to six of them) and in each, reading its spin and velocity afresh
@@ -5389,14 +5367,6 @@ mod tests {
         let grip = 0.1 + (4.0 - 0.1) * 0.05;
         let want = -6.0 * 32000.0 * grip * DT;
         assert!((sum.z - want).abs() < -want * 1e-3, "{sum}");
-    }
-
-    #[test]
-    fn the_360_ease_keeps_its_share_each_sixtieth() {
-        assert_eq!(ease_towards(0.0, 1.0, 0.0, DT), 1.0);
-        assert!((ease_towards(0.0, 1.0, 0.9, DT) - 0.1).abs() < 1e-6);
-        assert!((ease_towards(0.0, 1.0, 0.9, 2.0 * DT) - 0.19).abs() < 1e-5);
-        assert!((ease_towards(0.0, 1.0, 0.9, 0.5 * DT) - 0.05).abs() < 1e-6);
     }
     #[test]
     fn a_car_driven_into_another_bumps_it_body_to_body() {
