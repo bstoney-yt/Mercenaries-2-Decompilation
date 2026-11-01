@@ -4,7 +4,8 @@
 //! out (`MaxSpeed`, km/h), how far it leans in a full-lock turn beside
 //! the lean that balances that turn, how far a sideways shove at
 //! speed rolls it and how long it takes to stand back up, and whether
-//! it ever tips over (standing, turning, shoved or weaving).
+//! it ever tips over (standing, turning, shoved or weaving), and the
+//! lean the 360 code's balance (0x8219D800) asks of that turn.
 //!
 //! ```text
 //! cargo run --release -p m2-engine --example biketest -- "<install dir>"
@@ -88,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "template\tcount\tdata km/h\tkm/h\ttop share\troll k\troll c\tpitch c\tyaw c\t\
-         turn km/h\tlean deg\tbalance deg\tshove deg\tstood s\tweave deg\ttipped"
+         turn km/h\tlean deg\tbalance deg\t360 lean deg\tshove deg\tstood s\tweave deg\ttipped"
     );
     let (mut ridden, mut tipped_all) = (0, 0);
     for ((model, record), ids) in &groups {
@@ -117,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_or(f32::NAN, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         };
         let [top, k, cr, cp, cy] = fields.map(f);
+        eprintln!("{name}: {:?} mass {}", spec.tuning.bike, spec.mass);
         let mut tipped = Vec::new();
         if stand(&spec) {
             tipped.push("stand");
@@ -125,7 +127,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if t {
             tipped.push("ahead");
         }
-        let (turn, lean, balance, t) = corner(&spec);
+        let (turn, lean, balance, rate, t) = corner(&spec);
+        let want = want_lean(&spec, turn, rate).to_degrees();
         if t {
             tipped.push("turn");
         }
@@ -142,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!(
             "{name}\t{}\t{top}\t{:.1}\t{:.2}\t{k}\t{cr}\t{cp}\t{cy}\t{:.1}\t{lean:.1}\t\
-             {balance:.1}\t{shoved:.1}\t{stood:.2}\t{weave:.1}\t{}",
+             {balance:.1}\t{want:.1}\t{shoved:.1}\t{stood:.2}\t{weave:.1}\t{}",
             ids.len(),
             fastest * 3.6,
             fastest * 3.6 / top,
@@ -257,7 +260,7 @@ fn ahead(spec: &VehicleSpec) -> (f32, bool) {
 /// 8 s flat out, then full lock left with the throttle open 6 s: its
 /// speed, mean lean and the lean that balances its turn over the last
 /// 3 s (degrees, positive into the turn), and whether it tipped.
-fn corner(spec: &VehicleSpec) -> (f32, f32, f32, bool) {
+fn corner(spec: &VehicleSpec) -> (f32, f32, f32, f32, bool) {
     let (mut p, id) = start(spec);
     let mut tipped = ride(&mut p, id, 8.0, |_| throttle(0.0), |_, _| {});
     let (mut n, mut speed, mut lean, mut rate) = (0.0, 0.0, 0.0, 0.0);
@@ -284,7 +287,7 @@ fn corner(spec: &VehicleSpec) -> (f32, f32, f32, bool) {
     let n = f32::max(n, 1.0);
     let (speed, lean, rate) = (speed / n, lean / n, rate / n);
     let balance = (speed * rate / GRAVITY).atan();
-    (speed, lean.to_degrees(), balance.to_degrees(), tipped)
+    (speed, lean.to_degrees(), balance.to_degrees(), rate, tipped)
 }
 
 /// 8 s flat out, then shoved sideways ([`SHOVE`]) and ridden on 6 s
@@ -337,4 +340,23 @@ fn slalom(spec: &VehicleSpec) -> (f32, bool) {
         |p, _| most = most.max(attitude(p, id).0.to_degrees().abs()),
     );
     (most, t)
+}
+
+/// The lean the 360 code's balance asks in a full-lock left turn at
+/// `speed` m/s turning `rate` rad/s (0x8219D800; radians, positive into
+/// the turn): the larger of its turn's and its steering's.
+fn want_lean(spec: &VehicleSpec, speed: f32, rate: f32) -> f32 {
+    let Some(b) = spec.tuning.bike else {
+        return f32::NAN;
+    };
+    let top = spec.tuning.max_speed.unwrap_or(f32::INFINITY);
+    let fast = (speed / top).clamp(0.0, 1.0);
+    let most = (1.0 - fast) * b.roll_angle.1 + fast * b.roll_angle.0;
+    let from_turn = if b.roll_rate != 0.0 {
+        most * (rate / b.roll_rate).min(1.0)
+    } else {
+        0.0
+    };
+    let slow = 1.0 - (speed / b.low_speed.max(1e-3)).min(1.0);
+    from_turn.max((1.0 - slow) * b.roll_input)
 }

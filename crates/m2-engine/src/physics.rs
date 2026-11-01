@@ -1016,17 +1016,24 @@ const CLIMB_EASE: f32 = 1.5;
 /// How quickly it leans to the tilt its stick asks, a second (its
 /// template's `PitchAccel` and `RollAccel` scale it).
 const LEAN_EASE: f32 = 3.0;
-/// A motorbike's balance when its template gives none: the Scooter's and
-/// the Chopper's strength and damps, the most common control in the air
-/// (invented: a mid-range record's).
+/// A motorbike's balance when its template gives none (invented: the
+/// Scooter's record, one of the island's commonest bikes).
 const BIKE: BikeTuning = BikeTuning {
+    roll_rate: 1.5,
+    roll_angle: (1.0, 0.3),
+    roll_input: 0.0,
     roll: 20.0,
-    damp: [10.0, 10.0, 1.0],
+    wheelie: 0.65,
+    pitch_strength: (30.0, 30.0),
+    pitch_high_speed: 1.0,
+    wheelie_steer: 1.0,
+    side_damp: 10.0,
+    damp: [11.0, 10.0, 1.0],
     air: (5.0, 1.5),
+    low_speed: 70.0 / 3.6,
+    inertia: [1.5, 0.3, 1.5],
+    centre_of_mass: [0.0; 3],
 };
-/// The most a motorbike leans to balance a turn, radians (45 degrees;
-/// invented: flat out at full lock its tyres' grip asks up to 66).
-const BIKE_LEAN: f32 = 0.785;
 
 /// A helicopter's body is at most this wide, metres either side: its hull
 /// box leaves the rotor disc out.
@@ -1140,16 +1147,30 @@ impl Axle {
     }
 }
 
-/// A motorbike's balance: its template's (else [`BIKE`]), and its body's
-/// inertia about its own axes (right, up, ahead), per kilogram, m², that
-/// turns those per-kilogram torques into turning accelerations. Its weight
-/// on the ground, per kilogram: gravity times its gravity factor
-/// ([`Springs`]), which the lean that balances a turn answers.
+/// A motorbike's balance: its template's (else [`BIKE`]), and where its
+/// steering stands as its balance eases it (0x270 of the 360's car; 360
+/// sign, positive to the right).
 #[derive(Clone, Copy)]
 struct Bike {
     tuning: BikeTuning,
-    inertia: Vec3,
-    weight: f32,
+    steer: f32,
+}
+
+/// What a motorbike's balance reads of it each step besides its body:
+/// its wheels and how many touch the ground, the mean of their contacts'
+/// normals (up if none), its speed of its top speed and its rider's
+/// inputs as the 360 code has them (steering positive to the right, the
+/// stick's forward and back, throttle and brake).
+#[derive(Clone, Copy, Debug)]
+struct BikeFooting {
+    wheels: usize,
+    touching: usize,
+    normal: Vec3,
+    top: f32,
+    steer: f32,
+    stick: f32,
+    throttle: f32,
+    brake: f32,
 }
 
 /// A boat's hull in the water: the points on its waterline that float it,
@@ -1228,51 +1249,150 @@ fn track_pull(curve: [f32; 4], along: f32) -> f32 {
     curve[i] + (curve[i + 1] - curve[i]) * k
 }
 
-/// A motorbike's spin after a step of `dt` s, from its spin `w` (rad/s,
-/// world), turned `turn` and moving at `velocity`: its template's
-/// strength turns it towards the lean that balances its turn (at most
-/// [`BIKE_LEAN`]), against its roll damp, and its pitch and yaw damps
-/// slow those; in the air its rider's `controls` turn its nose
-/// (throttle ahead dips it) and its heading. Each is a torque per
-/// kilogram over its inertia per kilogram, stepped implicitly so the
-/// stiffest (the street bike's 250 against a 0.2 m² roll inertia)
-/// stays steady at 60 steps a second.
-fn balance(
-    bike: Bike,
-    turn: Quat,
-    velocity: Vec3,
-    w: Vec3,
-    controls: Option<VehicleControls>,
-    dt: f32,
-) -> Vec3 {
-    let BikeTuning { roll, damp, air } = bike.tuning;
-    let per = |i: f32| 1.0 / i.max(1e-3);
-    // Leans so its weight and its turn's pull sum along its up axis.
-    let pull = Vec3::new(0.0, w.y, 0.0).cross(velocity).with_y(0.0);
-    let most = bike.weight * BIKE_LEAN.tan();
-    let pull = pull.clamp_length_max(most);
-    let want = (Vec3::Y * bike.weight + pull).normalize();
-    // About its heading, level (so a turn's yaw is no pitch or roll).
-    let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or(Vec3::Z);
-    let off = (turn * Vec3::Y).cross(want).dot(ahead);
-    let (k, c) = (roll * per(bike.inertia.z), damp[0] * per(bike.inertia.z));
-    let spin = w.dot(ahead);
-    let rolled = spin + dt * (k * off - c * spin) / (1.0 + c * dt + k * dt * dt);
-    let mut w = w + ahead * (rolled - spin);
-    // Pitch about its left, level (nose down positive); yaw about the
-    // vertical.
-    let (stick, steer) = controls.map_or((0.0, 0.0), |c| {
-        (c.throttle.clamp(-1.0, 1.0), c.steer.clamp(-1.0, 1.0))
-    });
-    for (axis, inertia, damp, push) in [
-        (Vec3::Y.cross(ahead), bike.inertia.x, damp[1], stick * air.0),
-        (Vec3::Y, bike.inertia.y, damp[2], steer * air.1),
-    ] {
-        let spin = w.dot(axis);
-        let to = (spin + dt * push * per(inertia)) / (1.0 + damp * per(inertia) * dt);
-        w += axis * (to - spin);
+/// The 360 code's frame-rate-free ease (0x824BB050): `from` moves
+/// towards `to` keeping `keep` of the gap each sixtieth of a second (all
+/// of it at once for `keep` 0), part steps in proportion; the last bit
+/// snaps.
+fn ease_towards(mut from: f32, to: f32, keep: f32, mut dt: f32) -> f32 {
+    const TICK: f32 = 1.0 / 60.0;
+    if dt > 1000.0 * TICK {
+        return if keep <= 0.9999 { to } else { from };
     }
-    w
+    let take = 1.0 - keep;
+    while dt > TICK {
+        let gap = to - from;
+        if gap * gap < (keep * 1e-5) * (keep * 1e-5) {
+            return to;
+        }
+        dt -= TICK;
+        from += gap * take;
+    }
+    let next = from + (to - from) * take;
+    next * (dt * 60.0) + (1.0 - dt * 60.0) * from
+}
+
+/// A motorbike's balance for a step of `dt` s, as the 360 code holds it
+/// up (0x8219D800): it splits the step into sixtieths of a second (one
+/// to six of them) and in each, reading its spin and velocity afresh
+/// (`motion`: angular, then linear, world), `push`es it with an angular
+/// and a linear impulse per kilogram (the caller times its mass). `turn`
+/// is its attitude, held over the step.
+///
+/// - On the ground it rolls towards a lean: from its turning rate, minus
+///   its blended most lean ([`BikeTuning::roll_angle`]) times its turning
+///   rate over [`BikeTuning::roll_rate`] (at most 1 either way), and from
+///   its steering ([`BikeTuning::roll_input`], faded in up to
+///   [`BikeTuning::low_speed`]), their sum held to the larger of them;
+///   upright unless both wheels touch. Strength times the lean it is off
+///   (asin of its sideways axis's height) less roll damp times its roll
+///   rate, about its heading, level.
+/// - Rolling forwards, its nose turns towards the ground's slope (plus
+///   a wheelie's pitch with the stick held and the throttle or brake
+///   open), by the pitch strengths eased off towards its top speed, less
+///   pitch damp; in the air its stick pitches it instead. About its
+///   sideways axis, level.
+/// - Its yaw is damped, about the vertical; its eased steering turns it
+///   in the air (and in a wheelie on the ground).
+/// - In a wheelie on the ground its side damp holds it from sliding.
+fn hold_bike(
+    bike: &mut Bike,
+    f: BikeFooting,
+    turn: Quat,
+    mut motion: impl FnMut() -> (Vec3, Vec3),
+    mut push: impl FnMut(Vec3, Vec3),
+    dt: f32,
+) {
+    let t = bike.tuning;
+    if !t.balances() {
+        return;
+    }
+    let (side, up, ahead) = (turn * Vec3::X, turn * Vec3::Y, turn * Vec3::Z);
+    let pitch_of = |v: Vec3| (v.y / v.length().max(1e-6)).clamp(-1.0, 1.0).asin();
+    let airborne = f.touching == 0;
+    // Along the ground under it, ahead.
+    let along = side.cross(f.normal).normalize_or_zero();
+    let gear = if f.stick > 0.0 { f.throttle } else { f.brake };
+    let gear = gear * gear;
+    let steps = ((dt * 60.0).ceil() as i32).clamp(1, 6);
+    let dt = dt / steps as f32;
+    for _ in 0..steps {
+        let (w, v) = motion();
+        let speed = v.with_y(0.0).length();
+        let fast = if f.top > 0.0 {
+            (speed / f.top).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let slow = if t.low_speed > 0.0 {
+            1.0 - (speed / t.low_speed).min(1.0)
+        } else {
+            0.0
+        };
+        let (roll_rate, pitch_rate, yaw_rate) = (w.dot(ahead), w.dot(side), w.dot(up));
+        if !airborne {
+            let from_turn = if t.roll_rate != 0.0 {
+                let most = (1.0 - fast) * t.roll_angle.1 + fast * t.roll_angle.0;
+                -most * (yaw_rate / t.roll_rate).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            let from_steer = (1.0 - slow) * t.roll_input * f.steer;
+            let most = from_turn.abs().max(from_steer.abs());
+            let want = if f.touching >= f.wheels {
+                (from_turn + from_steer).clamp(-most, most)
+            } else {
+                0.0
+            };
+            let roll = (want - pitch_of(side)) * t.roll - t.damp[0] * roll_rate;
+            if roll != 0.0 {
+                push(ahead.with_y(0.0) * roll * dt, Vec3::ZERO);
+            }
+        }
+        if v.dot(ahead) > 0.0 {
+            let sign = if f.stick < 0.0 { -1.0 } else { 1.0 };
+            let lift = ((f.stick.abs() - 0.5) * 2.0).clamp(0.0, 1.0);
+            let eased = t.pitch_high_speed * fast + (1.0 - fast);
+            let off = pitch_of(along) - pitch_of(ahead);
+            let want = -(lift * sign * t.wheelie * gear);
+            let strength = if want.abs() > off.abs() {
+                t.pitch_strength.0
+            } else {
+                t.pitch_strength.1
+            };
+            let damp = t.damp[1] * pitch_rate;
+            let pitch = if airborne {
+                -(f.stick * t.air.0) - damp
+            } else {
+                strength * (want - off) * eased - damp
+            };
+            if pitch != 0.0 {
+                push(side.with_y(0.0) * pitch * dt, Vec3::ZERO);
+            }
+        }
+        let sign = if f.steer < 0.0 { -1.0 } else { 1.0 };
+        let target = ((f.steer.abs() - 0.25) * (4.0 / 3.0)).clamp(0.0, 1.0) * sign;
+        let keep = if target * target > bike.steer * bike.steer {
+            0.9
+        } else {
+            0.0
+        };
+        bike.steer = ease_towards(bike.steer, target, keep, dt);
+        let damp = -(w.y * t.damp[2]);
+        let yaw = if airborne {
+            damp - t.air.1 * bike.steer
+        } else {
+            // Forwards; backing up the 360 code turns it the other way
+            // (0x98 clear), never in the alpha (no stick).
+            damp - f.stick.abs() * t.wheelie_steer * bike.steer * gear
+        };
+        if yaw != 0.0 {
+            push(Vec3::Y * yaw * dt, Vec3::ZERO);
+        }
+        if !airborne && t.side_damp != 0.0 {
+            let slide = -(f.stick.abs() * t.side_damp * v.dot(side));
+            push(Vec3::ZERO, side * slide * dt);
+        }
+    }
 }
 
 /// How fast a wheeled vehicle's driven wheels turn, rpm, as its engine
@@ -2111,14 +2231,27 @@ impl Physics {
             size.x * size.x + size.z * size.z,
             size.x * size.x + size.y * size.y,
         ) * (m / 12.0 * 1.5);
+        // A motorbike's is its template's per kilogram times its mass, as
+        // the 360 code sets it (0x8219BA08), which its balance is tuned
+        // against.
+        let bike = spec.is_bike().then(|| spec.tuning.bike.unwrap_or(BIKE));
+        let inertia = bike.map_or(inertia, |b| Vec3::from(b.inertia) * m);
+        // Its centre of mass: a motorbike's at the middle of its wheels
+        // plus its template's offset, as the 360 code puts it
+        // (0x8219BABC; which point of a wheel it takes, 0xE0 of the
+        // wheel, isn't traced: its centre here).
+        let com = match bike {
+            Some(b) if !spec.wheels.is_empty() => {
+                let mid =
+                    spec.wheels.iter().map(|w| w.centre).sum::<Vec3>() / spec.wheels.len() as f32;
+                mid + Vec3::from(b.centre_of_mass) - centre
+            }
+            _ => Vec3::new(0.0, -half.y * 0.8, 0.0),
+        };
         let hull = r::InteractionGroups::new(VEHICLE, r::Group::ALL, r::InteractionTestMode::And);
         let collider = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
             .translation(vector(centre))
-            .mass_properties(r::MassProperties::new(
-                vector(Vec3::new(0.0, -half.y * 0.8, 0.0)),
-                m,
-                vector(inertia),
-            ))
+            .mass_properties(r::MassProperties::new(vector(com), m, vector(inertia)))
             .friction(0.6)
             .collision_groups(hull);
         self.world.insert_collider(collider, Some(body));
@@ -2147,13 +2280,9 @@ impl Physics {
         // sets how short it gets (down to minus the wheel's radius, the
         // hit at the cast's start), so its travel never clamps it.
         let springs = (!spec.tracked).then(|| spec.tuning.springs.unwrap_or(Springs::DEFAULT));
-        // Its weight on the ground. A motorbike keeps its plain weight
-        // until its own balance (the 360's at 0x8219D800) is traced: the
-        // alpha's, holding itself up per kilogram, can't carry its
-        // record's 1.7 (the weakest, shoved, falls over in 7 s).
-        let gravity_factor = springs
-            .filter(|_| !spec.is_bike())
-            .map_or(1.0, |s| s.gravity_factor);
+        // Its weight on the ground, a motorbike's too (the 360 code pulls
+        // every car down so, 0x8219EE14, and balances a bike after).
+        let gravity_factor = springs.map_or(1.0, |s| s.gravity_factor);
         let preload = preloads(spec, |_| SPRING, centre.z);
         let mut tops = Vec::with_capacity(spec.wheels.len());
         for (w, &preload) in spec.wheels.iter().zip(&preload) {
@@ -2231,11 +2360,7 @@ impl Physics {
             footing: 1.0,
             gravity_factor,
             tracked: spec.tracked,
-            bike: spec.is_bike().then(|| Bike {
-                tuning: spec.tuning.bike.unwrap_or(BIKE),
-                inertia: inertia / m.max(1.0),
-                weight: GRAVITY * gravity_factor,
-            }),
+            bike: bike.map(|tuning| Bike { tuning, steer: 0.0 }),
             top: spec.tuning.max_speed.unwrap_or(top),
             reverse_top: match spec.tuning.engine {
                 Some(e) if !spec.tracked => e.reverse_speed,
@@ -2480,26 +2605,53 @@ impl Physics {
             .count()
             >= 2;
         let mass = v.mass;
-        // A motorbike holds itself up as its template says, towards the
-        // lean that balances its turn; gravity and its tyres do the rest
-        // (it can fall over).
-        let airborne = !v
-            .controller
-            .wheels()
-            .iter()
-            .any(|w| w.raycast_info().is_in_contact);
-        if let Some(bike) = v.bike
+        // A motorbike holds itself up as the 360 code does ([`hold_bike`]);
+        // gravity and its tyres do the rest (it can fall over).
+        let top = v.top;
+        if let Some(bike) = &mut v.bike
             && let Some(body) = self.world.bodies.get_mut(v.controller.chassis)
         {
-            let w = balance(
+            let wheels = v.controller.wheels();
+            let touching: Vec<Vec3> = wheels
+                .iter()
+                .filter(|w| w.raycast_info().is_in_contact)
+                .map(|w| vec3(w.raycast_info().contact_normal_ws))
+                .collect();
+            let normal = if touching.is_empty() {
+                Vec3::Y
+            } else {
+                touching.iter().sum::<Vec3>() / touching.len() as f32
+            };
+            let footing = BikeFooting {
+                wheels: wheels.len(),
+                touching: touching.len(),
+                normal,
+                top,
+                // The alpha steers positive to the left, the 360 code
+                // to the right (its steering's lean and turn agree only
+                // so); the pad's stick forward and back has no key.
+                steer: -controls.steer.clamp(-1.0, 1.0),
+                stick: 0.0,
+                throttle: open,
+                brake: pressed,
+            };
+            let turn = Quat::from_array(body.position().rotation.to_array());
+            let body = std::cell::RefCell::new(body);
+            hold_bike(
                 bike,
-                Quat::from_array(body.position().rotation.to_array()),
-                vec3(body.linvel()),
-                vec3(body.angvel()),
-                airborne.then_some(controls),
+                footing,
+                turn,
+                || {
+                    let b = body.borrow();
+                    (vec3(b.angvel()), vec3(b.linvel()))
+                },
+                |spin, slide| {
+                    let mut b = body.borrow_mut();
+                    b.apply_torque_impulse(vector(spin * mass), true);
+                    b.apply_impulse(vector(slide * mass), true);
+                },
                 dt,
             );
-            body.set_angvel(vector(w), true);
         }
         // Tracks turn the hull on the spot (one track forward, the other
         // back), so the yaw is set directly; a little slower on the move.
@@ -3877,9 +4029,20 @@ mod tests {
 
     /// The Offroad Motorcycle (AL)'s `Bike*` fields, the weakest.
     const OFFROAD: BikeTuning = BikeTuning {
+        roll_rate: 1.3,
+        roll_angle: (0.7, 0.5),
+        roll_input: 0.1,
         roll: 10.0,
+        wheelie: 0.85,
+        pitch_strength: (40.0, 50.0),
+        pitch_high_speed: 1.0,
+        wheelie_steer: 2.0,
+        side_damp: 10.0,
         damp: [6.0, 10.0, 0.0],
         air: (2.0, 1.5),
+        low_speed: 65.0 / 3.6,
+        inertia: [0.5, 0.3, 0.5],
+        centre_of_mass: [0.0; 3],
     };
     /// Its springs, its record's.
     const OFFROAD_SPRINGS: Springs = Springs {
@@ -3934,9 +4097,9 @@ mod tests {
         bike.tuning.bike = Some(OFFROAD);
         bike.tuning.springs = Some(OFFROAD_SPRINGS);
         bike.tuning.engine = Some(OFFROAD_ENGINE);
-        // Held to 80 km/h (its record: 110): the alpha's own balance can't
-        // stand it back up at its top speed; the 360's, 0x8219D800, is next.
-        bike.tuning.max_speed = Some(80.0 / 3.6);
+        // At its record's top speed, 110 km/h, with its record's 1.7 x
+        // weight (the 360 balance, 0x8219D800, holds it up there).
+        bike.tuning.max_speed = Some(110.0 / 3.6);
         let id = p.add_vehicle(&bike, Vec3::new(0.0, 0.2, 0.0), 0.0);
         let up = |p: &Physics| p.vehicle_transform(id).unwrap().transform_vector3(Vec3::Y);
         let ahead = VehicleControls {
@@ -3952,8 +4115,7 @@ mod tests {
         let at = m.transform_point3(Vec3::Y);
         p.push_vehicle(id, m.transform_vector3(Vec3::X) * 300.0 * 1.5, at);
         let mut most = 1.0f32;
-        // Slower since the 360's tyres push its axles low (round 3 of the
-        // driving model; its own balance, 0x8219D800, isn't traced).
+        // The 360 balance stands it back up (0x8219D800).
         for _ in 0..600 {
             p.drive(id, ahead);
             p.step(DT);
@@ -3965,66 +4127,188 @@ mod tests {
         assert!(end > 0.9986, "back up within 3 degrees in 10 s ({end})");
     }
 
-    #[test]
-    fn a_bike_leans_into_its_turn_and_turns_in_the_air_as_its_template_says() {
-        let bike = Bike {
-            tuning: OFFROAD,
-            inertia: Vec3::new(0.7, 0.6, 0.24),
-            weight: GRAVITY,
-        };
-        // Upright at 10 m/s ahead (+z), turning left (+y) 1 rad/s: it
-        // rolls left, about -z.
-        let w = balance(bike, Quat::IDENTITY, Vec3::Z * 10.0, Vec3::Y, None, DT);
-        assert!(w.z < -0.1, "{w}");
-        // Leaned as far as that turn balances (45 degrees: 10 m/s² of
-        // pull), it holds there.
-        let leaned = Quat::from_rotation_z(-std::f32::consts::FRAC_PI_4);
-        let pull = GRAVITY / 10.0;
-        let w = balance(bike, leaned, Vec3::Z * 10.0, Vec3::Y * pull, None, DT);
-        assert!(w.z.abs() < 1e-3, "{w}");
-        // In the air the throttle dips its nose (+x) and the stick turns
-        // it left (+y): at most control / damp rad/s, its nose's 0.2.
-        let air = Some(VehicleControls {
+    /// A body for [`hold_bike`] alone: its spin and velocity, turned by
+    /// angular impulses per kilogram over its inertia per kilogram
+    /// (upright and heading +z, so its own axes are the world's).
+    struct Spun {
+        w: Vec3,
+        v: Vec3,
+        inertia: Vec3,
+    }
+
+    fn hold(bike: &mut Bike, body: &mut Spun, f: BikeFooting, turn: Quat, dt: f32) {
+        let cell = std::cell::RefCell::new(body);
+        hold_bike(
+            bike,
+            f,
+            turn,
+            || {
+                let b = cell.borrow();
+                (b.w, b.v)
+            },
+            |spin, slide| {
+                let mut b = cell.borrow_mut();
+                let i = b.inertia;
+                b.w += spin / i;
+                b.v += slide;
+            },
+            dt,
+        );
+    }
+
+    fn footing(steer: f32) -> BikeFooting {
+        BikeFooting {
+            wheels: 2,
+            touching: 2,
+            normal: Vec3::Y,
+            top: 110.0 / 3.6,
+            steer,
+            stick: 0.0,
             throttle: 1.0,
-            steer: 1.0,
-            ..Default::default()
-        });
-        let mut w = Vec3::ZERO;
-        for _ in 0..600 {
-            w = balance(bike, Quat::IDENTITY, Vec3::ZERO, w, air, DT);
+            brake: 0.0,
         }
-        assert!((w.x - 0.2).abs() < 1e-3, "{w}");
-        assert!(w.y > 1.0, "{w}");
-        // On the ground the stick does nothing to its pitch or yaw.
-        let w = balance(bike, Quat::IDENTITY, Vec3::ZERO, Vec3::ZERO, None, DT);
-        assert_eq!(w, Vec3::ZERO);
+    }
+
+    #[test]
+    fn a_bike_leans_as_far_as_its_turn_asks_and_no_further() {
+        let mut bike = Bike {
+            tuning: OFFROAD,
+            steer: 0.0,
+        };
+        let inertia = Vec3::from(OFFROAD.inertia);
+        // At 10 m/s ahead turning +y at its most-lean rate: it asks its
+        // most lean, (1 - s) hi + s lo, negative (its sideways axis
+        // dips). Upright, it rolls that way, about -z.
+        let fast = 10.0 / (110.0 / 3.6);
+        let most = (1.0 - fast) * 0.5 + fast * 0.7;
+        let mut body = Spun {
+            w: Vec3::Y * 1.3,
+            v: Vec3::Z * 10.0,
+            inertia,
+        };
+        hold(&mut bike, &mut body, footing(0.0), Quat::IDENTITY, DT);
+        let k = OFFROAD.roll / inertia.z * DT;
+        assert!((body.w.z - (-most * k)).abs() < 1e-4, "{}", body.w);
+        // Leaned exactly that far, turning at that rate about its own up
+        // axis, it holds there (its steering asks less).
+        let leaned = Quat::from_rotation_z(-most);
+        let mut body = Spun {
+            w: leaned * Vec3::Y * 1.3,
+            v: Vec3::Z * 10.0,
+            inertia,
+        };
+        hold(&mut bike, &mut body, footing(-0.1), leaned, DT);
+        assert!(body.w.z.abs() < 1e-4, "{}", body.w);
+        // With a wheel off the ground it stands up instead.
+        let mut body = Spun {
+            w: Vec3::Y * 1.3,
+            v: Vec3::Z * 10.0,
+            inertia,
+        };
+        let one = BikeFooting {
+            touching: 1,
+            ..footing(0.0)
+        };
+        hold(&mut bike, &mut body, one, leaned, DT);
+        assert!(body.w.z > 0.0, "{}", body.w);
+    }
+
+    #[test]
+    fn its_steering_leans_it_once_it_is_moving() {
+        let inertia = Vec3::from(OFFROAD.inertia);
+        let roll = |speed: f32| {
+            let mut bike = Bike {
+                tuning: OFFROAD,
+                steer: 0.0,
+            };
+            let mut body = Spun {
+                w: Vec3::ZERO,
+                v: Vec3::Z * speed,
+                inertia,
+            };
+            // Full lock to the 360's right: lean `roll_input` positive.
+            hold(&mut bike, &mut body, footing(1.0), Quat::IDENTITY, DT);
+            body.w.z
+        };
+        assert_eq!(roll(0.0), 0.0);
+        let k = OFFROAD.roll / inertia.z * DT;
+        let half = OFFROAD.low_speed * 0.5;
+        assert!((roll(half) - 0.5 * OFFROAD.roll_input * k).abs() < 1e-5);
+        assert!((roll(30.0) - OFFROAD.roll_input * k).abs() < 1e-5);
+    }
+
+    #[test]
+    fn on_the_ground_its_nose_follows_the_slope_and_in_the_air_its_steering_turns_it() {
+        let mut bike = Bike {
+            tuning: OFFROAD,
+            steer: 0.0,
+        };
+        let inertia = Vec3::from(OFFROAD.inertia);
+        // Nose up 0.1 rad on the flat, riding forwards: pushed nose down
+        // (+x) by its down strength.
+        let mut body = Spun {
+            w: Vec3::ZERO,
+            v: Vec3::Z * 5.0,
+            inertia,
+        };
+        let up = Quat::from_rotation_x(-0.1);
+        hold(&mut bike, &mut body, footing(0.0), up, DT);
+        let want = OFFROAD.pitch_strength.1 * 0.1 / inertia.x * DT;
+        assert!((body.w.x - want).abs() < 1e-4, "{}", body.w);
+        // In the air full lock to the 360's right eases in (all at once
+        // growing) and turns it -y by its air yaw.
+        let mut body = Spun {
+            w: Vec3::ZERO,
+            v: Vec3::ZERO,
+            inertia,
+        };
+        let air = BikeFooting {
+            touching: 0,
+            ..footing(1.0)
+        };
+        hold(&mut bike, &mut body, air, Quat::IDENTITY, DT);
+        assert!((bike.steer - 0.1).abs() < 1e-5, "eased {}", bike.steer);
+        let want = -OFFROAD.air.1 * bike.steer / inertia.y * DT;
+        assert!((body.w.y - want).abs() < 1e-5, "{}", body.w);
+    }
+
+    #[test]
+    fn the_360_ease_keeps_its_share_each_sixtieth() {
+        assert_eq!(ease_towards(0.0, 1.0, 0.0, DT), 1.0);
+        assert!((ease_towards(0.0, 1.0, 0.9, DT) - 0.1).abs() < 1e-6);
+        // Two sixtieths: 1 - 0.9².
+        assert!((ease_towards(0.0, 1.0, 0.9, 2.0 * DT) - 0.19).abs() < 1e-5);
+        // Half a sixtieth: halfway to one step.
+        assert!((ease_towards(0.0, 1.0, 0.9, 0.5 * DT) - 0.05).abs() < 1e-6);
     }
 
     #[test]
     fn the_stiffest_bike_settles_without_ringing() {
-        // The street `Motorcycle`'s 250 and 50, over a 0.2 m² roll
-        // inertia: stepped explicitly it would overshoot each step.
-        let bike = Bike {
-            tuning: BikeTuning {
-                roll: 250.0,
-                damp: [50.0, 10.0, 1.0],
-                air: (5.0, 1.5),
-            },
-            inertia: Vec3::new(0.7, 0.6, 0.2),
-            weight: GRAVITY,
+        // The old street `Motorcycle`'s 250 and 50 over its 1.5 m² roll
+        // inertia, explicitly stepped as the 360 code steps it.
+        let tuning = BikeTuning {
+            roll: 250.0,
+            damp: [50.0, 10.0, 1.0],
+            inertia: [1.5, 0.7, 1.5],
+            ..OFFROAD
         };
+        let mut bike = Bike { tuning, steer: 0.0 };
         let mut lean = 0.3f32;
-        let mut spin = 0.0;
-        for _ in 0..120 {
-            let turn = Quat::from_rotation_z(lean);
-            let w = balance(bike, turn, Vec3::ZERO, Vec3::Z * spin, None, DT);
-            spin = w.z;
-            let before = lean;
-            lean += spin * DT;
-            assert!(
-                lean.abs() <= before.abs() + 1e-6,
-                "rings: {before} to {lean}"
+        let mut body = Spun {
+            w: Vec3::ZERO,
+            v: Vec3::ZERO,
+            inertia: Vec3::from(tuning.inertia),
+        };
+        for _ in 0..240 {
+            body.w = Vec3::Z * body.w.z;
+            hold(
+                &mut bike,
+                &mut body,
+                footing(0.0),
+                Quat::from_rotation_z(lean),
+                DT,
             );
+            lean += body.w.z * DT;
         }
         assert!(lean.abs() < 0.01, "settled at {lean}");
     }

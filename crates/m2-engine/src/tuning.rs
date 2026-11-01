@@ -177,43 +177,83 @@ impl BoatTuning {
 }
 
 /// How a motorbike holds itself up, from its `_CarPhysicsV2`'s `Bike*`
-/// fields (names found by hash, gap round 17; read here gap round 18;
-/// the Offroad Motorcycle (AL)'s values in brackets, the range over the
-/// 11 distinct bike records after them). Only bikes give them (every
-/// other record's `BikeRollStabilityStrength` is 0).
+/// fields (names from the 360 code's record, 0x823EB210, in its order
+/// @130..@16C; the 360 code copies them 0xE8 on into the running car,
+/// 0x8219B774, and its balance reads them there, 0x8219D800). Only bikes
+/// give them: the 360 code balances a car only if one of its roll
+/// strength and damp, pitch damp and strengths, wheelie steering or air
+/// controls is not 0 (0x8219D800's test), and every other record's are.
 ///
-/// Read as the suspension's strengths and damps are, per kilogram the
-/// bike weighs (inferred from samples, not checked against the game's
-/// code): a torque of strength x lean x mass, newton-metres. Gravity
-/// tips a bike with 9.81 x its centre of mass's height (0.33 to 0.48 m
-/// in the alpha's bodies), 3.3 to 4.7 N m/kg a radian, so even the
-/// weakest record (the player's off-road bike's 10) holds itself up
-/// twice over, and the AI's 100 and the street `Motorcycle`'s 250 with
-/// room to spare. Read the other way, as a turning acceleration per
-/// radian, the five records at 10 to 20 barely beat gravity: shoved at
-/// speed they hang leaning over 3 degrees for 6 s (biketest, gap round
-/// 18), where per kilogram every bike stands back up within 1.7 s. The damps against
-/// its roll, pitch and yaw, and its control in the air, read per
-/// kilogram alike: in the air its stick then turns it at control / damp
-/// rad/s, 0.2 to 0.5 for the nose (the AI-only bike's 3.5).
-///
-/// Named but not read: `BikeWheeliePitch` (0.85; 0.5 to 1) and
-/// `BikeWheelieSideDamp` (10; 10 throughout), as the alpha has no
-/// wheelie. The four fields between them (@148 to @154) are unnamed.
+/// Each value is a torque per kilogram: the 360 code turns it into an
+/// angular impulse of value x step x mass (0x8262C120 is the body's mass)
+/// against the body's inertia, [`inertia`](Self::inertia) x mass
+/// (0x8219BA08). Angles are radians. Fields the record leaves out take
+/// the 360 record's defaults (all 0; inertia 2, 1, 1.5).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BikeTuning {
-    /// What holds it up towards the lean that balances its turn,
-    /// newton-metres per radian off it, per kilogram
-    /// (`BikeRollStabilityStrength` 10; 10 to 250).
+    /// The turning rate, rad/s, at which it leans the most
+    /// (`BikeRollAngVelForMaxRoll`).
+    pub roll_rate: f32,
+    /// That most lean, radians, as the 360 code blends it by its speed s
+    /// of its top speed: `(1 - s) x hi + s x lo` (`BikeRollAngleAtLoSpeed`,
+    /// `BikeRollAngleAtHiSpeed`; the code weights them so, 0x8219DC00,
+    /// against what the names suggest).
+    pub roll_angle: (f32, f32),
+    /// The lean its steering asks on its own at full lock, radians, faded
+    /// in from a standstill up to `low_speed` (`BikeRollAngleFromInput`).
+    pub roll_input: f32,
+    /// What turns it towards that lean, per radian off it
+    /// (`BikeRollStabilityStrength`).
     pub roll: f32,
-    /// Damping against its roll, pitch and yaw, newton-metres per rad/s,
-    /// per kilogram (`BikeExtraDampRoll` 6, `BikeExtraDampPitch` 10,
-    /// `BikeExtraDampYaw` 0; 5 to 50, 10 throughout, 0 to 3).
+    /// How far its nose lifts in a wheelie, radians (`BikeWheeliePitch`).
+    pub wheelie: f32,
+    /// What turns its nose towards the pitch it wants on the ground, per
+    /// radian: when that asks more than it is off the ground's slope, and
+    /// when less (`BikeWheeliePitchStrengthUp`, `...StrengthDown`).
+    pub pitch_strength: (f32, f32),
+    /// Of those, what is left at its top speed
+    /// (`BikeWheeliePitchHiSpeedRatio`).
+    pub pitch_high_speed: f32,
+    /// How well it steers in a wheelie (`BikeWheelieSteerAbility`).
+    pub wheelie_steer: f32,
+    /// What holds it from sliding sideways in a wheelie, per m/s
+    /// (`BikeWheelieSideDamp`).
+    pub side_damp: f32,
+    /// Damping against its roll, pitch and yaw, per rad/s
+    /// (`BikeExtraDampRoll`, `BikeExtraDampPitch`, `BikeExtraDampYaw`).
     pub damp: [f32; 3],
-    /// In the air, what its stick turns its nose and its heading with,
-    /// newton-metres per kilogram at full stick (`BikeAirControlPitch`
-    /// 2, `BikeAirControlYaw` 1.5; 1 to 35, 1.5 to 4).
+    /// In the air, what its stick turns its nose and its heading with
+    /// (`BikeAirControlPitch`, `BikeAirControlYaw`).
     pub air: (f32, f32),
+    /// Up to this speed, m/s, its steering's lean fades in
+    /// (`LowSpeedLimit`, km/h).
+    pub low_speed: f32,
+    /// Its inertia about its own sideways, up and ahead axes, m² per
+    /// kilogram (`InertiaTensorX`, `Y`, `Z`).
+    pub inertia: [f32; 3],
+    /// Where its centre of mass sits from the middle of its wheels, model
+    /// space, metres (`CenterOfMassOffset`; the 360 code adds it to the
+    /// mean of its wheels' positions, 0x8219BABC).
+    pub centre_of_mass: [f32; 3],
+}
+
+impl BikeTuning {
+    /// Whether the 360 code balances it at all (0x8219D800's test).
+    pub fn balances(&self) -> bool {
+        [
+            self.air.0,
+            self.air.1,
+            self.damp[0],
+            self.damp[1],
+            self.damp[2],
+            self.roll,
+            self.pitch_strength.0,
+            self.pitch_strength.1,
+            self.wheelie_steer,
+        ]
+        .iter()
+        .any(|&v| v != 0.0)
+    }
 }
 
 /// A wheeled vehicle's engine and gearbox, from its `_CarPhysicsV2` (the
@@ -1056,6 +1096,16 @@ impl<'a> Table<'a> {
             .filter(|f| f.is_finite())
     }
 
+    /// Field `field` in `record` as three floats in a row (a vector).
+    pub(crate) fn vector(&self, record: &[u8], field: u32) -> Option<[f32; 3]> {
+        let &(at, _, _) = self.fields.get(&field)?;
+        let b = record.get(at..at + 12)?;
+        let v: [f32; 3] = std::array::from_fn(|i| {
+            f32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
+        });
+        v.iter().all(|f| f.is_finite()).then_some(v)
+    }
+
     /// Field `field` of template `id`'s first record as a number, stored
     /// as a float or a whole number.
     fn number(&self, id: u32, field: u32) -> Option<f32> {
@@ -1497,17 +1547,40 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                 })(),
                 bike: (|| {
                     let r = *car.of_template(id).first()?;
-                    let f = |name| car.float(r, name_hash(name)).filter(|v| *v >= 0.0);
+                    let f = |name, default| car.float(r, name_hash(name)).unwrap_or(default);
                     let b = BikeTuning {
-                        roll: f("BikeRollStabilityStrength")?,
+                        roll_rate: f("BikeRollAngVelForMaxRoll", 0.0),
+                        roll_angle: (
+                            f("BikeRollAngleAtLoSpeed", 0.0),
+                            f("BikeRollAngleAtHiSpeed", 0.0),
+                        ),
+                        roll_input: f("BikeRollAngleFromInput", 0.0),
+                        roll: f("BikeRollStabilityStrength", 0.0),
+                        wheelie: f("BikeWheeliePitch", 0.0),
+                        pitch_strength: (
+                            f("BikeWheeliePitchStrengthUp", 0.0),
+                            f("BikeWheeliePitchStrengthDown", 0.0),
+                        ),
+                        pitch_high_speed: f("BikeWheeliePitchHiSpeedRatio", 0.0),
+                        wheelie_steer: f("BikeWheelieSteerAbility", 0.0),
+                        side_damp: f("BikeWheelieSideDamp", 0.0),
                         damp: [
-                            f("BikeExtraDampRoll")?,
-                            f("BikeExtraDampPitch")?,
-                            f("BikeExtraDampYaw")?,
+                            f("BikeExtraDampRoll", 0.0),
+                            f("BikeExtraDampPitch", 0.0),
+                            f("BikeExtraDampYaw", 0.0),
                         ],
-                        air: (f("BikeAirControlPitch")?, f("BikeAirControlYaw")?),
+                        air: (f("BikeAirControlPitch", 0.0), f("BikeAirControlYaw", 0.0)),
+                        low_speed: f("LowSpeedLimit", 30.0) / 3.6,
+                        inertia: [
+                            f("InertiaTensorX", 2.0),
+                            f("InertiaTensorY", 1.0),
+                            f("InertiaTensorZ", 1.5),
+                        ],
+                        centre_of_mass: car
+                            .vector(r, name_hash("CenterOfMassOffset"))
+                            .unwrap_or([0.0; 3]),
                     };
-                    (b.roll > 0.0).then_some(b)
+                    b.balances().then_some(b)
                 })(),
                 chase: (|| {
                     let records = heli_camera.of_template(id);
