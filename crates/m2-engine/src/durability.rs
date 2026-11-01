@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 
 use m2_assets::{Layer, name_hash};
+use m2_math::glam::Vec3;
 
 use crate::tuning::Table;
 
@@ -35,6 +36,126 @@ pub struct Durability {
     pub invincible: bool,
     /// A building's collapse, if it has one.
     pub collapse: Option<Collapse>,
+    /// How it burns down once worn low (`TickDamage`), if it does.
+    pub burn: Option<BurnDown>,
+}
+
+/// How an object worn below a health burns itself down (`TickDamage`:
+/// `DamageThresh`, `Damage`, `TickLength`). From the 360 code: damage
+/// that carries its health from above `below` to under it starts a timer
+/// (0x822889F8) that adds each frame's time and, each time it reaches
+/// `every`, has it take `damage` and starts again less `every`
+/// (0x8240ADF8), until it is destroyed. `below` is a whole number
+/// (`DamageThresh` is read as one, 0x823F4300), and the burning is armed
+/// only when both `damage` and `every` are above 0 (0x823FCB98). The fuel
+/// tanks': below 465 of their 500, 50 every half second.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BurnDown {
+    pub below: f32,
+    pub damage: f32,
+    pub every: f32,
+}
+
+impl BurnDown {
+    /// Seconds it burns with `health` left until it is destroyed, with
+    /// nothing else hurting it: a tick of `damage` each `every`, the first
+    /// `every` after it caught.
+    pub fn seconds_to_burn_out(&self, health: f32) -> f32 {
+        (health / self.damage).ceil() * self.every
+    }
+}
+
+/// What a blast does `d` metres from its heart: `damage` falling off with
+/// the distance to none at `radius`, but never less than `least` (the 360
+/// code's 0x82291640: `max(least, damage * clamp(1 - d / radius, 0, 1))`,
+/// before the damage table's cell). What lies past `radius` it does not
+/// reach.
+pub fn blast_damage(damage: f32, least: f32, radius: f32, d: f32) -> f32 {
+    if d > radius {
+        return 0.0;
+    }
+    let falloff = (1.0 - d / radius.max(0.01)).clamp(0.0, 1.0);
+    (damage * falloff).max(least)
+}
+
+/// How hard a blast pushes, by the size (m³) of what it pushes: up to
+/// each size, of its push (the 360 code's table at 0x82DE88F0, read by
+/// 0x8215CBC8): all of it up to 2 m³, half up to 60, 0.3 up to 200, a
+/// tenth beyond.
+const PUSH_BY_SIZE: [(f32, f32); 12] = [
+    (0.02, 1.0),
+    (0.05, 1.0),
+    (0.5, 1.0),
+    (1.5, 1.0),
+    (2.0, 1.0),
+    (5.0, 0.5),
+    (10.0, 0.5),
+    (25.0, 0.5),
+    (40.0, 0.5),
+    (60.0, 0.5),
+    (200.0, 0.3),
+    (f32::MAX, 0.1),
+];
+
+/// The least of its push a blast gives what it reaches, however far
+/// (`MinForceFalloff`: 0.3 on every `Explosive` in the data, as the
+/// schema's default, 0x823EF9F0).
+pub const LEAST_PUSH: f32 = 0.3;
+
+/// What a blast pushes broken pieces with: where it went off, its reach
+/// (`Radius`, metres) and its push (`MaxForce`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlastPush {
+    pub at: Vec3,
+    pub radius: f32,
+    pub force: f32,
+}
+
+impl BlastPush {
+    /// No push at all, from `at`: what breaks with no blast (a round, a
+    /// `DestructionLink` fall) comes down where it stood.
+    pub fn none(at: Vec3) -> Self {
+        Self {
+            at,
+            radius: 1.0,
+            force: 0.0,
+        }
+    }
+
+    /// The velocity (m/s) and spin (radians a second) it gives a broken
+    /// piece whose world box is `lo` to `hi`, `fudge` its template's
+    /// `ExplosionFudge` (1 without one). From the 360 code (0x8215CBC8):
+    /// the push falls off with the distance from the blast to the box, as
+    /// `max(1 - d / radius, LEAST_PUSH)`, and is [`PUSH_BY_SIZE`] of
+    /// `force` for the box's size, times 0.004 and the fudge; it is given
+    /// five times, at the bottom of the box, a quarter, half and three
+    /// quarters up and at its top, 1, 1.25, 1.5, 1.75 and 2 times as hard,
+    /// each away from the blast across the ground and as much up, and
+    /// each times the piece's mass, so the piece goes as fast whatever it
+    /// weighs: 7.5 times the push out and as much up, its top pushed
+    /// hardest, tipping it away from the blast. The spin is that of a
+    /// solid box (inferred: the 360 leaves it to its physics), about the
+    /// level axis across the way it is pushed.
+    pub fn throw(&self, lo: Vec3, hi: Vec3, fudge: f32) -> (Vec3, Vec3) {
+        let centre = (lo + hi) * 0.5;
+        let d = self.at.clamp(lo, hi).distance(self.at);
+        let falloff = (1.0 - d / self.radius.max(0.01)).max(LEAST_PUSH);
+        let extent = hi - lo;
+        let size = extent.x * extent.y * extent.z;
+        let by_size = PUSH_BY_SIZE
+            .iter()
+            .find(|&&(most, _)| size < most)
+            .map_or(0.0, |&(_, k)| k);
+        let push = self.force * by_size * falloff * 0.004 * fudge;
+        let away = (centre - self.at).with_y(0.0).normalize_or_zero();
+        let velocity = (away + Vec3::Y) * (7.5 * push);
+        // Its height, and its depth the way it is pushed.
+        let height = extent.y;
+        let depth = (extent.x * away.x).abs() + (extent.z * away.z).abs();
+        let spin = Vec3::new(away.z, 0.0, -away.x)
+            * (7.5 * push * height / (height * height + depth * depth).max(0.01));
+        (velocity, spin)
+    }
 }
 
 /// How a building sinks and leans as it comes down
@@ -55,6 +176,12 @@ pub struct Collapse {
 pub fn read(db: &Layer<'_>) -> HashMap<u32, Durability> {
     let health = Table::new(db, "Health");
     let anim = Table::new(db, "BuildingCollapseAnim");
+    let tick = Table::new(db, "TickDamage");
+    let (below, damage, every) = (
+        name_hash("DamageThresh"),
+        name_hash("Damage"),
+        name_hash("TickLength"),
+    );
     let invincible = name_hash("Invincible");
     let (kind, sink) = (name_hash("Type"), name_hash("SinkAccel"));
     health
@@ -76,6 +203,14 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, Durability> {
                     health: health.float(r, AMOUNT).unwrap_or(0.0),
                     invincible: health.word(r, invincible) == Some(1),
                     collapse,
+                    burn: tick.of_template(id).first().and_then(|t| {
+                        let b = BurnDown {
+                            below: tick.word(t, below)? as f32,
+                            damage: tick.float(t, damage)?,
+                            every: tick.float(t, every)?,
+                        };
+                        (b.damage > 0.0 && b.every > 0.0).then_some(b)
+                    }),
                 },
             ))
         })
@@ -188,6 +323,17 @@ pub fn sound_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
 /// or `DebrisTemplate`, the name hash of a template.
 const OSM_VALUE: u32 = 0x255f_12c0;
 
+/// Each template's `ExplosionFudge` (field 6bcc541e, name unknown), by
+/// id: how hard blasts push its objects, of their push (322 templates,
+/// all vehicles but the port's containers, 0.8, and the large fuel
+/// pickup; the 360 code takes 1 for the rest, 0x8215CBC8).
+pub fn explosion_fudges(db: &Layer<'_>) -> HashMap<u32, f32> {
+    let t = Table::new(db, "ExplosionFudge");
+    t.templates()
+        .filter_map(|id| Some((id, t.float(t.of_template(id).first()?, 0x6bcc_541e)?)))
+        .collect()
+}
+
 /// What each piece of a template's objects weighs once broken off (kg),
 /// by id: the `_DebrisPhysics` `Mass` of the template its `OSMParameter`
 /// `PropTemplate` names, the object its pieces become as its model's
@@ -274,6 +420,21 @@ pub fn prop_physics(db: &Layer<'_>) -> HashMap<u32, PropPhysics> {
         .collect()
 }
 
+/// Each template's `PhysicsPropertyGravityScaler` `Scale`, by id: how
+/// many times gravity pulls its objects (1.5 on the weapons and grenades
+/// that lie to be taken: the `Assault Rifle`, the `Grenade`; PC data,
+/// 2026-10-29; from samples).
+pub fn gravity_scales(db: &Layer<'_>) -> HashMap<u32, f32> {
+    let t = Table::new(db, "PhysicsPropertyGravityScaler");
+    let scale = name_hash("Scale");
+    t.templates()
+        .filter_map(|id| {
+            let s = t.float(t.of_template(id).first()?, scale)?;
+            (s.is_finite() && s > 0.0).then_some((id, s))
+        })
+        .collect()
+}
+
 /// Each template's `ModifierKey` (its field of that name, a name hash:
 /// `PropFragile`, `Prop`, `Fence`, `Shack`, `Car`, `Tank`, ...), by id:
 /// the damage table's row for what its objects take of each kind of
@@ -294,6 +455,45 @@ pub fn modifier_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
 /// of a ram's damage and what each thing takes of it, not its size.
 pub fn ram(mass: f32, speed: f32) -> f32 {
     mass * speed / 1000.0
+}
+
+/// How hard two bodies of `mass_a` and `mass_b` (kg) meet when they close
+/// at `closing` (m/s, along the contact normal): a tenth of the closing
+/// speed times the sum of the masses' square roots, so a 2,000 kg car
+/// meeting a 6,000 kg truck at 2.6 m/s makes 31.8. Each side's factor
+/// for the other (1 for vehicles) multiplies it; a body with no mass (a
+/// fixed one) counts as [`FIXED_MASS`]. From the 360 code: the collision
+/// event's size, 0x82163758 (masses and factors) and 0x82162BB8 (the
+/// contacts' mean closing speed times it).
+pub fn crash_size(mass_a: f32, mass_b: f32, closing: f32) -> f32 {
+    let root = |m: f32| if m > 0.0 { m.sqrt() } else { FIXED_MASS.sqrt() };
+    closing.abs() * (root(mass_a) + root(mass_b)) * 0.1
+}
+
+/// The mass a fixed body counts as in [`crash_size`]. From the 360 code
+/// (0x82163758).
+pub const FIXED_MASS: f32 = 15_000.0;
+
+/// A crash smaller than this hurts neither side. From the 360 code
+/// (0x8228B5F0).
+pub const CRASH_FLOOR: f32 = 5.0;
+
+/// What a crash of `size` ([`crash_size`]) does to one side, whose
+/// `ModifierKey` row gives `cell` for the other side's `DamageKey`: a
+/// hundredth of the size times the cell, and nothing unless that is
+/// over 1. From the 360 code: 0x8228B5F0 (the floor and the hundredth),
+/// 0x82287CF8 (each side's cell, and the 1).
+pub fn crash_damage(size: f32, cell: f32) -> f32 {
+    let damage = crash_base(size) * cell;
+    if damage > 1.0 { damage } else { 0.0 }
+}
+
+/// A crash's damage before the damage table's cell: a hundredth of its
+/// `size` ([`crash_size`]), none under [`CRASH_FLOOR`]. From the 360 code
+/// (0x8228B5F0). What the cell makes of it counts only past 1
+/// ([`crash_damage`]).
+pub fn crash_base(size: f32) -> f32 {
+    if size < CRASH_FLOOR { 0.0 } else { size * 0.01 }
 }
 
 /// A ram's kind of damage where its vehicle's template names none: `Car`,
@@ -338,6 +538,9 @@ pub struct Explosion {
     pub damage: f32,
     /// At its edge (`minDamage`).
     pub least: f32,
+    /// Its push at its heart (`MaxForce`; 500 where the template gives
+    /// none, the schema's default, 0x823EF9F0).
+    pub force: f32,
     /// Its template's `DamageKey` (name hash; 0 for none): the damage
     /// table's column for what each thing it reaches takes of it (the
     /// RPG's blast `Explosion`, its frag `Bullet`, the air strike's bomb
@@ -402,6 +605,7 @@ pub fn explosions(db: &Layer<'_>) -> HashMap<u32, Explosion> {
                     radius: t.float(r, radius).unwrap_or(0.0),
                     damage: t.float(r, damage).unwrap_or(0.0),
                     least: t.float(r, least).unwrap_or(0.0),
+                    force: t.float(r, name_hash("MaxForce")).unwrap_or(500.0),
                     kind: keys.get(&id).copied().unwrap_or(0),
                 },
             ))
@@ -412,6 +616,48 @@ pub fn explosions(db: &Layer<'_>) -> HashMap<u32, Explosion> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A blast falls off with the distance to none at its edge, but never
+    // under its least within reach (`fx_Explosion_HugeOil`'s 400, 95, 8 m).
+    #[test]
+    fn a_blast_falls_off_to_its_least_within_reach() {
+        assert_eq!(blast_damage(400.0, 95.0, 8.0, 0.0), 400.0);
+        assert_eq!(blast_damage(400.0, 95.0, 8.0, 4.0), 200.0);
+        assert_eq!(blast_damage(400.0, 95.0, 8.0, 7.0), 95.0);
+        assert_eq!(blast_damage(400.0, 95.0, 8.0, 8.5), 0.0);
+        // A fuel tank burning from just under 465 by 50 a half second
+        // burns out in 10 ticks.
+        let b = BurnDown {
+            below: 465.0,
+            damage: 50.0,
+            every: 0.5,
+        };
+        assert_eq!(b.seconds_to_burn_out(464.5), 5.0);
+    }
+
+    // A crash's size is a tenth of the closing speed times the masses'
+    // roots summed; a fixed body counts as 15 t.
+    #[test]
+    fn a_crash_is_the_closing_speed_times_the_masses_roots() {
+        let size = crash_size(2_000.0, 6_000.0, 2.6);
+        assert!((size - 2.6 * (2_000f32.sqrt() + 6_000f32.sqrt()) * 0.1).abs() < 1e-4);
+        assert_eq!(crash_size(2_000.0, 6_000.0, -2.6), size, "either way round");
+        let fixed = crash_size(2_000.0, 0.0, 10.0);
+        assert!((fixed - 10.0 * (2_000f32.sqrt() + 15_000f32.sqrt()) * 0.1).abs() < 1e-3);
+    }
+
+    // Each side takes a hundredth of the size times its cell, only once a
+    // crash reaches 5 and only past 1 damage.
+    #[test]
+    fn a_crash_hurts_past_the_floor_and_past_one() {
+        assert_eq!(crash_damage(4.9, 100.0), 0.0, "under the floor");
+        assert_eq!(crash_damage(60.0, 1.0), 0.0, "0.6 is not past 1");
+        assert!((crash_damage(60.0, 2.0) - 1.2).abs() < 1e-5);
+        assert!((crash_damage(300.0, 2.0) - 6.0).abs() < 1e-4);
+        assert_eq!(crash_damage(300.0, 0.0), 0.0, "a cell of nothing");
+        assert_eq!(crash_base(4.9), 0.0);
+        assert!((crash_base(60.0) - 0.6).abs() < 1e-6);
+    }
 
     // A ram is a tonne a metre a second, times the table's cell for the
     // person's row and the vehicle's kind; a row the table lacks takes the

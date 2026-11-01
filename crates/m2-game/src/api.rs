@@ -478,7 +478,9 @@ pub struct ContextAction {
     pub reach: f32,
 }
 
-/// Reach (metres) for a context action whose call gives none (invented).
+/// Reach (metres) for a context action whose call gives none. From the
+/// 360 code: `Pg.AddContextAction` (0x823381E8) defaults its reach to the
+/// constant 2.0 at 0x820C77A4.
 pub const CONTEXT_REACH: f32 = 2.0;
 
 /// The pursuit (`Pg.SetPursuit`, `LockPursuit`, `SetCustomPursuit`,
@@ -524,6 +526,10 @@ pub const INFINITE_RESERVE: u32 = 999;
 #[derive(Debug, Default)]
 pub struct ScriptWorld {
     pub objects: HashMap<u32, Object>,
+    /// Each character's last raw clip (`Human.PlayRawAnimation`): seconds
+    /// left once the game has said its length ([`ScriptWorld::raw_clip_length`]),
+    /// `None` until then.
+    pub raw_clips: HashMap<u32, Option<f32>>,
     /// The player's character.
     pub player: Option<u32>,
     pub commands: Vec<Command>,
@@ -534,6 +540,13 @@ pub struct ScriptWorld {
     /// the scripts' next look finds them awake wherever they are
     /// ([`Self::update_hibernation`]).
     fresh: Vec<u32>,
+    /// Who may ride something: those riding at the last pass over every
+    /// object ([`Self::update_hibernation`]) and those put aboard or
+    /// spawned aboard since (a few may have got out). Lets the crews
+    /// riding be found without going over every object each tick, which
+    /// with a contract's 76,000 objects cost a fifth of play's time (perf
+    /// round 1).
+    pub riders: Vec<u32>,
     /// What `Sys.GetAssetRequestMax` answers; scripts raise it while
     /// layers load and put it back.
     pub asset_request_max: u32,
@@ -599,6 +612,10 @@ pub struct ScriptWorld {
     pub outside: bool,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Every template the template database names, in lower case: the
+    /// names `Pg.GetGuidByName` answers with a template's guid
+    /// ([`ScriptWorld::is_template`]).
+    pub template_names: std::collections::HashSet<String>,
     /// Who drives each template's vehicle, by name in lower case, as its
     /// `Rider` in the driver's seat names them: a vehicle spawned without
     /// "(Driver)" in its name comes with them ([`ScriptWorld::spawn`]).
@@ -606,9 +623,14 @@ pub struct ScriptWorld {
     /// Who else rides each template's vehicle (its other `Rider`
     /// records): a `(Full)` vehicle spawned comes with them too.
     pub template_passengers: HashMap<String, Vec<String>>,
-    /// Every layer entity's place, and its guid by name in lower case,
-    /// loaded or not: `Pg.GetGuidByName` finds markers (landing zones) of
-    /// layers that aren't in, and scripts measure to them.
+    /// Every layer entity's place, loaded or not; and the layers' markers'
+    /// guids by name in lower case ([`crate::mission::Entity::is_marker`]):
+    /// `Pg.GetGuidByName` finds markers (landing zones) of layers that
+    /// aren't in, and scripts measure to them. Any other object of a layer
+    /// that isn't in is not found by name: from samples, the shipped HQ
+    /// scripts spawn each faction's interior when no `HqInterior` exists
+    /// (`MrxUtil.SpawnActor`), so the PMC's, of its own layer, must not
+    /// stand in for it once that layer is out.
     pub entities: HashMap<u32, [f32; 3]>,
     pub entity_names: HashMap<String, u32>,
     /// A save's script data to load, as Lua text ([`crate::savedata`]):
@@ -713,7 +735,20 @@ pub struct ScriptWorld {
 impl ScriptWorld {
     /// Adds (or replaces) an object scripts can name.
     pub fn insert(&mut self, guid: u32, object: Object) {
+        if object.vehicle.is_some() {
+            self.riders.push(guid);
+        }
         self.objects.insert(guid, object);
+    }
+
+    /// Puts `guid` aboard `vehicle` (`seated_instantly` as `instant`), if
+    /// it is an object.
+    pub fn put_aboard(&mut self, guid: u32, vehicle: u32, instant: bool) {
+        if let Some(o) = self.objects.get_mut(&guid) {
+            o.vehicle = Some(vehicle);
+            o.seated_instantly = instant;
+            self.riders.push(guid);
+        }
     }
 
     /// The object called `name` (layer entity names are unique enough;
@@ -734,6 +769,14 @@ impl ScriptWorld {
             .get(&guid)
             .map(|o| o.position)
             .or_else(|| self.entities.get(&guid).copied())
+    }
+
+    /// Whether `name` is an object template's: one the template database
+    /// names (`"Supply Drop (GL)"`, `"AMX30"`, the factions' `"OC"`). A
+    /// name that only looks like one is not: `"HqInterior"`, which the
+    /// HQ scripts give the interiors they spawn.
+    pub fn is_template(&self, name: &str) -> bool {
+        self.template_names.contains(&name.to_ascii_lowercase())
     }
 
     /// Takes the commands issued since the last call.
@@ -922,6 +965,19 @@ impl ScriptWorld {
         FIRST_SPAWNED + self.next_spawn
     }
 
+    /// The game says how long `guid`'s last raw clip is (seconds): it
+    /// runs out from now.
+    pub fn raw_clip_length(&mut self, guid: u32, seconds: f32) {
+        self.raw_clips.insert(guid, Some(seconds));
+    }
+
+    /// Moves the raw clips on by `dt` seconds.
+    pub fn tick_raw_clips(&mut self, dt: f32) {
+        for left in self.raw_clips.values_mut().flatten() {
+            *left -= dt;
+        }
+    }
+
     /// Wakes the objects the player has come within their hibernation
     /// distance of ([`HIBERNATION_DISTANCE`], every object's until the
     /// templates' own are read) and puts to sleep those she has left
@@ -942,14 +998,26 @@ impl ScriptWorld {
     /// from the drop zone); in the real game's recording that helicopter
     /// comes 4 s after the objective is shown, so it isn't waiting for her
     /// to come near (inferred from the scripts and the footage).
+    ///
+    /// The same pass finds who rides something, for [`Self::riders`].
     pub fn update_hibernation(&mut self) {
         let fresh = std::mem::take(&mut self.fresh);
+        self.riders.clear();
         let Some(her) = self.player.and_then(|p| self.objects.get(&p)) else {
+            self.riders.extend(
+                self.objects
+                    .iter()
+                    .filter(|(_, o)| o.vehicle.is_some())
+                    .map(|(&g, _)| g),
+            );
             return;
         };
         let (at, riding) = (Vec3::from(her.position), her.vehicle);
         let wake = HIBERNATION_DISTANCE as f32;
         for (g, o) in &mut self.objects {
+            if o.vehicle.is_some() {
+                self.riders.push(*g);
+            }
             if Some(*g) == self.player
                 || Some(*g) == riding
                 || (FIRST_TEMPLATE..FIRST_SPAWNED).contains(g)
@@ -986,6 +1054,9 @@ impl World for ScriptWorld {
     }
     fn is_awake(&self, guid: u32) -> bool {
         self.objects.get(&guid).is_some_and(|o| o.awake)
+    }
+    fn raw_clip_left(&self, guid: u32) -> Option<f32> {
+        self.raw_clips.get(&guid).copied().flatten()
     }
     /// On screen: in play, not hidden (nor put under the island), its
     /// place (a rider's, its vehicle's) inside the camera's view, and not
@@ -1036,6 +1107,17 @@ impl World for ScriptWorld {
             .collect();
         out.sort_unstable();
         out
+    }
+    fn visit_labels(&self, visit: &mut dyn FnMut(u32, &mut dyn Iterator<Item = u32>)) -> bool {
+        for (&g, o) in &self.objects {
+            let mut labels = o
+                .labels
+                .iter()
+                .map(|l| m2_assets::name_hash(l))
+                .chain(o.label_hashes.iter().copied());
+            visit(g, &mut labels);
+        }
+        true
     }
     fn unheard_at_gate(&self, a: u32, gate: u32) -> bool {
         let hers = self
@@ -1238,13 +1320,6 @@ fn num(v: Option<&Value>) -> Option<f32> {
         Value::Number(n) => Some(*n as f32),
         _ => None,
     }
-}
-
-/// Whether a name no object has is an object template's: templates are
-/// named in words (`"Supply Drop (GL)"`, `"AMX30"`), layer objects in
-/// snake case (`vza001_gate`). A guess from the names scripts use.
-fn is_template(name: &str) -> bool {
-    name.starts_with(|c: char| c.is_ascii_uppercase()) && !name.contains('_')
 }
 
 /// The people of squad `squad` (an object's name, `oc001.obj1.vzsquad1`)
@@ -1550,7 +1625,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 let name = s.to_string_lossy();
                 w.by_name(&name)
                     .or_else(|| w.entity_names.get(&name.to_ascii_lowercase()).copied())
-                    .or_else(|| is_template(&name).then(|| w.template(&name)))
+                    .or_else(|| w.is_template(&name).then(|| w.template(&name)))
             }
             _ => None,
         };
@@ -1631,6 +1706,20 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 o.position = position;
             }
             w.commands.push(Command::Move { guid, position });
+        }
+        values([])
+    })?;
+    // Object.SetName(object, name): what it is called from now on, so
+    // `Pg.GetGuidByName(name)` finds it. `MrxUtil.SpawnActor` names a
+    // faction HQ's spawned interior `HqInterior` this way; the HQ then
+    // finds it by that name to teleport her in and, leaving, to remove it
+    // (from the scripts: MrxUtil's `SpawnActor`, MrxHq's `_LoadInterior`
+    // and `Unload`).
+    add(&object, "SetName", |w, _, a| {
+        if let (Some(g), Some(Value::String(name))) = (id(a.first()), a.get(1))
+            && let Some(o) = w.objects.get_mut(&g)
+        {
+            o.name = name.to_string_lossy();
         }
         values([])
     })?;
@@ -1805,7 +1894,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             return values([guid_value(Some(c.template))]);
         }
         let name = match w.objects.get(&g) {
-            Some(o) if is_template(&o.name) && !w.templates.values().any(|&t| t == g) => {
+            Some(o) if w.is_template(&o.name) && !w.templates.values().any(|&t| t == g) => {
                 o.name.clone()
             }
             _ => return values([Value::Nil]),
@@ -1885,6 +1974,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&human, "PlayRawAnimation", |w, _, a| {
         if let (Some(guid), Some(Value::String(clip))) = (id(a.first()), a.get(1)) {
             let clip = clip.to_string_lossy();
+            w.raw_clips.insert(guid, None);
             w.commands.push(Command::RawClip { guid, clip });
         }
         values([])
@@ -2502,10 +2592,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => String::new(),
         };
         let instant = matches!(a.get(3), Some(Value::Boolean(true)));
-        if let Some(o) = w.objects.get_mut(&guid) {
-            o.vehicle = Some(vehicle);
-            o.seated_instantly = instant;
-        }
+        w.put_aboard(guid, vehicle, instant);
         w.commands.push(Command::EnterVehicle {
             guid,
             vehicle,
@@ -3610,6 +3697,10 @@ mod tests {
             let mut jeep = Object::new("_global_veh_jeep 0x0001", [0.0, 0.0, 0.0]);
             jeep.labels.push("Vehicle".into());
             w.insert(50, jeep);
+            // The template database's templates the tests' scripts name.
+            w.template_names = ["carbine", "grenade", "supply drop (gl)", "oc", "allied"]
+                .map(String::from)
+                .into();
         }
         install(host.lua(), &world).unwrap();
         (host, world)
@@ -4168,6 +4259,56 @@ mod tests {
     }
 
     #[test]
+    fn a_raw_clip_nearly_done_fires_its_event_drawn_or_not() {
+        // WifHq's cheap cinematic plays a briefing line's named clip and
+        // waits for it to have 0.1 s left before the next line.
+        let (host, world) = setup();
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                done = nil
+                local her = Player.GetAnyCharacter()
+                Human.PlayRawAnimation(her, "all_starter03_job_briefing_spiel", true, true, 0.5, false, true)
+                Event.Create(Event.HumanAnimationNearlyCompleted, { her, 0.1 },
+                    function(who) done = who end, {})
+                "#,
+            )
+            .exec()
+            .unwrap();
+        // Its length unknown yet: it waits.
+        events.update_shared(0.5, &world);
+        assert!(
+            host.lua()
+                .globals()
+                .get::<Option<u32>>("done")
+                .unwrap()
+                .is_none()
+        );
+        // The game says it runs 1 s: not yet at 0.5 s, done once 0.1 s is left.
+        world.borrow_mut().raw_clip_length(1, 1.0);
+        world.borrow_mut().tick_raw_clips(0.5);
+        events.update_shared(0.5, &world);
+        assert!(
+            host.lua()
+                .globals()
+                .get::<Option<u32>>("done")
+                .unwrap()
+                .is_none()
+        );
+        world.borrow_mut().tick_raw_clips(0.45);
+        events.update_shared(0.45, &world);
+        assert!(
+            host.lua()
+                .globals()
+                .get::<Option<mlua::Value>>("done")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn game_state_changes_fire_events() {
         let (host, world) = setup();
         let events = crate::events::Events::default();
@@ -4504,6 +4645,61 @@ mod tests {
         assert_eq!(crossed(), ["zone enter", "zone exit", "zone enter"]);
     }
 
+    // MC-16: WifVzAtmosphere's { char, region, "enter" | "exit", false }
+    // boundaries read the direction after the boundary (its line 79).
+    #[test]
+    fn an_enter_or_exit_boundary_tells_its_callback_the_direction() {
+        for mode in ["enter", "exit"] {
+            let (host, world) = setup();
+            {
+                let mut w = world.borrow_mut();
+                w.insert(70, Object::new("rgn_atmo_Caracas", [100.0, 0.0, 100.0]));
+                let corners = vec![[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]];
+                w.regions.insert(
+                    70,
+                    m2_assets::Region {
+                        flags: 0x0004_0002,
+                        unk_0x04: 0,
+                        corners,
+                    },
+                );
+                if mode == "exit" {
+                    w.objects.get_mut(&1).unwrap().position = [101.0, 0.0, 101.0];
+                }
+            }
+            let events = crate::events::Events::default();
+            events.install(host.lua()).unwrap();
+            host.lua().globals().set("mode", mode).unwrap();
+            host.lua()
+                .load(
+                    r#"
+                    crossed = nil
+                    local region = Pg.GetGuidByName("rgn_atmo_Caracas")
+                    Event.Create(Event.Boundary,
+                        {Player.GetLocalCharacter(), region, mode, false},
+                        function(tag, who, where, how)
+                            crossed = tag .. " " .. Sys.GuidToString(who) .. "@"
+                                .. Sys.GuidToString(where) .. " " .. how
+                        end, {"zone"})
+                    "#,
+                )
+                .exec()
+                .unwrap();
+            assert!(events.update_shared(0.1, &world).is_empty());
+            let crossed: Option<String> = host.lua().globals().get("crossed").unwrap();
+            assert_eq!(crossed, None, "{mode}");
+            let to = if mode == "enter" {
+                [103.0, 0.0, 98.0]
+            } else {
+                [120.0, 0.0, 99.0]
+            };
+            world.borrow_mut().objects.get_mut(&1).unwrap().position = to;
+            assert!(events.update_shared(0.1, &world).is_empty());
+            let crossed: String = host.lua().globals().get("crossed").unwrap();
+            assert_eq!(crossed, format!("zone 1@70 {mode}"));
+        }
+    }
+
     #[test]
     fn vehicle_disguises_work_once_a_script_turns_them_on() {
         let (host, world) = setup();
@@ -4613,6 +4809,28 @@ mod tests {
         events.update_shared(0.1, &world);
         let dead: Vec<String> = host.lua().globals().get("dead").unwrap();
         assert_eq!(dead, ["60", "61"]);
+    }
+
+    // Only the template database's names are templates: `HqInterior`
+    // looks like one but is the name the HQ scripts give the interiors
+    // they spawn, and with none about it is nil, so `MrxUtil.SpawnActor`
+    // spawns one.
+    #[test]
+    fn only_the_databases_names_are_templates() {
+        let (host, world) = setup();
+        assert!(world.borrow().is_template("Supply Drop (GL)"));
+        assert!(world.borrow().is_template("oc"));
+        assert!(!world.borrow().is_template("HqInterior"));
+        let (interior, drop): (bool, bool) = host
+            .lua()
+            .load(
+                r#"return Pg.GetGuidByName("HqInterior") == nil,
+                    Pg.GetGuidByName("Supply Drop (GL)") ~= nil"#,
+            )
+            .eval()
+            .unwrap();
+        assert!(interior && drop);
+        assert!(world.borrow().by_name("HqInterior").is_none());
     }
 
     #[test]

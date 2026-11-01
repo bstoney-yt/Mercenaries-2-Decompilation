@@ -17,7 +17,7 @@
 //! (see `wad -- calls`); the readings are noted per kind below.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use mlua::{Function, Lua, MultiValue, Table, Value};
@@ -51,12 +51,24 @@ pub trait World {
     fn is_visible(&self, _guid: u32) -> Option<bool> {
         None
     }
+    /// Seconds left of the raw clip a character was last given
+    /// (`Human.PlayRawAnimation`), once the game has said how long it is;
+    /// `None` while unknown.
+    fn raw_clip_left(&self, _guid: u32) -> Option<f32> {
+        None
+    }
     /// Whether an object is inside a boundary object's area; `None` when
     /// the boundary's shape isn't known.
     fn inside(&self, guid: u32, boundary: u32) -> Option<bool>;
     /// Objects carrying a label (`"Prisoner"`), for parameters that name
     /// a kind of object rather than one.
     fn labelled(&self, label: &str) -> Vec<u32>;
+    /// Gives `visit` every object with its labels as name hashes, which
+    /// [`labelled`](Self::labelled) matches, so that many labels can be
+    /// looked up from one reading; false if the world doesn't list them.
+    fn visit_labels(&self, _visit: &mut dyn FnMut(u32, &mut dyn Iterator<Item = u32>)) -> bool {
+        false
+    }
     /// The game state the scripts last asked for with
     /// `Sys.RequestGameState` and the game is in (`"WaitForStreaming"`
     /// while the world streams in), if the world tracks it.
@@ -620,6 +632,8 @@ impl Events {
     }
 
     fn due(&self, dt: f64, world: &dyn World, accepted: &Accepted) -> Vec<Fired> {
+        // The world is borrowed and unchanged while the events are checked.
+        let _memo = LabelMemo::start();
         {
             let mut s = self.store.borrow_mut();
             s.now += dt;
@@ -955,6 +969,133 @@ fn by_label(t: &Table, world: &dyn World) -> Vec<u32> {
     }
 }
 
+thread_local! {
+    /// While the pending events are checked ([`LabelMemo`]): the label
+    /// index, once a check has looked a label up.
+    static LABELLED: RefCell<Option<Option<LabelIndex>>> = const { RefCell::new(None) };
+}
+
+/// Every object's labels, read once, and what each label looked up named:
+/// a lookup went over every object and hashed each of its labels again
+/// for each label term, and with a contract's layers in (76,000 objects,
+/// 30,000 of them labelled, and a few hundred pending events) those
+/// lookups took over half of play's time and stalled frames for seconds
+/// (perf round 1).
+#[derive(Debug, Default)]
+struct LabelIndex {
+    /// The labelled objects, each with where its labels are in `hashes`.
+    objects: Vec<(u32, std::ops::Range<usize>)>,
+    /// The labelled objects' labels as name hashes.
+    hashes: Vec<u32>,
+    /// The objects without labels.
+    unlabelled: Vec<u32>,
+    /// Where in `objects` the objects with each label are.
+    by_label: HashMap<u32, Vec<usize>>,
+    /// What each label expression named.
+    found: HashMap<String, Vec<u32>>,
+}
+
+impl LabelIndex {
+    /// The index of what `world` lists ([`World::visit_labels`]).
+    fn of(world: &dyn World) -> Option<Self> {
+        let mut index = Self::default();
+        world
+            .visit_labels(&mut |g, labels| index.add(g, labels))
+            .then_some(index)
+    }
+
+    fn add(&mut self, guid: u32, labels: &mut dyn Iterator<Item = u32>) {
+        let start = self.hashes.len();
+        self.hashes.extend(labels);
+        if self.hashes.len() == start {
+            self.unlabelled.push(guid);
+            return;
+        }
+        let i = self.objects.len();
+        for &h in &self.hashes[start..] {
+            let at = self.by_label.entry(h).or_default();
+            if at.last() != Some(&i) {
+                at.push(i);
+            }
+        }
+        self.objects.push((guid, start..self.hashes.len()));
+    }
+
+    /// The objects `expr` names, as [`World::labelled`]: those matching
+    /// any of its alternatives ([`class_alternatives`]), by guid.
+    fn labelled(&mut self, expr: &str) -> Vec<u32> {
+        if let Some(found) = self.found.get(expr) {
+            return found.clone();
+        }
+        let mut out = Vec::new();
+        for terms in class_alternatives(expr) {
+            let matches = |i: &usize| {
+                let labels = &self.hashes[self.objects[*i].1.clone()];
+                terms.iter().all(|&(h, not)| labels.contains(&h) != not)
+            };
+            match terms.iter().find(|t| !t.1) {
+                // Only those with its first label can match ...
+                Some((h, _)) => out.extend(
+                    self.by_label
+                        .get(h)
+                        .into_iter()
+                        .flatten()
+                        .filter(|i| matches(i))
+                        .map(|&i| self.objects[i].0),
+                ),
+                // ... and with none (all negated), any can, those without
+                // labels too.
+                None => {
+                    out.extend(
+                        (0..self.objects.len())
+                            .filter(matches)
+                            .map(|i| self.objects[i].0),
+                    );
+                    out.extend_from_slice(&self.unlabelled);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        self.found.insert(expr.to_owned(), out.clone());
+        out
+    }
+}
+
+/// Keeps a [`LabelIndex`] while it lives. Only for while the world is
+/// borrowed and cannot change.
+struct LabelMemo;
+
+impl LabelMemo {
+    fn start() -> Self {
+        LABELLED.set(Some(None));
+        Self
+    }
+}
+
+impl Drop for LabelMemo {
+    fn drop(&mut self) {
+        LABELLED.set(None);
+    }
+}
+
+/// The objects with `label` ([`World::labelled`]), from the index while
+/// a [`LabelMemo`] lives and the world lists its labels.
+fn labelled(world: &dyn World, label: &str) -> Vec<u32> {
+    LABELLED.with_borrow_mut(|memo| match memo {
+        Some(index) => {
+            if index.is_none() {
+                *index = LabelIndex::of(world);
+            }
+            match index {
+                Some(index) => index.labelled(label),
+                None => world.labelled(label),
+            }
+        }
+        None => world.labelled(label),
+    })
+}
+
 /// The objects a parameter names: a guid, `"hero"` (the player), or a
 /// label. Anything else (an object filter) names none yet.
 fn objects(t: &Table, i: i64, world: &dyn World) -> Vec<u32> {
@@ -964,7 +1105,7 @@ fn objects(t: &Table, i: i64, world: &dyn World) -> Vec<u32> {
             if s.eq_ignore_ascii_case("hero") {
                 world.player().into_iter().collect()
             } else {
-                let labelled = world.labelled(&s);
+                let labelled = labelled(world, &s);
                 if labelled.is_empty() {
                     world.named(&s).into_iter().collect()
                 } else {
@@ -991,7 +1132,7 @@ fn objects(t: &Table, i: i64, world: &dyn World) -> Vec<u32> {
                 out.extend(world.player());
             }
             if let Ok(Some(label)) = f.raw_get::<Option<String>>("label") {
-                out.extend(world.labelled(&label));
+                out.extend(labelled(world, &label));
             }
             if let Ok(Some(ex)) = f.raw_get::<Option<Table>>("ex") {
                 let excluded: Vec<u32> = ex
@@ -1215,11 +1356,17 @@ fn check(
             let (Some(b), exit) = (boundary, mode.as_deref() == Some("exit")) else {
                 return no;
             };
+            // The callback is also told the direction it waited on, after
+            // the boundary, as the "any" path above does. From samples: the
+            // shipped scripts read the direction as the callback's argument
+            // after the boundary (`WifVzAtmosphere.CrossedBoundary`
+            // concatenates it). The 360's argument order is not yet traced.
+            let direction = p.params.raw_get::<Value>(3).unwrap_or(Value::Nil);
             for o in objects(&p.params, 1, world) {
                 if let Some(inside) = world.inside(o, b)
                     && inside != exit
                 {
-                    return Check::Holds(true, vec![id(o), id(b)]);
+                    return Check::Holds(true, vec![id(o), id(b), direction]);
                 }
             }
             no
@@ -1377,6 +1524,20 @@ fn check(
         // destroyed states) takes the same parameters and is read the
         // same: ready as awake is inferred, the engine's own test is not
         // seen.
+        // { character, seconds }: once the raw clip she was last given has
+        // that little left (the briefings' named spiel clips: `WifHq`'s
+        // cheap cinematic waits on it with 0.1 before the next line; from
+        // the scripts). Passes the character.
+        "HumanAnimationNearlyCompleted" => match guid(&p.params, 1) {
+            Some(g) => {
+                let margin = p.params.raw_get::<f64>(2).unwrap_or(0.1) as f32;
+                match world.raw_clip_left(g) {
+                    Some(left) if left <= margin => Check::Holds(true, vec![id(g)]),
+                    _ => no,
+                }
+            }
+            None => no,
+        },
         "ObjectHibernation" | "ObjectIsReady" => match guid(&p.params, 1) {
             Some(g) => {
                 let want_awake = !text(&p.params, 2).is_some_and(|t| t.starts_with("hibernat"));
@@ -1730,7 +1891,7 @@ mod tests {
             .load(
                 "Event.CreatePersistent(Event.ContextAction, { 0, { objs = { 11, 12 } } }, \
                  function(d, who, target) table.insert(log, d .. ' ' .. tostring(who ~= nil) \
-                 .. ' ' .. tostring(target)) end, { 'office' })",
+                 .. ' ' .. type(target) .. ' ' .. tostring(gid(target))) end, { 'office' })",
             )
             .exec()
             .unwrap();
@@ -1743,7 +1904,7 @@ mod tests {
         world.context.push((0.75, 12));
         events.update(0.5, &world);
         events.update(0.5, &world);
-        assert_eq!(log(&host), ["office true userdata: 000000000000000C"]);
+        assert_eq!(log(&host), ["office true userdata 12"]);
     }
 
     #[test]
@@ -2118,5 +2279,77 @@ mod tests {
         let errors = events.update(0.1, &TestWorld::default());
         assert_eq!(errors.len(), 1);
         assert!(errors[0].error.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn label_index_names_what_a_scan_names() {
+        let h = m2_assets::name_hash;
+        let objects = vec![
+            (5, vec![h("Prisoner"), h("VZ")]),
+            (2, vec![h("Prisoner")]),
+            (9, vec![h("VZ"), h("Tank")]),
+            (7, vec![]),
+        ];
+        // What `World::labelled` would name: every object matching an
+        // alternative, by guid.
+        let scan = |expr: &str| -> Vec<u32> {
+            let alts = class_alternatives(expr);
+            let mut out: Vec<u32> = objects
+                .iter()
+                .filter(|(_, l)| {
+                    alts.iter()
+                        .any(|t| t.iter().all(|&(x, not)| l.contains(&x) != not))
+                })
+                .map(|o| o.0)
+                .collect();
+            out.sort_unstable();
+            out
+        };
+        let mut index = LabelIndex::default();
+        for (g, labels) in &objects {
+            index.add(*g, &mut labels.iter().copied());
+        }
+        for expr in [
+            "Prisoner",
+            "prisoner",
+            "Prisoner && VZ",
+            "Prisoner && !VZ",
+            "!VZ",
+            "Tank || Prisoner",
+            "(VZ && Tank) || (!Prisoner)",
+            "Nothing",
+        ] {
+            assert_eq!(index.labelled(expr), scan(expr), "{expr}");
+            // And again, from what it found.
+            assert_eq!(index.labelled(expr), scan(expr), "{expr}");
+        }
+        assert_eq!(index.labelled("Prisoner"), [2, 5]);
+        assert_eq!(index.labelled("!VZ"), [2, 7]);
+    }
+
+    #[test]
+    fn script_world_labels_index_as_it_looks_them_up() {
+        use crate::api::{Object, ScriptWorld};
+        let mut w = ScriptWorld::default();
+        let mut add = |g: u32, labels: &[&str], hashed: &[&str]| {
+            let mut o = Object::new("x", [0.0; 3]);
+            o.labels = labels.iter().map(|l| (*l).to_owned()).collect();
+            o.label_hashes = hashed.iter().map(|l| m2_assets::name_hash(l)).collect();
+            w.objects.insert(g, o);
+        };
+        add(1, &["Prisoner"], &[]);
+        add(2, &[], &["prisoner", "VZ"]);
+        add(3, &["Tank"], &["VZ"]);
+        add(4, &[], &[]);
+        let mut index = LabelIndex::of(&w).unwrap();
+        for expr in [
+            "Prisoner",
+            "Prisoner && !VZ",
+            "!Tank",
+            "VZ || Prisoner",
+            "Gone",
+        ] {
+            assert_eq!(index.labelled(expr), w.labelled(expr), "{expr}");
+        }
     }
 }

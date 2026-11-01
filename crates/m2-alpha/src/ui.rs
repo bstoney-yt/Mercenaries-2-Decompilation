@@ -22,6 +22,7 @@ use crate::combat::Weapon;
 use crate::config::Config;
 use crate::gamehud::{GameHud, HudState, flash_key};
 use crate::mission::MissionView;
+use crate::pickup_marker::PickupMarker;
 use crate::support::{SupportHud, WheelHud};
 
 /// What the HUD shows this frame.
@@ -50,7 +51,7 @@ pub struct HudInfo {
     /// ("Equip Grenade Launcher").
     pub prompt: Option<String>,
     /// A hijack's button prompt is up and the keyboard plays: the keys
-    /// that press it ("K or flick the mouse down"), under the game's arrow
+    /// that press it ("Space"), under the game's icon
     /// ([`crate::hijack::key_hint`]).
     pub hijack_keys: Option<String>,
     /// Driving: the vehicle's name and speed (m/s), and whether it is
@@ -77,6 +78,10 @@ pub struct HudInfo {
     pub support: SupportHud,
     /// The hero she is (the pause menu marks them).
     pub hero: crate::hero::Hero,
+    /// The markers over the pickups lying near her.
+    pub pickups: Vec<PickupMarker>,
+    /// The markers over the vehicles' entrances near her, on foot.
+    pub entrance_markers: Vec<crate::entrance_marker::EntranceMarker>,
 }
 
 /// What the pause menu asked for.
@@ -214,8 +219,8 @@ impl Hud {
         state.pause = self.menu && self.shop.is_none();
         state.pause_settings = self.pause_settings.clone();
         state.pause_captured = std::mem::take(&mut self.pause_captured);
-        // The pause menu takes the mouse.
-        if state.pause {
+        // The pause menu takes the mouse, as does the PDA.
+        if state.pause || info.support.pda {
             let at = input.events.iter().rev().find_map(|e| match e {
                 egui::Event::PointerMoved(p) => Some(*p),
                 _ => None,
@@ -225,6 +230,7 @@ impl Hud {
         let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
         state.messages.extend(game.message(message));
         state.blips = blips(info);
+        state.textures = marker_textures(info);
         state.reticle = reticle(info);
         state.support = info.support.clone();
         state.cash = info.mission.as_ref().and_then(|m| m.cash);
@@ -287,6 +293,7 @@ impl Hud {
         let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
         state.messages.extend(game.message(message));
         state.blips = blips(info);
+        state.textures = marker_textures(info);
         state.reticle = reticle(info);
         state.support = info.support.clone();
         state.cash = info.mission.as_ref().and_then(|m| m.cash);
@@ -598,6 +605,24 @@ fn reticle(info: &HudInfo) -> Option<[f32; 2]> {
 }
 
 /// The mission's markers, for the game HUD's minimap.
+/// The textures the pickups' markers draw: the backing, and each icon.
+fn marker_textures(info: &HudInfo) -> Vec<u32> {
+    let mut out = Vec::new();
+    if !info.pickups.is_empty() {
+        out.push(m2_assets::name_hash(crate::pickup_marker::BACKGROUND));
+    }
+    let entrances = info
+        .entrance_markers
+        .iter()
+        .map(|m| m2_assets::name_hash(crate::entrance_marker::texture(m.role)));
+    for icon in info.pickups.iter().map(|p| p.icon).chain(entrances) {
+        if !out.contains(&icon) {
+            out.push(icon);
+        }
+    }
+    out
+}
+
 fn blips(info: &HudInfo) -> Vec<([f32; 3], String, [u8; 4])> {
     info.mission.as_ref().map_or_else(Vec::new, |m| {
         m.markers
@@ -625,7 +650,6 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
         painter.text(at, align, s, FontId::proportional(size), colour);
     };
     let white = Color32::from_gray(235);
-    flash(&ctx, screen, info.support.flash);
     // The scripts' fade to black (`MrxGui.GlobalFadeToBlack`), over all,
     // unless its movie (the loading screen) plays it.
     if let Some(black) = info
@@ -686,11 +710,20 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
     if info.playing
         && let Some(game) = game
     {
-        // The scripts' markers in the world, under the HUD.
+        // The engine's markers over pickups, then the scripts' markers in
+        // the world, under the HUD.
+        if let Some(vp) = info.view_proj {
+            let style = info
+                .mission
+                .as_ref()
+                .map_or_else(Default::default, |m| m.pickup_markers);
+            pickup_markers(&painter, screen, vp, &info.pickups, style, game);
+            entrance_markers(&painter, screen, vp, &info.entrance_markers, game);
+        }
         if let (Some(m), Some(vp)) = (&info.mission, info.view_proj) {
             let here = info.game.as_ref().and_then(|s| s.position).map(Vec3::from);
             ground_discs(&painter, screen, vp, m, here);
-            world_markers(&painter, screen, vp, m, game, here);
+            world_markers(&painter, screen, vp, m, game);
         }
         game.paint(&painter);
         if std::env::var_os("M2_PAINT_TEST").is_some() {
@@ -995,23 +1028,6 @@ fn pda<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
         "P: close the PDA",
         14.0,
         Color32::from_gray(200),
-    );
-}
-
-/// The bomb's flash over everything, `strength` 1 at its brightest.
-fn flash(ctx: &egui::Context, screen: egui::Rect, strength: f32) {
-    if strength <= 0.0 {
-        return;
-    }
-    let alpha = (255.0 * strength.min(1.0)) as u8;
-    ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::new("flash"),
-    ))
-    .rect_filled(
-        screen,
-        0.0,
-        Color32::from_rgba_unmultiplied(255, 248, 220, alpha),
     );
 }
 
@@ -1438,21 +1454,26 @@ fn ground_discs(
 
 /// The scripts' markers (`Marker.AddBlip`) over the world, under the
 /// game's HUD: each its icon (the HUD's texture) tinted its colour,
-/// centred on its point while she is within its `near` to `far` metres
-/// (inferred: from her rather than from the camera). Its size is taken
-/// as the HUD's 640x480 units (inferred: the call's units aren't known),
-/// and one off the screen isn't drawn (nor pinned to its edge).
+/// centred on its point, its alpha scaled by its fade from the camera
+/// ([`MarkerView::alpha_from`]; from the 360 code: the marker renderer
+/// measures from its view's camera position, the translation of the
+/// camera-to-world matrix the view keeps). Its size is taken as the HUD's
+/// 640x480 units (inferred: the call's units aren't known), and one off
+/// the screen isn't drawn (nor pinned to its edge).
+///
+/// [`MarkerView::alpha_from`]: crate::mission::MarkerView::alpha_from
 fn world_markers(
     painter: &egui::Painter,
     screen: egui::Rect,
     view_proj: Mat4,
     m: &MissionView,
     game: &GameHud,
-    here: Option<Vec3>,
 ) {
     let unit = screen.height() / m2_game::gui::VIRTUAL_SIZE.1;
+    let eye = camera_position(view_proj);
     for marker in &m.markers {
-        if here.is_some_and(|h| !marker.shown_from(h)) {
+        let fade = eye.map_or(1.0, |e| marker.alpha_from(e));
+        if fade <= 0.0 {
             continue;
         }
         let Some(p) = project(view_proj, marker.at, screen) else {
@@ -1460,8 +1481,83 @@ fn world_markers(
         };
         let rect = Rect::from_center_size(p, vec2(marker.size, marker.size) * unit);
         let [r, g, b, a] = marker.colour;
+        let a = (f32::from(a) * fade).round() as u8;
         let colour = Color32::from_rgba_unmultiplied(r, g, b, a);
         game.paint_texture(painter, &marker.icon, rect, colour);
+    }
+}
+
+/// The engine's markers over pickups ([`crate::pickup_marker`]): for each
+/// within reach of the camera (play's: `style`'s first view), the backing
+/// and over it the pickup's icon, white at its fade, sized as on the 360's
+/// 720 lines and scaled to the window's. One whose point is off
+/// the screen isn't drawn (from the 360 code: the renderer skips a point
+/// outside -1..1).
+fn pickup_markers(
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    view_proj: Mat4,
+    pickups: &[PickupMarker],
+    style: m2_game::hud::PickupMarkers,
+    game: &GameHud,
+) {
+    let Some(eye) = camera_position(view_proj) else {
+        return;
+    };
+    // The 360's picture is 720 lines high.
+    let unit = screen.height() / 720.0;
+    let backing = m2_assets::name_hash(crate::pickup_marker::BACKGROUND);
+    for p in pickups {
+        let fade = p.alpha_from(eye, style.reach[0]);
+        if fade <= 0.0 {
+            continue;
+        }
+        let Some(at) = project(view_proj, p.at, screen).filter(|at| screen.contains(*at)) else {
+            continue;
+        };
+        let (under, over) = crate::pickup_marker::squares(at, style.size[0], unit);
+        let colour = Color32::from_white_alpha((fade * 255.0).round() as u8);
+        game.paint_texture_hash(painter, backing, under, colour);
+        game.paint_texture_hash(painter, p.icon, over, colour);
+    }
+}
+
+/// The engine's markers over vehicles' entrances
+/// ([`crate::entrance_marker`]): each within its reach of the camera, its
+/// seat's icon white at the pickups' fade, sized as on the 360's 720
+/// lines and scaled to the window's; one off the screen isn't drawn.
+fn entrance_markers(
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    view_proj: Mat4,
+    markers: &[crate::entrance_marker::EntranceMarker],
+    game: &GameHud,
+) {
+    use crate::entrance_marker::{REACH, square, texture};
+    let Some(eye) = camera_position(view_proj) else {
+        return;
+    };
+    let unit = screen.height() / 720.0;
+    for m in markers {
+        let fade = PickupMarker {
+            at: m.at,
+            icon: 0,
+            flat: false,
+        }
+        .alpha_from(eye, REACH);
+        if fade <= 0.0 {
+            continue;
+        }
+        let Some(at) = project(view_proj, m.at, screen).filter(|at| screen.contains(*at)) else {
+            continue;
+        };
+        let colour = Color32::from_white_alpha((fade * 255.0).round() as u8);
+        game.paint_texture_hash(
+            painter,
+            m2_assets::name_hash(texture(m.role)),
+            square(at, unit),
+            colour,
+        );
     }
 }
 
@@ -1496,6 +1592,13 @@ fn crosshair(painter: &egui::Painter, c: egui::Pos2) {
     ] {
         painter.line_segment([c + a, c + b], stroke);
     }
+}
+
+/// The camera's position, from its view-projection: the one point it maps
+/// to clip-space w = 0 with x = y = 0 (none for an orthographic one).
+fn camera_position(view_proj: Mat4) -> Option<Vec3> {
+    let eye = view_proj.inverse() * m2_math::glam::Vec4::Z;
+    (eye.w.abs() > f32::EPSILON).then(|| eye.truncate() / eye.w)
 }
 
 /// Where a world point lands on the screen, if in front of the camera.
@@ -1880,6 +1983,31 @@ mod tests {
     }
 
     #[test]
+    fn markers_fade_from_the_camera_not_from_her() {
+        // A chase camera 6 m behind and 3 m over her: the marker's fade is
+        // measured from the camera (from the 360 code), not from her.
+        let eye = Vec3::new(10.0, 5.0, 26.0);
+        let view = Mat4::look_at_rh(eye, Vec3::new(10.0, 2.0, 20.0), Vec3::Y);
+        let vp = Mat4::perspective_rh(1.0, 800.0 / 600.0, 0.1, 1000.0) * view;
+        let found = camera_position(vp).unwrap();
+        assert!(found.distance(eye) < 1e-3, "{found}");
+        let marker = crate::mission::MarkerView {
+            at: Vec3::new(10.0, 2.0, 15.0),
+            icon: "HUD_objective_destroy".into(),
+            colour: [255, 0, 0, 255],
+            near: 5.0,
+            far: 175.0,
+            flat: false,
+            size: 32.0,
+        };
+        // 5 m from her: opaque from her, but the camera is ~11.4 m off.
+        let her = Vec3::new(10.0, 2.0, 20.0);
+        assert_eq!(marker.alpha_from(her), 1.0);
+        assert!(marker.alpha_from(found) < 1.0);
+        assert!(camera_position(Mat4::orthographic_rh(-1.0, 1.0, -1.0, 1.0, 0.1, 10.0)).is_none());
+    }
+
+    #[test]
     fn the_reticle_goes_where_she_aims() {
         let vp = Mat4::perspective_rh(1.0, 800.0 / 600.0, 0.1, 100.0);
         let mut info = HudInfo {
@@ -1919,6 +2047,7 @@ mod tests {
                     colour: [255, 200, 0, 255],
                     near: 5.0,
                     far: 175.0,
+                    flat: false,
                     size: 32.0,
                 }],
                 message: Some((false, "VzaCon001 objective 1".into())),
@@ -1970,7 +2099,6 @@ mod tests {
                     mark: Some(true),
                     size: 1.0,
                 }),
-                flash: 0.5,
                 ..SupportHud::default()
             },
             ..HudInfo::default()

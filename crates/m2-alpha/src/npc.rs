@@ -1261,7 +1261,10 @@ impl Npc {
             Down::Falling(t) => Some(Down::Falling(t - dt)),
             Down::Knocked(t) if t - dt <= 0.0 => {
                 if let Some(c) = clips.getup {
-                    self.rig.animator.play_once(c);
+                    // `KnockedDown.Getup`: the original snaps into it.
+                    self.rig
+                        .animator
+                        .play_action(c, true, m2_engine::blend::action::GETUP);
                 }
                 Some(Down::GettingUp(GETUP_SECONDS))
             }
@@ -1612,10 +1615,8 @@ impl Npc {
                 self.cooldown += pause * rng.range(1.0 - PAUSE_JITTER, 1.0 + PAUSE_JITTER);
             }
         }
-        let rate = match self.rig.gait_speed(gait) {
-            Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
-            _ => 1.0,
-        };
+        // His number stands in for the game's entity handle (invented).
+        let rate = self.rig.play_rate(gait, moved, self.shooter);
         self.rig.advance(dt * rate);
         true
     }
@@ -2036,10 +2037,8 @@ impl Npc {
         } else {
             self.rig.set_gait(gait);
         }
-        let rate = match self.rig.gait_speed(gait) {
-            Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
-            _ => 1.0,
-        };
+        // His number stands in for the game's entity handle (invented).
+        let rate = self.rig.play_rate(gait, moved, self.shooter);
         self.rig.advance(dt * rate);
     }
 }
@@ -3862,6 +3861,7 @@ pub(crate) mod tests {
             sinks: Vec::new(),
             breakup: None,
             parts: None,
+            state_fx: Default::default(),
             looks: None,
             lamp_nodes: Default::default(),
         };
@@ -3888,6 +3888,7 @@ pub(crate) mod tests {
             aim_clip: None,
             barrel: true,
             scripted: None,
+            time_scales: Default::default(),
         }
     }
 

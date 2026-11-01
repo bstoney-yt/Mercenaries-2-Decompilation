@@ -157,6 +157,8 @@ pub fn block_contents(assets: &[(u32, u32, u32, Vec<u8>)]) -> Vec<u8> {
 pub enum UcfxNode {
     Leaf([u8; 4], Vec<u8>),
     Container([u8; 4], Vec<UcfxNode>),
+    /// A container with bytes of its own (an effect's `FRCE`).
+    Both([u8; 4], Vec<u8>, Vec<UcfxNode>),
 }
 
 /// Builds a `UCFX` container from a section tree.
@@ -166,7 +168,7 @@ pub fn ucfx(nodes: &[UcfxNode]) -> Vec<u8> {
             .iter()
             .map(|n| match n {
                 UcfxNode::Leaf(..) => 1,
-                UcfxNode::Container(_, c) => 1 + descendants(c),
+                UcfxNode::Container(_, c) | UcfxNode::Both(_, _, c) => 1 + descendants(c),
             })
             .sum()
     }
@@ -187,6 +189,19 @@ pub fn ucfx(nodes: &[UcfxNode]) -> Vec<u8> {
                     for v in [u32::MAX, 0, after, descendants(children)] {
                         records.extend_from_slice(&v.to_le_bytes());
                     }
+                    walk(children, records, data, count);
+                }
+                UcfxNode::Both(cc, bytes, children) => {
+                    records.extend_from_slice(cc);
+                    for v in [
+                        data.len() as u32,
+                        bytes.len() as u32,
+                        after,
+                        descendants(children),
+                    ] {
+                        records.extend_from_slice(&v.to_le_bytes());
+                    }
+                    data.extend_from_slice(bytes);
                     walk(children, records, data, count);
                 }
             }

@@ -31,9 +31,13 @@
 //! - That a message's handler stays set in later states until a state
 //!   sets it again (the dented door's state sets only `DamageMsg`, to
 //!   nothing; its `DestroyMsg` still throws the door off).
-//! - How much of a hit a part takes: the hit's own damage (a rifle round's
-//!   9) times the part's scale, nearest part to where it struck (within
-//!   [`HIT_SLACK`], invented). A blast hurts each part in reach by its
+//! - How much of a hit a part takes: the hit's damage times the part's
+//!   scale, nearest part to where it struck (within [`HIT_SLACK`],
+//!   invented). From the 360 code (playtest round): the hit's damage is
+//!   what the whole vehicle takes, the damage table's cell already
+//!   applied, as the one damage message posted for a round names the
+//!   node struck along with it (0x8228BFA8, 0x82287CF8); so a tank's
+//!   parts take nothing of a rifle round, as the tank doesn't. A blast hurts each part in reach by its
 //!   own distance from the heart, by the explosion template's fall from
 //!   `Damage` to `MinDamage` (round 21; before, a straight fall to
 //!   nothing, invented).
@@ -111,7 +115,17 @@ pub struct Debris {
     /// How long they last, seconds, shortest and longest (read as
     /// lifetimes).
     pub lasts: (f32, f32),
+    /// When the record fires (its `Type`): [`ON_DEATH`] when the object
+    /// dies; 0 to 2 when a part breaks or is damaged.
+    pub when: u32,
 }
+
+/// A `DebrisEffect` `Type` that fires on the object's death. From the 360
+/// code: 822089B0 runs records of this `Type` off the death queue
+/// (831B21C0), as many as `Min + rand(Max - Min)` of the record's
+/// template. Every vehicle's `fueltank` record is one, naming `Fuel
+/// Pickup (Small)` (PC data, 2026-10-27: 781 templates).
+pub const ON_DEATH: u32 = 3;
 
 /// A template's parts' health, the part that burns, its parts' own
 /// damage keys and the chunks its wreck throws.
@@ -198,6 +212,7 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, PartHealths> {
                         count: (lo.min(hi), lo.max(hi)),
                         speed: (fl("MinChunkVel")?, fl("MaxChunkVel")?),
                         lasts: (fl("MinChunkTime")?, fl("MaxChunkTime")?),
+                        when: w("Type").unwrap_or(0),
                     })
                 })
                 .collect();

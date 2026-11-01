@@ -9671,6 +9671,13 @@ fn runover<R: Read + Seek>(
         *by_key.entry(key_name(*k)).or_default() += 1;
     }
     println!("vehicles\t{}\tby DamageKey {by_key:?}", vehicles.len());
+    // Those whose template gives no `Health`.
+    let healthless: Vec<&str> = vehicles
+        .keys()
+        .filter(|id| tuning.get(id).and_then(|t| t.health).is_none())
+        .map(|id| tnames.get(id).copied().unwrap_or("?"))
+        .collect();
+    println!("no health\t{}\t{}", healthless.len(), healthless.join(" "));
     // Bash templates.
     let bash = m2_assets::name_hash("MeleeBash");
     for (&id, &k) in &dkeys {

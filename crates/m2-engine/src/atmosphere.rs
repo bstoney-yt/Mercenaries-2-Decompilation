@@ -88,6 +88,10 @@ pub struct Atmosphere {
     /// shaders' `rimLightColor.w`): inferred, the other colours' alpha
     /// bytes have no use.
     pub rim_threshold: f32,
+    /// `AmbientCube0Multiplier`..`5` and `RimColorMultiplier`: the scales
+    /// on those colours, kept so that a colour a script sets
+    /// ([`Atmosphere::edited`]) is scaled as the record's own.
+    pub multipliers: [f32; 7],
     /// `ScatterInscatteringMultiplier`, `ScatterExtinctionMultiplier`,
     /// `ScatterBetaMieMultiplier` and `ScatterHgG`: the haze.
     pub inscattering: f32,
@@ -141,6 +145,43 @@ pub struct Atmosphere {
     /// 1 for the record named `night`, else 0, blended between records:
     /// how far the searchlights' beams show (see [`BEAMS_FULL_RAMP`]).
     pub night: f32,
+}
+
+/// A value a script sets on the light ([`Atmosphere::edited`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EditValue {
+    /// `SetValue(name, x)`.
+    Float(f32),
+    /// `SetColorValue(name, r, g, b, a)`, as the word the game packs.
+    Colour(u32),
+}
+
+impl EditValue {
+    /// The word `SetColorValue(name, r, g, b, a)` stores: red in the low
+    /// byte, then green, blue and alpha (from the 360 code, 0x82318FA0).
+    pub fn colour(r: u32, g: u32, b: u32, a: u32) -> Self {
+        Self::Colour((a & 0xff) << 24 | (b & 0xff) << 16 | (g & 0xff) << 8 | (r & 0xff))
+    }
+}
+
+/// What a script does to the light with one `Graphics.Atmosphere.Begin`
+/// .. `End`: its values, then how it eases in and back out.
+///
+/// From the 360 code: `Begin` (0x82319248) copies the light now into a
+/// scratch record and `SetValue`/`SetColorValue` (0x82318E40,
+/// 0x82318FA0) write the scratch record's fields by the name's hash.
+/// `End` (0x82319288) eases the light to the scratch record over its
+/// argument (`fInterpolateTime`, none at all when there is none), and
+/// when it has got there (0x8224D1B8), a `fTimeRestore` of zero or more
+/// eases it back to the region's own record over that many seconds; the
+/// default, -1 (0x82DE896C), stays.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScriptAtmosphere {
+    pub edits: Vec<(String, EditValue)>,
+    /// Seconds easing in (`End`'s argument).
+    pub interpolate: f32,
+    /// Seconds easing back (`fTimeRestore`), if it does.
+    pub restore: Option<f32>,
 }
 
 /// Which way the sun stands at `LightTime` 0 (and 0.1, low in the
@@ -277,6 +318,14 @@ impl Atmosphere {
             light_intensity: float("LightIntensity").unwrap_or(1.0),
             rim: colour("RimColor").unwrap_or(Vec3::ZERO),
             rim_threshold: field("RimColor").map_or(0.0, |v| channels(v, Lit::Light)[3]),
+            multipliers: std::array::from_fn(|i| {
+                let name = if i < 6 {
+                    format!("AmbientCube{i}Multiplier")
+                } else {
+                    "RimColorMultiplier".to_owned()
+                };
+                float(&name).unwrap_or(1.0)
+            }),
             inscattering: float("ScatterInscatteringMultiplier").unwrap_or(0.0),
             extinction: float("ScatterExtinctionMultiplier").unwrap_or(0.0),
             mie: float("ScatterBetaMieMultiplier").unwrap_or(0.0),
@@ -402,6 +451,7 @@ impl Atmosphere {
             light_intensity: f(self.light_intensity, to.light_intensity),
             rim: v(self.rim, to.rim),
             rim_threshold: f(self.rim_threshold, to.rim_threshold),
+            multipliers: std::array::from_fn(|i| f(self.multipliers[i], to.multipliers[i])),
             inscattering: f(self.inscattering, to.inscattering),
             extinction: f(self.extinction, to.extinction),
             mie: f(self.mie, to.mie),
@@ -447,6 +497,107 @@ impl Atmosphere {
                 (_, b) => b,
             },
         }
+    }
+
+    /// These settings with a script's values over them
+    /// (`Graphics.Atmosphere.SetValue` and `SetColorValue` between `Begin`
+    /// and `End`), by the names the scripts give (`fLightIntensity`,
+    /// `uiAmbientCube0`: a record field's name behind a type prefix, `f`
+    /// or `ui`). A colour is the word the game packs from its four numbers
+    /// ([`EditValue::colour`]), read as the record's own colour and
+    /// scaled by the record's multiplier. Also returns the names that set
+    /// nothing here (fields the alpha doesn't draw, such as
+    /// `uiAmbientColor`).
+    pub fn edited(&self, edits: &[(String, EditValue)]) -> (Self, Vec<String>) {
+        let mut a = *self;
+        let mut unused = Vec::new();
+        for (name, value) in edits {
+            let field = name
+                .strip_prefix("ui")
+                .or_else(|| name.strip_prefix('f'))
+                .unwrap_or(name);
+            let set = match (*value, field) {
+                (EditValue::Colour(w), f) if f.starts_with("AmbientCube") => {
+                    match f["AmbientCube".len()..].parse::<usize>() {
+                        Ok(i) if i < 6 => {
+                            let [r, g, b, _] = channels(w, Lit::Light);
+                            a.ambient_cube[i] = Vec3::new(r, g, b) * a.multipliers[i];
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                (EditValue::Colour(w), "RimColor") => {
+                    let [r, g, b, alpha] = channels(w, Lit::Light);
+                    a.rim = Vec3::new(r, g, b) * a.multipliers[6];
+                    a.rim_threshold = alpha;
+                    true
+                }
+                (EditValue::Colour(w), "Gradient0_Color2") => {
+                    a.monochrome = Some(Vec4::from_array(channels(w, Lit::Post)));
+                    true
+                }
+                (EditValue::Float(v), f) => match f {
+                    "LightIntensity" => {
+                        a.light_intensity = v;
+                        true
+                    }
+                    "InterpolateTime" => {
+                        a.interpolate_time = v;
+                        true
+                    }
+                    "AtmosphereForce" | "AtmosphereLimit" | "HazeForce" | "HazeLimit" => {
+                        let i = [
+                            "AtmosphereForce",
+                            "AtmosphereLimit",
+                            "HazeForce",
+                            "HazeLimit",
+                        ]
+                        .iter()
+                        .position(|n| *n == f)
+                        .unwrap_or(0);
+                        match &mut a.haze_layers {
+                            Some(h) => {
+                                h[i] = v;
+                                true
+                            }
+                            None => false,
+                        }
+                    }
+                    "BloomAmount" | "BloomMultiplier" | "BloomThreshold" | "BloomBlurRadius" => {
+                        let i = [
+                            "BloomAmount",
+                            "BloomMultiplier",
+                            "BloomThreshold",
+                            "BloomBlurRadius",
+                        ]
+                        .iter()
+                        .position(|n| *n == f)
+                        .unwrap_or(0);
+                        a.bloom[i] = v;
+                        true
+                    }
+                    _ => match &mut a.tone_map {
+                        Some(t) => {
+                            let slot = match f {
+                                "BloomTargetLuminance" => Some(&mut t.target),
+                                "BloomAdaptiveLuminancePercent" => Some(&mut t.retention),
+                                "BloomContastLimit" => Some(&mut t.contrast_limit),
+                                "BloomContastMultiplier" => Some(&mut t.contrast),
+                                _ => None,
+                            };
+                            slot.map(|s| *s = v).is_some()
+                        }
+                        None => false,
+                    },
+                },
+                _ => false,
+            };
+            if !set {
+                unused.push(name.clone());
+            }
+        }
+        (a, unused)
     }
 
     /// The way the sunlight travels at this `LightTime`: from a sun on
@@ -777,6 +928,19 @@ pub struct AtmosphereMix {
     /// Seconds into the change, and its length.
     t: f32,
     length: f32,
+    /// A script's light over the region's ([`ScriptAtmosphere`]).
+    script: Option<ScriptLight>,
+}
+
+/// A script's light as it eases in and back out: eased from, the script's,
+/// seconds since `End`, and the script's times.
+#[derive(Clone, Debug)]
+struct ScriptLight {
+    from: Atmosphere,
+    to: Atmosphere,
+    t: f32,
+    interpolate: f32,
+    restore: Option<f32>,
 }
 
 impl AtmosphereMix {
@@ -822,10 +986,16 @@ impl AtmosphereMix {
         let key = self.over(regions, at);
         let target = key.map_or(*default, |(r, s)| regions[r].settings[s].1);
         self.t += dt;
+        if let Some(s) = &mut self.script {
+            s.t += dt;
+            if s.restore.is_some_and(|r| s.t >= s.interpolate + r) {
+                self.script = None;
+            }
+        }
         match &self.to {
             Some((k, _)) if *k == key => None,
             Some(_) => {
-                self.from = Some(self.current(default));
+                self.from = Some(self.region_light(default));
                 self.length = if self.immediate {
                     0.0
                 } else {
@@ -849,8 +1019,44 @@ impl AtmosphereMix {
         self.t
     }
 
+    /// Puts a script's light over the region's, from the light now
+    /// ([`ScriptAtmosphere`]). Returns the names that set nothing here.
+    pub fn script(&mut self, default: &Atmosphere, script: &ScriptAtmosphere) -> Vec<String> {
+        let from = self.current(default);
+        let (to, unused) = from.edited(&script.edits);
+        self.script = Some(ScriptLight {
+            from,
+            to,
+            t: 0.0,
+            interpolate: script.interpolate.max(0.0),
+            restore: script.restore.filter(|r| *r >= 0.0),
+        });
+        unused
+    }
+
+    /// Whether a script's light is showing.
+    pub fn scripted(&self) -> bool {
+        self.script.is_some()
+    }
+
     /// The light now.
     pub fn current(&self, default: &Atmosphere) -> Atmosphere {
+        let region = self.region_light(default);
+        let Some(s) = &self.script else {
+            return region;
+        };
+        if s.t < s.interpolate {
+            return s.from.lerp(&s.to, s.t / s.interpolate);
+        }
+        match s.restore {
+            None => s.to,
+            Some(r) if r > 0.0 => s.to.lerp(&region, (s.t - s.interpolate) / r),
+            Some(_) => region,
+        }
+    }
+
+    /// The region's light now, without a script's.
+    fn region_light(&self, default: &Atmosphere) -> Atmosphere {
         let Some((_, to)) = &self.to else {
             return *default;
         };
@@ -972,6 +1178,7 @@ mod tests {
             light_intensity: 1.0,
             rim: Vec3::ZERO,
             rim_threshold: 0.0,
+            multipliers: [1.0; 7],
             inscattering: 0.0,
             extinction: 0.0,
             mie: 0.0,
@@ -1100,5 +1307,58 @@ mod tests {
         };
         ramped_day.apply(&mut lighting);
         assert_eq!(lighting.beam_gain, 0.0);
+    }
+
+    /// The satellite bomb's blast script (228f1fde): grey ambient light,
+    /// sunlight 3.75, then back to the region's light over 1.7 s.
+    #[test]
+    fn a_script_s_light_comes_in_at_once_and_eases_back_over_its_restore() {
+        let day = Atmosphere {
+            multipliers: [2.0; 7],
+            haze_layers: Some([1.0, 600.0, 1.0, 100.0]),
+            monochrome: Some(Vec4::new(0.5, 0.45, 0.55, 0.5)),
+            ..plain(0.2, 0.0)
+        };
+        let script = ScriptAtmosphere {
+            edits: vec![
+                (
+                    "uiAmbientCube2".into(),
+                    EditValue::colour(128, 128, 128, 255),
+                ),
+                ("fLightIntensity".into(), EditValue::Float(3.75)),
+                ("fAtmosphereLimit".into(), EditValue::Float(250.0)),
+                ("uiGradient0_Color2".into(), EditValue::colour(0, 0, 255, 0)),
+                (
+                    "uiAmbientColor".into(),
+                    EditValue::colour(128, 128, 128, 255),
+                ),
+            ],
+            interpolate: 0.0,
+            restore: Some(1.7),
+        };
+        let mut mix = AtmosphereMix::default();
+        mix.update(&day, &[], Vec3::ZERO, 0.0);
+        assert_eq!(mix.script(&day, &script), vec!["uiAmbientColor".to_owned()]);
+        let now = mix.current(&day);
+        assert_eq!(now.light_intensity, 3.75);
+        assert!((now.ambient_cube[2] - Vec3::splat(2.0 * 128.0 / 255.0)).length() < 1e-6);
+        assert_eq!(now.ambient_cube[3], day.ambient_cube[3]);
+        assert_eq!(now.haze_layers.unwrap()[1], 250.0);
+        assert_eq!(now.monochrome.unwrap().w, 0.0);
+        mix.update(&day, &[], Vec3::ZERO, 0.85);
+        assert!((mix.current(&day).light_intensity - (3.75 + 1.0) / 2.0).abs() < 1e-5);
+        mix.update(&day, &[], Vec3::ZERO, 0.9);
+        assert!(!mix.scripted());
+        assert_eq!(mix.current(&day), day);
+        // Without a restore (-1, the default) the script's light stays.
+        mix.script(
+            &day,
+            &ScriptAtmosphere {
+                restore: None,
+                ..script
+            },
+        );
+        mix.update(&day, &[], Vec3::ZERO, 60.0);
+        assert_eq!(mix.current(&day).light_intensity, 3.75);
     }
 }

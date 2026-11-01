@@ -145,6 +145,8 @@ pub fn vehicle(entry: &CatalogueEntry) -> (VehicleSpec, CpuModel) {
         bounds: cpu.bounds,
         seat: Some(l.seat),
         door: Some(l.door),
+        seating: None,
+        entrances: Vec::new(),
         tracked: false,
         road_wheels: Vec::new(),
         node_names: node_names().to_vec(),
@@ -688,6 +690,7 @@ pub fn model() -> CpuModel {
         sinks: Vec::new(),
         breakup: None,
         parts: None,
+        state_fx: Default::default(),
         looks: None,
         lamp_nodes: Default::default(),
     }

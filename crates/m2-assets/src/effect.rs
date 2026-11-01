@@ -16,7 +16,8 @@
 //!     ATRB ...              settings (see `Attr`)
 //!     COLR 800              100 colour keys over a particle's life
 //!     TEXT                  u32 count, then that many texture name hashes
-//!   FRCE                    a force (wind, gravity, drag): ATRBs
+//!   FRCE                    a force: its own bytes (kind tag, kind settings;
+//!                           `ForceHead`), then ATRBs
 //! ```
 //!
 //! An `ATRB` leaf is 12 bytes: `u32` setting name hash, `u8` kind (1 for a
@@ -92,6 +93,16 @@ pub mod setting {
     /// Values 0, 90, 180, 540: a turning speed in degrees a second,
     /// inferred.
     pub const UNKNOWN_35ACBAB7: u32 = 0x35ac_bab7;
+    /// How much an attractor moves a particle, and its spread: the 360
+    /// reader keeps them where the 360 particle step reads an attractor's
+    /// scale (emitter +0x174 and +0x180; from the 360 code, 0x821E0C00 and
+    /// 0x827DD6A0). Names unread.
+    pub const UNKNOWN_10831673: u32 = 0x1083_1673;
+    pub const UNKNOWN_B6197EFE: u32 = 0xb619_7efe;
+    /// The same for a vortex (emitter +0x188 and +0x194; from the 360
+    /// code). Names unread.
+    pub const UNKNOWN_720F22F8: u32 = 0x720f_22f8;
+    pub const UNKNOWN_4712719F: u32 = 0x4712_719f;
     pub const POS_X: u32 = 0x7d11_17eb;
     pub const POS_Y: u32 = 0x9b0f_088e;
     pub const POS_Z: u32 = 0xfd16_5e99;
@@ -104,6 +115,126 @@ pub mod setting {
     pub const RANGE: u32 = 0xe068_6a68;
     pub const DECAY: u32 = 0xc278_3a55;
     pub const RADIAL: u32 = 0xb46f_1f0c;
+    /// A drag force's radius (0.1 on all 255 that carry it): the 360 code
+    /// scales a drag's strength by pi times its square, drag by
+    /// cross-section area (from the 360 code, 0x821D9110). Its name is
+    /// unread. The 360 reader keeps it in the same place as `range`
+    /// (the force's +0x8c), which attractors and vortices read as their
+    /// reach.
+    pub const DRAG_RADIUS: u32 = 0x2f68_cd8f;
+}
+
+/// What a force does. Each `FRCE`'s own bytes start with one of these
+/// names' hashes ([`ForceHead`]), and the 360 code reads them as kinds 0
+/// to 4 (from the 360 code: the effect reader at 0x821E0C00, the per-frame
+/// setup at 0x821D9110). From samples: all 659 PC forces carry one, the
+/// same as the 360 disc's same force carries (659 of 659, matched by
+/// effect and order, every setting identical).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForceKind {
+    /// The world's wind (the 360 code takes its direction and speed from
+    /// the world, not from the force's own settings).
+    Wind,
+    /// A pull straight down the world (the 360 step uses (0, -1, 0), not
+    /// the force's turned axis), by its strength.
+    Gravity,
+    /// Slowing, by strength x pi x radius squared.
+    Drag,
+    /// A push from the force's place (a pull for a negative strength),
+    /// fading with distance.
+    Attractor,
+    /// A turn of a particle's velocity about the force's place, and a
+    /// radial push.
+    Vortex,
+}
+
+impl ForceKind {
+    /// The kind's number in the 360 code (its runtime record's +0xa4).
+    pub const fn index(self) -> u32 {
+        match self {
+            Self::Wind => 0,
+            Self::Gravity => 1,
+            Self::Drag => 2,
+            Self::Attractor => 3,
+            Self::Vortex => 4,
+        }
+    }
+
+    /// The tag the 360 format stores: [`crate::name_hash`] of the kind's
+    /// name (wind, gravity, drag, attractor, vortex; matched against the
+    /// hashes the 360 reader compares).
+    pub const fn tag(self) -> u32 {
+        match self {
+            Self::Wind => 0xc9f7_a9d7,
+            Self::Gravity => 0x14bd_1bbd,
+            Self::Drag => 0xed79_1c4b,
+            Self::Attractor => 0xc235_456b,
+            Self::Vortex => 0xf4d8_5a49,
+        }
+    }
+
+    /// The kind a 360 tag names.
+    pub fn from_tag(tag: u32) -> Option<Self> {
+        [
+            Self::Wind,
+            Self::Gravity,
+            Self::Drag,
+            Self::Attractor,
+            Self::Vortex,
+        ]
+        .into_iter()
+        .find(|k| k.tag() == tag)
+    }
+
+    /// A guess at a force's kind from the settings it carries, for a force
+    /// without a tag (none in the data; inferred). A drag radius makes it
+    /// a drag; a range with a radial share a vortex, a range without one an
+    /// attractor; the rest gravity. Against the tags it is right on 617 of
+    /// the 659 forces: the 42 winds carry the same settings as gravities
+    /// and are taken for gravity.
+    pub fn infer(attrs: &[Attr]) -> Self {
+        let has = |name| find(attrs, name).is_some();
+        if has(setting::DRAG_RADIUS) {
+            Self::Drag
+        } else if has(setting::RANGE) {
+            if has(setting::RADIAL) {
+                Self::Vortex
+            } else {
+                Self::Attractor
+            }
+        } else {
+            Self::Gravity
+        }
+    }
+}
+
+/// A `FRCE`'s own bytes: its kind's tag ([`ForceKind::tag`]), then the
+/// kind's settings as 32-bit words (from samples: 8, 20, 32 or 60 bytes,
+/// by kind; the 360 reader takes them so, 0x821E0C00: a wind's or
+/// gravity's strength and direction, a drag's strength, an attractor's
+/// or vortex's strength, flag, reach, decay and place, a vortex's two
+/// axes as well). Empty for a force without them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForceHead {
+    pub tag: u32,
+    pub params: Vec<u32>,
+}
+
+impl ForceHead {
+    fn read(own: &[u8]) -> Self {
+        let mut words = own
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+        Self {
+            tag: words.next().unwrap_or(0),
+            params: words.collect(),
+        }
+    }
+
+    /// The kind its tag names; `None` without a known tag.
+    pub fn kind(&self) -> Option<ForceKind> {
+        ForceKind::from_tag(self.tag)
+    }
 }
 
 /// The order of every `PTYP`'s 32 settings.
@@ -308,8 +439,10 @@ pub struct Effect {
     /// [`Triangle`]s ([`Effect::shape_triangles`]).
     pub shapes: Vec<Vec<u8>>,
     pub emitters: Vec<Emitter>,
-    /// `FRCE`s.
+    /// `FRCE`s' settings.
     pub forces: Vec<Vec<Attr>>,
+    /// Each `FRCE`'s own bytes, in the same order as [`forces`](Self::forces).
+    pub force_heads: Vec<ForceHead>,
     /// `TEXT` leaves straight under the effect (a few effects have one).
     pub textures: Vec<u32>,
 }
@@ -397,7 +530,11 @@ pub fn parse(asset: &[u8]) -> Result<Effect, EffectError> {
                     }
                 }
             }
-            b"FRCE" => fx.forces.push(attrs(&u, i, &FORCE_ORDER)?),
+            b"FRCE" => {
+                fx.forces.push(attrs(&u, i, &FORCE_ORDER)?);
+                fx.force_heads
+                    .push(ForceHead::read(s.own.unwrap_or_default()));
+            }
             b"TEXT" => fx.textures = hashes(s.data.unwrap_or_default())?,
             _ => {}
         }
@@ -729,6 +866,66 @@ mod tests {
         assert_eq!(fx.shape_triangles(2), None);
         assert_eq!(fx.emitters[0].shape(), Some((0, 2)));
         assert_eq!(fx.emitters[1].shape(), None);
+    }
+
+    /// The five tags are the kinds' names hashed, numbered as the 360 code
+    /// numbers them; a PC force's kind follows the settings it carries.
+    #[test]
+    fn force_kinds_from_their_tags_and_settings() {
+        for (k, name, n) in [
+            (ForceKind::Wind, "wind", 0),
+            (ForceKind::Gravity, "gravity", 1),
+            (ForceKind::Drag, "drag", 2),
+            (ForceKind::Attractor, "attractor", 3),
+            (ForceKind::Vortex, "vortex", 4),
+        ] {
+            assert_eq!(k.tag(), name_hash(name), "{name}");
+            assert_eq!(ForceKind::from_tag(name_hash(name)), Some(k));
+            assert_eq!(k.index(), n);
+        }
+        assert_eq!(ForceKind::from_tag(0x1234_5678), None);
+        let a = |name: u32| Attr {
+            name: Some(name),
+            kind: 1,
+            flags: 0,
+            value: 1.0f32.to_le_bytes(),
+            keys: Vec::new(),
+        };
+        let base = vec![a(setting::UNKNOWN_3DC3D9DF), a(setting::POS_X)];
+        assert_eq!(ForceKind::infer(&base), ForceKind::Gravity);
+        let mut drag = base.clone();
+        drag.push(a(setting::DRAG_RADIUS));
+        assert_eq!(ForceKind::infer(&drag), ForceKind::Drag);
+        let mut attract = base.clone();
+        attract.extend([a(setting::LOCAL), a(setting::RANGE), a(setting::DECAY)]);
+        assert_eq!(ForceKind::infer(&attract), ForceKind::Attractor);
+        attract.push(a(setting::RADIAL));
+        assert_eq!(ForceKind::infer(&attract), ForceKind::Vortex);
+    }
+
+    /// A `FRCE`'s own bytes give its kind and the kind's settings; a force
+    /// without them has an empty head and falls back on the guess.
+    #[test]
+    fn reads_each_force_s_kind_from_its_own_bytes() {
+        let mut wind = ForceKind::Wind.tag().to_le_bytes().to_vec();
+        wind.extend(2.5f32.to_le_bytes());
+        let asset = ucfx(&[node(
+            b"EFCT",
+            vec![
+                UcfxNode::Both(*b"FRCE", wind, vec![atrb(setting::UNKNOWN_3DC3D9DF, 10.0)]),
+                node(b"FRCE", vec![atrb(setting::UNKNOWN_3DC3D9DF, 1.0)]),
+            ],
+        )]);
+        let fx = parse(&asset).unwrap();
+        assert_eq!(fx.forces.len(), 2);
+        assert_eq!(fx.force_heads.len(), 2);
+        assert_eq!(fx.force_heads[0].kind(), Some(ForceKind::Wind));
+        assert_eq!(fx.force_heads[0].params, vec![2.5f32.to_bits()]);
+        assert_eq!(fx.forces[0][0].float(), 10.0);
+        // Its settings alone would have said gravity.
+        assert_eq!(ForceKind::infer(&fx.forces[0]), ForceKind::Gravity);
+        assert_eq!(fx.force_heads[1], ForceHead::default());
+        assert_eq!(fx.force_heads[1].kind(), None);
     }
 
     #[test]

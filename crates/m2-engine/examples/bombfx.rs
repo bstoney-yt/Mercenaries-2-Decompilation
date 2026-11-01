@@ -95,8 +95,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         e.speed_var,
                         e.spread.at(0.0),
                         e.spread_var,
-                        e.gravity,
-                        e.drag,
+                        e.gravity.value,
+                        e.drag.value,
                         e.turn,
                         e.spin
                     );

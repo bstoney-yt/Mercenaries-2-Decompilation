@@ -88,6 +88,7 @@ pub mod vertex;
 pub mod voice;
 pub mod wad;
 pub mod water;
+pub mod x360;
 
 #[cfg(test)]
 mod testutil;

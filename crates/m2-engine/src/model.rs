@@ -643,6 +643,50 @@ pub struct CpuPiece {
     pub at: u16,
 }
 
+/// An effect a model's part state starts on entering it
+/// (`StartEmitter`): the state's name hash (`DamageState` 4aa0beed,
+/// `CollapseState` 694683eb), the effect template's name hash, and where,
+/// model space: on a node of the model, or `None` for a locator the
+/// model doesn't carry. The fuel tanks' `DamageState` starts blue fire
+/// jets on three nodes; their `CollapseState` the huge explosion, smoke
+/// at three locators and the collapse's bits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StateFx {
+    pub state: u32,
+    pub effect: u32,
+    pub at: Option<Vec3>,
+}
+
+impl StateFx {
+    /// `DamageState`, entered as a part's health falls to its
+    /// `NodeHealth` damaged-at health.
+    pub const DAMAGE: u32 = 0x4aa0_beed;
+    /// `CollapseState`, entered as it is destroyed.
+    pub const COLLAPSE: u32 = 0x6946_83eb;
+
+    /// Every effect `model`'s part states start, in order.
+    pub fn of(model: &Model<'_>) -> Vec<Self> {
+        let Some(states) = &model.states else {
+            return Vec::new();
+        };
+        states
+            .machines
+            .iter()
+            .flat_map(|m| m.states.iter().zip(&m.acts))
+            .flat_map(|((state, _), acts)| {
+                acts.emitters.iter().map(|&(effect, at)| Self {
+                    state: *state,
+                    effect,
+                    at: at
+                        .ok()
+                        .and_then(|n| model.node_to_model(n))
+                        .map(|m| m.w_axis.truncate()),
+                })
+            })
+            .collect()
+    }
+}
+
 /// A model's geometry at one level of detail, decoded but not uploaded.
 #[derive(Clone, Debug)]
 pub struct CpuModel {
@@ -682,6 +726,9 @@ pub struct CpuModel {
     /// Its parts a vehicle breaks one at a time, when its state machine
     /// has more than one ([`ModelParts`]).
     pub parts: Option<std::sync::Arc<ModelParts>>,
+    /// The effects its part states start (`StartEmitter`), by state
+    /// ([`StateFx`]).
+    pub state_fx: std::sync::Arc<Vec<StateFx>>,
     /// The looks a person model's mixer can give it ([`Looks`]).
     pub looks: Option<std::sync::Arc<Looks>>,
     /// A vehicle's lamp glow quads' nodes, by lamp ([`lamp_nodes`]):
@@ -1010,6 +1057,7 @@ impl CpuModel {
                 .map_or_else(Vec::new, |s| s.sinking(&model.nodes)),
             breakup: None,
             parts,
+            state_fx: std::sync::Arc::new(StateFx::of(model)),
             looks,
             lamp_nodes: lamp_nodes(&model.nodes),
         }
@@ -1153,6 +1201,8 @@ pub struct GpuModel {
     pub parts_hidden: Option<Vec<bool>>,
     /// Per node, hidden whatever the state ([`hide`](Self::hide)).
     forced: Vec<bool>,
+    /// The effects its part states start ([`CpuModel::state_fx`]).
+    pub state_fx: std::sync::Arc<Vec<StateFx>>,
     /// The looks a person model can take ([`CpuModel::looks`]); each
     /// person's is drawn by [`draw_posed_as`](Self::draw_posed_as).
     pub looks: Option<std::sync::Arc<Looks>>,
@@ -1382,6 +1432,7 @@ impl GpuModel {
             tracks: false,
             track_travel: 0.0,
             parts: cpu.parts.clone(),
+            state_fx: cpu.state_fx.clone(),
             parts_hidden: None,
             forced: Vec::new(),
             looks: cpu.looks.clone(),

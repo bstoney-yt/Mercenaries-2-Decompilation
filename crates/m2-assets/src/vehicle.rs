@@ -59,17 +59,24 @@ pub struct NodeBox {
     pub max: [f32; 3],
 }
 
-/// Node name hash of the driver's seat marker: a leaf node at floor height
-/// at the left front seat, the same hash on every car and truck sampled
-/// (PMC car x -0.37, civilian car -0.42, HMMWV -0.73, M35 -0.42, semi
-/// -0.42). The right front seat is [`PASSENGER_SEAT`].
+/// Node name hash of a front seat marker: a leaf node at floor height, the
+/// same hash on every car and truck sampled (PMC car x -0.37, civilian car
+/// -0.42, HMMWV -0.73, M35 -0.42, semi -0.42). Its name is a misnomer: the
+/// templates' seat data links it as `seat_front_right`, and the driver's
+/// seat (`seat_driver`) at [`PASSENGER_SEAT`] (from samples; on screen the
+/// data's driver sits on the left, behind the wheel). A vehicle's driver is
+/// placed by its seat data (`m2_engine::seats`); this is only the stand-in
+/// for a model without any.
 pub const DRIVER_SEAT: u32 = 0xd6eb_e292;
-/// The right front seat marker.
+/// The other front seat marker: the templates' `seat_driver` hardpoint
+/// (see [`DRIVER_SEAT`]).
 pub const PASSENGER_SEAT: u32 = 0xd721_fc8c;
-/// The marker outside the driver's door, where a character stands to get
-/// in (PMC car x -1.40, civilian car -1.70, HMMWV -1.93, semi -2.10).
+/// A door marker, where a character stands to get in (PMC car x -1.40,
+/// civilian car -1.70, HMMWV -1.93, semi -2.10). A misnomer like
+/// [`DRIVER_SEAT`]'s: the templates link it as `entrance_front_right`.
 pub const DRIVER_DOOR: u32 = 0x688c_4858;
-/// The marker outside the passenger's door.
+/// The other door marker: the templates' `entrance_driver` hardpoint, whose
+/// `EntranceDirection` is Left.
 pub const PASSENGER_DOOR: u32 = 0x8869_e876;
 
 /// Material name hash of a vehicle's rear red lamps (the brake lights):

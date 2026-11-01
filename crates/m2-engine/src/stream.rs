@@ -377,6 +377,9 @@ struct ClumpGpu {
     count: u32,
     material: MaterialId,
     translucent: bool,
+    /// The mesh's fade distances (m): its instances are gone past the
+    /// second.
+    fade: [f32; 2],
     instances: Vec<Mat4>,
 }
 
@@ -1290,6 +1293,7 @@ impl World {
                                     count: m.indices.len() as u32,
                                     material,
                                     translucent: materials.is_translucent(material),
+                                    fade: m.fade,
                                     instances: m.instances,
                                 });
                             }
@@ -1754,10 +1758,21 @@ impl World {
         for slot in self.scatter.values() {
             let Slot::Ready(clumps) = slot else { continue };
             for c in clumps {
-                // Stopping at the meshes' fade distances left the ground
-                // nearly bare on the device; until what they mean is
-                // checked, everything within reach draws.
-                let reach2 = self.settings.scatter_distance.powi(2);
+                // Each mesh's instances stop at its own fade end (the
+                // scatter record's second fade distance: 70 m for most of
+                // the grass, 40-50 m for the rest), within the scatter
+                // reach. Playtest (a phone at the villa, 13-27 fps, held
+                // by the GPU): out to the reach, 150 m, 4,115 clumps drew
+                // there; to their fade ends 647, the ground near her as
+                // grassed as before. (An earlier try on a device left the
+                // ground bare; that wasn't reproduced on the PC's render.)
+                // The fade in between isn't drawn: they stop at its end.
+                let reach = if c.fade[1] > 0.0 {
+                    c.fade[1].min(self.settings.scatter_distance)
+                } else {
+                    self.settings.scatter_distance
+                };
+                let reach2 = reach * reach;
                 near.clear();
                 near.extend(c.instances.iter().filter(|m| {
                     let at = m.w_axis.truncate();

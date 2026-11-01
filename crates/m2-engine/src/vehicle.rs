@@ -12,8 +12,12 @@
 //! # Provenance
 //!
 //! Clean-room. The kinds, wheels and markers come from the game's data as
-//! `m2_assets::vehicle` describes; the masses, engine forces, suspension
-//! and grip are invented arcade tuning, as in the browser viewer.
+//! `m2_assets::vehicle` describes. The masses, engines, brakes, grip and
+//! springs come from each template's `_CarPhysicsV2`
+//! ([`VehicleTuning`]); how a wheeled vehicle's
+//! springs hang and push, and its gravity factor, are from the Xbox 360
+//! code ([`Springs`](crate::tuning::Springs)); how the rest of the data
+//! drives it is still the alpha's reading (`physics.rs` says which).
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
@@ -200,9 +204,16 @@ pub struct VehicleSpec {
     pub wheels: Vec<WheelSpec>,
     /// Model-space bounds.
     pub bounds: (Vec3, Vec3),
-    /// Driver's seat and door markers, model space.
+    /// Driver's seat and door, model space: the template's seat data's
+    /// ([`VehicleSpec::with_driver_points`]) once tuned, else fixed markers.
     pub seat: Option<Vec3>,
     pub door: Option<Vec3>,
+    /// Its template's seats and entrances ([`crate::seats::VehicleSeats`]),
+    /// when the data gives them ([`VehicleSpec::with_seating`]).
+    pub seating: Option<std::sync::Arc<crate::seats::VehicleSeats>>,
+    /// Those entrances whose hardpoint node the model has, with that
+    /// node's place, model space.
+    pub entrances: Vec<(crate::seats::Entrance, Vec3)>,
     /// Tracked vehicles (tanks, APCs without usable wheels) drive on four
     /// made-up wheels; their road wheels turn with the ground covered.
     pub tracked: bool,
@@ -340,6 +351,26 @@ pub const GUN: u32 = 0xcc0e_3f83;
 /// a cannon: the Stryker's 45 a minute, as the AMX-30's, where machine
 /// guns fire hundreds.
 const CANNON_RATE: f32 = 120.0;
+
+/// The six points a tracked vehicle's tracks touch the ground at, model
+/// space, as the 360 code drives it on them (`hp_wheel_fl`, `_fr`, `_rl`,
+/// `_rr`, `_ml`, `_mr`, in that order, 0x82900338): `None` unless its
+/// model has all six.
+pub fn track_hardpoints(model: &Model<'_>) -> Option<[Vec3; 6]> {
+    const NAMES: [&str; 6] = [
+        "hp_wheel_fl",
+        "hp_wheel_fr",
+        "hp_wheel_rl",
+        "hp_wheel_rr",
+        "hp_wheel_ml",
+        "hp_wheel_mr",
+    ];
+    let mut out = [Vec3::ZERO; 6];
+    for (o, n) in out.iter_mut().zip(NAMES) {
+        *o = Vec3::from(vehicle::marker(model, m2_assets::name_hash(n))?);
+    }
+    Some(out)
+}
 
 /// The four wheels a tracked vehicle drives on: under the corners of its
 /// road wheels, where the tracks meet the ground, else under its hull's.
@@ -593,7 +624,22 @@ impl VehicleSpec {
         }))
         .filter(|(lo, hi)| (*hi - *lo).min_element() > 0.2);
         if tracked {
-            wheels = stand_ins(&road_wheels, hull);
+            // On its six track hardpoints, as the 360 code drives it
+            // (0x821A4A60), where its model has them (every tracked
+            // template's does; tanktest), else on stand-ins.
+            wheels = match track_hardpoints(model) {
+                Some(h) => h
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &p)| WheelSpec {
+                        centre: p + Vec3::Y * 0.45,
+                        radius: 0.45,
+                        width: 0.5,
+                        steers: i < 2,
+                    })
+                    .collect(),
+                None => stand_ins(&road_wheels, hull),
+            };
         }
         let muzzle = muzzle.map(|(_, at)| at).or_else(|| {
             let b = boxes
@@ -630,6 +676,8 @@ impl VehicleSpec {
             bounds,
             seat: marker(DRIVER_SEAT),
             door: marker(DRIVER_DOOR),
+            seating: None,
+            entrances: Vec::new(),
             tracked,
             road_wheels,
             rest,
@@ -675,6 +723,53 @@ impl VehicleSpec {
             crate::weapons::mounted(a, arms, &self.node_names)
         });
         self
+    }
+
+    /// With its driver's seat and door where its template's seat data
+    /// puts them ([`crate::seats`]), at those hardpoints' nodes. A point
+    /// the data doesn't give, or whose node the model lacks, keeps the
+    /// fixed model marker (Invented stand-in: those markers are the front
+    /// right seat and door, see [`crate::seats`]).
+    pub fn with_driver_points(mut self, points: Option<crate::seats::DriverPoints>) -> Self {
+        let Some(p) = points else {
+            return self;
+        };
+        let node = |hash: u32| {
+            let i = self.node_names.iter().position(|&n| n == hash)?;
+            self.rest.get(i).map(|m| m.w_axis.truncate())
+        };
+        let (seat, door) = (node(p.seat), p.door.and_then(node));
+        self.seat = seat.or(self.seat);
+        self.door = door.or(self.door);
+        self
+    }
+
+    /// With its template's seats and entrances, each entrance placed at its
+    /// hardpoint's node (one whose node the model lacks is left out).
+    pub fn with_seating(
+        mut self,
+        seating: Option<std::sync::Arc<crate::seats::VehicleSeats>>,
+    ) -> Self {
+        let node = |hash: u32| {
+            let i = self.node_names.iter().position(|&n| n == hash)?;
+            self.rest.get(i).map(|m| m.w_axis.truncate())
+        };
+        self.entrances = seating.as_ref().map_or_else(Vec::new, |s| {
+            s.entrances
+                .iter()
+                .filter_map(|e| Some((*e, node(e.hardpoint?)?)))
+                .collect()
+        });
+        self.seating = seating;
+        self
+    }
+
+    /// The place, model space, of its entrance named `name`.
+    pub fn entrance_at(&self, name: u32) -> Option<Vec3> {
+        self.entrances
+            .iter()
+            .find(|(e, _)| e.name == name)
+            .map(|&(_, at)| at)
     }
 
     /// With its template's tuning: its mass and how far its gun tilts.
@@ -1049,6 +1144,33 @@ mod tests {
         assert_eq!(spec().tuned(None), spec());
     }
 
+    #[test]
+    fn the_driver_sits_and_gets_out_where_the_seat_data_says() {
+        use crate::seats::DriverPoints;
+        // The Valiant's nodes (round PR3): its fixed markers, the front
+        // right seat and door, at -x; the data's driver seat and door at +x.
+        let at = |x: f32| Mat4::from_translation(Vec3::new(x, 0.0, 0.4));
+        let mut s = spec();
+        s.node_names = vec![0xd6eb_e292, 0x688c_4858, 0xd721_fc8c, 0x8869_e876];
+        s.rest = vec![at(-0.42), at(-1.7), at(0.42), at(1.7)];
+        s.seat = Some(Vec3::new(-0.42, 0.0, 0.4));
+        s.door = Some(Vec3::new(-1.7, 0.0, 0.4));
+        let data = DriverPoints {
+            seat: 0xd721_fc8c,
+            door: Some(0x8869_e876),
+        };
+        let d = s.clone().with_driver_points(Some(data));
+        assert_eq!(d.seat, Some(Vec3::new(0.42, 0.0, 0.4)));
+        assert_eq!(d.door, Some(Vec3::new(1.7, 0.0, 0.4)));
+        // No seat data, or a node the model lacks: the fixed markers stay.
+        assert_eq!(s.clone().with_driver_points(None), s);
+        let missing = DriverPoints {
+            seat: 7,
+            door: Some(8),
+        };
+        assert_eq!(s.clone().with_driver_points(Some(missing)), s);
+    }
+
     fn spec() -> VehicleSpec {
         let wheel = |x: f32, z: f32| WheelSpec {
             centre: Vec3::new(x, 0.35, z),
@@ -1071,6 +1193,8 @@ mod tests {
             bounds: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2)),
             seat: None,
             door: None,
+            seating: None,
+            entrances: Vec::new(),
             tracked: false,
             road_wheels: Vec::new(),
             rest: vec![

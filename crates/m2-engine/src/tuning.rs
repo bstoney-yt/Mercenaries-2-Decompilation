@@ -31,7 +31,7 @@ pub struct VehicleTuning {
     /// Its armour class (`ObjectHint`'s `Armor`): 1 none (cars, boats),
     /// 2 light (helicopters), 3 medium (the LAV III), 4 heavy (tanks).
     pub armour: Option<u32>,
-    /// What blasts do to it, of their damage (`ExplosionFudge`'s field
+    /// How hard blasts throw it, of their usual (`ExplosionFudge`'s field
     /// 6bcc541e: the AMX-30's 0.2, a truck's 0.4, a boat's 1.1).
     pub blast_scale: Option<f32>,
     /// Health below which it burns down by itself (`TickDamage`'s field
@@ -50,11 +50,12 @@ pub struct VehicleTuning {
     pub engine: Option<EngineTuning>,
     /// A wheeled vehicle's steering, brakes and grip (`_CarPhysicsV2`).
     pub handling: Option<Handling>,
-    /// A tracked vehicle's pull at a standstill, a third, two thirds and
-    /// all of its top speed, of its most (`_TankPhysics`'s
-    /// `EngineTorqueRatio0`..`3`, names found by hash: the AMX-30's 1,
-    /// 0.45, 0.3, 0.1; read as a curve over its speed, inferred).
-    pub tracks: Option<[f32; 4]>,
+    /// A wheeled vehicle's springs (`_CarPhysicsV2`).
+    pub springs: Option<Springs>,
+    /// How a wheeled vehicle's tyres slow it along (`_CarPhysicsV2`).
+    pub tyres: Option<Tyres>,
+    /// A tracked vehicle's drive, tracks and steering (`_TankPhysics`).
+    pub tank: Option<TankTuning>,
     /// A helicopter's handling (`_HelicopterPhysics`).
     pub flight: Option<FlightTuning>,
     /// A boat's engine and the water's drag on it (`_BoatPhysics`).
@@ -67,6 +68,57 @@ pub struct VehicleTuning {
     /// `ee30a43d`, name unknown: 20 for the light helicopters, 39 for the
     /// Mi-26; and `DefaultPitch`).
     pub chase: Option<(f32, f32)>,
+}
+
+/// How a tracked vehicle drives, from its `_TankPhysics` (names from the
+/// 360 code's record, 0x823EBBE8, in its order; the AMX-30's values in
+/// brackets), as the 360 code runs it (step 0x821A49E8; see
+/// `physics::drive_tracks`). Fields the record leaves out take the 360
+/// record's defaults. Its springs (`SpringStrength`, `SpringDamp`,
+/// `SpringExpLength`, `SpringCmpLength`) are read but not yet used.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TankTuning {
+    /// Top speed, m/s (`MaxSpeed` 45 km/h): the drive stops pushing at it.
+    pub max_speed: f32,
+    /// Each track point's grip along it braking, per second (`Brake` 4).
+    pub brake: f32,
+    /// What its steering turns it with (`SteerSpeed` 12).
+    pub steer_speed: f32,
+    /// How much of its steering's gap it keeps each sixtieth of a second,
+    /// steering and letting go (`SteerInertia` 0.95,
+    /// `SteerInertiaNoInput` 0.65).
+    pub steer_inertia: (f32, f32),
+    /// Each track point's grip along it rolling, and across it, per second
+    /// (`FwdFriction` 0.1, `SideFriction` 0.9).
+    pub friction: (f32, f32),
+    /// Where its drive pushes it, metres up the ground's normal from its
+    /// centre of mass (`EngineOffsetY` -0.3).
+    pub engine_height: f32,
+    /// Its weight off the ground, of its plain weight (`GravityFactor` 2).
+    pub gravity_factor: f32,
+    /// Of its steering, what its top speed takes off (`HiSpeedSteerLoss`
+    /// 0.1).
+    pub steer_loss: f32,
+    /// Its tracks' grip at its top speed, of their grip (`HiSpeedGrip` 1).
+    pub high_speed_grip: f32,
+    /// Damping against its spin about its own sideways, up and ahead
+    /// axes, per second (`AngDampX`, `Y`, `Z`: 9, 0, 9).
+    pub ang_damp: [f32; 3],
+    /// Its centre of mass from its body's, metres (`CenterOfMassOffset`).
+    pub centre_of_mass: [f32; 3],
+    /// Its drive's push at its best, of 200 newtons (`EngineTorque` 2000).
+    pub torque: f32,
+    /// How much of its throttle's gap it keeps each sixtieth of a second
+    /// (`EngineInertia` 0.85).
+    pub engine_inertia: f32,
+    /// Its push over its speed: (of its top speed, of `torque`) at 0,
+    /// `EngineTorquePos1`, `EngineTorquePos2` and 1, in a line between
+    /// (`EngineTorqueRatio0`..`3` 1, 0.45, 0.3, 0.1 at 0, 0.4, 0.6, 1).
+    pub curve: [(f32, f32); 4],
+    /// Its springs: strength and damp per kilogram, how far they stretch
+    /// and squeeze, metres (`SpringStrength` 20, `SpringDamp` 2.5,
+    /// `SpringExpLength` 0.35, `SpringCmpLength` 0.7).
+    pub springs: (f32, f32, f32, f32),
 }
 
 /// How a helicopter flies, from its `_HelicopterPhysics` (names found by
@@ -173,60 +225,95 @@ impl BoatTuning {
 }
 
 /// How a motorbike holds itself up, from its `_CarPhysicsV2`'s `Bike*`
-/// fields (names found by hash, gap round 17; read here gap round 18;
-/// the Offroad Motorcycle (AL)'s values in brackets, the range over the
-/// 11 distinct bike records after them). Only bikes give them (every
-/// other record's `BikeRollStabilityStrength` is 0).
+/// fields (names from the 360 code's record, 0x823EB210, in its order
+/// @130..@16C; the 360 code copies them 0xE8 on into the running car,
+/// 0x8219B774, and its balance reads them there, 0x8219D800). Only bikes
+/// give them: the 360 code balances a car only if one of its roll
+/// strength and damp, pitch damp and strengths, wheelie steering or air
+/// controls is not 0 (0x8219D800's test), and every other record's are.
 ///
-/// Read as the suspension's strengths and damps are, per kilogram the
-/// bike weighs (inferred from samples, not checked against the game's
-/// code): a torque of strength x lean x mass, newton-metres. Gravity
-/// tips a bike with 9.81 x its centre of mass's height (0.33 to 0.48 m
-/// in the alpha's bodies), 3.3 to 4.7 N m/kg a radian, so even the
-/// weakest record (the player's off-road bike's 10) holds itself up
-/// twice over, and the AI's 100 and the street `Motorcycle`'s 250 with
-/// room to spare. Read the other way, as a turning acceleration per
-/// radian, the five records at 10 to 20 barely beat gravity: shoved at
-/// speed they hang leaning over 3 degrees for 6 s (biketest, gap round
-/// 18), where per kilogram every bike stands back up within 1.7 s. The damps against
-/// its roll, pitch and yaw, and its control in the air, read per
-/// kilogram alike: in the air its stick then turns it at control / damp
-/// rad/s, 0.2 to 0.5 for the nose (the AI-only bike's 3.5).
-///
-/// Named but not read: `BikeWheeliePitch` (0.85; 0.5 to 1) and
-/// `BikeWheelieSideDamp` (10; 10 throughout), as the alpha has no
-/// wheelie. The four fields between them (@148 to @154) are unnamed.
+/// Each value is a torque per kilogram: the 360 code turns it into an
+/// angular impulse of value x step x mass (0x8262C120 is the body's mass)
+/// against the body's inertia, [`inertia`](Self::inertia) x mass
+/// (0x8219BA08). Angles are radians. Fields the record leaves out take
+/// the 360 record's defaults (all 0; inertia 2, 1, 1.5).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BikeTuning {
-    /// What holds it up towards the lean that balances its turn,
-    /// newton-metres per radian off it, per kilogram
-    /// (`BikeRollStabilityStrength` 10; 10 to 250).
+    /// The turning rate, rad/s, at which it leans the most
+    /// (`BikeRollAngVelForMaxRoll`).
+    pub roll_rate: f32,
+    /// That most lean, radians, as the 360 code blends it by its speed s
+    /// of its top speed: `(1 - s) x hi + s x lo` (`BikeRollAngleAtLoSpeed`,
+    /// `BikeRollAngleAtHiSpeed`; the code weights them so, 0x8219DC00,
+    /// against what the names suggest).
+    pub roll_angle: (f32, f32),
+    /// The lean its steering asks on its own at full lock, radians, faded
+    /// in from a standstill up to `low_speed` (`BikeRollAngleFromInput`).
+    pub roll_input: f32,
+    /// What turns it towards that lean, per radian off it
+    /// (`BikeRollStabilityStrength`).
     pub roll: f32,
-    /// Damping against its roll, pitch and yaw, newton-metres per rad/s,
-    /// per kilogram (`BikeExtraDampRoll` 6, `BikeExtraDampPitch` 10,
-    /// `BikeExtraDampYaw` 0; 5 to 50, 10 throughout, 0 to 3).
+    /// How far its nose lifts in a wheelie, radians (`BikeWheeliePitch`).
+    pub wheelie: f32,
+    /// What turns its nose towards the pitch it wants on the ground, per
+    /// radian: when that asks more than it is off the ground's slope, and
+    /// when less (`BikeWheeliePitchStrengthUp`, `...StrengthDown`).
+    pub pitch_strength: (f32, f32),
+    /// Of those, what is left at its top speed
+    /// (`BikeWheeliePitchHiSpeedRatio`).
+    pub pitch_high_speed: f32,
+    /// How well it steers in a wheelie (`BikeWheelieSteerAbility`).
+    pub wheelie_steer: f32,
+    /// What holds it from sliding sideways in a wheelie, per m/s
+    /// (`BikeWheelieSideDamp`).
+    pub side_damp: f32,
+    /// Damping against its roll, pitch and yaw, per rad/s
+    /// (`BikeExtraDampRoll`, `BikeExtraDampPitch`, `BikeExtraDampYaw`).
     pub damp: [f32; 3],
-    /// In the air, what its stick turns its nose and its heading with,
-    /// newton-metres per kilogram at full stick (`BikeAirControlPitch`
-    /// 2, `BikeAirControlYaw` 1.5; 1 to 35, 1.5 to 4).
+    /// In the air, what its stick turns its nose and its heading with
+    /// (`BikeAirControlPitch`, `BikeAirControlYaw`).
     pub air: (f32, f32),
+    /// Up to this speed, m/s, its steering's lean fades in
+    /// (`LowSpeedLimit`, km/h).
+    pub low_speed: f32,
+    /// Its inertia about its own sideways, up and ahead axes, m² per
+    /// kilogram (`InertiaTensorX`, `Y`, `Z`).
+    pub inertia: [f32; 3],
+    /// Where its centre of mass sits from the middle of its wheels, model
+    /// space, metres (`CenterOfMassOffset`; the 360 code adds it to the
+    /// mean of its wheels' positions, 0x8219BABC).
+    pub centre_of_mass: [f32; 3],
 }
 
-/// A wheeled vehicle's engine and gearbox, from its `_CarPhysicsV2`
-/// (names found by hash, round 18 of the playtest fixes; the M151's
-/// values in brackets). The fields are those of a Havok vehicle's
-/// engine and transmission (`minRPM`, `optRPM`, `maxRPM`, upshift and
-/// downshift RPM, primary ratio, a ratio a gear), so the game's own top
-/// speeds come out of them: the M151 in fifth at its optimum 3,000 rpm
-/// runs at 84 km/h against its `MaxSpeed` of 85.
+impl BikeTuning {
+    /// Whether the 360 code balances it at all (0x8219D800's test).
+    pub fn balances(&self) -> bool {
+        [
+            self.air.0,
+            self.air.1,
+            self.damp[0],
+            self.damp[1],
+            self.damp[2],
+            self.roll,
+            self.pitch_strength.0,
+            self.pitch_strength.1,
+            self.wheelie_steer,
+        ]
+        .iter()
+        .any(|&v| v != 0.0)
+    }
+}
+
+/// A wheeled vehicle's engine and gearbox, from its `_CarPhysicsV2` (the
+/// M151's values in brackets), as the Xbox 360 code runs them (from the
+/// 360 code, driving round 6: the gearbox and engine at 0x821A0528, the
+/// push at 0x8219C518; [`EngineTuning::step`]). A field the record
+/// leaves out takes the code's default (0x823EB210,
+/// [`EngineTuning::DEFAULT`]).
 ///
-/// Not read: `GearSlipRPM` (0, 1,000 or 2,000; Havok's clutch slip,
-/// meaning here unchecked), and the six fields after `GearRatio5`
-/// (@bc to @d0, unnamed: no name tried hashes to them). Five of the six
-/// are 1 in every record, so a factor of them changes nothing; the
-/// first is 0.5 on the Sidecar Motorcycle and the Sportbike, 1.5 on the
-/// Phoenix and the RTR and 0.7 on the Garbage Truck (31 of 454
-/// records), its meaning unknown.
+/// Not read: `GearTorqueMultiReverse` and `GearTorqueMulti1`..`5` (the
+/// six fields after `GearRatio5`; 1 in every record but the
+/// `...Reverse` of 31: 0.5 to 1.5), which the step doesn't use.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EngineTuning {
     /// Most torque, newton-metres (`EngineTorque` 130).
@@ -235,13 +322,11 @@ pub struct EngineTuning {
     /// (`GearMinRPM` 900, `GearOptRPM` 3,000, `GearMaxRPM` 12,000).
     pub rpm: (f32, f32, f32),
     /// It changes up a gear above this, rpm (`GearUpshiftRPM` 4,000),
-    /// and down one below this (`GearDownshiftRPM` 2,500; 1,500 to
-    /// 5,500 over the 454 records).
+    /// and down one below this (`GearDownshiftRPM` 2,500).
     pub upshift: f32,
     pub downshift: f32,
-    /// How long a change of gear takes, seconds, the engine driving
-    /// nothing meanwhile (`ClutchDelayTime` 0; 0 in 307 of the 454
-    /// records, up to 1.75).
+    /// How long after a change of gear it may change again, seconds
+    /// (`ClutchDelayTime` 0; up to 1.75): the engine drives on meanwhile.
     pub clutch_delay: f32,
     /// The final drive's ratio (`GearRatioPrimary` 3.5), each forward
     /// gear's (`GearRatio1`..`5`: 4, 3.1, 2.4, 2, 1.5; a 0 is no gear)
@@ -249,152 +334,551 @@ pub struct EngineTuning {
     pub primary: f32,
     pub gears: [f32; 5],
     pub reverse: f32,
-    /// The driven wheels' radius, metres (`RearWheelRadius` 0.39).
+    /// The rear wheels' radius, metres (`RearWheelRadius` 0.39).
     pub radius: f32,
     /// Of its most torque, what it gives at idle and at its most rpm
-    /// (`TorqueFactorAtMinRPM` 0.8 and `TorqueFactorAtMaxRPM` 1.0; 0.5 to
-    /// 1 both; names found by hash, gap round 24, as Havok's engine
-    /// names them; between idle, the optimum and the most rpm read as
-    /// straight lines, inferred).
+    /// (`TorqueFactorAtMinRPM` 0.8 and `TorqueFactorAtMaxRPM` 1.0).
     pub torque_at: (f32, f32),
-    /// Top speed backing up, m/s (`ReverseMaxSpeed`, km/h: 55).
+    /// Top speed backing up, m/s (`ReverseMaxSpeed`, km/h: 55). The
+    /// 360's push fades by `MaxSpeed` alone; where this is used isn't
+    /// traced.
     pub reverse_speed: f32,
+    /// How far over idle the engine runs as the clutch slips at a crawl,
+    /// rpm, at full throttle (`GearSlipRPM`; 0, 1,000 or 2,000).
+    pub slip: f32,
+    /// The rear wheels' share of the drive (`RearToFrontTorqueDistrib`,
+    /// default 1): each rear wheel weighs twice that over their number
+    /// in the engine's speed, the front the rest (0x821A0390).
+    pub split: f32,
 }
 
-/// How a wheeled vehicle steers, brakes and holds the road, from its
-/// `_CarPhysicsV2` (names found by hash, gap round 4; the M151's values
-/// in brackets, the range over the 454 records after them).
+/// How a wheeled vehicle steers, from its `_CarPhysicsV2` (the M151's
+/// values in brackets, the range over the 454 records after them), as
+/// the Xbox 360 code turns its front wheels (from the 360 code, driving
+/// round 4: each front wheel's angle at 0x821A020C, in the wheel step;
+/// the record's defaults at 0x823EB210).
+///
+/// Each step the wheels' angle heads for the stick's share of the lock,
+/// the lock shrinking with speed ([`Handling::range`]). With
+/// `SteeringInertia` below 0 (the default, -1) the angle moves there at
+/// most its swing speed, which also shrinks with speed; let go of the
+/// stick, or pushed the other way, it first eases back towards straight
+/// by `SteerNoInputInertia` or `SteerDiffSignInertia`. With
+/// `SteeringInertia` 0 or more, it eases to where the stick asks by that
+/// (or those two). Easing keeps that share of the way left each 1/60 s
+/// ([`ease`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Handling {
     /// How far its front wheels turn, radians (`SteerMaxAngle` 0.7; 0.5
-    /// to 1.1, 29 to 63 degrees; radians inferred, as the database gives
-    /// the helicopters' and cameras' angles in them too).
+    /// to 1.1, 29 to 63 degrees; the wheels take it as it is).
     pub steer_lock: f32,
-    /// Each axle's brake, front and back (`FrontBrake` 7, `RearBrake` 6;
-    /// 2.5 to 11 and 1 to 13). Read as the slowing it gives the whole
-    /// vehicle, m/s², if every wheel braked as that axle's do (inferred:
-    /// the heavy trucks' are the lowest, the garbage truck's 4 and 1, the
-    /// light cars' and bikes' the highest).
-    pub brake: (f32, f32),
-    /// Each axle's sideways grip (`FrontWheelFrictionSide` 1.5,
-    /// `RearWheelFrictionSide` 1.5; 0.5 to 3 and 0.7 to 5), read as the
-    /// tyres' friction coefficient (inferred).
-    pub grip: (f32, f32),
     /// How quickly its front wheels swing towards where the driver
-    /// steers, radians a second (`SteerSpeed` 0.6; 0.1 to 10; gap round
-    /// 14, the unit inferred, as the lock's is radians).
+    /// steers, radians a second (`SteerSpeed` 0.6; 0.1 to 10).
     pub steer_speed: f32,
-    /// Below this speed, m/s, they swing at `low_steer_speed` instead
-    /// (`LowSpeedLimit` 35 and `LowSpeedSteerSpeed` 0.9; 0 to 80 and 0
-    /// to 6). The limit read as km/h, as its `MaxSpeed` is (inferred);
-    /// the pair read as the helicopters' `LowSpeedLimit` and
-    /// `LowSpeedYawSpeed` are. 0 when its template gives no limit (7 of
-    /// the 454 records).
+    /// At a standstill they swing at `low_steer_speed` instead, easing to
+    /// `steer_speed` at this speed, m/s (`LowSpeedLimit` 35 km/h and
+    /// `LowSpeedSteerSpeed` 0.9; 0 to 80 and 0 to 6). 0: no low speed.
     pub low_speed: f32,
     pub low_steer_speed: f32,
-    /// Each axle's springs, front and back (`FrontWheelSuspStrength`
-    /// 25, `RearWheelSuspStrength` 25; 4.5 to 80 and 8 to 80; gap round
-    /// 16): the push of each wheel's spring per metre it is compressed,
-    /// per kilogram the vehicle weighs (read per unit of mass, as a
-    /// Havok or Bullet ray-cast suspension takes it, inferred: the
-    /// 11-tonne Escort's is 13, the 200 kg scooter's 70, so it does not
-    /// grow with the weight). The body bounces at the square root of
-    /// their sum, rad/s: an M151's 25 x 4 at 1.6 Hz.
-    pub spring: (f32, f32),
-    /// Each axle's dampers (`FrontWheelSuspDamp` 1.7,
-    /// `RearWheelSuspDamp` 1.7; 0.8 to 10 and 0.4 to 10), per kilogram
-    /// as the springs are, the same squeezed or stretched (one field
-    /// each; inferred).
-    pub damping: (f32, f32),
+    /// At its top speed its lock and swing are this much less
+    /// (`HighSpeedSteerLoss`, default 0.1), times `loss_braking`
+    /// braking (`HighSpeedSteerLossBrakeMulti`, 0.5) or `loss_coasting`
+    /// off the throttle (`HighSpeedSteerLossNoThrottleMulti`, 0.8).
+    pub high_speed_loss: f32,
+    pub loss_braking: f32,
+    pub loss_coasting: f32,
+    /// How its wheels ease to where the stick asks (`SteeringInertia`,
+    /// default -1: below 0, they swing at the swing speed instead), back
+    /// to straight with the stick let go (`SteerNoInputInertia`, 0) and
+    /// back to straight when steered the other way
+    /// (`SteerDiffSignInertia`, 0.9).
+    pub inertia: f32,
+    pub no_input_inertia: f32,
+    pub diff_sign_inertia: f32,
 }
 
 impl Handling {
-    /// How quickly its front wheels swing at `speed` m/s, radians a
-    /// second.
-    pub fn swing(&self, speed: f32) -> f32 {
-        if speed.abs() < self.low_speed {
-            self.low_steer_speed
+    /// The 360 code's defaults, for a vehicle with no `_CarPhysicsV2`.
+    pub const DEFAULT: Handling = Handling {
+        steer_lock: 1.0,
+        steer_speed: 10.0,
+        low_speed: 30.0 / 3.6,
+        low_steer_speed: 5.0,
+        high_speed_loss: 0.1,
+        loss_braking: 0.5,
+        loss_coasting: 0.8,
+        inertia: -1.0,
+        no_input_inertia: 0.0,
+        diff_sign_inertia: 0.9,
+    };
+
+    /// Its lock's (and swing's) share left at `fast` (its speed's share
+    /// of its `MaxSpeed`), with the throttle open or the brake on.
+    pub fn range(&self, fast: f32, throttle: f32, brake: f32) -> f32 {
+        let multi = if throttle >= 1e-4 {
+            1.0
+        } else if brake >= 1e-4 {
+            self.loss_braking
         } else {
-            self.steer_speed
+            self.loss_coasting
+        };
+        1.0 - self.high_speed_loss * multi * fast.clamp(0.0, 1.0)
+    }
+
+    /// How quickly its front wheels swing at `speed` m/s, radians a
+    /// second (before [`range`](Self::range)).
+    pub fn swing(&self, speed: f32) -> f32 {
+        let low = if self.low_speed > 0.0 {
+            1.0 - (speed.abs() / self.low_speed).min(1.0)
+        } else {
+            0.0
+        };
+        self.steer_speed + (self.low_steer_speed - self.steer_speed) * low
+    }
+
+    /// Its front wheels' angle after `dt` s from `angle`, radians, with
+    /// the stick at `steer` (-1 to 1), at `speed` m/s, `fast` its share
+    /// of its `MaxSpeed`, the throttle and brake as [`range`] takes them.
+    ///
+    /// [`range`]: Self::range
+    #[allow(clippy::too_many_arguments)]
+    pub fn steer(
+        &self,
+        angle: f32,
+        steer: f32,
+        speed: f32,
+        fast: f32,
+        throttle: f32,
+        brake: f32,
+        dt: f32,
+    ) -> f32 {
+        let range = self.range(fast, throttle, brake);
+        let want = self.steer_lock * range * steer;
+        let back = if steer == 0.0 {
+            Some(self.no_input_inertia)
+        } else if angle * steer < 0.0 {
+            Some(self.diff_sign_inertia)
+        } else {
+            None
+        };
+        if self.inertia >= 0.0 {
+            return ease(angle, want, back.unwrap_or(self.inertia), dt);
+        }
+        let angle = back.map_or(angle, |keep| ease(angle, 0.0, keep, dt));
+        let most = self.swing(speed) * range * dt;
+        angle + (want - angle).clamp(-most, most)
+    }
+}
+
+/// Eases `from` towards `to` over `dt` s as the 360 code does (from the
+/// 360 code, 0x824BB050): each 1/60 s it keeps `keep` of the way left,
+/// the rest of a 1/60 s a share of a step; done when the way left is
+/// under `keep` x 1e-5. Over 16.7 s, there at once unless `keep` is over
+/// 0.9999.
+pub fn ease(from: f32, to: f32, keep: f32, dt: f32) -> f32 {
+    const TICK: f32 = 1.0 / 60.0;
+    if dt > 1000.0 * TICK {
+        return if keep <= 0.9999 { to } else { from };
+    }
+    let (mut at, mut left) = (from, dt);
+    while left > TICK {
+        let way = to - at;
+        if way * way < (keep * 1e-5) * (keep * 1e-5) {
+            return to;
+        }
+        left -= TICK;
+        at += way * (1.0 - keep);
+    }
+    let share = left * 60.0;
+    let next = at + (to - at) * (1.0 - keep);
+    next * share + (1.0 - share) * at
+}
+
+/// A wheeled vehicle's springs, from its `_CarPhysicsV2` (the M151's
+/// values in brackets), as the Xbox 360 code builds and drives each
+/// wheel (from the 360 code, driving round 1: the wheel set-up at
+/// 0x8219EF90 and the wheel step at 0x8219F510):
+///
+/// - Each wheel's spring hangs from a point its `*WheelSuspCmpLength`
+///   above where the model has the wheel's centre, and is
+///   `ExtraInvisibleSpringLength + *WheelSuspExpLength +
+///   *WheelSuspCmpLength` long unloaded ([`Springs::length`]). The
+///   wheel is cast down that far plus its radius; fully stretched it
+///   hangs `ExtraInvisibleSpringLength + *WheelSuspExpLength` below the
+///   model's wheel, squeezed flat `*WheelSuspCmpLength` above it.
+/// - Touching the ground, it pushes the chassis along the contact's
+///   normal with mass x (strength x squeeze - damp x stretching speed),
+///   newtons, where squeeze is how much shorter than unloaded it is and
+///   the stretching speed its length's change over the step: one damp,
+///   squeezed or stretched.
+/// - With more than half its wheels on the ground the chassis is pulled
+///   down by (`GravityFactor` - 1) x its weight more (at 0x8219EE14).
+///
+/// A field the record leaves out takes the 360 code's own default
+/// (0x823EB210): 40.1 and 3 for a spring's strength and damp, 0.2 m
+/// for each of its lengths, 0 extra, a `GravityFactor` of 2.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Springs {
+    /// Each axle's spring, front and back (`FrontWheelSuspStrength` 25,
+    /// `RearWheelSuspStrength` 25; 4.5 to 80 and 8 to 80): its push per
+    /// metre squeezed, per kilogram the vehicle weighs.
+    pub strength: (f32, f32),
+    /// Each axle's damp (`FrontWheelSuspDamp` 1.7, `RearWheelSuspDamp`
+    /// 1.7), per kilogram as the strength is.
+    pub damping: (f32, f32),
+    /// How far each axle's spring stretches below the model's wheel and
+    /// squeezes above it, metres (`*WheelSuspExpLength`,
+    /// `*WheelSuspCmpLength`).
+    pub stretch: (f32, f32),
+    pub squeeze: (f32, f32),
+    /// Unloaded length every spring has besides those, metres
+    /// (`ExtraInvisibleSpringLength`).
+    pub extra: f32,
+    /// Its weight on the ground, of its plain weight (`GravityFactor`).
+    pub gravity_factor: f32,
+}
+
+impl Springs {
+    /// The 360 code's defaults, for a vehicle with no `_CarPhysicsV2`.
+    pub const DEFAULT: Springs = Springs {
+        strength: (40.1, 40.1),
+        damping: (3.0, 3.0),
+        stretch: (0.2, 0.2),
+        squeeze: (0.2, 0.2),
+        extra: 0.0,
+        gravity_factor: 2.0,
+    };
+
+    /// One axle's (front, the steering one, or back) strength, damp,
+    /// unloaded length and how far its spring's top sits above the
+    /// model's wheel centre, metres.
+    pub fn axle(&self, front: bool) -> (f32, f32, f32, f32) {
+        let pick = |p: (f32, f32)| if front { p.0 } else { p.1 };
+        let squeeze = pick(self.squeeze);
+        (
+            pick(self.strength),
+            pick(self.damping),
+            self.extra + pick(self.stretch) + squeeze,
+            squeeze,
+        )
+    }
+
+    /// An axle's spring's unloaded length, metres.
+    pub fn length(&self, front: bool) -> f32 {
+        self.axle(front).2
+    }
+}
+
+/// How a wheeled vehicle's tyres hold it, along the way they roll and
+/// across it, from its `_CarPhysicsV2` (the M151's values in brackets),
+/// as the Xbox 360 code works it out (from the 360 code, driving rounds 2
+/// and 3: each wheel's coefficients at 0x8219FB08, summed by axle at
+/// 0x8219FE80 and averaged at 0x8219AF38, the axle's push at 0x821A08D8,
+/// applied per axle at 0x8219C118):
+///
+/// - Each axle pushes the chassis, at a point between its wheels' spring
+///   tops and their contacts ([`Tyres::sway`]), with mass x (its
+///   coefficient along ([`Tyres::slowing`], m/s²) x the velocity along
+///   its wheels clamped to +-1 m/s, plus its coefficient across
+///   ([`Tyres::grip`], per second) x the level velocity across them):
+///   so the axles' coefficients add up, every axle's on its own; along,
+///   it is a slowing, across, a damping of the sideways slide, with no
+///   limit.
+/// - Each wheel's coefficients are scaled by the share of the vehicle's
+///   wheels on the ground; an axle's are its wheels' mean, a wheel off
+///   the ground giving none.
+/// - Each step's coefficients are the new ones outright: the code eases
+///   them from the last step's (by 0.9, 0.5 braking) only until the first
+///   time one falls, which zeroes the easing for good (a static at
+///   0x8387C0F8).
+///
+/// A field the record leaves out takes the 360 code's own default
+/// (0x823EB210).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tyres {
+    /// Each axle's rolling friction, front and back
+    /// (`FrontWheelFrictionFwd`, `RearWheelFrictionFwd`; default 0.5).
+    pub rolling: (f32, f32),
+    /// Each axle's brake (`FrontBrake` 7, `RearBrake` 6; default 2).
+    pub brake: (f32, f32),
+    /// Each axle's handbrake (`FrontEmergencyBrake`,
+    /// `RearEmergencyBrake`; default 1): up to 1, the share of its
+    /// sideways grip it keeps on the handbrake; above, its slowing.
+    pub emergency: (f32, f32),
+    /// Each axle's sideways grip (`FrontWheelFrictionSide` 1.5,
+    /// `RearWheelFrictionSide` 1.5; default 1.5), which the handbrake
+    /// slows it with.
+    pub side: (f32, f32),
+    /// Below this speed, m/s, it rolls harder (`LowSpeedLimit`, km/h,
+    /// as the code compares it with its speed in km/h: default 30).
+    pub low_speed: f32,
+    /// Its sideways grip flat out, of its grip standing (`HiSpeedGrip`;
+    /// default 0.8), eased in over its speed's share of its `MaxSpeed`.
+    pub high_speed_grip: f32,
+    /// How far from its wheels' spring tops towards their contacts its
+    /// axles push, at a standstill (`SuspSteerSwayAmp`; default 1).
+    pub sway: f32,
+    /// The steepest ground it stands and drives on, radians (`MaxSlope`:
+    /// 45 degrees for its first value, 60 for the others; from the 360 code,
+    /// 0x8219B740). From 20 degrees less its springs push it more and more
+    /// as the ground leans and its engine less ([`Tyres::footing`]).
+    pub max_slope: f32,
+}
+
+impl Tyres {
+    /// The 360 code's defaults, for a vehicle with no `_CarPhysicsV2`.
+    pub const DEFAULT: Tyres = Tyres {
+        rolling: (0.5, 0.5),
+        brake: (2.0, 2.0),
+        emergency: (1.0, 1.0),
+        side: (1.5, 1.5),
+        low_speed: 30.0 / 3.6,
+        high_speed_grip: 0.8,
+        sway: 1.0,
+        max_slope: std::f32::consts::FRAC_PI_4,
+    };
+
+    /// One axle's coefficient (the front, steering one, or the back),
+    /// m/s², at `speed` m/s with the throttle open `throttle` (0 to 1),
+    /// the brake pressed `brake` (0 to 1), the handbrake on `handbrake`
+    /// (0 to 1) and the stick steering `steer` (-1 to 1):
+    ///
+    /// - rolling: its rolling friction less what the throttle opens,
+    ///   three times as hard at a standstill, easing to once at its low
+    ///   speed limit;
+    /// - braking: from that to its brake as the brake is pressed;
+    /// - else on the handbrake: from that to its sideways grip times
+    ///   0.33 + 0.67 x its handbrake x (1 - 0.55 |steer| front, 0.75
+    ///   back) (a handbrake over 1: that itself).
+    ///
+    /// Not here: a reversing or spun wheel's `*Rev180FrictionMulti`.
+    pub fn slowing(
+        &self,
+        front: bool,
+        speed: f32,
+        throttle: f32,
+        brake: f32,
+        handbrake: f32,
+        steer: f32,
+    ) -> f32 {
+        let pick = |p: (f32, f32)| if front { p.0 } else { p.1 };
+        let low = if self.low_speed > 0.0 {
+            1.0 - (speed.abs() / self.low_speed).min(1.0)
+        } else {
+            0.0
+        };
+        let rolling =
+            (low * 3.0 + (1.0 - low)) * (1.0 - throttle.clamp(0.0, 1.0)) * pick(self.rolling);
+        let brake = brake.clamp(0.0, 1.0);
+        let handbrake = handbrake.clamp(0.0, 1.0);
+        if brake > 0.0 {
+            (1.0 - brake) * rolling + brake * pick(self.brake)
+        } else if handbrake > 0.01 {
+            (1.0 - handbrake) * rolling + handbrake * self.held(front, handbrake, steer)
+        } else {
+            rolling
+        }
+    }
+
+    /// What an axle holds with on the handbrake, along and across.
+    fn held(&self, front: bool, handbrake: f32, steer: f32) -> f32 {
+        let pick = |p: (f32, f32)| if front { p.0 } else { p.1 };
+        let emergency = pick(self.emergency);
+        if emergency <= 1.0 {
+            let turn = if front { 0.55 } else { 0.75 };
+            let keep = (1.0 - steer.abs() * turn) * emergency * 0.67 + 0.33;
+            pick(self.side) * (handbrake * keep + (1.0 - handbrake))
+        } else {
+            emergency
+        }
+    }
+
+    /// One axle's sideways coefficient, per second, at `fast` (its speed's
+    /// share of its `MaxSpeed`, 0 to 1), with the brake, handbrake and
+    /// stick as [`slowing`](Self::slowing) takes them: its sideways grip,
+    /// eased from itself standing to [`high_speed_grip`] of it flat out;
+    /// braking, the back's less by 0.15 x |steer| x `fast`; else on the
+    /// handbrake, what [`slowing`](Self::slowing) holds with.
+    ///
+    /// [`high_speed_grip`]: Self::high_speed_grip
+    pub fn grip(&self, front: bool, fast: f32, brake: f32, handbrake: f32, steer: f32) -> f32 {
+        let pick = |p: (f32, f32)| if front { p.0 } else { p.1 };
+        let fast = fast.clamp(0.0, 1.0);
+        let mut side = pick(self.side);
+        if brake > 0.0 {
+            if !front {
+                side *= 1.0 - steer.abs() * fast * 0.15;
+            }
+        } else if handbrake > 0.01 {
+            side = self.held(front, handbrake, steer);
+        }
+        (self.high_speed_grip * fast + (1.0 - fast)) * side
+    }
+
+    /// How well it stands on ground leaning `tilt` radians (the mean of
+    /// its wheels' contacts' normals' lean; from the 360 code, 0x8219E020):
+    /// 1 up to 20 degrees under its [`max_slope`], falling straight to 0
+    /// at it. Its springs push it level by that share less of their
+    /// lean (0x8219C27C: on gentle ground they push straight up, so it
+    /// doesn't roll down), and its engine pulls by that share
+    /// (0x8219C6CC: beyond it, it can't drive on).
+    ///
+    /// [`max_slope`]: Self::max_slope
+    pub fn footing(&self, tilt: f32) -> f32 {
+        let ramp = 20f32.to_radians();
+        let past = (tilt - (self.max_slope - ramp)) / ramp;
+        1.0 - past.clamp(0.0, 1.0)
+    }
+
+    /// How far from its wheels' spring tops towards their contacts each
+    /// axle pushes, at `fast` (as [`grip`](Self::grip) takes it) with its
+    /// body rolled so its right side rises `roll` (the sine): its sway
+    /// x (2 - `fast`) / 2, less as it rolls, to none at a fifth.
+    pub fn sway(&self, fast: f32, roll: f32) -> f32 {
+        let fast = fast.clamp(0.0, 1.0);
+        (2.0 - fast) * 0.5 * self.sway * (1.0 - (roll.abs() * 5.0).min(1.0))
+    }
+}
+
+/// A wheeled vehicle's gearbox as it runs (the 360's at the vehicle's
+/// 0x94).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gearbox {
+    /// 0 reverse, 1 to 5 the forward gears.
+    pub gear: usize,
+    /// Until it may change gear again, seconds (below 0: it may).
+    pub clutch: f32,
+    /// How fast the engine turns, rpm.
+    pub rpm: f32,
+    /// The pedals' pull towards reverse or out of it, seconds, -0.1 to
+    /// 0.1 (the vehicle's 0x274).
+    pub reversing: f32,
+}
+
+impl Default for Gearbox {
+    fn default() -> Self {
+        Gearbox {
+            gear: 1,
+            clutch: 0.0,
+            rpm: 0.0,
+            reversing: 0.0,
         }
     }
 }
 
 impl EngineTuning {
-    /// How many forward gears it has.
-    pub fn gear_count(&self) -> usize {
-        self.gears.iter().take_while(|&&g| g > 0.0).count().max(1)
-    }
+    /// The 360 code's defaults, for a vehicle with no `_CarPhysicsV2`.
+    pub const DEFAULT: EngineTuning = EngineTuning {
+        torque: 500.0,
+        rpm: (1000.0, 5000.0, 8000.0),
+        upshift: 7000.0,
+        downshift: 2000.0,
+        clutch_delay: 0.5,
+        primary: 8.0,
+        gears: [3.0, 2.25, 1.5, 0.75, 0.4],
+        reverse: 1.0,
+        radius: 0.42,
+        torque_at: (1.0, 1.0),
+        reverse_speed: 50.0 / 3.6,
+        slip: 2000.0,
+        split: 1.0,
+    };
 
-    /// How fast the engine turns, rpm, in a gear of `ratio` at `speed`
-    /// m/s.
-    pub fn rpm_at(&self, ratio: f32, speed: f32) -> f32 {
-        speed.abs() / self.radius * self.primary * ratio * 60.0 / std::f32::consts::TAU
-    }
-
-    /// The gear it settles in at `speed` m/s (0 is first): the lowest
-    /// that keeps the engine below its upshift speed, else its top gear.
-    /// What it drives in as it goes is [`shift`](Self::shift)'s.
-    pub fn gear(&self, speed: f32) -> usize {
-        let n = self.gear_count();
-        (0..n)
-            .find(|&g| self.rpm_at(self.gears[g], speed) <= self.upshift)
-            .unwrap_or(n - 1)
-    }
-
-    /// The gear it changes to from `gear` at `speed` m/s: up one once
-    /// the engine turns faster than its upshift speed (short of its top
-    /// gear), down one once slower than its downshift speed (short of
-    /// first), else the same. Read as a Havok gearbox's upshift and
-    /// downshift RPM are, one gear at a time (inferred: the names are
-    /// Havok's, and in all 454 records a change up lands the engine
-    /// above the next gear's downshift speed, so it never changes
-    /// straight back).
-    pub fn shift(&self, gear: usize, speed: f32) -> usize {
-        let n = self.gear_count();
-        let gear = gear.min(n - 1);
-        let rpm = self.rpm_at(self.gears[gear], speed);
-        if rpm > self.upshift && gear + 1 < n {
-            gear + 1
-        } else if rpm < self.downshift && gear > 0 {
-            gear - 1
-        } else {
-            gear
-        }
-    }
-
-    /// Of its most torque, what the engine gives at `rpm`: rising from
-    /// idle to the optimum, falling from there to its most, nothing
-    /// beyond.
-    pub fn torque_factor(&self, rpm: f32) -> f32 {
-        let (min, opt, max) = self.rpm;
-        let rpm = rpm.max(min);
-        let along = |a: f32, b: f32| ((rpm - a) / (b - a).max(1.0)).clamp(0.0, 1.0);
-        if rpm <= opt {
-            self.torque_at.0 + (1.0 - self.torque_at.0) * along(min, opt)
-        } else if rpm <= max {
-            1.0 + (self.torque_at.1 - 1.0) * along(opt, max)
-        } else {
-            0.0
-        }
-    }
-
-    /// How hard the driven wheels push flat out at `speed` m/s, newtons,
-    /// forwards or backing up, in the gear it settles in there.
-    pub fn push(&self, speed: f32, backwards: bool) -> f32 {
-        self.push_in(self.gear(speed), speed, backwards)
-    }
-
-    /// How hard the driven wheels push flat out at `speed` m/s in `gear`
-    /// (0 is first), newtons, or backing up in reverse.
-    pub fn push_in(&self, gear: usize, speed: f32, backwards: bool) -> f32 {
-        let ratio = if backwards {
-            self.reverse
-        } else {
-            self.gears[gear.min(self.gear_count() - 1)]
+    /// A gear's ratio, final drive included (0 reverse, backwards; a gear
+    /// it hasn't, 0).
+    pub fn ratio(&self, gear: usize) -> f32 {
+        let r = match gear {
+            0 => -self.reverse,
+            g => self.gears.get(g - 1).copied().unwrap_or(0.0),
         };
-        let rpm = self.rpm_at(ratio, speed);
-        self.torque * self.torque_factor(rpm) * self.primary * ratio / self.radius
+        r * self.primary
+    }
+
+    /// One step of its gearbox and engine as the 360 code runs them
+    /// (0x821A0528), `dt` s on with the throttle open `throttle` (0 to
+    /// 1), its driven wheels turning at `wheels` rpm (weighted by their
+    /// shares of the drive, [`split`](Self::split)) and the driver asking
+    /// for reverse or not: the torque it pushes with, newton-metres,
+    /// backwards in reverse.
+    ///
+    /// - Once its clutch delay has run out, it goes into reverse from
+    ///   first when asked, back to first when not; else up a gear above
+    ///   its upshift speed (short of fifth) and down one below its
+    ///   downshift speed (short of first), the delay starting again.
+    /// - The engine turns at the wheels' speed through the gear; under
+    ///   idle the clutch slips, holding it at idle plus the throttle's
+    ///   share of its slip, from half idle up eased in towards the
+    ///   wheels'.
+    /// - Its torque is its most times a factor falling from 1 at the
+    ///   optimum to its torque factor at idle (or at its most rpm) as
+    ///   the square of the way there; it drags with a tenth of its most
+    ///   at the optimum, rising by a twentieth to idle and a fifth to its
+    ///   most rpm, three tenths there (nothing pushing), scaled down
+    ///   with the speed below idle. It pushes with the throttle's share
+    ///   of the one less the other.
+    ///
+    /// A gear whose ratio is 0 isn't changed up into (the 360 would).
+    pub fn step(&self, g: &mut Gearbox, dt: f32, throttle: f32, wheels: f32, reverse: bool) -> f32 {
+        g.clutch -= dt;
+        if g.clutch < 0.0 {
+            if reverse && g.gear == 1 {
+                g.gear = 0;
+            }
+            let rpm = self.ratio(g.gear) * wheels;
+            if g.gear == 0 {
+                if !reverse {
+                    g.gear = 1;
+                }
+            } else {
+                if rpm < self.downshift && g.gear > 1 {
+                    g.clutch = self.clutch_delay;
+                    g.gear -= 1;
+                }
+                if rpm > self.upshift && g.gear < 5 && self.ratio(g.gear + 1) != 0.0 {
+                    g.gear += 1;
+                    g.clutch = self.clutch_delay;
+                }
+            }
+        }
+        let (min, opt, max) = self.rpm;
+        let ratio = self.ratio(g.gear);
+        let turning = ratio * wheels;
+        let throttle = throttle.clamp(0.0, 1.0);
+        g.rpm = turning;
+        if turning < min {
+            let half = min * 0.5;
+            g.rpm = if turning >= half {
+                (turning - half) * (self.slip * throttle) / (min - half) + min
+            } else {
+                min + self.slip * throttle
+            };
+        }
+        let past = g.rpm - opt;
+        let (push, drag) = if past >= 0.0 {
+            if g.rpm >= max {
+                g.rpm = max;
+                (0.0, 0.3 * self.torque)
+            } else {
+                let f = 1.0 / (max - opt);
+                (
+                    ((self.torque_at.1 - 1.0) * f * f * past * past + 1.0) * self.torque,
+                    (0.2 * f * past + 0.1) * self.torque,
+                )
+            }
+        } else {
+            let f = 1.0 / (opt - min);
+            let drag = (-0.05 * f * past + 0.1) * self.torque;
+            (
+                ((self.torque_at.0 - 1.0) * f * f * past * past + 1.0) * self.torque,
+                if turning < min {
+                    drag / min * turning
+                } else {
+                    drag
+                },
+            )
+        };
+        let torque = push * throttle - drag;
+        if ratio < 0.0 { -torque } else { torque }
     }
 }
 
@@ -658,6 +1142,16 @@ impl<'a> Table<'a> {
         self.word(record, field)
             .map(f32::from_bits)
             .filter(|f| f.is_finite())
+    }
+
+    /// Field `field` in `record` as three floats in a row (a vector).
+    pub(crate) fn vector(&self, record: &[u8], field: u32) -> Option<[f32; 3]> {
+        let &(at, _, _) = self.fields.get(&field)?;
+        let b = record.get(at..at + 12)?;
+        let v: [f32; 3] = std::array::from_fn(|i| {
+            f32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
+        });
+        v.iter().all(|f| f.is_finite()).then_some(v)
     }
 
     /// Field `field` of template `id`'s first record as a number, stored
@@ -968,6 +1462,12 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         radius: f("RearWheelRadius")?,
                         torque_at: (f("TorqueFactorAtMinRPM")?, f("TorqueFactorAtMaxRPM")?),
                         reverse_speed: f("ReverseMaxSpeed")? / 3.6,
+                        slip: f("GearSlipRPM")
+                            .unwrap_or(EngineTuning::DEFAULT.slip)
+                            .max(0.0),
+                        split: f("RearToFrontTorqueDistrib")
+                            .unwrap_or(EngineTuning::DEFAULT.split)
+                            .clamp(0.0, 1.0),
                     };
                     (e.torque > 0.0
                         && e.primary > 0.0
@@ -981,30 +1481,102 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                     let r = *car.of_template(id).first()?;
                     let f = |name| car.float(r, name_hash(name)).filter(|v| *v > 0.0);
                     let low = (|| Some((f("LowSpeedLimit")? / 3.6, f("LowSpeedSteerSpeed")?)))();
+                    let d = Handling::DEFAULT;
+                    let or = |name, or: f32| car.float(r, name_hash(name)).unwrap_or(or);
                     Some(Handling {
                         steer_lock: f("SteerMaxAngle").filter(|a| *a < 1.5)?,
-                        brake: (f("FrontBrake")?, f("RearBrake")?),
-                        grip: (f("FrontWheelFrictionSide")?, f("RearWheelFrictionSide")?),
                         steer_speed: f("SteerSpeed")?,
                         low_speed: low.map_or(0.0, |l| l.0),
                         low_steer_speed: low.map_or(0.0, |l| l.1),
-                        spring: (f("FrontWheelSuspStrength")?, f("RearWheelSuspStrength")?),
-                        damping: (f("FrontWheelSuspDamp")?, f("RearWheelSuspDamp")?),
+                        high_speed_loss: or("HighSpeedSteerLoss", d.high_speed_loss),
+                        loss_braking: or("HighSpeedSteerLossBrakeMulti", d.loss_braking),
+                        loss_coasting: or("HighSpeedSteerLossNoThrottleMulti", d.loss_coasting),
+                        inertia: or("SteeringInertia", d.inertia),
+                        no_input_inertia: or("SteerNoInputInertia", d.no_input_inertia),
+                        diff_sign_inertia: or("SteerDiffSignInertia", d.diff_sign_inertia),
                     })
                 })(),
-                tracks: (|| {
+                springs: (|| {
+                    let r = *car.of_template(id).first()?;
+                    let d = Springs::DEFAULT;
+                    let f = |name, or: f32| car.float(r, name_hash(name)).unwrap_or(or);
+                    let pair = |front, rear, or: (f32, f32)| (f(front, or.0), f(rear, or.1));
+                    let length = |front, rear, or| {
+                        let (a, b) = pair(front, rear, or);
+                        (a.max(0.0), b.max(0.0))
+                    };
+                    Some(Springs {
+                        strength: pair(
+                            "FrontWheelSuspStrength",
+                            "RearWheelSuspStrength",
+                            d.strength,
+                        ),
+                        damping: pair("FrontWheelSuspDamp", "RearWheelSuspDamp", d.damping),
+                        stretch: length(
+                            "FrontWheelSuspExpLength",
+                            "RearWheelSuspExpLength",
+                            d.stretch,
+                        ),
+                        squeeze: length(
+                            "FrontWheelSuspCmpLength",
+                            "RearWheelSuspCmpLength",
+                            d.squeeze,
+                        ),
+                        extra: f("ExtraInvisibleSpringLength", d.extra).max(0.0),
+                        gravity_factor: f("GravityFactor", d.gravity_factor),
+                    })
+                })(),
+                tyres: (|| {
+                    let r = *car.of_template(id).first()?;
+                    let d = Tyres::DEFAULT;
+                    let f = |name, or: f32| car.float(r, name_hash(name)).unwrap_or(or).max(0.0);
+                    let pair = |front, rear, or: (f32, f32)| (f(front, or.0), f(rear, or.1));
+                    Some(Tyres {
+                        rolling: pair("FrontWheelFrictionFwd", "RearWheelFrictionFwd", d.rolling),
+                        brake: pair("FrontBrake", "RearBrake", d.brake),
+                        emergency: pair("FrontEmergencyBrake", "RearEmergencyBrake", d.emergency),
+                        side: pair("FrontWheelFrictionSide", "RearWheelFrictionSide", d.side),
+                        low_speed: f("LowSpeedLimit", d.low_speed * 3.6) / 3.6,
+                        high_speed_grip: f("HiSpeedGrip", d.high_speed_grip),
+                        sway: f("SuspSteerSwayAmp", d.sway),
+                        max_slope: match car.word(r, name_hash("MaxSlope")) {
+                            Some(v) if v != 0 => 60f32.to_radians(),
+                            _ => d.max_slope,
+                        },
+                    })
+                })(),
+                tank: (|| {
                     let r = *tank.of_template(id).first()?;
-                    let f = |name| tank.float(r, name_hash(name));
-                    let curve = [
-                        f("EngineTorqueRatio0")?,
-                        f("EngineTorqueRatio1")?,
-                        f("EngineTorqueRatio2")?,
-                        f("EngineTorqueRatio3")?,
-                    ];
-                    curve
-                        .iter()
-                        .all(|c| (0.0..=1.0).contains(c))
-                        .then_some(curve)
+                    let f = |name, default| tank.float(r, name_hash(name)).unwrap_or(default);
+                    Some(TankTuning {
+                        max_speed: f("MaxSpeed", 40.0) / 3.6,
+                        brake: f("Brake", 20.0),
+                        steer_speed: f("SteerSpeed", 15.0),
+                        steer_inertia: (f("SteerInertia", 0.0), f("SteerInertiaNoInput", 0.0)),
+                        friction: (f("FwdFriction", 1.0), f("SideFriction", 30.0)),
+                        engine_height: f("EngineOffsetY", -0.25),
+                        gravity_factor: f("GravityFactor", 2.0),
+                        steer_loss: f("HiSpeedSteerLoss", 0.0),
+                        high_speed_grip: f("HiSpeedGrip", 1.0),
+                        ang_damp: [f("AngDampX", 0.5), f("AngDampY", 1.0), f("AngDampZ", 5.0)],
+                        centre_of_mass: tank
+                            .vector(r, name_hash("CenterOfMassOffset"))
+                            .unwrap_or([0.0; 3]),
+                        torque: f("EngineTorque", 1000.0),
+                        engine_inertia: f("EngineInertia", 0.95),
+                        curve: [
+                            (0.0, f("EngineTorqueRatio0", 1.0)),
+                            (f("EngineTorquePos1", 0.25), f("EngineTorqueRatio1", 0.55)),
+                            (f("EngineTorquePos2", 0.5), f("EngineTorqueRatio2", 0.55)),
+                            (1.0, f("EngineTorqueRatio3", 0.1)),
+                        ],
+                        springs: (
+                            f("SpringStrength", 9.0),
+                            f("SpringDamp", 0.4),
+                            f("SpringExpLength", 0.17),
+                            f("SpringCmpLength", 0.3),
+                        ),
+                    })
                 })(),
                 flight: (|| {
                     let f = |name| heli.get(id, name);
@@ -1042,17 +1614,40 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                 })(),
                 bike: (|| {
                     let r = *car.of_template(id).first()?;
-                    let f = |name| car.float(r, name_hash(name)).filter(|v| *v >= 0.0);
+                    let f = |name, default| car.float(r, name_hash(name)).unwrap_or(default);
                     let b = BikeTuning {
-                        roll: f("BikeRollStabilityStrength")?,
+                        roll_rate: f("BikeRollAngVelForMaxRoll", 0.0),
+                        roll_angle: (
+                            f("BikeRollAngleAtLoSpeed", 0.0),
+                            f("BikeRollAngleAtHiSpeed", 0.0),
+                        ),
+                        roll_input: f("BikeRollAngleFromInput", 0.0),
+                        roll: f("BikeRollStabilityStrength", 0.0),
+                        wheelie: f("BikeWheeliePitch", 0.0),
+                        pitch_strength: (
+                            f("BikeWheeliePitchStrengthUp", 0.0),
+                            f("BikeWheeliePitchStrengthDown", 0.0),
+                        ),
+                        pitch_high_speed: f("BikeWheeliePitchHiSpeedRatio", 0.0),
+                        wheelie_steer: f("BikeWheelieSteerAbility", 0.0),
+                        side_damp: f("BikeWheelieSideDamp", 0.0),
                         damp: [
-                            f("BikeExtraDampRoll")?,
-                            f("BikeExtraDampPitch")?,
-                            f("BikeExtraDampYaw")?,
+                            f("BikeExtraDampRoll", 0.0),
+                            f("BikeExtraDampPitch", 0.0),
+                            f("BikeExtraDampYaw", 0.0),
                         ],
-                        air: (f("BikeAirControlPitch")?, f("BikeAirControlYaw")?),
+                        air: (f("BikeAirControlPitch", 0.0), f("BikeAirControlYaw", 0.0)),
+                        low_speed: f("LowSpeedLimit", 30.0) / 3.6,
+                        inertia: [
+                            f("InertiaTensorX", 2.0),
+                            f("InertiaTensorY", 1.0),
+                            f("InertiaTensorZ", 1.5),
+                        ],
+                        centre_of_mass: car
+                            .vector(r, name_hash("CenterOfMassOffset"))
+                            .unwrap_or([0.0; 3]),
                     };
-                    (b.roll > 0.0).then_some(b)
+                    b.balances().then_some(b)
                 })(),
                 chase: (|| {
                     let records = heli_camera.of_template(id);
@@ -1252,69 +1847,75 @@ mod tests {
             radius: 0.39,
             torque_at: (0.8, 1.0),
             reverse_speed: 55.0 / 3.6,
+            slip: 1000.0,
+            split: 1.0,
         }
     }
 
-    // Its top gear at its optimum rpm is its template's `MaxSpeed`, 85
-    // km/h, near enough.
+    // Its torque as the 360 code works it out (0x821A0528): its most at
+    // the optimum less a tenth dragging; at idle 0.8 of it less 0.15;
+    // at its most rpm nothing but 0.3 dragging.
     #[test]
-    fn the_m151_tops_out_in_fifth_near_its_max_speed() {
+    fn the_engine_gives_its_torque_as_the_360s() {
         let e = m151();
-        assert_eq!(e.gear_count(), 5);
-        let kmh = 3000.0 / (e.primary * 1.5) * std::f32::consts::TAU / 60.0 * e.radius * 3.6;
-        assert!((kmh - 85.0).abs() < 2.0, "{kmh}");
-        assert_eq!(e.gear(85.0 / 3.6), 4);
-        assert!((e.rpm_at(1.5, 85.0 / 3.6) - 3034.0).abs() < 5.0);
+        let at = |rpm: f32, throttle: f32| {
+            let mut g = Gearbox {
+                clutch: 1.0,
+                ..Gearbox::default()
+            };
+            e.step(&mut g, 0.0, throttle, rpm / e.ratio(1), false)
+        };
+        let close = |a: f32, b: f32| assert!((a - b).abs() < 0.01, "{a} {b}");
+        close(at(3000.0, 1.0), 130.0 - 13.0);
+        close(at(900.0, 1.0), 0.8 * 130.0 - 0.15 * 130.0);
+        close(at(12_000.0, 1.0), -0.3 * 130.0);
+        // Off the throttle it only drags: a tenth at the optimum.
+        close(at(3000.0, 0.0), -13.0);
+        // Halfway from the optimum to idle: 1 - 0.2 / 4 of it.
+        close(at(1950.0, 1.0), 0.95 * 130.0 - 0.125 * 130.0);
     }
 
-    // It pulls away in first at its idle torque (0.8 of 130 Nm through
-    // 3.5 x 4 on 0.39 m wheels: 3.7 kN) and changes up as it goes.
+    // Under idle the clutch slips: standing, the engine turns at idle plus
+    // the throttle's share of its slip.
     #[test]
-    fn the_engine_pulls_through_its_gears() {
+    fn the_clutch_slips_under_idle() {
         let e = m151();
-        assert_eq!(e.gear(0.0), 0);
-        assert!((e.push(0.0, false) - 3733.0).abs() < 2.0);
-        let gears: Vec<usize> = (0..25).map(|v| e.gear(v as f32)).collect();
-        assert!(gears.windows(2).all(|w| w[1] >= w[0]), "{gears:?}");
-        assert_eq!(gears[24], 4);
-        // Harder in first than in fifth; nothing past its most rpm.
-        assert!(e.push(5.0, false) > e.push(23.0, false));
-        assert_eq!(e.torque_factor(12_001.0), 0.0);
-        assert_eq!(e.torque_factor(3000.0), 1.0);
-        assert!((e.torque_factor(500.0) - 0.8).abs() < 1e-6);
-        // Backing up in reverse's ratio.
-        assert!((e.push(0.0, true) - 130.0 * 0.8 * 3.5 * 3.7 / 0.39).abs() < 2.0);
+        let mut g = Gearbox::default();
+        e.step(&mut g, 1.0 / 60.0, 0.5, 0.0, false);
+        assert!((g.rpm - 1400.0).abs() < 1e-3, "{}", g.rpm);
     }
 
-    // Gap round 24: it changes up at its 4,000 rpm and back down only
-    // below its 2,500, one gear at a time, so it never changes straight
-    // back (by speed alone it changed down at 4,000 rpm in the gear
-    // below, and the garbage truck hunted between gears 225 times in a
-    // run).
+    // It changes up above its 4,000 rpm and down below its 2,500, one gear
+    // at a time; into reverse from first when asked, pushing backwards,
+    // and back to first when not.
     #[test]
-    fn the_gearbox_changes_up_and_down_at_its_shift_speeds() {
+    fn the_gearbox_changes_as_the_360s() {
         let e = m151();
-        let at = |gear: usize, rpm: f32| rpm / e.rpm_at(e.gears[gear], 1.0);
-        assert_eq!(e.shift(0, at(0, 3990.0)), 0);
-        assert_eq!(e.shift(0, at(0, 4010.0)), 1);
-        // Just changed up: 4,010 x 3.1 / 4 = 3,108 rpm in second.
-        assert_eq!(e.shift(1, at(0, 4010.0)), 1);
-        assert_eq!(e.shift(1, at(1, 2510.0)), 1);
-        assert_eq!(e.shift(1, at(1, 2490.0)), 0);
-        // Its top gear and first are the ends.
-        assert_eq!(e.shift(4, 60.0), 4);
-        assert_eq!(e.shift(0, 0.0), 0);
-        // Rolling at 1,500 rpm in fifth it changes down one at a time,
-        // to second (3,100 rpm there).
-        let mut gear = 4;
-        let mut seen = vec![gear];
-        for _ in 0..5 {
-            gear = e.shift(gear, at(4, 1500.0));
-            seen.push(gear);
-        }
-        assert_eq!(seen, [4, 3, 2, 1, 1, 1]);
-        // It pulls harder in a lower gear.
-        assert!(e.push_in(0, 5.0, false) > e.push_in(1, 5.0, false));
+        let mut g = Gearbox::default();
+        let first = |rpm: f32| rpm / e.ratio(1);
+        e.step(&mut g, 0.01, 1.0, first(3990.0), false);
+        assert_eq!(g.gear, 1);
+        e.step(&mut g, 0.01, 1.0, first(4010.0), false);
+        assert_eq!(g.gear, 2);
+        // In second that is 3,108 rpm: it stays.
+        e.step(&mut g, 0.01, 1.0, first(4010.0), false);
+        assert_eq!(g.gear, 2);
+        e.step(&mut g, 0.01, 1.0, 2490.0 / e.ratio(2), false);
+        assert_eq!(g.gear, 1);
+        let back = e.step(&mut g, 0.01, 1.0, 0.0, true);
+        assert_eq!(g.gear, 0);
+        assert!(back < 0.0, "{back}");
+        e.step(&mut g, 0.01, 1.0, 0.0, false);
+        assert_eq!(g.gear, 1);
+        // Its clutch delay holds the gear it changed to.
+        let slow = EngineTuning {
+            clutch_delay: 0.5,
+            ..e
+        };
+        let mut g = Gearbox::default();
+        slow.step(&mut g, 0.01, 1.0, first(4010.0), false);
+        slow.step(&mut g, 0.01, 1.0, 5000.0 / e.ratio(2), false);
+        assert_eq!(g.gear, 2);
     }
 
     // A gearbox with fewer than five gears stops at its last.
@@ -1324,8 +1925,12 @@ mod tests {
             gears: [3.0, 2.0, 1.0, 0.0, 0.0],
             ..m151()
         };
-        assert_eq!(e.gear_count(), 3);
-        assert_eq!(e.gear(60.0), 2);
+        let mut g = Gearbox {
+            gear: 3,
+            ..Gearbox::default()
+        };
+        e.step(&mut g, 0.01, 1.0, 9000.0 / e.ratio(3), false);
+        assert_eq!(g.gear, 3);
     }
 
     // A table laid out as the game's: two targets, three kinds of damage.
@@ -1388,5 +1993,68 @@ mod tests {
         // A tank takes no round at all: nothing to scale.
         assert_eq!(t.weak_point(tank, weak, bullet), None);
         assert_eq!(t.weak_point(tank, name_hash("Car"), rocket), None);
+    }
+
+    // Footing: whole up to 20 degrees under its steepest, none at it.
+    #[test]
+    fn footing_falls_over_the_last_20_degrees() {
+        let t = Tyres::DEFAULT;
+        let close = |a: f32, b: f32| assert!((a - b).abs() < 1e-5, "{a} {b}");
+        close(t.footing(20f32.to_radians()), 1.0);
+        close(t.footing(35f32.to_radians()), 0.5);
+        close(t.footing(50f32.to_radians()), 0.0);
+        let steep = Tyres {
+            max_slope: 60f32.to_radians(),
+            ..t
+        };
+        close(steep.footing(45f32.to_radians()), 0.75);
+    }
+
+    // Easing keeps its share of the way left each 1/60 s, a share of a
+    // step for the rest (0x824BB050).
+    #[test]
+    fn ease_keeps_its_share_each_sixtieth() {
+        let close = |a: f32, b: f32| assert!((a - b).abs() < 1e-5, "{a} {b}");
+        close(ease(1.0, 0.0, 0.9, 1.0 / 60.0), 0.9);
+        close(ease(1.0, 0.0, 0.9, 3.0 / 60.0), 0.729);
+        close(ease(1.0, 0.0, 0.9, 1.5 / 60.0), 0.9 - 0.5 * 0.09);
+        close(ease(1.0, 0.0, 0.0, 1.0 / 60.0), 0.0);
+        close(ease(1.0, 0.0, 0.5, 20.0), 0.0);
+    }
+
+    // An axle's slowing as the 360 code works it out (0x8219FB08).
+    #[test]
+    fn brakes_slow_as_the_360_code_has_them() {
+        let b = Tyres {
+            rolling: (0.5, 0.4),
+            brake: (7.0, 6.0),
+            emergency: (0.5, 1.5),
+            side: (1.5, 1.2),
+            low_speed: 30.0 / 3.6,
+            high_speed_grip: 0.8,
+            sway: 1.0,
+            max_slope: std::f32::consts::FRAC_PI_4,
+        };
+        let close = |a: f32, b: f32| assert!((a - b).abs() < 1e-5, "{a} {b}");
+        // Rolling: three times as hard standing, once from its low speed
+        // limit up, none at full throttle.
+        close(b.slowing(true, 0.0, 0.0, 0.0, 0.0, 0.0), 1.5);
+        close(b.slowing(true, 15.0 / 3.6, 0.0, 0.0, 0.0, 0.0), 1.0);
+        close(b.slowing(false, 20.0, 0.0, 0.0, 0.0, 0.0), 0.4);
+        close(b.slowing(true, 20.0, 1.0, 0.0, 0.0, 0.0), 0.0);
+        // Braking: from rolling to its brake.
+        close(b.slowing(true, 20.0, 0.0, 1.0, 0.0, 0.0), 7.0);
+        close(b.slowing(false, 20.0, 0.0, 0.5, 0.0, 0.0), 3.2);
+        // The handbrake: its sideways grip times 0.33 + 0.67 x 0.5 x (1 -
+        // 0.55 |steer|) at the front; a handbrake over 1 is itself.
+        close(
+            b.slowing(true, 20.0, 0.0, 0.0, 1.0, 0.0),
+            1.5 * (0.33 + 0.335),
+        );
+        close(
+            b.slowing(true, 20.0, 0.0, 0.0, 1.0, 1.0),
+            1.5 * (0.33 + 0.335 * 0.45),
+        );
+        close(b.slowing(false, 20.0, 0.0, 0.0, 1.0, 0.0), 1.5);
     }
 }

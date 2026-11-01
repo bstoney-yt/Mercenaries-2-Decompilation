@@ -554,6 +554,8 @@ pub struct HudState {
     /// The pad's (or the touch controls') left stick, x right and y up,
     /// for the PDA's map.
     pub stick: [f32; 2],
+    /// The pad's right stick, x right and y up: the PDA map's zoom.
+    pub right_stick: [f32; 2],
     /// Seconds since the last state.
     pub dt: f64,
     /// Health, 0..=100: hers, or the vehicle's she is in.
@@ -624,6 +626,9 @@ pub struct HudState {
     /// (`HUD_objective_deliverable`...), colour (RGBA). Their icons are
     /// read for the world's markers too ([`GameHud::paint_texture`]).
     pub blips: Vec<([f32; 3], String, [u8; 4])>,
+    /// Other textures the world's icons draw, by name hash: the pickups'
+    /// markers' ([`crate::pickup_marker`]).
+    pub textures: Vec<u32>,
     /// Where the reticle goes: the screen point her weapon (or her
     /// vehicle's gun) aims at, -1..=1 across and up the screen as
     /// `Gui.GetReticlePosition` answers. None hides it (down, or in a
@@ -649,6 +654,10 @@ pub struct HudState {
     /// codes ([`flash_key`]): the PDA's movies' own `Key` listeners take
     /// them (the map's Home shows the current contract).
     pub keys: Vec<(i32, bool)>,
+    /// The pad's buttons and stick pushes as the PDA's keys
+    /// ([`crate::pad::Pad::pda_keys`]): for its movies only, not its
+    /// map's movement keys (the stick moves the map itself).
+    pub pad_keys: Vec<(i32, bool)>,
     /// The GUI's named buttons pressed (`"selection"`: Enter), for the
     /// scripts' `Button` events (the contract fanfare's skip).
     pub buttons: Vec<String>,
@@ -753,6 +762,9 @@ pub fn flash_key(key: egui::Key) -> Option<i32> {
         ArrowDown => 40,
         Insert => 45,
         Delete => 46,
+        // The right stick's down and right in the PDA (`pad::PDA_STICK_KEYS`).
+        Semicolon => 186,
+        Quote => 222,
         OpenBracket => 219,
         CloseBracket => 221,
         _ => return None,
@@ -902,9 +914,13 @@ impl HudState {
                         .localized_keys(&v.spec.label, v.spec.model)
                 })
                 .unwrap_or_default(),
-            cannon: vehicle.and_then(|v| Some((v.rounds()?, v.spec.tuning.gun?.rounds))),
+            // The driver's guns' counts, only in the driver's seat (a
+            // gunner fires her seat's own).
+            cannon: vehicle
+                .filter(|_| game.combat.seat == 0)
+                .and_then(|v| Some((v.rounds()?, v.spec.tuning.gun?.rounds))),
             machine_gun: vehicle
-                .filter(|_| game.combat.vehicle_gun == 1)
+                .filter(|_| game.combat.seat == 0 && game.combat.vehicle_gun == 1)
                 .and_then(|v| v.machine_gun())
                 .and_then(|(w, left)| Some((w.ui?, left, w.clip))),
             heading: game.view_heading().to_degrees(),
@@ -942,6 +958,8 @@ impl HudState {
         gui_calls.extend(later.gui_calls.iter().cloned());
         let mut keys = std::mem::take(&mut self.keys);
         keys.extend(later.keys.iter().copied());
+        let mut pad_keys = std::mem::take(&mut self.pad_keys);
+        pad_keys.extend(later.pad_keys.iter().copied());
         let mut buttons = std::mem::take(&mut self.buttons);
         buttons.extend(later.buttons.iter().cloned());
         let mut dialog_keys = std::mem::take(&mut self.dialog_keys);
@@ -960,6 +978,7 @@ impl HudState {
             hud_calls,
             gui_calls,
             keys,
+            pad_keys,
             buttons,
             dialog_keys,
             pause_captured,
@@ -1488,7 +1507,19 @@ impl GameHud {
         rect: egui::Rect,
         colour: Color32,
     ) -> bool {
-        let Some(Some(texture)) = self.textures.get(&texture_hash(name)) else {
+        self.paint_texture_hash(painter, texture_hash(name), rect, colour)
+    }
+
+    /// [`paint_texture`](Self::paint_texture) by the texture's name hash
+    /// (one of [`HudState::textures`]).
+    pub fn paint_texture_hash(
+        &self,
+        painter: &egui::Painter,
+        hash: u32,
+        rect: egui::Rect,
+        colour: Color32,
+    ) -> bool {
+        let Some(Some(texture)) = self.textures.get(&hash) else {
             return false;
         };
         let uv = egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
@@ -1635,9 +1666,11 @@ end
 /// movie's `leftAnalog`, which moves the map under its cursor). Inferred
 /// from the alpha's renders: the movie moves the map's picture by the pair
 /// as given, so the view's way across is the stick's reversed. Answers
-/// whether the PDA's map took it.
+/// whether the PDA's map took it. The right stick comes in the same
+/// event (`RightAnalogX`/`Y`, which `_HandleInput` passes to the movie's
+/// `rightAnalog`: the map's zoom), as given.
 const PDA_STICK: &str = r#"
-local x, y = ...
+local x, y, rx, ry = ...
 local module = rawget(_G, "MrxGuiPda")
 if type(module) ~= "table" or type(module._HandleInput) ~= "function" then
     return false
@@ -1673,7 +1706,9 @@ if widget.CustomData.bMapMode == nil then
 end
 -- The movie moves the map's picture by the pair (right, down): up the
 -- screen is north, and the view goes against x, so x is reversed.
-module._HandleInput(widget, { LeftAnalogX = -x, LeftAnalogY = y })
+module._HandleInput(widget, {
+    LeftAnalogX = -x, LeftAnalogY = y, RightAnalogX = rx, RightAnalogY = ry,
+})
 return true
 "#;
 
@@ -1953,7 +1988,7 @@ struct Thread {
     /// The PDA's movement keys held ([`PDA_STICK_KEYS`]), and the stick
     /// they last pushed its map with.
     pda_held: HashSet<i32>,
-    pda_stick: [f32; 2],
+    pda_stick: [f32; 4],
     /// HUD updates since the PDA's movie loaded (`None`: not yet), and
     /// since `TogglePDA` was last sent.
     pda_ready: Option<u32>,
@@ -2137,7 +2172,7 @@ impl Thread {
             pause_movie: None,
             options_told: None,
             pda_held: HashSet::new(),
-            pda_stick: [0.0; 2],
+            pda_stick: [0.0; 4],
             pda_ready: None,
             since_toggle: u32::MAX,
             pda_scripted: None,
@@ -2290,6 +2325,10 @@ impl Thread {
         if self.pda_shown || self.fanfare_up() || self.pause_up() {
             self.keys.extend(state.keys.iter().copied());
         }
+        if self.pda_shown && !state.pad_keys.is_empty() {
+            log.push(format!("pda: pad keys {:?}", state.pad_keys));
+            self.keys.extend(state.pad_keys.iter().copied());
+        }
         // The PDA's map moves while its movement keys are held, as the
         // pad's left stick moves it.
         for &(code, down) in &state.keys {
@@ -2304,18 +2343,20 @@ impl Thread {
         }
         // The movement keys and the pad's stick together, sped up.
         let keys = pda_stick(&self.pda_held);
+        // The right stick zooms, as pushed.
         let stick = if self.pda_shown {
-            [0, 1].map(|i| (keys[i] + state.stick[i]).clamp(-1.0, 1.0) * PDA_PAN)
+            let [x, y] = [0, 1].map(|i| (keys[i] + state.stick[i]).clamp(-1.0, 1.0) * PDA_PAN);
+            [x, y, state.right_stick[0], state.right_stick[1]]
         } else {
-            [0.0; 2]
+            [0.0; 4]
         };
-        if stick != [0.0; 2] || self.pda_stick != [0.0; 2] {
+        if stick != [0.0; 4] || self.pda_stick != [0.0; 4] {
             let took = self
                 .mission
                 .lua()
                 .load(PDA_STICK)
                 .set_name("=m2-hud pda stick")
-                .call::<bool>((stick[0], stick[1]));
+                .call::<bool>((stick[0], stick[1], stick[2], stick[3]));
             if stick != self.pda_stick {
                 log.push(format!("pda: stick {stick:?} ({took:?})"));
             }
@@ -2328,6 +2369,11 @@ impl Thread {
         self.pause_calls(state, &mut log);
         if self.pause_up() {
             self.mouse(PAUSE_MOVIE, state, &mut log);
+        } else if self.pda_shown {
+            // The PC's PDA is a mouse screen too: its tabs and its
+            // buttons (Detail, Browser, Beacon) are the movies' own
+            // (`topbar`'s `onMove`/`onDown`, the map's on `_level1`).
+            self.mouse(PDA_MOVIES[0], state, &mut log);
         }
         self.play_flash(dt, &mut log);
         self.pause_answers(&mut log);
@@ -2592,6 +2638,7 @@ impl Thread {
         // The objective markers' icons, for the world's markers
         // ([`GameHud::paint_texture`]) whether or not the minimap is up.
         want.extend(state.blips.iter().map(|(_, icon, _)| name_hash(icon)));
+        want.extend(state.textures.iter().copied());
         // The pad's Y, for the use prompts with a pad (`crate::ui`).
         if state.pad {
             want.push(name_hash(crate::pad::Button::Y.texture()));
@@ -5944,17 +5991,43 @@ mod tests {
         assert!((x - 2.0).abs() < 1e-5 && y.abs() < 1e-5, "{x} {y}");
     }
 
+    /// The PDA's `ControllerInput` event carries both sticks: the left
+    /// (x reversed) moves the map, the right zooms it, as pushed.
+    #[test]
+    fn the_pdas_controller_event_carries_both_sticks() {
+        let lua = Lua::new();
+        lua.load(
+            r#"
+            got = nil
+            MrxGuiPda = { _HandleInput = function(w, e) got = e end }
+            PdaWidget = { CustomData = { oMapFlash = true } }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let took: bool = lua.load(PDA_STICK).call((0.5, 0.25, 0.0, -1.0)).unwrap();
+        assert!(took);
+        let got: mlua::Table = lua.globals().get("got").unwrap();
+        let read = |k: &str| got.get::<f32>(k).unwrap();
+        assert_eq!(read("LeftAnalogX"), -0.5);
+        assert_eq!(read("LeftAnalogY"), 0.25);
+        assert_eq!(read("RightAnalogX"), 0.0);
+        assert_eq!(read("RightAnalogY"), -1.0);
+    }
+
     #[test]
     fn later_states_add_their_events() {
         let mut a = HudState {
             dt: 0.1,
             hurts: vec![(10.0, 0.0)],
             hp: 90.0,
+            pad_keys: vec![(219, true)],
             ..HudState::default()
         };
         a.merge(HudState {
             dt: 0.2,
             hurts: vec![(5.0, 90.0)],
+            pad_keys: vec![(219, false)],
             messages: vec![ObjectiveMessage {
                 kind: "add".into(),
                 icon: 5,
@@ -5966,6 +6039,11 @@ mod tests {
         assert!((a.dt - 0.3).abs() < 1e-9);
         assert_eq!(a.hurts.len(), 2);
         assert_eq!(a.messages.len(), 1);
+        assert_eq!(
+            a.pad_keys,
+            [(219, true), (219, false)],
+            "a press and its let go"
+        );
         assert_eq!(a.hp, 85.0);
     }
 

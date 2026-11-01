@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 
 use m2_assets::layer::{LAYER_TYPE, Placement, TEMPLATE_DB_TYPE};
+use m2_assets::lua::SCRIPT_TYPE;
 use m2_assets::model::MODEL_TYPE;
 use m2_assets::model::Material;
 use m2_assets::path::PATH_TYPE;
@@ -275,6 +276,11 @@ pub struct Templates {
     pub names: HashMap<u32, String>,
     /// How the templates that say so handle and fight, by id.
     pub tuning: HashMap<u32, VehicleTuning>,
+    /// The light templates (an explosion's flash, a fire's glow),
+    /// by id ([`crate::lights`]).
+    pub lights: HashMap<u32, crate::lights::LightSpec>,
+    /// What each template sets off with it, and where ([`crate::lights::links`]).
+    pub links: HashMap<u32, Vec<crate::lights::Link>>,
     /// The templates whose props move on their own, by id.
     pub motions: HashMap<u32, PropMotion>,
     /// What templates leave when destroyed, and what pickups give.
@@ -287,6 +293,10 @@ pub struct Templates {
     pub durability: HashMap<u32, crate::durability::Durability>,
     /// The blasts of those with `Explosive`, by id.
     pub explosions: HashMap<u32, crate::durability::Explosion>,
+    /// The compiled script (`ObjectScript`) of those blasts that run one,
+    /// by id, as the archive holds it (the satellite bomb's sets the
+    /// light: `m2_game::atmosphere_script`).
+    pub blast_scripts: HashMap<u32, Vec<u8>>,
     /// How the templates that can be hijacked are, by id.
     pub hijack: HashMap<u32, Vec<crate::hijack::HijackEntrance>>,
     /// The radio templates' playlist and reach, by id
@@ -297,11 +307,20 @@ pub struct Templates {
     /// Where each template's entrances are got in by (`DriverHatch`), by
     /// id ([`crate::hijack::entrance_points`]).
     pub entrance_points: HashMap<u32, Vec<u32>>,
+    /// Where each vehicle template's driver sits and gets out, by id
+    /// ([`crate::seats::read`]).
+    pub driver_points: HashMap<u32, crate::seats::DriverPoints>,
+    /// Each vehicle template's seats and entrances, by id
+    /// ([`crate::seats::read_vehicles`]).
+    pub vehicle_seats: HashMap<u32, std::sync::Arc<crate::seats::VehicleSeats>>,
     /// How air strikes' ordnance flies and what its blasts do.
     pub ordnance: crate::ordnance::Ordnance,
     /// The effects each template shows, by id
     /// ([`crate::particles::template_effects`]).
     pub effects: HashMap<u32, Vec<u32>>,
+    /// How long each of those runs, in the same order
+    /// ([`crate::particles::template_runs`]).
+    pub effect_runs: HashMap<u32, Vec<crate::particles::EffectRun>>,
     /// How vehicles break each template's objects running into them.
     pub crashable: HashMap<u32, crate::durability::Crash>,
     /// The parts of a template's objects vehicles break one at a time
@@ -314,6 +333,10 @@ pub struct Templates {
     /// What each piece of a template's objects weighs once broken off,
     /// kg, by id ([`crate::durability::piece_masses`]).
     pub piece_masses: HashMap<u32, f32>,
+    /// How hard blasts push each template's objects, of their push
+    /// (`ExplosionFudge`), by id, where it says
+    /// ([`crate::durability::explosion_fudges`]).
+    pub explosion_fudges: HashMap<u32, f32>,
     /// The templates that stand already destroyed, by id: those whose
     /// `Health` is 0. All 201 such are ruins (`_marsh_bridgemid_ruined`,
     /// `AMX30_RUIN`), each with the model of its intact twin, whose
@@ -339,6 +362,9 @@ pub struct Templates {
     /// Each template's `_PropPhysics`, by id: the props that move when
     /// hit ([`crate::durability::prop_physics`]).
     pub prop_physics: HashMap<u32, crate::durability::PropPhysics>,
+    /// Each template's gravity scale where it gives one, by id
+    /// ([`crate::durability::gravity_scales`]).
+    pub gravity_scales: HashMap<u32, f32>,
     /// What each projectile does where it lands, by id
     /// ([`crate::durability::projectiles`]).
     pub projectiles: HashMap<u32, crate::durability::Projectile>,
@@ -660,6 +686,73 @@ impl Templates {
             .or_else(|| self.tuning_for_model(model))
     }
 
+    /// The driver's points of template `name` (a vehicle's own), else of
+    /// the first by name of `model`'s templates that give them.
+    pub fn driver_points_for(&self, name: &str, model: u32) -> Option<crate::seats::DriverPoints> {
+        if let Some(&p) = self
+            .ids(name)
+            .iter()
+            .find_map(|id| self.driver_points.get(id))
+        {
+            return Some(p);
+        }
+        let mut ids: Vec<(String, u32)> = self
+            .names
+            .iter()
+            .filter(|(_, n)| self.get(n).is_some_and(|t| t.model == Some(model)))
+            .map(|(&id, n)| (n.to_ascii_lowercase(), id))
+            .collect();
+        ids.sort();
+        ids.iter()
+            .find_map(|(_, id)| self.driver_points.get(id).copied())
+    }
+
+    /// The seats and entrances of template `name` (a vehicle's own), else
+    /// of the first by name of `model`'s templates that give them (as
+    /// [`Self::driver_points_for`]).
+    pub fn vehicle_seats_for(
+        &self,
+        name: &str,
+        model: u32,
+    ) -> Option<std::sync::Arc<crate::seats::VehicleSeats>> {
+        if let Some(s) = self
+            .ids(name)
+            .iter()
+            .find_map(|id| self.vehicle_seats.get(id))
+        {
+            return Some(s.clone());
+        }
+        let mut ids: Vec<(String, u32)> = self
+            .names
+            .iter()
+            .filter(|(_, n)| self.get(n).is_some_and(|t| t.model == Some(model)))
+            .map(|(&id, n)| (n.to_ascii_lowercase(), id))
+            .collect();
+        ids.sort();
+        ids.iter()
+            .find_map(|(_, id)| self.vehicle_seats.get(id).cloned())
+    }
+
+    /// The labels (name hashes) of template `name` (a vehicle's own), else
+    /// of the first by name of `model`'s templates that has any (as
+    /// [`Self::vehicle_seats_for`]).
+    pub fn vehicle_labels_for(&self, name: &str, model: u32) -> Vec<u32> {
+        let labels = |id: &u32| self.leavings.labels.get(id).filter(|l| !l.is_empty());
+        if let Some(l) = self.ids(name).iter().find_map(labels) {
+            return l.clone();
+        }
+        let mut ids: Vec<(String, u32)> = self
+            .names
+            .iter()
+            .filter(|(_, n)| self.get(n).is_some_and(|t| t.model == Some(model)))
+            .map(|(&id, n)| (n.to_ascii_lowercase(), id))
+            .collect();
+        ids.sort();
+        ids.iter()
+            .find_map(|(_, id)| labels(id).cloned())
+            .unwrap_or_default()
+    }
+
     /// The parts' health of template `name` (a vehicle's own), else of
     /// the first by name of `model`'s templates that give them.
     pub fn part_healths_for(
@@ -847,11 +940,14 @@ impl Templates {
                 .collect(),
             infos,
             piece_masses: crate::durability::piece_masses(&db, &names),
+            explosion_fudges: crate::durability::explosion_fudges(&db),
             names: names
                 .into_iter()
                 .map(|(id, name)| (id, name.to_owned()))
                 .collect(),
             tuning: crate::tuning::read(&db, damage.as_ref()),
+            lights: crate::lights::read(&db),
+            links: crate::lights::links(&db),
             part_healths: crate::vehicle_damage::read(&db),
             leavings: crate::pickup::read(&db),
             ruined: ruined(&db),
@@ -864,12 +960,19 @@ impl Templates {
             music_sources: crate::music_source::read(&db),
             grapple: crate::grapple::read(&db),
             entrance_points: crate::hijack::entrance_points(&db),
+            driver_points: crate::seats::read(&db),
+            vehicle_seats: crate::seats::read_vehicles(&db)
+                .into_iter()
+                .map(|(id, s)| (id, std::sync::Arc::new(s)))
+                .collect(),
             ordnance: crate::ordnance::read(&db),
             effects: crate::particles::template_effects(&db),
+            effect_runs: crate::particles::template_runs(&db),
             crashable: crate::durability::crashable(&db),
             crash_parts: crate::durability::crash_parts(&db),
             sound_keys: crate::durability::sound_keys(&db),
             prop_physics: crate::durability::prop_physics(&db),
+            gravity_scales: crate::durability::gravity_scales(&db),
             projectiles: crate::durability::projectiles(&db),
             modifiers: crate::durability::modifier_keys(&db),
             health: crate::tuning::healths(&db),
@@ -880,7 +983,15 @@ impl Templates {
             arms: crate::weapons::read(&db),
             localized: localized_names(&db),
             damage,
+            blast_scripts: HashMap::new(),
         };
+        for (id, script) in db.hashes("ObjectScript") {
+            if templates.explosions.contains_key(&id)
+                && let Ok(chunk) = source.asset(script, SCRIPT_TYPE)
+            {
+                templates.blast_scripts.insert(id, chunk);
+            }
+        }
         crate::standin::add_supply_drops(&mut templates);
         crate::standin::arm_the_osprey(&mut templates);
         (templates, atmosphere)

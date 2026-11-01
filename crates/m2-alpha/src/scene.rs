@@ -107,6 +107,10 @@ pub struct Rig {
     /// posed from it over whatever else the character would play
     /// ([`crate::raw`]).
     pub scripted: Option<(Arc<m2_engine::anim::BoundClip>, f32)>,
+    /// The on-foot table's rate limits of each clip that has them
+    /// ([`m2_assets::animation_table::clip_time_scales`]), for
+    /// [`Rig::play_rate`]. Empty when the table could not be read.
+    pub time_scales: Arc<HashMap<u32, (f32, f32)>>,
 }
 
 /// Most clip events a rig keeps for the taking (older ones are dropped:
@@ -152,6 +156,65 @@ const GAIT_KEYS: [(Gait, u32); 4] = [
     (Gait::Run, 0x1091_2665),
     (Gait::Sprint, 0x076a_6136),
 ];
+
+/// The rate a character's clip plays at, moving `moved` m/s at `gait`,
+/// whose clip travels `clip_speed` m/s; `playing` is the clip playing
+/// now (its hash) and its on-foot row's rate limits, if it has any.
+///
+/// - Moving (not [`Gait::Idle`]): the clip's stride to the speed,
+///   `moved / clip_speed`. From the 360 code: the locomotion update
+///   (82808468 forward, 82809468 backward) advances the gait clip by
+///   `dt * speed / clip speed`, where the clip's speed (its node's +0x5c,
+///   8280F650) already carries the clip's table rate (+0x34, set through
+///   +0x50 by 82801A30), so that rate cancels and a moving gait follows
+///   the ground speed alone, with no clamp. Known runtime limitation: at
+///   speeds far from a clip's own, the feet may slide or the legs stall
+///   (against a wall the ratio is near 0); not yet assessed in play.
+/// - Standing: the table rate of the clip playing
+///   ([`m2_assets::animation_table::clip_rate`] for `id`). From the 360
+///   code: the standing locomotion (82809D60, state 0) advances its clips
+///   by the plain `dt`, and a clip node plays at its rate (8280F398).
+///   1.0 for a clip without limits (the idle `01ca8a69`'s row has -1).
+pub fn gait_rate(
+    gait: Gait,
+    clip_speed: Option<f32>,
+    moved: f32,
+    playing: Option<(u32, Option<(f32, f32)>)>,
+    id: u32,
+) -> f32 {
+    match clip_speed {
+        Some(clip) if gait != Gait::Idle && clip > 0.1 => moved / clip,
+        _ if gait != Gait::Idle => 1.0,
+        _ => match playing {
+            Some((hash, Some((min, max)))) => {
+                m2_assets::animation_table::clip_rate(min, max, id, hash)
+            }
+            _ => 1.0,
+        },
+    }
+}
+
+/// The on-foot table's rate limits by clip
+/// ([`m2_assets::animation_table::clip_time_scales`]), logged: "clip
+/// rates: <n> clips with limits". Empty if the table can't be read.
+fn time_scales(source: &mut AssetSource<BufReader<File>>) -> HashMap<u32, (f32, f32)> {
+    use m2_assets::animation_table::{self as table, AnimationTable};
+    let read = source
+        .asset(table::CHARACTER_ANIMATIONS, table::ANIMATION_TABLE_TYPE)
+        .map_err(anyhow::Error::from)
+        .and_then(|a| Ok(AnimationTable::parse(&a)?));
+    match read {
+        Ok(t) => {
+            let s = table::clip_time_scales(&t);
+            eprintln!("clip rates: {} clips with limits", s.len());
+            s
+        }
+        Err(e) => {
+            eprintln!("clip rates: no on-foot table: {e:#}");
+            HashMap::new()
+        }
+    }
+}
 
 /// What the on-foot table settled for a hero ([`table_clips`]).
 #[derive(Debug, Default)]
@@ -450,7 +513,7 @@ impl Rig {
         let started = std::time::Instant::now();
         let skeleton = Skeleton::from_nodes(&source.model(hash)?.parse()?.nodes);
         let clips = load_clips(source, &skeleton, &[""])?;
-        let rig = match hero {
+        let mut rig = match hero {
             // Jennifer's gaits and clips were matched against her footage
             // from every clip (rounds 55-153): they stay as they were.
             Some(hero) if hero != Hero::Jennifer => {
@@ -472,6 +535,7 @@ impl Rig {
             }
             _ => Rig::new(skeleton, clips, gait),
         };
+        rig.time_scales = Arc::new(time_scales(source));
         eprintln!(
             "model {hash:08x}: {} bones, {} clips fit ({:.1} s), locomotion {}",
             rig.skeleton.len(),
@@ -502,6 +566,17 @@ impl Rig {
     pub fn gait_speed(&self, gait: Gait) -> Option<f32> {
         let &i = self.locomotion.as_ref()?.clips.get(&gait)?;
         Some(self.clips[i].info.speed)
+    }
+
+    /// The rate the clip playing now plays at, at `gait` moving `moved`
+    /// m/s, for the character numbered `id` ([`gait_rate`]).
+    pub fn play_rate(&self, gait: Gait, moved: f32, id: u32) -> f32 {
+        let playing = self
+            .animator
+            .current()
+            .map(|(i, _)| self.clips[i].hash)
+            .map(|h| (h, self.time_scales.get(&h).copied()));
+        gait_rate(gait, self.gait_speed(gait), moved, playing, id)
     }
 
     /// This rig's clips on another model's `skeleton`: shared when it has
@@ -564,6 +639,7 @@ impl Rig {
             scripted: None,
             gait: Gait::Idle,
             cues: Vec::new(),
+            time_scales: self.time_scales.clone(),
         })
     }
 
@@ -621,6 +697,7 @@ impl Rig {
             aim_clip: None,
             barrel: true,
             scripted: None,
+            time_scales: Default::default(),
         };
         rig.set_gait(gait);
         rig
@@ -1179,13 +1256,82 @@ pub fn throw_chunks(
     out
 }
 
-/// A vehicle's health where its template gives none.
-const VEHICLE_HEALTH: f32 = 500.0;
+/// Where the pickups a wreck standing at `body` (its box `bounds`, model
+/// space) leaves on dying lie: per `DebrisEffect` record that fires on
+/// death ([`ON_DEATH`](m2_engine::vehicle_damage::ON_DEATH)) and names a
+/// pickup (`is_pickup`; every vehicle's `fueltank` names `Fuel Pickup
+/// (Small)`), `Min + rand(Max - Min)` of its template, each at a point on
+/// the box's lower half. From the 360 code (82208208, 82208130): a face
+/// of the box at random, the other two axes anywhere across it, its
+/// height turned down if above the middle, and turned to the side facing
+/// the camera when more than 100 degrees from it. Here `viewer` (the
+/// player) stands for the camera (inferred). The record's speeds give
+/// the can an impulse of 0.10 to 0.15 m/s (82209848); it is laid on the
+/// ground where it starts instead (invented: too slow to carry it).
+pub fn death_pickups(
+    debris: &[m2_engine::vehicle_damage::Debris],
+    body: Mat4,
+    bounds: (Vec3, Vec3),
+    viewer: Option<Vec3>,
+    seed: u32,
+    is_pickup: impl Fn(u32) -> bool,
+) -> Vec<(u32, Vec3)> {
+    let mut state = (seed ^ 0x6c8e_9cf5).wrapping_mul(0x9e37_79b9) | 1;
+    let mut random = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state >> 8) as f32 / (1u32 << 24) as f32
+    };
+    let middle = (bounds.0 + bounds.1) * 0.5;
+    let half = (bounds.1 - bounds.0) * 0.5;
+    // The viewer's heading from the box's middle, in its own space.
+    let toward = viewer.map(|v| body.inverse().transform_point3(v) - middle);
+    let mut out = Vec::new();
+    for d in debris {
+        if d.when != m2_engine::vehicle_damage::ON_DEATH || !is_pickup(d.template) {
+            continue;
+        }
+        let (lo, hi) = d.count;
+        let n = lo + ((hi - lo) as f32 * random()) as u32;
+        for _ in 0..n {
+            let face = ((random() * 6.0) as usize).min(5);
+            let mut at = Vec3::new(
+                (random() * 2.0 - 1.0) * half.x,
+                (random() * 2.0 - 1.0) * half.y,
+                (random() * 2.0 - 1.0) * half.z,
+            );
+            let axis = face % 3;
+            at[axis] = if face < 3 { half[axis] } else { -half[axis] };
+            if at.y > 0.0 {
+                at.y = -at.y;
+            }
+            if let Some(t) = toward {
+                let yaw = |v: Vec3| v.x.atan2(v.z);
+                let turn = (yaw(at) - yaw(t) + std::f32::consts::PI)
+                    .rem_euclid(std::f32::consts::TAU)
+                    - std::f32::consts::PI;
+                if turn.abs() > 100f32.to_radians() {
+                    at.x = -at.x;
+                    at.z = -at.z;
+                }
+            }
+            out.push((d.template, body.transform_point3(middle + at)));
+        }
+    }
+    out
+}
 
 impl ParkedVehicle {
     /// The damage it takes before it is wrecked: its template's health.
+    /// A template with no `Health` (3 of 779 with vehicle physics, all
+    /// props: survey `runover`) is never wrecked: in the 360 damage is
+    /// taken by the `Health` component, and it has none. Inferred.
     pub fn most_health(&self) -> f32 {
-        self.spec.tuning.health.unwrap_or(VEHICLE_HEALTH).max(1.0)
+        self.spec
+            .tuning
+            .health
+            .map_or(f32::INFINITY, |h| h.max(1.0))
     }
 
     /// Its health of 100, as the HUD's health box shows it: none once
@@ -2304,6 +2450,16 @@ impl Scene {
             };
             let t = db.tuning_for(&spec.label, spec.model);
             let arm = db.armament_for(&spec.label, spec.model);
+            let driver = db.driver_points_for(&spec.label, spec.model);
+            let markers = (spec.seat, spec.door);
+            let has = |h: u32| spec.node_names.contains(&h);
+            let found = driver.map(|p| (has(p.seat), p.door.map(has)));
+            let seating = db.vehicle_seats_for(&spec.label, spec.model);
+            let spec = spec.with_driver_points(driver).with_seating(seating);
+            eprintln!(
+                "driver: {}: seat {:?} door {:?} (seat data {driver:x?}, nodes found {found:?}; fixed markers {:?} {:?})",
+                spec.label, spec.seat, spec.door, markers.0, markers.1,
+            );
             let mut spec = spec.tuned(t).armed_with(arm, &db.arms);
             // The Osprey drops the bombing run's bombs from its bay.
             if m2_engine::osprey::is_osprey(spec.model) {
@@ -2503,6 +2659,7 @@ impl Scene {
         };
         let db = &world.index.template_db;
         let mut thrown = Vec::new();
+        let mut left = Vec::new();
         for (i, v) in self.vehicles.iter_mut().enumerate() {
             if v.parts.is_none()
                 && let Some(dm) = v.spec.damage.as_deref()
@@ -2544,6 +2701,18 @@ impl Scene {
                         debris.len()
                     );
                     thrown.extend(chunks);
+                    // What it leaves to be taken: its fuel can.
+                    let viewer = self.player.as_ref().map(|p| p.character.position);
+                    for (k, (template, at)) in
+                        death_pickups(debris, body, v.spec.bounds, viewer, seed, |t| {
+                            db.leavings.pickups.contains_key(&t)
+                        })
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let from = v.guid.unwrap_or(0x4000_0000 | i as u32);
+                        left.push((from.wrapping_add(k as u32), template, at));
+                    }
                 }
             }
             v.step_loose(dt);
@@ -2555,6 +2724,25 @@ impl Scene {
         }
         self.chunks.retain(|c| c.age < c.lasts);
         self.chunks.extend(thrown);
+        for (from, template, at) in left {
+            let Some(what) = crate::mission::pickup(db, template) else {
+                continue;
+            };
+            // Laid on what is under it.
+            let at = ground(at, 10.0).map_or(at, |(d, _)| at - Vec3::Y * d);
+            eprintln!(
+                "wreck pickup: {} ({template:#x}) at {at:.1}: cash {}, fuel {}",
+                db.by_id(template).map_or("?", |t| t.0),
+                what.cash,
+                what.fuel
+            );
+            self.flights.leave(crate::flights::Pickup {
+                from,
+                what,
+                at: at + Vec3::Y * 0.1,
+                yaw: 0.0,
+            });
+        }
         if self.chunks.len() > CHUNKS_MOST {
             let over = self.chunks.len() - CHUNKS_MOST;
             self.chunks.drain(..over);
@@ -2857,9 +3045,7 @@ impl Scene {
             // The game's own effects draw fire and smoke when they loaded.
             let standing_in = matches!(
                 effect,
-                combat::Effect::Fire { .. }
-                    | combat::Effect::Smoke { .. }
-                    | combat::Effect::Soot { .. }
+                combat::Effect::Fire { .. } | combat::Effect::Smoke { .. }
             );
             if standing_in && (self.particles.is_some() || self.hide_fx) {
                 continue;
@@ -3101,15 +3287,6 @@ impl Effects {
                 self.smoke,
                 true,
             ),
-            Effect::Soot { at, size } => (
-                Mat4::from_scale_rotation_translation(
-                    Vec3::splat(size * (0.6 + 1.4 * age)),
-                    Quat::IDENTITY,
-                    at + Vec3::Y * (age * size * 4.0),
-                ),
-                self.soot,
-                true,
-            ),
             // Out and up, falling back as it goes, gone at the end.
             Effect::Spray { at, drift, size } => (
                 Mat4::from_scale_rotation_translation(
@@ -3332,6 +3509,7 @@ mod tests {
                 count: (2, 4),
                 speed: (15.0, 30.0),
                 lasts: (5.0, 20.0),
+                when: 3,
             },
             Debris {
                 template: 0x8000_8608,
@@ -3340,6 +3518,7 @@ mod tests {
                 count: (1, 1),
                 speed: (0.1, 0.15),
                 lasts: (0.0, 0.2),
+                when: 3,
             },
         ]
     }
@@ -3372,6 +3551,102 @@ mod tests {
     }
 
     #[test]
+    fn a_wreck_leaves_its_fuel_can_low_on_the_side_facing_her() {
+        // The beta threw no fuel can at all: `throw_chunks` still skips it
+        // (no chunk model); what dies leaves it as a pickup instead.
+        let fuel = 0x8000_8608;
+        let bounds = (Vec3::new(-1.0, 0.0, -2.5), Vec3::new(1.0, 1.5, 2.5));
+        let body =
+            Mat4::from_rotation_translation(Quat::from_rotation_y(0.7), Vec3::new(10.0, 2.0, 0.0));
+        let viewer = Vec3::new(30.0, 2.0, 5.0);
+        let local_viewer = body.inverse().transform_point3(viewer) - Vec3::new(0.0, 0.75, 0.0);
+        for seed in 0..64 {
+            assert!(
+                throw_chunks(&valiant_debris(), body, bounds, seed)
+                    .iter()
+                    .all(|c| c.model != 0)
+            );
+            let left = death_pickups(&valiant_debris(), body, bounds, Some(viewer), seed, |t| {
+                t == fuel
+            });
+            let [(template, at)] = left[..] else {
+                panic!("one can, not {left:?}");
+            };
+            assert_eq!(template, fuel);
+            let local = body.inverse().transform_point3(at) - Vec3::new(0.0, 0.75, 0.0);
+            // On the box, its lower half.
+            let on = (local.x.abs() - 1.0).abs() < 1e-4
+                || (local.y.abs() - 0.75).abs() < 1e-4
+                || (local.z.abs() - 2.5).abs() < 1e-4;
+            assert!(on && local.y <= 0.0, "{local}");
+            assert!(local.x.abs() <= 1.0 + 1e-4 && local.z.abs() <= 2.5 + 1e-4);
+            // Within 100 degrees of her heading.
+            let yaw = |v: Vec3| v.x.atan2(v.z);
+            let turn = (yaw(local) - yaw(local_viewer) + std::f32::consts::PI)
+                .rem_euclid(std::f32::consts::TAU)
+                - std::f32::consts::PI;
+            assert!(turn.abs() <= 100f32.to_radians() + 1e-4, "{turn}");
+        }
+    }
+
+    #[test]
+    fn only_death_records_naming_a_pickup_leave_one_min_plus_rand_of_the_rest() {
+        use m2_engine::vehicle_damage::Debris;
+        let record = |template, count, when| Debris {
+            template,
+            model: None,
+            hardpoint: None,
+            count,
+            speed: (0.1, 0.15),
+            lasts: (0.0, 0.2),
+            when,
+        };
+        let bounds = (Vec3::splat(-1.0), Vec3::splat(1.0));
+        let is_pickup = |t| t == 1;
+        // A part's record (`Type` 0 to 2) and a chunk that isn't a pickup
+        // leave nothing.
+        for when in 0..3 {
+            assert!(
+                death_pickups(
+                    &[record(1, (1, 1), when)],
+                    Mat4::IDENTITY,
+                    bounds,
+                    None,
+                    3,
+                    is_pickup
+                )
+                .is_empty()
+            );
+        }
+        assert!(
+            death_pickups(
+                &[record(2, (1, 1), 3)],
+                Mat4::IDENTITY,
+                bounds,
+                None,
+                3,
+                is_pickup
+            )
+            .is_empty()
+        );
+        // 2 to 4: 2 or 3, never the most (the 360's `Min + rand(Max - Min)`).
+        let counts: HashSet<usize> = (0..64)
+            .map(|seed| {
+                death_pickups(
+                    &[record(1, (2, 4), 3)],
+                    Mat4::IDENTITY,
+                    bounds,
+                    None,
+                    seed,
+                    is_pickup,
+                )
+                .len()
+            })
+            .collect();
+        assert_eq!(counts, HashSet::from([2, 3]));
+    }
+
+    #[test]
     fn a_chunk_falls_to_the_ground_and_lies_there() {
         let mut c = Chunk {
             model: 1,
@@ -3395,5 +3670,44 @@ mod tests {
         c.step(1.0, ground);
         assert_eq!(c.at, lying.at);
         assert!((c.age - 6.0).abs() < 1e-3);
+    }
+    #[test]
+    fn a_moving_gait_follows_the_ground_speed() {
+        // 3 m/s on a 2.5 m/s clip: 1.2, whatever the clip's table rate.
+        let limits = Some((0x1234, Some((1.0, 1.5))));
+        assert!((gait_rate(Gait::Run, Some(2.5), 3.0, limits, 9) - 1.2).abs() < 1e-6);
+        assert!((gait_rate(Gait::Run, Some(2.5), 3.0, None, 9) - 1.2).abs() < 1e-6);
+        // No clamp, as in the original: rates past the old 0.6 to 1.4 pass
+        // through; no clip speed: 1.0.
+        assert_eq!(gait_rate(Gait::Walk, Some(1.0), 9.0, None, 0), 9.0);
+        assert_eq!(gait_rate(Gait::Walk, Some(2.0), 0.5, None, 0), 0.25);
+        assert_eq!(gait_rate(Gait::Walk, Some(1.0), 0.0, None, 0), 0.0);
+        assert_eq!(gait_rate(Gait::Walk, None, 3.0, limits, 0), 1.0);
+    }
+
+    #[test]
+    fn standing_plays_the_clips_table_rate() {
+        use m2_assets::animation_table::clip_rate;
+        // No limits (-1 rows are not in the map) or no clip: 1.0.
+        assert_eq!(
+            gait_rate(Gait::Idle, Some(0.0), 0.0, Some((0x1234, None)), 3),
+            1.0
+        );
+        assert_eq!(gait_rate(Gait::Idle, Some(0.0), 0.0, None, 3), 1.0);
+        // With limits: the character's own rate, not the speed.
+        for id in 0..8 {
+            let r = gait_rate(
+                Gait::Idle,
+                Some(0.0),
+                2.0,
+                Some((0x1230, Some((1.0, 1.5)))),
+                id,
+            );
+            assert_eq!(r, clip_rate(1.0, 1.5, id, 0x1230));
+        }
+        assert_eq!(
+            gait_rate(Gait::Idle, None, 0.0, Some((0x1235, Some((1.0, 1.5)))), 0),
+            1.0
+        );
     }
 }

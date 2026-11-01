@@ -17,12 +17,13 @@ use crate::tuning::Table;
 /// `SpawnOnDeath`'s field naming the template left (name unknown).
 const SPAWNS: u32 = 0x7461_c0cd;
 /// `Pickup`'s fields (names unknown): the ammunition it gives (a weapon's
-/// `AmmoTemplate`), how many rounds, the name hash of what is heard or
-/// shown when it is taken (`pickup_ammo_rockets`) and of the effect then
-/// (`global_particle_explosion_pickup_rocket`).
+/// `AmmoTemplate`), how many rounds, the name hash of the icon shown over
+/// it (`pickup_ammo_rockets`; from the 360 code: the record's sixth word,
+/// `TextureModel`, which the HUD's pickup markers draw, 82378890) and of
+/// the effect when it is taken (`global_particle_explosion_pickup_rocket`).
 const AMMO: u32 = 0xc867_d0d0;
 const ROUNDS: u32 = 0xa06b_3faa;
-const CUE: u32 = 0xb6d6_0154;
+const ICON: u32 = 0xb6d6_0154;
 const EFFECT: u32 = 0x6235_349a;
 /// `Label`'s field: the label's name hash (`HeavySoldier`).
 const LABEL: u32 = 0xfd08_4cce;
@@ -38,6 +39,9 @@ pub const EQUIPMENT: u32 = 2;
 /// PC data, 2026-10-14.
 pub const CASH: u32 = 5;
 pub const FUEL: u32 = 6;
+/// A vehicle's ammunition (`PickupTypeEnum` 4; from the 360 code, no
+/// template uses it).
+pub const VEHICLE_AMMUNITION: u32 = 4;
 
 /// A pickup's template: what walking up to it gives.
 #[derive(Clone, Debug, PartialEq)]
@@ -65,10 +69,20 @@ pub struct PickupInfo {
     /// record of that `Type` among its 19 ammunition records (8000a286; PC
     /// data, 2026-10-09).
     pub heals: u32,
-    /// Name hashes of its sound or message on being taken and of its
-    /// effect.
-    pub cue: Option<u32>,
+    /// Name hashes of the icon its marker shows (`pickup_fuel`) and of its
+    /// effect on being taken.
+    pub icon: Option<u32>,
     pub effect: Option<u32>,
+}
+
+impl PickupInfo {
+    /// Whether its marker fades by the distance over the ground only, not
+    /// counting height (from the 360 code, 82378890): ammunition, a
+    /// vehicle's ammunition, cash and fuel do; health and a weapon lying
+    /// there measure the whole distance.
+    pub fn marker_flat(&self) -> bool {
+        matches!(self.kind, AMMUNITION | VEHICLE_AMMUNITION | CASH | FUEL)
+    }
 }
 
 /// What the database says of leaving and picking up, by template id.
@@ -140,7 +154,7 @@ pub fn read(db: &Layer<'_>) -> Leavings {
                             .filter(|r| pickup.word(r, kind) == Some(HEALTH))
                             .map(|r| pickup.word(r, ROUNDS).unwrap_or(0))
                             .sum(),
-                        cue: nonzero(pickup.word(r, CUE)),
+                        icon: nonzero(pickup.word(r, ICON)),
                         effect: nonzero(pickup.word(r, EFFECT)),
                     },
                 ))

@@ -24,9 +24,9 @@
 //!
 //! Her clips, the crewman's and the vehicle's play together. The
 //! vehicle's clip moves its own nodes (the hatch thrown open). Her clips
-//! play from the vehicle's origin, lifted so that, holding the pistol at
-//! the hatch, she stands on the roof the hatch hinges in (the M1A2 0.9 m,
-//! the AMX30 2.1 m). The crewman (drawn as a rider is, on his kind's
+//! play from the driver's seat's point, all in one place: from the ground
+//! in front, up over the gun barrel (the line's caption: "climbing up
+//! tank barrel"), to the roof the hatch hinges in. The crewman (drawn as a rider is, on his kind's
 //! skeleton) plays his so that in his struggle loop his pelvis is at the
 //! hatch: half out of it. The camera sits close at her chest, from her
 //! side of the vehicle, as the footage's does. The scripts' own calls
@@ -34,13 +34,19 @@
 //! ([`Hijacks::take_gui_calls`]).
 //!
 //! Provenance: which clips play is the tables' (from samples; the
-//! crewman's by the driver's seat). Where they play is inferred from
-//! samples against the footage (the hijack video's M1A2: her on the
-//! turret roof, the crewman half out of the hatch): her clips sat 0.9 m
-//! (M1A2) to 2.1 m (AMX30) under that roof, his some 6 m behind the tank
-//! (his loop's pelvis then lands within 0.1 m of the hatch across and
-//! up, both tanks). How the game places them was not read from the 360
-//! code. The camera's distance and angle are from the footage.
+//! crewman's by the driver's seat). Her clips play at the driver's
+//! seat's point (from samples, playtest round): the scripts set her
+//! `InVehicle`, and her clips' roots run on from one to the next in one
+//! place whose origin is the seat's: put there, her feet start on the
+//! ground in front of the hull (0.43 m up on the M1A1, 0.17 m on the
+//! AMX30) and stand on the hatch's roof in her pistol loop (within
+//! 0.05 m of the fit to the footage, 0.9 m under that roof on the M1A2,
+//! 2.1 m on the AMX30), where the vehicle's origin had her first clip
+//! 0.5 m (M1A1) and 1.8 m (AMX30) underground. The 360 code's placing
+//! of a seated character was not traced. The crewman's clips play some
+//! 6 m behind the tank, moved so his loop's pelvis lands within 0.1 m of
+//! the hatch (both tanks; inferred against the footage). The camera's
+//! distance and angle are from the footage.
 //!
 //! [`ParkedVehicle::crew`]: crate::scene::ParkedVehicle::crew
 //!
@@ -91,65 +97,15 @@ const CAMERA_AHEAD: f32 = 0.6;
 /// How far above the vehicle's top (later her feet) the camera looks,
 /// metres.
 const CAMERA_LIFT: f32 = 1.0;
-/// Mouse counts within [`FLICK_WINDOW`] that make a flick ([`Flick`]).
-/// Invented.
-const FLICK: f64 = 40.0;
-/// How long the mouse's motion adds up toward a flick, seconds. Counted
-/// per tick before (playtest 12: no tap of 9 rounds reached the scripts),
-/// a flick had to land its counts inside one frame: 6 ms at Brendan's
-/// 165 Hz, which an ordinary flick doesn't. Invented.
-const FLICK_WINDOW: f64 = 0.12;
-
-/// The mouse's motion of late, adding up toward a flick whatever the
-/// frame rate: the counts since the window began, and how long ago.
-#[derive(Debug, Default)]
-struct Flick {
-    dx: f64,
-    dy: f64,
-    seconds: f64,
-}
-
-impl Flick {
-    /// Adds a tick's motion (`dt` seconds): the button a flick presses
-    /// ([`m2_game::hijack::BUTTONS`]: up 5, down 6, left 7, right 8), with
-    /// its counts and how long they took, once per flick.
-    fn feed(&mut self, dx: f64, dy: f64, dt: f64) -> Option<(u32, f64, f64)> {
-        self.dx += dx;
-        self.dy += dy;
-        self.seconds += dt;
-        let (counts, button) = if self.dy.abs() > self.dx.abs() {
-            (self.dy.abs(), if self.dy < 0.0 { 5 } else { 6 })
-        } else {
-            (self.dx.abs(), if self.dx < 0.0 { 7 } else { 8 })
-        };
-        let flicked = counts > FLICK;
-        if flicked || self.seconds >= FLICK_WINDOW {
-            let seconds = self.seconds;
-            *self = Self::default();
-            if flicked {
-                return Some((button, counts, seconds));
-            }
-        }
-        None
-    }
-}
 /// How long an action lasts when its clip is unknown, seconds.
 const UNKNOWN_CLIP: f64 = 2.0;
-/// What the keyboard does for a hijack prompt ("K or flick the mouse
-/// down", "hold K", "J and L in turn"), for the HUD to write under the
-/// game's arrow, which on the PC names no key. `None` for a button no key
-/// has.
+/// What the keyboard does for a hijack prompt ("E", "hold Space", "R and
+/// F in turn"), for the HUD to write under the game's icon. `None` for a
+/// button no key has.
 pub fn key_hint(prompt: &Minigame, keys: &crate::input::Bindings) -> Option<String> {
     let key = |button: u32| -> Option<String> {
         let (action, _) = PAD.iter().find(|(_, b)| *b == button)?;
         keys.key_name(*action)
-    };
-    let flick = |button: u32| match button {
-        5 => " or flick the mouse up",
-        6 => " or flick the mouse down",
-        7 => " or flick the mouse left",
-        8 => " or flick the mouse right",
-        _ => "",
     };
     let first = *prompt.buttons.first()?;
     Some(match prompt.mode.as_str() {
@@ -158,9 +114,18 @@ pub fn key_hint(prompt: &Minigame, keys: &crate::input::Bindings) -> Option<Stri
             let second = *prompt.buttons.get(1)?;
             format!("{} and {} in turn", key(first)?, key(second)?)
         }
-        _ => format!("{}{}", key(first)?, flick(first)),
+        _ => key(first)?,
     })
 }
+
+/// What the face buttons' keys do on foot, taken while a hijack runs.
+const SHARED: [Action; 5] = [
+    Action::Use,
+    Action::MoveUp,
+    Action::Reload,
+    Action::Reset,
+    Action::Melee,
+];
 
 /// The pad, as the scripts number its buttons
 /// ([`m2_game::hijack::BUTTONS`]).
@@ -260,8 +225,6 @@ struct Active {
     actions: Vec<(u32, f64)>,
     /// Pad buttons held, as the scripts were last told.
     held: Vec<u32>,
-    /// The mouse's motion of late, for a flick.
-    flick: Flick,
     /// Her hijack clip playing (an index into her rig's clips).
     clip: Option<usize>,
     /// The entrance, in the world when it started: the camera looks at it.
@@ -583,7 +546,7 @@ impl Hijacks {
             self.by_model = Some(by_model);
         }
         if self.active.is_some() {
-            self.pad(input, dt);
+            self.pad(input);
         } else {
             drain(input);
             self.near = self.find(game);
@@ -631,20 +594,10 @@ impl Hijacks {
     }
 
     /// Feeds the pad's presses and holds to the scripts.
-    fn pad(&mut self, input: &mut Input, dt: f32) {
+    fn pad(&mut self, input: &mut Input) {
         let (State::Ready(l), Some(a)) = (&mut self.state, &mut self.active) else {
             return;
         };
-        // A flick of the mouse the way an arrow points presses it, as the
-        // PC HUD draws the face buttons as arrows (see
-        // [`crate::input::Bindings`]; inferred).
-        let (dx, dy) = input.take_mouse();
-        if let Some((button, counts, seconds)) = a.flick.feed(dx, dy, f64::from(dt)) {
-            eprintln!(
-                "hijack: button {button} by a mouse flick ({counts:.0} counts in {seconds:.2} s)"
-            );
-            l.mission.press(button);
-        }
         for (action, button) in PAD {
             if input.take_pressed(action) {
                 eprintln!("hijack: button {button} pressed ({action:?})");
@@ -659,6 +612,11 @@ impl Hijacks {
                     a.held.retain(|&b| b != button);
                 }
             }
+        }
+        // The face buttons share their keys with what they do on foot
+        // (use, jump, reload, melee): mid-hijack those presses are hers.
+        for action in SHARED {
+            input.take_pressed(action);
         }
     }
 
@@ -817,7 +775,6 @@ impl Hijacks {
                 set,
                 actions: Vec::new(),
                 held: Vec::new(),
-                flick: Flick::default(),
                 clip: None,
                 // Over the entrance at the top of the vehicle, where the
                 // hijack plays out (the M1A2's driver's hatch is low on
@@ -990,11 +947,18 @@ impl Hijacks {
         let model_yaw = forward.x.atan2(forward.y);
         let ahead = at.transform_vector3(Vec3::Z);
         let yaw = ahead.x.atan2(ahead.z);
-        let origin = at.transform_point3(Vec3::ZERO);
+        // Her clips play in the driver's seat's place (the scripts set her
+        // `InVehicle`, the stance whose clips sit at the seat): one place
+        // for the whole hijack, the clips' roots running on from one to
+        // the next. Without the seat's point, the vehicle's origin with
+        // the lift fitted to the hatch's roof, the first clip on the
+        // ground (the old way).
+        let seat = scene.vehicles[a.vehicle].spec.seat;
+        let origin = at.transform_point3(seat.unwrap_or(Vec3::ZERO));
         let off = m2_math::glam::Quat::from_rotation_y(yaw)
             * Vec3::new(root.x - c.info.pin.x, 0.0, root.z - c.info.pin.y);
         p.facing = yaw + model_yaw;
-        let lift = if a.clip == a.first {
+        let lift = if seat.is_some() || a.clip == a.first {
             0.0
         } else {
             a.lift.unwrap_or(0.0)
@@ -1583,7 +1547,7 @@ fn follow(
                 if guid == a.hero
                     && let Some((hash, _)) = clip
                 {
-                    a.clip = play(game, hash);
+                    a.clip = play(game, hash, m2_assets::name_hash(&action));
                     started = true;
                 }
                 if guid == a.crewman
@@ -2492,11 +2456,13 @@ fn bind_rider(
     bound
 }
 
-/// Plays clip `hash` on her once; its index in her rig's clips.
-fn play(game: &mut Game, hash: u32) -> Option<usize> {
+/// Plays clip `hash` on her once for the script's `action` (its name
+/// hash, which sets the blend: the hijack actions snap); its index in her
+/// rig's clips.
+fn play(game: &mut Game, hash: u32, action: u32) -> Option<usize> {
     let index = bind(game, hash)?;
     let (_, rig) = game.scene.player.as_mut()?.model.as_mut()?;
-    rig.animator.play_once(index);
+    rig.animator.play_action(index, true, action);
     Some(index)
 }
 
@@ -2685,10 +2651,10 @@ mod tests {
         }
     }
 
-    /// The Scorpion's rounds: press right (8), then tap down (6); a hold
-    /// and an alternate of the face buttons; a stick push no key names.
+    /// The Scorpion's rounds: press right (8, melee), then tap down (6,
+    /// jump); a hold and an alternate of the face buttons; a stick push.
     #[test]
-    fn the_keyboard_hint_names_the_keys_the_arrows_mean() {
+    fn the_keyboard_hint_names_the_keys_of_the_game_s_icons() {
         let keys = crate::input::Bindings::default();
         let game = |mode: &str, buttons: &[u32]| Minigame {
             mode: mode.into(),
@@ -2697,42 +2663,14 @@ mod tests {
             hold: None,
         };
         let hint = |mode: &str, buttons: &[u32]| key_hint(&game(mode, buttons), &keys);
-        assert_eq!(
-            hint("press", &[8]).as_deref(),
-            Some("L or flick the mouse right")
-        );
-        assert_eq!(
-            hint("tap", &[6]).as_deref(),
-            Some("K or flick the mouse down")
-        );
-        assert_eq!(hint("hold", &[5]).as_deref(), Some("hold I"));
+        assert_eq!(hint("press", &[8]).as_deref(), Some("F"));
+        assert_eq!(hint("tap", &[6]).as_deref(), Some("Space"));
+        assert_eq!(hint("hold", &[5]).as_deref(), Some("hold E"));
         assert_eq!(
             hint("alternate", &[7, 8]).as_deref(),
-            Some("J and L in turn")
+            Some("R and F in turn")
         );
         assert_eq!(hint("press", &[12]).as_deref(), Some("S"));
         assert_eq!(hint("press", &[]), None);
-    }
-
-    /// A flick spread over frames at 165 Hz (12 counts a frame, 40 crossed
-    /// on the fourth) presses once, whatever any one frame holds; a drift of
-    /// the same counts over a second presses nothing.
-    #[test]
-    fn a_flick_adds_up_across_frames_and_presses_once() {
-        let tick = 1.0 / 165.0;
-        let mut f = Flick::default();
-        let mut pressed = Vec::new();
-        for _ in 0..5 {
-            if let Some((b, counts, _)) = f.feed(0.0, 12.0, tick) {
-                pressed.push((b, counts));
-            }
-        }
-        assert_eq!(pressed, vec![(6, 48.0)]);
-        // Right, and up, by their larger axis.
-        assert_eq!(f.feed(50.0, 10.0, tick).map(|p| p.0), Some(8));
-        assert_eq!(f.feed(-10.0, -50.0, tick).map(|p| p.0), Some(5));
-        let mut slow = Flick::default();
-        let drift: Vec<_> = (0..165).filter_map(|_| slow.feed(0.0, 0.4, tick)).collect();
-        assert!(drift.is_empty(), "{drift:?}");
     }
 }

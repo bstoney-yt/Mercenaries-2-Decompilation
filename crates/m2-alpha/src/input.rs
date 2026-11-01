@@ -232,16 +232,18 @@ impl Default for Bindings {
             (QuickLoad, vec![k(F9)]),
             (Cheats, vec![k(F7)]),
             (Quit, vec![k(Escape)]),
-            // The PC HUD draws the face buttons as arrows (its own
-            // `icon_hijack_button_*` for the pad's `BUTTON_PAD2_U`, `_D`,
-            // `_L`, `_R`: a fist under an arrow pointing that way, playtest
-            // 5's footage), so they sit on the look keys, which lie the
-            // same way, and on the arrow keys (playtest 5: no key named,
-            // every try at the villa's tank timed out). Inferred.
-            (PadY, vec![k(KeyI), k(ArrowUp)]),
-            (PadA, vec![k(KeyK), k(ArrowDown)]),
-            (PadX, vec![k(KeyJ), k(ArrowLeft)]),
-            (PadB, vec![k(KeyL), k(ArrowRight)]),
+            // The hijack prompts' face buttons, on the keys of what each
+            // does on foot (the game's pad layout, [`crate::pad`]: Y use,
+            // A jump, X reload, B melee): the PC game's hijack icons are a
+            // hand for use (E), a boot for jump (Space), an ammunition clip
+            // for reload (R) and a fist for melee (F), its arrows the
+            // movement keys (a players' guide to the PC version,
+            // calltoreason.org/?p=1482). The keys are the guide's; which
+            // face button each icon stands for is the pad layout's.
+            (PadY, vec![k(KeyE)]),
+            (PadA, vec![k(Space)]),
+            (PadX, vec![k(KeyR)]),
+            (PadB, vec![k(KeyF)]),
             (SwitchWeapon, vec![k(Tab), m(WheelUp), m(WheelDown)]),
         ]))
     }

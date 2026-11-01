@@ -73,6 +73,12 @@ pub const PRIMARY_EQUIPMENT_NAME: &str = "PrimaryEquipmentName";
 pub const IN_USE_EQUIPMENT_CLASS: &str = "InUseEquipmentClass";
 pub const IN_USE_EQUIPMENT_NAME: &str = "InUseEquipmentName";
 pub const ANIMATION: &str = "Animation";
+/// The on-foot and vehicle tables' playback-rate limits (f32 cells, -1
+/// for "none"). From the 360 code: the clip pick reads the on-foot
+/// table's columns 8 and 9 (82802360, 82802398) and the vehicle table's
+/// 7 and 8 (828021F0, 82802228), the columns after `Animation`.
+pub const MIN_TIME_SCALE: &str = "MinTimeScale";
+pub const MAX_TIME_SCALE: &str = "MaxTimeScale";
 /// The on-foot table's equipment class of a rifle: `name_hash("rifle")`.
 /// The class cells are the name hashes of plain words (`rifle`, `pistol`,
 /// `rocket`, `grenade`, `golfclub`, `box`, and one not yet named,
@@ -372,6 +378,71 @@ pub struct CharacterClip {
 pub fn row_listing(table: &AnimationTable, clip: u32) -> Option<usize> {
     let list = table.column(ANIMATION)?;
     (1..table.rows()).find(|&r| table.list(r, list).contains(&clip))
+}
+
+/// The order a row's rate range is shared out in: the `n`th of eight
+/// steps from `MinTimeScale` to `MaxTimeScale`, by `(id ^ clip) & 7`. From
+/// the 360 code (82800FB8, a byte table on the stack).
+pub const RATE_SPREAD: [u8; 8] = [5, 2, 7, 1, 4, 0, 6, 3];
+
+/// The playback rate a clip node gives `clip` (its name hash) picked from
+/// a row with `min` and `max` ([`MIN_TIME_SCALE`], [`MAX_TIME_SCALE`]),
+/// for the character `id`. From the 360 code (82801650, 82800FB8,
+/// 82175618):
+///
+/// - 1.0 when `min` is 0 or less (the tables' -1) or `max` is below it;
+/// - `min` when the two are equal;
+/// - else `min + (max - min) * RATE_SPREAD[(id ^ clip) & 7] / 7`, worked
+///   as the game does (the step times the f32 1/7, then the lerp in
+///   double, rounded to f32).
+///
+/// So each character plays a clip at its own fixed rate within the row's
+/// range, the same every time. `id` is the game's entity handle (82420A00
+/// passes it in); how the game numbers its handles is not known, so the
+/// alpha's ids are stand-ins and which character gets which rate is
+/// invented (the spread over a crowd is not). A NaN `min` gives 1.0.
+pub fn clip_rate(min: f32, max: f32, id: u32, clip: u32) -> f32 {
+    if min.is_nan() || min <= 0.0 || max < min {
+        return 1.0;
+    }
+    if min == max {
+        return min;
+    }
+    let step = f32::from(RATE_SPREAD[((id ^ clip) & 7) as usize]) * (1.0f32 / 7.0);
+    (f64::from(max - min) * f64::from(step) + f64::from(min)) as f32
+}
+
+/// A row's `(MinTimeScale, MaxTimeScale)`; `None` if the table lacks the
+/// columns or the row.
+pub fn time_scales(table: &AnimationTable, row: usize) -> Option<(f32, f32)> {
+    let min = table.cell(row, table.column(MIN_TIME_SCALE)?)?;
+    let max = table.cell(row, table.column(MAX_TIME_SCALE)?)?;
+    Some((f32::from_bits(min), f32::from_bits(max)))
+}
+
+/// Each listed clip's `(MinTimeScale, MaxTimeScale)`, from the first row
+/// listing it ([`row_listing`]). Inferred: the game reads the limits of
+/// the row its key query picked (82801508), which the alpha does not run
+/// for every clip; a clip listed in rows with different limits takes the
+/// first's. Rows with no limits (-1, the most) are left out.
+pub fn clip_time_scales(table: &AnimationTable) -> std::collections::HashMap<u32, (f32, f32)> {
+    let mut out = std::collections::HashMap::new();
+    let Some(list) = table.column(ANIMATION) else {
+        return out;
+    };
+    let mut seen = std::collections::HashSet::new();
+    for row in 1..table.rows() {
+        let scales = time_scales(table, row);
+        for &clip in table.list(row, list) {
+            if !seen.insert(clip) {
+                continue;
+            }
+            if let Some(s) = scales.filter(|&(min, _)| min > 0.0) {
+                out.insert(clip, s);
+            }
+        }
+    }
+    out
 }
 
 /// The clip a character plays for what `key` is played for, by the
@@ -897,5 +968,85 @@ mod tests {
         assert_eq!(clip(None), Some(0x9d88_6544));
         assert_eq!(clip(Some(0x0bad)), Some(0x9d88_6544));
         assert_eq!(action_handle(&a, "InVehicle", "Idle"), Some(0x9999));
+    }
+    #[test]
+    fn a_rate_is_one_without_limits() {
+        // -1 (most rows), 0, max below min, NaN: the clip plays at 1.0.
+        assert_eq!(clip_rate(-1.0, -1.0, 7, 0x1234), 1.0);
+        assert_eq!(clip_rate(0.0, 1.5, 7, 0x1234), 1.0);
+        assert_eq!(clip_rate(1.2, 0.8, 7, 0x1234), 1.0);
+        assert_eq!(clip_rate(f32::NAN, 1.5, 7, 0x1234), 1.0);
+        // Equal limits: that rate, whoever plays it.
+        assert_eq!(clip_rate(1.5, 1.5, 7, 0x1234), 1.5);
+        assert_eq!(clip_rate(2.0, 2.0, 0, 0), 2.0);
+    }
+
+    #[test]
+    fn a_rate_steps_through_the_range_by_id_and_clip() {
+        // Each of the eight (id ^ clip) & 7 picks its own step of the
+        // spread, min + (max - min) * step / 7.
+        let clip = 0x0123_4560; // low 3 bits 0
+        for (low, &step) in RATE_SPREAD.iter().enumerate() {
+            let want =
+                (f64::from(0.5f32) * f64::from(f32::from(step) * (1.0f32 / 7.0)) + 1.0) as f32;
+            assert_eq!(clip_rate(1.0, 1.5, low as u32, clip), want, "id {low}");
+        }
+        assert_eq!(clip_rate(1.0, 1.5, 5, clip), 1.0); // step 0: min
+        assert_eq!(clip_rate(1.0, 1.5, 2, clip), 1.5); // step 7: max
+        assert_eq!(
+            clip_rate(0.8, 1.2, 0, clip),
+            (0.4f64 * f64::from(5.0f32 / 7.0) + 0.8) as f32
+        );
+        // Only the low 3 bits of id ^ clip count, from either side.
+        assert_eq!(
+            clip_rate(1.0, 1.5, 0x10, clip),
+            clip_rate(1.0, 1.5, 0, clip)
+        );
+        assert_eq!(
+            clip_rate(1.0, 1.5, 0, clip | 3),
+            clip_rate(1.0, 1.5, 3, clip)
+        );
+        assert_eq!(
+            clip_rate(1.0, 1.5, 3, clip | 3),
+            clip_rate(1.0, 1.5, 0, clip)
+        );
+    }
+
+    #[test]
+    fn the_spread_is_each_step_once() {
+        let mut s = RATE_SPREAD;
+        s.sort_unstable();
+        assert_eq!(s, [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn a_clips_limits_come_from_the_first_row_listing_it() {
+        let m = (-1.0f32).to_bits();
+        let (lo, hi) = (1.0f32.to_bits(), 1.5f32.to_bits());
+        let asto = [1, 0xaaaa, 2, 0xbbbb, 0xaaaa, 1, 0xcccc, 1, 0xdddd];
+        let columns = [
+            (HANDLE, 4),
+            (ANIMATION, 8),
+            (MIN_TIME_SCALE, 3),
+            (MAX_TIME_SCALE, 3),
+        ];
+        let rows: [&[u32]; 5] = [
+            &[ANY, 0, m, m],
+            &[1, 0, lo, hi],
+            &[2, 2, m, m],
+            &[3, 5, m, m],
+            &[4, 7, hi, hi],
+        ];
+        let t = AnimationTable::parse(&table(&columns, &rows, Some(&asto))).unwrap();
+        assert_eq!(time_scales(&t, 1), Some((1.0, 1.5)));
+        assert_eq!(time_scales(&t, 3), Some((-1.0, -1.0)));
+        let s = clip_time_scales(&t);
+        // aaaa: row 1 first (row 2 lists it again, without limits).
+        assert_eq!(s.get(&0xaaaa), Some(&(1.0, 1.5)));
+        // bbbb and cccc: rows without limits are left out.
+        assert_eq!(s.get(&0xbbbb), None);
+        assert_eq!(s.get(&0xcccc), None);
+        assert_eq!(s.get(&0xdddd), Some(&(1.5, 1.5)));
+        assert_eq!(s.len(), 2);
     }
 }

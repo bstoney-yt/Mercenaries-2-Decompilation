@@ -31,7 +31,10 @@ use rapier3d::control::{
     KinematicCharacterController, WheelTuning,
 };
 
-use crate::tuning::{BikeTuning, BoatTuning, FlightTuning};
+use crate::tuning::{
+    BikeTuning, BoatTuning, EngineTuning, FlightTuning, Gearbox, Handling, Springs, TankTuning,
+    Tyres,
+};
 use crate::vehicle::VehicleSpec;
 use rapier3d::prelude as r;
 
@@ -41,6 +44,10 @@ pub const STEP_HEIGHT: f32 = 0.5;
 pub const MAX_SLOPE: f32 = 50.0 * std::f32::consts::PI / 180.0;
 /// Downward acceleration, m/s².
 pub const GRAVITY: f32 = 9.81;
+/// The gravity the 360 car code pulls with where it works its own, m/s²
+/// (the constant at 0x82DE8C30, -10, that the gravity factor's pull at
+/// 0x8219EE4C and 14 other physics routines read).
+pub const GRAVITY_360: f32 = 10.0;
 /// Slowest a vehicle's wheels and tracks are seen to roll, m/s: under
 /// it a vehicle is settling, not driving
 /// ([`Physics::vehicle_rolling`]). Invented.
@@ -868,14 +875,13 @@ pub enum StaticKey {
     Entity(u32),
 }
 
-/// How far each wheel may rise above where its model has it, metres.
-/// Invented. Its spring is this much longer than that plus what the
-/// vehicle's weight squeezes it ([`preloads`]), so standing it sits as
-/// its model has it (inferred: the models' wheels rest on their floor)
-/// and its drawn wheels follow their springs
-/// ([`Physics::vehicle_wheel_lift`]). Before, all 113 wheeled template
-/// groups' tyres were drawn into the road, 9.3 cm on average and 36.5 cm
-/// at worst; now 0.2 cm at worst (susptest's `sunk` columns).
+/// A tracked vehicle's road wheels: how far each may rise above where its
+/// model has it, metres. Invented (the 360 code drives tanks with their
+/// own `_TankPhysics`, not traced yet; a wheeled vehicle's springs are its
+/// template's [`Springs`]). Its spring is this much longer than that plus
+/// what the vehicle's weight squeezes it ([`preloads`]), so standing it
+/// sits as its model has it and its drawn wheels follow their springs
+/// ([`Physics::vehicle_wheel_lift`]).
 const SUSPENSION: f32 = 0.3;
 /// How far each wheel's spring is squeezed by the vehicle's weight
 /// standing on level ground, metres, in spec order: the front (steering)
@@ -918,20 +924,14 @@ fn preloads(spec: &VehicleSpec, strength: impl Fn(bool) -> f32, mass_z: f32) -> 
         .collect()
 }
 
-/// Each wheel's spring and dampers (squeezed, stretched), per kilogram,
-/// for a vehicle whose template gives no `FrontWheelSuspStrength` and
-/// the rest ([`Handling`](crate::tuning::Handling)'s `spring` and
-/// `damping`). Invented.
+/// A tracked vehicle's road wheels' springs and dampers (squeezed,
+/// stretched), per kilogram. Invented.
 const SPRING: f32 = 40.0;
 const DAMPING: (f32, f32) = (2.0, 3.0);
-/// Steering lock at a standstill, radians, for a vehicle whose template
-/// gives none (its `SteerMaxAngle` otherwise,
-/// [`Handling`](crate::tuning::Handling)). Invented.
-const MAX_STEER: f32 = 0.6;
-/// Braking with the throttle against the motion (for a vehicle whose
-/// template gives no `FrontBrake` and `RearBrake`), the handbrake (on
-/// the wheels that don't steer), rolling with no throttle, and holding
-/// still, m/s² (as if all wheels braked so). Invented.
+/// A tank's braking with the throttle against the motion, its handbrake
+/// (on the wheels that don't steer), rolling with no throttle, and
+/// holding still, m/s² (as if all wheels braked so). Invented: a wheeled
+/// vehicle's tyres slow it as its template's [`Tyres`] say.
 const SERVICE_BRAKE: f32 = 8.0;
 /// The tyres' friction coefficient, for a vehicle whose template gives
 /// no `FrontWheelFrictionSide` and `RearWheelFrictionSide`. Invented.
@@ -939,7 +939,7 @@ const GRIP: f32 = 2.0;
 const HANDBRAKE: f32 = 9.0;
 const ROLLING: f32 = 0.6;
 const HOLD: f32 = 3.0;
-/// Left to itself, a vehicle rolling faster than this (m/s) slows at
+/// Left to itself, a tank rolling faster than this (m/s) slows at
 /// [`HOLD`], then holds with every wheel as hard as the handbrake.
 const PARKED_FAST: f32 = 3.0;
 /// How far a ragdoll's limb may drift off its joint before it is put
@@ -963,12 +963,9 @@ const REVERSE_SPEED: f32 = 8.0;
 /// 4 m/s² falling to nothing at the top (the playtest's "vehicles feel
 /// slower"); its own engine now sets how it gathers speed. Invented.
 const GROUND_DAMPING: f32 = 0.02;
-/// How a vehicle's pull fades as it reaches its top speed, over this
-/// many m/s below it (its template's `MaxSpeed` caps it). Invented.
-const TOP_EASE: f32 = 1.0;
-/// A tracked vehicle's most pull, m/s², shaped by its tracks' curve
-/// ([`VehicleTuning::tracks`](crate::VehicleTuning)); and a vehicle's
-/// whose template gives neither engine nor tracks. Invented.
+/// A tracked vehicle's pull, m/s², falling to nothing at its top speed,
+/// when its template gives no `_TankPhysics` ([`drive_tracks`] drives one
+/// that does). Invented.
 const TRACK_PULL: f32 = 4.0;
 /// Boats ([`Physics::set_water`]): how deep a boat's origin floats,
 /// metres (the layers put the start's boat 0.35 m under the -36 m sea,
@@ -1000,11 +997,6 @@ const BOAT: BoatTuning = BoatTuning {
 pub const PLANE_SPEED: f32 = 12.0;
 const PLANE_RISE: f32 = 0.3;
 const PLANE_TRIM: f32 = 0.25;
-/// The steepest hill a wheeled vehicle takes about as fast as the flat,
-/// radians: uphill the engine pulls as a lower gear would
-/// (invented; the playthrough's jeep and tank take the hill roads at
-/// speed). Steeper than this, it slows and in the end slides back.
-const CLIMB: f32 = 0.52;
 /// Tracks grip: on the ground, a tracked vehicle's weight doesn't pull it
 /// down hills up to this steep, radians, so it climbs, turns and stands on
 /// them as on the flat (a play-tester: the game's tank "should be able to climb
@@ -1022,17 +1014,24 @@ const CLIMB_EASE: f32 = 1.5;
 /// How quickly it leans to the tilt its stick asks, a second (its
 /// template's `PitchAccel` and `RollAccel` scale it).
 const LEAN_EASE: f32 = 3.0;
-/// A motorbike's balance when its template gives none: the Scooter's and
-/// the Chopper's strength and damps, the most common control in the air
-/// (invented: a mid-range record's).
+/// A motorbike's balance when its template gives none (invented: the
+/// Scooter's record, one of the island's commonest bikes).
 const BIKE: BikeTuning = BikeTuning {
+    roll_rate: 1.5,
+    roll_angle: (1.0, 0.3),
+    roll_input: 0.0,
     roll: 20.0,
-    damp: [10.0, 10.0, 1.0],
+    wheelie: 0.65,
+    pitch_strength: (30.0, 30.0),
+    pitch_high_speed: 1.0,
+    wheelie_steer: 1.0,
+    side_damp: 10.0,
+    damp: [11.0, 10.0, 1.0],
     air: (5.0, 1.5),
+    low_speed: 70.0 / 3.6,
+    inertia: [1.5, 0.3, 1.5],
+    centre_of_mass: [0.0; 3],
 };
-/// The most a motorbike leans to balance a turn, radians (45 degrees;
-/// invented: flat out at full lock its tyres' grip asks up to 66).
-const BIKE_LEAN: f32 = 0.785;
 
 /// A helicopter's body is at most this wide, metres either side: its hull
 /// box leaves the rotor disc out.
@@ -1058,6 +1057,21 @@ struct VehicleBody {
     mass: f32,
     /// Which wheels steer (the front axle), in wheel order.
     steers: Vec<bool>,
+    /// How far each wheel's spring's top sits above where the model has
+    /// the wheel's centre, metres, in wheel order.
+    tops: Vec<f32>,
+    /// How its tyres hold it ([`Tyres`]; a tank's are Rapier's, invented).
+    tyres: Option<Tyres>,
+    /// What its driver asks of its front and back axles' tyres now
+    /// ([`Physics::drive`]), which they push it with each step
+    /// ([`push_axles`]).
+    axles: [Axle; 2],
+    /// How well it stands on the ground under it now ([`Tyres::footing`];
+    /// 1 on the flat).
+    footing: f32,
+    /// Its weight on the ground, of its plain weight ([`Springs`]'s
+    /// `gravity_factor`; 1 for a tank).
+    gravity_factor: f32,
     /// On tracks: turns on the spot instead of steering wheels.
     tracked: bool,
     /// On two wheels in line: held up, leaning into its turns.
@@ -1065,14 +1079,20 @@ struct VehicleBody {
     /// Top speed forwards and backing up, m/s.
     top: f32,
     reverse_top: f32,
-    /// Its template's engine and gearbox, or its tracks' pull over its
-    /// speed ([`VehicleTuning`](crate::VehicleTuning)).
-    engine: Option<crate::tuning::EngineTuning>,
-    tracks: Option<[f32; 4]>,
-    /// The forward gear its engine is in (0 is first), and how long its
-    /// clutch is still out changing to it, seconds.
-    gear: usize,
-    clutch: f32,
+    /// A wheeled vehicle's engine and gearbox (its template's, else the
+    /// 360 code's defaults).
+    engine: Option<EngineTuning>,
+    /// A tracked vehicle's drive and tracks as the 360 code runs them,
+    /// with its template's `_TankPhysics` ([`drive_tracks`]).
+    tank: Option<Tracks>,
+    /// Its gearbox as it runs.
+    gearbox: Gearbox,
+    /// The torque its engine drives its wheels with now, newton-metres,
+    /// through its gear and eased by its top speed ([`drive_axles`]).
+    drive: f32,
+    /// Its driver has the throttle open (its engine driving it, or about
+    /// to once its clutch delay is out).
+    pulling: bool,
     /// Its driver brakes: pulls against the way it rolls, or holds the
     /// handbrake (not a parked vehicle's hold).
     braking: bool,
@@ -1101,13 +1121,55 @@ struct Rotorcraft {
     lift: f32,
 }
 
-/// A motorbike's balance: its template's (else [`BIKE`]), and its body's
-/// inertia about its own axes (right, up, ahead), per kilogram, m², that
-/// turns those per-kilogram torques into turning accelerations.
+/// One axle's tyres as its driver works them ([`Tyres`]): its coefficient
+/// along, m/s², and across, per second, as the 360 code works them out.
+#[derive(Clone, Copy, Debug, Default)]
+struct Axle {
+    along: f32,
+    across: f32,
+    /// Parked: it holds still, up to its coefficients (along, and across
+    /// as though sliding at 1 m/s), as a tank does (invented).
+    hold: bool,
+}
+
+impl Axle {
+    /// Front and back, standing with nobody at the wheel.
+    fn standing(tyres: &Option<Tyres>) -> [Axle; 2] {
+        let axle = |front| {
+            tyres.map_or(Axle::default(), |t| Axle {
+                along: t.slowing(front, 0.0, 0.0, 0.0, 0.0, 0.0),
+                across: t.grip(front, 0.0, 0.0, 0.0, 0.0),
+                hold: false,
+            })
+        };
+        [axle(true), axle(false)]
+    }
+}
+
+/// A motorbike's balance: its template's (else [`BIKE`]), and where its
+/// steering stands as its balance eases it (0x270 of the 360's car; 360
+/// sign, positive to the right).
 #[derive(Clone, Copy)]
 struct Bike {
     tuning: BikeTuning,
-    inertia: Vec3,
+    steer: f32,
+}
+
+/// What a motorbike's balance reads of it each step besides its body:
+/// its wheels and how many touch the ground, the mean of their contacts'
+/// normals (up if none), its speed of its top speed and its rider's
+/// inputs as the 360 code has them (steering positive to the right, the
+/// stick's forward and back, throttle and brake).
+#[derive(Clone, Copy, Debug)]
+struct BikeFooting {
+    wheels: usize,
+    touching: usize,
+    normal: Vec3,
+    top: f32,
+    steer: f32,
+    stick: f32,
+    throttle: f32,
+    brake: f32,
 }
 
 /// A boat's hull in the water: the points on its waterline that float it,
@@ -1176,61 +1238,537 @@ const VEHICLE: r::Group = r::Group::GROUP_4;
 /// through a gate's rubble in the videos; shots pass).
 const RUBBLE: r::Group = r::Group::GROUP_5;
 
-/// Of a tracked vehicle's most pull, what its tracks give at `along` of
-/// its top speed (0 to 1): its curve's four points at a standstill, a
-/// third, two thirds and all of it, between them in a line.
-fn track_pull(curve: [f32; 4], along: f32) -> f32 {
-    let at = along.clamp(0.0, 1.0) * 3.0;
-    let i = (at as usize).min(2);
-    let k = at - i as f32;
-    curve[i] + (curve[i + 1] - curve[i]) * k
+/// A tracked vehicle's push at `s` of its top speed, of its most: its
+/// curve's points (of its top speed, of its most) in a line between, as
+/// the 360 code finds the stretch `s` is on (0x821A55F0: the first whose
+/// end it hasn't reached, the last from the second point on).
+fn track_push(curve: [(f32, f32); 4], s: f32) -> f32 {
+    let mut i = 1;
+    while i < 3 && s >= curve[i].0 {
+        i += 1;
+    }
+    let ((a, ra), (b, rb)) = (curve[i - 1], curve[i]);
+    let k = if b > a { (s - a) / (b - a) } else { 1.0 };
+    (1.0 - k) * ra + k * rb
 }
 
-/// A motorbike's spin after a step of `dt` s, from its spin `w` (rad/s,
-/// world), turned `turn` and moving at `velocity`: its template's
-/// strength turns it towards the lean that balances its turn (at most
-/// [`BIKE_LEAN`]), against its roll damp, and its pitch and yaw damps
-/// slow those; in the air its rider's `controls` turn its nose
-/// (throttle ahead dips it) and its heading. Each is a torque per
-/// kilogram over its inertia per kilogram, stepped implicitly so the
-/// stiffest (the street bike's 250 against a 0.2 m² roll inertia)
-/// stays steady at 60 steps a second.
-fn balance(
-    bike: Bike,
-    turn: Quat,
-    velocity: Vec3,
-    w: Vec3,
-    controls: Option<VehicleControls>,
-    dt: f32,
-) -> Vec3 {
-    let BikeTuning { roll, damp, air } = bike.tuning;
-    let per = |i: f32| 1.0 / i.max(1e-3);
-    // Leans so its weight and its turn's pull sum along its up axis.
-    let pull = Vec3::new(0.0, w.y, 0.0).cross(velocity).with_y(0.0);
-    let most = GRAVITY * BIKE_LEAN.tan();
-    let pull = pull.clamp_length_max(most);
-    let want = (Vec3::Y * GRAVITY + pull).normalize();
-    // About its heading, level (so a turn's yaw is no pitch or roll).
-    let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or(Vec3::Z);
-    let off = (turn * Vec3::Y).cross(want).dot(ahead);
-    let (k, c) = (roll * per(bike.inertia.z), damp[0] * per(bike.inertia.z));
-    let spin = w.dot(ahead);
-    let rolled = spin + dt * (k * off - c * spin) / (1.0 + c * dt + k * dt * dt);
-    let mut w = w + ahead * (rolled - spin);
-    // Pitch about its left, level (nose down positive); yaw about the
-    // vertical.
-    let (stick, steer) = controls.map_or((0.0, 0.0), |c| {
-        (c.throttle.clamp(-1.0, 1.0), c.steer.clamp(-1.0, 1.0))
-    });
-    for (axis, inertia, damp, push) in [
-        (Vec3::Y.cross(ahead), bike.inertia.x, damp[1], stick * air.0),
-        (Vec3::Y, bike.inertia.y, damp[2], steer * air.1),
-    ] {
-        let spin = w.dot(axis);
-        let to = (spin + dt * push * per(inertia)) / (1.0 + damp * per(inertia) * dt);
-        w += axis * (to - spin);
+/// The 360 code's frame-rate-free ease (0x824BB050): `from` moves
+/// towards `to` keeping `keep` of the gap each sixtieth of a second (all
+/// of it at once for `keep` 0), part steps in proportion; the last bit
+/// snaps.
+fn ease_towards(mut from: f32, to: f32, keep: f32, mut dt: f32) -> f32 {
+    const TICK: f32 = 1.0 / 60.0;
+    if dt > 1000.0 * TICK {
+        return if keep <= 0.9999 { to } else { from };
     }
-    w
+    let take = 1.0 - keep;
+    while dt > TICK {
+        let gap = to - from;
+        if gap * gap < (keep * 1e-5) * (keep * 1e-5) {
+            return to;
+        }
+        dt -= TICK;
+        from += gap * take;
+    }
+    let next = from + (to - from) * take;
+    next * (dt * 60.0) + (1.0 - dt * 60.0) * from
+}
+
+/// A tracked vehicle as the 360 code drives it: its template's tuning,
+/// its throttle and steering as they ease (0x330, 0x35C of the 360's
+/// tank) and each track point's grip along and across now (0x84, 0x88
+/// of its wheel).
+#[derive(Clone, Debug)]
+struct Tracks {
+    tuning: TankTuning,
+    throttle: f32,
+    steer: f32,
+    grip: Vec<(f32, f32)>,
+}
+
+impl Tracks {
+    fn new(tuning: TankTuning, points: usize) -> Self {
+        Self {
+            tuning,
+            throttle: 0.0,
+            steer: 0.0,
+            grip: vec![tuning.friction; points],
+        }
+    }
+}
+
+/// What [`drive_tracks`] reads of a tracked vehicle each step besides its
+/// spin and velocity: its attitude, its centre of mass and mass, each
+/// track point's contact with the ground (point and normal, world) if it
+/// touches, and its driver's throttle and steering as the 360 code has
+/// them (throttle negative ahead, steering positive to the right), or
+/// held with nobody in it.
+struct TrackFooting<'a> {
+    turn: Quat,
+    centre: Vec3,
+    mass: f32,
+    points: &'a [Option<(Vec3, Vec3)>],
+    throttle: f32,
+    steer: f32,
+    held: bool,
+}
+
+/// One step of `dt` s of a tracked vehicle as the 360 code drives it (its
+/// step, 0x821A49E8, without its springs), in its order. `motion` reads
+/// its spin and velocity afresh (world); `push` gives it an impulse,
+/// linear at a point (world) or angular when the point is `None`.
+///
+/// - How far it leans (0x821A5BC0): level (1) until its steeper of its
+///   pitch and roll passes 25 to 40 degrees (with the throttle), none
+///   past 45 to 60; a level vehicle's tracks push it only across the
+///   ground (their up share is dropped).
+/// - Its tracks (0x821A5D30): each touching point's grip eases (keeping
+///   95% along, 80% across, each sixtieth of a second) towards its
+///   rolling grip less the throttle's share, or its brake with the
+///   throttle against its motion, and across towards its side grip,
+///   scaled by its high-speed grip towards its top speed; off the ground
+///   none. Each pushes back mass x grip x its point's speed along (up
+///   to 1 m/s) and across the hull, level (0x821A62A8).
+/// - Its drive (0x821A53E0): its throttle eases (its engine inertia);
+///   with a point down, the throttle not against its motion and under
+///   its top speed, it pushes |eased| x throttle x its curve x torque x
+///   200 N along the ground under it, at its centre of mass up the
+///   ground's normal by its engine height.
+/// - Its steering (0x821A5158): eased (its steering inertia, or letting
+///   go to nothing with its no-input inertia whenever the stick asks less
+///   or the other way), less a share at speed, it turns it by a pair of
+///   pushes either side, mass x steer speed (less that share again).
+/// - Its spin is damped about its own axes; points off the ground pull
+///   it down by its gravity factor less 1, 1.5 m/s² each (0x821A4F10).
+fn drive_tracks(
+    t: &mut Tracks,
+    f: &TrackFooting<'_>,
+    mut motion: impl FnMut() -> (Vec3, Vec3),
+    mut push: impl FnMut(Vec3, Option<Vec3>),
+    dt: f32,
+) {
+    let tun = t.tuning;
+    let (side, up, ahead) = (f.turn * Vec3::X, f.turn * Vec3::Y, f.turn * Vec3::Z);
+    let pitch_of = |v: Vec3| (v.y / v.length().max(1e-6)).clamp(-1.0, 1.0).asin();
+    let (thr, mass) = (f.throttle, f.mass);
+    // How far it leans.
+    let narrow = 20f32.to_radians();
+    let wide = 45f32.to_radians() + t.throttle.abs() * 15f32.to_radians();
+    let (a, b) = (pitch_of(side), pitch_of(ahead));
+    let tilt = if a * a < b * b { b } else { a };
+    let level = 1.0 - ((tilt - (wide - narrow)) / narrow).clamp(0.0, 1.0);
+    // Its tracks.
+    let (w, v) = motion();
+    let top = tun.max_speed.max(1e-3);
+    let s = (v.length() / top).clamp(0.0, 1.0);
+    let braking = f.held || ahead.dot(v) * thr > 0.1;
+    let scale = tun.high_speed_grip * s + (1.0 - s);
+    let across = side.with_y(0.0);
+    let mut pushes = Vec::with_capacity(f.points.len());
+    for (grip, point) in t.grip.iter_mut().zip(f.points) {
+        let Some((at, _)) = *point else {
+            *grip = (0.0, 0.0);
+            continue;
+        };
+        let along = if braking {
+            tun.brake
+        } else {
+            (1.0 - thr.abs()) * tun.friction.0
+        };
+        grip.0 = ease_towards(grip.0 * scale, along, 0.95, dt).max(0.0);
+        grip.1 = ease_towards(grip.1 * scale, tun.friction.1, 0.8, dt).max(0.0);
+        let there = v + w.cross(at - f.centre);
+        let force = -ahead * (mass * grip.0 * there.dot(ahead).clamp(-1.0, 1.0))
+            - across * (mass * grip.1 * there.dot(across));
+        let mut impulse = force * dt;
+        impulse.y *= 1.0 - level;
+        pushes.push((impulse, at));
+    }
+    for (impulse, at) in pushes {
+        push(impulse, Some(at));
+    }
+    // Its drive.
+    let (_, v) = motion();
+    let s = (v.length() / top).min(1.0);
+    t.throttle = ease_towards(t.throttle, thr, tun.engine_inertia, dt).clamp(-1.0, 1.0);
+    let normals: Vec<Vec3> = f.points.iter().flatten().map(|&(_, n)| n).collect();
+    if !normals.is_empty() {
+        let n = normals.iter().sum::<Vec3>() / normals.len() as f32;
+        let dir = side.cross(n);
+        let dir = if dir.length_squared() > 0.0 {
+            dir.normalize()
+        } else {
+            ahead
+        };
+        if thr * ahead.dot(v) <= 0.1 && s < 1.0 {
+            let pull = t.throttle.abs() * track_push(tun.curve, s) * tun.torque * 200.0 * thr * dt;
+            push(-dir * pull, Some(f.centre + n * tun.engine_height));
+        }
+    }
+    // Its steering.
+    let (_, v) = motion();
+    let loss = (1.0 - (v.length() / top).min(1.0) * tun.steer_loss).clamp(0.0, 1.0);
+    let mut want = f.steer * loss;
+    let mut keep = tun.steer_inertia.0;
+    if want == 0.0 || t.steer * want < -0.01 || t.steer.abs() > want.abs() {
+        keep = tun.steer_inertia.1;
+        want = 0.0;
+    }
+    t.steer = ease_towards(t.steer, want, keep, dt);
+    let turn = t.steer * mass * tun.steer_speed * loss * dt;
+    if turn != 0.0 {
+        push(-ahead * turn, Some(f.centre - side));
+        push(ahead * turn, Some(f.centre + side));
+    }
+    // Its spin damped, and the pull on its points off the ground.
+    let (w, _) = motion();
+    let [dx, dy, dz] = tun.ang_damp;
+    let damp = side * (w.dot(side) * dx) + up * (w.dot(up) * dy) + ahead * (w.dot(ahead) * dz);
+    push(-damp * mass * dt, None);
+    let off = f.points.iter().filter(|p| p.is_none()).count() as f32;
+    let pull = (tun.gravity_factor - 1.0) * off * mass * -1.5;
+    if pull != 0.0 {
+        push(Vec3::Y * pull * dt, Some(f.centre));
+    }
+}
+
+/// A motorbike's balance for a step of `dt` s, as the 360 code holds it
+/// up (0x8219D800): it splits the step into sixtieths of a second (one
+/// to six of them) and in each, reading its spin and velocity afresh
+/// (`motion`: angular, then linear, world), `push`es it with an angular
+/// and a linear impulse per kilogram (the caller times its mass). `turn`
+/// is its attitude, held over the step.
+///
+/// - On the ground it rolls towards a lean: from its turning rate, minus
+///   its blended most lean ([`BikeTuning::roll_angle`]) times its turning
+///   rate over [`BikeTuning::roll_rate`] (at most 1 either way), and from
+///   its steering ([`BikeTuning::roll_input`], faded in up to
+///   [`BikeTuning::low_speed`]), their sum held to the larger of them;
+///   upright unless both wheels touch. Strength times the lean it is off
+///   (asin of its sideways axis's height) less roll damp times its roll
+///   rate, about its heading, level.
+/// - Rolling forwards, its nose turns towards the ground's slope (plus
+///   a wheelie's pitch with the stick held and the throttle or brake
+///   open), by the pitch strengths eased off towards its top speed, less
+///   pitch damp; in the air its stick pitches it instead. About its
+///   sideways axis, level.
+/// - Its yaw is damped, about the vertical; its eased steering turns it
+///   in the air (and in a wheelie on the ground).
+/// - In a wheelie on the ground its side damp holds it from sliding.
+fn hold_bike(
+    bike: &mut Bike,
+    f: BikeFooting,
+    turn: Quat,
+    mut motion: impl FnMut() -> (Vec3, Vec3),
+    mut push: impl FnMut(Vec3, Vec3),
+    dt: f32,
+) {
+    let t = bike.tuning;
+    if !t.balances() {
+        return;
+    }
+    let (side, up, ahead) = (turn * Vec3::X, turn * Vec3::Y, turn * Vec3::Z);
+    let pitch_of = |v: Vec3| (v.y / v.length().max(1e-6)).clamp(-1.0, 1.0).asin();
+    let airborne = f.touching == 0;
+    // Along the ground under it, ahead.
+    let along = side.cross(f.normal).normalize_or_zero();
+    let gear = if f.stick > 0.0 { f.throttle } else { f.brake };
+    let gear = gear * gear;
+    let steps = ((dt * 60.0).ceil() as i32).clamp(1, 6);
+    let dt = dt / steps as f32;
+    for _ in 0..steps {
+        let (w, v) = motion();
+        let speed = v.with_y(0.0).length();
+        let fast = if f.top > 0.0 {
+            (speed / f.top).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let slow = if t.low_speed > 0.0 {
+            1.0 - (speed / t.low_speed).min(1.0)
+        } else {
+            0.0
+        };
+        let (roll_rate, pitch_rate, yaw_rate) = (w.dot(ahead), w.dot(side), w.dot(up));
+        if !airborne {
+            let from_turn = if t.roll_rate != 0.0 {
+                let most = (1.0 - fast) * t.roll_angle.1 + fast * t.roll_angle.0;
+                -most * (yaw_rate / t.roll_rate).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            let from_steer = (1.0 - slow) * t.roll_input * f.steer;
+            let most = from_turn.abs().max(from_steer.abs());
+            let want = if f.touching >= f.wheels {
+                (from_turn + from_steer).clamp(-most, most)
+            } else {
+                0.0
+            };
+            let roll = (want - pitch_of(side)) * t.roll - t.damp[0] * roll_rate;
+            if roll != 0.0 {
+                push(ahead.with_y(0.0) * roll * dt, Vec3::ZERO);
+            }
+        }
+        if v.dot(ahead) > 0.0 {
+            let sign = if f.stick < 0.0 { -1.0 } else { 1.0 };
+            let lift = ((f.stick.abs() - 0.5) * 2.0).clamp(0.0, 1.0);
+            let eased = t.pitch_high_speed * fast + (1.0 - fast);
+            let off = pitch_of(along) - pitch_of(ahead);
+            let want = -(lift * sign * t.wheelie * gear);
+            let strength = if want.abs() > off.abs() {
+                t.pitch_strength.0
+            } else {
+                t.pitch_strength.1
+            };
+            let damp = t.damp[1] * pitch_rate;
+            let pitch = if airborne {
+                -(f.stick * t.air.0) - damp
+            } else {
+                strength * (want - off) * eased - damp
+            };
+            if pitch != 0.0 {
+                push(side.with_y(0.0) * pitch * dt, Vec3::ZERO);
+            }
+        }
+        let sign = if f.steer < 0.0 { -1.0 } else { 1.0 };
+        let target = ((f.steer.abs() - 0.25) * (4.0 / 3.0)).clamp(0.0, 1.0) * sign;
+        let keep = if target * target > bike.steer * bike.steer {
+            0.9
+        } else {
+            0.0
+        };
+        bike.steer = ease_towards(bike.steer, target, keep, dt);
+        let damp = -(w.y * t.damp[2]);
+        let yaw = if airborne {
+            damp - t.air.1 * bike.steer
+        } else {
+            // Forwards; backing up the 360 code turns it the other way
+            // (0x98 clear), never in the alpha (no stick).
+            damp - f.stick.abs() * t.wheelie_steer * bike.steer * gear
+        };
+        if yaw != 0.0 {
+            push(Vec3::Y * yaw * dt, Vec3::ZERO);
+        }
+        if !airborne && t.side_damp != 0.0 {
+            let slide = -(f.stick.abs() * t.side_damp * v.dot(side));
+            push(Vec3::ZERO, side * slide * dt);
+        }
+    }
+}
+
+/// How fast a wheeled vehicle's driven wheels turn, rpm, as its engine
+/// feels them (from the 360 code, 0x8219E678): each wheel's ground speed
+/// along it (the chassis' velocity at its contact, the front's turned as
+/// they steer) over its radius, weighted by its share of the drive: the
+/// back's `split` x 2 over their number, the front's the rest (0x821A0390;
+/// the shares add up to 2).
+fn driven_rpm(
+    body: &r::RigidBody,
+    wheels: &[rapier3d::control::Wheel],
+    steers: &[bool],
+    steering: f32,
+    split: f32,
+) -> f32 {
+    let turn = Quat::from_array(body.position().rotation.to_array());
+    let (ahead, up) = (turn * Vec3::Z, turn * Vec3::Y);
+    let count = |front: bool| steers.iter().filter(|&&s| s == front).count().max(1) as f32;
+    let share = |front: bool| {
+        if front {
+            (1.0 - split) * 2.0 / count(true)
+        } else {
+            split * 2.0 / count(false)
+        }
+    };
+    wheels
+        .iter()
+        .zip(steers)
+        .map(|(w, &front)| {
+            let along = if front {
+                Quat::from_axis_angle(up, steering) * ahead
+            } else {
+                ahead
+            };
+            let at = w.raycast_info().contact_point_ws;
+            let speed = vec3(body.velocity_at_point(at)).dot(along);
+            share(front) * speed / w.radius.max(0.05) * 60.0 / std::f32::consts::TAU
+        })
+        .sum()
+}
+
+/// Works out how well a wheeled vehicle stands on the ground under it
+/// ([`Tyres::footing`], from the lean of its wheels' contacts' mean
+/// normal) and takes that share of the level part off each spring's push
+/// (from the 360 code, 0x8219E020 and 0x8219C27C): on gentle ground its
+/// springs push it straight up, so it stands and drives as on the flat,
+/// and only nearing its steepest does the ground's lean push it down
+/// the hill. Rapier has pushed along the contact normal; this takes the
+/// share back at the same point.
+fn stand(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
+    let Some(tyres) = v.tyres else {
+        return;
+    };
+    let wheels = v.controller.wheels();
+    let normals: Vec<Vec3> = wheels
+        .iter()
+        .map(|w| w.raycast_info())
+        .filter(|r| r.is_in_contact)
+        .map(|r| vec3(r.contact_normal_ws))
+        .collect();
+    if normals.is_empty() {
+        v.footing = 0.0;
+        return;
+    }
+    let mean = normals.iter().sum::<Vec3>() / normals.len() as f32;
+    let tilt = (mean.with_y(0.0).length() / mean.length().max(1e-6))
+        .min(1.0)
+        .asin();
+    v.footing = tyres.footing(tilt);
+    let Some(body) = bodies.get_mut(v.controller.chassis) else {
+        return;
+    };
+    for w in wheels {
+        let ray = w.raycast_info();
+        if !ray.is_in_contact {
+            continue;
+        }
+        let push = w.wheel_suspension_force.min(w.max_suspension_force) * dt;
+        let level = vec3(ray.contact_normal_ws).with_y(0.0) * push * v.footing;
+        body.apply_impulse_at_point(vector(-level), ray.contact_point_ws, true);
+    }
+}
+
+/// Pushes a wheeled vehicle along and across with each of its axles as
+/// the 360 code does ([`Tyres`]; from the 360 code, at 0x8219C118 and
+/// 0x821A08D8): at the mean, over its wheels on the ground, of a point
+/// [`Tyres::sway`] of the way from each spring's top to its contact, by
+/// mass x step x (its coefficient along x the velocity there along its
+/// wheels clamped to +-1 m/s, along them, plus its coefficient across x
+/// the level velocity across them, across them, level), both against the
+/// motion and scaled by the share of the vehicle's wheels on the ground
+/// and of the axle's. Its engine's pull (the alpha's, along its wheels,
+/// for each wheel on the ground) is pushed there too. The front axle's
+/// wheels point as they steer.
+fn push_axles(v: &VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
+    let Some(tyres) = v.tyres else {
+        return;
+    };
+    let Some(body) = bodies.get_mut(v.controller.chassis) else {
+        return;
+    };
+    let wheels = v.controller.wheels();
+    let down = wheels
+        .iter()
+        .filter(|w| w.raycast_info().is_in_contact)
+        .count();
+    if down == 0 {
+        return;
+    }
+    let share = down as f32 / wheels.len() as f32;
+    let turn = Quat::from_array(body.position().rotation.to_array());
+    let (side, ahead, up) = (turn * Vec3::X, turn * Vec3::Z, turn * Vec3::Y);
+    let fast = (vec3(body.linvel()).with_y(0.0).length() / v.top.max(0.1)).min(1.0);
+    let sway = tyres.sway(fast, side.y);
+    for (axle, front) in v.axles.iter().zip([true, false]) {
+        let on: Vec<_> = wheels
+            .iter()
+            .zip(&v.steers)
+            .filter(|(_, s)| **s == front)
+            .map(|(w, _)| w)
+            .collect();
+        let grounded: Vec<_> = on
+            .iter()
+            .filter(|w| w.raycast_info().is_in_contact)
+            .collect();
+        if grounded.is_empty() {
+            continue;
+        }
+        let at = grounded
+            .iter()
+            .map(|w| {
+                let ray = w.raycast_info();
+                let top = vec3(ray.hard_point_ws);
+                top + (vec3(ray.contact_point_ws) - top) * sway
+            })
+            .sum::<Vec3>()
+            / grounded.len() as f32;
+        let steered = if front {
+            Quat::from_axis_angle(up, v.steering)
+        } else {
+            Quat::IDENTITY
+        };
+        let (along, across) = (steered * ahead, steered * side);
+        let level = across.with_y(0.0);
+        let k = share * grounded.len() as f32 / on.len() as f32;
+        let velocity = vec3(body.velocity_at_point(vector(at)));
+        let (slow, slide) = if axle.hold {
+            // What stops it there (its axles sharing its mass), up to
+            // its coefficients.
+            let stop = |v: f32, most: f32| (v / (2.0 * dt)).clamp(-most, most);
+            (
+                stop(velocity.dot(along), axle.along * k),
+                stop(velocity.dot(level), axle.across * k),
+            )
+        } else {
+            (
+                axle.along * k * velocity.dot(along).clamp(-1.0, 1.0),
+                axle.across * k * velocity.dot(level),
+            )
+        };
+        let push = -(along * slow + level * slide) * v.mass * dt;
+        body.apply_impulse_at_point(vector(push), vector(at), true);
+    }
+}
+
+/// Drives a wheeled vehicle as its engine turns its wheels ([`Physics::drive`]
+/// sets the torque; from the 360 code, 0x8219CAE8 to 0x8219CDEC): each
+/// wheel on the ground pushes with its share of the torque over its
+/// radius, along the way it points; each axle sums its wheels' pushes and
+/// pushes along their mean way at their contacts' mean, by how well it
+/// stands ([`Tyres::footing`]).
+fn drive_axles(v: &VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
+    let Some(e) = v.engine.filter(|_| v.tyres.is_some() && v.drive != 0.0) else {
+        return;
+    };
+    let Some(body) = bodies.get_mut(v.controller.chassis) else {
+        return;
+    };
+    let turn = Quat::from_array(body.position().rotation.to_array());
+    let (ahead, up) = (turn * Vec3::Z, turn * Vec3::Y);
+    let count = |front: bool| v.steers.iter().filter(|&&s| s == front).count().max(1) as f32;
+    for front in [true, false] {
+        let share = if front {
+            (1.0 - e.split) * 2.0 / count(true)
+        } else {
+            e.split * 2.0 / count(false)
+        };
+        let way = if front {
+            Quat::from_axis_angle(up, v.steering) * ahead
+        } else {
+            ahead
+        };
+        let grounded: Vec<_> = v
+            .controller
+            .wheels()
+            .iter()
+            .zip(&v.steers)
+            .filter(|(w, s)| **s == front && w.raycast_info().is_in_contact)
+            .map(|(w, _)| w)
+            .collect();
+        if grounded.is_empty() || share == 0.0 {
+            continue;
+        }
+        let pull: f32 = grounded
+            .iter()
+            .map(|w| share * v.drive / w.radius.max(0.05))
+            .sum();
+        let at = grounded
+            .iter()
+            .map(|w| vec3(w.raycast_info().contact_point_ws))
+            .sum::<Vec3>()
+            / grounded.len() as f32;
+        let push = way * pull * v.footing * dt;
+        body.apply_impulse_at_point(vector(push), vector(at), true);
+    }
 }
 
 /// Queries that see everything but ragdolls and rubble.
@@ -1441,6 +1979,26 @@ impl Physics {
                 filter,
             );
             v.controller.update_vehicle(dt, queries);
+            if !v.wrecked {
+                stand(v, &mut w.bodies, dt);
+                push_axles(v, &mut w.bodies, dt);
+                drive_axles(v, &mut w.bodies, dt);
+            }
+            // More than half its wheels down, it is pulled down by its
+            // template's `GravityFactor` less one of its weight more
+            // (from the 360 code, at 0x8219EE14, by its gravity of 10 m/s²,
+            // [`GRAVITY_360`]).
+            let wheels = v.controller.wheels();
+            let down = wheels
+                .iter()
+                .filter(|w| w.raycast_info().is_in_contact)
+                .count();
+            if !v.wrecked && v.gravity_factor != 1.0 && down * 2 > wheels.len() {
+                let pull = (v.gravity_factor - 1.0) * v.mass * GRAVITY_360 * dt;
+                if let Some(b) = w.bodies.get_mut(v.controller.chassis) {
+                    b.apply_impulse(r::Vector::new(0.0, -pull, 0.0), true);
+                }
+            }
         }
         self.float_boats(dt);
         self.fly_helicopters(dt);
@@ -1628,7 +2186,20 @@ impl Physics {
         velocity: Vec3,
         spin: Vec3,
     ) -> DebrisId {
-        self.add_piece(
+        self.add_falling_debris(piece, at, (velocity, spin), 1.0)
+    }
+
+    /// As [`add_debris`](Self::add_debris), pulled by `gravity` times the
+    /// world's gravity (a weapon lying to be taken: its template's
+    /// `PhysicsPropertyGravityScaler`).
+    pub fn add_falling_debris(
+        &mut self,
+        piece: &LoosePiece,
+        at: Mat4,
+        (velocity, spin): (Vec3, Vec3),
+        gravity: f32,
+    ) -> DebrisId {
+        let id = self.add_piece(
             piece,
             at,
             velocity,
@@ -1638,7 +2209,13 @@ impl Physics {
                 r::Group::ALL.difference(DEBRIS).difference(VEHICLE),
                 r::InteractionTestMode::And,
             ),
-        )
+        );
+        if gravity != 1.0
+            && let Some(b) = self.debris[id.0].and_then(|h| self.world.bodies.get_mut(h))
+        {
+            b.set_gravity_scale(gravity, true);
+        }
+        id
     }
 
     /// As [`add_debris`](Self::add_debris), a piece a building broke
@@ -1815,14 +2392,27 @@ impl Physics {
             size.x * size.x + size.z * size.z,
             size.x * size.x + size.y * size.y,
         ) * (m / 12.0 * 1.5);
+        // A motorbike's is its template's per kilogram times its mass, as
+        // the 360 code sets it (0x8219BA08), which its balance is tuned
+        // against.
+        let bike = spec.is_bike().then(|| spec.tuning.bike.unwrap_or(BIKE));
+        let inertia = bike.map_or(inertia, |b| Vec3::from(b.inertia) * m);
+        // Its centre of mass: a motorbike's at the middle of its wheels
+        // plus its template's offset, as the 360 code puts it
+        // (0x8219BABC; which point of a wheel it takes, 0xE0 of the
+        // wheel, isn't traced: its centre here).
+        let com = match bike {
+            Some(b) if !spec.wheels.is_empty() => {
+                let mid =
+                    spec.wheels.iter().map(|w| w.centre).sum::<Vec3>() / spec.wheels.len() as f32;
+                mid + Vec3::from(b.centre_of_mass) - centre
+            }
+            _ => Vec3::new(0.0, -half.y * 0.8, 0.0),
+        };
         let hull = r::InteractionGroups::new(VEHICLE, r::Group::ALL, r::InteractionTestMode::And);
         let collider = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
             .translation(vector(centre))
-            .mass_properties(r::MassProperties::new(
-                vector(Vec3::new(0.0, -half.y * 0.8, 0.0)),
-                m,
-                vector(inertia),
-            ))
+            .mass_properties(r::MassProperties::new(vector(com), m, vector(inertia)))
             .friction(0.6)
             .collision_groups(hull);
         self.world.insert_collider(collider, Some(body));
@@ -1840,39 +2430,57 @@ impl Physics {
         let mut controller = DynamicRayCastVehicleController::new(body);
         controller.index_up_axis = 1;
         controller.index_forward_axis = 2;
-        // Each axle's tyres grip as its template's side friction says (the
-        // steering axle's as the front's).
-        let handling = spec.tuning.handling.filter(|_| !spec.tracked);
-        let grip = |front: bool| handling.map_or(GRIP, |h| if front { h.grip.0 } else { h.grip.1 });
-        // Its springs and dampers as its template's, each axle's own.
-        let spring = |front: bool| {
-            handling.map_or((SPRING, DAMPING), |h| {
-                let (k, c) = if front {
-                    (h.spring.0, h.damping.0)
-                } else {
-                    (h.spring.1, h.damping.1)
-                };
-                (k, (c, c))
-            })
+        let tank = spec
+            .tuning
+            .tank
+            .filter(|_| spec.tracked)
+            .map(|t| Tracks::new(t, spec.wheels.len()));
+        // A tank with its template's tracks grips by them (`drive_tracks`),
+        // without one as Rapier's tyres by an invented friction; a wheeled
+        // vehicle's tyres give none there either.
+        let grip = if spec.tracked && tank.is_none() {
+            GRIP
+        } else {
+            0.0
         };
-        let preload = preloads(spec, |front| spring(front).0, centre.z);
+        // A wheeled vehicle's springs as the 360 code builds them from its
+        // template ([`Springs`], its defaults without one): each hangs
+        // from its squeeze above the model's wheel, as long as all its
+        // lengths, one damp both ways. Unlike rapier's, the 360's cast
+        // sets how short it gets (down to minus the wheel's radius, the
+        // hit at the cast's start), so its travel never clamps it.
+        let springs = (!spec.tracked).then(|| spec.tuning.springs.unwrap_or(Springs::DEFAULT));
+        // Its weight on the ground, a motorbike's too (the 360 code pulls
+        // every car down so, 0x8219EE14, and balances a bike after).
+        let gravity_factor = springs.map_or(1.0, |s| s.gravity_factor);
+        let preload = preloads(spec, |_| SPRING, centre.z);
+        let mut tops = Vec::with_capacity(spec.wheels.len());
         for (w, &preload) in spec.wheels.iter().zip(&preload) {
-            let (stiffness, (squeezed, stretched)) = spring(w.steers);
-            // Its spring is longer than SUSPENSION by what its share of
-            // the weight squeezes it, so standing it sits as its model
-            // has it: tyres on the ground, wheels in their arches.
-            let rest = SUSPENSION + preload;
+            let (stiffness, (squeezed, stretched), rest, top, travel) = match springs {
+                Some(s) => {
+                    let (k, c, length, top) = s.axle(w.steers);
+                    (k, (c, c), length, top, length + w.radius)
+                }
+                // A tank's are invented: longer than SUSPENSION by what
+                // its share of the weight squeezes them, so standing it
+                // sits as its model has it.
+                None => {
+                    let rest = SUSPENSION + preload;
+                    (SPRING, DAMPING, rest, SUSPENSION, rest)
+                }
+            };
+            tops.push(top);
             let tuning = WheelTuning {
                 suspension_stiffness: stiffness,
                 suspension_compression: squeezed,
                 suspension_damping: stretched,
-                max_suspension_travel: rest,
+                max_suspension_travel: travel,
                 side_friction_stiffness: 1.0,
-                friction_slip: grip(w.steers),
+                friction_slip: grip,
                 max_suspension_force: spec.mass * 40.0,
             };
             controller.add_wheel(
-                vector(w.centre + Vec3::Y * SUSPENSION),
+                vector(w.centre + Vec3::Y * top),
                 -r::Vector::Y,
                 // Forward = up x axle = +z.
                 -r::Vector::X,
@@ -1910,25 +2518,29 @@ impl Physics {
                 lift: 0.0,
             });
         let top = if boat { BOAT_TOP } else { TOP_SPEED };
+        let tyres = (!spec.tracked).then(|| spec.tuning.tyres.unwrap_or(Tyres::DEFAULT));
         let id = VehicleId(self.vehicles.len());
         self.vehicles.push(Some(VehicleBody {
             controller,
             mass: spec.mass,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
+            tops,
+            tyres,
+            axles: Axle::standing(&tyres),
+            footing: 1.0,
+            gravity_factor,
             tracked: spec.tracked,
-            bike: spec.is_bike().then(|| Bike {
-                tuning: spec.tuning.bike.unwrap_or(BIKE),
-                inertia: inertia / m.max(1.0),
-            }),
+            bike: bike.map(|tuning| Bike { tuning, steer: 0.0 }),
             top: spec.tuning.max_speed.unwrap_or(top),
             reverse_top: match spec.tuning.engine {
                 Some(e) if !spec.tracked => e.reverse_speed,
                 _ => (spec.tuning.max_speed.unwrap_or(top) * 0.5).min(REVERSE_SPEED),
             },
-            engine: spec.tuning.engine.filter(|_| !spec.tracked),
-            tracks: spec.tuning.tracks,
-            gear: 0,
-            clutch: 0.0,
+            engine: (!spec.tracked).then(|| spec.tuning.engine.unwrap_or(EngineTuning::DEFAULT)),
+            tank,
+            gearbox: Gearbox::default(),
+            drive: 0.0,
+            pulling: false,
             braking: false,
             handling: spec.tuning.handling.filter(|_| !spec.tracked),
             steering: 0.0,
@@ -1973,62 +2585,130 @@ impl Physics {
         }
         let speed = v.controller.current_vehicle_speed;
         let wheels = v.controller.wheels().len().max(1) as f32;
-        // How steeply its nose points up (the sine).
-        let nose = self
-            .world
-            .bodies
-            .get(v.controller.chassis)
-            .map_or(0.0, |b| (b.position().rotation * r::Vector::Z).y);
         // A wheel's brake is the most impulse it may take off per step:
         // this many m/s² over the whole vehicle.
         let slowing = |decel: f32| v.mass * decel * dt / wheels;
         let throttle = controls.throttle.clamp(-1.0, 1.0);
+        // A tank's throttle against the motion brakes it.
         let against = speed.abs() > 0.5 && throttle * speed < 0.0;
-        v.braking = !controls.parked && (controls.brake || against);
-        // Its gearbox changes up and down as its template's shift speeds
-        // say, rolling forwards, and while its clutch is out its engine
-        // drives nothing (the clutch's delay read so, inferred).
+        // A wheeled vehicle's pedals as the 360 code's two inputs, its
+        // throttle (0x2C) and brake (0x30): ahead the stick forward is the
+        // throttle and back the brake; in reverse they swap (inferred
+        // from 0x8219C540, which stays in reverse while the brake isn't
+        // held and leaves it when it is: which pad input feeds which isn't
+        // traced).
+        let (open, pressed) = match v.engine {
+            Some(_) => {
+                let t = if v.gearbox.gear == 0 {
+                    -throttle
+                } else {
+                    throttle
+                };
+                (t.max(0.0), (-t).max(0.0))
+            }
+            None if against => (0.0, throttle.abs()),
+            None => (throttle.abs(), 0.0),
+        };
+        v.braking = !controls.parked && (controls.brake || pressed > 0.0);
+        v.pulling = !controls.parked && !controls.brake && open > 0.0;
+        // Its engine drives its wheels as the 360 code's does
+        // ([`EngineTuning::step`]; the drive path at 0x8219C9EC): with at
+        // least half its wheels down, its torque through the gear it is in
+        // (nothing while its clutch delay runs) and off the handbrake,
+        // shared out to its wheels ([`push_axles`]), fading over the last
+        // twentieth of its `MaxSpeed` (`ReverseMaxSpeed` in reverse). Its
+        // gearbox goes into reverse once it is all but still (under 2
+        // km/h) with the brake held over 0.9 and the throttle under 0.1
+        // for a tenth of a second, and back out once that has stopped for
+        // as long (as the other drive path has it, 0x8219C490).
+        v.drive = 0.0;
         if let Some(e) = v.engine {
-            if v.clutch > 0.0 {
-                v.clutch -= dt;
+            let slow = speed.abs() * 3.6 < 2.0;
+            let asks = slow && pressed > 0.9 && open < 0.1;
+            let reversing = v.gearbox.gear == 0;
+            let gb = &mut v.gearbox;
+            gb.reversing = if asks != reversing {
+                (gb.reversing + dt).min(0.1)
             } else {
-                let next = e.shift(v.gear, speed.max(0.0));
-                if next != v.gear {
-                    v.gear = next;
-                    v.clutch = e.clutch_delay;
+                (gb.reversing - dt).max(-0.1)
+            };
+            let reverse = if gb.reversing >= 0.1 {
+                true
+            } else {
+                gb.reversing > -0.1 && reversing
+            };
+            let all = v.controller.wheels();
+            let down = all
+                .iter()
+                .filter(|w| w.raycast_info().is_in_contact)
+                .count();
+            if down >= all.len() / 2 {
+                let wheels = self
+                    .world
+                    .bodies
+                    .get(v.controller.chassis)
+                    .map_or(0.0, |b| driven_rpm(b, all, &v.steers, v.steering, e.split));
+                let torque = e.step(gb, dt, open, wheels, reverse);
+                let top = if gb.gear == 0 { e.reverse_speed } else { v.top };
+                let ease = ((top - speed.abs()) / (0.05 * top).max(1e-3)).clamp(0.0, 1.0);
+                if gb.clutch < 0.0 && !controls.brake {
+                    v.drive = e.ratio(gb.gear).abs() * torque * ease;
                 }
             }
         }
-        let declutched = v.clutch > 0.0 && throttle > 0.0;
-        // Pulls as its engine turns in the gear it is in, or as its
-        // tracks' curve says (else 4 m/s² falling to nothing at the
-        // top), up to its top speed; backs up to its reverse top speed
-        // (else half its top speed, at most 8 m/s).
+        // A tank without its template's tracks pulls 4 m/s² falling to
+        // nothing at its top speed (invented); one with them is driven as
+        // the 360 code drives it, below.
         let top = if throttle >= 0.0 {
             v.top
         } else {
             v.reverse_top
         };
         let headroom = (1.0 - speed.abs() / top).clamp(0.0, 1.0);
-        let ease = ((top - speed.abs()) / TOP_EASE).clamp(0.0, 1.0);
-        let push = match (v.engine, v.tracks) {
-            (Some(_), _) if declutched => 0.0,
-            (Some(e), _) => e.push_in(v.gear, speed.abs(), throttle < 0.0) / v.mass * ease,
-            (None, Some(curve)) => TRACK_PULL * track_pull(curve, 1.0 - headroom) * ease,
-            (None, None) => TRACK_PULL * headroom,
+        let push = if v.tank.is_some() {
+            0.0
+        } else {
+            TRACK_PULL * headroom
         };
-        // Uphill (the way it is driven), the pull that holds it as on the
-        // flat, up to its steepest hill (tracks hold it by their grip).
-        let most = if v.tracked { 0.0 } else { CLIMB };
-        let uphill = (nose * throttle.signum()).clamp(0.0, most.sin());
-        // Braking against the motion: each axle as its template's brake
-        // says (else 8 m/s²), the front's on the wheels that steer.
-        let service = |front: bool| {
-            let decel = v
-                .handling
-                .map_or(SERVICE_BRAKE, |h| if front { h.brake.0 } else { h.brake.1 });
-            slowing(decel * throttle.abs())
-        };
+        // A tank's braking against the motion (invented).
+        let service = |_front: bool| slowing(SERVICE_BRAKE * throttle.abs());
+        // A wheeled vehicle's axles' coefficients along and across as the
+        // 360 code works them out ([`Tyres`]), which [`push_axles`] pushes
+        // it with. Throttle against the motion is the brake pressed that
+        // hard. A parked one (nobody at the wheel) still holds as a tank
+        // does: what the 360 does with an empty car isn't traced, and on
+        // its handbrake (3 m/s² by the defaults) it would slide down a
+        // hill.
+        let fast = (speed.abs() / v.top.max(0.1)).min(1.0);
+        let tyres = v.tyres.map(|t| {
+            let held = if controls.brake { 1.0 } else { 0.0 };
+            let steer = controls.steer;
+            let share = |front: bool| {
+                let on = v.steers.iter().filter(|&&s| s == front).count();
+                on as f32 / v.steers.len().max(1) as f32
+            };
+            let axle = |front: bool| {
+                if controls.parked {
+                    let hard = if speed.abs() > PARKED_FAST {
+                        HOLD
+                    } else {
+                        HANDBRAKE
+                    };
+                    Axle {
+                        along: hard * share(front),
+                        across: t.grip(front, fast, 0.0, 0.0, 0.0),
+                        hold: true,
+                    }
+                } else {
+                    Axle {
+                        along: t.slowing(front, speed, open, pressed, held, steer),
+                        across: t.grip(front, fast, pressed, held, steer),
+                        hold: false,
+                    }
+                }
+            };
+            [axle(true), axle(false)]
+        });
         let (force, brake) = if controls.parked {
             let hard = if speed.abs() > PARKED_FAST {
                 HOLD
@@ -2041,25 +2721,26 @@ impl Physics {
         } else if against {
             (0.0, -1.0)
         } else if throttle != 0.0 {
-            let pull = push + GRAVITY * uphill;
-            (throttle * v.mass * pull / wheels, 0.0)
+            (throttle * v.mass * push / wheels, 0.0)
         } else if speed.abs() < 1.0 {
             (0.0, slowing(HOLD))
         } else {
             (0.0, slowing(ROLLING))
         };
-        // Its template's lock at a standstill, less as it speeds up (the
-        // fall with speed invented); the wheels swing there as quickly
-        // as its template says at this speed (else at once).
-        let lock = v.handling.map_or(MAX_STEER, |h| h.steer_lock);
-        let want = controls.steer.clamp(-1.0, 1.0) * lock / (1.0 + speed.abs() * 0.04);
-        let want = if v.tracked { 0.0 } else { want };
-        v.steering = match v.handling {
-            Some(h) => {
-                let most = h.swing(speed) * dt;
-                v.steering + (want - v.steering).clamp(-most, most)
-            }
-            None => want,
+        // Its front wheels turn as the 360 code turns them ([`Handling`];
+        // its defaults without a template); a tank's wheels don't.
+        v.steering = if v.tracked {
+            0.0
+        } else {
+            v.handling.unwrap_or(Handling::DEFAULT).steer(
+                v.steering,
+                controls.steer.clamp(-1.0, 1.0),
+                speed,
+                fast,
+                open,
+                pressed,
+                dt,
+            )
         };
         let steer = v.steering;
         let tracked = v
@@ -2068,11 +2749,19 @@ impl Physics {
         // Only the front axle steers: steering every wheel the same way
         // slides the vehicle sideways instead of turning it. The handbrake
         // locks the rest, so the back can slide out.
+        // A wheeled vehicle's axles hold it, not Rapier's tyres (which give
+        // it no grip), and its engine pushes it ([`push_axles`]).
+        if let Some(axles) = tyres {
+            v.axles = axles;
+        }
+        let own = tyres.is_some() || v.tank.is_some();
         for (i, w) in v.controller.wheels_mut().iter_mut().enumerate() {
             let front = v.steers.get(i).copied().unwrap_or(false);
-            w.engine_force = force;
+            w.engine_force = if own { 0.0 } else { force };
             w.steering = if front { steer } else { 0.0 };
-            w.brake = if controls.brake && !front {
+            w.brake = if own {
+                0.0
+            } else if controls.brake && !front {
                 slowing(HANDBRAKE)
             } else if brake < 0.0 {
                 service(front)
@@ -2088,26 +2777,53 @@ impl Physics {
             .count()
             >= 2;
         let mass = v.mass;
-        // A motorbike holds itself up as its template says, towards the
-        // lean that balances its turn; gravity and its tyres do the rest
-        // (it can fall over).
-        let airborne = !v
-            .controller
-            .wheels()
-            .iter()
-            .any(|w| w.raycast_info().is_in_contact);
-        if let Some(bike) = v.bike
+        // A motorbike holds itself up as the 360 code does ([`hold_bike`]);
+        // gravity and its tyres do the rest (it can fall over).
+        let top = v.top;
+        if let Some(bike) = &mut v.bike
             && let Some(body) = self.world.bodies.get_mut(v.controller.chassis)
         {
-            let w = balance(
+            let wheels = v.controller.wheels();
+            let touching: Vec<Vec3> = wheels
+                .iter()
+                .filter(|w| w.raycast_info().is_in_contact)
+                .map(|w| vec3(w.raycast_info().contact_normal_ws))
+                .collect();
+            let normal = if touching.is_empty() {
+                Vec3::Y
+            } else {
+                touching.iter().sum::<Vec3>() / touching.len() as f32
+            };
+            let footing = BikeFooting {
+                wheels: wheels.len(),
+                touching: touching.len(),
+                normal,
+                top,
+                // The alpha steers positive to the left, the 360 code
+                // to the right (its steering's lean and turn agree only
+                // so); the pad's stick forward and back has no key.
+                steer: -controls.steer.clamp(-1.0, 1.0),
+                stick: 0.0,
+                throttle: open,
+                brake: pressed,
+            };
+            let turn = Quat::from_array(body.position().rotation.to_array());
+            let body = std::cell::RefCell::new(body);
+            hold_bike(
                 bike,
-                Quat::from_array(body.position().rotation.to_array()),
-                vec3(body.linvel()),
-                vec3(body.angvel()),
-                airborne.then_some(controls),
+                footing,
+                turn,
+                || {
+                    let b = body.borrow();
+                    (vec3(b.angvel()), vec3(b.linvel()))
+                },
+                |spin, slide| {
+                    let mut b = body.borrow_mut();
+                    b.apply_torque_impulse(vector(spin * mass), true);
+                    b.apply_impulse(vector(slide * mass), true);
+                },
                 dt,
             );
-            body.set_angvel(vector(w), true);
         }
         // Tracks turn the hull on the spot (one track forward, the other
         // back), so the yaw is set directly; a little slower on the move.
@@ -2124,11 +2840,54 @@ impl Physics {
                 let held = (CLIMB_TRACKED.sin() / steep.max(1e-3)).min(1.0);
                 body.apply_impulse(-along * held * mass * dt, true);
             }
-            let w = body.angvel();
-            let rate = turn * TRACK_TURN / (1.0 + speed.abs() * 0.05);
-            let up = body.position().rotation * r::Vector::Y;
-            let keep = w - up * w.dot(up);
-            body.set_angvel(keep + up * rate, true);
+            if let Some(tank) = &mut v.tank {
+                let points: Vec<Option<(Vec3, Vec3)>> = v
+                    .controller
+                    .wheels()
+                    .iter()
+                    .map(|w| {
+                        let r = w.raycast_info();
+                        r.is_in_contact
+                            .then(|| (vec3(r.contact_point_ws), vec3(r.contact_normal_ws)))
+                    })
+                    .collect();
+                // The alpha's throttle is positive ahead and its steering
+                // positive to the left; the 360 code's the other way round
+                // for both (its drive pushes against the throttle, its
+                // steering turns the hull clockwise from above).
+                let footing = TrackFooting {
+                    turn: Quat::from_array(body.position().rotation.to_array()),
+                    centre: vec3(body.center_of_mass()),
+                    mass,
+                    points: &points,
+                    throttle: if controls.parked { 0.0 } else { -throttle },
+                    steer: if controls.parked { 0.0 } else { -turn },
+                    held: controls.parked,
+                };
+                let body = std::cell::RefCell::new(body);
+                drive_tracks(
+                    tank,
+                    &footing,
+                    || {
+                        let b = body.borrow();
+                        (vec3(b.angvel()), vec3(b.linvel()))
+                    },
+                    |impulse, at| {
+                        let mut b = body.borrow_mut();
+                        match at {
+                            Some(p) => b.apply_impulse_at_point(vector(impulse), vector(p), true),
+                            None => b.apply_torque_impulse(vector(impulse), true),
+                        }
+                    },
+                    dt,
+                );
+            } else {
+                let w = body.angvel();
+                let rate = turn * TRACK_TURN / (1.0 + speed.abs() * 0.05);
+                let up = body.position().rotation * r::Vector::Y;
+                let keep = w - up * w.dot(up);
+                body.set_angvel(keep + up * rate, true);
+            }
         }
     }
 
@@ -2214,16 +2973,17 @@ impl Physics {
                 v.controller
                     .wheels()
                     .iter()
-                    .map(|w| {
+                    .zip(&v.tops)
+                    .map(|(w, top)| {
                         let ray = w.raycast_info();
                         let length = if ray.is_in_contact {
                             ray.suspension_length
                         } else {
                             w.suspension_rest_length
                         };
-                        // The model's wheel centre is SUSPENSION under its
+                        // The model's wheel centre is `top` under its
                         // spring's top (see `add_vehicle_turned`).
-                        SUSPENSION - length
+                        top - length
                     })
                     .collect()
             })
@@ -2304,8 +3064,9 @@ impl Physics {
     }
 
     /// The other vehicles a vehicle's body is in contact with, body to
-    /// body, each once, with the deepest point of contact (world space).
-    pub fn vehicle_bumps(&self, id: VehicleId) -> Vec<(VehicleId, Vec3)> {
+    /// body, each once, with the deepest point of contact and the contact
+    /// normal from this one toward the other (world space).
+    pub fn vehicle_bumps(&self, id: VehicleId) -> Vec<(VehicleId, Vec3, Vec3)> {
         let chassis = |v: &VehicleId| {
             self.vehicles
                 .get(v.0)
@@ -2318,7 +3079,7 @@ impl Physics {
         let Some(body) = self.world.bodies.get(own) else {
             return Vec::new();
         };
-        let mut out: Vec<(VehicleId, Vec3)> = Vec::new();
+        let mut out: Vec<(VehicleId, Vec3, Vec3)> = Vec::new();
         for &c in body.colliders() {
             let Some(mine) = self.world.colliders.get(c) else {
                 continue;
@@ -2342,23 +3103,29 @@ impl Physics {
                 else {
                     continue;
                 };
-                if out.iter().any(|(v, _)| *v == them) {
+                if out.iter().any(|(v, ..)| *v == them) {
                     continue;
                 }
-                let Some(deepest) = pair
+                let Some((manifold, deepest)) = pair
                     .manifolds()
                     .iter()
-                    .flat_map(|m| &m.points)
-                    .min_by(|a, b| a.dist.total_cmp(&b.dist))
+                    .flat_map(|m| m.points.iter().map(move |p| (m, p)))
+                    .min_by(|a, b| a.1.dist.total_cmp(&b.1.dist))
                 else {
                     continue;
                 };
-                let local = if first {
-                    deepest.local_p1
+                // The manifold's normal points from its first collider
+                // toward its second.
+                let (local, normal) = if first {
+                    (deepest.local_p1, vec3(manifold.data.normal))
                 } else {
-                    deepest.local_p2
+                    (deepest.local_p2, -vec3(manifold.data.normal))
                 };
-                out.push((them, vec3(mine.position().transform_point(local))));
+                out.push((
+                    them,
+                    vec3(mine.position().transform_point(local)),
+                    normal.normalize_or_zero(),
+                ));
             }
         }
         out
@@ -2442,7 +3209,10 @@ impl Physics {
         self.vehicles
             .get(id.0)
             .and_then(Option::as_ref)
-            .is_some_and(|v| v.controller.wheels().iter().any(|w| w.engine_force != 0.0))
+            .is_some_and(|v| {
+                (v.tyres.is_some() && v.pulling)
+                    || v.controller.wheels().iter().any(|w| w.engine_force != 0.0)
+            })
     }
 
     /// A vehicle's velocity, m/s.
@@ -2486,14 +3256,12 @@ impl Physics {
         if along.abs() < ROLL_REST { 0.0 } else { along }
     }
 
-    /// The forward gear a wheeled vehicle's engine drives in (0 is first)
-    /// and how fast that engine turns in it, rpm; `None` without an
-    /// engine from its template.
+    /// The gear a wheeled vehicle's engine drives in (0 reverse, 1 first)
+    /// and how fast that engine turns, rpm; `None` for a tank.
     pub fn vehicle_gear(&self, id: VehicleId) -> Option<(usize, f32)> {
         let v = self.vehicles.get(id.0).and_then(Option::as_ref)?;
-        let e = v.engine?;
-        let speed = v.controller.current_vehicle_speed.abs();
-        Some((v.gear, e.rpm_at(e.gears[v.gear], speed)))
+        v.engine?;
+        Some((v.gearbox.gear, v.gearbox.rpm))
     }
 
     /// Whether a vehicle's driver is braking ([`drive`](Self::drive) last
@@ -2516,8 +3284,8 @@ impl Physics {
         v.wrecked = true;
         // How low the rims reach, chassis space.
         let mut rims = f32::INFINITY;
-        for w in v.controller.wheels_mut() {
-            let centre = w.chassis_connection_point_cs.y - SUSPENSION;
+        for (w, top) in v.controller.wheels_mut().iter_mut().zip(&v.tops) {
+            let centre = w.chassis_connection_point_cs.y - top;
             rims = rims.min(centre - w.radius * WRECK_RIM);
             w.max_suspension_force = 0.0;
             w.friction_slip = 0.0;
@@ -3322,6 +4090,8 @@ mod tests {
             bounds: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2)),
             seat: None,
             door: None,
+            seating: None,
+            entrances: Vec::new(),
             tracked: false,
             road_wheels: Vec::new(),
             rest: Vec::new(),
@@ -3465,18 +4235,54 @@ mod tests {
             "turned left"
         );
         assert!(m.transform_vector3(Vec3::X).y < -0.1, "leans left");
-        // Up to 45 degrees over: standing at its model's height on its
-        // springs it leans 40 here (the island's bikes up to 45 at full
-        // lock, biketest).
+        // About 45 degrees over at most (the island's bikes up to 45 at
+        // full lock, biketest; 46 here since the 360's tyres push its
+        // axles low, round 3 of the driving model).
         let up = m.transform_vector3(Vec3::Y).y;
-        assert!(up > 0.7, "still up: {up}");
+        assert!(up > 0.68, "still up: {up}");
     }
 
     /// The Offroad Motorcycle (AL)'s `Bike*` fields, the weakest.
     const OFFROAD: BikeTuning = BikeTuning {
+        roll_rate: 1.3,
+        roll_angle: (0.7, 0.5),
+        roll_input: 0.1,
         roll: 10.0,
+        wheelie: 0.85,
+        pitch_strength: (40.0, 50.0),
+        pitch_high_speed: 1.0,
+        wheelie_steer: 2.0,
+        side_damp: 10.0,
         damp: [6.0, 10.0, 0.0],
         air: (2.0, 1.5),
+        low_speed: 65.0 / 3.6,
+        inertia: [0.5, 0.3, 0.5],
+        centre_of_mass: [0.0; 3],
+    };
+    /// Its springs, its record's.
+    const OFFROAD_SPRINGS: Springs = Springs {
+        strength: (70.0, 70.0),
+        damping: (10.0, 10.0),
+        stretch: (0.1, 0.1),
+        squeeze: (0.1, 0.1),
+        extra: 0.05,
+        gravity_factor: 1.7,
+    };
+    /// Its engine and gearbox, its record's.
+    const OFFROAD_ENGINE: EngineTuning = EngineTuning {
+        torque: 65.0,
+        rpm: (1000.0, 5000.0, 8000.0),
+        upshift: 7000.0,
+        downshift: 4000.0,
+        clutch_delay: 0.0,
+        primary: 5.0,
+        gears: [2.0, 1.35, 0.9, 0.6, 0.4],
+        reverse: 1.0,
+        radius: 0.32,
+        torque_at: (1.0, 1.0),
+        reverse_speed: 50.0 / 3.6,
+        slip: 0.0,
+        split: 0.5,
     };
 
     #[test]
@@ -3504,6 +4310,11 @@ mod tests {
             ..car()
         };
         bike.tuning.bike = Some(OFFROAD);
+        bike.tuning.springs = Some(OFFROAD_SPRINGS);
+        bike.tuning.engine = Some(OFFROAD_ENGINE);
+        // At its record's top speed, 110 km/h, with its record's 1.7 x
+        // weight (the 360 balance, 0x8219D800, holds it up there).
+        bike.tuning.max_speed = Some(110.0 / 3.6);
         let id = p.add_vehicle(&bike, Vec3::new(0.0, 0.2, 0.0), 0.0);
         let up = |p: &Physics| p.vehicle_transform(id).unwrap().transform_vector3(Vec3::Y);
         let ahead = VehicleControls {
@@ -3519,74 +4330,200 @@ mod tests {
         let at = m.transform_point3(Vec3::Y);
         p.push_vehicle(id, m.transform_vector3(Vec3::X) * 300.0 * 1.5, at);
         let mut most = 1.0f32;
-        for _ in 0..180 {
+        // The 360 balance stands it back up (0x8219D800).
+        for _ in 0..600 {
             p.drive(id, ahead);
             p.step(DT);
             most = most.min(up(&p).y);
         }
         assert!(most < 0.995, "the shove rolls it ({most})");
         assert!(most > 0.5, "without tipping it over ({most})");
-        assert!(up(&p).y > 0.9986, "back up within 3 degrees in 3 s");
+        let end = up(&p).y;
+        assert!(end > 0.9986, "back up within 3 degrees in 10 s ({end})");
+    }
+
+    /// A body for [`hold_bike`] alone: its spin and velocity, turned by
+    /// angular impulses per kilogram over its inertia per kilogram
+    /// (upright and heading +z, so its own axes are the world's).
+    struct Spun {
+        w: Vec3,
+        v: Vec3,
+        inertia: Vec3,
+    }
+
+    fn hold(bike: &mut Bike, body: &mut Spun, f: BikeFooting, turn: Quat, dt: f32) {
+        let cell = std::cell::RefCell::new(body);
+        hold_bike(
+            bike,
+            f,
+            turn,
+            || {
+                let b = cell.borrow();
+                (b.w, b.v)
+            },
+            |spin, slide| {
+                let mut b = cell.borrow_mut();
+                let i = b.inertia;
+                b.w += spin / i;
+                b.v += slide;
+            },
+            dt,
+        );
+    }
+
+    fn footing(steer: f32) -> BikeFooting {
+        BikeFooting {
+            wheels: 2,
+            touching: 2,
+            normal: Vec3::Y,
+            top: 110.0 / 3.6,
+            steer,
+            stick: 0.0,
+            throttle: 1.0,
+            brake: 0.0,
+        }
     }
 
     #[test]
-    fn a_bike_leans_into_its_turn_and_turns_in_the_air_as_its_template_says() {
-        let bike = Bike {
+    fn a_bike_leans_as_far_as_its_turn_asks_and_no_further() {
+        let mut bike = Bike {
             tuning: OFFROAD,
-            inertia: Vec3::new(0.7, 0.6, 0.24),
+            steer: 0.0,
         };
-        // Upright at 10 m/s ahead (+z), turning left (+y) 1 rad/s: it
-        // rolls left, about -z.
-        let w = balance(bike, Quat::IDENTITY, Vec3::Z * 10.0, Vec3::Y, None, DT);
-        assert!(w.z < -0.1, "{w}");
-        // Leaned as far as that turn balances (45 degrees: 10 m/s² of
-        // pull), it holds there.
-        let leaned = Quat::from_rotation_z(-std::f32::consts::FRAC_PI_4);
-        let pull = GRAVITY / 10.0;
-        let w = balance(bike, leaned, Vec3::Z * 10.0, Vec3::Y * pull, None, DT);
-        assert!(w.z.abs() < 1e-3, "{w}");
-        // In the air the throttle dips its nose (+x) and the stick turns
-        // it left (+y): at most control / damp rad/s, its nose's 0.2.
-        let air = Some(VehicleControls {
-            throttle: 1.0,
-            steer: 1.0,
-            ..Default::default()
-        });
-        let mut w = Vec3::ZERO;
-        for _ in 0..600 {
-            w = balance(bike, Quat::IDENTITY, Vec3::ZERO, w, air, DT);
-        }
-        assert!((w.x - 0.2).abs() < 1e-3, "{w}");
-        assert!(w.y > 1.0, "{w}");
-        // On the ground the stick does nothing to its pitch or yaw.
-        let w = balance(bike, Quat::IDENTITY, Vec3::ZERO, Vec3::ZERO, None, DT);
-        assert_eq!(w, Vec3::ZERO);
+        let inertia = Vec3::from(OFFROAD.inertia);
+        // At 10 m/s ahead turning +y at its most-lean rate: it asks its
+        // most lean, (1 - s) hi + s lo, negative (its sideways axis
+        // dips). Upright, it rolls that way, about -z.
+        let fast = 10.0 / (110.0 / 3.6);
+        let most = (1.0 - fast) * 0.5 + fast * 0.7;
+        let mut body = Spun {
+            w: Vec3::Y * 1.3,
+            v: Vec3::Z * 10.0,
+            inertia,
+        };
+        hold(&mut bike, &mut body, footing(0.0), Quat::IDENTITY, DT);
+        let k = OFFROAD.roll / inertia.z * DT;
+        assert!((body.w.z - (-most * k)).abs() < 1e-4, "{}", body.w);
+        // Leaned exactly that far, turning at that rate about its own up
+        // axis, it holds there (its steering asks less).
+        let leaned = Quat::from_rotation_z(-most);
+        let mut body = Spun {
+            w: leaned * Vec3::Y * 1.3,
+            v: Vec3::Z * 10.0,
+            inertia,
+        };
+        hold(&mut bike, &mut body, footing(-0.1), leaned, DT);
+        assert!(body.w.z.abs() < 1e-4, "{}", body.w);
+        // With a wheel off the ground it stands up instead.
+        let mut body = Spun {
+            w: Vec3::Y * 1.3,
+            v: Vec3::Z * 10.0,
+            inertia,
+        };
+        let one = BikeFooting {
+            touching: 1,
+            ..footing(0.0)
+        };
+        hold(&mut bike, &mut body, one, leaned, DT);
+        assert!(body.w.z > 0.0, "{}", body.w);
+    }
+
+    #[test]
+    fn its_steering_leans_it_once_it_is_moving() {
+        let inertia = Vec3::from(OFFROAD.inertia);
+        let roll = |speed: f32| {
+            let mut bike = Bike {
+                tuning: OFFROAD,
+                steer: 0.0,
+            };
+            let mut body = Spun {
+                w: Vec3::ZERO,
+                v: Vec3::Z * speed,
+                inertia,
+            };
+            // Full lock to the 360's right: lean `roll_input` positive.
+            hold(&mut bike, &mut body, footing(1.0), Quat::IDENTITY, DT);
+            body.w.z
+        };
+        assert_eq!(roll(0.0), 0.0);
+        let k = OFFROAD.roll / inertia.z * DT;
+        let half = OFFROAD.low_speed * 0.5;
+        assert!((roll(half) - 0.5 * OFFROAD.roll_input * k).abs() < 1e-5);
+        assert!((roll(30.0) - OFFROAD.roll_input * k).abs() < 1e-5);
+    }
+
+    #[test]
+    fn on_the_ground_its_nose_follows_the_slope_and_in_the_air_its_steering_turns_it() {
+        let mut bike = Bike {
+            tuning: OFFROAD,
+            steer: 0.0,
+        };
+        let inertia = Vec3::from(OFFROAD.inertia);
+        // Nose up 0.1 rad on the flat, riding forwards: pushed nose down
+        // (+x) by its down strength.
+        let mut body = Spun {
+            w: Vec3::ZERO,
+            v: Vec3::Z * 5.0,
+            inertia,
+        };
+        let up = Quat::from_rotation_x(-0.1);
+        hold(&mut bike, &mut body, footing(0.0), up, DT);
+        let want = OFFROAD.pitch_strength.1 * 0.1 / inertia.x * DT;
+        assert!((body.w.x - want).abs() < 1e-4, "{}", body.w);
+        // In the air full lock to the 360's right eases in (all at once
+        // growing) and turns it -y by its air yaw.
+        let mut body = Spun {
+            w: Vec3::ZERO,
+            v: Vec3::ZERO,
+            inertia,
+        };
+        let air = BikeFooting {
+            touching: 0,
+            ..footing(1.0)
+        };
+        hold(&mut bike, &mut body, air, Quat::IDENTITY, DT);
+        assert!((bike.steer - 0.1).abs() < 1e-5, "eased {}", bike.steer);
+        let want = -OFFROAD.air.1 * bike.steer / inertia.y * DT;
+        assert!((body.w.y - want).abs() < 1e-5, "{}", body.w);
+    }
+
+    #[test]
+    fn the_360_ease_keeps_its_share_each_sixtieth() {
+        assert_eq!(ease_towards(0.0, 1.0, 0.0, DT), 1.0);
+        assert!((ease_towards(0.0, 1.0, 0.9, DT) - 0.1).abs() < 1e-6);
+        // Two sixtieths: 1 - 0.9².
+        assert!((ease_towards(0.0, 1.0, 0.9, 2.0 * DT) - 0.19).abs() < 1e-5);
+        // Half a sixtieth: halfway to one step.
+        assert!((ease_towards(0.0, 1.0, 0.9, 0.5 * DT) - 0.05).abs() < 1e-6);
     }
 
     #[test]
     fn the_stiffest_bike_settles_without_ringing() {
-        // The street `Motorcycle`'s 250 and 50, over a 0.2 m² roll
-        // inertia: stepped explicitly it would overshoot each step.
-        let bike = Bike {
-            tuning: BikeTuning {
-                roll: 250.0,
-                damp: [50.0, 10.0, 1.0],
-                air: (5.0, 1.5),
-            },
-            inertia: Vec3::new(0.7, 0.6, 0.2),
+        // The old street `Motorcycle`'s 250 and 50 over its 1.5 m² roll
+        // inertia, explicitly stepped as the 360 code steps it.
+        let tuning = BikeTuning {
+            roll: 250.0,
+            damp: [50.0, 10.0, 1.0],
+            inertia: [1.5, 0.7, 1.5],
+            ..OFFROAD
         };
+        let mut bike = Bike { tuning, steer: 0.0 };
         let mut lean = 0.3f32;
-        let mut spin = 0.0;
-        for _ in 0..120 {
-            let turn = Quat::from_rotation_z(lean);
-            let w = balance(bike, turn, Vec3::ZERO, Vec3::Z * spin, None, DT);
-            spin = w.z;
-            let before = lean;
-            lean += spin * DT;
-            assert!(
-                lean.abs() <= before.abs() + 1e-6,
-                "rings: {before} to {lean}"
+        let mut body = Spun {
+            w: Vec3::ZERO,
+            v: Vec3::ZERO,
+            inertia: Vec3::from(tuning.inertia),
+        };
+        for _ in 0..240 {
+            body.w = Vec3::Z * body.w.z;
+            hold(
+                &mut bike,
+                &mut body,
+                footing(0.0),
+                Quat::from_rotation_z(lean),
+                DT,
             );
+            lean += body.w.z * DT;
         }
         assert!(lean.abs() < 0.01, "settled at {lean}");
     }
@@ -3914,7 +4851,13 @@ mod tests {
             Quat::from_rotation_x(-slope),
         );
         p.step(DT);
-        let spec = car();
+        // An M151's brakes: by the defaults (2 an axle) one rolled back at
+        // the start can't stop on a 20 degree hill at its gravity factor.
+        let mut spec = car();
+        spec.tuning.tyres = Some(Tyres {
+            brake: (7.0, 6.0),
+            ..Tyres::DEFAULT
+        });
         let ground = |at: Vec3| {
             p.cast_ray(Vec3::new(at.x, 80.0, at.z), Vec3::NEG_Y, 200.0)
                 .map(|(d, _)| 80.0 - d)
@@ -3931,7 +4874,8 @@ mod tests {
             );
             p.step(DT);
         }
-        // It crawled at 2 m/s before the engine pulled harder uphill.
+        // Under its steepest less 20 degrees its springs push it straight
+        // up, so the hill holds it back no more than the flat.
         let speed = p.vehicle_speed(id);
         assert!(speed > 12.0, "{speed} m/s");
     }
@@ -4108,6 +5052,96 @@ mod tests {
         );
     }
 
+    // Let roll on a hill, a car stays put on one gentler than its steepest
+    // less 20 degrees (its springs push it straight up there, as the 360
+    // code's do) and rolls down one steeper than its steepest (45 by
+    // default), on which its engine can't drive it up either.
+    #[test]
+    fn it_stands_on_gentle_hills_and_rolls_down_steep_ones() {
+        let run = |degrees: f32, throttle: f32| {
+            let mut p = Physics::new();
+            let half = 100.0;
+            let v = [
+                Vec3::new(-half, 0.0, -half),
+                Vec3::new(half, 0.0, -half),
+                Vec3::new(half, 0.0, half),
+                Vec3::new(-half, 0.0, half),
+            ];
+            let shape = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+            let slope = degrees.to_radians();
+            p.add_static(
+                StaticKey::Cell(1),
+                &shape,
+                Vec3::ZERO,
+                Quat::from_rotation_z(slope),
+            );
+            p.step(DT);
+            let spec = car();
+            let yaw = std::f32::consts::FRAC_PI_2;
+            let ground = |at: Vec3| {
+                p.cast_ray(Vec3::new(at.x, 80.0, at.z), Vec3::NEG_Y, 200.0)
+                    .map(|(d, _)| 80.0 - d)
+            };
+            let rest = spec.rest_on(Vec3::new(5.0, 0.0, 0.0), yaw, ground).unwrap();
+            let id = p.add_vehicle_turned(&spec, rest.position + Vec3::Y * 0.3, rest.rotation);
+            let go = VehicleControls {
+                throttle,
+                ..Default::default()
+            };
+            for _ in 0..180 {
+                p.drive(id, go);
+                p.step(DT);
+            }
+            let at = p
+                .vehicle_transform(id)
+                .unwrap()
+                .transform_point3(Vec3::ZERO);
+            at.x - rest.position.x
+        };
+        let gentle = run(20.0, 0.0);
+        assert!(gentle.abs() < 0.3, "rolled {gentle} m on 20 degrees");
+        let steep = run(50.0, 0.0);
+        assert!(steep < -3.0, "rolled {steep} m on 50 degrees");
+        let up = run(50.0, 1.0);
+        assert!(up < -3.0, "drove {up} m up 50 degrees");
+    }
+
+    /// Playtest (Android, a controller): the gearbox goes into reverse
+    /// only with the brake pedal all but floored (over 0.9), so a pedal
+    /// that shares its push with the steering (0.71 at full lock, as the
+    /// alpha's pad once gave it) never backs up. The whole pedal does,
+    /// steering or not.
+    #[test]
+    fn a_floored_pedal_backs_up_at_full_lock() {
+        let backed = |throttle: f32, steer: f32| {
+            let mut p = Physics::new();
+            floor(&mut p, 1, 0.0, 0.0, 0.0, 600.0);
+            p.step(DT);
+            let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+            for _ in 0..(3.0 / DT) as usize {
+                p.drive(
+                    id,
+                    VehicleControls {
+                        throttle,
+                        steer,
+                        ..Default::default()
+                    },
+                );
+                p.step(DT);
+            }
+            (
+                p.vehicle_gear(id).expect("an engine").0,
+                p.vehicle_speed(id),
+            )
+        };
+        let shared = backed(-std::f32::consts::FRAC_1_SQRT_2, 1.0);
+        assert_eq!(shared.0, 1, "{shared:?}");
+        assert!(shared.1.abs() < 0.5, "{shared:?}");
+        let floored = backed(-1.0, 1.0);
+        assert_eq!(floored.0, 0, "{floored:?}");
+        assert!(floored.1 < -2.0, "{floored:?}");
+    }
+
     // Round 18: with the M151's engine and gearbox it reaches its
     // template's 85 km/h in seconds and holds there (it used to level
     // off at 60% of it), and backs up no faster than its 55 km/h.
@@ -4125,6 +5159,8 @@ mod tests {
             radius: 0.39,
             torque_at: (0.8, 1.0),
             reverse_speed: 55.0 / 3.6,
+            slip: 1000.0,
+            split: 1.0,
         };
         let spec = VehicleSpec {
             mass: 1000.0,
@@ -4169,9 +5205,9 @@ mod tests {
         assert!(fastest < engine.reverse_speed * 1.03, "{fastest}");
     }
 
-    // Gap round 24: with its template's clutch delay, its gearbox changes
-    // up one gear at a time as it speeds up, and for that long after
-    // each change its engine drives nothing, so it gathers no speed.
+    // With its template's clutch delay, its gearbox changes up one gear at
+    // a time as it speeds up, no sooner than that long after the last
+    // change, its engine driving nothing meanwhile (0x821A0528).
     #[test]
     fn a_change_of_gear_takes_its_clutch_delay() {
         let engine = crate::tuning::EngineTuning {
@@ -4186,6 +5222,8 @@ mod tests {
             radius: 0.39,
             torque_at: (0.8, 1.0),
             reverse_speed: 55.0 / 3.6,
+            slip: 1000.0,
+            split: 1.0,
         };
         let spec = VehicleSpec {
             mass: 1000.0,
@@ -4215,14 +5253,22 @@ mod tests {
                 p.vehicle_speed(id),
             ));
         }
-        let first_change = steps.iter().position(|s| s.0 == 1).expect("changes up");
-        assert_eq!(steps[first_change - 1].0, 0);
-        // Over the delay that follows it gains next to nothing.
-        let after = steps[first_change + (0.4 / DT) as usize];
+        let first_change = steps.iter().position(|s| s.0 == 2).expect("changes up");
+        assert_eq!(steps[first_change - 1].0, 1);
+        // Over the delay that follows it stays in second, its engine
+        // driving nothing, so it gains next to nothing.
+        let after = steps[first_change + (0.45 / DT) as usize];
+        assert_eq!(after.0, 2);
         assert!(after.1 - steps[first_change].1 < 0.1, "{after:?}");
-        // Then it pulls again.
-        let later = steps[first_change + (1.0 / DT) as usize];
-        assert!(later.1 - after.1 > 0.5, "{later:?}");
+        let changes: Vec<usize> = (1..steps.len())
+            .filter(|&i| steps[i].0 != steps[i - 1].0)
+            .collect();
+        assert!(
+            changes
+                .windows(2)
+                .all(|w| (w[1] - w[0]) as f32 * DT >= 0.49),
+            "{changes:?}"
+        );
         // One gear at a time, never back down while it speeds up.
         assert!(
             steps
@@ -4233,15 +5279,95 @@ mod tests {
     }
 
     #[test]
-    fn tracks_pull_along_their_curve() {
-        let curve = [1.0, 0.45, 0.3, 0.1];
-        assert_eq!(track_pull(curve, 0.0), 1.0);
-        assert!((track_pull(curve, 1.0 / 3.0) - 0.45).abs() < 1e-5);
-        assert!((track_pull(curve, 0.5) - 0.375).abs() < 1e-5);
-        assert!((track_pull(curve, 1.0) - 0.1).abs() < 1e-5);
-        assert!((track_pull(curve, 2.0) - 0.1).abs() < 1e-5);
+    fn tracks_push_along_their_curve() {
+        // The AMX-30's: 1, 0.45, 0.3, 0.1 at 0, 0.4, 0.6, 1.
+        let curve = [(0.0, 1.0), (0.4, 0.45), (0.6, 0.3), (1.0, 0.1)];
+        assert_eq!(track_push(curve, 0.0), 1.0);
+        assert!((track_push(curve, 0.2) - 0.725).abs() < 1e-5);
+        assert!((track_push(curve, 0.4) - 0.45).abs() < 1e-5);
+        assert!((track_push(curve, 0.5) - 0.375).abs() < 1e-5);
+        assert!((track_push(curve, 0.8) - 0.2).abs() < 1e-5);
+        assert!((track_push(curve, 1.0) - 0.1).abs() < 1e-5);
     }
 
+    /// The AMX-30's `_TankPhysics`.
+    const AMX30: TankTuning = TankTuning {
+        max_speed: 45.0 / 3.6,
+        brake: 4.0,
+        steer_speed: 12.0,
+        steer_inertia: (0.95, 0.65),
+        friction: (0.1, 0.9),
+        engine_height: -0.3,
+        gravity_factor: 2.0,
+        steer_loss: 0.1,
+        high_speed_grip: 1.0,
+        ang_damp: [9.0, 0.0, 9.0],
+        centre_of_mass: [0.0; 3],
+        torque: 2000.0,
+        engine_inertia: 0.85,
+        curve: [(0.0, 1.0), (0.4, 0.45), (0.6, 0.3), (1.0, 0.1)],
+        springs: (20.0, 2.5, 0.35, 0.7),
+    };
+
+    /// One `drive_tracks` step of a still AMX-30 on six points at rest:
+    /// the sum of its linear impulses and of their turn about its centre.
+    fn tank_step(t: &mut Tracks, v: Vec3, throttle: f32, steer: f32) -> (Vec3, Vec3) {
+        let points: Vec<Option<(Vec3, Vec3)>> = [-1.2f32, 1.2]
+            .iter()
+            .flat_map(|&x| [-2.0f32, 0.0, 2.0].map(|z| Some((Vec3::new(x, -1.0, z), Vec3::Y))))
+            .collect();
+        let f = TrackFooting {
+            turn: Quat::IDENTITY,
+            centre: Vec3::ZERO,
+            mass: 32000.0,
+            points: &points,
+            throttle,
+            steer,
+            held: false,
+        };
+        let (mut sum, mut spin) = (Vec3::ZERO, Vec3::ZERO);
+        drive_tracks(
+            t,
+            &f,
+            || (Vec3::ZERO, v),
+            |i, at| match at {
+                Some(p) => {
+                    sum += i;
+                    spin += p.cross(i);
+                }
+                None => spin += i,
+            },
+            DT,
+        );
+        (sum, spin)
+    }
+
+    #[test]
+    fn a_tank_drives_against_its_throttle_and_turns_as_the_360_code_turns_it() {
+        // Full throttle ahead (-1 for the 360 code) from a standstill:
+        // its throttle eases 15% in, its curve gives 1, so 0.15 x 2000 x
+        // 200 N for a step, along +z.
+        let mut t = Tracks::new(AMX30, 6);
+        let (sum, _) = tank_step(&mut t, Vec3::ZERO, -1.0, 0.0);
+        let want = 0.15 * 2000.0 * 200.0 * DT;
+        assert!((sum.z - want).abs() < want * 1e-3, "{sum}");
+        assert!(sum.x.abs() < 1e-3);
+        // Full right (+1): its steering eases 5% in and the pair of pushes
+        // turns it clockwise from above (-y), 2 x mass x 12 x 0.05.
+        let mut t = Tracks::new(AMX30, 6);
+        let (sum, spin) = tank_step(&mut t, Vec3::ZERO, 0.0, 1.0);
+        assert!(sum.length() < 1e-3, "{sum}");
+        let want = 2.0 * 32000.0 * 12.0 * 0.05 * DT;
+        assert!((spin.y + want).abs() < want * 1e-3, "{spin}");
+        // Rolling at 5 m/s with the throttle against it: each point's
+        // grip eases from rolling (0.1) towards its brake (4) and slows it
+        // up to 1 m/s's worth, and the drive gives nothing.
+        let mut t = Tracks::new(AMX30, 6);
+        let (sum, _) = tank_step(&mut t, Vec3::Z * 5.0, 1.0, 0.0);
+        let grip = 0.1 + (4.0 - 0.1) * 0.05;
+        let want = -6.0 * 32000.0 * grip * DT;
+        assert!((sum.z - want).abs() < -want * 1e-3, "{sum}");
+    }
     #[test]
     fn a_car_driven_into_another_bumps_it_body_to_body() {
         let mut p = Physics::new();
@@ -4258,16 +5384,20 @@ mod tests {
         let mut met = None;
         for i in 0..120 {
             p.step(DT);
-            if let Some(&(other, at)) = p.vehicle_bumps(a).first() {
-                met = Some((i, other, at));
+            if let Some(&(other, at, normal)) = p.vehicle_bumps(a).first() {
+                met = Some((i, other, at, normal));
                 break;
             }
         }
-        let (_, other, at) = met.expect("they never met");
+        let (_, other, at, normal) = met.expect("they never met");
         assert_eq!(other, b);
         // Where its front bumper meets the other's rear one, 7.8 m on.
         assert!((at.z - 7.8).abs() < 0.5, "met at {at:?}");
-        assert_eq!(p.vehicle_bumps(b).first().map(|m| m.0), Some(a));
+        // The normal points from it toward the other: on along +z.
+        assert!(normal.z > 0.9, "normal {normal:?}");
+        let back = p.vehicle_bumps(b);
+        assert_eq!(back.first().map(|m| m.0), Some(a));
+        assert!(back[0].2.z < -0.9, "and back the other way");
     }
 
     #[test]
@@ -4341,22 +5471,23 @@ mod tests {
         assert!(p.vehicle_transform(id).is_none());
     }
 
-    // A car whose template gives its brakes and lock slows as its brakes
-    // say (the mean of its axles' m/s²) and turns its front wheels as
-    // far as its lock, not the invented 8 m/s² and 0.6 rad.
+    // A car whose template gives its brakes and lock slows as the 360
+    // code has its brakes slow it (each axle's m/s², added up) and turns
+    // its front wheels as far as its lock, not the invented 0.6 rad.
     #[test]
     fn brakes_and_lock_come_from_the_template() {
         let slowing = |brake: (f32, f32), lock: f32| {
             let mut spec = car();
+            spec.tuning.tyres = Some(Tyres {
+                brake,
+                ..Tyres::DEFAULT
+            });
             spec.tuning.handling = Some(crate::tuning::Handling {
                 steer_lock: lock,
-                brake,
-                grip: (1.5, 1.5),
                 steer_speed: 100.0,
                 low_speed: 0.0,
                 low_steer_speed: 0.0,
-                spring: (40.0, 40.0),
-                damping: (2.5, 2.5),
+                ..crate::tuning::Handling::DEFAULT
             });
             let mut p = Physics::new();
             floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
@@ -4399,29 +5530,31 @@ mod tests {
             }
             (steered, v0 / t)
         };
+        // Its engine drags it as well (the default engine's, off the
+        // throttle): the brakes add their sum on top of that.
         let (lock, soft) = slowing((3.0, 1.0), 1.0);
         assert!((lock - 1.0).abs() < 0.05, "{lock}");
-        assert!((soft - 2.0).abs() < 0.4, "{soft}");
+        assert!(soft > 3.8, "{soft}");
         let (lock, hard) = slowing((9.0, 7.0), 0.5);
         assert!((lock - 0.5).abs() < 0.05, "{lock}");
-        assert!((hard - 8.0).abs() < 1.0, "{hard}");
+        assert!(((hard - soft) - 12.0).abs() < 1.5, "{soft} {hard}");
     }
 
     // Its front wheels swing towards full lock as quickly as its template
-    // says (radians a second): `LowSpeedSteerSpeed` below its
-    // `LowSpeedLimit`, `SteerSpeed` above it; and back as quickly.
+    // says (radians a second): `LowSpeedSteerSpeed` at a standstill,
+    // easing to `SteerSpeed` at its `LowSpeedLimit`; let go, back straight
+    // at once (`SteerNoInputInertia` 0); at its top speed its lock and
+    // swing a tenth less (`HighSpeedSteerLoss`), times 0.5 braking and
+    // 0.8 coasting.
     #[test]
     fn wheels_swing_at_the_templates_steer_speed() {
         let mut spec = car();
         spec.tuning.handling = Some(crate::tuning::Handling {
             steer_lock: 0.7,
-            brake: (7.0, 6.0),
-            grip: (1.5, 1.5),
             steer_speed: 0.6,
             low_speed: 35.0 / 3.6,
             low_steer_speed: 0.9,
-            spring: (40.0, 40.0),
-            damping: (2.5, 2.5),
+            ..crate::tuning::Handling::DEFAULT
         });
         let mut p = Physics::new();
         floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
@@ -4444,59 +5577,107 @@ mod tests {
             p.vehicle_wheels(id)[0].0
         };
         // At a standstill: 0.9 rad/s, so 0.45 rad after half a second,
-        // full lock (0.7) by 0.8 s, and straight again 0.8 s later.
+        // full lock (0.7) by 0.8 s, and straight again a step after.
         let half = steer(&mut p, 1.0, 0.5);
         assert!((half - 0.45).abs() < 0.03, "{half}");
         let full = steer(&mut p, 1.0, 0.5);
         assert!((full - 0.7).abs() < 0.01, "{full}");
-        let back = steer(&mut p, 0.0, 0.8);
-        assert!(back.abs() < 0.01, "{back}");
-        // Above 35 km/h: 0.6 rad/s.
+        let back = steer(&mut p, 0.0, DT);
+        assert!(back.abs() < 1e-6, "{back}");
+        // Halfway to 35 km/h: 0.75 rad/s; above it 0.6.
         let h = spec.tuning.handling.expect("set");
-        assert_eq!(h.swing(5.0), 0.9);
+        assert!((h.swing(17.5 / 3.6) - 0.75).abs() < 1e-5);
         assert_eq!(h.swing(-12.0), 0.6);
+        assert!((h.range(1.0, 1.0, 0.0) - 0.9).abs() < 1e-6);
+        assert!((h.range(1.0, 0.0, 1.0) - 0.95).abs() < 1e-6);
+        assert!((h.range(1.0, 0.0, 0.0) - 0.92).abs() < 1e-6);
     }
 
-    // Its springs and dampers are its template's, per kilogram: on four
-    // wheels of strength k it sits g / 4k down on them, and kicked
-    // downwards bounces back past its settled height after half a swing
-    // at sqrt(4k (1 - zeta^2)) rad/s, zeta = 4c / (2 sqrt(4k)).
-    // Standing, a car's springs are squeezed by its weight, but it sits
-    // where its model has it (its wheels' bottoms on the ground) and its
-    // wheels are drawn there, not sunk into the road by the squeeze.
+    // Its springs hang as the 360 code hangs them: from their squeeze
+    // above the model's wheels, as long as their lengths together. In the
+    // air its wheels drop their stretch and the extra length below the
+    // model's; standing on four of strength k with a gravity factor f,
+    // they are squeezed f g / 4k on average (the back pair more, carrying
+    // more of the weight), so its wheels sit that much higher, and the
+    // chassis that much less above its model's height.
     #[test]
-    fn it_stands_with_its_tyres_on_the_ground() {
-        for k in [8.0, 25.0, 60.0] {
+    fn its_springs_hang_as_the_360_codes() {
+        for (k, f) in [(8.0, 1.0), (25.0, 2.0), (60.0, 2.0)] {
             let mut spec = car();
-            spec.tuning.handling = Some(crate::tuning::Handling {
-                steer_lock: 0.7,
-                brake: (7.0, 6.0),
-                grip: (1.5, 1.5),
-                steer_speed: 0.6,
-                low_speed: 0.0,
-                low_steer_speed: 0.0,
-                spring: (k, k),
+            let springs = Springs {
+                strength: (k, k),
                 damping: (1.7, 1.7),
+                stretch: (0.25, 0.25),
+                squeeze: (0.15, 0.15),
+                extra: 0.05,
+                gravity_factor: f,
+            };
+            spec.tuning.springs = Some(springs);
+            let mut p = Physics::new();
+            floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
+            p.step(DT);
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, spec.ride_height() + 3.0, -400.0), 0.0);
+            p.step(DT);
+            let hang = p.vehicle_wheel_lift(id);
+            assert!(hang.iter().all(|l| (l + 0.3).abs() < 1e-4), "{k}: {hang:?}");
+            for _ in 0..300 {
+                p.step(DT);
+            }
+            let want = f * GRAVITY / (4.0 * k);
+            let sag = p.vehicle_suspension(id);
+            let mean = sag.iter().sum::<f32>() / 4.0;
+            // Within 5%: Rapier's springs settle 2 to 4% short of what
+            // k c = f g says.
+            assert!((mean - want).abs() < 0.05 * want, "{k}: {sag:?} {want}");
+            assert!(sag[2] > sag[0], "{k}: {sag:?}");
+            let lift = p.vehicle_wheel_lift(id);
+            let mean_lift = lift.iter().sum::<f32>() / 4.0;
+            assert!((mean_lift - (mean - 0.3)).abs() < 1e-4, "{k}: {lift:?}");
+            let y = p.vehicle_transform(id).expect("car").w_axis.y;
+            assert!(
+                (y - (spec.ride_height() + 0.3 - mean)).abs() < 0.02,
+                "{k}: {y}"
+            );
+        }
+    }
+
+    // Sliding sideways, its tyres damp the slide as the 360 code's do: each
+    // axle by its sideways grip a second, so with 1.5 on both it slows as
+    // exp(-3 t), with no limit on how hard; on the handbrake (its
+    // `EmergencyBrake` 0.2) the axles keep 0.33 + 0.67 x 0.2 of it.
+    #[test]
+    fn its_tyres_damp_a_sideways_slide_as_the_360s_do() {
+        let slide = |handbrake: bool| {
+            let mut spec = car();
+            spec.tuning.tyres = Some(Tyres {
+                emergency: (0.2, 0.2),
+                ..Tyres::DEFAULT
             });
             let mut p = Physics::new();
             floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
             p.step(DT);
-            let id = p.add_vehicle(&spec, Vec3::new(0.0, spec.ride_height() + 0.1, -400.0), 0.0);
-            for _ in 0..240 {
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, -400.0), 0.0);
+            let still = VehicleControls {
+                brake: handbrake,
+                ..Default::default()
+            };
+            for _ in 0..90 {
+                p.drive(id, still);
                 p.step(DT);
             }
-            let sag = p.vehicle_suspension(id);
-            assert!(
-                sag.iter().all(|&s| s > 0.9 * 9.81 / (8.0 * k)),
-                "{k}: {sag:?}"
-            );
-            let y = p.vehicle_transform(id).expect("car").w_axis.y;
-            assert!((y - spec.ride_height()).abs() < 0.02, "{k}: {y}");
-            let lift = p.vehicle_wheel_lift(id);
-            // Within 2 cm: Rapier's springs settle about 1% further down
-            // than k c = g says (1.3 cm at a strength of 8).
-            assert!(lift.iter().all(|l| l.abs() < 0.02), "{k}: {lift:?}");
-        }
+            p.set_vehicle_velocity(id, Vec3::X * 4.0);
+            for _ in 0..15 {
+                p.drive(id, still);
+                p.step(DT);
+            }
+            p.vehicle_velocity(id).x
+        };
+        let gripped = slide(false);
+        let want = 4.0 * (-3.0f32 * 0.25).exp();
+        assert!((gripped - want).abs() < 0.15 * want, "{gripped} {want}");
+        let held = slide(true);
+        let want = 4.0 * (-3.0f32 * 0.25 * (0.33 + 0.67 * 0.2)).exp();
+        assert!((held - want).abs() < 0.15 * want, "{held} {want}");
     }
 
     // Its brake lamps glow while it is driven against the way it rolls or
@@ -4541,15 +5722,11 @@ mod tests {
     fn springs_and_dampers_come_from_the_template() {
         let ride = |k: f32, c: f32| {
             let mut spec = car();
-            spec.tuning.handling = Some(crate::tuning::Handling {
-                steer_lock: 0.7,
-                brake: (7.0, 6.0),
-                grip: (1.5, 1.5),
-                steer_speed: 0.6,
-                low_speed: 0.0,
-                low_steer_speed: 0.0,
-                spring: (k, k),
+            spec.tuning.springs = Some(Springs {
+                strength: (k, k),
                 damping: (c, c),
+                gravity_factor: 1.0,
+                ..Springs::DEFAULT
             });
             let mut p = Physics::new();
             floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);

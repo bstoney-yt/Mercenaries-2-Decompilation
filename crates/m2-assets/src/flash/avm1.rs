@@ -359,6 +359,18 @@ impl Avm {
         )
     }
 
+    /// `v`, or for a reference to a removed instance, the one now at its
+    /// place ([`Player::now_at`]).
+    fn live_value(&mut self, player: &Player, v: &Value) -> Value {
+        if let Some(id) = clip_id(v)
+            && player.clip(id).is_none()
+            && let Some(now) = player.now_at(id)
+        {
+            return Value::Object(self.clip_object(now));
+        }
+        v.clone()
+    }
+
     fn clip_value(&mut self, player: &Player, id: Option<ClipId>) -> Value {
         match id.filter(|&i| player.clip(i).is_some()) {
             Some(i) => Value::Object(self.clip_object(i)),
@@ -524,6 +536,14 @@ impl Avm {
                         }
                     }
                     ObjKind::Clip(id) => {
+                        // A reference to a removed instance reads the one
+                        // now at its place.
+                        if player.clip(id).is_none()
+                            && let Some(now) = player.now_at(id)
+                        {
+                            let now = Value::Object(self.clip_object(now));
+                            return self.get(player, &now, name);
+                        }
                         if let Some(v) = self.clip_property(player, id, name) {
                             return v;
                         }
@@ -566,6 +586,13 @@ impl Avm {
                 }
             }
             ObjKind::Clip(id) => {
+                if player.clip(id).is_none()
+                    && let Some(now) = player.now_at(id)
+                {
+                    let now = Value::Object(self.clip_object(now));
+                    self.set(player, &now, name, value);
+                    return;
+                }
                 if self.set_clip_property(player, id, name, &value) {
                     return;
                 }
@@ -735,6 +762,25 @@ impl Avm {
                 }
                 true
             }
+            // Its lines wrap at its box, or break only where its text
+            // does (the PDA's log sets both on each message it adds).
+            lower @ ("wordwrap" | "multiline")
+                if matches!(player.clip(id).map(|c| &c.kind), Some(Kind::Text(..))) =>
+            {
+                let on = self.truthy(value);
+                let refit = player.clip_mut(id).and_then(|c| {
+                    if lower == "wordwrap" {
+                        c.word_wrap = Some(on);
+                    } else {
+                        c.multiline = Some(on);
+                    }
+                    c.auto_size
+                });
+                if let Some(anchor) = refit {
+                    fit_text_box(player, id, anchor);
+                }
+                true
+            }
             "text" | "htmltext" => {
                 if !matches!(player.clip(id).map(|c| &c.kind), Some(Kind::Text(..))) {
                     return false;
@@ -769,6 +815,7 @@ impl Avm {
             return Value::Undefined;
         };
         let kind = o.borrow().kind.clone();
+        let this = &self.live_value(player, this);
         match kind {
             ObjKind::Native(n) => n(self, player, this, args),
             ObjKind::Function(func) => self.call_function(player, &func, this, args),
@@ -2136,10 +2183,15 @@ fn fit_text_box(player: &mut Player, id: ClipId, anchor: f32) {
     else {
         return;
     };
+    let before = player.clip(id).and_then(|c| c.text_box);
     if !wraps && let Some(c) = player.clip_mut(id) {
         c.text_box = Some([b[0], b[1], b[0] + 1.0e5, b[3]]);
     }
     let Some((w, h)) = player.text_size(id) else {
+        // Not measured: its box as it was, not the wide one.
+        if let Some(c) = player.clip_mut(id) {
+            c.text_box = before;
+        }
         return;
     };
     let Some(c) = player.clip_mut(id) else {
@@ -2238,9 +2290,8 @@ fn collect(player: &Player, id: ClipId, m: &Matrix, out: &mut Vec<Triangle>, nes
     // The shape's whole area, see-through fills too: Flash's bounds and
     // hit areas count them (the menus' buttons are fully transparent
     // shapes), though drawing leaves them out.
-    if let Kind::Shape(s) = c.kind
-        && let Some((_, mesh)) = c.lib.shapes.get(&s)
-    {
+    // A morph shape's, at its ratio (the PDA's buttons' highlights).
+    let whole = |mesh: &[super::ShapeTriangle], out: &mut Vec<Triangle>| {
         out.extend(mesh.iter().map(|t| Triangle {
             corners: t.corners.map(|p| m.apply(p)),
             uv: [[0.0; 2]; 3],
@@ -2248,6 +2299,36 @@ fn collect(player: &Player, id: ClipId, m: &Matrix, out: &mut Vec<Triangle>, nes
             texture: None,
             multiply: false,
         }));
+    };
+    match c.kind {
+        Kind::Shape(s) => {
+            if let Some((_, mesh)) = c.lib.shapes.get(&s) {
+                whole(mesh, out);
+            }
+        }
+        Kind::Morph(s) => {
+            if let Some(morphed) = c.lib.morph(s, c.ratio) {
+                whole(&morphed.1, out);
+            }
+        }
+        _ => {}
+    }
+    // A text field's box, as Flash counts it in its parents' bounds (the
+    // PDA's log stacks its messages by their `_height`).
+    if matches!(c.kind, Kind::Text(..))
+        && let Some(t) = c.text_def()
+    {
+        let [x0, y0, x1, y1] = t.bounds;
+        let corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(|p| m.apply(p));
+        for tri in [[0, 1, 2], [0, 2, 3]] {
+            out.push(Triangle {
+                corners: tri.map(|i| corners[i]),
+                uv: [[0.0; 2]; 3],
+                colour: [1.0; 4],
+                texture: None,
+                multiply: false,
+            });
+        }
     }
     for t in &c.drawing {
         out.push(Triangle {

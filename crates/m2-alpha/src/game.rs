@@ -3,8 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use m2_engine::atmosphere::AtmosphereMix;
-use m2_engine::durability::{CrashHow, Explosion};
+use m2_engine::atmosphere::{AtmosphereMix, ScriptAtmosphere};
+use m2_engine::durability::{BlastPush, CrashHow, Explosion};
 use m2_engine::physics::FLOAT_DEPTH;
 use m2_engine::{
     CatalogueEntry, Install, Physics, StaticKey, Templates, VehicleControls, VehicleSpec, World,
@@ -161,6 +161,9 @@ pub struct Game {
     spray_wait: f32,
     /// The light of the atmosphere region the player is in.
     pub sky: AtmosphereMix,
+    /// Lights blasts' scripts set, seconds before each comes in
+    /// ([`m2_game::atmosphere_script`]).
+    script_lights: Vec<(f32, ScriptAtmosphere)>,
     /// Props that move on their own.
     moving: MovingProps,
     /// Her support: the items she holds and the call under way; her
@@ -181,6 +184,10 @@ pub struct Game {
     pub placed: crate::placed::Placed,
     /// The scripts have turned her controls off (a loading fade).
     pub input_locked: bool,
+    /// A dialog box of the scripts is up (Fiona's contract menu): it
+    /// has the controls (`MrxGuiDialogBox._HandleInputEvent` takes the
+    /// pad's events), so she stands still and has no crosshair.
+    pub dialog_up: bool,
     /// The scripts' countdown ticked since autoplay last looked (a
     /// `ui_HUD_Timer_` cue: OilCon002's 15 minutes).
     pub countdown_tick: bool,
@@ -190,6 +197,13 @@ pub struct Game {
     /// Vehicles (by guid) the scripts keep for themselves
     /// (`Vehicle.Usable(vehicle, false)`): the use key doesn't get her in.
     pub unusable: HashSet<u32>,
+    /// The vehicle she last got into: the use key sticks to its entrances
+    /// ([`entrance_pick`]).
+    pub last_vehicle: Option<usize>,
+    /// The vehicle the use key seated her in and her seat's `SeatLink`
+    /// name ([`crate::ride`]); while she rides any other, or none is
+    /// given, she sits at the wheel.
+    pub ride: Option<(usize, u32)>,
     /// The field of view (degrees, bottom to top) and the screen's width
     /// over its height the last frame was drawn with: what the scripts'
     /// camera sees (`Event.ObjectIsVisible`).
@@ -380,6 +394,7 @@ impl Game {
             throttle: 0.0,
             spray_wait: 0.0,
             sky: AtmosphereMix::default(),
+            script_lights: Vec::new(),
             moving: MovingProps::default(),
             support: Support::default(),
             earned: Vec::new(),
@@ -388,9 +403,12 @@ impl Game {
             refused: std::collections::HashSet::new(),
             placed: crate::placed::Placed::default(),
             input_locked: false,
+            dialog_up: false,
             countdown_tick: false,
             hijack_only: HashSet::new(),
             unusable: HashSet::new(),
+            last_vehicle: None,
+            ride: None,
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
             context: None,
@@ -867,7 +885,7 @@ impl Game {
         split("game: moving");
         self.fetch_world_vehicles(dt);
         self.arrive(dt);
-        let intent = if self.input_locked {
+        let intent = if self.input_locked || self.dialog_up {
             Intent::default()
         } else {
             intent
@@ -925,6 +943,34 @@ impl Game {
                     self.park_tries += 1;
                     park(physics, &mut scene.vehicles, player, self.park_tries);
                 }
+                // Out of the vehicle the use key seated her in, or in
+                // another one, her seat is forgotten.
+                if self.ride.is_some_and(|(i, _)| player.driving != Some(i)) {
+                    self.ride = None;
+                }
+                // The seat key: over her seat's link to a free one.
+                if intent.trigger.seat
+                    && let Some(i) = player.driving
+                    && let Some(v) = scene.vehicles.get(i)
+                    && v.spec.seating.is_some()
+                {
+                    let from = self.ride.map(|(_, s)| s);
+                    match crate::ride::transfer(crate::ride::Ride::of(v), from) {
+                        Some(to) => {
+                            self.ride = Some((i, to));
+                            self.combat.seat = crate::ride::armed_index(
+                                crate::ride::Ride::of(v),
+                                Some(to),
+                                &combat::armed_seats(v),
+                            );
+                            eprintln!(
+                                "seat: she moves over to {to:08x} ({:?})",
+                                crate::ride::Ride::of(v).role(Some(to))
+                            );
+                        }
+                        None => eprintln!("seat: no free seat linked to hers"),
+                    }
+                }
                 if intent.use_pressed {
                     // The emplaced gun she would man, if nothing nearer
                     // takes the key.
@@ -938,10 +984,18 @@ impl Game {
                             player.character.position,
                         )
                     })
-                    .flatten();
+                    .flatten()
+                    .map(|mut m| {
+                        m.barrel = crate::placed::barrel(scene.source.as_mut(), &scene.props, &m);
+                        m
+                    });
                     match player.driving {
                         // Out over deep water she swims (`Player::update_swim`).
-                        Some(i) => get_out(physics, &scene.vehicles[i], player),
+                        Some(i) => {
+                            let seat = self.ride.filter(|r| r.0 == i).map(|r| r.1);
+                            get_out(physics, &scene.vehicles[i], seat, player);
+                            self.ride = None;
+                        }
                         // Off the emplaced gun she mans.
                         None if self.combat.manned.is_some() => {
                             if let Some(m) = self.combat.manned.take() {
@@ -987,20 +1041,53 @@ impl Game {
                             self.combat.manned = Some(m);
                         }
                         None => {
-                            player.driving = nearest(
+                            let picked = entrance_pick(
                                 physics,
                                 &scene.vehicles,
                                 (&self.hijack_only, &self.unusable),
                                 player,
-                                REACH,
+                                self.last_vehicle,
                             );
+                            let db = &world.index.template_db;
+                            // The seat the entrance gives her.
+                            let boarding = picked.and_then(|(i, entrance)| {
+                                let v = &scene.vehicles[i];
+                                let labels = db.vehicle_labels_for(&v.spec.label, v.spec.model);
+                                let b = crate::ride::board(
+                                    crate::ride::Ride::of(v),
+                                    entrance,
+                                    crate::ride::car_or_truck(&labels),
+                                    &scene.people,
+                                );
+                                log_entry(physics, v, player, entrance, b.as_ref());
+                                Some((i, b?))
+                            });
+                            player.driving = boarding.as_ref().map(|(i, _)| *i);
+                            if let Some((i, b)) = &boarding {
+                                self.last_vehicle = Some(*i);
+                                self.ride = b.seat.map(|s| (*i, s));
+                                let v = &scene.vehicles[*i];
+                                self.combat.seat = crate::ride::armed_index(
+                                    crate::ride::Ride::of(v),
+                                    b.seat,
+                                    &combat::armed_seats(v),
+                                );
+                            }
                             // Seated: she no longer waits to land (people
                             // wait on that, and she may have hopped out and
                             // back in before the ground streamed).
-                            if let Some(i) = player.driving {
+                            if let Some((i, b)) = boarding {
                                 player.landed = true;
-                                let db = &world.index.template_db;
-                                let out = take_seat(&mut scene.vehicles[i])
+                                let v = &mut scene.vehicles[i];
+                                let out = crate::ride::empty_seats(&mut v.crew, &b.out);
+                                if !out.is_empty() {
+                                    eprintln!(
+                                        "hijack: she takes the {} from {} rider(s)",
+                                        v.spec.label,
+                                        out.len()
+                                    );
+                                }
+                                let out = out
                                     .into_iter()
                                     .map(|who| {
                                         let model = db.get(&who).and_then(|t| t.model);
@@ -1026,7 +1113,8 @@ impl Game {
                     .and_then(|v| v.id.map(|id| (id, v)));
                 self.throttle = 0.0;
                 let was_honking = std::mem::take(&mut self.honking);
-                // In a gunner's seat nobody drives: it stops.
+                // In a gunner's or passenger's seat (any but the driver's
+                // armed seat 0) nobody drives: it stops.
                 let gunner = self.combat.seat > 0;
                 if let Some((id, v)) = id
                     && !v.wrecked
@@ -1223,6 +1311,7 @@ impl Game {
                 walking,
                 dt,
             );
+            run_over_pickups(world, &mut self.scene.flights, &self.scene.vehicles);
             knock_loose(
                 world,
                 &mut self.scene.props,
@@ -1257,6 +1346,12 @@ impl Game {
             // What came down (to a vehicle, the traffic's too, or a blast
             // last tick) comes down whether she is on foot or the free
             // camera flies: its island copy has lost its collision already.
+            self.destruction.burn(
+                world,
+                &mut self.scene.props,
+                self.scene.install.as_ref(),
+                dt,
+            );
             self.destruction.update(
                 world,
                 &mut self.scene.props,
@@ -1332,11 +1427,16 @@ impl Game {
                 // where the targets are brought down from its emplaced
                 // guns; inferred from the scripts).
                 let manning = self.combat.manned.is_some() && !field.player.swimming();
-                let trigger = if field.player.weapons_away() && !manning {
+                let mut trigger = if field.player.weapons_away() && !manning {
                     crate::combat::Trigger::default()
                 } else {
                     intent.trigger
                 };
+                // The seat key moved her over her seat's links already.
+                let seated = field.player.driving.and_then(|i| field.vehicles.get(i));
+                if seated.is_some_and(|v| v.spec.seating.is_some()) {
+                    trigger.seat = false;
+                }
                 self.combat.step(&mut field, trigger, dt);
             });
             crate::spans::time("on foot: vehicles hit her", || {
@@ -1419,6 +1519,13 @@ impl Game {
                         p,
                         walked,
                     );
+                    // "Take Ammo" is the weapon's context action as
+                    // "Equip" is: the 360 posts `PickupWeapon` (8768c3b1)
+                    // to her for either before the pickup is settled
+                    // (8228FE58), so she picks it up off the ground too.
+                    if near.is_some_and(|n| n.0 == Offer::TakeAmmo) {
+                        player.start_pickup();
+                    }
                 }
                 // A placed one's prop comes down with it.
                 if self.placed.is_pickup(from) {
@@ -1502,6 +1609,9 @@ impl Game {
 
     /// Sets off the game's effects the fight asked for and runs them.
     fn run_particles(&mut self, dt: f32) {
+        if let Some(world) = self.scene.world.as_ref() {
+            state_effects(world, &mut self.combat);
+        }
         let asked = std::mem::take(&mut self.combat.game_fx);
         let scene = &mut self.scene;
         let (Some(p), Some(world)) = (scene.particles.as_mut(), scene.world.as_ref()) else {
@@ -1648,7 +1758,7 @@ impl Game {
                 // the texts' `[confirm]` shows) confirms as well.
                 use_pressed: intent.use_pressed || (intent.jump && self.support.busy()),
                 fire: intent.trigger.fire,
-                steer: intent.movement,
+                steer: intent.walking(),
                 select: intent.trigger.select.is_some(),
                 hurt: hp < self.support_hp,
                 pda: intent.trigger.pda,
@@ -1715,19 +1825,16 @@ impl Game {
                 Impact::Bomb(_) => {
                     eprintln!("support: the bomb lands at {at:.1}");
                     self.combat.bomb(&mut field, at);
-                    blast_loose(world, &mut scene.props, &[at], combat::BOMB.0, true);
+                    let blasts = bomb_blasts(&world.index.template_db, at);
+                    self.combat.last_push = blasts.first().map(|b| b.push);
+                    if let Some(light) = blast_light(&world.index.template_db, BOMB_BLAST) {
+                        self.script_lights.push(light);
+                    }
+                    let pushes: Vec<BlastPush> =
+                        blasts.first().map(|b| b.push).into_iter().collect();
+                    blast_loose(world, &mut scene.props, &pushes, true);
                     if let Some(install) = &scene.install {
-                        for (name, (radius, damage)) in
-                            [(BOMB_BLAST, combat::BOMB), (BOMB_FRAG, combat::BOMB_FRAG)]
-                        {
-                            let e = explosion(&world.index.template_db, &[name]);
-                            let blast = Blast {
-                                at,
-                                radius: e.map_or(radius, |e| e.radius),
-                                damage: e.map_or(damage, |e| e.damage),
-                                least: e.map_or(0.0, |e| e.least),
-                                kind: e.map_or(0, |e| e.kind),
-                            };
+                        for blast in blasts {
                             self.destruction
                                 .blast(world, &mut scene.props, Some(install), blast);
                         }
@@ -1754,13 +1861,23 @@ impl Game {
         let fresh: Vec<_> = scene.strikes.burst[before..].to_vec();
         for (_, template, at) in fresh {
             let ordnance = &world.index.template_db.ordnance;
-            let blasts: Vec<(f32, f32)> = template
+            let infos: Vec<_> = template
                 .map(|t| ordnance.blasts_of(t))
                 .unwrap_or_default()
                 .iter()
                 .filter_map(|b| ordnance.blasts.get(b))
-                .map(|b| (b.radius, b.damage))
                 .collect();
+            let blasts: Vec<(f32, f32)> = infos.iter().map(|b| (b.radius, b.damage)).collect();
+            // The strongest push of those going off together
+            // ([`crate::destruct::together`]).
+            let push = infos
+                .iter()
+                .max_by(|a, b| a.force.total_cmp(&b.force))
+                .map(|b| BlastPush {
+                    at,
+                    radius: b.radius,
+                    force: b.force,
+                });
             let mut field = Field {
                 physics: &mut world.physics,
                 player,
@@ -1777,14 +1894,8 @@ impl Game {
             for &(radius, damage) in blasts.iter().skip(1) {
                 self.combat.harm_at(&mut field, at, radius, damage);
             }
-            if let Some(reach) = blasts.iter().map(|b| b.0).reduce(f32::max) {
-                blast_loose(
-                    world,
-                    &mut scene.props,
-                    &[at],
-                    reach,
-                    reach >= combat::BOMB.0,
-                );
+            if let (Some(reach), Some(push)) = (blasts.iter().map(|b| b.0).reduce(f32::max), push) {
+                blast_loose(world, &mut scene.props, &[push], reach >= combat::BOMB.0);
             }
             world
                 .destroyed
@@ -1991,16 +2102,17 @@ impl Game {
         let driving = player.and_then(|p| p.driving).and_then(|i| {
             let v = self.scene.vehicles.get(i)?;
             let speed = self.driving().map_or(0.0, |d| d.1);
-            // In a gunner's seat, so marked.
+            // In a gunner's or passenger's seat, so marked.
             let label = match self.combat.seat {
                 0 => v.spec.label.clone(),
+                combat::NO_GUN => format!("{} (passenger)", v.spec.label),
                 _ => format!("{} (gunner)", v.spec.label),
             };
             Some((label, speed, v.wrecked))
         });
         // What the crosshair is on: on foot, or in a vehicle with a gun.
         let crosshair = match (&self.scene.world, player) {
-            (Some(w), Some(p)) if self.combat.down <= 0.0 => match p.driving {
+            (Some(w), Some(p)) if self.combat.down <= 0.0 && !self.dialog_up => match p.driving {
                 Some(i) => self
                     .scene
                     .vehicles
@@ -2015,14 +2127,14 @@ impl Game {
             _ => None,
         };
         let can_enter = match (&self.scene.world, player) {
-            (Some(w), Some(p)) if p.driving.is_none() && p.landed => nearest(
+            (Some(w), Some(p)) if p.driving.is_none() && p.landed => entrance_pick(
                 &w.physics,
                 &self.scene.vehicles,
                 (&self.hijack_only, &self.unusable),
                 p,
-                REACH,
+                self.last_vehicle,
             )
-            .map(|i| {
+            .map(|(i, _)| {
                 let spec = &self.scene.vehicles[i].spec;
                 vehicle_name(&w.index.template_db, strings, &spec.label, spec.model)
             }),
@@ -2113,6 +2225,35 @@ impl Game {
                 .support
                 .hud(player.map_or(self.camera.position.y, |p| p.character.position.y)),
             hero: self.scene.hero,
+            pickups: player.map_or_else(Vec::new, |p| {
+                self.scene
+                    .flights
+                    .marker_points(p.character.position, crate::pickup_marker::NEAR_HER)
+                    .into_iter()
+                    .filter_map(|(at, lying)| {
+                        Some(crate::pickup_marker::PickupMarker {
+                            at,
+                            icon: lying.what.icon?,
+                            flat: lying.what.icon_flat,
+                        })
+                    })
+                    .collect()
+            }),
+            entrance_markers: match (&self.scene.world, player) {
+                // None while she rides anything: a hijack has her in the
+                // vehicle's `InVehicle` stance with the controls off, and
+                // the 360 queues none then (82376A48).
+                (Some(w), Some(p)) if p.driving.is_none() && !self.input_locked => {
+                    entrance_markers(
+                        &w.physics,
+                        &w.index.template_db,
+                        &self.scene,
+                        (&self.hijack_only, &self.unusable),
+                        p.character.position,
+                    )
+                }
+                _ => Vec::new(),
+            },
             ..HudInfo::default()
         }
     }
@@ -2263,6 +2404,17 @@ impl Game {
             return;
         };
         let regions = &world.index.atmosphere_regions;
+        for (left, light) in &mut self.script_lights {
+            *left -= dt;
+            if *left <= 0.0 {
+                let unused = self.sky.script(default, light);
+                eprintln!(
+                    "atmosphere: a blast's script sets the light (restored over {:?} s; not drawn: {unused:?})",
+                    light.restore
+                );
+            }
+        }
+        self.script_lights.retain(|(left, _)| *left > 0.0);
         if let Some(now) = self.sky.update(default, regions, focus, dt) {
             match now {
                 Some((r, s)) => {
@@ -2372,6 +2524,11 @@ impl Game {
             satellite_look(&mut view.lighting);
         }
         self.picture.apply(&mut view.lighting);
+        // The effects' lights (a blast's flash, a fire), the nearest first.
+        if let Some(p) = &self.scene.particles {
+            let eye = view.view.inverse().w_axis.truncate();
+            view.lighting.point_lights = p.point_lights(eye);
+        }
         view
     }
 }
@@ -2634,6 +2791,8 @@ fn take_up(
             weapon: Some(left),
             gun,
             gives: Some((left, kept)),
+            icon: template.and_then(|(id, info)| crate::mission::marker_icon(templates, *id, info)),
+            icon_flat: template.is_some_and(|(_, info)| info.marker_flat()),
             ..crate::flights::Leaves::default()
         },
         at: player.character.position + right * LEFT_BESIDE,
@@ -2777,15 +2936,29 @@ fn hit_world(
             destruction.wear(world, props, install, key, (s.round, s.kind, 0.0), s.at);
         }
     }
-    for &at in &combat.went_off {
-        for blast in rocket_blasts(&world.index.template_db, at) {
+    let mut pushes = Vec::new();
+    for at in combat.went_off.clone() {
+        let blasts = rocket_blasts(&world.index.template_db, at);
+        combat.last_push = blasts.first().map(|b| b.push);
+        pushes.extend(combat.last_push);
+        for blast in blasts {
             destruction.blast(world, props, install, blast);
         }
     }
-    blast_loose(world, props, &combat.went_off, combat::REACH, false);
-    // What was worn down and blows up goes off a moment later.
-    for (at, size) in destruction.set_off.drain(..) {
-        combat.set_off(at, size);
+    blast_loose(world, props, &pushes, false);
+    blast_pickups(world, flights, &pushes);
+    // What was worn down and blows up goes off at once, with the blast
+    // its template leaves, and shows what its model's `CollapseState`
+    // starts.
+    for (at, template, shows) in destruction.set_off.drain(..) {
+        combat.set_off(at, combat::left_blast(&world.index.template_db, template));
+        for (effect, at) in shows {
+            combat.game_fx.push(combat::GameFx {
+                template: combat::FxTemplate::Hash(effect),
+                at,
+                hold: None,
+            });
+        }
     }
     let mut broken = flights.strike(&mut world.physics, &combat.struck, &combat.went_off);
     // The state layers' crates too ([`crate::placed`]).
@@ -3148,6 +3321,24 @@ const ROCKET_BLASTS: [&str; 4] = [
 const BOMB_BLAST: &str = "Explosion (Airstike Bomb)";
 const BOMB_FRAG: &str = "Explosion (Airstrike Frag)";
 
+/// What the script of the blast `name` does to the light, if it does
+/// ([`m2_game::atmosphere_script`]): seconds until, and the light.
+fn blast_light(db: &Templates, name: &str) -> Option<(f32, ScriptAtmosphere)> {
+    // `M2_BLAST_LIGHT=off` leaves the light alone (to measure against).
+    if std::env::var("M2_BLAST_LIGHT").is_ok_and(|v| v == "off") {
+        return None;
+    }
+    let bytes = db.blast_scripts.get(&db.id(name)?)?;
+    let chunk = m2_assets::lua::Chunk::from_asset(bytes).ok()?;
+    match m2_game::atmosphere_script::activation_light(&chunk) {
+        Ok(light) => light,
+        Err(e) => {
+            eprintln!("atmosphere: {name}'s script did not run: {e}");
+            None
+        }
+    }
+}
+
 /// The first of `names` the template database gives a blast.
 fn explosion(db: &Templates, names: &[&str]) -> Option<Explosion> {
     names
@@ -3180,25 +3371,20 @@ const ROCKET_HIT: f32 = 0.5;
 /// doesn't give are left out; with none, combat's own reach and 100 to
 /// nothing.
 pub(crate) fn rocket_blasts(db: &Templates, at: Vec3) -> Vec<Blast> {
-    let of = |e: Explosion| Blast {
-        at,
-        radius: e.radius,
-        damage: e.damage,
-        least: e.least,
-        kind: e.kind,
-    };
     let mut out: Vec<Blast> = [explosion(db, &ROCKET_BLASTS), explosion(db, &[ROCKET_FRAG])]
         .into_iter()
         .flatten()
-        .map(of)
+        .map(|e| of_explosion(e, at))
         .collect();
     if let Some(p) = db.id(ROCKET).and_then(|id| db.projectiles.get(&id)) {
+        // The rocket itself pushes nothing: a projectile, no `Explosive`.
         out.push(Blast {
             at,
             radius: ROCKET_HIT,
             damage: p.damage,
             least: p.damage,
             kind: p.kind,
+            push: BlastPush::none(at),
         });
     }
     if out.is_empty() {
@@ -3209,9 +3395,58 @@ pub(crate) fn rocket_blasts(db: &Templates, at: Vec3) -> Vec<Blast> {
             damage,
             least,
             kind: 0,
+            push: BlastPush {
+                at,
+                radius,
+                force: EXPLOSIVE_FORCE,
+            },
         });
     }
-    out
+    crate::destruct::together(out)
+}
+
+/// The air strike bomb's blasts going off at `at`: its explosion and its
+/// frag, as the data has them (combat's own where it hasn't).
+pub(crate) fn bomb_blasts(db: &Templates, at: Vec3) -> Vec<Blast> {
+    let blasts = [(BOMB_BLAST, combat::BOMB), (BOMB_FRAG, combat::BOMB_FRAG)].map(
+        |(name, (radius, damage))| match explosion(db, &[name]) {
+            Some(e) => of_explosion(e, at),
+            None => Blast {
+                at,
+                radius,
+                damage,
+                least: 0.0,
+                kind: 0,
+                push: BlastPush {
+                    at,
+                    radius,
+                    force: EXPLOSIVE_FORCE,
+                },
+            },
+        },
+    );
+    crate::destruct::together(blasts.to_vec())
+}
+
+/// The `MaxForce` an `Explosive` has when its template gives none (the
+/// schema's default, 0x823EF9F0), for a blast not found in the data.
+const EXPLOSIVE_FORCE: f32 = 500.0;
+
+/// Explosion `e` going off at `at` as a blast that wears things down and
+/// pushes what it breaks.
+fn of_explosion(e: Explosion, at: Vec3) -> Blast {
+    Blast {
+        at,
+        radius: e.radius,
+        damage: e.damage,
+        least: e.least,
+        kind: e.kind,
+        push: BlastPush {
+            at,
+            radius: e.radius,
+            force: e.force,
+        },
+    }
 }
 
 /// Whether an ordinary blast throws loose what template `t`'s objects
@@ -3235,32 +3470,115 @@ fn blown_loose(db: &Templates, t: u32) -> bool {
     })
 }
 
-fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3], reach: f32, strike: bool) {
-    let thrown = |blast: Vec3, at: Vec3, d: f32| {
-        let near = (1.0 - d / reach).clamp(0.0, 1.0);
-        let away = (at - blast).with_y(0.0).normalize_or(Vec3::X);
-        let (out, up) = combat::BLAST_PUSH;
-        let velocity = away * (out * near + 1.0) + Vec3::Y * (up * near + 1.0);
-        (velocity, Vec3::Y.cross(away) * (TOPPLE * out * near))
-    };
-    for &at in blasts {
-        for (i, d) in world.loose_near(at, reach) {
+/// What a pickup of template `t` weighs, if it is a physics prop
+/// (`_PropPhysics`): kilograms and its gravity scale.
+pub(crate) fn pickup_weight(db: &m2_engine::Templates, t: u32) -> Option<(f32, f32)> {
+    let p = db.prop_physics.get(&t)?;
+    Some((p.kg(), db.gravity_scales.get(&t).copied().unwrap_or(1.0)))
+}
+
+/// Vehicles on the move throw the physics props lying to be taken that
+/// they run into, as they knock props loose ([`flung`]).
+fn run_over_pickups(
+    world: &mut World,
+    flights: &mut crate::flights::Flights,
+    vehicles: &[ParkedVehicle],
+) {
+    for v in vehicles {
+        let Some(id) = v.id else { continue };
+        let Some(place) = world.physics.vehicle_transform(id) else {
+            continue;
+        };
+        let velocity = world.physics.vehicle_velocity(id);
+        let db = &world.index.template_db;
+        let threw = flights.run_over(
+            &mut world.physics,
+            (place, v.model.bounds, velocity, v.spec.mass),
+            |t| pickup_weight(db, t),
+            flung,
+        );
+        if threw > 0 {
+            eprintln!("pickups: the {} throws {threw}", v.spec.label);
+        }
+    }
+}
+
+/// Blasts throw the physics props lying to be taken (the weapons and
+/// grenades soldiers leave) within each one's reach, as it pushes them
+/// ([`BlastPush::throw`], each taken as a point: none is anywhere near
+/// the 2 m³ the push is full up to).
+fn blast_pickups(world: &mut World, flights: &mut crate::flights::Flights, pushes: &[BlastPush]) {
+    let db = &world.index.template_db;
+    for push in pushes {
+        let threw = flights.blow(
+            &mut world.physics,
+            &[push.at],
+            push.radius,
+            |t| pickup_weight(db, t),
+            |_, at, _| push.throw(at, at, 1.0),
+        );
+        if threw > 0 {
+            eprintln!("pickups: a blast throws {threw}");
+        }
+    }
+}
+
+/// What `pushes` knock loose within each one's reach (what comes loose:
+/// a lamp, a fence, a chair) flies as the blast pushes it, by its own
+/// box and its template's `ExplosionFudge` ([`BlastPush::throw`], the 360
+/// code's push on what moves, 0x8215CBC8). An ordinary blast knocks loose
+/// only what [`blown_loose`] says; a `strike` (an air strike's) all of it.
+fn blast_loose(world: &mut World, props: &mut Props, pushes: &[BlastPush], strike: bool) {
+    let fudge = |db: &Templates, t: u32| db.explosion_fudges.get(&t).copied().unwrap_or(1.0);
+    for push in pushes {
+        for (i, _) in world.loose_near(push.at, push.radius) {
             let o = world.index.objects[i];
-            if !strike && !blown_loose(&world.index.template_db, o.template) {
+            let db = &world.index.template_db;
+            if !strike && !blown_loose(db, o.template) {
                 continue;
             }
-            let (velocity, spin) = thrown(at, o.position, d);
+            let placed = Mat4::from_rotation_translation(o.rotation, o.position);
+            let (lo, hi) = world.object_model(i).map_or((o.position, o.position), |m| {
+                crate::props::box_around(placed, m.bounds)
+            });
+            let (velocity, spin) = push.throw(lo, hi, fudge(db, o.template));
             world.knock(i, velocity, spin);
         }
-        for (e, d) in props.loose_near(&world.physics, at, reach, strike) {
+        for (e, _) in props.loose_near(&world.physics, push.at, push.radius, strike) {
             let Some((p, template)) = props.get(e).map(|(p, _)| (p.position, p.template)) else {
                 continue;
             };
-            if !strike && !blown_loose(&world.index.template_db, template) {
+            let db = &world.index.template_db;
+            if !strike && !blown_loose(db, template) {
                 continue;
             }
-            let (velocity, spin) = thrown(at, p, d);
+            let (lo, hi) = props
+                .placed_bounds(e)
+                .map_or((p, p), |(at, bounds)| crate::props::box_around(at, bounds));
+            let (velocity, spin) = push.throw(lo, hi, fudge(db, template));
             props.knock(&mut world.physics, e, velocity, spin, strike);
+        }
+    }
+}
+
+/// What the island's explosives' models start on entering the states the
+/// fight put them in ([`Combat::explosive_states`]): each effect their
+/// part states start there (`StartEmitter`), on its node, or at the
+/// object for a locator the model doesn't carry (inferred), each running
+/// as long as its template says (the fuel tanks' fire jets 10 s, their
+/// wreck's smoke 100 s). Asked of the particles as the fight's own are.
+fn state_effects(world: &World, combat: &mut Combat) {
+    for (i, state) in std::mem::take(&mut combat.explosive_states) {
+        let (Some(o), Some(model)) = (world.index.objects.get(i), world.object_model(i)) else {
+            continue;
+        };
+        let placed = Mat4::from_rotation_translation(o.rotation, o.position);
+        for fx in model.state_fx.iter().filter(|fx| fx.state == state) {
+            combat.game_fx.push(combat::GameFx {
+                template: combat::FxTemplate::Hash(fx.effect),
+                at: fx.at.map_or(o.position, |at| placed.transform_point3(at)),
+                hold: None,
+            });
         }
     }
 }
@@ -3542,14 +3860,11 @@ fn has_driver(crew: &[(String, String)]) -> bool {
 /// crew forgets them: playtest 4, no car could be taken from traffic).
 /// The templates of those put out.
 fn take_seat(v: &mut ParkedVehicle) -> Vec<String> {
-    let (out, kept) = std::mem::take(&mut v.crew)
-        .into_iter()
-        .partition(|(seat, _)| seat.to_ascii_lowercase().contains("driver"));
-    v.crew = kept;
+    let out = crate::ride::empty_seats(&mut v.crew, &[None]);
     if !out.is_empty() {
         eprintln!("hijack: she takes the {} from its driver", v.spec.label);
     }
-    out.into_iter().map(|(_, who)| who).collect()
+    out
 }
 
 /// Those put out of vehicle `v`'s (`vehicles[i]`) seats (`out`, by
@@ -3591,8 +3906,6 @@ fn put_out(
     }
 }
 
-/// The vehicle nearest her within `reach` metres of its door marker (or its
-/// hull, for those without one).
 /// Whether a vehicle of catalogue kind `kind` has a seat to get into: not
 /// a trailer (ChiCon003's `civ_veh_trailer_flatbed`, kind `trailer`, was
 /// got into for the M2A3 it carries, and "driven" stuck for 3,200 s).
@@ -3601,17 +3914,187 @@ fn can_sit_in(kind: &str) -> bool {
     kind != "trailer"
 }
 
-fn nearest(
+/// The vehicle she gets into at a press of the use key, and the entrance
+/// she gets in by (`None` for a vehicle without entrance data), as the 360
+/// does ([`m2_engine::seats`]): of the entrances in front of the camera
+/// within their `UseDistance` + 1 m of her, the nearest, sticking to
+/// `last`, the vehicle she last got into. A vehicle without entrance
+/// data is reached at its door marker (or hull) within [`REACH`]
+/// (Invented stand-in, the beta's rule).
+fn entrance_pick(
     physics: &Physics,
     vehicles: &[ParkedVehicle],
-    (hijack_only, unusable): (&HashSet<u32>, &HashSet<u32>),
+    rules: (&HashSet<u32>, &HashSet<u32>),
     player: &Player,
-    reach: f32,
-) -> Option<usize> {
-    let p = player.character.position;
+    last: Option<usize>,
+) -> Option<(usize, Option<u32>)> {
+    use m2_engine::seats::{self, Candidate};
+    let her = player.character.position;
+    let (eye, aim) = (player.eye(), player.camera_forward());
+    let mut found: Vec<(Candidate, Option<u32>)> = Vec::new();
+    for (i, v) in usable(vehicles, rules) {
+        let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id)) else {
+            continue;
+        };
+        let upright = at.transform_vector3(Vec3::Y).normalize_or_zero().y >= seats::UPRIGHT_MIN_Y;
+        if v.spec.entrances.is_empty() {
+            let d = reach_of(at, &v.spec, her);
+            if d <= REACH {
+                let c = Candidate {
+                    vehicle: i,
+                    distance_sq: d * d,
+                    use_distance: REACH,
+                    upright,
+                    offered: true,
+                };
+                found.push((c, None));
+            }
+            continue;
+        }
+        for &(e, local) in &v.spec.entrances {
+            let place = at.transform_point3(local);
+            let p = e.params;
+            if seats::in_search(her, eye, aim, place, p.use_distance, seats::SEARCH_PAD) {
+                let c = Candidate {
+                    vehicle: i,
+                    distance_sq: her.distance_squared(place),
+                    use_distance: p.use_distance,
+                    upright,
+                    // The scripts' `Vehicle.Usable` stays the alpha's rule
+                    // ([`usable`]); ladders' seat paths are not checked.
+                    offered: seats::offered(&p, true),
+                };
+                found.push((c, Some(e.name)));
+            }
+        }
+    }
+    found.truncate(seats::LIST_CAP);
+    let cands: Vec<Candidate> = found.iter().map(|(c, _)| *c).collect();
+    let k = seats::pick(&cands, last)?;
+    Some((found[k].0.vehicle, found[k].1))
+}
+
+/// The markers over the entrances near her, standing at `her` on foot
+/// ([`crate::entrance_marker`]): of each vehicle she may get into within
+/// [`NEAR_VEHICLE`](crate::entrance_marker::NEAR_VEHICLE), each entrance
+/// offered for plain entry within the markers' reach that gives her a
+/// seat ([`crate::ride::board`]'s first seat, before any slide over: the
+/// 360 marks the seat 0x82299D68 gives).
+fn entrance_markers(
+    physics: &Physics,
+    db: &Templates,
+    scene: &Scene,
+    rules: (&HashSet<u32>, &HashSet<u32>),
+    her: Vec3,
+) -> Vec<crate::entrance_marker::EntranceMarker> {
+    use crate::entrance_marker::{EntranceMarker, LIFT, NEAR_VEHICLE, REACH};
+    let mut out = Vec::new();
+    for (_, v) in usable(&scene.vehicles, rules) {
+        let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id)) else {
+            continue;
+        };
+        if at.w_axis.truncate().distance_squared(her) >= NEAR_VEHICLE * NEAR_VEHICLE {
+            continue;
+        }
+        let labels = db.vehicle_labels_for(&v.spec.label, v.spec.model);
+        for &(e, local) in &v.spec.entrances {
+            let place = at.transform_point3(local);
+            if e.params.use_distance <= 0.0
+                || !m2_engine::seats::offered(&e.params, true)
+                || place.distance_squared(her) >= REACH * REACH
+            {
+                continue;
+            }
+            let Some(b) = crate::ride::board(
+                crate::ride::Ride::of(v),
+                Some(e.name),
+                crate::ride::car_or_truck(&labels),
+                &scene.people,
+            ) else {
+                continue;
+            };
+            // The seat the entrance gives, not the one she slides to.
+            let seat = b.slid_from.or(b.seat);
+            out.push(EntranceMarker {
+                at: place + Vec3::Y * LIFT,
+                role: crate::ride::Ride::of(v).role(seat),
+            });
+        }
+    }
+    out
+}
+
+/// Logs her getting into `v` by `entrance`: how far she stood from it and
+/// the seat [`crate::ride::board`] gave her (`None`: no way in).
+fn log_entry(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    player: &Player,
+    entrance: Option<u32>,
+    boarding: Option<&crate::ride::Boarding>,
+) {
+    let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id)) else {
+        return;
+    };
+    match boarding {
+        Some(b) => eprintln!(
+            "seat: in the {}: {:x?} ({:?}){}{}",
+            v.spec.label,
+            b.seat,
+            b.role,
+            b.slid_from
+                .map_or(String::new(), |f| format!(", slid over from {f:08x}")),
+            b.stayed.map_or(String::new(), |w| format!(", stays: {w}"))
+        ),
+        None => eprintln!("seat: the {}'s entrance gives her no seat", v.spec.label),
+    }
+    let her = at.inverse().transform_point3(player.character.position);
+    let Some(e) = entrance else {
+        eprintln!(
+            "enter: {} by its door marker (no entrance data), her local {:.2?}",
+            v.spec.label,
+            her.to_array()
+        );
+        return;
+    };
+    let place = v.spec.entrance_at(e).unwrap_or(Vec3::ZERO);
+    let ud = v
+        .spec
+        .entrances
+        .iter()
+        .find(|(x, _)| x.name == e)
+        .map_or(0.0, |(x, _)| x.params.use_distance);
+    eprintln!(
+        "enter: {} by entrance {e:#010x} at local {:.2?} (UseDistance {ud}), her local {:.2?}, \
+         {:.2} m",
+        v.spec.label,
+        place.to_array(),
+        her.to_array(),
+        her.distance(place),
+    );
+}
+
+/// Her distance from vehicle `spec` standing at `at`: from its door marker,
+/// else its hull.
+fn reach_of(at: Mat4, spec: &VehicleSpec, her: Vec3) -> f32 {
+    let local = at.inverse() * her.extend(1.0);
+    let (lo, hi) = spec.bounds;
+    match spec.door {
+        Some(door) => (local.xyz() - door).length(),
+        None => (local.xyz().clamp(lo, hi) - local.xyz()).length(),
+    }
+}
+
+/// The vehicles she may get into, with their indices: not wrecked, with a
+/// seat, and not kept by the scripts or an action hijack while crewed.
+fn usable<'a>(
+    vehicles: &'a [ParkedVehicle],
+    (hijack_only, unusable): (&'a HashSet<u32>, &'a HashSet<u32>),
+) -> impl Iterator<Item = (usize, &'a ParkedVehicle)> + 'a {
     vehicles
         .iter()
         .enumerate()
+        .filter(|(_, v)| !v.wrecked && can_sit_in(&v.spec.kind))
         .filter(|(_, v)| !v.wrecked && can_sit_in(&v.spec.kind))
         // Crewed, one with an action hijack is taken only by it (playtest
         // 5: the villa's tank, whose scripts make it usable by the hijack
@@ -3624,18 +4107,22 @@ fn nearest(
         // crewed tank is the hijack's alone). From those samples; the 360
         // code not checked.
         .filter(|(_, v)| !(v.guid.is_some_and(|g| unusable.contains(&g)) && has_driver(&v.crew)))
-        // One with someone in the driver's seat is taken from them: the
-        // action hijacks (tanks, helicopters) took the key first if near
-        // ([`crate::hijack`]); cars, bikes and jeeps have none in the data
-        // and are got into, the driver put out ([`take_seat`]).
+}
+
+/// The vehicle nearest her within `reach` metres of its door marker (or its
+/// hull, for those without one): `--drive`'s pick, at any distance. One
+/// with someone in the driver's seat is taken from them ([`take_seat`]).
+fn nearest(
+    physics: &Physics,
+    vehicles: &[ParkedVehicle],
+    rules: (&HashSet<u32>, &HashSet<u32>),
+    player: &Player,
+    reach: f32,
+) -> Option<usize> {
+    let p = player.character.position;
+    usable(vehicles, rules)
         .filter_map(|(i, v)| {
-            let at = physics.vehicle_transform(v.id?)?;
-            let local = at.inverse() * p.extend(1.0);
-            let (lo, hi) = v.spec.bounds;
-            let d = match v.spec.door {
-                Some(door) => (local.xyz() - door).length(),
-                None => (local.xyz().clamp(lo, hi) - local.xyz()).length(),
-            };
+            let d = reach_of(physics.vehicle_transform(v.id?)?, &v.spec, p);
             (d <= reach).then_some((i, d))
         })
         .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -3678,18 +4165,92 @@ pub(crate) fn can_get_out(physics: &Physics, v: &ParkedVehicle) -> bool {
 /// The deepest water she gets out of a boat into, metres: chest deep.
 const WADE: f32 = 1.4;
 
-/// Gets her out on the driver's side, beside the hull, to drop to the
-/// ground there.
-pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player) {
-    if let Some(at) =
-        v.id.and_then(|id| physics.vehicle_transform(id))
-            .filter(|at| at.is_finite())
+/// How and where she gets out of `v`, standing at `at` and moving at
+/// `velocity`, from seat `her_seat` (its `SeatLink` name; `None`, the
+/// driver's) ([`m2_engine::seats::exit_kind`]),
+/// and where she lands, world space: the hardpoint of the seat's exit
+/// entrance at the hull's height (0x822A1B70 puts a ditching rider there;
+/// Invented for the animated exit, whose clip is not played), or beside
+/// the hull by the door when the way there is blocked (Invented stand-in
+/// for 0x822A13D0's clear point) or the hardpoint lies within the hull (a
+/// boat's driver gets out at the seat itself).
+fn exit_plan(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    her_seat: Option<u32>,
+    at: Mat4,
+    velocity: Vec3,
+) -> (m2_engine::seats::ExitKind, Vec3) {
+    use m2_engine::seats::{self, ExitKind};
+    let seating = v.spec.seating.as_deref();
+    // Her seat, else the driver's.
+    let index = seating.and_then(|s| her_seat.and_then(|n| s.seat(n)).or_else(|| s.driver()));
+    let seat = seating.zip(index).map(|(s, i)| &s.seats[i]);
+    let exit = seating.zip(index).and_then(|(s, i)| s.exit_of(i));
+    let local = exit
+        .and_then(|e| v.spec.entrance_at(e.name))
+        .map(|p| Vec3::new(p.x, 0.0, p.z));
+    let (lo, hi) = v.spec.bounds;
+    let local = local.filter(|p| !(lo.x..=hi.x).contains(&p.x) || !(lo.z..=hi.z).contains(&p.z));
+    let place = local.map(|p| at.transform_point3(p));
+    // The 360 sweeps her capsule (0.4 m, 0.6 to 1.8 m up) from her seat to
+    // the hardpoint (0x8229AC90); here one ray at 1.2 m.
+    let blocked = place.zip(v.id).is_some_and(|(to, id)| {
+        let from = at.transform_point3(v.spec.seat.unwrap_or(Vec3::ZERO)) + Vec3::Y * 1.2;
+        let way = to + Vec3::Y * 1.2 - from;
+        physics.cast_ray_past(from, way, way.length(), id).is_some()
+    });
+    let up_y = at.transform_vector3(Vec3::Y).normalize_or_zero().y;
+    // A helicopter's landed share is not modelled: it counts as landed
+    // (Invented; 0x822A2B60 ditches from one in the air).
+    let kind = seats::exit_kind(
+        seat,
+        exit.map(|e| &e.params),
+        velocity.length(),
+        false,
+        up_y,
+        blocked,
+    );
+    let place = match (kind, place) {
+        (ExitKind::Snap, _) | (_, None) => door_out(at, &v.spec),
+        (_, Some(p)) => p,
+    };
+    (kind, place)
+}
+
+/// Gets her out of `v` as [`exit_plan`] has it, to drop to the ground
+/// there; ditching or tossed, she keeps the push off (a toss's own push,
+/// 0x822A1B70's passed speed, is not traced: it gets the ditch's).
+pub(crate) fn get_out(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    seat: Option<u32>,
+    player: &mut Player,
+) {
+    if let Some((id, at)) =
+        v.id.and_then(|id| Some((id, physics.vehicle_transform(id)?)))
+            .filter(|(_, at)| at.is_finite())
     {
+        use m2_engine::seats::ExitKind;
+        let velocity = physics.vehicle_velocity(id);
+        let (kind, place) = exit_plan(physics, v, seat, at, velocity);
         // At the hull's height: onto the ground by the door, not onto a
         // boulder or roof over it.
-        player.drop_at(door_out(at, &v.spec));
+        player.drop_at(place);
+        if matches!(kind, ExitKind::Ditch | ExitKind::Toss) {
+            let out = place - at.transform_point3(Vec3::ZERO);
+            player.character.velocity =
+                m2_engine::seats::ditch_velocity(velocity, Vec3::new(out.x, 0.0, out.z));
+        }
         let f = at.transform_vector3(Vec3::Z);
         player.facing = f.x.atan2(f.z);
+        let local = at.inverse().transform_point3(place);
+        eprintln!(
+            "exit: {} {kind:?} at {:.1} m/s, out at local {:.2?}",
+            v.spec.label,
+            velocity.length(),
+            local.to_array()
+        );
     }
     player.driving = None;
     player.chase_target = None;
@@ -3910,6 +4471,7 @@ mod tests {
             radius,
             damage,
             least,
+            force: 500.0,
             kind: key(kind),
         };
         let db = Templates {
@@ -3939,8 +4501,10 @@ mod tests {
         // The rocket only on what it lands on.
         assert_eq!(blasts[2].at_distance(0.2), 100.0);
         assert_eq!(blasts[2].at_distance(1.0), 0.0);
-        // The frag still bites at 10 m.
-        assert!(blasts[1].at_distance(10.0) > 100.0);
+        // The frag still bites at 10 m: 300 x (1 - 10 / 15), and never
+        // under its 40 within reach.
+        assert!((blasts[1].at_distance(10.0) - 100.0).abs() < 1e-3);
+        assert_eq!(blasts[1].at_distance(14.9), 40.0);
         // With none in the data: one blast of combat's own, taken in full.
         let none = rocket_blasts(&Templates::default(), at);
         assert_eq!(none.len(), 1);

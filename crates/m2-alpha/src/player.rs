@@ -159,7 +159,10 @@ const LAND_REACH: f32 = 60.0;
 /// What the player asks for this tick.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Intent {
-    /// Camera-relative: x right, y forward; length at most 1.
+    /// Camera-relative: x right, y forward, each -1..=1 on its own: at
+    /// the wheel the steering and the pedals, which don't share a push
+    /// (the 360's car takes its throttle, brake and steering as separate
+    /// inputs); on foot she walks the way it points ([`Intent::walking`]).
     pub movement: Vec2,
     pub sprint: bool,
     pub walk: bool,
@@ -183,6 +186,12 @@ pub struct Intent {
 }
 
 impl Intent {
+    /// The way she walks: [`movement`](Self::movement) no longer than a
+    /// full push (a diagonal of the keys is no faster than straight).
+    pub fn walking(&self) -> Vec2 {
+        self.movement.clamp_length_max(1.0)
+    }
+
     pub fn from_input(input: &mut Input, config: &CameraConfig, mouse_look: bool) -> Self {
         let (dx, dy) = input.take_look(mouse_look);
         let invert = if config.invert_y { -1.0 } else { 1.0 };
@@ -195,8 +204,7 @@ impl Intent {
             movement: Vec2::new(
                 input.axis(Action::MoveLeft, Action::MoveRight),
                 input.axis(Action::MoveBack, Action::MoveForward),
-            )
-            .clamp_length_max(1.0),
+            ),
             sprint: input.held(Action::Sprint),
             walk: input.held(Action::Walk),
             jump: input.take_pressed(Action::MoveUp),
@@ -815,7 +823,8 @@ impl Player {
         let forward = Vec3::new(s, 0.0, c);
         // Right-handed, +y up: right is forward turned clockwise from above.
         let right = Vec3::new(-c, 0.0, s);
-        let direction = forward * intent.movement.y + right * intent.movement.x;
+        let walking = intent.walking();
+        let direction = forward * walking.y + right * walking.x;
 
         if self.update_swim(physics, direction, dt) {
             self.camera(physics);
@@ -889,13 +898,21 @@ impl Player {
                 };
                 eprintln!("jump: take-off at {:.2} m/s, {was}", moved);
                 self.leap = Leap::Air(0.0);
-                if let Some(clip) = takeoff.or(clips.jump) {
+                // The original's actions for the clip, for its blend: a
+                // take-off blends in, the air `Jump` snaps.
+                use m2_engine::blend::action;
+                let played = match takeoff {
+                    Some(c) if Some(c) == clips.takeoff => Some((c, action::JUMP_TAKEOFF_MOVING)),
+                    Some(c) => Some((c, action::JUMP_TAKEOFF_STATIONARY)),
+                    None => clips.jump.map(|c| (c, action::JUMP)),
+                };
+                if let Some((clip, act)) = played {
                     // At the height she stands at, so the take-off's
                     // crouch doesn't sink her.
                     let hips = rig
                         .gait_clip(Gait::Idle)
                         .map_or(1.0, |i| rig.clips[i].info.hips);
-                    rig.animator.play_leveled(clip, hips);
+                    rig.animator.play_leveled(clip, hips, act);
                 }
             } else {
                 self.leap = match self.leap {
@@ -907,7 +924,15 @@ impl Player {
                         };
                         match land {
                             Some(clip) => {
-                                rig.animator.play_once(clip);
+                                // Landings snap in, and the gait after
+                                // one settles in quickly (the original's
+                                // blend times).
+                                let act = if Some(clip) == clips.land {
+                                    m2_engine::blend::action::JUMP_LAND_MOVING
+                                } else {
+                                    m2_engine::blend::action::JUMP_LAND_STATIONARY
+                                };
+                                rig.animator.play_action(clip, true, act);
                                 Leap::Land(0.0, clip)
                             }
                             None => Leap::No,
@@ -1030,10 +1055,12 @@ impl Player {
             rig.aim_along(self.facing, self.aiming.then_some(look).or(rest));
             // Play the clip at the speed she actually moves, so feet don't
             // slide (within reason: against a wall the legs keep going).
-            let rate = match rig.gait_speed(gait) {
-                _ if leaping => 1.0,
-                Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
-                _ => 1.0,
+            // Her number for the clips' table rates is 0 (invented: the
+            // game's entity handle is not known).
+            let rate = if leaping {
+                1.0
+            } else {
+                rig.play_rate(gait, moved, 0)
             };
             rig.advance(dt * rate);
         }
@@ -1275,6 +1302,8 @@ mod tests {
             bounds: (Vec3::new(-1.8, 0.0, -3.3), Vec3::new(2.0, 4.2, 8.1)),
             seat: None,
             door: None,
+            seating: None,
+            entrances: Vec::new(),
             tracked: true,
             road_wheels: Vec::new(),
             rest: Vec::new(),

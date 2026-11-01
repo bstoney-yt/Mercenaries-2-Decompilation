@@ -1,0 +1,13 @@
+[package]
+name = "m2-runsum"
+description = "Summarizes an m2-alpha autoplay run from its stderr log (std only)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

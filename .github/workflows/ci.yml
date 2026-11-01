@@ -1,8 +1,9 @@
 name: CI
 
 # Runs on the test PC (a self-hosted Windows x64 runner labelled m2-pc),
-# not GitHub's machines: the private repo's free Actions minutes ran out.
-# The runner keeps its checkout and target directory between runs, so
+# not GitHub's machines. The repository is public, so code from a fork's
+# pull request never runs here: the jobs run only for pushes to main and
+# for pull requests whose branch is in this repository. The runner keeps its checkout and target directory between runs, so
 # builds are incremental and need no cache step.
 on:
   push:
@@ -21,13 +22,25 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# The job token can read the repository and nothing more.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# The runner's service account may not run PowerShell scripts (its
+# execution policy), and every step here is a plain command, so steps
+# run in cmd.
+defaults:
+  run:
+    shell: cmd
+
 jobs:
   host:
     name: Lint and test (host)
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Windows, X64, m2-pc]
     steps:
       - uses: actions/checkout@v4
