@@ -219,8 +219,8 @@ impl Hud {
         state.pause = self.menu && self.shop.is_none();
         state.pause_settings = self.pause_settings.clone();
         state.pause_captured = std::mem::take(&mut self.pause_captured);
-        // The pause menu takes the mouse.
-        if state.pause {
+        // The pause menu takes the mouse, as does the PDA.
+        if state.pause || info.support.pda {
             let at = input.events.iter().rev().find_map(|e| match e {
                 egui::Event::PointerMoved(p) => Some(*p),
                 _ => None,

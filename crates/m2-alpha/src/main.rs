@@ -2418,7 +2418,8 @@ fn screenshot(
             (w, h),
             seconds,
             (&options.pda_keys, &options.pda_clicks),
-            options.pause,
+            // Clicks are typed in turn, as in the pause menu.
+            options.pause || !options.pda_clicks.is_empty(),
             Duration::from_secs(120),
         );
         let mut state = gamehud::HudState::of(&mut game);
@@ -7882,9 +7883,12 @@ impl Running {
     /// Captures the mouse and hides its pointer in play, and lets it go
     /// in the front end and the pause menu, as the game does; the pointer
     /// was left showing over play until a click captured it (round 2 of
-    /// the owner's play tests). Each change is logged.
+    /// the owner's play tests). The PDA frees it too: the PC's PDA is
+    /// clicked. Each change is logged.
     fn keep_mouse(&mut self) {
-        let menus = self.hud.menu || self.flow.as_ref().is_some_and(flow::Flow::in_menus);
+        let menus = self.hud.menu
+            || self.game.support.pda
+            || self.flow.as_ref().is_some_and(flow::Flow::in_menus);
         let want = !menus && self.focused && !self.released;
         if want != self.mouse_look {
             self.set_mouse_look(want);
