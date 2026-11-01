@@ -381,6 +381,10 @@ pub struct Clip {
     /// A text field fits its box to its text (`autoSize`), from its left
     /// edge (0), centre (0.5) or right edge (1), each time its text is set.
     pub auto_size: Option<f32>,
+    /// A text field's `wordWrap` and `multiline` as its scripts set them,
+    /// over its definition's.
+    pub word_wrap: Option<bool>,
+    pub multiline: Option<bool>,
 }
 
 impl Clip {
@@ -413,22 +417,27 @@ impl Clip {
             substitutions: Vec::new(),
             text_box: None,
             auto_size: None,
+            word_wrap: None,
+            multiline: None,
         }
     }
 
-    /// A text field's definition, with its box as its scripts sized it.
+    /// A text field's definition, with its box, `wordWrap` and
+    /// `multiline` as its scripts set them.
     pub fn text_def(&self) -> Option<Cow<'_, EditText>> {
         let Kind::Text(def, _) = &self.kind else {
             return None;
         };
         let t = self.lib.texts.get(def)?;
-        Some(match self.text_box {
-            Some(bounds) => Cow::Owned(EditText {
-                bounds,
-                ..t.clone()
-            }),
-            None => Cow::Borrowed(t),
-        })
+        if self.text_box.is_none() && self.word_wrap.is_none() && self.multiline.is_none() {
+            return Some(Cow::Borrowed(t));
+        }
+        Some(Cow::Owned(EditText {
+            bounds: self.text_box.unwrap_or(t.bounds),
+            word_wrap: self.word_wrap.unwrap_or(t.word_wrap),
+            multiline: self.multiline.unwrap_or(t.multiline),
+            ..t.clone()
+        }))
     }
 
     /// Frames in its timeline (1 for one without).
@@ -458,6 +467,10 @@ pub struct Player {
     /// The fonts its text is drawn with, if the scripts may measure it
     /// (`textWidth`, `textHeight`); else those are estimated.
     pub fonts: Option<Rc<FontBook>>,
+    /// Where each removed (named) instance was: its level's root and the
+    /// names down to it. The scripts' references to one stand for what
+    /// is at that place since, as Flash's do ([`Player::now_at`]).
+    gone: HashMap<ClipId, (ClipId, Vec<String>)>,
 }
 
 /// Text as drawn from text as set ([`Player::translate`]).
@@ -484,9 +497,22 @@ impl Player {
             scripts: Vec::new(),
             translate: None,
             fonts: None,
+            gone: HashMap::new(),
         };
         p.goto(0, 0);
         p
+    }
+
+    /// The instance now where removed instance `id` was (by its names
+    /// from its level's root), if any; `id` itself while it is on stage.
+    pub fn now_at(&self, id: ClipId) -> Option<ClipId> {
+        if self.clip(id).is_some() {
+            return Some(id);
+        }
+        let (root, names) = self.gone.get(&id)?;
+        names
+            .iter()
+            .try_fold(*root, |at, name| self.child(at, name))
     }
 
     pub fn clip(&self, id: ClipId) -> Option<&Clip> {
@@ -646,15 +672,34 @@ impl Player {
 
     /// Takes `child` (at `depth`) off `parent`, and everything under it.
     pub fn remove(&mut self, parent: ClipId, depth: i32, child: ClipId) {
+        // Where it was, for references to it ([`Player::now_at`]).
+        let mut names = Vec::new();
+        let mut root = parent;
+        while let Some(c) = self.clip(root) {
+            let Some(p) = c.parent else { break };
+            names.push(c.name.clone());
+            root = p;
+        }
+        names.reverse();
         if let Some(p) = self.clip_mut(parent)
             && p.children.get(&depth) == Some(&child)
         {
             p.children.remove(&depth);
         }
-        let mut stack = vec![child];
-        while let Some(id) = stack.pop() {
+        // Paths through an unnamed instance name nothing.
+        let mut stack = vec![(child, Some(names))];
+        while let Some((id, path)) = stack.pop() {
             if let Some(c) = self.clips.get_mut(id).and_then(Option::take) {
-                stack.extend(c.children.values());
+                let path = path.filter(|_| !c.name.is_empty()).map(|mut p| {
+                    p.push(c.name);
+                    p
+                });
+                for &k in c.children.values() {
+                    stack.push((k, path.clone()));
+                }
+                if let Some(p) = path {
+                    self.gone.insert(id, (root, p));
+                }
             }
         }
     }
