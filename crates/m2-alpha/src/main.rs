@@ -7993,6 +7993,7 @@ impl Running {
             let mut state = gamehud::HudState::of(&mut self.game);
             state.buttons = buttons;
             state.dialog_keys = std::mem::take(&mut self.dialog_keys);
+            state.pad_keys = std::mem::take(&mut self.pad.pda_keys);
             state.medevac = self
                 .mission
                 .as_ref()
@@ -8002,6 +8003,7 @@ impl Running {
             state.stick = self.input.stick();
             info.game = Some(state);
         }
+        self.pad.pda_keys.clear();
         if self.pad.touch.used {
             info.touch = Some(self.pad.touch.picture());
         }
@@ -8164,6 +8166,10 @@ impl Running {
             );
         }
         self.pad.stick_menu = dialog;
+        // The PDA open (and no menu over it): its movies hear the pad as
+        // the 360's keys ([`pad::PDA_BUTTON_KEYS`]), handed on with the
+        // HUD's state.
+        self.pad.pda = self.game.support.pda && !self.hud.menu;
         let mut held = Input::default();
         let target = if dialog { &mut held } else { &mut self.input };
         let keys = self.pad.poll(target, driving, dt);

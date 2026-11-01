@@ -802,6 +802,12 @@ P2
    input handler, `MrxGuiPda._HandleInput` (script `97f9c4ee`). In map
    mode it passes `LeftAnalogX`/`Y` to the map movie. The movie handles
    the PDA's buttons. Footage shows the PDA navigated by pad.
+   360 code: the GUI layer's button handler (`Function_82384E48`) turns
+   pad buttons into the movies' key codes (LT `Q` and RT `[` step the
+   pages, Y Home shows the contract, A Enter, B Shift, X Backspace, the
+   sticks' pushes letters). **Pad part done (claude/pda-input):** the
+   alpha sends that table (`pad::PDA_BUTTON_KEYS`); before, only A and
+   the d-pad reached the PDA (5 of 20 inputs).
 2. **Ours:** The map follows the pad's stick (`ControllerInput`,
    `crates/m2-alpha/src/gamehud.rs:1632`; 66bc531). An offscreen harness
    types keys and clicks into the PDA's movie for screenshots
