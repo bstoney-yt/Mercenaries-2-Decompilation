@@ -337,6 +337,11 @@ impl Pad {
         keys
     }
 
+    /// The right stick as last read (x right, y up).
+    pub fn right_stick(&self) -> [f32; 2] {
+        self.last.right
+    }
+
     /// Feeds one reading `s` to `input`.
     pub fn feed(&mut self, input: &mut Input, s: PadState, driving: bool, dt: f64) {
         let layout = if driving { DRIVING } else { ON_FOOT };

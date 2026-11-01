@@ -299,6 +299,9 @@ struct Options {
     /// Clicks among them (`--pda-click x,y`, screen pixels): the key slot
     /// each takes, and where.
     pda_clicks: Vec<(usize, [f32; 2])>,
+    /// With `--pda`: the pad's right stick held this far up (`--pda-zoom y`,
+    /// -1 to 1) for the HUD's whole run: the map's zoom.
+    pda_zoom: f32,
     /// With `--mission --screenshot`: take the picture from this far from
     /// the nearest marker, looking at it.
     mission_look: Option<f32>,
@@ -809,6 +812,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--pickup" => o.pickup = true,
             "--closeup" => o.closeup = true,
             "--pda" => o.pda = true,
+            "--pda-zoom" => {
+                o.pda_zoom = value()?.parse().context("--pda-zoom expects a number")?;
+            }
             "--pause" => o.pause = true,
             "--binoculars" => {
                 o.binoculars = Some(
@@ -2405,6 +2411,7 @@ fn screenshot(
         state.pause_settings.profile = game.scene.hero.full_name().into();
         state.pause_settings.video = video;
         state.pause_settings.modes = modes.clone();
+        state.right_stick = [0.0, options.pda_zoom];
         info.game = Some(state);
         let seconds = options
             .hud_seconds
@@ -8005,6 +8012,7 @@ impl Running {
             state.gui_calls = gui_calls;
             state.pad = self.input.pad();
             state.stick = self.input.stick();
+            state.right_stick = self.pad.right_stick();
             info.game = Some(state);
         }
         self.pad.pda_keys.clear();

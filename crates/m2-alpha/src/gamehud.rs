@@ -554,6 +554,8 @@ pub struct HudState {
     /// The pad's (or the touch controls') left stick, x right and y up,
     /// for the PDA's map.
     pub stick: [f32; 2],
+    /// The pad's right stick, x right and y up: the PDA map's zoom.
+    pub right_stick: [f32; 2],
     /// Seconds since the last state.
     pub dt: f64,
     /// Health, 0..=100: hers, or the vehicle's she is in.
@@ -1664,9 +1666,11 @@ end
 /// movie's `leftAnalog`, which moves the map under its cursor). Inferred
 /// from the alpha's renders: the movie moves the map's picture by the pair
 /// as given, so the view's way across is the stick's reversed. Answers
-/// whether the PDA's map took it.
+/// whether the PDA's map took it. The right stick comes in the same
+/// event (`RightAnalogX`/`Y`, which `_HandleInput` passes to the movie's
+/// `rightAnalog`: the map's zoom), as given.
 const PDA_STICK: &str = r#"
-local x, y = ...
+local x, y, rx, ry = ...
 local module = rawget(_G, "MrxGuiPda")
 if type(module) ~= "table" or type(module._HandleInput) ~= "function" then
     return false
@@ -1702,7 +1706,9 @@ if widget.CustomData.bMapMode == nil then
 end
 -- The movie moves the map's picture by the pair (right, down): up the
 -- screen is north, and the view goes against x, so x is reversed.
-module._HandleInput(widget, { LeftAnalogX = -x, LeftAnalogY = y })
+module._HandleInput(widget, {
+    LeftAnalogX = -x, LeftAnalogY = y, RightAnalogX = rx, RightAnalogY = ry,
+})
 return true
 "#;
 
@@ -1982,7 +1988,7 @@ struct Thread {
     /// The PDA's movement keys held ([`PDA_STICK_KEYS`]), and the stick
     /// they last pushed its map with.
     pda_held: HashSet<i32>,
-    pda_stick: [f32; 2],
+    pda_stick: [f32; 4],
     /// HUD updates since the PDA's movie loaded (`None`: not yet), and
     /// since `TogglePDA` was last sent.
     pda_ready: Option<u32>,
@@ -2166,7 +2172,7 @@ impl Thread {
             pause_movie: None,
             options_told: None,
             pda_held: HashSet::new(),
-            pda_stick: [0.0; 2],
+            pda_stick: [0.0; 4],
             pda_ready: None,
             since_toggle: u32::MAX,
             pda_scripted: None,
@@ -2337,18 +2343,20 @@ impl Thread {
         }
         // The movement keys and the pad's stick together, sped up.
         let keys = pda_stick(&self.pda_held);
+        // The right stick zooms, as pushed.
         let stick = if self.pda_shown {
-            [0, 1].map(|i| (keys[i] + state.stick[i]).clamp(-1.0, 1.0) * PDA_PAN)
+            let [x, y] = [0, 1].map(|i| (keys[i] + state.stick[i]).clamp(-1.0, 1.0) * PDA_PAN);
+            [x, y, state.right_stick[0], state.right_stick[1]]
         } else {
-            [0.0; 2]
+            [0.0; 4]
         };
-        if stick != [0.0; 2] || self.pda_stick != [0.0; 2] {
+        if stick != [0.0; 4] || self.pda_stick != [0.0; 4] {
             let took = self
                 .mission
                 .lua()
                 .load(PDA_STICK)
                 .set_name("=m2-hud pda stick")
-                .call::<bool>((stick[0], stick[1]));
+                .call::<bool>((stick[0], stick[1], stick[2], stick[3]));
             if stick != self.pda_stick {
                 log.push(format!("pda: stick {stick:?} ({took:?})"));
             }
@@ -5981,6 +5989,30 @@ mod tests {
         // The top left corner goes to the top right.
         let [x, y] = p.corners[0];
         assert!((x - 2.0).abs() < 1e-5 && y.abs() < 1e-5, "{x} {y}");
+    }
+
+    /// The PDA's `ControllerInput` event carries both sticks: the left
+    /// (x reversed) moves the map, the right zooms it, as pushed.
+    #[test]
+    fn the_pdas_controller_event_carries_both_sticks() {
+        let lua = Lua::new();
+        lua.load(
+            r#"
+            got = nil
+            MrxGuiPda = { _HandleInput = function(w, e) got = e end }
+            PdaWidget = { CustomData = { oMapFlash = true } }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let took: bool = lua.load(PDA_STICK).call((0.5, 0.25, 0.0, -1.0)).unwrap();
+        assert!(took);
+        let got: mlua::Table = lua.globals().get("got").unwrap();
+        let read = |k: &str| got.get::<f32>(k).unwrap();
+        assert_eq!(read("LeftAnalogX"), -0.5);
+        assert_eq!(read("LeftAnalogY"), 0.25);
+        assert_eq!(read("RightAnalogX"), 0.0);
+        assert_eq!(read("RightAnalogY"), -1.0);
     }
 
     #[test]
