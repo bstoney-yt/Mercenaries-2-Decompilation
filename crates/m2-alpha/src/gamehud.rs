@@ -120,6 +120,9 @@ const RPG_STORED: u32 = 4;
 const RIFLE_ICON: &str = "weapons_m4";
 const RPG_ICON: &str = "weapons_rpg";
 const LAUNCHER_ICON: &str = "weapons_grenade_launcher_2";
+/// Her hand grenades' icon (`uNewCurrentExplosive`): the texture the HUD
+/// layout gives the explosive box (`Current Explosive`), from samples.
+const GRENADE_ICON: &str = "explosives_grenade_1";
 /// Their reticles (`uReticleTexture`), `reticle_*` by the kind of round
 /// (inferred from the textures' names: the guns' `WeaponUI` records, which
 /// name them, aren't read yet).
@@ -1892,6 +1895,8 @@ struct Told {
     /// The template of the gun in her rifle's place ([`HudState::gun`]).
     gun: Option<u32>,
     ammo: Option<[i64; 5]>,
+    /// Whether the explosive box has been told her explosive.
+    explosive: bool,
     /// She was in a vehicle ([`HudState::in_vehicle`]).
     in_vehicle: Option<bool>,
     /// The gun box's icon widgets as last logged ([`Thread::gun_box`]).
@@ -3674,6 +3679,15 @@ impl Thread {
             )?;
             fire(lua, "GuiWeaponEquippedUpdate", t)?;
         }
+        // Her explosive, as the engine's `GuiWeaponEquippedUpdate` carries it
+        // when the equipped explosive changes (360 0x8234F458: its
+        // `WeaponUI` icon as `uNewCurrentExplosive`). Until told, the
+        // explosive box has no weapon: it never times out and stays up for
+        // good, where the footage's sits hidden till the grenades change.
+        if !self.told.explosive {
+            self.told.explosive = true;
+            fire(lua, "GuiWeaponEquippedUpdate", explosive_equipped(lua)?)?;
+        }
         let ammo = ammo(
             s.weapon,
             s.fired,
@@ -4409,6 +4423,22 @@ fn ammo(
 
 fn fire(lua: &Lua, event: &str, args: impl IntoLuaMulti) -> mlua::Result<()> {
     gui_runtime::fire(lua, event, args).map(|_| ())
+}
+
+/// The explosive half of `GuiWeaponEquippedUpdate` (360 0x8234F458, its
+/// flag 0x20): the explosive's icon alone, so the gun box and the reticle,
+/// which find no `uNewCurrentGun`, are left as they were.
+/// `MrxGuiHudAmmoCountersNew.HandleExplosiveSwitchEvent` gives the box a
+/// weapon for a string here; from then its counter shows 3 s after each
+/// change and fades over 1 s (`_SetUpFadeBehavior`, `_ShowForDuration`).
+fn explosive_equipped(lua: &Lua) -> mlua::Result<Value> {
+    table(
+        lua,
+        [(
+            "uNewCurrentExplosive",
+            Value::String(lua.create_string(GRENADE_ICON)?),
+        )],
+    )
 }
 
 fn table<const N: usize>(lua: &Lua, fields: [(&str, Value); N]) -> mlua::Result<Value> {
@@ -5585,6 +5615,26 @@ mod tests {
     /// where its art points.
     fn arc(heading: f32, from: Vec3) -> f32 {
         (direction(Some(Vec3::ZERO), Some(from)) + heading).rem_euclid(360.0)
+    }
+
+    #[test]
+    fn the_explosive_box_is_given_her_grenades_alone() {
+        let lua = Lua::new();
+        let t = explosive_equipped(&lua).unwrap();
+        lua.globals().set("e", t).unwrap();
+        // What the box's switch handler takes for a weapon (a string or
+        // userdata), and nothing the gun box or reticle would act on.
+        let (explosive, gun): (bool, bool) = lua
+            .load(
+                "return type(e.uNewCurrentExplosive) == 'string', \
+                 e.uNewCurrentGun ~= nil or e.sReticleType ~= nil",
+            )
+            .eval()
+            .unwrap();
+        assert!(explosive);
+        assert!(!gun);
+        let icon: String = lua.load("return e.uNewCurrentExplosive").eval().unwrap();
+        assert_eq!(icon, "explosives_grenade_1");
     }
 
     #[test]
