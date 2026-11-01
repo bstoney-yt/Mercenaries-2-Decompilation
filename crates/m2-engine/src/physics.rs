@@ -967,6 +967,9 @@ const GROUND_DAMPING: f32 = 0.02;
 /// when its template gives no `_TankPhysics` ([`drive_tracks`] drives one
 /// that does). Invented.
 const TRACK_PULL: f32 = 4.0;
+/// The wheel Rapier casts each of a 360-driven tank's track points with,
+/// metres: the 360 code casts a bare ray (0x821A5898).
+const TRACK_RAY_RADIUS: f32 = 0.02;
 /// Boats ([`Physics::set_water`]): how deep a boat's origin floats,
 /// metres (the layers put the start's boat 0.35 m under the -36 m sea,
 /// patrol boats at it); how its rocking dies down, per second; how fast
@@ -1277,13 +1280,15 @@ fn ease_towards(mut from: f32, to: f32, keep: f32, mut dt: f32) -> f32 {
 /// A tracked vehicle as the 360 code drives it: its template's tuning,
 /// its throttle and steering as they ease (0x330, 0x35C of the 360's
 /// tank) and each track point's grip along and across now (0x84, 0x88
-/// of its wheel).
+/// of its wheel), and how long each point's spring was last step,
+/// metres (its ray's fraction, 0x30, times its length).
 #[derive(Clone, Debug)]
 struct Tracks {
     tuning: TankTuning,
     throttle: f32,
     steer: f32,
     grip: Vec<(f32, f32)>,
+    lengths: Vec<f32>,
 }
 
 impl Tracks {
@@ -1293,8 +1298,19 @@ impl Tracks {
             throttle: 0.0,
             steer: 0.0,
             grip: vec![tuning.friction; points],
+            lengths: vec![tuning.spring_length(); points],
         }
     }
+}
+
+/// Where one track point meets the ground (world): the hit, the ground's
+/// normal there, and where its ray starts (its hardpoint, its spring's
+/// squeeze up its hull).
+#[derive(Clone, Copy, Debug)]
+struct TrackContact {
+    at: Vec3,
+    normal: Vec3,
+    start: Vec3,
 }
 
 /// What [`drive_tracks`] reads of a tracked vehicle each step besides its
@@ -1307,14 +1323,14 @@ struct TrackFooting<'a> {
     turn: Quat,
     centre: Vec3,
     mass: f32,
-    points: &'a [Option<(Vec3, Vec3)>],
+    points: &'a [Option<TrackContact>],
     throttle: f32,
     steer: f32,
     held: bool,
 }
 
 /// One step of `dt` s of a tracked vehicle as the 360 code drives it (its
-/// step, 0x821A49E8, without its springs), in its order. `motion` reads
+/// step, 0x821A49E8), in its order. `motion` reads
 /// its spin and velocity afresh (world); `push` gives it an impulse,
 /// linear at a point (world) or angular when the point is `None`.
 ///
@@ -1322,7 +1338,8 @@ struct TrackFooting<'a> {
 ///   pitch and roll passes 25 to 40 degrees (with the throttle), none
 ///   past 45 to 60; a level vehicle's tracks push it only across the
 ///   ground (their up share is dropped).
-/// - Its tracks (0x821A5D30): each touching point's grip eases (keeping
+/// - Its tracks (0x821A5D30): each touching point's spring pushes it up
+///   (see the loop), and its grip eases (keeping
 ///   95% along, 80% across, each sixtieth of a second) towards its
 ///   rolling grip less the throttle's share, or its brake with the
 ///   throttle against its motion, and across towards its side grip,
@@ -1364,12 +1381,26 @@ fn drive_tracks(
     let braking = f.held || ahead.dot(v) * thr > 0.1;
     let scale = tun.high_speed_grip * s + (1.0 - s);
     let across = side.with_y(0.0);
-    let mut pushes = Vec::with_capacity(f.points.len());
-    for (grip, point) in t.grip.iter_mut().zip(f.points) {
-        let Some((at, _)) = *point else {
+    let mut pushes = Vec::with_capacity(f.points.len() * 2);
+    let (k, c, full) = (tun.springs.0, tun.springs.1, tun.spring_length());
+    for ((grip, last), point) in t.grip.iter_mut().zip(&mut t.lengths).zip(f.points) {
+        let Some(TrackContact { at, start, .. }) = *point else {
             *grip = (0.0, 0.0);
+            *last = full;
             continue;
         };
+        // Its spring: squeezed x, it pushes mass x (strength x x, less
+        // damp x how fast it stretches) x x up its hull (straight up
+        // while it is level), at its ray's start.
+        let length = (start - at).length().min(full);
+        let x = full - length;
+        let stretching = ((length - *last) / dt).max(0.0) * c;
+        let force = (mass * (k * x - stretching)).max(0.0);
+        let mut spring = up * (force * x * dt);
+        spring.x *= 1.0 - level;
+        spring.z *= 1.0 - level;
+        pushes.push((spring, start));
+        *last = length;
         let along = if braking {
             tun.brake
         } else {
@@ -1391,7 +1422,7 @@ fn drive_tracks(
     let (_, v) = motion();
     let s = (v.length() / top).min(1.0);
     t.throttle = ease_towards(t.throttle, thr, tun.engine_inertia, dt).clamp(-1.0, 1.0);
-    let normals: Vec<Vec3> = f.points.iter().flatten().map(|&(_, n)| n).collect();
+    let normals: Vec<Vec3> = f.points.iter().flatten().map(|p| p.normal).collect();
     if !normals.is_empty() {
         let n = normals.iter().sum::<Vec3>() / normals.len() as f32;
         let dir = side.cross(n);
@@ -2456,6 +2487,33 @@ impl Physics {
         let preload = preloads(spec, |_| SPRING, centre.z);
         let mut tops = Vec::with_capacity(spec.wheels.len());
         for (w, &preload) in spec.wheels.iter().zip(&preload) {
+            // A tank driven as the 360 code drives it springs itself
+            // ([`drive_tracks`]): Rapier only casts each point's ray, from
+            // its squeeze up from the bottom of its track (its hardpoint)
+            // down its whole length, with a wheel too thin to matter.
+            if let Some(t) = &tank {
+                let (_, _, _, squeeze) = t.tuning.springs;
+                let floor = w.centre - Vec3::Y * w.radius;
+                tops.push(squeeze - w.radius);
+                let none = WheelTuning {
+                    suspension_stiffness: 0.0,
+                    suspension_compression: 0.0,
+                    suspension_damping: 0.0,
+                    max_suspension_travel: t.tuning.spring_length(),
+                    side_friction_stiffness: 0.0,
+                    friction_slip: 0.0,
+                    max_suspension_force: 0.0,
+                };
+                controller.add_wheel(
+                    vector(floor + Vec3::Y * squeeze),
+                    -r::Vector::Y,
+                    -r::Vector::X,
+                    t.tuning.spring_length() - TRACK_RAY_RADIUS,
+                    TRACK_RAY_RADIUS,
+                    &none,
+                );
+                continue;
+            }
             let (stiffness, (squeezed, stretched), rest, top, travel) = match springs {
                 Some(s) => {
                     let (k, c, length, top) = s.axle(w.steers);
@@ -2831,8 +2889,10 @@ impl Physics {
             && let Some(body) = self.world.bodies.get_mut(chassis)
         {
             // Their grip holds its weight on the hill (along the ground,
-            // the way its hull lies).
-            if gripping {
+            // the way its hull lies; invented). One driven as the 360 code
+            // drives it stands on its springs instead, which push straight
+            // up while it is near level.
+            if gripping && v.tank.is_none() {
                 let up = body.position().rotation * r::Vector::Y;
                 let down = r::Vector::new(0.0, -GRAVITY, 0.0);
                 let along = down - up * down.dot(up);
@@ -2841,14 +2901,17 @@ impl Physics {
                 body.apply_impulse(-along * held * mass * dt, true);
             }
             if let Some(tank) = &mut v.tank {
-                let points: Vec<Option<(Vec3, Vec3)>> = v
+                let points: Vec<Option<TrackContact>> = v
                     .controller
                     .wheels()
                     .iter()
                     .map(|w| {
                         let r = w.raycast_info();
-                        r.is_in_contact
-                            .then(|| (vec3(r.contact_point_ws), vec3(r.contact_normal_ws)))
+                        r.is_in_contact.then(|| TrackContact {
+                            at: vec3(r.contact_point_ws),
+                            normal: vec3(r.contact_normal_ws),
+                            start: vec3(r.hard_point_ws),
+                        })
                     })
                     .collect();
                 // The alpha's throttle is positive ahead and its steering
