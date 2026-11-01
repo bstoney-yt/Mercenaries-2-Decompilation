@@ -993,7 +993,7 @@ fn keep_crash_reports() {
         default(info);
         let path = Config::file_beside("m2-alpha-crash.log");
         let report = format!(
-            "m2-alpha {} crashed: {info}\n\n{}\n",
+            "Mercenaries 2 beta {} crashed: {info}\n\n{}\n",
             env!("CARGO_PKG_VERSION"),
             std::backtrace::Backtrace::force_capture()
         );
@@ -1199,8 +1199,8 @@ fn run(
 /// ends: so this one stays, windowless, until it is done.
 fn wait_for_successor(mut child: std::process::Child) {
     match child.wait() {
-        Ok(status) => eprintln!("quit: the alpha started again ended ({status})"),
-        Err(e) => eprintln!("quit: could not wait for the alpha started again: {e}"),
+        Ok(status) => eprintln!("quit: the beta started again ended ({status})"),
+        Err(e) => eprintln!("quit: could not wait for the beta started again: {e}"),
     }
 }
 
@@ -2465,7 +2465,7 @@ fn screenshot(
             }
             if news.quit {
                 eprintln!(
-                    "pause: Quit: the alpha would start again with {:?}",
+                    "pause: Quit: the beta would start again with {:?}",
                     args_front_end(std::env::args().skip(1))
                 );
             }
@@ -3610,7 +3610,7 @@ fn front_end_offscreen(
             );
         }
         for unused in &news.unused {
-            eprintln!("front end: {unused} kept in the menu; the alpha has nothing for it");
+            eprintln!("front end: {unused} kept in the menu; the beta has nothing for it");
         }
         if let Some(s) = &news.settings {
             config.keep_menu_settings(s);
@@ -7712,7 +7712,7 @@ impl App {
         let (full, how) =
             display::fullscreen_for(monitor.clone(), w.mode, (w.width, w.height), w.refresh);
         let attributes = Window::default_attributes()
-            .with_title("Mercenaries 2 (alpha)")
+            .with_title("Mercenaries 2 (beta)")
             .with_inner_size(display::fit((w.width, w.height), monitor.as_ref()))
             .with_fullscreen(full);
         let window = Arc::new(event_loop.create_window(attributes)?);
@@ -7772,7 +7772,7 @@ impl App {
         );
         let mut running = Running {
             title: format!(
-                "Mercenaries 2 (alpha) - {} on {}",
+                "Mercenaries 2 (beta) - {} on {}",
                 adapter.name, adapter.backend
             ),
             window,
@@ -8367,7 +8367,7 @@ impl Running {
             }
         }
         for unused in &news.unused {
-            eprintln!("pause: {unused} kept in the menu; the alpha has nothing for it");
+            eprintln!("pause: {unused} kept in the menu; the beta has nothing for it");
         }
         if let Some(c) = news.capture {
             self.capturing = c;
@@ -8401,7 +8401,7 @@ impl Running {
                 eprintln!("pause: Quit: back to the front end");
                 self.to_front_end = true;
             } else {
-                eprintln!("pause: Quit: the alpha closes (it has no front end up)");
+                eprintln!("pause: Quit: the beta closes (it has no front end up)");
                 event_loop.exit();
             }
         } else if news.resume && self.hud.menu {
@@ -8444,7 +8444,7 @@ impl Running {
             self.set_volumes(v);
         }
         for unused in &news.unused {
-            eprintln!("front end: {unused} kept in the menu; the alpha has nothing for it");
+            eprintln!("front end: {unused} kept in the menu; the beta has nothing for it");
         }
         if let Some(c) = news.capture {
             self.capturing = c;

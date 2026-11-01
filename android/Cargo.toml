@@ -6,7 +6,7 @@
 
 [package]
 name = "m2-alpha-android"
-description = "Mercenaries 2 alpha for Android."
+description = "Mercenaries 2 beta for Android."
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -55,7 +55,7 @@ winit = { path = "target/winit" }
 
 [package.metadata.android]
 package = "com.bstoney.m2alpha"
-apk_name = "Mercenaries2Alpha"
+apk_name = "Mercenaries2Beta"
 build_targets = ["aarch64-linux-android"]
 strip = "strip"
 # The launcher icon: build-apk.ps1 copies res/ (a placeholder drawn for the
@@ -70,7 +70,7 @@ min_sdk_version = 26
 target_sdk_version = 34
 
 [package.metadata.android.application]
-label = "Mercenaries 2 Alpha"
+label = "Mercenaries 2 Beta"
 icon = "@mipmap/ic_launcher"
 
 [package.metadata.android.application.activity]
@@ -78,7 +78,7 @@ orientation = "landscape"
 config_changes = "orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|smallestScreenSize"
 resizeable_activity = true
 
-# Reading the game from the Mercenaries2Alpha folder the player drags onto
+# Reading the game from the Mercenaries2Beta folder the player drags onto
 # the phone ("all files access" on Android 11 and later).
 [[package.metadata.android.uses_permission]]
 name = "android.permission.MANAGE_EXTERNAL_STORAGE"

@@ -1853,7 +1853,7 @@ impl GameAudio {
                     if (a + b) % 20 == 1 {
                         eprintln!(
                             "sound: {} launches: {a} with their weapon's own cue, {b} with \
-                             the alpha's standing in",
+                             the beta's standing in",
                             a + b
                         );
                     }
