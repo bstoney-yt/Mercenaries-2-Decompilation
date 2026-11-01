@@ -352,6 +352,26 @@ pub const GUN: u32 = 0xcc0e_3f83;
 /// guns fire hundreds.
 const CANNON_RATE: f32 = 120.0;
 
+/// The six points a tracked vehicle's tracks touch the ground at, model
+/// space, as the 360 code drives it on them (`hp_wheel_fl`, `_fr`, `_rl`,
+/// `_rr`, `_ml`, `_mr`, in that order, 0x82900338): `None` unless its
+/// model has all six.
+pub fn track_hardpoints(model: &Model<'_>) -> Option<[Vec3; 6]> {
+    const NAMES: [&str; 6] = [
+        "hp_wheel_fl",
+        "hp_wheel_fr",
+        "hp_wheel_rl",
+        "hp_wheel_rr",
+        "hp_wheel_ml",
+        "hp_wheel_mr",
+    ];
+    let mut out = [Vec3::ZERO; 6];
+    for (o, n) in out.iter_mut().zip(NAMES) {
+        *o = Vec3::from(vehicle::marker(model, m2_assets::name_hash(n))?);
+    }
+    Some(out)
+}
+
 /// The four wheels a tracked vehicle drives on: under the corners of its
 /// road wheels, where the tracks meet the ground, else under its hull's.
 fn stand_ins(road: &[(Vec3, f32)], hull: (Vec3, Vec3)) -> Vec<WheelSpec> {
@@ -604,7 +624,22 @@ impl VehicleSpec {
         }))
         .filter(|(lo, hi)| (*hi - *lo).min_element() > 0.2);
         if tracked {
-            wheels = stand_ins(&road_wheels, hull);
+            // On its six track hardpoints, as the 360 code drives it
+            // (0x821A4A60), where its model has them (every tracked
+            // template's does; tanktest), else on stand-ins.
+            wheels = match track_hardpoints(model) {
+                Some(h) => h
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &p)| WheelSpec {
+                        centre: p + Vec3::Y * 0.45,
+                        radius: 0.45,
+                        width: 0.5,
+                        steers: i < 2,
+                    })
+                    .collect(),
+                None => stand_ins(&road_wheels, hull),
+            };
         }
         let muzzle = muzzle.map(|(_, at)| at).or_else(|| {
             let b = boxes

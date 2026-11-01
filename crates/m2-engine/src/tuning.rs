@@ -54,11 +54,8 @@ pub struct VehicleTuning {
     pub springs: Option<Springs>,
     /// How a wheeled vehicle's tyres slow it along (`_CarPhysicsV2`).
     pub tyres: Option<Tyres>,
-    /// A tracked vehicle's pull at a standstill, a third, two thirds and
-    /// all of its top speed, of its most (`_TankPhysics`'s
-    /// `EngineTorqueRatio0`..`3`, names found by hash: the AMX-30's 1,
-    /// 0.45, 0.3, 0.1; read as a curve over its speed, inferred).
-    pub tracks: Option<[f32; 4]>,
+    /// A tracked vehicle's drive, tracks and steering (`_TankPhysics`).
+    pub tank: Option<TankTuning>,
     /// A helicopter's handling (`_HelicopterPhysics`).
     pub flight: Option<FlightTuning>,
     /// A boat's engine and the water's drag on it (`_BoatPhysics`).
@@ -71,6 +68,57 @@ pub struct VehicleTuning {
     /// `ee30a43d`, name unknown: 20 for the light helicopters, 39 for the
     /// Mi-26; and `DefaultPitch`).
     pub chase: Option<(f32, f32)>,
+}
+
+/// How a tracked vehicle drives, from its `_TankPhysics` (names from the
+/// 360 code's record, 0x823EBBE8, in its order; the AMX-30's values in
+/// brackets), as the 360 code runs it (step 0x821A49E8; see
+/// `physics::drive_tracks`). Fields the record leaves out take the 360
+/// record's defaults. Its springs (`SpringStrength`, `SpringDamp`,
+/// `SpringExpLength`, `SpringCmpLength`) are read but not yet used.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TankTuning {
+    /// Top speed, m/s (`MaxSpeed` 45 km/h): the drive stops pushing at it.
+    pub max_speed: f32,
+    /// Each track point's grip along it braking, per second (`Brake` 4).
+    pub brake: f32,
+    /// What its steering turns it with (`SteerSpeed` 12).
+    pub steer_speed: f32,
+    /// How much of its steering's gap it keeps each sixtieth of a second,
+    /// steering and letting go (`SteerInertia` 0.95,
+    /// `SteerInertiaNoInput` 0.65).
+    pub steer_inertia: (f32, f32),
+    /// Each track point's grip along it rolling, and across it, per second
+    /// (`FwdFriction` 0.1, `SideFriction` 0.9).
+    pub friction: (f32, f32),
+    /// Where its drive pushes it, metres up the ground's normal from its
+    /// centre of mass (`EngineOffsetY` -0.3).
+    pub engine_height: f32,
+    /// Its weight off the ground, of its plain weight (`GravityFactor` 2).
+    pub gravity_factor: f32,
+    /// Of its steering, what its top speed takes off (`HiSpeedSteerLoss`
+    /// 0.1).
+    pub steer_loss: f32,
+    /// Its tracks' grip at its top speed, of their grip (`HiSpeedGrip` 1).
+    pub high_speed_grip: f32,
+    /// Damping against its spin about its own sideways, up and ahead
+    /// axes, per second (`AngDampX`, `Y`, `Z`: 9, 0, 9).
+    pub ang_damp: [f32; 3],
+    /// Its centre of mass from its body's, metres (`CenterOfMassOffset`).
+    pub centre_of_mass: [f32; 3],
+    /// Its drive's push at its best, of 200 newtons (`EngineTorque` 2000).
+    pub torque: f32,
+    /// How much of its throttle's gap it keeps each sixtieth of a second
+    /// (`EngineInertia` 0.85).
+    pub engine_inertia: f32,
+    /// Its push over its speed: (of its top speed, of `torque`) at 0,
+    /// `EngineTorquePos1`, `EngineTorquePos2` and 1, in a line between
+    /// (`EngineTorqueRatio0`..`3` 1, 0.45, 0.3, 0.1 at 0, 0.4, 0.6, 1).
+    pub curve: [(f32, f32); 4],
+    /// Its springs: strength and damp per kilogram, how far they stretch
+    /// and squeeze, metres (`SpringStrength` 20, `SpringDamp` 2.5,
+    /// `SpringExpLength` 0.35, `SpringCmpLength` 0.7).
+    pub springs: (f32, f32, f32, f32),
 }
 
 /// How a helicopter flies, from its `_HelicopterPhysics` (names found by
@@ -1056,6 +1104,16 @@ impl<'a> Table<'a> {
             .filter(|f| f.is_finite())
     }
 
+    /// Field `field` in `record` as three floats in a row (a vector).
+    pub(crate) fn vector(&self, record: &[u8], field: u32) -> Option<[f32; 3]> {
+        let &(at, _, _) = self.fields.get(&field)?;
+        let b = record.get(at..at + 12)?;
+        let v: [f32; 3] = std::array::from_fn(|i| {
+            f32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
+        });
+        v.iter().all(|f| f.is_finite()).then_some(v)
+    }
+
     /// Field `field` of template `id`'s first record as a number, stored
     /// as a float or a whole number.
     fn number(&self, id: u32, field: u32) -> Option<f32> {
@@ -1447,19 +1505,38 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         },
                     })
                 })(),
-                tracks: (|| {
+                tank: (|| {
                     let r = *tank.of_template(id).first()?;
-                    let f = |name| tank.float(r, name_hash(name));
-                    let curve = [
-                        f("EngineTorqueRatio0")?,
-                        f("EngineTorqueRatio1")?,
-                        f("EngineTorqueRatio2")?,
-                        f("EngineTorqueRatio3")?,
-                    ];
-                    curve
-                        .iter()
-                        .all(|c| (0.0..=1.0).contains(c))
-                        .then_some(curve)
+                    let f = |name, default| tank.float(r, name_hash(name)).unwrap_or(default);
+                    Some(TankTuning {
+                        max_speed: f("MaxSpeed", 40.0) / 3.6,
+                        brake: f("Brake", 20.0),
+                        steer_speed: f("SteerSpeed", 15.0),
+                        steer_inertia: (f("SteerInertia", 0.0), f("SteerInertiaNoInput", 0.0)),
+                        friction: (f("FwdFriction", 1.0), f("SideFriction", 30.0)),
+                        engine_height: f("EngineOffsetY", -0.25),
+                        gravity_factor: f("GravityFactor", 2.0),
+                        steer_loss: f("HiSpeedSteerLoss", 0.0),
+                        high_speed_grip: f("HiSpeedGrip", 1.0),
+                        ang_damp: [f("AngDampX", 0.5), f("AngDampY", 1.0), f("AngDampZ", 5.0)],
+                        centre_of_mass: tank
+                            .vector(r, name_hash("CenterOfMassOffset"))
+                            .unwrap_or([0.0; 3]),
+                        torque: f("EngineTorque", 1000.0),
+                        engine_inertia: f("EngineInertia", 0.95),
+                        curve: [
+                            (0.0, f("EngineTorqueRatio0", 1.0)),
+                            (f("EngineTorquePos1", 0.25), f("EngineTorqueRatio1", 0.55)),
+                            (f("EngineTorquePos2", 0.5), f("EngineTorqueRatio2", 0.55)),
+                            (1.0, f("EngineTorqueRatio3", 0.1)),
+                        ],
+                        springs: (
+                            f("SpringStrength", 9.0),
+                            f("SpringDamp", 0.4),
+                            f("SpringExpLength", 0.17),
+                            f("SpringCmpLength", 0.3),
+                        ),
+                    })
                 })(),
                 flight: (|| {
                     let f = |name| heli.get(id, name);
