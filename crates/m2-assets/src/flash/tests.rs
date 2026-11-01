@@ -1282,3 +1282,44 @@ fn the_mouse_rolls_over_presses_and_releases_buttons() {
     rt.player.clip_mut(btn).unwrap().visible = false;
     assert_eq!(rt.button_at([15.0, 15.0]), None);
 }
+
+/// A `DefineMorphShape` from a 10 px red square to a 20 px blue one.
+fn morph_square() -> MorphShape {
+    let mut w = Writer::default();
+    w.u16(9);
+    w.rect(0, 200, 0, 200);
+    w.rect(0, 400, 0, 400);
+    // The end edges' offset (unused).
+    w.u16(0);
+    w.u16(0);
+    w.u8(1);
+    w.u8(0x00);
+    for v in [255, 0, 0, 255, 0, 0, 255, 255] {
+        w.u8(v);
+    }
+    w.u8(0);
+    w.align();
+    w.ub(4, 2);
+    w.ub(4, 0);
+    square(&mut w, 0, 0, 200, None, Some(1));
+    w.end();
+    w.ub(4, 0);
+    w.ub(4, 0);
+    square(&mut w, 0, 0, 400, None, None);
+    w.end();
+    let (id, m) = MorphShape::parse(&w.bytes, false);
+    assert_eq!(id, 9);
+    m
+}
+
+#[test]
+fn a_morph_shape_is_drawn_between_its_ends() {
+    let m = morph_square();
+    assert_eq!(m.start.edges.len(), 4);
+    assert_eq!(m.end.edges.len(), 4);
+    assert!((area(&m.at(0.0).mesh()) - 100.0).abs() < 1e-3);
+    assert!((area(&m.at(1.0).mesh()) - 400.0).abs() < 1e-3);
+    let half = m.at(0.5);
+    assert!((area(&half.mesh()) - 225.0).abs() < 1e-3);
+    assert_eq!(half.fills[1], Fill::Solid([0.5, 0.0, 0.5, 1.0]));
+}

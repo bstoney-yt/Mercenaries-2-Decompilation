@@ -17,13 +17,14 @@
 //! [`Player::draw`] lays out what is on stage as triangles.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use super::text::{EditText, Font, FontBook, layout};
 use super::{
-    Bits, ColourTransform, Corners, Image, Matrix, Shape, ShapeTriangle, Triangle, bounds,
-    draw_shape, tags,
+    Bits, ColourTransform, Corners, Image, Matrix, MorphShape, Shape, ShapeTriangle, Triangle,
+    bounds, draw_shape, tags,
 };
 use crate::gfx::{Character, Movie, tag};
 
@@ -49,6 +50,8 @@ pub struct Place {
     /// 4 screen, 5 lighten, 6 darken, 7 difference, 8 add, 9 subtract,
     /// 10 invert, 11 alpha, 12 erase, 13 overlay, 14 hard light.
     pub blend: Option<u8>,
+    /// A morph shape's point between its start (0) and end (65535).
+    pub ratio: Option<u16>,
     /// Changes the character at the depth (with `character`, replaces it).
     pub moving: bool,
 }
@@ -138,9 +141,7 @@ fn place23(data: &[u8], three: bool) -> Place {
     let character = (flags & 2 != 0).then(|| b.u16());
     let matrix = (flags & 4 != 0).then(|| b.matrix());
     let colour = (flags & 8 != 0).then(|| b.cxform(true));
-    if flags & 16 != 0 {
-        b.u16();
-    }
+    let ratio = (flags & 16 != 0).then(|| b.u16());
     let name = (flags & 32 != 0).then(|| b.cstr());
     let clip_depth = (flags & 64 != 0).then(|| b.u16());
     if flags3 & 1 != 0 {
@@ -155,6 +156,7 @@ fn place23(data: &[u8], three: bool) -> Place {
         name,
         clip_depth,
         blend,
+        ratio,
         moving: flags & 1 != 0,
     }
 }
@@ -184,12 +186,19 @@ fn skip_filters(b: &mut Bits) {
     }
 }
 
+/// A morph shape drawn at one ratio: the shape and its mesh.
+pub type MorphMesh = Rc<(Shape, Vec<ShapeTriangle>)>;
+
 /// What a movie defines.
 #[derive(Clone, Debug, Default)]
 pub struct Library {
     pub size: [f32; 2],
     pub frame_rate: f32,
     pub shapes: HashMap<u16, (Shape, Vec<ShapeTriangle>)>,
+    /// Morph shapes, and the shapes (with meshes) drawn of them at the
+    /// ratios placed so far.
+    pub morphs: HashMap<u16, MorphShape>,
+    pub morphed: RefCell<HashMap<(u16, u16), MorphMesh>>,
     pub sprites: HashMap<u16, Rc<Timeline>>,
     pub images: HashMap<u16, Image>,
     /// Images it defines that aren't drawn: bitmaps embedded in the movie,
@@ -282,6 +291,18 @@ impl Library {
         lib
     }
 
+    /// Morph shape `id` at `ratio` (0 to 65535), meshed once per ratio.
+    pub fn morph(&self, id: u16, ratio: u16) -> Option<MorphMesh> {
+        let morph = self.morphs.get(&id)?;
+        let mut cache = self.morphed.borrow_mut();
+        let made = cache.entry((id, ratio)).or_insert_with(|| {
+            let shape = morph.at(f32::from(ratio) / 65535.0);
+            let mesh = shape.mesh();
+            Rc::new((shape, mesh))
+        });
+        Some(Rc::clone(made))
+    }
+
     /// The characters defined in `tags`.
     fn add(&mut self, tags: &[(u16, &[u8])]) {
         for &(code, data) in tags {
@@ -309,6 +330,11 @@ impl Library {
                     if let Some((id, f)) = Font::parse(data) {
                         self.fonts.insert(id, f);
                     }
+                    continue;
+                }
+                tag::DEFINE_MORPH_SHAPE | tag::DEFINE_MORPH_SHAPE2 => {
+                    let (id, morph) = MorphShape::parse(data, code == tag::DEFINE_MORPH_SHAPE2);
+                    self.morphs.insert(id, morph);
                     continue;
                 }
                 tag::DO_INIT_ACTION => {
@@ -339,9 +365,11 @@ pub enum Kind {
     /// A sprite or the movie: a timeline (or none, for one a script made).
     Sprite,
     Shape(u16),
+    /// A morph shape, drawn at the clip's ratio.
+    Morph(u16),
     /// A text field: its definition, and the text it shows.
     Text(u16, String),
-    /// A character not drawn (a morph shape, a button...).
+    /// A character not drawn (a button...).
     Other,
 }
 
@@ -378,6 +406,8 @@ pub struct Clip {
     /// A text field's box as its scripts sized it (`_width`, `_height`,
     /// `autoSize`), in place of its definition's.
     pub text_box: Option<[f32; 4]>,
+    /// A morph shape's ratio (0 to 65535), as last placed.
+    pub ratio: u16,
     /// A text field fits its box to its text (`autoSize`), from its left
     /// edge (0), centre (0.5) or right edge (1), each time its text is set.
     pub auto_size: Option<f32>,
@@ -412,6 +442,7 @@ impl Clip {
             drawing: Vec::new(),
             substitutions: Vec::new(),
             text_box: None,
+            ratio: 0,
             auto_size: None,
         }
     }
@@ -692,6 +723,7 @@ impl Player {
                         .map(|d| i32::from(d) + TIMELINE_DEPTH)
                         .or(keep.as_ref().and_then(|o| o.clip_depth));
                     c.blend = p.blend.or(keep.as_ref().map(|o| o.blend)).unwrap_or(0);
+                    c.ratio = p.ratio.or(keep.as_ref().map(|o| o.ratio)).unwrap_or(0);
                     c.name = p.name.clone().or(keep.map(|o| o.name)).unwrap_or_default();
                 }
                 // A sprite shows its first frame as it is placed.
@@ -714,6 +746,9 @@ impl Player {
                     if let Some(b) = p.blend {
                         c.blend = b;
                     }
+                    if let Some(r) = p.ratio {
+                        c.ratio = r;
+                    }
                     if let Some(n) = &p.name {
                         c.name.clone_from(n);
                     }
@@ -733,6 +768,8 @@ impl Player {
             Kind::Sprite
         } else if lib.shapes.contains_key(&character) {
             Kind::Shape(character)
+        } else if lib.morphs.contains_key(&character) {
+            Kind::Morph(character)
         } else if let Some(t) = lib.texts.get(&character) {
             Kind::Text(character, t.initial.clone())
         } else {
@@ -999,6 +1036,11 @@ impl Player {
             Kind::Shape(s) => {
                 if let Some((shape, mesh)) = c.lib.shapes.get(s) {
                     draw_shape(shape, mesh, &c.lib.images, &m, &col, clip, out);
+                }
+            }
+            Kind::Morph(s) => {
+                if let Some(morphed) = c.lib.morph(*s, c.ratio) {
+                    draw_shape(&morphed.0, &morphed.1, &c.lib.images, &m, &col, clip, out);
                 }
             }
             Kind::Text(_, s) => {
