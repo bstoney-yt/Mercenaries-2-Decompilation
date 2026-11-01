@@ -40,7 +40,8 @@
 //! to [`LOOK_RATE`] mouse counts a second, squared for fine aim.
 //!
 //! In the front end and the menus, A is Enter, B Escape and the d-pad the
-//! arrows ([`MenuKey`]).
+//! arrows ([`MenuKey`]). In the PDA the buttons and the sticks' pushes are
+//! the keys the 360's GUI layer hands its movies ([`PDA_BUTTON_KEYS`]).
 //!
 //! On Android there is no XInput: a controller (an Xbox pad over
 //! Bluetooth, or any the phone takes as a gamepad) arrives as window
@@ -172,6 +173,38 @@ pub const LOOK_RATE: f64 = 1000.0;
 /// A stick push counts as a press (a hijack's `LStick_Left`) past this.
 const PUSH: f32 = 0.5;
 
+/// The keys the PDA's movies hear for the pad's buttons, as Flash key
+/// codes. From the 360 code: the GUI layer's button handler
+/// (`Function_82384E48`, called per queued button event from
+/// `Function_823847E0`) turns the game's `Joystick.BUTTON_*` numbers into
+/// key-down events (key-up on release) for the movies' `Key` listeners:
+/// the d-pad the arrows, Y Home (the map's current contract), A Enter
+/// and B Shift (swapped when the confirm button is B; A is the one the
+/// engine starts with), X Backspace, LT `Q` and RT `[` (`topbar`'s `L1`
+/// and `R1`, which step its pages), L3 `E` and R3 `O`. LB, RB, Start and
+/// Back send nothing (Back is the PDA's own button).
+pub const PDA_BUTTON_KEYS: [(Button, i32); 12] = [
+    (Button::DpadUp, 38),
+    (Button::DpadDown, 40),
+    (Button::DpadLeft, 37),
+    (Button::DpadRight, 39),
+    (Button::Y, 36),
+    (Button::A, 13),
+    (Button::X, 8),
+    (Button::B, 16),
+    (Button::LeftTrigger, 81),
+    (Button::LeftStick, 69),
+    (Button::RightTrigger, 219),
+    (Button::RightStick, 79),
+];
+
+/// The keys the sticks' pushes send the PDA's movies, by the same
+/// handler: per stick its left, right, up and down, the left stick's the
+/// letters A D W S and the right stick's `L`, `'`, `P` and `;`. When a
+/// push counts isn't from the 360 code (its stick events come from
+/// further up): past [`PUSH`], as the hijacks' pushes.
+pub const PDA_STICK_KEYS: [[i32; 4]; 2] = [[65, 68, 87, 83], [76, 222, 80, 186]];
+
 /// A key the front end and the menus take from the pad.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuKey {
@@ -211,6 +244,11 @@ pub struct Pad {
     /// The left stick's pushes up and down step a menu as the d-pad
     /// does ([`Pad::stick_steps`]): set while a dialog box is up.
     pub stick_menu: bool,
+    /// The PDA is open: the buttons and the sticks' pushes go to its
+    /// movies as keys ([`Pad::pda_keys`], gathered in `pda_keys`) and
+    /// not as menu keys.
+    pub pda: bool,
+    pub pda_keys: Vec<(i32, bool)>,
     /// The motors are running.
     motors: bool,
 }
@@ -272,16 +310,29 @@ impl Pad {
             let took = m2_sys::xinput::vibrate(left, right);
             self.motors = on && took;
         }
-        let mut keys = Self::menu_keys(&self.last, &s);
-        if self.stick_menu {
-            keys.extend(Self::stick_steps(&self.last, &s));
-        }
+        let keys = self.keys(&s);
         self.feed(input, s, driving, dt);
         // The touch controls' sprint is switched on, not held: she sprints
         // on foot whenever she moves while it is.
         if self.touch.sprint {
             let moving = s.left[0].hypot(s.left[1]) > 0.0;
             input.set_pad_hold(Action::Sprint, !driving && moving);
+        }
+        keys
+    }
+
+    /// The menu keys reading `s` presses, the stick's steps too while a
+    /// dialog box is up; while the PDA is open, none: its keys are
+    /// gathered in `pda_keys` instead.
+    fn keys(&mut self, s: &PadState) -> Vec<MenuKey> {
+        if self.pda {
+            let pda = Self::pda_keys(&self.last, s);
+            self.pda_keys.extend(pda);
+            return Vec::new();
+        }
+        let mut keys = Self::menu_keys(&self.last, s);
+        if self.stick_menu {
+            keys.extend(Self::stick_steps(&self.last, s));
         }
         keys
     }
@@ -348,6 +399,31 @@ impl Pad {
         }
         if is < -PUSH && was >= -PUSH {
             out.push(MenuKey::Down);
+        }
+        out
+    }
+
+    /// The keys the PDA's movies hear going from reading `before` to
+    /// `now` (Flash key codes, down or up): [`PDA_BUTTON_KEYS`] as their
+    /// buttons go down and come up, then [`PDA_STICK_KEYS`] as the
+    /// sticks are pushed past [`PUSH`] and let back.
+    pub fn pda_keys(before: &PadState, now: &PadState) -> Vec<(i32, bool)> {
+        let mut out = Vec::new();
+        for (b, code) in PDA_BUTTON_KEYS {
+            if b.held(now) != b.held(before) {
+                out.push((code, b.held(now)));
+            }
+        }
+        let pushes = |s: &PadState| {
+            [s.left, s.right].map(|[x, y]| [-x > PUSH, x > PUSH, y > PUSH, -y > PUSH])
+        };
+        let (was, is) = (pushes(before), pushes(now));
+        for (stick, codes) in PDA_STICK_KEYS.iter().enumerate() {
+            for (way, &code) in codes.iter().enumerate() {
+                if is[stick][way] != was[stick][way] {
+                    out.push((code, is[stick][way]));
+                }
+            }
         }
         out
     }
@@ -746,6 +822,69 @@ mod tests {
             [MenuKey::Enter, MenuKey::Down]
         );
         assert!(Pad::menu_keys(&press(xb::B), &press(xb::B)).is_empty());
+    }
+
+    /// The 360's button handler: LT and RT step the PDA's pages (`Q` and
+    /// `[`), Y shows the current contract (Home), A and B are Enter and
+    /// Shift, X Backspace; each comes up again as its button does.
+    #[test]
+    fn the_pda_hears_the_360s_keys_for_the_buttons() {
+        let none = PadState::default();
+        let rt = PadState {
+            right_trigger: 1.0,
+            ..PadState::default()
+        };
+        assert_eq!(Pad::pda_keys(&none, &rt), [(219, true)]);
+        assert!(Pad::pda_keys(&rt, &rt).is_empty(), "held");
+        assert_eq!(Pad::pda_keys(&rt, &none), [(219, false)]);
+        let lt = PadState {
+            left_trigger: 1.0,
+            ..PadState::default()
+        };
+        assert_eq!(Pad::pda_keys(&none, &lt), [(81, true)]);
+        assert_eq!(
+            Pad::pda_keys(&none, &press(xb::Y | xb::A | xb::X | xb::B)),
+            [(36, true), (13, true), (8, true), (16, true)]
+        );
+        assert_eq!(
+            Pad::pda_keys(&none, &press(xb::DPAD_UP | xb::DPAD_RIGHT)),
+            [(38, true), (39, true)]
+        );
+        // The bumpers, Start and Back send nothing.
+        let quiet = xb::LEFT_SHOULDER | xb::RIGHT_SHOULDER | xb::START | xb::BACK;
+        assert!(Pad::pda_keys(&none, &press(quiet)).is_empty());
+    }
+
+    /// The sticks' pushes: the left stick's are A D W S, the right's
+    /// `L` `'` `P` `;`, once a push past half way.
+    #[test]
+    fn the_pda_hears_the_sticks_pushes_as_keys() {
+        let none = PadState::default();
+        let s = |left, right| PadState {
+            left,
+            right,
+            ..PadState::default()
+        };
+        assert_eq!(
+            Pad::pda_keys(&none, &s([-0.9, 0.0], [0.0, 0.9])),
+            [(65, true), (80, true)]
+        );
+        assert!(Pad::pda_keys(&none, &s([0.3, 0.0], [0.0, 0.0])).is_empty());
+        assert_eq!(
+            Pad::pda_keys(&s([0.0, 0.9], [0.0, 0.0]), &s([0.0, -0.9], [0.9, 0.0])),
+            [(87, false), (83, true), (222, true)]
+        );
+    }
+
+    /// With the PDA open, the pad's A and d-pad go to it as keys only,
+    /// not as menu keys too (one Enter, not two).
+    #[test]
+    fn with_the_pda_open_the_buttons_are_its_keys() {
+        let mut pad = Pad::default();
+        assert_eq!(pad.keys(&press(xb::A)), [MenuKey::Enter]);
+        pad.pda = true;
+        assert!(pad.keys(&press(xb::A)).is_empty());
+        assert_eq!(pad.pda_keys, [(13, true)]);
     }
 
     #[test]

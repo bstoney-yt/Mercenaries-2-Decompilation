@@ -652,6 +652,10 @@ pub struct HudState {
     /// codes ([`flash_key`]): the PDA's movies' own `Key` listeners take
     /// them (the map's Home shows the current contract).
     pub keys: Vec<(i32, bool)>,
+    /// The pad's buttons and stick pushes as the PDA's keys
+    /// ([`crate::pad::Pad::pda_keys`]): for its movies only, not its
+    /// map's movement keys (the stick moves the map itself).
+    pub pad_keys: Vec<(i32, bool)>,
     /// The GUI's named buttons pressed (`"selection"`: Enter), for the
     /// scripts' `Button` events (the contract fanfare's skip).
     pub buttons: Vec<String>,
@@ -756,6 +760,9 @@ pub fn flash_key(key: egui::Key) -> Option<i32> {
         ArrowDown => 40,
         Insert => 45,
         Delete => 46,
+        // The right stick's down and right in the PDA (`pad::PDA_STICK_KEYS`).
+        Semicolon => 186,
+        Quote => 222,
         OpenBracket => 219,
         CloseBracket => 221,
         _ => return None,
@@ -949,6 +956,8 @@ impl HudState {
         gui_calls.extend(later.gui_calls.iter().cloned());
         let mut keys = std::mem::take(&mut self.keys);
         keys.extend(later.keys.iter().copied());
+        let mut pad_keys = std::mem::take(&mut self.pad_keys);
+        pad_keys.extend(later.pad_keys.iter().copied());
         let mut buttons = std::mem::take(&mut self.buttons);
         buttons.extend(later.buttons.iter().cloned());
         let mut dialog_keys = std::mem::take(&mut self.dialog_keys);
@@ -967,6 +976,7 @@ impl HudState {
             hud_calls,
             gui_calls,
             keys,
+            pad_keys,
             buttons,
             dialog_keys,
             pause_captured,
@@ -2308,6 +2318,10 @@ impl Thread {
         self.tell_options(&state.pause_settings, &mut log);
         if self.pda_shown || self.fanfare_up() || self.pause_up() {
             self.keys.extend(state.keys.iter().copied());
+        }
+        if self.pda_shown && !state.pad_keys.is_empty() {
+            log.push(format!("pda: pad keys {:?}", state.pad_keys));
+            self.keys.extend(state.pad_keys.iter().copied());
         }
         // The PDA's map moves while its movement keys are held, as the
         // pad's left stick moves it.
@@ -5970,11 +5984,13 @@ mod tests {
             dt: 0.1,
             hurts: vec![(10.0, 0.0)],
             hp: 90.0,
+            pad_keys: vec![(219, true)],
             ..HudState::default()
         };
         a.merge(HudState {
             dt: 0.2,
             hurts: vec![(5.0, 90.0)],
+            pad_keys: vec![(219, false)],
             messages: vec![ObjectiveMessage {
                 kind: "add".into(),
                 icon: 5,
@@ -5986,6 +6002,11 @@ mod tests {
         assert!((a.dt - 0.3).abs() < 1e-9);
         assert_eq!(a.hurts.len(), 2);
         assert_eq!(a.messages.len(), 1);
+        assert_eq!(
+            a.pad_keys,
+            [(219, true), (219, false)],
+            "a press and its let go"
+        );
         assert_eq!(a.hp, 85.0);
     }
 
