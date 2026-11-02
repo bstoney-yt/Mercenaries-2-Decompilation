@@ -2884,9 +2884,11 @@ impl Physics {
                 .can_sleep(false)
                 .ccd_enabled(true),
         );
-        // Mass low in the hull (as an engine and axles put it) and inertia
-        // a little above a solid box's, so it takes a steep slope or a
-        // hard turn without rolling over.
+        // A tank's, boat's or helicopter's (and a car's with no template):
+        // mass low in the hull and inertia a little above a solid box's,
+        // invented. The 360 code works theirs out from their PHY2 shapes
+        // (0x8216A290, Havok's computer, clipped to 1/15 at 0x82167500);
+        // not yet ported.
         let m = spec.mass;
         let size = half * 2.0;
         let inertia = Vec3::new(
@@ -2894,22 +2896,34 @@ impl Physics {
             size.x * size.x + size.z * size.z,
             size.x * size.x + size.y * size.y,
         ) * (m / 12.0 * 1.5);
-        // A motorbike's is its template's per kilogram times its mass, as
-        // the 360 code sets it (0x8219BA08), which its balance is tuned
-        // against.
+        // A car's or motorbike's (its `_CarPhysicsV2`'s) is its template's
+        // per kilogram times its mass, as the 360 code sets every car's
+        // body (0x8219BA08), and its centre of mass the middle of its
+        // wheels plus its template's offset (0x8219BABC). The point it
+        // takes of each wheel (its 0xE0) is its hardpoint raised by its
+        // axle's `SuspCmpLength` (0x8219EF90): the top of its spring
+        // here, its squeeze above the model's wheel.
         let bike = spec.is_bike().then(|| spec.tuning.bike.unwrap_or(BIKE));
-        let inertia = bike.map_or(inertia, |b| Vec3::from(b.inertia) * m);
-        // Its centre of mass: a motorbike's at the middle of its wheels
-        // plus its template's offset, as the 360 code puts it
-        // (0x8219BABC; which point of a wheel it takes, 0xE0 of the
-        // wheel, isn't traced: its centre here).
-        let com = match bike {
-            Some(b) if !spec.wheels.is_empty() => {
-                let mid =
-                    spec.wheels.iter().map(|w| w.centre).sum::<Vec3>() / spec.wheels.len() as f32;
+        let car_body = bike
+            .map(|b| crate::tuning::CarBody {
+                inertia: b.inertia,
+                centre_of_mass: b.centre_of_mass,
+            })
+            .or(spec.tuning.body)
+            .filter(|_| !spec.tracked && !spec.wheels.is_empty());
+        let inertia = car_body.map_or(inertia, |b| Vec3::from(b.inertia) * m);
+        let com = match car_body {
+            Some(b) => {
+                let springs = spec.tuning.springs.unwrap_or(Springs::DEFAULT);
+                let mid = spec
+                    .wheels
+                    .iter()
+                    .map(|w| w.centre + Vec3::Y * springs.axle(w.steers).3)
+                    .sum::<Vec3>()
+                    / spec.wheels.len() as f32;
                 mid + Vec3::from(b.centre_of_mass) - centre
             }
-            _ => Vec3::new(0.0, -half.y * 0.8, 0.0),
+            None => Vec3::new(0.0, -half.y * 0.8, 0.0),
         };
         let hull = r::InteractionGroups::new(VEHICLE, r::Group::ALL, r::InteractionTestMode::And);
         let (car_hull, hull_friction) = hull_feel(spec);
@@ -5285,6 +5299,32 @@ mod tests {
             p.step(DT);
         }
         assert!(p.vehicle_velocity(id).y < -5.0, "falls");
+    }
+
+    /// A car's body as the 360 code sets it (0x8219BA08, 0x8219BABC): its
+    /// template's inertia per kilogram times its mass, its centre of mass
+    /// the middle of its wheels' spring tops plus its template's offset.
+    #[test]
+    fn a_cars_inertia_and_centre_of_mass_are_its_templates() {
+        let mut spec = car();
+        spec.tuning.body = Some(crate::tuning::CarBody {
+            inertia: [2.0, 1.0, 1.5],
+            centre_of_mass: [0.0, -0.2, 0.1],
+        });
+        let mut p = Physics::new();
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 1.0, 0.0), 0.0);
+        let v = p.vehicles[id.0].as_ref().unwrap();
+        let b = &p.world.bodies[v.controller.chassis];
+        let props = b.mass_properties().local_mprops;
+        let i = vec3(props.principal_inertia());
+        let want = Vec3::new(2.0, 1.0, 1.5) * 1400.0;
+        assert!((i - want).length() < 1.0, "inertia {i}");
+        // The wheels' middle (0, 0.35, 0.05) raised by the default
+        // squeeze, plus the offset.
+        let top = Springs::DEFAULT.axle(true).3;
+        let com = vec3(props.local_com);
+        let want = Vec3::new(0.0, 0.35 + top - 0.2, 0.05 + 0.1);
+        assert!((com - want).length() < 1e-3, "centre {com} want {want}");
     }
 
     /// The 360 code's per-60th decay (0x821A3B38): a whole number of
