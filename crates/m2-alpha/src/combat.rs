@@ -1706,6 +1706,9 @@ pub struct Manned {
     /// where either model lacks its node ([`MANNED_PIVOT`],
     /// [`MANNED_MUZZLE`]).
     pub barrel: Option<(Vec3, Vec3)>,
+    /// Where she mans it: its seat's hardpoint ([`crate::placed::seat_points`]),
+    /// else behind it ([`crate::placed::stand_behind`]).
+    pub seat: Option<Vec3>,
 }
 
 /// An emplaced gun's barrel above its place, metres, where its model's

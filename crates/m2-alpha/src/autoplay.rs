@@ -6920,6 +6920,7 @@ mod tests {
             model: 0,
             hardpoint: 0,
             barrel: None,
+            seat: None,
         }
     }
 

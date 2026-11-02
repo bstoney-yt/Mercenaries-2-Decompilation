@@ -1024,6 +1024,76 @@ impl Game {
                         m.barrel = crate::placed::barrel(scene.source.as_mut(), &scene.props, &m);
                         m
                     });
+                    // Its seat data: got on through its entrance as a
+                    // vehicle is (gathered and picked with theirs, and the
+                    // ladders'), manned from its seat's hardpoint, turned
+                    // and tilted within its seat's `Turret`.
+                    let points = manning.as_ref().and_then(|m| {
+                        crate::placed::seat_points(
+                            scene.source.as_mut(),
+                            &scene.props,
+                            &world.index.template_db,
+                            m,
+                        )
+                    });
+                    let her = player.character.position;
+                    let manning = match (manning, points) {
+                        (Some(mut m), Some(p)) => m2_engine::seats::in_search(
+                            her,
+                            player.eye(),
+                            player.camera_forward(),
+                            p.entrance,
+                            p.use_distance,
+                            m2_engine::seats::SEARCH_PAD,
+                        )
+                        .then(|| {
+                            if let Some(t) = p.turret {
+                                m.yaw = t.yaw;
+                                m.pitch = t.pitch;
+                            }
+                            m.seat = Some(p.seat);
+                            m
+                        }),
+                        (m, _) => m,
+                    };
+                    let gun =
+                        points
+                            .filter(|_| manning.is_some())
+                            .map(|p| m2_engine::seats::Candidate {
+                                vehicle: EMPLACED,
+                                distance_sq: her.distance_squared(p.entrance),
+                                use_distance: p.use_distance,
+                                upright: true,
+                                offered: true,
+                            });
+                    let ends = if player.driving.is_none() {
+                        self.ladders.gathered(
+                            &world.index,
+                            &world.destroyed,
+                            scene.source.as_mut(),
+                            her,
+                            player.eye(),
+                            player.camera_forward(),
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    let picked = entrance_pick(
+                        physics,
+                        &scene.vehicles,
+                        (&self.hijack_only, &self.unusable),
+                        player,
+                        self.last_vehicle,
+                        &ends,
+                        gun,
+                    );
+                    // Without seat data the gun comes before any vehicle
+                    // (the alpha's former rule); with it, if it is the
+                    // nearest entrance.
+                    let man_it = manning.is_some()
+                        && (gun.is_none() || picked.is_some_and(|(i, _)| i == EMPLACED));
+                    let manning = manning.filter(|_| man_it);
+                    let picked = picked.filter(|&(i, _)| i != EMPLACED);
                     match player.driving {
                         // Out over deep water she swims (`Player::update_swim`).
                         Some(i) => {
@@ -1044,7 +1114,7 @@ impl Game {
                         None if scene.flights.within(player.character.position).is_some() => {
                             taking = true;
                         }
-                        // An emplaced gun, before any vehicle.
+                        // An emplaced gun.
                         None if manning.is_some() => {
                             let Some(m) = manning else { unreachable!() };
                             eprintln!(
@@ -1066,32 +1136,17 @@ impl Game {
                                 m.pitch.0.to_degrees(),
                                 m.pitch.1.to_degrees()
                             );
-                            // Behind it, facing the way it does.
+                            // At its seat (else behind it), facing the way
+                            // it does.
                             player.facing = m.facing;
-                            player.character.position = crate::placed::stand_behind(
-                                m.pivot,
-                                m.facing,
-                                player.character.position.y,
-                            );
+                            let feet = player.character.position.y;
+                            player.character.position = match m.seat {
+                                Some(s) => s.with_y(feet),
+                                None => crate::placed::stand_behind(m.pivot, m.facing, feet),
+                            };
                             self.combat.manned = Some(m);
                         }
                         None => {
-                            let ends = self.ladders.gathered(
-                                &world.index,
-                                &world.destroyed,
-                                scene.source.as_mut(),
-                                player.character.position,
-                                player.eye(),
-                                player.camera_forward(),
-                            );
-                            let picked = entrance_pick(
-                                physics,
-                                &scene.vehicles,
-                                (&self.hijack_only, &self.unusable),
-                                player,
-                                self.last_vehicle,
-                                &ends,
-                            );
                             // A ladder's end, nearer than any vehicle's
                             // entrance.
                             let reach = picked
@@ -2259,6 +2314,7 @@ impl Game {
                 p,
                 self.last_vehicle,
                 &[],
+                None,
             )
             .map(|(i, _)| {
                 let spec = &self.scene.vehicles[i].spec;
@@ -4064,6 +4120,8 @@ fn can_sit_in(kind: &str) -> bool {
 
 /// Where [`entrance_pick`] numbers the ladder ends it picks from.
 const LADDER: usize = usize::MAX / 2;
+/// The number [`entrance_pick`] gives an emplaced gun's entrance.
+const EMPLACED: usize = usize::MAX / 4;
 
 /// The vehicle she gets into at a press of the use key, and the entrance
 /// she gets in by (`None` for a vehicle without entrance data), as the 360
@@ -4083,6 +4141,7 @@ fn entrance_pick(
     player: &Player,
     last: Option<usize>,
     ladders: &[crate::ladders::Reach],
+    gun: Option<m2_engine::seats::Candidate>,
 ) -> Option<(usize, Option<u32>)> {
     use m2_engine::seats::{self, Candidate};
     let her = player.character.position;
@@ -4134,6 +4193,8 @@ fn entrance_pick(
         };
         found.push((c, None));
     }
+    // An emplaced gun's entrance, its vehicle [`EMPLACED`].
+    found.extend(gun.map(|c| (c, None)));
     found.truncate(seats::LIST_CAP);
     let cands: Vec<Candidate> = found.iter().map(|(c, _)| *c).collect();
     let k = seats::pick(&cands, last)?;
