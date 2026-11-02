@@ -884,6 +884,8 @@ pub struct MissionLink {
     /// The armies' pursuit helicopters ([`crate::reinforce`]), read from
     /// the data once, and those under way.
     squads: Option<HashMap<&'static str, crate::reinforce::Squad>>,
+    /// How many units each army's pursuit sends ([`crate::reinforce::Counts`]).
+    pursuit_counts: Option<crate::reinforce::Counts>,
     reinforcements: crate::reinforce::Reinforcements,
     /// Seconds since the scripts said the contract was completed.
     completed: Option<f32>,
@@ -1053,6 +1055,7 @@ impl MissionLink {
             vehicles: Fleet::default(),
             out_for: 0.0,
             squads: None,
+            pursuit_counts: None,
             reinforcements: crate::reinforce::Reinforcements::default(),
             completed: None,
             contracts: 0,
@@ -2223,16 +2226,53 @@ impl MissionLink {
             eprintln!("reinforcements: pursuit helicopters {names:?}");
             self.squads = Some(squads);
         }
-        if let (Some(squads), Some(her)) = (
+        if self.pursuit_counts.is_none()
+            && let Some(source) = game.scene.source.as_mut()
+        {
+            use m2_assets::animation_table::{ANIMATION_TABLE_TYPE, AnimationTable};
+            let counts = source
+                .asset(crate::reinforce::COUNTS_TABLE, ANIMATION_TABLE_TYPE)
+                .ok()
+                .and_then(|a| AnimationTable::parse(&a).ok())
+                .map(|t| crate::reinforce::Counts::of(&t))
+                .unwrap_or_default();
+            if counts.is_empty() {
+                eprintln!("reinforcements: no pursuit counts table: no helicopters are sent");
+            } else {
+                eprintln!("reinforcements: pursuit counts for {} rows", counts.len());
+            }
+            self.pursuit_counts = Some(counts);
+        }
+        if let (Some(squads), Some(counts), Some(her)) = (
             &self.squads,
+            &self.pursuit_counts,
             game.scene.player.as_ref().map(|p| p.character.position),
         ) {
-            let mut pursuing: Vec<&'static str> =
-                game.scene.people.pursuit.keys().copied().collect();
-            pursuing.sort_unstable();
+            // The engine's pursuit, and the helicopters it wants out for
+            // where she is.
+            let clock = mission.world().borrow().pursuit.clock;
+            let faction = clock.faction.filter(|_| clock.active).and_then(|g| {
+                let w = mission.world().borrow();
+                crate::npc::faction_by_label(w.template_name(g)?)
+            });
+            let wanted = faction.map(|f| {
+                let standing = pursuit_standing(game, her);
+                let n = counts.helicopters(f, standing, clock.level.max(0) as usize);
+                (f, n)
+            });
+            if let Some((f, n)) = wanted
+                && n > self.reinforcements.out(f)
+            {
+                eprintln!(
+                    "reinforcements: {f}'s pursuit at level {} ({} s left) wants {n} helicopter(s) out, she {:?}",
+                    clock.level + 1,
+                    clock.seconds,
+                    pursuit_standing(game, her)
+                );
+            }
             let due = self
                 .reinforcements
-                .step(&pursuing, squads, &mut game.scene.flights, her, dt);
+                .step(wanted, squads, &mut game.scene.flights, her, dt);
             for (g, template, at) in due {
                 let model = game
                     .scene
@@ -4741,6 +4781,49 @@ fn report_strikes(game: &mut Game, mission: &mut Mission) -> (u32, u32) {
 
 /// The ground under `at` (a satellite's mark is on the ground she stands
 /// on); `at` itself where nothing is found.
+/// Where she is as the pursuit tables read it (from the 360 code,
+/// 0x822644E0): her vehicle's kind (a helicopter, a tank, a boat); else
+/// on a road or within [`crate::reinforce::NEAR_ROAD`] of one, `Driving`
+/// in a vehicle going 4 m/s or more (the constant at 0x820B7B6C) and
+/// `Stopped` otherwise; off the roads `OffRoad`.
+fn pursuit_standing(game: &Game, her: Vec3) -> crate::reinforce::Standing {
+    use crate::reinforce::Standing;
+    let riding = game
+        .scene
+        .player
+        .as_ref()
+        .and_then(|p| p.driving)
+        .and_then(|i| game.scene.vehicles.get(i));
+    if let Some(v) = riding {
+        if v.spec.is_helicopter() {
+            return Standing::Heli;
+        }
+        if v.spec.tracked {
+            return Standing::Tank;
+        }
+        if v.spec.is_boat() {
+            return Standing::Boat;
+        }
+    }
+    let at = game.driving().map_or(her, |(at, _)| at);
+    let near = game.scene.world.as_ref().is_some_and(|w| {
+        w.index.roads.iter().any(|r| {
+            r.points.windows(2).any(|s| {
+                let (a, b) = (s[0].with_y(0.0), s[1].with_y(0.0));
+                let p = at.with_y(0.0);
+                let ab = b - a;
+                let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+                p.distance(a + ab * t) <= crate::reinforce::NEAR_ROAD
+            })
+        })
+    });
+    match (near, game.driving()) {
+        (false, _) => Standing::OffRoad,
+        (true, Some((_, speed))) if speed >= 4.0 => Standing::Driving,
+        (true, _) => Standing::Stopped,
+    }
+}
+
 fn ground_under(game: &Game, at: Vec3) -> Vec3 {
     const ABOVE: f32 = 300.0;
     let top = at + Vec3::Y * ABOVE;

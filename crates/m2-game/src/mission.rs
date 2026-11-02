@@ -1015,6 +1015,7 @@ impl Mission {
         {
             let mut w = self.world.borrow_mut();
             w.honk_heard = (w.honk_heard - dt as f32).max(0.0);
+            w.pursuit.clock.step(dt as f32);
         }
         // Streaming is instant here: a waiting state ends a second after
         // it was asked for, and the scripts hear that it did.
@@ -1306,8 +1307,9 @@ impl Mission {
         self.world.borrow().music.playlist(hash).to_vec()
     }
 
-    /// The pursuit the scripts set ran out: `Pg.GetPursuitState` reads
-    /// level 0 again.
+    /// The fight the scripts' pursuit set off ran out (the game's
+    /// soldiers stop chasing her); the engine's own pursuit
+    /// ([`crate::api::PursuitClock`]) runs out by its clock.
     pub fn pursuit_over(&mut self) {
         let mut w = self.world.borrow_mut();
         w.pursuit.level = 0;
