@@ -210,6 +210,9 @@ pub struct PersonKind {
     pub gun: Option<HandGun>,
     pub model: GpuModel,
     pub rig: Rig,
+    /// How fast they swim ashore, m/s: their template's `SwimJogSpeed`
+    /// ([`m2_engine::tuning::SWIM_SPEEDS`]); `None` for a role's.
+    pub swim: Option<f32>,
 }
 
 /// What a person is doing.
@@ -912,6 +915,9 @@ pub struct Npc {
     through: bool,
     /// In the water out of their depth: they swim ([`NpcSwim`]).
     pub swim: Option<NpcSwim>,
+    /// How fast they swim, m/s (their kind's [`PersonKind::swim`], else
+    /// [`crate::player::SWIM_SPEED`]).
+    pub swim_speed: f32,
     /// Standing up out of the water: the climb-out's seconds left.
     climbing: f32,
 }
@@ -1062,6 +1068,7 @@ impl Npc {
             ended: false,
             through: false,
             swim: None,
+            swim_speed: crate::player::SWIM_SPEED,
             climbing: 0.0,
         }
     }
@@ -1148,7 +1155,7 @@ impl Npc {
             swim.shore = shore(physics, at);
         }
         let wanted = swim.shore.map_or(Vec3::ZERO, |s| {
-            (s - at).with_y(0.0).normalize_or_zero() * crate::player::SWIM_SPEED
+            (s - at).with_y(0.0).normalize_or_zero() * self.swim_speed
         });
         physics.move_character(&mut self.character, wanted, None, dt);
         self.character.position.y = water - crate::player::SWIM_FLOAT;
@@ -3002,6 +3009,11 @@ impl People {
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
             npc.target_armour = self.target_armour.max(1);
+            npc.swim_speed = self
+                .kinds
+                .get(npc.kind)
+                .and_then(|k| k.swim)
+                .unwrap_or(crate::player::SWIM_SPEED);
             npc.rammed = (npc.rammed - dt).max(0.0);
             let facing = npc.facing;
             npc.update(physics, &mut self.rng, threat, dt);
@@ -4513,6 +4525,7 @@ pub(crate) mod tests {
             gun: None,
             model: empty_model(),
             rig: rig(),
+            swim: None,
         }
     }
 
