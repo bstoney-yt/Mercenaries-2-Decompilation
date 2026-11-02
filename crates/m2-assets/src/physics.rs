@@ -37,8 +37,9 @@
 //!       u32 node name hash, u32 node index, u32 body, u32 shape, u32 ?,
 //!       u32 parent, u32 first child, u32 next sibling, u32 0xBBBBBBBB
 //! body, 0x6C bytes: u32 0xCCCCCCCC, f32x9 inertia (all FLT_MAX: fixed),
-//!       f32x3 centre of mass, f32 mass, f32x4 unknown (0.3), u32x8 ?,
-//!       u32 0xDDDDDDDD
+//!       f32x3 centre of mass, f32 mass, f32 ?, f32 friction, f32 ?,
+//!       f32 angular damping, f32x3 linear and f32x3 angular velocity,
+//!       u32 ?, u32 ?, u32 0xDDDDDDDD (see [`Body`])
 //! shape, 0x6C bytes: u32 0xEEEEEEEE, then 26 words: 3 kind (2 mesh),
 //!       4 collision class (see [`Shape::class`]), 5..10 f32x6 vertex pool bounds
 //!       (meshes), 16 vertex count, 18 vertex pool offset (meshes),
@@ -132,6 +133,18 @@ pub struct Part {
 }
 
 /// Rigid body properties.
+///
+/// From the 360 code (the body builder at 0x8216A290, reached from the
+/// part walk at 0x8216BC08): record +0x28 centre of mass and +0x34 mass
+/// go to the Havok body as they are; +0x3C ([`unk`](Self::unk)`[1]`) is
+/// its friction and +0x44 (`unk[3]`) its angular damping; +0x38 and
+/// +0x40 (`unk[0]`, `unk[2]`) aren't read there. Words 0..2 and 3..5 of
+/// [`unk_words`](Self::unk_words) are, as floats, a starting linear and
+/// angular velocity the part walk gives the body when either is non-zero;
+/// bits 5..8 of word 6 pick an entry of a per-model table.
+///
+/// From samples: `unk` is 0.3 throughout on 16,070 of the 16,088 bodies
+/// in `vz.wad`; a few have 0.7, 0.8 or 1.0 at +0x44.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Body {
     pub inertia: [f32; 9],
@@ -142,9 +155,24 @@ pub struct Body {
 }
 
 impl Body {
-    /// Fixed bodies have infinite inertia and never move.
+    /// A body of no mass is fixed and never moves. From the 360 code: the
+    /// body builder (0x8216A410) makes one whose mass isn't over 0 a fixed
+    /// Havok body and any other a moving one; inertia all `f32::MAX` (on
+    /// 3,370 records, 43 of them with mass) only has it work the inertia
+    /// out from the shape (0x8216A500).
     pub fn is_fixed(&self) -> bool {
-        self.inertia[0] == f32::MAX
+        self.mass.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+    }
+
+    /// The friction the game gives its Havok body (record +0x3C).
+    pub fn friction(&self) -> f32 {
+        self.unk[1]
+    }
+
+    /// The angular damping the record asks for (+0x44), before the game's
+    /// floor on it.
+    pub fn angular_damping(&self) -> f32 {
+        self.unk[3]
     }
 }
 
@@ -934,9 +962,9 @@ mod tests {
         s.extend(part(2, NONE, shape(1), parts_at + PART_LEN as u32));
         for fixed in [true, false] {
             let mut b = le(&[0xCCCC_CCCC]);
-            let i = if fixed { f32::MAX } else { 1.0 };
+            let (i, kg) = if fixed { (f32::MAX, 0.0) } else { (1.0, 10.0) };
             b.extend(lef(&[
-                i, 0.0, 0.0, 0.0, i, 0.0, 0.0, 0.0, i, 0.0, 0.0, 0.0, 10.0, 0.3, 0.3, 0.3, 0.3,
+                i, 0.0, 0.0, 0.0, i, 0.0, 0.0, 0.0, i, 0.0, 0.0, 0.0, kg, 0.3, 0.3, 0.3, 0.3,
             ]));
             b.extend(le(&[0; 8]));
             b.extend(le(&[0xDDDD_DDDD]));
