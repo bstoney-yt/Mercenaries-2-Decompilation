@@ -1896,7 +1896,7 @@ fn pause_menu(
         .rect_filled(ctx.content_rect(), 0.0, Color32::from_black_alpha(120));
     }
     let window = if own {
-        egui::Window::new("Alpha settings")
+        egui::Window::new("Beta settings")
             .anchor(Align2::RIGHT_TOP, vec2(-16.0, 16.0))
             .collapsible(true)
             .default_open(false)

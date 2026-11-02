@@ -3,8 +3,8 @@
 //! activity's entry point, the game's folder, and mouse capture. The
 //! controller is read from winit's events ([`crate::pad::Events`]).
 //!
-//! The game is read from the `Mercenaries2Alpha` folder at the top of the
-//! phone's storage (or the top of the storage, or the downloads), where the
+//! The game is read from the `Mercenaries2Beta` folder (or the older
+//! `Mercenaries2Alpha` one) at the top of the phone's storage (or the top of the storage, or the downloads), where the
 //! player drags a folder holding the APK and their install's `data` folder. Reading it needs "all files access",
 //! which the app asks for (by opening its settings page) when it can't read
 //! the game there. The app's own folder (`Android/data/<package>/files`)
@@ -36,11 +36,14 @@ const ARGS_FILE: &str = "m2-alpha-args.txt";
 const LOG_FILE: &str = "m2-alpha.log";
 /// The top of the phone's shared storage.
 const STORAGE: &str = "/storage/emulated/0";
-/// The folder the player drags onto the phone (its name), and where else
-/// the game may have landed: the top of the storage, or the downloads.
-const SHARED: [&str; 4] = [
+/// The folder the player drags onto the phone (its name, then the alpha's
+/// older name), and where else the game may have landed: the top of the
+/// storage, or the downloads.
+const SHARED: [&str; 6] = [
+    "Mercenaries2Beta",
     "Mercenaries2Alpha",
     "",
+    "Download/Mercenaries2Beta",
     "Download/Mercenaries2Alpha",
     "Download",
 ];

@@ -26,12 +26,12 @@ Everything else (the mission, HUD, saves, settings) is the PC build's.
 
 ## Copying the game to the phone
 
-Make a folder named `Mercenaries2Alpha` holding the APK and your install's
+Make a folder named `Mercenaries2Beta` holding the APK and your install's
 `data` folder (`C:\Program Files (x86)\EA Games\Mercenaries 2 World in
 Flames\data`; its `Movies` folder can be left out). Then:
 
 1. Connect the phone to the PC by USB, allow file transfer, and drag the
-   `Mercenaries2Alpha` folder onto the phone's `Internal storage`.
+   `Mercenaries2Beta` folder onto the phone's `Internal storage`.
 2. On the phone, open it in My Files and tap the APK to install it (allow
    installs from unknown sources when asked).
 3. Open the app. The first time, it opens the "All files access" page:
@@ -67,7 +67,7 @@ controller's sticks as touches), makes a signing key at
 install's `mercs2.ico` into the launcher icons under `android\target\res`
 (pass `-Install <folder>` or set `M2_INSTALL` when the game is not in the
 default EA Games folder; without it the placeholder in `res\` is kept), and builds
-`android\target\release\apk\Mercenaries2Alpha.apk`.
+`android\target\release\apk\Mercenaries2Beta.apk`.
 
 `android\` is its own Cargo workspace so the desktop builds and CI never
 compile it. Its library is `crates\m2-alpha\src\main.rs`; the Android entry

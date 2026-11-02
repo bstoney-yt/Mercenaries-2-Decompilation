@@ -1,4 +1,4 @@
-# Builds the Android APK (arm64) of the alpha: android\target\release\apk\Mercenaries2Alpha.apk.
+# Builds the Android APK (arm64) of the beta: android\target\release\apk\Mercenaries2Beta.apk.
 #
 # Needs (see README.md): ANDROID_HOME (an SDK with a platform and build-tools),
 # ANDROID_NDK_ROOT (an NDK), a JDK's keytool on PATH or under JAVA_HOME,
@@ -59,7 +59,7 @@ if (-not (Test-Path $keystore)) {
     New-Item -ItemType Directory -Force (Split-Path $keystore) | Out-Null
     $keytool = if ($env:JAVA_HOME) { Join-Path $env:JAVA_HOME 'bin\keytool.exe' } else { 'keytool' }
     & $keytool -genkeypair -keystore $keystore -storepass android -keypass android -alias m2alpha `
-        -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=Mercenaries 2 Alpha' | Out-Null
+        -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=Mercenaries 2 Beta' | Out-Null
 }
 $env:CARGO_APK_RELEASE_KEYSTORE = $keystore
 $env:CARGO_APK_RELEASE_KEYSTORE_PASSWORD = 'android'
@@ -105,4 +105,4 @@ try {
     Invoke-Tool { cargo apk build --release }
     if ($LASTEXITCODE -ne 0) { throw "cargo apk build failed ($LASTEXITCODE)" }
 } finally { Pop-Location }
-Get-Item (Join-Path $here 'target\release\apk\Mercenaries2Alpha.apk')
+Get-Item (Join-Path $here 'target\release\apk\Mercenaries2Beta.apk')
