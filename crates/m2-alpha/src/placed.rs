@@ -38,9 +38,9 @@ const LEFT_APART: f32 = 0.7;
 /// (invented: its `Vehicle Entrance (_Default)` gives a hardpoint, no
 /// reach).
 pub const MAN_REACH: f32 = 2.0;
-/// Manning one, she stands this far behind its pivot, metres (invented:
-/// its entrance hardpoint isn't read yet; playtest 4 had her fire it from
-/// wherever she stood, beside it).
+/// Manning one without seat data, she stands this far behind its pivot,
+/// metres (invented; every `Emplaced` template has seat data, and she
+/// stands at its seat's hardpoint, [`seat_points`]).
 pub const MAN_BEHIND: f32 = 0.8;
 
 /// Where she stands to man a gun turning about `pivot`, facing `facing`
