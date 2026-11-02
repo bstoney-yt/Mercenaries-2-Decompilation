@@ -2223,6 +2223,9 @@ const SHORE_RINGS: [f32; 6] = [3.0, 6.0, 12.0, 24.0, 48.0, 96.0];
 const SHORE_WAYS: usize = 16;
 /// How far over the water the shore's ground is looked down for, metres.
 const SHORE_LOOK_HIGH: f32 = 30.0;
+/// How far over a swimmer's origin the way to a shore is looked along,
+/// metres: about his chest, over the water (invented).
+const SHORE_CLEAR_UP: f32 = 0.6;
 
 /// How deep the water at `water` is over the ground under `at`, metres
 /// (infinite with no ground under), and the ground's height.
@@ -2237,12 +2240,20 @@ fn depth_under(physics: &Physics, at: Vec3, water: f32) -> (f32, Option<f32>) {
 /// The nearest point to `at` where the water is shallow enough to stand
 /// in (under [`crate::player::SWIM_STOP`], or dry ground), looking out
 /// ring by ring ([`SHORE_RINGS`]); within a ring, the first found going
-/// round from +z. `None` if there is none within the last ring.
+/// round from +z, of those with nothing in the way at the swimmer's
+/// chest short of the last metre (by the first contract's river, one
+/// aimed through a bank's rocks swam 0.5 m/s against them). `None` if
+/// there is none within the last ring.
 fn shore(physics: &Physics, at: Vec3) -> Option<Vec3> {
     SHORE_RINGS.iter().find_map(|&r| {
         (0..SHORE_WAYS).find_map(|k| {
             let a = k as f32 / SHORE_WAYS as f32 * std::f32::consts::TAU;
-            let p = at + Vec3::new(a.sin(), 0.0, a.cos()) * r;
+            let way = Vec3::new(a.sin(), 0.0, a.cos());
+            let p = at + way * r;
+            let chest = at + Vec3::Y * SHORE_CLEAR_UP;
+            if physics.cast_ray(chest, way, (r - 1.0).max(0.1)).is_some() {
+                return None;
+            }
             // Looked down on from well above (a bank higher than the
             // water).
             let shallow = physics.water_at(p.x, p.z).is_none_or(|w| {
