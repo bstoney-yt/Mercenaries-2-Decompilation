@@ -203,6 +203,10 @@ pub struct Game {
     /// The vehicle she last got into: the use key sticks to its entrances
     /// ([`entrance_pick`]).
     pub last_vehicle: Option<usize>,
+    /// The island's ladders ([`crate::ladders`]).
+    pub ladders: crate::ladders::Ladders,
+    /// The ladder she is on.
+    pub climb: Option<crate::ladders::Climbing>,
     /// The vehicle the use key seated her in and her seat's `SeatLink`
     /// name ([`crate::ride`]); while she rides any other, or none is
     /// given, she sits at the wheel.
@@ -412,6 +416,8 @@ impl Game {
             hijack_only: HashSet::new(),
             unusable: HashSet::new(),
             last_vehicle: None,
+            ladders: Default::default(),
+            climb: None,
             ride: None,
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
@@ -975,7 +981,32 @@ impl Game {
                         None => eprintln!("seat: no free seat linked to hers"),
                     }
                 }
-                if intent.use_pressed {
+                // On a ladder the climb takes the stick, and the use and
+                // jump keys let go.
+                let climbing = self.climb.is_some();
+                if let Some(c) = self.climb.as_mut() {
+                    let let_go = intent.use_pressed || intent.jump;
+                    let floor = crate::ladders::floor_under(
+                        physics,
+                        c.climb.feet(&c.moves),
+                        c.climb.floor_probe(),
+                    );
+                    match c.tick(intent.movement.y, let_go, floor, dt) {
+                        Some(off) => {
+                            let (m2_engine::ladder::Off::Stepped(at)
+                            | m2_engine::ladder::Off::LetGo(at)) = off;
+                            eprintln!("ladder: she gets off at rung {} ({off:?})", c.climb.rung);
+                            // Where the clip leaves her, or where she let
+                            // go: her body stands or falls from there.
+                            player.ladder = None;
+                            player.character.position = at;
+                            player.character.velocity = Vec3::ZERO;
+                            self.climb = None;
+                        }
+                        None => player.ladder = Some(c.pose()),
+                    }
+                }
+                if intent.use_pressed && !climbing {
                     // The emplaced gun she would man, if nothing nearer
                     // takes the key.
                     let manning = (player.driving.is_none()
@@ -1045,13 +1076,52 @@ impl Game {
                             self.combat.manned = Some(m);
                         }
                         None => {
+                            let ends = self.ladders.gathered(
+                                &world.index,
+                                &world.destroyed,
+                                scene.source.as_mut(),
+                                player.character.position,
+                                player.eye(),
+                                player.camera_forward(),
+                            );
                             let picked = entrance_pick(
                                 physics,
                                 &scene.vehicles,
                                 (&self.hijack_only, &self.unusable),
                                 player,
                                 self.last_vehicle,
+                                &ends,
                             );
+                            // A ladder's end, nearer than any vehicle's
+                            // entrance.
+                            let reach = picked
+                                .and_then(|(i, _)| i.checked_sub(LADDER))
+                                .and_then(|j| ends.get(j).copied());
+                            let picked = picked.filter(|&(i, _)| i < LADDER);
+                            if let Some(r) = reach {
+                                let c = crate::ladders::Climbing::start(
+                                    r,
+                                    crate::ladders::moves(player),
+                                );
+                                eprintln!(
+                                    "ladder: she gets on {} at the {} of object {} ({:.1} m, \
+                                     {} rungs, from rung {})",
+                                    world
+                                        .index
+                                        .template_db
+                                        .names
+                                        .get(&world.index.objects[r.object].template)
+                                        .map_or("?", String::as_str),
+                                    if r.top { "top" } else { "bottom" },
+                                    r.object,
+                                    r.ladder.length(),
+                                    r.ladder.rungs(&c.moves),
+                                    c.climb.rung
+                                );
+                                player.off_foot();
+                                player.ladder = Some(c.pose());
+                                self.climb = Some(c);
+                            }
                             let db = &world.index.template_db;
                             // The seat the entrance gives her.
                             let boarding = picked.and_then(|(i, entrance)| {
@@ -2188,6 +2258,7 @@ impl Game {
                 (&self.hijack_only, &self.unusable),
                 p,
                 self.last_vehicle,
+                &[],
             )
             .map(|(i, _)| {
                 let spec = &self.scene.vehicles[i].spec;
@@ -3991,6 +4062,9 @@ fn can_sit_in(kind: &str) -> bool {
     kind != "trailer"
 }
 
+/// Where [`entrance_pick`] numbers the ladder ends it picks from.
+const LADDER: usize = usize::MAX / 2;
+
 /// The vehicle she gets into at a press of the use key, and the entrance
 /// she gets in by (`None` for a vehicle without entrance data), as the 360
 /// does ([`m2_engine::seats`]): of the entrances in front of the camera
@@ -3998,12 +4072,17 @@ fn can_sit_in(kind: &str) -> bool {
 /// `last`, the vehicle she last got into. A vehicle without entrance
 /// data is reached at its door marker (or hull) within [`REACH`]
 /// (Invented stand-in, the beta's rule).
+///
+/// The ladder ends gathered (`ladders`) are in the same list after the
+/// vehicles' entrances (0x82440F30 gathers both): one picked is
+/// [`LADDER`] + its index.
 fn entrance_pick(
     physics: &Physics,
     vehicles: &[ParkedVehicle],
     rules: (&HashSet<u32>, &HashSet<u32>),
     player: &Player,
     last: Option<usize>,
+    ladders: &[crate::ladders::Reach],
 ) -> Option<(usize, Option<u32>)> {
     use m2_engine::seats::{self, Candidate};
     let her = player.character.position;
@@ -4044,6 +4123,16 @@ fn entrance_pick(
                 found.push((c, Some(e.name)));
             }
         }
+    }
+    for (j, r) in ladders.iter().enumerate() {
+        let c = Candidate {
+            vehicle: LADDER + j,
+            distance_sq: r.distance_sq,
+            use_distance: r.use_distance,
+            upright: true,
+            offered: true,
+        };
+        found.push((c, None));
     }
     found.truncate(seats::LIST_CAP);
     let cands: Vec<Candidate> = found.iter().map(|(c, _)| *c).collect();

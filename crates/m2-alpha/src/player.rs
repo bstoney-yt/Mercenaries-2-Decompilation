@@ -156,6 +156,18 @@ const LAND_WAIT: u16 = 600;
 const LAND_ABOVE: f32 = 2.0;
 const LAND_REACH: f32 = 60.0;
 
+/// How a climb holds her on a ladder this tick ([`crate::ladders`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LadderPose {
+    pub feet: Vec3,
+    /// Radians, 0 along +Z.
+    pub facing: f32,
+    /// The clip she plays, by hash.
+    pub clip: u32,
+    /// Counts the climb's steps: a new one starts its clip again.
+    pub step: u32,
+}
+
 /// What the player asks for this tick.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Intent {
@@ -301,6 +313,11 @@ pub struct Player {
     /// stands there).
     pub floor_landed: bool,
     pub model: Option<(GpuModel, Rig)>,
+    /// On a ladder: where the climb holds her and what she plays
+    /// ([`crate::ladders`]).
+    pub ladder: Option<LadderPose>,
+    /// The ladder pose whose clip she last started (its `step`).
+    ladder_step: Option<u32>,
     /// The vehicle she is driving (index into the scene's vehicles).
     pub driving: Option<usize>,
     /// Aiming: she faces the camera's way with the rifle shouldered.
@@ -485,6 +502,8 @@ impl Player {
             floor_landed: false,
             models_coming: false,
             model,
+            ladder: None,
+            ladder_step: None,
             driving: None,
             aiming: false,
             lens: 1.0,
@@ -749,10 +768,37 @@ impl Player {
         true
     }
 
+    /// Held on a ladder for a tick of `dt` seconds: her feet where the
+    /// climb puts them, facing it, playing its clip from the start each
+    /// new step (the clip's root carries her up or down the rest).
+    fn hang(&mut self, l: LadderPose, dt: f32) {
+        self.character.position = l.feet;
+        self.character.velocity = Vec3::ZERO;
+        self.facing = l.facing;
+        self.landed = true;
+        self.leap = Leap::No;
+        let fresh = self.ladder_step != Some(l.step);
+        self.ladder_step = Some(l.step);
+        if let Some((_, rig)) = &mut self.model {
+            if fresh && let Some(k) = rig.clips.iter().position(|c| c.hash == l.clip) {
+                rig.animator.set_upper(None);
+                rig.animator.play_once(k);
+                rig.animator.seek(0.0);
+            }
+            rig.advance(dt);
+        }
+    }
+
     /// One fixed tick of `dt` seconds.
     pub fn update(&mut self, physics: &Physics, intent: Intent, dt: f32) {
         self.yaw += intent.look.x;
         self.pitch = (self.pitch + intent.look.y).clamp(-1.2, 0.9);
+
+        if let Some(l) = self.ladder {
+            self.hang(l, dt);
+            self.camera(physics);
+            return;
+        }
 
         if !self.landed {
             // Wait for the ground and whatever stands on it, then stand on

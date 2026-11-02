@@ -24,6 +24,7 @@ pub mod durability;
 pub mod grapple;
 pub mod gun_sounds;
 pub mod hijack;
+pub mod ladder;
 pub mod lights;
 pub mod model;
 pub mod motion;

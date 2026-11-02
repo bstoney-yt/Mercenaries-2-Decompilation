@@ -336,6 +336,32 @@ impl Rifle {
 /// passenger, or a gunner whose seat has none).
 pub const NO_GUN: usize = usize::MAX;
 
+/// A gunner's wait after a round `gap` seconds from the last, and the
+/// rounds then left in his burst (`left` before it), as soldiers fire
+/// ([`m2_engine::weapons::FireHint`]): bursts of its length, the pause
+/// after each. Without a hint, round after round.
+fn gunner_burst(
+    hint: Option<m2_engine::weapons::FireHint>,
+    gap: f32,
+    close: bool,
+    left: u32,
+) -> (f32, u32) {
+    let Some(h) = hint else {
+        return (gap, 0);
+    };
+    let left = if left == 0 {
+        h.rounds(gap, close)
+    } else {
+        left
+    } - 1;
+    let wait = if left == 0 {
+        gap + h.burst(close).1
+    } else {
+        gap
+    };
+    (wait, left)
+}
+
 /// The seats of vehicle `v` whose riders fire something, the driver's
 /// first.
 pub fn armed_seats(v: &ParkedVehicle) -> Vec<u32> {
@@ -394,10 +420,9 @@ const TANK_MG_GAP: f32 = 60.0 / 450.0;
 const MG_DAMAGE: f32 = 45.0;
 const MG_RANGE: f32 = 500.0;
 
-/// How far gunners riding with her shoot, metres, and how far off they
-/// aim, as a share of the distance (both invented).
+/// How far gunners riding with her shoot when their weapon gives no
+/// `WeaponHint` range, metres (invented).
 const GUNNER_RANGE: f32 = 120.0;
-const GUNNER_SPREAD: f32 = 0.02;
 /// Gunfire puts soldiers this close on alert and sends civilians running.
 const ALERT_RANGE: f32 = 60.0;
 const PANIC_RANGE: f32 = 40.0;
@@ -1617,6 +1642,10 @@ pub struct Combat {
     /// Seconds until each gunner riding with her fires again
     /// ([`Combat::gunners_fire`]).
     gunner_wait: Vec<f32>,
+    /// Rounds left in each such gunner's burst.
+    gunner_burst: Vec<u32>,
+    /// Rounds those gunners have fired, all told (logged by checks).
+    pub gunner_rounds: u32,
     seed: u64,
     /// What she has fired, for the HUD's ammo counters.
     pub fired: Fired,
@@ -1852,6 +1881,8 @@ impl Default for Combat {
             vehicle_gun: 0,
             ripple: 0,
             gunner_wait: Vec::new(),
+            gunner_burst: Vec::new(),
+            gunner_rounds: 0,
             seed: 0x2545_f491_4f6c_dd1d,
             fired: Fired::default(),
             shots: std::collections::BTreeMap::new(),
@@ -3805,51 +3836,104 @@ impl Combat {
 
     /// Those riding with her in vehicle `i`'s gunner seats (friendly
     /// soldiers she called in with the horn: [`People::man_guns`], one to a
-    /// seat with a gun, after the driver's) fire their seat's first weapon
-    /// at the nearest of those fighting her within [`GUNNER_RANGE`], each at
-    /// its weapon's rate ([`m2_engine::weapons::WeaponSpec::gap`]) and
-    /// [`GUNNER_SPREAD`] off (both invented: the text says only that they
-    /// get in, "Get in the gunner's seat").
+    /// seat with a gun, after the driver's) work their seat's turret as she
+    /// would from it: each turns the turret its seat names
+    /// (`ControllerTurret`, [`m2_engine::vehicle::Aimer`]) toward the
+    /// nearest of those fighting her within its first weapon's
+    /// `WeaponHint` range, at the turret's speeds and within its arc, and
+    /// fires once the gun is laid on him, in the bursts its `WeaponHint`
+    /// gives soldiers ([`gunner_burst`]), each round strayed in the
+    /// weapon's `ScatterMin` cone.
+    ///
+    /// Provenance: from the 360 code, an AI rider's attack behaviour
+    /// (`TurretAttack`, 0x822B7C10, registered by name at 0x822B5638) is
+    /// the soldiers' own attack (0x822C95D8, then 0x822C2678): it gives
+    /// the rider a target, and the seat's turret is what turns to it, as
+    /// for her. Inferred: that the turret then turns at its record's
+    /// speeds within its arc, and that the attack fires once laid
+    /// ([`LAID`], the alpha's own). Without a weapon hint, [`GUNNER_RANGE`]
+    /// (invented).
     fn gunners_fire(&mut self, f: &mut Field<'_>, dt: f32) {
-        let Some(v) = f
-            .player
-            .driving
-            .and_then(|i| f.vehicles.get(i).map(|v| (i, v)))
-        else {
+        let Some(i) = f.player.driving.filter(|&i| i < f.vehicles.len()) else {
             self.gunner_wait.clear();
+            self.gunner_burst.clear();
             return;
         };
-        let (i, v) = v;
-        let riders = f
-            .people
-            .gunners()
-            .min(armed_seats(v).len().saturating_sub(1));
+        let seats = armed_seats(&f.vehicles[i]);
+        let riders = f.people.gunners().min(seats.len().saturating_sub(1));
         self.gunner_wait.resize(riders, 0.0);
-        let Some(body) = v.id.and_then(|id| f.physics.vehicle_transform(id)) else {
+        self.gunner_burst.resize(riders, 0);
+        let Some(body) = f.vehicles[i]
+            .id
+            .and_then(|id| f.physics.vehicle_transform(id))
+        else {
             return;
         };
         let centre = body.transform_point3(Vec3::ZERO);
-        let target = f
+        let foes: Vec<Vec3> = f
             .people
             .npcs
             .iter()
-            .filter(|n| n.alive && n.soldier)
+            .filter(|n| n.alive && n.faction.is_some_and(|x| f.people.fights_for(x)))
             .map(|n| n.character.position + Vec3::Y * 1.2)
-            .filter(|p| p.distance(centre) <= GUNNER_RANGE)
-            .min_by(|a, b| a.distance(centre).total_cmp(&b.distance(centre)));
+            .collect();
         for k in 0..riders {
             self.gunner_wait[k] -= dt;
             let seat = k + 1;
-            if self.gunner_wait[k] > 0.0 || seat == self.seat {
+            if seat == self.seat {
                 continue;
             }
-            let Some(at) = target else {
+            let v = &mut f.vehicles[i];
+            let Some(m) = v
+                .spec
+                .armed
+                .iter()
+                .find(|m| m.seat == seats[seat] && m.priority == 0)
+            else {
                 continue;
             };
-            let off = at.distance(centre) * GUNNER_SPREAD;
-            let aim = at + Vec3::new(self.random(), self.random(), self.random()) * 2.0 * off;
-            if let Some(gap) = self.fire_mount(f, i, seat, 0, Some(aim)) {
-                self.gunner_wait[k] = gap;
+            let hint = m.weapon.hint;
+            let (near, far) = hint.map_or((0.0, GUNNER_RANGE), |h| (h.min_range, h.range));
+            let cone = m.weapon.feel.cone(0.0);
+            let gap = m.weapon.gap();
+            let Some(at) = foes
+                .iter()
+                .copied()
+                .filter(|p| (near..=far).contains(&p.distance(centre)))
+                .min_by(|a, b| a.distance(centre).total_cmp(&b.distance(centre)))
+            else {
+                continue;
+            };
+            // Her seat's turret, turned toward him at its pace.
+            let laid = match v.spec.aimer_of_seat(seats[seat]) {
+                Some(a) => {
+                    v.aims.resize(v.spec.aimers.len(), (0.0, 0.0));
+                    let want = v.spec.aim_toward(a, body, v.turret, at);
+                    let now = v.spec.aimers[a].step(v.aims[a], want, dt);
+                    v.aims[a] = now;
+                    (now.0 - want.0).abs() <= LAID && (now.1 - want.1).abs() <= LAID
+                }
+                None => true,
+            };
+            if !laid || self.gunner_wait[k] > 0.0 {
+                continue;
+            }
+            let to = at - centre;
+            let dir = m2_engine::weapons::stray_in_cone(
+                to.normalize_or(Vec3::Z),
+                cone,
+                self.random(),
+                self.random(),
+            );
+            let close = to.length() < m2_engine::weapons::FireHint::CLOSE;
+            if self
+                .fire_mount(f, i, seat, 0, Some(centre + dir * to.length()))
+                .is_some()
+            {
+                let (wait, burst) = gunner_burst(hint, gap, close, self.gunner_burst[k]);
+                self.gunner_wait[k] = wait;
+                self.gunner_burst[k] = burst;
+                self.gunner_rounds += 1;
             }
         }
     }
@@ -7004,5 +7088,74 @@ mod tests {
         assert_eq!(combat.grenades, 0);
         assert_eq!(combat.weapon, Weapon::Rifle);
         assert!(combat.second.is_none());
+    }
+
+    #[test]
+    fn gunners_fire_their_weapons_bursts() {
+        // The carbine's hint: 0.3 s bursts, 4.5 s pauses; 562 a minute.
+        let hint = m2_engine::weapons::FireHint {
+            min_range: 1.0,
+            range: 70.0,
+            angle: 0,
+            on: 0.3,
+            off: 4.5,
+            on_close: -1.0,
+            off_close: 0.75,
+            against: [3, 1, 0, 0],
+        };
+        let gap = 60.0 / 562.0;
+        let mut left = 0;
+        let mut waits = Vec::new();
+        for _ in 0..4 {
+            let (w, l) = gunner_burst(Some(hint), gap, false, left);
+            waits.push(w);
+            left = l;
+        }
+        // Three rounds a burst, then the pause.
+        assert!((waits[0] - gap).abs() < 1e-6 && (waits[1] - gap).abs() < 1e-6);
+        assert!((waits[2] - (gap + 4.5)).abs() < 1e-5);
+        assert!((waits[3] - gap).abs() < 1e-6);
+        assert_eq!(gunner_burst(None, gap, false, 0), (gap, 0));
+    }
+
+    #[test]
+    fn a_gunners_pintle_turns_at_its_pace_and_stops_at_its_arc() {
+        use m2_engine::seats::TurretRecord;
+        // The M151's pintle: +-70 degrees at 100 a second.
+        let aimer = m2_engine::vehicle::Aimer {
+            record: TurretRecord {
+                name: 1,
+                bone_yaw: Some(2),
+                bone_pitch: None,
+                yaw: (-70f32.to_radians(), 70f32.to_radians()),
+                yaw_speed: 100f32.to_radians(),
+                pitch: (-0.3, 0.6),
+                pitch_speed: 1.0,
+            },
+            yaw_nodes: Vec::new(),
+            pitch_nodes: Vec::new(),
+            yaw_pivot: None,
+            pitch_pivot: None,
+        };
+        let dt = 1.0 / 60.0;
+        let laid = |aim: (f32, f32), want: (f32, f32)| {
+            (aim.0 - want.0).abs() <= LAID && (aim.1 - want.1).abs() <= LAID
+        };
+        // A foe 60 degrees off: laid after 0.6 s, not before.
+        let want = (60f32.to_radians(), 0.0);
+        let mut aim = (0.0, 0.0);
+        let mut t = 0.0;
+        while !laid(aim, want) {
+            aim = aimer.step(aim, want, dt);
+            t += dt;
+        }
+        assert!((0.55..0.65).contains(&t), "{t}");
+        // One behind: the gun stops at its arc and never fires.
+        let want = (170f32.to_radians(), 0.0);
+        for _ in 0..300 {
+            aim = aimer.step(aim, want, dt);
+            assert!(!laid(aim, want));
+        }
+        assert!((aim.0 - 70f32.to_radians()).abs() < 1e-5);
     }
 }

@@ -67,6 +67,7 @@ mod hijack;
 mod input;
 mod jobs;
 mod keytable;
+mod ladders;
 mod loading;
 mod mission;
 mod movie;
@@ -394,6 +395,12 @@ struct Options {
     /// door and get in and out with the use key, logging the entrance,
     /// seat and exit the rules give.
     board: bool,
+    /// With `--screenshot --drive`: walk to the nearest placed ladder and
+    /// climb it with the use key and the stick, logging each rung
+    /// (`ladder-check:` lines): up and off the top, back on and down, for
+    /// 0; for more, held up that many seconds and left on it for the
+    /// picture.
+    ladder_check: Option<f32>,
     /// With `--board`: the entrance she stands at, by name or hash
     /// (`entrance_driver`, `8efe45f3`); else the front right one.
     entrance: Option<u32>,
@@ -720,6 +727,13 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--seated" => o.seated = true,
             "--board" => o.board = true,
+            "--ladder-check" => {
+                o.ladder_check = Some(
+                    value()?
+                        .parse::<f32>()
+                        .context("--ladder-check expects seconds")?,
+                );
+            }
             "--entrance" => {
                 let v = value()?;
                 o.entrance = Some(
@@ -5831,6 +5845,10 @@ fn drive_for_screenshot(
     if options.board {
         return board_for_check(game, options, tick);
     }
+    if let Some(hold) = options.ladder_check {
+        ladder_check(game, hold, tick);
+        return Ok(());
+    }
     let entered = match &options.vehicle {
         Some(want) => {
             let here = game.focus();
@@ -6572,6 +6590,152 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 
 /// With `--fuel-check`: out of the wreck she drove, to the pickups its
 /// death left, and logs what each gave (`fuel-check:` lines).
+/// `--ladder-check`: she walks to the nearest placed ladder's bottom and
+/// climbs it with the use key and the stick, through the game's tick,
+/// logging each rung. `hold` 0: up and off the top, then back on there
+/// and down; else held up `hold` seconds and left on it.
+fn ladder_check(game: &mut Game, hold: f32, tick: f32) {
+    use m2_math::glam::{Vec2, Vec3};
+    let here = game.focus();
+    let Some(world) = game.scene.world.as_ref() else {
+        return;
+    };
+    let found = game
+        .ladders
+        .nearest(&world.index, game.scene.source.as_mut(), here);
+    let Some((object, ladder, place)) = found else {
+        eprintln!("ladder-check: no ladder near {here:.0}");
+        return;
+    };
+    let name = world
+        .index
+        .template_db
+        .names
+        .get(&world.index.objects[object].template)
+        .cloned()
+        .unwrap_or_default();
+    eprintln!(
+        "ladder-check: {name} (object {object}) {:.0} m away: bottom {:.2} top {:.2} ({:.2} m), facing {:.2}",
+        place.distance(here),
+        ladder.bottom,
+        ladder.top,
+        ladder.length(),
+        ladder.facing
+    );
+    let face = |p: &mut crate::player::Player, f: Vec3| {
+        p.yaw = f.x.atan2(f.z);
+        p.pitch = 0.0;
+        p.facing = p.yaw;
+    };
+    if let Some(p) = game.scene.player.as_mut() {
+        p.drop_at(place - ladder.facing * 0.9 + Vec3::Y);
+        face(p, ladder.facing);
+    }
+    let settle = |game: &mut Game| {
+        for _ in 0..600 {
+            if game.scene.player.as_ref().is_some_and(|p| p.landed) {
+                break;
+            }
+            game.step(Intent::default(), tick);
+        }
+        for _ in 0..90 {
+            game.step(Intent::default(), tick);
+        }
+    };
+    settle(game);
+    let feet = |game: &Game| {
+        game.scene
+            .player
+            .as_ref()
+            .map_or(Vec3::ZERO, |p| p.character.position)
+    };
+    eprintln!(
+        "ladder-check: she stands at {:.2}, {:.2} m from the entrance",
+        feet(game),
+        feet(game).distance(place)
+    );
+    let use_key = Intent {
+        use_pressed: true,
+        ..Intent::default()
+    };
+    // Climbs with the stick at `stick` until she is off (or `limit` s).
+    let climb = |game: &mut Game, stick: f32, limit: f32| {
+        let push = Intent {
+            movement: Vec2::new(0.0, stick),
+            ..Intent::default()
+        };
+        let (mut t, mut rung) = (0.0, None);
+        while t < limit && game.climb.is_some() {
+            game.step(push, tick);
+            t += tick;
+            let now = game.climb.map(|c| c.climb.rung);
+            if now.is_some() && now != rung {
+                rung = now;
+                eprintln!(
+                    "ladder-check: {t:5.2} s rung {} feet y {:.2}",
+                    now.unwrap_or(0),
+                    feet(game).y
+                );
+            }
+        }
+        t
+    };
+    game.step(use_key, tick);
+    if game.climb.is_none() {
+        eprintln!("ladder-check: the use key didn't put her on it");
+        return;
+    }
+    if hold > 0.0 {
+        climb(game, 1.0, hold);
+        eprintln!("ladder-check: left on it at {:.2}", feet(game));
+        return;
+    }
+    let t = climb(game, 1.0, 120.0);
+    // What she may stand on round the top: floor heights down from 2 m
+    // over it, along the facing (-1.5..1.5 m) and across.
+    if let Some(w) = game.scene.world.as_ref() {
+        let side = Vec3::Y.cross(ladder.facing);
+        let probe: Vec<String> = [-1.5f32, -0.75, 0.0, 0.42, 0.75, 1.5]
+            .iter()
+            .flat_map(|&a| [-0.75f32, 0.0, 0.75].map(|s| (a, s)))
+            .map(|(a, s)| {
+                let from = ladder.top + ladder.facing * a + side * s + Vec3::Y * 2.0;
+                let hit = w.physics.cast_ray(from, -Vec3::Y, 6.0);
+                format!(
+                    "({a:+.2},{s:+.2}):{}",
+                    hit.map_or("-".into(), |(d, _)| format!(
+                        "{:+.2}",
+                        from.y - d - ladder.top.y
+                    ))
+                )
+            })
+            .collect();
+        eprintln!("ladder-check: floors round the top {}", probe.join(" "));
+    }
+    settle(game);
+    let top = feet(game);
+    eprintln!(
+        "ladder-check: off the top after {t:.2} s, standing at {top:.2} ({:+.2} m from the top end)",
+        top.y - ladder.top.y
+    );
+    // Back on from the top, facing the ladder's end behind her.
+    if let Some(p) = game.scene.player.as_mut() {
+        face(p, -ladder.facing);
+    }
+    game.step(use_key, tick);
+    if game.climb.is_none() {
+        eprintln!("ladder-check: the use key didn't put her on it at the top");
+        return;
+    }
+    let t = climb(game, -1.0, 120.0);
+    settle(game);
+    let bottom = feet(game);
+    eprintln!(
+        "ladder-check: off the bottom after {t:.2} s, standing at {bottom:.2} ({:+.2} m from the bottom end)",
+        bottom.y - ladder.bottom.y
+    );
+}
+
 fn fuel_check(game: &mut Game, tick: f32) {
     let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
         eprintln!("fuel-check: not driving");
