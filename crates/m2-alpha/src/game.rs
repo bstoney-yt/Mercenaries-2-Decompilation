@@ -1259,7 +1259,7 @@ impl Game {
         if let Some(world) = &mut self.scene.world {
             for v in &self.scene.vehicles {
                 if let (Some(id), Some(Some(shape))) = (v.id, self.bed_shapes.get(&v.spec.model)) {
-                    world.physics.add_bed(id, shape, Props::bed_friction());
+                    world.physics.add_bed(id, shape);
                 }
             }
         }

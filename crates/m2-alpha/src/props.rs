@@ -28,14 +28,6 @@ use m2_engine::{
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{DrawQueue, RenderBackend};
 
-/// How hard goods riding a load bed hold on to it, and the bed to them:
-/// the friction they slide off by as the vehicle turns, brakes and hits.
-/// From samples: every `PHY2` body of OilCon020's crates and guns
-/// (models 2a47d96b, a250fa25) and of the El Grande (720f3948) has 0.3 in
-/// its first unread float ([`m2_assets::physics::Body::unk`]), read here
-/// as its Havok friction; the 360 code that reads it isn't traced.
-const CARGO_FRICTION: f32 = 0.3;
-
 /// What a prop riding a load bed weighs when neither its `PHY2` nor its
 /// template says, kg (invented, as [`m2_engine::durability`]'s light
 /// prop).
@@ -600,7 +592,12 @@ impl Props {
             .or_else(|| self.physics_props.get(&p.template).map(|t| t.kg()))
             .unwrap_or(CARGO_KG);
         let half = ((hi - lo) * 0.5).max(Vec3::splat(0.05));
-        let piece = m2_engine::LoosePiece::block(None, (lo + hi) * 0.5, half, kg);
+        let mut piece = m2_engine::LoosePiece::block(None, (lo + hi) * 0.5, half, kg);
+        // It slides as its own `PHY2` body does (friction 0.3 on
+        // OilCon020's guns and crates, models a250fa25 and 2a47d96b).
+        if let Some(m) = collision.material {
+            piece.material = m;
+        }
         let mut at = Mat4::from_rotation_translation(p.rotation, p.position);
         if let (Some(bed), Some(place)) = (bed, physics.vehicle_transform(id)) {
             let local = place.inverse() * at;
@@ -613,7 +610,7 @@ impl Props {
         }
         let velocity = physics.vehicle_velocity(id);
         physics.remove_static(StaticKey::Entity(entity));
-        let piece = physics.add_cargo(&piece, at, velocity, CARGO_FRICTION);
+        let piece = physics.add_cargo(&piece, at, velocity);
         self.cargo.insert(
             entity,
             Riding {
@@ -640,11 +637,6 @@ impl Props {
                 physics.move_debris(r.piece, moved * at);
             }
         }
-    }
-
-    /// The friction a vehicle's bed holds its goods by ([`CARGO_FRICTION`]).
-    pub fn bed_friction() -> f32 {
-        CARGO_FRICTION
     }
 
     /// Whether anything is still aboard vehicle `index`.

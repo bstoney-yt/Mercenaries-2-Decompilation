@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use m2_assets::Model;
 use m2_assets::model::GeometryKind;
-use m2_assets::physics::Physics as Phy2;
+use m2_assets::physics::{Body, Physics as Phy2};
 use m2_assets::vertex::DeclUsage;
 use m2_math::glam::{Mat4, Quat, Vec3};
 use rapier3d::control::{
@@ -85,6 +85,9 @@ pub struct CollisionShape {
     /// (`_PropPhysics`: a café chair, a planter), whose mass it is given
     /// ([`Loose::weighing`]).
     pub whole: Option<Arc<Loose>>,
+    /// How it slides and bounces: [`BodyMaterial::of`] its `PHY2`'s first
+    /// body that moves, else its first; `None` without a body.
+    pub material: Option<BodyMaterial>,
     /// What its triangles are made of ([`crate::surface`]): runs of
     /// (first triangle, surface name hash) in triangle order; empty when
     /// nothing says (surface 0).
@@ -148,6 +151,73 @@ impl fmt::Debug for Loose {
     }
 }
 
+/// How a `PHY2` body slides, bounces and slows: what the game gives the
+/// Havok body it makes of one.
+///
+/// From the 360 code: the body builder (0x8216A290) starts from Havok's
+/// rigid-body defaults (0x82621820: no linear damping, 0.05 angular, 0.5
+/// friction, 0.4 restitution, 200 m/s and 200 rad/s at most), then sets
+/// the record's friction, no restitution, the record's angular damping
+/// but [`MIN_ANGULAR_DAMPING`] at least, and caps the speeds at
+/// [`MAX_LINEAR_SPEED`] and [`MAX_ANGULAR_SPEED`]; linear damping stays
+/// none. Havok mixes two bodies' friction as the square root of their
+/// product; Rapier's average gives the same for the equal values the
+/// samples have.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BodyMaterial {
+    pub friction: f32,
+    pub restitution: f32,
+    pub linear_damping: f32,
+    pub angular_damping: f32,
+}
+
+/// The least angular damping the game gives a `PHY2` body (0x8216A390,
+/// its constant 0x820B8034). From the 360 code.
+pub const MIN_ANGULAR_DAMPING: f32 = 0.8;
+/// The fastest a `PHY2` body moves and turns, m/s and radians a second
+/// (0x8216A400, its constants 0x820F9628 and 0x820F8CC4: 132 and 3π).
+/// From the 360 code.
+pub const MAX_LINEAR_SPEED: f32 = 132.0;
+pub const MAX_ANGULAR_SPEED: f32 = 3.0 * std::f32::consts::PI;
+
+impl BodyMaterial {
+    /// What the game makes of body record `body`.
+    pub fn of(body: &Body) -> Self {
+        let damping = body.angular_damping();
+        Self {
+            friction: body.friction(),
+            restitution: 0.0,
+            linear_damping: 0.0,
+            // As the game's compare: one not over the floor (NaN too) gets
+            // the floor.
+            angular_damping: if damping > MIN_ANGULAR_DAMPING {
+                damping
+            } else {
+                MIN_ANGULAR_DAMPING
+            },
+        }
+    }
+
+    /// What the game makes of the commonest record (0.3 throughout, on
+    /// 16,070 of `vz.wad`'s 16,088 bodies; from samples), for a piece
+    /// whose own body isn't known.
+    pub const COMMON: Self = Self {
+        friction: 0.3,
+        restitution: 0.0,
+        linear_damping: 0.0,
+        angular_damping: MIN_ANGULAR_DAMPING,
+    };
+
+    /// How a loose piece not made from a `PHY2` body (a gate's chunk)
+    /// slows in the air and slides. Invented.
+    const DEBRIS: Self = Self {
+        friction: 0.8,
+        restitution: 0.0,
+        linear_damping: 0.2,
+        angular_damping: 0.2,
+    };
+}
+
 /// One piece of a [`Loose`] prop: boxes round its `PHY2` shapes, in the
 /// space of the node it moves.
 #[derive(Clone)]
@@ -158,13 +228,16 @@ pub struct LoosePiece {
     shape: r::SharedShape,
     /// Kilograms.
     pub mass: f32,
+    /// How it slides and slows.
+    pub material: BodyMaterial,
     /// Model space to the node's space, at rest.
     from_model: Mat4,
 }
 
 impl LoosePiece {
     /// A box of half extents `half` about `centre` (model space), moving
-    /// node `node`, which sits at the model's origin at rest.
+    /// node `node`, which sits at the model's origin at rest; of the
+    /// commonest body ([`BodyMaterial::COMMON`]).
     pub fn block(node: Option<u16>, centre: Vec3, half: Vec3, mass: f32) -> Self {
         Self {
             node,
@@ -173,6 +246,7 @@ impl LoosePiece {
                 r::SharedShape::cuboid(half.x, half.y, half.z),
             )]),
             mass,
+            material: BodyMaterial::COMMON,
             from_model: Mat4::IDENTITY,
         }
     }
@@ -275,6 +349,7 @@ impl Loose {
                     node: Some(node),
                     shape: r::SharedShape::compound(boxes),
                     mass: loose_mass(p.bodies[b].mass),
+                    material: BodyMaterial::of(&p.bodies[b]),
                     from_model,
                 });
             }
@@ -296,6 +371,7 @@ impl Loose {
                     node: None,
                     shape: r::SharedShape::compound(boxes),
                     mass: loose_mass(moving.iter().map(|&b| loose_mass(p.bodies[b].mass)).sum()),
+                    material: BodyMaterial::of(&p.bodies[moving[0]]),
                     from_model: Mat4::IDENTITY,
                 });
             }
@@ -495,6 +571,7 @@ impl Breakup {
                     shape,
                 )]),
                 mass: loose_mass(8.0 * half.x * half.y * half.z * CHUNK_DENSITY),
+                material: BodyMaterial::DEBRIS,
                 from_model,
             });
         }
@@ -565,6 +642,7 @@ impl CollisionShape {
             stand_in: false,
             loose: None,
             whole: None,
+            material: None,
             surfaces: Arc::new([]),
         }
     }
@@ -606,6 +684,7 @@ impl CollisionShape {
             stand_in: false,
             loose: None,
             whole: None,
+            material: None,
             surfaces: runs.into(),
         })
     }
@@ -690,12 +769,16 @@ impl CollisionShape {
         let mut triangles = Vec::new();
         let mut surfaces = Vec::new();
         let mut loose = None;
+        let mut material = None;
         // Shapes of its own, whether or not any stands in the way: no
         // stand-in then.
         let mut shaped = false;
         if let Some(p) = phy2.and_then(|d| Phy2::parse(d).ok()) {
             if sub_object.is_none() {
                 loose = Loose::of(model, &p).map(Arc::new);
+            }
+            if let Some(b) = p.bodies.iter().find(|b| !b.is_fixed()).or(p.bodies.first()) {
+                material = Some(BodyMaterial::of(b));
             }
             shaped = !p.shapes.is_empty();
             let hidden = model
@@ -802,6 +885,7 @@ impl CollisionShape {
             stand_in,
             loose,
             whole,
+            material,
             ..shape
         })
     }
@@ -1904,9 +1988,6 @@ const MAX_DEBRIS: usize = 160;
 /// A loose piece this far down has fallen through the island (its ground
 /// streamed out) and is held.
 const DEBRIS_FLOOR: f32 = -500.0;
-/// How a loose piece slows in the air and slides, invented.
-const DEBRIS_DAMPING: f32 = 0.2;
-const DEBRIS_FRICTION: f32 = 0.8;
 
 impl fmt::Debug for Physics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1988,9 +2069,15 @@ impl Physics {
         rotation: Quat,
     ) {
         self.remove_static(key);
-        let collider = r::ColliderBuilder::new(shape.shape.clone())
-            .position(pose(position, rotation))
-            .build();
+        let mut collider =
+            r::ColliderBuilder::new(shape.shape.clone()).position(pose(position, rotation));
+        // A model's own fixed body is made as a moving one is (the 360
+        // body builder gives a body of no mass motion type 7, fixed, with
+        // the same friction and no bounce); one without keeps Rapier's.
+        if let Some(m) = shape.material {
+            collider = collider.friction(m.friction).restitution(m.restitution);
+        }
+        let collider = collider.build();
         let handle = self.world.insert_collider(collider, None);
         self.statics.insert(key, handle);
         self.keys.insert(handle, key);
@@ -2059,6 +2146,7 @@ impl Physics {
         }
         self.float_boats(dt);
         self.fly_helicopters(dt);
+        self.cap_debris_speeds();
         self.world.step();
         self.hold_ragdolls_together();
         self.settle_debris();
@@ -2233,6 +2321,27 @@ impl Physics {
         }
     }
 
+    /// Holds loose pieces to Havok's caps on a body's speeds, as the game
+    /// sets them ([`MAX_LINEAR_SPEED`], [`MAX_ANGULAR_SPEED`]), before
+    /// they move by them.
+    fn cap_debris_speeds(&mut self) {
+        for h in self.debris.iter().flatten() {
+            let Some(b) = self.world.bodies.get_mut(*h) else {
+                continue;
+            };
+            if !b.is_dynamic() {
+                continue;
+            }
+            let (v, w) = (vec3(b.linvel()), vec3(b.angvel()));
+            if v.length() > MAX_LINEAR_SPEED {
+                b.set_linvel(vector(v.clamp_length_max(MAX_LINEAR_SPEED)), true);
+            }
+            if w.length() > MAX_ANGULAR_SPEED {
+                b.set_angvel(vector(w.clamp_length_max(MAX_ANGULAR_SPEED)), true);
+            }
+        }
+    }
+
     /// Adds a loose piece where `at` (world space; scale ignored) puts it,
     /// flying at `velocity` (m/s) and turning at `spin` (radians a second
     /// about each axis).
@@ -2304,15 +2413,10 @@ impl Physics {
     /// As [`add_debris`](Self::add_debris), a piece of goods riding loose
     /// on a vehicle's load bed ([`CARGO`]): it lies on the bed's own shapes
     /// ([`add_bed`](Self::add_bed)) and slides, tips and falls off as the
-    /// vehicle turns, brakes and hits, held there by `friction` alone.
-    pub fn add_cargo(
-        &mut self,
-        piece: &LoosePiece,
-        at: Mat4,
-        velocity: Vec3,
-        friction: f32,
-    ) -> DebrisId {
-        let id = self.add_piece(
+    /// vehicle turns, brakes and hits, held there by friction alone (its
+    /// [`LoosePiece::material`] and the bed's).
+    pub fn add_cargo(&mut self, piece: &LoosePiece, at: Mat4, velocity: Vec3) -> DebrisId {
+        self.add_piece(
             piece,
             at,
             velocity,
@@ -2322,21 +2426,7 @@ impl Physics {
                 r::Group::ALL.difference(VEHICLE).difference(RUBBLE),
                 r::InteractionTestMode::And,
             ),
-        );
-        let mut colliders = Vec::new();
-        if let Some(b) = self.debris[id.0].and_then(|h| self.world.bodies.get_mut(h)) {
-            // Riding, it doesn't slow in the air (the pieces' damping is
-            // for what flies off a blast).
-            b.set_linear_damping(0.0);
-            b.set_angular_damping(0.0);
-            colliders.extend_from_slice(b.colliders());
-        }
-        for c in colliders {
-            if let Some(c) = self.world.colliders.get_mut(c) {
-                c.set_friction(friction);
-            }
-        }
-        id
+        )
     }
 
     /// Puts vehicle `id`'s own collision, `shape` (its `PHY2`, model
@@ -2344,15 +2434,20 @@ impl Physics {
     /// pickup's bed floor and sides, which its hull's box doesn't have.
     /// Nothing but goods meets it, and it adds nothing to the mass. Once a
     /// vehicle; false if it isn't placed.
-    pub fn add_bed(&mut self, id: VehicleId, shape: &CollisionShape, friction: f32) -> bool {
+    ///
+    /// It holds them by the friction and bounce of the vehicle's own body
+    /// ([`CollisionShape::material`]; the commonest body's without one).
+    pub fn add_bed(&mut self, id: VehicleId, shape: &CollisionShape) -> bool {
         let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
             return false;
         };
         if !v.bed {
             v.bed = true;
+            let bed = shape.material.unwrap_or(BodyMaterial::COMMON);
             let collider = r::ColliderBuilder::new(shape.shape.clone())
                 .density(0.0)
-                .friction(friction)
+                .friction(bed.friction)
+                .restitution(bed.restitution)
                 .collision_groups(r::InteractionGroups::new(
                     BED,
                     CARGO,
@@ -2378,13 +2473,14 @@ impl Physics {
                 .pose(pose(translation, rotation.normalize()))
                 .linvel(vector(velocity))
                 .angvel(vector(spin))
-                .linear_damping(DEBRIS_DAMPING)
-                .angular_damping(DEBRIS_DAMPING)
+                .linear_damping(piece.material.linear_damping)
+                .angular_damping(piece.material.angular_damping)
                 .ccd_enabled(true),
         );
         let collider = r::ColliderBuilder::new(piece.shape.clone())
             .mass(piece.mass)
-            .friction(DEBRIS_FRICTION)
+            .friction(piece.material.friction)
+            .restitution(piece.material.restitution)
             .collision_groups(groups);
         self.world.insert_collider(collider, Some(body));
         self.debris.push(Some(body));
@@ -4196,6 +4292,16 @@ mod tests {
     /// crate's place on the bed (z, car space) after `secs` rolling on,
     /// then `stop` (the car's speed taken away at once, as a wall does).
     fn crate_on_bed(friction: f32, stop: bool) -> f32 {
+        crate_on_bed_as(
+            BodyMaterial {
+                friction,
+                ..BodyMaterial::COMMON
+            },
+            stop,
+        )
+    }
+
+    fn crate_on_bed_as(m: BodyMaterial, stop: bool) -> f32 {
         let mut p = ready();
         let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
         for _ in 0..120 {
@@ -4207,15 +4313,17 @@ mod tests {
             Vec3::new(1.0, 1.0, 0.0),
             Vec3::new(-1.0, 1.0, 0.0),
         ];
-        let bed = CollisionShape::mesh(&tray, &[[0, 2, 1], [0, 3, 2]]).unwrap();
-        assert!(p.add_bed(id, &bed, friction));
+        let mut bed = CollisionShape::mesh(&tray, &[[0, 2, 1], [0, 3, 2]]).unwrap();
+        bed.material = Some(m);
+        assert!(p.add_bed(id, &bed));
         let place = p.vehicle_transform(id).unwrap();
-        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.25), 40.0);
+        let mut piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.25), 40.0);
+        piece.material = m;
         let at = place * Mat4::from_translation(Vec3::new(0.0, 1.27, -1.1));
         let speed = Vec3::new(0.0, 0.0, 12.0);
         let up = p.vehicle_velocity(id).y;
         p.set_vehicle_velocity(id, speed.with_y(up));
-        let c = p.add_cargo(&piece, at, speed, friction);
+        let c = p.add_cargo(&piece, at, speed);
         for _ in 0..30 {
             p.step(DT);
         }
@@ -4228,6 +4336,42 @@ mod tests {
         let place = p.vehicle_transform(id).unwrap();
         let on = place.inverse() * p.debris_place(c).unwrap();
         on.w_axis.z
+    }
+
+    #[test]
+    fn a_body_slides_by_its_record_s_friction_and_damps_by_the_game_s_floor() {
+        let body = |unk: [f32; 4]| Body {
+            inertia: [1.0; 9],
+            centre_of_mass: [0.0; 3],
+            mass: 10.0,
+            unk,
+            unk_words: [0; 8],
+        };
+        // The commonest record: friction 0.3, damping raised to 0.8, no
+        // bounce and no linear damping, whatever +0x38 and +0x40 say.
+        let m = BodyMaterial::of(&body([9.0, 0.3, 9.0, 0.3]));
+        assert_eq!(m, BodyMaterial::COMMON);
+        // One damped harder keeps its own; a garbage one gets the floor.
+        assert_eq!(
+            BodyMaterial::of(&body([0.3, 0.7, 0.3, 1.0])).angular_damping,
+            1.0
+        );
+        assert_eq!(BodyMaterial::of(&body([0.3, 0.7, 0.3, 1.0])).friction, 0.7);
+        let nan = BodyMaterial::of(&body([0.3, 0.3, f32::NAN, f32::NAN]));
+        assert_eq!(nan.angular_damping, MIN_ANGULAR_DAMPING);
+    }
+
+    #[test]
+    fn a_flung_piece_is_held_to_havok_s_speeds() {
+        let mut p = ready();
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.25), 10.0);
+        let at = Mat4::from_translation(Vec3::new(0.0, 50.0, 0.0));
+        let id = p.add_debris(&piece, at, Vec3::new(500.0, 0.0, 0.0), Vec3::splat(40.0));
+        let before = p.debris_place(id).unwrap().w_axis.x;
+        p.step(DT);
+        p.step(DT);
+        let moved = p.debris_place(id).unwrap().w_axis.x - before;
+        assert!(moved < MAX_LINEAR_SPEED * 2.0 * DT * 1.05, "{moved}");
     }
 
     #[test]
@@ -6190,6 +6334,7 @@ mod tests {
                 node: Some(1),
                 shape: r::SharedShape::cuboid(0.5, 0.1, 0.1),
                 mass: 10.0,
+                material: BodyMaterial::DEBRIS,
                 from_model: rest[1].inverse(),
             }],
             breaks: true,
@@ -6229,6 +6374,7 @@ mod tests {
             node: None,
             shape: r::SharedShape::cuboid(2.0, 0.3, 0.3),
             mass: 400.0,
+            material: BodyMaterial::DEBRIS,
             from_model: Mat4::IDENTITY,
         };
         let d = p.add_debris(
@@ -6280,6 +6426,7 @@ mod tests {
                 r::SharedShape::cuboid(0.1, 3.0, 0.1),
             )]),
             mass: 150.0,
+            material: BodyMaterial::DEBRIS,
             from_model: Mat4::IDENTITY,
         };
         let pole = CollisionShape {
@@ -6291,6 +6438,7 @@ mod tests {
             stand_in: false,
             loose: None,
             whole: None,
+            material: None,
             surfaces: Arc::new([]),
         };
         let base = Vec3::new(0.0, 0.0, 12.0);
@@ -6362,6 +6510,7 @@ mod tests {
                 r::SharedShape::cuboid(2.0, 1.0, 0.5),
             )]),
             mass: 9600.0,
+            material: BodyMaterial::DEBRIS,
             from_model: Mat4::IDENTITY,
         };
         assert_eq!(slab.centre(), Vec3::Y);
