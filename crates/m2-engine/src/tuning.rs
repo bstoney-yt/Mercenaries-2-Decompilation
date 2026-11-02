@@ -163,7 +163,7 @@ pub struct FlightTuning {
 /// is [`VehicleTuning::max_speed`] (`MaxSpeed` 120 km/h).
 ///
 /// Named but not read here: `Steering`, `LowSpeedSteering`,
-/// `LowSpeedLimit`, `SteerInertia`, `EngineInertia`, `HullFriction`,
+/// `LowSpeedLimit`, `SteerInertia`, `EngineInertia`,
 /// `RollInertia`, `PitchUpSpeed`, `PitchDownInertia`, `HandbrakeInertia`,
 /// `HandbrakeSteerBoost`; some 45 fields are still unnamed. The steering
 /// fields are not a turn rate (gap-list sweep, `boatsteer` over the 25
@@ -205,6 +205,11 @@ pub struct BoatTuning {
     /// inferred). Only their shape is read: scaled so that at its top
     /// speed it pulls what holds it there.
     pub curve: [f32; 4],
+    /// Its hull's friction (`HullFriction`, 0.3 when the record gives
+    /// none, as the 360 code's schema reader defaults it at 0x823EA968):
+    /// its sim sets it on its body (0x82198FF8, through 0x82629DB0). From
+    /// the 360 code.
+    pub hull_friction: f32,
 }
 
 impl BoatTuning {
@@ -1616,6 +1621,7 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                             f("EngineTorqueRatio2")?,
                             f("EngineTorqueRatio3")?,
                         ],
+                        hull_friction: f("HullFriction").unwrap_or(0.3),
                     };
                     (b.torque.0 > 0.0 && b.drag[0] > 0.0).then_some(b)
                 })(),
