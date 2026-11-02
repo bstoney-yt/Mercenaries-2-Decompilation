@@ -18,7 +18,7 @@ use crate::game::{Game, can_get_out, get_out, place};
 use crate::mission::{Mark, WATERLINE};
 use crate::player::{Intent, Player};
 use crate::route::{Mover, Route};
-use crate::support::{Aim, Entry, PDA_CLOSE, PDA_OPEN, Phase};
+use crate::support::{Aim, Entry, GPS_BEACON_SET, PDA_CLOSE, PDA_OPEN, Phase};
 
 /// How fast she turns the camera, radians a second (a quick hand on the
 /// mouse).
@@ -118,6 +118,21 @@ const BLAST_RANGE: (f32, f32) = (15.0, 45.0);
 /// With nothing to blow things up with, she mans an emplaced gun this
 /// near her (metres) that is this near the target (invented).
 const MAN_SEEK: f32 = 80.0;
+
+/// Where she sets a beacon on her PDA's map: the nearest of the contract's
+/// live markers (not a job's), as a player sets it on where the contract
+/// sends her.
+fn beacon_mark(marks: &[Mark], from: Vec3) -> Option<&Mark> {
+    marks
+        .iter()
+        .filter(|m| m.alive && !m.secondary)
+        .filter(|m| matches!(m.kind.as_str(), "action" | "deliverable" | "destroy"))
+        .min_by(|a, b| {
+            from.distance_squared(a.at)
+                .total_cmp(&from.distance_squared(b.at))
+        })
+}
+
 /// Whether target `g` is a prop that rounds break (its template's damage
 /// row takes a `Bullet`, with health to wear: the ranges' targets): shot
 /// with her rifle rather than rockets or C4 (PmcCon033 round 11: C4 on
@@ -990,6 +1005,9 @@ pub struct Autoplay {
     pda_since: Option<f32>,
     pda_pressed: f32,
     pda_asked: Option<f32>,
+    /// She set a beacon the scripts still wait on (their answer comes the
+    /// next tick).
+    beacon_set: bool,
     /// The action objective's object whose prompt she last took, and
     /// when; and the one she was last logged at without its prompt.
     acted: Option<(u32, f32)>,
@@ -1155,6 +1173,30 @@ impl Autoplay {
         {
             // Its prompt isn't up yet: she waits for it.
             return Intent::default();
+        }
+        // With her PDA open the scripts wait for a beacon on the map
+        // (OilCon020's PDA tutorial): she sets one over the contract's
+        // marker once she has looked a moment.
+        if game.support.pda
+            && wants(GPS_BEACON_SET)
+            && self.pda_since.is_some_and(|t| self.clock - t > PDA_LOOK)
+            && game.support.beacon.is_none()
+            && !self.beacon_set
+            && let Some(m) = beacon_mark(marks, game.focus())
+        {
+            self.beacon_set = true;
+            // The PDA's map numbers a spot 35 m east and 40 m north of
+            // where it is (from the scripts: `HandleBeaconCheck` takes 35
+            // and 40 off a beacon's to test its ground).
+            let at = [m.at.x + 35.0, m.at.z + 40.0];
+            eprintln!(
+                "autoplay {:.1} s: a beacon over {} at {:.0}: test shortcut, set on the stand-in PDA without its map",
+                self.clock, m.name, m.at
+            );
+            game.support.beacon = Some(at);
+        }
+        if !wants(GPS_BEACON_SET) {
+            self.beacon_set = false;
         }
         if game.support.pda || asked {
             return self.pda(game.support.pda, wants(PDA_CLOSE));

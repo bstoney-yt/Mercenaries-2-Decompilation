@@ -259,6 +259,10 @@ struct Store {
     pending: Vec<Pending>,
     /// `Event.Post` calls not yet delivered: name and data.
     posted: Vec<(String, Value)>,
+    /// The names whose `Event.Post`s are copied out too
+    /// ([`Events::relay`]), and the copies not yet taken.
+    relay: BTreeSet<String>,
+    relayed: Vec<(String, Value)>,
     /// Events deleted since the last check began: what fired with them
     /// in that check doesn't run ([`fire`]).
     deleted: BTreeSet<u32>,
@@ -397,10 +401,12 @@ impl Events {
                 let mut args = args.into_iter();
                 if let Some(Value::String(name)) = args.next() {
                     let data = args.next().unwrap_or(Value::Nil);
-                    store
-                        .borrow_mut()
-                        .posted
-                        .push((name.to_string_lossy(), data));
+                    let name = name.to_string_lossy();
+                    let mut s = store.borrow_mut();
+                    if s.relay.contains(&name) {
+                        s.relayed.push((name.clone(), data.clone()));
+                    }
+                    s.posted.push((name, data));
                 }
                 Ok(MultiValue::new())
             })?,
@@ -569,6 +575,20 @@ impl Events {
     /// Posts `name` with `data`, as `Event.Post(name, data)` does.
     pub fn post_data(&self, name: &str, data: Value) {
         self.store.borrow_mut().posted.push((name.to_owned(), data));
+    }
+
+    /// Copies the scripts' own `Event.Post`s of `names` out as well, for
+    /// another script state to hear ([`Events::take_relayed`]): the game
+    /// runs its interface's scripts and its contracts in one state, so
+    /// what `MrxGuiPda` posts the contracts hear.
+    pub fn relay(&self, names: &[&str]) {
+        self.store.borrow_mut().relay = names.iter().map(|n| (*n).to_owned()).collect();
+    }
+
+    /// The scripts' posts of the [`Events::relay`] names since the last
+    /// call, oldest first.
+    pub fn take_relayed(&self) -> Vec<(String, Value)> {
+        std::mem::take(&mut self.store.borrow_mut().relayed)
     }
 
     /// Advances game time by `dt` seconds and fires every event whose
@@ -2158,6 +2178,59 @@ mod tests {
         events.update(0.1, &world);
         assert_eq!(log(&host), ["started"]);
         assert!(events.awaited().is_empty());
+    }
+
+    #[test]
+    fn the_pdas_opening_names_her_as_the_player_object_the_watch_compares() {
+        // OilCon020's tutorial: `Player.GetLocalPlayer() == tData.uPlayer`
+        // (here `me`, her guid as the game hands it). A number never
+        // matched, so the tutorial never went on.
+        let (host, events) = setup();
+        let lua = host.lua();
+        lua.globals().set("me", guid_value(1)).unwrap();
+        lua.load(
+            r#"Event.Create(Event.ScriptEvent, { "PDA Open", function(t) return me == t.uPlayer end },
+                function() table.insert(log, "in the PDA") end)"#,
+        )
+        .exec()
+        .unwrap();
+        let world = TestWorld::default();
+        let post = |player: Value| {
+            let t = lua.create_table().unwrap();
+            t.set("uPlayer", player).unwrap();
+            events.post_data("PDA Open", Value::Table(t));
+        };
+        post(Value::Integer(1));
+        events.update(0.1, &world);
+        assert!(log(&host).is_empty());
+        post(guid_value(1));
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["in the PDA"]);
+    }
+
+    #[test]
+    fn posts_of_relayed_names_are_copied_out_and_still_heard_here() {
+        let (host, events) = setup();
+        events.relay(&["GPS Beacon Set"]);
+        host.lua()
+            .load(
+                r#"Event.Create(Event.ScriptEvent, { "GPS Beacon Set" },
+                    function(self, t) table.insert(log, "here " .. t.nX) end, { {} })
+                Event.Post("GPS Beacon Set", { nX = 2791, nY = -383 })
+                Event.Post("PDA Open", {})"#,
+            )
+            .exec()
+            .unwrap();
+        let relayed = events.take_relayed();
+        assert_eq!(relayed.len(), 1);
+        assert_eq!(relayed[0].0, "GPS Beacon Set");
+        let Value::Table(t) = &relayed[0].1 else {
+            panic!("no data");
+        };
+        assert_eq!(t.get::<f64>("nY").unwrap(), -383.0);
+        assert!(events.take_relayed().is_empty());
+        events.update(0.1, &TestWorld::default());
+        assert_eq!(log(&host), ["here 2791"]);
     }
 
     #[test]

@@ -2377,14 +2377,17 @@ end
         self.events.post(name);
     }
 
-    /// Posts a script event as the resident script's network-event
-    /// callback does for the PDA: `"PDA Open"` with `{ uPlayer = 1 }` (the
-    /// watch filters on whose PDA it was), `"PDA Close"` with an empty
-    /// table (`for_player` false).
+    /// Posts a script event as `MrxGuiPda` does when the PDA opens and
+    /// shuts: `"PDA Open"` / `"PDA Close"` with `{ uPlayer = owner }`, the
+    /// owner her player object, which watches compare with
+    /// `Player.GetLocalPlayer()` (OilCon020's PDA tutorial: a number
+    /// there never matched). `for_player` false posts an empty table, as
+    /// the resident script's network-event callback does for a client's
+    /// `"PDA Close"`.
     pub fn post_net_event(&mut self, name: &str, for_player: bool) {
         let data = self.host.lua().create_table().and_then(|t| {
             if for_player {
-                t.set("uPlayer", 1)?;
+                t.set("uPlayer", crate::events::guid_value(1))?;
             }
             Ok(t)
         });
@@ -2392,6 +2395,31 @@ end
             Ok(t) => self.events.post_data(name, mlua::Value::Table(t)),
             Err(_) => self.events.post(name),
         }
+    }
+
+    /// Posts `name` with a table of the numbers `data`, as
+    /// `Event.Post(name, data)` does.
+    pub fn post_numbers(&mut self, name: &str, data: &[(&str, f64)]) {
+        let table = self.host.lua().create_table().and_then(|t| {
+            for (k, v) in data {
+                t.set(*k, *v)?;
+            }
+            Ok(t)
+        });
+        match table {
+            Ok(t) => self.events.post_data(name, mlua::Value::Table(t)),
+            Err(_) => self.events.post(name),
+        }
+    }
+
+    /// See [`crate::events::Events::relay`].
+    pub fn relay_posts(&mut self, names: &[&str]) {
+        self.events.relay(names);
+    }
+
+    /// See [`crate::events::Events::take_relayed`].
+    pub fn take_relayed(&mut self) -> Vec<(String, mlua::Value)> {
+        self.events.take_relayed()
     }
 
     /// Logs what happened, then carries out layer requests and deliveries

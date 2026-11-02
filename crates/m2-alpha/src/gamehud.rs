@@ -308,6 +308,75 @@ local inside, faction = ...
 MrxGui.SendEvent({ EventType = "TrespassStateChange", bTrespassing = inside,
     sFaction = faction })
 "#;
+/// The script posts the game's HUD makes for the contracts to hear, as
+/// the game's one script state hears them: `MrxGuiPda` posts a beacon set
+/// on its map and cleared (`HandleMarkerUpdate`, `HandleMarkerClear`).
+pub const HUD_POSTS: &[&str] = &["GPS Beacon Set", "GPS Beacon Cleared"];
+/// The engine's GPS destination events to the GUI, as the map movie's
+/// `fscommand("destinationMarker", "x,z")` makes them (from the 360 code:
+/// the command handler `0x82384348` hands the text to `0x82438FD8`, which
+/// reads it with `"%d,%d"`, keeps it as the player's destination and sends
+/// `{ EventType = "SetGPSDest", uPlayerGuid, PosX, PosZ }`;
+/// `removeDestinationMarker` goes to `0x82439190`, which forgets it and
+/// sends `{ EventType = "ClearGPSDest", uPlayerGuid }`). The PDA widget
+/// maps them to `HandleMarkerUpdate` and `HandleMarkerClear`.
+const GPS_DEST: &str = r#"
+local x, z = ...
+local player = Player.GetLocalPlayer()
+if x then
+    MrxGui.SendEvent({ EventType = "SetGPSDest", uPlayerGuid = player, PosX = x, PosZ = z })
+else
+    MrxGui.SendEvent({ EventType = "ClearGPSDest", uPlayerGuid = player })
+end
+"#;
+
+/// The map movie's GPS destination commands ([`GPS_DEST`]): whether
+/// `command` was one, sent on to the GUI.
+fn gps_dest(lua: &Lua, command: &str, arg: &str) -> bool {
+    let pos = match command {
+        "destinationMarker" => match parse_pair(arg) {
+            Some(p) => Some(p),
+            None => return false,
+        },
+        "removeDestinationMarker" => None,
+        _ => return false,
+    };
+    let args = pos.map_or((None, None), |[x, z]| (Some(x), Some(z)));
+    lua.load(GPS_DEST)
+        .set_name("=m2-hud gps destination")
+        .call::<()>(args)
+        .is_ok()
+}
+
+/// A script post the HUD hands back: its name and its data's numbers.
+pub type Post = (String, Vec<(String, f64)>);
+
+/// The numbers in a post's data table, by name, sorted.
+fn post_numbers(data: &mlua::Value) -> Vec<(String, f64)> {
+    let mlua::Value::Table(t) = data else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, f64)> = t.pairs::<String, f64>().flatten().collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Two whole numbers as `sscanf("%d,%d")` reads them: each its leading
+/// sign and digits.
+fn parse_pair(text: &str) -> Option<[i32; 2]> {
+    fn int(s: &str) -> Option<i32> {
+        let s = s.trim_start();
+        let digits = s
+            .char_indices()
+            .take_while(|&(i, c)| c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+')))
+            .last()?
+            .0;
+        s[..=digits].parse().ok()
+    }
+    let (a, b) = text.split_once(',')?;
+    Some([int(a)?, int(b)?])
+}
+
 const REMOVE_REGION: &str = r#"
 local guid = Pg.GetGuidByName(...)
 if guid then
@@ -1096,6 +1165,8 @@ enum Output {
         log: Vec<String>,
         /// The mission calls whose callbacks the HUD called.
         callbacks: Vec<u64>,
+        /// The scripts' posts for the contracts ([`HUD_POSTS`]).
+        posts: Vec<Post>,
         /// The mission's dialog boxes closed, each with the option picked.
         choices: Vec<(u64, i64)>,
         /// The front end's news (nothing for the HUD).
@@ -1179,6 +1250,8 @@ pub struct GameHud {
     last_time: Option<f64>,
     /// Mission calls whose callbacks the HUD has called, to hand back.
     callbacks: Vec<u64>,
+    /// The scripts' posts for the contracts ([`HUD_POSTS`]), to hand back.
+    posts: Vec<Post>,
     /// The mission's dialog boxes closed and the options picked, to hand
     /// back.
     choices: Vec<(u64, i64)>,
@@ -1241,6 +1314,7 @@ impl GameHud {
             rx,
             status: Status::Loading,
             callbacks: Vec::new(),
+            posts: Vec::new(),
             choices: Vec::new(),
             dropped_fanfare: false,
             prims: Vec::new(),
@@ -1331,6 +1405,12 @@ impl GameHud {
         std::mem::take(&mut self.callbacks)
     }
 
+    /// The posts the HUD's scripts made for the contracts ([`HUD_POSTS`])
+    /// since the last call, oldest first.
+    pub fn take_posts(&mut self) -> Vec<Post> {
+        std::mem::take(&mut self.posts)
+    }
+
     /// The mission's dialog boxes ([`HudCall::seq`]) the player closed on
     /// an option, each with the option, since the last call.
     pub fn take_choices(&mut self) -> Vec<(u64, i64)> {
@@ -1406,11 +1486,13 @@ impl GameHud {
                 images,
                 log,
                 callbacks,
+                posts,
                 choices,
                 shell,
                 pause,
             } => {
                 self.callbacks.extend(callbacks);
+                self.posts.extend(posts);
                 self.choices.extend(choices);
                 let (pause, shell) = (*pause, *shell);
                 self.pause_news.merge(pause.news);
@@ -2097,6 +2179,8 @@ impl Thread {
             crate::shell::open(&mut mission)?;
             return Ok(Self::new(mission, assets, language, fonts, movies, mode));
         }
+        // What `MrxGuiPda` posts for the contracts to hear ([`HUD_POSTS`]).
+        mission.relay_posts(HUD_POSTS);
         // Her guns, for the gun box to name.
         {
             let mut world = mission.world().borrow_mut();
@@ -2711,11 +2795,18 @@ impl Thread {
                     .collect()
             })
             .unwrap_or_default();
+        let posts: Vec<Post> = self
+            .mission
+            .take_relayed()
+            .into_iter()
+            .map(|(name, data)| (name, post_numbers(&data)))
+            .collect();
         Output::Frame {
             prims,
             images,
             log,
             callbacks,
+            posts,
             choices,
             shell: Box::default(),
             pause: Box::new(PauseOut {
@@ -2943,6 +3034,7 @@ impl Thread {
             images,
             log,
             callbacks: Vec::new(),
+            posts: Vec::new(),
             choices: Vec::new(),
             shell: Box::new(ShellNews {
                 movie,
@@ -3273,6 +3365,11 @@ impl Thread {
             };
             match heard {
                 Ok(true) => {}
+                Ok(false) if self.mode != Mode::Shell && gps_dest(lua, &command, &arg) => {
+                    log.push(format!(
+                        "flash: widget {id}: {command}({arg}): the GPS beacon"
+                    ));
+                }
                 Ok(false) => {
                     log.push(format!(
                         "flash: widget {id}: fscommand {command}({arg}) unheard"
@@ -6041,6 +6138,36 @@ mod tests {
         assert!((x - 2.0).abs() < 1e-5 && y.abs() < 1e-5, "{x} {y}");
     }
 
+    /// The map movie's beacon commands reach the GUI as the engine's GPS
+    /// destination events, read as `"%d,%d"`.
+    #[test]
+    fn the_maps_beacon_becomes_the_gps_destination_event() {
+        let lua = Lua::new();
+        lua.load(
+            r#"
+            sent = {}
+            Player = { GetLocalPlayer = function() return "her" end }
+            MrxGui = { SendEvent = function(e)
+                table.insert(sent, e.EventType .. " " .. tostring(e.uPlayerGuid) .. " "
+                    .. tostring(e.PosX) .. " " .. tostring(e.PosZ))
+            end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert!(gps_dest(&lua, "destinationMarker", "2788,-384"));
+        assert!(gps_dest(&lua, "removeDestinationMarker", "2788,-384"));
+        assert!(!gps_dest(&lua, "destinationMarker", "nowhere"));
+        assert!(!gps_dest(&lua, "TrackBlip", "1"));
+        let sent: Vec<String> = lua.globals().get("sent").unwrap();
+        assert_eq!(
+            sent,
+            ["SetGPSDest her 2788 -384", "ClearGPSDest her nil nil"]
+        );
+        assert_eq!(parse_pair(" 12.7,-3x"), Some([12, -3]));
+        assert_eq!(parse_pair("12"), None);
+    }
+
     /// The PDA's `ControllerInput` event carries both sticks: the left
     /// (x reversed) moves the map, the right zooms it, as pushed.
     #[test]
@@ -6261,6 +6388,7 @@ mod paint_tests {
             rx,
             status,
             callbacks: Vec::new(),
+            posts: Vec::new(),
             choices: Vec::new(),
             dropped_fanfare: false,
             shell: ShellNews::default(),
@@ -6346,6 +6474,7 @@ mod paint_tests {
             images: Vec::new(),
             log: log.iter().map(|l| (*l).to_owned()).collect(),
             callbacks: Vec::new(),
+            posts: Vec::new(),
             choices: Vec::new(),
             shell: Box::default(),
             pause: Box::default(),
