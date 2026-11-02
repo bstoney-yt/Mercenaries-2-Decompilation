@@ -6638,7 +6638,7 @@ fn ladder_check(game: &mut Game, hold: f32, tick: f32) {
             }
             game.step(Intent::default(), tick);
         }
-        for _ in 0..20 {
+        for _ in 0..90 {
             game.step(Intent::default(), tick);
         }
     };

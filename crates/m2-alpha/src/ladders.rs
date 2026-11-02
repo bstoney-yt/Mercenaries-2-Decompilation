@@ -10,8 +10,8 @@
 //!
 //! Provenance: the gathering and the pick are from the 360 code, as for
 //! vehicles; the ladder's ends from the 360 code and samples (see
-//! [`m2_engine::ladder`]). Invented: a vehicle entrance in reach is taken
-//! before any ladder (the 360 picks the nearest of both).
+//! [`m2_engine::ladder`]); its ends are gathered with the vehicles'
+//! entrances and the nearest of all is taken (0x82299E48).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -45,6 +45,8 @@ pub struct Reach {
     /// Getting on at the top.
     pub top: bool,
     pub distance_sq: f32,
+    /// Its entrance's `UseDistance`.
+    pub use_distance: f32,
     /// The placed object.
     pub object: usize,
 }
@@ -127,9 +129,11 @@ impl Ladders {
         out
     }
 
-    /// The ladder end she would get on at, standing at `her` with the
-    /// camera at `eye` looking along `aim`.
-    pub fn pick(
+    /// The ladder ends she may get on at, standing at `her` with the
+    /// camera at `eye` looking along `aim` (gathered as vehicle entrances
+    /// are, 0x82440F30; the pick among them and the vehicles' is
+    /// [`m2_engine::seats::pick`]).
+    pub fn gathered(
         &mut self,
         index: &WorldIndex,
         destroyed: &HashSet<usize>,
@@ -137,7 +141,7 @@ impl Ladders {
         her: Vec3,
         eye: Vec3,
         aim: Vec3,
-    ) -> Option<Reach> {
+    ) -> Vec<Reach> {
         let near: Vec<usize> = self
             .placed(index)
             .iter()
@@ -147,23 +151,22 @@ impl Ladders {
                     && index.objects[i].position.distance_squared(her) <= LOOK * LOOK
             })
             .collect();
-        let mut best: Option<Reach> = None;
+        let mut out = Vec::new();
         for i in near {
             for (ladder, top, place, reach) in self.ends(index, source.as_deref_mut(), i) {
                 let d = her.distance_squared(place);
-                if seats::in_search(her, eye, aim, place, reach, seats::SEARCH_PAD)
-                    && best.is_none_or(|r| d < r.distance_sq)
-                {
-                    best = Some(Reach {
+                if seats::in_search(her, eye, aim, place, reach, seats::SEARCH_PAD) {
+                    out.push(Reach {
                         ladder,
                         top,
                         distance_sq: d,
+                        use_distance: reach,
                         object: i,
                     });
                 }
             }
         }
-        best
+        out
     }
 
     /// The placed ladder nearest `from` (by its object's place) and its
@@ -236,9 +239,10 @@ impl Climbing {
         }
     }
 
-    /// One tick (`stick` up +), `Some` once she is off.
-    pub fn tick(&mut self, stick: f32, let_go: bool, dt: f32) -> Option<Off> {
-        let off = self.climb.tick(&self.moves, stick, let_go, dt);
+    /// One tick (`stick` up +, `floor` within the climb's probe under
+    /// her feet), `Some` once she is off.
+    pub fn tick(&mut self, stick: f32, let_go: bool, floor: bool, dt: f32) -> Option<Off> {
+        let off = self.climb.tick(&self.moves, stick, let_go, floor, dt);
         let phase = std::mem::discriminant(&self.climb.phase);
         if phase != self.phase || self.climb.rung != self.rung {
             self.step += 1;
@@ -260,30 +264,18 @@ impl Climbing {
     }
 }
 
-/// How far on she may step to find a floor getting off, metres, and in
-/// what steps (invented: the 360's capsule stands across a hatch's hole
-/// that the alpha's single landing ray falls through; the tall guard
-/// tower's hatch is under the top dismount's end, its floor 0.59 m below
-/// the top hardpoint from 0.75 m on).
-const STEP_ON: f32 = 1.0;
-const STEP_BY: f32 = 0.2;
-/// A floor this far under where she gets off is stood on, metres.
-const FLOOR_BELOW: f32 = 1.5;
+/// Her body (a capsule 1.8 m tall and 0.4 m round, 0x82B7C0EC
+/// and 0x82B7C0F0, as 0x8229A8D8 tests it).
+const BODY_RADIUS: f32 = 0.4;
 
-/// Where she stands getting off at `at`: there, or the first spot on
-/// along `facing` with a floor within [`FLOOR_BELOW`] under it.
-pub fn step_onto(physics: &m2_engine::Physics, at: Vec3, facing: Vec3) -> Vec3 {
-    let mut k = 0.0;
-    while k <= STEP_ON + 1e-3 {
-        let p = at + facing * k;
-        let from = p + Vec3::Y;
-        if physics
-            .cast_ray(from, -Vec3::Y, 1.0 + FLOOR_BELOW)
-            .is_some()
-        {
-            return p;
-        }
-        k += STEP_BY;
-    }
-    at
+/// Whether a floor is within `depth` under her feet at `feet`: what stops
+/// a climb down (0x8229A8D8 asks whether her body, lowered `depth`, is
+/// clear of the ground and the world; here rays down under its middle and
+/// its rim).
+pub fn floor_under(physics: &m2_engine::Physics, feet: Vec3, depth: f32) -> bool {
+    let rim = [Vec3::ZERO, Vec3::X, -Vec3::X, Vec3::Z, -Vec3::Z];
+    rim.iter().any(|d| {
+        let from = feet + *d * BODY_RADIUS * 0.7 + Vec3::Y * 0.3;
+        physics.cast_ray(from, -Vec3::Y, 0.3 + depth).is_some()
+    })
 }

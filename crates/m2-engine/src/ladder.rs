@@ -19,7 +19,10 @@
 //!   0x82431EF8) until the lowest even rung, where she gets off at the
 //!   bottom. Below the lowest rung (just on) she climbs up by herself.
 //!   The jump or use button lets go (0x824313F8 sets its let-go flag,
-//!   0x82431320 gets her off where she is).
+//!   0x82431320 gets her off where she is). Pulled down, she also gets
+//!   off at the bottom wherever her body, lowered 0.1 m (0.25 m once she
+//!   is climbing down), would meet the ground or the world (0x8229A8D8:
+//!   her 1.8 m by 0.4 m body tested there; [`Climb::floor_probe`]).
 //! - From samples (Jennifer's clips, `OnLadder` stance rows of the action
 //!   table): ClimbUp `36784490` rises 0.8 m in 0.534 s, ClimbDown
 //!   `9fcade79` falls 0.8 m in 0.534 s (spacing 0.4 m, two rungs a cycle);
@@ -29,15 +32,18 @@
 //!   reverse; the top mount `727bbe36` drops 1.607 m in 1.001 s. While
 //!   climbing her root hangs 0.4 m back from the ladder's line, as the
 //!   360's rung probes look (0x82430EC0, 0.4 along the seat's facing).
+//! - From samples (the clips' frames): the mount and dismount clips run
+//!   from or to their seat's hardpoint (the bottom mount ends, the top
+//!   dismount starts 1.623 m under the top one, as the climb's rungs
+//!   reach), so her feet are at the rung's height, rung 1 at the bottom
+//!   hardpoint, and the clips leave her where they end; her body stands
+//!   or falls from there. The hardpoints stand over the floors by
+//!   differing amounts (bottom 0.62 to 1.43 m, top 0.14 to 0.95 m on the
+//!   tower, water tower and two billboards measured).
 //! - Inferred: she faces along the bottom seat hardpoint's forward axis
-//!   (towards the building, the top dismount steps that way); her feet
-//!   are at the rung's height, rung 1 at the bottom hardpoint. On the tall
-//!   guard tower the hardpoints stand 0.88 m over the ground and 0.59 m
-//!   over the platform, so she hangs that much high; where the 360 puts
-//!   the root against the seat hardpoint was not traced.
-//! - Invented: the collision probes the 360 makes before each climb
-//!   (0x8229A8D8) and the ground probe that ends a climb down early are
-//!   not made; letting go drops her to the floor under her.
+//!   (towards the building, the top dismount steps that way).
+//! - Not made: the 360's test of each rung she starts on (0x82430EC0),
+//!   which only matters grabbing a ladder part way up.
 
 use m2_math::glam::Vec3;
 
@@ -47,6 +53,9 @@ pub const UPRIGHT: f32 = 0.85;
 pub const DEAD_ZONE: f32 = 0.5;
 /// How far back from the ladder's line she hangs, metres.
 pub const HANG_BACK: f32 = 0.4;
+/// How far under the top hardpoint the top dismount clip starts her,
+/// metres (Jennifer's `4f962bd2`, from samples).
+pub const TOP_DISMOUNT_START: f32 = 1.623;
 
 /// The action table's ladder clips, by hash.
 pub mod clips {
@@ -119,10 +128,9 @@ impl Moves {
             dismount_top: top.1,
             top_rungs: (top.0 / spacing + 0.5).floor() as i32,
             low_rung: ((-1.0 / spacing) * bottom.0 + 0.5).floor() as i32,
-            off_top: (
-                top.2,
-                (top.0 - (top.0 / spacing + 0.5).floor() * spacing).max(0.0),
-            ),
+            // The top dismount's root ends 0.059 m over the top hardpoint
+            // (from samples): its rise less the 1.623 m it starts under.
+            off_top: (top.2, top.0 - TOP_DISMOUNT_START),
             off_bottom: (bottom.2, -bottom.0),
         }
     }
@@ -220,6 +228,8 @@ pub struct Climb {
     pub ladder: Ladder,
     pub rung: i32,
     pub phase: Phase,
+    /// Her last step was down a rung pair.
+    pub was_down: bool,
 }
 
 impl Climb {
@@ -234,12 +244,28 @@ impl Climb {
             ladder,
             rung,
             phase: Phase::Mounting { top, t: 0.0 },
+            was_down: false,
         }
     }
 
-    /// One tick: `stick` up (+) or down (-), `let_go` pressed. `Some`
+    /// How far under her feet a floor ends a climb down (0x824313F8's
+    /// clear test, 0x8229A8D8): 0.1 m, or 0.25 m when she has just
+    /// climbed down.
+    pub fn floor_probe(&self) -> f32 {
+        if self.was_down { 0.25 } else { 0.1 }
+    }
+
+    /// One tick: `stick` up (+) or down (-), `let_go` pressed, `floor`
+    /// within [`floor_probe`](Self::floor_probe) under her feet. `Some`
     /// once she is off.
-    pub fn tick(&mut self, m: &Moves, stick: f32, let_go: bool, dt: f32) -> Option<Off> {
+    pub fn tick(
+        &mut self,
+        m: &Moves,
+        stick: f32,
+        let_go: bool,
+        floor: bool,
+        dt: f32,
+    ) -> Option<Off> {
         let l = self.ladder;
         if let_go && !matches!(self.phase, Phase::Dismounting { .. }) {
             return Some(Off::LetGo(self.feet(m)));
@@ -263,6 +289,7 @@ impl Climb {
                 *t += dt;
                 if *t >= m.down_cycle {
                     self.rung -= 2;
+                    self.was_down = true;
                     self.phase = Phase::Still;
                 }
             }
@@ -294,7 +321,7 @@ impl Climb {
                     Phase::Dismounting { top: true, t: 0.0 }
                 }
             } else if stick < -DEAD_ZONE {
-                if self.rung > low + (low & 1) {
+                if !floor && self.rung > low + (low & 1) {
                     Phase::Down(0.0)
                 } else {
                     Phase::Dismounting { top: false, t: 0.0 }
@@ -302,6 +329,9 @@ impl Climb {
             } else {
                 Phase::Still
             };
+            if !matches!(self.phase, Phase::Still | Phase::Down(_)) {
+                self.was_down = false;
+            }
         }
         None
     }
@@ -364,7 +394,7 @@ mod tests {
         let dt = 1.0 / 60.0;
         let mut t = 0.0;
         while t < secs {
-            if let Some(o) = c.tick(m, stick, false, dt) {
+            if let Some(o) = c.tick(m, stick, false, false, dt) {
                 return Some(o);
             }
             t += dt;
@@ -409,7 +439,30 @@ mod tests {
         let mut c = Climb::start(tower(), false, &m);
         run(&mut c, &m, 1.0, 3.0);
         let at = c.feet(&m);
-        assert_eq!(c.tick(&m, 0.0, true, 0.016), Some(Off::LetGo(at)));
+        assert_eq!(c.tick(&m, 0.0, true, false, 0.016), Some(Off::LetGo(at)));
         assert!(at.y > 1.0 && (at.z + HANG_BACK).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_floor_under_her_ends_the_climb_down() {
+        let m = Moves::default();
+        let mut c = Climb::start(tower(), true, &m);
+        let dt = 1.0 / 60.0;
+        // Down to rung 21, then a floor (a roof the ladder passes) is
+        // under her feet.
+        while c.rung > 21 {
+            assert_eq!(c.tick(&m, -1.0, false, false, dt), None);
+        }
+        assert_eq!(c.floor_probe(), 0.25);
+        let mut off = None;
+        for _ in 0..120 {
+            off = c.tick(&m, -1.0, false, true, dt);
+            if off.is_some() {
+                break;
+            }
+        }
+        assert!(matches!(off, Some(Off::Stepped(_))), "{off:?}");
+        // The step under way when the floor came finishes first.
+        assert_eq!(c.rung, 19);
     }
 }
