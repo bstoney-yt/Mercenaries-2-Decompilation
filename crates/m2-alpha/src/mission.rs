@@ -5123,6 +5123,25 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
                             eprintln!("mission: {:#x} taken up to be carried", l.guid);
                         }
                     }
+                    // A crate to carry is the one the scripts spawned, not a
+                    // second: the prop put up where they spawned it goes
+                    // while it hangs and once it is let go (the flight draws
+                    // it). From the scripts: `MrxCopterDrop.Create` spawns
+                    // its cargo once (`Pg.SpawnFromCamera`, out of her
+                    // sight) and hangs that object on the winch
+                    // (`Object.AttachCargoToWinch`); VzaCon001's grenade
+                    // launcher drop stood twice, at its spawn too.
+                    if let Some(world) = &mut game.scene.world {
+                        for l in loads.iter().filter(|l| l.model.is_some()) {
+                            if game.scene.props.get(l.guid).is_some() {
+                                game.scene.props.hide(&mut world.physics, [l.guid]);
+                                eprintln!(
+                                    "mission: {:#x} taken down where it was spawned, to be carried",
+                                    l.guid
+                                );
+                            }
+                        }
+                    }
                     eprintln!(
                         "mission: {name} flies a delivery from {from:.1} to {:.1}, model {}, \
                          sound bank {}, carrying {:?}",
