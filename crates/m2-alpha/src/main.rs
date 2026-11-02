@@ -349,6 +349,10 @@ struct Options {
     /// With `--mission`: the keys pressed in a dialog box the scripts put
     /// up (`up`, `down`, `accept`, `back`, comma-separated), for testing.
     dialog_keys: Option<String>,
+    /// With `--mission`: the game's HUD runs whenever a dialog box of the
+    /// scripts is up, and each box is pictured a second and a half after
+    /// it opens (`<out>-dialog<seq>.ppm`), for comparing the menus.
+    dialog_shots: bool,
     /// With `--screenshot` on foot and `--gait`: she goes on this long
     /// (seconds, default 3), logging where she is each second.
     walk_seconds: Option<f32>,
@@ -702,6 +706,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--placed-check" => o.placed_check = true,
             "--context" => o.context = Some(value()?),
             "--dialog-keys" => o.dialog_keys = Some(value()?),
+            "--dialog-shots" => o.dialog_shots = true,
             "--medevac" => o.medevac = Some(value()?.parse()?),
             "--visit-faction" => o.visit_faction = Some(value()?),
             "--call-extraction" => o.call_extraction = Some(value()?.parse()?),
@@ -3869,6 +3874,9 @@ fn mission_for_screenshot(
     let mut play_done: Option<u32> = None;
     let mut contracts_seen = 0;
     let mut late_hud: Option<(ui::Hud, Config)> = None;
+    // `--dialog-shots`: the boxes pictured so far, and how long the open
+    // one has been up.
+    let (mut dialog_shot, mut shot_up) = (Vec::<u64>::new(), 0.0f32);
     // The loading screen's steps over the scripts' fades until the late HUD
     // (which draws it) runs, logged.
     let mut screen_cycle = loading::Cycle::default();
@@ -4602,7 +4610,8 @@ fn mission_for_screenshot(
         }
         // After the contract (--after-contract) the game's HUD runs too:
         // the flow waits on its fanfare closing.
-        if contract_done.is_some() {
+        let boxed_now = options.dialog_shots && (late_hud.is_some() || link.dialog_open());
+        if contract_done.is_some() || boxed_now {
             let (hud, settings) = late_hud.get_or_insert_with(|| {
                 let mut hud = ui::Hud::new();
                 hud.game = game_hud(Some(install), &Mode::Island(None), false, game);
@@ -4668,6 +4677,29 @@ fn mission_for_screenshot(
                 });
             }
             let _ = hud.build(input, &info, settings);
+            // `--dialog-shots`: the box as the game's HUD draws it over the
+            // scene, a second and a half after it opened.
+            match link.open_dialog().filter(|_| options.dialog_shots) {
+                Some(d) if !dialog_shot.contains(&d.seq) => {
+                    shot_up += tick;
+                    if shot_up >= 1.5 {
+                        dialog_shot.push(d.seq);
+                        render(backend, game, fov, aspect, Some(hud))?;
+                        let path = out.with_file_name(format!("{stem}-dialog{}.ppm", d.seq));
+                        write_ppm(backend, &path)?;
+                        eprintln!(
+                            "dialog-shot: box {} {:?} ({}) of {:?}: {}",
+                            d.seq,
+                            d.text,
+                            d.method,
+                            d.options,
+                            path.display()
+                        );
+                    }
+                }
+                Some(_) => {}
+                None => shot_up = 0.0,
+            }
             if let Some(g) = &mut hud.game {
                 for seq in g.take_callbacks() {
                     eprintln!("after contract: the HUD called back call {seq}");

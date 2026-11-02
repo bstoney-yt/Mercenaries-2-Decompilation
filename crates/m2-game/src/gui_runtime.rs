@@ -28,9 +28,17 @@
 //!   its data and the time step (the handlers' `GuiUpdate`).
 //! - `CorrectWidgetForResolution` fixes a top-level widget's anchor point
 //!   for the screen's shape; see [`crate::gui::Correction`].
-//! - Every live widget is on the screen, in creation order (a parent
-//!   before its children), with `PushWidgetToFront`/`Back` reordering;
-//!   one draws if it is visible and not asleep.
+//! - A widget goes on the screen's drawing list, at its end, the first
+//!   time it is activated (`ActivateWidget(id, true)`), and stays there
+//!   when deactivated; so the drawing order is the order of first
+//!   activation, not of creation. `MrxGuiBase.AddWidgetWithChildren`
+//!   activates a parent, then each child's subtree in child order, so a
+//!   dialog box's frame (made last but added as its first children) draws
+//!   under its text. `PushWidgetToFront` moves each active, listed widget
+//!   of a subtree (depth first, a parent before its children) to the end
+//!   of the list; `PushWidgetToBack` to its start, each in turn, so the
+//!   subtree comes out reversed there. One draws if it is visible, active
+//!   and not asleep.
 //!
 //! Natives not implemented answer as the old stand-in did (`Create*` a new
 //! plain widget, `Get*` zeros, `Is*` false, anything else nothing) and are
@@ -46,7 +54,17 @@
 //!
 //! Behaviour read from how the game's scripts call `_GuiInternal`
 //! (`MrxGuiBase` and the HUD handler scripts in a legally installed copy)
-//! and checked against footage of the game. Nothing from the executable.
+//! and checked against footage of the game.
+//!
+//! From the 360 code: the drawing list and its order. `ActivateWidget`'s
+//! native (0x8231D448, into 0x82380448) appends a widget to the manager's
+//! list the first time it is activated (a flag at +0x55 keeps it listed);
+//! `AddWidgetChild` (0x8231E000) appends the child to its parent's
+//! children; `PushWidgetToFront` (0x82380580) and `PushWidgetToBack`
+//! (0x82380700) move a widget to the list's tail or head and recurse into
+//! its children in order, skipping deactivated and unlisted widgets. Not
+//! established: the second list the natives keep for widgets of a kind
+//! that answers true to a virtual (+0x54); none is told apart here.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -321,7 +339,8 @@ pub enum DrawItem {
 pub struct Screen {
     widgets: BTreeMap<u32, Widget>,
     next_id: u32,
-    /// Drawing order.
+    /// Drawing order: the widgets activated at least once, in the order
+    /// of their first activation as the pushes to front and back left it.
     order: Vec<u32>,
     next_callback: u32,
     /// Callbacks due at the next tick: handle and extra arguments.
@@ -476,8 +495,42 @@ impl Screen {
         self.next_id += 1;
         let id = self.next_id;
         self.widgets.insert(id, Widget::new(kind, name));
-        self.order.push(id);
         id
+    }
+
+    /// `ActivateWidget`: an activated widget draws, and goes at the end of
+    /// the drawing list the first time; a deactivated one keeps its place.
+    fn activate(&mut self, id: u32, active: bool) {
+        let Some(w) = self.widgets.get_mut(&id) else {
+            return;
+        };
+        w.inactive = !active;
+        if active && !self.order.contains(&id) {
+            self.order.push(id);
+        }
+    }
+
+    /// The widget and its descendants, depth first, each parent before
+    /// its children and the children in order.
+    fn depth_first(&self, id: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut stack = vec![id];
+        while let Some(at) = stack.pop() {
+            if let Some(w) = self.widgets.get(&at) {
+                out.push(at);
+                stack.extend(w.children.iter().rev().copied());
+            }
+        }
+        out
+    }
+
+    /// The listed, active widgets of `id`'s subtree, depth first: the ones
+    /// `PushWidgetToFront` and `PushWidgetToBack` move.
+    fn pushed(&self, id: u32) -> Vec<u32> {
+        self.depth_first(id)
+            .into_iter()
+            .filter(|o| self.order.contains(o) && self.widgets.get(o).is_some_and(|w| !w.inactive))
+            .collect()
     }
 
     fn delete(&mut self, id: u32) {
@@ -1755,9 +1808,7 @@ natives! {
     "ActivateWidget" => |s, _, a| {
         // `WidgetManager.AddWidget` activates, `RemoveWidget` deactivates.
         let active = a.get(1).is_none_or(|v| !matches!(v, Value::Nil | Value::Boolean(false)));
-        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
-            w.inactive = !active;
-        }
+        s.activate(a.id(0), active);
         Ok(MultiValue::new())
     },
     "SetWidgetVisible" => |s, _, a| {
@@ -1864,17 +1915,18 @@ natives! {
         ret(l, (t, children.len()))
     },
     "PushWidgetToFront" => |s, _, a| {
-        let ids = s.subtree(a.id(0));
+        let ids = s.pushed(a.id(0));
         s.order.retain(|o| !ids.contains(o));
         s.order.extend(ids);
         Ok(MultiValue::new())
     },
     "PushWidgetToBack" => |s, _, a| {
-        let ids = s.subtree(a.id(0));
+        // Each goes before the list's first in turn: the subtree reversed.
+        let mut ids = s.pushed(a.id(0));
         s.order.retain(|o| !ids.contains(o));
-        let mut order = ids;
-        order.append(&mut s.order);
-        s.order = order;
+        ids.reverse();
+        ids.append(&mut s.order);
+        s.order = ids;
         Ok(MultiValue::new())
     },
     "SetWidgetUpdateCallback" => |s, l, a| {
@@ -2431,8 +2483,10 @@ mod tests {
     /// Activates every widget made so far, as the scripts'
     /// `MrxGui.AddWidget` does for the ones they show.
     fn added(screen: &ScreenRef) {
-        for w in screen.borrow_mut().widgets.values_mut() {
-            w.inactive = false;
+        let mut s = screen.borrow_mut();
+        let ids: Vec<u32> = s.widgets.keys().copied().collect();
+        for id in ids {
+            s.activate(id, true);
         }
     }
 
@@ -2463,7 +2517,68 @@ mod tests {
         };
         assert_eq!(texts(), ["now"]);
         run(&host, "_GuiInternal.ActivateWidget(queued, true)");
-        assert_eq!(texts(), ["later", "now"]);
+        // Drawn in the order first activated, not made.
+        assert_eq!(texts(), ["now", "later"]);
+        // Taken off and put back, it keeps its place.
+        run(
+            &host,
+            "_GuiInternal.ActivateWidget(shown, false) _GuiInternal.ActivateWidget(shown, true)",
+        );
+        assert_eq!(texts(), ["now", "later"]);
+    }
+
+    /// `MrxGuiDialogBox._BuildDialogBox` as it orders its widgets: the
+    /// container, its title, then the frame made last but added as the
+    /// container's first child; `AddWidgetWithChildren` activates the
+    /// container and then each child's subtree in child order.
+    #[test]
+    fn a_dialog_box_frame_draws_under_its_text() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            box = G.CreateWidget()
+            title = G.CreateTextWidget()
+            G.SetTextText(title, "Select an option:")
+            frame = G.CreateImageWidget()
+            G.AddWidgetChild(box, frame)
+            G.AddWidgetChild(box, title)
+            local function add(w)
+                G.ActivateWidget(w, true)
+                for _, c in ipairs(G.GetWidgetChildren(w)) do add(c) end
+            end
+            add(box)
+            "#,
+        );
+        let kinds = |s: &Screen| {
+            s.draw_list(640.0, 480.0)
+                .into_iter()
+                .map(|i| match i {
+                    DrawItem::Fill { .. } | DrawItem::Quad { .. } => "frame",
+                    DrawItem::Text { .. } => "text",
+                    _ => "other",
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(&screen.borrow()), ["frame", "text"]);
+        // To the back, the subtree goes in reversed: the title, then the
+        // frame, then the box, ahead of what was there.
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            other = G.CreateTextWidget()
+            G.SetTextText(other, "x")
+            G.ActivateWidget(other, true)
+            G.PushWidgetToBack(box)
+            "#,
+        );
+        assert_eq!(kinds(&screen.borrow()), ["text", "frame", "text"]);
+        assert_eq!(screen.borrow().order.last(), Some(&4));
+        // To the front, in order again, a parent before its children.
+        run(&host, "_GuiInternal.PushWidgetToFront(box)");
+        assert_eq!(screen.borrow().order, [4, 1, 3, 2]);
     }
 
     #[test]
@@ -2671,6 +2786,9 @@ mod tests {
             G.CorrectWidgetForResolution(top)
             back = G.CreateImageWidget()
             G.SetWidgetLocation(back, 0, 0, 640, 480)
+            G.ActivateWidget(top, true)
+            G.ActivateWidget(t, true)
+            G.ActivateWidget(back, true)
             G.PushWidgetToBack(back)
             "#,
         );
@@ -3024,6 +3142,8 @@ mod tests {
             map = G.MinimapCreate(534, 386, 50, "VZ", 2800, 2800, "left", "top",
                 -4096, 4096, -4096, 4096)
             assert(type(map) == "number")
+            -- `MinimapWidget:SetUpMinimap` adds it (`WidgetManager.AddWidget`).
+            G.ActivateWidget(map, true)
             G.MinimapUpdate(map, 534, 386, 10, 2, -30, 10, 2, -30, 45)
             G.MinimapSetRange(map, 150)
             "#,

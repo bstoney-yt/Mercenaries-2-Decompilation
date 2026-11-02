@@ -262,7 +262,11 @@ m2-alpha [options]
                          right, accept,
                          back; comma-separated), the first 3 s after it
                          opens and each 2 s on (dialog-check lines)
-  --medevac <s>          with --mission --after-contract: this long after the
+  --dialog-shots         with --mission --screenshot: the game's HUD runs
+                         while a dialog box of the scripts is up, and each
+                         box is pictured 1.5 s after it opens
+                         (<out>-dialog<n>.ppm; dialog-shot lines)
+  --medevac <s>        with --mission --after-contract: this long after the
                          contract, the pause menu's Medevac as confirmed, if
                          the scripts allow it then (medevac-check lines)
   --visit-faction <f>    with --mission --after-contract: 30 s after the
