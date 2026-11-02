@@ -401,6 +401,10 @@ struct Options {
     /// 0; for more, held up that many seconds and left on it for the
     /// picture.
     ladder_check: Option<f32>,
+    /// With `--screenshot --drive`: put her in the nearest deep water and
+    /// swim her forward walking, at her pace and sprinting, logging how
+    /// fast she goes (`swim-check:` lines).
+    swim_check: bool,
     /// With `--board`: the entrance she stands at, by name or hash
     /// (`entrance_driver`, `8efe45f3`); else the front right one.
     entrance: Option<u32>,
@@ -727,6 +731,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--seated" => o.seated = true,
             "--board" => o.board = true,
+            "--swim-check" => o.swim_check = true,
             "--ladder-check" => {
                 o.ladder_check = Some(
                     value()?
@@ -5853,6 +5858,10 @@ fn drive_for_screenshot(
     if options.board {
         return board_for_check(game, options, tick);
     }
+    if options.swim_check {
+        swim_check(game, tick);
+        return Ok(());
+    }
     if let Some(hold) = options.ladder_check {
         ladder_check(game, hold, tick);
         return Ok(());
@@ -6598,6 +6607,101 @@ fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
 
 /// With `--fuel-check`: out of the wreck she drove, to the pickups its
 /// death left, and logs what each gave (`fuel-check:` lines).
+/// `--swim-check`: she is put in the nearest water over 4 m deep (looked
+/// for in rings out to 600 m) and swims forward for 4 s walking, at her
+/// pace and sprinting, through the game's tick; logs her speed each time.
+fn swim_check(game: &mut Game, tick: f32) {
+    use m2_math::glam::{Vec2, Vec3};
+    let here = game.focus();
+    let Some(world) = game.scene.world.as_ref() else {
+        return;
+    };
+    let physics = &world.physics;
+    let depth_at = |p: Vec3| {
+        let water = physics.water_at(p.x, p.z)?;
+        let top = water + 50.0;
+        let ground = physics
+            .cast_ray(p.with_y(top), Vec3::NEG_Y, 600.0)
+            .map(|(d, _)| top - d)?;
+        Some((water, water - ground))
+    };
+    let mut found = None;
+    'rings: for r in (0..=600).step_by(20) {
+        let n = (r / 5).max(1);
+        for k in 0..n {
+            let a = k as f32 / n as f32 * std::f32::consts::TAU;
+            let p = here + Vec3::new(a.sin(), 0.0, a.cos()) * r as f32;
+            if let Some((water, depth)) = depth_at(p)
+                && depth > 4.0
+            {
+                found = Some((p.with_y(water), depth));
+                break 'rings;
+            }
+        }
+    }
+    let Some((at, depth)) = found else {
+        eprintln!("swim-check: no water over 4 m deep within 600 m of {here:.0}");
+        return;
+    };
+    eprintln!("swim-check: water {depth:.1} m deep at {at:.1}");
+    // Out toward the deepest water 15 m off.
+    let heading = (0..16)
+        .map(|k| k as f32 / 16.0 * std::f32::consts::TAU)
+        .max_by(|a, b| {
+            let d = |y: f32| {
+                depth_at(at + Vec3::new(y.sin(), 0.0, y.cos()) * 15.0).map_or(0.0, |w| w.1)
+            };
+            d(*a).total_cmp(&d(*b))
+        })
+        .unwrap_or(0.0);
+    if let Some(p) = game.scene.player.as_mut() {
+        p.character.position = at;
+        p.character.velocity = Vec3::ZERO;
+        p.landed = true;
+    }
+    for _ in 0..60 {
+        game.step(Intent::default(), tick);
+    }
+    let swimming = game.scene.player.as_ref().is_some_and(|p| p.swimming());
+    eprintln!("swim-check: swimming {swimming}");
+    for (label, walk, sprint) in [
+        ("walk", true, false),
+        ("pace", false, false),
+        ("sprint", false, true),
+    ] {
+        let intent = Intent {
+            movement: Vec2::new(0.0, 1.0),
+            walk,
+            sprint,
+            ..Intent::default()
+        };
+        if let Some(p) = game.scene.player.as_mut() {
+            p.character.position = at;
+            p.yaw = heading;
+            p.pitch = 0.0;
+        }
+        for _ in 0..10 {
+            game.step(Intent::default(), tick);
+        }
+        let from = game
+            .scene
+            .player
+            .as_ref()
+            .map_or(Vec3::ZERO, |p| p.character.position);
+        for _ in 0..(4.0 / tick) as u32 {
+            game.step(intent, tick);
+        }
+        let p = game.scene.player.as_ref();
+        let to = p.map_or(Vec3::ZERO, |p| p.character.position);
+        eprintln!(
+            "swim-check: {label}: {:.2} m/s, still swimming {}, weapons away {}",
+            (to - from).with_y(0.0).length() / 4.0,
+            p.is_some_and(|p| p.swimming()),
+            p.is_some_and(|p| p.weapons_away())
+        );
+    }
+}
+
 /// `--ladder-check`: she walks to the nearest placed ladder's bottom and
 /// climbs it with the use key and the stick, through the game's tick,
 /// logging each rung. `hold` 0: up and off the top, then back on there

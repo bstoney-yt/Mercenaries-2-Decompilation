@@ -2144,6 +2144,11 @@ impl Scene {
             "hero: {hero} walks {:.2}, runs {:.2}, sprints {:.2} m/s",
             speeds[0], speeds[1], speeds[2]
         );
+        // Swimming, her template's own `SwimWalkSpeed`, `SwimJogSpeed` and
+        // `SwimRunSpeed` (the same three as her `Upright` speeds on foot).
+        let swim = templates.and_then(|t| t.swim_speeds(hero.template()));
+        eprintln!("hero: {hero} swims {swim:?} m/s (walk, jog, run, sprint)");
+        let swim_speeds = swim.map_or([crate::player::SWIM_SPEED; 3], |s| [s[0], s[1], s[2]]);
         // The weapons already loaded were held by the last body's
         // skeleton.
         if let Some((_, rig)) = &mut model {
@@ -2157,6 +2162,7 @@ impl Scene {
         if let Some(player) = &mut self.player {
             player.set_body(model, clips, moves);
             player.speeds = speeds;
+            player.swim_speeds = swim_speeds;
         }
     }
 

@@ -1608,7 +1608,7 @@ impl Game {
                 // guns; inferred from the scripts).
                 let manning = self.combat.manned.is_some() && !field.player.swimming();
                 let mut trigger = if field.player.weapons_away() && !manning {
-                    crate::combat::Trigger::default()
+                    intent.trigger.weapons_away()
                 } else {
                     intent.trigger
                 };

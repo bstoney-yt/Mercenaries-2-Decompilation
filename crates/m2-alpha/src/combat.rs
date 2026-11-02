@@ -1429,6 +1429,29 @@ pub struct Trigger {
     pub pda: bool,
 }
 
+impl Trigger {
+    /// What of it she may do with her weapons away (swimming, or put away
+    /// by the scripts): set off her C4, and the support menu and PDA,
+    /// which are no weapon's; nothing to fire, aim, reload, throw, bash or
+    /// pick.
+    ///
+    /// From samples (the on-foot action table): the `Swim` stance has rows
+    /// for `TriggerDetonator`, `VerifyCamera`, `Grapple`, `Dive`,
+    /// `EnterSwim`, `Idle`, `Die` and `dead` and four unnamed actions, and
+    /// none for firing, aiming, reloading, throwing or a bash. That the
+    /// support menu and PDA stay open to her is inferred: they play no
+    /// clip of the table's.
+    pub fn weapons_away(self) -> Self {
+        Self {
+            detonate: self.detonate,
+            support: self.support,
+            support_down: self.support_down,
+            pda: self.pda,
+            ..Self::default()
+        }
+    }
+}
+
 /// The game's effect templates the fight's own fire and smoke set off,
 /// where no template of the fight's says which (names from the template
 /// database; which source shows which is chosen by name: invented). A
@@ -7160,5 +7183,33 @@ mod tests {
             assert!(!laid(aim, want));
         }
         assert!((aim.0 - 70f32.to_radians()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn with_her_weapons_away_she_may_still_set_off_c4_and_call_support() {
+        let all = Trigger {
+            fire: true,
+            reload: true,
+            aim: true,
+            throw: true,
+            melee: true,
+            select: Some(Weapon::Rifle),
+            next_explosive: true,
+            detonate: true,
+            seat: true,
+            support: true,
+            support_down: true,
+            pda: true,
+        };
+        assert_eq!(
+            all.weapons_away(),
+            Trigger {
+                detonate: true,
+                support: true,
+                support_down: true,
+                pda: true,
+                ..Trigger::default()
+            }
+        );
     }
 }
