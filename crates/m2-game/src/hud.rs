@@ -36,10 +36,20 @@ pub struct Objective {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Blip {
     pub target: Option<u32>,
-    /// Offset from the target, metres.
+    /// Offset from the target, metres (without a target, where it is).
     pub offset: [f32; 3],
     pub colour: [u8; 3],
+    /// Index into the scripts' radar icons
+    /// (`MrxUtil.MarkerGetNameByIndex_Radar`: `"objective_action"`).
     pub icon: i64,
+    /// Kept on the radar's rim while out of its range; else not drawn
+    /// there (from the 360 code, see [`Blip::sticky`]'s use in the
+    /// minimap). An objective's targets are sticky while its mission is
+    /// tracked (`MrxTaskObjective.EnableTracking`).
+    pub sticky: bool,
+    /// Draw order, 1 to 7: lower sorts draw over higher (from the 360
+    /// code: the minimap's renderer draws 7 down to 1, clamping to that).
+    pub sort: i64,
 }
 
 /// A disc on the ground round a target or a point (`Marker.AddDisc`).
@@ -362,6 +372,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 offset: [f(1), f(2), f(3)],
                 colour: [byte(a.get(4)), byte(a.get(5)), byte(a.get(6))],
                 icon: int(a.get(9)),
+                sticky: matches!(a.get(11), Some(Value::Boolean(true))),
+                sort: int(a.get(14)).clamp(1, 7),
             },
         );
         Ok(MultiValue::new())
@@ -629,6 +641,8 @@ mod tests {
             );
             assert_eq!(hud.objectives["734801"].target, Some(734_801));
             assert_eq!(hud.radar["734801"].colour, [255, 200, 0]);
+            assert!(hud.radar["734801"].sticky);
+            assert_eq!(hud.radar["734801"].sort, 5);
             assert_eq!(
                 hud.messages,
                 [ObjectiveMessage {
