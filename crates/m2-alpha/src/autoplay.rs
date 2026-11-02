@@ -1008,6 +1008,8 @@ pub struct Autoplay {
     /// She set a beacon the scripts still wait on (their answer comes the
     /// next tick).
     beacon_set: bool,
+    /// She is stopping to open her PDA (logged once).
+    pda_stop_logged: bool,
     /// The action objective's object whose prompt she last took, and
     /// when; and the one she was last logged at without its prompt.
     acted: Option<(u32, f32)>,
@@ -1158,6 +1160,25 @@ impl Autoplay {
         // The scripts wait for her to look at her PDA (the first contract,
         // at the first gate): she opens it, and shuts it again.
         let wants = |name: &str| awaited.iter().any(|a| a == name);
+        // The stand-in PDA opens on foot only: driving when the scripts
+        // ask for it (OilCon020's beacon tutorial comes on the road), she
+        // stops and gets out first.
+        if wants(PDA_OPEN)
+            && game.support.phase == Phase::Idle
+            && let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving)
+            && self.may_get_out(game, i)
+        {
+            let speed = vehicle_state(game, i).map_or(0.0, |s| s.1);
+            if !self.pda_stop_logged {
+                self.pda_stop_logged = true;
+                eprintln!(
+                    "autoplay {:.1} s: the scripts ask for her PDA: she stops and gets out",
+                    self.clock
+                );
+            }
+            return self.press(speed);
+        }
+        self.pda_stop_logged = false;
         let asked = wants(PDA_OPEN)
             && game.support.phase == Phase::Idle
             && game
@@ -1197,6 +1218,15 @@ impl Autoplay {
         }
         if !wants(GPS_BEACON_SET) {
             self.beacon_set = false;
+        }
+        // Her beacon set, she keeps the PDA open until the scripts answer
+        // it (shut at once, the tutorial's own "PDA Close" watch, that
+        // nags her back, heard it first; OilCon020 round 1).
+        if game.support.pda
+            && (self.beacon_set || game.support.beacon.is_some())
+            && self.pda_since.is_some_and(|t| self.clock - t < PDA_MOST)
+        {
+            return Intent::default();
         }
         if game.support.pda || asked {
             return self.pda(game.support.pda, wants(PDA_CLOSE));
