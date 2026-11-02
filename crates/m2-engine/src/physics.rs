@@ -1016,6 +1016,46 @@ fn preloads(spec: &VehicleSpec, strength: impl Fn(bool) -> f32, mass_z: f32) -> 
         .collect()
 }
 
+/// How a vehicle's hull slides on what it meets when driven: whether it
+/// is a car or motorbike (the game's `_CarPhysicsV2`, whose friction
+/// [`car_hull_friction`] sets each step), and its friction to start.
+///
+/// From the 360 code: a car's step (0x8219ECA4) sets it each step; a
+/// boat's sim (0x82198FF8) sets its template's `HullFriction` once
+/// ([`BoatTuning::hull_friction`]); a tank's and a helicopter's keep
+/// their `PHY2` body's, which is 0.3 on every record (from samples,
+/// [`BodyMaterial::COMMON`]).
+fn hull_feel(spec: &VehicleSpec) -> (bool, f32) {
+    let tank = spec.tracked && spec.tuning.tank.is_some();
+    if spec.is_boat() {
+        (false, spec.tuning.boat.unwrap_or(BOAT).hull_friction)
+    } else if spec.is_bike() {
+        // The 360's bike runs the car's step too (0x8219EE74), so its hull
+        // slides free upright; but the alpha's box hull scrapes the ground
+        // at a lean, and the bike's balance was tuned against it holding
+        // there by this (invented) until it has its own collision.
+        (false, BIKE_HULL_FRICTION)
+    } else if tank || spec.is_helicopter() {
+        (false, BodyMaterial::COMMON.friction)
+    } else {
+        (true, car_hull_friction(1.0))
+    }
+}
+
+/// A car's or motorbike's hull friction while its up axis points
+/// up_y up: none upright, [`CAR_TIPPED_FRICTION`] once on its side or
+/// roof (its up axis level or below). From the 360 code (0x8219ECA4: the
+/// chassis matrix's up y over 0 gives 0, else 0.3, set when it differs).
+fn car_hull_friction(up_y: f32) -> f32 {
+    if up_y > 0.0 { 0.0 } else { CAR_TIPPED_FRICTION }
+}
+
+/// A motorbike's hull friction ([`hull_feel`]). Invented.
+const BIKE_HULL_FRICTION: f32 = 0.6;
+
+/// See [`car_hull_friction`] (its constant 0x820BAF0C).
+const CAR_TIPPED_FRICTION: f32 = 0.3;
+
 /// A tracked vehicle's road wheels' springs and dampers (squeezed,
 /// stretched), per kilogram. Invented.
 const SPRING: f32 = 40.0;
@@ -1084,6 +1124,7 @@ const BOAT: BoatTuning = BoatTuning {
     drag: [0.3, 2.5, 3.0],
     brake: 0.9,
     curve: [1.0; 4],
+    hull_friction: 0.3,
 };
 /// A boat going fast planes (the playthroughs' speedboat rides high, bow
 /// up): from a standstill to this speed, m/s, its hull rises up to this
@@ -1200,6 +1241,9 @@ struct VehicleBody {
     steering: f32,
     /// Wrecked: nothing drives it any more.
     wrecked: bool,
+    /// A car or motorbike (the game's `_CarPhysicsV2`): its hull's
+    /// friction follows how it lies ([`car_hull_friction`]).
+    car_hull: bool,
     /// Held where it is ([`Physics::hold_vehicle`]): its body fixed.
     held: bool,
     /// Its velocity before the last step, m/s: what it hit things with.
@@ -2128,6 +2172,20 @@ impl Physics {
                 push_axles(v, &mut w.bodies, dt);
                 drive_axles(v, &mut w.bodies, dt);
             }
+            if v.car_hull
+                && !v.wrecked
+                && let Some(b) = w.bodies.get(v.controller.chassis)
+            {
+                let up = Quat::from_array(b.position().rotation.to_array()) * Vec3::Y;
+                let friction = car_hull_friction(up.y);
+                for &h in b.colliders() {
+                    if let Some(c) = w.colliders.get_mut(h)
+                        && c.friction() != friction
+                    {
+                        c.set_friction(friction);
+                    }
+                }
+            }
             // More than half its wheels down, it is pulled down by its
             // template's `GravityFactor` less one of its weight more
             // (from the 360 code, at 0x8219EE14, by its gravity of 10 m/s²,
@@ -2447,6 +2505,7 @@ impl Physics {
             let collider = r::ColliderBuilder::new(shape.shape.clone())
                 .density(0.0)
                 .friction(bed.friction)
+                .friction_combine_rule(r::CoefficientCombineRule::Min)
                 .restitution(bed.restitution)
                 .collision_groups(r::InteractionGroups::new(
                     BED,
@@ -2643,10 +2702,21 @@ impl Physics {
             _ => Vec3::new(0.0, -half.y * 0.8, 0.0),
         };
         let hull = r::InteractionGroups::new(VEHICLE, r::Group::ALL, r::InteractionTestMode::And);
+        let (car_hull, hull_friction) = hull_feel(spec);
+        // Havok mixes two bodies' friction as the root of their product;
+        // the least of the two gives the same for the values met here (one
+        // of them 0, or both alike). The bike keeps Rapier's mean (see
+        // [`BIKE_HULL_FRICTION`]).
+        let combine = if spec.is_bike() {
+            r::CoefficientCombineRule::Average
+        } else {
+            r::CoefficientCombineRule::Min
+        };
         let collider = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
             .translation(vector(centre))
             .mass_properties(r::MassProperties::new(vector(com), m, vector(inertia)))
-            .friction(0.6)
+            .friction(hull_friction)
+            .friction_combine_rule(combine)
             .collision_groups(hull);
         self.world.insert_collider(collider, Some(body));
         // The turret on top, adding nothing to the mass the hull carries.
@@ -2655,7 +2725,8 @@ impl Physics {
             let turret = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
                 .translation(vector((lo + hi) * 0.5))
                 .density(0.0)
-                .friction(0.6)
+                .friction(hull_friction)
+                .friction_combine_rule(combine)
                 .collision_groups(hull);
             self.world.insert_collider(turret, Some(body));
         }
@@ -2806,6 +2877,7 @@ impl Physics {
             handling: spec.tuning.handling.filter(|_| !spec.tracked),
             steering: 0.0,
             wrecked: false,
+            car_hull,
             held: false,
             before: Vec3::ZERO,
             hull,
@@ -4376,15 +4448,16 @@ mod tests {
 
     #[test]
     fn goods_ride_loose_on_a_bed_and_slide_when_it_stops_short() {
-        // Rolling on, the crate stays where it was put.
+        // A car's bed holds nothing by friction while it is upright (its
+        // hull's, [`car_hull_friction`]): rolling on as the car slows,
+        // the crate slides forward of where it was put (z -1.1).
         let rolling = crate_on_bed(0.3, false);
-        assert!((rolling + 1.1).abs() < 0.2, "{rolling}");
-        // Stopped short, it slides on forward of where it was.
+        assert!(rolling > -0.9, "{rolling}");
+        // Stopped short, it slides on to the front, however hard it holds.
         let stopped = crate_on_bed(0.3, true);
-        assert!(stopped > -0.3, "{stopped}");
-        // Held harder, it slides less far.
+        assert!(stopped > rolling, "{stopped}");
         let held = crate_on_bed(1.5, true);
-        assert!(held < stopped, "{held} {stopped}");
+        assert!((held - stopped).abs() < 0.05, "{held} {stopped}");
     }
 
     #[test]
@@ -5000,6 +5073,7 @@ mod tests {
                     drag: [0.2, 2.0, 2.0],
                     brake: 3.0,
                     curve: [1.0, 0.7, 0.6, 0.5],
+                    hull_friction: 0.3,
                 }),
                 ..crate::VehicleTuning::default()
             },
@@ -5146,11 +5220,13 @@ mod tests {
             p.step(DT);
         }
         // The beach comes out of the water at z 241; it runs up it at its
-        // top speed (18 m/s since gap round 17, 13 before) and slides on.
+        // top speed (18 m/s since gap round 17, 13 before) and slides on
+        // (further since its hull's 360 friction, 0.3, took the invented
+        // 0.6's place).
         let m = place(&p);
         assert!(p.vehicle_speed(id).abs() < 2.0, "{}", p.vehicle_speed(id));
         assert!(
-            (215.0..265.0).contains(&m.w_axis.z),
+            (215.0..275.0).contains(&m.w_axis.z),
             "aground at {}",
             m.w_axis
         );
@@ -6189,6 +6265,39 @@ mod tests {
         let (sag, t) = ride(60.0, 3.0);
         assert!((sag - 9.81 / 240.0).abs() < 0.01, "{sag}");
         assert!((t - half(60.0, 3.0)).abs() < 0.04, "{t}");
+    }
+
+    #[test]
+    fn a_car_s_hull_slides_free_upright_and_drags_once_tipped() {
+        assert_eq!(car_hull_friction(1.0), 0.0);
+        assert_eq!(car_hull_friction(0.01), 0.0);
+        assert_eq!(car_hull_friction(0.0), CAR_TIPPED_FRICTION);
+        assert_eq!(car_hull_friction(-1.0), 0.3);
+        assert_eq!(hull_feel(&car()), (true, 0.0));
+        assert_eq!(hull_feel(&helicopter()), (false, 0.3));
+        let mut b = boat();
+        b.tuning.boat = Some(BoatTuning {
+            hull_friction: 0.6,
+            ..BOAT
+        });
+        assert_eq!(hull_feel(&b), (false, 0.6));
+        // Put down on its roof, a step on its hull holds on.
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        p.step(DT);
+        let id = p.add_vehicle_turned(
+            &car(),
+            Vec3::new(0.0, 2.0, 0.0),
+            Quat::from_rotation_z(std::f32::consts::PI),
+        );
+        let hull = |p: &Physics| {
+            let v = p.vehicles[id.0].as_ref().unwrap();
+            let b = p.world.bodies.get(v.controller.chassis).unwrap();
+            p.world.colliders.get(b.colliders()[0]).unwrap().friction()
+        };
+        assert_eq!(hull(&p), 0.0);
+        p.step(DT);
+        assert_eq!(hull(&p), CAR_TIPPED_FRICTION);
     }
 
     #[test]
