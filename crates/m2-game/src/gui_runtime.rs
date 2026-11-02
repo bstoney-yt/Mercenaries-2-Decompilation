@@ -1463,15 +1463,21 @@ impl Args {
     }
 }
 
-/// The box `SetWidgetLocation(id, x1, y1, x2, y2)` asks for: without `x2`
-/// and `y2` the widget moves to `x1`, `y1` and keeps its size (the
-/// reticle follows the aim so).
+/// The box `SetWidgetLocation(id, x1, y1, x2, y2)` asks for, as the 360's
+/// native (0x8231CA30) reads it: with `x1` and `y1` and neither `x2` nor
+/// `y2` the widget moves there and keeps its size (the reticle follows
+/// the aim so); otherwise each coordinate not given keeps its value (the
+/// dialog box's cursor takes an option's `nil, y1, nil, y2`).
 fn new_location(s: &Screen, a: &Args) -> [f32; 4] {
     let old = s.rect(a.id(0));
-    let (x1, y1) = (a.f(1).unwrap_or(old[0]), a.f(2).unwrap_or(old[1]));
-    match (a.f(3), a.f(4)) {
-        (Some(x2), Some(y2)) => [x1, y1, x2, y2],
-        _ => [x1, y1, x1 + old[2] - old[0], y1 + old[3] - old[1]],
+    match [a.f(1), a.f(2), a.f(3), a.f(4)] {
+        [Some(x1), Some(y1), None, None] => [x1, y1, x1 + old[2] - old[0], y1 + old[3] - old[1]],
+        [x1, y1, x2, y2] => [
+            x1.unwrap_or(old[0]),
+            y1.unwrap_or(old[1]),
+            x2.unwrap_or(old[2]),
+            y2.unwrap_or(old[3]),
+        ],
     }
 }
 
@@ -2525,6 +2531,29 @@ mod tests {
             "_GuiInternal.ActivateWidget(shown, false) _GuiInternal.ActivateWidget(shown, true)",
         );
         assert_eq!(texts(), ["now", "later"]);
+    }
+
+    /// `SetWidgetLocation` with coordinates left out, as the 360 reads it.
+    #[test]
+    fn a_location_left_out_keeps_its_value() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            bar = G.CreateImageWidget()
+            G.SetWidgetLocation(bar, 180, 1, 458, 2)
+            -- The dialog box's cursor onto an option's row.
+            G.SetWidgetLocation(bar, nil, 150, nil, 170)
+            moved = G.CreateImageWidget()
+            G.SetWidgetLocation(moved, 10, 10, 30, 20)
+            G.SetWidgetLocation(moved, 100, 50)
+            "#,
+        );
+        let s = screen.borrow();
+        let id = |name: &str| host.lua().globals().get::<u32>(name).unwrap();
+        assert_eq!(s.rect(id("bar")), [180.0, 150.0, 458.0, 170.0]);
+        assert_eq!(s.rect(id("moved")), [100.0, 50.0, 120.0, 60.0]);
     }
 
     /// `MrxGuiDialogBox._BuildDialogBox` as it orders its widgets: the
