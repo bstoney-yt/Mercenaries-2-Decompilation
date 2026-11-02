@@ -128,33 +128,81 @@ impl TankTuning {
     }
 }
 
-/// How a helicopter flies, from its `_HelicopterPhysics` (names found by
-/// hash, 2026-10-08; the AH-1Z's values in brackets).
+/// How a helicopter flies: its `_HelicopterPhysics` record, field for
+/// field as the 360 code's schema (0x823EBFA0) lays it out, with the
+/// schema's defaults ([`FlightTuning::DEFAULT`]) for a field the record
+/// leaves out (the AH-1Z's values in brackets). Speeds are m/s and turn
+/// rates radians a second: the 360 code sets them against the body's own
+/// velocities. The `*Acc`, `*Accel` and `YawDamp` fields are gains a
+/// second. `physics.rs` (`fly_helicopters`) flies it with them.
+///
+/// The record's `Mass` is the body's; its `KickBack` isn't read by the
+/// flight code.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlightTuning {
-    /// Fastest climb or descent, forwards, sideways, m/s
-    /// (`MaxElevationSpeed` 25, `MaxFwdSpeed` 30, `MaxRightSpeed` 30).
+    /// `MaxElevationSpeed`, `MaxFwdSpeed`, `MaxRightSpeed`: its fastest
+    /// climb, ahead and sideways (25, 30, 30).
     pub climb: f32,
     pub forward: f32,
     pub sideways: f32,
-    /// Fastest turn (`maxYawSpeed` 3.5) and, below `low_speed`
-    /// (`LowSpeedLimit` 25), its turn on the spot (`LowSpeedYawSpeed`
-    /// 6.5); units unknown.
+    /// `FwdSpeedAcc`, `RightSpeedAcc`: how hard it pulls towards the speed
+    /// asked ahead and sideways.
+    pub forward_accel: f32,
+    pub sideways_accel: f32,
+    /// `MaxYawSpeed` (3.5), `YawAcc`, `YawDamp`: its fastest turn, how
+    /// hard it turns towards the rate asked, and how hard it stops
+    /// turning when asked for almost none.
     pub yaw: f32,
-    pub low_speed: f32,
-    pub low_speed_yaw: f32,
-    /// How far the nose dips flying forwards, radians (`MaxPitch` 0.4),
-    /// and how quickly (`PitchAccel` 0.9).
+    pub yaw_accel: f32,
+    pub yaw_damp: f32,
+    /// `MaxPitch` (0.4), `PitchAccel` (0.9): how far its nose dips,
+    /// radians, and how quickly it pitches to it.
     pub pitch: f32,
     pub pitch_accel: f32,
-    /// How far it rolls sliding sideways and banking into a turn,
-    /// radians (`MaxRollSide` 0.3, `MaxRollBank` 0.3), and how quickly
-    /// (`RollAccel` 1.0); it banks fully from `bank_speed` (`BankSpeedLimit`
-    /// 25 m/s).
+    /// `MaxRollFwd`, `MaxRollSide` (0.3), `RollAccel` (1): how far it
+    /// rolls turning and sliding sideways, radians, and how quickly.
+    pub roll_forward: f32,
     pub roll_side: f32,
-    pub roll_bank: f32,
     pub roll_accel: f32,
+    /// `LowSpeedYawSpeed` (6.5), its turn below `LowSpeedLimit` (25), and
+    /// the share of its turn it loses at top speed (`HiSpeedYawLoss`).
+    pub low_speed_yaw: f32,
+    pub low_speed: f32,
+    pub high_speed_yaw_loss: f32,
+    /// `BankSpeedLimit` (25), `MaxRollBank` (0.3), `BankYawAmplification`:
+    /// how it banks into a sideways slide at speed and turns with it.
     pub bank_speed: f32,
+    pub roll_bank: f32,
+    pub bank_yaw: f32,
+    /// `FwdSpeedNoInputInertia`: how much less it pulls with the stick
+    /// let go.
+    pub no_input_inertia: f32,
+}
+
+impl FlightTuning {
+    /// The schema's defaults (0x823EBFA0).
+    pub const DEFAULT: Self = Self {
+        climb: 10.0,
+        forward: 30.0,
+        sideways: 20.0,
+        forward_accel: 1.0,
+        sideways_accel: 3.0,
+        yaw: 1.5,
+        yaw_accel: 2.0,
+        yaw_damp: 15.0,
+        pitch: 0.75,
+        pitch_accel: 5.0,
+        roll_forward: 0.5,
+        roll_side: 0.33,
+        roll_accel: 3.33,
+        low_speed_yaw: 1.5,
+        low_speed: 0.0,
+        high_speed_yaw_loss: 0.0,
+        bank_speed: 0.0,
+        roll_bank: 0.0,
+        bank_yaw: 0.0,
+        no_input_inertia: 0.0,
+    };
 }
 
 /// A boat's engine and how the water slows it, from its `_BoatPhysics`
@@ -1591,20 +1639,30 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                     })
                 })(),
                 flight: (|| {
-                    let f = |name| heli.get(id, name);
+                    let r = *heli.of_template(id).first()?;
+                    let d = FlightTuning::DEFAULT;
+                    let f = |name, default| heli.float(r, name_hash(name)).unwrap_or(default);
                     Some(FlightTuning {
-                        climb: f("MaxElevationSpeed")?,
-                        forward: f("MaxFwdSpeed")?,
-                        sideways: f("MaxRightSpeed")?,
-                        yaw: f("maxYawSpeed")?,
-                        low_speed: f("LowSpeedLimit")?,
-                        low_speed_yaw: f("LowSpeedYawSpeed")?,
-                        pitch: f("MaxPitch")?,
-                        pitch_accel: f("PitchAccel")?,
-                        roll_side: f("MaxRollSide")?,
-                        roll_bank: f("MaxRollBank")?,
-                        roll_accel: f("RollAccel")?,
-                        bank_speed: f("BankSpeedLimit")?,
+                        climb: f("MaxElevationSpeed", d.climb),
+                        forward: f("MaxFwdSpeed", d.forward),
+                        sideways: f("MaxRightSpeed", d.sideways),
+                        forward_accel: f("FwdSpeedAcc", d.forward_accel),
+                        sideways_accel: f("RightSpeedAcc", d.sideways_accel),
+                        yaw: f("MaxYawSpeed", d.yaw),
+                        yaw_accel: f("YawAcc", d.yaw_accel),
+                        yaw_damp: f("YawDamp", d.yaw_damp),
+                        pitch: f("MaxPitch", d.pitch),
+                        pitch_accel: f("PitchAccel", d.pitch_accel),
+                        roll_forward: f("MaxRollFwd", d.roll_forward),
+                        roll_side: f("MaxRollSide", d.roll_side),
+                        roll_accel: f("RollAccel", d.roll_accel),
+                        low_speed_yaw: f("LowSpeedYawSpeed", d.low_speed_yaw),
+                        low_speed: f("LowSpeedLimit", d.low_speed),
+                        high_speed_yaw_loss: f("HiSpeedYawLoss", d.high_speed_yaw_loss),
+                        bank_speed: f("BankSpeedLimit", d.bank_speed),
+                        roll_bank: f("MaxRollBank", d.roll_bank),
+                        bank_yaw: f("BankYawAmplification", d.bank_yaw),
+                        no_input_inertia: f("FwdSpeedNoInputInertia", d.no_input_inertia),
                     })
                 })(),
                 boat: (|| {

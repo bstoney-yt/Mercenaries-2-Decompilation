@@ -1139,17 +1139,25 @@ const PLANE_TRIM: f32 = 0.25;
 /// almost any hill"; the steepness is invented).
 const CLIMB_TRACKED: f32 = 0.87;
 
-/// A helicopter's turn at full stick, of its template's `maxYawSpeed`
-/// (whose units are unknown): the AH-1Z's 3.5 gives 1.2 radians a second.
-/// Inferred; check against footage.
-const YAW_SHARE: f32 = 0.35;
-/// How quickly a helicopter's speed follows the stick, a second: across
-/// and along, and up and down. Inferred.
-const FLY_EASE: f32 = 0.6;
-const CLIMB_EASE: f32 = 1.5;
-/// How quickly it leans to the tilt its stick asks, a second (its
-/// template's `PitchAccel` and `RollAccel` scale it).
-const LEAN_EASE: f32 = 3.0;
+/// How quickly a helicopter's rotor spins up with the climb held, of its
+/// full speed a second (from the 360 code, 0x821A2150).
+const ROTOR_SPIN_UP: f32 = 0.25;
+/// What a helicopter's rotor keeps of its speed each 1/60 s as it winds
+/// down on the ground with no climb asked (0.99, from 0.1 of full speed
+/// 0.95), with the descent held (0.975), and wrecked (0.925); from the
+/// 360 code (0x821A2150).
+const ROTOR_IDLE: (f32, f32) = (0.99, 0.95);
+const ROTOR_DOWN: f32 = 0.975;
+const ROTOR_WRECKED: f32 = 0.925;
+/// From this height up a helicopter's lift fades out over
+/// [`CEILING_FADE`] metres (from the 360 code, 0x821A25E0: 500 m and 0.01
+/// a metre).
+const CEILING: f32 = 500.0;
+const CEILING_FADE: f32 = 100.0;
+/// A helicopter asked to turn slower than this, radians a second, stops
+/// turning with its template's `YawDamp` instead of `YawAcc` (from the
+/// 360 code, 0x821A25E0).
+const YAW_STILL: f32 = 0.2;
 /// A motorbike's balance when its template gives none (invented: the
 /// Scooter's record, one of the island's commonest bikes).
 const BIKE: BikeTuning = BikeTuning {
@@ -1260,6 +1268,198 @@ struct Rotorcraft {
     controls: VehicleControls,
     /// Up (1) or down (-1).
     lift: f32,
+    /// How it flies now, as the 360 code keeps it ([`Rotor`]).
+    state: Rotor,
+}
+
+/// What a helicopter's `_HelicopterPhysics` keeps from step to step
+/// (from the 360 code: its object's 0x3C, 0x38, 0x50 and 0x4C).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Rotor {
+    /// Its rotor's speed, of full (0 to 1): it lifts only at full.
+    spin: f32,
+    /// The climb it works to, of its fastest (-1 to 1): eases to the
+    /// climb asked by its difference a second.
+    climb: f32,
+    /// How long it has been off everything, and on something, seconds
+    /// (each at most 1, the other 0).
+    air: f32,
+    ground: f32,
+}
+
+/// What a helicopter's pilot asks, each -1 to 1 (from the 360 code: the
+/// messages 0x8218C018 stores at its object's 0x28 to 0x34).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Stick {
+    /// Climb (+) or descend.
+    lift: f32,
+    /// Turn right (+) or left.
+    yaw: f32,
+    /// Ahead (+) or back.
+    ahead: f32,
+    /// Slide right (+) or left.
+    right: f32,
+}
+
+/// What a helicopter's step does to its body ([`Rotor::fly`]): the
+/// impulse on its middle, N s, the angular velocity it is given across
+/// (x and z; its y is kept), rad/s, and the torque turning it about y,
+/// N m, for the step.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Flown {
+    impulse: Vec3,
+    spin_across: Option<(f32, f32)>,
+    torque_y: f32,
+}
+
+/// What the 360 code's `x` keeps of itself after `dt` seconds at `keep`
+/// each 1/60 s, the last part of a 60th blended (0x821A3B38).
+fn keep_per_frame(mut x: f32, keep: f32, mut dt: f32) -> f32 {
+    const FRAME: f32 = 1.0 / 60.0;
+    while dt > FRAME {
+        if x * x < (keep * 1e-5) * (keep * 1e-5) {
+            return 0.0;
+        }
+        dt -= FRAME;
+        x *= keep;
+    }
+    let part = dt * 60.0;
+    x * keep * part + x * (1.0 - part)
+}
+
+impl Rotor {
+    /// Its rotor's spin (0x821A2150) and how long it has been in the air
+    /// or on something (0x821A2010), for `dt` seconds of `stick`; wrecked,
+    /// its rotor winds down. `touching`: its body touches anything.
+    fn spin(&mut self, stick: Stick, wrecked: bool, touching: bool, dt: f32) {
+        self.spin = if wrecked {
+            keep_per_frame(self.spin, ROTOR_WRECKED, dt)
+        } else if stick.lift > 0.0 {
+            self.spin + dt * ROTOR_SPIN_UP
+        } else if self.ground <= 0.5 {
+            self.spin
+        } else if stick.lift == 0.0 {
+            let keep = if self.spin <= 0.1 {
+                ROTOR_IDLE.1
+            } else {
+                ROTOR_IDLE.0
+            };
+            keep_per_frame(self.spin, keep, dt)
+        } else {
+            keep_per_frame(self.spin, ROTOR_DOWN, dt)
+        }
+        .clamp(0.0, 1.0);
+        if touching {
+            self.ground = (self.ground + dt).min(1.0);
+            self.air = 0.0;
+        } else {
+            self.air = (self.air + dt).min(1.0);
+            self.ground = 0.0;
+        }
+    }
+
+    /// One step of the 360 code's helicopter (0x821A38F0, after its
+    /// rotor and timers, [`spin`](Self::spin)): it rolls and pitches to
+    /// what the stick asks (0x821A2C28), pulls towards the speeds asked
+    /// ahead and sideways, turns at the rate asked and climbs at the rate
+    /// asked (0x821A25E0). `turn` is its rotation, `velocity` and `angular`
+    /// its body's, `height` its middle's, `mass` its, `gravity` the
+    /// world's pull, m/s².
+    #[allow(clippy::too_many_arguments)]
+    fn fly(
+        &mut self,
+        f: &FlightTuning,
+        stick: Stick,
+        turn: Quat,
+        velocity: Vec3,
+        angular: Vec3,
+        height: f32,
+        mass: f32,
+        gravity: f32,
+        dt: f32,
+    ) -> Flown {
+        let mut out = Flown::default();
+        let spin = self.spin;
+        let spin2 = spin * spin;
+        let air = (self.air * 4.0).clamp(0.0, 1.0);
+        let x = turn * Vec3::X;
+        let z = turn * Vec3::Z;
+        let hspeed = velocity.with_y(0.0).length();
+        // How far it banks into a slide at speed (0x821A3210).
+        let bank = {
+            let span = f.forward - f.bank_speed;
+            if span > 0.0 && stick.right * stick.yaw > -1e-4 {
+                ((hspeed - f.bank_speed) / span).clamp(0.0, 1.0) * f.roll_bank
+            } else {
+                0.0
+            }
+        };
+        if spin > 0.0 {
+            let share = (velocity.dot(z) / f.forward).clamp(-1.0, 1.0);
+            let roll = (x.y / x.length()).clamp(-1.0, 1.0).asin();
+            let pitch = z.y.atan2(z.with_y(0.0).length());
+            let want_roll = (0.25 + 0.75 * share) * f.roll_forward * stick.yaw
+                + air * stick.right * (f.roll_side + bank);
+            let want_pitch =
+                -share * f.pitch * 0.66 - air * stick.ahead.clamp(-1.0, 1.0) * f.pitch * 0.33;
+            let roll_rate = f.roll_accel * (want_roll - roll);
+            let pitch_rate = f.pitch_accel * (want_pitch - pitch);
+            let across = |zc: f32, xc: f32, w: f32| {
+                spin2 * (roll_rate * zc - pitch_rate * xc) + (1.0 - spin2) * w
+            };
+            out.spin_across = Some((across(z.x, x.x, angular.x), across(z.z, x.z, angular.z)));
+        }
+        let ahead = z.with_y(0.0).normalize_or_zero();
+        let right = (-x).with_y(0.0).normalize_or_zero();
+        // Ahead and sideways.
+        let stick_ahead = stick.ahead.clamp(-1.0, 1.0);
+        let pull = f.forward_accel * (1.0 - (1.0 - stick.ahead * stick.ahead) * f.no_input_inertia);
+        out.impulse += ahead
+            * (pull * (stick_ahead * f.forward - ahead.dot(velocity)) * mass * dt * spin * air);
+        out.impulse += right
+            * (f.sideways_accel
+                * (stick.right.clamp(-1.0, 1.0) * f.sideways - right.dot(velocity))
+                * air
+                * mass
+                * dt
+                * spin);
+        // Its turn: faster slow, less so at speed.
+        let rate = if hspeed < f.low_speed {
+            let t = hspeed / f.low_speed;
+            (1.0 - t) * f.low_speed_yaw + t * f.yaw
+        } else if f.forward - f.low_speed > 0.0 {
+            let t = ((hspeed - f.low_speed) / (f.forward - f.low_speed)).min(1.0);
+            (1.0 - t * f.high_speed_yaw_loss) * f.yaw
+        } else {
+            (1.0 - f.high_speed_yaw_loss) * f.yaw
+        };
+        // As the 360 code's, positive turns right: anticlockwise from
+        // above is +y.
+        let want = -(stick.yaw * rate + bank * f.bank_yaw * stick.right);
+        let gain = if want.abs() < YAW_STILL {
+            f.yaw_damp
+        } else {
+            f.yaw_accel
+        };
+        out.torque_y = gain * (want - angular.y) * air * spin * mass;
+        // Its climb, at full rotor only: the weight held, the climb
+        // asked, fading out above the ceiling.
+        if spin == 1.0 {
+            self.climb =
+                (self.climb + (stick.lift.clamp(-1.0, 1.0) - self.climb) * dt).clamp(-1.0, 1.0);
+            let high = ((height - CEILING) / CEILING_FADE).clamp(0.0, 1.0);
+            out.impulse.y += (f.climb * self.climb - velocity.y + 1.0)
+                * gravity
+                * spin
+                * (1.0 - high)
+                * spin2
+                * mass
+                * dt;
+        } else {
+            self.climb = 0.0;
+        }
+        out
+    }
 }
 
 /// One axle's tyres as its driver works them ([`Tyres`]): its coefficient
@@ -2310,54 +2510,63 @@ impl Physics {
         }
     }
 
-    /// Flies helicopters as their pilots ask: speed along, up and down
-    /// eases to what the stick asks of the template's fastest
-    /// (`MaxFwdSpeed`, `MaxElevationSpeed`), it turns at its share of
-    /// `maxYawSpeed`, dips its nose to `MaxPitch` flying forwards and
-    /// banks to `MaxRollBank` turning at speed. With nobody flying it (or
-    /// wrecked) its rotor stops holding it up and it falls.
+    /// Flies helicopters as the 360 code's `_HelicopterPhysics` does
+    /// ([`Rotor`]): the climb held spins its rotor up, and only at full
+    /// speed does it hold its weight and climb; it rolls and pitches to
+    /// the stick, pulls towards the speed asked and turns at the rate
+    /// asked. The stick: the throttle ahead, the steering (positive left,
+    /// as the wheels) its turn, [`fly`](Self::fly) its climb; it has no
+    /// sideways slide. Nobody flying it, its stick is let go (as the
+    /// game's message 0x6C5F1491 zeroes it): in the air it hovers, on
+    /// the ground its rotor winds down. Wrecked, its rotor winds down
+    /// and it falls.
     fn fly_helicopters(&mut self, dt: f32) {
-        for v in self.vehicles.iter().flatten() {
-            let Some(r) = v.rotor.as_ref().filter(|_| !v.held) else {
+        for v in self.vehicles.iter_mut().flatten() {
+            let Some(r) = v.rotor.as_mut().filter(|_| !v.held) else {
                 continue;
             };
+            let Some(b) = self.world.bodies.get(v.controller.chassis) else {
+                continue;
+            };
+            let touching = b.colliders().iter().any(|&c| {
+                self.world
+                    .narrow_phase
+                    .contact_pairs_with(c)
+                    .any(|p| p.has_any_active_contact())
+            });
+            let c = r.controls;
+            let stick = if v.wrecked || c.parked {
+                Stick::default()
+            } else {
+                Stick {
+                    lift: r.lift.clamp(-1.0, 1.0),
+                    yaw: -c.steer.clamp(-1.0, 1.0),
+                    ahead: c.throttle.clamp(-1.0, 1.0),
+                    right: 0.0,
+                }
+            };
+            r.state.spin(stick, v.wrecked, touching, dt);
             let Some(b) = self.world.bodies.get_mut(v.controller.chassis) else {
                 continue;
             };
-            let c = r.controls;
-            if v.wrecked || c.parked {
-                b.set_gravity_scale(1.0, true);
-                continue;
+            let p = b.position();
+            let flown = r.state.fly(
+                &r.flight,
+                stick,
+                Quat::from_array(p.rotation.to_array()),
+                vec3(b.linvel()),
+                vec3(b.angvel()),
+                p.translation.y,
+                b.mass(),
+                GRAVITY,
+                dt,
+            );
+            if let Some((x, z)) = flown.spin_across {
+                let w = vec3(b.angvel());
+                b.set_angvel(vector(Vec3::new(x, w.y, z)), true);
             }
-            b.set_gravity_scale(0.0, true);
-            let f = r.flight;
-            let turn = Quat::from_array(b.position().rotation.to_array());
-            let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or(Vec3::Z);
-            let heading = ahead.x.atan2(ahead.z);
-            let velocity = vec3(b.linvel());
-            let flat = velocity.with_y(0.0);
-            let throttle = c.throttle.clamp(-1.0, 1.0);
-            let steer = c.steer.clamp(-1.0, 1.0);
-            let want = ahead * throttle * f.forward;
-            let flat = flat + (want - flat) * (FLY_EASE * dt).min(1.0);
-            let rise = velocity.y
-                + (r.lift.clamp(-1.0, 1.0) * f.climb - velocity.y) * (CLIMB_EASE * dt).min(1.0);
-            b.set_linvel(vector(flat + Vec3::Y * rise), true);
-            // Nose down flying forwards; banked into a turn at speed (as
-            // the wheels, positive steering turns left; +x is its left).
-            let bank = (flat.length() / f.bank_speed.max(1.0)).min(1.0);
-            let lean = Quat::from_rotation_y(heading)
-                * Quat::from_rotation_x(throttle * f.pitch)
-                * Quat::from_rotation_z(-steer * f.roll_bank * bank);
-            let mut error = lean * turn.inverse();
-            if error.w < 0.0 {
-                error = -error;
-            }
-            let (axis, angle) = error.to_axis_angle();
-            let rate = LEAN_EASE * 0.5 * (f.pitch_accel + f.roll_accel);
-            let yaw = steer * f.yaw * YAW_SHARE;
-            let spin = (axis * angle * rate).with_y(0.0) + Vec3::Y * yaw;
-            b.set_angvel(vector(spin), true);
+            b.apply_impulse(vector(flown.impulse), true);
+            b.apply_torque_impulse(vector(Vec3::Y * flown.torque_y * dt), true);
         }
     }
 
@@ -2662,11 +2871,12 @@ impl Physics {
             r::RigidBodyBuilder::dynamic()
                 .pose(pose(position, rotation))
                 // A boat's water drag slows it instead
-                // ([`Physics::float_boats`]).
-                .linear_damping(if spec.is_boat() {
+                // ([`Physics::float_boats`]); a helicopter pulls itself to
+                // the speed it is asked ([`Rotor::fly`]), with Havok's
+                // default of no damping (the 360 body builder's damping of
+                // a vehicle isn't traced).
+                .linear_damping(if spec.is_boat() || spec.is_helicopter() {
                     0.0
-                } else if spec.is_helicopter() {
-                    0.1
                 } else {
                     GROUND_DAMPING
                 })
@@ -2847,6 +3057,7 @@ impl Physics {
                     ..VehicleControls::default()
                 },
                 lift: 0.0,
+                state: Rotor::default(),
             });
         let top = if boat { BOAT_TOP } else { TOP_SPEED };
         let tyres = (!spec.tracked).then(|| spec.tuning.tyres.unwrap_or(Tyres::DEFAULT));
@@ -4582,15 +4793,23 @@ mod tests {
                     climb: 25.0,
                     forward: 30.0,
                     sideways: 30.0,
+                    forward_accel: 0.8,
+                    sideways_accel: 1.0,
                     yaw: 3.5,
-                    low_speed: 25.0,
-                    low_speed_yaw: 6.5,
+                    yaw_accel: 3.0,
+                    yaw_damp: 1.0,
                     pitch: 0.4,
                     pitch_accel: 0.9,
+                    roll_forward: 0.5,
                     roll_side: 0.3,
-                    roll_bank: 0.3,
                     roll_accel: 1.0,
+                    low_speed_yaw: 6.5,
+                    low_speed: 25.0,
+                    high_speed_yaw_loss: 0.2,
                     bank_speed: 25.0,
+                    roll_bank: 0.3,
+                    bank_yaw: 5.0,
+                    no_input_inertia: 0.6,
                 }),
                 ..Default::default()
             },
@@ -4969,8 +5188,13 @@ mod tests {
         assert!(lean.abs() < 0.01, "settled at {lean}");
     }
 
+    /// The AH-1Z flown as the 360 code flies it (0x821A38F0): the climb
+    /// held spins its rotor up for 4 s before it lifts, then it climbs at
+    /// its `MaxElevationSpeed`; flat out it reaches its `MaxFwdSpeed`
+    /// with its nose down; it turns and banks the way it is steered; let
+    /// go in the air it hovers, and wrecked it falls.
     #[test]
-    fn a_helicopter_climbs_flies_turns_and_falls_unflown() {
+    fn a_helicopter_spins_up_climbs_flies_turns_and_falls_wrecked() {
         let mut p = Physics::new();
         let ground = CollisionShape::cuboid(Vec3::new(2000.0, 1.0, 2000.0));
         p.add_static(
@@ -4982,62 +5206,66 @@ mod tests {
         let id = p.add_vehicle(&helicopter(), Vec3::new(0.0, 0.1, 0.0), 0.0);
         assert!(p.flies(id));
         let place = |p: &Physics| p.vehicle_transform(id).unwrap();
+        let parked = VehicleControls {
+            parked: true,
+            ..Default::default()
+        };
         // Parked, it sits on the ground.
         for _ in 0..120 {
-            p.drive(
-                id,
-                VehicleControls {
-                    parked: true,
-                    ..Default::default()
-                },
-            );
+            p.drive(id, parked);
             p.step(DT);
         }
-        assert!(
-            place(&p).w_axis.y.abs() < 0.3,
-            "sits at {}",
-            place(&p).w_axis.y
-        );
-        // Flown up for two seconds: well off the ground, still level.
+        let floor = place(&p).w_axis.y;
+        assert!(floor.abs() < 0.3, "sits at {floor}");
         let flown = |throttle: f32, steer: f32| VehicleControls {
             throttle,
             steer,
             ..Default::default()
         };
+        // The climb held: for most of 4 s its rotor spins up and it stays
+        // put, then it lifts.
         p.fly(id, 1.0);
-        for _ in 0..120 {
+        for _ in 0..210 {
             p.drive(id, flown(0.0, 0.0));
             p.step(DT);
         }
-        let up = place(&p).w_axis.y;
-        assert!(up > 20.0, "climbed to {up}");
+        let y = place(&p).w_axis.y;
+        assert!((y - floor).abs() < 0.3, "spinning up at {y}");
+        for _ in 0..360 {
+            p.drive(id, flown(0.0, 0.0));
+            p.step(DT);
+        }
+        let climb = p.vehicle_velocity(id).y;
+        assert!((climb - 25.0).abs() < 1.0, "climbs at {climb}");
         assert!(place(&p).transform_vector3(Vec3::Y).y > 0.99, "level");
-        // Let go of the climb: it slows to a hover.
+        // Let go of the climb: it eases to a hover.
         p.fly(id, 0.0);
-        for _ in 0..240 {
+        for _ in 0..600 {
             p.drive(id, flown(0.0, 0.0));
             p.step(DT);
         }
         let up = place(&p).w_axis.y;
         assert!(p.vehicle_velocity(id).length() < 0.5, "hovers");
-        // Holding its height, flat out ahead: fast, nose down.
-        for _ in 0..600 {
+        // Holding its height, flat out ahead: its top speed, nose down
+        // by its `MaxPitch` (0.66 for its speed, 0.33 for the stick).
+        for _ in 0..1500 {
             p.drive(id, flown(1.0, 0.0));
             p.step(DT);
         }
         let m = place(&p);
         let v = p.vehicle_velocity(id);
-        assert!(v.with_y(0.0).length() > 25.0, "flies at {v}");
+        assert!((v.with_y(0.0).length() - 30.0).abs() < 0.5, "flies at {v}");
         assert!(
             (m.w_axis.y - up).abs() < 3.0,
             "held its height: {}",
             m.w_axis.y
         );
-        assert!(m.transform_vector3(Vec3::Z).y < -0.3, "nose down");
+        let nose = -m.transform_vector3(Vec3::Z).y.asin();
+        assert!((nose - 0.99 * 0.4).abs() < 0.03, "nose down {nose}");
         // Steering left (positive, as the wheels) turns it left
         // (anticlockwise from above) and banks it left side down.
         let before = m.transform_vector3(Vec3::Z);
-        for _ in 0..30 {
+        for _ in 0..60 {
             p.drive(id, flown(1.0, 1.0));
             p.step(DT);
         }
@@ -5045,18 +5273,50 @@ mod tests {
         let after = m.transform_vector3(Vec3::Z);
         assert!(before.cross(after).y > 0.0, "turned left");
         assert!(m.transform_vector3(Vec3::X).y < -0.05, "banked");
-        // Nobody flying it: it falls.
-        for _ in 0..60 {
-            p.drive(
-                id,
-                VehicleControls {
-                    parked: true,
-                    ..Default::default()
-                },
-            );
+        // Nobody flying it in the air: its stick let go, it hovers.
+        for _ in 0..600 {
+            p.drive(id, parked);
+            p.step(DT);
+        }
+        assert!(p.vehicle_velocity(id).length() < 1.0, "hovers unflown");
+        // Wrecked, its rotor winds down and it falls.
+        p.wreck_vehicle(id);
+        for _ in 0..90 {
             p.step(DT);
         }
         assert!(p.vehicle_velocity(id).y < -5.0, "falls");
+    }
+
+    /// The 360 code's per-60th decay (0x821A3B38): a whole number of
+    /// 60ths keep `keep` each, a part of one blends.
+    #[test]
+    fn a_rotor_winds_down_per_sixtieth() {
+        let keep = keep_per_frame(1.0, 0.99, 1.0);
+        assert!((keep - 0.99f32.powi(60)).abs() < 1e-3, "{keep}");
+        let half = keep_per_frame(1.0, 0.9, 0.5 / 60.0);
+        assert!((half - 0.95).abs() < 1e-5, "{half}");
+    }
+
+    /// The rotor (0x821A2150): the climb spins it up a quarter a second;
+    /// in the air it keeps its speed; on the ground half a second, let go,
+    /// it winds down.
+    #[test]
+    fn a_rotor_spins_up_and_winds_down_on_the_ground() {
+        let up = Stick {
+            lift: 1.0,
+            ..Stick::default()
+        };
+        let mut r = Rotor::default();
+        r.spin(up, false, true, 2.0);
+        assert_eq!(r.spin, 0.5);
+        r.spin(up, false, false, 3.0);
+        assert_eq!(r.spin, 1.0);
+        r.spin(Stick::default(), false, false, 1.0);
+        assert_eq!(r.spin, 1.0, "kept in the air");
+        r.spin(Stick::default(), false, true, 1.0);
+        assert_eq!(r.spin, 1.0, "kept its first half second down");
+        r.spin(Stick::default(), false, true, 1.0);
+        assert!((r.spin - 0.99f32.powi(60)).abs() < 1e-3, "{}", r.spin);
     }
 
     /// The Speed Boat's `_BoatPhysics` (gap round 17): flat out it
