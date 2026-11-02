@@ -2148,7 +2148,8 @@ impl Scene {
         // `SwimRunSpeed` (the same three as her `Upright` speeds on foot).
         let swim = templates.and_then(|t| t.swim_speeds(hero.template()));
         eprintln!("hero: {hero} swims {swim:?} m/s (walk, jog, run, sprint)");
-        let swim_speeds = swim.map_or([crate::player::SWIM_SPEED; 3], |s| [s[0], s[1], s[2]]);
+        let swim = swim.unwrap_or(crate::player::SWIM_SPEEDS);
+        let swim_speeds = [swim[0], swim[1], swim[2]];
         // The weapons already loaded were held by the last body's
         // skeleton.
         if let Some((_, rig)) = &mut model {
@@ -2608,10 +2609,16 @@ impl Scene {
                     .filter(|_| named)
                     .and_then(|db| db.own_rifle(&p.role))
                     .map(|(name, gun)| (name.to_owned(), gun));
+                // Their template's own swimming pace ashore (its
+                // `SwimJogSpeed`, the middle of its paces, as hers is).
+                let swim = db
+                    .filter(|_| named)
+                    .and_then(|db| db.swim_speeds(&p.role))
+                    .map(|s| s[1]);
                 match template {
                     Some(rig) => {
                         eprintln!(
-                            "person {} ({:08x}): {} bones, {} clips, gun {}",
+                            "person {} ({:08x}): {} bones, {} clips, swims {swim:?} m/s, gun {}",
                             p.role,
                             p.model,
                             rig.skeleton.len(),
@@ -2632,6 +2639,7 @@ impl Scene {
                             gun: gun.map(|(_, g)| g),
                             model,
                             rig,
+                            swim,
                         });
                     }
                     None => {

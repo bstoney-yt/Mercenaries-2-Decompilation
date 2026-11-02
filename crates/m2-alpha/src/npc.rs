@@ -210,6 +210,9 @@ pub struct PersonKind {
     pub gun: Option<HandGun>,
     pub model: GpuModel,
     pub rig: Rig,
+    /// How fast they swim ashore, m/s: their template's `SwimJogSpeed`
+    /// ([`m2_engine::tuning::SWIM_SPEEDS`]); `None` for a role's.
+    pub swim: Option<f32>,
 }
 
 /// What a person is doing.
@@ -912,6 +915,9 @@ pub struct Npc {
     through: bool,
     /// In the water out of their depth: they swim ([`NpcSwim`]).
     pub swim: Option<NpcSwim>,
+    /// How fast they swim, m/s (their kind's [`PersonKind::swim`], else
+    /// [`crate::player::SWIM_SPEED`]).
+    pub swim_speed: f32,
     /// Standing up out of the water: the climb-out's seconds left.
     climbing: f32,
 }
@@ -1062,6 +1068,7 @@ impl Npc {
             ended: false,
             through: false,
             swim: None,
+            swim_speed: crate::player::SWIM_SPEED,
             climbing: 0.0,
         }
     }
@@ -1148,7 +1155,7 @@ impl Npc {
             swim.shore = shore(physics, at);
         }
         let wanted = swim.shore.map_or(Vec3::ZERO, |s| {
-            (s - at).with_y(0.0).normalize_or_zero() * crate::player::SWIM_SPEED
+            (s - at).with_y(0.0).normalize_or_zero() * self.swim_speed
         });
         physics.move_character(&mut self.character, wanted, None, dt);
         self.character.position.y = water - crate::player::SWIM_FLOAT;
@@ -2216,6 +2223,9 @@ const SHORE_RINGS: [f32; 6] = [3.0, 6.0, 12.0, 24.0, 48.0, 96.0];
 const SHORE_WAYS: usize = 16;
 /// How far over the water the shore's ground is looked down for, metres.
 const SHORE_LOOK_HIGH: f32 = 30.0;
+/// How far over a swimmer's origin the way to a shore is looked along,
+/// metres: about his chest, over the water (invented).
+const SHORE_CLEAR_UP: f32 = 0.6;
 
 /// How deep the water at `water` is over the ground under `at`, metres
 /// (infinite with no ground under), and the ground's height.
@@ -2230,12 +2240,20 @@ fn depth_under(physics: &Physics, at: Vec3, water: f32) -> (f32, Option<f32>) {
 /// The nearest point to `at` where the water is shallow enough to stand
 /// in (under [`crate::player::SWIM_STOP`], or dry ground), looking out
 /// ring by ring ([`SHORE_RINGS`]); within a ring, the first found going
-/// round from +z. `None` if there is none within the last ring.
+/// round from +z, of those with nothing in the way at the swimmer's
+/// chest short of the last metre (by the first contract's river, one
+/// aimed through a bank's rocks swam 0.5 m/s against them). `None` if
+/// there is none within the last ring.
 fn shore(physics: &Physics, at: Vec3) -> Option<Vec3> {
     SHORE_RINGS.iter().find_map(|&r| {
         (0..SHORE_WAYS).find_map(|k| {
             let a = k as f32 / SHORE_WAYS as f32 * std::f32::consts::TAU;
-            let p = at + Vec3::new(a.sin(), 0.0, a.cos()) * r;
+            let way = Vec3::new(a.sin(), 0.0, a.cos());
+            let p = at + way * r;
+            let chest = at + Vec3::Y * SHORE_CLEAR_UP;
+            if physics.cast_ray(chest, way, (r - 1.0).max(0.1)).is_some() {
+                return None;
+            }
             // Looked down on from well above (a bank higher than the
             // water).
             let shallow = physics.water_at(p.x, p.z).is_none_or(|w| {
@@ -3002,6 +3020,11 @@ impl People {
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
             npc.target_armour = self.target_armour.max(1);
+            npc.swim_speed = self
+                .kinds
+                .get(npc.kind)
+                .and_then(|k| k.swim)
+                .unwrap_or(crate::player::SWIM_SPEED);
             npc.rammed = (npc.rammed - dt).max(0.0);
             let facing = npc.facing;
             npc.update(physics, &mut self.rng, threat, dt);
@@ -4513,6 +4536,7 @@ pub(crate) mod tests {
             gun: None,
             model: empty_model(),
             rig: rig(),
+            swim: None,
         }
     }
 

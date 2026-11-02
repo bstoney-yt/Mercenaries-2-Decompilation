@@ -54,11 +54,15 @@ pub const SWIM_STOP: f32 = 1.15;
 /// so her back is at the waterline. Invented, by eye (at 0.9 m she was
 /// all under the water in the picture).
 pub const SWIM_FLOAT: f32 = 0.35;
-/// Swimming speed where her template gives none, m/s, and people's as
-/// they swim ashore: the stroke's own root speed (0.81 m/s, from samples)
-/// played at twice its rate. Invented. Hers are her template's
-/// ([`Player::swim_speeds`]).
-pub const SWIM_SPEED: f32 = 1.6;
+/// The swimming speeds a template that gives none has, m/s: walk, jog, run
+/// and sprint. From the 360 code: `_HumanPhysics`'s registered defaults
+/// for `SwimWalkSpeed`, `SwimJogSpeed`, `SwimRunSpeed` and
+/// `SwimSprintSpeed` (0x823EAE98: 1, 2, 3 and 5; Jennifer's own are the
+/// same, and every soldier template read gives 2 to jog).
+pub const SWIM_SPEEDS: [f32; 4] = [1.0, 2.0, 3.0, 5.0];
+/// The jog among them: people's pace as they swim ashore (inferred: the
+/// middle pace, as hers when neither walking nor sprinting).
+pub const SWIM_SPEED: f32 = SWIM_SPEEDS[1];
 /// The stroke's rate while she floats still (the `Swim` stance's `Idle`
 /// gives no clip of its own). Invented.
 pub const SWIM_STILL_RATE: f32 = 0.35;
@@ -515,7 +519,7 @@ impl Player {
             scope: None,
             clips: FightClips::default(),
             speeds: SPEEDS,
-            swim_speeds: [SWIM_SPEED; 3],
+            swim_speeds: [SWIM_SPEEDS[0], SWIM_SPEEDS[1], SWIM_SPEEDS[2]],
             leap: Leap::No,
             jump_queued: false,
             throwing: None,
