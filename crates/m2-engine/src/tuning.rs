@@ -1217,6 +1217,35 @@ pub fn human_speeds(db: &Layer<'_>) -> HashMap<u32, [f32; 3]> {
         .collect()
 }
 
+/// `_HumanPhysics`'s swimming speeds, m/s: `SwimWalkSpeed`,
+/// `SwimJogSpeed`, `SwimRunSpeed` and `SwimSprintSpeed` (field names from
+/// the exe's reflection registration of `_HumanPhysics`, 0x823EAE98,
+/// which lists them after the four `Upright` speeds; defaults there 1, 2,
+/// and the others' as read). From the 360 code: a person is swimming
+/// while his stance is `Swim` (the `Object.IsSwimming` native,
+/// 0x82324FB8).
+pub const SWIM_SPEEDS: [u32; 4] = [0x0aae_47db, 0xa95d_1404, 0x78a5_7e3d, 0x4e95_4566];
+
+/// Every person template's four `_HumanPhysics` swimming speeds (walk,
+/// jog, run, sprint), by id, where all four are given and above 0.
+pub fn human_swim_speeds(db: &Layer<'_>) -> HashMap<u32, [f32; 4]> {
+    let physics = Table::new(db, "_HumanPhysics");
+    physics
+        .records
+        .keys()
+        .filter_map(|&id| {
+            let record = physics.of_template(id).first()?;
+            let mut out = [0.0; 4];
+            for (o, field) in out.iter_mut().zip(SWIM_SPEEDS) {
+                *o = f32::from_bits(physics.word(record, field)?);
+            }
+            out.iter()
+                .all(|v| v.is_normal() && *v > 0.0)
+                .then_some((id, out))
+        })
+        .collect()
+}
+
 /// Every person template's `HumanAnimationSet`: its `Gender` and
 /// `CharacterName` (name hashes: Mattias's `Hero` and `mattias`), which
 /// pick the character's rows of the on-foot animation table

@@ -54,8 +54,10 @@ pub const SWIM_STOP: f32 = 1.15;
 /// so her back is at the waterline. Invented, by eye (at 0.9 m she was
 /// all under the water in the picture).
 pub const SWIM_FLOAT: f32 = 0.35;
-/// Swimming speed, m/s: the stroke's own root speed (0.81 m/s, from
-/// samples) played at twice its rate. Invented.
+/// Swimming speed where her template gives none, m/s, and people's as
+/// they swim ashore: the stroke's own root speed (0.81 m/s, from samples)
+/// played at twice its rate. Invented. Hers are her template's
+/// ([`Player::swim_speeds`]).
 pub const SWIM_SPEED: f32 = 1.6;
 /// The stroke's rate while she floats still (the `Swim` stance's `Idle`
 /// gives no clip of its own). Invented.
@@ -331,6 +333,9 @@ pub struct Player {
     pub clips: FightClips,
     /// Walking, running and sprinting speeds, m/s.
     pub speeds: [f32; 3],
+    /// Her swimming speeds, the same way: her template's `SwimWalkSpeed`,
+    /// `SwimJogSpeed` and `SwimRunSpeed` ([`m2_engine::tuning::SWIM_SPEEDS`]).
+    pub swim_speeds: [f32; 3],
     /// In a jump, until she has landed.
     leap: Leap,
     /// Jump was pressed while she was landing: she jumps again as the
@@ -397,7 +402,7 @@ impl Player {
 
     /// Swims her when the water under her is out of her depth
     /// ([`SWIM_START`]), `direction` the way she is told to go: she floats
-    /// at the surface ([`SWIM_FLOAT`]), goes at [`SWIM_SPEED`] and plays
+    /// at the surface ([`SWIM_FLOAT`]), goes at her swimming speed for her pace ([`Player::swim_speeds`]) and plays
     /// the stroke, her weapon away. Where it shallows again
     /// ([`SWIM_STOP`]) she stands up with the climb-out. True while she
     /// swims: the rest of the step (running, jumping, aiming) is left
@@ -410,7 +415,7 @@ impl Player {
     /// the stroke's rate when still are invented. The water is the sea or,
     /// higher, the game's water heights there (rivers, pools, lakes:
     /// [`Physics::water_at`]).
-    fn update_swim(&mut self, physics: &Physics, direction: Vec3, dt: f32) -> bool {
+    fn update_swim(&mut self, physics: &Physics, direction: Vec3, speed: f32, dt: f32) -> bool {
         let at = self.character.position;
         let Some(water) = physics.water_at(at.x, at.z) else {
             self.swim = None;
@@ -449,7 +454,7 @@ impl Player {
             return false;
         };
         swim.since += dt;
-        physics.move_character(&mut self.character, direction * SWIM_SPEED, None, dt);
+        physics.move_character(&mut self.character, direction * speed, None, dt);
         self.character.position.y = water - SWIM_FLOAT;
         self.character.velocity.y = 0.0;
         if direction.length_squared() > 0.01 {
@@ -510,6 +515,7 @@ impl Player {
             scope: None,
             clips: FightClips::default(),
             speeds: SPEEDS,
+            swim_speeds: [SWIM_SPEED; 3],
             leap: Leap::No,
             jump_queued: false,
             throwing: None,
@@ -872,18 +878,20 @@ impl Player {
         let walking = intent.walking();
         let direction = forward * walking.y + right * walking.x;
 
-        if self.update_swim(physics, direction, dt) {
+        // Walking, sprinting or neither: the same of her speeds on foot
+        // and swimming.
+        let pace = if intent.walk {
+            0
+        } else if intent.sprint {
+            2
+        } else {
+            1
+        };
+        if self.update_swim(physics, direction, self.swim_speeds[pace], dt) {
             self.camera(physics);
             return;
         }
-        let [walk, run, sprint] = self.speeds;
-        let speed = if intent.walk {
-            walk
-        } else if intent.sprint {
-            sprint
-        } else {
-            run
-        };
+        let speed = self.speeds[pace];
         // Bashing or picking a weapon up, she stands.
         let bashing = self.bashing.is_some() || self.picking.is_some();
         let wanted = if bashing {
@@ -1494,6 +1502,8 @@ mod tests {
         let mut physics = ground();
         physics.set_water(12.0);
         let mut p = Player::new(0.0, 0.0, std::f32::consts::FRAC_PI_2, None);
+        // Jennifer's `SwimWalkSpeed`, `SwimJogSpeed` and `SwimRunSpeed`.
+        p.swim_speeds = [1.0, 2.0, 3.0];
         let dt = 1.0 / 60.0;
         for _ in 0..usize::from(SETTLED) {
             p.update(&physics, Intent::default(), dt);
@@ -1510,8 +1520,9 @@ mod tests {
         assert!(p.swimming());
         let at = p.character.position;
         assert!((at.y - (12.0 - SWIM_FLOAT)).abs() < 1e-3, "{at}");
-        // At swimming speed, not running (the sprint is not hers here).
-        assert!((at.x - SWIM_SPEED).abs() < 0.4, "{at}");
+        // Sprinting, at her `SwimRunSpeed` (Jennifer's 3 m/s), not her
+        // sprint on foot.
+        assert!((at.x - 3.0).abs() < 0.4, "{at}");
         // The sea goes down to 1 m over the ground: she stands.
         physics.set_water(11.0);
         p.update(&physics, forward, dt);
