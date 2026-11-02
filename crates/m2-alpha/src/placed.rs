@@ -126,6 +126,53 @@ pub fn barrel<R: std::io::Read + std::io::Seek>(
     Some((p.position + p.rotation * mount?, muzzle?))
 }
 
+/// Where she gets on an emplaced gun and where she mans it, from its
+/// template's seat data (every `Emplaced` template read: one seat at
+/// `hp_seat_gunner`, its `Entrance` at node `8834cccd`, `UseDistance` 1;
+/// from samples): world places, with the entrance's `UseDistance` and the
+/// `Turret` record the seat aims, if any.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SeatPoints {
+    pub entrance: Vec3,
+    pub use_distance: f32,
+    pub seat: Vec3,
+    pub turret: Option<m2_engine::seats::TurretRecord>,
+}
+
+/// [`SeatPoints`] of emplaced gun `m`, when its template has seat data
+/// and its model the nodes.
+pub fn seat_points<R: std::io::Read + std::io::Seek>(
+    source: Option<&mut m2_engine::AssetSource<R>>,
+    props: &Props,
+    templates: &Templates,
+    m: &Manned,
+) -> Option<SeatPoints> {
+    let s = templates.vehicle_seats.get(&m.template)?;
+    let (k, seat) = s
+        .seats
+        .iter()
+        .enumerate()
+        .find(|(_, x)| x.player_use && x.rows.iter().any(|r| r.can_enter))?;
+    let entrance = seat
+        .rows
+        .iter()
+        .filter(|r| r.can_enter)
+        .find_map(|r| s.entrance(r.link_name))?;
+    let (p, _) = props.get(m.entity)?;
+    let data = source?.model(m.model).ok()?;
+    let parsed = data.parse().ok()?;
+    let node = |h: Option<u32>| {
+        let at = Vec3::from(m2_assets::vehicle::marker(&parsed, h?)?);
+        Some(p.position + p.rotation * at)
+    };
+    Some(SeatPoints {
+        entrance: node(entrance.hardpoint)?,
+        use_distance: entrance.params.use_distance,
+        seat: node(seat.hardpoint)?,
+        turret: s.turret_of(k).copied(),
+    })
+}
+
 /// How many of each are in play, for the log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
@@ -367,6 +414,7 @@ impl Placed {
             model: p.model,
             hardpoint,
             barrel: None,
+            seat: None,
         })
     }
 
@@ -556,6 +604,12 @@ pub fn check(game: &mut crate::game::Game, tried: &mut std::collections::HashSet
                 };
                 let (at, facing) = (p.position, yaw_of(p.rotation));
                 go(game, at - Vec3::new(facing.sin(), 0.0, facing.cos()));
+                // Facing it, as one walking up does (its entrance must lie
+                // ahead of the camera).
+                if let Some(pl) = game.scene.player.as_mut() {
+                    pl.yaw = facing;
+                    pl.pitch = 0.0;
+                }
                 let prompt = worded(game);
                 let off = game.scene.player.as_ref().map_or(f32::NAN, |p| {
                     (p.character.position - at).with_y(0.0).length()
@@ -568,6 +622,19 @@ pub fn check(game: &mut crate::game::Game, tried: &mut std::collections::HashSet
                     },
                     2,
                 );
+                if let (Some(m), Some(pl)) =
+                    (game.combat.manned.as_ref(), game.scene.player.as_ref())
+                {
+                    eprintln!(
+                        "placed-check: emplaced {e:#x} manned from {:.2} (seat {:.2?}), turning {:.0}..{:.0} tilting {:.0}..{:.0}",
+                        pl.character.position - at,
+                        m.seat.map(|s| s - at),
+                        m.yaw.0.to_degrees(),
+                        m.yaw.1.to_degrees(),
+                        m.pitch.0.to_degrees(),
+                        m.pitch.1.to_degrees()
+                    );
+                }
                 let before = game.combat.manned.as_ref().map(|m| m.rounds);
                 let hits = game.combat.hits;
                 let mut fire = Intent::default();
