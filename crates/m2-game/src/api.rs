@@ -503,6 +503,170 @@ pub struct Pursuit {
     pub level: i64,
     /// The faction pursuing (its template's guid).
     pub faction: Option<u32>,
+    /// The engine's own pursuit, which sends the faction's units
+    /// ([`PursuitClock`]).
+    pub clock: PursuitClock,
+}
+
+/// The engine's pursuit, as the 360 code keeps it (its manager at
+/// 0x822371F8..0x8223A900): one faction at a time, at a level (0 to 2:
+/// the pursuit tables' `Threat1` to `Threat3`) that its seconds left
+/// decide. While it is active the faction's units are sent up to the
+/// table's count for the level (the game's side, `crate::reinforce`).
+///
+/// From the 360 code: the defaults (0x82236410: level times 200 and 400,
+/// at most 700 s and level 2), the level a number of seconds makes
+/// (0x82238670: under 1 none, under the first time 0, from the second 2,
+/// else 1), the seconds a level starts at (0x822384C0: the first time's
+/// half, at most 100; the middle of the two times, at most the first
+/// plus 100; the middle of the second and the most, at most the second
+/// plus 100), `SetPursuit` (0x82238398: level 1 to 3 as 0 to 2, an
+/// active one kept unless forced), `SetPursuitSeconds` (0x82238570: its
+/// seconds, the level they make), a lock (0x823390C8) and the clock
+/// (0x82238020: a second off each whole second unlocked, the level
+/// dropping with it, over once below level 0).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PursuitClock {
+    /// Under way (`GetPursuitState().Active`).
+    pub active: bool,
+    /// Held where it is (`LockPursuit`).
+    pub locked: bool,
+    /// The faction (its template's guid).
+    pub faction: Option<u32>,
+    /// Seconds left, whole.
+    pub seconds: i32,
+    /// Its level, 0 to [`max_level`](Self::max_level); -1 when none.
+    pub level: i32,
+    /// Where levels 1 and 2 start, in seconds left (`SetPursuitLevelTimes`).
+    pub times: (i32, i32),
+    /// The most seconds it may have.
+    pub max_seconds: i32,
+    /// The highest level it may reach.
+    pub max_level: i32,
+    /// The part of a second run since the last whole one.
+    carry: f32,
+}
+
+impl Default for PursuitClock {
+    fn default() -> Self {
+        Self {
+            active: false,
+            locked: false,
+            faction: None,
+            seconds: 0,
+            level: -1,
+            times: (200, 400),
+            max_seconds: 700,
+            max_level: 2,
+            carry: 0.0,
+        }
+    }
+}
+
+impl PursuitClock {
+    /// The level `seconds` left make (-1: over).
+    pub fn level_of(&self, seconds: i32) -> i32 {
+        if seconds < 1 {
+            -1
+        } else if seconds < self.times.0 {
+            0
+        } else if seconds >= self.times.1 {
+            self.max_level.min(2)
+        } else {
+            self.max_level.min(1)
+        }
+    }
+
+    /// The seconds a pursuit at `level` starts with.
+    pub fn start_of(&self, level: i32) -> i32 {
+        let (a, b) = self.times;
+        let s = match level {
+            0 => (a / 2).min(100),
+            1 => ((a + b) / 2).min(a + 100),
+            2 => ((b + self.max_seconds) / 2).min(b + 100),
+            _ => 0,
+        };
+        s.min(self.max_seconds)
+    }
+
+    /// Ends it.
+    pub fn end(&mut self) {
+        self.active = false;
+        self.locked = false;
+        self.faction = None;
+        self.seconds = 0;
+        self.level = -1;
+        self.carry = 0.0;
+    }
+
+    /// `SetPursuit(faction, level, force)`: starts one at `level` (1 to 3);
+    /// one under way stays unless `force`. False if it didn't start.
+    pub fn set(&mut self, faction: u32, level: i32, force: bool) -> bool {
+        if self.locked || (self.active && !force) || level < 1 {
+            return false;
+        }
+        self.end();
+        self.level = (level - 1).min(self.max_level);
+        self.seconds = self.start_of(self.level);
+        self.faction = Some(faction);
+        self.active = true;
+        true
+    }
+
+    /// `SetPursuitSeconds(faction, seconds, force)`: starts one with
+    /// `seconds` left, at the level they make.
+    pub fn set_seconds(&mut self, faction: u32, seconds: i32, force: bool) -> bool {
+        if self.locked || (self.active && !force) || seconds < 1 {
+            return false;
+        }
+        self.end();
+        self.seconds = seconds.min(self.max_seconds);
+        self.level = self.level_of(self.seconds);
+        self.faction = Some(faction);
+        self.active = true;
+        true
+    }
+
+    /// `LockPursuit(faction, level)`: held at `level` until cleared.
+    pub fn lock(&mut self, faction: u32, level: i32) {
+        self.end();
+        self.level = (level - 1).clamp(0, self.max_level);
+        self.seconds = self.start_of(self.level);
+        self.faction = Some(faction);
+        self.active = true;
+        self.locked = true;
+    }
+
+    /// Runs on by `dt` seconds.
+    pub fn step(&mut self, dt: f32) {
+        if !self.active {
+            return;
+        }
+        self.carry += dt;
+        let whole = self.carry.floor();
+        self.carry -= whole;
+        if whole < 1.0 || self.locked {
+            return;
+        }
+        self.seconds -= whole as i32;
+        while self.active && self.level_of(self.seconds) < self.level {
+            if self.level == 0 {
+                self.end();
+            } else {
+                self.level -= 1;
+                self.seconds = self.start_of(self.level);
+            }
+        }
+    }
+
+    /// `GetPursuitState().Level`: its level counted from 1, 0 when none.
+    pub fn shown_level(&self) -> i64 {
+        if self.active {
+            i64::from(self.level + 1)
+        } else {
+            0
+        }
+    }
 }
 
 impl Pursuit {
@@ -761,6 +925,14 @@ impl ScriptWorld {
             .get(&guid)
             .map(|o| o.position)
             .or_else(|| self.entities.get(&guid).copied())
+    }
+
+    /// The template whose guid `guid` is (a faction's, `"VZ"`), if any.
+    pub fn template_name(&self, guid: u32) -> Option<&str> {
+        self.templates
+            .iter()
+            .find(|(_, g)| **g == guid)
+            .map(|(n, _)| n.as_str())
     }
 
     /// Whether `name` is an object template's: one the template database
@@ -1439,13 +1611,22 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&pg, "SetPursuitLevelTimes", |w, _, a| {
         if let (Some(low), Some(high)) = (num(a.first()), num(a.get(1))) {
             w.pursuit.times = Some((low, high));
+            // The engine's level times, the lower first (0x8233A078).
+            let (a, b) = (low as i32, high as i32);
+            w.pursuit.clock.times = (a.min(b), a.max(b));
         }
         values([])
     })?;
+    // The engine's pursuit as 0x82339808 gives it.
     add(&pg, "GetPursuitState", |w, lua, _| {
+        let c = &w.pursuit.clock;
         let t = lua.create_table()?;
-        t.set("Level", w.pursuit.level)?;
-        if let Some(f) = w.pursuit.faction {
+        t.set("Active", c.active)?;
+        t.set("Locked", c.locked)?;
+        t.set("Level", c.shown_level())?;
+        t.set("SecondsLeftInLevel", c.seconds)?;
+        t.set("SecondsLeft", c.seconds)?;
+        if let Some(f) = c.faction.filter(|_| c.active) {
             t.set("Faction", guid_value(Some(f)))?;
         }
         values([Value::Table(t)])
@@ -1464,6 +1645,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         };
         w.pursuit.level = level;
         w.pursuit.faction = Some(f);
+        if locked {
+            w.pursuit.clock.lock(f, level as i32);
+        } else {
+            let force = matches!(a.get(2), Some(Value::Boolean(true)));
+            w.pursuit.clock.set(f, level as i32, force);
+        }
         let seconds = (!locked).then(|| w.pursuit.seconds(level));
         w.commands.push(Command::Pursuit {
             faction: name,
@@ -1505,12 +1692,22 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         add(&pg, clear, |w, _, _| {
             w.pursuit.level = 0;
             w.pursuit.faction = None;
+            // Over (0x82339230 ends it as 0x82237F70).
+            w.pursuit.clock.end();
             w.commands.push(Command::PursuitClear);
             values([])
         })?;
     }
-    // (faction, seconds, _): see [`Pursuit`].
-    add(&pg, "SetPursuitSeconds", |_, _, _| values([]))?;
+    // (faction, seconds, force): the engine's pursuit restarted with that
+    // many seconds left (0x823393B0 -> 0x82238570), at the level they
+    // make: the faction manager's `IncrementPursuit` gives 5, level 0.
+    add(&pg, "SetPursuitSeconds", |w, _, a| {
+        if let (Some(f), Some(s)) = (id(a.first()), num(a.get(1))) {
+            let force = matches!(a.get(2), Some(Value::Boolean(true)));
+            w.pursuit.clock.set_seconds(f, s as i32, force);
+        }
+        values([])
+    })?;
     // The objects of a kind within a radius of a point (x, y, z, radius),
     // as a list: what the strikes hit (the bunker buster's buildings, the
     // tank buster's tanks, the air patrol's aircraft). Which labels make
@@ -3871,6 +4068,43 @@ mod tests {
                 Command::PursuitClear,
             ]
         );
+    }
+
+    // The faction manager's `IncrementPursuit`: a level, then 5 s, which
+    // leave level 1 (`Threat1`) for 5 s; the clock as the 360's.
+    #[test]
+    fn the_engines_pursuit_runs_by_its_seconds_as_the_360s() {
+        let (host, world) = setup();
+        let run = |code: &str| host.lua().load(code).exec().unwrap();
+        run("Pg.SetPursuitLevelTimes(120, 300)\n\
+             local oc = Pg.GetGuidByName('OC')\n\
+             Pg.SetPursuit(oc, 2, true)\n\
+             __two = Pg.GetPursuitState().Level\n\
+             Pg.SetPursuitSeconds(oc, 5, true)\n\
+             local s = Pg.GetPursuitState()\n\
+             __one, __left, __active = s.Level, s.SecondsLeft, s.Active");
+        let g = host.lua().globals();
+        assert_eq!(g.get::<i64>("__two").unwrap(), 2);
+        assert_eq!(g.get::<i64>("__one").unwrap(), 1);
+        assert_eq!(g.get::<i64>("__left").unwrap(), 5);
+        assert!(g.get::<bool>("__active").unwrap());
+        let mut c = world.borrow().pursuit.clock;
+        c.step(4.5);
+        assert!(c.active && c.seconds == 1);
+        c.step(1.0);
+        assert!(!c.active);
+        assert_eq!(c.shown_level(), 0);
+        // Level 3 starts at the second time plus 100 at most, and drops a
+        // level as its seconds fall under the second time.
+        let oc = 1;
+        assert!(c.set(oc, 3, false));
+        assert_eq!((c.level, c.seconds), (2, 400));
+        assert!(!c.set(oc, 1, false), "kept unless forced");
+        c.step(101.0);
+        assert_eq!((c.level, c.seconds), (1, 210));
+        c.lock(oc, 1);
+        c.step(1000.0);
+        assert!(c.active && c.level == 0);
     }
 
     #[test]
