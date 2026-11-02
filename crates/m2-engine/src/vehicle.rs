@@ -195,6 +195,71 @@ pub struct WheelSpec {
     pub steers: bool,
 }
 
+/// A turret of a vehicle besides its main one, as its template's `Turret`
+/// record gives it ([`crate::seats::TurretRecord`]): a jeep's pintle
+/// gun, a tank's cupola machine gun, a gunboat's deck guns.
+///
+/// Provenance: from samples, each seat's template names the turret its
+/// rider aims (`ControllerTurret` `TurretName`), and the turret its yaw
+/// and pitch bones, limits and speeds (all with yaw about the model's y
+/// and pitch about its x, forward z, on every record read). The field
+/// names are the exe's reflection strings (`Turret` 0x823EC738,
+/// `ControllerTurret` 0x823F1368). Inferred: the rider's aim turns it
+/// as the alpha turns the main turret (at its speeds, within its limits);
+/// the engine's own turret update is not decoded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Aimer {
+    pub record: crate::seats::TurretRecord,
+    /// The nodes that turn with it (its yaw bone and those under it), and
+    /// those that tilt (its pitch bone and those under it).
+    pub yaw_nodes: Vec<bool>,
+    pub pitch_nodes: Vec<bool>,
+    /// Where it turns and tilts about, model space (its bones' origins).
+    pub yaw_pivot: Option<Vec3>,
+    pub pitch_pivot: Option<Vec3>,
+}
+
+impl Aimer {
+    /// How node `i` moves with it turned `yaw` and tilted `pitch` radians
+    /// (up positive), model space.
+    pub fn transform(&self, i: usize, yaw: f32, pitch: f32) -> Mat4 {
+        let about = |at: Option<Vec3>, r: Mat4| {
+            at.map_or(Mat4::IDENTITY, |at| {
+                Mat4::from_translation(at) * r * Mat4::from_translation(-at)
+            })
+        };
+        let mut m = Mat4::IDENTITY;
+        if self.pitch_nodes.get(i).copied().unwrap_or(false) {
+            // Models face +z: a turn about x by -pitch lifts the muzzle.
+            m = about(self.pitch_pivot, Mat4::from_rotation_x(-pitch)) * m;
+        }
+        if self.yaw_nodes.get(i).copied().unwrap_or(false) {
+            m = about(self.yaw_pivot, Mat4::from_rotation_y(yaw)) * m;
+        }
+        m
+    }
+
+    /// Turns and tilts `aim` (yaw, pitch) toward `want` by at most its
+    /// speeds over `dt` seconds, within its limits. A turret that turns
+    /// all the way round takes the short way.
+    pub fn step(&self, aim: (f32, f32), want: (f32, f32), dt: f32) -> (f32, f32) {
+        let r = &self.record;
+        let yaw = if r.full_circle() {
+            let mut turn = (want.0 - aim.0).rem_euclid(std::f32::consts::TAU);
+            if turn > std::f32::consts::PI {
+                turn -= std::f32::consts::TAU;
+            }
+            aim.0 + turn.clamp(-r.yaw_speed * dt, r.yaw_speed * dt)
+        } else {
+            let goal = want.0.clamp(r.yaw.0, r.yaw.1);
+            aim.0 + (goal - aim.0).clamp(-r.yaw_speed * dt, r.yaw_speed * dt)
+        };
+        let goal = want.1.clamp(r.pitch.0, r.pitch.1);
+        let pitch = aim.1 + (goal - aim.1).clamp(-r.pitch_speed * dt, r.pitch_speed * dt);
+        (yaw, pitch)
+    }
+}
+
 /// How to build and draw one vehicle model.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VehicleSpec {
@@ -275,6 +340,11 @@ pub struct VehicleSpec {
     pub tilts: Vec<TiltSpec>,
     /// A bomb bay its driver drops bombs from (none but the Osprey's).
     pub bomb_bay: Option<BombBay>,
+    /// Each node's parent, by index.
+    pub node_parents: Vec<Option<u16>>,
+    /// Its turrets other than the main one ([`turret`](Self::turret)),
+    /// each turned by the seat that names it ([`VehicleSpec::with_seating`]).
+    pub aimers: Vec<Aimer>,
     /// What its parts do as they are damaged, if its model says
     /// ([`crate::vehicle_damage`]).
     pub damage: Option<std::sync::Arc<crate::vehicle_damage::DamageModel>>,
@@ -709,6 +779,8 @@ impl VehicleSpec {
             },
             tilts: Vec::new(),
             bomb_bay: None,
+            node_parents: model.nodes.iter().map(|x| x.parent).collect(),
+            aimers: Vec::new(),
         })
     }
 
@@ -760,8 +832,175 @@ impl VehicleSpec {
                 .filter_map(|e| Some((*e, node(e.hardpoint?)?)))
                 .collect()
         });
+        self.aimers = seating
+            .as_ref()
+            .map_or_else(Vec::new, |s| self.aimers_of(&s.turrets));
         self.seating = seating;
         self
+    }
+
+    /// Its `Turret` records other than the main turret's (whose yaw bone
+    /// is the [`TURRET`] node the alpha already turns), as [`Aimer`]s on
+    /// its model's nodes; a record none of whose bones the model has is
+    /// left out.
+    fn aimers_of(&self, records: &[crate::seats::TurretRecord]) -> Vec<Aimer> {
+        let index = |hash: u32| self.node_names.iter().position(|&n| n == hash);
+        let n = self.node_names.len();
+        let under = |k: usize, top: Option<usize>| {
+            let Some(top) = top else { return false };
+            let mut at = Some(k as u16);
+            for _ in 0..=n {
+                match at {
+                    Some(c) if usize::from(c) == top => return true,
+                    Some(c) => at = self.node_parents.get(usize::from(c)).copied().flatten(),
+                    None => break,
+                }
+            }
+            false
+        };
+        let depth = |i: Option<usize>| {
+            let mut d = 0;
+            let mut at = i.map(|i| i as u16);
+            while let Some(c) = at {
+                d += 1;
+                at = self.node_parents.get(usize::from(c)).copied().flatten();
+                if d > n {
+                    break;
+                }
+            }
+            d
+        };
+        // The deepest first, so one mounted on another (a gun on a ring)
+        // is moved on its mount's rest place before its mount moves it.
+        let mut records: Vec<&crate::seats::TurretRecord> = records.iter().collect();
+        records
+            .sort_by_key(|r| std::cmp::Reverse(depth(r.bone_yaw.or(r.bone_pitch).and_then(index))));
+        records
+            .into_iter()
+            .filter(|r| r.bone_yaw != Some(TURRET))
+            .filter_map(|r| {
+                let yaw = r.bone_yaw.and_then(index);
+                let pitch = r.bone_pitch.and_then(index);
+                if yaw.is_none() && pitch.is_none() {
+                    return None;
+                }
+                let origin = |i: Option<usize>| {
+                    i.and_then(|i| self.rest.get(i))
+                        .map(|m| m.w_axis.truncate())
+                };
+                Some(Aimer {
+                    record: *r,
+                    yaw_nodes: (0..n).map(|k| under(k, yaw)).collect(),
+                    pitch_nodes: (0..n).map(|k| under(k, pitch)).collect(),
+                    yaw_pivot: origin(yaw),
+                    pitch_pivot: origin(pitch),
+                })
+            })
+            .collect()
+    }
+
+    /// The aimer seat `seat` (its `SeatLink` name) turns, by index into
+    /// [`aimers`](Self::aimers).
+    pub fn aimer_of_seat(&self, seat: u32) -> Option<usize> {
+        let s = self.seating.as_ref()?;
+        let name = s.seats.get(s.seat(seat)?)?.turret?;
+        self.aimers.iter().position(|a| a.record.name == name)
+    }
+
+    /// Whether the main turret is turned from seat `seat` (`None`: from
+    /// the driver's seat, as without seat data): the seat whose
+    /// `ControllerTurret` names the record whose yaw bone is [`TURRET`];
+    /// with no such record (or no seat data), the driver's.
+    pub fn turns_main_turret(&self, seat: Option<u32>) -> bool {
+        let Some(s) = self.seating.as_deref() else {
+            return true;
+        };
+        let main = s
+            .turrets
+            .iter()
+            .find(|r| r.bone_yaw == Some(TURRET))
+            .map(|r| r.name);
+        let index = match seat {
+            Some(n) => s.seat(n),
+            None => s.driver(),
+        };
+        let Some(i) = index else {
+            return seat.is_none();
+        };
+        match main {
+            Some(m) => s.seats[i].turret == Some(m),
+            None => s.seats[i].driver,
+        }
+    }
+
+    /// Where node `i` is, model space, with the main turret turned
+    /// `turret` and each aimer at `aims` (yaw, pitch).
+    pub fn node_place(&self, i: usize, turret: f32, aims: &[(f32, f32)]) -> Option<Mat4> {
+        let mut m = *self.rest.get(i)?;
+        for (a, &(yaw, pitch)) in self.aimers.iter().zip(aims) {
+            m = a.transform(i, yaw, pitch) * m;
+        }
+        if self.turret.get(i).copied().unwrap_or(false) {
+            m = self.turret_transform(turret) * m;
+        }
+        Some(m)
+    }
+
+    /// Whether aimer `k` sits on the main turret (a tank's cupola gun),
+    /// so turns with it too.
+    fn aimer_on_turret(&self, k: usize) -> bool {
+        let a = &self.aimers[k];
+        (0..self.turret.len()).any(|i| {
+            self.turret[i]
+                && (a.yaw_nodes.get(i).copied().unwrap_or(false)
+                    || a.pitch_nodes.get(i).copied().unwrap_or(false))
+        })
+    }
+
+    /// The yaw and pitch, radians, that lay aimer `k` on `goal` (world
+    /// space) with the vehicle at `body` and its main turret turned
+    /// `turret`: about its yaw bone from straight ahead (model +z), then
+    /// up from level about its pitch bone, as [`Aimer::transform`] moves
+    /// them.
+    pub fn aim_toward(&self, k: usize, body: Mat4, turret: f32, goal: Vec3) -> (f32, f32) {
+        let a = &self.aimers[k];
+        let frame = if self.aimer_on_turret(k) {
+            body * self.turret_transform(turret)
+        } else {
+            body
+        };
+        let local = frame.inverse().transform_point3(goal);
+        let yaw = a.yaw_pivot.map_or(0.0, |p| {
+            let d = local - p;
+            d.x.atan2(d.z)
+        });
+        // As seen with the mount turned back straight ahead.
+        let unturned = a
+            .yaw_pivot
+            .map_or(local, |p| p + Quat::from_rotation_y(-yaw) * (local - p));
+        let pitch = a.pitch_pivot.or(a.yaw_pivot).map_or(0.0, |p| {
+            let d = unturned - p;
+            d.y.atan2(d.with_y(0.0).length())
+        });
+        (yaw, pitch)
+    }
+
+    /// Which way the gun at node `node` points, model space, when one of
+    /// its aimers moves it: straight ahead turned and tilted as that
+    /// aimer's `aims`, turned with the main turret too when on it. `None`:
+    /// no aimer moves that node.
+    pub fn barrel_of(&self, node: usize, turret: f32, aims: &[(f32, f32)]) -> Option<Vec3> {
+        let k = self.aimers.iter().position(|a| {
+            a.yaw_nodes.get(node).copied().unwrap_or(false)
+                || a.pitch_nodes.get(node).copied().unwrap_or(false)
+        })?;
+        let (yaw, pitch) = aims.get(k).copied().unwrap_or((0.0, 0.0));
+        let d = Quat::from_rotation_y(yaw) * Quat::from_rotation_x(-pitch) * Vec3::Z;
+        Some(if self.aimer_on_turret(k) {
+            self.turret_transform(turret).transform_vector3(d)
+        } else {
+            d
+        })
     }
 
     /// The place, model space, of its entrance named `name`.
@@ -982,6 +1221,20 @@ impl VehicleSpec {
         turret: f32,
         gun: f32,
     ) -> Vec<Mat4> {
+        self.posed_nodes_aimed(wheels, rolled, turret, gun, &[])
+    }
+
+    /// [`posed_nodes`](Self::posed_nodes) with each of its
+    /// [`aimers`](Self::aimers) turned and tilted as `aims` (yaw, pitch;
+    /// one missing stays straight ahead).
+    pub fn posed_nodes_aimed(
+        &self,
+        wheels: &[(f32, f32)],
+        rolled: f32,
+        turret: f32,
+        gun: f32,
+        aims: &[(f32, f32)],
+    ) -> Vec<Mat4> {
         let about = |centre: Vec3, steer: f32, spin: f32| {
             Mat4::from_translation(centre)
                 * Mat4::from_rotation_y(steer)
@@ -1022,6 +1275,11 @@ impl VehicleSpec {
                     }
                     None => m,
                 };
+                let m = self
+                    .aimers
+                    .iter()
+                    .zip(aims)
+                    .fold(m, |m, (a, &(yaw, pitch))| a.transform(i, yaw, pitch) * m);
                 let m = if self.gun.get(i).copied().unwrap_or(false) {
                     tilt * m
                 } else {
@@ -1080,6 +1338,7 @@ fn fit_plane(points: &[(Vec3, f32)]) -> Option<(f32, f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use m2_assets::name_hash;
 
     #[test]
     fn a_tank_stands_on_its_tracks_not_under_its_gun() {
@@ -1216,9 +1475,144 @@ mod tests {
             rotors: Vec::new(),
             tilts: Vec::new(),
             bomb_bay: None,
+            node_parents: Vec::new(),
+            aimers: Vec::new(),
             damage: None,
             tuning: VehicleTuning::default(),
         }
+    }
+
+    /// An M151 (MG) as its data has it (round seat-turrets): the gunner's
+    /// `ControllerTurret` names turret edac857b (yaw -70..70, pitch
+    /// -30..30, 100 degrees a second), whose yaw bone c9f161f3 holds the
+    /// pitch bone 5e99f424, which holds the gun's hardpoint. The driver
+    /// aims nothing. Nodes: 0 root, 1 the wheel, 2 the pintle (yaw), 3 the
+    /// gun (pitch), 4 its hardpoint, 0.8 m ahead of the gun's trunnion.
+    fn m151() -> VehicleSpec {
+        use crate::seats::{Seat, TurretRecord, VehicleSeats};
+        let mut s = spec();
+        s.node_names = vec![0, 1, 0xc9f1_61f3, 0x5e99_f424, 7];
+        s.rest.extend([
+            Mat4::from_translation(Vec3::new(0.0, 1.5, -1.0)),
+            Mat4::from_translation(Vec3::new(0.0, 1.8, -1.0)),
+            Mat4::from_translation(Vec3::new(0.0, 1.8, -0.2)),
+        ]);
+        s.node_wheel.extend([None, None, None]);
+        s.turret = vec![false; 5];
+        s.gun = vec![false; 5];
+        s.node_parents = vec![None, Some(0), Some(0), Some(2), Some(3)];
+        let seat = |name: &str, driver: bool, turret: Option<u32>| Seat {
+            name: name_hash(name),
+            hardpoint: None,
+            driver,
+            gunner: !driver,
+            hijackable: true,
+            player_use: true,
+            toss_speed: -1.0,
+            min_ditch_speed: 5.0,
+            rows: Vec::new(),
+            links: Vec::new(),
+            turret,
+        };
+        let r = |d: f32| d.to_radians();
+        let seating = VehicleSeats {
+            seats: vec![
+                seat("seat_driver", true, None),
+                seat("seat_gunner", false, Some(0xedac_857b)),
+            ],
+            entrances: Vec::new(),
+            turrets: vec![TurretRecord {
+                name: 0xedac_857b,
+                bone_yaw: Some(0xc9f1_61f3),
+                bone_pitch: Some(0x5e99_f424),
+                yaw: (r(-70.0), r(70.0)),
+                yaw_speed: r(100.0),
+                pitch: (r(-30.0), r(30.0)),
+                pitch_speed: r(100.0),
+            }],
+        };
+        s.with_seating(Some(std::sync::Arc::new(seating)))
+    }
+
+    #[test]
+    fn a_gunner_seat_turns_its_own_turret_and_the_driver_none() {
+        let s = m151();
+        assert_eq!(s.aimers.len(), 1);
+        let a = &s.aimers[0];
+        // The pintle turns itself, the gun and its hardpoint; the gun tilts
+        // with its hardpoint; the body and wheel stay.
+        assert_eq!(a.yaw_nodes, [false, false, true, true, true]);
+        assert_eq!(a.pitch_nodes, [false, false, false, true, true]);
+        assert_eq!(s.aimer_of_seat(name_hash("seat_gunner")), Some(0));
+        assert_eq!(s.aimer_of_seat(name_hash("seat_driver")), None);
+        // No record turns the main turret's node: the driver's seat turns
+        // it (the old rule), the gunner's does not.
+        assert!(s.turns_main_turret(Some(name_hash("seat_driver"))));
+        assert!(!s.turns_main_turret(Some(name_hash("seat_gunner"))));
+        // Turned a quarter left, the hardpoint 0.8 m ahead of the pivot
+        // swings to its left (+x), and the pose agrees with node_place.
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let posed = s.posed_nodes_aimed(&[(0.0, 0.0); 4], 0.0, 0.0, 0.0, &[(quarter, 0.0)]);
+        let tip = posed[4].w_axis.truncate();
+        assert!(tip.abs_diff_eq(Vec3::new(0.8, 1.8, -1.0), 1e-4), "{tip}");
+        let placed = s.node_place(4, 0.0, &[(quarter, 0.0)]).unwrap();
+        assert!(placed.abs_diff_eq(posed[4], 1e-5));
+        // Tilted up, the tip rises.
+        let up = s.posed_nodes_aimed(&[(0.0, 0.0); 4], 0.0, 0.0, 0.0, &[(0.0, 0.5)]);
+        assert!(up[4].w_axis.y > 1.8 + 0.3);
+        assert!(
+            up[2].abs_diff_eq(s.rest[2], 1e-6),
+            "the pintle doesn't tilt"
+        );
+    }
+
+    #[test]
+    fn aimed_at_a_point_the_gun_points_at_it() {
+        let s = m151();
+        let body = Mat4::from_translation(Vec3::new(10.0, 0.0, 20.0));
+        // Up and to the left, within the pintle's arc.
+        let goal = Vec3::new(10.0 + 6.0, 1.8 + 3.0, 20.0 - 1.0 + 8.0);
+        let aim = s.aim_toward(0, body, 0.0, goal);
+        let barrel = s.barrel_of(4, 0.0, &[aim]).unwrap();
+        let tip = body.transform_point3(s.node_place(4, 0.0, &[aim]).unwrap().w_axis.truncate());
+        let pivot = body.transform_point3(Vec3::new(0.0, 1.8, -1.0));
+        assert!(barrel.angle_between(goal - pivot) < 1e-4);
+        assert!((tip - pivot).angle_between(goal - pivot) < 1e-4);
+        assert_eq!(s.barrel_of(1, 0.0, &[aim]), None, "the wheel is no gun");
+    }
+
+    #[test]
+    fn an_aimer_keeps_to_its_arc_and_speed_and_a_ring_takes_the_short_way() {
+        let s = m151();
+        let a = &s.aimers[0];
+        let r = |d: f32| d.to_radians();
+        // A second at 100 degrees a second gets no further than 70 left.
+        let (yaw, pitch) = a.step((0.0, 0.0), (r(120.0), r(-80.0)), 1.0);
+        assert!((yaw - r(70.0)).abs() < 1e-5 && (pitch - r(-30.0)).abs() < 1e-5);
+        // A tenth of a second turns 10 degrees.
+        let (yaw, _) = a.step((0.0, 0.0), (r(60.0), 0.0), 0.1);
+        assert!((yaw - r(10.0)).abs() < 1e-5);
+        // All the way round: from 170 to -170 is 20 degrees through 180.
+        let mut ring = a.clone();
+        ring.record.yaw = (r(-180.0), r(180.0));
+        let (yaw, _) = ring.step((r(170.0), 0.0), (r(-170.0), 0.0), 1.0);
+        assert!((yaw - r(190.0)).abs() < 1e-4, "{}", yaw.to_degrees());
+    }
+
+    #[test]
+    fn the_main_turrets_record_is_left_to_the_main_turret() {
+        use crate::seats::VehicleSeats;
+        let mut s = m151();
+        let mut main = s.seating.as_ref().unwrap().turrets[0];
+        main.name = name_hash("main_turret");
+        main.bone_yaw = Some(TURRET);
+        let mut seating = VehicleSeats::clone(s.seating.as_ref().unwrap());
+        seating.turrets.push(main);
+        seating.seats[1].turret = Some(main.name);
+        s = s.with_seating(Some(std::sync::Arc::new(seating)));
+        assert_eq!(s.aimers.len(), 1, "only the pintle's");
+        assert!(s.turns_main_turret(Some(name_hash("seat_gunner"))));
+        assert!(!s.turns_main_turret(Some(name_hash("seat_driver"))));
     }
 
     #[test]

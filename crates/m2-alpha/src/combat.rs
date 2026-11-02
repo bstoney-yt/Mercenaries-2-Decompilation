@@ -3687,24 +3687,34 @@ impl Combat {
             .flatten();
         self.ripple += 1;
         let (lo, hi) = v.spec.bounds;
+        // Turned and tilted with its turret (her seat's aimer, or the main
+        // turret it sits on).
         let local = match node {
-            Some(n) => {
-                let at = v.spec.rest[n].w_axis.truncate();
-                if v.spec.turret.get(n).copied().unwrap_or(false) {
-                    v.spec.turret_transform(v.turret).transform_point3(at)
-                } else {
-                    at
-                }
-            }
+            Some(n) => v
+                .spec
+                .node_place(n, v.turret, &v.aims)
+                .map_or(v.spec.rest[n].w_axis.truncate(), |m| m.w_axis.truncate()),
             None => v
                 .spec
                 .muzzle_pose(v.turret, v.gun)
                 .map_or(Vec3::new(0.0, (lo.y + hi.y) * 0.5, hi.z), |(p, _)| p),
         };
         let from = body.transform_point3(local);
+        let hers = goal.is_none();
         let goal = goal.unwrap_or_else(|| Self::aim_point(f.physics, f.people, f.player, Some(id)));
         let forward = body.transform_vector3(Vec3::Z).normalize_or(Vec3::Z);
-        let aim = (goal - from).normalize_or(forward);
+        let to_goal = (goal - from).normalize_or(forward);
+        // Hers from a turret her seat aims: at the crosshair once the gun
+        // is laid on it, else where its barrel points (as the main gun,
+        // [`Combat::vehicle_fire`]), so never outside its arc.
+        let barrel = node
+            .filter(|_| hers)
+            .and_then(|n| v.spec.barrel_of(n, v.turret, &v.aims))
+            .map(|d| body.transform_vector3(d).normalize_or(forward));
+        let aim = match barrel {
+            Some(b) if to_goal.angle_between(b) > LAID => b,
+            _ => to_goal,
+        };
         let w = &m.weapon;
         if self.ripple == 1 {
             eprintln!(
@@ -6162,6 +6172,8 @@ mod tests {
             rotors: Vec::new(),
             tilts: Vec::new(),
             bomb_bay: None,
+            node_parents: Vec::new(),
+            aimers: Vec::new(),
             damage: None,
             tuning: VehicleTuning {
                 gun: Some(gun),
@@ -6181,6 +6193,7 @@ mod tests {
             turret: 0.0,
             hijack_nodes: Vec::new(),
             gun: 0.0,
+            aims: Vec::new(),
             rolled: 0.0,
             fired: 0,
             mg_fired: 0,

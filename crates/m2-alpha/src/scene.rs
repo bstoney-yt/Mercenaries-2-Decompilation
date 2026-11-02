@@ -1066,6 +1066,10 @@ pub struct ParkedVehicle {
     pub hijack_nodes: Vec<(usize, Mat4)>,
     /// How far its gun is raised, radians (down is negative).
     pub gun: f32,
+    /// How far each of its [`aimers`](m2_engine::VehicleSpec::aimers) is
+    /// turned and tilted (yaw, pitch), radians; one not yet aimed is
+    /// straight ahead.
+    pub aims: Vec<(f32, f32)>,
     /// How far it has rolled, metres (backwards less), for turning a
     /// tracked vehicle's road wheels; a helicopter's: how far its rotors
     /// have turned, radians.
@@ -2481,6 +2485,7 @@ impl Scene {
                 turret: 0.0,
                 hijack_nodes: Vec::new(),
                 gun: 0.0,
+                aims: Vec::new(),
                 rolled: 0.0,
                 fired: 0,
                 mg_fired: 0,
@@ -2513,6 +2518,7 @@ impl Scene {
                     turret: 0.0,
                     hijack_nodes: Vec::new(),
                     gun: 0.0,
+                    aims: Vec::new(),
                     rolled: 0.0,
                     fired: 0,
                     mg_fired: 0,
@@ -2534,6 +2540,7 @@ impl Scene {
                     turret: 0.0,
                     hijack_nodes: Vec::new(),
                     gun: 0.0,
+                    aims: Vec::new(),
                     rolled: 0.0,
                     fired: 0,
                     mg_fired: 0,
@@ -2863,11 +2870,12 @@ impl Scene {
                     );
                 }
                 v.model.lamps = lamps;
-                let mut nodes = v.spec.posed_nodes(
+                let mut nodes = v.spec.posed_nodes_aimed(
                     &world.physics.vehicle_wheels(id),
                     v.rolled,
                     v.turret,
                     v.gun,
+                    &v.aims,
                 );
                 v.spec
                     .lift_wheels(&mut nodes, &world.physics.vehicle_wheel_lift(id));
@@ -2897,7 +2905,9 @@ impl Scene {
         }
         for (i, at) in hanging.hung {
             let v = &self.vehicles[i];
-            let nodes = v.spec.posed_nodes(&[], v.rolled, v.turret, v.gun);
+            let nodes = v
+                .spec
+                .posed_nodes_aimed(&[], v.rolled, v.turret, v.gun, &v.aims);
             v.model.draw_posed(backend, queue, at, &nodes, &[])?;
         }
         if let Some(player) = &self.player
