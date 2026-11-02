@@ -1454,6 +1454,13 @@ impl Mission {
 
     /// Reports where an object is in play (a vehicle that was driven or
     /// pushed about).
+    /// Sets the world box round `guid`'s collision (lowest corner, then
+    /// highest) the scripts' area searches meet it by
+    /// ([`ScriptWorld::bounds`](crate::api::ScriptWorld::bounds)).
+    pub fn set_bounds(&mut self, guid: u32, lo: [f32; 3], hi: [f32; 3]) {
+        self.world.borrow_mut().bounds.insert(guid, (lo, hi));
+    }
+
     pub fn place(&mut self, guid: u32, at: [f32; 3], yaw: f32) {
         let mut w = self.world.borrow_mut();
         if let Some(o) = w.objects.get_mut(&guid) {

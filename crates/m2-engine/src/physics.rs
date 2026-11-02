@@ -618,6 +618,14 @@ impl CollisionShape {
         k.checked_sub(1).map_or(0, |k| self.surfaces[k].1)
     }
 
+    /// The height of the highest of its surfaces at or under `(x, from, z)`
+    /// (its own space), if any is: a load bed's floor under a crate.
+    pub fn floor_under(&self, x: f32, from: f32, z: f32) -> Option<f32> {
+        let ray = r::Ray::new(vector(Vec3::new(x, from, z)), vector(-Vec3::Y));
+        let toi = self.shape.cast_local_ray(&ray, 100.0, true)?;
+        Some(from - toi)
+    }
+
     /// The box the shape fills, in its own space.
     pub fn bounds(&self) -> (Vec3, Vec3) {
         let b = self.shape.compute_local_aabb();
@@ -1057,6 +1065,8 @@ pub struct VehicleControls {
 
 struct VehicleBody {
     controller: DynamicRayCastVehicleController,
+    /// Its own collision is on it for what rides it ([`Physics::add_bed`]).
+    bed: bool,
     mass: f32,
     /// Which wheels steer (the front axle), in wheel order.
     steers: Vec<bool>,
@@ -1240,6 +1250,16 @@ const VEHICLE: r::Group = r::Group::GROUP_4;
 /// meets it (people walk and vehicles drive through it, as she goes
 /// through a gate's rubble in the videos; shots pass).
 const RUBBLE: r::Group = r::Group::GROUP_5;
+
+/// The collision group of goods riding loose on a vehicle's load bed
+/// ([`Physics::add_cargo`]): they land on the world, on each other and on
+/// the beds' own shapes ([`BED`]), not on the hulls' boxes (which fill a
+/// pickup's bed to its cab roof).
+const CARGO: r::Group = r::Group::GROUP_6;
+
+/// The collision group of a vehicle's own collision shapes, its `PHY2`
+/// ([`Physics::add_bed`]): only goods riding it ([`CARGO`]) meet them.
+const BED: r::Group = r::Group::GROUP_7;
 
 /// A tracked vehicle's push at `s` of its top speed, of its most: its
 /// curve's points (of its top speed, of its most) in a line between, as
@@ -1802,24 +1822,30 @@ fn drive_axles(v: &VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
     }
 }
 
-/// Queries that see everything but ragdolls and rubble.
+/// Queries that see everything but ragdolls, rubble and vehicles' own
+/// shapes (their hulls stand for them).
 fn solid<'a>() -> r::QueryFilter<'a> {
     r::QueryFilter::default().groups(r::InteractionGroups::new(
         r::Group::ALL,
-        r::Group::ALL.difference(RAGDOLL).difference(RUBBLE),
+        r::Group::ALL
+            .difference(RAGDOLL)
+            .difference(RUBBLE)
+            .difference(BED),
         r::InteractionTestMode::And,
     ))
 }
 
 /// Queries that see what a wheel stands on: everything but ragdolls,
-/// loose pieces and rubble.
+/// loose pieces, rubble, goods and beds.
 fn ground<'a>() -> r::QueryFilter<'a> {
     r::QueryFilter::default().groups(r::InteractionGroups::new(
         r::Group::ALL,
         r::Group::ALL
             .difference(RAGDOLL)
             .difference(DEBRIS)
-            .difference(RUBBLE),
+            .difference(RUBBLE)
+            .difference(CARGO)
+            .difference(BED),
         r::InteractionTestMode::And,
     ))
 }
@@ -2275,6 +2301,69 @@ impl Physics {
         )
     }
 
+    /// As [`add_debris`](Self::add_debris), a piece of goods riding loose
+    /// on a vehicle's load bed ([`CARGO`]): it lies on the bed's own shapes
+    /// ([`add_bed`](Self::add_bed)) and slides, tips and falls off as the
+    /// vehicle turns, brakes and hits, held there by `friction` alone.
+    pub fn add_cargo(
+        &mut self,
+        piece: &LoosePiece,
+        at: Mat4,
+        velocity: Vec3,
+        friction: f32,
+    ) -> DebrisId {
+        let id = self.add_piece(
+            piece,
+            at,
+            velocity,
+            Vec3::ZERO,
+            r::InteractionGroups::new(
+                CARGO,
+                r::Group::ALL.difference(VEHICLE).difference(RUBBLE),
+                r::InteractionTestMode::And,
+            ),
+        );
+        let mut colliders = Vec::new();
+        if let Some(b) = self.debris[id.0].and_then(|h| self.world.bodies.get_mut(h)) {
+            // Riding, it doesn't slow in the air (the pieces' damping is
+            // for what flies off a blast).
+            b.set_linear_damping(0.0);
+            b.set_angular_damping(0.0);
+            colliders.extend_from_slice(b.colliders());
+        }
+        for c in colliders {
+            if let Some(c) = self.world.colliders.get_mut(c) {
+                c.set_friction(friction);
+            }
+        }
+        id
+    }
+
+    /// Puts vehicle `id`'s own collision, `shape` (its `PHY2`, model
+    /// space), on it for the goods riding it to lie on ([`BED`]): a
+    /// pickup's bed floor and sides, which its hull's box doesn't have.
+    /// Nothing but goods meets it, and it adds nothing to the mass. Once a
+    /// vehicle; false if it isn't placed.
+    pub fn add_bed(&mut self, id: VehicleId, shape: &CollisionShape, friction: f32) -> bool {
+        let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
+            return false;
+        };
+        if !v.bed {
+            v.bed = true;
+            let collider = r::ColliderBuilder::new(shape.shape.clone())
+                .density(0.0)
+                .friction(friction)
+                .collision_groups(r::InteractionGroups::new(
+                    BED,
+                    CARGO,
+                    r::InteractionTestMode::And,
+                ));
+            let chassis = v.controller.chassis;
+            self.world.insert_collider(collider, Some(chassis));
+        }
+        true
+    }
+
     fn add_piece(
         &mut self,
         piece: &LoosePiece,
@@ -2318,6 +2407,23 @@ impl Physics {
         let h = (*self.debris.get(id.0)?)?;
         let b = self.world.bodies.get(h)?;
         Some((vec3(b.linvel()), vec3(b.angvel())))
+    }
+
+    /// Puts a loose piece at `at` (world space), at rest.
+    pub fn move_debris(&mut self, id: DebrisId, at: Mat4) {
+        let Some(b) = self
+            .debris
+            .get(id.0)
+            .copied()
+            .flatten()
+            .and_then(|h| self.world.bodies.get_mut(h))
+        else {
+            return;
+        };
+        let (_, rotation, translation) = at.to_scale_rotation_translation();
+        b.set_position(pose(translation, rotation.normalize()), true);
+        b.set_linvel(vector(Vec3::ZERO), true);
+        b.set_angvel(vector(Vec3::ZERO), true);
     }
 
     pub fn remove_debris(&mut self, id: DebrisId) {
@@ -2580,6 +2686,7 @@ impl Physics {
         let id = VehicleId(self.vehicles.len());
         self.vehicles.push(Some(VehicleBody {
             controller,
+            bed: false,
             mass: spec.mass,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
             tops,
@@ -4082,6 +4189,58 @@ mod tests {
         let mut c = Character::new(Vec3::new(0.0, 0.0, -10.0));
         walk(&p, &mut c, Vec3::new(4.0, 0.0, 0.0), 3.0);
         assert!(c.position.x < 5.0, "through the wall: {}", c.position);
+    }
+
+    /// A car with a flat load bed 1 m up over its back half, a 40 kg
+    /// crate on it riding at the car's speed, going 12 m/s along +z: the
+    /// crate's place on the bed (z, car space) after `secs` rolling on,
+    /// then `stop` (the car's speed taken away at once, as a wall does).
+    fn crate_on_bed(friction: f32, stop: bool) -> f32 {
+        let mut p = ready();
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..120 {
+            p.step(DT);
+        }
+        let tray = [
+            Vec3::new(-1.0, 1.0, -2.2),
+            Vec3::new(1.0, 1.0, -2.2),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+        ];
+        let bed = CollisionShape::mesh(&tray, &[[0, 2, 1], [0, 3, 2]]).unwrap();
+        assert!(p.add_bed(id, &bed, friction));
+        let place = p.vehicle_transform(id).unwrap();
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.25), 40.0);
+        let at = place * Mat4::from_translation(Vec3::new(0.0, 1.27, -1.1));
+        let speed = Vec3::new(0.0, 0.0, 12.0);
+        let up = p.vehicle_velocity(id).y;
+        p.set_vehicle_velocity(id, speed.with_y(up));
+        let c = p.add_cargo(&piece, at, speed, friction);
+        for _ in 0..30 {
+            p.step(DT);
+        }
+        if stop {
+            p.set_vehicle_velocity(id, Vec3::ZERO);
+        }
+        for _ in 0..30 {
+            p.step(DT);
+        }
+        let place = p.vehicle_transform(id).unwrap();
+        let on = place.inverse() * p.debris_place(c).unwrap();
+        on.w_axis.z
+    }
+
+    #[test]
+    fn goods_ride_loose_on_a_bed_and_slide_when_it_stops_short() {
+        // Rolling on, the crate stays where it was put.
+        let rolling = crate_on_bed(0.3, false);
+        assert!((rolling + 1.1).abs() < 0.2, "{rolling}");
+        // Stopped short, it slides on forward of where it was.
+        let stopped = crate_on_bed(0.3, true);
+        assert!(stopped > -0.3, "{stopped}");
+        // Held harder, it slides less far.
+        let held = crate_on_bed(1.5, true);
+        assert!(held < stopped, "{held} {stopped}");
     }
 
     #[test]

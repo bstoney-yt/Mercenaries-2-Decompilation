@@ -2447,8 +2447,9 @@ impl MissionLink {
             }
             // What rides on a vehicle is where it rides, for the scripts
             // that count it there (`Pg.GetObjectsInArea`).
-            for (g, at, yaw) in game.scene.props.cargo_places() {
+            for (g, at, yaw, (lo, hi)) in game.scene.props.cargo_places() {
                 mission.place(g, at.to_array(), yaw);
+                mission.set_bounds(g, lo.to_array(), hi.to_array());
             }
             for (g, at, yaw) in game.scene.flights.places(&game.scene.vehicles) {
                 mission.place(g, at.to_array(), yaw);

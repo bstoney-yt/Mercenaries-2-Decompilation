@@ -632,6 +632,10 @@ pub struct ScriptWorld {
     /// (`MrxUtil.SpawnActor`), so the PMC's, of its own layer, must not
     /// stand in for it once that layer is out.
     pub entities: HashMap<u32, [f32; 3]>,
+    /// The world box round the collision of those the game moves loose
+    /// (goods riding a vehicle's bed), lowest corner then highest: what
+    /// `Pg.GetObjectsInArea` meets of them ([`crate::Mission::set_bounds`]).
+    pub bounds: HashMap<u32, ([f32; 3], [f32; 3])>,
     pub entity_names: HashMap<String, u32>,
     /// A save's script data to load, as Lua text ([`crate::savedata`]):
     /// while it is here `Pg.LoadGame` answers that a save is loading.
@@ -1520,7 +1524,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     // Pg.GetObjectsInArea(x, y, z, radius, name): the objects of that
     // name (a template's label: PirCon002's `"RumJug"`s on its truck's
-    // bed, counted with `table.getn`) within the radius.
+    // bed, OilCon020's `"OilCon020gun"`s on its pickup's, counted with
+    // `table.getn`) whose collision's box meets the box reaching `radius`
+    // each way from the point. From the 360 code: the binding (0x82335908)
+    // asks the physics broadphase (0x82153D28, through its query at
+    // vtable 0x40) for the bodies whose boxes overlap that axis-aligned
+    // cube, not a sphere; OilCon020 counts its 20 guns with a radius of 1
+    // round `HP_Truckbed`, which a sphere round their origins misses
+    // (one of the 20, as they were put down on the bed). Those without a
+    // box of their own ([`ScriptWorld::bounds`]) meet it by their place.
     add(&pg, "GetObjectsInArea", |w, lua, a| {
         let list = lua.create_table()?;
         let (Some(x), Some(y), Some(z), Some(r), Some(Value::String(name))) = (
@@ -1548,9 +1560,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                     || m2_engine::world::member_stem(&o.name).eq_ignore_ascii_case(&name)
             })
             .filter_map(|(&g, _)| {
-                let p = w.place_of(g)?;
-                let d = ((p[0] - x).powi(2) + (p[1] - y).powi(2) + (p[2] - z).powi(2)).sqrt();
-                (d <= r).then_some(g)
+                let (lo, hi) = match w.bounds.get(&g) {
+                    Some(&b) => b,
+                    None => {
+                        let p = w.place_of(g)?;
+                        (p, p)
+                    }
+                };
+                let c = [x, y, z];
+                (0..3)
+                    .all(|k| lo[k] <= c[k] + r && hi[k] >= c[k] - r)
+                    .then_some(g)
             })
             .collect();
         found.sort_unstable();
@@ -4123,6 +4143,27 @@ mod tests {
             w.take_commands(),
             [Command::Notify("Pg.ContractActivated".into())]
         );
+    }
+
+    // The 360's area search meets what overlaps a cube round the point
+    // (0x82335908): a corner of it further than the radius counts, and a
+    // body whose box reaches in counts though its origin is outside.
+    #[test]
+    fn objects_in_an_area_meet_a_cube_by_their_boxes() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(10, Object::new("OilCon020gun 01", [0.9, 0.9, 0.9]));
+            w.insert(11, Object::new("OilCon020gun 02", [0.0, -1.5, 0.0]));
+            w.bounds.insert(11, ([-0.3, -1.8, -0.3], [0.3, -0.9, 0.3]));
+            w.insert(12, Object::new("OilCon020gun 03", [0.0, -1.5, 0.0]));
+        }
+        let n: i64 = host
+            .lua()
+            .load("return table.getn(Pg.GetObjectsInArea(0, 0, 0, 1, 'OilCon020gun'))")
+            .eval()
+            .unwrap();
+        assert_eq!(n, 2);
     }
 
     #[test]
