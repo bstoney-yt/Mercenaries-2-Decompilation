@@ -63,6 +63,9 @@ pub struct VehicleTuning {
     /// A motorbike's balance and damping (`_CarPhysicsV2`'s `Bike*`
     /// fields).
     pub bike: Option<BikeTuning>,
+    /// A wheeled vehicle's inertia and centre of mass (`_CarPhysicsV2`),
+    /// as the 360 code sets every car's body (0x8219BA08, 0x8219BABC).
+    pub body: Option<CarBody>,
     /// How far behind a helicopter its pilot's camera sits, metres, and
     /// how far it looks down, radians (`CameraHelicopter`'s field
     /// `ee30a43d`, name unknown: 20 for the light helicopters, 39 for the
@@ -282,6 +285,24 @@ impl BoatTuning {
             ahead
         }
     }
+}
+
+/// A wheeled vehicle's body as its `_CarPhysicsV2` sets it, from the 360
+/// code's car set-up (0x8219B774 on): the body's mass is the record's
+/// `Mass` (0x82629D80), its inertia a diagonal of [`inertia`](Self::inertia)
+/// x that mass (0x8219BA08 -> 0x82629DC0), and its centre of mass the
+/// mean of its wheels' positions plus
+/// [`centre_of_mass`](Self::centre_of_mass) (0x8219BABC -> 0x8262A680).
+/// Fields the record leaves out take the record's defaults (inertia 2, 1,
+/// 1.5; offset 0).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CarBody {
+    /// Its inertia about its own sideways, up and ahead axes, m² per
+    /// kilogram (`InertiaTensorX`, `Y`, `Z`).
+    pub inertia: [f32; 3],
+    /// Where its centre of mass sits from the middle of its wheels, model
+    /// space, metres (`CenterOfMassOffset`).
+    pub centre_of_mass: [f32; 3],
 }
 
 /// How a motorbike holds itself up, from its `_CarPhysicsV2`'s `Bike*`
@@ -1682,6 +1703,20 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         hull_friction: f("HullFriction").unwrap_or(0.3),
                     };
                     (b.torque.0 > 0.0 && b.drag[0] > 0.0).then_some(b)
+                })(),
+                body: (|| {
+                    let r = *car.of_template(id).first()?;
+                    let f = |name, default| car.float(r, name_hash(name)).unwrap_or(default);
+                    Some(CarBody {
+                        inertia: [
+                            f("InertiaTensorX", 2.0),
+                            f("InertiaTensorY", 1.0),
+                            f("InertiaTensorZ", 1.5),
+                        ],
+                        centre_of_mass: car
+                            .vector(r, name_hash("CenterOfMassOffset"))
+                            .unwrap_or([0.0; 3]),
+                    })
                 })(),
                 bike: (|| {
                     let r = *car.of_template(id).first()?;
