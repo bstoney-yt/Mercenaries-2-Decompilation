@@ -6532,6 +6532,8 @@ mod tests {
             rotors: Vec::new(),
             tilts: Vec::new(),
             bomb_bay: None,
+            node_parents: Vec::new(),
+            aimers: Vec::new(),
             damage: None,
             tuning: Default::default(),
         };

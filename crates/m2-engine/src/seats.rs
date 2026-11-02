@@ -37,6 +37,12 @@
 //!   [`seat_for_entrance`]). On getting out, 0x822A2B60 chooses how
 //!   ([`exit_kind`]); a ditch or toss puts her at the exit entrance's
 //!   hardpoint (0x822A1B70) and pushes her off ([`ditch_velocity`]).
+//! - From samples (round seat-turrets): a seat's template names the turret
+//!   its rider aims (`ControllerTurret` `TurretName`), one of the vehicle
+//!   template's `Turret` records ([`TurretRecord`]). Of 727 such links, 637
+//!   name a record on their own vehicle: 453 gunners', 180 drivers', 4
+//!   passengers'. The field names are the exe's reflection strings
+//!   (`ControllerTurret` 0x823F1368, `Turret` 0x823EC738).
 //! - Invented: where an animated exit ends. The exit clip is played from
 //!   the entrance (0x822A2298) and its end is not read; the alpha, which
 //!   plays no clip, puts her at that entrance's hardpoint as a ditch does.
@@ -256,6 +262,10 @@ pub struct Seat {
     /// Its template's `SeatToSeat` rows' `SeatLinkName`s: the seats its
     /// rider may move over to, in order.
     pub links: Vec<u32>,
+    /// The vehicle's `Turret` its rider aims (its template's
+    /// `ControllerTurret` `TurretName`): a tank driver's `main_turret`,
+    /// the M151 gunner's pintle gun. `None`: it aims nothing.
+    pub turret: Option<u32>,
 }
 
 impl Seat {
@@ -286,9 +296,45 @@ pub enum Role {
 pub struct VehicleSeats {
     pub seats: Vec<Seat>,
     pub entrances: Vec<Entrance>,
+    /// The vehicle template's own `Turret` records, which its seats name.
+    pub turrets: Vec<TurretRecord>,
+}
+
+/// One `Turret` record of a vehicle template: a gun mount its seat's rider
+/// turns and tilts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TurretRecord {
+    /// Its `Name`, as seats name it (`main_turret`).
+    pub name: u32,
+    /// The model nodes that turn (`BoneYaw`) and that tilt (`BonePitch`)
+    /// with it, by name hash; either may be missing (a mount that only
+    /// tilts has no yaw bone and a 0..0 yaw).
+    pub bone_yaw: Option<u32>,
+    pub bone_pitch: Option<u32>,
+    /// How far it turns either way of straight ahead, radians (`MinYaw`,
+    /// `MaxYaw`), at most `yaw_speed` radians a second (`MaxYawSpeed`).
+    pub yaw: (f32, f32),
+    pub yaw_speed: f32,
+    /// How far it tilts down and up, radians (`MinPitch`, `MaxPitch`), at
+    /// most `pitch_speed` a second (`MaxPitchSpeed`).
+    pub pitch: (f32, f32),
+    pub pitch_speed: f32,
+}
+
+impl TurretRecord {
+    /// Whether it turns all the way round (a tank's turret's -180..180).
+    pub fn full_circle(&self) -> bool {
+        self.yaw.1 - self.yaw.0 >= std::f32::consts::TAU - 1e-3
+    }
 }
 
 impl VehicleSeats {
+    /// The turret seat `seat` aims (its `ControllerTurret`'s record).
+    pub fn turret_of(&self, seat: usize) -> Option<&TurretRecord> {
+        let name = self.seats.get(seat)?.turret?;
+        self.turrets.iter().find(|t| t.name == name)
+    }
+
     pub fn entrance(&self, name: u32) -> Option<&Entrance> {
         self.entrances.iter().find(|e| e.name == name)
     }
@@ -549,6 +595,8 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
     let entrance_params = Table::new(db, "EntranceParameters");
     let to_seat = Table::new(db, "EntranceToSeat");
     let seat_to_seat = Table::new(db, "SeatToSeat");
+    let controller = Table::new(db, "ControllerTurret");
+    let turret = Table::new(db, "Turret");
     let h = name_hash;
     let (hardpoint, name) = (h("Hardpoint"), h("Name"));
     let nonzero = |v: Option<u32>| v.filter(|&v| v != 0);
@@ -611,6 +659,10 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
                         .iter()
                         .filter_map(|r| nonzero(seat_to_seat.word(r, h("SeatLinkName"))))
                         .collect(),
+                    turret: controller
+                        .of_template(template)
+                        .first()
+                        .and_then(|r| nonzero(controller.word(r, h("TurretName")))),
                 })
             })
             .collect();
@@ -631,7 +683,30 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
                 None => entrances.push(e),
             }
         }
-        out.insert(vehicle, VehicleSeats { seats, entrances });
+        let deg = |r: &[u8], f: &str| turret.float(r, h(f)).unwrap_or(0.0).to_radians();
+        let turrets = turret
+            .of_template(vehicle)
+            .iter()
+            .filter_map(|r| {
+                Some(TurretRecord {
+                    name: nonzero(turret.word(r, name))?,
+                    bone_yaw: nonzero(turret.word(r, h("BoneYaw"))),
+                    bone_pitch: nonzero(turret.word(r, h("BonePitch"))),
+                    yaw: (deg(r, "MinYaw"), deg(r, "MaxYaw")),
+                    yaw_speed: deg(r, "MaxYawSpeed"),
+                    pitch: (deg(r, "MinPitch"), deg(r, "MaxPitch")),
+                    pitch_speed: deg(r, "MaxPitchSpeed"),
+                })
+            })
+            .collect();
+        out.insert(
+            vehicle,
+            VehicleSeats {
+                seats,
+                entrances,
+                turrets,
+            },
+        );
     }
     out
 }
@@ -843,6 +918,7 @@ mod tests {
                 })
                 .collect(),
             links: Vec::new(),
+            turret: None,
         }
     }
 
@@ -1025,6 +1101,7 @@ mod tests {
                     params: EntranceParams::default(),
                 },
             ],
+            turrets: Vec::new(),
         };
         assert_eq!(v.driver(), Some(0));
         assert_eq!(v.exit_of(0).and_then(|e| e.hardpoint), Some(11));

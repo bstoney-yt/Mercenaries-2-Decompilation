@@ -167,6 +167,8 @@ pub fn vehicle(entry: &CatalogueEntry) -> (VehicleSpec, CpuModel) {
         rotors: rotor_specs(&rest),
         tilts: tilt_specs(&rest),
         bomb_bay: None,
+        node_parents: Vec::new(),
+        aimers: Vec::new(),
         damage: None,
         rest,
     };

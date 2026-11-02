@@ -6208,6 +6208,16 @@ fn drive_for_screenshot(
                         .as_ref()
                         .map_or(0.0, |p| p.pitch.to_degrees())
                 );
+                for (a, &(yaw, pitch)) in v.spec.aimers.iter().zip(&v.aims) {
+                    eprintln!(
+                        "drive: turret {:08x} at {:.0} deg on the hull (arc {:.0}..{:.0}), raised {:.1} deg",
+                        a.record.name,
+                        yaw.to_degrees(),
+                        a.record.yaw.0.to_degrees(),
+                        a.record.yaw.1.to_degrees(),
+                        pitch.to_degrees(),
+                    );
+                }
             }
         }
         if options.fire {
@@ -6326,6 +6336,48 @@ fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Res
         game.combat.seat,
         game.hud_info(None).driving.map(|d| d.0)
     );
+    // `--look`: the camera swung, and the turret her seat aims following
+    // (to the end of its arc, at its pace).
+    if options.look != 0.0 {
+        let swing = 10;
+        for k in 0..90 {
+            let look = if k < swing {
+                m2_math::glam::Vec2::new(options.look / swing as f32, 0.0)
+            } else {
+                m2_math::glam::Vec2::ZERO
+            };
+            game.step(
+                Intent {
+                    look,
+                    ..Intent::default()
+                },
+                tick,
+            );
+            if k % 15 == 14 {
+                let v = &game.scene.vehicles[i];
+                let aims: Vec<String> = v
+                    .spec
+                    .aimers
+                    .iter()
+                    .zip(&v.aims)
+                    .map(|(a, &(yaw, pitch))| {
+                        format!(
+                            "{:08x} at {:.0} deg (arc {:.0}..{:.0}) raised {:.1}",
+                            a.record.name,
+                            yaw.to_degrees(),
+                            a.record.yaw.0.to_degrees(),
+                            a.record.yaw.1.to_degrees(),
+                            pitch.to_degrees()
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "board: main turret at {:.0} deg; her seat's turrets {aims:?}",
+                    v.turret.to_degrees()
+                );
+            }
+        }
+    }
     // Fire with each of the guns the switch gives, and drive ahead: what
     // her seat lets her do.
     let start = game

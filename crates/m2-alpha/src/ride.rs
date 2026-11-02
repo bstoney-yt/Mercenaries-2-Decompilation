@@ -215,6 +215,7 @@ mod tests {
                 can_exit: true,
             }],
             links: links.iter().map(|l| name_hash(l)).collect(),
+            turret: None,
         }
     }
 
@@ -247,7 +248,11 @@ mod tests {
                 params: EntranceParams::default(),
             })
             .collect();
-        VehicleSeats { seats, entrances }
+        VehicleSeats {
+            seats,
+            entrances,
+            turrets: Vec::new(),
+        }
     }
 
     fn crew(riders: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -339,6 +344,7 @@ mod tests {
                 seat("seat_rear", "entrance_rear", false, false, &["seat_driver"]),
             ],
             entrances: Vec::new(),
+            turrets: Vec::new(),
         };
         let mut ride = Ride {
             seating: Some(&s),

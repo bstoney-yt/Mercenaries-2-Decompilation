@@ -1189,9 +1189,26 @@ impl Game {
                     }
                 }
                 // A turret turns after the camera, at its own pace, and
-                // its gun tilts to what the crosshair is on.
+                // its gun tilts to what the crosshair is on: the turret
+                // her seat aims (its `ControllerTurret`; see
+                // [`m2_engine::vehicle::Aimer`]), the main one only from
+                // the seat that names it (the driver's, without seat data).
+                let her_seat = player
+                    .driving
+                    .and_then(|i| self.ride.filter(|r| r.0 == i).map(|r| r.1));
                 if let Some(v) = player.driving.and_then(|i| scene.vehicles.get_mut(i))
                     && !v.wrecked
+                    && let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id))
+                    && let Some(k) = her_seat.and_then(|s| v.spec.aimer_of_seat(s))
+                {
+                    let goal = Combat::aim_point(physics, &scene.people, player, v.id);
+                    v.aims.resize(v.spec.aimers.len(), (0.0, 0.0));
+                    let want = v.spec.aim_toward(k, at, v.turret, goal);
+                    v.aims[k] = v.spec.aimers[k].step(v.aims[k], want, dt);
+                }
+                if let Some(v) = player.driving.and_then(|i| scene.vehicles.get_mut(i))
+                    && !v.wrecked
+                    && v.spec.turns_main_turret(her_seat)
                     && let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id))
                 {
                     let f = at.transform_vector3(Vec3::Z);
