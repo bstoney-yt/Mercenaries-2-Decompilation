@@ -127,6 +127,9 @@ pub struct Game {
     /// Each vehicle model's load bed, its `HP_Truckbed` node in its own
     /// space, by model (`None`: it has none), as looked up.
     beds: HashMap<u32, Option<Vec3>>,
+    /// Each vehicle model with a load bed, its own collision (its `PHY2`,
+    /// model space), which the goods on the bed lie on, by model.
+    bed_shapes: HashMap<u32, BedShape>,
     /// The scripts' vehicles whose load bed's goods were logged (taken up,
     /// or what stood near and why not), by index.
     beds_told: HashSet<usize>,
@@ -378,6 +381,7 @@ impl Game {
             combat,
             destruction: Destruction::default(),
             beds: HashMap::new(),
+            bed_shapes: HashMap::new(),
             beds_told: HashSet::new(),
             fetched: HashSet::new(),
             traffic: crate::traffic::Traffic::default(),
@@ -1227,6 +1231,19 @@ impl Game {
                         .find(|(n, _)| *n == m2_assets::name_hash(BED_NODE))
                         .map(|(_, at)| at)
                 });
+                if self.beds.get(&v.spec.model).copied().flatten().is_some() {
+                    self.bed_shapes
+                        .entry(v.spec.model)
+                        .or_insert_with(|| bed_shape(source, v.spec.model));
+                }
+            }
+        }
+        // Each one's own collision goes on it for the goods on its bed.
+        if let Some(world) = &mut self.scene.world {
+            for v in &self.scene.vehicles {
+                if let (Some(id), Some(Some(shape))) = (v.id, self.bed_shapes.get(&v.spec.model)) {
+                    world.physics.add_bed(id, shape, Props::bed_friction());
+                }
             }
         }
         let beds: Vec<Option<Vec3>> = self
@@ -1234,6 +1251,12 @@ impl Game {
             .vehicles
             .iter()
             .map(|v| self.beds.get(&v.spec.model).copied().flatten())
+            .collect();
+        let shapes: Vec<BedShape> = self
+            .scene
+            .vehicles
+            .iter()
+            .map(|v| self.bed_shapes.get(&v.spec.model).cloned().flatten())
             .collect();
         let focus = self.focus();
         if let Some(world) = &mut self.scene.world {
@@ -1316,17 +1339,32 @@ impl Game {
                 world,
                 &mut self.scene.props,
                 &self.scene.vehicles,
-                (&beds, &mut self.beds_told),
+                (&beds, &shapes, &mut self.beds_told),
                 &mut self.destruction,
                 self.scene.install.as_ref(),
             );
-            // What rides on a vehicle that tipped over falls off it.
-            let placed: Vec<_> = self.scene.vehicles.iter().map(|v| v.id).collect();
-            for (e, at) in self.scene.props.carry(&world.physics, &placed) {
-                eprintln!("cargo: {e:#x} falls off at {at:.1}");
-                self.scene
-                    .props
-                    .knock(&mut world.physics, e, Vec3::Y, Vec3::ZERO, false);
+            // What rides loose on a vehicle goes where its body went; what
+            // slid or tipped off the bed is noted.
+            let vehicles = &self.scene.vehicles;
+            let physics = &world.physics;
+            let aboard = |index: usize, centre: Vec3| {
+                let Some(v) = vehicles.get(index) else {
+                    return false;
+                };
+                let (Some(id), Some(bed)) = (v.id, beds.get(index).copied().flatten()) else {
+                    return true;
+                };
+                physics
+                    .vehicle_transform(id)
+                    .is_none_or(|place| within_bed(place, v.model.bounds, bed, centre))
+            };
+            for (e, index, at) in self.scene.props.carry(physics, aboard) {
+                let v = &vehicles[index];
+                let speed = v.id.map_or(0.0, |id| physics.vehicle_speed(id));
+                eprintln!(
+                    "cargo: {e:#x} comes off the {} at {at:.1}, it going {speed:.1} m/s",
+                    v.spec.label
+                );
             }
             // Vehicles running into each other hurt each other and the
             // parts where they met.
@@ -3038,10 +3076,25 @@ impl Game {
 /// scene's and its physics id, and its load bed in its space.
 type Carrier = ((usize, m2_engine::VehicleId), Vec3);
 
+/// A vehicle model's own collision, which its load bed's goods lie on.
+type BedShape = Option<std::sync::Arc<m2_engine::CollisionShape>>;
+
 /// The node of a vehicle model that is its load bed (the scripts count
 /// the goods on it there: PirCon002's `GetHardpointPosition(truck,
 /// "HP_Truckbed")`).
 pub(crate) const BED_NODE: &str = "HP_Truckbed";
+
+/// Vehicle model `model`'s own collision, its `PHY2` shapes (model space):
+/// a pickup's bed floor and sides, for the goods on it to lie on.
+fn bed_shape(
+    source: &mut m2_engine::AssetSource<std::io::BufReader<std::fs::File>>,
+    model: u32,
+) -> Option<std::sync::Arc<m2_engine::CollisionShape>> {
+    let data = source.model(model).ok()?;
+    let cpu = m2_engine::CpuModel::from_data(&data, 0).ok()?;
+    cpu.collision.map(std::sync::Arc::new)
+}
+
 /// The props within this of a scripts' vehicle's load bed are logged
 /// once, metres.
 const TOLD_REACH: f32 = 6.0;
@@ -3057,16 +3110,22 @@ const BED_OVER: f32 = 1.0;
 /// `bed` in its space: over its footprint, from [`BED_UNDER`] under the
 /// node's height to [`BED_OVER`] over it.
 fn on_bed(props: &Props, vehicle: &Crasher, bed: Vec3, entity: u32) -> bool {
-    let (lo, hi) = vehicle.bounds;
-    props.centre(entity).is_some_and(|c| {
-        let l = vehicle.place.inverse().transform_point3(c);
-        l.x > lo.x
-            && l.x < hi.x
-            && l.z > lo.z
-            && l.z < hi.z
-            && l.y > bed.y - BED_UNDER
-            && l.y < bed.y + BED_OVER
-    })
+    props
+        .centre(entity)
+        .is_some_and(|c| within_bed(vehicle.place, vehicle.bounds, bed, c))
+}
+
+/// Whether point `c` is over the footprint `(lo, hi)` of a vehicle placed
+/// at `place`, from [`BED_UNDER`] under its bed node `bed` (its space) to
+/// [`BED_OVER`] over it.
+fn within_bed(place: Mat4, (lo, hi): (Vec3, Vec3), bed: Vec3, c: Vec3) -> bool {
+    let l = place.inverse().transform_point3(c);
+    l.x > lo.x
+        && l.x < hi.x
+        && l.z > lo.z
+        && l.z < hi.z
+        && l.y > bed.y - BED_UNDER
+        && l.y < bed.y + BED_OVER
 }
 
 /// Vehicles knock loose what they hit that comes loose, with the weight
@@ -3080,7 +3139,7 @@ fn knock_loose(
     world: &mut World,
     props: &mut Props,
     vehicles: &[ParkedVehicle],
-    (beds, told): (&[Option<Vec3>], &mut HashSet<usize>),
+    (beds, shapes, told): (&[Option<Vec3>], &[BedShape], &mut HashSet<usize>),
     destruction: &mut Destruction,
     install: Option<&Install>,
 ) {
@@ -3090,6 +3149,7 @@ fn knock_loose(
         .enumerate()
     {
         let Some(id) = v.id else { continue };
+        let shape = shapes.get(index).and_then(|s| s.as_deref());
         // The scripts' vehicles with a load bed take up what stands on it
         // as soon as they are placed, standing or not: the scripts count
         // the goods on the bed from then on (PirCon002 counted none, and
@@ -3141,7 +3201,7 @@ fn knock_loose(
             for e in near {
                 if !props.is_cargo(e)
                     && on_bed(props, &standing, *b, e)
-                    && props.load(&mut world.physics, e, (index, id), b.y)
+                    && props.load(&mut world.physics, e, (index, id), shape)
                 {
                     eprintln!("cargo: {e:#x} rides on the {}", v.spec.label);
                 }
@@ -3239,7 +3299,7 @@ fn run_into(
         StaticKey::Entity(e) => match carrier {
             Some((carrier, bed))
                 if on_bed(props, vehicle, bed, e)
-                    && props.load(&mut world.physics, e, carrier, bed.y) =>
+                    && props.load(&mut world.physics, e, carrier, None) =>
             {
                 eprintln!("cargo: {e:#x} rides on the {label}");
                 false

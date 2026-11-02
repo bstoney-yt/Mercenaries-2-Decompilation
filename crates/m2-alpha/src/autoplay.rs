@@ -4720,6 +4720,7 @@ impl Autoplay {
                         stuck_report(world, id, v.spec.hull, self.reversing.is_some())
                     );
                 }
+                let was = v.id.and_then(|id| world.physics.vehicle_transform(id));
                 if let Some(id) = v.id.take() {
                     world.physics.remove_vehicle(id);
                 }
@@ -4728,6 +4729,14 @@ impl Autoplay {
                         "autoplay: no ground to put the {} on at {to:.1}",
                         v.spec.label
                     );
+                }
+                // The goods aboard go with it.
+                if let (Some(was), Some(now)) =
+                    (was, v.id.and_then(|id| world.physics.vehicle_transform(id)))
+                {
+                    game.scene
+                        .props
+                        .shift_cargo(&mut world.physics, i, was, now);
                 }
             }
             (None, _) => {

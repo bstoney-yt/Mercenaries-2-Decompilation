@@ -28,9 +28,36 @@ use m2_engine::{
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{DrawQueue, RenderBackend};
 
-/// A vehicle whose up axis leans further than this from the vertical
-/// (its height, of 1) has tipped: what rides on it comes off (invented).
-const TIPPED: f32 = 0.5;
+/// How hard goods riding a load bed hold on to it, and the bed to them:
+/// the friction they slide off by as the vehicle turns, brakes and hits.
+/// From samples: every `PHY2` body of OilCon020's crates and guns
+/// (models 2a47d96b, a250fa25) and of the El Grande (720f3948) has 0.3 in
+/// its first unread float ([`m2_assets::physics::Body::unk`]), read here
+/// as its Havok friction; the 360 code that reads it isn't traced.
+const CARGO_FRICTION: f32 = 0.3;
+
+/// What a prop riding a load bed weighs when neither its `PHY2` nor its
+/// template says, kg (invented, as [`m2_engine::durability`]'s light
+/// prop).
+const CARGO_KG: f32 = 50.0;
+
+/// How far over the bed's floor goods sunk in it start, metres (invented:
+/// a hair, for the solver).
+const BED_CLEAR: f32 = 0.02;
+
+/// A prop riding loose on a vehicle's load bed ([`Props::load`]).
+#[derive(Clone, Copy, Debug)]
+struct Riding {
+    /// The vehicle, by its index among the scene's (which stays when it
+    /// is placed afresh).
+    vehicle: usize,
+    /// Its body in the physics world.
+    piece: DebrisId,
+    /// Its model's collision box (model space), which it rides as.
+    bounds: (Vec3, Vec3),
+    /// Still on the bed, as last seen ([`Props::carry`]).
+    aboard: bool,
+}
 
 /// One shown.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -94,11 +121,9 @@ pub struct Props {
     reach: f32,
     /// Those knocked loose: their pieces, in [`Loose`] order.
     knocked: HashMap<u32, Vec<DebrisId>>,
-    /// Those riding on a vehicle's load bed (PirCon002's rum jugs on its
-    /// truck): the vehicle (its index among the scene's, which stays when
-    /// it is placed afresh), and where on it, in its space
-    /// ([`Props::load`]).
-    cargo: HashMap<u32, (usize, Mat4)>,
+    /// Those riding loose on a vehicle's load bed (PirCon002's rum jugs on
+    /// its truck, OilCon020's guns on the El Grande): [`Props::load`].
+    cargo: HashMap<u32, Riding>,
     /// Those broken apart: their pieces, in their [`Breakup`]'s order.
     broken: HashMap<u32, Vec<DebrisId>>,
     /// Those wrecked by a blast: their intact parts going down into the
@@ -471,7 +496,15 @@ impl Props {
             self.parts_down.remove(&e);
             self.sinking.remove(&e);
             let broken = self.broken.remove(&e).into_iter().flatten();
-            for d in self.knocked.remove(&e).into_iter().flatten().chain(broken) {
+            let riding = self.cargo.remove(&e).map(|r| r.piece);
+            for d in self
+                .knocked
+                .remove(&e)
+                .into_iter()
+                .flatten()
+                .chain(broken)
+                .chain(riding)
+            {
                 physics.remove_debris(d);
             }
         }
@@ -525,70 +558,131 @@ impl Props {
         mass.is_some() && self.fling(physics, entity, velocity, spin)
     }
 
-    /// Puts `entity` on the load bed of vehicle `index` (placed as `id`)
-    /// where it stands, raised to at least `floor` (the bed's height in
-    /// the vehicle's space): it rides there ([`carry`](Self::carry)) until
-    /// the vehicle tips over. Its standing collision goes while it rides.
-    /// False unless both are in play.
+    /// Puts `entity` loose on the load bed of vehicle `index` (placed as
+    /// `id`) where it stands, moving with it: a body of its own, its
+    /// model's collision box, that lies on the bed's own shapes
+    /// ([`Physics::add_bed`]) and slides, tips and falls off as the
+    /// vehicle turns, brakes and hits (as the game's goods do: OilCon020's
+    /// guns are lost off a driven pickup). Its standing collision goes.
+    /// It starts clear of `bed` (the vehicle's own collision, its space),
+    /// lifted out of the floor where it stood sunk in it (a layer's goods
+    /// stand a little in the bed as the truck settles on its springs, and
+    /// would drop through it). False unless both are in play and it has a
+    /// collision box.
     pub fn load(
         &mut self,
         physics: &mut Physics,
         entity: u32,
         (index, id): (usize, m2_engine::VehicleId),
-        floor: f32,
+        bed: Option<&CollisionShape>,
     ) -> bool {
-        let (Some(p), Some(t)) = (self.shown.get(&entity), physics.vehicle_transform(id)) else {
+        let Some(p) = self.shown.get(&entity) else {
             return false;
         };
-        let mut local = t.inverse() * Mat4::from_rotation_translation(p.rotation, p.position);
-        local.w_axis.y = local.w_axis.y.max(floor);
+        let Some(collision) = self
+            .models
+            .get(&p.model)
+            .and_then(|m| m.as_ref())
+            .and_then(|m| m.collision.as_ref())
+        else {
+            return false;
+        };
+        let bounds = collision.bounds();
+        let (lo, hi) = bounds;
+        if !(lo.cmple(hi).all() && (hi - lo).is_finite()) {
+            return false;
+        }
+        // Its `PHY2` bodies' mass, else its template's.
+        let kg = collision
+            .loose
+            .as_deref()
+            .map(|l| l.mass)
+            .or_else(|| self.physics_props.get(&p.template).map(|t| t.kg()))
+            .unwrap_or(CARGO_KG);
+        let half = ((hi - lo) * 0.5).max(Vec3::splat(0.05));
+        let piece = m2_engine::LoosePiece::block(None, (lo + hi) * 0.5, half, kg);
+        let mut at = Mat4::from_rotation_translation(p.rotation, p.position);
+        if let (Some(bed), Some(place)) = (bed, physics.vehicle_transform(id)) {
+            let local = place.inverse() * at;
+            let (blo, bhi) = box_around(local, bounds);
+            let middle = (blo + bhi) * 0.5;
+            if let Some(floor) = bed.floor_under(middle.x, bhi.y, middle.z) {
+                let lift = (floor + BED_CLEAR - blo.y).max(0.0);
+                at = place * Mat4::from_translation(Vec3::Y * lift) * local;
+            }
+        }
+        let velocity = physics.vehicle_velocity(id);
         physics.remove_static(StaticKey::Entity(entity));
-        self.cargo.insert(entity, (index, local));
+        let piece = physics.add_cargo(&piece, at, velocity, CARGO_FRICTION);
+        self.cargo.insert(
+            entity,
+            Riding {
+                vehicle: index,
+                piece,
+                bounds,
+                aboard: true,
+            },
+        );
         true
     }
 
-    /// Whether anything rides on vehicle `index`.
-    pub fn carrying(&self, index: usize) -> bool {
-        self.cargo.values().any(|(v, _)| *v == index)
+    /// Moves what is aboard vehicle `index` with it as it is put down
+    /// elsewhere: from where it was, `from`, to `to` (the autoplay's hop,
+    /// which lifts a stuck vehicle out; the goods go with it at rest).
+    pub fn shift_cargo(&mut self, physics: &mut Physics, index: usize, from: Mat4, to: Mat4) {
+        let moved = to * from.inverse();
+        for r in self
+            .cargo
+            .values()
+            .filter(|r| r.vehicle == index && r.aboard)
+        {
+            if let Some(at) = physics.debris_place(r.piece) {
+                physics.move_debris(r.piece, moved * at);
+            }
+        }
     }
 
-    /// Whether `entity` rides on a vehicle ([`load`](Self::load)).
+    /// The friction a vehicle's bed holds its goods by ([`CARGO_FRICTION`]).
+    pub fn bed_friction() -> f32 {
+        CARGO_FRICTION
+    }
+
+    /// Whether anything is still aboard vehicle `index`.
+    pub fn carrying(&self, index: usize) -> bool {
+        self.cargo.values().any(|r| r.vehicle == index && r.aboard)
+    }
+
+    /// Whether `entity` was loaded on a vehicle ([`load`](Self::load)),
+    /// aboard still or fallen off.
     pub fn is_cargo(&self, entity: u32) -> bool {
         self.cargo.contains_key(&entity)
     }
 
-    /// Moves what rides on vehicles with them (`placed`: each vehicle's
-    /// physics id, by index, while it is placed). What rides on one
-    /// tipped past [`TIPPED`] comes off: returned, with where it is, to be
-    /// knocked loose. One not placed for the moment (being placed afresh)
-    /// keeps its load.
+    /// Moves what was loaded on vehicles to where its body is, and finds
+    /// what has come off: `aboard(vehicle, centre)` says whether a point is
+    /// still on that vehicle's bed. Returns those fallen off since the
+    /// last call, with the vehicle and where they are.
     pub fn carry(
         &mut self,
         physics: &Physics,
-        placed: &[Option<m2_engine::VehicleId>],
-    ) -> Vec<(u32, Vec3)> {
+        aboard: impl Fn(usize, Vec3) -> bool,
+    ) -> Vec<(u32, usize, Vec3)> {
         let mut off = Vec::new();
-        for (&e, &(v, local)) in &self.cargo {
-            let Some(t) = placed
-                .get(v)
-                .copied()
-                .flatten()
-                .and_then(|id| physics.vehicle_transform(id))
-            else {
+        for (&e, r) in &mut self.cargo {
+            let Some(at) = physics.debris_place(r.piece) else {
                 continue;
             };
-            if t.y_axis.y > TIPPED {
-                let (_, rotation, position) = (t * local).to_scale_rotation_translation();
-                if let Some(p) = self.shown.get_mut(&e) {
-                    p.position = position;
-                    p.rotation = rotation;
-                }
-            } else {
-                off.push((e, self.shown.get(&e).map_or(Vec3::ZERO, |p| p.position)));
+            let (_, rotation, position) = at.to_scale_rotation_translation();
+            if let Some(p) = self.shown.get_mut(&e) {
+                p.position = position;
+                p.rotation = rotation;
             }
-        }
-        for (e, _) in &off {
-            self.cargo.remove(e);
+            let (lo, hi) = r.bounds;
+            let centre = at.transform_point3((lo + hi) * 0.5);
+            if r.aboard && !aboard(r.vehicle, centre) {
+                r.aboard = false;
+                off.push((e, r.vehicle, centre));
+            }
         }
         if !self.cargo.is_empty() {
             self.changes += 1;
@@ -596,14 +690,17 @@ impl Props {
         off
     }
 
-    /// Where each prop riding on a vehicle is, and its heading.
-    pub fn cargo_places(&self) -> Vec<(u32, Vec3, f32)> {
+    /// Where each prop loaded on a vehicle is, its heading, and the world
+    /// box round its collision (what the scripts' area searches meet:
+    /// `Pg.GetObjectsInArea`).
+    pub fn cargo_places(&self) -> Vec<(u32, Vec3, f32, (Vec3, Vec3))> {
         self.cargo
-            .keys()
-            .filter_map(|e| {
+            .iter()
+            .filter_map(|(e, r)| {
                 let p = self.shown.get(e)?;
                 let f = p.rotation * Vec3::Z;
-                Some((*e, p.position, f.x.atan2(f.z)))
+                let at = Mat4::from_rotation_translation(p.rotation, p.position);
+                Some((*e, p.position, f.x.atan2(f.z), box_around(at, r.bounds)))
             })
             .collect()
     }
