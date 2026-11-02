@@ -1324,6 +1324,26 @@ impl Hijacks {
             }
             self.seats.insert(key.clone(), seat);
         }
+        // In another seat than the driver's (the use key put her in a
+        // passenger's or gunner's), that seat's own link, hardpoint and
+        // clip, as a rider's.
+        let ride = game
+            .ride
+            .filter(|r| r.0 == i)
+            .map(|r| r.1)
+            .filter(|&s| s != m2_assets::name_hash("seat_driver"));
+        let her_seat = match ride {
+            Some(s) => {
+                let k = (key.0, key.1.clone(), s);
+                if !self.rider_seats.contains_key(&k) {
+                    let seat = find_seat(game, &mut self.points, &loaded.clips, i, Some(s));
+                    eprintln!("seat: she sits in {s:08x} of {}: {seat:?}", key.1);
+                    self.rider_seats.insert(k.clone(), seat);
+                }
+                self.rider_seats[&k]
+            }
+            None => self.seats[&key],
+        };
         // What she did on foot stops (Player::update, which would end it,
         // doesn't run while she drives).
         if let Some(p) = &mut game.scene.player {
@@ -1333,7 +1353,7 @@ impl Hijacks {
         // left her, else as the vehicle's entrance has it (a DriverHatch:
         // inside).
         let shown = |s: &Seat| self.scripts_shown.get(&key).copied().unwrap_or(s.shown);
-        let seated = self.seats[&key].filter(shown).and_then(|seat| {
+        let seated = her_seat.filter(shown).and_then(|seat| {
             let index = bind(game, seat.clip)?;
             let scene = &mut game.scene;
             let world = scene.world.as_ref()?;
