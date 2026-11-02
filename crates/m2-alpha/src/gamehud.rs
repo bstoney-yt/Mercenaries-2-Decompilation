@@ -694,12 +694,10 @@ pub struct HudState {
     /// turning left, as the heading.
     pub position: Option<[f32; 3]>,
     pub facing: f32,
-    /// Objective markers for the minimap: where, icon
-    /// (`HUD_objective_deliverable`...), colour (RGBA). Their icons are
-    /// read for the world's markers too ([`GameHud::paint_texture`]).
-    pub blips: Vec<([f32; 3], String, [u8; 4])>,
-    /// Other textures the world's icons draw, by name hash: the pickups'
-    /// markers' ([`crate::pickup_marker`]).
+    /// The radar's objective blips, for the minimap.
+    pub blips: Vec<crate::mission::RadarView>,
+    /// Textures the world's icons draw, by name hash: the objective
+    /// markers' and the pickups' markers' ([`crate::pickup_marker`]).
     pub textures: Vec<u32>,
     /// Where the reticle goes: the screen point her weapon (or her
     /// vehicle's gun) aims at, -1..=1 across and up the screen as
@@ -1582,8 +1580,8 @@ impl GameHud {
     }
 
     /// Paints the HUD's texture `name` over `rect` (screen points), tinted
-    /// by `colour`, once the HUD has read it (the objective markers'
-    /// icons, read with the minimap's blips: [`HudState::blips`]). False
+    /// by `colour`, once the HUD has read it (the world's markers' icons:
+    /// [`HudState::textures`]). False
     /// until then, or if the archive has no such texture.
     pub fn paint_texture(
         &self,
@@ -2724,9 +2722,8 @@ impl Thread {
             log.push(format!("screen covers: {covers} of {} prims", prims.len()));
             self.covers_seen = covers;
         }
-        // The objective markers' icons, for the world's markers
-        // ([`GameHud::paint_texture`]) whether or not the minimap is up.
-        want.extend(state.blips.iter().map(|(_, icon, _)| name_hash(icon)));
+        // The world's markers' icons ([`GameHud::paint_texture`]), whether
+        // or not the minimap is up.
         want.extend(state.textures.iter().copied());
         // The pad's Y, for the use prompts with a pad (`crate::ui`).
         if state.pad {
@@ -5169,20 +5166,17 @@ fn minimap(
     for zone in zones {
         zone.draw(view, &disc, line, out);
     }
-    for (at, icon, colour) in &state.blips {
-        let ([x, y], inside) = view.screen(at[0], at[2]);
-        // Farther ones sit on the rim, towards them.
-        let [x, y] = if inside {
-            [x, y]
-        } else {
-            let (dx, dy) = (x - cx, y - cy);
-            let k = r / dx.hypot(dy).max(1e-3);
-            [cx + dx * k, cy + dy * k]
+    // Sort 7 drawn first, 1 last (on top), as the game's renderer does.
+    let mut blips: Vec<_> = state.blips.iter().collect();
+    blips.sort_by_key(|b| std::cmp::Reverse(b.sort));
+    for b in blips {
+        let Some([x, y]) = blip_place(view, b.at, b.sticky) else {
+            continue;
         };
-        let hash = name_hash(icon);
+        let hash = name_hash(&b.icon);
         want.push(hash);
         let s = r * 0.16;
-        let c = colour.map(|v| f32::from(v) / 255.0);
+        let c = b.colour.map(|v| f32::from(v) / 255.0);
         out.push(quad(Some(hash), [x - s, y - s, x + s, y + s], full, c, 0.0));
     }
     // Her: a white square, upright whichever way she faces (the map turns
@@ -5195,6 +5189,31 @@ fn minimap(
         white,
         0.0,
     ));
+}
+
+/// How far past the rim a sticky blip out of range sits: 2 of the
+/// radar's own units (from the 360 code, the minimap's projection
+/// 82389090: its radius + 2.0), out of the [`BORDER`]'s minimap 100
+/// across.
+const RIM_OUT: f32 = 2.0 / 50.0;
+
+/// Where a radar blip at `at` (world) shows on the minimap, if it does
+/// (from the 360 code, the minimap's renderer 823879D0 and projection
+/// 82389090): inside the range where it is; beyond it, a sticky blip (its
+/// mission tracked) sits just past the rim towards it, and any other is
+/// not drawn.
+fn blip_place(view: &MapView, at: Vec3, sticky: bool) -> Option<[f32; 2]> {
+    let ([x, y], inside) = view.screen(at.x, at.z);
+    if inside {
+        return Some([x, y]);
+    }
+    if !sticky {
+        return None;
+    }
+    let [cx, cy] = view.centre();
+    let (dx, dy) = (x - cx, y - cy);
+    let k = view.radius() * (1.0 + RIM_OUT) / dx.hypot(dy).max(1e-3);
+    Some([cx + dx * k, cy + dy * k])
 }
 
 /// The roads on the minimap, inside its rim: the paved solid strokes
@@ -6239,6 +6258,30 @@ mod tests {
                     / 2.0
             })
             .sum()
+    }
+
+    #[test]
+    fn only_tracked_blips_out_of_range_sit_on_the_rim() {
+        // 100 pixels across, 50 m to the rim, north up.
+        let view = MapView {
+            rect: [0.0, 0.0, 100.0, 100.0],
+            player: [0.0; 3],
+            heading: 0.0,
+            range: 50.0,
+        };
+        // In range: where it is, tracked or not.
+        let near = Vec3::new(0.0, 0.0, 20.0);
+        assert_eq!(blip_place(&view, near, false), Some([50.0, 30.0]));
+        assert_eq!(blip_place(&view, near, true), Some([50.0, 30.0]));
+        // 500 m ahead: a job not tracked is not drawn; a tracked one sits
+        // 2 of the radar's units (of 100 across) past the rim.
+        let far = Vec3::new(0.0, 0.0, 500.0);
+        assert_eq!(blip_place(&view, far, false), None);
+        let [x, y] = blip_place(&view, far, true).unwrap();
+        assert!(
+            (x - 50.0).abs() < 1e-3 && (y - -2.0).abs() < 1e-3,
+            "{x}, {y}"
+        );
     }
 
     #[test]

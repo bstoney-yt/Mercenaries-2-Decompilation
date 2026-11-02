@@ -138,6 +138,9 @@ pub struct MissionView {
     pub key_names: Vec<(String, String)>,
     /// Markers over targets.
     pub markers: Vec<MarkerView>,
+    /// The radar's objective blips (`Hud.Radar.AddObjective`), what the
+    /// minimap shows.
+    pub radar: Vec<RadarView>,
     /// Discs on the ground (`Marker.AddDisc`): centre, radius, colour.
     pub discs: Vec<(Vec3, f32, [u8; 3])>,
     /// The newest objective message: completed (or else added), and text.
@@ -169,6 +172,22 @@ pub struct MissionView {
     /// The size and reach of the markers over pickups, as the scripts set
     /// them ([`crate::pickup_marker`]).
     pub pickup_markers: m2_game::hud::PickupMarkers,
+}
+
+/// An objective blip on the radar (`Hud.Radar.AddObjective`), as the
+/// minimap shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RadarView {
+    /// Where (world): its target's place plus its offset, or its own.
+    pub at: Vec3,
+    /// Its texture (`objective_action`), from the scripts' radar icons.
+    pub icon: String,
+    /// RGBA.
+    pub colour: [u8; 4],
+    /// Kept on the rim while out of range (see [`m2_game::hud::Blip`]).
+    pub sticky: bool,
+    /// Draw order: lower over higher.
+    pub sort: i64,
 }
 
 /// A marker the scripts put over one of their objects (`Marker.AddBlip`),
@@ -3924,6 +3943,15 @@ impl MissionLink {
                 })
             })
             .collect();
+        let radar = radar_views(mission.lua(), &hud.radar, |g| {
+            let o = w.objects.get(&g)?;
+            Some(
+                self.marked
+                    .get(&g)
+                    .copied()
+                    .unwrap_or_else(|| Vec3::from(o.position)),
+            )
+        });
         MissionView {
             status: None,
             black: mission.black(),
@@ -3935,6 +3963,7 @@ impl MissionLink {
             key_names: crate::input::token_keys(&self.keys),
             objectives,
             markers,
+            radar,
             discs,
             message,
             game_message,
@@ -4112,6 +4141,51 @@ fn radar_regions(lua: &mlua::Lua) -> Vec<RadarRegion> {
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// The radar's blips `radar` as the minimap shows them: each at its
+/// target's place (`place`, none if gone) plus its offset, or at the
+/// offset itself without a target (from the 360 code, the minimap's
+/// objective update 82388320), its icon named by the scripts' own
+/// `MrxUtil.MarkerGetNameByIndex_Radar`.
+fn radar_views(
+    lua: &mlua::Lua,
+    radar: &std::collections::BTreeMap<String, m2_game::hud::Blip>,
+    place: impl Fn(u32) -> Option<Vec3>,
+) -> Vec<RadarView> {
+    let name_of = lua
+        .globals()
+        .get::<Option<mlua::Table>>("MrxUtil")
+        .ok()
+        .flatten()
+        .and_then(|u| {
+            u.get::<Option<mlua::Function>>("MarkerGetNameByIndex_Radar")
+                .ok()
+                .flatten()
+        });
+    radar
+        .values()
+        .filter_map(|b| {
+            let offset = Vec3::from(b.offset);
+            let at = match b.target {
+                Some(g) => place(g)? + offset,
+                None => offset,
+            };
+            let icon = name_of
+                .as_ref()
+                .and_then(|f| f.call::<Option<String>>(b.icon).ok().flatten())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "objective_action".to_owned());
+            let [r, g, bl] = b.colour;
+            Some(RadarView {
+                at,
+                icon,
+                colour: [r, g, bl, 255],
+                sticky: b.sticky,
+                sort: b.sort,
+            })
+        })
+        .collect()
 }
 
 impl Fleet {

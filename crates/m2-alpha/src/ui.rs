@@ -604,10 +604,16 @@ fn reticle(info: &HudInfo) -> Option<[f32; 2]> {
     Some([ndc.x.clamp(-1.0, 1.0), ndc.y.clamp(-1.0, 1.0)])
 }
 
-/// The mission's markers, for the game HUD's minimap.
-/// The textures the pickups' markers draw: the backing, and each icon.
+/// The textures the world's markers draw: the objective markers' icons,
+/// the pickups' markers' backing, and each icon.
 fn marker_textures(info: &HudInfo) -> Vec<u32> {
     let mut out = Vec::new();
+    for m in info.mission.iter().flat_map(|m| &m.markers) {
+        let hash = m2_assets::name_hash(&m.icon);
+        if !out.contains(&hash) {
+            out.push(hash);
+        }
+    }
     if !info.pickups.is_empty() {
         out.push(m2_assets::name_hash(crate::pickup_marker::BACKGROUND));
     }
@@ -623,13 +629,11 @@ fn marker_textures(info: &HudInfo) -> Vec<u32> {
     out
 }
 
-fn blips(info: &HudInfo) -> Vec<([f32; 3], String, [u8; 4])> {
-    info.mission.as_ref().map_or_else(Vec::new, |m| {
-        m.markers
-            .iter()
-            .map(|m| (m.at.to_array(), m.icon.clone(), m.colour))
-            .collect()
-    })
+/// The radar's blips, for the game HUD's minimap.
+fn blips(info: &HudInfo) -> Vec<crate::mission::RadarView> {
+    info.mission
+        .as_ref()
+        .map_or_else(Vec::new, |m| m.radar.clone())
 }
 
 /// The HUD for `info`; `covered`: the game's loading screen is up, in
