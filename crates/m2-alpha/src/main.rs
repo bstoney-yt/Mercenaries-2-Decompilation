@@ -3013,6 +3013,11 @@ fn gates_for_screenshot(
     Ok(())
 }
 
+/// A HUD post's numbers ([`gamehud::Post`]) as the mission takes them.
+fn numbers(data: &[(String, f64)]) -> Vec<(&str, f64)> {
+    data.iter().map(|(k, v)| (k.as_str(), *v)).collect()
+}
+
 /// Draws a frame with the HUD (and the mission's objectives) and writes
 /// it to `out` as a binary PPM.
 fn hud_picture(
@@ -4666,6 +4671,9 @@ fn mission_for_screenshot(
                 for (seq, picked) in g.take_choices() {
                     eprintln!("dialog-check: box {seq} closed on option {picked}");
                     link.hud_choice(seq, picked);
+                }
+                for (name, data) in g.take_posts() {
+                    link.hud_post(&name, &numbers(&data));
                 }
             }
         }
@@ -8257,6 +8265,11 @@ impl Running {
             // And the options picked in its dialog boxes.
             for (seq, picked) in g.take_choices() {
                 m.hud_choice(seq, picked);
+            }
+            // And what its scripts posted for the contracts (the PDA's
+            // beacon, which OilCon020's tutorial waits for).
+            for (name, data) in g.take_posts() {
+                m.hud_post(&name, &numbers(&data));
             }
         }
         // With no game HUD to show the contract's fanfare (`--old-hud`,

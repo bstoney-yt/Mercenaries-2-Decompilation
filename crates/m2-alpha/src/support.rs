@@ -119,6 +119,8 @@ pub const CUE_FAIL: &str = "ui_SatDes_Circular_Timing_Fail";
 /// The PDA opened and closed, as the scripts hear it.
 pub const PDA_OPEN: &str = "PDA Open";
 pub const PDA_CLOSE: &str = "PDA Close";
+/// The PDA map's beacon set, with its `nX`, `nY` (`MrxGuiPda.HandleMarkerUpdate`).
+pub const GPS_BEACON_SET: &str = "GPS Beacon Set";
 
 /// The support items there are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,6 +367,10 @@ pub struct Support {
     pub cues: Vec<&'static str>,
     /// The PDA is open.
     pub pda: bool,
+    /// A GPS beacon set (`[x, z]`) for the scripts' `"GPS Beacon Set"`,
+    /// not yet posted: the autoplay's, since this stand-in PDA has no map
+    /// to set one on (the game's HUD sends its map's own).
+    pub beacon: Option<[f32; 2]>,
     /// Seconds a strike has been wanted with nothing to call it with
     /// ([`fallback`](Self::fallback)).
     wanted: f32,

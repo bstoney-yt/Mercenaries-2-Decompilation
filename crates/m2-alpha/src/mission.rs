@@ -390,6 +390,8 @@ local methods = {
     -- attitudes, the log, the people, the score).
     ["Pda.Database"] = { "SetFactionAttitude", "AddLogEntry", "AddHelpEntry",
         "AddDossierEntry", "AddStatisticCategory", "AddStatisticEntry" },
+    -- OilCon020's PDA tutorial turns the map's beacon tutorial on and off.
+    ["Pda.Map"] = { "SetBeaconTutorialMode" },
 }
 for group, names in pairs(methods) do
     local g
@@ -1348,6 +1350,20 @@ impl MissionLink {
         }
     }
 
+    /// A post the HUD's scripts made for the contracts (`MrxGuiPda`'s
+    /// `"GPS Beacon Set"` with the beacon's `nX`, `nY`): the game ran both
+    /// in one script state, so the contracts' watches hear it.
+    pub fn hud_post(&mut self, name: &str, data: &[(&str, f64)]) {
+        let State::Running(m) = &mut self.state else {
+            return;
+        };
+        let waiting = m.awaited_posts().iter().filter(|n| *n == name).count();
+        m.post_numbers(name, data);
+        self.write([format!(
+            "hud post {name:?} {data:?}, {waiting} script events waiting for it"
+        )]);
+    }
+
     /// The HUD's dialog box for the mission's call `seq` ([`DIALOG_BOXES`])
     /// closed on option `picked`: its callback runs with its arguments and
     /// then the option, as the game's box calls it.
@@ -1953,9 +1969,25 @@ impl MissionLink {
             eprintln!("mission: posted {name:?}, {waiting} script events waiting for it");
             match name {
                 support::PDA_OPEN => mission.post_net_event(name, true),
-                support::PDA_CLOSE => mission.post_net_event(name, false),
+                // `MrxGuiPda` posts its closing with its owner too.
+                support::PDA_CLOSE => mission.post_net_event(name, true),
                 _ => mission.post(name),
             }
+        }
+        if let Some([x, z]) = game.support.beacon.take() {
+            let waiting = mission
+                .awaited_posts()
+                .iter()
+                .filter(|n| n.as_str() == support::GPS_BEACON_SET)
+                .count();
+            eprintln!(
+                "mission: posted {:?} at [{x:.0}, {z:.0}], {waiting} script events waiting for it",
+                support::GPS_BEACON_SET
+            );
+            mission.post_numbers(
+                support::GPS_BEACON_SET,
+                &[("nX", f64::from(x)), ("nY", f64::from(z))],
+            );
         }
         // And the sounds the interface cues with them (the timing wheel's
         // beeps, its correct and failed presses).
