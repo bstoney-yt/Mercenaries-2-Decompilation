@@ -203,6 +203,10 @@ pub struct Game {
     /// The vehicle she last got into: the use key sticks to its entrances
     /// ([`entrance_pick`]).
     pub last_vehicle: Option<usize>,
+    /// The island's ladders ([`crate::ladders`]).
+    pub ladders: crate::ladders::Ladders,
+    /// The ladder she is on.
+    pub climb: Option<crate::ladders::Climbing>,
     /// The vehicle the use key seated her in and her seat's `SeatLink`
     /// name ([`crate::ride`]); while she rides any other, or none is
     /// given, she sits at the wheel.
@@ -412,6 +416,8 @@ impl Game {
             hijack_only: HashSet::new(),
             unusable: HashSet::new(),
             last_vehicle: None,
+            ladders: Default::default(),
+            climb: None,
             ride: None,
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
@@ -975,7 +981,28 @@ impl Game {
                         None => eprintln!("seat: no free seat linked to hers"),
                     }
                 }
-                if intent.use_pressed {
+                // On a ladder the climb takes the stick, and the use and
+                // jump keys let go.
+                let climbing = self.climb.is_some();
+                if let Some(c) = self.climb.as_mut() {
+                    let let_go = intent.use_pressed || intent.jump;
+                    match c.tick(intent.movement.y, let_go, dt) {
+                        Some(off) => {
+                            let at = match off {
+                                m2_engine::ladder::Off::Stepped(at) => {
+                                    crate::ladders::step_onto(physics, at, c.climb.ladder.facing)
+                                }
+                                m2_engine::ladder::Off::LetGo(at) => at,
+                            };
+                            eprintln!("ladder: she gets off at rung {} ({off:?})", c.climb.rung);
+                            player.ladder = None;
+                            player.drop_at(at);
+                            self.climb = None;
+                        }
+                        None => player.ladder = Some(c.pose()),
+                    }
+                }
+                if intent.use_pressed && !climbing {
                     // The emplaced gun she would man, if nothing nearer
                     // takes the key.
                     let manning = (player.driving.is_none()
@@ -1052,6 +1079,45 @@ impl Game {
                                 player,
                                 self.last_vehicle,
                             );
+                            // A ladder's end, with no vehicle's entrance
+                            // in reach.
+                            let reach = picked
+                                .is_none()
+                                .then(|| {
+                                    self.ladders.pick(
+                                        &world.index,
+                                        &world.destroyed,
+                                        scene.source.as_mut(),
+                                        player.character.position,
+                                        player.eye(),
+                                        player.camera_forward(),
+                                    )
+                                })
+                                .flatten();
+                            if let Some(r) = reach {
+                                let c = crate::ladders::Climbing::start(
+                                    r,
+                                    crate::ladders::moves(player),
+                                );
+                                eprintln!(
+                                    "ladder: she gets on {} at the {} of object {} ({:.1} m, \
+                                     {} rungs, from rung {})",
+                                    world
+                                        .index
+                                        .template_db
+                                        .names
+                                        .get(&world.index.objects[r.object].template)
+                                        .map_or("?", String::as_str),
+                                    if r.top { "top" } else { "bottom" },
+                                    r.object,
+                                    r.ladder.length(),
+                                    r.ladder.rungs(&c.moves),
+                                    c.climb.rung
+                                );
+                                player.off_foot();
+                                player.ladder = Some(c.pose());
+                                self.climb = Some(c);
+                            }
                             let db = &world.index.template_db;
                             // The seat the entrance gives her.
                             let boarding = picked.and_then(|(i, entrance)| {
