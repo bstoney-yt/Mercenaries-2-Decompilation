@@ -163,6 +163,15 @@ if seq then
         table.insert(__m2_hud_done, seq)
     end
 end
+-- The mission's `ToggleHud` (the HQ hides the HUD inside it): the HUD's
+-- own manager hides or shows its widgets (`SetAllWidgetsSleep`), keeping
+-- the message box and subtitles for a "briefing".
+if group == "GuiManager" and method == "ToggleHud" then
+    local m = rawget(_G, "MrxGuiManager")
+    if type(m) ~= "table" or type(m.ToggleHud) ~= "function" then return false end
+    m.ToggleHud(Player.GetLocalPlayer(), data.bOn, data.sReason)
+    return true
+end
 local module = rawget(_G, "MrxGuiInterface")
 local pda = group:sub(1, 4) == "Pda."
 local hud = type(module) == "table" and (pda and module.PdaInterface or module.HudInterface)
