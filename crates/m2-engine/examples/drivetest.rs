@@ -105,7 +105,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             kind: (*kind).to_owned(),
             label: name.to_owned(),
         };
-        let Some(spec) = VehicleSpec::from_model(&entry, &m) else {
+        let Some(spec) =
+            VehicleSpec::from_model(&entry, &m).map(|s| s.with_chassis(&m, &data.base))
+        else {
             no_spec += ids.len();
             continue;
         };

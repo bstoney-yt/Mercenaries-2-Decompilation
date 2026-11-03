@@ -232,6 +232,18 @@ impl Shape {
     pub fn is_foliage(&self) -> bool {
         self.class() == FOLIAGE
     }
+
+    /// Bit 0 of record word 3 (the record's +0x10 in memory): which of a
+    /// body's two sets of shapes it is in. The 360 code gathers a body's
+    /// shapes by it (0x82169B68, 0x82169E78: the bit equal to the one
+    /// asked for), and a body built for a vehicle (its set-up's flag,
+    /// +0x30 of the build, set by the car's, tank's, helicopter's and
+    /// boat's) collides by those with it set, if it has any, keeping
+    /// the rest aside (0x8216BC08). A car's set without it holds a shape
+    /// on each wheel down to the ground.
+    pub fn is_vehicle_hull(&self) -> bool {
+        self.record[3] & 1 != 0
+    }
 }
 
 /// A parsed `PHY2` section.
@@ -839,6 +851,25 @@ fn capsule(a: [f32; 3], b: [f32; 3], r: f32) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
 mod tests {
     use super::*;
     use crate::havok::tests::PackBuilder;
+
+    #[test]
+    fn a_shape_is_in_the_vehicle_hull_set_by_bit_0_of_word_3() {
+        let shape = |word3| Shape {
+            radius: 0.0,
+            geometry: Geometry::Sphere,
+            part: 0,
+            record: {
+                let mut r = [0; 26];
+                r[3] = word3;
+                r
+            },
+        };
+        // The M151's chassis: its hull's are 1, its wheels' 0, and its
+        // class-5 shapes 2.
+        assert!(shape(1).is_vehicle_hull());
+        assert!(!shape(0).is_vehicle_hull());
+        assert!(!shape(2).is_vehicle_hull());
+    }
 
     fn le(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
