@@ -354,6 +354,10 @@ struct Options {
     /// scripts is up, and each box is pictured a second and a half after
     /// it opens (`<out>-dialog<seq>.ppm`), for comparing the menus.
     dialog_shots: bool,
+    /// With `--mission --after-contract`: the seconds after the contract
+    /// is done at which the scene and the game's HUD are pictured
+    /// (`<out>-late<s>.ppm`), for comparing its end screens.
+    late_shots: Vec<f32>,
     /// With `--screenshot` on foot and `--gait`: she goes on this long
     /// (seconds, default 3), logging where she is each second.
     walk_seconds: Option<f32>,
@@ -711,6 +715,12 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--context" => o.context = Some(value()?),
             "--dialog-keys" => o.dialog_keys = Some(value()?),
             "--dialog-shots" => o.dialog_shots = true,
+            "--late-shots" => {
+                o.late_shots = value()?
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<_, _>>()?
+            }
             "--medevac" => o.medevac = Some(value()?.parse()?),
             "--visit-faction" => o.visit_faction = Some(value()?),
             "--call-extraction" => o.call_extraction = Some(value()?.parse()?),
@@ -4682,6 +4692,21 @@ fn mission_for_screenshot(
                 });
             }
             let _ = hud.build(input, &info, settings);
+            // `--late-shots`: the scene and the HUD at those seconds after
+            // the contract was done (its fanfare, the screens after).
+            if let Some(done) = contract_done {
+                let since = (i - done) as f32 * tick;
+                for &s in options
+                    .late_shots
+                    .iter()
+                    .filter(|&&s| since >= s && since - tick < s)
+                {
+                    render(backend, game, fov, aspect, Some(hud))?;
+                    let path = out.with_file_name(format!("{stem}-late{s}.ppm"));
+                    write_ppm(backend, &path)?;
+                    eprintln!("late-shot: {s} s after the contract: {}", path.display());
+                }
+            }
             // `--dialog-shots`: the box as the game's HUD draws it over the
             // scene, a second and a half after it opened.
             match link.open_dialog().filter(|_| options.dialog_shots) {
