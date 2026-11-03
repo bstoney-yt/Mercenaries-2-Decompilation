@@ -2593,13 +2593,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
     // Player.AddFuel(amount): a fuel pickup's script (133dde94) adds its
-    // amount once it checked her tanks have room; clamped to the
-    // capacity here too.
+    // amount once it checked her tanks have room. From the 360 code
+    // (`lua_Player_AddFuel` 0x8233F828): the engine only adds to the
+    // player state's fuel, with no clamp and no look at the capacity
+    // (`SetFuelCapacity` 0x8233F908 only stores it); any limit is the
+    // scripts' own.
     add(&player, "AddFuel", |w, _, a| {
         if let Some(n) = num(a.first()) {
-            let cap = w.fuel_capacity.unwrap_or(100.0);
             if let Some(o) = w.player.and_then(|p| w.objects.get_mut(&p)) {
-                o.fuel = (o.fuel + n).clamp(0.0, cap);
+                o.fuel += n;
             }
             w.commands.push(Command::AddFuel(n));
         }
@@ -4039,8 +4041,9 @@ mod tests {
                 Command::AddFuel(80.0),
             ]
         );
-        // Up to the tanks' capacity.
-        assert_eq!(w.objects[&1].fuel, 50.0);
+        // Added whole: the engine doesn't hold it to the tanks' capacity
+        // (the 360's `Player.AddFuel`).
+        assert_eq!(w.objects[&1].fuel, 180.0);
     }
 
     #[test]
