@@ -109,6 +109,12 @@ struct Interp {
     elapsed: f32,
     from_rect: [f32; 4],
     to_rect: [f32; 4],
+    /// How much of the move from `from_rect` to `to_rect` is made (0..=1):
+    /// the 360 keeps an animation's move as a change still to make (its
+    /// native, 0x8238FFD8, stores target minus where the widget is), so the
+    /// widget moves by its share each tick and a parent moved meanwhile
+    /// (the box centred after its cursor's pulse began) takes it along.
+    moved: f32,
     from_colour: [f32; 4],
     /// Per channel; `None` stays.
     to_colour: [Option<f32>; 4],
@@ -137,6 +143,9 @@ pub struct Widget {
     /// `SetMovieEndCallback`: what runs when its movie ends (`PlayMovie`
     /// plays none here, so it ends at once).
     pub movie_end: Option<u32>,
+    /// A line `SplitText` made: its spans as split from the whole text, so
+    /// colours and inline icons set before the line's start carry into it.
+    pub line_spans: Option<Vec<TextSpan>>,
     /// The box as last set on this widget, and its parent's box then:
     /// the widget's box now is this mapped from that to the parent's box
     /// now.
@@ -209,6 +218,7 @@ impl Widget {
             sleeping: false,
             inactive: false,
             movie_end: None,
+            line_spans: None,
             own: [0.0; 4],
             parent_ref: None,
             colour: [255.0; 4],
@@ -649,7 +659,7 @@ impl Screen {
             } else {
                 (it.elapsed / it.duration).min(1.0)
             };
-            self.apply_interp(id, &it, t);
+            self.apply_interp(id, &mut it, t);
             if t >= 1.0 {
                 if let Some(cb) = it.callback {
                     due.push((cb, Vec::new()));
@@ -668,10 +678,15 @@ impl Screen {
         due
     }
 
-    fn apply_interp(&mut self, id: u32, it: &Interp, t: f32) {
+    fn apply_interp(&mut self, id: u32, it: &mut Interp, t: f32) {
         let lerp = |a: f32, b: f32| a + (b - a) * t;
-        let rect = [0, 1, 2, 3].map(|i| lerp(it.from_rect[i], it.to_rect[i]));
-        self.set_rect(id, rect);
+        let step = t - it.moved;
+        if it.from_rect != it.to_rect && step != 0.0 {
+            let now = self.rect(id);
+            let rect = [0, 1, 2, 3].map(|i| now[i] + (it.to_rect[i] - it.from_rect[i]) * step);
+            self.set_rect(id, rect);
+        }
+        it.moved = t;
         let colour = [0, 1, 2, 3].map(|i| it.to_colour[i].map(|to| lerp(it.from_colour[i], to)));
         if colour.iter().any(Option::is_some) {
             self.set_colour(id, colour, true);
@@ -800,6 +815,9 @@ impl Screen {
         let Some(w) = self.widgets.get(&id) else {
             return Vec::new();
         };
+        if let Some(line) = &w.line_spans {
+            return line.clone();
+        }
         let spans = self.spans(&w.text);
         if !w.wraps {
             return spans;
@@ -1008,6 +1026,35 @@ pub struct TextSpan {
     /// An inline icon in its place instead of text: the texture, a line
     /// high and square, tinted by the colour.
     pub icon: Option<String>,
+}
+
+/// Wrapped spans cut at their new lines: each line's spans, each keeping
+/// the colour it had (an empty line has none).
+fn span_lines(spans: Vec<TextSpan>) -> Vec<Vec<TextSpan>> {
+    let mut lines: Vec<Vec<TextSpan>> = vec![Vec::new()];
+    for span in spans {
+        if span.icon.is_some() {
+            lines
+                .last_mut()
+                .into_iter()
+                .for_each(|l| l.push(span.clone()));
+            continue;
+        }
+        for (i, part) in span.text.split('\n').enumerate() {
+            if i > 0 {
+                lines.push(Vec::new());
+            }
+            if !part.is_empty() {
+                lines.last_mut().into_iter().for_each(|l| {
+                    l.push(TextSpan {
+                        text: part.to_owned(),
+                        ..span.clone()
+                    })
+                });
+            }
+        }
+    }
+    lines
 }
 
 /// `spans` with a new line put for the space before each word that would
@@ -1286,6 +1333,22 @@ fn inline_icon(word: &str) -> Option<&'static str> {
         "objdestroy" => "HUD_objective_destroy",
         "objdefend" => "HUD_objective_defend",
         "objverify" => "HUD_objective_verify",
+        // The factions' flags (`[flagpmc]` in a contract's terms, after
+        // `[Briefing.Faction]:`), as the HUD movies' text formatter
+        // (`formatText`, topbar) has them: its words and its 32 x 32
+        // `faction_*` pictures, paired by name (AN the Allied Nations, CV
+        // the civilians, OC Universal Petroleum). Those pictures live only
+        // in the movies; drawn here are vz.wad's own `HUD_faction_*` (the
+        // HUD's disguise marker's `_tFactionTextures`). Invented: which
+        // pictures the native text widget draws is not traced.
+        "flagallies" => "HUD_faction_AN",
+        "flagchina" => "HUD_faction_CH",
+        "flagcivilian" => "HUD_faction_CV",
+        "flagguerillas" => "HUD_faction_GR",
+        "flagoil" => "HUD_faction_OC",
+        "flagpirates" => "HUD_faction_PR",
+        "flagpmc" => "HUD_faction_PMC",
+        "flagvz" => "HUD_faction_VZ",
         _ => return None,
     })
 }
@@ -1987,6 +2050,7 @@ natives! {
             elapsed: a.f(18).unwrap_or(0.0).max(0.0),
             from_rect,
             to_rect,
+            moved: 0.0,
             from_colour,
             to_colour: [ch(6), ch(7), ch(8), ch(9)],
             from_uv,
@@ -2070,25 +2134,14 @@ natives! {
         };
         let r = s.rect(id);
         let max = (r[2] - r[0]).max(1.0);
-        let text = s.display_text(&w.text);
         let font = s.fonts.get(&w.font.to_ascii_lowercase());
-        let width = |t: &str| {
-            let px = font.map_or(t.chars().count() as f32 * 12.0, |f| f.text_width(t));
-            px * VIRTUAL_SIZE.1 / FONT_LINES * w.scale
-        };
-        let mut lines = Vec::new();
-        for para in text.split('\n') {
-            let mut line = String::new();
-            for word in para.split(' ') {
-                let candidate = if line.is_empty() { word.to_owned() } else { format!("{line} {word}") };
-                if !line.is_empty() && width(&candidate) > max {
-                    lines.push(std::mem::replace(&mut line, word.to_owned()));
-                } else {
-                    line = candidate;
-                }
-            }
-            lines.push(line);
-        }
+        let unit = VIRTUAL_SIZE.1 / FONT_LINES * w.scale;
+        let width =
+            |t: &str| unit * font.map_or(t.chars().count() as f32 * 12.0, |f| f.text_width(t));
+        let icon = unit * font.map_or(30.0, |f| f32::from(f.line_height));
+        // Wrapped as the widget's own text is, the colours and the inline
+        // icons (a contract's `[flagpmc]`) kept with each line.
+        let lines = span_lines(wrap_spans(s.spans(&w.text), max, width, icon));
         // A new text widget for each line, in the widget's font, scale,
         // colour and justification: `SplitIntoLines` wraps each id it is
         // given in a `TextWidget` (`TextWidget.new(nil, uId)`), and the
@@ -2099,7 +2152,8 @@ natives! {
         for line in lines {
             let line_id = s.create(Kind::Text, String::new());
             if let Some(n) = s.widgets.get_mut(&line_id) {
-                n.text = line;
+                n.text = line.iter().map(|s| s.text.as_str()).collect();
+                n.line_spans = Some(line);
                 n.font = font.clone();
                 n.scale = scale;
                 n.colour = colour;
@@ -2332,6 +2386,7 @@ natives! {
     "SetTextText" => |s, _, a| {
         if let Some(w) = s.widgets.get_mut(&a.id(0)) {
             w.text = a.text(1).unwrap_or_default();
+            w.line_spans = None;
         }
         Ok(MultiValue::new())
     },
@@ -2531,6 +2586,41 @@ mod tests {
             "_GuiInternal.ActivateWidget(shown, false) _GuiInternal.ActivateWidget(shown, true)",
         );
         assert_eq!(texts(), ["now", "later"]);
+    }
+
+    /// A contract's terms split into lines for the scrolling box: the
+    /// faction's flag stays an icon, and a colour carries onto later lines.
+    #[test]
+    fn split_lines_keep_their_icons_and_colours() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            t = G.CreateTextWidget()
+            G.SetWidgetLocation(t, 0, 0, 600, 20)
+            G.SetTextText(t, "Faction: [flagpmc] PMC[n][green]Go[n]On")
+            lines = { G.SplitText(t) }
+            "#,
+        );
+        let ids: Vec<u32> = host
+            .lua()
+            .load("return unpack(lines)")
+            .eval::<mlua::Variadic<u32>>()
+            .unwrap()
+            .to_vec();
+        assert_eq!(ids.len(), 3);
+        let s = screen.borrow();
+        let first = s.text_spans(ids[0]);
+        assert!(
+            first
+                .iter()
+                .any(|p| p.icon.as_deref() == Some("HUD_faction_PMC")),
+            "{first:?}"
+        );
+        let green = colour_name("green");
+        assert_eq!(s.text_spans(ids[2])[0].colour, green);
+        assert_eq!(s.widget(ids[2]).unwrap().text, "On");
     }
 
     /// `SetWidgetLocation` with coordinates left out, as the 360 reads it.
@@ -2748,6 +2838,31 @@ mod tests {
         assert!(screen.borrow_mut().take_log().is_empty());
     }
 
+    /// A dialog box's cursor pulses (its colour only, its box given as
+    /// where it is) and then the box is centred: the cursor goes with the
+    /// box, as the 360 keeps an animation's move as a change still to make.
+    #[test]
+    fn an_animation_keeps_to_its_parent_moved_meanwhile() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            box = G.CreateWidget()
+            G.SetWidgetLocation(box, 0, 0, 300, 200)
+            cursor = G.CreateImageWidget()
+            G.SetWidgetLocation(cursor, 10, 150, 150, 190)
+            G.AddWidgetChild(box, cursor)
+            local x1, y1, x2, y2 = G.GetWidgetLocation(cursor)
+            G.InterpolateWidget(cursor, 1, x1, y1, x2, y2, -4096, -4096, -4096, 100)
+            G.SetWidgetLocation(box, 170, 140)
+            "#,
+        );
+        tick(host.lua(), 0.5);
+        let s = screen.borrow();
+        assert_eq!(s.rect(2), [180.0, 290.0, 320.0, 330.0]);
+    }
+
     #[test]
     fn text_markup_expands_ids_arguments_lines_and_colours() {
         let mut s = Screen::default();
@@ -2857,6 +2972,14 @@ mod tests {
         assert_eq!(spans[0].colour, yellow);
         assert_eq!((spans[1].text.as_str(), spans[1].colour), (" Go", yellow));
         assert_eq!(s.display_text("[2ndobjt][objverify2] x"), " x");
+        // A contract's faction, its flag.
+        let spans = s.spans("Faction: [flagpmc] PMC");
+        assert_eq!(
+            spans[1].icon.as_deref(),
+            Some("HUD_faction_PMC"),
+            "{spans:?}"
+        );
+        assert_eq!(s.display_text("Faction: [flagpmc] PMC"), "Faction:  PMC");
     }
 
     #[test]
