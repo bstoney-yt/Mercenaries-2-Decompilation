@@ -992,6 +992,11 @@ impl Game {
                     let from = self.ride.map(|(_, s)| s);
                     match crate::ride::transfer(crate::ride::Ride::of(v), from) {
                         Some(to) => {
+                            // Over by the clip, from the seat she leaves.
+                            if v.spec.seating.is_some() {
+                                self.boarding =
+                                    Some(crate::boarding::Boarding::transfer(i, from, to));
+                            }
                             self.ride = Some((i, to));
                             self.combat.seat = crate::ride::armed_index(
                                 crate::ride::Ride::of(v),
@@ -1230,17 +1235,45 @@ impl Game {
                                 log_entry(physics, v, player, entrance, b.as_ref());
                                 Some((i, b?, entrance))
                             });
+                            // Swimming 3 m or more off a dive entrance, she
+                            // dives for it (0x8229F890).
+                            let dive = boarding.as_ref().and_then(|(i, _, entrance)| {
+                                let v = &scene.vehicles[*i];
+                                let e = (*entrance)?;
+                                let local = v.spec.entrance_at(e)?;
+                                let at = physics.vehicle_transform(v.id?)?;
+                                let p = v.spec.seating.as_deref()?.entrance(e)?.params;
+                                let her = player.character.position;
+                                let flat = (at.transform_point3(local) - her).with_y(0.0).length();
+                                m2_engine::seats::dives(
+                                    &p,
+                                    player.swimming(),
+                                    afloat(physics, v, at),
+                                    flat,
+                                )
+                                .then(|| {
+                                    eprintln!(
+                                        "enter: she dives for the {} from {flat:.2} m",
+                                        v.spec.label
+                                    );
+                                    her
+                                })
+                            });
                             player.driving = boarding.as_ref().map(|(i, _, _)| *i);
                             if let Some((i, b, entrance)) = &boarding {
                                 self.last_vehicle = Some(*i);
                                 // By the clips, through the entrance she took, for
                                 // the seat it gave her (before any slide over).
                                 if scene.vehicles[*i].spec.seating.is_some() {
-                                    self.boarding = Some(crate::boarding::Boarding::enter(
+                                    let mut boarding = crate::boarding::Boarding::enter(
                                         *i,
                                         b.slid_from.or(b.seat),
                                         *entrance,
-                                    ));
+                                    );
+                                    boarding.transfer_to = b.seat.filter(|_| b.slid_from.is_some());
+                                    boarding.dive =
+                                        dive.map(|from| (from, m2_engine::seats::DIVE_TIME));
+                                    self.boarding = Some(boarding);
                                 }
                                 self.ride = b.seat.map(|s| (*i, s));
                                 let v = &scene.vehicles[*i];
@@ -4217,7 +4250,9 @@ fn entrance_pick(
         for &(e, local) in &v.spec.entrances {
             let place = at.transform_point3(local);
             let p = e.params;
-            if seats::in_search(her, eye, aim, place, p.use_distance, seats::SEARCH_PAD) {
+            // Swimming, a boat's long-search entrances from afar.
+            let pad = seats::search_pad(&p, player.swimming(), afloat(physics, v, at));
+            if seats::in_search(her, eye, aim, place, p.use_distance, pad) {
                 let c = Candidate {
                     vehicle: i,
                     distance_sq: her.distance_squared(place),
@@ -4491,6 +4526,17 @@ fn exit_plan(
         (_, Some(p)) => p,
     };
     (kind, place)
+}
+
+/// Whether `v`, standing at `at`, is a boat afloat: its origin (its
+/// waterline, [`m2_engine::Physics`]'s boats float on it) under the water
+/// there. The 360 asks more of it (a value of the boat's body over 0.01 to
+/// dive for it, over 0.9 to be offered it from afar, 0x8229F890 and
+/// 0x82440F30, read off its first float point's record +0x50); that this
+/// is how far it sits in the water is inferred.
+fn afloat(physics: &Physics, v: &ParkedVehicle, at: Mat4) -> bool {
+    let o = at.transform_point3(Vec3::ZERO);
+    v.spec.is_boat() && physics.water_at(o.x, o.z).is_some_and(|w| o.y < w)
 }
 
 /// Whether she gets out of `v` from seat `seat` (`None`, the driver's) by

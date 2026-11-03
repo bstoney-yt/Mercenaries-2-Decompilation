@@ -257,6 +257,17 @@ pub enum Step {
     Exit { door: bool },
     /// `ExitVehicleCloseDoor`.
     CloseAfterExit,
+    /// `SeatToSeatTransfer`: over from her seat to another, played at the
+    /// seat she leaves (0x822A6FF0 sends it; at its `Complete` 0x822A7198
+    /// seats her in the other).
+    Transfer,
+    /// `Dive`: swimming, she dives for a boat's entrance from afar
+    /// (0x8229F890), staying where she was.
+    Dive,
+    /// `SwimToEnterBoat` (sent at the dive's `Complete`, 0x822A5990):
+    /// she glides to the entrance until the dive's time is up, when
+    /// `EnterVehicle` follows ([`crate::seats::DIVE_TIME`], 0x8229FDE8).
+    SwimToBoat,
 }
 
 impl Step {
@@ -269,6 +280,9 @@ impl Step {
             Step::OpenToExit => "ExitVehicleOpenDoor",
             Step::Exit { .. } => "ExitVehicle",
             Step::CloseAfterExit => "ExitVehicleCloseDoor",
+            Step::Transfer => "SeatToSeatTransfer",
+            Step::Dive => "Dive",
+            Step::SwimToBoat => "SwimToEnterBoat",
         }
     }
 
@@ -304,12 +318,18 @@ impl Step {
     pub fn next(self, door: Option<f32>) -> Option<Self> {
         match self {
             Step::OpenToEnter => Some(Step::Enter),
+            Step::Dive => Some(Step::SwimToBoat),
+            // It loops; the dive's time ends it.
+            Step::SwimToBoat => Some(Step::SwimToBoat),
             Step::Enter => door
                 .filter(|&c| c <= LEFT_OPEN_COS)
                 .map(|_| Step::CloseAfterEnter),
             Step::OpenToExit => Some(Step::Exit { door: true }),
             Step::Exit { door: true } => Some(Step::CloseAfterExit),
-            Step::CloseAfterEnter | Step::Exit { door: false } | Step::CloseAfterExit => None,
+            Step::CloseAfterEnter
+            | Step::Exit { door: false }
+            | Step::CloseAfterExit
+            | Step::Transfer => None,
         }
     }
 }
@@ -433,6 +453,23 @@ mod tests {
             Step::Enter.next(Some(20f32.to_radians().cos())),
             Some(Step::CloseAfterEnter)
         );
+    }
+
+    #[test]
+    fn a_dive_swims_on_till_its_time_is_up() {
+        assert_eq!(m2_assets::name_hash(Step::Dive.action()), 0x4565_e347);
+        assert_eq!(m2_assets::name_hash(Step::SwimToBoat.action()), 0x6241_6b66);
+        assert_eq!(Step::Dive.next(None), Some(Step::SwimToBoat));
+        assert_eq!(Step::SwimToBoat.next(None), Some(Step::SwimToBoat));
+        assert!(!Step::Dive.exiting());
+    }
+
+    #[test]
+    fn the_slide_over_is_a_step_of_its_own() {
+        assert_eq!(Step::Transfer.action(), "SeatToSeatTransfer");
+        assert_eq!(m2_assets::name_hash(Step::Transfer.action()), 0x13c2_c767);
+        assert!(!Step::Transfer.exiting());
+        assert_eq!(Step::Transfer.next(Some(1.0)), None);
     }
 
     #[test]

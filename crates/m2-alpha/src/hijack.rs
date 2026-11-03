@@ -1495,17 +1495,27 @@ impl Hijacks {
             Step::OpenToExit,
             Step::Exit { door: false },
             Step::CloseAfterExit,
+            Step::Transfer,
+            Step::Dive,
+            Step::SwimToBoat,
         ];
         let clips: Vec<(&'static str, Option<u32>)> = steps
             .iter()
             .map(|s| {
-                let clip = animation_table::seat_clip_row(
+                // The table's target: the seat slid over to, else the
+                // entrance.
+                let target = match s {
+                    Step::Transfer => b.transfer_to,
+                    _ => b.entrance,
+                };
+                let clip = animation_table::seat_clip_row_to(
                     actions,
                     vehicles,
                     "InVehicle",
                     s.action(),
                     seat.set,
                     Some(seat_name),
+                    target,
                 )
                 .map(|(clip, _)| clip);
                 (s.action(), clip)
@@ -1518,10 +1528,13 @@ impl Hijacks {
                 .and_then(|c| c.1)
         };
         let mut step = b.step;
-        let mut begun = false;
+        // A step set before any clip played (a slide over) begins now.
+        let mut begun = b.step.is_some() && b.t == 0.0;
         if step.is_none() {
             step = Some(if b.exiting {
                 Step::exit(cos)
+            } else if b.dive.is_some() {
+                Step::Dive
             } else {
                 Step::enter(cos)
             });
@@ -1541,6 +1554,21 @@ impl Hijacks {
                 ),
                 step
             );
+        }
+        // Diving for a boat: when its time is up she is at the entrance and
+        // gets in (0x8229FDE8 sends `EnterVehicle`), whatever plays.
+        if let Some((from, left)) = b.dive {
+            let left = left - dt;
+            if left <= 0.0 {
+                b.dive = None;
+                b.dived = true;
+                step = Some(Step::Enter);
+                b.t = 0.0;
+                begun = true;
+                eprintln!("boarding: the dive is over: she gets in");
+            } else {
+                b.dive = Some((from, left));
+            }
         }
         // The clip under way, or the step's after it ends.
         let mut prev = b.t;
@@ -1572,6 +1600,10 @@ impl Hijacks {
             }
             let door = self.boarding_door(game, &b);
             step = s.next(door.map(|(d, sw)| sw.cos(&d)));
+            // In, she slides over to the seat hero.lua gave her.
+            if step.is_none() && !b.exiting && s != Step::Transfer && b.transfer_to.is_some() {
+                step = Some(Step::Transfer);
+            }
             begun = true;
             if let Some(n) = step {
                 eprintln!("boarding: then {}", n.action());
@@ -1590,14 +1622,18 @@ impl Hijacks {
         self.door_events_between(game, &b, Some(hash), prev, b.t);
         if b.step != Some(s) || begun {
             if let Some((_, rig)) = game.scene.player.as_mut().and_then(|p| p.model.as_mut()) {
+                // `SwimToEnterBoat` loops (its `Complete` starts it again).
+                let once = s != Step::SwimToBoat;
                 rig.animator
-                    .play_action(index, true, m2_assets::name_hash(s.action()));
+                    .play_action(index, once, m2_assets::name_hash(s.action()));
             }
             eprintln!("boarding: she plays {} (clip {hash:08x})", s.action());
         }
         b.step = Some(s);
         b.unplayed = 0.0;
         let entrance = b.entrance;
+        let dive = b.dive;
+        let dived = b.dived;
         game.boarding = Some(b);
         // Her clip at the seat, as she sits there.
         let scene = &mut game.scene;
@@ -1631,7 +1667,40 @@ impl Hijacks {
         // stands 0.08 m from the entrance's hardpoint and her first exit
         // frame within 0.02 m of where her seated loop has her.
         let origin = exit_point.filter(|_| s.exiting()).unwrap_or(seat.at);
-        let frame = at * Mat4::from_translation(origin + seat_offset(rig, index));
+        let mut frame = at * Mat4::from_translation(origin + seat_offset(rig, index));
+        // After a dive her `EnterVehicle` plays on from the entrance she was
+        // put at (0x8229FDE8 attaches her where she is, not at the seat),
+        // her clip's root from where it starts. Measured on the speed boat:
+        // so its clip ends 0.01 m from her seat's hardpoint, where played
+        // from the seat it ended 2.4 m off.
+        if dived
+            && s == Step::Enter
+            && let Some(e) = exit_point
+        {
+            let from_start = seat_offset(rig, index) - clip_start_offset(rig, index);
+            frame = at * Mat4::from_translation(e + from_start);
+        }
+        // Diving, she stays where she swam while `Dive` plays, then glides
+        // evenly to the entrance over what is left of the dive's time
+        // (0x8229FDE8: the way left is the time left over the whole),
+        // turned to it.
+        if let (Some((from, left)), Some(to)) = (
+            dive,
+            entrance
+                .and_then(|e| scene.vehicles[i].spec.entrance_at(e))
+                .map(|l| at.transform_point3(l)),
+        ) {
+            let here = if s == Step::SwimToBoat {
+                to - (to - from) * (left / m2_engine::seats::DIVE_TIME)
+            } else {
+                from
+            };
+            let way = (to - from).with_y(0.0);
+            let yaw = way.x.atan2(way.z);
+            p.facing = yaw + forward.x.atan2(forward.y);
+            frame =
+                Mat4::from_rotation_translation(m2_math::glam::Quat::from_rotation_y(yaw), here);
+        }
         p.seat_frame = Some(frame);
         p.character.position = frame.transform_point3(Vec3::ZERO);
         p.character.velocity = Vec3::ZERO;
@@ -1716,7 +1785,46 @@ impl Hijacks {
             "boarding: her exit clips end at local {:.2?}",
             local.to_array()
         );
-        crate::game::get_out_at(&world.physics, v, b.seat, p, place, facing);
+        // Where she stands is kept unless it is not clear (0x822A2648 asks
+        // 0x8229A8D8, which also fails her standing on a vehicle all round:
+        // a tank's exit clips leave her on its hull); then the clear point
+        // search's first place she fits (0x822A13D0, 0x8239F440). Here
+        // "on the vehicle" is within its footprint and "fits" is a clear
+        // ray from the vehicle's middle at chest height; with none, she
+        // gets out as without the clips.
+        let (lo, hi) = v.spec.bounds;
+        let inside = (lo.x..=hi.x).contains(&local.x) && (lo.z..=hi.z).contains(&local.z);
+        let clear = || {
+            let id = v.id?;
+            let centre = at.transform_point3((lo + hi) * 0.5);
+            let ahead = at.transform_vector3(Vec3::Z);
+            let yaw = ahead.x.atan2(ahead.z);
+            let from = centre.with_y(place.y + 1.2);
+            m2_engine::seats::clear_points(centre, yaw, (hi - lo).length() * 0.5)
+                .into_iter()
+                .enumerate()
+                .find(|(_, q)| {
+                    let way = q.with_y(from.y) - from;
+                    world
+                        .physics
+                        .cast_ray_past(from, way, way.length(), id)
+                        .is_none()
+                })
+                .map(|(k, q)| (k, q.with_y(place.y)))
+        };
+        match (inside, inside.then(clear).flatten()) {
+            (false, _) => crate::game::get_out_at(&world.physics, v, b.seat, p, place, facing),
+            (true, Some((k, q))) => {
+                eprintln!("boarding: that is on the vehicle: clear point {k} instead");
+                crate::game::get_out_at(&world.physics, v, b.seat, p, q, facing);
+            }
+            (true, None) => {
+                eprintln!(
+                    "boarding: that is on the vehicle, no clear point: out as without the clips"
+                );
+                crate::game::get_out(&world.physics, v, b.seat, p);
+            }
+        }
         p.seated = false;
         p.seat_frame = None;
         game.ride = None;
@@ -2603,6 +2711,22 @@ fn find_seat(
         .and_then(|l| l.1)
         .and_then(|h| point(points, scene.source.as_mut(), model, h));
     eprintln!("seat: {name} link {link:x?} hardpoint {hardpoint:?} marker {marker:?}");
+    // How the hardpoint's node is turned in the model (for the clips'
+    // frame): its axes' headings.
+    if let (Some(h), Some(src)) = (link.and_then(|l| l.1), scene.source.as_mut())
+        && let Ok(data) = src.model(model)
+        && let Ok(m) = data.parse()
+        && let Some(k) = m.nodes.iter().position(|n| n.name_hash == h)
+        && let Some(to) = m.node_to_model(k as u16)
+    {
+        let z = to.transform_vector3(Vec3::Z);
+        let x = to.transform_vector3(Vec3::X);
+        eprintln!(
+            "seat: {name}: hardpoint {h:08x} turned: z to {:.2?}, x to {:.2?}",
+            z.to_array(),
+            x.to_array()
+        );
+    }
     // Every SeatLink record of the template whole: which field (if any)
     // says the seat is enclosed is not known yet.
     for (k, row) in clips
@@ -2755,6 +2879,21 @@ fn seat_offset(rig: &crate::scene::Rig, clip: usize) -> Vec3 {
         .filter(|cur| cur.0 == clip)
         .map_or(0.0, |cur| cur.1);
     let pose = c.sample_looped(&rig.skeleton, t);
+    pose.0.get(rig.skeleton.root()).map_or(Vec3::ZERO, |l| {
+        Vec3::new(
+            l.translation.x - c.info.pin.x,
+            0.0,
+            l.translation.z - c.info.pin.y,
+        )
+    })
+}
+
+/// [`seat_offset`] at the start of clip `clip`.
+fn clip_start_offset(rig: &crate::scene::Rig, clip: usize) -> Vec3 {
+    let Some(c) = rig.clips.get(clip) else {
+        return Vec3::ZERO;
+    };
+    let pose = c.sample_looped(&rig.skeleton, 0.0);
     pose.0.get(rig.skeleton.root()).map_or(Vec3::ZERO, |l| {
         Vec3::new(
             l.translation.x - c.info.pin.x,

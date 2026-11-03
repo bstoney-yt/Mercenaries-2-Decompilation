@@ -321,6 +321,23 @@ pub fn seat_clip_row(
     (class, name): (u32, u32),
     seat: Option<u32>,
 ) -> Option<(u32, usize)> {
+    seat_clip_row_to(actions, vehicles, stance, action, (class, name), seat, None)
+}
+
+/// [`seat_clip_row`] with the stance and action table's `Target`: the
+/// entrance a getting in or out goes by, or the seat a slide over goes to
+/// (from samples: the `EnterVehicle` rows name the tanks' entrances there,
+/// the `SeatToSeatTransfer` rows the seat moved to). A row for any target
+/// still matches.
+pub fn seat_clip_row_to(
+    actions: &AnimationTable,
+    vehicles: &AnimationTable,
+    stance: &str,
+    action: &str,
+    (class, name): (u32, u32),
+    seat: Option<u32>,
+    target: Option<u32>,
+) -> Option<(u32, usize)> {
     let handle = actions.lookup(
         &[
             ("Stance", Some(crate::name_hash(stance))),
@@ -328,7 +345,7 @@ pub fn seat_clip_row(
             ("AimState", None),
             ("Tandem", None),
             ("Seat", seat),
-            ("Target", None),
+            ("Target", target),
             ("ActionDirection", None),
             ("DamageDirection", None),
         ],

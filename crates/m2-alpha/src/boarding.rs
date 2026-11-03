@@ -9,6 +9,12 @@
 //! ends the boarding. A boarding nothing plays (the tables not loaded, a
 //! vehicle without clips) ends on its own after [`UNPLAYED`]: she is in,
 //! or out at the door, as before.
+//!
+//! From the 360 code: getting in she is put on the vehicle at once
+//! (0x8229B580) and her first clip starts where it was cut, by the
+//! entrance; she is not glided there. Only a dive in (0x8229F890: from the
+//! air, 3 m or more off, through a `bUseDive` entrance) glides her, over
+//! 1.2 s (0x820C9BB8, 0x8229FDE8); the alpha has no dive in.
 
 use m2_engine::vehicle_door::Step;
 
@@ -27,12 +33,21 @@ pub struct Boarding {
     pub entrance: Option<u32>,
     /// Getting out.
     pub exiting: bool,
+    /// Over to this seat (`SeatLink` name) once in ([`Step::Transfer`]):
+    /// hero.lua slid her over from the seat she got in by, or the seat key.
+    pub transfer_to: Option<u32>,
     /// The clip playing: its step, once begun.
     pub step: Option<Step>,
     /// Seconds into that step's clip.
     pub t: f32,
     /// Seconds since a clip was last played for it.
     pub unplayed: f32,
+    /// Diving for a boat from where she swam (world space), and the
+    /// seconds of the dive left ([`m2_engine::seats::DIVE_TIME`]).
+    pub dive: Option<(m2_math::glam::Vec3, f32)>,
+    /// The dive is over: she is at the entrance, where her `EnterVehicle`
+    /// clip now plays from.
+    pub dived: bool,
 }
 
 impl Boarding {
@@ -42,9 +57,12 @@ impl Boarding {
             seat,
             entrance,
             exiting: false,
+            transfer_to: None,
             step: None,
             t: 0.0,
             unplayed: 0.0,
+            dive: None,
+            dived: false,
         }
     }
 
@@ -52,6 +70,15 @@ impl Boarding {
         Self {
             exiting: true,
             ..Self::enter(vehicle, seat, entrance)
+        }
+    }
+
+    /// Over from seat `from` to `to` (seated already).
+    pub fn transfer(vehicle: usize, from: Option<u32>, to: u32) -> Self {
+        Self {
+            transfer_to: Some(to),
+            step: Some(Step::Transfer),
+            ..Self::enter(vehicle, from, None)
         }
     }
 
