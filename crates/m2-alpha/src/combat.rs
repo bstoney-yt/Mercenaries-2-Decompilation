@@ -6286,6 +6286,7 @@ mod tests {
             aimers: Vec::new(),
             damage: None,
             chassis: None,
+            shapes: Default::default(),
             tuning: VehicleTuning {
                 gun: Some(gun),
                 ..VehicleTuning::default()

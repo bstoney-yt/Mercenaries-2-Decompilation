@@ -3126,30 +3126,28 @@ impl Physics {
         } else {
             r::CoefficientCombineRule::Min
         };
-        // A tank driven as the 360 code drives it collides by its chassis
-        // body's own `PHY2` shapes, as the 360 code builds its body from
-        // them (0x8216A290): low enough under its hull that, springs
-        // bottomed out, its track rays still start above the ground. Our
-        // box stood 0.45 m up (the wheels' middle), over a squeeze of
-        // 0.36 to 0.4 m on five tanks, whose rays then started under the
-        // ground and missed, leaving them sliding on the box. Each shape
-        // is its points' convex hull (Havok's are convex but for a
-        // mesh one, whose hull covers a little more). Others keep the
-        // invented box.
+        // It collides by its chassis body's own `PHY2` shapes, as the 360
+        // code builds its body from them (0x8216A290). A tank's sit low
+        // enough under its hull that, springs bottomed out, its track rays
+        // still start above the ground: our box stood 0.45 m up (the
+        // wheels' middle), over a squeeze of 0.36 to 0.4 m on five tanks,
+        // whose rays then started under the ground and missed, leaving
+        // them sliding on the box. Each shape is its points' convex hull
+        // (Havok's are convex but for a mesh one, whose hull covers a
+        // little more). A model without them keeps the invented box, and
+        // so do cars and motorbikes for now: their chassis bodies carry a
+        // shape on each wheel down to the ground (the M151's, the Transport
+        // Truck's), which would carry them on rigid wheels; how the 360
+        // keeps those off the ground under its ray wheels isn't traced.
         let shapes: Vec<r::SharedShape> = spec
-            .chassis
-            .as_ref()
-            .filter(|_| spec.tracked && spec.tuning.tank.is_some())
-            .map(|c| {
-                c.shapes
-                    .iter()
-                    .filter_map(|v| {
-                        let points: Vec<_> = v.iter().map(|&p| vector(p)).collect();
-                        r::SharedShape::convex_hull(&points)
-                    })
-                    .collect()
+            .shapes
+            .iter()
+            .filter(|_| spec.tracked || spec.wheels.is_empty())
+            .filter_map(|v| {
+                let points: Vec<_> = v.iter().map(|&p| vector(p)).collect();
+                r::SharedShape::convex_hull(&points)
             })
-            .unwrap_or_default();
+            .collect();
         if shapes.is_empty() {
             let collider = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
                 .translation(vector(centre))
@@ -4104,13 +4102,21 @@ impl Physics {
         };
         body.set_linear_damping(WRECK_DAMPING);
         body.set_angular_damping(WRECK_DAMPING);
-        // The hull (the first collider; a turret's comes after), which
-        // stopped at the wheels' centres, reaches down to the rims and
-        // drags on the ground.
-        for &h in body.colliders().iter().take(1) {
+        // An invented box hull (the first collider; a turret's comes
+        // after), which stopped at the wheels' centres, reaches down to the
+        // rims and drags on the ground; a hull of its chassis's own shapes
+        // ([`VehicleSpec::shapes`]) just drags.
+        for (i, &h) in body.colliders().iter().enumerate() {
             let Some(c) = self.world.colliders.get_mut(h) else {
                 continue;
             };
+            if c.shape().as_cuboid().is_none() {
+                c.set_friction(WRECK_FRICTION);
+                continue;
+            }
+            if i > 0 {
+                continue;
+            }
             let (Some(cube), Some(at)) = (
                 c.shape().as_cuboid().map(|b| vec3(b.half_extents)),
                 c.position_wrt_parent().map(|p| vec3(p.translation)),
@@ -5022,6 +5028,7 @@ mod tests {
             aimers: Vec::new(),
             damage: None,
             chassis: None,
+            shapes: Default::default(),
             tuning: crate::VehicleTuning::default(),
         }
     }
@@ -5608,7 +5615,6 @@ mod tests {
             mass: 83_000.0,
             inertia: Mat3::from_diagonal(Vec3::new(400_000.0, 500_000.0, 200_000.0)),
             centre_of_mass: Vec3::new(0.1, 1.2, 0.5),
-            shapes: Arc::from([]),
         });
         let mut p = Physics::new();
         let id = p.add_vehicle(&spec, Vec3::new(0.0, 1.0, 0.0), 0.0);
@@ -6449,16 +6455,16 @@ mod tests {
             mass: 30_000.0,
             inertia: Mat3::from_diagonal(Vec3::new(100_000.0, 110_000.0, 40_000.0)),
             centre_of_mass: Vec3::new(0.0, 0.9, 0.0),
-            shapes: shape_floor
-                .map(|y| {
-                    vec![box_points(
-                        Vec3::new(-1.6, y, -3.3),
-                        Vec3::new(1.6, 1.6, 3.3),
-                    )]
-                })
-                .unwrap_or_default()
-                .into(),
         });
+        spec.shapes = shape_floor
+            .map(|y| {
+                vec![box_points(
+                    Vec3::new(-1.6, y, -3.3),
+                    Vec3::new(1.6, 1.6, 3.3),
+                )]
+            })
+            .unwrap_or_default()
+            .into();
         let mut p = Physics::new();
         let tilt = Quat::from_rotation_x(-20f32.to_radians());
         let half = 200.0;

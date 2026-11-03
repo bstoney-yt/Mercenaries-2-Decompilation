@@ -1384,6 +1384,7 @@ mod tests {
             aimers: Vec::new(),
             damage: None,
             chassis: None,
+            shapes: Default::default(),
             tuning: Default::default(),
         };
         let plain = ChaseRig::of(&spec);
