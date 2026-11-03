@@ -66,7 +66,13 @@ const REFILL_CLEAR: f32 = 20.0;
 const WANDER: f32 = 30.0;
 /// Walking and fleeing speeds, m/s, and the pause at each end of a route
 /// or stroll.
-const WALK: f32 = 1.4;
+/// How far the 360's `HumanWalk` task pushes a person's stick, and its
+/// `HumanRun` (and `HumanFlee`) task: shares of their full speed, which
+/// their template's paces turn into a walk, jog or run
+/// ([`m2_engine::on_foot::pace`]): 0x822B19A0 and 0x822B1A40 hand
+/// 0x822B1900 0.4 and 1.0; the flee task hands 0x822B3798 1.0.
+const HUMAN_WALK: f32 = 0.4;
+const HUMAN_RUN: f32 = 1.0;
 const FLEE: f32 = 5.0;
 const FLEE_TIME: f32 = 6.0;
 /// How far a runner who meets a wall looks along it each way, metres.
@@ -86,9 +92,6 @@ const AIM_ARC: f32 = 1.05;
 const SIGHT: f32 = FIGHT_RANGE;
 const EYE: f32 = 1.6;
 const LOOK_EVERY: f32 = 0.2;
-/// A soldier's full sprint, m/s, that `PursueSpeed` and `CombatSpeed`
-/// are fractions of (inferred: the player's sprint).
-const SPRINT: f32 = 7.2;
 /// Seconds a soldier hunts without sight of her before calming down, and
 /// how close to where he last saw her he goes (inferred).
 const GIVE_UP: f32 = 20.0;
@@ -193,8 +196,10 @@ pub const RUN_OVER: f32 = 2.5;
 pub const RAM_GAP: f32 = 1.0;
 const SHOVE: f32 = 4.0;
 /// Steps in a row stalled before people count it as walking into
-/// something (invented).
-const STALLED: u8 = 3;
+/// something (invented: a sixth of a second, long enough for the
+/// collision mesh catching them at an inner edge as their speed builds,
+/// and for their way to swing round a little after a turn).
+const STALLED: u8 = 10;
 /// How far ahead (seconds) people see a vehicle coming at them.
 const DODGE_TIME: f32 = 2.0;
 
@@ -1402,6 +1407,15 @@ impl Npc {
         }
     }
 
+    /// The speed (m/s) a push of `stick` (a share of their full speed,
+    /// as the 360's AI tasks push it, 0x822D19C8) asks of them, before
+    /// their paces pick from it ([`Npc::move_dry`]). The `Ai` record's
+    /// `PursueSpeed`, `CombatSpeed` and `SprintSpeed` are such shares (the
+    /// AI object's +0x9a4/+0x9a8/+0x9ac, default 0.7, 0x822BDAD0).
+    fn push(&self, stick: f32) -> f32 {
+        stick * self.motion.full_speed()
+    }
+
     /// Chest height, where shots aim.
     pub fn chest(&self) -> Vec3 {
         self.character.position + Vec3::Y * 1.3
@@ -1509,10 +1523,11 @@ impl Npc {
                 .map(|spot| (spot, smart.cover_time));
         }
         let mut hiding = false;
+        let sprint = self.push(self.ai.sprint_speed);
         if let Some((spot, left)) = &mut self.cover {
             let flat = (*spot - at).with_y(0.0);
             if flat.length() > 0.6 {
-                wanted = flat.normalize() * SPRINT * self.ai.sprint_speed;
+                wanted = flat.normalize() * sprint;
             } else {
                 *left -= dt;
             }
@@ -1544,11 +1559,11 @@ impl Npc {
                 if *left <= 0.0 || (open && *left < DETOUR_TIME - DETOUR_MIN) {
                     self.detour = None;
                 } else {
-                    wanted = *way * SPRINT * self.ai.pursue_speed;
+                    wanted = *way * self.push(self.ai.pursue_speed);
                 }
             }
             if self.detour.is_none() && toward.length() > CLOSE_ENOUGH {
-                wanted = toward.normalize() * SPRINT * self.ai.pursue_speed;
+                wanted = toward.normalize() * self.push(self.ai.pursue_speed);
             }
         } else {
             self.detour = None;
@@ -1574,7 +1589,7 @@ impl Npc {
                         target = at + flat.normalize() * length;
                     }
                 }
-                self.step = Some((target, length / (SPRINT * self.ai.combat_speed)));
+                self.step = Some((target, length / (self.push(self.ai.combat_speed))));
             }
             if let Some((target, left)) = &mut self.step {
                 *left -= dt;
@@ -1582,7 +1597,7 @@ impl Npc {
                 if *left <= 0.0 || flat.length() < 0.5 {
                     self.step = None;
                 } else {
-                    wanted = flat.normalize() * SPRINT * self.ai.combat_speed;
+                    wanted = flat.normalize() * self.push(self.ai.combat_speed);
                 }
             }
         }
@@ -1621,6 +1636,9 @@ impl Npc {
                     }
                 };
                 self.detour = Some((way, DETOUR_TIME));
+                // Turning to the way round takes them a moment
+                // ([`m2_engine::on_foot::steer`]): stalls count afresh.
+                self.stalled = 0;
             }
         }
         let seen = seen && !hiding;
@@ -1928,7 +1946,8 @@ impl Npc {
         let at = self.character.position;
         let mut wanted = Vec3::ZERO;
         let mut face = None;
-        let mut speed = WALK;
+        let mut speed = self.push(HUMAN_WALK);
+        let run = self.push(HUMAN_RUN);
         if let Some((target, left)) = &mut self.flee {
             *left -= dt;
             let to = (*target - at).with_y(0.0);
@@ -1941,8 +1960,8 @@ impl Npc {
                 };
                 self.flee = None;
             } else {
-                wanted = to.normalize() * FLEE;
-                speed = FLEE;
+                speed = self.push(HUMAN_RUN);
+                wanted = to.normalize() * speed;
             }
         }
         let mut arrived = false;
@@ -2003,7 +2022,7 @@ impl Npc {
                 let ahead = at + flat.normalize_or_zero() * 1.0 + Vec3::Y;
                 let drop = physics.cast_ray(ahead, -Vec3::Y, LEDGE + 1.0).is_none();
                 if flat.length() > *near && !drop {
-                    wanted = flat.normalize() * FLEE;
+                    wanted = flat.normalize() * run;
                 }
             }
             Brain::Route { route, next } => {
@@ -2041,8 +2060,9 @@ impl Npc {
                         glide = Some(point);
                         face = Some(flat.x.atan2(flat.z));
                     } else {
-                        // At a run, as the scripts' `Haste` 1 asks.
-                        wanted = flat.normalize() * FLEE;
+                        // At a run, as the scripts' `Haste` 1 asks
+                        // (the `HumanRun` push).
+                        wanted = flat.normalize() * run;
                     }
                 }
             }
@@ -4727,7 +4747,7 @@ pub(crate) mod tests {
         // program's default run, 5 m/s), built up at 7.5 m/s²: 3.3 m in
         // the second.
         let m = soldier.motion;
-        let ask = SPRINT * soldier.ai.pursue_speed / m.full_speed();
+        let ask = soldier.ai.pursue_speed;
         let (_, pace) = m2_engine::on_foot::pace(&m, ask, false, 1.0, false);
         let ramp = pace / m2_engine::on_foot::MOVE_ACCEL;
         let expect = pace * ramp * 0.5 + pace * (1.0 - ramp).max(0.0);
@@ -4949,8 +4969,10 @@ pub(crate) mod tests {
             n.panic(danger);
             n.update(&physics, &mut rng, None, dt);
         }
+        // Along it, at their run (5 m/s by default), less the moment their
+        // speed takes to build and their way to swing round.
         let p = n.character.position;
-        assert!(p.x < 1.0 && p.z.abs() > 6.0, "{p}");
+        assert!(p.x < 1.0 && p.z.abs() > 4.5, "{p}");
     }
 
     // Hit by her from behind a wall, a soldier chasing her goes round it
