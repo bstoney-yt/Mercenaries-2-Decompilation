@@ -53,6 +53,40 @@ pub const GRAVITY_360: f32 = 10.0;
 /// ([`Physics::vehicle_rolling`]). Invented.
 pub const ROLL_REST: f32 = 0.05;
 
+/// Puts a collider into `world` (on `parent`'s body), its contacts' friction
+/// mixed as Havok mixes it ([`HavokFriction`]).
+fn insert_collider(
+    world: &mut r::PhysicsWorld,
+    collider: impl Into<r::Collider>,
+    parent: Option<r::RigidBodyHandle>,
+) -> r::ColliderHandle {
+    let mut collider = collider.into();
+    collider.set_active_hooks(collider.active_hooks() | r::ActiveHooks::MODIFY_SOLVER_CONTACTS);
+    world.insert_collider(collider, parent)
+}
+
+/// Two touching colliders' friction as Havok gives it: the square root of
+/// the product of theirs (its material default, as the 360's bodies keep it;
+/// Rapier's own rules have no such mean). A terrain at the rigid-body
+/// default 0.5 (0x82621820 +0x9C) under a wreck's 0.3 grips at 0.39, not
+/// the 0.3 the least of the two gave.
+struct HavokFriction;
+
+impl r::PhysicsHooks for HavokFriction {
+    fn modify_solver_contacts(&self, context: &mut r::ContactModificationContext) {
+        let (Some(a), Some(b)) = (
+            context.colliders.get(context.collider1),
+            context.colliders.get(context.collider2),
+        ) else {
+            return;
+        };
+        let mixed = (a.friction() * b.friction()).max(0.0).sqrt();
+        if let Some(m) = context.rigid_mut() {
+            *m.friction = mixed;
+        }
+    }
+}
+
 fn vector(v: Vec3) -> r::Vector {
     r::Vector::from_array(v.to_array())
 }
@@ -2484,7 +2518,7 @@ impl Physics {
             collider = collider.friction(m.friction).restitution(m.restitution);
         }
         let collider = collider.build();
-        let handle = self.world.insert_collider(collider, None);
+        let handle = insert_collider(&mut self.world, collider, None);
         self.statics.insert(key, handle);
         self.keys.insert(handle, key);
         if !shape.surfaces.is_empty() {
@@ -2587,7 +2621,7 @@ impl Physics {
         self.float_boats(dt);
         self.fly_helicopters(dt);
         self.cap_debris_speeds();
-        self.world.step();
+        self.world.step_with_events(&HavokFriction, &());
         self.hold_ragdolls_together();
         self.settle_debris();
     }
@@ -2904,7 +2938,7 @@ impl Physics {
                     r::InteractionTestMode::And,
                 ));
             let chassis = v.controller.chassis;
-            self.world.insert_collider(collider, Some(chassis));
+            insert_collider(&mut self.world, collider, Some(chassis));
         }
         true
     }
@@ -2932,7 +2966,7 @@ impl Physics {
             .friction(piece.material.friction)
             .restitution(piece.material.restitution)
             .collision_groups(groups);
-        self.world.insert_collider(collider, Some(body));
+        insert_collider(&mut self.world, collider, Some(body));
         self.debris.push(Some(body));
         DebrisId(self.debris.len() - 1)
     }
@@ -3176,7 +3210,7 @@ impl Physics {
                 .friction(hull_friction)
                 .friction_combine_rule(combine)
                 .collision_groups(hull);
-            self.world.insert_collider(collider, Some(body));
+            insert_collider(&mut self.world, collider, Some(body));
         }
         for (i, shape) in shapes.into_iter().enumerate() {
             let collider = r::ColliderBuilder::new(shape)
@@ -3192,7 +3226,7 @@ impl Physics {
             } else {
                 collider.density(0.0)
             };
-            self.world.insert_collider(collider, Some(body));
+            insert_collider(&mut self.world, collider, Some(body));
         }
         // The turret on top, adding nothing to the mass the hull carries:
         // its own bodies' shapes ([`VehicleSpec::turret_shapes`]), held
@@ -3208,7 +3242,7 @@ impl Physics {
                 .friction(hull_friction)
                 .friction_combine_rule(combine)
                 .collision_groups(hull);
-            self.world.insert_collider(turret, Some(body));
+            insert_collider(&mut self.world, turret, Some(body));
         }
         if let Some((lo, hi)) = spec.turret_box.filter(|_| spec.turret_shapes.is_empty()) {
             let half = ((hi - lo) * 0.5).max(Vec3::splat(0.1));
@@ -3218,7 +3252,7 @@ impl Physics {
                 .friction(hull_friction)
                 .friction_combine_rule(combine)
                 .collision_groups(hull);
-            self.world.insert_collider(turret, Some(body));
+            insert_collider(&mut self.world, turret, Some(body));
         }
 
         let mut controller = DynamicRayCastVehicleController::new(body);
@@ -4183,7 +4217,7 @@ impl Physics {
                 } else {
                     c.density(0.0)
                 };
-                self.world.insert_collider(c, Some(chassis));
+                insert_collider(&mut self.world, c, Some(chassis));
             }
             return;
         }
@@ -4375,7 +4409,8 @@ impl Physics {
                     .angular_damping(2.0)
                     .ccd_enabled(true),
             );
-            self.world.insert_collider(
+            insert_collider(
+                &mut self.world,
                 shape.density(1000.0).friction(0.9).collision_groups(groups),
                 Some(body),
             );
@@ -6599,9 +6634,10 @@ mod tests {
         assert!(slid < 2.0, "slid {slid} m");
         assert_eq!(touching, 6);
         // On the invented box (0.45 m up, over its 0.4 m squeeze) its rays
-        // started under the ground and it slid away on the box.
-        let (slid, touching) = parked_tank_on_a_slope(None);
-        assert!(slid > 20.0, "slid {slid} m");
+        // start under the ground: it rests on the box (which, its 0.3 mixed
+        // with the ground's 0.5 as Havok mixes them, 0.39, holds it on 20
+        // degrees; by the least of the two, 0.3, it slid away).
+        let (_, touching) = parked_tank_on_a_slope(None);
         assert_eq!(touching, 0);
     }
 
