@@ -6288,6 +6288,7 @@ mod tests {
             chassis: None,
             shapes: Default::default(),
             material: None,
+            turret_shapes: Default::default(),
             tuning: VehicleTuning {
                 gun: Some(gun),
                 ..VehicleTuning::default()

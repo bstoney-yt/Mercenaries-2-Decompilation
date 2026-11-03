@@ -3177,8 +3177,23 @@ impl Physics {
             };
             self.world.insert_collider(collider, Some(body));
         }
-        // The turret on top, adding nothing to the mass the hull carries.
-        if let Some((lo, hi)) = spec.turret_box {
+        // The turret on top, adding nothing to the mass the hull carries:
+        // its own bodies' shapes ([`VehicleSpec::turret_shapes`]), held
+        // straight ahead, else an invented box. Flagged: the 360 builds
+        // them as bodies of their own, joined to the hull (0x8216B818),
+        // with their own mass; here they ride the hull as it stands.
+        for shape in spec.turret_shapes.iter().filter_map(|v| {
+            let points: Vec<_> = v.iter().map(|&p| vector(p)).collect();
+            r::SharedShape::convex_hull(&points)
+        }) {
+            let turret = r::ColliderBuilder::new(shape)
+                .density(0.0)
+                .friction(hull_friction)
+                .friction_combine_rule(combine)
+                .collision_groups(hull);
+            self.world.insert_collider(turret, Some(body));
+        }
+        if let Some((lo, hi)) = spec.turret_box.filter(|_| spec.turret_shapes.is_empty()) {
             let half = ((hi - lo) * 0.5).max(Vec3::splat(0.1));
             let turret = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
                 .translation(vector((lo + hi) * 0.5))
@@ -5034,6 +5049,7 @@ mod tests {
             chassis: None,
             shapes: Default::default(),
             material: None,
+            turret_shapes: Default::default(),
             tuning: crate::VehicleTuning::default(),
         }
     }

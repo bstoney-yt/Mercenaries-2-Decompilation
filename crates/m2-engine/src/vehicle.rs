@@ -362,6 +362,11 @@ pub struct VehicleSpec {
     /// body builder's, [`crate::physics::BodyMaterial::of`]). `None`
     /// without one.
     pub material: Option<crate::physics::BodyMaterial>,
+    /// The shapes its turret's own bodies collide with (the `PHY2` bodies
+    /// on its [`turret`](Self::turret) nodes: the 360 builds them as bodies
+    /// of their own, 0x8216B910), their vehicle hull sets, model space
+    /// with the turret straight ahead. Empty without them.
+    pub turret_shapes: std::sync::Arc<[Vec<Vec3>]>,
 }
 
 /// How a vehicle sits on uneven ground ([`VehicleSpec::rest_on`]).
@@ -426,6 +431,24 @@ fn chassis_shapes(
                 (shapes, hull, material)
             },
         )
+}
+
+/// The shapes of `model`'s bodies on its turret's nodes (`turret`, by
+/// node), as [`chassis_shapes`] takes a body's.
+fn turret_shapes(model: &Model<'_>, base: &[u8], turret: &[bool]) -> Vec<Vec<Vec3>> {
+    let Some(p) = Ucfx::parse(base)
+        .ok()
+        .and_then(|u| u.top_level(*b"PHY2").map(<[u8]>::to_vec))
+        .and_then(|d| m2_assets::physics::Physics::parse(&d).ok())
+    else {
+        return Vec::new();
+    };
+    p.parts
+        .iter()
+        .filter(|q| turret.get(q.node as usize).copied().unwrap_or(false))
+        .filter_map(|q| q.body)
+        .flat_map(|body| crate::physics::body_shapes(model, &p, body).0)
+        .collect()
 }
 
 impl Chassis {
@@ -859,6 +882,7 @@ impl VehicleSpec {
             chassis: None,
             shapes: Default::default(),
             material: None,
+            turret_shapes: Default::default(),
             rotors: if flies {
                 vehicle::rotors(model)
                     .into_iter()
@@ -1126,6 +1150,7 @@ impl VehicleSpec {
         self.chassis = Chassis::of(base);
         let (shapes, hull, material) = chassis_shapes(model, base);
         self.material = material;
+        self.turret_shapes = turret_shapes(model, base, &self.turret).into();
         // Flagged, not traced: a wheeled vehicle without a hull set (the
         // trailers) would drag on its wheels' own shapes, and a
         // motorbike's balance was tuned against the box hull (26 of 33
@@ -1620,6 +1645,7 @@ mod tests {
             chassis: None,
             shapes: Default::default(),
             material: None,
+            turret_shapes: Default::default(),
             tuning: VehicleTuning::default(),
         }
     }

@@ -109,8 +109,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|p| p.y)
                 .fold(f32::MAX, f32::min);
             eprintln!(
-                "{name}: {} chassis shapes, lowest {floor:.2}",
-                spec.shapes.len()
+                "{name}: {} chassis shapes, lowest {floor:.2}; {} turret shapes",
+                spec.shapes.len(),
+                spec.turret_shapes.len()
             );
             Some((spec, found))
         }) else {
