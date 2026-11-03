@@ -1248,7 +1248,7 @@ impl Game {
                                 m2_engine::seats::dives(
                                     &p,
                                     player.swimming(),
-                                    v.spec.is_boat(),
+                                    afloat(physics, v, at),
                                     flat,
                                 )
                                 .then(|| {
@@ -4250,9 +4250,8 @@ fn entrance_pick(
         for &(e, local) in &v.spec.entrances {
             let place = at.transform_point3(local);
             let p = e.params;
-            // Swimming, a boat's long-search entrances from afar (a boat is
-            // taken to be afloat: inferred).
-            let pad = seats::search_pad(&p, player.swimming(), v.spec.is_boat());
+            // Swimming, a boat's long-search entrances from afar.
+            let pad = seats::search_pad(&p, player.swimming(), afloat(physics, v, at));
             if seats::in_search(her, eye, aim, place, p.use_distance, pad) {
                 let c = Candidate {
                     vehicle: i,
@@ -4527,6 +4526,17 @@ fn exit_plan(
         (_, Some(p)) => p,
     };
     (kind, place)
+}
+
+/// Whether `v`, standing at `at`, is a boat afloat: its origin (its
+/// waterline, [`m2_engine::Physics`]'s boats float on it) under the water
+/// there. The 360 asks more of it (a value of the boat's body over 0.01 to
+/// dive for it, over 0.9 to be offered it from afar, 0x8229F890 and
+/// 0x82440F30, read off its first float point's record +0x50); that this
+/// is how far it sits in the water is inferred.
+fn afloat(physics: &Physics, v: &ParkedVehicle, at: Mat4) -> bool {
+    let o = at.transform_point3(Vec3::ZERO);
+    v.spec.is_boat() && physics.water_at(o.x, o.z).is_some_and(|w| o.y < w)
 }
 
 /// Whether she gets out of `v` from seat `seat` (`None`, the driver's) by

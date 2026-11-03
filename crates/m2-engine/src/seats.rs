@@ -198,10 +198,11 @@ pub const DIVE_TIME: f32 = 1.2;
 /// The pad past an entrance's `UseDistance` she is offered it within
 /// (0x82440F30): [`LONG_SEARCH_PAD`] for a `bLongSearchDistance` entrance
 /// of a boat (vehicle type 10) afloat while she `swims` (her character
-/// state 4 or 5), else [`SEARCH_PAD`]. That states 4 and 5 are swimming
-/// is inferred (the state table's `Dive` leads to `SwimToEnterBoat`, and
-/// the 360's `InVehicle` `Dive` is reached from `Swim`); a ladder's long
-/// search (the other case) is not used.
+/// state 4 or 5), else [`SEARCH_PAD`]. States 4 and 5 are swimming: in
+/// them the character's speed limits are its second set of four (0x82179350
+/// reads +0x270 and +0x290 for them, +0x260 and +0x280 otherwise), the
+/// `_HumanPhysics` `Swim` speeds that follow the `Upright` ones
+/// (0x823EAE98). A ladder's long search (the other case) is not used.
 pub fn search_pad(p: &EntranceParams, swims: bool, boat_afloat: bool) -> f32 {
     if p.long_search && swims && boat_afloat {
         LONG_SEARCH_PAD

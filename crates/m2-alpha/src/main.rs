@@ -6488,11 +6488,11 @@ fn board_stand(
     let (door, centre) = (at.transform_point3(local), at.transform_point3(Vec3::ZERO));
     let off = options.board_off.unwrap_or(0.6);
     let mut stand = door + (door - centre).with_y(0.0).normalize_or_zero() * off;
-    // Off a boat, out where the water is deepest (to swim there).
-    if game.scene.vehicles[i].spec.is_boat()
-        && off > 1.5
-        && let Some(world) = game.scene.world.as_ref()
-    {
+    // Off a boat, out where the water is deepest (to swim there); she is
+    // let swim before the use key (pressed as she lands, before her swim
+    // has begun, it found her standing: the check run's first press).
+    let swim = game.scene.vehicles[i].spec.is_boat() && off > 1.5;
+    if swim && let Some(world) = game.scene.world.as_ref() {
         let physics = &world.physics;
         let depth = |p: Vec3| {
             let water = physics.water_at(p.x, p.z)?;
@@ -6527,7 +6527,12 @@ fn board_stand(
         p.facing = p.yaw;
     }
     for _ in 0..600 {
-        if game.scene.player.as_ref().is_some_and(|p| p.landed) {
+        if game
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.landed && (!swim || p.swimming()))
+        {
             break;
         }
         game.step(Intent::default(), tick);
