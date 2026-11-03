@@ -81,6 +81,9 @@ pub struct Held {
     /// gait's clip, walking forwards (false) or backwards (true), from
     /// the on-foot table's `Crouch_Aim_*` handles ([`CROUCH_HANDLES`]).
     pub crouch: Vec<(Gait, bool, usize)>,
+    /// Crouched and aiming, standing: the shuffles round to the left and
+    /// to the right (`Crouch_Aim_Shuffle_Left90`, `..._Right90`).
+    pub shuffle: [Option<usize>; 2],
 }
 
 /// The on-foot table's handles for the crouched, aiming gaits, by name
@@ -286,8 +289,13 @@ pub fn resolve(
                 Some((g, back, index(p.clip)?))
             })
             .collect();
+        let shuffle = ["Crouch_Aim_Shuffle_Left90", "Crouch_Aim_Shuffle_Right90"].map(|name| {
+            let p = table::handle_clip(t, m2_assets::name_hash(name), who, class, fits)?;
+            index(p.clip)
+        });
         held.push(Held {
             crouch,
+            shuffle,
             class,
             clips,
             gaits,

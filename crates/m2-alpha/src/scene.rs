@@ -470,7 +470,12 @@ fn hero_moves(
                 format!("{}{way} {}", format!("{g:?}").to_lowercase(), h(Some(*i)))
             })
             .collect();
-        eprintln!("hero moves: {hero}: crouched {}", crouch.join(", "));
+        eprintln!(
+            "hero moves: {hero}: crouched {}; shuffle left {}, right {}",
+            crouch.join(", "),
+            h(r.shuffle[0]),
+            h(r.shuffle[1])
+        );
     }
     moves
 }
