@@ -397,21 +397,22 @@ pub struct Chassis {
 /// The shapes the intact chassis body of `model` (whose resident asset is
 /// `base`) collides with, model space: each standing one's points, its
 /// convex radius included. Empty without a `PHY2` chassis body.
-fn chassis_shapes(model: &Model<'_>, base: &[u8]) -> Vec<Vec<Vec3>> {
+fn chassis_shapes(model: &Model<'_>, base: &[u8]) -> (Vec<Vec<Vec3>>, bool) {
     let Some(p) = Ucfx::parse(base)
         .ok()
         .and_then(|u| u.top_level(*b"PHY2").map(<[u8]>::to_vec))
         .and_then(|d| m2_assets::physics::Physics::parse(&d).ok())
     else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     p.parts
         .iter()
         .find(|q| q.node_hash == CHASSIS && q.body.is_some())
         .and_then(|q| q.body)
-        .map_or_else(Vec::new, |body| {
-            crate::physics::body_shapes(model, &p, body)
-        })
+        .map_or_else(
+            || (Vec::new(), false),
+            |body| crate::physics::body_shapes(model, &p, body),
+        )
 }
 
 impl Chassis {
@@ -1109,7 +1110,17 @@ impl VehicleSpec {
     /// asset `base`) and that body's shapes (`model`'s).
     pub fn with_chassis(mut self, model: &Model<'_>, base: &[u8]) -> Self {
         self.chassis = Chassis::of(base);
-        self.shapes = chassis_shapes(model, base).into();
+        let (shapes, hull) = chassis_shapes(model, base);
+        // Flagged, not traced: a wheeled vehicle without a hull set (the
+        // trailers) would drag on its wheels' own shapes, and a
+        // motorbike's balance was tuned against the box hull (26 of 33
+        // fell over on their shapes), so both keep the box for now.
+        let wheeled = !self.tracked && !self.wheels.is_empty();
+        self.shapes = if wheeled && (!hull || self.is_bike()) {
+            Default::default()
+        } else {
+            shapes.into()
+        };
         self
     }
 

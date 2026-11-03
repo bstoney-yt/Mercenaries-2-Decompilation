@@ -36,7 +36,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let names = db.names();
     let models = db.hashes("ModelName");
     let tuning = m2_engine::tuning::read(&db, None);
-    for comp in ["_TankPhysics", "_BoatPhysics", "_HelicopterPhysics"] {
+    for comp in [
+        "_TankPhysics",
+        "_BoatPhysics",
+        "_HelicopterPhysics",
+        "_CarPhysicsV2",
+    ] {
         let Some(c) = db.component(comp) else {
             continue;
         };
@@ -118,6 +123,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect();
             println!("  parts {}", tree.join(" "));
+            if std::env::var("SHAPES").is_ok() {
+                for (si, s) in p.shapes.iter().enumerate() {
+                    let (v, _) = s.geometry.triangles(s.radius);
+                    let lo = v.iter().map(|x| x[1]).fold(f32::MAX, f32::min);
+                    println!(
+                        "  shape {si} part {} body {:?} node {:?} class {} rec {:08x?} floor {lo:.2}",
+                        s.part,
+                        p.body_of(si),
+                        p.shape_node(si),
+                        s.class(),
+                        &s.record[..8]
+                    );
+                }
+            }
             for (bi, b) in p.bodies.iter().enumerate() {
                 let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
                 for (si, s) in p.shapes.iter().enumerate() {

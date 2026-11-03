@@ -653,17 +653,25 @@ fn standing(p: &Phy2, k: usize, hidden: &[bool]) -> bool {
     !s.is_foliage() && !hidden.get(node).copied().unwrap_or(false)
 }
 
-/// The shapes body `body` of `PHY2` `p` collides with, model space: each
-/// standing one's points (its convex radius included), as
-/// [`CollisionShape::shape_meshes`] places them.
-pub(crate) fn body_shapes(model: &Model<'_>, p: &Phy2, body: usize) -> Vec<Vec<Vec3>> {
+/// The shapes body `body` of `PHY2` `p` collides with as a vehicle's
+/// body, model space: each standing one's points (its convex radius
+/// included), as [`CollisionShape::shape_meshes`] places them. Those of
+/// its vehicle hull set if it has any, else the others
+/// ([`m2_assets::physics::Shape::is_vehicle_hull`], 0x8216BC08), and
+/// whether they are its hull set.
+pub(crate) fn body_shapes(model: &Model<'_>, p: &Phy2, body: usize) -> (Vec<Vec<Vec3>>, bool) {
     let hidden = model
         .states
         .as_ref()
         .map(|s| s.hidden(&model.nodes, false))
         .unwrap_or_default();
-    (0..p.shapes.len())
+    let mine: Vec<usize> = (0..p.shapes.len())
         .filter(|&k| p.body_of(k) == Some(body) && standing(p, k, &hidden))
+        .collect();
+    let hull = mine.iter().any(|&k| p.shapes[k].is_vehicle_hull());
+    let shapes = mine
+        .into_iter()
+        .filter(|&k| p.shapes[k].is_vehicle_hull() == hull)
         .map(|k| {
             let s = &p.shapes[k];
             let to_model = p
@@ -678,7 +686,8 @@ pub(crate) fn body_shapes(model: &Model<'_>, p: &Phy2, body: usize) -> Vec<Vec<V
                 .collect()
         })
         .filter(|v: &Vec<Vec3>| v.len() >= 4)
-        .collect()
+        .collect();
+    (shapes, hull)
 }
 
 /// A box round `PHY2` shape `k` (its convex radius included, as its
@@ -3127,22 +3136,19 @@ impl Physics {
             r::CoefficientCombineRule::Min
         };
         // It collides by its chassis body's own `PHY2` shapes, as the 360
-        // code builds its body from them (0x8216A290). A tank's sit low
-        // enough under its hull that, springs bottomed out, its track rays
-        // still start above the ground: our box stood 0.45 m up (the
-        // wheels' middle), over a squeeze of 0.36 to 0.4 m on five tanks,
-        // whose rays then started under the ground and missed, leaving
-        // them sliding on the box. Each shape is its points' convex hull
-        // (Havok's are convex but for a mesh one, whose hull covers a
-        // little more). A model without them keeps the invented box, and
-        // so do cars and motorbikes for now: their chassis bodies carry a
-        // shape on each wheel down to the ground (the M151's, the Transport
-        // Truck's), which would carry them on rigid wheels; how the 360
-        // keeps those off the ground under its ray wheels isn't traced.
+        // code builds its body from them (0x8216A290): its vehicle hull
+        // set ([`VehicleSpec::shapes`]). A tank's sit low enough under its
+        // hull that, springs bottomed out, its track rays still start
+        // above the ground: our box stood 0.45 m up (the wheels' middle),
+        // over a squeeze of 0.36 to 0.4 m on five tanks, whose rays then
+        // started under the ground and missed, leaving them sliding on the
+        // box. A car's leaves out the shape on each wheel. Each shape is
+        // its points' convex hull (Havok's are convex but for a mesh one,
+        // whose hull covers a little more). A model without them keeps the
+        // invented box.
         let shapes: Vec<r::SharedShape> = spec
             .shapes
             .iter()
-            .filter(|_| spec.tracked || spec.wheels.is_empty())
             .filter_map(|v| {
                 let points: Vec<_> = v.iter().map(|&p| vector(p)).collect();
                 r::SharedShape::convex_hull(&points)
