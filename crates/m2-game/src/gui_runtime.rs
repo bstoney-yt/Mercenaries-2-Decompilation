@@ -29,9 +29,10 @@
 //! - `CorrectWidgetForResolution` fixes a top-level widget's anchor point
 //!   for the screen's shape; see [`crate::gui::Correction`].
 //! - A widget goes on the screen's drawing list, at its end, the first
-//!   time it is activated (`ActivateWidget(id, true)`), and stays there
-//!   when deactivated; so the drawing order is the order of first
-//!   activation, not of creation. `MrxGuiBase.AddWidgetWithChildren`
+//!   time it is activated (`ActivateWidget(id, true)`), and comes off it
+//!   at the next tick once deactivated (so activated again after that, it
+//!   goes at the end); so the drawing order is the order of activation,
+//!   not of creation. Flash movies draw after all the other widgets. `MrxGuiBase.AddWidgetWithChildren`
 //!   activates a parent, then each child's subtree in child order, so a
 //!   dialog box's frame (made last but added as its first children) draws
 //!   under its text. `PushWidgetToFront` moves each active, listed widget
@@ -62,9 +63,11 @@
 //! `AddWidgetChild` (0x8231E000) appends the child to its parent's
 //! children; `PushWidgetToFront` (0x82380580) and `PushWidgetToBack`
 //! (0x82380700) move a widget to the list's tail or head and recurse into
-//! its children in order, skipping deactivated and unlisted widgets. Not
-//! established: the second list the natives keep for widgets of a kind
-//! that answers true to a virtual (+0x54); none is told apart here.
+//! its children in order, skipping deactivated and unlisted widgets. The
+//! manager's update (0x82380868) moves newly activated widgets onto the
+//! drawn list in that order and takes deactivated ones off it; its draw
+//! (0x82380E50) draws the list in order but holds the Flash widgets (type
+//! 6) back until the rest are drawn.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -638,6 +641,13 @@ impl Screen {
     /// (completed animations, then the update callbacks with `dt`).
     fn advance(&mut self, dt: f32) -> Vec<(u32, Vec<f64>)> {
         let mut due = std::mem::take(&mut self.due);
+        // The 360's manager update (0x82380868) takes deactivated widgets
+        // off its drawing list each frame: activated again later, they go
+        // at its end (taken off and put back within a frame, they keep
+        // their place).
+        let widgets = &self.widgets;
+        self.order
+            .retain(|id| widgets.get(id).is_some_and(|w| !w.inactive));
         for w in self.widgets.values_mut() {
             if let Some(run) = &mut w.sprite_run {
                 run.elapsed += dt;
@@ -1008,7 +1018,16 @@ impl Screen {
                 }),
             }
         }
-        out
+        // The Flash movies draw after every other widget, in their own
+        // order: the 360's draw pass (0x82380E50) holds back widgets of the
+        // Flash type (6) and draws them once the rest are drawn. So the
+        // fanfare's movie shows over its full-screen fade, though the fade
+        // is added after it.
+        let (mut first, flash): (Vec<_>, Vec<_>) = out
+            .into_iter()
+            .partition(|i| !matches!(i, DrawItem::Flash { .. }));
+        first.extend(flash);
+        first
     }
 
     fn log_unknown(&mut self, name: &str) {
@@ -2644,6 +2663,43 @@ mod tests {
         let id = |name: &str| host.lua().globals().get::<u32>(name).unwrap();
         assert_eq!(s.rect(id("bar")), [180.0, 150.0, 458.0, 170.0]);
         assert_eq!(s.rect(id("moved")), [100.0, 50.0, 120.0, 60.0]);
+    }
+
+    /// The contract's fanfare: its movie, then the full-screen fade added
+    /// after it; the movie still draws over the fade. A widget taken off
+    /// for a tick and put back goes to the end of the list.
+    #[test]
+    fn flash_movies_draw_last_and_a_widget_put_back_later_goes_last() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            fan = G.CreateFlashWidget()
+            G.ActivateWidget(fan, true)
+            fade = G.CreateImageWidget()
+            G.ActivateWidget(fade, true)
+            label = G.CreateTextWidget()
+            G.SetTextText(label, "x")
+            G.ActivateWidget(label, true)
+            "#,
+        );
+        let kinds = |s: &Screen| {
+            s.draw_list(640.0, 480.0)
+                .into_iter()
+                .map(|i| match i {
+                    DrawItem::Flash { .. } => "flash",
+                    DrawItem::Fill { .. } => "fill",
+                    DrawItem::Text { .. } => "text",
+                    _ => "other",
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(&screen.borrow()), ["fill", "text", "flash"]);
+        run(&host, "_GuiInternal.ActivateWidget(fade, false)");
+        tick(host.lua(), 0.1);
+        run(&host, "_GuiInternal.ActivateWidget(fade, true)");
+        assert_eq!(kinds(&screen.borrow()), ["text", "fill", "flash"]);
     }
 
     /// `MrxGuiDialogBox._BuildDialogBox` as it orders its widgets: the
