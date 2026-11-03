@@ -101,10 +101,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     h.map(|p| (p.z * 100.0).round() / 100.0)
                 );
             }
-            Some((
-                VehicleSpec::from_model(&entry, &m)?.with_chassis(&d.base),
-                found,
-            ))
+            let spec = VehicleSpec::from_model(&entry, &m)?.with_chassis(&m, &d.base);
+            if let Some(c) = &spec.chassis {
+                let floor = c
+                    .shapes
+                    .iter()
+                    .flatten()
+                    .map(|p| p.y)
+                    .fold(f32::MAX, f32::min);
+                eprintln!(
+                    "{name}: {} chassis shapes, lowest {floor:.2}",
+                    c.shapes.len()
+                );
+            }
+            Some((spec, found))
         }) else {
             continue;
         };
@@ -114,9 +124,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(t) = spec.tuning.tank {
             eprintln!(
-                "{name}: FwdFriction {} SideFriction {} Brake {}",
-                t.friction.0, t.friction.1, t.brake
+                "{name}: FwdFriction {} SideFriction {} Brake {} springs {:?}",
+                t.friction.0, t.friction.1, t.brake, t.springs
             );
+        }
+        if std::env::var("TANK_INFO").is_ok() {
+            continue;
         }
         let top = spec.tuning.max_speed.unwrap_or(f32::NAN) * 3.6;
         let (fastest, to20) = ahead(&spec);
@@ -124,7 +137,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (turn_speed, turn) = corner(&spec);
         let stop = stop(&spec);
         let rest = rest(&spec) * 100.0;
-        let (slide20, slide30) = (slide(&spec, 20.0), slide(&spec, 30.0));
+        let trace = std::env::var("TANK_TRACE").is_ok_and(|t| t == name);
+        let (slide20, slide30) = (slide(&spec, 20.0, trace), slide(&spec, 30.0, false));
         println!(
             "{name}\t{}\t{top:.0}\t{:.1}\t{to20:.2}\t{spin:.1}\t{:.1}\t{turn:.1}\t{stop:.1}\t{rest:.0}\t{slide20:.2}\t{slide30:.2}\t{hardpoints}",
             ids.len(),
@@ -272,8 +286,37 @@ fn rest(spec: &VehicleSpec) -> f32 {
 
 /// Parked 10 s facing up a plane tilted `degrees`: how far it slides,
 /// metres.
-fn slide(spec: &VehicleSpec, degrees: f32) -> f32 {
+fn slide(spec: &VehicleSpec, degrees: f32, trace: bool) -> f32 {
     let mut p = Physics::new();
+    let up = Quat::from_rotation_x(-degrees.to_radians()) * Vec3::Y;
+    let mut n = 0usize;
+    let mut show = |p: &Physics, id: VehicleId| {
+        n += 1;
+        if !trace || n % 6 != 1 {
+            return;
+        }
+        let m = p.vehicle_transform(id).unwrap_or_default();
+        let touch: Vec<String> = p
+            .vehicle_touching(id)
+            .iter()
+            .map(|(_, at, _)| {
+                let l = m.inverse().transform_point3(*at);
+                format!("({:.2},{:.2},{:.2})", l.x, l.y, l.z)
+            })
+            .collect();
+        eprintln!(
+            "t {:.2} h {:.3} pitch {:.1} v {:.2} wheels {:?} susp {:?} touch {touch:?}",
+            n as f32 * DT,
+            m.w_axis.truncate().dot(up),
+            m.z_axis.truncate().dot(up).asin().to_degrees(),
+            p.vehicle_speed(id),
+            p.vehicle_contacts(id),
+            p.vehicle_suspension(id)
+                .iter()
+                .map(|x| (x * 100.0).round() / 100.0)
+                .collect::<Vec<_>>(),
+        );
+    };
     let half = 200.0;
     let tilt = Quat::from_rotation_x(-degrees.to_radians());
     let v = [
@@ -289,11 +332,16 @@ fn slide(spec: &VehicleSpec, degrees: f32) -> f32 {
     for _ in 0..(2.0 / DT) as usize {
         p.drive(id, controls(0.0, 0.0, true));
         p.step(DT);
+        show(&p, id);
     }
     let from = p
         .vehicle_transform(id)
         .map_or(Vec3::ZERO, |m| m.w_axis.truncate());
-    ride(&mut p, id, 10.0, controls(0.0, 0.0, true), |_, _| {});
+    for _ in 0..(10.0 / DT) as usize {
+        p.drive(id, controls(0.0, 0.0, true));
+        p.step(DT);
+        show(&p, id);
+    }
     let at = p
         .vehicle_transform(id)
         .map_or(Vec3::ZERO, |m| m.w_axis.truncate());
