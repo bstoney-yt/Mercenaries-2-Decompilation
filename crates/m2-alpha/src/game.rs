@@ -211,6 +211,8 @@ pub struct Game {
     /// name ([`crate::ride`]); while she rides any other, or none is
     /// given, she sits at the wheel.
     pub ride: Option<(usize, u32)>,
+    /// Her getting in or out by the clips, under way ([`crate::boarding`]).
+    pub boarding: Option<crate::boarding::Boarding>,
     /// The field of view (degrees, bottom to top) and the screen's width
     /// over its height the last frame was drawn with: what the scripts'
     /// camera sees (`Event.ObjectIsVisible`).
@@ -419,6 +421,7 @@ impl Game {
             ladders: Default::default(),
             climb: None,
             ride: None,
+            boarding: None,
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
             context: None,
@@ -900,6 +903,15 @@ impl Game {
         } else {
             intent
         };
+        // Getting in or out by the clips she only looks about.
+        let intent = if self.boarding.is_some() {
+            Intent {
+                look: intent.look,
+                ..Intent::default()
+            }
+        } else {
+            intent
+        };
         if self.on_foot
             && let Some(p) = self.scene.player.as_ref().filter(|p| p.landed)
         {
@@ -952,6 +964,19 @@ impl Game {
                     self.park_wait = 0.5;
                     self.park_tries += 1;
                     park(physics, &mut scene.vehicles, player, self.park_tries);
+                }
+                // A boarding nothing plays ends as the use key used to:
+                // she is in, or out at the door. One for a vehicle she is
+                // not in any more is dropped.
+                if let Some(b) = &mut self.boarding
+                    && (player.driving != Some(b.vehicle) || b.age(dt))
+                {
+                    let b = self.boarding.take().expect("a boarding");
+                    if b.exiting && player.driving == Some(b.vehicle) {
+                        eprintln!("boarding: no clip played: she gets out at once");
+                        get_out(physics, &scene.vehicles[b.vehicle], b.seat, player);
+                        self.ride = None;
+                    }
                 }
                 // Out of the vehicle the use key seated her in, or in
                 // another one, her seat is forgotten.
@@ -1098,8 +1123,22 @@ impl Game {
                         // Out over deep water she swims (`Player::update_swim`).
                         Some(i) => {
                             let seat = self.ride.filter(|r| r.0 == i).map(|r| r.1);
-                            get_out(physics, &scene.vehicles[i], seat, player);
-                            self.ride = None;
+                            match animated_exit(physics, &scene.vehicles[i], seat) {
+                                // By the clips: out when they end.
+                                Some(entrance) => {
+                                    eprintln!(
+                                        "boarding: she gets out of the {} by the clips \
+                                         (seat {seat:08x?}, entrance {entrance:08x?})",
+                                        scene.vehicles[i].spec.label
+                                    );
+                                    self.boarding =
+                                        Some(crate::boarding::Boarding::exit(i, seat, entrance));
+                                }
+                                None => {
+                                    get_out(physics, &scene.vehicles[i], seat, player);
+                                    self.ride = None;
+                                }
+                            }
                         }
                         // Off the emplaced gun she mans.
                         None if self.combat.manned.is_some() => {
@@ -1189,11 +1228,20 @@ impl Game {
                                     &scene.people,
                                 );
                                 log_entry(physics, v, player, entrance, b.as_ref());
-                                Some((i, b?))
+                                Some((i, b?, entrance))
                             });
-                            player.driving = boarding.as_ref().map(|(i, _)| *i);
-                            if let Some((i, b)) = &boarding {
+                            player.driving = boarding.as_ref().map(|(i, _, _)| *i);
+                            if let Some((i, b, entrance)) = &boarding {
                                 self.last_vehicle = Some(*i);
+                                // By the clips, through the entrance she took, for
+                                // the seat it gave her (before any slide over).
+                                if scene.vehicles[*i].spec.seating.is_some() {
+                                    self.boarding = Some(crate::boarding::Boarding::enter(
+                                        *i,
+                                        b.slid_from.or(b.seat),
+                                        *entrance,
+                                    ));
+                                }
                                 self.ride = b.seat.map(|s| (*i, s));
                                 let v = &scene.vehicles[*i];
                                 self.combat.seat = crate::ride::armed_index(
@@ -1205,7 +1253,7 @@ impl Game {
                             // Seated: she no longer waits to land (people
                             // wait on that, and she may have hopped out and
                             // back in before the ground streamed).
-                            if let Some((i, b)) = boarding {
+                            if let Some((i, b, _)) = boarding {
                                 player.landed = true;
                                 let v = &mut scene.vehicles[i];
                                 let out = crate::ride::empty_seats(&mut v.crew, &b.out);
@@ -4443,6 +4491,47 @@ fn exit_plan(
         (_, Some(p)) => p,
     };
     (kind, place)
+}
+
+/// Whether she gets out of `v` from seat `seat` (`None`, the driver's) by
+/// the clips ([`crate::boarding`]): the exit kind is `Animated` and the
+/// vehicle has seat data; with the entrance she leaves by (the seat's
+/// exit). Not from a boat, whose exits into water swim.
+fn animated_exit(physics: &Physics, v: &ParkedVehicle, seat: Option<u32>) -> Option<Option<u32>> {
+    let seating = v.spec.seating.as_deref()?;
+    if v.spec.is_boat() {
+        return None;
+    }
+    let id = v.id?;
+    let at = physics.vehicle_transform(id).filter(|at| at.is_finite())?;
+    let (kind, _) = exit_plan(physics, v, seat, at, physics.vehicle_velocity(id));
+    if kind != m2_engine::seats::ExitKind::Animated {
+        return None;
+    }
+    let index = seat
+        .and_then(|n| seating.seat(n))
+        .or_else(|| seating.driver());
+    Some(index.and_then(|i| seating.exit_of(i)).map(|e| e.name))
+}
+
+/// Gets her out of `v` at the end of her exit clips: as [`get_out`],
+/// standing at `place` (world space), where the last clip left her.
+pub(crate) fn get_out_at(
+    physics: &Physics,
+    v: &ParkedVehicle,
+    seat: Option<u32>,
+    player: &mut Player,
+    place: Vec3,
+    facing: f32,
+) {
+    get_out(physics, v, seat, player);
+    player.drop_at(place);
+    player.facing = facing;
+    eprintln!(
+        "boarding: out of the {} where her clip ends, at {:.2?}",
+        v.spec.label,
+        place.to_array()
+    );
 }
 
 /// Gets her out of `v` as [`exit_plan`] has it, to drop to the ground

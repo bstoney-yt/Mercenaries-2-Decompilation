@@ -6302,6 +6302,7 @@ mod tests {
             crew: Vec::new(),
             turret: 0.0,
             hijack_nodes: Vec::new(),
+            door_turns: Vec::new(),
             gun: 0.0,
             aims: Vec::new(),
             rolled: 0.0,

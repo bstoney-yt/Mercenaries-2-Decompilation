@@ -1077,6 +1077,32 @@ impl VehicleSpec {
         }
     }
 
+    /// Swings doors in `nodes` (as [`posed_nodes`] gives them): each
+    /// `(node name hash, axis, angle)` turns its node `angle` radians about
+    /// `axis` in the node's own frame ([`crate::vehicle_door::swung`]), and
+    /// every node under it with it.
+    ///
+    /// [`posed_nodes`]: Self::posed_nodes
+    pub fn swing_doors(&self, nodes: &mut [Mat4], doors: &[(u32, Vec3, f32)]) {
+        for &(bone, axis, angle) in doors {
+            let Some(i) = self.node_names.iter().position(|&n| n == bone) else {
+                continue;
+            };
+            let Some(&at) = nodes.get(i) else { continue };
+            let turn = at * Mat4::from_axis_angle(axis, angle) * at.inverse();
+            for (j, m) in nodes.iter_mut().enumerate() {
+                let mut up = Some(j as u16);
+                while let Some(n) = up {
+                    if usize::from(n) == i {
+                        *m = turn * *m;
+                        break;
+                    }
+                    up = self.node_parents.get(usize::from(n)).copied().flatten();
+                }
+            }
+        }
+    }
+
     /// Whether it is a boat: it floats ([`Physics::set_water`]) and has
     /// no wheels.
     ///
@@ -1530,6 +1556,7 @@ mod tests {
                 pitch: (r(-30.0), r(30.0)),
                 pitch_speed: r(100.0),
             }],
+            doors: Vec::new(),
         };
         s.with_seating(Some(std::sync::Arc::new(seating)))
     }

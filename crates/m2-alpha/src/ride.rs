@@ -252,6 +252,7 @@ mod tests {
             seats,
             entrances,
             turrets: Vec::new(),
+            doors: Vec::new(),
         }
     }
 
@@ -345,6 +346,7 @@ mod tests {
             ],
             entrances: Vec::new(),
             turrets: Vec::new(),
+            doors: Vec::new(),
         };
         let mut ride = Ride {
             seating: Some(&s),
