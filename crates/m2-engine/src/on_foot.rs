@@ -33,6 +33,9 @@ pub struct HumanMotion {
     /// `UprightWalkSpeed`, `UprightJogSpeed`, `UprightRunSpeed` and
     /// `UprightSprintSpeed`, m/s (the sprint is -1, none, by default).
     pub paces: [f32; 4],
+    /// `CrouchWalkSpeed`, m/s: the pace crouched, which is how the 360
+    /// aims in (every hero 1.5).
+    pub crouch_walk: f32,
 }
 
 impl Default for HumanMotion {
@@ -43,14 +46,15 @@ impl Default for HumanMotion {
             max_rotation: 180.0,
             max_air_speed: 4.0,
             paces: [1.2, 2.5, 5.0, -1.0],
+            crouch_walk: 1.5,
         }
     }
 }
 
 /// The field name hashes [`HumanMotion`] is read from, in its order:
-/// `JumpHeight`, `Gravity`, `MaxRotationSpeed`, `MaxAirSpeed`, then the
-/// four `Upright` paces.
-pub const FIELDS: [&str; 8] = [
+/// `JumpHeight`, `Gravity`, `MaxRotationSpeed`, `MaxAirSpeed`, the four
+/// `Upright` paces and `CrouchWalkSpeed`.
+pub const FIELDS: [&str; 9] = [
     "JumpHeight",
     "Gravity",
     "MaxRotationSpeed",
@@ -59,17 +63,19 @@ pub const FIELDS: [&str; 8] = [
     "UprightJogSpeed",
     "UprightRunSpeed",
     "UprightSprintSpeed",
+    "CrouchWalkSpeed",
 ];
 
 impl HumanMotion {
     /// From the eight fields in [`FIELDS`]' order.
-    pub fn from_fields(f: [f32; 8]) -> Self {
+    pub fn from_fields(f: [f32; 9]) -> Self {
         Self {
             jump_height: f[0],
             gravity: f[1],
             max_rotation: f[2],
             max_air_speed: f[3],
             paces: [f[4], f[5], f[6], f[7]],
+            crouch_walk: f[8],
         }
     }
 
@@ -195,6 +201,16 @@ pub fn steer(current: Vec2, wanted: Vec2, dt: f32) -> Vec2 {
     Vec2::new(way.sin(), way.cos()) * speed
 }
 
+/// Aiming in, a player drops into the `Crouched` stance (the pad's aim
+/// button, bit 0x20000, sends the `Crouch` action and the low-mode
+/// message from the player control at 0x824333E0; the camera record's
+/// `CrouchFov` 0.75 and `CrouchYawSpeed` 0.5 are the aimed view). For
+/// this long after (0x82DE8858), and for as long as the slide to a stop
+/// that sets off lasts, what the stick asks is held at nothing
+/// (the same function, its flag +0x26 and timer +0x28): running, she slides into the crouch on her run's speed
+/// ([`RunStop`]); standing, she holds still a moment.
+pub const CROUCH_HOLD: f32 = 0.25;
+
 /// How long the slide to a stop after a run lasts for a player, seconds
 /// (0x82DE8850; the people's are 0.25 s, 0.666 s crouched).
 pub const RUN_STOP: f32 = 0.4;
@@ -287,6 +303,7 @@ mod tests {
             max_rotation: 700.0,
             max_air_speed: 12.0,
             paces: [2.0, 5.0, 7.0, 12.0],
+            crouch_walk: 1.5,
         }
     }
 

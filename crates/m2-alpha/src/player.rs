@@ -35,6 +35,7 @@ pub const JENNIFER: HumanMotion = HumanMotion {
     max_rotation: 700.0,
     max_air_speed: 12.0,
     paces: [2.0, 5.0, 7.0, 12.0],
+    crouch_walk: 1.5,
 };
 /// Seconds after take-off before touching the ground counts as landing.
 const MIN_AIR: f32 = 0.15;
@@ -365,6 +366,10 @@ pub struct Player {
     /// The way she last moved (a unit vector), the way a slide to a stop
     /// carries her.
     way: Vec2,
+    /// Seconds left of the hold on her stick after she aims in
+    /// ([`on_foot::CROUCH_HOLD`]), and whether she aimed last step.
+    crouch_hold: Option<f32>,
+    was_aiming: bool,
     /// Playing the slide to a stop's clip ([`crate::held::Moves::run_stop`]).
     stopping: Option<usize>,
     /// In a jump, until she has landed.
@@ -556,6 +561,8 @@ impl Player {
             ground: Vec2::ZERO,
             way: Vec2::Y,
             stopping: None,
+            crouch_hold: None,
+            was_aiming: false,
             leap: Leap::No,
             jump_queued: false,
             throwing: None,
@@ -680,6 +687,7 @@ impl Player {
         self.ground = Vec2::ZERO;
         self.run_stop = RunStop::default();
         self.stopping = None;
+        self.crouch_hold = None;
         self.turn = Turn::default();
         self.leap = Leap::No;
         self.jump_queued = false;
@@ -944,10 +952,32 @@ impl Player {
             self.camera(physics);
             return;
         }
-        let speed = self.speeds[pace];
+        // Aimed in she is crouched, at her template's `CrouchWalkSpeed`
+        // (inferred for the player: the 360 picks that pace for the
+        // crouched people; how its player control scales the stick is
+        // untraced).
+        let speed = if self.aiming {
+            self.motion.crouch_walk
+        } else {
+            self.speeds[pace]
+        };
+        if self.aiming && !self.was_aiming {
+            self.crouch_hold = Some(on_foot::CROUCH_HOLD);
+        }
+        self.was_aiming = self.aiming;
+        let held = match self.crouch_hold {
+            Some(t) if t > 0.0 || self.run_stop.sliding.is_some() => {
+                self.crouch_hold = Some(t - dt);
+                true
+            }
+            _ => {
+                self.crouch_hold = None;
+                false
+            }
+        };
         // Bashing or picking a weapon up, she stands.
         let bashing = self.bashing.is_some() || self.picking.is_some();
-        let asked = if bashing {
+        let asked = if bashing || held {
             Vec2::ZERO
         } else {
             Vec2::new(direction.x, direction.z) * speed
@@ -1638,10 +1668,38 @@ mod tests {
             r.update(&physics, Intent::default(), dt);
         }
         let slid = (r.character.position - from).length();
+        // Aiming in from a sprint, stick still forward: she slides into
+        // the crouch, then walks crouched.
+        let mut s = fresh();
+        for _ in 0..150 {
+            s.update(&physics, sprint, dt);
+        }
+        s.aiming = true;
+        let from = s.character.position;
+        let mut slide_time = 0.0;
+        let mut sliding = false;
+        let mut aim_slid = 0.0;
+        for i in 0..60 {
+            s.update(&physics, sprint, dt);
+            if s.run_stop.sliding.is_some() {
+                sliding = true;
+                slide_time = (i + 1) as f32 * dt;
+                aim_slid = (s.character.position - from).length();
+            }
+        }
+        for _ in 0..60 {
+            s.update(&physics, sprint, dt);
+        }
+        let crouched = s.character.velocity.length();
         eprintln!(
             "on foot: jump {top:.2} m, {air:.2} s in the air; half turn {turn:.2} s; \
-             to run {to_run:.2} s; slide after a sprint {slid:.2} m"
+             to run {to_run:.2} s; slide after a sprint {slid:.2} m; \
+             aim-in from a sprint: slides {aim_slid:.2} m, ends {slide_time:.2} s in, \
+             then {crouched:.2} m/s crouched"
         );
+        assert!(sliding);
+        assert!((aim_slid - 1.4).abs() < 0.3, "{aim_slid}");
+        assert!((crouched - 1.5).abs() < 0.05, "{crouched}");
         assert!((top - 1.0).abs() < 0.06, "{top}");
         assert!((air - 0.70).abs() < 0.05, "{air}");
         assert!((0.3..0.45).contains(&turn), "{turn}");
