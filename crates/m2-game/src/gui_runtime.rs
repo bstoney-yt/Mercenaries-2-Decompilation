@@ -109,6 +109,12 @@ struct Interp {
     elapsed: f32,
     from_rect: [f32; 4],
     to_rect: [f32; 4],
+    /// How much of the move from `from_rect` to `to_rect` is made (0..=1):
+    /// the 360 keeps an animation's move as a change still to make (its
+    /// native, 0x8238FFD8, stores target minus where the widget is), so the
+    /// widget moves by its share each tick and a parent moved meanwhile
+    /// (the box centred after its cursor's pulse began) takes it along.
+    moved: f32,
     from_colour: [f32; 4],
     /// Per channel; `None` stays.
     to_colour: [Option<f32>; 4],
@@ -653,7 +659,7 @@ impl Screen {
             } else {
                 (it.elapsed / it.duration).min(1.0)
             };
-            self.apply_interp(id, &it, t);
+            self.apply_interp(id, &mut it, t);
             if t >= 1.0 {
                 if let Some(cb) = it.callback {
                     due.push((cb, Vec::new()));
@@ -672,10 +678,15 @@ impl Screen {
         due
     }
 
-    fn apply_interp(&mut self, id: u32, it: &Interp, t: f32) {
+    fn apply_interp(&mut self, id: u32, it: &mut Interp, t: f32) {
         let lerp = |a: f32, b: f32| a + (b - a) * t;
-        let rect = [0, 1, 2, 3].map(|i| lerp(it.from_rect[i], it.to_rect[i]));
-        self.set_rect(id, rect);
+        let step = t - it.moved;
+        if it.from_rect != it.to_rect && step != 0.0 {
+            let now = self.rect(id);
+            let rect = [0, 1, 2, 3].map(|i| now[i] + (it.to_rect[i] - it.from_rect[i]) * step);
+            self.set_rect(id, rect);
+        }
+        it.moved = t;
         let colour = [0, 1, 2, 3].map(|i| it.to_colour[i].map(|to| lerp(it.from_colour[i], to)));
         if colour.iter().any(Option::is_some) {
             self.set_colour(id, colour, true);
@@ -2039,6 +2050,7 @@ natives! {
             elapsed: a.f(18).unwrap_or(0.0).max(0.0),
             from_rect,
             to_rect,
+            moved: 0.0,
             from_colour,
             to_colour: [ch(6), ch(7), ch(8), ch(9)],
             from_uv,
@@ -2824,6 +2836,31 @@ mod tests {
         assert!((g.get::<f64>("ticks").unwrap() - 1.5).abs() < 1e-9);
         assert_eq!(screen.borrow().rect(1), [100.0, 0.0, 110.0, 10.0]);
         assert!(screen.borrow_mut().take_log().is_empty());
+    }
+
+    /// A dialog box's cursor pulses (its colour only, its box given as
+    /// where it is) and then the box is centred: the cursor goes with the
+    /// box, as the 360 keeps an animation's move as a change still to make.
+    #[test]
+    fn an_animation_keeps_to_its_parent_moved_meanwhile() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            box = G.CreateWidget()
+            G.SetWidgetLocation(box, 0, 0, 300, 200)
+            cursor = G.CreateImageWidget()
+            G.SetWidgetLocation(cursor, 10, 150, 150, 190)
+            G.AddWidgetChild(box, cursor)
+            local x1, y1, x2, y2 = G.GetWidgetLocation(cursor)
+            G.InterpolateWidget(cursor, 1, x1, y1, x2, y2, -4096, -4096, -4096, 100)
+            G.SetWidgetLocation(box, 170, 140)
+            "#,
+        );
+        tick(host.lua(), 0.5);
+        let s = screen.borrow();
+        assert_eq!(s.rect(2), [180.0, 290.0, 320.0, 330.0]);
     }
 
     #[test]
