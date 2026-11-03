@@ -1513,6 +1513,7 @@ mod tests {
             shapes: Default::default(),
             material: None,
             turret_shapes: Default::default(),
+            wreck: None,
             tuning: Default::default(),
         };
         let plain = ChaseRig::of(&spec);
