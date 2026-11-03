@@ -606,7 +606,36 @@ local function wrap(m, name, f)
     local d = rawget(m, name)
     if d ~= nil and not __m2_dialog_wrapped[d] then rawset(m, name, f) end
 end
+-- ToggleHud(player, on, reason): the HQ hides the HUD on entering
+-- (`MrxHq.GlobalEnter`, through `MrxGuiBootstrap.ToggleHud`, reason
+-- "briefing", which keeps the message box and subtitles) and shows it on
+-- leaving. A `GuiManager` `ToggleHud` call for the HUD, which runs its own
+-- `MrxGuiManager.ToggleHud`; the original then runs as it would.
+local function toggling(m, name)
+    local d = rawget(m, name)
+    if type(d) ~= "function" or __m2_dialog_wrapped[d] then return end
+    local f = function(player, on, reason, ...)
+        -- The bootstrap's calls the manager's: one call for the HUD.
+        if __m2_toggling then return d(player, on, reason, ...) end
+        __m2_hud_call_count = __m2_hud_call_count + 1
+        table.insert(__m2_hud_calls, { seq = __m2_hud_call_count, group = "GuiManager",
+            method = "ToggleHud", data = { bOn = on and true or false, sReason = plain(reason) },
+            callback = false })
+        if #__m2_hud_calls > 64 then table.remove(__m2_hud_calls, 1) end
+        __m2_toggling = true
+        local ok, r = pcall(d, player, on, reason, ...)
+        __m2_toggling = false
+        if not ok then error(r, 0) end
+        return r
+    end
+    __m2_dialog_wrapped[f] = true
+    rawset(m, name, f)
+end
 function __m2_wrap_dialogs()
+    for _, name in ipairs({ "MrxGuiBootstrap", "MrxGuiManager" }) do
+        local m = rawget(_G, name)
+        if type(m) == "table" then toggling(m, "ToggleHud") end
+    end
     local m = rawget(_G, "MrxGuiDialogBox")
     if type(m) == "table" then
         wrap(m, "DisplayDialogBox", display)
@@ -2380,8 +2409,20 @@ impl MissionLink {
         if let Some(shot) = game.shot.as_mut() {
             let w = mission.world().borrow();
             let at = |g: &u32| w.objects.get(g).map(|o| Vec3::from(o.position));
-            if let (Some(b), Some(t)) = (at(&shot.base), at(&shot.target)) {
-                shot.place(b, t);
+            match (at(&shot.base), at(&shot.target)) {
+                (Some(b), Some(t)) => shot.place(b, t),
+                (b, t) if shot.view.is_none() && !shot.unplaced_logged => {
+                    shot.unplaced_logged = true;
+                    eprintln!(
+                        "mission: camera shot {} not placed: {:#x} {}, {:#x} {}",
+                        shot.name,
+                        shot.base,
+                        if b.is_some() { "found" } else { "missing" },
+                        shot.target,
+                        if t.is_some() { "found" } else { "missing" }
+                    );
+                }
+                _ => {}
             }
         }
         lap.mark("scripts: attitudes");
@@ -5609,6 +5650,7 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 base: *base,
                 target: *target,
                 view: None,
+                unplaced_logged: false,
             });
             return false;
         }
@@ -6840,6 +6882,45 @@ mod tests {
         let exit_only = box_of("Display", "[Briefing.RootMenuDialog]", &["[Generic.Exit]"]);
         assert_eq!(contract_pick(&exit_only, &offered), None);
         assert_eq!(contract_pick(&menu, &[]), None);
+    }
+
+    // The HQ hides the HUD on entering (`MrxHq.GlobalEnter`: the
+    // bootstrap's ToggleHud, which calls the manager's): one call for the
+    // HUD, with its switch and reason, and the scripts' own still runs.
+    #[test]
+    fn the_hqs_hud_toggle_goes_to_the_hud_once() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            Hud = {}
+            ran = 0
+            MrxGuiManager = { ToggleHud = function(p, on, why) ran = ran + 1 end }
+            MrxGuiBootstrap = { ToggleHud = function(p, on, why)
+                MrxGuiManager.ToggleHud(p, on, why) end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(DIALOG_BOXES).exec().unwrap();
+        lua.load(r#"MrxGuiBootstrap.ToggleHud(1, false, "briefing")"#)
+            .exec()
+            .unwrap();
+        let calls = hud_calls(&lua);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(
+            (calls[0].group.as_str(), calls[0].method.as_str()),
+            ("GuiManager", "ToggleHud")
+        );
+        let Plain::Table(data) = &calls[0].data else {
+            panic!("{:?}", calls[0].data);
+        };
+        assert!(data.contains(&(Plain::Text("bOn".into()), Plain::Bool(false))));
+        assert!(data.contains(&(
+            Plain::Text("sReason".into()),
+            Plain::Text("briefing".into())
+        )));
+        assert_eq!(lua.globals().get::<i64>("ran").unwrap(), 1);
     }
 
     // The box's call keeps what it shows: its kind, title and options,

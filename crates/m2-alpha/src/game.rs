@@ -282,6 +282,8 @@ pub struct Shot {
     /// Where it sees from and looks at, as last placed
     /// ([`Shot::place`]); `None` until both objects are known.
     pub view: Option<(Vec3, Vec3)>,
+    /// Whether the log has said it could not be placed.
+    pub unplaced_logged: bool,
 }
 
 /// An over-the-shoulder shot's eye from its base's feet: this far up, back
@@ -4696,6 +4698,7 @@ mod tests {
             base: 1,
             target: 2,
             view: None,
+            unplaced_logged: false,
         };
         let (base, target) = (super::Vec3::ZERO, super::Vec3::new(0.0, 0.0, 2.0));
         shot.place(base, target);
