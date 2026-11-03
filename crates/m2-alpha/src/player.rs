@@ -1,7 +1,7 @@
 //! The player on foot: Jennifer walking the island under the character
 //! controller, with a third-person camera behind her.
 
-use m2_engine::on_foot::{self, HumanMotion, RunStop, StopEvent, Turn};
+use m2_engine::on_foot::{self, AimLegs, HumanMotion, RunStop, StopEvent, Turn};
 use m2_engine::{Character, Gait, GpuModel, Physics, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
@@ -370,6 +370,9 @@ pub struct Player {
     /// ([`on_foot::CROUCH_HOLD`]), and whether she aimed last step.
     crouch_hold: Option<f32>,
     was_aiming: bool,
+    /// Aiming on the move: whether her legs walk forwards or backwards
+    /// ([`on_foot::AimLegs`]).
+    aim_legs: AimLegs,
     /// Playing the slide to a stop's clip ([`crate::held::Moves::run_stop`]).
     stopping: Option<usize>,
     /// In a jump, until she has landed.
@@ -563,6 +566,7 @@ impl Player {
             stopping: None,
             crouch_hold: None,
             was_aiming: false,
+            aim_legs: AimLegs::Still,
             leap: Leap::No,
             jump_queued: false,
             throwing: None,
@@ -1002,7 +1006,30 @@ impl Player {
 
         // Aiming, throwing or bashing, she turns the camera's way.
         let aimed = self.aiming || self.throwing.is_some() || bashing;
-        let heading = if aimed {
+        // Aiming on the move, her legs face the way she goes, or away
+        // from it walking backwards, and swing round at 720 degrees a
+        // second; her upper body turns to the aim ([`on_foot::AimLegs`]).
+        let moving =
+            (self.ground.length_squared() > 0.01).then(|| self.ground.x.atan2(self.ground.y));
+        self.aim_legs = if self.aiming && self.throwing.is_none() && !bashing {
+            self.aim_legs.step(moving.map(|m| m - self.yaw))
+        } else {
+            AimLegs::Still
+        };
+        let legs = match (self.aim_legs, moving) {
+            (AimLegs::Forward | AimLegs::Backward, Some(m)) => Some(self.aim_legs.facing(m)),
+            _ => None,
+        };
+        let heading = if let Some(l) = legs {
+            let mut d = (l - self.facing).rem_euclid(std::f32::consts::TAU);
+            if d > std::f32::consts::PI {
+                d -= std::f32::consts::TAU;
+            }
+            let step = on_foot::LEG_SWING * dt;
+            self.facing += d.clamp(-step, step);
+            self.turn = Turn::default();
+            None
+        } else if aimed {
             Some(self.yaw)
         } else {
             (direction.length_squared() > 0.01).then(|| direction.x.atan2(direction.z))
@@ -1032,7 +1059,7 @@ impl Player {
         if let Some((_, rig)) = &mut self.model {
             let gait = if moved < 0.3 {
                 Gait::Idle
-            } else if intent.walk {
+            } else if intent.walk || self.aiming {
                 Gait::Walk
             } else if intent.sprint {
                 Gait::Sprint
@@ -1040,6 +1067,17 @@ impl Player {
                 Gait::Run
             };
             let clips = &self.clips;
+            // Aimed in she is `Crouched`: its gait's clip for what she
+            // holds ([`crate::held::CROUCH_HANDLES`]).
+            let crouched = self
+                .aiming
+                .then(|| self.moves.of(self.shown.class))
+                .flatten()
+                .and_then(|h| {
+                    let back = self.aim_legs == AimLegs::Backward;
+                    h.crouch.iter().find(|(g, b, _)| *g == gait && *b == back)
+                })
+                .map(|&(_, _, c)| c);
             // The jump: a take-off (on the run or standing), the air,
             // and a landing.
             if jump.is_some() {
@@ -1168,6 +1206,14 @@ impl Player {
                 };
                 rig.two_handed = carry == Carry::Aim && upper.is_some();
                 rig.animator.set_upper(upper.zip(rig.upper.clone()));
+            } else if let Some(c) = crouched {
+                // The crouched clip carries her legs and body; moving,
+                // the aim's arms ride over it, as upright.
+                rig.gait = gait;
+                rig.animator.play(c);
+                let upper = (gait != Gait::Idle).then_some(clips.aim).flatten();
+                rig.animator.set_upper(upper.zip(rig.upper.clone()));
+                rig.two_handed = rig.barrel;
             } else {
                 rig.hold_rifle(gait, clips, carry);
                 // A pistol is held in the right hand alone.
@@ -1244,7 +1290,12 @@ impl Player {
             let rate = if leaping || self.stopping.is_some() {
                 1.0
             } else {
-                rig.play_rate(gait, moved, 0)
+                match crouched.map(|c| rig.clips[c].info.speed) {
+                    // Crouched and moving, its stride to her speed.
+                    Some(s) if gait != Gait::Idle && s > 0.1 => moved / s,
+                    Some(_) => 1.0,
+                    None => rig.play_rate(gait, moved, 0),
+                }
             };
             rig.advance(dt * rate);
         }

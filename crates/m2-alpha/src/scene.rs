@@ -456,7 +456,22 @@ fn hero_moves(
             moves_of(&held.equip)
         );
     }
-    eprintln!("hero moves: {hero}: pickup {}", h(moves.pickup));
+    eprintln!(
+        "hero moves: {hero}: pickup {}, run stop {}",
+        h(moves.pickup),
+        h(moves.run_stop)
+    );
+    if let Some(r) = moves.of(table::RIFLE) {
+        let crouch: Vec<String> = r
+            .crouch
+            .iter()
+            .map(|(g, back, i)| {
+                let way = if *back { " back" } else { "" };
+                format!("{}{way} {}", format!("{g:?}").to_lowercase(), h(Some(*i)))
+            })
+            .collect();
+        eprintln!("hero moves: {hero}: crouched {}", crouch.join(", "));
+    }
     moves
 }
 

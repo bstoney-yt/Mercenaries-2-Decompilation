@@ -417,3 +417,75 @@ mod tests {
         }
     }
 }
+
+/// Which way an aiming person's legs carry them (the locomotion node's
+/// state, +0x30 of the object 0x828071A8 steps).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AimLegs {
+    /// Standing (state 2).
+    #[default]
+    Still,
+    /// Walking forwards the way they go, the upper body turned to the
+    /// aim (state 0).
+    Forward,
+    /// Walking backwards, facing away from the way they go (state 1).
+    Backward,
+}
+
+impl AimLegs {
+    /// The legs' state for moving at `rel` radians from the aim's heading
+    /// (positive to the left), from `self`, as 0x828071A8 picks it while
+    /// aiming: forward until past 90 degrees to the left or 155 to the
+    /// right; back to forward inside 80 to the left and 145 to the right;
+    /// from standing, backwards past 90 left or 150 right. `None` for
+    /// standing still.
+    pub fn step(self, rel: Option<f32>) -> Self {
+        let Some(rel) = rel.map(wrap) else {
+            return Self::Still;
+        };
+        let d = rel.to_degrees();
+        match self {
+            Self::Forward if !(-155.0..=90.0).contains(&d) => Self::Backward,
+            Self::Forward => Self::Forward,
+            Self::Backward if d < 80.0 && d > -145.0 => Self::Forward,
+            Self::Backward => Self::Backward,
+            Self::Still if !(-150.0..=90.0).contains(&d) => Self::Backward,
+            Self::Still => Self::Forward,
+        }
+    }
+
+    /// The heading the legs face, moving along `heading`.
+    pub fn facing(self, heading: f32) -> f32 {
+        match self {
+            Self::Backward => wrap(heading + std::f32::consts::PI),
+            _ => heading,
+        }
+    }
+}
+
+/// How fast an aiming person's legs swing round to the way they face,
+/// rad/s (720 degrees a second, 0x820F939C).
+pub const LEG_SWING: f32 = 4.0 * std::f32::consts::PI;
+
+#[cfg(test)]
+mod aim_tests {
+    use super::*;
+
+    #[test]
+    fn aimed_legs_switch_with_hysteresis_and_handedness() {
+        let r = |d: f32| Some(d.to_radians());
+        let f = AimLegs::Still.step(r(0.0));
+        assert_eq!(f, AimLegs::Forward);
+        // Strafing right keeps forward legs, far round to the right too.
+        assert_eq!(f.step(r(-150.0)), AimLegs::Forward);
+        assert_eq!(f.step(r(-160.0)), AimLegs::Backward);
+        // To the left, past 90 degrees goes backwards...
+        let b = f.step(r(95.0));
+        assert_eq!(b, AimLegs::Backward);
+        // ...and comes back only inside 80.
+        assert_eq!(b.step(r(85.0)), AimLegs::Backward);
+        assert_eq!(b.step(r(75.0)), AimLegs::Forward);
+        assert_eq!(b.step(None), AimLegs::Still);
+        assert!((b.facing(0.5) - (0.5 - std::f32::consts::PI)).abs() < 1e-5);
+    }
+}
