@@ -350,6 +350,9 @@ pub struct Templates {
     /// Each person template's swimming speeds (walk, jog, run, sprint), by
     /// id ([`crate::tuning::human_swim_speeds`]).
     pub swim_speeds: HashMap<u32, [f32; 4]>,
+    /// Each person template's jump, gravity, turn and paces, by id
+    /// ([`crate::tuning::human_motion`]).
+    pub human_motion: HashMap<u32, crate::on_foot::HumanMotion>,
     /// Each person template's `HumanAnimationSet` gender and character
     /// name, by id ([`crate::tuning::human_animation_sets`]).
     pub human_sets: HashMap<u32, (u32, u32)>,
@@ -611,6 +614,13 @@ impl Templates {
         self.ids(name)
             .iter()
             .find_map(|id| self.swim_speeds.get(id).copied())
+    }
+
+    /// Template `name`'s jump, gravity, turn and paces, whatever its case.
+    pub fn human_motion(&self, name: &str) -> Option<crate::on_foot::HumanMotion> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.human_motion.get(id).copied())
     }
 
     /// Template `name`'s walk, run and sprint speeds, whatever its case.
@@ -989,6 +999,7 @@ impl Templates {
             health: crate::tuning::healths(&db),
             speeds: crate::tuning::human_speeds(&db),
             swim_speeds: crate::tuning::human_swim_speeds(&db),
+            human_motion: crate::tuning::human_motion(&db),
             human_sets: crate::tuning::human_animation_sets(&db),
             guns: crate::tuning::hand_guns(&db),
             equipment: crate::tuning::equipment(&db),

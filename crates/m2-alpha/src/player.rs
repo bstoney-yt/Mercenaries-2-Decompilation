@@ -1,6 +1,7 @@
 //! The player on foot: Jennifer walking the island under the character
 //! controller, with a third-person camera behind her.
 
+use m2_engine::on_foot::{self, HumanMotion, RunStop, StopEvent, Turn};
 use m2_engine::{Character, Gait, GpuModel, Physics, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
@@ -17,14 +18,25 @@ use crate::scene::{Carry, Rig};
 /// Seconds the mouse must be still before the chase camera swings back
 /// behind the vehicle.
 const CHASE_HOLD: f32 = 1.5;
-const WALK: f32 = 1.4;
+/// Jennifer's walk, run and sprint, m/s: her template's
+/// `UprightWalkSpeed`, `UprightJogSpeed` and `UprightRunSpeed` (from the
+/// 360 code's field names; that the alpha's three keys are those three
+/// paces is inferred). Another hero's are these scaled by their
+/// template's speeds against hers ([`Player::hero_speeds`]).
+const WALK: f32 = 2.0;
 const RUN: f32 = 5.0;
-const SPRINT: f32 = 7.2;
-/// Jennifer's walk, run and sprint; another hero's are these scaled by
-/// their template's speeds against hers ([`Player::hero_speeds`]).
+const SPRINT: f32 = 7.0;
 pub const SPEEDS: [f32; 3] = [WALK, RUN, SPRINT];
-/// Take-off speed of a jump, m/s (about 0.8 m high).
-const JUMP: f32 = 4.0;
+/// Jennifer's `_HumanPhysics` (her template `Jen`, read in round 1 of
+/// the animation thread), for a player whose template isn't read.
+pub const JENNIFER: HumanMotion = HumanMotion {
+    jump_height: 1.0,
+    gravity: 16.5,
+    max_rotation: 700.0,
+    max_air_speed: 12.0,
+    paces: [2.0, 5.0, 7.0, 12.0],
+    crouch_walk: 1.5,
+};
 /// Seconds after take-off before touching the ground counts as landing.
 const MIN_AIR: f32 = 0.15;
 /// Seconds before a landing clip's end that the gait takes over again
@@ -33,7 +45,8 @@ const LAND_FADE: f32 = 0.1;
 /// Speeds (m/s) above which she takes off and lands on the run.
 const RUNNING_JUMP: f32 = 1.0;
 const RUNNING_LAND: f32 = 1.5;
-/// How fast she turns to face where she is going, radians per second.
+/// How fast she turns to face where she swims, radians per second
+/// (invented: on foot she turns as the 360 does, [`on_foot::Turn`]).
 const TURN_RATE: f32 = 10.0;
 /// Swimming. She swims where the sea over the ground under her is deeper
 /// than this, metres (chest deep: the depth she gets out of a boat into,
@@ -340,6 +353,25 @@ pub struct Player {
     /// Her swimming speeds, the same way: her template's `SwimWalkSpeed`,
     /// `SwimJogSpeed` and `SwimRunSpeed` ([`m2_engine::tuning::SWIM_SPEEDS`]).
     pub swim_speeds: [f32; 3],
+    /// Her template's jump, gravity, turn and paces
+    /// ([`Player::set_motion`]).
+    pub motion: HumanMotion,
+    /// Her turn to face where she goes, and the slide to a stop after a
+    /// run ([`on_foot`]).
+    turn: Turn,
+    run_stop: RunStop,
+    /// The way and speed she moves over the ground, m/s, as the stick's
+    /// ask builds up to it ([`on_foot::steer`]).
+    ground: Vec2,
+    /// The way she last moved (a unit vector), the way a slide to a stop
+    /// carries her.
+    way: Vec2,
+    /// Seconds left of the hold on her stick after she aims in
+    /// ([`on_foot::CROUCH_HOLD`]), and whether she aimed last step.
+    crouch_hold: Option<f32>,
+    was_aiming: bool,
+    /// Playing the slide to a stop's clip ([`crate::held::Moves::run_stop`]).
+    stopping: Option<usize>,
     /// In a jump, until she has landed.
     leap: Leap,
     /// Jump was pressed while she was landing: she jumps again as the
@@ -494,7 +526,10 @@ impl Player {
     /// A player who will drop onto the ground at `(x, z)` once it loads.
     pub fn new(x: f32, z: f32, yaw: f32, model: Option<(GpuModel, Rig)>) -> Self {
         Self {
-            character: Character::new(Vec3::new(x, 0.0, z)),
+            character: Character {
+                gravity: JENNIFER.gravity,
+                ..Character::new(Vec3::new(x, 0.0, z))
+            },
             facing: yaw,
             yaw,
             pitch: -0.2,
@@ -520,6 +555,14 @@ impl Player {
             clips: FightClips::default(),
             speeds: SPEEDS,
             swim_speeds: [SWIM_SPEEDS[0], SWIM_SPEEDS[1], SWIM_SPEEDS[2]],
+            motion: JENNIFER,
+            turn: Turn::default(),
+            run_stop: RunStop::default(),
+            ground: Vec2::ZERO,
+            way: Vec2::Y,
+            stopping: None,
+            crouch_hold: None,
+            was_aiming: false,
             leap: Leap::No,
             jump_queued: false,
             throwing: None,
@@ -538,6 +581,13 @@ impl Player {
             swim: None,
             holstered: false,
         }
+    }
+
+    /// Takes her template's `_HumanPhysics` tuning: her jump, the gravity
+    /// she falls under and how fast she turns.
+    pub fn set_motion(&mut self, motion: HumanMotion) {
+        self.motion = motion;
+        self.character.gravity = motion.gravity;
     }
 
     /// The speeds of a hero whose template gives `theirs` (walk, run,
@@ -634,6 +684,11 @@ impl Player {
     /// carried rifle's arm, an aim, a throw), her aim's turn, a bash and
     /// a jump. Back on foot, `update` takes them up again.
     pub fn off_foot(&mut self) {
+        self.ground = Vec2::ZERO;
+        self.run_stop = RunStop::default();
+        self.stopping = None;
+        self.crouch_hold = None;
+        self.turn = Turn::default();
         self.leap = Leap::No;
         self.jump_queued = false;
         self.throwing = None;
@@ -721,6 +776,8 @@ impl Player {
     pub fn drop_at(&mut self, at: Vec3) {
         self.character.position = at;
         self.character.velocity = Vec3::ZERO;
+        self.ground = Vec2::ZERO;
+        self.run_stop = RunStop::default();
         self.landed = false;
         self.land_from = Some(at);
         self.waited = 0;
@@ -895,29 +952,75 @@ impl Player {
             self.camera(physics);
             return;
         }
-        let speed = self.speeds[pace];
+        // Aimed in she is crouched, at her template's `CrouchWalkSpeed`
+        // (inferred for the player: the 360 picks that pace for the
+        // crouched people; how its player control scales the stick is
+        // untraced).
+        let speed = if self.aiming {
+            self.motion.crouch_walk
+        } else {
+            self.speeds[pace]
+        };
+        if self.aiming && !self.was_aiming {
+            self.crouch_hold = Some(on_foot::CROUCH_HOLD);
+        }
+        self.was_aiming = self.aiming;
+        let held = match self.crouch_hold {
+            Some(t) if t > 0.0 || self.run_stop.sliding.is_some() => {
+                self.crouch_hold = Some(t - dt);
+                true
+            }
+            _ => {
+                self.crouch_hold = None;
+                false
+            }
+        };
         // Bashing or picking a weapon up, she stands.
         let bashing = self.bashing.is_some() || self.picking.is_some();
-        let wanted = if bashing {
-            Vec3::ZERO
+        let asked = if bashing || held {
+            Vec2::ZERO
         } else {
-            direction * speed
+            Vec2::new(direction.x, direction.z) * speed
         };
-        let jump = self.takes_off(intent.jump, bashing).then_some(JUMP);
+        // Her speed builds up to what is asked and drops at once; let go
+        // after a run, she slides to a stop ([`on_foot`]).
+        self.ground = on_foot::steer(self.ground, asked, dt);
+        if self.ground.length_squared() > 1e-8 {
+            self.way = self.ground.normalize();
+        }
+        let (slide, stop) = self.run_stop.step(self.ground.length(), self.speeds[2], dt);
+        let ground = if self.run_stop.sliding.is_some() || stop == StopEvent::Began {
+            self.way * slide
+        } else {
+            self.ground
+        };
+        let wanted = Vec3::new(ground.x, 0.0, ground.y);
+        let jump = self
+            .takes_off(intent.jump, bashing)
+            .then(|| self.motion.jump_speed());
         physics.move_character(&mut self.character, wanted, jump, dt);
 
         // Aiming, throwing or bashing, she turns the camera's way.
-        let heading = if self.aiming || self.throwing.is_some() || bashing {
+        let aimed = self.aiming || self.throwing.is_some() || bashing;
+        let heading = if aimed {
             Some(self.yaw)
         } else {
             (direction.length_squared() > 0.01).then(|| direction.x.atan2(direction.z))
         };
         if let Some(target) = heading {
-            let mut turn = (target - self.facing).rem_euclid(std::f32::consts::TAU);
-            if turn > std::f32::consts::PI {
-                turn -= std::f32::consts::TAU;
-            }
-            self.facing += turn.clamp(-TURN_RATE * dt, TURN_RATE * dt);
+            let accel = if aimed {
+                on_foot::TURN_ACCEL_AIMED
+            } else {
+                on_foot::TURN_ACCEL
+            };
+            let max = if self.character.grounded {
+                self.motion.max_rotation.to_radians()
+            } else {
+                on_foot::AIR_TURN
+            };
+            self.facing = self.turn.step(self.facing, target, accel, max, dt);
+        } else {
+            self.turn = Turn::default();
         }
 
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
@@ -1030,7 +1133,30 @@ impl Player {
                     swap = Some(self.in_hand);
                 }
             }
-            if self.bashing.is_some() || self.picking.is_some() {
+            // The slide to a stop plays `RunStop` over the whole body,
+            // until it ends or she sets off (or jumps) again.
+            match stop {
+                StopEvent::Began => {
+                    if let Some(c) = self.moves.run_stop {
+                        rig.animator.set_upper(None);
+                        rig.animator.play_once(c);
+                        rig.animator.seek(0.0);
+                        eprintln!(
+                            "anim: run stop {:08x} from {slide:.1} m/s",
+                            rig.clips[c].hash
+                        );
+                        self.stopping = Some(c);
+                    } else {
+                        eprintln!("anim: run stop from {slide:.1} m/s (no clip)");
+                    }
+                }
+                StopEvent::Cancelled | StopEvent::Ended => self.stopping = None,
+                StopEvent::None => {}
+            }
+            if leaping {
+                self.stopping = None;
+            }
+            if self.bashing.is_some() || self.picking.is_some() || self.stopping.is_some() {
                 rig.two_handed = false;
             } else if leaping {
                 // The legs jump; the arms keep the weapon as they were
@@ -1115,7 +1241,7 @@ impl Player {
             // slide (within reason: against a wall the legs keep going).
             // Her number for the clips' table rates is 0 (invented: the
             // game's entity handle is not known).
-            let rate = if leaping {
+            let rate = if leaping || self.stopping.is_some() {
                 1.0
             } else {
                 rig.play_rate(gait, moved, 0)
@@ -1463,16 +1589,125 @@ mod tests {
             movement: Vec2::Y,
             ..Intent::default()
         };
-        for _ in 0..60 {
+        // Her speed builds at 7.5 m/s² to her run: 1.67 m in the first
+        // two thirds of a second, then 5 m/s.
+        for _ in 0..120 {
             p.update(&physics, forward, dt);
         }
         let at = p.character.position;
-        assert!((at.x - RUN).abs() < 0.6, "{at}");
+        assert!((at.x - 8.33).abs() < 0.3, "{at}");
+        assert!((p.character.velocity.x - RUN).abs() < 0.05);
         assert!(at.z.abs() < 0.1, "{at}");
         assert!((p.facing - std::f32::consts::FRAC_PI_2).abs() < 1e-3);
         // The camera is behind her and above.
         let eye = p.eye();
         assert!(eye.x < at.x && eye.y > at.y, "{eye}");
+    }
+
+    /// The on-foot measures the animation thread reports before and after
+    /// (`cargo test -p m2-alpha on_foot_measures -- --nocapture`): a
+    /// standing jump's height and time in the air, a half turn, the time
+    /// to her run, and how far she slides letting go after a sprint.
+    #[test]
+    fn on_foot_measures() {
+        let physics = ground();
+        let dt = 1.0 / 60.0;
+        let fresh = || {
+            let mut p = Player::new(0.0, 0.0, 0.0, None);
+            for _ in 0..usize::from(SETTLED) {
+                p.update(&physics, Intent::default(), dt);
+            }
+            assert!(p.landed);
+            for _ in 0..10 {
+                p.update(&physics, Intent::default(), dt);
+            }
+            p
+        };
+        // The jump.
+        let mut p = fresh();
+        let floor = p.character.position.y;
+        let jump = Intent {
+            jump: true,
+            ..Intent::default()
+        };
+        p.update(&physics, jump, dt);
+        let (mut top, mut air) = (0.0f32, dt);
+        while !p.character.grounded && air < 3.0 {
+            p.update(&physics, Intent::default(), dt);
+            top = top.max(p.character.position.y - floor);
+            air += dt;
+        }
+        // A half turn: the camera's yaw stays, she turns to run back.
+        let mut q = fresh();
+        let back = Intent {
+            movement: -Vec2::Y,
+            ..Intent::default()
+        };
+        let mut turn = 0.0;
+        while (q.facing.abs() - std::f32::consts::PI).abs() > 0.02 && turn < 2.0 {
+            q.update(&physics, back, dt);
+            turn += dt;
+        }
+        // To her run, and the slide after a sprint.
+        let mut r = fresh();
+        let run = Intent {
+            movement: Vec2::Y,
+            ..Intent::default()
+        };
+        let mut to_run = 0.0;
+        while r.character.velocity.length() < RUN - 0.05 && to_run < 3.0 {
+            r.update(&physics, run, dt);
+            to_run += dt;
+        }
+        let sprint = Intent {
+            sprint: true,
+            ..run
+        };
+        for _ in 0..90 {
+            r.update(&physics, sprint, dt);
+        }
+        let from = r.character.position;
+        for _ in 0..60 {
+            r.update(&physics, Intent::default(), dt);
+        }
+        let slid = (r.character.position - from).length();
+        // Aiming in from a sprint, stick still forward: she slides into
+        // the crouch, then walks crouched.
+        let mut s = fresh();
+        for _ in 0..150 {
+            s.update(&physics, sprint, dt);
+        }
+        s.aiming = true;
+        let from = s.character.position;
+        let mut slide_time = 0.0;
+        let mut sliding = false;
+        let mut aim_slid = 0.0;
+        for i in 0..60 {
+            s.update(&physics, sprint, dt);
+            if s.run_stop.sliding.is_some() {
+                sliding = true;
+                slide_time = (i + 1) as f32 * dt;
+                aim_slid = (s.character.position - from).length();
+            }
+        }
+        for _ in 0..60 {
+            s.update(&physics, sprint, dt);
+        }
+        let crouched = s.character.velocity.length();
+        eprintln!(
+            "on foot: jump {top:.2} m, {air:.2} s in the air; half turn {turn:.2} s; \
+             to run {to_run:.2} s; slide after a sprint {slid:.2} m; \
+             aim-in from a sprint: slides {aim_slid:.2} m, ends {slide_time:.2} s in, \
+             then {crouched:.2} m/s crouched"
+        );
+        assert!(sliding);
+        assert!((aim_slid - 1.4).abs() < 0.3, "{aim_slid}");
+        assert!((crouched - 1.5).abs() < 0.05, "{crouched}");
+        assert!((top - 1.0).abs() < 0.06, "{top}");
+        assert!((air - 0.70).abs() < 0.05, "{air}");
+        assert!((0.3..0.45).contains(&turn), "{turn}");
+        assert!((to_run - 0.67).abs() < 0.05, "{to_run}");
+        assert!((slid - 1.4).abs() < 0.3, "{slid}");
     }
 
     // Playtest 8: the pad's A that closed the contract's fanfare jumped
