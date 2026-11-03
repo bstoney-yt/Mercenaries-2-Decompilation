@@ -660,10 +660,21 @@ fn standing(p: &Phy2, k: usize, hidden: &[bool]) -> bool {
 /// ([`m2_assets::physics::Shape::is_vehicle_hull`], 0x8216BC08), and
 /// whether they are its hull set.
 pub(crate) fn body_shapes(model: &Model<'_>, p: &Phy2, body: usize) -> (Vec<Vec<Vec3>>, bool) {
+    body_shapes_showing(model, p, body, false)
+}
+
+/// [`body_shapes`] with the model's parts showing as it stands intact, or
+/// `wrecked`.
+pub(crate) fn body_shapes_showing(
+    model: &Model<'_>,
+    p: &Phy2,
+    body: usize,
+    wrecked: bool,
+) -> (Vec<Vec<Vec3>>, bool) {
     let hidden = model
         .states
         .as_ref()
-        .map(|s| s.hidden(&model.nodes, false))
+        .map(|s| s.hidden(&model.nodes, wrecked))
         .unwrap_or_default();
     let mine: Vec<usize> = (0..p.shapes.len())
         .filter(|&k| p.body_of(k) == Some(body) && standing(p, k, &hidden))
@@ -1276,6 +1287,8 @@ pub struct VehicleControls {
 
 struct VehicleBody {
     controller: DynamicRayCastVehicleController,
+    /// The body its wreck collides with ([`VehicleSpec::wreck`]).
+    wreck: Option<crate::vehicle::WreckBody>,
     /// Its own collision is on it for what rides it ([`Physics::add_bed`]).
     bed: bool,
     mass: f32,
@@ -3350,6 +3363,7 @@ impl Physics {
             braking: false,
             handling: spec.tuning.handling.filter(|_| !spec.tracked),
             steering: 0.0,
+            wreck: spec.wreck.clone(),
             wrecked: false,
             car_hull,
             held: false,
@@ -4119,6 +4133,49 @@ impl Physics {
         let Some(body) = self.world.bodies.get_mut(v.controller.chassis) else {
             return;
         };
+        // Its wrecked chassis body, as the 360 rebuilds it once the wreck's
+        // parts show ([`crate::vehicle::WreckBody`]): its shapes, friction
+        // and damping in place of the intact one's, its mass and motion
+        // kept. Flagged: that the rebuild keeps the vehicle's flag for its
+        // hull set, and its template's mass, isn't traced.
+        if let Some(wreck) = v.wreck.clone() {
+            let mass = body.mass_properties().local_mprops;
+            let m = wreck.material;
+            body.set_linear_damping(m.linear_damping);
+            body.set_angular_damping(m.angular_damping);
+            let old: Vec<_> = body.colliders().to_vec();
+            let groups = old
+                .first()
+                .and_then(|&h| self.world.colliders.get(h))
+                .map(|c| c.collision_groups());
+            let chassis = v.controller.chassis;
+            for h in old {
+                self.world.remove_collider(h);
+            }
+            for (i, shape) in wreck
+                .shapes
+                .iter()
+                .filter_map(|v| {
+                    let points: Vec<_> = v.iter().map(|&p| vector(p)).collect();
+                    r::SharedShape::convex_hull(&points)
+                })
+                .enumerate()
+            {
+                let mut c = r::ColliderBuilder::new(shape)
+                    .friction(m.friction)
+                    .friction_combine_rule(r::CoefficientCombineRule::Min);
+                if let Some(g) = groups {
+                    c = c.collision_groups(g);
+                }
+                let c = if i == 0 {
+                    c.mass_properties(mass)
+                } else {
+                    c.density(0.0)
+                };
+                self.world.insert_collider(c, Some(chassis));
+            }
+            return;
+        }
         body.set_linear_damping(WRECK_DAMPING);
         body.set_angular_damping(WRECK_DAMPING);
         // An invented box hull (the first collider; a turret's comes
@@ -5050,6 +5107,7 @@ mod tests {
             shapes: Default::default(),
             material: None,
             turret_shapes: Default::default(),
+            wreck: None,
             tuning: crate::VehicleTuning::default(),
         }
     }

@@ -367,6 +367,25 @@ pub struct VehicleSpec {
     /// of their own, 0x8216B910), their vehicle hull sets, model space
     /// with the turret straight ahead. Empty without them.
     pub turret_shapes: std::sync::Arc<[Vec<Vec3>]>,
+    /// Its wrecked chassis body ([`WRECKED_CHASSIS`]), which the 360 builds
+    /// once the wreck's parts show instead of the intact ones.
+    pub wreck: Option<WreckBody>,
+}
+
+/// The body of a vehicle's wreck: the `PHY2` body on its wrecked chassis
+/// part ([`WRECKED_CHASSIS`]).
+///
+/// From the 360 code: a body's parts are picked by which show
+/// (0x8216B910 takes the last showing part of [`CHASSIS`],
+/// [`WRECKED_CHASSIS`] or 0x765CD254 as its root); rebuilt with other parts
+/// showing, it drops the bodies on parts now hidden, keeping their mass
+/// and linear and angular velocity for what replaces them (0x82184370,
+/// from 0x8216C570).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WreckBody {
+    /// Its shapes, as [`VehicleSpec::shapes`] takes the intact one's.
+    pub shapes: std::sync::Arc<[Vec<Vec3>]>,
+    pub material: crate::physics::BodyMaterial,
 }
 
 /// How a vehicle sits on uneven ground ([`VehicleSpec::rest_on`]).
@@ -391,6 +410,10 @@ pub struct Rest {
 /// shown intact and hidden wrecked, and one on 0x75F1F74D, the other
 /// way about.
 pub const CHASSIS: u32 = 0x255e_ab53;
+
+/// The node hash of a vehicle's wrecked chassis part, shown once it is
+/// wrecked (the other of the two [`CHASSIS`] describes).
+pub const WRECKED_CHASSIS: u32 = 0x75f1_f74d;
 
 /// A vehicle's intact chassis body as its model's `PHY2` record gives
 /// it, in model space.
@@ -431,6 +454,25 @@ fn chassis_shapes(
                 (shapes, hull, material)
             },
         )
+}
+
+/// `model`'s wrecked chassis body ([`WreckBody`]), if it has one with
+/// shapes.
+fn wreck_body(model: &Model<'_>, base: &[u8]) -> Option<WreckBody> {
+    let p = Ucfx::parse(base)
+        .ok()
+        .and_then(|u| u.top_level(*b"PHY2").map(<[u8]>::to_vec))
+        .and_then(|d| m2_assets::physics::Physics::parse(&d).ok())?;
+    let body = p
+        .parts
+        .iter()
+        .find(|q| q.node_hash == WRECKED_CHASSIS && q.body.is_some())?
+        .body?;
+    let (shapes, _) = crate::physics::body_shapes_showing(model, &p, body, true);
+    (!shapes.is_empty()).then(|| WreckBody {
+        shapes: shapes.into(),
+        material: crate::physics::BodyMaterial::of(&p.bodies[body]),
+    })
 }
 
 /// The shapes of `model`'s bodies on its turret's nodes (`turret`, by
@@ -883,6 +925,7 @@ impl VehicleSpec {
             shapes: Default::default(),
             material: None,
             turret_shapes: Default::default(),
+            wreck: None,
             rotors: if flies {
                 vehicle::rotors(model)
                     .into_iter()
@@ -1151,6 +1194,7 @@ impl VehicleSpec {
         let (shapes, hull, material) = chassis_shapes(model, base);
         self.material = material;
         self.turret_shapes = turret_shapes(model, base, &self.turret).into();
+        self.wreck = wreck_body(model, base);
         // Flagged, not traced: a wheeled vehicle without a hull set (the
         // trailers) would drag on its wheels' own shapes, and a
         // motorbike's balance was tuned against the box hull (26 of 33
@@ -1646,6 +1690,7 @@ mod tests {
             shapes: Default::default(),
             material: None,
             turret_shapes: Default::default(),
+            wreck: None,
             tuning: VehicleTuning::default(),
         }
     }
