@@ -1199,7 +1199,10 @@ fn colour_name(word: &str) -> Option<[f32; 3]> {
         "white" => rgb(255, 255, 255),
         "green" => rgb(96, 208, 64),
         "red" => rgb(216, 32, 32),
-        "yellow" => rgb(255, 208, 64),
+        // From footage: Fiona's menu's "NEW!" ([yellow]) shows at about
+        // 234,224,47 where the objectives' FFC800 shows at 225,180,49, so
+        // full red and green, no blue.
+        "yellow" => rgb(255, 255, 0),
         "orange" => rgb(255, 144, 32),
         "blue" => rgb(64, 144, 255),
         "grey" | "gray" => rgb(160, 160, 160),
@@ -3028,6 +3031,8 @@ mod tests {
         assert_eq!(spans[0].colour, yellow);
         assert_eq!((spans[1].text.as_str(), spans[1].colour), (" Go", yellow));
         assert_eq!(s.display_text("[2ndobjt][objverify2] x"), " x");
+        // Fiona's menu's "NEW!": the footage's full yellow.
+        assert_eq!(s.spans("[yellow]NEW!")[0].colour, Some([1.0, 1.0, 0.0]));
         // A contract's faction, its flag.
         let spans = s.spans("Faction: [flagpmc] PMC");
         assert_eq!(
