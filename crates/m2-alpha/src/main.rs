@@ -3884,6 +3884,9 @@ fn mission_for_screenshot(
     let mut offered_actions: Vec<u32> = Vec::new();
     let mut delivery_key: Vec<(u32, usize, usize)> = Vec::new();
     let mut contract_done: Option<u32> = None;
+    // The latest contract done: the tick and how many were then (for
+    // `--late-shots`).
+    let mut last_done: Option<(u32, u32)> = None;
     // With --contracts N, she plays on through the later contracts: the
     // tick the Nth was done, and how many have been.
     let mut play_done: Option<u32> = None;
@@ -4693,8 +4696,8 @@ fn mission_for_screenshot(
             }
             let _ = hud.build(input, &info, settings);
             // `--late-shots`: the scene and the HUD at those seconds after
-            // the contract was done (its fanfare, the screens after).
-            if let Some(done) = contract_done {
+            // each contract was done (its fanfare, the screens after).
+            if let Some((done, n)) = last_done {
                 let since = (i - done) as f32 * tick;
                 for &s in options
                     .late_shots
@@ -4702,9 +4705,9 @@ fn mission_for_screenshot(
                     .filter(|&&s| since >= s && since - tick < s)
                 {
                     render(backend, game, fov, aspect, Some(hud))?;
-                    let path = out.with_file_name(format!("{stem}-late{s}.ppm"));
+                    let path = out.with_file_name(format!("{stem}-c{n}-late{s}.ppm"));
                     write_ppm(backend, &path)?;
-                    eprintln!("late-shot: {s} s after the contract: {}", path.display());
+                    eprintln!("late-shot: {s} s after contract {n}: {}", path.display());
                 }
             }
             // `--dialog-shots`: the box as the game's HUD draws it over the
@@ -5161,6 +5164,7 @@ fn mission_for_screenshot(
                     .unwrap_or_default()
             );
             contract_done.get_or_insert(i);
+            last_done = Some((i, contracts_seen));
             // She stops playing once the last asked for is done; the
             // scripts go on (--after-contract).
             if contracts_seen >= options.contracts.max(1) {
