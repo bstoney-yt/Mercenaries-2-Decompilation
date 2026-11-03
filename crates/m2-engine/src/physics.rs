@@ -2177,7 +2177,10 @@ fn driven_rpm(
 /// springs push it straight up, so it stands and drives as on the flat,
 /// and only nearing its steepest does the ground's lean push it down
 /// the hill. Rapier has pushed along the contact normal; this takes the
-/// share back at the same point.
+/// share back at the same point, then moves what is left to the spring's
+/// top, where the 360 code pushes (0x8219F510 to 0x8219C27C): a leaning
+/// wheel's push turns its vehicle by how far its spring's top is off the
+/// centre of mass, not its contact.
 fn stand(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
     let Some(tyres) = v.tyres else {
         return;
@@ -2207,8 +2210,14 @@ fn stand(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
             continue;
         }
         let push = w.wheel_suspension_force.min(w.max_suspension_force) * dt;
-        let level = vec3(ray.contact_normal_ws).with_y(0.0) * push * v.footing;
+        let normal = vec3(ray.contact_normal_ws);
+        let level = normal.with_y(0.0) * push * v.footing;
         body.apply_impulse_at_point(vector(-level), ray.contact_point_ws, true);
+        // The 360 code pushes at the spring's top, not its contact
+        // (0x8219F510 hands 0x8219C27C the push and the wheel's +0x48,
+        // its hardpoint in the world): what moving it there turns.
+        let arm = vec3(ray.hard_point_ws) - vec3(ray.contact_point_ws);
+        body.apply_torque_impulse(vector(arm.cross(normal * push - level)), true);
     }
 }
 
@@ -5286,11 +5295,13 @@ mod tests {
             "turned left"
         );
         assert!(m.transform_vector3(Vec3::X).y < -0.1, "leans left");
-        // About 45 degrees over at most (the island's bikes up to 45 at
-        // full lock, biketest; 46 here since the 360's tyres push its
-        // axles low, round 3 of the driving model).
+        // Under 43 degrees over a second into the turn (41.5; 45.5 when
+        // its springs pushed at their contacts): its springs push at their
+        // tops, as the 360's do ([`stand`]), so the turn pulls it less far
+        // past the lean its balance asks (the island's bikes within 11
+        // degrees of it at full lock, biketest; up to 28 past before).
         let up = m.transform_vector3(Vec3::Y).y;
-        assert!(up > 0.68, "still up: {up}");
+        assert!(up > 0.73, "still up: {up}");
     }
 
     /// The Offroad Motorcycle (AL)'s `Bike*` fields, the weakest.
