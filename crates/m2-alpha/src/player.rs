@@ -373,6 +373,10 @@ pub struct Player {
     /// Aiming on the move: whether her legs walk forwards or backwards
     /// ([`on_foot::AimLegs`]).
     aim_legs: AimLegs,
+    /// Standing aimed: a shuffle round under way, and the camera's yaw
+    /// last step (how fast the aim turns).
+    shuffle: Option<on_foot::Shuffle>,
+    last_yaw: f32,
     /// Playing the slide to a stop's clip ([`crate::held::Moves::run_stop`]).
     stopping: Option<usize>,
     /// In a jump, until she has landed.
@@ -567,6 +571,8 @@ impl Player {
             crouch_hold: None,
             was_aiming: false,
             aim_legs: AimLegs::Still,
+            shuffle: None,
+            last_yaw: yaw,
             leap: Leap::No,
             jump_queued: false,
             throwing: None,
@@ -1016,6 +1022,17 @@ impl Player {
         } else {
             AimLegs::Still
         };
+        let shuffles = self
+            .moves
+            .of(self.shown.class)
+            .map_or([None, None], |h| h.shuffle);
+        let mut aim_rate = (self.yaw - self.last_yaw).rem_euclid(std::f32::consts::TAU);
+        if aim_rate > std::f32::consts::PI {
+            aim_rate -= std::f32::consts::TAU;
+        }
+        let aim_rate = aim_rate / dt.max(1e-4);
+        self.last_yaw = self.yaw;
+        let mut shuffling: Option<(usize, f32, bool)> = None;
         let legs = match (self.aim_legs, moving) {
             (AimLegs::Forward | AimLegs::Backward, Some(m)) => Some(self.aim_legs.facing(m)),
             _ => None,
@@ -1028,10 +1045,43 @@ impl Player {
             let step = on_foot::LEG_SWING * dt;
             self.facing += d.clamp(-step, step);
             self.turn = Turn::default();
+            self.shuffle = None;
+            None
+        } else if self.aiming
+            && self.throwing.is_none()
+            && !bashing
+            && shuffles.iter().any(Option::is_some)
+        {
+            // Standing aimed, her feet stay put while her upper body takes
+            // the aim, until it is past 60 degrees from them: then she
+            // shuffles round ([`on_foot::Shuffle`]).
+            if self.shuffle.is_none() {
+                self.shuffle = on_foot::Shuffle::start(self.facing, self.yaw)
+                    .filter(|s| shuffles[usize::from(!s.left)].is_some());
+            }
+            if let Some(s) = &mut self.shuffle {
+                let fresh = s.time == 0.0;
+                let c = shuffles[usize::from(!s.left)].unwrap_or_default();
+                let length = self
+                    .model
+                    .as_ref()
+                    .and_then(|(_, r)| r.clips.get(c))
+                    .map_or(0.5, |k| k.info.duration);
+                match s.step(length, aim_rate, dt) {
+                    Some((by, play)) => {
+                        self.facing += by;
+                        shuffling = Some((c, play, fresh));
+                    }
+                    None => self.shuffle = None,
+                }
+            }
+            self.turn = Turn::default();
             None
         } else if aimed {
+            self.shuffle = None;
             Some(self.yaw)
         } else {
+            self.shuffle = None;
             (direction.length_squared() > 0.01).then(|| direction.x.atan2(direction.z))
         };
         if let Some(target) = heading {
@@ -1196,6 +1246,15 @@ impl Player {
             }
             if self.bashing.is_some() || self.picking.is_some() || self.stopping.is_some() {
                 rig.two_handed = false;
+            } else if let Some((c, _, fresh)) = shuffling {
+                // The shuffle round plays whole, the rifle aimed.
+                rig.animator.set_upper(None);
+                if fresh {
+                    rig.animator.play_once(c);
+                    rig.animator.seek(0.0);
+                    eprintln!("anim: aimed shuffle {:08x}", rig.clips[c].hash);
+                }
+                rig.two_handed = rig.barrel;
             } else if leaping {
                 // The legs jump; the arms keep the weapon as they were
                 // (the jump's own arms fly out).
@@ -1287,7 +1346,9 @@ impl Player {
             // slide (within reason: against a wall the legs keep going).
             // Her number for the clips' table rates is 0 (invented: the
             // game's entity handle is not known).
-            let rate = if leaping || self.stopping.is_some() {
+            let rate = if let Some((_, play, _)) = shuffling {
+                play
+            } else if leaping || self.stopping.is_some() {
                 1.0
             } else {
                 match crouched.map(|c| rig.clips[c].info.speed) {

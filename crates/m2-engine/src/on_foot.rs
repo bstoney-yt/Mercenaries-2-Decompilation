@@ -489,3 +489,85 @@ mod aim_tests {
         assert!((b.facing(0.5) - (0.5 - std::f32::consts::PI)).abs() < 1e-5);
     }
 }
+
+/// Standing aimed, how far the aim may get from the way her feet point
+/// before she shuffles round, radians (60 degrees, the constants at
+/// 0x82070290 and 0x8205F1CC in the standing locomotion, 0x82809D60).
+pub const SHUFFLE_AT: f32 = std::f32::consts::FRAC_PI_3;
+/// How far a shuffle to the left and to the right turns her feet over
+/// its clip, radians (110 and 90 degrees: 0x82070298 and 0x820F8D08,
+/// scaled to radians by the static initialisers at 0x82A2A380 and
+/// 0x82A2A3A0).
+pub const SHUFFLE_LEFT: f32 = 110.0 * std::f32::consts::PI / 180.0;
+pub const SHUFFLE_RIGHT: f32 = std::f32::consts::FRAC_PI_2;
+/// Swinging the aim round faster than the shuffle turns, the feet turn at
+/// this much of the aim's rate instead (0x82B4DB14).
+pub const SHUFFLE_CATCH_UP: f32 = 1.1;
+
+/// A shuffle under way: which way, and seconds into its clip.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shuffle {
+    pub left: bool,
+    pub time: f32,
+}
+
+impl Shuffle {
+    /// Starts one when the feet (`feet`) are further than [`SHUFFLE_AT`]
+    /// from the aim (`aim`), both headings: to the left when the aim is to
+    /// their left.
+    pub fn start(feet: f32, aim: f32) -> Option<Self> {
+        let off = wrap(feet - aim);
+        (off.abs() > SHUFFLE_AT).then_some(Self {
+            left: off < 0.0,
+            time: 0.0,
+        })
+    }
+
+    /// Steps on `dt` seconds of a clip `length` seconds long with the aim
+    /// turning at `aim_rate` rad/s: the feet's turn this step (radians,
+    /// positive to the left) and the clip's play rate, or `None` once the
+    /// clip has played out (0x82809D60, states 1 and 2).
+    pub fn step(&mut self, length: f32, aim_rate: f32, dt: f32) -> Option<(f32, f32)> {
+        if self.time >= length {
+            return None;
+        }
+        let base = if self.left {
+            SHUFFLE_LEFT
+        } else {
+            SHUFFLE_RIGHT
+        } / length.max(1e-4);
+        let rate = if aim_rate.abs() > base {
+            aim_rate.abs() * SHUFFLE_CATCH_UP
+        } else {
+            base
+        };
+        let play = rate / base;
+        self.time += dt * play;
+        let sign = if self.left { 1.0 } else { -1.0 };
+        Some((sign * rate * dt, play))
+    }
+}
+
+#[cfg(test)]
+mod shuffle_tests {
+    use super::*;
+
+    #[test]
+    fn standing_aimed_her_feet_stay_until_sixty_degrees_then_shuffle() {
+        assert_eq!(Shuffle::start(0.0, 0.9), None);
+        let s = Shuffle::start(0.0, 1.2).unwrap();
+        assert!(s.left);
+        assert!(!Shuffle::start(0.0, -1.2).unwrap().left);
+        // A 0.5 s clip turns her 110 degrees left over its length.
+        let mut s = s;
+        let mut turned = 0.0;
+        while let Some((d, _)) = s.step(0.5, 0.0, 1.0 / 60.0) {
+            turned += d;
+        }
+        assert!(
+            (turned.to_degrees() - 110.0).abs() < 4.0,
+            "{}",
+            turned.to_degrees()
+        );
+    }
+}
