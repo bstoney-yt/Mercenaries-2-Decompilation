@@ -4112,9 +4112,9 @@ impl Physics {
             .is_some_and(|v| v.braking && !v.wrecked)
     }
 
-    /// Makes a vehicle a wreck: burst tyres and bent axles no longer carry
-    /// it, so it drops onto its rims and belly and scrapes to a stop
-    /// instead of rolling on.
+    /// Makes a vehicle a wreck: its wheels no longer carry it (the 360
+    /// sets a dead vehicle up without its wheel action), so it drops onto
+    /// its wrecked chassis and slides to a stop instead of rolling on.
     pub fn wreck_vehicle(&mut self, id: VehicleId) {
         let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
             return;
@@ -4136,8 +4136,15 @@ impl Physics {
         // Its wrecked chassis body, as the 360 rebuilds it once the wreck's
         // parts show ([`crate::vehicle::WreckBody`]): its shapes, friction
         // and damping in place of the intact one's, its mass and motion
-        // kept. Flagged: that the rebuild keeps the vehicle's flag for its
-        // hull set, and its template's mass, isn't traced.
+        // kept. From the 360 code: a kill queues the object (0x82182CE8)
+        // for its physics to be rebuilt (0x82152780: bodies on hidden parts
+        // dropped, 0x82184370, then set up again, 0x821831B0); an object
+        // whose health (its record's +4) is under 0.01 is set up reduced
+        // (+0x15): one body, its showing chassis part's (0x8216C570), and
+        // no wheel action (0x821897F8 drops it, 0x82185240). Its set-up
+        // still asks for the hull set and gives it the template's mass
+        // (0x82182848). So its turret's bodies go and its wheels stop
+        // carrying it.
         if let Some(wreck) = v.wreck.clone() {
             let mass = body.mass_properties().local_mprops;
             let m = wreck.material;
