@@ -275,6 +275,59 @@ impl Start {
 /// The turn's build-up while getting going, rad/s² (0x82DE8874).
 pub const TURN_ACCEL_STARTING: f32 = 10.0;
 
+/// How fast the speed of a person with an `Ai` component builds towards
+/// what they ask, m/s² (0x82DE87F8): the people, not the player (the
+/// object's +0x418 is set from the AI personality record, table
+/// 0x83653598; see [`SWING`]).
+pub const MOVE_ACCEL: f32 = 7.5;
+/// How fast it drops, m/s² (0x82DE87FC): at once, in practice.
+pub const MOVE_DECEL: f32 = 1000.0;
+/// Asked to go further round than this from the way they move (the
+/// cosine, 0x82DE880C: 150 degrees) at over [`REVERSE_MIN`] m/s, they stop
+/// first.
+const REVERSE_COS: f32 = -0.866;
+const REVERSE_MIN: f32 = 0.5;
+/// Above this speed, m/s (0x82DE8804), the way they move swings round to
+/// the asked one at no more than [`SWING`] rad/s; at or below it, at once.
+const SWING_MIN: f32 = 1.75;
+/// 180 degrees a second (0x82DE8800 = 180 x pi/180, set by the static
+/// initialiser at 0x829064C8).
+const AI_SWING: f32 = std::f32::consts::PI;
+
+/// The velocity on the ground of a person with an `Ai` component after
+/// `dt` seconds from `current` (m/s, horizontal) when they ask for
+/// `wanted`: that branch of 0x8217BDE0 (the player takes [`swing`] and
+/// [`pace`] instead). Speed builds at [`MOVE_ACCEL`] and drops at
+/// [`MOVE_DECEL`]; the people's run stop lasts 0.4 s (0x82DE8850).
+pub fn steer(current: Vec2, wanted: Vec2, dt: f32) -> Vec2 {
+    let (have, want) = (current.length(), wanted.length());
+    let heading = |v: Vec2| v.x.atan2(v.y);
+    let reversing =
+        have > 1e-4 && want > REVERSE_MIN && current.dot(wanted) / (have * want) < REVERSE_COS;
+    let mut way = heading(current);
+    let speed = if reversing {
+        (have - MOVE_DECEL * dt).max(0.0)
+    } else {
+        let s = if have > want {
+            (have - MOVE_DECEL * dt).max(want)
+        } else {
+            (have + MOVE_ACCEL * dt).min(want)
+        };
+        if want > 1e-4 {
+            way = heading(wanted);
+            if have > SWING_MIN {
+                let d = wrap(heading(wanted) - heading(current));
+                way = wrap(heading(current) + d.clamp(-AI_SWING * dt, AI_SWING * dt));
+            }
+        }
+        s
+    };
+    if have <= 1e-4 && want <= 1e-4 {
+        return Vec2::ZERO;
+    }
+    Vec2::new(way.sin(), way.cos()) * speed
+}
+
 /// Aiming in, a player drops into the `Crouched` stance (the pad's aim
 /// button, bit 0x20000, sends the `Crouch` action and the low-mode
 /// message from the player control at 0x824333E0; the camera record's
@@ -698,5 +751,27 @@ mod shuffle_tests {
             "{}",
             turned.to_degrees()
         );
+    }
+}
+
+#[cfg(test)]
+mod people_tests {
+    use super::*;
+
+    #[test]
+    fn the_peoples_speed_builds_slowly_and_drops_at_once() {
+        let dt = 1.0 / 60.0;
+        let mut v = Vec2::ZERO;
+        let want = Vec2::new(0.0, 5.0);
+        let mut steps = 0;
+        while v.length() < 4.999 {
+            v = steer(v, want, dt);
+            steps += 1;
+        }
+        // 5 m/s at 7.5 m/s²: two thirds of a second.
+        assert!((steps as f32 * dt - 0.667).abs() < 0.02, "{steps}");
+        assert_eq!(steer(v, Vec2::ZERO, dt), Vec2::ZERO);
+        // Asked straight back, they stop before going the other way.
+        assert_eq!(steer(v, -want, dt).length(), 0.0);
     }
 }
