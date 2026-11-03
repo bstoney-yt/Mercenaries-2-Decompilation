@@ -587,6 +587,36 @@ pub fn exit_kind(
     }
 }
 
+/// The turns, from the vehicle's heading, of the eight places the clear
+/// point search tries in order (0x8239F440's table at 0x82DE88B8): front
+/// corners, back corners, the sides, behind, ahead.
+pub const CLEAR_TURNS: [f32; 8] = [
+    std::f32::consts::FRAC_PI_4,
+    -std::f32::consts::FRAC_PI_4,
+    3.0 * std::f32::consts::FRAC_PI_4,
+    -3.0 * std::f32::consts::FRAC_PI_4,
+    std::f32::consts::FRAC_PI_2,
+    -std::f32::consts::FRAC_PI_2,
+    std::f32::consts::PI,
+    0.0,
+];
+/// How far past the vehicle's bounding radius the clear point search
+/// looks, metres (0x82B7C10C).
+pub const CLEAR_PAD: f32 = 1.5;
+
+/// The places the clear point search (0x8239F440, from 0x822A13D0) tries
+/// for her, in order, flat: out from the middle of the vehicle's box
+/// `centre` by its bounding `radius` plus [`CLEAR_PAD`], turned
+/// [`CLEAR_TURNS`] from its heading `yaw` (radians about up, 0 along +z).
+/// The first where she fits is taken. That a turn is measured the way
+/// `yaw` is (towards +x) is inferred.
+pub fn clear_points(centre: Vec3, yaw: f32, radius: f32) -> [Vec3; 8] {
+    CLEAR_TURNS.map(|turn| {
+        let a = yaw + turn;
+        centre + Vec3::new(a.sin(), 0.0, a.cos()) * (radius + CLEAR_PAD)
+    })
+}
+
 /// Her speed as she ditches out (0x822A1B70): 2 m/s along the vehicle's
 /// way of travel, 1.5 up and 1.5 out through the exit (`out`, from the
 /// vehicle towards her).
@@ -1086,6 +1116,17 @@ mod tests {
             seat_for_entrance(&barred, e("entrance_driver"), |_| false),
             None
         );
+    }
+
+    #[test]
+    fn the_clear_point_search_tries_the_front_corners_first() {
+        let p = clear_points(Vec3::new(10.0, 1.0, 0.0), 0.0, 2.5);
+        // 4 m out: front corners, back corners, sides, behind, ahead.
+        let d = 4.0 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(p[0].abs_diff_eq(Vec3::new(10.0 + d, 1.0, d), 1e-5));
+        assert!(p[1].abs_diff_eq(Vec3::new(10.0 - d, 1.0, d), 1e-5));
+        assert!(p[6].abs_diff_eq(Vec3::new(10.0, 1.0, -4.0), 1e-4));
+        assert!(p[7].abs_diff_eq(Vec3::new(10.0, 1.0, 4.0), 1e-5));
     }
 
     #[test]
