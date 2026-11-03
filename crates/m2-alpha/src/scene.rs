@@ -1064,6 +1064,9 @@ pub struct ParkedVehicle {
     /// hatch thrown open) and those under them, model space, over its
     /// posed nodes ([`crate::hijack::Hijacks::place`]).
     pub hijack_nodes: Vec<(usize, Mat4)>,
+    /// Its doors swung open ([`m2_engine::vehicle_door`]): node name hash,
+    /// axis and angle, radians.
+    pub door_turns: Vec<(u32, Vec3, f32)>,
     /// How far its gun is raised, radians (down is negative).
     pub gun: f32,
     /// How far each of its [`aimers`](m2_engine::VehicleSpec::aimers) is
@@ -2495,6 +2498,7 @@ impl Scene {
                 crew: Vec::new(),
                 turret: 0.0,
                 hijack_nodes: Vec::new(),
+                door_turns: Vec::new(),
                 gun: 0.0,
                 aims: Vec::new(),
                 rolled: 0.0,
@@ -2528,6 +2532,7 @@ impl Scene {
                     crew,
                     turret: 0.0,
                     hijack_nodes: Vec::new(),
+                    door_turns: Vec::new(),
                     gun: 0.0,
                     aims: Vec::new(),
                     rolled: 0.0,
@@ -2550,6 +2555,7 @@ impl Scene {
                     crew,
                     turret: 0.0,
                     hijack_nodes: Vec::new(),
+                    door_turns: Vec::new(),
                     gun: 0.0,
                     aims: Vec::new(),
                     rolled: 0.0,
@@ -2903,6 +2909,7 @@ impl Scene {
                     v.spec
                         .tilt_parts(&mut nodes, m2_engine::osprey::tilt_at(speed));
                 }
+                v.spec.swing_doors(&mut nodes, &v.door_turns);
                 for &(i, m) in &v.hijack_nodes {
                     if let Some(n) = nodes.get_mut(i) {
                         *n = m;

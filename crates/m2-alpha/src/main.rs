@@ -44,6 +44,7 @@ mod aim;
 mod android;
 mod autoplay;
 mod binoculars;
+mod boarding;
 mod breakables;
 mod cache;
 mod camera;
@@ -5888,6 +5889,11 @@ fn drive_for_screenshot(
         return Ok(());
     }
     if options.board {
+        if options.seated
+            && let Some(install) = install
+        {
+            return board_animated(backend, game, fov, aspect, options, install);
+        }
         return board_for_check(game, options, tick);
     }
     if options.swim_check {
@@ -6305,6 +6311,120 @@ fn drive_for_screenshot(
 /// The game's log lines (`enter:`, `exit:`) say which entrance, seat and
 /// exit the rules chose.
 fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Result<()> {
+    let Some((i, at)) = board_stand(game, options, tick) else {
+        return Ok(());
+    };
+    board_pressed(game, options, tick, i, at)
+}
+
+/// `--board --seated`: as `--board`, with the clips of her getting in and
+/// out played ([`boarding`]): pictures every quarter second while she
+/// gets in, seated, and while she gets out (`<stem>-in-NN.ppm`,
+/// `<stem>-out-NN.ppm`), and the door's angle and her place logged.
+fn board_animated(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    options: &Options,
+    install: &Install,
+) -> anyhow::Result<()> {
+    let tick = TICK.as_secs_f32();
+    let mut h = hijack::Hijacks::start(install, None);
+    let mut input = Input::default();
+    let waited = Instant::now();
+    while h.loading() && waited.elapsed() < Duration::from_secs(120) {
+        h.tick(game, &mut input, tick);
+        game.step(Intent::default(), tick);
+    }
+    let Some((i, at)) = board_stand(game, options, tick) else {
+        return Ok(());
+    };
+    let stem = options
+        .screenshot
+        .as_ref()
+        .and_then(|o| o.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
+        .unwrap_or_else(|| "board".to_owned());
+    let shoot = |backend: &mut WgpuBackend, game: &mut Game, name: String| -> anyhow::Result<()> {
+        let Some(out) = &options.screenshot else {
+            return Ok(());
+        };
+        render(backend, game, fov, aspect, None)?;
+        write_ppm(backend, &out.with_file_name(format!("{stem}-{name}.ppm")))
+    };
+    let log = |game: &Game, t: f32, phase: &str| {
+        let v = &game.scene.vehicles[i];
+        let her = game
+            .scene
+            .player
+            .as_ref()
+            .map(|p| at.inverse().transform_point3(p.character.position));
+        let clip = game
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.model.as_ref())
+            .and_then(|(_, r)| r.animator.current().map(|(c, ct)| (r.clips[c].hash, ct)));
+        eprintln!(
+            "board: {phase} t={t:.2} step {:?} her local {:.2?} clip {clip:08x?} doors {:?}",
+            game.boarding.as_ref().and_then(|b| b.step),
+            her.map(|h| h.to_array()),
+            v.door_turns
+                .iter()
+                .map(|d| (d.0, (d.2.to_degrees() * 10.0).round() / 10.0))
+                .collect::<Vec<_>>()
+        );
+    };
+    let use_key = Intent {
+        use_pressed: true,
+        ..Intent::default()
+    };
+    for (phase, press) in [("in", true), ("seated", false), ("out", true)] {
+        if press {
+            game.step(use_key, tick);
+        }
+        let mut t = 0.0;
+        let mut shots = 0;
+        let mut was_driving = true;
+        // Until the boarding ends (and the door shuts), at most 6 s; a
+        // second seated.
+        while t < 6.0 {
+            h.tick(game, &mut input, tick);
+            game.step(Intent::default(), tick);
+            h.seat(game, tick);
+            t += tick;
+            if t >= 0.25 * shots as f32 {
+                log(game, t, phase);
+                if phase != "seated" {
+                    shoot(backend, game, format!("{phase}-{shots:02}"))?;
+                }
+                shots += 1;
+            }
+            let driving = game.scene.player.as_ref().and_then(|p| p.driving).is_some();
+            if was_driving && !driving {
+                eprintln!("board: out after {t:.2} s");
+            }
+            was_driving = driving;
+            let done = game.boarding.is_none() && game.scene.vehicles[i].door_turns.is_empty();
+            if (phase == "seated" && t >= 1.0) || (phase != "seated" && done && t > 0.3) {
+                break;
+            }
+        }
+        log(game, t, phase);
+        eprintln!("board: {phase} took {t:.2} s");
+    }
+    shoot(backend, game, "end".to_owned())?;
+    Ok(())
+}
+
+/// `--board`'s start: the parked vehicle nearest (of `--vehicle`'s), her
+/// put 0.6 m out from its entrance (`--entrance`, else the front right
+/// door), looking at it, landed; the vehicle and where it stands.
+fn board_stand(
+    game: &mut Game,
+    options: &Options,
+    tick: f32,
+) -> Option<(usize, m2_math::glam::Mat4)> {
     use m2_math::glam::Vec3;
     let want = options.vehicle.as_deref().unwrap_or("");
     let here = game.focus();
@@ -6323,20 +6443,17 @@ fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Res
         .min_by(|a, b| a.2.total_cmp(&b.2));
     let Some((i, at, _)) = pick else {
         eprintln!("board: no parked vehicle with entrance data");
-        return Ok(());
+        return None;
     };
     let spec = &game.scene.vehicles[i].spec;
     let right = options
         .entrance
         .unwrap_or_else(|| m2_assets::name_hash("entrance_front_right"));
-    let Some(&(e, local)) = spec
+    let &(e, local) = spec
         .entrances
         .iter()
         .find(|(e, _)| e.name == right)
-        .or(spec.entrances.first())
-    else {
-        return Ok(());
-    };
+        .or(spec.entrances.first())?;
     let label = spec.label.clone();
     for s in spec.seating.iter().flat_map(|s| s.seats.iter()) {
         eprintln!(
@@ -6381,6 +6498,18 @@ fn board_for_check(game: &mut Game, options: &Options, tick: f32) -> anyhow::Res
         }
         game.step(Intent::default(), tick);
     }
+    Some((i, at))
+}
+
+/// `--board` once she stands at the entrance: the use key, what her seat
+/// lets her do, and the use key again.
+fn board_pressed(
+    game: &mut Game,
+    options: &Options,
+    tick: f32,
+    i: usize,
+    at: m2_math::glam::Mat4,
+) -> anyhow::Result<()> {
     let marks = game.hud_info(None).entrance_markers;
     eprintln!(
         "board: {} entrance markers: {:?}",

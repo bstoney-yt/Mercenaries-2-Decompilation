@@ -65,6 +65,7 @@ use m2_assets::animation::{ANIMATION_TYPE, Clip};
 use m2_assets::animation_table;
 use m2_engine::Install;
 use m2_engine::hijack::HijackEntrance;
+use m2_engine::vehicle_door::{Door, Step, Swing};
 use m2_game::api::Command;
 use m2_game::hijack::{ClipTimes, HijackCommand, Minigame};
 use m2_game::mission::{GameData, Mission};
@@ -337,6 +338,11 @@ pub struct Hijacks {
     /// The latest riders' tally, and the last one written to the log.
     pub riders: RiderTally,
     told_riders: RiderTally,
+    /// Vehicles' doors swinging or standing open, by the vehicle (index)
+    /// and the door's `Name` ([`m2_engine::vehicle_door`]).
+    doors: HashMap<(usize, u32), (Door, Swing)>,
+    /// Clips' door events (seconds in, open or shut), by clip hash.
+    door_events: HashMap<u32, Vec<(f32, bool)>>,
 }
 
 /// Riders are drawn in vehicles this near her, metres (as far as people
@@ -396,6 +402,9 @@ struct Seat {
     /// scripts' showing or hiding her goes over it
     /// ([`Hijacks::scripts_shown`]).
     shown: bool,
+    /// The vehicle's `VehicleAnimationSet` class and name, which pick its
+    /// clips in the tables.
+    set: (u32, u32),
 }
 
 impl Hijacks {
@@ -435,6 +444,8 @@ impl Hijacks {
             prop_looks: HashMap::new(),
             riders: RiderTally::default(),
             told_riders: RiderTally::default(),
+            doors: HashMap::new(),
+            door_events: HashMap::new(),
             active: None,
         }
     }
@@ -1285,6 +1296,7 @@ impl Hijacks {
         dress(game, &mut self.dressed, &loaded.clips);
         self.seat_riders(game, dt);
         self.seat_prop_riders(game, dt);
+        self.swing_doors(game, dt);
         let State::Ready(loaded) = &self.state else {
             return;
         };
@@ -1324,6 +1336,30 @@ impl Hijacks {
             }
             self.seats.insert(key.clone(), seat);
         }
+        // In another seat than the driver's (the use key put her in a
+        // passenger's or gunner's), that seat's own link, hardpoint and
+        // clip, as a rider's.
+        let ride = game
+            .ride
+            .filter(|r| r.0 == i)
+            .map(|r| r.1)
+            .filter(|&s| s != m2_assets::name_hash("seat_driver"));
+        let her_seat = match ride {
+            Some(s) => {
+                let k = (key.0, key.1.clone(), s);
+                if !self.rider_seats.contains_key(&k) {
+                    let seat = find_seat(game, &mut self.points, &loaded.clips, i, Some(s));
+                    eprintln!("seat: she sits in {s:08x} of {}: {seat:?}", key.1);
+                    self.rider_seats.insert(k.clone(), seat);
+                }
+                self.rider_seats[&k]
+            }
+            None => self.seats[&key],
+        };
+        // Getting in or out by the clips.
+        if game.boarding.as_ref().is_some_and(|b| b.vehicle == i) && self.board(game, i, dt) {
+            return;
+        }
         // What she did on foot stops (Player::update, which would end it,
         // doesn't run while she drives).
         if let Some(p) = &mut game.scene.player {
@@ -1333,7 +1369,7 @@ impl Hijacks {
         // left her, else as the vehicle's entrance has it (a DriverHatch:
         // inside).
         let shown = |s: &Seat| self.scripts_shown.get(&key).copied().unwrap_or(s.shown);
-        let seated = self.seats[&key].filter(shown).and_then(|seat| {
+        let seated = her_seat.filter(shown).and_then(|seat| {
             let index = bind(game, seat.clip)?;
             let scene = &mut game.scene;
             let world = scene.world.as_ref()?;
@@ -1363,6 +1399,327 @@ impl Hijacks {
                 p.seat_frame = None;
             }
         }
+    }
+
+    /// Runs the doors swinging on every vehicle and poses their nodes
+    /// ([`ParkedVehicle::door_turns`]); a door swung shut is let go.
+    ///
+    /// [`ParkedVehicle::door_turns`]: crate::scene::ParkedVehicle::door_turns
+    fn swing_doors(&mut self, game: &mut Game, dt: f32) {
+        let vehicles = &mut game.scene.vehicles;
+        let mut touched: Vec<usize> = self.doors.keys().map(|k| k.0).collect();
+        touched.sort_unstable();
+        touched.dedup();
+        for &i in &touched {
+            if let Some(v) = vehicles.get_mut(i) {
+                v.door_turns.clear();
+            }
+        }
+        self.doors.retain(|&(i, name), (door, swing)| {
+            let was = swing.phase;
+            swing.tick(door, dt);
+            if swing.phase != was {
+                eprintln!(
+                    "door: {name:08x} of vehicle {i} is {:?} ({:.0} degrees)",
+                    swing.phase,
+                    swing.angle(door).to_degrees()
+                );
+            }
+            let Some(v) = vehicles.get_mut(i) else {
+                return false;
+            };
+            if !swing.is_shut() {
+                v.door_turns.push((door.bone, door.axis, swing.angle(door)));
+            }
+            !swing.is_shut()
+        });
+    }
+
+    /// The door her boarding's entrance opens, if the vehicle has it and
+    /// it is still on: its record and how it stands.
+    fn boarding_door(&self, game: &Game, b: &crate::boarding::Boarding) -> Option<(Door, Swing)> {
+        let v = game.scene.vehicles.get(b.vehicle)?;
+        let seating = v.spec.seating.as_deref()?;
+        let name = seating.entrance(b.entrance?)?.params.door?;
+        let door = *seating.doors.iter().find(|d| d.name == name)?;
+        // Thrown off (its node no longer shown): no door to open.
+        let node = v.spec.node_names.iter().position(|&n| n == door.bone);
+        if let (Some(p), Some(dm), Some(n)) = (&v.parts, v.spec.damage.as_deref(), node)
+            && p.hidden(dm).get(n).copied().unwrap_or(false)
+        {
+            return None;
+        }
+        let swing = self
+            .doors
+            .get(&(b.vehicle, name))
+            .map_or_else(|| Swing::new(&door), |d| d.1);
+        Some((door, swing))
+    }
+
+    /// Plays her boarding of vehicle `i` ([`Game::boarding`]) on: her clip
+    /// for the step at the seat, the door on the clip's events, the next
+    /// step when the clip ends. Getting in, done, she sits; getting out,
+    /// she stands where her last clip ends. False when no clip plays
+    /// (left to run out, [`crate::boarding::UNPLAYED`]) or she is seated.
+    fn board(&mut self, game: &mut Game, i: usize, dt: f32) -> bool {
+        let State::Ready(loaded) = &self.state else {
+            return false;
+        };
+        let Some(mut b) = game.boarding.clone() else {
+            return false;
+        };
+        let Some(v) = game.scene.vehicles.get(i) else {
+            return false;
+        };
+        let driver = m2_assets::name_hash("seat_driver");
+        let seat_name = b.seat.unwrap_or(driver);
+        let key = (v.spec.model, v.spec.label.to_ascii_lowercase(), seat_name);
+        if !self.rider_seats.contains_key(&key) {
+            let seat = find_seat(game, &mut self.points, &loaded.clips, i, Some(seat_name));
+            self.rider_seats.insert(key.clone(), seat);
+        }
+        let Some(seat) = self.rider_seats[&key] else {
+            return false;
+        };
+        let Some((actions, vehicles)) = loaded.clips.tables.as_ref() else {
+            return false;
+        };
+        let door = self.boarding_door(game, &b);
+        let cos = door.map(|(d, s)| s.cos(&d));
+        // The clip each step plays, for her seat; a step the tables give
+        // none is passed over.
+        let steps = [
+            Step::OpenToEnter,
+            Step::Enter,
+            Step::CloseAfterEnter,
+            Step::OpenToExit,
+            Step::Exit { door: false },
+            Step::CloseAfterExit,
+        ];
+        let clips: Vec<(&'static str, Option<u32>)> = steps
+            .iter()
+            .map(|s| {
+                let clip = animation_table::seat_clip_row(
+                    actions,
+                    vehicles,
+                    "InVehicle",
+                    s.action(),
+                    seat.set,
+                    Some(seat_name),
+                )
+                .map(|(clip, _)| clip);
+                (s.action(), clip)
+            })
+            .collect();
+        let clip_of = |step: Step| {
+            clips
+                .iter()
+                .find(|c| c.0 == step.action())
+                .and_then(|c| c.1)
+        };
+        let mut step = b.step;
+        let mut begun = false;
+        if step.is_none() {
+            step = Some(if b.exiting {
+                Step::exit(cos)
+            } else {
+                Step::enter(cos)
+            });
+            begun = true;
+            eprintln!(
+                "boarding: {} the {} (seat {seat_name:08x}, entrance {:08x?}, door {}): {:?}",
+                if b.exiting { "out of" } else { "into" },
+                game.scene.vehicles[i].spec.label,
+                b.entrance,
+                door.map_or_else(
+                    || "none".to_owned(),
+                    |(d, s)| format!(
+                        "{:08x}, {:.0} degrees open",
+                        d.name,
+                        s.angle(&d).to_degrees()
+                    )
+                ),
+                step
+            );
+        }
+        // The clip under way, or the step's after it ends.
+        let mut prev = b.t;
+        b.t += dt;
+        let mut playing = None;
+        while let Some(s) = step {
+            let clip = clip_of(s).and_then(|c| Some((c, bind(game, c)?)));
+            let duration = clip.and_then(|(_, index)| {
+                Some(
+                    game.scene.player.as_ref()?.model.as_ref()?.1.clips[index]
+                        .info
+                        .duration,
+                )
+            });
+            match (clip, duration) {
+                (Some((hash, index)), Some(d)) if b.t < d || d <= 0.0 && begun => {
+                    playing = Some((s, hash, index, d));
+                    break;
+                }
+                (Some(_), Some(d)) => {
+                    // Its door events before it ends.
+                    self.door_events_between(game, &b, clip.map(|c| c.0), prev, d);
+                    b.t -= d;
+                    prev = 0.0;
+                }
+                _ => {
+                    eprintln!("boarding: no {} clip for the seat: passed over", s.action());
+                }
+            }
+            let door = self.boarding_door(game, &b);
+            step = s.next(door.map(|(d, sw)| sw.cos(&d)));
+            begun = true;
+            if let Some(n) = step {
+                eprintln!("boarding: then {}", n.action());
+            }
+        }
+        let Some((s, hash, index, _)) = playing else {
+            // Done: seated, or out where the last clip left her.
+            game.boarding = None;
+            if b.exiting {
+                self.finish_exit(game, &b, seat);
+                return true;
+            }
+            eprintln!("boarding: she is seated");
+            return false;
+        };
+        self.door_events_between(game, &b, Some(hash), prev, b.t);
+        if b.step != Some(s) || begun {
+            if let Some((_, rig)) = game.scene.player.as_mut().and_then(|p| p.model.as_mut()) {
+                rig.animator
+                    .play_action(index, true, m2_assets::name_hash(s.action()));
+            }
+            eprintln!("boarding: she plays {} (clip {hash:08x})", s.action());
+        }
+        b.step = Some(s);
+        b.unplayed = 0.0;
+        let entrance = b.entrance;
+        game.boarding = Some(b);
+        // Her clip at the seat, as she sits there.
+        let scene = &mut game.scene;
+        let exit_point = entrance
+            .and_then(|e| scene.vehicles[i].spec.entrance_at(e))
+            .map(|p| Vec3::new(p.x, seat.at.y, p.z));
+        let Some(at) = scene
+            .world
+            .as_ref()
+            .and_then(|w| w.physics.vehicle_transform(scene.vehicles[i].id?))
+        else {
+            return true;
+        };
+        let Some(p) = scene.player.as_mut() else {
+            return true;
+        };
+        p.off_foot();
+        let Some((_, rig)) = p.model.as_mut() else {
+            return true;
+        };
+        rig.animator.advance(dt);
+        let forward = rig
+            .locomotion
+            .as_ref()
+            .map_or(m2_math::glam::Vec2::Y, |l| l.forward);
+        let ahead = at.transform_vector3(Vec3::Z);
+        p.facing = ahead.x.atan2(ahead.z) + forward.x.atan2(forward.y);
+        // Getting in, her clips' origin is the seat; getting out, the
+        // entrance she leaves by (0x822A2298 puts her there for the exit
+        // clip). Measured on the Valiant: so placed, her first entry frame
+        // stands 0.08 m from the entrance's hardpoint and her first exit
+        // frame within 0.02 m of where her seated loop has her.
+        let origin = exit_point.filter(|_| s.exiting()).unwrap_or(seat.at);
+        let frame = at * Mat4::from_translation(origin + seat_offset(rig, index));
+        p.seat_frame = Some(frame);
+        p.character.position = frame.transform_point3(Vec3::ZERO);
+        p.character.velocity = Vec3::ZERO;
+        p.seated = true;
+        true
+    }
+
+    /// Opens or shuts her boarding's door for the events of clip `clip`
+    /// from `from` (not taken) to `to` seconds in.
+    fn door_events_between(
+        &mut self,
+        game: &mut Game,
+        b: &crate::boarding::Boarding,
+        clip: Option<u32>,
+        from: f32,
+        to: f32,
+    ) {
+        let Some(hash) = clip else { return };
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.door_events.entry(hash) {
+            let events = load(game, hash)
+                .map(|c| {
+                    c.events
+                        .iter()
+                        .filter_map(|e| {
+                            Some((e.time, m2_engine::vehicle_door::door_event(&e.name)?))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            slot.insert(events);
+        }
+        let due: Vec<bool> = self.door_events[&hash]
+            .iter()
+            .filter(|&&(t, _)| (from < t || from == 0.0 && t <= 0.0) && t <= to)
+            .map(|&(_, open)| open)
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let Some((door, swing)) = self.boarding_door(game, b) else {
+            return;
+        };
+        let entry = self
+            .doors
+            .entry((b.vehicle, door.name))
+            .or_insert((door, swing));
+        for open in due {
+            eprintln!(
+                "door: clip {hash:08x} {} door {:08x}",
+                if open { "opens" } else { "shuts" },
+                door.name
+            );
+            if open {
+                entry.1.open();
+            } else {
+                entry.1.close();
+            }
+        }
+    }
+
+    /// She stands where her last exit clip left her: the clip's root at
+    /// its end, on the vehicle's seat frame, at the hull's height.
+    fn finish_exit(&mut self, game: &mut Game, b: &crate::boarding::Boarding, seat: Seat) {
+        let scene = &mut game.scene;
+        let (Some(world), Some(p)) = (scene.world.as_ref(), scene.player.as_mut()) else {
+            return;
+        };
+        let Some(v) = scene.vehicles.get(b.vehicle) else {
+            return;
+        };
+        let Some(at) = v.id.and_then(|id| world.physics.vehicle_transform(id)) else {
+            return;
+        };
+        let end = p.seat_frame.map_or_else(
+            || at.transform_point3(seat.at),
+            |f| f.transform_point3(Vec3::ZERO),
+        );
+        let place = Vec3::new(end.x, at.transform_point3(Vec3::ZERO).y, end.z);
+        let facing = p.facing;
+        let local = at.inverse().transform_point3(place);
+        eprintln!(
+            "boarding: her exit clips end at local {:.2?}",
+            local.to_array()
+        );
+        crate::game::get_out_at(&world.physics, v, b.seat, p, place, facing);
+        p.seated = false;
+        p.seat_frame = None;
+        game.ride = None;
     }
 
     /// Where she is in the hijacked vehicle's space (x right, y up, z
@@ -2328,6 +2685,7 @@ fn find_seat(
         clip,
         at,
         shown: !hatch,
+        set,
     })
 }
 
@@ -2377,6 +2735,7 @@ fn find_prop_seat(
         clip: clip?,
         at: at?,
         shown: true,
+        set,
     })
 }
 

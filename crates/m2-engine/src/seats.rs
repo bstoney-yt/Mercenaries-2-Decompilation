@@ -208,6 +208,9 @@ pub struct EntranceParams {
     pub ladder: bool,
     pub long_search: bool,
     pub speed_match: bool,
+    /// `DoorName`: the vehicle's `Door` record (by its `Name`) she opens
+    /// to use it ([`crate::vehicle_door`]); `None`: no door.
+    pub door: Option<u32>,
 }
 
 impl Default for EntranceParams {
@@ -219,6 +222,7 @@ impl Default for EntranceParams {
             ladder: false,
             long_search: false,
             speed_match: false,
+            door: None,
         }
     }
 }
@@ -298,6 +302,9 @@ pub struct VehicleSeats {
     pub entrances: Vec<Entrance>,
     /// The vehicle template's own `Turret` records, which its seats name.
     pub turrets: Vec<TurretRecord>,
+    /// The vehicle template's own `Door` records, which its entrances
+    /// name.
+    pub doors: Vec<crate::vehicle_door::Door>,
 }
 
 /// One `Turret` record of a vehicle template: a gun mount its seat's rider
@@ -589,6 +596,7 @@ pub fn ditch_velocity(vehicle_velocity: Vec3, out: Vec3) -> Vec3 {
 
 /// Every vehicle template's seats and entrances, by template id.
 pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
+    let mut doors = crate::vehicle_door::read(db);
     let seat_links = Table::new(db, "SeatLink");
     let entrance_links = Table::new(db, "EntranceLink");
     let seat_params = Table::new(db, "SeatParameters");
@@ -628,6 +636,7 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
             ladder: bit(&entrance_params, r, "bLadder"),
             long_search: bit(&entrance_params, r, "bLongSearchDistance"),
             speed_match: bit(&entrance_params, r, "bSpeedMatchOnExit"),
+            door: entrance_params.word(r, h("DoorName")).filter(|&n| n != 0),
         }
     };
     let mut out = HashMap::new();
@@ -705,6 +714,7 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
                 seats,
                 entrances,
                 turrets,
+                doors: doors.remove(&vehicle).unwrap_or_default(),
             },
         );
     }
@@ -1102,6 +1112,7 @@ mod tests {
                 },
             ],
             turrets: Vec::new(),
+            doors: Vec::new(),
         };
         assert_eq!(v.driver(), Some(0));
         assert_eq!(v.exit_of(0).and_then(|e| e.hardpoint), Some(11));
