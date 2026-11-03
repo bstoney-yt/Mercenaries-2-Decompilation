@@ -1168,6 +1168,20 @@ impl MissionLink {
         }
     }
 
+    /// Puts the game's own developer cheat menu up
+    /// (`MrxCheatBootstrap.DisplayOptions`, [`m2_game::cheat`]): its pages
+    /// are the scripts' dialog boxes, which the HUD shows and the pad
+    /// works. Why not, if it could not.
+    pub fn game_cheat_menu(&mut self) -> Result<(), String> {
+        let State::Running(m) = &mut self.state else {
+            return Err("the mission scripts aren't running".to_owned());
+        };
+        let done = m.run(m2_game::cheat::OPEN_MENU, "game cheat menu");
+        let lines = m.take_log();
+        self.write(lines);
+        done.map_err(|e| e.to_string())
+    }
+
     /// Frees every recruit of the support's (the helicopter pilot, the jet
     /// pilot...) at once, their cooldowns and errands cut short: for a
     /// check calling one item after another.
@@ -3050,6 +3064,14 @@ impl MissionLink {
                     }
                 });
                 mission.start();
+                if let Some((to, _)) = &self.skip_to {
+                    // What the scripts' skip is meant to hand her there,
+                    // to set against what she holds on arrival.
+                    self.write([match m2_game::cheat::stockpile(mission.lua(), to) {
+                        Some(s) => format!("skip to: {to}'s cheat stockpile: {}", s.summary()),
+                        None => format!("skip to: no cheat stockpile for {to}"),
+                    }]);
+                }
                 // Her own interface, made in the scripts' state as the game
                 // makes it, one state for all its scripts: the HUD's
                 // layouts and the PDA, loaded as the GUI runtime ticks
