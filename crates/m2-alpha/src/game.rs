@@ -1247,7 +1247,6 @@ impl Game {
                                         *entrance,
                                     );
                                     boarding.transfer_to = b.seat.filter(|_| b.slid_from.is_some());
-                                    boarding.stood = Some(player.character.position);
                                     self.boarding = Some(boarding);
                                 }
                                 self.ride = b.seat.map(|s| (*i, s));

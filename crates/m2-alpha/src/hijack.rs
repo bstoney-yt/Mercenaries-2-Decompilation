@@ -1644,24 +1644,7 @@ impl Hijacks {
         // stands 0.08 m from the entrance's hardpoint and her first exit
         // frame within 0.02 m of where her seated loop has her.
         let origin = exit_point.filter(|_| s.exiting()).unwrap_or(seat.at);
-        let mut frame = at * Mat4::from_translation(origin + seat_offset(rig, index));
-        // Getting in, she slides from where she stood to where her first
-        // clip starts ([`crate::boarding::SLIDE`]).
-        if let Some(b) = game.boarding.as_mut() {
-            if b.elapsed == 0.0
-                && !b.exiting
-                && let Some(stood) = b.stood
-            {
-                let start = frame.transform_point3(Vec3::ZERO);
-                b.slide = (stood - start).with_y(0.0);
-                eprintln!(
-                    "boarding: she slides {:.2} m to her clip's start",
-                    b.slide.length()
-                );
-            }
-            frame = Mat4::from_translation(b.slide * b.slide_left()) * frame;
-            b.elapsed += dt;
-        }
+        let frame = at * Mat4::from_translation(origin + seat_offset(rig, index));
         p.seat_frame = Some(frame);
         p.character.position = frame.transform_point3(Vec3::ZERO);
         p.character.velocity = Vec3::ZERO;
@@ -1746,17 +1729,45 @@ impl Hijacks {
             "boarding: her exit clips end at local {:.2?}",
             local.to_array()
         );
-        // Where she stands is kept unless it is blocked (0x822A2648 tests
-        // it, 0x8229A8D8, and else finds a clear point, 0x822A13D0): here,
-        // within the hull's footprint (a tank's catch-all exit clip leaves
-        // her on the hull), she gets out as without the clips.
+        // Where she stands is kept unless it is not clear (0x822A2648 asks
+        // 0x8229A8D8, which also fails her standing on a vehicle all round:
+        // a tank's exit clips leave her on its hull); then the clear point
+        // search's first place she fits (0x822A13D0, 0x8239F440). Here
+        // "on the vehicle" is within its footprint and "fits" is a clear
+        // ray from the vehicle's middle at chest height; with none, she
+        // gets out as without the clips.
         let (lo, hi) = v.spec.bounds;
         let inside = (lo.x..=hi.x).contains(&local.x) && (lo.z..=hi.z).contains(&local.z);
-        if inside {
-            eprintln!("boarding: that is within the hull: out as without the clips");
-            crate::game::get_out(&world.physics, v, b.seat, p);
-        } else {
-            crate::game::get_out_at(&world.physics, v, b.seat, p, place, facing);
+        let clear = || {
+            let id = v.id?;
+            let centre = at.transform_point3((lo + hi) * 0.5);
+            let ahead = at.transform_vector3(Vec3::Z);
+            let yaw = ahead.x.atan2(ahead.z);
+            let from = centre.with_y(place.y + 1.2);
+            m2_engine::seats::clear_points(centre, yaw, (hi - lo).length() * 0.5)
+                .into_iter()
+                .enumerate()
+                .find(|(_, q)| {
+                    let way = q.with_y(from.y) - from;
+                    world
+                        .physics
+                        .cast_ray_past(from, way, way.length(), id)
+                        .is_none()
+                })
+                .map(|(k, q)| (k, q.with_y(place.y)))
+        };
+        match (inside, inside.then(clear).flatten()) {
+            (false, _) => crate::game::get_out_at(&world.physics, v, b.seat, p, place, facing),
+            (true, Some((k, q))) => {
+                eprintln!("boarding: that is on the vehicle: clear point {k} instead");
+                crate::game::get_out_at(&world.physics, v, b.seat, p, q, facing);
+            }
+            (true, None) => {
+                eprintln!(
+                    "boarding: that is on the vehicle, no clear point: out as without the clips"
+                );
+                crate::game::get_out(&world.physics, v, b.seat, p);
+            }
         }
         p.seated = false;
         p.seat_frame = None;
