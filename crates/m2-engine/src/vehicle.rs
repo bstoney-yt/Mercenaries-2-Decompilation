@@ -379,7 +379,7 @@ pub const CHASSIS: u32 = 0x255e_ab53;
 
 /// A vehicle's intact chassis body as its model's `PHY2` record gives
 /// it, in model space.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Chassis {
     /// The record's mass, kg: the art's, often far from the template's
     /// (the Mi-35's 333,882 against its `Mass` 20,000).
@@ -387,20 +387,26 @@ pub struct Chassis {
     /// The record's inertia, kg m², model axes.
     pub inertia: Mat3,
     pub centre_of_mass: Vec3,
+    /// The shapes the body collides with, model space: each one's points
+    /// (convex radius included). The 360 code builds the body from them
+    /// (0x8216A290), so it is what touches the ground under a tank whose
+    /// springs bottom out.
+    pub shapes: std::sync::Arc<[Vec<Vec3>]>,
 }
 
 impl Chassis {
-    /// The chassis of the model whose resident asset is `base`, if its
+    /// The chassis of `model`, whose resident asset is `base`, if its
     /// `PHY2` has one with an inertia of its own (not left to its
     /// shapes, `f32::MAX`) and some mass.
-    pub fn of(base: &[u8]) -> Option<Self> {
+    pub fn of(model: &Model<'_>, base: &[u8]) -> Option<Self> {
         let phy2 = Ucfx::parse(base).ok()?.top_level(*b"PHY2")?.to_vec();
         let p = m2_assets::physics::Physics::parse(&phy2).ok()?;
         let part = p
             .parts
             .iter()
             .find(|q| q.node_hash == CHASSIS && q.body.is_some())?;
-        let b = p.bodies.get(part.body?)?;
+        let body = part.body?;
+        let b = p.bodies.get(body)?;
         if b.is_fixed() || b.inertia[0] == f32::MAX || !b.inertia.iter().all(|v| v.is_finite()) {
             return None;
         }
@@ -411,6 +417,7 @@ impl Chassis {
             mass: b.mass,
             inertia: turn * inertia * turn.transpose(),
             centre_of_mass: turn * Vec3::from(b.centre_of_mass) + Vec3::from(part.position),
+            shapes: crate::physics::body_shapes(model, &p, body).into(),
         })
     }
 }
@@ -1079,10 +1086,10 @@ impl VehicleSpec {
         self
     }
 
-    /// With its model's intact chassis body ([`Chassis::of`] its resident
-    /// asset `base`).
-    pub fn with_chassis(mut self, base: &[u8]) -> Self {
-        self.chassis = Chassis::of(base);
+    /// With its model's intact chassis body ([`Chassis::of`] `model`, its
+    /// resident asset `base`).
+    pub fn with_chassis(mut self, model: &Model<'_>, base: &[u8]) -> Self {
+        self.chassis = Chassis::of(model, base);
         self
     }
 

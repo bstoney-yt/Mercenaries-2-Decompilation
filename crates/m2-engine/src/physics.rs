@@ -653,6 +653,34 @@ fn standing(p: &Phy2, k: usize, hidden: &[bool]) -> bool {
     !s.is_foliage() && !hidden.get(node).copied().unwrap_or(false)
 }
 
+/// The shapes body `body` of `PHY2` `p` collides with, model space: each
+/// standing one's points (its convex radius included), as
+/// [`CollisionShape::shape_meshes`] places them.
+pub(crate) fn body_shapes(model: &Model<'_>, p: &Phy2, body: usize) -> Vec<Vec<Vec3>> {
+    let hidden = model
+        .states
+        .as_ref()
+        .map(|s| s.hidden(&model.nodes, false))
+        .unwrap_or_default();
+    (0..p.shapes.len())
+        .filter(|&k| p.body_of(k) == Some(body) && standing(p, k, &hidden))
+        .map(|k| {
+            let s = &p.shapes[k];
+            let to_model = p
+                .shape_node(k)
+                .and_then(|n| u16::try_from(n).ok())
+                .and_then(|n| model.node_to_model(n))
+                .unwrap_or(Mat4::IDENTITY)
+                * p.shape_place(k).map_or(Mat4::IDENTITY, place);
+            let (v, _) = s.geometry.triangles(s.radius);
+            v.iter()
+                .map(|&x| to_model.transform_point3(Vec3::from(x)))
+                .collect()
+        })
+        .filter(|v: &Vec<Vec3>| v.len() >= 4)
+        .collect()
+}
+
 /// A box round `PHY2` shape `k` (its convex radius included, as its
 /// triangles have it), placed by `to` from its body node's space.
 fn shape_box(p: &Phy2, k: usize, to: Mat4) -> Option<(r::Pose, r::SharedShape)> {
@@ -3024,8 +3052,9 @@ impl Physics {
         // inertia a little above a solid box's, invented.
         let chassis = spec
             .chassis
+            .as_ref()
             .filter(|_| spec.tracked || spec.wheels.is_empty())
-            .map(|c| chassis_mass(&c, spec.tuning.mass));
+            .map(|c| chassis_mass(c, spec.tuning.mass));
         let m = chassis.map_or(spec.mass, |c| c.0);
         let size = half * 2.0;
         let inertia = Vec3::new(
@@ -3060,7 +3089,7 @@ impl Physics {
                     / spec.wheels.len() as f32;
                 mid + Vec3::from(b.centre_of_mass) - centre
             }
-            None => match spec.chassis.filter(|_| chassis.is_some()) {
+            None => match spec.chassis.as_ref().filter(|_| chassis.is_some()) {
                 // A tank's moves by its template's `CenterOfMassOffset`
                 // (0x821A4D40 -> 0x8262A680); a boat's or helicopter's stays.
                 Some(c) => {
@@ -3097,13 +3126,55 @@ impl Physics {
         } else {
             r::CoefficientCombineRule::Min
         };
-        let collider = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
-            .translation(vector(centre))
-            .mass_properties(mass)
-            .friction(hull_friction)
-            .friction_combine_rule(combine)
-            .collision_groups(hull);
-        self.world.insert_collider(collider, Some(body));
+        // A tank driven as the 360 code drives it collides by its chassis
+        // body's own `PHY2` shapes, as the 360 code builds its body from
+        // them (0x8216A290): low enough under its hull that, springs
+        // bottomed out, its track rays still start above the ground. Our
+        // box stood 0.45 m up (the wheels' middle), over a squeeze of
+        // 0.36 to 0.4 m on five tanks, whose rays then started under the
+        // ground and missed, leaving them sliding on the box. Each shape
+        // is its points' convex hull (Havok's are convex but for a
+        // mesh one, whose hull covers a little more). Others keep the
+        // invented box.
+        let shapes: Vec<r::SharedShape> = spec
+            .chassis
+            .as_ref()
+            .filter(|_| spec.tracked && spec.tuning.tank.is_some())
+            .map(|c| {
+                c.shapes
+                    .iter()
+                    .filter_map(|v| {
+                        let points: Vec<_> = v.iter().map(|&p| vector(p)).collect();
+                        r::SharedShape::convex_hull(&points)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if shapes.is_empty() {
+            let collider = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
+                .translation(vector(centre))
+                .mass_properties(mass)
+                .friction(hull_friction)
+                .friction_combine_rule(combine)
+                .collision_groups(hull);
+            self.world.insert_collider(collider, Some(body));
+        }
+        for (i, shape) in shapes.into_iter().enumerate() {
+            let collider = r::ColliderBuilder::new(shape)
+                .friction(hull_friction)
+                .friction_combine_rule(combine)
+                .collision_groups(hull);
+            // The body's mass and inertia are its chassis record's, on
+            // the first (in model space: the box's sat at `centre`); the
+            // rest add nothing.
+            let collider = if i == 0 {
+                collider
+                    .mass_properties(mass.transform_by(&r::Pose::from_translation(vector(centre))))
+            } else {
+                collider.density(0.0)
+            };
+            self.world.insert_collider(collider, Some(body));
+        }
         // The turret on top, adding nothing to the mass the hull carries.
         if let Some((lo, hi)) = spec.turret_box {
             let half = ((hi - lo) * 0.5).max(Vec3::splat(0.1));
@@ -5537,6 +5608,7 @@ mod tests {
             mass: 83_000.0,
             inertia: Mat3::from_diagonal(Vec3::new(400_000.0, 500_000.0, 200_000.0)),
             centre_of_mass: Vec3::new(0.1, 1.2, 0.5),
+            shapes: Arc::from([]),
         });
         let mut p = Physics::new();
         let id = p.add_vehicle(&spec, Vec3::new(0.0, 1.0, 0.0), 0.0);
@@ -6336,6 +6408,99 @@ mod tests {
         assert!((track_push(curve, 0.5) - 0.375).abs() < 1e-5);
         assert!((track_push(curve, 0.8) - 0.2).abs() < 1e-5);
         assert!((track_push(curve, 1.0) - 0.1).abs() < 1e-5);
+    }
+
+    /// Dropped 1 m onto a 20 degree slope and parked 12 s, a 360-driven
+    /// tank with a short squeeze (0.4 m, the PLZ45's springs) and its
+    /// chassis's shape 0.38 m up: how far it slid over the last 10 s, and
+    /// how many of its six track points touch at the end.
+    fn parked_tank_on_a_slope(shape_floor: Option<f32>) -> (f32, usize) {
+        use crate::vehicle::WheelSpec;
+        let mut spec = tank();
+        spec.wheels = [-2.3f32, 0.0, 2.3]
+            .iter()
+            .flat_map(|&z| {
+                [-1.2f32, 1.2].map(|x| WheelSpec {
+                    centre: Vec3::new(x, 0.45, z),
+                    radius: 0.45,
+                    width: 0.5,
+                    steers: false,
+                })
+            })
+            .collect();
+        spec.tuning.mass = Some(30_000.0);
+        spec.tuning.tank = Some(TankTuning {
+            friction: (0.5, 0.9),
+            springs: (30.0, 3.0, 0.3, 0.4),
+            ..AMX30
+        });
+        let box_points = |lo: Vec3, hi: Vec3| {
+            (0..8)
+                .map(|i| {
+                    Vec3::new(
+                        if i & 1 == 0 { lo.x } else { hi.x },
+                        if i & 2 == 0 { lo.y } else { hi.y },
+                        if i & 4 == 0 { lo.z } else { hi.z },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        spec.chassis = Some(crate::vehicle::Chassis {
+            mass: 30_000.0,
+            inertia: Mat3::from_diagonal(Vec3::new(100_000.0, 110_000.0, 40_000.0)),
+            centre_of_mass: Vec3::new(0.0, 0.9, 0.0),
+            shapes: shape_floor
+                .map(|y| {
+                    vec![box_points(
+                        Vec3::new(-1.6, y, -3.3),
+                        Vec3::new(1.6, 1.6, 3.3),
+                    )]
+                })
+                .unwrap_or_default()
+                .into(),
+        });
+        let mut p = Physics::new();
+        let tilt = Quat::from_rotation_x(-20f32.to_radians());
+        let half = 200.0;
+        let v = [
+            Vec3::new(-half, 0.0, -half),
+            Vec3::new(half, 0.0, -half),
+            Vec3::new(half, 0.0, half),
+            Vec3::new(-half, 0.0, half),
+        ];
+        let shape = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        p.add_static(StaticKey::Cell(1), &shape, Vec3::ZERO, tilt);
+        p.step(DT);
+        let id = p.add_vehicle_turned(&spec, tilt * Vec3::Y, tilt);
+        let parked = VehicleControls {
+            parked: true,
+            ..Default::default()
+        };
+        let mut from = Vec3::ZERO;
+        for i in 0..(12.0 / DT) as usize {
+            if i == (2.0 / DT) as usize {
+                from = p.vehicle_transform(id).unwrap().w_axis.truncate();
+            }
+            p.drive(id, parked);
+            p.step(DT);
+        }
+        let at = p.vehicle_transform(id).unwrap().w_axis.truncate();
+        ((at - from).length(), p.vehicle_contacts(id).0)
+    }
+
+    #[test]
+    fn a_tank_lands_on_its_chassis_shapes_and_stays_on_its_tracks() {
+        // On its chassis's own shape (the 360 body's, 0x8216A290) its
+        // bottomed-out rays start above the ground: it springs back onto
+        // its tracks and holds.
+        let (slid, touching) = parked_tank_on_a_slope(Some(0.38));
+        assert!(slid < 2.0, "slid {slid} m");
+        assert_eq!(touching, 6);
+        // On the invented box (0.45 m up, over its 0.4 m squeeze) its rays
+        // started under the ground and it slid away on the box.
+        let (slid, touching) = parked_tank_on_a_slope(None);
+        assert!(slid > 20.0, "slid {slid} m");
+        assert_eq!(touching, 0);
     }
 
     /// The AMX-30's `_TankPhysics`.

@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 kind: "boat".to_owned(),
                 label: name.to_owned(),
             };
-            VehicleSpec::from_model(&entry, &m).map(|s| s.with_chassis(&d.base))
+            VehicleSpec::from_model(&entry, &m).map(|s| s.with_chassis(&m, &d.base))
         }) else {
             skipped += ids.len();
             continue;

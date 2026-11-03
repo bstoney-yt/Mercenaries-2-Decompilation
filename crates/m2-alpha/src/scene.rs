@@ -1691,7 +1691,7 @@ fn load_cast(install: Install, hand: Vec<u32>, park: bool) -> Receiver<Loaded> {
                 let data = source.model(e.model)?;
                 let model = data.parse()?;
                 let Some(spec) =
-                    VehicleSpec::from_model(e, &model).map(|s| s.with_chassis(&data.base))
+                    VehicleSpec::from_model(e, &model).map(|s| s.with_chassis(&model, &data.base))
                 else {
                     labels.remove(&e.label);
                     continue;
@@ -2347,8 +2347,8 @@ impl Scene {
                     }
                     let data = source.model(e.model)?;
                     let model = data.parse()?;
-                    if let Some(spec) =
-                        VehicleSpec::from_model(e, &model).map(|s| s.with_chassis(&data.base))
+                    if let Some(spec) = VehicleSpec::from_model(e, &model)
+                        .map(|s| s.with_chassis(&model, &data.base))
                     {
                         let mut cpu = CpuModel::build(e.model, &model, 0);
                         cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
