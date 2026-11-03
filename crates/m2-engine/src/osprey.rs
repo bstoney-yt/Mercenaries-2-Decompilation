@@ -172,6 +172,7 @@ pub fn vehicle(entry: &CatalogueEntry) -> (VehicleSpec, CpuModel) {
         damage: None,
         chassis: None,
         shapes: Default::default(),
+        material: None,
         rest,
     };
     (spec, cpu)

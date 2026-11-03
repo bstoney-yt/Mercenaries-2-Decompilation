@@ -357,6 +357,11 @@ pub struct VehicleSpec {
     /// convex radius included. The 360 code builds its body from them
     /// (0x8216A290). Empty without them.
     pub shapes: std::sync::Arc<[Vec<Vec3>]>,
+    /// What the game makes of its intact chassis body's record
+    /// ([`VehicleSpec::with_chassis`]): its friction and damping (the 360
+    /// body builder's, [`crate::physics::BodyMaterial::of`]). `None`
+    /// without one.
+    pub material: Option<crate::physics::BodyMaterial>,
 }
 
 /// How a vehicle sits on uneven ground ([`VehicleSpec::rest_on`]).
@@ -397,21 +402,29 @@ pub struct Chassis {
 /// The shapes the intact chassis body of `model` (whose resident asset is
 /// `base`) collides with, model space: each standing one's points, its
 /// convex radius included. Empty without a `PHY2` chassis body.
-fn chassis_shapes(model: &Model<'_>, base: &[u8]) -> (Vec<Vec<Vec3>>, bool) {
+#[allow(clippy::type_complexity)]
+fn chassis_shapes(
+    model: &Model<'_>,
+    base: &[u8],
+) -> (Vec<Vec<Vec3>>, bool, Option<crate::physics::BodyMaterial>) {
     let Some(p) = Ucfx::parse(base)
         .ok()
         .and_then(|u| u.top_level(*b"PHY2").map(<[u8]>::to_vec))
         .and_then(|d| m2_assets::physics::Physics::parse(&d).ok())
     else {
-        return (Vec::new(), false);
+        return (Vec::new(), false, None);
     };
     p.parts
         .iter()
         .find(|q| q.node_hash == CHASSIS && q.body.is_some())
         .and_then(|q| q.body)
         .map_or_else(
-            || (Vec::new(), false),
-            |body| crate::physics::body_shapes(model, &p, body),
+            || (Vec::new(), false, None),
+            |body| {
+                let (shapes, hull) = crate::physics::body_shapes(model, &p, body);
+                let material = p.bodies.get(body).map(crate::physics::BodyMaterial::of);
+                (shapes, hull, material)
+            },
         )
 }
 
@@ -845,6 +858,7 @@ impl VehicleSpec {
             damage: crate::vehicle_damage::DamageModel::from_model(model).map(std::sync::Arc::new),
             chassis: None,
             shapes: Default::default(),
+            material: None,
             rotors: if flies {
                 vehicle::rotors(model)
                     .into_iter()
@@ -1110,7 +1124,8 @@ impl VehicleSpec {
     /// asset `base`) and that body's shapes (`model`'s).
     pub fn with_chassis(mut self, model: &Model<'_>, base: &[u8]) -> Self {
         self.chassis = Chassis::of(base);
-        let (shapes, hull) = chassis_shapes(model, base);
+        let (shapes, hull, material) = chassis_shapes(model, base);
+        self.material = material;
         // Flagged, not traced: a wheeled vehicle without a hull set (the
         // trailers) would drag on its wheels' own shapes, and a
         // motorbike's balance was tuned against the box hull (26 of 33
@@ -1604,6 +1619,7 @@ mod tests {
             damage: None,
             chassis: None,
             shapes: Default::default(),
+            material: None,
             tuning: VehicleTuning::default(),
         }
     }

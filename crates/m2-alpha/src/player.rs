@@ -1385,6 +1385,7 @@ mod tests {
             damage: None,
             chassis: None,
             shapes: Default::default(),
+            material: None,
             tuning: Default::default(),
         };
         let plain = ChaseRig::of(&spec);

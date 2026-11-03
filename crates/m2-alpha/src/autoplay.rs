@@ -6796,6 +6796,7 @@ mod tests {
             damage: None,
             chassis: None,
             shapes: Default::default(),
+            material: None,
             tuning: Default::default(),
         };
         let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);

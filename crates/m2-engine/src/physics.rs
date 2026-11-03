@@ -1172,12 +1172,6 @@ const TRACK_TURN: f32 = 0.9;
 /// and backwards.
 const TOP_SPEED: f32 = 30.0;
 const REVERSE_SPEED: f32 = 8.0;
-/// A wheeled or tracked vehicle's drag, per second (a helicopter's is
-/// 0.1, a boat's its water drag). Until round 18 it was 0.1 too, which held every
-/// car to about 60% of its template's `MaxSpeed` against the old pull of
-/// 4 m/s² falling to nothing at the top (the playtest's "vehicles feel
-/// slower"); its own engine now sets how it gathers speed. Invented.
-const GROUND_DAMPING: f32 = 0.02;
 /// A tracked vehicle's pull, m/s², falling to nothing at its top speed,
 /// when its template gives no `_TankPhysics` ([`drive_tracks`] drives one
 /// that does). Invented.
@@ -3041,17 +3035,21 @@ impl Physics {
         let body = self.world.insert_body(
             r::RigidBodyBuilder::dynamic()
                 .pose(pose(position, rotation))
-                // A boat's water drag slows it instead
-                // ([`Physics::float_boats`]); a helicopter pulls itself to
-                // the speed it is asked ([`Rotor::fly`]), with Havok's
-                // default of no damping (the 360 body builder's damping of
-                // a vehicle isn't traced).
-                .linear_damping(if spec.is_boat() || spec.is_helicopter() {
-                    0.0
-                } else {
-                    GROUND_DAMPING
-                })
-                .angular_damping(0.5)
+                // Its chassis body's damping as the 360 body builder gives
+                // it ([`BodyMaterial::of`]): none against its motion (the
+                // rigid-body defaults', 0x82621820: +0x94 0), and its
+                // record's against its spin, at least 0.8. A boat's water
+                // drag slows it besides ([`Physics::float_boats`]). No set-up
+                // of a car, tank, boat or helicopter calls a body setter
+                // but its mass (0x82629D80) and inertia; one inlined in
+                // them isn't ruled out. Without a `PHY2` chassis, the
+                // commonest record's.
+                .linear_damping(spec.material.unwrap_or(BodyMaterial::COMMON).linear_damping)
+                .angular_damping(
+                    spec.material
+                        .unwrap_or(BodyMaterial::COMMON)
+                        .angular_damping,
+                )
                 .can_sleep(false)
                 .ccd_enabled(true),
         );
@@ -5035,6 +5033,7 @@ mod tests {
             damage: None,
             chassis: None,
             shapes: Default::default(),
+            material: None,
             tuning: crate::VehicleTuning::default(),
         }
     }
@@ -5545,12 +5544,18 @@ mod tests {
         let after = m.transform_vector3(Vec3::Z);
         assert!(before.cross(after).y > 0.0, "turned left");
         assert!(m.transform_vector3(Vec3::X).y < -0.05, "banked");
-        // Nobody flying it in the air: its stick let go, it hovers.
-        for _ in 0..600 {
+        // Nobody flying it in the air: its stick let go, it hovers (within
+        // 20 s; its spin damped 0.8, the 360 body builder's least, it
+        // takes longer to level than with the invented 0.5).
+        for _ in 0..1200 {
             p.drive(id, parked);
             p.step(DT);
         }
-        assert!(p.vehicle_velocity(id).length() < 1.0, "hovers unflown");
+        assert!(
+            p.vehicle_velocity(id).length() < 1.0,
+            "hovers unflown {}",
+            p.vehicle_velocity(id)
+        );
         // Wrecked, its rotor winds down and it falls.
         p.wreck_vehicle(id);
         for _ in 0..90 {
