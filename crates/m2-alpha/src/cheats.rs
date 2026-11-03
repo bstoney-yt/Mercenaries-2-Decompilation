@@ -16,8 +16,10 @@
 //!   drops, the vehicle deliveries and the air and artillery strikes),
 //!   stocked free into her support menu or called in at once.
 //!
-//! Provenance: the lists are the data's; the menu, its key and its
-//! helpers are invented for testing (the game has no such menu on PC).
+//! Provenance: the lists are the data's; this menu, its key and its
+//! helpers are invented for testing. The game's own developer menu is
+//! script (`MrxCheatBootstrap`, unreachable in retail play): its button
+//! here puts that one up as the scripts build it ([`m2_game::cheat`]).
 
 use m2_engine::world::{Templates, VehicleKind, member_stem};
 use m2_engine::{CatalogueEntry, weapons::Arms};
@@ -156,6 +158,9 @@ pub enum CheatAction {
     Heal,
     TeleportAhead,
     TeleportObjective,
+    /// Close this menu and put up the game's own developer cheat menu
+    /// (`MrxCheatBootstrap.DisplayOptions`, [`m2_game::cheat`]).
+    GameMenu,
     Close,
 }
 
@@ -268,6 +273,14 @@ pub fn apply(
             }
             None => "No money until the mission scripts run.".to_owned(),
         }),
+        A::GameMenu => match mission.map(|m| m.game_cheat_menu()) {
+            Some(Ok(())) => Applied {
+                said: "The game's own cheat menu is up.".to_owned(),
+                close: true,
+            },
+            Some(Err(e)) => Applied::say(format!("The game's cheat menu did not open: {e}.")),
+            None => Applied::say("No game cheat menu until the mission scripts run.".to_owned()),
+        },
         A::TeleportAhead | A::TeleportObjective => {
             let Some(p) = game.scene.player.as_ref() else {
                 return Applied::say("No one to move.".to_owned());

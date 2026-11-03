@@ -1850,6 +1850,9 @@ fn cheat_window(
                         if ui.button("Teleport to the nearest objective").clicked() {
                             action = Some(A::TeleportObjective);
                         }
+                        if ui.button("The game's own cheat menu").clicked() {
+                            action = Some(A::GameMenu);
+                        }
                     }
                 });
             ui.separator();
