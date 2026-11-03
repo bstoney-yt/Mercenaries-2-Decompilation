@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 kind: m2_engine::vehicle::HELICOPTER.to_owned(),
                 label: name.to_owned(),
             };
-            VehicleSpec::from_model(&entry, &m)
+            VehicleSpec::from_model(&entry, &m).map(|s| s.with_chassis(&d.base))
         }) else {
             continue;
         };

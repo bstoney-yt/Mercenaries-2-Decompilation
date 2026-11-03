@@ -4,7 +4,8 @@
 //! backing up (`MaxSpeed`, `MaxSpeedReverse`, km/h), how long it takes
 //! to reach 90% of its top speed, and how quickly the water slows it
 //! coasting, braking and sliding sideways, per second (`WaterDragFwd`,
-//! `WaterDragFwd` + `BrakeDrag`, `WaterDragSide`).
+//! `WaterDragFwd` + `BrakeDrag`, `WaterDragSide`), and how fast it turns
+//! and how far it heels flat out with the helm hard over.
 //!
 //! ```text
 //! cargo run --release -p m2-engine --example boattest -- "<install dir>"
@@ -31,6 +32,8 @@ const ASTERN: f32 = 40.0;
 /// The speed each slowing is measured from, m/s, and for how long, s.
 const FROM: f32 = 8.0;
 const OVER: f32 = 1.0;
+/// How long it turns flat out with the helm hard over, seconds.
+const TURN: f32 = 15.0;
 
 type Floated = (u32, Vec<u8>);
 
@@ -84,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "template\tcount\tmass\ttorque\treverse torque\t\
          data top\ttop\tt90 s\tdata reverse\treverse\t\
-         data coast\tcoast\tdata brake\tbrake\tdata side\tside"
+         data coast\tcoast\tdata brake\tbrake\tdata side\tside\tturn deg/s\theel deg"
     );
     let (mut floated, mut skipped) = (0, 0);
     for ((model, record), ids) in &groups {
@@ -99,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 kind: "boat".to_owned(),
                 label: name.to_owned(),
             };
-            VehicleSpec::from_model(&entry, &m)
+            VehicleSpec::from_model(&entry, &m).map(|s| s.with_chassis(&d.base))
         }) else {
             skipped += ids.len();
             continue;
@@ -121,10 +124,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let coast = slowing(&spec, Vec3::Z, false);
         let braking = slowing(&spec, Vec3::Z, true);
         let sliding = slowing(&spec, Vec3::X, false);
+        let (turn, tilt) = turning(&spec);
         println!(
             "{name}\t{}\t{}\t{torque}\t{back}\t{top:.2}\t{got_top:.2}\t{t90:.1}\t\
              {reverse:.2}\t{got_reverse:.2}\t{fwd:.3}\t{coast:.3}\t{:.3}\t{braking:.3}\t\
-             {side:.3}\t{sliding:.3}",
+             {side:.3}\t{sliding:.3}\t{turn:.1}\t{tilt:.1}",
             ids.len(),
             spec.mass,
             fwd + brake,
@@ -176,6 +180,43 @@ fn flat_out(spec: &VehicleSpec, throttle: f32, secs: f32, want: f32) -> (f32, f3
         }
     }
     (best, t90)
+}
+
+/// Throttle and the helm hard over for [`TURN`] s: how fast it turns over
+/// the last third, degrees a second, and the most it heels, degrees.
+fn turning(spec: &VehicleSpec) -> (f32, f32) {
+    let (mut p, id) = start(spec);
+    let heading = |p: &Physics| {
+        let f = p
+            .vehicle_transform(id)
+            .map_or(Vec3::Z, |m| m.transform_vector3(Vec3::Z));
+        f.x.atan2(f.z)
+    };
+    let steps = (TURN / DT) as usize;
+    let (mut turned, mut last, mut tilt) = (0.0f32, heading(&p), 0.0f32);
+    for i in 0..steps {
+        p.drive(
+            id,
+            VehicleControls {
+                throttle: 1.0,
+                steer: 1.0,
+                ..VehicleControls::default()
+            },
+        );
+        p.step(DT);
+        let now = heading(&p);
+        let mut d = now - last;
+        d = (d + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+        last = now;
+        if i >= steps * 2 / 3 {
+            turned += d;
+        }
+        let up = p
+            .vehicle_transform(id)
+            .map_or(Vec3::Y, |m| m.transform_vector3(Vec3::Y));
+        tilt = tilt.max(up.y.clamp(-1.0, 1.0).acos().to_degrees());
+    }
+    ((turned / (TURN / 3.0)).to_degrees().abs(), tilt)
 }
 
 /// Set going [`FROM`] m/s along `way` (its own axes) and left alone, or

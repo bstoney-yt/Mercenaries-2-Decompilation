@@ -348,6 +348,10 @@ pub struct VehicleSpec {
     /// What its parts do as they are damaged, if its model says
     /// ([`crate::vehicle_damage`]).
     pub damage: Option<std::sync::Arc<crate::vehicle_damage::DamageModel>>,
+    /// Its model's intact chassis body ([`VehicleSpec::with_chassis`]),
+    /// which a tank, boat or helicopter takes its inertia and centre of
+    /// mass from.
+    pub chassis: Option<Chassis>,
 }
 
 /// How a vehicle sits on uneven ground ([`VehicleSpec::rest_on`]).
@@ -361,6 +365,54 @@ pub struct Rest {
     /// How far the ground under its footprint rises above the plane its
     /// wheels rest on (a rock or a kerb under the hull, a ledge), metres.
     pub bumps: f32,
+}
+
+/// The node a vehicle's intact chassis body hangs on in its model's
+/// `PHY2`. From the 360 code: the part walk (0x8216BC08) puts a body on
+/// this node, on 0x75F1F74D or on 0x765CD254 first in its object's list
+/// (0x82185DB0 -> 0x821824E8), and that first body is the one the
+/// template's `Mass` goes to (0x82182848). From samples: each of the 57
+/// tank, boat and helicopter models with a `PHY2` has one body here,
+/// shown intact and hidden wrecked, and one on 0x75F1F74D, the other
+/// way about.
+pub const CHASSIS: u32 = 0x255e_ab53;
+
+/// A vehicle's intact chassis body as its model's `PHY2` record gives
+/// it, in model space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Chassis {
+    /// The record's mass, kg: the art's, often far from the template's
+    /// (the Mi-35's 333,882 against its `Mass` 20,000).
+    pub mass: f32,
+    /// The record's inertia, kg m², model axes.
+    pub inertia: Mat3,
+    pub centre_of_mass: Vec3,
+}
+
+impl Chassis {
+    /// The chassis of the model whose resident asset is `base`, if its
+    /// `PHY2` has one with an inertia of its own (not left to its
+    /// shapes, `f32::MAX`) and some mass.
+    pub fn of(base: &[u8]) -> Option<Self> {
+        let phy2 = Ucfx::parse(base).ok()?.top_level(*b"PHY2")?.to_vec();
+        let p = m2_assets::physics::Physics::parse(&phy2).ok()?;
+        let part = p
+            .parts
+            .iter()
+            .find(|q| q.node_hash == CHASSIS && q.body.is_some())?;
+        let b = p.bodies.get(part.body?)?;
+        if b.is_fixed() || b.inertia[0] == f32::MAX || !b.inertia.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        // The body sits on its part, in model space.
+        let turn = Mat3::from_quat(Quat::from_array(part.rotation).normalize());
+        let inertia = Mat3::from_cols_array(&b.inertia);
+        Some(Self {
+            mass: b.mass,
+            inertia: turn * inertia * turn.transpose(),
+            centre_of_mass: turn * Vec3::from(b.centre_of_mass) + Vec3::from(part.position),
+        })
+    }
 }
 
 /// The [`CatalogueEntry::kind`] of boats (a template with `_BoatPhysics`).
@@ -765,6 +817,7 @@ impl VehicleSpec {
             turret_box,
             tuning: VehicleTuning::default(),
             damage: crate::vehicle_damage::DamageModel::from_model(model).map(std::sync::Arc::new),
+            chassis: None,
             rotors: if flies {
                 vehicle::rotors(model)
                     .into_iter()
@@ -1023,6 +1076,13 @@ impl VehicleSpec {
         if let Some(turret) = t.turret {
             self.elevation = turret.pitch;
         }
+        self
+    }
+
+    /// With its model's intact chassis body ([`Chassis::of`] its resident
+    /// asset `base`).
+    pub fn with_chassis(mut self, base: &[u8]) -> Self {
+        self.chassis = Chassis::of(base);
         self
     }
 
@@ -1478,6 +1538,7 @@ mod tests {
             node_parents: Vec::new(),
             aimers: Vec::new(),
             damage: None,
+            chassis: None,
             tuning: VehicleTuning::default(),
         }
     }
