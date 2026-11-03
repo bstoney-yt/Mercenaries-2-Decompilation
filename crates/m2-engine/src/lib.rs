@@ -29,6 +29,7 @@ pub mod lights;
 pub mod model;
 pub mod motion;
 pub mod music_source;
+pub mod on_foot;
 pub mod ordnance;
 pub mod osprey;
 pub mod osprey_mesh;

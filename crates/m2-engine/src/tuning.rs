@@ -1260,10 +1260,12 @@ impl<'a> Table<'a> {
 
 /// The tuning of every template the database gives any, by template id.
 /// `damage` is the game's damage table, if found.
-/// `_HumanPhysics` fields that differ between the heroes as their
-/// speeds do (heroes round 02; names unsolved, so read as speeds by
-/// inference): Jennifer 2.0, 5.0 and 7.0, Chris 1.5, 4.5 and 6.25,
-/// Mattias 1.5, 4.5 and 5.5. Her run (5.0) is the alpha's run speed.
+/// `_HumanPhysics`'s `UprightWalkSpeed`, `UprightJogSpeed` and
+/// `UprightRunSpeed` (names from the program's registration at
+/// 0x823EAE98, hashed): Jennifer 2.0, 5.0 and 7.0, Chris 1.5, 4.5 and
+/// 6.25, Mattias 1.5, 4.5 and 5.5. The alpha's walk, run and sprint keys
+/// take them in that order (inferred: how the 360's player control scales
+/// the stick is not traced).
 const HUMAN_SPEEDS: [u32; 3] = [0xb535_3104, 0x5cc8_c4d9, 0x6167_d5fc];
 
 /// Every person template's three `_HumanPhysics` speeds (walk, run,
@@ -1282,6 +1284,39 @@ pub fn human_speeds(db: &Layer<'_>) -> HashMap<u32, [f32; 3]> {
             out.iter()
                 .all(|v| v.is_normal() && *v > 0.0)
                 .then_some((id, out))
+        })
+        .collect()
+}
+
+/// Every person template's `_HumanPhysics` jump, gravity, turn and paces
+/// ([`crate::on_foot::HumanMotion`]), by id; a field the record lacks
+/// keeps the program's default.
+pub fn human_motion(db: &Layer<'_>) -> HashMap<u32, crate::on_foot::HumanMotion> {
+    use crate::on_foot::{FIELDS, HumanMotion};
+    let physics = Table::new(db, "_HumanPhysics");
+    let d = HumanMotion::default();
+    let defaults = [
+        d.jump_height,
+        d.gravity,
+        d.max_rotation,
+        d.max_air_speed,
+        d.paces[0],
+        d.paces[1],
+        d.paces[2],
+        d.paces[3],
+    ];
+    physics
+        .records
+        .keys()
+        .filter_map(|&id| {
+            let record = physics.of_template(id).first()?;
+            let mut out = defaults;
+            for (o, name) in out.iter_mut().zip(FIELDS) {
+                if let Some(v) = physics.float(record, name_hash(name)) {
+                    *o = v;
+                }
+            }
+            Some((id, HumanMotion::from_fields(out)))
         })
         .collect()
 }
