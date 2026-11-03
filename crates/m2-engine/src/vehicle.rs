@@ -352,6 +352,11 @@ pub struct VehicleSpec {
     /// which a tank, boat or helicopter takes its inertia and centre of
     /// mass from.
     pub chassis: Option<Chassis>,
+    /// The shapes its intact chassis body collides with
+    /// ([`VehicleSpec::with_chassis`]), model space: each one's points,
+    /// convex radius included. The 360 code builds its body from them
+    /// (0x8216A290). Empty without them.
+    pub shapes: std::sync::Arc<[Vec<Vec3>]>,
 }
 
 /// How a vehicle sits on uneven ground ([`VehicleSpec::rest_on`]).
@@ -379,7 +384,7 @@ pub const CHASSIS: u32 = 0x255e_ab53;
 
 /// A vehicle's intact chassis body as its model's `PHY2` record gives
 /// it, in model space.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Chassis {
     /// The record's mass, kg: the art's, often far from the template's
     /// (the Mi-35's 333,882 against its `Mass` 20,000).
@@ -387,26 +392,40 @@ pub struct Chassis {
     /// The record's inertia, kg m², model axes.
     pub inertia: Mat3,
     pub centre_of_mass: Vec3,
-    /// The shapes the body collides with, model space: each one's points
-    /// (convex radius included). The 360 code builds the body from them
-    /// (0x8216A290), so it is what touches the ground under a tank whose
-    /// springs bottom out.
-    pub shapes: std::sync::Arc<[Vec<Vec3>]>,
+}
+
+/// The shapes the intact chassis body of `model` (whose resident asset is
+/// `base`) collides with, model space: each standing one's points, its
+/// convex radius included. Empty without a `PHY2` chassis body.
+fn chassis_shapes(model: &Model<'_>, base: &[u8]) -> Vec<Vec<Vec3>> {
+    let Some(p) = Ucfx::parse(base)
+        .ok()
+        .and_then(|u| u.top_level(*b"PHY2").map(<[u8]>::to_vec))
+        .and_then(|d| m2_assets::physics::Physics::parse(&d).ok())
+    else {
+        return Vec::new();
+    };
+    p.parts
+        .iter()
+        .find(|q| q.node_hash == CHASSIS && q.body.is_some())
+        .and_then(|q| q.body)
+        .map_or_else(Vec::new, |body| {
+            crate::physics::body_shapes(model, &p, body)
+        })
 }
 
 impl Chassis {
-    /// The chassis of `model`, whose resident asset is `base`, if its
+    /// The chassis of the model whose resident asset is `base`, if its
     /// `PHY2` has one with an inertia of its own (not left to its
     /// shapes, `f32::MAX`) and some mass.
-    pub fn of(model: &Model<'_>, base: &[u8]) -> Option<Self> {
+    pub fn of(base: &[u8]) -> Option<Self> {
         let phy2 = Ucfx::parse(base).ok()?.top_level(*b"PHY2")?.to_vec();
         let p = m2_assets::physics::Physics::parse(&phy2).ok()?;
         let part = p
             .parts
             .iter()
             .find(|q| q.node_hash == CHASSIS && q.body.is_some())?;
-        let body = part.body?;
-        let b = p.bodies.get(body)?;
+        let b = p.bodies.get(part.body?)?;
         if b.is_fixed() || b.inertia[0] == f32::MAX || !b.inertia.iter().all(|v| v.is_finite()) {
             return None;
         }
@@ -417,7 +436,6 @@ impl Chassis {
             mass: b.mass,
             inertia: turn * inertia * turn.transpose(),
             centre_of_mass: turn * Vec3::from(b.centre_of_mass) + Vec3::from(part.position),
-            shapes: crate::physics::body_shapes(model, &p, body).into(),
         })
     }
 }
@@ -825,6 +843,7 @@ impl VehicleSpec {
             tuning: VehicleTuning::default(),
             damage: crate::vehicle_damage::DamageModel::from_model(model).map(std::sync::Arc::new),
             chassis: None,
+            shapes: Default::default(),
             rotors: if flies {
                 vehicle::rotors(model)
                     .into_iter()
@@ -1086,10 +1105,11 @@ impl VehicleSpec {
         self
     }
 
-    /// With its model's intact chassis body ([`Chassis::of`] `model`, its
-    /// resident asset `base`).
+    /// With its model's intact chassis body ([`Chassis::of`] its resident
+    /// asset `base`) and that body's shapes (`model`'s).
     pub fn with_chassis(mut self, model: &Model<'_>, base: &[u8]) -> Self {
-        self.chassis = Chassis::of(model, base);
+        self.chassis = Chassis::of(base);
+        self.shapes = chassis_shapes(model, base).into();
         self
     }
 
@@ -1572,6 +1592,7 @@ mod tests {
             aimers: Vec::new(),
             damage: None,
             chassis: None,
+            shapes: Default::default(),
             tuning: VehicleTuning::default(),
         }
     }

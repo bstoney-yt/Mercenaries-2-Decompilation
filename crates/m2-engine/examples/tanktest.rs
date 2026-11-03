@@ -102,18 +102,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             let spec = VehicleSpec::from_model(&entry, &m)?.with_chassis(&m, &d.base);
-            if let Some(c) = &spec.chassis {
-                let floor = c
-                    .shapes
-                    .iter()
-                    .flatten()
-                    .map(|p| p.y)
-                    .fold(f32::MAX, f32::min);
-                eprintln!(
-                    "{name}: {} chassis shapes, lowest {floor:.2}",
-                    c.shapes.len()
-                );
-            }
+            let floor = spec
+                .shapes
+                .iter()
+                .flatten()
+                .map(|p| p.y)
+                .fold(f32::MAX, f32::min);
+            eprintln!(
+                "{name}: {} chassis shapes, lowest {floor:.2}",
+                spec.shapes.len()
+            );
             Some((spec, found))
         }) else {
             continue;
