@@ -1032,7 +1032,7 @@ impl Player {
         if let Some((_, rig)) = &mut self.model {
             let gait = if moved < 0.3 {
                 Gait::Idle
-            } else if intent.walk {
+            } else if intent.walk || self.aiming {
                 Gait::Walk
             } else if intent.sprint {
                 Gait::Sprint
@@ -1040,6 +1040,14 @@ impl Player {
                 Gait::Run
             };
             let clips = &self.clips;
+            // Aimed in she is `Crouched`: its gait's clip for what she
+            // holds ([`crate::held::CROUCH_HANDLES`]).
+            let crouched = self
+                .aiming
+                .then(|| self.moves.of(self.shown.class))
+                .flatten()
+                .and_then(|h| h.crouch.iter().find(|(g, _)| *g == gait))
+                .map(|&(_, c)| c);
             // The jump: a take-off (on the run or standing), the air,
             // and a landing.
             if jump.is_some() {
@@ -1168,6 +1176,14 @@ impl Player {
                 };
                 rig.two_handed = carry == Carry::Aim && upper.is_some();
                 rig.animator.set_upper(upper.zip(rig.upper.clone()));
+            } else if let Some(c) = crouched {
+                // The crouched clip carries her legs and body; moving,
+                // the aim's arms ride over it, as upright.
+                rig.gait = gait;
+                rig.animator.play(c);
+                let upper = (gait != Gait::Idle).then_some(clips.aim).flatten();
+                rig.animator.set_upper(upper.zip(rig.upper.clone()));
+                rig.two_handed = rig.barrel;
             } else {
                 rig.hold_rifle(gait, clips, carry);
                 // A pistol is held in the right hand alone.
@@ -1244,7 +1260,12 @@ impl Player {
             let rate = if leaping || self.stopping.is_some() {
                 1.0
             } else {
-                rig.play_rate(gait, moved, 0)
+                match crouched.map(|c| rig.clips[c].info.speed) {
+                    // Crouched and moving, its stride to her speed.
+                    Some(s) if gait != Gait::Idle && s > 0.1 => moved / s,
+                    Some(_) => 1.0,
+                    None => rig.play_rate(gait, moved, 0),
+                }
             };
             rig.advance(dt * rate);
         }

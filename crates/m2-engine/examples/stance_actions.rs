@@ -57,5 +57,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_or("-".into(), show);
         println!("{} -> {h}", cells.join(" "));
     }
+    // The on-foot table's rows for each handle named `#<hex>`.
+    let c = AnimationTable::parse(
+        &source.asset(table::CHARACTER_ANIMATIONS, table::ANIMATION_TABLE_TYPE)?,
+    )?;
+    let col = |n: &str| c.column(n);
+    for h in names.iter().filter_map(|n| n.strip_prefix('#')) {
+        let h = u32::from_str_radix(h, 16)?;
+        for row in 0..c.rows() {
+            if col(table::HANDLE).and_then(|k| c.cell(row, k)) != Some(h) {
+                continue;
+            }
+            let cell = |n: &str| col(n).and_then(|k| c.cell(row, k)).map_or("-".into(), show);
+            let clips: Vec<String> = col(table::ANIMATION)
+                .map(|k| c.list(row, k).iter().map(|v| format!("{v:08x}")).collect())
+                .unwrap_or_default();
+            println!(
+                "handle {h:08x}: {} {} {} -> {}",
+                cell(table::GENDER),
+                cell(table::CHARACTER_NAME),
+                cell(table::PRIMARY_EQUIPMENT_CLASS),
+                clips.join(",")
+            );
+        }
+    }
+    if names.iter().any(|n| n == "!handles") {
+        let mut all: Vec<u32> = (0..c.rows())
+            .filter_map(|r| col(table::HANDLE).and_then(|k| c.cell(r, k)))
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        for h in all {
+            println!("handle {}", show(h));
+        }
+    }
+    // Every animation table that holds a word named `@<hex>`.
+    let want: Vec<u32> = names
+        .iter()
+        .filter_map(|n| n.strip_prefix('@'))
+        .filter_map(|h| u32::from_str_radix(h, 16).ok())
+        .collect();
+    if !want.is_empty() {
+        let tables: Vec<u32> = {
+            let index = source.archive().index();
+            index
+                .assets()
+                .iter()
+                .filter(|a| index.type_hash(a) == table::ANIMATION_TABLE_TYPE)
+                .map(|a| a.name_hash)
+                .collect()
+        };
+        for t in tables {
+            let data = source.asset(t, table::ANIMATION_TABLE_TYPE)?;
+            for w in &want {
+                let hits = data
+                    .chunks_exact(4)
+                    .filter(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) == *w)
+                    .count();
+                if hits > 0 {
+                    println!("table {t:08x} ({} bytes) holds {w:08x} x{hits}", data.len());
+                }
+            }
+        }
+    }
     Ok(())
 }
