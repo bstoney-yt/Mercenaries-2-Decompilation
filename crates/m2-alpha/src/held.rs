@@ -77,23 +77,26 @@ pub struct Held {
     pub equip: HashMap<(Side, bool), usize>,
     /// Changing its clip, running (true) or standing.
     pub reload: HashMap<bool, usize>,
-    /// Crouched (aimed in, [`m2_engine::on_foot::CROUCH_HOLD`]): the
-    /// gaits' clips, from the on-foot table's `Crouch_*` handles
-    /// ([`CROUCH_HANDLES`]).
-    pub crouch: Vec<(Gait, usize)>,
+    /// Crouched and aiming ([`m2_engine::on_foot::CROUCH_HOLD`]): each
+    /// gait's clip, walking forwards (false) or backwards (true), from
+    /// the on-foot table's `Crouch_Aim_*` handles ([`CROUCH_HANDLES`]).
+    pub crouch: Vec<(Gait, bool, usize)>,
 }
 
-/// The on-foot table's handles for the crouched gaits, by name (their
-/// hashes are in the table; the names are the ones that hash to them,
-/// as `Upright_Idle`, `Upright_Walk_Forward`, `Upright_Jog_Forward` and
-/// `Upright_Run_Forward` do to the upright gaits' handles). The 360 aims
-/// in by going `Crouched`; the alpha's run and sprint are the 360's jog
-/// and run.
-pub const CROUCH_HANDLES: [(Gait, &str); 4] = [
-    (Gait::Idle, "Crouch_Idle"),
-    (Gait::Walk, "Crouch_Walk_Forward"),
-    (Gait::Run, "Crouch_Jog_Forward"),
-    (Gait::Sprint, "Crouch_Run_Forward"),
+/// The on-foot table's handles for the crouched, aiming gaits, by name
+/// (their hashes are in the table; the names are the ones that hash to
+/// them, as `Upright_Idle` and `Upright_Jog_Forward` do to the upright
+/// gaits'): the 360 aims in by going `Crouched`, and its aim movement
+/// (`AimMovementNodes`, 0x82802B10) is these seven and two 90 degree
+/// shuffles. The alpha's run and sprint are the 360's jog and run.
+pub const CROUCH_HANDLES: [(Gait, bool, &str); 7] = [
+    (Gait::Idle, false, "Crouch_Aim_Idle"),
+    (Gait::Walk, false, "Crouch_Aim_WalkForward"),
+    (Gait::Walk, true, "Crouch_Aim_WalkBackward"),
+    (Gait::Run, false, "Crouch_Aim_JogForward"),
+    (Gait::Run, true, "Crouch_Aim_JogBackward"),
+    (Gait::Sprint, false, "Crouch_Aim_RunForward"),
+    (Gait::Sprint, true, "Crouch_Aim_RunBackward"),
 ];
 
 impl Held {
@@ -278,9 +281,9 @@ pub fn resolve(
         }
         let crouch = CROUCH_HANDLES
             .iter()
-            .filter_map(|&(g, name)| {
+            .filter_map(|&(g, back, name)| {
                 let p = table::handle_clip(t, m2_assets::name_hash(name), who, class, fits)?;
-                Some((g, index(p.clip)?))
+                Some((g, back, index(p.clip)?))
             })
             .collect();
         held.push(Held {

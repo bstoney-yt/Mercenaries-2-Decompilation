@@ -465,7 +465,10 @@ fn hero_moves(
         let crouch: Vec<String> = r
             .crouch
             .iter()
-            .map(|(g, i)| format!("{} {}", format!("{g:?}").to_lowercase(), h(Some(*i))))
+            .map(|(g, back, i)| {
+                let way = if *back { " back" } else { "" };
+                format!("{}{way} {}", format!("{g:?}").to_lowercase(), h(Some(*i)))
+            })
             .collect();
         eprintln!("hero moves: {hero}: crouched {}", crouch.join(", "));
     }
