@@ -19,6 +19,16 @@
 //! gives each one `nCash`, `nFuel`, `tEquipment` and `tSupport` (item key
 //! to count): what she is meant to hold on arriving there by the skip.
 //!
+//! Measured on the PC (PR #255): in m2-alpha the menu opens as two pages,
+//! "Welcome to the Cheat Menu. (Page 1/2)" with Next page, Skip to a
+//! mission, Skip to a briefing, Complete current contract, Traverse
+//! mission hierarchy, Add cash, Add fuel, Add support and Close; page 2/2
+//! with Previous page and the rest. The PC screenshot showed one page
+//! without the developer entries; why is unknown. A `--skip-to` arrives
+//! with the stockpile's cash but not its fuel (her tank caps it at 300)
+//! and a few support items over (added to what she had, not set): how the
+//! original applies it is still to be traced.
+//!
 //! Unknown: how the developers opened the menu (no retail path calls it
 //! that the scripts show; the 360 program is still to be traced for a pad
 //! combination or INI switch). The key m2-alpha opens it with is invented.
