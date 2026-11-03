@@ -379,7 +379,13 @@ pub struct RunStop {
     pub sliding: Option<(f32, f32)>,
     length: f32,
     hurried: bool,
+    /// A person with an `Ai` component: their slide lasts [`AI_RUN_STOP`].
+    ai: bool,
 }
+
+/// How long the slide to a stop lasts for a person with an `Ai`
+/// component, seconds (0x82DE8850).
+pub const AI_RUN_STOP: f32 = 0.4;
 
 /// What [`RunStop::step`] did this step.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -394,6 +400,14 @@ pub enum StopEvent {
 }
 
 impl RunStop {
+    /// One for a person with an `Ai` component (the people).
+    pub fn people() -> Self {
+        Self {
+            ai: true,
+            ..Self::default()
+        }
+    }
+
     /// Steps on `dt` seconds with `speed` m/s asked (after the pace pick
     /// and [`Start`]); `m` gives the run and sprint paces, `sprinting`
     /// whether the sprint is held, `crouched` whether aimed in. The
@@ -442,7 +456,11 @@ impl RunStop {
             } else {
                 run
             };
-            self.length = run_stop_length(crouched, self.sprinted);
+            self.length = if self.ai {
+                AI_RUN_STOP
+            } else {
+                run_stop_length(crouched, self.sprinted)
+            };
             self.hurried = false;
             self.sliding = Some((from, 0.0));
             return (from, StopEvent::Began);

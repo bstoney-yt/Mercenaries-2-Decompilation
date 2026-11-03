@@ -184,7 +184,6 @@ impl Default for SmarterAi {
 
 /// People are drawn this close to the camera, metres.
 pub const DRAW_DISTANCE: f32 = 200.0;
-const TURN_RATE: f32 = 6.0;
 /// Seconds the dead take to topple when no fall clip fits their model.
 const TOPPLE: f32 = 0.6;
 /// Slowest a vehicle hurts people it meets, m/s.
@@ -193,6 +192,9 @@ pub const RUN_OVER: f32 = 2.5;
 /// hurt them again, and how hard it shoves them aside (m/s). Invented.
 pub const RAM_GAP: f32 = 1.0;
 const SHOVE: f32 = 4.0;
+/// Steps in a row stalled before people count it as walking into
+/// something (invented).
+const STALLED: u8 = 3;
 /// How far ahead (seconds) people see a vehicle coming at them.
 const DODGE_TIME: f32 = 2.0;
 
@@ -213,6 +215,10 @@ pub struct PersonKind {
     /// How fast they swim ashore, m/s: their template's `SwimJogSpeed`
     /// ([`m2_engine::tuning::SWIM_SPEEDS`]); `None` for a role's.
     pub swim: Option<f32>,
+    /// Their template's `_HumanPhysics` paces and turn
+    /// ([`m2_engine::on_foot::HumanMotion`]); `None` keeps the program's
+    /// defaults.
+    pub motion: Option<m2_engine::on_foot::HumanMotion>,
 }
 
 /// What a person is doing.
@@ -918,6 +924,18 @@ pub struct Npc {
     /// How fast they swim, m/s (their kind's [`PersonKind::swim`], else
     /// [`crate::player::SWIM_SPEED`]).
     pub swim_speed: f32,
+    /// How they move on foot, as the 360's people do
+    /// ([`m2_engine::on_foot`]): their kind's paces and turn, the way and
+    /// speed they go as it builds, their turn's speed and the slide to a
+    /// stop after a run.
+    pub motion: m2_engine::on_foot::HumanMotion,
+    ground: Vec2,
+    /// The speed they last moved at (m/s): what a stall is judged by.
+    pushed: f32,
+    stalled: u8,
+    way: Vec2,
+    turning: m2_engine::on_foot::Turn,
+    run_stop: m2_engine::on_foot::RunStop,
     /// Standing up out of the water: the climb-out's seconds left.
     climbing: f32,
 }
@@ -1069,6 +1087,13 @@ impl Npc {
             through: false,
             swim: None,
             swim_speed: crate::player::SWIM_SPEED,
+            motion: m2_engine::on_foot::HumanMotion::default(),
+            ground: Vec2::ZERO,
+            pushed: 0.0,
+            stalled: 0,
+            way: Vec2::Y,
+            turning: m2_engine::on_foot::Turn::default(),
+            run_stop: m2_engine::on_foot::RunStop::people(),
             climbing: 0.0,
         }
     }
@@ -1314,7 +1339,43 @@ impl Npc {
     /// sea, or the game's water heights: the villa's pool, rivers) deeper
     /// than [`WET`]: they stop at the water's edge, as at a wall (invented:
     /// nobody in the alpha swims; playtest 8).
+    ///
+    /// As the 360's people move (a person with an `Ai` component,
+    /// [`m2_engine::on_foot`]): the speed asked is taken to the nearest of
+    /// their paces as its share of their full speed picks it (0x82179350),
+    /// their speed builds at 7.5 m/s² and drops at once, they stop before
+    /// turning back and swing round at 180 degrees a second above
+    /// 1.75 m/s ([`m2_engine::on_foot::steer`]), and stopping from a run
+    /// they slide 0.4 s ([`m2_engine::on_foot::RunStop`]).
     fn move_dry(&mut self, physics: &Physics, wanted: Vec3, dt: f32) {
+        use m2_engine::on_foot;
+        let asked = Vec2::new(wanted.x, wanted.z);
+        let full = self.motion.full_speed().max(1e-4);
+        let (_, pace) = on_foot::pace(&self.motion, asked.length() / full, false, 1.0, false);
+        let asked = asked.normalize_or_zero() * pace;
+        self.ground = on_foot::steer(self.ground, asked, dt);
+        if self.ground.length_squared() > 1e-8 {
+            self.way = self.ground.normalize();
+        }
+        let (slide, stop) =
+            self.run_stop
+                .step(&self.motion, self.ground.length(), false, false, dt);
+        let ground = if self.run_stop.sliding.is_some() || stop == on_foot::StopEvent::Began {
+            self.way * slide
+        } else {
+            self.ground
+        };
+        // A step stalled short of what was asked; a few in a row are
+        // what counts as walking into something (a single one is the
+        // collision mesh catching the capsule at an inner edge as the
+        // speed builds).
+        self.stalled = if self.pushed > 0.3 && self.character.velocity.with_y(0.0).length() < 0.2 {
+            self.stalled.saturating_add(1)
+        } else {
+            0
+        };
+        self.pushed = ground.length();
+        let wanted = Vec3::new(ground.x, 0.0, ground.y);
         let before = self.character.position;
         physics.move_character(&mut self.character, wanted, None, dt);
         let now = self.character.position;
@@ -1351,7 +1412,16 @@ impl Npc {
         if turn > std::f32::consts::PI {
             turn -= std::f32::consts::TAU;
         }
-        self.facing += turn.clamp(-TURN_RATE * dt, TURN_RATE * dt);
+        // As the 360 turns people (0x8217BB60): building at 50 rad/s² to
+        // their template's `MaxRotationSpeed`.
+        let target = self.facing + turn;
+        self.facing = self.turning.step(
+            self.facing,
+            target,
+            m2_engine::on_foot::TURN_ACCEL,
+            self.motion.max_rotation.to_radians(),
+            dt,
+        );
         turn.abs()
     }
 
@@ -1518,7 +1588,7 @@ impl Npc {
         }
         self.move_dry(physics, wanted, dt);
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
-        if wanted != Vec3::ZERO && moved < 0.2 {
+        if self.pushed > 0.3 && moved < 0.2 && self.stalled >= STALLED {
             // Walked into something: stop stepping; a chase goes round it
             // (along it the clearer way, or back if it is a corner) for a
             // while, then on.
@@ -1997,7 +2067,7 @@ impl Npc {
         // Walked into something: give up on that point (strolls) or wait
         // and try again (routes).
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
-        if wanted != Vec3::ZERO && moved < 0.2 {
+        if self.pushed > 0.3 && moved < 0.2 && self.stalled >= STALLED {
             match (&mut self.flee, &mut self.brain) {
                 // Ran into a wall: along it, the clearer way, or back the
                 // way they came if it is a corner (not stood against it).
@@ -3025,6 +3095,11 @@ impl People {
                 .get(npc.kind)
                 .and_then(|k| k.swim)
                 .unwrap_or(crate::player::SWIM_SPEED);
+            npc.motion = self
+                .kinds
+                .get(npc.kind)
+                .and_then(|k| k.motion)
+                .unwrap_or_default();
             npc.rammed = (npc.rammed - dt).max(0.0);
             let facing = npc.facing;
             npc.update(physics, &mut self.rng, threat, dt);
@@ -3935,12 +4010,15 @@ pub(crate) mod tests {
         }
         assert!(npc.landed);
         assert!(furthest > 9.0, "{furthest}");
-        // Back at the start (or pausing near it) by now: 10 m at 1.4 m/s
-        // each way plus a pause.
+        // Back at the start (or pausing near it) by now: 10 m at the
+        // program's default walk (1.2 m/s, the paces the people take,
+        // m2_engine::on_foot::pace) each way plus a pause.
+        let mut nearest: f32 = f32::INFINITY;
         for _ in 0..60 * 14 {
             npc.update(&physics, &mut rng, None, dt);
+            nearest = nearest.min(npc.character.position.z);
         }
-        assert!(npc.character.position.z < 2.0, "{}", npc.character.position);
+        assert!(nearest < 1.0, "{nearest}");
     }
 
     #[test]
@@ -4537,6 +4615,7 @@ pub(crate) mod tests {
             model: empty_model(),
             rig: rig(),
             swim: None,
+            motion: None,
         }
     }
 
@@ -4644,11 +4723,15 @@ pub(crate) mod tests {
             shots += usize::from(std::mem::take(&mut soldier.fires));
         }
         let gone = soldier.character.position.z - start.z;
-        let pursue = SPRINT * soldier.ai.pursue_speed;
-        assert!(
-            gone > pursue * 0.6 && gone < pursue * 1.1,
-            "{gone} vs {pursue}"
-        );
+        // At the pace his PursueSpeed picks from his template's (the
+        // program's default run, 5 m/s), built up at 7.5 m/s²: 3.3 m in
+        // the second.
+        let m = soldier.motion;
+        let ask = SPRINT * soldier.ai.pursue_speed / m.full_speed();
+        let (_, pace) = m2_engine::on_foot::pace(&m, ask, false, 1.0, false);
+        let ramp = pace / m2_engine::on_foot::MOVE_ACCEL;
+        let expect = pace * ramp * 0.5 + pace * (1.0 - ramp).max(0.0);
+        assert!((gone - expect).abs() < expect * 0.25, "{gone} vs {expect}");
         assert_eq!(shots, 0, "out of firing range");
     }
 

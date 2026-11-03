@@ -2675,6 +2675,9 @@ impl Scene {
                                     )
                                 })
                         );
+                        // Their template's paces and turn (the role's, a
+                        // template too where it is one).
+                        let motion = db.and_then(|db| db.human_motion(&p.role));
                         self.people.add_kind(PersonKind {
                             role: p.role,
                             named,
@@ -2682,6 +2685,7 @@ impl Scene {
                             model,
                             rig,
                             swim,
+                            motion,
                         });
                     }
                     None => {
