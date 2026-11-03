@@ -6285,6 +6285,7 @@ mod tests {
             node_parents: Vec::new(),
             aimers: Vec::new(),
             damage: None,
+            chassis: None,
             tuning: VehicleTuning {
                 gun: Some(gun),
                 ..VehicleTuning::default()

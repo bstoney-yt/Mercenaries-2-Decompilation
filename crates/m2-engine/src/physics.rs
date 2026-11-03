@@ -25,7 +25,7 @@ use m2_assets::Model;
 use m2_assets::model::GeometryKind;
 use m2_assets::physics::{Body, Physics as Phy2};
 use m2_assets::vertex::DeclUsage;
-use m2_math::glam::{Mat4, Quat, Vec3};
+use m2_math::glam::{Mat3, Mat4, Quat, Vec3};
 use rapier3d::control::{
     CharacterAutostep, CharacterLength, DynamicRayCastVehicleController,
     KinematicCharacterController, WheelTuning,
@@ -66,6 +66,52 @@ fn pose(position: Vec3, rotation: Quat) -> r::Pose {
         vector(position),
         r::Rotation::from_array(rotation.to_array()),
     )
+}
+
+/// Inertia this small against another axis's is raised to it (0x82167500,
+/// its caller's argument from 0x820BAFBC).
+const INERTIA_FLOOR: f32 = 1.0 / 15.0;
+/// Every inertia the game sets is this much over what it worked out
+/// (0x82167500, 0x820F9274).
+const INERTIA_SCALE: f32 = 16.0 / 15.0;
+
+/// An inertia as the 360 code sets it on a body (0x82167500): each axis
+/// (its row's length) under [`INERTIA_FLOOR`] of another's raised to that,
+/// weighed against the first other axis in turn (x against y, else z; y
+/// against x, else z; z against x, else y) by their lengths before any is
+/// raised, and the whole then made [`INERTIA_SCALE`] larger.
+fn clip_inertia(i: Mat3) -> Mat3 {
+    let rows = [i.row(0), i.row(1), i.row(2)];
+    let len = rows.map(|r| r.length());
+    let mut out = rows;
+    for (k, (a, b)) in [(0, (1, 2)), (1, (0, 2)), (2, (0, 1))] {
+        for other in [a, b] {
+            let ratio = len[k] / len[other];
+            if ratio < INERTIA_FLOOR {
+                out[k] *= INERTIA_FLOOR / ratio;
+                break;
+            }
+        }
+    }
+    Mat3::from_cols(out[0], out[1], out[2]).transpose() * INERTIA_SCALE
+}
+
+/// The mass and inertia (kg m², model axes) a tank, boat or helicopter's
+/// chassis body ends up with. From the 360 code: each such object's set-up
+/// hands its template's `Mass` (record word 0) to its physics (vtable
+/// +0x128, 0x82182848), which gives it to its first body ([`CHASSIS`])
+/// and, from the body's `PHY2` record, sets its inertia to the record's
+/// times that mass over the record's, clipped (0x82167700,
+/// [`clip_inertia`]); setting the mass alone leaves the inertia be
+/// (0x8262C088). With no `Mass` it keeps the record's mass, and the body
+/// builder clips the record's inertia (0x8216A290).
+///
+/// [`CHASSIS`]: crate::vehicle::CHASSIS
+fn chassis_mass(c: &crate::vehicle::Chassis, mass: Option<f32>) -> (f32, Mat3) {
+    match mass.filter(|m| *m > 0.0 && c.mass > 0.0) {
+        Some(m) => (m, clip_inertia(c.inertia * (m / c.mass))),
+        None => (c.mass, clip_inertia(c.inertia)),
+    }
 }
 
 /// A static collision shape, shared between every place it is used.
@@ -2884,12 +2930,15 @@ impl Physics {
                 .can_sleep(false)
                 .ccd_enabled(true),
         );
-        // A tank's, boat's or helicopter's (and a car's with no template):
-        // mass low in the hull and inertia a little above a solid box's,
-        // invented. The 360 code works theirs out from their PHY2 shapes
-        // (0x8216A290, Havok's computer, clipped to 1/15 at 0x82167500);
-        // not yet ported.
-        let m = spec.mass;
+        // A tank's, boat's or helicopter's: its chassis body's, as the 360
+        // code sets it (see [`chassis_mass`]). Without one (a model with no
+        // `PHY2` chassis, a car with no template): mass low in the hull and
+        // inertia a little above a solid box's, invented.
+        let chassis = spec
+            .chassis
+            .filter(|_| spec.tracked || spec.wheels.is_empty())
+            .map(|c| chassis_mass(&c, spec.tuning.mass));
+        let m = chassis.map_or(spec.mass, |c| c.0);
         let size = half * 2.0;
         let inertia = Vec3::new(
             size.y * size.y + size.z * size.z,
@@ -2923,7 +2972,31 @@ impl Physics {
                     / spec.wheels.len() as f32;
                 mid + Vec3::from(b.centre_of_mass) - centre
             }
-            None => Vec3::new(0.0, -half.y * 0.8, 0.0),
+            None => match spec.chassis.filter(|_| chassis.is_some()) {
+                // A tank's moves by its template's `CenterOfMassOffset`
+                // (0x821A4D40 -> 0x8262A680); a boat's or helicopter's stays.
+                Some(c) => {
+                    let offset = spec
+                        .tuning
+                        .tank
+                        .filter(|_| spec.tracked)
+                        .map_or(Vec3::ZERO, |t| Vec3::from(t.centre_of_mass));
+                    c.centre_of_mass + offset - centre
+                }
+                None => Vec3::new(0.0, -half.y * 0.8, 0.0),
+            },
+        };
+        let mass = match chassis {
+            // Rapier takes it symmetric; a clipped axis leaves it a touch
+            // off (none of the 57 chassis bodies: their axes are within 14x).
+            Some((_, i)) => r::MassProperties::with_inertia_matrix(
+                vector(com),
+                m,
+                rapier3d::math::Matrix::from_cols_array(
+                    &((i + i.transpose()) * 0.5).to_cols_array(),
+                ),
+            ),
+            None => r::MassProperties::new(vector(com), m, vector(inertia)),
         };
         let hull = r::InteractionGroups::new(VEHICLE, r::Group::ALL, r::InteractionTestMode::And);
         let (car_hull, hull_friction) = hull_feel(spec);
@@ -2938,7 +3011,7 @@ impl Physics {
         };
         let collider = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
             .translation(vector(centre))
-            .mass_properties(r::MassProperties::new(vector(com), m, vector(inertia)))
+            .mass_properties(mass)
             .friction(hull_friction)
             .friction_combine_rule(combine)
             .collision_groups(hull);
@@ -3079,7 +3152,7 @@ impl Physics {
         self.vehicles.push(Some(VehicleBody {
             controller,
             bed: false,
-            mass: spec.mass,
+            mass: m,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
             tops,
             tyres,
@@ -4777,6 +4850,7 @@ mod tests {
             node_parents: Vec::new(),
             aimers: Vec::new(),
             damage: None,
+            chassis: None,
             tuning: crate::VehicleTuning::default(),
         }
     }
@@ -5325,6 +5399,60 @@ mod tests {
         let com = vec3(props.local_com);
         let want = Vec3::new(0.0, 0.35 + top - 0.2, 0.05 + 0.1);
         assert!((com - want).length() < 1e-3, "centre {com} want {want}");
+    }
+
+    /// 0x82167500: an axis under a fifteenth of the first other it is
+    /// weighed against is raised to that, and every inertia comes out
+    /// 16/15 of what was worked out.
+    #[test]
+    fn an_inertia_is_clipped_to_a_fifteenth_and_raised_by_a_fifteenth() {
+        let i = clip_inertia(Mat3::from_diagonal(Vec3::new(2.0, 1.0, 1.5)));
+        let want = Vec3::new(2.0, 1.0, 1.5) * 16.0 / 15.0;
+        assert!(
+            (Vec3::new(i.x_axis.x, i.y_axis.y, i.z_axis.z) - want).length() < 1e-5,
+            "{i}"
+        );
+        // A needle: its long axis's inertia is raised to a fifteenth of
+        // the x axis's.
+        let i = clip_inertia(Mat3::from_diagonal(Vec3::new(10.0, 10.0, 0.1)));
+        let want = Vec3::new(10.0, 10.0, 10.0 / 15.0) * 16.0 / 15.0;
+        assert!(
+            (Vec3::new(i.x_axis.x, i.y_axis.y, i.z_axis.z) - want).length() < 1e-4,
+            "{i}"
+        );
+        // x is weighed against y alone when y already makes it too small,
+        // even though z is larger.
+        let i = clip_inertia(Mat3::from_diagonal(Vec3::new(0.01, 1.0, 30.0)));
+        assert!((i.x_axis.x - 1.0 / 15.0 * 16.0 / 15.0).abs() < 1e-5, "{i}");
+    }
+
+    /// A helicopter's (or a tank's, or a boat's) chassis keeps its
+    /// record's inertia per kilogram at its template's mass (0x82167700),
+    /// and its record's centre of mass.
+    #[test]
+    fn a_helicopters_inertia_and_centre_of_mass_are_its_chassis_bodys() {
+        let mut spec = helicopter();
+        spec.tuning.mass = Some(8300.0);
+        spec.chassis = Some(crate::vehicle::Chassis {
+            mass: 83_000.0,
+            inertia: Mat3::from_diagonal(Vec3::new(400_000.0, 500_000.0, 200_000.0)),
+            centre_of_mass: Vec3::new(0.1, 1.2, 0.5),
+        });
+        let mut p = Physics::new();
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 1.0, 0.0), 0.0);
+        let v = p.vehicles[id.0].as_ref().unwrap();
+        let b = &p.world.bodies[v.controller.chassis];
+        let props = b.mass_properties().local_mprops;
+        assert!((props.mass() - 8300.0).abs() < 1e-2);
+        let mut i = vec3(props.principal_inertia()).to_array();
+        i.sort_by(f32::total_cmp);
+        let want = [20_000.0, 40_000.0, 50_000.0].map(|x| x * 16.0 / 15.0);
+        for (got, want) in i.iter().zip(want) {
+            assert!((got - want).abs() < 1.0, "inertia {i:?}");
+        }
+        // Model space, as the body's frame is.
+        let com = vec3(props.local_com);
+        assert!((com - Vec3::new(0.1, 1.2, 0.5)).length() < 1e-3, "{com}");
     }
 
     /// The 360 code's per-60th decay (0x821A3B38): a whole number of

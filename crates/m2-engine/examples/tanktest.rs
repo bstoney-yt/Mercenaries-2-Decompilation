@@ -101,7 +101,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     h.map(|p| (p.z * 100.0).round() / 100.0)
                 );
             }
-            Some((VehicleSpec::from_model(&entry, &m)?, found))
+            Some((
+                VehicleSpec::from_model(&entry, &m)?.with_chassis(&d.base),
+                found,
+            ))
         }) else {
             continue;
         };

@@ -170,6 +170,7 @@ pub fn vehicle(entry: &CatalogueEntry) -> (VehicleSpec, CpuModel) {
         node_parents: Vec::new(),
         aimers: Vec::new(),
         damage: None,
+        chassis: None,
         rest,
     };
     (spec, cpu)
