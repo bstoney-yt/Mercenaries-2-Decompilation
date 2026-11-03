@@ -652,6 +652,9 @@ pub struct HudState {
     /// starts with, as the constants have it.
     pub gun: Option<(u32, String, m2_engine::weapons::GunUi)>,
     pub fired: Fired,
+    /// The times she asked to see her ammo (reload, a weapon switch;
+    /// `Combat::ammo_shown`): each puts both ammo boxes up.
+    pub ammo_shown: u32,
     /// The rifle's rounds: in the clip, stored.
     pub rifle: Rounds,
     /// Rounds the gun in her hands holds a clip (the carbine's 30, the
@@ -975,6 +978,7 @@ impl HudState {
                 r.template.zip(r.ui).map(|(t, ui)| (t, r.name.clone(), ui))
             },
             fired: game.combat.fired,
+            ammo_shown: game.combat.ammo_shown,
             picked: game.combat.picked,
             launcher: game.combat.launcher_rounds,
             rifle: game.combat.rifle_rounds,
@@ -2002,6 +2006,8 @@ struct Told {
     ammo: Option<[i64; 5]>,
     /// Whether the explosive box has been told her explosive.
     explosive: bool,
+    /// The ammo-box requests passed on ([`HudState::ammo_shown`]).
+    ammo_shown: u32,
     /// She was in a vehicle ([`HudState::in_vehicle`]).
     in_vehicle: Option<bool>,
     /// The gun box's icon widgets as last logged ([`Thread::gun_box`]).
@@ -3817,6 +3823,20 @@ impl Thread {
         if !self.told.explosive {
             self.told.explosive = true;
             fire(lua, "GuiWeaponEquippedUpdate", explosive_equipped(lua)?)?;
+        }
+        // Reload or a weapon switch pressed: both ammo boxes up, as the
+        // 360's on-foot input sends it (0x824333E0: `GuiShowAmmoCounter`
+        // with `bShowGun` and `bShowExplosive` true).
+        if s.ammo_shown != self.told.ammo_shown {
+            self.told.ammo_shown = s.ammo_shown;
+            let t = table(
+                lua,
+                [
+                    ("bShowGun", Value::Boolean(true)),
+                    ("bShowExplosive", Value::Boolean(true)),
+                ],
+            )?;
+            fire(lua, "GuiShowAmmoCounter", t)?;
         }
         let ammo = ammo(
             s.weapon,

@@ -1689,6 +1689,18 @@ impl Game {
                 // the scripts put her weapons away for its shooting range,
                 // where the targets are brought down from its emplaced
                 // guns; inferred from the scripts).
+                // The 360's on-foot input (0x824333E0) puts both ammo boxes
+                // up (`GuiShowAmmoCounter`) as the reload key or either
+                // weapon switch is pressed: its input bits 0x80 (the reload
+                // the Lua `Reload` calls), 0x200000 and 8 (the weapon equip
+                // and stow `EquipWeapon` and `StowWeapon` call).
+                if field.player.driving.is_none()
+                    && (intent.trigger.reload
+                        || intent.trigger.select.is_some()
+                        || intent.trigger.next_explosive)
+                {
+                    self.combat.ammo_shown += 1;
+                }
                 let manning = self.combat.manned.is_some() && !field.player.swimming();
                 let mut trigger = if field.player.weapons_away() && !manning {
                     intent.trigger.weapons_away()
