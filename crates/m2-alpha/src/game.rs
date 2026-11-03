@@ -992,6 +992,11 @@ impl Game {
                     let from = self.ride.map(|(_, s)| s);
                     match crate::ride::transfer(crate::ride::Ride::of(v), from) {
                         Some(to) => {
+                            // Over by the clip, from the seat she leaves.
+                            if v.spec.seating.is_some() {
+                                self.boarding =
+                                    Some(crate::boarding::Boarding::transfer(i, from, to));
+                            }
                             self.ride = Some((i, to));
                             self.combat.seat = crate::ride::armed_index(
                                 crate::ride::Ride::of(v),
@@ -1236,11 +1241,14 @@ impl Game {
                                 // By the clips, through the entrance she took, for
                                 // the seat it gave her (before any slide over).
                                 if scene.vehicles[*i].spec.seating.is_some() {
-                                    self.boarding = Some(crate::boarding::Boarding::enter(
+                                    let mut boarding = crate::boarding::Boarding::enter(
                                         *i,
                                         b.slid_from.or(b.seat),
                                         *entrance,
-                                    ));
+                                    );
+                                    boarding.transfer_to = b.seat.filter(|_| b.slid_from.is_some());
+                                    boarding.stood = Some(player.character.position);
+                                    self.boarding = Some(boarding);
                                 }
                                 self.ride = b.seat.map(|s| (*i, s));
                                 let v = &scene.vehicles[*i];

@@ -257,6 +257,10 @@ pub enum Step {
     Exit { door: bool },
     /// `ExitVehicleCloseDoor`.
     CloseAfterExit,
+    /// `SeatToSeatTransfer`: over from her seat to another, played at the
+    /// seat she leaves (0x822A6FF0 sends it; at its `Complete` 0x822A7198
+    /// seats her in the other).
+    Transfer,
 }
 
 impl Step {
@@ -269,6 +273,7 @@ impl Step {
             Step::OpenToExit => "ExitVehicleOpenDoor",
             Step::Exit { .. } => "ExitVehicle",
             Step::CloseAfterExit => "ExitVehicleCloseDoor",
+            Step::Transfer => "SeatToSeatTransfer",
         }
     }
 
@@ -309,7 +314,10 @@ impl Step {
                 .map(|_| Step::CloseAfterEnter),
             Step::OpenToExit => Some(Step::Exit { door: true }),
             Step::Exit { door: true } => Some(Step::CloseAfterExit),
-            Step::CloseAfterEnter | Step::Exit { door: false } | Step::CloseAfterExit => None,
+            Step::CloseAfterEnter
+            | Step::Exit { door: false }
+            | Step::CloseAfterExit
+            | Step::Transfer => None,
         }
     }
 }
@@ -433,6 +441,14 @@ mod tests {
             Step::Enter.next(Some(20f32.to_radians().cos())),
             Some(Step::CloseAfterEnter)
         );
+    }
+
+    #[test]
+    fn the_slide_over_is_a_step_of_its_own() {
+        assert_eq!(Step::Transfer.action(), "SeatToSeatTransfer");
+        assert_eq!(m2_assets::name_hash(Step::Transfer.action()), 0x13c2_c767);
+        assert!(!Step::Transfer.exiting());
+        assert_eq!(Step::Transfer.next(Some(1.0)), None);
     }
 
     #[test]

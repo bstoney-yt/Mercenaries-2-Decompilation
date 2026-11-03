@@ -1495,17 +1495,25 @@ impl Hijacks {
             Step::OpenToExit,
             Step::Exit { door: false },
             Step::CloseAfterExit,
+            Step::Transfer,
         ];
         let clips: Vec<(&'static str, Option<u32>)> = steps
             .iter()
             .map(|s| {
-                let clip = animation_table::seat_clip_row(
+                // The table's target: the seat slid over to, else the
+                // entrance.
+                let target = match s {
+                    Step::Transfer => b.transfer_to,
+                    _ => b.entrance,
+                };
+                let clip = animation_table::seat_clip_row_to(
                     actions,
                     vehicles,
                     "InVehicle",
                     s.action(),
                     seat.set,
                     Some(seat_name),
+                    target,
                 )
                 .map(|(clip, _)| clip);
                 (s.action(), clip)
@@ -1518,7 +1526,8 @@ impl Hijacks {
                 .and_then(|c| c.1)
         };
         let mut step = b.step;
-        let mut begun = false;
+        // A step set before any clip played (a slide over) begins now.
+        let mut begun = b.step.is_some() && b.t == 0.0;
         if step.is_none() {
             step = Some(if b.exiting {
                 Step::exit(cos)
@@ -1572,6 +1581,10 @@ impl Hijacks {
             }
             let door = self.boarding_door(game, &b);
             step = s.next(door.map(|(d, sw)| sw.cos(&d)));
+            // In, she slides over to the seat hero.lua gave her.
+            if step.is_none() && !b.exiting && s != Step::Transfer && b.transfer_to.is_some() {
+                step = Some(Step::Transfer);
+            }
             begun = true;
             if let Some(n) = step {
                 eprintln!("boarding: then {}", n.action());
@@ -1631,7 +1644,24 @@ impl Hijacks {
         // stands 0.08 m from the entrance's hardpoint and her first exit
         // frame within 0.02 m of where her seated loop has her.
         let origin = exit_point.filter(|_| s.exiting()).unwrap_or(seat.at);
-        let frame = at * Mat4::from_translation(origin + seat_offset(rig, index));
+        let mut frame = at * Mat4::from_translation(origin + seat_offset(rig, index));
+        // Getting in, she slides from where she stood to where her first
+        // clip starts ([`crate::boarding::SLIDE`]).
+        if let Some(b) = game.boarding.as_mut() {
+            if b.elapsed == 0.0
+                && !b.exiting
+                && let Some(stood) = b.stood
+            {
+                let start = frame.transform_point3(Vec3::ZERO);
+                b.slide = (stood - start).with_y(0.0);
+                eprintln!(
+                    "boarding: she slides {:.2} m to her clip's start",
+                    b.slide.length()
+                );
+            }
+            frame = Mat4::from_translation(b.slide * b.slide_left()) * frame;
+            b.elapsed += dt;
+        }
         p.seat_frame = Some(frame);
         p.character.position = frame.transform_point3(Vec3::ZERO);
         p.character.velocity = Vec3::ZERO;
@@ -1716,7 +1746,18 @@ impl Hijacks {
             "boarding: her exit clips end at local {:.2?}",
             local.to_array()
         );
-        crate::game::get_out_at(&world.physics, v, b.seat, p, place, facing);
+        // Where she stands is kept unless it is blocked (0x822A2648 tests
+        // it, 0x8229A8D8, and else finds a clear point, 0x822A13D0): here,
+        // within the hull's footprint (a tank's catch-all exit clip leaves
+        // her on the hull), she gets out as without the clips.
+        let (lo, hi) = v.spec.bounds;
+        let inside = (lo.x..=hi.x).contains(&local.x) && (lo.z..=hi.z).contains(&local.z);
+        if inside {
+            eprintln!("boarding: that is within the hull: out as without the clips");
+            crate::game::get_out(&world.physics, v, b.seat, p);
+        } else {
+            crate::game::get_out_at(&world.physics, v, b.seat, p, place, facing);
+        }
         p.seated = false;
         p.seat_frame = None;
         game.ride = None;
