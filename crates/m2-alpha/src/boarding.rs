@@ -42,6 +42,12 @@ pub struct Boarding {
     pub t: f32,
     /// Seconds since a clip was last played for it.
     pub unplayed: f32,
+    /// Diving for a boat from where she swam (world space), and the
+    /// seconds of the dive left ([`m2_engine::seats::DIVE_TIME`]).
+    pub dive: Option<(m2_math::glam::Vec3, f32)>,
+    /// The dive is over: she is at the entrance, where her `EnterVehicle`
+    /// clip now plays from.
+    pub dived: bool,
 }
 
 impl Boarding {
@@ -55,6 +61,8 @@ impl Boarding {
             step: None,
             t: 0.0,
             unplayed: 0.0,
+            dive: None,
+            dived: false,
         }
     }
 

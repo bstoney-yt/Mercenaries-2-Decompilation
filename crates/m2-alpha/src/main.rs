@@ -413,6 +413,9 @@ struct Options {
     /// With `--board`: the entrance she stands at, by name or hash
     /// (`entrance_driver`, `8efe45f3`); else the front right one.
     entrance: Option<u32>,
+    /// With `--board`: how far out from the entrance she is put, metres
+    /// (0.6 when not given; further, off a boat, she swims).
+    board_off: Option<f32>,
     mission_seconds: f32,
     /// With `--mission --autoplay`: she plays on through this many
     /// contracts (the first, then the story's next ones) before she stops
@@ -745,6 +748,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                         .context("--ladder-check expects seconds")?,
                 );
             }
+            "--board-off" => o.board_off = Some(value()?.parse()?),
             "--entrance" => {
                 let v = value()?;
                 o.entrance = Some(
@@ -6366,8 +6370,9 @@ fn board_animated(
             .and_then(|p| p.model.as_ref())
             .and_then(|(_, r)| r.animator.current().map(|(c, ct)| (r.clips[c].hash, ct)));
         eprintln!(
-            "board: {phase} t={t:.2} step {:?} her local {:.2?} clip {clip:08x?} doors {:?}",
+            "board: {phase} t={t:.2} step {:?} swimming {} her local {:.2?} clip {clip:08x?} doors {:?}",
             game.boarding.as_ref().and_then(|b| b.step),
+            game.scene.player.as_ref().is_some_and(|p| p.swimming()),
             her.map(|h| h.to_array()),
             v.door_turns
                 .iter()
@@ -6472,14 +6477,43 @@ fn board_stand(
     }
     for (e, p) in &spec.entrances {
         eprintln!(
-            "board: entrance {:08x} at local {:.2?} hijack-only {}",
+            "board: entrance {:08x} at local {:.2?} hijack-only {} long-search {} dive {}",
             e.name,
             p.to_array(),
-            e.params.hijack_only
+            e.params.hijack_only,
+            e.params.long_search,
+            e.params.use_dive
         );
     }
     let (door, centre) = (at.transform_point3(local), at.transform_point3(Vec3::ZERO));
-    let stand = door + (door - centre).with_y(0.0).normalize_or_zero() * 0.6;
+    let off = options.board_off.unwrap_or(0.6);
+    let mut stand = door + (door - centre).with_y(0.0).normalize_or_zero() * off;
+    // Off a boat, out where the water is deepest (to swim there).
+    if game.scene.vehicles[i].spec.is_boat()
+        && off > 1.5
+        && let Some(world) = game.scene.world.as_ref()
+    {
+        let physics = &world.physics;
+        let depth = |p: Vec3| {
+            let water = physics.water_at(p.x, p.z)?;
+            let top = water + 50.0;
+            let ground = physics
+                .cast_ray(p.with_y(top), Vec3::NEG_Y, 600.0)
+                .map(|(d, _)| top - d)?;
+            Some((water, water - ground))
+        };
+        let best = (0..16)
+            .filter_map(|k| {
+                let a = k as f32 / 16.0 * std::f32::consts::TAU;
+                let p = door + Vec3::new(a.sin(), 0.0, a.cos()) * off;
+                depth(p).map(|(w, d)| (p.with_y(w), d))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((p, d)) = best {
+            eprintln!("board: {d:.1} m of water {off} m off the entrance");
+            stand = p;
+        }
+    }
     eprintln!(
         "board: the {label}: standing by entrance {:#010x} at local {:.2?}",
         e.name,

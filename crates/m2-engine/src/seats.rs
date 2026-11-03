@@ -185,10 +185,37 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, DriverPoints> {
 /// How far past an entrance's `UseDistance` she may stand and still be
 /// offered it, metres (0x82440F30's 1.0 at 0x820BAEE8).
 pub const SEARCH_PAD: f32 = 1.0;
-/// The pad of a `bLongSearchDistance` entrance while she is in the air
-/// near a fast boat or a ladder (25.0 at 0x82B75FD0; the alpha does not
-/// use it: its conditions are only partly traced).
+/// The pad of a `bLongSearchDistance` entrance of a boat afloat while she
+/// swims (25.0 at 0x82B75FD0; [`search_pad`]).
 pub const LONG_SEARCH_PAD: f32 = 25.0;
+/// How far (flat) she must be from a `bUseDive` entrance to dive for it,
+/// metres (0x8229F890 compares 9.0 at 0x820F9224 with the distance squared).
+pub const DIVE_MIN: f32 = 3.0;
+/// How long her dive for a boat lasts, from where she swam to the
+/// entrance, seconds (1.2 at 0x820C9BB8, 0x8229FDE8).
+pub const DIVE_TIME: f32 = 1.2;
+
+/// The pad past an entrance's `UseDistance` she is offered it within
+/// (0x82440F30): [`LONG_SEARCH_PAD`] for a `bLongSearchDistance` entrance
+/// of a boat (vehicle type 10) afloat while she `swims` (her character
+/// state 4 or 5), else [`SEARCH_PAD`]. That states 4 and 5 are swimming
+/// is inferred (the state table's `Dive` leads to `SwimToEnterBoat`, and
+/// the 360's `InVehicle` `Dive` is reached from `Swim`); a ladder's long
+/// search (the other case) is not used.
+pub fn search_pad(p: &EntranceParams, swims: bool, boat_afloat: bool) -> f32 {
+    if p.long_search && swims && boat_afloat {
+        LONG_SEARCH_PAD
+    } else {
+        SEARCH_PAD
+    }
+}
+
+/// Whether she dives for the entrance rather than getting in where she is
+/// (0x8229F890): it is `bUseDive`, she swims, the boat is afloat, and she
+/// is at least [`DIVE_MIN`] from it, flat (`flat` metres).
+pub fn dives(p: &EntranceParams, swims: bool, boat_afloat: bool, flat: f32) -> bool {
+    p.use_dive && swims && boat_afloat && flat * flat >= DIVE_MIN * DIVE_MIN
+}
 /// How many entrances the search keeps (0x82440F30 stops at 16).
 pub const LIST_CAP: usize = 16;
 /// A vehicle whose up axis has less height than this is not got into
@@ -207,6 +234,8 @@ pub struct EntranceParams {
     pub boarding: bool,
     pub ladder: bool,
     pub long_search: bool,
+    /// `bUseDive`: swimming, she dives for it from afar ([`dives`]).
+    pub use_dive: bool,
     pub speed_match: bool,
     /// `DoorName`: the vehicle's `Door` record (by its `Name`) she opens
     /// to use it ([`crate::vehicle_door`]); `None`: no door.
@@ -221,6 +250,7 @@ impl Default for EntranceParams {
             boarding: false,
             ladder: false,
             long_search: false,
+            use_dive: false,
             speed_match: false,
             door: None,
         }
@@ -665,6 +695,7 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
             boarding: bit(&entrance_params, r, "bBoarding"),
             ladder: bit(&entrance_params, r, "bLadder"),
             long_search: bit(&entrance_params, r, "bLongSearchDistance"),
+            use_dive: bit(&entrance_params, r, "bUseDive"),
             speed_match: bit(&entrance_params, r, "bSpeedMatchOnExit"),
             door: entrance_params.word(r, h("DoorName")).filter(|&n| n != 0),
         }
@@ -1116,6 +1147,24 @@ mod tests {
             seat_for_entrance(&barred, e("entrance_driver"), |_| false),
             None
         );
+    }
+
+    #[test]
+    fn swimming_she_is_offered_a_boat_from_afar_and_dives_for_it() {
+        let p = EntranceParams {
+            long_search: true,
+            use_dive: true,
+            ..EntranceParams::default()
+        };
+        assert_eq!(search_pad(&p, true, true), 25.0);
+        assert_eq!(search_pad(&p, false, true), SEARCH_PAD);
+        assert_eq!(search_pad(&p, true, false), SEARCH_PAD);
+        assert!(dives(&p, true, true, 3.0));
+        assert!(!dives(&p, true, true, 2.99));
+        assert!(!dives(&p, false, true, 10.0));
+        let plain = EntranceParams::default();
+        assert!(!dives(&plain, true, true, 10.0));
+        assert_eq!(name_hash("bUseDive"), 0xdcc5_0074);
     }
 
     #[test]

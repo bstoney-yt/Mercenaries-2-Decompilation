@@ -1496,6 +1496,8 @@ impl Hijacks {
             Step::Exit { door: false },
             Step::CloseAfterExit,
             Step::Transfer,
+            Step::Dive,
+            Step::SwimToBoat,
         ];
         let clips: Vec<(&'static str, Option<u32>)> = steps
             .iter()
@@ -1531,6 +1533,8 @@ impl Hijacks {
         if step.is_none() {
             step = Some(if b.exiting {
                 Step::exit(cos)
+            } else if b.dive.is_some() {
+                Step::Dive
             } else {
                 Step::enter(cos)
             });
@@ -1550,6 +1554,21 @@ impl Hijacks {
                 ),
                 step
             );
+        }
+        // Diving for a boat: when its time is up she is at the entrance and
+        // gets in (0x8229FDE8 sends `EnterVehicle`), whatever plays.
+        if let Some((from, left)) = b.dive {
+            let left = left - dt;
+            if left <= 0.0 {
+                b.dive = None;
+                b.dived = true;
+                step = Some(Step::Enter);
+                b.t = 0.0;
+                begun = true;
+                eprintln!("boarding: the dive is over: she gets in");
+            } else {
+                b.dive = Some((from, left));
+            }
         }
         // The clip under way, or the step's after it ends.
         let mut prev = b.t;
@@ -1603,14 +1622,18 @@ impl Hijacks {
         self.door_events_between(game, &b, Some(hash), prev, b.t);
         if b.step != Some(s) || begun {
             if let Some((_, rig)) = game.scene.player.as_mut().and_then(|p| p.model.as_mut()) {
+                // `SwimToEnterBoat` loops (its `Complete` starts it again).
+                let once = s != Step::SwimToBoat;
                 rig.animator
-                    .play_action(index, true, m2_assets::name_hash(s.action()));
+                    .play_action(index, once, m2_assets::name_hash(s.action()));
             }
             eprintln!("boarding: she plays {} (clip {hash:08x})", s.action());
         }
         b.step = Some(s);
         b.unplayed = 0.0;
         let entrance = b.entrance;
+        let dive = b.dive;
+        let dived = b.dived;
         game.boarding = Some(b);
         // Her clip at the seat, as she sits there.
         let scene = &mut game.scene;
@@ -1644,7 +1667,40 @@ impl Hijacks {
         // stands 0.08 m from the entrance's hardpoint and her first exit
         // frame within 0.02 m of where her seated loop has her.
         let origin = exit_point.filter(|_| s.exiting()).unwrap_or(seat.at);
-        let frame = at * Mat4::from_translation(origin + seat_offset(rig, index));
+        let mut frame = at * Mat4::from_translation(origin + seat_offset(rig, index));
+        // After a dive her `EnterVehicle` plays on from the entrance she was
+        // put at (0x8229FDE8 attaches her where she is, not at the seat),
+        // her clip's root from where it starts. Measured on the speed boat:
+        // so its clip ends 0.01 m from her seat's hardpoint, where played
+        // from the seat it ended 2.4 m off.
+        if dived
+            && s == Step::Enter
+            && let Some(e) = exit_point
+        {
+            let from_start = seat_offset(rig, index) - clip_start_offset(rig, index);
+            frame = at * Mat4::from_translation(e + from_start);
+        }
+        // Diving, she stays where she swam while `Dive` plays, then glides
+        // evenly to the entrance over what is left of the dive's time
+        // (0x8229FDE8: the way left is the time left over the whole),
+        // turned to it.
+        if let (Some((from, left)), Some(to)) = (
+            dive,
+            entrance
+                .and_then(|e| scene.vehicles[i].spec.entrance_at(e))
+                .map(|l| at.transform_point3(l)),
+        ) {
+            let here = if s == Step::SwimToBoat {
+                to - (to - from) * (left / m2_engine::seats::DIVE_TIME)
+            } else {
+                from
+            };
+            let way = (to - from).with_y(0.0);
+            let yaw = way.x.atan2(way.z);
+            p.facing = yaw + forward.x.atan2(forward.y);
+            frame =
+                Mat4::from_rotation_translation(m2_math::glam::Quat::from_rotation_y(yaw), here);
+        }
         p.seat_frame = Some(frame);
         p.character.position = frame.transform_point3(Vec3::ZERO);
         p.character.velocity = Vec3::ZERO;
@@ -2655,6 +2711,22 @@ fn find_seat(
         .and_then(|l| l.1)
         .and_then(|h| point(points, scene.source.as_mut(), model, h));
     eprintln!("seat: {name} link {link:x?} hardpoint {hardpoint:?} marker {marker:?}");
+    // How the hardpoint's node is turned in the model (for the clips'
+    // frame): its axes' headings.
+    if let (Some(h), Some(src)) = (link.and_then(|l| l.1), scene.source.as_mut())
+        && let Ok(data) = src.model(model)
+        && let Ok(m) = data.parse()
+        && let Some(k) = m.nodes.iter().position(|n| n.name_hash == h)
+        && let Some(to) = m.node_to_model(k as u16)
+    {
+        let z = to.transform_vector3(Vec3::Z);
+        let x = to.transform_vector3(Vec3::X);
+        eprintln!(
+            "seat: {name}: hardpoint {h:08x} turned: z to {:.2?}, x to {:.2?}",
+            z.to_array(),
+            x.to_array()
+        );
+    }
     // Every SeatLink record of the template whole: which field (if any)
     // says the seat is enclosed is not known yet.
     for (k, row) in clips
@@ -2807,6 +2879,21 @@ fn seat_offset(rig: &crate::scene::Rig, clip: usize) -> Vec3 {
         .filter(|cur| cur.0 == clip)
         .map_or(0.0, |cur| cur.1);
     let pose = c.sample_looped(&rig.skeleton, t);
+    pose.0.get(rig.skeleton.root()).map_or(Vec3::ZERO, |l| {
+        Vec3::new(
+            l.translation.x - c.info.pin.x,
+            0.0,
+            l.translation.z - c.info.pin.y,
+        )
+    })
+}
+
+/// [`seat_offset`] at the start of clip `clip`.
+fn clip_start_offset(rig: &crate::scene::Rig, clip: usize) -> Vec3 {
+    let Some(c) = rig.clips.get(clip) else {
+        return Vec3::ZERO;
+    };
+    let pose = c.sample_looped(&rig.skeleton, 0.0);
     pose.0.get(rig.skeleton.root()).map_or(Vec3::ZERO, |l| {
         Vec3::new(
             l.translation.x - c.info.pin.x,
