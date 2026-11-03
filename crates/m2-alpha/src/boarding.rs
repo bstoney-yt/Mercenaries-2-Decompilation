@@ -11,10 +11,17 @@
 //! or out at the door, as before.
 
 use m2_engine::vehicle_door::Step;
+use m2_math::glam::Vec3;
 
 /// How long a boarding may go without a clip played before it ends,
 /// seconds (Invented: a slow frame or two).
 pub const UNPLAYED: f32 = 1.0;
+
+/// How long she takes to slide from where she stood to where her first
+/// clip getting in starts, seconds, at an even rate. From the 360 code: she
+/// is moved there evenly over a set time while the clip plays (0x8229FDE8,
+/// the time left over the whole); the time itself was not found (Invented).
+pub const SLIDE: f32 = 0.25;
 
 /// Her getting in or out under way.
 #[derive(Clone, Debug, PartialEq)]
@@ -27,12 +34,22 @@ pub struct Boarding {
     pub entrance: Option<u32>,
     /// Getting out.
     pub exiting: bool,
+    /// Over to this seat (`SeatLink` name) once in ([`Step::Transfer`]):
+    /// hero.lua slid her over from the seat she got in by, or the seat key.
+    pub transfer_to: Option<u32>,
     /// The clip playing: its step, once begun.
     pub step: Option<Step>,
     /// Seconds into that step's clip.
     pub t: f32,
     /// Seconds since a clip was last played for it.
     pub unplayed: f32,
+    /// Seconds since it began.
+    pub elapsed: f32,
+    /// Where she stood from where her first clip starts, flat: the slide
+    /// still to go is this times [`Boarding::slide_left`].
+    pub slide: Vec3,
+    /// Where she stood when she pressed the use key, world space.
+    pub stood: Option<Vec3>,
 }
 
 impl Boarding {
@@ -42,9 +59,13 @@ impl Boarding {
             seat,
             entrance,
             exiting: false,
+            transfer_to: None,
             step: None,
             t: 0.0,
             unplayed: 0.0,
+            elapsed: 0.0,
+            slide: Vec3::ZERO,
+            stood: None,
         }
     }
 
@@ -53,6 +74,20 @@ impl Boarding {
             exiting: true,
             ..Self::enter(vehicle, seat, entrance)
         }
+    }
+
+    /// Over from seat `from` to `to` (seated already).
+    pub fn transfer(vehicle: usize, from: Option<u32>, to: u32) -> Self {
+        Self {
+            transfer_to: Some(to),
+            step: Some(Step::Transfer),
+            ..Self::enter(vehicle, from, None)
+        }
+    }
+
+    /// The share of the slide still to go ([`SLIDE`]).
+    pub fn slide_left(&self) -> f32 {
+        (1.0 - self.elapsed / SLIDE).clamp(0.0, 1.0)
     }
 
     /// Ages it by `dt` seconds with nothing played; whether it has gone
@@ -76,5 +111,15 @@ mod tests {
         // Played, it starts over.
         b.unplayed = 0.0;
         assert!(!b.age(0.1));
+    }
+
+    #[test]
+    fn the_slide_to_the_clip_goes_evenly() {
+        let mut b = Boarding::enter(0, None, Some(1));
+        assert_eq!(b.slide_left(), 1.0);
+        b.elapsed = SLIDE / 2.0;
+        assert!((b.slide_left() - 0.5).abs() < 1e-6);
+        b.elapsed = SLIDE * 2.0;
+        assert_eq!(b.slide_left(), 0.0);
     }
 }
