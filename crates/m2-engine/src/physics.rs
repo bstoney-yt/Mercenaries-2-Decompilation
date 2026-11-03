@@ -1238,7 +1238,8 @@ pub struct VehicleControls {
     pub steer: f32,
     pub brake: bool,
     /// Nobody at the wheel: it brakes to a stop (gently while it still
-    /// rolls fast) and then holds, even on a hill.
+    /// rolls fast) and then holds, even on a hill. A tank instead rolls on
+    /// its tracks' grip with no throttle until its body sleeps ([`Rest`]).
     pub parked: bool,
 }
 
@@ -1683,6 +1684,7 @@ struct Tracks {
     steer: f32,
     grip: Vec<(f32, f32)>,
     lengths: Vec<f32>,
+    rest: Rest,
 }
 
 impl Tracks {
@@ -1693,7 +1695,72 @@ impl Tracks {
             steer: 0.0,
             grip: vec![tuning.friction; points],
             lengths: vec![tuning.spring_length(); points],
+            rest: Rest::default(),
         }
+    }
+}
+
+/// How a tank's body goes to sleep when it keeps still, which is all that
+/// holds an empty one on a hill.
+///
+/// From the 360 code: its chassis body is built (0x8216A290) from the
+/// rigid-body defaults (0x82621820), which leave Havok's spatial
+/// deactivation on (+0xB1 = 2) at solver class 2 (+0xB2); nothing in the
+/// tank's set-up (0x82194520) turns it off, as the set-up at 0x8218CAA8
+/// does for its vehicle (0x82629CF0 with 1). Its tracks are an action on
+/// that body, which a sleeping island doesn't step, and any non-zero
+/// input to it (0x82194298) wakes the body (0x8261EEB0). An island sleeps
+/// once each of its bodies has kept still for 6 checks (0x824CE9C8: a
+/// body under 6 keeps it awake).
+///
+/// From the 360 data: the world's defaults (hkpWorldCinfo's, 0x820AA278)
+/// check every 0.2 s (`highFrequencyDeactivationPeriod`) against a
+/// reference distance of 0.02 m (`deactivationReferenceDistance`); the
+/// second check every 10 s (`lowFrequencyDeactivationPeriod`) is left
+/// out.
+///
+/// Inferred, not traced: that each check compares how far its centre of
+/// mass has moved since the last one with that distance (the VMX check
+/// itself isn't found, nor its rotation test or class scaling), and that
+/// the game keeps those world defaults.
+#[derive(Clone, Copy, Debug, Default)]
+struct Rest {
+    /// Where its centre of mass was at the last check (world).
+    from: Option<Vec3>,
+    /// Seconds since the last check.
+    clock: f32,
+    /// Checks in a row it has kept within the distance.
+    still: u8,
+    /// Its body was put to sleep (or found asleep).
+    asleep: bool,
+}
+
+/// See [`Rest`].
+const REST_PERIOD: f32 = 0.2;
+const REST_DISTANCE: f32 = 0.02;
+const REST_CHECKS: u8 = 6;
+
+impl Rest {
+    /// One step of `dt` s at `centre`: whether it now sleeps.
+    fn step(&mut self, centre: Vec3, dt: f32) -> bool {
+        let from = *self.from.get_or_insert(centre);
+        self.clock += dt;
+        if self.clock + 1e-6 < REST_PERIOD {
+            return false;
+        }
+        self.clock -= REST_PERIOD;
+        self.still = if (centre - from).length() < REST_DISTANCE {
+            self.still.saturating_add(1)
+        } else {
+            0
+        };
+        self.from = Some(centre);
+        self.still >= REST_CHECKS
+    }
+
+    /// Woken: it starts counting again.
+    fn wake(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -1711,8 +1778,10 @@ struct TrackContact {
 /// spin and velocity: its attitude, its centre of mass and mass, each
 /// track point's contact with the ground (point and normal, world) if it
 /// touches, and its driver's throttle and steering as the 360 code has
-/// them (throttle negative ahead, steering positive to the right), or
-/// held with nobody in it.
+/// them (throttle negative ahead, steering positive to the right). With
+/// nobody in it both are 0, as its controls' reset (0x6C5F1491 at
+/// 0x82194298) leaves them: an empty tank has no brake of its own, only
+/// its sleep ([`Rest`]).
 struct TrackFooting<'a> {
     turn: Quat,
     centre: Vec3,
@@ -1720,7 +1789,6 @@ struct TrackFooting<'a> {
     points: &'a [Option<TrackContact>],
     throttle: f32,
     steer: f32,
-    held: bool,
 }
 
 /// One step of `dt` s of a tracked vehicle as the 360 code drives it (its
@@ -1772,7 +1840,7 @@ fn drive_tracks(
     let (w, v) = motion();
     let top = tun.max_speed.max(1e-3);
     let s = (v.length() / top).clamp(0.0, 1.0);
-    let braking = f.held || ahead.dot(v) * thr > 0.1;
+    let braking = ahead.dot(v) * thr > 0.1;
     let scale = tun.high_speed_grip * s + (1.0 - s);
     let across = side.with_y(0.0);
     let mut pushes = Vec::with_capacity(f.points.len() * 2);
@@ -2404,6 +2472,26 @@ impl Physics {
                 .map_or(Vec3::ZERO, |b| vec3(b.linvel()));
             if v.held {
                 continue;
+            }
+            // A tank's body sleeps once it keeps still, and then nothing
+            // of it runs until it is woken: by its input ([`Physics::drive`])
+            // or by something touching it. Woken, it counts again
+            // (0x8261EEB0 clears its counts).
+            if let Some(tank) = &mut v.tank
+                && let Some(b) = w.bodies.get_mut(v.controller.chassis)
+            {
+                if b.is_sleeping() {
+                    tank.rest.asleep = true;
+                    continue;
+                }
+                if tank.rest.asleep {
+                    tank.rest.wake();
+                }
+                if !v.wrecked && tank.rest.step(vec3(b.center_of_mass()), dt) {
+                    b.sleep();
+                    tank.rest.asleep = true;
+                    continue;
+                }
             }
             let filter = ground().exclude_rigid_body(v.controller.chassis);
             let queries = w.broad_phase.as_query_pipeline_mut(
@@ -3214,6 +3302,19 @@ impl Physics {
             rotor.controls = controls;
             return;
         }
+        // A sleeping tank's tracks don't run; any input wakes it (see
+        // [`Rest`]).
+        if let Some(tank) = &mut v.tank
+            && let Some(body) = self.world.bodies.get_mut(v.controller.chassis)
+            && body.is_sleeping()
+        {
+            let input = !controls.parked && (controls.throttle != 0.0 || controls.steer != 0.0);
+            if !input {
+                return;
+            }
+            body.wake_up(true);
+            tank.rest.wake();
+        }
         let speed = v.controller.current_vehicle_speed;
         let wheels = v.controller.wheels().len().max(1) as f32;
         // A wheel's brake is the most impulse it may take off per step:
@@ -3498,7 +3599,6 @@ impl Physics {
                     points: &points,
                     throttle: if controls.parked { 0.0 } else { -throttle },
                     steer: if controls.parked { 0.0 } else { -turn },
-                    held: controls.parked,
                 };
                 let body = std::cell::RefCell::new(body);
                 drive_tracks(
@@ -6167,7 +6267,6 @@ mod tests {
                 points: &points,
                 throttle: 0.0,
                 steer: 0.0,
-                held: false,
             };
             let mut spring = Vec3::ZERO;
             drive_tracks(
@@ -6194,6 +6293,37 @@ mod tests {
         let up = push(&mut t, full - 0.29);
         let want = 32000.0 * (20.0 * 0.29 - 2.5 * 0.01 / DT) * 0.29 * DT;
         assert!((up.y - want).abs() < want * 1e-3, "{up}");
+    }
+
+    #[test]
+    fn a_tank_sleeps_after_six_still_checks_and_not_while_it_creeps() {
+        let dt = 1.0 / 60.0;
+        let mut still = Rest::default();
+        let steps = |r: &mut Rest, speed: f32| {
+            (1..=120).find(|&i| r.step(Vec3::Z * speed * i as f32 * dt, dt))
+        };
+        // Still: the first check sets where it stands, then six in a row
+        // within 0.02 m (each 0.2 s): asleep at 1.2 s.
+        assert_eq!(steps(&mut still, 0.0), Some(72));
+        // Creeping at 0.15 m/s (0.03 m a check): never.
+        let mut creeping = Rest::default();
+        assert_eq!(steps(&mut creeping, 0.15), None);
+        // At 0.05 m/s (0.01 m a check) it still sleeps.
+        let mut slow = Rest::default();
+        assert_eq!(steps(&mut slow, 0.05), Some(72));
+    }
+
+    #[test]
+    fn an_empty_tank_coasts_on_its_rolling_grip_not_its_brake() {
+        // Throttle 0 at 5 m/s ahead: its grip eases to its rolling grip
+        // (0.1 for the AMX30), not its brake (4), as nobody brakes it.
+        let mut t = Tracks::new(AMX30, 6);
+        for _ in 0..240 {
+            tank_step(&mut t, Vec3::Z * 5.0, 0.0, 0.0);
+        }
+        for g in &t.grip {
+            assert!((g.0 - AMX30.friction.0).abs() < 1e-3, "grip {g:?}");
+        }
     }
 
     #[test]
@@ -6253,7 +6383,6 @@ mod tests {
             points: &points,
             throttle,
             steer,
-            held: false,
         };
         let (mut sum, mut spin) = (Vec3::ZERO, Vec3::ZERO);
         drive_tracks(

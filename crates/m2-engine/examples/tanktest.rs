@@ -112,6 +112,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !spec.tracked {
             continue;
         }
+        if let Some(t) = spec.tuning.tank {
+            eprintln!(
+                "{name}: FwdFriction {} SideFriction {} Brake {}",
+                t.friction.0, t.friction.1, t.brake
+            );
+        }
         let top = spec.tuning.max_speed.unwrap_or(f32::NAN) * 3.6;
         let (fastest, to20) = ahead(&spec);
         let spin = spin(&spec);
