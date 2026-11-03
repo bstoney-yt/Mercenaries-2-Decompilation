@@ -96,6 +96,9 @@ pub struct Moves {
     pub held: Vec<Held>,
     /// `PickupWeapon`: the whole body, once.
     pub pickup: Option<usize>,
+    /// `RunStop`: the slide to a stop after a run, the whole body
+    /// ([`m2_engine::on_foot::RunStop`]).
+    pub run_stop: Option<usize>,
 }
 
 impl Moves {
@@ -268,6 +271,7 @@ pub fn resolve(
     Moves {
         held,
         pickup: by_action("PickupWeapon", table::RIFLE),
+        run_stop: by_action(m2_engine::on_foot::RUN_STOP_ACTION, table::RIFLE),
     }
 }
 
@@ -297,6 +301,7 @@ mod tests {
         Moves {
             held: vec![rifle, pistol, rocket],
             pickup: Some(9),
+            run_stop: None,
         }
     }
 

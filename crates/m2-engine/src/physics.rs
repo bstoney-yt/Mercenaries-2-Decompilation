@@ -1626,6 +1626,9 @@ pub struct Character {
     pub radius: f32,
     /// Total height, feet to top of head.
     pub height: f32,
+    /// Downward acceleration it falls at, m/s² ([`GRAVITY`] unless its
+    /// template gives its own `_HumanPhysics` `Gravity`).
+    pub gravity: f32,
 }
 
 impl Character {
@@ -1637,6 +1640,7 @@ impl Character {
             grounded: false,
             radius: 0.35,
             height: 1.8,
+            gravity: GRAVITY,
         }
     }
 
@@ -4671,7 +4675,7 @@ impl Physics {
         if character.grounded {
             vertical = jump.unwrap_or(0.0);
         }
-        vertical -= GRAVITY * dt;
+        vertical -= character.gravity * dt;
         let desired = Vec3::new(walk.x, 0.0, walk.z) * dt + Vec3::Y * (vertical * dt);
         let shape = r::Capsule::new_y(character.half_height(), character.radius);
         let movement = self.controller.move_shape(

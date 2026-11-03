@@ -2154,6 +2154,17 @@ impl Scene {
         let swim = templates.and_then(|t| t.swim_speeds(hero.template()));
         eprintln!("hero: {hero} swims {swim:?} m/s (walk, jog, run, sprint)");
         let swim = swim.unwrap_or(crate::player::SWIM_SPEEDS);
+        // Her jump, gravity and turn, her template's own.
+        let motion = templates
+            .and_then(|t| t.human_motion(hero.template()))
+            .unwrap_or(crate::player::JENNIFER);
+        eprintln!(
+            "hero: {hero} jumps {:.2} m under {:.1} m/s² ({:.2} m/s up), turns {:.0} deg/s",
+            motion.jump_height,
+            motion.gravity,
+            motion.jump_speed(),
+            motion.max_rotation
+        );
         let swim_speeds = [swim[0], swim[1], swim[2]];
         // The weapons already loaded were held by the last body's
         // skeleton.
@@ -2166,6 +2177,7 @@ impl Scene {
             None => held::Moves::default(),
         };
         if let Some(player) = &mut self.player {
+            player.set_motion(motion);
             player.set_body(model, clips, moves);
             player.speeds = speeds;
             player.swim_speeds = swim_speeds;
