@@ -515,10 +515,13 @@ local function display(owner, title, options, default, callback, args, ...)
     return open("Display", { sTitle = plain(title) or "", tOptions = texts(options),
         nDefault = plain(default), tRest = rest(...) }, callback, args)
 end
--- DisplayScrollingDialogBox(owner, text, callback, args, options, ...): the
--- contract's description with its Accept and Decline (a cancel picks 2).
-local function scrolling(owner, text, callback, args, options, ...)
-    return open("Scroll", { sText = plain(text) or "", tOptions = texts(options),
+-- DisplayScrollingDialogBox(owner, text, callback, args, wager, ...): the
+-- contract's description with its Accept and Decline (a cancel picks 2),
+-- and a third button, Change wager, only when `wager` is true
+-- (`MrxBriefing` passes true for a contract with wager data,
+-- `MrxRewardData.GetWagerData`; the recommendations box passes false).
+local function scrolling(owner, text, callback, args, wager, ...)
+    return open("Scroll", { sText = plain(text) or "", bWager = wager == true,
         tRest = rest(...) }, callback, args)
 end
 -- DisplayNumericBox(owner, title, text, prefix, suffix, start, min, max,
@@ -7087,7 +7090,7 @@ mod tests {
         // closing a box tells the HUD.
         lua.load(
             r#"s = MrxGuiDialogBox.DisplayScrollingDialogBox(1, "[OilCon020.Terms.Summary]",
-                function(n) picked = n end, {}, { "[Generic.Accept]" })
+                function(n) picked = n end, {}, false)
             s:Close()"#,
         )
         .exec()
@@ -7095,6 +7098,12 @@ mod tests {
         let calls = hud_calls(&lua);
         let methods: Vec<&str> = calls.iter().map(|c| c.method.as_str()).collect();
         assert_eq!(methods, ["Display", "Scroll", "Close"]);
+        // Its fifth argument is whether it offers Change wager: false
+        // stays false (it once went over as a table, which offered it).
+        let Plain::Table(data) = &calls[1].data else {
+            panic!("{:?}", calls[1].data);
+        };
+        assert!(data.contains(&(Plain::Text("bWager".into()), Plain::Bool(false))));
         // The wager's digit box, as the HQ's `_ChangeWager` calls it: the
         // HUD answers the value, or -1 - the value for a cancel.
         lua.load(

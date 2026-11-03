@@ -213,7 +213,7 @@ elseif method == "Scroll" and type(m.DisplayScrollingDialogBox) == "function" th
             table.insert(__m2_hud_choices, { seq, tonumber(picked) or 0 })
             __m2_dialog_boxes[seq] = nil
         end,
-        {}, data.tOptions or {}, rest[1], rest[2], rest[3])
+        {}, data.bWager == true, rest[1], rest[2], rest[3])
     __m2_dialog_boxes[seq] = box
     return box ~= nil
 elseif method == "Numeric" then
