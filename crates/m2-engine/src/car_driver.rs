@@ -36,9 +36,9 @@
 //! Unknown: the mind's +0x320 (0x822AC008 caps the car at 5 m/s while it
 //! is under 0.5; who writes it is not found): taken as at least 0.5. Its
 //! +0x344 (a reach from the car's width, 1.5 x 3..6.5 of it) is not used
-//! here. Who sets the car's gear (+0x98 of its input) is not found: it is
-//! taken to change, to the way the throttle asks, only under 0.5 m/s
-//! (inferred).
+//! here. The car's gear (+0x98 of its input) is its gearbox's: the
+//! alpha's, which goes into reverse once all but still with the brake held
+//! (as 0x8219C490 has it; see [`crate::physics::Physics::drive`]).
 
 use m2_math::glam::Vec3;
 
@@ -99,15 +99,13 @@ impl Default for CarInputs {
 }
 
 impl CarInputs {
-    /// Takes `input`'s messages in order, the car going `speed` m/s along
-    /// its heading.
-    pub fn take(&mut self, input: &AiInput, speed: f32) {
+    /// Takes `input`'s messages in order, the car's gearbox in its
+    /// `forward` gears or reverse.
+    pub fn take(&mut self, input: &AiInput, forward: bool) {
+        self.forward = forward;
         for &(m, v) in &input.0 {
             match m {
                 Msg::Throttle => {
-                    if speed.abs() < 0.5 && v.abs() > 0.01 {
-                        self.forward = v > 0.0;
-                    }
                     (self.pedal, self.brake) = match (v >= -0.01, self.forward) {
                         (true, true) => (v, 0.0),
                         (true, false) | (false, true) => (0.0, 1.0),
@@ -121,18 +119,20 @@ impl CarInputs {
         }
     }
 
-    /// The alpha's controls for what it holds, the car going `speed` m/s
-    /// along its heading: its pedal the way its gear goes; a brake as a
-    /// full throttle against the motion (the alpha brakes so); the wheel
-    /// as it is (the alpha's +1 turns the car the way the 360's +1 does,
-    /// toward +x of its heading: checked with the `aidrive` example).
-    pub fn controls(&self, speed: f32) -> crate::physics::VehicleControls {
-        let throttle = if self.brake > 0.0 && speed.abs() > 0.1 {
-            -speed.signum()
-        } else if self.forward {
-            self.pedal
+    /// The alpha's controls for what it holds: the alpha's car takes its
+    /// stick as the 360's pedal (+0x2C) and brake (+0x30) by its gear
+    /// (ahead the stick forward is the pedal and back the brake; in
+    /// reverse they swap), so the brake is the stick against its gear
+    /// (taking the place of the pedal while held), the pedal the stick
+    /// with it; the wheel as it is (the alpha's +1 turns the car the way
+    /// the 360's +1 does, toward +x of its heading: checked with the
+    /// `aidrive` example).
+    pub fn controls(&self) -> crate::physics::VehicleControls {
+        let way = if self.forward { 1.0 } else { -1.0 };
+        let throttle = if self.brake > 0.0 {
+            -way * self.brake.min(1.0)
         } else {
-            -self.pedal
+            way * self.pedal
         };
         crate::physics::VehicleControls {
             throttle,
@@ -415,22 +415,25 @@ mod tests {
         let i = d.drive_to(&c, Vec3::NEG_Z * 10.0, 40.0, false, 0.1);
         assert_eq!(i.last(Msg::Brake), Some(1.0));
         let mut held = CarInputs::default();
-        held.take(&i, 20.0);
+        held.take(&i, true);
         assert_eq!((held.pedal, held.brake), (0.0, 0.0));
     }
 
-    // The car's input: a throttle against its gear brakes; at rest it
-    // changes gear and backs.
+    // The car's input: a throttle against its gear brakes (the alpha's
+    // stick against the gear); in reverse it backs (the stick back).
     #[test]
     fn the_cars_input_brakes_against_its_gear_then_backs() {
         let back = AiInput::default().send(Msg::Throttle, -0.5);
         let mut held = CarInputs::default();
-        held.take(&back, 10.0);
-        assert_eq!((held.pedal, held.brake, held.forward), (0.0, 1.0, true));
-        assert_eq!(held.controls(10.0).throttle, -1.0);
-        held.take(&back, 0.0);
-        assert_eq!((held.pedal, held.brake, held.forward), (0.5, 0.0, false));
-        assert_eq!(held.controls(0.0).throttle, -0.5);
+        held.take(&back, true);
+        assert_eq!((held.pedal, held.brake), (0.0, 1.0));
+        assert_eq!(held.controls().throttle, -1.0);
+        held.take(&back, false);
+        assert_eq!((held.pedal, held.brake), (0.5, 0.0));
+        assert_eq!(held.controls().throttle, -0.5);
+        // Ahead in reverse: the brake, the stick forward.
+        held.take(&AiInput::default().send(Msg::Throttle, 0.3), false);
+        assert_eq!(held.controls().throttle, 1.0);
     }
 
     #[test]

@@ -146,11 +146,18 @@ impl Counts {
     /// Helicopters `faction` sends at `level` (0 to 2) while she is
     /// `standing` so.
     pub fn helicopters(&self, faction: &str, standing: Standing, level: usize) -> usize {
+        self.units(faction, standing, "Heli", level)
+    }
+
+    /// Units of `kind` (the table's `Spawn Type`: `Car`, `Tank`, `Boat`,
+    /// `Heli`, `human`) `faction` sends at `level` while she is `standing`
+    /// so.
+    pub fn units(&self, faction: &str, standing: Standing, kind: &str, level: usize) -> usize {
         let Some(f) = faction_key(faction) else {
             return 0;
         };
         self.0
-            .get(&(f, name_hash(standing.name()), name_hash("Heli")))
+            .get(&(f, name_hash(standing.name()), name_hash(kind)))
             .and_then(|n| n.get(level))
             .map_or(0, |&n| n.max(0) as usize)
     }

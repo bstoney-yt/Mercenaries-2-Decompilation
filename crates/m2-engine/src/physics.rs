@@ -4129,6 +4129,17 @@ impl Physics {
             body.wake_up(true);
             tank.rest.wake();
         }
+        // A sleeping car wakes to any input: its input handler
+        // wakes its body on each message of a value other than 0
+        // (0x82189AC8 -> 0x8261EEB0).
+        if v.tank.is_none()
+            && !controls.parked
+            && (controls.throttle != 0.0 || controls.steer != 0.0 || controls.brake)
+            && let Some(body) = self.world.bodies.get_mut(v.controller.chassis)
+            && body.is_sleeping()
+        {
+            body.wake_up(true);
+        }
         let speed = v.controller.current_vehicle_speed;
         let wheels = v.controller.wheels().len().max(1) as f32;
         // A wheel's brake is the most impulse it may take off per step:
@@ -4976,6 +4987,15 @@ impl Physics {
             .and_then(Option::as_ref)
             .and_then(|v| self.world.bodies.get(v.controller.chassis))
             .map_or(Vec3::ZERO, |b| vec3(b.linvel()))
+    }
+
+    /// A vehicle's angular velocity, rad/s.
+    pub fn vehicle_spin(&self, id: VehicleId) -> Vec3 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| self.world.bodies.get(v.controller.chassis))
+            .map_or(Vec3::ZERO, |b| vec3(b.angvel()))
     }
 
     /// Signed forward speed, m/s. None while held

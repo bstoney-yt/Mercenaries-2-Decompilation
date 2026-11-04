@@ -85,6 +85,7 @@ mod placed;
 mod player;
 mod props;
 mod puppet;
+mod pursuers;
 mod raw;
 mod reinforce;
 mod ride;

@@ -139,6 +139,8 @@ pub struct Game {
     pub traffic: crate::traffic::Traffic,
     /// A pursuit's gunships ([`crate::gunships`]).
     pub gunships: crate::gunships::Gunships,
+    /// A pursuit's cars ([`crate::pursuers`]).
+    pub pursuers: crate::pursuers::Pursuers,
     /// Vehicles the mission scripts send along a path (`crate::paths`).
     pub paths: crate::paths::PathMoves,
     /// Traffic on the road network (`crate::roads`).
@@ -438,6 +440,7 @@ impl Game {
             fetched: HashSet::new(),
             traffic: crate::traffic::Traffic::default(),
             gunships: crate::gunships::Gunships::default(),
+            pursuers: crate::pursuers::Pursuers::default(),
             paths: crate::paths::PathMoves::default(),
             roads: crate::roads::RoadTraffic::default(),
             census: std::env::var("M2_LIFE_CENSUS")
@@ -623,9 +626,10 @@ impl Game {
         };
         for v in scene.vehicles.iter_mut().filter(|v| v.id.is_none()) {
             // A gunship is put in the air where it comes in
-            // ([`crate::gunships::Gunships::fly`]), or is gone.
+            // ([`crate::gunships::Gunships::fly`]), a pursuit's car on the
+            // road ([`crate::pursuers::Pursuers::drive`]), or is gone.
             if v.spot
-                .is_some_and(|(e, _, _)| e >= crate::gunships::FIRST_ENTITY)
+                .is_some_and(|(e, _, _)| e >= crate::pursuers::FIRST_ENTITY)
             {
                 continue;
             }
@@ -1607,6 +1611,12 @@ impl Game {
                     }
                     continue;
                 }
+                // A pursuit's car is driven at her ([`crate::pursuers`]):
+                // not held or parked.
+                if v.spot.is_some_and(|(e, _, _)| self.pursuers.owns(e)) {
+                    v.rolled += world.physics.vehicle_rolling(id) * dt;
+                    continue;
+                }
                 // Far from her, the island's ground streams out from under
                 // a vehicle: it is held where it stands until she comes
                 // back and the ground under it is in again.
@@ -1681,7 +1691,26 @@ impl Game {
                         world.physics.remove_vehicle(id);
                     }
                 }
+                // And its cars.
+                let in_vehicle = p.driving.is_some();
+                let dropped = self.pursuers.drive(
+                    &mut world.physics,
+                    &mut self.scene.vehicles,
+                    her,
+                    her_velocity,
+                    in_vehicle,
+                    crate::gunships::VANISH,
+                    dt,
+                );
+                for i in dropped {
+                    if let Some(id) = self.scene.vehicles[i].id.take() {
+                        world.physics.remove_vehicle(id);
+                    }
+                }
                 self.combat.pilot_shots = self.gunships.shots.clone();
+                self.combat
+                    .pilot_shots
+                    .extend(self.pursuers.shots.iter().copied());
                 self.combat.pilot_view = Some((self.camera.position, self.camera.forward()));
             }
             self.paths
