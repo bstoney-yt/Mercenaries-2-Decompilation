@@ -1713,8 +1713,15 @@ pub enum Loaded {
     /// model, muzzle, case node.
     HandModel(u32, CpuModel, Vec3, Option<Vec3>),
     /// A model for the helicopters' deliveries (a helicopter's, a supply
-    /// crate's): its hash, each node's place at rest, and its rotors.
-    Flight(u32, CpuModel, Vec<Mat4>, Vec<m2_assets::vehicle::Rotor>),
+    /// crate's): its hash, each node's place at rest, its rotors, and (a
+    /// helicopter's) what to fly it by.
+    Flight(
+        u32,
+        CpuModel,
+        Vec<Mat4>,
+        Vec<m2_assets::vehicle::Rotor>,
+        Option<VehicleSpec>,
+    ),
     /// A wreck's chunk's model ([`Chunk`]): its hash and model.
     Chunk(u32, CpuModel),
 }
@@ -2439,7 +2446,7 @@ impl Scene {
             let result = (|| -> anyhow::Result<()> {
                 if m2_engine::osprey::is_osprey(hash) {
                     let (cpu, rest, rotors) = m2_engine::osprey::flight();
-                    let _ = tx.send(Loaded::Flight(hash, cpu, rest, rotors));
+                    let _ = tx.send(Loaded::Flight(hash, cpu, rest, rotors, None));
                     return Ok(());
                 }
                 let mut source = install.open_world()?;
@@ -2449,8 +2456,18 @@ impl Scene {
                     .map(|n| model.node_to_model(n as u16).unwrap_or(Mat4::IDENTITY))
                     .collect();
                 let rotors = m2_assets::vehicle::rotors(&model);
+                // A helicopter's, to be flown by its AI pilot
+                // ([`Flights::step`]).
+                let entry = CatalogueEntry {
+                    model: hash,
+                    kind: m2_engine::vehicle::HELICOPTER.to_owned(),
+                    label: String::new(),
+                };
+                let spec = VehicleSpec::from_model(&entry, &model)
+                    .map(|s| s.with_chassis(&model, &data.base))
+                    .filter(|s| s.is_helicopter());
                 let cpu = CpuModel::build(hash, &model, 0);
-                let _ = tx.send(Loaded::Flight(hash, cpu, rest, rotors));
+                let _ = tx.send(Loaded::Flight(hash, cpu, rest, rotors, spec));
                 Ok(())
             })();
             if let Err(e) = result {
@@ -2625,7 +2642,7 @@ impl Scene {
             | Loaded::Person(_, cpu, _, _)
             | Loaded::Weapon(_, cpu, _, _)
             | Loaded::HandModel(_, cpu, _, _)
-            | Loaded::Flight(_, cpu, _, _)
+            | Loaded::Flight(_, cpu, _, _, _)
             | Loaded::Chunk(_, cpu) => cpu,
         };
         let uploaded = self
@@ -2767,7 +2784,7 @@ impl Scene {
                 );
                 self.chunk_models.insert(hash, Some(model));
             }
-            Loaded::Flight(hash, _, rest, rotors) => {
+            Loaded::Flight(hash, _, rest, rotors, spec) => {
                 self.flights.loaded(
                     hash,
                     FlightModel {
@@ -2775,6 +2792,7 @@ impl Scene {
                         rest,
                         rotors,
                     },
+                    spec.map(tune),
                 );
             }
             Loaded::Weapon(name, _, muzzle, eject) => {

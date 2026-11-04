@@ -11,7 +11,11 @@
 use std::collections::HashMap;
 
 use m2_assets::vehicle::Rotor;
-use m2_engine::{CollisionShape, DebrisId, GpuModel, LoosePiece, Physics, StaticKey};
+use m2_engine::heli_pilot::{HeliPilot, Sight, Slung};
+use m2_engine::tuning::PilotTuning;
+use m2_engine::{
+    CollisionShape, DebrisId, GpuModel, LoosePiece, Physics, StaticKey, VehicleId, VehicleSpec,
+};
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::DrawQueue;
 
@@ -39,6 +43,9 @@ const LOOK_AHEAD: [f32; 4] = [0.0, 20.0, 40.0, 60.0];
 /// above the ground the load is let go, metres.
 const CABLE: f32 = 5.0;
 const DROP: f32 = 3.0;
+/// How low a flown delivery's load comes before it lets go when the order
+/// gives no height, m (0x822DC468: 0.5).
+const DROP_DEFAULT: f32 = 0.5;
 /// Seconds it hovers over the drop point before letting go, and after.
 const HOVER: f32 = 1.5;
 const LINGER: f32 = 2.0;
@@ -200,6 +207,17 @@ struct Flight {
     /// A landing (the scripts' `HeliLand`), not a delivery: it sets down
     /// on the drop point and stays there until sent home.
     lands: bool,
+    /// Its body in the physics and its AI pilot, once its model has
+    /// loaded as a helicopter ([`Flights::loaded`]): flown as the 360's
+    /// pilot flies it ([`HeliPilot`]). Without them it is moved as
+    /// before (invented).
+    body: Option<VehicleId>,
+    pilot_ai: Option<HeliPilot>,
+    /// How its body is turned, when flown.
+    turn: Option<Quat>,
+    /// How low its load's underside comes over the drop point before it
+    /// lets go, m (the order's value, 0.5 when none: 0x822DC468).
+    drop: f32,
 }
 
 /// A crate let go: falling, then lying where it landed, until broken
@@ -269,6 +287,11 @@ pub struct Flights {
     tumbling: HashMap<(u32, u32), (DebrisId, Mat4)>,
     /// The boxes (model space) of the models loaded, by hash.
     boxes: HashMap<u32, (Vec3, Vec3)>,
+    /// The helicopters' models that fly, by hash ([`Flight::body`]).
+    specs: HashMap<u32, VehicleSpec>,
+    /// Helicopters' bodies flown out of sight, to take out of the
+    /// physics.
+    gone_copters: Vec<VehicleId>,
     /// Bodies of pickups taken or gone, to take out of the physics.
     gone_bodies: Vec<DebrisId>,
 }
@@ -326,7 +349,19 @@ impl Flights {
             rotor: 0.0,
             released: false,
             lands: false,
+            body: None,
+            pilot_ai: None,
+            turn: None,
+            drop: DROP_DEFAULT,
         });
+    }
+
+    /// How low pilot `pilot`'s load comes before it lets go, m (the
+    /// scripts' `Ai.Deliver`'s fifth value).
+    pub fn drop_height(&mut self, pilot: u32, height: f32) {
+        for f in self.flights.iter_mut().filter(|f| f.pilot == pilot) {
+            f.drop = if height > 0.0 { height } else { DROP_DEFAULT };
+        }
     }
 
     /// Models to load ([`loaded`](Self::loaded) takes them).
@@ -351,7 +386,10 @@ impl Flights {
     }
 
     /// A model asked for has loaded.
-    pub fn loaded(&mut self, hash: u32, model: FlightModel) {
+    pub fn loaded(&mut self, hash: u32, model: FlightModel, spec: Option<VehicleSpec>) {
+        if let Some(spec) = spec {
+            self.specs.insert(hash, spec);
+        }
         self.boxes.insert(hash, model.gpu.bounds);
         self.models.insert(hash, Some(model));
     }
@@ -824,6 +862,119 @@ impl Flights {
     /// Flies them on by `dt` seconds (`focus`: where the player is), and
     /// lets go of loads over their drop points: vehicles of the scene's
     /// are put down in `physics` where they hang. Returns what was let go.
+    /// Flies delivery `i` by its AI pilot if its helicopter's model has
+    /// loaded as one ([`Flight::body`]), as the 360 flies a delivery: put
+    /// in the air where the scripts made it, then each frame its pilot
+    /// thinks ([`HeliPilot::sense`]) and works the task: `HeliDeliver`
+    /// ([`HeliPilot::deliver`]) until it lets its load go, then on 1000 m
+    /// ahead, or (sent home) round things to home. A landing (`HeliLand`)
+    /// is not flown so (its task, 0x822AF3D8, not ported). Returns
+    /// whether it flew it. Its load hangs as before (invented: the 360's
+    /// winch is untraced), and neither weighs on it.
+    fn pilot(
+        &mut self,
+        i: usize,
+        dt: f32,
+        physics: &mut Physics,
+        vehicles: &[ParkedVehicle],
+        releases: &mut Vec<Release>,
+    ) -> bool {
+        let f = &self.flights[i];
+        if f.lands || f.released && f.body.is_none() {
+            return false;
+        }
+        let Some(spec) = f.model.and_then(|m| self.specs.get(&m)) else {
+            return false;
+        };
+        let size = {
+            let (lo, hi) = spec.hull;
+            (hi.y - lo.y, (hi.x - lo.x).max(hi.z - lo.z))
+        };
+        let half_wide = size.1 * 0.5;
+        // What it carries, as its pilot's state has it: where the first
+        // load hangs and how far its underside is under the helicopter.
+        let slung = (!f.released).then(|| f.loads.first()).flatten().map(|l| {
+            let (at, turn) = self.hanging(f, l, vehicles);
+            let low = self.load_box(l, vehicles).map_or(0.0, |(lo, _)| lo.y);
+            let under = (turn * Vec3::Y * low + at).y;
+            Slung {
+                at,
+                below: f.at.y - under,
+                under: true,
+            }
+        });
+        let id = match f.body {
+            Some(id) => id,
+            None => {
+                let id = physics.add_vehicle_turned(spec, f.at, Quat::from_rotation_y(f.yaw));
+                physics.set_ai_pilot(id, true);
+                physics.start_rotor(id);
+                let flight = spec
+                    .tuning
+                    .flight_ai
+                    .or(spec.tuning.flight)
+                    .unwrap_or(m2_engine::tuning::FlightTuning::DEFAULT);
+                let tuning = spec.tuning.pilot.unwrap_or(PilotTuning::DEFAULT);
+                let f = &mut self.flights[i];
+                f.body = Some(id);
+                f.pilot_ai = Some(HeliPilot::new(tuning, &flight));
+                eprintln!("delivery: {} flies its helicopter by its AI pilot", f.pilot);
+                id
+            }
+        };
+        let Some(m) = physics.vehicle_transform(id) else {
+            return false;
+        };
+        let (_, turn, at) = m.to_scale_rotation_translation();
+        let velocity = physics.vehicle_velocity(id);
+        let ground = physics.ground_under(id, at);
+        let airborne = physics.helicopter_airborne(id).unwrap_or(true);
+        let f = &mut self.flights[i];
+        f.clock += dt;
+        f.rotor = (f.rotor + dt) % 1000.0;
+        f.at = at;
+        f.turn = Some(turn);
+        let ahead = turn * Vec3::Z;
+        f.yaw = ahead.x.atan2(ahead.z);
+        f.velocity = velocity.with_y(0.0);
+        f.climb = velocity.y;
+        let Some(pilot) = f.pilot_ai.as_mut() else {
+            return false;
+        };
+        pilot.load = slung;
+        pilot.airborne = airborne;
+        pilot.sense(at, turn, velocity, ground, dt);
+        let mut sight = Sight { physics, own: id };
+        let stick = match (f.phase, f.home) {
+            (Phase::Leaving, Some(home)) => {
+                pilot.fly_round_to(home, 1.0, true, true, size, &mut sight, dt)
+            }
+            _ => {
+                let (stick, gone) = pilot.deliver(f.to, f.drop, half_wide, size, &mut sight, dt);
+                let late = f.clock > INBOUND_LONGEST && f.phase == Phase::Inbound;
+                if (gone || late) && !f.released {
+                    if late {
+                        eprintln!(
+                            "delivery: {} lets go late, its pilot not over the point",
+                            f.pilot
+                        );
+                    }
+                    f.released = true;
+                    f.phase = Phase::Leaving;
+                    f.clock = 0.0;
+                    releases.push(Release {
+                        pilot: f.pilot,
+                        to: f.to,
+                        dropped: Vec::new(),
+                    });
+                }
+                stick
+            }
+        };
+        physics.pilot_helicopter(id, stick);
+        true
+    }
+
     pub fn step(
         &mut self,
         dt: f32,
@@ -844,9 +995,22 @@ impl Flights {
             // height may be a little off), not a roof or a tree over it.
             if self.flights[i].phase == Phase::Inbound {
                 let to = self.flights[i].to;
-                if let Some(g) = ground(physics, to).filter(|g| (g - to.y).abs() < GROUND_SLACK) {
+                // Past its own helicopter, flown in the physics over it.
+                let found = match self.flights[i].body {
+                    Some(id) => {
+                        let top = Vec3::new(to.x, to.y + 300.0, to.z);
+                        physics
+                            .cast_ray_past(top, Vec3::NEG_Y, 900.0, id)
+                            .map(|(t, _)| top.y - t)
+                    }
+                    None => ground(physics, to),
+                };
+                if let Some(g) = found.filter(|g| (g - to.y).abs() < GROUND_SLACK) {
                     self.flights[i].to.y = g;
                 }
+            }
+            if self.pilot(i, dt, physics, vehicles, &mut releases) {
+                continue;
             }
             let hover = self.hover_height(&self.flights[i], vehicles);
             let f = &mut self.flights[i];
@@ -1007,14 +1171,21 @@ impl Flights {
             }
         }
         let home = &mut self.home;
+        let gone = &mut self.gone_copters;
         self.flights.retain(|f| {
             let stays = f.phase != Phase::Leaving
                 || (f.clock < LEAVE_TIME && f.at.with_y(0.0).distance(focus.with_y(0.0)) < VANISH);
             if !stays && let Some(h) = f.home {
                 home.push((f.pilot, h));
             }
+            if !stays && let Some(id) = f.body {
+                gone.push(id);
+            }
             stays
         });
+        for id in self.gone_copters.drain(..) {
+            physics.remove_vehicle(id);
+        }
         releases
     }
 
@@ -1100,6 +1271,9 @@ impl Flights {
     /// The helicopter's model-to-world transform: placed, turned to its
     /// heading, leaning.
     fn body(&self, f: &Flight) -> Mat4 {
+        if let Some(turn) = f.turn {
+            return Mat4::from_rotation_translation(turn, f.at);
+        }
         let up = (Vec3::Y + f.lean).normalize();
         Mat4::from_rotation_translation(
             Quat::from_rotation_arc(Vec3::Y, up) * Quat::from_rotation_y(f.yaw),

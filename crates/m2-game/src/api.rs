@@ -3129,7 +3129,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     // A pilot flies its vehicle, with any cargo on the winch, to a point
-    // and lets the cargo go there: pilot, x, y, z, then how it flies.
+    // and lets the cargo go there: pilot, x, y, z, then how low the cargo
+    // comes before it is let go (0x82311C50 puts the fifth value in the
+    // order; 0x822DC468 makes it that height), carried as its haste.
     add(&ai, "Deliver", |w, _, a| {
         let Some(guid) = id(a.first()) else {
             return values([]);
@@ -3143,7 +3145,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             goal: "Deliver".into(),
             location,
             target: None,
-            haste: None,
+            haste: num(a.get(4)),
         });
         values([])
     })?;

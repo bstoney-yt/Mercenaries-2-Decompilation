@@ -4628,6 +4628,23 @@ impl Physics {
         }
     }
 
+    /// Puts a helicopter in the air as one made flying: its rotor at full
+    /// and off the ground a second. The 360's physics starts every rotor
+    /// stopped (0x821A3278); one the scripts make in the air is taken to
+    /// be flying already (inferred).
+    pub fn start_rotor(&mut self, id: VehicleId) {
+        if let Some(r) = self
+            .vehicles
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .and_then(|v| v.rotor.as_mut())
+        {
+            r.state.spin = 1.0;
+            r.state.air = 1.0;
+            r.state.ground = 0.0;
+        }
+    }
+
     /// Asks a helicopter to climb (1) or come down (-1), as fast as it
     /// can; 0 holds its height.
     pub fn fly(&mut self, id: VehicleId, lift: f32) {
