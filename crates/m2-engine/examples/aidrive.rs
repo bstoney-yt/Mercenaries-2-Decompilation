@@ -149,8 +149,9 @@ fn drive(spec: &VehicleSpec, to: Vec3) -> (Option<f32>, f32, f32) {
             return (Some(i as f32 * DT), nearest, fastest);
         }
         let input = driver.drive_to(&s, goal, CAP, false, DT);
-        held.take(&input, s.speed());
-        p.drive(id, held.controls(s.speed()));
+        let forward = p.vehicle_gear(id).is_none_or(|(g, _)| g != 0);
+        held.take(&input, forward);
+        p.drive(id, held.controls());
         p.step(DT);
     }
     (None, nearest, fastest)
