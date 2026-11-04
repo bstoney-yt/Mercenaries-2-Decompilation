@@ -68,6 +68,15 @@ pub enum Standing {
 }
 
 impl Standing {
+    /// Its name in the factions' pursuit tables' `When` column (a
+    /// helicopter `Helicopter` there).
+    pub fn table_name(self) -> &'static str {
+        match self {
+            Self::Heli => "Helicopter",
+            other => other.name(),
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Heli => "Heli",

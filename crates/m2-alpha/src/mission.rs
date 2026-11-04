@@ -949,6 +949,8 @@ pub struct MissionLink {
     squads: Option<HashMap<&'static str, crate::reinforce::Squad>>,
     /// How many units each army's pursuit sends ([`crate::reinforce::Counts`]).
     pursuit_counts: Option<crate::reinforce::Counts>,
+    /// The factions' pursuit lists of units ([`crate::gunships::Lists`]).
+    pursuit_lists: Option<crate::gunships::Lists>,
     reinforcements: crate::reinforce::Reinforcements,
     /// Seconds since the scripts said the contract was completed.
     completed: Option<f32>,
@@ -1121,6 +1123,7 @@ impl MissionLink {
             out_for: 0.0,
             squads: None,
             pursuit_counts: None,
+            pursuit_lists: None,
             reinforcements: crate::reinforce::Reinforcements::default(),
             completed: None,
             contracts: 0,
@@ -2383,6 +2386,37 @@ impl MissionLink {
             }
             self.pursuit_counts = Some(counts);
         }
+        if self.pursuit_lists.is_none()
+            && let (Some(source), Some(world)) = (game.scene.source.as_mut(), &game.scene.world)
+        {
+            use m2_assets::animation_table::{ANIMATION_TABLE_TYPE, AnimationTable};
+            let names: HashMap<u32, String> = world
+                .index
+                .template_db
+                .names
+                .values()
+                .map(|n| (m2_assets::name_hash(n), n.clone()))
+                .collect();
+            let mut seed: u32 = 0x2545_f491;
+            let lists = crate::gunships::Lists::build(
+                |h| {
+                    source
+                        .asset(h, ANIMATION_TABLE_TYPE)
+                        .ok()
+                        .and_then(|a| AnimationTable::parse(&a).ok())
+                },
+                &names,
+                || {
+                    seed = seed.wrapping_mul(0x0019_660d).wrapping_add(0x3c6e_f35f);
+                    (seed >> 8) as f32 / (1u32 << 24) as f32
+                },
+            );
+            eprintln!(
+                "gunships: pursuit lists {}",
+                if lists.is_empty() { "missing" } else { "read" }
+            );
+            self.pursuit_lists = Some(lists);
+        }
         if let (Some(squads), Some(counts), Some(her)) = (
             &self.squads,
             &self.pursuit_counts,
@@ -2390,18 +2424,27 @@ impl MissionLink {
         ) {
             // The engine's pursuit, and the helicopters it wants out for
             // where she is.
-            let clock = mission.world().borrow().pursuit.clock;
-            let faction = clock.faction.filter(|_| clock.active).and_then(|g| {
+            let mut clock = mission.world().borrow().pursuit.clock;
+            let mut faction = clock.faction.filter(|_| clock.active).and_then(|g| {
                 let w = mission.world().borrow();
                 crate::npc::faction_by_label(w.template_name(g)?)
             });
+            // For a test run: `M2_TEST_PURSUIT=<faction label>,<level 0-2>`
+            // keeps that faction's pursuit on (`VZ,0`).
+            if let Ok(test) = std::env::var("M2_TEST_PURSUIT")
+                && let Some((label, level)) = test.split_once(',')
+                && let Some(f) = crate::npc::faction_by_label(label)
+            {
+                faction = Some(f);
+                clock.level = level.trim().parse().unwrap_or(0);
+            }
             let wanted = faction.map(|f| {
                 let standing = pursuit_standing(game, her);
                 let n = counts.helicopters(f, standing, clock.level.max(0) as usize);
                 (f, n)
             });
             if let Some((f, n)) = wanted
-                && n > self.reinforcements.out(f)
+                && n > self.reinforcements.out(f) + game.gunships.out(f)
             {
                 eprintln!(
                     "reinforcements: {f}'s pursuit at level {} ({} s left) wants {n} helicopter(s) out, she {:?}",
@@ -2410,6 +2453,32 @@ impl MissionLink {
                     pursuit_standing(game, her)
                 );
             }
+            // Each helicopter due is the next of the faction's list for her
+            // state and the level ([`crate::gunships::Lists`]): its
+            // transport sets soldiers down, any other is a gunship.
+            let mut wanted = wanted;
+            if let (Some((f, n)), Some(lists)) = (wanted, self.pursuit_lists.as_mut()) {
+                let standing = pursuit_standing(game, her);
+                let level = clock.level.max(0) as usize;
+                let mut transports = 0;
+                let mut out = self.reinforcements.out(f) + game.gunships.out(f);
+                let mut tries = 0;
+                while out < n && tries < 8 {
+                    tries += 1;
+                    let Some(template) = lists.next(f, standing.table_name(), "Helicopter", level)
+                    else {
+                        break;
+                    };
+                    out += 1;
+                    if template.to_ascii_lowercase().contains("(pursuit)") {
+                        transports += 1;
+                        continue;
+                    }
+                    send_gunship(game, f, &template, her);
+                }
+                wanted = Some((f, self.reinforcements.out(f) + transports));
+            }
+            game.gunships.call_off(wanted.map(|(f, _)| f));
             let due = self
                 .reinforcements
                 .step(wanted, squads, &mut game.scene.flights, her, dt);
@@ -5075,6 +5144,49 @@ const PICKUP_HOVER: f32 = 15.0;
 /// on a road or within [`crate::reinforce::NEAR_ROAD`] of one, `Driving`
 /// in a vehicle going 4 m/s or more (the constant at 0x820B7B6C) and
 /// `Stopped` otherwise; off the roads `OffRoad`.
+/// Sends one of `faction`'s gunships, `template`, in for her at `her`
+/// ([`crate::gunships`]): from 350 m about the way she faces, its
+/// vehicle loaded as the island's are.
+fn send_gunship(game: &mut Game, faction: &'static str, template: &str, her: Vec3) {
+    let (Some(world), Some(catalogue)) = (&game.scene.world, &game.scene.catalogue) else {
+        return;
+    };
+    let heading = game.scene.player.as_ref().map_or(0.0, |p| p.yaw);
+    let r = game.gunships.random();
+    let physics = &world.physics;
+    let at = crate::gunships::coming_in(
+        her,
+        heading,
+        r,
+        |p| {
+            physics
+                .cast_ray(Vec3::new(p.x, 1000.0, p.z), Vec3::NEG_Y, 2000.0)
+                .map(|(d, _)| 1000.0 - d)
+        },
+        |p| {
+            let half = Vec3::splat(crate::gunships::CLEAR);
+            physics
+                .statics_in_box(m2_math::glam::Mat4::from_translation(p), (-half, half))
+                .is_empty()
+        },
+    );
+    let Some(at) = at else {
+        eprintln!("gunships: no clear place for {faction}'s {template}");
+        return;
+    };
+    let models = template_models(template, &world.index.template_db, &catalogue.vehicles);
+    if models.is_empty() {
+        eprintln!("gunships: no model for {faction}'s {template}");
+        return;
+    }
+    let crew = world.index.template_db.crew(template);
+    let entity = game.gunships.send(faction, template.to_owned(), at, her);
+    let toward = (her - at).with_y(0.0);
+    game.scene
+        .load_world_vehicle(entity, at, toward.x.atan2(toward.z), crew, models);
+    eprintln!("gunships: {faction} send their {template} from {at:.0}");
+}
+
 fn pursuit_standing(game: &Game, her: Vec3) -> crate::reinforce::Standing {
     use crate::reinforce::Standing;
     let riding = game
