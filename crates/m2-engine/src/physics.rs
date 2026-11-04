@@ -1399,6 +1399,8 @@ struct Rotorcraft {
     controls: VehicleControls,
     /// Up (1) or down (-1).
     lift: f32,
+    /// Slide right (1) or left (-1), its own way ([`Physics::strafe`]).
+    strafe: f32,
     /// How it flies now, as the 360 code keeps it ([`Rotor`]).
     state: Rotor,
 }
@@ -2855,7 +2857,7 @@ impl Physics {
                     lift: r.lift.clamp(-1.0, 1.0),
                     yaw: -c.steer.clamp(-1.0, 1.0),
                     ahead: c.throttle.clamp(-1.0, 1.0),
-                    right: 0.0,
+                    right: r.strafe.clamp(-1.0, 1.0),
                 }
             };
             r.state.spin(stick, v.wrecked, touching, dt);
@@ -3492,6 +3494,7 @@ impl Physics {
                     ..VehicleControls::default()
                 },
                 lift: 0.0,
+                strafe: 0.0,
                 state: Rotor::default(),
             });
         let top = if boat { BOAT_TOP } else { TOP_SPEED };
@@ -3885,6 +3888,19 @@ impl Physics {
                 let keep = w - up * w.dot(up);
                 body.set_angvel(keep + up * rate, true);
             }
+        }
+    }
+
+    /// Asks a helicopter to slide right (1) or left (-1), as fast as it can
+    /// (the 360 code's message 0x11C78A3C, its stick's across).
+    pub fn strafe(&mut self, id: VehicleId, right: f32) {
+        if let Some(r) = self
+            .vehicles
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .and_then(|v| v.rotor.as_mut())
+        {
+            r.strafe = right;
         }
     }
 
@@ -4860,6 +4876,49 @@ impl Physics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A helicopter strafes as the 360 code's stick across asks
+    // (0x11C78A3C; 0x821A25E0): hovering, held right it slides to its
+    // right (-x, facing +z) toward its `MaxRightSpeed` (banked into the
+    // slide its `BankYawAmplification` turns it a little too).
+    #[test]
+    fn a_helicopter_strafes_to_its_right() {
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(2000.0, 1.0, 2000.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let spec = helicopter();
+        let top = spec.tuning.flight.unwrap().sideways;
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
+        let flown = VehicleControls::default();
+        p.fly(id, 1.0);
+        for _ in 0..600 {
+            p.drive(id, flown);
+            p.step(DT);
+        }
+        p.fly(id, 0.0);
+        p.strafe(id, 1.0);
+        for _ in 0..600 {
+            p.drive(id, flown);
+            p.step(DT);
+        }
+        let v = p.vehicle_velocity(id);
+        let right = p
+            .vehicle_transform(id)
+            .unwrap()
+            .transform_vector3(Vec3::NEG_X)
+            .with_y(0.0)
+            .normalize();
+        let across = v.dot(right);
+        assert!(
+            across > 0.6 * top && across < 1.1 * top,
+            "slides at {v} of {top}"
+        );
+    }
 
     const DT: f32 = 1.0 / 60.0;
 

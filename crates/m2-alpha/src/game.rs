@@ -1340,11 +1340,42 @@ impl Game {
                             ..VehicleControls::default()
                         },
                     );
+                    physics.strafe(id, 0.0);
                     physics.fly(id, 0.0);
                 } else if let Some((id, v)) = id
                     && !v.wrecked
                 {
                     self.throttle = intent.movement.y;
+                    // A helicopter flies as the 360 code's pad maps it
+                    // (0x824307C0): the movement stick, seen from the camera,
+                    // turned into its own ahead and across (its forward and
+                    // strafe), and its turn from the camera's turn (the right
+                    // stick's across there; here the mouse's turn this frame
+                    // over the helicopter's fastest turn, inferred for a
+                    // mouse).
+                    let heli = v.spec.tuning.flight.filter(|_| v.spec.is_helicopter());
+                    let (ahead, across, steer) = match (heli, physics.vehicle_transform(id)) {
+                        (Some(f), Some(at)) => {
+                            let yaw = player.yaw;
+                            let cam_ahead = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+                            let cam_right = Vec3::new(-yaw.cos(), 0.0, yaw.sin());
+                            let way = cam_ahead * intent.movement.y + cam_right * intent.movement.x;
+                            let h = at.transform_vector3(Vec3::Z);
+                            let h = h.x.atan2(h.z);
+                            let own_ahead = Vec3::new(h.sin(), 0.0, h.cos());
+                            let own_right = Vec3::new(-h.cos(), 0.0, h.sin());
+                            let turn = intent.look.x / dt.max(1e-3) / f.yaw.max(1e-3);
+                            (
+                                way.dot(own_ahead).clamp(-1.0, 1.0),
+                                way.dot(own_right).clamp(-1.0, 1.0),
+                                turn.clamp(-1.0, 1.0),
+                            )
+                        }
+                        _ => (intent.movement.y, intent.movement.x, -intent.movement.x),
+                    };
+                    if heli.is_some() {
+                        physics.strafe(id, across);
+                    }
                     // The horn, as long as it is held; each press counts.
                     self.honking = intent.honk;
                     if self.honking && !was_honking {
@@ -1353,9 +1384,9 @@ impl Game {
                     physics.drive(
                         id,
                         VehicleControls {
-                            throttle: intent.movement.y,
+                            throttle: ahead,
                             // Wheels turned the positive way steer left.
-                            steer: -intent.movement.x,
+                            steer,
                             brake: intent.hold_jump,
                             parked: false,
                         },
