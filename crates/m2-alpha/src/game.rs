@@ -286,36 +286,75 @@ pub struct Shot {
     pub unplaced_logged: bool,
 }
 
-/// An over-the-shoulder shot's eye from its base's feet: this far up, back
-/// from the target and aside (metres), and where on the target it looks.
-/// Invented (the engine's shot table is not read, and these are not yet
-/// checked against the footage of the HQ's briefings).
-const SHOULDER_UP: f32 = 1.65;
+/// The over-the-shoulder shots, from the 360 code (the shot camera's
+/// update, 0x824C7E78, keyed by the shot's name hash): the eye stands at a
+/// hardpoint of the base's (one for each side), this far along the base's
+/// own x axis (+ for `OverTheShoulderLeft`, - for `Right`) and its z axis
+/// (behind it), and this far up; it looks across to half way between the
+/// two (level), and down by [`SHOULDER_DROP`] for each metre of that.
+const SHOULDER_ASIDE: f32 = 0.55;
+const SHOULDER_ALONG: f32 = -0.53;
+const SHOULDER_UP: f32 = 0.3;
+/// The look's fall: its direction is (to the middle, level) with this as
+/// its downward part before it is made unit length.
+const SHOULDER_DROP: f32 = 0.4;
+/// The base's hardpoints the eye stands at, by name hash (their names are
+/// not in the code): `OverTheShoulderLeft`'s and `Right`'s.
+const SHOULDER_HARDPOINT_LEFT: u32 = 0xa3a5_094a;
+const SHOULDER_HARDPOINT_RIGHT: u32 = 0xba8c_a3a8;
+
+/// Where a shot's actor stands: feet, facing (radians clockwise from +z,
+/// as the player's and people's) and, for the base, its shot hardpoint
+/// in the world if its model has it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShotActor {
+    pub feet: Vec3,
+    pub facing: f32,
+    pub hardpoint: Option<Vec3>,
+}
 
 /// How long the HUD's save icon stays up once the game is saved, seconds:
 /// the HUD's own icon (`HandleSaveIconShow`) takes `_knSaveIconTime`
 /// (0.5 s, from the scripts) to come in and as long to go; a second
 /// between is invented (the save itself is at once here).
 pub const SAVE_ICON_SECONDS: f32 = 2.0;
-const SHOULDER_BACK: f32 = 1.1;
-const SHOULDER_ASIDE: f32 = 0.45;
-const SHOULDER_LOOK_UP: f32 = 1.5;
 
 impl Shot {
-    /// Places the shot from where its base and target stand (feet): over
-    /// the base's left or right shoulder at the target's head; any other
-    /// shot is taken as the left one.
-    pub fn place(&mut self, base: Vec3, target: Vec3) {
-        let ahead = (target - base).with_y(0.0).normalize_or(Vec3::Z);
-        let right = ahead.cross(Vec3::Y).normalize_or(Vec3::X);
-        let side = if self.name.ends_with("Right") {
-            1.0
+    /// Whether it is `OverTheShoulderRight` (any other shot is taken as
+    /// the left one).
+    fn right(&self) -> bool {
+        self.name.ends_with("Right")
+    }
+
+    /// The base's hardpoint the shot's eye stands at.
+    pub fn hardpoint(&self) -> u32 {
+        if self.right() {
+            SHOULDER_HARDPOINT_RIGHT
         } else {
-            -1.0
+            SHOULDER_HARDPOINT_LEFT
+        }
+    }
+
+    /// Places the shot from where its base and target stand: the eye by
+    /// the base's hardpoint (its feet when its model has none, as the
+    /// engine falls back to the base's place), looking down across to half
+    /// way between the two.
+    pub fn place(&mut self, base: ShotActor, target: Vec3) {
+        let (sin, cos) = base.facing.sin_cos();
+        // The base's own axes: z the way it faces, x across.
+        let z = Vec3::new(sin, 0.0, cos);
+        let x = Vec3::new(cos, 0.0, -sin);
+        let side = if self.right() {
+            -SHOULDER_ASIDE
+        } else {
+            SHOULDER_ASIDE
         };
-        let eye =
-            base + Vec3::Y * SHOULDER_UP - ahead * SHOULDER_BACK + right * side * SHOULDER_ASIDE;
-        self.view = Some((eye, target + Vec3::Y * SHOULDER_LOOK_UP));
+        let anchor = base.hardpoint.unwrap_or(base.feet);
+        let eye = anchor + x * side + z * SHOULDER_ALONG + Vec3::Y * SHOULDER_UP;
+        let middle = (base.feet + target) * 0.5;
+        let level = (middle - eye).with_y(0.0);
+        let look = Vec3::new(level.x, -SHOULDER_DROP, level.z).normalize_or(Vec3::Z);
+        self.view = Some((eye, eye + look));
     }
 }
 
@@ -4769,8 +4808,10 @@ mod tests {
     }
 
     #[test]
-    fn a_shoulder_shot_sees_the_target_from_behind_the_base() {
-        // Jennifer at the origin facing Fiona 2 m up +z.
+    fn a_shoulder_shot_stands_by_the_bases_hardpoint() {
+        use super::{ShotActor, Vec3};
+        // Fiona at the origin facing +z, her shot hardpoint 1.6 m up;
+        // the player 2 m ahead of her.
         let mut shot = super::Shot {
             name: "OverTheShoulderLeft".into(),
             base: 1,
@@ -4778,16 +4819,37 @@ mod tests {
             view: None,
             unplaced_logged: false,
         };
-        let (base, target) = (super::Vec3::ZERO, super::Vec3::new(0.0, 0.0, 2.0));
+        assert_eq!(shot.hardpoint(), 0xa3a5_094a);
+        let base = ShotActor {
+            feet: Vec3::ZERO,
+            facing: 0.0,
+            hardpoint: Some(Vec3::new(0.0, 1.6, 0.0)),
+        };
+        let target = Vec3::new(0.0, 0.0, 2.0);
         shot.place(base, target);
         let (eye, at) = shot.view.unwrap();
-        assert!(eye.z < 0.0 && eye.y > 1.0, "{eye}");
-        assert!((at - super::Vec3::new(0.0, 1.5, 2.0)).length() < 1e-5);
-        let left = eye.x;
+        // The 360's offsets: 0.55 along her x, 0.53 behind, 0.3 up.
+        assert!((eye - Vec3::new(0.55, 1.9, -0.53)).length() < 1e-5, "{eye}");
+        // Looking to half way between them (1 m ahead of her feet), down
+        // 0.4 for the level part's length.
+        let look = at - eye;
+        let level = Vec3::new(-0.55, 0.0, 1.53);
+        let want = Vec3::new(level.x, -0.4, level.z).normalize();
+        assert!((look - want).length() < 1e-5, "{look}");
+        // The right one: the other side, its own hardpoint.
         shot.name = "OverTheShoulderRight".into();
+        assert_eq!(shot.hardpoint(), 0xba8c_a3a8);
         shot.place(base, target);
-        let right = shot.view.unwrap().0.x;
-        assert!((left + right).abs() < 1e-5 && left != right);
+        assert!((shot.view.unwrap().0.x + 0.55).abs() < 1e-5);
+        // No hardpoint on the model: from the feet, as the engine does.
+        shot.place(
+            ShotActor {
+                hardpoint: None,
+                ..base
+            },
+            target,
+        );
+        assert!((shot.view.unwrap().0.y - 0.3).abs() < 1e-5);
     }
 
     #[test]
