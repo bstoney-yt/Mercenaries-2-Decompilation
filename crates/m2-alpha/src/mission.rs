@@ -22,7 +22,8 @@
 //! into them. Their
 //! deliveries come by helicopter ([`crate::flights`]): the crate, the jeep
 //! and the tank hang under it until it lets go over the drop point. Their
-//! boats are not shown yet.
+//! boats load as their ground vehicles do; a layer's boat on its own
+//! patrol drives it ([`crate::traffic`]).
 //!
 //! The scripts' log goes to `m2-alpha-mission.log` beside the settings.
 
@@ -4357,6 +4358,15 @@ impl Fleet {
                 (!models.is_empty()).then_some((d, g, models))
             })
             .filter(|(_, g, models)| !ai_flown(&w, *g, models))
+            // One of the layers' patrol boats the traffic already put out
+            // ([`crate::traffic`]) is that one.
+            .filter(|(_, g, _)| {
+                !game
+                    .scene
+                    .vehicles
+                    .iter()
+                    .any(|v| v.spot.is_some_and(|(e, _, _)| e == *g))
+            })
             .collect();
         // Those the scripts still have in play near her count against the
         // most: the first contract's boats and jeeps, kilometres behind
@@ -7366,6 +7376,7 @@ mod tests {
             class: Some(name_hash("Rifle")),
             semi: false,
             rate_of_fire: 600.0,
+            aim_ai: 15f32.to_radians(),
             clip: 30,
             reserve_clips: 8,
             pellets: 1,

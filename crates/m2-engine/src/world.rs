@@ -302,6 +302,9 @@ pub struct Templates {
     /// The radio templates' playlist and reach, by id
     /// ([`crate::music_source`]).
     pub music_sources: HashMap<u32, (u32, f32)>,
+    /// How near a player wakes each template that says so, by id: its
+    /// `HibernationControl` `Distance` ([`crate::population::hibernation`]).
+    pub hibernation: HashMap<u32, f32>,
     /// Each hero template's grappling hook, by id ([`crate::grapple`]).
     pub grapple: HashMap<u32, crate::grapple::Grapple>,
     /// Where each template's entrances are got in by (`DriverHatch`), by
@@ -981,6 +984,10 @@ impl Templates {
             explosions: crate::durability::explosions(&db),
             hijack: crate::hijack::read(&db),
             music_sources: crate::music_source::read(&db),
+            hibernation: db
+                .component("HibernationControl")
+                .map(|c| crate::population::hibernation(c))
+                .unwrap_or_default(),
             grapple: crate::grapple::read(&db),
             entrance_points: crate::hijack::entrance_points(&db),
             driver_points: crate::seats::read(&db),
@@ -1997,6 +2004,55 @@ impl WorldIndex {
                     .copied(),
             });
         }
+        // A boat placed on its own patrol (its own `AiPatrol`: the Allied
+        // MarkVs off ChiJob009's beach, Huangfengs, cutters): it is out
+        // while its layer is in and drives its path, once, not
+        // respawned; while a player is within 1.2 x its `HibernationControl`
+        // `Distance` (its own, else its template's, else 100 m), as the 360
+        // code wakes objects ([`crate::population::hibernation`]).
+        let own_sleep = layer
+            .component("HibernationControl")
+            .map(crate::population::hibernation)
+            .unwrap_or_default();
+        for (&entity, p) in &layer.placements() {
+            let Some(&haste) = own_haste.get(&entity) else {
+                continue;
+            };
+            let stem = member_stem(names.get(&entity).copied().unwrap_or(""));
+            let template = match templates.get(stem) {
+                Some(t) => Some((stem, t)),
+                None => templates.by_id(p.parent),
+            };
+            let Some((name, info)) = template else {
+                continue;
+            };
+            if info.vehicle != Some(VehicleKind::Boat) || info.model.is_none() {
+                continue;
+            }
+            self.traffic.push(TrafficPoint {
+                entity,
+                name: stem.to_owned(),
+                position: Vec3::from(p.position),
+                rotation: rotation(p.rotation),
+                layer: Some(layer_hash),
+                static_layer: is_static,
+                spawner: crate::population::Spawner {
+                    list: 0,
+                    seconds_per_cycle: f32::INFINITY,
+                    active_radius: own_sleep
+                        .get(&entity)
+                        .or_else(|| templates.hibernation.get(&p.parent))
+                        .copied()
+                        .unwrap_or(crate::population::HIBERNATION_DEFAULT)
+                        * crate::population::HIBERNATION_WAKE,
+                    kind: 0,
+                    far: None,
+                },
+                vehicles: vec![(name.to_owned(), 1.0)],
+                route: Vec::new(),
+                haste: Some(haste),
+            });
+        }
     }
 
     /// A layer's `DestructionLink`s: an entity's record names another
@@ -2929,6 +2985,7 @@ mod tests {
             class: None,
             semi,
             rate_of_fire: 150.0,
+            aim_ai: 15f32.to_radians(),
             clip: 8,
             reserve_clips: 4,
             pellets: 1,

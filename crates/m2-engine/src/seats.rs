@@ -364,6 +364,19 @@ impl TurretRecord {
     pub fn full_circle(&self) -> bool {
         self.yaw.1 - self.yaw.0 >= std::f32::consts::TAU - 1e-3
     }
+
+    /// Whether it can be turned and tilted to `want` (yaw, pitch,
+    /// radians): inside its arc and its tilt. From the 360 code: an AI
+    /// rider's turret weapon may fire once its target is inside them
+    /// (0x822EF8C8, from its attack 0x822C95D8), whether or not the
+    /// turret has got there yet; nothing waits for it to be laid (its aim
+    /// error, turret +0x1C, is only copied, 0x822EE178). The 360 code
+    /// widens both by `margin` radians (its weapon's,
+    /// [`ai_turret_margin`](crate::weapons::ai_turret_margin)).
+    pub fn reaches(&self, want: (f32, f32), margin: f32) -> bool {
+        let inside = |v: f32, (lo, hi): (f32, f32)| (lo - margin..=hi + margin).contains(&v);
+        (self.full_circle() || inside(want.0, self.yaw)) && inside(want.1, self.pitch)
+    }
 }
 
 impl VehicleSeats {

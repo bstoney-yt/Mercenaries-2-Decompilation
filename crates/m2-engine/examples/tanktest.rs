@@ -27,6 +27,13 @@ use m2_engine::{
 use m2_math::glam::{Quat, Vec3};
 
 const DT: f32 = 1.0 / 60.0;
+/// How high over the slope a tank is let go, metres (`TANK_DROP`, else 1).
+static DROP_AT: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+    std::env::var("TANK_DROP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0)
+});
 /// The six track hardpoints, in the 360 code's order.
 const HARDPOINTS: [&str; 6] = [
     "hp_wheel_fl",
@@ -327,7 +334,7 @@ fn slide(spec: &VehicleSpec, degrees: f32, trace: bool) -> f32 {
     let shape = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).expect("plane");
     p.add_static(StaticKey::Cell(1), &shape, Vec3::ZERO, tilt);
     p.step(DT);
-    let id = p.add_vehicle_turned(spec, tilt * Vec3::Y * 1.0, tilt);
+    let id = p.add_vehicle_turned(spec, tilt * Vec3::Y * *DROP_AT, tilt);
     for _ in 0..(2.0 / DT) as usize {
         p.drive(id, controls(0.0, 0.0, true));
         p.step(DT);

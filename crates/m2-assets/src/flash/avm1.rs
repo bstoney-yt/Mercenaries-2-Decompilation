@@ -786,6 +786,10 @@ impl Avm {
                     return false;
                 }
                 let s = self.to_str(player, value);
+                if self.trace {
+                    let name = player.clip(id).map_or("", |c| c.name.as_str());
+                    self.log.push(format!("{name}.text = {s:?} (#{id})"));
+                }
                 if let Some(c) = player.clip_mut(id)
                     && let Kind::Text(_, t) = &mut c.kind
                 {
@@ -2425,8 +2429,10 @@ impl Runtime {
             if due.is_empty() {
                 break;
             }
-            for (id, code) in due {
-                self.avm.run_script(&mut self.player, id, &code);
+            for (id, frame, code) in due {
+                if self.player.still_on(id, frame) {
+                    self.avm.run_script(&mut self.player, id, &code);
+                }
             }
         }
     }

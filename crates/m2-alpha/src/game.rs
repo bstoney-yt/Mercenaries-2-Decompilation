@@ -1420,14 +1420,26 @@ impl Game {
                     && let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id))
                 {
                     let f = at.transform_vector3(Vec3::Z);
+                    // Turned on from where it was last asked to (on its own
+                    // body it lags that, [`m2_engine::Physics::turret_target`]).
+                    let target =
+                        v.id.and_then(|id| physics.turret_target(id))
+                            .unwrap_or(v.turret);
                     let mut turn =
-                        (player.yaw - f.x.atan2(f.z) - v.turret).rem_euclid(std::f32::consts::TAU);
+                        (player.yaw - f.x.atan2(f.z) - target).rem_euclid(std::f32::consts::TAU);
                     if turn > std::f32::consts::PI {
                         turn -= std::f32::consts::TAU;
                     }
                     let turret = v.spec.tuning.turret;
                     let rate = turret.map_or(TURRET_RATE, |t| t.yaw_speed);
-                    v.turret += turn.clamp(-rate * dt, rate * dt);
+                    // Asked at its turn rate; drawn where its own body has got
+                    // to, if it has one ([`m2_engine::Physics::turret_yaw`]).
+                    let asked = target + turn.clamp(-rate * dt, rate * dt);
+                    v.turret = asked;
+                    if let Some(id) = v.id {
+                        physics.turn_turret(id, asked);
+                        v.turret = physics.turret_yaw(id).unwrap_or(asked);
+                    }
                     if let Some(pivot) = v.spec.gun_pivot {
                         let goal = Combat::aim_point(physics, &scene.people, player, v.id);
                         // The crosshair's point as seen from the gun with
@@ -1736,6 +1748,23 @@ impl Game {
                     &mut self.combat,
                 );
             });
+            // Blockers of soldiers' lines of fire, cleared as worth
+            // shooting by the 360's test (0x822EFE48).
+            for n in scene.people.npcs.iter_mut() {
+                if let Some(b) = n.blocker.as_mut().filter(|b| !b.cleared) {
+                    let round = n.gun.map_or(0.0, |g| g.damage);
+                    let kind = crate::combat::round_kind(n.gun.and_then(|g| g.damage_key));
+                    b.cleared =
+                        self.destruction
+                            .shootable_blocker(world, &scene.props, b.key, round, kind);
+                    if b.cleared {
+                        eprintln!(
+                            "people: a soldier shoots {:?} in his way at {:.1}",
+                            b.key, b.at
+                        );
+                    }
+                }
+            }
             // What lies within her reach, taken as the real game takes it
             // ([`crate::mission::offer`]): health and the small ammunition
             // box as she walks over them, if they give her anything; an
