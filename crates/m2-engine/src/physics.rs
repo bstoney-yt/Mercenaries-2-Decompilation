@@ -4585,6 +4585,14 @@ impl Physics {
             .map(|(d, _)| 1000.0 - d)
     }
 
+    /// Whether a helicopter has been off everything for half a second or
+    /// more, as its pilot's mind reads its physics' ground time
+    /// (0x822BCDC8: not over 0.5 s); `None` for one that isn't.
+    pub fn helicopter_airborne(&self, id: VehicleId) -> Option<bool> {
+        let v = self.vehicles.get(id.0).and_then(Option::as_ref)?;
+        v.rotor.as_ref().map(|r| r.state.ground <= 0.5)
+    }
+
     /// Hands a helicopter's stick to an AI (`true`) or back to the
     /// player: with an AI it flies by its `_HelicopterPhysicsAi` record,
     /// as the 360 code picks it for one the player does not fly
