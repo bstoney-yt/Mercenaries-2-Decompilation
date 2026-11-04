@@ -91,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "template\tcount\tmass\ttorque\treverse torque\t\
          data top\ttop\tt90 s\tdata reverse\treverse\t\
          data coast\tcoast\tdata brake\tbrake\tdata side\tside\tturn deg/s\theel deg\t\
-         360 rest m\trest m\tbob m\ttrim deg	keel m	deck m"
+         360 rest m\trest m\tbob m\ttrim deg	keel m	deck m	hb side	hb ahead m/s"
     );
     let (mut floated, mut skipped) = (0, 0);
     for ((model, record), ids) in &groups {
@@ -145,12 +145,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let coast = slowing(&spec, Vec3::Z, false);
         let braking = slowing(&spec, Vec3::Z, true);
         let sliding = slowing(&spec, Vec3::X, false);
+        let hb_side = slowing(&spec, Vec3::X, true);
+        let hb_ahead = slid_ahead(&spec);
         let (turn, tilt) = turning(&spec);
         println!(
             "{name}\t{}\t{}\t{torque}\t{back}\t{top:.2}\t{got_top:.2}\t{t90:.1}\t\
              {reverse:.2}\t{got_reverse:.2}\t{fwd:.3}\t{coast:.3}\t{:.3}\t{braking:.3}\t\
              {side:.3}\t{sliding:.3}\t{turn:.1}\t{tilt:.1}\t{want_rest:.2}\t{rest:.2}\t\
-             {bob:.3}\t{trim:.1}	{:.2}	{:.2}",
+             {bob:.3}\t{trim:.1}	{:.2}	{:.2}	{hb_side:.3}	{hb_ahead:.3}",
             ids.len(),
             spec.mass,
             fwd + brake,
@@ -310,4 +312,29 @@ fn slowing(spec: &VehicleSpec, way: Vec3, brake: bool) -> f32 {
     }
     let left = p.vehicle_velocity(id).dot(world).max(1e-3);
     (FROM / left).ln() / OVER
+}
+
+/// Set sliding [`FROM`] m/s across itself on its handbrake for [`OVER`]
+/// s: how fast it is going ahead at the end, m/s (its
+/// `HandBrakeMomentumKeep` turning the water's drag across it into a
+/// push ahead).
+fn slid_ahead(spec: &VehicleSpec) -> f32 {
+    let (mut p, id) = start(spec);
+    let world = p
+        .vehicle_transform(id)
+        .map_or(Vec3::X, |m| m.transform_vector3(Vec3::X).with_y(0.0))
+        .normalize_or(Vec3::X);
+    let v = p.vehicle_velocity(id);
+    p.set_vehicle_velocity(id, v.with_x(0.0).with_z(0.0) + world * FROM);
+    for _ in 0..(OVER / DT) as usize {
+        p.drive(
+            id,
+            VehicleControls {
+                brake: true,
+                ..VehicleControls::default()
+            },
+        );
+        p.step(DT);
+    }
+    along(&p, id)
 }
