@@ -1892,6 +1892,13 @@ impl Game {
             {
                 let walked = near.is_some_and(|n| n.0 != Offer::Equip);
                 let from = p.from;
+                if walked && let Some(effect) = taken_effect(templates, p.what.template) {
+                    self.combat.game_fx.push(combat::GameFx {
+                        template: combat::FxTemplate::Hash(effect),
+                        at: p.at,
+                        hold: None,
+                    });
+                }
                 if p.what.is_money() {
                     eprintln!(
                         "pickup: she takes {} ({:#x}) at {:.1}: cash {}, fuel {}",
@@ -4761,6 +4768,25 @@ fn view_heading(player: Option<&Player>, fly: &FlyCamera) -> f32 {
     player.map_or(fly.yaw, |p| p.yaw)
 }
 
+/// The effect template (name hash) pickup template `template` sets off
+/// where it lay as it is taken: its `Pickup` record's `PickupEffect`
+/// (`Cash (Case)`: `global_particle_explosion_pickup_money`).
+///
+/// From the 360 code: taking a pickup, walked over (8228F5E8) or its
+/// ammunition taken with the use key (8228FE58), runs 0x822905B8, which
+/// finds the template the record's `PickupEffect` (word 0x18) names
+/// (0x82408B88) and spawns it at the pickup, upright (0x821DD438, through
+/// the game's spawner 0x82409B38), before deleting the pickup (0x8228F540).
+/// A weapon taken up in place of hers (the swap, 8228FE58) is deleted with
+/// no effect. Read here as the first record naming an effect
+/// ([`m2_engine::pickup::PickupInfo::effect`]), the 360's choice when no
+/// record is passed it; with the use key it is passed the record the
+/// ammunition matched, whose own effect, if set, comes first (not
+/// followed here: inferred the same).
+fn taken_effect(templates: &m2_engine::Templates, template: u32) -> Option<u32> {
+    templates.leavings.pickups.get(&template)?.effect
+}
+
 /// How far down the pickups she stands at `p` comes
 /// ([`crate::flights::Flights::within_by`]): 0 for what she would take
 /// (walked over or with the use key, given room for it, or a weapon to
@@ -4816,6 +4842,28 @@ fn switch_weapon(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    #[test]
+    fn a_pickup_taken_sets_off_its_pickup_effect() {
+        let mut db = m2_engine::Templates::default();
+        let money = m2_assets::name_hash("global_particle_explosion_pickup_money");
+        db.leavings.pickups.insert(
+            1,
+            m2_engine::pickup::PickupInfo {
+                kind: m2_engine::pickup::CASH,
+                radius: 1.0,
+                ammo: None,
+                rounds: 25000,
+                gives: Vec::new(),
+                walked: Vec::new(),
+                heals: 0,
+                icon: None,
+                effect: Some(money),
+            },
+        );
+        assert_eq!(super::taken_effect(&db, 1), Some(money));
+        assert_eq!(super::taken_effect(&db, 2), None);
+    }
 
     #[test]
     fn a_trailer_is_not_got_into() {

@@ -155,7 +155,10 @@ pub fn read(db: &Layer<'_>) -> Leavings {
                             .map(|r| pickup.word(r, ROUNDS).unwrap_or(0))
                             .sum(),
                         icon: nonzero(pickup.word(r, ICON)),
-                        effect: nonzero(pickup.word(r, EFFECT)),
+                        // The first of its records naming one (from the 360
+                        // code: 0x822905B8 falls back to the first record
+                        // whose `PickupEffect` is set).
+                        effect: records.iter().find_map(|r| nonzero(pickup.word(r, EFFECT))),
                     },
                 ))
             })
