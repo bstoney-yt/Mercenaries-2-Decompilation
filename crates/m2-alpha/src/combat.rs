@@ -1315,6 +1315,15 @@ pub enum Sound {
     },
     /// A building the bomb brought down coming apart.
     Collapse(Vec3),
+    /// An effect a model's state started (`StartEmitter`: a wreck's
+    /// fire, a tank's hull blowing out) coming into being as an object of
+    /// its template, `template`: heard only as that template's
+    /// `SoundEffect` says ([`m2_engine::spawn_sound`]), nothing standing
+    /// in.
+    Created {
+        at: Vec3,
+        template: u32,
+    },
     /// Something with no building's collapse (a fence, a sign) breaking:
     /// its template's `SoundKey` (`prop_sheetmetal_sml`).
     Break {
@@ -2763,6 +2772,17 @@ impl Combat {
         }
     }
 
+    /// The objects the effects a model's state started came into being
+    /// as (template, where): each heard as its template says
+    /// ([`Sound::Created`]).
+    pub fn created(&mut self, created: Vec<(u32, Vec3)>) {
+        self.sounds.extend(
+            created
+                .into_iter()
+                .map(|(template, at)| Sound::Created { at, template }),
+        );
+    }
+
     /// A building the bomb brought down comes apart at `at`: heard.
     pub fn collapse(&mut self, at: Vec3) {
         self.sounds.push(Sound::Collapse(at));
@@ -3296,6 +3316,9 @@ impl Combat {
             RIFLE_FLASH,
             None,
         );
+        if let Some((_, rig)) = &mut f.player.model {
+            rig.fired();
+        }
         if killed {
             self.remarks.push(Remark::Kill);
         }
@@ -3435,6 +3458,7 @@ impl Combat {
             self.effect(Effect::Tracer { from, to: end }, 0.07);
             if k == 0 {
                 self.gun_fired(feel, (from, case), dir, RIFLE_FLASH, Some(shooter));
+                f.people.npcs[i].rig.fired();
             }
             let closest = from + dir * (aim - from).dot(dir).max(0.0);
             let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
@@ -7490,6 +7514,20 @@ mod tests {
                 pda: true,
                 ..Trigger::default()
             }
+        );
+    }
+
+    #[test]
+    fn what_a_state_started_is_heard_as_its_template() {
+        let mut combat = Combat::default();
+        let at = Vec3::new(1.0, 2.0, 3.0);
+        combat.created(vec![(0x8000_1234, at)]);
+        assert_eq!(
+            combat.take_sounds(),
+            vec![Sound::Created {
+                at,
+                template: 0x8000_1234
+            }]
         );
     }
 }

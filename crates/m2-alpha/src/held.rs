@@ -84,10 +84,10 @@ pub struct Held {
     /// Crouched and aiming, standing: the shuffles round to the left and
     /// to the right (`Crouch_Aim_Shuffle_Left90`, `..._Right90`).
     pub shuffle: [Option<usize>; 2],
-    /// Her own aim sweeps for the class, standing and moving, each low,
-    /// mid and high ([`m2_engine::aim_sweep`]): the on-foot table's rows
+    /// Her own aim sweeps for the class, standing and moving, and their
+    /// firing sweeps ([`m2_engine::aim_sweep`]): the on-foot table's rows
     /// for her and the class under the rifle sweeps' handles.
-    pub sweeps: Option<[[usize; 3]; 2]>,
+    pub sweeps: Option<crate::scene::Sweeps>,
 }
 
 /// The on-foot table's handles for the crouched, aiming gaits, by name
@@ -304,10 +304,15 @@ pub fn resolve(
             }
             Some(out)
         };
-        use m2_engine::aim_sweep::{RIFLE_MOVING, RIFLE_STANDING};
+        use m2_engine::aim_sweep::{
+            RIFLE_MOVING, RIFLE_MOVING_FIRE, RIFLE_STANDING, RIFLE_STANDING_FIRE,
+        };
+        let fire = sweep_of(RIFLE_STANDING_FIRE)
+            .zip(sweep_of(RIFLE_MOVING_FIRE))
+            .map(|(s, m)| [s, m]);
         let sweeps = sweep_of(RIFLE_STANDING)
             .zip(sweep_of(RIFLE_MOVING))
-            .map(|(s, m)| [s, m]);
+            .map(|(s, m)| crate::scene::Sweeps { aim: [s, m], fire });
         held.push(Held {
             sweeps,
             crouch,

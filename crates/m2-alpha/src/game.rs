@@ -2055,7 +2055,10 @@ impl Game {
         let (Some(p), Some(world)) = (scene.particles.as_mut(), scene.world.as_ref()) else {
             return;
         };
-        p.take(asked, &world.index.template_db);
+        let created = p.take(asked, &world.index.template_db);
+        // What came into being is heard as its template's `SoundEffect`
+        // says.
+        self.combat.created(created);
         p.step(dt);
     }
 

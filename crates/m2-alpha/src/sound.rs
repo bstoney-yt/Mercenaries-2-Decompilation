@@ -264,6 +264,10 @@ pub struct GameAudio {
     /// Blasts heard with their own cue, silent as their template says,
     /// and with the beta's blast standing in.
     blasts_heard: [u32; 3],
+    /// Objects the effects a state started came into being as
+    /// ([`Sound::Created`]): heard with their template's own cue, silent
+    /// as their template says, and silent for want of a `Sounds` row.
+    created_heard: [u32; 3],
     /// Whether the blast templates' cues have been asked for.
     blasts_primed: bool,
     /// Spinning guns firing now: their loop's voice ([`GunCues::spin`]).
@@ -1285,6 +1289,7 @@ impl GameAudio {
             shots: (0, 0),
             launches: (0, 0),
             blasts_heard: [0; 3],
+            created_heard: [0; 3],
             blasts_primed: false,
             spins: Vec::new(),
         };
@@ -1935,6 +1940,10 @@ impl GameAudio {
                     continue;
                 }
                 Sound::Collapse(at) => (5, at, 2.0),
+                Sound::Created { at, template } => {
+                    self.play_created(at, template, db);
+                    continue;
+                }
                 Sound::Break { at, key } => {
                     self.play_key(key, at);
                     continue;
@@ -1996,6 +2005,32 @@ impl GameAudio {
             );
         }
         heard != BlastHeard::Unknown
+    }
+
+    /// An object of effect template `template` a model's state started
+    /// coming into being at `at` ([`Sound::Created`]): its `SoundEffect`
+    /// plays as for a blast ([`blast_heard`]); where the data says
+    /// nothing, nothing is heard.
+    fn play_created(&mut self, at: Vec3, template: u32, db: Option<&m2_engine::world::Templates>) {
+        let spawn = db.and_then(|db| db.spawn_sounds.get(&template).copied());
+        let draw = self.random();
+        let n = match blast_heard(spawn.as_ref(), &self.gun_cues, draw) {
+            BlastHeard::Cue(cue) => {
+                self.play_key(cue, at);
+                0
+            }
+            BlastHeard::Silent => 1,
+            BlastHeard::Unknown => 2,
+        };
+        self.created_heard[n] += 1;
+        let [a, b, c] = self.created_heard;
+        if (a + b + c) % 10 == 1 {
+            eprintln!(
+                "sound: {} state effects: {a} with their template's own cue, {b} silent as \
+                 their template says, {c} silent for want of a Sounds row",
+                a + b + c
+            );
+        }
     }
 
     /// Starts reading every blast template's own cue, once a template

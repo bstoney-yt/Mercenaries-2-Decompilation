@@ -25,7 +25,7 @@ use anyhow::Context as _;
 use m2_assets::effect::ATLAS_TEXTURE;
 use m2_engine::AssetSource;
 use m2_engine::model::{MaterialCache, upload_texture};
-use m2_engine::particles::{Library, Particles, Sprite};
+use m2_engine::particles::{HOLD, Library, Particles, Sprite};
 use m2_engine::world::Templates;
 use m2_math::glam::{Mat4, Vec3};
 use m2_render::{
@@ -77,6 +77,10 @@ pub struct ParticleDraw {
     pub resolved: HashMap<String, Resolved>,
     /// The lights the effects lit ([`m2_engine::lights`]).
     flashes: Vec<Flash>,
+    /// Seconds run, and when each held state effect was last asked for
+    /// ([`fresh_hold`]).
+    clock: f32,
+    held_asks: HashMap<u64, f32>,
 }
 
 /// A light an effect lit: where, what, how old, and for a held effect
@@ -184,11 +188,24 @@ impl ParticleDraw {
             by_hash: None,
             resolved: HashMap::new(),
             flashes: Vec::new(),
+            clock: 0.0,
+            held_asks: HashMap::new(),
         })
     }
 
-    /// Sets off what the fight asked for.
-    pub fn take(&mut self, asked: Vec<GameFx>, templates: &Templates) {
+    /// Sets off what the fight asked for. Returns the effect templates a
+    /// model's state started (`StartEmitter`, [`FxTemplate::Hash`]) that
+    /// came into being as objects this time, with where: a held one only
+    /// as it starts, not while its source keeps asking ([`fresh_hold`]).
+    /// From the 360 code: `StartEmitter` (verb 0x3347914F, handler
+    /// 0x8222FA30 calling 0x8222FA68, also behind
+    /// `lua_ObjectState_StartEmitter`) finds the template by the effect's
+    /// name hash (0x82408B88) and spawns an object of it through the
+    /// game's spawner (0x82409B38, as `lua_Pg_SpawnRelative` does), so
+    /// the template's components come into being with it, its
+    /// `SoundEffect` among them ([`m2_engine::spawn_sound`]).
+    pub fn take(&mut self, asked: Vec<GameFx>, templates: &Templates) -> Vec<(u32, Vec3)> {
+        let mut created = Vec::new();
         for fx in asked {
             let (label, id) = match &fx.template {
                 FxTemplate::Id(id) => (format!("{id:08x}"), Some(*id)),
@@ -212,6 +229,18 @@ impl ParticleDraw {
                     (label, id)
                 }
             };
+            if let (FxTemplate::Hash(_), Some(id)) = (&fx.template, id) {
+                let fresh = match fx.hold {
+                    Some(key) => fresh_hold(&mut self.held_asks, key, self.clock),
+                    None => true,
+                };
+                if fresh {
+                    if !self.resolved.contains_key(&label) {
+                        eprintln!("state effect: {label} ({id:08x}) comes into being");
+                    }
+                    created.push((id, fx.at));
+                }
+            }
             let effects: Vec<u32> =
                 id.map_or_else(Vec::new, |id| self.lib.of_template(id).to_vec());
             let first = !self.resolved.contains_key(&label);
@@ -312,10 +341,14 @@ impl ParticleDraw {
                 }
             }
         }
+        created
     }
 
     pub fn step(&mut self, dt: f32) {
         self.sim.step(&self.lib, dt);
+        self.clock += dt;
+        let now = self.clock;
+        self.held_asks.retain(|_, at| now - *at <= HOLD);
         for f in &mut self.flashes {
             f.age += dt;
             f.since_call += dt;
@@ -537,9 +570,32 @@ fn quad(out: &mut Vec<f32>, s: &Sprite, right: Vec3, up: Vec3, light: Vec3) {
     }
 }
 
+/// Whether the held effect `key`, asked for at `now` (seconds), comes
+/// into being afresh: when it was not asked for in the last [`HOLD`]
+/// seconds, the time a held effect outlives its last ask. Records the
+/// ask. Inferred: a held effect stands for the 360's emitter object
+/// living on while its state lasts, so it is created, and heard, once.
+fn fresh_hold(asks: &mut HashMap<u64, f32>, key: u64, now: f32) -> bool {
+    let fresh = asks.get(&key).is_none_or(|&at| now - at > HOLD);
+    asks.insert(key, now);
+    fresh
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_effect_comes_into_being_once_while_asked_for() {
+        let mut asks = HashMap::new();
+        assert!(fresh_hold(&mut asks, 7, 0.0));
+        assert!(!fresh_hold(&mut asks, 7, 0.3));
+        assert!(!fresh_hold(&mut asks, 7, 0.6));
+        // Another source's is its own.
+        assert!(fresh_hold(&mut asks, 8, 0.6));
+        // Asked for again after it went out: anew.
+        assert!(fresh_hold(&mut asks, 7, 0.6 + HOLD + 0.1));
+    }
 
     #[test]
     fn a_quad_faces_the_camera_and_covers_its_atlas_cell() {

@@ -12,14 +12,19 @@ on:
       - '**.md'
       - 'docs/**'
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `closed` runs nothing: it only joins the PR's concurrency group so
+    # that a merged or closed PR's queued run is cancelled instead of
+    # holding the one runner for an hour (see concurrency below).
+    types: [opened, synchronize, reopened, ready_for_review, closed]
     paths-ignore:
       - '**.md'
       - 'docs/**'
 
-# A new push to a PR cancels the run it supersedes; runs on main finish.
+# A new push to a PR, or merging or closing it, cancels the run it
+# supersedes; runs on main finish. PR runs are grouped by PR number so
+# the `closed` event lands in the same group as the PR's earlier runs.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # The job token can read the repository and nothing more.
@@ -40,7 +45,10 @@ defaults:
 jobs:
   host:
     name: Lint and test (host)
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.action != 'closed' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, Windows, X64, m2-pc]
     steps:
       - uses: actions/checkout@v4

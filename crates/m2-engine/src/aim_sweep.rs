@@ -28,11 +28,25 @@
 //! rifle turns from about +170 degrees to -55 through the clip, so
 //! [`phase`] takes this crate's yaw negated.
 //!
-//! **Not ported**: the standing groups' third clip, weighted by a 0 to 1
-//! value at the aiming component's +0x30 (its meaning not traced; taken
-//! as 0, so the second clip alone), the moving groups' fourth (weighted
-//! by the same value), and the node's easing of the aim yaw (rate at
-//! 0x82DE8828).
+//! - Each group's other two clips are its firing poses (standing: entries
+//!   17, 21 and 26; moving: 16, 20 and 25). The step weights them by a
+//!   value at +0x30 of the person's per-entity record (the pool at
+//!   0x836572EC, records of 0x48 bytes), clamped to 0..1: the standing
+//!   sweep takes one minus it, both firing clips take it. [`Kick`] is that
+//!   value. Every shot a gun fires (0x82283A10) posts a message naming its
+//!   wielder (type 0x2C49ADC9, the wielder at +0xC). Its handler
+//!   (0x8242A6D0) sets the wielder's +0x34 to 30 (0x82DE88A8), and each
+//!   frame (0x8241F580) eases the pair back to 0 as a critically damped
+//!   spring, +0x30 the value and +0x34 its rate, of smooth time 0.1 s
+//!   (2.0 at 0x820C77A4 over 0.1 at 0x82DE88AC; the series terms 0.48
+//!   and 0.235 at 0x820F8C60 and 0x820F8C64).
+//!
+//! **Inferred**: how the group's blend shares its inputs. Standing, the
+//! sweep and its firing clip are a crossfade (1 - w and w). Moving, the
+//! moving sweep's input is set to the node's +0x158C path (taken as 1)
+//! and its firing clip's to w, taken as shares of their sum.
+//!
+//! **Not ported**: the node's easing of the aim yaw (rate at 0x82DE8828).
 
 /// The aim yaw at the start and end of a sweep, degrees, in the 360's
 /// sense (see the module documentation).
@@ -65,6 +79,57 @@ pub fn weights(pitch: f32) -> [f32; 3] {
 pub const RIFLE_STANDING: [u32; 3] = [0xd86c_bb46, 0x0823_5d42, 0xf877_b44a];
 pub const RIFLE_MOVING: [u32; 3] = [0x9e25_852b, 0x48f8_5c73, 0x034c_acb5];
 
+/// The rifle's firing sweeps, low, mid and high: standing (entries 17,
+/// 21 and 26: handles b33294eb, 8d9e02a7 and b011e74f) and moving (16,
+/// 20 and 25: handles f341cf84, 0c11cea4 and 59ec84c6).
+pub const RIFLE_STANDING_FIRE: [u32; 3] = [0x03ca_d528, 0xaf17_eb9c, 0x2330_6354];
+pub const RIFLE_MOVING_FIRE: [u32; 3] = [0xc112_cc47, 0xb973_4a27, 0xbf3c_3419];
+
+/// The rate a shot gives the firing weight, per second (0x82DE88A8).
+pub const KICK_RATE: f32 = 30.0;
+
+/// The spring's smooth time, seconds (0x82DE88AC).
+pub const KICK_SMOOTH: f32 = 0.1;
+
+/// The weight of the firing sweeps: kicked by each shot, eased back to 0
+/// by a critically damped spring (see the module documentation).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Kick {
+    /// The value, +0x30 of the record.
+    pub value: f32,
+    /// Its rate, +0x34.
+    pub rate: f32,
+}
+
+impl Kick {
+    /// A shot fired: the rate set (not added) to [`KICK_RATE`].
+    pub fn fire(&mut self) {
+        self.rate = KICK_RATE;
+    }
+
+    /// Eases on `dt` seconds toward 0.
+    pub fn step(&mut self, dt: f32) {
+        let omega = 2.0 / KICK_SMOOTH;
+        let x = omega * dt;
+        let e = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x);
+        let temp = (self.value * omega + self.rate) * dt;
+        self.rate = (self.rate - temp * omega) * e;
+        self.value = (self.value + temp) * e;
+    }
+
+    /// The firing clips' weight, 0 to 1.
+    pub fn weight(&self) -> f32 {
+        self.value.clamp(0.0, 1.0)
+    }
+}
+
+/// The firing clip's share of a group for firing weight `w`: standing a
+/// crossfade, moving its share of 1 and `w` (inferred).
+pub fn fire_share(w: f32, moving: bool) -> f32 {
+    let w = w.clamp(0.0, 1.0);
+    if moving { w / (1.0 + w) } else { w }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +143,40 @@ mod tests {
         // Past either end it holds the end.
         assert_eq!(phase(3.0), 0.0);
         assert_eq!(phase(-3.0), 1.0);
+    }
+
+    #[test]
+    fn a_shot_kicks_and_eases_back() {
+        let mut k = Kick::default();
+        k.fire();
+        let dt = 1.0 / 60.0;
+        let mut peak: (f32, usize) = (0.0, 0);
+        for i in 1..=60 {
+            k.step(dt);
+            if k.value > peak.0 {
+                peak = (k.value, i);
+            }
+        }
+        // Critically damped: 30 t e^(-20 t), its peak 1.5 / e at 0.05 s.
+        assert!((peak.0 - 0.552).abs() < 0.03, "{peak:?}");
+        assert!((2..=4).contains(&peak.1), "{peak:?}");
+        assert!(k.weight() < 1e-3);
+        // Shots in quick succession hold it up, never past 1.
+        for _ in 0..30 {
+            k.fire();
+            for _ in 0..6 {
+                k.step(dt);
+                assert!(k.weight() <= 1.0);
+            }
+        }
+        assert!(k.weight() > 0.5);
+    }
+
+    #[test]
+    fn firing_shares() {
+        assert_eq!(fire_share(0.0, false), 0.0);
+        assert_eq!(fire_share(0.5, false), 0.5);
+        assert!((fire_share(1.0, true) - 0.5).abs() < 1e-6);
     }
 
     #[test]

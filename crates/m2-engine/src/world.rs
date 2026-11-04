@@ -1327,6 +1327,11 @@ pub struct Road {
     /// Whether its kind's template has no `LaneData` but is named a road
     /// (`_mar_commercial_road20Clean`): driven as one lane each way.
     pub named_road: bool,
+    /// The junctions (`RoadIntersection` entities) at its path's first
+    /// and last points: its record's words at 8 and 12 (0 for none). From
+    /// the 360 code: the road flood (0x8223ECD0) goes on from a road to
+    /// the junctions its record names there.
+    pub ends: [u32; 2],
 }
 
 impl Road {
@@ -1563,6 +1568,7 @@ impl WorldIndex {
                             path,
                             kind: word(ROAD_KIND).unwrap_or(0),
                             bounds: corner(ROAD_BOX).zip(corner(ROAD_BOX + 12)),
+                            ends: [word(8).unwrap_or(0), word(12).unwrap_or(0)],
                         });
                     }
                 }
@@ -3372,6 +3378,7 @@ impl WorldIndex {
                 kind: road.kind,
                 lanes: kind.and_then(|k| k.lanes),
                 named_road: kind.is_some_and(|k| k.lanes.is_none()),
+                ends: road.ends,
             });
         }
     }
@@ -3533,6 +3540,8 @@ struct PlacedRoad {
     /// Its path asset.
     path: u32,
     kind: u32,
+    /// Its record's junctions, first point's and last's.
+    ends: [u32; 2],
     /// Its record's box, in the entity's space.
     bounds: Option<(Vec3, Vec3)>,
 }
@@ -3658,6 +3667,7 @@ mod road_tests {
                 direction: None,
             }),
             named_road: false,
+            ends: [0, 0],
         };
         assert!(r.drivable());
         let one = |v: Vec<f32>, want: f32| v.len() == 1 && (v[0] - want).abs() < 1e-4;
