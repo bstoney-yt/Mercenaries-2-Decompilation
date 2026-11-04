@@ -14,6 +14,7 @@
 //! game's data directly (see `docs/alpha-roadmap.md`).
 
 pub mod ai;
+pub mod ai_close;
 pub mod ai_dither;
 pub mod ambience;
 pub mod anim;

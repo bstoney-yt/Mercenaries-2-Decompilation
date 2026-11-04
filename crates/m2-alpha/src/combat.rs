@@ -522,6 +522,9 @@ fn within_bash(feet: Vec3, ahead: Vec3, middle: Vec3, half: f32) -> bool {
     to.length() <= BASH_REACH + half && to.normalize_or_zero().dot(ahead) >= BASH_ARC
 }
 const BASH_DAMAGE: f32 = 60.0;
+/// The `Bash` record's `BashRange`, metres (its registered default,
+/// schema 0x823F43D8).
+const BASH_RANGE: f32 = 1.0;
 const BASH_BREAK: f32 = 100.0;
 const BASH_PUSH: (f32, f32) = (3.0, 1.0);
 const BASH_GAP: f32 = 0.8;
@@ -2927,6 +2930,9 @@ impl Combat {
             if let Some(at) = f.people.npcs[i].throws.take() {
                 self.npc_throw(f, i, at);
             }
+            if std::mem::take(&mut f.people.npcs[i].melee) {
+                self.npc_melee(f, i);
+            }
         }
         self.fly(f, dt);
         self.burn_vehicles(f, dt);
@@ -5007,6 +5013,34 @@ impl Combat {
     /// `DamageKey` (a round without a key is a `Bullet`); the Assault
     /// Rifle Bullet's [`NPC_DAMAGE`] when his template names no gun, or
     /// the table isn't found.
+    /// Soldier `i`'s blow (the close-quarters cycle's strike,
+    /// [`m2_engine::ai_close`]): the melee message the player's button
+    /// posts, handled at 0x8222B2E8 (research thread, 360 notes s21). It
+    /// lands on her within the `Bash` record's `BashRange` (1 m)
+    /// beyond the two bodies, and she takes the damage table's cell for
+    /// her row (`Hero`) and `MeleeBash` (0x29EFE0B5, as damage of type
+    /// 3). Not yet: the 60 / 300 shove and the 6 s knockdown it gives a
+    /// human, and her 0.15 camera shake.
+    fn npc_melee(&mut self, f: &mut Field<'_>, i: usize) {
+        let n = &f.people.npcs[i];
+        if f.player.driving.is_some() || !n.alive {
+            return;
+        }
+        let from = n.character.position;
+        let reach = BASH_RANGE + n.character.radius + f.player.character.radius;
+        if from.distance(f.player.character.position) > reach {
+            return;
+        }
+        let melee = m2_assets::name_hash("MeleeBash");
+        let damage = self
+            .damage_table
+            .as_ref()
+            .and_then(|t| t.scale(m2_assets::name_hash("Hero"), melee))
+            .unwrap_or(0.0);
+        let lost = self.hurt_player(f, damage, Some(from));
+        eprintln!("melee: a soldier's blow lands on her: {damage:.1} ({lost:.1} lost)");
+    }
+
     fn npc_round(&self, gun: Option<m2_engine::tuning::HandGun>) -> f32 {
         let Some(g) = gun else { return NPC_DAMAGE };
         let key = g

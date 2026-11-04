@@ -939,6 +939,11 @@ pub struct Npc {
     pushed: f32,
     /// The fight's dithering check and the spots it marked bad.
     dither: m2_engine::ai_dither::Dither,
+    /// The close-quarters cycle, and seconds left of a blow's clip.
+    close: m2_engine::ai_close::CloseQuarters,
+    striking: f32,
+    /// He struck this tick (the melee hook: its damage is not traced yet).
+    pub melee: bool,
     stalled: u8,
     way: Vec2,
     turning: m2_engine::on_foot::Turn,
@@ -1098,6 +1103,9 @@ impl Npc {
             ground: Vec2::ZERO,
             pushed: 0.0,
             dither: Default::default(),
+            close: Default::default(),
+            striking: 0.0,
+            melee: false,
             stalled: 0,
             way: Vec2::Y,
             turning: m2_engine::on_foot::Turn::default(),
@@ -1607,6 +1615,44 @@ impl Npc {
                 }
             }
         }
+        // Within reach of her, with nothing between: the 360's
+        // close-quarters cycle (0x822B2D30, [`m2_engine::ai_close`]) moves
+        // him instead, and strikes.
+        let reach = 2.0 * self.character.radius + m2_engine::ai_close::REACH;
+        if seen && !hiding && distance < reach && self.striking <= 0.0 {
+            self.step = None;
+            self.detour = None;
+            let toward = to.with_y(0.0).normalize_or_zero();
+            match self.close.think(distance, self.ai.combat_speed, dt) {
+                m2_engine::ai_close::Close::Move(k) => {
+                    wanted = toward * self.push(k.abs()) * k.signum();
+                }
+                m2_engine::ai_close::Close::Stand => wanted = Vec3::ZERO,
+                m2_engine::ai_close::Close::Strike => {
+                    wanted = Vec3::ZERO;
+                    // The blow: the melee message the player's button posts.
+                    // Its damage comes from the melee action's own events,
+                    // not yet traced: `melee` is the hook for it.
+                    self.melee = true;
+                    if let Some((clip, _)) = clips.bash {
+                        self.rig.animator.set_upper(None);
+                        self.rig.animator.play_once(clip);
+                        self.rig.animator.seek(0.0);
+                        self.striking = self.rig.clips[clip].info.duration;
+                    }
+                    eprintln!(
+                        "people: {:08x} strikes at {distance:.1} m",
+                        self.spawn.unwrap_or(u32::MAX)
+                    );
+                }
+            }
+        } else if distance >= reach {
+            self.close = Default::default();
+        }
+        if self.striking > 0.0 {
+            self.striking -= dt;
+            wanted = Vec3::ZERO;
+        }
         self.move_dry(physics, wanted, dt);
         // Swinging back and forth in the fight: past 8 swings he gives the
         // move up and marks the spot bad for a minute, as the 360's
@@ -1687,8 +1733,10 @@ impl Npc {
         // he turns round with the rifle ready first.
         let ahead = seen && off < AIM_ARC;
         let carry = if ahead { Carry::Aim } else { Carry::Ready };
-        self.rig.hold_rifle(gait, &clips, carry);
-        if ahead {
+        if self.striking <= 0.0 {
+            self.rig.hold_rifle(gait, &clips, carry);
+        }
+        if ahead && self.striking <= 0.0 {
             self.rig.aim_along(self.facing, Some(threat - self.chest()));
         }
         self.cooldown -= dt;
@@ -1730,7 +1778,11 @@ impl Npc {
             }
         }
         // His number stands in for the game's entity handle (invented).
-        let rate = self.rig.play_rate(gait, moved, self.shooter);
+        let rate = if self.striking > 0.0 {
+            1.0
+        } else {
+            self.rig.play_rate(gait, moved, self.shooter)
+        };
         self.rig.advance(dt * rate);
         true
     }
