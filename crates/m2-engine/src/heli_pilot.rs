@@ -70,6 +70,14 @@ pub struct HeliPilot {
     pub airborne: bool,
     /// What it carries slung under it, if anything ([`Slung`]).
     pub load: Option<Slung>,
+    /// Its attack (the task `HeliAttack`, [`HeliPilot::attack`]): which
+    /// part of it (+0x0: circling, a run over the target, turning back),
+    /// where on its circle it is (+0x64, radians), how long to its next
+    /// crossing over (+0x80, s) and how long its run fires (+0x8C, s).
+    pub attack_part: u8,
+    pub orbit: f32,
+    pub cross_in: f32,
+    pub run_fire: f32,
     thought: bool,
 }
 
@@ -102,6 +110,29 @@ fn wrap(a: f32) -> f32 {
 /// The heading of a direction, radians (0x82855048: from its x and z).
 pub fn heading_of(v: Vec3) -> f32 {
     v.x.atan2(v.z)
+}
+
+/// What an attacking pilot's target is, as its mind's target record has
+/// it (0x822B0338).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AttackTarget {
+    /// Where it is and how it moves.
+    pub at: Vec3,
+    pub velocity: Vec3,
+    /// How long since it was last seen, s (the record's +0x8C).
+    pub unseen: f32,
+    /// How fast its gun's rounds fly, m/s, if it has a gun (0x822D5620
+    /// leads by them; without one it leads by 1.5 s).
+    pub round_speed: Option<f32>,
+}
+
+/// What an attacking pilot does with its gun ([`HeliPilot::attack`]):
+/// aims at a point, or fires at it (0x822AE598 modes 3, and 1 or 2 by
+/// the gun's own firing, 0x822B0578).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Gun {
+    Aim(Vec3),
+    Fire(Vec3),
 }
 
 /// How a landing goes ([`HeliPilot::land_near`]).
@@ -196,6 +227,10 @@ impl HeliPilot {
             blocked: 0.0,
             airborne: false,
             load: None,
+            attack_part: 0,
+            orbit: 0.0,
+            cross_in: 0.0,
+            run_fire: 0.0,
             thought: false,
         }
     }
@@ -205,7 +240,7 @@ impl HeliPilot {
     /// straight under it (the 360 casts from 1000 m down to -1000 m,
     /// 0x822ED8C0; `None` keeps the last it found).
     pub fn sense(&mut self, at: Vec3, turn: Quat, velocity: Vec3, ground: Option<f32>, dt: f32) {
-        for t in [&mut self.steering, &mut self.blocked] {
+        for t in [&mut self.steering, &mut self.blocked, &mut self.run_fire] {
             if *t > 0.0 {
                 *t -= dt;
             }
@@ -442,6 +477,167 @@ impl HeliPilot {
                     self.fly_round_to(spot, 1.0, true, false, size, world, dt)
                 };
                 (stick, Landing::Flying)
+            }
+        }
+    }
+
+    /// Attacks `target` (the task `HeliAttack`, 0x822B1250): its stick let
+    /// go first (0x6C5F1491), then by its part:
+    ///
+    /// - circling (0x822B0F58): round a point `AttackRadius` out from the
+    ///   target and `AttackHeight` up, crossing to the far side every
+    ///   `FlyoverAttackRate` s, creeping round 0.01 rad a think the way it
+    ///   slides; facing the target, firing at where it will be when
+    ///   facing it within 0.3 rad and it was seen within the second. With
+    ///   the way from the point to the target blocked it picks another
+    ///   point at random and hovers. Once on its point, seen within the
+    ///   second, its run not firing, facing within 0.2 rad, at its height
+    ///   within 3 m, and its way to the target clear, it starts a run.
+    /// - a run (0x822B09F0, 0x822B06F0): flat out ahead at its height and
+    ///   heading, firing for 20 s, until the target is over 120 degrees
+    ///   off its nose and 0.75 of `AttackRadius` behind.
+    /// - turning back to it at a fifth of its throttle until it faces it
+    ///   within 0.785 rad, then circling again from where it is
+    ///   (0x822B1198).
+    ///
+    /// Not ported: 0x822C2678's check while low (taken as passed), the
+    /// boxes swept beside its rays to and from the target (0x822B0C90,
+    /// 0x822B06F0: here its circling looks by the ray alone, its run by a
+    /// box along the way alone), and how a burst is timed (the gun's own, 0x822B0578).
+    /// `rand` is the game's random number in 0..1 (0x8215E260).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attack(
+        &mut self,
+        target: &AttackTarget,
+        size: (f32, f32),
+        world: &mut dyn PilotWorld,
+        rand: f32,
+        dt: f32,
+    ) -> (PilotStick, Gun) {
+        use std::f32::consts::{PI, TAU};
+        self.stick = PilotStick::default();
+        let t = &self.tuning;
+        let (radius, height) = (t.attack_radius, t.attack_height);
+        let at = target.at + Vec3::Y;
+        let lead_time = match target.round_speed {
+            Some(speed) => {
+                let to = target.at - self.at;
+                let dist = to.length();
+                let dir = to / (dist + 1e-4);
+                let closing = speed - target.velocity.dot(dir);
+                if closing > 0.0 {
+                    dist / closing
+                } else {
+                    1000.0
+                }
+            }
+            None => 1.5,
+        };
+        let lead = at + target.velocity * lead_time;
+        let off = |p: Vec3, h: f32| wrap(heading_of(p - self.at) - h).abs();
+        let facing = off(at, self.heading);
+        let wrap_turn = |a: f32| a.rem_euclid(TAU);
+        let gun_at = |facing: f32| {
+            if facing >= 0.3 || target.unseen >= 1.0 {
+                Gun::Aim(lead)
+            } else {
+                Gun::Fire(lead)
+            }
+        };
+        match self.attack_part {
+            0 => {
+                // Circling (0x822B0F58).
+                self.cross_in -= dt;
+                if self.cross_in < 0.0 {
+                    self.orbit = wrap_turn(self.orbit + PI);
+                    self.cross_in = t.flyover_rate;
+                }
+                let centre = if height == 0.0 {
+                    Vec3::new(at.x, (at.y * 0.2).floor() * 5.0, at.z)
+                } else {
+                    Vec3::new(lead.x, at.y, lead.z)
+                };
+                let point = centre
+                    + Vec3::new(-self.orbit.sin(), 0.0, self.orbit.cos()) * radius
+                    + Vec3::Y * height;
+                let blocked = world.ground(point, at).is_some();
+                let mut ready = false;
+                if blocked {
+                    self.orbit = rand * TAU;
+                    self.hover(self.clearance, true);
+                } else {
+                    if (point - self.at).with_y(0.0).length() < self.fastest.1 {
+                        ready = true;
+                        let creep = if self.along.x <= 0.0 { -0.01 } else { 0.01 };
+                        self.orbit = wrap_turn(self.orbit + creep);
+                    }
+                    self.fly_round_to(point, 1.0, true, true, size, world, dt);
+                }
+                self.hold_heading(heading_of(at - self.at));
+                let gun = gun_at(facing);
+                // A run, when it can (0x822B06F0).
+                if ready && target.unseen < 1.0 && self.run_fire <= 0.0 && facing < 0.2 {
+                    let level = ((self.at.y - at.y) - height).abs() < 3.0;
+                    let way = (lead - self.at).normalize_or_zero();
+                    let clear = level
+                        && world.sweep(
+                            self.at,
+                            self.turn,
+                            Vec3::new(size.1, size.0, size.1) * 0.5,
+                            way,
+                            radius * 2.0 + size.1 * 2.0,
+                        ) >= 1.0;
+                    if clear {
+                        self.attack_part = 1;
+                        self.run_fire = 20.0;
+                    }
+                }
+                (self.stick, gun)
+            }
+            1 => {
+                // A run (0x822B09F0).
+                let here = self.height;
+                self.hold_height(here, false);
+                self.hold_across(0.0);
+                self.hold_ahead(self.fastest.0);
+                self.hold_heading(self.heading);
+                let mut done = false;
+                if facing > 2.094 {
+                    let behind = (self.at - at).with_y(0.0).length();
+                    if (radius * 0.75).powi(2) <= behind * behind {
+                        done = true;
+                    }
+                }
+                let gun = if !done && self.run_fire > 0.0 {
+                    Gun::Fire(lead)
+                } else {
+                    done = true;
+                    Gun::Aim(lead)
+                };
+                if done {
+                    self.attack_part = 2;
+                }
+                (self.stick, gun)
+            }
+            _ => {
+                // Turning back (0x822C2008: a whole turn its way).
+                let way = wrap(heading_of(self.at - at) - self.heading);
+                let turn = if way > 0.0 {
+                    -1.0
+                } else if way < 0.0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                self.stick.yaw = -turn;
+                self.stick.ahead = 0.2;
+                let ahead = self.turn * Vec3::Z;
+                let to = (at - self.at).normalize_or_zero();
+                if (0.785f32).cos() < to.x * ahead.x + to.z * ahead.z {
+                    self.orbit = wrap_turn(-heading_of(self.at - target.at));
+                    self.attack_part = 0;
+                }
+                (self.stick, Gun::Aim(lead))
             }
         }
     }
@@ -812,5 +1008,49 @@ mod tests {
         );
         let (stick, gone) = p.deliver(target, 0.5, 6.0, (3.0, 12.0), &mut Open, 1.0 / 60.0);
         assert!(!gone && stick.ahead > 0.9, "{stick:?}");
+    }
+
+    // Attacking, it circles a point `AttackRadius` out and `AttackHeight`
+    // up; on it, facing the target, level and with its way clear it
+    // starts a run, firing for 20 s (0x822B0F58, 0x822B06F0).
+    #[test]
+    fn attacking_it_circles_then_makes_a_run() {
+        let mut p = pilot();
+        let target = AttackTarget {
+            at: Vec3::ZERO,
+            velocity: Vec3::ZERO,
+            unseen: 0.0,
+            round_speed: None,
+        };
+        let facing_in = Quat::from_rotation_y(std::f32::consts::PI);
+        p.sense(
+            Vec3::new(0.0, 21.0, 80.0),
+            facing_in,
+            Vec3::ZERO,
+            Some(0.0),
+            1.0 / 60.0,
+        );
+        p.cross_in = 5.0;
+        let (_, gun) = p.attack(&target, (3.0, 12.0), &mut Open, 0.5, 1.0 / 60.0);
+        assert_eq!(gun, Gun::Fire(Vec3::Y));
+        assert_eq!(p.attack_part, 1);
+        assert_eq!(p.run_fire, 20.0);
+        assert!(
+            (p.orbit - (std::f32::consts::TAU - 0.01)).abs() < 1e-4,
+            "{}",
+            p.orbit
+        );
+        // Far off its point it only circles.
+        let mut q = pilot();
+        q.sense(
+            Vec3::new(0.0, 21.0, 300.0),
+            facing_in,
+            Vec3::ZERO,
+            Some(0.0),
+            1.0 / 60.0,
+        );
+        q.cross_in = 5.0;
+        q.attack(&target, (3.0, 12.0), &mut Open, 0.5, 1.0 / 60.0);
+        assert_eq!(q.attack_part, 0);
     }
 }

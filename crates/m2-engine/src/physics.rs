@@ -5510,7 +5510,11 @@ impl Physics {
 
     /// How far, of `max` metres along `direction`, a box of half
     /// extents `half` turned `turn` goes from `origin` before it meets
-    /// something solid, passing through vehicle `skip`.
+    /// something solid but the terrain, passing through vehicle `skip`:
+    /// an AI pilot's sweeps. The 360's are Havok shape casts while it
+    /// finds the ground with rays and keeps its pilots over it by them
+    /// (`MinAltitude`); that its casts meet no terrain is inferred (a run's
+    /// box swept at the target on the ground would always meet it).
     pub fn cast_box(
         &self,
         origin: Vec3,
@@ -5520,7 +5524,10 @@ impl Physics {
         max: f32,
         skip: Option<VehicleId>,
     ) -> Option<f32> {
-        let mut filter = solid();
+        let not_terrain = |h: r::ColliderHandle, _: &r::Collider| {
+            !matches!(self.keys.get(&h), Some(StaticKey::Cell(_)))
+        };
+        let mut filter = solid().predicate(&not_terrain);
         if let Some(v) = skip
             .and_then(|v| self.vehicles.get(v.0))
             .and_then(Option::as_ref)
