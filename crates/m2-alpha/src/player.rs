@@ -706,6 +706,9 @@ impl Player {
             return;
         };
         self.clips = set.clips;
+        if let Some((_, rig)) = &mut self.model {
+            rig.set_sweeps(set.sweeps);
+        }
         if let Some((_, rig)) = &mut self.model
             && let Some(l) = rig.locomotion.as_mut()
         {

@@ -85,6 +85,12 @@ pub struct Rig {
     pub aim: Option<Vec3>,
     /// (rear, front) hands of the aim pose, found once.
     pub(crate) hands: std::sync::OnceLock<Option<(usize, usize)>>,
+    /// The rifle's aim sweeps, standing and moving, each low, mid and
+    /// high ([`m2_engine::aim_sweep`]), found once.
+    pub(crate) sweeps: std::sync::OnceLock<Option<[[usize; 3]; 2]>>,
+    /// The sweeps pose the upper body alone, standing too: a hero's, who
+    /// aims in crouched ([`Rig::set_sweeps`]).
+    pub sweep_upper: bool,
     /// The arm that carries the rifle low, found once.
     pub(crate) arm: std::sync::OnceLock<Option<Arc<[bool]>>>,
     /// The clips' events met and not yet taken: (clip, event).
@@ -476,8 +482,14 @@ fn hero_moves(
             v.join(", ")
         };
         eprintln!(
-            "hero moves: {hero}: {name}: aim {}, ready {}, run {}, gaits {}; stow {}; take up {}",
+            "hero moves: {hero}: {name}: aim {}, sweeps {}, ready {}, run {}, gaits {}; stow {}; take up {}",
             h(held.clips.aim),
+            held.sweeps.map_or("none".to_owned(), |s| s
+                .iter()
+                .flatten()
+                .map(|&i| h(Some(i)))
+                .collect::<Vec<_>>()
+                .join(" ")),
             h(held.clips.ready),
             h(held.clips.run_low),
             gaits.join(", "),
@@ -644,11 +656,17 @@ impl Rig {
         }
         let locomotion = self.locomotion.as_ref()?;
         let fight = npc::FightClips::find(self);
+        use m2_engine::aim_sweep::{RIFLE_MOVING, RIFLE_STANDING};
+        let sweeps = RIFLE_STANDING
+            .iter()
+            .chain(&RIFLE_MOVING)
+            .filter_map(|&h| self.clips.iter().position(|c| c.hash == h));
         let mut wanted: Vec<usize> = locomotion
             .clips
             .values()
             .copied()
             .chain(fight.all())
+            .chain(sweeps)
             .collect();
         wanted.sort_unstable();
         wanted.dedup();
@@ -673,6 +691,8 @@ impl Rig {
             two_handed: false,
             aim: None,
             hands: Default::default(),
+            sweeps: Default::default(),
+            sweep_upper: false,
             arm: Default::default(),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
@@ -734,6 +754,8 @@ impl Rig {
             two_handed: false,
             aim: None,
             hands: Default::default(),
+            sweeps: Default::default(),
+            sweep_upper: false,
             arm: Default::default(),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
@@ -763,6 +785,8 @@ impl Rig {
             barrel: true,
             scripted: None,
             hands: Default::default(),
+            sweeps: Default::default(),
+            sweep_upper: false,
             animator: Animator::default(),
             cues: Vec::new(),
             ..self.clone()
@@ -843,8 +867,92 @@ impl Rig {
     pub fn aimed_pose(&self) -> Option<Pose> {
         let want = self.aim.filter(|_| self.two_handed && self.barrel)?;
         let mut pose = self.animator.pose(&self.skeleton, &self.clips);
-        self.point(&mut pose, want);
+        if !self.sweep(&mut pose, want) {
+            self.point(&mut pose, want);
+        }
         Some(pose)
+    }
+
+    /// A hero's own aim sweeps for what she holds
+    /// ([`crate::held::Held::sweeps`]); `None`: she aims by turning the
+    /// aim clip.
+    pub fn set_sweeps(&mut self, sweeps: Option<[[usize; 3]; 2]>) {
+        self.sweeps = std::sync::OnceLock::from(sweeps);
+        self.sweep_upper = true;
+    }
+
+    /// The rifle's sweep clips, standing and moving, if this rig has them:
+    /// the people's by the generic rifle rows, a hero's as
+    /// [`set_sweeps`](Self::set_sweeps) gave them.
+    fn sweep_clips(&self) -> Option<[[usize; 3]; 2]> {
+        if self.sweep_upper || !self.own.is_empty() {
+            return self.sweeps.get().copied().flatten();
+        }
+        *self.sweeps.get_or_init(|| {
+            use m2_engine::aim_sweep::{RIFLE_MOVING, RIFLE_STANDING};
+            let find = |hs: [u32; 3]| -> Option<[usize; 3]> {
+                let mut out = [0; 3];
+                for (o, h) in out.iter_mut().zip(hs) {
+                    *o = self.clips.iter().position(|c| c.hash == h)?;
+                }
+                Some(out)
+            };
+            Some([find(RIFLE_STANDING)?, find(RIFLE_MOVING)?])
+        })
+    }
+
+    /// Poses the aim along `want` (model space) as the 360 does
+    /// ([`m2_engine::aim_sweep`]): the sweeps held at the point for the
+    /// aim's yaw from the body, low, mid and high shared by its pitch;
+    /// over the whole body standing, over the upper body on the move.
+    /// False without the sweep clips.
+    fn sweep(&self, pose: &mut Pose, want: Vec3) -> bool {
+        use m2_engine::aim_sweep;
+        let Some(sets) = self.sweep_clips() else {
+            return false;
+        };
+        let w = want.normalize_or_zero();
+        if w == Vec3::ZERO {
+            return false;
+        }
+        let forward = self
+            .locomotion
+            .as_ref()
+            .map_or(m2_math::glam::Vec2::Y, |l| l.forward);
+        let mut yaw = w.x.atan2(w.z) - forward.x.atan2(forward.y);
+        yaw = (yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+        let pitch = w.y.clamp(-1.0, 1.0).asin();
+        // A hero aims in crouched (`Crouched` stance): her legs keep the
+        // crouched clip and the sweep poses her upper body, standing too.
+        let hero = self.sweep_upper;
+        let moving = self.animator.upper().is_some();
+        let set = sets[usize::from(moving)];
+        let at = aim_sweep::phase(yaw);
+        let root = self.skeleton.root();
+        let sample = |i: usize| {
+            let c = &self.clips[i];
+            let mut p = c.sample(&self.skeleton, at * c.info.duration);
+            p.strip_root_motion(root, c.info.pin);
+            p
+        };
+        let [low, mid, high] = aim_sweep::weights(pitch);
+        let mut aimed = sample(set[1]);
+        if low > 0.0 {
+            aimed.blend(&sample(set[0]), low / (low + mid));
+        } else if high > 0.0 {
+            aimed.blend(&sample(set[2]), high / (high + mid));
+        }
+        match self.upper.as_ref().filter(|_| moving || hero) {
+            Some(mask) => {
+                for ((local, mine), on) in pose.0.iter_mut().zip(aimed.0).zip(mask.iter()) {
+                    if *on {
+                        *local = mine;
+                    }
+                }
+            }
+            None => *pose = aimed,
+        }
+        true
     }
 
     /// Aims with clip `clip` (the hero's own pick, which for Mattias and
