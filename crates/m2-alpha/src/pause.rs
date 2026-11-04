@@ -26,9 +26,9 @@
 //!   (`audioSetSFXVolume`...), for the player to hear.
 //! - Its question boxes: its Save Game, Load Game, Cancel Contract and
 //!   Quit buttons ask the engine to put up their box
-//!   (`messageQuitGame`...), with the title, text and buttons its test
-//!   path puts up itself; the box's own answer goes on (Quit's yes:
-//!   `quitGame` and `closePause`).
+//!   (`messageQuitGame`...), with the title, text and buttons the
+//!   engine's box table gives (see [`BOXES`]); the box's own answer goes
+//!   on (Quit's yes: `quitGame` and `closePause`).
 //! - Its saves: `saveCheck` asks the engine to get them ready
 //!   (`preoperation` with "perform,what") and goes on when told
 //!   (`preopComplete(true, what)`): listing them (`listLoadGame`), the
@@ -84,17 +84,27 @@ pub const MOVIE: &str = "pause_menu";
 /// A call into the movie: the function's name and its arguments.
 pub type Call = (&'static str, Vec<Value>);
 
-/// The question boxes the movie asks the engine for, with what its test
-/// path puts up for each (title, text; the buttons are Yes and No).
+/// The question boxes the movie asks the engine for, with what the engine
+/// puts up for each (title, text; the buttons are Yes and No). From the
+/// 360 code: its box table (0x8237D310) keys each by the hash of the
+/// command's name and gives "Are you sure?" (9b476854) with "Quit this
+/// game? Any unsaved changes will be lost." (e5c9f6c4), "Overwrite your
+/// existing saved game?" (c7e9b207), "Load game? Any unsaved changes
+/// will be lost." (1c55a948) and "Cancel the current contract?"
+/// (8bcbd1d7), as the PC footage's Quit and Save boxes read. The movie's
+/// own test path has other texts ("Any unsaved mission progress will be
+/// lost..."), which the Beta showed before. The 360's other Quit text,
+/// for a flag of its game state's not yet read, is left out.
 const BOXES: [(&str, &str, &str); 4] = [
-    ("messageQuitGame", "[0x229c06dc]", "[0x0c7173a4]"),
-    ("messageSaveGame", "[0x229c06dc]", "[0x29dd2ac5]"),
-    ("messageLoadGame", "[0x229c06dc]", "[0x0c7173a4]"),
-    ("messageCancelContract", "[0x229c06dc]", "[0xeeeee69f]"),
+    ("messageQuitGame", TITLE, "[0xe5c9f6c4]"),
+    ("messageSaveGame", TITLE, "[0xc7e9b207]"),
+    ("messageLoadGame", TITLE, "[0x1c55a948]"),
+    ("messageCancelContract", TITLE, "[0x8bcbd1d7]"),
 ];
-/// The boxes' buttons, as its test path labels them.
-const YES: &str = "[0x2d95aa31]";
-const NO: &str = "[0x399868dd]";
+/// The boxes' title, "Are you sure?", and buttons, from the same table.
+const TITLE: &str = "[0x9b476854]";
+const YES: &str = "[0xaf4b6e11]";
+const NO: &str = "[0xc9a7eabd]";
 
 /// The player's settings as the menu shows them: sliders 0 to 100.
 ///
@@ -1129,6 +1139,11 @@ mod tests {
         let calls = n.calls(&s);
         assert_eq!(calls[0].0, "onlineMessage");
         assert_eq!(calls[0].1.len(), 7);
+        // The 360 box table's Quit text, as the PC footage reads it.
+        assert_eq!(
+            format!("{:?}", calls[0].1[1]),
+            format!("{:?}", text("[0xe5c9f6c4]"))
+        );
         assert!(n.command("preoperation", "load,listLoadGame"));
         assert_eq!(
             names(n.calls(&s)),
