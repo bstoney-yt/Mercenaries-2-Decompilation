@@ -1764,6 +1764,11 @@ impl Game {
             world
                 .destroyed
                 .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));
+            // The cover service: one spot for each soldier who asked
+            // ([`m2_engine::ai_cover`]).
+            crate::spans::time("on foot: cover", || {
+                serve_cover(world, &mut scene.people);
+            });
             crate::spans::time("on foot: hit world", || {
                 hit_world(
                     world,
@@ -5118,5 +5123,80 @@ mod picture_tests {
             shadows: false,
         };
         assert_eq!(lit(dark), (0.5, 0.0));
+    }
+}
+
+/// The cover service (0x822CC020): for each soldier who asked this tick, the
+/// best spot among the cover hints of the objects within the search radius
+/// of him ([`m2_engine::ai_cover`]), from the threat he named, away from
+/// his fellow soldiers (at most 15); none found, he asks again after
+/// [`m2_engine::ai_cover::RETRY`]. Rays are the physics' (the program's
+/// own filters are not modelled); the threat's eye is taken 1.3 m over
+/// where she stands (inferred).
+fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
+    use m2_engine::ai_cover::{self, Placed, Request};
+    let asks: Vec<(usize, Vec3, Vec3)> = people
+        .npcs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| Some((i, n.character.position, n.cover_ask?)))
+        .collect();
+    for (i, centre, threat) in asks {
+        let avoid: Vec<Vec3> = people
+            .npcs
+            .iter()
+            .enumerate()
+            .filter(|&(j, n)| j != i && n.alive && n.soldier)
+            .map(|(_, n)| n.character.position)
+            .filter(|p| p.distance(centre) < ai_cover::SEARCH * 2.0)
+            .take(15)
+            .collect();
+        let req = Request {
+            centre,
+            radius: ai_cover::SEARCH,
+            threat: threat + Vec3::Y * 1.3,
+            avoid,
+        };
+        let mut cands = Vec::new();
+        for (o, _) in world.near(centre, ai_cover::SEARCH) {
+            let p = &world.index.objects[o];
+            let Some(hints) = world.index.template_db.cover_hints.get(&p.template) else {
+                continue;
+            };
+            let Some(model) = world.object_model(o) else {
+                continue;
+            };
+            let placed = Placed {
+                position: p.position,
+                rotation: p.rotation,
+                bounds: model.bounds,
+            };
+            for h in hints {
+                cands.extend(ai_cover::candidates(&req, &placed, h));
+            }
+        }
+        let physics = &world.physics;
+        let ground = |at: Vec3| {
+            physics
+                .cast_ray(at + Vec3::Y * 0.5, -Vec3::Y, 2.0)
+                .map(|(d, _)| at.y + 0.5 - d)
+        };
+        let blocked = |a: Vec3, b: Vec3| {
+            let to = b - a;
+            physics
+                .cast_ray(a, to, to.length())
+                .is_some_and(|(d, _)| d < to.length() - 0.05)
+        };
+        let found = ai_cover::choose(&req, &cands, ground, blocked);
+        let n = &mut people.npcs[i];
+        n.cover_ask = None;
+        n.cover_spot = found;
+        if let Some(at) = found {
+            eprintln!(
+                "people: {:08x} takes cover at {at:.1} ({} spots looked at)",
+                n.spawn.unwrap_or(u32::MAX),
+                cands.len()
+            );
+        }
     }
 }

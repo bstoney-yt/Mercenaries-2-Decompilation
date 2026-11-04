@@ -950,6 +950,12 @@ pub struct Npc {
     /// How fast they swim, m/s (their kind's [`PersonKind::swim`], else
     /// [`crate::player::SWIM_SPEED`]).
     pub swim_speed: f32,
+    /// Cover from her: the threat he wants cover from (asked of the cover
+    /// service this tick, [`People::find_cover`]), the spot it gave, and
+    /// seconds until he may ask again ([`m2_engine::ai_cover::RETRY`]).
+    pub cover_ask: Option<Vec3>,
+    pub cover_spot: Option<Vec3>,
+    cover_retry: f32,
     /// How they move on foot, as the 360's people do
     /// ([`m2_engine::on_foot`]): their kind's paces and turn, the way and
     /// speed they go as it builds, their turn's speed and the slide to a
@@ -1128,6 +1134,9 @@ impl Npc {
             through: false,
             swim: None,
             swim_speed: crate::player::SWIM_SPEED,
+            cover_ask: None,
+            cover_spot: None,
+            cover_retry: 0.0,
             motion: m2_engine::on_foot::HumanMotion::default(),
             ground: Vec2::ZERO,
             pushed: 0.0,
@@ -1609,7 +1618,32 @@ impl Npc {
                 self.cover = None;
             }
         }
-        if hiding {
+        // Beyond his guns' reach of her, the 360's fighting mind takes
+        // cover rather than attacking (0x822D8890): a spot asked of the
+        // cover service ([`CoverSearch`]), gone to at his `CombatSpeed`
+        // (`HumanTakeCover`, 0x822B3970), held facing her. Within reach
+        // again, the attack.
+        let beyond = distance > self.fire_hint().range;
+        if !beyond {
+            self.cover_spot = None;
+        }
+        self.cover_retry -= dt;
+        if beyond && !hiding && self.cover_spot.is_none() && self.cover_retry <= 0.0 {
+            self.cover_ask = Some(threat);
+            self.cover_retry = m2_engine::ai_cover::RETRY;
+        }
+        let to_cover = self.push(self.ai.combat_speed);
+        let covered = match self.cover_spot.filter(|_| beyond && !hiding) {
+            Some(spot) => {
+                let flat = (spot - at).with_y(0.0);
+                if flat.length() > 0.6 {
+                    wanted = flat.normalize() * to_cover;
+                }
+                true
+            }
+            None => false,
+        };
+        if hiding || covered {
             self.step = None;
         } else if !seen || distance > self.fire_hint().range {
             self.step = None;
