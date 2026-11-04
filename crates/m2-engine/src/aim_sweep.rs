@@ -67,10 +67,13 @@
 //! times 2 (0x82003CF4), scaled by 1 and raised by 0.5, or a steady 0.5 for
 //! a pistol (the equipment class `pistol`, 0xD48C7D34; init 0x82805E18).
 //!
-//! **Inferred**: how the group's blend shares its inputs. Standing, the
-//! sweep and its firing clip are a crossfade (1 - w and w). Moving, the
-//! moving sweep's input is set to the node's +0x158C path (taken as 1)
-//! and its firing clip's to w, taken as shares of their sum.
+//! - Moving is the same crossfade as standing: the step also stores
+//!   `1 - w` at the node's +0x158C (0x8280B444), and the moving steps
+//!   (0x82808468 at 0x82808FB4, 0x82809468 at 0x828099C8) set each
+//!   group's moving sweep (ports +0xB80, +0xD44, +0xF08) to it. Moving
+//!   fades in each group's first and fourth inputs (0x82808018,
+//!   0x82809188), standing its second and third (0x82809B98), and the
+//!   blend (0x827F9C28, mode 0) shares its inputs by their sum, 1.
 //!
 //! **Not ported**: the node's easing of the aim yaw (rate at 0x82DE8828).
 
@@ -149,11 +152,10 @@ impl Kick {
     }
 }
 
-/// The firing clip's share of a group for firing weight `w`: standing a
-/// crossfade, moving its share of 1 and `w` (inferred).
-pub fn fire_share(w: f32, moving: bool) -> f32 {
-    let w = w.clamp(0.0, 1.0);
-    if moving { w / (1.0 + w) } else { w }
+/// The firing clip's share of a group for firing weight `w`, standing or
+/// moving: a crossfade, the sweep taking `1 - w`.
+pub fn fire_share(w: f32) -> f32 {
+    w.clamp(0.0, 1.0)
 }
 
 /// The bones the crouched aim movement poses (the 360's `lowerbody`
@@ -343,9 +345,9 @@ mod tests {
 
     #[test]
     fn firing_shares() {
-        assert_eq!(fire_share(0.0, false), 0.0);
-        assert_eq!(fire_share(0.5, false), 0.5);
-        assert!((fire_share(1.0, true) - 0.5).abs() < 1e-6);
+        assert_eq!(fire_share(0.0), 0.0);
+        assert_eq!(fire_share(0.5), 0.5);
+        assert_eq!(fire_share(1.4), 1.0);
     }
 
     #[test]

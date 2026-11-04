@@ -976,7 +976,7 @@ impl Rig {
         let fire = sets
             .fire
             .map(|f| f[usize::from(moving)])
-            .zip(Some(aim_sweep::fire_share(self.kick.weight(), moving)))
+            .zip(Some(aim_sweep::fire_share(self.kick.weight())))
             .filter(|&(_, share)| share > 0.0);
         let at = aim_sweep::phase(yaw);
         let root = self.skeleton.root();
