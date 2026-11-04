@@ -1033,8 +1033,9 @@ impl Player {
         // Havok's ground state takes her actual velocity 95% of the way
         // there a step, at most 200 m/s² (0x8268DD08); just off a ledge
         // she steers so for 0.25 s more, capped at 100 m/s a step
-        // ([`on_foot::ground_step`]). Further in the air, as before
-        // (Havok's in-air state is untraced).
+        // ([`on_foot::ground_step`]). Further in the air, and from the
+        // start of a jump, Havok's in-air state steers towards the stick
+        // times her `MaxAirSpeed`, 7% a step, at most 50 m/s².
         self.unsupported = if self.character.grounded {
             0.0
         } else {
@@ -1043,10 +1044,16 @@ impl Player {
         let have = Vec2::new(self.character.velocity.x, self.character.velocity.z);
         let ground = if self.character.grounded {
             on_foot::ground_step(have, ground, on_foot::GROUND_MAX_ACCEL * dt)
-        } else if self.unsupported < on_foot::LEDGE_GRACE {
+        } else if self.unsupported < on_foot::LEDGE_GRACE && !matches!(self.leap, Leap::Air(_)) {
             on_foot::ground_step(have, ground, on_foot::LEDGE_MAX_CHANGE)
         } else {
-            ground
+            let stick = Vec2::new(direction.x, direction.z);
+            on_foot::gain_step(
+                have,
+                stick * self.motion.max_air_speed,
+                on_foot::AIR_GAIN,
+                on_foot::AIR_MAX_ACCEL * dt,
+            )
         };
         let wanted = Vec3::new(ground.x, 0.0, ground.y);
         let jump = self

@@ -818,6 +818,13 @@ pub const GROUND_MAX_ACCEL: f32 = 200.0;
 /// [`LEDGE_MAX_CHANGE`] m/s a step whatever the step, falling meanwhile.
 pub const LEDGE_GRACE: f32 = 0.25;
 pub const LEDGE_MAX_CHANGE: f32 = 100.0;
+/// In the air (past the grace, and from the start of a jump), Havok's
+/// in-air state steers the same way towards the stick times the
+/// template's `MaxAirSpeed`, with this gain a step and change capped at
+/// [`AIR_MAX_ACCEL`] m/s² (research thread, 360 notes s16); the vertical
+/// speed is left to gravity.
+pub const AIR_GAIN: f32 = 0.07;
+pub const AIR_MAX_ACCEL: f32 = 50.0;
 
 /// The horizontal velocity after one Havok step of `dt` from `current`
 /// towards `wanted` (0x8268DD08): the gap times [`GROUND_GAIN`], its
@@ -825,8 +832,13 @@ pub const LEDGE_MAX_CHANGE: f32 = 100.0;
 /// ground, [`LEDGE_MAX_CHANGE`] in the grace). Per step, so it depends on
 /// the step's length as the 360's does.
 pub fn ground_step(current: Vec2, wanted: Vec2, max_change: f32) -> Vec2 {
+    gain_step(current, wanted, GROUND_GAIN, max_change)
+}
+
+/// [`ground_step`] with gain `gain`.
+pub fn gain_step(current: Vec2, wanted: Vec2, gain: f32, max_change: f32) -> Vec2 {
     let d = wanted - current;
-    let change = d * GROUND_GAIN;
+    let change = d * gain;
     let len = change.length();
     if len > max_change && len > 0.0 {
         current + change * (max_change / len)
