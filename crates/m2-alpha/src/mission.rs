@@ -2406,10 +2406,35 @@ impl MissionLink {
             .is_some_and(|p| p.driving.is_none() && p.swimming());
         mission.set_swimming(PLAYER, swimming);
         // A scene's camera shot, from where its two stand now.
-        if let Some(shot) = game.shot.as_mut() {
+        if let Some(mut shot) = game.shot.take() {
             let w = mission.world().borrow();
             let at = |g: &u32| w.objects.get(g).map(|o| Vec3::from(o.position));
-            match (at(&shot.base), at(&shot.target)) {
+            let base = at(&shot.base).map(|feet| {
+                shot_actor(&game.scene, shot.base, shot.hardpoint()).unwrap_or(
+                    crate::game::ShotActor {
+                        feet,
+                        facing: w.objects.get(&shot.base).map_or(0.0, |o| o.yaw),
+                        hardpoint: None,
+                    },
+                )
+            });
+            if !shot.unplaced_logged
+                && let Some(b) = base
+            {
+                shot.unplaced_logged = true;
+                eprintln!(
+                    "mission: camera shot {} from {:#x}: hardpoint {:08x} {}",
+                    shot.name,
+                    shot.base,
+                    shot.hardpoint(),
+                    if b.hardpoint.is_some() {
+                        "found"
+                    } else {
+                        "not on its model"
+                    }
+                );
+            }
+            match (base, at(&shot.target)) {
                 (Some(b), Some(t)) => shot.place(b, t),
                 (b, t) if shot.view.is_none() && !shot.unplaced_logged => {
                     shot.unplaced_logged = true;
@@ -2424,6 +2449,8 @@ impl MissionLink {
                 }
                 _ => {}
             }
+            drop(w);
+            game.shot = Some(shot);
         }
         lap.mark("scripts: attitudes");
         // The dialog boxes, as the scripts may have imported their module
@@ -6761,6 +6788,56 @@ fn prop_hardpoints(
             (g, hardpoints_at(known, at))
         })
         .collect()
+}
+
+/// Where the scripts' character `guid` stands for a camera shot: the
+/// player, someone the scripts stand, or someone seated on a prop (the
+/// PMC HQ's starter), with node `hardpoint` of their posed model in the
+/// world, if their model has it. `None` for anyone else.
+fn shot_actor(
+    scene: &crate::scene::Scene,
+    guid: u32,
+    hardpoint: u32,
+) -> Option<crate::game::ShotActor> {
+    let node = |rig: &crate::scene::Rig, to_world: m2_math::glam::Mat4| {
+        let i = rig
+            .skeleton
+            .name_hashes
+            .iter()
+            .position(|&h| h == hardpoint)?;
+        let (nodes, _) = rig.posed();
+        Some(to_world.transform_point3(nodes.get(i)?.w_axis.truncate()))
+    };
+    if guid == PLAYER {
+        let p = scene.player.as_ref()?;
+        return Some(crate::game::ShotActor {
+            feet: p.character.position,
+            facing: p.facing,
+            hardpoint: p
+                .model
+                .as_ref()
+                .and_then(|(_, rig)| node(rig, p.model_matrix())),
+        });
+    }
+    if let Some(n) = scene
+        .people
+        .npcs
+        .iter()
+        .find(|n| n.spawn == Some(guid) && n.alive)
+    {
+        return Some(crate::game::ShotActor {
+            feet: n.character.position,
+            facing: n.facing,
+            hardpoint: node(&n.rig, n.model_matrix()),
+        });
+    }
+    let r = scene.riders.iter().find(|r| r.guid == Some(guid))?;
+    let forward = r.frame.transform_vector3(Vec3::Z);
+    Some(crate::game::ShotActor {
+        feet: r.frame.w_axis.truncate(),
+        facing: forward.x.atan2(forward.z),
+        hardpoint: node(&r.rig, r.frame),
+    })
 }
 
 /// Where a model's `nodes` (name hash, place in the model) stand with the
