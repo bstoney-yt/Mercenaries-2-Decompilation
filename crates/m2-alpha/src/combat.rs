@@ -1232,6 +1232,14 @@ pub enum FxTemplate {
     Hash(u32),
 }
 
+/// Which blast template went off, as the fight knows it: by id (a
+/// weapon's or a strike's blast) or by name (the satellite bomb's).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Blasted {
+    Id(u32),
+    Named(&'static str),
+}
+
 /// A sound the fight makes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Sound {
@@ -1259,7 +1267,19 @@ pub enum Sound {
         at: Vec3,
         set: Option<u32>,
     },
-    Explosion(Vec3),
+    /// A blast going off: its template where the fight knows it, whose
+    /// `SoundEffect` says what it plays ([`m2_engine::spawn_sound`]); else
+    /// the alpha's own blast.
+    Explosion {
+        at: Vec3,
+        of: Option<Blasted>,
+    },
+    /// A blast that goes off with another (its frag): heard only as its
+    /// own template's `SoundEffect` says, never with a sound standing in.
+    Frag {
+        at: Vec3,
+        of: Blasted,
+    },
     Cannon {
         at: Vec3,
         set: Option<u32>,
@@ -1275,7 +1295,10 @@ pub enum Sound {
         set: Option<u32>,
     },
     /// The satellite-guided bomb landing.
-    Bomb(Vec3),
+    Bomb {
+        at: Vec3,
+        of: Option<Blasted>,
+    },
     /// A building the bomb brought down coming apart.
     Collapse(Vec3),
     /// Something with no building's collapse (a fence, a sign) breaking:
@@ -2514,7 +2537,7 @@ impl Combat {
     /// Where blasts went off since sounds were last taken.
     pub fn explosions(&self) -> impl Iterator<Item = Vec3> + '_ {
         self.sounds.iter().filter_map(|s| match s {
-            Sound::Explosion(at) => Some(*at),
+            Sound::Explosion { at, .. } => Some(*at),
             _ => None,
         })
     }
@@ -4938,7 +4961,7 @@ impl Combat {
     /// A blast at `at`: fire and smoke, people killed or hurt, vehicles
     /// near it wrecked and thrown.
     pub fn explode(&mut self, f: &mut Field<'_>, at: Vec3) {
-        self.burst(at, 1.0);
+        self.burst(at, 1.0, None);
         self.show_fx(fx::GRENADE, at);
         let mut killed = false;
         let key = Some(m2_assets::name_hash("Explosion"));
@@ -5023,11 +5046,11 @@ impl Combat {
     }
 
     /// A blast's fire, smoke and sound, `size` times a grenade's.
-    fn burst(&mut self, at: Vec3, size: f32) {
+    fn burst(&mut self, at: Vec3, size: f32, of: Option<Blasted>) {
         self.blasts += 1;
         self.last_blast = Some(at);
         self.went_off.push(at);
-        self.sounds.push(Sound::Explosion(at));
+        self.sounds.push(Sound::Explosion { at, of });
         self.effect(
             Effect::Fire {
                 at,
@@ -5171,7 +5194,11 @@ impl Combat {
             return;
         };
         // Fire and smoke the size of a grenade's at its 5 m reach.
-        self.burst(at, (b.radius / 5.0).clamp(0.4, 3.0));
+        self.burst(
+            at,
+            (b.radius / 5.0).clamp(0.4, 3.0),
+            Some(Blasted::Id(b.template)),
+        );
         self.game_fx.push(GameFx {
             template: FxTemplate::Id(b.template),
             at,
@@ -5249,7 +5276,10 @@ impl Combat {
         self.blasts += 1;
         self.last_blast = Some(at);
         self.went_off.push(at);
-        self.sounds.push(Sound::Bomb(at));
+        self.sounds.push(Sound::Bomb {
+            at,
+            of: Some(Blasted::Named(fx::BOMB)),
+        });
         let hers = self.hero_damage;
         self.harm(f, at, BOMB, false, (hers.explosion_large, "ExplosionLarge"));
         self.show_fx(fx::BOMB, at);
@@ -5312,14 +5342,22 @@ impl Combat {
     /// An air strike's blast at `at`, as its explosion template has it:
     /// reaching `radius` metres with `damage` at its heart. Fire and smoke
     /// in proportion (the template's own effects aren't drawn yet).
-    pub fn blast(&mut self, f: &mut Field<'_>, at: Vec3, radius: f32, damage: f32) {
+    pub fn blast(
+        &mut self,
+        f: &mut Field<'_>,
+        at: Vec3,
+        radius: f32,
+        damage: f32,
+        template: Option<u32>,
+    ) {
+        let of = template.map(Blasted::Id);
         self.blasts += 1;
         self.last_blast = Some(at);
         self.went_off.push(at);
         self.sounds.push(if radius >= BOMB.0 {
-            Sound::Bomb(at)
+            Sound::Bomb { at, of }
         } else {
-            Sound::Explosion(at)
+            Sound::Explosion { at, of }
         });
         // The strikes' ordnance keys aren't read yet: an `Explosion`.
         let hers = self.hero_damage.explosion;
@@ -5358,9 +5396,20 @@ impl Combat {
         alarm(f.people, at);
     }
 
-    /// Harm a blast's frag does around `at`, without fire or sound of its
-    /// own.
-    pub fn harm_at(&mut self, f: &mut Field<'_>, at: Vec3, radius: f32, damage: f32) {
+    /// Harm a blast's frag (template `template`) does around `at`,
+    /// without fire of its own, heard only as its template says.
+    pub fn harm_at(
+        &mut self,
+        f: &mut Field<'_>,
+        at: Vec3,
+        radius: f32,
+        damage: f32,
+        template: u32,
+    ) {
+        self.sounds.push(Sound::Frag {
+            at,
+            of: Blasted::Id(template),
+        });
         // Frag, as the satellite bomb's: a `BulletLarge`.
         let hers = self.hero_damage.bullet_large;
         self.harm(f, at, (radius, damage), false, (hers, "BulletLarge"));
@@ -5369,7 +5418,10 @@ impl Combat {
     /// The bomb's final strike at `at`, after it lands.
     pub fn final_strike(&mut self, f: &mut Field<'_>, at: Vec3) {
         self.went_off.push(at);
-        self.sounds.push(Sound::Explosion(at));
+        self.sounds.push(Sound::Explosion {
+            at,
+            of: Some(Blasted::Named(fx::FINAL)),
+        });
         let hers = self.hero_damage.explosion_large;
         self.harm(f, at, BOMB_FINAL, false, (hers, "ExplosionLarge"));
         self.show_fx(fx::FINAL, at);
