@@ -409,8 +409,9 @@ const CANNON_FLASH_TIME: f32 = 0.3;
 /// machine gun on anything else with a turret (seconds between rounds,
 /// damage, range). Invented, like the rest of the rules.
 const CANNON_RELOAD: f32 = 2.5;
-/// A turret's gun fires at the crosshair when it points within this of
-/// it, radians; else along its barrel.
+/// Her turret's gun fires at the crosshair when it points within this of
+/// it, radians; else along its barrel (invented; the 360 code's AI
+/// riders wait for no such thing, [`Combat::gunners_fire`]).
 const LAID: f32 = 0.06;
 const SHELL_SPEED: f32 = 150.0;
 const MG_GAP: f32 = 0.09;
@@ -3871,7 +3872,7 @@ impl Combat {
     /// (`ControllerTurret`, [`m2_engine::vehicle::Aimer`]) toward the
     /// nearest of those fighting her within its first weapon's
     /// `WeaponHint` range, at the turret's speeds and within its arc, and
-    /// fires once the gun is laid on him, in the bursts its `WeaponHint`
+    /// fires once he is inside its arc and tilt, in the bursts its `WeaponHint`
     /// gives soldiers ([`gunner_burst`]), each round strayed in the
     /// weapon's `ScatterMin` cone.
     ///
@@ -3879,10 +3880,14 @@ impl Combat {
     /// (`TurretAttack`, 0x822B7C10, registered by name at 0x822B5638) is
     /// the soldiers' own attack (0x822C95D8, then 0x822C2678): it gives
     /// the rider a target, and the seat's turret is what turns to it, as
-    /// for her. Inferred: that the turret then turns at its record's
-    /// speeds within its arc, and that the attack fires once laid
-    /// ([`LAID`], the alpha's own). Without a weapon hint, [`GUNNER_RANGE`]
-    /// (invented).
+    /// for her; it may fire once he is inside the turret's arc and tilt,
+    /// not waiting for the turret to get there
+    /// ([`TurretRecord::reaches`](m2_engine::seats::TurretRecord::reaches),
+    /// 0x822EF8C8); a seat with no turret fires only inside its weapon's
+    /// `MaxAimAngleAi` cone round the vehicle's nose (0x822CAB34; turning
+    /// to face him otherwise is the driver's, here hers). Inferred: that
+    /// the turret then turns at its record's speeds within its arc. Without a weapon hint,
+    /// [`GUNNER_RANGE`] (invented).
     fn gunners_fire(&mut self, f: &mut Field<'_>, dt: f32) {
         let Some(i) = f.player.driving.filter(|&i| i < f.vehicles.len()) else {
             self.gunner_wait.clear();
@@ -3941,9 +3946,16 @@ impl Combat {
                     let want = v.spec.aim_toward(a, body, v.turret, at);
                     let now = v.spec.aimers[a].step(v.aims[a], want, dt);
                     v.aims[a] = now;
-                    (now.0 - want.0).abs() <= LAID && (now.1 - want.1).abs() <= LAID
+                    let margin = m2_engine::weapons::ai_turret_margin(m.weapon.aim_ai);
+                    v.spec.aimers[a].record.reaches(want, margin)
                 }
-                None => true,
+                // A fixed gun: inside its weapon's cone round the nose
+                // ([`m2_engine::weapons::ai_aim_cosine`]).
+                None => {
+                    let nose = body.transform_vector3(Vec3::Z).normalize_or(Vec3::Z);
+                    (at - centre).normalize_or(nose).dot(nose)
+                        > m2_engine::weapons::ai_aim_cosine(m.weapon.aim_ai)
+                }
             };
             if !laid || self.gunner_wait[k] > 0.0 {
                 continue;
@@ -7174,23 +7186,24 @@ mod tests {
             pitch_pivot: None,
         };
         let dt = 1.0 / 60.0;
-        let laid = |aim: (f32, f32), want: (f32, f32)| {
-            (aim.0 - want.0).abs() <= LAID && (aim.1 - want.1).abs() <= LAID
-        };
-        // A foe 60 degrees off: laid after 0.6 s, not before.
+        // A foe 60 degrees off: inside its arc, so its gunner may fire at
+        // once (0x822EF8C8), while the pintle takes 0.6 s to get there.
         let want = (60f32.to_radians(), 0.0);
+        assert!(aimer.record.reaches(want, 0.0));
         let mut aim = (0.0, 0.0);
         let mut t = 0.0;
-        while !laid(aim, want) {
+        while (aim.0 - want.0).abs() > 1e-4 {
             aim = aimer.step(aim, want, dt);
             t += dt;
         }
         assert!((0.55..0.65).contains(&t), "{t}");
-        // One behind: the gun stops at its arc and never fires.
+        // One behind, or too high: the gun stops at its arc and its gunner
+        // never fires.
         let want = (170f32.to_radians(), 0.0);
+        assert!(!aimer.record.reaches(want, 0.0));
+        assert!(!aimer.record.reaches((0.0, 0.7), 0.0));
         for _ in 0..300 {
             aim = aimer.step(aim, want, dt);
-            assert!(!laid(aim, want));
         }
         assert!((aim.0 - 70f32.to_radians()).abs() < 1e-5);
     }

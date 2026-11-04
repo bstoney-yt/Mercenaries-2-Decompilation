@@ -2926,6 +2926,7 @@ mod tests {
             class: None,
             semi,
             rate_of_fire: 150.0,
+            aim_ai: 15f32.to_radians(),
             clip: 8,
             reserve_clips: 4,
             pellets: 1,
