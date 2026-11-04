@@ -1454,6 +1454,8 @@ pub fn human_motion(db: &Layer<'_>) -> HashMap<u32, crate::on_foot::HumanMotion>
         d.paces[2],
         d.paces[3],
         d.crouch_walk,
+        d.capsule_radius,
+        d.capsule_height,
     ];
     physics
         .records

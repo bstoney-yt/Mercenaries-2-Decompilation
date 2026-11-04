@@ -15,6 +15,7 @@
 
 pub mod ai;
 pub mod ai_cover;
+pub mod ai_plan;
 pub mod ambience;
 pub mod anim;
 pub mod assets;
