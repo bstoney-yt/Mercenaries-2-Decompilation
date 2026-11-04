@@ -1714,23 +1714,38 @@ struct BikeFooting {
 /// them (0x82273F90, from the turret update 0x82275608): a hinge between
 /// the turret part's body and its parent's about the turret's up, its
 /// turn limited to its record's arc unless that goes all the way round,
-/// with a motor driving it toward the angle asked at 20 times the angle
-/// still to go a second, as hard as its `maxForce`, the turret's mass x
-/// (20 + 6 x its `maxYawAccel`, radians; inferred: the 360 reads the
-/// turret def's +0x1C there, taken for that field), N m. The angle asked
-/// moves at most its record's turn rate a second (0x82273C88: here
-/// [`Physics::turn_turret`]'s caller's). Havok's motor field names are
-/// inferred from its usual layout.
+/// with no motor (the yaw hinge is built unmotorised, 0x82275898). An
+/// action on the turret's body (0x82273C88, stepped by 0x821A65D0) turns
+/// it instead, once first asked: from its spin about its own up `w`, its
+/// heading's error `e` from the hull's heading + the angle asked, the step
+/// `dt`, its spin becomes `w + dt (1000 e - c w)` held to its
+/// `MaxYawSpeed` either way, changed by at most its `MaxYawAccel` x `dt`,
+/// where `c` is 200, or (the turn asked faster than it spins) the
+/// global at 0x8380EC18, which no code writes (zero; [`TURRET_LEAD_DAMP`]).
 struct TurretHinge {
     body: r::RigidBodyHandle,
-    joint: r::ImpulseJointHandle,
-    force: f32,
-    /// The angle asked, radians.
+    /// Its fastest turn, radians a second (`MaxYawSpeed`), and how fast
+    /// its turn may change, radians a second squared (`MaxYawAccel`).
+    speed: f32,
+    accel: f32,
+    /// The angle asked, radians (from the hull's ahead).
     target: f32,
+    /// The angle asked when it was last driven; `None` before it is
+    /// first asked to turn (the 360's action does nothing until then).
+    last: Option<f32>,
     /// Its gun on a body of its own, hinged to the turret's
     /// ([`VehicleSpec::gun_body`]).
     gun: Option<GunHinge>,
 }
+
+/// The 360 turret action's pull on its heading's error and its damping
+/// of its spin (0x821A65D0: the constants at 0x82DE8C2C and 0x820B7FB4).
+const TURRET_PULL: f32 = 1000.0;
+const TURRET_DAMP: f32 = 200.0;
+/// Its damping while the turn asked is faster than it spins: the global
+/// it reads there (0x8380EC18) is in zeroed memory and no code found
+/// writes it (searched as a store, an immediate and a pointer), so 0.
+const TURRET_LEAD_DAMP: f32 = 0.0;
 
 /// A turret's gun on a body of its own, on a hinge across the turret
 /// at its trunnions, as the 360 code builds it (0x82275974 calls
@@ -3022,7 +3037,7 @@ impl Physics {
                 }
             }
         }
-        self.drive_turrets();
+        self.drive_turrets(dt);
         self.float_boats(dt);
         self.fly_helicopters(dt);
         self.cap_debris_speeds();
@@ -3753,19 +3768,16 @@ impl Physics {
                     insert_collider(&mut self.world, c, Some(turret_body));
                 }
                 let t = spec.tuning.turret;
-                let accel = t.map_or(0.0, |t| t.yaw_accel);
                 let mut joint = r::RevoluteJointBuilder::new(r::Vector::Y)
                     .local_anchor1(vector(mount))
                     .local_anchor2(vector(mount))
-                    .contacts_enabled(false)
-                    .motor_model(r::MotorModel::ForceBased)
-                    .motor_max_force(m.mass * (20.0 + 6.0 * accel));
+                    .contacts_enabled(false);
                 if let Some((lo, hi)) = t.and_then(|t| t.yaw)
                     && hi - lo < std::f32::consts::TAU - 0.01
                 {
                     joint = joint.limits([lo, hi]);
                 }
-                let joint = self.world.insert_impulse_joint(body, turret_body, joint);
+                self.world.insert_impulse_joint(body, turret_body, joint);
                 let gun = spec
                     .gun_body
                     .as_ref()
@@ -3784,9 +3796,10 @@ impl Physics {
                     });
                 Some(TurretHinge {
                     body: turret_body,
-                    joint,
-                    force: m.mass * (20.0 + 6.0 * accel),
+                    speed: t.map_or(0.0, |t| t.yaw_speed),
+                    accel: t.map_or(0.0, |t| t.yaw_accel),
                     target: 0.0,
+                    last: None,
                     gun,
                 })
             }
@@ -4359,6 +4372,7 @@ impl Physics {
             return;
         };
         if let Some(h) = &mut v.hinge {
+            h.last = h.last.or(Some(yaw));
             h.target = yaw;
             return;
         }
@@ -4372,29 +4386,56 @@ impl Physics {
         }
     }
 
-    /// Drives each turret on its own body toward the angle asked
-    /// ([`TurretHinge`]): its motor's speed 20 times the angle still to go.
-    fn drive_turrets(&mut self) {
+    /// Turns each turret on its own body toward the angle asked as the
+    /// 360's turret action does ([`TurretHinge`]), and drives its gun's
+    /// motor toward the pitch asked ([`GunHinge`]); `dt` the step.
+    fn drive_turrets(&mut self, dt: f32) {
+        let wrap = |a: f32| {
+            let a = a.rem_euclid(std::f32::consts::TAU);
+            if a > std::f32::consts::PI {
+                a - std::f32::consts::TAU
+            } else {
+                a
+            }
+        };
+        let heading = |q: Quat| {
+            let f = q * Vec3::Z;
+            f.x.atan2(f.z)
+        };
         for i in 0..self.vehicles.len() {
-            let Some((joint, force, target)) = self.vehicles[i]
-                .as_ref()
-                .and_then(|v| v.hinge.as_ref())
-                .map(|h| (h.joint, h.force, h.target))
-            else {
+            let Some(v) = self.vehicles[i].as_mut() else {
                 continue;
             };
-            let Some(now) = self.turret_yaw(VehicleId(i)) else {
-                continue;
-            };
-            let mut off = (target - now).rem_euclid(std::f32::consts::TAU);
-            if off > std::f32::consts::PI {
-                off -= std::f32::consts::TAU;
+            let chassis = v.controller.chassis;
+            if let Some(h) = v.hinge.as_mut()
+                && let Some(last) = h.last
+                && dt > 0.0
+            {
+                // The turn asked this step (0x8227582C: its change / dt).
+                let asked = wrap(h.target - last) / dt;
+                h.last = Some(h.target);
+                let hull = self
+                    .world
+                    .bodies
+                    .get(chassis)
+                    .map(|b| Quat::from_array(b.position().rotation.to_array()));
+                if let (Some(hull), Some(b)) = (hull, self.world.bodies.get_mut(h.body)) {
+                    let turn = Quat::from_array(b.position().rotation.to_array());
+                    let up = turn * Vec3::Y;
+                    let spin = vec3(b.angvel());
+                    let w = spin.dot(up);
+                    let e = wrap(heading(hull) + h.target - heading(turn));
+                    let damp = if asked * asked > w * w {
+                        TURRET_LEAD_DAMP
+                    } else {
+                        TURRET_DAMP
+                    };
+                    let want = (w + dt * (TURRET_PULL * e - damp * w)).clamp(-h.speed, h.speed);
+                    let change = (want - w).clamp(-h.accel * dt, h.accel * dt);
+                    b.set_angvel(vector(spin + up * change), change.abs() > 1e-6);
+                }
             }
-            if let Some(j) = self.world.impulse_joints.get_mut(joint, off.abs() > 1e-4) {
-                j.data
-                    .set_motor_velocity(r::JointAxis::AngX, 20.0 * off, force);
-            }
-            // Its gun likewise, to the pitch asked.
+            // Its gun to the pitch asked.
             let Some((joint, force, target)) = self.vehicles[i]
                 .as_ref()
                 .and_then(|v| v.hinge.as_ref())
@@ -5716,8 +5757,13 @@ mod tests {
         assert!((p.gun_pitch(id).unwrap() - 0.3).abs() < 0.03);
     }
 
+    // A turret on its own body is turned by the 360's turret action
+    // (0x821A65D0): left alone until first asked; asked a whole radian at
+    // once, it speeds up no faster than its `MaxYawAccel`, turns no faster
+    // than its `MaxYawSpeed`, and settles on the angle asked, the hull
+    // left as it was.
     #[test]
-    fn a_turret_on_its_own_body_follows_its_hinge_motor() {
+    fn a_turret_on_its_own_body_turns_as_the_360_action_turns_it() {
         let mut p = Physics::new();
         let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
         p.add_static(
@@ -5743,6 +5789,18 @@ mod tests {
             }),
             pivot: Some(Vec3::new(0.0, 2.0, 0.0)),
             mass: 30000.0,
+            tuning: crate::tuning::VehicleTuning {
+                turret: Some(crate::tuning::TurretTuning {
+                    main: true,
+                    yaw_speed: 0.5,
+                    yaw_accel: 2.0,
+                    pitch: (-0.1, 0.3),
+                    pitch_speed: 1.0,
+                    pitch_accel: 20.0,
+                    yaw: None,
+                }),
+                ..car().tuning
+            },
             ..car()
         };
         let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.5, 0.0), 0.0);
@@ -5756,22 +5814,24 @@ mod tests {
             f.x.atan2(f.z)
         };
         let before = heading(&p);
-        let mut asked = 0.0;
-        for _ in 0..90 {
-            asked += DT;
-            p.turn_turret(id, asked);
+        let (mut last, mut fastest, mut early) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..360 {
+            p.turn_turret(id, 1.0);
             p.drive(id, VehicleControls::default());
             p.step(DT);
+            let yaw = p.turret_yaw(id).unwrap();
+            let rate = (yaw - last) / DT;
+            fastest = fastest.max(rate);
+            if i < 6 {
+                early = early.max(rate);
+            }
+            last = yaw;
         }
-        let yaw = p.turret_yaw(id).unwrap();
-        assert!((asked - yaw - 1.0 / 20.0).abs() < 0.03, "{yaw} of {asked}");
+        assert!(early < 2.0 * 0.1 + 0.05, "sped up to {early} in 0.1 s");
+        assert!(fastest < 0.5 + 0.03, "turned at {fastest}");
+        assert!(fastest > 0.45, "turned at {fastest}");
+        assert!((last - 1.0).abs() < 0.02, "at {last}");
         assert!((heading(&p) - before).abs() < 0.05, "hull turned");
-        // Held there, it stays.
-        for _ in 0..60 {
-            p.turn_turret(id, asked);
-            p.step(DT);
-        }
-        assert!((p.turret_yaw(id).unwrap() - asked).abs() < 0.01);
     }
 
     // A turret's colliders turn with it ([`Physics::turn_turret`]): a

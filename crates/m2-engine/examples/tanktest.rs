@@ -166,6 +166,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             eprintln!("{name}: no gun body");
         }
+        // Its turret on its own body asked a quarter turn left at once: its
+        // fastest turn, deg/s, and when it is first within 2 degrees, s.
+        if spec.turret_mass.is_some() {
+            let mut p = Physics::new();
+            let ground = CollisionShape::cuboid(Vec3::new(500.0, 1.0, 500.0));
+            p.add_static(
+                StaticKey::Cell(1),
+                &ground,
+                Vec3::new(0.0, -1.0, 0.0),
+                Quat::IDENTITY,
+            );
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, 1.0, 0.0), 0.0);
+            for _ in 0..(1.0 / DT) as usize {
+                p.drive(id, VehicleControls::default());
+                p.step(DT);
+            }
+            let want = std::f32::consts::FRAC_PI_2;
+            let (mut last, mut fastest, mut within) =
+                (p.turret_yaw(id).unwrap_or(0.0), 0.0f32, f32::NAN);
+            for i in 0..(10.0 / DT) as usize {
+                p.turn_turret(id, want);
+                p.drive(id, VehicleControls::default());
+                p.step(DT);
+                let yaw = p.turret_yaw(id).unwrap_or(0.0);
+                fastest = fastest.max((yaw - last) / DT);
+                last = yaw;
+                if within.is_nan() && (yaw - want).abs() < 2f32.to_radians() {
+                    within = (i + 1) as f32 * DT;
+                }
+            }
+            eprintln!(
+                "{name}: turret quarter turn: fastest {:.1} deg/s (MaxYawSpeed {:.1}), within 2 deg at {within:.2} s, ends {:.1} deg",
+                fastest.to_degrees(),
+                spec.tuning
+                    .turret
+                    .map_or(f32::NAN, |t| t.yaw_speed.to_degrees()),
+                last.to_degrees()
+            );
+        }
         if std::env::var("TANK_INFO").is_ok() {
             continue;
         }
