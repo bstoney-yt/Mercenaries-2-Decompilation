@@ -481,7 +481,12 @@ fn hero_moves(
         eprintln!(
             "hero moves: {hero}: {name}: aim {}, sweeps {}, ready {}, run {}, gaits {}; stow {}; take up {}",
             h(held.clips.aim),
-            held.sweeps.map_or("none".to_owned(), |s| s.iter().flatten().map(|&i| h(Some(i))).collect::<Vec<_>>().join(" ")),
+            held.sweeps.map_or("none".to_owned(), |s| s
+                .iter()
+                .flatten()
+                .map(|&i| h(Some(i)))
+                .collect::<Vec<_>>()
+                .join(" ")),
             h(held.clips.ready),
             h(held.clips.run_low),
             gaits.join(", "),
