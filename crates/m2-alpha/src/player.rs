@@ -48,19 +48,24 @@ const RUNNING_LAND: f32 = 1.5;
 /// How fast she turns to face where she swims, radians per second
 /// (invented: on foot she turns as the 360 does, [`on_foot::Turn`]).
 const TURN_RATE: f32 = 10.0;
-/// Swimming. She swims where the sea over the ground under her is deeper
-/// than this, metres (chest deep: the depth she gets out of a boat into,
-/// `game::WADE`), and stands again where it is shallower than
-/// [`SWIM_STOP`]; between the two she keeps doing what she did, so the
-/// shore's slope doesn't flick her in and out. Invented: the game's own
-/// depth isn't read.
 /// When a state layer goes: how far under her feet her floor is looked
 /// for, and how near the floor after must be to the floor before for it
 /// to be the same one, metres. Invented.
 const FLOOR_LOOK: f32 = 60.0;
 const FLOOR_SAME: f32 = 0.25;
-pub const SWIM_START: f32 = 1.4;
-pub const SWIM_STOP: f32 = 1.15;
+/// Swimming. She swims where the water at her feet is at least half her
+/// capsule's height deep, metres: from the 360 code, the ground and
+/// in-air states (0x82171330, 0x82171270) switch to swimming when
+/// `feet + 0.5 x height <= water` (the half height kept at the
+/// character input's +8, 0x821778F4), 0.9 m for the 1.8 m capsule every
+/// hero and soldier has. She stands again where it is shallower than
+/// [`SWIM_STOP`] (invented: the 360 leaves the water once her swimming
+/// shape is pushed up more than its radius out of it, 0x821715F8, and that
+/// shape's place on her is not read, so the alpha floats her at
+/// [`SWIM_FLOAT`] and stands her up a little shallower than she starts,
+/// so the shore's slope doesn't flick her in and out).
+pub const SWIM_START: f32 = 0.9;
+pub const SWIM_STOP: f32 = 0.85;
 /// How far her model's origin hangs under the surface while she swims,
 /// metres: the stroke's body lies flat (its highest node only 0.11 m
 /// over its hips, from samples) about a third of a metre over the origin,
@@ -353,6 +358,9 @@ pub struct Player {
     /// Her swimming speeds, the same way: her template's `SwimWalkSpeed`,
     /// `SwimJogSpeed` and `SwimRunSpeed` ([`m2_engine::tuning::SWIM_SPEEDS`]).
     pub swim_speeds: [f32; 3],
+    /// Her full swimming speed, m/s: the larger of her template's
+    /// `SwimRunSpeed` and `SwimSprintSpeed`.
+    pub swim_full: f32,
     /// Her template's jump, gravity, turn and paces
     /// ([`Player::set_motion`]).
     pub motion: HumanMotion,
@@ -501,7 +509,13 @@ impl Player {
             return false;
         };
         swim.since += dt;
-        physics.move_character(&mut self.character, direction * speed, None, dt);
+        // From the 360 code (0x821715F8): each step her velocity goes half
+        // way to the stick's way times her full swimming speed, the larger
+        // of her `SwimRunSpeed` and `SwimSprintSpeed` (0x82177830).
+        let _ = speed;
+        let have = Vec3::new(self.character.velocity.x, 0.0, self.character.velocity.z);
+        let wanted = have * 0.5 + direction * self.swim_full * 0.5;
+        physics.move_character(&mut self.character, wanted, None, dt);
         self.character.position.y = water - SWIM_FLOAT;
         self.character.velocity.y = 0.0;
         if direction.length_squared() > 0.01 {
@@ -566,6 +580,7 @@ impl Player {
             clips: FightClips::default(),
             speeds: SPEEDS,
             swim_speeds: [SWIM_SPEEDS[0], SWIM_SPEEDS[1], SWIM_SPEEDS[2]],
+            swim_full: SWIM_SPEEDS[2].max(SWIM_SPEEDS[3]),
             motion: JENNIFER,
             turn: Turn::default(),
             run_stop: RunStop::default(),
@@ -965,7 +980,14 @@ impl Player {
         } else {
             1
         };
-        if self.update_swim(physics, direction, self.swim_speeds[pace], dt) {
+        // Swimming, the stick's push alone sets the pace (the walk key
+        // standing for its lightest, 0.25).
+        let swim_push = if intent.walk {
+            direction * 0.25
+        } else {
+            direction
+        };
+        if self.update_swim(physics, swim_push, self.swim_speeds[pace], dt) {
             self.camera(physics);
             return;
         }
@@ -1896,11 +1918,11 @@ mod tests {
         assert!(p.swimming());
         let at = p.character.position;
         assert!((at.y - (12.0 - SWIM_FLOAT)).abs() < 1e-3, "{at}");
-        // Sprinting, at her `SwimRunSpeed` (Jennifer's 3 m/s), not her
-        // sprint on foot.
-        assert!((at.x - 3.0).abs() < 0.4, "{at}");
-        // The sea goes down to 1 m over the ground: she stands.
-        physics.set_water(11.0);
+        // At her full swimming speed, the larger of `SwimRunSpeed` and
+        // `SwimSprintSpeed` (5 m/s by default), reached half way a step.
+        assert!((at.x - 5.0).abs() < 0.4, "{at}");
+        // The sea goes down to 0.8 m over the ground: she stands.
+        physics.set_water(10.8);
         p.update(&physics, forward, dt);
         assert!(!p.swimming());
     }
