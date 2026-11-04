@@ -36,6 +36,8 @@ pub const JENNIFER: HumanMotion = HumanMotion {
     max_air_speed: 12.0,
     paces: [2.0, 5.0, 7.0, 12.0],
     crouch_walk: 1.5,
+    capsule_radius: 0.4,
+    capsule_height: 1.8,
 };
 /// Seconds after take-off before touching the ground counts as landing.
 const MIN_AIR: f32 = 0.15;
@@ -367,6 +369,8 @@ pub struct Player {
     /// ([`on_foot::Start`]).
     pace: Pace,
     start: Start,
+    /// Seconds since she last stood on something.
+    unsupported: f32,
     /// The way she last moved (a unit vector), the way a slide to a stop
     /// carries her.
     way: Vec2,
@@ -572,6 +576,7 @@ impl Player {
             ground: Vec2::ZERO,
             pace: Pace::Still,
             start: Start::default(),
+            unsupported: 0.0,
             way: Vec2::Y,
             stopping: None,
             crouch_hold: None,
@@ -604,6 +609,9 @@ impl Player {
     pub fn set_motion(&mut self, motion: HumanMotion) {
         self.motion = motion;
         self.character.gravity = motion.gravity;
+        // Her template's standing capsule, feet to the full height.
+        self.character.radius = motion.capsule_radius;
+        self.character.height = motion.capsule_height.max(2.0 * motion.capsule_radius);
     }
 
     /// The speeds of a hero whose template gives `theirs` (walk, run,
@@ -1022,6 +1030,24 @@ impl Player {
             self.way * speed
         };
         self.ground = ground;
+        // Havok's ground state takes her actual velocity 95% of the way
+        // there a step, at most 200 m/s² (0x8268DD08); just off a ledge
+        // she steers so for 0.25 s more, capped at 100 m/s a step
+        // ([`on_foot::ground_step`]). Further in the air, as before
+        // (Havok's in-air state is untraced).
+        self.unsupported = if self.character.grounded {
+            0.0
+        } else {
+            self.unsupported + dt
+        };
+        let have = Vec2::new(self.character.velocity.x, self.character.velocity.z);
+        let ground = if self.character.grounded {
+            on_foot::ground_step(have, ground, on_foot::GROUND_MAX_ACCEL * dt)
+        } else if self.unsupported < on_foot::LEDGE_GRACE {
+            on_foot::ground_step(have, ground, on_foot::LEDGE_MAX_CHANGE)
+        } else {
+            ground
+        };
         let wanted = Vec3::new(ground.x, 0.0, ground.y);
         let jump = self
             .takes_off(intent.jump, bashing)

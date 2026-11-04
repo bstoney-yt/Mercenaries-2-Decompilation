@@ -3120,6 +3120,11 @@ impl People {
                 .get(npc.kind)
                 .and_then(|k| k.motion)
                 .unwrap_or_default();
+            npc.character.radius = npc.motion.capsule_radius;
+            npc.character.height = npc
+                .motion
+                .capsule_height
+                .max(2.0 * npc.motion.capsule_radius);
             npc.rammed = (npc.rammed - dt).max(0.0);
             let facing = npc.facing;
             npc.update(physics, &mut self.rng, threat, dt);
