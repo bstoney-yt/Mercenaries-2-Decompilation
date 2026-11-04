@@ -1704,6 +1704,11 @@ pub struct Combat {
     gunner_wait: Vec<f32>,
     /// Rounds left in each such gunner's burst.
     gunner_burst: Vec<u32>,
+    /// What AI pilots ask their guns to fire at this frame: the vehicle
+    /// (in the scene's) and where ([`crate::gunships`]), and each such
+    /// vehicle's wait till its next round.
+    pub pilot_shots: Vec<(usize, Vec3)>,
+    pilot_wait: std::collections::HashMap<usize, (f32, u32)>,
     /// Rounds those gunners have fired, all told (logged by checks).
     pub gunner_rounds: u32,
     seed: u64,
@@ -1948,6 +1953,8 @@ impl Default for Combat {
             ripple: 0,
             gunner_wait: Vec::new(),
             gunner_burst: Vec::new(),
+            pilot_shots: Vec::new(),
+            pilot_wait: std::collections::HashMap::new(),
             gunner_rounds: 0,
             seed: 0x2545_f491_4f6c_dd1d,
             fired: Fired::default(),
@@ -2906,6 +2913,7 @@ impl Combat {
         }
         if self.down <= 0.0 {
             self.gunners_fire(f, dt);
+            self.pilots_fire(f, dt);
         }
         // Fire fires the gun chosen with the switch: the main gun, or the
         // machine gun (as Aim does too).
@@ -4027,6 +4035,54 @@ impl Combat {
                 self.gunner_wait[k] = wait;
                 self.gunner_burst[k] = burst;
                 self.gunner_rounds += 1;
+            }
+        }
+    }
+
+    /// AI pilots' guns ([`pilot_shots`](Self::pilot_shots)): each fires
+    /// its first mount's weapon at the point its pilot asks, at the
+    /// weapon's own rate in the bursts its `WeaponHint` gives soldiers
+    /// ([`gunner_burst`]), each round strayed in its `ScatterMin` cone, as
+    /// her gunners' rounds are ([`gunners_fire`](Self::gunners_fire)).
+    /// From the 360 code: a pilot's `HeliAttack` fires through its seat's
+    /// weapon at the target's lead (0x822B0578, 0x822AE598) by the AI's
+    /// fire control (0x822F0098); that it bursts as a soldier's does is
+    /// inferred.
+    fn pilots_fire(&mut self, f: &mut Field<'_>, dt: f32) {
+        for (w, _) in self.pilot_wait.values_mut() {
+            *w -= dt;
+        }
+        let shots = std::mem::take(&mut self.pilot_shots);
+        for (i, at) in shots {
+            if self.pilot_wait.get(&i).is_some_and(|&(w, _)| w > 0.0) {
+                continue;
+            }
+            let Some(v) = f.vehicles.get(i) else {
+                continue;
+            };
+            let Some(m) = v.spec.armed.iter().find(|m| m.priority == 0) else {
+                continue;
+            };
+            let cone = m.weapon.feel.cone(0.0);
+            let hint = m.weapon.hint;
+            let Some(from) =
+                v.id.and_then(|id| f.physics.vehicle_transform(id))
+                    .map(|b| b.transform_point3(Vec3::ZERO))
+            else {
+                continue;
+            };
+            let to = at - from;
+            let dir = m2_engine::weapons::stray_in_cone(
+                to.normalize_or(Vec3::Z),
+                cone,
+                self.random(),
+                self.random(),
+            );
+            let close = to.length() < m2_engine::weapons::FireHint::CLOSE;
+            let left = self.pilot_wait.get(&i).map_or(0, |&(_, l)| l);
+            if let Some(gap) = self.fire_mount(f, i, 0, 0, Some(from + dir * to.length())) {
+                self.pilot_wait
+                    .insert(i, gunner_burst(hint, gap, close, left));
             }
         }
     }

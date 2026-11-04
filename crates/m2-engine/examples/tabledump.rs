@@ -39,8 +39,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|n| (m2_assets::name_hash(n), (*n).to_owned()))
         .collect();
     for w in [
-        "Heli", "Car", "Tank", "Boat", "Man", "Driving", "Stopped", "OffRoad", "Helicopter",
-        "Always", "Hostile", "Neutral", "Friendly", "Default", "Vehicle", "Infantry", "Air",
+        "Heli",
+        "Car",
+        "Tank",
+        "Boat",
+        "Man",
+        "Driving",
+        "Stopped",
+        "OffRoad",
+        "Helicopter",
+        "Always",
+        "Hostile",
+        "Neutral",
+        "Friendly",
+        "Default",
+        "Vehicle",
+        "Infantry",
+        "Air",
     ] {
         by_hash.insert(m2_assets::name_hash(w), w.to_owned());
     }

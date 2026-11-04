@@ -137,6 +137,8 @@ pub struct Game {
     fetched: HashSet<u32>,
     /// The island's traffic spawners and what they have out.
     pub traffic: crate::traffic::Traffic,
+    /// A pursuit's gunships ([`crate::gunships`]).
+    pub gunships: crate::gunships::Gunships,
     /// Vehicles the mission scripts send along a path (`crate::paths`).
     pub paths: crate::paths::PathMoves,
     /// Traffic on the road network (`crate::roads`).
@@ -435,6 +437,7 @@ impl Game {
             beds_told: HashSet::new(),
             fetched: HashSet::new(),
             traffic: crate::traffic::Traffic::default(),
+            gunships: crate::gunships::Gunships::default(),
             paths: crate::paths::PathMoves::default(),
             roads: crate::roads::RoadTraffic::default(),
             census: std::env::var("M2_LIFE_CENSUS")
@@ -619,6 +622,13 @@ impl Game {
             return;
         };
         for v in scene.vehicles.iter_mut().filter(|v| v.id.is_none()) {
+            // A gunship is put in the air where it comes in
+            // ([`crate::gunships::Gunships::fly`]), or is gone.
+            if v.spot
+                .is_some_and(|(e, _, _)| e >= crate::gunships::FIRST_ENTITY)
+            {
+                continue;
+            }
             if let Some((entity, at, yaw)) = v.spot
                 && place(&mut world.physics, v, at, yaw)
             {
@@ -1589,6 +1599,14 @@ impl Game {
             let hold = world.settings.detail_radius;
             for (i, v) in self.scene.vehicles.iter_mut().enumerate() {
                 let Some(id) = v.id else { continue };
+                // A gunship flies by its pilot ([`crate::gunships`]): not
+                // held, parked or still.
+                if v.spot.is_some_and(|(e, _, _)| self.gunships.owns(e)) {
+                    if !v.wrecked {
+                        v.rolled += ROTOR_SPIN * dt;
+                    }
+                    continue;
+                }
                 // Far from her, the island's ground streams out from under
                 // a vehicle: it is held where it stands until she comes
                 // back and the ground under it is in again.
@@ -1638,6 +1656,33 @@ impl Game {
             }
             self.traffic
                 .drive(&mut world.physics, &self.scene.vehicles, driven);
+            // A pursuit's gunships, at her.
+            if let Some(p) = self.scene.player.as_ref() {
+                let her = p.character.position;
+                let her_velocity = match p.driving.and_then(|i| self.scene.vehicles.get(i)?.id) {
+                    Some(id) => world.physics.vehicle_velocity(id),
+                    None => p.character.velocity,
+                };
+                let mut seed = self.gunships.random();
+                let dropped = self.gunships.fly(
+                    &mut world.physics,
+                    &mut self.scene.vehicles,
+                    her,
+                    her_velocity,
+                    crate::gunships::VANISH,
+                    || {
+                        seed = (seed * 7919.17).fract();
+                        seed
+                    },
+                    dt,
+                );
+                for i in dropped {
+                    if let Some(id) = self.scene.vehicles[i].id.take() {
+                        world.physics.remove_vehicle(id);
+                    }
+                }
+                self.combat.pilot_shots = self.gunships.shots.clone();
+            }
             self.paths
                 .drive(&mut world.physics, &self.scene.vehicles, driven);
             let walking = self
