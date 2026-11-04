@@ -233,12 +233,8 @@ pub struct BoatTuning {
     /// is: 40; 6 to 45).
     pub reverse_speed: f32,
     /// Its engine's pull ahead and backing up (`EngineTorque` 1,000 and
-    /// `EngineReverseTorque` 500; 30 to 2,500 and 10 to 3,000). Only
-    /// their ratio is read: backing up it pulls that share of what it
-    /// pulls ahead (inferred: the Air Boat's 0.5 and the Barco's 0.44 of
-    /// their `MaxSpeed` are their `MaxSpeedReverse`). The units are
-    /// unknown: the torque over the mass varies 12-fold between boats
-    /// whose drag and top speed ask the same pull.
+    /// `EngineReverseTorque` 500; 30 to 2,500 and 10 to 3,000): x 200, N
+    /// (`physics::float_hull`, from 0x82198F08 and 0x82199B08).
     pub torque: (f32, f32),
     /// How quickly the water slows it along, across and up and down, a
     /// second (`WaterDragFwd` 0.2, `WaterDragSide` 2, `WaterDragUp` 2;
@@ -247,14 +243,12 @@ pub struct BoatTuning {
     /// did; the Air Boat's sideways 0.5 lets it skid, the landing craft's
     /// 10 holds it to its course).
     pub drag: [f32; 3],
-    /// How much more its brake slows it, a second (`BrakeDrag` 3; 0 to 8;
-    /// added to its drag along, inferred).
+    /// How hard its brake slows it, m/s² (`BrakeDrag` 3; 0 to 8): from
+    /// the 360 code (0x82199B08), a steady slowing, not a drag.
     pub brake: f32,
-    /// Its pull at a standstill, a third, two thirds and all of its top
-    /// speed (`EngineTorqueRatio0`..`3`, as a tank's are named: 1, 0.7,
-    /// 0.6, 0.5; read as a curve over its speed, as a tank's are,
-    /// inferred). Only their shape is read: scaled so that at its top
-    /// speed it pulls what holds it there.
+    /// Its pull, of its torque, at a standstill, at
+    /// [`BoatFloat::curve_at`] and at its top speed
+    /// (`EngineTorqueRatio0`..`3`; 0x82198F08).
     pub curve: [f32; 4],
     /// Its hull's friction (`HullFriction`, 0.3 when the record gives
     /// none, as the 360 code's schema reader defaults it at 0x823EA968):
@@ -366,9 +360,14 @@ pub struct BoatFloat {
     pub low_speed_steering: f32,
     pub handbrake_boost: f32,
     pub air_steering: f32,
+    /// Where its engine's pull curve has its middle two points, of its
+    /// top speed (`EngineTorquePos1`, `EngineTorquePos2`).
+    pub curve_at: (f32, f32),
     /// How its spin about its roll, pitch and yaw axes dies down
     /// (`AngDampRoll`, `AngDampPitch`, `AngDampYaw`; 0x8219A5E0).
     pub ang_damp: [f32; 3],
+    /// How its handbrake eases off once let go (`HandBrakeInertia`).
+    pub handbrake_inertia: f32,
     /// How its engine's throttle eases to the throttle asked
     /// (`EngineInertia`, kept each 1/60 s; 0x82198F08).
     pub engine_inertia: f32,
@@ -406,6 +405,8 @@ impl BoatFloat {
         low_speed_steering: 0.0,
         handbrake_boost: 0.0,
         air_steering: 0.0,
+        curve_at: (0.25, 0.5),
+        handbrake_inertia: 0.0,
         ang_damp: [0.0, 0.0, 0.5],
         engine_inertia: 0.975,
     };
@@ -435,30 +436,6 @@ impl BoatFloat {
     pub fn rest_depth(&self, gravity: f32) -> f32 {
         let s = self.slow;
         s.start.min(s.end) + gravity / (4.0 * s.strength.max(1e-3))
-    }
-}
-
-impl BoatTuning {
-    /// Its pull flat out at `speed` m/s, m/s²: at `top` m/s, what holds
-    /// it there against its drag along (inferred: the data gives no pull
-    /// its torque fits, see [`torque`](Self::torque)), more or less
-    /// below it as its [`curve`](Self::curve) says; backing up, its
-    /// share of that.
-    pub fn push(&self, speed: f32, top: f32, backwards: bool) -> f32 {
-        let c = self.curve;
-        let shape = if c[3] > 0.0 && top > 0.0 {
-            let at = (speed.abs() / top).clamp(0.0, 1.0) * 3.0;
-            let i = (at as usize).min(2);
-            (c[i] + (c[i + 1] - c[i]) * (at - i as f32)) / c[3]
-        } else {
-            1.0
-        };
-        let ahead = self.drag[0] * top * shape;
-        if backwards {
-            ahead * (self.torque.1 / self.torque.0).clamp(0.0, 2.0)
-        } else {
-            ahead
-        }
     }
 }
 
@@ -1974,6 +1951,11 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                                 low_speed_steering: g("LowSpeedSteering", d.low_speed_steering),
                                 handbrake_boost: g("HandbrakeSteerBoost", d.handbrake_boost),
                                 air_steering: g("AirCtrlSteering", d.air_steering),
+                                handbrake_inertia: g("HandBrakeInertia", d.handbrake_inertia),
+                                curve_at: (
+                                    g("EngineTorquePos1", d.curve_at.0),
+                                    g("EngineTorquePos2", d.curve_at.1),
+                                ),
                                 ang_damp: [
                                     g("AngDampRoll", d.ang_damp[0]),
                                     g("AngDampPitch", d.ang_damp[1]),
