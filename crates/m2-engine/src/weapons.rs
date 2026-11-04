@@ -581,10 +581,13 @@ pub struct FireHint {
     /// used: which armour class a vehicle or a person is has not been
     /// read.
     pub against: [u32; 4],
+    /// `SingleShotWeapon` (@20): one round a burst (its burst length
+    /// taken as none, 0x822F0098).
+    pub single: bool,
 }
 // Also in `WeaponHint`, named by hashing (gap-list sweep) and not read:
-// `SingleShotWeapon` (@20: 1 on the 31 records whose `BurstOnLength` is
-// 0 but the rocket pod's, so already one round a burst). Unnamed: the
+// `SingleShotWeapon` (read: [`FireHint::single`]; @20: 1 on the 31
+// records whose `BurstOnLength` is 0 but the rocket pod's). Unnamed: the
 // small whole numbers at @0 (1 to 3), @4 (1 to 3) and @24 (1 on the
 // guided missiles only).
 
@@ -636,6 +639,7 @@ impl FireHint {
             on_close: f("BurstOnCloseLength")?,
             off_close: f("BurstOffCloseLength")?,
             against: AGAINST.map(|n| hint.word(r, name_hash(n)).unwrap_or(0)),
+            single: hint.word(r, name_hash("SingleShotWeapon")) == Some(1),
         })
     }
 
@@ -655,6 +659,38 @@ impl FireHint {
         let (on, _) = self.burst(close);
         (on / gap.max(1e-3) + 1e-3).floor() as u32 + 1
     }
+
+    /// A burst's length and the pause after it, seconds, as the AI's fire
+    /// control works them out for a target `dist` metres off (0x822F0098):
+    /// each the close value at `MinFireRange`, the far one at `FireRange`,
+    /// straight between, unless the close value is -1 (then the far one
+    /// throughout). A single-shot weapon's burst is none. With no hint,
+    /// 2 s and 2 s ([`FireHint::NO_HINT`]).
+    pub fn cycle(hint: Option<&Self>, dist: f32) -> (f32, f32) {
+        let Some(h) = hint else {
+            return Self::NO_HINT;
+        };
+        let t = (dist - h.min_range) / (h.range - h.min_range);
+        // Past 1 (or not a number) it is 1, below 0 it is 0.
+        let t = if t < 1.0 { t.max(0.0) } else { 1.0 };
+        let lerp = |near: f32, far: f32| {
+            if near == -1.0 {
+                far
+            } else {
+                (far - near) * t + near
+            }
+        };
+        let on = if h.single {
+            0.0
+        } else {
+            lerp(h.on_close, h.on)
+        };
+        (on, lerp(h.off_close, h.off))
+    }
+
+    /// The burst and pause of a weapon with no `WeaponHint` (0x822F0098's
+    /// 2.0 for both).
+    pub const NO_HINT: (f32, f32) = (2.0, 2.0);
 
     /// The share of the time a soldier who keeps firing spends in bursts.
     pub fn firing_share(&self, gap: f32, close: bool) -> f32 {
@@ -1359,6 +1395,37 @@ mod tests {
         assert_eq!(off.draw(aim, him), aim);
     }
 
+    // The fire control's burst and pause run from the close values at
+    // `MinFireRange` to the far ones at `FireRange`; a -1 close value
+    // keeps the far one; a single-shot weapon has no burst; no hint, 2 s
+    // and 2 s (0x822F0098).
+    #[test]
+    fn the_fire_cycle_runs_from_close_to_far() {
+        let h = FireHint {
+            min_range: 10.0,
+            range: 50.0,
+            angle: 0,
+            on: 1.0,
+            off: 4.0,
+            on_close: -1.0,
+            off_close: 2.0,
+            against: [0; 4],
+            single: false,
+        };
+        assert_eq!(FireHint::cycle(Some(&h), 0.0), (1.0, 2.0));
+        assert_eq!(FireHint::cycle(Some(&h), 30.0), (1.0, 3.0));
+        assert_eq!(FireHint::cycle(Some(&h), 90.0), (1.0, 4.0));
+        let h = FireHint {
+            on_close: 3.0,
+            single: true,
+            ..h
+        };
+        assert_eq!(FireHint::cycle(Some(&h), 30.0), (0.0, 3.0));
+        let h = FireHint { single: false, ..h };
+        assert_eq!(FireHint::cycle(Some(&h), 30.0), (2.0, 3.0));
+        assert_eq!(FireHint::cycle(None, 30.0), (2.0, 2.0));
+    }
+
     #[test]
     fn rounds_stray_evenly_over_the_round_cone() {
         // A 2-degree cone: no round more than 1 degree out, corners
@@ -1641,6 +1708,7 @@ mod tests {
             on_close: -1.0,
             off_close: 0.75,
             against: [3, 1, 0, 0],
+            single: false,
         };
         let gap = 60.0 / 562.0;
         // 0.3 s at 562 a minute: rounds at 0, 0.107 and 0.214 s.

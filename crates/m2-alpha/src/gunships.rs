@@ -190,14 +190,27 @@ struct Gunship {
     leaving: bool,
 }
 
+/// A pilot's ask of its gun this frame (`HeliAttack`'s fire, 0x822B0578).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shot {
+    /// The vehicle (in the scene's) and where it aims.
+    pub vehicle: usize,
+    pub at: Vec3,
+    /// How far its target is.
+    pub dist: f32,
+    /// On an attack run (its mind's +0x8C timer running): its pauses are
+    /// a fifth as long.
+    pub run: bool,
+}
+
 /// The gunships out, and where to put each as it loads.
 #[derive(Debug, Default)]
 pub struct Gunships {
     out: Vec<Gunship>,
     next: u32,
-    /// Shots their pilots ask of their guns this frame: the vehicle (in
-    /// the scene's) and where at ([`crate::combat::Combat::pilot_fire`]).
-    pub shots: Vec<(usize, Vec3)>,
+    /// Shots their pilots ask of their guns this frame
+    /// ([`crate::combat::Combat::pilot_shots`]).
+    pub shots: Vec<Shot>,
     /// Sent so far, for the log's tally.
     pub sent: usize,
     gone: HashSet<u32>,
@@ -353,7 +366,12 @@ impl Gunships {
                     };
                     let (stick, gun) = pilot.attack(&target, size, &mut sight, rand(), dt);
                     if let Gun::Fire(p) = gun {
-                        self.shots.push((i, p));
+                        self.shots.push(Shot {
+                            vehicle: i,
+                            at: p,
+                            dist: (her - pilot.at).length(),
+                            run: pilot.run_fire > 0.0,
+                        });
                     }
                     stick
                 }

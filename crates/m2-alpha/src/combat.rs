@@ -362,6 +362,21 @@ fn gunner_burst(
     (wait, left)
 }
 
+/// An AI pilot's gun's timers: its fire cycle and burst (its mind's
+/// +0x84 and +0x88, 0x822B0578), and the wait till the weapon can fire
+/// again.
+#[derive(Clone, Copy, Debug, Default)]
+struct PilotGun {
+    cycle: f32,
+    burst: f32,
+    wait: f32,
+}
+
+/// The cosine of 0x822EC720's view half-angle as 0x822F0098 asks it
+/// (1.5705 rad, read from its 8192-step sine table: 0): a gunship
+/// ahead of her camera's heading, seen from above, is in view.
+const PILOT_VIEW_COS: f32 = 0.0;
+
 /// The seats of vehicle `v` whose riders fire something, the driver's
 /// first.
 pub fn armed_seats(v: &ParkedVehicle) -> Vec<u32> {
@@ -1704,11 +1719,12 @@ pub struct Combat {
     gunner_wait: Vec<f32>,
     /// Rounds left in each such gunner's burst.
     gunner_burst: Vec<u32>,
-    /// What AI pilots ask their guns to fire at this frame: the vehicle
-    /// (in the scene's) and where ([`crate::gunships`]), and each such
-    /// vehicle's wait till its next round.
-    pub pilot_shots: Vec<(usize, Vec3)>,
-    pilot_wait: std::collections::HashMap<usize, (f32, u32)>,
+    /// What AI pilots ask their guns to fire at this frame
+    /// ([`crate::gunships`]), her camera's eye and heading then (for
+    /// [`Combat::pilots_fire`]'s view check), and each such gun's timers.
+    pub pilot_shots: Vec<crate::gunships::Shot>,
+    pub pilot_view: Option<(Vec3, Vec3)>,
+    pilot_guns: std::collections::HashMap<usize, PilotGun>,
     /// Rounds those gunners have fired, all told (logged by checks).
     pub gunner_rounds: u32,
     seed: u64,
@@ -1954,7 +1970,8 @@ impl Default for Combat {
             gunner_wait: Vec::new(),
             gunner_burst: Vec::new(),
             pilot_shots: Vec::new(),
-            pilot_wait: std::collections::HashMap::new(),
+            pilot_view: None,
+            pilot_guns: std::collections::HashMap::new(),
             gunner_rounds: 0,
             seed: 0x2545_f491_4f6c_dd1d,
             fired: Fired::default(),
@@ -4040,23 +4057,28 @@ impl Combat {
     }
 
     /// AI pilots' guns ([`pilot_shots`](Self::pilot_shots)): each fires
-    /// its first mount's weapon at the point its pilot asks, at the
-    /// weapon's own rate in the bursts its `WeaponHint` gives soldiers
-    /// ([`gunner_burst`]), each round strayed in its `ScatterMin` cone, as
-    /// her gunners' rounds are ([`gunners_fire`](Self::gunners_fire)).
-    /// From the 360 code: a pilot's `HeliAttack` fires through its seat's
-    /// weapon at the target's lead (0x822B0578, 0x822AE598) by the AI's
-    /// fire control (0x822F0098); that it bursts as a soldier's does is
-    /// inferred.
+    /// its first mount's weapon at the point its pilot asks, each round
+    /// strayed in its `ScatterMin` cone, as her gunners' rounds are
+    /// ([`gunners_fire`](Self::gunners_fire)). From the 360 code: a
+    /// pilot's `HeliAttack` fires through its seat's weapon at the
+    /// target's lead (0x822B0578, 0x822AE598), in the cycles of the AI's
+    /// fire control ([`m2_engine::weapons::FireHint::cycle`], 0x822F0098).
+    /// Each time its cycle runs out a new one starts: its burst that long,
+    /// the next after the burst and the pause, the pause twice as long
+    /// when the gunship is behind her camera (more than 90 degrees off
+    /// its heading, seen from above: 0x822EC720) and a fifth as long on
+    /// an attack run. While the burst lasts it holds the trigger (the
+    /// weapon's own rate); a single-shot weapon fires one round as each
+    /// cycle starts. Inferred: that both timers count down with the frame.
     fn pilots_fire(&mut self, f: &mut Field<'_>, dt: f32) {
-        for (w, _) in self.pilot_wait.values_mut() {
-            *w -= dt;
+        for g in self.pilot_guns.values_mut() {
+            g.cycle -= dt;
+            g.burst -= dt;
+            g.wait -= dt;
         }
         let shots = std::mem::take(&mut self.pilot_shots);
-        for (i, at) in shots {
-            if self.pilot_wait.get(&i).is_some_and(|&(w, _)| w > 0.0) {
-                continue;
-            }
+        for s in shots {
+            let i = s.vehicle;
             let Some(v) = f.vehicles.get(i) else {
                 continue;
             };
@@ -4071,18 +4093,39 @@ impl Combat {
             else {
                 continue;
             };
-            let to = at - from;
+            let (on, mut off) = m2_engine::weapons::FireHint::cycle(hint.as_ref(), s.dist);
+            let seen = self.pilot_view.is_some_and(|(eye, ahead)| {
+                let d = (from - eye).normalize_or_zero();
+                ahead.x * d.x + ahead.z * d.z > PILOT_VIEW_COS
+            });
+            if !seen {
+                off *= 2.0;
+            }
+            if s.run {
+                off *= 0.2;
+            }
+            let g = self.pilot_guns.entry(i).or_default();
+            let mut fire = false;
+            if g.cycle <= 0.0 {
+                g.burst = on;
+                g.cycle = off + on;
+                fire = hint.is_some_and(|h| h.single);
+            }
+            if g.burst > 0.0 {
+                fire = g.wait <= 0.0;
+            }
+            if !fire {
+                continue;
+            }
+            let to = s.at - from;
             let dir = m2_engine::weapons::stray_in_cone(
                 to.normalize_or(Vec3::Z),
                 cone,
                 self.random(),
                 self.random(),
             );
-            let close = to.length() < m2_engine::weapons::FireHint::CLOSE;
-            let left = self.pilot_wait.get(&i).map_or(0, |&(_, l)| l);
             if let Some(gap) = self.fire_mount(f, i, 0, 0, Some(from + dir * to.length())) {
-                self.pilot_wait
-                    .insert(i, gunner_burst(hint, gap, close, left));
+                self.pilot_guns.entry(i).or_default().wait = gap;
             }
         }
     }
@@ -7376,6 +7419,7 @@ mod tests {
             on_close: -1.0,
             off_close: 0.75,
             against: [3, 1, 0, 0],
+            single: false,
         };
         let gap = 60.0 / 562.0;
         let mut left = 0;
