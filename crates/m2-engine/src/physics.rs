@@ -3073,8 +3073,23 @@ impl Physics {
             let side = Vec3::new(ahead.z, 0.0, -ahead.x);
             let velocity = vec3(b.linvel());
             let w = hull.water;
-            let along = velocity.dot(ahead) * ease(w.drag[0]);
-            let across = velocity.dot(side) * ease(w.drag[1]);
+            // On its handbrake the drag across it is lifted by its
+            // `HandBrakeAntiSideDrag` x its handbrake x its share of its
+            // top speed, and its `HandBrakeMomentumKeep` x its handbrake x
+            // the drag across it left pushes it on ahead instead (the 360
+            // code's 0x8219A9F0 and 0x8219AB4C, level, by its share of
+            // the water). Neither is held to a range there.
+            let f = w.float;
+            let gone = if f.top > 1e-4 {
+                (velocity.length() / f.top).min(1.0)
+            } else {
+                1.0
+            };
+            let side_drag = w.drag[1] * (1.0 - f.anti_side_drag * hull.handbrake * gone);
+            let across_now = velocity.dot(side);
+            let kept = f.momentum_keep * hull.handbrake * (side_drag * across_now).abs() * dt * wet;
+            let along = velocity.dot(ahead) * ease(w.drag[0]) + kept;
+            let across = across_now * ease(side_drag);
             let rise = velocity.y * ease(w.drag[2]);
             b.set_linvel(vector(ahead * along + side * across + Vec3::Y * rise), true);
             // An intact boat's helm turned it with its springs
@@ -5249,6 +5264,51 @@ impl Physics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // On its handbrake a boat slides across with less of the water's drag
+    // (`HandBrakeAntiSideDrag`, by its share of its top speed) and the
+    // drag left pushes it on ahead (`HandBrakeMomentumKeep`; 0x8219A9F0,
+    // 0x8219AB4C); with both 0, as the 360 record's defaults, neither.
+    #[test]
+    fn a_boat_on_its_handbrake_slides_and_keeps_its_way() {
+        let slid = |anti: f32, keep: f32| {
+            let mut p = Physics::new();
+            p.set_water(0.0);
+            let mut spec = boat();
+            spec.tuning.boat = Some(BoatTuning {
+                float: BoatFloat {
+                    anti_side_drag: anti,
+                    momentum_keep: keep,
+                    ..BoatFloat::DEFAULT
+                },
+                ..BOAT
+            });
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, -0.5, 0.0), 0.0);
+            for _ in 0..120 {
+                p.drive(id, VehicleControls::default());
+                p.step(DT);
+            }
+            let v = p.vehicle_velocity(id);
+            p.set_vehicle_velocity(id, v.with_x(8.0).with_z(0.0));
+            let held = VehicleControls {
+                brake: true,
+                ..VehicleControls::default()
+            };
+            for _ in 0..30 {
+                p.drive(id, held);
+                p.step(DT);
+            }
+            let m = p.vehicle_transform(id).unwrap();
+            let v = p.vehicle_velocity(id);
+            let ahead = m.transform_vector3(Vec3::Z).with_y(0.0).normalize();
+            let side = m.transform_vector3(Vec3::X).with_y(0.0).normalize();
+            (v.dot(side).abs(), v.dot(ahead))
+        };
+        let (plain, lifted, kept) = (slid(0.0, 0.0), slid(0.9, 0.0), slid(0.0, 1.0));
+        assert!(plain.1.abs() < 0.05, "{plain:?}");
+        assert!(lifted.0 > plain.0 + 0.3, "slides {lifted:?}, {plain:?}");
+        assert!(kept.1 > 1.0, "keeps {kept:?}");
+    }
 
     // A boat that hits something loses its roll (`CollisionStabilization`
     // 1, the 360 record's default; 0x8219A7xx); afloat and clear of

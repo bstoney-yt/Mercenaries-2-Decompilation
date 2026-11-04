@@ -374,6 +374,13 @@ pub struct BoatFloat {
     pub hit_torque: f32,
     /// How its handbrake eases off once let go (`HandBrakeInertia`).
     pub handbrake_inertia: f32,
+    /// On its handbrake, how much of the water's drag across it is
+    /// lifted (x its handbrake x its share of its top speed;
+    /// `HandBrakeAntiSideDrag`), and how much of the drag across it left
+    /// pushes it on ahead instead (`HandBrakeMomentumKeep`);
+    /// `physics::Physics::float_boats`, 0x8219A9F0 and 0x8219AB4C.
+    pub anti_side_drag: f32,
+    pub momentum_keep: f32,
     /// How its engine's throttle eases to the throttle asked
     /// (`EngineInertia`, kept each 1/60 s; 0x82198F08).
     pub engine_inertia: f32,
@@ -413,6 +420,8 @@ impl BoatFloat {
         air_steering: 0.0,
         curve_at: (0.25, 0.5),
         handbrake_inertia: 0.0,
+        anti_side_drag: 0.0,
+        momentum_keep: 0.0,
         stabilization: 1.0,
         hit_torque: 1.0,
         ang_damp: [0.0, 0.0, 0.5],
@@ -1962,6 +1971,8 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                                 handbrake_boost: g("HandbrakeSteerBoost", d.handbrake_boost),
                                 air_steering: g("AirCtrlSteering", d.air_steering),
                                 handbrake_inertia: g("HandBrakeInertia", d.handbrake_inertia),
+                                anti_side_drag: g("HandBrakeAntiSideDrag", d.anti_side_drag),
+                                momentum_keep: g("HandBrakeMomentumKeep", d.momentum_keep),
                                 stabilization: g("CollisionStabilization", d.stabilization),
                                 hit_torque: g("EngineTorqueMultiAtCollision", d.hit_torque),
                                 curve_at: (
