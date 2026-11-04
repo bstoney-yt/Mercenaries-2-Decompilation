@@ -142,7 +142,7 @@ impl LandingSearch {
                 } else if self.counter == self.ring * 2 + 1 {
                     self.ring += 1;
                     if rings < self.ring {
-                                self.done = Some(Search::Failed);
+                        self.done = Some(Search::Failed);
                         return Search::Failed;
                     }
                     self.counter = 0;

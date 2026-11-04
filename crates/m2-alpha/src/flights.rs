@@ -966,8 +966,7 @@ impl Flights {
             // A landing (`HeliLand`): down near the point, and there
             // until sent home.
             _ if f.lands => {
-                let (stick, how) =
-                    pilot.land_near(f.to, &mut f.search, box_, size, &mut sight, dt);
+                let (stick, how) = pilot.land_near(f.to, &mut f.search, box_, size, &mut sight, dt);
                 let late = f.clock > INBOUND_LONGEST && f.phase == Phase::Inbound;
                 if !f.released && (how != Landing::Flying || late) {
                     eprintln!("delivery: {} lands ({how:?}) at {:.1}", f.pilot, f.at);
