@@ -367,8 +367,7 @@ fn gunner_burst(
 /// again.
 #[derive(Clone, Copy, Debug, Default)]
 struct PilotGun {
-    cycle: f32,
-    burst: f32,
+    cycle: m2_engine::weapons::FireCycle,
     wait: f32,
 }
 
@@ -4072,8 +4071,7 @@ impl Combat {
     /// cycle starts. Inferred: that both timers count down with the frame.
     fn pilots_fire(&mut self, f: &mut Field<'_>, dt: f32) {
         for g in self.pilot_guns.values_mut() {
-            g.cycle -= dt;
-            g.burst -= dt;
+            g.cycle.tick(dt);
             g.wait -= dt;
         }
         let shots = std::mem::take(&mut self.pilot_shots);
@@ -4093,27 +4091,16 @@ impl Combat {
             else {
                 continue;
             };
-            let (on, mut off) = m2_engine::weapons::FireHint::cycle(hint.as_ref(), s.dist);
             let seen = self.pilot_view.is_some_and(|(eye, ahead)| {
                 let d = (from - eye).normalize_or_zero();
                 ahead.x * d.x + ahead.z * d.z > PILOT_VIEW_COS
             });
-            if !seen {
-                off *= 2.0;
-            }
-            if s.run {
-                off *= 0.2;
-            }
             let g = self.pilot_guns.entry(i).or_default();
-            let mut fire = false;
-            if g.cycle <= 0.0 {
-                g.burst = on;
-                g.cycle = off + on;
-                fire = hint.is_some_and(|h| h.single);
-            }
-            if g.burst > 0.0 {
-                fire = g.wait <= 0.0;
-            }
+            let fire = match g.cycle.trigger(hint.as_ref(), s.dist, seen, s.run) {
+                m2_engine::weapons::Trigger::One => true,
+                m2_engine::weapons::Trigger::Hold => g.wait <= 0.0,
+                m2_engine::weapons::Trigger::Off => false,
+            };
             if !fire {
                 continue;
             }

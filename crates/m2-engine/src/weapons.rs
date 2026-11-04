@@ -700,6 +700,69 @@ impl FireHint {
     }
 }
 
+/// What an AI's fire control does with its trigger this frame
+/// (0x822AE598's modes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    /// Mode 1: one round (a single-shot weapon as its cycle starts).
+    One,
+    /// Mode 2: held, the weapon firing at its own rate.
+    Hold,
+    /// Mode 3: let go.
+    Off,
+}
+
+/// An AI gunner's fire cycle (its mind's +0x84 and +0x88, as `HeliAttack`
+/// keeps them, 0x822B0578): each time the cycle runs out a new one
+/// starts, its burst [`FireHint::cycle`]'s length, the next after the
+/// burst and the pause; the pause twice as long when it is out of her
+/// view (0x822F0098) and a fifth as long on an attack run. Inferred: that
+/// both count down with the frame (where the 360 counts them down is not
+/// traced).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FireCycle {
+    pub cycle: f32,
+    pub burst: f32,
+}
+
+impl FireCycle {
+    /// Its timers `dt` on.
+    pub fn tick(&mut self, dt: f32) {
+        self.cycle -= dt;
+        self.burst -= dt;
+    }
+
+    /// The trigger this frame for a weapon of `hint` at a target `dist`
+    /// off, `seen` or not, on a `run` or not.
+    pub fn trigger(
+        &mut self,
+        hint: Option<&FireHint>,
+        dist: f32,
+        seen: bool,
+        run: bool,
+    ) -> Trigger {
+        let (on, mut off) = FireHint::cycle(hint, dist);
+        if !seen {
+            off *= 2.0;
+        }
+        if run {
+            off *= 0.2;
+        }
+        let mut t = Trigger::Off;
+        if self.cycle <= 0.0 {
+            self.burst = on;
+            self.cycle = off + on;
+            if hint.is_some_and(|h| h.single) {
+                t = Trigger::One;
+            }
+        }
+        if self.burst > 0.0 {
+            t = Trigger::Hold;
+        }
+        t
+    }
+}
+
 /// How far a soldier's rounds stray from where he aims: widths across,
 /// radians, sideways and up, each round a uniform pick within them
 /// ([`SoldierSpread::stray`]), as her own rounds scatter over her gun's
@@ -1424,6 +1487,48 @@ mod tests {
         let h = FireHint { single: false, ..h };
         assert_eq!(FireHint::cycle(Some(&h), 30.0), (2.0, 3.0));
         assert_eq!(FireHint::cycle(None, 30.0), (2.0, 2.0));
+    }
+
+    // A cycle holds the trigger for its burst, lets go for its pause
+    // (twice as long out of view, a fifth on a run), and a single-shot
+    // weapon fires once a cycle (0x822B0578, 0x822F0098).
+    #[test]
+    fn a_fire_cycle_holds_then_lets_go() {
+        let h = FireHint {
+            min_range: 0.0,
+            range: 100.0,
+            angle: 0,
+            on: 1.0,
+            off: 2.0,
+            on_close: -1.0,
+            off_close: -1.0,
+            against: [0; 4],
+            single: false,
+        };
+        let held = |seen: bool, run: bool, h: &FireHint| {
+            let mut c = FireCycle::default();
+            let (mut hold, mut one) = (0, 0);
+            for _ in 0..1200 {
+                c.tick(0.01);
+                match c.trigger(Some(h), 50.0, seen, run) {
+                    Trigger::Hold => hold += 1,
+                    Trigger::One => one += 1,
+                    Trigger::Off => {}
+                }
+            }
+            (hold, one)
+        };
+        // 12 s: four 3 s cycles, each 1 s held.
+        let (hold, one) = held(true, false, &h);
+        assert!((396..=404).contains(&hold) && one == 0, "{hold}");
+        // Out of view: 5 s cycles.
+        let (hold, _) = held(false, false, &h);
+        assert!((240..=306).contains(&hold), "{hold}");
+        // On a run: 1.4 s cycles.
+        let (hold, _) = held(true, true, &h);
+        assert!((800..=900).contains(&hold), "{hold}");
+        let single = FireHint { single: true, ..h };
+        assert_eq!(held(true, false, &single), (0, 6));
     }
 
     #[test]
