@@ -2652,6 +2652,36 @@ fn float_hull(hull: &mut Hull, b: &mut r::RigidBody, water: f32, touched: bool, 
     wet
 }
 
+/// An intact boat's velocity after the water's drag for a step `dt`, as
+/// the 360 code drags it (0x8219A5E0, from 0x8219A9D4): along each of
+/// its own axes (its hull turned `turn`), its velocity along it x its
+/// template's drag that way (`WaterDragFwd`, `WaterDragSide`,
+/// `WaterDragUp`), against the motion, x the step x its share of the
+/// water (an impulse of that x its mass, so a change in velocity of it).
+/// On its handbrake the level part of the drag across it is lifted by its
+/// `HandBrakeAntiSideDrag` x its handbrake x its share of its top speed
+/// (0x8219A9F0), and its `HandBrakeMomentumKeep` x its handbrake x the
+/// size of the drag across it left x the step x its share of the water
+/// pushes it along its level ahead, never down (0x8219AB4C). Neither is
+/// held to a range there.
+fn boat_drag(hull: &Hull, turn: Quat, velocity: Vec3, dt: f32) -> Vec3 {
+    let (w, f) = (hull.water, hull.water.float);
+    let (x, y, z) = (turn * Vec3::X, turn * Vec3::Y, turn * Vec3::Z);
+    let gone = if f.top > 1e-4 {
+        (velocity.length() / f.top).min(1.0)
+    } else {
+        1.0
+    };
+    let lift = f.anti_side_drag * hull.handbrake * gone;
+    let mut across = x * (w.drag[1] * velocity.dot(x));
+    across -= across.with_y(0.0) * lift;
+    let drag = z * (w.drag[0] * velocity.dot(z)) + across + y * (w.drag[2] * velocity.dot(y));
+    let share = hull.water_share;
+    let keep = f.momentum_keep * hull.handbrake * across.length() * dt * share;
+    let push = (z.with_y(0.0) * keep).with_y(0.0);
+    velocity - drag * dt * share + push
+}
+
 /// Pushes a wheeled vehicle along and across with each of its axles as
 /// the 360 code does ([`Tyres`]; from the 360 code, at 0x8219C118 and
 /// 0x821A08D8): at the mean, over its wheels on the ground, of a point
@@ -3132,30 +3162,20 @@ impl Physics {
                 continue;
             }
             let ease = |rate: f32| 1.0 - (rate * dt * wet).min(1.0);
-            // The water slows it along, across and up and down (its engine
-            // and brake pushed it in [`float_hull`], from 0x82199B08).
-            let side = Vec3::new(ahead.z, 0.0, -ahead.x);
             let velocity = vec3(b.linvel());
             let w = hull.water;
-            // On its handbrake the drag across it is lifted by its
-            // `HandBrakeAntiSideDrag` x its handbrake x its share of its
-            // top speed, and its `HandBrakeMomentumKeep` x its handbrake x
-            // the drag across it left pushes it on ahead instead (the 360
-            // code's 0x8219A9F0 and 0x8219AB4C, level, by its share of
-            // the water). Neither is held to a range there.
-            let f = w.float;
-            let gone = if f.top > 1e-4 {
-                (velocity.length() / f.top).min(1.0)
+            if v.wrecked {
+                // A wreck is slowed along, across and up and down as its
+                // template's drag says, level (invented: the 360's wreck
+                // has no boat action).
+                let side = Vec3::new(ahead.z, 0.0, -ahead.x);
+                let along = velocity.dot(ahead) * ease(w.drag[0]);
+                let across = velocity.dot(side) * ease(w.drag[1]);
+                let rise = velocity.y * ease(w.drag[2]);
+                b.set_linvel(vector(ahead * along + side * across + Vec3::Y * rise), true);
             } else {
-                1.0
-            };
-            let side_drag = w.drag[1] * (1.0 - f.anti_side_drag * hull.handbrake * gone);
-            let across_now = velocity.dot(side);
-            let kept = f.momentum_keep * hull.handbrake * (side_drag * across_now).abs() * dt * wet;
-            let along = velocity.dot(ahead) * ease(w.drag[0]) + kept;
-            let across = across_now * ease(side_drag);
-            let rise = velocity.y * ease(w.drag[2]);
-            b.set_linvel(vector(ahead * along + side * across + Vec3::Y * rise), true);
+                b.set_linvel(vector(boat_drag(hull, turn, velocity, dt)), true);
+            }
             // An intact boat's helm turned it with its springs
             // ([`float_hull`]); a wreck stops turning and rocking
             // (invented).
@@ -5641,6 +5661,31 @@ mod tests {
     // (`HandBrakeAntiSideDrag`, by its share of its top speed) and the
     // drag left pushes it on ahead (`HandBrakeMomentumKeep`; 0x8219A9F0,
     // 0x8219AB4C); with both 0, as the 360 record's defaults, neither.
+    // The water drags a boat along its own axes, by its template's drag
+    // that way x the step x its share of the water (0x8219A5E0): set
+    // sliding across at 6 m/s afloat, one step takes `WaterDragSide` x 6
+    // x the step off it.
+    #[test]
+    fn the_water_drags_a_boat_along_its_own_axes() {
+        let mut p = Physics::new();
+        p.set_water(0.0);
+        let spec = boat();
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, -0.5, 0.0), 0.0);
+        for _ in 0..240 {
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        let m = p.vehicle_transform(id).unwrap();
+        let side = m.transform_vector3(Vec3::X);
+        let v = p.vehicle_velocity(id);
+        p.set_vehicle_velocity(id, v - side * v.dot(side) + side * 6.0);
+        p.drive(id, VehicleControls::default());
+        p.step(DT);
+        let left = p.vehicle_velocity(id).dot(side);
+        let want = 6.0 - BOAT.drag[1] * 6.0 * DT;
+        assert!((left - want).abs() < 0.02, "{left} of {want}");
+    }
+
     #[test]
     fn a_boat_on_its_handbrake_slides_and_keeps_its_way() {
         let slid = |anti: f32, keep: f32| {
