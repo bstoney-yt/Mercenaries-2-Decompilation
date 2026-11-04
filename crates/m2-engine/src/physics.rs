@@ -1374,6 +1374,8 @@ struct VehicleBody {
     /// Its turret's colliders, and where they turn about (model space):
     /// turned with its turret ([`Physics::turn_turret`]).
     turret: (Vec<r::ColliderHandle>, Option<Vec3>),
+    /// Its turret's own body and hinge, when it has one.
+    hinge: Option<TurretHinge>,
     /// Held where it is ([`Physics::hold_vehicle`]): its body fixed.
     held: bool,
     /// Its velocity before the last step, m/s: what it hit things with.
@@ -1633,6 +1635,25 @@ struct BikeFooting {
     stick: f32,
     throttle: f32,
     brake: f32,
+}
+
+/// A turret's own body and the hinge it turns on, as the 360 code builds
+/// them (0x82273F90, from the turret update 0x82275608): a hinge between
+/// the turret part's body and its parent's about the turret's up, its
+/// turn limited to its record's arc unless that goes all the way round,
+/// with a motor driving it toward the angle asked at 20 times the angle
+/// still to go a second, as hard as its `maxForce`, the turret's mass x
+/// (20 + 6 x its `maxYawAccel`, radians; inferred: the 360 reads the
+/// turret def's +0x1C there, taken for that field), N m. The angle asked
+/// moves at most its record's turn rate a second (0x82273C88: here
+/// [`Physics::turn_turret`]'s caller's). Havok's motor field names are
+/// inferred from its usual layout.
+struct TurretHinge {
+    body: r::RigidBodyHandle,
+    joint: r::ImpulseJointHandle,
+    force: f32,
+    /// The angle asked, radians.
+    target: f32,
 }
 
 /// A boat's hull in the water: what floats it, and what its driver asks
@@ -2876,6 +2897,7 @@ impl Physics {
                 }
             }
         }
+        self.drive_turrets();
         self.float_boats(dt);
         self.fly_helicopters(dt);
         self.cap_debris_speeds();
@@ -3448,22 +3470,81 @@ impl Physics {
             };
             insert_collider(&mut self.world, collider, Some(body));
         }
-        // The turret on top, adding nothing to the mass the hull carries:
-        // its own bodies' shapes ([`VehicleSpec::turret_shapes`]), held
-        // straight ahead, else an invented box. Flagged: the 360 builds
-        // them as bodies of their own, joined to the hull (0x8216B818),
-        // with their own mass; here they ride the hull as it stands.
+        // The turret: a body of its own on a hinge about the up through
+        // its mount when its parts have a mass ([`VehicleSpec::turret_mass`];
+        // the 360 code's turret update builds it, 0x82273F90, and drives it
+        // with a motor, [`TurretHinge`]); else its shapes
+        // ([`VehicleSpec::turret_shapes`]), or an invented box, ride the
+        // hull, turned with it ([`Physics::turn_turret`]).
         let mut turret_colliders = Vec::new();
-        for shape in spec.turret_shapes.iter().filter_map(|v| {
-            let points: Vec<_> = v.iter().map(|&p| vector(p)).collect();
-            r::SharedShape::convex_hull(&points)
-        }) {
-            let turret = r::ColliderBuilder::new(shape)
-                .density(0.0)
-                .friction(hull_friction)
-                .friction_combine_rule(combine)
-                .collision_groups(hull);
-            turret_colliders.push(insert_collider(&mut self.world, turret, Some(body)));
+        let shapes: Vec<r::SharedShape> = spec
+            .turret_shapes
+            .iter()
+            .filter_map(|v| {
+                let points: Vec<_> = v.iter().map(|&p| vector(p)).collect();
+                r::SharedShape::convex_hull(&points)
+            })
+            .collect();
+        let hinge = match (spec.turret_mass, spec.turret_mount()) {
+            (Some(m), Some(mount)) if !shapes.is_empty() => {
+                let turret_body = self.world.insert_body(
+                    r::RigidBodyBuilder::dynamic()
+                        .pose(pose(position, rotation))
+                        .linear_damping(BodyMaterial::COMMON.linear_damping)
+                        .angular_damping(BodyMaterial::COMMON.angular_damping)
+                        .ccd_enabled(true),
+                );
+                let props = r::MassProperties::with_inertia_matrix(
+                    vector(m.centre_of_mass),
+                    m.mass,
+                    rapier3d::math::Matrix::from_cols_array(
+                        &((m.inertia + m.inertia.transpose()) * 0.5).to_cols_array(),
+                    ),
+                );
+                for (i, shape) in shapes.iter().enumerate() {
+                    let c = r::ColliderBuilder::new(shape.clone())
+                        .friction(hull_friction)
+                        .friction_combine_rule(combine)
+                        .collision_groups(hull);
+                    let c = if i == 0 {
+                        c.mass_properties(props)
+                    } else {
+                        c.density(0.0)
+                    };
+                    insert_collider(&mut self.world, c, Some(turret_body));
+                }
+                let t = spec.tuning.turret;
+                let accel = t.map_or(0.0, |t| t.yaw_accel);
+                let mut joint = r::RevoluteJointBuilder::new(r::Vector::Y)
+                    .local_anchor1(vector(mount))
+                    .local_anchor2(vector(mount))
+                    .contacts_enabled(false)
+                    .motor_model(r::MotorModel::ForceBased)
+                    .motor_max_force(m.mass * (20.0 + 6.0 * accel));
+                if let Some((lo, hi)) = t.and_then(|t| t.yaw)
+                    && hi - lo < std::f32::consts::TAU - 0.01
+                {
+                    joint = joint.limits([lo, hi]);
+                }
+                let joint = self.world.insert_impulse_joint(body, turret_body, joint);
+                Some(TurretHinge {
+                    body: turret_body,
+                    joint,
+                    force: m.mass * (20.0 + 6.0 * accel),
+                    target: 0.0,
+                })
+            }
+            _ => None,
+        };
+        if hinge.is_none() {
+            for shape in shapes {
+                let turret = r::ColliderBuilder::new(shape)
+                    .density(0.0)
+                    .friction(hull_friction)
+                    .friction_combine_rule(combine)
+                    .collision_groups(hull);
+                turret_colliders.push(insert_collider(&mut self.world, turret, Some(body)));
+            }
         }
         if let Some((lo, hi)) = spec.turret_box.filter(|_| spec.turret_shapes.is_empty()) {
             let half = ((hi - lo) * 0.5).max(Vec3::splat(0.1));
@@ -3654,6 +3735,7 @@ impl Physics {
             wrecked: false,
             car_hull,
             turret: (turret_colliders, spec.turret_mount()),
+            hinge,
             held: false,
             before: Vec3::ZERO,
             hull,
@@ -3664,6 +3746,9 @@ impl Physics {
 
     pub fn remove_vehicle(&mut self, id: VehicleId) {
         if let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::take) {
+            if let Some(h) = &v.hinge {
+                self.world.remove_body_with_colliders(h.body, true);
+            }
             self.world
                 .remove_body_with_colliders(v.controller.chassis, true);
         }
@@ -3986,15 +4071,21 @@ impl Physics {
         }
     }
 
-    /// Turns a vehicle's turret's colliders to `yaw` radians
-    /// (anticlockwise from above, as [`VehicleSpec::turret_transform`]
-    /// turns its nodes), so what it hits is where it is drawn. Flagged:
-    /// the 360 code makes the turret a body of its own on a motorised
-    /// hinge (0x82273F90, 0x82273C88); here it rides the hull, turned.
+    /// Asks a vehicle's turret to turn to `yaw` radians (anticlockwise from
+    /// above, as [`VehicleSpec::turret_transform`] turns its nodes): one on
+    /// its own body is driven there by its hinge's motor ([`TurretHinge`];
+    /// the caller moves `yaw` at most its turn rate a second, as the 360
+    /// code's 0x82273C88 does), one riding the hull has its colliders
+    /// turned there at once. See [`turret_yaw`](Self::turret_yaw) for where
+    /// it is.
     pub fn turn_turret(&mut self, id: VehicleId, yaw: f32) {
-        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+        let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
             return;
         };
+        if let Some(h) = &mut v.hinge {
+            h.target = yaw;
+            return;
+        }
         let (handles, mount) = (&v.turret.0, v.turret.1.unwrap_or(Vec3::ZERO));
         let turn = Quat::from_rotation_y(yaw);
         let place = pose(mount - turn * mount, turn);
@@ -4003,6 +4094,52 @@ impl Physics {
                 c.set_position_wrt_parent(place);
             }
         }
+    }
+
+    /// Drives each turret on its own body toward the angle asked
+    /// ([`TurretHinge`]): its motor's speed 20 times the angle still to go.
+    fn drive_turrets(&mut self) {
+        for i in 0..self.vehicles.len() {
+            let Some((joint, force, target)) = self.vehicles[i]
+                .as_ref()
+                .and_then(|v| v.hinge.as_ref())
+                .map(|h| (h.joint, h.force, h.target))
+            else {
+                continue;
+            };
+            let Some(now) = self.turret_yaw(VehicleId(i)) else {
+                continue;
+            };
+            let mut off = (target - now).rem_euclid(std::f32::consts::TAU);
+            if off > std::f32::consts::PI {
+                off -= std::f32::consts::TAU;
+            }
+            if let Some(j) = self.world.impulse_joints.get_mut(joint, off.abs() > 1e-4) {
+                j.data
+                    .set_motor_velocity(r::JointAxis::AngX, 20.0 * off, force);
+            }
+        }
+    }
+
+    /// The angle a vehicle's turret on its own body was last asked to
+    /// turn to ([`turn_turret`](Self::turn_turret)), radians; `None` for
+    /// one riding the hull.
+    pub fn turret_target(&self, id: VehicleId) -> Option<f32> {
+        let v = self.vehicles.get(id.0).and_then(Option::as_ref)?;
+        v.hinge.as_ref().map(|h| h.target)
+    }
+
+    /// Where a vehicle's turret on its own body has turned to, radians
+    /// (anticlockwise from above): its body's turn about the hull's up.
+    /// `None` for one riding the hull.
+    pub fn turret_yaw(&self, id: VehicleId) -> Option<f32> {
+        let v = self.vehicles.get(id.0).and_then(Option::as_ref)?;
+        let h = v.hinge.as_ref()?;
+        let hull = self.world.bodies.get(v.controller.chassis)?;
+        let turret = self.world.bodies.get(h.body)?;
+        let q = Quat::from_array(hull.position().rotation.to_array()).inverse()
+            * Quat::from_array(turret.position().rotation.to_array());
+        Some(2.0 * q.y.atan2(q.w))
     }
 
     /// Asks a helicopter to climb (1) or come down (-1), as fast as it
@@ -4978,6 +5115,68 @@ impl Physics {
 mod tests {
     use super::*;
 
+    // A turret on its own body follows the angle asked on its hinge's
+    // motor (20 x the angle to go, a second; 0x82273F90): asked to move at
+    // 1 rad/s it keeps up a twentieth of a second behind, and turns the
+    // hull it sits on hardly at all.
+    #[test]
+    fn a_turret_on_its_own_body_follows_its_hinge_motor() {
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let mut block = Vec::new();
+        for x in [-1.0, 1.0] {
+            for y in [1.6, 2.4] {
+                for z in [-1.0, 2.0] {
+                    block.push(Vec3::new(x, y, z));
+                }
+            }
+        }
+        let spec = VehicleSpec {
+            turret_shapes: vec![block].into(),
+            turret_mass: Some(crate::vehicle::Chassis {
+                mass: 3000.0,
+                inertia: Mat3::from_diagonal(Vec3::new(2000.0, 2500.0, 1000.0)),
+                centre_of_mass: Vec3::new(0.0, 2.0, 0.3),
+            }),
+            pivot: Some(Vec3::new(0.0, 2.0, 0.0)),
+            mass: 30000.0,
+            ..car()
+        };
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.5, 0.0), 0.0);
+        for _ in 0..60 {
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        assert!(p.turret_yaw(id).unwrap().abs() < 0.01);
+        let heading = |p: &Physics| {
+            let f = p.vehicle_transform(id).unwrap().transform_vector3(Vec3::Z);
+            f.x.atan2(f.z)
+        };
+        let before = heading(&p);
+        let mut asked = 0.0;
+        for _ in 0..90 {
+            asked += DT;
+            p.turn_turret(id, asked);
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        let yaw = p.turret_yaw(id).unwrap();
+        assert!((asked - yaw - 1.0 / 20.0).abs() < 0.03, "{yaw} of {asked}");
+        assert!((heading(&p) - before).abs() < 0.05, "hull turned");
+        // Held there, it stays.
+        for _ in 0..60 {
+            p.turn_turret(id, asked);
+            p.step(DT);
+        }
+        assert!((p.turret_yaw(id).unwrap() - asked).abs() < 0.01);
+    }
+
     // A turret's colliders turn with it ([`Physics::turn_turret`]): a
     // block on its front, turned a quarter left, is hit from above on its
     // left and no longer ahead.
@@ -5423,6 +5622,7 @@ mod tests {
             shapes: Default::default(),
             material: None,
             turret_shapes: Default::default(),
+            turret_mass: None,
             wreck: None,
             tuning: crate::VehicleTuning::default(),
         }
