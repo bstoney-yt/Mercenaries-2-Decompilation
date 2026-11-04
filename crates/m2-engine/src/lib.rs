@@ -14,6 +14,7 @@
 //! game's data directly (see `docs/alpha-roadmap.md`).
 
 pub mod ai;
+pub mod ai_cover;
 pub mod ambience;
 pub mod anim;
 pub mod assets;

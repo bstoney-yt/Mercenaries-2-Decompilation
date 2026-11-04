@@ -353,6 +353,8 @@ pub struct Templates {
     /// Each person template's jump, gravity, turn and paces, by id
     /// ([`crate::tuning::human_motion`]).
     pub human_motion: HashMap<u32, crate::on_foot::HumanMotion>,
+    /// Each template's cover hints, by id ([`crate::tuning::cover_hints`]).
+    pub cover_hints: HashMap<u32, Vec<crate::ai_cover::Hint>>,
     /// Each person template's `HumanAnimationSet` gender and character
     /// name, by id ([`crate::tuning::human_animation_sets`]).
     pub human_sets: HashMap<u32, (u32, u32)>,
@@ -1000,6 +1002,7 @@ impl Templates {
             speeds: crate::tuning::human_speeds(&db),
             swim_speeds: crate::tuning::human_swim_speeds(&db),
             human_motion: crate::tuning::human_motion(&db),
+            cover_hints: crate::tuning::cover_hints(&db),
             human_sets: crate::tuning::human_animation_sets(&db),
             guns: crate::tuning::hand_guns(&db),
             equipment: crate::tuning::equipment(&db),
