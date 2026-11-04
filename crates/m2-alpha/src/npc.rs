@@ -123,6 +123,7 @@ const STAND_IN: FireHint = FireHint {
     on_close: 0.8,
     off_close: 1.5,
     against: [3, 1, 0, 0],
+    single: false,
 };
 /// The least pause between a soldier's rockets, seconds, where his
 /// launcher's `BurstOffLength` is shorter (invented).
@@ -4741,6 +4742,7 @@ pub(crate) mod tests {
         );
         let rocket = FireHint {
             against: [1, 3, 3, 3],
+            single: false,
             ..STAND_IN
         };
         n.gun = Some(HandGun {

@@ -1682,6 +1682,7 @@ impl Game {
                     }
                 }
                 self.combat.pilot_shots = self.gunships.shots.clone();
+                self.combat.pilot_view = Some((self.camera.position, self.camera.forward()));
             }
             self.paths
                 .drive(&mut world.physics, &self.scene.vehicles, driven);

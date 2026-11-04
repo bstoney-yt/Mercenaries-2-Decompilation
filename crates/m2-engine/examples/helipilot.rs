@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "template\tcount\tfwd m/s\tmin alt\tto 30 m s\tover m\tlast 5 s err m\tdrift m\tto 400 m s\tfastest m/s\tends off m	land s	round wall s	wall clear m	land-near s	land-near off m	attack mean m	attack nearest m	runs	firing share"
+        "template\tcount\tfwd m/s\tmin alt\tto 30 m s\tover m\tlast 5 s err m\tdrift m\tto 400 m s\tfastest m/s\tends off m	land s	round wall s	wall clear m	land-near s	land-near off m	attack mean m	attack nearest m	runs	firing share	trigger share"
     );
     for ((model, _), ids) in &groups {
         let mut ids = ids.clone();
@@ -140,9 +140,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let (round, clear) = round_the_wall(&spec, &flight, pilot_tuning);
         let (down, spot) = land_by_a_shed(&spec, &flight, pilot_tuning);
-        let (mean, nearest, runs, firing) = attack_a_point(&spec, &flight, pilot_tuning);
+        let (mean, nearest, runs, firing, held) = attack_a_point(&spec, &flight, pilot_tuning);
         println!(
-            "{name}\t{}\t{:.0}\t{:.0}\t{reached:.2}\t{top:.2}\t{:.2}\t{drift:.2}\t{arrived:.1}\t{fastest:.1}\t{off:.2}\t{landed:.1}\t{round:.1}\t{clear:.1}	{down:.1}	{spot:.1}	{mean:.1}	{nearest:.1}	{runs}	{firing:.2}",
+            "{name}\t{}\t{:.0}\t{:.0}\t{reached:.2}\t{top:.2}\t{:.2}\t{drift:.2}\t{arrived:.1}\t{fastest:.1}\t{off:.2}\t{landed:.1}\t{round:.1}\t{clear:.1}	{down:.1}	{spot:.1}	{mean:.1}	{nearest:.1}	{runs}	{firing:.2}	{held:.2}",
             ids.len(),
             flight.forward,
             pilot_tuning.min_altitude,
@@ -299,12 +299,13 @@ fn land_by_a_shed(
 /// From a hover 30 m up, an attack (`HeliAttack`, [`HeliPilot::attack`])
 /// on a still target on open ground 200 m off, for 120 s: its mean and
 /// least distance from the target, how many runs it made, and the share
-/// of the time it fired.
+/// of the time it asked to fire and the share its fire control held the
+/// trigger ([`m2_engine::weapons::FireCycle`], in her view).
 fn attack_a_point(
     spec: &VehicleSpec,
     flight: &m2_engine::tuning::FlightTuning,
     tuning: PilotTuning,
-) -> (f32, f32, u32, f32) {
+) -> (f32, f32, u32, f32, f32) {
     let (mut p, vid) = start(spec);
     let at = place(&p, vid);
     let mut pilot = HeliPilot::new(tuning, flight);
@@ -327,8 +328,16 @@ fn attack_a_point(
     let (mut sum, mut n, mut nearest, mut runs, mut fired) =
         (0.0f32, 0.0f32, f32::INFINITY, 0u32, 0.0f32);
     let mut seed: u32 = 1;
+    let hint = spec
+        .armed
+        .iter()
+        .find(|m| m.priority == 0)
+        .and_then(|m| m.weapon.hint);
+    let mut cycle = m2_engine::weapons::FireCycle::default();
+    let mut held = 0.0f32;
     let mut last = 0;
     for _ in 0..(120.0 / DT) as usize {
+        cycle.tick(DT);
         think(&mut p, vid, &mut pilot);
         seed = seed.wrapping_mul(0x0019_660D).wrapping_add(0x3C6E_F35F);
         let rand = (seed >> 8) as f32 / (1u32 << 24) as f32;
@@ -345,13 +354,18 @@ fn attack_a_point(
             runs += 1;
         }
         last = pilot.attack_part;
-        if matches!(gun, m2_engine::heli_pilot::Gun::Fire(_)) {
+        if let m2_engine::heli_pilot::Gun::Fire(_) = gun {
             fired += 1.0;
+            let dist = place(&p, vid).distance(target.at);
+            let run = pilot.run_fire > 0.0;
+            if cycle.trigger(hint.as_ref(), dist, true, run) != m2_engine::weapons::Trigger::Off {
+                held += 1.0;
+            }
         }
         let d = place(&p, vid).distance(target.at);
         sum += d;
         n += 1.0;
         nearest = nearest.min(d);
     }
-    (sum / n, nearest, runs, fired / n)
+    (sum / n, nearest, runs, fired / n, held / n)
 }
