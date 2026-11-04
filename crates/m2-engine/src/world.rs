@@ -302,6 +302,9 @@ pub struct Templates {
     /// The radio templates' playlist and reach, by id
     /// ([`crate::music_source`]).
     pub music_sources: HashMap<u32, (u32, f32)>,
+    /// What each template with a `SoundEffect` plays as its objects come
+    /// into being, by id ([`crate::spawn_sound`]).
+    pub spawn_sounds: HashMap<u32, crate::spawn_sound::SpawnSound>,
     /// How near a player wakes each template that says so, by id: its
     /// `HibernationControl` `Distance` ([`crate::population::hibernation`]).
     pub hibernation: HashMap<u32, f32>,
@@ -984,6 +987,7 @@ impl Templates {
             explosions: crate::durability::explosions(&db),
             hijack: crate::hijack::read(&db),
             music_sources: crate::music_source::read(&db),
+            spawn_sounds: crate::spawn_sound::read(&db),
             hibernation: db
                 .component("HibernationControl")
                 .map(|c| crate::population::hibernation(c))

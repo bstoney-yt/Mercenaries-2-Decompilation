@@ -9526,7 +9526,8 @@ impl Running {
             self.audio.shout(sets[i % sets.len()], Some(at));
         }
         let sounds = self.game.combat.take_sounds();
-        self.audio.play_fight(&sounds);
+        let db = self.game.scene.world.as_ref().map(|w| &w.index.template_db);
+        self.audio.play_fight(&sounds, db);
         let cues = self.game.scene.take_cues(ear, CUE_REACH);
         self.audio.play_cues(&cues);
         let engine = self.game.engine();
