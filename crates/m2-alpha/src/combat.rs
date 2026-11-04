@@ -1292,7 +1292,7 @@ pub struct Strike {
 }
 
 /// A round's `DamageKey`: its ammunition's, a plain `Bullet` for none.
-fn round_kind(key: Option<u32>) -> u32 {
+pub fn round_kind(key: Option<u32>) -> u32 {
     key.filter(|&k| k != 0)
         .unwrap_or_else(|| m2_assets::name_hash("Bullet"))
 }
@@ -2922,7 +2922,8 @@ impl Combat {
         let target = self.target(f.player, true);
         for i in 0..f.people.npcs.len() {
             if std::mem::take(&mut f.people.npcs[i].fires) {
-                self.npc_shoot(f, i, target);
+                let at = f.people.npcs[i].fire_at.take().or(target);
+                self.npc_shoot(f, i, at);
             }
             if std::mem::take(&mut f.people.npcs[i].launches) {
                 self.npc_launch(f, i, target);
@@ -3387,6 +3388,17 @@ impl Combat {
             }
             if let Some((t, None)) = hit {
                 self.round_on_vehicle(f, (from, dir, t), npc_round_on_vehicle(gun), None);
+                // What of the world it meets, it wears as her rounds do.
+                if let Some((_, _, Some(key))) = f.physics.cast_ray_keyed(from, dir, t + 0.05) {
+                    let round = gun.map_or(NPC_DAMAGE, |g| g.damage);
+                    self.struck.push(Strike {
+                        at: from + dir * t,
+                        damage: round,
+                        key: Some(key),
+                        round,
+                        kind: round_kind(gun.and_then(|g| g.damage_key)),
+                    });
+                }
             }
         }
     }

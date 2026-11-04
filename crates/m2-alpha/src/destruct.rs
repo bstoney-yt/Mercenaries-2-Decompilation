@@ -435,6 +435,87 @@ impl Destruction {
         )
     }
 
+    /// What `key` is, if hits can wear it down: its template and
+    /// durability (not broken, taken, knocked loose or already a wreck, not
+    /// an explosive the fight counts, not a placed supply or cash, and with
+    /// a `Health` above 0 that isn't invincible).
+    fn wearable(
+        &self,
+        world: &World,
+        props: &Props,
+        key: StaticKey,
+    ) -> Option<(u32, m2_engine::durability::Durability)> {
+        let template = match key {
+            StaticKey::Object(i) => {
+                if self.destroyed.contains(&i)
+                    || world.destroyed.contains(&i)
+                    || world.is_taken(i)
+                    || world.knocked_loose(i).is_some()
+                    || explodes(&world.index.template_db, world.index.objects[i].template)
+                    || !world
+                        .object_model(i)
+                        .is_some_and(|m| m.has_wreck() || world.loose_mass(i).is_some())
+                {
+                    return None;
+                }
+                world.index.objects[i].template
+            }
+            StaticKey::Entity(e) => match props.get(e) {
+                Some((p, _))
+                    if !p.wrecked
+                        && !adopted(e)
+                        && !props.sturdy.contains(&e)
+                        && props.knocked_loose(e).is_none() =>
+                {
+                    p.template
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let db = &world.index.template_db;
+        if crate::placed::kind(db, template).is_some()
+            || db.names.get(&template).is_some_and(|n| n.contains("Cash"))
+        {
+            return None;
+        }
+        let durability = *db.durability.get(&template).filter(|d| !d.invincible)?;
+        (durability.health > 0.0).then_some((template, durability))
+    }
+
+    /// The damage table's cell for `template`'s row and damage `kind` (1
+    /// for no kind, `unrowed` for a template with no row).
+    fn cell(world: &World, template: u32, kind: u32, unrowed: f32) -> f32 {
+        let db = &world.index.template_db;
+        match (db.modifiers.get(&template), db.damage.as_ref()) {
+            _ if kind == 0 => 1.0,
+            (Some(&row), Some(table)) => table.scale(row, kind).unwrap_or(0.0),
+            _ => unrowed,
+        }
+    }
+
+    /// Whether a soldier may shoot at `key` to clear his line of fire
+    /// with rounds of `damage` and kind `kind`, as the 360's blocker test
+    /// does (0x822EFE48, research thread, 360 notes s23): it must be
+    /// something hits wear down, and one round's damage times its row's
+    /// cell over its `Health` must be above 0 and no more than 3. (The
+    /// faction test, relation to its owner at most 20, passes: the island's
+    /// props have no owner, which the 360 rates 0.)
+    pub fn shootable_blocker(
+        &self,
+        world: &World,
+        props: &Props,
+        key: StaticKey,
+        damage: f32,
+        kind: u32,
+    ) -> bool {
+        let Some((template, durability)) = self.wearable(world, props, key) else {
+            return false;
+        };
+        let ratio = damage * Self::cell(world, template, kind, 0.0) / durability.health;
+        ratio > 0.0 && ratio <= 3.0
+    }
+
     /// [`wear`](Self::wear) by `cause`: what breaks with nothing to show
     /// broken flies as it says (on with a vehicle that ran into it, away
     /// from a blast).
@@ -459,52 +540,12 @@ impl Destruction {
                 _ => Vec3::ZERO,
             },
         };
-        let template = match key {
-            StaticKey::Object(i) => {
-                if self.destroyed.contains(&i)
-                    || world.destroyed.contains(&i)
-                    || world.is_taken(i)
-                    || world.knocked_loose(i).is_some()
-                    || explodes(&world.index.template_db, world.index.objects[i].template)
-                    || !world
-                        .object_model(i)
-                        .is_some_and(|m| m.has_wreck() || world.loose_mass(i).is_some())
-                {
-                    return false;
-                }
-                world.index.objects[i].template
-            }
-            StaticKey::Entity(e) => match props.get(e) {
-                Some((p, _))
-                    if !p.wrecked
-                        && !adopted(e)
-                        && !props.sturdy.contains(&e)
-                        && props.knocked_loose(e).is_none() =>
-                {
-                    p.template
-                }
-                _ => return false,
-            },
-            _ => return false,
+        let Some((template, durability)) = self.wearable(world, props, key) else {
+            return false;
         };
         let db = &world.index.template_db;
-        if crate::placed::kind(db, template).is_some()
-            || db.names.get(&template).is_some_and(|n| n.contains("Cash"))
-        {
-            return false;
-        }
-        let Some(durability) = db.durability.get(&template).filter(|d| !d.invincible) else {
-            return false;
-        };
         let health = durability.health;
-        if health <= 0.0 {
-            return false;
-        }
-        let scale = match (db.modifiers.get(&template), db.damage.as_ref()) {
-            _ if kind == 0 => 1.0,
-            (Some(&row), Some(table)) => table.scale(row, kind).unwrap_or(0.0),
-            _ => unrowed,
-        };
+        let scale = Self::cell(world, template, kind, unrowed);
         let hit = damage * scale;
         // A crash counts only past 1 once the cell has scaled it (the 360's
         // 0x82287CF8, as [`m2_engine::durability::crash_damage`]).

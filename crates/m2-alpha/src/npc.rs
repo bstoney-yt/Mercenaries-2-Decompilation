@@ -203,6 +203,27 @@ const STALLED: u8 = 10;
 /// How far ahead (seconds) people see a vehicle coming at them.
 const DODGE_TIME: f32 = 2.0;
 
+/// Something between a soldier and her that he may shoot to clear his
+/// line of fire (the 360's line-of-fire upkeep 0x822C95D8, research
+/// thread, 360 notes s22/s23).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Blocker {
+    /// Where his ray met it, and what it is.
+    pub at: Vec3,
+    pub key: m2_engine::StaticKey,
+    /// The fight found it worth shooting
+    /// ([`crate::destruct::Destruction::shootable_blocker`]).
+    pub cleared: bool,
+}
+
+/// How often the line-of-fire upkeep looks, seconds.
+const LOF_EVERY: f32 = 1.0;
+/// A blocker within this of the end he aims at, at least (the weapon's
+/// blast radius, 0 for rounds, floored at 5 m, times 1.5).
+const LOF_NEAR: f32 = 5.0 * 1.5;
+/// Seconds his memory of her is stretched by when a blocker is found.
+const LOF_REMEMBER: f32 = 5.0;
+
 /// A person model and the rig that animates it.
 #[derive(Debug)]
 pub struct PersonKind {
@@ -944,6 +965,14 @@ pub struct Npc {
     striking: f32,
     /// He struck this tick (the melee hook: its damage is not traced yet).
     pub melee: bool,
+    /// What blocks his line of fire at her, and whether the fight cleared
+    /// it as worth shooting ([`Blocker`]); seconds to the next check.
+    pub blocker: Option<Blocker>,
+    lof: f32,
+    /// Seconds his memory of her is stretched by (a blocker found).
+    remember: f32,
+    /// Where his next shot goes instead of at her (a blocker).
+    pub fire_at: Option<Vec3>,
     stalled: u8,
     way: Vec2,
     turning: m2_engine::on_foot::Turn,
@@ -1106,6 +1135,10 @@ impl Npc {
             close: Default::default(),
             striking: 0.0,
             melee: false,
+            blocker: None,
+            lof: 0.0,
+            remember: 0.0,
+            fire_at: None,
             stalled: 0,
             way: Vec2::Y,
             turning: m2_engine::on_foot::Turn::default(),
@@ -1498,10 +1531,39 @@ impl Npc {
             }
         }
         let seen = self.unseen < LOOK_EVERY * 1.5 && self.last_seen.is_some();
+        if seen {
+            self.remember = 0.0;
+        }
+        // Once a second: unseen where he last saw her, a ray from his chest
+        // to there; what it meets past the half way, within reach of that
+        // end, he may shoot (0x822C95D8).
+        self.lof -= dt;
+        if self.lof <= 0.0 {
+            self.lof = LOF_EVERY;
+            self.blocker = match self.last_seen.filter(|_| !seen) {
+                Some(end) => {
+                    let from = self.chest();
+                    let to = end - from;
+                    let length = to.length();
+                    physics
+                        .cast_ray_keyed(from, to, length)
+                        .and_then(|(t, _, key)| Some((t, key?)))
+                        .filter(|&(t, _)| t > length - t)
+                        .map(|(t, key)| (from + to.normalize_or_zero() * t, key))
+                        .filter(|&(at, _)| at.distance(end) <= LOF_NEAR)
+                        .map(|(at, key)| {
+                            self.remember = LOF_REMEMBER;
+                            let cleared = self.blocker.is_some_and(|b| b.key == key && b.cleared);
+                            Blocker { at, key, cleared }
+                        })
+                }
+                None => None,
+            };
+        }
         self.unseen += dt;
         // Heard or hit without seeing her: he goes to the noise.
         let goal = self.last_seen.unwrap_or(threat);
-        if self.unseen > GIVE_UP {
+        if self.unseen > GIVE_UP + self.remember {
             return false;
         }
         let smart = self.smart;
@@ -1756,6 +1818,15 @@ impl Npc {
                 self.since_shot = 0.0;
                 let pause = l.hint.off.max(LAUNCHER_GAP);
                 self.launcher_wait = pause * rng.range(1.0 - PAUSE_JITTER, 1.0 + PAUSE_JITTER);
+            }
+        } else if let Some(b) = self.blocker.filter(|b| b.cleared && !seen) {
+            // A blocker cleared as worth it: he shoots it, with his gun's
+            // rhythm, as at her.
+            if self.cooldown <= 0.0 {
+                self.fires = true;
+                self.fire_at = Some(b.at);
+                self.since_shot = 0.0;
+                self.cooldown = self.burst_gap();
             }
         } else if seen
             && self.rates_target()
