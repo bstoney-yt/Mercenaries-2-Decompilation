@@ -5425,6 +5425,51 @@ impl Physics {
             .map(|(_, hit)| (hit.time_of_impact, vec3(hit.normal)))
     }
 
+    /// Whether a ball of `radius` swept from `origin` `down` metres
+    /// straight down meets anything solid but the terrain, passing
+    /// through vehicle `skip`: a landing spot's clearance. The 360's
+    /// clearance checks (0x822CE820) are Havok shape casts while its
+    /// ground is found by rays; that those casts meet no terrain is
+    /// inferred (balls as wide as the rotor swept down to 1.5 m over level
+    /// ground would always meet it).
+    pub fn sphere_meets_below(
+        &self,
+        origin: Vec3,
+        down: f32,
+        radius: f32,
+        skip: Option<VehicleId>,
+    ) -> bool {
+        if down <= 0.0 {
+            return false;
+        }
+        let ball = r::Ball::new(radius.max(1e-3));
+        let skip_body = skip
+            .and_then(|v| self.vehicles.get(v.0))
+            .and_then(Option::as_ref)
+            .map(|v| v.controller.chassis);
+        let not_terrain = |h: r::ColliderHandle, _: &r::Collider| {
+            !matches!(self.keys.get(&h), Some(StaticKey::Cell(_)))
+        };
+        let mut filter = solid().predicate(&not_terrain);
+        if let Some(b) = skip_body {
+            filter = filter.exclude_rigid_body(b);
+        }
+        let options = rapier3d::parry::query::ShapeCastOptions {
+            max_time_of_impact: down,
+            stop_at_penetration: true,
+            ..Default::default()
+        };
+        self.world
+            .cast_shape(
+                &pose(origin, Quat::IDENTITY),
+                vector(Vec3::NEG_Y),
+                &ball,
+                options,
+                filter,
+            )
+            .is_some()
+    }
+
     /// How far a ball of `radius` metres goes from `origin` along
     /// `direction` before it touches something solid, within `max`
     /// metres, passing through vehicle `skip`: how near a camera may come

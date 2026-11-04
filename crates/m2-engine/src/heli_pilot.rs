@@ -104,6 +104,16 @@ pub fn heading_of(v: Vec3) -> f32 {
     v.x.atan2(v.z)
 }
 
+/// How a landing goes ([`HeliPilot::land_near`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Landing {
+    Flying,
+    /// Down (the task done).
+    Landed,
+    /// No spot found (the task failed).
+    Failed,
+}
+
 /// What a pilot looks at in the world as it goes round things.
 pub trait PilotWorld {
     /// The first solid thing on the line from `from` to `to`: where.
@@ -112,6 +122,17 @@ pub trait PilotWorld {
     /// `half` turned `turn` goes from `origin` before it meets something
     /// (1 if nothing).
     fn sweep(&mut self, origin: Vec3, turn: Quat, half: Vec3, way: Vec3, max: f32) -> f32;
+    /// Whether a ball of `radius` swept from `top` down `down` metres
+    /// meets anything ([`crate::heli_land`]'s clearance checks).
+    fn column(&mut self, top: Vec3, down: f32, radius: f32) -> bool {
+        let _ = (top, down, radius);
+        false
+    }
+    /// The water's height over `at`, if there is water there.
+    fn water(&mut self, at: Vec3) -> Option<f32> {
+        let _ = at;
+        None
+    }
 }
 
 /// The alpha's physics as a pilot sees it, past its own helicopter.
@@ -138,6 +159,16 @@ impl PilotWorld for Sight<'_> {
         self.physics
             .cast_box(origin, turn, half, way, max, Some(self.own))
             .map_or(1.0, |t| (t / max).clamp(0.0, 1.0))
+    }
+
+    fn column(&mut self, top: Vec3, down: f32, radius: f32) -> bool {
+        self.physics
+            .sphere_meets_below(top, down, radius, Some(self.own))
+    }
+
+    fn water(&mut self, at: Vec3) -> Option<f32> {
+        let _ = at;
+        self.physics.water()
     }
 }
 
@@ -344,6 +375,75 @@ impl HeliPilot {
             return (stick, true);
         }
         (self.fly_to(target, 1.0, false), false)
+    }
+
+    /// Lands near `target` (the task `HeliLand`, 0x822AF3D8): asks for a
+    /// spot ([`crate::heli_land::LandingSearch`], `search`, one think of
+    /// it each call; a new one when the target moves over 20 m) and
+    /// while it looks flies round things to the target, hovering its
+    /// `MinAltitude` up once within 400 m. Found, it flies to the spot
+    /// (straight once within the spot's clear radius) and over its
+    /// middle (within half a cell) comes down ([`land`](Self::land));
+    /// down, it is done. Failing, it hovers where it is. Which facing and
+    /// floor flags the 360 hands its fly and hover calls here is not
+    /// traced (taken as below).
+    #[allow(clippy::too_many_arguments)]
+    pub fn land_near(
+        &mut self,
+        target: Vec3,
+        search: &mut Option<crate::heli_land::LandingSearch>,
+        box_: (Vec3, Vec3),
+        size: (f32, f32),
+        world: &mut dyn PilotWorld,
+        dt: f32,
+    ) -> (PilotStick, Landing) {
+        use crate::heli_land::{LandingSearch, Search};
+        let moved = search
+            .as_ref()
+            .is_some_and(|s| (s.target - target).with_y(0.0).length() > 20.0);
+        if moved || search.is_none() {
+            *search = Some(LandingSearch::new(
+                target,
+                box_,
+                self.tuning.min_altitude,
+                self.tuning.landing_slope,
+                self.tuning.outer_height.max(1.5),
+            ));
+        }
+        let Some(s) = search.as_mut() else {
+            return (self.stick, Landing::Flying);
+        };
+        match s.step(world) {
+            Search::Failed => (self.hover(self.clearance, true), Landing::Failed),
+            Search::Looking => {
+                if (target - self.at).with_y(0.0).length() < 400.0 {
+                    (self.hover(self.tuning.min_altitude, true), Landing::Flying)
+                } else {
+                    let stick = self.fly_round_to(target, 1.0, true, true, size, world, dt);
+                    (stick, Landing::Flying)
+                }
+            }
+            Search::Found(spot) => {
+                let off = (spot - self.at).with_y(0.0).length();
+                let step = s.step;
+                let clear = s.clear;
+                if self.airborne && off < step * 0.5 {
+                    return (self.land(), Landing::Flying);
+                }
+                if !self.airborne {
+                    self.stick.ahead = 0.0;
+                    self.stick.right = 0.0;
+                    self.stick.lift = -1.0;
+                    return (self.stick, Landing::Landed);
+                }
+                let stick = if off < clear {
+                    self.fly_to(spot, 1.0, true)
+                } else {
+                    self.fly_round_to(spot, 1.0, true, false, size, world, dt)
+                };
+                (stick, Landing::Flying)
+            }
+        }
     }
 
     /// Comes down to land (0x822D4848): holds its heading, works to no
