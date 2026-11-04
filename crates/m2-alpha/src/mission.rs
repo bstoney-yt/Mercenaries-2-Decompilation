@@ -7366,6 +7366,7 @@ mod tests {
             class: Some(name_hash("Rifle")),
             semi: false,
             rate_of_fire: 600.0,
+            aim_ai: 15f32.to_radians(),
             clip: 30,
             reserve_clips: 8,
             pellets: 1,

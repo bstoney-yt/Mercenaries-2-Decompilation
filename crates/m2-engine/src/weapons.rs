@@ -370,6 +370,26 @@ pub enum Flight {
     Homing,
 }
 
+/// The cosine of the cone round a vehicle's nose an AI's fixed vehicle
+/// gun fires inside, for its weapon's [`WeaponSpec::aim_ai`]: from the
+/// 360 code, the weapon's build (0x823F8D90) keeps cos(`MaxAimAngleAi`),
+/// and the AI's vehicle attack (0x822C95D8, 0x822CAB34) fires only when
+/// the way to its target is that close to the nose, else turns to face
+/// it. A vehicle gun whose angle is 0 keeps 0 (a quarter turn either way;
+/// only hand-held weapons take 0.98 instead).
+pub fn ai_aim_cosine(aim_ai: f32) -> f32 {
+    if aim_ai == 0.0 { 0.0 } else { aim_ai.cos() }
+}
+
+/// How much wider than its arc and tilt an AI's turret weapon may fire,
+/// radians, for its weapon's [`WeaponSpec::aim_ai`]: from the 360 code,
+/// 0x822EF8C8 widens the turret's limits, kept in degrees, by
+/// acos(cos `MaxAimAngleAi`), in radians, so 15 degrees widens them by
+/// 0.26 of a degree. The 360's mix of units, kept.
+pub fn ai_turret_margin(aim_ai: f32) -> f32 {
+    aim_ai.to_radians()
+}
+
 /// A gun: any weapon template with a `WeaponProjectileBase`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WeaponSpec {
@@ -382,6 +402,10 @@ pub struct WeaponSpec {
     /// One shot a pull (`FireType` 1).
     pub semi: bool,
     pub rate_of_fire: f32,
+    /// How far off an AI's aim it may fire, radians (`MaxAimAngleAi`,
+    /// 15 degrees when its record gives none; the firing record's +0x18,
+    /// schema 0x823EED38). From the 360 code ([`ai_aim_cosine`]).
+    pub aim_ai: f32,
     pub clip: u32,
     pub reserve_clips: u32,
     pub pellets: u32,
@@ -1128,6 +1152,10 @@ pub fn read(db: &Layer<'_>) -> Arms {
                     class: class_of(id),
                     semi: w("FireType") == Some(1),
                     rate_of_fire: base.float(r, name_hash("RateOfFire")).unwrap_or(60.0),
+                    aim_ai: base
+                        .float(r, name_hash("MaxAimAngleAi"))
+                        .unwrap_or(15.0)
+                        .to_radians(),
                     clip: w("iClipSize").map_or(1, |c| c & 0xffff).max(1),
                     reserve_clips: w("MaxAmmoReserve").map_or(0, |c| c & 0xff),
                     pellets: w("iBulletsPerShot").map_or(1, |c| c & 0xff).max(1),
@@ -1286,6 +1314,17 @@ pub fn read(db: &Layer<'_>) -> Arms {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An AI's fixed vehicle gun fires inside cos(MaxAimAngleAi) of its
+    // nose (a quarter turn for 0); its turret's limits widen by that
+    // angle's radians read as degrees (0x823F8D90, 0x822EF8C8).
+    #[test]
+    fn ai_vehicle_guns_fire_inside_their_cone_and_turret_margin() {
+        let deg15 = 15f32.to_radians();
+        assert!((ai_aim_cosine(deg15) - 0.965_926).abs() < 1e-5);
+        assert_eq!(ai_aim_cosine(0.0), 0.0);
+        assert!((ai_turret_margin(deg15) - 0.261_799f32.to_radians()).abs() < 1e-7);
+    }
 
     #[test]
     fn aim_assist_draws_her_aim_onto_a_target_within_its_window() {
@@ -1458,6 +1497,7 @@ mod tests {
                 class: None,
                 semi: false,
                 rate_of_fire: 400.0,
+                aim_ai: 15f32.to_radians(),
                 clip: 100,
                 reserve_clips: 0,
                 pellets: 1,
@@ -1653,6 +1693,7 @@ mod tests {
             class: None,
             semi: false,
             rate_of_fire: 120.0,
+            aim_ai: 15f32.to_radians(),
             clip: 8,
             reserve_clips: 0,
             pellets: 1,
