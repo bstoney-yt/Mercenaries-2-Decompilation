@@ -1420,14 +1420,26 @@ impl Game {
                     && let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id))
                 {
                     let f = at.transform_vector3(Vec3::Z);
+                    // Turned on from where it was last asked to (on its own
+                    // body it lags that, [`m2_engine::Physics::turret_target`]).
+                    let target =
+                        v.id.and_then(|id| physics.turret_target(id))
+                            .unwrap_or(v.turret);
                     let mut turn =
-                        (player.yaw - f.x.atan2(f.z) - v.turret).rem_euclid(std::f32::consts::TAU);
+                        (player.yaw - f.x.atan2(f.z) - target).rem_euclid(std::f32::consts::TAU);
                     if turn > std::f32::consts::PI {
                         turn -= std::f32::consts::TAU;
                     }
                     let turret = v.spec.tuning.turret;
                     let rate = turret.map_or(TURRET_RATE, |t| t.yaw_speed);
-                    v.turret += turn.clamp(-rate * dt, rate * dt);
+                    // Asked at its turn rate; drawn where its own body has got
+                    // to, if it has one ([`m2_engine::Physics::turret_yaw`]).
+                    let asked = target + turn.clamp(-rate * dt, rate * dt);
+                    v.turret = asked;
+                    if let Some(id) = v.id {
+                        physics.turn_turret(id, asked);
+                        v.turret = physics.turret_yaw(id).unwrap_or(asked);
+                    }
                     if let Some(pivot) = v.spec.gun_pivot {
                         let goal = Combat::aim_point(physics, &scene.people, player, v.id);
                         // The crosshair's point as seen from the gun with

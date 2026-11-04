@@ -36,6 +36,11 @@ pub struct HumanMotion {
     /// `CrouchWalkSpeed`, m/s: the pace crouched, which is how the 360
     /// aims in (every hero 1.5).
     pub crouch_walk: f32,
+    /// `ProxyCapsuleRadius` and `ProxyCapsuleHeight`, metres: the
+    /// standing capsule runs from the feet to the full height (the
+    /// constructor's first shape, 0x821771B0).
+    pub capsule_radius: f32,
+    pub capsule_height: f32,
 }
 
 impl Default for HumanMotion {
@@ -47,6 +52,8 @@ impl Default for HumanMotion {
             max_air_speed: 4.0,
             paces: [1.2, 2.5, 5.0, -1.0],
             crouch_walk: 1.5,
+            capsule_radius: 0.4,
+            capsule_height: 1.8,
         }
     }
 }
@@ -54,7 +61,7 @@ impl Default for HumanMotion {
 /// The field name hashes [`HumanMotion`] is read from, in its order:
 /// `JumpHeight`, `Gravity`, `MaxRotationSpeed`, `MaxAirSpeed`, the four
 /// `Upright` paces and `CrouchWalkSpeed`.
-pub const FIELDS: [&str; 9] = [
+pub const FIELDS: [&str; 11] = [
     "JumpHeight",
     "Gravity",
     "MaxRotationSpeed",
@@ -64,11 +71,13 @@ pub const FIELDS: [&str; 9] = [
     "UprightRunSpeed",
     "UprightSprintSpeed",
     "CrouchWalkSpeed",
+    "ProxyCapsuleRadius",
+    "ProxyCapsuleHeight",
 ];
 
 impl HumanMotion {
     /// From the eight fields in [`FIELDS`]' order.
-    pub fn from_fields(f: [f32; 9]) -> Self {
+    pub fn from_fields(f: [f32; 11]) -> Self {
         Self {
             jump_height: f[0],
             gravity: f[1],
@@ -76,6 +85,8 @@ impl HumanMotion {
             max_air_speed: f[3],
             paces: [f[4], f[5], f[6], f[7]],
             crouch_walk: f[8],
+            capsule_radius: f[9],
+            capsule_height: f[10],
         }
     }
 
@@ -491,6 +502,8 @@ mod tests {
             max_air_speed: 12.0,
             paces: [2.0, 5.0, 7.0, 12.0],
             crouch_walk: 1.5,
+            capsule_radius: 0.4,
+            capsule_height: 1.8,
         }
     }
 
@@ -791,5 +804,63 @@ mod people_tests {
         assert_eq!(steer(v, Vec2::ZERO, dt), Vec2::ZERO);
         // Asked straight back, they stop before going the other way.
         assert_eq!(steer(v, -want, dt).length(), 0.0);
+    }
+}
+
+/// Havok's character on-ground state, as the 360 builds it (0x8268D398):
+/// each step the velocity over the ground closes this share of its gap to
+/// what is wanted (0x82053618)...
+pub const GROUND_GAIN: f32 = 0.95;
+/// ...changing by at most this much a second, m/s² (0x820516B4).
+pub const GROUND_MAX_ACCEL: f32 = 200.0;
+/// Off the ground for less than this, seconds (0x82DE88B0), a person
+/// still steers as on it ("ledge grace", 0x82171330), the change capped at
+/// [`LEDGE_MAX_CHANGE`] m/s a step whatever the step, falling meanwhile.
+pub const LEDGE_GRACE: f32 = 0.25;
+pub const LEDGE_MAX_CHANGE: f32 = 100.0;
+/// In the air (past the grace, and from the start of a jump), Havok's
+/// in-air state steers the same way towards the stick times the
+/// template's `MaxAirSpeed`, with this gain a step and change capped at
+/// [`AIR_MAX_ACCEL`] m/s² (research thread, 360 notes s16); the vertical
+/// speed is left to gravity.
+pub const AIR_GAIN: f32 = 0.07;
+pub const AIR_MAX_ACCEL: f32 = 50.0;
+
+/// The horizontal velocity after one Havok step of `dt` from `current`
+/// towards `wanted` (0x8268DD08): the gap times [`GROUND_GAIN`], its
+/// length capped at `max_change` ([`GROUND_MAX_ACCEL`] x `dt` on the
+/// ground, [`LEDGE_MAX_CHANGE`] in the grace). Per step, so it depends on
+/// the step's length as the 360's does.
+pub fn ground_step(current: Vec2, wanted: Vec2, max_change: f32) -> Vec2 {
+    gain_step(current, wanted, GROUND_GAIN, max_change)
+}
+
+/// [`ground_step`] with gain `gain`.
+pub fn gain_step(current: Vec2, wanted: Vec2, gain: f32, max_change: f32) -> Vec2 {
+    let d = wanted - current;
+    let change = d * gain;
+    let len = change.length();
+    if len > max_change && len > 0.0 {
+        current + change * (max_change / len)
+    } else {
+        current + change
+    }
+}
+
+#[cfg(test)]
+mod ground_tests {
+    use super::*;
+
+    #[test]
+    fn havok_closes_ninety_five_percent_of_the_gap_a_step() {
+        let dt = 1.0 / 60.0;
+        // 0 to 5 m/s: 4.75 asked of the first step, capped at 200 x dt.
+        let v = ground_step(Vec2::ZERO, Vec2::new(0.0, 5.0), GROUND_MAX_ACCEL * dt);
+        assert!((v.y - 3.333).abs() < 1e-3, "{v}");
+        let v = ground_step(v, Vec2::new(0.0, 5.0), GROUND_MAX_ACCEL * dt);
+        assert!((v.y - (3.333 + 0.95 * 1.667)).abs() < 1e-2, "{v}");
+        // In the ledge grace the cap is 100 m/s a step: the 95% stands.
+        let v = ground_step(Vec2::ZERO, Vec2::new(0.0, 5.0), LEDGE_MAX_CHANGE);
+        assert!((v.y - 4.75).abs() < 1e-4);
     }
 }
