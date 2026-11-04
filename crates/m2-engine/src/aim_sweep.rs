@@ -41,6 +41,32 @@
 //!   (2.0 at 0x820C77A4 over 0.1 at 0x82DE88AC; the series terms 0.48
 //!   and 0.235 at 0x820F8C60 and 0x820F8C64).
 //!
+//! How the aim mixes with the crouched stance (round 11), from the same
+//! node: its `MoveAim` blend has four inputs, the aim movement
+//! (`AimMovementNodes`, the nine `Crouch_Aim_*` gaits and shuffles), the
+//! loose movement, the aim (`AimNodes`) and `TTNoAimNodes`. Its init
+//! (0x82804AE8) gives three of them a weight per bone (0x827FA2A8), from
+//! fixed tables (0x82412CE0): the aim movement the `lowerbody` table
+//! ([`LOWER_BODY`], at 0x82B76110), the aim and `TTNoAimNodes` the table
+//! 0x2CA54698 ([`UPPER_BODY`], at 0x82B762F0, the same 48 bones as the
+//! `upperbody` table at 0x82B76168), all at 1 and every other bone at 0.
+//! Aiming (0x828071A8: on 0x8280B6E8 and 0x8280AE60) fades in the aim
+//! movement and the aim and fades the loose movement out, so the legs
+//! play the crouched clip and the upper body the aim. The blend's
+//! weighted inputs (0x827F9C28, mode 0) are shared per bone, and a bone
+//! neither table names falls to the skeleton's reference pose.
+//!
+//! The aim is itself a blend (`AimNodes`): the sweeps' pitch blend
+//! (`AimNodes_StaticSweep`) and, laid over it as an additive input (mode
+//! 1, set by 0x827FA550), the aim movement's motion from its start
+//! (0x8280FD50's difference node: the movement less `AimReferenceNodes`,
+//! the same clips bound again and held at their start). So the upper body
+//! still bobs and sways with the crouched gait. That input's weight is
+//! set each step (0x8280AED8, port +0x1048) to [`layer_weight`]: a smooth
+//! value noise ([`value_noise`], 0x825736B0) of the node's clock (+0x1588)
+//! times 2 (0x82003CF4), scaled by 1 and raised by 0.5, or a steady 0.5 for
+//! a pistol (the equipment class `pistol`, 0xD48C7D34; init 0x82805E18).
+//!
 //! **Inferred**: how the group's blend shares its inputs. Standing, the
 //! sweep and its firing clip are a crossfade (1 - w and w). Moving, the
 //! moving sweep's input is set to the node's +0x158C path (taken as 1)
@@ -130,6 +156,149 @@ pub fn fire_share(w: f32, moving: bool) -> f32 {
     if moving { w / (1.0 + w) } else { w }
 }
 
+/// The bones the crouched aim movement poses (the 360's `lowerbody`
+/// table, 0x82B76110): the pelvis, hips, and each leg's thigh, calf, foot
+/// and toe, by name hash.
+pub const LOWER_BODY: [u32; 10] = [
+    0xfaef_b386,
+    0x24c5_009c,
+    0x7685_3d12,
+    0xa76c_9842,
+    0x1226_f58d,
+    0x901f_6d22,
+    0xc229_9ac4,
+    0x0163_705c,
+    0x3120_671b,
+    0x9723_4644,
+];
+
+/// The bones the aim poses (table 0x2CA54698, at 0x82B762F0): the spine,
+/// neck, head, arms, hands and fingers, by name hash. Not the face.
+pub const UPPER_BODY: [u32; 48] = [
+    0x5ca4_9bd8,
+    0x66a2_6cff,
+    0x4c77_33ed,
+    0xa6ef_dd4f,
+    0xc187_105b,
+    0x705c_4508,
+    0xa3a5_094a,
+    0xb2c9_ce63,
+    0xbefc_09a2,
+    0x0371_9eef,
+    0xeb6f_1b2d,
+    0xfa76_1573,
+    0xca00_61a5,
+    0x67f9_0b9a,
+    0x49fb_1af7,
+    0xa622_1fbb,
+    0x8c24_3564,
+    0xa626_9ce9,
+    0x7f5d_343e,
+    0x2164_ef09,
+    0x0762_8784,
+    0x1ce7_3684,
+    0xb6e4_575b,
+    0x94e1_e33e,
+    0x0cc7_1f3f,
+    0x02c9_4e18,
+    0x2ccb_cecd,
+    0xba8c_a3a8,
+    0x20f6_35d9,
+    0x23f6_f598,
+    0x328c_1f25,
+    0xd34f_7713,
+    0xf450_ed0d,
+    0x248e_1087,
+    0xfa90_0d00,
+    0x2492_8db5,
+    0xe1bb_4731,
+    0x5fb3_bec6,
+    0x81b6_32e3,
+    0x8def_bc44,
+    0x27ec_dd1b,
+    0x05ea_68fe,
+    0x54c6_c05e,
+    0x76cd_b1a9,
+    0x5ccb_4a24,
+    0x163f_93bd,
+    0x9438_0b52,
+    0xb63a_7f6f,
+];
+
+/// Which part of an aiming body a bone (by name hash) follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// The crouched gait ([`LOWER_BODY`]).
+    Legs,
+    /// The aim, the gait's motion laid over it ([`UPPER_BODY`]).
+    Aim,
+    /// Neither: the skeleton's reference pose.
+    Rest,
+}
+
+/// The part of an aiming body the bone named `hash` follows.
+pub fn part(hash: u32) -> Part {
+    if LOWER_BODY.contains(&hash) {
+        Part::Legs
+    } else if UPPER_BODY.contains(&hash) {
+        Part::Aim
+    } else {
+        Part::Rest
+    }
+}
+
+/// How fast the layer's noise runs, per second of the node's clock
+/// (0x82003CF4).
+pub const LAYER_RATE: f32 = 2.0;
+
+/// The weight of the crouched gait's motion over the aim, the node's
+/// clock `clock` seconds in: `0.5 + noise(2 clock)`, or 0.5 for a pistol
+/// (see the module documentation). About 0 to 1; not clamped, as the
+/// 360 does not.
+pub fn layer_weight(clock: f32, pistol: bool) -> f32 {
+    let scale = if pistol { 0.0 } else { 1.0 };
+    value_noise(clock * LAYER_RATE, 0.5) * scale + 0.5
+}
+
+/// The 360's smooth value noise at (`x`, `y`), -1 to 1 (0x825736B0): the
+/// lattice's [`smoothed`] values round the point, blended in straight
+/// lines across the cell.
+pub fn value_noise(x: f32, y: f32) -> f32 {
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let (xi, yi) = (x0 as i32, y0 as i32);
+    let s = |dx: i32, dy: i32| smoothed(xi.wrapping_add(dx), yi.wrapping_add(dy));
+    let near = s(0, 0) * (1.0 - fx) + s(1, 0) * fx;
+    let far = s(0, 1) * (1.0 - fx) + s(1, 1) * fx;
+    near * (1.0 - fy) + far * fy
+}
+
+/// A lattice point's value with its neighbours' (0x825733B8): a quarter of
+/// its own, an eighth of each side's, a sixteenth of each corner's.
+pub fn smoothed(x: i32, y: i32) -> f32 {
+    let at = |dx: i32, dy: i32| {
+        lattice(
+            x.wrapping_add(dx)
+                .wrapping_add(y.wrapping_add(dy).wrapping_mul(57)),
+        )
+    };
+    let corners = at(-1, -1) + at(1, -1) + at(-1, 1) + at(1, 1);
+    let sides = at(-1, 0) + at(1, 0) + at(0, -1) + at(0, 1);
+    at(0, 0) * 0.25 + sides * 0.125 + corners * 0.0625
+}
+
+/// The lattice's value for key `n` (x + 57 y), -1 to 1 (0x825733B8): an
+/// integer hash, `n` mixed by a shift of 13, cubed with odd constants,
+/// its low 31 bits scaled by 2^-30 from 1.
+pub fn lattice(n: i32) -> f32 {
+    let n = (n << 13) ^ n;
+    let v = n
+        .wrapping_mul(n.wrapping_mul(n).wrapping_mul(15731).wrapping_add(789_221))
+        .wrapping_add(1_376_312_589)
+        & 0x7fff_ffff;
+    1.0 - v as f32 / 1_073_741_824.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +346,39 @@ mod tests {
         assert_eq!(fire_share(0.0, false), 0.0);
         assert_eq!(fire_share(0.5, false), 0.5);
         assert!((fire_share(1.0, true) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_tables_split_the_body() {
+        // The tables share no bone; both hands are the aim's, the pelvis
+        // the legs'.
+        assert!(LOWER_BODY.iter().all(|h| !UPPER_BODY.contains(h)));
+        assert_eq!(part(0xd34f_7713), Part::Aim);
+        assert_eq!(part(0xeb6f_1b2d), Part::Aim);
+        assert_eq!(part(0xfaef_b386), Part::Legs);
+        // The skeleton's root and a face bone rest.
+        assert_eq!(part(0xcbc1_eb51), Part::Rest);
+        assert_eq!(part(0xbdff_6658), Part::Rest);
+    }
+
+    #[test]
+    fn the_layer_weight_wanders_round_a_half() {
+        // The lattice's hash at 0: 1 - 1376312589 / 2^30.
+        assert!((lattice(0) + 0.281_791).abs() < 1e-5, "{}", lattice(0));
+        assert_eq!(layer_weight(3.7, true), 0.5);
+        // On a lattice line the noise is the cell's two points' mean.
+        let at = value_noise(4.0, 0.5);
+        assert!((at - (smoothed(4, 0) + smoothed(4, 1)) * 0.5).abs() < 1e-6);
+        // Smooth and within -1..1; it moves, and about a half on average.
+        let (mut sum, mut last, mut low, mut high) = (0.0, layer_weight(0.0, false), 9f32, -9f32);
+        for i in 1..=6000 {
+            let w = layer_weight(i as f32 / 60.0, false);
+            assert!((-0.5..=1.5).contains(&w));
+            assert!((w - last).abs() < 0.05, "a jump at {i}: {last} to {w}");
+            (sum, last, low, high) = (sum + w, w, low.min(w), high.max(w));
+        }
+        assert!(high - low > 0.2, "{low} {high}");
+        assert!((sum / 6000.0 - 0.5).abs() < 0.15, "{}", sum / 6000.0);
     }
 
     #[test]

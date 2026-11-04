@@ -44,6 +44,25 @@ impl Local {
         }
     }
 
+    /// `self` with the motion of `moved` from `reference` laid over it,
+    /// by `w` (0 keeps `self`): an additive layer, as the 360's blend
+    /// node adds an input of mode 1 (0x827F9C28), the motion made by its
+    /// difference node (0x8280FC28: `moved` after `reference` undone).
+    /// The motion goes before `self` (`motion * self`), its translation
+    /// carried through it. Inferred: that order, as the 360's transform
+    /// helpers there (0x82193E78, 0x82193548) are vector code not
+    /// decoded. Scale is kept.
+    pub fn layered(&self, moved: &Self, reference: &Self, w: f32) -> Self {
+        let turn = (moved.rotation * reference.rotation.inverse()).normalize();
+        let shift = moved.translation - turn * reference.translation;
+        let full = Self {
+            translation: turn * self.translation + shift,
+            rotation: (turn * self.rotation).normalize(),
+            scale: self.scale,
+        };
+        self.lerp(&full, w)
+    }
+
     fn from_matrix(m: Mat4) -> Self {
         let (scale, rotation, translation) = m.to_scale_rotation_translation();
         Self {
@@ -913,12 +932,39 @@ impl Animator {
 
     /// The blended pose, root pinned.
     pub fn pose(&self, skeleton: &Skeleton, clips: &[BoundClip]) -> Pose {
+        let mut pose = self.gait_pose(skeleton, clips, false);
+        if let Some(u) = &self.upper
+            && let Some(c) = clips.get(u.clip)
+        {
+            let over = if u.once {
+                c.sample(skeleton, u.time.min(c.info.duration))
+            } else {
+                c.sample_looped(skeleton, u.time)
+            };
+            for ((local, mine), on) in pose.0.iter_mut().zip(over.0).zip(u.mask.iter()) {
+                if *on {
+                    *local = mine;
+                }
+            }
+        }
+        pose
+    }
+
+    /// The gait's pose alone (the clip playing, blended from the one
+    /// before), without the clip over the upper body, root pinned. With
+    /// `from_start`, each clip at its start, blended alike: the 360's aim
+    /// reference (`AimReferenceNodes`, 0x82802B10), the aim movement's
+    /// clips bound again (0x82804AE8) and never moved on from their start
+    /// (the movement's steps, 0x82808468 and 0x82809D60, time the
+    /// movement's nodes and only the two shuffles' references).
+    pub fn gait_pose(&self, skeleton: &Skeleton, clips: &[BoundClip], from_start: bool) -> Pose {
         let sample = |p: Playing| {
             clips.get(p.clip).map(|c| {
+                let time = if from_start { 0.0 } else { p.time };
                 let mut pose = if p.once {
-                    c.sample(skeleton, p.time.min(c.info.duration))
+                    c.sample(skeleton, time.min(c.info.duration))
                 } else {
-                    c.sample_looped(skeleton, p.time)
+                    c.sample_looped(skeleton, time)
                 };
                 pose.strip_root_motion(skeleton.root(), c.info.pin);
                 if let Some(hips) = p.level
@@ -936,20 +982,6 @@ impl Animator {
         if let Some(mut from) = self.previous.and_then(sample) {
             from.blend(&pose, self.fade);
             pose = from;
-        }
-        if let Some(u) = &self.upper
-            && let Some(c) = clips.get(u.clip)
-        {
-            let over = if u.once {
-                c.sample(skeleton, u.time.min(c.info.duration))
-            } else {
-                c.sample_looped(skeleton, u.time)
-            };
-            for ((local, mine), on) in pose.0.iter_mut().zip(over.0).zip(u.mask.iter()) {
-                if *on {
-                    *local = mine;
-                }
-            }
         }
         pose
     }
@@ -1014,6 +1046,33 @@ mod tests {
                 Mat4::from_translation(Vec3::new(0.0, -1.5, 0.0)),
             ],
         }
+    }
+
+    #[test]
+    fn a_layer_adds_the_motion_from_its_reference() {
+        let at = |y: f32, turn: f32| Local {
+            translation: Vec3::new(0.0, y, 0.0),
+            rotation: Quat::from_rotation_x(turn),
+            scale: Vec3::ONE,
+        };
+        let base = at(0.5, 0.3);
+        let (reference, moved) = (at(1.0, 0.1), at(0.9, 0.25));
+        // No motion: the base kept, whatever the weight.
+        let same = base.layered(&reference, &reference, 1.0);
+        assert!(same.rotation.abs_diff_eq(base.rotation, 1e-6));
+        assert!(same.translation.abs_diff_eq(base.translation, 1e-6));
+        // Over the reference itself, all of it gives the moved pose.
+        let full = reference.layered(&moved, &reference, 1.0);
+        assert!(full.rotation.abs_diff_eq(moved.rotation, 1e-5));
+        assert!(full.translation.abs_diff_eq(moved.translation, 1e-5));
+        // Half of it turns the base half the motion's turn (0.15).
+        let half = base.layered(&moved, &reference, 0.5);
+        assert!((half.rotation.angle_between(base.rotation) - 0.075).abs() < 1e-4);
+        assert!(
+            base.layered(&moved, &reference, 0.0)
+                .rotation
+                .abs_diff_eq(base.rotation, 1e-6)
+        );
     }
 
     #[test]

@@ -98,11 +98,17 @@ pub struct Rig {
     /// The rifle's aim sweeps ([`m2_engine::aim_sweep`]), found once.
     pub(crate) sweeps: std::sync::OnceLock<Option<Sweeps>>,
     /// The sweeps pose the upper body alone, standing too: a hero's, who
-    /// aims in crouched ([`Rig::set_sweeps`]).
+    /// aims in crouched ([`Rig::set_sweeps`]). The bones are the 360's
+    /// ([`m2_engine::aim_sweep::part`]), the crouched gait's motion laid
+    /// over the aim.
     pub sweep_upper: bool,
     /// The weight of the firing sweeps, kicked by each shot
     /// ([`Rig::fired`]).
     pub kick: m2_engine::aim_sweep::Kick,
+    /// The locomotion node's clock, seconds (the 360's +0x1588): runs the
+    /// noise of the crouched gait's weight over the aim
+    /// ([`m2_engine::aim_sweep::layer_weight`]).
+    pub aim_clock: f32,
     /// The arm that carries the rifle low, found once.
     pub(crate) arm: std::sync::OnceLock<Option<Arc<[bool]>>>,
     /// The clips' events met and not yet taken: (clip, event).
@@ -712,6 +718,7 @@ impl Rig {
             sweeps: Default::default(),
             sweep_upper: false,
             kick: Default::default(),
+            aim_clock: 0.0,
             arm: Default::default(),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
@@ -776,6 +783,7 @@ impl Rig {
             sweeps: Default::default(),
             sweep_upper: false,
             kick: Default::default(),
+            aim_clock: 0.0,
             arm: Default::default(),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
@@ -808,6 +816,7 @@ impl Rig {
             sweeps: Default::default(),
             sweep_upper: false,
             kick: Default::default(),
+            aim_clock: 0.0,
             animator: Animator::default(),
             cues: Vec::new(),
             ..self.clone()
@@ -825,6 +834,7 @@ impl Rig {
         self.cues.drain(..over);
         self.animator.advance(dt);
         self.kick.step(dt);
+        self.aim_clock += dt;
     }
 
     /// A shot fired from the gun she holds: the firing sweeps kicked in
@@ -957,8 +967,8 @@ impl Rig {
         let mut yaw = w.x.atan2(w.z) - forward.x.atan2(forward.y);
         yaw = (yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
         let pitch = w.y.clamp(-1.0, 1.0).asin();
-        // A hero aims in crouched (`Crouched` stance): her legs keep the
-        // crouched clip and the sweep poses her upper body, standing too.
+        // A hero aims in crouched (`Crouched` stance), standing too: the
+        // 360's bone tables split her body below.
         let hero = self.sweep_upper;
         let moving = self.animator.upper().is_some();
         let set = sets.aim[usize::from(moving)];
@@ -990,7 +1000,32 @@ impl Rig {
         } else if high > 0.0 {
             aimed.blend(&group(2), high / (high + mid));
         }
-        match self.upper.as_ref().filter(|_| moving || hero) {
+        if hero {
+            // The 360's mix (`MoveAim`): the legs keep the crouched gait,
+            // the upper body takes the aim with the gait's motion from its
+            // start laid over it, and the rest (the face, the hips'
+            // helpers) the reference pose. The root stays the gait's, as
+            // it carries her place.
+            let gait = self.animator.gait_pose(&self.skeleton, &self.clips, false);
+            let start = self.animator.gait_pose(&self.skeleton, &self.clips, true);
+            let w = aim_sweep::layer_weight(self.aim_clock, false);
+            let rest = self.skeleton.rest_pose();
+            let parts = self
+                .skeleton
+                .name_hashes
+                .iter()
+                .map(|&h| aim_sweep::part(h));
+            for (i, (local, part)) in pose.0.iter_mut().zip(parts).enumerate() {
+                *local = match part {
+                    aim_sweep::Part::Legs => gait.0[i],
+                    aim_sweep::Part::Aim => aimed.0[i].layered(&gait.0[i], &start.0[i], w),
+                    aim_sweep::Part::Rest if i != root => rest.0[i],
+                    aim_sweep::Part::Rest => *local,
+                };
+            }
+            return true;
+        }
+        match self.upper.as_ref().filter(|_| moving) {
             Some(mask) => {
                 for ((local, mine), on) in pose.0.iter_mut().zip(aimed.0).zip(mask.iter()) {
                     if *on {
