@@ -4192,6 +4192,7 @@ pub(crate) mod tests {
             aim: None,
             hands: Default::default(),
             sweeps: Default::default(),
+            sweep_upper: false,
             arm: Default::default(),
             cues: Vec::new(),
             own: Default::default(),

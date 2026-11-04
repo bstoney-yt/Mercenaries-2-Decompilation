@@ -88,6 +88,9 @@ pub struct Rig {
     /// The rifle's aim sweeps, standing and moving, each low, mid and
     /// high ([`m2_engine::aim_sweep`]), found once.
     pub(crate) sweeps: std::sync::OnceLock<Option<[[usize; 3]; 2]>>,
+    /// The sweeps pose the upper body alone, standing too: a hero's, who
+    /// aims in crouched ([`Rig::set_sweeps`]).
+    pub sweep_upper: bool,
     /// The arm that carries the rifle low, found once.
     pub(crate) arm: std::sync::OnceLock<Option<Arc<[bool]>>>,
     /// The clips' events met and not yet taken: (clip, event).
@@ -689,6 +692,7 @@ impl Rig {
             aim: None,
             hands: Default::default(),
             sweeps: Default::default(),
+            sweep_upper: false,
             arm: Default::default(),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
@@ -751,6 +755,7 @@ impl Rig {
             aim: None,
             hands: Default::default(),
             sweeps: Default::default(),
+            sweep_upper: false,
             arm: Default::default(),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
@@ -781,6 +786,7 @@ impl Rig {
             scripted: None,
             hands: Default::default(),
             sweeps: Default::default(),
+            sweep_upper: false,
             animator: Animator::default(),
             cues: Vec::new(),
             ..self.clone()
@@ -872,13 +878,14 @@ impl Rig {
     /// aim clip.
     pub fn set_sweeps(&mut self, sweeps: Option<[[usize; 3]; 2]>) {
         self.sweeps = std::sync::OnceLock::from(sweeps);
+        self.sweep_upper = true;
     }
 
     /// The rifle's sweep clips, standing and moving, if this rig has them:
     /// the people's by the generic rifle rows, a hero's as
     /// [`set_sweeps`](Self::set_sweeps) gave them.
     fn sweep_clips(&self) -> Option<[[usize; 3]; 2]> {
-        if !self.own.is_empty() {
+        if self.sweep_upper || !self.own.is_empty() {
             return self.sweeps.get().copied().flatten();
         }
         *self.sweeps.get_or_init(|| {
@@ -917,7 +924,7 @@ impl Rig {
         let pitch = w.y.clamp(-1.0, 1.0).asin();
         // A hero aims in crouched (`Crouched` stance): her legs keep the
         // crouched clip and the sweep poses her upper body, standing too.
-        let hero = !self.own.is_empty();
+        let hero = self.sweep_upper;
         let moving = self.animator.upper().is_some();
         let set = sets[usize::from(moving)];
         let at = aim_sweep::phase(yaw);
