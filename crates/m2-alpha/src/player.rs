@@ -200,8 +200,11 @@ pub struct Intent {
     pub jump: bool,
     /// Jump held: the brake when driving, climbing in a helicopter.
     pub hold_jump: bool,
-    /// Crouch held: coming down in a helicopter.
+    /// Crouch held.
     pub lower: bool,
+    /// Reload held: coming down in a helicopter (the game's own hint,
+    /// "[jump] Ascend [reload] Descend", string c926a880).
+    pub reload_held: bool,
     /// Get in or out of a vehicle.
     pub use_pressed: bool,
     /// Turn an overturned vehicle back up.
@@ -241,6 +244,7 @@ impl Intent {
             jump: input.take_pressed(Action::MoveUp),
             hold_jump: input.held(Action::MoveUp),
             lower: input.held(Action::MoveDown),
+            reload_held: input.held(Action::Reload),
             use_pressed: input.take_pressed(Action::Use),
             right_vehicle: input.take_pressed(Action::Reset),
             honk: input.held(Action::Melee),

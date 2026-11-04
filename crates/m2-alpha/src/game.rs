@@ -1393,7 +1393,8 @@ impl Game {
                     );
                     physics.fly(
                         id,
-                        f32::from(u8::from(intent.hold_jump)) - f32::from(u8::from(intent.lower)),
+                        f32::from(u8::from(intent.hold_jump))
+                            - f32::from(u8::from(intent.reload_held)),
                     );
                     if intent.right_vehicle {
                         physics.right_vehicle(id);
