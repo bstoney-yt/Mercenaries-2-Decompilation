@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "template\tcount\tfwd m/s\tmin alt\tto 30 m s\tover m\tlast 5 s err m\tdrift m\tto 400 m s\tfastest m/s\tends off m"
+        "template\tcount\tfwd m/s\tmin alt\tto 30 m s\tover m\tlast 5 s err m\tdrift m\tto 400 m s\tfastest m/s\tends off m	land s	round wall s	wall clear m"
     );
     for ((model, _), ids) in &groups {
         let mut ids = ids.clone();
@@ -127,8 +127,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         let off = (place(&p, vid) - goal).length();
+        // Down from where it stopped.
+        let mut landed = f32::NAN;
+        for i in 0..(60.0 / DT) as usize {
+            think(&mut p, vid, &mut pilot);
+            let stick = pilot.land();
+            p.pilot_helicopter(vid, stick);
+            p.step(DT);
+            if landed.is_nan() && pilot.clearance < 0.3 {
+                landed = (i + 1) as f32 * DT;
+            }
+        }
+        let (round, clear) = round_the_wall(&spec, &flight, pilot_tuning);
         println!(
-            "{name}\t{}\t{:.0}\t{:.0}\t{reached:.2}\t{top:.2}\t{:.2}\t{drift:.2}\t{arrived:.1}\t{fastest:.1}\t{off:.2}",
+            "{name}\t{}\t{:.0}\t{:.0}\t{reached:.2}\t{top:.2}\t{:.2}\t{drift:.2}\t{arrived:.1}\t{fastest:.1}\t{off:.2}\t{landed:.1}\t{round:.1}\t{clear:.1}",
             ids.len(),
             flight.forward,
             pilot_tuning.min_altitude,
@@ -136,6 +148,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     Ok(())
+}
+
+/// From a hover 30 m up, flown round things ([`HeliPilot::fly_round_to`])
+/// to 300 m ahead at 30 m past a wall 60 m high and 40 m wide across its
+/// way halfway: how long until it is within 5 m, and the least its
+/// underside cleared the wall's top by passing it (negative: under it).
+fn round_the_wall(
+    spec: &VehicleSpec,
+    flight: &m2_engine::tuning::FlightTuning,
+    tuning: PilotTuning,
+) -> (f32, f32) {
+    let (mut p, vid) = start(spec);
+    let at = place(&p, vid);
+    let wall = CollisionShape::cuboid(Vec3::new(20.0, 30.0, 2.0));
+    p.add_static(
+        StaticKey::Cell(2),
+        &wall,
+        Vec3::new(at.x, 30.0, at.z + 150.0),
+        Quat::IDENTITY,
+    );
+    let mut pilot = HeliPilot::new(tuning, flight);
+    for _ in 0..(20.0 / DT) as usize {
+        think(&mut p, vid, &mut pilot);
+        let stick = pilot.hover(HOVER, true);
+        p.pilot_helicopter(vid, stick);
+        p.step(DT);
+    }
+    let size = {
+        let (lo, hi) = spec.hull;
+        (hi.y - lo.y, (hi.x - lo.x).max(hi.z - lo.z))
+    };
+    let goal = Vec3::new(at.x, HOVER, at.z + 300.0);
+    let (mut arrived, mut clear) = (f32::NAN, f32::INFINITY);
+    for i in 0..(120.0 / DT) as usize {
+        think(&mut p, vid, &mut pilot);
+        let stick = {
+            let mut sight = m2_engine::heli_pilot::Sight {
+                physics: &p,
+                own: vid,
+            };
+            pilot.fly_round_to(goal, 1.0, true, true, size, &mut sight, DT)
+        };
+        p.pilot_helicopter(vid, stick);
+        p.step(DT);
+        let now = place(&p, vid);
+        if (now.z - (at.z + 150.0)).abs() < 3.0 {
+            clear = clear.min(now.y + spec.hull.0.y - 60.0);
+        }
+        if arrived.is_nan() && (now - goal).length() < 5.0 {
+            arrived = (i + 1) as f32 * DT;
+        }
+    }
+    (arrived, clear)
 }
 
 fn place(p: &Physics, id: VehicleId) -> Vec3 {
@@ -151,7 +216,7 @@ fn think(p: &mut Physics, id: VehicleId, pilot: &mut HeliPilot) {
     };
     let (_, turn, at) = m.to_scale_rotation_translation();
     let ground = p.ground_under(id, at);
-    pilot.sense(at, turn, p.vehicle_velocity(id), ground);
+    pilot.sense(at, turn, p.vehicle_velocity(id), ground, DT);
 }
 
 /// A level plane and the helicopter settled on it, facing +z, its stick
