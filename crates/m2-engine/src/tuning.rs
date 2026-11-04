@@ -319,6 +319,11 @@ impl FloatSpring {
 ///   at most) keeping [`steer_inertia`](Self::steer_inertia), or
 ///   [`steer_release`](Self::steer_release) with the helm let go
 ///   (0x82199548, 0x8219A390, 0x82199B08).
+/// - Its helm turns it about the world's up ([`steering`](Self::steering)
+///   and the rest; `physics::float_hull`, from 0x8219A390), as much as it
+///   sits in the water, and its springs' pushes are scaled by that share,
+///   eased toward 1 while any is in the water and 0 when none is
+///   (0x8219A248).
 /// - Under throttle its bow lifts: its bow springs feel the water stand
 ///   higher by sin([`pitch`](Self::pitch)) x its length x its lift, which
 ///   rises toward its throttle by [`pitch_up`](Self::pitch_up) a second
@@ -353,6 +358,20 @@ pub struct BoatFloat {
     /// `MaxSpeedReverse`, km/h).
     pub top: f32,
     pub reverse: f32,
+    /// How hard its helm turns it (`physics::float_hull`, 0x8219A390): `Steering`,
+    /// `NoSpeedSteering`, `LowSpeedSteering`, `HandbrakeSteerBoost` and
+    /// `AirCtrlSteering`.
+    pub steering: f32,
+    pub no_speed_steering: f32,
+    pub low_speed_steering: f32,
+    pub handbrake_boost: f32,
+    pub air_steering: f32,
+    /// How its spin about its roll, pitch and yaw axes dies down
+    /// (`AngDampRoll`, `AngDampPitch`, `AngDampYaw`; 0x8219A5E0).
+    pub ang_damp: [f32; 3],
+    /// How its engine's throttle eases to the throttle asked
+    /// (`EngineInertia`, kept each 1/60 s; 0x82198F08).
+    pub engine_inertia: f32,
 }
 
 impl BoatFloat {
@@ -382,6 +401,13 @@ impl BoatFloat {
         steer_release: 0.0,
         top: 40.0 / 3.6,
         reverse: 10.0 / 3.6,
+        steering: 2.0,
+        no_speed_steering: 0.0,
+        low_speed_steering: 0.0,
+        handbrake_boost: 0.0,
+        air_steering: 0.0,
+        ang_damp: [0.0, 0.0, 0.5],
+        engine_inertia: 0.975,
     };
 
     /// Its springs at `going` of its top speed (0 to 1).
@@ -1943,6 +1969,17 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                                 steer_release: g("SteerNoInputInertia", d.steer_release),
                                 top: g("MaxSpeed", d.top * 3.6) / 3.6,
                                 reverse: g("MaxSpeedReverse", d.reverse * 3.6) / 3.6,
+                                steering: g("Steering", d.steering),
+                                no_speed_steering: g("NoSpeedSteering", d.no_speed_steering),
+                                low_speed_steering: g("LowSpeedSteering", d.low_speed_steering),
+                                handbrake_boost: g("HandbrakeSteerBoost", d.handbrake_boost),
+                                air_steering: g("AirCtrlSteering", d.air_steering),
+                                ang_damp: [
+                                    g("AngDampRoll", d.ang_damp[0]),
+                                    g("AngDampPitch", d.ang_damp[1]),
+                                    g("AngDampYaw", d.ang_damp[2]),
+                                ],
+                                engine_inertia: g("EngineInertia", d.engine_inertia),
                             }
                         },
                     };
