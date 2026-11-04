@@ -26,8 +26,8 @@
 //! movie's own test path (taken when its `testingVAR` is set) tells it:
 //! `setPlatform`, `firstTimeLoad(true)`, `setRegion("US")` and
 //! `setTerritory("EN")`, with the platform the PC's (`PC`, which its text
-//! tables tell apart); then, once press-start is up, Enter calls
-//! `startShell` (see [`Native`]).
+//! tables tell apart); then, once press-start is up, Space (the PC's, as
+//! its prompt says; Enter too) calls `startShell` (see [`Native`]).
 //!
 //! Left at the main menu for a minute, the scripts ask for the `attract`
 //! game state and hide their menus; the game plays the attract video over
@@ -222,6 +222,14 @@ pub const MOVIE: &str = "shell";
 /// arguments.
 pub type Call = (&'static str, Vec<m2_assets::flash::avm1::Value>);
 
+/// The PC title screen's prompt, as footage of the PC game shows it
+/// (`LTIPressStart`'s text; the PC library that makes it is not read).
+const START_PROMPT: &str = "Press Space to continue.";
+
+/// The key that goes on from the title screen on the PC, Space (Flash's
+/// code), as the prompt says; Enter, which the Beta took before, still does.
+const START_KEY: i32 = 32;
+
 /// `onlineLTIIsConnected`'s pages that go on to the game: Continue's (1),
 /// New Game's (2) and the load screen's (4), as `LTIgotoGame` reads
 /// `ProfilePage`. Join Game's (3) is online, which this has none of.
@@ -408,7 +416,7 @@ impl Native {
 
     /// A key (Flash's code) going down: what to call for it.
     pub fn key(&mut self, code: i32) -> Vec<Call> {
-        if self.press_start && code == 13 {
+        if self.press_start && (code == START_KEY || code == 13) {
             self.press_start = false;
             self.started = true;
             return vec![("startShell", Vec::new())];
@@ -450,6 +458,13 @@ impl Native {
             return answered;
         }
         match name {
+            // The title screen asks the PC's library for its start key and
+            // shows the text `LTIPressStart` hands it ([`START_PROMPT`]).
+            "LTIGetStartButton" => {
+                self.pending
+                    .push(("LTIPressStart", vec![text(START_PROMPT)]));
+                true
+            }
             "LTIPauseItemChanged" => self.item_changed(arg),
             // The video screen opened: its items read as the window is,
             // and as the settings are.
@@ -914,9 +929,12 @@ mod tests {
         assert!(n.calls(&s).is_empty());
         assert!(n.key(13).is_empty());
         assert!(n.command("pressStartEnabled", "true"));
-        assert!(n.key(32).is_empty());
-        assert_eq!(names(n.key(13)), ["startShell"]);
+        // Space goes on, as the PC game's prompt says (Enter does too).
+        assert_eq!(names(n.key(32)), ["startShell"]);
         assert!(n.key(13).is_empty());
+        let mut n = Native::default();
+        assert!(n.command("pressStartEnabled", "true"));
+        assert_eq!(names(n.key(13)), ["startShell"]);
         assert!(!n.command("startMovie", "x"));
     }
 
@@ -984,7 +1002,16 @@ mod tests {
         assert!(n.library("LTIVideoCancel", "", window, &modes));
         assert!(n.library(VIDEO_ACCEPT, "", window, &modes));
         assert_eq!(n.take_news().video, None);
-        assert!(!n.library("LTIGetStartButton", "", window, &modes));
+        assert!(!n.library("LTINoSuchCall", "", window, &modes));
+        // The title screen's prompt, the PC's.
+        assert!(n.library("LTIGetStartButton", "", window, &modes));
+        let s = Settings::default();
+        let calls = n.calls(&s);
+        let prompt = calls.iter().find(|c| c.0 == "LTIPressStart").unwrap();
+        assert_eq!(
+            format!("{:?}", prompt.1),
+            format!("{:?}", [text(START_PROMPT)])
+        );
     }
 
     #[test]
