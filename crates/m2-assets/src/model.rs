@@ -884,6 +884,10 @@ pub struct StateActs {
     /// (0x83232DB0), whose sound handler (0x8235FCE8) reads the message
     /// at word 2 and the second operand at word 1.
     pub messages: Vec<(u32, u32)>,
+    /// The messages leaving it sends, as [`messages`](Self::messages):
+    /// a building's leaving its `CollapseState` sends `73aa04b8`, which
+    /// stops the rumble and plays its set's `0519d48b`.
+    pub exit_messages: Vec<(u32, u32)>,
 }
 
 /// The message a part takes when its health falls to its `NodeHealth`
@@ -964,17 +968,21 @@ impl PartStates {
                     let Some(a) = states.machines.last_mut().and_then(|m| m.acts.last_mut()) else {
                         continue;
                     };
-                    let mut first = None;
+                    let mut operands = Vec::new();
                     for pair in w.chunks_exact(2) {
                         match (pair[0], pair[1]) {
-                            (1, x) => {
-                                first.get_or_insert(x);
-                            }
+                            (1, x) => operands.push(x),
                             (2, verb) => {
                                 if verb == STOP_EMITTER {
-                                    a.stops.extend(first);
+                                    a.stops.extend(operands.first());
                                 }
-                                first = None;
+                                if verb == SEND_MESSAGE
+                                    && let Some(&message) = operands.first()
+                                {
+                                    a.exit_messages
+                                        .push((message, operands.get(1).copied().unwrap_or(0)));
+                                }
+                                operands.clear();
                             }
                             _ => break,
                         }
@@ -2105,7 +2113,7 @@ mod tests {
     #[test]
     fn a_collapse_state_sends_its_messages() {
         // As `_merida_bld_plazachurch`: its `CollapseState` sends
-        // `de60c8e2` with `5e3bcf7b`; on leaving it sends another, not read.
+        // `de60c8e2` with `5e3bcf7b`; on leaving it, `73aa04b8`.
         let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));
         let exit = || leaf(b"CHDR", le(&[0xdb41_017d, 0]));
         let collapse = 0x6946_83eb;
@@ -2146,6 +2154,10 @@ mod tests {
         assert_eq!(
             states.machines[0].acts[0].messages,
             vec![(0xde60_c8e2, 0x5e3b_cf7b)]
+        );
+        assert_eq!(
+            states.machines[0].acts[0].exit_messages,
+            vec![(0x73aa_04b8, 0x5e3b_cf7b)]
         );
     }
 

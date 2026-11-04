@@ -5405,8 +5405,11 @@ fn break_props(game: &mut Game, mission: &Mission) {
             && let Some(at) = scene.props.centre(e)
         {
             let template = scene.props.get(e).map_or(0, |(p, _)| p.template);
-            let sent = scene.props.state_messages(e, m2_engine::StateFx::COLLAPSE);
+            let sent = scene
+                .props
+                .state_messages(e, m2_engine::StateFx::COLLAPSE, false);
             falling.push((at, template, sent));
+            scene.props.heard_collapse(e);
         }
     }
     scene.props.hide(&mut world.physics, gone);

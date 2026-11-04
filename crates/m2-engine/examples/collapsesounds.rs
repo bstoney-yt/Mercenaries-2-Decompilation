@@ -52,10 +52,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // What each heard as: its own cues, by line, with the templates so.
     let mut heard: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     let mut tally = [0usize; 4];
+    let mut ended = 0;
     for &id in &buildings {
         let name = names.get(&id).copied().unwrap_or("?");
         let set = spawn.get(&id).map_or(0, |s| s.set);
-        let sent: Vec<StateMessage> = models
+        let all: Vec<StateMessage> = models
             .get(&id)
             .and_then(|&m| source.model(m).ok())
             .and_then(|d| d.parse().ok().map(|m| StateMessage::of(&m)))
@@ -63,6 +64,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_iter()
             .filter(|s| s.state == StateFx::COLLAPSE)
             .collect();
+        // Leaving it: does it start a cue of its own (the crash)?
+        let ends = all.iter().filter(|s| s.on_exit).any(|s| {
+            m2_engine::spawn_sound::object_event(s.message)
+                .iter()
+                .any(|&(start, e)| start && set != 0 && cues.cue_of(set, e).is_some())
+        });
+        ended += usize::from(ends);
+        let sent: Vec<StateMessage> = all.into_iter().filter(|s| !s.on_exit).collect();
         let mut parts = Vec::new();
         let mut own = false;
         let mut started = false;
@@ -115,5 +124,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tally[2],
         tally[3]
     );
+    println!("{ended} building templates also play a cue of their own as their collapse ends");
     Ok(())
 }

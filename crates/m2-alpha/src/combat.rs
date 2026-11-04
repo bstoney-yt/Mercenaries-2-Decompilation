@@ -2789,6 +2789,20 @@ impl Combat {
         self.sounds.push(Sound::Collapse(at));
     }
 
+    /// The building of `template` that came apart at `at` is down, its
+    /// model leaving its `CollapseState` and sending `messages` there:
+    /// heard as its sound set answers them, with nothing standing in.
+    pub fn collapse_ended(&mut self, at: Vec3, template: u32, messages: &[(u32, u32)]) {
+        for &(message, param) in messages {
+            self.sounds.push(Sound::ObjectEvent {
+                at,
+                template,
+                message,
+                param,
+            });
+        }
+    }
+
     /// Something that doesn't come down as a building does breaks at
     /// `at`: heard as its template's `SoundKey` `key` says.
     pub fn broke(&mut self, at: Vec3, key: u32) {
