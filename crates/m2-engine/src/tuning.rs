@@ -2077,6 +2077,49 @@ impl Guns<'_> {
     }
 }
 
+/// Every template's cover hints (its `CoverHintOffset` entries,
+/// [`crate::ai_cover::Hint`]), by id: `Type` (Offset 0, Point 1, Box 2),
+/// `Rating`, `CoverAnimation`, `CoverPosition`, `FacingYawOrRadius`,
+/// `CoverRange`, `RestrictRadius`, `NoCoverX`, `NoCoverZ` (research thread,
+/// 360 notes s24).
+pub fn cover_hints(db: &Layer<'_>) -> HashMap<u32, Vec<crate::ai_cover::Hint>> {
+    use crate::ai_cover::{Hint, Kind};
+    let t = Table::new(db, "CoverHintOffset");
+    let word = |r: &[u8], n: &str| t.word(r, name_hash(n)).unwrap_or(0);
+    let float = |r: &[u8], n: &str, d: f32| t.float(r, name_hash(n)).unwrap_or(d);
+    t.records
+        .keys()
+        .map(|&id| {
+            let hints = t
+                .of_template(id)
+                .iter()
+                .filter_map(|r| {
+                    let kind = match word(r, "Type") {
+                        0 => Kind::Offset,
+                        1 => Kind::Point,
+                        2 => Kind::Box,
+                        _ => return None,
+                    };
+                    Some(Hint {
+                        kind,
+                        rating: word(r, "Rating").min(255) as u8,
+                        animation: word(r, "CoverAnimation").min(255) as u8,
+                        position: t
+                            .vector(r, name_hash("CoverPosition"))
+                            .map_or(m2_math::glam::Vec3::ZERO, m2_math::glam::Vec3::from),
+                        facing_or_radius: float(r, "FacingYawOrRadius", 0.0),
+                        range: float(r, "CoverRange", 90.0),
+                        restrict: float(r, "RestrictRadius", 50.0),
+                        no_x: word(r, "NoCoverX") != 0,
+                        no_z: word(r, "NoCoverZ") != 0,
+                    })
+                })
+                .collect();
+            (id, hints)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
