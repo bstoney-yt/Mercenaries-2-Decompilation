@@ -1305,17 +1305,22 @@ impl VehicleSpec {
                     .is_some_and(|g| g.rate_of_fire < CANNON_RATE))
     }
 
-    /// How the turret's nodes move with the turret turned `turret`
-    /// radians (anticlockwise from above): about the pivot, or its mount.
-    pub fn turret_transform(&self, turret: f32) -> Mat4 {
-        let mount = self.pivot.or_else(|| {
+    /// Where the turret turns about, model space: its pivot, or its
+    /// mount (its first node's origin).
+    pub fn turret_mount(&self) -> Option<Vec3> {
+        self.pivot.or_else(|| {
             self.turret
                 .iter()
                 .zip(&self.rest)
                 .find(|(on, _)| **on)
                 .map(|(_, m)| m.w_axis.truncate())
-        });
-        mount.map_or(Mat4::IDENTITY, |at| {
+        })
+    }
+
+    /// How the turret's nodes move with the turret turned `turret`
+    /// radians (anticlockwise from above): about the pivot, or its mount.
+    pub fn turret_transform(&self, turret: f32) -> Mat4 {
+        self.turret_mount().map_or(Mat4::IDENTITY, |at| {
             Mat4::from_translation(at) * Mat4::from_rotation_y(turret) * Mat4::from_translation(-at)
         })
     }
