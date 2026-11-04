@@ -937,6 +937,8 @@ pub struct Npc {
     ground: Vec2,
     /// The speed they last moved at (m/s): what a stall is judged by.
     pushed: f32,
+    /// The fight's dithering check and the spots it marked bad.
+    dither: m2_engine::ai_dither::Dither,
     stalled: u8,
     way: Vec2,
     turning: m2_engine::on_foot::Turn,
@@ -1095,6 +1097,7 @@ impl Npc {
             motion: m2_engine::on_foot::HumanMotion::default(),
             ground: Vec2::ZERO,
             pushed: 0.0,
+            dither: Default::default(),
             stalled: 0,
             way: Vec2::Y,
             turning: m2_engine::on_foot::Turn::default(),
@@ -1589,7 +1592,10 @@ impl Npc {
                         target = at + flat.normalize() * length;
                     }
                 }
-                self.step = Some((target, length / (self.push(self.ai.combat_speed))));
+                // Not to a spot he dithered at lately ([`m2_engine::ai_dither`]).
+                if !self.dither.bad(target) {
+                    self.step = Some((target, length / (self.push(self.ai.combat_speed))));
+                }
             }
             if let Some((target, left)) = &mut self.step {
                 *left -= dt;
@@ -1602,6 +1608,19 @@ impl Npc {
             }
         }
         self.move_dry(physics, wanted, dt);
+        // Swinging back and forth in the fight: past 8 swings he gives the
+        // move up and marks the spot bad for a minute, as the 360's
+        // `HumanCombat` path step does (0x822B3130, 0x822BF4D8).
+        if self.dither.step(Vec2::new(wanted.x, wanted.z), dt) {
+            eprintln!(
+                "people: {:08x} dithers at {:.1}: gives the move up",
+                self.spawn.unwrap_or(u32::MAX),
+                self.character.position
+            );
+            self.dither.mark(self.character.position);
+            self.step = None;
+            self.detour = None;
+        }
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
         if self.pushed > 0.3 && moved < 0.2 && self.stalled >= STALLED {
             // Walked into something: stop stepping; a chase goes round it
