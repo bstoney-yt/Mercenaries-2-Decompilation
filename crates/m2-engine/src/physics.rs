@@ -1420,6 +1420,24 @@ fn noise_table() -> &'static [f32; 256] {
     })
 }
 
+/// How an AI pilot's stick wobbles at `time` (the game's clock, s), as the
+/// 360 code's 0x821A1DC0 works it each step from [`noise`]: added to the
+/// speed asked ahead, (n(t + 205.642) + 1) / 4; sideways,
+/// (n(t / 4 + 128.245) - 1/2) x 4; and to the climb asked,
+/// -(n(2t + 5.111) + 1) / 4; each held to -1..1. None once it has been on
+/// the ground over half a second (its `ground`, s), and none with the
+/// player at the stick (its object's 0x68, taken for that: inferred).
+fn ai_wobble(time: f32, ground: f32) -> [f32; 3] {
+    if ground > 0.5 {
+        return [0.0; 3];
+    }
+    [
+        ((noise(time + 205.642) + 1.0) * 0.25).clamp(-1.0, 1.0),
+        ((noise(time * 0.25 + 128.245) - 0.5) * 4.0).clamp(-1.0, 1.0),
+        (-(noise(time * 2.0 + 5.111) + 1.0) * 0.25).clamp(-1.0, 1.0),
+    ]
+}
+
 /// Where in its turbulence a helicopter is, 0 to 1, from its id as the
 /// 360 code takes it from its entity's (0x821A2F00: two steps of the
 /// generator 0x19660D, 0x3C6EF35F from id ^ 0xC71C2830, made a float in
@@ -1458,6 +1476,13 @@ fn turbulence(phase: f32, time: f32, spin: f32, air: f32, ground: f32) -> (f32, 
 /// A helicopter's handling and what its pilot asks of it.
 struct Rotorcraft {
     flight: FlightTuning,
+    /// Its handling with an AI at the stick (`_HelicopterPhysicsAi`), if
+    /// its template gives one.
+    flight_ai: Option<FlightTuning>,
+    /// An AI flies it ([`Physics::set_ai_pilot`]): it flies by
+    /// [`flight_ai`](Self::flight_ai) and its stick wobbles
+    /// ([`ai_wobble`]).
+    ai: bool,
     controls: VehicleControls,
     /// Up (1) or down (-1).
     lift: f32,
@@ -1567,6 +1592,7 @@ impl Rotor {
         &mut self,
         f: &FlightTuning,
         stick: Stick,
+        shake: [f32; 3],
         turn: Quat,
         velocity: Vec3,
         angular: Vec3,
@@ -1609,13 +1635,15 @@ impl Rotor {
         let ahead = z.with_y(0.0).normalize_or_zero();
         let right = (-x).with_y(0.0).normalize_or_zero();
         // Ahead and sideways.
-        let stick_ahead = stick.ahead.clamp(-1.0, 1.0);
+        // An AI's wobble ([`ai_wobble`]) on the speed asked, not on how
+        // hard it pulls (0x821A28F8, 0x821A2990).
+        let stick_ahead = (stick.ahead + shake[0]).clamp(-1.0, 1.0);
         let pull = f.forward_accel * (1.0 - (1.0 - stick.ahead * stick.ahead) * f.no_input_inertia);
         out.impulse += ahead
             * (pull * (stick_ahead * f.forward - ahead.dot(velocity)) * mass * dt * spin * air);
         out.impulse += right
             * (f.sideways_accel
-                * (stick.right.clamp(-1.0, 1.0) * f.sideways - right.dot(velocity))
+                * ((stick.right + shake[1]).clamp(-1.0, 1.0) * f.sideways - right.dot(velocity))
                 * air
                 * mass
                 * dt
@@ -1642,8 +1670,9 @@ impl Rotor {
         // Its climb, at full rotor only: the weight held, the climb
         // asked, fading out above the ceiling.
         if spin == 1.0 {
-            self.climb =
-                (self.climb + (stick.lift.clamp(-1.0, 1.0) - self.climb) * dt).clamp(-1.0, 1.0);
+            self.climb = (self.climb
+                + ((stick.lift + shake[2]).clamp(-1.0, 1.0) - self.climb) * dt)
+                .clamp(-1.0, 1.0);
             let high = ((height - CEILING) / CEILING_FADE).clamp(0.0, 1.0);
             out.impulse.y += (f.climb * self.climb - velocity.y + 1.0)
                 * gravity
@@ -3180,9 +3209,21 @@ impl Physics {
                 continue;
             };
             let p = b.position();
+            // An AI at the stick flies by its AI handling and wobbles.
+            let flight = if r.ai {
+                r.flight_ai.unwrap_or(r.flight)
+            } else {
+                r.flight
+            };
+            let shake = if r.ai && !v.wrecked {
+                ai_wobble(self.time, r.state.ground)
+            } else {
+                [0.0; 3]
+            };
             let flown = r.state.fly(
-                &r.flight,
+                &flight,
                 stick,
+                shake,
                 Quat::from_array(p.rotation.to_array()),
                 vec3(b.linvel()),
                 vec3(b.angvel()),
@@ -3967,6 +4008,8 @@ impl Physics {
             .filter(|_| spec.is_helicopter())
             .map(|flight| Rotorcraft {
                 flight,
+                flight_ai: spec.tuning.flight_ai,
+                ai: false,
                 controls: VehicleControls {
                     parked: true,
                     ..VehicleControls::default()
@@ -4511,6 +4554,50 @@ impl Physics {
         let q = Quat::from_array(hull.position().rotation.to_array()).inverse()
             * Quat::from_array(turret.position().rotation.to_array());
         Some(2.0 * q.y.atan2(q.w))
+    }
+
+    /// An AI pilot's stick messages for a helicopter
+    /// ([`crate::heli_pilot::PilotStick`], the 360's lift, yaw, ahead and
+    /// sideways), as its pad's would be.
+    pub fn pilot_helicopter(&mut self, id: VehicleId, stick: crate::heli_pilot::PilotStick) {
+        let Some(r) = self
+            .vehicles
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .and_then(|v| v.rotor.as_mut())
+        else {
+            return;
+        };
+        r.lift = stick.lift;
+        r.strafe = stick.right;
+        r.controls = VehicleControls {
+            throttle: stick.ahead,
+            steer: -stick.yaw,
+            ..VehicleControls::default()
+        };
+    }
+
+    /// The ground straight under a vehicle as an AI pilot looks for it:
+    /// the first thing solid but itself down from 1000 m to -1000 m
+    /// (0x822ED8C0), its height.
+    pub fn ground_under(&self, id: VehicleId, at: Vec3) -> Option<f32> {
+        self.cast_ray_past(Vec3::new(at.x, 1000.0, at.z), Vec3::NEG_Y, 2000.0, id)
+            .map(|(d, _)| 1000.0 - d)
+    }
+
+    /// Hands a helicopter's stick to an AI (`true`) or back to the
+    /// player: with an AI it flies by its `_HelicopterPhysicsAi` record,
+    /// as the 360 code picks it for one the player does not fly
+    /// (0x8218C1F0), and its stick wobbles ([`ai_wobble`]).
+    pub fn set_ai_pilot(&mut self, id: VehicleId, ai: bool) {
+        if let Some(r) = self
+            .vehicles
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .and_then(|v| v.rotor.as_mut())
+        {
+            r.ai = ai;
+        }
     }
 
     /// Asks a helicopter to climb (1) or come down (-1), as fast as it
@@ -5535,6 +5622,53 @@ mod tests {
     // (0x11C78A3C; 0x821A25E0): hovering, held right it slides to its
     // right (-x, facing +z) toward its `MaxRightSpeed` (banked into the
     // slide its `BankYawAmplification` turns it a little too).
+    // An AI's stick wobbles as the 360's 0x821A1DC0 has it: a push ahead
+    // of a quarter to a half, a slide of up to 2 either way held to 1, a
+    // pull down of a quarter to a half; none on the ground past 1/2 s.
+    #[test]
+    fn an_ai_s_stick_wobbles_in_the_air_only() {
+        for i in 0..400 {
+            let [a, s, l] = ai_wobble(i as f32 * 0.37, 0.0);
+            assert!((0.25..=0.5).contains(&a), "{a}");
+            assert!((-1.0..=1.0).contains(&s), "{s}");
+            assert!((-0.5..=-0.25).contains(&l), "{l}");
+        }
+        assert_eq!(ai_wobble(3.0, 0.6), [0.0; 3]);
+    }
+
+    // An AI pilot takes a helicopter up off the ground and holds it 30 m
+    // over it, its stick wobbling ([`crate::heli_pilot`]).
+    #[test]
+    fn an_ai_pilot_hovers_a_helicopter_30_m_up() {
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(2000.0, 1.0, 2000.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let spec = helicopter();
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
+        p.set_ai_pilot(id, true);
+        let mut pilot = crate::heli_pilot::HeliPilot::new(
+            crate::tuning::PilotTuning::DEFAULT,
+            &spec.tuning.flight.unwrap(),
+        );
+        for _ in 0..(25.0 / DT) as usize {
+            let m = p.vehicle_transform(id).unwrap();
+            let (_, turn, at) = m.to_scale_rotation_translation();
+            let g = p.ground_under(id, at);
+            pilot.sense(at, turn, p.vehicle_velocity(id), g);
+            let stick = pilot.hover(30.0, true);
+            p.pilot_helicopter(id, stick);
+            p.step(DT);
+        }
+        let y = p.vehicle_transform(id).unwrap().w_axis.y;
+        assert!((y - 30.0).abs() < 1.5, "at {y}");
+        assert!(p.vehicle_velocity(id).length() < 1.0);
+    }
+
     #[test]
     fn a_helicopter_strafes_to_its_right() {
         let mut p = Physics::new();
