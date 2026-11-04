@@ -459,6 +459,10 @@ pub enum Command {
     /// A scene of the scripts' begins (true) or ends
     /// (`Player.SetCinematicMode`): on its end the camera is hers again.
     Cinematic(bool),
+    /// The player's aiming is on or off (`Player.SetAimMode(player, on)`):
+    /// the HQ turns it off as she goes in, with `Human.DisableWeapons`,
+    /// and on again as she leaves; off, she has no reticle.
+    AimMode(bool),
 }
 
 /// An action the player can take beside an object (`Pg.AddContextAction`):
@@ -2525,6 +2529,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // controls and the camera for a scene (the HQ's briefings), and give
     // them back with false; the first boolean is the switch (the scripts'
     // 1-argument and 5-argument calls).
+    // Player.SetAimMode(player, on): the HQ's entry (with
+    // `Human.DisableWeapons`) turns her aiming off, its exit on again.
+    add(&player, "SetAimMode", |w, _, a| {
+        if let Some(on) = a.iter().find_map(|v| match v {
+            Value::Boolean(b) => Some(*b),
+            _ => None,
+        }) {
+            w.commands.push(Command::AimMode(on));
+        }
+        values([])
+    })?;
     add(&player, "SetCinematicMode", |w, _, a| {
         let Some(on) = a.iter().find_map(|v| match v {
             Value::Boolean(b) => Some(*b),
