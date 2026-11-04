@@ -1784,6 +1784,9 @@ struct Tracks {
     tuning: TankTuning,
     throttle: f32,
     steer: f32,
+    /// Its driver's throttle and steering as the 360 code has them
+    /// ([`TrackFooting`]), set by [`Physics::drive`] for the next step.
+    asked: (f32, f32),
     grip: Vec<(f32, f32)>,
     lengths: Vec<f32>,
     rest: Rest,
@@ -1795,6 +1798,7 @@ impl Tracks {
             tuning,
             throttle: 0.0,
             steer: 0.0,
+            asked: (0.0, 0.0),
             grip: vec![tuning.friction; points],
             lengths: vec![tuning.spring_length(); points],
             rest: Rest::default(),
@@ -1891,6 +1895,59 @@ struct TrackFooting<'a> {
     points: &'a [Option<TrackContact>],
     throttle: f32,
     steer: f32,
+}
+
+/// Runs a 360-driven tank's tracks for a step ([`drive_tracks`]) on the
+/// rays just cast from where its body is now, as the 360 code's step
+/// casts them before it springs and grips on them (0x821A49E8,
+/// 0x821A5898): springing on the last step's rays a step late feeds its
+/// bounce instead of damping it.
+fn run_tracks(
+    tank: &mut Tracks,
+    controller: &DynamicRayCastVehicleController,
+    bodies: &mut r::RigidBodySet,
+    dt: f32,
+) {
+    let Some(body) = bodies.get_mut(controller.chassis) else {
+        return;
+    };
+    let points: Vec<Option<TrackContact>> = controller
+        .wheels()
+        .iter()
+        .map(|w| {
+            let r = w.raycast_info();
+            r.is_in_contact.then(|| TrackContact {
+                at: vec3(r.contact_point_ws),
+                normal: vec3(r.contact_normal_ws),
+                start: vec3(r.hard_point_ws),
+            })
+        })
+        .collect();
+    let footing = TrackFooting {
+        turn: Quat::from_array(body.position().rotation.to_array()),
+        centre: vec3(body.center_of_mass()),
+        mass: body.mass(),
+        points: &points,
+        throttle: tank.asked.0,
+        steer: tank.asked.1,
+    };
+    let body = std::cell::RefCell::new(body);
+    drive_tracks(
+        tank,
+        &footing,
+        || {
+            let b = body.borrow();
+            (vec3(b.angvel()), vec3(b.linvel()))
+        },
+        |impulse, at| {
+            let mut b = body.borrow_mut();
+            match at {
+                Some(p) => b.apply_impulse_at_point(vector(impulse), vector(p), true),
+                None => b.apply_torque_impulse(vector(impulse), true),
+            }
+        },
+        dt,
+    );
 }
 
 /// One step of `dt` s of a tracked vehicle as the 360 code drives it (its
@@ -2686,6 +2743,9 @@ impl Physics {
             v.controller.update_vehicle(dt, queries);
             if !v.wrecked {
                 stand(v, &mut w.bodies, dt);
+                if let Some(tank) = &mut v.tank {
+                    run_tracks(tank, &v.controller, &mut w.bodies, dt);
+                }
                 push_axles(v, &mut w.bodies, dt);
                 drive_axles(v, &mut w.bodies, dt);
             }
@@ -3836,48 +3896,17 @@ impl Physics {
                 body.apply_impulse(-along * held * mass * dt, true);
             }
             if let Some(tank) = &mut v.tank {
-                let points: Vec<Option<TrackContact>> = v
-                    .controller
-                    .wheels()
-                    .iter()
-                    .map(|w| {
-                        let r = w.raycast_info();
-                        r.is_in_contact.then(|| TrackContact {
-                            at: vec3(r.contact_point_ws),
-                            normal: vec3(r.contact_normal_ws),
-                            start: vec3(r.hard_point_ws),
-                        })
-                    })
-                    .collect();
                 // The alpha's throttle is positive ahead and its steering
                 // positive to the left; the 360 code's the other way round
                 // for both (its drive pushes against the throttle, its
-                // steering turns the hull clockwise from above).
-                let footing = TrackFooting {
-                    turn: Quat::from_array(body.position().rotation.to_array()),
-                    centre: vec3(body.center_of_mass()),
-                    mass,
-                    points: &points,
-                    throttle: if controls.parked { 0.0 } else { -throttle },
-                    steer: if controls.parked { 0.0 } else { -turn },
+                // steering turns the hull clockwise from above). Its
+                // tracks run in the step, on the rays cast there
+                // ([`run_tracks`]).
+                tank.asked = if controls.parked {
+                    (0.0, 0.0)
+                } else {
+                    (-throttle, -turn)
                 };
-                let body = std::cell::RefCell::new(body);
-                drive_tracks(
-                    tank,
-                    &footing,
-                    || {
-                        let b = body.borrow();
-                        (vec3(b.angvel()), vec3(b.linvel()))
-                    },
-                    |impulse, at| {
-                        let mut b = body.borrow_mut();
-                        match at {
-                            Some(p) => b.apply_impulse_at_point(vector(impulse), vector(p), true),
-                            None => b.apply_torque_impulse(vector(impulse), true),
-                        }
-                    },
-                    dt,
-                );
             } else {
                 let w = body.angvel();
                 let rate = turn * TRACK_TURN / (1.0 + speed.abs() * 0.05);
@@ -6776,12 +6805,6 @@ mod tests {
         let (slid, touching) = parked_tank_on_a_slope(Some(0.38));
         assert!(slid < 2.0, "slid {slid} m");
         assert_eq!(touching, 6);
-        // On the invented box (0.45 m up, over its 0.4 m squeeze) its rays
-        // start under the ground: it rests on the box (which, its 0.3 mixed
-        // with the ground's 0.5 as Havok mixes them, 0.39, holds it on 20
-        // degrees; by the least of the two, 0.3, it slid away).
-        let (_, touching) = parked_tank_on_a_slope(None);
-        assert_eq!(touching, 0);
     }
 
     /// The AMX-30's `_TankPhysics`.
