@@ -1195,16 +1195,12 @@ impl VehicleSpec {
         self.material = material;
         self.turret_shapes = turret_shapes(model, base, &self.turret).into();
         self.wreck = wreck_body(model, base);
-        // Flagged, not traced: a wheeled vehicle without a hull set (the
-        // trailers) would drag on its wheels' own shapes, and a
-        // motorbike's balance was tuned against the box hull (26 of 33
-        // fell over on their shapes), so both keep the box for now.
-        let wheeled = !self.tracked && !self.wheels.is_empty();
-        self.shapes = if wheeled && (!hull || self.is_bike()) {
-            Default::default()
-        } else {
-            shapes.into()
-        };
+        // Every vehicle collides by its chassis's shapes alone, as the 360
+        // code builds it (0x8216BC08): its hull set when it has one, else
+        // all of them (a trailer's wheels' shapes too). No record field
+        // changes that.
+        let _ = hull;
+        self.shapes = shapes.into();
         self
     }
 
