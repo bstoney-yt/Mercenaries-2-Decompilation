@@ -995,7 +995,17 @@ impl Flights {
             // height may be a little off), not a roof or a tree over it.
             if self.flights[i].phase == Phase::Inbound {
                 let to = self.flights[i].to;
-                if let Some(g) = ground(physics, to).filter(|g| (g - to.y).abs() < GROUND_SLACK) {
+                // Past its own helicopter, flown in the physics over it.
+                let found = match self.flights[i].body {
+                    Some(id) => {
+                        let top = Vec3::new(to.x, to.y + 300.0, to.z);
+                        physics
+                            .cast_ray_past(top, Vec3::NEG_Y, 900.0, id)
+                            .map(|(t, _)| top.y - t)
+                    }
+                    None => ground(physics, to),
+                };
+                if let Some(g) = found.filter(|g| (g - to.y).abs() < GROUND_SLACK) {
                     self.flights[i].to.y = g;
                 }
             }
