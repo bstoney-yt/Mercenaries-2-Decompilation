@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use m2_assets::layer::{Layer, TEMPLATE_DB_TYPE};
-use m2_engine::car_driver::{CarDriver, CarState};
+use m2_engine::car_driver::{CarDriver, CarInputs, CarState};
 use m2_engine::tuning::{DAMAGE_TABLE, DAMAGE_TABLE_TYPE, DamageTable};
 use m2_engine::{CatalogueEntry, CollisionShape, Install, Physics, StaticKey, VehicleControls};
 use m2_engine::{VehicleId, VehicleSpec};
@@ -136,6 +136,7 @@ fn drive(spec: &VehicleSpec, to: Vec3) -> (Option<f32>, f32, f32) {
     let start = state(&p, id).map_or(Vec3::ZERO, |s| s.at.with_y(0.0));
     let goal = start + to;
     let mut driver = CarDriver::default();
+    let mut held = m2_engine::car_driver::CarInputs::default();
     let (mut nearest, mut fastest) = (f32::INFINITY, 0.0f32);
     for i in 0..(SECONDS / DT) as usize {
         let Some(s) = state(&p, id) else {
@@ -148,7 +149,8 @@ fn drive(spec: &VehicleSpec, to: Vec3) -> (Option<f32>, f32, f32) {
             return (Some(i as f32 * DT), nearest, fastest);
         }
         let input = driver.drive_to(&s, goal, CAP, false, DT);
-        p.drive(id, input.controls(s.speed()));
+        held.take(&input, s.speed());
+        p.drive(id, held.controls(s.speed()));
         p.step(DT);
     }
     (None, nearest, fastest)
