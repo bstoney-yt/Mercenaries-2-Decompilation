@@ -372,6 +372,14 @@ pub struct VehicleSpec {
     /// any: the 360 code makes its turret a body of its own on a hinge
     /// (0x82273F90).
     pub turret_mass: Option<Chassis>,
+    /// Its turret's gun on a body of its own (the `PHY2` bodies on its
+    /// [`gun`](Self::gun) nodes, when it has a turret body and a
+    /// [`gun_pivot`](Self::gun_pivot)): the 360 code hinges it to the
+    /// turret's body and drives it to the pitch asked (0x82275974,
+    /// 0x82273F90). Its bodies are then not in
+    /// [`turret_mass`](Self::turret_mass) or
+    /// [`turret_shapes`](Self::turret_shapes).
+    pub gun_body: Option<GunBody>,
     /// Its wrecked chassis body ([`WRECKED_CHASSIS`]), which the 360 builds
     /// once the wreck's parts show instead of the intact ones.
     pub wreck: Option<WreckBody>,
@@ -419,6 +427,15 @@ pub const CHASSIS: u32 = 0x255e_ab53;
 /// The node hash of a vehicle's wrecked chassis part, shown once it is
 /// wrecked (the other of the two [`CHASSIS`] describes).
 pub const WRECKED_CHASSIS: u32 = 0x75f1_f74d;
+
+/// A turret's gun's own body ([`VehicleSpec::gun_body`]): its shapes,
+/// model space with the turret straight ahead and the gun level, and
+/// its mass.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GunBody {
+    pub shapes: std::sync::Arc<[Vec<Vec3>]>,
+    pub mass: Chassis,
+}
 
 /// A vehicle's intact chassis body as its model's `PHY2` record gives
 /// it, in model space.
@@ -982,6 +999,7 @@ impl VehicleSpec {
             material: None,
             turret_shapes: Default::default(),
             turret_mass: None,
+            gun_body: None,
             wreck: None,
             rotors: if flies {
                 vehicle::rotors(model)
@@ -1250,8 +1268,31 @@ impl VehicleSpec {
         self.chassis = Chassis::of(base);
         let (shapes, hull, material) = chassis_shapes(model, base);
         self.material = material;
-        self.turret_shapes = turret_shapes(model, base, &self.turret).into();
-        self.turret_mass = turret_mass(base, &self.turret);
+        // The gun on a body of its own when its parts have one, hinged to
+        // the turret's (0x82275974); the turret's body then without it.
+        let gun_shapes = turret_shapes(model, base, &self.gun);
+        self.gun_body = match turret_mass(base, &self.gun) {
+            Some(mass) if !gun_shapes.is_empty() && self.gun_pivot.is_some() => Some(GunBody {
+                shapes: gun_shapes.into(),
+                mass,
+            }),
+            _ => None,
+        };
+        let turret: Vec<bool> = if self.gun_body.is_some() {
+            let on_gun = |i: usize| self.gun.get(i).copied().unwrap_or(false);
+            self.turret
+                .iter()
+                .enumerate()
+                .map(|(i, &t)| t && !on_gun(i))
+                .collect()
+        } else {
+            self.turret.clone()
+        };
+        self.turret_shapes = turret_shapes(model, base, &turret).into();
+        self.turret_mass = turret_mass(base, &turret);
+        if self.turret_mass.is_none() {
+            self.gun_body = None;
+        }
         self.wreck = wreck_body(model, base);
         // Every vehicle collides by its chassis's shapes alone, as the 360
         // code builds it (0x8216BC08): its hull set when it has one, else
@@ -1750,6 +1791,7 @@ mod tests {
             material: None,
             turret_shapes: Default::default(),
             turret_mass: None,
+            gun_body: None,
             wreck: None,
             tuning: VehicleTuning::default(),
         }

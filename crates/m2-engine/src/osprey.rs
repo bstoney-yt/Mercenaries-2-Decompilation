@@ -175,6 +175,7 @@ pub fn vehicle(entry: &CatalogueEntry) -> (VehicleSpec, CpuModel) {
         material: None,
         turret_shapes: Default::default(),
         turret_mass: None,
+        gun_body: None,
         wreck: None,
         rest,
     };
