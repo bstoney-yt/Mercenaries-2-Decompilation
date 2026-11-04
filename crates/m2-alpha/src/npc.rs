@@ -1523,15 +1523,11 @@ impl Npc {
                 .map(|spot| (spot, smart.cover_time));
         }
         let mut hiding = false;
-        // To cover at his `CombatSpeed`, as the 360's `HumanTakeCover`
-        // moves (its start, 0x822B3970, sets the push to the AI object's
-        // +0x9a8; its step, 0x822B3A70, moves by it). `HumanCombat`
-        // (0x822B3668) moves by it too.
-        let to_cover = self.push(self.ai.combat_speed);
+        let sprint = self.push(self.ai.sprint_speed);
         if let Some((spot, left)) = &mut self.cover {
             let flat = (*spot - at).with_y(0.0);
             if flat.length() > 0.6 {
-                wanted = flat.normalize() * to_cover;
+                wanted = flat.normalize() * sprint;
             } else {
                 *left -= dt;
             }
