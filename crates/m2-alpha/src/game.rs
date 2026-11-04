@@ -191,6 +191,9 @@ pub struct Game {
     /// has the controls (`MrxGuiDialogBox._HandleInputEvent` takes the
     /// pad's events), so she stands still and has no crosshair.
     pub dialog_up: bool,
+    /// The scripts turned her aiming off (`Player.SetAimMode`, the HQ):
+    /// no reticle until they turn it on again.
+    pub aim_off: bool,
     /// The scripts' countdown ticked since autoplay last looked (a
     /// `ui_HUD_Timer_` cue: OilCon002's 15 minutes).
     pub countdown_tick: bool,
@@ -455,6 +458,7 @@ impl Game {
             placed: crate::placed::Placed::default(),
             input_locked: false,
             dialog_up: false,
+            aim_off: false,
             countdown_tick: false,
             hijack_only: HashSet::new(),
             unusable: HashSet::new(),
@@ -2492,18 +2496,22 @@ impl Game {
         });
         // What the crosshair is on: on foot, or in a vehicle with a gun.
         let crosshair = match (&self.scene.world, player) {
-            (Some(w), Some(p)) if self.combat.down <= 0.0 && !self.dialog_up => match p.driving {
-                Some(i) => self
-                    .scene
-                    .vehicles
-                    .get(i)
-                    .filter(|v| (v.spec.muzzle.is_some() || !v.spec.armed.is_empty()) && !v.wrecked)
-                    .map(|v| Combat::aim_point(&w.physics, &self.scene.people, p, v.id)),
-                None if self.on_foot && p.landed => {
-                    Some(Combat::aim_point(&w.physics, &self.scene.people, p, None))
+            (Some(w), Some(p)) if self.combat.down <= 0.0 && !self.dialog_up && !self.aim_off => {
+                match p.driving {
+                    Some(i) => self
+                        .scene
+                        .vehicles
+                        .get(i)
+                        .filter(|v| {
+                            (v.spec.muzzle.is_some() || !v.spec.armed.is_empty()) && !v.wrecked
+                        })
+                        .map(|v| Combat::aim_point(&w.physics, &self.scene.people, p, v.id)),
+                    None if self.on_foot && p.landed => {
+                        Some(Combat::aim_point(&w.physics, &self.scene.people, p, None))
+                    }
+                    None => None,
                 }
-                None => None,
-            },
+            }
             _ => None,
         };
         let can_enter = match (&self.scene.world, player) {

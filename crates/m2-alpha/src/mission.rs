@@ -5741,6 +5741,16 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             });
             return false;
         }
+        Command::AimMode(on) => {
+            if game.aim_off == *on {
+                game.aim_off = !on;
+                eprintln!(
+                    "mission: her aiming {} (no reticle while off)",
+                    if *on { "on" } else { "off" }
+                );
+            }
+            return false;
+        }
         Command::Cinematic(on) => {
             if !on && game.shot.take().is_some() {
                 eprintln!("mission: the scene ends; the camera is hers again");
