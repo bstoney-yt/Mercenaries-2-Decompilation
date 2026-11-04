@@ -1157,12 +1157,6 @@ fn hull_feel(spec: &VehicleSpec) -> (bool, f32) {
     let tank = spec.tracked && spec.tuning.tank.is_some();
     if spec.is_boat() {
         (false, spec.tuning.boat.unwrap_or(BOAT).hull_friction)
-    } else if spec.is_bike() {
-        // The 360's bike runs the car's step too (0x8219EE74), so its hull
-        // slides free upright; but the alpha's box hull scrapes the ground
-        // at a lean, and the bike's balance was tuned against it holding
-        // there by this (invented) until it has its own collision.
-        (false, BIKE_HULL_FRICTION)
     } else if tank || spec.is_helicopter() {
         (false, BodyMaterial::COMMON.friction)
     } else {
@@ -1171,15 +1165,13 @@ fn hull_feel(spec: &VehicleSpec) -> (bool, f32) {
 }
 
 /// A car's or motorbike's hull friction while its up axis points
+/// (the 360's bike runs the car's step, 0x8219EE74, on its own shapes)
 /// up_y up: none upright, [`CAR_TIPPED_FRICTION`] once on its side or
 /// roof (its up axis level or below). From the 360 code (0x8219ECA4: the
 /// chassis matrix's up y over 0 gives 0, else 0.3, set when it differs).
 fn car_hull_friction(up_y: f32) -> f32 {
     if up_y > 0.0 { 0.0 } else { CAR_TIPPED_FRICTION }
 }
-
-/// A motorbike's hull friction ([`hull_feel`]). Invented.
-const BIKE_HULL_FRICTION: f32 = 0.6;
 
 /// See [`car_hull_friction`] (its constant 0x820BAF0C).
 const CAR_TIPPED_FRICTION: f32 = 0.3;
@@ -3274,13 +3266,8 @@ impl Physics {
         let (car_hull, hull_friction) = hull_feel(spec);
         // Havok mixes two bodies' friction as the root of their product;
         // the least of the two gives the same for the values met here (one
-        // of them 0, or both alike). The bike keeps Rapier's mean (see
-        // [`BIKE_HULL_FRICTION`]).
-        let combine = if spec.is_bike() {
-            r::CoefficientCombineRule::Average
-        } else {
-            r::CoefficientCombineRule::Min
-        };
+        // of them 0, or both alike).
+        let combine = r::CoefficientCombineRule::Min;
         // It collides by its chassis body's own `PHY2` shapes, as the 360
         // code builds its body from them (0x8216A290): its vehicle hull
         // set ([`VehicleSpec::shapes`]). A tank's sit low enough under its
@@ -5407,13 +5394,14 @@ mod tests {
             "turned left"
         );
         assert!(m.transform_vector3(Vec3::X).y < -0.1, "leans left");
-        // Under 43 degrees over a second into the turn (41.5; 45.5 when
-        // its springs pushed at their contacts): its springs push at their
+        // Under 44.7 degrees over a second into the turn (43.9 with its box
+        // sliding free as a car's hull, 41.5 held by the invented 0.6 it
+        // had; 45.5 when its springs pushed at their contacts): its springs push at their
         // tops, as the 360's do ([`stand`]), so the turn pulls it less far
         // past the lean its balance asks (the island's bikes within 11
         // degrees of it at full lock, biketest; up to 28 past before).
         let up = m.transform_vector3(Vec3::Y).y;
-        assert!(up > 0.73, "still up: {up}");
+        assert!(up > 0.71, "still up: {up}");
     }
 
     /// The Offroad Motorcycle (AL)'s `Bike*` fields, the weakest.
