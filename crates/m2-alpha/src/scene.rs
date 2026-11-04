@@ -157,6 +157,35 @@ const GAIT_KEYS: [(Gait, u32); 4] = [
     (Gait::Sprint, 0x076a_6136),
 ];
 
+/// Below this a character stands, m/s. Not the 360's: its node stands
+/// at 0.01 m/s ([`m2_engine::blend::STILL`]), but the alpha's character
+/// controller leaves a person stopped at a wall, or setting off, moving
+/// 0.001 to 0.07 m/s from tick to tick, and at 0.01 the hero flipped
+/// between standing and walking 106 times in 6 s (round 10's island run).
+/// 0.3 m/s is the alpha's old threshold (invented).
+pub const STAND: f32 = 0.3;
+
+/// The gait the 360's locomotion node plays moving `moved` m/s with the
+/// `Upright` paces `paces` ([`m2_engine::blend::gait`]), as the alpha's
+/// gaits: its jog plays the alpha's run clip (`Upright_Jog_Forward`), its
+/// run the alpha's sprint (`Upright_Run_Forward`), and its sprint too (the
+/// 360 plays `Upright_Sprint_Forward` there, which the alpha doesn't bind).
+///
+/// Below [`STAND`] she stands, not below the 360's
+/// [`STILL`](m2_engine::blend::STILL): see there.
+pub fn loco_gait(paces: [f32; 4], moved: f32) -> Gait {
+    use m2_engine::blend::LocoGait;
+    if moved < STAND {
+        return Gait::Idle;
+    }
+    match m2_engine::blend::gait(paces, moved) {
+        LocoGait::Still => Gait::Idle,
+        LocoGait::Walk => Gait::Walk,
+        LocoGait::Jog => Gait::Run,
+        LocoGait::Run | LocoGait::Sprint => Gait::Sprint,
+    }
+}
+
 /// The rate a character's clip plays at, moving `moved` m/s at `gait`,
 /// whose clip travels `clip_speed` m/s; `playing` is the clip playing
 /// now (its hash) and its on-foot row's rate limits, if it has any.
@@ -755,8 +784,16 @@ impl Rig {
     pub fn set_gait(&mut self, gait: Gait) {
         self.gait = gait;
         if let Some(&clip) = self.locomotion.as_ref().and_then(|l| l.clips.get(&gait)) {
-            self.animator.play(clip);
+            self.play_gait(clip);
         }
+    }
+
+    /// Plays `clip` as a gait of the locomotion node: blended over the
+    /// 360's 0.3 s and kept in step with the gait before it
+    /// ([`Animator::play_gait`]).
+    pub fn play_gait(&mut self, clip: usize) {
+        let length = self.clips[clip].info.duration;
+        self.animator.play_gait(clip, length);
     }
 
     /// Moves at `gait` holding a rifle as `carry` says. Aiming, it is
@@ -785,7 +822,7 @@ impl Rig {
         match whole {
             Some(clip) => {
                 self.gait = gait;
-                self.animator.play(clip);
+                self.play_gait(clip);
             }
             None => self.set_gait(gait),
         }

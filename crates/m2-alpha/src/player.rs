@@ -1204,15 +1204,9 @@ impl Player {
         }
         let (mut swap, mut switched) = (None, false);
         if let Some((_, rig)) = &mut self.model {
-            // The 360's paces to the alpha's gaits: its jog plays the
-            // `Upright_Jog_Forward` clip (the alpha's run), its run and
-            // sprint `Upright_Run_Forward` (the alpha's sprint).
-            let gait = match self.pace {
-                _ if moved < 0.3 => Gait::Idle,
-                Pace::Still | Pace::Walk => Gait::Walk,
-                Pace::Jog => Gait::Run,
-                Pace::Run | Pace::Sprint => Gait::Sprint,
-            };
+            // The 360's locomotion node picks the gait from her speed,
+            // halfway between her paces ([`crate::scene::loco_gait`]).
+            let gait = crate::scene::loco_gait(self.motion.paces, moved);
             let clips = &self.clips;
             // Aimed in she is `Crouched`: its gait's clip for what she
             // holds ([`crate::held::CROUCH_HANDLES`]).
@@ -1366,7 +1360,7 @@ impl Player {
                 // The crouched clip carries her legs and body; moving,
                 // the aim's arms ride over it, as upright.
                 rig.gait = gait;
-                rig.animator.play(c);
+                rig.play_gait(c);
                 let upper = (gait != Gait::Idle).then_some(clips.aim).flatten();
                 rig.animator.set_upper(upper.zip(rig.upper.clone()));
                 rig.two_handed = rig.barrel;
