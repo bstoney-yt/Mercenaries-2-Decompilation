@@ -47,6 +47,7 @@ pub mod pickup;
 pub mod population;
 pub mod reverb;
 pub mod road_graph;
+pub mod road_ring;
 pub mod scatter;
 pub mod seats;
 pub mod sound_regions;

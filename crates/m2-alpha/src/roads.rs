@@ -676,6 +676,7 @@ mod tests {
             kind: 0,
             lanes: None,
             named_road: true,
+            ends: [0, 0],
         }
     }
 
