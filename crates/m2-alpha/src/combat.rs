@@ -499,9 +499,10 @@ const THROW_GAP: f32 = RPG_RELOAD * 0.5;
 pub const MAX_GRENADES: u32 = 9;
 /// A melee bash: how far ahead of her it reaches (from her chest, or her
 /// knees for a low one at something on the ground), how wide (the cosine
-/// of its half-angle), how much it hurts a person and what of the world's
-/// it meets (a supply crate's 100 health: one blow opens it), how hard it
-/// shoves (out, up; m/s), and seconds before she can bash or fire again.
+/// of its half-angle), how much it hurts what of the world's it meets (a
+/// supply crate's 100 health: one blow opens it), and seconds before she
+/// can bash or fire again. People are reached, hurt and shoved as the 360
+/// does instead ([`m2_engine::melee`]).
 /// Invented, from the playthroughs. A person takes the blow times their
 /// damage table row's `MeleeBash` cell (from the data; no template's
 /// `DamageKey` is `MeleeBash`, so the blow's own size stays invented).
@@ -523,11 +524,20 @@ fn within_bash(feet: Vec3, ahead: Vec3, middle: Vec3, half: f32) -> bool {
     to.length() <= BASH_REACH + half && to.normalize_or_zero().dot(ahead) >= BASH_ARC
 }
 const BASH_DAMAGE: f32 = 60.0;
-/// The `Bash` record's `BashRange`, metres (its registered default,
-/// schema 0x823F43D8).
-const BASH_RANGE: f32 = 1.0;
+/// A person's `_HumanPhysics` `Mass`, kg (the registered default), that a
+/// bash's impulse moves ([`m2_engine::melee::shove`]).
+const BODY_MASS: f32 = 100.0;
+
+/// How tall someone stands for a bash's boxes: their capsule's height, or
+/// half a metre lying down (invented: the height of a body on the ground).
+fn body_height(n: &crate::npc::Npc) -> f32 {
+    if n.down.is_some() {
+        0.5
+    } else {
+        n.character.height
+    }
+}
 const BASH_BREAK: f32 = 100.0;
-const BASH_PUSH: (f32, f32) = (3.0, 1.0);
 const BASH_GAP: f32 = 0.8;
 /// Heights of a blow over her feet, high and low, metres.
 const BASH_HIGH: f32 = 1.2;
@@ -4438,17 +4448,50 @@ impl Combat {
         Some(f.player.model_matrix().transform_point3(at))
     }
 
-    /// Whether her blow goes low: something stands within reach ahead of
-    /// her knees but nothing ahead of her chest (a crate on the ground).
-    fn low_blow(f: &Field<'_>) -> bool {
+    /// As the 360 starts a bash (0x8222A828, [`m2_engine::melee`]): she
+    /// turns to the likeliest person within 2 m, then the blow goes low if
+    /// something is in the low box ahead of her and nothing in the high
+    /// one. People are tested against the boxes; the world (a crate on the
+    /// ground) still by the alpha's rays at knee and chest height, standing
+    /// in for the boxes' object query.
+    fn low_blow(f: &mut Field<'_>) -> bool {
+        use m2_engine::melee::{self, Relation};
         let feet = f.player.character.position;
-        let ahead = Vec3::new(f.player.facing.sin(), 0.0, f.player.facing.cos());
-        let meets = |h: f32| {
-            f.physics
-                .cast_ray(feet + Vec3::Y * h, ahead, BASH_REACH)
+        let people = &*f.people;
+        let target = people
+            .npcs
+            .iter()
+            .filter(|n| n.alive && n.character.position.distance(feet) <= melee::TARGET_RADIUS)
+            .map(|n| {
+                let flat = (n.character.position - feet).with_y(0.0).length();
+                let enemy = n.alert || n.faction.is_some_and(|x| people.fights_for(x));
+                let rel = if enemy {
+                    Relation::Enemy
+                } else {
+                    Relation::Neutral
+                };
+                (melee::target_score(flat, false, rel), n.character.position)
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some(yaw) = target.and_then(|(_, at)| melee::yaw_to(feet, at)) {
+            f.player.facing = yaw;
+        }
+        let facing = f.player.facing;
+        let ahead = Vec3::new(facing.sin(), 0.0, facing.cos());
+        let in_box = |b: &melee::BashBox, ray: f32| {
+            f.people.npcs.iter().filter(|n| n.alive).any(|n| {
+                let (at, r) = (n.character.position, n.character.radius);
+                melee::reaches(b, feet, facing, at, r, body_height(n))
+            }) || f
+                .physics
+                .cast_ray(feet + Vec3::Y * ray, ahead, BASH_REACH)
                 .is_some()
         };
-        meets(BASH_LOW) && !meets(BASH_HIGH)
+        let (high, low) = (
+            in_box(&melee::HIGH, BASH_HIGH),
+            in_box(&melee::LOW, BASH_LOW),
+        );
+        melee::goes_low(high, low)
     }
 
     /// Her blow, high or low, the way she faces: it hurts and shoves those
@@ -4456,33 +4499,51 @@ impl Combat {
     /// (a supply crate breaks open), and rights an overturned vehicle
     /// there.
     fn bash(&mut self, f: &mut Field<'_>, low: bool) {
+        use m2_engine::melee;
         let feet = f.player.character.position;
-        let ahead = Vec3::new(f.player.facing.sin(), 0.0, f.player.facing.cos());
+        let facing = f.player.facing;
+        let ahead = Vec3::new(facing.sin(), 0.0, facing.cos());
         let from = feet + Vec3::Y * if low { BASH_LOW } else { BASH_HIGH };
-        let push = ahead * BASH_PUSH.0 + Vec3::Y * BASH_PUSH.1;
+        let reach = if low { melee::LOW } else { melee::HIGH };
+        // The shove pushes from her position raised by the box's height.
+        let pushed_from = feet + Vec3::Y * reach.push_height;
+        let mut landed = 0;
         for n in f.people.npcs.iter_mut().filter(|n| n.alive) {
-            let to = n.character.position - feet;
-            let flat = to.with_y(0.0);
-            if to.y.abs() > 1.5
-                || flat.length() > BASH_REACH + BODY_RADIUS
-                || flat.normalize_or_zero().dot(ahead) < BASH_ARC
-            {
+            let at = n.character.position;
+            let tall = body_height(n);
+            if !melee::reaches(&reach, feet, facing, at, n.character.radius, tall) {
                 continue;
             }
-            // Of the blow, what the damage table's row for them gives of a
-            // `MeleeBash`: a thousand times for a `Human` or `HumanArmor`
-            // (one blow fells any soldier), nothing for the bosses and
-            // targets (`cab45462`: Carmona, Blanco, Peng).
-            let taken = BASH_DAMAGE * self.on_person(n, Some(m2_assets::name_hash("MeleeBash")));
+            let to = at + Vec3::Y * reach.push_height;
+            let push = melee::shove(low, pushed_from, to, BODY_MASS);
+            // The damage table's cell for their row and `MeleeBash`: a
+            // thousand for a `Human` or `HumanArmor` (one blow fells any
+            // soldier), nothing for the bosses and targets (`cab45462`:
+            // Carmona, Blanco, Peng).
+            // Without the table, the alpha's own blow (invented).
+            let cell = self.on_person(n, Some(m2_assets::name_hash("MeleeBash")));
+            let taken = if self.damage_table.is_some() {
+                cell
+            } else {
+                BASH_DAMAGE * cell
+            };
             let soldier = n.soldier;
             if n.hurt(taken, push) && soldier {
                 self.remarks.push(Remark::Kill);
             }
-            // Still alive (a target the blow doesn't hurt, or one it
-            // doesn't fell): knocked down ([`crate::npc::Down`]).
-            n.knock_down();
+            // Still alive: felled for the 360's knockdown time (its random
+            // spread stood in for by the blow's count, invented).
+            let r = (self.hits as f32 * 0.618_034).fract();
+            let seconds = melee::knockdown_seconds(melee::KNOCKDOWN_SECONDS, false, r);
+            n.knock_down_for(seconds, push);
             self.hits += 1;
+            landed += 1;
         }
+        eprintln!(
+            "bash: {} blow lands on {landed} ({})",
+            if low { "low" } else { "high" },
+            if landed > 0 { "shake 0.12" } else { "no shake" }
+        );
         // A vehicle on its side or roof in front of her: the blow rights it
         // (from the owner's play of the game; nothing in the data says so).
         for v in f
@@ -5050,9 +5111,14 @@ impl Combat {
         if f.player.driving.is_some() || !n.alive {
             return;
         }
+        // As her bash: he hits her if she is in either box ahead of him
+        // (the high one standing, the low one lying or crouched).
         let from = n.character.position;
-        let reach = BASH_RANGE + n.character.radius + f.player.character.radius;
-        if from.distance(f.player.character.position) > reach {
+        let her = &f.player.character;
+        let meets = |b: &m2_engine::melee::BashBox| {
+            m2_engine::melee::reaches(b, from, n.facing, her.position, her.radius, her.height)
+        };
+        if !meets(&m2_engine::melee::HIGH) && !meets(&m2_engine::melee::LOW) {
             return;
         }
         let melee = m2_assets::name_hash("MeleeBash");
@@ -5062,7 +5128,10 @@ impl Combat {
             .and_then(|t| t.scale(m2_assets::name_hash("Hero"), melee))
             .unwrap_or(0.0);
         let lost = self.hurt_player(f, damage, Some(from));
-        eprintln!("melee: a soldier's blow lands on her: {damage:.1} ({lost:.1} lost)");
+        eprintln!(
+            "melee: a soldier's blow lands on her: {damage:.1} ({lost:.1} lost), shake {}",
+            m2_engine::melee::SHAKE_HIT
+        );
     }
 
     fn npc_round(&self, gun: Option<m2_engine::tuning::HandGun>) -> f32 {
@@ -5828,8 +5897,9 @@ mod tests {
         let dt = 1.0 / 60.0;
         let mut player = Player::new(0.0, 0.0, 0.0, None);
         let mut people = People::default();
-        // One just ahead of her, one just behind.
-        for z in [1.2, -1.2] {
+        // One just ahead of her, one behind past the 2 m she turns to
+        // (the 360 turns her to the nearest within it).
+        for z in [1.2, -2.5] {
             people.npcs.push(Npc::new(
                 0,
                 &rig(),

@@ -30,6 +30,7 @@ pub mod gun_sounds;
 pub mod hijack;
 pub mod ladder;
 pub mod lights;
+pub mod melee;
 pub mod model;
 pub mod motion;
 pub mod music_source;

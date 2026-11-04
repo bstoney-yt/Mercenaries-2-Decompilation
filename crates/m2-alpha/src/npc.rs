@@ -985,6 +985,9 @@ pub struct Npc {
     run_stop: m2_engine::on_foot::RunStop,
     /// Standing up out of the water: the climb-out's seconds left.
     climbing: f32,
+    /// Seconds a bash fells them for, fall and all
+    /// ([`m2_engine::melee::knockdown_seconds`]); `None`: the alpha's own.
+    knocked_for: Option<f32>,
 }
 
 /// Someone swimming: how long they have been in, and the shore they make
@@ -1153,6 +1156,7 @@ impl Npc {
             turning: m2_engine::on_foot::Turn::default(),
             run_stop: m2_engine::on_foot::RunStop::people(),
             climbing: 0.0,
+            knocked_for: None,
         }
     }
 
@@ -1300,6 +1304,17 @@ impl Npc {
 
     /// Bashed and still alive: they fall and lie a while ([`Down`]).
     /// Someone already down stays as they are.
+    /// Felled by a bash for `seconds` (the 360's knockdown time, fall
+    /// included), shoved by `push` (m/s): see [`knock_down`](Self::knock_down).
+    pub fn knock_down_for(&mut self, seconds: f32, push: Vec3) {
+        if !self.alive || self.down.is_some() {
+            return;
+        }
+        self.character.velocity += push;
+        self.knock_down();
+        self.knocked_for = Some(seconds);
+    }
+
     pub fn knock_down(&mut self) {
         if !self.alive || self.down.is_some() {
             return;
@@ -1346,7 +1361,11 @@ impl Npc {
                 if let Some(c) = clips.knocked {
                     self.rig.animator.play(c);
                 }
-                Some(Down::Knocked(KNOCKED_SECONDS))
+                let lie = self
+                    .knocked_for
+                    .take()
+                    .map_or(KNOCKED_SECONDS, |s| (s - FALL_SECONDS).max(0.0));
+                Some(Down::Knocked(lie))
             }
             Down::Falling(t) => Some(Down::Falling(t - dt)),
             Down::Knocked(t) if t - dt <= 0.0 => {
