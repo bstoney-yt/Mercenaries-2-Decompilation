@@ -479,8 +479,9 @@ fn hero_moves(
             v.join(", ")
         };
         eprintln!(
-            "hero moves: {hero}: {name}: aim {}, ready {}, run {}, gaits {}; stow {}; take up {}",
+            "hero moves: {hero}: {name}: aim {}, sweeps {}, ready {}, run {}, gaits {}; stow {}; take up {}",
             h(held.clips.aim),
+            held.sweeps.map_or("none".to_owned(), |s| s.iter().flatten().map(|&i| h(Some(i))).collect::<Vec<_>>().join(" ")),
             h(held.clips.ready),
             h(held.clips.run_low),
             gaits.join(", "),
@@ -861,12 +862,19 @@ impl Rig {
         Some(pose)
     }
 
+    /// A hero's own aim sweeps for what she holds
+    /// ([`crate::held::Held::sweeps`]); `None`: she aims by turning the
+    /// aim clip.
+    pub fn set_sweeps(&mut self, sweeps: Option<[[usize; 3]; 2]>) {
+        self.sweeps = std::sync::OnceLock::from(sweeps);
+    }
+
     /// The rifle's sweep clips, standing and moving, if this rig has them:
-    /// the people's (a hero's own group gives the heroes sweeps of their
-    /// own per weapon, which the hero's aim doesn't use yet).
+    /// the people's by the generic rifle rows, a hero's as
+    /// [`set_sweeps`](Self::set_sweeps) gave them.
     fn sweep_clips(&self) -> Option<[[usize; 3]; 2]> {
         if !self.own.is_empty() {
-            return None;
+            return self.sweeps.get().copied().flatten();
         }
         *self.sweeps.get_or_init(|| {
             use m2_engine::aim_sweep::{RIFLE_MOVING, RIFLE_STANDING};
@@ -902,6 +910,9 @@ impl Rig {
         let mut yaw = w.x.atan2(w.z) - forward.x.atan2(forward.y);
         yaw = (yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
         let pitch = w.y.clamp(-1.0, 1.0).asin();
+        // A hero aims in crouched (`Crouched` stance): her legs keep the
+        // crouched clip and the sweep poses her upper body, standing too.
+        let hero = !self.own.is_empty();
         let moving = self.animator.upper().is_some();
         let set = sets[usize::from(moving)];
         let at = aim_sweep::phase(yaw);
@@ -919,7 +930,7 @@ impl Rig {
         } else if high > 0.0 {
             aimed.blend(&sample(set[2]), high / (high + mid));
         }
-        match self.upper.as_ref().filter(|_| moving) {
+        match self.upper.as_ref().filter(|_| moving || hero) {
             Some(mask) => {
                 for ((local, mine), on) in pose.0.iter_mut().zip(aimed.0).zip(mask.iter()) {
                     if *on {

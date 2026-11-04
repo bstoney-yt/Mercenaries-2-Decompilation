@@ -84,6 +84,10 @@ pub struct Held {
     /// Crouched and aiming, standing: the shuffles round to the left and
     /// to the right (`Crouch_Aim_Shuffle_Left90`, `..._Right90`).
     pub shuffle: [Option<usize>; 2],
+    /// Her own aim sweeps for the class, standing and moving, each low,
+    /// mid and high ([`m2_engine::aim_sweep`]): the on-foot table's rows
+    /// for her and the class under the rifle sweeps' handles.
+    pub sweeps: Option<[[usize; 3]; 2]>,
 }
 
 /// The on-foot table's handles for the crouched, aiming gaits, by name
@@ -293,7 +297,19 @@ pub fn resolve(
             let p = table::handle_clip(t, m2_assets::name_hash(name), who, class, fits)?;
             index(p.clip)
         });
+        let sweep_of = |keys: [u32; 3]| -> Option<[usize; 3]> {
+            let mut out = [0; 3];
+            for (o, key) in out.iter_mut().zip(keys) {
+                *o = index(table::character_clip(t, key, who, class, fits)?.clip)?;
+            }
+            Some(out)
+        };
+        use m2_engine::aim_sweep::{RIFLE_MOVING, RIFLE_STANDING};
+        let sweeps = sweep_of(RIFLE_STANDING)
+            .zip(sweep_of(RIFLE_MOVING))
+            .map(|(s, m)| [s, m]);
         held.push(Held {
+            sweeps,
             crouch,
             shuffle,
             class,
