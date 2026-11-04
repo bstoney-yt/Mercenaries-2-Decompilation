@@ -335,6 +335,10 @@ struct Options {
     /// With `--screenshot --drive`: hijack the vehicle instead of getting
     /// in, answering every prompt at once.
     hijack: bool,
+    /// `--autoplay-avoid <id>[,<id>...]`: contracts autoplay leaves on
+    /// offer (testing: a story run moves on past a contract it failed to
+    /// finish in a few tries, taking the others the flow offers).
+    autoplay_avoid: Vec<String>,
     /// `--grapple`: she may grapple without the scripts' leave (testing;
     /// with `--screenshot --drive --hijack`, she grapples to the nearest
     /// crewed helicopter from 40 m and hijacks it).
@@ -714,6 +718,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--no-fx" => o.no_fx = true,
             "--hijack-crew" => o.hijack_crew = Some(value()?),
             "--hijack" => o.hijack = true,
+            "--autoplay-avoid" => {
+                o.autoplay_avoid = value()?.split(',').map(str::to_owned).collect();
+            }
             "--grapple" => o.grapple = true,
             "--placed-check" => o.placed_check = true,
             "--context" => o.context = Some(value()?),
@@ -1008,6 +1015,7 @@ const SCREENSHOT_ONLY: &[&str] = &[
     "--contracts",
     "--after-contract",
     "--hijack",
+    "--autoplay-avoid",
     "--movies",
 ];
 
@@ -3998,7 +4006,9 @@ fn mission_for_screenshot(
                 a.sights = link.sight_targets(game);
                 if i % (1.0 / tick).round().max(1.0) as u32 == 0 {
                     let offer = if link.contract().is_none() && link.job().is_none() {
-                        link.contracts_on_offer()
+                        let mut offer = link.contracts_on_offer();
+                        offer.retain(|c| !options.autoplay_avoid.contains(c));
+                        offer
                     } else {
                         Vec::new()
                     };
@@ -9892,6 +9902,14 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autoplay_avoid_lists_the_contracts_left_on_offer() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let o = parse_args(&args(&["--autoplay-avoid", "OilCon020,PmcCon031"])).unwrap();
+        assert_eq!(o.autoplay_avoid, ["OilCon020", "PmcCon031"]);
+        assert!(parse_args(&args(&[])).unwrap().autoplay_avoid.is_empty());
+    }
 
     #[test]
     fn screenshot_only_options_are_named_when_windowed() {
