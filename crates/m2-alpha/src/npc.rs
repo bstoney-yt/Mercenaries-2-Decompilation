@@ -4195,6 +4195,7 @@ pub(crate) mod tests {
             sweeps: Default::default(),
             sweep_upper: false,
             kick: Default::default(),
+            aim_clock: 0.0,
             arm: Default::default(),
             cues: Vec::new(),
             own: Default::default(),
