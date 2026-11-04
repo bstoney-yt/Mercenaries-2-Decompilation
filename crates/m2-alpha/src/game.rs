@@ -1743,6 +1743,23 @@ impl Game {
                     &mut self.combat,
                 );
             });
+            // Blockers of soldiers' lines of fire, cleared as worth
+            // shooting by the 360's test (0x822EFE48).
+            for n in scene.people.npcs.iter_mut() {
+                if let Some(b) = n.blocker.as_mut().filter(|b| !b.cleared) {
+                    let round = n.gun.map_or(0.0, |g| g.damage);
+                    let kind = crate::combat::round_kind(n.gun.and_then(|g| g.damage_key));
+                    b.cleared =
+                        self.destruction
+                            .shootable_blocker(world, &scene.props, b.key, round, kind);
+                    if b.cleared {
+                        eprintln!(
+                            "people: a soldier shoots {:?} in his way at {:.1}",
+                            b.key, b.at
+                        );
+                    }
+                }
+            }
             // What lies within her reach, taken as the real game takes it
             // ([`crate::mission::offer`]): health and the small ammunition
             // box as she walks over them, if they give her anything; an

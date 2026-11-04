@@ -203,6 +203,27 @@ const STALLED: u8 = 10;
 /// How far ahead (seconds) people see a vehicle coming at them.
 const DODGE_TIME: f32 = 2.0;
 
+/// Something between a soldier and her that he may shoot to clear his
+/// line of fire (the 360's line-of-fire upkeep 0x822C95D8, research
+/// thread, 360 notes s22/s23).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Blocker {
+    /// Where his ray met it, and what it is.
+    pub at: Vec3,
+    pub key: m2_engine::StaticKey,
+    /// The fight found it worth shooting
+    /// ([`crate::destruct::Destruction::shootable_blocker`]).
+    pub cleared: bool,
+}
+
+/// How often the line-of-fire upkeep looks, seconds.
+const LOF_EVERY: f32 = 1.0;
+/// A blocker within this of the end he aims at, at least (the weapon's
+/// blast radius, 0 for rounds, floored at 5 m, times 1.5).
+const LOF_NEAR: f32 = 5.0 * 1.5;
+/// Seconds his memory of her is stretched by when a blocker is found.
+const LOF_REMEMBER: f32 = 5.0;
+
 /// A person model and the rig that animates it.
 #[derive(Debug)]
 pub struct PersonKind {
@@ -937,6 +958,21 @@ pub struct Npc {
     ground: Vec2,
     /// The speed they last moved at (m/s): what a stall is judged by.
     pushed: f32,
+    /// The fight's dithering check and the spots it marked bad.
+    dither: m2_engine::ai_dither::Dither,
+    /// The close-quarters cycle, and seconds left of a blow's clip.
+    close: m2_engine::ai_close::CloseQuarters,
+    striking: f32,
+    /// He struck this tick (the melee hook: its damage is not traced yet).
+    pub melee: bool,
+    /// What blocks his line of fire at her, and whether the fight cleared
+    /// it as worth shooting ([`Blocker`]); seconds to the next check.
+    pub blocker: Option<Blocker>,
+    lof: f32,
+    /// Seconds his memory of her is stretched by (a blocker found).
+    remember: f32,
+    /// Where his next shot goes instead of at her (a blocker).
+    pub fire_at: Option<Vec3>,
     stalled: u8,
     way: Vec2,
     turning: m2_engine::on_foot::Turn,
@@ -1095,6 +1131,14 @@ impl Npc {
             motion: m2_engine::on_foot::HumanMotion::default(),
             ground: Vec2::ZERO,
             pushed: 0.0,
+            dither: Default::default(),
+            close: Default::default(),
+            striking: 0.0,
+            melee: false,
+            blocker: None,
+            lof: 0.0,
+            remember: 0.0,
+            fire_at: None,
             stalled: 0,
             way: Vec2::Y,
             turning: m2_engine::on_foot::Turn::default(),
@@ -1487,10 +1531,39 @@ impl Npc {
             }
         }
         let seen = self.unseen < LOOK_EVERY * 1.5 && self.last_seen.is_some();
+        if seen {
+            self.remember = 0.0;
+        }
+        // Once a second: unseen where he last saw her, a ray from his chest
+        // to there; what it meets past the half way, within reach of that
+        // end, he may shoot (0x822C95D8).
+        self.lof -= dt;
+        if self.lof <= 0.0 {
+            self.lof = LOF_EVERY;
+            self.blocker = match self.last_seen.filter(|_| !seen) {
+                Some(end) => {
+                    let from = self.chest();
+                    let to = end - from;
+                    let length = to.length();
+                    physics
+                        .cast_ray_keyed(from, to, length)
+                        .and_then(|(t, _, key)| Some((t, key?)))
+                        .filter(|&(t, _)| t > length - t)
+                        .map(|(t, key)| (from + to.normalize_or_zero() * t, key))
+                        .filter(|&(at, _)| at.distance(end) <= LOF_NEAR)
+                        .map(|(at, key)| {
+                            self.remember = LOF_REMEMBER;
+                            let cleared = self.blocker.is_some_and(|b| b.key == key && b.cleared);
+                            Blocker { at, key, cleared }
+                        })
+                }
+                None => None,
+            };
+        }
         self.unseen += dt;
         // Heard or hit without seeing her: he goes to the noise.
         let goal = self.last_seen.unwrap_or(threat);
-        if self.unseen > GIVE_UP {
+        if self.unseen > GIVE_UP + self.remember {
             return false;
         }
         let smart = self.smart;
@@ -1589,7 +1662,10 @@ impl Npc {
                         target = at + flat.normalize() * length;
                     }
                 }
-                self.step = Some((target, length / (self.push(self.ai.combat_speed))));
+                // Not to a spot he dithered at lately ([`m2_engine::ai_dither`]).
+                if !self.dither.bad(target) {
+                    self.step = Some((target, length / (self.push(self.ai.combat_speed))));
+                }
             }
             if let Some((target, left)) = &mut self.step {
                 *left -= dt;
@@ -1601,7 +1677,58 @@ impl Npc {
                 }
             }
         }
+        // Within reach of her, with nothing between: the 360's
+        // close-quarters cycle (0x822B2D30, [`m2_engine::ai_close`]) moves
+        // him instead, and strikes.
+        let reach = 2.0 * self.character.radius + m2_engine::ai_close::REACH;
+        if seen && !hiding && distance < reach && self.striking <= 0.0 {
+            self.step = None;
+            self.detour = None;
+            let toward = to.with_y(0.0).normalize_or_zero();
+            match self.close.think(distance, self.ai.combat_speed, dt) {
+                m2_engine::ai_close::Close::Move(k) => {
+                    wanted = toward * self.push(k.abs()) * k.signum();
+                }
+                m2_engine::ai_close::Close::Stand => wanted = Vec3::ZERO,
+                m2_engine::ai_close::Close::Strike => {
+                    wanted = Vec3::ZERO;
+                    // The blow: the melee message the player's button posts.
+                    // Its damage comes from the melee action's own events,
+                    // not yet traced: `melee` is the hook for it.
+                    self.melee = true;
+                    if let Some((clip, _)) = clips.bash {
+                        self.rig.animator.set_upper(None);
+                        self.rig.animator.play_once(clip);
+                        self.rig.animator.seek(0.0);
+                        self.striking = self.rig.clips[clip].info.duration;
+                    }
+                    eprintln!(
+                        "people: {:08x} strikes at {distance:.1} m",
+                        self.spawn.unwrap_or(u32::MAX)
+                    );
+                }
+            }
+        } else if distance >= reach {
+            self.close = Default::default();
+        }
+        if self.striking > 0.0 {
+            self.striking -= dt;
+            wanted = Vec3::ZERO;
+        }
         self.move_dry(physics, wanted, dt);
+        // Swinging back and forth in the fight: past 8 swings he gives the
+        // move up and marks the spot bad for a minute, as the 360's
+        // `HumanCombat` path step does (0x822B3130, 0x822BF4D8).
+        if self.dither.step(Vec2::new(wanted.x, wanted.z), dt) {
+            eprintln!(
+                "people: {:08x} dithers at {:.1}: gives the move up",
+                self.spawn.unwrap_or(u32::MAX),
+                self.character.position
+            );
+            self.dither.mark(self.character.position);
+            self.step = None;
+            self.detour = None;
+        }
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
         if self.pushed > 0.3 && moved < 0.2 && self.stalled >= STALLED {
             // Walked into something: stop stepping; a chase goes round it
@@ -1668,8 +1795,10 @@ impl Npc {
         // he turns round with the rifle ready first.
         let ahead = seen && off < AIM_ARC;
         let carry = if ahead { Carry::Aim } else { Carry::Ready };
-        self.rig.hold_rifle(gait, &clips, carry);
-        if ahead {
+        if self.striking <= 0.0 {
+            self.rig.hold_rifle(gait, &clips, carry);
+        }
+        if ahead && self.striking <= 0.0 {
             self.rig.aim_along(self.facing, Some(threat - self.chest()));
         }
         self.cooldown -= dt;
@@ -1689,6 +1818,15 @@ impl Npc {
                 self.since_shot = 0.0;
                 let pause = l.hint.off.max(LAUNCHER_GAP);
                 self.launcher_wait = pause * rng.range(1.0 - PAUSE_JITTER, 1.0 + PAUSE_JITTER);
+            }
+        } else if let Some(b) = self.blocker.filter(|b| b.cleared && !seen) {
+            // A blocker cleared as worth it: he shoots it, with his gun's
+            // rhythm, as at her.
+            if self.cooldown <= 0.0 {
+                self.fires = true;
+                self.fire_at = Some(b.at);
+                self.since_shot = 0.0;
+                self.cooldown = self.burst_gap();
             }
         } else if seen
             && self.rates_target()
@@ -1711,7 +1849,11 @@ impl Npc {
             }
         }
         // His number stands in for the game's entity handle (invented).
-        let rate = self.rig.play_rate(gait, moved, self.shooter);
+        let rate = if self.striking > 0.0 {
+            1.0
+        } else {
+            self.rig.play_rate(gait, moved, self.shooter)
+        };
         self.rig.advance(dt * rate);
         true
     }
