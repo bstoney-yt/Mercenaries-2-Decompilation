@@ -16,6 +16,7 @@
 pub mod ai;
 pub mod ai_close;
 pub mod ai_dither;
+pub mod ai_plan;
 pub mod ambience;
 pub mod anim;
 pub mod assets;
