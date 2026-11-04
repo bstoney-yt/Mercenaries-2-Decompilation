@@ -5468,6 +5468,7 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
             guid,
             goal,
             location: Some(to),
+            haste,
             ..
         } if goal == "Deliver" || goal == m2_game::mission::LAND => {
             let to = &if goal == m2_game::mission::LAND {
@@ -5586,6 +5587,12 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
                     game.scene
                         .flights
                         .start(copter, loads, from, Vec3::from(*to));
+                    // `Ai.Deliver`'s fifth value: how low its load comes
+                    // before it lets go (0x82311C50 puts it in the order,
+                    // 0x822DC468 takes it so).
+                    if let Some(h) = haste {
+                        game.scene.flights.drop_height(*guid, *h);
+                    }
                     if goal == m2_game::mission::LAND {
                         game.scene.flights.land(*guid);
                     }
