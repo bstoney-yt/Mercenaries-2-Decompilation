@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "template\tcount\tfwd m/s\tmin alt\tto 30 m s\tover m\tlast 5 s err m\tdrift m\tto 400 m s\tfastest m/s\tends off m	land s	round wall s	wall clear m	land-near s	land-near off m"
+        "template\tcount\tfwd m/s\tmin alt\tto 30 m s\tover m\tlast 5 s err m\tdrift m\tto 400 m s\tfastest m/s\tends off m	land s	round wall s	wall clear m	land-near s	land-near off m	attack mean m	attack nearest m	runs	firing share"
     );
     for ((model, _), ids) in &groups {
         let mut ids = ids.clone();
@@ -140,8 +140,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let (round, clear) = round_the_wall(&spec, &flight, pilot_tuning);
         let (down, spot) = land_by_a_shed(&spec, &flight, pilot_tuning);
+        let (mean, nearest, runs, firing) = attack_a_point(&spec, &flight, pilot_tuning);
         println!(
-            "{name}\t{}\t{:.0}\t{:.0}\t{reached:.2}\t{top:.2}\t{:.2}\t{drift:.2}\t{arrived:.1}\t{fastest:.1}\t{off:.2}\t{landed:.1}\t{round:.1}\t{clear:.1}	{down:.1}	{spot:.1}",
+            "{name}\t{}\t{:.0}\t{:.0}\t{reached:.2}\t{top:.2}\t{:.2}\t{drift:.2}\t{arrived:.1}\t{fastest:.1}\t{off:.2}\t{landed:.1}\t{round:.1}\t{clear:.1}	{down:.1}	{spot:.1}	{mean:.1}	{nearest:.1}	{runs}	{firing:.2}",
             ids.len(),
             flight.forward,
             pilot_tuning.min_altitude,
@@ -164,7 +165,7 @@ fn round_the_wall(
     let at = place(&p, vid);
     let wall = CollisionShape::cuboid(Vec3::new(20.0, 30.0, 2.0));
     p.add_static(
-        StaticKey::Cell(2),
+        StaticKey::Object(2),
         &wall,
         Vec3::new(at.x, 30.0, at.z + 150.0),
         Quat::IDENTITY,
@@ -293,4 +294,64 @@ fn land_by_a_shed(
         }
     }
     (down, (place(&p, vid) - point).with_y(0.0).length())
+}
+
+/// From a hover 30 m up, an attack (`HeliAttack`, [`HeliPilot::attack`])
+/// on a still target on open ground 200 m off, for 120 s: its mean and
+/// least distance from the target, how many runs it made, and the share
+/// of the time it fired.
+fn attack_a_point(
+    spec: &VehicleSpec,
+    flight: &m2_engine::tuning::FlightTuning,
+    tuning: PilotTuning,
+) -> (f32, f32, u32, f32) {
+    let (mut p, vid) = start(spec);
+    let at = place(&p, vid);
+    let mut pilot = HeliPilot::new(tuning, flight);
+    for _ in 0..(20.0 / DT) as usize {
+        think(&mut p, vid, &mut pilot);
+        let stick = pilot.hover(HOVER, true);
+        p.pilot_helicopter(vid, stick);
+        p.step(DT);
+    }
+    let target = m2_engine::heli_pilot::AttackTarget {
+        at: Vec3::new(at.x, 0.0, at.z + 200.0),
+        velocity: Vec3::ZERO,
+        unseen: 0.0,
+        round_speed: Some(400.0),
+    };
+    let size = {
+        let (lo, hi) = spec.hull;
+        (hi.y - lo.y, (hi.x - lo.x).max(hi.z - lo.z))
+    };
+    let (mut sum, mut n, mut nearest, mut runs, mut fired) =
+        (0.0f32, 0.0f32, f32::INFINITY, 0u32, 0.0f32);
+    let mut seed: u32 = 1;
+    let mut last = 0;
+    for _ in 0..(120.0 / DT) as usize {
+        think(&mut p, vid, &mut pilot);
+        seed = seed.wrapping_mul(0x0019_660D).wrapping_add(0x3C6E_F35F);
+        let rand = (seed >> 8) as f32 / (1u32 << 24) as f32;
+        let (stick, gun) = {
+            let mut sight = m2_engine::heli_pilot::Sight {
+                physics: &p,
+                own: vid,
+            };
+            pilot.attack(&target, size, &mut sight, rand, DT)
+        };
+        p.pilot_helicopter(vid, stick);
+        p.step(DT);
+        if pilot.attack_part == 1 && last != 1 {
+            runs += 1;
+        }
+        last = pilot.attack_part;
+        if matches!(gun, m2_engine::heli_pilot::Gun::Fire(_)) {
+            fired += 1.0;
+        }
+        let d = place(&p, vid).distance(target.at);
+        sum += d;
+        n += 1.0;
+        nearest = nearest.min(d);
+    }
+    (sum / n, nearest, runs, fired / n)
 }
