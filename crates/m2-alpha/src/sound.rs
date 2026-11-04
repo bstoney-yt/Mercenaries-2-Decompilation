@@ -18,7 +18,7 @@ use m2_engine::audio::{EngineSounds, Falloff, KeySounds, Play, SoundLibrary};
 use m2_engine::gun_sounds::GunCues;
 use m2_engine::{Category, Install, Mixer, SoundBuffer, Streams, VoiceId, Voices};
 
-use crate::combat::{Remark, Sound};
+use crate::combat::{Blasted, Remark, Sound};
 use crate::hero::Hero;
 use crate::scene::Cue;
 use m2_assets::name_hash;
@@ -261,6 +261,11 @@ pub struct GameAudio {
     /// Launches, lobs and cannon shots heard with their weapon's own cue,
     /// and with the alpha's sound standing in.
     launches: (u32, u32),
+    /// Blasts heard with their own cue, silent as their template says,
+    /// and with the beta's blast standing in.
+    blasts_heard: [u32; 3],
+    /// Whether the blast templates' cues have been asked for.
+    blasts_primed: bool,
     /// Spinning guns firing now: their loop's voice ([`GunCues::spin`]).
     spins: Vec<Spin>,
 }
@@ -913,6 +918,51 @@ pub fn log_tank_gun(install: &Install) {
     }
 }
 
+/// What a blast is heard as, by its template's `SoundEffect`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlastHeard {
+    /// The cue its sound set plays as it comes into being.
+    Cue(u32),
+    /// Nothing: its record plays nothing then (no set, another mode, or
+    /// the chance missed).
+    Silent,
+    /// The data doesn't say: no record, or a set with no `Sounds` row
+    /// for the event (5 sets, 10 of the 59 blast templates).
+    Unknown,
+}
+
+/// What a blast whose template's `SoundEffect` is `spawn` plays, for a
+/// draw of `draw` in [0, 1): from the 360 code (0x82403758), its sound
+/// set's cue for [`CREATE_EVENT`](m2_engine::spawn_sound::CREATE_EVENT)
+/// with the wildcard `Param`.
+pub fn blast_heard(
+    spawn: Option<&m2_engine::spawn_sound::SpawnSound>,
+    cues: &GunCues,
+    draw: f32,
+) -> BlastHeard {
+    let Some(spawn) = spawn else {
+        return BlastHeard::Unknown;
+    };
+    let Some(set) = spawn.on_create(draw) else {
+        return BlastHeard::Silent;
+    };
+    cues.cue_of(set, m2_engine::spawn_sound::CREATE_EVENT)
+        .map_or(BlastHeard::Unknown, BlastHeard::Cue)
+}
+
+/// The template id of blast `b`: its own, or the template so named.
+fn blast_template(db: &m2_engine::world::Templates, b: Blasted) -> Option<u32> {
+    match b {
+        Blasted::Id(id) => Some(id),
+        Blasted::Named(name) => db
+            .names
+            .iter()
+            .filter(|(_, n)| n.as_str() == name)
+            .map(|(&id, _)| id)
+            .min(),
+    }
+}
+
 /// Sounds read from the banks: the fight's and the ambient one-shots.
 type BankSounds = ([Option<SoundBuffer>; 6], [Vec<SoundBuffer>; 2]);
 
@@ -1234,6 +1284,8 @@ impl GameAudio {
             punches: HashMap::new(),
             shots: (0, 0),
             launches: (0, 0),
+            blasts_heard: [0; 3],
+            blasts_primed: false,
             spins: Vec::new(),
         };
         audio.prime_guns();
@@ -1809,7 +1861,7 @@ impl GameAudio {
     }
 
     /// Plays the fight's sounds where they happened.
-    pub fn play_fight(&mut self, sounds: &[Sound]) {
+    pub fn play_fight(&mut self, sounds: &[Sound], db: Option<&m2_engine::world::Templates>) {
         self.keys_loaded();
         self.spins_stopped();
         for sound in sounds {
@@ -1866,8 +1918,22 @@ impl GameAudio {
                         _ => (4, at, 1.0),
                     }
                 }
-                Sound::Explosion(at) => (2, at, 1.4),
-                Sound::Bomb(at) => (2, at, 2.5),
+                Sound::Explosion { at, of } => {
+                    if self.play_blast(at, of, db) {
+                        continue;
+                    }
+                    (2, at, 1.4)
+                }
+                Sound::Bomb { at, of } => {
+                    if self.play_blast(at, of, db) {
+                        continue;
+                    }
+                    (2, at, 2.5)
+                }
+                Sound::Frag { at, of } => {
+                    self.play_blast(at, Some(of), db);
+                    continue;
+                }
                 Sound::Collapse(at) => (5, at, 2.0),
                 Sound::Break { at, key } => {
                     self.play_key(key, at);
@@ -1891,6 +1957,77 @@ impl GameAudio {
         }
     }
 
+    /// A blast going off at `at`, of template `of`: what its template's
+    /// `SoundEffect` plays as it comes into being ([`blast_heard`]). True
+    /// when the data decides it (its cue played, or nothing to play);
+    /// false when it says nothing (no template known, no record, or a
+    /// sound set the `Sounds` table has no row for), and the alpha's own
+    /// blast stands in.
+    fn play_blast(
+        &mut self,
+        at: Vec3,
+        of: Option<Blasted>,
+        db: Option<&m2_engine::world::Templates>,
+    ) -> bool {
+        if let Some(db) = db {
+            self.prime_blasts(db);
+        }
+        let template = of.zip(db).and_then(|(b, db)| blast_template(db, b));
+        let spawn = template
+            .zip(db)
+            .and_then(|(t, db)| db.spawn_sounds.get(&t).copied());
+        let draw = self.random();
+        let heard = blast_heard(spawn.as_ref(), &self.gun_cues, draw);
+        let n = match heard {
+            BlastHeard::Cue(cue) => {
+                self.play_key(cue, at);
+                0
+            }
+            BlastHeard::Silent => 1,
+            BlastHeard::Unknown => 2,
+        };
+        self.blasts_heard[n] += 1;
+        let [a, b, c] = self.blasts_heard;
+        if (a + b + c) % 10 == 1 {
+            eprintln!(
+                "sound: {} blasts: {a} with their template's own cue, {b} silent as their \
+                 template says, {c} with the beta's standing in",
+                a + b + c
+            );
+        }
+        heard != BlastHeard::Unknown
+    }
+
+    /// Starts reading every blast template's own cue, once a template
+    /// database is at hand, so that the first blast of each is heard on
+    /// time.
+    fn prime_blasts(&mut self, db: &m2_engine::world::Templates) {
+        if self.blasts_primed {
+            return;
+        }
+        self.blasts_primed = true;
+        let mut cues: Vec<u32> = db
+            .ordnance
+            .blasts
+            .keys()
+            .filter_map(|t| db.spawn_sounds.get(t))
+            .filter_map(|s| match blast_heard(Some(s), &self.gun_cues, 0.0) {
+                BlastHeard::Cue(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        cues.sort_unstable();
+        cues.dedup();
+        eprintln!(
+            "sound: {} blast templates, {} cues of their own to read",
+            db.ordnance.blasts.len(),
+            cues.len()
+        );
+        for cue in cues {
+            self.ask_key(cue);
+        }
+    }
+
     /// Plays what sound key `key` plays at `at`, as its cue's volume has
     /// it; a key not yet read is read on a thread, and played once read
     /// if still fresh ([`KEY_FRESH`]). A key that nothing answers stays
@@ -1902,7 +2039,7 @@ impl GameAudio {
                 let pick = self.random();
                 if let Some(buffer) = found.pick(pick).cloned() {
                     eprintln!(
-                        "sound: break, key {key:08x}, sound {:08x} ({:.2} s) at {at:.1}",
+                        "sound: key {key:08x}, sound {:08x} ({:.2} s) at {at:.1}",
                         buffer.hash,
                         buffer.seconds()
                     );
@@ -1914,7 +2051,7 @@ impl GameAudio {
                     self.out.with(|m| m.play(play));
                 }
             }
-            Some(None) => eprintln!("sound: break, key {key:08x}: nothing found for it, silent"),
+            Some(None) => eprintln!("sound: key {key:08x}: nothing found for it, silent"),
             None => {
                 if self.install.is_none() {
                     self.keys.insert(key, None);
@@ -2452,6 +2589,67 @@ impl GameAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The grenade's blast as the data has it: set `701d113d`, whose
+    /// only `Sounds` row is the create event's, cue `19152b89`.
+    fn grenade_blast() -> (m2_engine::spawn_sound::SpawnSound, GunCues) {
+        let any = m2_assets::animation_table::ANY;
+        let set = 0x701d_113d;
+        (
+            m2_engine::spawn_sound::SpawnSound {
+                set,
+                mode: 1,
+                chance: 1.0,
+                reach: Some(125.0),
+            },
+            GunCues::from_rows([[set, m2_engine::spawn_sound::CREATE_EVENT, any, 0x1915_2b89]]),
+        )
+    }
+
+    #[test]
+    fn a_blast_plays_its_sets_create_cue() {
+        let (g, cues) = grenade_blast();
+        assert_eq!(
+            blast_heard(Some(&g), &cues, 0.3),
+            BlastHeard::Cue(0x1915_2b89)
+        );
+    }
+
+    #[test]
+    fn a_blast_whose_record_plays_nothing_is_silent_not_stood_in_for() {
+        let (g, cues) = grenade_blast();
+        let frag = m2_engine::spawn_sound::SpawnSound { set: 0, ..g };
+        assert_eq!(blast_heard(Some(&frag), &cues, 0.0), BlastHeard::Silent);
+        let half = m2_engine::spawn_sound::SpawnSound { chance: 0.5, ..g };
+        assert_eq!(blast_heard(Some(&half), &cues, 0.9), BlastHeard::Silent);
+    }
+
+    #[test]
+    fn a_blast_the_data_says_nothing_of_is_unknown() {
+        let (g, cues) = grenade_blast();
+        assert_eq!(blast_heard(None, &cues, 0.0), BlastHeard::Unknown);
+        let rowless = m2_engine::spawn_sound::SpawnSound {
+            set: 0x90df_6e5b,
+            ..g
+        };
+        assert_eq!(blast_heard(Some(&rowless), &cues, 0.0), BlastHeard::Unknown);
+    }
+
+    #[test]
+    fn a_named_blast_is_the_lowest_id_so_named() {
+        let mut db = m2_engine::world::Templates::default();
+        db.names
+            .insert(0x8000_8e3f, "Explosion (Airstike Bomb)".into());
+        db.names
+            .insert(0x8000_9000, "Explosion (Airstike Bomb)".into());
+        db.names.insert(0x8000_0001, "Other".into());
+        assert_eq!(
+            blast_template(&db, Blasted::Named("Explosion (Airstike Bomb)")),
+            Some(0x8000_8e3f)
+        );
+        assert_eq!(blast_template(&db, Blasted::Id(7)), Some(7));
+        assert_eq!(blast_template(&db, Blasted::Named("None")), None);
+    }
 
     #[test]
     fn a_radio_is_full_close_by_and_silent_at_its_reach() {

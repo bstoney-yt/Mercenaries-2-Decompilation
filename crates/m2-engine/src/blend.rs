@@ -109,8 +109,9 @@ pub const GAIT: f32 = 0.3;
 pub const STILL: f32 = 0.01;
 
 /// The node's gait threshold above the run when the template has no
-/// faster sprint (the float at 0x82108BFC, as 0x828070D0 stores it).
-const NO_SPRINT: f32 = 2.003_358;
+/// faster sprint: `FLT_MAX` (the float at 0x820F8BFC, as 0x828070D0
+/// stores it; first misread as 0x82108BFC, a .pdata word read as 2.0034).
+const NO_SPRINT: f32 = f32::MAX;
 
 /// A gait the locomotion node plays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -127,8 +128,7 @@ pub enum LocoGait {
 /// with the thresholds of 0x828070D0): below halfway from walk to jog it
 /// walks, below halfway from jog to run it jogs, below halfway from run to
 /// sprint it runs, and otherwise sprints. With no sprint faster than the
-/// run, the last threshold is a constant below the others, so anything at
-/// or past the jog-to-run threshold sprints.
+/// run (the program's default, -1), there is no sprint: it runs on.
 pub fn gait(paces: [f32; 4], speed: f32) -> LocoGait {
     if speed <= STILL {
         return LocoGait::Still;
@@ -307,8 +307,9 @@ mod tests {
         assert_eq!(gait(people, 1.84), Walk);
         assert_eq!(gait(people, 1.85), Jog);
         assert_eq!(gait(people, 3.74), Jog);
-        assert_eq!(gait(people, 3.75), Sprint);
-        assert_eq!(gait(people, 5.0), Sprint);
+        assert_eq!(gait(people, 3.75), Run);
+        assert_eq!(gait(people, 5.0), Run);
+        assert_eq!(gait(people, 50.0), Run);
         assert_eq!((super::GAIT, super::STILL), (0.3, 0.01));
     }
 

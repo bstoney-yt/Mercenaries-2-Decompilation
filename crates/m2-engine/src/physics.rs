@@ -1420,6 +1420,24 @@ fn noise_table() -> &'static [f32; 256] {
     })
 }
 
+/// How an AI pilot's stick wobbles at `time` (the game's clock, s), as the
+/// 360 code's 0x821A1DC0 works it each step from [`noise`]: added to the
+/// speed asked ahead, (n(t + 205.642) + 1) / 4; sideways,
+/// (n(t / 4 + 128.245) - 1/2) x 4; and to the climb asked,
+/// -(n(2t + 5.111) + 1) / 4; each held to -1..1. None once it has been on
+/// the ground over half a second (its `ground`, s), and none with the
+/// player at the stick (its object's 0x68, taken for that: inferred).
+fn ai_wobble(time: f32, ground: f32) -> [f32; 3] {
+    if ground > 0.5 {
+        return [0.0; 3];
+    }
+    [
+        ((noise(time + 205.642) + 1.0) * 0.25).clamp(-1.0, 1.0),
+        ((noise(time * 0.25 + 128.245) - 0.5) * 4.0).clamp(-1.0, 1.0),
+        (-(noise(time * 2.0 + 5.111) + 1.0) * 0.25).clamp(-1.0, 1.0),
+    ]
+}
+
 /// Where in its turbulence a helicopter is, 0 to 1, from its id as the
 /// 360 code takes it from its entity's (0x821A2F00: two steps of the
 /// generator 0x19660D, 0x3C6EF35F from id ^ 0xC71C2830, made a float in
@@ -1458,6 +1476,13 @@ fn turbulence(phase: f32, time: f32, spin: f32, air: f32, ground: f32) -> (f32, 
 /// A helicopter's handling and what its pilot asks of it.
 struct Rotorcraft {
     flight: FlightTuning,
+    /// Its handling with an AI at the stick (`_HelicopterPhysicsAi`), if
+    /// its template gives one.
+    flight_ai: Option<FlightTuning>,
+    /// An AI flies it ([`Physics::set_ai_pilot`]): it flies by
+    /// [`flight_ai`](Self::flight_ai) and its stick wobbles
+    /// ([`ai_wobble`]).
+    ai: bool,
     controls: VehicleControls,
     /// Up (1) or down (-1).
     lift: f32,
@@ -1567,6 +1592,7 @@ impl Rotor {
         &mut self,
         f: &FlightTuning,
         stick: Stick,
+        shake: [f32; 3],
         turn: Quat,
         velocity: Vec3,
         angular: Vec3,
@@ -1609,13 +1635,15 @@ impl Rotor {
         let ahead = z.with_y(0.0).normalize_or_zero();
         let right = (-x).with_y(0.0).normalize_or_zero();
         // Ahead and sideways.
-        let stick_ahead = stick.ahead.clamp(-1.0, 1.0);
+        // An AI's wobble ([`ai_wobble`]) on the speed asked, not on how
+        // hard it pulls (0x821A28F8, 0x821A2990).
+        let stick_ahead = (stick.ahead + shake[0]).clamp(-1.0, 1.0);
         let pull = f.forward_accel * (1.0 - (1.0 - stick.ahead * stick.ahead) * f.no_input_inertia);
         out.impulse += ahead
             * (pull * (stick_ahead * f.forward - ahead.dot(velocity)) * mass * dt * spin * air);
         out.impulse += right
             * (f.sideways_accel
-                * (stick.right.clamp(-1.0, 1.0) * f.sideways - right.dot(velocity))
+                * ((stick.right + shake[1]).clamp(-1.0, 1.0) * f.sideways - right.dot(velocity))
                 * air
                 * mass
                 * dt
@@ -1642,8 +1670,9 @@ impl Rotor {
         // Its climb, at full rotor only: the weight held, the climb
         // asked, fading out above the ceiling.
         if spin == 1.0 {
-            self.climb =
-                (self.climb + (stick.lift.clamp(-1.0, 1.0) - self.climb) * dt).clamp(-1.0, 1.0);
+            self.climb = (self.climb
+                + ((stick.lift + shake[2]).clamp(-1.0, 1.0) - self.climb) * dt)
+                .clamp(-1.0, 1.0);
             let high = ((height - CEILING) / CEILING_FADE).clamp(0.0, 1.0);
             out.impulse.y += (f.climb * self.climb - velocity.y + 1.0)
                 * gravity
@@ -1714,23 +1743,38 @@ struct BikeFooting {
 /// them (0x82273F90, from the turret update 0x82275608): a hinge between
 /// the turret part's body and its parent's about the turret's up, its
 /// turn limited to its record's arc unless that goes all the way round,
-/// with a motor driving it toward the angle asked at 20 times the angle
-/// still to go a second, as hard as its `maxForce`, the turret's mass x
-/// (20 + 6 x its `maxYawAccel`, radians; inferred: the 360 reads the
-/// turret def's +0x1C there, taken for that field), N m. The angle asked
-/// moves at most its record's turn rate a second (0x82273C88: here
-/// [`Physics::turn_turret`]'s caller's). Havok's motor field names are
-/// inferred from its usual layout.
+/// with no motor (the yaw hinge is built unmotorised, 0x82275898). An
+/// action on the turret's body (0x82273C88, stepped by 0x821A65D0) turns
+/// it instead, once first asked: from its spin about its own up `w`, its
+/// heading's error `e` from the hull's heading + the angle asked, the step
+/// `dt`, its spin becomes `w + dt (1000 e - c w)` held to its
+/// `MaxYawSpeed` either way, changed by at most its `MaxYawAccel` x `dt`,
+/// where `c` is 200, or (the turn asked faster than it spins) the
+/// global at 0x8380EC18, which no code writes (zero; [`TURRET_LEAD_DAMP`]).
 struct TurretHinge {
     body: r::RigidBodyHandle,
-    joint: r::ImpulseJointHandle,
-    force: f32,
-    /// The angle asked, radians.
+    /// Its fastest turn, radians a second (`MaxYawSpeed`), and how fast
+    /// its turn may change, radians a second squared (`MaxYawAccel`).
+    speed: f32,
+    accel: f32,
+    /// The angle asked, radians (from the hull's ahead).
     target: f32,
+    /// The angle asked when it was last driven; `None` before it is
+    /// first asked to turn (the 360's action does nothing until then).
+    last: Option<f32>,
     /// Its gun on a body of its own, hinged to the turret's
     /// ([`VehicleSpec::gun_body`]).
     gun: Option<GunHinge>,
 }
+
+/// The 360 turret action's pull on its heading's error and its damping
+/// of its spin (0x821A65D0: the constants at 0x82DE8C2C and 0x820B7FB4).
+const TURRET_PULL: f32 = 1000.0;
+const TURRET_DAMP: f32 = 200.0;
+/// Its damping while the turn asked is faster than it spins: the global
+/// it reads there (0x8380EC18) is in zeroed memory and no code found
+/// writes it (searched as a store, an immediate and a pointer), so 0.
+const TURRET_LEAD_DAMP: f32 = 0.0;
 
 /// A turret's gun on a body of its own, on a hinge across the turret
 /// at its trunnions, as the 360 code builds it (0x82275974 calls
@@ -2608,6 +2652,36 @@ fn float_hull(hull: &mut Hull, b: &mut r::RigidBody, water: f32, touched: bool, 
     wet
 }
 
+/// An intact boat's velocity after the water's drag for a step `dt`, as
+/// the 360 code drags it (0x8219A5E0, from 0x8219A9D4): along each of
+/// its own axes (its hull turned `turn`), its velocity along it x its
+/// template's drag that way (`WaterDragFwd`, `WaterDragSide`,
+/// `WaterDragUp`), against the motion, x the step x its share of the
+/// water (an impulse of that x its mass, so a change in velocity of it).
+/// On its handbrake the level part of the drag across it is lifted by its
+/// `HandBrakeAntiSideDrag` x its handbrake x its share of its top speed
+/// (0x8219A9F0), and its `HandBrakeMomentumKeep` x its handbrake x the
+/// size of the drag across it left x the step x its share of the water
+/// pushes it along its level ahead, never down (0x8219AB4C). Neither is
+/// held to a range there.
+fn boat_drag(hull: &Hull, turn: Quat, velocity: Vec3, dt: f32) -> Vec3 {
+    let (w, f) = (hull.water, hull.water.float);
+    let (x, y, z) = (turn * Vec3::X, turn * Vec3::Y, turn * Vec3::Z);
+    let gone = if f.top > 1e-4 {
+        (velocity.length() / f.top).min(1.0)
+    } else {
+        1.0
+    };
+    let lift = f.anti_side_drag * hull.handbrake * gone;
+    let mut across = x * (w.drag[1] * velocity.dot(x));
+    across -= across.with_y(0.0) * lift;
+    let drag = z * (w.drag[0] * velocity.dot(z)) + across + y * (w.drag[2] * velocity.dot(y));
+    let share = hull.water_share;
+    let keep = f.momentum_keep * hull.handbrake * across.length() * dt * share;
+    let push = (z.with_y(0.0) * keep).with_y(0.0);
+    velocity - drag * dt * share + push
+}
+
 /// Pushes a wheeled vehicle along and across with each of its axles as
 /// the 360 code does ([`Tyres`]; from the 360 code, at 0x8219C118 and
 /// 0x821A08D8): at the mean, over its wheels on the ground, of a point
@@ -3022,7 +3096,7 @@ impl Physics {
                 }
             }
         }
-        self.drive_turrets();
+        self.drive_turrets(dt);
         self.float_boats(dt);
         self.fly_helicopters(dt);
         self.cap_debris_speeds();
@@ -3088,30 +3162,20 @@ impl Physics {
                 continue;
             }
             let ease = |rate: f32| 1.0 - (rate * dt * wet).min(1.0);
-            // The water slows it along, across and up and down (its engine
-            // and brake pushed it in [`float_hull`], from 0x82199B08).
-            let side = Vec3::new(ahead.z, 0.0, -ahead.x);
             let velocity = vec3(b.linvel());
             let w = hull.water;
-            // On its handbrake the drag across it is lifted by its
-            // `HandBrakeAntiSideDrag` x its handbrake x its share of its
-            // top speed, and its `HandBrakeMomentumKeep` x its handbrake x
-            // the drag across it left pushes it on ahead instead (the 360
-            // code's 0x8219A9F0 and 0x8219AB4C, level, by its share of
-            // the water). Neither is held to a range there.
-            let f = w.float;
-            let gone = if f.top > 1e-4 {
-                (velocity.length() / f.top).min(1.0)
+            if v.wrecked {
+                // A wreck is slowed along, across and up and down as its
+                // template's drag says, level (invented: the 360's wreck
+                // has no boat action).
+                let side = Vec3::new(ahead.z, 0.0, -ahead.x);
+                let along = velocity.dot(ahead) * ease(w.drag[0]);
+                let across = velocity.dot(side) * ease(w.drag[1]);
+                let rise = velocity.y * ease(w.drag[2]);
+                b.set_linvel(vector(ahead * along + side * across + Vec3::Y * rise), true);
             } else {
-                1.0
-            };
-            let side_drag = w.drag[1] * (1.0 - f.anti_side_drag * hull.handbrake * gone);
-            let across_now = velocity.dot(side);
-            let kept = f.momentum_keep * hull.handbrake * (side_drag * across_now).abs() * dt * wet;
-            let along = velocity.dot(ahead) * ease(w.drag[0]) + kept;
-            let across = across_now * ease(side_drag);
-            let rise = velocity.y * ease(w.drag[2]);
-            b.set_linvel(vector(ahead * along + side * across + Vec3::Y * rise), true);
+                b.set_linvel(vector(boat_drag(hull, turn, velocity, dt)), true);
+            }
             // An intact boat's helm turned it with its springs
             // ([`float_hull`]); a wreck stops turning and rocking
             // (invented).
@@ -3165,9 +3229,21 @@ impl Physics {
                 continue;
             };
             let p = b.position();
+            // An AI at the stick flies by its AI handling and wobbles.
+            let flight = if r.ai {
+                r.flight_ai.unwrap_or(r.flight)
+            } else {
+                r.flight
+            };
+            let shake = if r.ai && !v.wrecked {
+                ai_wobble(self.time, r.state.ground)
+            } else {
+                [0.0; 3]
+            };
             let flown = r.state.fly(
-                &r.flight,
+                &flight,
                 stick,
+                shake,
                 Quat::from_array(p.rotation.to_array()),
                 vec3(b.linvel()),
                 vec3(b.angvel()),
@@ -3753,19 +3829,16 @@ impl Physics {
                     insert_collider(&mut self.world, c, Some(turret_body));
                 }
                 let t = spec.tuning.turret;
-                let accel = t.map_or(0.0, |t| t.yaw_accel);
                 let mut joint = r::RevoluteJointBuilder::new(r::Vector::Y)
                     .local_anchor1(vector(mount))
                     .local_anchor2(vector(mount))
-                    .contacts_enabled(false)
-                    .motor_model(r::MotorModel::ForceBased)
-                    .motor_max_force(m.mass * (20.0 + 6.0 * accel));
+                    .contacts_enabled(false);
                 if let Some((lo, hi)) = t.and_then(|t| t.yaw)
                     && hi - lo < std::f32::consts::TAU - 0.01
                 {
                     joint = joint.limits([lo, hi]);
                 }
-                let joint = self.world.insert_impulse_joint(body, turret_body, joint);
+                self.world.insert_impulse_joint(body, turret_body, joint);
                 let gun = spec
                     .gun_body
                     .as_ref()
@@ -3784,9 +3857,10 @@ impl Physics {
                     });
                 Some(TurretHinge {
                     body: turret_body,
-                    joint,
-                    force: m.mass * (20.0 + 6.0 * accel),
+                    speed: t.map_or(0.0, |t| t.yaw_speed),
+                    accel: t.map_or(0.0, |t| t.yaw_accel),
                     target: 0.0,
+                    last: None,
                     gun,
                 })
             }
@@ -3954,6 +4028,8 @@ impl Physics {
             .filter(|_| spec.is_helicopter())
             .map(|flight| Rotorcraft {
                 flight,
+                flight_ai: spec.tuning.flight_ai,
+                ai: false,
                 controls: VehicleControls {
                     parked: true,
                     ..VehicleControls::default()
@@ -4359,6 +4435,7 @@ impl Physics {
             return;
         };
         if let Some(h) = &mut v.hinge {
+            h.last = h.last.or(Some(yaw));
             h.target = yaw;
             return;
         }
@@ -4372,29 +4449,56 @@ impl Physics {
         }
     }
 
-    /// Drives each turret on its own body toward the angle asked
-    /// ([`TurretHinge`]): its motor's speed 20 times the angle still to go.
-    fn drive_turrets(&mut self) {
+    /// Turns each turret on its own body toward the angle asked as the
+    /// 360's turret action does ([`TurretHinge`]), and drives its gun's
+    /// motor toward the pitch asked ([`GunHinge`]); `dt` the step.
+    fn drive_turrets(&mut self, dt: f32) {
+        let wrap = |a: f32| {
+            let a = a.rem_euclid(std::f32::consts::TAU);
+            if a > std::f32::consts::PI {
+                a - std::f32::consts::TAU
+            } else {
+                a
+            }
+        };
+        let heading = |q: Quat| {
+            let f = q * Vec3::Z;
+            f.x.atan2(f.z)
+        };
         for i in 0..self.vehicles.len() {
-            let Some((joint, force, target)) = self.vehicles[i]
-                .as_ref()
-                .and_then(|v| v.hinge.as_ref())
-                .map(|h| (h.joint, h.force, h.target))
-            else {
+            let Some(v) = self.vehicles[i].as_mut() else {
                 continue;
             };
-            let Some(now) = self.turret_yaw(VehicleId(i)) else {
-                continue;
-            };
-            let mut off = (target - now).rem_euclid(std::f32::consts::TAU);
-            if off > std::f32::consts::PI {
-                off -= std::f32::consts::TAU;
+            let chassis = v.controller.chassis;
+            if let Some(h) = v.hinge.as_mut()
+                && let Some(last) = h.last
+                && dt > 0.0
+            {
+                // The turn asked this step (0x8227582C: its change / dt).
+                let asked = wrap(h.target - last) / dt;
+                h.last = Some(h.target);
+                let hull = self
+                    .world
+                    .bodies
+                    .get(chassis)
+                    .map(|b| Quat::from_array(b.position().rotation.to_array()));
+                if let (Some(hull), Some(b)) = (hull, self.world.bodies.get_mut(h.body)) {
+                    let turn = Quat::from_array(b.position().rotation.to_array());
+                    let up = turn * Vec3::Y;
+                    let spin = vec3(b.angvel());
+                    let w = spin.dot(up);
+                    let e = wrap(heading(hull) + h.target - heading(turn));
+                    let damp = if asked * asked > w * w {
+                        TURRET_LEAD_DAMP
+                    } else {
+                        TURRET_DAMP
+                    };
+                    let want = (w + dt * (TURRET_PULL * e - damp * w)).clamp(-h.speed, h.speed);
+                    let change = (want - w).clamp(-h.accel * dt, h.accel * dt);
+                    b.set_angvel(vector(spin + up * change), change.abs() > 1e-6);
+                }
             }
-            if let Some(j) = self.world.impulse_joints.get_mut(joint, off.abs() > 1e-4) {
-                j.data
-                    .set_motor_velocity(r::JointAxis::AngX, 20.0 * off, force);
-            }
-            // Its gun likewise, to the pitch asked.
+            // Its gun to the pitch asked.
             let Some((joint, force, target)) = self.vehicles[i]
                 .as_ref()
                 .and_then(|v| v.hinge.as_ref())
@@ -4470,6 +4574,58 @@ impl Physics {
         let q = Quat::from_array(hull.position().rotation.to_array()).inverse()
             * Quat::from_array(turret.position().rotation.to_array());
         Some(2.0 * q.y.atan2(q.w))
+    }
+
+    /// An AI pilot's stick messages for a helicopter
+    /// ([`crate::heli_pilot::PilotStick`], the 360's lift, yaw, ahead and
+    /// sideways), as its pad's would be.
+    pub fn pilot_helicopter(&mut self, id: VehicleId, stick: crate::heli_pilot::PilotStick) {
+        let Some(r) = self
+            .vehicles
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .and_then(|v| v.rotor.as_mut())
+        else {
+            return;
+        };
+        r.lift = stick.lift;
+        r.strafe = stick.right;
+        r.controls = VehicleControls {
+            throttle: stick.ahead,
+            steer: -stick.yaw,
+            ..VehicleControls::default()
+        };
+    }
+
+    /// The ground straight under a vehicle as an AI pilot looks for it:
+    /// the first thing solid but itself down from 1000 m to -1000 m
+    /// (0x822ED8C0), its height.
+    pub fn ground_under(&self, id: VehicleId, at: Vec3) -> Option<f32> {
+        self.cast_ray_past(Vec3::new(at.x, 1000.0, at.z), Vec3::NEG_Y, 2000.0, id)
+            .map(|(d, _)| 1000.0 - d)
+    }
+
+    /// Whether a helicopter has been off everything for half a second or
+    /// more, as its pilot's mind reads its physics' ground time
+    /// (0x822BCDC8: not over 0.5 s); `None` for one that isn't.
+    pub fn helicopter_airborne(&self, id: VehicleId) -> Option<bool> {
+        let v = self.vehicles.get(id.0).and_then(Option::as_ref)?;
+        v.rotor.as_ref().map(|r| r.state.ground <= 0.5)
+    }
+
+    /// Hands a helicopter's stick to an AI (`true`) or back to the
+    /// player: with an AI it flies by its `_HelicopterPhysicsAi` record,
+    /// as the 360 code picks it for one the player does not fly
+    /// (0x8218C1F0), and its stick wobbles ([`ai_wobble`]).
+    pub fn set_ai_pilot(&mut self, id: VehicleId, ai: bool) {
+        if let Some(r) = self
+            .vehicles
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .and_then(|v| v.rotor.as_mut())
+        {
+            r.ai = ai;
+        }
     }
 
     /// Asks a helicopter to climb (1) or come down (-1), as fast as it
@@ -5290,6 +5446,45 @@ impl Physics {
             .map(|(_, hit)| hit.time_of_impact)
     }
 
+    /// How far, of `max` metres along `direction`, a box of half
+    /// extents `half` turned `turn` goes from `origin` before it meets
+    /// something solid, passing through vehicle `skip`.
+    pub fn cast_box(
+        &self,
+        origin: Vec3,
+        turn: Quat,
+        half: Vec3,
+        direction: Vec3,
+        max: f32,
+        skip: Option<VehicleId>,
+    ) -> Option<f32> {
+        let mut filter = solid();
+        if let Some(v) = skip
+            .and_then(|v| self.vehicles.get(v.0))
+            .and_then(Option::as_ref)
+        {
+            filter = filter.exclude_rigid_body(v.controller.chassis);
+            if let Some(h) = &v.hinge {
+                filter = filter.exclude_rigid_body(h.body);
+            }
+        }
+        let cube = r::Cuboid::new(vector(half.max(Vec3::splat(1e-3))));
+        let options = rapier3d::parry::query::ShapeCastOptions {
+            max_time_of_impact: max,
+            stop_at_penetration: false,
+            ..Default::default()
+        };
+        self.world
+            .cast_shape(
+                &pose(origin, turn),
+                vector(direction.normalize_or_zero()),
+                &cube,
+                options,
+                filter,
+            )
+            .map(|(_, hit)| hit.time_of_impact)
+    }
+
     /// The first solid thing along a ray, passing through vehicle `skip`:
     /// its distance, and the vehicle it is if one (what a round hits).
     pub fn cast_ray_vehicle(
@@ -5449,6 +5644,31 @@ mod tests {
     // (`HandBrakeAntiSideDrag`, by its share of its top speed) and the
     // drag left pushes it on ahead (`HandBrakeMomentumKeep`; 0x8219A9F0,
     // 0x8219AB4C); with both 0, as the 360 record's defaults, neither.
+    // The water drags a boat along its own axes, by its template's drag
+    // that way x the step x its share of the water (0x8219A5E0): set
+    // sliding across at 6 m/s afloat, one step takes `WaterDragSide` x 6
+    // x the step off it.
+    #[test]
+    fn the_water_drags_a_boat_along_its_own_axes() {
+        let mut p = Physics::new();
+        p.set_water(0.0);
+        let spec = boat();
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, -0.5, 0.0), 0.0);
+        for _ in 0..240 {
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        let m = p.vehicle_transform(id).unwrap();
+        let side = m.transform_vector3(Vec3::X);
+        let v = p.vehicle_velocity(id);
+        p.set_vehicle_velocity(id, v - side * v.dot(side) + side * 6.0);
+        p.drive(id, VehicleControls::default());
+        p.step(DT);
+        let left = p.vehicle_velocity(id).dot(side);
+        let want = 6.0 - BOAT.drag[1] * 6.0 * DT;
+        assert!((left - want).abs() < 0.02, "{left} of {want}");
+    }
+
     #[test]
     fn a_boat_on_its_handbrake_slides_and_keeps_its_way() {
         let slid = |anti: f32, keep: f32| {
@@ -5494,6 +5714,53 @@ mod tests {
     // (0x11C78A3C; 0x821A25E0): hovering, held right it slides to its
     // right (-x, facing +z) toward its `MaxRightSpeed` (banked into the
     // slide its `BankYawAmplification` turns it a little too).
+    // An AI's stick wobbles as the 360's 0x821A1DC0 has it: a push ahead
+    // of a quarter to a half, a slide of up to 2 either way held to 1, a
+    // pull down of a quarter to a half; none on the ground past 1/2 s.
+    #[test]
+    fn an_ai_s_stick_wobbles_in_the_air_only() {
+        for i in 0..400 {
+            let [a, s, l] = ai_wobble(i as f32 * 0.37, 0.0);
+            assert!((0.25..=0.5).contains(&a), "{a}");
+            assert!((-1.0..=1.0).contains(&s), "{s}");
+            assert!((-0.5..=-0.25).contains(&l), "{l}");
+        }
+        assert_eq!(ai_wobble(3.0, 0.6), [0.0; 3]);
+    }
+
+    // An AI pilot takes a helicopter up off the ground and holds it 30 m
+    // over it, its stick wobbling ([`crate::heli_pilot`]).
+    #[test]
+    fn an_ai_pilot_hovers_a_helicopter_30_m_up() {
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(2000.0, 1.0, 2000.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let spec = helicopter();
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
+        p.set_ai_pilot(id, true);
+        let mut pilot = crate::heli_pilot::HeliPilot::new(
+            crate::tuning::PilotTuning::DEFAULT,
+            &spec.tuning.flight.unwrap(),
+        );
+        for _ in 0..(25.0 / DT) as usize {
+            let m = p.vehicle_transform(id).unwrap();
+            let (_, turn, at) = m.to_scale_rotation_translation();
+            let g = p.ground_under(id, at);
+            pilot.sense(at, turn, p.vehicle_velocity(id), g, DT);
+            let stick = pilot.hover(30.0, true);
+            p.pilot_helicopter(id, stick);
+            p.step(DT);
+        }
+        let y = p.vehicle_transform(id).unwrap().w_axis.y;
+        assert!((y - 30.0).abs() < 1.5, "at {y}");
+        assert!(p.vehicle_velocity(id).length() < 1.0);
+    }
+
     #[test]
     fn a_helicopter_strafes_to_its_right() {
         let mut p = Physics::new();
@@ -5716,8 +5983,13 @@ mod tests {
         assert!((p.gun_pitch(id).unwrap() - 0.3).abs() < 0.03);
     }
 
+    // A turret on its own body is turned by the 360's turret action
+    // (0x821A65D0): left alone until first asked; asked a whole radian at
+    // once, it speeds up no faster than its `MaxYawAccel`, turns no faster
+    // than its `MaxYawSpeed`, and settles on the angle asked, the hull
+    // left as it was.
     #[test]
-    fn a_turret_on_its_own_body_follows_its_hinge_motor() {
+    fn a_turret_on_its_own_body_turns_as_the_360_action_turns_it() {
         let mut p = Physics::new();
         let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
         p.add_static(
@@ -5743,6 +6015,18 @@ mod tests {
             }),
             pivot: Some(Vec3::new(0.0, 2.0, 0.0)),
             mass: 30000.0,
+            tuning: crate::tuning::VehicleTuning {
+                turret: Some(crate::tuning::TurretTuning {
+                    main: true,
+                    yaw_speed: 0.5,
+                    yaw_accel: 2.0,
+                    pitch: (-0.1, 0.3),
+                    pitch_speed: 1.0,
+                    pitch_accel: 20.0,
+                    yaw: None,
+                }),
+                ..car().tuning
+            },
             ..car()
         };
         let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.5, 0.0), 0.0);
@@ -5756,22 +6040,24 @@ mod tests {
             f.x.atan2(f.z)
         };
         let before = heading(&p);
-        let mut asked = 0.0;
-        for _ in 0..90 {
-            asked += DT;
-            p.turn_turret(id, asked);
+        let (mut last, mut fastest, mut early) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..360 {
+            p.turn_turret(id, 1.0);
             p.drive(id, VehicleControls::default());
             p.step(DT);
+            let yaw = p.turret_yaw(id).unwrap();
+            let rate = (yaw - last) / DT;
+            fastest = fastest.max(rate);
+            if i < 6 {
+                early = early.max(rate);
+            }
+            last = yaw;
         }
-        let yaw = p.turret_yaw(id).unwrap();
-        assert!((asked - yaw - 1.0 / 20.0).abs() < 0.03, "{yaw} of {asked}");
+        assert!(early < 2.0 * 0.1 + 0.05, "sped up to {early} in 0.1 s");
+        assert!(fastest < 0.5 + 0.03, "turned at {fastest}");
+        assert!(fastest > 0.45, "turned at {fastest}");
+        assert!((last - 1.0).abs() < 0.02, "at {last}");
         assert!((heading(&p) - before).abs() < 0.05, "hull turned");
-        // Held there, it stays.
-        for _ in 0..60 {
-            p.turn_turret(id, asked);
-            p.step(DT);
-        }
-        assert!((p.turret_yaw(id).unwrap() - asked).abs() < 0.01);
     }
 
     // A turret's colliders turn with it ([`Physics::turn_turret`]): a

@@ -2253,12 +2253,12 @@ impl Game {
         let fresh: Vec<_> = scene.strikes.burst[before..].to_vec();
         for (_, template, at) in fresh {
             let ordnance = &world.index.template_db.ordnance;
-            let infos: Vec<_> = template
+            let (ids, infos): (Vec<u32>, Vec<_>) = template
                 .map(|t| ordnance.blasts_of(t))
                 .unwrap_or_default()
                 .iter()
-                .filter_map(|b| ordnance.blasts.get(b))
-                .collect();
+                .filter_map(|b| ordnance.blasts.get(b).map(|i| (*b, i)))
+                .unzip();
             let blasts: Vec<(f32, f32)> = infos.iter().map(|b| (b.radius, b.damage)).collect();
             // The strongest push of those going off together
             // ([`crate::destruct::together`]).
@@ -2281,10 +2281,11 @@ impl Game {
             // The first is the blast itself; the rest (its frag) reach
             // further with the same push.
             if let Some(&(radius, damage)) = blasts.first() {
-                self.combat.blast(&mut field, at, radius, damage);
+                self.combat
+                    .blast(&mut field, at, radius, damage, ids.first().copied());
             }
-            for &(radius, damage) in blasts.iter().skip(1) {
-                self.combat.harm_at(&mut field, at, radius, damage);
+            for (&(radius, damage), &id) in blasts.iter().zip(&ids).skip(1) {
+                self.combat.harm_at(&mut field, at, radius, damage, id);
             }
             if let (Some(reach), Some(push)) = (blasts.iter().map(|b| b.0).reduce(f32::max), push) {
                 blast_loose(world, &mut scene.props, &[push], reach >= combat::BOMB.0);

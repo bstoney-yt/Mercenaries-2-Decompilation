@@ -184,6 +184,13 @@ impl GunCues {
         Self::from_table(&table).ok_or_else(|| "the Sounds table lacks a column".to_owned())
     }
 
+    /// The cue sound set `set` plays for the event whose name hashes to
+    /// `event` (for one whose name is not known:
+    /// [`crate::spawn_sound::CREATE_EVENT`]).
+    pub fn cue_of(&self, set: u32, event: u32) -> Option<u32> {
+        self.cues.get(&(set, event)).copied()
+    }
+
     /// The cue sound set `set` plays for `event` ([`FIRE`], ...).
     pub fn cue(&self, set: u32, event: &str) -> Option<u32> {
         self.cues.get(&(set, name_hash(event))).copied()
