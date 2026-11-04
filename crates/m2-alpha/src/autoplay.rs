@@ -195,6 +195,9 @@ const DEFEND_HURRIED: f32 = 12.0;
 /// order is hers to choose.
 const SAVE_FOR_LAST: &[&str] = &["oilcon002_loc_postC"];
 const HURRY_FOR: f32 = 65.0;
+/// Racing, she drives straight at the checkpoint while she has gained on
+/// it within this long, seconds; else round what is in the way.
+const RACE_STRAIGHT_FOR: f32 = 2.0;
 /// Aimed this long (seconds) with something in the way, she goes where she
 /// can see her target from: on rings this far out (metres), no higher or
 /// lower than she stands by more than this if she can (metres).
@@ -1038,6 +1041,14 @@ pub struct Autoplay {
 }
 
 impl Autoplay {
+    /// Whether a race of the scripts' is on: its objective is shown
+    /// (`MrxTaskRace`'s "Race to the checkpoint").
+    fn racing(&self) -> bool {
+        self.objectives
+            .iter()
+            .any(|o| o.starts_with("Race to the checkpoint"))
+    }
+
     /// One tick: how she plays it, from the scripts' markers. `objectives`
     /// (as shown) are logged as they change. May hop her ahead, or put
     /// her back on the ground.
@@ -1839,6 +1850,28 @@ impl Autoplay {
     }
 
     fn choose(&self, game: &Game, marks: &[Mark]) -> Option<(Goal, String)> {
+        // A race on, in a vehicle: the contract's next checkpoint before
+        // anything else (round 35: OilCon005 left its race for a job's fuel,
+        // ChiCon008 waited at a barrel).
+        if self.racing()
+            && let Some(p) = game.scene.player.as_ref()
+            && p.driving.is_some()
+            && let Some(m) = marks
+                .iter()
+                .filter(|m| m.alive && m.kind == "deliverable" && for_a_contract(m))
+                .min_by(|a, b| {
+                    a.at.distance(game.focus())
+                        .total_cmp(&b.at.distance(game.focus()))
+                })
+        {
+            return Some((
+                Goal::Reach {
+                    target: m.target,
+                    at: m.at,
+                },
+                format!("racing to {} ({:#x})", m.name, m.target),
+            ));
+        }
         // Off a contract with one on offer, a job's or collection's marks
         // wait: the contract comes first (story run B3: she called
         // satellite bombs on PmcJob001's treasures from the PMC HQ).
@@ -3014,7 +3047,10 @@ impl Autoplay {
         } else {
             1.0
         };
-        if (d < SLOW_NEAR && speed > SLOW) || (angle.abs() > 0.8 && speed > SLOW) {
+        // (Racing, no slowing for the checkpoint: it is passed within 10 m,
+        // and the next leg's seconds start there.)
+        let racing = self.racing();
+        if (!racing && d < SLOW_NEAR && speed > SLOW) || (angle.abs() > 0.8 && speed > SLOW) {
             throttle = throttle.min(0.2);
         }
         // Goods riding on her truck (PirCon002's rum): no faster than a
@@ -3026,7 +3062,9 @@ impl Autoplay {
         // 20 m/s, 240 damage, and the blast killed him).
         let frail = game.scene.vehicles[i].most_health() <= FRAIL
             || game.scene.people.aboard().len() > game.scene.people.gunners();
-        let laden = game.scene.props.carrying(i) || frail;
+        // Not racing: the race's clock is what loses it (OilCon005 gives
+        // 8 s, then 7 s a checkpoint: `nStartTime`, `nAddTime`).
+        let laden = (game.scene.props.carrying(i) || frail) && !racing;
         if laden && speed > if frail { FRAIL_SPEED } else { LADEN_SPEED } {
             throttle = 0.0;
         }
@@ -4538,7 +4576,19 @@ impl Autoplay {
             at
         };
         // Far, by road.
-        let at = if boat {
+        // Racing in a vehicle: straight at the checkpoint, no roads and no
+        // ways round (the races' legs give seconds, not minutes: OilCon005
+        // round 35 never came within 93 m of its second checkpoint by its
+        // way round), while she gains on it; short of that for
+        // [`RACE_STRAIGHT_FOR`] (a wall, a house in the way: ChiCon008
+        // round 36 stood 19 s against one 103 m from its twelfth), round
+        // what is in the way, not by road.
+        let racing = self.racing() && driving.is_some();
+        if racing && self.clock - self.best.1 < RACE_STRAIGHT_FOR {
+            self.way = None;
+            return at;
+        }
+        let at = if boat || racing {
             at
         } else {
             self.by_road(game, pos, at)
@@ -6798,6 +6848,7 @@ mod tests {
             shapes: Default::default(),
             material: None,
             turret_shapes: Default::default(),
+            turret_mass: None,
             wreck: None,
             tuning: Default::default(),
         };
@@ -6888,6 +6939,7 @@ mod tests {
                 class: None,
                 semi: false,
                 rate_of_fire: 200.0,
+                aim_ai: 15f32.to_radians(),
                 clip: 50,
                 reserve_clips: 0,
                 pellets: 1,

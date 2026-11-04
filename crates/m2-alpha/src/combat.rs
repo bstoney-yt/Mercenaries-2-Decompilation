@@ -409,8 +409,9 @@ const CANNON_FLASH_TIME: f32 = 0.3;
 /// machine gun on anything else with a turret (seconds between rounds,
 /// damage, range). Invented, like the rest of the rules.
 const CANNON_RELOAD: f32 = 2.5;
-/// A turret's gun fires at the crosshair when it points within this of
-/// it, radians; else along its barrel.
+/// Her turret's gun fires at the crosshair when it points within this of
+/// it, radians; else along its barrel (invented; the 360 code's AI
+/// riders wait for no such thing, [`Combat::gunners_fire`]).
 const LAID: f32 = 0.06;
 const SHELL_SPEED: f32 = 150.0;
 const MG_GAP: f32 = 0.09;
@@ -522,6 +523,9 @@ fn within_bash(feet: Vec3, ahead: Vec3, middle: Vec3, half: f32) -> bool {
     to.length() <= BASH_REACH + half && to.normalize_or_zero().dot(ahead) >= BASH_ARC
 }
 const BASH_DAMAGE: f32 = 60.0;
+/// The `Bash` record's `BashRange`, metres (its registered default,
+/// schema 0x823F43D8).
+const BASH_RANGE: f32 = 1.0;
 const BASH_BREAK: f32 = 100.0;
 const BASH_PUSH: (f32, f32) = (3.0, 1.0);
 const BASH_GAP: f32 = 0.8;
@@ -1289,7 +1293,7 @@ pub struct Strike {
 }
 
 /// A round's `DamageKey`: its ammunition's, a plain `Bullet` for none.
-fn round_kind(key: Option<u32>) -> u32 {
+pub fn round_kind(key: Option<u32>) -> u32 {
     key.filter(|&k| k != 0)
         .unwrap_or_else(|| m2_assets::name_hash("Bullet"))
 }
@@ -2919,13 +2923,17 @@ impl Combat {
         let target = self.target(f.player, true);
         for i in 0..f.people.npcs.len() {
             if std::mem::take(&mut f.people.npcs[i].fires) {
-                self.npc_shoot(f, i, target);
+                let at = f.people.npcs[i].fire_at.take().or(target);
+                self.npc_shoot(f, i, at);
             }
             if std::mem::take(&mut f.people.npcs[i].launches) {
                 self.npc_launch(f, i, target);
             }
             if let Some(at) = f.people.npcs[i].throws.take() {
                 self.npc_throw(f, i, at);
+            }
+            if std::mem::take(&mut f.people.npcs[i].melee) {
+                self.npc_melee(f, i);
             }
         }
         self.fly(f, dt);
@@ -3381,6 +3389,17 @@ impl Combat {
             }
             if let Some((t, None)) = hit {
                 self.round_on_vehicle(f, (from, dir, t), npc_round_on_vehicle(gun), None);
+                // What of the world it meets, it wears as her rounds do.
+                if let Some((_, _, Some(key))) = f.physics.cast_ray_keyed(from, dir, t + 0.05) {
+                    let round = gun.map_or(NPC_DAMAGE, |g| g.damage);
+                    self.struck.push(Strike {
+                        at: from + dir * t,
+                        damage: round,
+                        key: Some(key),
+                        round,
+                        kind: round_kind(gun.and_then(|g| g.damage_key)),
+                    });
+                }
             }
         }
     }
@@ -3871,7 +3890,7 @@ impl Combat {
     /// (`ControllerTurret`, [`m2_engine::vehicle::Aimer`]) toward the
     /// nearest of those fighting her within its first weapon's
     /// `WeaponHint` range, at the turret's speeds and within its arc, and
-    /// fires once the gun is laid on him, in the bursts its `WeaponHint`
+    /// fires once he is inside its arc and tilt, in the bursts its `WeaponHint`
     /// gives soldiers ([`gunner_burst`]), each round strayed in the
     /// weapon's `ScatterMin` cone.
     ///
@@ -3879,10 +3898,14 @@ impl Combat {
     /// (`TurretAttack`, 0x822B7C10, registered by name at 0x822B5638) is
     /// the soldiers' own attack (0x822C95D8, then 0x822C2678): it gives
     /// the rider a target, and the seat's turret is what turns to it, as
-    /// for her. Inferred: that the turret then turns at its record's
-    /// speeds within its arc, and that the attack fires once laid
-    /// ([`LAID`], the alpha's own). Without a weapon hint, [`GUNNER_RANGE`]
-    /// (invented).
+    /// for her; it may fire once he is inside the turret's arc and tilt,
+    /// not waiting for the turret to get there
+    /// ([`TurretRecord::reaches`](m2_engine::seats::TurretRecord::reaches),
+    /// 0x822EF8C8); a seat with no turret fires only inside its weapon's
+    /// `MaxAimAngleAi` cone round the vehicle's nose (0x822CAB34; turning
+    /// to face him otherwise is the driver's, here hers). Inferred: that
+    /// the turret then turns at its record's speeds within its arc. Without a weapon hint,
+    /// [`GUNNER_RANGE`] (invented).
     fn gunners_fire(&mut self, f: &mut Field<'_>, dt: f32) {
         let Some(i) = f.player.driving.filter(|&i| i < f.vehicles.len()) else {
             self.gunner_wait.clear();
@@ -3941,9 +3964,16 @@ impl Combat {
                     let want = v.spec.aim_toward(a, body, v.turret, at);
                     let now = v.spec.aimers[a].step(v.aims[a], want, dt);
                     v.aims[a] = now;
-                    (now.0 - want.0).abs() <= LAID && (now.1 - want.1).abs() <= LAID
+                    let margin = m2_engine::weapons::ai_turret_margin(m.weapon.aim_ai);
+                    v.spec.aimers[a].record.reaches(want, margin)
                 }
-                None => true,
+                // A fixed gun: inside its weapon's cone round the nose
+                // ([`m2_engine::weapons::ai_aim_cosine`]).
+                None => {
+                    let nose = body.transform_vector3(Vec3::Z).normalize_or(Vec3::Z);
+                    (at - centre).normalize_or(nose).dot(nose)
+                        > m2_engine::weapons::ai_aim_cosine(m.weapon.aim_ai)
+                }
             };
             if !laid || self.gunner_wait[k] > 0.0 {
                 continue;
@@ -5007,6 +5037,34 @@ impl Combat {
     /// `DamageKey` (a round without a key is a `Bullet`); the Assault
     /// Rifle Bullet's [`NPC_DAMAGE`] when his template names no gun, or
     /// the table isn't found.
+    /// Soldier `i`'s blow (the close-quarters cycle's strike,
+    /// [`m2_engine::ai_close`]): the melee message the player's button
+    /// posts, handled at 0x8222B2E8 (research thread, 360 notes s21). It
+    /// lands on her within the `Bash` record's `BashRange` (1 m)
+    /// beyond the two bodies, and she takes the damage table's cell for
+    /// her row (`Hero`) and `MeleeBash` (0x29EFE0B5, as damage of type
+    /// 3). Not yet: the 60 / 300 shove and the 6 s knockdown it gives a
+    /// human, and her 0.15 camera shake.
+    fn npc_melee(&mut self, f: &mut Field<'_>, i: usize) {
+        let n = &f.people.npcs[i];
+        if f.player.driving.is_some() || !n.alive {
+            return;
+        }
+        let from = n.character.position;
+        let reach = BASH_RANGE + n.character.radius + f.player.character.radius;
+        if from.distance(f.player.character.position) > reach {
+            return;
+        }
+        let melee = m2_assets::name_hash("MeleeBash");
+        let damage = self
+            .damage_table
+            .as_ref()
+            .and_then(|t| t.scale(m2_assets::name_hash("Hero"), melee))
+            .unwrap_or(0.0);
+        let lost = self.hurt_player(f, damage, Some(from));
+        eprintln!("melee: a soldier's blow lands on her: {damage:.1} ({lost:.1} lost)");
+    }
+
     fn npc_round(&self, gun: Option<m2_engine::tuning::HandGun>) -> f32 {
         let Some(g) = gun else { return NPC_DAMAGE };
         let key = g
@@ -6293,6 +6351,7 @@ mod tests {
             shapes: Default::default(),
             material: None,
             turret_shapes: Default::default(),
+            turret_mass: None,
             wreck: None,
             tuning: VehicleTuning {
                 gun: Some(gun),
@@ -7174,23 +7233,24 @@ mod tests {
             pitch_pivot: None,
         };
         let dt = 1.0 / 60.0;
-        let laid = |aim: (f32, f32), want: (f32, f32)| {
-            (aim.0 - want.0).abs() <= LAID && (aim.1 - want.1).abs() <= LAID
-        };
-        // A foe 60 degrees off: laid after 0.6 s, not before.
+        // A foe 60 degrees off: inside its arc, so its gunner may fire at
+        // once (0x822EF8C8), while the pintle takes 0.6 s to get there.
         let want = (60f32.to_radians(), 0.0);
+        assert!(aimer.record.reaches(want, 0.0));
         let mut aim = (0.0, 0.0);
         let mut t = 0.0;
-        while !laid(aim, want) {
+        while (aim.0 - want.0).abs() > 1e-4 {
             aim = aimer.step(aim, want, dt);
             t += dt;
         }
         assert!((0.55..0.65).contains(&t), "{t}");
-        // One behind: the gun stops at its arc and never fires.
+        // One behind, or too high: the gun stops at its arc and its gunner
+        // never fires.
         let want = (170f32.to_radians(), 0.0);
+        assert!(!aimer.record.reaches(want, 0.0));
+        assert!(!aimer.record.reaches((0.0, 0.7), 0.0));
         for _ in 0..300 {
             aim = aimer.step(aim, want, dt);
-            assert!(!laid(aim, want));
         }
         assert!((aim.0 - 70f32.to_radians()).abs() < 1e-5);
     }

@@ -1192,17 +1192,19 @@ fn fill(template: &str, args: &[String]) -> String {
     out
 }
 
-/// The colour a markup word names (approximate shades).
+/// The colour a markup word names. From the 360 code: the text parser
+/// (0x8238D2B8) reads `[green]` and `[yellow]` as colour tokens, and the
+/// text draw (0x8238DE68) gives their slots (0.5, 1, 0.5) and (1, 1, 0),
+/// `[white]` (1, 1, 1); the other shades here are approximate.
 fn colour_name(word: &str) -> Option<[f32; 3]> {
     let rgb = |r: u8, g: u8, b: u8| [r, g, b].map(|v| f32::from(v) / 255.0);
     Some(match word.to_ascii_lowercase().as_str() {
-        "white" => rgb(255, 255, 255),
-        "green" => rgb(96, 208, 64),
+        "white" => [1.0, 1.0, 1.0],
+        "green" => [0.5, 1.0, 0.5],
         "red" => rgb(216, 32, 32),
-        // From footage: Fiona's menu's "NEW!" ([yellow]) shows at about
-        // 234,224,47 where the objectives' FFC800 shows at 225,180,49, so
-        // full red and green, no blue.
-        "yellow" => rgb(255, 255, 0),
+        // Footage agrees: Fiona's menu's "NEW!" ([yellow]) shows at about
+        // 234,224,47 where the objectives' FFC800 shows at 225,180,49.
+        "yellow" => [1.0, 1.0, 0.0],
         "orange" => rgb(255, 144, 32),
         "blue" => rgb(64, 144, 255),
         "grey" | "gray" => rgb(160, 160, 160),
@@ -3031,7 +3033,9 @@ mod tests {
         assert_eq!(spans[0].colour, yellow);
         assert_eq!((spans[1].text.as_str(), spans[1].colour), (" Go", yellow));
         assert_eq!(s.display_text("[2ndobjt][objverify2] x"), " x");
-        // Fiona's menu's "NEW!": the footage's full yellow.
+        // The 360 text draw's slots: [yellow] (1, 1, 0), as the footage of
+        // Fiona's menu's "NEW!" shows; [green] (0.5, 1, 0.5).
+        assert_eq!(s.spans("[green]+")[0].colour, Some([0.5, 1.0, 0.5]));
         assert_eq!(s.spans("[yellow]NEW!")[0].colour, Some([1.0, 1.0, 0.0]));
         // A contract's faction, its flag.
         let spans = s.spans("Faction: [flagpmc] PMC");

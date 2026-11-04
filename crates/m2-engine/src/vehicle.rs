@@ -367,6 +367,11 @@ pub struct VehicleSpec {
     /// of their own, 0x8216B910), their vehicle hull sets, model space
     /// with the turret straight ahead. Empty without them.
     pub turret_shapes: std::sync::Arc<[Vec<Vec3>]>,
+    /// Its turret's bodies' mass, together, model space (its parts'
+    /// own `PHY2` bodies': the AMX-30's turret 3.0 t and gun 3.2 t), if
+    /// any: the 360 code makes its turret a body of its own on a hinge
+    /// (0x82273F90).
+    pub turret_mass: Option<Chassis>,
     /// Its wrecked chassis body ([`WRECKED_CHASSIS`]), which the 360 builds
     /// once the wreck's parts show instead of the intact ones.
     pub wreck: Option<WreckBody>,
@@ -491,6 +496,57 @@ fn turret_shapes(model: &Model<'_>, base: &[u8], turret: &[bool]) -> Vec<Vec<Vec
         .filter_map(|q| q.body)
         .flat_map(|body| crate::physics::body_shapes(model, &p, body).0)
         .collect()
+}
+
+/// The mass of the turret parts' `PHY2` bodies of the model whose resident
+/// asset is `base`, together, model space (each placed on its part as the
+/// chassis's is, [`Chassis::of`]; inertias moved to their common centre of
+/// mass). `None` without a turret body with mass.
+fn turret_mass(base: &[u8], turret: &[bool]) -> Option<Chassis> {
+    let phy2 = Ucfx::parse(base).ok()?.top_level(*b"PHY2")?.to_vec();
+    let p = m2_assets::physics::Physics::parse(&phy2).ok()?;
+    let parts: Vec<Chassis> = p
+        .parts
+        .iter()
+        .filter(|q| turret.get(q.node as usize).copied().unwrap_or(false))
+        .filter_map(|q| {
+            let b = p.bodies.get(q.body?)?;
+            let usable = !b.is_fixed()
+                && b.mass > 0.0
+                && b.inertia[0] != f32::MAX
+                && b.inertia.iter().all(|v| v.is_finite());
+            usable.then(|| {
+                let turn = Mat3::from_quat(Quat::from_array(q.rotation).normalize());
+                Chassis {
+                    mass: b.mass,
+                    inertia: turn * Mat3::from_cols_array(&b.inertia) * turn.transpose(),
+                    centre_of_mass: turn * Vec3::from(b.centre_of_mass) + Vec3::from(q.position),
+                }
+            })
+        })
+        .collect();
+    let mass: f32 = parts.iter().map(|c| c.mass).sum();
+    if parts.is_empty() || mass <= 0.0 {
+        return None;
+    }
+    let centre = parts
+        .iter()
+        .map(|c| c.centre_of_mass * c.mass)
+        .sum::<Vec3>()
+        / mass;
+    // Each part's inertia about the common centre: its own, plus its mass
+    // x (|d|² 1 - d dᵀ).
+    let inertia = parts.iter().fold(Mat3::ZERO, |sum, c| {
+        let d = c.centre_of_mass - centre;
+        let shift = Mat3::from_diagonal(Vec3::splat(d.length_squared()))
+            - Mat3::from_cols(d * d.x, d * d.y, d * d.z);
+        sum + c.inertia + shift * c.mass
+    });
+    Some(Chassis {
+        mass,
+        inertia,
+        centre_of_mass: centre,
+    })
 }
 
 impl Chassis {
@@ -925,6 +981,7 @@ impl VehicleSpec {
             shapes: Default::default(),
             material: None,
             turret_shapes: Default::default(),
+            turret_mass: None,
             wreck: None,
             rotors: if flies {
                 vehicle::rotors(model)
@@ -1194,17 +1251,14 @@ impl VehicleSpec {
         let (shapes, hull, material) = chassis_shapes(model, base);
         self.material = material;
         self.turret_shapes = turret_shapes(model, base, &self.turret).into();
+        self.turret_mass = turret_mass(base, &self.turret);
         self.wreck = wreck_body(model, base);
-        // Flagged, not traced: a wheeled vehicle without a hull set (the
-        // trailers) would drag on its wheels' own shapes, and a
-        // motorbike's balance was tuned against the box hull (26 of 33
-        // fell over on their shapes), so both keep the box for now.
-        let wheeled = !self.tracked && !self.wheels.is_empty();
-        self.shapes = if wheeled && (!hull || self.is_bike()) {
-            Default::default()
-        } else {
-            shapes.into()
-        };
+        // Every vehicle collides by its chassis's shapes alone, as the 360
+        // code builds it (0x8216BC08): its hull set when it has one, else
+        // all of them (a trailer's wheels' shapes too). No record field
+        // changes that.
+        let _ = hull;
+        self.shapes = shapes.into();
         self
     }
 
@@ -1305,17 +1359,22 @@ impl VehicleSpec {
                     .is_some_and(|g| g.rate_of_fire < CANNON_RATE))
     }
 
-    /// How the turret's nodes move with the turret turned `turret`
-    /// radians (anticlockwise from above): about the pivot, or its mount.
-    pub fn turret_transform(&self, turret: f32) -> Mat4 {
-        let mount = self.pivot.or_else(|| {
+    /// Where the turret turns about, model space: its pivot, or its
+    /// mount (its first node's origin).
+    pub fn turret_mount(&self) -> Option<Vec3> {
+        self.pivot.or_else(|| {
             self.turret
                 .iter()
                 .zip(&self.rest)
                 .find(|(on, _)| **on)
                 .map(|(_, m)| m.w_axis.truncate())
-        });
-        mount.map_or(Mat4::IDENTITY, |at| {
+        })
+    }
+
+    /// How the turret's nodes move with the turret turned `turret`
+    /// radians (anticlockwise from above): about the pivot, or its mount.
+    pub fn turret_transform(&self, turret: f32) -> Mat4 {
+        self.turret_mount().map_or(Mat4::IDENTITY, |at| {
             Mat4::from_translation(at) * Mat4::from_rotation_y(turret) * Mat4::from_translation(-at)
         })
     }
@@ -1690,6 +1749,7 @@ mod tests {
             shapes: Default::default(),
             material: None,
             turret_shapes: Default::default(),
+            turret_mass: None,
             wreck: None,
             tuning: VehicleTuning::default(),
         }

@@ -141,6 +141,12 @@ const GUESSES: &[&str] = &[
     "AngDampYaw",
     "AngDampRoll",
     "AngDampPitch",
+    "NoSpeedSteering",
+    "AirCtrlSteering",
+    "EngineTorqueMultiAtCollision",
+    "HandBrakeAntiSideDrag",
+    "HandBrakeMomentumKeep",
+    "CollisionStabilization",
     // `_CarPhysicsV2`'s bike fields (round 18, gap round 17).
     "BikeRollStabilityStrength",
     "BikeWheeliePitch",
