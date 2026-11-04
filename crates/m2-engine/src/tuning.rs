@@ -58,6 +58,12 @@ pub struct VehicleTuning {
     pub tank: Option<TankTuning>,
     /// A helicopter's handling (`_HelicopterPhysics`).
     pub flight: Option<FlightTuning>,
+    /// A helicopter's handling with an AI at its stick
+    /// (`_HelicopterPhysicsAi`, schema 0x823EC220: the same fields but
+    /// `Mass`; 0x8218C1F0 picks it for one not flown by the player).
+    pub flight_ai: Option<FlightTuning>,
+    /// How its AI pilot flies it (`AiHelicopter`).
+    pub pilot: Option<PilotTuning>,
     /// A boat's engine and the water's drag on it (`_BoatPhysics`).
     pub boat: Option<BoatTuning>,
     /// A motorbike's balance and damping (`_CarPhysicsV2`'s `Bike*`
@@ -129,6 +135,73 @@ impl TankTuning {
     pub fn spring_length(&self) -> f32 {
         self.springs.2 + self.springs.3
     }
+}
+
+/// How a helicopter's AI pilot flies it: its `AiHelicopter` record
+/// (schema 0x823EF200; the pilot's state takes it at 0x822BCC08). All
+/// metres or seconds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PilotTuning {
+    /// `MinAltitude`: the least it holds over the ground (10).
+    pub min_altitude: f32,
+    /// `AttackRadius`, `AttackHeight` (80, 20).
+    pub attack_radius: f32,
+    pub attack_height: f32,
+    /// `SearchRadius`, `SearchHeight`, `SearchTime` (30, 20, 5).
+    pub search_radius: f32,
+    pub search_height: f32,
+    pub search_time: f32,
+    /// `LandingSlopeTolerance` (1), `OuterHeightTolerance` (-1: taken
+    /// from the template's other records, at least 1.5, 0x822BCC08).
+    pub landing_slope: f32,
+    pub outer_height: f32,
+    /// `FlyoverAttackRate` (20).
+    pub flyover_rate: f32,
+}
+
+impl PilotTuning {
+    /// The schema's defaults (0x823EF200).
+    pub const DEFAULT: Self = Self {
+        min_altitude: 10.0,
+        attack_radius: 80.0,
+        attack_height: 20.0,
+        search_radius: 30.0,
+        search_height: 20.0,
+        search_time: 5.0,
+        landing_slope: 1.0,
+        outer_height: -1.0,
+        flyover_rate: 20.0,
+    };
+}
+
+/// A helicopter's handling from its record in `table`
+/// (`_HelicopterPhysics` or `_HelicopterPhysicsAi`), if it has one.
+fn flight_of(table: &Table<'_>, id: u32) -> Option<FlightTuning> {
+    let r = *table.of_template(id).first()?;
+    let d = FlightTuning::DEFAULT;
+    let f = |name, default| table.float(r, name_hash(name)).unwrap_or(default);
+    Some(FlightTuning {
+        climb: f("MaxElevationSpeed", d.climb),
+        forward: f("MaxFwdSpeed", d.forward),
+        sideways: f("MaxRightSpeed", d.sideways),
+        forward_accel: f("FwdSpeedAcc", d.forward_accel),
+        sideways_accel: f("RightSpeedAcc", d.sideways_accel),
+        yaw: f("MaxYawSpeed", d.yaw),
+        yaw_accel: f("YawAcc", d.yaw_accel),
+        yaw_damp: f("YawDamp", d.yaw_damp),
+        pitch: f("MaxPitch", d.pitch),
+        pitch_accel: f("PitchAccel", d.pitch_accel),
+        roll_forward: f("MaxRollFwd", d.roll_forward),
+        roll_side: f("MaxRollSide", d.roll_side),
+        roll_accel: f("RollAccel", d.roll_accel),
+        low_speed_yaw: f("LowSpeedYawSpeed", d.low_speed_yaw),
+        low_speed: f("LowSpeedLimit", d.low_speed),
+        high_speed_yaw_loss: f("HiSpeedYawLoss", d.high_speed_yaw_loss),
+        bank_speed: f("BankSpeedLimit", d.bank_speed),
+        roll_bank: f("MaxRollBank", d.roll_bank),
+        bank_yaw: f("BankYawAmplification", d.bank_yaw),
+        no_input_inertia: f("FwdSpeedNoInputInertia", d.no_input_inertia),
+    })
 }
 
 /// How a helicopter flies: its `_HelicopterPhysics` record, field for
@@ -1665,6 +1738,8 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
     let tick = Table::new(db, "TickDamage");
     let modifier = Table::new(db, "ModifierKey");
     let heli = Table::new(db, "_HelicopterPhysics");
+    let heli_ai = Table::new(db, "_HelicopterPhysicsAi");
+    let pilot = Table::new(db, "AiHelicopter");
     let heli_camera = Table::new(db, "CameraHelicopter");
     let guns = Guns {
         weapon: Table::new(db, "WeaponProjectileBase"),
@@ -1895,31 +1970,22 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         ),
                     })
                 })(),
-                flight: (|| {
-                    let r = *heli.of_template(id).first()?;
-                    let d = FlightTuning::DEFAULT;
-                    let f = |name, default| heli.float(r, name_hash(name)).unwrap_or(default);
-                    Some(FlightTuning {
-                        climb: f("MaxElevationSpeed", d.climb),
-                        forward: f("MaxFwdSpeed", d.forward),
-                        sideways: f("MaxRightSpeed", d.sideways),
-                        forward_accel: f("FwdSpeedAcc", d.forward_accel),
-                        sideways_accel: f("RightSpeedAcc", d.sideways_accel),
-                        yaw: f("MaxYawSpeed", d.yaw),
-                        yaw_accel: f("YawAcc", d.yaw_accel),
-                        yaw_damp: f("YawDamp", d.yaw_damp),
-                        pitch: f("MaxPitch", d.pitch),
-                        pitch_accel: f("PitchAccel", d.pitch_accel),
-                        roll_forward: f("MaxRollFwd", d.roll_forward),
-                        roll_side: f("MaxRollSide", d.roll_side),
-                        roll_accel: f("RollAccel", d.roll_accel),
-                        low_speed_yaw: f("LowSpeedYawSpeed", d.low_speed_yaw),
-                        low_speed: f("LowSpeedLimit", d.low_speed),
-                        high_speed_yaw_loss: f("HiSpeedYawLoss", d.high_speed_yaw_loss),
-                        bank_speed: f("BankSpeedLimit", d.bank_speed),
-                        roll_bank: f("MaxRollBank", d.roll_bank),
-                        bank_yaw: f("BankYawAmplification", d.bank_yaw),
-                        no_input_inertia: f("FwdSpeedNoInputInertia", d.no_input_inertia),
+                flight: flight_of(&heli, id),
+                flight_ai: flight_of(&heli_ai, id),
+                pilot: (|| {
+                    let r = *pilot.of_template(id).first()?;
+                    let d = PilotTuning::DEFAULT;
+                    let f = |name, default| pilot.float(r, name_hash(name)).unwrap_or(default);
+                    Some(PilotTuning {
+                        min_altitude: f("MinAltitude", d.min_altitude),
+                        attack_radius: f("AttackRadius", d.attack_radius),
+                        attack_height: f("AttackHeight", d.attack_height),
+                        search_radius: f("SearchRadius", d.search_radius),
+                        search_height: f("SearchHeight", d.search_height),
+                        search_time: f("SearchTime", d.search_time),
+                        landing_slope: f("LandingSlopeTolerance", d.landing_slope),
+                        outer_height: f("OuterHeightTolerance", d.outer_height),
+                        flyover_rate: f("FlyoverAttackRate", d.flyover_rate),
                     })
                 })(),
                 boat: (|| {

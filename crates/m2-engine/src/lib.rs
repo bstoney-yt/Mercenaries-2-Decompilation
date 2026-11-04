@@ -27,6 +27,7 @@ pub mod blend;
 pub mod durability;
 pub mod grapple;
 pub mod gun_sounds;
+pub mod heli_pilot;
 pub mod hijack;
 pub mod ladder;
 pub mod lights;
