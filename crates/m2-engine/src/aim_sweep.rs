@@ -114,6 +114,19 @@ pub const RIFLE_MOVING: [u32; 3] = [0x9e25_852b, 0x48f8_5c73, 0x034c_acb5];
 pub const RIFLE_STANDING_FIRE: [u32; 3] = [0x03ca_d528, 0xaf17_eb9c, 0x2330_6354];
 pub const RIFLE_MOVING_FIRE: [u32; 3] = [0xc112_cc47, 0xb973_4a27, 0xbf3c_3419];
 
+/// The crouched stance's sweep handles, low, mid and high. The stance
+/// (`Crouched`, 0xC8886020) builds its own locomotion node (0x8280EC68, by
+/// 0x8241F878), whose init (0x8280ECB0) gives 0x82804AE8 the handle list
+/// at 0x82B4DBC0 in place of the upright one (0x82B4DA98). Its entries 0
+/// to 6 are the `Crouch_Aim_*` gaits and 27 and 28 the crouched shuffles,
+/// so its aim movement is the crouched one; entries 14 to 26 are these.
+/// Standing (entries 15, 19, 24), moving (14, 18, 23), standing firing
+/// (17, 21, 26) and moving firing (16, 20, 25).
+pub const CROUCHED_STANDING: [u32; 3] = [0xdf29_1074, 0xb0b8_5fb4, 0x1d88_e276];
+pub const CROUCHED_MOVING: [u32; 3] = [0x28fc_8ad9, 0xb19e_abc5, 0x4ab3_573d];
+pub const CROUCHED_STANDING_FIRE: [u32; 3] = [0xb96d_6af0, 0x9924_99f8, 0xfb7a_8e1a];
+pub const CROUCHED_MOVING_FIRE: [u32; 3] = [0xaef9_664b, 0x8bdf_3d07, 0x6207_b72f];
+
 /// The rate a shot gives the firing weight, per second (0x82DE88A8).
 pub const KICK_RATE: f32 = 30.0;
 
@@ -348,6 +361,25 @@ mod tests {
         assert_eq!(fire_share(0.0), 0.0);
         assert_eq!(fire_share(0.5), 0.5);
         assert_eq!(fire_share(1.4), 1.0);
+    }
+
+    #[test]
+    fn the_crouched_node_has_its_own_sweep_handles() {
+        let all = [
+            CROUCHED_STANDING,
+            CROUCHED_MOVING,
+            CROUCHED_STANDING_FIRE,
+            CROUCHED_MOVING_FIRE,
+        ]
+        .concat();
+        let mut seen = all.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 12);
+        // Handles, not the upright rows' clips.
+        for c in [RIFLE_STANDING, RIFLE_MOVING].concat() {
+            assert!(!all.contains(&c));
+        }
     }
 
     #[test]
