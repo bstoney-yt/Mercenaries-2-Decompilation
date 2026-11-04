@@ -134,6 +134,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 t.friction.0, t.friction.1, t.brake, t.springs
             );
         }
+        // Its gun on its own body ([`VehicleSpec::gun_body`]): its mass,
+        // and how far it has tilted 0.5 s and 2 s after being asked to its
+        // `MaxPitch` from level, radians.
+        if let (Some(g), Some(t)) = (&spec.gun_body, spec.tuning.turret) {
+            let mut p = Physics::new();
+            let ground = CollisionShape::cuboid(Vec3::new(500.0, 1.0, 500.0));
+            p.add_static(
+                StaticKey::Cell(1),
+                &ground,
+                Vec3::new(0.0, -1.0, 0.0),
+                Quat::IDENTITY,
+            );
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, 1.0, 0.0), 0.0);
+            let mut at = [0.0; 2];
+            for i in 0..(3.0 / DT) as usize {
+                if i == (1.0 / DT) as usize {
+                    p.aim_gun(id, t.pitch.1);
+                }
+                p.drive(id, VehicleControls::default());
+                p.step(DT);
+                if i == (1.5 / DT) as usize {
+                    at[0] = p.gun_pitch(id).unwrap_or(f32::NAN);
+                }
+            }
+            at[1] = p.gun_pitch(id).unwrap_or(f32::NAN);
+            eprintln!(
+                "{name}: gun body {:.0} kg, pitch {:.2}..{:.2}, at 0.5 s {:.3}, at 2 s {:.3}",
+                g.mass.mass, t.pitch.0, t.pitch.1, at[0], at[1]
+            );
+        } else {
+            eprintln!("{name}: no gun body");
+        }
         if std::env::var("TANK_INFO").is_ok() {
             continue;
         }

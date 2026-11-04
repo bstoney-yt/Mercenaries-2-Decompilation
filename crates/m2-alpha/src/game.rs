@@ -1526,7 +1526,15 @@ impl Game {
                         let (down, up) = v.spec.elevation;
                         let want = local.y.atan2(local.with_y(0.0).length()).clamp(down, up);
                         let rate = turret.map_or(GUN_RATE, |t| t.pitch_speed);
-                        v.gun += (want - v.gun).clamp(-rate * dt, rate * dt);
+                        // Asked on from where it was last asked to; a gun
+                        // on its own body is drawn where it has got to
+                        // ([`m2_engine::Physics::gun_pitch`]).
+                        let from = v.id.and_then(|id| physics.gun_target(id)).unwrap_or(v.gun);
+                        v.gun = from + (want - from).clamp(-rate * dt, rate * dt);
+                        if let Some(id) = v.id {
+                            physics.aim_gun(id, v.gun);
+                            v.gun = physics.gun_pitch(id).unwrap_or(v.gun);
+                        }
                     }
                 }
             } else {

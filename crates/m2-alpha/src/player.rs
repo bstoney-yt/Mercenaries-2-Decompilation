@@ -1720,6 +1720,7 @@ mod tests {
             material: None,
             turret_shapes: Default::default(),
             turret_mass: None,
+            gun_body: None,
             wreck: None,
             tuning: Default::default(),
         };
