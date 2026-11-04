@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use m2_assets::vehicle::Rotor;
-use m2_engine::heli_pilot::{HeliPilot, Sight, Slung};
+use m2_engine::heli_pilot::{HeliPilot, Landing, Sight, Slung};
 use m2_engine::tuning::PilotTuning;
 use m2_engine::{
     CollisionShape, DebrisId, GpuModel, LoosePiece, Physics, StaticKey, VehicleId, VehicleSpec,
@@ -218,6 +218,10 @@ struct Flight {
     /// How low its load's underside comes over the drop point before it
     /// lets go, m (the order's value, 0.5 when none: 0x822DC468).
     drop: f32,
+    /// A landing's search for its spot ([`HeliPilot::land_near`]), and
+    /// whether, sent home from it, it has taken off again.
+    search: Option<m2_engine::heli_land::LandingSearch>,
+    up: bool,
 }
 
 /// A crate let go: falling, then lying where it landed, until broken
@@ -353,6 +357,8 @@ impl Flights {
             pilot_ai: None,
             turn: None,
             drop: DROP_DEFAULT,
+            search: None,
+            up: false,
         });
     }
 
@@ -867,8 +873,9 @@ impl Flights {
     /// in the air where the scripts made it, then each frame its pilot
     /// thinks ([`HeliPilot::sense`]) and works the task: `HeliDeliver`
     /// ([`HeliPilot::deliver`]) until it lets its load go, then on 1000 m
-    /// ahead, or (sent home) round things to home. A landing (`HeliLand`)
-    /// is not flown so (its task, 0x822AF3D8, not ported). Returns
+    /// ahead, or (sent home) round things to home; a landing (`HeliLand`)
+    /// by [`HeliPilot::land_near`], up again by [`HeliPilot::take_off`]
+    /// once sent home. Returns
     /// whether it flew it. Its load hangs as before (invented: the 360's
     /// winch is untraced), and neither weighs on it.
     fn pilot(
@@ -880,7 +887,7 @@ impl Flights {
         releases: &mut Vec<Release>,
     ) -> bool {
         let f = &self.flights[i];
-        if f.lands || f.released && f.body.is_none() {
+        if f.released && f.body.is_none() {
             return false;
         }
         let Some(spec) = f.model.and_then(|m| self.specs.get(&m)) else {
@@ -945,9 +952,39 @@ impl Flights {
         pilot.airborne = airborne;
         pilot.sense(at, turn, velocity, ground, dt);
         let mut sight = Sight { physics, own: id };
+        let box_ = spec.hull;
         let stick = match (f.phase, f.home) {
+            // Sent home from where it landed: up first (`HeliTakeoff`).
+            (Phase::Leaving, Some(_)) if f.lands && !f.up => {
+                let (stick, done) = pilot.take_off();
+                f.up = done;
+                stick
+            }
             (Phase::Leaving, Some(home)) => {
                 pilot.fly_round_to(home, 1.0, true, true, size, &mut sight, dt)
+            }
+            // A landing (`HeliLand`): down near the point, and there
+            // until sent home.
+            _ if f.lands => {
+                let (stick, how) =
+                    pilot.land_near(f.to, &mut f.search, box_, size, &mut sight, dt);
+                let late = f.clock > INBOUND_LONGEST && f.phase == Phase::Inbound;
+                if !f.released && (how != Landing::Flying || late) {
+                    eprintln!("delivery: {} lands ({how:?}) at {:.1}", f.pilot, f.at);
+                    f.released = true;
+                    f.phase = Phase::Hovering;
+                    f.clock = 0.0;
+                    releases.push(Release {
+                        pilot: f.pilot,
+                        to: f.to,
+                        dropped: Vec::new(),
+                    });
+                }
+                if f.released && f.home.is_some() {
+                    f.phase = Phase::Leaving;
+                    f.clock = 0.0;
+                }
+                stick
             }
             _ => {
                 let (stick, gone) = pilot.deliver(f.to, f.drop, half_wide, size, &mut sight, dt);

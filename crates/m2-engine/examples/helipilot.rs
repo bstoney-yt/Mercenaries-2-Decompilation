@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "template\tcount\tfwd m/s\tmin alt\tto 30 m s\tover m\tlast 5 s err m\tdrift m\tto 400 m s\tfastest m/s\tends off m	land s	round wall s	wall clear m"
+        "template\tcount\tfwd m/s\tmin alt\tto 30 m s\tover m\tlast 5 s err m\tdrift m\tto 400 m s\tfastest m/s\tends off m	land s	round wall s	wall clear m	land-near s	land-near off m"
     );
     for ((model, _), ids) in &groups {
         let mut ids = ids.clone();
@@ -139,8 +139,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         let (round, clear) = round_the_wall(&spec, &flight, pilot_tuning);
+        let (down, spot) = land_by_a_shed(&spec, &flight, pilot_tuning);
         println!(
-            "{name}\t{}\t{:.0}\t{:.0}\t{reached:.2}\t{top:.2}\t{:.2}\t{drift:.2}\t{arrived:.1}\t{fastest:.1}\t{off:.2}\t{landed:.1}\t{round:.1}\t{clear:.1}",
+            "{name}\t{}\t{:.0}\t{:.0}\t{reached:.2}\t{top:.2}\t{:.2}\t{drift:.2}\t{arrived:.1}\t{fastest:.1}\t{off:.2}\t{landed:.1}\t{round:.1}\t{clear:.1}	{down:.1}	{spot:.1}",
             ids.len(),
             flight.forward,
             pilot_tuning.min_altitude,
@@ -240,4 +241,56 @@ fn start(spec: &VehicleSpec) -> (Physics, VehicleId) {
         p.step(DT);
     }
     (p, id)
+}
+
+/// From a hover 30 m up 300 m off, a landing (`HeliLand`,
+/// [`HeliPilot::land_near`]) at a point half a metre from a shed 8 m square and 4 m high: how
+/// long until it is down, and how far from the point it set down (off
+/// the shed: the patch under it level).
+fn land_by_a_shed(
+    spec: &VehicleSpec,
+    flight: &m2_engine::tuning::FlightTuning,
+    tuning: PilotTuning,
+) -> (f32, f32) {
+    let (mut p, vid) = start(spec);
+    let at = place(&p, vid);
+    let point = Vec3::new(at.x, 0.0, at.z + 300.0);
+    let shed = CollisionShape::cuboid(Vec3::new(4.0, 2.0, 4.0));
+    p.add_static(
+        StaticKey::Object(3),
+        &shed,
+        point + Vec3::new(4.5, 2.0, 0.0),
+        Quat::IDENTITY,
+    );
+    let mut pilot = HeliPilot::new(tuning, flight);
+    for _ in 0..(20.0 / DT) as usize {
+        think(&mut p, vid, &mut pilot);
+        let stick = pilot.hover(HOVER, true);
+        p.pilot_helicopter(vid, stick);
+        p.step(DT);
+    }
+    let size = {
+        let (lo, hi) = spec.hull;
+        (hi.y - lo.y, (hi.x - lo.x).max(hi.z - lo.z))
+    };
+    let mut search = None;
+    let mut down = f32::NAN;
+    for i in 0..(120.0 / DT) as usize {
+        think(&mut p, vid, &mut pilot);
+        pilot.airborne = p.helicopter_airborne(vid).unwrap_or(true);
+        let (stick, how) = {
+            let mut sight = m2_engine::heli_pilot::Sight {
+                physics: &p,
+                own: vid,
+            };
+            pilot.land_near(point, &mut search, spec.hull, size, &mut sight, DT)
+        };
+        p.pilot_helicopter(vid, stick);
+        p.step(DT);
+        if how == m2_engine::heli_pilot::Landing::Landed {
+            down = (i + 1) as f32 * DT;
+            break;
+        }
+    }
+    (down, (place(&p, vid) - point).with_y(0.0).length())
 }
