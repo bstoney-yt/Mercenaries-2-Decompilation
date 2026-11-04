@@ -5418,6 +5418,45 @@ impl Physics {
             .map(|(_, hit)| hit.time_of_impact)
     }
 
+    /// How far, of `max` metres along `direction`, a box of half
+    /// extents `half` turned `turn` goes from `origin` before it meets
+    /// something solid, passing through vehicle `skip`.
+    pub fn cast_box(
+        &self,
+        origin: Vec3,
+        turn: Quat,
+        half: Vec3,
+        direction: Vec3,
+        max: f32,
+        skip: Option<VehicleId>,
+    ) -> Option<f32> {
+        let mut filter = solid();
+        if let Some(v) = skip
+            .and_then(|v| self.vehicles.get(v.0))
+            .and_then(Option::as_ref)
+        {
+            filter = filter.exclude_rigid_body(v.controller.chassis);
+            if let Some(h) = &v.hinge {
+                filter = filter.exclude_rigid_body(h.body);
+            }
+        }
+        let cube = r::Cuboid::new(vector(half.max(Vec3::splat(1e-3))));
+        let options = rapier3d::parry::query::ShapeCastOptions {
+            max_time_of_impact: max,
+            stop_at_penetration: false,
+            ..Default::default()
+        };
+        self.world
+            .cast_shape(
+                &pose(origin, turn),
+                vector(direction.normalize_or_zero()),
+                &cube,
+                options,
+                filter,
+            )
+            .map(|(_, hit)| hit.time_of_impact)
+    }
+
     /// The first solid thing along a ray, passing through vehicle `skip`:
     /// its distance, and the vehicle it is if one (what a round hits).
     pub fn cast_ray_vehicle(
@@ -5659,7 +5698,7 @@ mod tests {
             let m = p.vehicle_transform(id).unwrap();
             let (_, turn, at) = m.to_scale_rotation_translation();
             let g = p.ground_under(id, at);
-            pilot.sense(at, turn, p.vehicle_velocity(id), g);
+            pilot.sense(at, turn, p.vehicle_velocity(id), g, DT);
             let stick = pilot.hover(30.0, true);
             p.pilot_helicopter(id, stick);
             p.step(DT);

@@ -57,6 +57,14 @@ pub struct HeliPilot {
     pub face: f32,
     /// The stick as it was last sent.
     pub stick: PilotStick,
+    /// The way it steers when going round things (+0x50, +0x54: a
+    /// heading and a climb, radians), and how long it keeps steering by
+    /// them, and since something was in its way, s (+0x98, +0x9C; each
+    /// think takes its time off them, 0x822BCDC8).
+    pub steer_heading: f32,
+    pub steer_climb: f32,
+    pub steering: f32,
+    pub blocked: f32,
     thought: bool,
 }
 
@@ -74,6 +82,43 @@ fn wrap(a: f32) -> f32 {
 /// The heading of a direction, radians (0x82855048: from its x and z).
 pub fn heading_of(v: Vec3) -> f32 {
     v.x.atan2(v.z)
+}
+
+/// What a pilot looks at in the world as it goes round things.
+pub trait PilotWorld {
+    /// The first solid thing on the line from `from` to `to`: where.
+    fn ground(&mut self, from: Vec3, to: Vec3) -> Option<Vec3>;
+    /// How far, of `max` metres along `way`, a box of half extents
+    /// `half` turned `turn` goes from `origin` before it meets something
+    /// (1 if nothing).
+    fn sweep(&mut self, origin: Vec3, turn: Quat, half: Vec3, way: Vec3, max: f32) -> f32;
+}
+
+/// The alpha's physics as a pilot sees it, past its own helicopter.
+pub struct Sight<'a> {
+    pub physics: &'a crate::Physics,
+    pub own: crate::VehicleId,
+}
+
+impl std::fmt::Debug for Sight<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sight").field("own", &self.own).finish()
+    }
+}
+
+impl PilotWorld for Sight<'_> {
+    fn ground(&mut self, from: Vec3, to: Vec3) -> Option<Vec3> {
+        let d = to - from;
+        self.physics
+            .cast_ray_past(from, d, d.length(), self.own)
+            .map(|(t, _)| from + d.normalize_or_zero() * t)
+    }
+
+    fn sweep(&mut self, origin: Vec3, turn: Quat, half: Vec3, way: Vec3, max: f32) -> f32 {
+        self.physics
+            .cast_box(origin, turn, half, way, max, Some(self.own))
+            .map_or(1.0, |t| (t / max).clamp(0.0, 1.0))
+    }
 }
 
 impl HeliPilot {
@@ -94,6 +139,10 @@ impl HeliPilot {
             clearance: 0.0,
             face: 0.0,
             stick: PilotStick::default(),
+            steer_heading: 0.0,
+            steer_climb: 0.0,
+            steering: 0.0,
+            blocked: 0.0,
             thought: false,
         }
     }
@@ -102,7 +151,12 @@ impl HeliPilot {
     /// it is, how it is turned, its velocity (world), and the ground
     /// straight under it (the 360 casts from 1000 m down to -1000 m,
     /// 0x822ED8C0; `None` keeps the last it found).
-    pub fn sense(&mut self, at: Vec3, turn: Quat, velocity: Vec3, ground: Option<f32>) {
+    pub fn sense(&mut self, at: Vec3, turn: Quat, velocity: Vec3, ground: Option<f32>, dt: f32) {
+        for t in [&mut self.steering, &mut self.blocked] {
+            if *t > 0.0 {
+                *t -= dt;
+            }
+        }
         let heading = heading_of(turn * Vec3::Z);
         if self.thought {
             self.last_heading = self.heading;
@@ -216,6 +270,109 @@ impl HeliPilot {
         self.stick
     }
 
+    /// Comes down to land (0x822D4848): holds its heading, works to no
+    /// speed ahead or across, and comes down at a lift of -(0.1 + ((its
+    /// clearance - 0.2) / 10)², the square at most 0.9), at most -0.5;
+    /// within 0.2 m of the ground, -1.
+    pub fn land(&mut self) -> PilotStick {
+        self.hold_heading(self.heading);
+        self.hold_across(0.0);
+        self.hold_ahead(0.0);
+        self.stick.lift = if self.clearance > 0.2 {
+            let s = ((self.clearance - 0.2) * 0.1).powi(2).min(0.9);
+            -(s + 0.1).min(0.5)
+        } else {
+            -1.0
+        };
+        self.stick
+    }
+
+    /// Flies to `target` going round what is in its way (0x822D43A8),
+    /// at `haste`, facing its way if `facing`; held its `MinAltitude`
+    /// over the ground there if `above` (0x822D3B60: a ray from 2 m over
+    /// the point to that far under it). `size` is its box's height and
+    /// its wider of its width and length (the mind's +0x2A0 box; +0x2C0
+    /// is half the wider), `dt` the think's step (at most 1/30 s here).
+    ///
+    /// From its box's middle it heads for the point by a way it turns
+    /// to: straight there unless it was steering in the last 2 s, else by
+    /// its last way, turned towards the point by at most a quarter turn
+    /// a second in heading and in climb. A box as wide and long as its wider side and as tall as it is
+    /// (0x82166880 halves them for Havok) is swept that way, up to 50
+    /// m or its distance less half its box's diagonal; anything in the
+    /// way marks it blocked for 1 s and tips its way up by (1 - the share
+    /// of the sweep made) x 2 turns a second. It flies to the point as
+    /// far along its way as the target is ([`fly_to`](Self::fly_to)).
+    /// Not ported: the turn away from what the fan of eight rays to
+    /// either side of its way finds (0x822D3FC8, 0x822D40E0), whose ray
+    /// results are not traced; it turns by none.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fly_round_to(
+        &mut self,
+        target: Vec3,
+        haste: f32,
+        facing: bool,
+        above: bool,
+        size: (f32, f32),
+        world: &mut dyn PilotWorld,
+        dt: f32,
+    ) -> PilotStick {
+        let dt = dt.min(1.0 / 30.0);
+        let (box_height, wide) = size;
+        let tall = (self.at.y - self.height) + box_height;
+        let lift = tall * 0.5 - (tall - box_height);
+        let origin = Vec3::new(self.at.x, self.at.y + lift, self.at.z);
+        let mut target = target;
+        if above {
+            let floor = self.tuning.min_altitude;
+            if let Some(g) = world.ground(target + Vec3::Y * 2.0, target - Vec3::Y * floor) {
+                target = g + Vec3::Y * floor;
+            }
+        }
+        target.y += lift;
+        let d = target - origin;
+        let gap = d.length();
+        let flat = d.with_y(0.0).length();
+        let want_heading = heading_of(d);
+        let want_climb = if flat > 0.0 { (d.y / flat).atan() } else { 0.0 };
+        let way = if self.steering > 0.0 {
+            let ahead = Vec3::new(self.steer_heading.sin(), 0.0, self.steer_heading.cos());
+            let across = Vec3::new(-self.steer_heading.cos(), 0.0, self.steer_heading.sin());
+            let way = Quat::from_axis_angle(across, self.steer_climb) * ahead;
+            let most = std::f32::consts::FRAC_PI_2 * dt;
+            self.steer_heading += wrap(want_heading - self.steer_heading).clamp(-most, most);
+            self.steer_climb += wrap(want_climb - self.steer_climb).clamp(-most, most);
+            way
+        } else {
+            self.steer_heading = want_heading;
+            self.steer_climb = want_climb;
+            d / (gap + 0.01)
+        };
+        self.steering = 2.0;
+        let reach = gap - (tall * tall + wide * wide + wide * wide).sqrt() * 0.5;
+        let sweep = reach.min(50.0);
+        let made = if sweep > 0.0 {
+            let made = world.sweep(
+                origin,
+                self.turn,
+                Vec3::new(wide, tall, wide) * 0.5,
+                way,
+                sweep,
+            );
+            if made < 1.0 {
+                self.blocked = 1.0;
+            }
+            made
+        } else {
+            1.0
+        };
+        let point = origin + way * gap;
+        if made < 1.0 || self.blocked > 0.0 {
+            self.steer_climb += (1.0 - made) * std::f32::consts::TAU * dt;
+        }
+        self.fly_to(point, haste, facing)
+    }
+
     /// The velocity along its own z, x and y it flies `d` at `haste`
     /// with (0x822D3638): the way `d` points on its own axes, at `haste`
     /// x its fastest ahead, slowed so neither the part across nor the
@@ -258,12 +415,14 @@ mod tests {
             Quat::IDENTITY,
             Vec3::ZERO,
             Some(0.0),
+            1.0 / 60.0,
         );
         p.sense(
             Vec3::new(0.0, 20.02, 0.0),
             Quat::IDENTITY,
             Vec3::ZERO,
             Some(0.0),
+            1.0 / 60.0,
         );
         p.hold_height(21.0, true);
         let want = (0.98 * 0.5 - 0.02 * 25.0f32).clamp(-1.0, 1.0);
@@ -274,12 +433,14 @@ mod tests {
             Quat::IDENTITY,
             Vec3::ZERO,
             Some(0.0),
+            1.0 / 60.0,
         );
         p.sense(
             Vec3::new(0.0, 3.0, 0.0),
             Quat::IDENTITY,
             Vec3::ZERO,
             Some(0.0),
+            1.0 / 60.0,
         );
         p.hold_height(2.0, false);
         assert_eq!(p.stick.lift, 1.0);
@@ -293,11 +454,11 @@ mod tests {
     #[test]
     fn it_turns_to_the_heading_asked() {
         let mut p = pilot();
-        p.sense(Vec3::ZERO, Quat::IDENTITY, Vec3::ZERO, None);
+        p.sense(Vec3::ZERO, Quat::IDENTITY, Vec3::ZERO, None, 1.0 / 60.0);
         p.hold_heading(0.05);
         assert!((p.stick.yaw + 0.5).abs() < 1e-4, "{}", p.stick.yaw);
         let turned = Quat::from_rotation_y(0.04);
-        p.sense(Vec3::ZERO, turned, Vec3::ZERO, None);
+        p.sense(Vec3::ZERO, turned, Vec3::ZERO, None, 1.0 / 60.0);
         p.hold_heading(0.05);
         assert!((p.stick.yaw + (0.1 - 0.4)).abs() < 1e-3, "{}", p.stick.yaw);
     }
@@ -307,7 +468,13 @@ mod tests {
     #[test]
     fn its_speed_across_is_held_to_its_fastest_that_way() {
         let mut p = pilot();
-        p.sense(Vec3::ZERO, Quat::IDENTITY, Vec3::ZERO, Some(-50.0));
+        p.sense(
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            Vec3::ZERO,
+            Some(-50.0),
+            1.0 / 60.0,
+        );
         let (ahead, across, up) = p.velocity_along(1.0, Vec3::new(1.0, 0.0, 1.0));
         assert!((across - 20.0).abs() < 1e-3, "{across}");
         assert!((ahead - 20.0).abs() < 1e-3, "{ahead}");
@@ -315,5 +482,67 @@ mod tests {
         // Straight ahead: its fastest ahead.
         let (ahead, _, _) = p.velocity_along(1.0, Vec3::Z);
         assert!((ahead - 30.0).abs() < 1e-3);
+    }
+
+    // Coming down to land it eases its descent as it nears the ground
+    // (0x822D4848): 20 m up -0.5, 2 m up -0.13, at 0.2 m all it can.
+    #[test]
+    fn it_comes_down_slower_near_the_ground() {
+        let mut p = pilot();
+        let at = |p: &mut HeliPilot, y: f32| {
+            p.sense(
+                Vec3::new(0.0, y, 0.0),
+                Quat::IDENTITY,
+                Vec3::ZERO,
+                Some(0.0),
+                1.0 / 60.0,
+            );
+            p.land().lift
+        };
+        assert_eq!(at(&mut p, 20.0), -0.5);
+        assert!((at(&mut p, 2.0) + (0.1 + 0.18f32 * 0.18)).abs() < 1e-4);
+        assert_eq!(at(&mut p, 0.1), -1.0);
+    }
+
+    struct Wall;
+
+    impl PilotWorld for Wall {
+        fn ground(&mut self, _: Vec3, _: Vec3) -> Option<Vec3> {
+            None
+        }
+        fn sweep(&mut self, _: Vec3, _: Quat, _: Vec3, _: Vec3, _: f32) -> f32 {
+            0.5
+        }
+    }
+
+    // Something half way along its sweep marks it blocked and tips its
+    // way up by half of two turns a second (0x822D43A8).
+    #[test]
+    fn blocked_it_tips_its_way_up() {
+        let mut p = pilot();
+        p.sense(
+            Vec3::new(0.0, 30.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::ZERO,
+            Some(0.0),
+            1.0 / 60.0,
+        );
+        let dt = 1.0 / 60.0;
+        p.fly_round_to(
+            Vec3::new(0.0, 30.0, 200.0),
+            1.0,
+            true,
+            false,
+            (3.0, 12.0),
+            &mut Wall,
+            dt,
+        );
+        assert_eq!(p.blocked, 1.0);
+        assert!(
+            (p.steer_climb - 0.5 * std::f32::consts::TAU * dt).abs() < 1e-5,
+            "{}",
+            p.steer_climb
+        );
+        assert_eq!(p.steering, 2.0);
     }
 }
