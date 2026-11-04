@@ -1751,7 +1751,12 @@ struct Hull {
     /// whether any spring stood in the water last step ([`float_hull`]).
     engine: f32,
     water_share: f32,
-    afloat: bool,
+    /// How long since its hull last touched anything solid, and how long
+    /// it has been touching (0x821999E0's timers), seconds; and how much
+    /// of its roll it loses this step.
+    clear: f32,
+    touching: f32,
+    stabilise: f32,
     /// Its eased handbrake (0 to 1).
     handbrake: f32,
     controls: VehicleControls,
@@ -2393,8 +2398,17 @@ fn stand(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
 /// standing at `water` under every spring (the 360 code eases each toward
 /// the highest water it samples round it; the alpha's sea has no waves).
 /// Returns the share of its springs whose bottoms are under the water.
-fn float_hull(hull: &mut Hull, b: &mut r::RigidBody, water: f32, dt: f32) -> f32 {
+fn float_hull(hull: &mut Hull, b: &mut r::RigidBody, water: f32, touched: bool, dt: f32) -> f32 {
     use crate::tuning::ease;
+    // How long since its hull touched anything solid, or how long it
+    // has (0x821999E0).
+    if touched {
+        hull.touching += dt;
+        hull.clear = 0.0;
+    } else {
+        hull.clear += dt;
+        hull.touching = 0.0;
+    }
     let f = hull.water.float;
     let c = hull.controls;
     let turn = Quat::from_array(b.position().rotation.to_array());
@@ -2471,7 +2485,13 @@ fn float_hull(hull: &mut Hull, b: &mut r::RigidBody, water: f32, dt: f32) -> f32
         let torque = if e <= 0.0 { w.torque.1 } else { w.torque.0 };
         let pull = e.abs() * track_push(curve, going_at) * torque * 200.0;
         if going_at < 1.0 || pedals * ahead < 0.0 {
-            let push = pull * (1.0 - handbrake) * hull.water_share * pedals * dt;
+            // The first 1/8 s after a hit, by its `EngineTorqueMultiAtCollision`.
+            let hit = if hull.clear < 0.125 {
+                f.hit_torque
+            } else {
+                1.0
+            };
+            let push = pull * hit * (1.0 - handbrake) * hull.water_share * pedals * dt;
             b.apply_impulse(vector(bow.with_y(0.0) * push), true);
         }
     }
@@ -2500,12 +2520,8 @@ fn float_hull(hull: &mut Hull, b: &mut r::RigidBody, water: f32, dt: f32) -> f32
         + f.handbrake_boost * e * e * slow * handbrake
         + f.no_speed_steering * e.max(0.0) * pedal * (1.0 - handbrake) * (1.0 - slow)
         + if crawling { f.low_speed_steering } else { 0.0 };
-    let afloat = if hull.afloat {
-        0.0
-    } else {
-        f.air_steering * 0.1
-    };
-    let wetness = hull.water_share + (1.0 - hull.water_share) * afloat;
+    let air = if touched { 0.0 } else { f.air_steering * 0.1 };
+    let wetness = hull.water_share + (1.0 - hull.water_share) * air;
     let yaw = reach * hull.helm * loss * mass * wetness * 10.0 * dt;
     b.apply_torque_impulse(vector(Vec3::Y * yaw), true);
     // Its springs (0x82199EA8), each push then scaled by its water share:
@@ -2535,7 +2551,6 @@ fn float_hull(hull: &mut Hull, b: &mut r::RigidBody, water: f32, dt: f32) -> f32
     }
     let target = if deeps * 0.25 > 0.0 { 1.0 } else { 0.0 };
     hull.water_share = ease(hull.water_share, target, 0.95, dt);
-    hull.afloat = wet > 0.0;
     let spin = vec3(b.angvel()).y;
     for (point, push) in pushes {
         if push > 0.0 {
@@ -2556,6 +2571,20 @@ fn float_hull(hull: &mut Hull, b: &mut r::RigidBody, water: f32, dt: f32) -> f32
     let [roll, pitch, yaw] = f.ang_damp;
     let damp = bow * (roll * w.dot(bow)) + x * (pitch * w.dot(x)) + up * (yaw * w.dot(up));
     b.apply_torque_impulse(vector(-damp * mass * dt * hull.water_share), true);
+    // Just after a hit, or out of the water and not on anything long,
+    // it loses its roll: all of it at `CollisionStabilization` 1, less
+    // as the hit grows old (from 1.5 s on), and less below its low-speed
+    // limit; afloat and clear of things, or touching them past 0.2 s, that
+    // eases away (keeping 0.9 a 1/60 s; 0x8219A7xx).
+    let calm = (hull.water_share > 0.5 && hull.clear > 0.2) || hull.touching > 0.2;
+    hull.stabilise = if calm {
+        ease(hull.stabilise, 0.0, 0.9, dt)
+    } else {
+        let old = ((hull.clear - 1.5) * 2.003_48).clamp(0.0, 1.0);
+        (f.stabilization * (1.0 - old) * slow).min(1.0)
+    };
+    let w = vec3(b.angvel());
+    b.set_angvel(vector(w - bow * (w.dot(bow) * hull.stabilise)), true);
     wet
 }
 
@@ -2999,6 +3028,18 @@ impl Physics {
             let Some(hull) = v.hull.as_mut().filter(|_| !held) else {
                 continue;
             };
+            let touched = self
+                .world
+                .bodies
+                .get(v.controller.chassis)
+                .is_some_and(|b| {
+                    b.colliders().iter().any(|&c| {
+                        self.world
+                            .narrow_phase
+                            .contact_pairs_with(c)
+                            .any(|p| p.has_any_active_contact())
+                    })
+                });
             let Some(b) = self.world.bodies.get_mut(v.controller.chassis) else {
                 continue;
             };
@@ -3021,7 +3062,7 @@ impl Physics {
                 }
                 wet / n
             } else {
-                float_hull(hull, b, water, dt)
+                float_hull(hull, b, water, touched, dt)
             };
             if wet == 0.0 {
                 continue;
@@ -3775,7 +3816,9 @@ impl Physics {
                 lift: 0.0,
                 engine: 0.0,
                 water_share: 1.0,
-                afloat: true,
+                clear: 1000.0,
+                touching: 0.0,
+                stabilise: 0.0,
                 handbrake: 0.0,
                 controls: VehicleControls::default(),
                 water,
@@ -5206,6 +5249,60 @@ impl Physics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A boat that hits something loses its roll (`CollisionStabilization`
+    // 1, the 360 record's default; 0x8219A7xx); afloat and clear of
+    // things it rolls on as its springs let it.
+    #[test]
+    fn a_boat_that_hits_something_stops_rolling() {
+        let rolled = |wall: bool, stabilization: f32| {
+            let mut p = Physics::new();
+            p.set_water(0.0);
+            if wall {
+                let block = CollisionShape::cuboid(Vec3::new(20.0, 5.0, 1.0));
+                p.add_static(
+                    StaticKey::Cell(1),
+                    &block,
+                    Vec3::new(0.0, 0.0, 4.5),
+                    Quat::IDENTITY,
+                );
+            }
+            let mut spec = boat();
+            spec.tuning.boat = Some(BoatTuning {
+                float: BoatFloat {
+                    stabilization,
+                    ..BoatFloat::DEFAULT
+                },
+                ..BOAT
+            });
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, -0.5, 0.0), 0.0);
+            for _ in 0..120 {
+                p.drive(id, VehicleControls::default());
+                p.step(DT);
+            }
+            // Rolling hard and driven at 8 m/s into the wall's face half a
+            // metre ahead; a sixth of a second on.
+            let v = p.vehicle_velocity(id);
+            p.set_vehicle_velocity(id, v.with_z(8.0));
+            let h = p.vehicles[id.0].as_ref().unwrap().controller.chassis;
+            p.world
+                .bodies
+                .get_mut(h)
+                .unwrap()
+                .set_angvel(vector(Vec3::Z * 2.0), true);
+            for _ in 0..10 {
+                p.drive(id, VehicleControls::default());
+                p.step(DT);
+            }
+            let m = p.vehicle_transform(id).unwrap();
+            vec3(p.world.bodies.get(h).unwrap().angvel())
+                .dot(m.transform_vector3(Vec3::Z))
+                .abs()
+        };
+        let (open, hit, unheld) = (rolled(false, 1.0), rolled(true, 1.0), rolled(true, 0.0));
+        assert!(hit < 0.35 * open, "rolls {hit} after the hit, {open} clear");
+        assert!(hit < 0.5 * unheld, "rolls {hit}, {unheld} without it");
+    }
 
     // The 360 code's noise is smooth and stays within 0 to 1, a
     // helicopter's phase within 0 to 1, and its turbulence is nothing with
