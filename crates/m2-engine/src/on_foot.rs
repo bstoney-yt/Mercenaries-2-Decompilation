@@ -150,8 +150,135 @@ impl Turn {
     }
 }
 
-/// How fast a player's speed builds towards what the stick asks, m/s²
-/// (0x82DE87F8).
+/// How fast the way a person moves swings round to the way the stick
+/// points, rad/s (1200 degrees a second: 0x820F9808 scaled to radians by
+/// the static initialiser at 0x82900138), for a person without an
+/// `Ai` component, as the player is (the object's +0x418 is set when the
+/// template has the AI personality record, table 0x83653598: the
+/// constructor's tail at 0x821779B4). The swing is slowed where the turn
+/// is small: by the turn over pi, but no less than [`SWING_MIN_SHARE`]
+/// (0x8217BDE0, its first branch).
+pub const SWING: f32 = 1200.0 * std::f32::consts::PI / 180.0;
+const SWING_MIN_SHARE: f32 = 0.4;
+
+/// The way a player moves after `dt` seconds, from `way` (a unit
+/// vector) towards `stick` (the stick's way, any length): the new unit
+/// way. The stick's length passes through untouched.
+pub fn swing(way: Vec2, stick: Vec2, dt: f32) -> Vec2 {
+    if stick.length_squared() < 1e-8 {
+        return way;
+    }
+    let want = stick.normalize();
+    if way.length_squared() < 1e-8 {
+        return want;
+    }
+    let heading = |v: Vec2| v.x.atan2(v.y);
+    let d = wrap(heading(want) - heading(way));
+    let share = (d.abs() / std::f32::consts::PI).clamp(SWING_MIN_SHARE, 1.0);
+    let step = d.clamp(-SWING * dt, SWING * dt) * share;
+    let h = heading(way) + step;
+    Vec2::new(h.sin(), h.cos())
+}
+
+/// Which pace the stick picks (0x82179350): the gait states it reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pace {
+    Still,
+    Walk,
+    Jog,
+    Run,
+    /// Sprinting: between the run and the sprint pace.
+    Sprint,
+}
+
+/// The pace and speed (m/s) a person without an `Ai` component moves
+/// at with the stick pushed `stick` of the way (0 to 1, the player
+/// control passes the stick's own length, no less than 0.25 once pushed:
+/// 0x824333E0), sprinting or not, `align` the cosine between the way they
+/// face and the way they move, crouched (aimed in) or not. As 0x82179350:
+/// the paces are kept as shares of [`HumanMotion::full_speed`]
+/// (0x8217D608) and the stick picks between them at the midpoints
+/// (0x8217D598); crouched it is `CrouchWalkSpeed` once past the walk's
+/// threshold; sprinting, the run pace plus the share of the way to the
+/// sprint pace that they face where they go.
+pub fn pace(m: &HumanMotion, stick: f32, sprint: bool, align: f32, crouched: bool) -> (Pace, f32) {
+    let [walk, jog, run, sprint_pace] = m.paces;
+    let k = m.full_speed().max(1e-4);
+    let s = stick * k;
+    if s <= walk * 0.5 {
+        return (Pace::Still, 0.0);
+    }
+    if crouched {
+        return (Pace::Walk, m.crouch_walk);
+    }
+    if sprint && sprint_pace > run {
+        return (Pace::Sprint, run + align.max(0.0) * (sprint_pace - run));
+    }
+    if s < (walk + jog) * 0.5 {
+        (Pace::Walk, walk)
+    } else if s < (jog + run) * 0.5 {
+        (Pace::Jog, jog)
+    } else {
+        (Pace::Run, run)
+    }
+}
+
+/// How long a person takes to get going from a stop, seconds (0x82DE8868):
+/// their speed is scaled by the square of the share of it gone. Stopping
+/// for less than [`START_AGAIN`] (0x82DE886C) and setting off again needs
+/// no build-up (0x82179588).
+pub const START: f32 = 0.06;
+const START_AGAIN: f32 = 0.25;
+
+/// The build-up of a person's speed from a stop (0x82179588: the
+/// object's +0x184 state and +0x188 timer).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Start {
+    state: u8,
+    time: f32,
+}
+
+impl Start {
+    /// Steps on `dt` with `speed` asked: the speed to go at.
+    pub fn step(&mut self, speed: f32, dt: f32) -> f32 {
+        let moving = speed > 0.0;
+        let next = match (self.state, moving) {
+            (0, true) => 1,
+            (1, true) if self.time > START => 2,
+            (1, false) => 0,
+            (2, false) => 3,
+            (3, true) => 2,
+            (3, false) if self.time > START_AGAIN => 0,
+            (s, _) => s,
+        };
+        if next != self.state {
+            self.state = next;
+            self.time = 0.0;
+        }
+        let out = if self.state == 1 {
+            let t = (self.time / START).clamp(0.0, 1.0);
+            speed * t * t
+        } else {
+            speed
+        };
+        self.time += dt;
+        out
+    }
+
+    /// Getting going: the turn to face builds at [`TURN_ACCEL_STARTING`]
+    /// instead.
+    pub fn starting(&self) -> bool {
+        self.state == 1
+    }
+}
+
+/// The turn's build-up while getting going, rad/s² (0x82DE8874).
+pub const TURN_ACCEL_STARTING: f32 = 10.0;
+
+/// How fast the speed of a person with an `Ai` component builds towards
+/// what they ask, m/s² (0x82DE87F8): the people, not the player (the
+/// object's +0x418 is set from the AI personality record, table
+/// 0x83653598; see [`SWING`]).
 pub const MOVE_ACCEL: f32 = 7.5;
 /// How fast it drops, m/s² (0x82DE87FC): at once, in practice.
 pub const MOVE_DECEL: f32 = 1000.0;
@@ -165,13 +292,13 @@ const REVERSE_MIN: f32 = 0.5;
 const SWING_MIN: f32 = 1.75;
 /// 180 degrees a second (0x82DE8800 = 180 x pi/180, set by the static
 /// initialiser at 0x829064C8).
-const SWING: f32 = std::f32::consts::PI;
+const AI_SWING: f32 = std::f32::consts::PI;
 
-/// A player's velocity on the ground after `dt` seconds from `current`
-/// (m/s, horizontal) when the stick asks for `wanted`: the player's branch
-/// of 0x8217BDE0 (the object's +0x418 set; the people's branch turns the
-/// asked way at 1200 degrees a second instead). Speed builds at
-/// [`MOVE_ACCEL`] and drops at [`MOVE_DECEL`].
+/// The velocity on the ground of a person with an `Ai` component after
+/// `dt` seconds from `current` (m/s, horizontal) when they ask for
+/// `wanted`: that branch of 0x8217BDE0 (the player takes [`swing`] and
+/// [`pace`] instead). Speed builds at [`MOVE_ACCEL`] and drops at
+/// [`MOVE_DECEL`]; the people's run stop lasts 0.4 s (0x82DE8850).
 pub fn steer(current: Vec2, wanted: Vec2, dt: f32) -> Vec2 {
     let (have, want) = (current.length(), wanted.length());
     let heading = |v: Vec2| v.x.atan2(v.y);
@@ -190,7 +317,7 @@ pub fn steer(current: Vec2, wanted: Vec2, dt: f32) -> Vec2 {
             way = heading(wanted);
             if have > SWING_MIN {
                 let d = wrap(heading(wanted) - heading(current));
-                way = wrap(heading(current) + d.clamp(-SWING * dt, SWING * dt));
+                way = wrap(heading(current) + d.clamp(-AI_SWING * dt, AI_SWING * dt));
             }
         }
         s
@@ -211,9 +338,21 @@ pub fn steer(current: Vec2, wanted: Vec2, dt: f32) -> Vec2 {
 /// ([`RunStop`]); standing, she holds still a moment.
 pub const CROUCH_HOLD: f32 = 0.25;
 
-/// How long the slide to a stop after a run lasts for a player, seconds
-/// (0x82DE8850; the people's are 0.25 s, 0.666 s crouched).
-pub const RUN_STOP: f32 = 0.4;
+/// How long the slide to a stop after a run lasts, seconds, for a person
+/// without an `Ai` component (the people with one take 0.4 s,
+/// 0x82DE8850): 0.25 s (0x82DE8840, 0x82DE8844), crouched 0.666 s
+/// (0x82DE8848), crouched from a sprint 1.3 s (0x82DE884C) (0x8217CD20).
+pub fn run_stop_length(crouched: bool, sprinting: bool) -> f32 {
+    match (crouched, sprinting) {
+        (false, _) => 0.25,
+        (true, false) => 0.666,
+        (true, true) => 1.3,
+    }
+}
+/// The slide ends this many times faster once hurried (0x82DE8854: the
+/// player control's message 3, sent while she drops into the crouch with
+/// the stick not pushed the way she slides).
+pub const RUN_STOP_HURRY: f32 = 3.0;
 /// Let go within this long of last being at a run, and after running at
 /// least [`RUN_STOP_RUNNING`], they slide (0x82DE8860, 0x82DE8864), but
 /// not until [`RUN_STOP_WAIT`] after (0x82DE885C).
@@ -230,13 +369,23 @@ pub const CANCEL_STOP_ACTION: &str = "CancelStop";
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RunStop {
     /// Seconds since they last ran, and since the run they were last in
-    /// began (the object's +0x1b4 and +0x1bc timers).
+    /// began (the object's +0x1b4 and +0x1bc timers), and whether they
+    /// sprinted then (+0x1b1).
     since_run: f32,
     since_start: f32,
-    /// Sliding: the speed it started at (m/s) and how far through it is,
-    /// 0 to 1.
+    sprinted: bool,
+    /// Sliding: the speed it started at (m/s), how far through it is (0
+    /// to 1), how long it lasts and whether it was hurried (+0x1b0).
     pub sliding: Option<(f32, f32)>,
+    length: f32,
+    hurried: bool,
+    /// A person with an `Ai` component: their slide lasts [`AI_RUN_STOP`].
+    ai: bool,
 }
+
+/// How long the slide to a stop lasts for a person with an `Ai`
+/// component, seconds (0x82DE8850).
+pub const AI_RUN_STOP: f32 = 0.4;
 
 /// What [`RunStop::step`] did this step.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -251,10 +400,27 @@ pub enum StopEvent {
 }
 
 impl RunStop {
-    /// Steps on `dt` seconds with the player asking for `speed` m/s
-    /// (after [`steer`]); `run` is their run pace. The speed to move at
-    /// instead while sliding, and what happened.
-    pub fn step(&mut self, speed: f32, run: f32, dt: f32) -> (f32, StopEvent) {
+    /// One for a person with an `Ai` component (the people).
+    pub fn people() -> Self {
+        Self {
+            ai: true,
+            ..Self::default()
+        }
+    }
+
+    /// Steps on `dt` seconds with `speed` m/s asked (after the pace pick
+    /// and [`Start`]); `m` gives the run and sprint paces, `sprinting`
+    /// whether the sprint is held, `crouched` whether aimed in. The
+    /// speed to move at instead while sliding, and what happened.
+    pub fn step(
+        &mut self,
+        m: &HumanMotion,
+        speed: f32,
+        sprinting: bool,
+        crouched: bool,
+        dt: f32,
+    ) -> (f32, StopEvent) {
+        let [_, _, run, sprint] = m.paces;
         self.since_run += dt;
         self.since_start += dt;
         if let Some((from, t)) = self.sliding {
@@ -262,7 +428,8 @@ impl RunStop {
                 self.sliding = None;
                 return (speed, StopEvent::Cancelled);
             }
-            let t = t + dt / (RUN_STOP + 1e-4);
+            let hurry = if self.hurried { RUN_STOP_HURRY } else { 1.0 };
+            let t = t + hurry * dt / (self.length + 1e-4);
             if t >= 1.0 {
                 self.sliding = None;
                 return (0.0, StopEvent::Ended);
@@ -276,6 +443,7 @@ impl RunStop {
                     self.since_start = 0.0;
                 }
                 self.since_run = 0.0;
+                self.sprinted = sprinting;
             }
             return (speed, StopEvent::None);
         }
@@ -283,10 +451,29 @@ impl RunStop {
             && self.since_start - self.since_run > RUN_STOP_RUNNING
             && self.since_run >= RUN_STOP_WAIT
         {
-            self.sliding = Some((run, 0.0));
-            return (run, StopEvent::Began);
+            let from = if self.sprinted && sprint > run {
+                sprint
+            } else {
+                run
+            };
+            self.length = if self.ai {
+                AI_RUN_STOP
+            } else {
+                run_stop_length(crouched, self.sprinted)
+            };
+            self.hurried = false;
+            self.sliding = Some((from, 0.0));
+            return (from, StopEvent::Began);
         }
         (0.0, StopEvent::None)
+    }
+
+    /// Hurries a slide under way to its end (the player control's message
+    /// 3, handled at 0x82178948).
+    pub fn hurry(&mut self) {
+        if self.sliding.is_some() {
+            self.hurried = true;
+        }
     }
 }
 
@@ -354,66 +541,79 @@ mod tests {
     }
 
     #[test]
-    fn speed_builds_slowly_and_drops_at_once() {
-        let mut v = Vec2::ZERO;
-        let want = Vec2::new(0.0, 5.0);
-        let mut steps = 0;
-        while v.length() < 4.999 {
-            v = steer(v, want, DT);
-            steps += 1;
+    fn the_stick_picks_a_pace_and_sprinting_runs_up_to_the_sprint() {
+        let m = jennifer();
+        // Shares of her full 12 m/s: walk past 1/12, jog past 7/24, run
+        // past 1/2.
+        assert_eq!(pace(&m, 0.05, false, 1.0, false), (Pace::Still, 0.0));
+        assert_eq!(pace(&m, 0.25, false, 1.0, false), (Pace::Walk, 2.0));
+        assert_eq!(pace(&m, 0.4, false, 1.0, false), (Pace::Jog, 5.0));
+        assert_eq!(pace(&m, 1.0, false, 1.0, false), (Pace::Run, 7.0));
+        assert_eq!(pace(&m, 1.0, true, 1.0, false), (Pace::Sprint, 12.0));
+        assert_eq!(pace(&m, 1.0, true, 0.5, false), (Pace::Sprint, 9.5));
+        assert_eq!(pace(&m, 1.0, true, 1.0, true), (Pace::Walk, 1.5));
+    }
+
+    #[test]
+    fn getting_going_takes_six_hundredths_and_the_way_swings_fast() {
+        let mut s = Start::default();
+        let first = s.step(7.0, DT);
+        assert_eq!(first, 0.0);
+        let mut v = 0.0;
+        for _ in 0..5 {
+            v = s.step(7.0, DT);
         }
-        // 5 m/s at 7.5 m/s²: two thirds of a second.
-        assert!((steps as f32 * DT - 0.667).abs() < 0.02, "{steps}");
-        assert_eq!(steer(v, Vec2::ZERO, DT), Vec2::ZERO);
-        // Asked straight back, she stops before going the other way.
-        let back = steer(v, -want, DT);
-        assert_eq!(back.length(), 0.0);
-        // Above 1.75 m/s the way she goes swings at 180 degrees a second.
-        let side = steer(v, Vec2::new(5.0, 0.0), DT);
-        let turned = side.x.atan2(side.y);
-        assert!(
-            (turned - std::f32::consts::PI / 60.0).abs() < 1e-4,
-            "{turned}"
-        );
+        assert_eq!(v, 7.0);
+        // A quarter turn of the stick: swung at up to 1200 degrees a
+        // second, slowed to half for a quarter of pi.
+        let w = swing(Vec2::Y, Vec2::X, DT);
+        let turned = w.x.atan2(w.y).to_degrees();
+        assert!((turned - 10.0).abs() < 0.1, "{turned}");
     }
 
     #[test]
     fn letting_go_after_a_run_slides_to_a_stop() {
-        let mut s = RunStop::default();
-        for _ in 0..30 {
-            assert_eq!(s.step(7.0, 7.0, DT), (7.0, StopEvent::None));
-        }
-        // Let go: a moment's wait, then the slide from her run pace.
-        let mut began = None;
-        for i in 0..10 {
-            if let (v, StopEvent::Began) = s.step(0.0, 7.0, DT) {
-                began = Some((i, v));
-                break;
+        let m = jennifer();
+        let slide = |sprint: bool, crouch: bool| {
+            let mut s = RunStop::default();
+            let pace = if sprint { 12.0 } else { 7.0 };
+            for _ in 0..30 {
+                s.step(&m, pace, sprint, false, DT);
             }
-        }
-        let (i, v) = began.expect("the slide began");
-        assert!((2..=4).contains(&i), "{i}");
-        assert_eq!(v, 7.0);
-        let mut moved = 0.0;
-        let mut steps = 0;
-        loop {
-            let (v, e) = s.step(0.0, 7.0, DT);
-            moved += v * DT;
-            steps += 1;
-            if e == StopEvent::Ended {
-                break;
+            let mut began = None;
+            for _ in 0..10 {
+                if let (v, StopEvent::Began) = s.step(&m, 0.0, sprint, crouch, DT) {
+                    began = Some(v);
+                    break;
+                }
             }
-        }
-        assert!((steps as f32 * DT - RUN_STOP).abs() < 0.03, "{steps}");
-        // About half of 7 m/s over 0.4 s.
-        assert!((moved - 1.4).abs() < 0.15, "{moved}");
+            let from = began.expect("the slide began");
+            let (mut moved, mut secs) = (0.0, 0.0);
+            loop {
+                let (v, e) = s.step(&m, 0.0, sprint, crouch, DT);
+                moved += v * DT;
+                secs += DT;
+                if e == StopEvent::Ended {
+                    break;
+                }
+            }
+            (from, secs, moved)
+        };
+        let (from, secs, moved) = slide(false, false);
+        assert_eq!(from, 7.0);
+        assert!((secs - 0.25).abs() < 0.03 && (moved - 0.875).abs() < 0.15);
+        // Aimed in from a sprint: a long low slide from the sprint pace.
+        let (from, secs, moved) = slide(true, true);
+        assert_eq!(from, 12.0);
+        assert!((secs - 1.3).abs() < 0.03, "{secs}");
+        assert!((moved - 7.8).abs() < 0.4, "{moved}");
         // A walk lets go without a slide.
         let mut s = RunStop::default();
         for _ in 0..30 {
-            s.step(2.0, 7.0, DT);
+            s.step(&m, 2.0, false, false, DT);
         }
         for _ in 0..30 {
-            assert_eq!(s.step(0.0, 7.0, DT).1, StopEvent::None);
+            assert_eq!(s.step(&m, 0.0, false, false, DT).1, StopEvent::None);
         }
     }
 }
@@ -569,5 +769,27 @@ mod shuffle_tests {
             "{}",
             turned.to_degrees()
         );
+    }
+}
+
+#[cfg(test)]
+mod people_tests {
+    use super::*;
+
+    #[test]
+    fn the_peoples_speed_builds_slowly_and_drops_at_once() {
+        let dt = 1.0 / 60.0;
+        let mut v = Vec2::ZERO;
+        let want = Vec2::new(0.0, 5.0);
+        let mut steps = 0;
+        while v.length() < 4.999 {
+            v = steer(v, want, dt);
+            steps += 1;
+        }
+        // 5 m/s at 7.5 m/s²: two thirds of a second.
+        assert!((steps as f32 * dt - 0.667).abs() < 0.02, "{steps}");
+        assert_eq!(steer(v, Vec2::ZERO, dt), Vec2::ZERO);
+        // Asked straight back, they stop before going the other way.
+        assert_eq!(steer(v, -want, dt).length(), 0.0);
     }
 }

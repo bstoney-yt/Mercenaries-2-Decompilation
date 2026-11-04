@@ -1,7 +1,7 @@
 //! The player on foot: Jennifer walking the island under the character
 //! controller, with a third-person camera behind her.
 
-use m2_engine::on_foot::{self, AimLegs, HumanMotion, RunStop, StopEvent, Turn};
+use m2_engine::on_foot::{self, AimLegs, HumanMotion, Pace, RunStop, Start, StopEvent, Turn};
 use m2_engine::{Character, Gait, GpuModel, Physics, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
@@ -360,9 +360,13 @@ pub struct Player {
     /// run ([`on_foot`]).
     turn: Turn,
     run_stop: RunStop,
-    /// The way and speed she moves over the ground, m/s, as the stick's
-    /// ask builds up to it ([`on_foot::steer`]).
+    /// The way and speed she moves over the ground, m/s
+    /// ([`on_foot::pace`], [`on_foot::swing`]).
     ground: Vec2,
+    /// The pace the stick picked this step, and her getting going
+    /// ([`on_foot::Start`]).
+    pace: Pace,
+    start: Start,
     /// The way she last moved (a unit vector), the way a slide to a stop
     /// carries her.
     way: Vec2,
@@ -566,6 +570,8 @@ impl Player {
             turn: Turn::default(),
             run_stop: RunStop::default(),
             ground: Vec2::ZERO,
+            pace: Pace::Still,
+            start: Start::default(),
             way: Vec2::Y,
             stopping: None,
             crouch_hold: None,
@@ -695,6 +701,7 @@ impl Player {
     /// a jump. Back on foot, `update` takes them up again.
     pub fn off_foot(&mut self) {
         self.ground = Vec2::ZERO;
+        self.start = Start::default();
         self.run_stop = RunStop::default();
         self.stopping = None;
         self.crouch_hold = None;
@@ -962,15 +969,6 @@ impl Player {
             self.camera(physics);
             return;
         }
-        // Aimed in she is crouched, at her template's `CrouchWalkSpeed`
-        // (inferred for the player: the 360 picks that pace for the
-        // crouched people; how its player control scales the stick is
-        // untraced).
-        let speed = if self.aiming {
-            self.motion.crouch_walk
-        } else {
-            self.speeds[pace]
-        };
         if self.aiming && !self.was_aiming {
             self.crouch_hold = Some(on_foot::CROUCH_HOLD);
         }
@@ -987,23 +985,43 @@ impl Player {
         };
         // Bashing or picking a weapon up, she stands.
         let bashing = self.bashing.is_some() || self.picking.is_some();
-        let asked = if bashing || held {
-            Vec2::ZERO
-        } else {
-            Vec2::new(direction.x, direction.z) * speed
+        // The stick picks her pace, as the 360 player's does: its own
+        // length, the walk key standing for its lightest push (0.25,
+        // the least the 360's player control passes on); the full push
+        // is her run, the sprint key her sprint, aimed in her crouched
+        // walk ([`on_foot::pace`]). The way she goes swings round to the
+        // stick's ([`on_foot::swing`]); she gets going in 0.06 s
+        // ([`on_foot::Start`]); let go after a run she slides to a stop
+        // ([`RunStop`]).
+        let stick = Vec2::new(direction.x, direction.z);
+        let push = match stick.length() {
+            l if l < 1e-4 => 0.0,
+            _ if intent.walk => 0.25,
+            l => l.max(0.25),
         };
-        // Her speed builds up to what is asked and drops at once; let go
-        // after a run, she slides to a stop ([`on_foot`]).
-        self.ground = on_foot::steer(self.ground, asked, dt);
-        if self.ground.length_squared() > 1e-8 {
-            self.way = self.ground.normalize();
+        let align = Vec2::new(self.facing.sin(), self.facing.cos()).dot(self.way);
+        let (picked, speed) = on_foot::pace(&self.motion, push, intent.sprint, align, self.aiming);
+        let speed = if bashing || held { 0.0 } else { speed };
+        self.pace = if speed > 0.0 { picked } else { Pace::Still };
+        if held && stick.dot(self.way) < 1e-4 {
+            // Dropping into the crouch with the stick not pushed the way
+            // she slides: the slide hurries to its end (the player
+            // control's message 3).
+            self.run_stop.hurry();
         }
-        let (slide, stop) = self.run_stop.step(self.ground.length(), self.speeds[2], dt);
+        let speed = self.start.step(speed, dt);
+        if !held && !bashing {
+            self.way = on_foot::swing(self.way, stick, dt);
+        }
+        let (slide, stop) = self
+            .run_stop
+            .step(&self.motion, speed, intent.sprint, self.aiming, dt);
         let ground = if self.run_stop.sliding.is_some() || stop == StopEvent::Began {
             self.way * slide
         } else {
-            self.ground
+            self.way * speed
         };
+        self.ground = ground;
         let wanted = Vec3::new(ground.x, 0.0, ground.y);
         let jump = self
             .takes_off(intent.jump, bashing)
@@ -1087,6 +1105,8 @@ impl Player {
         if let Some(target) = heading {
             let accel = if aimed {
                 on_foot::TURN_ACCEL_AIMED
+            } else if self.start.starting() {
+                on_foot::TURN_ACCEL_STARTING
             } else {
                 on_foot::TURN_ACCEL
             };
@@ -1107,14 +1127,14 @@ impl Player {
         }
         let (mut swap, mut switched) = (None, false);
         if let Some((_, rig)) = &mut self.model {
-            let gait = if moved < 0.3 {
-                Gait::Idle
-            } else if intent.walk || self.aiming {
-                Gait::Walk
-            } else if intent.sprint {
-                Gait::Sprint
-            } else {
-                Gait::Run
+            // The 360's paces to the alpha's gaits: its jog plays the
+            // `Upright_Jog_Forward` clip (the alpha's run), its run and
+            // sprint `Upright_Run_Forward` (the alpha's sprint).
+            let gait = match self.pace {
+                _ if moved < 0.3 => Gait::Idle,
+                Pace::Still | Pace::Walk => Gait::Walk,
+                Pace::Jog => Gait::Run,
+                Pace::Run | Pace::Sprint => Gait::Sprint,
             };
             let clips = &self.clips;
             // Aimed in she is `Crouched`: its gait's clip for what she
@@ -1702,15 +1722,15 @@ mod tests {
             movement: Vec2::Y,
             ..Intent::default()
         };
-        // Her speed builds at 7.5 m/s² to her run: 1.67 m in the first
-        // two thirds of a second, then 5 m/s.
+        // The full push is her run (Jennifer's 7 m/s), reached in 0.06 s;
+        // the way she goes swings from where she faced to the camera's.
         for _ in 0..120 {
             p.update(&physics, forward, dt);
         }
         let at = p.character.position;
-        assert!((at.x - 8.33).abs() < 0.3, "{at}");
-        assert!((p.character.velocity.x - RUN).abs() < 0.05);
-        assert!(at.z.abs() < 0.1, "{at}");
+        assert!((at.x - 13.2).abs() < 0.5, "{at}");
+        assert!((p.character.velocity.x - JENNIFER.paces[2]).abs() < 0.05);
+        assert!(at.z.abs() < 0.6, "{at}");
         assert!((p.facing - std::f32::consts::FRAC_PI_2).abs() < 1e-3);
         // The camera is behind her and above.
         let eye = p.eye();
@@ -1768,7 +1788,7 @@ mod tests {
             ..Intent::default()
         };
         let mut to_run = 0.0;
-        while r.character.velocity.length() < RUN - 0.05 && to_run < 3.0 {
+        while r.character.velocity.length() < JENNIFER.paces[2] - 0.05 && to_run < 3.0 {
             r.update(&physics, run, dt);
             to_run += dt;
         }
@@ -1795,7 +1815,7 @@ mod tests {
         let mut slide_time = 0.0;
         let mut sliding = false;
         let mut aim_slid = 0.0;
-        for i in 0..60 {
+        for i in 0..120 {
             s.update(&physics, sprint, dt);
             if s.run_stop.sliding.is_some() {
                 sliding = true;
@@ -1814,13 +1834,13 @@ mod tests {
              then {crouched:.2} m/s crouched"
         );
         assert!(sliding);
-        assert!((aim_slid - 1.4).abs() < 0.3, "{aim_slid}");
+        assert!((aim_slid - 7.8).abs() < 0.6, "{aim_slid}");
         assert!((crouched - 1.5).abs() < 0.05, "{crouched}");
         assert!((top - 1.0).abs() < 0.06, "{top}");
         assert!((air - 0.70).abs() < 0.05, "{air}");
         assert!((0.3..0.45).contains(&turn), "{turn}");
-        assert!((to_run - 0.67).abs() < 0.05, "{to_run}");
-        assert!((slid - 1.4).abs() < 0.3, "{slid}");
+        assert!(to_run < 0.15, "{to_run}");
+        assert!((slid - 1.5).abs() < 0.3, "{slid}");
     }
 
     // Playtest 8: the pad's A that closed the contract's fanfare jumped
