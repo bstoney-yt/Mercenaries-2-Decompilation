@@ -1386,6 +1386,75 @@ struct VehicleBody {
     rotor: Option<Rotorcraft>,
 }
 
+/// How hard a helicopter's turbulence pushes it, m/s² a radian of its
+/// shake ([`turbulence`]): the 360 code's 0.5 (its object's 0xD0, set at
+/// 0x821A3278) x 30 (0x821A2F00).
+const TURBULENCE_PUSH: f32 = 0.5 * 30.0;
+
+/// The 360 code's smooth noise over one axis (0x828566B0): the gradient
+/// at each whole step from a table of 256 ([`noise_table`]), eased
+/// between them (3f² - 2f³), 0 to 1 about 0.5.
+fn noise(x: f32) -> f32 {
+    let g = noise_table();
+    let i = x.floor();
+    let f = x - i;
+    let i = i as i64;
+    let (a, b) = (g[(i & 255) as usize], g[((i + 1) & 255) as usize]);
+    let s = f * f * (3.0 - 2.0 * f);
+    (a * f + s * (b * (f - 1.0) - a * f) + 1.0) * 0.5
+}
+
+/// The gradients [`noise`] reads, each -1 to 1. The 360 code fills its
+/// table once from the game's random numbers (0x82856768, through
+/// 0x8215E260), so its values depend on that generator's state: these
+/// are the alpha's own, from a fixed seed. Invented values, the 360's
+/// form.
+fn noise_table() -> &'static [f32; 256] {
+    static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut u: u32 = 0x2545_F491;
+        std::array::from_fn(|_| {
+            u = u.wrapping_mul(0x0019_660D).wrapping_add(0x3C6E_F35F);
+            (u >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        })
+    })
+}
+
+/// Where in its turbulence a helicopter is, 0 to 1, from its id as the
+/// 360 code takes it from its entity's (0x821A2F00: two steps of the
+/// generator 0x19660D, 0x3C6EF35F from id ^ 0xC71C2830, made a float in
+/// 1..2 less 1). The alpha's ids are its own, so its helicopters' phases
+/// are not the 360's.
+fn turbulence_phase(id: u32) -> f32 {
+    let step = |u: u32| u.wrapping_mul(0x0019_660D).wrapping_add(0x3C6E_F35F);
+    let u = step(id ^ 0xC71C_2830);
+    let u2 = step(u);
+    f32::from_bits(0x3F80_0000 | (((u2 & 0xFFFF_01FF) | (u >> 16)) >> 9)) - 1.0
+}
+
+/// A helicopter's shake by the air, as the 360 code works it each step
+/// (0x821A2F00): along (`a`) and across (`b`, three times as much) its
+/// flat heading, radians, at `time` seconds into the game, `phase` its
+/// [`turbulence_phase`]: each the sum of two of [`noise`] less 1, at
+/// times 0.4 as fast as the clock and set apart, x 8 degrees x its
+/// rotor's `spin` x how far it is off the ground (`air` seconds off it,
+/// at most 1; on it, 1 less `ground` seconds on it, at most 1). It is
+/// pushed by (flat across x `b` + flat ahead x `a`) x its mass x
+/// [`TURBULENCE_PUSH`].
+fn turbulence(phase: f32, time: f32, spin: f32, air: f32, ground: f32) -> (f32, f32) {
+    let off = if air > 0.0 {
+        air.clamp(0.0, 1.0)
+    } else {
+        1.0 - ground.clamp(0.0, 1.0)
+    };
+    let t = 60.0 * phase + 0.4 * time;
+    let t9 = t + 53.245;
+    let shake = 8f32.to_radians() * spin * off;
+    let a = (noise(t + 123.356) + noise(205.642 - t9) - 1.0) * shake;
+    let b = (noise(63.427 - t) + noise(t9 + 183.235) - 1.0) * 3.0 * shake;
+    (a, b)
+}
+
 /// A helicopter's handling and what its pilot asks of it.
 struct Rotorcraft {
     flight: FlightTuning,
@@ -1394,6 +1463,8 @@ struct Rotorcraft {
     lift: f32,
     /// How it flies now, as the 360 code keeps it ([`Rotor`]).
     state: Rotor,
+    /// Where in its turbulence it is ([`turbulence_phase`]), 0 to 1.
+    phase: f32,
 }
 
 /// What a helicopter's `_HelicopterPhysics` keeps from step to step
@@ -2721,6 +2792,9 @@ pub struct Physics {
     /// The game's water heights: rivers, pools and lakes above the sea
     /// ([`Physics::water_at`]).
     inland: Option<std::sync::Arc<m2_assets::water::WaterHeights>>,
+    /// How long it has run, seconds: the game's clock its helicopters'
+    /// turbulence reads ([`turbulence`]).
+    time: f32,
 }
 
 /// A loose prop's piece in the physics world ([`Physics::add_debris`]).
@@ -2776,6 +2850,7 @@ impl Physics {
             debris: Vec::new(),
             water: None,
             inland: None,
+            time: 0.0,
         }
     }
 
@@ -2851,6 +2926,7 @@ impl Physics {
     /// since the last step into scene queries).
     pub fn step(&mut self, dt: f32) {
         self.world.integration_parameters.dt = dt;
+        self.time += dt;
         let w = &mut self.world;
         for v in self.vehicles.iter_mut().flatten() {
             v.before = w
@@ -3071,6 +3147,21 @@ impl Physics {
             }
             b.apply_impulse(vector(flown.impulse), true);
             b.apply_torque_impulse(vector(Vec3::Y * flown.torque_y * dt), true);
+            // Shaken by the air as its rotor turns, as much as it is
+            // off the ground: a force at its centre of mass (0x821A31FC
+            // hands Havok's applyForce its velocity change, F dt / mass).
+            let (a, bb) = turbulence(
+                r.phase,
+                self.time,
+                r.state.spin,
+                r.state.air,
+                r.state.ground,
+            );
+            let turn = Quat::from_array(b.position().rotation.to_array());
+            let flat = |v: Vec3| v.with_y(0.0).normalize_or_zero();
+            let push =
+                (flat(turn * Vec3::X) * bb + flat(turn * Vec3::Z) * a) * b.mass() * TURBULENCE_PUSH;
+            b.apply_impulse(vector(push * dt), true);
         }
     }
 
@@ -3745,6 +3836,7 @@ impl Physics {
                 },
                 lift: 0.0,
                 state: Rotor::default(),
+                phase: turbulence_phase(self.vehicles.len() as u32),
             });
         let top = if boat { BOAT_TOP } else { TOP_SPEED };
         let tyres = (!spec.tracked).then(|| spec.tuning.tyres.unwrap_or(Tyres::DEFAULT));
@@ -5212,6 +5304,42 @@ mod tests {
         assert!(hit < 0.5 * unheld, "rolls {hit}, {unheld} without it");
     }
 
+    // The 360 code's noise is smooth and stays within 0 to 1, a
+    // helicopter's phase within 0 to 1, and its turbulence is nothing with
+    // its rotor stopped or a second on the ground, at most 8 degrees x 3
+    // across (0x828566B0, 0x821A2F00).
+    #[test]
+    fn helicopter_turbulence_shakes_only_in_the_air_with_its_rotor_turning() {
+        let mut last = noise(0.0);
+        for i in 1..20_000 {
+            let n = noise(i as f32 * 0.01 - 50.0);
+            assert!((0.0..=1.0).contains(&n), "{n}");
+            assert!((n - last).abs() < 0.05, "smooth: {last} to {n}");
+            last = n;
+        }
+        // At whole steps the gradient adds nothing: 0.5.
+        assert_eq!(noise(7.0), 0.5);
+        for id in 0..500 {
+            assert!((0.0..1.0).contains(&turbulence_phase(id)));
+        }
+        assert_ne!(turbulence_phase(1), turbulence_phase(2));
+        assert_eq!(turbulence(0.3, 12.0, 0.0, 1.0, 0.0), (0.0, 0.0));
+        assert_eq!(turbulence(0.3, 12.0, 1.0, 0.0, 1.0), (0.0, 0.0));
+        let most = 8f32.to_radians();
+        let (mut big_a, mut big_b) = (0.0f32, 0.0f32);
+        for i in 0..6000 {
+            let (a, b) = turbulence(0.3, i as f32 / 60.0, 1.0, 1.0, 0.0);
+            assert!(a.abs() <= most && b.abs() <= 3.0 * most);
+            big_a = big_a.max(a.abs());
+            big_b = big_b.max(b.abs());
+        }
+        assert!(big_a > 0.1 * most && big_b > big_a, "{big_a} {big_b}");
+        // Half a second on the ground, half as much.
+        let (a, b) = turbulence(0.3, 5.0, 1.0, 0.0, 0.5);
+        let (a1, b1) = turbulence(0.3, 5.0, 1.0, 1.0, 0.0);
+        assert!((a - a1 * 0.5).abs() < 1e-6 && (b - b1 * 0.5).abs() < 1e-6);
+    }
+
     // A turret on its own body follows the angle asked on its hinge's
     // motor (20 x the angle to go, a second; 0x82273F90): asked to move at
     // 1 rad/s it keeps up a twentieth of a second behind, and turns the
@@ -6206,7 +6334,12 @@ mod tests {
             p.step(DT);
         }
         let up = place(&p).w_axis.y;
-        assert!(p.vehicle_velocity(id).length() < 0.5, "hovers");
+        // (Swaying in its turbulence, under a metre a second.)
+        let v = p.vehicle_velocity(id);
+        assert!(
+            v.y.abs() < 0.5 && v.with_y(0.0).length() < 1.0,
+            "hovers at {v}"
+        );
         // Holding its height, flat out ahead: its top speed, nose down
         // by its `MaxPitch` (0.66 for its speed, 0.33 for the stick).
         for _ in 0..1500 {

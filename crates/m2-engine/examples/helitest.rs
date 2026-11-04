@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "template\tcount\tfwd m/s\tclimb m/s\tlift-off s\tclimb@10s m/s\tfastest m/s\tnose deg\thover turn deg/s\tturn m/s\tturn deg/s\tbank deg"
+        "template\tcount\tfwd m/s\tclimb m/s\tlift-off s\tclimb@10s m/s\tfastest m/s\tnose deg\thover turn deg/s\tturn m/s\tturn deg/s\tbank deg\thover drift m\thover sway m/s"
     );
     for ((model, _), ids) in &groups {
         let mut ids = ids.clone();
@@ -91,8 +91,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (fastest, nose) = ahead(&spec);
         let hover = hover_turn(&spec);
         let (turn_speed, turn, bank) = corner(&spec);
+        let (drift, sway) = hands_off(&spec);
         println!(
-            "{name}\t{}\t{:.0}\t{:.0}\t{lift_off:.2}\t{climb:.1}\t{fastest:.1}\t{nose:.1}\t{hover:.1}\t{turn_speed:.1}\t{turn:.1}\t{bank:.1}",
+            "{name}\t{}\t{:.0}\t{:.0}\t{lift_off:.2}\t{climb:.1}\t{fastest:.1}\t{nose:.1}\t{hover:.1}\t{turn_speed:.1}\t{turn:.1}\t{bank:.1}\t{drift:.2}\t{sway:.2}",
             ids.len(),
             f.forward,
             f.climb,
@@ -225,4 +226,24 @@ fn corner(spec: &VehicleSpec) -> (f32, f32, f32) {
     ride(&mut p, id, 15.0, controls(1.0, 0.0, false), 0.0, |_, _| {});
     let (rate, speed, bank) = turning(&mut p, id, 6.0, controls(1.0, 1.0, false));
     (speed, rate, bank)
+}
+
+/// Up 12 s, then hands off 20 s: how far it wanders across the ground
+/// over the last 15, m, and its mean speed across the ground then, m/s.
+fn hands_off(spec: &VehicleSpec) -> (f32, f32) {
+    let (mut p, id) = start(spec);
+    ride(&mut p, id, 12.0, controls(0.0, 0.0, false), 1.0, |_, _| {});
+    ride(&mut p, id, 5.0, controls(0.0, 0.0, false), 0.0, |_, _| {});
+    let at = |p: &Physics| {
+        p.vehicle_transform(id)
+            .map_or(Vec3::ZERO, |m| m.w_axis.truncate())
+    };
+    let from = at(&p);
+    let (mut most, mut speed, mut n) = (0.0f32, 0.0, 0.0);
+    ride(&mut p, id, 15.0, controls(0.0, 0.0, false), 0.0, |p, _| {
+        most = most.max((at(p) - from).with_y(0.0).length());
+        speed += p.vehicle_velocity(id).with_y(0.0).length();
+        n += 1.0;
+    });
+    (most, speed / n)
 }
