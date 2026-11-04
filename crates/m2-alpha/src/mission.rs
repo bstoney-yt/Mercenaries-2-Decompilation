@@ -153,6 +153,11 @@ pub struct MissionView {
     pub contract_complete: bool,
     /// Her cash, as the scripts hold it.
     pub cash: Option<f64>,
+    /// Her fuel, and her support stock by item key (`MrxPmc`'s), for the
+    /// HUD's own `MrxPmc` to answer as the scripts would (the shop's and
+    /// the PDA's stockpile counts).
+    pub fuel: Option<f64>,
+    pub stock: Vec<(String, u32)>,
     /// The contract is completed and its fanfare waits for Enter to
     /// close it ([`MissionLink::waiting_fanfare`]).
     pub fanfare_waiting: bool,
@@ -992,6 +997,8 @@ pub struct MissionLink {
     saves: Vec<String>,
     /// Steps to the next look at her support stock.
     stock_look: u32,
+    /// Her support stock by item key, as last looked at.
+    stock_counts: Vec<(String, u32)>,
     /// Aimed designators' marks (guid, where) waiting to settle, and the
     /// scripts' time they do.
     aimed: Vec<(u32, Vec3, f64)>,
@@ -1136,6 +1143,7 @@ impl MissionLink {
             sighted: HashMap::new(),
             saves: Vec::new(),
             stock_look: 0,
+            stock_counts: Vec::new(),
             aimed: Vec::new(),
             landed: HashSet::new(),
             resources: None,
@@ -1399,6 +1407,36 @@ impl MissionLink {
     /// Stocks and calls in these support items once the scripts run.
     pub fn with_support(self, support: Vec<String>) -> Self {
         Self { support, ..self }
+    }
+
+    /// The HUD called back the mission's HUD call number `seq` with
+    /// arguments of its own (the shop's purchase: the item's id and how
+    /// many, `MrxShop._ShopSelection`'s): its `fCallback` runs with its
+    /// `tCallbackData` and then those, and stays for the next.
+    pub fn hud_callback_with(&mut self, seq: u64, args: &[crate::gamehud::CallArg]) {
+        let State::Running(m) = &mut self.state else {
+            return;
+        };
+        let given: Vec<String> = args.iter().map(|a| a.lua()).collect();
+        // Kept for the next (the shop calls its purchase callback for each
+        // item bought).
+        let code = format!(
+            "local t = __m2_hud_callbacks[{seq}]\n\
+             if t and type(t.fCallback) == 'function' then\n\
+               local a = {{}}\n\
+               if type(t.tCallbackData) == 'table' then\n\
+                 for _, v in ipairs(t.tCallbackData) do table.insert(a, v) end\n\
+               end\n\
+               for _, v in ipairs({{{}}}) do table.insert(a, v) end\n\
+               t.fCallback(unpack(a))\n\
+             end",
+            given.join(", ")
+        );
+        if let Err(e) = m.run(&code, "hud callback") {
+            self.write([format!("hud callback {seq} {given:?}: {e}")]);
+        } else {
+            self.write([format!("hud callback {seq} with {given:?}")]);
+        }
     }
 
     /// The HUD called back the mission's HUD call number `seq` (the
@@ -2826,6 +2864,12 @@ impl MissionLink {
             // Her stock, cash and fuel as the scripts hold them.
             if self.stock_look == 0 {
                 game.support.stock = crate::spans::time("scripts: stock", || stocked(mission));
+                self.stock_counts = game
+                    .support
+                    .stock
+                    .iter()
+                    .map(|s| (s.key.clone(), s.count))
+                    .collect();
                 self.resources = Some(mission.resources());
                 self.stock_look = STOCK_LOOK;
             }
@@ -4040,6 +4084,8 @@ impl MissionLink {
             game_message,
             contract_complete: self.completed.is_some_and(|age| age < BANNER_TIME),
             cash: self.resources.map(|r| r.0),
+            fuel: self.resources.map(|r| r.1),
+            stock: self.stock_counts.clone(),
             fanfare_waiting: self.completed.is_some() && waiting_fanfare(mission.lua()).is_some(),
             radar_regions: radar_regions(mission.lua()),
             hud_calls: hud_calls(mission.lua()),

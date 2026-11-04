@@ -4764,6 +4764,10 @@ fn mission_for_screenshot(
                     eprintln!("after contract: the HUD called back call {seq}");
                     link.hud_callback(seq);
                 }
+                for (seq, args) in g.take_callback_args() {
+                    eprintln!("after contract: the HUD called back call {seq} with {args:?}");
+                    link.hud_callback_with(seq, &args);
+                }
                 for (seq, picked) in g.take_choices() {
                     eprintln!("dialog-check: box {seq} closed on option {picked}");
                     link.hud_choice(seq, picked);
@@ -8620,6 +8624,9 @@ impl Running {
         if let (Some(g), Some(m)) = (&mut self.hud.game, &mut self.mission) {
             for seq in g.take_callbacks() {
                 m.hud_callback(seq);
+            }
+            for (seq, args) in g.take_callback_args() {
+                m.hud_callback_with(seq, &args);
             }
             // And the options picked in its dialog boxes.
             for (seq, picked) in g.take_choices() {
