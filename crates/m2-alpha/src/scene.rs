@@ -2186,6 +2186,7 @@ impl Scene {
             motion.max_rotation
         );
         let swim_speeds = [swim[0], swim[1], swim[2]];
+        let swim_full = swim[2].max(swim[3]);
         // The weapons already loaded were held by the last body's
         // skeleton.
         if let Some((_, rig)) = &mut model {
@@ -2201,6 +2202,7 @@ impl Scene {
             player.set_body(model, clips, moves);
             player.speeds = speeds;
             player.swim_speeds = swim_speeds;
+            player.swim_full = swim_full;
         }
     }
 

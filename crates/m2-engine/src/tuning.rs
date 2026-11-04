@@ -233,12 +233,8 @@ pub struct BoatTuning {
     /// is: 40; 6 to 45).
     pub reverse_speed: f32,
     /// Its engine's pull ahead and backing up (`EngineTorque` 1,000 and
-    /// `EngineReverseTorque` 500; 30 to 2,500 and 10 to 3,000). Only
-    /// their ratio is read: backing up it pulls that share of what it
-    /// pulls ahead (inferred: the Air Boat's 0.5 and the Barco's 0.44 of
-    /// their `MaxSpeed` are their `MaxSpeedReverse`). The units are
-    /// unknown: the torque over the mass varies 12-fold between boats
-    /// whose drag and top speed ask the same pull.
+    /// `EngineReverseTorque` 500; 30 to 2,500 and 10 to 3,000): x 200, N
+    /// (`physics::float_hull`, from 0x82198F08 and 0x82199B08).
     pub torque: (f32, f32),
     /// How quickly the water slows it along, across and up and down, a
     /// second (`WaterDragFwd` 0.2, `WaterDragSide` 2, `WaterDragUp` 2;
@@ -247,43 +243,199 @@ pub struct BoatTuning {
     /// did; the Air Boat's sideways 0.5 lets it skid, the landing craft's
     /// 10 holds it to its course).
     pub drag: [f32; 3],
-    /// How much more its brake slows it, a second (`BrakeDrag` 3; 0 to 8;
-    /// added to its drag along, inferred).
+    /// How hard its brake slows it, m/s² (`BrakeDrag` 3; 0 to 8): from
+    /// the 360 code (0x82199B08), a steady slowing, not a drag.
     pub brake: f32,
-    /// Its pull at a standstill, a third, two thirds and all of its top
-    /// speed (`EngineTorqueRatio0`..`3`, as a tank's are named: 1, 0.7,
-    /// 0.6, 0.5; read as a curve over its speed, as a tank's are,
-    /// inferred). Only their shape is read: scaled so that at its top
-    /// speed it pulls what holds it there.
+    /// Its pull, of its torque, at a standstill, at
+    /// [`BoatFloat::curve_at`] and at its top speed
+    /// (`EngineTorqueRatio0`..`3`; 0x82198F08).
     pub curve: [f32; 4],
     /// Its hull's friction (`HullFriction`, 0.3 when the record gives
     /// none, as the 360 code's schema reader defaults it at 0x823EA968):
     /// its sim sets it on its body (0x82198FF8, through 0x82629DB0). From
     /// the 360 code.
     pub hull_friction: f32,
+    /// What floats it and how it leans and lifts its bow
+    /// ([`BoatFloat`]).
+    pub float: BoatFloat,
 }
 
-impl BoatTuning {
-    /// Its pull flat out at `speed` m/s, m/s²: at `top` m/s, what holds
-    /// it there against its drag along (inferred: the data gives no pull
-    /// its torque fits, see [`torque`](Self::torque)), more or less
-    /// below it as its [`curve`](Self::curve) says; backing up, its
-    /// share of that.
-    pub fn push(&self, speed: f32, top: f32, backwards: bool) -> f32 {
-        let c = self.curve;
-        let shape = if c[3] > 0.0 && top > 0.0 {
-            let at = (speed.abs() / top).clamp(0.0, 1.0) * 3.0;
-            let i = (at as usize).min(2);
-            (c[i] + (c[i + 1] - c[i]) * (at - i as f32)) / c[3]
-        } else {
-            1.0
-        };
-        let ahead = self.drag[0] * top * shape;
-        if backwards {
-            ahead * (self.torque.1 / self.torque.0).clamp(0.0, 2.0)
-        } else {
-            ahead
+/// One of a boat's float springs as its speed sets them ([`BoatFloat`]):
+/// the heights, model space, metres, of its top and bottom
+/// (`Spring..SpeedStartOffset`, `..EndOffset`), and its strength (a
+/// second², of its mass per metre the water stands over its bottom) and
+/// damping (a second, of its mass per m/s it rises), `..Strength` and
+/// `..Dampening`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FloatSpring {
+    pub start: f32,
+    pub end: f32,
+    pub strength: f32,
+    pub damping: f32,
+}
+
+impl FloatSpring {
+    /// Its length, metres: its top above its bottom, 0 the other way up.
+    pub fn length(&self) -> f32 {
+        (self.start - self.end).max(0.0)
+    }
+}
+
+/// How a boat floats, from its `_BoatPhysics` (record 0x823EA868, which
+/// the 360 code copies into its boat sim at 0x82198FF8). From the 360
+/// code:
+///
+/// - It floats on four springs, one at each corner of its hull's box
+///   seen from above (0x82199328, the box from its body's shape), each
+///   pushing its body straight up, at the corner at its origin's height,
+///   by its mass x step x (strength x how far the water stands over its
+///   bottom, not below 0, less damping x how fast that corner rises x how
+///   far in the water is, its length's share, 0 to 1), never down
+///   (0x82199EA8).
+/// - Its springs are [`slow`](Self::slow)'s at a standstill and
+///   [`fast`](Self::fast)'s at its top speed ahead (`MaxSpeed`),
+///   between them as far as it goes; a spring's bottom is its length
+///   under its top, its top where its height puts it on the turned
+///   boat, its length measured up the world.
+/// - The water each spring stands in is eased each 1/60 s towards the
+///   water under it, keeping [`smoothing`](Self::smoothing) of the way
+///   (`SpringWaterSmoothing`).
+/// - Turning, it leans into the turn: with the helm to port its
+///   starboard springs (-x) feel the water stand higher, its port ones
+///   (+x) lower, by sin([`roll`](Self::roll)) x half its beam x its
+///   lean, eased toward its eased helm (positive to port, the 360 code's
+///   own sign: its car code turns it round, 0x82189448's 0x3483DBF1)
+///   (keeping [`roll_inertia`](Self::roll_inertia) a 1/60 s) x its speed
+///   over [`low_speed`](Self::low_speed) (at most 1) x (1 -
+///   [`steer_loss`](Self::steer_loss) x its speed over its top speed, at
+///   most 1); its helm eases toward the helm asked (backwards when
+///   backing up faster than a quarter of its reverse top speed, 10 km/h
+///   at most) keeping [`steer_inertia`](Self::steer_inertia), or
+///   [`steer_release`](Self::steer_release) with the helm let go
+///   (0x82199548, 0x8219A390, 0x82199B08).
+/// - Its helm turns it about the world's up ([`steering`](Self::steering)
+///   and the rest; `physics::float_hull`, from 0x8219A390), as much as it
+///   sits in the water, and its springs' pushes are scaled by that share,
+///   eased toward 1 while any is in the water and 0 when none is
+///   (0x8219A248).
+/// - Under throttle its bow lifts: its bow springs feel the water stand
+///   higher by sin([`pitch`](Self::pitch)) x its length x its lift, which
+///   rises toward its throttle by [`pitch_up`](Self::pitch_up) a second
+///   and eases down toward it keeping
+///   [`pitch_down_inertia`](Self::pitch_down_inertia) (0x82199548).
+///
+/// Fields the record leaves out take the 360 record's defaults.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoatFloat {
+    pub slow: FloatSpring,
+    pub fast: FloatSpring,
+    pub smoothing: f32,
+    /// Radians (`RollFromTurning`).
+    pub roll: f32,
+    /// `RollInertia`.
+    pub roll_inertia: f32,
+    /// Radians (`PitchFromAcceleration`).
+    pub pitch: f32,
+    /// A second (`PitchUpSpeed`).
+    pub pitch_up: f32,
+    /// `PitchDownInertia`.
+    pub pitch_down_inertia: f32,
+    /// m/s (`LowSpeedLimit`, km/h).
+    pub low_speed: f32,
+    /// `HighSpeedSteerLoss`.
+    pub steer_loss: f32,
+    /// `SteerInertia`.
+    pub steer_inertia: f32,
+    /// `SteerNoInputInertia`.
+    pub steer_release: f32,
+    /// Its top speeds ahead and backing up, m/s (`MaxSpeed`,
+    /// `MaxSpeedReverse`, km/h).
+    pub top: f32,
+    pub reverse: f32,
+    /// How hard its helm turns it (`physics::float_hull`, 0x8219A390): `Steering`,
+    /// `NoSpeedSteering`, `LowSpeedSteering`, `HandbrakeSteerBoost` and
+    /// `AirCtrlSteering`.
+    pub steering: f32,
+    pub no_speed_steering: f32,
+    pub low_speed_steering: f32,
+    pub handbrake_boost: f32,
+    pub air_steering: f32,
+    /// Where its engine's pull curve has its middle two points, of its
+    /// top speed (`EngineTorquePos1`, `EngineTorquePos2`).
+    pub curve_at: (f32, f32),
+    /// How its spin about its roll, pitch and yaw axes dies down
+    /// (`AngDampRoll`, `AngDampPitch`, `AngDampYaw`; 0x8219A5E0).
+    pub ang_damp: [f32; 3],
+    /// How its handbrake eases off once let go (`HandBrakeInertia`).
+    pub handbrake_inertia: f32,
+    /// How its engine's throttle eases to the throttle asked
+    /// (`EngineInertia`, kept each 1/60 s; 0x82198F08).
+    pub engine_inertia: f32,
+}
+
+impl BoatFloat {
+    /// The 360 record's defaults (0x823EA868).
+    pub const DEFAULT: Self = Self {
+        slow: FloatSpring {
+            start: 1.0,
+            end: 0.0,
+            strength: 5.0,
+            damping: 1.0,
+        },
+        fast: FloatSpring {
+            start: 1.0,
+            end: 0.0,
+            strength: 5.0,
+            damping: 1.0,
+        },
+        smoothing: 0.9,
+        roll: 0.0,
+        roll_inertia: 0.95,
+        pitch: 0.0,
+        pitch_up: 0.25,
+        pitch_down_inertia: 0.95,
+        low_speed: 10.0 / 3.6,
+        steer_loss: 0.0,
+        steer_inertia: 0.0,
+        steer_release: 0.0,
+        top: 40.0 / 3.6,
+        reverse: 10.0 / 3.6,
+        steering: 2.0,
+        no_speed_steering: 0.0,
+        low_speed_steering: 0.0,
+        handbrake_boost: 0.0,
+        air_steering: 0.0,
+        curve_at: (0.25, 0.5),
+        handbrake_inertia: 0.0,
+        ang_damp: [0.0, 0.0, 0.5],
+        engine_inertia: 0.975,
+    };
+
+    /// Its springs at `going` of its top speed (0 to 1).
+    pub fn spring(&self, going: f32) -> FloatSpring {
+        let (a, b, s) = (self.slow, self.fast, going.clamp(0.0, 1.0));
+        let mix = |x: f32, y: f32| x * (1.0 - s) + y * s;
+        FloatSpring {
+            start: mix(a.start, b.start),
+            end: mix(a.end, b.end),
+            strength: mix(a.strength, b.strength),
+            damping: mix(a.damping, b.damping),
         }
+    }
+
+    /// Its springs' length at `going` of its top speed, metres: each
+    /// end's length mixed, as the 360 code mixes them (0x8219A00C).
+    pub fn length(&self, going: f32) -> f32 {
+        let s = going.clamp(0.0, 1.0);
+        self.slow.length() * (1.0 - s) + self.fast.length() * s
+    }
+
+    /// How deep its origin rests under still water, level and stopped,
+    /// metres, under `gravity` m/s²: its four springs hold its weight
+    /// with the water this far over their bottoms.
+    pub fn rest_depth(&self, gravity: f32) -> f32 {
+        let s = self.slow;
+        s.start.min(s.end) + gravity / (4.0 * s.strength.max(1e-3))
     }
 }
 
@@ -1305,6 +1457,8 @@ pub fn human_motion(db: &Layer<'_>) -> HashMap<u32, crate::on_foot::HumanMotion>
         d.paces[2],
         d.paces[3],
         d.crouch_walk,
+        d.capsule_radius,
+        d.capsule_height,
     ];
     physics
         .records
@@ -1766,6 +1920,52 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                             f("EngineTorqueRatio3")?,
                         ],
                         hull_friction: f("HullFriction").unwrap_or(0.3),
+                        float: {
+                            let d = BoatFloat::DEFAULT;
+                            // Not held to 0 or more: spring heights go below
+                            // the origin.
+                            let g = |name: &str, default: f32| {
+                                boat.float(r, name_hash(name)).unwrap_or(default)
+                            };
+                            let spring = |speed: &str, d: FloatSpring| FloatSpring {
+                                start: g(&format!("Spring{speed}SpeedStartOffset"), d.start),
+                                end: g(&format!("Spring{speed}SpeedEndOffset"), d.end),
+                                strength: g(&format!("Spring{speed}SpeedStrength"), d.strength),
+                                damping: g(&format!("Spring{speed}SpeedDampening"), d.damping),
+                            };
+                            BoatFloat {
+                                slow: spring("Lo", d.slow),
+                                fast: spring("Hi", d.fast),
+                                smoothing: g("SpringWaterSmoothing", d.smoothing),
+                                roll: g("RollFromTurning", d.roll),
+                                roll_inertia: g("RollInertia", d.roll_inertia),
+                                pitch: g("PitchFromAcceleration", d.pitch),
+                                pitch_up: g("PitchUpSpeed", d.pitch_up),
+                                pitch_down_inertia: g("PitchDownInertia", d.pitch_down_inertia),
+                                low_speed: g("LowSpeedLimit", d.low_speed * 3.6) / 3.6,
+                                steer_loss: g("HighSpeedSteerLoss", d.steer_loss),
+                                steer_inertia: g("SteerInertia", d.steer_inertia),
+                                steer_release: g("SteerNoInputInertia", d.steer_release),
+                                top: g("MaxSpeed", d.top * 3.6) / 3.6,
+                                reverse: g("MaxSpeedReverse", d.reverse * 3.6) / 3.6,
+                                steering: g("Steering", d.steering),
+                                no_speed_steering: g("NoSpeedSteering", d.no_speed_steering),
+                                low_speed_steering: g("LowSpeedSteering", d.low_speed_steering),
+                                handbrake_boost: g("HandbrakeSteerBoost", d.handbrake_boost),
+                                air_steering: g("AirCtrlSteering", d.air_steering),
+                                handbrake_inertia: g("HandBrakeInertia", d.handbrake_inertia),
+                                curve_at: (
+                                    g("EngineTorquePos1", d.curve_at.0),
+                                    g("EngineTorquePos2", d.curve_at.1),
+                                ),
+                                ang_damp: [
+                                    g("AngDampRoll", d.ang_damp[0]),
+                                    g("AngDampPitch", d.ang_damp[1]),
+                                    g("AngDampYaw", d.ang_damp[2]),
+                                ],
+                                engine_inertia: g("EngineInertia", d.engine_inertia),
+                            }
+                        },
                     };
                     (b.torque.0 > 0.0 && b.drag[0] > 0.0).then_some(b)
                 })(),
@@ -2179,6 +2379,45 @@ mod tests {
             ..t
         };
         close(steep.footing(45f32.to_radians()), 0.75);
+    }
+
+    // A boat's springs mix from slow to fast with its speed, each end's
+    // length mixed (0x8219A00C), and hold its weight with the water a
+    // quarter of g over its strength above their bottoms (the Huangfeng's
+    // record: 4 to 2.5 m slow, 5 to 3 fast, strength 8 and 9).
+    #[test]
+    fn boat_springs_mix_with_speed_and_hold_its_weight() {
+        let f = BoatFloat {
+            slow: FloatSpring {
+                start: 4.0,
+                end: 2.5,
+                strength: 8.0,
+                damping: 2.0,
+            },
+            fast: FloatSpring {
+                start: 5.0,
+                end: 3.0,
+                strength: 9.0,
+                damping: 4.0,
+            },
+            ..BoatFloat::DEFAULT
+        };
+        let half = f.spring(0.5);
+        assert_eq!((half.start, half.end), (4.5, 2.75));
+        assert_eq!((half.strength, half.damping), (8.5, 3.0));
+        assert_eq!(f.length(0.5), 1.75);
+        assert_eq!(f.spring(2.0), f.fast);
+        assert!((f.rest_depth(10.0) - (2.5 + 10.0 / 32.0)).abs() < 1e-6);
+        // Upside down (its top under its bottom), a spring has no length
+        // and its top is its bottom.
+        let flipped = FloatSpring {
+            start: -0.1,
+            end: 0.2,
+            ..f.slow
+        };
+        assert_eq!(flipped.length(), 0.0);
+        let g = BoatFloat { slow: flipped, ..f };
+        assert!((g.rest_depth(10.0) - (-0.1 + 10.0 / 32.0)).abs() < 1e-6);
     }
 
     // Easing keeps its share of the way left each 1/60 s, a share of a
