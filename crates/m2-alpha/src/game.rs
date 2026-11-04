@@ -1428,6 +1428,9 @@ impl Game {
                     let turret = v.spec.tuning.turret;
                     let rate = turret.map_or(TURRET_RATE, |t| t.yaw_speed);
                     v.turret += turn.clamp(-rate * dt, rate * dt);
+                    if let Some(id) = v.id {
+                        physics.turn_turret(id, v.turret);
+                    }
                     if let Some(pivot) = v.spec.gun_pivot {
                         let goal = Combat::aim_point(physics, &scene.people, player, v.id);
                         // The crosshair's point as seen from the gun with

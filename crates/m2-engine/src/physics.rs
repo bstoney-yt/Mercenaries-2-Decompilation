@@ -1371,6 +1371,9 @@ struct VehicleBody {
     /// A car or motorbike (the game's `_CarPhysicsV2`): its hull's
     /// friction follows how it lies ([`car_hull_friction`]).
     car_hull: bool,
+    /// Its turret's colliders, and where they turn about (model space):
+    /// turned with its turret ([`Physics::turn_turret`]).
+    turret: (Vec<r::ColliderHandle>, Option<Vec3>),
     /// Held where it is ([`Physics::hold_vehicle`]): its body fixed.
     held: bool,
     /// Its velocity before the last step, m/s: what it hit things with.
@@ -3450,6 +3453,7 @@ impl Physics {
         // straight ahead, else an invented box. Flagged: the 360 builds
         // them as bodies of their own, joined to the hull (0x8216B818),
         // with their own mass; here they ride the hull as it stands.
+        let mut turret_colliders = Vec::new();
         for shape in spec.turret_shapes.iter().filter_map(|v| {
             let points: Vec<_> = v.iter().map(|&p| vector(p)).collect();
             r::SharedShape::convex_hull(&points)
@@ -3459,7 +3463,7 @@ impl Physics {
                 .friction(hull_friction)
                 .friction_combine_rule(combine)
                 .collision_groups(hull);
-            insert_collider(&mut self.world, turret, Some(body));
+            turret_colliders.push(insert_collider(&mut self.world, turret, Some(body)));
         }
         if let Some((lo, hi)) = spec.turret_box.filter(|_| spec.turret_shapes.is_empty()) {
             let half = ((hi - lo) * 0.5).max(Vec3::splat(0.1));
@@ -3469,7 +3473,7 @@ impl Physics {
                 .friction(hull_friction)
                 .friction_combine_rule(combine)
                 .collision_groups(hull);
-            insert_collider(&mut self.world, turret, Some(body));
+            turret_colliders.push(insert_collider(&mut self.world, turret, Some(body)));
         }
 
         let mut controller = DynamicRayCastVehicleController::new(body);
@@ -3649,6 +3653,7 @@ impl Physics {
             wreck: spec.wreck.clone(),
             wrecked: false,
             car_hull,
+            turret: (turret_colliders, spec.turret_mount()),
             held: false,
             before: Vec3::ZERO,
             hull,
@@ -3977,6 +3982,25 @@ impl Physics {
                 let up = body.position().rotation * r::Vector::Y;
                 let keep = w - up * w.dot(up);
                 body.set_angvel(keep + up * rate, true);
+            }
+        }
+    }
+
+    /// Turns a vehicle's turret's colliders to `yaw` radians
+    /// (anticlockwise from above, as [`VehicleSpec::turret_transform`]
+    /// turns its nodes), so what it hits is where it is drawn. Flagged:
+    /// the 360 code makes the turret a body of its own on a motorised
+    /// hinge (0x82273F90, 0x82273C88); here it rides the hull, turned.
+    pub fn turn_turret(&mut self, id: VehicleId, yaw: f32) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        let (handles, mount) = (&v.turret.0, v.turret.1.unwrap_or(Vec3::ZERO));
+        let turn = Quat::from_rotation_y(yaw);
+        let place = pose(mount - turn * mount, turn);
+        for &h in handles {
+            if let Some(c) = self.world.colliders.get_mut(h) {
+                c.set_position_wrt_parent(place);
             }
         }
     }
@@ -4953,6 +4977,38 @@ impl Physics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A turret's colliders turn with it ([`Physics::turn_turret`]): a
+    // block on its front, turned a quarter left, is hit from above on its
+    // left and no longer ahead.
+    #[test]
+    fn a_turrets_colliders_turn_with_it() {
+        let mut p = Physics::new();
+        let mut block = Vec::new();
+        for x in [-0.5, 0.5] {
+            for y in [3.0, 4.0] {
+                for z in [1.0, 3.0] {
+                    block.push(Vec3::new(x, y, z));
+                }
+            }
+        }
+        let spec = VehicleSpec {
+            turret_shapes: vec![block].into(),
+            pivot: Some(Vec3::new(0.0, 3.0, 0.0)),
+            ..car()
+        };
+        let id = p.add_vehicle(&spec, Vec3::ZERO, 0.0);
+        p.hold_vehicle(id, true);
+        p.step(DT);
+        let down =
+            |p: &Physics, x: f32, z: f32| p.cast_ray(Vec3::new(x, 10.0, z), Vec3::NEG_Y, 20.0);
+        assert!(down(&p, 0.0, 2.0).is_some_and(|(d, _)| (d - 6.0).abs() < 0.1));
+        assert!(down(&p, 2.0, 0.0).is_none_or(|(d, _)| d > 6.5));
+        p.turn_turret(id, std::f32::consts::FRAC_PI_2);
+        p.step(DT);
+        assert!(down(&p, 2.0, 0.0).is_some_and(|(d, _)| (d - 6.0).abs() < 0.1));
+        assert!(down(&p, 0.0, 2.0).is_none_or(|(d, _)| d > 6.5));
+    }
 
     const DT: f32 = 1.0 / 60.0;
 
