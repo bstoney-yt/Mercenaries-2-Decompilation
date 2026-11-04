@@ -2479,6 +2479,31 @@ impl MissionLink {
                 wanted = Some((f, self.reinforcements.out(f) + transports));
             }
             game.gunships.call_off(wanted.map(|(f, _)| f));
+            // Its cars, by road ([`crate::pursuers`]): one a think while its
+            // count for her state and the level is above those out and its
+            // gate is open (0x822371F8, 0x822387C0).
+            game.pursuers.tick(dt);
+            if let Some(f) = faction {
+                let standing = pursuit_standing(game, her);
+                let level = clock.level.max(0) as usize;
+                let n = counts.units(f, standing, "Car", level);
+                if n > game.pursuers.out(f)
+                    && game.pursuers.may_send(standing)
+                    && let Some(world) = game.scene.world.as_ref()
+                {
+                    game.pursuers
+                        .net(&world.index.roads, &world.index.junctions);
+                    let (at, forward) = her_on_road(game, her);
+                    let r = game.pursuers.random();
+                    if let Some(arrival) = game.pursuers.arrival(at, forward, standing, r)
+                        && let Some(lists) = self.pursuit_lists.as_mut()
+                        && let Some(template) = lists.next(f, standing.table_name(), "Car", level)
+                    {
+                        send_pursuit_car(game, f, &template, arrival);
+                    }
+                }
+            }
+            game.pursuers.call_off(faction);
             let due = self
                 .reinforcements
                 .step(wanted, squads, &mut game.scene.flights, her, dt);
@@ -7036,6 +7061,56 @@ fn hardpoints_at(nodes: &[(u32, Vec3)], at: m2_math::glam::Mat4) -> Hardpoints {
         .iter()
         .map(|&(name, local)| (name, at.transform_point3(local).to_array()))
         .collect()
+}
+
+/// Where she is for the road network (her vehicle's place, if she
+/// drives) and the way she faces (her vehicle's heading, else her own).
+fn her_on_road(game: &Game, her: Vec3) -> (Vec3, Vec3) {
+    let at = game.driving().map_or(her, |(at, _)| at);
+    let player = game.scene.player.as_ref();
+    let vehicle = player
+        .and_then(|p| p.driving)
+        .and_then(|i| game.scene.vehicles.get(i)?.id)
+        .zip(game.scene.world.as_ref())
+        .and_then(|(id, w)| w.physics.vehicle_transform(id));
+    let forward = match vehicle {
+        Some(m) => m
+            .transform_vector3(Vec3::Z)
+            .with_y(0.0)
+            .normalize_or(Vec3::Z),
+        None => {
+            let yaw = player.map_or(0.0, |p| p.yaw);
+            Vec3::new(yaw.sin(), 0.0, yaw.cos())
+        }
+    };
+    (at, forward)
+}
+
+/// Sends one of `faction`'s pursuit cars, `template`, in by `arrival`
+/// ([`crate::pursuers`]), its vehicle and crew loaded as the island's are.
+fn send_pursuit_car(
+    game: &mut Game,
+    faction: &'static str,
+    template: &str,
+    arrival: m2_engine::road_ring::Arrival,
+) {
+    let (Some(world), Some(catalogue)) = (&game.scene.world, &game.scene.catalogue) else {
+        return;
+    };
+    let models = template_models(template, &world.index.template_db, &catalogue.vehicles);
+    if models.is_empty() {
+        eprintln!("pursuers: no model for {faction}'s {template}");
+        return;
+    }
+    let crew = world.index.template_db.crew(template);
+    let entity = game.pursuers.send(faction, template.to_owned(), arrival);
+    let yaw = m2_engine::car_driver::yaw(arrival.facing);
+    game.scene
+        .load_world_vehicle(entity, arrival.at, yaw, crew, models);
+    eprintln!(
+        "pursuers: {faction} send their {template} by road to {:.0}",
+        arrival.at
+    );
 }
 
 #[cfg(test)]

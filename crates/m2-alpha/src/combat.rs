@@ -1732,7 +1732,11 @@ pub struct Combat {
     /// [`Combat::pilots_fire`]'s view check), and each such gun's timers.
     pub pilot_shots: Vec<crate::gunships::Shot>,
     pub pilot_view: Option<(Vec3, Vec3)>,
-    pilot_guns: std::collections::HashMap<usize, PilotGun>,
+    pilot_guns: std::collections::HashMap<(usize, usize), PilotGun>,
+    /// Rounds those guns fired (pilots' and gunners'), and seconds to
+    /// the next log line of them.
+    pilot_rounds: [u32; 2],
+    pilot_log: f32,
     /// Rounds those gunners have fired, all told (logged by checks).
     pub gunner_rounds: u32,
     seed: u64,
@@ -1980,6 +1984,8 @@ impl Default for Combat {
             pilot_shots: Vec::new(),
             pilot_view: None,
             pilot_guns: std::collections::HashMap::new(),
+            pilot_rounds: [0; 2],
+            pilot_log: 0.0,
             gunner_rounds: 0,
             seed: 0x2545_f491_4f6c_dd1d,
             fired: Fired::default(),
@@ -4094,6 +4100,16 @@ impl Combat {
     /// weapon's own rate); a single-shot weapon fires one round as each
     /// cycle starts. Inferred: that both timers count down with the frame.
     fn pilots_fire(&mut self, f: &mut Field<'_>, dt: f32) {
+        self.pilot_log -= dt;
+        if self.pilot_log <= 0.0 {
+            self.pilot_log = 15.0;
+            if self.pilot_rounds != [0; 2] {
+                eprintln!(
+                    "pilots fire: {} rounds by pilots, {} by gunners so far",
+                    self.pilot_rounds[0], self.pilot_rounds[1]
+                );
+            }
+        }
         for g in self.pilot_guns.values_mut() {
             g.cycle.tick(dt);
             g.wait -= dt;
@@ -4104,7 +4120,15 @@ impl Combat {
             let Some(v) = f.vehicles.get(i) else {
                 continue;
             };
-            let Some(m) = v.spec.armed.iter().find(|m| m.priority == 0) else {
+            let Some(&seat) = armed_seats(v).get(s.seat) else {
+                continue;
+            };
+            let Some(m) = v
+                .spec
+                .armed
+                .iter()
+                .find(|m| m.seat == seat && m.priority == s.priority)
+            else {
                 continue;
             };
             let cone = m.weapon.feel.cone(0.0);
@@ -4119,7 +4143,7 @@ impl Combat {
                 let d = (from - eye).normalize_or_zero();
                 ahead.x * d.x + ahead.z * d.z > PILOT_VIEW_COS
             });
-            let g = self.pilot_guns.entry(i).or_default();
+            let g = self.pilot_guns.entry((i, s.seat)).or_default();
             let fire = match g.cycle.trigger(hint.as_ref(), s.dist, seen, s.run) {
                 m2_engine::weapons::Trigger::One => true,
                 m2_engine::weapons::Trigger::Hold => g.wait <= 0.0,
@@ -4135,8 +4159,11 @@ impl Combat {
                 self.random(),
                 self.random(),
             );
-            if let Some(gap) = self.fire_mount(f, i, 0, 0, Some(from + dir * to.length())) {
-                self.pilot_guns.entry(i).or_default().wait = gap;
+            if let Some(gap) =
+                self.fire_mount(f, i, s.seat, s.priority, Some(from + dir * to.length()))
+            {
+                self.pilot_guns.entry((i, s.seat)).or_default().wait = gap;
+                self.pilot_rounds[usize::from(s.seat > 0)] += 1;
             }
         }
     }

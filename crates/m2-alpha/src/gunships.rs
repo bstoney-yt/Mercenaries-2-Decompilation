@@ -201,6 +201,10 @@ pub struct Shot {
     /// On an attack run (its mind's +0x8C timer running): its pauses are
     /// a fifth as long.
     pub run: bool,
+    /// The seat whose gun fires (of [`crate::combat::armed_seats`]: 0 the
+    /// driver's) and the gun's priority there.
+    pub seat: usize,
+    pub priority: usize,
 }
 
 /// The gunships out, and where to put each as it loads.
@@ -371,6 +375,8 @@ impl Gunships {
                             at: p,
                             dist: (her - pilot.at).length(),
                             run: pilot.run_fire > 0.0,
+                            seat: 0,
+                            priority: 0,
                         });
                     }
                     stick
