@@ -4,8 +4,11 @@
 //! each cue finds a sound in the world's cue tables.
 //!
 //! ```text
-//! cargo run --release -p m2-engine --example blastsounds -- "<install dir>" [names.txt]
+//! cargo run --release -p m2-engine --example blastsounds -- "<install dir>" [names.txt] [prefix]
 //! ```
+//!
+//! `prefix` picks the templates by the start of their names (`Explosion`
+//! unless given; `global_particle` for the effects a state starts).
 //!
 //! `names.txt` holds guesses for event names, one a line; an event whose
 //! hash one makes prints by that name. Prints hashes, names and numbers
@@ -35,6 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    let prefix = args.get(2).map_or("Explosion", String::as_str);
     let name = |h: u32| dict.get(&h).cloned().unwrap_or(format!("{h:08x}"));
     let install = Install::find(Path::new(root))?;
     let mut source = install.open_world()?;
@@ -88,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut by_set: BTreeMap<u32, Vec<String>> = BTreeMap::new();
     for (id, r) in c.records().unwrap_or_default() {
         let n = names.get(&id).copied().unwrap_or("?");
-        if !n.starts_with("Explosion") {
+        if !n.starts_with(prefix) {
             continue;
         }
         let set = word(r, set_at).unwrap_or(0);
@@ -140,6 +144,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             heard += ts.len();
         }
     }
-    println!("{heard} of {blasts} blast templates' sound sets have Sounds rows");
+    println!("{heard} of {blasts} {prefix}* templates' sound sets have Sounds rows");
     Ok(())
 }

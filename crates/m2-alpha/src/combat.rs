@@ -1301,6 +1301,15 @@ pub enum Sound {
     },
     /// A building the bomb brought down coming apart.
     Collapse(Vec3),
+    /// An effect a model's state started (`StartEmitter`: a wreck's
+    /// fire, a tank's hull blowing out) coming into being as an object of
+    /// its template, `template`: heard only as that template's
+    /// `SoundEffect` says ([`m2_engine::spawn_sound`]), nothing standing
+    /// in.
+    Created {
+        at: Vec3,
+        template: u32,
+    },
     /// Something with no building's collapse (a fence, a sign) breaking:
     /// its template's `SoundKey` (`prop_sheetmetal_sml`).
     Break {
@@ -2738,6 +2747,17 @@ impl Combat {
                 hold: None,
             });
         }
+    }
+
+    /// The objects the effects a model's state started came into being
+    /// as (template, where): each heard as its template says
+    /// ([`Sound::Created`]).
+    pub fn created(&mut self, created: Vec<(u32, Vec3)>) {
+        self.sounds.extend(
+            created
+                .into_iter()
+                .map(|(template, at)| Sound::Created { at, template }),
+        );
     }
 
     /// A building the bomb brought down comes apart at `at`: heard.
@@ -7403,6 +7423,20 @@ mod tests {
                 pda: true,
                 ..Trigger::default()
             }
+        );
+    }
+
+    #[test]
+    fn what_a_state_started_is_heard_as_its_template() {
+        let mut combat = Combat::default();
+        let at = Vec3::new(1.0, 2.0, 3.0);
+        combat.created(vec![(0x8000_1234, at)]);
+        assert_eq!(
+            combat.take_sounds(),
+            vec![Sound::Created {
+                at,
+                template: 0x8000_1234
+            }]
         );
     }
 }
