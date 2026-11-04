@@ -136,7 +136,7 @@ fn drive(spec: &VehicleSpec, to: Vec3) -> (Option<f32>, f32, f32) {
     let start = state(&p, id).map_or(Vec3::ZERO, |s| s.at.with_y(0.0));
     let goal = start + to;
     let mut driver = CarDriver::default();
-    let mut held = m2_engine::car_driver::CarInputs::default();
+    let mut held = CarInputs::default();
     let (mut nearest, mut fastest) = (f32::INFINITY, 0.0f32);
     for i in 0..(SECONDS / DT) as usize {
         let Some(s) = state(&p, id) else {
