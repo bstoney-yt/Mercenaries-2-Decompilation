@@ -302,6 +302,9 @@ pub struct Templates {
     /// The radio templates' playlist and reach, by id
     /// ([`crate::music_source`]).
     pub music_sources: HashMap<u32, (u32, f32)>,
+    /// How near a player wakes each template that says so, by id: its
+    /// `HibernationControl` `Distance` ([`crate::population::hibernation`]).
+    pub hibernation: HashMap<u32, f32>,
     /// Each hero template's grappling hook, by id ([`crate::grapple`]).
     pub grapple: HashMap<u32, crate::grapple::Grapple>,
     /// Where each template's entrances are got in by (`DriverHatch`), by
@@ -979,6 +982,10 @@ impl Templates {
             explosions: crate::durability::explosions(&db),
             hijack: crate::hijack::read(&db),
             music_sources: crate::music_source::read(&db),
+            hibernation: db
+                .component("HibernationControl")
+                .map(|c| crate::population::hibernation(c))
+                .unwrap_or_default(),
             grapple: crate::grapple::read(&db),
             entrance_points: crate::hijack::entrance_points(&db),
             driver_points: crate::seats::read(&db),
@@ -1119,11 +1126,6 @@ pub struct StartPoint {
     pub position: Vec3,
     pub rotation: Quat,
 }
-
-/// How near the player a boat on its own patrol comes out, metres (the
-/// alpha's reach for the scripts' vehicles, `mission::VEHICLE_REACH`;
-/// its `HibernationControl`, which may say, is not read). Invented.
-pub const PATROL_BOAT_REACH: f32 = 300.0;
 
 /// A spawner of vehicles a layer places: a `PointTraffic_*` roadblock
 /// or a `PathSpawner_*`, which spawns from its list every so often while
@@ -2002,7 +2004,13 @@ impl WorldIndex {
         // A boat placed on its own patrol (its own `AiPatrol`: the Allied
         // MarkVs off ChiJob009's beach, Huangfengs, cutters): it is out
         // while its layer is in and drives its path, once, not
-        // respawned; within [`PATROL_BOAT_REACH`] of the player.
+        // respawned; while a player is within 1.2 x its `HibernationControl`
+        // `Distance` (its own, else its template's, else 100 m), as the 360
+        // code wakes objects ([`crate::population::hibernation`]).
+        let own_sleep = layer
+            .component("HibernationControl")
+            .map(crate::population::hibernation)
+            .unwrap_or_default();
         for (&entity, p) in &layer.placements() {
             let Some(&haste) = own_haste.get(&entity) else {
                 continue;
@@ -2028,7 +2036,12 @@ impl WorldIndex {
                 spawner: crate::population::Spawner {
                     list: 0,
                     seconds_per_cycle: f32::INFINITY,
-                    active_radius: PATROL_BOAT_REACH,
+                    active_radius: own_sleep
+                        .get(&entity)
+                        .or_else(|| templates.hibernation.get(&p.parent))
+                        .copied()
+                        .unwrap_or(crate::population::HIBERNATION_DEFAULT)
+                        * crate::population::HIBERNATION_WAKE,
                     kind: 0,
                     far: None,
                 },

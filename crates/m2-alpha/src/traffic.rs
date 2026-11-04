@@ -35,6 +35,12 @@ const DEFAULT_TOP: f32 = 20.0;
 /// Haste when the patrol gives none (the install's spawners give 0.175 to
 /// 0.35).
 const DEFAULT_HASTE: f32 = 0.3;
+/// A boat on its patrol: the speed its path move asks, m/s a unit of its
+/// `Haste` (40 x the AI's +0x7EC, read as its `Haste`, inferred), and the
+/// least reference speed its controller slows into turns by, m/s (the 360
+/// code, 0x822A7C30, research notes section 27).
+const BOAT_PATROL_SPEED: f32 = 40.0;
+const BOAT_REFERENCE_SPEED: f32 = 25.0;
 /// A vehicle not loaded after this many seconds never will be.
 const GIVE_UP: f32 = 30.0;
 
@@ -246,7 +252,19 @@ impl Traffic {
                 .next
                 .entry(entity)
                 .or_insert_with(|| (nearest_ahead(route, here), false));
-            while !done && flat(route[next] - here).length() < ARRIVE {
+            // A boat's own controller (0x822A7C30) looks ahead by its
+            // length x (its speed over its reference speed + 1.5, 1.5 to 2).
+            let boat = v.spec.is_boat();
+            let task = BOAT_PATROL_SPEED * point.haste.unwrap_or(DEFAULT_HASTE);
+            let reference = task.max(BOAT_REFERENCE_SPEED);
+            let arrive = if boat {
+                let length = v.spec.hull.1.z - v.spec.hull.0.z;
+                let speed = physics.vehicle_speed(id);
+                length * (speed / reference + 1.5).clamp(1.5, 2.0)
+            } else {
+                ARRIVE
+            };
+            while !done && flat(route[next] - here).length() < arrive {
                 if next + 1 < route.len() {
                     next += 1;
                 } else if closed {
@@ -257,10 +275,12 @@ impl Traffic {
             }
             self.next.insert(entity, (next, done));
             if done {
+                // At its path's end a boat lets go of its helm and throttle
+                // (0x822A7C30); a car parks.
                 physics.drive(
                     id,
                     VehicleControls {
-                        parked: true,
+                        parked: !boat,
                         ..VehicleControls::default()
                     },
                 );
@@ -271,6 +291,25 @@ impl Traffic {
             // Positive: the waypoint is to the left (+x of a vehicle facing
             // +z), and wheels turned the positive way steer left.
             let off = -forward.perp_dot(to).atan2(forward.dot(to));
+            if boat {
+                // The 360 boat controller (0x822A7C30): helm 10/pi a radian
+                // off, held to full; it asks its task speed, less into a
+                // turn (its reference speed x 0.1309 / (|off| + 0.1309)), and
+                // opens its throttle 0.1 a m/s short of that. Its avoidance
+                // nudge (0x822A7858) is not ported.
+                let want = task.min(reference * 0.1309 / (off.abs() + 0.1309));
+                let speed = physics.vehicle_speed(id);
+                physics.drive(
+                    id,
+                    VehicleControls {
+                        throttle: ((want - speed) * 0.1).clamp(-1.0, 1.0),
+                        steer: (off * 10.0 / std::f32::consts::PI).clamp(-1.0, 1.0),
+                        brake: false,
+                        parked: false,
+                    },
+                );
+                continue;
+            }
             let top = v.spec.tuning.max_speed.unwrap_or(DEFAULT_TOP);
             let haste = point.haste.unwrap_or(DEFAULT_HASTE);
             // Slower into a turn.
@@ -556,7 +595,7 @@ mod tests {
                 spawner: m2_engine::population::Spawner {
                     list: 0,
                     seconds_per_cycle: f32::INFINITY,
-                    active_radius: m2_engine::world::PATROL_BOAT_REACH,
+                    active_radius: 120.0,
                     kind: 0,
                     far: None,
                 },

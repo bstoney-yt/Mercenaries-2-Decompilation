@@ -352,6 +352,30 @@ pub fn haste(c: &Component<'_>) -> HashMap<u32, f32> {
         .collect()
 }
 
+/// Each record's `HibernationControl` `Distance` (a u16, metres), by id:
+/// an object wakes when a player comes within [`HIBERNATION_WAKE`] x it,
+/// flat (from the 360 code, research notes section 26; [`HIBERNATION_DEFAULT`]
+/// without the component).
+pub fn hibernation(c: &Component<'_>) -> HashMap<u32, f32> {
+    let Some(at) = field_at(c, "Distance") else {
+        return HashMap::new();
+    };
+    c.records()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(id, r)| {
+            let b = r.get(at..at + 2)?;
+            Some((id, f32::from(u16::from_le_bytes([b[0], b[1]]))))
+        })
+        .collect()
+}
+
+/// An object's `HibernationControl` `Distance` without one, metres, and
+/// how much farther than it a player wakes it in single player (the 360
+/// code; split-screen doubles it).
+pub const HIBERNATION_DEFAULT: f32 = 100.0;
+pub const HIBERNATION_WAKE: f32 = 1.2;
+
 /// Where the field named `name` is in a record, by its hash.
 fn field_at(c: &Component<'_>, name: &str) -> Option<usize> {
     let h = name_hash(name);
