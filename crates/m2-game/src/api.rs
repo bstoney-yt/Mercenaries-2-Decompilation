@@ -4029,6 +4029,22 @@ mod tests {
     }
 
     #[test]
+    fn the_hqs_aim_mode_reaches_the_game() {
+        let (host, world) = setup();
+        host.lua()
+            .load(
+                "Player.SetAimMode(Player.GetLocalPlayer(), false)\n\
+                 Player.SetAimMode(Player.GetLocalPlayer(), true)",
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [Command::AimMode(false), Command::AimMode(true)]
+        );
+    }
+
+    #[test]
     fn gates_weapons_usable_vehicles_and_fuel_reach_the_game() {
         let (host, world) = setup();
         world.borrow_mut().fuel_capacity = Some(50.0);
