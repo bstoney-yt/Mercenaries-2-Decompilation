@@ -3272,6 +3272,9 @@ impl Combat {
             RIFLE_FLASH,
             None,
         );
+        if let Some((_, rig)) = &mut f.player.model {
+            rig.fired();
+        }
         if killed {
             self.remarks.push(Remark::Kill);
         }
@@ -3411,6 +3414,7 @@ impl Combat {
             self.effect(Effect::Tracer { from, to: end }, 0.07);
             if k == 0 {
                 self.gun_fired(feel, (from, case), dir, RIFLE_FLASH, Some(shooter));
+                f.people.npcs[i].rig.fired();
             }
             let closest = from + dir * (aim - from).dot(dir).max(0.0);
             let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
