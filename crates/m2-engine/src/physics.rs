@@ -5766,7 +5766,10 @@ mod tests {
         let up = place(&p).w_axis.y;
         // (Swaying in its turbulence, under a metre a second.)
         let v = p.vehicle_velocity(id);
-        assert!(v.y.abs() < 0.5 && v.with_y(0.0).length() < 1.0, "hovers at {v}");
+        assert!(
+            v.y.abs() < 0.5 && v.with_y(0.0).length() < 1.0,
+            "hovers at {v}"
+        );
         // Holding its height, flat out ahead: its top speed, nose down
         // by its `MaxPitch` (0.66 for its speed, 0.33 for the stick).
         for _ in 0..1500 {
