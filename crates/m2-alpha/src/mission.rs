@@ -405,6 +405,10 @@ local methods = {
         "AddMeter", "StartTimer", "StartPursuit", "HideMeter", "RemoveMeter",
         "RemoveAllMeters" },
     Tutorial = { "SetText", "ShowTutorialForObject", "ShowTutorialOnscreen" },
+    -- The shop (`MrxShop.Open`, a contact's "Shop"): the HUD's
+    -- `MrxGuiSupportShop` puts up the `store` movie with the items.
+    Shop = { "Create", "AddItem", "AddItemFull", "SetCallback", "SetCloseCallback",
+        "Commence", "Close" },
     -- The engine's `Pda` library goes to the HUD's `PdaInterface` the
     -- same way: its database is the PDA's Info pages (the factions'
     -- attitudes, the log, the people, the score).

@@ -1261,6 +1261,9 @@ pub struct GameHud {
     last_time: Option<f64>,
     /// Mission calls whose callbacks the HUD has called, to hand back.
     callbacks: Vec<u64>,
+    /// The Flash movies its widgets started, by widget, as the thread
+    /// logged them ([`GameHud::flash_movies`]).
+    movies: Vec<(u32, String)>,
     /// The scripts' posts for the contracts ([`HUD_POSTS`]), to hand back.
     posts: Vec<Post>,
     /// The mission's dialog boxes closed and the options picked, to hand
@@ -1325,6 +1328,7 @@ impl GameHud {
             rx,
             status: Status::Loading,
             callbacks: Vec::new(),
+            movies: Vec::new(),
             posts: Vec::new(),
             choices: Vec::new(),
             dropped_fanfare: false,
@@ -1408,6 +1412,12 @@ impl GameHud {
         }
         self.last_message = message.cloned();
         message.cloned()
+    }
+
+    /// The Flash movies the scripts' widgets play now: widget and movie
+    /// (`store`, `topbar`), for the test runs' pictures.
+    pub fn flash_movies(&self) -> Vec<(u32, String)> {
+        self.movies.clone()
     }
 
     /// The mission calls ([`HudCall::seq`]) whose callbacks the HUD has
@@ -1505,6 +1515,19 @@ impl GameHud {
                 self.callbacks.extend(callbacks);
                 self.posts.extend(posts);
                 self.choices.extend(choices);
+                // The Flash movies started, from the thread's log
+                // ("flash: widget 372 () plays store, ...").
+                for line in &log {
+                    if let Some(rest) = line.strip_prefix("flash: widget ")
+                        && let Some((id, more)) = rest.split_once(' ')
+                        && let Ok(id) = id.parse::<u32>()
+                        && let Some((_, movie)) = more.split_once(") plays ")
+                        && let Some(movie) = movie.split(',').next()
+                    {
+                        self.movies.retain(|(w, _)| *w != id);
+                        self.movies.push((id, movie.to_owned()));
+                    }
+                }
                 let (pause, shell) = (*pause, *shell);
                 self.pause_news.merge(pause.news);
                 self.pause_available = pause.available;
