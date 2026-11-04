@@ -490,8 +490,9 @@ pub struct Player {
     pub levels: BTreeMap<i32, ClipId>,
     /// Seconds since the last frame played.
     clock: f32,
-    /// Scripts due, in order: the instance they run on, and the bytes.
-    scripts: Vec<(ClipId, Rc<[u8]>)>,
+    /// Scripts due, in order: the instance they run on, the frame of its
+    /// that queued them, and the bytes.
+    scripts: Vec<(ClipId, usize, Rc<[u8]>)>,
     /// Looks up the text ids in what text fields show (`[0x129ee2f1]`), as
     /// the game's translator does when they draw; the scripts keep the ids.
     pub translate: Option<Translator>,
@@ -554,9 +555,20 @@ impl Player {
         self.clips.get_mut(id).and_then(Option::as_mut)
     }
 
-    /// The scripts due since the last call, in the order they run.
-    pub fn take_scripts(&mut self) -> Vec<(ClipId, Rc<[u8]>)> {
+    /// The scripts due since the last call, in the order they run, each
+    /// with the frame of its instance that queued it.
+    pub fn take_scripts(&mut self) -> Vec<(ClipId, usize, Rc<[u8]>)> {
         std::mem::take(&mut self.scripts)
+    }
+
+    /// Whether a frame script queued on `frame` of `id` is still due:
+    /// not when a script that ran before it sent the instance to another
+    /// frame (the PDA stockpile's description fades in from `_intro`,
+    /// sent there as the frame its `stop()` is on comes up). Inferred
+    /// from footage, where that description shows; Flash's own rule not
+    /// read.
+    pub fn still_on(&self, id: ClipId, frame: usize) -> bool {
+        self.clip(id).is_some_and(|c| c.frame == frame)
     }
 
     /// Plays `dt` seconds: every playing timeline moves on a frame each
@@ -689,7 +701,7 @@ impl Player {
                         }
                     }
                     Control::Script(bytes) if f == frame => {
-                        self.scripts.push((id, Rc::clone(bytes)))
+                        self.scripts.push((id, frame, Rc::clone(bytes)))
                     }
                     Control::Script(_) => {}
                 }

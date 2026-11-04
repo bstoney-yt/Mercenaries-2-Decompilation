@@ -1384,3 +1384,41 @@ fn a_morph_shape_is_drawn_between_its_ends() {
     assert!((area(&half.mesh()) - 225.0).abs() < 1e-3);
     assert_eq!(half.fills[1], Fill::Solid([0.5, 0.0, 0.5, 1.0]));
 }
+
+#[test]
+fn a_frame_script_left_behind_by_a_goto_does_not_run() {
+    // Frame two of the sprite stops it; the root's frame two, which runs
+    // first on the same frame, sends the sprite back to its first frame
+    // to play (as the PDA stockpile does its description's `_intro`).
+    let mut stop = Asm::default();
+    stop.op(0x07);
+    let mut back = Asm::default();
+    back.act(0x8B, b"clip\0")
+        .act(0x81, &0u16.to_le_bytes())
+        .op(0x06)
+        .act(0x8B, b"\0");
+    let lib = library(
+        vec![
+            vec![put(1, 2, at(0.0, 0.0), "clip")],
+            vec![Control::Script(back.bytes())],
+            vec![Control::Script(stop.bytes())],
+        ],
+        vec![vec![], vec![Control::Script(stop.bytes())]],
+    );
+    let mut rt = Runtime::new(Player::new(lib));
+    let clip = rt.player.child(rt.player.root, "clip").unwrap();
+    rt.step(0.1);
+    let c = rt.player.clip(clip).unwrap();
+    assert_eq!(
+        (c.frame, c.playing),
+        (0, true),
+        "the stale stop() was skipped"
+    );
+    // A frame script still on its frame runs: the root's own stop().
+    rt.step(0.1);
+    let root = rt.player.clip(rt.player.root).unwrap();
+    assert_eq!((root.frame, root.playing), (2, false));
+    // And the sprite, on its second frame again, stops there.
+    let c = rt.player.clip(clip).unwrap();
+    assert_eq!((c.frame, c.playing), (1, false));
+}
