@@ -36,10 +36,14 @@ const DEFAULT_TOP: f32 = 20.0;
 /// 0.35).
 const DEFAULT_HASTE: f32 = 0.3;
 /// A boat on its patrol: the speed its path move asks, m/s a unit of its
-/// `Haste` (40 x the AI's +0x7EC, read as its `Haste`, inferred), and the
+/// speed factor (40 x the AI's +0x7EC, [`BOAT_SPEED_FACTOR`]), and the
 /// least reference speed its controller slows into turns by, m/s (the 360
 /// code, 0x822A7C30, research notes section 27).
 const BOAT_PATROL_SPEED: f32 = 40.0;
+/// The AI's path-move speed factor when its move asks none (the 360 AI's
+/// +0x7EC, 0.4 from its set-up 0x822BDAD0; a move's own speed above 0
+/// replaces it, read here as the patrol's `Haste`, inferred).
+const BOAT_SPEED_FACTOR: f32 = 0.4;
 const BOAT_REFERENCE_SPEED: f32 = 25.0;
 /// A vehicle not loaded after this many seconds never will be.
 const GIVE_UP: f32 = 30.0;
@@ -255,7 +259,11 @@ impl Traffic {
             // A boat's own controller (0x822A7C30) looks ahead by its
             // length x (its speed over its reference speed + 1.5, 1.5 to 2).
             let boat = v.spec.is_boat();
-            let task = BOAT_PATROL_SPEED * point.haste.unwrap_or(DEFAULT_HASTE);
+            let task = BOAT_PATROL_SPEED
+                * point
+                    .haste
+                    .filter(|&h| h > 0.0)
+                    .unwrap_or(BOAT_SPEED_FACTOR);
             let reference = task.max(BOAT_REFERENCE_SPEED);
             let arrive = if boat {
                 let length = v.spec.hull.1.z - v.spec.hull.0.z;
@@ -288,6 +296,39 @@ impl Traffic {
             }
             let forward = flat(at.transform_vector3(Vec3::Z)).normalize_or_zero();
             let to = flat(route[next] - here).normalize_or_zero();
+            // A boat steers round what is in its way (0x822A7858): toward
+            // its point plus the mean of the pushes from what it will pass
+            // too near.
+            let to = if boat {
+                let length = v.spec.hull.1.z - v.spec.hull.0.z;
+                let size = (v.spec.hull.1 - v.spec.hull.0).with_y(0.0).max_element();
+                let velocity = flat(physics.vehicle_velocity(id));
+                let velocity = if velocity.length() < 0.5 {
+                    forward * length
+                } else {
+                    velocity
+                };
+                let others: Vec<(Vec2, Vec2, f32)> = vehicles
+                    .iter()
+                    .enumerate()
+                    .filter(|&(k, o)| k != i && !o.wrecked)
+                    .filter_map(|(_, o)| {
+                        let oid = o.id?;
+                        let m = physics.vehicle_transform(oid)?;
+                        let (lo, hi) = o.spec.hull;
+                        let radius = (hi - lo).with_y(0.0).max_element() * 0.5;
+                        Some((
+                            flat(m.w_axis.truncate()),
+                            flat(physics.vehicle_velocity(oid)),
+                            radius,
+                        ))
+                    })
+                    .collect();
+                let push = avoidance(flat(here), velocity, forward, size, &others);
+                (to + push).normalize_or(to)
+            } else {
+                to
+            };
             // Positive: the waypoint is to the left (+x of a vehicle facing
             // +z), and wheels turned the positive way steer left.
             let off = -forward.perp_dot(to).atan2(forward.dot(to));
@@ -459,6 +500,46 @@ fn nearest_ahead(route: &[Vec3], here: Vec3) -> usize {
         }
     }
     near
+}
+
+/// How a patrol boat steers round what is in its way, as the 360 boat
+/// controller does (0x822A7858, research notes section 27): of the others
+/// (each place, velocity and radius, flat) within 50 m of a point 50 m
+/// ahead of it, each ahead of it whose closest approach, by both their
+/// velocities, comes within R (its radius plus half the boat's larger
+/// side) pushes it away along their separation then, by |2R - d| / R
+/// (at most 1); the mean of the pushes. `velocity` is the boat's (its
+/// heading x its length when it is all but still).
+fn avoidance(
+    at: Vec2,
+    velocity: Vec2,
+    forward: Vec2,
+    size: f32,
+    others: &[(Vec2, Vec2, f32)],
+) -> Vec2 {
+    let probe = at + forward * 50.0;
+    let mut sum = Vec2::ZERO;
+    let mut n = 0.0;
+    for &(p, v, radius) in others {
+        if p.distance(probe) > 50.0 || (p - at).dot(forward) <= 0.0 {
+            continue;
+        }
+        let rel_p = p - at;
+        let rel_v = v - velocity;
+        let t = if rel_v.length_squared() > 1e-6 {
+            (-rel_p.dot(rel_v) / rel_v.length_squared()).max(0.0)
+        } else {
+            0.0
+        };
+        let apart = -(rel_p + rel_v * t);
+        let d = apart.length();
+        let r = radius + size * 0.5;
+        if d < r {
+            sum += apart.normalize_or_zero() * ((2.0 * r - d).abs() / r).clamp(0.0, 1.0);
+            n += 1.0;
+        }
+    }
+    if n > 0.0 { sum / n } else { Vec2::ZERO }
 }
 
 fn pick(entries: &[(String, f32)], roll: f32) -> Option<&str> {
@@ -638,5 +719,23 @@ mod tests {
             }
         }
         assert!(passed >= 3, "passed {passed} waypoints");
+    }
+
+    // A boat heading for another just off its line steers away from it;
+    // one behind it, or clear of its way, pushes nothing (0x822A7858).
+    #[test]
+    fn a_boat_steers_round_what_is_in_its_way() {
+        let (at, v, ahead) = (Vec2::ZERO, Vec2::new(0.0, 10.0), Vec2::Y);
+        let still = |x: f32, y: f32| (Vec2::new(x, y), Vec2::ZERO, 3.0);
+        let push = avoidance(at, v, ahead, 6.0, &[still(1.0, 30.0)]);
+        assert!(push.x < -0.3, "{push}");
+        assert_eq!(
+            avoidance(at, v, ahead, 6.0, &[still(0.0, -20.0)]),
+            Vec2::ZERO
+        );
+        assert_eq!(
+            avoidance(at, v, ahead, 6.0, &[still(30.0, 30.0)]),
+            Vec2::ZERO
+        );
     }
 }
