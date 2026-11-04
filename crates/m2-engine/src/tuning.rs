@@ -366,6 +366,12 @@ pub struct BoatFloat {
     /// How its spin about its roll, pitch and yaw axes dies down
     /// (`AngDampRoll`, `AngDampPitch`, `AngDampYaw`; 0x8219A5E0).
     pub ang_damp: [f32; 3],
+    /// How much of its roll it loses just after it hits something or
+    /// while out of the water (`CollisionStabilization`), and how its
+    /// engine pulls the first 1/8 s after a hit
+    /// (`EngineTorqueMultiAtCollision`); `physics::float_hull`, 0x8219A7xx.
+    pub stabilization: f32,
+    pub hit_torque: f32,
     /// How its handbrake eases off once let go (`HandBrakeInertia`).
     pub handbrake_inertia: f32,
     /// How its engine's throttle eases to the throttle asked
@@ -407,6 +413,8 @@ impl BoatFloat {
         air_steering: 0.0,
         curve_at: (0.25, 0.5),
         handbrake_inertia: 0.0,
+        stabilization: 1.0,
+        hit_torque: 1.0,
         ang_damp: [0.0, 0.0, 0.5],
         engine_inertia: 0.975,
     };
@@ -1952,6 +1960,8 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                                 handbrake_boost: g("HandbrakeSteerBoost", d.handbrake_boost),
                                 air_steering: g("AirCtrlSteering", d.air_steering),
                                 handbrake_inertia: g("HandBrakeInertia", d.handbrake_inertia),
+                                stabilization: g("CollisionStabilization", d.stabilization),
+                                hit_torque: g("EngineTorqueMultiAtCollision", d.hit_torque),
                                 curve_at: (
                                     g("EngineTorquePos1", d.curve_at.0),
                                     g("EngineTorquePos2", d.curve_at.1),
