@@ -288,15 +288,12 @@ impl Pursuers {
             p.held.take(&input, forward);
             if log {
                 eprintln!(
-                    "pursuers: {} {:#x} {:.0} m from her at {:.1} m/s, held {:?}, wheels down {:?}, body held {}, gear {:?}{}",
+                    "pursuers: {} {:#x} {:.0} m from her at {:.1} m/s, touching {}{}",
                     p.template,
                     p.entity,
                     car.at.distance(her),
                     car.speed(),
-                    p.held,
-                    physics.vehicle_contacts(id),
-                    physics.vehicle_held(id),
-                    physics.vehicle_gear(id),
+                    physics.vehicle_touching(id).len(),
                     if p.leaving { " (leaving)" } else { "" }
                 );
             }
