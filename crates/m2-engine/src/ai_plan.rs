@@ -400,3 +400,32 @@ mod tests {
         assert_eq!(p.1, 6.0);
     }
 }
+
+/// What a fighting mind asks of the planner about its target (0x822D8890,
+/// from the mind's think 0x822D9C10): to attack it when it is within the
+/// longest range of the weapons it can use (the best of up to four) plus
+/// its anchor radius (mind+0x7BC: set by the scripts' `Ai.Anchor`
+/// `AnchorRadius`, 50 m when anchored to an object by 0x82243320, 0 when
+/// not anchored), else to take cover from it. Both requests carry a keep
+/// factor of 0.99 and a value of twice mind+0x1470 (provisional: only its
+/// resets to 0 are found).
+pub fn attack_or_cover(distance: f32, best_range: f32, anchor_radius: f32) -> Request {
+    if distance <= best_range + anchor_radius {
+        Request::Attack
+    } else {
+        Request::TakeCover
+    }
+}
+
+#[cfg(test)]
+mod decide_tests {
+    use super::*;
+
+    #[test]
+    fn out_of_his_guns_reach_he_takes_cover() {
+        assert_eq!(attack_or_cover(40.0, 70.0, 0.0), Request::Attack);
+        assert_eq!(attack_or_cover(90.0, 70.0, 0.0), Request::TakeCover);
+        // Anchored, his anchor radius stretches it.
+        assert_eq!(attack_or_cover(90.0, 70.0, 50.0), Request::Attack);
+    }
+}
