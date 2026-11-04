@@ -234,6 +234,12 @@ impl Hud {
         state.reticle = reticle(info);
         state.support = info.support.clone();
         state.cash = info.mission.as_ref().and_then(|m| m.cash);
+        state.fuel = info.mission.as_ref().and_then(|m| m.fuel);
+        state.stock = info
+            .mission
+            .as_ref()
+            .map(|m| m.stock.clone())
+            .unwrap_or_default();
         state.radar_regions = info
             .mission
             .as_ref()
@@ -297,6 +303,12 @@ impl Hud {
         state.reticle = reticle(info);
         state.support = info.support.clone();
         state.cash = info.mission.as_ref().and_then(|m| m.cash);
+        state.fuel = info.mission.as_ref().and_then(|m| m.fuel);
+        state.stock = info
+            .mission
+            .as_ref()
+            .map(|m| m.stock.clone())
+            .unwrap_or_default();
         state.radar_regions = info
             .mission
             .as_ref()

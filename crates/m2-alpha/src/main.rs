@@ -105,7 +105,7 @@ mod traffic;
 mod ui;
 
 use crate::hero::Hero;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -354,6 +354,10 @@ struct Options {
     /// scripts is up, and each box is pictured a second and a half after
     /// it opens (`<out>-dialog<seq>.ppm`), for comparing the menus.
     dialog_shots: bool,
+    /// With `--mission --dialog-shots`: each Flash movie the scripts' HUD
+    /// widgets start is pictured a second and a half after it starts
+    /// (`<out>-flash-<movie>-<widget>.ppm`): the shop's `store`.
+    flash_shots: bool,
     /// With `--mission --after-contract`: the seconds after the contract
     /// is done at which the scene and the game's HUD are pictured
     /// (`<out>-late<s>.ppm`), for comparing its end screens.
@@ -715,6 +719,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--context" => o.context = Some(value()?),
             "--dialog-keys" => o.dialog_keys = Some(value()?),
             "--dialog-shots" => o.dialog_shots = true,
+            "--flash-shots" => o.flash_shots = true,
             "--late-shots" => {
                 o.late_shots = value()?
                     .split(',')
@@ -3895,6 +3900,9 @@ fn mission_for_screenshot(
     // `--dialog-shots`: the boxes pictured so far, and how long the open
     // one has been up.
     let (mut dialog_shot, mut shot_up) = (Vec::<u64>::new(), 0.0f32);
+    // `--flash-shots`: Flash movies seen, by widget: seconds since each
+    // started (None once pictured).
+    let mut flash_seen: HashMap<u32, Option<f32>> = HashMap::new();
     // The loading screen's steps over the scripts' fades until the late HUD
     // (which draws it) runs, logged.
     let mut screen_cycle = loading::Cycle::default();
@@ -4733,10 +4741,32 @@ fn mission_for_screenshot(
                 Some(_) => {}
                 None => shot_up = 0.0,
             }
+            // `--flash-shots`: each Flash movie the scripts start (the
+            // shop's `store`), a second and a half in.
+            let movies = match &hud.game {
+                Some(g) if options.flash_shots => g.flash_movies(),
+                _ => Vec::new(),
+            };
+            for (id, swf) in movies {
+                let up = flash_seen.entry(id).or_insert(Some(0.0));
+                let Some(t) = up else { continue };
+                *t += tick;
+                if *t >= 1.5 {
+                    *up = None;
+                    render(backend, game, fov, aspect, Some(hud))?;
+                    let path = out.with_file_name(format!("{stem}-flash-{swf}-{id}.ppm"));
+                    write_ppm(backend, &path)?;
+                    eprintln!("flash-shot: {swf} (widget {id}): {}", path.display());
+                }
+            }
             if let Some(g) = &mut hud.game {
                 for seq in g.take_callbacks() {
                     eprintln!("after contract: the HUD called back call {seq}");
                     link.hud_callback(seq);
+                }
+                for (seq, args) in g.take_callback_args() {
+                    eprintln!("after contract: the HUD called back call {seq} with {args:?}");
+                    link.hud_callback_with(seq, &args);
                 }
                 for (seq, picked) in g.take_choices() {
                     eprintln!("dialog-check: box {seq} closed on option {picked}");
@@ -8594,6 +8624,9 @@ impl Running {
         if let (Some(g), Some(m)) = (&mut self.hud.game, &mut self.mission) {
             for seq in g.take_callbacks() {
                 m.hud_callback(seq);
+            }
+            for (seq, args) in g.take_callback_args() {
+                m.hud_callback_with(seq, &args);
             }
             // And the options picked in its dialog boxes.
             for (seq, picked) in g.take_choices() {

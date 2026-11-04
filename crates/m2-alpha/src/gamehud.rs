@@ -58,6 +58,8 @@ use crate::support::{self, SupportHud};
 
 /// The pause menu's movie (`MrxGuiPauseScreen._Initialize`'s `sFile`).
 const PAUSE_MOVIE: &str = crate::pause::MOVIE;
+/// The shop's movie (`MrxGuiSupportShop`'s `sFlashFile`).
+const STORE_MOVIE: &str = "store";
 /// The pause layout's widget (`Pause_Layout`).
 const PAUSE_LAYOUT: &str = "Pause Layout";
 /// The PC's library behind the pause menu's options (`LTILibName`): its
@@ -158,7 +160,28 @@ local group, method, data, seq, call = ...
 -- state) stands here as a note of the call's number, for the game to
 -- hand back ([`HudCall::callback`]).
 if seq then
-    data.fCallback = function()
+    data.fCallback = function(...)
+        -- What the HUD passes after the call's own data (the shop's
+        -- purchase: the item's id and how many) goes back with it, plain
+        -- values only.
+        local arg = { ... }
+        local given = select('#', ...)
+        local own = type(data.tCallbackData) == "table" and table.getn(data.tCallbackData) or 0
+        if given > own then
+            local extra = { seq }
+            for i = own + 1, given do
+                local v = arg[i]
+                local t = type(v)
+                if t == "string" or t == "number" or t == "boolean" then
+                    table.insert(extra, v)
+                else
+                    table.insert(extra, false)
+                end
+            end
+            __m2_hud_args = __m2_hud_args or {}
+            table.insert(__m2_hud_args, extra)
+            return
+        end
         __m2_hud_done = __m2_hud_done or {}
         table.insert(__m2_hud_done, seq)
     end
@@ -475,6 +498,22 @@ for _, w in pairs(MrxGuiInterface._GetWidgetsForPlayers(nil, "fuel") or {}) do
     w:SetAppendedString("/" .. cap)
 end
 "#;
+/// Her cash, fuel and support stock (by item key) as mirrored into the
+/// HUD's `MrxPmc` ([`PMC_MIRROR`]).
+type Pmc = (Option<f64>, Option<f64>, Vec<(String, u32)>);
+/// Her cash, fuel and support stock as the mission's scripts hold them
+/// (`MrxPmc` there), for this state's `MrxPmc` to answer: its getters are
+/// set to answer these (the module's own copy here never changes).
+const PMC_MIRROR: &str = r#"
+local cash, fuel, stock = ...
+__m2_cash, __m2_fuel, __m2_stock = cash, fuel, stock
+local m = rawget(_G, "MrxPmc")
+if type(m) == "table" then
+    rawset(m, "GetCashQty", function() return __m2_cash or 0 end)
+    rawset(m, "GetFuelQty", function() return __m2_fuel or 0 end)
+    rawset(m, "GetSupportQty", function(key) return (__m2_stock or {})[key] or 0 end)
+end
+"#;
 /// The support menu opened (true) or closed: its own `Open` and `Close`.
 const SUPPORT_MENU: &str = r#"
 local open = ...
@@ -761,6 +800,11 @@ pub struct HudState {
     /// Her cash, as the scripts hold it (`PlayerCashChanged` tells the HUD;
     /// the PDA's stats page reads `Player.GetCash`).
     pub cash: Option<f64>,
+    /// Her fuel and her support stock by item key, as the scripts hold
+    /// them: the HUD's own `MrxPmc` answers them (the shop's `store`, the
+    /// PDA's stockpile).
+    pub fuel: Option<f64>,
+    pub stock: Vec<(String, u32)>,
     /// What the faction zones last told the HUD (`MissionView::trespass`).
     pub trespass: crate::mission::Trespass,
     /// Whether vehicle disguises work, and her disguise while one holds:
@@ -1176,6 +1220,9 @@ enum Output {
         log: Vec<String>,
         /// The mission calls whose callbacks the HUD called.
         callbacks: Vec<u64>,
+        /// Callbacks the HUD called with what it passed (the shop's
+        /// purchases: item and count).
+        callback_args: Vec<(u64, Vec<CallArg>)>,
         /// The scripts' posts for the contracts ([`HUD_POSTS`]).
         posts: Vec<Post>,
         /// The mission's dialog boxes closed, each with the option picked.
@@ -1186,6 +1233,25 @@ enum Output {
         pause: Box<PauseOut>,
     },
     Failed(String),
+}
+
+/// A plain value a HUD callback passed back to the mission.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CallArg {
+    Num(f64),
+    Str(String),
+    Bool(bool),
+}
+
+impl CallArg {
+    /// As a Lua literal, for the mission's script.
+    pub fn lua(&self) -> String {
+        match self {
+            CallArg::Num(n) => format!("{n}"),
+            CallArg::Str(s) => format!("{s:?}"),
+            CallArg::Bool(b) => format!("{b}"),
+        }
+    }
 }
 
 /// What the pause menu ([`crate::pause`]) asks of play, and whether the
@@ -1261,6 +1327,11 @@ pub struct GameHud {
     last_time: Option<f64>,
     /// Mission calls whose callbacks the HUD has called, to hand back.
     callbacks: Vec<u64>,
+    /// Callbacks called with what the HUD passed, to hand back.
+    callback_args: Vec<(u64, Vec<CallArg>)>,
+    /// The Flash movies its widgets started, by widget, as the thread
+    /// logged them ([`GameHud::flash_movies`]).
+    movies: Vec<(u32, String)>,
     /// The scripts' posts for the contracts ([`HUD_POSTS`]), to hand back.
     posts: Vec<Post>,
     /// The mission's dialog boxes closed and the options picked, to hand
@@ -1325,6 +1396,8 @@ impl GameHud {
             rx,
             status: Status::Loading,
             callbacks: Vec::new(),
+            callback_args: Vec::new(),
+            movies: Vec::new(),
             posts: Vec::new(),
             choices: Vec::new(),
             dropped_fanfare: false,
@@ -1410,8 +1483,21 @@ impl GameHud {
         message.cloned()
     }
 
+    /// The Flash movies the scripts' widgets play now: widget and movie
+    /// (`store`, `topbar`), for the test runs' pictures.
+    pub fn flash_movies(&self) -> Vec<(u32, String)> {
+        self.movies.clone()
+    }
+
+    /// The mission calls whose callbacks the HUD called with arguments of
+    /// its own (the shop's purchases: the item and how many) since the
+    /// last time, with them: the mission runs its own with them.
+    pub fn take_callback_args(&mut self) -> Vec<(u64, Vec<CallArg>)> {
+        std::mem::take(&mut self.callback_args)
+    }
+
     /// The mission calls ([`HudCall::seq`]) whose callbacks the HUD has
-    /// called since the last time: the mission runs its own.
+    /// called (without arguments of its own) since the last time.
     pub fn take_callbacks(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.callbacks)
     }
@@ -1497,14 +1583,29 @@ impl GameHud {
                 images,
                 log,
                 callbacks,
+                callback_args,
                 posts,
                 choices,
                 shell,
                 pause,
             } => {
                 self.callbacks.extend(callbacks);
+                self.callback_args.extend(callback_args);
                 self.posts.extend(posts);
                 self.choices.extend(choices);
+                // The Flash movies started, from the thread's log
+                // ("flash: widget 372 () plays store, ...").
+                for line in &log {
+                    if let Some(rest) = line.strip_prefix("flash: widget ")
+                        && let Some((id, more)) = rest.split_once(' ')
+                        && let Ok(id) = id.parse::<u32>()
+                        && let Some((_, movie)) = more.split_once(") plays ")
+                        && let Some(movie) = movie.split(',').next()
+                    {
+                        self.movies.retain(|(w, _)| *w != id);
+                        self.movies.push((id, movie.to_owned()));
+                    }
+                }
                 let (pause, shell) = (*pause, *shell);
                 self.pause_news.merge(pause.news);
                 self.pause_available = pause.available;
@@ -2014,6 +2115,8 @@ struct Told {
     gun_box: String,
     /// Her cash as last told, in whole dollars.
     cash: Option<i64>,
+    /// Her cash, fuel and stock as last mirrored into `MrxPmc` ([`PMC_MIRROR`]).
+    pmc: Option<Pmc>,
     vehicle: Option<Option<String>>,
     vehicle_templates: Option<Vec<String>>,
     target: Option<Option<(i32, i32, i32)>>,
@@ -2424,7 +2527,7 @@ impl Thread {
         // fanfare while it is up (its Key listener's Enter continues, as
         // `_HandleFanfareInput` passes the select button on), else the PDA.
         self.tell_options(&state.pause_settings, &mut log);
-        if self.pda_shown || self.fanfare_up() || self.pause_up() {
+        if self.pda_shown || self.fanfare_up() || self.pause_up() || self.store_up() {
             self.keys.extend(state.keys.iter().copied());
         }
         if self.pda_shown && !state.pad_keys.is_empty() {
@@ -2794,6 +2897,35 @@ impl Thread {
                 t.sequence_values::<u64>().flatten().collect()
             })
             .unwrap_or_default();
+        // Callbacks with what the HUD passed (the shop's purchases), taken
+        // out the same way.
+        let callback_args = globals
+            .raw_get::<Option<mlua::Table>>("__m2_hud_args")
+            .ok()
+            .flatten()
+            .map(|t| {
+                let _ = globals.raw_set("__m2_hud_args", mlua::Value::Nil);
+                t.sequence_values::<mlua::Table>()
+                    .flatten()
+                    .filter_map(|c| {
+                        let seq = c.get::<u64>(1).ok()?;
+                        let args = c
+                            .sequence_values::<mlua::Value>()
+                            .skip(1)
+                            .flatten()
+                            .map(|v| match v {
+                                mlua::Value::String(s) => CallArg::Str(s.to_string_lossy()),
+                                mlua::Value::Integer(n) => CallArg::Num(n as f64),
+                                mlua::Value::Number(n) => CallArg::Num(n),
+                                mlua::Value::Boolean(b) => CallArg::Bool(b),
+                                _ => CallArg::Bool(false),
+                            })
+                            .collect();
+                        Some((seq, args))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         // Taken out the same way.
         let choices = globals
             .raw_get::<Option<mlua::Table>>("__m2_hud_choices")
@@ -2818,6 +2950,7 @@ impl Thread {
             images,
             log,
             callbacks,
+            callback_args,
             posts,
             choices,
             shell: Box::default(),
@@ -3046,6 +3179,7 @@ impl Thread {
             images,
             log,
             callbacks: Vec::new(),
+            callback_args: Vec::new(),
             posts: Vec::new(),
             choices: Vec::new(),
             shell: Box::new(ShellNews {
@@ -3122,6 +3256,11 @@ impl Thread {
     /// A fanfare movie is playing (`fanfare_mission`...).
     fn fanfare_up(&self) -> bool {
         self.flash.values().any(|m| m.swf.contains("fanfare"))
+    }
+
+    /// The shop's movie is playing (`MrxGuiSupportShop`'s `store`).
+    fn store_up(&self) -> bool {
+        self.flash.values().any(|m| m.swf == STORE_MOVIE)
     }
 
     /// The pause menu's movie is playing.
@@ -3306,14 +3445,19 @@ impl Thread {
                 "flash: key {code} {}",
                 if down { "down" } else { "up" }
             ));
-            // The pause menu over all holds them; else a fanfare.
+            // The pause menu over all holds them; else a fanfare; else the
+            // shop's store, which takes the controls while it is up
+            // (`MrxGuiSupportShop._RunShop`'s `GetControlFocus`).
             let pause = self.pause_up();
             let fanfare = self.fanfare_up();
+            let store = self.store_up();
             for m in self.flash.values_mut().filter(|m| {
                 if pause {
                     m.swf == PAUSE_MOVIE
+                } else if fanfare {
+                    m.swf.contains("fanfare")
                 } else {
-                    !fanfare || m.swf.contains("fanfare")
+                    !store || m.swf == STORE_MOVIE
                 }
             }) {
                 if down {
@@ -3588,6 +3732,22 @@ impl Thread {
                 [("uGuid", guid_value(PLAYER)), ("nValue", Value::Number(n))],
             )?;
             fire(lua, "PlayerCashChanged", t)?;
+        }
+        // Her cash, fuel and stock as the scripts hold them, for the HUD's
+        // own `MrxPmc` to answer (the shop's `store` and the PDA's
+        // stockpile read them there): its getters answer these.
+        let pmc = (s.cash, s.fuel, s.stock.clone());
+        if self.told.pmc.as_ref() != Some(&pmc) {
+            let stock = lua.create_table()?;
+            for (key, count) in &pmc.2 {
+                stock.raw_set(key.as_str(), *count)?;
+            }
+            lua.load(PMC_MIRROR).set_name("=m2-hud pmc").call::<()>((
+                pmc.0.unwrap_or(0.0),
+                pmc.1.unwrap_or(0.0),
+                stock,
+            ))?;
+            self.told.pmc = Some(pmc);
         }
         // The satellite looks down with north up: its compass reads the
         // camera's heading as the view opens.
@@ -5764,6 +5924,38 @@ mod tests {
     use crate::combat::RIFLE_CLIP;
 
     #[test]
+    fn a_callback_with_its_own_arguments_hands_them_back() {
+        // The shop's purchase: `MrxGuiSupportShop` calls the mission's
+        // callback with its data, then the item and how many.
+        let lua = mlua::Lua::new();
+        let data = lua.create_table().unwrap();
+        data.set("tCallbackData", lua.create_table().unwrap())
+            .unwrap();
+        let found: bool = lua
+            .load(HUD_CALL)
+            .call(("Shop", "SetCallback", data.clone(), 69, 69))
+            .unwrap();
+        // No HUD interface in this state: the call isn't taken, but the
+        // stand-in callback is there for the HUD's module.
+        assert!(!found);
+        let f: mlua::Function = data.get("fCallback").unwrap();
+        f.call::<()>(("riotgun", 1)).unwrap();
+        f.call::<()>(()).unwrap();
+        let args: mlua::Table = lua.globals().get("__m2_hud_args").unwrap();
+        let first: mlua::Table = args.get(1).unwrap();
+        assert_eq!(first.get::<u64>(1).unwrap(), 69);
+        assert_eq!(first.get::<String>(2).unwrap(), "riotgun");
+        assert_eq!(first.get::<f64>(3).unwrap(), 1.0);
+        // Without arguments of its own, the plain way.
+        let done: mlua::Table = lua.globals().get("__m2_hud_done").unwrap();
+        assert_eq!(done.get::<u64>(1).unwrap(), 69);
+        // And as the mission's script writes them.
+        assert_eq!(CallArg::Str("riotgun".into()).lua(), "\"riotgun\"");
+        assert_eq!(CallArg::Num(1.0).lua(), "1");
+        assert_eq!(CallArg::Bool(true).lua(), "true");
+    }
+
+    #[test]
     fn a_texture_named_by_hash_is_that_hash() {
         // The shotgun's reticle, by its `WeaponUI` hash.
         assert_eq!(texture_hash(&by_hash(0xe350_5568)), 0xe350_5568);
@@ -6460,6 +6652,8 @@ mod paint_tests {
             rx,
             status,
             callbacks: Vec::new(),
+            callback_args: Vec::new(),
+            movies: Vec::new(),
             posts: Vec::new(),
             choices: Vec::new(),
             dropped_fanfare: false,
@@ -6546,6 +6740,7 @@ mod paint_tests {
             images: Vec::new(),
             log: log.iter().map(|l| (*l).to_owned()).collect(),
             callbacks: Vec::new(),
+            callback_args: Vec::new(),
             posts: Vec::new(),
             choices: Vec::new(),
             shell: Box::default(),

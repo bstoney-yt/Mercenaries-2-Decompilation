@@ -266,6 +266,10 @@ m2-alpha [options]
                          while a dialog box of the scripts is up, and each
                          box is pictured 1.5 s after it opens
                          (<out>-dialog<n>.ppm; dialog-shot lines)
+  --flash-shots          with --mission --dialog-shots: each Flash movie the
+                         scripts' HUD widgets start (the shop's store) is
+                         pictured 1.5 s after it starts
+                         (<out>-flash-<movie>-<widget>.ppm; flash-shot lines)
   --late-shots <s,...>   with --mission --after-contract --screenshot: the
                          scene and the game's HUD pictured at these seconds
                          after each contract is done (<out>-c<n>-late<s>.ppm;
