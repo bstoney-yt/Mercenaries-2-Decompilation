@@ -1672,6 +1672,9 @@ pub struct Combat {
     seed: u64,
     /// What she has fired, for the HUD's ammo counters.
     pub fired: Fired,
+    /// The times she asked to see her ammo (reload, a weapon switch):
+    /// the HUD shows both ammo boxes for each.
+    pub ammo_shown: u32,
     /// Every shot fired, by its gun's sound set (0: none) and whether the
     /// hero fired it, and the muzzle flashes drawn as the game's effect
     /// and as the alpha's own: for the run's log.
@@ -1911,6 +1914,7 @@ impl Default for Combat {
             gunner_rounds: 0,
             seed: 0x2545_f491_4f6c_dd1d,
             fired: Fired::default(),
+            ammo_shown: 0,
             shots: std::collections::BTreeMap::new(),
             shooters: std::collections::BTreeMap::new(),
             flashes: (0, 0),
