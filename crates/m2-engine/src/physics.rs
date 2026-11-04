@@ -1219,8 +1219,8 @@ const TRACK_RAY_RADIUS: f32 = 0.02;
 /// Boats ([`Physics::set_water`]): how deep a wreck's origin floats,
 /// metres (the layers put the start's boat 0.35 m under the -36 m sea,
 /// patrol boats at it; an intact boat floats as deep as its springs hold
-/// it, [`float_depth`]); how a wreck's rocking dies down, per second; how fast
-/// it turns at speed, radians a second, from what speed, m/s; its top
+/// it, [`float_depth`]); how a wreck's rocking dies down, per second (an
+/// intact boat turns by its helm, [`BoatFloat`]); its top
 /// speed when its template gives none, m/s; and the most of its weight a
 /// wreck's buoyancy holds up (it sinks). All invented.
 pub const FLOAT_DEPTH: f32 = 0.35;
@@ -1232,20 +1232,16 @@ pub fn float_depth(spec: &VehicleSpec) -> f32 {
     spec.tuning.boat.unwrap_or(BOAT).float.rest_depth(GRAVITY)
 }
 const BOAT_ROCK: f32 = 2.5;
-const BOAT_TURN: f32 = 0.9;
-const BOAT_TURN_SPEED: f32 = 6.0;
 const BOAT_TOP: f32 = 18.0;
 const WRECK_FLOAT: f32 = 0.4;
 /// A boat's engine and drag when its template gives none (its own
-/// `_BoatPhysics` otherwise, gap round 17): the alpha's earlier invented
-/// coasting, keel and heave drag (0.3, 2.5, 3 a second), braking 1.2 a
-/// second in all, 4 m/s backing up. Invented.
+/// `_BoatPhysics` otherwise): the 360 record's defaults (0x823EA868).
 const BOAT: BoatTuning = BoatTuning {
-    reverse_speed: 4.0,
-    torque: (1.0, 0.8),
-    drag: [0.3, 2.5, 3.0],
-    brake: 0.9,
-    curve: [1.0; 4],
+    reverse_speed: 10.0 / 3.6,
+    torque: (100.0, 10.0),
+    drag: [0.5, 2.0, 1.0],
+    brake: 0.0,
+    curve: [0.4, 1.0, 0.9, 0.15],
     hull_friction: 0.3,
     float: BoatFloat::DEFAULT,
 };
@@ -1656,6 +1652,13 @@ struct Hull {
     helm: f32,
     lean: f32,
     lift: f32,
+    /// Its engine's eased throttle (0x82198F08), its water share and
+    /// whether any spring stood in the water last step ([`float_hull`]).
+    engine: f32,
+    water_share: f32,
+    afloat: bool,
+    /// Its eased handbrake (0 to 1).
+    handbrake: f32,
     controls: VehicleControls,
     /// Its engine and how the water slows it: its template's, else
     /// [`BOAT`].
@@ -2318,18 +2321,65 @@ fn float_hull(hull: &mut Hull, b: &mut r::RigidBody, water: f32, dt: f32) -> f32
     hull.helm = ease(hull.helm, asked, keep, dt);
     let lean = (1.0 - f.steer_loss * share(speed, f.top)) * hull.helm * share(speed, f.low_speed);
     hull.lean = ease(hull.lean, lean, f.roll_inertia, dt);
-    // Its bow lift toward its throttle (its handbrake, which would hold
-    // it down, the alpha's boats have not).
     let throttle = if c.parked {
         0.0
     } else {
         c.throttle.clamp(-1.0, 1.0)
     };
-    hull.lift = if throttle < hull.lift {
-        ease(hull.lift, throttle, f.pitch_down_inertia, dt)
+    let mass = b.mass();
+    // Its brake and engine (0x82199B08). Its two pedals, the throttle
+    // ahead and the brake (the alpha's throttle back), and its handbrake
+    // (the alpha's brake): held, at once; let go, eased off keeping
+    // `HandBrakeInertia`.
+    let w = hull.water;
+    let (pedal, brake) = (throttle.max(0.0), (-throttle).max(0.0));
+    let held = if c.brake && !c.parked { 1.0 } else { 0.0 };
+    hull.handbrake = if held > hull.handbrake {
+        held
     } else {
-        (hull.lift + f.pitch_up * dt).min(throttle)
+        ease(hull.handbrake, held, f.handbrake_inertia, dt)
     };
+    let handbrake = hull.handbrake;
+    // Its bow lift toward its throttle ahead, held down by its handbrake.
+    let lifting = pedal * (1.0 - handbrake);
+    hull.lift = if lifting < hull.lift {
+        ease(hull.lift, lifting, f.pitch_down_inertia, dt)
+    } else {
+        (hull.lift + f.pitch_up * dt).min(lifting)
+    };
+    // Going faster than 2 km/h, its brake slows it steadily, by its
+    // `BrakeDrag` m/s² as much as it sits in the water: going ahead its
+    // brake pedal, backing up its throttle.
+    if (ahead * 3.6).powi(2) > 4.0 {
+        let k = w.brake * hull.water_share * mass * dt;
+        let push = if backing { pedal * k } else { -brake * k };
+        b.apply_impulse(vector(bow * push), true);
+    }
+    // Upright, its engine's throttle eases toward the pedals' difference
+    // (keeping `EngineInertia`); it pulls |that| x its curve at its speed
+    // (of its top ahead, of its reverse top backing up) x its torque
+    // (reverse torque when not ahead) x 200, N, x the pedals' difference
+    // again, along its flat heading, as much as it sits in the water, so
+    // long as it is under its top speed or pulling against its motion
+    // (0x82198F08).
+    let pedals = pedal - brake;
+    let going_at = (ahead / if backing { -f.reverse } else { f.top }).min(1.0);
+    if up.y >= 0.0 {
+        hull.engine = ease(hull.engine, pedals, f.engine_inertia, dt).clamp(-1.0, 1.0);
+        let e = hull.engine;
+        let curve = [
+            (0.0, w.curve[0]),
+            (f.curve_at.0, w.curve[1]),
+            (f.curve_at.1, w.curve[2]),
+            (1.0, w.curve[3]),
+        ];
+        let torque = if e <= 0.0 { w.torque.1 } else { w.torque.0 };
+        let pull = e.abs() * track_push(curve, going_at) * torque * 200.0;
+        if going_at < 1.0 || pedals * ahead < 0.0 {
+            let push = pull * (1.0 - handbrake) * hull.water_share * pedals * dt;
+            b.apply_impulse(vector(bow.with_y(0.0) * push), true);
+        }
+    }
     let going = if f.top > 1e-4 {
         (ahead / f.top).clamp(0.0, 1.0)
     } else {
@@ -2337,8 +2387,38 @@ fn float_hull(hull: &mut Hull, b: &mut r::RigidBody, water: f32, dt: f32) -> f32
     };
     let spring = f.spring(going);
     let length = f.length(going);
-    let mass = b.mass();
+    // Its helm turns it (0x8219A390), as much as it sits in the water
+    // (its water share as the last step left it) or, out of it, by its
+    // air control: about the world's up, by mass x step x 10 x its helm x
+    // (its steering, less its high-speed loss, as fast as it goes up to
+    // its low-speed limit; its handbrake's boost x its engine's throttle
+    // squared x its handbrake; its no-speed steering x its engine's
+    // throttle ahead x the throttle asked, held off by its handbrake and
+    // gone by its low-speed limit; its low-speed
+    // steering under a quarter of its reverse top speed, 10 km/h at
+    // most), less its high-speed loss again.
+    let slow = share(speed, f.low_speed);
+    let loss = 1.0 - f.steer_loss * share(speed, f.top);
+    let crawling = speed < (f.reverse * 0.25).min(10.0 / 3.6);
+    let e = hull.engine;
+    let reach = f.steering * loss * slow
+        + f.handbrake_boost * e * e * slow * handbrake
+        + f.no_speed_steering * e.max(0.0) * pedal * (1.0 - handbrake) * (1.0 - slow)
+        + if crawling { f.low_speed_steering } else { 0.0 };
+    let afloat = if hull.afloat {
+        0.0
+    } else {
+        f.air_steering * 0.1
+    };
+    let wetness = hull.water_share + (1.0 - hull.water_share) * afloat;
+    let yaw = reach * hull.helm * loss * mass * wetness * 10.0 * dt;
+    b.apply_torque_impulse(vector(Vec3::Y * yaw), true);
+    // Its springs (0x82199EA8), each push then scaled by its water share:
+    // eased (keeping 0.95 a 1/60 s) toward 1 while any spring is in the
+    // water, else 0 (0x8219A248); none of them turns it about the up.
+    let mut pushes = [(Vec3::ZERO, 0.0f32); 4];
     let mut wet = 0.0;
+    let mut deeps = 0.0;
     for (i, &(corner, lean, lift)) in hull.springs.iter().enumerate() {
         let bottom = (at + turn * corner.with_y(spring.start)).y - up.y * length;
         let stood = hull.wet[i].map_or(water, |w| ease(w, water, f.smoothing, dt));
@@ -2349,16 +2429,38 @@ fn float_hull(hull: &mut Hull, b: &mut r::RigidBody, water: f32, dt: f32) -> f32
         } else {
             0.0
         };
+        deeps += deep;
         let point = at + turn * corner;
         let rising = vec3(b.velocity_at_point(vector(point))).y;
         let push = ((over * spring.strength).max(0.0) - rising * deep * spring.damping) * mass * dt;
         if over > 0.0 {
             wet += 0.25;
         }
+        pushes[i] = (point, push.max(0.0));
+    }
+    let target = if deeps * 0.25 > 0.0 { 1.0 } else { 0.0 };
+    hull.water_share = ease(hull.water_share, target, 0.95, dt);
+    hull.afloat = wet > 0.0;
+    let spin = vec3(b.angvel()).y;
+    for (point, push) in pushes {
         if push > 0.0 {
-            b.apply_impulse_at_point(vector(Vec3::Y * push), vector(point), true);
+            b.apply_impulse_at_point(
+                vector(Vec3::Y * push * hull.water_share),
+                vector(point),
+                true,
+            );
         }
     }
+    let w = vec3(b.angvel());
+    b.set_angvel(vector(w.with_y(spin)), true);
+    // Its spin about its own roll, pitch and yaw axes dies down by its
+    // damping of each, x its mass x step, as much as it sits in the water
+    // (0x8219ABE8).
+    let w = vec3(b.angvel());
+    let x = turn * Vec3::X;
+    let [roll, pitch, yaw] = f.ang_damp;
+    let damp = bow * (roll * w.dot(bow)) + x * (pitch * w.dot(x)) + up * (yaw * w.dot(up));
+    b.apply_torque_impulse(vector(-damp * mass * dt * hull.water_share), true);
     wet
 }
 
@@ -2824,54 +2926,25 @@ impl Physics {
                 continue;
             }
             let ease = |rate: f32| 1.0 - (rate * dt * wet).min(1.0);
-            let c = if v.wrecked {
-                VehicleControls::default()
-            } else {
-                hull.controls
-            };
+            // The water slows it along, across and up and down (its engine
+            // and brake pushed it in [`float_hull`], from 0x82199B08).
             let side = Vec3::new(ahead.z, 0.0, -ahead.x);
             let velocity = vec3(b.linvel());
-            let mut along = velocity.dot(ahead);
-            let throttle = c.throttle.clamp(-1.0, 1.0);
-            let against = throttle * along < -0.5;
             let w = hull.water;
-            // Its engine pulls the way the throttle asks (against the way
-            // it goes as well, so a boat with no brake stops); its drag
-            // along holds it at its top speed ahead; backing up, it goes
-            // no faster than its template's reverse top speed.
-            if throttle != 0.0 && !c.brake && !c.parked {
-                along += throttle * w.push(along, v.top, throttle < 0.0) * dt * wet;
-            }
-            let braking = c.brake || c.parked || against;
-            along *= ease(w.drag[0] + if braking { w.brake } else { 0.0 });
-            if throttle < 0.0 && !braking {
-                along = along.max(-w.reverse_speed);
-            }
+            let along = velocity.dot(ahead) * ease(w.drag[0]);
             let across = velocity.dot(side) * ease(w.drag[1]);
             let rise = velocity.y * ease(w.drag[2]);
             b.set_linvel(vector(ahead * along + side * across + Vec3::Y * rise), true);
-            // The rudder bites as the water goes by (the other way round
-            // backing up), a little with the throttle open at a standstill;
-            // it turns as tracks do for the same steering.
-            let spin = vec3(b.angvel());
-            let up = turn * Vec3::Y;
-            let bite = if along.abs() < 0.9 {
-                0.15 * throttle
-            } else {
-                (along / BOAT_TURN_SPEED).clamp(-1.0, 1.0)
-            };
-            let want = c.steer.clamp(-1.0, 1.0) * BOAT_TURN * bite;
-            let yaw = spin.dot(up);
-            let yaw = yaw + (want - yaw) * (3.0 * dt * wet).min(1.0);
-            // A wreck stops rocking (invented); an intact boat rocks as its
-            // springs let it.
-            let rock = spin - up * spin.dot(up);
-            let rock = if v.wrecked {
-                rock * ease(BOAT_ROCK)
-            } else {
-                rock
-            };
-            b.set_angvel(vector(rock + up * yaw), true);
+            // An intact boat's helm turned it with its springs
+            // ([`float_hull`]); a wreck stops turning and rocking
+            // (invented).
+            if v.wrecked {
+                let spin = vec3(b.angvel());
+                let up = turn * Vec3::Y;
+                let yaw = spin.dot(up) * (1.0 - (3.0 * dt * wet).min(1.0));
+                let rock = (spin - up * spin.dot(up)) * ease(BOAT_ROCK);
+                b.set_angvel(vector(rock + up * yaw), true);
+            }
         }
     }
 
@@ -3524,6 +3597,10 @@ impl Physics {
                 helm: 0.0,
                 lean: 0.0,
                 lift: 0.0,
+                engine: 0.0,
+                water_share: 1.0,
+                afloat: true,
+                handbrake: 0.0,
                 controls: VehicleControls::default(),
                 water,
             }
@@ -5959,6 +6036,7 @@ mod tests {
                 }),
                 ..crate::VehicleTuning::default()
             },
+            mass: 8000.0,
             ..boat()
         };
         let run = |throttle: f32, brake: bool, secs: f32, from: Option<f32>| {
@@ -5988,14 +6066,17 @@ mod tests {
         assert!((ahead - 33.33).abs() < 0.7, "ahead {ahead}");
         let astern = run(-1.0, false, 30.0, None);
         assert!((astern + 11.11).abs() < 0.3, "astern {astern}");
-        // From 8 m/s for a second: e^-0.2 and e^-(0.2 + 3) of it.
+        // From 8 m/s for a second: coasting, e^-0.2 of it; its handbrake
+        // held, the same (it only cuts its engine); the throttle back, its
+        // brake's steady 3 m/s² on top of the drag, (8 + 15) e^-0.2 - 15,
+        // and its engine starting to pull it back (0x82199B08).
         let coast = run(0.0, false, 1.0, Some(8.0));
         assert!((coast - 8.0 * (-0.2f32).exp()).abs() < 0.2, "coast {coast}");
-        let braked = run(0.0, true, 1.0, Some(8.0));
-        assert!(
-            (braked - 8.0 * (-3.2f32).exp()).abs() < 0.1,
-            "braked {braked}"
-        );
+        let held = run(0.0, true, 1.0, Some(8.0));
+        assert!((held - coast).abs() < 0.05, "handbrake {held}");
+        let braked = run(-1.0, false, 1.0, Some(8.0));
+        let steady = 23.0 * (-0.2f32).exp() - 15.0;
+        assert!(braked < steady + 0.1 && braked > -6.0, "braked {braked}");
     }
 
     #[test]
@@ -6056,8 +6137,10 @@ mod tests {
             );
             p.step(DT);
         }
+        // (On the 360 record's defaults: 100 x 200 N on 2 t, fading to
+        // 0.15 of it at its 40 km/h.)
         let speed = p.vehicle_speed(id);
-        assert!((10.0..=BOAT_TOP + 0.5).contains(&speed), "{speed} m/s");
+        assert!((5.0..=40.0 / 3.6 + 0.3).contains(&speed), "{speed} m/s");
         let m = place(&p);
         assert!(
             m.w_axis.z > -170.0 && m.w_axis.x.abs() < 1.0,
@@ -6070,7 +6153,11 @@ mod tests {
         assert!((0.005..0.1).contains(&bow), "bow up {bow}");
         // Steering turns it as steering a tank does: positive steer, a
         // positive turn about up.
-        let before = m.transform_vector3(Vec3::Z);
+        // (Its helm as the 360 code's turns it, 0x8219A390: 10 x its
+        // steering 2 x helm against its yaw damping 0.5, the record's
+        // defaults.)
+        let mut turned = 0.0;
+        let mut last = m.transform_vector3(Vec3::Z);
         for _ in 0..120 {
             p.drive(
                 id,
@@ -6081,9 +6168,10 @@ mod tests {
                 },
             );
             p.step(DT);
+            let now = place(&p).transform_vector3(Vec3::Z);
+            turned += last.with_y(0.0).cross(now.with_y(0.0)).y.asin();
+            last = now;
         }
-        let after = place(&p).transform_vector3(Vec3::Z);
-        let turned = after.x.atan2(after.z) - before.x.atan2(before.z);
         assert!(turned > 0.8, "turned {turned}");
         // Leaning into the turn: its port side (+x) down.
         let port = place(&p).transform_vector3(Vec3::X).y;
@@ -6101,7 +6189,7 @@ mod tests {
             );
             p.step(DT);
         }
-        for _ in 0..60 * 40 {
+        for _ in 0..60 * 60 {
             let m = place(&p);
             let f = m.transform_vector3(Vec3::Z);
             // Heading for +z.
@@ -6117,11 +6205,16 @@ mod tests {
             p.step(DT);
         }
         // The beach comes out of the water at z 241; it runs up it at its
-        // top speed (18 m/s since gap round 17, 13 before) and slides on
+        // top speed (11 m/s on the 360 record's defaults) and slides on
         // (further since its hull's 360 friction, 0.3, took the invented
         // 0.6's place).
         let m = place(&p);
-        assert!(p.vehicle_speed(id).abs() < 2.0, "{}", p.vehicle_speed(id));
+        assert!(
+            p.vehicle_speed(id).abs() < 2.0,
+            "{} at {}",
+            p.vehicle_speed(id),
+            m.w_axis
+        );
         assert!(
             (215.0..275.0).contains(&m.w_axis.z),
             "aground at {}",
