@@ -32,8 +32,8 @@ use rapier3d::control::{
 };
 
 use crate::tuning::{
-    BikeTuning, BoatTuning, EngineTuning, FlightTuning, Gearbox, Handling, Springs, TankTuning,
-    Tyres,
+    BikeTuning, BoatFloat, BoatTuning, EngineTuning, FlightTuning, Gearbox, Handling, Springs,
+    TankTuning, Tyres,
 };
 use crate::vehicle::VehicleSpec;
 use rapier3d::prelude as r;
@@ -1224,13 +1224,21 @@ const TRACK_PULL: f32 = 4.0;
 /// The wheel Rapier casts each of a 360-driven tank's track points with,
 /// metres: the 360 code casts a bare ray (0x821A5898).
 const TRACK_RAY_RADIUS: f32 = 0.02;
-/// Boats ([`Physics::set_water`]): how deep a boat's origin floats,
+/// Boats ([`Physics::set_water`]): how deep a wreck's origin floats,
 /// metres (the layers put the start's boat 0.35 m under the -36 m sea,
-/// patrol boats at it); how its rocking dies down, per second; how fast
+/// patrol boats at it; an intact boat floats as deep as its springs hold
+/// it, [`float_depth`]); how a wreck's rocking dies down, per second; how fast
 /// it turns at speed, radians a second, from what speed, m/s; its top
 /// speed when its template gives none, m/s; and the most of its weight a
 /// wreck's buoyancy holds up (it sinks). All invented.
 pub const FLOAT_DEPTH: f32 = 0.35;
+
+/// How deep a boat's origin rests under still water, level and stopped,
+/// metres: where its float springs hold it ([`BoatFloat::rest_depth`];
+/// its template's, else the 360 record's defaults).
+pub fn float_depth(spec: &VehicleSpec) -> f32 {
+    spec.tuning.boat.unwrap_or(BOAT).float.rest_depth(GRAVITY)
+}
 const BOAT_ROCK: f32 = 2.5;
 const BOAT_TURN: f32 = 0.9;
 const BOAT_TURN_SPEED: f32 = 6.0;
@@ -1247,14 +1255,12 @@ const BOAT: BoatTuning = BoatTuning {
     brake: 0.9,
     curve: [1.0; 4],
     hull_friction: 0.3,
+    float: BoatFloat::DEFAULT,
 };
-/// A boat going fast planes (the playthroughs' speedboat rides high, bow
-/// up): from a standstill to this speed, m/s, its hull rises up to this
-/// far, metres, and its bow this much more than its stern (and the stern
-/// that much less), metres. Invented, from the videos.
+/// The speed a boat is taken to plane from, m/s, for its spray and sound
+/// (its float lifts its bow as its springs do, [`BoatFloat`]). Invented,
+/// from the videos.
 pub const PLANE_SPEED: f32 = 12.0;
-const PLANE_RISE: f32 = 0.3;
-const PLANE_TRIM: f32 = 0.25;
 /// Tracks grip: on the ground, a tracked vehicle's weight doesn't pull it
 /// down hills up to this steep, radians, so it climbs, turns and stands on
 /// them as on the flat (a play-tester: the game's tank "should be able to climb
@@ -1638,12 +1644,26 @@ struct BikeFooting {
     brake: f32,
 }
 
-/// A boat's hull in the water: the points on its waterline that float it,
-/// and what its driver asks of it.
+/// A boat's hull in the water: what floats it, and what its driver asks
+/// of it.
 struct Hull {
     /// Model space, at its origin's height: over its hull's footprint,
-    /// its corners, the middles of its sides and its middle.
+    /// its corners, the middles of its sides and its middle. A wreck
+    /// floats on them ([`WRECK_FLOAT`]).
     points: Vec<Vec3>,
+    /// Its four float springs ([`BoatFloat`]): each one's corner of its
+    /// hull's box, model space, at its origin's height (bow port, bow
+    /// starboard, stern port, stern starboard, as 0x82199328 sets them),
+    /// and how much higher it feels the water stand for a full lean and
+    /// a full bow lift, metres.
+    springs: [(Vec3, f32, f32); 4],
+    /// The water each spring last stood in, eased (`None` until it has
+    /// stood in water).
+    wet: [Option<f32>; 4],
+    /// Its eased helm, lean and bow lift ([`BoatFloat`]).
+    helm: f32,
+    lean: f32,
+    lift: f32,
     controls: VehicleControls,
     /// Its engine and how the water slows it: its template's, else
     /// [`BOAT`].
@@ -2212,6 +2232,78 @@ fn stand(v: &mut VehicleBody, bodies: &mut r::RigidBodySet, dt: f32) {
     }
 }
 
+/// Floats an intact boat on its four springs as the 360 code does
+/// ([`BoatFloat`]; 0x82199548, 0x8219A390 and 0x82199EA8), still water
+/// standing at `water` under every spring (the 360 code eases each toward
+/// the highest water it samples round it; the alpha's sea has no waves).
+/// Returns the share of its springs whose bottoms are under the water.
+fn float_hull(hull: &mut Hull, b: &mut r::RigidBody, water: f32, dt: f32) -> f32 {
+    use crate::tuning::ease;
+    let f = hull.water.float;
+    let c = hull.controls;
+    let turn = Quat::from_array(b.position().rotation.to_array());
+    let at = vec3(b.position().translation);
+    let (up, bow) = (turn * Vec3::Y, turn * Vec3::Z);
+    let velocity = vec3(b.linvel());
+    let speed = velocity.length();
+    let ahead = velocity.dot(bow);
+    let share = |v: f32, of: f32| if of > 1e-4 { (v / of).min(1.0) } else { 1.0 };
+    // Its helm, the way it is asked (positive to port, as the alpha's
+    // and the 360 code's own messages have it) or backwards backing up.
+    let backing = ahead < -(f.reverse * 0.25).min(10.0 / 3.6);
+    let asked = c.steer.clamp(-1.0, 1.0) * if backing { -1.0 } else { 1.0 };
+    let keep = if asked * asked >= 1e-4 {
+        f.steer_inertia
+    } else {
+        f.steer_release
+    };
+    hull.helm = ease(hull.helm, asked, keep, dt);
+    let lean = (1.0 - f.steer_loss * share(speed, f.top)) * hull.helm * share(speed, f.low_speed);
+    hull.lean = ease(hull.lean, lean, f.roll_inertia, dt);
+    // Its bow lift toward its throttle (its handbrake, which would hold
+    // it down, the alpha's boats have not).
+    let throttle = if c.parked {
+        0.0
+    } else {
+        c.throttle.clamp(-1.0, 1.0)
+    };
+    hull.lift = if throttle < hull.lift {
+        ease(hull.lift, throttle, f.pitch_down_inertia, dt)
+    } else {
+        (hull.lift + f.pitch_up * dt).min(throttle)
+    };
+    let going = if f.top > 1e-4 {
+        (ahead / f.top).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let spring = f.spring(going);
+    let length = f.length(going);
+    let mass = b.mass();
+    let mut wet = 0.0;
+    for (i, &(corner, lean, lift)) in hull.springs.iter().enumerate() {
+        let bottom = (at + turn * corner.with_y(spring.start)).y - up.y * length;
+        let stood = hull.wet[i].map_or(water, |w| ease(w, water, f.smoothing, dt));
+        hull.wet[i] = Some(stood);
+        let over = stood + lean * hull.lean + lift * hull.lift - bottom;
+        let deep = if length > 1e-4 {
+            (over / length).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let point = at + turn * corner;
+        let rising = vec3(b.velocity_at_point(vector(point))).y;
+        let push = ((over * spring.strength).max(0.0) - rising * deep * spring.damping) * mass * dt;
+        if over > 0.0 {
+            wet += 0.25;
+        }
+        if push > 0.0 {
+            b.apply_impulse_at_point(vector(Vec3::Y * push), vector(point), true);
+        }
+    }
+    wet
+}
+
 /// Pushes a wheeled vehicle along and across with each of its axles as
 /// the 360 code does ([`Tyres`]; from the 360 code, at 0x8219C118 and
 /// 0x821A08D8): at the mean, over its wheels on the ground, of a point
@@ -2627,17 +2719,20 @@ impl Physics {
     }
 
     /// Floats boats on the water ([`set_water`](Self::set_water)) and
-    /// drives them as asked: each point of a hull's waterline under the
-    /// surface lifts it as deep as it is (the hull's whole weight with its
-    /// origin [`FLOAT_DEPTH`] under), and in the water a boat is pushed and
-    /// steered, slowed along, across and up and down as its template's
-    /// drag says ([`BoatTuning`]), and stopped rocking.
+    /// drives them as asked. An intact boat floats on its four springs as
+    /// the 360 code floats it ([`BoatFloat`]); a wreck on the points of
+    /// its waterline under the surface, each lifting it as deep as it is
+    /// (its whole weight with its origin [`FLOAT_DEPTH`] under, never more
+    /// than [`WRECK_FLOAT`] of it; invented). In the water a boat is
+    /// pushed and steered, slowed along, across and up and down as its
+    /// template's drag says ([`BoatTuning`]).
     fn float_boats(&mut self, dt: f32) {
         let Some(water) = self.water else {
             return;
         };
-        for v in self.vehicles.iter().flatten() {
-            let Some(hull) = v.hull.as_ref().filter(|_| !v.held) else {
+        for v in self.vehicles.iter_mut().flatten() {
+            let held = v.held;
+            let Some(hull) = v.hull.as_mut().filter(|_| !held) else {
                 continue;
             };
             let Some(b) = self.world.bodies.get_mut(v.controller.chassis) else {
@@ -2646,41 +2741,27 @@ impl Physics {
             let place = *b.position();
             let turn = Quat::from_array(place.rotation.to_array());
             let at = vec3(place.translation);
-            let n = hull.points.len().max(1) as f32;
-            // Deep under, three times its share of the weight; a wreck's
-            // never more than its share of [`WRECK_FLOAT`] of it.
-            let most = if v.wrecked { WRECK_FLOAT } else { 3.0 };
-            let lift = GRAVITY * v.mass / n * dt;
-            // Planing, it floats as if the water stood higher, the more so
-            // at the bow.
             let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or_zero();
-            let going = vec3(b.linvel()).dot(ahead);
-            let plane = if v.wrecked {
-                0.0
-            } else {
-                (going / PLANE_SPEED).clamp(0.0, 1.0)
-            };
-            let reach = hull
-                .points
-                .iter()
-                .map(|q| q.z.abs())
-                .fold(0.0f32, f32::max)
-                .max(0.1);
-            let mut wet = 0.0;
-            for &q in &hull.points {
-                let p = at + turn * q;
-                let surface = water + plane * (PLANE_RISE + PLANE_TRIM * q.z / reach);
-                let depth = surface - p.y;
-                if depth > 0.0 {
-                    wet += 1.0;
-                    let up = lift * (depth / FLOAT_DEPTH).min(most);
-                    b.apply_impulse_at_point(vector(Vec3::Y * up), vector(p), true);
+            let wet = if v.wrecked {
+                let n = hull.points.len().max(1) as f32;
+                let lift = GRAVITY * v.mass / n * dt;
+                let mut wet = 0.0;
+                for &q in &hull.points {
+                    let p = at + turn * q;
+                    let depth = water - p.y;
+                    if depth > 0.0 {
+                        wet += 1.0;
+                        let up = lift * (depth / FLOAT_DEPTH).min(WRECK_FLOAT);
+                        b.apply_impulse_at_point(vector(Vec3::Y * up), vector(p), true);
+                    }
                 }
-            }
+                wet / n
+            } else {
+                float_hull(hull, b, water, dt)
+            };
             if wet == 0.0 {
                 continue;
             }
-            let wet = wet / n;
             let ease = |rate: f32| 1.0 - (rate * dt * wet).min(1.0);
             let c = if v.wrecked {
                 VehicleControls::default()
@@ -2721,7 +2802,14 @@ impl Physics {
             let want = c.steer.clamp(-1.0, 1.0) * BOAT_TURN * bite;
             let yaw = spin.dot(up);
             let yaw = yaw + (want - yaw) * (3.0 * dt * wet).min(1.0);
-            let rock = (spin - up * spin.dot(up)) * ease(BOAT_ROCK);
+            // A wreck stops rocking (invented); an intact boat rocks as its
+            // springs let it.
+            let rock = spin - up * spin.dot(up);
+            let rock = if v.wrecked {
+                rock * ease(BOAT_ROCK)
+            } else {
+                rock
+            };
             b.set_angvel(vector(rock + up * yaw), true);
         }
     }
@@ -3354,10 +3442,34 @@ impl Physics {
                 .flat_map(|i| (0..3).map(move |j| (i as f32, j as f32)))
                 .map(|(i, j)| Vec3::new(at(lo.x, hi.x, i), 0.0, at(lo.z, hi.z, j)))
                 .collect();
+            let water = spec.tuning.boat.unwrap_or(BOAT);
+            // Its springs at its body's shape's box's corners (0x82199328
+            // takes the box from the body's shape), else its hull's.
+            let (lo, hi) = spec
+                .shapes
+                .iter()
+                .flatten()
+                .fold(None, |b: Option<(Vec3, Vec3)>, &p| {
+                    Some(b.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))))
+                })
+                .unwrap_or((lo, hi));
+            let lean = water.float.roll.sin() * (hi.x - lo.x) * 0.5;
+            let lift = water.float.pitch.sin() * (hi.z - lo.z);
+            let springs = [
+                (Vec3::new(lo.x, 0.0, hi.z), lean, lift),
+                (Vec3::new(hi.x, 0.0, hi.z), -lean, lift),
+                (Vec3::new(lo.x, 0.0, lo.z), lean, 0.0),
+                (Vec3::new(hi.x, 0.0, lo.z), -lean, 0.0),
+            ];
             Hull {
                 points,
+                springs,
+                wet: [None; 4],
+                helm: 0.0,
+                lean: 0.0,
+                lift: 0.0,
                 controls: VehicleControls::default(),
-                water: spec.tuning.boat.unwrap_or(BOAT),
+                water,
             }
         });
         let rotor = spec
@@ -5811,6 +5923,11 @@ mod tests {
                     brake: 3.0,
                     curve: [1.0, 0.7, 0.6, 0.5],
                     hull_friction: 0.3,
+                    float: BoatFloat {
+                        top: 120.0 / 3.6,
+                        reverse: 40.0 / 3.6,
+                        ..BoatFloat::DEFAULT
+                    },
                 }),
                 ..crate::VehicleTuning::default()
             },
@@ -5873,16 +5990,32 @@ mod tests {
         .unwrap();
         p.add_static(StaticKey::Cell(1), &bed, Vec3::ZERO, Quat::IDENTITY);
         p.step(DT);
-        let id = p.add_vehicle(&boat(), Vec3::new(0.0, water + 1.5, -200.0), 0.0);
+        // A boat that leans 0.2 rad into its turns and lifts its bow 0.06
+        // under throttle (the Gar's, its springs the 360 record's defaults).
+        let mut spec = boat();
+        spec.tuning.boat = Some(BoatTuning {
+            float: BoatFloat {
+                roll: 0.2,
+                pitch: 0.06,
+                ..BoatFloat::DEFAULT
+            },
+            ..BOAT
+        });
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, water + 1.5, -200.0), 0.0);
         let place = |p: &Physics| p.vehicle_transform(id).unwrap();
         for _ in 0..600 {
             p.drive(id, VehicleControls::default());
             p.step(DT);
         }
-        // Afloat, level, its origin about as deep as the layers put boats.
+        // Afloat, level, its origin as deep as its springs hold it: their
+        // bottoms at its origin, 9.81 / (4 x 5) m under the water.
         let m = place(&p);
         let y = m.w_axis.y;
-        assert!((y - (water - FLOAT_DEPTH)).abs() < 0.15, "floats at {y}");
+        assert!((float_depth(&spec) - 0.49).abs() < 0.01);
+        assert!(
+            (y - (water - float_depth(&spec))).abs() < 0.05,
+            "floats at {y}"
+        );
         assert!(m.transform_vector3(Vec3::Y).y > 0.99, "level");
         // Flat out ahead.
         for _ in 0..360 {
@@ -5903,14 +6036,10 @@ mod tests {
             "at {}",
             m.w_axis
         );
-        // Planing: riding higher than at rest, bow up.
-        assert!(
-            m.w_axis.y > water - FLOAT_DEPTH + 0.1 && m.w_axis.y < water + 0.3,
-            "planes at {}",
-            m.w_axis.y
-        );
+        // Under throttle its bow springs feel the water up to 6% of its
+        // length higher: bow up.
         let bow = m.transform_vector3(Vec3::Z).y;
-        assert!((0.02..0.2).contains(&bow), "bow up {bow}");
+        assert!((0.005..0.1).contains(&bow), "bow up {bow}");
         // Steering turns it as steering a tank does: positive steer, a
         // positive turn about up.
         let before = m.transform_vector3(Vec3::Z);
@@ -5928,6 +6057,9 @@ mod tests {
         let after = place(&p).transform_vector3(Vec3::Z);
         let turned = after.x.atan2(after.z) - before.x.atan2(before.z);
         assert!(turned > 0.8, "turned {turned}");
+        // Leaning into the turn: its port side (+x) down.
+        let port = place(&p).transform_vector3(Vec3::X).y;
+        assert!(port < -0.02, "leans {port}");
         // Straight on at the beach: it runs aground and stops there,
         // still upright.
         for _ in 0..120 {
