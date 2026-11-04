@@ -65,7 +65,27 @@ pub struct HeliPilot {
     pub steer_climb: f32,
     pub steering: f32,
     pub blocked: f32,
+    /// It has been off the ground half a second or more (the mind's
+    /// +0x70D bit 0x80, from its physics' ground time, 0x822BCDC8).
+    pub airborne: bool,
+    /// What it carries slung under it, if anything ([`Slung`]).
+    pub load: Option<Slung>,
     thought: bool,
+}
+
+/// A load slung under a helicopter, as its pilot's state keeps it
+/// (+0xB0 its place, +0xBC the load, flag 0x04 of +0xD0).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Slung {
+    /// Where the load is.
+    pub at: Vec3,
+    /// How far its underside hangs under the helicopter's origin, m (the
+    /// 360: its hook's offset plus 0.75 of the load's largest side,
+    /// 0x822BCDC8).
+    pub below: f32,
+    /// It hangs under the helicopter: within 2 m of it across, and the
+    /// hook within 4 m of where it should be (0x822BCDC8's flag 0x04).
+    pub under: bool,
 }
 
 /// `x` held to -1..1, as each controller holds its message.
@@ -143,6 +163,8 @@ impl HeliPilot {
             steer_climb: 0.0,
             steering: 0.0,
             blocked: 0.0,
+            airborne: false,
+            load: None,
             thought: false,
         }
     }
@@ -169,7 +191,8 @@ impl HeliPilot {
         self.at = at;
         self.turn = turn;
         self.heading = heading;
-        self.height = at.y;
+        // With a load its height is the load's underside's (+0x10).
+        self.height = at.y - self.load.map_or(0.0, |l| l.below);
         self.along = Vec3::new(
             velocity.dot(turn * Vec3::X),
             velocity.dot(turn * Vec3::Y),
@@ -268,6 +291,59 @@ impl HeliPilot {
         self.hold_across(across);
         self.stick.lift = unit((up - self.along.y) * 2.0);
         self.stick
+    }
+
+    /// Takes off (the task `HeliTakeoff`, 0x822AF2F8): the climb held
+    /// until it is 10 m over the ground and off it; then the climb let go
+    /// and done (`true`).
+    pub fn take_off(&mut self) -> (PilotStick, bool) {
+        if self.clearance < 10.0 || !self.airborne {
+            self.stick.lift = 1.0;
+            (self.stick, false)
+        } else {
+            self.stick.lift = 0.0;
+            (self.stick, true)
+        }
+    }
+
+    /// Delivers its load to `target` (the task `HeliDeliver`, 0x822AFA18,
+    /// for the scripts' `Ai.Deliver`, request 0x1A whose goal bit 40 only
+    /// it gives): over `half_wide` (0x2C0, half its wider side) away
+    /// across, it flies round things to the point; within 2 m across and
+    /// its load's underside within `drop` m over the ground (the order's
+    /// value, 0.5 when none, 0x822DC468), it lets go (`true`; the message
+    /// 0xB422F25E) and hovers its `MinAltitude` up; else it comes down
+    /// onto the point. With nothing slung it flies on 1000 m ahead the
+    /// way it heads (0x822AF900). The task never ends of itself. Which
+    /// of the facing and floor flags the 360 hands 0x822D43A8 and
+    /// 0x822D39F0 here is not traced (taken as below).
+    #[allow(clippy::too_many_arguments)]
+    pub fn deliver(
+        &mut self,
+        target: Vec3,
+        drop: f32,
+        half_wide: f32,
+        size: (f32, f32),
+        world: &mut dyn PilotWorld,
+        dt: f32,
+    ) -> (PilotStick, bool) {
+        let Some(load) = self.load else {
+            let ahead = Vec3::new(self.heading.sin(), 0.0, self.heading.cos());
+            let away = self.at + ahead * 1000.0;
+            let stick = self.fly_round_to(away, 1.0, true, true, size, world, dt);
+            return (stick, false);
+        };
+        let across = (target - load.at).with_y(0.0).length();
+        if across > half_wide {
+            self.face = self.heading;
+            let stick = self.fly_round_to(target, 1.0, true, false, size, world, dt);
+            return (stick, false);
+        }
+        if load.under && across <= 2.0 && self.clearance <= drop {
+            let stick = self.hover(self.tuning.min_altitude, true);
+            return (stick, true);
+        }
+        (self.fly_to(target, 1.0, false), false)
     }
 
     /// Comes down to land (0x822D4848): holds its heading, works to no
@@ -544,5 +620,97 @@ mod tests {
             p.steer_climb
         );
         assert_eq!(p.steering, 2.0);
+    }
+
+    // It takes off with the climb held until 10 m up and off the ground,
+    // then lets go of it (0x822AF2F8).
+    #[test]
+    fn it_takes_off_to_10_m() {
+        let mut p = pilot();
+        p.sense(
+            Vec3::new(0.0, 4.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::ZERO,
+            Some(0.0),
+            1.0 / 60.0,
+        );
+        p.airborne = true;
+        assert_eq!(
+            p.take_off(),
+            (
+                PilotStick {
+                    lift: 1.0,
+                    ..PilotStick::default()
+                },
+                false
+            )
+        );
+        p.sense(
+            Vec3::new(0.0, 11.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::ZERO,
+            Some(0.0),
+            1.0 / 60.0,
+        );
+        p.airborne = false;
+        assert!(!p.take_off().1);
+        p.airborne = true;
+        let (stick, done) = p.take_off();
+        assert!(done && stick.lift == 0.0);
+    }
+
+    struct Open;
+
+    impl PilotWorld for Open {
+        fn ground(&mut self, _: Vec3, _: Vec3) -> Option<Vec3> {
+            None
+        }
+        fn sweep(&mut self, _: Vec3, _: Quat, _: Vec3, _: Vec3, _: f32) -> f32 {
+            1.0
+        }
+    }
+
+    // Delivering, it lets its load go once over the point and its load's
+    // underside within the drop height, then hovers its `MinAltitude`
+    // up; with nothing slung it flies on ahead (0x822AFA18, 0x822AF900).
+    #[test]
+    fn it_lets_its_load_go_over_the_point_and_low() {
+        let mut p = pilot();
+        let target = Vec3::new(0.0, 0.0, 1.0);
+        p.load = Some(Slung {
+            at: Vec3::new(0.0, 0.3, 0.0),
+            below: 5.0,
+            under: true,
+        });
+        p.sense(
+            Vec3::new(0.0, 5.3, 0.0),
+            Quat::IDENTITY,
+            Vec3::ZERO,
+            Some(0.0),
+            1.0 / 60.0,
+        );
+        let (_, gone) = p.deliver(target, 0.5, 6.0, (3.0, 12.0), &mut Open, 1.0 / 60.0);
+        assert!(gone);
+        // Too high yet: it comes down onto the point.
+        p.sense(
+            Vec3::new(0.0, 9.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::ZERO,
+            Some(0.0),
+            1.0 / 60.0,
+        );
+        let (stick, gone) = p.deliver(target, 0.5, 6.0, (3.0, 12.0), &mut Open, 1.0 / 60.0);
+        assert!(!gone && stick.lift < 0.0, "{stick:?}");
+        // Unladen: on ahead, the way it heads.
+        p.load = None;
+        p.sense(
+            Vec3::new(0.0, 30.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::ZERO,
+            Some(0.0),
+            1.0 / 60.0,
+        );
+        let (stick, gone) = p.deliver(target, 0.5, 6.0, (3.0, 12.0), &mut Open, 1.0 / 60.0);
+        assert!(!gone && stick.ahead > 0.9, "{stick:?}");
     }
 }
