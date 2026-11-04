@@ -8,7 +8,7 @@
 //! no headway for a while she hops ahead (logged too): the run goes on to
 //! the later objectives, and the hops show where the way is blocked.
 
-use m2_engine::physics::{FLOAT_DEPTH, StaticKey};
+use m2_engine::physics::{StaticKey, float_depth};
 use m2_engine::road_graph::RoadGraph;
 use m2_engine::{Physics, Templates, VehicleControls, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
@@ -5609,7 +5609,7 @@ fn afloat_near(
 
 /// How deep a boat's keel floats under the water, metres.
 fn keel_depth(spec: &VehicleSpec) -> f32 {
-    FLOAT_DEPTH - spec.hull.0.y
+    float_depth(spec) - spec.hull.0.y
 }
 
 /// Whether something stands within `within` metres of a vehicle's

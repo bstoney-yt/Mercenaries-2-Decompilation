@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use m2_engine::atmosphere::{AtmosphereMix, ScriptAtmosphere};
 use m2_engine::durability::{BlastPush, CrashHow, Explosion};
-use m2_engine::physics::FLOAT_DEPTH;
+use m2_engine::physics::float_depth;
 use m2_engine::{
     CatalogueEntry, Install, Physics, StaticKey, Templates, VehicleControls, VehicleSpec, World,
 };
@@ -3941,11 +3941,11 @@ pub(crate) fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw:
     // Level, as deep as it floats, where the seabed is under its keel (or
     // hasn't loaded).
     let float = physics.water().filter(|&water| {
-        let keel = water - FLOAT_DEPTH + v.spec.hull.0.y;
+        let keel = water - float_depth(&v.spec) + v.spec.hull.0.y;
         v.spec.is_boat() && ground(at).is_none_or(|h| h < keel)
     });
     if let Some(water) = float {
-        let at = Vec3::new(at.x, water - FLOAT_DEPTH, at.z);
+        let at = Vec3::new(at.x, water - float_depth(&v.spec), at.z);
         v.id = Some(physics.add_vehicle_turned(&v.spec, at, Quat::from_rotation_y(yaw)));
         return true;
     }

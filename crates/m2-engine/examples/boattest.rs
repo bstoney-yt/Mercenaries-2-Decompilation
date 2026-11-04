@@ -77,6 +77,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         at("WaterDragSide"),
         at("EngineTorque"),
         at("EngineReverseTorque"),
+        at("SpringLoSpeedStartOffset"),
+        at("SpringLoSpeedEndOffset"),
+        at("SpringLoSpeedStrength"),
     ];
     let mut groups: BTreeMap<Floated, Vec<u32>> = BTreeMap::new();
     for (id, r) in c.records().unwrap_or_default() {
@@ -87,7 +90,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "template\tcount\tmass\ttorque\treverse torque\t\
          data top\ttop\tt90 s\tdata reverse\treverse\t\
-         data coast\tcoast\tdata brake\tbrake\tdata side\tside\tturn deg/s\theel deg"
+         data coast\tcoast\tdata brake\tbrake\tdata side\tside\tturn deg/s\theel deg\t\
+         360 rest m\trest m\tbob m\ttrim deg	keel m	deck m"
     );
     let (mut floated, mut skipped) = (0, 0);
     for ((model, record), ids) in &groups {
@@ -117,7 +121,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             at.and_then(|a| record.get(a..a + 4))
                 .map_or(f32::NAN, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         };
-        let [top, reverse, fwd, brake, side, torque, back] = fields.map(f);
+        let [
+            top,
+            reverse,
+            fwd,
+            brake,
+            side,
+            torque,
+            back,
+            start_at,
+            end_at,
+            strength,
+        ] = fields.map(f);
+        // Where the 360 code's springs (0x82199EA8) hold it level and still:
+        // its four push its weight up, each its strength x mass x how far
+        // the water stands over the bottom of its spring.
+        let want_rest = start_at.min(end_at) + m2_engine::physics::GRAVITY / (4.0 * strength);
+        let (rest, bob) = resting(&spec);
+        let trim = trimmed(&spec);
         let (top, reverse) = (top / 3.6, reverse / 3.6);
         let (got_top, t90) = flat_out(&spec, 1.0, AHEAD, top);
         let (got_reverse, _) = flat_out(&spec, -1.0, ASTERN, reverse);
@@ -128,10 +149,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "{name}\t{}\t{}\t{torque}\t{back}\t{top:.2}\t{got_top:.2}\t{t90:.1}\t\
              {reverse:.2}\t{got_reverse:.2}\t{fwd:.3}\t{coast:.3}\t{:.3}\t{braking:.3}\t\
-             {side:.3}\t{sliding:.3}\t{turn:.1}\t{tilt:.1}",
+             {side:.3}\t{sliding:.3}\t{turn:.1}\t{tilt:.1}\t{want_rest:.2}\t{rest:.2}\t\
+             {bob:.3}\t{trim:.1}	{:.2}	{:.2}",
             ids.len(),
             spec.mass,
             fwd + brake,
+            rest - spec.hull.0.y,
+            spec.hull.1.y - rest,
         );
     }
     println!("floated {floated}, skipped {skipped}");
@@ -148,6 +172,51 @@ fn start(spec: &VehicleSpec) -> (Physics, VehicleId) {
         p.step(DT);
     }
     (p, id)
+}
+
+/// Left alone a further 5 s after [`start`]: how deep its origin rests
+/// under the water over the last 2 s, m, and how far it bobs over them
+/// (highest less lowest), m.
+fn resting(spec: &VehicleSpec) -> (f32, f32) {
+    let (mut p, id) = start(spec);
+    let (mut sum, mut n, mut lo, mut hi) = (0.0, 0.0, f32::INFINITY, f32::NEG_INFINITY);
+    for i in 0..(5.0 / DT) as usize {
+        p.drive(id, VehicleControls::default());
+        p.step(DT);
+        if i as f32 * DT >= 3.0 {
+            let y = p.vehicle_transform(id).map_or(0.0, |m| m.w_axis.y);
+            sum += -y;
+            n += 1.0;
+            lo = lo.min(y);
+            hi = hi.max(y);
+        }
+    }
+    (sum / n, hi - lo)
+}
+
+/// Flat out ahead for 20 s: how far its bow is up over the last 5,
+/// degrees (negative down).
+fn trimmed(spec: &VehicleSpec) -> f32 {
+    let (mut p, id) = start(spec);
+    let (mut sum, mut n) = (0.0, 0.0);
+    for i in 0..(20.0 / DT) as usize {
+        p.drive(
+            id,
+            VehicleControls {
+                throttle: 1.0,
+                ..VehicleControls::default()
+            },
+        );
+        p.step(DT);
+        if i as f32 * DT >= 15.0 {
+            let ahead = p
+                .vehicle_transform(id)
+                .map_or(Vec3::Z, |m| m.transform_vector3(Vec3::Z));
+            sum += ahead.y.clamp(-1.0, 1.0).asin().to_degrees();
+            n += 1.0;
+        }
+    }
+    sum / n
 }
 
 /// Its speed along its heading, m/s (negative backing up).
