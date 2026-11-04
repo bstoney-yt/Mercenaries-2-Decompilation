@@ -1120,6 +1120,11 @@ pub struct StartPoint {
     pub rotation: Quat,
 }
 
+/// How near the player a boat on its own patrol comes out, metres (the
+/// alpha's reach for the scripts' vehicles, `mission::VEHICLE_REACH`;
+/// its `HibernationControl`, which may say, is not read). Invented.
+pub const PATROL_BOAT_REACH: f32 = 300.0;
+
 /// A spawner of vehicles a layer places: a `PointTraffic_*` roadblock
 /// or a `PathSpawner_*`, which spawns from its list every so often while
 /// the player is near; what it spawns drives its patrol path, if it has
@@ -1992,6 +1997,44 @@ impl WorldIndex {
                     .get(&entity)
                     .or_else(|| population.haste.get(&p.parent))
                     .copied(),
+            });
+        }
+        // A boat placed on its own patrol (its own `AiPatrol`: the Allied
+        // MarkVs off ChiJob009's beach, Huangfengs, cutters): it is out
+        // while its layer is in and drives its path, once, not
+        // respawned; within [`PATROL_BOAT_REACH`] of the player.
+        for (&entity, p) in &layer.placements() {
+            let Some(&haste) = own_haste.get(&entity) else {
+                continue;
+            };
+            let stem = member_stem(names.get(&entity).copied().unwrap_or(""));
+            let template = match templates.get(stem) {
+                Some(t) => Some((stem, t)),
+                None => templates.by_id(p.parent),
+            };
+            let Some((name, info)) = template else {
+                continue;
+            };
+            if info.vehicle != Some(VehicleKind::Boat) || info.model.is_none() {
+                continue;
+            }
+            self.traffic.push(TrafficPoint {
+                entity,
+                name: stem.to_owned(),
+                position: Vec3::from(p.position),
+                rotation: rotation(p.rotation),
+                layer: Some(layer_hash),
+                static_layer: is_static,
+                spawner: crate::population::Spawner {
+                    list: 0,
+                    seconds_per_cycle: f32::INFINITY,
+                    active_radius: PATROL_BOAT_REACH,
+                    kind: 0,
+                    far: None,
+                },
+                vehicles: vec![(name.to_owned(), 1.0)],
+                route: Vec::new(),
+                haste: Some(haste),
             });
         }
     }

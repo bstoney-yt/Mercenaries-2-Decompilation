@@ -127,7 +127,9 @@ impl Traffic {
         // A vehicle that loaded is out; a wreck frees its spawner.
         let mut out: HashSet<u32> = HashSet::new();
         for v in &scene.vehicles {
-            if let Some((e, _, _)) = v.spot
+            // Its own, or one of the scripts' that is one of its placed
+            // patrol boats (loaded for them first).
+            if let Some(e) = v.spot.map(|(e, _, _)| e).or(v.guid)
                 && self.points.contains_key(&e)
             {
                 self.loading.remove(&e);
@@ -222,7 +224,7 @@ impl Traffic {
         driven: Option<usize>,
     ) {
         for (i, v) in vehicles.iter().enumerate() {
-            let (Some((entity, _, _)), Some(id)) = (v.spot, v.id) else {
+            let (Some(entity), Some(id)) = (v.spot.map(|(e, _, _)| e).or(v.guid), v.id) else {
                 continue;
             };
             let Some(point) = self.points.get(&entity) else {
@@ -484,5 +486,118 @@ mod tests {
         assert_eq!(nearest_ahead(&route, Vec3::new(1.0, 0.0, 55.0)), 2);
         assert_eq!(nearest_ahead(&route, Vec3::new(1.0, 0.0, 45.0)), 1);
         assert_eq!(nearest_ahead(&route, Vec3::new(0.0, 0.0, -10.0)), 0);
+    }
+
+    // A boat on its own patrol, loaded for the scripts (its guid the
+    // patrol's entity), drives its path round on the water.
+    #[test]
+    fn a_patrol_boat_drives_its_path() {
+        use m2_engine::{Physics, VehicleSpec, VehicleTuning};
+        let hull = (Vec3::new(-1.2, -0.7, -3.0), Vec3::new(1.2, 1.0, 3.0));
+        let spec = VehicleSpec {
+            model: 1,
+            kind: m2_engine::vehicle::BOAT.into(),
+            label: "test".into(),
+            node_names: Vec::new(),
+            armed: Vec::new(),
+            wheels: Vec::new(),
+            bounds: hull,
+            seat: None,
+            door: None,
+            seating: None,
+            entrances: Vec::new(),
+            tracked: false,
+            road_wheels: Vec::new(),
+            rest: Vec::new(),
+            node_wheel: Vec::new(),
+            node_rolls: Vec::new(),
+            mass: 2_000.0,
+            turret: Vec::new(),
+            pivot: None,
+            muzzle: None,
+            gun: Vec::new(),
+            gun_pivot: None,
+            muzzle_on_gun: false,
+            elevation: (0.0, 0.0),
+            hull,
+            turret_box: None,
+            rotors: Vec::new(),
+            tilts: Vec::new(),
+            bomb_bay: None,
+            node_parents: Vec::new(),
+            aimers: Vec::new(),
+            damage: None,
+            chassis: None,
+            shapes: Default::default(),
+            material: None,
+            turret_shapes: Default::default(),
+            wreck: None,
+            tuning: VehicleTuning::default(),
+        };
+        let mut physics = Physics::new();
+        physics.set_water(0.0);
+        let id = physics.add_vehicle(&spec, Vec3::new(0.0, -0.5, 0.0), 0.0);
+        let route = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 60.0),
+            Vec3::new(60.0, 0.0, 60.0),
+            Vec3::new(60.0, 0.0, 0.0),
+        ];
+        let mut traffic = Traffic::default();
+        traffic.points.insert(
+            7,
+            TrafficPoint {
+                entity: 7,
+                name: "MarkV (Full) (Allied)".into(),
+                position: Vec3::ZERO,
+                rotation: m2_math::glam::Quat::IDENTITY,
+                layer: None,
+                static_layer: false,
+                spawner: m2_engine::population::Spawner {
+                    list: 0,
+                    seconds_per_cycle: f32::INFINITY,
+                    active_radius: m2_engine::world::PATROL_BOAT_REACH,
+                    kind: 0,
+                    far: None,
+                },
+                vehicles: vec![("MarkV (Full) (Allied)".into(), 1.0)],
+                route,
+                haste: Some(0.5),
+            },
+        );
+        let vehicles = vec![crate::scene::ParkedVehicle {
+            spec,
+            model: crate::npc::tests::empty_model(),
+            id: Some(id),
+            wrecked: false,
+            guid: Some(7),
+            spot: None,
+            crew: Vec::new(),
+            turret: 0.0,
+            hijack_nodes: Vec::new(),
+            door_turns: Vec::new(),
+            gun: 0.0,
+            aims: Vec::new(),
+            rolled: 0.0,
+            fired: 0,
+            mg_fired: 0,
+            damage: 0.0,
+            parts: None,
+            loose: Vec::new(),
+            debris_thrown: false,
+        }];
+        let dt = 1.0 / 60.0;
+        let mut passed = 0;
+        let mut last = 0;
+        for _ in 0..(90.0 / dt) as usize {
+            traffic.drive(&mut physics, &vehicles, None);
+            physics.step(dt);
+            let next = traffic.next.get(&7).map_or(0, |n| n.0);
+            if next != last {
+                passed += 1;
+                last = next;
+            }
+        }
+        assert!(passed >= 3, "passed {passed} waypoints");
     }
 }
