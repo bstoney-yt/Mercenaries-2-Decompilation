@@ -619,6 +619,17 @@ struct Playing {
     /// Keeps the pelvis at this height, metres (a jump: the body rises in
     /// the game's physics, not in the clip).
     level: Option<f32>,
+    /// A gait of the locomotion node: its length, seconds. Gaits keep in
+    /// step ([`Animator::play_gait`]).
+    gait: Option<f32>,
+}
+
+impl Playing {
+    /// How far through its stride a gait is, 0 to 1.
+    fn phase(&self) -> Option<f32> {
+        let length = self.gait.filter(|l| *l > 1e-3)?;
+        Some((self.time / length).rem_euclid(1.0))
+    }
 }
 
 /// A clip the upper body plays over the rest (a rifle held while the legs
@@ -646,6 +657,9 @@ pub struct Animator {
     action: Option<u32>,
     /// A blend time a script gave the next action change, used once.
     next_blend: Option<f32>,
+    /// How far through its stride the last gait was, 0 to 1: the next
+    /// gait starts there (the node keeps it, 0x82808018).
+    stride: f32,
 }
 
 impl Default for Animator {
@@ -658,6 +672,7 @@ impl Default for Animator {
             upper: None,
             action: None,
             next_blend: None,
+            stride: 0.0,
         }
     }
 }
@@ -690,6 +705,52 @@ impl Animator {
     /// ground.
     pub fn play_leveled(&mut self, index: usize, hips: f32, action: u32) {
         self.start(index, true, Some(hips), action);
+    }
+
+    /// Plays clip `index`, `length` seconds long, looped as a gait of the locomotion
+    /// node, in the `Idle` action: from another gait it fades over
+    /// [`blend::GAIT`] and starts at the same point of its stride, and the
+    /// two keep in step while they blend; from an action it fades as
+    /// [`play`](Self::play) does. See [`blend`]'s locomotion.
+    pub fn play_gait(&mut self, index: usize, length: f32) {
+        if let Some(c) = self.current.as_mut()
+            && c.clip == index
+            && !c.once
+            && c.level.is_none()
+        {
+            c.gait = Some(length);
+            return;
+        }
+        let from_gait = self.current.is_some_and(|c| c.gait.is_some())
+            && self.action == Some(blend::action::IDLE);
+        if let Some(p) = self.current.and_then(|c| c.phase()) {
+            self.stride = p;
+        }
+        if !from_gait {
+            self.start(index, false, None, blend::action::IDLE);
+            if let Some(c) = self.current.as_mut() {
+                c.gait = Some(length);
+                c.time = self.stride * length;
+            }
+            return;
+        }
+        self.fade_time = blend::GAIT;
+        // For play checks: gait changes, and the stride they carry over.
+        eprintln!(
+            "anim: gait {} -> {index} over {:.2} s at stride {:.2}",
+            self.current.map_or(0, |c| c.clip),
+            blend::GAIT,
+            self.stride
+        );
+        self.previous = self.current;
+        self.current = Some(Playing {
+            clip: index,
+            time: self.stride * length,
+            once: false,
+            level: None,
+            gait: Some(length),
+        });
+        self.fade = 0.0;
     }
 
     /// Makes the next clip change fade over `seconds` instead of the
@@ -736,6 +797,7 @@ impl Animator {
             time: 0.0,
             once,
             level,
+            gait: None,
         });
         self.fade = if self.previous.is_some() && self.fade_time >= blend::INSTANT {
             0.0
@@ -828,6 +890,16 @@ impl Animator {
             .flatten()
         {
             c.time += dt;
+        }
+        // Gaits blending keep in step: the one fading out is set to the
+        // point of its stride the one playing is at (0x82808468).
+        if let (Some(p), Some(prev)) = (self.current.and_then(|c| c.phase()), &mut self.previous)
+            && let Some(length) = prev.gait
+        {
+            prev.time = p * length;
+        }
+        if let Some(p) = self.current.and_then(|c| c.phase()) {
+            self.stride = p;
         }
         self.fade = if self.fade_time < blend::INSTANT {
             1.0
@@ -1102,6 +1174,39 @@ mod tests {
         assert_eq!(anim.upper.as_ref().map(|u| u.time), Some(0.5));
         anim.set_upper(None);
         assert!(anim.upper.is_none());
+    }
+
+    #[test]
+    fn gaits_keep_in_step_through_their_blend() {
+        use crate::blend::{GAIT, QUICK, action::JUMP_LAND_MOVING};
+        let mut anim = Animator::default();
+        // A walk 1.2 s long, 0.3 s in: a quarter of its stride.
+        anim.play_gait(0, 1.2);
+        anim.advance(0.3);
+        // Into the jog (0.8 s long): 0.3 s, starting a quarter in.
+        anim.play_gait(1, 0.8);
+        assert_eq!((anim.fade, anim.fade_time()), (0.0, GAIT));
+        let (clip, t) = anim.current().unwrap();
+        assert_eq!(clip, 1);
+        assert!((t - 0.2).abs() < 1e-5, "{t}");
+        // The walk follows the jog's stride while it fades out.
+        anim.advance(0.16);
+        let walk = anim.previous.unwrap();
+        assert!((walk.time - 0.54).abs() < 1e-4, "{}", walk.time);
+        assert!((anim.fade - 0.16 / GAIT).abs() < 1e-5);
+        anim.advance(0.15);
+        assert!(anim.previous.is_none());
+        // The same gait again changes nothing.
+        anim.play_gait(1, 0.8);
+        assert_eq!(anim.fade, 1.0);
+        // From an action the action's blend holds, and the gait picks up
+        // the stride it left.
+        anim.play_action(5, true, JUMP_LAND_MOVING);
+        anim.play_gait(0, 1.2);
+        assert_eq!(anim.fade_time(), QUICK);
+        let (_, t) = anim.current().unwrap();
+        // The jog stopped 0.51 s in, 0.6375 of its stride.
+        assert!((t - 0.6375 * 1.2).abs() < 1e-4, "{t}");
     }
 
     #[test]

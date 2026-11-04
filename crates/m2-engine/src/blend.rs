@@ -56,10 +56,39 @@
 //! - the script override (nothing calls it yet);
 //! - how any of it looks (no frame-stepped comparison with PC footage).
 //!
-//! Not from the original: the beta's clips are not all driven by human
-//! states. Locomotion within `Idle` (idle, walk, run, sprint) is blended by
-//! a separate original locomotion node not traced yet; the beta crossfades
-//! those changes with [`DEFAULT`] (Invented, the action blend standing in).
+//! # Locomotion
+//!
+//! Within `Idle` a stance's locomotion node plays the gaits ([`gait`],
+//! [`GAIT`]). From the 360 code: the driver builds the node per stance
+//! (0x8241F878: `Upright` 0x82802B10, `Crouched` 0x8280EC68, `Swim`
+//! 0x827F9890, all one class), blending into a new stance's node over
+//! [`DEFAULT`] (0 into `InVehicle`). The node's step (0x828071A8) keeps
+//! it in one of three modes: moving forward (enter 0x82808018, step
+//! 0x82808468), moving backward, or standing (enter 0x82809B98), standing
+//! when its speed is at most [`STILL`].
+//!
+//! Moving, it picks a gait from its speed (0x82807F70, [`gait`]) between
+//! thresholds set halfway between the template's `_HumanPhysics` paces
+//! (0x828070D0). On a change it fades the old gait's weights out and the
+//! new one's in over [`GAIT`] seconds, linearly (0x827FA6F0 and
+//! 0x827FA620, the same fade as the actions'); going between standing and
+//! moving fades over the same 0.3 s (the float at 0x8206F940). Every gait
+//! clip plays at the same point of its stride: the gait playing is moved
+//! on by `dt * speed / clip speed` and the others are set to the same
+//! fraction of their length (the tail of 0x82808468), so the feet stay in
+//! step through a blend. A clip of no measurable speed counts as 1, 2.5,
+//! 5 and 5 m/s for the four gaits.
+//!
+//! The four gaits' handles are the node's list at 0x82B4DA98:
+//! `Upright_Walk_Forward`, `Upright_Jog_Forward`, `Upright_Run_Forward`
+//! and `Upright_Sprint_Forward` (entries 10 to 7, matched by name hash).
+//! The beta has no sprint clip bound, so its [`LocoGait::Sprint`] plays the
+//! run's (not from the original).
+//!
+//! **Not ported**: the backward mode's gaits, the node's lean and the
+//! turn-in-place clips of the standing mode, and the carry gaits (the
+//! node's second set, picked by a flag in the human state, with its own
+//! threshold halfway between `CarryWalkSpeed` and `CarryJogSpeed`).
 
 /// The blend into most actions, seconds.
 pub const DEFAULT: f32 = 0.2;
@@ -70,6 +99,56 @@ pub const QUICK: f32 = 0.066_67;
 
 /// Fades shorter than this snap.
 pub const INSTANT: f32 = 1e-4;
+
+/// The locomotion node's fade between gaits, and between standing and
+/// moving, seconds: the program's floats at 0x8206F93C and 0x8206F940.
+pub const GAIT: f32 = 0.3;
+
+/// The locomotion node stands when its speed is at most this, m/s (the
+/// float at 0x82052394, compared in 0x828071A8).
+pub const STILL: f32 = 0.01;
+
+/// The node's gait threshold above the run when the template has no
+/// faster sprint (the float at 0x82108BFC, as 0x828070D0 stores it).
+const NO_SPRINT: f32 = 2.003_358;
+
+/// A gait the locomotion node plays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LocoGait {
+    Still,
+    Walk,
+    Jog,
+    Run,
+    Sprint,
+}
+
+/// The gait the locomotion node plays moving `speed` m/s with the
+/// template's `Upright` paces `[walk, jog, run, sprint]` (0x82807F70
+/// with the thresholds of 0x828070D0): below halfway from walk to jog it
+/// walks, below halfway from jog to run it jogs, below halfway from run to
+/// sprint it runs, and otherwise sprints. With no sprint faster than the
+/// run, the last threshold is a constant below the others, so anything at
+/// or past the jog-to-run threshold sprints.
+pub fn gait(paces: [f32; 4], speed: f32) -> LocoGait {
+    if speed <= STILL {
+        return LocoGait::Still;
+    }
+    let [walk, jog, run, sprint] = paces;
+    let fast = if sprint > run {
+        (run + sprint) * 0.5
+    } else {
+        NO_SPRINT
+    };
+    if speed < (walk + jog) * 0.5 {
+        LocoGait::Walk
+    } else if speed < (jog + run) * 0.5 {
+        LocoGait::Jog
+    } else if speed < fast {
+        LocoGait::Run
+    } else {
+        LocoGait::Sprint
+    }
+}
 
 /// Action name hashes the blend times depend on.
 pub mod action {
@@ -208,6 +287,29 @@ mod tests {
             assert_eq!(time(Some(IDLE), next), QUICK, "{next:08x}");
         }
         assert!((QUICK - 1.0 / 15.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn gaits_change_halfway_between_the_paces() {
+        use super::{LocoGait::*, gait};
+        // Jennifer: 2, 5, 7 and 12 m/s; thresholds 3.5, 6 and 9.5.
+        let jen = [2.0, 5.0, 7.0, 12.0];
+        assert_eq!(gait(jen, 0.0), Still);
+        assert_eq!(gait(jen, 0.01), Still);
+        assert_eq!(gait(jen, 3.49), Walk);
+        assert_eq!(gait(jen, 3.5), Jog);
+        assert_eq!(gait(jen, 5.99), Jog);
+        assert_eq!(gait(jen, 6.0), Run);
+        assert_eq!(gait(jen, 9.49), Run);
+        assert_eq!(gait(jen, 9.5), Sprint);
+        // The program's defaults, no sprint: 1.85, then 3.75 and on.
+        let people = [1.2, 2.5, 5.0, -1.0];
+        assert_eq!(gait(people, 1.84), Walk);
+        assert_eq!(gait(people, 1.85), Jog);
+        assert_eq!(gait(people, 3.74), Jog);
+        assert_eq!(gait(people, 3.75), Sprint);
+        assert_eq!(gait(people, 5.0), Sprint);
+        assert_eq!((super::GAIT, super::STILL), (0.3, 0.01));
     }
 
     #[test]

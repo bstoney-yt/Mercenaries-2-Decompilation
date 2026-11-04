@@ -1781,13 +1781,9 @@ impl Npc {
             wanted.x.atan2(wanted.z)
         };
         let off = self.turn_to(face, dt);
-        let gait = if moved < 0.3 {
-            Gait::Idle
-        } else if moved > 2.5 {
-            Gait::Run
-        } else {
-            Gait::Walk
-        };
+        // The 360's locomotion node picks the gait from his speed
+        // ([`loco_gait`](crate::scene::loco_gait)).
+        let gait = crate::scene::loco_gait(self.motion.paces, moved);
         // He aims only at her before him: the aim turns his whole drawn body
         // onto her, and with her behind him that turn wrapped between
         // +180 and -180 degrees tick by tick, so soldiers she drove round
@@ -2263,13 +2259,9 @@ impl Npc {
         if let Some(target) = face {
             self.turn_to(target, dt);
         }
-        let gait = if moved < 0.3 {
-            Gait::Idle
-        } else if moved > 2.5 {
-            Gait::Run
-        } else {
-            Gait::Walk
-        };
+        // The 360's locomotion node picks the gait from his speed
+        // ([`loco_gait`](crate::scene::loco_gait)).
+        let gait = crate::scene::loco_gait(self.motion.paces, moved);
         if self.soldier {
             let clips = self.clips;
             self.rig.hold_rifle(gait, &clips, Carry::Ready);
