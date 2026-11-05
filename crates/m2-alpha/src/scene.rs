@@ -129,6 +129,9 @@ pub struct Rig {
     /// A hero's: the name hashes of the clips only in the other heroes'
     /// own groups, which this hero never plays.
     pub foreign: Arc<HashSet<u32>>,
+    /// A person's: the on-foot table's clip for them of each generic
+    /// clip the alpha names ([`Rig::for_character`]), by name hash.
+    pub theirs: Arc<HashMap<u32, u32>>,
     /// A hero's: the clip the hero aims with ([`Rig::set_aim_clip`]),
     /// which the weapons' grip and the aim's hands are read from. `None`:
     /// the aim clip by name.
@@ -175,6 +178,29 @@ fn hero_clips(source: &AssetSource<BufReader<File>>, hero: Hero) -> (HashSet<u32
         }
     }
     (allowed, own)
+}
+
+/// The class (`PrimaryEquipmentClass`) a person of template `role` asks
+/// the on-foot table for: their gun's `Equipment` carry class, a rifle's
+/// where it names none or for a catalogue role (the AK47 they stand in
+/// with); with no weapon at all, the table's unarmed class, as the 360's
+/// query fills in (828011C0). Which of several weapons is the primary
+/// one is inferred: the gun the alpha hands them
+/// ([`m2_engine::world::Templates::rifle_of`]).
+fn carried_class(db: &m2_engine::world::Templates, role: &str, named: bool) -> u32 {
+    use m2_assets::animation_table::{RIFLE, UNARMED};
+    if !named {
+        return RIFLE;
+    }
+    match db.own_rifle(role) {
+        Some((_, gun)) => db
+            .arms
+            .weapons
+            .get(&gun.template)
+            .and_then(|w| w.class)
+            .unwrap_or(RIFLE),
+        None => UNARMED,
+    }
 }
 
 /// The gaits' keys in the on-foot animation table: the clip of each gait
@@ -695,7 +721,10 @@ impl Rig {
             .chain(&RIFLE_MOVING)
             .chain(&RIFLE_STANDING_FIRE)
             .chain(&RIFLE_MOVING_FIRE)
-            .filter_map(|&h| self.clips.iter().position(|c| c.hash == h));
+            .filter_map(|&h| {
+                let h = self.their_clip(h);
+                self.clips.iter().position(|c| c.hash == h)
+            });
         let mut wanted: Vec<usize> = locomotion
             .clips
             .values()
@@ -743,13 +772,70 @@ impl Rig {
             animator: Animator::default(),
             own: Default::default(),
             foreign: Default::default(),
+            theirs: self.theirs.clone(),
             aim_clip: None,
-            barrel: true,
+            barrel: self.barrel,
             scripted: None,
             gait: Gait::Idle,
             cues: Vec::new(),
             time_scales: self.time_scales.clone(),
         })
+    }
+
+    /// The clip this character plays where the alpha names generic clip
+    /// `hash` ([`for_character`](Self::for_character)).
+    pub fn their_clip(&self, hash: u32) -> u32 {
+        self.theirs.get(&hash).copied().unwrap_or(hash)
+    }
+
+    /// This (the people's) rig for a character of `HumanAnimationSet`
+    /// `who` holding a `class` weapon: every clip the alpha names, its
+    /// gaits, aim movement, shuffles, sweeps and fight clips, as the
+    /// on-foot table gives them the character
+    /// ([`m2_assets::animation_table::character_clip`]), where the rig
+    /// has that clip. The 360 picks them so for each character
+    /// (locomotion nodes 0x8280BA00 and 0x8280CCB0).
+    pub fn for_character(
+        &self,
+        on_foot: &m2_assets::animation_table::AnimationTable,
+        who: (u32, u32),
+        class: u32,
+    ) -> Self {
+        use m2_assets::animation_table::character_clip;
+        let pistol = class == m2_assets::name_hash("pistol");
+        use m2_engine::aim_sweep::{
+            RIFLE_MOVING, RIFLE_MOVING_FIRE, RIFLE_STANDING, RIFLE_STANDING_FIRE,
+        };
+        let index = |hash: u32| self.clips.iter().position(|c| c.hash == hash);
+        let pick = |key: u32| character_clip(on_foot, key, who, class, |c| index(c).is_some());
+        let mut theirs = HashMap::new();
+        let keys = npc::FightClips::TABLE_KEYS
+            .iter()
+            .map(|k| k.1)
+            .chain(npc::FightClips::AIM_GAITS)
+            .chain(npc::FightClips::AIM_SHUFFLES)
+            .chain(RIFLE_STANDING)
+            .chain(RIFLE_MOVING)
+            .chain(RIFLE_STANDING_FIRE)
+            .chain(RIFLE_MOVING_FIRE);
+        for key in keys {
+            if let Some(p) = pick(key).filter(|p| p.clip != key) {
+                theirs.insert(key, p.clip);
+            }
+        }
+        let mut rig = self.clone();
+        if let Some(locomotion) = &mut rig.locomotion {
+            for (gait, key) in GAIT_KEYS {
+                if let Some(i) = pick(key).and_then(|p| index(p.clip)) {
+                    locomotion.clips.insert(gait, i);
+                }
+            }
+        }
+        rig.theirs = Arc::new(theirs);
+        // As hers: no hand on the barrel of a pistol.
+        rig.barrel = !pistol;
+        rig.sweeps = Default::default();
+        rig
     }
 
     /// Its idle clip in words, and how far it turns on the spot; and the
@@ -810,6 +896,7 @@ impl Rig {
             cues: Vec::new(),
             own: Default::default(),
             foreign: Default::default(),
+            theirs: Default::default(),
             aim_clip: None,
             barrel: true,
             scripted: None,
@@ -826,6 +913,7 @@ impl Rig {
             locomotion: Locomotion::choose(&self.clips),
             own: Default::default(),
             foreign: Default::default(),
+            theirs: Default::default(),
             aim_clip: None,
             barrel: true,
             scripted: None,
@@ -990,6 +1078,7 @@ impl Rig {
             let find = |hs: [u32; 3]| -> Option<[usize; 3]> {
                 let mut out = [0; 3];
                 for (o, h) in out.iter_mut().zip(hs) {
+                    let h = self.their_clip(h);
                     *o = self.clips.iter().position(|c| c.hash == h)?;
                 }
                 Some(out)
@@ -1318,6 +1407,8 @@ pub struct Scene {
     /// everyone's clips give ([`Rig::shared`]). Made once: switching hero
     /// leaves the people be.
     people_rig: Option<Rig>,
+    /// The on-foot table the people's clips are picked from.
+    on_foot: Option<m2_assets::animation_table::AnimationTable>,
     /// Online co-op: the other player's hero ([`Scene::load_puppet`]).
     pub puppet: Option<crate::puppet::Puppet>,
     /// Drivable vehicles near the spawn.
@@ -2079,6 +2170,7 @@ impl Scene {
             hero: Hero::default(),
             outfit: None,
             people_rig: None,
+            on_foot: None,
             puppet: None,
             vehicles: Vec::new(),
             park: true,
@@ -2392,6 +2484,13 @@ impl Scene {
                     }
                 },
             };
+        }
+        if self.on_foot.is_none() {
+            use m2_assets::animation_table::{self as table, AnimationTable};
+            self.on_foot = source
+                .asset(table::CHARACTER_ANIMATIONS, table::ANIMATION_TABLE_TYPE)
+                .ok()
+                .and_then(|a| AnimationTable::parse(&a).ok());
         }
         // The clips by name, then as the on-foot table gives them the
         // hero, then the hero's own group's for those it doesn't.
@@ -2979,12 +3078,38 @@ impl Scene {
             }
             Loaded::Person(p, _, skeleton, named) => {
                 // The people's clips fit every human skeleton.
-                let template = self
-                    .people_rig
-                    .as_ref()
-                    .and_then(|rig| rig.for_skeleton(skeleton));
-                // A template's own gun (`EquipmentLink`); a role's none.
                 let db = self.world.as_ref().map(|w| &w.index.template_db);
+                // Their rows of the on-foot table, by their template's
+                // `HumanAnimationSet`, and what they hold.
+                let who = db
+                    .and_then(|db| db.animation_set(&p.role))
+                    .unwrap_or_default();
+                let held = db.map_or(m2_assets::animation_table::RIFLE, |db| {
+                    carried_class(db, &p.role, named)
+                });
+                let template = self.people_rig.as_ref().and_then(|rig| {
+                    let Some(table) = &self.on_foot else {
+                        return rig.for_skeleton(skeleton);
+                    };
+                    let theirs = rig.for_character(table, who, held);
+                    let gait = |g| {
+                        theirs
+                            .gait_clip(g)
+                            .map_or(0, |i: usize| theirs.clips[i].hash)
+                    };
+                    eprintln!(
+                        "person {}: set {:08x} {:08x}, holds {held:08x}: idle {:08x} walk {:08x} run {:08x}, {} clips by the table",
+                        p.role,
+                        who.0,
+                        who.1,
+                        gait(Gait::Idle),
+                        gait(Gait::Walk),
+                        gait(Gait::Run),
+                        theirs.theirs.len(),
+                    );
+                    theirs.for_skeleton(skeleton)
+                });
+                // A template's own gun (`EquipmentLink`); a role's none.
                 let gun = db
                     .filter(|_| named)
                     .and_then(|db| db.own_rifle(&p.role))
