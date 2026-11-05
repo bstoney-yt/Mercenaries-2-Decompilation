@@ -75,6 +75,8 @@ pub enum State {
     Turning,
     Charging,
     Stopping,
+    /// 6: hit hard by her, it faces her and stays.
+    UnderFire,
 }
 
 /// What the car sees of her this think.
@@ -186,6 +188,9 @@ pub struct CarAttack {
     pub way: Option<Vec3>,
     /// Its turn-round manoeuvre (+0x4C record, 0x822C8770).
     pub manoeuvre: Manoeuvre,
+    /// Her share of its hit memory (0x822FA988: damage over its health,
+    /// fading 0.1 a second, 0x822BE240; see [`feel`](Self::feel)).
+    pub hit: f32,
 }
 
 /// The cone she must be in for a line check, radians (0x822ACB28 asks
@@ -205,6 +210,13 @@ fn within(car: &CarState, p: Vec3, angle: f32) -> bool {
 }
 
 impl CarAttack {
+    /// Its hit memory over `dt`: `share` more of its health taken by her
+    /// (0x822FA988 adds damage over the victim's health), fading 0.1 a
+    /// second to nothing (0x822BE240).
+    pub fn feel(&mut self, share: f32, dt: f32) {
+        self.hit = (self.hit - dt * 0.1).max(0.0) + share;
+    }
+
     /// One think: `car` of `length` (its box along its heading), `crew`
     /// its crew's range if any are counted, her as `her`; `dt` the
     /// think's length.
@@ -223,6 +235,16 @@ impl CarAttack {
         self.check_wait -= dt;
         if her.unseen > 20.0 {
             return car_driver::slow_to_stop(car).unwrap_or_default();
+        }
+        // Its hit memory (0x822C2738 over the mind's +0x6CC records): her
+        // share past 0.3 sends it to state 6, kept at 0.5 while she is seen
+        // within 3 s, and cuts its timer to 2 s.
+        if self.hit > 0.3 {
+            if her.unseen < 3.0 {
+                self.hit = 0.5;
+            }
+            self.state = State::UnderFire;
+            self.timer = self.timer.min(2.0);
         }
         let dist2 = (her.at - car.at).length_squared();
         let near2 = (length * 5.0) * (length * 5.0);
@@ -308,6 +330,18 @@ impl CarAttack {
                         self.check_wait = 40.0;
                         self.timer = (world.rand() + 1.0) * 1.5;
                         return AiInput::default();
+                    }
+                }
+            }
+            State::UnderFire => {
+                let bearing = car_driver::wrap(
+                    car_driver::yaw(her.at - car.at) - car_driver::yaw(car.forward),
+                );
+                if !within(car, her.at, 0.785_25) {
+                    let dist = (her.at - car.at).with_y(0.0).length();
+                    match self.manoeuvre.think(car, length, bearing, dist, world) {
+                        Some(i) => out = Some(i),
+                        None => self.manoeuvre = Manoeuvre::Idle,
                     }
                 }
             }
@@ -465,5 +499,28 @@ mod tests {
             m.think(&c, 5.0, -0.5, 10.0, &mut Room(false, false))
                 .is_none()
         );
+    }
+
+    // Hit hard by her (more than 0.3 of its health, fading 0.1 a second):
+    // it faces her and stays, its timer cut to 2 s.
+    #[test]
+    fn hit_hard_it_faces_her() {
+        let mut a = CarAttack {
+            timer: 5.0,
+            ..CarAttack::default()
+        };
+        a.feel(0.2, 0.1);
+        let mut d = CarDriver::default();
+        let mut w = W {
+            r: 0.5,
+            clear: true,
+        };
+        a.think(&mut d, &car(0.0), 6.0, Some(50.0), &her(150.0), &mut w, 0.1);
+        assert_ne!(a.state, State::UnderFire);
+        a.feel(0.2, 0.1);
+        a.think(&mut d, &car(0.0), 6.0, Some(50.0), &her(150.0), &mut w, 0.1);
+        assert_eq!(a.state, State::UnderFire);
+        assert_eq!(a.hit, 0.5);
+        assert!(a.timer <= 2.0);
     }
 }

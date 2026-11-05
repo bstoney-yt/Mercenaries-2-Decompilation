@@ -141,6 +141,8 @@ pub enum State {
     Turning,
     Charging,
     Beside,
+    /// 6: hit hard by her, it faces her and backs off.
+    UnderFire,
 }
 
 /// One tank driver's `TankAttack` memory.
@@ -150,6 +152,8 @@ pub struct TankAttack {
     pub timer: f32,
     pub check_wait: f32,
     pub way: Option<Vec3>,
+    /// Her share of its hit memory.
+    pub hit: f32,
 }
 
 /// The tank: where and how it moves, its box (`length` along its heading,
@@ -183,10 +187,23 @@ pub fn beside(h: &Hull, at: Vec3) -> f32 {
 }
 
 impl TankAttack {
+    /// Its hit memory over `dt` ([`crate::car_attack::CarAttack::feel`]).
+    pub fn feel(&mut self, share: f32, dt: f32) {
+        self.hit = (self.hit - dt * 0.1).max(0.0) + share;
+    }
+
     /// One think at her (`her`), `dt` its length.
     pub fn think(&mut self, h: &Hull, her: &Sight, w: &mut impl AttackWorld, dt: f32) -> TankInput {
         self.timer -= dt;
         self.check_wait -= dt;
+        // Its hit memory, as `CarAttack`'s (0x822B6508 reads it alike).
+        if self.hit > 0.3 {
+            if her.unseen < 3.0 {
+                self.hit = 0.5;
+            }
+            self.state = State::UnderFire;
+            self.timer = self.timer.min(2.0);
+        }
         let car = &h.car;
         let dist2 = (her.at - car.at).with_y(0.0).length_squared();
         let near2 = (h.length * 5.0) * (h.length * 5.0);
@@ -278,6 +295,19 @@ impl TankAttack {
                     return stop(car).0;
                 }
                 return drive_to(car, her.at, 25.0, false);
+            }
+            State::UnderFire => {
+                // Her at its own height; not within 20 degrees, it turns to
+                // face her; facing her with room behind, it backs to 10 m
+                // behind where it is at up to 5 m/s.
+                let flat = Vec3::new(her.at.x, car.at.y, her.at.z);
+                if 0.349_f32.cos() >= (flat - car.at).normalize_or_zero().dot(car.forward) {
+                    return turn_to(car, flat).0;
+                }
+                if w.room(false, 0.7, 0.7) {
+                    return drive_to(car, car.at - car.forward * 10.0, 5.0, false);
+                }
+                follow = expired;
             }
             State::Beside => {
                 if side == 0.0 {
@@ -385,5 +415,18 @@ mod tests {
         let mut t = TankAttack::default();
         t.think(&hull(0.0), &her(0.0, -60.0), &mut w, 0.1);
         assert_eq!(t.state, State::Turning);
+    }
+
+    // Hit hard by her: facing her, it backs off; not facing her, it turns.
+    #[test]
+    fn hit_hard_it_backs_off() {
+        let mut t = TankAttack::default();
+        let mut w = W(0.5);
+        t.feel(0.4, 0.1);
+        let i = t.think(&hull(0.0), &her(0.0, 60.0), &mut w, 0.1);
+        assert_eq!(t.state, State::UnderFire);
+        assert!(i.throttle < 0.0, "{i:?}");
+        let i = t.think(&hull(0.0), &her(60.0, 0.0), &mut w, 0.1);
+        assert!(i.steer > 0.0 && i.throttle == 0.0, "{i:?}");
     }
 }

@@ -504,6 +504,8 @@ impl Pursuers {
                     unseen: 0.0,
                     vehicle: in_vehicle,
                 };
+                // What she has hit it for since the last think (0x822FA988).
+                p.tank.feel(std::mem::take(&mut v.hit), dt);
                 let state = p.tank.state;
                 let mut world = Look {
                     physics,
@@ -595,6 +597,7 @@ impl Pursuers {
                             dt,
                         ),
                     };
+                    p.attack.feel(std::mem::take(&mut v.hit), dt);
                     let state = p.attack.state;
                     let input = p.attack.think(
                         &mut p.driver,

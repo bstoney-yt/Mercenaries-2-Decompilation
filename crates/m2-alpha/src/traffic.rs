@@ -704,6 +704,7 @@ mod tests {
             fired: 0,
             mg_fired: 0,
             damage: 0.0,
+            hit: 0.0,
             parts: None,
             loose: Vec::new(),
             debris_thrown: false,
