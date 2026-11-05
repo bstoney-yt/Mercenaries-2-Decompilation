@@ -52,8 +52,8 @@
 //! ahead" is a ray 0.7 m out from its nose (0x822C8CB8 sweeps a box);
 //! her record's +0x5C is her distance. Not ported (never): the hit
 //! memory (state 6), the stuck check, the leash (+0x7BC), 0x822B5EC0's
-//! ordered point. Stand-in: its way (0x822BF7A8's path) is the straight
-//! line to the point.
+//! ordered point. Its way is 0x822BF7A8's path
+//! ([`AttackWorld::toward`], [`crate::path_search`]).
 
 use m2_math::glam::Vec3;
 
@@ -300,7 +300,8 @@ impl TankAttack {
                 self.way = None;
                 self.timer = w.rand() * 2.0 + 4.5;
             } else {
-                return drive_to(car, end, 10.0, false);
+                let to = w.toward(car.at, end);
+                return drive_to(car, to, 10.0, false);
             }
         }
         stop(car).0

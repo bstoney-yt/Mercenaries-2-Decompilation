@@ -44,6 +44,7 @@ pub mod ordnance;
 pub mod osprey;
 pub mod osprey_mesh;
 pub mod particles;
+pub mod path_search;
 pub mod physics;
 pub mod pickup;
 pub mod population;
