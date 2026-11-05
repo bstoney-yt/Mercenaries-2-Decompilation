@@ -3278,7 +3278,7 @@ impl Scene {
                             (self.chunk_models.get(&emitter.model), nodes.get(*node))
                         {
                             let from = (at * *n).w_axis.truncate();
-                            // The flat card faces the eye (inferred).
+                            // The flat card faces the eye (0x821DCCE0).
                             let face = Mat4::from_quat(Quat::from_mat4(&view.view.inverse()));
                             let salt = (i + *node) as u32;
                             let now = self.began.elapsed().as_secs_f32();

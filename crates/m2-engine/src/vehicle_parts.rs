@@ -27,9 +27,17 @@
 //! card 0.38 m wide. Its settings are the data's: 25 a second, living 0.6
 //! s, `Size` falling from 1.2 to 0.1.
 //!
-//! Inferred, not traced: that the card faces the eye, that `Size` scales
-//! the model as it stands, and that the particles stay at the node (their
-//! speed is 0; the effect's inherited velocity is left out).
+//! From the 360 code: as an effect starts (0x821D7B10) each emitter looks
+//! its name up among the entity's `EffectModel` records and keeps the
+//! model (emitter +0x1fc) and the record's flag (+0x207). Each particle of
+//! such an emitter is then drawn as the model (0x821DCCE0), scaled evenly
+//! by its size at its age; with the flag set, as `fx_engineHeatHaze`'s
+//! is, it faces the eye, turned about the view by its spin.
+//!
+//! Inferred: that the size is what reaches that scale (the decompiled
+//! call loses it, and the size sampled just before is the likely one), and
+//! that the particles stay at the node (their speed is 0; the 80% of the
+//! vehicle's velocity they inherit is left out).
 //!
 //! From footage: Brendan's co-op video at 7:20, a crewed Puma Light Tank
 //! with the air shimmering over its hull. That the Puma is the
