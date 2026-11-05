@@ -1319,6 +1319,11 @@ pub struct Scene {
     pub chunks: Vec<Chunk>,
     /// The chunks' models by hash, `None` while one loads.
     chunk_models: HashMap<u32, Option<GpuModel>>,
+    /// What each vehicle (by model and label) shows over its exhausts
+    /// while it has a driver: (node, the effect), read once.
+    hazes: HashMap<(u32, String), Vec<(usize, m2_engine::vehicle_parts::ModelEmitter)>>,
+    /// When the scene began: the clock those run by.
+    began: std::time::Instant,
     /// Time spent streaming since this was last cleared: the island's
     /// streamer, vehicles and people, and the state layers' props.
     pub streamed: [Duration; 3],
@@ -2051,6 +2056,8 @@ impl Scene {
             requests: channel(),
             chunks: Vec::new(),
             chunk_models: HashMap::new(),
+            hazes: HashMap::new(),
+            began: std::time::Instant::now(),
             streamed: [Duration::ZERO; 3],
         })
     }
@@ -3100,10 +3107,29 @@ impl Scene {
             let over = self.chunks.len() - CHUNKS_MOST;
             self.chunks.drain(..over);
         }
+        // The effect models over the vehicles' exhausts
+        // (`m2_engine::vehicle_parts`).
+        if let Some(world) = &self.world {
+            let db = &world.index.template_db;
+            for v in &self.vehicles {
+                self.hazes
+                    .entry((v.spec.model, v.spec.label.clone()))
+                    .or_insert_with(|| {
+                        db.exhausts_for(&v.spec.label, v.spec.model)
+                            .iter()
+                            .filter_map(|e| {
+                                let node = v.spec.node_names.iter().position(|&n| n == e.node)?;
+                                Some((node, db.effect_models.get(&e.effect)?.clone()))
+                            })
+                            .collect()
+                    });
+            }
+        }
         let wanted: Vec<u32> = self
             .chunks
             .iter()
             .map(|c| c.model)
+            .chain(self.hazes.values().flatten().map(|h| h.1.model))
             .filter(|m| !self.chunk_models.contains_key(m))
             .collect();
         for m in wanted {
@@ -3238,6 +3264,36 @@ impl Scene {
                     }
                 }
                 v.model.draw_posed(backend, queue, at, &nodes, &[])?;
+                // Over its exhausts while it has a driver (from the 360
+                // code, 0x822772B0 and 0x822766F0).
+                let crewed = driven == Some(i)
+                    || v.crew
+                        .iter()
+                        .any(|(seat, _)| seat.to_ascii_lowercase().contains("driver"));
+                if crewed && !v.wrecked {
+                    let key = (v.spec.model, v.spec.label.clone());
+                    let parts = self.hazes.get(&key).map_or(&[][..], Vec::as_slice);
+                    for (node, emitter) in parts {
+                        if let (Some(Some(m)), Some(n)) =
+                            (self.chunk_models.get(&emitter.model), nodes.get(*node))
+                        {
+                            let from = (at * *n).w_axis.truncate();
+                            // The flat card faces the eye (inferred).
+                            let face = Mat4::from_quat(Quat::from_mat4(&view.view.inverse()));
+                            let salt = (i + *node) as u32;
+                            let now = self.began.elapsed().as_secs_f32();
+                            for (size, turn) in emitter.alive(now, salt) {
+                                m.draw(
+                                    queue,
+                                    Mat4::from_translation(from)
+                                        * face
+                                        * Mat4::from_rotation_z(turn)
+                                        * Mat4::from_scale(Vec3::splat(size)),
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         for c in &self.chunks {

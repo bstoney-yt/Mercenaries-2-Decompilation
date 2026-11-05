@@ -305,6 +305,11 @@ pub struct Templates {
     /// What each template with a `SoundEffect` plays as its objects come
     /// into being, by id ([`crate::spawn_sound`]).
     pub spawn_sounds: HashMap<u32, crate::spawn_sound::SpawnSound>,
+    /// Each template's exhausts, by id ([`crate::vehicle_parts`]).
+    pub exhausts: HashMap<u32, Vec<crate::vehicle_parts::Exhaust>>,
+    /// The emitter each `EffectModel` template draws as a model, by its
+    /// name hash.
+    pub effect_models: HashMap<u32, crate::vehicle_parts::ModelEmitter>,
     /// How near a player wakes each template that says so, by id: its
     /// `HibernationControl` `Distance` ([`crate::population::hibernation`]).
     pub hibernation: HashMap<u32, f32>,
@@ -715,6 +720,23 @@ impl Templates {
             .or_else(|| self.tuning_for_model(model))
     }
 
+    /// The exhausts of template `name` (a vehicle's own), else of the
+    /// lowest id of `model`'s templates that have them.
+    pub fn exhausts_for(&self, name: &str, model: u32) -> &[crate::vehicle_parts::Exhaust] {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.exhausts.get(id))
+            .or_else(|| {
+                self.infos
+                    .iter()
+                    .filter(|(id, t)| t.model == Some(model) && self.exhausts.contains_key(id))
+                    .map(|(&id, _)| id)
+                    .min()
+                    .and_then(|id| self.exhausts.get(&id))
+            })
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// The driver's points of template `name` (a vehicle's own), else of
     /// the first by name of `model`'s templates that give them.
     pub fn driver_points_for(&self, name: &str, model: u32) -> Option<crate::seats::DriverPoints> {
@@ -1007,6 +1029,18 @@ impl Templates {
             hijack: crate::hijack::read(&db),
             music_sources: crate::music_source::read(&db),
             spawn_sounds: crate::spawn_sound::read(&db),
+            exhausts: crate::vehicle_parts::read(&db),
+            effect_models: crate::vehicle_parts::effect_models(&db)
+                .into_iter()
+                .filter_map(|(name, model, emitter, fx)| {
+                    let data = source.asset(fx, m2_assets::effect::EFFECT_TYPE).ok()?;
+                    let fx = m2_assets::effect::parse(&data).ok()?;
+                    Some((
+                        name,
+                        crate::vehicle_parts::ModelEmitter::of(&fx, emitter, model)?,
+                    ))
+                })
+                .collect(),
             hibernation: db
                 .component("HibernationControl")
                 .map(|c| crate::population::hibernation(c))
