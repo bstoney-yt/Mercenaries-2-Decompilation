@@ -875,6 +875,25 @@ impl Templates {
             .max_by_key(|&(bank, n)| (n, std::cmp::Reverse(bank)))
             .map(|(bank, _)| bank)
     }
+
+    /// The sound set most templates of `model` with an engine name in
+    /// their `SoundEffect` ([`crate::spawn_sound::SpawnSound::engine`]):
+    /// the set its engine's start and stop are heard from.
+    pub fn engine_set_for_model(&self, model: u32) -> Option<u32> {
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        for (id, t) in &self.infos {
+            if t.model != Some(model) {
+                continue;
+            }
+            if let Some(s) = self.spawn_sounds.get(id).filter(|s| s.engine && s.set != 0) {
+                *counts.entry(s.set).or_default() += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .max_by_key(|&(set, n)| (n, std::cmp::Reverse(set)))
+            .map(|(set, _)| set)
+    }
 }
 
 impl Templates {

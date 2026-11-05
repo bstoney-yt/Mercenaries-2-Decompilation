@@ -192,6 +192,13 @@ pub struct Track {
 
 /// A plain cue: its name hash, the record it plays, and how long it
 /// lasts (seconds; negative: it loops, as the music's states do).
+///
+/// The record is the low half of the cue's last word; the high half is
+/// not known (0 on most cues; 0x3e99 on the vehicles' engine starts and
+/// stops). Format-from-samples: with the low half taken, 64 more cues of
+/// the world's tables read (the vehicles' starts and stops), and each
+/// plays a sound as long as the cue says, as 211 of 212 other plain cues
+/// do (`plaincuelen` example).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlainCue {
     pub cue: u32,
@@ -379,7 +386,9 @@ impl CueTable {
             };
             let mut at = 0;
             while at + PLAIN_CUE <= region.len() {
-                let record = word(at + 20);
+                // The record index is the word's low half; the high half
+                // is not known (see [`PlainCue`]).
+                let record = word(at + 20) & 0xffff;
                 if word(at) != 0
                     && word(at + 4) == 0
                     && word(at + 16) == hash
@@ -592,6 +601,40 @@ mod tests {
         assert_eq!((b.cue, b.stream, b.max_distance), (2, 610, 1000.0));
         let asset = crate::testutil::ucfx(&[crate::testutil::UcfxNode::Leaf(*b"data", d)]);
         assert_eq!(CueTable::parse(&asset).unwrap().lines.len(), 2);
+    }
+
+    // An engine's start as the vehicles' tables lay it out: the record
+    // word's high half set (0x3e99), its low half the record.
+    #[test]
+    fn a_plain_cues_record_is_its_last_words_low_half() {
+        let mut d = table(&[
+            line(1, RADIO, 10.0, 1000.0, 15),
+            line(2, RADIO, 10.0, 1000.0, 16),
+        ]);
+        let list = d.len() as u32;
+        let words: [u32; 6] = [
+            0x5c55_1331,
+            0,
+            0x3f00_0000,
+            0x4058_0000,
+            0xabcd,
+            0x3e99_0001,
+        ];
+        d.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+        let end = d.len() as u32;
+        d[0x18..0x1c].copy_from_slice(&list.to_le_bytes());
+        d[0x1c..0x20].copy_from_slice(&end.to_le_bytes());
+        let t = CueTable::parse_data(&d).unwrap();
+        assert_eq!(
+            t.cues,
+            [PlainCue {
+                cue: 0x5c55_1331,
+                record: 1,
+                a: 0.5,
+                seconds: 3.375
+            }]
+        );
+        assert_eq!(t.cue_record(0x5c55_1331).unwrap().volume, 0.7);
     }
 
     #[test]

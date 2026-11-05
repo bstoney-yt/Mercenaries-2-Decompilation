@@ -4,7 +4,7 @@
 //! the template it spawns says, not as a sound picked for it.
 //!
 //! The record's words, by offset: `SoundSet` at 0x0 (the `Sounds` table's
-//! key, [`crate::gun_sounds`]), 0x4 (a count gating a tracked emitter),
+//! key, [`crate::gun_sounds`]), 0x4 (whether it has an engine, [`ENGINE_START_EVENT`]),
 //! [`MODE`] at 0x8, [`CHANCE`] at 0xc, the engine bank at 0x10
 //! ([`crate::weapons`]), [`HEARD`] at 0x14 and [`REACH`] at 0x18.
 //!
@@ -48,6 +48,32 @@ pub const CREATE_EVENT: u32 = 0x390a_dd0a;
 /// sets have a row for it (the ammunition boxes' among them).
 pub const TAKEN_EVENT: u32 = 0xa639_af36;
 
+/// The `Sounds` table event a vehicle's set plays as its engine starts
+/// (name unknown), and the one it plays as the engine stops.
+///
+/// From the 360 code: a `SoundEffect` record whose word at 0x4 is 1 or
+/// more registers an engine for its entity (0x82403758 takes a node from
+/// the pool at 0x831343EC; 0x82367358 hangs a controller of the entity's
+/// kind on it: wheeled 0x820D9E90, others 0x820D9E78/A8/C0). The sound
+/// system's handler for seat changes (0x82360400) starts the engine as
+/// the player gets in to drive (0x82367800 with its third argument set):
+/// it starts one of two sets of loops on the vehicle's set
+/// (`82577648`, `514c1ed1` and `6477ffe6`, or `fbf9a4b4`, `8a55f77d` and
+/// `a1ced25e`, by its second and fourth arguments) and then this event.
+/// As the player gets out it stops the engine (0x82367E30): those loops
+/// stop and [`ENGINE_OFF_EVENT`] starts, the controller's own loops stop
+/// after (0x82369AF8 on a wheeled one: `3c4e6551`, `a99c0571`,
+/// `376de087`). Every message names the vehicle, its set and the `Param`
+/// wildcard.
+///
+/// From samples: of the 58 sets of templates with that word set, 53
+/// have a row for each; their cues are plain cues whose record words
+/// carry a high half ([`m2_assets::voice::PlainCue`]), and all 64 such
+/// starts and stops read (36 of the 53 starts, 48 of the stops) last as
+/// long as their cue says (`plaincuelen` example).
+pub const ENGINE_START_EVENT: u32 = 0x72b6_619e;
+pub const ENGINE_OFF_EVENT: u32 = 0xc8f1_7f2a;
+
 /// `SoundEffect`'s field naming its sound set.
 const SET: &str = "SoundSet";
 /// When it plays (name unknown): 1 as its entity comes into being, 2
@@ -55,6 +81,9 @@ const SET: &str = "SoundSet";
 const MODE: u32 = 0x29f1_5442;
 /// The chance it plays at all (name unknown; 0x82403758 draws against it).
 const CHANCE: u32 = 0x4e97_de03;
+/// Whether its entity has an engine (name unknown, word 0x4: 1 or more
+/// registers one, 0x82403758; see [`ENGINE_START_EVENT`]).
+const ENGINE: u32 = 0xc433_22c3;
 /// Whether it registers a reach (name unknown, word 0x14), and the reach
 /// itself (word 0x18): passed to the system at 0x83656624 by 0x82403758,
 /// not yet followed further.
@@ -72,6 +101,8 @@ pub struct SpawnSound {
     pub chance: f32,
     /// The reach it registers, if its flag says to (not yet used).
     pub reach: Option<f32>,
+    /// Its entity has an engine ([`ENGINE_START_EVENT`]).
+    pub engine: bool,
 }
 
 impl SpawnSound {
@@ -101,6 +132,7 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, SpawnSound> {
                     reach: (t.word(r, HEARD) == Some(1))
                         .then(|| t.float(r, REACH))
                         .flatten(),
+                    engine: t.word(r, ENGINE).is_some_and(|n| n as i32 >= 1),
                 },
             ))
         })
@@ -160,6 +192,7 @@ mod tests {
             mode: 1,
             chance: 1.0,
             reach: Some(125.0),
+            engine: false,
         }
     }
 

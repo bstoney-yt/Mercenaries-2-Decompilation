@@ -774,6 +774,9 @@ pub fn engine_bank(kind: &str, label: &str) -> &'static str {
 pub struct EngineInput {
     /// The name hash of its sound bank (`veh_jeep`).
     pub bank: u32,
+    /// Its sound set (0: none), whose `Sounds` rows give its engine's
+    /// start and stop ([`engine_cues`]).
+    pub set: u32,
     /// Speed and top speed, m/s.
     pub speed: f32,
     pub top: f32,
@@ -825,6 +828,24 @@ pub fn load_horns(install: &Install) -> SpareHorns {
     horns
 }
 
+/// The cues vehicle sound set `set` plays as its engine starts and as it
+/// stops: its `Sounds` rows for
+/// [`ENGINE_START_EVENT`](m2_engine::spawn_sound::ENGINE_START_EVENT) and
+/// [`ENGINE_OFF_EVENT`](m2_engine::spawn_sound::ENGINE_OFF_EVENT) with
+/// the wildcard `Param`, as the sound system starts them as the player
+/// gets in to drive and out (0x82367800, 0x82367E30). Where a set has
+/// none, or its cue finds no sound, the bank's own start or stop plays
+/// (from samples, by name; none where the bank names none).
+pub fn engine_cues(cues: &GunCues, set: u32) -> (Option<u32>, Option<u32>) {
+    if set == 0 {
+        return (None, None);
+    }
+    (
+        cues.cue_of(set, m2_engine::spawn_sound::ENGINE_START_EVENT),
+        cues.cue_of(set, m2_engine::spawn_sound::ENGINE_OFF_EVENT),
+    )
+}
+
 /// A bank's engine sounds, read on a thread.
 type EngineLoad = (u32, Option<EngineSounds>);
 
@@ -832,6 +853,8 @@ type EngineLoad = (u32, Option<EngineSounds>);
 #[derive(Debug)]
 struct Engine {
     bank: u32,
+    /// Its vehicle's sound set (0: none).
+    set: u32,
     sounds: Arc<EngineSounds>,
     voices: Vec<VoiceId>,
     /// 0 idling to 1 flat out, eased.
@@ -2244,6 +2267,11 @@ impl GameAudio {
     /// its volume: its reload cue ([`GunCues::reload`]) or the cue it plays
     /// taken up (`equip_pickup`), `what` saying which. A cue not yet read
     /// is read on a thread and this one goes unheard.
+    /// Whether sound key `key` has been read and finds a sound.
+    fn key_found(&self, key: u32) -> bool {
+        matches!(self.keys.get(&key), Some(Some(_)))
+    }
+
     fn play_flat(&mut self, what: &str, set: Option<u32>, cue: Option<u32>) {
         let Some(cue) = cue else {
             return;
@@ -2431,17 +2459,23 @@ impl GameAudio {
         if self
             .engine
             .as_ref()
-            .is_some_and(|e| Some(e.bank) != driving.map(|d| d.bank))
+            .is_some_and(|e| Some((e.bank, e.set)) != driving.map(|d| (d.bank, d.set)))
             && let Some(e) = self.engine.take()
         {
+            let off = engine_cues(&self.gun_cues, e.set)
+                .1
+                .filter(|c| self.key_found(*c));
             self.out.with(|m| {
                 for id in &e.voices {
                     m.stop(*id);
                 }
-                if let Some(stop) = &e.sounds.stop {
+                if off.is_none()
+                    && let Some(stop) = &e.sounds.stop
+                {
                     m.play(Play::flat(stop.clone()).gain(ENGINE_GAIN));
                 }
             });
+            self.play_flat("engine off", Some(e.set), off);
         }
         let Some(input) = driving else {
             return;
@@ -2451,8 +2485,22 @@ impl GameAudio {
             let Some(sounds) = self.engine_sounds(input.bank) else {
                 return;
             };
+            // The set's start and stop, read ahead; the engine waits for
+            // its start.
+            let (start, off) = engine_cues(&self.gun_cues, input.set);
+            for c in [start, off].into_iter().flatten() {
+                if !self.keys.contains_key(&c) {
+                    self.ask_key(c);
+                }
+            }
+            if start.is_some_and(|c| !self.keys.contains_key(&c)) && self.install.is_some() {
+                return;
+            }
+            let start = start.filter(|c| self.key_found(*c));
             let voices = self.out.with(|m| {
-                if let Some(start) = &sounds.start {
+                if start.is_none()
+                    && let Some(start) = &sounds.start
+                {
                     m.play(Play::flat(start.clone()).gain(ENGINE_GAIN));
                 }
                 sounds
@@ -2461,8 +2509,10 @@ impl GameAudio {
                     .map(|(buffer, _)| m.play(Play::flat(buffer.clone()).looped().gain(0.0)))
                     .collect()
             });
+            self.play_flat("engine start", Some(input.set), start);
             self.engine = Some(Engine {
                 bank: input.bank,
+                set: input.set,
                 sounds,
                 voices,
                 rpm: 0.0,
@@ -2721,9 +2771,29 @@ mod tests {
                 mode: 1,
                 chance: 1.0,
                 reach: Some(125.0),
+                engine: false,
             },
             GunCues::from_rows([[set, m2_engine::spawn_sound::CREATE_EVENT, any, 0x1915_2b89]]),
         )
+    }
+
+    /// The HMMWV's set (`ef7403d8`) as the data has it: start `5c551331`,
+    /// stop `59b70d03`.
+    #[test]
+    fn an_engine_starts_and_stops_with_its_sets_rows() {
+        use m2_engine::spawn_sound::{ENGINE_OFF_EVENT, ENGINE_START_EVENT};
+        let any = m2_assets::animation_table::ANY;
+        let set = 0xef74_03d8;
+        let cues = GunCues::from_rows([
+            [set, ENGINE_START_EVENT, any, 0x5c55_1331],
+            [set, ENGINE_OFF_EVENT, any, 0x59b7_0d03],
+        ]);
+        assert_eq!(
+            engine_cues(&cues, set),
+            (Some(0x5c55_1331), Some(0x59b7_0d03))
+        );
+        assert_eq!(engine_cues(&cues, 0), (None, None));
+        assert_eq!(engine_cues(&cues, 0x1234_5678), (None, None));
     }
 
     #[test]

@@ -2845,8 +2845,15 @@ impl Game {
             .unwrap_or_else(|| {
                 m2_assets::name_hash(crate::sound::engine_bank(&v.spec.kind, &v.spec.label))
             });
+        let set = self
+            .scene
+            .world
+            .as_ref()
+            .and_then(|w| w.index.template_db.engine_set_for_model(v.spec.model))
+            .unwrap_or(0);
         Some(crate::sound::EngineInput {
             bank,
+            set,
             speed,
             top: v
                 .spec
