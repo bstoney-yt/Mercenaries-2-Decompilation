@@ -57,6 +57,7 @@ pub mod spawn_sound;
 pub mod standin;
 pub mod stream;
 pub mod surface;
+pub mod tank_attack;
 pub mod technique;
 pub mod tuning;
 pub mod vehicle;
