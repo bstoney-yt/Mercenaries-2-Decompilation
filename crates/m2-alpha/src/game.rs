@@ -1991,6 +1991,11 @@ impl Game {
                         hold: None,
                     });
                 }
+                // Heard as its own sound set says it is taken (the ammo
+                // box's beep: [`m2_engine::spawn_sound::TAKEN_EVENT`]).
+                if walked {
+                    self.combat.taken(p.at, p.what.template);
+                }
                 if p.what.is_money() {
                     eprintln!(
                         "pickup: she takes {} ({:#x}) at {:.1}: cash {}, fuel {}",

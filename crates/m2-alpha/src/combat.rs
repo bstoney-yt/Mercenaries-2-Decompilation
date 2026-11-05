@@ -1319,6 +1319,14 @@ pub enum Sound {
     /// unless the messages its state sent just before at the same place
     /// ([`Sound::ObjectEvent`]) played a cue of its own.
     Collapse(Vec3),
+    /// A pickup of `template` taken at `at` (walked over, or its
+    /// ammunition taken with the use key): heard as its own `SoundEffect`
+    /// set answers [`m2_engine::spawn_sound::TAKEN_EVENT`], nothing
+    /// standing in.
+    Taken {
+        at: Vec3,
+        template: u32,
+    },
     /// A message an object's model state sent (`SendMessage`), heard as
     /// the 360's sound system hears it: the events
     /// [`m2_engine::spawn_sound::object_event`] gives it, played from the
@@ -2807,6 +2815,11 @@ impl Combat {
                 .into_iter()
                 .map(|(template, at)| Sound::Created { at, template }),
         );
+    }
+
+    /// A pickup of `template` was taken at `at`: heard ([`Sound::Taken`]).
+    pub fn taken(&mut self, at: Vec3, template: u32) {
+        self.sounds.push(Sound::Taken { at, template });
     }
 
     /// A building of template `template` comes apart at `at`, its
@@ -7635,6 +7648,20 @@ mod tests {
             vec![Sound::Created {
                 at,
                 template: 0x8000_1234
+            }]
+        );
+    }
+
+    #[test]
+    fn a_pickup_taken_is_heard_as_its_template() {
+        let mut combat = Combat::default();
+        let at = Vec3::new(4.0, 0.0, 2.0);
+        combat.taken(at, 0x8000_a286);
+        assert_eq!(
+            combat.take_sounds(),
+            vec![Sound::Taken {
+                at,
+                template: 0x8000_a286
             }]
         );
     }

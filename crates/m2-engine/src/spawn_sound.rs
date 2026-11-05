@@ -38,6 +38,16 @@ use crate::tuning::Table;
 /// into being (name unknown; the hash the 360 code posts, 0x82403758).
 pub const CREATE_EVENT: u32 = 0x390a_dd0a;
 
+/// The `Sounds` table event a pickup's `SoundEffect` set plays as it is
+/// taken (name unknown). From the 360 code: taking a pickup (0x8228F5E8,
+/// 0x8228FE58) posts the script event `Pickup` (0x8602E37D) naming the
+/// pickup; the sound system's handler for script events (0x82360FA8, run
+/// from its update 0x8235EFA0) answers it by starting this event on the
+/// pickup's own set (its `SoundEffect` record, table 0x83654C50; none,
+/// nothing), the `Param` wildcard, at the pickup. From samples: 26 sound
+/// sets have a row for it (the ammunition boxes' among them).
+pub const TAKEN_EVENT: u32 = 0xa639_af36;
+
 /// `SoundEffect`'s field naming its sound set.
 const SET: &str = "SoundSet";
 /// When it plays (name unknown): 1 as its entity comes into being, 2
