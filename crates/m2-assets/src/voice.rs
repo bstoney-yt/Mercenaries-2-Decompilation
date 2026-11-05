@@ -420,6 +420,10 @@ impl CueTable {
     }
 }
 
+/// A mixed cue's track header's first word (0x100 set when a block of
+/// eight words follows it; see [`MixedCue`]).
+const TRACK_HEADER: u32 = 0x0001_0000;
+
 /// The mixed cues of a cue list `region` of table `hash` with `count`
 /// records: each cue flagged 0x100 with the tracks found after it, up to
 /// the next cue, plain or mixed (see [`MixedCue`]).
@@ -443,9 +447,15 @@ fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
         let (a, seconds) = (float(at + 8), float(at + 12));
         // A cue's hash, not a small offset (a track header's 0x44 is
         // followed by 0x10100, 0.2 and 0.7 on the minigun's loop).
+        // Nor a track header (0x00010000 or 0x00010100), which a cue's
+        // own header block may hold followed by 0x100, 1.0 and -1 (the
+        // Semi's engine start): taken for a cue, it would end the cue it
+        // stands in.
         if at + 16 <= region.len()
             && w > 0xffff
             && w != hash
+            && w != TRACK_HEADER
+            && w != TRACK_HEADER | 0x100
             && flags & 0xff00 == 0x100
             && flags & 0xff == 0
             && flags >> 24 == 0
@@ -685,6 +695,52 @@ mod tests {
     // A mixed cue as the assault rifle's table lays its shot out (words
     // shaped as read on a legally installed copy; values made up): its
     // header, words not decoded, two tracks, then a plain cue ending it.
+    // The Semi's engine start: a header block holding a track header
+    // followed by 0x100, 1.0 and -1, which reads like a looping cue of
+    // its own; the cue is still found, with its one track.
+    #[test]
+    fn a_track_header_in_a_cues_header_is_not_a_cue() {
+        let mut d = table(&[
+            line(1, RADIO, 10.0, 1000.0, 15),
+            line(2, RADIO, 10.0, 1000.0, 16),
+        ]);
+        let list = d.len() as u32;
+        let f = |v: f32| v.to_bits();
+        let words: Vec<u32> = vec![
+            0x9197_0795,
+            0x2_0100,
+            f(0.631),
+            f(1.64), // the mixed cue
+            0x1_0000,
+            0x100,
+            f(1.0),
+            f(-1.0), // a track header, not a cue
+            0x1c,
+            0x102_0200,
+            1,
+            f(0.0),
+            0x10,
+            0xabcd,
+            1,
+            f(1.0), // track
+            0x55,
+            0,
+            f(0.5),
+            f(0.125),
+            0xabcd,
+            0, // a plain cue
+        ];
+        d.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+        let end = d.len() as u32;
+        d[0x18..0x1c].copy_from_slice(&list.to_le_bytes());
+        d[0x1c..0x20].copy_from_slice(&end.to_le_bytes());
+        let t = CueTable::parse_data(&d).unwrap();
+        let m = t.mix(0x9197_0795).unwrap();
+        assert_eq!((m.seconds, m.tracks.len()), (1.64, 1));
+        assert_eq!(m.tracks[0].record, 1);
+        assert_eq!(t.mixes.len(), 1);
+    }
+
     #[test]
     fn finds_mixed_cues_and_their_tracks() {
         let mut d = table(&[
