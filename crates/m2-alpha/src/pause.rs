@@ -91,15 +91,24 @@ pub type Call = (&'static str, Vec<Value>);
 /// game? Any unsaved changes will be lost." (e5c9f6c4), "Overwrite your
 /// existing saved game?" (c7e9b207), "Load game? Any unsaved changes
 /// will be lost." (1c55a948) and "Cancel the current contract?"
-/// (8bcbd1d7), as the PC footage's Quit and Save boxes read. The movie's
-/// own test path has other texts ("Any unsaved mission progress will be
-/// lost..."), which the Beta showed before. The 360's other Quit text,
-/// for a flag of its game state's not yet read, is left out.
-const BOXES: [(&str, &str, &str); 4] = [
+/// (8bcbd1d7), as the PC footage's Quit and Save boxes read, and for the
+/// load list's delete (`deleteloadgame`) "DELETE CONFIRMATION"
+/// (2e4b3b56) over "Are you sure?". The movie's own test path has other
+/// texts ("Any unsaved mission progress will be lost..."), which the Beta
+/// showed before.
+///
+/// Left out, as online only: the table's `kickPlayer` box ("Are you sure
+/// you want to kick the remote player ?", 2bc63a69), a one-button NOTICE
+/// box (1a7c4871, its command not identified), and Quit's other form: the
+/// same text, but the box is named `clientQuitPrompt` (0x820DAA74) when
+/// two flags of the game state (+0x5383 and +0x5381) are both set (by its
+/// name a co-op client's quit, inferred); offline it is `messageQuitGame`.
+const BOXES: [(&str, &str, &str); 5] = [
     ("messageQuitGame", TITLE, "[0xe5c9f6c4]"),
     ("messageSaveGame", TITLE, "[0xc7e9b207]"),
     ("messageLoadGame", TITLE, "[0x1c55a948]"),
     ("messageCancelContract", TITLE, "[0x8bcbd1d7]"),
+    ("deleteloadgame", "[0x2e4b3b56]", TITLE),
 ];
 /// The boxes' title, "Are you sure?", and buttons, from the same table.
 const TITLE: &str = "[0x9b476854]";
@@ -1143,6 +1152,19 @@ mod tests {
         assert_eq!(
             format!("{:?}", calls[0].1[1]),
             format!("{:?}", text("[0xe5c9f6c4]"))
+        );
+        // The load list's delete: DELETE CONFIRMATION over Are you sure?
+        assert!(n.command("deleteloadgame", "true"));
+        let calls = n.calls(&s);
+        assert_eq!(
+            (
+                format!("{:?}", calls[0].1[0]),
+                format!("{:?}", calls[0].1[1])
+            ),
+            (
+                format!("{:?}", text("[0x2e4b3b56]")),
+                format!("{:?}", text(TITLE))
+            )
         );
         assert!(n.command("preoperation", "load,listLoadGame"));
         assert_eq!(
