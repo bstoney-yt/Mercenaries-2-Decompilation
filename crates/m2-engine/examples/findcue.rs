@@ -153,6 +153,68 @@ fn ncc(signal: &[f32], t: &[f32]) -> Vec<f64> {
     scores
 }
 
+/// Hop and window of the band frames, samples.
+const HOP: usize = 256;
+const WINDOW: usize = 512;
+/// Bands per frame, spaced evenly over the window's spectrum's bins 4..
+const BANDS: usize = 24;
+
+/// Each frame's log energy per band.
+fn bands(x: &[f32]) -> Vec<[f32; BANDS]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let bins = WINDOW / 2;
+    let per = (bins - 4) / BANDS;
+    while start + WINDOW <= x.len() {
+        let (mut re, mut im) = (vec![0.0f64; WINDOW], vec![0.0f64; WINDOW]);
+        for (i, r) in re.iter_mut().enumerate() {
+            let w = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / WINDOW as f64).cos();
+            *r = f64::from(x[start + i]) * w;
+        }
+        fft(&mut re, &mut im, false);
+        let mut f = [0.0f32; BANDS];
+        for (b, e) in f.iter_mut().enumerate() {
+            let s: f64 = (4 + b * per..4 + (b + 1) * per)
+                .map(|i| re[i] * re[i] + im[i] * im[i])
+                .sum();
+            *e = (s + 1.0).ln() as f32;
+        }
+        out.push(f);
+        start += HOP;
+    }
+    out
+}
+
+/// Pearson correlation of the template's band frames `t` with the
+/// recording's `r` at each frame lag.
+fn band_match(r: &[[f32; BANDS]], t: &[[f32; BANDS]]) -> Vec<f64> {
+    let m = t.len();
+    if m == 0 || r.len() < m {
+        return Vec::new();
+    }
+    let flat_t: Vec<f64> = t.iter().flatten().map(|&v| f64::from(v)).collect();
+    let mt = flat_t.iter().sum::<f64>() / flat_t.len() as f64;
+    let tz: Vec<f64> = flat_t.iter().map(|v| v - mt).collect();
+    let tn = tz.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-9);
+    (0..=r.len() - m)
+        .map(|at| {
+            let w: Vec<f64> = r[at..at + m]
+                .iter()
+                .flatten()
+                .map(|&v| f64::from(v))
+                .collect();
+            let mw = w.iter().sum::<f64>() / w.len() as f64;
+            let (mut dot, mut wn) = (0.0, 0.0);
+            for (a, b) in w.iter().zip(&tz) {
+                let a = a - mw;
+                dot += a * b;
+                wn += a * a;
+            }
+            dot / (wn.sqrt().max(1e-9) * tn)
+        })
+        .collect()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [root, out, cue, rest @ ..] = &args[..] else {
@@ -209,8 +271,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let threshold: f64 = rest.get(1).and_then(|t| t.parse().ok()).unwrap_or(0.5);
     let signal = read_wav(Path::new(rec))?;
     println!("recording: {} samples", signal.len());
+    // `FINDCUE_SPECTRAL` matches log band energies instead of the wave:
+    // steadier where the sound is heard under others.
+    let spectral = std::env::var_os("FINDCUE_SPECTRAL").is_some();
+    let rec_bands = spectral.then(|| bands(&signal));
     for (k, rate, t) in templates {
-        let scores = ncc(&signal, &t);
+        let (scores, per_second) = match &rec_bands {
+            Some(r) => (
+                band_match(r, &bands(&t)),
+                f64::from(rate) / HOP as f64,
+            ),
+            None => (ncc(&signal, &t), f64::from(rate)),
+        };
+        let rate = per_second;
         let gap = rate as usize;
         let (mut i, mut hits) = (0, 0);
         while i < scores.len() {
@@ -222,7 +295,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .enumerate()
                     .max_by(|a, b| a.1.total_cmp(&b.1))
                     .unwrap_or((0, 0.0));
-                let at = (i + best) as f64 / f64::from(rate);
+                let at = (i + best) as f64 / rate;
                 println!(
                     "sound {k}: at {:02}:{:05.2} score {score:.2}",
                     (at / 60.0) as u32,
