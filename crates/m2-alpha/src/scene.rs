@@ -1361,6 +1361,10 @@ pub struct Scene {
     /// What each vehicle (by model and label) shows over its exhausts
     /// while it has a driver: (node, the effect), read once.
     hazes: HashMap<(u32, String), Vec<(usize, m2_engine::vehicle_parts::ModelEmitter)>>,
+    /// The particle effects each vehicle (by model and label) gives off
+    /// from its exhausts while it has a driver: (node, effect template's
+    /// name hash), read once.
+    pub smokes: HashMap<(u32, String), Vec<(usize, u32)>>,
     /// When the scene began: the clock those run by.
     began: std::time::Instant,
     /// Time spent streaming since this was last cleared: the island's
@@ -1663,6 +1667,17 @@ pub fn death_pickups(
 }
 
 impl ParkedVehicle {
+    /// Whether its exhausts are going: it has a driver (`driven`: her) and
+    /// is no wreck (from the 360 code, 0x822772B0).
+    pub fn exhausting(&self, driven: bool) -> bool {
+        !self.wrecked
+            && (driven
+                || self
+                    .crew
+                    .iter()
+                    .any(|(seat, _)| seat.to_ascii_lowercase().contains("driver")))
+    }
+
     /// The damage it takes before it is wrecked: its template's health.
     /// A template with no `Health` (3 of 779 with vehicle physics, all
     /// props: survey `runover`) is never wrecked: in the 360 damage is
@@ -2099,6 +2114,7 @@ impl Scene {
             chunks: Vec::new(),
             chunk_models: HashMap::new(),
             hazes: HashMap::new(),
+            smokes: HashMap::new(),
             began: std::time::Instant::now(),
             streamed: [Duration::ZERO; 3],
         })
@@ -3157,6 +3173,18 @@ impl Scene {
         if let Some(world) = &self.world {
             let db = &world.index.template_db;
             for v in &self.vehicles {
+                self.smokes
+                    .entry((v.spec.model, v.spec.label.clone()))
+                    .or_insert_with(|| {
+                        db.exhausts_for(&v.spec.label, v.spec.model)
+                            .iter()
+                            .filter(|e| !db.effect_models.contains_key(&e.effect))
+                            .filter_map(|e| {
+                                let node = v.spec.node_names.iter().position(|&n| n == e.node)?;
+                                Some((node, e.effect))
+                            })
+                            .collect()
+                    });
                 self.hazes
                     .entry((v.spec.model, v.spec.label.clone()))
                     .or_insert_with(|| {
@@ -3311,11 +3339,7 @@ impl Scene {
                 v.model.draw_posed(backend, queue, at, &nodes, &[])?;
                 // Over its exhausts while it has a driver (from the 360
                 // code, 0x822772B0 and 0x822766F0).
-                let crewed = driven == Some(i)
-                    || v.crew
-                        .iter()
-                        .any(|(seat, _)| seat.to_ascii_lowercase().contains("driver"));
-                if crewed && !v.wrecked {
+                if v.exhausting(driven == Some(i)) {
                     let key = (v.spec.model, v.spec.label.clone());
                     let parts = self.hazes.get(&key).map_or(&[][..], Vec::as_slice);
                     for (node, emitter) in parts {
