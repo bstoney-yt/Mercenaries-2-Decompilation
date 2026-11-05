@@ -232,6 +232,7 @@ mod tests {
             mixes: vec![MixedCue {
                 cue: JUNGLE,
                 seconds: -1.0,
+                curves: Vec::new(),
                 tracks: vec![
                     track(0, 0.0, 1.0),
                     track(1, 5.11, 1.0),

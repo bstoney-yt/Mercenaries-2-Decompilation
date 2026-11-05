@@ -883,6 +883,88 @@ pub fn world_cue_tables<R: Read + Seek>(source: &mut AssetSource<R>) -> Vec<CueT
     tables
 }
 
+/// The parameters an engine cue's curves read, as the 360's wheeled
+/// controller fills them (0x823696E8, 0x82368EE0): speed over the top
+/// speed, the load (the throttle, eased), and reversing, 0 or 1.
+pub const PARAM_SPEED: u32 = 0x15ba_509e;
+pub const PARAM_LOAD: u32 = 0xe092_4df9;
+pub const PARAM_REVERSE: u32 = 0xa09a_4dfd;
+
+/// A looping mixed cue played track by track, each moved by its curves
+/// (an engine: idle, low and high loops crossfaded as the data says).
+#[derive(Clone, Debug)]
+pub struct EngineCue {
+    pub tracks: Vec<EngineTrack>,
+}
+
+/// One track of an [`EngineCue`].
+#[derive(Clone, Debug)]
+pub struct EngineTrack {
+    pub sound: SoundBuffer,
+    /// Its record's level.
+    pub volume: f32,
+    pub curves: Vec<m2_assets::voice::Curve>,
+}
+
+impl EngineCue {
+    /// Mixed cue `cue` of the `tables`, if it loops and its tracks find
+    /// sounds. A track with several variants plays its first.
+    pub fn read<R: Read + Seek>(
+        source: &mut AssetSource<R>,
+        tables: &[CueTable],
+        cue: u32,
+    ) -> Option<Self> {
+        let mix = tables.iter().find_map(|t| t.mix(cue))?;
+        if mix.seconds >= 0.0 {
+            return None;
+        }
+        let mut tracks = Vec::new();
+        for (t, curves) in mix.tracks.iter().zip(&mix.curves) {
+            let table = tables.iter().find(|c| c.hash == t.table)?;
+            let record = table.records.get(t.record as usize)?;
+            let &(bank, index, _) = record.variants.first()?;
+            let library = SoundLibrary::load_banks(source, &[bank]);
+            let (_, list) = library.bank_hash(bank)?;
+            let sound = list.get(index as usize)?.clone();
+            let volume = if record.volume > 0.0 {
+                record.volume
+            } else {
+                1.0
+            };
+            tracks.push(EngineTrack {
+                sound,
+                volume: volume * t.level,
+                curves: curves.clone(),
+            });
+        }
+        (!tracks.is_empty()).then_some(Self { tracks })
+    }
+
+    /// Each track's gain and pitch with the parameters at `params` (hash,
+    /// value): its volumes multiplied, its pitches added, as semitones
+    /// (inferred). A curve of a parameter not given is passed over.
+    pub fn mix(&self, params: &[(u32, f32)]) -> Vec<(f32, f32)> {
+        use m2_assets::voice::{CURVE_PITCH, CURVE_VOLUME};
+        self.tracks
+            .iter()
+            .map(|t| {
+                let (mut gain, mut semitones) = (t.volume, 0.0);
+                for c in &t.curves {
+                    let Some(&(_, x)) = params.iter().find(|p| p.0 == c.param) else {
+                        continue;
+                    };
+                    match c.kind {
+                        CURVE_VOLUME => gain *= c.at(x),
+                        CURVE_PITCH => semitones += c.at(x),
+                        _ => {}
+                    }
+                }
+                (gain, 2f32.powf(semitones / 12.0))
+            })
+            .collect()
+    }
+}
+
 /// The sounds a template's `SoundKey` (a name hash, `prop_sheetmetal_sml`)
 /// plays, each with its weight, how loud, and how they were found, for
 /// the log.
@@ -1645,6 +1727,63 @@ impl Voices {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A HMMWV's idle track as the data has it, and a pitched track.
+    fn engine_cue() -> EngineCue {
+        use m2_assets::voice::{CURVE_PITCH, CURVE_VOLUME, Curve};
+        let sound = SoundBuffer {
+            hash: 1,
+            channels: 1,
+            rate: 44100,
+            samples: vec![0; 8].into(),
+        };
+        EngineCue {
+            tracks: vec![
+                EngineTrack {
+                    sound: sound.clone(),
+                    volume: 1.0,
+                    curves: vec![Curve {
+                        kind: CURVE_VOLUME,
+                        param: PARAM_SPEED,
+                        points: vec![(0.0, 0.6), (0.2, 0.0), (1.0, 0.0)],
+                    }],
+                },
+                EngineTrack {
+                    sound,
+                    volume: 0.5,
+                    curves: vec![
+                        Curve {
+                            kind: CURVE_PITCH,
+                            param: PARAM_SPEED,
+                            points: vec![(0.0, 0.0), (1.0, 12.0)],
+                        },
+                        Curve {
+                            kind: CURVE_PITCH,
+                            param: PARAM_LOAD,
+                            points: vec![(0.0, -12.0), (1.0, 0.0)],
+                        },
+                    ],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn an_engine_cues_curves_set_each_tracks_gain_and_pitch() {
+        let c = engine_cue();
+        let idle = c.mix(&[(PARAM_SPEED, 0.0), (PARAM_LOAD, 1.0)]);
+        assert_eq!(idle, vec![(0.6, 1.0), (0.5, 1.0)]);
+        let top = c.mix(&[(PARAM_SPEED, 1.0), (PARAM_LOAD, 1.0)]);
+        assert_eq!(top, vec![(0.0, 1.0), (0.5, 2.0)]);
+        // Semitones add: speed up an octave, load down one.
+        let coasting = c.mix(&[(PARAM_SPEED, 1.0), (PARAM_LOAD, 0.0)]);
+        assert_eq!(coasting[1], (0.5, 1.0));
+    }
+
+    #[test]
+    fn a_curve_of_a_parameter_not_given_is_passed_over() {
+        assert_eq!(engine_cue().mix(&[])[0], (1.0, 1.0));
+    }
 
     fn tone(rate: u32, frames: usize) -> SoundBuffer {
         SoundBuffer {

@@ -174,6 +174,58 @@ pub struct MixedCue {
     /// How long it lasts, seconds; negative when it loops.
     pub seconds: f32,
     pub tracks: Vec<Track>,
+    /// What moves each track while it plays, by track.
+    pub curves: Vec<Vec<Curve>>,
+}
+
+/// What a [`Curve`] moves.
+pub const CURVE_VOLUME: u32 = 5;
+pub const CURVE_PITCH: u32 = 6;
+
+/// A track's level or pitch as a parameter the game feeds the cue moves
+/// (the vehicles' engines: `15ba509e` their speed, 0 to 1).
+///
+/// ```text
+/// u32  what it moves: 5 volume, 6 pitch
+/// u32  0
+/// u32  n, its points
+/// u32  the parameter's hash
+/// u32  0x14, u32 0
+/// f32  the value at parameter 0, then n - 1 pairs (parameter, value)
+/// ```
+///
+/// Format-from-samples: over the engine cues every curve's parameters
+/// rise to 1. Volumes run 0 to 1; pitches about -10 to 7, read as
+/// semitones (inferred from their range).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Curve {
+    pub kind: u32,
+    pub param: u32,
+    /// (parameter, value), rising in the parameter.
+    pub points: Vec<(f32, f32)>,
+}
+
+impl Curve {
+    /// Its value at `x`: joined straight between points, flat past the
+    /// ends (inferred).
+    pub fn at(&self, x: f32) -> f32 {
+        let Some(&first) = self.points.first() else {
+            return 0.0;
+        };
+        let mut last = first;
+        for &p in &self.points {
+            if x <= p.0 {
+                let span = p.0 - last.0;
+                return if span > 0.0 {
+                    last.1 + (p.1 - last.1) * ((x - last.0) / span).max(0.0)
+                } else {
+                    p.1
+                };
+            }
+            last = p;
+        }
+        last.1
+    }
 }
 
 /// One record a [`MixedCue`] plays.
@@ -436,6 +488,7 @@ fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
     let float = |at: usize| f32::from_bits(word(at));
     let mut mixes = Vec::new();
     let mut current: Option<MixedCue> = None;
+    let mut pending: Vec<Curve> = Vec::new();
     let close = |m: Option<MixedCue>, mixes: &mut Vec<MixedCue>| {
         if let Some(m) = m.filter(|m| !m.tracks.is_empty()) {
             mixes.push(m);
@@ -468,7 +521,9 @@ fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
                 cue: w,
                 seconds,
                 tracks: Vec::new(),
+                curves: Vec::new(),
             });
+            pending.clear();
             at += 16;
             continue;
         }
@@ -481,6 +536,31 @@ fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
             close(current.take(), &mut mixes);
             at += PLAIN_CUE;
             continue;
+        }
+        // A curve of the track to come.
+        if (w == CURVE_VOLUME || w == CURVE_PITCH)
+            && current.is_some()
+            && flags == 0
+            && (2..=32).contains(&word(at + 8))
+            && word(at + 16) == 0x14
+            && word(at + 20) == 0
+        {
+            let n = word(at + 8) as usize;
+            let end = at + 24 + (2 * n - 1) * 4;
+            if end <= region.len() {
+                let mut points = vec![(0.0, float(at + 24))];
+                points.extend((0..n - 1).map(|i| {
+                    let p = at + 28 + i * 8;
+                    (float(p), float(p + 4))
+                }));
+                pending.push(Curve {
+                    kind: w,
+                    param: word(at + 12),
+                    points,
+                });
+                at = end;
+                continue;
+            }
         }
         if at >= 12
             && at + 12 <= region.len()
@@ -499,6 +579,7 @@ fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
                     weight,
                     level: track_block(region, at - 16).unwrap_or(1.0),
                 });
+                m.curves.push(std::mem::take(&mut pending));
                 at += 12;
                 continue;
             }
@@ -695,6 +776,69 @@ mod tests {
     // A mixed cue as the assault rifle's table lays its shot out (words
     // shaped as read on a legally installed copy; values made up): its
     // header, words not decoded, two tracks, then a plain cue ending it.
+    // A HMMWV engine track's curves: speed moves its volume and pitch.
+    #[test]
+    fn a_tracks_curves_are_read_and_join_straight() {
+        let mut d = table(&[
+            line(1, RADIO, 10.0, 1000.0, 15),
+            line(2, RADIO, 10.0, 1000.0, 16),
+        ]);
+        let list = d.len() as u32;
+        let f = |v: f32| v.to_bits();
+        let words: Vec<u32> = vec![
+            0x1234_5678,
+            0x100,
+            f(0.84),
+            f(-1.0), // a looping mixed cue
+            CURVE_VOLUME,
+            0,
+            2,
+            0x15ba_509e,
+            0x14,
+            0,
+            f(0.0),
+            f(1.0),
+            f(1.0), // volume: 0 to 1
+            CURVE_PITCH,
+            0,
+            2,
+            0x15ba_509e,
+            0x14,
+            0,
+            f(-1.0),
+            f(0.5),
+            f(3.0), // pitch: -1 to 3 by half speed
+            0x102_0200,
+            1,
+            f(0.0),
+            0x10,
+            0xabcd,
+            1,
+            f(1.0), // track
+            0x55,
+            0,
+            f(0.5),
+            f(0.125),
+            0xabcd,
+            0, // a plain cue
+        ];
+        d.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+        let end = d.len() as u32;
+        d[0x18..0x1c].copy_from_slice(&list.to_le_bytes());
+        d[0x1c..0x20].copy_from_slice(&end.to_le_bytes());
+        let t = CueTable::parse_data(&d).unwrap();
+        let m = t.mix(0x1234_5678).unwrap();
+        assert_eq!(m.curves.len(), 1);
+        let [volume, pitch] = &m.curves[0][..] else {
+            panic!("two curves");
+        };
+        assert_eq!((volume.kind, pitch.kind), (CURVE_VOLUME, CURVE_PITCH));
+        assert_eq!(volume.points, [(0.0, 0.0), (1.0, 1.0)]);
+        assert_eq!(volume.at(0.25), 0.25);
+        assert_eq!(pitch.at(0.25), 1.0);
+        assert_eq!(pitch.at(0.75), 3.0);
+    }
+
     // The Semi's engine start: a header block holding a track header
     // followed by 0x100, 1.0 and -1, which reads like a looping cue of
     // its own; the cue is still found, with its one track.
