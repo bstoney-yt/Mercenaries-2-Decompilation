@@ -39,6 +39,7 @@ use std::collections::HashSet;
 use m2_engine::Physics;
 use m2_engine::car_attack::{self, AttackWorld, CarAttack, Sight};
 use m2_engine::car_driver::{self, CarDriver, CarInputs, CarState, Quarry};
+use m2_engine::path_search::{self, PathWorld};
 use m2_engine::road_ring::{self, Arrival, Flood, RoadNet};
 use m2_engine::tank_attack::{Hull, TankAttack, TankWorld};
 use m2_math::glam::{Quat, Vec3};
@@ -60,12 +61,100 @@ struct Look<'a> {
     car: m2_engine::physics::VehicleId,
     /// Its nose, metres ahead of its origin.
     nose: f32,
+    /// Its size for a path search, its way found (with the goal it was
+    /// found for), and the lookahead it follows it by.
+    size: path_search::Size,
+    route: &'a mut Option<(Vec3, Option<path_search::Way>)>,
+    ahead: f32,
+}
+
+/// A path search's world: the alpha's physics, passing through the car
+/// searching.
+struct Ground<'a> {
+    physics: &'a Physics,
+    car: m2_engine::physics::VehicleId,
+    sweeps: usize,
+    ground_hits: usize,
+    body_hits: usize,
+}
+
+impl PathWorld for Ground<'_> {
+    fn sweep(&mut self, from: Vec3, to: Vec3, half: Vec3) -> Option<path_search::Obstacle> {
+        self.sweeps += 1;
+        let o = self.physics.sweep_obstacle(from, to, half, Some(self.car));
+        match o {
+            Some(o) if o.ground => self.ground_hits += 1,
+            Some(o) => {
+                self.body_hits += 1;
+                if self.body_hits <= 4 && std::env::var_os("M2_PATH_DEBUG").is_some() {
+                    eprintln!(
+                        "pursuers: path sweep {:.0} -> {:.0} met body {:#x} at {:.0}, box {:.1} at {:.0}",
+                        from,
+                        to,
+                        o.id,
+                        o.point,
+                        o.max - o.min,
+                        o.pose.0
+                    );
+                }
+            }
+            None => {}
+        }
+        o
+    }
+    /// Past the car searching (the 360's ray, 0x822E4120, would stand its
+    /// first node on its own roof; inferred that it doesn't).
+    fn ground(&mut self, at: Vec3) -> Option<(Vec3, Option<u64>)> {
+        self.physics.path_ground(at, Some(self.car))
+    }
+    /// The alpha does not yet place `AiHintNode` hardpoints: none.
+    fn hints(&mut self, _: u64) -> Vec<(u32, Vec3)> {
+        Vec::new()
+    }
+    fn body(&mut self, id: u64) -> Option<path_search::Obstacle> {
+        self.physics.obstacle(id)
+    }
 }
 
 impl AttackWorld for Look<'_> {
     fn rand(&mut self) -> f32 {
         *self.rng = self.rng.wrapping_mul(0x0019_660d).wrapping_add(0x3c6e_f35f);
         (*self.rng >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    /// Its way to `goal`, searched once for each goal (0x822BF5E0 keeps a
+    /// way while its goal stays put), then followed a lookahead on; straight
+    /// at the goal when the search found none.
+    fn toward(&mut self, from: Vec3, goal: Vec3) -> Vec3 {
+        if self
+            .route
+            .as_ref()
+            .is_none_or(|(g, _)| g.distance(goal) > 0.01)
+        {
+            let mut world = Ground {
+                physics: self.physics,
+                car: self.car,
+                sweeps: 0,
+                ground_hits: 0,
+                body_hits: 0,
+            };
+            let way = path_search::find(&mut world, self.size, from, goal);
+            eprintln!(
+                "pursuers: way to {:.0} from {:.0}: {} ({} sweeps, {} met the ground, {} a body)",
+                goal,
+                from,
+                way.as_ref()
+                    .map_or("none".to_owned(), |w| format!("{} points", w.points.len())),
+                world.sweeps,
+                world.ground_hits,
+                world.body_hits
+            );
+            *self.route = Some((goal, way));
+        }
+        match self.route.as_ref() {
+            Some((_, Some(w))) => w.ahead_of(from, self.ahead),
+            _ => goal,
+        }
     }
 
     /// A ray 1 m up from its middle to 1 m up at her, past the car's own
@@ -146,6 +235,8 @@ struct Pursuer {
     attack: CarAttack,
     /// A tank's driver: `TankAttack`.
     tank: TankAttack,
+    /// Its driver's way (0x822BF7A8's path), with its goal.
+    route: Option<(Vec3, Option<path_search::Way>)>,
     leaving: bool,
 }
 
@@ -271,6 +362,7 @@ impl Pursuers {
             attacks: false,
             attack: CarAttack::default(),
             tank: TankAttack::default(),
+            route: None,
             leaving: false,
         });
         self.gate[kind.gate()] = GATE;
@@ -409,6 +501,16 @@ impl Pursuers {
                     rng: &mut self.rng,
                     car: id,
                     nose: v.spec.bounds.1.z,
+                    size: path_search::Size {
+                        width: v.spec.bounds.1.x - v.spec.bounds.0.x,
+                        height: v.spec.bounds.1.y,
+                    },
+                    route: &mut p.route,
+                    ahead: path_search::lookahead(
+                        (v.spec.bounds.1 - v.spec.bounds.0).max_element(),
+                        car.speed().abs(),
+                        dt,
+                    ),
                 };
                 let t = p.tank.think(&hull, &sight, &mut world, dt);
                 if p.tank.state != state {
@@ -471,6 +573,16 @@ impl Pursuers {
                         rng: &mut self.rng,
                         car: id,
                         nose: v.spec.bounds.1.z,
+                        size: path_search::Size {
+                            width: v.spec.bounds.1.x - v.spec.bounds.0.x,
+                            height: v.spec.bounds.1.y,
+                        },
+                        route: &mut p.route,
+                        ahead: path_search::lookahead(
+                            (v.spec.bounds.1 - v.spec.bounds.0).max_element(),
+                            car.speed().abs(),
+                            dt,
+                        ),
                     };
                     let state = p.attack.state;
                     let input = p.attack.think(

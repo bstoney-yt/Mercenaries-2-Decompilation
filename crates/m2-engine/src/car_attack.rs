@@ -44,9 +44,9 @@
 //! her on the far side of the car's middle across its heading, "past its
 //! nose" past its front. Not ported (taken as never): the stuck check
 //! (+0x34), the hit memory (+0x6BC, +0x6CC, state 6), riders asking for
-//! a turn (kind 6), 0x822AA348's ordered point. Stand-ins: its way
-//! (0x822BF7A8's path) is the straight line to the point; the
-//! manoeuvre (0x822C8770) is 0x822AC008 toward her (which backs round
+//! a turn (kind 6), 0x822AA348's ordered point. Its way is
+//! 0x822BF7A8's path ([`AttackWorld::toward`], [`crate::path_search`]).
+//! Stand-in: the manoeuvre (0x822C8770) is 0x822AC008 toward her (which backs round
 //! when she is inside its turn).
 
 use m2_math::glam::Vec3;
@@ -91,6 +91,13 @@ pub trait AttackWorld {
     fn rand(&mut self) -> f32;
     /// The line from `from` to `to` is clear (0x82166958's sweep).
     fn line_clear(&mut self, from: Vec3, to: Vec3) -> bool;
+    /// Where to steer for, going from `from` to `goal` by its way
+    /// (0x822BF7A8 asks for one, [`crate::path_search`]); straight at it
+    /// unless the world finds one.
+    fn toward(&mut self, from: Vec3, goal: Vec3) -> Vec3 {
+        let _ = from;
+        goal
+    }
 }
 
 /// One driver's `CarAttack` memory.
@@ -241,7 +248,8 @@ impl CarAttack {
                 self.way = None;
                 self.timer = (world.rand() + 1.0) * 3.0;
             } else {
-                return driver.drive_to(car, end, 10.0, false, dt);
+                let to = world.toward(car.at, end);
+                return driver.drive_to(car, to, 10.0, false, dt);
             }
         }
         out.unwrap_or_else(|| car_driver::slow_to_stop(car).unwrap_or_default())

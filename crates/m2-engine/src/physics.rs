@@ -5574,6 +5574,123 @@ impl Physics {
             .map(|(_, hit)| hit.time_of_impact)
     }
 
+    /// What a path search's sweep met ([`crate::path_search`]): a box of
+    /// half extents `half` from `from` to `to`, turned to face along it,
+    /// passing through vehicle `skip`'s bodies, meeting no terrain (inferred,
+    /// as [`cast_box`](Self::cast_box)'s: a box 0.375 m up would meet every rise).
+    pub fn sweep_obstacle(
+        &self,
+        from: Vec3,
+        to: Vec3,
+        half: Vec3,
+        skip: Option<VehicleId>,
+    ) -> Option<crate::path_search::Obstacle> {
+        let d = to - from;
+        let len = d.length();
+        if len < 1e-4 {
+            return None;
+        }
+        let turn = Quat::from_rotation_y(d.x.atan2(d.z));
+        let cube = r::Cuboid::new(vector(half.max(Vec3::splat(1e-3))));
+        let options = rapier3d::parry::query::ShapeCastOptions {
+            max_time_of_impact: len,
+            stop_at_penetration: false,
+            ..Default::default()
+        };
+        let (handle, hit) = self.skipping(skip, false, |filter| {
+            self.world
+                .cast_shape(&pose(from, turn), vector(d / len), &cube, options, filter)
+        })?;
+        let mut o = self.body_obstacle(handle)?;
+        // Where it met it: the point on what it met (the 360 records the
+        // contact). Touching only at the very end of the sweep (within 5 cm,
+        // the alpha's own margin) is no meeting: a node put where the last
+        // sweep met the ground would otherwise always be met again there.
+        if hit.time_of_impact > len - 0.05 {
+            return None;
+        }
+        o.point = vec3(hit.witness1);
+        Some(o)
+    }
+
+    /// The bodies of vehicle `skip`: its chassis, its turret's and its
+    /// gun's.
+    fn bodies_of(&self, skip: Option<VehicleId>) -> Vec<r::RigidBodyHandle> {
+        let Some(v) = skip
+            .and_then(|v| self.vehicles.get(v.0))
+            .and_then(Option::as_ref)
+        else {
+            return Vec::new();
+        };
+        let mut b = vec![v.controller.chassis];
+        if let Some(h) = &v.hinge {
+            b.push(h.body);
+            if let Some(g) = &h.gun {
+                b.push(g.body);
+            }
+        }
+        b
+    }
+
+    /// Runs `f` with what is solid but vehicle `skip`'s bodies.
+    fn skipping<R>(
+        &self,
+        skip: Option<VehicleId>,
+        terrain: bool,
+        f: impl FnOnce(r::QueryFilter<'_>) -> R,
+    ) -> R {
+        let own = self.bodies_of(skip);
+        let keep = |h: r::ColliderHandle, c: &r::Collider| {
+            c.parent().is_none_or(|p| !own.contains(&p))
+                && (terrain || !matches!(self.keys.get(&h), Some(StaticKey::Cell(_))))
+        };
+        f(solid().predicate(&keep))
+    }
+
+    /// Collider `handle` as a path search's obstacle: its id, whether it is
+    /// the ground, its box.
+    fn body_obstacle(&self, handle: r::ColliderHandle) -> Option<crate::path_search::Obstacle> {
+        let c = self.world.colliders.get(handle)?;
+        let b = c.shape().compute_local_aabb();
+        let p = c.position();
+        let (i, g) = handle.into_raw_parts();
+        Some(crate::path_search::Obstacle {
+            point: vec3(p.translation),
+            id: (u64::from(g) << 32) | u64::from(i),
+            ground: matches!(self.keys.get(&handle), Some(StaticKey::Cell(_))),
+            pose: (vec3(p.translation), Quat::from_array(p.rotation.to_array())),
+            min: vec3(b.mins),
+            max: vec3(b.maxs),
+        })
+    }
+
+    /// A path search's obstacle by its id
+    /// ([`sweep_obstacle`](Self::sweep_obstacle)).
+    pub fn obstacle(&self, id: u64) -> Option<crate::path_search::Obstacle> {
+        self.body_obstacle(r::ColliderHandle::from_raw_parts(
+            id as u32,
+            (id >> 32) as u32,
+        ))
+    }
+
+    /// The ground under `at` for a path search (0x822E4120: a ray from 2 m
+    /// above to 1000 m below): where, and the body whose top it is when not
+    /// the terrain.
+    pub fn path_ground(&self, at: Vec3, skip: Option<VehicleId>) -> Option<(Vec3, Option<u64>)> {
+        let top = at + Vec3::Y * 2.0;
+        let ray = r::Ray::new(vector(top), vector(Vec3::NEG_Y));
+        let (handle, toi) = self.skipping(skip, true, |filter| {
+            self.world
+                .query_pipeline_with_filter(filter)
+                .cast_ray(&ray, 1002.0, true)
+        })?;
+        let body = self
+            .body_obstacle(handle)
+            .filter(|o| !o.ground)
+            .map(|o| o.id);
+        Some((top - Vec3::Y * toi, body))
+    }
+
     /// The first solid thing along a ray, passing through vehicle `skip`:
     /// its distance, and the vehicle it is if one (what a round hits).
     pub fn cast_ray_vehicle(
