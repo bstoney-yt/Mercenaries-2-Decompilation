@@ -200,6 +200,9 @@ struct Options {
     /// starts.
     lead: Option<f32>,
     fight: bool,
+    /// `--shuffle-test`: a soldier standing aimed while she steps round
+    /// him ([`shuffle_test`]).
+    shuffle_test: bool,
     /// With `--screenshot`: rocket the nearest fuel tank or barrel.
     blast: bool,
     /// With `--blast`: shoot it with the rifle instead.
@@ -672,6 +675,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             }
             "--lead" => o.lead = Some(value()?.parse().context("--lead expects seconds")?),
             "--fight" => o.fight = true,
+            "--shuffle-test" => o.shuffle_test = true,
             "--blast" => o.blast = true,
             "--blast-rifle" => {
                 o.blast = true;
@@ -2132,6 +2136,8 @@ fn screenshot(
             stage,
             options.fight_wait,
         )?;
+    } else if options.shuffle_test && game.on_foot && game.scene.player.is_some() {
+        shuffle_test(&mut game);
     } else if options.fight && game.on_foot && game.scene.player.is_some() {
         fight_for_screenshot(&mut backend, &mut game, fov, aspect, options.fight_wait)?;
     } else if let Some(rockets) = options
@@ -7319,6 +7325,89 @@ fn aim_at(game: &mut Game, target: m2_math::glam::Vec3) {
 /// Fights for the screenshot: shoots the nearest soldier, fires a rocket
 /// at the nearest parked vehicle and throws a grenade, printing how it
 /// went, then takes the picture aiming at the soldier.
+/// `--shuffle-test`: a soldier standing aimed while she steps round him.
+/// She stands 15 m from the nearest soldier, alerted to her, and every
+/// two seconds moves to 100 degrees off where he faces
+/// (to his left, ahead, to his right, ahead); his body's heading, his feet's and the shuffles
+/// he plays are logged (`shuffle-test:` lines and the `anim: soldier
+/// shuffle` ones), for the standing locomotion ([`m2_engine::on_foot::Shuffle`]).
+fn shuffle_test(game: &mut Game) {
+    let tick = TICK.as_secs_f32();
+    let here = game.focus();
+    let Some(i) = game
+        .scene
+        .people
+        .npcs
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.soldier && n.alive && n.landed)
+        .min_by(|a, b| {
+            let d = |n: &npc::Npc| n.character.position.distance(here);
+            d(a.1).total_cmp(&d(b.1))
+        })
+        .map(|(i, _)| i)
+    else {
+        eprintln!("shuffle-test: no soldier near");
+        return;
+    };
+    let spawn = game.scene.people.npcs[i].spawn;
+    let find = |game: &Game| {
+        game.scene
+            .people
+            .npcs
+            .iter()
+            .position(|n| n.spawn.is_some() && n.spawn == spawn)
+    };
+    let round = [0.0f32, 100.0, 0.0, -100.0, 0.0, 100.0, 0.0, -100.0, 0.0];
+    let mut feet_off_max = 0.0f32;
+    let mut standing = 0;
+    for (step, deg) in round.iter().enumerate() {
+        let Some(i) = find(game) else {
+            eprintln!("shuffle-test: lost him at step {step}");
+            return;
+        };
+        let n = &mut game.scene.people.npcs[i];
+        n.alert = true;
+        let at = n.character.position;
+        let start = n.facing;
+        // Round him from where he faced at the start.
+        let a = start + deg.to_radians();
+        if let Some(p) = game.scene.player.as_mut() {
+            p.character.position = at + m2_math::glam::Vec3::new(a.sin(), 0.0, a.cos()) * 15.0;
+            p.character.velocity = m2_math::glam::Vec3::ZERO;
+        }
+        for t in 0..(2.0 / tick) as usize {
+            game.step(Intent::default(), tick);
+            let Some(i) = find(game) else { break };
+            let n = &game.scene.people.npcs[i];
+            let mut off = (n.feet() - n.facing).rem_euclid(std::f32::consts::TAU);
+            if off > std::f32::consts::PI {
+                off -= std::f32::consts::TAU;
+            }
+            let still = n.character.velocity.length() < 0.05;
+            if still {
+                standing += 1;
+                feet_off_max = feet_off_max.max(off.abs());
+            }
+            if t % 10 == 0 {
+                eprintln!(
+                    "shuffle-test: step {step} ({deg:+.0}) t {:.2} body {:.0} feet {:.0} off {:+.0} still {still} clip {:?} alive {}",
+                    t as f32 * tick,
+                    n.facing.to_degrees(),
+                    n.feet().to_degrees(),
+                    off.to_degrees(),
+                    n.rig.animator.current().map(|c| n.rig.clips[c.0].hash),
+                    n.alive,
+                );
+            }
+        }
+    }
+    eprintln!(
+        "shuffle-test: done; {standing} still ticks, feet off the body at most {:.0} deg",
+        feet_off_max.to_degrees()
+    );
+}
+
 fn fight_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,

@@ -111,6 +111,11 @@ pub struct Rig {
     /// Which way the legs walk aiming ([`m2_engine::on_foot::AimLegs`]),
     /// set by whoever moves the rig (a soldier); forward when not.
     pub aim_walk: m2_engine::on_foot::AimLegs,
+    /// A shuffle round playing on the legs ([`Rig::shuffle_legs`]):
+    /// the aim reference keeps time with it, as the 360 times the
+    /// shuffles' references alone (0x82809D60, nodes +0x5D4 and +0x624),
+    /// so the shuffle lays no motion over the aimed upper body.
+    pub shuffling: bool,
     /// The locomotion node's clock, seconds (the 360's +0x1588): runs the
     /// noise of the crouched gait's weight over the aim
     /// ([`m2_engine::aim_sweep::layer_weight`]).
@@ -726,6 +731,7 @@ impl Rig {
             kick: Default::default(),
             aim_legs: false,
             aim_walk: Default::default(),
+            shuffling: false,
             aim_clock: 0.0,
             arm: Default::default(),
             skeleton: Arc::new(skeleton),
@@ -793,6 +799,7 @@ impl Rig {
             kick: Default::default(),
             aim_legs: false,
             aim_walk: Default::default(),
+            shuffling: false,
             aim_clock: 0.0,
             arm: Default::default(),
             skeleton: Arc::new(skeleton),
@@ -828,6 +835,7 @@ impl Rig {
             kick: Default::default(),
             aim_legs: false,
             aim_walk: Default::default(),
+            shuffling: false,
             aim_clock: 0.0,
             animator: Animator::default(),
             cues: Vec::new(),
@@ -870,6 +878,27 @@ impl Rig {
         self.animator.play_gait(clip, length);
     }
 
+    /// Standing aimed upright, a shuffle round on the legs: clip `clip`
+    /// played once (from its start when `fresh`), the aim sweep over the
+    /// upper body as standing ([`hold_rifle`](Self::hold_rifle)), the
+    /// 360's standing locomotion's states 1 and 2 (0x82809D60). Without
+    /// the sweeps, the rifle aimed by the whole-body aim clip as before.
+    pub fn shuffle_legs(&mut self, clip: usize, fresh: bool, clips: &npc::FightClips) {
+        if self.sweep_upper || self.sweep_clips().is_none() {
+            self.hold_rifle(Gait::Idle, clips, Carry::Aim);
+            return;
+        }
+        self.shuffling = true;
+        self.aim_legs = true;
+        self.gait = Gait::Idle;
+        self.two_handed = true;
+        self.animator.set_upper(None);
+        if fresh || self.animator.current().is_none_or(|(c, _)| c != clip) {
+            self.animator.play_once(clip);
+            self.animator.seek(0.0);
+        }
+    }
+
     /// Moves at `gait` holding a rifle as `carry` says. Aiming, it is
     /// shouldered: by the whole body standing, by the upper body over the
     /// legs' gait when moving. Running, it is held low across the body in
@@ -886,6 +915,7 @@ impl Rig {
     /// side to side and round again (Brendan's playtest). The 360's
     /// standing locomotion plays the idle clip.
     pub fn hold_rifle(&mut self, gait: Gait, clips: &npc::FightClips, carry: Carry) {
+        self.shuffling = false;
         // Aiming upright (not a hero, who aims in crouched), the 360's
         // locomotion node plays its aim movement on the legs and the aim
         // sweeps over the upper body ([`Rig::sweep`]): the legs' gait is
@@ -949,7 +979,7 @@ impl Rig {
     /// The rifle's sweep clips, standing and moving, if this rig has them:
     /// the people's by the generic rifle rows, a hero's as
     /// [`set_sweeps`](Self::set_sweeps) gave them.
-    fn sweep_clips(&self) -> Option<Sweeps> {
+    pub fn sweep_clips(&self) -> Option<Sweeps> {
         if self.sweep_upper || !self.own.is_empty() {
             return self.sweeps.get().copied().flatten();
         }
@@ -1038,7 +1068,9 @@ impl Rig {
             // helpers) the reference pose. The root stays the gait's, as
             // it carries her place.
             let gait = self.animator.gait_pose(&self.skeleton, &self.clips, false);
-            let start = self.animator.gait_pose(&self.skeleton, &self.clips, true);
+            let start = self
+                .animator
+                .gait_pose(&self.skeleton, &self.clips, !self.shuffling);
             let w = aim_sweep::layer_weight(self.aim_clock, false);
             let rest = self.skeleton.rest_pose();
             let parts = self

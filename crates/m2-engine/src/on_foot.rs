@@ -713,11 +713,28 @@ pub const SHUFFLE_AT: f32 = std::f32::consts::FRAC_PI_3;
 /// 0x82A2A3A0).
 pub const SHUFFLE_LEFT: f32 = 110.0 * std::f32::consts::PI / 180.0;
 pub const SHUFFLE_RIGHT: f32 = std::f32::consts::FRAC_PI_2;
-/// Swinging the aim round faster than the shuffle turns, the feet turn at
-/// this much of the aim's rate instead (0x82B4DB14).
+/// Turning faster than the shuffle turns, the feet turn at this much of
+/// the body's rate instead (0x82B4DB14).
 pub const SHUFFLE_CATCH_UP: f32 = 1.1;
+/// The wanted heading counts as still turning at under this much of the
+/// shuffle's own rate (0x82003BCC); then the feet catch up only once far
+/// behind the body: shuffling left, past 0.8 (0x82B4DB10) of 155 degrees
+/// (0x82070294, scaled at 0x82A2A308) to its right; shuffling right,
+/// past 0.8 of 90 degrees (the -90 at 0x820F8D04, scaled at 0x82A2A328)
+/// to its left.
+pub const SHUFFLE_CATCH_STILL: f32 = 0.25;
+pub const SHUFFLE_BEHIND_LEFT: f32 = 0.8 * 155.0 * std::f32::consts::PI / 180.0;
+pub const SHUFFLE_BEHIND_RIGHT: f32 = 0.8 * std::f32::consts::FRAC_PI_2;
 
 /// A shuffle under way: which way, and seconds into its clip.
+///
+/// From the 360 code: the standing locomotion's step (0x82809D60) keeps
+/// its own heading for the feet (+0x1584, the body's when the stance
+/// starts, 0x828071A8) and their offset from the body's heading
+/// (+0x1580). Aiming (state 0), past [`SHUFFLE_AT`] it plays a shuffle
+/// clip (state 1 to the left, 2 to the right) that turns the feet by
+/// [`SHUFFLE_LEFT`] or [`SHUFFLE_RIGHT`] over its length, and goes back
+/// to state 0 when the clip ends.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shuffle {
     pub left: bool,
@@ -727,37 +744,76 @@ pub struct Shuffle {
 impl Shuffle {
     /// Starts one when the feet (`feet`) are further than [`SHUFFLE_AT`]
     /// from the aim (`aim`), both headings: to the left when the aim is to
-    /// their left.
+    /// their left. The player's: her aim is both the body's heading and
+    /// the wanted one ([`begin`](Self::begin)).
     pub fn start(feet: f32, aim: f32) -> Option<Self> {
-        let off = wrap(feet - aim);
-        (off.abs() > SHUFFLE_AT).then_some(Self {
-            left: off < 0.0,
-            time: 0.0,
-        })
+        Self::begin(wrap(feet - aim), 0.0)
     }
 
-    /// Steps on `dt` seconds of a clip `length` seconds long with the aim
-    /// turning at `aim_rate` rad/s: the feet's turn this step (radians,
-    /// positive to the left) and the clip's play rate, or `None` once the
-    /// clip has played out (0x82809D60, states 1 and 2).
-    pub fn step(&mut self, length: f32, aim_rate: f32, dt: f32) -> Option<(f32, f32)> {
+    /// The 360's test (0x82809D60, state 0): `feet` the feet's offset
+    /// from the body's heading, `toward` the wanted heading's offset from
+    /// it, radians, positive to the left. To the left when the feet are
+    /// past [`SHUFFLE_AT`] to the body's right or the wanted heading past
+    /// it to the body's left; to the right the other way round.
+    pub fn begin(feet: f32, toward: f32) -> Option<Self> {
+        let left = feet < -SHUFFLE_AT || toward > SHUFFLE_AT;
+        let right = feet > SHUFFLE_AT || toward < -SHUFFLE_AT;
+        (left || right).then_some(Self { left, time: 0.0 })
+    }
+
+    /// Steps on `dt` seconds of a clip `length` seconds long, the
+    /// player's: her aim, turning at `aim_rate` rad/s, is both the body's
+    /// heading and the wanted one, her feet `feet` off it ([`turn`](Self::turn)).
+    pub fn step(&mut self, length: f32, aim_rate: f32, feet: f32, dt: f32) -> Option<(f32, f32)> {
+        self.turn(length, aim_rate, aim_rate, feet, dt)
+    }
+
+    /// Steps on `dt` seconds of a clip `length` seconds long: the feet's
+    /// turn this step (radians, positive to the left) and the clip's play
+    /// rate, or `None` once the clip has played out (0x82809D60, states 1
+    /// and 2). `body` and `toward` are how fast the body's heading and the
+    /// wanted one turn (rad/s, positive to the left), `feet` the feet's
+    /// offset from the body. With the body turning the shuffle's way
+    /// faster than the clip turns, the feet take [`SHUFFLE_CATCH_UP`] of
+    /// its rate, the clip played faster to match; with the wanted heading
+    /// still ([`SHUFFLE_CATCH_STILL`]), only when the feet are far behind.
+    pub fn turn(
+        &mut self,
+        length: f32,
+        body: f32,
+        toward: f32,
+        feet: f32,
+        dt: f32,
+    ) -> Option<(f32, f32)> {
         if self.time >= length {
             return None;
         }
-        let base = if self.left {
-            SHUFFLE_LEFT
+        let length = length.max(1e-4);
+        let (base, faster, still, behind) = if self.left {
+            let base = SHUFFLE_LEFT / length;
+            (
+                base,
+                body > base,
+                toward <= base * SHUFFLE_CATCH_STILL,
+                feet < -SHUFFLE_BEHIND_LEFT,
+            )
         } else {
-            SHUFFLE_RIGHT
-        } / length.max(1e-4);
-        let rate = if aim_rate.abs() > base {
-            aim_rate.abs() * SHUFFLE_CATCH_UP
+            let base = -SHUFFLE_RIGHT / length;
+            (
+                base,
+                body < base,
+                base * SHUFFLE_CATCH_STILL <= toward,
+                feet > SHUFFLE_BEHIND_RIGHT,
+            )
+        };
+        let rate = if faster && (!still || behind) {
+            body * SHUFFLE_CATCH_UP
         } else {
             base
         };
         let play = rate / base;
         self.time += dt * play;
-        let sign = if self.left { 1.0 } else { -1.0 };
-        Some((sign * rate * dt, play))
+        Some((rate * dt, play))
     }
 }
 
@@ -774,7 +830,7 @@ mod shuffle_tests {
         // A 0.5 s clip turns her 110 degrees left over its length.
         let mut s = s;
         let mut turned = 0.0;
-        while let Some((d, _)) = s.step(0.5, 0.0, 1.0 / 60.0) {
+        while let Some((d, _)) = s.step(0.5, 0.0, 0.0, 1.0 / 60.0) {
             turned += d;
         }
         assert!(
@@ -782,6 +838,49 @@ mod shuffle_tests {
             "{}",
             turned.to_degrees()
         );
+    }
+
+    #[test]
+    fn the_wanted_heading_past_sixty_degrees_starts_one_too() {
+        let r = f32::to_radians;
+        // Feet with the body, the wanted heading 70 degrees to its left.
+        assert!(Shuffle::begin(0.0, r(70.0)).unwrap().left);
+        assert!(!Shuffle::begin(0.0, r(-70.0)).unwrap().left);
+        // Feet 65 degrees to the body's right: round to the left.
+        assert!(Shuffle::begin(r(-65.0), 0.0).unwrap().left);
+        assert_eq!(Shuffle::begin(r(50.0), r(-50.0)), None);
+    }
+
+    #[test]
+    fn the_feet_catch_a_fast_body_unless_the_wanted_heading_is_still() {
+        let dt = 1.0 / 60.0;
+        // A 1 s clip turns 110 degrees a second to the left.
+        let base = SHUFFLE_LEFT;
+        let fast = base * 2.0;
+        let mut s = Shuffle {
+            left: true,
+            time: 0.0,
+        };
+        // Body and wanted heading both turning fast: 1.1 of the body's.
+        let (by, play) = s.turn(1.0, fast, fast, 0.0, dt).unwrap();
+        assert!((by / dt - fast * SHUFFLE_CATCH_UP).abs() < 1e-3);
+        assert!((play - 2.2).abs() < 1e-4);
+        // The wanted heading still, feet near: the clip's own rate...
+        let (by, _) = s.turn(1.0, fast, 0.0, 0.0, dt).unwrap();
+        assert!((by / dt - base).abs() < 1e-4);
+        // ...unless the feet are past 124 degrees behind.
+        let (by, _) = s
+            .turn(1.0, fast, 0.0, (-130.0f32).to_radians(), dt)
+            .unwrap();
+        assert!((by / dt - fast * SHUFFLE_CATCH_UP).abs() < 1e-3);
+        // To the right, the body turning left doesn't speed it up.
+        let mut s = Shuffle {
+            left: false,
+            time: 0.0,
+        };
+        let (by, play) = s.turn(1.0, fast, fast, 0.0, dt).unwrap();
+        assert!((by / dt + SHUFFLE_RIGHT).abs() < 1e-4);
+        assert!((play - 1.0).abs() < 1e-5);
     }
 }
 
