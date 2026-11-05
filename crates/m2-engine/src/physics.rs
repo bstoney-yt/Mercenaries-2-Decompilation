@@ -5544,34 +5544,22 @@ impl Physics {
         max: f32,
         skip: Option<VehicleId>,
     ) -> Option<f32> {
-        let not_terrain = |h: r::ColliderHandle, _: &r::Collider| {
-            !matches!(self.keys.get(&h), Some(StaticKey::Cell(_)))
-        };
-        let mut filter = solid().predicate(&not_terrain);
-        if let Some(v) = skip
-            .and_then(|v| self.vehicles.get(v.0))
-            .and_then(Option::as_ref)
-        {
-            filter = filter.exclude_rigid_body(v.controller.chassis);
-            if let Some(h) = &v.hinge {
-                filter = filter.exclude_rigid_body(h.body);
-            }
-        }
         let cube = r::Cuboid::new(vector(half.max(Vec3::splat(1e-3))));
         let options = rapier3d::parry::query::ShapeCastOptions {
             max_time_of_impact: max,
             stop_at_penetration: false,
             ..Default::default()
         };
-        self.world
-            .cast_shape(
+        self.skipping(skip, false, |filter| {
+            self.world.cast_shape(
                 &pose(origin, turn),
                 vector(direction.normalize_or_zero()),
                 &cube,
                 options,
                 filter,
             )
-            .map(|(_, hit)| hit.time_of_impact)
+        })
+        .map(|(_, hit)| hit.time_of_impact)
     }
 
     /// What a path search's sweep met ([`crate::path_search`]): a box of
