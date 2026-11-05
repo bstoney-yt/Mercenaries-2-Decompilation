@@ -81,6 +81,86 @@ const STUB_NAME: &str = "__m2_stub";
 /// ([`ScriptHost::script_names`]).
 const SCRIPT_NAMES: &str = "m2_script_names";
 
+/// The game's Lua keeps a table's size apart from its contents, as Lua 5.1
+/// built with `LUA_COMPAT_GETN` does (from the 360 code: `table.insert`,
+/// 0x827E3880, ends with the auxiliary library's `setn`, 0x827E0A80, which
+/// stores the size in the table's own numeric `n` if it has one, else in
+/// a weak table of sizes; its `getn`, 0x827E0B88, reads those before the
+/// length operator). A stock 5.1 VM finds the size with `#`, which a hole
+/// cuts short: `{ true, nil, 1, " ", true }` with two values inserted at
+/// its front unpacks as 3 values there, 7 in the game (the GUI's
+/// `CallActionScriptCallback` inserts the widget and function name before
+/// the arguments, so the contract fanfare's `fanfareInitialize` lost its
+/// player count). `table.insert`, `remove`, `getn`, `setn`, `concat`,
+/// `foreachi` and `unpack` keep the sizes as the game's do; `#` is the
+/// VM's own, as it is in the game.
+const COMPAT_GETN: &str = r##"
+local rawget, rawset, type, floor = rawget, rawset, type, math.floor
+local sizes = setmetatable({}, { __mode = "k" })
+local function getn(t)
+    local n = rawget(t, "n")
+    if type(n) == "number" then return floor(n) end
+    n = sizes[t]
+    if type(n) == "number" then return n end
+    return #t
+end
+local function setn(t, n)
+    if type(rawget(t, "n")) == "number" then rawset(t, "n", n) else sizes[t] = n end
+end
+local function checktable(t, f)
+    if type(t) ~= "table" then
+        error("bad argument #1 to '" .. f .. "' (table expected, got " .. type(t) .. ")", 3)
+    end
+end
+local unpack0, concat0 = unpack, table.concat
+function table.getn(t) checktable(t, "getn") return getn(t) end
+function table.setn(t, n) checktable(t, "setn") setn(t, n) return t end
+function table.insert(t, ...)
+    checktable(t, "insert")
+    local e = getn(t) + 1
+    local argc = select("#", ...)
+    local pos, v
+    if argc == 1 then
+        pos, v = e, ...
+    elseif argc == 2 then
+        pos, v = ...
+        pos = floor(pos)
+        if pos > e then e = pos end
+        for i = e, pos + 1, -1 do rawset(t, i, rawget(t, i - 1)) end
+    else
+        error("wrong number of arguments to 'insert'", 2)
+    end
+    setn(t, e)
+    rawset(t, pos, v)
+end
+function table.remove(t, pos)
+    checktable(t, "remove")
+    local e = getn(t)
+    pos = pos and floor(pos) or e
+    if not (1 <= pos and pos <= e) then return end
+    setn(t, e - 1)
+    local v = rawget(t, pos)
+    for i = pos, e - 1 do rawset(t, i, rawget(t, i + 1)) end
+    rawset(t, e, nil)
+    return v
+end
+function table.concat(t, sep, i, j)
+    checktable(t, "concat")
+    return concat0(t, sep or "", i or 1, j or getn(t))
+end
+function table.foreachi(t, f)
+    checktable(t, "foreachi")
+    for i = 1, getn(t) do
+        local r = f(i, t[i])
+        if r ~= nil then return r end
+    end
+end
+function unpack(t, i, j)
+    if type(t) ~= "table" then return unpack0(t, i, j) end
+    return unpack0(t, i or 1, j or getn(t))
+end
+"##;
+
 impl ScriptHost {
     pub fn new() -> Result<Self, ScriptError> {
         // SAFETY: loading precompiled chunks needs the unsafe constructor.
@@ -105,6 +185,10 @@ impl ScriptHost {
             .set_mode(ChunkMode::Text)
             .eval()?;
         lua.set_named_registry_value("m2_wrap", wrap)?;
+        lua.load(COMPAT_GETN)
+            .set_name("=m2-compat-getn")
+            .set_mode(ChunkMode::Text)
+            .exec()?;
         let stub_meta = lua.create_table()?;
         stub_meta.set(
             "__index",
@@ -1116,5 +1200,41 @@ mod tests {
         // No stubs: Objective_Add is nil.
         let e = start.call::<()>(()).unwrap_err().to_string();
         assert!(e.contains("mission"), "{e}");
+    }
+
+    #[test]
+    fn tables_keep_their_size_past_a_hole_as_the_games_lua_does() {
+        let host = ScriptHost::new().unwrap();
+        // The GUI's `CallActionScriptCallback`: the widget and the name
+        // go in front of `{ bComplete, bAllowRetry (nil), nPlayers, ...}`,
+        // then all of it is unpacked.
+        let (n, players): (i64, i64) = host
+            .lua()
+            .load(
+                r#"local t = { true, nil, 1, " ", true }
+                table.insert(t, 1, "fanfareInitialize")
+                table.insert(t, 1, 7)
+                local a = { unpack(t) }
+                return select('#', unpack(t)), a[5]"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((n, players), (7, 1));
+        let (getn, after, removed, concat): (i64, i64, String, String) = host
+            .lua()
+            .load(
+                r#"local t = { "a", "b", "c" }
+                local g = table.getn(t)
+                local r = table.remove(t, 1)
+                local u = { n = 5 }
+                table.insert(u, "x")
+                return g, table.getn(t), r .. u.n .. tostring(u[6]), table.concat(t, ",")"#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(
+            (getn, after, removed.as_str(), concat.as_str()),
+            (3, 2, "a6x", "b,c")
+        );
     }
 }
