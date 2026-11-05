@@ -18,9 +18,9 @@
 //! Inferred: the gravity factor is the round's `GravityScale`, the world's
 //! gravity the alpha's own ([`crate::physics::GRAVITY`], as its rounds fall
 //! by it); the round's speed its `Velocity`. Not ported: how often it
-//! takes a new aim point (+0x3C counting down from its +0x40), and its
-//! line-of-fire rays (0x82166510 at layers 0x223F6FDA) and what it does
-//! about what they meet (0x822C9530).
+//! takes a new aim point (+0x3C counting down from its +0x40), and what
+//! it does about what its line of sight meets (0x822C9530); its rays
+//! (mask 0x223F6FDA) are here all that is solid but its own bodies and hers.
 
 use m2_math::glam::Vec3;
 
@@ -132,6 +132,22 @@ pub fn aim(
     p
 }
 
+/// 0x822C9250's three lines of sight, tried once a second: from the middle
+/// of its eye (`eye`) to the middle of its target, and crosswise from
+/// `own` either side of the eye (half the smaller side of its box) to
+/// `far` the other side of the target (0.25 m, or half the smaller side of
+/// its box when it has one). It sees its target when any is clear
+/// (0x822C95D8's +0x70 bits).
+pub fn sight_lines(eye: Vec3, at: Vec3, own: f32, far: f32) -> [(Vec3, Vec3); 3] {
+    let d = (at - eye).with_y(0.0).normalize_or(Vec3::Z);
+    let side = Vec3::new(d.z, 0.0, -d.x);
+    [
+        (eye + side * own, at - side * far),
+        (eye, at),
+        (eye - side * own, at + side * far),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +206,15 @@ mod tests {
         assert!((h - 19.6).abs() < 1.0, "{h}");
         assert_eq!(drop(Vec3::Z * 200.0, 100.0, 0.0), Some(0.0));
         assert!(drop(Vec3::Z * 5000.0, 100.0, 9.81).is_none());
+    }
+
+    #[test]
+    fn its_lines_of_sight_cross() {
+        let [a, b, c] = sight_lines(Vec3::ZERO, Vec3::Z * 50.0, 1.0, 0.25);
+        assert_eq!(b, (Vec3::ZERO, Vec3::Z * 50.0));
+        assert_eq!(a.0.x, 1.0);
+        assert_eq!(a.1.x, -0.25);
+        assert_eq!(c.0.x, -1.0);
+        assert_eq!(c.1.x, 0.25);
     }
 }
