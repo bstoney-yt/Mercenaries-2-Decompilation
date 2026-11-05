@@ -324,9 +324,10 @@ pub struct FightClips {
     /// The swim gaits, slowest first: floating still, then the strokes
     /// ([`FightClips::SWIM_GAITS`]).
     pub swim_gaits: [Option<usize>; 4],
-    /// Aiming upright, the legs' gaits: standing, then walking, jogging
-    /// and running forward ([`FightClips::AIM_GAITS`]).
-    pub aim_gaits: [Option<usize>; 4],
+    /// Aiming upright, the legs' gaits: standing, walking, jogging and
+    /// running forward, then walking, jogging and running backward
+    /// ([`FightClips::AIM_GAITS`]).
+    pub aim_gaits: [Option<usize>; 7],
     /// Knocked down (lying, looped), getting up, and subdued (looped)
     /// ([`FightClips::KNOCKED`]).
     pub knocked: Option<usize>,
@@ -409,10 +410,20 @@ impl FightClips {
     /// `AimMovementNodes` play, 0x82804AE8): `Upright_Aim_Idle`
     /// (9f4eb947), `Upright_Aim_WalkForward` (61149bc1),
     /// `Upright_Aim_JogForward` (93c5de3a) and `Upright_Aim_RunForward`
-    /// (e20d8d5b); the handles named by their hashes, the clips from
-    /// samples (the on-foot table). The alpha's run and sprint are the
-    /// 360's jog and run.
-    pub const AIM_GAITS: [u32; 4] = [0xb29a_c474, 0xce87_ea25, 0xa207_7e52, 0x1d5b_7523];
+    /// (e20d8d5b), then entries 5, 3 and 1 backward
+    /// (`Upright_Aim_WalkBackward` 13de8d5d, `JogBackward` 8ece17d0,
+    /// `RunBackward` 5f0cd0e3: the backward state's, 0x82809188); the
+    /// handles named by their hashes, the clips from samples (the on-foot
+    /// table). The alpha's run and sprint are the 360's jog and run.
+    pub const AIM_GAITS: [u32; 7] = [
+        0xb29a_c474,
+        0xce87_ea25,
+        0xa207_7e52,
+        0x1d5b_7523,
+        0x2714_ad0b,
+        0x513a_aeda,
+        0xcafe_197d,
+    ];
 
     /// The swim clip for moving at `moved` m/s and its rate: the gait
     /// whose own root speed is nearest, played to match it (within a
@@ -815,6 +826,20 @@ impl FightClips {
             }
         }
         self
+    }
+
+    /// The entry of [`aim_gaits`](Self::aim_gaits) for `gait`, walking
+    /// backwards or not.
+    pub fn aim_gait_index(gait: Gait, back: bool) -> usize {
+        match (gait, back) {
+            (Gait::Idle, _) => 0,
+            (Gait::Walk, false) => 1,
+            (Gait::Run, false) => 2,
+            (Gait::Sprint, false) => 3,
+            (Gait::Walk, true) => 4,
+            (Gait::Run, true) => 5,
+            (Gait::Sprint, true) => 6,
+        }
     }
 
     /// Every clip, for rebinding.
@@ -1860,6 +1885,18 @@ impl Npc {
         // he turns round with the rifle ready first.
         let ahead = seen && off < AIM_ARC;
         let carry = if ahead { Carry::Aim } else { Carry::Ready };
+        // Aiming, his legs go forwards or backwards by the way he moves
+        // from the way he faces, as the 360's locomotion node picks
+        // (0x828071A8: still at or under 0.01 m/s, 0x82052394).
+        let heading = (moved > 0.01).then(|| {
+            let v = self.character.velocity;
+            v.x.atan2(v.z)
+        });
+        self.rig.aim_walk = if ahead {
+            self.rig.aim_walk.step(heading.map(|h| h - self.facing))
+        } else {
+            m2_engine::on_foot::AimLegs::Still
+        };
         if self.striking <= 0.0 {
             self.rig.hold_rifle(gait, &clips, carry);
         }
@@ -4126,11 +4163,15 @@ pub(crate) mod tests {
     #[test]
     fn the_aim_gaits_are_kept_for_rebinding() {
         let clips = FightClips {
-            aim_gaits: [Some(3), None, Some(5), Some(7)],
+            aim_gaits: [Some(3), None, Some(5), Some(7), None, None, Some(9)],
             ..FightClips::default()
         };
         let all: Vec<usize> = clips.all().collect();
-        assert_eq!(all, vec![3, 5, 7]);
+        assert_eq!(all, vec![3, 5, 7, 9]);
+        // Backwards, each moving gait takes its backward clip.
+        assert_eq!(FightClips::aim_gait_index(Gait::Run, true), 5);
+        assert_eq!(FightClips::aim_gait_index(Gait::Run, false), 2);
+        assert_eq!(FightClips::aim_gait_index(Gait::Idle, true), 0);
     }
 
     #[test]
@@ -4221,6 +4262,7 @@ pub(crate) mod tests {
             sweep_upper: false,
             kick: Default::default(),
             aim_legs: false,
+            aim_walk: Default::default(),
             aim_clock: 0.0,
             arm: Default::default(),
             cues: Vec::new(),
