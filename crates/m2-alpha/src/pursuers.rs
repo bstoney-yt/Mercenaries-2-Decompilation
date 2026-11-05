@@ -41,7 +41,7 @@ use m2_engine::car_attack::{self, AttackWorld, CarAttack, Sight};
 use m2_engine::car_driver::{self, CarDriver, CarInputs, CarState, Quarry};
 use m2_engine::path_search::{self, PathWorld};
 use m2_engine::road_ring::{self, Arrival, Flood, RoadNet};
-use m2_engine::tank_attack::{Hull, TankAttack, TankWorld};
+use m2_engine::tank_attack::{Hull, TankAttack};
 use m2_math::glam::{Quat, Vec3};
 
 use crate::gunships::Shot;
@@ -61,6 +61,8 @@ struct Look<'a> {
     car: m2_engine::physics::VehicleId,
     /// Its nose, metres ahead of its origin.
     nose: f32,
+    /// Its tail, metres behind its origin.
+    tail: f32,
     /// Its size for a path search, its way found (with the goal it was
     /// found for), and the lookahead it follows it by.
     size: path_search::Size,
@@ -160,6 +162,31 @@ impl AttackWorld for Look<'_> {
     /// A ray 1 m up from its middle to 1 m up at her, past the car's own
     /// body, stopping 4 m short of her (the 360 sweeps a box, 0x82166958,
     /// past her: a ray here).
+    /// 0x822C8CB8: its box's face (its width by its height, 0.02 m thin),
+    /// its middle `lift` m above the middle of its height, swept `reach` m
+    /// on from its nose (or back from its tail). Here past its own bodies
+    /// and meeting no terrain, as the path search's sweeps
+    /// ([`Physics::sweep_obstacle`]; the 360's mask 0x6228651E is layers
+    /// 1-4, 8, 10, 13, 14, 19, 21, 25, 29 and 30, not mapped to the alpha's
+    /// bodies); the middle of its height taken as half its height up.
+    fn room(&mut self, forward: bool, lift: f32, reach: f32) -> bool {
+        let Some(m) = self.physics.vehicle_transform(self.car) else {
+            return true;
+        };
+        let way = if forward { 1.0 } else { -1.0 };
+        let ahead = m
+            .transform_vector3(Vec3::Z)
+            .with_y(0.0)
+            .normalize_or(Vec3::Z)
+            * way;
+        let end = if forward { self.nose } else { -self.tail };
+        let face = m.transform_point3(Vec3::Z * end) + Vec3::Y * (self.size.height * 0.5 + lift);
+        let half = Vec3::new(self.size.width * 0.5, self.size.height * 0.5, 0.01);
+        self.physics
+            .sweep_obstacle(face, face + ahead * reach, half, Some(self.car))
+            .is_none()
+    }
+
     fn line_clear(&mut self, from: Vec3, to: Vec3) -> bool {
         let (a, b) = (from + Vec3::Y, to + Vec3::Y);
         let d = b - a;
@@ -198,28 +225,6 @@ impl Kind {
             Kind::Car => "Car",
             Kind::Tank => "Tank",
         }
-    }
-}
-
-impl TankWorld for Look<'_> {
-    /// 0x822C8CB8: its box's face (its width by its height, 0.02 m thin)
-    /// swept from its nose `reach` on along its heading. Here past its own
-    /// bodies and meeting no terrain, as the path search's sweeps
-    /// ([`Physics::sweep_obstacle`]; the 360's filter 0x6228651E is not
-    /// decoded); the face's middle taken as half its height up.
-    fn ahead_clear(&mut self, reach: f32) -> bool {
-        let Some(m) = self.physics.vehicle_transform(self.car) else {
-            return true;
-        };
-        let forward = m
-            .transform_vector3(Vec3::Z)
-            .with_y(0.0)
-            .normalize_or(Vec3::Z);
-        let nose = m.transform_point3(Vec3::Z * self.nose) + Vec3::Y * (self.size.height * 0.5);
-        let half = Vec3::new(self.size.width * 0.5, self.size.height * 0.5, 0.01);
-        self.physics
-            .sweep_obstacle(nose, nose + forward * reach, half, Some(self.car))
-            .is_none()
     }
 }
 
@@ -505,6 +510,7 @@ impl Pursuers {
                     rng: &mut self.rng,
                     car: id,
                     nose: v.spec.bounds.1.z,
+                    tail: -v.spec.bounds.0.z,
                     size: path_search::Size {
                         width: v.spec.bounds.1.x - v.spec.bounds.0.x,
                         height: v.spec.bounds.1.y,
@@ -577,6 +583,7 @@ impl Pursuers {
                         rng: &mut self.rng,
                         car: id,
                         nose: v.spec.bounds.1.z,
+                        tail: -v.spec.bounds.0.z,
                         size: path_search::Size {
                             width: v.spec.bounds.1.x - v.spec.bounds.0.x,
                             height: v.spec.bounds.1.y,

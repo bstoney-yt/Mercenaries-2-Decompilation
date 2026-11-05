@@ -20,7 +20,8 @@
 //!   before the next. It stops (to state 2 as in state 0, else 0) once it
 //!   set off out of range and is now in range, or its way is done.
 //! - **2, turning to face her:** while she is more than 45 degrees off
-//!   its heading it manoeuvres round (0x822C8770); then holds (state 0,
+//!   its heading it manoeuvres round ([`Manoeuvre`]); then, or when it
+//!   has no room, holds (state 0,
 //!   timer `(r + 1) x 3`).
 //! - **3, charging:** while she was seen within 2 s, the timer runs and
 //!   she is within `sqrt(1.5)` x five car lengths (the double 1.5 at
@@ -46,8 +47,9 @@
 //! (+0x34), the hit memory (+0x6BC, +0x6CC, state 6), riders asking for
 //! a turn (kind 6), 0x822AA348's ordered point. Its way is
 //! 0x822BF7A8's path ([`AttackWorld::toward`], [`crate::path_search`]).
-//! Stand-in: the manoeuvre (0x822C8770) is 0x822AC008 toward her (which backs round
-//! when she is inside its turn).
+//! The manoeuvre is [`Manoeuvre`] (0x822C8770); inferred there: its room
+//! check is only 0x822C8CB8's face sweep (the 360 first also sweeps the
+//! whole box shifted toward the turn, 0x82166880 with mask 0x6228651E).
 
 use m2_math::glam::Vec3;
 
@@ -98,6 +100,76 @@ pub trait AttackWorld {
         let _ = from;
         goal
     }
+    /// Room to move ahead (`forward`) or back: 0x822C8CB8's face of its
+    /// box, `lift` m up, swept `reach` m on from its nose or tail; clear
+    /// unless the world says otherwise.
+    fn room(&mut self, forward: bool, lift: f32, reach: f32) -> bool {
+        let _ = (forward, lift, reach);
+        true
+    }
+}
+
+/// The turn-round manoeuvre's state (its record's +8 top bits, 0x822C8770).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Manoeuvre {
+    #[default]
+    Idle,
+    /// Under way, ahead or backing (the record's +0xC bit 3).
+    Turning { forward: bool },
+    /// Over: no room either way, or none left the way it went.
+    Done,
+}
+
+impl Manoeuvre {
+    /// One think of 0x822C8770: turning `car` (of `length`) round toward a
+    /// point `bearing` off its heading, `dist` away. Starting, it goes ahead
+    /// when the point is more than 3 lengths off, else backs; with no room
+    /// that way (0x822C8CB8: 0.5 m up, 0.2 m on) it tries the other, four
+    /// tries in all, and with none it is over. Under way: when the way it
+    /// goes has no room it is over; going ahead within 0.75 x 3 lengths it
+    /// backs instead; full lock toward the point (the other way backing,
+    /// kept to -1..1 of the bearing in radians), the handbrake off and the
+    /// throttle 0.6 ahead or -0.6 back (0x822D3058). `None` when over.
+    pub fn think(
+        &mut self,
+        car: &CarState,
+        length: f32,
+        bearing: f32,
+        dist: f32,
+        world: &mut impl AttackWorld,
+    ) -> Option<AiInput> {
+        let _ = car;
+        if *self == Manoeuvre::Idle {
+            let mut forward = dist > length * 3.0;
+            *self = Manoeuvre::Done;
+            for _ in 0..4 {
+                if world.room(forward, 0.5, 0.2) {
+                    *self = Manoeuvre::Turning { forward };
+                    break;
+                }
+                forward = !forward;
+            }
+        }
+        let Manoeuvre::Turning { mut forward } = *self else {
+            return None;
+        };
+        if !world.room(forward, 0.5, 0.2) {
+            *self = Manoeuvre::Done;
+            return None;
+        }
+        if forward && dist < length * 3.0 * 0.75 {
+            forward = false;
+            *self = Manoeuvre::Turning { forward };
+        }
+        let steer = if forward { bearing } else { -bearing }.clamp(-1.0, 1.0);
+        let pedal = if forward { 0.6 } else { -0.6 };
+        Some(
+            AiInput::default()
+                .send(car_driver::Msg::Steer, steer)
+                .send(car_driver::Msg::Handbrake, 0.0)
+                .send(car_driver::Msg::Throttle, pedal),
+        )
+    }
 }
 
 /// One driver's `CarAttack` memory.
@@ -112,6 +184,8 @@ pub struct CarAttack {
     pub set_off_out: bool,
     /// Its way's end (+0x2DC, +0x360 bit 6).
     pub way: Option<Vec3>,
+    /// Its turn-round manoeuvre (+0x4C record, 0x822C8770).
+    pub manoeuvre: Manoeuvre,
 }
 
 /// The cone she must be in for a line check, radians (0x822ACB28 asks
@@ -205,9 +279,15 @@ impl CarAttack {
                 let bearing = car_driver::wrap(
                     car_driver::yaw(her.at - car.at) - car_driver::yaw(car.forward),
                 );
-                if bearing.abs() > 0.785_25 {
-                    out = Some(driver.drive_to(car, her.at, 40.0, false, dt));
-                } else {
+                let dist = (her.at - car.at).with_y(0.0).length();
+                let turning = bearing.abs() > 0.785_25
+                    && self
+                        .manoeuvre
+                        .think(car, length, bearing, dist, world)
+                        .inspect(|i| out = Some(i.clone()))
+                        .is_some();
+                if !turning {
+                    self.manoeuvre = Manoeuvre::Idle;
                     self.state = State::Hold;
                     self.timer = (world.rand() + 1.0) * 3.0;
                 }
@@ -340,5 +420,50 @@ mod tests {
         a.think(&mut d, &car(0.0), 6.0, Some(50.0), &her(-60.0), &mut w, 0.1);
         assert_eq!(a.state, State::Turning);
         assert!((a.timer - 2.25).abs() < 1e-6);
+    }
+
+    // The manoeuvre: far off it goes ahead on full lock toward her; near,
+    // it backs the other way; with no room either way it is over.
+    #[test]
+    fn the_manoeuvre_goes_ahead_or_backs_or_gives_up() {
+        struct Room(bool, bool);
+        impl AttackWorld for Room {
+            fn rand(&mut self) -> f32 {
+                0.5
+            }
+            fn line_clear(&mut self, _: Vec3, _: Vec3) -> bool {
+                true
+            }
+            fn room(&mut self, forward: bool, _: f32, _: f32) -> bool {
+                if forward { self.0 } else { self.1 }
+            }
+        }
+        let c = car(0.0);
+        let mut m = Manoeuvre::Idle;
+        let i = m.think(&c, 5.0, 2.0, 40.0, &mut Room(true, true)).unwrap();
+        assert_eq!(m, Manoeuvre::Turning { forward: true });
+        assert_eq!(i.last(car_driver::Msg::Steer), Some(1.0));
+        assert_eq!(i.last(car_driver::Msg::Throttle), Some(0.6));
+        // Within 0.75 x 3 lengths: it backs, steering the other way.
+        let i = m.think(&c, 5.0, 2.0, 10.0, &mut Room(true, true)).unwrap();
+        assert_eq!(m, Manoeuvre::Turning { forward: false });
+        assert_eq!(i.last(car_driver::Msg::Steer), Some(-1.0));
+        assert_eq!(i.last(car_driver::Msg::Throttle), Some(-0.6));
+        // No room backing: over.
+        assert!(
+            m.think(&c, 5.0, 2.0, 10.0, &mut Room(true, false))
+                .is_none()
+        );
+        assert_eq!(m, Manoeuvre::Done);
+        // Near with no room behind: it starts ahead, but near as it is it
+        // backs at once (0x822C8770 checks the distance after choosing).
+        let mut m = Manoeuvre::Idle;
+        m.think(&c, 5.0, -0.5, 10.0, &mut Room(true, false));
+        assert_eq!(m, Manoeuvre::Turning { forward: false });
+        let mut m = Manoeuvre::Idle;
+        assert!(
+            m.think(&c, 5.0, -0.5, 10.0, &mut Room(false, false))
+                .is_none()
+        );
     }
 }
