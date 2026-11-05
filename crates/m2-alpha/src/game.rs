@@ -2838,8 +2838,7 @@ impl Game {
     }
 
     /// The nearest vehicles to `ear` someone else drives, as their engines
-    /// are heard ([`crate::sound::ENGINES_HEARD`], within how far the
-    /// game's engines carry, [`ENGINE_REACH`]).
+    /// are heard ([`crate::sound::ENGINES_TRACKED`]).
     pub fn others_engines(&self, ear: Vec3) -> Vec<crate::sound::HeardEngine> {
         let Some(world) = self.scene.world.as_ref() else {
             return Vec::new();
@@ -2855,9 +2854,8 @@ impl Game {
                 let set = *self.scene.engine_sets.get(&v.spec.model)?;
                 let id = v.id?;
                 let at = world.physics.vehicle_transform(id)?.w_axis.truncate();
-                let far = at.distance(ear);
-                (set != 0 && far < ENGINE_REACH).then_some((
-                    far,
+                (set != 0).then_some((
+                    at.distance(ear),
                     crate::sound::HeardEngine {
                         id: i,
                         at,
@@ -2873,7 +2871,7 @@ impl Game {
             })
             .collect();
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
-        near.truncate(crate::sound::ENGINES_HEARD);
+        near.truncate(crate::sound::ENGINES_TRACKED);
         near.into_iter().map(|n| n.1).collect()
     }
 
@@ -4182,16 +4180,10 @@ fn state_effects(world: &World, combat: &mut Combat) {
     }
 }
 
-/// How far others' engines are heard: the farthest the cues' records
-/// carry in the HMMWV's table is 75 m (from samples), with room.
-const ENGINE_REACH: f32 = 100.0;
-
-/// How near the player a vehicle's exhausts smoke (invented: a budget, the
-/// game's own reach for them is not traced).
-const EXHAUST_REACH: f32 = 120.0;
-
 /// Keeps each crewed vehicle's exhaust effects going at their nodes
-/// (`m2_engine::vehicle_parts`; the heat haze is drawn with the vehicle).
+/// (`m2_engine::vehicle_parts`; the heat haze is drawn with the vehicle),
+/// however far off: from the 360 code, 0x822772B0 and 0x822766F0 look at
+/// no distance.
 fn exhaust_smoke(
     world: &World,
     vehicles: &[ParkedVehicle],
@@ -4202,7 +4194,6 @@ fn exhaust_smoke(
     let Some(player) = player else {
         return;
     };
-    let near = player.character.position;
     for (i, v) in vehicles.iter().enumerate() {
         if !v.exhausting(player.driving == Some(i)) {
             continue;
@@ -4214,9 +4205,6 @@ fn exhaust_smoke(
         let Some(at) = v.id.and_then(|id| world.physics.vehicle_transform(id)) else {
             continue;
         };
-        if at.w_axis.truncate().distance(near) > EXHAUST_REACH {
-            continue;
-        }
         for (k, &(node, effect)) in parts.iter().enumerate() {
             let Some(rest) = v.spec.rest.get(node) else {
                 continue;

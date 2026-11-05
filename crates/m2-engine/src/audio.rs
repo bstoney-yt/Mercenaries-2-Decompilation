@@ -951,6 +951,14 @@ impl EngineCue {
         (!tracks.is_empty()).then_some(Self { tracks })
     }
 
+    /// How far it carries: its farthest track's record's distance.
+    pub fn reach(&self) -> f32 {
+        self.tracks
+            .iter()
+            .map(|t| t.falloff.unwrap_or_default().far)
+            .fold(0.0, f32::max)
+    }
+
     /// Each track's gain and pitch with the parameters at `params` (hash,
     /// value): its volumes multiplied, its pitches added, as semitones
     /// (inferred). A curve of a parameter not given is passed over.
@@ -1791,6 +1799,20 @@ mod tests {
         // Semitones add: speed up an octave, load down one.
         let coasting = c.mix(&[(PARAM_SPEED, 1.0), (PARAM_LOAD, 0.0)]);
         assert_eq!(coasting[1], (0.5, 1.0));
+    }
+
+    #[test]
+    fn an_engine_cue_reaches_as_far_as_its_farthest_track() {
+        let mut c = engine_cue();
+        c.tracks[0].falloff = Some(Falloff {
+            near: 35.0,
+            far: 75.0,
+        });
+        c.tracks[1].falloff = Some(Falloff {
+            near: 10.0,
+            far: 80.0,
+        });
+        assert_eq!(c.reach(), 80.0);
     }
 
     #[test]

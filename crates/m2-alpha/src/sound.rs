@@ -774,8 +774,9 @@ pub fn engine_bank(kind: &str, label: &str) -> &'static str {
         .map_or("veh_4cylindernew", |e| e.1)
 }
 
-/// How many others' engines are heard at once (invented: a budget).
-pub const ENGINES_HEARD: usize = 6;
+/// How many engines the sound system tracks at once (from the 360 code:
+/// the pool 0x8236A528 builds, which 0x82403758 draws on, is 64 strong).
+pub const ENGINES_TRACKED: usize = 64;
 
 /// A vehicle someone else drives, as its engine is heard.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2824,14 +2825,19 @@ impl GameAudio {
     }
 
     /// Keeps the engines of the vehicles in `near` heard where they are:
-    /// each one's set's cue for others' engines, moved by its speed. One
-    /// gone from the list falls silent.
-    pub fn others_engines(&mut self, near: &[HeardEngine]) {
+    /// each one's set's cue for others' engines, moved by its speed, for
+    /// as far as that cue's records carry from `ear`. One gone from the
+    /// list or past that falls silent.
+    pub fn others_engines(&mut self, near: &[HeardEngine], ear: Vec3) {
         let gone: Vec<usize> = self
             .others
-            .keys()
-            .filter(|i| !near.iter().any(|n| n.id == **i))
-            .copied()
+            .iter()
+            .filter(|(i, (cue, _))| {
+                !near
+                    .iter()
+                    .any(|n| n.id == **i && n.at.distance(ear) <= cue.reach())
+            })
+            .map(|(i, _)| *i)
             .collect();
         for i in gone {
             if let Some((_, voices)) = self.others.remove(&i) {
@@ -2845,6 +2851,7 @@ impl GameAudio {
                     .gun_cues
                     .cue_of(n.set, m2_engine::spawn_sound::OTHERS_ENGINE_EVENT)
                     .and_then(|k| self.engine_cue(k))
+                    .filter(|c| n.at.distance(ear) <= c.reach())
                 else {
                     continue;
                 };

@@ -9754,7 +9754,7 @@ impl Running {
         self.audio.engine(engine, TICK.as_secs_f32());
         self.audio.rotors(&self.game.scene.flights.sounding());
         let others = self.game.others_engines(ear);
-        self.audio.others_engines(&others);
+        self.audio.others_engines(&others, ear);
         let driving = self.game.driving().is_some();
         let mut remarks = self.game.combat.take_remarks();
         if driving && !self.was_driving && self.game.car_remark_due() {
