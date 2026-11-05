@@ -56,6 +56,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    if let Ok(t) = std::env::var("TABLE") {
+        let want = u32::from_str_radix(&t, 16).unwrap_or(0);
+        for t in tables.iter().filter(|t| t.hash == want) {
+            println!(
+                "table {want:08x}: {} records, plain {:?}",
+                t.records.len(),
+                t.cues
+                    .iter()
+                    .map(|c| format!("{:08x}", c.cue))
+                    .collect::<Vec<_>>()
+            );
+            println!(
+                "   mixes {:?}",
+                t.mixes
+                    .iter()
+                    .map(|m| format!("{:08x} {}", m.cue, m.tracks.len()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    for &k in &picked {
+        for t in &tables {
+            if let Some(m) = t.mix(k) {
+                println!(
+                    "{k:08x}: mixed cue of table {:08x}, {:.3} s, tracks {:?}",
+                    t.hash, m.seconds, m.tracks
+                );
+                for tr in &m.tracks {
+                    let rec = tables
+                        .iter()
+                        .find(|x| x.hash == tr.table)
+                        .and_then(|x| x.records.get(tr.record as usize));
+                    println!(
+                        "   track record {}: {:?}",
+                        tr.record,
+                        rec.map(|r| (&r.variants, r.volume))
+                    );
+                }
+            }
+        }
+    }
     println!("other plain cues: {all_match} of {all} last as long as their longest sound");
     println!("cues given: {some_match} of {some}");
     Ok(())
