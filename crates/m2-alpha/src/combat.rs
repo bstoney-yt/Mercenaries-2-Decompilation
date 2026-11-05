@@ -4242,7 +4242,14 @@ impl Combat {
             if !fire || !loaded {
                 continue;
             }
-            let to = s.at - from;
+            // A gunner leads her and aims up by its round's drop
+            // ([`m2_engine::gunner_aim`], 0x822C95D8).
+            let at = s.lead.map_or(s.at, |l| {
+                m2_engine::gunner_aim::aim(
+                    from, s.at, l.velocity, l.watched, true, s.at, l.speed, l.gravity,
+                )
+            });
+            let to = at - from;
             let dir = m2_engine::weapons::stray_in_cone(
                 to.normalize_or(Vec3::Z),
                 cone,

@@ -189,14 +189,8 @@ impl AttackWorld for Look<'_> {
 
     fn line_clear(&mut self, from: Vec3, to: Vec3) -> bool {
         let (a, b) = (from + Vec3::Y, to + Vec3::Y);
-        let d = b - a;
-        let len = d.length();
-        if len < 1e-3 {
-            return true;
-        }
-        self.physics
-            .cast_ray_past(a, d / len, (len - 4.0).max(0.0), self.car)
-            .is_none()
+        let end = b - (b - a).normalize_or_zero() * 4.0;
+        self.physics.line_clear(a, end, Some(self.car))
     }
 }
 
@@ -246,6 +240,9 @@ struct Pursuer {
     tank: TankAttack,
     /// Its driver's way (0x822BF7A8's path), with its goal.
     route: Option<(Vec3, Option<path_search::Way>)>,
+    /// Seconds to its next look at her, and whether it saw her.
+    sight_wait: f32,
+    sees: bool,
     leaving: bool,
 }
 
@@ -266,6 +263,8 @@ pub struct Pursuers {
     /// Seconds to the next log line.
     log: f32,
     rng: u32,
+    /// What their gunners have seen of her motion ([`m2_engine::gunner_aim::Watch`]).
+    watch: m2_engine::gunner_aim::Watch,
 }
 
 impl Pursuers {
@@ -372,6 +371,8 @@ impl Pursuers {
             attack: CarAttack::default(),
             tank: TankAttack::default(),
             route: None,
+            sight_wait: 0.0,
+            sees: false,
             leaving: false,
         });
         self.gate[kind.gate()] = GATE;
@@ -407,6 +408,8 @@ impl Pursuers {
         dt: f32,
     ) -> Vec<usize> {
         self.shots.clear();
+        // Their gunners' watch on her motion (0x822C95D8, every 0.25 s).
+        self.watch.see(her, dt);
         let mut drop = Vec::new();
         self.log -= dt;
         let log = self.log <= 0.0;
@@ -647,6 +650,26 @@ impl Pursuers {
                     continue;
                 }
             }
+            // Its line of sight to her, tried once a second (0x822C95D8,
+            // 0x822C9250): with no line clear it does not fire.
+            p.sight_wait -= dt;
+            if p.sight_wait <= 0.0 {
+                p.sight_wait = 1.0;
+                let (lo, hi) = v.spec.bounds;
+                let eye = at + Vec3::Y * ((lo.y + hi.y) * 0.5);
+                let aim_at = her + Vec3::Y;
+                let half = (hi.x - lo.x).min(hi.z - lo.z) * 0.5;
+                p.sees = m2_engine::gunner_aim::sight_lines(eye, aim_at, half, 0.25)
+                    .iter()
+                    .any(|&(a, b)| {
+                        // Stopping 1 m short: she or her vehicle is no block.
+                        let end = b - (b - a).normalize_or_zero();
+                        physics.line_clear(a, end, Some(id))
+                    });
+            }
+            if !p.sees {
+                continue;
+            }
             // Its gunners, and its driver when he has a gun of his own
             // (`CarAttack` and `TankAttack` fire it, 0x822C95D8).
             let seats = crate::combat::armed_seats(v);
@@ -659,6 +682,12 @@ impl Pursuers {
                         run: false,
                         seat: k,
                         priority: mount.priority,
+                        lead: Some(crate::gunships::Lead {
+                            velocity: her_velocity,
+                            watched: self.watch.velocity,
+                            speed: mount.weapon.ammo.velocity,
+                            gravity: mount.weapon.ammo.gravity,
+                        }),
                     });
                 }
             }

@@ -190,6 +190,15 @@ struct Gunship {
     leaving: bool,
 }
 
+/// What a gunner aims by ([`Shot::lead`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lead {
+    pub velocity: Vec3,
+    pub watched: Vec3,
+    pub speed: f32,
+    pub gravity: f32,
+}
+
 /// A pilot's ask of its gun this frame (`HeliAttack`'s fire, 0x822B0578).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shot {
@@ -205,6 +214,10 @@ pub struct Shot {
     /// driver's) and the gun's priority there.
     pub seat: usize,
     pub priority: usize,
+    /// A gunner's lead and drop ([`m2_engine::gunner_aim`]), when it aims
+    /// so: its target's velocity, what it has seen of it, its round's
+    /// speed and gravity scale.
+    pub lead: Option<Lead>,
 }
 
 /// The gunships out, and where to put each as it loads.
@@ -377,6 +390,7 @@ impl Gunships {
                             run: pilot.run_fire > 0.0,
                             seat: 0,
                             priority: 0,
+                            lead: None,
                         });
                     }
                     stick

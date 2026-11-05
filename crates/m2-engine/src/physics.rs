@@ -5664,6 +5664,23 @@ impl Physics {
         })
     }
 
+    /// Whether the line from `from` to `to` meets nothing solid, passing
+    /// through vehicle `skip`'s bodies (its chassis, turret and gun).
+    pub fn line_clear(&self, from: Vec3, to: Vec3, skip: Option<VehicleId>) -> bool {
+        let d = to - from;
+        let len = d.length();
+        if len < 1e-4 {
+            return true;
+        }
+        let ray = r::Ray::new(vector(from), vector(d / len));
+        self.skipping(skip, true, |filter| {
+            self.world
+                .query_pipeline_with_filter(filter)
+                .cast_ray(&ray, len, true)
+                .is_none()
+        })
+    }
+
     /// A path search's obstacle by its id
     /// ([`sweep_obstacle`](Self::sweep_obstacle)).
     pub fn obstacle(&self, id: u64) -> Option<crate::path_search::Obstacle> {
