@@ -5,7 +5,7 @@
 //! resolve (the vehicles' engine start and stop cues).
 //!
 //! ```text
-//! cargo run --release -p m2-engine --example cuewords -- "<install dir>" <key hex>...
+//! cargo run --release -p m2-engine --example cuewords -- "<install dir>" <key hex | name:NAME>...
 //! ```
 //!
 //! Prints hashes, offsets and words only.
@@ -22,7 +22,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: cuewords <install dir> <key>...")?;
     let keys: Vec<u32> = args[1..]
         .iter()
-        .filter_map(|k| u32::from_str_radix(k, 16).ok())
+        .filter(|k| !k.starts_with("str:"))
+        .filter_map(|k| match k.strip_prefix("name:") {
+            // A name, hashed as the archives hash names.
+            Some(n) => {
+                let h = m2_assets::name_hash(n);
+                println!("{n} = {h:08x}");
+                Some(h)
+            }
+            None => u32::from_str_radix(k, 16).ok(),
+        })
+        .collect();
+    // Text to find as bytes, any case (`str:heathaze`).
+    let texts: Vec<Vec<u8>> = args[1..]
+        .iter()
+        .filter_map(|k| k.strip_prefix("str:"))
+        .map(|t| t.to_ascii_lowercase().into_bytes())
         .collect();
     let install = Install::find(Path::new(root))?;
     for wad in ["vz.wad", "shell.wad", "English.wad", "Loading.wad"] {
@@ -41,6 +56,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             };
             for (e, data) in contents.iter() {
+                for t in &texts {
+                    let lower = data.to_ascii_lowercase();
+                    for (at, w) in lower.windows(t.len()).enumerate() {
+                        if w != t.as_slice() {
+                            continue;
+                        }
+                        let from = at.saturating_sub(48);
+                        let to = (at + t.len() + 48).min(data.len());
+                        let text: String = data[from..to]
+                            .iter()
+                            .map(|&b| {
+                                if (0x20..0x7f).contains(&b) {
+                                    b as char
+                                } else {
+                                    '.'
+                                }
+                            })
+                            .collect();
+                        println!(
+                            "{wad} block {b} type {:08x} asset {:08x} @0x{at:x}: {text}",
+                            e.type_hash, e.name_hash
+                        );
+                    }
+                }
                 for at in (0..data.len().saturating_sub(3)).step_by(4) {
                     let w =
                         u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);

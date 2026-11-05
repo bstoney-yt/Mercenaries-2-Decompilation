@@ -67,10 +67,13 @@ pub const TAKEN_EVENT: u32 = 0xa639_af36;
 /// wildcard.
 ///
 /// From samples: of the 58 sets of templates with that word set, 53
-/// have a row for each; their cues are plain cues whose record words
-/// carry a high half ([`m2_assets::voice::PlainCue`]), and all 64 such
-/// starts and stops read (36 of the 53 starts, 48 of the stops) last as
-/// long as their cue says (`plaincuelen` example).
+/// have a row for each. 49 starts and 49 stops find sounds; the other
+/// four of each (the helicopters' and the trailer's) name `ba71c11c`, a
+/// cue no table or bank holds, which the template database also gives
+/// as many records' empty value: silent. Most are plain cues whose
+/// record words carry a high half ([`m2_assets::voice::PlainCue`]), and
+/// all 64 such starts and stops last as long as their cue says
+/// (`plaincuelen` example); the rest are mixed cues (the Semi's).
 pub const ENGINE_START_EVENT: u32 = 0x72b6_619e;
 pub const ENGINE_OFF_EVENT: u32 = 0xc8f1_7f2a;
 
