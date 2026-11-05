@@ -61,8 +61,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Where in the model's sections each `SendMessage` command sits: the
-/// fourccs leading to it and the last `CHDR`'s kind (debugging aid).
+/// With `SENDMSG_DEBUG` set, every section of the state `SENDMSG_STATE`
+/// (hex) names, in full, with the fourcc and the last `CHDR`'s kind: where
+/// a state's commands sit (debugging aid).
 fn debug(model: u32, base: &[u8]) {
     let Ok(u) = m2_assets::ucfx::Ucfx::parse(base) else {
         return;
@@ -80,11 +81,15 @@ fn debug(model: u32, base: &[u8]) {
             b"STAT" => stat = w.first().copied().unwrap_or(0),
             _ => {}
         }
-        if w.windows(2).any(|p| p == [2, 0xba20_f82c]) {
+        if std::env::var("SENDMSG_STATE")
+            .ok()
+            .and_then(|s| u32::from_str_radix(&s, 16).ok())
+            == Some(stat)
+        {
             println!(
                 "debug {model:08x} section {i} {} after STAT {stat:08x} CHDR {chdr:08x}: {:08x?}",
                 String::from_utf8_lossy(&s.fourcc),
-                &w[..w.len().min(16)]
+                w
             );
         }
     }

@@ -697,6 +697,9 @@ pub struct StateMessage {
     pub state: u32,
     pub message: u32,
     pub param: u32,
+    /// Sent on leaving the state rather than on entering it
+    /// ([`m2_assets::model::StateActs::exit_messages`]).
+    pub on_exit: bool,
 }
 
 impl StateMessage {
@@ -710,10 +713,13 @@ impl StateMessage {
             .iter()
             .flat_map(|m| m.states.iter().zip(&m.acts))
             .flat_map(|((state, _), acts)| {
-                acts.messages.iter().map(|&(message, param)| Self {
+                let enter = acts.messages.iter().map(|&m| (m, false));
+                let exit = acts.exit_messages.iter().map(|&m| (m, true));
+                enter.chain(exit).map(|((message, param), on_exit)| Self {
                     state: *state,
                     message,
                     param,
+                    on_exit,
                 })
             })
             .collect()

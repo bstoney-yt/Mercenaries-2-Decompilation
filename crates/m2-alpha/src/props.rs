@@ -121,6 +121,12 @@ pub struct Props {
     /// Those wrecked by a blast: their intact parts going down into the
     /// ground ([`SINK_ACCEL`]) as their wreck shows.
     sinking: HashMap<u32, Sinking>,
+    /// Those whose walls went all under since
+    /// [`take_collapsed`](Self::take_collapsed), of those heard coming
+    /// down ([`heard_collapse`](Self::heard_collapse)): their collapse is
+    /// over.
+    collapsed: Vec<u32>,
+    heard: HashSet<u32>,
     /// Knocked loose since [`take_knocked`](Self::take_knocked).
     fresh_knocks: Vec<u32>,
     /// Node matrices of those that move on their own, by entity
@@ -1032,10 +1038,11 @@ impl Props {
             .collect()
     }
 
-    /// What `entity`'s model sends on entering part state `state` (its
-    /// `SendMessage`s, [`m2_engine::StateMessage`]): each message and its
-    /// second operand, once each.
-    pub fn state_messages(&self, entity: u32, state: u32) -> Vec<(u32, u32)> {
+    /// What `entity`'s model sends on entering part state `state`, or on
+    /// leaving it with `exit` (its `SendMessage`s,
+    /// [`m2_engine::StateMessage`]): each message and its second operand,
+    /// once each.
+    pub fn state_messages(&self, entity: u32, state: u32, exit: bool) -> Vec<(u32, u32)> {
         let Some(m) = self
             .shown
             .get(&entity)
@@ -1044,7 +1051,12 @@ impl Props {
             return Vec::new();
         };
         let mut out: Vec<(u32, u32)> = Vec::new();
-        for s in m.gpu.state_messages.iter().filter(|s| s.state == state) {
+        for s in m
+            .gpu
+            .state_messages
+            .iter()
+            .filter(|s| s.state == state && s.on_exit == exit)
+        {
             if !out.contains(&(s.message, s.param)) {
                 out.push((s.message, s.param));
             }
@@ -1628,9 +1640,33 @@ impl Props {
 
     /// Moves on `dt` seconds: what breaks apart sinks.
     pub fn advance(&mut self, dt: f32) {
-        for s in self.sinking.values_mut() {
+        for (e, s) in self.sinking.iter_mut() {
             s.time += dt;
+            let bounds = self
+                .shown
+                .get(e)
+                .and_then(|p| self.models.get(&p.model)?.as_ref())
+                .map(|m| m.gpu.bounds);
+            if !s.ended && bounds.is_some_and(|b| s.done(b)) {
+                s.ended = true;
+                if self.heard.remove(e) {
+                    self.collapsed.push(*e);
+                }
+            }
         }
+    }
+
+    /// `entity` was heard coming down as a building: its collapse's end
+    /// will be told ([`take_collapsed`](Self::take_collapsed)).
+    pub fn heard_collapse(&mut self, entity: u32) {
+        self.heard.insert(entity);
+    }
+
+    /// Those whose collapse ended (their walls all under) since last
+    /// asked: as a building's `CollapseState` is left (inferred: its
+    /// collapse animation's end is read as the state's).
+    pub fn take_collapsed(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.collapsed)
     }
 
     /// Draws those `frustum` may see within their reach of `eye`, as the
@@ -1763,6 +1799,8 @@ struct Sinking {
     /// (model space, level).
     lean: f32,
     axis: Vec3,
+    /// Whether its end has been told ([`Props::take_collapsed`]).
+    ended: bool,
 }
 
 impl Sinking {
@@ -1785,6 +1823,7 @@ impl Sinking {
             lean: lean.to_radians(),
             // Its top goes along `side` of its z.
             axis: Vec3::X * side,
+            ended: false,
         }
     }
 
@@ -1794,6 +1833,7 @@ impl Sinking {
             time: f32::INFINITY,
             lean: 0.0,
             axis: Vec3::X,
+            ended: false,
         }
     }
 
