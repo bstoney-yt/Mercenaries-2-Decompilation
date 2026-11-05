@@ -911,6 +911,8 @@ pub struct EngineTrack {
     pub sound: SoundBuffer,
     /// Its record's level.
     pub volume: f32,
+    /// How far it carries, as its record says.
+    pub falloff: Option<Falloff>,
     pub curves: Vec<m2_assets::voice::Curve>,
 }
 
@@ -942,6 +944,7 @@ impl EngineCue {
             tracks.push(EngineTrack {
                 sound,
                 volume: volume * t.level,
+                falloff: Falloff::of_record(record.min_distance, record.max_distance),
                 curves: curves.clone(),
             });
         }
@@ -1750,6 +1753,7 @@ mod tests {
                 EngineTrack {
                     sound: sound.clone(),
                     volume: 1.0,
+                    falloff: None,
                     curves: vec![Curve {
                         kind: CURVE_VOLUME,
                         param: PARAM_SPEED,
@@ -1759,6 +1763,7 @@ mod tests {
                 EngineTrack {
                     sound,
                     volume: 0.5,
+                    falloff: None,
                     curves: vec![
                         Curve {
                             kind: CURVE_PITCH,

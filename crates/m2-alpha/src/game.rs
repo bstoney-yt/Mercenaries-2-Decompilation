@@ -2837,6 +2837,46 @@ impl Game {
         ))
     }
 
+    /// The nearest vehicles to `ear` someone else drives, as their engines
+    /// are heard ([`crate::sound::ENGINES_HEARD`], within how far the
+    /// game's engines carry, [`ENGINE_REACH`]).
+    pub fn others_engines(&self, ear: Vec3) -> Vec<crate::sound::HeardEngine> {
+        let Some(world) = self.scene.world.as_ref() else {
+            return Vec::new();
+        };
+        let driven = self.scene.player.as_ref().and_then(|p| p.driving);
+        let mut near: Vec<(f32, crate::sound::HeardEngine)> = self
+            .scene
+            .vehicles
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| driven != Some(*i) && v.exhausting(false))
+            .filter_map(|(i, v)| {
+                let set = *self.scene.engine_sets.get(&v.spec.model)?;
+                let id = v.id?;
+                let at = world.physics.vehicle_transform(id)?.w_axis.truncate();
+                let far = at.distance(ear);
+                (set != 0 && far < ENGINE_REACH).then_some((
+                    far,
+                    crate::sound::HeardEngine {
+                        id: i,
+                        at,
+                        set,
+                        speed: world.physics.vehicle_speed(id),
+                        top: v.spec.tuning.max_speed.unwrap_or(if v.spec.tracked {
+                            14.0
+                        } else {
+                            32.0
+                        }),
+                    },
+                ))
+            })
+            .collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        near.truncate(crate::sound::ENGINES_HEARD);
+        near.into_iter().map(|n| n.1).collect()
+    }
+
     /// The vehicle being driven's engine: its sound bank (the one its
     /// template names, else one for its kind), speed and throttle. A wreck
     /// has none.
@@ -4141,6 +4181,10 @@ fn state_effects(world: &World, combat: &mut Combat) {
         }
     }
 }
+
+/// How far others' engines are heard: the farthest the cues' records
+/// carry in the HMMWV's table is 75 m (from samples), with room.
+const ENGINE_REACH: f32 = 100.0;
 
 /// How near the player a vehicle's exhausts smoke (invented: a budget, the
 /// game's own reach for them is not traced).

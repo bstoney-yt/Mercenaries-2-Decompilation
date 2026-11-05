@@ -1365,6 +1365,8 @@ pub struct Scene {
     /// from its exhausts while it has a driver: (node, effect template's
     /// name hash), read once.
     pub smokes: HashMap<(u32, String), Vec<(usize, u32)>>,
+    /// Each vehicle model's engine sound set, read once.
+    pub engine_sets: HashMap<u32, u32>,
     /// When the scene began: the clock those run by.
     began: std::time::Instant,
     /// Time spent streaming since this was last cleared: the island's
@@ -2115,6 +2117,7 @@ impl Scene {
             chunk_models: HashMap::new(),
             hazes: HashMap::new(),
             smokes: HashMap::new(),
+            engine_sets: HashMap::new(),
             began: std::time::Instant::now(),
             streamed: [Duration::ZERO; 3],
         })
@@ -3173,6 +3176,9 @@ impl Scene {
         if let Some(world) = &self.world {
             let db = &world.index.template_db;
             for v in &self.vehicles {
+                self.engine_sets
+                    .entry(v.spec.model)
+                    .or_insert_with(|| db.engine_set_for_model(v.spec.model).unwrap_or(0));
                 self.smokes
                     .entry((v.spec.model, v.spec.label.clone()))
                     .or_insert_with(|| {

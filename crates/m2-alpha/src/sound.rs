@@ -200,6 +200,8 @@ pub struct GameAudio {
     horns_loading: Option<Receiver<SpareHorns>>,
     /// The rotors heard, by helicopter: a voice per loop.
     rotors: HashMap<u32, Vec<VoiceId>>,
+    /// Others' engines heard: their cue and a voice per track.
+    others: HashMap<usize, (Arc<EngineCue>, Vec<VoiceId>)>,
     /// Banks read and found to have no engine sounds.
     silent: HashSet<u32>,
     /// Seconds to the next one.
@@ -772,6 +774,22 @@ pub fn engine_bank(kind: &str, label: &str) -> &'static str {
         .map_or("veh_4cylindernew", |e| e.1)
 }
 
+/// How many others' engines are heard at once (invented: a budget).
+pub const ENGINES_HEARD: usize = 6;
+
+/// A vehicle someone else drives, as its engine is heard.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeardEngine {
+    /// Tells it from the others (its place in the scene's list).
+    pub id: usize,
+    pub at: Vec3,
+    /// Its sound set.
+    pub set: u32,
+    /// Speed and top speed, m/s.
+    pub speed: f32,
+    pub top: f32,
+}
+
 /// The engine of the vehicle being driven, as the game sees it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EngineInput {
@@ -1243,6 +1261,7 @@ impl GameAudio {
                 rx
             }),
             rotors: HashMap::new(),
+            others: HashMap::new(),
             silent: HashSet::new(),
             ambient_wait: 3.0,
             zone_sounds: None,
@@ -2779,6 +2798,82 @@ impl GameAudio {
             std::thread::spawn(move || drop(tx.send((bank, load_engine(&install, bank)))));
         }
         None
+    }
+
+    /// Engine cue `key`, once read; the first ask reads it on a thread.
+    fn engine_cue(&mut self, key: u32) -> Option<Arc<EngineCue>> {
+        while let Ok((k, cue)) = self.engine_cue_loads.1.try_recv() {
+            self.engine_cues.insert(k, cue.map(Arc::new));
+        }
+        if let Some(cue) = self.engine_cues.get(&key) {
+            return cue.clone();
+        }
+        let install = self.install.clone()?;
+        if self.key_asked.insert(key ^ ENGINE_CUE_ASKED) {
+            let tx = self.engine_cue_loads.0.clone();
+            let tables = self.key_tables.clone();
+            std::thread::spawn(move || {
+                let cue = install.open_world().ok().and_then(|mut source| {
+                    let tables = held_tables(&tables, &mut source);
+                    EngineCue::read(&mut source, &tables, key)
+                });
+                drop(tx.send((key, cue)));
+            });
+        }
+        None
+    }
+
+    /// Keeps the engines of the vehicles in `near` heard where they are:
+    /// each one's set's cue for others' engines, moved by its speed. One
+    /// gone from the list falls silent.
+    pub fn others_engines(&mut self, near: &[HeardEngine]) {
+        let gone: Vec<usize> = self
+            .others
+            .keys()
+            .filter(|i| !near.iter().any(|n| n.id == **i))
+            .copied()
+            .collect();
+        for i in gone {
+            if let Some((_, voices)) = self.others.remove(&i) {
+                self.out
+                    .with(|m| voices.into_iter().for_each(|id| m.stop(id)));
+            }
+        }
+        for n in near {
+            if !self.others.contains_key(&n.id) {
+                let Some(cue) = self
+                    .gun_cues
+                    .cue_of(n.set, m2_engine::spawn_sound::OTHERS_ENGINE_EVENT)
+                    .and_then(|k| self.engine_cue(k))
+                else {
+                    continue;
+                };
+                let voices = self.out.with(|m| {
+                    cue.tracks
+                        .iter()
+                        .map(|t| {
+                            let play = Play::at(t.sound.clone(), n.at).looped().gain(0.0);
+                            m.play(match t.falloff {
+                                Some(f) => play.falloff(f),
+                                None => play,
+                            })
+                        })
+                        .collect()
+                });
+                self.others.insert(n.id, (cue, voices));
+            }
+            if let Some((cue, voices)) = self.others.get(&n.id) {
+                let speed = (n.speed.abs() / n.top.max(1.0)).min(1.0);
+                let mix = cue.mix(&[(m2_engine::audio::PARAM_SPEED, speed)]);
+                self.out.with(|m| {
+                    for (id, (g, pitch)) in voices.iter().zip(mix) {
+                        m.set_position(*id, n.at);
+                        m.set_gain(*id, g);
+                        m.set_pitch(*id, pitch);
+                    }
+                });
+            }
+        }
     }
 
     /// Keeps the rotors of the helicopters in the air (`flying`: each
