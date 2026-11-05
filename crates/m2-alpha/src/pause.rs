@@ -948,9 +948,11 @@ pub struct PadReport {
 /// game's data: the shell's strings "Key Over Bound" (23641453), "Joystick
 /// Key Over Bound" (764469fd) and "The key %s is currently bound to %s,
 /// would you like to bind it to %s instead?" (603e1c7d, the same for
-/// both), and the movie's calls. Invented: Yes and No for its buttons,
-/// which the recording doesn't show (the delete box's, 0xaf4b6e11 and
-/// 0xc9a7eabd). The PC's library that puts it up isn't read.
+/// both), and the movie's calls. Inferred: its buttons, Yes and No
+/// (0x5f8dbd17 and 0x46d99603), the pair the pause movie holds for the
+/// options screens' own box, "Accept Changes?", which the recording shows
+/// in that case. The recording doesn't show this box, and the PC's
+/// library that puts it up isn't read.
 pub fn over_bound_box(answer: u8, key: &str, from: usize, to: usize) -> Call {
     let title = if answer == 1 {
         "[0x23641453]"
@@ -966,8 +968,8 @@ pub fn over_bound_box(answer: u8, key: &str, from: usize, to: usize) -> Call {
                 ROWS[from].name, ROWS[to].name
             )),
             Value::Number(2.0),
-            text("[0xaf4b6e11]"),
-            text("[0xc9a7eabd]"),
+            text("[0x5f8dbd17]"),
+            text("[0x46d99603]"),
             Value::Number(f64::from(answer)),
         ],
     )
