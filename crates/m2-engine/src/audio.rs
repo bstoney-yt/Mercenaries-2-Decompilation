@@ -469,7 +469,9 @@ impl Mixer {
             levels: [Glide::ONE; Category::ALL],
             pitches: [Glide::ONE; Category::ALL],
             volumes: [1.0; Category::ALL],
-            max_voices: 64,
+            // The 360 sound system's pool of playing sounds (0x8236A528;
+            // that it is what limits voices is inferred).
+            max_voices: 256,
             reverb: None,
             send: Vec::new(),
             holding: [false; Category::ALL],
