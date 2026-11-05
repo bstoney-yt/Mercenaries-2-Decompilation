@@ -1315,8 +1315,20 @@ pub enum Sound {
         at: Vec3,
         of: Option<Blasted>,
     },
-    /// A building the bomb brought down coming apart.
+    /// A building the bomb brought down coming apart: the alpha's rumble,
+    /// unless the messages its state sent just before at the same place
+    /// ([`Sound::ObjectEvent`]) played a cue of its own.
     Collapse(Vec3),
+    /// A message an object's model state sent (`SendMessage`), heard as
+    /// the 360's sound system hears it: the events
+    /// [`m2_engine::spawn_sound::object_event`] gives it, played from the
+    /// sound set of the object's template's `SoundEffect`.
+    ObjectEvent {
+        at: Vec3,
+        template: u32,
+        message: u32,
+        param: u32,
+    },
     /// An effect a model's state started (`StartEmitter`: a wreck's
     /// fire, a tank's hull blowing out) coming into being as an object of
     /// its template, `template`: heard only as that template's
@@ -2797,8 +2809,20 @@ impl Combat {
         );
     }
 
-    /// A building the bomb brought down comes apart at `at`: heard.
-    pub fn collapse(&mut self, at: Vec3) {
+    /// A building of template `template` comes apart at `at`, its
+    /// model's `CollapseState` sending `messages` (message, second
+    /// operand: [`crate::props::Props::state_messages`]): heard as its
+    /// sound set answers them ([`Sound::ObjectEvent`]), else with the
+    /// alpha's rumble standing in ([`Sound::Collapse`]).
+    pub fn collapse(&mut self, at: Vec3, template: u32, messages: &[(u32, u32)]) {
+        for &(message, param) in messages {
+            self.sounds.push(Sound::ObjectEvent {
+                at,
+                template,
+                message,
+                param,
+            });
+        }
         self.sounds.push(Sound::Collapse(at));
     }
 

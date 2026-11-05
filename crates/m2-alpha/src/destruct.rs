@@ -1089,7 +1089,13 @@ impl Destruction {
                     props.wreck(&mut world.physics, key, Some(from));
                     if props.broke_apart(key) && building {
                         if let Some(at) = props.centre(key) {
-                            combat.collapse(at);
+                            let sent = props.state_messages(key, m2_engine::StateFx::COLLAPSE);
+                            eprintln!(
+                                "collapse: {} ({template:08x}) sends {sent:08x?}, set {:08x}",
+                                db.names.get(&template).map_or("?", String::as_str),
+                                db.spawn_sounds.get(&template).map_or(0, |s| s.set)
+                            );
+                            combat.collapse(at, template, &sent);
                         }
                         // What its model's `CollapseState` starts (a gate's
                         // smoke, the collapse's bits).

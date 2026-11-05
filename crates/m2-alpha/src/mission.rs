@@ -5538,16 +5538,21 @@ fn break_props(game: &mut Game, mission: &Mission) {
     for e in dead {
         scene.props.wreck(&mut world.physics, e, blast);
         fires.extend(scene.props.state_effects(e, m2_engine::StateFx::COLLAPSE));
-        if scene.props.broke_apart(e) {
-            falling.extend(scene.props.centre(e));
+        if scene.props.broke_apart(e)
+            && let Some(at) = scene.props.centre(e)
+        {
+            let template = scene.props.get(e).map_or(0, |(p, _)| p.template);
+            let sent = scene.props.state_messages(e, m2_engine::StateFx::COLLAPSE);
+            falling.push((at, template, sent));
         }
     }
     scene.props.hide(&mut world.physics, gone);
     // What broke apart shows what its model's `CollapseState` starts
-    // (its smoke, the collapse's bits), and is heard coming down.
+    // (its smoke, the collapse's bits), and is heard coming down as its
+    // state's messages say.
     game.combat.state_shows(fires);
-    for at in falling {
-        game.combat.collapse(at);
+    for (at, template, sent) in falling {
+        game.combat.collapse(at, template, &sent);
     }
 }
 

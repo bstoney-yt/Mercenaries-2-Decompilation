@@ -97,9 +97,52 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, SpawnSound> {
         .collect()
 }
 
+/// What a message one of an object's model states sends
+/// ([`crate::model::StateMessage`]) has the sound system do with the
+/// object's sound set (its `SoundEffect` record's `SoundSet`), in order:
+/// start (`true`) or stop (`false`) the `Sounds` table's cue for each
+/// event, the message's second operand as the row's `Param`. Empty for a
+/// message the sound system doesn't hear.
+///
+/// From the 360 code: the sound system's handler for the object event
+/// queue (0x8235FCE8, run from its update 0x8235EFA0) fetches the
+/// object's `SoundEffect` record (table 0x83654C50; none, nothing) and
+/// posts the sound system (0x83220B28) one or two messages {0 to start,
+/// 1 to stop; the object; 9; the set; the event; the operand}, by the
+/// message's hash. The messages' and events' names are not known; of
+/// the island's models, a building's collapse sends `de60c8e2` (186
+/// commands) and its wreck `73aa04b8`, and the buildings' sound sets
+/// answer `9cda7642` (a long cue, its tracks to 3.5 s) and `0519d48b`
+/// (PC data, `sendmessages` and `collapsesounds` examples).
+pub fn object_event(message: u32) -> &'static [(bool, u32)] {
+    match message {
+        0xde60_c8e2 | 0x020f_0fba => &[(true, 0x9cda_7642), (true, 0x4fa7_1143)],
+        0x73aa_04b8 | 0xfc2a_e8f0 => &[(false, 0x9cda_7642), (true, 0x0519_d48b)],
+        0x1bbf_3186 | 0x4fa0_90ae => &[(true, 0x6e3f_ade6), (true, 0x6bcd_f63f)],
+        0x8435_194c | 0x967b_24e4 => &[(false, 0x6e3f_ade6), (true, 0xd881_a717)],
+        0x21ed_b37f => &[(true, 0xdce3_d8a8), (true, 0xd40b_8901)],
+        0x3e5b_a553 => &[(false, 0xdce3_d8a8), (true, 0x2584_cfd1)],
+        0x5a96_9765 => &[(true, 0x4717_a5db)],
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_collapse_starts_its_rumble_and_its_wreck_stops_it() {
+        assert_eq!(
+            object_event(0xde60_c8e2),
+            &[(true, 0x9cda_7642), (true, 0x4fa7_1143)]
+        );
+        assert_eq!(
+            object_event(0x73aa_04b8),
+            &[(false, 0x9cda_7642), (true, 0x0519_d48b)]
+        );
+        assert!(object_event(0x1234_5678).is_empty());
+    }
 
     fn grenade() -> SpawnSound {
         SpawnSound {

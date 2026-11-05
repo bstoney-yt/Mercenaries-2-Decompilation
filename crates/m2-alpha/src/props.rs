@@ -1032,6 +1032,26 @@ impl Props {
             .collect()
     }
 
+    /// What `entity`'s model sends on entering part state `state` (its
+    /// `SendMessage`s, [`m2_engine::StateMessage`]): each message and its
+    /// second operand, once each.
+    pub fn state_messages(&self, entity: u32, state: u32) -> Vec<(u32, u32)> {
+        let Some(m) = self
+            .shown
+            .get(&entity)
+            .and_then(|p| self.models.get(&p.model)?.as_ref())
+        else {
+            return Vec::new();
+        };
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for s in m.gpu.state_messages.iter().filter(|s| s.state == state) {
+            if !out.contains(&(s.message, s.param)) {
+                out.push((s.message, s.param));
+            }
+        }
+        out
+    }
+
     pub fn placed_bounds(&self, entity: u32) -> Option<(Mat4, (Vec3, Vec3))> {
         let p = self.shown.get(&entity)?;
         let m = self.models.get(&p.model)?.as_ref()?;
