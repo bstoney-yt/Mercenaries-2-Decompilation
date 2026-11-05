@@ -136,7 +136,7 @@ fn ncc(signal: &[f32], t: &[f32]) -> Vec<f64> {
             si[i] = a * d + b * c;
         }
         fft(&mut sr, &mut si, true);
-        for lag in 0..step {
+        for (lag, &value) in sr.iter().enumerate().take(step) {
             let at = start + lag;
             if at >= scores.len() {
                 break;
@@ -145,7 +145,7 @@ fn ncc(signal: &[f32], t: &[f32]) -> Vec<f64> {
             let q = csq[at + m] - csq[at];
             let spread = (q - s * s / m as f64).max(0.0).sqrt();
             if spread > 1e-3 {
-                scores[at] = sr[lag] / n as f64 / (spread * tnorm);
+                scores[at] = value / n as f64 / (spread * tnorm);
             }
         }
         start += step;
