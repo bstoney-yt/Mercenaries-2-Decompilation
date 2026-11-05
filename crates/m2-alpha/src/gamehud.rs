@@ -1255,11 +1255,13 @@ impl CallArg {
 }
 
 /// What the pause menu ([`crate::pause`]) asks of play, and whether the
-/// game's own is there to open.
+/// game's own is there to open; and whether the shop's store screen is up
+/// (it has the controls).
 #[derive(Clone, Debug, Default, PartialEq)]
 struct PauseOut {
     news: crate::pause::News,
     available: bool,
+    store: bool,
 }
 
 /// What the front end ([`GameHud::start_shell`]) asks of the game.
@@ -1346,6 +1348,8 @@ pub struct GameHud {
     /// whether the HUD's scripts have it ([`crate::pause`]).
     pause_news: crate::pause::News,
     pause_available: bool,
+    /// The shop's store screen is up, as last drawn.
+    store_up: bool,
     log: Option<BufWriter<File>>,
 }
 
@@ -1412,6 +1416,7 @@ impl GameHud {
             shell: ShellNews::default(),
             pause_news: crate::pause::News::default(),
             pause_available: false,
+            store_up: false,
             log,
         }
     }
@@ -1420,6 +1425,12 @@ impl GameHud {
     /// layout ([`HudState::pause`]).
     pub fn pause_available(&self) -> bool {
         self.ready() && self.pause_available
+    }
+
+    /// The shop's store screen is up: it has the controls (the pad's keys
+    /// go to it, [`HudState::pad_keys`]).
+    pub fn store_up(&self) -> bool {
+        self.ready() && self.store_up
     }
 
     /// What the game's pause menu asked of play since the last time.
@@ -1609,6 +1620,7 @@ impl GameHud {
                 let (pause, shell) = (*pause, *shell);
                 self.pause_news.merge(pause.news);
                 self.pause_available = pause.available;
+                self.store_up = pause.store;
                 // Handed over already (a frame queued before it in this
                 // drain broke): a later frame does not take it back.
                 if self.failed() {
@@ -2530,7 +2542,10 @@ impl Thread {
         if self.pda_shown || self.fanfare_up() || self.pause_up() || self.store_up() {
             self.keys.extend(state.keys.iter().copied());
         }
-        if self.pda_shown && !state.pad_keys.is_empty() {
+        // The pad's keys too, for the PDA or the shop's store (its cancel
+        // is the pad's B, key 16: the movie's `keyCode == 16` calls
+        // `closeStore`).
+        if (self.pda_shown || self.store_up()) && !state.pad_keys.is_empty() {
             log.push(format!("pda: pad keys {:?}", state.pad_keys));
             self.keys.extend(state.pad_keys.iter().copied());
         }
@@ -2957,6 +2972,7 @@ impl Thread {
             pause: Box::new(PauseOut {
                 news: self.pause_native.take_news(),
                 available: names.values().any(|n| n == PAUSE_LAYOUT),
+                store: self.store_up(),
             }),
         }
     }
@@ -6668,6 +6684,7 @@ mod paint_tests {
             last_time: None,
             pause_news: crate::pause::News::default(),
             pause_available: false,
+            store_up: false,
             log: None,
         }
     }

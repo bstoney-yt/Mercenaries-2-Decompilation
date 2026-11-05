@@ -360,6 +360,9 @@ struct Options {
     /// With `--mission`: the keys pressed in a dialog box the scripts put
     /// up (`up`, `down`, `accept`, `back`, comma-separated), for testing.
     dialog_keys: Option<String>,
+    /// `--store-keys <code,...>`: with `--mission`, the pad keys pressed
+    /// in turn while the shop's store screen is up (16 is its B).
+    store_keys: Vec<i32>,
     /// With `--mission`: the game's HUD runs whenever a dialog box of the
     /// scripts is up, and each box is pictured a second and a half after
     /// it opens (`<out>-dialog<seq>.ppm`), for comparing the menus.
@@ -731,6 +734,12 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--placed-check" => o.placed_check = true,
             "--context" => o.context = Some(value()?),
             "--dialog-keys" => o.dialog_keys = Some(value()?),
+            "--store-keys" => {
+                o.store_keys = value()?
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<_, _>>()?
+            }
             "--dialog-shots" => o.dialog_shots = true,
             "--flash-shots" => o.flash_shots = true,
             "--late-shots" => {
@@ -4025,6 +4034,7 @@ fn mission_for_screenshot(
     let mut cheat_check = options.cheat_check.then(cheats::Check::default);
     let mut context = ContextCheck::default();
     let (mut dialog_up, mut dialog_pressed) = (0.0f32, 0usize);
+    let (mut store_up, mut store_pressed) = (0.0f32, 0usize);
     let (mut medevac_done, mut medevac_from) = (false, None::<(f32, m2_math::glam::Vec3)>);
     let mut visit: Option<f32> = None;
     // `--call-extraction`: its step (0 waiting, 1 menu up, 2 calling, 3 by
@@ -4730,7 +4740,9 @@ fn mission_for_screenshot(
             let mut state = gamehud::HudState::of(game);
             // She presses Enter every four seconds, as a player would to
             // close the contract's fanfare.
-            if i % (4.0 / tick).round() as u32 == 0 {
+            if i % (4.0 / tick).round() as u32 == 0
+                && (options.store_keys.is_empty() || store_up == 0.0)
+            {
                 state.buttons.push("selection".into());
             }
             // `--dialog-keys`: with a dialog box of the scripts up, its keys
@@ -4765,13 +4777,33 @@ fn mission_for_screenshot(
                 eprintln!("dialog-check: the box closed after {dialog_up:.1} s");
                 dialog_up = 0.0;
             }
+            // `--store-keys`: with the shop's store screen up, the pad's
+            // keys in turn (the 360 GUI layer's codes, 16 its B), the
+            // first 3 s after it came up and each 2 s on.
+            if hud.game.as_ref().is_some_and(gamehud::GameHud::store_up) {
+                store_up += tick;
+                let due = ((store_up - 3.0) / 2.0).floor();
+                if due >= 0.0
+                    && (due as usize) == store_pressed
+                    && let Some(&code) = options.store_keys.get(store_pressed)
+                {
+                    eprintln!("store-check: {store_up:.0} s into the store, the pad key {code}");
+                    state.pad_keys.extend([(code, true), (code, false)]);
+                    store_pressed += 1;
+                }
+            } else if store_up > 0.0 {
+                eprintln!("store-check: the store closed after {store_up:.1} s");
+                store_up = 0.0;
+            }
             info.game = Some(state);
             let (w, h) = backend.size();
             let mut input = ui::headless_input(w, h, f64::from(i) * f64::from(tick));
             // And the Enter key itself, down then up, for the movie that
             // has the controls (the fanfare's Key listener).
             let every = (4.0 / tick).round() as u32;
-            if i % every <= 1 {
+            // Not while `--store-keys` steps the store (Enter would buy).
+            let storing = !options.store_keys.is_empty() && store_up > 0.0;
+            if i % every <= 1 && !storing {
                 input.events.push(egui::Event::Key {
                     key: egui::Key::Enter,
                     physical_key: None,
@@ -8855,10 +8887,17 @@ impl Running {
             );
         }
         self.pad.stick_menu = dialog;
-        // The PDA open (and no menu over it): its movies hear the pad as
-        // the 360's keys ([`pad::PDA_BUTTON_KEYS`]), handed on with the
-        // HUD's state.
-        self.pad.pda = self.game.support.pda && !self.hud.menu;
+        // The PDA open, or the shop's store screen up (and no menu over
+        // either): their movies hear the pad as the 360's GUI layer hands
+        // its movies the pad, as keys ([`pad::PDA_BUTTON_KEYS`]: the
+        // d-pad steps the store's list, A buys, B is its cancel, 16),
+        // handed on with the HUD's state.
+        let store = self
+            .hud
+            .game
+            .as_ref()
+            .is_some_and(gamehud::GameHud::store_up);
+        self.pad.pda = (self.game.support.pda || store) && !self.hud.menu;
         let mut held = Input::default();
         let target = if dialog { &mut held } else { &mut self.input };
         let keys = self.pad.poll(target, driving, dt);
