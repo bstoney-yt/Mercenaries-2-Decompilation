@@ -32,16 +32,18 @@
 //! run into each other.
 //!
 //! Row 0 has every cell [`ANY`]. A filter cell holding [`ANY`] matches
-//! anything; the row that matches with the most filters set wins (the
-//! vehicle tables give a class-only row and a row for the vehicle itself
-//! under one handle).
+//! anything. In the vehicle tables the row that matches with the most
+//! filters set wins (they give a class-only row and a row for the vehicle
+//! itself under one handle); the on-foot table's scoring is the 360's
+//! ([`character_clip`]).
 //!
 //! # Provenance
 //!
 //! Format-from-samples: inferred from the 15 tables in a legally installed
 //! copy's `resident` block (round H7), which all parse with these rules.
-//! The precedence rule is inferred from how the rows overlap, not seen
-//! working. No bytes from the archives are committed.
+//! From the 360 code: the on-foot table's pick. The vehicle tables' rule
+//! is inferred from how the rows overlap, not seen working. No bytes from
+//! the archives are committed.
 
 use crate::bytes::{OutOfBounds, Reader};
 use crate::ucfx::{Ucfx, UcfxError};
@@ -56,6 +58,9 @@ pub const ACTIONS: u32 = 0x6802_c321;
 pub const VEHICLE_ANIMATIONS: u32 = 0x1826_24e1;
 /// The on-foot handle table.
 pub const CHARACTER_ANIMATIONS: u32 = 0xe00b_080c;
+/// The clip of the on-foot table's catch-all rows, and what the 360's
+/// pick gives when it finds nothing (82801508, 82801650).
+pub const NO_ANIMATION: u32 = 0x9d88_6544;
 /// The on-foot table's columns for who plays a row's clips, named as the
 /// `HumanAnimationSet` fields that say it of a character (the table's
 /// own column names; that the template's fields fill them is inferred, as
@@ -86,6 +91,9 @@ pub const MAX_TIME_SCALE: &str = "MaxTimeScale";
 /// to be `rifle`s (inferred: the weapon templates' own equipment class
 /// field is not decoded).
 pub const RIFLE: u32 = 0xd045_9a41;
+/// The class the 360's query gives a character holding nothing
+/// (0xD20EC345, 828011C0).
+pub const UNARMED: u32 = 0xd20e_c345;
 
 /// A column's type code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,8 +373,8 @@ pub fn seat_clip_row_to(
     Some((clip, row))
 }
 
-/// How far down the on-foot table's precedence a character's clip was
-/// found ([`character_clip`]).
+/// Whose on-foot table row a character's clip was found in
+/// ([`character_clip`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Precedence {
     /// The character's own row for the handle and equipment.
@@ -466,24 +474,15 @@ pub fn clip_time_scales(table: &AnimationTable) -> std::collections::HashMap<u32
 /// on-foot table ([`CHARACTER_ANIMATIONS`]). The first row listing `key`
 /// ([`row_listing`]; the heroes' keys are Jennifer's clips) gives the
 /// animation handle, and what is in use (its `InUseEquipment` cells: a
-/// grenade for a throw). Of that handle's rows with that in use and no
-/// weapon named (`PrimaryEquipmentName` [`ANY`]), the first of:
-///
-/// 1. the character's own (`who`: its `HumanAnimationSet` gender and
-///    character name; the row's gender may be [`ANY`]) with `equipment`
-///    as the primary weapon's class ([`Precedence::Own`]);
-/// 2. anyone's (character [`ANY`]; the gender the character's or
-///    [`ANY`]) with `equipment` ([`Precedence::Equipment`]);
-/// 3. the character's own with any equipment ([`Precedence::OwnAny`];
-///    inferred: its place between 2 and 4 is not known);
-/// 4. anyone's with any equipment ([`Precedence::Handle`]);
-///
-/// with a clip that `fits` (is on the character's rig): `key` if the row
-/// lists it, else the first listed. An empty list, or one with nothing
-/// that fits, falls through to the next (inferred: the game would have
-/// nothing to play from it). Within a step, rows naming the gender come
-/// before those that don't. `None` when no row lists `key`, nothing
-/// fits, or the table lacks a column named here.
+/// grenade for a throw). The character's row for that handle is then
+/// the 360's best by score ([`handle_rows`], `who` being its
+/// `HumanAnimationSet` gender and character name, `equipment` the
+/// primary weapon's class; 0 in either of the first two as [`ANY`]), so
+/// a character's own row for any equipment
+/// beats anyone's for theirs unless that one names the gender too.
+/// `Precedence` says what the row found names, not its rank. `None`
+/// when no row lists `key`, nothing fits (is on the character's rig), or
+/// the table lacks a column named here.
 pub fn character_clip(
     table: &AnimationTable,
     key: u32,
@@ -535,8 +534,71 @@ pub fn action_handle(actions: &AnimationTable, stance: &str, action: &str) -> Op
     )
 }
 
-/// [`character_clip`]'s and [`handle_clip`]'s search over handle `h`'s
-/// rows with `in_use`, preferring `key` where a row lists it.
+/// The on-foot table's filter columns, in order: the seven a row is
+/// scored over ([`foot_rows`]).
+const FOOT_FILTERS: [&str; 7] = [
+    HANDLE,
+    GENDER,
+    CHARACTER_NAME,
+    PRIMARY_EQUIPMENT_CLASS,
+    PRIMARY_EQUIPMENT_NAME,
+    IN_USE_EQUIPMENT_CLASS,
+    IN_USE_EQUIPMENT_NAME,
+];
+
+/// The rows the 360's pick considers for `query` (one value for each of
+/// [`FOOT_FILTERS`]), best first. From the 360 code:
+///
+/// - the on-foot table's index covers `Handle` alone, with no catch-all
+///   list, and `PrimaryEquipmentClass` is its check column (82410BB0,
+///   the only table so set): a candidate has exactly the handle, and the
+///   query's class or the table's default (row 0, [`ANY`]) (824111D8);
+/// - each candidate scores 2 for every filter cell equal to the query's,
+///   1 for one holding the default, 0 otherwise (82410A18), so a cell
+///   the query leaves [`ANY`] gives a row with [`ANY`] there 2;
+/// - the highest score wins, the first of equals (82411638).
+fn foot_rows(table: &AnimationTable, query: [u32; 7]) -> Option<Vec<usize>> {
+    let columns = FOOT_FILTERS.map(|n| table.column(n));
+    let columns = columns.map(|c| c.unwrap_or(usize::MAX));
+    if columns.contains(&usize::MAX) {
+        return None;
+    }
+    let cell = |row: usize, column: usize| table.cell(row, column).unwrap_or(ANY);
+    let (handle, class) = (columns[0], columns[3]);
+    let score = |row: usize| -> u32 {
+        columns
+            .iter()
+            .zip(query)
+            .map(|(&c, q)| match cell(row, c) {
+                x if x == q => 2,
+                x if x == cell(0, c) => 1,
+                _ => 0,
+            })
+            .sum()
+    };
+    let mut rows: Vec<usize> = (1..table.rows())
+        .filter(|&r| {
+            cell(r, handle) == query[0]
+                && (cell(r, class) == query[3] || cell(r, class) == cell(0, class))
+        })
+        .collect();
+    // Stable: the first of equals stays first.
+    rows.sort_by_key(|&r| std::cmp::Reverse(score(r)));
+    Some(rows)
+}
+
+/// [`character_clip`]'s and [`handle_clip`]'s pick from handle `h`'s
+/// rows with `in_use`, preferring `key` where a row lists it: the best
+/// row ([`foot_rows`]; what the 360's query fills in: 828011C0, the
+/// weapon's name left [`ANY`] here, which only 12 rows name).
+///
+/// From the 360 code (82801508): when the best row is another
+/// character's the pick gives nothing but the table's stand-in clip
+/// ([`NO_ANIMATION`]); and of a row's clips it takes one at random.
+/// Here that's `key`, or the first that `fits` (the same clip for every
+/// character, where the game's differ by the throw). A row with no clip
+/// that fits falls through to the next (inferred: an empty list would
+/// trap the 360's pick, and the alpha's rigs hold fewer clips).
 fn handle_rows(
     table: &AnimationTable,
     h: u32,
@@ -547,46 +609,47 @@ fn handle_rows(
     fits: impl Fn(u32) -> bool,
 ) -> Option<CharacterClip> {
     let col = |n: &str| table.column(n);
-    let handle = col(HANDLE)?;
-    let (g, c) = (col(GENDER)?, col(CHARACTER_NAME)?);
-    let (pc, pn) = (col(PRIMARY_EQUIPMENT_CLASS)?, col(PRIMARY_EQUIPMENT_NAME)?);
-    let (uc, un) = (col(IN_USE_EQUIPMENT_CLASS)?, col(IN_USE_EQUIPMENT_NAME)?);
+    let c = col(CHARACTER_NAME)?;
+    let pc = col(PRIMARY_EQUIPMENT_CLASS)?;
     let list = col(ANIMATION)?;
     if table.columns[list].kind != ColumnKind::List {
         return None;
     }
     let cell = |row: usize, column: usize| table.cell(row, column).unwrap_or(ANY);
-    let steps = [
-        (Precedence::Own, name, equipment),
-        (Precedence::Equipment, ANY, equipment),
-        (Precedence::OwnAny, name, ANY),
-        (Precedence::Handle, ANY, ANY),
-    ];
-    for (by, character, class) in steps {
-        let rows = (1..table.rows()).filter(|&r| {
-            cell(r, handle) == h
-                && cell(r, c) == character
-                && cell(r, pc) == class
-                && cell(r, pn) == ANY
-                && (cell(r, uc), cell(r, un)) == in_use
-        });
-        let named = rows.clone().filter(|&r| cell(r, g) == gender);
-        let unnamed = rows.filter(|&r| gender != ANY && cell(r, g) == ANY);
-        for row in named.chain(unnamed) {
-            let clips = table.list(row, list);
-            let clip = if let Some(key) = key.filter(|&k| clips.contains(&k) && fits(k)) {
-                Some(key)
-            } else {
-                clips.iter().copied().find(|&x| fits(x))
+    // A template may leave these 0 (the soldiers' do): the 360's query
+    // then keeps the table's default (828011C0).
+    let blank = |v: u32| if v == 0 { ANY } else { v };
+    let (gender, name) = (blank(gender), blank(name));
+    let query = [h, gender, name, equipment, ANY, in_use.0, in_use.1];
+    for row in foot_rows(table, query)? {
+        let who = cell(row, c);
+        if who != name && who != ANY {
+            return fits(NO_ANIMATION).then_some(CharacterClip {
+                clip: NO_ANIMATION,
+                handle: h,
+                row,
+                by: Precedence::Handle,
+            });
+        }
+        let clips = table.list(row, list);
+        let clip = if let Some(key) = key.filter(|&k| clips.contains(&k) && fits(k)) {
+            Some(key)
+        } else {
+            clips.iter().copied().find(|&x| fits(x))
+        };
+        if let Some(clip) = clip {
+            let by = match (who == name, cell(row, pc) == equipment) {
+                (true, true) => Precedence::Own,
+                (false, true) => Precedence::Equipment,
+                (true, false) => Precedence::OwnAny,
+                (false, false) => Precedence::Handle,
             };
-            if let Some(clip) = clip {
-                return Some(CharacterClip {
-                    clip,
-                    handle: h,
-                    row,
-                    by,
-                });
-            }
+            return Some(CharacterClip {
+                clip,
+                handle: h,
+                row,
+                by,
+            });
         }
     }
     None
@@ -916,10 +979,55 @@ mod tests {
         assert_eq!(pick("Chris", pistol), Some((0x4916_51da, OwnAny)));
         // Hers names the pistol.
         assert_eq!(pick("jennifer", pistol), Some((0x777b_d24e, Own)));
-        // Mattias has no row of his own here: anyone's.
-        assert_eq!(pick("mattias", pistol), Some((0x9874_62fc, Handle)));
+        // Mattias has no row of his own here, and Chris's outscores
+        // anyone's: nothing but the stand-in.
+        assert_eq!(pick("mattias", pistol), Some((NO_ANIMATION, Handle)));
         // A handle no row gives: nothing.
         assert_eq!(handle_clip(&t, 0x1234, (hero, 1), RIFLE, |_| true), None);
+        // A template that leaves its set 0 asks for anyone's.
+        let blank = handle_clip(&t, PICKUP, (0, 0), pistol, |_| true);
+        assert_eq!(blank.map(|p| p.clip), Some(0x9874_62fc));
+    }
+
+    #[test]
+    fn the_on_foot_pick_scores_rows_as_the_360_does() {
+        const H: u32 = 0x1000;
+        const TAKEN: u32 = 0x1001;
+        let (male, soldier, other) = (0x51, 0x52, 0x53);
+        let columns = [
+            (HANDLE, 4),
+            (GENDER, 4),
+            (CHARACTER_NAME, 4),
+            (PRIMARY_EQUIPMENT_CLASS, 4),
+            (PRIMARY_EQUIPMENT_NAME, 4),
+            (IN_USE_EQUIPMENT_CLASS, 4),
+            (IN_USE_EQUIPMENT_NAME, 4),
+            (ANIMATION, 4),
+        ];
+        let row = |h, g, c, p, clip| [h, g, c, p, ANY, ANY, ANY, clip];
+        let rows = [
+            [ANY; 8],
+            // Under H: anyone's with a rifle, then his own with anything.
+            row(H, ANY, ANY, RIFLE, 0xa1),
+            row(H, male, soldier, ANY, 0xa2),
+            // A class he doesn't hold is out, however well it matches.
+            row(H, male, soldier, 0x77, 0xa3),
+            // Under TAKEN: another's row scores above anyone's.
+            row(TAKEN, ANY, ANY, RIFLE, 0xb1),
+            row(TAKEN, male, other, RIFLE, 0xb2),
+        ];
+        let rows: Vec<&[u32]> = rows.iter().map(|r| &r[..]).collect();
+        // `Animation` here is a hash cell: score the rows directly.
+        let t = AnimationTable::parse(&table(&columns, &rows, None)).unwrap();
+        let query = |h, c| [h, male, c, RIFLE, ANY, ANY, ANY];
+        // 2+2+2+1+2+2+2 = 13 beats 2+1+1+2+2+2+2 = 12.
+        assert_eq!(foot_rows(&t, query(H, soldier)), Some(vec![2, 1]));
+        // Someone else: the rifle row (12) beats his (2+2+0+1+2+2+2 = 11).
+        assert_eq!(foot_rows(&t, query(H, other)), Some(vec![1, 2]));
+        // Another's row (2+2+0+2+2+2+2 = 12) ties anyone's, which is first.
+        assert_eq!(foot_rows(&t, query(TAKEN, soldier)), Some(vec![4, 5]));
+        // A handle with no rows: none, row 0's catch-all not a candidate.
+        assert_eq!(foot_rows(&t, query(0x2000, soldier)), Some(vec![]));
     }
 
     #[test]

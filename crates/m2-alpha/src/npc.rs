@@ -433,9 +433,8 @@ impl FightClips {
     /// 360 code), `Upright_Aim_Shuffle_Left110` (daf1c53a) and
     /// `Upright_Aim_Shuffle_Right90` (3024fd38), named by their hashes.
     /// The clips are the on-foot table's generic rifle rows for them
-    /// (from samples): a soldier has no rifle row of his own there, and a
-    /// rifle row comes before his own with anything held
-    /// ([`m2_assets::animation_table::character_clip`]).
+    /// (from samples), which name the handles; a character's own come
+    /// by [`Rig::their_clip`].
     pub const AIM_SHUFFLES: [u32; 2] = [0x6af4_b7e3, 0x14df_b49d];
 
     /// The swim clip for moving at `moved` m/s and its rate: the gait
@@ -498,6 +497,7 @@ impl FightClips {
     /// hers), so that the next listed, everyone's, is taken.
     pub fn find(rig: &Rig) -> Self {
         let find = |hash| {
+            let hash = rig.their_clip(hash);
             rig.clips
                 .iter()
                 .position(|c| c.hash == hash && !rig.foreign.contains(&hash))
@@ -4389,6 +4389,7 @@ pub(crate) mod tests {
             cues: Vec::new(),
             own: Default::default(),
             foreign: Default::default(),
+            theirs: Default::default(),
             aim_clip: None,
             barrel: true,
             scripted: None,
