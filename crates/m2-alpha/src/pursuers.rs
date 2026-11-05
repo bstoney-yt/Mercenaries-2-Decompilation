@@ -18,9 +18,13 @@
 //!   fire control (`TurretAttack` 0x822B7C10 -> 0x822C95D8 ->
 //!   0x822F0098, as the gunships' [`crate::combat::Combat::pilots_fire`]).
 //!
-//! Not yet: a driver with a gun of his own (`CarAttack`, 0x822ACB28) is
-//! left where he comes in; tanks (`TankAttack`), boats and men are not
-//! sent. Inferred: the gunners aim at her where she is (0x822C95D8's lead
+//! - A driver with a gun of his own, or the driver of a car labelled
+//!   `Apc` with a crew (its gunners here), runs `CarAttack` instead
+//!   ([`m2_engine::car_attack`], 0x822ACB28); the crew's range is the
+//!   middle of their guns' `MinFireRange` and `FireRange` (inferred, see
+//!   there), her line checked by a ray (0x82166958 sweeps a box).
+//!
+//! Not yet: tanks (`TankAttack`), boats and men are not sent. Inferred: the gunners aim at her where she is (0x822C95D8's lead
 //! and line-of-fire checks are not ported); the 360 thinks at its own
 //! rate (not traced), the alpha every step. Invented: once the pursuit is
 //! over a car stops (0x822AA568) and is taken out of play past
@@ -29,6 +33,7 @@
 use std::collections::HashSet;
 
 use m2_engine::Physics;
+use m2_engine::car_attack::{self, AttackWorld, CarAttack, Sight};
 use m2_engine::car_driver::{self, CarDriver, CarInputs, CarState, Quarry};
 use m2_engine::road_ring::{self, Arrival, Flood, RoadNet};
 use m2_math::glam::{Quat, Vec3};
@@ -43,6 +48,35 @@ pub const FIRST_ENTITY: u32 = 0xfc00_0000;
 /// Seconds a kind waits after one is sent (0x82239AD0's 5).
 const GATE: u32 = 5;
 
+/// What `CarAttack` asks of the world, from the alpha's physics.
+struct Look<'a> {
+    physics: &'a Physics,
+    rng: &'a mut u32,
+    car: m2_engine::physics::VehicleId,
+}
+
+impl AttackWorld for Look<'_> {
+    fn rand(&mut self) -> f32 {
+        *self.rng = self.rng.wrapping_mul(0x0019_660d).wrapping_add(0x3c6e_f35f);
+        (*self.rng >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    /// A ray 1 m up from its middle to 1 m up at her, past the car's own
+    /// body, stopping 4 m short of her (the 360 sweeps a box, 0x82166958,
+    /// past her: a ray here).
+    fn line_clear(&mut self, from: Vec3, to: Vec3) -> bool {
+        let (a, b) = (from + Vec3::Y, to + Vec3::Y);
+        let d = b - a;
+        let len = d.length();
+        if len < 1e-3 {
+            return true;
+        }
+        self.physics
+            .cast_ray_past(a, d / len, (len - 4.0).max(0.0), self.car)
+            .is_none()
+    }
+}
+
 /// One car out.
 #[derive(Debug)]
 struct Pursuer {
@@ -52,9 +86,10 @@ struct Pursuer {
     arrival: Arrival,
     driver: CarDriver,
     held: CarInputs,
-    /// Its driver has a gun of his own (his seat's): `CarAttack`, not
-    /// ported.
+    /// Its driver runs `CarAttack` (0x822ADE08's choice: a gun of his
+    /// own, or an `Apc` with a crew).
     attacks: bool,
+    attack: CarAttack,
     leaving: bool,
 }
 
@@ -159,6 +194,7 @@ impl Pursuers {
             driver: CarDriver::default(),
             held: CarInputs::default(),
             attacks: false,
+            attack: CarAttack::default(),
             leaving: false,
         });
         self.gate = GATE;
@@ -190,6 +226,7 @@ impl Pursuers {
         her_velocity: Vec3,
         in_vehicle: bool,
         vanish: f32,
+        labels: impl Fn(&ParkedVehicle) -> Vec<u32>,
         dt: f32,
     ) -> Vec<usize> {
         self.shots.clear();
@@ -237,19 +274,17 @@ impl Pursuers {
                     physics.set_vehicle_velocity(id, p.arrival.velocity);
                     v.id = Some(id);
                     let driver = crate::combat::armed_seats(v)[0];
-                    p.attacks = v.spec.armed.iter().any(|m| m.seat == driver);
+                    let armed = v.spec.armed.iter().any(|m| m.seat == driver);
+                    let crew = crate::combat::armed_seats(v).len() - 1;
+                    p.attacks = car_attack::runs_car_attack(armed, &labels(v), crew);
                     eprintln!(
-                        "pursuers: {}'s {} in at {:.0}, {:.0} m from her, {:.1} m/s{}",
+                        "pursuers: {}'s {} in at {:.0}, {:.0} m from her, {:.1} m/s, {}",
                         p.faction,
                         p.template,
                         p.arrival.at,
                         p.arrival.at.distance(her),
                         p.arrival.velocity.length(),
-                        if p.attacks {
-                            " (its driver armed: CarAttack, not ported: it stands)"
-                        } else {
-                            ""
-                        }
+                        if p.attacks { "CarAttack" } else { "CarPursue" }
                     );
                     id
                 }
@@ -272,8 +307,57 @@ impl Pursuers {
                 drop.push(i);
                 continue;
             }
-            let input = if p.leaving || p.attacks {
+            let input = if p.leaving {
                 car_driver::slow_to_stop(&car).unwrap_or_default()
+            } else if p.attacks {
+                // The crew's range: the middle of their guns' two
+                // distances (0x822ACB28's mean of 0x822ECE70's +0x20 and
+                // +0x24), of those with a fire hint.
+                let crew_guns: Vec<(f32, f32)> = crate::combat::armed_seats(v)
+                    .iter()
+                    .skip(1)
+                    .filter_map(|&s| v.spec.armed.iter().find(|m| m.seat == s))
+                    .filter_map(|m| m.weapon.hint.map(|h| (h.min_range, h.range)))
+                    .collect();
+                let crew = (!crew_guns.is_empty()).then(|| {
+                    let n = crew_guns.len() as f32;
+                    let (lo, hi) = crew_guns
+                        .iter()
+                        .fold((0.0, 0.0), |(a, b), &(l, h)| (a + l, b + h));
+                    (lo / n + hi / n) * 0.5
+                });
+                let (lo, hi) = v.spec.bounds;
+                let sight = Sight {
+                    at: her,
+                    unseen: 0.0,
+                    vehicle: in_vehicle,
+                };
+                let mut world = Look {
+                    physics,
+                    rng: &mut self.rng,
+                    car: id,
+                };
+                let state = p.attack.state;
+                let input = p.attack.think(
+                    &mut p.driver,
+                    &car,
+                    hi.z - lo.z,
+                    crew,
+                    &sight,
+                    &mut world,
+                    dt,
+                );
+                if p.attack.state != state {
+                    eprintln!(
+                        "pursuers: {} {:#x} CarAttack {:?} -> {:?}, {:.0} m from her",
+                        p.template,
+                        p.entity,
+                        state,
+                        p.attack.state,
+                        car.at.distance(her)
+                    );
+                }
+                input
             } else {
                 let right = m.transform_vector3(Vec3::X).normalize_or(Vec3::X);
                 let turning = physics.vehicle_spin(id).y;

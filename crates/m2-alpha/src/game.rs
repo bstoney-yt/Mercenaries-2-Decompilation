@@ -1700,6 +1700,12 @@ impl Game {
                     her_velocity,
                     in_vehicle,
                     crate::gunships::VANISH,
+                    |v| {
+                        world
+                            .index
+                            .template_db
+                            .vehicle_labels_for(&v.spec.label, v.spec.model)
+                    },
                     dt,
                 );
                 for i in dropped {

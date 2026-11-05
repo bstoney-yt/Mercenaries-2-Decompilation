@@ -25,6 +25,7 @@ pub mod assets;
 pub mod atmosphere;
 pub mod audio;
 pub mod blend;
+pub mod car_attack;
 pub mod car_driver;
 pub mod durability;
 pub mod grapple;
