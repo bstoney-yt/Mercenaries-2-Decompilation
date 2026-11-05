@@ -1720,7 +1720,7 @@ impl Game {
                 self.combat.pilot_view = Some((self.camera.position, self.camera.forward()));
             }
             self.paths
-                .drive(&mut world.physics, &self.scene.vehicles, driven);
+                .drive(&mut world.physics, &self.scene.vehicles, driven, dt);
             let walking = self
                 .scene
                 .player

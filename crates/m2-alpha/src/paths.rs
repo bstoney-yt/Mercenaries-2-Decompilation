@@ -9,12 +9,20 @@
 //! Driven from [`Game::step`](crate::game::Game::step) right after the
 //! traffic, so the step's "nobody at the wheel" brake doesn't hold it.
 //!
-//! Inferred: the speed is `Haste` times the template's top speed (what
-//! `Haste` scales isn't known, as for traffic); slower into turns.
+//! Cars and tanks drive by the 360's own drivers: a car by 0x822AC008
+//! ([`CarDriver::drive_to`], as `CarMove` 0x822AC458), a tank by 0x822B5B98
+//! ([`tank_attack::drive_to`], as `TankMove` 0x822B6150). Others (boats)
+//! drive as traffic's do.
+//!
+//! Inferred: the speed asked is `Haste` times the template's top speed
+//! (what `Haste` scales isn't known, as for traffic; `CarMove` and
+//! `TankMove` themselves ask 15 and 16 m/s). Not ported: the search for a
+//! way between the points (0x822BF7A8); it goes straight at each.
 
 use std::collections::HashMap;
 
-use m2_engine::{Physics, VehicleControls};
+use m2_engine::car_driver::{CarDriver, CarInputs, CarState};
+use m2_engine::{Physics, VehicleControls, tank_attack};
 use m2_math::glam::{Vec2, Vec3};
 
 use crate::scene::ParkedVehicle;
@@ -36,6 +44,9 @@ struct PathMove {
     next: usize,
     haste: f32,
     steps: u32,
+    /// A car's driver and what its input holds.
+    driver: CarDriver,
+    held: CarInputs,
 }
 
 /// The vehicles driving the scripts' paths, by the scripts' guid.
@@ -58,6 +69,8 @@ impl PathMoves {
                 next: 0,
                 haste: haste.clamp(0.05, 1.0),
                 steps: 0,
+                driver: CarDriver::default(),
+                held: CarInputs::default(),
             },
         );
     }
@@ -69,6 +82,7 @@ impl PathMoves {
         physics: &mut Physics,
         vehicles: &[ParkedVehicle],
         driven: Option<usize>,
+        dt: f32,
     ) {
         // Where every vehicle is, to stop short of (GurCon003 round 82: a
         // fishing boat on its path ran into her race boat, 31 m/s).
@@ -113,13 +127,37 @@ impl PathMoves {
                 eprintln!("paths: {g:#x} drove its path to the end, at {here:.1}");
                 return false;
             }
+            let top = v.spec.tuning.max_speed.unwrap_or(DEFAULT_TOP) * m.haste;
             let (controls, want, off) = steer(
                 at.transform_vector3(Vec3::Z),
                 here,
                 m.route[m.next],
-                v.spec.tuning.max_speed.unwrap_or(DEFAULT_TOP) * m.haste,
+                top,
                 physics.vehicle_speed(id),
             );
+            let car = CarState {
+                at: here,
+                forward: at
+                    .transform_vector3(Vec3::Z)
+                    .with_y(0.0)
+                    .normalize_or(Vec3::Z),
+                velocity: physics.vehicle_velocity(id),
+            };
+            let controls = if v.spec.tracked {
+                let t = tank_attack::drive_to(&car, m.route[m.next], top, false);
+                VehicleControls {
+                    throttle: t.throttle,
+                    steer: t.steer,
+                    ..VehicleControls::default()
+                }
+            } else if v.spec.is_boat() {
+                controls
+            } else {
+                let input = m.driver.drive_to(&car, m.route[m.next], top, false, dt);
+                let forward = physics.vehicle_gear(id).is_none_or(|(g, _)| g != 0);
+                m.held.take(&input, forward);
+                m.held.controls()
+            };
             if m.steps % LOG_EVERY == 0 {
                 eprintln!(
                     "paths: {g:#x} at {here:.1}, {:.1} m/s (wants {want:.1}), for point {} \
