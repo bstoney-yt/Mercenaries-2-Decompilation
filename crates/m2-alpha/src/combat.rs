@@ -4436,6 +4436,8 @@ impl Combat {
             };
             if !v.wrecked && v.damage > 0.0 && v.most_health() - v.damage <= below {
                 self.hurt_vehicle(f.physics, v, i, BURN_DOWN * dt);
+                // Burning down is no one's hit.
+                v.hit -= BURN_DOWN * dt / v.most_health().max(1e-3);
             }
         }
     }
@@ -4542,6 +4544,7 @@ impl Combat {
             return;
         }
         v.damage += damage;
+        v.hit += damage / v.most_health().max(1e-3);
         if v.damage >= v.most_health() {
             self.wreck(physics, v, i);
         }
@@ -6731,6 +6734,7 @@ mod tests {
             fired: 0,
             mg_fired: 0,
             damage: 0.0,
+            hit: 0.0,
             parts: None,
             loose: Vec::new(),
             debris_thrown: false,

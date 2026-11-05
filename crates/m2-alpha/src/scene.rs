@@ -1401,6 +1401,9 @@ pub struct ParkedVehicle {
     pub mg_fired: u32,
     /// Damage it has taken, of its [`most_health`](Self::most_health).
     pub damage: f32,
+    /// Damage taken since its AI driver last read it, as a share of its
+    /// health (0x822FA988's hit record; the alpha keeps no source).
+    pub hit: f32,
     /// Its parts as they stand: dented, broken, thrown off
     /// ([`m2_engine::vehicle_damage`]), if its model and template say.
     pub parts: Option<PartDamage>,
@@ -2854,6 +2857,7 @@ impl Scene {
                 fired: 0,
                 mg_fired: 0,
                 damage: 0.0,
+                hit: 0.0,
                 parts: None,
                 loose: Vec::new(),
                 debris_thrown: false,
@@ -2888,6 +2892,7 @@ impl Scene {
                     fired: 0,
                     mg_fired: 0,
                     damage: 0.0,
+                    hit: 0.0,
                     parts: None,
                     loose: Vec::new(),
                     debris_thrown: self.ruins.contains(&guid),
@@ -2911,6 +2916,7 @@ impl Scene {
                     fired: 0,
                     mg_fired: 0,
                     damage: 0.0,
+                    hit: 0.0,
                     parts: None,
                     loose: Vec::new(),
                     debris_thrown: self.ruins.contains(&entity),
