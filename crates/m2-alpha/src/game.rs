@@ -1813,6 +1813,13 @@ impl Game {
             if self.spray_wait <= 0.0 {
                 self.spray_wait = SPRAY_GAP;
                 spray(world, &self.scene.vehicles, &mut self.combat);
+                exhaust_smoke(
+                    world,
+                    &self.scene.vehicles,
+                    &self.scene.smokes,
+                    self.scene.player.as_ref(),
+                    &mut self.combat,
+                );
             }
         }
         split("game: vehicles");
@@ -4113,6 +4120,50 @@ fn state_effects(world: &World, combat: &mut Combat) {
                 template: combat::FxTemplate::Hash(fx.effect),
                 at: fx.at.map_or(o.position, |at| placed.transform_point3(at)),
                 hold: None,
+            });
+        }
+    }
+}
+
+/// How near the player a vehicle's exhausts smoke (invented: a budget, the
+/// game's own reach for them is not traced).
+const EXHAUST_REACH: f32 = 120.0;
+
+/// Keeps each crewed vehicle's exhaust effects going at their nodes
+/// (`m2_engine::vehicle_parts`; the heat haze is drawn with the vehicle).
+fn exhaust_smoke(
+    world: &World,
+    vehicles: &[ParkedVehicle],
+    smokes: &HashMap<(u32, String), Vec<(usize, u32)>>,
+    player: Option<&crate::player::Player>,
+    combat: &mut Combat,
+) {
+    let Some(player) = player else {
+        return;
+    };
+    let near = player.character.position;
+    for (i, v) in vehicles.iter().enumerate() {
+        if !v.exhausting(player.driving == Some(i)) {
+            continue;
+        }
+        let key = (v.spec.model, v.spec.label.clone());
+        let Some(parts) = smokes.get(&key).filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        let Some(at) = v.id.and_then(|id| world.physics.vehicle_transform(id)) else {
+            continue;
+        };
+        if at.w_axis.truncate().distance(near) > EXHAUST_REACH {
+            continue;
+        }
+        for (k, &(node, effect)) in parts.iter().enumerate() {
+            let Some(rest) = v.spec.rest.get(node) else {
+                continue;
+            };
+            combat.game_fx.push(combat::GameFx {
+                template: combat::FxTemplate::Hash(effect),
+                at: (at * *rest).w_axis.truncate(),
+                hold: Some(0xe000_0000_0000_0000 | (i as u64) << 8 | k as u64),
             });
         }
     }
