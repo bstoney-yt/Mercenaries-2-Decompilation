@@ -1693,12 +1693,21 @@ impl Game {
                 }
                 // And its cars.
                 let in_vehicle = p.driving.is_some();
+                // Her vehicle's larger side (0x822A94E8's ring).
+                let her_size =
+                    p.driving
+                        .and_then(|i| self.scene.vehicles.get(i))
+                        .map_or(0.0, |v| {
+                            let (lo, hi) = v.spec.bounds;
+                            (hi.x - lo.x).max(hi.z - lo.z)
+                        });
                 let dropped = self.pursuers.drive(
                     &mut world.physics,
                     &mut self.scene.vehicles,
                     her,
                     her_velocity,
                     in_vehicle,
+                    her_size,
                     crate::gunships::VANISH,
                     |v| {
                         world

@@ -2500,7 +2500,8 @@ impl MissionLink {
             if let Some(f) = faction {
                 let standing = pursuit_standing(game, her);
                 let level = clock.level.max(0) as usize;
-                for kind in [crate::pursuers::Kind::Car, crate::pursuers::Kind::Tank] {
+                use crate::pursuers::Kind;
+                for kind in [Kind::Car, Kind::Tank, Kind::Boat] {
                     let n = counts.units(f, standing, kind.table_name(), level);
                     if n > game.pursuers.out(f, kind)
                         && game.pursuers.may_send(kind, standing)
@@ -2510,7 +2511,20 @@ impl MissionLink {
                             .net(&world.index.roads, &world.index.junctions);
                         let (at, forward) = her_on_road(game, her);
                         let r = game.pursuers.random();
-                        if let Some(arrival) = game.pursuers.arrival(kind, at, forward, standing, r)
+                        let arrival = if kind == Kind::Boat {
+                            let velocity =
+                                game.scene.player.as_ref().map_or(Vec3::ZERO, |p| {
+                                    match p.driving.and_then(|i| game.scene.vehicles.get(i)?.id) {
+                                        Some(id) => world.physics.vehicle_velocity(id),
+                                        None => p.character.velocity,
+                                    }
+                                });
+                            game.pursuers
+                                .boat_arrival(&world.physics, her, forward, velocity)
+                        } else {
+                            game.pursuers.arrival(kind, at, forward, standing, r)
+                        };
+                        if let Some(arrival) = arrival
                             && let Some(lists) = self.pursuit_lists.as_mut()
                             && let Some(template) =
                                 lists.next(f, standing.table_name(), kind.table_name(), level)
