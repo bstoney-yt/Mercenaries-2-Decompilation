@@ -190,6 +190,10 @@ pub struct Native {
     /// The press-start screen is up (`pressStartEnabled`), waiting for a
     /// key.
     press_start: bool,
+    /// Join Game's NOTICE box ([`JOIN_NOTICE`]) is up.
+    notice: bool,
+    /// The save list's delete box ([`DELETE_BOX`]) is up.
+    delete_box: bool,
     /// A key has started the shell from it ([`Native::started`]).
     started: bool,
     /// Calls to make at the next frame.
@@ -232,8 +236,33 @@ const START_KEY: i32 = 32;
 
 /// `onlineLTIIsConnected`'s pages that go on to the game: Continue's (1),
 /// New Game's (2) and the load screen's (4), as `LTIgotoGame` reads
-/// `ProfilePage`. Join Game's (3) is online, which this has none of.
+/// `ProfilePage`. Join Game's (3) is online, which this has none of: it
+/// gets [`JOIN_NOTICE`].
 const OFFLINE_PAGES: [&str; 3] = ["1", "2", "4"];
+
+/// Join Game with no connection: the box the PC recording shows, NOTICE,
+/// "You must be connected to the EA Servers to access the online..."
+/// with Cancel and Connect (the shell's strings fac274ae, 3f5f875e,
+/// 01197779, bd5d6839; from footage, the PC's online library that puts it
+/// up isn't read). The movie's box is `onlineError(title, text, buttons,
+/// first, second, what it goes to, cancel allowed, spinning logo)`; both
+/// buttons go to `"close"`, as nothing here can connect.
+const JOIN_NOTICE: [&str; 4] = [
+    "[0xfac274ae]",
+    "[0x3f5f875e]",
+    "[0x01197779]",
+    "[0xbd5d6839]",
+];
+
+/// The save list's Delete: the 360's box table (0x8237D310) under
+/// `deleteloadgame`, "DELETE CONFIRMATION" over "Are you sure?", Yes and
+/// No (the buttons' first is the movie's way on to the delete).
+const DELETE_BOX: [&str; 4] = [
+    "[0x2e4b3b56]",
+    "[0x9b476854]",
+    "[0xaf4b6e11]",
+    "[0xc9a7eabd]",
+];
 
 /// The `saveCheck` operations that save the profile and then wait on the
 /// engine (`saveCompleteContinue`); the others go on at
@@ -248,6 +277,25 @@ const PROFILE_SAVES: [&str; 6] = [
 ];
 
 impl Native {
+    /// Puts up the NOTICE box ([`JOIN_NOTICE`]).
+    fn show_notice(&mut self) {
+        let [title, body, cancel, connect] = JOIN_NOTICE;
+        self.notice = true;
+        self.pending.push((
+            "onlineError",
+            vec![
+                text(title),
+                text(body),
+                Value::Number(2.0),
+                text(cancel),
+                text(connect),
+                text("close"),
+                Value::Bool(true),
+                Value::Bool(false),
+            ],
+        ));
+    }
+
     /// What to call in the movie now, `settings` being play's: set up as
     /// it starts (once), then the answers to what it asked.
     pub fn calls(&mut self, settings: &Settings) -> Vec<Call> {
@@ -298,7 +346,7 @@ impl Native {
     /// saves (`saveCheck("load", "continue")`), New Game's goes on to the
     /// characters (`newGameSelect`; its trace says "new game - success"),
     /// the load screen's loads the save picked (`"loadSaveGame"`). Join
-    /// Game's (online) is not answered.
+    /// Game's (online) gets the NOTICE box.
     pub fn command(&mut self, command: &str, arg: &str) -> bool {
         match command {
             "pressStartEnabled" => {
@@ -308,6 +356,57 @@ impl Native {
             "onlineLTIIsConnected" => {
                 if OFFLINE_PAGES.contains(&arg.trim()) {
                     self.pending.push(("LTIgotoGame", Vec::new()));
+                } else {
+                    self.show_notice();
+                }
+                true
+            }
+            // Extras' Unlockables and the like ask too: the same box, as
+            // the PC recording shows.
+            "onlineIsConnected" => {
+                self.show_notice();
+                true
+            }
+            // The NOTICE box's buttons: the movie's two-button box leaves
+            // closing to the engine (`buttonPress`, then
+            // `onlineErrorClose`). Connect can't, here. Going to Join Game
+            // took the main menu's key listener away; the movie's
+            // `LTIAllowFlashMouse` is what gives it back (its
+            // `transOutMainMenu`, inferred as the PC library's call).
+            "buttonPress" if self.notice => {
+                self.notice = false;
+                self.pending.push(("onlineErrorClose", Vec::new()));
+                self.pending.push(("LTIAllowFlashMouse", Vec::new()));
+                true
+            }
+            // The save list's Delete asks for the box the 360's table gives
+            // `deleteloadgame` ([`DELETE_BOX`]): the movie's box goes on
+            // by that name, its first button to the `deleteSaveGame` save.
+            "messageDeleteGame" => {
+                let [title, body, yes, no] = DELETE_BOX;
+                self.delete_box = true;
+                self.pending.push((
+                    "onlineError",
+                    vec![
+                        text(title),
+                        text(body),
+                        Value::Number(2.0),
+                        text(yes),
+                        text(no),
+                        text("deleteloadgame"),
+                        Value::Bool(true),
+                        Value::Bool(false),
+                    ],
+                ));
+                true
+            }
+            // Its No (and cancel): the box goes and the list has the keys
+            // again. Its Yes goes on in the movie.
+            "buttonPress" if self.delete_box => {
+                self.delete_box = false;
+                if arg.trim() != "1" {
+                    self.pending.push(("onlineErrorClose", Vec::new()));
+                    self.pending.push(("LTIAllowFlashMouse", Vec::new()));
                 }
                 true
             }
@@ -371,6 +470,8 @@ impl Native {
                 };
                 self.settings.saves.retain(|s| s.number != n);
                 self.news.delete = Some(n);
+                // Done: the confirmation box goes, as the list moves on.
+                self.pending.push(("onlineErrorClose", Vec::new()));
                 true
             }
             // The first run's brightness screen: the level as it moves.
@@ -1019,9 +1120,42 @@ mod tests {
         let mut n = Native::default();
         let s = Settings::default();
         n.calls(&s);
-        // Join Game (online): no answer.
+        // Join Game (online): the NOTICE box.
         assert!(n.command("onlineLTIIsConnected", "3"));
+        assert_eq!(names(n.calls(&s)), ["onlineError"]);
+        assert!(n.command("buttonPress", "2"));
+        assert_eq!(
+            names(n.calls(&s)),
+            ["onlineErrorClose", "LTIAllowFlashMouse"]
+        );
+        assert!(!n.command("buttonPress", "2"));
+        // Extras' Unlockables: the same box.
+        assert!(n.command("onlineIsConnected", "unlockables"));
+        assert_eq!(names(n.calls(&s)), ["onlineError"]);
+        assert!(n.command("buttonPress", "1"));
+        n.calls(&s);
+        // The save list's Delete: the box, No puts it away and gives the
+        // list its keys back; Yes goes on in the movie, and the delete
+        // takes the box away.
+        assert!(n.command("messageDeleteGame", "true"));
+        let calls = n.calls(&s);
+        assert_eq!(calls[0].0, "onlineError");
+        assert_eq!(
+            format!("{:?}", calls[0].1[5]),
+            format!("{:?}", text("deleteloadgame"))
+        );
+        assert!(n.command("buttonPress", "2"));
+        assert_eq!(
+            names(n.calls(&s)),
+            ["onlineErrorClose", "LTIAllowFlashMouse"]
+        );
+        assert!(n.command("messageDeleteGame", "true"));
+        n.calls(&s);
+        assert!(n.command("buttonPress", "1"));
         assert!(n.calls(&s).is_empty());
+        assert!(n.command("DeleteSaveGame", "0"));
+        assert_eq!(names(n.calls(&s)), ["onlineErrorClose"]);
+        assert_eq!(n.take_news().delete, Some(0));
         assert!(n.command("onlineLTIIsConnected", "2"));
         assert_eq!(names(n.calls(&s)), ["LTIgotoGame"]);
         assert!(n.command("preoperation", "save,newGame"));
@@ -1114,6 +1248,7 @@ mod tests {
         assert_eq!(names(n.calls(&s)).last(), Some(&"preopComplete"));
         assert!(n.command("DeleteSaveGame", "1"));
         assert_eq!(n.take_news().delete, Some(1));
+        n.calls(&s);
         // Listed again, the deleted one is gone.
         assert!(n.command("preoperation", "load,"));
         assert_eq!(
