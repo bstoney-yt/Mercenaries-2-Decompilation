@@ -2436,6 +2436,7 @@ impl MissionLink {
                 && let Some(f) = crate::npc::faction_by_label(label)
             {
                 faction = Some(f);
+                let level = level.split(',').next().unwrap_or(level);
                 clock.level = level.trim().parse().unwrap_or(0);
             }
             let wanted = faction.map(|f| {
@@ -2479,27 +2480,31 @@ impl MissionLink {
                 wanted = Some((f, self.reinforcements.out(f) + transports));
             }
             game.gunships.call_off(wanted.map(|(f, _)| f));
-            // Its cars, by road ([`crate::pursuers`]): one a think while its
-            // count for her state and the level is above those out and its
-            // gate is open (0x822371F8, 0x822387C0).
+            // Its cars and tanks, by road ([`crate::pursuers`]): one of a
+            // kind a think while its count for her state and the level is
+            // above those out and its gate is open (0x822371F8, 0x822387C0,
+            // 0x8223A410).
             game.pursuers.tick(dt);
             if let Some(f) = faction {
                 let standing = pursuit_standing(game, her);
                 let level = clock.level.max(0) as usize;
-                let n = counts.units(f, standing, "Car", level);
-                if n > game.pursuers.out(f)
-                    && game.pursuers.may_send(standing)
-                    && let Some(world) = game.scene.world.as_ref()
-                {
-                    game.pursuers
-                        .net(&world.index.roads, &world.index.junctions);
-                    let (at, forward) = her_on_road(game, her);
-                    let r = game.pursuers.random();
-                    if let Some(arrival) = game.pursuers.arrival(at, forward, standing, r)
-                        && let Some(lists) = self.pursuit_lists.as_mut()
-                        && let Some(template) = lists.next(f, standing.table_name(), "Car", level)
+                for kind in [crate::pursuers::Kind::Car, crate::pursuers::Kind::Tank] {
+                    let n = counts.units(f, standing, kind.table_name(), level);
+                    if n > game.pursuers.out(f, kind)
+                        && game.pursuers.may_send(kind, standing)
+                        && let Some(world) = game.scene.world.as_ref()
                     {
-                        send_pursuit_car(game, f, &template, arrival);
+                        game.pursuers
+                            .net(&world.index.roads, &world.index.junctions);
+                        let (at, forward) = her_on_road(game, her);
+                        let r = game.pursuers.random();
+                        if let Some(arrival) = game.pursuers.arrival(kind, at, forward, standing, r)
+                            && let Some(lists) = self.pursuit_lists.as_mut()
+                            && let Some(template) =
+                                lists.next(f, standing.table_name(), kind.table_name(), level)
+                        {
+                            send_pursuit_car(game, kind, f, &template, arrival);
+                        }
                     }
                 }
             }
@@ -5214,6 +5219,23 @@ fn send_gunship(game: &mut Game, faction: &'static str, template: &str, her: Vec
 
 fn pursuit_standing(game: &Game, her: Vec3) -> crate::reinforce::Standing {
     use crate::reinforce::Standing;
+    // For a test run: `M2_TEST_PURSUIT=<faction>,<level>,<state>` takes
+    // her state as that one (its pursuit-table name: `Tank`, `Driving`...).
+    if let Ok(test) = std::env::var("M2_TEST_PURSUIT")
+        && let Some(name) = test.split(',').nth(2)
+        && let Some(s) = [
+            Standing::Heli,
+            Standing::Tank,
+            Standing::Boat,
+            Standing::OffRoad,
+            Standing::Stopped,
+            Standing::Driving,
+        ]
+        .into_iter()
+        .find(|s| s.table_name().eq_ignore_ascii_case(name.trim()))
+    {
+        return s;
+    }
     let riding = game
         .scene
         .player
@@ -7098,6 +7120,7 @@ fn her_on_road(game: &Game, her: Vec3) -> (Vec3, Vec3) {
 /// ([`crate::pursuers`]), its vehicle and crew loaded as the island's are.
 fn send_pursuit_car(
     game: &mut Game,
+    kind: crate::pursuers::Kind,
     faction: &'static str,
     template: &str,
     arrival: m2_engine::road_ring::Arrival,
@@ -7111,7 +7134,9 @@ fn send_pursuit_car(
         return;
     }
     let crew = world.index.template_db.crew(template);
-    let entity = game.pursuers.send(faction, template.to_owned(), arrival);
+    let entity = game
+        .pursuers
+        .send(kind, faction, template.to_owned(), arrival);
     let yaw = m2_engine::car_driver::yaw(arrival.facing);
     game.scene
         .load_world_vehicle(entity, arrival.at, yaw, crew, models);
