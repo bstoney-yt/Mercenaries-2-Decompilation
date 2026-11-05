@@ -77,6 +77,8 @@ use m2_assets::flash::avm1::Value;
 
 use crate::input::Control;
 use crate::keytable::{KeyTable, ROWS};
+use crate::pad::Button;
+use crate::padtable::{PAD_NAME, PadTable};
 
 /// The menu movie's name.
 pub const MOVIE: &str = "pause_menu";
@@ -154,6 +156,8 @@ pub struct Settings {
     pub saves: Vec<SaveEntry>,
     /// The keyboard and mouse table ([`crate::keytable`]).
     pub keys: KeyTable,
+    /// The joystick table.
+    pub pad_table: PadTable,
     /// The front end's video screen's Graphic Detail (0 to 2), and its
     /// advanced screen's eight options in its setters' order
     /// (`LTIVideoSetSwitchOpt1` to `8`: the first, two detail levels,
@@ -192,6 +196,7 @@ impl Default for Settings {
             modes: Vec::new(),
             saves: Vec::new(),
             keys: KeyTable::default(),
+            pad_table: PadTable::default(),
             detail: DETAIL,
             advanced: ADVANCED,
         }
@@ -382,6 +387,11 @@ pub struct News {
     pub capture: Option<bool>,
     /// The keyboard table accepted: bind as it says.
     pub keys: Option<KeyTable>,
+    /// The joystick table wants the next pad button pressed, or no
+    /// longer does.
+    pub pad_capture: Option<bool>,
+    /// The joystick table accepted: the pad does as it says.
+    pub pad_table: Option<PadTable>,
     /// The video screen's Resolution and Refresh Rate kept: put the
     /// window into them.
     pub video: Option<Video>,
@@ -413,6 +423,8 @@ impl News {
         self.unused.extend(later.unused);
         self.capture = later.capture.or(self.capture);
         self.keys = later.keys.or(self.keys.take());
+        self.pad_capture = later.pad_capture.or(self.pad_capture);
+        self.pad_table = later.pad_table.or(self.pad_table);
         self.video = later.video.or(self.video);
         self.medevac |= later.medevac;
         self.music = later.music.or(self.music.take());
@@ -436,6 +448,7 @@ pub struct Native {
     other: std::collections::BTreeMap<String, String>,
     /// The keyboard table's screen.
     table: KeyScreen,
+    joy: JoyScreen,
     /// The video screen's Resolution and Refresh Rate as the player has
     /// stepped them, and its Aspect Ratio (wide), applied when the changes
     /// are kept.
@@ -455,6 +468,7 @@ impl Native {
         self.set_up = false;
         self.pending.clear();
         self.table.stop_waiting(&mut self.news);
+        self.joy.stop_waiting(&mut self.news);
     }
 
     /// What to call in the movie now, `settings` being play's: set up as
@@ -479,6 +493,7 @@ impl Native {
             // The keyboard table, filled before its screen counts the rows.
             self.table = KeyScreen::new(settings.keys.clone());
             calls.extend(self.table.fill());
+            self.joy = JoyScreen::new(settings.pad_table);
         }
         calls.append(&mut self.pending);
         calls
@@ -542,17 +557,35 @@ impl Native {
                 self.pending.extend(self.controls_calls());
                 true
             }
-            _ => match self
-                .table
-                .library(name, arg, &mut self.pending, &mut self.news)
-            {
-                Some(answered) => {
-                    self.settings.keys = self.table.kept.clone();
-                    answered
+            _ => {
+                let joy = self
+                    .joy
+                    .library(name, arg, &mut self.pending, &mut self.news);
+                if let Some(answered) = joy {
+                    self.settings.pad_table = self.joy.kept;
+                    return answered;
                 }
-                None => false,
-            },
+                match self
+                    .table
+                    .library(name, arg, &mut self.pending, &mut self.news)
+                {
+                    Some(answered) => {
+                        self.settings.keys = self.table.kept.clone();
+                        answered
+                    }
+                    None => false,
+                }
+            }
         }
+    }
+
+    /// The pad as it is now, for the joystick screen: what to call in the
+    /// movie.
+    pub fn pad(&mut self, pad: &PadReport) -> Vec<Call> {
+        for &b in &pad.captured {
+            self.joy.button(b, &mut self.pending, &mut self.news);
+        }
+        self.joy.report(pad)
     }
 
     /// The key or mouse button pressed while the keyboard table waited
@@ -560,6 +593,7 @@ impl Native {
     pub fn captured(&mut self, control: Control) {
         self.table
             .captured(control, &mut self.pending, &mut self.news);
+        self.joy.captured(&mut self.pending, &mut self.news);
     }
 
     fn item_changed(&mut self, arg: &str) -> bool {
@@ -871,6 +905,162 @@ impl KeyScreen {
     }
 }
 
+/// The pad as the menus' joystick screen needs it, each frame.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PadReport {
+    pub connected: bool,
+    /// The buttons held, as the screen shows them, empty for none.
+    pub held: String,
+    /// The button the table waited for, pressed.
+    pub captured: Vec<Button>,
+}
+
+/// The joystick table's screen (Controls, Joystick), as both menus'
+/// movies run it ([`crate::padtable`]). With no pad the screen is left
+/// as it is ("No Joystick Connected...", as the PC recording shows it),
+/// and a cell picked is called off at once: nothing can answer it, and
+/// the movie would wait for good.
+#[derive(Debug, Default)]
+pub struct JoyScreen {
+    /// The table as last accepted.
+    pub kept: PadTable,
+    /// The table as the movie shows it.
+    buttons: PadTable,
+    /// The row waiting for a button.
+    waiting: Option<usize>,
+    /// What the movie has been told.
+    connected: bool,
+    held: String,
+}
+
+impl JoyScreen {
+    pub fn new(kept: PadTable) -> Self {
+        Self {
+            kept,
+            buttons: kept,
+            ..Self::default()
+        }
+    }
+
+    fn map_call(&self, row: usize) -> Call {
+        (
+            "LTIInputJoystickMap",
+            vec![Value::Number(row as f64), text(&self.buttons.text(row))],
+        )
+    }
+
+    /// The table into the movie, if it has a joystick to list.
+    fn fill(&self, pending: &mut Vec<Call>) {
+        if self.connected {
+            pending.extend((0..ROWS.len()).map(|r| self.map_call(r)));
+            pending.push(("LTIInputJoystickUpdateTable", Vec::new()));
+        }
+    }
+
+    /// A call to the PC's library: `Some` whether it is answered, if it
+    /// is the table's.
+    pub fn library(
+        &mut self,
+        name: &str,
+        arg: &str,
+        pending: &mut Vec<Call>,
+        news: &mut News,
+    ) -> Option<bool> {
+        Some(match name {
+            "LTIInputJoystickEnter" | "LTIInputJoystickReEnter" | "LTIInputJoystickExit" => {
+                self.stop_waiting(news);
+                self.buttons = self.kept;
+                self.fill(pending);
+                true
+            }
+            // One pad: nothing to step to.
+            "LTIInputJoystickChangePrimary" => true,
+            "LTIInputJoystickChangeInput" => {
+                let row = arg.trim().parse::<usize>().ok().filter(|&r| r < ROWS.len());
+                match row {
+                    Some(row) if self.connected => {
+                        self.waiting = Some(row);
+                        news.capture = Some(true);
+                        news.pad_capture = Some(true);
+                    }
+                    _ => pending.push(("LTIInputJoystickCancel", Vec::new())),
+                }
+                true
+            }
+            "LTIInputJoystickCancel" => {
+                self.stop_waiting(news);
+                true
+            }
+            "LTIInputJoystickDefault" => {
+                self.stop_waiting(news);
+                self.buttons = PadTable::default();
+                self.fill(pending);
+                true
+            }
+            "LTIInputJoystickApplyChanges" => {
+                self.stop_waiting(news);
+                self.kept = self.buttons;
+                news.pad_table = Some(self.kept);
+                true
+            }
+            _ => return None,
+        })
+    }
+
+    /// The button pressed while a row waited for one: into the row.
+    pub fn button(&mut self, button: Button, pending: &mut Vec<Call>, news: &mut News) {
+        let Some(row) = self.waiting else {
+            return;
+        };
+        self.stop_waiting(news);
+        for r in self.buttons.set(row, button) {
+            pending.push(self.map_call(r));
+        }
+        pending.push(("LTIFinishedGettingJoystickInput", vec![Value::Bool(false)]));
+        pending.push(("LTIInputJoystickUpdateTable", Vec::new()));
+    }
+
+    /// A key or mouse button pressed while a row waited: the wait called
+    /// off.
+    pub fn captured(&mut self, pending: &mut Vec<Call>, news: &mut News) {
+        if self.waiting.is_some() {
+            self.stop_waiting(news);
+            pending.push(("LTIInputJoystickCancel", Vec::new()));
+        }
+    }
+
+    /// The table no longer waits for a button.
+    pub fn stop_waiting(&mut self, news: &mut News) {
+        if self.waiting.take().is_some() {
+            news.capture = Some(false);
+            news.pad_capture = Some(false);
+        }
+    }
+
+    /// What changed of the pad, for the movie.
+    pub fn report(&mut self, pad: &PadReport) -> Vec<Call> {
+        let mut calls = Vec::new();
+        if pad.connected != self.connected {
+            self.connected = pad.connected;
+            calls.push((
+                "LTIInputNumberControllers",
+                vec![Value::Number(f64::from(u8::from(pad.connected)))],
+            ));
+            if pad.connected {
+                calls.push((
+                    "LTIInputControllerNames",
+                    vec![Value::Number(0.0), text(PAD_NAME)],
+                ));
+            }
+        }
+        if pad.held != self.held {
+            self.held.clone_from(&pad.held);
+            calls.push(("LTIInputSeeButtonsPushed", vec![text(&pad.held)]));
+        }
+        calls
+    }
+}
+
 impl Settings {
     /// Sets the movie's variable `name` to `value` (`"true"`, `"80"`):
     /// whether play has it.
@@ -1064,6 +1254,125 @@ mod tests {
 
     fn names(calls: Vec<Call>) -> Vec<&'static str> {
         calls.into_iter().map(|c| c.0).collect()
+    }
+
+    fn pad_on() -> PadReport {
+        PadReport {
+            connected: true,
+            ..PadReport::default()
+        }
+    }
+
+    #[test]
+    fn with_no_pad_the_joystick_screen_stays_the_recordings() {
+        let mut n = Native::default();
+        let s = Settings::default();
+        n.calls(&s);
+        assert!(n.pad(&PadReport::default()).is_empty());
+        assert!(n.library("LTIInputJoystickEnter", ""));
+        assert_eq!(names(n.calls(&s)), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn with_no_pad_a_picked_cell_does_not_wait_for_good() {
+        let mut n = Native::default();
+        let s = Settings::default();
+        n.calls(&s);
+        assert!(n.library("LTIInputJoystickChangeInput", "4"));
+        assert_eq!(names(n.calls(&s)), ["LTIInputJoystickCancel"]);
+        assert_eq!(n.take_news().capture, None);
+        // The movie's `cancel` says so back.
+        assert!(n.library("LTIInputJoystickCancel", ""));
+    }
+
+    #[test]
+    fn a_pad_is_named_once_and_its_table_listed() {
+        let mut n = Native::default();
+        let s = Settings::default();
+        n.calls(&s);
+        assert_eq!(
+            names(n.pad(&pad_on())),
+            ["LTIInputNumberControllers", "LTIInputControllerNames"]
+        );
+        assert!(n.pad(&pad_on()).is_empty());
+        assert!(n.library("LTIInputJoystickEnter", ""));
+        let calls = n.calls(&s);
+        assert_eq!(calls.len(), ROWS.len() + 1);
+        assert_eq!(
+            (calls[4].0, texts(&calls[4])[1].as_str()),
+            ("LTIInputJoystickMap", "RT")
+        );
+        assert_eq!(calls[ROWS.len()].0, "LTIInputJoystickUpdateTable");
+    }
+
+    #[test]
+    fn the_buttons_held_are_shown_as_they_change() {
+        let mut n = Native::default();
+        n.calls(&Settings::default());
+        n.pad(&pad_on());
+        let held = PadReport {
+            held: "A + RT".into(),
+            ..pad_on()
+        };
+        let calls = n.pad(&held);
+        assert_eq!(calls[0].0, "LTIInputSeeButtonsPushed");
+        assert_eq!(texts(&calls[0]), ["A + RT"]);
+        assert!(n.pad(&held).is_empty());
+    }
+
+    #[test]
+    fn a_pressed_button_goes_in_its_row_and_accept_keeps_it() {
+        let mut n = Native::default();
+        let s = Settings::default();
+        n.calls(&s);
+        n.pad(&pad_on());
+        assert!(n.library("LTIInputJoystickEnter", ""));
+        n.calls(&s);
+        assert!(n.library("LTIInputJoystickChangeInput", "4"));
+        let news = n.take_news();
+        assert_eq!((news.capture, news.pad_capture), (Some(true), Some(true)));
+        n.pad(&PadReport {
+            captured: vec![Button::A],
+            ..pad_on()
+        });
+        let news = n.take_news();
+        assert_eq!((news.capture, news.pad_capture), (Some(false), Some(false)));
+        // The row, and Jump, which had A.
+        assert_eq!(
+            names(n.calls(&s)),
+            [
+                "LTIInputJoystickMap",
+                "LTIInputJoystickMap",
+                "LTIFinishedGettingJoystickInput",
+                "LTIInputJoystickUpdateTable"
+            ]
+        );
+        assert!(n.library("LTIInputJoystickApplyChanges", ""));
+        let kept = n.take_news().pad_table.expect("kept");
+        assert_eq!(kept.text(4), "A");
+        assert_eq!(kept.0[11], None);
+    }
+
+    #[test]
+    fn leaving_or_a_key_drops_what_was_not_accepted() {
+        let mut n = Native::default();
+        let s = Settings::default();
+        n.calls(&s);
+        n.pad(&pad_on());
+        assert!(n.library("LTIInputJoystickChangeInput", "4"));
+        n.pad(&PadReport {
+            captured: vec![Button::X],
+            ..pad_on()
+        });
+        n.calls(&s);
+        assert!(n.library("LTIInputJoystickExit", ""));
+        assert_eq!(texts(&n.calls(&s)[4])[1], "RT");
+        // A key calls the wait off.
+        assert!(n.library("LTIInputJoystickChangeInput", "4"));
+        n.take_news();
+        n.captured(Control::Key(KeyCode::Escape));
+        assert_eq!(n.take_news().pad_capture, Some(false));
+        assert_eq!(names(n.calls(&s)), ["LTIInputJoystickCancel"]);
     }
 
     #[test]

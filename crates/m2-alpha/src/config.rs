@@ -66,6 +66,10 @@ pub struct GameOptions {
     pub pad_sensitivity: f64,
     pub invert_pad: bool,
     pub rumble: bool,
+    /// The joystick table ([`crate::padtable::PadTable::names`]): its
+    /// rows' buttons, empty for the defaults.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pad_buttons: Vec<String>,
     pub brightness: f64,
     pub view_distance: f64,
     pub sfx_volume: f64,
@@ -87,6 +91,7 @@ impl Default for GameOptions {
             pad_sensitivity: 50.0,
             invert_pad: false,
             rumble: true,
+            pad_buttons: Vec::new(),
             brightness: 50.0,
             view_distance: 100.0,
             sfx_volume: 100.0,
@@ -303,6 +308,7 @@ impl Config {
             music: o.music_volume,
             dialog: o.dialog_volume,
             keys: crate::keytable::KeyTable::of(&self.keys),
+            pad_table: crate::padtable::PadTable::from_names(&o.pad_buttons),
             detail: o.video_detail,
             advanced: o.advanced_video,
             ..crate::pause::Settings::default()
