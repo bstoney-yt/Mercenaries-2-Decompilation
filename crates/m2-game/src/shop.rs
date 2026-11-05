@@ -28,8 +28,19 @@ function S.Create(self, t) fresh() end
 function S.SetCallback(self, t)
     if type(t) == "table" then __m2_shop.fCallback = t.fCallback end
 end
+-- The scripts' close callback: the shop is down once it is called (the
+-- HUD's store calls it as it closes itself, `_FlashCloseShopCallback`),
+-- whoever calls it.
 function S.SetCloseCallback(self, t)
-    if type(t) == "table" then __m2_shop.fClose = t.fCallback end
+    if type(t) ~= "table" then return end
+    local f = t.fCallback
+    __m2_shop.fClose = f
+    if type(f) == "function" then
+        t.fCallback = function(...)
+            __m2_shop.open = false
+            return f(...)
+        end
+    end
 end
 function S.AddItemFull(self, t)
     if type(t) == "table" then table.insert(__m2_shop.items, t) end
@@ -236,7 +247,10 @@ mod tests {
             local own = {}
             for _, name in ipairs({ "Create", "SetCallback", "SetCloseCallback",
                     "AddItemFull", "Commence", "Close" }) do
-                own[name] = function(self, t) table.insert(forwarded, name) end
+                own[name] = function(self, t)
+                    table.insert(forwarded, name)
+                    if name == "SetCloseCallback" then closeT = t end
+                end
             end
             Hud = { Shop = own }
             ownShop = own
@@ -259,5 +273,11 @@ mod tests {
         lua.load(OPEN).exec().unwrap();
         assert_eq!(n(&lua), 12);
         assert_eq!(Shop::read(&lua).unwrap().items.len(), 2);
+        // The HUD's store closing itself calls the close callback it was
+        // handed: the shop is down here too, and the scripts' callback ran.
+        assert!(Shop::read(&lua).unwrap().open);
+        lua.load("closeT.fCallback()").exec().unwrap();
+        assert!(!Shop::read(&lua).unwrap().open);
+        assert!(lua.load("return closed == true").eval::<bool>().unwrap());
     }
 }
