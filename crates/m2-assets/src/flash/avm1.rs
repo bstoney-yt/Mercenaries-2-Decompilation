@@ -2399,6 +2399,15 @@ impl Runtime {
     pub fn new(mut player: Player) -> Self {
         let mut avm = Avm::new();
         avm.stage = player.lib.size;
+        // `Stage.width` and `Stage.height`: the movie's own size (the
+        // default scale mode, `showAll`; the game's movies set no other).
+        // The shop's PURCHASE? box centres itself on `Stage.width / 2`.
+        let stage = avm.global.borrow().own("Stage");
+        if let Some(Value::Object(stage)) = stage {
+            let mut stage = stage.borrow_mut();
+            stage.set("width", Value::Number(f64::from(avm.stage[0])));
+            stage.set("height", Value::Number(f64::from(avm.stage[1])));
+        }
         let inits = player.lib.init_scripts.clone();
         let root = player.root;
         for (_, code) in inits {

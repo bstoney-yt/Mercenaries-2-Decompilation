@@ -1422,3 +1422,18 @@ fn a_frame_script_left_behind_by_a_goto_does_not_run() {
     let c = rt.player.clip(clip).unwrap();
     assert_eq!((c.frame, c.playing), (1, false));
 }
+
+#[test]
+fn the_stage_answers_the_movies_own_size() {
+    // `w = Stage.width; h = Stage.height` (the shop's PURCHASE? box is
+    // placed at `Stage.width / 2`).
+    let mut a = Asm::default();
+    for (var_name, member) in [("w", "width"), ("h", "height")] {
+        a.set(var_name, |a| {
+            a.str("Stage").op(0x1C).str(member).op(0x4E);
+        });
+    }
+    let mut rt = run(&a, Vec::new());
+    assert_eq!(number(&var(&mut rt, "w")), 100.0);
+    assert_eq!(number(&var(&mut rt, "h")), 100.0);
+}
