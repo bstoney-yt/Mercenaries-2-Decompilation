@@ -1940,6 +1940,24 @@ impl GameAudio {
                     continue;
                 }
                 Sound::Collapse(at) => (5, at, 2.0),
+                Sound::Taken { at, template } => {
+                    let set = db
+                        .and_then(|db| db.spawn_sounds.get(&template))
+                        .map_or(0, |s| s.set);
+                    let cue = (set != 0)
+                        .then(|| {
+                            self.gun_cues
+                                .cue_of(set, m2_engine::spawn_sound::TAKEN_EVENT)
+                        })
+                        .flatten();
+                    eprintln!(
+                        "sound: pickup {template:08x} taken at {at:.1}: set {set:08x}, cue {cue:08x?}"
+                    );
+                    if let Some(cue) = cue {
+                        self.play_key(cue, at);
+                    }
+                    continue;
+                }
                 Sound::Created { at, template } => {
                     self.play_created(at, template, db);
                     continue;

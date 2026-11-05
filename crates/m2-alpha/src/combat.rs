@@ -1315,6 +1315,14 @@ pub enum Sound {
     },
     /// A building the bomb brought down coming apart.
     Collapse(Vec3),
+    /// A pickup of `template` taken at `at` (walked over, or its
+    /// ammunition taken with the use key): heard as its own `SoundEffect`
+    /// set answers [`m2_engine::spawn_sound::TAKEN_EVENT`], nothing
+    /// standing in.
+    Taken {
+        at: Vec3,
+        template: u32,
+    },
     /// An effect a model's state started (`StartEmitter`: a wreck's
     /// fire, a tank's hull blowing out) coming into being as an object of
     /// its template, `template`: heard only as that template's
@@ -2787,6 +2795,11 @@ impl Combat {
                 .into_iter()
                 .map(|(template, at)| Sound::Created { at, template }),
         );
+    }
+
+    /// A pickup of `template` was taken at `at`: heard ([`Sound::Taken`]).
+    pub fn taken(&mut self, at: Vec3, template: u32) {
+        self.sounds.push(Sound::Taken { at, template });
     }
 
     /// A building the bomb brought down comes apart at `at`: heard.
@@ -7554,6 +7567,20 @@ mod tests {
             vec![Sound::Created {
                 at,
                 template: 0x8000_1234
+            }]
+        );
+    }
+
+    #[test]
+    fn a_pickup_taken_is_heard_as_its_template() {
+        let mut combat = Combat::default();
+        let at = Vec3::new(4.0, 0.0, 2.0);
+        combat.taken(at, 0x8000_a286);
+        assert_eq!(
+            combat.take_sounds(),
+            vec![Sound::Taken {
+                at,
+                template: 0x8000_a286
             }]
         );
     }
