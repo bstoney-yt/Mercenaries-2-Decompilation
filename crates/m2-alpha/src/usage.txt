@@ -385,9 +385,11 @@ the wheel away). Tab or the wheel puts the menu away; at the view, 1 or 2
 calls it off; so does being hurt. F1 opens and shuts the PDA, whose map
 WASD or the arrows move (the first contract's scripts give the bomb once
 she has looked at it).
-Shop and money: H opens the shop (a tab for each faction's; what each
+Shop and money: H opens the shop on the game's store screen, as a contact's
+Shop does (the arrows pick, Enter buys, Escape or B leaves; whose is the
+settings' [enhanced.shop] vendor, the Allied Nations' by default). What each
 sells unlocks with contracts, or all at once with the settings'
-[enhanced.shop] unlock_all = true). What she buys is in the support
+[enhanced.shop] unlock_all = true. What she buys is in the support
 menu: 1/2, the arrows or W/S pick the item, E calls it in. G throws its smoke,
 flare or beacon; a laser designator is held on the spot with fire; a
 satellite one is moved like the bomb's view and confirmed with fire.

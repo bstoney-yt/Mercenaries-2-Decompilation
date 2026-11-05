@@ -324,6 +324,10 @@ struct Options {
     /// (or those) bought and called in, one after another
     /// ([`shopcheck`]), for testing.
     shop_check: Option<Vec<String>>,
+    /// `--shop-key <s>`: with `--mission --after-contract`, the shop key
+    /// pressed this many seconds after the contract is done (the store
+    /// screen, [`open_store`]), for testing.
+    shop_key: Option<f32>,
     /// `--cheat-check`: with `--mission`, every cheat of the menu tried
     /// once she is ashore ([`cheats::Check`]), for testing.
     cheat_check: bool,
@@ -798,6 +802,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                     format!("--cheat-menu expects weapons, vehicles, support or player, not {v}")
                 })?);
             }
+            "--shop-key" => o.shop_key = Some(value()?.parse()?),
             "--shop-check" => {
                 let v = value()?;
                 o.shop_check = Some(if v == "all" {
@@ -1352,6 +1357,42 @@ fn give_guns(game: &mut Game, guns: &[String]) {
     for name in guns {
         if !game.give(name) {
             eprintln!("--gun {name}: no hand weapon of that name in the templates");
+        }
+    }
+}
+
+/// The shop key's vendor ([`config::ShopCheat::vendor`]) in
+/// [`mission::SHOPS`]: the Allied Nations' when empty or unknown.
+fn shop_vendor(vendor: &str) -> (&'static str, &'static str) {
+    mission::SHOPS
+        .iter()
+        .copied()
+        .find(|(key, _)| key.eq_ignore_ascii_case(vendor))
+        .unwrap_or(mission::SHOPS[0])
+}
+
+/// Opens the vendor's shop as a contact's Shop option does
+/// (`MrxShop.Open`): the scripts fill `Hud.Shop`, whose calls go on to
+/// the game's HUD, and its `MrxGuiSupportShop` puts up the `store` screen
+/// with the items; purchases and leaving come back as its callbacks, as
+/// for a contact. With `unlock_all` everything is unlocked first. Not
+/// again while a shop is up. Whether the scripts put it up.
+fn open_store(link: &mut mission::MissionLink, shop: &config::ShopCheat) -> bool {
+    if link.shop_open() {
+        return true;
+    }
+    let (key, name) = shop_vendor(&shop.vendor);
+    match link.open_shop(key, shop.unlock_all) {
+        Some(view) => {
+            eprintln!(
+                "shop: {name}'s store screen, {} things on sale",
+                view.items.len()
+            );
+            true
+        }
+        None => {
+            eprintln!("shop: {name}'s shop isn't there until the scripts run");
+            false
         }
     }
 }
@@ -3899,6 +3940,7 @@ fn mission_for_screenshot(
     let mut offered_actions: Vec<u32> = Vec::new();
     let mut delivery_key: Vec<(u32, usize, usize)> = Vec::new();
     let mut contract_done: Option<u32> = None;
+    let mut shop_pressed = 0u8;
     // The latest contract done: the tick and how many were then (for
     // `--late-shots`).
     let mut last_done: Option<(u32, u32)> = None;
@@ -4646,6 +4688,30 @@ fn mission_for_screenshot(
                 eprintln!("loading screen: {step:?} at {:.1} s", i as f32 * tick);
             }
         }
+        // `--shop-key`: the shop key pressed, by the clock, as in play,
+        // with cash given her as the contract ends (as if picked up) for
+        // the harness's Enter presses to buy with; Escape 15 s later.
+        if let (Some(at), Some(done)) = (options.shop_key, contract_done) {
+            let t = i.saturating_sub(done) as f32 * tick;
+            if shop_pressed == 0 {
+                shop_pressed = 1;
+                game.earned.push((1_000_000, 0));
+            } else if shop_pressed == 1 && t >= at {
+                shop_pressed = 2;
+                eprintln!("shop-key: she presses the shop key");
+                open_store(&mut link, &config::ShopCheat::default());
+            } else if shop_pressed == 2 && t >= at + 15.0 {
+                shop_pressed = 3;
+                let open = link.shop_open();
+                eprintln!("shop-key: she presses Escape (shop open: {open})");
+                if open {
+                    link.close_shop();
+                }
+            } else if shop_pressed == 3 && t >= at + 18.0 {
+                shop_pressed = 4;
+                eprintln!("shop-key: shop open 3 s after: {}", link.shop_open());
+            }
+        }
         // After the contract (--after-contract) the game's HUD runs too:
         // the flow waits on its fanfare closing.
         let boxed_now = options.dialog_shots && (late_hud.is_some() || link.dialog_open());
@@ -4669,7 +4735,7 @@ fn mission_for_screenshot(
             }
             // `--dialog-keys`: with a dialog box of the scripts up, its keys
             // in turn, the first 3 s after it opened and each 2 s on.
-            if link.dialog_open() {
+            if link.dialog_open() || link.shop_open() {
                 dialog_up += tick;
                 let keys: Vec<&str> = options
                     .dialog_keys
@@ -8699,7 +8765,6 @@ impl Running {
                 config.save("pause");
             }
             Some(ui::MenuAction::Quit) => event_loop.exit(),
-            Some(ui::MenuAction::Shop(a)) => self.shop_action(a, config),
             Some(ui::MenuAction::Cheat(a)) => self.cheat_action(a),
             None => {}
         }
@@ -8773,12 +8838,14 @@ impl Running {
         self.pad.rumble(rumble);
         // A dialog box the scripts put up has the pad: its stick and
         // buttons step and take the box, not move her (playtest: at
-        // Fiona's contract menu the stick walked her about).
+        // Fiona's contract menu the stick walked her about). So does the
+        // shop's store screen, which takes the controls while it is up
+        // (`MrxGuiSupportShop._RunShop`'s `GetControlFocus`): she stands.
         let dialog = !self.hud.menu
             && self
                 .mission
                 .as_ref()
-                .is_some_and(mission::MissionLink::dialog_open);
+                .is_some_and(|m| m.dialog_open() || m.shop_open());
         if dialog != self.game.dialog_up {
             self.game.dialog_up = dialog;
             self.input.clear();
@@ -8832,7 +8899,6 @@ impl Running {
             // down through its list, left and right a setting, Enter);
             // B leaves it as Escape does, as Start would.
             let own = self.hud.menu
-                && self.hud.shop.is_none()
                 && self
                     .hud
                     .game
@@ -8880,11 +8946,6 @@ impl Running {
 
     fn close_menu(&mut self) {
         self.hud.cheats = None;
-        if self.hud.shop.take().is_some()
-            && let Some(m) = &mut self.mission
-        {
-            m.close_shop();
-        }
         self.hud.menu = false;
         self.capturing = false;
         self.input.clear();
@@ -9242,65 +9303,12 @@ impl Running {
         }
     }
 
-    /// Puts faction `faction`'s shop up ([`mission::SHOPS`]), in the pause
-    /// menu's place: the world waits while she shops. Only once the
-    /// scripts run.
-    fn show_shop(&mut self, faction: usize, unlock_all: bool) {
-        let Some((key, name)) = mission::SHOPS.get(faction) else {
-            return;
-        };
-        let Some(view) = self
-            .mission
-            .as_mut()
-            .and_then(|m| m.open_shop(key, unlock_all))
-        else {
-            eprintln!("shop: {name}'s shop isn't there until the scripts run");
-            return;
-        };
-        eprintln!("shop: {name}'s, {} things on sale", view.items.len());
-        self.hud.shop = Some(ui::ShopScreen {
-            faction,
-            view,
-            said: None,
-            unlock_all,
-        });
-        if !self.hud.menu {
-            self.open_menu();
-        }
-    }
-
-    fn shop_action(&mut self, action: ui::ShopAction, config: &mut Config) {
-        let faction = self.hud.shop.as_ref().map_or(0, |s| s.faction);
-        match action {
-            ui::ShopAction::Close => self.close_menu(),
-            ui::ShopAction::Faction(i) => {
-                if let Some(m) = &mut self.mission {
-                    m.close_shop();
-                }
-                self.show_shop(i, config.enhanced.shop.unlock_all);
-            }
-            ui::ShopAction::UnlockAll(on) => {
-                config.enhanced.shop.unlock_all = on;
-                self.show_shop(faction, on);
-            }
-            ui::ShopAction::Buy(id) => {
-                let Some((view, bought)) = self.mission.as_mut().and_then(|m| m.buy(&id)) else {
-                    return;
-                };
-                if let Some(shop) = &mut self.hud.shop {
-                    let name = view
-                        .items
-                        .iter()
-                        .find(|i| i.id == id)
-                        .map_or(id.clone(), |i| i.name.clone());
-                    shop.said = Some(if bought {
-                        format!("Bought: {name}. Call it in from the support menu.")
-                    } else {
-                        format!("Could not buy {name}.")
-                    });
-                    shop.view = view;
-                }
-            }
+    /// Puts the shop up on the game's own store screen, as a contact's
+    /// Shop does ([`open_store`]); the store has the controls while it is
+    /// up. Only once the scripts run.
+    fn show_shop(&mut self, shop: &config::ShopCheat) {
+        if let Some(m) = &mut self.mission {
+            open_store(m, shop);
         }
     }
 
@@ -9358,17 +9366,28 @@ impl Running {
                 return;
             }
         }
+        // With the store screen up, Escape leaves it (the scripts' close
+        // callback, then `MrxShop.Close`), as its back button does.
+        let store = !self.hud.menu
+            && self
+                .mission
+                .as_ref()
+                .is_some_and(mission::MissionLink::shop_open);
         if self.input.take_pressed(Action::Quit) {
             if self.hud.menu {
                 self.close_menu();
+            } else if store {
+                eprintln!("shop: Escape leaves the store screen");
+                if let Some(m) = &mut self.mission {
+                    m.close_shop();
+                }
             } else {
                 self.hud.pause_settings = self.pause_settings(config);
                 self.open_menu();
             }
         }
-        if self.input.take_pressed(Action::Shop) && !self.hud.menu {
-            let unlock = config.enhanced.shop.unlock_all;
-            self.show_shop(0, unlock);
+        if self.input.take_pressed(Action::Shop) && !self.hud.menu && !store {
+            self.show_shop(&config.enhanced.shop);
         }
         // The cheat menu: a developer's key (taken either way), or its
         // code typed in play by anyone.
@@ -9905,6 +9924,14 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shop_key_opens_the_vendor_named_or_the_allied_nations() {
+        assert_eq!(shop_vendor("Chi").0, "Chi");
+        assert_eq!(shop_vendor("pmc").0, "Pmc");
+        assert_eq!(shop_vendor("").0, "All");
+        assert_eq!(shop_vendor("Nobody").0, "All");
+    }
 
     #[test]
     fn autoplay_avoid_lists_the_contracts_left_on_offer() {

@@ -1361,6 +1361,18 @@ impl MissionLink {
         Some((shop_view(m), bought))
     }
 
+    /// The scripts have a shop up (`Hud.Shop` `Commence`d and not yet
+    /// closed): the store screen has the controls while it is.
+    pub fn shop_open(&self) -> bool {
+        let State::Running(m) = &self.state else {
+            return false;
+        };
+        m.lua()
+            .load("return type(__m2_shop) == 'table' and __m2_shop.open == true")
+            .eval::<bool>()
+            .unwrap_or(false)
+    }
+
     /// Leaves the shop.
     pub fn close_shop(&mut self) {
         if let State::Running(m) = &mut self.state {
