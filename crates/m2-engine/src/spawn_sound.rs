@@ -72,6 +72,16 @@ pub const TAKEN_EVENT: u32 = 0xa639_af36;
 /// starts and stops read (36 of the 53 starts, 48 of the stops) last as
 /// long as their cue says (`plaincuelen` example).
 pub const ENGINE_START_EVENT: u32 = 0x72b6_619e;
+/// The `Sounds` table event of a vehicle's horn (name unknown).
+///
+/// From the 360 code: the player's vehicle update (0x8242E7A0) starts it
+/// on the vehicle's set as the driver's horn button goes down and stops
+/// it as it comes up; getting out stops it too (0x82360400). AI drivers
+/// sound another event, `6c15643b` (0x822BE7C0).
+///
+/// From samples: 54 sound sets have a row for it, and 53 of their cues
+/// find a sound (volume 0.85, heard 10 to 100 m on those read).
+pub const HORN_EVENT: u32 = 0xfc70_3e23;
 pub const ENGINE_OFF_EVENT: u32 = 0xc8f1_7f2a;
 
 /// `SoundEffect`'s field naming its sound set.
