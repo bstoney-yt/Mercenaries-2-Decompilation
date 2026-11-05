@@ -1165,7 +1165,11 @@ impl Player {
                     .as_ref()
                     .and_then(|(_, r)| r.clips.get(c))
                     .map_or(0.5, |k| k.info.duration);
-                match s.step(length, aim_rate, dt) {
+                let mut feet = (self.facing - self.yaw).rem_euclid(std::f32::consts::TAU);
+                if feet > std::f32::consts::PI {
+                    feet -= std::f32::consts::TAU;
+                }
+                match s.step(length, aim_rate, feet, dt) {
                     Some((by, play)) => {
                         self.facing += by;
                         shuffling = Some((c, play, fresh));
@@ -1338,6 +1342,9 @@ impl Player {
             if leaping {
                 self.stopping = None;
             }
+            // The aim reference keeps time with a shuffle round alone
+            // ([`Rig::shuffling`]).
+            rig.shuffling = shuffling.is_some();
             if self.bashing.is_some() || self.picking.is_some() || self.stopping.is_some() {
                 rig.two_handed = false;
             } else if let Some((c, _, fresh)) = shuffling {

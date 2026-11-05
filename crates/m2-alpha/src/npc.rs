@@ -328,6 +328,9 @@ pub struct FightClips {
     /// running forward, then walking, jogging and running backward
     /// ([`FightClips::AIM_GAITS`]).
     pub aim_gaits: [Option<usize>; 7],
+    /// Aiming upright and standing, the shuffles round to the left and
+    /// to the right ([`FightClips::AIM_SHUFFLES`]).
+    pub aim_shuffles: [Option<usize>; 2],
     /// Knocked down (lying, looped), getting up, and subdued (looped)
     /// ([`FightClips::KNOCKED`]).
     pub knocked: Option<usize>,
@@ -424,6 +427,16 @@ impl FightClips {
         0x513a_aeda,
         0xcafe_197d,
     ];
+
+    /// The upright stance's shuffles round, standing aimed: entries 27
+    /// and 28 of its locomotion node's handle list (0x82B4DA98, from the
+    /// 360 code), `Upright_Aim_Shuffle_Left110` (daf1c53a) and
+    /// `Upright_Aim_Shuffle_Right90` (3024fd38), named by their hashes.
+    /// The clips are the on-foot table's generic rifle rows for them
+    /// (from samples): a soldier has no rifle row of his own there, and a
+    /// rifle row comes before his own with anything held
+    /// ([`m2_assets::animation_table::character_clip`]).
+    pub const AIM_SHUFFLES: [u32; 2] = [0x6af4_b7e3, 0x14df_b49d];
 
     /// The swim clip for moving at `moved` m/s and its rate: the gait
     /// whose own root speed is nearest, played to match it (within a
@@ -537,6 +550,7 @@ impl FightClips {
             swim_out: find(Self::SWIM_OUT),
             swim_gaits: Self::SWIM_GAITS.map(find),
             aim_gaits: Self::AIM_GAITS.map(find),
+            aim_shuffles: Self::AIM_SHUFFLES.map(find),
             knocked: find(Self::KNOCKED),
             getup: find(Self::GETUP),
             subdued: find(Self::SUBDUED),
@@ -847,6 +861,7 @@ impl FightClips {
         [self.aim, self.ready, self.run_low, self.jump, self.die]
             .into_iter()
             .chain(self.aim_gaits)
+            .chain(self.aim_shuffles)
             .flatten()
     }
 }
@@ -1023,6 +1038,14 @@ pub struct Npc {
     stalled: u8,
     way: Vec2,
     turning: m2_engine::on_foot::Turn,
+    /// Standing aimed, the way his feet point, apart from his body's
+    /// [`facing`](Self::facing) (the 360's standing locomotion keeps its
+    /// own, +0x1584, 0x82809D60); `None` otherwise, the feet with the
+    /// body. The shuffle round under way, and the body's and the wanted
+    /// heading's last tick, for their rates.
+    feet: Option<f32>,
+    shuffle: Option<m2_engine::on_foot::Shuffle>,
+    last_heads: (f32, f32),
     run_stop: m2_engine::on_foot::RunStop,
     /// Standing up out of the water: the climb-out's seconds left.
     climbing: f32,
@@ -1195,6 +1218,9 @@ impl Npc {
             stalled: 0,
             way: Vec2::Y,
             turning: m2_engine::on_foot::Turn::default(),
+            feet: None,
+            shuffle: None,
+            last_heads: (0.0, 0.0),
             run_stop: m2_engine::on_foot::RunStop::people(),
             climbing: 0.0,
             knocked_for: None,
@@ -1532,6 +1558,74 @@ impl Npc {
     /// Chest height, where shots aim.
     pub fn chest(&self) -> Vec3 {
         self.character.position + Vec3::Y * 1.3
+    }
+
+    /// The way his feet point: his model turns to it.
+    pub fn feet(&self) -> f32 {
+        self.feet.unwrap_or(self.facing)
+    }
+
+    /// Steps his feet, `standing` aimed or not, the way he wants to face
+    /// being `toward`: the 360's standing locomotion (0x82809D60). Aimed
+    /// and still, the feet keep their own heading until they, or the
+    /// wanted heading, are past 60 degrees from his body's
+    /// ([`m2_engine::on_foot::Shuffle::begin`]); then a shuffle round
+    /// turns them as its clip plays ([`m2_engine::on_foot::Shuffle::turn`]).
+    /// `shuffles` are the clips round to the left and to the right, with
+    /// their lengths (seconds). Returns the shuffle's clip, whether it
+    /// starts this tick, and its play rate. Otherwise the feet go with the body (the moving steps
+    /// don't use them; the stance starts them at the body's, 0x828071A8).
+    fn step_feet(
+        &mut self,
+        standing: bool,
+        toward: f32,
+        shuffles: [Option<(usize, f32)>; 2],
+        dt: f32,
+    ) -> Option<(usize, bool, f32)> {
+        let wrap = |a: f32| {
+            let a = a.rem_euclid(std::f32::consts::TAU);
+            if a > std::f32::consts::PI {
+                a - std::f32::consts::TAU
+            } else {
+                a
+            }
+        };
+        let rates = (
+            wrap(self.facing - self.last_heads.0) / dt.max(1e-4),
+            wrap(toward - self.last_heads.1) / dt.max(1e-4),
+        );
+        self.last_heads = (self.facing, toward);
+        if !standing || shuffles.iter().all(Option::is_none) {
+            self.feet = None;
+            self.shuffle = None;
+            return None;
+        }
+        let feet = *self.feet.get_or_insert(self.facing);
+        let off = wrap(feet - self.facing);
+        if self.shuffle.is_none() {
+            self.shuffle = m2_engine::on_foot::Shuffle::begin(off, wrap(toward - self.facing))
+                .filter(|s| shuffles[usize::from(!s.left)].is_some());
+        }
+        let s = self.shuffle.as_mut()?;
+        let fresh = s.time == 0.0;
+        let (c, length) = shuffles[usize::from(!s.left)]?;
+        match s.turn(length, rates.0, rates.1, off, dt) {
+            Some((by, play)) => {
+                self.feet = Some(wrap(feet + by));
+                if fresh {
+                    eprintln!(
+                        "anim: soldier shuffle {} (clip {c}), feet {:.0} deg off",
+                        if s.left { "left" } else { "right" },
+                        off.to_degrees()
+                    );
+                }
+                Some((c, fresh, play))
+            }
+            None => {
+                self.shuffle = None;
+                None
+            }
+        }
     }
 
     fn turn_to(&mut self, target: f32, dt: f32) -> f32 {
@@ -1897,11 +1991,34 @@ impl Npc {
         } else {
             m2_engine::on_foot::AimLegs::Still
         };
+        // Standing in a fight, his feet stay put while his body turns,
+        // until they are past 60 degrees from it or the way he wants to
+        // face (at her) is: then he shuffles round, aiming
+        // ([`m2_engine::on_foot::Shuffle`]). Her past 60 degrees from his
+        // body, he would hold the rifle ready ([`AIM_ARC`]); the shuffle
+        // that starts at once takes him round aimed (inferred: the 360's
+        // AI holding its aim state, +0x15EC, at its target throughout).
+        let shuffles = if self.rig.sweep_clips().is_some() {
+            clips
+                .aim_shuffles
+                .map(|c| c.map(|c| (c, self.rig.clips[c].info.duration)))
+        } else {
+            [None; 2]
+        };
+        let shuffling = self.step_feet(
+            seen && self.striking <= 0.0 && gait == Gait::Idle,
+            face,
+            shuffles,
+            dt,
+        );
         if self.striking <= 0.0 {
-            self.rig.hold_rifle(gait, &clips, carry);
+            match shuffling {
+                Some((c, fresh, _)) => self.rig.shuffle_legs(c, fresh, &clips),
+                None => self.rig.hold_rifle(gait, &clips, carry),
+            }
         }
-        if ahead && self.striking <= 0.0 {
-            self.rig.aim_along(self.facing, Some(threat - self.chest()));
+        if (ahead || shuffling.is_some()) && self.striking <= 0.0 {
+            self.rig.aim_along(self.feet(), Some(threat - self.chest()));
         }
         self.cooldown -= dt;
         self.launcher_wait -= dt;
@@ -1953,6 +2070,8 @@ impl Npc {
         // His number stands in for the game's entity handle (invented).
         let rate = if self.striking > 0.0 {
             1.0
+        } else if let Some((_, _, play)) = shuffling {
+            play
         } else {
             self.rig.play_rate(gait, moved, self.shooter)
         };
@@ -2104,13 +2223,13 @@ impl Npc {
         }
     }
 
-    /// Model to world, turned so the model faces `facing`. The dead
+    /// Model to world, turned so the model faces its feet ([`feet`](Self::feet)). The dead
     /// whose model has no fall clip that fits topple over backwards about
     /// their feet instead.
     pub fn model_matrix(&self) -> Mat4 {
         let forward = self.rig.locomotion.as_ref().map_or(Vec2::Y, |l| l.forward);
         let turned = Mat4::from_translation(self.character.position)
-            * Mat4::from_rotation_y(self.facing - forward.x.atan2(forward.y));
+            * Mat4::from_rotation_y(self.feet() - forward.x.atan2(forward.y));
         if self.alive || self.clips.die.is_some() {
             return turned;
         }
@@ -4264,6 +4383,7 @@ pub(crate) mod tests {
             kick: Default::default(),
             aim_legs: false,
             aim_walk: Default::default(),
+            shuffling: false,
             aim_clock: 0.0,
             arm: Default::default(),
             cues: Vec::new(),
@@ -4386,6 +4506,46 @@ pub(crate) mod tests {
         assert_eq!(sent.len(), 1);
         // Not a Venezuelan: doesn't fight, nor is he a story character.
         assert!(!sent[0].soldier && !sent[0].held);
+    }
+
+    #[test]
+    fn standing_aimed_his_feet_stay_then_shuffle_round() {
+        let brain = Brain::Post { facing: 0.0 };
+        let mut npc = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, brain, Some(1));
+        let dt = 1.0 / 60.0;
+        // Left 110 degrees in 1 s, right 90 in 0.73 s.
+        let shuffles = [Some((4, 1.0)), Some((5, 0.73))];
+        // Standing still aimed, the feet start with the body; his body
+        // turns 30 degrees left onto her: the feet stay.
+        assert_eq!(npc.step_feet(true, 0.0, shuffles, dt), None);
+        let body = 30f32.to_radians();
+        npc.facing = body;
+        assert_eq!(npc.step_feet(true, body, shuffles, dt), None);
+        assert_eq!(npc.feet(), 0.0);
+        // She steps 70 degrees past his body to the left: he shuffles left
+        // at once.
+        let toward = 100f32.to_radians();
+        let (c, fresh, play) = npc.step_feet(true, toward, shuffles, dt).unwrap();
+        assert_eq!((c, fresh), (4, true));
+        assert!((play - 1.0).abs() < 1e-4);
+        // His body turns onto her as quickly.
+        npc.facing = toward;
+        let mut ticks = 1;
+        while npc.step_feet(true, toward, shuffles, dt).is_some() {
+            ticks += 1;
+        }
+        // The clip's second, turning the feet its 110 degrees.
+        assert!((59..=61).contains(&ticks), "{ticks}");
+        assert!(
+            (npc.feet().to_degrees() - 110.0).abs() < 2.5,
+            "{}",
+            npc.feet().to_degrees()
+        );
+        // 10 degrees past his body now: they stay.
+        assert_eq!(npc.step_feet(true, toward, shuffles, dt), None);
+        // Moving off, the feet go with the body again.
+        assert_eq!(npc.step_feet(false, toward, shuffles, dt), None);
+        assert_eq!(npc.feet(), npc.facing);
     }
 
     #[test]
