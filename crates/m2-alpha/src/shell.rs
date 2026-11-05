@@ -277,6 +277,25 @@ const PROFILE_SAVES: [&str; 6] = [
 ];
 
 impl Native {
+    /// Puts up the NOTICE box ([`JOIN_NOTICE`]).
+    fn show_notice(&mut self) {
+        let [title, body, cancel, connect] = JOIN_NOTICE;
+        self.notice = true;
+        self.pending.push((
+            "onlineError",
+            vec![
+                text(title),
+                text(body),
+                Value::Number(2.0),
+                text(cancel),
+                text(connect),
+                text("close"),
+                Value::Bool(true),
+                Value::Bool(false),
+            ],
+        ));
+    }
+
     /// What to call in the movie now, `settings` being play's: set up as
     /// it starts (once), then the answers to what it asked.
     pub fn calls(&mut self, settings: &Settings) -> Vec<Call> {
@@ -338,22 +357,14 @@ impl Native {
                 if OFFLINE_PAGES.contains(&arg.trim()) {
                     self.pending.push(("LTIgotoGame", Vec::new()));
                 } else {
-                    let [title, body, cancel, connect] = JOIN_NOTICE;
-                    self.notice = true;
-                    self.pending.push((
-                        "onlineError",
-                        vec![
-                            text(title),
-                            text(body),
-                            Value::Number(2.0),
-                            text(cancel),
-                            text(connect),
-                            text("close"),
-                            Value::Bool(true),
-                            Value::Bool(false),
-                        ],
-                    ));
+                    self.show_notice();
                 }
+                true
+            }
+            // Extras' Unlockables and the like ask too: the same box, as
+            // the PC recording shows.
+            "onlineIsConnected" => {
+                self.show_notice();
                 true
             }
             // The NOTICE box's buttons: the movie's two-button box leaves
@@ -1118,6 +1129,11 @@ mod tests {
             ["onlineErrorClose", "LTIAllowFlashMouse"]
         );
         assert!(!n.command("buttonPress", "2"));
+        // Extras' Unlockables: the same box.
+        assert!(n.command("onlineIsConnected", "unlockables"));
+        assert_eq!(names(n.calls(&s)), ["onlineError"]);
+        assert!(n.command("buttonPress", "1"));
+        n.calls(&s);
         // The save list's Delete: the box, No puts it away and gives the
         // list its keys back; Yes goes on in the movie, and the delete
         // takes the box away.
