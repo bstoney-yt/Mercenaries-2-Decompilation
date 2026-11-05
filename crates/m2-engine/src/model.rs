@@ -270,7 +270,26 @@ impl MaterialCache {
             });
         let has = |bit: u16| material.flags & bit != 0;
         let alpha = matches!(texture, Some((_, true)));
-        let blend = if has(flags::ADDITIVE) {
+        // The refracting shader (shader3.bin 093, PgDiffRefractNormFP)
+        // bends by constant0.y, constant 15: 0.015 on the heat haze,
+        // 0.08 on the shockwaves, 0.02 to 0.025 on the ghost. It draws over
+        // what is behind it, so it comes after everything solid.
+        let refraction = technique
+            .filter(|t| t.refraction)
+            .map_or(0.0, |_| material.constants[15]);
+        let emissive = emissive.or_else(|| {
+            (refraction > 0.0).then_some(Emissive {
+                color: [
+                    material.constants[9],
+                    material.constants[10],
+                    material.constants[11],
+                ],
+                map: None,
+            })
+        });
+        let blend = if refraction > 0.0 {
+            BlendMode::Translucent
+        } else if has(flags::ADDITIVE) {
             BlendMode::Additive
         } else if has(flags::BLENDED) {
             BlendMode::Translucent
@@ -328,6 +347,7 @@ impl MaterialCache {
             normal_map,
             emissive,
             reflection,
+            refraction,
             rim: technique.is_some_and(|t| t.rim),
             depth_bias,
             // The game's beam shader has no fade by how the surface faces
@@ -1977,6 +1997,25 @@ mod tests {
         };
         let m = cache.material(&mut backend, &light).unwrap();
         assert_eq!(backend.material(m).blend, BlendMode::Additive);
+        assert!(cache.is_translucent(m));
+        // The heat haze: PgDiffRefractNormFP bends by constant 15, tinted by
+        // constants 9-11, over what is behind it.
+        let mut haze = Material {
+            flags: 0x0100,
+            technique: m2_assets::name_hash("PgDiffRefractNormFP"),
+            ..material(6, 10)
+        };
+        haze.constants[9] = 1.0;
+        haze.constants[10] = 1.0;
+        haze.constants[11] = 1.0;
+        haze.constants[15] = 0.015;
+        let m = cache.material(&mut backend, &haze).unwrap();
+        assert_eq!(backend.material(m).blend, BlendMode::Translucent);
+        assert_eq!(backend.material(m).refraction, 0.015);
+        assert_eq!(
+            backend.material(m).emissive.map(|e| e.color),
+            Some([1.0; 3])
+        );
         assert!(cache.is_translucent(m));
         // A lamp lens: PgDiffEmisFP glows with constants 9-11 through slot 1.
         let mut lamp = Material {
