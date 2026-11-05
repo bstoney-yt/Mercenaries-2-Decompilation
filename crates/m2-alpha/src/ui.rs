@@ -134,6 +134,8 @@ pub struct Hud {
     /// Keys and mouse buttons for the pause menu's keyboard table, not yet
     /// passed on.
     pub pause_captured: Vec<crate::input::Control>,
+    /// The pad, for the pause menu's joystick screen.
+    pub pause_pad: crate::pause::PadReport,
 }
 
 impl std::fmt::Debug for Hud {
@@ -176,6 +178,7 @@ impl Hud {
             dev: true,
             pause_settings: crate::pause::Settings::default(),
             pause_captured: Vec::new(),
+            pause_pad: crate::pause::PadReport::default(),
         }
     }
 
@@ -193,6 +196,8 @@ impl Hud {
         state.pause = self.menu;
         state.pause_settings = self.pause_settings.clone();
         state.pause_captured = std::mem::take(&mut self.pause_captured);
+        state.pause_pad = self.pause_pad.clone();
+        self.pause_pad.captured.clear();
         // The pause menu takes the mouse, as does the PDA.
         if state.pause || info.support.pda {
             let at = input.events.iter().rev().find_map(|e| match e {

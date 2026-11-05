@@ -82,6 +82,8 @@ pub struct Flow {
     settings: Option<crate::pause::Settings>,
     /// Keys and buttons for the shell's keyboard table, waiting for one.
     captured: Vec<crate::input::Control>,
+    /// The pad, for the front end's joystick screen.
+    pad: crate::pause::PadReport,
     /// What the shell's menus asked of the game, not yet taken.
     news: crate::pause::News,
     /// The shell's scripts are in their attract state: its video is up
@@ -129,6 +131,7 @@ impl Flow {
             backdrop: None,
             settings: None,
             captured: Vec::new(),
+            pad: crate::pause::PadReport::default(),
             news: crate::pause::News::default(),
             attract: false,
             wake: false,
@@ -159,6 +162,13 @@ impl Flow {
         if let Some(s) = &mut self.settings {
             s.video = video;
         }
+    }
+
+    /// The pad as it is now, for the front end's joystick screen.
+    pub fn pad(&mut self, connected: bool, held: String, captured: Option<crate::pad::Button>) {
+        self.pad.connected = connected;
+        self.pad.held = held;
+        self.pad.captured.extend(captured);
     }
 
     /// A key or button for the front end's keyboard table, which waits
@@ -492,6 +502,8 @@ impl Flow {
                 state.pause_settings = settings.clone();
             }
             state.pause_captured = std::mem::take(&mut self.captured);
+            state.pause_pad = self.pad.clone();
+            self.pad.captured.clear();
             // The menus take the mouse too.
             (state.pointer, state.clicks) = ui
                 .ctx()

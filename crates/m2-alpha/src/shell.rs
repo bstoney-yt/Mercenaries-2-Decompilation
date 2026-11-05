@@ -59,7 +59,7 @@
 use m2_game::gui_runtime;
 
 use crate::input::Control;
-use crate::pause::{self, KeyScreen, Mode, News, Settings, Video};
+use crate::pause::{self, JoyScreen, KeyScreen, Mode, News, PadReport, Settings, Video};
 use m2_assets::flash::avm1::Value;
 use m2_game::mission::Mission;
 use mlua::Lua;
@@ -215,6 +215,7 @@ pub struct Native {
     /// The keyboard and mouse table (Controls, Keyboard/Mouse), as the
     /// pause menu's ([`KeyScreen`]).
     table: KeyScreen,
+    joy: JoyScreen,
     /// What the menus asked of the game since last taken.
     news: News,
 }
@@ -317,6 +318,7 @@ impl Native {
             calls.extend(self.setting_calls());
             calls.extend(self.save_calls());
             calls.extend(self.table.fill());
+            self.joy = JoyScreen::new(settings.pad_table);
         } else if settings.saves != self.told_saves {
             // The saves came after the movie was set up (the front end's
             // first frames run before they are told it), or changed (a
@@ -541,6 +543,16 @@ impl Native {
     pub fn captured(&mut self, control: Control) {
         self.table
             .captured(control, &mut self.pending, &mut self.news);
+        self.joy.captured(&mut self.pending, &mut self.news);
+    }
+
+    /// The pad as it is now, for the joystick screen: what to call in the
+    /// movie.
+    pub fn pad(&mut self, pad: &PadReport) -> Vec<Call> {
+        for &b in &pad.captured {
+            self.joy.button(b, &mut self.pending, &mut self.news);
+        }
+        self.joy.report(pad)
     }
 
     /// A call to the PC's library (`LTILibName.<name>(arg)`) from the
@@ -548,6 +560,14 @@ impl Native {
     /// `_LTIPauseItemChanged`...): whether it is answered. `window` is how
     /// the window is shown now and `modes` the monitor's.
     pub fn library(&mut self, name: &str, arg: &str, window: Video, modes: &[Mode]) -> bool {
+        if let Some(answered) = self
+            .joy
+            .library(name, arg, &mut self.pending, &mut self.news)
+        {
+            self.settings.pad_table = self.joy.kept;
+            self.editing.pad_table = self.joy.kept;
+            return answered;
+        }
         if let Some(answered) = self
             .table
             .library(name, arg, &mut self.pending, &mut self.news)

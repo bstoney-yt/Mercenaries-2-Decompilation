@@ -77,6 +77,7 @@ mod moving;
 mod multiply;
 mod npc;
 mod pad;
+mod padtable;
 mod particles;
 mod paths;
 mod pause;
@@ -2521,6 +2522,15 @@ fn screenshot(
         state.pause_settings.profile = game.scene.hero.full_name().into();
         state.pause_settings.video = video;
         state.pause_settings.modes = modes.clone();
+        // For checking the joystick table without a pad: one reads as
+        // connected, and this button answers the table's waits.
+        if let Ok(button) = std::env::var("M2_FAKE_PAD") {
+            state.pause_pad = pause::PadReport {
+                connected: true,
+                held: button.clone(),
+                captured: pad::Button::by_name(&button).into_iter().collect(),
+            };
+        }
         state.right_stick = [0.0, options.pda_zoom];
         info.game = Some(state);
         let seconds = options
@@ -3733,6 +3743,10 @@ fn front_end_offscreen(
         }
         if let Some(table) = news.keys {
             table.apply(&mut config.keys);
+            config.save("front end");
+        }
+        if let Some(table) = news.pad_table {
+            config.options.pad_buttons = table.names();
             config.save("front end");
         }
         if let Some(n) = news.delete {
@@ -8991,6 +9005,20 @@ impl Running {
         let mut held = Input::default();
         let target = if dialog { &mut held } else { &mut self.input };
         let keys = self.pad.poll(target, driving, dt);
+        // The joystick table's wait for a button, and what it shows.
+        let captured = self.pad.take_captured();
+        if captured.is_some() {
+            self.capturing = false;
+        }
+        let (connected, held) = (self.pad.connected(), self.pad.held_text());
+        match self.flow.as_mut().filter(|f| f.in_menus()) {
+            Some(flow) => flow.pad(connected, held, captured),
+            None => {
+                self.hud.pause_pad.connected = connected;
+                self.hud.pause_pad.held = held;
+                self.hud.pause_pad.captured.extend(captured);
+            }
+        }
         for key in keys {
             use pad::MenuKey;
             if let Some(flow) = self.flow.as_mut().filter(|f| f.holds()) {
@@ -9117,6 +9145,7 @@ impl Running {
         self.pad.look = Some(pause::pad_scale(o.pad_sensitivity));
         self.pad.invert = o.invert_pad;
         self.pad.rumble_on = o.rumble;
+        self.pad.table = Some(padtable::PadTable::from_names(&o.pad_buttons));
         // The advanced video screen's fourth option is shadows.
         self.game.picture = game::Picture {
             brightness: o.brightness,
@@ -9171,6 +9200,12 @@ impl Running {
         }
         if let Some(c) = news.capture {
             self.capturing = c;
+        }
+        if let Some(c) = news.pad_capture {
+            self.pad.capture = c;
+        }
+        if let Some(table) = news.pad_table {
+            self.keep_pad_table(config, table, "pause");
         }
         if let Some(table) = news.keys {
             table.apply(&mut config.keys);
@@ -9249,6 +9284,12 @@ impl Running {
         if let Some(c) = news.capture {
             self.capturing = c;
         }
+        if let Some(c) = news.pad_capture {
+            self.pad.capture = c;
+        }
+        if let Some(table) = news.pad_table {
+            self.keep_pad_table(config, table, "front end");
+        }
         if let Some(table) = news.keys {
             table.apply(&mut config.keys);
             let path = config::Config::default_path();
@@ -9318,6 +9359,18 @@ impl Running {
         );
         if !taken {
             self.load_from(path);
+        }
+    }
+
+    /// The joystick table accepted in the `menu`: the pad does as it
+    /// says from now on, and the settings file keeps it.
+    fn keep_pad_table(&mut self, config: &mut Config, table: padtable::PadTable, menu: &str) {
+        self.pad.table = Some(table);
+        config.options.pad_buttons = table.names();
+        let path = config::Config::default_path();
+        match std::fs::write(&path, config.to_toml()) {
+            Ok(()) => eprintln!("{menu}: joystick table kept, saved to {}", path.display()),
+            Err(e) => eprintln!("{menu}: could not save {}: {e}", path.display()),
         }
     }
 

@@ -54,6 +54,7 @@
 use m2_sys::xinput::{LEFT_DEAD_ZONE, PadState, RIGHT_DEAD_ZONE, buttons as xb};
 
 use crate::input::{Action, Input};
+use crate::padtable::PadTable;
 
 /// A button of the pad (the triggers count as buttons past half way).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -77,6 +78,53 @@ pub enum Button {
 }
 
 impl Button {
+    /// Every button, in the order a press is looked for.
+    pub const ALL: [Self; 16] = [
+        Self::A,
+        Self::B,
+        Self::X,
+        Self::Y,
+        Self::LeftBumper,
+        Self::RightBumper,
+        Self::LeftTrigger,
+        Self::RightTrigger,
+        Self::LeftStick,
+        Self::RightStick,
+        Self::Start,
+        Self::Back,
+        Self::DpadUp,
+        Self::DpadDown,
+        Self::DpadLeft,
+        Self::DpadRight,
+    ];
+
+    /// What the joystick table calls it (invented: [`crate::padtable`]).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::B => "B",
+            Self::X => "X",
+            Self::Y => "Y",
+            Self::LeftBumper => "LB",
+            Self::RightBumper => "RB",
+            Self::LeftTrigger => "LT",
+            Self::RightTrigger => "RT",
+            Self::LeftStick => "L3",
+            Self::RightStick => "R3",
+            Self::Start => "START",
+            Self::Back => "BACK",
+            Self::DpadUp => "DPAD UP",
+            Self::DpadDown => "DPAD DOWN",
+            Self::DpadLeft => "DPAD LEFT",
+            Self::DpadRight => "DPAD RIGHT",
+        }
+    }
+
+    /// The button called `name`.
+    pub fn by_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|b| b.name() == name)
+    }
+
     /// Held in `s`.
     pub fn held(self, s: &PadState) -> bool {
         let bit = match self {
@@ -251,6 +299,12 @@ pub struct Pad {
     pub pda_keys: Vec<(i32, bool)>,
     /// The motors are running.
     motors: bool,
+    /// The joystick table, once it differs from the pad's own layout.
+    pub table: Option<PadTable>,
+    /// The joystick table waits for a button: none reaches the menus,
+    /// and the next pressed is [`Pad::take_captured`]'s.
+    pub capture: bool,
+    captured: Option<Button>,
 }
 
 /// How hard the motors run while the scripts shake the pad, left (heavy)
@@ -325,6 +379,12 @@ impl Pad {
     /// dialog box is up; while the PDA is open, none: its keys are
     /// gathered in `pda_keys` instead.
     fn keys(&mut self, s: &PadState) -> Vec<MenuKey> {
+        if self.capture {
+            if self.captured.is_none() {
+                self.captured = Self::pressed(&self.last, s);
+            }
+            return Vec::new();
+        }
         if self.pda {
             let pda = Self::pda_keys(&self.last, s);
             self.pda_keys.extend(pda);
@@ -337,6 +397,38 @@ impl Pad {
         keys
     }
 
+    /// The first button going down from `before` to `now`.
+    pub fn pressed(before: &PadState, now: &PadState) -> Option<Button> {
+        Button::ALL
+            .into_iter()
+            .find(|b| b.held(now) && !b.held(before))
+    }
+
+    /// The button the joystick table waited for, once pressed.
+    pub fn take_captured(&mut self) -> Option<Button> {
+        let b = self.captured.take();
+        if b.is_some() {
+            self.capture = false;
+        }
+        b
+    }
+
+    /// Whether a pad is there.
+    pub fn connected(&self) -> bool {
+        self.connected
+    }
+
+    /// The buttons held now as the joystick screen shows them, empty for
+    /// none (its `LTIJoystickBtnsDown`).
+    pub fn held_text(&self) -> String {
+        Button::ALL
+            .into_iter()
+            .filter(|b| b.held(&self.last))
+            .map(Button::name)
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+
     /// The right stick as last read (x right, y up).
     pub fn right_stick(&self) -> [f32; 2] {
         self.last.right
@@ -344,7 +436,12 @@ impl Pad {
 
     /// Feeds one reading `s` to `input`.
     pub fn feed(&mut self, input: &mut Input, s: PadState, driving: bool, dt: f64) {
-        let layout = if driving { DRIVING } else { ON_FOOT };
+        let base = if driving { DRIVING } else { ON_FOOT };
+        let layout = self.table.map_or_else(|| base.to_vec(), |t| t.layout(base));
+        let sprint = self
+            .table
+            .map_or(Some(Button::LeftStick), |t| t.sprint())
+            .filter(|b| b.held(&s) && !b.held(&self.last));
         let active = s != PadState::default();
         if active && !input.pad() {
             input.set_pad(true);
@@ -368,7 +465,7 @@ impl Pad {
         let tilt = lx.hypot(ly);
         if driving || tilt == 0.0 {
             self.sprint = false;
-        } else if Button::LeftStick.held(&s) && !Button::LeftStick.held(&self.last) {
+        } else if sprint.is_some() {
             self.sprint = !self.sprint;
         }
         input.set_pad_hold(Action::Sprint, self.sprint);

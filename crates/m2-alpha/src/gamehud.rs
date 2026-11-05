@@ -829,6 +829,8 @@ pub struct HudState {
     /// Keys and mouse buttons pressed while the pause menu's keyboard
     /// table waited for one ([`crate::pause::News::capture`]).
     pub pause_captured: Vec<crate::input::Control>,
+    /// The pad, for the menus' joystick screen.
+    pub pause_pad: crate::pause::PadReport,
     /// The mouse pointer (screen points), while the menus show it, and the
     /// left button going down (true) and up since the last frame: for the
     /// menu movies' buttons (the front end's, the pause menu's).
@@ -1093,6 +1095,11 @@ impl HudState {
         dialog_keys.extend(later.dialog_keys.iter().copied());
         let mut pause_captured = std::mem::take(&mut self.pause_captured);
         pause_captured.extend(later.pause_captured.iter().copied());
+        let mut pause_pad = later.pause_pad.clone();
+        pause_pad.captured = std::mem::take(&mut self.pause_pad.captured);
+        pause_pad
+            .captured
+            .extend(later.pause_pad.captured.iter().copied());
         let mut clicks = std::mem::take(&mut self.clicks);
         clicks.extend(later.clicks.iter().copied());
         hurts.extend(later.hurts.iter().copied());
@@ -1109,6 +1116,7 @@ impl HudState {
             buttons,
             dialog_keys,
             pause_captured,
+            pause_pad,
             clicks,
             ..later
         };
@@ -3059,6 +3067,7 @@ impl Thread {
                 self.native.captured(c);
             }
             calls.extend(self.native.calls(&state.pause_settings));
+            calls.extend(self.native.pad(&state.pause_pad));
             for &(code, down) in &state.keys {
                 if down {
                     calls.extend(self.native.key(code));
@@ -3299,7 +3308,8 @@ impl Thread {
         let Some((id, _)) = movie else {
             return;
         };
-        let calls = self.pause_native.calls(&state.pause_settings);
+        let mut calls = self.pause_native.calls(&state.pause_settings);
+        calls.extend(self.pause_native.pad(&state.pause_pad));
         if let Some(m) = self.flash.get_mut(&id) {
             for (name, args) in calls {
                 log.push(format!(
