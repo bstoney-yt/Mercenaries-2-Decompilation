@@ -187,6 +187,12 @@ pub struct MaterialDesc {
     pub reflection: Option<Reflection>,
     /// Takes the view's rim light (see [`Lighting`](crate::Lighting)).
     pub rim: bool,
+    /// Draw what lies behind it bent, this far (0: not refracting), tinted
+    /// by the emissive colour, as the game's `PgDiffRefractNormFP`
+    /// (shader3.bin 093; heat haze, shockwaves): the scene sampled at the
+    /// pixel plus the world normal's x and y times its facing times this,
+    /// in fractions of the screen.
+    pub refraction: f32,
     /// Shade as open water: moving waves, reflecting the sky by Fresnel
     /// over `color` (the water's body colour and opacity looking straight
     /// down).
@@ -282,6 +288,7 @@ impl Default for MaterialDesc {
             emissive: None,
             reflection: None,
             rim: false,
+            refraction: 0.0,
             water: false,
             water_sky: 1.0,
             water_waves: 1.0,

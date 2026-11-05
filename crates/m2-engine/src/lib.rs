@@ -65,6 +65,7 @@ pub mod tuning;
 pub mod vehicle;
 pub mod vehicle_damage;
 pub mod vehicle_door;
+pub mod vehicle_parts;
 pub mod weapons;
 pub mod world;
 

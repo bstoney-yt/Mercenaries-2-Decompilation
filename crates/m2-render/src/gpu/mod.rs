@@ -1201,8 +1201,13 @@ impl WgpuBackend {
                 None => [0.0; 4],
             },
             reflection: match desc.reflection {
-                Some(r) => [r.strength, r.fresnel.unwrap_or(-1.0), flag(desc.rim), 0.0],
-                None => [0.0, -1.0, flag(desc.rim), 0.0],
+                Some(r) => [
+                    r.strength,
+                    r.fresnel.unwrap_or(-1.0),
+                    flag(desc.rim),
+                    desc.refraction,
+                ],
+                None => [0.0, -1.0, flag(desc.rim), desc.refraction],
             },
             water: [
                 flag(desc.water),
@@ -2253,15 +2258,16 @@ impl WgpuBackend {
         if let Some(cascades) = &cascades {
             self.encode_shadows(&mut encoder, &frame, cascades, refresh, draws)?;
         }
-        // Water reads the depth of what lies beneath it, so the world is
-        // drawn in two passes split at the first water draw, with the
-        // depth buffer copied between them.
+        // Water reads the depth of what lies beneath it, and water and
+        // refracting surfaces the colour behind them, so the world is
+        // drawn in two passes split at the first such draw, with the
+        // depth buffer and colour copied between them.
         let split = draws
             .iter()
             .position(|d| {
                 self.materials
                     .get(&d.material)
-                    .is_some_and(|m| m.desc.water)
+                    .is_some_and(|m| m.desc.water || m.desc.refraction > 0.0)
             })
             .unwrap_or(draws.len());
         self.encode_world(

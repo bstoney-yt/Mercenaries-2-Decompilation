@@ -194,7 +194,8 @@ struct Material {
     // rgb: emitted colour (0: none), w: scaled by the specular map's texel
     emissive: vec4<f32>,
     // x: reflection strength (0: none), y: Fresnel reflectance facing the
-    // eye (negative: no Fresnel), z: takes the rim light
+    // eye (negative: no Fresnel), z: takes the rim light, w: refraction
+    // strength (0: none)
     reflection: vec4<f32>,
     // x: open water, y: scale on the sky it mirrors, z: on its waves,
     // w: how soon its waves fade with the pixel's size
@@ -840,6 +841,21 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
         let l = -normalize(frame.sun_dir.xyz);
         let n_dot_l = dot(n, l);
         let view = normalize(frame.eye.xyz - v.world_pos);
+        if material.reflection.w > 0.0 {
+            // The scene behind it, bent as the game's PgDiffRefractNormFP
+            // bends it: by the world normal's x and y, times the facing,
+            // times the strength, in fractions of the screen. Tinted by
+            // the emissive colour; the shader's lit terms are left out
+            // (all zero on the haze and the shockwaves).
+            let bend = n.xy * dot(view, n) * material.reflection.w;
+            let size = vec2<f32>(textureDimensions(scene_color));
+            let at = clamp(
+                vec2<i32>(v.clip.xy + bend * size),
+                vec2<i32>(0),
+                vec2<i32>(size) - 1,
+            );
+            return vec4<f32>(textureLoad(scene_color, at, 0).rgb * material.emissive.rgb, 1.0);
+        }
         var surface_n = normalize(v.normal + vec3<f32>(0.0, 1e-6, 0.0));
         if !front {
             surface_n = -surface_n;
