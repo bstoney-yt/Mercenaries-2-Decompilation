@@ -846,6 +846,16 @@ pub fn engine_cues(cues: &GunCues, set: u32) -> (Option<u32>, Option<u32>) {
     )
 }
 
+/// The cue vehicle sound set `set` sounds its horn with: its `Sounds` row
+/// for [`HORN_EVENT`](m2_engine::spawn_sound::HORN_EVENT). Where it has
+/// none, or its cue finds no sound, the bank's horn or a resident one
+/// sounds ([`load_horns`]).
+pub fn horn_cue(cues: &GunCues, set: u32) -> Option<u32> {
+    (set != 0)
+        .then(|| cues.cue_of(set, m2_engine::spawn_sound::HORN_EVENT))
+        .flatten()
+}
+
 /// A bank's engine sounds, read on a thread.
 type EngineLoad = (u32, Option<EngineSounds>);
 
@@ -2488,7 +2498,8 @@ impl GameAudio {
             // The set's start and stop, read ahead; the engine waits for
             // its start.
             let (start, off) = engine_cues(&self.gun_cues, input.set);
-            for c in [start, off].into_iter().flatten() {
+            let horn = horn_cue(&self.gun_cues, input.set);
+            for c in [start, off, horn].into_iter().flatten() {
                 if !self.keys.contains_key(&c) {
                     self.ask_key(c);
                 }
@@ -2556,6 +2567,25 @@ impl GameAudio {
         };
         if self.horn.is_some() {
             return;
+        }
+        // Its sound set's horn, read ahead as the engine starts.
+        if let Some(cue) = horn_cue(&self.gun_cues, input.set)
+            && let Some(Some(found)) = self.keys.get(&cue).cloned()
+        {
+            let pick = self.random();
+            if let Some(buffer) = found.pick(pick).cloned() {
+                eprintln!(
+                    "horn: set {:08x}, cue {cue:08x} ({:08x}, {:.2} s, looped)",
+                    input.set,
+                    buffer.hash,
+                    buffer.seconds()
+                );
+                let play = Play::flat(buffer)
+                    .looped()
+                    .gain(found.volume.clamp(0.0, 2.0));
+                self.horn = Some(self.out.with(|m| m.play(play)));
+                return;
+            }
         }
         let own = self
             .engine
@@ -2775,6 +2805,20 @@ mod tests {
             },
             GunCues::from_rows([[set, m2_engine::spawn_sound::CREATE_EVENT, any, 0x1915_2b89]]),
         )
+    }
+
+    #[test]
+    fn a_horn_is_its_sets_row() {
+        let any = m2_assets::animation_table::ANY;
+        let cues = GunCues::from_rows([[
+            0xbac4_4630,
+            m2_engine::spawn_sound::HORN_EVENT,
+            any,
+            0x219e_5c43,
+        ]]);
+        assert_eq!(horn_cue(&cues, 0xbac4_4630), Some(0x219e_5c43));
+        assert_eq!(horn_cue(&cues, 0), None);
+        assert_eq!(horn_cue(&cues, 1), None);
     }
 
     /// The HMMWV's set (`ef7403d8`) as the data has it: start `5c551331`,
