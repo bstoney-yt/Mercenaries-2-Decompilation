@@ -105,6 +105,9 @@ pub struct Rig {
     /// The weight of the firing sweeps, kicked by each shot
     /// ([`Rig::fired`]).
     pub kick: m2_engine::aim_sweep::Kick,
+    /// Aiming upright with the aim movement on the legs
+    /// ([`Rig::hold_rifle`]): the body split as a hero's crouched aim.
+    pub aim_legs: bool,
     /// The locomotion node's clock, seconds (the 360's +0x1588): runs the
     /// noise of the crouched gait's weight over the aim
     /// ([`m2_engine::aim_sweep::layer_weight`]).
@@ -718,6 +721,7 @@ impl Rig {
             sweeps: Default::default(),
             sweep_upper: false,
             kick: Default::default(),
+            aim_legs: false,
             aim_clock: 0.0,
             arm: Default::default(),
             skeleton: Arc::new(skeleton),
@@ -783,6 +787,7 @@ impl Rig {
             sweeps: Default::default(),
             sweep_upper: false,
             kick: Default::default(),
+            aim_legs: false,
             aim_clock: 0.0,
             arm: Default::default(),
             skeleton: Arc::new(skeleton),
@@ -816,6 +821,7 @@ impl Rig {
             sweeps: Default::default(),
             sweep_upper: false,
             kick: Default::default(),
+            aim_legs: false,
             aim_clock: 0.0,
             animator: Animator::default(),
             cues: Vec::new(),
@@ -874,6 +880,25 @@ impl Rig {
     /// side to side and round again (Brendan's playtest). The 360's
     /// standing locomotion plays the idle clip.
     pub fn hold_rifle(&mut self, gait: Gait, clips: &npc::FightClips, carry: Carry) {
+        // Aiming upright (not a hero, who aims in crouched), the 360's
+        // locomotion node plays its aim movement on the legs and the aim
+        // sweeps over the upper body ([`Rig::sweep`]): the legs' gait is
+        // the upright aim gait, where the rig has it and the sweeps.
+        let aim_gait = clips.aim_gaits[match gait {
+            Gait::Idle => 0,
+            Gait::Walk => 1,
+            Gait::Run => 2,
+            Gait::Sprint => 3,
+        }]
+        .filter(|_| carry == Carry::Aim && !self.sweep_upper && self.sweep_clips().is_some());
+        self.aim_legs = aim_gait.is_some();
+        if let Some(clip) = aim_gait {
+            self.gait = gait;
+            self.play_gait(clip);
+            self.two_handed = true;
+            self.animator.set_upper(None);
+            return;
+        }
         let (whole, upper) = match (gait, carry) {
             (Gait::Idle, Carry::Aim) => (clips.aim, None),
             (_, Carry::Aim) => (None, clips.aim),
@@ -969,8 +994,12 @@ impl Rig {
         let pitch = w.y.clamp(-1.0, 1.0).asin();
         // A hero aims in crouched (`Crouched` stance), standing too: the
         // 360's bone tables split her body below.
-        let hero = self.sweep_upper;
-        let moving = self.animator.upper().is_some();
+        let hero = self.sweep_upper || self.aim_legs;
+        let moving = if self.aim_legs {
+            self.gait != Gait::Idle
+        } else {
+            self.animator.upper().is_some()
+        };
         let set = sets.aim[usize::from(moving)];
         // Each group's firing clip, by the shots' kick.
         let fire = sets
