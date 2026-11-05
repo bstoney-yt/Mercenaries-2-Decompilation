@@ -2858,6 +2858,19 @@ impl Game {
             .as_ref()
             .and_then(|w| w.index.template_db.engine_set_for_model(v.spec.model))
             .unwrap_or(0);
+        let physics = self.scene.world.as_ref().map(|w| &w.physics);
+        let id = v.id;
+        let (mut revs, mut slide, mut surface, mut braking) = (None, 0.0, 0.0, false);
+        if let (Some(p), Some(id)) = (physics, id) {
+            // The top revs are its `GearMaxRPM` default of 8000 where the
+            // gearbox's own aren't to hand (360's divides by a record's).
+            revs = p.vehicle_gear(id).map(|(_, rpm)| (rpm / 8000.0).min(1.0));
+            braking = p.vehicle_braking(id);
+            if let Some(at) = p.vehicle_transform(id) {
+                slide = p.vehicle_velocity(id).dot(at.x_axis.truncate());
+                surface = m2_engine::surface::tyre_class(p.vehicle_ground(id, 5.0));
+            }
+        }
         Some(crate::sound::EngineInput {
             bank,
             set,
@@ -2870,6 +2883,10 @@ impl Game {
             throttle: self.throttle,
             horn: self.honking,
             heavy: heavy_horn(&v.spec.kind, &v.spec.label, v.spec.tracked),
+            revs,
+            slide,
+            surface,
+            braking,
         })
     }
 

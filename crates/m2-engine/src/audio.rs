@@ -889,6 +889,14 @@ pub fn world_cue_tables<R: Read + Seek>(source: &mut AssetSource<R>) -> Vec<CueT
 pub const PARAM_SPEED: u32 = 0x15ba_509e;
 pub const PARAM_LOAD: u32 = 0xe092_4df9;
 pub const PARAM_REVERSE: u32 = 0xa09a_4dfd;
+/// The engine's revs over its top revs (the same controller's
+/// rpm / maximum, from the gearbox it simulates at 0x82368080).
+pub const PARAM_REVS: u32 = 0x8834_a6b4;
+/// Sideways speed times 2.5 over the top speed, the brake, and the
+/// surface's class ([`crate::surface::tyre_class`]).
+pub const PARAM_SLIDE: u32 = 0x79a9_e4cc;
+pub const PARAM_BRAKE: u32 = 0xa922_b8ee;
+pub const PARAM_SURFACE: u32 = 0xb2ba_fff9;
 
 /// A looping mixed cue played track by track, each moved by its curves
 /// (an engine: idle, low and high loops crossfaded as the data says).

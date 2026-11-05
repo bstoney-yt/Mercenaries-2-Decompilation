@@ -5009,6 +5009,25 @@ impl Physics {
             .map_or(0.0, |v| v.controller.current_vehicle_speed)
     }
 
+    /// What the ground under a vehicle is made of: the surface word of
+    /// what a ray straight down from it meets, 0 for nothing within `max`
+    /// metres or nothing that says.
+    pub fn vehicle_ground(&self, id: VehicleId, max: f32) -> u32 {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return 0;
+        };
+        let Some(body) = self.world.bodies.get(v.controller.chassis) else {
+            return 0;
+        };
+        let ray = r::Ray::new(body.translation(), vector(Vec3::NEG_Y));
+        let filter = solid().exclude_rigid_body(v.controller.chassis);
+        self.world
+            .query_pipeline_with_filter(filter)
+            .cast_ray_and_get_normal(&ray, max, true)
+            .and_then(|(handle, hit)| Some(self.surfaces.get(&handle)?.surface_of(hit.subshape)))
+            .unwrap_or(0)
+    }
+
     /// How fast a vehicle's wheels and tracks roll, m/s: its chassis's
     /// velocity along its own forward axis, signed (the controller's
     /// [`vehicle_speed`](Self::vehicle_speed) is the whole velocity's

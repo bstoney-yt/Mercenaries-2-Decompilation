@@ -81,6 +81,69 @@ pub fn word(surface: u32) -> Option<&'static str> {
         .find(|w| name_hash(w) == surface)
 }
 
+/// The value the tyre cues' surface parameter takes on `surface`: its
+/// class, 0 to 4, times 0.2 (from the 360 code, 0x82369190; 0.2 at
+/// 0x820B8054). Each track of a tyre cue plays over a window of this
+/// parameter. A surface the code doesn't list is class 0.
+pub fn tyre_class(surface: u32) -> f32 {
+    const ONE: [u32; 27] = [
+        0x6700_5058,
+        0x30e6_dade,
+        0x1d1b_f411,
+        0x01b7_74fc,
+        0x0eec_28b8,
+        0x171a_3b8e,
+        0x1c72_73b4,
+        0x2861_15a2,
+        0x26fe_046c,
+        0x4cdb_6b73,
+        0x409d_41ce,
+        0x349e_446a,
+        0x44d6_ab50,
+        0x6624_a04f,
+        0x5497_915d,
+        0x63e1_1a24,
+        0xbe74_5c9d,
+        0xff30_afe5,
+        0xec3c_dfeb,
+        0xf23a_a29b,
+        0xbcda_2be7,
+        0xa90c_7469,
+        0x8a39_4748,
+        0x75e2_bf9c,
+        0xa44c_4ed1,
+        0xb5c6_8379,
+        0xbbe2_6f59,
+    ];
+    const THREE: [u32; 13] = [
+        0x1611_7a0b,
+        0x236d_008b,
+        0x2ab2_7544,
+        0x3b60_032f,
+        0x4224_488a,
+        0x6674_bb3b,
+        0xe729_9bd8,
+        0xc968_7379,
+        0xffcf_647e,
+        0x6f4f_283e,
+        0x8bad_ebcf,
+        0xb727_8f60,
+        0xb3a7_e6c1,
+    ];
+    let class = if ONE.contains(&surface) {
+        1.0
+    } else if surface == 0xbd92_3d99 {
+        2.0
+    } else if THREE.contains(&surface) {
+        3.0
+    } else if surface == 0xbffd_e8f8 {
+        4.0
+    } else {
+        0.0
+    };
+    class * 0.2
+}
+
 /// The template a bullet striking `surface` sets off, and whether the
 /// surface's word chose it (rather than [`GENERIC_IMPACT`] standing in).
 pub fn bullet_impact(surface: u32) -> (&'static str, bool) {
@@ -93,6 +156,15 @@ pub fn bullet_impact(surface: u32) -> (&'static str, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surfaces_fall_into_the_tyre_classes_the_code_lists() {
+        assert_eq!(tyre_class(0x6700_5058), 0.2);
+        assert_eq!(tyre_class(0xbd92_3d99), 0.4);
+        assert!((tyre_class(0xffcf_647e) - 0.6).abs() < 1e-6);
+        assert_eq!(tyre_class(0xbffd_e8f8), 0.8);
+        assert_eq!(tyre_class(0x1234_5678), 0.0);
+    }
 
     #[test]
     fn generic_is_the_word_most_materials_carry() {
