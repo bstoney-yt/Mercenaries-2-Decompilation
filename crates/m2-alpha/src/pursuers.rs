@@ -266,6 +266,8 @@ pub struct Pursuers {
     /// Seconds to the next log line.
     log: f32,
     rng: u32,
+    /// What their gunners have seen of her motion ([`m2_engine::gunner_aim::Watch`]).
+    watch: m2_engine::gunner_aim::Watch,
 }
 
 impl Pursuers {
@@ -407,6 +409,8 @@ impl Pursuers {
         dt: f32,
     ) -> Vec<usize> {
         self.shots.clear();
+        // Their gunners' watch on her motion (0x822C95D8, every 0.25 s).
+        self.watch.see(her, dt);
         let mut drop = Vec::new();
         self.log -= dt;
         let log = self.log <= 0.0;
@@ -659,6 +663,12 @@ impl Pursuers {
                         run: false,
                         seat: k,
                         priority: mount.priority,
+                        lead: Some(crate::gunships::Lead {
+                            velocity: her_velocity,
+                            watched: self.watch.velocity,
+                            speed: mount.weapon.ammo.velocity,
+                            gravity: mount.weapon.ammo.gravity,
+                        }),
                     });
                 }
             }

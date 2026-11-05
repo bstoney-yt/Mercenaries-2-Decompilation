@@ -31,6 +31,7 @@ pub mod durability;
 pub mod grapple;
 pub mod gun_sounds;
 pub mod hand_ik;
+pub mod gunner_aim;
 pub mod heli_land;
 pub mod heli_pilot;
 pub mod hijack;
