@@ -202,8 +202,11 @@ impl Kind {
 }
 
 impl TankWorld for Look<'_> {
-    /// A ray from 1 m up at its nose (`nose` along its heading), `reach`
-    /// on (0x822C8CB8 sweeps its box that far ahead).
+    /// 0x822C8CB8: its box's face (its width by its height, 0.02 m thin)
+    /// swept from its nose `reach` on along its heading. Here past its own
+    /// bodies and meeting no terrain, as the path search's sweeps
+    /// ([`Physics::sweep_obstacle`]; the 360's filter 0x6228651E is not
+    /// decoded); the face's middle taken as half its height up.
     fn ahead_clear(&mut self, reach: f32) -> bool {
         let Some(m) = self.physics.vehicle_transform(self.car) else {
             return true;
@@ -212,9 +215,10 @@ impl TankWorld for Look<'_> {
             .transform_vector3(Vec3::Z)
             .with_y(0.0)
             .normalize_or(Vec3::Z);
-        let nose = m.transform_point3(Vec3::Z * self.nose) + Vec3::Y;
+        let nose = m.transform_point3(Vec3::Z * self.nose) + Vec3::Y * (self.size.height * 0.5);
+        let half = Vec3::new(self.size.width * 0.5, self.size.height * 0.5, 0.01);
         self.physics
-            .cast_ray_past(nose, forward, reach, self.car)
+            .sweep_obstacle(nose, nose + forward * reach, half, Some(self.car))
             .is_none()
     }
 }
