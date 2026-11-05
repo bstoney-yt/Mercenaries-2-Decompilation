@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use m2_engine::ambience::{AmbiencePlan, Layers};
-use m2_engine::audio::{EngineSounds, Falloff, KeySounds, Play, SoundLibrary};
+use m2_engine::audio::{EngineCue, EngineSounds, Falloff, KeySounds, Play, SoundLibrary};
 use m2_engine::gun_sounds::GunCues;
 use m2_engine::{Category, Install, Mixer, SoundBuffer, Streams, VoiceId, Voices};
 
@@ -186,6 +186,9 @@ pub struct GameAudio {
     /// Engine sounds by bank name hash, once read (`None`: the bank has
     /// none); banks are read on a thread the first time they're driven.
     engines: HashMap<u32, Option<Arc<EngineSounds>>>,
+    /// Engine cues by key, once read (`None`: none plays).
+    engine_cues: HashMap<u32, Option<Arc<EngineCue>>>,
+    engine_cue_loads: (Sender<EngineCueLoad>, Receiver<EngineCueLoad>),
     engine_loads: (Sender<EngineLoad>, Receiver<EngineLoad>),
     install: Option<Install>,
     /// The engine running now.
@@ -856,12 +859,20 @@ pub fn horn_cue(cues: &GunCues, set: u32) -> Option<u32> {
         .flatten()
 }
 
+/// An engine cue, read on a thread.
+type EngineCueLoad = (u32, Option<EngineCue>);
+
 /// A bank's engine sounds, read on a thread.
 type EngineLoad = (u32, Option<EngineSounds>);
 
 /// An engine running: its sounds, a voice per loop, and how hard it runs.
 #[derive(Debug)]
 struct Engine {
+    /// Its set's engine cue, played in place of the bank's loops.
+    cue: Option<Arc<EngineCue>>,
+    /// The load, eased (the 360's rate is in a record not found:
+    /// [`ENGINE_EASE`] is invented).
+    load: f32,
     bank: u32,
     /// Its vehicle's sound set (0: none).
     set: u32,
@@ -872,6 +883,9 @@ struct Engine {
     /// Seconds since it started.
     running: f32,
 }
+
+/// Told apart from a key in [`GameAudio::key_asked`]: an engine cue's read.
+const ENGINE_CUE_ASKED: u32 = 0x5a5a_5a5a;
 
 /// How loud the engine is, and how long its loops take to come in (under
 /// the start sound, if it has one).
@@ -1206,6 +1220,8 @@ impl GameAudio {
             engine_loads: channel(),
             install: install.cloned(),
             engine: None,
+            engine_cues: HashMap::new(),
+            engine_cue_loads: std::sync::mpsc::channel(),
             horn: None,
             spare_horns: None,
             horns_loading: install.map(|install| {
@@ -2507,6 +2523,37 @@ impl GameAudio {
             if start.is_some_and(|c| !self.keys.contains_key(&c)) && self.install.is_some() {
                 return;
             }
+            // Its set's engine cue, read first where there is one.
+            while let Ok((key, cue)) = self.engine_cue_loads.1.try_recv() {
+                eprintln!(
+                    "engine: cue {key:08x}: {} tracks",
+                    cue.as_ref().map_or(0, |c| c.tracks.len())
+                );
+                self.engine_cues.insert(key, cue.map(Arc::new));
+            }
+            let looped = (input.set != 0)
+                .then(|| {
+                    self.gun_cues
+                        .cue_of(input.set, m2_engine::spawn_sound::ENGINE_LOOP_EVENT)
+                })
+                .flatten();
+            if let (Some(key), Some(install)) = (looped, self.install.clone())
+                && !self.engine_cues.contains_key(&key)
+            {
+                if self.key_asked.insert(key ^ ENGINE_CUE_ASKED) {
+                    let tx = self.engine_cue_loads.0.clone();
+                    let tables = self.key_tables.clone();
+                    std::thread::spawn(move || {
+                        let cue = install.open_world().ok().and_then(|mut source| {
+                            let tables = held_tables(&tables, &mut source);
+                            EngineCue::read(&mut source, &tables, key)
+                        });
+                        drop(tx.send((key, cue)));
+                    });
+                }
+                return;
+            }
+            let cue = looped.and_then(|k| self.engine_cues.get(&k).cloned().flatten());
             let start = start.filter(|c| self.key_found(*c));
             let voices = self.out.with(|m| {
                 if start.is_none()
@@ -2514,14 +2561,23 @@ impl GameAudio {
                 {
                     m.play(Play::flat(start.clone()).gain(ENGINE_GAIN));
                 }
-                sounds
-                    .loops
-                    .iter()
-                    .map(|(buffer, _)| m.play(Play::flat(buffer.clone()).looped().gain(0.0)))
-                    .collect()
+                match &cue {
+                    Some(c) => c
+                        .tracks
+                        .iter()
+                        .map(|t| m.play(Play::flat(t.sound.clone()).looped().gain(0.0)))
+                        .collect(),
+                    None => sounds
+                        .loops
+                        .iter()
+                        .map(|(buffer, _)| m.play(Play::flat(buffer.clone()).looped().gain(0.0)))
+                        .collect(),
+                }
             });
             self.play_flat("engine start", Some(input.set), start);
             self.engine = Some(Engine {
+                cue,
+                load: 0.0,
                 bank: input.bank,
                 set: input.set,
                 sounds,
@@ -2535,6 +2591,29 @@ impl GameAudio {
         };
         e.running += dt;
         let load = input.throttle.abs().min(1.0);
+        e.load += (load - e.load) * (dt * ENGINE_EASE).min(1.0);
+        if let Some(cue) = &e.cue {
+            use m2_engine::audio::{PARAM_LOAD, PARAM_REVERSE, PARAM_SPEED};
+            let fade = (e.running / ENGINE_FADE_IN).min(1.0);
+            let mix = cue.mix(&[
+                (
+                    PARAM_SPEED,
+                    (input.speed.abs() / input.top.max(1.0)).min(1.0),
+                ),
+                (PARAM_LOAD, e.load),
+                (
+                    PARAM_REVERSE,
+                    f32::from(input.throttle < 0.0 && input.speed < 0.0),
+                ),
+            ]);
+            self.out.with(|m| {
+                for (id, (g, pitch)) in e.voices.iter().zip(mix) {
+                    m.set_gain(*id, fade * g);
+                    m.set_pitch(*id, pitch);
+                }
+            });
+            return;
+        }
         let want = (input.speed.abs() / input.top.max(1.0)).min(1.0) * 0.8 + load * 0.2;
         e.rpm += (want - e.rpm) * (dt * ENGINE_EASE).min(1.0);
         let fade = (e.running / ENGINE_FADE_IN).min(1.0);
