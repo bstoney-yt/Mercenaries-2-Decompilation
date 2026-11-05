@@ -1086,6 +1086,13 @@ impl Rig {
                     aim_sweep::Part::Rest => *local,
                 };
             }
+            // Then the 360's `PostIK` (0x82810058, flag 4): the left hand
+            // back where the sweep holds it from the right, as the gait's
+            // motion moved the arms apart; not with a pistol up
+            // ([`m2_engine::hand_ik`]).
+            if self.barrel {
+                m2_engine::hand_ik::left_to_right(&self.skeleton, pose, &aimed);
+            }
             return true;
         }
         match self.upper.as_ref().filter(|_| moving) {
