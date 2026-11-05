@@ -305,14 +305,34 @@ pub fn resolve(
             Some(out)
         };
         use m2_engine::aim_sweep::{
+            CROUCHED_MOVING, CROUCHED_MOVING_FIRE, CROUCHED_STANDING, CROUCHED_STANDING_FIRE,
             RIFLE_MOVING, RIFLE_MOVING_FIRE, RIFLE_STANDING, RIFLE_STANDING_FIRE,
         };
+        // She aims in crouched, so the crouched node's sweeps (by handle);
+        // the upright ones where the table gives her none.
+        let crouched_of = |handles: [u32; 3]| -> Option<[usize; 3]> {
+            let mut out = [0; 3];
+            for (o, h) in out.iter_mut().zip(handles) {
+                *o = index(table::handle_clip(t, h, who, class, fits)?.clip)?;
+            }
+            Some(out)
+        };
+        let crouched = crouched_of(CROUCHED_STANDING)
+            .zip(crouched_of(CROUCHED_MOVING))
+            .map(|(s, m)| {
+                let fire = crouched_of(CROUCHED_STANDING_FIRE)
+                    .zip(crouched_of(CROUCHED_MOVING_FIRE))
+                    .map(|(s, m)| [s, m]);
+                crate::scene::Sweeps { aim: [s, m], fire }
+            });
         let fire = sweep_of(RIFLE_STANDING_FIRE)
             .zip(sweep_of(RIFLE_MOVING_FIRE))
             .map(|(s, m)| [s, m]);
-        let sweeps = sweep_of(RIFLE_STANDING)
-            .zip(sweep_of(RIFLE_MOVING))
-            .map(|(s, m)| crate::scene::Sweeps { aim: [s, m], fire });
+        let sweeps = crouched.or_else(|| {
+            sweep_of(RIFLE_STANDING)
+                .zip(sweep_of(RIFLE_MOVING))
+                .map(|(s, m)| crate::scene::Sweeps { aim: [s, m], fire })
+        });
         held.push(Held {
             sweeps,
             crouch,

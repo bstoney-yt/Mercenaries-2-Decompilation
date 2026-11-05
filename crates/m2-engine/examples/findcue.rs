@@ -277,10 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rec_bands = spectral.then(|| bands(&signal));
     for (k, rate, t) in templates {
         let (scores, per_second) = match &rec_bands {
-            Some(r) => (
-                band_match(r, &bands(&t)),
-                f64::from(rate) / HOP as f64,
-            ),
+            Some(r) => (band_match(r, &bands(&t)), f64::from(rate) / HOP as f64),
             None => (ncc(&signal, &t), f64::from(rate)),
         };
         let rate = per_second;

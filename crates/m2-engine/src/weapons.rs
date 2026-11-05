@@ -763,6 +763,105 @@ impl FireCycle {
     }
 }
 
+/// An AI rider's clip in a vehicle's weapon: the rounds left in it, and
+/// how a pilot and a gunner reload it.
+///
+/// Provenance, from the 360 code:
+/// - A weapon's clip (its runtime weapon +0x30) starts full, its
+///   `WeaponProjectileBase` `iClipSize` (+0x1C; 0x82285800). Every shot
+///   takes one round (the shot loop 0x82283A10, however many projectiles
+///   the shot throws), and a weapon with none left cannot fire
+///   (0x8227F908: rounds above 0 and its shot timer run out).
+/// - Weapons fired in turn (the links coupled after the first) are each
+///   their own weapon, with their own clip, the shot going to the one
+///   whose turn it is (0x822835D0, 0x8365622C): the group holds
+///   `iClipSize` rounds for each mount ([`AiClip::size`]). Inferred: that
+///   their turns share the rounds out evenly enough that the group runs
+///   dry together.
+/// - A reload ([`AiClip::reload`]) refills the clip at once for any weapon
+///   that is no hand-held `Equipment` (0x82285548 skips the reload clip,
+///   0x822853F8, 0x82285118; the runtime weapon's flag 0x1000, set by
+///   0x823F8D90 only where an `Equipment` record exists). Its reserve is
+///   not spent: every mounted weapon's `MaxAmmoReserve` is 0, so it
+///   reloads only because its owner never runs out (0x8227F600 asks the
+///   set 0x83657F28, which a thing with an `Ai` component is put in,
+///   0x82400128, as `SetInfiniteAmmo` 0x823305F0 puts one). Inferred: that
+///   every AI vehicle is so (0x82400128's caller is a vtable slot whose
+///   class is not named).
+/// - A pilot (`HeliAttack` 0x822B0578, fire mode 3 of 0x822AE598) asks
+///   for a reload every frame its trigger is let go
+///   ([`AiClip::pilot_off`]): a clip it has fired from is full again
+///   after each burst.
+/// - A gunner (0x822C95D8) reloads only once the clip is empty (its
+///   slot's flag 0x200, from 0x822EDBC0): then, its own timer run out, it
+///   lets go of the trigger, sets the timer to 0.5 s and asks for the
+///   reload, firing nothing that frame ([`AiClip::gunner_empty`]).
+///   Inferred: that the timer counts down with the frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AiClip {
+    /// Rounds left; `None` until first asked (full).
+    pub left: Option<u32>,
+    /// A gunner's reload timer, seconds.
+    pub wait: f32,
+}
+
+impl AiClip {
+    /// A gunner's wait after asking for a reload (0x822C95D8, 0x820D9EDC).
+    pub const GUNNER_WAIT: f32 = 0.5;
+
+    /// The rounds a full clip of mount `m` holds: its `iClipSize` for each
+    /// mount it fires in turn.
+    pub fn size(m: &Mounted) -> u32 {
+        m.weapon.clip.max(1) * (m.nodes.len().max(1) as u32)
+    }
+
+    /// Its timer `dt` on.
+    pub fn tick(&mut self, dt: f32) {
+        self.wait -= dt;
+    }
+
+    /// Rounds left, of a clip of `size`.
+    pub fn rounds(&mut self, size: u32) -> u32 {
+        *self.left.get_or_insert(size)
+    }
+
+    /// Whether it can fire, from a clip of `size`.
+    pub fn can_fire(&mut self, size: u32) -> bool {
+        self.rounds(size) > 0
+    }
+
+    /// One shot fired, from a clip of `size`.
+    pub fn shot(&mut self, size: u32) {
+        let left = self.rounds(size);
+        self.left = Some(left.saturating_sub(1));
+    }
+
+    /// Refilled to `size` (a mounted weapon's reload, at once).
+    pub fn reload(&mut self, size: u32) {
+        self.left = Some(size);
+    }
+
+    /// A pilot's trigger let go: its clip refilled.
+    pub fn pilot_off(&mut self, size: u32) {
+        self.reload(size);
+    }
+
+    /// A gunner's turn to fire from a clip of `size`: when it is empty and
+    /// his timer has run out, he reloads, waits [`Self::GUNNER_WAIT`]
+    /// before he may again, and fires nothing this frame. True when he may
+    /// fire.
+    pub fn gunner_empty(&mut self, size: u32) -> bool {
+        if self.rounds(size) > 0 {
+            return true;
+        }
+        if self.wait < 0.0 {
+            self.wait = Self::GUNNER_WAIT;
+            self.reload(size);
+        }
+        false
+    }
+}
+
 /// How far a soldier's rounds stray from where he aims: widths across,
 /// radians, sideways and up, each round a uniform pick within them
 /// ([`SoldierSpread::stray`]), as her own rounds scatter over her gun's
@@ -1891,6 +1990,48 @@ mod tests {
         assert_eq!((m[0].seat, m[0].priority), (5, 0));
         assert_eq!(m[0].nodes, vec![Some(2), None, Some(0)]);
         assert_eq!(m[1].nodes, vec![None]);
+        // Three pods of 8 fired in turn hold 24 rounds between them.
+        assert_eq!(AiClip::size(&m[0]), 24);
+    }
+
+    #[test]
+    fn ai_clips_empty_and_reload() {
+        // A pilot's pod of 7 held for 10 rounds' worth: 7 go, then none
+        // until the trigger is let go, which fills it.
+        let mut p = AiClip::default();
+        let fired = (0..10)
+            .filter(|_| {
+                let ok = p.can_fire(7);
+                if ok {
+                    p.shot(7);
+                }
+                ok
+            })
+            .count();
+        assert_eq!(fired, 7);
+        assert_eq!(p.rounds(7), 0);
+        p.pilot_off(7);
+        assert_eq!(p.rounds(7), 7);
+        // A gunner with an empty clip: the frame his timer has run out he
+        // reloads and fires nothing, then may fire; he cannot ask again
+        // for 0.5 s.
+        let mut g = AiClip {
+            left: Some(1),
+            wait: 0.0,
+        };
+        assert!(g.gunner_empty(3));
+        g.shot(3);
+        g.tick(1.0 / 60.0);
+        assert!(!g.gunner_empty(3));
+        assert_eq!((g.rounds(3), g.wait), (3, AiClip::GUNNER_WAIT));
+        assert!(g.gunner_empty(3));
+        g.left = Some(0);
+        g.tick(0.25);
+        assert!(!g.gunner_empty(3));
+        assert_eq!(g.rounds(3), 0);
+        g.tick(0.3);
+        assert!(!g.gunner_empty(3));
+        assert_eq!(g.rounds(3), 3);
     }
 
     /// Share of rounds within 0.45 m of a mark `distance` ahead, by a

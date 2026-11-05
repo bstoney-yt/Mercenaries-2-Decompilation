@@ -268,6 +268,9 @@ pub struct GameAudio {
     /// ([`Sound::Created`]): heard with their template's own cue, silent
     /// as their template says, and silent for want of a `Sounds` row.
     created_heard: [u32; 3],
+    /// Events object state messages started ([`Sound::ObjectEvent`]):
+    /// with their set's own cue, and with no `Sounds` row.
+    objects_heard: [u32; 2],
     /// Whether the blast templates' cues have been asked for.
     blasts_primed: bool,
     /// Spinning guns firing now: their loop's voice ([`GunCues::spin`]).
@@ -1290,6 +1293,7 @@ impl GameAudio {
             launches: (0, 0),
             blasts_heard: [0; 3],
             created_heard: [0; 3],
+            objects_heard: [0; 2],
             blasts_primed: false,
             spins: Vec::new(),
         };
@@ -1869,6 +1873,9 @@ impl GameAudio {
     pub fn play_fight(&mut self, sounds: &[Sound], db: Option<&m2_engine::world::Templates>) {
         self.keys_loaded();
         self.spins_stopped();
+        // Where a building's state messages last played a cue of its own:
+        // its collapse there needs no rumble standing in.
+        let mut object_heard: Option<Vec3> = None;
         for sound in sounds {
             let (i, at, gain) = match *sound {
                 Sound::Shot {
@@ -1939,7 +1946,6 @@ impl GameAudio {
                     self.play_blast(at, Some(of), db);
                     continue;
                 }
-                Sound::Collapse(at) => (5, at, 2.0),
                 Sound::Taken { at, template } => {
                     let set = db
                         .and_then(|db| db.spawn_sounds.get(&template))
@@ -1955,6 +1961,23 @@ impl GameAudio {
                     );
                     if let Some(cue) = cue {
                         self.play_key(cue, at);
+                    }
+                    continue;
+                }
+                Sound::Collapse(at) => {
+                    if object_heard == Some(at) {
+                        continue;
+                    }
+                    (5, at, 2.0)
+                }
+                Sound::ObjectEvent {
+                    at,
+                    template,
+                    message,
+                    param,
+                } => {
+                    if self.play_object_event(at, template, message, param, db) {
+                        object_heard = Some(at);
                     }
                     continue;
                 }
@@ -2023,6 +2046,50 @@ impl GameAudio {
             );
         }
         heard != BlastHeard::Unknown
+    }
+
+    /// A message `message` (second operand `param`) an object of
+    /// `template` sent from its model's state, at `at`: each event the
+    /// 360's sound system starts for it
+    /// ([`m2_engine::spawn_sound::object_event`]) plays the cue the
+    /// `Sounds` table gives the template's `SoundEffect` set for it (the
+    /// row whose `Param` is the wildcard, else the first: the buildings'
+    /// rows sampled are all the wildcard's). True when one played. The
+    /// events it stops are not followed: the cues play once
+    /// (inferred).
+    fn play_object_event(
+        &mut self,
+        at: Vec3,
+        template: u32,
+        message: u32,
+        param: u32,
+        db: Option<&m2_engine::world::Templates>,
+    ) -> bool {
+        let set = db
+            .and_then(|db| db.spawn_sounds.get(&template))
+            .map_or(0, |s| s.set);
+        let mut played = false;
+        for &(start, event) in m2_engine::spawn_sound::object_event(message) {
+            if !start || set == 0 {
+                continue;
+            }
+            let cue = self.gun_cues.cue_of(set, event);
+            self.objects_heard[usize::from(cue.is_none())] += 1;
+            if let Some(cue) = cue {
+                self.play_key(cue, at);
+                played = true;
+            }
+            let [a, b] = self.objects_heard;
+            if (a + b) % 10 == 1 {
+                eprintln!(
+                    "sound: {} object events started: {a} with their set's own cue, {b} \
+                     with no Sounds row (last: message {message:08x} {param:08x}, set \
+                     {set:08x}, event {event:08x})",
+                    a + b
+                );
+            }
+        }
+        played
     }
 
     /// An object of effect template `template` a model's state started

@@ -876,6 +876,18 @@ pub struct StateActs {
     /// state starts run on until a state stops them (the wreck's smoke,
     /// started on the way to `DestroyedState`).
     pub stops: Vec<u32>,
+    /// The messages it sends (`SendMessage`, verb 0xBA20F82C), as
+    /// (message, its second operand): a building's collapse sends
+    /// `de60c8e2` (186 commands with `5e3bcf7b`), which the 360's sound
+    /// system turns into its sound set's rumble. From the 360 code: the
+    /// verb's handler (0x8222F6E0) posts the object event queue
+    /// (0x83232DB0), whose sound handler (0x8235FCE8) reads the message
+    /// at word 2 and the second operand at word 1.
+    pub messages: Vec<(u32, u32)>,
+    /// The messages leaving it sends, as [`messages`](Self::messages):
+    /// a building's leaving its `CollapseState` sends `73aa04b8`, which
+    /// stops the rumble and plays its set's `0519d48b`.
+    pub exit_messages: Vec<(u32, u32)>,
 }
 
 /// The message a part takes when its health falls to its `NodeHealth`
@@ -904,6 +916,7 @@ const SET_STATE: u32 = 0x9b31_491a;
 const START_EMITTER: u32 = 0x3347_914f;
 const CREATE_OBJECT: u32 = 0xc6e8_afa8;
 const SEND_DAMAGE: u32 = 0x82d1_e93c;
+const SEND_MESSAGE: u32 = 0xba20_f82c;
 const STOP_EMITTER: u32 = 0x687c_78c5;
 const DETACH_STATE: u32 = 0xa530_b827;
 
@@ -955,17 +968,21 @@ impl PartStates {
                     let Some(a) = states.machines.last_mut().and_then(|m| m.acts.last_mut()) else {
                         continue;
                     };
-                    let mut first = None;
+                    let mut operands = Vec::new();
                     for pair in w.chunks_exact(2) {
                         match (pair[0], pair[1]) {
-                            (1, x) => {
-                                first.get_or_insert(x);
-                            }
+                            (1, x) => operands.push(x),
                             (2, verb) => {
                                 if verb == STOP_EMITTER {
-                                    a.stops.extend(first);
+                                    a.stops.extend(operands.first());
                                 }
-                                first = None;
+                                if verb == SEND_MESSAGE
+                                    && let Some(&message) = operands.first()
+                                {
+                                    a.exit_messages
+                                        .push((message, operands.get(1).copied().unwrap_or(0)));
+                                }
+                                operands.clear();
                             }
                             _ => break,
                         }
@@ -1031,6 +1048,11 @@ impl PartStates {
                                             acts.sends.push((float(amount), to));
                                         }
                                     }
+                                    SEND_MESSAGE => {
+                                        if let Some(message) = op(0) {
+                                            acts.messages.push((message, op(1).unwrap_or(0)));
+                                        }
+                                    }
                                     _ => {}
                                 }
                                 if verb == start_anim
@@ -1071,6 +1093,7 @@ impl PartStates {
                             emitters,
                             detaches,
                             sends,
+                            messages,
                             ..
                         } = acts;
                         a.on.extend(on);
@@ -1078,6 +1101,7 @@ impl PartStates {
                         a.emitters.extend(emitters);
                         a.detaches.extend(detaches);
                         a.sends.extend(sends);
+                        a.messages.extend(messages);
                     }
                 }
                 _ => {}
@@ -2083,6 +2107,57 @@ mod tests {
         assert_eq!(
             states.hidden(&nodes, true),
             vec![false, true, false, true, true, false]
+        );
+    }
+
+    #[test]
+    fn a_collapse_state_sends_its_messages() {
+        // As `_merida_bld_plazachurch`: its `CollapseState` sends
+        // `de60c8e2` with `5e3bcf7b`; on leaving it, `73aa04b8`.
+        let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));
+        let exit = || leaf(b"CHDR", le(&[0xdb41_017d, 0]));
+        let collapse = 0x6946_83eb;
+        let data = ucfx(&[node(
+            b"STAM",
+            vec![
+                leaf(b"INFO", le(&[5, 15, 7])),
+                leaf(b"NODE", le(&[100, 2])),
+                leaf(b"STAT", le(&[collapse])),
+                enter(),
+                leaf(
+                    b"CEXE",
+                    le(&[1, 0xde60_c8e2, 1, 0x5e3b_cf7b, 2, SEND_MESSAGE, 3]),
+                ),
+                exit(),
+                leaf(
+                    b"CEXE",
+                    le(&[1, 0x73aa_04b8, 1, 0x5e3b_cf7b, 2, SEND_MESSAGE, 3]),
+                ),
+            ],
+        )]);
+        let u = Ucfx::parse(&data).unwrap();
+        let stam = u.children(None).next().unwrap();
+        let nodes = [Node {
+            name_hash: 100,
+            flags: 0,
+            first_child: None,
+            parent: None,
+            next_sibling: None,
+            unk_0x0c: 0,
+            local: Default::default(),
+            inverse_bind: Default::default(),
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
+        }];
+        let states = PartStates::parse(&u, stam, &nodes);
+        assert_eq!(states.machines[0].states[0].0, collapse);
+        assert_eq!(
+            states.machines[0].acts[0].messages,
+            vec![(0xde60_c8e2, 0x5e3b_cf7b)]
+        );
+        assert_eq!(
+            states.machines[0].acts[0].exit_messages,
+            vec![(0x73aa_04b8, 0x5e3b_cf7b)]
         );
     }
 

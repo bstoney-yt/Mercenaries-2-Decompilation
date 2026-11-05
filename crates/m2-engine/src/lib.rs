@@ -25,6 +25,7 @@ pub mod assets;
 pub mod atmosphere;
 pub mod audio;
 pub mod blend;
+pub mod car_attack;
 pub mod car_driver;
 pub mod durability;
 pub mod grapple;
@@ -56,6 +57,7 @@ pub mod spawn_sound;
 pub mod standin;
 pub mod stream;
 pub mod surface;
+pub mod tank_attack;
 pub mod technique;
 pub mod tuning;
 pub mod vehicle;
@@ -69,7 +71,7 @@ pub use anim::{Animator, BoundClip, Gait, Locomotion, Pose, Skeleton};
 pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
 pub use atmosphere::Atmosphere;
 pub use audio::{Category, Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices};
-pub use model::{CpuModel, GpuModel, Looks, MaterialCache, ModelParts, StateFx};
+pub use model::{CpuModel, GpuModel, Looks, MaterialCache, ModelParts, StateFx, StateMessage};
 pub use physics::{
     Breakup, Character, CollisionShape, DebrisId, Loose, LoosePiece, Physics, RagdollId, StaticKey,
     VehicleControls, VehicleId,

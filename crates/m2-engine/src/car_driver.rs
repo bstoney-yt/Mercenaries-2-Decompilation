@@ -64,7 +64,7 @@ pub enum Msg {
 pub struct AiInput(pub Vec<(Msg, f32)>);
 
 impl AiInput {
-    fn send(mut self, m: Msg, v: f32) -> Self {
+    pub(crate) fn send(mut self, m: Msg, v: f32) -> Self {
         self.0.push((m, v));
         self
     }

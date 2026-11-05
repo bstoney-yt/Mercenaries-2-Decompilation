@@ -1700,6 +1700,12 @@ impl Game {
                     her_velocity,
                     in_vehicle,
                     crate::gunships::VANISH,
+                    |v| {
+                        world
+                            .index
+                            .template_db
+                            .vehicle_labels_for(&v.spec.label, v.spec.model)
+                    },
                     dt,
                 );
                 for i in dropped {
@@ -1792,6 +1798,17 @@ impl Game {
                 self.scene.install.as_ref(),
             );
             self.scene.props.advance(dt);
+            // Those whose collapse ended leave their `CollapseState`, and
+            // are heard as what leaving it sends says (the crash after
+            // the rumble).
+            for e in self.scene.props.take_collapsed() {
+                let props = &self.scene.props;
+                let Some(at) = props.centre(e) else { continue };
+                let template = props.get(e).map_or(0, |(p, _)| p.template);
+                let sent = props.state_messages(e, m2_engine::StateFx::COLLAPSE, true);
+                eprintln!("collapse: {e:#x} ({template:08x}) is down; leaving sends {sent:08x?}");
+                self.combat.collapse_ended(at, template, &sent);
+            }
             self.spray_wait -= dt;
             if self.spray_wait <= 0.0 {
                 self.spray_wait = SPRAY_GAP;

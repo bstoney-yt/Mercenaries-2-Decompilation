@@ -687,6 +687,45 @@ impl StateFx {
     }
 }
 
+/// A message one of a model's part states sends as it is entered
+/// (`SendMessage`: [`m2_assets::model::StateActs::messages`]): the state,
+/// the message and its second operand. A building's `CollapseState` sends
+/// the messages the 360's sound system turns into its rumble
+/// ([`crate::spawn_sound::object_event`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateMessage {
+    pub state: u32,
+    pub message: u32,
+    pub param: u32,
+    /// Sent on leaving the state rather than on entering it
+    /// ([`m2_assets::model::StateActs::exit_messages`]).
+    pub on_exit: bool,
+}
+
+impl StateMessage {
+    /// Every message `model`'s part states send, in order.
+    pub fn of(model: &Model<'_>) -> Vec<Self> {
+        let Some(states) = &model.states else {
+            return Vec::new();
+        };
+        states
+            .machines
+            .iter()
+            .flat_map(|m| m.states.iter().zip(&m.acts))
+            .flat_map(|((state, _), acts)| {
+                let enter = acts.messages.iter().map(|&m| (m, false));
+                let exit = acts.exit_messages.iter().map(|&m| (m, true));
+                enter.chain(exit).map(|((message, param), on_exit)| Self {
+                    state: *state,
+                    message,
+                    param,
+                    on_exit,
+                })
+            })
+            .collect()
+    }
+}
+
 /// A model's geometry at one level of detail, decoded but not uploaded.
 #[derive(Clone, Debug)]
 pub struct CpuModel {
@@ -729,6 +768,9 @@ pub struct CpuModel {
     /// The effects its part states start (`StartEmitter`), by state
     /// ([`StateFx`]).
     pub state_fx: std::sync::Arc<Vec<StateFx>>,
+    /// The messages its part states send (`SendMessage`), by state
+    /// ([`StateMessage`]).
+    pub state_messages: std::sync::Arc<Vec<StateMessage>>,
     /// The looks a person model's mixer can give it ([`Looks`]).
     pub looks: Option<std::sync::Arc<Looks>>,
     /// A vehicle's lamp glow quads' nodes, by lamp ([`lamp_nodes`]):
@@ -1058,6 +1100,7 @@ impl CpuModel {
             breakup: None,
             parts,
             state_fx: std::sync::Arc::new(StateFx::of(model)),
+            state_messages: std::sync::Arc::new(StateMessage::of(model)),
             looks,
             lamp_nodes: lamp_nodes(&model.nodes),
         }
@@ -1203,6 +1246,8 @@ pub struct GpuModel {
     forced: Vec<bool>,
     /// The effects its part states start ([`CpuModel::state_fx`]).
     pub state_fx: std::sync::Arc<Vec<StateFx>>,
+    /// The messages its part states send ([`CpuModel::state_messages`]).
+    pub state_messages: std::sync::Arc<Vec<StateMessage>>,
     /// The looks a person model can take ([`CpuModel::looks`]); each
     /// person's is drawn by [`draw_posed_as`](Self::draw_posed_as).
     pub looks: Option<std::sync::Arc<Looks>>,
@@ -1433,6 +1478,7 @@ impl GpuModel {
             track_travel: 0.0,
             parts: cpu.parts.clone(),
             state_fx: cpu.state_fx.clone(),
+            state_messages: cpu.state_messages.clone(),
             parts_hidden: None,
             forced: Vec::new(),
             looks: cpu.looks.clone(),

@@ -365,10 +365,12 @@ fn gunner_burst(
 /// An AI pilot's gun's timers: its fire cycle and burst (its mind's
 /// +0x84 and +0x88, 0x822B0578), and the wait till the weapon can fire
 /// again.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct PilotGun {
     cycle: m2_engine::weapons::FireCycle,
     wait: f32,
+    /// Its weapons' clips, by `Priority`.
+    clips: Vec<m2_engine::weapons::AiClip>,
 }
 
 /// The cosine of 0x822EC720's view half-angle as 0x822F0098 asks it
@@ -1313,7 +1315,9 @@ pub enum Sound {
         at: Vec3,
         of: Option<Blasted>,
     },
-    /// A building the bomb brought down coming apart.
+    /// A building the bomb brought down coming apart: the alpha's rumble,
+    /// unless the messages its state sent just before at the same place
+    /// ([`Sound::ObjectEvent`]) played a cue of its own.
     Collapse(Vec3),
     /// A pickup of `template` taken at `at` (walked over, or its
     /// ammunition taken with the use key): heard as its own `SoundEffect`
@@ -1322,6 +1326,16 @@ pub enum Sound {
     Taken {
         at: Vec3,
         template: u32,
+    },
+    /// A message an object's model state sent (`SendMessage`), heard as
+    /// the 360's sound system hears it: the events
+    /// [`m2_engine::spawn_sound::object_event`] gives it, played from the
+    /// sound set of the object's template's `SoundEffect`.
+    ObjectEvent {
+        at: Vec3,
+        template: u32,
+        message: u32,
+        param: u32,
     },
     /// An effect a model's state started (`StartEmitter`: a wreck's
     /// fire, a tank's hull blowing out) coming into being as an object of
@@ -1735,6 +1749,8 @@ pub struct Combat {
     gunner_wait: Vec<f32>,
     /// Rounds left in each such gunner's burst.
     gunner_burst: Vec<u32>,
+    /// Each such gunner's clip ([`m2_engine::weapons::AiClip`]).
+    gunner_clips: Vec<m2_engine::weapons::AiClip>,
     /// What AI pilots ask their guns to fire at this frame
     /// ([`crate::gunships`]), her camera's eye and heading then (for
     /// [`Combat::pilots_fire`]'s view check), and each such gun's timers.
@@ -1744,6 +1760,8 @@ pub struct Combat {
     /// Rounds those guns fired (pilots' and gunners'), and seconds to
     /// the next log line of them.
     pilot_rounds: [u32; 2],
+    /// Shots their fire control called for that an empty clip held back.
+    pilot_dry: u32,
     pilot_log: f32,
     /// Rounds those gunners have fired, all told (logged by checks).
     pub gunner_rounds: u32,
@@ -1989,10 +2007,12 @@ impl Default for Combat {
             ripple: 0,
             gunner_wait: Vec::new(),
             gunner_burst: Vec::new(),
+            gunner_clips: Vec::new(),
             pilot_shots: Vec::new(),
             pilot_view: None,
             pilot_guns: std::collections::HashMap::new(),
             pilot_rounds: [0; 2],
+            pilot_dry: 0,
             pilot_log: 0.0,
             gunner_rounds: 0,
             seed: 0x2545_f491_4f6c_dd1d,
@@ -2802,9 +2822,35 @@ impl Combat {
         self.sounds.push(Sound::Taken { at, template });
     }
 
-    /// A building the bomb brought down comes apart at `at`: heard.
-    pub fn collapse(&mut self, at: Vec3) {
+    /// A building of template `template` comes apart at `at`, its
+    /// model's `CollapseState` sending `messages` (message, second
+    /// operand: [`crate::props::Props::state_messages`]): heard as its
+    /// sound set answers them ([`Sound::ObjectEvent`]), else with the
+    /// alpha's rumble standing in ([`Sound::Collapse`]).
+    pub fn collapse(&mut self, at: Vec3, template: u32, messages: &[(u32, u32)]) {
+        for &(message, param) in messages {
+            self.sounds.push(Sound::ObjectEvent {
+                at,
+                template,
+                message,
+                param,
+            });
+        }
         self.sounds.push(Sound::Collapse(at));
+    }
+
+    /// The building of `template` that came apart at `at` is down, its
+    /// model leaving its `CollapseState` and sending `messages` there:
+    /// heard as its sound set answers them, with nothing standing in.
+    pub fn collapse_ended(&mut self, at: Vec3, template: u32, messages: &[(u32, u32)]) {
+        for &(message, param) in messages {
+            self.sounds.push(Sound::ObjectEvent {
+                at,
+                template,
+                message,
+                param,
+            });
+        }
     }
 
     /// Something that doesn't come down as a building does breaks at
@@ -4010,12 +4056,14 @@ impl Combat {
         let Some(i) = f.player.driving.filter(|&i| i < f.vehicles.len()) else {
             self.gunner_wait.clear();
             self.gunner_burst.clear();
+            self.gunner_clips.clear();
             return;
         };
         let seats = armed_seats(&f.vehicles[i]);
         let riders = f.people.gunners().min(seats.len().saturating_sub(1));
         self.gunner_wait.resize(riders, 0.0);
         self.gunner_burst.resize(riders, 0);
+        self.gunner_clips.resize(riders, Default::default());
         let Some(body) = f.vehicles[i]
             .id
             .and_then(|id| f.physics.vehicle_transform(id))
@@ -4032,6 +4080,7 @@ impl Combat {
             .collect();
         for k in 0..riders {
             self.gunner_wait[k] -= dt;
+            self.gunner_clips[k].tick(dt);
             let seat = k + 1;
             if seat == self.seat {
                 continue;
@@ -4049,6 +4098,7 @@ impl Combat {
             let (near, far) = hint.map_or((0.0, GUNNER_RANGE), |h| (h.min_range, h.range));
             let cone = m.weapon.feel.cone(0.0);
             let gap = m.weapon.gap();
+            let size = m2_engine::weapons::AiClip::size(m);
             let Some(at) = foes
                 .iter()
                 .copied()
@@ -4075,7 +4125,7 @@ impl Combat {
                         > m2_engine::weapons::ai_aim_cosine(m.weapon.aim_ai)
                 }
             };
-            if !laid || self.gunner_wait[k] > 0.0 {
+            if !laid || self.gunner_wait[k] > 0.0 || !self.gunner_clips[k].gunner_empty(size) {
                 continue;
             }
             let to = at - centre;
@@ -4090,6 +4140,7 @@ impl Combat {
                 .fire_mount(f, i, seat, 0, Some(centre + dir * to.length()))
                 .is_some()
             {
+                self.gunner_clips[k].shot(size);
                 let (wait, burst) = gunner_burst(hint, gap, close, self.gunner_burst[k]);
                 self.gunner_wait[k] = wait;
                 self.gunner_burst[k] = burst;
@@ -4112,20 +4163,26 @@ impl Combat {
     /// an attack run. While the burst lasts it holds the trigger (the
     /// weapon's own rate); a single-shot weapon fires one round as each
     /// cycle starts. Inferred: that both timers count down with the frame.
+    /// Each weapon fires from its clip ([`m2_engine::weapons::AiClip`],
+    /// from the 360 code): a pilot's refills each time he lets go, a
+    /// gunner's once it is empty.
     fn pilots_fire(&mut self, f: &mut Field<'_>, dt: f32) {
         self.pilot_log -= dt;
         if self.pilot_log <= 0.0 {
             self.pilot_log = 15.0;
             if self.pilot_rounds != [0; 2] {
                 eprintln!(
-                    "pilots fire: {} rounds by pilots, {} by gunners so far",
-                    self.pilot_rounds[0], self.pilot_rounds[1]
+                    "pilots fire: {} rounds by pilots, {} by gunners so far, {} shots held back by an empty clip",
+                    self.pilot_rounds[0], self.pilot_rounds[1], self.pilot_dry
                 );
             }
         }
         for g in self.pilot_guns.values_mut() {
             g.cycle.tick(dt);
             g.wait -= dt;
+            for c in &mut g.clips {
+                c.tick(dt);
+            }
         }
         let shots = std::mem::take(&mut self.pilot_shots);
         for s in shots {
@@ -4146,6 +4203,7 @@ impl Combat {
             };
             let cone = m.weapon.feel.cone(0.0);
             let hint = m.weapon.hint;
+            let size = m2_engine::weapons::AiClip::size(m);
             let Some(from) =
                 v.id.and_then(|id| f.physics.vehicle_transform(id))
                     .map(|b| b.transform_point3(Vec3::ZERO))
@@ -4157,12 +4215,31 @@ impl Combat {
                 ahead.x * d.x + ahead.z * d.z > PILOT_VIEW_COS
             });
             let g = self.pilot_guns.entry((i, s.seat)).or_default();
-            let fire = match g.cycle.trigger(hint.as_ref(), s.dist, seen, s.run) {
+            let trigger = g.cycle.trigger(hint.as_ref(), s.dist, seen, s.run);
+            let fire = match trigger {
                 m2_engine::weapons::Trigger::One => true,
                 m2_engine::weapons::Trigger::Hold => g.wait <= 0.0,
                 m2_engine::weapons::Trigger::Off => false,
             };
-            if !fire {
+            // The pilot reloads whenever he lets go, a gunner only once
+            // his clip is empty ([`m2_engine::weapons::AiClip`]).
+            let pilot = s.seat == 0;
+            if g.clips.len() <= s.priority {
+                g.clips.resize(s.priority + 1, Default::default());
+            }
+            let clip = &mut g.clips[s.priority];
+            if pilot && trigger == m2_engine::weapons::Trigger::Off {
+                clip.pilot_off(size);
+            }
+            let loaded = if pilot {
+                clip.can_fire(size)
+            } else {
+                clip.gunner_empty(size)
+            };
+            if fire && !loaded {
+                self.pilot_dry += 1;
+            }
+            if !fire || !loaded {
                 continue;
             }
             let to = s.at - from;
@@ -4175,7 +4252,11 @@ impl Combat {
             if let Some(gap) =
                 self.fire_mount(f, i, s.seat, s.priority, Some(from + dir * to.length()))
             {
-                self.pilot_guns.entry((i, s.seat)).or_default().wait = gap;
+                let g = self.pilot_guns.entry((i, s.seat)).or_default();
+                g.wait = gap;
+                if let Some(c) = g.clips.get_mut(s.priority) {
+                    c.shot(size);
+                }
                 self.pilot_rounds[usize::from(s.seat > 0)] += 1;
             }
         }
