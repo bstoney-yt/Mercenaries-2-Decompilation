@@ -28,8 +28,19 @@ function S.Create(self, t) fresh() end
 function S.SetCallback(self, t)
     if type(t) == "table" then __m2_shop.fCallback = t.fCallback end
 end
+-- The scripts' close callback: the shop is down once it is called (the
+-- HUD's store calls it as it closes itself, `_FlashCloseShopCallback`),
+-- whoever calls it.
 function S.SetCloseCallback(self, t)
-    if type(t) == "table" then __m2_shop.fClose = t.fCallback end
+    if type(t) ~= "table" then return end
+    local f = t.fCallback
+    __m2_shop.fClose = f
+    if type(f) == "function" then
+        t.fCallback = function(...)
+            __m2_shop.open = false
+            return f(...)
+        end
+    end
 end
 function S.AddItemFull(self, t)
     if type(t) == "table" then table.insert(__m2_shop.items, t) end
@@ -43,10 +54,26 @@ return S
 /// Opens faction `__m2_faction`'s shop as its contact's menu does, with a
 /// stand-in for the contact (the scripts ask it only its faction and
 /// whether it keeps a vehicle shop of its own). The engine's interface is
-/// put back first: the `Hud` the scripts see by then is not always the
-/// table it was installed in. Evaluates to whether the shop came up.
+/// put back first where it is gone: the `Hud` the scripts see by then is
+/// not always the table it was installed in. Where the scripts' `Hud`
+/// has a `Shop` of its own (one whose calls go on to the game's HUD, as
+/// the alpha's do), it is kept, and each of its methods calls this
+/// interface's after its own (once), so the shop is read here too.
+/// Evaluates to whether the shop came up.
 pub const OPEN: &str = r#"
-rawset(Hud, "Shop", __m2_hud_shop)
+local h = rawget(Hud, "Shop")
+if type(h) ~= "table" then
+    rawset(Hud, "Shop", __m2_hud_shop)
+elseif h ~= __m2_hud_shop and not rawget(h, "__m2_kept") then
+    rawset(h, "__m2_kept", true)
+    for name, s in pairs(__m2_hud_shop) do
+        local f = h[name]
+        h[name] = function(self, ...)
+            if type(f) == "function" then f(self, ...) end
+            return s(self, ...)
+        end
+    end
+end
 local vendor = {}
 function vendor:GetFaction() return __m2_faction end
 function vendor:HasCustomVehicleShop() return false end
@@ -206,5 +233,51 @@ mod tests {
         lua.globals().set("__m2_faction", "Pirate").unwrap();
         lua.load(OPEN).exec().unwrap();
         assert_eq!(Shop::read(&lua).unwrap().items[0].cash, 800.0);
+    }
+
+    #[test]
+    fn a_shop_of_the_scripts_own_is_kept_and_read_too() {
+        // The scripts' `Hud` has a `Shop` of its own whose calls go on
+        // elsewhere (the alpha's, to the game's HUD): opening keeps it,
+        // its calls still go on, and the shop is read here as well.
+        let lua = lua();
+        lua.load(
+            r#"
+            forwarded = {}
+            local own = {}
+            for _, name in ipairs({ "Create", "SetCallback", "SetCloseCallback",
+                    "AddItemFull", "Commence", "Close" }) do
+                own[name] = function(self, t)
+                    table.insert(forwarded, name)
+                    if name == "SetCloseCallback" then closeT = t end
+                end
+            end
+            Hud = { Shop = own }
+            ownShop = own
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.globals().set("__m2_faction", "Pmc").unwrap();
+        assert!(lua.load(OPEN).eval::<bool>().unwrap());
+        assert!(
+            lua.load("return Hud.Shop == ownShop")
+                .eval::<bool>()
+                .unwrap()
+        );
+        assert_eq!(Shop::read(&lua).unwrap().items.len(), 2);
+        let n = |lua: &Lua| lua.load("return #forwarded").eval::<i64>().unwrap();
+        // Create, SetCallback, SetCloseCallback, two items, Commence.
+        assert_eq!(n(&lua), 6);
+        // Opened again: each call goes on once, not twice.
+        lua.load(OPEN).exec().unwrap();
+        assert_eq!(n(&lua), 12);
+        assert_eq!(Shop::read(&lua).unwrap().items.len(), 2);
+        // The HUD's store closing itself calls the close callback it was
+        // handed: the shop is down here too, and the scripts' callback ran.
+        assert!(Shop::read(&lua).unwrap().open);
+        lua.load("closeT.fCallback()").exec().unwrap();
+        assert!(!Shop::read(&lua).unwrap().open);
+        assert!(lua.load("return closed == true").eval::<bool>().unwrap());
     }
 }

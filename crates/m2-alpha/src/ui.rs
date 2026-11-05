@@ -98,31 +98,8 @@ pub enum MenuAction {
     /// Show the window another way (also kept in the settings).
     Display(crate::config::DisplayMode),
     Quit,
-    /// Something done in the shop.
-    Shop(ShopAction),
     /// Something done in the cheat menu.
     Cheat(crate::cheats::CheatAction),
-}
-
-/// What the player does in the shop.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ShopAction {
-    /// Look at faction `i`'s shop ([`crate::mission::SHOPS`]).
-    Faction(usize),
-    /// Buy one of this.
-    Buy(String),
-    /// Every shop's items unlocked or not (the cheat).
-    UnlockAll(bool),
-    Close,
-}
-
-/// The shop up: whose, what it sells, and what the last purchase said.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ShopScreen {
-    pub faction: usize,
-    pub view: crate::mission::ShopView,
-    pub said: Option<String>,
-    pub unlock_all: bool,
 }
 
 /// Seconds the controls hint shows at the start.
@@ -136,8 +113,6 @@ pub struct Hud {
     uploaded: std::collections::HashSet<egui::TextureId>,
     /// The pause menu is open.
     pub menu: bool,
-    /// The shop is up, in the pause menu's place.
-    pub shop: Option<ShopScreen>,
     /// The cheat menu is up, in the pause menu's place.
     pub cheats: Option<crate::cheats::CheatScreen>,
     /// Tessellated and waiting to paint: shapes, texture changes, scale.
@@ -193,7 +168,6 @@ impl Hud {
             renderer: None,
             uploaded: Default::default(),
             menu: false,
-            shop: None,
             cheats: None,
             frame: None,
             game: None,
@@ -215,8 +189,8 @@ impl Hud {
             .screen_rect
             .map_or([0.0; 2], |r| [r.width(), r.height()]);
         state.dt = game.frame_time(input.time);
-        // The menu is the game's own pause menu, but in the shop.
-        state.pause = self.menu && self.shop.is_none();
+        // The menu is the game's own pause menu.
+        state.pause = self.menu;
         state.pause_settings = self.pause_settings.clone();
         state.pause_captured = std::mem::take(&mut self.pause_captured);
         // The pause menu takes the mouse, as does the PDA.
@@ -394,7 +368,6 @@ impl Hud {
         // would put the world back without their state.
         let load = self.dev || info.mission.is_none();
         let dev = self.dev;
-        let shop = self.shop.as_ref();
         let cheats = self.cheats.as_ref();
         // The game's own pause menu, once its scripts run: ours keeps the
         // alpha's own settings beside it.
@@ -432,8 +405,6 @@ impl Hud {
             }
             if let (true, Some(cheats)) = (menu, cheats) {
                 action = cheat_window(ui.ctx(), cheats).map(MenuAction::Cheat);
-            } else if let (true, Some(shop)) = (menu, shop) {
-                action = shop_window(ui.ctx(), shop).map(MenuAction::Shop);
             } else if menu {
                 action = pause_menu(ui.ctx(), config, info.hero, dev, load, own);
             }
@@ -1645,76 +1616,6 @@ fn project(view_proj: Mat4, world: Vec3, screen: egui::Rect) -> Option<egui::Pos
         screen.left() + (ndc.x + 1.0) * 0.5 * screen.width(),
         screen.top() + (1.0 - ndc.y) * 0.5 * screen.height(),
     ))
-}
-
-/// The shop: a tab for each faction's, her cash, and what it sells, with
-/// a button to buy each that is unlocked and that she can pay for. The
-/// look is this game's own (the game's shop screen isn't drawn); what is
-/// sold, and at what price, is the scripts' (`MrxShop`).
-fn shop_window(ctx: &egui::Context, shop: &ShopScreen) -> Option<ShopAction> {
-    let mut action = None;
-    ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Middle,
-        egui::Id::new("dim"),
-    ))
-    .rect_filled(ctx.content_rect(), 0.0, Color32::from_black_alpha(120));
-    egui::Window::new("Shop")
-        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-        .collapsible(false)
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.set_min_width(560.0);
-            ui.horizontal_wrapped(|ui| {
-                for (i, (_, name)) in crate::mission::SHOPS.iter().enumerate() {
-                    if ui.selectable_label(shop.faction == i, *name).clicked() && shop.faction != i
-                    {
-                        action = Some(ShopAction::Faction(i));
-                    }
-                }
-            });
-            ui.separator();
-            ui.label(format!(
-                "Cash ${}    Fuel {:.0}",
-                thousands(shop.view.cash),
-                shop.view.fuel
-            ));
-            if let Some(said) = &shop.said {
-                ui.label(said);
-            }
-            egui::ScrollArea::vertical()
-                .max_height(420.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("shop items")
-                        .striped(true)
-                        .num_columns(4)
-                        .show(ui, |ui| {
-                            for item in &shop.view.items {
-                                ui.label(&item.name).on_hover_text(&item.description);
-                                ui.label(format!("${}", thousands(item.price)));
-                                ui.label(format!("{} held", item.stock));
-                                let can = item.unlocked
-                                    && item.price <= shop.view.cash
-                                    && item.stock < item.most.max(1);
-                                let label = if item.unlocked { "Buy" } else { "Locked" };
-                                if ui.add_enabled(can, egui::Button::new(label)).clicked() {
-                                    action = Some(ShopAction::Buy(item.id.clone()));
-                                }
-                                ui.end_row();
-                            }
-                        });
-                });
-            ui.separator();
-            ui.horizontal(|ui| {
-                let mut all = shop.unlock_all;
-                if ui.checkbox(&mut all, "Unlock everything (cheat)").changed() {
-                    action = Some(ShopAction::UnlockAll(all));
-                }
-                if ui.button("Close").clicked() {
-                    action = Some(ShopAction::Close);
-                }
-            });
-        });
-    action
 }
 
 /// The test cheat menu ([`crate::cheats`]): a page each for weapons,

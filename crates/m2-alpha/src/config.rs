@@ -34,14 +34,18 @@ pub struct EnhancedConfig {
     pub shop: ShopCheat,
 }
 
-/// `[enhanced.shop]`: the shop opens anywhere with its key, as the game's
-/// contacts open it in their menus; `unlock_all` unlocks everything each
-/// shop could sell, and brings the pilots and mechanic the support needs
-/// (the story recruits them one by one).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// `[enhanced.shop]`: the shop opens anywhere with its key, on the game's
+/// own store screen as the game's contacts open it from their menus;
+/// `vendor` is whose (`MrxFactionManager`'s keys: `"All"`, `"Chi"`,
+/// `"Gur"`, `"Pir"`, `"Oil"`, `"Pmc"`; the Allied Nations' when empty or
+/// unknown). `unlock_all` unlocks everything each shop could sell, and
+/// brings the pilots and mechanic the support needs (the story recruits
+/// them one by one).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ShopCheat {
     pub unlock_all: bool,
+    pub vendor: String,
 }
 
 /// The game's own options (its pause menu's).
