@@ -2284,6 +2284,11 @@ impl Game {
             .player
             .as_ref()
             .filter(|p| self.on_foot && p.landed && p.driving.is_none() && !p.down);
+        let aboard = self
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| self.on_foot && p.driving.is_some() && !p.down);
         let at = her
             .map(|p| p.character.position)
             .unwrap_or(self.camera.position);
@@ -2312,18 +2317,24 @@ impl Game {
                 hurt: hp < self.support_hp,
                 pda: intent.trigger.pda,
             },
+            // In a vehicle only the PDA opens: the game's car layout keeps
+            // Back on the PDA (`tControlMap`'s `car`, [`crate::pad`]).
+            None if aboard => Call {
+                pda: intent.trigger.pda,
+                ..Call::default()
+            },
             None => Call::default(),
         };
         self.support_hp = hp;
         let before = self.support.busy();
-        // In a vehicle, down or flying the camera, a call is dropped (and
-        // the PDA shut).
-        if her.is_none() && self.support.busy() {
+        // In a vehicle, down or flying the camera, a call is dropped; down
+        // or flying the camera the PDA is shut as well.
+        if her.is_none() && self.support.phase != support::Phase::Idle {
             self.support.phase = support::Phase::Idle;
-            if self.support.pda {
-                self.support.pda = false;
-                self.support.posts.push(support::PDA_CLOSE);
-            }
+        }
+        if her.is_none() && !aboard && self.support.pda {
+            self.support.pda = false;
+            self.support.posts.push(support::PDA_CLOSE);
         }
         self.support.step(call, at, dt);
         self.combat.designator = self.support.holding() || self.support.looking().is_some();

@@ -10,7 +10,10 @@
 //! (A B X Y), switch weapon and throw (the bumpers), sprint (L3), the
 //! d-pad (support, explosives, detonate), pause (Start) and the PDA
 //! (Back). A finger that lands on fire also turns the view as it drags,
-//! to aim while firing.
+//! to aim while firing. Driving, the car's buttons show instead, the horn
+//! among them; with the PDA open or a dialog box up, the menu's
+//! ([`MENU_KEYS`]): a large d-pad and the face buttons and triggers by the
+//! pad's own letters, which the game's prompts show.
 
 use std::collections::HashMap;
 
@@ -81,9 +84,10 @@ pub const KEYS: [Key; 16] = [
 /// The buttons while she drives (the on-foot ones hide): the pad's driving
 /// layout ([`crate::pad`]): gas and reverse (A, X), the handbrake (the left
 /// trigger), fire (the right), get out (Y), switch gun (RB), right an
-/// overturned vehicle (R3), the next seat (the d-pad's up), the PDA and
+/// overturned vehicle (R3), the next seat (the d-pad's up), the horn (B:
+/// the car layout's `B call allies`, the texts' `[honk]`), the PDA and
 /// pause. The stick steers.
-pub const CAR_KEYS: [Key; 10] = [
+pub const CAR_KEYS: [Key; 11] = [
     key(Press::Button(xb::A), "GAS", 0.90, 0.74, 0.09),
     key(Press::Button(xb::X), "REVERSE", 0.76, 0.84, 0.065),
     key(Press::LeftTrigger, "BRAKE", 0.75, 0.62, 0.06),
@@ -92,9 +96,41 @@ pub const CAR_KEYS: [Key; 10] = [
     key(Press::Button(xb::RIGHT_SHOULDER), "GUN", 0.82, 0.27, 0.05),
     key(Press::Button(xb::RIGHT_THUMB), "FLIP", 0.62, 0.84, 0.045),
     key(Press::Button(xb::DPAD_UP), "SEAT", 0.08, 0.33, 0.045),
+    key(Press::Button(xb::B), "HORN", 0.64, 0.56, 0.05),
     key(Press::Button(xb::BACK), "PDA", 0.44, 0.07, 0.04),
     key(Press::Button(xb::START), "PAUSE", 0.56, 0.07, 0.04),
 ];
+
+/// The buttons with the PDA open or a dialog box up: the pad's keys their
+/// movies hear ([`crate::pad::PDA_BUTTON_KEYS`]: the d-pad steps, A picks,
+/// B goes back, Y the current contract, X, and the triggers turn the
+/// PDA's pages), named by the pad's letters as the game's own prompts
+/// show them, the d-pad large at the left; Back shuts the PDA.
+pub const MENU_KEYS: [Key; 12] = [
+    key(Press::Button(xb::DPAD_UP), "▲", 0.11, 0.48, 0.065),
+    key(Press::Button(xb::DPAD_DOWN), "▼", 0.11, 0.80, 0.065),
+    key(Press::Button(xb::DPAD_LEFT), "◀", 0.04, 0.64, 0.065),
+    key(Press::Button(xb::DPAD_RIGHT), "▶", 0.18, 0.64, 0.065),
+    key(Press::Button(xb::A), "A", 0.86, 0.80, 0.075),
+    key(Press::Button(xb::B), "B", 0.95, 0.62, 0.06),
+    key(Press::Button(xb::X), "X", 0.77, 0.62, 0.06),
+    key(Press::Button(xb::Y), "Y", 0.86, 0.46, 0.06),
+    key(Press::LeftTrigger, "LT", 0.06, 0.22, 0.05),
+    key(Press::RightTrigger, "RT", 0.94, 0.22, 0.05),
+    key(Press::Button(xb::BACK), "PDA", 0.44, 0.07, 0.04),
+    key(Press::Button(xb::START), "PAUSE", 0.56, 0.07, 0.04),
+];
+
+/// The layout showing: `menu` over `driving` over on foot.
+fn layout(driving: bool, menu: bool) -> &'static [Key] {
+    if menu {
+        &MENU_KEYS
+    } else if driving {
+        &CAR_KEYS
+    } else {
+        &KEYS
+    }
+}
 
 /// What a finger is doing, from where it landed.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -127,6 +163,9 @@ pub struct Touch {
     pub sprint: bool,
     /// She drives: the driving buttons show ([`CAR_KEYS`]).
     driving: bool,
+    /// The PDA is open or a dialog box up: the menu's buttons show
+    /// ([`MENU_KEYS`]).
+    menu: bool,
 }
 
 impl Touch {
@@ -135,16 +174,24 @@ impl Touch {
         self.size = [width as f32, height as f32];
     }
 
-    /// The buttons showing: on foot or driving.
+    /// The buttons showing: on foot, driving or the menu's.
     pub fn keys(&self) -> &'static [Key] {
-        if self.driving { &CAR_KEYS } else { &KEYS }
+        layout(self.driving, self.menu)
     }
 
     /// She gets in (`driving`) or out: the buttons change, and fingers on
     /// the old ones let go.
+    #[cfg(test)]
     pub fn set_driving(&mut self, driving: bool) {
-        if driving != self.driving {
+        self.set_layout(driving, self.menu);
+    }
+
+    /// She drives or not, and the PDA or a dialog box is up (`menu`) or
+    /// not: when the buttons showing change, fingers on the old ones let go.
+    pub fn set_layout(&mut self, driving: bool, menu: bool) {
+        if driving != self.driving || menu != self.menu {
             self.driving = driving;
+            self.menu = menu;
             self.fingers.retain(|_, f| !matches!(f.role, Role::Key(_)));
         }
     }
@@ -173,6 +220,7 @@ impl Touch {
             );
         if let Role::Key(i) = role
             && !self.driving
+            && !self.menu
             && keys[i].press == Press::Button(xb::LEFT_THUMB)
         {
             self.sprint = !self.sprint;
@@ -223,7 +271,7 @@ impl Touch {
             match f.role {
                 Role::Key(i) => match keys[i].press {
                     // On foot, sprint is switched, not held ([`Touch::sprint`]).
-                    Press::Button(xb::LEFT_THUMB) if !self.driving => {}
+                    Press::Button(xb::LEFT_THUMB) if !self.driving && !self.menu => {}
                     Press::Button(bit) => s.buttons |= bit,
                     Press::LeftTrigger => s.left_trigger = 1.0,
                     Press::RightTrigger => s.right_trigger = 1.0,
@@ -282,6 +330,8 @@ pub fn merge(s: PadState, t: PadState) -> PadState {
 pub struct Picture {
     /// The driving buttons show, not the on-foot ones.
     pub driving: bool,
+    /// The menu's buttons show ([`MENU_KEYS`]), over either.
+    pub menu: bool,
     /// By button of those showing (the rest unused).
     pub held: [bool; KEYS.len()],
     pub stick: Option<([f32; 2], [f32; 2])>,
@@ -290,7 +340,7 @@ pub struct Picture {
 impl Picture {
     /// The buttons it shows.
     pub fn keys(&self) -> &'static [Key] {
-        if self.driving { &CAR_KEYS } else { &KEYS }
+        layout(self.driving, self.menu)
     }
 }
 
@@ -300,8 +350,13 @@ impl Touch {
         let keys = self.keys();
         Picture {
             driving: self.driving,
+            menu: self.menu,
             held: std::array::from_fn(|i| match keys.get(i) {
-                Some(k) if !self.driving && k.press == Press::Button(xb::LEFT_THUMB) => self.sprint,
+                Some(k)
+                    if !self.driving && !self.menu && k.press == Press::Button(xb::LEFT_THUMB) =>
+                {
+                    self.sprint
+                }
                 Some(_) => self.held(i),
                 None => false,
             }),
@@ -425,6 +480,48 @@ mod tests {
         t.down(2, at);
         t.up(2);
         assert!(!t.sprint);
+    }
+
+    #[test]
+    fn driving_has_a_horn_on_the_pads_b() {
+        let mut t = touch();
+        t.set_driving(true);
+        let horn = CAR_KEYS.iter().find(|k| k.label == "HORN").unwrap();
+        t.down(1, [horn.at[0] * 2000.0, horn.at[1] * 1000.0]);
+        assert!(t.state().held(xb::B));
+    }
+
+    #[test]
+    fn the_pda_or_a_dialog_shows_the_menu_buttons_over_the_others() {
+        let mut t = touch();
+        t.set_layout(true, true);
+        assert!(t.picture().menu);
+        assert_eq!(t.picture().keys().len(), MENU_KEYS.len());
+        let down = MENU_KEYS.iter().find(|k| k.label == "▼").unwrap();
+        t.down(1, [down.at[0] * 2000.0, down.at[1] * 1000.0]);
+        assert!(t.state().held(xb::DPAD_DOWN));
+        // Shut again: the car's buttons, the finger let go.
+        t.set_layout(true, false);
+        assert!(!t.picture().menu && t.picture().driving);
+        assert!(!t.state().held(xb::DPAD_DOWN));
+    }
+
+    #[test]
+    fn no_layout_has_overlapping_buttons() {
+        // On a 2:1 screen, in pixels, with the touch slack (1.25).
+        for keys in [&KEYS[..], &CAR_KEYS[..], &MENU_KEYS[..]] {
+            for (i, a) in keys.iter().enumerate() {
+                for b in &keys[i + 1..] {
+                    let d = ((a.at[0] - b.at[0]) * 2.0).hypot(a.at[1] - b.at[1]);
+                    assert!(
+                        d > (a.radius + b.radius) * 1.25,
+                        "{} and {}",
+                        a.label,
+                        b.label
+                    );
+                }
+            }
+        }
     }
 
     #[test]
