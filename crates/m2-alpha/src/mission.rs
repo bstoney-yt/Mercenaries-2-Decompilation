@@ -372,13 +372,16 @@ end
 /// The scripts' calls to the HUD's interface through the engine's `Hud`
 /// library (`Hud.Fanfare:Create`, `:AddItem`, `:Commence` as a contract
 /// ends...), which the engine hands to the HUD's `HudInterface`: kept,
-/// with their data copied as it was, in `__m2_hud_calls` (the latest 64)
+/// with their data copied as it was, in `__m2_hud_calls` (the latest 512)
 /// for the game HUD, which runs in a Lua state of its
 /// own. Each call then goes on as it would. The groups and methods are
 /// those `MrxGuiInterface` gives `HudInterface`.
 const HUD_CALLS: &str = r#"
 __m2_hud_calls = {}
 __m2_hud_call_count = 0
+-- The latest calls kept: room for the PDA map's missions and blips, which
+-- the contracts and HQs add all at once as the world starts.
+__m2_hud_calls_kept = 512
 -- Calls with a callback, by number, for the HUD to call back.
 __m2_hud_callbacks = {}
 local function copy(v, depth)
@@ -419,8 +422,16 @@ local methods = {
     -- attitudes, the log, the people, the score).
     ["Pda.Database"] = { "SetFactionAttitude", "AddLogEntry", "AddHelpEntry",
         "AddDossierEntry", "AddStatisticCategory", "AddStatisticEntry" },
-    -- OilCon020's PDA tutorial turns the map's beacon tutorial on and off.
-    ["Pda.Map"] = { "SetBeaconTutorialMode" },
+    -- The PDA map: the contracts' and jobs' missions and their blips
+    -- (`Pda.Map:AddMission`, `:AddBlip`..., which the HUD keeps in the
+    -- PDA widget's `tMissions` and `tMapBlips` and hands its map movie
+    -- as it opens, `MrxGuiPda`), and OilCon020's beacon tutorial. Not the
+    -- track callback ([`m2_game::mission`] keeps that), nor
+    -- `GetSelectedMission`, which answers.
+    ["Pda.Map"] = { "AddBlip", "RemoveBlip", "AddMission", "RemoveMission",
+        "UpdateMission", "SetSelectedMission", "AddLineRegion", "RemoveLineRegion",
+        "SetMissionTrackable", "SetMissionChangeAllowed", "SetFakePlayerLocation",
+        "SetBeaconTutorialMode" },
 }
 for group, names in pairs(methods) do
     local g
@@ -443,7 +454,7 @@ for group, names in pairs(methods) do
                 table.insert(__m2_hud_calls, { seq = __m2_hud_call_count,
                     group = group, method = name, data = copy(t, 0),
                     callback = callback })
-                if #__m2_hud_calls > 64 then table.remove(__m2_hud_calls, 1) end
+                if #__m2_hud_calls > (__m2_hud_calls_kept or 64) then table.remove(__m2_hud_calls, 1) end
                 local r
                 if type(f) == "function" then r = f(self, t, ...) end
                 -- A message added here gets the call's number as its id,
@@ -504,7 +515,7 @@ local function open(method, data, callback, args)
         method = method, data = data }
     table.insert(__m2_hud_calls, { seq = seq, group = "DialogBox", method = method,
         data = data, callback = type(callback) == "function" })
-    if #__m2_hud_calls > 64 then table.remove(__m2_hud_calls, 1) end
+    if #__m2_hud_calls > (__m2_hud_calls_kept or 64) then table.remove(__m2_hud_calls, 1) end
     local box = { CustomData = {}, __m2_dialog = seq }
     box.Close = function()
         if __m2_hud_callbacks[seq] then __m2_hud_callbacks[seq] = nil end
@@ -631,7 +642,7 @@ local function toggling(m, name)
         table.insert(__m2_hud_calls, { seq = __m2_hud_call_count, group = "GuiManager",
             method = "ToggleHud", data = { bOn = on and true or false, sReason = plain(reason) },
             callback = false })
-        if #__m2_hud_calls > 64 then table.remove(__m2_hud_calls, 1) end
+        if #__m2_hud_calls > (__m2_hud_calls_kept or 64) then table.remove(__m2_hud_calls, 1) end
         __m2_toggling = true
         local ok, r = pcall(d, player, on, reason, ...)
         __m2_toggling = false
@@ -1451,6 +1462,35 @@ impl MissionLink {
             self.write([format!("hud callback {seq} {given:?}: {e}")]);
         } else {
             self.write([format!("hud callback {seq} with {given:?}")]);
+        }
+    }
+
+    /// The game's HUD has taken the mission's HUD calls through number
+    /// `seq` ([`HUD_CALLS`]): they are let go, so each view copies only
+    /// those still to take.
+    pub fn hud_calls_taken(&self, seq: u64) {
+        let State::Running(m) = &self.state else {
+            return;
+        };
+        let Ok(Some(calls)) = m
+            .lua()
+            .globals()
+            .get::<Option<mlua::Table>>("__m2_hud_calls")
+        else {
+            return;
+        };
+        let kept: Vec<mlua::Table> = calls
+            .clone()
+            .sequence_values::<mlua::Table>()
+            .flatten()
+            .filter(|t| t.get::<u64>("seq").unwrap_or(0) > seq)
+            .collect();
+        if kept.len() == calls.raw_len() {
+            return;
+        }
+        let _ = calls.clear();
+        for (i, t) in kept.into_iter().enumerate() {
+            let _ = calls.raw_set(i + 1, t);
         }
     }
 
@@ -7540,6 +7580,35 @@ mod tests {
                 ("Pda.Database", "AddLogEntry")
             ]
         );
+    }
+
+    #[test]
+    fn the_pda_maps_missions_and_blips_reach_the_hud_all_of_them() {
+        // The scripts' calls as the world starts (`Pda.Map:AddMission`,
+        // then each contract's and HQ's `:AddBlip`): hundreds at once.
+        let lua = mlua::Lua::new();
+        lua.load("Hud = {} Pda = { Map = {} }").exec().unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(
+            r#"Pda.Map:AddMission({ sName = "PmcCon001", sLabel = "l", sFaction = "PMC" })
+            for i = 1, 300 do
+                Pda.Map:AddBlip({ sName = "b" .. i, nX = i, nY = -i, sMission = "PmcCon001",
+                    sTexture = "icon_action_3_mc", sLabel = "l", sDesc = "d", sFaction = "PMC" })
+            end
+            Pda.Map:RemoveBlip({ sName = "b1" })"#,
+        )
+        .exec()
+        .unwrap();
+        let t = std::time::Instant::now();
+        let calls = hud_calls(&lua);
+        eprintln!("{} calls copied in {:?}", calls.len(), t.elapsed());
+        assert_eq!(calls.len(), 302);
+        assert_eq!(
+            (calls[0].group.as_str(), calls[0].method.as_str()),
+            ("Pda.Map", "AddMission")
+        );
+        assert_eq!(calls[1].method, "AddBlip");
+        assert_eq!(calls[301].method, "RemoveBlip");
     }
 
     #[test]

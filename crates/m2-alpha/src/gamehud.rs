@@ -1534,6 +1534,11 @@ impl GameHud {
         std::mem::take(&mut self.choices)
     }
 
+    /// The number of the last mission HUD call passed on.
+    pub fn last_call(&self) -> u64 {
+        self.last_call
+    }
+
     /// The mission's HUD calls in `calls` not passed on yet.
     pub fn hud_calls(&mut self, calls: &[HudCall]) -> Vec<HudCall> {
         let new: Vec<HudCall> = calls
