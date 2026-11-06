@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use m2_engine::ambience::{AmbiencePlan, Layers};
-use m2_engine::audio::{EngineCue, EngineSounds, Falloff, KeySounds, Play, SoundLibrary};
+use m2_engine::audio::{
+    EngineCue, EngineSounds, Falloff, KeySounds, Play, SoundLibrary, VoiceBank,
+};
 use m2_engine::gun_sounds::GunCues;
 use m2_engine::{Category, Install, Mixer, SoundBuffer, Streams, VoiceId, Voices};
 
@@ -221,6 +223,10 @@ pub struct GameAudio {
     /// The characters' voices, once read (on a thread: `English.wad`).
     voices: Option<Arc<Voices>>,
     voices_loading: Option<Receiver<Voices>>,
+    /// Voice banks the scripts have loaded (`vo_job_pmc.english`: the
+    /// HQ's briefings), by name in lower case, once read (on a thread).
+    voice_banks: HashMap<String, Arc<VoiceBank>>,
+    voice_banks_loading: (Sender<VoiceBank>, Receiver<VoiceBank>),
     /// Decoded lines waiting to play: where (`None` flat) and how.
     said: (Sender<Spoken>, Receiver<Spoken>),
     /// When each line now playing or decoding ends.
@@ -1309,6 +1315,8 @@ impl GameAudio {
                 rx
             }),
             said: channel(),
+            voice_banks: HashMap::new(),
+            voice_banks_loading: channel(),
             lines: HashMap::new(),
             ui_playing: HashMap::new(),
             hushed: HashSet::new(),
@@ -1682,8 +1690,16 @@ impl GameAudio {
     /// where `at` is if the line is heard from where it is said. Returns
     /// how long it lasts, or `None` if it cannot be played.
     pub fn say(&mut self, id: u32, cue: &str, at: Option<Vec3>) -> Option<f32> {
-        let voices = self.voices.clone()?;
         let hash = m2_assets::name_hash(cue);
+        let found = self.voices.as_ref().is_some_and(|v| {
+            v.sets.iter().any(|t| {
+                t.lines.iter().any(|l| l.cue == hash) || t.groups.iter().any(|g| g.cue == hash)
+            })
+        });
+        if !found {
+            return self.say_from_bank(id, cue, hash, at);
+        }
+        let voices = self.voices.clone()?;
         let (streams, volume, near, far, positional) = voices.sets.iter().find_map(|t| {
             let (volume, near, far, positional) = t
                 .lines
@@ -1723,6 +1739,94 @@ impl GameAudio {
             Some(id),
         );
         Some(seconds)
+    }
+
+    /// Plays line `cue` (hash `hash`) from a voice bank the scripts
+    /// loaded ([`GameAudio::voice_bank`]): the HQ's briefing lines are
+    /// only there (`Fiona-Briefing-Contract-Oil020-01` in `vo_job_pmc`).
+    /// Its sound is decoded in the bank already, so it is handed straight
+    /// to [`GameAudio::update`] to start. `None`, and logged, if no bank
+    /// read has it.
+    fn say_from_bank(&mut self, id: u32, cue: &str, hash: u32, at: Option<Vec3>) -> Option<f32> {
+        self.take_voice_banks();
+        let Some((bank, sounds, volume, near, far, positional)) =
+            self.voice_banks.values().find_map(|b| {
+                let (sounds, volume, near, far, positional) = b.line(hash)?;
+                let sounds: Vec<SoundBuffer> = sounds.into_iter().cloned().collect();
+                Some((b.name.clone(), sounds, volume, near, far, positional))
+            })
+        else {
+            eprintln!(
+                "voice: line {cue} (#{id}) is in no voice set or bank read ({} banks: {:?}): not heard",
+                self.voice_banks.len(),
+                self.voice_banks.keys().collect::<Vec<_>>()
+            );
+            return None;
+        };
+        let pick = ((self.random() * sounds.len() as f32) as usize).min(sounds.len() - 1);
+        let buffer = sounds[pick].clone();
+        let seconds = buffer.seconds();
+        let now = Instant::now();
+        self.quiet_until = self
+            .quiet_until
+            .max(now + Duration::from_secs_f32(seconds + REMARK_GAP));
+        self.speaking
+            .push(now + Duration::from_secs_f32(seconds + 0.3));
+        eprintln!("voice: line {cue} (#{id}), bank {bank}, {seconds:.1} s");
+        let falloff = Falloff {
+            near: near.max(1.0),
+            far: far.max(near + 1.0),
+        };
+        let _ = self.said.0.send((
+            buffer,
+            at.filter(|_| positional),
+            falloff,
+            volume.clamp(0.0, 2.0),
+            Some(id),
+        ));
+        Some(seconds)
+    }
+
+    /// Reads voice bank `name` (`vo_job_pmc.english`) on a thread when the
+    /// scripts load it, and lets it go when they unload it.
+    pub fn voice_bank(&mut self, name: &str, load: bool) {
+        let key = name.to_ascii_lowercase();
+        if !load {
+            if self.voice_banks.remove(&key).is_some() {
+                eprintln!("voice bank: {key} let go");
+            }
+            return;
+        }
+        if self.voice_banks.contains_key(&key) {
+            return;
+        }
+        let Some(install) = self.install.clone() else {
+            return;
+        };
+        let tx = self.voice_banks_loading.0.clone();
+        std::thread::spawn(move || match VoiceBank::load(&install, &key) {
+            Ok(b) => {
+                eprintln!(
+                    "voice bank: {} read: {} tables, {} lines, {} sounds",
+                    b.name,
+                    b.sets.len(),
+                    b.sets
+                        .iter()
+                        .map(|t| t.lines.len() + t.groups.len())
+                        .sum::<usize>(),
+                    b.sounds.len()
+                );
+                let _ = tx.send(b);
+            }
+            Err(e) => eprintln!("voice bank: {key}: {e}"),
+        });
+    }
+
+    /// Takes in the voice banks read since the last call.
+    fn take_voice_banks(&mut self) {
+        while let Ok(b) = self.voice_banks_loading.1.try_recv() {
+            self.voice_banks.insert(b.name.clone(), Arc::new(b));
+        }
     }
 
     /// Stops scripted line `id`, as the scripts asked (`VO.Cancel`), at
@@ -2968,6 +3072,7 @@ impl GameAudio {
             self.voices = Some(Arc::new(v));
             self.voices_loading = None;
         }
+        self.take_voice_banks();
         while let Ok((buffer, at, falloff, gain, line)) = self.said.1.try_recv() {
             if let Some(l) = line.filter(|l| self.hushed.remove(l)) {
                 eprintln!("voice: line #{l} cancelled by the scripts before it played");

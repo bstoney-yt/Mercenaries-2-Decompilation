@@ -381,6 +381,14 @@ pub enum Command {
     /// The player can't be killed while on (`Player.SetHealthClamp`): her
     /// health stops short of nothing, for the survival system to step in.
     HealthClamp(bool),
+    /// A voice bank the scripts load (`true`) or let go (`false`) by its
+    /// localised name (`vo_job_pmc.english`): `MrxSoundBanks.LoadTempBank`
+    /// and `LoadSoundBank` for an HQ's briefings and a contract's lines,
+    /// whose cue tables and sounds are not among the resident sets.
+    VoiceBank {
+        name: String,
+        load: bool,
+    },
     /// The player's controls on or off (`Player.SetInputEnabled`): the
     /// state system turns them off on entering a loading fade and back on
     /// once the screen has faded in.
@@ -3415,6 +3423,33 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&sound, "IsDynamicMusic", |w, _, _| {
         values([Value::Boolean(w.music.dynamic)])
     })?;
+    // Sound.LoadTempBank(name, type, callback, data) and
+    // Sound.LoadBankWithCallback(name, type, callback): how
+    // `MrxSoundBanks` loads a bank, by its localised name
+    // (`_GetLocalizedName`: `vo_job_pmc.english`). The HQ's briefings and
+    // the contracts list theirs in `tAssetPreload` (`soundbank` and
+    // `wavebank`, both the same name); a voice bank's lines are only
+    // heard once it is in. The callback hears it loaded on the next tick,
+    // as `Pg.LoadAsset`'s does; the unload calls let the bank go.
+    fn bank(w: &mut ScriptWorld, a: &[Value], load: bool) -> mlua::Result<MultiValue> {
+        if let Some(Value::String(name)) = a.first() {
+            let name = name.to_string_lossy();
+            if name.to_ascii_lowercase().starts_with("vo_") {
+                w.commands.push(Command::VoiceBank { name, load });
+            }
+        }
+        if let Some(Value::Function(f)) = a.get(2) {
+            w.asset_loads
+                .push((f.clone(), a.get(3).cloned().unwrap_or(Value::Nil)));
+        }
+        values([])
+    }
+    add(&sound, "LoadTempBank", |w, _, a| bank(w, a, true))?;
+    add(&sound, "LoadBankWithCallback", |w, _, a| bank(w, a, true))?;
+    add(&sound, "UnloadTempBank", |w, _, a| bank(w, a, false))?;
+    add(&sound, "UnloadBankWithCallback", |w, _, a| {
+        bank(w, a, false)
+    })?;
     // Set-up and the action level the score is not driven by yet.
     for name in [
         "AddFactionMusic",
@@ -4703,6 +4738,40 @@ mod tests {
         let log: String = host.lua().globals().get("log").unwrap();
         assert_eq!(log, "car out ");
         assert_eq!(world.borrow().objects.get(&1).and_then(|o| o.vehicle), None);
+    }
+
+    #[test]
+    fn voice_banks_load_by_their_localised_names() {
+        let (host, world) = setup();
+        host.lua()
+            .load(
+                r#"
+                log = {}
+                Sound.LoadTempBank("vo_job_pmc.english", "soundbank", function(name, t, late)
+                    table.insert(log, name .. " " .. t .. " " .. tostring(late))
+                end, { "vo_job_pmc", "soundbank", false })
+                Sound.LoadBankWithCallback("ambience_jungle", "wavebank", function() end)
+                Sound.UnloadTempBank("vo_job_pmc.english", "soundbank")
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [
+                Command::VoiceBank {
+                    name: "vo_job_pmc.english".into(),
+                    load: true
+                },
+                Command::VoiceBank {
+                    name: "vo_job_pmc.english".into(),
+                    load: false
+                },
+            ]
+        );
+        assert!(answer_asset_loads(&world).is_empty());
+        let first: String = host.lua().load("return log[1]").eval().unwrap();
+        assert_eq!(first, "vo_job_pmc soundbank false");
     }
 
     #[test]
