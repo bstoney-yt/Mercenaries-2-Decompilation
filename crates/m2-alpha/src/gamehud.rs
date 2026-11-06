@@ -1066,6 +1066,7 @@ impl HudState {
                     .map(|b| (b.zoom, false))
                     .or(scope)
                     .map(|(zoom, sniper)| binoculars::View {
+                        focus: game.binocular_focus(),
                         zoom,
                         sniper,
                         heading: binoculars::wrap_degrees(game.view_heading().to_degrees()),
@@ -2152,6 +2153,7 @@ struct Told {
     /// The zoom and the handlers that answered when the meters were last
     /// logged.
     binoculars_logged: Option<(u8, usize)>,
+    binocular_focus: Option<Option<binoculars::Focus>>,
     /// What the tutorial box says (None: never anything).
     tutorial: Option<Option<String>>,
     trespass: crate::mission::Trespass,
@@ -4185,7 +4187,20 @@ impl Thread {
             t.set("nCameraHeading", f64::from(v.heading))?;
             t.set("nPitch", f64::from(v.pitch))?;
             t.set("nZoomLevel", f64::from(v.zoom))?;
-            t.set("FactionTexture", 0)?;
+            // A number puts the badge away, as the 360 sends for none.
+            match v.focus.and_then(|f| f.texture) {
+                Some(texture) => t.set("FactionTexture", texture)?,
+                None => t.set("FactionTexture", 0)?,
+            }
+            if self.told.binocular_focus != Some(v.focus) {
+                self.told.binocular_focus = Some(v.focus);
+                log.push(format!("binoculars: on {:?}", v.focus));
+            }
+            let name = v.focus.and_then(|f| f.name);
+            t.set(
+                "sFocusName",
+                name.map_or_else(String::new, |k| format!("[{k:#010x}]")),
+            )?;
             let n = gui_runtime::fire(lua, "BinocularsUpdate", t)?;
             if self.told.binoculars_logged != Some((v.zoom, n)) {
                 self.told.binoculars_logged = Some((v.zoom, n));

@@ -4347,6 +4347,53 @@ fn restore(physics: &mut Physics, vehicles: &mut [ParkedVehicle], saved: &mut Ve
     }
 }
 
+impl Game {
+    /// What her binoculars' reticle is on: the nearest vehicle or person
+    /// along it, not behind the ground or a building
+    /// ([`crate::binoculars`]).
+    pub fn binocular_focus(&self) -> Option<crate::binoculars::Focus> {
+        use crate::binoculars::{Focus, along_ray, faction_texture, marker_texture};
+        let world = self.scene.world.as_ref()?;
+        let db = &world.index.template_db;
+        let camera = self.walking()?.view(60.0, 16.0 / 9.0).view.inverse();
+        let (eye, ahead) = (
+            camera.w_axis.truncate(),
+            -camera.z_axis.truncate().normalize_or_zero(),
+        );
+        let of_template = |id: Option<u32>| {
+            let id = id?;
+            let texture = db.faction_markers.get(&id).copied();
+            Some(Focus {
+                texture: texture.and_then(marker_texture),
+                name: db.localized.get(&id).copied(),
+            })
+        };
+        let vehicles = self.scene.vehicles.iter().filter_map(|v| {
+            let m = world.physics.vehicle_transform(v.id?)?;
+            let (lo, hi) = v.spec.bounds;
+            let t = along_ray(eye, ahead, m.transform_point3((lo + hi) * 0.5))?;
+            let names = db.names_for(&v.spec.label, v.spec.model);
+            let id = names.first().and_then(|n| db.id(n));
+            Some((t, of_template(id)?))
+        });
+        let people = self.scene.people.npcs.iter().filter_map(|n| {
+            let t = along_ray(eye, ahead, n.character.position + Vec3::Y)?;
+            let kind = self.scene.people.kinds.get(n.kind)?;
+            let own = kind.named.then(|| db.id(&kind.role)).flatten();
+            let focus = of_template(own).unwrap_or(Focus {
+                texture: n.faction.and_then(faction_texture),
+                name: None,
+            });
+            Some((t, focus))
+        });
+        let (t, focus) = vehicles.chain(people).min_by(|a, b| a.0.total_cmp(&b.0))?;
+        // Behind something, more than its own body's length before it:
+        // nothing's shown.
+        let hit = world.physics.cast_ray(eye, ahead, t);
+        hit.is_none_or(|(d, _)| d + 6.0 >= t).then_some(focus)
+    }
+}
+
 /// Half the diagonal of a vehicle's footprint.
 fn footprint_radius(spec: &m2_engine::VehicleSpec) -> f32 {
     let (lo, hi) = spec.bounds;
