@@ -123,6 +123,24 @@ impl PathWorld for Ground<'_> {
     }
 }
 
+/// What a boat keeps clear of (0x822ED248): the boats; not buildings.
+pub fn afloat(physics: &Physics, vehicles: &[ParkedVehicle]) -> Vec<boat_attack::Neighbour> {
+    vehicles
+        .iter()
+        .filter(|v| v.spec.is_boat() && !v.wrecked)
+        .filter_map(|v| {
+            let id = v.id?;
+            let turn = physics.vehicle_transform(id)?;
+            let (lo, hi) = v.spec.bounds;
+            Some(boat_attack::Neighbour {
+                at: turn.transform_point3((lo + hi) * 0.5),
+                radius: (hi - lo).length() * 0.5,
+                velocity: physics.vehicle_velocity(id),
+            })
+        })
+        .collect()
+}
+
 /// What the boats want to know of her.
 #[derive(Clone, Copy, Debug)]
 pub struct Her {
@@ -537,21 +555,7 @@ impl Pursuers {
             self.log = 5.0;
         }
         let mut boats = 0;
-        // What the boats keep clear of (0x822ED248): boats; not buildings.
-        let afloat: Vec<boat_attack::Neighbour> = vehicles
-            .iter()
-            .filter(|v| v.spec.is_boat() && !v.wrecked)
-            .filter_map(|v| {
-                let id = v.id?;
-                let turn = physics.vehicle_transform(id)?;
-                let (lo, hi) = v.spec.bounds;
-                Some(boat_attack::Neighbour {
-                    at: turn.transform_point3((lo + hi) * 0.5),
-                    radius: (hi - lo).length() * 0.5,
-                    velocity: physics.vehicle_velocity(id),
-                })
-            })
-            .collect();
+        let afloat = afloat(physics, vehicles);
         for p in &mut self.out {
             let Some(i) = vehicles
                 .iter()

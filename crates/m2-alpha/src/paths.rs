@@ -11,8 +11,9 @@
 //!
 //! Cars and tanks drive by the 360's own drivers: a car by 0x822AC008
 //! ([`CarDriver::drive_to`], as `CarMove` 0x822AC458), a tank by 0x822B5B98
-//! ([`tank_attack::drive_to`], as `TankMove` 0x822B6150). Others (boats)
-//! drive as traffic's do.
+//! ([`tank_attack::drive_to`], as `TankMove` 0x822B6150), a boat by
+//! 0x822A7C30 ([`boat_attack::drive_to`], as 0x822A8028), keeping clear of
+//! other boats.
 //!
 //! Inferred: the speed asked is `Haste` times the template's top speed
 //! (what `Haste` scales isn't known, as for traffic; `CarMove` and
@@ -22,7 +23,7 @@
 use std::collections::HashMap;
 
 use m2_engine::car_driver::{CarDriver, CarInputs, CarState};
-use m2_engine::{Physics, VehicleControls, tank_attack};
+use m2_engine::{Physics, VehicleControls, boat_attack, tank_attack};
 use m2_math::glam::{Vec2, Vec3};
 
 use crate::scene::ParkedVehicle;
@@ -91,6 +92,7 @@ impl PathMoves {
             .enumerate()
             .filter_map(|(i, v)| Some((i, physics.vehicle_transform(v.id?)?.w_axis.truncate())))
             .collect();
+        let afloat = crate::pursuers::afloat(physics, vehicles);
         self.moves.retain(|&g, m| {
             let Some((i, v)) = vehicles.iter().enumerate().find(|(_, v)| v.guid == Some(g)) else {
                 return true;
@@ -128,7 +130,7 @@ impl PathMoves {
                 return false;
             }
             let top = v.spec.tuning.max_speed.unwrap_or(DEFAULT_TOP) * m.haste;
-            let (controls, want, off) = steer(
+            let (_, want, off) = steer(
                 at.transform_vector3(Vec3::Z),
                 here,
                 m.route[m.next],
@@ -151,7 +153,16 @@ impl PathMoves {
                     ..VehicleControls::default()
                 }
             } else if v.spec.is_boat() {
-                controls
+                let (lo, hi) = v.spec.bounds;
+                let length = hi.z - lo.z;
+                let size = length.max(hi.x - lo.x);
+                let push = boat_attack::keep_clear(&car, length, size, &afloat);
+                let b = boat_attack::drive_to(&car, m.route[m.next], top, false, push);
+                VehicleControls {
+                    throttle: b.throttle,
+                    steer: b.steer,
+                    ..VehicleControls::default()
+                }
             } else {
                 let input = m.driver.drive_to(&car, m.route[m.next], top, false, dt);
                 let forward = physics.vehicle_gear(id).is_none_or(|(g, _)| g != 0);
