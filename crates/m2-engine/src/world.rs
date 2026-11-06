@@ -378,6 +378,10 @@ pub struct Templates {
     /// "Chopper"; `M151 Softtop (VZ)`'s is `vehicle.m151softtopvz`; PC
     /// data, 2026-10-09).
     pub localized: HashMap<u32, u32>,
+    /// Each template's `FactionMarker` texture (`MarkerTextureName`, a name
+    /// hash), by id: the badge the binocular screen shows for it (the 360
+    /// code, 0x82443160).
+    pub faction_markers: HashMap<u32, u32>,
     /// Each template's `_PropPhysics`, by id: the props that move when
     /// hit ([`crate::durability::prop_physics`]).
     pub prop_physics: HashMap<u32, crate::durability::PropPhysics>,
@@ -1072,6 +1076,7 @@ impl Templates {
             equipment: crate::tuning::equipment(&db),
             arms: crate::weapons::read(&db),
             localized: localized_names(&db),
+            faction_markers: faction_markers(&db),
             damage,
             blast_scripts: HashMap::new(),
         };
@@ -1086,6 +1091,18 @@ impl Templates {
         crate::standin::arm_the_osprey(&mut templates);
         (templates, atmosphere)
     }
+}
+
+/// Each template's `FactionMarker` texture, by id, where it gives one.
+fn faction_markers(db: &Layer<'_>) -> HashMap<u32, u32> {
+    let t = crate::tuning::Table::new(db, "FactionMarker");
+    let field = name_hash("MarkerTextureName");
+    t.templates()
+        .filter_map(|id| {
+            let texture = t.word(t.of_template(id).first()?, field)?;
+            (texture != 0).then_some((id, texture))
+        })
+        .collect()
 }
 
 /// Each template's `LocalizedName` key (its field `kEy`, a name hash),

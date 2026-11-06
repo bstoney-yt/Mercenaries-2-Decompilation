@@ -76,7 +76,7 @@
 use m2_assets::flash::avm1::Value;
 
 use crate::input::Control;
-use crate::keytable::{KeyTable, ROWS};
+use crate::keytable::{KeyTable, ROWS, Slot};
 use crate::pad::Button;
 use crate::padtable::{PAD_NAME, PadTable};
 
@@ -792,6 +792,8 @@ pub struct KeyScreen {
     keys: KeyTable,
     /// The cell (row, column) waiting for a key.
     waiting: Option<(usize, usize)>,
+    /// The cell and the key the over-bound box asks about.
+    asking: Option<(usize, usize, Slot)>,
 }
 
 impl KeyScreen {
@@ -800,6 +802,7 @@ impl KeyScreen {
             keys: kept.clone(),
             kept,
             waiting: None,
+            asking: None,
         }
     }
 
@@ -818,6 +821,16 @@ impl KeyScreen {
         news: &mut News,
     ) -> Option<bool> {
         Some(match name {
+            "LTIOverBoundResponse" => {
+                if let Some((row, column, slot)) = self.asking.take() {
+                    if arg.trim() == "1" {
+                        self.bind(row, column, slot, pending);
+                    } else {
+                        pending.push(("LTIInputKMCancel", Vec::new()));
+                    }
+                }
+                true
+            }
             "LTIInputKMEnter" | "LTIInputKMExit" => {
                 // As last accepted: what was changed and not accepted goes.
                 self.stop_waiting(news);
@@ -870,7 +883,19 @@ impl KeyScreen {
             pending.push(("LTIInputKMCancel", Vec::new()));
             return;
         }
-        for r in self.keys.set(row, column, control.into()) {
+        let slot = Slot::from(control);
+        match self.keys.holder(slot).filter(|&(r, _)| r != row) {
+            Some((from, _)) => {
+                self.asking = Some((row, column, slot));
+                pending.push(over_bound_box(1, &slot.name(), from, row));
+            }
+            None => self.bind(row, column, slot, pending),
+        }
+    }
+
+    /// `slot` into the cell, out of any other.
+    fn bind(&mut self, row: usize, column: usize, slot: Slot, pending: &mut Vec<Call>) {
+        for r in self.keys.set(row, column, slot) {
             pending.extend(self.row_calls(r).into_iter().skip(1));
         }
         pending.push(("LTIFinishedGettingInput", vec![Value::Bool(false)]));
@@ -879,6 +904,7 @@ impl KeyScreen {
 
     /// The table no longer waits for a key.
     pub fn stop_waiting(&mut self, news: &mut News) {
+        self.asking = None;
         if self.waiting.take().is_some() {
             news.capture = Some(false);
         }
@@ -915,6 +941,40 @@ pub struct PadReport {
     pub captured: Vec<Button>,
 }
 
+/// The box asking whether to move a key or button already bound: the
+/// movies' `LTIonlineMsgBox(title, text, buttons, first, second, answer)`,
+/// its answer 1 going to `LTIOverBoundResponse` and 2 to
+/// `LTIJoystickOverBoundResponse`, each with the button pressed. From the
+/// game's data: the shell's strings "Key Over Bound" (23641453), "Joystick
+/// Key Over Bound" (764469fd) and "The key %s is currently bound to %s,
+/// would you like to bind it to %s instead?" (603e1c7d, the same for
+/// both), and the movie's calls. Inferred: its buttons, Yes and No
+/// (0x5f8dbd17 and 0x46d99603), the pair the pause movie holds for the
+/// options screens' own box, "Accept Changes?", which the recording shows
+/// in that case. The recording doesn't show this box, and the PC's
+/// library that puts it up isn't read.
+pub fn over_bound_box(answer: u8, key: &str, from: usize, to: usize) -> Call {
+    let title = if answer == 1 {
+        "[0x23641453]"
+    } else {
+        "[0x764469fd]"
+    };
+    (
+        "LTIonlineMsgBox",
+        vec![
+            text(title),
+            text(&format!(
+                "[0x603e1c7d:{key}:{}:{}]",
+                ROWS[from].name, ROWS[to].name
+            )),
+            Value::Number(2.0),
+            text("[0x5f8dbd17]"),
+            text("[0x46d99603]"),
+            Value::Number(f64::from(answer)),
+        ],
+    )
+}
+
 /// The joystick table's screen (Controls, Joystick), as both menus'
 /// movies run it ([`crate::padtable`]). With no pad the screen is left
 /// as it is ("No Joystick Connected...", as the PC recording shows it),
@@ -928,6 +988,8 @@ pub struct JoyScreen {
     buttons: PadTable,
     /// The row waiting for a button.
     waiting: Option<usize>,
+    /// The row and the button the over-bound box asks about.
+    asking: Option<(usize, Button)>,
     /// What the movie has been told.
     connected: bool,
     held: String,
@@ -967,6 +1029,16 @@ impl JoyScreen {
         news: &mut News,
     ) -> Option<bool> {
         Some(match name {
+            "LTIJoystickOverBoundResponse" => {
+                if let Some((row, button)) = self.asking.take() {
+                    if arg.trim() == "1" {
+                        self.bind(row, button, pending);
+                    } else {
+                        pending.push(("LTIInputJoystickCancel", Vec::new()));
+                    }
+                }
+                true
+            }
             "LTIInputJoystickEnter" | "LTIInputJoystickReEnter" | "LTIInputJoystickExit" => {
                 self.stop_waiting(news);
                 self.buttons = self.kept;
@@ -1013,6 +1085,17 @@ impl JoyScreen {
             return;
         };
         self.stop_waiting(news);
+        match self.buttons.holder(button).filter(|&r| r != row) {
+            Some(from) => {
+                self.asking = Some((row, button));
+                pending.push(over_bound_box(2, button.name(), from, row));
+            }
+            None => self.bind(row, button, pending),
+        }
+    }
+
+    /// `button` into the row, out of any other.
+    fn bind(&mut self, row: usize, button: Button, pending: &mut Vec<Call>) {
         for r in self.buttons.set(row, button) {
             pending.push(self.map_call(r));
         }
@@ -1031,6 +1114,7 @@ impl JoyScreen {
 
     /// The table no longer waits for a button.
     pub fn stop_waiting(&mut self, news: &mut News) {
+        self.asking = None;
         if self.waiting.take().is_some() {
             news.capture = Some(false);
             news.pad_capture = Some(false);
@@ -1337,6 +1421,17 @@ mod tests {
         });
         let news = n.take_news();
         assert_eq!((news.capture, news.pad_capture), (Some(false), Some(false)));
+        // Jump has A: the box asks first.
+        let calls = n.calls(&s);
+        assert_eq!(calls[0].0, "LTIonlineMsgBox");
+        assert_eq!(
+            texts(&calls[0])[..2],
+            [
+                "[0x764469fd]",
+                "[0x603e1c7d:A:[SHELL.PCShell.Jump2]:[SHELL.PCShell.PrimaryAttack2]]"
+            ]
+        );
+        assert!(n.library("LTIJoystickOverBoundResponse", "1"));
         // The row, and Jump, which had A.
         assert_eq!(
             names(n.calls(&s)),
@@ -1354,6 +1449,68 @@ mod tests {
     }
 
     #[test]
+    fn no_on_the_over_bound_box_leaves_the_table() {
+        let mut n = Native::default();
+        let s = Settings::default();
+        n.calls(&s);
+        n.pad(&pad_on());
+        assert!(n.library("LTIInputJoystickChangeInput", "4"));
+        n.pad(&PadReport {
+            captured: vec![Button::A],
+            ..pad_on()
+        });
+        n.calls(&s);
+        assert!(n.library("LTIJoystickOverBoundResponse", "2"));
+        assert_eq!(names(n.calls(&s)), ["LTIInputJoystickCancel"]);
+        assert!(n.library("LTIInputJoystickEnter", ""));
+        let calls = n.calls(&s);
+        assert_eq!(texts(&calls[4])[1], "RT");
+        assert_eq!(texts(&calls[11])[1], "A");
+    }
+
+    #[test]
+    fn a_button_in_its_own_row_needs_no_box() {
+        let mut n = Native::default();
+        let s = Settings::default();
+        n.calls(&s);
+        n.pad(&pad_on());
+        assert!(n.library("LTIInputJoystickChangeInput", "4"));
+        n.pad(&PadReport {
+            captured: vec![Button::RightTrigger],
+            ..pad_on()
+        });
+        assert_eq!(n.calls(&s)[0].0, "LTIInputJoystickMap");
+    }
+
+    #[test]
+    fn a_key_in_another_row_asks_first() {
+        let mut n = Native::default();
+        let s = Settings::default();
+        n.calls(&s);
+        assert!(n.library("LTIInputKMEnter", ""));
+        n.calls(&s);
+        // Jump's primary cell takes W from Move Forward.
+        assert!(n.library("LTIInputKMChangeInput", "11"));
+        n.captured(Control::Key(KeyCode::KeyW));
+        let calls = n.calls(&s);
+        assert_eq!(calls[0].0, "LTIonlineMsgBox");
+        assert_eq!(
+            texts(&calls[0])[..2],
+            [
+                "[0x23641453]",
+                "[0x603e1c7d:W:[SHELL.PCShell.MoveForward]:[SHELL.PCShell.Jump2]]"
+            ]
+        );
+        assert!(n.library("LTIOverBoundResponse", "2"));
+        assert_eq!(names(n.calls(&s)), ["LTIInputKMCancel"]);
+        assert!(n.library("LTIInputKMChangeInput", "11"));
+        n.captured(Control::Key(KeyCode::KeyW));
+        n.calls(&s);
+        assert!(n.library("LTIOverBoundResponse", "1"));
+        assert_eq!(names(n.calls(&s)).last(), Some(&"LTIInputKMUpdateTable"));
+    }
+
+    #[test]
     fn leaving_or_a_key_drops_what_was_not_accepted() {
         let mut n = Native::default();
         let s = Settings::default();
@@ -1364,6 +1521,8 @@ mod tests {
             captured: vec![Button::X],
             ..pad_on()
         });
+        n.calls(&s);
+        assert!(n.library("LTIJoystickOverBoundResponse", "1"));
         n.calls(&s);
         assert!(n.library("LTIInputJoystickExit", ""));
         assert_eq!(texts(&n.calls(&s)[4])[1], "RT");

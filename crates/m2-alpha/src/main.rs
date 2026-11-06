@@ -6354,9 +6354,15 @@ fn drive_for_screenshot(
             .as_ref()
             .and_then(|w| w.index.template_db.engine_for_model(v.spec.model))
             .is_some();
+        if let (Some(w), Some(id)) = (game.scene.world.as_ref(), v.id) {
+            eprintln!(
+                "drive: ground word {:08x}",
+                w.physics.vehicle_ground(id, 5.0)
+            );
+        }
         if let Some(e) = game.engine() {
             eprintln!(
-                "drive: engine bank {:08x} {} ({}), sound set {:08x}, throttle {:.1}",
+                "drive: engine bank {:08x} {} ({}), sound set {:08x}, throttle {:.1}, surface class {:.1}",
                 e.bank,
                 sound::bank_name(e.bank).unwrap_or("?"),
                 if templated {
@@ -6365,7 +6371,8 @@ fn drive_for_screenshot(
                     "by kind"
                 },
                 e.set,
-                e.throttle
+                e.throttle,
+                e.surface
             );
             // What it plays (read here: the picture has no sound).
             if let Some(install) = install {
@@ -9746,6 +9753,8 @@ impl Running {
         let engine = self.game.engine();
         self.audio.engine(engine, TICK.as_secs_f32());
         self.audio.rotors(&self.game.scene.flights.sounding());
+        let others = self.game.others_engines(ear);
+        self.audio.others_engines(&others, ear);
         let driving = self.game.driving().is_some();
         let mut remarks = self.game.combat.take_remarks();
         if driving && !self.was_driving && self.game.car_remark_due() {

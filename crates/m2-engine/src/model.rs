@@ -29,7 +29,7 @@ use m2_render::{
 };
 
 use crate::assets::{AssetError, AssetSource, DecodedTexture, ModelData};
-use crate::physics::CollisionShape;
+use crate::physics::{CollisionShape, PathSolid};
 use crate::technique::Technique;
 
 /// An uploaded texture and what its pixels say about it.
@@ -840,8 +840,9 @@ impl Looks {
 }
 
 /// A collision shape of a model's parts ([`ModelParts::meshes`]): the part
-/// it stands on, if any, its vertices (model space) and its triangles.
-pub type PartMesh = (Option<usize>, Vec<Vec3>, Vec<[u32; 3]>);
+/// it stands on, if any, its vertices (model space), its triangles and
+/// whether it stands in an AI's way ([`PathSolid`](crate::physics::PathSolid)).
+pub type PartMesh = (Option<usize>, Vec<Vec3>, Vec<[u32; 3]>, bool);
 
 /// The parts of a model its state machine switches one at a time: a long
 /// hedge's sections, a gate's two leaves. A vehicle breaks those its
@@ -951,15 +952,26 @@ impl ModelParts {
     pub fn collision(&self, wrecked: &[bool]) -> Option<CollisionShape> {
         let mut vertices = Vec::new();
         let mut triangles = Vec::new();
-        for (part, v, t) in &self.meshes {
+        let mut way = Vec::new();
+        let mut clear = false;
+        for (part, v, t, in_way) in &self.meshes {
             if part.is_some_and(|k| wrecked.get(k).copied().unwrap_or(false)) {
                 continue;
             }
             let first = vertices.len() as u32;
             vertices.extend_from_slice(v);
             triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
+            if *in_way {
+                way.extend(t.iter().map(|t| t.map(|i| first + i)));
+            } else {
+                clear = true;
+            }
         }
-        CollisionShape::mesh(&vertices, &triangles)
+        let mut shape = CollisionShape::mesh(&vertices, &triangles)?;
+        if clear {
+            shape.path = PathSolid::of(&vertices, &way);
+        }
+        Some(shape)
     }
 }
 
@@ -1140,7 +1152,7 @@ impl CpuModel {
             let mut parts = std::sync::Arc::unwrap_or_clone(parts);
             parts.meshes = CollisionShape::shape_meshes(&model, phy2)
                 .into_iter()
-                .map(|(node, v, t)| (parts.part_holding(node), v, t))
+                .map(|(node, v, t, way)| (parts.part_holding(node), v, t, way))
                 .collect();
             cpu.parts = Some(std::sync::Arc::new(parts));
         }

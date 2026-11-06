@@ -15,6 +15,10 @@
 //!   it falls on the way, from the arc 0x828542C0 solves through the
 //!   point at the round's speed (the flatter of its two arcs).
 //!
+//! - **What it reports:** each think it leaves its verdict in its +0xCC
+//!   byte (the rider's mind +0x128, which 0x822ECE70 hands the driver):
+//!   [`Report`], from which `CarAttack` moves and turns for its crew.
+//!
 //! Inferred: the gravity factor is the round's `GravityScale`, the world's
 //! gravity the alpha's own ([`crate::physics::GRAVITY`], as its rounds fall
 //! by it); the round's speed its `Velocity`. Not ported: how often it
@@ -23,6 +27,94 @@
 //! (mask 0x223F6FDA) are here all that is solid but its own bodies and hers.
 
 use m2_math::glam::Vec3;
+
+/// What a gunner's fire control last made of its target, its +0xCC byte
+/// (0x822C95D8 writes it, 0x822C8EA8 clears it; 0x822ECE70 reads it as the
+/// rider's mind +0x128, the fire control being the mind's +0x5C).
+///
+/// From the 360 code. The byte is left as it is unless a think has
+/// something to say, so a gunner goes on reporting what it last did:
+/// [`next`](Report::next). Not told apart here: 8 (its burst running) and
+/// 9 (two kinds of mind, or asked for a special attack), both of which
+/// `CarAttack` counts as it does 3, and which only follow a 3. 7 is read
+/// by `CarAttack` and written by nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Report {
+    /// 0: nothing yet.
+    #[default]
+    Nothing,
+    /// 2: not seen for too long.
+    Lost,
+    /// 3: it has had a clear line and may fire.
+    Ready,
+    /// 4: past its weapon's reach.
+    TooFar,
+    /// 5: inside its weapon's least range.
+    TooNear,
+    /// 6: its turret or gun can't be brought to bear.
+    NoReach,
+}
+
+/// How long a target goes unseen before a gunner reports it lost, seconds
+/// (0x822C95D8: 5; 30 after it took its last aim from a hit, not ported).
+pub const LOST_AFTER: f32 = 5.0;
+
+/// A gunner's weapon's reach with no `WeaponHint`, metres (the float 80 at
+/// 0x820BAF98, used by 0x822C95D8 and 0x822EDBC0 alike).
+pub const NO_HINT_RANGE: f32 = 80.0;
+
+/// What one think of the fire control looks at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FireView {
+    /// Seconds since its target was seen (its record's +0x8C).
+    pub unseen: f32,
+    /// Its flat distance to its aim point (0x822C95D8 leaves out height).
+    pub flat: f32,
+    /// Its weapon's `MinFireRange` and `FireRange` (0 and
+    /// [`NO_HINT_RANGE`] with no hint).
+    pub near: f32,
+    pub far: f32,
+    /// One of its sight lines is clear (+0x70 bits 30, 31).
+    pub sees: bool,
+    /// It can be brought to bear (0x822EF8C8, or its gun's cone).
+    pub reaches: bool,
+}
+
+impl Report {
+    /// One think of 0x822C95D8. In its order: unseen too long it reports
+    /// lost; a clear line makes it ready; then inside its least range, past
+    /// its reach and not able to bear each report and end the think short
+    /// of firing (0x822CAA64..0x822CABFC). With nothing to say the last
+    /// report stands.
+    pub fn next(self, v: &FireView) -> Self {
+        if v.unseen >= LOST_AFTER {
+            return Self::Lost;
+        }
+        let was = if v.sees { Self::Ready } else { self };
+        if v.flat <= v.near {
+            Self::TooNear
+        } else if v.far <= v.flat {
+            Self::TooFar
+        } else if !v.reaches {
+            Self::NoReach
+        } else {
+            was
+        }
+    }
+
+    /// Whether this think may fire: it did not end short of firing, and
+    /// it has been ready.
+    pub fn fires(self) -> bool {
+        self == Self::Ready
+    }
+}
+
+/// The least range a gunner's weapon slot keeps (0x822EDBC0, its +0x20,
+/// which `CarAttack` averages): its `MinFireRange` (0 with no hint), but
+/// at least 1 m past its round's blast (1 m with none).
+pub fn slot_near(min_range: f32, blast_radius: Option<f32>) -> f32 {
+    min_range.max(blast_radius.unwrap_or(0.0) + 1.0)
+}
 
 /// A gunner's watch on its target's motion (its +0x8C..+0xC4).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -151,6 +243,61 @@ pub fn sight_lines(eye: Vec3, at: Vec3, own: f32, far: f32) -> [(Vec3, Vec3); 3]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view(flat: f32) -> FireView {
+        FireView {
+            unseen: 0.0,
+            flat,
+            near: 5.0,
+            far: 100.0,
+            sees: true,
+            reaches: true,
+        }
+    }
+
+    // What 0x822C95D8 leaves in its +0xCC byte, in its own order.
+    #[test]
+    fn a_gunner_reports_as_the_360s_fire_control() {
+        let r = Report::default();
+        assert_eq!(r.next(&view(50.0)), Report::Ready);
+        assert_eq!(r.next(&view(100.0)), Report::TooFar);
+        assert_eq!(r.next(&view(5.0)), Report::TooNear);
+        let v = FireView {
+            reaches: false,
+            ..view(50.0)
+        };
+        assert_eq!(r.next(&v), Report::NoReach);
+        // Lost comes first, however near.
+        let v = FireView {
+            unseen: 5.0,
+            ..view(1.0)
+        };
+        assert_eq!(r.next(&v), Report::Lost);
+    }
+
+    // With no clear line and nothing else to say, the last report stands.
+    #[test]
+    fn a_report_stands_until_a_think_has_something_to_say() {
+        let blind = FireView {
+            sees: false,
+            ..view(50.0)
+        };
+        assert_eq!(Report::Nothing.next(&blind), Report::Nothing);
+        assert_eq!(Report::TooFar.next(&blind), Report::TooFar);
+        assert_eq!(Report::Ready.next(&blind), Report::Ready);
+        assert!(Report::Ready.next(&blind).fires());
+        assert!(!Report::Nothing.next(&blind).fires());
+        // A clear line back in reach makes it ready again.
+        assert_eq!(Report::TooFar.next(&view(50.0)), Report::Ready);
+    }
+
+    // 0x822EDBC0: at least 1 m past its blast.
+    #[test]
+    fn a_slot_keeps_its_gunner_out_of_its_own_blast() {
+        assert_eq!(slot_near(0.0, None), 1.0);
+        assert_eq!(slot_near(20.0, None), 20.0);
+        assert_eq!(slot_near(4.0, Some(8.0)), 9.0);
+    }
 
     #[test]
     fn it_reads_the_targets_motion_over_three_quarters_of_a_second() {

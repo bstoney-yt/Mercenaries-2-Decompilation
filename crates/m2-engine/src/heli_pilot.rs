@@ -145,6 +145,30 @@ pub enum Landing {
     Failed,
 }
 
+/// 0x822D40E0 and 0x822D3FC8: eight rays `reach` long from `at`, fanned
+/// 45 degrees either side of `way` about the up axis, evenly; each
+/// side's (the first four, then the last) mean share of its ray that is
+/// clear (1 for a ray that meets nothing, inferred: the 360 sums each
+/// query's fraction), less a half and doubled, kept above 0; the first
+/// side's less the second's, doubled. The pilot turns its heading by
+/// minus this x pi a second: toward the open side.
+fn fan_turn(at: Vec3, way: Vec3, reach: f32, world: &mut dyn PilotWorld) -> f32 {
+    let flat = way.with_y(0.0).normalize_or_zero();
+    let share = |i: usize, world: &mut dyn PilotWorld| {
+        let angle = -std::f32::consts::FRAC_PI_4 + i as f32 * std::f32::consts::FRAC_PI_2 / 7.0;
+        let to = at + Quat::from_rotation_y(angle) * flat * reach;
+        world
+            .ground(at, to)
+            .map_or(1.0, |hit| (hit.distance(at) / reach).min(1.0))
+    };
+    let mut side = [0.0f32; 2];
+    for i in 0..8 {
+        side[i / 4] += share(i, world) / 4.0;
+    }
+    let open = |s: f32| (s - 0.5).max(0.0) * 2.0;
+    (open(side[0]) - open(side[1])) * 2.0
+}
+
 /// What a pilot looks at in the world as it goes round things.
 pub trait PilotWorld {
     /// The first solid thing on the line from `from` to `to`: where.
@@ -675,9 +699,9 @@ impl HeliPilot {
     /// way marks it blocked for 1 s and tips its way up by (1 - the share
     /// of the sweep made) x 2 turns a second. It flies to the point as
     /// far along its way as the target is ([`fly_to`](Self::fly_to)).
-    /// Not ported: the turn away from what the fan of eight rays to
-    /// either side of its way finds (0x822D3FC8, 0x822D40E0), whose ray
-    /// results are not traced; it turns by none.
+    /// Blocked, it also turns toward the open side of its way by the fan
+    /// of eight rays ([`fan_turn`]). The 360 reads the fan cast the frame
+    /// before; here it is cast and read at once.
     #[allow(clippy::too_many_arguments)]
     pub fn fly_round_to(
         &mut self,
@@ -741,6 +765,8 @@ impl HeliPilot {
         let point = origin + way * gap;
         if made < 1.0 || self.blocked > 0.0 {
             self.steer_climb += (1.0 - made) * std::f32::consts::TAU * dt;
+            let reach = (made * sweep.max(0.0) * 2.0).max(20.0);
+            self.steer_heading -= fan_turn(self.at, way, reach, world) * std::f32::consts::PI * dt;
         }
         self.fly_to(point, haste, facing)
     }
@@ -1052,5 +1078,22 @@ mod tests {
         q.cross_in = 5.0;
         q.attack(&target, (3.0, 12.0), &mut Open, 0.5, 1.0 / 60.0);
         assert_eq!(q.attack_part, 0);
+    }
+
+    // The fan: rays toward +x stopped at once, -x open: it is to turn
+    // toward -x, its heading down.
+    #[test]
+    fn the_fan_turns_it_to_the_open_side() {
+        struct Side;
+        impl PilotWorld for Side {
+            fn ground(&mut self, from: Vec3, to: Vec3) -> Option<Vec3> {
+                (to.x > from.x + 1.0).then_some(from)
+            }
+            fn sweep(&mut self, _: Vec3, _: Quat, _: Vec3, _: Vec3, _: f32) -> f32 {
+                1.0
+            }
+        }
+        let t = fan_turn(Vec3::ZERO, Vec3::Z, 20.0, &mut Side);
+        assert!((t - 2.0).abs() < 1e-5, "{t}");
     }
 }

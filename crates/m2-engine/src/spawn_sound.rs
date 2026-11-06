@@ -89,6 +89,14 @@ pub const HORN_EVENT: u32 = 0xfc70_3e23;
 /// [`ENGINE_START_EVENT`] (0x82367800): a looping mixed cue whose tracks
 /// the vehicle's speed and load move ([`m2_assets::voice::Curve`]).
 pub const ENGINE_LOOP_EVENT: u32 = 0x8257_7648;
+/// The `Sounds` table event of an engine someone else drives, started in
+/// place of [`ENGINE_LOOP_EVENT`] (from the 360 code, 0x82367800, whose
+/// second argument tells the player's from others').
+pub const OTHERS_ENGINE_EVENT: u32 = 0xfbf9_a4b4;
+/// The `Sounds` table event started beside [`ENGINE_LOOP_EVENT`]
+/// (0x82367800): a looping mixed cue of tyres on the ground, whose tracks
+/// the surface picks ([`crate::surface::tyre_class`]).
+pub const TYRE_LOOP_EVENT: u32 = 0x514c_1ed1;
 pub const ENGINE_OFF_EVENT: u32 = 0xc8f1_7f2a;
 
 /// `SoundEffect`'s field naming its sound set.

@@ -2852,6 +2852,44 @@ impl Game {
         ))
     }
 
+    /// The nearest vehicles to `ear` someone else drives, as their engines
+    /// are heard ([`crate::sound::ENGINES_TRACKED`]).
+    pub fn others_engines(&self, ear: Vec3) -> Vec<crate::sound::HeardEngine> {
+        let Some(world) = self.scene.world.as_ref() else {
+            return Vec::new();
+        };
+        let driven = self.scene.player.as_ref().and_then(|p| p.driving);
+        let mut near: Vec<(f32, crate::sound::HeardEngine)> = self
+            .scene
+            .vehicles
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| driven != Some(*i) && v.exhausting(false))
+            .filter_map(|(i, v)| {
+                let set = *self.scene.engine_sets.get(&v.spec.model)?;
+                let id = v.id?;
+                let at = world.physics.vehicle_transform(id)?.w_axis.truncate();
+                (set != 0).then_some((
+                    at.distance(ear),
+                    crate::sound::HeardEngine {
+                        id: i,
+                        at,
+                        set,
+                        speed: world.physics.vehicle_speed(id),
+                        top: v.spec.tuning.max_speed.unwrap_or(if v.spec.tracked {
+                            14.0
+                        } else {
+                            32.0
+                        }),
+                    },
+                ))
+            })
+            .collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        near.truncate(crate::sound::ENGINES_TRACKED);
+        near.into_iter().map(|n| n.1).collect()
+    }
+
     /// The vehicle being driven's engine: its sound bank (the one its
     /// template names, else one for its kind), speed and throttle. A wreck
     /// has none.
@@ -2873,6 +2911,19 @@ impl Game {
             .as_ref()
             .and_then(|w| w.index.template_db.engine_set_for_model(v.spec.model))
             .unwrap_or(0);
+        let physics = self.scene.world.as_ref().map(|w| &w.physics);
+        let id = v.id;
+        let (mut revs, mut slide, mut surface, mut braking) = (None, 0.0, 0.0, false);
+        if let (Some(p), Some(id)) = (physics, id) {
+            // The top revs are its `GearMaxRPM` default of 8000 where the
+            // gearbox's own aren't to hand (360's divides by a record's).
+            revs = p.vehicle_gear(id).map(|(_, rpm)| (rpm / 8000.0).min(1.0));
+            braking = p.vehicle_braking(id);
+            if let Some(at) = p.vehicle_transform(id) {
+                slide = p.vehicle_velocity(id).dot(at.x_axis.truncate());
+                surface = m2_engine::surface::tyre_class(p.vehicle_ground(id, 5.0));
+            }
+        }
         Some(crate::sound::EngineInput {
             bank,
             set,
@@ -2885,6 +2936,10 @@ impl Game {
             throttle: self.throttle,
             horn: self.honking,
             heavy: heavy_horn(&v.spec.kind, &v.spec.label, v.spec.tracked),
+            revs,
+            slide,
+            surface,
+            braking,
         })
     }
 
@@ -4140,12 +4195,10 @@ fn state_effects(world: &World, combat: &mut Combat) {
     }
 }
 
-/// How near the player a vehicle's exhausts smoke (invented: a budget, the
-/// game's own reach for them is not traced).
-const EXHAUST_REACH: f32 = 120.0;
-
 /// Keeps each crewed vehicle's exhaust effects going at their nodes
-/// (`m2_engine::vehicle_parts`; the heat haze is drawn with the vehicle).
+/// (`m2_engine::vehicle_parts`; the heat haze is drawn with the vehicle),
+/// however far off: from the 360 code, 0x822772B0 and 0x822766F0 look at
+/// no distance.
 fn exhaust_smoke(
     world: &World,
     vehicles: &[ParkedVehicle],
@@ -4156,7 +4209,6 @@ fn exhaust_smoke(
     let Some(player) = player else {
         return;
     };
-    let near = player.character.position;
     for (i, v) in vehicles.iter().enumerate() {
         if !v.exhausting(player.driving == Some(i)) {
             continue;
@@ -4168,9 +4220,6 @@ fn exhaust_smoke(
         let Some(at) = v.id.and_then(|id| world.physics.vehicle_transform(id)) else {
             continue;
         };
-        if at.w_axis.truncate().distance(near) > EXHAUST_REACH {
-            continue;
-        }
         for (k, &(node, effect)) in parts.iter().enumerate() {
             let Some(rest) = v.spec.rest.get(node) else {
                 continue;
@@ -4310,6 +4359,53 @@ fn restore(physics: &mut Physics, vehicles: &mut [ParkedVehicle], saved: &mut Ve
         if v.wrecked {
             physics.wreck_vehicle(id);
         }
+    }
+}
+
+impl Game {
+    /// What her binoculars' reticle is on: the nearest vehicle or person
+    /// along it, not behind the ground or a building
+    /// ([`crate::binoculars`]).
+    pub fn binocular_focus(&self) -> Option<crate::binoculars::Focus> {
+        use crate::binoculars::{Focus, along_ray, faction_texture, marker_texture};
+        let world = self.scene.world.as_ref()?;
+        let db = &world.index.template_db;
+        let camera = self.walking()?.view(60.0, 16.0 / 9.0).view.inverse();
+        let (eye, ahead) = (
+            camera.w_axis.truncate(),
+            -camera.z_axis.truncate().normalize_or_zero(),
+        );
+        let of_template = |id: Option<u32>| {
+            let id = id?;
+            let texture = db.faction_markers.get(&id).copied();
+            Some(Focus {
+                texture: texture.and_then(marker_texture),
+                name: db.localized.get(&id).copied(),
+            })
+        };
+        let vehicles = self.scene.vehicles.iter().filter_map(|v| {
+            let m = world.physics.vehicle_transform(v.id?)?;
+            let (lo, hi) = v.spec.bounds;
+            let t = along_ray(eye, ahead, m.transform_point3((lo + hi) * 0.5))?;
+            let names = db.names_for(&v.spec.label, v.spec.model);
+            let id = names.first().and_then(|n| db.id(n));
+            Some((t, of_template(id)?))
+        });
+        let people = self.scene.people.npcs.iter().filter_map(|n| {
+            let t = along_ray(eye, ahead, n.character.position + Vec3::Y)?;
+            let kind = self.scene.people.kinds.get(n.kind)?;
+            let own = kind.named.then(|| db.id(&kind.role)).flatten();
+            let focus = of_template(own).unwrap_or(Focus {
+                texture: n.faction.and_then(faction_texture),
+                name: None,
+            });
+            Some((t, focus))
+        });
+        let (t, focus) = vehicles.chain(people).min_by(|a, b| a.0.total_cmp(&b.0))?;
+        // Behind something, more than its own body's length before it:
+        // nothing's shown.
+        let hit = world.physics.cast_ray(eye, ahead, t);
+        hit.is_none_or(|(d, _)| d + 6.0 >= t).then_some(focus)
     }
 }
 

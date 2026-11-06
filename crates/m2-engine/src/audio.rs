@@ -469,7 +469,9 @@ impl Mixer {
             levels: [Glide::ONE; Category::ALL],
             pitches: [Glide::ONE; Category::ALL],
             volumes: [1.0; Category::ALL],
-            max_voices: 64,
+            // The 360 sound system's pool of playing sounds (0x8236A528;
+            // that it is what limits voices is inferred).
+            max_voices: 256,
             reverb: None,
             send: Vec::new(),
             holding: [false; Category::ALL],
@@ -889,6 +891,14 @@ pub fn world_cue_tables<R: Read + Seek>(source: &mut AssetSource<R>) -> Vec<CueT
 pub const PARAM_SPEED: u32 = 0x15ba_509e;
 pub const PARAM_LOAD: u32 = 0xe092_4df9;
 pub const PARAM_REVERSE: u32 = 0xa09a_4dfd;
+/// The engine's revs over its top revs (the same controller's
+/// rpm / maximum, from the gearbox it simulates at 0x82368080).
+pub const PARAM_REVS: u32 = 0x8834_a6b4;
+/// Sideways speed times 2.5 over the top speed, the brake, and the
+/// surface's class ([`crate::surface::tyre_class`]).
+pub const PARAM_SLIDE: u32 = 0x79a9_e4cc;
+pub const PARAM_BRAKE: u32 = 0xa922_b8ee;
+pub const PARAM_SURFACE: u32 = 0xb2ba_fff9;
 
 /// A looping mixed cue played track by track, each moved by its curves
 /// (an engine: idle, low and high loops crossfaded as the data says).
@@ -903,6 +913,8 @@ pub struct EngineTrack {
     pub sound: SoundBuffer,
     /// Its record's level.
     pub volume: f32,
+    /// How far it carries, as its record says.
+    pub falloff: Option<Falloff>,
     pub curves: Vec<m2_assets::voice::Curve>,
 }
 
@@ -934,10 +946,19 @@ impl EngineCue {
             tracks.push(EngineTrack {
                 sound,
                 volume: volume * t.level,
+                falloff: Falloff::of_record(record.min_distance, record.max_distance),
                 curves: curves.clone(),
             });
         }
         (!tracks.is_empty()).then_some(Self { tracks })
+    }
+
+    /// How far it carries: its farthest track's record's distance.
+    pub fn reach(&self) -> f32 {
+        self.tracks
+            .iter()
+            .map(|t| t.falloff.unwrap_or_default().far)
+            .fold(0.0, f32::max)
     }
 
     /// Each track's gain and pitch with the parameters at `params` (hash,
@@ -1742,6 +1763,7 @@ mod tests {
                 EngineTrack {
                     sound: sound.clone(),
                     volume: 1.0,
+                    falloff: None,
                     curves: vec![Curve {
                         kind: CURVE_VOLUME,
                         param: PARAM_SPEED,
@@ -1751,6 +1773,7 @@ mod tests {
                 EngineTrack {
                     sound,
                     volume: 0.5,
+                    falloff: None,
                     curves: vec![
                         Curve {
                             kind: CURVE_PITCH,
@@ -1778,6 +1801,20 @@ mod tests {
         // Semitones add: speed up an octave, load down one.
         let coasting = c.mix(&[(PARAM_SPEED, 1.0), (PARAM_LOAD, 0.0)]);
         assert_eq!(coasting[1], (0.5, 1.0));
+    }
+
+    #[test]
+    fn an_engine_cue_reaches_as_far_as_its_farthest_track() {
+        let mut c = engine_cue();
+        c.tracks[0].falloff = Some(Falloff {
+            near: 35.0,
+            far: 75.0,
+        });
+        c.tracks[1].falloff = Some(Falloff {
+            near: 10.0,
+            far: 80.0,
+        });
+        assert_eq!(c.reach(), 80.0);
     }
 
     #[test]
