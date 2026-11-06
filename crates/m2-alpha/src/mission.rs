@@ -5964,6 +5964,14 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             return false;
         }
         Command::Cinematic(on) => {
+            if game.cinematic != *on {
+                game.cinematic = *on;
+                eprintln!(
+                    "mission: cinematic mode {}: her controls are {}",
+                    if *on { "on" } else { "off" },
+                    if *on { "the scene's" } else { "hers again" }
+                );
+            }
             if !on && game.shot.take().is_some() {
                 eprintln!("mission: the scene ends; the camera is hers again");
             }
