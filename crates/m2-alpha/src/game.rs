@@ -164,6 +164,8 @@ pub struct Game {
     props_up: bool,
     /// The driver's throttle last tick, -1 (reverse) to 1.
     pub throttle: f32,
+    /// What stops her vehicle dead, for the log ([`crate::halt`]).
+    halts: crate::halt::Halts,
     /// Seconds to the next puffs of spray off boats going fast.
     spray_wait: f32,
     /// The light of the atmosphere region the player is in.
@@ -452,6 +454,7 @@ impl Game {
             arrival: None,
             props_up: false,
             throttle: 0.0,
+            halts: crate::halt::Halts::default(),
             spray_wait: 0.0,
             sky: AtmosphereMix::default(),
             script_lights: Vec::new(),
@@ -1461,10 +1464,21 @@ impl Game {
                 match id.and_then(|(id, v)| Some((physics.vehicle_transform(id)?, v, id))) {
                     Some((at, v, id)) => {
                         let speed = physics.vehicle_speed(id);
+                        if let Some(i) = player.driving {
+                            self.halts.watch(
+                                physics,
+                                (id, i),
+                                &scene.vehicles,
+                                speed,
+                                self.throttle,
+                                dt,
+                            );
+                        }
                         player.chase(at, ChaseRig::of(&v.spec), intent.look, speed, dt);
                         player.keep_chase_clear(physics, Some(id));
                     }
                     None => {
+                        self.halts.clear();
                         player.driving = None;
                         player.chase_target = None;
                         // At an emplaced gun she stands behind it and only
@@ -1552,6 +1566,7 @@ impl Game {
                     }
                 }
             } else {
+                self.halts.clear();
                 physics.step(dt);
             }
         }

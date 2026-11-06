@@ -63,6 +63,7 @@ mod game;
 mod gamehud;
 mod grapple;
 mod gunships;
+mod halt;
 mod held;
 mod hero;
 mod hijack;
