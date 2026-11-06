@@ -525,6 +525,12 @@ pub enum Gait {
     Walk,
     Run,
     Sprint,
+    /// Faster than [`Sprint`](Self::Sprint): the 360's sprint
+    /// (`Upright_Sprint_Forward`, handle `5cc77d41`), where the alpha's
+    /// own run and sprint play the 360's jog and run. Its clip comes from
+    /// the on-foot table where a character has one; otherwise it is the
+    /// sprint's ([`Locomotion::choose`]).
+    FullSprint,
 }
 
 impl Gait {
@@ -535,7 +541,7 @@ impl Gait {
             Self::Idle => (0.0, 0.0),
             Self::Walk => (0.9, 1.9),
             Self::Run => (4.5, 5.6),
-            Self::Sprint => (5.6, 7.5),
+            Self::Sprint | Self::FullSprint => (5.6, 7.5),
         }
     }
 }
@@ -599,6 +605,9 @@ impl Locomotion {
             })?;
             chosen.insert(gait, i);
         }
+        // The 360's sprint plays the sprint's clip until a character's own
+        // is put in (the on-foot table's, by handle).
+        chosen.insert(Gait::FullSprint, chosen[&Gait::Sprint]);
         // Idle: of the clips that stay put and hold the pelvis at standing
         // height, the one whose first frame looks most like the walk's
         // (many still clips are sitting, lying or scripted poses).

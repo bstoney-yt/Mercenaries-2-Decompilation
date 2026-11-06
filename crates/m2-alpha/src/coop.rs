@@ -362,7 +362,7 @@ pub fn offscreen(
         let intent = match walk {
             Some(g) if g != m2_engine::Gait::Idle && coop.peer.is_some() => crate::player::Intent {
                 movement: m2_math::glam::Vec2::Y,
-                sprint: g == m2_engine::Gait::Sprint,
+                sprint: matches!(g, m2_engine::Gait::Sprint | m2_engine::Gait::FullSprint),
                 walk: g == m2_engine::Gait::Walk,
                 ..Default::default()
             },
