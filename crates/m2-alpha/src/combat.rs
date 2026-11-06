@@ -4263,7 +4263,9 @@ impl Combat {
                             clear - 2.5,
                             v.id.expect("it has a body"),
                         );
-                        if in_slot || hit.is_none() {
+                        // A gun fires only along a clear line (inferred: a soldier's
+                        // fight keeps him from firing blind; a crew has no such step).
+                        if hit.is_none() {
                             let score = m2_engine::ai_target::score(d, current, in_slot);
                             best.offer(who, score);
                             if best.who == Some(who) {
