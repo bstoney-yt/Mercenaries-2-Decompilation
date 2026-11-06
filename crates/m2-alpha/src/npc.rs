@@ -3298,6 +3298,28 @@ impl People {
                 .is_some_and(|(_, r)| m2_engine::ai_target::attacks(*r))
     }
 
+    /// Those army `side` is at war with near `at`: people and vehicles,
+    /// each with their number, where they are and their `Visibility`.
+    pub fn foes_of(&self, side: &str, at: Vec3) -> Vec<(u32, Vec3, f32)> {
+        let mut foes: Vec<(u32, Vec3, f32)> = self
+            .npcs
+            .iter()
+            .filter(|n| n.alive && n.landed)
+            .filter(|n| n.faction.is_some_and(|f| self.at_war(side, f)))
+            .map(|n| (n.shooter, n.chest(), n.ai.visibility))
+            .chain(
+                self.vehicle_subjects
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| self.at_war(side, v.faction))
+                    .map(|(i, v)| (VEHICLES + i as u32, v.at, v.visibility)),
+            )
+            .collect();
+        foes.sort_by(|a, b| a.1.distance(at).total_cmp(&b.1.distance(at)));
+        foes.truncate(FOE_LOOKS);
+        foes
+    }
+
     /// Whether persons `i` and `j` are of armies at war.
     pub fn enemies(&self, i: usize, j: usize) -> bool {
         match (self.npcs[i].faction, self.npcs[j].faction) {

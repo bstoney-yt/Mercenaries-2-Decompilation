@@ -391,6 +391,22 @@ pub fn armed_seats(v: &ParkedVehicle) -> Vec<u32> {
     seats
 }
 
+/// How often an army's vehicle's gun looks for a target, seconds (as a
+/// soldier does, `npc::LOOK_EVERY`; inferred).
+const CREW_LOOK: f32 = 0.2;
+
+/// An armed seat of an army's vehicle: see [`Combat::crews_fire`].
+#[derive(Debug, Default)]
+struct CrewGun {
+    slot: m2_engine::ai_target::Slot,
+    /// Where the one in its slot is.
+    at: Option<Vec3>,
+    look: f32,
+    wait: f32,
+    burst: u32,
+    clip: m2_engine::weapons::AiClip,
+}
+
 /// Seconds a clip takes to change when she has no reload clip to play
 /// (invented); with one, the change lasts as long as it (playtest 8: the
 /// rifle's `ReloadIdle` 49288f7f, 1.0 s; inferred, as no gun template
@@ -1750,6 +1766,11 @@ pub struct Combat {
     ripple: usize,
     /// Seconds until each gunner riding with her fires again
     /// ([`Combat::gunners_fire`]).
+    /// The armies' vehicles' armed seats ([`crews_fire`](Self::crews_fire)),
+    /// by vehicle and seat.
+    crews: std::collections::HashMap<(usize, usize), CrewGun>,
+    /// A crew's gun, not hers, is firing.
+    crew_firing: bool,
     gunner_wait: Vec<f32>,
     /// Rounds left in each such gunner's burst.
     gunner_burst: Vec<u32>,
@@ -2009,6 +2030,8 @@ impl Default for Combat {
             seat: 0,
             vehicle_gun: 0,
             ripple: 0,
+            crews: std::collections::HashMap::new(),
+            crew_firing: false,
             gunner_wait: Vec::new(),
             gunner_burst: Vec::new(),
             gunner_clips: Vec::new(),
@@ -3018,6 +3041,7 @@ impl Combat {
         }
         if self.down <= 0.0 {
             self.gunners_fire(f, dt);
+            self.crews_fire(f, dt);
             self.pilots_fire(f, dt);
         }
         // Fire fires the gun chosen with the switch: the main gun, or the
@@ -4036,7 +4060,7 @@ impl Combat {
                     blast: ammo.burst(),
                     homing: None,
                     key: ammo.key,
-                    army: false,
+                    army: self.crew_firing,
                 });
                 self.effect(
                     Effect::Flash {
@@ -4172,6 +4196,135 @@ impl Combat {
                 self.gunner_wait[k] = wait;
                 self.gunner_burst[k] = burst;
                 self.gunner_rounds += 1;
+            }
+        }
+    }
+
+    /// The armies' crewed vehicles go for those at war with their army,
+    /// as a soldier does ([`m2_engine::ai_target`]): each armed seat's
+    /// mind offers its slot whom it can see within its weapon's range,
+    /// lays the gun on the one it settles on, and fires by its hint's
+    /// bursts, as her gunners do ([`gunners_fire`](Self::gunners_fire)).
+    /// `Vision` 1.25 is vehicles' (from samples); that they leave her to
+    /// the pursuit's vehicles is the alpha's, for now.
+    fn crews_fire(&mut self, f: &mut Field<'_>, dt: f32) {
+        const VISION: f32 = 1.25;
+        let driven = f.player.driving;
+        for i in 0..f.vehicles.len() {
+            let v = &f.vehicles[i];
+            let Some(side) = v.army() else { continue };
+            if v.wrecked || Some(i) == driven || v.spec.armed.is_empty() {
+                continue;
+            }
+            let Some(body) = v.id.and_then(|id| f.physics.vehicle_transform(id)) else {
+                continue;
+            };
+            let centre = body.transform_point3(Vec3::Y);
+            let seats = armed_seats(v);
+            for seat in 0..seats.len() {
+                let v = &f.vehicles[i];
+                let Some(m) = v
+                    .spec
+                    .armed
+                    .iter()
+                    .find(|m| m.seat == seats[seat] && m.priority == 0)
+                else {
+                    continue;
+                };
+                let hint = m.weapon.hint;
+                let (near, far) = hint.map_or((0.0, GUNNER_RANGE), |h| (h.min_range, h.range));
+                let cone = m.weapon.feel.cone(0.0);
+                let gap = m.weapon.gap();
+                let size = m2_engine::weapons::AiClip::size(m);
+                let aim_ai = m.weapon.aim_ai;
+                let aimer = v.spec.aimer_of_seat(seats[seat]);
+                let gun = self.crews.entry((i, seat)).or_default();
+                gun.wait -= dt;
+                gun.clip.tick(dt);
+                gun.look -= dt;
+                if gun.look <= 0.0 {
+                    gun.look = CREW_LOOK;
+                    let current = gun.at.map(|a| a.distance(centre));
+                    gun.at = None;
+                    let mut best = gun.slot;
+                    let seen = f.people.foes_of(side, centre);
+                    for (who, at, visibility) in seen {
+                        let d = at.distance(centre);
+                        let in_slot = best.who == Some(who);
+                        let reach = VISION * visibility * if in_slot { 1.5 } else { 1.0 };
+                        if !(near..=far).contains(&d) || d > reach {
+                            continue;
+                        }
+                        let to = at - centre;
+                        let clear = (d - 2.5).max(0.5);
+                        let hit = f.physics.cast_ray_past(
+                            centre + to.normalize_or(Vec3::Z) * 2.5,
+                            to.normalize_or(Vec3::Z),
+                            clear - 2.5,
+                            v.id.expect("it has a body"),
+                        );
+                        if in_slot || hit.is_none() {
+                            let score = m2_engine::ai_target::score(d, current, in_slot);
+                            best.offer(who, score);
+                            if best.who == Some(who) {
+                                gun.at = Some(at);
+                            }
+                        }
+                    }
+                    if gun.slot.who != best.who
+                        && let Some(at) = gun.at
+                    {
+                        eprintln!(
+                            "war: a {side} {} goes for {:?} at {:.0} m",
+                            v.spec.label,
+                            best.who,
+                            at.distance(centre)
+                        );
+                    }
+                    gun.slot = if gun.at.is_some() {
+                        best
+                    } else {
+                        Default::default()
+                    };
+                }
+                let Some(at) = gun.at else { continue };
+                let (wait, left, empty) = (gun.wait, gun.burst, gun.clip.gunner_empty(size));
+                let v = &mut f.vehicles[i];
+                let laid = match aimer {
+                    Some(a) => {
+                        v.aims.resize(v.spec.aimers.len(), (0.0, 0.0));
+                        let want = v.spec.aim_toward(a, body, v.turret, at);
+                        let now = v.spec.aimers[a].step(v.aims[a], want, dt);
+                        v.aims[a] = now;
+                        let margin = m2_engine::weapons::ai_turret_margin(aim_ai);
+                        v.spec.aimers[a].record.reaches(want, margin)
+                    }
+                    None => {
+                        let nose = body.transform_vector3(Vec3::Z).normalize_or(Vec3::Z);
+                        (at - centre).normalize_or(nose).dot(nose)
+                            > m2_engine::weapons::ai_aim_cosine(aim_ai)
+                    }
+                };
+                if !laid || wait > 0.0 || !empty {
+                    continue;
+                }
+                let to = at - centre;
+                let (a, b) = (self.random(), self.random());
+                let dir = m2_engine::weapons::stray_in_cone(to.normalize_or(Vec3::Z), cone, a, b);
+                let close = to.length() < m2_engine::weapons::FireHint::CLOSE;
+                self.crew_firing = true;
+                let fired = self
+                    .fire_mount(f, i, seat, 0, Some(centre + dir * to.length()))
+                    .is_some();
+                self.crew_firing = false;
+                if fired {
+                    f.people.war_tally.0 += 1;
+                    let gun = self.crews.entry((i, seat)).or_default();
+                    gun.clip.shot(size);
+                    let (wait, burst) = gunner_burst(hint, gap, close, left);
+                    gun.wait = wait;
+                    gun.burst = burst;
+                }
             }
         }
     }
@@ -4359,7 +4512,7 @@ impl Combat {
                 blast,
                 homing: None,
                 key,
-                army: false,
+                army: self.crew_firing,
             });
             if let Some(v) = f.vehicles.get_mut(i) {
                 v.fired += 1;
@@ -5402,6 +5555,12 @@ impl Combat {
         push: Vec3,
     ) -> bool {
         let taken = damage * hero * self.on_person(&people.npcs[j], key);
+        if self.crew_firing {
+            let killed = people.npcs[j].shot_by_army(taken, push, 0);
+            people.war_tally.1 += 1;
+            people.war_tally.2 += u32::from(killed);
+            return false;
+        }
         let n = &mut people.npcs[j];
         let counts = n.alive && n.soldier;
         let killed = n.hurt(taken, push) && n.soldier;

@@ -1909,9 +1909,7 @@ impl Game {
             .enumerate()
             .filter(|(i, v)| !v.wrecked && Some(*i) != driven)
             .filter_map(|(_, v)| {
-                let faction = v.crew.iter().find_map(|(a, b)| {
-                    crate::npc::faction_of(a).or_else(|| crate::npc::faction_of(b))
-                })?;
+                let faction = v.army()?;
                 let at = physics?.vehicle_transform(v.id?)?;
                 Some(crate::npc::VehicleSubject {
                     faction,
