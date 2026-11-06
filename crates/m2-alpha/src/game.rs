@@ -1886,6 +1886,14 @@ impl Game {
             .player
             .as_ref()
             .and_then(|p| self.combat.target(p, self.on_foot));
+        // What she is in, for soldiers to see her by.
+        self.scene.people.her_visibility = self
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| self.scene.vehicles.get(i))
+            .and_then(|v| v.spec.tuning.visibility);
         // What she is in, for soldiers whose guns are no use against it.
         self.scene.people.target_armour = self
             .scene

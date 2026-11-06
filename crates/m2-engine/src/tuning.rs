@@ -31,6 +31,9 @@ pub struct VehicleTuning {
     /// Its armour class (`ObjectHint`'s `Armor`): 1 none (cars, boats),
     /// 2 light (helicopters), 3 medium (the LAV III), 4 heavy (tanks).
     pub armour: Option<u32>,
+    /// `Stimulus` `Visibility`: from how far it can be seen, metres
+    /// (0x822E89B0; `M151 .50Cal (VZ) (Full)` 200).
+    pub visibility: Option<f32>,
     /// How hard blasts throw it, of their usual (`ExplosionFudge`'s field
     /// 6bcc541e: the AMX-30's 0.2, a truck's 0.4, a boat's 1.1).
     pub blast_scale: Option<f32>,
@@ -1734,6 +1737,7 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
     let links = Table::new(db, "PhysicalLink");
     let health = Table::new(db, "Health");
     let hint = Table::new(db, "ObjectHint");
+    let stimulus = Table::new(db, "Stimulus");
     let fudge = Table::new(db, "ExplosionFudge");
     let tick = Table::new(db, "TickDamage");
     let modifier = Table::new(db, "ModifierKey");
@@ -1778,6 +1782,7 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                     .and_then(|r| hint.word(r, name_hash("Armor")))
                     .map(|a| a & 0xff)
                     .filter(|a| (1..=4).contains(a)),
+                visibility: stimulus.get(id, "Visibility"),
                 blast_scale: fudge.number(id, BLAST_SCALE),
                 burns_below: tick.number(id, BURNS_BELOW),
                 // The whole vehicle's key: its record with no `Name` (the
