@@ -1898,6 +1898,30 @@ impl Game {
             .and_then(|i| self.scene.vehicles.get(i))
             .and_then(|v| v.spec.tuning.armour)
             .unwrap_or(1);
+        // The armies' vehicles, for those at war with them. A vehicle's
+        // side is its crew's; an empty one is nobody's.
+        let driven = self.scene.player.as_ref().and_then(|p| p.driving);
+        let physics = self.scene.world.as_ref().map(|w| &w.physics);
+        let subjects: Vec<_> = self
+            .scene
+            .vehicles
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| !v.wrecked && Some(*i) != driven)
+            .filter_map(|(_, v)| {
+                let faction = v.crew.iter().find_map(|(a, b)| {
+                    crate::npc::faction_of(a).or_else(|| crate::npc::faction_of(b))
+                })?;
+                let at = physics?.vehicle_transform(v.id?)?;
+                Some(crate::npc::VehicleSubject {
+                    faction,
+                    at: at.transform_point3(Vec3::Y),
+                    visibility: v.spec.tuning.visibility.unwrap_or(200.0),
+                    armour: v.spec.tuning.armour.unwrap_or(1),
+                })
+            })
+            .collect();
+        self.scene.people.vehicle_subjects = subjects;
         if let Some(world) = &mut self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {

@@ -56,6 +56,22 @@ use crate::scene::{Carry, Rig};
 /// nearest first (invented: the frame rate's limit; the 360 queues its
 /// sight lines and runs at most 0x800 a frame, 0x822E8DF8).
 const FOE_LOOKS: usize = 4;
+/// A vehicle of an army, as those at war with it see it.
+#[derive(Clone, Copy, Debug)]
+pub struct VehicleSubject {
+    /// Its army ([`faction_of`], by its crew).
+    pub faction: &'static str,
+    /// Where it is.
+    pub at: Vec3,
+    /// Its `Stimulus` `Visibility`, metres.
+    pub visibility: f32,
+    /// Its armour class ([`Npc::target_armour`]).
+    pub armour: u32,
+}
+
+/// The first number in a mind's attack slot of a vehicle, the rest going
+/// by [`People::vehicle_subjects`]'s order.
+const VEHICLES: u32 = 0x4000_0000;
 /// The player's number in a mind's attack slot
 /// ([`m2_engine::ai_target::Slot`]); the rest go by their
 /// [`Npc::shooter`] number.
@@ -897,6 +913,8 @@ pub struct Npc {
     pub slot: m2_engine::ai_target::Slot,
     /// Where the person in their slot now is, unless that's her.
     pub foe_at: Option<Vec3>,
+    /// The armour class of the vehicle they go for, if it is one.
+    foe_armour: Option<u32>,
     /// Until they next look for a target, seconds.
     foe_look: f32,
     /// From how far they can see the one they look at, unless that's
@@ -1179,6 +1197,7 @@ impl Npc {
             faction: None,
             slot: m2_engine::ai_target::Slot::default(),
             foe_at: None,
+            foe_armour: None,
             foe_look: 0.0,
             foe_reach: None,
             shot_by: None,
@@ -2363,6 +2382,7 @@ impl Npc {
                     self.slot.clear();
                     self.foe_at = None;
                     self.foe_reach = None;
+                    self.foe_armour = None;
                     self.calm();
                 }
             }
@@ -2647,6 +2667,9 @@ pub struct People {
     pub hostile: Option<HashSet<&'static str>>,
     /// How the factions regard each other ([`People::set_relations`]).
     relations: HashMap<(&'static str, &'static str), f32>,
+    /// The armies' vehicles about, for those at war with them to see;
+    /// their order may change, so a soldier's hold on one lasts a look.
+    pub vehicle_subjects: Vec<VehicleSubject>,
     /// As the templates have it.
     authored: HashMap<(&'static str, &'static str), f32>,
     /// Rounds between the armies since the start: fired, hit, killed.
@@ -3296,6 +3319,12 @@ impl People {
             .iter()
             .filter(|n| n.alive && n.landed)
             .filter_map(|n| Some((n.shooter, n.faction?, n.chest(), n.ai.visibility)))
+            .chain(
+                self.vehicle_subjects
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (VEHICLES + i as u32, v.faction, v.at, v.visibility)),
+            )
             .collect();
         for i in 0..self.npcs.len() {
             if !self.npcs[i].can_war() {
@@ -3371,6 +3400,10 @@ impl People {
                 Some(w) => {
                     let c = all.iter().find(|c| c.0 == w);
                     n.foe_at = c.map(|c| c.2);
+                    n.foe_armour = (w >= VEHICLES && w != HER)
+                        .then(|| self.vehicle_subjects.get((w - VEHICLES) as usize))
+                        .flatten()
+                        .map(|v| v.armour);
                     n.foe_reach = c.map(|c| vision * c.3 * 1.5);
                     if !n.alert {
                         n.alert = true;
@@ -3385,6 +3418,7 @@ impl People {
                 None => {
                     n.foe_at = None;
                     n.foe_reach = None;
+                    n.foe_armour = None;
                 }
             }
         }
@@ -3715,7 +3749,7 @@ impl People {
         let mut callouts = Vec::new();
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
-            npc.target_armour = self.target_armour.max(1);
+            npc.target_armour = npc.foe_armour.unwrap_or(self.target_armour).max(1);
             npc.swim_speed = self
                 .kinds
                 .get(npc.kind)
@@ -5435,6 +5469,33 @@ pub(crate) mod tests {
         assert!(!people.npcs[1].killed_by_her && !people.npcs[1].hurt_by_her);
         people.war(&physics, None, dt);
         assert_eq!(foe(&people, 0), None);
+    }
+
+    #[test]
+    fn soldiers_see_an_armys_vehicle_from_as_far_as_its_visibility() {
+        let physics = ground();
+        let mut people = People::default();
+        let post = Brain::Post { facing: 0.0 };
+        let mut n = Npc::new(0, &rig(), Vec3::Y, 0.0, post, Some(1));
+        n.faction = Some("Vza");
+        n.gun = Some(rifle());
+        n.landed = true;
+        n.soldier = false;
+        people.npcs.push(n);
+        people.set_relations([(("Vza", "All"), -80.0)].into_iter().collect());
+        let truck = |z: f32, visibility: f32| VehicleSubject {
+            faction: "All",
+            at: Vec3::new(0.0, 1.0, z),
+            visibility,
+            armour: 2,
+        };
+        people.vehicle_subjects = vec![truck(150.0, 100.0)];
+        people.war(&physics, None, 0.25);
+        assert_eq!(people.npcs[0].foe_at, None, "out of its reach");
+        people.vehicle_subjects = vec![truck(150.0, 200.0)];
+        people.war(&physics, None, 0.25);
+        assert!(people.npcs[0].foe_at.is_some());
+        assert_eq!(people.npcs[0].foe_armour, Some(2));
     }
 
     #[test]
