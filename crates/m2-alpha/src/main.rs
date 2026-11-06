@@ -8843,6 +8843,7 @@ impl Running {
         // The mission's callbacks the game's HUD called (the contract
         // fanfare closing), back to the mission's scripts.
         if let (Some(g), Some(m)) = (&mut self.hud.game, &mut self.mission) {
+            m.hud_calls_taken(g.last_call());
             for seq in g.take_callbacks() {
                 m.hud_callback(seq);
             }
