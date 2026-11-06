@@ -20,15 +20,19 @@
 //!
 //! - A driver with a gun of his own, or the driver of a car labelled
 //!   `Apc` with a crew (its gunners here), runs `CarAttack` instead
-//!   ([`m2_engine::car_attack`], 0x822ACB28); the crew's range is the
-//!   middle of their guns' `MinFireRange` and `FireRange` (inferred, see
-//!   there), her line checked by a ray (0x82166958 sweeps a box).
+//!   ([`m2_engine::car_attack`], 0x822ACB28), moving and turning by what
+//!   each gunner's fire control reports
+//!   ([`m2_engine::gunner_aim::Report`]), her line checked by a ray
+//!   (0x82166958 sweeps a box). A gunner too far, too near or unable to
+//!   bear does not fire (0x822C95D8 ends short of it).
 //!
 //! - Tanks come from ahead (0x8223A410 -> 0x8223A0A8) while she is in a
 //!   tank or driving, each run by `TankAttack`
 //!   ([`m2_engine::tank_attack`], 0x822B6508), firing its own gun.
 //!
-//! Not yet: boats and men are not sent. Inferred: the gunners aim at her where she is (0x822C95D8's lead
+//! Not yet: boats and men are not sent. Inferred: how long a gunner has
+//! gone without seeing her is the time since his sight lines were last
+//! clear (the 360 keeps it in her record, +0x8C). Inferred: the gunners aim at her where she is (0x822C95D8's lead
 //! and line-of-fire checks are not ported); the 360 thinks at its own
 //! rate (not traced), the alpha every step. Invented: once the pursuit is
 //! over a car stops (0x822AA568) and is taken out of play past
@@ -37,12 +41,13 @@
 use std::collections::HashSet;
 
 use m2_engine::Physics;
-use m2_engine::car_attack::{self, AttackWorld, CarAttack, Sight};
+use m2_engine::car_attack::{self, AttackWorld, CarAttack, Rider, Sight};
 use m2_engine::car_driver::{self, CarDriver, CarInputs, CarState, Quarry};
+use m2_engine::gunner_aim::{self, Report};
 use m2_engine::path_search::{self, PathWorld};
 use m2_engine::road_ring::{self, Arrival, Flood, RoadNet};
 use m2_engine::tank_attack::{Hull, TankAttack};
-use m2_math::glam::{Quat, Vec3};
+use m2_math::glam::{Mat4, Quat, Vec3};
 
 use crate::gunships::Shot;
 use crate::reinforce::Standing;
@@ -240,9 +245,14 @@ struct Pursuer {
     tank: TankAttack,
     /// Its driver's way (0x822BF7A8's path), with its goal.
     route: Option<(Vec3, Option<path_search::Way>)>,
-    /// Seconds to its next look at her, and whether it saw her.
+    /// Seconds to its next look at her, whether it saw her, and seconds
+    /// since it last did.
     sight_wait: f32,
     sees: bool,
+    unseen: f32,
+    /// What each armed seat's fire control last reported
+    /// ([`m2_engine::gunner_aim::Report`]), by [`armed_seats`](crate::combat::armed_seats).
+    reports: Vec<Report>,
     leaving: bool,
 }
 
@@ -373,6 +383,8 @@ impl Pursuers {
             route: None,
             sight_wait: 0.0,
             sees: false,
+            unseen: 0.0,
+            reports: Vec::new(),
             leaving: false,
         });
         self.gate[kind.gate()] = GATE;
@@ -561,22 +573,10 @@ impl Pursuers {
                 let input = if p.leaving {
                     car_driver::slow_to_stop(&car).unwrap_or_default()
                 } else if p.attacks {
-                    // The crew's range: the middle of their guns' two
-                    // distances (0x822ACB28's mean of 0x822ECE70's +0x20 and
-                    // +0x24), of those with a fire hint.
-                    let crew_guns: Vec<(f32, f32)> = crate::combat::armed_seats(v)
-                        .iter()
-                        .skip(1)
-                        .filter_map(|&s| v.spec.armed.iter().find(|m| m.seat == s))
-                        .filter_map(|m| m.weapon.hint.map(|h| (h.min_range, h.range)))
-                        .collect();
-                    let crew = (!crew_guns.is_empty()).then(|| {
-                        let n = crew_guns.len() as f32;
-                        let (lo, hi) = crew_guns
-                            .iter()
-                            .fold((0.0, 0.0), |(a, b), &(l, h)| (a + l, b + h));
-                        (lo / n + hi / n) * 0.5
-                    });
+                    // The crew as 0x822ECE70 lists them: the riders of the
+                    // seats with a gun, each with his fire control's last
+                    // report and his weapon slot's distances.
+                    let crew = rider_list(v, &p.reports, car.at, car.forward);
                     let (lo, hi) = v.spec.bounds;
                     let sight = Sight {
                         at: her,
@@ -606,7 +606,7 @@ impl Pursuers {
                         &mut p.driver,
                         &car,
                         hi.z - lo.z,
-                        crew,
+                        &crew,
                         &sight,
                         &mut world,
                         dt,
@@ -636,12 +636,13 @@ impl Pursuers {
                 p.held.take(&input, forward);
                 if log {
                     eprintln!(
-                        "pursuers: {} {:#x} {:.0} m from her at {:.1} m/s, touching {}{}",
+                        "pursuers: {} {:#x} {:.0} m from her at {:.1} m/s, touching {}, reports {:?}{}",
                         p.template,
                         p.entity,
                         car.at.distance(her),
                         car.speed(),
                         physics.vehicle_touching(id).len(),
+                        p.reports,
                         if p.leaving { " (leaving)" } else { "" }
                     );
                 }
@@ -667,14 +668,29 @@ impl Pursuers {
                         physics.line_clear(a, end, Some(id))
                     });
             }
-            if !p.sees {
-                continue;
-            }
+            p.unseen = if p.sees { 0.0 } else { p.unseen + dt };
             // Its gunners, and its driver when he has a gun of his own
-            // (`CarAttack` and `TankAttack` fire it, 0x822C95D8).
+            // (`CarAttack` and `TankAttack` fire it, 0x822C95D8): each
+            // think ends in a report, and short of firing unless ready.
             let seats = crate::combat::armed_seats(v);
+            p.reports.resize(seats.len(), Report::default());
             for (k, &seat) in seats.iter().enumerate() {
                 if let Some(mount) = v.spec.armed.iter().find(|m| m.seat == seat) {
+                    let (near, far) = mount
+                        .weapon
+                        .hint
+                        .map_or((0.0, gunner_aim::NO_HINT_RANGE), |h| (h.min_range, h.range));
+                    p.reports[k] = p.reports[k].next(&gunner_aim::FireView {
+                        unseen: p.unseen,
+                        flat: (her - at).with_y(0.0).length(),
+                        near,
+                        far,
+                        sees: p.sees,
+                        reaches: bears(v, mount, k == 0, m, at, her),
+                    });
+                    if !p.sees || !p.reports[k].fires() {
+                        continue;
+                    }
                     self.shots.push(Shot {
                         vehicle: i,
                         at: her,
@@ -695,6 +711,65 @@ impl Pursuers {
         let gone = &self.gone;
         self.out.retain(|p| !gone.contains(&p.entity));
         drop
+    }
+}
+
+/// The riders of `v`'s seats with a gun, its driver's left out (he asks
+/// 0x822ECE70), as `CarAttack` reads them: each with the report in
+/// `reports`, at the vehicle's middle and heading (inferred: nothing here
+/// turns a pursuit gunner's turret).
+fn rider_list(v: &ParkedVehicle, reports: &[Report], at: Vec3, forward: Vec3) -> Vec<Rider> {
+    crate::combat::armed_seats(v)
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(k, &seat)| {
+            let m = v.spec.armed.iter().find(|m| m.seat == seat)?;
+            let (near, far) = m
+                .weapon
+                .hint
+                .map_or((0.0, gunner_aim::NO_HINT_RANGE), |h| (h.min_range, h.range));
+            Some(Rider {
+                seat,
+                report: reports.get(k).copied().unwrap_or_default(),
+                near: gunner_aim::slot_near(near, m.weapon.ammo.blast.as_ref().map(|b| b.radius)),
+                far,
+                at,
+                facing: car_driver::yaw(forward),
+            })
+        })
+        .collect()
+}
+
+/// Whether the rider of a seat with gun `mount` can bring it to bear on
+/// `her`, `v` at `body` with its middle `at`: from the 360 code (0x822C95D8,
+/// by what his mind's +0x14 top byte says he rides, 0x822BB608): a seat
+/// with a turret (7), inside its arc and tilt (0x822EF8C8), a driver of
+/// a fixed gun (1..4), inside its weapon's cone round the nose; a seat
+/// with neither (6) is not asked. A driver who turns the main turret
+/// has it go all the way round. Inferred: out of its arc a turret is not
+/// also within its weapon's cone (nothing turns a pursuit gunner's turret
+/// to be).
+fn bears(
+    v: &ParkedVehicle,
+    mount: &m2_engine::weapons::Mounted,
+    driver: bool,
+    body: Mat4,
+    at: Vec3,
+    her: Vec3,
+) -> bool {
+    match v.spec.aimer_of_seat(mount.seat) {
+        Some(a) => {
+            let want = v.spec.aim_toward(a, body, v.turret, her);
+            let margin = m2_engine::weapons::ai_turret_margin(mount.weapon.aim_ai);
+            v.spec.aimers[a].record.reaches(want, margin)
+        }
+        None if driver && !v.spec.turns_main_turret(None) => {
+            let nose = body.transform_vector3(Vec3::Z).normalize_or(Vec3::Z);
+            (her - at).normalize_or(nose).dot(nose)
+                > m2_engine::weapons::ai_aim_cosine(mount.weapon.aim_ai)
+        }
+        None => true,
     }
 }
 

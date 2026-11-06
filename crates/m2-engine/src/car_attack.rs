@@ -34,18 +34,27 @@
 //! - Moving, it follows its way at up to 10 m/s (0x822AC008); within 4 m
 //!   of its end the way is done (timer `(r + 1) x 3`).
 //!
-//! The crew's range: the mean of the crew's two weapon distances (the
-//! weapon slots' +0x20 and +0x24 of those 0x822ECE70 lists), halved
-//! together; a car with no crew so counted always moves up.
+//! The crew, each think (0x822ECE70 lists its gunner seats' riders, each
+//! with what his fire control last reported, [`Report`]):
+//! - One too far from her (4) has the driver head for her at once, by a
+//!   way to her own place.
+//! - One who can't bring his gun to bear (6) asks for a turn (+0x24): with
+//!   no way under way the driver manoeuvres until she is within 0.1745 rad
+//!   of that rider's heading (or it can't), then a 0.5 s timer. Any other
+//!   rider counted calls it off.
+//! - Those ready (3, and 8, 9; 7 is written by nothing) are counted, but
+//!   the one asking for the turn: the crew's range is the mean of their
+//!   weapon slots' two distances (+0x20, the `MinFireRange` kept 1 m past
+//!   the round's blast, +0x24 the `FireRange`: 0x822EDBC0), halved
+//!   together. With none counted it always moves up.
 //!
-//! Inferred: the crew's two distances are their weapons' `MinFireRange`
-//! and `FireRange` (the slots' +0x20/+0x24); her record's +0x5C and +0x60
-//! are both her distance; the timer and line-check wait count down by
-//! the think's length (nothing in 0x822ACB28 counts them); "behind" is
-//! her on the far side of the car's middle across its heading, "past its
-//! nose" past its front. Not ported (taken as never): the stuck check
-//! (+0x34), the hit memory (+0x6BC, +0x6CC, state 6), riders asking for
-//! a turn (kind 6), 0x822AA348's ordered point. Its way is
+//! The timer and line-check wait count down in the mind's own update
+//! (0x822BE240). Inferred: her record's +0x5C and +0x60 are both her
+//! distance; "behind" is her on the far side of the car's middle across
+//! its heading, "past its nose" past its front; a rider's heading is the
+//! vehicle's (the alpha turns no pursuit gunner's turret). Not ported
+//! (taken as never): the stuck check (+0x34), the hit memory (+0x6BC,
+//! +0x6CC, state 6), 0x822AA348's ordered point. Its way is
 //! 0x822BF7A8's path ([`AttackWorld::toward`], [`crate::path_search`]).
 //! The manoeuvre is [`Manoeuvre`] (0x822C8770); inferred there: its room
 //! check is only 0x822C8CB8's face sweep (the 360 first also sweeps the
@@ -54,6 +63,7 @@
 use m2_math::glam::Vec3;
 
 use crate::car_driver::{self, AiInput, CarDriver, CarState};
+use crate::gunner_aim::Report;
 
 /// The 360's label of an armoured personnel carrier (`name_hash("Apc")`,
 /// 0x82255118's class 3).
@@ -87,6 +97,21 @@ pub struct Sight {
     pub unseen: f32,
     /// She is in a vehicle (her record's kind 4).
     pub vehicle: bool,
+}
+
+/// A rider of the crew, as 0x822ECE70 lists him.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rider {
+    /// His seat.
+    pub seat: u32,
+    /// What his fire control last reported (his mind's +0x128).
+    pub report: Report,
+    /// His weapon slot's two distances (its +0x20 and +0x24).
+    pub near: f32,
+    pub far: f32,
+    /// Where he is, and his heading, radians (his mind's +0x280).
+    pub at: Vec3,
+    pub facing: f32,
 }
 
 /// What `CarAttack` asks of the world.
@@ -191,6 +216,8 @@ pub struct CarAttack {
     /// Her share of its hit memory (0x822FA988: damage over its health,
     /// fading 0.1 a second, 0x822BE240; see [`feel`](Self::feel)).
     pub hit: f32,
+    /// +0x24: the rider who asked for a turn.
+    pub turn_for: Option<u32>,
 }
 
 /// The cone she must be in for a line check, radians (0x822ACB28 asks
@@ -218,15 +245,14 @@ impl CarAttack {
     }
 
     /// One think: `car` of `length` (its box along its heading), `crew`
-    /// its crew's range if any are counted, her as `her`; `dt` the
-    /// think's length.
+    /// the riders 0x822ECE70 lists, her as `her`; `dt` the think's length.
     #[allow(clippy::too_many_arguments)]
     pub fn think(
         &mut self,
         driver: &mut CarDriver,
         car: &CarState,
         length: f32,
-        crew: Option<f32>,
+        crew: &[Rider],
         her: &Sight,
         world: &mut impl AttackWorld,
         dt: f32,
@@ -236,6 +262,28 @@ impl CarAttack {
         if her.unseen > 20.0 {
             return car_driver::slow_to_stop(car).unwrap_or_default();
         }
+        // What the crew's fire control reports: move, turn or count them.
+        let (mut counted, mut near, mut far) = (0u32, 0.0, 0.0);
+        for r in crew {
+            match r.report {
+                Report::TooFar => {
+                    self.set_off_out = false;
+                    self.way = Some(her.at);
+                }
+                Report::NoReach => self.turn_for = Some(r.seat),
+                Report::Ready if self.turn_for != Some(r.seat) => {
+                    counted += 1;
+                    near += r.near;
+                    far += r.far;
+                }
+                _ => {}
+            }
+        }
+        if counted > 0 {
+            self.turn_for = None;
+        }
+        // The crew's range, if any are counted.
+        let range = (counted > 0).then(|| (near + far) / counted as f32 * 0.5);
         // Its hit memory (0x822C2738 over the mind's +0x6CC records): her
         // share past 0.3 sends it to state 6, kept at 0.5 while she is seen
         // within 3 s, and cuts its timer to 2 s.
@@ -248,7 +296,7 @@ impl CarAttack {
         }
         let dist2 = (her.at - car.at).length_squared();
         let near2 = (length * 5.0) * (length * 5.0);
-        let out_of_range = crew.is_none_or(|m| m * m < dist2);
+        let out_of_range = range.is_none_or(|m| m * m < dist2);
         let mut expired = self.timer <= 0.0;
         let far_ahead = self.check_wait <= 0.0
             && near2 < dist2
@@ -259,13 +307,37 @@ impl CarAttack {
                 > 0.0
             && !her.vehicle;
         let mut out = None;
+        // A rider's turn, with no way under way: until she is within
+        // 0.1745 rad of his heading or the manoeuvre gives up.
+        if let Some(seat) = self.turn_for
+            && self.way.is_none()
+        {
+            let bearing = crew
+                .iter()
+                .find(|r| r.seat == seat)
+                .map(|r| car_driver::wrap(car_driver::yaw(her.at - r.at) - r.facing));
+            let turning = bearing.is_some_and(|b| {
+                b.abs() > 0.1745 && {
+                    let dist = (her.at - car.at).with_y(0.0).length();
+                    self.manoeuvre
+                        .think(car, length, b, dist, world)
+                        .inspect(|i| out = Some(i.clone()))
+                        .is_some()
+                }
+            });
+            if !turning {
+                self.manoeuvre = Manoeuvre::Idle;
+                self.timer = 0.5;
+                self.turn_for = None;
+            }
+        }
         match self.state {
             State::Hold => {
                 if expired {
                     if behind(car, her.at) || world.rand() < 0.1 {
                         self.state = State::Turning;
                         self.timer = (world.rand() + 1.0) * 1.5;
-                    } else if crew.is_none() || her.unseen > 5.0 || out_of_range {
+                    } else if range.is_none() || her.unseen > 5.0 || out_of_range {
                         let back = (car.at - her.at).normalize_or_zero();
                         self.way = Some(her.at + back * length);
                         self.state = State::Moving;
@@ -276,7 +348,7 @@ impl CarAttack {
             }
             State::Moving => {
                 expired = true;
-                let chance = if crew.is_some() { 0.2 } else { 0.4 };
+                let chance = if crew.is_empty() { 0.4 } else { 0.2 };
                 if far_ahead && world.rand() < chance {
                     if world.line_clear(car.at, her.at) {
                         self.way = None;
@@ -395,12 +467,105 @@ mod tests {
         }
     }
 
+    /// One rider, ready, of a weapon reaching `far`.
+    fn crew(far: f32) -> [Rider; 1] {
+        [Rider {
+            seat: 1,
+            report: Report::Ready,
+            near: far,
+            far,
+            at: Vec3::ZERO,
+            facing: 0.0,
+        }]
+    }
+
     fn her(z: f32) -> Sight {
         Sight {
             at: Vec3::new(0.0, 0.0, z),
             unseen: 0.0,
             vehicle: false,
         }
+    }
+
+    // A rider too far from her (kind 4) has the driver head for her at
+    // once, whatever its state, and is not counted.
+    #[test]
+    fn a_rider_out_of_reach_sends_it_for_her() {
+        let mut a = CarAttack {
+            timer: 5.0,
+            set_off_out: true,
+            ..CarAttack::default()
+        };
+        let mut d = CarDriver::default();
+        let mut w = W {
+            r: 0.5,
+            clear: true,
+        };
+        let [mut r] = crew(50.0);
+        r.report = Report::TooFar;
+        a.think(&mut d, &car(0.0), 6.0, &[r], &her(150.0), &mut w, 0.1);
+        assert_eq!(a.way, Some(her(150.0).at));
+        assert!(!a.set_off_out);
+        assert_eq!(a.state, State::Hold);
+    }
+
+    // Only those ready count: with its one rider not, it moves up even
+    // with her inside his range.
+    #[test]
+    fn a_rider_not_ready_is_not_counted() {
+        let mut d = CarDriver::default();
+        let mut w = W {
+            r: 0.5,
+            clear: true,
+        };
+        for report in [Report::Nothing, Report::Lost, Report::TooNear] {
+            let mut a = CarAttack::default();
+            let [mut r] = crew(80.0);
+            r.report = report;
+            a.think(&mut d, &car(0.0), 6.0, &[r], &her(60.0), &mut w, 0.1);
+            assert_eq!(a.state, State::Moving, "{report:?}");
+        }
+        let mut a = CarAttack::default();
+        a.think(&mut d, &car(0.0), 6.0, &crew(80.0), &her(60.0), &mut w, 0.1);
+        assert_eq!(a.state, State::Hold);
+    }
+
+    // A rider who can't bear (kind 6) gets the car turned for him until
+    // she is within 0.1745 rad of his heading, then a 0.5 s wait; another
+    // rider ready calls it off.
+    #[test]
+    fn a_rider_who_cannot_bear_asks_for_a_turn() {
+        let mut a = CarAttack {
+            timer: 5.0,
+            ..CarAttack::default()
+        };
+        let mut d = CarDriver::default();
+        let mut w = W {
+            r: 0.5,
+            clear: true,
+        };
+        let [mut r] = crew(80.0);
+        r.report = Report::NoReach;
+        r.facing = 1.0;
+        let i = a.think(&mut d, &car(0.0), 6.0, &[r], &her(60.0), &mut w, 0.1);
+        assert_eq!(a.turn_for, Some(1));
+        assert_ne!(a.manoeuvre, Manoeuvre::Idle);
+        assert_ne!(i, AiInput::default());
+        // Now she is along his heading.
+        r.facing = 0.0;
+        a.think(&mut d, &car(0.0), 6.0, &[r], &her(60.0), &mut w, 0.1);
+        assert_eq!(a.turn_for, None);
+        assert_eq!(a.manoeuvre, Manoeuvre::Idle);
+        assert!((a.timer - 0.5).abs() < 1e-5);
+        // A second rider ready calls it off in the same think.
+        let mut a = CarAttack {
+            timer: 5.0,
+            ..CarAttack::default()
+        };
+        let [mut b] = crew(80.0);
+        b.seat = 2;
+        a.think(&mut d, &car(0.0), 6.0, &[r, b], &her(60.0), &mut w, 0.1);
+        assert_eq!(a.turn_for, None);
     }
 
     #[test]
@@ -422,23 +587,39 @@ mod tests {
             r: 0.5,
             clear: true,
         };
-        let i = a.think(&mut d, &car(0.0), 6.0, Some(50.0), &her(150.0), &mut w, 0.1);
+        let i = a.think(
+            &mut d,
+            &car(0.0),
+            6.0,
+            &crew(50.0),
+            &her(150.0),
+            &mut w,
+            0.1,
+        );
         assert_eq!(a.state, State::Moving);
         assert!(a.set_off_out);
         assert_eq!(a.way, Some(Vec3::new(0.0, 0.0, 144.0)));
         assert!(i.last(car_driver::Msg::Throttle).unwrap() > 0.0);
         // One think in five checks the line: r 0.1 < 0.2.
         w.r = 0.1;
-        a.think(&mut d, &car(5.0), 6.0, Some(50.0), &her(150.0), &mut w, 0.1);
+        a.think(
+            &mut d,
+            &car(5.0),
+            6.0,
+            &crew(50.0),
+            &her(150.0),
+            &mut w,
+            0.1,
+        );
         assert_eq!(a.state, State::Charging);
         // Charging needs her within sqrt(1.5) x 30 m.
-        let i = a.think(&mut d, &car(5.0), 6.0, Some(50.0), &her(30.0), &mut w, 0.1);
+        let i = a.think(&mut d, &car(5.0), 6.0, &crew(50.0), &her(30.0), &mut w, 0.1);
         assert_eq!(a.state, State::Charging);
         assert!(i.last(car_driver::Msg::Throttle).unwrap() > 0.0);
         // In range from the start: it holds.
         let mut a = CarAttack::default();
         w.r = 0.5;
-        a.think(&mut d, &car(0.0), 6.0, Some(80.0), &her(60.0), &mut w, 0.1);
+        a.think(&mut d, &car(0.0), 6.0, &crew(80.0), &her(60.0), &mut w, 0.1);
         assert_eq!(a.state, State::Hold);
     }
 
@@ -451,7 +632,15 @@ mod tests {
             r: 0.5,
             clear: true,
         };
-        a.think(&mut d, &car(0.0), 6.0, Some(50.0), &her(-60.0), &mut w, 0.1);
+        a.think(
+            &mut d,
+            &car(0.0),
+            6.0,
+            &crew(50.0),
+            &her(-60.0),
+            &mut w,
+            0.1,
+        );
         assert_eq!(a.state, State::Turning);
         assert!((a.timer - 2.25).abs() < 1e-6);
     }
@@ -515,10 +704,26 @@ mod tests {
             r: 0.5,
             clear: true,
         };
-        a.think(&mut d, &car(0.0), 6.0, Some(50.0), &her(150.0), &mut w, 0.1);
+        a.think(
+            &mut d,
+            &car(0.0),
+            6.0,
+            &crew(50.0),
+            &her(150.0),
+            &mut w,
+            0.1,
+        );
         assert_ne!(a.state, State::UnderFire);
         a.feel(0.2, 0.1);
-        a.think(&mut d, &car(0.0), 6.0, Some(50.0), &her(150.0), &mut w, 0.1);
+        a.think(
+            &mut d,
+            &car(0.0),
+            6.0,
+            &crew(50.0),
+            &her(150.0),
+            &mut w,
+            0.1,
+        );
         assert_eq!(a.state, State::UnderFire);
         assert_eq!(a.hit, 0.5);
         assert!(a.timer <= 2.0);
