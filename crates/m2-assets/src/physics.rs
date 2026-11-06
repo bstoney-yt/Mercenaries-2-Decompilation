@@ -228,6 +228,19 @@ impl Shape {
         self.record[4] & 0x1f
     }
 
+    /// Record word 4 whole (the record's +0x14 in memory): the flags the
+    /// 360 picks the shape's collision layer by (0x8216C308,
+    /// `m2_engine::collision_layers`).
+    pub fn flags(&self) -> u32 {
+        self.record[4]
+    }
+
+    /// Record word 11 (the record's +0x30 in memory): what 0x8216C308
+    /// tests against 4. Meaning inferred: the shape's geometry kind.
+    pub fn kind(&self) -> u32 {
+        self.record[11]
+    }
+
     /// A plant's or bush's leaves ([`FOLIAGE`]).
     pub fn is_foliage(&self) -> bool {
         self.class() == FOLIAGE

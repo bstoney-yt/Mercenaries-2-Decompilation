@@ -31,6 +31,7 @@ use rapier3d::control::{
     KinematicCharacterController, WheelTuning,
 };
 
+use crate::collision_layers::{self, layer_of, seen_by};
 use crate::tuning::{
     BikeTuning, BoatFloat, BoatTuning, EngineTuning, FlightTuning, Gearbox, Handling, Springs,
     TankTuning, Tyres,
@@ -172,6 +173,49 @@ pub struct CollisionShape {
     /// (first triangle, surface name hash) in triangle order; empty when
     /// nothing says (surface 0).
     pub surfaces: Arc<[(u32, u32)]>,
+    /// What of it stands in an AI's way ([`PathSolid`]).
+    pub path: PathSolid,
+}
+
+/// What of a model a path search meets. From the 360 code: its sweeps and
+/// nose checks see only the layers of [`PATH_MASK`](crate::collision_layers::PATH_MASK),
+/// and a building's shapes take their layers shape by shape
+/// ([`layer_of`](crate::collision_layers::layer_of)).
+#[derive(Clone, Default)]
+pub enum PathSolid {
+    /// All of it.
+    #[default]
+    All,
+    /// None: a chain-link fence, which an AI drives through.
+    Nothing,
+    /// Only these of its shapes.
+    Part(r::SharedShape),
+}
+
+impl PathSolid {
+    /// A model with some shapes left out: `triangles` of `vertices` are
+    /// those a path search meets.
+    pub fn of(vertices: &[Vec3], triangles: &[[u32; 3]]) -> Self {
+        CollisionShape::mesh(vertices, triangles).map_or(Self::Nothing, |m| Self::Part(m.shape))
+    }
+}
+
+/// Whether a path search meets `PHY2` shape `s` of a building's model.
+fn in_ais_way(s: &m2_assets::physics::Shape) -> bool {
+    seen_by(
+        collision_layers::PATH_MASK,
+        layer_of(&collision_layers::BUILDING, s.flags(), s.kind()),
+    )
+}
+
+impl fmt::Debug for PathSolid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::All => "All",
+            Self::Nothing => "Nothing",
+            Self::Part(_) => "Part",
+        })
+    }
 }
 
 impl fmt::Debug for CollisionShape {
@@ -185,9 +229,10 @@ impl fmt::Debug for CollisionShape {
     }
 }
 
-/// A `PHY2` shape as [`CollisionShape::shape_meshes`] gives it: its node,
+/// A `PHY2` shape as [`CollisionShape::shape_meshes`] gives it, last whether
+/// it stands in an AI's way ([`PathSolid`]): its node,
 /// its vertices (model space) and triangles.
-pub type ShapeMesh = (u16, Vec<Vec3>, Vec<[u32; 3]>);
+pub type ShapeMesh = (u16, Vec<Vec3>, Vec<[u32; 3]>, bool);
 
 /// How a prop comes loose when a vehicle or a blast knocks it (its `PHY2`
 /// has bodies that move: traffic lights, plants, barricades, poles): its
@@ -772,6 +817,7 @@ impl CollisionShape {
             whole: None,
             material: None,
             surfaces: Arc::new([]),
+            path: PathSolid::All,
         }
     }
 
@@ -814,6 +860,7 @@ impl CollisionShape {
             whole: None,
             material: None,
             surfaces: runs.into(),
+            path: PathSolid::All,
         })
     }
 
@@ -875,6 +922,7 @@ impl CollisionShape {
                     .map(|&x| to_model.transform_point3(Vec3::from(x)))
                     .collect(),
                 t,
+                in_ais_way(s),
             ));
         }
         out
@@ -896,6 +944,10 @@ impl CollisionShape {
         let mut vertices = Vec::new();
         let mut triangles = Vec::new();
         let mut surfaces = Vec::new();
+        // The triangles of its shapes a path search meets, and whether
+        // some are left out.
+        let mut path_triangles = Vec::new();
+        let mut path_part = false;
         let mut loose = None;
         let mut material = None;
         // Shapes of its own, whether or not any stands in the way: no
@@ -929,6 +981,11 @@ impl CollisionShape {
                 let (v, t) = s.geometry.triangles(s.radius);
                 let first = vertices.len() as u32;
                 vertices.extend(v.iter().map(|&x| to_model.transform_point3(Vec3::from(x))));
+                if in_ais_way(s) {
+                    path_triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
+                } else {
+                    path_part = true;
+                }
                 triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
             }
         }
@@ -1004,7 +1061,10 @@ impl CollisionShape {
             // the surface most of its solid drawn area has (inferred).
             surfaces = vec![drawn_surface(model, lod); triangles.len()];
         }
-        let shape = Self::mesh_of(&vertices, &triangles, &surfaces)?;
+        let mut shape = Self::mesh_of(&vertices, &triangles, &surfaces)?;
+        if path_part {
+            shape.path = PathSolid::of(&vertices, &path_triangles);
+        }
         let whole = match (&loose, sub_object) {
             (None, None) => Loose::whole(model, shape.bounds()).map(Arc::new),
             _ => None,
@@ -2876,6 +2936,8 @@ pub struct Physics {
     keys: HashMap<r::ColliderHandle, StaticKey>,
     /// What each static's triangles are made of ([`CollisionShape::surfaces`]).
     surfaces: HashMap<r::ColliderHandle, CollisionShape>,
+    /// What of a static a path search does not see in full ([`PathSolid`]).
+    path_solid: HashMap<r::ColliderHandle, PathSolid>,
     controller: KinematicCharacterController,
     vehicles: Vec<Option<VehicleBody>>,
     ragdolls: Vec<Option<Ragdoll>>,
@@ -2938,6 +3000,7 @@ impl Physics {
             statics: HashMap::new(),
             keys: HashMap::new(),
             surfaces: HashMap::new(),
+            path_solid: HashMap::new(),
             controller,
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
@@ -2998,12 +3061,16 @@ impl Physics {
         if !shape.surfaces.is_empty() {
             self.surfaces.insert(handle, shape.clone());
         }
+        if !matches!(shape.path, PathSolid::All) {
+            self.path_solid.insert(handle, shape.path.clone());
+        }
     }
 
     pub fn remove_static(&mut self, key: StaticKey) {
         if let Some(h) = self.statics.remove(&key) {
             self.keys.remove(&h);
             self.surfaces.remove(&h);
+            self.path_solid.remove(&h);
             self.world.remove_collider(h);
         }
     }
@@ -5585,20 +5652,67 @@ impl Physics {
             stop_at_penetration: false,
             ..Default::default()
         };
-        let (handle, hit) = self.skipping(skip, false, |filter| {
-            self.world
-                .cast_shape(&pose(from, turn), vector(d / len), &cube, options, filter)
-        })?;
+        let (start, way) = (pose(from, turn), vector(d / len));
+        // Past what the sweep doesn't see of a model (its [`PathSolid`]):
+        // the first of what it does, cast again with the rest left out.
+        let mut past = Vec::new();
+        let mut best: Option<(r::ColliderHandle, f32, Vec3)> = None;
+        while let Some((handle, hit)) = self.skipping_past(skip, false, &past, |filter| {
+            self.world.cast_shape(&start, way, &cube, options, filter)
+        }) {
+            if best.is_some_and(|b| b.1 <= hit.time_of_impact) {
+                break;
+            }
+            let Some(PathSolid::Part(part)) = self.path_solid.get(&handle) else {
+                best = Some((handle, hit.time_of_impact, vec3(hit.witness1)));
+                break;
+            };
+            past.push(handle);
+            let at = self.world.colliders.get(handle)?.position();
+            if let Ok(Some(h)) = rapier3d::parry::query::cast_shapes(
+                at,
+                r::Vector::ZERO,
+                &**part,
+                &start,
+                way,
+                &cube,
+                options,
+            ) && best.is_none_or(|b| h.time_of_impact < b.1)
+            {
+                best = Some((handle, h.time_of_impact, vec3(*at * h.witness1)));
+            }
+        }
+        let (handle, toi, point) = best?;
         let mut o = self.body_obstacle(handle)?;
         // Where it met it: the point on what it met (the 360 records the
         // contact). Touching only at the very end of the sweep (within 5 cm,
         // the alpha's own margin) is no meeting: a node put where the last
         // sweep met the ground would otherwise always be met again there.
-        if hit.time_of_impact > len - 0.05 {
+        if toi > len - 0.05 {
             return None;
         }
-        o.point = vec3(hit.witness1);
+        o.point = point;
         Some(o)
+    }
+
+    /// Runs `f` with what a path search sees: what is solid but vehicle
+    /// `skip`'s bodies, the terrain unless `terrain`, a model with nothing
+    /// of it in the way ([`PathSolid::Nothing`]), and `past`.
+    fn skipping_past<R>(
+        &self,
+        skip: Option<VehicleId>,
+        terrain: bool,
+        past: &[r::ColliderHandle],
+        f: impl FnOnce(r::QueryFilter<'_>) -> R,
+    ) -> R {
+        let own = self.bodies_of(skip);
+        let keep = |h: r::ColliderHandle, c: &r::Collider| {
+            c.parent().is_none_or(|p| !own.contains(&p))
+                && (terrain || !matches!(self.keys.get(&h), Some(StaticKey::Cell(_))))
+                && !matches!(self.path_solid.get(&h), Some(PathSolid::Nothing))
+                && !past.contains(&h)
+        };
+        f(solid().predicate(&keep))
     }
 
     /// The bodies of vehicle `skip`: its chassis, its turret's and its
@@ -5639,7 +5753,10 @@ impl Physics {
     /// the ground, its box.
     fn body_obstacle(&self, handle: r::ColliderHandle) -> Option<crate::path_search::Obstacle> {
         let c = self.world.colliders.get(handle)?;
-        let b = c.shape().compute_local_aabb();
+        let b = match self.path_solid.get(&handle) {
+            Some(PathSolid::Part(part)) => part.compute_local_aabb(),
+            _ => c.shape().compute_local_aabb(),
+        };
         let p = c.position();
         let (i, g) = handle.into_raw_parts();
         Some(crate::path_search::Obstacle {
@@ -5684,7 +5801,7 @@ impl Physics {
     pub fn path_ground(&self, at: Vec3, skip: Option<VehicleId>) -> Option<(Vec3, Option<u64>)> {
         let top = at + Vec3::Y * 2.0;
         let ray = r::Ray::new(vector(top), vector(Vec3::NEG_Y));
-        let (handle, toi) = self.skipping(skip, true, |filter| {
+        let (handle, toi) = self.skipping_past(skip, true, &[], |filter| {
             self.world
                 .query_pipeline_with_filter(filter)
                 .cast_ray(&ray, 1002.0, true)
@@ -9012,6 +9129,7 @@ mod tests {
             whole: None,
             material: None,
             surfaces: Arc::new([]),
+            path: PathSolid::All,
         };
         let base = Vec3::new(0.0, 0.0, 12.0);
         p.add_static(StaticKey::Object(7), &pole, base, Quat::IDENTITY);
@@ -9198,5 +9316,50 @@ mod tests {
             p.cast_ray(Vec3::new(0.0, 10.0, 0.0), -Vec3::Y, 100.0)
                 .is_none()
         );
+    }
+
+    // A chain-link fence (no shape in the path mask) is no obstacle to a
+    // path search, though solid to a query; a model with some shapes in the
+    // mask is met only at those.
+    #[test]
+    fn a_path_search_sees_only_what_stands_in_an_ais_way() {
+        let sweep = |p: &Physics| {
+            p.sweep_obstacle(
+                Vec3::new(0.0, 1.0, -5.0),
+                Vec3::new(0.0, 1.0, 5.0),
+                Vec3::splat(0.5),
+                None,
+            )
+        };
+        let wall = CollisionShape::cuboid(Vec3::new(5.0, 2.0, 0.25));
+        let mut p = Physics::new();
+        p.add_static(StaticKey::Object(1), &wall, Vec3::ZERO, Quat::IDENTITY);
+        p.step(0.01);
+        assert!(sweep(&p).is_some());
+
+        let mut fence = wall.clone();
+        fence.path = PathSolid::Nothing;
+        p.add_static(StaticKey::Object(1), &fence, Vec3::ZERO, Quat::IDENTITY);
+        p.step(0.01);
+        assert!(sweep(&p).is_none());
+        assert!(!p.line_clear(Vec3::new(0.0, 1.0, -5.0), Vec3::new(0.0, 1.0, 5.0), None));
+        assert!(p.path_ground(Vec3::new(0.0, 3.0, 0.0), None).is_none());
+
+        // Only its far end stands in the way: a sweep past the near end
+        // meets nothing, one along the far end meets it.
+        let mut part = wall.clone();
+        part.path = PathSolid::Part(r::SharedShape::cuboid(1.0, 2.0, 0.25));
+        p.add_static(StaticKey::Object(1), &part, Vec3::X * 4.0, Quat::IDENTITY);
+        p.step(0.01);
+        assert!(sweep(&p).is_none());
+        let far = p
+            .sweep_obstacle(
+                Vec3::new(4.0, 1.0, -5.0),
+                Vec3::new(4.0, 1.0, 5.0),
+                Vec3::splat(0.5),
+                None,
+            )
+            .unwrap();
+        assert!((far.point.z + 0.25).abs() < 0.1, "{:?}", far.point);
     }
 }
