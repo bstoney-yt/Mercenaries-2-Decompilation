@@ -311,7 +311,7 @@ impl Traffic {
                 let others: Vec<(Vec2, Vec2, f32)> = vehicles
                     .iter()
                     .enumerate()
-                    .filter(|&(k, o)| k != i && !o.wrecked)
+                    .filter(|&(k, o)| k != i && !o.wrecked && o.spec.is_boat())
                     .filter_map(|(_, o)| {
                         let oid = o.id?;
                         let m = physics.vehicle_transform(oid)?;
@@ -336,8 +336,7 @@ impl Traffic {
                 // The 360 boat controller (0x822A7C30): helm 10/pi a radian
                 // off, held to full; it asks its task speed, less into a
                 // turn (its reference speed x 0.1309 / (|off| + 0.1309)), and
-                // opens its throttle 0.1 a m/s short of that. Its avoidance
-                // nudge (0x822A7858) is not ported.
+                // opens its throttle 0.1 a m/s short of that.
                 let want = task.min(reference * 0.1309 / (off.abs() + 0.1309));
                 let speed = physics.vehicle_speed(id);
                 physics.drive(
@@ -503,8 +502,9 @@ fn nearest_ahead(route: &[Vec3], here: Vec3) -> usize {
 }
 
 /// How a patrol boat steers round what is in its way, as the 360 boat
-/// controller does (0x822A7858, research notes section 27): of the others
-/// (each place, velocity and radius, flat) within 50 m of a point 50 m
+/// controller does (0x822A7858, research notes section 27): of the other
+/// boats (0x822ED248's kinds are boats and buildings; buildings are not
+/// given here; each place, velocity and radius, flat) within 50 m of a point 50 m
 /// ahead of it, each ahead of it whose closest approach, by both their
 /// velocities, comes within R (its radius plus half the boat's larger
 /// side) pushes it away along their separation then, by |2R - d| / R

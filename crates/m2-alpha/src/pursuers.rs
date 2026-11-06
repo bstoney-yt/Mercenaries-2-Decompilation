@@ -30,7 +30,11 @@
 //!   tank or driving, each run by `TankAttack`
 //!   ([`m2_engine::tank_attack`], 0x822B6508), firing its own gun.
 //!
-//! Not yet: boats and men are not sent. Inferred: how long a gunner has
+//! - Boats come over the water (0x82239FC8 -> 0x82238E88) while she is in
+//!   a boat, off the roads or stopped, each run by `BoatAttack`
+//!   ([`m2_engine::boat_attack`], 0x822A9750).
+//!
+//! Not yet: men are not sent (no faction's table asks for any). Inferred: how long a gunner has
 //! gone without seeing her is the time since his sight lines were last
 //! clear (the 360 keeps it in her record, +0x8C). Inferred: the gunners aim at her where she is (0x822C95D8's lead
 //! and line-of-fire checks are not ported); the 360 thinks at its own
@@ -41,6 +45,7 @@
 use std::collections::HashSet;
 
 use m2_engine::Physics;
+use m2_engine::boat_attack::{self, BoatAttack};
 use m2_engine::car_attack::{self, AttackWorld, CarAttack, Rider, Sight};
 use m2_engine::car_driver::{self, CarDriver, CarInputs, CarState, Quarry};
 use m2_engine::gunner_aim::{self, Report};
@@ -120,6 +125,67 @@ impl PathWorld for Ground<'_> {
     }
     fn body(&mut self, id: u64) -> Option<path_search::Obstacle> {
         self.physics.obstacle(id)
+    }
+}
+
+/// What a boat keeps clear of (0x822ED248): the boats; not buildings.
+pub fn afloat(physics: &Physics, vehicles: &[ParkedVehicle]) -> Vec<boat_attack::Neighbour> {
+    vehicles
+        .iter()
+        .filter(|v| v.spec.is_boat() && !v.wrecked)
+        .filter_map(|v| {
+            let id = v.id?;
+            let turn = physics.vehicle_transform(id)?;
+            let (lo, hi) = v.spec.bounds;
+            Some(boat_attack::Neighbour {
+                at: turn.transform_point3((lo + hi) * 0.5),
+                radius: (hi - lo).length() * 0.5,
+                velocity: physics.vehicle_velocity(id),
+            })
+        })
+        .collect()
+}
+
+/// What the boats want to know of her.
+#[derive(Clone, Copy, Debug)]
+pub struct Her {
+    pub forward: Vec3,
+    /// Her vehicle's larger side (0x822A94E8's ring).
+    pub size: f32,
+    pub vehicle: Option<m2_engine::physics::VehicleId>,
+    pub swimming: bool,
+}
+
+/// What a boat asks of the world ([`boat_attack::BoatWorld`]).
+struct Afloat<'a> {
+    physics: &'a Physics,
+    id: m2_engine::physics::VehicleId,
+    from: Vec3,
+    face: Vec3,
+    length: f32,
+    her: Option<m2_engine::physics::VehicleId>,
+}
+
+impl boat_attack::BoatWorld for Afloat<'_> {
+    fn sweep(&mut self, to: Vec3) -> boat_attack::Sweep {
+        let to = to.with_y(self.from.y);
+        match self.physics.sweep_afloat(self.from, to, self.face, self.id) {
+            // Its own length short of it.
+            Some(met) => boat_attack::Sweep {
+                blocked: true,
+                met: met - (to - self.from).normalize_or_zero() * self.length,
+            },
+            None => boat_attack::Sweep {
+                blocked: false,
+                met: to,
+            },
+        }
+    }
+
+    fn open_under(&mut self, her: Vec3, depth: f32) -> bool {
+        self.physics
+            .path_ground(her, self.her)
+            .is_none_or(|(g, _)| g.y < her.y - depth)
     }
 }
 
@@ -208,6 +274,9 @@ pub enum Kind {
     /// 0x8223A410: from ahead (0x8223A0A8), while she is in a tank or
     /// driving.
     Tank,
+    /// 0x82239FC8: over the water near her (0x82238E88), while she is in
+    /// a boat, off the roads or stopped.
+    Boat,
 }
 
 impl Kind {
@@ -215,6 +284,7 @@ impl Kind {
         match self {
             Kind::Car => 0,
             Kind::Tank => 1,
+            Kind::Boat => 2,
         }
     }
 
@@ -223,6 +293,7 @@ impl Kind {
         match self {
             Kind::Car => "Car",
             Kind::Tank => "Tank",
+            Kind::Boat => "Boat",
         }
     }
 }
@@ -243,6 +314,8 @@ struct Pursuer {
     attack: CarAttack,
     /// A tank's driver: `TankAttack`.
     tank: TankAttack,
+    /// A boat's driver: `BoatAttack`.
+    boat: BoatAttack,
     /// Its driver's way (0x822BF7A8's path), with its goal.
     route: Option<(Vec3, Option<path_search::Way>)>,
     /// Seconds to its next look at her, whether it saw her, and seconds
@@ -263,7 +336,13 @@ pub struct Pursuers {
     out: Vec<Pursuer>,
     next: u32,
     /// Each kind's gate, whole seconds, and the part second counted.
-    gate: [u32; 2],
+    gate: [u32; 3],
+    /// The boats' two placements: the one next, and how far round each
+    /// has come (0x8380EC88, 0x83134160, 0x8313415C).
+    boat_side: bool,
+    boat_sweep: [f32; 2],
+    /// Which boat has the run at her (0x822A86B0's claim).
+    boat_run: Option<u32>,
     second: f32,
     /// Shots their gunners ask of their guns this frame.
     pub shots: Vec<Shot>,
@@ -325,6 +404,10 @@ impl Pursuers {
             && match kind {
                 Kind::Car => behind_chance(standing).is_some(),
                 Kind::Tank => matches!(standing, Standing::Tank | Standing::Driving),
+                Kind::Boat => matches!(
+                    standing,
+                    Standing::Boat | Standing::OffRoad | Standing::Stopped
+                ),
             }
     }
 
@@ -358,6 +441,55 @@ impl Pursuers {
         }
     }
 
+    /// Where a boat comes in for her at `her`, facing `forward`, moving
+    /// `velocity` (0x82238E88): by turns 200 m off at a heading that swings
+    /// with each try, making for where she will be in 1.5 s at 25 m/s, and
+    /// 125 m off, making for where she will be in 8 s at ten times her
+    /// speed (25 to 65 m/s). It must be over water at least 5 m deep.
+    /// Not checked: the box of 20 m round the point (0x82153B30).
+    pub fn boat_arrival(
+        &mut self,
+        physics: &Physics,
+        her: Vec3,
+        forward: Vec3,
+        velocity: Vec3,
+    ) -> Option<Arrival> {
+        let pi = std::f32::consts::PI;
+        let second = self.boat_side;
+        let t = &mut self.boat_sweep[usize::from(second)];
+        *t = if *t < pi { *t + 0.1 } else { 0.0 };
+        let (reach, angle) = if second {
+            (125.0, *t * 1.4 + 0.942_477_9)
+        } else {
+            (200.0, 0.628_318_55 - *t * 0.4)
+        };
+        let (s, c) = angle.sin_cos();
+        let f = forward.with_y(0.0).normalize_or(Vec3::Z) * reach;
+        let at = her + Vec3::new(f.x * c - f.z * s, 0.0, f.z * c + f.x * s);
+        let surface = physics.water_at(at.x, at.z)?;
+        let top = Vec3::new(at.x, surface, at.z);
+        if physics
+            .cast_ray(top + Vec3::Y * 0.1, Vec3::NEG_Y, 5.0)
+            .is_some()
+        {
+            return None;
+        }
+        let (goal, speed) = if second {
+            (
+                her + velocity * 8.0,
+                (velocity.length() * 10.0).clamp(25.0, 65.0),
+            )
+        } else {
+            (her + velocity * 1.5, 25.0)
+        };
+        let way = (goal - top).with_y(0.0).normalize_or(Vec3::Z);
+        Some(Arrival {
+            at: top + Vec3::Y,
+            facing: way,
+            velocity: way * speed + Vec3::Y,
+        })
+    }
+
     /// Sends one: `template` of `faction`, a `kind`, coming in by
     /// `arrival`; returns the entity it is to be placed as. Shuts its gate.
     pub fn send(
@@ -380,6 +512,7 @@ impl Pursuers {
             attacks: false,
             attack: CarAttack::default(),
             tank: TankAttack::default(),
+            boat: BoatAttack::default(),
             route: None,
             sight_wait: 0.0,
             sees: false,
@@ -387,7 +520,11 @@ impl Pursuers {
             reports: Vec::new(),
             leaving: false,
         });
-        self.gate[kind.gate()] = GATE;
+        // 0x82239AD0: 5 s, a boat's 2.
+        self.gate[kind.gate()] = if kind == Kind::Boat { 2 } else { GATE };
+        if kind == Kind::Boat {
+            self.boat_side = !self.boat_side;
+        }
         self.sent += 1;
         entity
     }
@@ -415,6 +552,7 @@ impl Pursuers {
         her: Vec3,
         her_velocity: Vec3,
         in_vehicle: bool,
+        she: Her,
         vanish: f32,
         labels: impl Fn(&ParkedVehicle) -> Vec<u32>,
         dt: f32,
@@ -428,6 +566,8 @@ impl Pursuers {
         if log {
             self.log = 5.0;
         }
+        let mut boats = 0;
+        let afloat = afloat(physics, vehicles);
         for p in &mut self.out {
             let Some(i) = vehicles
                 .iter()
@@ -454,10 +594,13 @@ impl Pursuers {
                             .map(|(d, _)| top.y - d)
                     };
                     let surface = ground(p.arrival.at);
-                    let at = v
-                        .spec
-                        .rest_on(p.arrival.at, yaw, ground)
-                        .map_or(p.arrival.at, |r| r.position);
+                    let at = if p.kind == Kind::Boat {
+                        p.arrival.at
+                    } else {
+                        v.spec
+                            .rest_on(p.arrival.at, yaw, ground)
+                            .map_or(p.arrival.at, |r| r.position)
+                    };
                     eprintln!(
                         "pursuers: the road point at {:.2} m, the ground under it at {:?}",
                         p.arrival.at.y, surface
@@ -478,6 +621,7 @@ impl Pursuers {
                         p.arrival.velocity.length(),
                         match (p.kind, p.attacks) {
                             (Kind::Tank, _) => "TankAttack",
+                            (Kind::Boat, _) => "BoatAttack",
                             (Kind::Car, true) => "CarAttack",
                             (Kind::Car, false) => "CarPursue",
                         }
@@ -503,7 +647,104 @@ impl Pursuers {
                 drop.push(i);
                 continue;
             }
-            if p.kind == Kind::Tank && !p.leaving {
+            if p.kind == Kind::Boat && !p.leaving {
+                // A boat's driver: `BoatAttack` (0x822A9750).
+                let (lo, hi) = v.spec.bounds;
+                let seats = v.spec.seating.as_deref();
+                let mut bears = boat_attack::Bears::default();
+                for &seat in crate::combat::armed_seats(v).iter().skip(1) {
+                    let Some(m) = v.spec.armed.iter().find(|m| m.seat == seat) else {
+                        continue;
+                    };
+                    let facing = m
+                        .nodes
+                        .iter()
+                        .flatten()
+                        .next()
+                        .and_then(|&n| v.spec.rest.get(n))
+                        .map_or(Vec3::Z, |t| t.z_axis.truncate().normalize_or(Vec3::Z));
+                    let yaw = seats
+                        .and_then(|s| s.turret_of(s.seat(seat)?))
+                        .map_or((0.0, 0.0), |t| t.yaw);
+                    bears.add(facing, yaw);
+                }
+                let hull = boat_attack::Hull {
+                    id: p.entity,
+                    car,
+                    length: hi.z - lo.z,
+                    width: hi.x - lo.x,
+                    height: hi.y - lo.y,
+                    stern: lo.z,
+                    range: v
+                        .spec
+                        .armed
+                        .iter()
+                        .find_map(|m| m.weapon.hint.map(|h| h.range)),
+                    rank: boats,
+                    bears,
+                };
+                boats += 1;
+                let target = boat_attack::Target {
+                    sight: Sight {
+                        at: her,
+                        unseen: 0.0,
+                        vehicle: in_vehicle,
+                    },
+                    velocity: her_velocity,
+                    forward: she.forward,
+                    size: she.size,
+                    swimming: she.swimming,
+                };
+                let state = p.boat.state;
+                let mut world = Afloat {
+                    physics: &*physics,
+                    id,
+                    from: at + (lo + hi).y * 0.5 * Vec3::Y,
+                    face: Vec3::new(hull.width, hull.height, 0.02) * 0.5,
+                    length: hull.length,
+                    her: she.vehicle,
+                };
+                self.rng = self.rng.wrapping_mul(0x0019_660d).wrapping_add(0x3c6e_f35f);
+                let rand = (self.rng >> 8) as f32 / (1u32 << 24) as f32;
+                let b = p.boat.think(
+                    &hull,
+                    &target,
+                    &mut world,
+                    &afloat,
+                    &mut self.boat_run,
+                    rand,
+                    dt,
+                );
+                if p.boat.state != state {
+                    eprintln!(
+                        "pursuers: {} {:#x} BoatAttack {:?} -> {:?}, {:.0} m from her",
+                        p.template,
+                        p.entity,
+                        state,
+                        p.boat.state,
+                        car.at.distance(her)
+                    );
+                }
+                physics.drive(
+                    id,
+                    m2_engine::physics::VehicleControls {
+                        throttle: b.throttle,
+                        steer: b.steer,
+                        brake: false,
+                        parked: false,
+                    },
+                );
+                if log {
+                    eprintln!(
+                        "pursuers: {} {:#x} {:.0} m from her at {:.1} m/s, {:?}",
+                        p.template,
+                        p.entity,
+                        car.at.distance(her),
+                        car.speed(),
+                        p.boat.state
+                    );
+                }
+            } else if p.kind == Kind::Tank && !p.leaving {
                 // A tank's driver: `TankAttack` (0x822B6508), another
                 // gunner aboard who can fire (0x822ECA20) taken as any
                 // armed seat but his.

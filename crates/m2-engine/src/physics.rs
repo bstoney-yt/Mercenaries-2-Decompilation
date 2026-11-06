@@ -5714,6 +5714,29 @@ impl Physics {
         Some(o)
     }
 
+    /// What a boat's sweep to a point met (0x822A8220): as
+    /// [`sweep_obstacle`](Self::sweep_obstacle), meeting the ground too;
+    /// the point on it.
+    pub fn sweep_afloat(&self, from: Vec3, to: Vec3, half: Vec3, skip: VehicleId) -> Option<Vec3> {
+        let d = to - from;
+        let len = d.length();
+        if len < 1e-4 {
+            return None;
+        }
+        let turn = Quat::from_rotation_y(d.x.atan2(d.z));
+        let cube = r::Cuboid::new(vector(half.max(Vec3::splat(1e-3))));
+        let options = rapier3d::parry::query::ShapeCastOptions {
+            max_time_of_impact: len,
+            stop_at_penetration: false,
+            ..Default::default()
+        };
+        let (_, hit) = self.skipping(Some(skip), true, |filter| {
+            self.world
+                .cast_shape(&pose(from, turn), vector(d / len), &cube, options, filter)
+        })?;
+        Some(from + d / len * hit.time_of_impact)
+    }
+
     /// Runs `f` with what a path search sees: what is solid but vehicle
     /// `skip`'s bodies, the terrain unless `terrain`, a model with nothing
     /// of it in the way ([`PathSolid::Nothing`]), and `past`.
