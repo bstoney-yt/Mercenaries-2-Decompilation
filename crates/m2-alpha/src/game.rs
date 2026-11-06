@@ -1017,6 +1017,9 @@ impl Game {
             let layers = self.scene.people.state_layers.clone();
             let layer_in = |l: u32| layers.as_ref().is_none_or(|set| set.contains(&l));
             if let Some(world) = &self.scene.world {
+                self.scene
+                    .people
+                    .set_authored_relations(&world.index.template_db.relations);
                 let zones = world.index.zones.iter().filter(|z| layer_in(z.layer));
                 self.scene.people.walker_cap =
                     m2_engine::population::zone_at(zones, focus.x, focus.z)

@@ -1446,12 +1446,16 @@ enum Projectile {
         /// Its round's `DamageKey` (`Rocket`): what a weak point it
         /// strikes takes of its blast ([`DamageTable::weak_point`]).
         key: Option<u32>,
+        /// A soldier's: what it does isn't to her account.
+        army: bool,
     },
     Grenade {
         at: Vec3,
         velocity: Vec3,
         fuse: f32,
         blast: Option<Blast>,
+        /// A soldier's, as a rocket's.
+        army: bool,
     },
     /// A grenade launcher's round: bursts where it lands.
     Round {
@@ -3064,12 +3068,14 @@ impl Combat {
         // Soldiers' shots and grenades.
         let target = self.target(f.player, true);
         for i in 0..f.people.npcs.len() {
+            // Whom they go for, of another army, else her.
+            let foe = f.people.npcs[i].foe_at;
             if std::mem::take(&mut f.people.npcs[i].fires) {
-                let at = f.people.npcs[i].fire_at.take().or(target);
+                let at = f.people.npcs[i].fire_at.take().or(foe).or(target);
                 self.npc_shoot(f, i, at);
             }
             if std::mem::take(&mut f.people.npcs[i].launches) {
-                self.npc_launch(f, i, target);
+                self.npc_launch(f, i, foe.or(target));
             }
             if let Some(at) = f.people.npcs[i].throws.take() {
                 self.npc_throw(f, i, at);
@@ -3246,6 +3252,7 @@ impl Combat {
                     blast: ammo.burst(),
                     homing: None,
                     key: ammo.key,
+                    army: false,
                 });
                 self.effect(
                     Effect::Flash {
@@ -3421,6 +3428,7 @@ impl Combat {
             blast: l.ammo.burst(),
             homing: None,
             key: l.ammo.key,
+            army: true,
         });
         self.effect(
             Effect::Flash {
@@ -3457,6 +3465,7 @@ impl Combat {
             velocity,
             fuse: FUSE,
             blast,
+            army: true,
         });
     }
 
@@ -3465,6 +3474,10 @@ impl Combat {
         let n = &f.people.npcs[i];
         let gun = n.gun;
         let shooter = n.shooter;
+        let at_her = n.foe_at.is_none();
+        if !at_her {
+            f.people.war_tally.0 += 1;
+        }
         let (from, case) = match (f.arsenal.npc_gun(gun), f.people.kinds.get(n.kind)) {
             (Some(w), Some(_)) => {
                 let (nodes, _) = n.rig.posed();
@@ -3527,7 +3540,19 @@ impl Combat {
             }
             let closest = from + dir * (aim - from).dot(dir).max(0.0);
             let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
-            if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
+            if let Some((_, Some(j))) = hit
+                && f.people.enemies(i, j)
+            {
+                // The round's `Damage` by their own row of the table, as
+                // her rounds are, without her gun's `Hero` multiple.
+                let round = gun.map_or(NPC_DAMAGE, |g| g.damage);
+                let key = gun.and_then(|g| g.damage_key);
+                let taken = round * self.on_person(&f.people.npcs[j], key);
+                let killed = f.people.npcs[j].shot_by_army(taken, dir * SHOT_PUSH, shooter);
+                f.people.war_tally.1 += 1;
+                f.people.war_tally.2 += u32::from(killed);
+            }
+            if at_her && f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
                 let damage = self.npc_round(gun);
                 let lost = self.hurt_player(f, damage, Some(from));
                 self.tally.taken_rounds += lost;
@@ -3754,6 +3779,7 @@ impl Combat {
             blast: self.launcher.blast(),
             homing,
             key: self.launcher.ammo.and_then(|a| a.key),
+            army: false,
         });
         self.effect(
             Effect::Flash {
@@ -4010,6 +4036,7 @@ impl Combat {
                     blast: ammo.burst(),
                     homing: None,
                     key: ammo.key,
+                    army: false,
                 });
                 self.effect(
                     Effect::Flash {
@@ -4332,6 +4359,7 @@ impl Combat {
                 blast,
                 homing: None,
                 key,
+                army: false,
             });
             if let Some(v) = f.vehicles.get_mut(i) {
                 v.fired += 1;
@@ -4891,6 +4919,7 @@ impl Combat {
                 velocity,
                 fuse: FUSE,
                 blast: None,
+                army: false,
             });
             return;
         };
@@ -4923,6 +4952,7 @@ impl Combat {
                 velocity,
                 fuse: timer.unwrap_or(FUSE),
                 blast: t.ammo.burst(),
+                army: false,
             });
         }
     }
@@ -5042,6 +5072,8 @@ impl Combat {
         }
         let mut puffs = Vec::new();
         let mut streaks = Vec::new();
+        // Where soldiers' rockets and grenades burst.
+        let mut armies = Vec::new();
         // Where people and vehicles are, for mines.
         let near: Vec<Vec3> = f
             .people
@@ -5066,6 +5098,7 @@ impl Combat {
                 blast,
                 homing,
                 key,
+                army,
             } => {
                 // Turning after the vehicle it locked on, no faster than its
                 // turn rate.
@@ -5085,7 +5118,11 @@ impl Combat {
                 let len = step.length();
                 let hit = cast_shot(f.physics, f.people, *at, step, len, None, *owner);
                 if let Some((d, _)) = hit {
-                    blasts.push((*at + step.normalize_or_zero() * d, *blast, *key));
+                    let burst = *at + step.normalize_or_zero() * d;
+                    if *army {
+                        armies.push(burst);
+                    }
+                    blasts.push((burst, *blast, *key));
                     return false;
                 }
                 if *shell {
@@ -5096,6 +5133,9 @@ impl Combat {
                 *at += step;
                 *flown += len;
                 if *flown > ROCKET_RANGE {
+                    if *army {
+                        armies.push(*at);
+                    }
                     blasts.push((*at, *blast, *key));
                     return false;
                 }
@@ -5168,6 +5208,7 @@ impl Combat {
                 velocity,
                 fuse,
                 blast,
+                army,
             } => {
                 velocity.y -= m2_engine::physics::GRAVITY * dt;
                 let step = *velocity * dt;
@@ -5179,6 +5220,9 @@ impl Combat {
                 }
                 *fuse -= dt;
                 if *fuse <= 0.0 {
+                    if *army {
+                        armies.push(*at);
+                    }
                     blasts.push((*at, *blast, None));
                     return false;
                 }
@@ -5195,7 +5239,20 @@ impl Combat {
             self.effect(Effect::Tracer { from, to }, dt * 1.5);
         }
         for (at, blast, key) in blasts {
+            // A soldier's blast isn't to her account.
+            let army = armies.contains(&at);
+            let hers: Vec<_> = f
+                .people
+                .npcs
+                .iter()
+                .map(|n| (n.hurt_by_her, n.killed_by_her))
+                .collect();
             self.explode_keyed(f, at, blast, key);
+            if army {
+                for (n, (hurt, killed)) in f.people.npcs.iter_mut().zip(hers) {
+                    (n.hurt_by_her, n.killed_by_her) = (hurt, killed);
+                }
+            }
         }
     }
 

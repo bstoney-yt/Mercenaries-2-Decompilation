@@ -14,7 +14,9 @@
 //! fight. Whom spawners send out stand whoever they are, but of the
 //! rest the layers place only story characters do (a one-word template:
 //! `Carmona`), not another army's. A story character is the scripts':
-//! they stay where they are put. The
+//! they stay where they are put. Armies fight each other as their
+//! templates' `Relationship` records and the scripts have it (see
+//! [`People::war`], from the 360 code). The
 //! behaviour (standing at posts, walking routes there and back with
 //! pauses, running from gunfire) is invented: the game's AI code is not
 //! decoded.
@@ -49,6 +51,15 @@ use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::scene::{Carry, Rig};
+
+/// The most subjects a soldier looks over for a target at each look,
+/// nearest first (invented: the frame rate's limit; the 360 queues its
+/// sight lines and runs at most 0x800 a frame, 0x822E8DF8).
+const FOE_LOOKS: usize = 4;
+/// The player's number in a mind's attack slot
+/// ([`m2_engine::ai_target::Slot`]); the rest go by their
+/// [`Npc::shooter`] number.
+const HER: u32 = u32::MAX;
 
 /// Soldiers come and go within these distances of the player, metres.
 const ACTIVE: f32 = 450.0;
@@ -882,6 +893,17 @@ pub struct Npc {
     pub layer: Option<u32>,
     /// The faction they are of ([`faction_of`]), if an army's.
     pub faction: Option<&'static str>,
+    /// Whom they go for ([`People::war`]).
+    pub slot: m2_engine::ai_target::Slot,
+    /// Where the person in their slot now is, unless that's her.
+    pub foe_at: Option<Vec3>,
+    /// Until they next look for a target, seconds.
+    foe_look: f32,
+    /// From how far they can see the one they look at, unless that's
+    /// her ([`People::war`]).
+    foe_reach: Option<f32>,
+    /// Who last shot them, of another army.
+    shot_by: Option<u32>,
     /// She hurt them: they fight her while her pursuit lasts.
     pub provoked: bool,
     /// Their death was taken as an infraction already.
@@ -1155,6 +1177,11 @@ impl Npc {
             layer: None,
             held: false,
             faction: None,
+            slot: m2_engine::ai_target::Slot::default(),
+            foe_at: None,
+            foe_look: 0.0,
+            foe_reach: None,
+            shot_by: None,
             provoked: false,
             hurt_by_her: false,
             killed_by_her: false,
@@ -1361,6 +1388,28 @@ impl Npc {
             }
         }
         !self.alive
+    }
+
+    /// A round from `by`, of another army, takes `damage`, as
+    /// [`hurt`](Self::hurt) but not to her account.
+    pub fn shot_by_army(&mut self, damage: f32, push: Vec3, by: u32) -> bool {
+        let hers = (self.hurt_by_her, self.killed_by_her);
+        let killed = self.hurt(damage, push);
+        (self.hurt_by_her, self.killed_by_her) = hers;
+        self.shot_by = Some(by);
+        killed
+    }
+
+    /// Whether they may go for another army: armed, on their feet, an
+    /// army's, no pacifist, and not held by the scripts.
+    fn can_war(&self) -> bool {
+        self.alive
+            && self.landed
+            && self.down.is_none()
+            && !self.held
+            && self.faction.is_some()
+            && self.gun.is_some()
+            && !self.ai.flags.pacifist
     }
 
     /// The human state they are in, as the scripts' `HumanStateTransition`
@@ -1650,11 +1699,16 @@ impl Npc {
     /// `Vision`, inside his `VisionFOV` (unless `any_way`, as in a fight,
     /// where he keeps turning to her), and nothing static between (a
     /// little short of her, so the car she sits in doesn't hide her).
+    /// How far they see what they look at, metres.
+    fn sight(&self) -> f32 {
+        self.foe_reach.unwrap_or(SIGHT * self.ai.vision)
+    }
+
     pub fn sees(&self, physics: &Physics, target: Vec3, any_way: bool) -> bool {
         let eye = self.character.position + Vec3::Y * EYE;
         let to = target - eye;
         let distance = to.length();
-        if distance > SIGHT * self.ai.vision || distance < 1e-3 {
+        if distance > self.sight() || distance < 1e-3 {
             return false;
         }
         if !any_way {
@@ -1681,7 +1735,7 @@ impl Npc {
         let at = self.character.position;
         let to = threat - at;
         let distance = to.with_y(0.0).length();
-        if self.ai.flags.pacifist || distance > SIGHT * self.ai.vision * 1.25 {
+        if self.ai.flags.pacifist || distance > self.sight() * 1.25 {
             return false;
         }
         self.look -= dt;
@@ -2282,6 +2336,8 @@ impl Npc {
             return;
         }
         self.since_shot += dt;
+        // Whom they go for, if not her ([`People::war`]).
+        let threat = self.foe_at.or(threat);
         // A soldier on watch who catches sight of her turns on her.
         if self.soldier && !self.alert && !self.ai.flags.pacifist {
             self.look -= dt;
@@ -2303,7 +2359,12 @@ impl Npc {
         if self.alert && !sent {
             match threat {
                 Some(t) if self.fight(physics, t, rng, dt) => return,
-                _ => self.calm(),
+                _ => {
+                    self.slot.clear();
+                    self.foe_at = None;
+                    self.foe_reach = None;
+                    self.calm();
+                }
             }
         }
         let at = self.character.position;
@@ -2487,7 +2548,7 @@ impl Npc {
         // The 360's locomotion node picks the gait from his speed
         // ([`loco_gait`](crate::scene::loco_gait)).
         let gait = crate::scene::loco_gait(self.motion.paces, moved);
-        if self.soldier {
+        if self.soldier || self.foe_at.is_some() {
             let clips = self.clips;
             self.rig.hold_rifle(gait, &clips, Carry::Ready);
         } else {
@@ -2584,6 +2645,14 @@ pub struct People {
     /// ([`People::set_hostile`]); `None` before they have: then only the
     /// Venezuelans fight.
     pub hostile: Option<HashSet<&'static str>>,
+    /// How the factions regard each other ([`People::set_relations`]).
+    relations: HashMap<(&'static str, &'static str), f32>,
+    /// As the templates have it.
+    authored: HashMap<(&'static str, &'static str), f32>,
+    /// Rounds between the armies since the start: fired, hit, killed.
+    pub war_tally: (u32, u32, u32),
+    /// Until the war's next log line, seconds.
+    war_log: f32,
     /// The faction she passes for, disguised in its vehicle
     /// ([`People::set_disguise`]).
     pub disguised_as: Option<&'static str>,
@@ -3042,7 +3111,6 @@ impl People {
     ) -> bool {
         if let Some(n) = self.npcs.iter_mut().find(|n| n.spawn == Some(guid)) {
             if n.character.position.distance(at) > 0.25 || (n.facing - facing).abs() > 0.01 {
-                n.character.position = at;
                 n.character.velocity = Vec3::ZERO;
                 n.facing = facing;
                 n.brain = Brain::Post { facing };
@@ -3158,6 +3226,167 @@ impl People {
             eprintln!("people: she passes for {faction:?}");
             self.disguised_as = faction;
             self.refresh_sides();
+        }
+    }
+
+    /// How the factions regard each other, from the templates'
+    /// `Relationship` records: the two armies' relation, -100 to 100, by
+    /// the manager's abbreviations, the rest left out.
+    pub fn set_authored_relations(&mut self, records: &[(String, String, f32)]) {
+        if !self.authored.is_empty() {
+            return;
+        }
+        let relations = records
+            .iter()
+            .filter_map(|(a, b, r)| Some(((faction_by_label(a)?, faction_by_label(b)?), *r)))
+            .collect();
+        self.authored = relations;
+        self.set_relations(HashMap::new());
+    }
+
+    /// What the scripts set of how the factions regard each other, over
+    /// the templates' ([`set_authored_relations`](Self::set_authored_relations)):
+    /// the 360's `Ai.SetRelation` writes the same table. A pair the
+    /// scripts have at 0 here is one they never set (`Ai.GetRelation`
+    /// answers 0 for those), and keeps the templates' value.
+    pub fn set_relations(&mut self, set: HashMap<(&'static str, &'static str), f32>) {
+        let mut relations = self.authored.clone();
+        relations.extend(set.into_iter().filter(|(_, r)| *r != 0.0));
+        if self.relations != relations {
+            let mut hostile: Vec<_> = relations
+                .iter()
+                .filter(|(_, r)| m2_engine::ai_target::attacks(**r))
+                .map(|(pair, _)| *pair)
+                .collect();
+            hostile.sort_unstable();
+            eprintln!("people: armies at war now {hostile:?}");
+            self.relations = relations;
+        }
+    }
+
+    /// Whether faction `a`'s people may attack faction `b`'s: how `a`
+    /// regards `b`, each way apart (0x822F0440 takes the pair in order).
+    fn at_war(&self, a: &str, b: &str) -> bool {
+        a != b
+            && self
+                .relations
+                .iter()
+                .find(|((x, y), _)| *x == a && *y == b)
+                .is_some_and(|(_, r)| m2_engine::ai_target::attacks(*r))
+    }
+
+    /// Whether persons `i` and `j` are of armies at war.
+    pub fn enemies(&self, i: usize, j: usize) -> bool {
+        match (self.npcs[i].faction, self.npcs[j].faction) {
+            (Some(a), Some(b)) => self.at_war(a, b),
+            _ => false,
+        }
+    }
+
+    /// Armies fight each other: each fighter looks over whom they can see
+    /// of the armies theirs is at war with, her too if theirs fights her,
+    /// and goes for the one their attack slot settles on
+    /// ([`m2_engine::ai_target`]).
+    fn war(&mut self, physics: &Physics, threat: Option<Vec3>, dt: f32) {
+        if self.relations.is_empty() {
+            return;
+        }
+        let all: Vec<(u32, &'static str, Vec3, f32)> = self
+            .npcs
+            .iter()
+            .filter(|n| n.alive && n.landed)
+            .filter_map(|n| Some((n.shooter, n.faction?, n.chest(), n.ai.visibility)))
+            .collect();
+        for i in 0..self.npcs.len() {
+            if !self.npcs[i].can_war() {
+                if self.npcs[i].foe_at.take().is_some() {
+                    self.npcs[i].slot.clear();
+                    self.npcs[i].foe_reach = None;
+                }
+                continue;
+            }
+            let me = self.npcs[i].shooter;
+            let side = self.npcs[i].faction.unwrap_or_default();
+            let at = self.npcs[i].chest();
+            let held = self.npcs[i].slot.who.filter(|&w| w != HER);
+            let foe = held.and_then(|w| all.iter().find(|c| c.0 == w));
+            if held.is_some() && foe.is_none_or(|c| !self.at_war(side, c.1)) {
+                let n = &mut self.npcs[i];
+                n.slot.clear();
+                n.foe_at = None;
+                n.foe_reach = None;
+                n.alert = n.soldier && n.alert;
+            }
+            let n = &mut self.npcs[i];
+            n.foe_look -= dt;
+            let shot = n.shot_by.take();
+            if n.foe_look > 0.0 && shot.is_none() {
+                if let Some(c) = foe.filter(|_| n.slot.who.is_some()) {
+                    n.foe_at = Some(c.2);
+                }
+                continue;
+            }
+            n.foe_look = LOOK_EVERY;
+            // As far as they can see each: their `Vision` times its
+            // `Visibility`, half as far again for the one in the slot
+            // (0x822E89B0).
+            let vision = n.ai.vision;
+            let held_now = n.slot.who;
+            let reach = |c: &(u32, &'static str, Vec3, f32)| {
+                let hold = if held_now == Some(c.0) { 1.5 } else { 1.0 };
+                vision * c.3 * hold
+            };
+            let mut seen: Vec<(f32, u32, Vec3, &'static str, f32)> = all
+                .iter()
+                .filter(|c| c.0 != me && c.1 != side)
+                .map(|c| (c.2.distance(at), c.0, c.2, c.1, reach(c)))
+                .filter(|c| c.0 <= c.4)
+                .collect();
+            seen.sort_by(|a, b| a.0.total_cmp(&b.0));
+            seen.retain(|c| self.at_war(side, c.3));
+            seen.truncate(FOE_LOOKS);
+            let n = &mut self.npcs[i];
+            let current = n.foe_at.map(|f| f.distance(at));
+            let alert = n.alert;
+            for (d, who, chest, _, far) in seen {
+                let in_slot = n.slot.who == Some(who);
+                n.foe_reach = Some(far);
+                if in_slot || shot == Some(who) || n.sees(physics, chest, alert) {
+                    let score = m2_engine::ai_target::score(d, current, in_slot);
+                    n.slot.offer(who, score);
+                }
+            }
+            n.foe_reach = None;
+            if n.soldier
+                && let Some(t) = threat
+            {
+                let d = t.distance(at);
+                let in_slot = n.slot.who == Some(HER);
+                if d <= SIGHT * vision && (in_slot || n.alert || n.sees(physics, t, false)) {
+                    n.slot
+                        .offer(HER, m2_engine::ai_target::score(d, current, in_slot));
+                }
+            }
+            match n.slot.who.filter(|&w| w != HER) {
+                Some(w) => {
+                    let c = all.iter().find(|c| c.0 == w);
+                    n.foe_at = c.map(|c| c.2);
+                    n.foe_reach = c.map(|c| vision * c.3 * 1.5);
+                    if !n.alert {
+                        n.alert = true;
+                        n.spotted = true;
+                        n.last_seen = n.foe_at;
+                        if let Some(c) = c {
+                            let d = c.2.distance(at);
+                            eprintln!("war: a {side} soldier goes for a {} at {d:.0} m", c.1);
+                        }
+                    }
+                }
+                None => {
+                    n.foe_at = None;
+                    n.foe_reach = None;
+                }
+            }
         }
     }
 
@@ -3455,6 +3684,24 @@ impl People {
         dt: f32,
     ) {
         self.pursue(dt);
+        self.war(physics, threat, dt);
+        self.war_log -= dt;
+        if self.war_log <= 0.0 {
+            self.war_log = 30.0;
+            let fighting = self.npcs.iter().filter(|n| n.foe_at.is_some()).count();
+            let mut sides: Vec<(&str, usize)> = Vec::new();
+            for n in self.npcs.iter().filter(|n| n.alive) {
+                let f = n.faction.unwrap_or("-");
+                match sides.iter_mut().find(|s| s.0 == f) {
+                    Some(s) => s.1 += 1,
+                    None => sides.push((f, 1)),
+                }
+            }
+            let (fired, hit, killed) = self.war_tally;
+            eprintln!(
+                "war: {sides:?}: {fighting} fighting, {fired} rounds, {hit} hit, {killed} killed"
+            );
+        }
         self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
         let scripted = std::mem::take(&mut self.scripted);
@@ -5132,6 +5379,62 @@ pub(crate) mod tests {
         assert!(civilian.hurt(60.0, Vec3::ZERO));
         assert!(!civilian.alive);
         assert!(!civilian.hurt(60.0, Vec3::ZERO), "only dies once");
+    }
+
+    #[test]
+    fn armies_at_war_go_for_each_other_and_others_dont() {
+        let physics = ground();
+        let mut people = People::default();
+        let fighters = [
+            (Vec3::new(0.0, 0.0, 0.0), "Vza"),
+            (Vec3::new(0.0, 0.0, 15.0), "All"),
+            (Vec3::new(0.0, 0.0, -15.0), "Chi"),
+        ];
+        for (k, (at, side)) in fighters.into_iter().enumerate() {
+            let post = Brain::Post { facing: 0.0 };
+            let mut n = Npc::new(k, &rig(), at + Vec3::Y, 0.0, post, Some(1));
+            n.facing = if at.z > 0.0 {
+                std::f32::consts::PI
+            } else {
+                0.0
+            };
+            n.faction = Some(side);
+            n.gun = Some(rifle());
+            n.landed = true;
+            n.soldier = false;
+            n.character.position = at;
+            people.npcs.push(n);
+        }
+        let dt = 0.25;
+        people.war(&physics, None, dt);
+        assert!(
+            people.npcs.iter().all(|n| n.foe_at.is_none()),
+            "no relations, no war"
+        );
+        let relations = [
+            (("Vza", "All"), -80.0),
+            (("All", "Vza"), -80.0),
+            (("Vza", "Chi"), 50.0),
+        ];
+        people.set_relations(relations.into_iter().collect());
+        people.war(&physics, None, dt);
+        let foe = |p: &People, i: usize| p.npcs[i].foe_at;
+        assert!(
+            foe(&people, 0).is_some_and(|f| f.z > 0.0),
+            "the Allies, not China"
+        );
+        assert!(
+            foe(&people, 1).is_some_and(|f| f.z.abs() < 2.0),
+            "the Venezuelan"
+        );
+        assert_eq!(foe(&people, 2), None, "China is at peace with both");
+        assert!(people.npcs[1].alert && !people.npcs[1].soldier);
+        // One who falls drops out of the slot of who went for him.
+        let by = people.npcs[0].shooter;
+        assert!(people.npcs[1].shot_by_army(1e4, Vec3::ZERO, by));
+        assert!(!people.npcs[1].killed_by_her && !people.npcs[1].hurt_by_her);
+        people.war(&physics, None, dt);
+        assert_eq!(foe(&people, 0), None);
     }
 
     #[test]
