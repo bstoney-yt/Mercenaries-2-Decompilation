@@ -208,14 +208,19 @@ fn carried_class(db: &m2_engine::world::Templates, role: &str, named: bool) -> u
 /// 2026-10-08: "model 15d89832 ... locomotion"), whose first row gives
 /// the gait's animation handle ([`m2_assets::animation_table::character_clip`]):
 /// idle `5aac9b8d`, walk `695f945a`, run `b99ad3b3` (the run's, as the
-/// rifle run's), sprint `f71c4238` (PC, 2026-10-09). That those handles
-/// are the gaits is inferred from these clips' speeds alone: the
-/// handles' names are not known.
-const GAIT_KEYS: [(Gait, u32); 4] = [
+/// rifle run's), sprint `f71c4238` (PC, 2026-10-09). The handles are
+/// the names' hashes ([`m2_assets::name_hash`]) of the 360's locomotion
+/// node's gaits: `Upright_Walk_Forward` `695f945a`, `Upright_Jog_Forward`
+/// `b99ad3b3`, `Upright_Run_Forward` `f71c4238` and
+/// `Upright_Sprint_Forward` `5cc77d41` ([`m2_engine::blend`]), whose
+/// clip for Jennifer with a rifle is `50abfbf3` (the table's row 1286,
+/// PC 2026-11-06): the 360's sprint, [`Gait::FullSprint`].
+const GAIT_KEYS: [(Gait, u32); 5] = [
     (Gait::Idle, 0x01ca_8a69),
     (Gait::Walk, 0x067a_b57f),
     (Gait::Run, 0x1091_2665),
     (Gait::Sprint, 0x076a_6136),
+    (Gait::FullSprint, 0x50ab_fbf3),
 ];
 
 /// Below this a character stands, m/s. Not the 360's: its node stands
@@ -229,8 +234,8 @@ pub const STAND: f32 = 0.3;
 /// The gait the 360's locomotion node plays moving `moved` m/s with the
 /// `Upright` paces `paces` ([`m2_engine::blend::gait`]), as the alpha's
 /// gaits: its jog plays the alpha's run clip (`Upright_Jog_Forward`), its
-/// run the alpha's sprint (`Upright_Run_Forward`), and its sprint too (the
-/// 360 plays `Upright_Sprint_Forward` there, which the alpha doesn't bind).
+/// run the alpha's sprint (`Upright_Run_Forward`), and its sprint
+/// [`Gait::FullSprint`] (`Upright_Sprint_Forward`).
 ///
 /// Below [`STAND`] she stands, not below the 360's
 /// [`STILL`](m2_engine::blend::STILL): see there.
@@ -243,7 +248,8 @@ pub fn loco_gait(paces: [f32; 4], moved: f32) -> Gait {
         LocoGait::Still => Gait::Idle,
         LocoGait::Walk => Gait::Walk,
         LocoGait::Jog => Gait::Run,
-        LocoGait::Run | LocoGait::Sprint => Gait::Sprint,
+        LocoGait::Run => Gait::Sprint,
+        LocoGait::Sprint => Gait::FullSprint,
     }
 }
 
@@ -452,7 +458,9 @@ fn table_clips(
         let g = format!("{gait:?}").to_lowercase();
         let was = rig.gait_clip(gait).map(|i| rig.clips[i].hash);
         match resolve(key).and_then(|p| Some((p, index(p.clip)?))) {
-            Some((p, i)) if !jennifer || was == Some(p.clip) => {
+            // The 360's sprint has no footage-matched pick of hers: the
+            // table's stands.
+            Some((p, i)) if !jennifer || was == Some(p.clip) || gait == Gait::FullSprint => {
                 eprintln!("hero clips: {hero}: {g} {:08x} from {}", p.clip, row(&p));
                 gaits.push((gait, i));
             }
@@ -1004,6 +1012,14 @@ impl Rig {
     /// standing locomotion plays the idle clip.
     pub fn hold_rifle(&mut self, gait: Gait, clips: &npc::FightClips, carry: Carry) {
         self.shuffling = false;
+        // The 360's sprint with no clip of its own is the sprint (its
+        // two-handed one too).
+        let gait = match gait {
+            Gait::FullSprint if self.gait_clip(gait) == self.gait_clip(Gait::Sprint) => {
+                Gait::Sprint
+            }
+            g => g,
+        };
         // Aiming upright (not a hero, who aims in crouched), the 360's
         // locomotion node plays its aim movement on the legs and the aim
         // sweeps over the upper body ([`Rig::sweep`]): the legs' gait is
@@ -1323,7 +1339,8 @@ impl Rig {
             Gait::Idle => Gait::Walk,
             Gait::Walk => Gait::Run,
             Gait::Run => Gait::Sprint,
-            Gait::Sprint => Gait::Idle,
+            Gait::Sprint => Gait::FullSprint,
+            Gait::FullSprint => Gait::Idle,
         });
     }
 
@@ -4284,6 +4301,17 @@ mod tests {
         assert_eq!(c.at, lying.at);
         assert!((c.age - 6.0).abs() < 1e-3);
     }
+    #[test]
+    fn the_360s_sprint_is_a_gait_of_its_own() {
+        // Jennifer's paces: 2, 5, 7 and 12 m/s.
+        let jen = [2.0, 5.0, 7.0, 12.0];
+        assert_eq!(loco_gait(jen, 4.0), Gait::Run);
+        assert_eq!(loco_gait(jen, 8.0), Gait::Sprint);
+        assert_eq!(loco_gait(jen, 12.0), Gait::FullSprint);
+        // No sprint past the run (people's): the run goes on.
+        assert_eq!(loco_gait([1.2, 2.5, 5.0, -1.0], 9.0), Gait::Sprint);
+    }
+
     #[test]
     fn a_moving_gait_follows_the_ground_speed() {
         // 3 m/s on a 2.5 m/s clip: 1.2, whatever the clip's table rate.

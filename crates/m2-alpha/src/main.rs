@@ -2159,7 +2159,7 @@ fn screenshot(
                 m2_math::glam::Vec2::Y
             },
             walk: gait == Gait::Walk,
-            sprint: gait == Gait::Sprint,
+            sprint: matches!(gait, Gait::Sprint | Gait::FullSprint),
             ..Intent::default()
         };
         let from = game.scene.player.as_ref().map(|p| p.character.position);

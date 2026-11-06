@@ -106,7 +106,7 @@ pub fn wire_gait(g: Gait) -> m2_net::Gait {
         Gait::Idle => m2_net::Gait::Idle,
         Gait::Walk => m2_net::Gait::Walk,
         Gait::Run => m2_net::Gait::Run,
-        Gait::Sprint => m2_net::Gait::Sprint,
+        Gait::Sprint | Gait::FullSprint => m2_net::Gait::Sprint,
     }
 }
 

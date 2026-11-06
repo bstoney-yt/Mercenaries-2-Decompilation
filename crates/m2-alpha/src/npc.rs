@@ -849,10 +849,10 @@ impl FightClips {
             (Gait::Idle, _) => 0,
             (Gait::Walk, false) => 1,
             (Gait::Run, false) => 2,
-            (Gait::Sprint, false) => 3,
+            (Gait::Sprint | Gait::FullSprint, false) => 3,
             (Gait::Walk, true) => 4,
             (Gait::Run, true) => 5,
-            (Gait::Sprint, true) => 6,
+            (Gait::Sprint | Gait::FullSprint, true) => 6,
         }
     }
 
