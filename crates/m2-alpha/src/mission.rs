@@ -1486,28 +1486,8 @@ impl MissionLink {
     /// `seq` ([`HUD_CALLS`]): they are let go, so each view copies only
     /// those still to take.
     pub fn hud_calls_taken(&self, seq: u64) {
-        let State::Running(m) = &self.state else {
-            return;
-        };
-        let Ok(Some(calls)) = m
-            .lua()
-            .globals()
-            .get::<Option<mlua::Table>>("__m2_hud_calls")
-        else {
-            return;
-        };
-        let kept: Vec<mlua::Table> = calls
-            .clone()
-            .sequence_values::<mlua::Table>()
-            .flatten()
-            .filter(|t| t.get::<u64>("seq").unwrap_or(0) > seq)
-            .collect();
-        if kept.len() == calls.raw_len() {
-            return;
-        }
-        let _ = calls.clear();
-        for (i, t) in kept.into_iter().enumerate() {
-            let _ = calls.raw_set(i + 1, t);
+        if let State::Running(m) = &self.state {
+            let_go_hud_calls(m.lua(), seq);
         }
     }
 
@@ -4418,6 +4398,33 @@ pub fn set_hero(mission: &mut Mission, hero: Hero, max: f32, who: &str) {
 }
 
 /// The calls [`HUD_CALLS`] keeps, oldest first.
+/// Lets go of the kept HUD calls ([`HUD_CALLS`]) through number `seq`, in
+/// place, from the scripts' side. Not with mlua's `Table::clear`, which
+/// leaves the table on the Lua stack each time (mlua 0.11's own code: it
+/// pushes it and never pops it); in play, where this runs each frame, no
+/// HUD call was kept after the first time (playtest: Fiona's contract menu
+/// never reached the HUD, nor did any later call).
+fn let_go_hud_calls(lua: &mlua::Lua, seq: u64) {
+    let _ = lua
+        .load(
+            r#"
+            local seq, t = ..., __m2_hud_calls
+            if type(t) ~= "table" then return end
+            local n, kept = #t, 0
+            for i = 1, n do
+                local c = t[i]
+                if type(c) == "table" and (tonumber(c.seq) or 0) > seq then
+                    kept = kept + 1
+                    t[kept] = c
+                end
+            end
+            for i = n, kept + 1, -1 do t[i] = nil end
+            "#,
+        )
+        .set_name("=m2-hud calls let go")
+        .call::<()>(seq as f64);
+}
+
 fn hud_calls(lua: &mlua::Lua) -> Vec<HudCall> {
     let Ok(Some(calls)) = lua.globals().get::<Option<mlua::Table>>("__m2_hud_calls") else {
         return Vec::new();
@@ -8328,5 +8335,37 @@ mod tests {
         // Shown at 200 to 300 m, where the beta's 175 m hid it.
         assert!(m.alpha_from(Vec3::new(290.0, 0.0, 0.0)) > 0.0);
         assert_eq!(m.alpha_from(Vec3::new(301.0, 0.0, 0.0)), 0.0);
+    }
+
+    #[test]
+    fn hud_calls_let_go_leave_the_new_ones_to_take() {
+        let lua = mlua::Lua::new();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(
+            r#"
+            function add(n)
+                for _ = 1, n do
+                    __m2_hud_call_count = __m2_hud_call_count + 1
+                    table.insert(__m2_hud_calls, { seq = __m2_hud_call_count,
+                        group = "Pda.Map", method = "AddBlip", data = {}, callback = false })
+                end
+            end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let mut last = 0;
+        for n in [3, 600, 1, 0, 5] {
+            lua.load(format!("add({n})")).exec().unwrap();
+            let new: Vec<u64> = hud_calls(&lua)
+                .iter()
+                .map(|c| c.seq)
+                .filter(|&s| s > last)
+                .collect();
+            assert_eq!(new.len(), n, "after adding {n}: {new:?}");
+            last = new.last().copied().unwrap_or(last);
+            let_go_hud_calls(&lua, last);
+            assert!(hud_calls(&lua).is_empty());
+        }
     }
 }
