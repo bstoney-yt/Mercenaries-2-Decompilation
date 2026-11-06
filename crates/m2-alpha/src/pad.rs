@@ -352,7 +352,7 @@ impl Pad {
             );
         }
         let mut s = state.unwrap_or_default();
-        self.touch.set_driving(driving);
+        self.touch.set_layout(driving, self.pda || self.stick_menu);
         if self.touch.used {
             s = crate::touch::merge(s, self.touch.state());
             let (dx, dy) = self.touch.take_look();
