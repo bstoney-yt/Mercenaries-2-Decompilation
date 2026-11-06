@@ -156,7 +156,8 @@ impl PathMoves {
                 let (lo, hi) = v.spec.bounds;
                 let length = hi.z - lo.z;
                 let size = length.max(hi.x - lo.x);
-                let push = boat_attack::keep_clear(&car, length, size, &afloat);
+                let near = crate::pursuers::around(physics, &afloat, &car, (lo, hi));
+                let push = boat_attack::keep_clear(&car, length, size, &near);
                 let b = boat_attack::drive_to(&car, m.route[m.next], top, false, push);
                 VehicleControls {
                     throttle: b.throttle,
