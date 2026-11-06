@@ -3831,6 +3831,17 @@ impl Thread {
         // rotation (the map turns with the camera).
         if let Some([x, y, z]) = s.position {
             fire(lua, "GuiMinimapUpdate", (x, y, z, s.heading))?;
+            // And for the PDA map's own blip of her, which it places by
+            // `Object.GetPosition` of her character (`MrxGuiPda`).
+            if let Some(me) = self
+                .mission
+                .world()
+                .borrow_mut()
+                .objects
+                .get_mut(&m2_game::mission::PLAYER)
+            {
+                me.position = [x, y, z];
+            }
         }
         // Into the vehicle before her health is told, as the health box
         // picks its badge then.

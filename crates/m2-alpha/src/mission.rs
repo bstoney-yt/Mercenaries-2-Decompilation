@@ -451,8 +451,21 @@ for group, names in pairs(methods) do
                     -- The contract's fanfare, which the flow waits on.
                     if group == "Fanfare" then __m2_fanfare = __m2_hud_call_count end
                 end
+                local data = copy(t, 0)
+                -- A PDA map blip on an object goes where the object is:
+                -- the HUD's own state knows no objects' places, where the
+                -- engine's map reads them (`Object.GetPosition(uGuid)`,
+                -- `MrxGuiPda`'s blip list).
+                if group == "Pda.Map" and name == "AddBlip" and type(data) == "table"
+                    and data.uGuid ~= nil and type(Object) == "table"
+                    and type(Object.GetPosition) == "function" then
+                    local x, _, z = Object.GetPosition(data.uGuid)
+                    if type(x) == "number" and type(z) == "number" then
+                        data.nX, data.nY = x, z
+                    end
+                end
                 table.insert(__m2_hud_calls, { seq = __m2_hud_call_count,
-                    group = group, method = name, data = copy(t, 0),
+                    group = group, method = name, data = data,
                     callback = callback })
                 if #__m2_hud_calls > (__m2_hud_calls_kept or 64) then table.remove(__m2_hud_calls, 1) end
                 local r
@@ -7595,20 +7608,28 @@ mod tests {
                 Pda.Map:AddBlip({ sName = "b" .. i, nX = i, nY = -i, sMission = "PmcCon001",
                     sTexture = "icon_action_3_mc", sLabel = "l", sDesc = "d", sFaction = "PMC" })
             end
-            Pda.Map:RemoveBlip({ sName = "b1" })"#,
+            Pda.Map:RemoveBlip({ sName = "b1" })
+            Object = { GetPosition = function(g) return 10, 2, -30 end }
+            Pda.Map:AddBlip({ sName = "on", uGuid = 5, nX = 0, nY = 0 })"#,
         )
         .exec()
         .unwrap();
         let t = std::time::Instant::now();
         let calls = hud_calls(&lua);
         eprintln!("{} calls copied in {:?}", calls.len(), t.elapsed());
-        assert_eq!(calls.len(), 302);
+        assert_eq!(calls.len(), 303);
         assert_eq!(
             (calls[0].group.as_str(), calls[0].method.as_str()),
             ("Pda.Map", "AddMission")
         );
         assert_eq!(calls[1].method, "AddBlip");
         assert_eq!(calls[301].method, "RemoveBlip");
+        // One on an object: where the object is (x, and z as the map's y).
+        let Plain::Table(on) = &calls[302].data else {
+            panic!("{:?}", calls[302].data);
+        };
+        assert!(on.contains(&(Plain::Text("nX".into()), Plain::Number(10.0))));
+        assert!(on.contains(&(Plain::Text("nY".into()), Plain::Number(-30.0))));
     }
 
     #[test]
