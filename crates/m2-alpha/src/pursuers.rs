@@ -492,6 +492,21 @@ impl Pursuers {
             self.log = 5.0;
         }
         let mut boats = 0;
+        // What the boats keep clear of (0x822ED248): boats; not buildings.
+        let afloat: Vec<boat_attack::Neighbour> = vehicles
+            .iter()
+            .filter(|v| v.spec.is_boat() && !v.wrecked)
+            .filter_map(|v| {
+                let id = v.id?;
+                let turn = physics.vehicle_transform(id)?;
+                let (lo, hi) = v.spec.bounds;
+                Some(boat_attack::Neighbour {
+                    at: turn.transform_point3((lo + hi) * 0.5),
+                    radius: (hi - lo).length() * 0.5,
+                    velocity: physics.vehicle_velocity(id),
+                })
+            })
+            .collect();
         for p in &mut self.out {
             let Some(i) = vehicles
                 .iter()
@@ -578,6 +593,7 @@ impl Pursuers {
                     car,
                     length: hi.z - lo.z,
                     width: hi.x - lo.x,
+                    height: hi.y - lo.y,
                     range: v
                         .spec
                         .armed
@@ -592,18 +608,31 @@ impl Pursuers {
                     vehicle: in_vehicle,
                 };
                 let state = p.boat.state;
+                // 0x822A8220: the boat's face swept to the point, with
+                // the water it needs there (inferred).
+                let middle = at + (lo + hi).y * 0.5 * Vec3::Y;
+                let face = Vec3::new(hull.width, hull.height, 0.02) * 0.5;
                 let mut water = |q: Vec3| {
                     physics.water_at(q.x, q.z).is_some_and(|s| {
                         physics
                             .cast_ray(Vec3::new(q.x, s + 0.1, q.z), Vec3::NEG_Y, 5.0)
                             .is_none()
-                    })
+                    }) && physics
+                        .sweep_obstacle(middle, q.with_y(middle.y), face, Some(id))
+                        .is_none()
                 };
                 self.rng = self.rng.wrapping_mul(0x0019_660d).wrapping_add(0x3c6e_f35f);
                 let rand = (self.rng >> 8) as f32 / (1u32 << 24) as f32;
-                let b = p
-                    .boat
-                    .think(&hull, &sight, her_velocity, her_size, &mut water, rand, dt);
+                let b = p.boat.think(
+                    &hull,
+                    &sight,
+                    her_velocity,
+                    her_size,
+                    &mut water,
+                    &afloat,
+                    rand,
+                    dt,
+                );
                 if p.boat.state != state {
                     eprintln!(
                         "pursuers: {} {:#x} BoatAttack {:?} -> {:?}, {:.0} m from her",
