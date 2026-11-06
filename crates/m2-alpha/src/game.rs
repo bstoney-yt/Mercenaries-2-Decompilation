@@ -2837,6 +2837,44 @@ impl Game {
         ))
     }
 
+    /// The nearest vehicles to `ear` someone else drives, as their engines
+    /// are heard ([`crate::sound::ENGINES_TRACKED`]).
+    pub fn others_engines(&self, ear: Vec3) -> Vec<crate::sound::HeardEngine> {
+        let Some(world) = self.scene.world.as_ref() else {
+            return Vec::new();
+        };
+        let driven = self.scene.player.as_ref().and_then(|p| p.driving);
+        let mut near: Vec<(f32, crate::sound::HeardEngine)> = self
+            .scene
+            .vehicles
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| driven != Some(*i) && v.exhausting(false))
+            .filter_map(|(i, v)| {
+                let set = *self.scene.engine_sets.get(&v.spec.model)?;
+                let id = v.id?;
+                let at = world.physics.vehicle_transform(id)?.w_axis.truncate();
+                (set != 0).then_some((
+                    at.distance(ear),
+                    crate::sound::HeardEngine {
+                        id: i,
+                        at,
+                        set,
+                        speed: world.physics.vehicle_speed(id),
+                        top: v.spec.tuning.max_speed.unwrap_or(if v.spec.tracked {
+                            14.0
+                        } else {
+                            32.0
+                        }),
+                    },
+                ))
+            })
+            .collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        near.truncate(crate::sound::ENGINES_TRACKED);
+        near.into_iter().map(|n| n.1).collect()
+    }
+
     /// The vehicle being driven's engine: its sound bank (the one its
     /// template names, else one for its kind), speed and throttle. A wreck
     /// has none.
@@ -4142,12 +4180,10 @@ fn state_effects(world: &World, combat: &mut Combat) {
     }
 }
 
-/// How near the player a vehicle's exhausts smoke (invented: a budget, the
-/// game's own reach for them is not traced).
-const EXHAUST_REACH: f32 = 120.0;
-
 /// Keeps each crewed vehicle's exhaust effects going at their nodes
-/// (`m2_engine::vehicle_parts`; the heat haze is drawn with the vehicle).
+/// (`m2_engine::vehicle_parts`; the heat haze is drawn with the vehicle),
+/// however far off: from the 360 code, 0x822772B0 and 0x822766F0 look at
+/// no distance.
 fn exhaust_smoke(
     world: &World,
     vehicles: &[ParkedVehicle],
@@ -4158,7 +4194,6 @@ fn exhaust_smoke(
     let Some(player) = player else {
         return;
     };
-    let near = player.character.position;
     for (i, v) in vehicles.iter().enumerate() {
         if !v.exhausting(player.driving == Some(i)) {
             continue;
@@ -4170,9 +4205,6 @@ fn exhaust_smoke(
         let Some(at) = v.id.and_then(|id| world.physics.vehicle_transform(id)) else {
             continue;
         };
-        if at.w_axis.truncate().distance(near) > EXHAUST_REACH {
-            continue;
-        }
         for (k, &(node, effect)) in parts.iter().enumerate() {
             let Some(rest) = v.spec.rest.get(node) else {
                 continue;

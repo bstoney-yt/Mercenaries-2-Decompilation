@@ -469,7 +469,9 @@ impl Mixer {
             levels: [Glide::ONE; Category::ALL],
             pitches: [Glide::ONE; Category::ALL],
             volumes: [1.0; Category::ALL],
-            max_voices: 64,
+            // The 360 sound system's pool of playing sounds (0x8236A528;
+            // that it is what limits voices is inferred).
+            max_voices: 256,
             reverb: None,
             send: Vec::new(),
             holding: [false; Category::ALL],
@@ -911,6 +913,8 @@ pub struct EngineTrack {
     pub sound: SoundBuffer,
     /// Its record's level.
     pub volume: f32,
+    /// How far it carries, as its record says.
+    pub falloff: Option<Falloff>,
     pub curves: Vec<m2_assets::voice::Curve>,
 }
 
@@ -942,10 +946,19 @@ impl EngineCue {
             tracks.push(EngineTrack {
                 sound,
                 volume: volume * t.level,
+                falloff: Falloff::of_record(record.min_distance, record.max_distance),
                 curves: curves.clone(),
             });
         }
         (!tracks.is_empty()).then_some(Self { tracks })
+    }
+
+    /// How far it carries: its farthest track's record's distance.
+    pub fn reach(&self) -> f32 {
+        self.tracks
+            .iter()
+            .map(|t| t.falloff.unwrap_or_default().far)
+            .fold(0.0, f32::max)
     }
 
     /// Each track's gain and pitch with the parameters at `params` (hash,
@@ -1750,6 +1763,7 @@ mod tests {
                 EngineTrack {
                     sound: sound.clone(),
                     volume: 1.0,
+                    falloff: None,
                     curves: vec![Curve {
                         kind: CURVE_VOLUME,
                         param: PARAM_SPEED,
@@ -1759,6 +1773,7 @@ mod tests {
                 EngineTrack {
                     sound,
                     volume: 0.5,
+                    falloff: None,
                     curves: vec![
                         Curve {
                             kind: CURVE_PITCH,
@@ -1786,6 +1801,20 @@ mod tests {
         // Semitones add: speed up an octave, load down one.
         let coasting = c.mix(&[(PARAM_SPEED, 1.0), (PARAM_LOAD, 0.0)]);
         assert_eq!(coasting[1], (0.5, 1.0));
+    }
+
+    #[test]
+    fn an_engine_cue_reaches_as_far_as_its_farthest_track() {
+        let mut c = engine_cue();
+        c.tracks[0].falloff = Some(Falloff {
+            near: 35.0,
+            far: 75.0,
+        });
+        c.tracks[1].falloff = Some(Falloff {
+            near: 10.0,
+            far: 80.0,
+        });
+        assert_eq!(c.reach(), 80.0);
     }
 
     #[test]
