@@ -4221,13 +4221,13 @@ impl Combat {
             };
             let centre = body.transform_point3(Vec3::Y);
             let seats = armed_seats(v);
-            for seat in 0..seats.len() {
+            for (seat, &mount) in seats.iter().enumerate() {
                 let v = &f.vehicles[i];
                 let Some(m) = v
                     .spec
                     .armed
                     .iter()
-                    .find(|m| m.seat == seats[seat] && m.priority == 0)
+                    .find(|m| m.seat == mount && m.priority == 0)
                 else {
                     continue;
                 };
@@ -4237,7 +4237,7 @@ impl Combat {
                 let gap = m.weapon.gap();
                 let size = m2_engine::weapons::AiClip::size(m);
                 let aim_ai = m.weapon.aim_ai;
-                let aimer = v.spec.aimer_of_seat(seats[seat]);
+                let aimer = v.spec.aimer_of_seat(mount);
                 let gun = self.crews.entry((i, seat)).or_default();
                 gun.wait -= dt;
                 gun.clip.tick(dt);
