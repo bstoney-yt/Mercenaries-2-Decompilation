@@ -71,8 +71,10 @@
 //! are not told apart: all it meets counts as blocking, where the 360 lets
 //! a candidate past some (buildings, boats). The cone looks along her
 //! facing (0x822EC800 reads her 0x83657FA8 record).
-//! Not ported: buildings among the neighbours (the alpha does not list
-//! them apart), the leash, a target in a vehicle of sub-kinds 0x180 and
+//! Everything fixed in the area counts as a building, of which the alpha
+//! keeps no list: the props standing there too. `BoatAttack` itself has no
+//! leash: it never reads +0x7BC. Not ported: `BoatIdle` (0x822AA0C8, on to
+//! where it last saw her at 20 m/s, slowing), a target in a vehicle of sub-kinds 0x180 and
 //! 0x300 (no point: not known which those are), the flip of the aim
 //! (+0x3F8 bit 0x40, no writer found).
 

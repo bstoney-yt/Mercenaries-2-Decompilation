@@ -128,7 +128,32 @@ impl PathWorld for Ground<'_> {
     }
 }
 
-/// What a boat keeps clear of (0x822ED248): the boats; not buildings.
+/// The boats, and what stands fixed in 0x822ED248's area for `car`, a boat
+/// of height from `lo.y` to `hi.y` round its place.
+pub fn around(
+    physics: &Physics,
+    boats: &[boat_attack::Neighbour],
+    car: &CarState,
+    (lo, hi): (Vec3, Vec3),
+) -> Vec<boat_attack::Neighbour> {
+    let ahead = car.at + car.forward * 50.0;
+    let reach = Vec3::new(50.0, 0.0, 50.0);
+    let area = (
+        (ahead - reach).with_y(car.at.y + lo.y),
+        (ahead + reach).with_y(car.at.y + hi.y),
+    );
+    let fixed = physics
+        .fixed_near(area.0, area.1)
+        .into_iter()
+        .map(|(at, radius)| boat_attack::Neighbour {
+            at,
+            radius,
+            velocity: Vec3::ZERO,
+        });
+    boats.iter().copied().chain(fixed).collect()
+}
+
+/// The boats, for those keeping clear (0x822ED248's kind 10).
 pub fn afloat(physics: &Physics, vehicles: &[ParkedVehicle]) -> Vec<boat_attack::Neighbour> {
     vehicles
         .iter()
@@ -567,7 +592,7 @@ impl Pursuers {
             self.log = 5.0;
         }
         let mut boats = 0;
-        let afloat = afloat(physics, vehicles);
+        let others = afloat(physics, vehicles);
         for p in &mut self.out {
             let Some(i) = vehicles
                 .iter()
@@ -696,6 +721,7 @@ impl Pursuers {
                     swimming: she.swimming,
                 };
                 let state = p.boat.state;
+                let near = around(physics, &others, &car, (lo, hi));
                 let mut world = Afloat {
                     physics: &*physics,
                     id,
@@ -710,7 +736,7 @@ impl Pursuers {
                     &hull,
                     &target,
                     &mut world,
-                    &afloat,
+                    &near,
                     &mut self.boat_run,
                     rand,
                     dt,
@@ -736,12 +762,13 @@ impl Pursuers {
                 );
                 if log {
                     eprintln!(
-                        "pursuers: {} {:#x} {:.0} m from her at {:.1} m/s, {:?}",
+                        "pursuers: {} {:#x} {:.0} m from her at {:.1} m/s, {:?}, {} near",
                         p.template,
                         p.entity,
                         car.at.distance(her),
                         car.speed(),
-                        p.boat.state
+                        p.boat.state,
+                        near.len()
                     );
                 }
             } else if p.kind == Kind::Tank && !p.leaving {

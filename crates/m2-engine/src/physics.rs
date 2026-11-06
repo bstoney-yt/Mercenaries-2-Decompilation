@@ -5757,6 +5757,30 @@ impl Physics {
         f(solid().predicate(&keep))
     }
 
+    /// What stands fixed in the box from `lo` to `hi` (0x822ED248's
+    /// area): each placed object's or building's bounds as a centre and
+    /// radius. Not the terrain.
+    pub fn fixed_near(&self, lo: Vec3, hi: Vec3) -> Vec<(Vec3, f32)> {
+        let middle = (lo + hi) * 0.5;
+        let cube = r::Cuboid::new(vector((hi - lo) * 0.5));
+        let mut out = Vec::new();
+        for (handle, _) in self.world.intersect_shape(
+            pose(middle, Quat::IDENTITY),
+            &cube,
+            r::QueryFilter::default(),
+        ) {
+            let fixed = matches!(
+                self.keys.get(&handle),
+                Some(StaticKey::Object(_) | StaticKey::Member(..) | StaticKey::Entity(_))
+            );
+            if fixed && let Some(c) = self.world.colliders.get(handle) {
+                let b = c.compute_aabb();
+                out.push((vec3(b.center()), vec3(b.half_extents()).length()));
+            }
+        }
+        out
+    }
+
     /// The bodies of vehicle `skip`: its chassis, its turret's and its
     /// gun's.
     fn bodies_of(&self, skip: Option<VehicleId>) -> Vec<r::RigidBodyHandle> {
@@ -6096,6 +6120,25 @@ mod tests {
             assert!((-0.5..=-0.25).contains(&l), "{l}");
         }
         assert_eq!(ai_wobble(3.0, 0.6), [0.0; 3]);
+    }
+
+    // What stands fixed in a boat's area, without the terrain.
+    #[test]
+    fn fixed_near_gives_placed_things_not_the_ground() {
+        let mut p = Physics::new();
+        let block = CollisionShape::cuboid(Vec3::new(3.0, 4.0, 0.0));
+        let at = Vec3::new(10.0, 0.0, 20.0);
+        p.add_static(StaticKey::Cell(1), &block, Vec3::ZERO, Quat::IDENTITY);
+        p.add_static(StaticKey::Object(2), &block, at, Quat::IDENTITY);
+        p.step(DT);
+        let found = p.fixed_near(Vec3::splat(-50.0), Vec3::splat(50.0));
+        assert_eq!(found.len(), 1);
+        assert!(found[0].0.distance(at) < 0.1, "{:?}", found[0]);
+        assert!((found[0].1 - 5.0).abs() < 0.1, "{:?}", found[0]);
+        assert!(
+            p.fixed_near(Vec3::splat(60.0), Vec3::splat(90.0))
+                .is_empty()
+        );
     }
 
     // An AI pilot takes a helicopter up off the ground and holds it 30 m
