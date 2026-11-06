@@ -365,6 +365,21 @@ impl Touch {
     }
 }
 
+/// The triangle for a d-pad arrow label (`▲ ▼ ◀ ▶`) centred on `c`,
+/// `size` from the centre to each point; none for any other label.
+fn arrow(label: &str, c: egui::Pos2, size: f32) -> Option<Vec<egui::Pos2>> {
+    let (x, y) = match label {
+        "▲" => (0.0, -1.0),
+        "▼" => (0.0, 1.0),
+        "◀" => (-1.0, 0.0),
+        "▶" => (1.0, 0.0),
+        _ => return None,
+    };
+    let tip = egui::vec2(x, y) * size;
+    let side = egui::vec2(-y, x) * size;
+    Some(vec![c + tip, c - tip * 0.6 + side, c - tip * 0.6 - side])
+}
+
 /// Draws the controls over the play screen (`rect`, in points) on
 /// `painter`: the buttons, held ones lit, and the stick where it is held.
 pub fn paint(touch: &Picture, painter: &egui::Painter, rect: egui::Rect, pixels_per_point: f32) {
@@ -380,12 +395,19 @@ pub fn paint(touch: &Picture, painter: &egui::Painter, rect: egui::Rect, pixels_
             Color32::from_rgba_unmultiplied(20, 22, 10, 70)
         };
         painter.circle(c, r, fill, Stroke::new(2.0, line));
+        let ink = Color32::from_rgba_unmultiplied(240, 225, 190, 220);
+        // The d-pad's arrows are drawn, not lettered: the phone's font has
+        // ◀ and ▶ but not ▲ and ▼ (playtest: those showed as empty boxes).
+        if let Some(points) = arrow(k.label, c, r * 0.32) {
+            painter.add(egui::Shape::convex_polygon(points, ink, Stroke::NONE));
+            continue;
+        }
         painter.text(
             c,
             Align2::CENTER_CENTER,
             k.label,
             FontId::proportional((r * 0.55).clamp(9.0, 22.0)),
-            Color32::from_rgba_unmultiplied(240, 225, 190, 220),
+            ink,
         );
     }
     if let Some((centre, at)) = touch.stick {
@@ -561,5 +583,21 @@ mod tests {
         assert_eq!(m.buttons, xb::A | xb::B);
         assert_eq!(m.left, [0.0, 0.9]);
         assert_eq!(m.right_trigger, 1.0);
+    }
+
+    #[test]
+    fn the_d_pad_arrows_are_drawn_as_triangles() {
+        let c = egui::pos2(100.0, 100.0);
+        let up = arrow("▲", c, 10.0).unwrap();
+        assert_eq!(up[0], egui::pos2(100.0, 90.0));
+        assert!(up[1].y > 100.0 && up[2].y > 100.0);
+        let right = arrow("▶", c, 10.0).unwrap();
+        assert_eq!(right[0], egui::pos2(110.0, 100.0));
+        for k in MENU_KEYS.iter().chain(KEYS.iter()) {
+            if k.label.chars().all(|ch| "▲▼◀▶".contains(ch)) {
+                assert!(arrow(k.label, c, 1.0).is_some(), "{}", k.label);
+            }
+        }
+        assert!(arrow("PDA", c, 10.0).is_none());
     }
 }
