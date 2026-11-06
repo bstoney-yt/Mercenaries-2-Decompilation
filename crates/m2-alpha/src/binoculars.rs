@@ -34,8 +34,13 @@
 //! view from the camera's pivot above her head, with her body left out;
 //! the narrower lens for a magnification ([`View::fov`]); the look slowed
 //! by it; that she stands and does not fire while they are up. What the
-//! reticle is on (`sFocusName`, `uFocusGuid`) is not told yet: its name
-//! line stays blank.
+//! reticle is on is told as [`Focus`]: from the 360 code (0x8243B250,
+//! 0x82443160) a ray of [`FOCUS_RANGE`] from the camera, the object's
+//! `FactionMarker` texture as `FactionTexture` and its `LocalizedName`
+//! key as `sFocusName` (`[0x%08x]`). Inferred: the 2 m around the ray,
+//! from the 2.0 the 360 hands that test. Invented: only vehicles and
+//! people count, the two the Beta can name, and a soldier without a
+//! template of his own shows his faction's badge and no name.
 //!
 //! Aiming a gun with a scope (`WeaponScope`: the sniper rifles', the
 //! anti-material rifle's) shows the same screen with `bSniper` set, its
@@ -102,6 +107,8 @@ pub fn magnified(fov: f32, zoom: f32) -> f32 {
 /// What the binocular screen is told each frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct View {
+    /// What the reticle is on.
+    pub focus: Option<Focus>,
     pub zoom: u8,
     /// Her gun's scope, not her binoculars (`bSniper`).
     pub sniper: bool,
@@ -109,6 +116,64 @@ pub struct View {
     pub heading: f32,
     /// Degrees up from the horizon.
     pub pitch: f32,
+}
+
+/// How far the reticle reaches, metres (the 360 code).
+pub const FOCUS_RANGE: f32 = 200.0;
+/// How near the reticle's line something must be, metres.
+pub const FOCUS_REACH: f32 = 2.0;
+
+/// The textures `FactionMarker` records name, by their name hashes
+/// (`m2_assets::name_hash`). The data's ninth texture (5b9de759, on 15
+/// templates) has no name found: no badge for those.
+const MARKERS: [&str; 8] = [
+    "HUD_faction_AN",
+    "HUD_faction_CH",
+    "HUD_faction_CV",
+    "HUD_faction_GR",
+    "HUD_faction_OC",
+    "HUD_faction_PMC",
+    "HUD_faction_PR",
+    "HUD_faction_VZ",
+];
+
+/// The texture a `FactionMarker` names.
+pub fn marker_texture(hash: u32) -> Option<&'static str> {
+    MARKERS
+        .into_iter()
+        .find(|n| m2_assets::name_hash(n) == hash)
+}
+
+/// The badge of a faction as the alpha names it ([`crate::npc::faction_of`]).
+pub fn faction_texture(faction: &str) -> Option<&'static str> {
+    Some(match faction {
+        "All" => "HUD_faction_AN",
+        "Chi" => "HUD_faction_CH",
+        "Gur" => "HUD_faction_GR",
+        "Oil" => "HUD_faction_OC",
+        "Pir" => "HUD_faction_PR",
+        "Vza" => "HUD_faction_VZ",
+        _ => return None,
+    })
+}
+
+/// What the reticle is on, for the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Focus {
+    pub texture: Option<&'static str>,
+    /// Its name's string table key.
+    pub name: Option<u32>,
+}
+
+/// How far along the ray from `eye` by `ahead` (a unit vector) `at` lies,
+/// if it's within the reticle's reach.
+pub fn along_ray(
+    eye: m2_math::glam::Vec3,
+    ahead: m2_math::glam::Vec3,
+    at: m2_math::glam::Vec3,
+) -> Option<f32> {
+    let t = (at - eye).dot(ahead);
+    ((0.0..=FOCUS_RANGE).contains(&t) && (eye + ahead * t).distance(at) <= FOCUS_REACH).then_some(t)
 }
 
 /// `degrees` brought into -180..180.
@@ -138,6 +203,25 @@ pub fn zoom_meter(zoom: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use m2_math::glam::Vec3;
+
+    #[test]
+    fn the_reticle_reaches_200_metres_and_2_either_side() {
+        let (eye, ahead) = (Vec3::new(1.0, 2.0, 3.0), Vec3::X);
+        let at = |x, y| along_ray(eye, ahead, eye + Vec3::new(x, y, 0.0));
+        assert_eq!(at(50.0, 1.5), Some(50.0));
+        assert_eq!(at(50.0, 2.5), None);
+        assert_eq!(at(201.0, 0.0), None);
+        assert_eq!(at(-5.0, 0.0), None);
+    }
+
+    #[test]
+    fn the_markers_are_the_datas_textures() {
+        // `FactionMarker`'s hashes in the template database.
+        assert_eq!(marker_texture(0x9fad_a550), Some("HUD_faction_PMC"));
+        assert_eq!(marker_texture(0x4434_32fc), Some("HUD_faction_VZ"));
+        assert_eq!(marker_texture(0x5b9d_e759), None);
+    }
 
     #[test]
     fn every_zoom_level_keeps_its_pointer_on_the_meter() {
