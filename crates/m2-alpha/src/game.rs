@@ -1693,21 +1693,27 @@ impl Game {
                 }
                 // And its cars.
                 let in_vehicle = p.driving.is_some();
-                // Her vehicle's larger side (0x822A94E8's ring).
-                let her_size =
-                    p.driving
-                        .and_then(|i| self.scene.vehicles.get(i))
-                        .map_or(0.0, |v| {
-                            let (lo, hi) = v.spec.bounds;
-                            (hi.x - lo.x).max(hi.z - lo.z)
-                        });
+                let hers = p.driving.and_then(|i| self.scene.vehicles.get(i));
+                let she = crate::pursuers::Her {
+                    forward: hers
+                        .and_then(|v| world.physics.vehicle_transform(v.id?))
+                        .map_or(Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()), |t| {
+                            t.transform_vector3(Vec3::Z).normalize_or(Vec3::Z)
+                        }),
+                    size: hers.map_or(0.0, |v| {
+                        let (lo, hi) = v.spec.bounds;
+                        (hi.x - lo.x).max(hi.z - lo.z)
+                    }),
+                    vehicle: hers.and_then(|v| v.id),
+                    swimming: p.swimming(),
+                };
                 let dropped = self.pursuers.drive(
                     &mut world.physics,
                     &mut self.scene.vehicles,
                     her,
                     her_velocity,
                     in_vehicle,
-                    her_size,
+                    she,
                     crate::gunships::VANISH,
                     |v| {
                         world
