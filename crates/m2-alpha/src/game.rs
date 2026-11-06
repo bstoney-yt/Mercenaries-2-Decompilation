@@ -195,6 +195,17 @@ pub struct Game {
     /// has the controls (`MrxGuiDialogBox._HandleInputEvent` takes the
     /// pad's events), so she stands still and has no crosshair.
     pub dialog_up: bool,
+    /// The scripts have her in cinematic mode (`Player.SetCinematicMode`:
+    /// the HQ's briefings, Fiona's talk). On the 360 that pushes a
+    /// control mode of its own onto the player's stack of modes
+    /// (8243AE00: a 0x1c-byte mode, vtable 820ecb50, kept at player+0x1a4,
+    /// added by 824384D8) whose camera is the scene's (824453C0); while it
+    /// is on top she does not move, act or aim, though the scripts turn
+    /// her input on between their shots (`Player.SetInputEnabled(true)`
+    /// mid-briefing). That the mode keeps the stick and buttons from her
+    /// is inferred: from it taking her camera and from the briefings in
+    /// play, where she stands through them.
+    pub cinematic: bool,
     /// The scripts turned her aiming off (`Player.SetAimMode`, the HQ):
     /// no reticle until they turn it on again.
     pub aim_off: bool,
@@ -464,6 +475,7 @@ impl Game {
             placed: crate::placed::Placed::default(),
             input_locked: false,
             dialog_up: false,
+            cinematic: false,
             aim_off: false,
             countdown_tick: false,
             hijack_only: HashSet::new(),
@@ -735,12 +747,28 @@ impl Game {
             // A context action she stands at takes the use key first.
             if let Some((g, _)) = &self.context
                 && !self.input_locked
+                && !self.cinematic
                 && input.take_pressed(Action::Use)
             {
                 eprintln!("context: she takes the action at {g:#x}");
                 self.context_taken = Some(*g);
             }
             let mut intent = Intent::from_input(input, config, mouse_look);
+            // In a scene of the scripts' she stands: what was pressed is
+            // read and let go, not kept for after.
+            if self.cinematic {
+                for a in [
+                    Action::Use,
+                    Action::Binoculars,
+                    Action::ZoomIn,
+                    Action::ZoomOut,
+                    Action::SwitchWeapon,
+                ] {
+                    input.take_pressed(a);
+                }
+                self.step(Intent::default(), dt);
+                return;
+            }
             // Aim assist on a pad or the touch controls (not the mouse):
             // aiming or firing on foot draws the view to the hostile
             // nearest the crosshair ([`crate::aim`]).
@@ -957,7 +985,7 @@ impl Game {
         split("game: moving");
         self.fetch_world_vehicles(dt);
         self.arrive(dt);
-        let intent = if self.input_locked || self.dialog_up {
+        let intent = if self.input_locked || self.dialog_up || self.cinematic {
             Intent::default()
         } else {
             intent
@@ -2634,7 +2662,12 @@ impl Game {
         });
         // What the crosshair is on: on foot, or in a vehicle with a gun.
         let crosshair = match (&self.scene.world, player) {
-            (Some(w), Some(p)) if self.combat.down <= 0.0 && !self.dialog_up && !self.aim_off => {
+            (Some(w), Some(p))
+                if self.combat.down <= 0.0
+                    && !self.dialog_up
+                    && !self.aim_off
+                    && !self.cinematic =>
+            {
                 match p.driving {
                     Some(i) => self
                         .scene
@@ -2740,7 +2773,7 @@ impl Game {
             prompt: self
                 .context
                 .as_ref()
-                .filter(|_| self.on_foot && !self.input_locked)
+                .filter(|_| self.on_foot && !self.input_locked && !self.cinematic)
                 .map(|(_, text)| text.clone())
                 .or(prompt)
                 .filter(|_| !self.support.busy()),
