@@ -25,9 +25,7 @@
 //! on this screen: the buttons' names and [`PAD_NAME`]; the default
 //! table (the pad's own layout, [`crate::pad::ON_FOOT`], with the
 //! stick's rows empty and Sprint on L3); that a row changed moves in both
-//! layouts; that any key or mouse button calls off the wait for a button;
-//! that a button already in another row moves to the new one (as the
-//! keyboard table here: the game has an over-bound box).
+//! layouts; that any key or mouse button calls off the wait for a button.
 
 use crate::input::Action;
 use crate::keytable::{EMPTY, ROWS};
@@ -95,6 +93,11 @@ impl PadTable {
         }
         self.0[row] = Some(button);
         changed
+    }
+
+    /// The row holding `button`.
+    pub fn holder(&self, button: Button) -> Option<usize> {
+        self.0.iter().position(|b| *b == Some(button))
     }
 
     /// Row `row` as the movie writes it.

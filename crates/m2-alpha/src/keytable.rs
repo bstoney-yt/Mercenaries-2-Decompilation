@@ -25,8 +25,8 @@
 //! `SPACE`, `LCTRL`, `UP`). The names of keys the footage does not show
 //! (`RCTRL`, `ENTER`...) follow the same pattern (invented). Which of the
 //! alpha's actions each row moves is inferred from the names. A key
-//! already in another cell moves to the new one, leaving that cell empty
-//! (invented: the game puts up a "Key Over Bound" box, not done here).
+//! already in another row asks first ([`crate::pause::over_bound_box`]);
+//! yes moves it to the new cell, leaving that one empty.
 
 use winit::keyboard::KeyCode;
 
@@ -205,6 +205,14 @@ impl KeyTable {
         }
         self.0[row][column] = Some(slot);
         changed
+    }
+
+    /// The row and column holding `slot`.
+    pub fn holder(&self, slot: Slot) -> Option<(usize, usize)> {
+        self.0.iter().enumerate().find_map(|(r, cell)| {
+            let c = cell.iter().position(|s| *s == Some(slot))?;
+            Some((r, c))
+        })
     }
 
     /// Row `row`'s cell `column` as the movie writes it.
