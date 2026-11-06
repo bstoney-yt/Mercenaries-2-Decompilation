@@ -384,6 +384,16 @@ __m2_hud_call_count = 0
 __m2_hud_calls_kept = 512
 -- Calls with a callback, by number, for the HUD to call back.
 __m2_hud_callbacks = {}
+-- Keeps call `c` by its number (`c.seq`), and lets go of the one
+-- `__m2_hud_calls_kept` older. By number, not as a list: once let go of
+-- ([`let_go_hud_calls`]), the list's `table.insert` went on from where it
+-- had been (calls at 19, 20... with nothing at 1, which reads as none),
+-- and no later call reached the HUD.
+function __m2_keep_hud_call(c)
+    rawset(__m2_hud_calls, c.seq, c)
+    local old = c.seq - (__m2_hud_calls_kept or 512)
+    if old > 0 then rawset(__m2_hud_calls, old, nil) end
+end
 local function copy(v, depth)
     if type(v) ~= "table" then
         -- Guids (userdata) go across; the HUD's state knows them.
@@ -464,10 +474,9 @@ for group, names in pairs(methods) do
                         data.nX, data.nY = x, z
                     end
                 end
-                table.insert(__m2_hud_calls, { seq = __m2_hud_call_count,
+                __m2_keep_hud_call({ seq = __m2_hud_call_count,
                     group = group, method = name, data = data,
                     callback = callback })
-                if #__m2_hud_calls > (__m2_hud_calls_kept or 64) then table.remove(__m2_hud_calls, 1) end
                 local r
                 if type(f) == "function" then r = f(self, t, ...) end
                 -- A message added here gets the call's number as its id,
@@ -526,14 +535,13 @@ local function open(method, data, callback, args)
     local seq = __m2_hud_call_count
     __m2_hud_callbacks[seq] = { fCallback = callback, tCallbackData = args, dialog = true,
         method = method, data = data }
-    table.insert(__m2_hud_calls, { seq = seq, group = "DialogBox", method = method,
+    __m2_keep_hud_call({ seq = seq, group = "DialogBox", method = method,
         data = data, callback = type(callback) == "function" })
-    if #__m2_hud_calls > (__m2_hud_calls_kept or 64) then table.remove(__m2_hud_calls, 1) end
     local box = { CustomData = {}, __m2_dialog = seq }
     box.Close = function()
         if __m2_hud_callbacks[seq] then __m2_hud_callbacks[seq] = nil end
         __m2_hud_call_count = __m2_hud_call_count + 1
-        table.insert(__m2_hud_calls, { seq = __m2_hud_call_count, group = "DialogBox",
+        __m2_keep_hud_call({ seq = __m2_hud_call_count, group = "DialogBox",
             method = "Close", data = { nBox = seq }, callback = false })
     end
     -- Whatever else the scripts ask of a box does nothing here.
@@ -652,10 +660,9 @@ local function toggling(m, name)
         -- The bootstrap's calls the manager's: one call for the HUD.
         if __m2_toggling then return d(player, on, reason, ...) end
         __m2_hud_call_count = __m2_hud_call_count + 1
-        table.insert(__m2_hud_calls, { seq = __m2_hud_call_count, group = "GuiManager",
+        __m2_keep_hud_call({ seq = __m2_hud_call_count, group = "GuiManager",
             method = "ToggleHud", data = { bOn = on and true or false, sReason = plain(reason) },
             callback = false })
-        if #__m2_hud_calls > (__m2_hud_calls_kept or 64) then table.remove(__m2_hud_calls, 1) end
         __m2_toggling = true
         local ok, r = pcall(d, player, on, reason, ...)
         __m2_toggling = false
@@ -4397,49 +4404,43 @@ pub fn set_hero(mission: &mut Mission, hero: Hero, max: f32, who: &str) {
     );
 }
 
-/// The calls [`HUD_CALLS`] keeps, oldest first.
-/// Lets go of the kept HUD calls ([`HUD_CALLS`]) through number `seq`, in
-/// place, from the scripts' side. Not with mlua's `Table::clear`, which
-/// leaves the table on the Lua stack each time (mlua 0.11's own code: it
-/// pushes it and never pops it); in play, where this runs each frame, no
-/// HUD call was kept after the first time (playtest: Fiona's contract menu
-/// never reached the HUD, nor did any later call).
+/// Lets go of the kept HUD calls ([`HUD_CALLS`]) through number `seq`,
+/// from the scripts' side. Not with mlua's `Table::clear`, which leaves
+/// the table on the Lua stack each time (mlua 0.11's own code: it pushes
+/// it and never pops it).
 fn let_go_hud_calls(lua: &mlua::Lua, seq: u64) {
     let _ = lua
         .load(
             r#"
             local seq, t = ..., __m2_hud_calls
             if type(t) ~= "table" then return end
-            local n, kept = #t, 0
-            for i = 1, n do
-                local c = t[i]
-                if type(c) == "table" and (tonumber(c.seq) or 0) > seq then
-                    kept = kept + 1
-                    t[kept] = c
-                end
+            for k in pairs(t) do
+                if type(k) ~= "number" or k <= seq then t[k] = nil end
             end
-            for i = n, kept + 1, -1 do t[i] = nil end
             "#,
         )
         .set_name("=m2-hud calls let go")
         .call::<()>(seq as f64);
 }
 
+/// The calls [`HUD_CALLS`] keeps, oldest first.
 fn hud_calls(lua: &mlua::Lua) -> Vec<HudCall> {
     let Ok(Some(calls)) = lua.globals().get::<Option<mlua::Table>>("__m2_hud_calls") else {
         return Vec::new();
     };
-    calls
-        .sequence_values::<mlua::Table>()
+    let mut out: Vec<HudCall> = calls
+        .pairs::<mlua::Value, mlua::Table>()
         .flatten()
-        .map(|t| HudCall {
+        .map(|(_, t)| HudCall {
             seq: t.get("seq").unwrap_or(0),
             group: t.get("group").unwrap_or_default(),
             method: t.get("method").unwrap_or_default(),
             data: Plain::of(&t.get("data").unwrap_or(mlua::Value::Nil)),
             callback: t.get("callback").unwrap_or(false),
         })
-        .collect()
+        .collect();
+    out.sort_by_key(|c| c.seq);
+    out
 }
 
 /// The fanfare call [`HUD_CALLS`] kept last with a callback, while that
@@ -8340,13 +8341,19 @@ mod tests {
     #[test]
     fn hud_calls_let_go_leave_the_new_ones_to_take() {
         let lua = mlua::Lua::new();
+        // A list append that goes on from its own count, as the game's did
+        // for this table once it was emptied: the calls must not depend on
+        // it.
+        lua.load("local n = 0; table.insert = function(t, v) n = n + 1; rawset(t, n, v) end")
+            .exec()
+            .unwrap();
         lua.load(HUD_CALLS).exec().unwrap();
         lua.load(
             r#"
             function add(n)
                 for _ = 1, n do
                     __m2_hud_call_count = __m2_hud_call_count + 1
-                    table.insert(__m2_hud_calls, { seq = __m2_hud_call_count,
+                    __m2_keep_hud_call({ seq = __m2_hud_call_count,
                         group = "Pda.Map", method = "AddBlip", data = {}, callback = false })
                 end
             end
@@ -8355,7 +8362,7 @@ mod tests {
         .exec()
         .unwrap();
         let mut last = 0;
-        for n in [3, 600, 1, 0, 5] {
+        for n in [3, 500, 1, 0, 5] {
             lua.load(format!("add({n})")).exec().unwrap();
             let new: Vec<u64> = hud_calls(&lua)
                 .iter()
