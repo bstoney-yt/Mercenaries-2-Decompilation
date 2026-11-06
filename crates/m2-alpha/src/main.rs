@@ -9696,6 +9696,9 @@ impl Running {
         if let Some(m) = &mut self.mission {
             spans::time("scripts", || m.tick(&mut self.game, TICK.as_secs_f32()));
             self.game.dress(&mut self.backend);
+            for (name, load) in m.take_voice_banks() {
+                self.audio.voice_bank(&name, load);
+            }
             let (lines, hushed) = m.take_lines();
             for (id, cue, at) in lines {
                 if let Some(seconds) = self.audio.say(id, &cue, at) {

@@ -1745,9 +1745,124 @@ impl Voices {
     }
 }
 
+/// A voice bank the scripts load for a while (`Sound.LoadTempBank`, by
+/// `MrxSoundBanks`): an HQ's briefings (`vo_job_pmc`, `vo_job_heros`), a
+/// contract's lines (`vo_oilCon001`). Its `English.wad` block holds the
+/// cue table naming its lines and the sounds themselves, decoded in the
+/// block (not streamed like the resident sets' `vo_stream`).
+///
+/// From samples: `vo_job_pmc` holds a cue table (hash `c0c53e15`), its
+/// sound bank and a cue index; the table's lines name the bank by the
+/// table's hash and a sound by its place in the bank
+/// (`Fiona-Briefing-Contract-Oil020-01` is sound 4). The blocks are named
+/// `<bank>.<language>_P000_Q3`, the bank name as the scripts give it with
+/// the language added (`MrxSoundBanks._GetLocalizedName`).
+#[derive(Debug)]
+pub struct VoiceBank {
+    pub name: String,
+    pub sets: Vec<CueTable>,
+    pub sounds: Vec<SoundBuffer>,
+}
+
+impl VoiceBank {
+    /// Reads bank `name` (`vo_job_pmc.english`, any case) from the
+    /// install's `English.wad`.
+    pub fn load(install: &Install, name: &str) -> Result<Self, AssetError> {
+        let wad = install.data.join("English.wad");
+        let io = |source| AssetError::Io {
+            path: wad.clone(),
+            source,
+        };
+        let file = File::open(&wad).map_err(io)?;
+        let mut source = AssetSource::new(std::io::BufReader::new(file))?;
+        let block = source
+            .archive()
+            .index()
+            .blocks()
+            .iter()
+            .position(|b| bank_block_is(&b.path, name))
+            .ok_or_else(|| {
+                io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no voice bank {name}"),
+                ))
+            })?;
+        let decoded = source.block(block)?;
+        let (mut sets, mut sounds) = (Vec::new(), Vec::new());
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            match e.type_hash {
+                CUE_TABLE_TYPE => {
+                    if let Ok(t) = CueTable::parse(data) {
+                        sets.push(t);
+                    }
+                }
+                SOUND_BANK_TYPE => {
+                    if let Ok(b) = SoundBank::parse(data) {
+                        sounds = b.sounds.iter().map(buffer).collect();
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
+            name: name.to_ascii_lowercase(),
+            sets,
+            sounds,
+        })
+    }
+
+    /// The sounds cue `cue` may play (one, or a group's variants), with
+    /// the line's volume, falloff distances and whether it is heard from
+    /// where it is said.
+    pub fn line(&self, cue: u32) -> Option<(Vec<&SoundBuffer>, f32, f32, f32, bool)> {
+        self.sets.iter().find_map(|t| {
+            let (volume, near, far, positional) = t
+                .lines
+                .iter()
+                .find(|l| l.cue == cue)
+                .map(|l| (l.volume, l.min_distance, l.max_distance, l.is_positional()))
+                .or_else(|| {
+                    t.groups
+                        .iter()
+                        .find(|g| g.cue == cue)
+                        .map(|g| (g.volume, g.min_distance, g.max_distance, g.is_positional()))
+                })?;
+            let sounds: Vec<&SoundBuffer> = t
+                .streams(cue)?
+                .into_iter()
+                .filter_map(|i| self.sounds.get(i as usize))
+                .collect();
+            (!sounds.is_empty()).then_some((sounds, volume, near, far, positional))
+        })
+    }
+}
+
+/// Whether archive block `path` (`blocks\English\vo_job_pmc.english_P000_Q3.block`)
+/// holds voice bank `name` (`vo_job_pmc.english`).
+fn bank_block_is(path: &str, name: &str) -> bool {
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    let file = file.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    file.strip_prefix(&name)
+        .is_some_and(|rest| rest.starts_with("_p") && rest.ends_with(".block"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_banks_are_found_by_their_block_name() {
+        let path = "blocks\\English\\vo_job_pmc.english_P000_Q3.block";
+        assert!(bank_block_is(path, "vo_job_pmc.english"));
+        assert!(bank_block_is(path, "VO_Job_PMC.English"));
+        assert!(!bank_block_is(path, "vo_job_pm.english"));
+        assert!(!bank_block_is(path, "vo_job_pmc"));
+        assert!(bank_block_is(
+            "blocks\\English\\vo_oilcon001.english_P000_Q3.block",
+            "vo_oilCon001.english"
+        ));
+    }
 
     /// A HMMWV's idle track as the data has it, and a pitched track.
     fn engine_cue() -> EngineCue {

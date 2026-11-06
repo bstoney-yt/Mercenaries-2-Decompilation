@@ -963,6 +963,9 @@ pub struct MissionLink {
     /// Scripted voice lines to play, and lines to stop.
     lines: Vec<ScriptLine>,
     hushed: Vec<u32>,
+    /// Voice banks the scripts loaded (true) or let go, by name
+    /// (`vo_job_pmc.english`).
+    voice_banks: Vec<(String, bool)>,
     /// Interface sounds the scripts cued (`ui_HUD_Objective_New`), and
     /// whether each is to stop instead.
     sounds: Vec<(String, bool)>,
@@ -1131,6 +1134,7 @@ impl MissionLink {
             keys: Default::default(),
             lines: Vec::new(),
             hushed: Vec::new(),
+            voice_banks: Vec::new(),
             sounds: Vec::new(),
             fades: Vec::new(),
             music: None,
@@ -3082,6 +3086,9 @@ impl MissionLink {
                         self.lines.push((*id, cue.clone(), at));
                     }
                     Command::Hush(id) => self.hushed.push(*id),
+                    Command::VoiceBank { name, load } => {
+                        self.voice_banks.push((name.clone(), *load));
+                    }
                     Command::CueSound { at: None, cue } => {
                         // The scripts' countdown ticks each minute (`MrxTimer`'s cue):
                         // autoplay hurries while it runs.
@@ -3408,6 +3415,11 @@ impl MissionLink {
             std::mem::take(&mut self.lines),
             std::mem::take(&mut self.hushed),
         )
+    }
+
+    /// Voice banks the scripts loaded or let go since the last call.
+    pub fn take_voice_banks(&mut self) -> Vec<(String, bool)> {
+        std::mem::take(&mut self.voice_banks)
     }
 
     /// Sound category fades and pitches the scripts asked for since the
