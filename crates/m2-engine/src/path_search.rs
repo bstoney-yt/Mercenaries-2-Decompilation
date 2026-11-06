@@ -47,6 +47,13 @@
 //!   from where the vehicle is nearest it, the lookahead the larger of
 //!   3 m, half its box's largest side and its speed over the think.
 //!
+//! The sweeps and ground rays see the layers of
+//! [`PATH_MASK`](crate::collision_layers::PATH_MASK): so not a chain-link
+//! fence ([`PathSolid`](crate::physics::PathSolid)), which a vehicle drives
+//! through and breaks. Not applied: a loose prop's layers (its own preset),
+//! and the leaves and AI-only shapes of [`collision_layers`](crate::collision_layers)
+//! layers 19 and 30, which the alpha's colliders don't keep apart.
+//!
 //! Inferred: a body's box is its collider's own bounds (the 360's is its
 //! entity's, 0x821861B0). Stand-ins: the search runs to its end at once
 //! (the 360's manager spreads searches over frames, 8 steps a frame
