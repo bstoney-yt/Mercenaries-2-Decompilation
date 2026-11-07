@@ -2614,9 +2614,20 @@ impl MissionLink {
                 }
             }
             game.pursuers.call_off(faction);
-            let due = self
-                .reinforcements
-                .step(wanted, squads, &mut game.scene.flights, her, dt);
+            // Where the next transport comes in, looked for only when one
+            // is due (each look takes a random number).
+            let next_in = match wanted {
+                Some((f, n)) if n > self.reinforcements.out(f) => air_unit_in(game, her),
+                _ => None,
+            };
+            let due = self.reinforcements.step(
+                wanted,
+                squads,
+                &mut game.scene.flights,
+                her,
+                &mut || next_in,
+                dt,
+            );
             for (g, template, at) in due {
                 let model = game
                     .scene
@@ -4395,7 +4406,8 @@ fn rides(game: &Game, mission: &Mission) -> Vec<(u32, Vec3)> {
         .filter_map(|m| m.target)
         .filter_map(|g| {
             let o = w.objects.get(&g).filter(|o| o.alive)?;
-            let models = object_models(g, &o.name, island, &catalogue.vehicles);
+            let placed = w.placed_as.get(&g).map(String::as_str);
+            let models = object_models(g, &o.name, placed, island, &catalogue.vehicles);
             // Or one nobody is in that the alpha doesn't have as hers
             // (PmcCon004's "Get Solano", the `Mi35 (Solano Hijack)` an
             // `MrxTaskObjectiveEnterVehicle` names: round 7 stood 1400 s by
@@ -4667,7 +4679,8 @@ impl Fleet {
                 (d <= VEHICLE_REACH).then_some((d, g, o))
             })
             .filter_map(|(d, g, o)| {
-                let models = object_models(g, &o.name, island, &catalogue.vehicles);
+                let placed = w.placed_as.get(&g).map(String::as_str);
+                let models = object_models(g, &o.name, placed, island, &catalogue.vehicles);
                 (!models.is_empty()).then_some((d, g, models))
             })
             .filter(|(_, g, models)| !ai_flown(&w, *g, models))
@@ -5314,14 +5327,14 @@ const PICKUP_HOVER: f32 = 15.0;
 /// Sends one of `faction`'s gunships, `template`, in for her at `her`
 /// ([`crate::gunships`]): from 350 m about the way she faces, its
 /// vehicle loaded as the island's are.
-fn send_gunship(game: &mut Game, faction: &'static str, template: &str, her: Vec3) {
-    let (Some(world), Some(catalogue)) = (&game.scene.world, &game.scene.catalogue) else {
-        return;
-    };
+/// Where a pursuit's air unit comes in for her at `her`
+/// ([`crate::gunships::coming_in`], 0x8223ADD0), the next of the
+/// gunships' random numbers taken; `None` where nowhere is clear.
+fn air_unit_in(game: &mut Game, her: Vec3) -> Option<Vec3> {
     let heading = game.scene.player.as_ref().map_or(0.0, |p| p.yaw);
     let r = game.gunships.random();
-    let physics = &world.physics;
-    let at = crate::gunships::coming_in(
+    let physics = &game.scene.world.as_ref()?.physics;
+    crate::gunships::coming_in(
         her,
         heading,
         r,
@@ -5336,9 +5349,18 @@ fn send_gunship(game: &mut Game, faction: &'static str, template: &str, her: Vec
                 .statics_in_box(m2_math::glam::Mat4::from_translation(p), (-half, half))
                 .is_empty()
         },
-    );
-    let Some(at) = at else {
+    )
+}
+
+fn send_gunship(game: &mut Game, faction: &'static str, template: &str, her: Vec3) {
+    if game.scene.world.is_none() || game.scene.catalogue.is_none() {
+        return;
+    }
+    let Some(at) = air_unit_in(game, her) else {
         eprintln!("gunships: no clear place for {faction}'s {template}");
+        return;
+    };
+    let (Some(world), Some(catalogue)) = (&game.scene.world, &game.scene.catalogue) else {
         return;
     };
     let models = template_models(template, &world.index.template_db, &catalogue.vehicles);
@@ -5995,10 +6017,16 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 .catalogue
                 .as_ref()
                 .map_or(&[][..], |c| c.vehicles.as_slice());
-            let models = w
-                .objects
-                .get(vehicle)
-                .map(|o| object_models(*vehicle, &o.name, game.scene.world.as_ref(), catalogue));
+            let models = w.objects.get(vehicle).map(|o| {
+                let placed = w.placed_as.get(vehicle).map(String::as_str);
+                object_models(
+                    *vehicle,
+                    &o.name,
+                    placed,
+                    game.scene.world.as_ref(),
+                    catalogue,
+                )
+            });
             // A helicopter its pilot flies (the scripts' transit seats her
             // in the Lucky Lady again, "p"): she rides in it.
             if models.as_ref().is_some_and(|m| ai_flown(&w, *vehicle, m)) {
@@ -6960,14 +6988,25 @@ pub(crate) fn is_ruin(templates: &Templates, name: &str) -> bool {
         .any(|id| templates.ruined.contains(id))
 }
 
+///
+/// A layer entity placed as a template the database knows is that
+/// template, whatever its name's words: MecCon001's `meccon_monster` is a
+/// `location` (from samples: `vz_state_meccon001`'s entity 0xf0030, the
+/// spot its script spawns the `Monster Truck` at, `MrxUtil.SpawnObject(
+/// "Monster Truck", "meccon_monster")`), no truck of its own (the sweep's
+/// MecCon001 stood a second truck there and she boarded the wrong one).
 fn object_models(
     guid: u32,
     name: &str,
+    placed_as: Option<&str>,
     world: Option<&m2_engine::World>,
     catalogue: &[CatalogueEntry],
 ) -> Vec<CatalogueEntry> {
     let none = Templates::default();
     let templates = world.map_or(&none, |w| &w.index.template_db);
+    if placed_as.is_some_and(|t| templates.get(t).is_some_and(|i| i.vehicle.is_none())) {
+        return Vec::new();
+    }
     let models = template_models(name, templates, catalogue);
     match world.and_then(|w| w.index.state_vehicles.get(&guid)) {
         Some(t) if models.is_empty() => template_models(&t.name, templates, catalogue),

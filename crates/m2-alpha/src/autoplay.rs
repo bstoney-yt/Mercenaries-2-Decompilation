@@ -408,12 +408,43 @@ const DOOR: f32 = 2.5;
 /// 0.6 m for her height over the hardpoint; [`DOOR`] for a vehicle without
 /// entrance data.
 fn door_reach(spec: &m2_engine::vehicle::VehicleSpec) -> f32 {
+    let door = way_in(spec);
     spec.entrances
         .iter()
-        .find(|(_, at)| spec.door.is_some_and(|d| at.distance(d) < 0.01))
+        .find(|(_, at)| door.is_some_and(|d| at.distance(d) < 0.01))
         .map_or(DOOR, |(e, _)| {
             (e.params.use_distance + m2_engine::seats::SEARCH_PAD - 0.6).clamp(0.3, DOOR)
         })
+}
+
+/// Where (model space) she goes to get in at the wheel: the first of the
+/// vehicle's entrances the driver's seat has a `CanEnter` row for, as
+/// the 360 seats her by the entrance she uses (0x8229A1C8,
+/// [`m2_engine::seats::seat_for_entrance`]); else its door marker. The
+/// driver's door marker is the seat's way *out* (its first `CanExit`
+/// row), which on the Piranha is `bb7635ae`, an exit no seat is got in
+/// by: the sweep's GurCon003 pressed there for 1,500 s with "no seat".
+fn way_in(spec: &m2_engine::vehicle::VehicleSpec) -> Option<Vec3> {
+    way_in_of(spec.seating.as_deref(), &spec.entrances, spec.door)
+}
+
+/// [`way_in`] of a vehicle's seat data, its entrances (model space) and
+/// its door marker.
+fn way_in_of(
+    seating: Option<&m2_engine::seats::VehicleSeats>,
+    entrances: &[(m2_engine::seats::Entrance, Vec3)],
+    door: Option<Vec3>,
+) -> Option<Vec3> {
+    let into = seating.and_then(|s| {
+        let d = s.driver()?;
+        s.seats[d]
+            .rows
+            .iter()
+            .filter(|r| r.can_enter)
+            .find_map(|r| entrances.iter().find(|(e, _)| e.name == r.link_name))
+            .map(|&(_, at)| at)
+    });
+    into.or(door)
 }
 /// Within this of a crewed vehicle's middle she starts its hijack,
 /// metres (invented; m2-alpha's `HIJACK_REACH` is 6).
@@ -4503,8 +4534,8 @@ impl Autoplay {
             return Intent::default();
         };
         let spec = &game.scene.vehicles[i].spec;
-        // Its door, else beside it on the left.
-        let door = spec.door.map_or_else(
+        // Its way in at the wheel, else beside it on the left.
+        let door = way_in(spec).map_or_else(
             || {
                 let (lo, hi) = spec.bounds;
                 m.transform_point3(Vec3::new(hi.x + 0.8, 0.0, (lo.z + hi.z) * 0.5))
@@ -6158,6 +6189,52 @@ impl Delivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The Piranha's driver's seat (from samples, `vehicleseats`): got in
+    // by `5a5610d8` (no entrance of the boat's) or `004fa930`, got out of
+    // by `bb7635ae` (its door marker). She goes to `004fa930`.
+    #[test]
+    fn she_goes_to_the_way_in_at_the_wheel_not_its_way_out() {
+        use m2_engine::seats::{Entrance, EntranceParams, EntranceToSeatRow, Seat, VehicleSeats};
+        let row = |link: u32, can_enter: bool, can_exit: bool| EntranceToSeatRow {
+            link_name: link,
+            can_enter,
+            can_exit,
+        };
+        let driver = Seat {
+            name: 0xf8b8_325f,
+            hardpoint: None,
+            driver: true,
+            gunner: false,
+            hijackable: true,
+            player_use: true,
+            toss_speed: -1.0,
+            min_ditch_speed: 5.0,
+            rows: vec![
+                row(0x5a56_10d8, true, true),
+                row(0x004f_a930, true, false),
+                row(0xbb76_35ae, false, true),
+            ],
+            links: Vec::new(),
+            turret: None,
+        };
+        let entrance = |name: u32| Entrance {
+            name,
+            hardpoint: None,
+            params: EntranceParams::default(),
+        };
+        let seats = VehicleSeats {
+            seats: vec![driver],
+            entrances: vec![entrance(0xbb76_35ae), entrance(0x004f_a930)],
+            turrets: Vec::new(),
+            doors: Vec::new(),
+        };
+        let (out, into) = (Vec3::new(-0.92, 0.9, -3.45), Vec3::new(1.2, 0.9, -2.0));
+        let entrances = [(entrance(0xbb76_35ae), out), (entrance(0x004f_a930), into)];
+        assert_eq!(way_in_of(Some(&seats), &entrances, Some(out)), Some(into));
+        // Without seat data, its door marker.
+        assert_eq!(way_in_of(None, &entrances, Some(out)), Some(out));
+    }
 
     // Off a contract, the nearest starter's talk is gone to, and only while
     // a flow contract is on offer.
