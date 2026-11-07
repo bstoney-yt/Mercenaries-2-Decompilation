@@ -3549,8 +3549,12 @@ impl Autoplay {
                     // Nowhere (within bounds) to see it from: the others
                     // first. (PmcCon031's MG platform: its rail hid one
                     // column, and she stood at it 20 s, round 25.)
+                    // And when she comes back to it, it is blown up or
+                    // bombed, not tried with her rifle again: the contract
+                    // sweep's GurCon002 had only its building left, 149 m
+                    // off, and found nowhere to see it from 81,000 times.
                     self.passed.push((target, self.clock + KEEP_PASS));
-                    self.rifle_on = None;
+                    self.rifle_on = Some((target, self.rifle_try(game, target)));
                     return Intent::default();
                 }
             }
@@ -4348,6 +4352,13 @@ impl Autoplay {
                     }
                     game.support.selected = i;
                     self.laser_called = Some(self.clock);
+                } else if let Some(i) = strike_line(&game.support.entries()) {
+                    // Else her own strike, the line a player scrolls to:
+                    // the menu's line as it stood was a delivery of the
+                    // scripts' (the contract sweep: ChiCon001 and ChiCon003
+                    // called in C4 42,000 and 14,000 times, 88 m and 59 m
+                    // from their targets, and never a bomb).
+                    game.support.selected = i;
                 }
                 intent.trigger.support = true;
             }
@@ -5964,6 +5975,12 @@ fn contract_first(places: Vec<&Mark>) -> Vec<&Mark> {
     }
 }
 
+/// The support menu's line with her own strike on it (the satellite
+/// bomb), if she holds one.
+fn strike_line(entries: &[Entry<'_>]) -> Option<usize> {
+    entries.iter().position(|e| matches!(e, Entry::Own(_)))
+}
+
 /// Whether a marker of the scripts' is still up on `g` (an action's, or a
 /// pickup's whose context action she took: the fuel tanks' "Steal fuel").
 fn marked_again(marks: &[Mark], g: u32) -> bool {
@@ -7175,6 +7192,28 @@ mod tests {
             Vec3::new(12.0, 3.0, 10.0),
         );
         assert_eq!(off, Vec3::new(10.0 + 5.0 + STEP_OFF, 1.0, 10.0));
+    }
+
+    #[test]
+    fn her_own_strike_is_chosen_over_a_scripts_delivery() {
+        use crate::support::{Item, Kind, Stocked};
+        let c4 = Stocked {
+            key: "c4".to_owned(),
+            name: "C4".to_owned(),
+            method: "Smoke".to_owned(),
+            count: 1,
+            free: true,
+        };
+        let bomb = Item {
+            kind: Kind::SatelliteBomb,
+            count: 1,
+            free: false,
+        };
+        assert_eq!(
+            strike_line(&[Entry::Stocked(&c4), Entry::Own(bomb)]),
+            Some(1)
+        );
+        assert_eq!(strike_line(&[Entry::Stocked(&c4)]), None);
     }
 
     #[test]
