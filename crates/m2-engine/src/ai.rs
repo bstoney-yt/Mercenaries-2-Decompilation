@@ -90,6 +90,84 @@ pub fn relations(db: &Layer<'_>) -> Vec<(String, String, f32)> {
     out
 }
 
+/// `StimulusModifier`: how much of a person's `Visibility` and
+/// `Audibility` counts as they move. From the 360 code: the perception
+/// update (0x822F4178) multiplies them by the `Fast` pair while the
+/// person's motion state (its human record's +0x3C bits 11..13) is 2 to 4,
+/// by the `Idle` pair at 0, by neither at 1, and by the `Sneak` pair on
+/// top while its sneak flag (+0x414) is up. Defaults are the schema's
+/// (0x823EDCE0).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StimulusModifier {
+    pub aud_fast: f32,
+    pub aud_idle: f32,
+    pub aud_sneak: f32,
+    pub vis_fast: f32,
+    pub vis_idle: f32,
+    pub vis_sneak: f32,
+}
+
+impl Default for StimulusModifier {
+    fn default() -> Self {
+        Self {
+            aud_fast: 2.0,
+            aud_idle: 0.0,
+            aud_sneak: 0.3,
+            vis_fast: 1.2,
+            vis_idle: 0.8,
+            vis_sneak: 0.6,
+        }
+    }
+}
+
+/// How a person moves, for [`StimulusModifier::visibility`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Motion {
+    /// Motion state 0.
+    Still,
+    /// Motion state 1.
+    Walking,
+    /// Motion states 2 to 4.
+    Fast,
+}
+
+impl StimulusModifier {
+    /// What multiplies `Visibility` moving so, and sneaking or not.
+    pub fn visibility(&self, motion: Motion, sneaking: bool) -> f32 {
+        let moving = match motion {
+            Motion::Still => self.vis_idle,
+            Motion::Walking => 1.0,
+            Motion::Fast => self.vis_fast,
+        };
+        moving * if sneaking { self.vis_sneak } else { 1.0 }
+    }
+}
+
+/// Every template's `StimulusModifier`, by its name in lower case.
+pub fn stimulus_modifiers(db: &Layer<'_>) -> HashMap<String, StimulusModifier> {
+    let table = Table::new(db, "StimulusModifier");
+    let names = db.names();
+    let d = StimulusModifier::default();
+    table
+        .templates()
+        .filter_map(|id| {
+            let r = *table.of_template(id).first()?;
+            let get = |n: &str, or: f32| table.float(r, name_hash(n)).unwrap_or(or);
+            Some((
+                names.get(&id)?.to_ascii_lowercase(),
+                StimulusModifier {
+                    aud_fast: get("AudFast", d.aud_fast),
+                    aud_idle: get("AudIdle", d.aud_idle),
+                    aud_sneak: get("AudSneak", d.aud_sneak),
+                    vis_fast: get("VisFast", d.vis_fast),
+                    vis_idle: get("VisIdle", d.vis_idle),
+                    vis_sneak: get("VisSneak", d.vis_sneak),
+                },
+            ))
+        })
+        .collect()
+}
+
 /// What a person template says of how they fight.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AiProfile {
@@ -237,6 +315,25 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, AiProfile> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn moving_fast_shows_more_and_sneaking_less() {
+        use super::{Motion, StimulusModifier};
+        // Jennifer's (`JenUpgrade1`).
+        let jen = StimulusModifier {
+            aud_fast: 1.0,
+            aud_idle: 0.0,
+            aud_sneak: 0.0,
+            vis_fast: 1.0,
+            vis_idle: 0.75,
+            vis_sneak: 0.5,
+        };
+        assert_eq!(jen.visibility(Motion::Walking, false), 1.0);
+        assert_eq!(jen.visibility(Motion::Still, false), 0.75);
+        assert_eq!(jen.visibility(Motion::Still, true), 0.375);
+        let d = StimulusModifier::default();
+        assert!((d.visibility(Motion::Fast, false) - 1.2).abs() < 1e-6);
+    }
+
     use super::*;
 
     #[test]
