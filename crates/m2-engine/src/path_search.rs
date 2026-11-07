@@ -24,10 +24,15 @@
 //!     (0x822E3138: of its eight, those furthest round either way about
 //!     the up axis), each pushed out sideways from that line of sight by
 //!     1.8 x the clearance (0x822E3080), the clearance `0.7 x width +
-//!     0.1`; from inside its box, one at the nearest face pushed out by as
-//!     much. Each corner is put on the ground and dropped, if what it
-//!     stands on is another body's top rising from the parent more than
-//!     0.2 of the way across (0x822E6BC0), for that body's corners in
+//!     0.1`; from inside its box (where the search's height doesn't
+//!     count), one where the line out from the box's origin meets a face,
+//!     pushed out by as much. All at the height of the body's origin. Each
+//!     node's key is the body and which of its corners (8 from inside), so
+//!     that a node at one corner can go on to the next: a long wall is
+//!     walked round corner by corner. Each corner is put on the ground and
+//!     dropped, if what it stands on is another body's top (not the one
+//!     the parent stands on) rising from the parent more than 0.2 of the
+//!     way across (0x822E6BC0), for the same side's corner of that body in
 //!     turn, up to three times (0x822E6C90). Then the body's own
 //!     `AiHintNode` hardpoints (template component: `Hardpoint`, `Type`,
 //!     `Name`; store 0x83653B38), each a node so (rising no more than 0.7
@@ -43,6 +48,8 @@
 //!   (0x822E67F8 keeps one only while the best is cheaper than it plus
 //!   1 m); the cheaper way is taken up when an edge to it holds, by
 //!   relinking the best (0x822E7688).
+//! - The pairs seen (0x822E6A40, 128 slots) leave out the first node's
+//!   edges (its key is 0), and start again once past 120.
 //! - **Following** (0x822E2770): the point a lookahead on along the way
 //!   from where the vehicle is nearest it, the lookahead the larger of
 //!   3 m, half its box's largest side and its speed over the think.
@@ -73,6 +80,9 @@ pub type Key = (u64, u64);
 /// The goal's key (0x80000000).
 pub const GOAL: Key = (0x8000_0000, 0);
 
+/// The first node's key.
+const FIRST: Key = (0, 0);
+
 /// What a sweep met.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Obstacle {
@@ -93,8 +103,9 @@ pub trait PathWorld {
     /// The first body a box of half extents `half`, turned to face along
     /// the sweep, meets going from `from` to `to`, if any.
     fn sweep(&mut self, from: Vec3, to: Vec3, half: Vec3) -> Option<Obstacle>;
-    /// The ground under `at` (a ray from 2 m above to 1000 m below): where,
-    /// and the body it is the top of when not the ground itself.
+    /// The ground under `at` (0x822E4120: a ray from 2 m above to 1000 m
+    /// below, then from 502 m above to 500 m below if that met nothing):
+    /// where, and the body it is the top of when not the ground itself.
     fn ground(&mut self, at: Vec3) -> Option<(Vec3, Option<u64>)>;
     /// Body `id`'s `AiHintNode` hardpoints in the world, by name hash.
     fn hints(&mut self, id: u64) -> Vec<(u32, Vec3)>;
@@ -108,6 +119,8 @@ struct Node {
     parent: Option<usize>,
     cost: f32,
     key: Key,
+    /// The body it stands on (+0x3C), if not the ground.
+    on: Option<u64>,
 }
 
 /// A path search's result: the way from the start to the goal.
@@ -135,6 +148,7 @@ struct Search<'w, W: PathWorld> {
     world: &'w mut W,
     size: Size,
     goal: Vec3,
+    goal_on: Option<u64>,
     nodes: Vec<Node>,
     open: [Option<usize>; 16],
     best: HashMap<Key, usize>,
@@ -165,15 +179,16 @@ impl<W: PathWorld> Search<'_, W> {
     }
 
     /// 0x822E6B10 + 0x822E67F8: a node at `at` from `parent` for `key`.
-    fn add(&mut self, parent: usize, at: Vec3, key: Key) {
+    fn add(&mut self, parent: usize, at: Vec3, key: Key, on: Option<u64>) {
         let p = &self.nodes[parent];
         let n = Node {
             at,
             parent: Some(parent),
             cost: p.cost + (at - p.at).length(),
             key,
+            on,
         };
-        if self.pairs.contains(&(p.key, key)) {
+        if p.key != FIRST && self.pairs.contains(&(p.key, key)) {
             return;
         }
         if let Some(&b) = self.best.get(&key)
@@ -187,58 +202,52 @@ impl<W: PathWorld> Search<'_, W> {
     }
 
     /// 0x822E6BC0: `at` put on the ground and added from `parent`, unless
-    /// it stands on another body's top rising more than `slope` of the way
-    /// across from the parent; then that body.
-    fn add_grounded(
-        &mut self,
-        parent: usize,
-        at: Vec3,
-        key: Key,
-        slope: f32,
-        from: u64,
-    ) -> Option<u64> {
+    /// it stands on a body other than the parent's, its top rising more
+    /// than `slope` of the way across from the parent; then that body.
+    fn add_grounded(&mut self, parent: usize, at: Vec3, key: Key, slope: f32) -> Option<u64> {
         let (g, on) = self.world.ground(at).unwrap_or((at, None));
-        let p = self.nodes[parent].at;
+        let (p, under) = (self.nodes[parent].at, self.nodes[parent].on);
         if let Some(b) = on
-            && b != from
+            && Some(b) != under
         {
             let d = (g - p).with_y(0.0).length();
             if g.y - p.y > d * slope {
                 return Some(b);
             }
         }
-        self.add(parent, g, key);
+        self.add(parent, g, key, on);
         None
     }
 
     /// 0x822E3138: the two corners of `o`'s box seen widest from `from`,
-    /// pushed out sideways by `clear`; or, from inside it, one at the
-    /// nearest face.
-    fn corners(o: &Obstacle, from: Vec3, clear: f32) -> Vec<Vec3> {
+    /// left then right, pushed out sideways by `clear`; or, from inside it,
+    /// one out at a face. Each with which corner it is, at the height of
+    /// `o`'s origin.
+    fn corners(o: &Obstacle, from: Vec3, clear: f32) -> Vec<(Vec3, u64)> {
         let (at, turn) = o.pose;
         let inv = turn.inverse();
-        let local = inv * (from - at);
+        // At the box's own height.
+        let local = inv * (from - at).with_y(0.0);
         let inside = (o.min.cmple(local) & local.cmple(o.max)).all();
         if inside {
-            let to_min = local - o.min;
-            let to_max = o.max - local;
-            let mut best = (f32::MAX, 0usize, false);
-            for a in [0usize, 2] {
-                if to_min[a] < best.0 {
-                    best = (to_min[a], a, false);
-                }
-                if to_max[a] < best.0 {
-                    best = (to_max[a], a, true);
-                }
-            }
-            let mut p = local;
-            p[best.1] = if best.2 {
-                o.max[best.1] + clear
+            // 0x822E48E0: where the line out from the origin through
+            // `local` meets the box.
+            let side = |a: usize| if local[a] >= 0.0 { o.max[a] } else { o.min[a] };
+            let (sx, sz) = (side(0), side(2));
+            let a = if (sz * local.x).abs() <= (sx * local.z).abs() {
+                2
             } else {
-                o.min[best.1] - clear
+                0
             };
+            let t = if local[a] == 0.0 {
+                0.0
+            } else {
+                side(a) / local[a]
+            };
+            let mut p = local * t;
+            p[a] += if p[a] <= 0.0 { -clear } else { clear };
             let w = at + turn * p;
-            return vec![Vec3::new(w.x, from.y, w.z)];
+            return vec![(Vec3::new(w.x, at.y, w.z), 8)];
         }
         let corner = |i: usize| {
             Vec3::new(
@@ -264,58 +273,49 @@ impl<W: PathWorld> Search<'_, W> {
                 right = i;
             }
         }
-        [left, right]
+        [(left, clear), (right, -clear)]
             .into_iter()
-            .map(|i| {
+            .map(|(i, out)| {
                 let w = at + turn * corner(i);
-                // 0x822E3080: sideways from the line of sight.
+                // 0x822E3080: sideways from the line of sight, away from
+                // the rest of the box.
                 let d = (w - from).with_y(0.0);
                 let across = Vec3::new(d.z, 0.0, -d.x).normalize_or_zero();
-                // Out, away from the box (the 360 pushes its left corner one way
-                // and its right the other).
-                let out = if (w - at).with_y(0.0).dot(across) < 0.0 {
-                    -clear
-                } else {
-                    clear
-                };
                 let p = w + across * out;
-                Vec3::new(p.x, from.y, p.z)
+                (Vec3::new(p.x, at.y, p.z), i as u64)
             })
             .collect()
     }
 
-    /// 0x822E74A8 and 0x822E6C90: new edges from `parent` round `o`.
+    /// 0x822E74A8, 0x822E6DC8 and 0x822E6C90: new edges from `parent`
+    /// round `o`.
     fn detour(&mut self, parent: usize, o: &Obstacle) {
         if o.ground {
             let key = (
                 u64::from(o.point.x.round() as i32 as u32),
                 u64::from(o.point.z.round() as i32 as u32),
             );
-            self.add_grounded(parent, o.point, key, 0.2, 0);
+            self.add_grounded(parent, o.point, key, 0.2);
             return;
         }
         let from = self.nodes[parent].at;
         let clear = self.size.clearance() * 1.8;
-        let mut stack = vec![(*o, 0)];
-        while let Some((ob, depth)) = stack.pop() {
-            for (k, c) in Self::corners(&ob, from, clear).into_iter().enumerate() {
-                let key = (ob.id, k as u64);
-                if let Some(b) = self.add_grounded(parent, c, key, 0.2, ob.id)
-                    && depth < 3
-                    && let Some(next) = self.world.body(b)
-                {
-                    stack.push((next, depth + 1));
+        for (side, (at, corner)) in Self::corners(o, from, clear).into_iter().enumerate() {
+            let mut on = self.add_grounded(parent, at, (o.id, corner), 0.2);
+            for _ in 0..3 {
+                let Some(body) = on.and_then(|b| self.world.body(b)) else {
+                    break;
+                };
+                let round = Self::corners(&body, from, clear);
+                if round.len() < 2 {
+                    break;
                 }
+                let (at, corner) = round[side];
+                on = self.add_grounded(parent, at, (body.id, corner), 0.2);
             }
         }
         for (hash, at) in self.world.hints(o.id) {
-            self.add_grounded(
-                parent,
-                at,
-                (o.id, 0x1_0000_0000 | u64::from(hash)),
-                0.7,
-                o.id,
-            );
+            self.add_grounded(parent, at, (o.id, 0x1_0000_0000 | u64::from(hash)), 0.7);
         }
     }
 
@@ -325,7 +325,16 @@ impl<W: PathWorld> Search<'_, W> {
             return;
         };
         let (pk, nk) = (self.nodes[p].key, self.nodes[n].key);
-        if pk == nk || !self.pairs.insert((pk, nk)) {
+        // 0x822E6A40.
+        if pk != FIRST {
+            if !self.pairs.insert((pk, nk)) {
+                return;
+            }
+            if self.pairs.len() > 120 {
+                self.pairs.clear();
+            }
+        }
+        if pk == nk {
             return;
         }
         let up = Vec3::Y * (self.size.height * 0.5 + 0.25);
@@ -339,10 +348,10 @@ impl<W: PathWorld> Search<'_, W> {
         let d = b - a;
         if d.length_squared() > 400.0 {
             let mid = a + d * (400.0 / d.length_squared()).sqrt();
-            if let Some((g, _)) = self.world.ground(mid)
+            if let Some((g, on)) = self.world.ground(mid)
                 && (g.y - mid.y).abs() > 1.0
             {
-                self.add(p, g, (nk.0 ^ 0x5151, nk.1 ^ p as u64));
+                self.add(p, g, (nk.0 ^ 0x5151, nk.1 ^ p as u64), on);
                 return;
             }
         }
@@ -353,7 +362,8 @@ impl<W: PathWorld> Search<'_, W> {
                     self.done = Some(n);
                 } else {
                     let goal = self.goal;
-                    self.add(n, goal, GOAL);
+                    let on = self.goal_on;
+                    self.add(n, goal, GOAL, on);
                 }
             }
             Some(b) if self.nodes[n].cost < self.nodes[b].cost => {
@@ -369,16 +379,18 @@ impl<W: PathWorld> Search<'_, W> {
 /// (0x822E64A8, stepped to its end).
 pub fn find(world: &mut impl PathWorld, size: Size, start: Vec3, goal: Vec3) -> Option<Way> {
     let start = world.ground(start).map_or(start, |(g, _)| g);
-    let goal = world.ground(goal).map_or(goal, |(g, _)| g);
+    let (goal, goal_on) = world.ground(goal).unwrap_or((goal, None));
     let mut s = Search {
         world,
         size,
         goal,
+        goal_on,
         nodes: vec![Node {
             at: start,
             parent: None,
             cost: 0.0,
-            key: (0, 0),
+            key: FIRST,
+            on: None,
         }],
         open: [None; 16],
         best: HashMap::new(),
@@ -390,6 +402,7 @@ pub fn find(world: &mut impl PathWorld, size: Size, start: Vec3, goal: Vec3) -> 
         parent: Some(0),
         cost: (goal - start).length(),
         key: GOAL,
+        on: goal_on,
     });
     s.push(1);
     for _ in 0..256 {
@@ -521,6 +534,93 @@ mod tests {
             (p.length() - 3.0).abs() < 1e-3 && p.x.signum() == mid.x.signum(),
             "{p}"
         );
+    }
+
+    /// A wall 60 m long and 8 m thick (x -30..30, z 10..18): no one corner
+    /// of it sees the goal behind it.
+    struct Thick;
+    impl PathWorld for Thick {
+        fn sweep(&mut self, from: Vec3, to: Vec3, half: Vec3) -> Option<Obstacle> {
+            let (lo, hi) = (
+                Vec3::new(-30.0 - half.x, 0.0, 10.0 - half.x),
+                Vec3::new(30.0 + half.x, 4.0, 18.0 + half.x),
+            );
+            let d = to - from;
+            let (mut t0, mut t1) = (0.0f32, 1.0f32);
+            for a in [0usize, 2] {
+                if d[a].abs() < 1e-6 {
+                    if from[a] < lo[a] || from[a] > hi[a] {
+                        return None;
+                    }
+                    continue;
+                }
+                let (mut ta, mut tb) = ((lo[a] - from[a]) / d[a], (hi[a] - from[a]) / d[a]);
+                if ta > tb {
+                    std::mem::swap(&mut ta, &mut tb);
+                }
+                t0 = t0.max(ta);
+                t1 = t1.min(tb);
+            }
+            (t0 < t1).then(|| Obstacle {
+                point: from + d * t0,
+                id: 7,
+                ground: false,
+                pose: (Vec3::new(0.0, 0.0, 14.0), Quat::IDENTITY),
+                min: Vec3::new(-30.0, 0.0, -4.0),
+                max: Vec3::new(30.0, 4.0, 4.0),
+            })
+        }
+        fn ground(&mut self, at: Vec3) -> Option<(Vec3, Option<u64>)> {
+            Some((at.with_y(0.0), None))
+        }
+        fn hints(&mut self, _: u64) -> Vec<(u32, Vec3)> {
+            Vec::new()
+        }
+        fn body(&mut self, _: u64) -> Option<Obstacle> {
+            None
+        }
+    }
+
+    #[test]
+    fn it_goes_round_a_long_wall_corner_by_corner() {
+        let size = Size {
+            width: 3.2,
+            height: 2.6,
+        };
+        let way = find(&mut Thick, size, Vec3::ZERO, Vec3::new(0.0, 0.0, 60.0)).unwrap();
+        // Two corners of the one wall: its near end, then its far end.
+        assert_eq!(way.points.len(), 4, "{way:?}");
+        assert!(way.points[1].z < way.points[2].z, "{way:?}");
+        assert_eq!(way.points[1].x.signum(), way.points[2].x.signum());
+    }
+
+    #[test]
+    fn the_corners_are_of_the_bodys_own_box_at_its_height() {
+        let o = Obstacle {
+            point: Vec3::ZERO,
+            id: 1,
+            ground: false,
+            pose: (Vec3::new(0.0, 5.0, 10.0), Quat::IDENTITY),
+            min: Vec3::new(-2.0, 0.0, -1.0),
+            max: Vec3::new(2.0, 3.0, 1.0),
+        };
+        type S<'a> = Search<'a, Thick>;
+        let c = S::corners(&o, Vec3::ZERO, 1.0);
+        assert_eq!(c.len(), 2);
+        // Its near corners (z min), at its height, clear of its box.
+        assert_eq!(c[0].1 & 1, 0);
+        assert_eq!(c[1].1 & 1, 0);
+        assert_ne!(c[0].1 & 4, c[1].1 & 4);
+        for (p, _) in &c {
+            assert_eq!(p.y, 5.0);
+            assert!(p.x.abs() > 2.5, "{p}");
+        }
+        // From inside, one at a face, keyed apart from the eight.
+        let c = S::corners(&o, Vec3::new(0.5, 0.0, 10.25), 1.0);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].1, 8);
+        assert!((c[0].0.z - 12.0).abs() < 0.01, "{}", c[0].0);
+        assert!((c[0].0.x - 2.0).abs() < 0.01, "{}", c[0].0);
     }
 
     #[test]
