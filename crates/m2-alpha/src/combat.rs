@@ -391,6 +391,22 @@ pub fn armed_seats(v: &ParkedVehicle) -> Vec<u32> {
     seats
 }
 
+/// How often an army's vehicle's gun looks for a target, seconds (as a
+/// soldier does, `npc::LOOK_EVERY`; inferred).
+const CREW_LOOK: f32 = 0.2;
+
+/// An armed seat of an army's vehicle: see [`Combat::crews_fire`].
+#[derive(Debug, Default)]
+struct CrewGun {
+    slot: m2_engine::ai_target::Slot,
+    /// Where the one in its slot is.
+    at: Option<Vec3>,
+    look: f32,
+    wait: f32,
+    burst: u32,
+    clip: m2_engine::weapons::AiClip,
+}
+
 /// Seconds a clip takes to change when she has no reload clip to play
 /// (invented); with one, the change lasts as long as it (playtest 8: the
 /// rifle's `ReloadIdle` 49288f7f, 1.0 s; inferred, as no gun template
@@ -1446,12 +1462,16 @@ enum Projectile {
         /// Its round's `DamageKey` (`Rocket`): what a weak point it
         /// strikes takes of its blast ([`DamageTable::weak_point`]).
         key: Option<u32>,
+        /// A soldier's: what it does isn't to her account.
+        army: bool,
     },
     Grenade {
         at: Vec3,
         velocity: Vec3,
         fuse: f32,
         blast: Option<Blast>,
+        /// A soldier's, as a rocket's.
+        army: bool,
     },
     /// A grenade launcher's round: bursts where it lands.
     Round {
@@ -1746,6 +1766,11 @@ pub struct Combat {
     ripple: usize,
     /// Seconds until each gunner riding with her fires again
     /// ([`Combat::gunners_fire`]).
+    /// The armies' vehicles' armed seats ([`crews_fire`](Self::crews_fire)),
+    /// by vehicle and seat.
+    crews: std::collections::HashMap<(usize, usize), CrewGun>,
+    /// A crew's gun, not hers, is firing.
+    crew_firing: bool,
     gunner_wait: Vec<f32>,
     /// Rounds left in each such gunner's burst.
     gunner_burst: Vec<u32>,
@@ -2005,6 +2030,8 @@ impl Default for Combat {
             seat: 0,
             vehicle_gun: 0,
             ripple: 0,
+            crews: std::collections::HashMap::new(),
+            crew_firing: false,
             gunner_wait: Vec::new(),
             gunner_burst: Vec::new(),
             gunner_clips: Vec::new(),
@@ -3014,6 +3041,7 @@ impl Combat {
         }
         if self.down <= 0.0 {
             self.gunners_fire(f, dt);
+            self.crews_fire(f, dt);
             self.pilots_fire(f, dt);
         }
         // Fire fires the gun chosen with the switch: the main gun, or the
@@ -3064,12 +3092,14 @@ impl Combat {
         // Soldiers' shots and grenades.
         let target = self.target(f.player, true);
         for i in 0..f.people.npcs.len() {
+            // Whom they go for, of another army, else her.
+            let foe = f.people.npcs[i].foe_at;
             if std::mem::take(&mut f.people.npcs[i].fires) {
-                let at = f.people.npcs[i].fire_at.take().or(target);
+                let at = f.people.npcs[i].fire_at.take().or(foe).or(target);
                 self.npc_shoot(f, i, at);
             }
             if std::mem::take(&mut f.people.npcs[i].launches) {
-                self.npc_launch(f, i, target);
+                self.npc_launch(f, i, foe.or(target));
             }
             if let Some(at) = f.people.npcs[i].throws.take() {
                 self.npc_throw(f, i, at);
@@ -3246,6 +3276,7 @@ impl Combat {
                     blast: ammo.burst(),
                     homing: None,
                     key: ammo.key,
+                    army: false,
                 });
                 self.effect(
                     Effect::Flash {
@@ -3421,6 +3452,7 @@ impl Combat {
             blast: l.ammo.burst(),
             homing: None,
             key: l.ammo.key,
+            army: true,
         });
         self.effect(
             Effect::Flash {
@@ -3457,6 +3489,7 @@ impl Combat {
             velocity,
             fuse: FUSE,
             blast,
+            army: true,
         });
     }
 
@@ -3465,6 +3498,10 @@ impl Combat {
         let n = &f.people.npcs[i];
         let gun = n.gun;
         let shooter = n.shooter;
+        let at_her = n.foe_at.is_none();
+        if !at_her {
+            f.people.war_tally.0 += 1;
+        }
         let (from, case) = match (f.arsenal.npc_gun(gun), f.people.kinds.get(n.kind)) {
             (Some(w), Some(_)) => {
                 let (nodes, _) = n.rig.posed();
@@ -3527,7 +3564,19 @@ impl Combat {
             }
             let closest = from + dir * (aim - from).dot(dir).max(0.0);
             let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
-            if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
+            if let Some((_, Some(j))) = hit
+                && f.people.enemies(i, j)
+            {
+                // The round's `Damage` by their own row of the table, as
+                // her rounds are, without her gun's `Hero` multiple.
+                let round = gun.map_or(NPC_DAMAGE, |g| g.damage);
+                let key = gun.and_then(|g| g.damage_key);
+                let taken = round * self.on_person(&f.people.npcs[j], key);
+                let killed = f.people.npcs[j].shot_by_army(taken, dir * SHOT_PUSH, shooter);
+                f.people.war_tally.1 += 1;
+                f.people.war_tally.2 += u32::from(killed);
+            }
+            if at_her && f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
                 let damage = self.npc_round(gun);
                 let lost = self.hurt_player(f, damage, Some(from));
                 self.tally.taken_rounds += lost;
@@ -3754,6 +3803,7 @@ impl Combat {
             blast: self.launcher.blast(),
             homing,
             key: self.launcher.ammo.and_then(|a| a.key),
+            army: false,
         });
         self.effect(
             Effect::Flash {
@@ -4010,6 +4060,7 @@ impl Combat {
                     blast: ammo.burst(),
                     homing: None,
                     key: ammo.key,
+                    army: self.crew_firing,
                 });
                 self.effect(
                     Effect::Flash {
@@ -4145,6 +4196,137 @@ impl Combat {
                 self.gunner_wait[k] = wait;
                 self.gunner_burst[k] = burst;
                 self.gunner_rounds += 1;
+            }
+        }
+    }
+
+    /// The armies' crewed vehicles go for those at war with their army,
+    /// as a soldier does ([`m2_engine::ai_target`]): each armed seat's
+    /// mind offers its slot whom it can see within its weapon's range,
+    /// lays the gun on the one it settles on, and fires by its hint's
+    /// bursts, as her gunners do ([`gunners_fire`](Self::gunners_fire)).
+    /// `Vision` 1.25 is vehicles' (from samples); that they leave her to
+    /// the pursuit's vehicles is the alpha's, for now.
+    fn crews_fire(&mut self, f: &mut Field<'_>, dt: f32) {
+        const VISION: f32 = 1.25;
+        let driven = f.player.driving;
+        for i in 0..f.vehicles.len() {
+            let v = &f.vehicles[i];
+            let Some(side) = v.army() else { continue };
+            if v.wrecked || Some(i) == driven || v.spec.armed.is_empty() {
+                continue;
+            }
+            let Some(body) = v.id.and_then(|id| f.physics.vehicle_transform(id)) else {
+                continue;
+            };
+            let centre = body.transform_point3(Vec3::Y);
+            let seats = armed_seats(v);
+            for (seat, &mount) in seats.iter().enumerate() {
+                let v = &f.vehicles[i];
+                let Some(m) = v
+                    .spec
+                    .armed
+                    .iter()
+                    .find(|m| m.seat == mount && m.priority == 0)
+                else {
+                    continue;
+                };
+                let hint = m.weapon.hint;
+                let (near, far) = hint.map_or((0.0, GUNNER_RANGE), |h| (h.min_range, h.range));
+                let cone = m.weapon.feel.cone(0.0);
+                let gap = m.weapon.gap();
+                let size = m2_engine::weapons::AiClip::size(m);
+                let aim_ai = m.weapon.aim_ai;
+                let aimer = v.spec.aimer_of_seat(mount);
+                let gun = self.crews.entry((i, seat)).or_default();
+                gun.wait -= dt;
+                gun.clip.tick(dt);
+                gun.look -= dt;
+                if gun.look <= 0.0 {
+                    gun.look = CREW_LOOK;
+                    let current = gun.at.map(|a| a.distance(centre));
+                    gun.at = None;
+                    let mut best = gun.slot;
+                    let seen = f.people.foes_of(side, centre);
+                    for (who, at, visibility) in seen {
+                        let d = at.distance(centre);
+                        let in_slot = best.who == Some(who);
+                        let reach = VISION * visibility * if in_slot { 1.5 } else { 1.0 };
+                        if !(near..=far).contains(&d) || d > reach {
+                            continue;
+                        }
+                        let to = at - centre;
+                        let clear = (d - 2.5).max(0.5);
+                        let hit = f.physics.cast_ray_past(
+                            centre + to.normalize_or(Vec3::Z) * 2.5,
+                            to.normalize_or(Vec3::Z),
+                            clear - 2.5,
+                            v.id.expect("it has a body"),
+                        );
+                        // A gun fires only along a clear line (inferred: a soldier's
+                        // fight keeps him from firing blind; a crew has no such step).
+                        if hit.is_none() {
+                            let score = m2_engine::ai_target::score(d, current, in_slot);
+                            best.offer(who, score);
+                            if best.who == Some(who) {
+                                gun.at = Some(at);
+                            }
+                        }
+                    }
+                    if gun.slot.who != best.who
+                        && let Some(at) = gun.at
+                    {
+                        eprintln!(
+                            "war: a {side} {} goes for {:?} at {:.0} m",
+                            v.spec.label,
+                            best.who,
+                            at.distance(centre)
+                        );
+                    }
+                    gun.slot = if gun.at.is_some() {
+                        best
+                    } else {
+                        Default::default()
+                    };
+                }
+                let Some(at) = gun.at else { continue };
+                let (wait, left, empty) = (gun.wait, gun.burst, gun.clip.gunner_empty(size));
+                let v = &mut f.vehicles[i];
+                let laid = match aimer {
+                    Some(a) => {
+                        v.aims.resize(v.spec.aimers.len(), (0.0, 0.0));
+                        let want = v.spec.aim_toward(a, body, v.turret, at);
+                        let now = v.spec.aimers[a].step(v.aims[a], want, dt);
+                        v.aims[a] = now;
+                        let margin = m2_engine::weapons::ai_turret_margin(aim_ai);
+                        v.spec.aimers[a].record.reaches(want, margin)
+                    }
+                    None => {
+                        let nose = body.transform_vector3(Vec3::Z).normalize_or(Vec3::Z);
+                        (at - centre).normalize_or(nose).dot(nose)
+                            > m2_engine::weapons::ai_aim_cosine(aim_ai)
+                    }
+                };
+                if !laid || wait > 0.0 || !empty {
+                    continue;
+                }
+                let to = at - centre;
+                let (a, b) = (self.random(), self.random());
+                let dir = m2_engine::weapons::stray_in_cone(to.normalize_or(Vec3::Z), cone, a, b);
+                let close = to.length() < m2_engine::weapons::FireHint::CLOSE;
+                self.crew_firing = true;
+                let fired = self
+                    .fire_mount(f, i, seat, 0, Some(centre + dir * to.length()))
+                    .is_some();
+                self.crew_firing = false;
+                if fired {
+                    f.people.war_tally.0 += 1;
+                    let gun = self.crews.entry((i, seat)).or_default();
+                    gun.clip.shot(size);
+                    let (wait, burst) = gunner_burst(hint, gap, close, left);
+                    gun.wait = wait;
+                    gun.burst = burst;
+                }
             }
         }
     }
@@ -4332,6 +4514,7 @@ impl Combat {
                 blast,
                 homing: None,
                 key,
+                army: self.crew_firing,
             });
             if let Some(v) = f.vehicles.get_mut(i) {
                 v.fired += 1;
@@ -4891,6 +5074,7 @@ impl Combat {
                 velocity,
                 fuse: FUSE,
                 blast: None,
+                army: false,
             });
             return;
         };
@@ -4923,6 +5107,7 @@ impl Combat {
                 velocity,
                 fuse: timer.unwrap_or(FUSE),
                 blast: t.ammo.burst(),
+                army: false,
             });
         }
     }
@@ -5042,6 +5227,8 @@ impl Combat {
         }
         let mut puffs = Vec::new();
         let mut streaks = Vec::new();
+        // Where soldiers' rockets and grenades burst.
+        let mut armies = Vec::new();
         // Where people and vehicles are, for mines.
         let near: Vec<Vec3> = f
             .people
@@ -5066,6 +5253,7 @@ impl Combat {
                 blast,
                 homing,
                 key,
+                army,
             } => {
                 // Turning after the vehicle it locked on, no faster than its
                 // turn rate.
@@ -5085,7 +5273,11 @@ impl Combat {
                 let len = step.length();
                 let hit = cast_shot(f.physics, f.people, *at, step, len, None, *owner);
                 if let Some((d, _)) = hit {
-                    blasts.push((*at + step.normalize_or_zero() * d, *blast, *key));
+                    let burst = *at + step.normalize_or_zero() * d;
+                    if *army {
+                        armies.push(burst);
+                    }
+                    blasts.push((burst, *blast, *key));
                     return false;
                 }
                 if *shell {
@@ -5096,6 +5288,9 @@ impl Combat {
                 *at += step;
                 *flown += len;
                 if *flown > ROCKET_RANGE {
+                    if *army {
+                        armies.push(*at);
+                    }
                     blasts.push((*at, *blast, *key));
                     return false;
                 }
@@ -5168,6 +5363,7 @@ impl Combat {
                 velocity,
                 fuse,
                 blast,
+                army,
             } => {
                 velocity.y -= m2_engine::physics::GRAVITY * dt;
                 let step = *velocity * dt;
@@ -5179,6 +5375,9 @@ impl Combat {
                 }
                 *fuse -= dt;
                 if *fuse <= 0.0 {
+                    if *army {
+                        armies.push(*at);
+                    }
                     blasts.push((*at, *blast, None));
                     return false;
                 }
@@ -5195,7 +5394,20 @@ impl Combat {
             self.effect(Effect::Tracer { from, to }, dt * 1.5);
         }
         for (at, blast, key) in blasts {
+            // A soldier's blast isn't to her account.
+            let army = armies.contains(&at);
+            let hers: Vec<_> = f
+                .people
+                .npcs
+                .iter()
+                .map(|n| (n.hurt_by_her, n.killed_by_her))
+                .collect();
             self.explode_keyed(f, at, blast, key);
+            if army {
+                for (n, (hurt, killed)) in f.people.npcs.iter_mut().zip(hers) {
+                    (n.hurt_by_her, n.killed_by_her) = (hurt, killed);
+                }
+            }
         }
     }
 
@@ -5345,6 +5557,12 @@ impl Combat {
         push: Vec3,
     ) -> bool {
         let taken = damage * hero * self.on_person(&people.npcs[j], key);
+        if self.crew_firing {
+            let killed = people.npcs[j].shot_by_army(taken, push, 0);
+            people.war_tally.1 += 1;
+            people.war_tally.2 += u32::from(killed);
+            return false;
+        }
         let n = &mut people.npcs[j];
         let counts = n.alive && n.soldier;
         let killed = n.hurt(taken, push) && n.soldier;

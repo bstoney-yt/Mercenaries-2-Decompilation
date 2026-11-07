@@ -709,6 +709,41 @@ fn hostile_factions(m: &Mission) -> Option<HashSet<&'static str>> {
     Some(hostile)
 }
 
+/// How the factions regard each other (`MrxFactionManager.GetRelation`),
+/// by the manager's abbreviations; `None` before the manager runs.
+fn faction_relations(m: &Mission) -> Option<HashMap<(&'static str, &'static str), f32>> {
+    const ARMIES: [&str; 6] = ["All", "Chi", "Gur", "Oil", "Pir", "Vza"];
+    let got: Option<mlua::Table> = m
+        .lua()
+        .load(
+            "local m = rawget(_G, 'MrxFactionManager') \
+             if type(m) ~= 'table' or type(m.GetRelation) ~= 'function' then return nil end \
+             local out = {} \
+             for _, a in ipairs({ 'All', 'Chi', 'Gur', 'Oil', 'Pir', 'Vza' }) do \
+                 for _, b in ipairs({ 'All', 'Chi', 'Gur', 'Oil', 'Pir', 'Vza' }) do \
+                     local ok, r = pcall(m.GetRelation, a, b) \
+                     if ok and type(r) == 'number' then out[a .. b] = r end \
+                 end \
+             end \
+             return out",
+        )
+        .eval()
+        .ok()
+        .flatten();
+    let got = got?;
+    let mut relations = HashMap::new();
+    for a in ARMIES {
+        for b in ARMIES {
+            if a != b
+                && let Ok(Some(r)) = got.get::<Option<f32>>(format!("{a}{b}"))
+            {
+                relations.insert((a, b), r);
+            }
+        }
+    }
+    Some(relations)
+}
+
 /// The factions whose attitude to the PMC the scripts have at `label`
 /// (`hostile`, `friendly`: `MrxFactionManager.GetAttitudeLabel(faction,
 /// "Pmc")`), by the manager's abbreviations; `None` before the manager
@@ -2601,6 +2636,9 @@ impl MissionLink {
             game.attitude_wait = 1.0;
             if let Some(hostile) = hostile_factions(mission) {
                 game.scene.people.set_hostile(hostile);
+            }
+            if let Some(relations) = faction_relations(mission) {
+                game.scene.people.set_relations(relations);
             }
         }
         // Whether she swims, for `Human.IsSwimming`.

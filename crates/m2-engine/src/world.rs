@@ -289,6 +289,8 @@ pub struct Templates {
     pub population: crate::population::Population,
     /// How the person templates fight and notice things, by id.
     pub ai: HashMap<u32, AiProfile>,
+    /// How templates regard each other ([`crate::ai::relations`]).
+    pub relations: Vec<(String, String, f32)>,
     /// How much those with `Health` take, by id.
     pub durability: HashMap<u32, crate::durability::Durability>,
     /// The blasts of those with `Explosive`, by id.
@@ -1028,6 +1030,7 @@ impl Templates {
             motions: crate::motion::read_templates(&db),
             population: crate::population::Population::read(&db),
             ai: crate::ai::read(&db),
+            relations: crate::ai::relations(&db),
             durability: crate::durability::read(&db),
             explosions: crate::durability::explosions(&db),
             hijack: crate::hijack::read(&db),

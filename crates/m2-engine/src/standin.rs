@@ -298,6 +298,7 @@ mod tests {
                 health: Some(300.0),
                 burns_below: Some(60.0),
                 armour: Some(2),
+                visibility: None,
                 ..VehicleTuning::default()
             },
         );
