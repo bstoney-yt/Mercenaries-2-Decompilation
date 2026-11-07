@@ -477,10 +477,15 @@ fn way_in_of(
 /// Within this of a crewed vehicle's middle she starts its hijack,
 /// metres (invented; m2-alpha's `HIJACK_REACH` is 6).
 const HIJACK_NEAR: f32 = 5.0;
+/// With another entrance nearer her than her vehicle's door she steps to
+/// this far out from the door (metres, invented).
+const DOOR_OUT: f32 = 0.3;
 const PRESS_GAP: f32 = 1.5;
 /// Fallen this far under the ground (metres: a hole where the island
 /// hadn't streamed in yet), she is put back on it.
 const UNDER: f32 = 5.0;
+/// Going down this fast (m/s) a driven vehicle's fall is logged.
+const FALLING: f32 = 8.0;
 /// From further than this from a place (metres), she goes the way planned
 /// to it ([`Route`]): in cells this size on foot and driving (metres),
 /// over ground up to this steep on foot, on wheels and on tracks; planned
@@ -1106,6 +1111,8 @@ pub struct Autoplay {
     laser_failed: u32,
     /// Seconds one following her has been left behind.
     left_behind: f32,
+    /// When a driven vehicle's fall was last logged, seconds ([`Self::watch_fall`]).
+    fall_logged: f32,
 }
 
 impl Autoplay {
@@ -1129,6 +1136,7 @@ impl Autoplay {
         dt: f32,
     ) -> Intent {
         self.clock += dt;
+        self.watch_fall(game);
         if std::mem::take(&mut game.countdown_tick) {
             self.hurry_until = self.clock + HURRY_FOR;
         }
@@ -2337,24 +2345,30 @@ impl Autoplay {
                     at.y > m.at.y + HOLDS_UP_RISE
                         && at.with_y(0.0).distance(m.at.with_y(0.0)) < HOLDS_UP
                 })
-                // Herself only on it, her feet at its box: from PmcCon031's
-                // MG platform, 4 m over its columns, those within 20 m were
-                // passed over, and 12 stood (round 24 of its thread).
-                || game
-                    .scene
-                    .props
-                    .stood_on(m.target, here, STANDS_ON)
-                    .unwrap_or(false)
                 || followers.iter().any(|f| {
                     f.with_y(0.0).distance(m.at.with_y(0.0)) < crate::combat::BOMB_FRAG.0 + HOLDS_UP
                 })
         };
+        // Herself only on it, her feet at its box: from PmcCon031's MG
+        // platform, 4 m over its columns, those within 20 m were passed
+        // over, and 12 stood (round 24 of its thread). Those wait for the
+        // others, not for good: on the only one left (PmcCon002's oil rig,
+        // PmcCon003's bunker) she stood with nothing to do for 50 minutes.
+        let stands_on = |m: &Mark| {
+            game.scene
+                .props
+                .stood_on(m.target, here, STANDS_ON)
+                .unwrap_or(false)
+        };
+        let others_to_destroy = live
+            .iter()
+            .any(|m| m.kind == "destroy" && !held_up(m) && !stands_on(m));
         // What to destroy, and HVTs to verify still standing: shot first.
         let mut destroy: Vec<&Mark> = live
             .iter()
             .copied()
             .filter(|m| {
-                (m.kind == "destroy" && !held_up(m))
+                (m.kind == "destroy" && !held_up(m) && !(others_to_destroy && stands_on(m)))
                     || (m.kind == "verify"
                         && npcs.iter().any(|n| n.spawn == Some(m.target) && n.alive))
             })
@@ -4361,12 +4375,18 @@ impl Autoplay {
                 // Its laser has to reach the target: from where nothing
                 // stands between (round 19 marked a wall 40 m short and
                 // spent all three), and not again while one is under way.
-                if let Some(i) = game
-                    .support
-                    .entries()
-                    .iter()
-                    .position(|e| matches!(e, Entry::Stocked(s) if s.key == "bunkerbuster"))
-                {
+                // Its nuclear kin first: PmcCon004's bunker falls only to
+                // the `PmcCon004_Nuke` the contract gives her (the scripts
+                // wait for its `Nuked`, not a plain bunker buster's
+                // `Busted`, which she spent there in story run r1104).
+                let entries = game.support.entries();
+                let laser = |nuke: bool| {
+                    entries.iter().position(|e| {
+                        matches!(e, Entry::Stocked(s)
+                            if s.key == "bunkerbuster" && !nuke || nuke && s.key.contains("Nuke"))
+                    })
+                };
+                if let Some(i) = laser(true).or_else(|| laser(false)) {
                     if self
                         .laser_called
                         .is_some_and(|t| self.clock - t < LASER_AGAIN)
@@ -4652,6 +4672,20 @@ impl Autoplay {
             |d| m.transform_point3(d),
         );
         let here = p.character.position;
+        // Another entrance nearer her than the door's is the one the use
+        // key takes (the nearest, [`m2_engine::seats::pick`]): OilCon021's
+        // mail scooter's pillion entrance, whose seat she may not use, had
+        // her press 3,000 s from behind it. She steps round to the door.
+        let flat = |a: Vec3| (a - here).with_y(0.0).length();
+        let other_nearer = spec.door.is_some_and(|d| {
+            spec.entrances
+                .iter()
+                .any(|(_, at)| at.distance(d) > 0.01 && flat(m.transform_point3(*at)) < flat(door))
+        });
+        if other_nearer && flat(door) < door_reach(spec) + 1.0 {
+            let out = (door - m.w_axis.truncate()).with_y(0.0).normalize_or_zero();
+            return self.walk(game, door + out * DOOR_OUT, 0.2, dt);
+        }
         if (door - here).with_y(0.0).length() < door_reach(spec) {
             // The key takes the nearest entrance ahead of the camera
             // (0x82440F30): she faces her way in first, or another
@@ -5316,6 +5350,42 @@ impl Autoplay {
             p.character.position.y = ground + 0.1;
             p.character.velocity = Vec3::ZERO;
         }
+    }
+
+    /// Says what lies under a vehicle she drives that is falling.
+    fn watch_fall(&mut self, game: &Game) {
+        let (Some(p), Some(w)) = (game.scene.player.as_ref(), game.scene.world.as_ref()) else {
+            return;
+        };
+        let Some(id) = p
+            .driving
+            .and_then(|i| game.scene.vehicles.get(i))
+            .filter(|v| !v.spec.is_helicopter() && !v.spec.is_boat())
+            .and_then(|v| v.id)
+        else {
+            return;
+        };
+        let v = w.physics.vehicle_velocity(id);
+        if v.y > -FALLING || self.clock - self.fall_logged < 1.0 {
+            return;
+        }
+        self.fall_logged = self.clock;
+        let Some(at) = w.physics.vehicle_transform(id).map(|m| m.w_axis.truncate()) else {
+            return;
+        };
+        let top = at + Vec3::Y * 300.0;
+        eprintln!(
+            "autoplay {:.1} s: her vehicle falls at {v:.1} at {at:.1}: wheels on the ground {:?}, ground under it {:?}, from 300 m over {:?}, touching {}",
+            self.clock,
+            w.physics.vehicle_contacts(id),
+            w.physics
+                .cast_ray_past(at, Vec3::NEG_Y, 100.0, id)
+                .map(|h| h.0),
+            w.physics
+                .cast_ray_past(top, Vec3::NEG_Y, 600.0, id)
+                .map(|h| top.y - h.0),
+            w.physics.vehicle_touching(id).len(),
+        );
     }
 
     /// How she is getting on, for the log.
