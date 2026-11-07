@@ -71,7 +71,7 @@ pub struct VehicleSubject {
 
 /// The first number in a mind's attack slot of a vehicle, the rest going
 /// by [`People::vehicle_subjects`]'s order.
-const VEHICLES: u32 = 0x4000_0000;
+pub const VEHICLES: u32 = 0x4000_0000;
 /// The player's number in a mind's attack slot
 /// ([`m2_engine::ai_target::Slot`]); the rest go by their
 /// [`Npc::shooter`] number.

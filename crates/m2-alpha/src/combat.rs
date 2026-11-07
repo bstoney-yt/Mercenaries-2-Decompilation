@@ -4200,6 +4200,27 @@ impl Combat {
         }
     }
 
+    /// The vehicles whose guns have a foe, each with where that foe is
+    /// and whether it is a vehicle, its first seat's that has one.
+    pub fn crew_foes(&self, driving: bool) -> Vec<(usize, Vec3, bool)> {
+        let mut foes: Vec<(usize, usize, Vec3, bool)> = self
+            .crews
+            .iter()
+            .filter_map(|(&(i, seat), gun)| {
+                let who = gun.slot.who?;
+                let vehicle = if who == crate::npc::HER {
+                    driving
+                } else {
+                    who >= crate::npc::VEHICLES
+                };
+                Some((i, seat, gun.at?, vehicle))
+            })
+            .collect();
+        foes.sort_by_key(|f| (f.0, f.1));
+        foes.dedup_by_key(|f| f.0);
+        foes.into_iter().map(|f| (f.0, f.2, f.3)).collect()
+    }
+
     /// The armies' crewed vehicles go for those at war with their army,
     /// as a soldier does ([`m2_engine::ai_target`]): each armed seat's
     /// mind offers its slot whom it can see within its weapon's range,

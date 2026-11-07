@@ -225,6 +225,15 @@ impl Traffic {
         }
     }
 
+    /// Whether vehicle `v` drives a path here.
+    pub fn patrols(&self, v: &ParkedVehicle) -> bool {
+        v.spot
+            .map(|(e, _, _)| e)
+            .or(v.guid)
+            .and_then(|e| self.points.get(&e))
+            .is_some_and(|p| p.route.len() >= 2)
+    }
+
     /// Drives the traffic that has a path; `driven` is the vehicle the
     /// player is in.
     pub fn drive(
@@ -232,6 +241,7 @@ impl Traffic {
         physics: &mut Physics,
         vehicles: &[ParkedVehicle],
         driven: Option<usize>,
+        assaults: &crate::pursuers::Assaults,
     ) {
         for (i, v) in vehicles.iter().enumerate() {
             let (Some(entity), Some(id)) = (v.spot.map(|(e, _, _)| e).or(v.guid), v.id) else {
@@ -243,7 +253,11 @@ impl Traffic {
             if driven == Some(i) {
                 self.taken.insert(entity);
             }
-            if v.wrecked || self.taken.contains(&entity) || point.route.len() < 2 {
+            if v.wrecked
+                || self.taken.contains(&entity)
+                || point.route.len() < 2
+                || assaults.holds(i)
+            {
                 continue;
             }
             let Some(at) = physics.vehicle_transform(id) else {
@@ -713,7 +727,12 @@ mod tests {
         let mut passed = 0;
         let mut last = 0;
         for _ in 0..(90.0 / dt) as usize {
-            traffic.drive(&mut physics, &vehicles, None);
+            traffic.drive(
+                &mut physics,
+                &vehicles,
+                None,
+                &crate::pursuers::Assaults::default(),
+            );
             physics.step(dt);
             let next = traffic.next.get(&7).map_or(0, |n| n.0);
             if next != last {
