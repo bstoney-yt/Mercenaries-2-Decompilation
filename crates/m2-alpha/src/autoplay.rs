@@ -5933,11 +5933,10 @@ fn contract_first(places: Vec<&Mark>) -> Vec<&Mark> {
     }
 }
 
-/// Whether an action marker of the scripts' is still up on `g`.
+/// Whether a marker of the scripts' is still up on `g` (an action's, or a
+/// pickup's whose context action she took: the fuel tanks' "Steal fuel").
 fn marked_again(marks: &[Mark], g: u32) -> bool {
-    marks
-        .iter()
-        .any(|m| m.alive && m.kind == ACTION_KIND && m.target == g)
+    marks.iter().any(|m| m.alive && m.target == g)
 }
 
 /// The way off a box (`lo`..`hi`, its model standing at `at`) from `here`
@@ -7134,10 +7133,10 @@ mod tests {
             secondary: false,
         };
         assert!(marked_again(&[mark(7, "action", true)], 7));
-        // Its marker gone, or another kind on it: forgotten.
+        // Its marker gone: forgotten.
         assert!(!marked_again(&[], 7));
         assert!(!marked_again(&[mark(7, "action", false)], 7));
-        assert!(!marked_again(&[mark(7, "deliverable", true)], 7));
+        assert!(marked_again(&[mark(7, "pickup_fuel_2", true)], 7));
         assert!(!marked_again(&[mark(8, "action", true)], 7));
     }
 
