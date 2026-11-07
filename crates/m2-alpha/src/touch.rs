@@ -5,15 +5,16 @@
 //!
 //! The left part of the screen is a stick that centres where a finger
 //! lands (the left stick: move, steer); the rest turns the view as the
-//! finger drags (as the mouse does); buttons stand at the edges, with the
-//! pad's names: fire and aim (the triggers), jump, melee, reload, use
-//! (A B X Y), switch weapon and throw (the bumpers), sprint (L3), the
-//! d-pad (support, explosives, detonate), pause (Start) and the PDA
-//! (Back). A finger that lands on fire also turns the view as it drags,
-//! to aim while firing. Driving, the car's buttons show instead, the horn
-//! among them; with the PDA open or a dialog box up, the menu's
-//! ([`MENU_KEYS`]): a large d-pad and the face buttons and triggers by the
-//! pad's own letters, which the game's prompts show.
+//! finger drags (as the mouse does); buttons stand at the edges, named
+//! as the pad's buttons are (the game's tutorials and prompts show the
+//! 360 pad's, playtest), A B X Y in their pad colours: fire and aim
+//! (RT, LT), jump, melee, reload, use (A B X Y), switch weapon and throw
+//! (RB, LB), sprint (LS), the d-pad (support, explosives, detonate),
+//! pause (START) and the PDA (BACK). A finger that lands on fire also
+//! turns the view as it drags, to aim while firing. Driving, the car's
+//! buttons show instead, the horn among them; with the PDA open or a
+//! dialog box up, the menu's ([`MENU_KEYS`]): a large d-pad, the face
+//! buttons and the triggers.
 
 use std::collections::HashMap;
 
@@ -57,28 +58,22 @@ const fn key(press: Press, label: &'static str, x: f32, y: f32, radius: f32) -> 
 
 /// The buttons, as they stand (first found wins where they overlap).
 pub const KEYS: [Key; 16] = [
-    key(Press::RightTrigger, "FIRE", 0.90, 0.60, 0.095),
-    key(Press::LeftTrigger, "AIM", 0.75, 0.62, 0.07),
-    key(Press::Button(xb::A), "JUMP", 0.81, 0.86, 0.065),
-    key(Press::Button(xb::B), "HIT", 0.94, 0.86, 0.055),
-    key(Press::Button(xb::X), "RELOAD", 0.68, 0.86, 0.055),
-    key(Press::Button(xb::Y), "USE", 0.86, 0.38, 0.06),
-    key(
-        Press::Button(xb::RIGHT_SHOULDER),
-        "WEAPON",
-        0.96,
-        0.24,
-        0.05,
-    ),
-    key(Press::Button(xb::LEFT_SHOULDER), "THROW", 0.73, 0.38, 0.05),
-    key(Press::Button(xb::LEFT_THUMB), "SPRINT", 0.34, 0.66, 0.05),
-    key(Press::Button(xb::RIGHT_THUMB), "ZOOM", 0.62, 0.62, 0.045),
+    key(Press::RightTrigger, "RT", 0.90, 0.60, 0.095),
+    key(Press::LeftTrigger, "LT", 0.75, 0.62, 0.07),
+    key(Press::Button(xb::A), "A", 0.81, 0.86, 0.065),
+    key(Press::Button(xb::B), "B", 0.94, 0.86, 0.055),
+    key(Press::Button(xb::X), "X", 0.68, 0.86, 0.055),
+    key(Press::Button(xb::Y), "Y", 0.86, 0.38, 0.06),
+    key(Press::Button(xb::RIGHT_SHOULDER), "RB", 0.96, 0.24, 0.05),
+    key(Press::Button(xb::LEFT_SHOULDER), "LB", 0.73, 0.38, 0.05),
+    key(Press::Button(xb::LEFT_THUMB), "LS", 0.34, 0.66, 0.05),
+    key(Press::Button(xb::RIGHT_THUMB), "RS", 0.62, 0.62, 0.045),
     key(Press::Button(xb::DPAD_UP), "▲", 0.08, 0.30, 0.04),
     key(Press::Button(xb::DPAD_DOWN), "▼", 0.08, 0.50, 0.04),
     key(Press::Button(xb::DPAD_LEFT), "◀", 0.04, 0.40, 0.04),
     key(Press::Button(xb::DPAD_RIGHT), "▶", 0.12, 0.40, 0.04),
-    key(Press::Button(xb::BACK), "PDA", 0.44, 0.07, 0.04),
-    key(Press::Button(xb::START), "PAUSE", 0.56, 0.07, 0.04),
+    key(Press::Button(xb::BACK), "BACK", 0.44, 0.07, 0.04),
+    key(Press::Button(xb::START), "START", 0.56, 0.07, 0.04),
 ];
 
 /// The buttons while she drives (the on-foot ones hide): the pad's driving
@@ -88,17 +83,17 @@ pub const KEYS: [Key; 16] = [
 /// the car layout's `B call allies`, the texts' `[honk]`), the PDA and
 /// pause. The stick steers.
 pub const CAR_KEYS: [Key; 11] = [
-    key(Press::Button(xb::A), "GAS", 0.90, 0.74, 0.09),
-    key(Press::Button(xb::X), "REVERSE", 0.76, 0.84, 0.065),
-    key(Press::LeftTrigger, "BRAKE", 0.75, 0.62, 0.06),
-    key(Press::RightTrigger, "FIRE", 0.90, 0.46, 0.075),
-    key(Press::Button(xb::Y), "EXIT", 0.95, 0.22, 0.05),
-    key(Press::Button(xb::RIGHT_SHOULDER), "GUN", 0.82, 0.27, 0.05),
-    key(Press::Button(xb::RIGHT_THUMB), "FLIP", 0.62, 0.84, 0.045),
-    key(Press::Button(xb::DPAD_UP), "SEAT", 0.08, 0.33, 0.045),
-    key(Press::Button(xb::B), "HORN", 0.64, 0.56, 0.05),
-    key(Press::Button(xb::BACK), "PDA", 0.44, 0.07, 0.04),
-    key(Press::Button(xb::START), "PAUSE", 0.56, 0.07, 0.04),
+    key(Press::Button(xb::A), "A", 0.90, 0.74, 0.09),
+    key(Press::Button(xb::X), "X", 0.76, 0.84, 0.065),
+    key(Press::LeftTrigger, "LT", 0.75, 0.62, 0.06),
+    key(Press::RightTrigger, "RT", 0.90, 0.46, 0.075),
+    key(Press::Button(xb::Y), "Y", 0.95, 0.22, 0.05),
+    key(Press::Button(xb::RIGHT_SHOULDER), "RB", 0.82, 0.27, 0.05),
+    key(Press::Button(xb::RIGHT_THUMB), "RS", 0.62, 0.84, 0.045),
+    key(Press::Button(xb::DPAD_UP), "▲", 0.08, 0.33, 0.045),
+    key(Press::Button(xb::B), "B", 0.64, 0.56, 0.05),
+    key(Press::Button(xb::BACK), "BACK", 0.44, 0.07, 0.04),
+    key(Press::Button(xb::START), "START", 0.56, 0.07, 0.04),
 ];
 
 /// The buttons with the PDA open or a dialog box up: the pad's keys their
@@ -117,8 +112,8 @@ pub const MENU_KEYS: [Key; 12] = [
     key(Press::Button(xb::Y), "Y", 0.86, 0.46, 0.06),
     key(Press::LeftTrigger, "LT", 0.06, 0.22, 0.05),
     key(Press::RightTrigger, "RT", 0.94, 0.22, 0.05),
-    key(Press::Button(xb::BACK), "PDA", 0.44, 0.07, 0.04),
-    key(Press::Button(xb::START), "PAUSE", 0.56, 0.07, 0.04),
+    key(Press::Button(xb::BACK), "BACK", 0.44, 0.07, 0.04),
+    key(Press::Button(xb::START), "START", 0.56, 0.07, 0.04),
 ];
 
 /// The layout showing: `menu` over `driving` over on foot.
@@ -380,6 +375,19 @@ fn arrow(label: &str, c: egui::Pos2, size: f32) -> Option<Vec<egui::Pos2>> {
     Some(vec![c + tip, c - tip * 0.6 + side, c - tip * 0.6 - side])
 }
 
+/// The colour of face button `label`'s letter, as on the 360 pad (A
+/// green, B red, X blue, Y yellow); none for the other buttons.
+fn face_colour(label: &str) -> Option<egui::Color32> {
+    let [r, g, b] = match label {
+        "A" => [96, 200, 64],
+        "B" => [232, 64, 48],
+        "X" => [48, 128, 232],
+        "Y" => [240, 200, 32],
+        _ => return None,
+    };
+    Some(egui::Color32::from_rgba_unmultiplied(r, g, b, 235))
+}
+
 /// Draws the controls over the play screen (`rect`, in points) on
 /// `painter`: the buttons, held ones lit, and the stick where it is held.
 pub fn paint(touch: &Picture, painter: &egui::Painter, rect: egui::Rect, pixels_per_point: f32) {
@@ -395,7 +403,8 @@ pub fn paint(touch: &Picture, painter: &egui::Painter, rect: egui::Rect, pixels_
             Color32::from_rgba_unmultiplied(20, 22, 10, 70)
         };
         painter.circle(c, r, fill, Stroke::new(2.0, line));
-        let ink = Color32::from_rgba_unmultiplied(240, 225, 190, 220);
+        let ink = face_colour(k.label)
+            .unwrap_or_else(|| Color32::from_rgba_unmultiplied(240, 225, 190, 220));
         // The d-pad's arrows are drawn, not lettered: the phone's font has
         // ◀ and ▶ but not ▲ and ▼ (playtest: those showed as empty boxes).
         if let Some(points) = arrow(k.label, c, r * 0.32) {
@@ -477,8 +486,11 @@ mod tests {
     fn buttons_hold_their_pad_bits_with_two_fingers_at_once() {
         let mut t = touch();
         let at = |k: &Key| [k.at[0] * 2000.0, k.at[1] * 1000.0];
-        let jump = KEYS.iter().find(|k| k.label == "JUMP").unwrap();
-        let use_ = KEYS.iter().find(|k| k.label == "USE").unwrap();
+        let jump = KEYS
+            .iter()
+            .find(|k| k.press == Press::Button(xb::A))
+            .unwrap();
+        let use_ = KEYS.iter().find(|k| k.label == "Y").unwrap();
         t.down(1, at(jump));
         t.down(2, at(use_));
         let s = t.state();
@@ -490,14 +502,14 @@ mod tests {
     #[test]
     fn a_tap_on_sprint_switches_it_on_and_another_off() {
         let mut t = touch();
-        let sprint = KEYS.iter().find(|k| k.label == "SPRINT").unwrap();
+        let sprint = KEYS.iter().find(|k| k.label == "LS").unwrap();
         let at = [sprint.at[0] * 2000.0, sprint.at[1] * 1000.0];
         t.down(1, at);
         t.up(1);
         assert!(t.sprint);
         // Not a held stick press: the pad's own L3 latch stays out of it.
         assert!(!t.state().held(xb::LEFT_THUMB));
-        let lit = KEYS.iter().position(|k| k.label == "SPRINT").unwrap();
+        let lit = KEYS.iter().position(|k| k.label == "LS").unwrap();
         assert!(t.picture().held[lit]);
         t.down(2, at);
         t.up(2);
@@ -508,7 +520,7 @@ mod tests {
     fn driving_has_a_horn_on_the_pads_b() {
         let mut t = touch();
         t.set_driving(true);
-        let horn = CAR_KEYS.iter().find(|k| k.label == "HORN").unwrap();
+        let horn = CAR_KEYS.iter().find(|k| k.label == "B").unwrap();
         t.down(1, [horn.at[0] * 2000.0, horn.at[1] * 1000.0]);
         assert!(t.state().held(xb::B));
     }
@@ -549,7 +561,7 @@ mod tests {
     #[test]
     fn driving_shows_the_car_buttons_and_lets_go_of_the_others() {
         let mut t = touch();
-        let fire = KEYS.iter().find(|k| k.label == "FIRE").unwrap();
+        let fire = KEYS.iter().find(|k| k.label == "RT").unwrap();
         t.down(1, [fire.at[0] * 2000.0, fire.at[1] * 1000.0]);
         assert_eq!(t.state().right_trigger, 1.0);
         t.set_driving(true);
@@ -557,11 +569,17 @@ mod tests {
         assert_eq!(t.state().right_trigger, 0.0);
         assert!(t.picture().driving);
         assert_eq!(t.picture().keys().len(), CAR_KEYS.len());
-        let gas = CAR_KEYS.iter().find(|k| k.label == "GAS").unwrap();
+        let gas = CAR_KEYS
+            .iter()
+            .find(|k| k.press == Press::Button(xb::A))
+            .unwrap();
         t.down(2, [gas.at[0] * 2000.0, gas.at[1] * 1000.0]);
         assert!(t.state().held(xb::A));
         // Jump's spot is nothing while driving.
-        let jump = KEYS.iter().find(|k| k.label == "JUMP").unwrap();
+        let jump = KEYS
+            .iter()
+            .find(|k| k.press == Press::Button(xb::A))
+            .unwrap();
         t.down(3, [jump.at[0] * 2000.0, jump.at[1] * 1000.0]);
         assert_eq!(t.state().buttons, xb::A);
     }
@@ -586,6 +604,18 @@ mod tests {
     }
 
     #[test]
+    fn every_button_is_named_as_the_pads_own() {
+        let names = [
+            "A", "B", "X", "Y", "LB", "RB", "LT", "RT", "LS", "RS", "BACK", "START", "▲", "▼", "◀",
+            "▶",
+        ];
+        for k in KEYS.iter().chain(CAR_KEYS.iter()).chain(MENU_KEYS.iter()) {
+            assert!(names.contains(&k.label), "{}", k.label);
+        }
+        assert!(face_colour("A").is_some() && face_colour("RB").is_none());
+    }
+
+    #[test]
     fn the_d_pad_arrows_are_drawn_as_triangles() {
         let c = egui::pos2(100.0, 100.0);
         let up = arrow("▲", c, 10.0).unwrap();
@@ -598,6 +628,6 @@ mod tests {
                 assert!(arrow(k.label, c, 1.0).is_some(), "{}", k.label);
             }
         }
-        assert!(arrow("PDA", c, 10.0).is_none());
+        assert!(arrow("BACK", c, 10.0).is_none());
     }
 }
