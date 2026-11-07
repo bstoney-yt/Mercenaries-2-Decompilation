@@ -291,6 +291,8 @@ pub struct Templates {
     pub ai: HashMap<u32, AiProfile>,
     /// How templates regard each other ([`crate::ai::relations`]).
     pub relations: Vec<(String, String, f32)>,
+    /// Templates' `StimulusModifier`s, by lower-case name.
+    pub stimulus_modifiers: HashMap<String, crate::ai::StimulusModifier>,
     /// How much those with `Health` take, by id.
     pub durability: HashMap<u32, crate::durability::Durability>,
     /// The blasts of those with `Explosive`, by id.
@@ -1031,6 +1033,7 @@ impl Templates {
             population: crate::population::Population::read(&db),
             ai: crate::ai::read(&db),
             relations: crate::ai::relations(&db),
+            stimulus_modifiers: crate::ai::stimulus_modifiers(&db),
             durability: crate::durability::read(&db),
             explosions: crate::durability::explosions(&db),
             hijack: crate::hijack::read(&db),

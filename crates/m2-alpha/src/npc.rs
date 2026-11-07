@@ -115,7 +115,7 @@ const AIM_ARC: f32 = 1.05;
 /// Her `Stimulus` `Visibility` on foot, metres: all three heroes' templates,
 /// whatever their upgrades (`JenUpgrade1` .. `ChrisUpgrade3`: 90, from
 /// samples). `StimulusModifier` on the same templates isn't read.
-const ON_FOOT_VISIBILITY: f32 = 90.0;
+pub const ON_FOOT_VISIBILITY: f32 = 90.0;
 /// How much further a mind sees the one it is on to (0x820BB6AC, 0x822E89B0).
 const HELD_SIGHT: f32 = 1.5;
 /// From how high he sees (his head), and how often he looks, seconds.

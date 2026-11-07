@@ -57,6 +57,16 @@ impl Hero {
         })
     }
 
+    /// The template whose `StimulusModifier` is the hero's: all three of
+    /// each hero's upgrade templates have the same (from samples).
+    pub fn upgrade_template(self) -> &'static str {
+        match self {
+            Hero::Mattias => "mattiasupgrade1",
+            Hero::Jennifer => "jenupgrade1",
+            Hero::Chris => "chrisupgrade1",
+        }
+    }
+
     /// The hero's template in the template database.
     pub fn template(self) -> &'static str {
         match self {
