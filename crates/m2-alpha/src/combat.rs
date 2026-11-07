@@ -4023,6 +4023,21 @@ impl Combat {
                     {
                         self.remarks.push(Remark::Kill);
                     }
+                    // A crew's round on her, on foot, as a soldier's is:
+                    // near enough its line and nothing before her.
+                    if self.crew_firing
+                        && f.player.driving.is_none()
+                        && let Some(her) = self.target(f.player, true)
+                    {
+                        let along = (her - from).dot(aim).max(0.0);
+                        let blocked = hit.is_some_and(|h| h.0 < along - 1.0);
+                        if !blocked && (from + aim * along).distance(her) < 0.45 {
+                            let taken = damage * self.hero_scale(ammo.key);
+                            let lost = self.hurt_player(f, taken, Some(from));
+                            self.tally.taken_rounds += lost;
+                            self.tally.rounds_on_her += u32::from(lost > 0.0);
+                        }
+                    }
                     if let Some((t, None)) = hit {
                         let round = match ammo.key {
                             Some(k) if k == m2_assets::name_hash("Bullet") => Round::Bullet,
@@ -4205,8 +4220,9 @@ impl Combat {
     /// mind offers its slot whom it can see within its weapon's range,
     /// lays the gun on the one it settles on, and fires by its hint's
     /// bursts, as her gunners do ([`gunners_fire`](Self::gunners_fire)).
-    /// `Vision` 1.25 is vehicles' (from samples); that they leave her to
-    /// the pursuit's vehicles is the alpha's, for now.
+    /// `Vision` 1.25 is vehicles' (from samples). She is one of those they
+    /// choose among, if their army fights her and she isn't disguised
+    /// ([`People::fights_for`](crate::npc::People::fights_for)).
     fn crews_fire(&mut self, f: &mut Field<'_>, dt: f32) {
         const VISION: f32 = 1.25;
         let driven = f.player.driving;
@@ -4221,6 +4237,10 @@ impl Combat {
             };
             let centre = body.transform_point3(Vec3::Y);
             let seats = armed_seats(v);
+            let her = self
+                .target(f.player, true)
+                .filter(|_| f.people.fights_for(side))
+                .map(|at| (crate::npc::HER, at, f.people.seen_at()));
             for (seat, &mount) in seats.iter().enumerate() {
                 let v = &f.vehicles[i];
                 let Some(m) = v
@@ -4248,7 +4268,7 @@ impl Combat {
                     gun.at = None;
                     let mut best = gun.slot;
                     let seen = f.people.foes_of(side, centre);
-                    for (who, at, visibility) in seen {
+                    for (who, at, visibility) in seen.into_iter().chain(her) {
                         let d = at.distance(centre);
                         let in_slot = best.who == Some(who);
                         let reach = VISION * visibility * if in_slot { 1.5 } else { 1.0 };
@@ -5626,6 +5646,18 @@ impl Combat {
             .as_ref()
             .and_then(|t| t.scale(m2_assets::name_hash("Hero"), key))
             .map_or(NPC_DAMAGE, |scale| g.damage * scale)
+    }
+
+    /// What she takes of a round of `DamageKey` `key`: the table's `Hero`
+    /// row (a round without a key is a `Bullet`), all of it without one.
+    fn hero_scale(&self, key: Option<u32>) -> f32 {
+        let key = key
+            .filter(|&k| k != 0)
+            .unwrap_or_else(|| m2_assets::name_hash("Bullet"));
+        self.damage_table
+            .as_ref()
+            .and_then(|t| t.scale(m2_assets::name_hash("Hero"), key))
+            .unwrap_or(1.0)
     }
 
     /// Explosion template `blast` going off at `at`, by its own `Radius`,
