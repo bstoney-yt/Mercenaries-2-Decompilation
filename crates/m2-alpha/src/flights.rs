@@ -362,6 +362,18 @@ impl Flights {
         });
     }
 
+    /// Moves pilot `pilot`'s drop point to `to` (on the ground) while it is
+    /// still on its way in; nothing once it hovers or leaves.
+    pub fn retarget(&mut self, pilot: u32, to: Vec3) {
+        for f in self
+            .flights
+            .iter_mut()
+            .filter(|f| f.pilot == pilot && f.phase == Phase::Inbound)
+        {
+            f.to = to;
+        }
+    }
+
     /// How low pilot `pilot`'s load comes before it lets go, m (the
     /// scripts' `Ai.Deliver`'s fifth value).
     pub fn drop_height(&mut self, pilot: u32, height: f32) {
@@ -1453,6 +1465,22 @@ mod tests {
         model: None,
         bank: None,
     };
+
+    // A pursuit's transport makes for her where she is now: its drop
+    // point moves while it is on its way, not once it hovers.
+    #[test]
+    fn a_drop_point_moves_only_while_on_the_way() {
+        let mut flights = Flights::default();
+        flights.start(COPTER, Vec::new(), Vec3::new(0.0, 70.0, 350.0), Vec3::ZERO);
+        let moved = Vec3::new(500.0, 0.0, -300.0);
+        flights.retarget(COPTER.pilot, moved);
+        assert_eq!(flights.flights[0].to, moved);
+        flights.retarget(7, Vec3::ZERO);
+        assert_eq!(flights.flights[0].to, moved);
+        flights.flights[0].phase = Phase::Hovering;
+        flights.retarget(COPTER.pilot, Vec3::ZERO);
+        assert_eq!(flights.flights[0].to, moved);
+    }
 
     #[test]
     fn a_delivery_flies_in_lets_go_over_the_drop_point_and_leaves() {
