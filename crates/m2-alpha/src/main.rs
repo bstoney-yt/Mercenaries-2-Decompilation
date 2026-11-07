@@ -5358,7 +5358,7 @@ fn mission_for_screenshot(
             eprintln!(
                 "autoplay: she takes Continue on the failed contract's fanfare (HUD call {seq})"
             );
-            link.hud_callback(seq);
+            link.close_fanfare_without_hud(seq);
         }
         // The job she was skipped to, done (a set job or a collection
         // completed, a standing bounty paid): she stops as for a contract.

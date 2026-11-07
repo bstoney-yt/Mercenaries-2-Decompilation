@@ -1004,8 +1004,10 @@ pub struct Autoplay {
     /// going for.
     boarding: Option<(usize, f32)>,
     left_rides: Vec<usize>,
-    /// Times she got out, seated away from the wheel ([`WRONG_SEATS`]).
+    /// Times she got out, seated away from the wheel ([`WRONG_SEATS`]),
+    /// and the ride she got out of to go round to its wheel.
     wrong_seats: u32,
+    reboard: Option<usize>,
     /// Hops she has had driving to the goal she is after.
     drive_hops: u32,
     /// Sidestepping (-1 left, 1 right), seconds left.
@@ -1956,6 +1958,23 @@ impl Autoplay {
                     at: m.at,
                 },
                 format!("racing to {} ({:#x})", m.name, m.target),
+            ));
+        }
+        // A race on and her out of the ride she got out of to reach its
+        // wheel: back into it, at the wheel (the sweep's GurCon003 raced
+        // on foot from the Piranha till its timer ran out).
+        if self.racing()
+            && let Some(i) = self.reboard
+            && let Some(p) = game.scene.player.as_ref()
+            && p.driving.is_none()
+            && game.scene.vehicles.get(i).is_some_and(|v| !v.wrecked)
+        {
+            return Some((
+                Goal::Board(i),
+                format!(
+                    "getting back into the {} at the wheel for the race",
+                    game.scene.vehicles[i].spec.label
+                ),
             ));
         }
         // Off a contract with one on offer, a job's or collection's marks
@@ -3088,6 +3107,7 @@ impl Autoplay {
             && self.may_get_out(game, i)
         {
             self.wrong_seats += 1;
+            self.reboard = Some(i);
             eprintln!(
                 "autoplay {:.1} s: in the {} but not at the wheel ({} of {WRONG_SEATS}): getting out to go round to it",
                 self.clock, game.scene.vehicles[i].spec.label, self.wrong_seats

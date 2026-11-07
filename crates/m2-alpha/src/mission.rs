@@ -1540,6 +1540,23 @@ impl MissionLink {
     /// The HUD called back the mission's HUD call number `seq` (the
     /// contract fanfare closing): its `fCallback` runs, as the HUD's own
     /// interface would run it, with its `tCallbackData`.
+    /// Closes the fanfare of the mission's HUD call `seq` with no game HUD
+    /// to: what the HUD's own close does to the game (its script
+    /// `vz_da6af53d`, line 979 on: her invincibility for the fanfare off,
+    /// `MrxHqManager.UnlockAllHq`, the HQs the end sequence locked), then
+    /// the callback (Continue: no `bRetry`).
+    pub fn close_fanfare_without_hud(&mut self, seq: u64) {
+        if let State::Running(m) = &mut self.state {
+            let code = "local c = Player.GetLocalCharacter()\n\
+                 if c then Object.SetInvincible(c, false, \"Fanfare\") end\n\
+                 if MrxHqManager and MrxHqManager.UnlockAllHq then MrxHqManager.UnlockAllHq() end";
+            if let Err(e) = m.run(code, "fanfare close") {
+                self.write([format!("fanfare close {seq}: {e}")]);
+            }
+        }
+        self.hud_callback(seq);
+    }
+
     pub fn hud_callback(&mut self, seq: u64) {
         let State::Running(m) = &mut self.state else {
             return;
