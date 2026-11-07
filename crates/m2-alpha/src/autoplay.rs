@@ -217,6 +217,9 @@ const UNSEEN_NEAR: f32 = 3.0;
 const LASER_RINGS: [f32; 4] = [30.0, 40.0, 55.0, 70.0];
 const LASER_SHORT: f32 = LASER_NEAR;
 const LASER_AGAIN: f32 = 20.0;
+/// After her laser marks a spot she waits this long for its bomb before she
+/// calls again, seconds (invented).
+const LASER_FLIGHT: f32 = 60.0;
 /// How long she makes for one such spot before trying another (seconds).
 const LASER_WALK: f32 = 40.0;
 /// The laser counts as on its target within this of it (metres), and
@@ -2048,9 +2051,12 @@ impl Autoplay {
                 || self
                     .delivered
                     .is_some_and(|t| self.clock - t < DESIGNATOR_WAIT));
+        // Nor with her rifle empty: she can't (PmcCon001 round r3 aimed at one
+        // for 2,170 s with no rounds left); she restocks first.
         if driving.is_none()
             && !p.swimming()
             && !throwing
+            && game.combat.rifle_rounds.total() > 0
             && let Some((i, d)) = npcs
                 .iter()
                 .enumerate()
@@ -2226,10 +2232,7 @@ impl Autoplay {
         let rockets_out = game.combat.second == Some(Weapon::Rpg)
             && game.combat.launcher_rounds.is_none_or(|r| r.total() == 0)
             && live.iter().any(|m| m.kind == "destroy");
-        let rifle_out = game.combat.rifle_rounds.total() == 0
-            && live
-                .iter()
-                .any(|m| m.kind == "destroy" && takes_rounds(game, m.target));
+        let rifle_out = game.combat.rifle_rounds.total() == 0;
         if driving.is_none()
             && let Some((from, d)) = game
                 .scene
@@ -4510,6 +4513,10 @@ impl Autoplay {
             Phase::Designating {
                 aim: Aim::Laser, ..
             } => {
+                // The call stands from when the laser comes off: its bomber
+                // is under way then (PmcCon003 round r3: called again the
+                // moment the laser marked the bunker, every call was lost).
+                self.laser_called = Some(self.clock + LASER_FLIGHT - LASER_AGAIN);
                 // Held only while it lands on the target (the laser's own
                 // ray, from the camera: round 22 lased a building 40 m
                 // short three times); kept off it a while, she goes
@@ -5439,11 +5446,12 @@ impl Autoplay {
             }
         }
         eprintln!(
-            "autoplay {:.1} s: at {:.1}, {}, health {:.0}, {}; closest {:.0} m, {:.0} s ago; {} hops{holding}; {}",
+            "autoplay {:.1} s: at {:.1}, {}, health {:.0}, rifle rounds {}, {}; closest {:.0} m, {:.0} s ago; {} hops{holding}; {}",
             self.clock,
             game.focus(),
             riding.unwrap_or_else(|| "on foot".to_owned()),
             game.combat.hp,
+            game.combat.rifle_rounds.total(),
             self.what,
             self.best.0,
             self.since_moved(),
