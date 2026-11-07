@@ -75,7 +75,7 @@ pub const VEHICLES: u32 = 0x4000_0000;
 /// The player's number in a mind's attack slot
 /// ([`m2_engine::ai_target::Slot`]); the rest go by their
 /// [`Npc::shooter`] number.
-const HER: u32 = u32::MAX;
+pub const HER: u32 = u32::MAX;
 
 /// Soldiers come and go within these distances of the player, metres.
 const ACTIVE: f32 = 450.0;
@@ -3311,6 +3311,11 @@ impl People {
                 .iter()
                 .find(|((x, y), _)| *x == a && *y == b)
                 .is_some_and(|(_, r)| m2_engine::ai_target::attacks(*r))
+    }
+
+    /// From how far she can be seen now, metres.
+    pub fn seen_at(&self) -> f32 {
+        self.her_visibility.unwrap_or(ON_FOOT_VISIBILITY)
     }
 
     /// Those army `side` is at war with near `at`: people and vehicles,
