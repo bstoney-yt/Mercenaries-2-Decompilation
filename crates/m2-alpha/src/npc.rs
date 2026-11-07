@@ -104,19 +104,21 @@ const FLEE: f32 = 5.0;
 const FLEE_TIME: f32 = 6.0;
 /// How far a runner who meets a wall looks along it each way, metres.
 const CLEAR: f32 = 6.0;
-/// A soldier fights within this range of the player, and fires within
+/// A soldier fires within
 /// his gun's `FireRange` once facing within `FIRE_ARC` radians of them
 /// (`FIRE_RANGE` for one with no gun: the "Assault Rifle"'s).
-const FIGHT_RANGE: f32 = 80.0;
 const FIRE_RANGE: f32 = 70.0;
 const FIRE_ARC: f32 = 0.3;
 /// He aims (the aim pose, turned onto her) only while she is within this
 /// of the way he faces, radians (60 degrees; invented, playtest 8).
 const AIM_ARC: f32 = 1.05;
-/// How far a soldier with `Vision` 1 sees, metres (inferred: the range
-/// they fight in), from how high (his head), and how often he looks,
-/// seconds.
-const SIGHT: f32 = FIGHT_RANGE;
+/// Her `Stimulus` `Visibility` on foot, metres: all three heroes' templates,
+/// whatever their upgrades (`JenUpgrade1` .. `ChrisUpgrade3`: 90, from
+/// samples). `StimulusModifier` on the same templates isn't read.
+const ON_FOOT_VISIBILITY: f32 = 90.0;
+/// How much further a mind sees the one it is on to (0x820BB6AC, 0x822E89B0).
+const HELD_SIGHT: f32 = 1.5;
+/// From how high he sees (his head), and how often he looks, seconds.
 const EYE: f32 = 1.6;
 const LOOK_EVERY: f32 = 0.2;
 /// Seconds a soldier hunts without sight of her before calming down, and
@@ -982,6 +984,8 @@ pub struct Npc {
     /// The armour class of what she is in (`ObjectHint`'s `Armor`, 1 to
     /// 4; 1 on foot), from [`People::target_armour`].
     pub target_armour: u32,
+    /// From how far those with `Vision` 1 can see her, metres.
+    pub her_visibility: f32,
     /// Saw her this tick for the first time in the fight (smarter: he
     /// calls it out).
     spotted: bool,
@@ -1227,6 +1231,7 @@ impl Npc {
             grenade_wait: 0.0,
             smart: SmarterAi::default(),
             target_armour: 1,
+            her_visibility: ON_FOOT_VISIBILITY,
             spotted: false,
             cover: None,
             hit: false,
@@ -1714,13 +1719,20 @@ impl Npc {
         turn.abs()
     }
 
-    /// Whether he sees `target` from his head: within `SIGHT` times his
-    /// `Vision`, inside his `VisionFOV` (unless `any_way`, as in a fight,
+    /// Whether he sees `target` from his head: within his
+    /// [`sight`](Self::sight), inside his `VisionFOV` (unless `any_way`, as in a fight,
     /// where he keeps turning to her), and nothing static between (a
     /// little short of her, so the car she sits in doesn't hide her).
+    /// How far he sees her, metres: his `Vision` times her `Visibility`,
+    /// half as far again once he is on to her (0x822E89B0).
+    fn her_sight(&self) -> f32 {
+        let held = if self.alert { HELD_SIGHT } else { 1.0 };
+        self.ai.vision * self.her_visibility * held
+    }
+
     /// How far they see what they look at, metres.
     fn sight(&self) -> f32 {
-        self.foe_reach.unwrap_or(SIGHT * self.ai.vision)
+        self.foe_reach.unwrap_or_else(|| self.her_sight())
     }
 
     pub fn sees(&self, physics: &Physics, target: Vec3, any_way: bool) -> bool {
@@ -2649,6 +2661,9 @@ pub struct People {
     /// the APCs, 4 the tanks): a soldier whose gun's `WeaponHint` rates it
     /// 0 against that class holds his fire ([`Npc::rates_target`]). 0
     /// (unset) is taken as 1.
+    /// From how far she can be seen, metres: her vehicle's `Visibility`
+    /// while she drives one that has one.
+    pub her_visibility: Option<f32>,
     pub target_armour: u32,
     /// What soldiers near her have been at (for checking).
     pub idle: IdleTally,
@@ -3413,7 +3428,7 @@ impl People {
             {
                 let d = t.distance(at);
                 let in_slot = n.slot.who == Some(HER);
-                if d <= SIGHT * vision && (in_slot || n.alert || n.sees(physics, t, false)) {
+                if d <= n.her_sight() && (in_slot || n.alert || n.sees(physics, t, false)) {
                     n.slot
                         .offer(HER, m2_engine::ai_target::score(d, current, in_slot));
                 }
@@ -3772,6 +3787,7 @@ impl People {
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
             npc.target_armour = npc.foe_armour.unwrap_or(self.target_armour).max(1);
+            npc.her_visibility = self.her_visibility.unwrap_or(ON_FOOT_VISIBILITY);
             npc.swim_speed = self
                 .kinds
                 .get(npc.kind)
@@ -5435,6 +5451,22 @@ pub(crate) mod tests {
         assert!(civilian.hurt(60.0, Vec3::ZERO));
         assert!(!civilian.alive);
         assert!(!civilian.hurt(60.0, Vec3::ZERO), "only dies once");
+    }
+
+    #[test]
+    fn he_sees_her_as_far_as_her_visibility_and_further_once_on_to_her() {
+        let physics = ground();
+        let post = Brain::Post { facing: 0.0 };
+        let mut n = Npc::new(0, &rig(), Vec3::Y, 0.0, post, Some(1));
+        let at = |z: f32| Vec3::new(0.0, 1.6, z);
+        assert!(n.sees(&physics, at(85.0), false), "90 m on foot");
+        assert!(!n.sees(&physics, at(95.0), false));
+        n.alert = true;
+        assert!(n.sees(&physics, at(130.0), false), "half as far again");
+        assert!(!n.sees(&physics, at(140.0), false));
+        n.alert = false;
+        n.her_visibility = 300.0;
+        assert!(n.sees(&physics, at(290.0), false), "her vehicle's");
     }
 
     #[test]
