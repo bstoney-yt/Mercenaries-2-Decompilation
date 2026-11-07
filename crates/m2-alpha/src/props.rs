@@ -259,6 +259,16 @@ struct Loaders {
     done: Receiver<Load>,
 }
 
+/// Whether `local` (in a box's model space) is at the top of box `lo`..`hi`,
+/// over its footprint: `pad` metres of slack each way.
+fn on_top_of(local: Vec3, lo: Vec3, hi: Vec3, pad: f32) -> bool {
+    local.x >= lo.x - pad
+        && local.x <= hi.x + pad
+        && local.z >= lo.z - pad
+        && local.z <= hi.z + pad
+        && (local.y - hi.y).abs() <= pad
+}
+
 impl Props {
     /// How many of `entity`'s `parts` (those its template's objects are
     /// broken in, one at a time, by vehicles: a hedge's sections) stand:
@@ -1008,6 +1018,17 @@ impl Props {
         let local = p.rotation.inverse() * (point - p.position);
         let (lo, hi) = m.gpu.bounds;
         Some(local.cmpge(lo - pad).all() && local.cmple(hi + pad).all())
+    }
+
+    /// Whether feet at `point` are on top of `entity`'s model's box, not
+    /// merely beside it: over its footprint and at its top, within `pad`
+    /// metres; `None` unless it is shown and its model has loaded.
+    pub fn stood_on(&self, entity: u32, point: Vec3, pad: f32) -> Option<bool> {
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model)?.as_ref()?;
+        let local = p.rotation.inverse() * (point - p.position);
+        let (lo, hi) = m.gpu.bounds;
+        Some(on_top_of(local, lo, hi, pad))
     }
 
     /// Where `entity` stands and its model's box (model space); `None`
@@ -2066,6 +2087,15 @@ impl Loaders {
 mod tests {
     use super::*;
     use m2_engine::{CollisionShape, LoosePiece};
+
+    #[test]
+    fn on_top_of_a_box_is_not_beside_it() {
+        let (lo, hi) = (Vec3::new(-3.0, 0.0, -1.0), Vec3::new(3.0, 8.0, 1.0));
+        assert!(on_top_of(Vec3::new(1.0, 8.5, 0.0), lo, hi, 1.0));
+        // At its wall, feet on the ground: inside the padded box, not on it.
+        assert!(!on_top_of(Vec3::new(1.0, 0.0, 1.5), lo, hi, 1.0));
+        assert!(!on_top_of(Vec3::new(5.0, 8.0, 0.0), lo, hi, 1.0));
+    }
 
     #[test]
     fn a_buildings_intact_walls_sink_leaning_until_under() {

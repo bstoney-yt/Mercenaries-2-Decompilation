@@ -539,8 +539,13 @@ const HOLDS_UP: f32 = 20.0;
 /// same floor and left them standing as if on their roof).
 const HOLDS_UP_RISE: f32 = 2.0;
 /// She stands on a building to destroy when her feet are within this of
-/// its box, metres (invented).
+/// the top of its box, metres (invented). Beside it she doesn't: at a wall
+/// of VzaCon001's second gate its whole box counted, the gate was left
+/// standing as under her feet, and she had nothing to do for 680 s.
 const STANDS_ON: f32 = 1.0;
+/// Standing on the last thing to destroy she steps this far (metres,
+/// invented) past its box, to bring it down from there.
+const STEP_OFF: f32 = 6.0;
 /// One following her left this far behind (metres) this long (seconds)
 /// is brought to her: a test driver's shortcut, logged, for ways the
 /// alpha has no means of (a VIP off a roof, which a player lifts off by
@@ -2231,7 +2236,7 @@ impl Autoplay {
                 || game
                     .scene
                     .props
-                    .touches(m.target, here - Vec3::Y * STANDS_ON, STANDS_ON)
+                    .stood_on(m.target, here, STANDS_ON)
                     .unwrap_or(false)
                 || followers.iter().any(|f| {
                     f.with_y(0.0).distance(m.at.with_y(0.0)) < crate::combat::BOMB_FRAG.0 + HOLDS_UP
@@ -2547,6 +2552,24 @@ impl Autoplay {
                     self.on_offer.join(" "),
                     at.distance(here)
                 ),
+            ));
+        }
+        // Nowhere else to go, and what is left to destroy is what she
+        // stands on: off it, for it to come down.
+        if places.is_empty()
+            && let Some((m, at)) = live.iter().find_map(|m| {
+                let (place, (lo, hi)) = game.scene.props.placed_bounds(m.target)?;
+                (m.kind == "destroy"
+                    && game.scene.props.stood_on(m.target, here, STANDS_ON) == Some(true))
+                .then(|| (m, off_the_box(place.w_axis.truncate(), lo, hi, here)))
+            })
+        {
+            return Some((
+                Goal::Reach {
+                    target: m.target,
+                    at,
+                },
+                format!("stepping off {} ({:#x}), to destroy it", m.name, m.target),
             ));
         }
         let m = nearest(places, here)?;
@@ -5876,6 +5899,14 @@ pub fn starter_for(on_offer: &[String], talks: &[ActionAt], here: Vec3) -> Optio
 /// is outside (`in_hq`), else the nearest of the doors offered (`enters`)
 /// to `here`. Invented: the scripts don't say which HQ's starter holds
 /// which contract until she is inside, so the nearest door is tried.
+/// The way off a box (`lo`..`hi`, its model standing at `at`) from `here`
+/// on it: straight out from its middle, past its widest reach.
+fn off_the_box(at: Vec3, lo: Vec3, hi: Vec3, here: Vec3) -> Vec3 {
+    let reach = lo.abs().max(hi.abs()).with_y(0.0).length();
+    let out = (here - at).with_y(0.0).normalize_or(Vec3::X);
+    at + out * (reach + STEP_OFF)
+}
+
 fn hq_door(
     on_offer: &[String],
     starter: bool,
@@ -7017,6 +7048,13 @@ mod tests {
     // On foot with a soldier fighting her, a ride the scripts mark close
     // by is got into first; far off, wrecked, or marked to destroy, it is
     // not (and she fights back as before).
+    #[test]
+    fn stepping_off_a_box_ends_past_its_widest_reach() {
+        let (lo, hi) = (Vec3::new(-3.0, 0.0, -4.0), Vec3::new(3.0, 2.0, 4.0));
+        let off = off_the_box(Vec3::new(10.0, 1.0, 10.0), lo, hi, Vec3::new(12.0, 3.0, 10.0));
+        assert_eq!(off, Vec3::new(10.0 + 5.0 + STEP_OFF, 1.0, 10.0));
+    }
+
     #[test]
     fn a_marked_ride_close_by_is_boarded_before_a_fight() {
         let mark = |target: u32, kind: &str| Mark {
