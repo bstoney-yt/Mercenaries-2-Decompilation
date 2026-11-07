@@ -3978,6 +3978,9 @@ fn mission_for_screenshot(
     // tick the Nth was done, and how many have been.
     let mut play_done: Option<u32> = None;
     let mut contracts_seen = 0;
+    // Contracts cancelled so far, and when she answers the last one's
+    // fanfare (tick number).
+    let (mut cancels_seen, mut continue_due): (u32, Option<u32>) = (0, None);
     let mut late_hud: Option<(ui::Hud, Config)> = None;
     // `--dialog-shots`: the boxes pictured so far, and how long the open
     // one has been up.
@@ -5331,6 +5334,31 @@ fn mission_for_screenshot(
             if contracts_seen >= options.contracts.max(1) {
                 play_done = Some(i);
             }
+        }
+        // A contract failed (the scripts' `Pg.ContractCancelled`): its
+        // fanfare waits for her answer, and with no game HUD here nothing
+        // answers it. She takes Continue (the callback without `bRetry`:
+        // the contract is cancelled and goes back on offer), 3 s on, and
+        // goes to take it again as a player would. The fanfare's Retry
+        // reloads the retry save (`Pg.LoadGame("retry")`), which the alpha
+        // doesn't do yet.
+        if auto.is_some() && link.contracts_cancelled() > cancels_seen {
+            cancels_seen = link.contracts_cancelled();
+            continue_due = Some(i + (3.0 / tick).round() as u32);
+            eprintln!(
+                "autoplay: contract cancelled ({cancels_seen} so far) after {:.1} s of play",
+                i as f32 * tick
+            );
+        }
+        if auto.is_some()
+            && continue_due.is_some_and(|d| i >= d)
+            && let Some(seq) = link.waiting_fanfare()
+        {
+            continue_due = None;
+            eprintln!(
+                "autoplay: she takes Continue on the failed contract's fanfare (HUD call {seq})"
+            );
+            link.hud_callback(seq);
         }
         // The job she was skipped to, done (a set job or a collection
         // completed, a standing bounty paid): she stops as for a contract.

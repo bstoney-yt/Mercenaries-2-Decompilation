@@ -1022,6 +1022,9 @@ pub struct MissionLink {
     completed: Option<f32>,
     /// How many times the scripts have said a contract was completed.
     contracts: u32,
+    /// How many times they have said one was cancelled
+    /// (`Pg.ContractCancelled`: failed, its fanfare up for Retry or not).
+    cancelled: u32,
     /// The speed of the vehicle she drives, held a little (m/s).
     speed: f32,
     /// The keys tutorial lines name.
@@ -1196,6 +1199,7 @@ impl MissionLink {
             reinforcements: crate::reinforce::Reinforcements::default(),
             completed: None,
             contracts: 0,
+            cancelled: 0,
             speed: 0.0,
             keys: Default::default(),
             lines: Vec::new(),
@@ -3326,6 +3330,10 @@ impl MissionLink {
                     );
                     log_recruits(mission, "contract completed");
                 }
+                if c == Command::Notify("Pg.ContractCancelled".into()) {
+                    self.cancelled += 1;
+                    eprintln!("mission: contract cancelled ({} so far)", self.cancelled);
+                }
             }
             if let Some(line) = tutorial(mission) {
                 self.tutorial = line;
@@ -4213,6 +4221,11 @@ impl MissionLink {
     /// How many contracts the scripts have said are completed.
     pub fn contracts_completed(&self) -> u32 {
         self.contracts
+    }
+
+    /// How many contracts the scripts have said are cancelled.
+    pub fn contracts_cancelled(&self) -> u32 {
+        self.cancelled
     }
 
     /// The kilobytes the scripts' Lua state holds, while they run: logged
