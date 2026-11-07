@@ -1137,6 +1137,17 @@ impl Autoplay {
     ) -> Intent {
         self.clock += dt;
         self.watch_fall(game);
+        // Once in, the time she took to get in starts again for the next
+        // time (OilCon021 round r2: out of the mail scooter after 90 s in
+        // it, it counted as never reached, and was left for good).
+        if game
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.driving.is_some())
+        {
+            self.boarding = None;
+        }
         if std::mem::take(&mut game.countdown_tick) {
             self.hurry_until = self.clock + HURRY_FOR;
         }
@@ -2243,7 +2254,14 @@ impl Autoplay {
                     // With the contract's things still to blow up, only
                     // what lies close is worth the detour (round 16's
                     // AllCon002 lost the boats' race to pickups).
-                    let reach = if destroying { BUSY_NEAR } else { OPEN_NEAR };
+                    // Nor while the scripts wait for her to look at something
+                    // (PmcCon001 round r2: the villa's column, which brings
+                    // the tank in; she went 190 m off for a dead soldier's gun).
+                    let reach = if destroying || !self.sights.is_empty() {
+                        BUSY_NEAR
+                    } else {
+                        OPEN_NEAR
+                    };
                     // Nor what lies out of her depth: she can't fight
                     // swimming (OilCon002 round 17 swam 1100 s by the first
                     // post after a dead soldier's rifle in the harbour).
