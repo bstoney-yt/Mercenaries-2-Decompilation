@@ -470,8 +470,14 @@ impl Pad {
         }
         input.set_pad_hold(Action::Sprint, self.sprint);
         input.set_pad_hold(Action::Walk, !driving && tilt > 0.0 && tilt < 0.5);
-        // The stick: steering only in a car (A and X are the pedals).
-        input.set_stick(if driving { [lx, 0.0] } else { [lx, ly] });
+        // The stick: steering only in a car (A and X are the pedals),
+        // except with the PDA open, whose map it moves both ways
+        // (playtest: in a car the map would not go up or down).
+        input.set_stick(if driving && !self.pda {
+            [lx, 0.0]
+        } else {
+            [lx, ly]
+        });
         for (action, push) in [
             (Action::MoveLeft, -lx),
             (Action::MoveRight, lx),
@@ -779,6 +785,21 @@ mod tests {
         pad.feed(&mut input, PadState::default(), true, 0.016);
         pad.feed(&mut input, press(xb::X), true, 0.016);
         assert!(input.held(Action::MoveBack));
+    }
+
+    #[test]
+    fn in_a_car_the_stick_steers_but_moves_the_open_pda_both_ways() {
+        let mut pad = Pad::default();
+        let mut input = Input::default();
+        let up_left = PadState {
+            left: [-0.5, 0.9],
+            ..PadState::default()
+        };
+        pad.feed(&mut input, up_left, true, 0.016);
+        assert_eq!(input.stick(), [-0.5, 0.0]);
+        pad.pda = true;
+        pad.feed(&mut input, up_left, true, 0.016);
+        assert_eq!(input.stick(), [-0.5, 0.9]);
     }
 
     #[test]
