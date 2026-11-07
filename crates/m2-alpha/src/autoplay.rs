@@ -539,8 +539,13 @@ const HOLDS_UP: f32 = 20.0;
 /// same floor and left them standing as if on their roof).
 const HOLDS_UP_RISE: f32 = 2.0;
 /// She stands on a building to destroy when her feet are within this of
-/// its box, metres (invented).
+/// the top of its box, metres (invented). Beside it she doesn't: at a wall
+/// of VzaCon001's second gate its whole box counted, the gate was left
+/// standing as under her feet, and she had nothing to do for 680 s.
 const STANDS_ON: f32 = 1.0;
+/// Standing on the last thing to destroy she steps this far (metres,
+/// invented) past its box, to bring it down from there.
+const STEP_OFF: f32 = 6.0;
 /// One following her left this far behind (metres) this long (seconds)
 /// is brought to her: a test driver's shortcut, logged, for ways the
 /// alpha has no means of (a VIP off a roof, which a player lifts off by
@@ -1242,11 +1247,22 @@ impl Autoplay {
         if game.support.pda || asked {
             return self.pda(game.support.pda, wants(PDA_CLOSE));
         }
+        // What she took an action on is forgotten once its marker is gone:
+        // one the scripts put up again asks for it again (the contract
+        // sweep: OilCon001's executive, marked again after she lost him,
+        // and OilCon002's helicopter, "Enter the 'Lucky Lady'" once she
+        // was out of it; she stood by each with nothing to do).
+        self.tagged.retain(|g| marked_again(marks, *g));
         // The scripts offer their context action on what a marker of
         // theirs is on, and she stands at it (a prisoner to release,
         // `[ContextAction.ReleasePrisoner]`): she takes it with the use key.
+        // Once taken, one not a contract's is left be (the contract
+        // sweep: AllCon008, OilCon005 and PirCon001 each stood at fuel tanks
+        // taking "Steal fuel" every 1.5 s, 1,100 times, to the time limit).
         if let Some((g, text)) = game.context.clone()
-            && marks.iter().any(|m| m.alive && m.target == g)
+            && marks.iter().any(|m| {
+                m.alive && m.target == g && (for_a_contract(m) || !self.tagged.contains(&g))
+            })
         {
             // As the use key does in play (`Game::tick`, which her
             // intents don't pass through), as `--context` does too.
@@ -1372,6 +1388,15 @@ impl Autoplay {
             && marks
                 .iter()
                 .any(|m| m.target == w && m.alive && m.kind == "deliverable")
+            // Not while what she brings is read as short of the place:
+            // she drives on in first ([`Self::choose`]). (OilCon021, the
+            // contract sweep: the scooter stood 10.6 m from the mail drop,
+            // its radius 8 m; each time she got in to drive on in, the
+            // wait kept from before got her out again, 1,450 s.)
+            && !self
+                .deliveries
+                .iter()
+                .any(|d| d.dest == w && !d.arrived())
             && let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving)
             && self.may_get_out(game, i)
         {
@@ -2231,7 +2256,7 @@ impl Autoplay {
                 || game
                     .scene
                     .props
-                    .touches(m.target, here - Vec3::Y * STANDS_ON, STANDS_ON)
+                    .stood_on(m.target, here, STANDS_ON)
                     .unwrap_or(false)
                 || followers.iter().any(|f| {
                     f.with_y(0.0).distance(m.at.with_y(0.0)) < crate::combat::BOMB_FRAG.0 + HOLDS_UP
@@ -2511,6 +2536,11 @@ impl Autoplay {
             .filter(|m| m.kind != "destroy")
             .filter(|m| Some(m.target) != riding && (!marked || !unmarked(m)))
             .collect();
+        // A contract's own places before the island's pickups and jobs'
+        // marks: a player on a contract follows it (the contract sweep:
+        // OilCon003, a timed contract, went 156 m out for a cash pickup
+        // with its delivery 187 m off).
+        let places = contract_first(places);
         // Nothing marked for a contract, off one with the flow's
         // contracts on offer: she goes to a starter and talks, as a player
         // takes a contract (her menu and its terms are answered by the
@@ -2547,6 +2577,24 @@ impl Autoplay {
                     self.on_offer.join(" "),
                     at.distance(here)
                 ),
+            ));
+        }
+        // Nowhere else to go, and what is left to destroy is what she
+        // stands on: off it, for it to come down.
+        if places.is_empty()
+            && let Some((m, at)) = live.iter().find_map(|m| {
+                let (place, (lo, hi)) = game.scene.props.placed_bounds(m.target)?;
+                (m.kind == "destroy"
+                    && game.scene.props.stood_on(m.target, here, STANDS_ON) == Some(true))
+                .then(|| (m, off_the_box(place.w_axis.truncate(), lo, hi, here)))
+            })
+        {
+            return Some((
+                Goal::Reach {
+                    target: m.target,
+                    at,
+                },
+                format!("stepping off {} ({:#x}), to destroy it", m.name, m.target),
             ));
         }
         let m = nearest(places, here)?;
@@ -5876,6 +5924,29 @@ pub fn starter_for(on_offer: &[String], talks: &[ActionAt], here: Vec3) -> Optio
 /// is outside (`in_hq`), else the nearest of the doors offered (`enters`)
 /// to `here`. Invented: the scripts don't say which HQ's starter holds
 /// which contract until she is inside, so the nearest door is tried.
+/// Of places to go, a contract's only, where there are any.
+fn contract_first(places: Vec<&Mark>) -> Vec<&Mark> {
+    if places.iter().any(|m| for_a_contract(m)) {
+        places.into_iter().filter(|m| for_a_contract(m)).collect()
+    } else {
+        places
+    }
+}
+
+/// Whether a marker of the scripts' is still up on `g` (an action's, or a
+/// pickup's whose context action she took: the fuel tanks' "Steal fuel").
+fn marked_again(marks: &[Mark], g: u32) -> bool {
+    marks.iter().any(|m| m.alive && m.target == g)
+}
+
+/// The way off a box (`lo`..`hi`, its model standing at `at`) from `here`
+/// on it: straight out from its middle, past its widest reach.
+fn off_the_box(at: Vec3, lo: Vec3, hi: Vec3, here: Vec3) -> Vec3 {
+    let reach = lo.abs().max(hi.abs()).with_y(0.0).length();
+    let out = (here - at).with_y(0.0).normalize_or(Vec3::X);
+    at + out * (reach + STEP_OFF)
+}
+
 fn hq_door(
     on_offer: &[String],
     starter: bool,
@@ -7017,6 +7088,58 @@ mod tests {
     // On foot with a soldier fighting her, a ride the scripts mark close
     // by is got into first; far off, wrecked, or marked to destroy, it is
     // not (and she fights back as before).
+    #[test]
+    fn stepping_off_a_box_ends_past_its_widest_reach() {
+        let (lo, hi) = (Vec3::new(-3.0, 0.0, -4.0), Vec3::new(3.0, 2.0, 4.0));
+        let off = off_the_box(
+            Vec3::new(10.0, 1.0, 10.0),
+            lo,
+            hi,
+            Vec3::new(12.0, 3.0, 10.0),
+        );
+        assert_eq!(off, Vec3::new(10.0 + 5.0 + STEP_OFF, 1.0, 10.0));
+    }
+
+    #[test]
+    fn a_contracts_places_come_before_pickups() {
+        let mark = |target: u32, mission: Option<&str>| Mark {
+            target,
+            kind: "deliverable".to_owned(),
+            name: format!("mark {target}"),
+            at: Vec3::ZERO,
+            alive: true,
+            mission: mission.map(|id| crate::mission::MarkFor::Id(id.to_owned())),
+            secondary: false,
+        };
+        let (cash, drop) = (mark(1, None), mark(2, Some("OilCon003")));
+        let kept: Vec<u32> = contract_first(vec![&cash, &drop])
+            .iter()
+            .map(|m| m.target)
+            .collect();
+        assert_eq!(kept, [2]);
+        // With no contract's place, the rest stay.
+        assert_eq!(contract_first(vec![&cash]).len(), 1);
+    }
+
+    #[test]
+    fn a_taken_action_is_kept_only_while_its_marker_is_up() {
+        let mark = |target: u32, kind: &str, alive: bool| Mark {
+            target,
+            kind: kind.to_owned(),
+            name: format!("mark {target}"),
+            at: Vec3::ZERO,
+            alive,
+            mission: None,
+            secondary: false,
+        };
+        assert!(marked_again(&[mark(7, "action", true)], 7));
+        // Its marker gone: forgotten.
+        assert!(!marked_again(&[], 7));
+        assert!(!marked_again(&[mark(7, "action", false)], 7));
+        assert!(marked_again(&[mark(7, "pickup_fuel_2", true)], 7));
+        assert!(!marked_again(&[mark(8, "action", true)], 7));
+    }
+
     #[test]
     fn a_marked_ride_close_by_is_boarded_before_a_fight() {
         let mark = |target: u32, kind: &str| Mark {
