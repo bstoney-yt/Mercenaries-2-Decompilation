@@ -1247,6 +1247,12 @@ impl Autoplay {
         if game.support.pda || asked {
             return self.pda(game.support.pda, wants(PDA_CLOSE));
         }
+        // What she took an action on is forgotten once its marker is gone:
+        // one the scripts put up again asks for it again (the contract
+        // sweep: OilCon001's executive, marked again after she lost him,
+        // and OilCon002's helicopter, "Enter the 'Lucky Lady'" once she
+        // was out of it; she stood by each with nothing to do).
+        self.tagged.retain(|g| marked_again(marks, *g));
         // The scripts offer their context action on what a marker of
         // theirs is on, and she stands at it (a prisoner to release,
         // `[ContextAction.ReleasePrisoner]`): she takes it with the use key.
@@ -1377,6 +1383,15 @@ impl Autoplay {
             && marks
                 .iter()
                 .any(|m| m.target == w && m.alive && m.kind == "deliverable")
+            // Not while what she brings is read as short of the place:
+            // she drives on in first ([`Self::choose`]). (OilCon021, the
+            // contract sweep: the scooter stood 10.6 m from the mail drop,
+            // its radius 8 m; each time she got in to drive on in, the
+            // wait kept from before got her out again, 1,450 s.)
+            && !self
+                .deliveries
+                .iter()
+                .any(|d| d.dest == w && !d.arrived())
             && let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving)
             && self.may_get_out(game, i)
         {
@@ -5899,6 +5914,13 @@ pub fn starter_for(on_offer: &[String], talks: &[ActionAt], here: Vec3) -> Optio
 /// is outside (`in_hq`), else the nearest of the doors offered (`enters`)
 /// to `here`. Invented: the scripts don't say which HQ's starter holds
 /// which contract until she is inside, so the nearest door is tried.
+/// Whether an action marker of the scripts' is still up on `g`.
+fn marked_again(marks: &[Mark], g: u32) -> bool {
+    marks
+        .iter()
+        .any(|m| m.alive && m.kind == ACTION_KIND && m.target == g)
+}
+
 /// The way off a box (`lo`..`hi`, its model standing at `at`) from `here`
 /// on it: straight out from its middle, past its widest reach.
 fn off_the_box(at: Vec3, lo: Vec3, hi: Vec3, here: Vec3) -> Vec3 {
@@ -7051,8 +7073,32 @@ mod tests {
     #[test]
     fn stepping_off_a_box_ends_past_its_widest_reach() {
         let (lo, hi) = (Vec3::new(-3.0, 0.0, -4.0), Vec3::new(3.0, 2.0, 4.0));
-        let off = off_the_box(Vec3::new(10.0, 1.0, 10.0), lo, hi, Vec3::new(12.0, 3.0, 10.0));
+        let off = off_the_box(
+            Vec3::new(10.0, 1.0, 10.0),
+            lo,
+            hi,
+            Vec3::new(12.0, 3.0, 10.0),
+        );
         assert_eq!(off, Vec3::new(10.0 + 5.0 + STEP_OFF, 1.0, 10.0));
+    }
+
+    #[test]
+    fn a_taken_action_is_kept_only_while_its_marker_is_up() {
+        let mark = |target: u32, kind: &str, alive: bool| Mark {
+            target,
+            kind: kind.to_owned(),
+            name: format!("mark {target}"),
+            at: Vec3::ZERO,
+            alive,
+            mission: None,
+            secondary: false,
+        };
+        assert!(marked_again(&[mark(7, "action", true)], 7));
+        // Its marker gone, or another kind on it: forgotten.
+        assert!(!marked_again(&[], 7));
+        assert!(!marked_again(&[mark(7, "action", false)], 7));
+        assert!(!marked_again(&[mark(7, "deliverable", true)], 7));
+        assert!(!marked_again(&[mark(8, "action", true)], 7));
     }
 
     #[test]
