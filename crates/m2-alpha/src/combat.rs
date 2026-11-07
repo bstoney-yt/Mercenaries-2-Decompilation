@@ -5549,7 +5549,7 @@ impl Combat {
         if killed {
             self.remarks.push(Remark::Kill);
         }
-        alarm(f.people, at);
+        alarm_within(f.people, at, BLAST_AUDIBILITY);
     }
 
     /// A blast's fire, smoke and sound, `size` times a grenade's.
@@ -5820,7 +5820,7 @@ impl Combat {
         if killed {
             self.remarks.push(Remark::Kill);
         }
-        alarm(f.people, at);
+        alarm_within(f.people, at, BLAST_AUDIBILITY);
     }
 
     /// The satellite-guided bomb landing at `at` ([`BOMB`]): a great
@@ -5889,7 +5889,7 @@ impl Combat {
             let ground = ground_under(f.physics, spot).unwrap_or(spot);
             self.fires.push((ground + Vec3::Y * 1.2, 2.5, burn, 0.0));
         }
-        alarm(f.people, at);
+        alarm_within(f.people, at, BLAST_AUDIBILITY);
     }
 
     /// An air strike's blast at `at`, as its explosion template has it:
@@ -5946,7 +5946,7 @@ impl Combat {
                 2.0 + size * 0.2,
             );
         }
-        alarm(f.people, at);
+        alarm_within(f.people, at, BLAST_AUDIBILITY);
     }
 
     /// Harm a blast's frag (template `template`) does around `at`,
@@ -6209,12 +6209,21 @@ fn farthest(way: Vec3, speed: f32) -> Vec3 {
 /// Gunfire or a blast at `at`: soldiers close by turn on the player,
 /// those close by who don't fight run (not story characters).
 fn alarm(people: &mut People, at: Vec3) {
+    alarm_within(people, at, ALERT_RANGE);
+}
+
+/// A blast's `Audibility`: the `Explosion` template's (from samples; most
+/// of the explosions' templates have it).
+const BLAST_AUDIBILITY: f32 = 100.0;
+
+/// As [`alarm`], heard as far as `audibility` times a soldier's `Hearing`.
+fn alarm_within(people: &mut People, at: Vec3, audibility: f32) {
     for n in &mut people.npcs {
         if !n.alive {
             continue;
         }
         let d = n.character.position.distance(at);
-        if n.soldier && !n.ai.flags.pacifist && d < ALERT_RANGE * n.ai.hearing {
+        if n.soldier && !n.ai.flags.pacifist && d < audibility * n.ai.hearing {
             n.alert = true;
         }
         if !n.soldier && d < PANIC_RANGE {

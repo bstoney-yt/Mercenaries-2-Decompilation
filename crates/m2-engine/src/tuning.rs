@@ -34,6 +34,9 @@ pub struct VehicleTuning {
     /// `Stimulus` `Visibility`: from how far it can be seen, metres
     /// (0x822E89B0; `M151 .50Cal (VZ) (Full)` 200).
     pub visibility: Option<f32>,
+    /// `Stimulus` `Audibility`: from how far it can be heard, metres
+    /// (`CRX` 40, `Helicopter` 300).
+    pub audibility: Option<f32>,
     /// How hard blasts throw it, of their usual (`ExplosionFudge`'s field
     /// 6bcc541e: the AMX-30's 0.2, a truck's 0.4, a boat's 1.1).
     pub blast_scale: Option<f32>,
@@ -1783,6 +1786,7 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                     .map(|a| a & 0xff)
                     .filter(|a| (1..=4).contains(a)),
                 visibility: stimulus.get(id, "Visibility"),
+                audibility: stimulus.get(id, "Audibility"),
                 blast_scale: fudge.number(id, BLAST_SCALE),
                 burns_below: tick.number(id, BURNS_BELOW),
                 // The whole vehicle's key: its record with no `Name` (the
