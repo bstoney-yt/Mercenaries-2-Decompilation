@@ -1256,8 +1256,13 @@ impl Autoplay {
         // The scripts offer their context action on what a marker of
         // theirs is on, and she stands at it (a prisoner to release,
         // `[ContextAction.ReleasePrisoner]`): she takes it with the use key.
+        // Once taken, one not a contract's is left be (the contract
+        // sweep: AllCon008, OilCon005 and PirCon001 each stood at fuel tanks
+        // taking "Steal fuel" every 1.5 s, 1,100 times, to the time limit).
         if let Some((g, text)) = game.context.clone()
-            && marks.iter().any(|m| m.alive && m.target == g)
+            && marks.iter().any(|m| {
+                m.alive && m.target == g && (for_a_contract(m) || !self.tagged.contains(&g))
+            })
         {
             // As the use key does in play (`Game::tick`, which her
             // intents don't pass through), as `--context` does too.
@@ -2531,6 +2536,11 @@ impl Autoplay {
             .filter(|m| m.kind != "destroy")
             .filter(|m| Some(m.target) != riding && (!marked || !unmarked(m)))
             .collect();
+        // A contract's own places before the island's pickups and jobs'
+        // marks: a player on a contract follows it (the contract sweep:
+        // OilCon003, a timed contract, went 156 m out for a cash pickup
+        // with its delivery 187 m off).
+        let places = contract_first(places);
         // Nothing marked for a contract, off one with the flow's
         // contracts on offer: she goes to a starter and talks, as a player
         // takes a contract (her menu and its terms are answered by the
@@ -5914,6 +5924,15 @@ pub fn starter_for(on_offer: &[String], talks: &[ActionAt], here: Vec3) -> Optio
 /// is outside (`in_hq`), else the nearest of the doors offered (`enters`)
 /// to `here`. Invented: the scripts don't say which HQ's starter holds
 /// which contract until she is inside, so the nearest door is tried.
+/// Of places to go, a contract's only, where there are any.
+fn contract_first(places: Vec<&Mark>) -> Vec<&Mark> {
+    if places.iter().any(|m| for_a_contract(m)) {
+        places.into_iter().filter(|m| for_a_contract(m)).collect()
+    } else {
+        places
+    }
+}
+
 /// Whether an action marker of the scripts' is still up on `g`.
 fn marked_again(marks: &[Mark], g: u32) -> bool {
     marks
@@ -7080,6 +7099,27 @@ mod tests {
             Vec3::new(12.0, 3.0, 10.0),
         );
         assert_eq!(off, Vec3::new(10.0 + 5.0 + STEP_OFF, 1.0, 10.0));
+    }
+
+    #[test]
+    fn a_contracts_places_come_before_pickups() {
+        let mark = |target: u32, mission: Option<&str>| Mark {
+            target,
+            kind: "deliverable".to_owned(),
+            name: format!("mark {target}"),
+            at: Vec3::ZERO,
+            alive: true,
+            mission: mission.map(|id| crate::mission::MarkFor::Id(id.to_owned())),
+            secondary: false,
+        };
+        let (cash, drop) = (mark(1, None), mark(2, Some("OilCon003")));
+        let kept: Vec<u32> = contract_first(vec![&cash, &drop])
+            .iter()
+            .map(|m| m.target)
+            .collect();
+        assert_eq!(kept, [2]);
+        // With no contract's place, the rest stay.
+        assert_eq!(contract_first(vec![&cash]).len(), 1);
     }
 
     #[test]
