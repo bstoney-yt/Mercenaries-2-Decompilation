@@ -1927,6 +1927,38 @@ impl Game {
                 .get(self.scene.hero.upgrade_template())
                 .copied()
         });
+        // And to hear her by: her own `Audibility` by the same, or her
+        // vehicle's.
+        let heard = self.scene.world.as_ref().and_then(|w| {
+            w.index
+                .template_db
+                .audibilities
+                .get(self.scene.hero.base_template())
+                .copied()
+        });
+        self.scene.people.her_audibility = self
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| match p.driving {
+                Some(i) => self
+                    .scene
+                    .vehicles
+                    .get(i)
+                    .and_then(|v| v.spec.tuning.audibility),
+                None => heard.map(|a| {
+                    let speed = p.character.velocity.with_y(0.0).length();
+                    let motion = if speed < 0.1 {
+                        m2_engine::ai::Motion::Still
+                    } else if speed > p.motion.paces[0] + 0.1 {
+                        m2_engine::ai::Motion::Fast
+                    } else {
+                        m2_engine::ai::Motion::Walking
+                    };
+                    a * modifier.map_or(1.0, |m| m.audibility(motion, p.aiming))
+                }),
+            })
+            .unwrap_or(0.0);
         self.scene.people.her_visibility =
             self.scene.player.as_ref().and_then(|p| match p.driving {
                 Some(i) => self

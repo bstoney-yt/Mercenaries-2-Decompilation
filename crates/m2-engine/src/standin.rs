@@ -299,6 +299,7 @@ mod tests {
                 burns_below: Some(60.0),
                 armour: Some(2),
                 visibility: None,
+                audibility: None,
                 ..VehicleTuning::default()
             },
         );

@@ -986,6 +986,8 @@ pub struct Npc {
     pub target_armour: u32,
     /// From how far those with `Vision` 1 can see her, metres.
     pub her_visibility: f32,
+    /// From how far those with `Hearing` 1 can hear her, metres.
+    pub her_audibility: f32,
     /// Saw her this tick for the first time in the fight (smarter: he
     /// calls it out).
     spotted: bool,
@@ -1232,6 +1234,7 @@ impl Npc {
             smart: SmarterAi::default(),
             target_armour: 1,
             her_visibility: ON_FOOT_VISIBILITY,
+            her_audibility: 0.0,
             spotted: false,
             cover: None,
             hit: false,
@@ -1728,6 +1731,15 @@ impl Npc {
     fn her_sight(&self) -> f32 {
         let held = if self.alert { HELD_SIGHT } else { 1.0 };
         self.ai.vision * self.her_visibility * held
+    }
+
+    /// Whether he hears her at `at`: within his `Hearing` times her
+    /// `Audibility`, half as far again once on to her, every way and
+    /// through walls (0x822E89B0: no ray for hearing).
+    fn hears(&self, at: Vec3) -> bool {
+        let held = if self.alert { HELD_SIGHT } else { 1.0 };
+        let reach = self.ai.hearing * self.her_audibility * held;
+        reach > 0.0 && self.character.position.distance(at) < reach
     }
 
     /// How far they see what they look at, metres.
@@ -2375,7 +2387,7 @@ impl Npc {
             if self.look <= 0.0 {
                 self.look = LOOK_EVERY;
                 if let Some(t) = threat
-                    && self.sees(physics, t, false)
+                    && (self.sees(physics, t, false) || self.hears(t))
                 {
                     self.alert = true;
                     self.spotted = true;
@@ -2661,6 +2673,9 @@ pub struct People {
     /// the APCs, 4 the tanks): a soldier whose gun's `WeaponHint` rates it
     /// 0 against that class holds his fire ([`Npc::rates_target`]). 0
     /// (unset) is taken as 1.
+    /// From how far she can be heard, metres: her own `Audibility` as
+    /// she moves, or her vehicle's.
+    pub her_audibility: f32,
     /// From how far she can be seen, metres: her vehicle's `Visibility`
     /// while she drives one that has one.
     pub her_visibility: Option<f32>,
@@ -3793,6 +3808,7 @@ impl People {
             npc.smart = self.smarter;
             npc.target_armour = npc.foe_armour.unwrap_or(self.target_armour).max(1);
             npc.her_visibility = self.her_visibility.unwrap_or(ON_FOOT_VISIBILITY);
+            npc.her_audibility = self.her_audibility;
             npc.swim_speed = self
                 .kinds
                 .get(npc.kind)
@@ -5456,6 +5472,19 @@ pub(crate) mod tests {
         assert!(civilian.hurt(60.0, Vec3::ZERO));
         assert!(!civilian.alive);
         assert!(!civilian.hurt(60.0, Vec3::ZERO), "only dies once");
+    }
+
+    #[test]
+    fn he_hears_her_behind_him_within_her_audibility() {
+        let post = Brain::Post { facing: 0.0 };
+        let mut n = Npc::new(0, &rig(), Vec3::Y, 0.0, post, Some(1));
+        let behind = Vec3::new(0.0, 1.0, -30.0);
+        assert!(!n.hears(behind), "on foot she makes no sound");
+        n.her_audibility = 40.0;
+        assert!(n.hears(behind), "her car, 40 m");
+        assert!(!n.hears(Vec3::new(0.0, 1.0, -45.0)));
+        n.alert = true;
+        assert!(n.hears(Vec3::new(0.0, 1.0, -55.0)), "half as far again");
     }
 
     #[test]

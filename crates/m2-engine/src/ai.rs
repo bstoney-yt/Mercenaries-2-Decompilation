@@ -132,6 +132,16 @@ pub enum Motion {
 }
 
 impl StimulusModifier {
+    /// What multiplies `Audibility` moving so, and sneaking or not.
+    pub fn audibility(&self, motion: Motion, sneaking: bool) -> f32 {
+        let moving = match motion {
+            Motion::Still => self.aud_idle,
+            Motion::Walking => 1.0,
+            Motion::Fast => self.aud_fast,
+        };
+        moving * if sneaking { self.aud_sneak } else { 1.0 }
+    }
+
     /// What multiplies `Visibility` moving so, and sneaking or not.
     pub fn visibility(&self, motion: Motion, sneaking: bool) -> f32 {
         let moving = match motion {
@@ -141,6 +151,22 @@ impl StimulusModifier {
         };
         moving * if sneaking { self.vis_sneak } else { 1.0 }
     }
+}
+
+/// Every template's `Stimulus` `Audibility`, by its name in lower case:
+/// from how far those with `Hearing` 1 hear it, metres (0x822E89B0; the
+/// schema's default 40, 0x823EDC38).
+pub fn audibilities(db: &Layer<'_>) -> HashMap<String, f32> {
+    let table = Table::new(db, "Stimulus");
+    let names = db.names();
+    table
+        .templates()
+        .filter_map(|id| {
+            let r = *table.of_template(id).first()?;
+            let a = table.float(r, name_hash("Audibility"))?;
+            Some((names.get(&id)?.to_ascii_lowercase(), a))
+        })
+        .collect()
 }
 
 /// Every template's `StimulusModifier`, by its name in lower case.
@@ -332,6 +358,9 @@ mod tests {
         assert_eq!(jen.visibility(Motion::Still, true), 0.375);
         let d = StimulusModifier::default();
         assert!((d.visibility(Motion::Fast, false) - 1.2).abs() < 1e-6);
+        assert_eq!(jen.audibility(Motion::Still, false), 0.0);
+        assert_eq!(jen.audibility(Motion::Fast, false), 1.0);
+        assert!((d.audibility(Motion::Walking, true) - 0.3).abs() < 1e-6);
     }
 
     use super::*;
