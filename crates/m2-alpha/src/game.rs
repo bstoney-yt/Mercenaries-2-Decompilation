@@ -141,6 +141,8 @@ pub struct Game {
     pub gunships: crate::gunships::Gunships,
     /// A pursuit's cars ([`crate::pursuers`]).
     pub pursuers: crate::pursuers::Pursuers,
+    /// The armies' patrols gone after a foe.
+    pub assaults: crate::pursuers::Assaults,
     /// Vehicles the mission scripts send along a path (`crate::paths`).
     pub paths: crate::paths::PathMoves,
     /// Traffic on the road network (`crate::roads`).
@@ -454,6 +456,7 @@ impl Game {
             traffic: crate::traffic::Traffic::default(),
             gunships: crate::gunships::Gunships::default(),
             pursuers: crate::pursuers::Pursuers::default(),
+            assaults: crate::pursuers::Assaults::default(),
             paths: crate::paths::PathMoves::default(),
             roads: crate::roads::RoadTraffic::default(),
             census: std::env::var("M2_LIFE_CENSUS")
@@ -1710,8 +1713,32 @@ impl Game {
                     );
                 }
             }
-            self.traffic
-                .drive(&mut world.physics, &self.scene.vehicles, driven);
+            // The armies' patrols with a foe leave their paths for it.
+            let foes: Vec<_> = self
+                .combat
+                .crew_foes(driven.is_some())
+                .into_iter()
+                .filter(|f| {
+                    self.scene
+                        .vehicles
+                        .get(f.0)
+                        .is_some_and(|v| self.traffic.patrols(v))
+                })
+                .collect();
+            let template_db = &world.index.template_db;
+            self.assaults.drive(
+                &mut world.physics,
+                &mut self.scene.vehicles,
+                &foes,
+                |v| template_db.vehicle_labels_for(&v.spec.label, v.spec.model),
+                dt,
+            );
+            self.traffic.drive(
+                &mut world.physics,
+                &self.scene.vehicles,
+                driven,
+                &self.assaults,
+            );
             // A pursuit's gunships, at her.
             if let Some(p) = self.scene.player.as_ref() {
                 let her = p.character.position;

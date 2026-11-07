@@ -354,6 +354,177 @@ struct Pursuer {
     leaving: bool,
 }
 
+/// One army's patrol vehicle gone after its foe: see [`Assaults`].
+#[derive(Debug, Default)]
+struct Assault {
+    driver: CarDriver,
+    held: CarInputs,
+    attack: CarAttack,
+    tank: TankAttack,
+    route: Option<(Vec3, Option<path_search::Way>)>,
+    /// Its going off has been logged.
+    logged: bool,
+}
+
+/// True the first time, for one line per assault.
+fn self_log(logged: &mut bool) -> bool {
+    !std::mem::replace(logged, true)
+}
+
+/// The armies' patrol vehicles while a foe is in their gun's slot
+/// ([`crate::combat::Combat::crew_foes`]): they leave their path and fight
+/// it as the pursuit's own do, by the same drivers: a tank by `TankAttack`
+/// (0x822B6508), a car by `CarAttack` (0x822ACB28) or `CarPursue`
+/// (0x822ADE08), as 0x822ADE08's choice has it. Each gunner's report comes
+/// from the distance alone (inferred: the fire control's other reports
+/// aren't kept for these). That those standing at a post stay there is
+/// inferred (they have no path to go back to); boats aren't sent.
+#[derive(Debug, Default)]
+pub struct Assaults {
+    out: std::collections::HashMap<usize, Assault>,
+    rng: u32,
+}
+
+impl Assaults {
+    /// Whether vehicle `i` is off after a foe, so not on its path.
+    pub fn holds(&self, i: usize) -> bool {
+        self.out.contains_key(&i)
+    }
+
+    /// Those in `foes` (vehicle, where its foe is, whether that is a
+    /// vehicle) drive at them.
+    pub fn drive(
+        &mut self,
+        physics: &mut Physics,
+        vehicles: &mut [ParkedVehicle],
+        foes: &[(usize, Vec3, bool)],
+        labels: impl Fn(&ParkedVehicle) -> Vec<u32>,
+        dt: f32,
+    ) {
+        self.out.retain(|i, _| foes.iter().any(|f| f.0 == *i));
+        for &(i, foe, vehicle) in foes {
+            let Some(v) = vehicles.get_mut(i) else {
+                continue;
+            };
+            let Some(id) = v.id.filter(|_| !v.wrecked && !v.spec.is_boat()) else {
+                continue;
+            };
+            let Some(m) = physics.vehicle_transform(id) else {
+                continue;
+            };
+            let a = self.out.entry(i).or_default();
+            let at = m.transform_point3(Vec3::ZERO);
+            let forward = m
+                .transform_vector3(Vec3::Z)
+                .with_y(0.0)
+                .normalize_or(Vec3::Z);
+            let car = CarState {
+                at,
+                forward,
+                velocity: physics.vehicle_velocity(id),
+            };
+            let sight = Sight {
+                at: foe,
+                unseen: 0.0,
+                vehicle,
+            };
+            let (lo, hi) = v.spec.bounds;
+            let mut world = Look {
+                physics,
+                rng: &mut self.rng,
+                car: id,
+                nose: hi.z,
+                tail: -lo.z,
+                size: path_search::Size {
+                    width: hi.x - lo.x,
+                    height: hi.y,
+                },
+                route: &mut a.route,
+                ahead: path_search::lookahead((hi - lo).max_element(), car.speed().abs(), dt),
+            };
+            if v.spec.kind == "tank" {
+                if self_log(&mut a.logged) {
+                    eprintln!(
+                        "assault: {} leaves its path for a foe {:.0} m off",
+                        v.spec.label,
+                        car.at.distance(foe)
+                    );
+                }
+                let hull = Hull {
+                    car,
+                    length: hi.z - lo.z,
+                    width: hi.x - lo.x,
+                    gunner: crate::combat::armed_seats(v).len() > 1,
+                };
+                a.tank.feel(std::mem::take(&mut v.hit), dt);
+                let t = a.tank.think(&hull, &sight, &mut world, dt);
+                physics.drive(
+                    id,
+                    m2_engine::physics::VehicleControls {
+                        throttle: t.throttle,
+                        steer: t.steer,
+                        brake: false,
+                        parked: false,
+                    },
+                );
+                continue;
+            }
+            let seats = crate::combat::armed_seats(v);
+            let armed = v.spec.armed.iter().any(|m| m.seat == seats[0]);
+            if self_log(&mut a.logged) {
+                eprintln!(
+                    "assault: {} leaves its path for a foe {:.0} m off",
+                    v.spec.label,
+                    car.at.distance(foe)
+                );
+            }
+            let input = if car_attack::runs_car_attack(armed, &labels(v), seats.len() - 1) {
+                let reports: Vec<Report> = seats
+                    .iter()
+                    .map(|&seat| {
+                        let hint = v
+                            .spec
+                            .armed
+                            .iter()
+                            .find(|m| m.seat == seat)
+                            .and_then(|m| m.weapon.hint);
+                        let (near, far) = hint
+                            .map_or((0.0, gunner_aim::NO_HINT_RANGE), |h| (h.min_range, h.range));
+                        match car.at.distance(foe) {
+                            d if d > far => Report::TooFar,
+                            d if d < near => Report::TooNear,
+                            _ => Report::Ready,
+                        }
+                    })
+                    .collect();
+                let crew = rider_list(v, &reports, car.at, car.forward);
+                a.attack.feel(std::mem::take(&mut v.hit), dt);
+                a.attack.think(
+                    &mut a.driver,
+                    &car,
+                    hi.z - lo.z,
+                    &crew,
+                    &sight,
+                    &mut world,
+                    dt,
+                )
+            } else {
+                let right = m.transform_vector3(Vec3::X).normalize_or(Vec3::X);
+                let turning = physics.vehicle_spin(id).y;
+                let quarry = Quarry {
+                    at: foe,
+                    velocity: Vec3::ZERO,
+                    vehicle,
+                };
+                a.driver.pursue(&car, right, turning, i as u32, &quarry, dt)
+            };
+            let ahead = physics.vehicle_gear(id).is_none_or(|(g, _)| g != 0);
+            a.held.take(&input, ahead);
+            physics.drive(id, a.held.controls());
+        }
+    }
+}
+
 /// The pursuit's cars and tanks out, and the road network they come by.
 #[derive(Debug, Default)]
 pub struct Pursuers {
@@ -1055,6 +1226,16 @@ fn behind_chance(standing: Standing) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_assault_ends_with_its_foe_and_the_vehicle_goes_back_to_its_path() {
+        let mut assaults = Assaults::default();
+        assaults.out.insert(3, Assault::default());
+        assert!(assaults.holds(3));
+        let mut physics = Physics::new();
+        assaults.drive(&mut physics, &mut [], &[], |_| Vec::new(), 0.1);
+        assert!(!assaults.holds(3));
+    }
     // Cars come in only for her in a tank, by a road or driving, tanks
     // only for her in a tank or driving; each kind's gate shuts for 5
     // whole seconds after one of it is sent.

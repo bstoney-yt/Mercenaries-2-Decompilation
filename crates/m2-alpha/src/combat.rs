@@ -401,6 +401,8 @@ struct CrewGun {
     slot: m2_engine::ai_target::Slot,
     /// Where the one in its slot is.
     at: Option<Vec3>,
+    /// Its watch on that one's motion.
+    watch: m2_engine::gunner_aim::Watch,
     look: f32,
     wait: f32,
     burst: u32,
@@ -4023,6 +4025,21 @@ impl Combat {
                     {
                         self.remarks.push(Remark::Kill);
                     }
+                    // A crew's round on her, on foot, as a soldier's is:
+                    // near enough its line and nothing before her.
+                    if self.crew_firing
+                        && f.player.driving.is_none()
+                        && let Some(her) = self.target(f.player, true)
+                    {
+                        let along = (her - from).dot(aim).max(0.0);
+                        let blocked = hit.is_some_and(|h| h.0 < along - 1.0);
+                        if !blocked && (from + aim * along).distance(her) < 0.45 {
+                            let taken = damage * self.hero_scale(ammo.key);
+                            let lost = self.hurt_player(f, taken, Some(from));
+                            self.tally.taken_rounds += lost;
+                            self.tally.rounds_on_her += u32::from(lost > 0.0);
+                        }
+                    }
                     if let Some((t, None)) = hit {
                         let round = match ammo.key {
                             Some(k) if k == m2_assets::name_hash("Bullet") => Round::Bullet,
@@ -4200,13 +4217,38 @@ impl Combat {
         }
     }
 
+    /// The vehicles whose guns have a foe, each with where that foe is
+    /// and whether it is a vehicle, its first seat's that has one.
+    pub fn crew_foes(&self, driving: bool) -> Vec<(usize, Vec3, bool)> {
+        let mut foes: Vec<(usize, usize, Vec3, bool)> = self
+            .crews
+            .iter()
+            .filter_map(|(&(i, seat), gun)| {
+                let who = gun.slot.who?;
+                let vehicle = if who == crate::npc::HER {
+                    driving
+                } else {
+                    who >= crate::npc::VEHICLES
+                };
+                Some((i, seat, gun.at?, vehicle))
+            })
+            .collect();
+        foes.sort_by_key(|f| (f.0, f.1));
+        foes.dedup_by_key(|f| f.0);
+        foes.into_iter().map(|f| (f.0, f.2, f.3)).collect()
+    }
+
     /// The armies' crewed vehicles go for those at war with their army,
     /// as a soldier does ([`m2_engine::ai_target`]): each armed seat's
     /// mind offers its slot whom it can see within its weapon's range,
     /// lays the gun on the one it settles on, and fires by its hint's
-    /// bursts, as her gunners do ([`gunners_fire`](Self::gunners_fire)).
-    /// `Vision` 1.25 is vehicles' (from samples); that they leave her to
-    /// the pursuit's vehicles is the alpha's, for now.
+    /// bursts, as her gunners do ([`gunners_fire`](Self::gunners_fire)),
+    /// leading it as the 360's gunners do ([`m2_engine::gunner_aim`]; the
+    /// watch sees it each look, not each 0.25 s, and from the vehicle's
+    /// middle, not its muzzle: inferred).
+    /// `Vision` 1.25 is vehicles' (from samples). She is one of those they
+    /// choose among, if their army fights her and she isn't disguised
+    /// ([`People::fights_for`](crate::npc::People::fights_for)).
     fn crews_fire(&mut self, f: &mut Field<'_>, dt: f32) {
         const VISION: f32 = 1.25;
         let driven = f.player.driving;
@@ -4221,6 +4263,10 @@ impl Combat {
             };
             let centre = body.transform_point3(Vec3::Y);
             let seats = armed_seats(v);
+            let her = self
+                .target(f.player, true)
+                .filter(|_| f.people.fights_for(side))
+                .map(|at| (crate::npc::HER, at, f.people.seen_at()));
             for (seat, &mount) in seats.iter().enumerate() {
                 let v = &f.vehicles[i];
                 let Some(m) = v
@@ -4237,6 +4283,7 @@ impl Combat {
                 let gap = m.weapon.gap();
                 let size = m2_engine::weapons::AiClip::size(m);
                 let aim_ai = m.weapon.aim_ai;
+                let (speed, fall) = (m.weapon.ammo.velocity, m.weapon.ammo.gravity);
                 let aimer = v.spec.aimer_of_seat(mount);
                 let gun = self.crews.entry((i, seat)).or_default();
                 gun.wait -= dt;
@@ -4248,7 +4295,7 @@ impl Combat {
                     gun.at = None;
                     let mut best = gun.slot;
                     let seen = f.people.foes_of(side, centre);
-                    for (who, at, visibility) in seen {
+                    for (who, at, visibility) in seen.into_iter().chain(her) {
                         let d = at.distance(centre);
                         let in_slot = best.who == Some(who);
                         let reach = VISION * visibility * if in_slot { 1.5 } else { 1.0 };
@@ -4273,6 +4320,9 @@ impl Combat {
                             }
                         }
                     }
+                    if gun.slot.who != best.who {
+                        gun.watch = Default::default();
+                    }
                     if gun.slot.who != best.who
                         && let Some(at) = gun.at
                     {
@@ -4290,6 +4340,10 @@ impl Combat {
                     };
                 }
                 let Some(at) = gun.at else { continue };
+                // Where a round will find it, and how much it falls on the way.
+                gun.watch.see(at, dt);
+                let seen = gun.watch.velocity;
+                let at = m2_engine::gunner_aim::aim(centre, at, seen, seen, true, at, speed, fall);
                 let (wait, left, empty) = (gun.wait, gun.burst, gun.clip.gunner_empty(size));
                 let v = &mut f.vehicles[i];
                 let laid = match aimer {
@@ -5590,6 +5644,34 @@ impl Combat {
     /// human, and her 0.15 camera shake.
     fn npc_melee(&mut self, f: &mut Field<'_>, i: usize) {
         let n = &f.people.npcs[i];
+        // Going for another army, he strikes the enemy his blow reaches,
+        // by their own row for a `MeleeBash`, not to her account (the same
+        // boxes as hers, inferred).
+        if n.foe_at.is_some() {
+            let (from, facing, by) = (n.character.position, n.facing, n.shooter);
+            let melee = Some(m2_assets::name_hash("MeleeBash"));
+            let struck = (0..f.people.npcs.len()).find(|&j| {
+                let o = &f.people.npcs[j];
+                let p = &o.character;
+                j != i
+                    && o.alive
+                    && f.people.enemies(i, j)
+                    && [&m2_engine::melee::HIGH, &m2_engine::melee::LOW]
+                        .iter()
+                        .any(|b| {
+                            m2_engine::melee::reaches(
+                                b, from, facing, p.position, p.radius, p.height,
+                            )
+                        })
+            });
+            if let Some(j) = struck {
+                let taken = self.on_person(&f.people.npcs[j], melee);
+                let killed = f.people.npcs[j].shot_by_army(taken, Vec3::ZERO, by);
+                f.people.war_tally.1 += 1;
+                f.people.war_tally.2 += u32::from(killed);
+            }
+            return;
+        }
         if f.player.driving.is_some() || !n.alive {
             return;
         }
@@ -5626,6 +5708,18 @@ impl Combat {
             .as_ref()
             .and_then(|t| t.scale(m2_assets::name_hash("Hero"), key))
             .map_or(NPC_DAMAGE, |scale| g.damage * scale)
+    }
+
+    /// What she takes of a round of `DamageKey` `key`: the table's `Hero`
+    /// row (a round without a key is a `Bullet`), all of it without one.
+    fn hero_scale(&self, key: Option<u32>) -> f32 {
+        let key = key
+            .filter(|&k| k != 0)
+            .unwrap_or_else(|| m2_assets::name_hash("Bullet"));
+        self.damage_table
+            .as_ref()
+            .and_then(|t| t.scale(m2_assets::name_hash("Hero"), key))
+            .unwrap_or(1.0)
     }
 
     /// Explosion template `blast` going off at `at`, by its own `Radius`,
