@@ -401,6 +401,8 @@ struct CrewGun {
     slot: m2_engine::ai_target::Slot,
     /// Where the one in its slot is.
     at: Option<Vec3>,
+    /// Its watch on that one's motion.
+    watch: m2_engine::gunner_aim::Watch,
     look: f32,
     wait: f32,
     burst: u32,
@@ -4240,7 +4242,10 @@ impl Combat {
     /// as a soldier does ([`m2_engine::ai_target`]): each armed seat's
     /// mind offers its slot whom it can see within its weapon's range,
     /// lays the gun on the one it settles on, and fires by its hint's
-    /// bursts, as her gunners do ([`gunners_fire`](Self::gunners_fire)).
+    /// bursts, as her gunners do ([`gunners_fire`](Self::gunners_fire)),
+    /// leading it as the 360's gunners do ([`m2_engine::gunner_aim`]; the
+    /// watch sees it each look, not each 0.25 s, and from the vehicle's
+    /// middle, not its muzzle: inferred).
     /// `Vision` 1.25 is vehicles' (from samples). She is one of those they
     /// choose among, if their army fights her and she isn't disguised
     /// ([`People::fights_for`](crate::npc::People::fights_for)).
@@ -4278,6 +4283,7 @@ impl Combat {
                 let gap = m.weapon.gap();
                 let size = m2_engine::weapons::AiClip::size(m);
                 let aim_ai = m.weapon.aim_ai;
+                let (speed, fall) = (m.weapon.ammo.velocity, m.weapon.ammo.gravity);
                 let aimer = v.spec.aimer_of_seat(mount);
                 let gun = self.crews.entry((i, seat)).or_default();
                 gun.wait -= dt;
@@ -4314,6 +4320,9 @@ impl Combat {
                             }
                         }
                     }
+                    if gun.slot.who != best.who {
+                        gun.watch = Default::default();
+                    }
                     if gun.slot.who != best.who
                         && let Some(at) = gun.at
                     {
@@ -4331,6 +4340,10 @@ impl Combat {
                     };
                 }
                 let Some(at) = gun.at else { continue };
+                // Where a round will find it, and how much it falls on the way.
+                gun.watch.see(at, dt);
+                let seen = gun.watch.velocity;
+                let at = m2_engine::gunner_aim::aim(centre, at, seen, seen, true, at, speed, fall);
                 let (wait, left, empty) = (gun.wait, gun.burst, gun.clip.gunner_empty(size));
                 let v = &mut f.vehicles[i];
                 let laid = match aimer {
