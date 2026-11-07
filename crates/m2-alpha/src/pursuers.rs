@@ -362,6 +362,13 @@ struct Assault {
     attack: CarAttack,
     tank: TankAttack,
     route: Option<(Vec3, Option<path_search::Way>)>,
+    /// Its going off has been logged.
+    logged: bool,
+}
+
+/// True the first time, for one line per assault.
+fn self_log(logged: &mut bool) -> bool {
+    !std::mem::replace(logged, true)
 }
 
 /// The armies' patrol vehicles while a foe is in their gun's slot
@@ -435,7 +442,14 @@ impl Assaults {
                 route: &mut a.route,
                 ahead: path_search::lookahead((hi - lo).max_element(), car.speed().abs(), dt),
             };
-            if v.spec.is_tank() {
+            if v.spec.kind == "tank" {
+                if self_log(&mut a.logged) {
+                    eprintln!(
+                        "assault: {} leaves its path for a foe {:.0} m off",
+                        v.spec.label,
+                        car.at.distance(foe)
+                    );
+                }
                 let hull = Hull {
                     car,
                     length: hi.z - lo.z,
@@ -457,6 +471,13 @@ impl Assaults {
             }
             let seats = crate::combat::armed_seats(v);
             let armed = v.spec.armed.iter().any(|m| m.seat == seats[0]);
+            if self_log(&mut a.logged) {
+                eprintln!(
+                    "assault: {} leaves its path for a foe {:.0} m off",
+                    v.spec.label,
+                    car.at.distance(foe)
+                );
+            }
             let input = if car_attack::runs_car_attack(armed, &labels(v), seats.len() - 1) {
                 let reports: Vec<Report> = seats
                     .iter()
@@ -467,9 +488,8 @@ impl Assaults {
                             .iter()
                             .find(|m| m.seat == seat)
                             .and_then(|m| m.weapon.hint);
-                        let (near, far) = hint.map_or((0.0, gunner_aim::NO_HINT_RANGE), |h| {
-                            (h.min_range, h.range)
-                        });
+                        let (near, far) = hint
+                            .map_or((0.0, gunner_aim::NO_HINT_RANGE), |h| (h.min_range, h.range));
                         match car.at.distance(foe) {
                             d if d > far => Report::TooFar,
                             d if d < near => Report::TooNear,
@@ -1206,6 +1226,16 @@ fn behind_chance(standing: Standing) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_assault_ends_with_its_foe_and_the_vehicle_goes_back_to_its_path() {
+        let mut assaults = Assaults::default();
+        assaults.out.insert(3, Assault::default());
+        assert!(assaults.holds(3));
+        let mut physics = Physics::new();
+        assaults.drive(&mut physics, &mut [], &[], |_| Vec::new(), 0.1);
+        assert!(!assaults.holds(3));
+    }
     // Cars come in only for her in a tank, by a road or driving, tanks
     // only for her in a tank or driving; each kind's gate shuts for 5
     // whole seconds after one of it is sent.
