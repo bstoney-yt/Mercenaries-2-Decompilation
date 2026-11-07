@@ -5644,6 +5644,34 @@ impl Combat {
     /// human, and her 0.15 camera shake.
     fn npc_melee(&mut self, f: &mut Field<'_>, i: usize) {
         let n = &f.people.npcs[i];
+        // Going for another army, he strikes the enemy his blow reaches,
+        // by their own row for a `MeleeBash`, not to her account (the same
+        // boxes as hers, inferred).
+        if n.foe_at.is_some() {
+            let (from, facing, by) = (n.character.position, n.facing, n.shooter);
+            let melee = Some(m2_assets::name_hash("MeleeBash"));
+            let struck = (0..f.people.npcs.len()).find(|&j| {
+                let o = &f.people.npcs[j];
+                let p = &o.character;
+                j != i
+                    && o.alive
+                    && f.people.enemies(i, j)
+                    && [&m2_engine::melee::HIGH, &m2_engine::melee::LOW]
+                        .iter()
+                        .any(|b| {
+                            m2_engine::melee::reaches(
+                                b, from, facing, p.position, p.radius, p.height,
+                            )
+                        })
+            });
+            if let Some(j) = struck {
+                let taken = self.on_person(&f.people.npcs[j], melee);
+                let killed = f.people.npcs[j].shot_by_army(taken, Vec3::ZERO, by);
+                f.people.war_tally.1 += 1;
+                f.people.war_tally.2 += u32::from(killed);
+            }
+            return;
+        }
         if f.player.driving.is_some() || !n.alive {
             return;
         }
