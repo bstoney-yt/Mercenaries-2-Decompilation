@@ -458,9 +458,21 @@ const MG_RANGE: f32 = 500.0;
 /// How far gunners riding with her shoot when their weapon gives no
 /// `WeaponHint` range, metres (invented).
 const GUNNER_RANGE: f32 = 120.0;
-/// Gunfire puts soldiers this close on alert and sends civilians running.
-const ALERT_RANGE: f32 = 60.0;
+/// Gunfire puts soldiers this close on alert. From the 360 code: each shot
+/// a gun fires posts its message (0x2C49ADC9, 0x82283A10), and every mind
+/// hears it as loud as 30 / (d + 30), d its distance from the shot's line
+/// (0x822FA410, 0x822EBDB8); under 0.2 it hears nothing, so up to 120 m,
+/// whatever its `Hearing`. Here d is from where the shot was fired, which is
+/// never nearer than its line (the line isn't ported).
+const ALERT_RANGE: f32 = 120.0;
+/// Gunfire sends civilians this close running (invented).
 const PANIC_RANGE: f32 = 40.0;
+/// A shot's loudness to a mind (0x822FA410), for [`ALERT_RANGE`].
+#[cfg(test)]
+fn shot_loudness(d: f32) -> f32 {
+    let l = 30.0 / (d + 30.0);
+    if l <= 0.2 { 0.0 } else { l }
+}
 /// A soldier's hit on her when his template names no gun (the AK47
 /// stands in; the rest hit as their own gun's round does,
 /// [`Combat::npc_round`]): the "Assault Rifle Bullet" template's Damage
@@ -5549,7 +5561,7 @@ impl Combat {
         if killed {
             self.remarks.push(Remark::Kill);
         }
-        alarm(f.people, at);
+        alarm_within(f.people, at, BLAST_AUDIBILITY);
     }
 
     /// A blast's fire, smoke and sound, `size` times a grenade's.
@@ -5820,7 +5832,7 @@ impl Combat {
         if killed {
             self.remarks.push(Remark::Kill);
         }
-        alarm(f.people, at);
+        alarm_within(f.people, at, BLAST_AUDIBILITY);
     }
 
     /// The satellite-guided bomb landing at `at` ([`BOMB`]): a great
@@ -5889,7 +5901,7 @@ impl Combat {
             let ground = ground_under(f.physics, spot).unwrap_or(spot);
             self.fires.push((ground + Vec3::Y * 1.2, 2.5, burn, 0.0));
         }
-        alarm(f.people, at);
+        alarm_within(f.people, at, BLAST_AUDIBILITY);
     }
 
     /// An air strike's blast at `at`, as its explosion template has it:
@@ -5946,7 +5958,7 @@ impl Combat {
                 2.0 + size * 0.2,
             );
         }
-        alarm(f.people, at);
+        alarm_within(f.people, at, BLAST_AUDIBILITY);
     }
 
     /// Harm a blast's frag (template `template`) does around `at`,
@@ -6214,7 +6226,27 @@ fn alarm(people: &mut People, at: Vec3) {
             continue;
         }
         let d = n.character.position.distance(at);
-        if n.soldier && !n.ai.flags.pacifist && d < ALERT_RANGE * n.ai.hearing {
+        if n.soldier && !n.ai.flags.pacifist && d < ALERT_RANGE {
+            n.alert = true;
+        }
+        if !n.soldier && d < PANIC_RANGE {
+            n.panic(at);
+        }
+    }
+}
+
+/// A blast's `Audibility`: the `Explosion` template's (from samples; most
+/// of the explosions' templates have it).
+const BLAST_AUDIBILITY: f32 = 100.0;
+
+/// As [`alarm`], heard as far as `audibility` times a soldier's `Hearing`.
+fn alarm_within(people: &mut People, at: Vec3, audibility: f32) {
+    for n in &mut people.npcs {
+        if !n.alive {
+            continue;
+        }
+        let d = n.character.position.distance(at);
+        if n.soldier && !n.ai.flags.pacifist && d < audibility * n.ai.hearing {
             n.alert = true;
         }
         if !n.soldier && d < PANIC_RANGE {
@@ -7860,6 +7892,13 @@ mod tests {
         assert_eq!(combat.grenades, 0);
         assert_eq!(combat.weapon, Weapon::Rifle);
         assert!(combat.second.is_none());
+    }
+
+    #[test]
+    fn a_shot_is_heard_out_to_120_m() {
+        assert!((shot_loudness(0.0) - 1.0).abs() < 1e-6);
+        assert!(shot_loudness(119.0) > 0.0);
+        assert_eq!(shot_loudness(121.0), 0.0);
     }
 
     #[test]
