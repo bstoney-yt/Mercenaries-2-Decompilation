@@ -53,6 +53,43 @@ const FLAGS: [(&str, Switch); 10] = [
     ("Pacifist", |f| &mut f.pacifist),
 ];
 
+/// How one template regards another: the `Relationship` records, each
+/// on the template regarding, as `(its name, the other's name, -100 to
+/// 100)`. The 360 reads these first where `Ai.SetRelation` has written
+/// none (table 0x83653928, read by 0x822F02C0). Those between armies are
+/// on the faction templates (`VZ` of `Allied`: -100).
+pub fn relations(db: &Layer<'_>) -> Vec<(String, String, f32)> {
+    let Some(c) = db.component("Relationship") else {
+        return Vec::new();
+    };
+    let field = |hash: u32| {
+        c.fields
+            .iter()
+            .find(|f| f.name_hash == hash)
+            .map(|f| usize::from(f.offset))
+    };
+    // The fields `Relationship` holds: the other template, and how it's
+    // regarded (from samples; their names aren't known).
+    let (Some(other), Some(value)) = (field(0x5470_4554), field(0x321f_edc3)) else {
+        return Vec::new();
+    };
+    let names = db.names();
+    let word = |r: &[u8], at: usize| {
+        r.get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let mut out = Vec::new();
+    for (id, r) in c.records().unwrap_or_default() {
+        let (Some(o), Some(v)) = (word(r, other), word(r, value)) else {
+            continue;
+        };
+        if let (Some(a), Some(b)) = (names.get(&id), names.get(&o)) {
+            out.push(((*a).to_owned(), (*b).to_owned(), f32::from_bits(v)));
+        }
+    }
+    out
+}
+
 /// What a person template says of how they fight.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AiProfile {
@@ -76,6 +113,10 @@ pub struct AiProfile {
     /// vehicles 1.25, helicopters 1.5), and how wide they look, degrees
     /// (people 180, vehicles and helicopters 360).
     pub vision: f32,
+    /// `Stimulus` `Visibility`: from how far, metres, those with `Vision`
+    /// 1 can see this one (100 where a template has none, as the 360's
+    /// default; 0x822E89B0).
+    pub visibility: f32,
     pub hearing: f32,
     pub vision_fov: f32,
     pub flags: AiFlags,
@@ -104,6 +145,7 @@ impl Default for AiProfile {
             sprint_speed: 1.0,
             skill: 60.0,
             vision: 1.0,
+            visibility: 100.0,
             hearing: 1.0,
             vision_fov: 180.0,
             flags: AiFlags::default(),
@@ -130,6 +172,7 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, AiProfile> {
     let behaviour = Table::new(db, "AiBehavior");
     let skill = Table::new(db, "AiSkill");
     let perception = Table::new(db, "Perception");
+    let stimulus = Table::new(db, "Stimulus");
     let health = Table::new(db, "Health");
     let equipment = Table::new(db, "EquipmentLink");
     let modifier = Table::new(db, "ModifierKey");
@@ -173,6 +216,7 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, AiProfile> {
                 sprint_speed: get(&ai, "SprintSpeed", d.sprint_speed),
                 skill: skill_points.unwrap_or(d.skill),
                 vision: get(&perception, "Vision", d.vision),
+                visibility: get(&stimulus, "Visibility", d.visibility),
                 hearing: get(&perception, "Hearing", d.hearing),
                 vision_fov: get(&perception, "VisionFOV", d.vision_fov),
                 flags: behaviour

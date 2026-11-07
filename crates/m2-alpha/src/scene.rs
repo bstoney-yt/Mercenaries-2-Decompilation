@@ -1777,6 +1777,18 @@ pub fn death_pickups(
 }
 
 impl ParkedVehicle {
+    /// The army it is of, by its crew; an empty one is nobody's. Not a
+    /// helicopter: those crewed here sit waiting for the scripts (extraction
+    /// and transport lists), and what fights in the air is the pilots' own.
+    pub fn army(&self) -> Option<&'static str> {
+        if self.spec.is_helicopter() {
+            return None;
+        }
+        self.crew
+            .iter()
+            .find_map(|(a, b)| crate::npc::faction_of(a).or_else(|| crate::npc::faction_of(b)))
+    }
+
     /// Whether its exhausts are going: it has a driver (`driven`: her) and
     /// is no wreck (from the 360 code, 0x822772B0).
     pub fn exhausting(&self, driven: bool) -> bool {
