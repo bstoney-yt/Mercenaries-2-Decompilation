@@ -5865,18 +5865,23 @@ impl Physics {
     /// above to 1000 m below): where, and the body whose top it is when not
     /// the terrain.
     pub fn path_ground(&self, at: Vec3, skip: Option<VehicleId>) -> Option<(Vec3, Option<u64>)> {
-        let top = at + Vec3::Y * 2.0;
-        let ray = r::Ray::new(vector(top), vector(Vec3::NEG_Y));
-        let (handle, toi) = self.skipping_past(skip, true, &[], |filter| {
-            self.world
-                .query_pipeline_with_filter(filter)
-                .cast_ray(&ray, 1002.0, true)
-        })?;
+        let cast = |top: Vec3| {
+            let ray = r::Ray::new(vector(top), vector(Vec3::NEG_Y));
+            self.skipping_past(skip, true, &[], |filter| {
+                self.world
+                    .query_pipeline_with_filter(filter)
+                    .cast_ray(&ray, 1002.0, true)
+            })
+            .map(|(handle, toi)| (handle, top - Vec3::Y * toi))
+        };
+        // 0x822E4120: from 2 m above, then, for a point under the ground,
+        // from 502 m above.
+        let (handle, hit) = cast(at + Vec3::Y * 2.0).or_else(|| cast(at + Vec3::Y * 502.0))?;
         let body = self
             .body_obstacle(handle)
             .filter(|o| !o.ground)
             .map(|o| o.id);
-        Some((top - Vec3::Y * toi, body))
+        Some((hit, body))
     }
 
     /// The first solid thing along a ray, passing through vehicle `skip`:
