@@ -4066,6 +4066,9 @@ fn mission_for_screenshot(
     let (mut extraction, mut extraction_tap, mut extraction_seen) = (0u8, false, 0.0f32);
     let (mut locked_was, mut locked_for) = (false, 0.0f32);
     let mut on_contract: Option<(String, i64)> = None;
+    // The contract she last failed, until she is on one again: its giver's
+    // HQ door is the way in she takes to take it again.
+    let mut failed_contract: Option<String> = None;
     // Message box calls with a callback, while the game's HUD isn't
     // running: when each is due back, by call number; the last seen.
     let (mut boxed, mut boxed_seen): (Vec<(f32, u64)>, u64) = (Vec::new(), 0);
@@ -4079,6 +4082,9 @@ fn mission_for_screenshot(
                         i as f32 * tick,
                         contract
                     );
+                    if contract.is_some() {
+                        failed_contract = None;
+                    }
                     on_contract = contract;
                 }
                 a.sights = link.sight_targets(game);
@@ -4155,7 +4161,7 @@ fn mission_for_screenshot(
                 a.offers = link.offers(game);
                 a.in_hq = link.in_hq();
                 a.exits = link.exit_offers();
-                a.enters = link.enter_offers();
+                a.enters = link.enter_offers_for(failed_contract.as_deref());
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)
             }
@@ -5344,6 +5350,7 @@ fn mission_for_screenshot(
         // doesn't do yet.
         if auto.is_some() && link.contracts_cancelled() > cancels_seen {
             cancels_seen = link.contracts_cancelled();
+            failed_contract = on_contract.as_ref().map(|(c, _)| c.clone());
             continue_due = Some(i + (3.0 / tick).round() as u32);
             eprintln!(
                 "autoplay: contract cancelled ({cancels_seen} so far) after {:.1} s of play",

@@ -1744,6 +1744,33 @@ impl MissionLink {
             .collect()
     }
 
+    /// [`Self::enter_offers`], only the ways into the HQ of contract
+    /// `contract`'s giver (by the HQ door's name, `Starter_Pir1_Entrance`
+    /// for a `PirCon`), where any of those is on offer; else all.
+    pub fn enter_offers_for(&self, contract: Option<&str>) -> Vec<crate::autoplay::ActionAt> {
+        let all = self.enter_offers();
+        let (Some(c), State::Running(mission)) = (contract, &self.state) else {
+            return all;
+        };
+        let Some(giver) = c
+            .get(..3)
+            .map(|p| format!("starter_{}", p.to_ascii_lowercase()))
+        else {
+            return all;
+        };
+        let w = mission.world().borrow();
+        let own: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|(g, _, _)| {
+                w.objects
+                    .get(g)
+                    .is_some_and(|o| o.name.to_ascii_lowercase().starts_with(&giver))
+            })
+            .collect();
+        if own.is_empty() { all } else { own }
+    }
+
     /// The starters' talks on offer (the context actions whose prompt is
     /// [`TALK_PROMPT`]): each one's object and where it stands, a person
     /// where one is that object, else its place.
