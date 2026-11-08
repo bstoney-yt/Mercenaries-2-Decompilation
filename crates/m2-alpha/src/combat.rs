@@ -3573,6 +3573,7 @@ impl Combat {
             let end = hit.map_or(from + dir * (distance + 2.0), |h| from + dir * h.0);
             self.effect(Effect::Tracer { from, to: end }, 0.07);
             if k == 0 {
+                f.people.heard_shot(i, from, ALERT_RANGE);
                 self.gun_fired(feel, (from, case), dir, RIFLE_FLASH, Some(shooter));
                 f.people.npcs[i].rig.fired();
             }
