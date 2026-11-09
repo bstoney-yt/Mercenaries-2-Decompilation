@@ -121,11 +121,12 @@ pub trait AttackWorld {
     /// The line from `from` to `to` is clear (0x82166958's sweep).
     fn line_clear(&mut self, from: Vec3, to: Vec3) -> bool;
     /// Where to steer for, going from `from` to `goal` by its way
-    /// (0x822BF7A8 asks for one, [`crate::path_search`]); straight at it
-    /// unless the world finds one.
-    fn toward(&mut self, from: Vec3, goal: Vec3) -> Vec3 {
+    /// (0x822BF7A8 asks for one, [`crate::path_search`]); `None` when the
+    /// search found no way (0x822BF1C0 sets the mind's +0x18 bit 0x10).
+    /// Straight at it unless the world says otherwise.
+    fn toward(&mut self, from: Vec3, goal: Vec3) -> Option<Vec3> {
         let _ = from;
-        goal
+        Some(goal)
     }
     /// Room to move ahead (`forward`) or back: 0x822C8CB8's face of its
     /// box, `lift` m up, swept `reach` m on from its nose or tail; clear
@@ -433,9 +434,12 @@ impl CarAttack {
             if flat.length_squared() <= 16.0 {
                 self.way = None;
                 self.timer = (world.rand() + 1.0) * 3.0;
-            } else {
-                let to = world.toward(car.at, end);
+            } else if let Some(to) = world.toward(car.at, end) {
                 return driver.drive_to(car, to, 10.0, false, dt);
+            } else {
+                // No way: given up as a way done (0x822ACB28 reads the
+                // failed bit with the way's end).
+                self.way = None;
             }
         }
         out.unwrap_or_else(|| car_driver::slow_to_stop(car).unwrap_or_default())
