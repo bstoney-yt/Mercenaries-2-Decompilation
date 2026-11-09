@@ -235,6 +235,11 @@ pub struct Game {
     pub ride: Option<(usize, u32)>,
     /// Her getting in or out by the clips, under way ([`crate::boarding`]).
     pub boarding: Option<crate::boarding::Boarding>,
+    /// Got in by a boarding entrance (`EntranceParameters` `bBoarding`, a
+    /// boat's from the water): the vehicle, and the seat it gave her,
+    /// which she is put out of onto the deck once in
+    /// ([`crate::ride::boards_onto_deck`]).
+    pub onto_deck: Option<(usize, Option<u32>)>,
     /// The field of view (degrees, bottom to top) and the screen's width
     /// over its height the last frame was drawn with: what the scripts'
     /// camera sees (`Event.ObjectIsVisible`).
@@ -491,6 +496,7 @@ impl Game {
             climb: None,
             ride: None,
             boarding: None,
+            onto_deck: None,
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
             context: None,
@@ -1074,6 +1080,26 @@ impl Game {
                         self.ride = None;
                     }
                 }
+                // In by a boarding entrance and seated (her clips done): the
+                // 360 puts her straight back out of that seat by its exit
+                // (0x822A0C30 -> 0x822A1280), onto the boat's deck, where
+                // she walks to the wheel (the sweep's GurCon003 climbed
+                // into the Piranha from the water and sat as a passenger).
+                if let Some((i, seat)) = self.onto_deck
+                    && self.boarding.is_none()
+                {
+                    self.onto_deck = None;
+                    if player.driving == Some(i)
+                        && let Some(v) = scene.vehicles.get(i)
+                    {
+                        eprintln!(
+                            "boarding: aboard the {} by a boarding entrance: out onto the deck",
+                            v.spec.label
+                        );
+                        get_out(physics, v, seat, player);
+                        self.ride = None;
+                    }
+                }
                 // Out of the vehicle the use key seated her in, or in
                 // another one, her seat is forgotten.
                 if self.ride.is_some_and(|(i, _)| player.driving != Some(i)) {
@@ -1373,6 +1399,11 @@ impl Game {
                                 }
                                 self.ride = b.seat.map(|s| (*i, s));
                                 let v = &scene.vehicles[*i];
+                                self.onto_deck = crate::ride::boards_onto_deck(
+                                    crate::ride::Ride::of(v),
+                                    *entrance,
+                                )
+                                .then_some((*i, b.seat));
                                 self.combat.seat = crate::ride::armed_index(
                                     crate::ride::Ride::of(v),
                                     b.seat,
