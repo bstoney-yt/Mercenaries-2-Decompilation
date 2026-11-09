@@ -3582,7 +3582,10 @@ impl People {
                 Some(w) => {
                     let c = all.iter().find(|c| c.0 == w);
                     n.foe_at = c.map(|c| c.2);
-                    n.foe_armour = (w >= VEHICLES && w != HER)
+                    // A vehicle by its record, not its number: people's numbers
+                    // are hashes and may lie above [`VEHICLES`] too.
+                    let vehicle = c.is_some_and(|c| matches!(c.4, Arms::Vehicle(_)));
+                    n.foe_armour = vehicle
                         .then(|| self.vehicle_subjects.get((w - VEHICLES) as usize))
                         .flatten()
                         .map(|v| v.armour);
@@ -3593,7 +3596,7 @@ impl People {
                         n.last_seen = n.foe_at;
                         if let Some(c) = c {
                             let d = c.2.distance(at);
-                            let what = if w >= VEHICLES { "vehicle" } else { "soldier" };
+                            let what = if vehicle { "vehicle" } else { "soldier" };
                             eprintln!(
                                 "war: a {side} soldier goes for a {} {what} at {d:.0} m",
                                 c.1
