@@ -4034,14 +4034,15 @@ fn mission_for_screenshot(
     // how many others' within earshot.
     let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
     let mut strike_seen: Option<u32> = None;
-    // With --hijack, the hijacks run as in the game, and she hijacks the
+    // With --hijack, or --autoplay (their host also seats the HQ's desk
+    // starters: story run r1104's PmcCon001 and OilCon021 stood idle
+    // without it), the hijacks run as in the game, and she hijacks the
     // vehicle an objective's "action" marker is on (PmcCon001's villa
     // tank): once the marker has been up HIJACK_WAIT (the tank comes
     // through the wall first), she is put beside it ([`hijack::beside`]),
     // presses the use key a second later and answers its prompts at once
     // ([`hijack::Autopad`]). For testing.
-    let mut hijacks = options
-        .hijack
+    let mut hijacks = (options.hijack || options.autoplay)
         .then(|| hijack::Hijacks::start(install, options.hijack_crew.clone()));
     let mut hijack_input = Input::default();
     let mut hijack_pad = hijack::Autopad::default();
