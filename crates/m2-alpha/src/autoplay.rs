@@ -2344,7 +2344,11 @@ impl Autoplay {
             // crew aboard come into play under its guid (PmcCon003's
             // AMX30s: round 8 aimed at a tank's commander inside it,
             // with never a clear shot, for 1900 s).
-            let a_vehicle = vehicles.iter().any(|v| v.guid == Some(m.target));
+            // So is a building that sends out its people under its own
+            // guid (the contract sweep's GurCon002: she shot its garrison
+            // for 1,800 s and the building stood).
+            let a_vehicle = vehicles.iter().any(|v| v.guid == Some(m.target))
+                || game.scene.props.get(m.target).is_some();
             if !a_vehicle
                 && let Some(i) = npcs
                     .iter()
@@ -4372,7 +4376,17 @@ impl Autoplay {
                 ..
             } => {
                 let to = Vec2::new(at.x, at.z) - view;
-                if to.length() < ON_SPOT {
+                if d > crate::support::VIEW_REACH - ON_SPOT {
+                    // Past the view's reach of her (the target changed
+                    // under an open view: the contract sweep's ChiCon001
+                    // held one 119 m from the next building for 24
+                    // minutes): shut it, and she goes nearer.
+                    eprintln!(
+                        "autoplay {:.1} s: support: the target is {d:.0} m off, past the view's reach: shutting it",
+                        self.clock
+                    );
+                    intent.trigger.support = true;
+                } else if to.length() < ON_SPOT {
                     intent.trigger.fire = self.tap();
                 } else {
                     // Screen right is the world's -x, looking down.
@@ -4408,7 +4422,18 @@ impl Autoplay {
                         vantage(&w.physics, at, here, &self.tried, &LASER_RINGS, LASER_SHORT)
                     });
                     self.laser_since = self.clock;
+                    // Nowhere left to see it from (the contract sweep's
+                    // AllCon001 stood 1,000 s lasing beside a plane's
+                    // wreck): after that many it is lased as it stands.
+                    if self.laser_spot.is_none() {
+                        self.laser_failed += 1;
+                        eprintln!(
+                            "autoplay {:.1} s: no spot left to lase it from ({} of {LASER_TRIES})",
+                            self.clock, self.laser_failed
+                        );
+                    }
                 }
+                let lands = lands || self.laser_failed >= LASER_TRIES;
                 if !lands
                     && let Some(spot) = self.laser_spot
                     && spot.with_y(0.0).distance(here.with_y(0.0)) > ARRIVE
