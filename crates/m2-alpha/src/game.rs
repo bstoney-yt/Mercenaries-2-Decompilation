@@ -1092,24 +1092,24 @@ impl Game {
                     if player.driving == Some(i)
                         && let Some(v) = scene.vehicles.get(i)
                     {
-                        // By the seat's exit clip (the 360's exit kind for
-                        // a boarding entrance is `Animated`, 0x822A2B60),
-                        // which ends where she stands.
-                        let exit = crate::ride::exit_entrance(crate::ride::Ride::of(v), seat);
+                        // Where she sits: 0x822A0C30 calls 0x822A1280 with
+                        // its second argument 0, which skips putting her at
+                        // the exit entrance (0x823F8370 -> 0x823F8178), so
+                        // she stands up where the seat is (the Piranha's
+                        // boarding seats are on its deck, 0.9 m up; their
+                        // exits are by the water).
+                        let place = seat_place(physics, v, seat);
                         eprintln!(
-                            "boarding: aboard the {} by a boarding entrance: out by its exit {exit:08x?}",
+                            "boarding: aboard the {} by a boarding entrance: up out of the seat at {place:.2?}",
                             v.spec.label
                         );
-                        match exit {
-                            Some(e) => {
-                                self.boarding =
-                                    Some(crate::boarding::Boarding::exit(i, seat, Some(e)));
+                        match place {
+                            Some((at, facing)) => {
+                                get_out_at(physics, v, seat, player, at, facing);
                             }
-                            None => {
-                                get_out(physics, v, seat, player);
-                                self.ride = None;
-                            }
+                            None => get_out(physics, v, seat, player),
                         }
+                        self.ride = None;
                     }
                 }
                 // Out of the vehicle the use key seated her in, or in
@@ -5186,6 +5186,22 @@ fn animated_exit(physics: &Physics, v: &ParkedVehicle, seat: Option<u32>) -> Opt
         .and_then(|n| seating.seat(n))
         .or_else(|| seating.driver());
     Some(index.and_then(|i| seating.exit_of(i)).map(|e| e.name))
+}
+
+/// Where seat `seat` (`SeatLink` name) of `v` is, world space, and the
+/// way the vehicle faces (yaw): its `SeatLink` hardpoint node.
+fn seat_place(physics: &Physics, v: &ParkedVehicle, seat: Option<u32>) -> Option<(Vec3, f32)> {
+    let s = v.spec.seating.as_deref()?;
+    let hardpoint = s.seats[s.seat(seat?)?].hardpoint?;
+    let node = v.spec.node_names.iter().position(|&n| n == hardpoint)?;
+    let local = v
+        .spec
+        .node_place(node, v.turret, &v.aims)?
+        .w_axis
+        .truncate();
+    let at = physics.vehicle_transform(v.id?)?;
+    let ahead = at.transform_vector3(Vec3::Z);
+    Some((at.transform_point3(local), ahead.x.atan2(ahead.z)))
 }
 
 /// Gets her out of `v` at the end of her exit clips: as [`get_out`],
