@@ -1092,12 +1092,24 @@ impl Game {
                     if player.driving == Some(i)
                         && let Some(v) = scene.vehicles.get(i)
                     {
+                        // By the seat's exit clip (the 360's exit kind for
+                        // a boarding entrance is `Animated`, 0x822A2B60),
+                        // which ends where she stands.
+                        let exit = crate::ride::exit_entrance(crate::ride::Ride::of(v), seat);
                         eprintln!(
-                            "boarding: aboard the {} by a boarding entrance: out onto the deck",
+                            "boarding: aboard the {} by a boarding entrance: out by its exit {exit:08x?}",
                             v.spec.label
                         );
-                        get_out(physics, v, seat, player);
-                        self.ride = None;
+                        match exit {
+                            Some(e) => {
+                                self.boarding =
+                                    Some(crate::boarding::Boarding::exit(i, seat, Some(e)));
+                            }
+                            None => {
+                                get_out(physics, v, seat, player);
+                                self.ride = None;
+                            }
+                        }
                     }
                 }
                 // Out of the vehicle the use key seated her in, or in
