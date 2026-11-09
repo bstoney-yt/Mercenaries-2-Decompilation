@@ -8408,13 +8408,13 @@ mod tests {
     /// chassis's shape 0.38 m up: how far it slid over the last 10 s, and
     /// how many of its six track points touch at the end.
     fn parked_tank_on_a_slope(shape_floor: Option<f32>) -> (f32, usize) {
-        let (slid, touching, _) = parked_tank(shape_floor, 20.0);
+        let (slid, touching, _) = parked_tank(shape_floor, 20.0, false);
         (slid, touching)
     }
 
     /// [`parked_tank_on_a_slope`] on a slope of `degrees`, with how far it
     /// sank over the last 10 s and whether it ends asleep.
-    fn parked_tank(shape_floor: Option<f32>, degrees: f32) -> (f32, usize, (f32, bool)) {
+    fn parked_tank(shape_floor: Option<f32>, degrees: f32, turret: bool) -> (f32, usize, (f32, bool)) {
         use crate::vehicle::WheelSpec;
         let mut spec = tank();
         spec.wheels = [-2.3f32, 0.0, 2.3]
@@ -8459,6 +8459,15 @@ mod tests {
             })
             .unwrap_or_default()
             .into();
+        if turret {
+            spec.turret_shapes = vec![box_points(Vec3::new(-1.0, 1.6, -1.0), Vec3::new(1.0, 2.4, 1.0))].into();
+            spec.turret_mass = Some(crate::vehicle::Chassis {
+                mass: 3000.0,
+                inertia: Mat3::from_diagonal(Vec3::new(2000.0, 2500.0, 1000.0)),
+                centre_of_mass: Vec3::new(0.0, 2.0, 0.0),
+            });
+            spec.pivot = Some(Vec3::new(0.0, 2.0, 0.0));
+        }
         let mut p = Physics::new();
         let tilt = Quat::from_rotation_x(-degrees.to_radians());
         let half = 200.0;
@@ -8499,7 +8508,7 @@ mod tests {
         // and stays where it stood. Put to sleep on its own (rapier's
         // `RigidBody::sleep`) its tracks stopped while rapier still moved
         // it, and it sank through the ground (PmcCon001's villa tank).
-        let (slid, touching, (sank, asleep)) = parked_tank(Some(0.38), 0.0);
+        let (slid, touching, (sank, asleep)) = parked_tank(Some(0.38), 0.0, true);
         assert!(asleep, "awake");
         assert!(sank.abs() < 0.05, "sank {sank} m");
         assert!(slid < 0.05, "slid {slid} m");
