@@ -1190,13 +1190,15 @@ impl Autoplay {
                 || (f.y - here.y).abs() > UNDER_BY * 3.0
         });
         self.left_behind = if behind { self.left_behind + dt } else { 0.0 };
-        if self.left_behind > LEFT_FOR
-            && game
-                .scene
-                .player
-                .as_ref()
-                .is_some_and(|p| p.driving.is_none())
-        {
+        // Driving, once she has stopped: they get in by her (the contract
+        // sweep's ChiCon001 drove the VIP's drop-off in a tank, the VIP
+        // left 750 m back, and sat at it 1,100 s).
+        let stopped = match game.scene.player.as_ref().map(|p| p.driving) {
+            Some(None) => true,
+            Some(Some(i)) => vehicle_state(game, i).is_some_and(|s| s.1 < 1.0),
+            None => false,
+        };
+        if self.left_behind > LEFT_FOR && stopped {
             self.left_behind = 0.0;
             let n = game.scene.people.bring_followers(here);
             eprintln!(
@@ -2056,9 +2058,14 @@ impl Autoplay {
             && marks
                 .iter()
                 .any(|m| m.kind == "action" && self.tagged.contains(&m.target))
-            && self
+            // Kept at while its smoke is in her hand: thrown, not left
+            // (the contract sweep's JetCon001 called it in five times,
+            // never threw the smoke, and the scripts took it back).
+            && (self
                 .delivered
                 .is_none_or(|t| self.clock - t > DELIVERY_AGAIN)
+                || game.combat.to_throw
+                || game.support.phase != Phase::Idle)
             && let Some(key) = game.support.entries().into_iter().find_map(|e| match e {
                 Entry::Stocked(s) if s.key == "MunitionsPickup" => Some(s.key.clone()),
                 _ => None,
