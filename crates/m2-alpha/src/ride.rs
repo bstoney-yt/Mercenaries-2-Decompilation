@@ -150,6 +150,37 @@ pub fn board(
     Some(b)
 }
 
+/// Whether getting into `ride` by `entrance` only puts her aboard: the
+/// entrance's `EntranceParameters` `bBoarding` (bit 30 of the record's
+/// +0x18 flags, read at 0x823F1CA0). From the 360 code: once she is
+/// seated by one (0x822A0C30), 0x822A0760 answers so and she is put
+/// straight back out of the seat by its exit (0x822A1280, the seat's
+/// first `CanExit` entrance, 0x8229C190), and the vehicle's entered
+/// broadcast is skipped (0x822A0958). The Piranha's water entrances
+/// (`7d95b1fe`, `1de04f90`) are such: they give its boarding seats
+/// (`Vehicle Seat (Boarding) (ML)`/`(MR)`), out onto its deck.
+pub fn boards_onto_deck(ride: Ride<'_>, entrance: Option<u32>) -> bool {
+    entrance
+        .and_then(|e| ride.seating?.entrance(e))
+        .is_some_and(|e| e.params.boarding)
+}
+
+/// The entrance seat `seat` (`None`: the driver's) is got out of by: its
+/// first `EntranceToSeat` row with `CanExit` naming one of the vehicle's
+/// entrances (0x8229C190).
+pub fn exit_entrance(ride: Ride<'_>, seat: Option<u32>) -> Option<u32> {
+    let s = ride.seating?;
+    let i = match seat {
+        Some(n) => s.seat(n)?,
+        None => s.driver()?,
+    };
+    s.seats[i]
+        .rows
+        .iter()
+        .find(|r| r.can_exit && s.entrance(r.link_name).is_some())
+        .map(|r| r.link_name)
+}
+
 /// Puts the riders of `seats` out of `crew` (`None`: any driver's seat;
 /// the crew forgets them: playtest 4, no car could be taken from traffic).
 /// The templates of those put out.
@@ -275,6 +306,20 @@ mod tests {
             crew: riders,
         };
         board(ride, Some(name_hash(e)), true, &hostile_vz())
+    }
+
+    // Only a `bBoarding` entrance puts her aboard to be put out on deck.
+    #[test]
+    fn a_boarding_entrance_puts_her_aboard_not_in_its_seat() {
+        let mut s = m151();
+        s.entrances[1].params.boarding = true;
+        let ride = Ride {
+            seating: Some(&s),
+            crew: &[],
+        };
+        assert!(boards_onto_deck(ride, Some(name_hash("entrance_gunner"))));
+        assert!(!boards_onto_deck(ride, Some(name_hash("entrance_driver"))));
+        assert!(!boards_onto_deck(ride, None));
     }
 
     #[test]
