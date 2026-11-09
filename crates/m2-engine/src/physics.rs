@@ -2089,6 +2089,31 @@ impl Rest {
     }
 }
 
+/// Lets a tank's body sleep, when [`Rest`] finds it still, the way Havok
+/// sleeps a body: with its whole island (0x8264ABF8 deactivates an island
+/// only once none of its bodies is moving, 0x824D0C88), so a body joined
+/// to one still moving, or touched by one, stays awake. Rapier's own
+/// island sleep does that; `still` lets it sleep this body at the end of
+/// the step (no speed or time of rapier's own stands in for [`Rest`]'s
+/// check), otherwise it never does. A body put to sleep alone
+/// (`RigidBody::sleep`) is still moved by rapier but no longer by its
+/// tracks, and sinks.
+fn rest_hand_off(body: &mut r::RigidBody, still: bool) {
+    let (threshold, after) = if still {
+        (f32::MAX, 0.0)
+    } else {
+        (-1.0, r::RigidBodyActivation::default_time_until_sleep())
+    };
+    // Only touched when it changes: each touch tells rapier its sleep
+    // changed.
+    if body.activation().normalized_linear_threshold != threshold {
+        let a = body.activation_mut();
+        a.normalized_linear_threshold = threshold;
+        a.angular_threshold = threshold;
+        a.time_until_sleep = after;
+    }
+}
+
 /// Where one track point meets the ground (world): the hit, the ground's
 /// normal there, and where its ray starts (its hardpoint, its spring's
 /// squeeze up its hull).
@@ -3105,17 +3130,23 @@ impl Physics {
                 && let Some(b) = w.bodies.get_mut(v.controller.chassis)
             {
                 if b.is_sleeping() {
+                    // Asleep with its island: it stays so until something
+                    // wakes the island (no sleep of rapier's own after).
                     tank.rest.asleep = true;
+                    rest_hand_off(b, false);
                     continue;
                 }
                 if tank.rest.asleep {
                     tank.rest.wake();
                 }
-                if !v.wrecked && tank.rest.step(vec3(b.center_of_mass()), dt) {
-                    b.sleep();
-                    tank.rest.asleep = true;
-                    continue;
-                }
+                // Still long enough: its island may sleep at the end of
+                // this step, if every body in it may (its turret and
+                // gun on their joints, anything resting on it). Its body
+                // is never put to sleep alone: rapier would go on moving
+                // it (gravity) while its tracks no longer hold it up
+                // (PmcCon001: the villa tank fell through the HQ's floor).
+                let still = !v.wrecked && tank.rest.step(vec3(b.center_of_mass()), dt);
+                rest_hand_off(b, still);
             }
             let filter = ground().exclude_rigid_body(v.controller.chassis);
             let queries = w.broad_phase.as_query_pipeline_mut(
@@ -4820,6 +4851,15 @@ impl Physics {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether a vehicle's body is asleep (a tank keeping still, [`Rest`]).
+    pub fn vehicle_asleep(&self, id: VehicleId) -> bool {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| self.world.bodies.get(v.controller.chassis))
+            .is_some_and(|b| b.is_sleeping())
     }
 
     /// How many of a vehicle's wheels touch the ground, of how many.
@@ -8368,6 +8408,13 @@ mod tests {
     /// chassis's shape 0.38 m up: how far it slid over the last 10 s, and
     /// how many of its six track points touch at the end.
     fn parked_tank_on_a_slope(shape_floor: Option<f32>) -> (f32, usize) {
+        let (slid, touching, _) = parked_tank(shape_floor, 20.0);
+        (slid, touching)
+    }
+
+    /// [`parked_tank_on_a_slope`] on a slope of `degrees`, with how far it
+    /// sank over the last 10 s and whether it ends asleep.
+    fn parked_tank(shape_floor: Option<f32>, degrees: f32) -> (f32, usize, (f32, bool)) {
         use crate::vehicle::WheelSpec;
         let mut spec = tank();
         spec.wheels = [-2.3f32, 0.0, 2.3]
@@ -8413,7 +8460,7 @@ mod tests {
             .unwrap_or_default()
             .into();
         let mut p = Physics::new();
-        let tilt = Quat::from_rotation_x(-20f32.to_radians());
+        let tilt = Quat::from_rotation_x(-degrees.to_radians());
         let half = 200.0;
         let v = [
             Vec3::new(-half, 0.0, -half),
@@ -8438,7 +8485,25 @@ mod tests {
             p.step(DT);
         }
         let at = p.vehicle_transform(id).unwrap().w_axis.truncate();
-        ((at - from).length(), p.vehicle_contacts(id).0)
+        (
+            (at - from).length(),
+            p.vehicle_contacts(id).0,
+            (from.y - at.y, p.vehicle_asleep(id)),
+        )
+    }
+
+    #[test]
+    fn a_parked_tank_sleeps_with_its_island_and_stays_up() {
+        // On its springs alone over flat ground (its shape 0.38 m up), it
+        // keeps still, sleeps (its whole island, as Havok's 0x8264ABF8)
+        // and stays where it stood. Put to sleep on its own (rapier's
+        // `RigidBody::sleep`) its tracks stopped while rapier still moved
+        // it, and it sank through the ground (PmcCon001's villa tank).
+        let (slid, touching, (sank, asleep)) = parked_tank(Some(0.38), 0.0);
+        assert!(asleep, "awake");
+        assert!(sank.abs() < 0.05, "sank {sank} m");
+        assert!(slid < 0.05, "slid {slid} m");
+        assert_eq!(touching, 6);
     }
 
     #[test]
