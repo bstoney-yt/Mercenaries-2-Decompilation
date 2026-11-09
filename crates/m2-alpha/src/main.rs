@@ -3981,6 +3981,8 @@ fn mission_for_screenshot(
     // Contracts cancelled so far, and when she answers the last one's
     // fanfare (tick number).
     let (mut cancels_seen, mut continue_due): (u32, Option<u32>) = (0, None);
+    // Timed fanfares waiting, by HUD call, and the tick each was first seen.
+    let mut timed_seen: std::collections::HashMap<u64, u32> = Default::default();
     let mut late_hud: Option<(ui::Hud, Config)> = None;
     // `--dialog-shots`: the boxes pictured so far, and how long the open
     // one has been up.
@@ -5367,6 +5369,22 @@ fn mission_for_screenshot(
                 "autoplay: she takes Continue on the failed contract's fanfare (HUD call {seq})"
             );
             link.close_fanfare_without_hud(seq);
+        }
+        // A timed fanfare the scripts wait on (an outpost contact's
+        // business card before her first briefing there) and no game HUD
+        // to show it: called back once it would have been shown its time,
+        // as the HUD does (the sweep's GurCon003 and PirCon004 stood in
+        // their outposts for good).
+        if auto.is_some() && late_hud.is_none() {
+            for (seq, shown) in link.timed_fanfares() {
+                let since = *timed_seen.entry(seq).or_insert(i);
+                if (i - since) as f32 * tick >= shown {
+                    eprintln!(
+                        "autoplay: the timed fanfare of HUD call {seq} shown its {shown} s, called back (no game HUD)"
+                    );
+                    link.hud_callback(seq);
+                }
+            }
         }
         // The job she was skipped to, done (a set job or a collection
         // completed, a standing bounty paid): she stops as for a contract.

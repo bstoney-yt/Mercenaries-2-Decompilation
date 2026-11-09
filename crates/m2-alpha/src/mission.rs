@@ -458,6 +458,8 @@ for group, names in pairs(methods) do
                 local callback = type(t) == "table" and type(t.fCallback) == "function"
                 if callback then
                     __m2_hud_callbacks[__m2_hud_call_count] = t
+                    __m2_hud_groups = __m2_hud_groups or {}
+                    __m2_hud_groups[__m2_hud_call_count] = group
                     -- The contract's fanfare, which the flow waits on.
                     if group == "Fanfare" then __m2_fanfare = __m2_hud_call_count end
                 end
@@ -1540,6 +1542,36 @@ impl MissionLink {
     /// The HUD called back the mission's HUD call number `seq` (the
     /// contract fanfare closing): its `fCallback` runs, as the HUD's own
     /// interface would run it, with its `tCallbackData`.
+    /// The timed fanfares the scripts wait on (a contact's business card,
+    /// `Hud.CardFanfare:Commence({ nDisplayTime = 3, fCallback =
+    /// _JobRequest })`, which an outpost's first briefing shows): each
+    /// call's number and the seconds it is shown (`nDisplayTime`, else 3).
+    /// The game's HUD calls back once it has shown one; with none, nobody
+    /// does and the briefing waits for ever.
+    pub fn timed_fanfares(&self) -> Vec<(u64, f32)> {
+        let State::Running(m) = &self.state else {
+            return Vec::new();
+        };
+        m.lua()
+            .load(
+                "local out = {} \
+                 local timed = { CardFanfare = true, ContactFanfare = true, \
+                   EventFanfare = true, TextFanfare = true } \
+                 for seq, t in pairs(__m2_hud_callbacks or {}) do \
+                   local g = (__m2_hud_groups or {})[seq] \
+                   if type(t) == 'table' and timed[g] then \
+                     table.insert(out, { seq, tonumber(t.nDisplayTime) or 3 }) \
+                   end \
+                 end \
+                 return out",
+            )
+            .eval::<Vec<Vec<f64>>>()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| Some((*v.first()? as u64, *v.get(1)? as f32)))
+            .collect()
+    }
+
     /// Closes the fanfare of the mission's HUD call `seq` with no game HUD
     /// to: what the HUD's own close does to the game (its script
     /// `vz_da6af53d`, line 979 on: her invincibility for the fanfare off,
