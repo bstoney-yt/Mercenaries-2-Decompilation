@@ -5391,16 +5391,22 @@ impl Autoplay {
             return;
         };
         let v = w.physics.vehicle_velocity(id);
-        if v.y > -FALLING || self.clock - self.fall_logged < 1.0 {
-            return;
-        }
-        self.fall_logged = self.clock;
         let Some(at) = w.physics.vehicle_transform(id).map(|m| m.w_axis.truncate()) else {
             return;
         };
+        // Or sunk under the ground she drives on (the ground not found
+        // from 2 m over its middle, within 6 m).
+        let sunk = w
+            .physics
+            .cast_ray_past(at + Vec3::Y * 2.0, Vec3::NEG_Y, 6.0, id)
+            .is_none();
+        if (v.y > -FALLING && !sunk) || self.clock - self.fall_logged < 0.5 {
+            return;
+        }
+        self.fall_logged = self.clock;
         let top = at + Vec3::Y * 300.0;
         eprintln!(
-            "autoplay {:.1} s: her vehicle falls at {v:.1} at {at:.1}: wheels on the ground {:?}, ground under it {:?}, from 300 m over {:?}, touching {}",
+            "autoplay {:.1} s: her vehicle falls or sinks at {v:.1} at {at:.1}: wheels on the ground {:?}, ground under it {:?}, from 300 m over {:?}, touching {}",
             self.clock,
             w.physics.vehicle_contacts(id),
             w.physics

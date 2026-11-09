@@ -3164,8 +3164,16 @@ impl MissionLink {
             // What she chose in the support menu, the scripts call in;
             // they hand her its designator.
             if let Some(key) = game.support.call_in.take() {
+                let (cash, fuel) = mission.resources();
+                let cost = mission
+                    .support_items()
+                    .into_iter()
+                    .find(|i| i.key == key)
+                    .map(|i| (i.cash, i.fuel));
                 let took = mission.use_support(&key);
-                eprintln!("mission: she calls in {key}: {took}");
+                eprintln!(
+                    "mission: she calls in {key}: {took} (she has cash {cash:.0}, fuel {fuel:.0}; it costs {cost:?})"
+                );
                 self.stock_look = 0;
             }
             // An aimed designator came down: the support manager takes the

@@ -1502,6 +1502,27 @@ pub const FACTIONS: [&str; 9] = [
 /// [`Object.GetHibernationDistance`]'s answer, metres.
 const HIBERNATION_DISTANCE: f64 = 155.0;
 
+/// A place argument at `a[i]`: three numbers (x, y, z), else an object's
+/// place; and the index of the argument after it.
+fn place_arg(w: &ScriptWorld, a: &[Value], i: usize) -> Option<([f32; 3], usize)> {
+    if let (Some(x), Some(y), Some(z)) = (num(a.get(i)), num(a.get(i + 1)), num(a.get(i + 2))) {
+        return Some(([x, y, z], i + 3));
+    }
+    Some((w.place_of(id(a.get(i))?)?, i + 1))
+}
+
+/// `Object.GetDistanceFrom`'s measure from `p` to `q`: flat (x and z
+/// only) or not, squared or not (0x8232F688).
+fn distance_from(p: [f32; 3], q: [f32; 3], flat: bool, squared: bool) -> f32 {
+    let (dx, dy, dz) = (p[0] - q[0], p[1] - q[1], p[2] - q[2]);
+    let d2 = if flat {
+        dx * dx + dz * dz
+    } else {
+        dx * dx + dy * dy + dz * dz
+    };
+    if squared { d2 } else { d2.sqrt() }
+}
+
 fn num(v: Option<&Value>) -> Option<f32> {
     match v? {
         Value::Integer(i) => Some(*i as f32),
@@ -2360,15 +2381,19 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // From an object to another, or to a point x, y, z (`MrxUtil.
     // GetDistanceToObject(her, x, y, z)`, as the laser guided bomb and the
     // daisy cutter ask how far she is from their target).
+    // From the 360 code (0x8232F688): two places, each an object or an x,
+    // y, z, then two optional flags: the first measures flat (x and z
+    // only: PmcCon004's nuke within 20 m of the bunker, measured from a
+    // burst on its roof 53 m up), the second leaves the distance squared.
     add(&object, "GetDistanceFrom", |w, _, a| {
-        let to = match (num(a.get(1)), num(a.get(2)), num(a.get(3))) {
-            (Some(x), Some(y), Some(z)) => Some([x, y, z]),
-            _ => id(a.get(1)).and_then(|g| w.place_of(g)),
-        };
-        let (Some(p), Some(q)) = (id(a.first()).and_then(|g| w.place_of(g)), to) else {
+        let Some((p, i)) = place_arg(w, a, 0) else {
             return values([Value::Nil]);
         };
-        let d: f32 = (0..3).map(|i| (p[i] - q[i]).powi(2)).sum::<f32>().sqrt();
+        let Some((q, j)) = place_arg(w, a, i) else {
+            return values([Value::Nil]);
+        };
+        let flag = |k: usize| matches!(a.get(k), Some(Value::Boolean(true)));
+        let d = distance_from(p, q, flag(j), flag(j + 1));
         values([Value::Number(f64::from(d))])
     })?;
     add(&object, "IsPlayerControlled", |w, _, a| {
@@ -5687,5 +5712,23 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(yaw, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod distance_tests {
+    use super::distance_from;
+
+    #[test]
+    fn get_distance_from_measures_flat_and_squared_as_its_flags_say() {
+        // PmcCon004's nuke bursts on the bunker's roof, 53 m over its
+        // origin and 17 m off it flat: within the script's 20 m only flat.
+        let (bunker, burst) = ([-2721.4, 159.5, -3096.5], [-2737.0, 212.5, -3104.4]);
+        let full = distance_from(bunker, burst, false, false);
+        let flat = distance_from(bunker, burst, true, false);
+        assert!(full > 50.0, "{full}");
+        assert!(flat < 20.0, "{flat}");
+        let squared = distance_from(bunker, burst, true, true);
+        assert!((squared - flat * flat).abs() < 1e-2);
     }
 }

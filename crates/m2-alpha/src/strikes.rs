@@ -166,8 +166,16 @@ impl Strikes {
             let length = step.length();
             let dir = step.normalize_or(Vec3::NEG_Y);
             let hit = physics
-                .cast_ray(s.at, dir, length)
-                .map(|(d, _)| s.at + dir * d);
+                .cast_ray_keyed(s.at, dir, length)
+                .map(|(d, _, key)| {
+                    eprintln!(
+                        "strike: shell {:#x} hits {key:?} at {:.1}, {:.0} m from its target",
+                        s.guid,
+                        s.at + dir * d,
+                        s.target.map_or(f32::NAN, |t| t.distance(s.at + dir * d))
+                    );
+                    s.at + dir * d
+                });
             let off = match &s.fuse {
                 // Opens when what lies ahead is this near.
                 Fuse::Obstructed(near) => physics
