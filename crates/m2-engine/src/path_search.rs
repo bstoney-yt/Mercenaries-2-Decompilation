@@ -48,8 +48,10 @@
 //!   (0x822E67F8 keeps one only while the best is cheaper than it plus
 //!   1 m); the cheaper way is taken up when an edge to it holds, by
 //!   relinking the best (0x822E7688).
-//! - The pairs seen (0x822E6A40, 128 slots) leave out the first node's
-//!   edges (its key is 0), and start again once past 120.
+//! - The pairs seen (0x822E6A40, 128 slots) are emptied when a new pair
+//!   comes with over 120 seen. The first node's key is 1 (0x822E6600),
+//!   not 0, so its edges count as pairs too: one already tried is not
+//!   added again (0x822E67F8).
 //! - **Following** (0x822E2770): the point a lookahead on along the way
 //!   from where the vehicle is nearest it, the lookahead the larger of
 //!   3 m, half its box's largest side and its speed over the think.
@@ -71,7 +73,67 @@
 
 use std::collections::{HashMap, HashSet};
 
-use m2_math::glam::{Quat, Vec3};
+use m2_assets::model::Node as ModelNode;
+use m2_assets::{Layer, name_hash};
+use m2_math::glam::{Mat4, Quat, Vec3};
+
+/// One of a template's `AiHintNode` records (template component; the
+/// 360's store 0x83653B38): the node of its model the hint is at (a name
+/// hash), its `Type` (an `AiHintEnum`) and its `Name`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AiHint {
+    pub hardpoint: u32,
+    pub kind: u32,
+    pub name: u32,
+}
+
+/// Every template's `AiHintNode` records, by its id.
+pub fn read_hints(db: &Layer<'_>) -> HashMap<u32, Vec<AiHint>> {
+    let t = crate::tuning::Table::new(db, "AiHintNode");
+    let (hardpoint, kind, name) = (name_hash("Hardpoint"), name_hash("Type"), name_hash("Name"));
+    t.templates()
+        .map(|id| {
+            let hints = t
+                .of_template(id)
+                .iter()
+                .filter_map(|r| {
+                    Some(AiHint {
+                        hardpoint: t.word(r, hardpoint).filter(|&h| h != 0)?,
+                        kind: t.word(r, kind).unwrap_or(0),
+                        name: t.word(r, name).unwrap_or(0),
+                    })
+                })
+                .collect();
+            (id, hints)
+        })
+        .collect()
+}
+
+/// Where `hints` are on a model of `nodes` (model space): each the origin
+/// of the node its hardpoint names (0x8241E3D0 finds an entity's
+/// hardpoint by name), by the hardpoint's name hash; one whose node the
+/// model lacks is left out (0x822E74A8 adds a node only when 0x8241E3D0
+/// finds it).
+pub fn hint_points(nodes: &[ModelNode], hints: &[AiHint]) -> Vec<(u32, Vec3)> {
+    hints
+        .iter()
+        .filter_map(|h| {
+            let mut at = nodes.iter().position(|n| n.name_hash == h.hardpoint)?;
+            let mut m = Mat4::IDENTITY;
+            // A node's parent chain ends within `nodes.len()` steps (the
+            // model's parse rejects cycles).
+            for _ in 0..=nodes.len() {
+                let n = nodes.get(at)?;
+                m = Mat4::from(n.local) * m;
+                match n.parent {
+                    Some(p) => at = usize::from(p),
+                    None => return Some((h.hardpoint, m.w_axis.truncate())),
+                }
+            }
+            None
+        })
+        .collect()
+}
 
 /// A node's key: what it was made for (the 360 combines two words,
 /// 0x82855980).
@@ -80,8 +142,8 @@ pub type Key = (u64, u64);
 /// The goal's key (0x80000000).
 pub const GOAL: Key = (0x8000_0000, 0);
 
-/// The first node's key.
-const FIRST: Key = (0, 0);
+/// The first node's key (the 360's 1, 0x822E6600).
+const FIRST: Key = (u64::MAX, 1);
 
 /// What a sweep met.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -188,7 +250,7 @@ impl<W: PathWorld> Search<'_, W> {
             key,
             on,
         };
-        if p.key != FIRST && self.pairs.contains(&(p.key, key)) {
+        if self.pairs.contains(&(p.key, key)) {
             return;
         }
         if let Some(&b) = self.best.get(&key)
@@ -325,15 +387,15 @@ impl<W: PathWorld> Search<'_, W> {
             return;
         };
         let (pk, nk) = (self.nodes[p].key, self.nodes[n].key);
-        // 0x822E6A40.
-        if pk != FIRST {
-            if !self.pairs.insert((pk, nk)) {
-                return;
-            }
-            if self.pairs.len() > 120 {
-                self.pairs.clear();
-            }
+        // 0x822E6A40: seen already, or kept (the set emptied first when
+        // over 120).
+        if self.pairs.contains(&(pk, nk)) {
+            return;
         }
+        if self.pairs.len() + 8 > 128 {
+            self.pairs.clear();
+        }
+        self.pairs.insert((pk, nk));
         if pk == nk {
             return;
         }
@@ -533,6 +595,77 @@ mod tests {
         assert!(
             (p.length() - 3.0).abs() < 1e-3 && p.x.signum() == mid.x.signum(),
             "{p}"
+        );
+    }
+
+    /// [`Wall`] with a hint just behind it, straight between the start
+    /// and the goal: the cheapest-looking node, and out of the start's
+    /// reach.
+    struct HintBehind;
+    impl PathWorld for HintBehind {
+        fn sweep(&mut self, from: Vec3, to: Vec3, half: Vec3) -> Option<Obstacle> {
+            Wall.sweep(from, to, half)
+        }
+        fn ground(&mut self, at: Vec3) -> Option<(Vec3, Option<u64>)> {
+            Wall.ground(at)
+        }
+        fn hints(&mut self, _: u64) -> Vec<(u32, Vec3)> {
+            vec![(0x1234, Vec3::new(0.0, 0.0, 23.5))]
+        }
+        fn body(&mut self, _: u64) -> Option<Obstacle> {
+            None
+        }
+    }
+
+    // The first node's edges count as pairs seen (its key is 1, not 0):
+    // the edge to the hint, blocked once, is not tried again from it each
+    // time, and the search goes round the wall.
+    #[test]
+    fn a_blocked_edge_from_the_start_is_not_tried_again() {
+        let size = Size {
+            width: 2.0,
+            height: 2.0,
+        };
+        let way = find(&mut HintBehind, size, Vec3::ZERO, Vec3::new(0.0, 0.0, 40.0));
+        let way = way.expect("a way round the wall");
+        assert!(way.points[1].x.abs() > 5.0, "{way:?}");
+    }
+
+    #[test]
+    fn hints_are_at_their_nodes_origins() {
+        use m2_math::RawMatrix44;
+        let at = |x: f32, y: f32, z: f32| {
+            let mut m = [[0.0f32; 4]; 4];
+            for (i, r) in m.iter_mut().enumerate() {
+                r[i] = 1.0;
+            }
+            m[3] = [x, y, z, 1.0];
+            RawMatrix44 { m }
+        };
+        let nodes = [
+            ModelNode {
+                name_hash: 10,
+                local: at(1.0, 0.0, 0.0),
+                ..Default::default()
+            },
+            ModelNode {
+                name_hash: 20,
+                parent: Some(0),
+                local: at(0.0, 2.0, 3.0),
+                ..Default::default()
+            },
+        ];
+        let hint = |hardpoint| AiHint {
+            hardpoint,
+            kind: 1,
+            name: 0,
+        };
+        assert_eq!(
+            hint_points(&nodes, &[hint(20), hint(99), hint(10)]),
+            vec![
+                (20, Vec3::new(1.0, 2.0, 3.0)),
+                (10, Vec3::new(1.0, 0.0, 0.0))
+            ]
         );
     }
 

@@ -281,6 +281,9 @@ pub struct Templates {
     pub lights: HashMap<u32, crate::lights::LightSpec>,
     /// What each template sets off with it, and where ([`crate::lights::links`]).
     pub links: HashMap<u32, Vec<crate::lights::Link>>,
+    /// Each template's `AiHintNode`s, the points an AI vehicle's path
+    /// search goes by round it ([`crate::path_search::read_hints`]).
+    pub ai_hints: HashMap<u32, Vec<crate::path_search::AiHint>>,
     /// The templates whose props move on their own, by id.
     pub motions: HashMap<u32, PropMotion>,
     /// What templates leave when destroyed, and what pickups give.
@@ -1028,6 +1031,7 @@ impl Templates {
             tuning: crate::tuning::read(&db, damage.as_ref()),
             lights: crate::lights::read(&db),
             links: crate::lights::links(&db),
+            ai_hints: crate::path_search::read_hints(&db),
             part_healths: crate::vehicle_damage::read(&db),
             leavings: crate::pickup::read(&db),
             ruined: ruined(&db),
