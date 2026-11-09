@@ -402,6 +402,12 @@ const GET_OUT: f32 = 40.0;
 /// Within this far of a vehicle's door she presses to get in, metres;
 /// presses are this far apart, seconds (a press gets her in or out).
 const DOOR: f32 = 2.5;
+/// She presses at her way in once the camera looks within about 35
+/// degrees of it (the cosine; invented).
+const FACE_DOOR: f32 = 0.82;
+/// Times she gets back out of a vehicle she is to drive and finds herself
+/// in another seat of, before she rides on as she is (invented).
+const WRONG_SEATS: u32 = 3;
 
 /// How near (flat) her vehicle's door she presses to get in: within the
 /// door entrance's reach, `UseDistance` + 1 m ([`m2_engine::seats`]), less
@@ -426,6 +432,28 @@ fn door_reach(spec: &m2_engine::vehicle::VehicleSpec) -> f32 {
 /// by: the sweep's GurCon003 pressed there for 1,500 s with "no seat".
 fn way_in(spec: &m2_engine::vehicle::VehicleSpec) -> Option<Vec3> {
     way_in_of(spec.seating.as_deref(), &spec.entrances, spec.door)
+}
+
+/// Whether she rides vehicle `i` in a seat other than its driver's while
+/// its driver's seat, one she may use, is empty: nobody will drive it.
+fn wrong_seat(game: &Game, i: usize) -> bool {
+    let (Some((j, seat)), Some(v)) = (game.ride, game.scene.vehicles.get(i)) else {
+        return false;
+    };
+    let ride = crate::ride::Ride::of(v);
+    j == i && seat_off_the_wheel(ride, seat)
+}
+
+/// [`wrong_seat`] of a vehicle's seats as `ride` has them, her in `seat`.
+fn seat_off_the_wheel(ride: crate::ride::Ride<'_>, seat: u32) -> bool {
+    let Some(s) = ride.seating else {
+        return false;
+    };
+    let Some(d) = s.driver() else {
+        return false;
+    };
+    let wheel = &s.seats[d];
+    wheel.name != seat && wheel.player_use && ride.rider(wheel.name).is_none()
 }
 
 /// [`way_in`] of a vehicle's seat data, its entrances (model space) and
@@ -976,6 +1004,10 @@ pub struct Autoplay {
     /// going for.
     boarding: Option<(usize, f32)>,
     left_rides: Vec<usize>,
+    /// Times she got out, seated away from the wheel ([`WRONG_SEATS`]),
+    /// and the ride she got out of to go round to its wheel.
+    wrong_seats: u32,
+    reboard: Option<usize>,
     /// Hops she has had driving to the goal she is after.
     drive_hops: u32,
     /// Sidestepping (-1 left, 1 right), seconds left.
@@ -1926,6 +1958,23 @@ impl Autoplay {
                     at: m.at,
                 },
                 format!("racing to {} ({:#x})", m.name, m.target),
+            ));
+        }
+        // A race on and her out of the ride she got out of to reach its
+        // wheel: back into it, at the wheel (the sweep's GurCon003 raced
+        // on foot from the Piranha till its timer ran out).
+        if self.racing()
+            && let Some(i) = self.reboard
+            && let Some(p) = game.scene.player.as_ref()
+            && p.driving.is_none()
+            && game.scene.vehicles.get(i).is_some_and(|v| !v.wrecked)
+        {
+            return Some((
+                Goal::Board(i),
+                format!(
+                    "getting back into the {} at the wheel for the race",
+                    game.scene.vehicles[i].spec.label
+                ),
             ));
         }
         // Off a contract with one on offer, a job's or collection's marks
@@ -3047,6 +3096,23 @@ impl Autoplay {
             return Intent::default();
         };
         if self.leave {
+            return self.press(speed);
+        }
+        // To drive, but seated elsewhere with nobody at the wheel (the
+        // sweep's GurCon003: a Piranha passenger, the race lost standing
+        // still): out, to try its way in at the wheel again.
+        if self.wrong_seats < WRONG_SEATS
+            && speed.abs() < 1.0
+            && wrong_seat(game, i)
+            && self.may_get_out(game, i)
+        {
+            self.wrong_seats += 1;
+            self.reboard = Some(i);
+            eprintln!(
+                "autoplay {:.1} s: in the {} but not at the wheel ({} of {WRONG_SEATS}): getting out to go round to it",
+                self.clock, game.scene.vehicles[i].spec.label, self.wrong_seats
+            );
+            self.leave = true;
             return self.press(speed);
         }
         let pos = m.w_axis.truncate();
@@ -4544,7 +4610,25 @@ impl Autoplay {
         );
         let here = p.character.position;
         if (door - here).with_y(0.0).length() < door_reach(spec) {
-            return self.press(0.0);
+            // The key takes the nearest entrance ahead of the camera
+            // (0x82440F30): she faces her way in first, or another
+            // entrance behind her back (GurCon003's Piranha: a passenger's
+            // by the bow, 2.6 m off) is the one ahead.
+            let to = door - p.eye();
+            let look = turn_to(p, to.x.atan2(to.z), p.pitch, dt);
+            let facing = p.camera_forward().with_y(0.0).normalize_or_zero();
+            if to.with_y(0.0).length() > 0.2
+                && facing.dot(to.with_y(0.0).normalize_or_zero()) < FACE_DOOR
+            {
+                return Intent {
+                    look,
+                    ..Intent::default()
+                };
+            }
+            return Intent {
+                look,
+                ..self.press(0.0)
+            };
         }
         // Crewed and taken only by its hijack (PmcCon001's villa tank):
         // the key anywhere close by starts it, door or not (round 4 stood

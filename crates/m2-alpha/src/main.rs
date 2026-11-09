@@ -3978,6 +3978,11 @@ fn mission_for_screenshot(
     // tick the Nth was done, and how many have been.
     let mut play_done: Option<u32> = None;
     let mut contracts_seen = 0;
+    // Contracts cancelled so far, and when she answers the last one's
+    // fanfare (tick number).
+    let (mut cancels_seen, mut continue_due): (u32, Option<u32>) = (0, None);
+    // Timed fanfares waiting, by HUD call, and the tick each was first seen.
+    let mut timed_seen: std::collections::HashMap<u64, u32> = Default::default();
     let mut late_hud: Option<(ui::Hud, Config)> = None;
     // `--dialog-shots`: the boxes pictured so far, and how long the open
     // one has been up.
@@ -4031,14 +4036,15 @@ fn mission_for_screenshot(
     // how many others' within earshot.
     let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
     let mut strike_seen: Option<u32> = None;
-    // With --hijack, the hijacks run as in the game, and she hijacks the
+    // With --hijack, or --autoplay (their host also seats the HQ's desk
+    // starters: story run r1104's PmcCon001 and OilCon021 stood idle
+    // without it), the hijacks run as in the game, and she hijacks the
     // vehicle an objective's "action" marker is on (PmcCon001's villa
     // tank): once the marker has been up HIJACK_WAIT (the tank comes
     // through the wall first), she is put beside it ([`hijack::beside`]),
     // presses the use key a second later and answers its prompts at once
     // ([`hijack::Autopad`]). For testing.
-    let mut hijacks = options
-        .hijack
+    let mut hijacks = (options.hijack || options.autoplay)
         .then(|| hijack::Hijacks::start(install, options.hijack_crew.clone()));
     let mut hijack_input = Input::default();
     let mut hijack_pad = hijack::Autopad::default();
@@ -4063,6 +4069,9 @@ fn mission_for_screenshot(
     let (mut extraction, mut extraction_tap, mut extraction_seen) = (0u8, false, 0.0f32);
     let (mut locked_was, mut locked_for) = (false, 0.0f32);
     let mut on_contract: Option<(String, i64)> = None;
+    // The contract she last failed, until she is on one again: its giver's
+    // HQ door is the way in she takes to take it again.
+    let mut failed_contract: Option<String> = None;
     // Message box calls with a callback, while the game's HUD isn't
     // running: when each is due back, by call number; the last seen.
     let (mut boxed, mut boxed_seen): (Vec<(f32, u64)>, u64) = (Vec::new(), 0);
@@ -4076,6 +4085,9 @@ fn mission_for_screenshot(
                         i as f32 * tick,
                         contract
                     );
+                    if contract.is_some() {
+                        failed_contract = None;
+                    }
                     on_contract = contract;
                 }
                 a.sights = link.sight_targets(game);
@@ -4152,7 +4164,7 @@ fn mission_for_screenshot(
                 a.offers = link.offers(game);
                 a.in_hq = link.in_hq();
                 a.exits = link.exit_offers();
-                a.enters = link.enter_offers();
+                a.enters = link.enter_offers_for(failed_contract.as_deref());
                 let objectives = link.view().objectives;
                 a.step(game, &marks, &objectives, &link.awaited(), tick)
             }
@@ -5330,6 +5342,48 @@ fn mission_for_screenshot(
             // scripts go on (--after-contract).
             if contracts_seen >= options.contracts.max(1) {
                 play_done = Some(i);
+            }
+        }
+        // A contract failed (the scripts' `Pg.ContractCancelled`): its
+        // fanfare waits for her answer, and with no game HUD here nothing
+        // answers it. She takes Continue (the callback without `bRetry`:
+        // the contract is cancelled and goes back on offer), 3 s on, and
+        // goes to take it again as a player would. The fanfare's Retry
+        // reloads the retry save (`Pg.LoadGame("retry")`), which the alpha
+        // doesn't do yet.
+        if auto.is_some() && link.contracts_cancelled() > cancels_seen {
+            cancels_seen = link.contracts_cancelled();
+            failed_contract = on_contract.as_ref().map(|(c, _)| c.clone());
+            continue_due = Some(i + (3.0 / tick).round() as u32);
+            eprintln!(
+                "autoplay: contract cancelled ({cancels_seen} so far) after {:.1} s of play",
+                i as f32 * tick
+            );
+        }
+        if auto.is_some()
+            && continue_due.is_some_and(|d| i >= d)
+            && let Some(seq) = link.waiting_fanfare()
+        {
+            continue_due = None;
+            eprintln!(
+                "autoplay: she takes Continue on the failed contract's fanfare (HUD call {seq})"
+            );
+            link.close_fanfare_without_hud(seq);
+        }
+        // A timed fanfare the scripts wait on (an outpost contact's
+        // business card before her first briefing there) and no game HUD
+        // to show it: called back once it would have been shown its time,
+        // as the HUD does (the sweep's GurCon003 and PirCon004 stood in
+        // their outposts for good).
+        if auto.is_some() && late_hud.is_none() {
+            for (seq, shown) in link.timed_fanfares() {
+                let since = *timed_seen.entry(seq).or_insert(i);
+                if (i - since) as f32 * tick >= shown {
+                    eprintln!(
+                        "autoplay: the timed fanfare of HUD call {seq} shown its {shown} s, called back (no game HUD)"
+                    );
+                    link.hud_callback(seq);
+                }
             }
         }
         // The job she was skipped to, done (a set job or a collection

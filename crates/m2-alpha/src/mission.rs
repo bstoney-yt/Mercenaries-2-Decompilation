@@ -458,6 +458,8 @@ for group, names in pairs(methods) do
                 local callback = type(t) == "table" and type(t.fCallback) == "function"
                 if callback then
                     __m2_hud_callbacks[__m2_hud_call_count] = t
+                    __m2_hud_groups = __m2_hud_groups or {}
+                    __m2_hud_groups[__m2_hud_call_count] = group
                     -- The contract's fanfare, which the flow waits on.
                     if group == "Fanfare" then __m2_fanfare = __m2_hud_call_count end
                 end
@@ -1022,6 +1024,9 @@ pub struct MissionLink {
     completed: Option<f32>,
     /// How many times the scripts have said a contract was completed.
     contracts: u32,
+    /// How many times they have said one was cancelled
+    /// (`Pg.ContractCancelled`: failed, its fanfare up for Retry or not).
+    cancelled: u32,
     /// The speed of the vehicle she drives, held a little (m/s).
     speed: f32,
     /// The keys tutorial lines name.
@@ -1196,6 +1201,7 @@ impl MissionLink {
             reinforcements: crate::reinforce::Reinforcements::default(),
             completed: None,
             contracts: 0,
+            cancelled: 0,
             speed: 0.0,
             keys: Default::default(),
             lines: Vec::new(),
@@ -1536,6 +1542,53 @@ impl MissionLink {
     /// The HUD called back the mission's HUD call number `seq` (the
     /// contract fanfare closing): its `fCallback` runs, as the HUD's own
     /// interface would run it, with its `tCallbackData`.
+    /// The timed fanfares the scripts wait on (a contact's business card,
+    /// `Hud.CardFanfare:Commence({ nDisplayTime = 3, fCallback =
+    /// _JobRequest })`, which an outpost's first briefing shows): each
+    /// call's number and the seconds it is shown (`nDisplayTime`, else 3).
+    /// The game's HUD calls back once it has shown one; with none, nobody
+    /// does and the briefing waits for ever.
+    pub fn timed_fanfares(&self) -> Vec<(u64, f32)> {
+        let State::Running(m) = &self.state else {
+            return Vec::new();
+        };
+        m.lua()
+            .load(
+                "local out = {} \
+                 local timed = { CardFanfare = true, ContactFanfare = true, \
+                   EventFanfare = true, TextFanfare = true } \
+                 for seq, t in pairs(__m2_hud_callbacks or {}) do \
+                   local g = (__m2_hud_groups or {})[seq] \
+                   if type(t) == 'table' and timed[g] then \
+                     table.insert(out, { seq, tonumber(t.nDisplayTime) or 3 }) \
+                   end \
+                 end \
+                 return out",
+            )
+            .eval::<Vec<Vec<f64>>>()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| Some((*v.first()? as u64, *v.get(1)? as f32)))
+            .collect()
+    }
+
+    /// Closes the fanfare of the mission's HUD call `seq` with no game HUD
+    /// to: what the HUD's own close does to the game (its script
+    /// `vz_da6af53d`, line 979 on: her invincibility for the fanfare off,
+    /// `MrxHqManager.UnlockAllHq`, the HQs the end sequence locked), then
+    /// the callback (Continue: no `bRetry`).
+    pub fn close_fanfare_without_hud(&mut self, seq: u64) {
+        if let State::Running(m) = &mut self.state {
+            let code = "local c = Player.GetLocalCharacter()\n\
+                 if c then Object.SetInvincible(c, false, \"Fanfare\") end\n\
+                 if MrxHqManager and MrxHqManager.UnlockAllHq then MrxHqManager.UnlockAllHq() end";
+            if let Err(e) = m.run(code, "fanfare close") {
+                self.write([format!("fanfare close {seq}: {e}")]);
+            }
+        }
+        self.hud_callback(seq);
+    }
+
     pub fn hud_callback(&mut self, seq: u64) {
         let State::Running(m) = &mut self.state else {
             return;
@@ -1721,6 +1774,33 @@ impl MissionLink {
             .filter(|(_, _, text, _)| text.eq_ignore_ascii_case(ENTER_PROMPT))
             .filter_map(|(g, at, _, reach)| Some((g, Vec3::from(at?), reach)))
             .collect()
+    }
+
+    /// [`Self::enter_offers`], only the ways into the HQ of contract
+    /// `contract`'s giver (by the HQ door's name, `Starter_Pir1_Entrance`
+    /// for a `PirCon`), where any of those is on offer; else all.
+    pub fn enter_offers_for(&self, contract: Option<&str>) -> Vec<crate::autoplay::ActionAt> {
+        let all = self.enter_offers();
+        let (Some(c), State::Running(mission)) = (contract, &self.state) else {
+            return all;
+        };
+        let Some(giver) = c
+            .get(..3)
+            .map(|p| format!("starter_{}", p.to_ascii_lowercase()))
+        else {
+            return all;
+        };
+        let w = mission.world().borrow();
+        let own: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|(g, _, _)| {
+                w.objects
+                    .get(g)
+                    .is_some_and(|o| o.name.to_ascii_lowercase().starts_with(&giver))
+            })
+            .collect();
+        if own.is_empty() { all } else { own }
     }
 
     /// The starters' talks on offer (the context actions whose prompt is
@@ -3326,6 +3406,10 @@ impl MissionLink {
                     );
                     log_recruits(mission, "contract completed");
                 }
+                if c == Command::Notify("Pg.ContractCancelled".into()) {
+                    self.cancelled += 1;
+                    eprintln!("mission: contract cancelled ({} so far)", self.cancelled);
+                }
             }
             if let Some(line) = tutorial(mission) {
                 self.tutorial = line;
@@ -4213,6 +4297,11 @@ impl MissionLink {
     /// How many contracts the scripts have said are completed.
     pub fn contracts_completed(&self) -> u32 {
         self.contracts
+    }
+
+    /// How many contracts the scripts have said are cancelled.
+    pub fn contracts_cancelled(&self) -> u32 {
+        self.cancelled
     }
 
     /// The kilobytes the scripts' Lua state holds, while they run: logged
