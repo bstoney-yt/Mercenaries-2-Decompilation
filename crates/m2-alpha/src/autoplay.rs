@@ -1222,13 +1222,15 @@ impl Autoplay {
                 || (f.y - here.y).abs() > UNDER_BY * 3.0
         });
         self.left_behind = if behind { self.left_behind + dt } else { 0.0 };
-        if self.left_behind > LEFT_FOR
-            && game
-                .scene
-                .player
-                .as_ref()
-                .is_some_and(|p| p.driving.is_none())
-        {
+        // Driving, once she has stopped: they get in by her (the contract
+        // sweep's ChiCon001 drove the VIP's drop-off in a tank, the VIP
+        // left 750 m back, and sat at it 1,100 s).
+        let stopped = match game.scene.player.as_ref().map(|p| p.driving) {
+            Some(None) => true,
+            Some(Some(i)) => vehicle_state(game, i).is_some_and(|s| s.1 < 1.0),
+            None => false,
+        };
+        if self.left_behind > LEFT_FOR && stopped {
             self.left_behind = 0.0;
             let n = game.scene.people.bring_followers(here);
             eprintln!(
@@ -2105,9 +2107,14 @@ impl Autoplay {
             && marks
                 .iter()
                 .any(|m| m.kind == "action" && self.tagged.contains(&m.target))
-            && self
+            // Kept at while its smoke is in her hand: thrown, not left
+            // (the contract sweep's JetCon001 called it in five times,
+            // never threw the smoke, and the scripts took it back).
+            && (self
                 .delivered
                 .is_none_or(|t| self.clock - t > DELIVERY_AGAIN)
+                || game.combat.to_throw
+                || game.support.phase != Phase::Idle)
             && let Some(key) = game.support.entries().into_iter().find_map(|e| match e {
                 Entry::Stocked(s) if s.key == "MunitionsPickup" => Some(s.key.clone()),
                 _ => None,
@@ -2393,7 +2400,11 @@ impl Autoplay {
             // crew aboard come into play under its guid (PmcCon003's
             // AMX30s: round 8 aimed at a tank's commander inside it,
             // with never a clear shot, for 1900 s).
-            let a_vehicle = vehicles.iter().any(|v| v.guid == Some(m.target));
+            // So is a building that sends out its people under its own
+            // guid (the contract sweep's GurCon002: she shot its garrison
+            // for 1,800 s and the building stood).
+            let a_vehicle = vehicles.iter().any(|v| v.guid == Some(m.target))
+                || game.scene.props.get(m.target).is_some();
             if !a_vehicle
                 && let Some(i) = npcs
                     .iter()
@@ -3615,8 +3626,12 @@ impl Autoplay {
                     // Nowhere (within bounds) to see it from: the others
                     // first. (PmcCon031's MG platform: its rail hid one
                     // column, and she stood at it 20 s, round 25.)
+                    // And when she comes back to it, it is blown up or
+                    // bombed, not tried with her rifle again: the contract
+                    // sweep's GurCon002 had only its building left, 149 m
+                    // off, and found nowhere to see it from 81,000 times.
                     self.passed.push((target, self.clock + KEEP_PASS));
-                    self.rifle_on = None;
+                    self.rifle_on = Some((target, self.rifle_try(game, target)));
                     return Intent::default();
                 }
             }
@@ -4414,6 +4429,13 @@ impl Autoplay {
                     }
                     game.support.selected = i;
                     self.laser_called = Some(self.clock);
+                } else if let Some(i) = strike_line(&game.support.entries()) {
+                    // Else her own strike, the line a player scrolls to:
+                    // the menu's line as it stood was a delivery of the
+                    // scripts' (the contract sweep: ChiCon001 and ChiCon003
+                    // called in C4 42,000 and 14,000 times, 88 m and 59 m
+                    // from their targets, and never a bomb).
+                    game.support.selected = i;
                 }
                 intent.trigger.support = true;
             }
@@ -4427,7 +4449,17 @@ impl Autoplay {
                 ..
             } => {
                 let to = Vec2::new(at.x, at.z) - view;
-                if to.length() < ON_SPOT {
+                if d > crate::support::VIEW_REACH - ON_SPOT {
+                    // Past the view's reach of her (the target changed
+                    // under an open view: the contract sweep's ChiCon001
+                    // held one 119 m from the next building for 24
+                    // minutes): shut it, and she goes nearer.
+                    eprintln!(
+                        "autoplay {:.1} s: support: the target is {d:.0} m off, past the view's reach: shutting it",
+                        self.clock
+                    );
+                    intent.trigger.support = true;
+                } else if to.length() < ON_SPOT {
                     intent.trigger.fire = self.tap();
                 } else {
                     // Screen right is the world's -x, looking down.
@@ -4463,7 +4495,18 @@ impl Autoplay {
                         vantage(&w.physics, at, here, &self.tried, &LASER_RINGS, LASER_SHORT)
                     });
                     self.laser_since = self.clock;
+                    // Nowhere left to see it from (the contract sweep's
+                    // AllCon001 stood 1,000 s lasing beside a plane's
+                    // wreck): after that many it is lased as it stands.
+                    if self.laser_spot.is_none() {
+                        self.laser_failed += 1;
+                        eprintln!(
+                            "autoplay {:.1} s: no spot left to lase it from ({} of {LASER_TRIES})",
+                            self.clock, self.laser_failed
+                        );
+                    }
                 }
+                let lands = lands || self.laser_failed >= LASER_TRIES;
                 if !lands
                     && let Some(spot) = self.laser_spot
                     && spot.with_y(0.0).distance(here.with_y(0.0)) > ARRIVE
@@ -6048,6 +6091,12 @@ fn contract_first(places: Vec<&Mark>) -> Vec<&Mark> {
     }
 }
 
+/// The support menu's line with her own strike on it (the satellite
+/// bomb), if she holds one.
+fn strike_line(entries: &[Entry<'_>]) -> Option<usize> {
+    entries.iter().position(|e| matches!(e, Entry::Own(_)))
+}
+
 /// Whether a marker of the scripts' is still up on `g` (an action's, or a
 /// pickup's whose context action she took: the fuel tanks' "Steal fuel").
 fn marked_again(marks: &[Mark], g: u32) -> bool {
@@ -7259,6 +7308,28 @@ mod tests {
             Vec3::new(12.0, 3.0, 10.0),
         );
         assert_eq!(off, Vec3::new(10.0 + 5.0 + STEP_OFF, 1.0, 10.0));
+    }
+
+    #[test]
+    fn her_own_strike_is_chosen_over_a_scripts_delivery() {
+        use crate::support::{Item, Kind, Stocked};
+        let c4 = Stocked {
+            key: "c4".to_owned(),
+            name: "C4".to_owned(),
+            method: "Smoke".to_owned(),
+            count: 1,
+            free: true,
+        };
+        let bomb = Item {
+            kind: Kind::SatelliteBomb,
+            count: 1,
+            free: false,
+        };
+        assert_eq!(
+            strike_line(&[Entry::Stocked(&c4), Entry::Own(bomb)]),
+            Some(1)
+        );
+        assert_eq!(strike_line(&[Entry::Stocked(&c4)]), None);
     }
 
     #[test]
