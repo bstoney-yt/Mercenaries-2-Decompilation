@@ -924,6 +924,8 @@ pub struct Npc {
     foe_reach: Option<f32>,
     /// Who last shot them, of another army.
     shot_by: Option<u32>,
+    /// Who of another army they last heard fire ([`People::heard_shot`]).
+    heard: Option<u32>,
     /// She hurt them: they fight her while her pursuit lasts.
     pub provoked: bool,
     /// Their death was taken as an infraction already.
@@ -1207,6 +1209,7 @@ impl Npc {
             foe_look: 0.0,
             foe_reach: None,
             shot_by: None,
+            heard: None,
             provoked: false,
             hurt_by_her: false,
             killed_by_her: false,
@@ -3355,6 +3358,23 @@ impl People {
         foes
     }
 
+    /// Person `i` fired from `from`: those of armies at war with theirs who
+    /// hear it (within `reach`, whatever their `Hearing`: the 360's shot
+    /// message, 0x822FA410) perceive the shooter, as if they had seen them.
+    pub fn heard_shot(&mut self, i: usize, from: Vec3, reach: f32) {
+        let (Some(side), by) = (self.npcs[i].faction, self.npcs[i].shooter) else {
+            return;
+        };
+        let near: Vec<usize> = (0..self.npcs.len())
+            .filter(|&j| j != i && self.npcs[j].alive)
+            .filter(|&j| self.npcs[j].faction.is_some_and(|f| self.at_war(f, side)))
+            .filter(|&j| self.npcs[j].character.position.distance(from) < reach)
+            .collect();
+        for j in near {
+            self.npcs[j].heard = Some(by);
+        }
+    }
+
     /// Whether persons `i` and `j` are of armies at war.
     pub fn enemies(&self, i: usize, j: usize) -> bool {
         match (self.npcs[i].faction, self.npcs[j].faction) {
@@ -3406,7 +3426,8 @@ impl People {
             let n = &mut self.npcs[i];
             n.foe_look -= dt;
             let shot = n.shot_by.take();
-            if n.foe_look > 0.0 && shot.is_none() {
+            let heard = n.heard.take();
+            if n.foe_look > 0.0 && shot.is_none() && heard.is_none() {
                 if let Some(c) = foe.filter(|_| n.slot.who.is_some()) {
                     n.foe_at = Some(c.2);
                 }
@@ -3426,7 +3447,7 @@ impl People {
                 .iter()
                 .filter(|c| c.0 != me && c.1 != side)
                 .map(|c| (c.2.distance(at), c.0, c.2, c.1, reach(c)))
-                .filter(|c| c.0 <= c.4)
+                .filter(|c| c.0 <= c.4 || Some(c.1) == heard || Some(c.1) == shot)
                 .collect();
             seen.sort_by(|a, b| a.0.total_cmp(&b.0));
             seen.retain(|c| self.at_war(side, c.3));
@@ -3437,7 +3458,8 @@ impl People {
             for (d, who, chest, _, far) in seen {
                 let in_slot = n.slot.who == Some(who);
                 n.foe_reach = Some(far);
-                if in_slot || shot == Some(who) || n.sees(physics, chest, alert) {
+                let perceived = shot == Some(who) || heard == Some(who);
+                if in_slot || perceived || n.sees(physics, chest, alert) {
                     let score = m2_engine::ai_target::score(d, current, in_slot);
                     n.slot.offer(who, score);
                 }
@@ -5557,6 +5579,31 @@ pub(crate) mod tests {
         assert!(!people.npcs[1].killed_by_her && !people.npcs[1].hurt_by_her);
         people.war(&physics, None, dt);
         assert_eq!(foe(&people, 0), None);
+    }
+
+    #[test]
+    fn an_army_hears_its_enemy_fire_out_of_sight() {
+        let physics = ground();
+        let mut people = People::default();
+        for (k, (z, side)) in [(0.0, "Vza"), (110.0, "All")].into_iter().enumerate() {
+            let post = Brain::Post { facing: 0.0 };
+            let mut n = Npc::new(k, &rig(), Vec3::new(0.0, 1.0, z), 0.0, post, Some(1));
+            n.faction = Some(side);
+            n.gun = Some(rifle());
+            n.landed = true;
+            n.soldier = false;
+            people.npcs.push(n);
+        }
+        people.set_relations(
+            [(("Vza", "All"), -80.0), (("All", "Vza"), -80.0)]
+                .into_iter()
+                .collect(),
+        );
+        people.war(&physics, None, 0.25);
+        assert_eq!(people.npcs[0].foe_at, None, "110 m is past his sight");
+        people.heard_shot(1, Vec3::new(0.0, 1.6, 110.0), 120.0);
+        people.war(&physics, None, 0.25);
+        assert!(people.npcs[0].foe_at.is_some(), "he heard the shot");
     }
 
     #[test]
