@@ -80,6 +80,7 @@ mod npc;
 mod pad;
 mod padtable;
 mod particles;
+mod path_hints;
 mod paths;
 mod pause;
 mod pickup_marker;

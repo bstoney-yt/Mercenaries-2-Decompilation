@@ -50,6 +50,7 @@ use m2_engine::car_attack::{self, AttackWorld, CarAttack, Rider, Sight};
 use m2_engine::car_driver::{self, CarDriver, CarInputs, CarState, Quarry};
 use m2_engine::gunner_aim::{self, Report};
 use m2_engine::path_search::{self, PathWorld};
+use m2_engine::physics::StaticKey;
 use m2_engine::road_ring::{self, Arrival, Flood, RoadNet};
 use m2_engine::tank_attack::{Hull, TankAttack};
 use m2_math::glam::{Mat4, Quat, Vec3};
@@ -57,6 +58,9 @@ use m2_math::glam::{Mat4, Quat, Vec3};
 use crate::gunships::Shot;
 use crate::reinforce::Standing;
 use crate::scene::ParkedVehicle;
+
+/// What gives the `AiHintNode` points of a static ([`crate::path_hints`]).
+pub type Hints<'a> = &'a dyn Fn(StaticKey) -> Vec<(u32, Vec3)>;
 
 /// The entities the pursuit's cars are placed as (their own range).
 pub const FIRST_ENTITY: u32 = 0xfc00_0000;
@@ -78,6 +82,8 @@ struct Look<'a> {
     size: path_search::Size,
     route: &'a mut Option<(Vec3, Option<path_search::Way>)>,
     ahead: f32,
+    /// The `AiHintNode` points of what a search meets ([`crate::path_hints`]).
+    hints: Hints<'a>,
 }
 
 /// A path search's world: the alpha's physics, passing through the car
@@ -85,6 +91,7 @@ struct Look<'a> {
 struct Ground<'a> {
     physics: &'a Physics,
     car: m2_engine::physics::VehicleId,
+    hints: Hints<'a>,
     sweeps: usize,
     ground_hits: usize,
     body_hits: usize,
@@ -119,9 +126,12 @@ impl PathWorld for Ground<'_> {
     fn ground(&mut self, at: Vec3) -> Option<(Vec3, Option<u64>)> {
         self.physics.path_ground(at, Some(self.car))
     }
-    /// The alpha does not yet place `AiHintNode` hardpoints: none.
-    fn hints(&mut self, _: u64) -> Vec<(u32, Vec3)> {
-        Vec::new()
+    /// Its `AiHintNode` points, when it is a placed object or a state
+    /// layer's prop.
+    fn hints(&mut self, id: u64) -> Vec<(u32, Vec3)> {
+        self.physics
+            .obstacle_key(id)
+            .map_or_else(Vec::new, self.hints)
     }
     fn body(&mut self, id: u64) -> Option<path_search::Obstacle> {
         self.physics.obstacle(id)
@@ -232,6 +242,7 @@ impl AttackWorld for Look<'_> {
             let mut world = Ground {
                 physics: self.physics,
                 car: self.car,
+                hints: self.hints,
                 sweeps: 0,
                 ground_hits: 0,
                 body_hits: 0,
@@ -399,6 +410,7 @@ impl Assaults {
         vehicles: &mut [ParkedVehicle],
         foes: &[(usize, Vec3, bool)],
         labels: impl Fn(&ParkedVehicle) -> Vec<u32>,
+        hints: Hints<'_>,
         dt: f32,
     ) {
         self.out.retain(|i, _| foes.iter().any(|f| f.0 == *i));
@@ -440,6 +452,7 @@ impl Assaults {
                     height: hi.y,
                 },
                 route: &mut a.route,
+                hints,
                 ahead: path_search::lookahead((hi - lo).max_element(), car.speed().abs(), dt),
             };
             if v.spec.kind == "tank" {
@@ -751,6 +764,7 @@ impl Pursuers {
         she: Her,
         vanish: f32,
         labels: impl Fn(&ParkedVehicle) -> Vec<u32>,
+        hints: Hints<'_>,
         dt: f32,
     ) -> Vec<usize> {
         self.shots.clear();
@@ -972,6 +986,7 @@ impl Pursuers {
                         height: v.spec.bounds.1.y,
                     },
                     route: &mut p.route,
+                    hints,
                     ahead: path_search::lookahead(
                         (v.spec.bounds.1 - v.spec.bounds.0).max_element(),
                         car.speed().abs(),
@@ -1033,6 +1048,7 @@ impl Pursuers {
                             height: v.spec.bounds.1.y,
                         },
                         route: &mut p.route,
+                        hints,
                         ahead: path_search::lookahead(
                             (v.spec.bounds.1 - v.spec.bounds.0).max_element(),
                             car.speed().abs(),
@@ -1233,7 +1249,14 @@ mod tests {
         assaults.out.insert(3, Assault::default());
         assert!(assaults.holds(3));
         let mut physics = Physics::new();
-        assaults.drive(&mut physics, &mut [], &[], |_| Vec::new(), 0.1);
+        assaults.drive(
+            &mut physics,
+            &mut [],
+            &[],
+            |_| Vec::new(),
+            &|_| Vec::new(),
+            0.1,
+        );
         assert!(!assaults.holds(3));
     }
     // Cars come in only for her in a tank, by a road or driving, tanks
