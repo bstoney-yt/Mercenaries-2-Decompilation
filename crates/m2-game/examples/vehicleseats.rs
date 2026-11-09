@@ -61,8 +61,8 @@ fn main() -> Result<()> {
                 println!("{name} ({id:#x}):");
                 for s in &v.seats {
                     println!(
-                        "  seat {:08x} hardpoint {:x?} driver {} gunner {} hijackable {} player_use {} rows {:x?}",
-                        s.name, s.hardpoint, s.driver, s.gunner, s.hijackable, s.player_use, s.rows
+                        "  seat {:08x} hardpoint {:x?} driver {} gunner {} hijackable {} player_use {} rows {:x?} links {:x?}",
+                        s.name, s.hardpoint, s.driver, s.gunner, s.hijackable, s.player_use, s.rows, s.links
                     );
                 }
                 for e in &v.entrances {
