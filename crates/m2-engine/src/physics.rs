@@ -5852,6 +5852,17 @@ impl Physics {
         })
     }
 
+    /// What a path search's obstacle `id` is, when a static (a placed
+    /// object, a state layer's prop, a terrain cell).
+    pub fn obstacle_key(&self, id: u64) -> Option<StaticKey> {
+        self.keys
+            .get(&r::ColliderHandle::from_raw_parts(
+                id as u32,
+                (id >> 32) as u32,
+            ))
+            .copied()
+    }
+
     /// A path search's obstacle by its id
     /// ([`sweep_obstacle`](Self::sweep_obstacle)).
     pub fn obstacle(&self, id: u64) -> Option<crate::path_search::Obstacle> {

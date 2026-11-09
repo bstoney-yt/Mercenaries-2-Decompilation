@@ -141,6 +141,9 @@ pub struct Game {
     pub gunships: crate::gunships::Gunships,
     /// A pursuit's cars ([`crate::pursuers`]).
     pub pursuers: crate::pursuers::Pursuers,
+    /// The `AiHintNode` points AI vehicles' path searches go by
+    /// ([`crate::path_hints`]).
+    pub path_hints: crate::path_hints::PathHints,
     /// The armies' patrols gone after a foe.
     pub assaults: crate::pursuers::Assaults,
     /// Vehicles the mission scripts send along a path (`crate::paths`).
@@ -462,6 +465,7 @@ impl Game {
             gunships: crate::gunships::Gunships::default(),
             pursuers: crate::pursuers::Pursuers::default(),
             assaults: crate::pursuers::Assaults::default(),
+            path_hints: crate::path_hints::PathHints::default(),
             paths: crate::paths::PathMoves::default(),
             roads: crate::roads::RoadTraffic::default(),
             census: std::env::var("M2_LIFE_CENSUS")
@@ -1769,11 +1773,36 @@ impl Game {
                 })
                 .collect();
             let template_db = &world.index.template_db;
+            if let Some(install) = &self.scene.install
+                && self.path_hints.load(install, template_db)
+            {
+                let placed = world
+                    .index
+                    .objects
+                    .iter()
+                    .filter(|o| self.path_hints.has(o.template))
+                    .count();
+                eprintln!("path hints: {placed} placed objects offer them");
+            }
+            let (objects, props, path_hints) =
+                (&world.index.objects, &self.scene.props, &self.path_hints);
+            let hints = |key: StaticKey| {
+                path_hints.of(key, |k| match k {
+                    StaticKey::Object(i) => {
+                        objects.get(i).map(|o| (o.template, o.position, o.rotation))
+                    }
+                    StaticKey::Entity(e) => props
+                        .get(e)
+                        .map(|(p, _)| (p.template, p.position, p.rotation)),
+                    _ => None,
+                })
+            };
             self.assaults.drive(
                 &mut world.physics,
                 &mut self.scene.vehicles,
                 &foes,
                 |v| template_db.vehicle_labels_for(&v.spec.label, v.spec.model),
+                &hints,
                 dt,
             );
             self.traffic.drive(
@@ -1837,6 +1866,7 @@ impl Game {
                             .template_db
                             .vehicle_labels_for(&v.spec.label, v.spec.model)
                     },
+                    &hints,
                     dt,
                 );
                 for i in dropped {
