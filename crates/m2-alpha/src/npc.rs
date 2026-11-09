@@ -913,6 +913,10 @@ pub struct Npc {
     pub faction: Option<&'static str>,
     /// Whom they go for ([`People::war`]).
     pub slot: m2_engine::ai_target::Slot,
+    /// Their own attitude to each army they have perceived one of
+    /// ([`m2_engine::ai_target::Attitude`]): it follows the relation
+    /// down at once and back up slowly.
+    attitudes: Vec<(&'static str, m2_engine::ai_target::Attitude)>,
     /// Where the person in their slot now is, unless that's her.
     pub foe_at: Option<Vec3>,
     /// The armour class of the vehicle they go for, if it is one.
@@ -1204,6 +1208,7 @@ impl Npc {
             held: false,
             faction: None,
             slot: m2_engine::ai_target::Slot::default(),
+            attitudes: Vec::new(),
             foe_at: None,
             foe_armour: None,
             foe_look: 0.0,
@@ -3323,12 +3328,58 @@ impl People {
     /// Whether faction `a`'s people may attack faction `b`'s: how `a`
     /// regards `b`, each way apart (0x822F0440 takes the pair in order).
     fn at_war(&self, a: &str, b: &str) -> bool {
-        a != b
-            && self
-                .relations
-                .iter()
-                .find(|((x, y), _)| *x == a && *y == b)
-                .is_some_and(|(_, r)| m2_engine::ai_target::attacks(*r))
+        a != b && m2_engine::ai_target::attacks(self.relation(a, b))
+    }
+
+    /// How faction `a` regards faction `b`, -100 to 100; 0 for a pair
+    /// nobody set (0x822F0440 answers 0 for those).
+    fn relation(&self, a: &str, b: &str) -> f32 {
+        self.relations
+            .iter()
+            .find(|((x, y), _)| *x == a && *y == b)
+            .map_or(0.0, |(_, r)| *r)
+    }
+
+    /// Whether person `i` may attack those of army `f` now: by their own
+    /// attitude to it once they have perceived one of them, else by their
+    /// army's relation.
+    fn hostile(&self, i: usize, f: &str) -> bool {
+        let n = &self.npcs[i];
+        match n.attitudes.iter().find(|(x, _)| *x == f) {
+            Some((_, a)) => a.attacks(),
+            None => n.faction.is_some_and(|side| self.at_war(side, f)),
+        }
+    }
+
+    /// Person `i` perceives one of army `f`: a new attitude to it takes
+    /// the relation as it is (0x822D5948).
+    fn perceive(&mut self, i: usize, f: &'static str) {
+        let Some(side) = self.npcs[i].faction else {
+            return;
+        };
+        if side != f && !self.npcs[i].attitudes.iter().any(|(x, _)| *x == f) {
+            let a = m2_engine::ai_target::Attitude::new(self.relation(side, f));
+            self.npcs[i].attitudes.push((f, a));
+        }
+    }
+
+    /// Each person's attitudes follow their army's relations, `dt`
+    /// seconds on (0x822DE240 then 0x822D5948).
+    fn calm(&mut self, dt: f32) {
+        for i in 0..self.npcs.len() {
+            let Some(side) = self.npcs[i].faction else {
+                continue;
+            };
+            let mut attitudes = std::mem::take(&mut self.npcs[i].attitudes);
+            for (f, a) in &mut attitudes {
+                let was = a.attacks();
+                a.think(self.relation(side, f), dt);
+                if was && !a.attacks() {
+                    eprintln!("war: a {side} soldier calms toward the {f}");
+                }
+            }
+            self.npcs[i].attitudes = attitudes;
+        }
     }
 
     /// From how far she can be seen now, metres.
@@ -3367,18 +3418,21 @@ impl People {
         };
         let near: Vec<usize> = (0..self.npcs.len())
             .filter(|&j| j != i && self.npcs[j].alive)
-            .filter(|&j| self.npcs[j].faction.is_some_and(|f| self.at_war(f, side)))
+            .filter(|&j| self.npcs[j].faction.is_some_and(|f| f != side))
             .filter(|&j| self.npcs[j].character.position.distance(from) < reach)
             .collect();
         for j in near {
-            self.npcs[j].heard = Some(by);
+            self.perceive(j, side);
+            if self.hostile(j, side) {
+                self.npcs[j].heard = Some(by);
+            }
         }
     }
 
     /// Whether persons `i` and `j` are of armies at war.
     pub fn enemies(&self, i: usize, j: usize) -> bool {
         match (self.npcs[i].faction, self.npcs[j].faction) {
-            (Some(a), Some(b)) => self.at_war(a, b),
+            (Some(a), Some(b)) => a != b && self.hostile(i, b),
             _ => false,
         }
     }
@@ -3403,6 +3457,7 @@ impl People {
                     .map(|(i, v)| (VEHICLES + i as u32, v.faction, v.at, v.visibility)),
             )
             .collect();
+        self.calm(dt);
         for i in 0..self.npcs.len() {
             if !self.npcs[i].can_war() {
                 if self.npcs[i].foe_at.take().is_some() {
@@ -3416,7 +3471,7 @@ impl People {
             let at = self.npcs[i].chest();
             let held = self.npcs[i].slot.who.filter(|&w| w != HER);
             let foe = held.and_then(|w| all.iter().find(|c| c.0 == w));
-            if held.is_some() && foe.is_none_or(|c| !self.at_war(side, c.1)) {
+            if held.is_some() && foe.is_none_or(|c| !self.hostile(i, c.1)) {
                 let n = &mut self.npcs[i];
                 n.slot.clear();
                 n.foe_at = None;
@@ -3450,7 +3505,10 @@ impl People {
                 .filter(|c| c.0 <= c.4 || Some(c.1) == heard || Some(c.1) == shot)
                 .collect();
             seen.sort_by(|a, b| a.0.total_cmp(&b.0));
-            seen.retain(|c| self.at_war(side, c.3));
+            for c in &seen {
+                self.perceive(i, c.3);
+            }
+            seen.retain(|c| self.hostile(i, c.3));
             seen.truncate(FOE_LOOKS);
             let n = &mut self.npcs[i];
             let current = n.foe_at.map(|f| f.distance(at));
@@ -5604,6 +5662,52 @@ pub(crate) mod tests {
         people.heard_shot(1, Vec3::new(0.0, 1.6, 110.0), 120.0);
         people.war(&physics, None, 0.25);
         assert!(people.npcs[0].foe_at.is_some(), "he heard the shot");
+    }
+
+    #[test]
+    fn made_peace_a_soldier_fights_on_until_he_calms_but_war_is_at_once() {
+        let physics = ground();
+        let mut people = People::default();
+        for (k, (z, side)) in [(0.0, "Vza"), (20.0, "All")].into_iter().enumerate() {
+            let post = Brain::Post { facing: 0.0 };
+            let mut n = Npc::new(k, &rig(), Vec3::new(0.0, 1.0, z), 0.0, post, Some(1));
+            n.facing = if z > 0.0 { std::f32::consts::PI } else { 0.0 };
+            n.faction = Some(side);
+            n.gun = Some(rifle());
+            n.landed = true;
+            n.soldier = false;
+            n.character.position = Vec3::new(0.0, 0.0, z);
+            people.npcs.push(n);
+        }
+        let set = |p: &mut People, r: f32| {
+            p.set_relations(
+                [(("Vza", "All"), r), (("All", "Vza"), r)]
+                    .into_iter()
+                    .collect(),
+            );
+        };
+        set(&mut people, -60.0);
+        let dt = 0.25;
+        people.war(&physics, None, dt);
+        assert!(people.npcs[0].foe_at.is_some(), "at war");
+        // Peace: he still fights after a minute, has calmed by 95 s
+        // (from -60 past -33 at 0.3 a second).
+        set(&mut people, 10.0);
+        let mut t = 0.0;
+        while t < 60.0 {
+            people.war(&physics, None, dt);
+            t += dt;
+        }
+        assert!(people.npcs[0].foe_at.is_some(), "still angry at 60 s");
+        while t < 95.0 {
+            people.war(&physics, None, dt);
+            t += dt;
+        }
+        assert_eq!(people.npcs[0].foe_at, None, "calmed by 95 s");
+        // War again: at once.
+        set(&mut people, -60.0);
+        people.war(&physics, None, dt);
+        assert!(people.npcs[0].foe_at.is_some(), "hostile at once");
     }
 
     #[test]

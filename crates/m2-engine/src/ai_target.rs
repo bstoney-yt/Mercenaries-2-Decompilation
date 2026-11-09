@@ -15,6 +15,52 @@
 //! [`BASE`]. What's left is the distance: within [`NEAR`] (or [`HOLD`] for
 //! the one in the slot) a subject counts double, and one nearer than the
 //! one in the slot gains [`CLOSER`].
+//!
+//! What a mind holds of a subject is not the relation itself but its own
+//! attitude ([`Attitude`], the record's +0xE4), which follows the
+//! relation (+0xA0): down at once, back up slowly. Made worse, a mind is
+//! hostile at once; made better, it calms over time.
+
+/// How fast an attitude climbs back toward a better relation, per second
+/// (0x820BAF0C, 0x822DE240).
+pub const CALMS_PER_SECOND: f32 = 0.3;
+/// How far an attitude may sit from the relation before it moves
+/// (0x820BAEE8, 0x822DE240).
+const SLACK: f32 = 1.0;
+
+/// A mind's attitude to a subject it perceives: the perception record's
+/// +0xE4, set through 0x822D5BF8.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Attitude(pub f32);
+
+impl Attitude {
+    /// A new record takes the relation as it is (0x822D5948 with its
+    /// last argument set).
+    pub fn new(relation: f32) -> Self {
+        Self(relation)
+    }
+
+    /// One think, `dt` seconds: the record's age step (0x822DE240) moves
+    /// the attitude [`CALMS_PER_SECOND`] toward the relation once it is
+    /// more than [`SLACK`] off, either way; then the relation is read
+    /// again (0x822D5948), and one below the attitude replaces it.
+    pub fn think(&mut self, relation: f32, dt: f32) {
+        let step = CALMS_PER_SECOND * dt;
+        if self.0 > relation + SLACK {
+            self.0 -= step;
+        } else if self.0 < relation - SLACK {
+            self.0 += step;
+        }
+        if relation < self.0 {
+            self.0 = relation;
+        }
+    }
+
+    /// Whether the mind may attack the subject now ([`attacks`]).
+    pub fn attacks(self) -> bool {
+        attacks(self.0)
+    }
+}
 
 /// A relation below this may be attacked (the program's first band,
 /// -100 to -33, rule bits 7).
@@ -76,6 +122,27 @@ impl Slot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostility_is_at_once_and_calm_comes_slowly() {
+        let mut a = Attitude::new(-60.0);
+        assert!(a.attacks());
+        // Made peace: 0.3 a second, so from -60 past -33 takes 90 s.
+        let mut t = 0.0_f32;
+        while a.attacks() {
+            a.think(0.0, 0.1);
+            t += 0.1;
+        }
+        assert!((t - 90.0).abs() < 0.2, "{t}");
+        // It settles within a point of the relation.
+        for _ in 0..2000 {
+            a.think(0.0, 0.1);
+        }
+        assert!((-1.0..=0.0).contains(&a.0), "{}", a.0);
+        // War again: at once.
+        a.think(-50.0, 0.1);
+        assert_eq!(a, Attitude(-50.0));
+    }
 
     #[test]
     fn only_the_hostile_band_may_be_attacked() {
