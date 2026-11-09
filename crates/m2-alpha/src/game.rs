@@ -2048,10 +2048,20 @@ impl Game {
                     at: at.transform_point3(Vec3::Y),
                     visibility: v.spec.tuning.visibility.unwrap_or(200.0),
                     armour: v.spec.tuning.armour.unwrap_or(1),
+                    threat: vehicle_threat(&v.spec),
                 })
             })
             .collect();
         self.scene.people.vehicle_subjects = subjects;
+        // What she carries, for her threat to soldiers: a vehicle's mounts
+        // when she drives one.
+        self.scene.people.her_arms = self
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| self.scene.vehicles.get(i))
+            .map(|v| crate::npc::Arms::Vehicle(vehicle_threat(&v.spec)));
         if let Some(world) = &mut self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {
@@ -5811,4 +5821,12 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
             );
         }
     }
+}
+
+/// How much of a threat a vehicle is to a soldier on foot: its mounted
+/// weapons' `WeaponHint`s' best rating, 0.6 at the least
+/// ([`m2_engine::ai_target::threat`], 0x822EC430).
+fn vehicle_threat(spec: &m2_engine::vehicle::VehicleSpec) -> f32 {
+    let hints = spec.armed.iter().filter_map(|m| m.weapon.hint.as_ref());
+    m2_engine::ai_target::threat(hints, m2_engine::ai_target::HUMAN, 0.0, true)
 }

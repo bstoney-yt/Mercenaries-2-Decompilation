@@ -46,6 +46,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Layer::parse(&data)?;
     let names = db.names();
     let c = db.component(component).ok_or("no such component")?;
+    if fields.is_empty() {
+        // No fields asked for: list the component's, by hash and place.
+        for f in &c.fields {
+            println!(
+                "#{:08x} @{:#x} bits {}..{}",
+                f.name_hash,
+                f.offset,
+                f.bit_shift,
+                u32::from(f.bit_shift) + u32::from(f.bit_width)
+            );
+        }
+        return Ok(());
+    }
     let at: Vec<Option<(usize, u8, u8)>> = fields
         .iter()
         .map(|n| {
