@@ -4697,6 +4697,17 @@ impl Autoplay {
             |d| m.transform_point3(d),
         );
         let here = p.character.position;
+        // Crewed and taken only by its hijack (PmcCon001's villa tank):
+        // the key anywhere close by starts it, door or not (round 4 stood
+        // 3 m off its door for minutes, the way to it blocked). Before the
+        // door's side below (round r5c circled the tank's hatch 420 s).
+        let v = &game.scene.vehicles[i];
+        if game.hijack_only.contains(&v.spec.model)
+            && !v.crew.is_empty()
+            && (m.w_axis.truncate() - here).length() < HIJACK_NEAR
+        {
+            return self.press(0.0);
+        }
         // Another entrance nearer her than the door's is the one the use
         // key takes (the nearest, [`m2_engine::seats::pick`]): OilCon021's
         // mail scooter's pillion entrance, whose seat she may not use, had
@@ -4731,16 +4742,6 @@ impl Autoplay {
                 look,
                 ..self.press(0.0)
             };
-        }
-        // Crewed and taken only by its hijack (PmcCon001's villa tank):
-        // the key anywhere close by starts it, door or not (round 4 stood
-        // 3 m off its door for minutes, the way to it blocked).
-        let v = &game.scene.vehicles[i];
-        if game.hijack_only.contains(&v.spec.model)
-            && !v.crew.is_empty()
-            && (m.w_axis.truncate() - here).length() < HIJACK_NEAR
-        {
-            return self.press(0.0);
         }
         self.walk(game, door, 1.0, dt)
     }
