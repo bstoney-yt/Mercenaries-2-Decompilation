@@ -221,9 +221,9 @@ impl AttackWorld for Look<'_> {
     }
 
     /// Its way to `goal`, searched once for each goal (0x822BF5E0 keeps a
-    /// way while its goal stays put), then followed a lookahead on; straight
-    /// at the goal when the search found none.
-    fn toward(&mut self, from: Vec3, goal: Vec3) -> Vec3 {
+    /// way while its goal stays put), then followed a lookahead on; none
+    /// when the search found none (0x822BF1C0 marks the way failed).
+    fn toward(&mut self, from: Vec3, goal: Vec3) -> Option<Vec3> {
         if self
             .route
             .as_ref()
@@ -250,8 +250,8 @@ impl AttackWorld for Look<'_> {
             *self.route = Some((goal, way));
         }
         match self.route.as_ref() {
-            Some((_, Some(w))) => w.ahead_of(from, self.ahead),
-            _ => goal,
+            Some((_, Some(w))) => Some(w.ahead_of(from, self.ahead)),
+            _ => None,
         }
     }
 

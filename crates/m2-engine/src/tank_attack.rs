@@ -33,7 +33,9 @@
 //!   fire, 0x822ECA20) and nothing just ahead (0x822C8CB8): it stops and
 //!   charges (state 3, timer `2r + 4.5`). Otherwise it goes on its way
 //!   unless the way is done or it is driving away from her at over
-//!   2 m/s (0x822C1B68); then it stops and holds.
+//!   2 m/s (0x822C1B68), or its search found no way (the mind's +0x18
+//!   bit 0x10, set by 0x822BF1C0); then it stops and holds, and picks
+//!   another point when the timer runs out.
 //! - **2, turning to face her** (0x822B5A88) until the timer runs out or
 //!   she has gone unseen 5 s (state 0, timer `r + 2.25`).
 //! - **3, charging** at her at up to 25 m/s (0x822B5B98) while she was
@@ -323,9 +325,13 @@ impl TankAttack {
             if (end - car.at).with_y(0.0).length_squared() <= 16.0 {
                 self.way = None;
                 self.timer = w.rand() * 2.0 + 4.5;
-            } else {
-                let to = w.toward(car.at, end);
+            } else if let Some(to) = w.toward(car.at, end) {
                 return drive_to(car, to, 10.0, false);
+            } else {
+                // No way (the mind's +0x18 bit 0x10): 0x822B6508 stops
+                // and holds, as when its way is done.
+                self.way = None;
+                self.state = State::Hold;
             }
         }
         stop(car).0
@@ -415,6 +421,29 @@ mod tests {
         let mut t = TankAttack::default();
         t.think(&hull(0.0), &her(0.0, -60.0), &mut w, 0.1);
         assert_eq!(t.state, State::Turning);
+    }
+
+    #[test]
+    fn with_no_way_found_it_stops_and_holds() {
+        struct NoWay;
+        impl AttackWorld for NoWay {
+            fn rand(&mut self) -> f32 {
+                0.5
+            }
+            fn line_clear(&mut self, _: Vec3, _: Vec3) -> bool {
+                true
+            }
+            fn toward(&mut self, _: Vec3, _: Vec3) -> Option<Vec3> {
+                None
+            }
+        }
+        let mut t = TankAttack::default();
+        // It picks a point round her, and its search finds no way there:
+        // it doesn't drive straight at it, it stops.
+        let i = t.think(&hull(4.0), &her(0.0, 150.0), &mut NoWay, 0.1);
+        assert_eq!(t.state, State::Hold);
+        assert_eq!(t.way, None);
+        assert!(i.throttle < 0.0 && i.steer == 0.0, "{i:?}");
     }
 
     // Hit hard by her: facing her, it backs off; not facing her, it turns.
