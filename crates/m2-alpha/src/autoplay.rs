@@ -2098,6 +2098,14 @@ impl Autoplay {
         {
             live.retain(|m| !SAVE_FOR_LAST.contains(&m.name.as_str()));
         }
+        // Someone following her to a place to deliver them goes there
+        // first: the rest waits (the contract sweep's ChiCon001 got out
+        // with the VIP aboard to bomb a building on the way, and the
+        // scripts sent the VIP to stand).
+        if !game.scene.people.followers().is_empty() && live.iter().any(|m| m.kind == "deliverable")
+        {
+            live.retain(|m| m.kind == "deliverable");
+        }
         // Every munition marked for her tagged (JetCon001's three bunker
         // busters, `Munitions.ActionTarget`): the pickup the tagging
         // stocked her with (`MunitionsPickup`, the munitions helicopter)
