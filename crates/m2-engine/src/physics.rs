@@ -1835,6 +1835,12 @@ const TURRET_DAMP: f32 = 200.0;
 /// it reads there (0x8380EC18) is in zeroed memory and no code found
 /// writes it (searched as a store, an immediate and a pointer), so 0.
 const TURRET_LEAD_DAMP: f32 = 0.0;
+/// How far, radians, the angle asked must be from where a sleeping
+/// turret points to wake it: the 360's turret update sets its action's
+/// angle every frame (0x821A64B8) and wakes its body only when the
+/// square of that error is over 0.001 (the constant at 0x820F8BE4), about
+/// 1.8 degrees. Closer, it and its tank sleep on.
+const TURRET_WAKE: f32 = 0.031_622_78;
 
 /// A turret's gun on a body of its own, on a hinge across the turret
 /// at its trunnions, as the 360 code builds it (0x82275974 calls
@@ -4602,9 +4608,14 @@ impl Physics {
                     } else {
                         TURRET_DAMP
                     };
-                    let want = (w + dt * (TURRET_PULL * e - damp * w)).clamp(-h.speed, h.speed);
-                    let change = (want - w).clamp(-h.accel * dt, h.accel * dt);
-                    b.set_angvel(vector(spin + up * change), change.abs() > 1e-6);
+                    // Asleep, it is woken only when the angle asked is
+                    // more than [`TURRET_WAKE`] off where it points
+                    // (0x821A64B8); else it, and its island, sleep on.
+                    if !b.is_sleeping() || e * e > TURRET_WAKE * TURRET_WAKE {
+                        let want = (w + dt * (TURRET_PULL * e - damp * w)).clamp(-h.speed, h.speed);
+                        let change = (want - w).clamp(-h.accel * dt, h.accel * dt);
+                        b.set_angvel(vector(spin + up * change), true);
+                    }
                 }
             }
             // Its gun to the pitch asked.
@@ -6457,6 +6468,78 @@ mod tests {
     // once, it speeds up no faster than its `MaxYawAccel`, turns no faster
     // than its `MaxYawSpeed`, and settles on the angle asked, the hull
     // left as it was.
+    #[test]
+    fn a_sleeping_turret_wakes_only_when_asked_more_than_its_threshold_off() {
+        // 0x821A64B8: a sleeping turret's body is woken only when the angle
+        // asked is more than sqrt(0.001) radians (1.8 degrees) off.
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let mut block = Vec::new();
+        for x in [-1.0, 1.0] {
+            for y in [1.6, 2.4] {
+                for z in [-1.0, 2.0] {
+                    block.push(Vec3::new(x, y, z));
+                }
+            }
+        }
+        let spec = VehicleSpec {
+            turret_shapes: vec![block].into(),
+            turret_mass: Some(crate::vehicle::Chassis {
+                mass: 3000.0,
+                inertia: Mat3::from_diagonal(Vec3::new(2000.0, 2500.0, 1000.0)),
+                centre_of_mass: Vec3::new(0.0, 2.0, 0.3),
+            }),
+            pivot: Some(Vec3::new(0.0, 2.0, 0.0)),
+            mass: 30000.0,
+            tuning: crate::tuning::VehicleTuning {
+                turret: Some(crate::tuning::TurretTuning {
+                    main: true,
+                    yaw_speed: 0.5,
+                    yaw_accel: 2.0,
+                    pitch: (-0.1, 0.3),
+                    pitch_speed: 1.0,
+                    pitch_accel: 20.0,
+                    yaw: None,
+                }),
+                ..car().tuning
+            },
+            ..car()
+        };
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.5, 0.0), 0.0);
+        for _ in 0..60 {
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        let start = p.turret_yaw(id).unwrap();
+        let v = p.vehicles[id.0].as_ref().unwrap();
+        let (chassis, turret) = (v.controller.chassis, v.hinge.as_ref().unwrap().body);
+        p.turn_turret(id, start);
+        p.world.bodies[chassis].sleep();
+        p.world.bodies[turret].sleep();
+        let asleep = |p: &Physics| p.world.bodies[turret].is_sleeping();
+        // 1.5 degrees off: it sleeps on.
+        for _ in 0..30 {
+            p.turn_turret(id, start + 1.5f32.to_radians());
+            p.step(DT);
+        }
+        assert!(asleep(&p), "woken 1.5 degrees off");
+        assert!((p.turret_yaw(id).unwrap() - start).abs() < 1e-4);
+        // 2.5 degrees off: woken, it turns there.
+        for _ in 0..120 {
+            p.turn_turret(id, start + 2.5f32.to_radians());
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        let turned = (p.turret_yaw(id).unwrap() - start).to_degrees();
+        assert!(turned > 1.5, "turned {turned} degrees");
+    }
+
     #[test]
     fn a_turret_on_its_own_body_turns_as_the_360_action_turns_it() {
         let mut p = Physics::new();
