@@ -1431,6 +1431,20 @@ impl Mission {
         {
             o.vehicle = vehicle;
             o.seated_instantly = false;
+            o.not_driving = false;
+        }
+    }
+
+    /// Puts the player in `vehicle` as a passenger (the scripts'
+    /// helicopter its own pilot flies): seat events fire on the next tick,
+    /// and `Vehicle.GetDriver` still answers its pilot, not her.
+    pub fn ride_as_passenger(&mut self, vehicle: u32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&PLAYER)
+            && o.vehicle != Some(vehicle)
+        {
+            o.vehicle = Some(vehicle);
+            o.seated_instantly = false;
+            o.not_driving = true;
         }
     }
 
