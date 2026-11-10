@@ -43,6 +43,7 @@ mod aim;
 #[cfg(target_os = "android")]
 mod android;
 mod autoplay;
+mod bench;
 mod binoculars;
 mod boarding;
 mod breakables;
@@ -59,6 +60,7 @@ mod drops;
 mod entrance_marker;
 mod flights;
 mod flow;
+mod frametimes;
 mod game;
 mod gamehud;
 mod grapple;
@@ -168,6 +170,9 @@ struct Options {
     guns: Vec<String>,
     gait: Option<Gait>,
     double_sided: bool,
+    /// `--bench <seconds>`: fly the [`bench::Route`] headless for so long
+    /// and log the frame rate and where the time goes.
+    bench: Option<f32>,
     fly: bool,
     /// The developer's keys in the whole game's launch too (`--dev`): the
     /// free camera, quick save and load, culling, the gait cycle.
@@ -649,6 +654,14 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--refresh" => o.refresh = Some(value()?.parse().context("--refresh expects hertz")?),
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
+            "--bench" => {
+                o.bench = Some(
+                    value()?
+                        .parse()
+                        .context("--bench expects seconds of flight")?,
+                );
+                o.fly = true;
+            }
             "--dev" => o.dev = true,
             // The default since round 25; kept so old launch lines work.
             "--skip-mode-off" => o.skip_mode_off = true,
@@ -1920,6 +1933,13 @@ fn screenshot(
     if options.fly {
         game.on_foot = false;
     }
+    let route = options
+        .bench
+        .and(game.scene.world.as_ref())
+        .map(|w| bench::Route::new(&w.index));
+    if let Some(r) = &route {
+        game.camera = r.pose(0.0);
+    }
     let fov = config.camera.fov;
     let mut aspect = w as f32 / h as f32;
     let tick = TICK.as_secs_f32();
@@ -2001,6 +2021,11 @@ fn screenshot(
             aspect,
             out,
         );
+    }
+    if let (Some(seconds), Some(route)) = (options.bench, &route) {
+        run_bench(&mut backend, &mut game, route, seconds, fov, aspect)?;
+        write_ppm(&backend, out)?;
+        return Ok(());
     }
     // The last frames are timed: the frame rate here, for checking.
     // Where the time goes: the tick, streaming, building the draws, and
@@ -2715,6 +2740,130 @@ fn screenshot(
 /// Puts the camera `reach` metres off the pickup lying nearest her, a
 /// little above it and looking at it, and says which it is and whether
 /// its model has loaded.
+/// Seconds of flight between `bench:` lines.
+const BENCH_EVERY: f32 = 10.0;
+
+/// Flies `route` for `seconds` (one tick a frame, no more than two frames
+/// on the GPU at once), logging a `bench:` line every [`BENCH_EVERY`]
+/// seconds of flight and a `bench summary:` at the end: the frame rate
+/// and its 1% low, the frame time's median and 99th percentile, the CPU's
+/// milliseconds a frame in the tick, streaming, building the draws,
+/// submitting and waiting for the GPU, the GPU's in each stage, and draws
+/// a frame.
+fn run_bench(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    route: &bench::Route,
+    seconds: f32,
+    fov: f32,
+    aspect: f32,
+) -> anyhow::Result<()> {
+    const PARTS: [&str; 5] = ["tick", "stream", "draws", "submit", "wait"];
+    let tick = TICK.as_secs_f32();
+    let frames = (seconds / tick).ceil().max(1.0) as u32;
+    eprintln!(
+        "bench: flying {:.0} m round the loop for {seconds:.0} s ({frames} frames)",
+        route.length()
+    );
+    let _ = backend.take_gpu_times();
+    let (mut all, mut span) = (
+        frametimes::FrameTimes::default(),
+        frametimes::FrameTimes::default(),
+    );
+    let (mut cpu_all, mut cpu_span) = ([0.0f64; 5], [0.0f64; 5]);
+    let (mut gpu_all, mut draws_all, mut draws_span) =
+        (m2_render::gpu::timer::GpuTimes::default(), 0u64, 0u64);
+    let mut next_line = BENCH_EVERY;
+    for k in 1..=frames {
+        let t = k as f32 * tick;
+        let start = Instant::now();
+        let mut lap = start;
+        let part = |i: usize, lap: &mut Instant, cpu: &mut [f64; 5]| {
+            cpu[i] += lap.elapsed().as_secs_f64() * 1000.0;
+            *lap = Instant::now();
+        };
+        let mut cpu = [0.0f64; 5];
+        game.camera = route.pose(t);
+        game.step(Intent::default(), tick);
+        part(0, &mut lap, &mut cpu);
+        let mut view = game.view(fov, aspect);
+        view.lighting.fog_density = 0.00025;
+        let focus = game.focus();
+        game.scene.update(backend, focus)?;
+        part(1, &mut lap, &mut cpu);
+        let mut queue = DrawQueue::new();
+        backend.begin_frame(&view)?;
+        game.scene.draw(backend, &mut queue, &view, &game.combat)?;
+        let drawn = queue.flush(&view, backend)?.draws as u64;
+        part(2, &mut lap, &mut cpu);
+        backend.end_frame()?;
+        part(3, &mut lap, &mut cpu);
+        backend.wait_for_frame_before_last()?;
+        part(4, &mut lap, &mut cpu);
+        let ms = start.elapsed().as_secs_f32() * 1000.0;
+        all.push(ms);
+        span.push(ms);
+        for i in 0..5 {
+            cpu_all[i] += cpu[i];
+            cpu_span[i] += cpu[i];
+        }
+        draws_all += drawn;
+        draws_span += drawn;
+        if t >= next_line || k == frames {
+            next_line += BENCH_EVERY;
+            let gpu = backend.take_gpu_times().unwrap_or_default();
+            gpu_all.frames += gpu.frames;
+            for (a, b) in gpu_all.stages.iter_mut().zip(gpu.stages) {
+                *a += b;
+            }
+            let n = span.summary().frames.max(1) as f64;
+            let s = span.summary();
+            let p = game.camera.position;
+            eprintln!(
+                "bench: {t:.0} s at ({:.0}, {:.0}, {:.0}): {:.1} fps, 1% low {:.1}, p50 {:.1} p99 {:.1} ms;                  cpu ms a frame {}; gpu {}; {} draws a frame",
+                p.x,
+                p.y,
+                p.z,
+                s.fps,
+                s.low1,
+                s.p50,
+                s.p99,
+                PARTS
+                    .iter()
+                    .zip(cpu_span)
+                    .map(|(name, v)| format!("{name} {:.2}", v / n))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                gpu_line(&gpu),
+                draws_span / n as u64,
+            );
+            span = frametimes::FrameTimes::default();
+            cpu_span = [0.0; 5];
+            draws_span = 0;
+        }
+    }
+    let s = all.summary();
+    let n = s.frames.max(1) as f64;
+    eprintln!(
+        "bench summary: {} frames, {:.1} fps, 1% low {:.1} fps, p50 {:.1} p99 {:.1} slowest {:.1} ms;          cpu ms a frame {}; gpu {}; {} draws a frame",
+        s.frames,
+        s.fps,
+        s.low1,
+        s.p50,
+        s.p99,
+        s.slowest,
+        PARTS
+            .iter()
+            .zip(cpu_all)
+            .map(|(name, v)| format!("{name} {:.2}", v / n))
+            .collect::<Vec<_>>()
+            .join(", "),
+        gpu_line(&gpu_all),
+        draws_all / n as u64,
+    );
+    Ok(())
+}
+
 fn look_at_pickup(game: &mut Game, reach: f32) {
     let Some(her) = game.scene.player.as_ref().map(|p| p.character.position) else {
         return;
@@ -8517,6 +8666,8 @@ struct Pace {
     frames: u32,
     slowest: Duration,
     slow: u32,
+    /// The span's frame times, for its 1% low and percentiles.
+    times: frametimes::FrameTimes,
 }
 
 impl Pace {
@@ -8531,6 +8682,7 @@ impl Pace {
         };
         let took = now - last;
         self.frames += 1;
+        self.times.push(took.as_secs_f32() * 1000.0);
         self.slowest = self.slowest.max(took);
         if took > Duration::from_millis(50) {
             self.slow += 1;
@@ -8540,13 +8692,18 @@ impl Pace {
         if span < PACE_EVERY {
             return None;
         }
+        let t = self.times.summary();
         let line = format!(
-            "pace: {:.0} fps over {span:.0} s, slowest frame {:.0} ms, {} over 50 ms, {}x{}",
+            "pace: {:.0} fps over {span:.0} s, slowest frame {:.0} ms, {} over 50 ms, {}x{}, \
+             1% low {:.0} fps, frame ms p50 {:.1} p99 {:.1}",
             self.frames as f32 / span,
             self.slowest.as_secs_f32() * 1000.0,
             self.slow,
             size.0,
-            size.1
+            size.1,
+            t.low1,
+            t.p50,
+            t.p99
         );
         *self = Self {
             since: Some((now, now)),
@@ -8554,6 +8711,23 @@ impl Pace {
         };
         Some((line, span))
     }
+}
+
+/// GPU milliseconds a frame, all stages and each
+/// ([`m2_render::gpu::timer::STAGES`]), over the frames timed.
+fn gpu_line(g: &m2_render::gpu::timer::GpuTimes) -> String {
+    let n = f64::from(g.frames.max(1));
+    let stages: Vec<String> = m2_render::gpu::timer::STAGES
+        .iter()
+        .zip(g.stages)
+        .map(|(name, ms)| format!("{name} {:.2}", ms / n))
+        .collect();
+    format!(
+        "ms a frame {:.2} over {} frames ({})",
+        g.per_frame(),
+        g.frames,
+        stages.join(", ")
+    )
 }
 
 struct Running {
@@ -9124,8 +9298,13 @@ impl Running {
                 Some(kb) => format!("; lua {kb} KB"),
                 None => String::new(),
             };
+            let gpu = self
+                .backend
+                .take_gpu_times()
+                .map(|g| format!("; gpu {}", gpu_line(&g)))
+                .unwrap_or_default();
             eprintln!(
-                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders{objects}, {} draws a frame; ms a second: {}{lua}",
+                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders{objects}, {} draws a frame; ms a second: {}{lua}{gpu}",
                 p.x,
                 p.z,
                 s.vehicles.len(),

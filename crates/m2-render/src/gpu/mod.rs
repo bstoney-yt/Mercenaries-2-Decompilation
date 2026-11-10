@@ -19,6 +19,7 @@
 mod post;
 mod shader;
 mod shadow;
+pub mod timer;
 
 use std::collections::HashMap;
 
@@ -469,6 +470,11 @@ pub struct WgpuBackend {
     frame: Option<OpenFrame>,
     /// Frames ended so far, which is also the number of the open frame.
     frames: u64,
+    /// The GPU time of each frame's stages, where the device can tell.
+    timer: Option<timer::GpuTimer>,
+    /// The last two offscreen frames' submissions, newest last
+    /// ([`wait_for_frame_before_last`](Self::wait_for_frame_before_last)).
+    submitted: [Option<wgpu::SubmissionIndex>; 2],
 }
 
 fn device_error(e: impl std::fmt::Display) -> BackendError {
@@ -655,6 +661,7 @@ impl WgpuBackend {
         width: u32,
         height: u32,
     ) -> Self {
+        let timer = timer::GpuTimer::new(&device, &queue);
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame"),
             entries: &[
@@ -1012,6 +1019,8 @@ impl WgpuBackend {
             materials: HashMap::new(),
             frame: None,
             frames: 0,
+            timer,
+            submitted: [None, None],
         }
     }
 
@@ -2257,9 +2266,19 @@ impl WgpuBackend {
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        let timer = self.timer.as_ref();
+        if let Some(t) = timer {
+            t.begin(&mut encoder);
+        }
         if let Some(cascades) = &cascades {
             self.encode_shadows(&mut encoder, &frame, cascades, refresh, draws)?;
         }
+        let mark = |encoder: &mut wgpu::CommandEncoder, stage: usize| {
+            if let Some(t) = timer {
+                t.mark(encoder, stage);
+            }
+        };
+        mark(&mut encoder, 0);
         // Water reads the depth of what lies beneath it, and water and
         // refracting surfaces the colour behind them, so the world is
         // drawn in two passes split at the first such draw, with the
@@ -2280,6 +2299,7 @@ impl WgpuBackend {
             0,
             true,
         )?;
+        mark(&mut encoder, 1);
         if split < draws.len() {
             encoder.copy_texture_to_texture(
                 self.depth.depth.as_image_copy(),
@@ -2300,8 +2320,14 @@ impl WgpuBackend {
                 false,
             )?;
         }
+        mark(&mut encoder, 2);
         self.encode_glows(&mut encoder, draws)?;
+        mark(&mut encoder, 3);
         self.post.encode(&self.queue, &mut encoder, l, target);
+        mark(&mut encoder, 4);
+        if let Some(t) = timer {
+            t.end(&mut encoder);
+        }
         Ok(encoder.finish())
     }
 }
@@ -2322,7 +2348,8 @@ async fn open(
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("m2"),
-            required_features: wgpu::Features::empty(),
+            // Timestamps for the frame timer, where the adapter has them.
+            required_features: adapter.features() & timer::features(),
             required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
             ..Default::default()
         })
@@ -2737,6 +2764,28 @@ impl WgpuBackend {
 }
 
 impl WgpuBackend {
+    /// Waits for the GPU to finish the offscreen frame before the last one
+    /// ended, so no more than two are in flight, as a window's swap chain
+    /// keeps them: a headless run's frame time is then the CPU's or the
+    /// GPU's, whichever is slower, and its frames don't pile up.
+    pub fn wait_for_frame_before_last(&self) -> Result<(), BackendError> {
+        if let Some(index) = self.submitted[0].clone() {
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(index),
+                    timeout: None,
+                })
+                .map_err(device_error)?;
+        }
+        Ok(())
+    }
+
+    /// The GPU time of each frame stage summed since last taken
+    /// ([`timer::STAGES`]); `None` where the device has no timestamps.
+    pub fn take_gpu_times(&self) -> Option<timer::GpuTimes> {
+        self.timer.as_ref().map(timer::GpuTimer::take)
+    }
+
     /// Ends the frame as [`RenderBackend::end_frame`] does, letting
     /// `overlay` draw over the world first.
     pub fn end_frame_with(
@@ -2811,7 +2860,11 @@ impl WgpuBackend {
                 let commands = self.encode(&view, &draws, &target)?;
                 let gamma = overlay_view(texture, format);
                 let overlay = over(&gamma, &mut overlay);
-                self.queue.submit(std::iter::once(commands).chain(overlay));
+                let index = self.queue.submit(std::iter::once(commands).chain(overlay));
+                self.submitted = [self.submitted[1].take(), Some(index)];
+                if let Some(t) = &self.timer {
+                    t.after_submit(&self.device);
+                }
             }
             // In the background: nothing to draw to.
             Target::Window { surface: None, .. } => {}
@@ -2838,6 +2891,9 @@ impl WgpuBackend {
                 let overlay = over(&gamma, &mut overlay);
                 self.queue.submit(std::iter::once(commands).chain(overlay));
                 self.queue.present(frame);
+                if let Some(t) = &self.timer {
+                    t.after_submit(&self.device);
+                }
             }
         }
         Ok(())
