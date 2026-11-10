@@ -3971,6 +3971,21 @@ impl People {
                             .is_some_and(|v| v.priority)
                 })
                 .count();
+            // Each priority target's nearest foe on foot, metres.
+            let nearest: Vec<f32> = self
+                .vehicle_subjects
+                .iter()
+                .filter(|v| v.priority)
+                .map(|v| {
+                    self.npcs
+                        .iter()
+                        .filter(|n| n.alive && n.landed)
+                        .filter(|n| n.faction.is_some_and(|f| self.at_war(f, v.faction)))
+                        .map(|n| n.chest().distance(v.at))
+                        .fold(f32::INFINITY, f32::min)
+                })
+                .collect();
+            eprintln!("war: priority targets' nearest foes on foot: {nearest:.0?} m");
             eprintln!(
                 "war: {sides:?}: {fighting} fighting ({on_priority} on a priority target), {fired} rounds, {hit} hit, {killed} killed"
             );
