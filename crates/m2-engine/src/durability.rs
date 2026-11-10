@@ -420,6 +420,34 @@ pub fn prop_physics(db: &Layer<'_>) -> HashMap<u32, PropPhysics> {
         .collect()
 }
 
+/// The collision preset of each template whose objects aren't buildings,
+/// by id ([`Preset`](crate::collision_layers::Preset)): a `_PropPhysics`
+/// one's by its record's `Mass` and heavy flag
+/// ([`Preset::of_prop`](crate::collision_layers::Preset::of_prop); a `Mass`
+/// it doesn't give reads 0), a `_DebrisPhysics` one's the prop preset
+/// (whether 0x82155328 makes one loose is not traced: it has no
+/// `_PropPhysics` record, so its answer then rests on the object's own
+/// state, 0x82187CA0). The rest are buildings.
+pub fn presets(db: &Layer<'_>) -> HashMap<u32, crate::collision_layers::Preset> {
+    use crate::collision_layers::Preset;
+    let mut out = HashMap::new();
+    let debris = Table::new(db, "_DebrisPhysics");
+    for id in debris.templates() {
+        out.insert(id, Preset::Prop);
+    }
+    let t = Table::new(db, "_PropPhysics");
+    let mass = name_hash("Mass");
+    for id in t.templates() {
+        let Some(r) = t.of_template(id).first() else {
+            continue;
+        };
+        let m = t.float(r, mass).unwrap_or(0.0);
+        let heavy = t.word(r, PROP_HEAVY) == Some(1);
+        out.insert(id, Preset::of_prop(m, heavy));
+    }
+    out
+}
+
 /// Each template's `PhysicsPropertyGravityScaler` `Scale`, by id: how
 /// many times gravity pulls its objects (1.5 on the weapons and grenades
 /// that lie to be taken: the `Assault Rifle`, the `Grenade`; PC data,

@@ -31,7 +31,7 @@ use rapier3d::control::{
     KinematicCharacterController, WheelTuning,
 };
 
-use crate::collision_layers::{self, layer_of, seen_by};
+use crate::collision_layers::{self, Preset, layer_of, seen_by};
 use crate::tuning::{
     BikeTuning, BoatFloat, BoatTuning, EngineTuning, FlightTuning, Gearbox, Handling, Springs,
     TankTuning, Tyres,
@@ -185,6 +185,9 @@ pub struct CollisionShape {
     /// hidden parts are dropped when it is rebuilt, 0x82152780). `None`
     /// without `PHY2` shapes.
     pub entity_box: Option<(Vec3, Vec3)>,
+    /// Its standing shapes as laid out, to split them by another preset
+    /// ([CollisionShape::as_preset]); None without PHY2 shapes.
+    pub source: Option<Arc<ShapeSource>>,
 }
 
 /// Shapes of a model that no vehicle meets and the world's queries still
@@ -239,10 +242,84 @@ impl PathSolid {
     }
 }
 
-/// Whether a vehicle meets `PHY2` shape `s` of a building's model
-/// ([`Ghost`]).
-fn meets_vehicles(s: &m2_assets::physics::Shape) -> bool {
-    collision_layers::meets_vehicles(layer_of(&collision_layers::BUILDING, s.flags(), s.kind()))
+/// One standing `PHY2` shape of a model ([`ShapeSource`]): its flags and
+/// kind, which give its layer, and its run of the triangles.
+#[derive(Clone, Debug, PartialEq)]
+struct ShapeRun {
+    flags: u32,
+    kind: u32,
+    triangles: std::ops::Range<u32>,
+}
+
+/// A model's standing `PHY2` shapes as [`CollisionShape::for_model`] laid
+/// them out, kept to split them again by another preset
+/// ([`CollisionShape::as_preset`]): their points (model space), triangles
+/// and runs.
+#[derive(Clone, Debug)]
+pub struct ShapeSource {
+    vertices: Vec<Vec3>,
+    triangles: Vec<[u32; 3]>,
+    runs: Vec<ShapeRun>,
+}
+
+impl ShapeSource {
+    /// Bytes it keeps (its points, triangles and runs).
+    pub fn bytes(&self) -> usize {
+        self.vertices.len() * std::mem::size_of::<Vec3>()
+            + self.triangles.len() * 12
+            + self.runs.len() * std::mem::size_of::<ShapeRun>()
+    }
+}
+
+/// A model's shapes split by what meets them under a preset.
+#[derive(Default)]
+struct Split {
+    /// What vehicles meet, and of it what a path search meets (and
+    /// whether some is left out).
+    solid: Vec<[u32; 3]>,
+    path: Vec<[u32; 3]>,
+    path_part: bool,
+    /// What no vehicle meets ([`Ghost`]), and of it what a path search
+    /// meets.
+    ghost: Vec<[u32; 3]>,
+    ghost_path: Vec<[u32; 3]>,
+    ghost_part: bool,
+}
+
+/// Splits `runs` of `triangles` by `preset`'s layers: a shape on a layer
+/// a vehicle meets is solid, the rest ghosts; each is in a path search's
+/// way when [`PATH_MASK`](collision_layers::PATH_MASK) has its layer. A
+/// model of no shape a vehicle meets keeps them all solid (none such is
+/// known among the buildings; kept as before).
+fn split_shapes(runs: &[ShapeRun], triangles: &[[u32; 3]], preset: Preset) -> Split {
+    let mut out = Split::default();
+    for r in runs {
+        let layer = layer_of(preset.layers(), r.flags, r.kind);
+        let tris = &triangles[r.triangles.start as usize..r.triangles.end as usize];
+        let seen = seen_by(collision_layers::PATH_MASK, layer);
+        if collision_layers::meets_vehicles(layer) {
+            if seen {
+                out.path.extend_from_slice(tris);
+            } else {
+                out.path_part = true;
+            }
+            out.solid.extend_from_slice(tris);
+        } else {
+            if seen {
+                out.ghost_path.extend_from_slice(tris);
+            } else {
+                out.ghost_part = true;
+            }
+            out.ghost.extend_from_slice(tris);
+        }
+    }
+    if out.solid.is_empty() {
+        out.solid = std::mem::take(&mut out.ghost);
+        out.path_part |= out.ghost_part;
+        out.path = std::mem::take(&mut out.ghost_path);
+        out.ghost_part = false;
+    }
+    out
 }
 
 /// Whether a path search meets `PHY2` shape `s` of a building's model.
@@ -885,6 +962,7 @@ impl CollisionShape {
             path: PathSolid::All,
             ghost: None,
             entity_box: None,
+            source: None,
         }
     }
 
@@ -930,6 +1008,7 @@ impl CollisionShape {
             path: PathSolid::All,
             ghost: None,
             entity_box: None,
+            source: None,
         })
     }
 
@@ -953,6 +1032,44 @@ impl CollisionShape {
     pub fn bounds(&self) -> (Vec3, Vec3) {
         let b = self.shape.compute_local_aabb();
         (vec3(b.mins), vec3(b.maxs))
+    }
+
+    /// This model's collision as a body of `preset` takes it: its standing
+    /// shapes split again by that preset's layers (what vehicles meet,
+    /// what a path search meets; [`split_shapes`]), all else as it is.
+    /// `None` when it is the same: the building preset (which
+    /// [`for_model`](Self::for_model) splits by), or no `PHY2` shapes.
+    pub fn as_preset(&self, preset: Preset) -> Option<Self> {
+        let src = self
+            .source
+            .as_ref()
+            .filter(|_| preset != Preset::Building)?;
+        let split = split_shapes(&src.runs, &src.triangles, preset);
+        let surface = self.surfaces.first().map_or(0, |r| r.1);
+        let surfaces = vec![surface; split.solid.len()];
+        let mut shape = Self::mesh_of(&src.vertices, &split.solid, &surfaces)?;
+        if split.path_part {
+            shape.path = PathSolid::of(&src.vertices, &split.path);
+        }
+        if let Some(g) = Self::mesh(&src.vertices, &split.ghost) {
+            shape.ghost = Some(Ghost {
+                shape: g.shape,
+                path: if split.ghost_part {
+                    PathSolid::of(&src.vertices, &split.ghost_path)
+                } else {
+                    PathSolid::All
+                },
+            });
+        }
+        Some(Self {
+            stand_in: self.stand_in,
+            loose: self.loose.clone(),
+            whole: self.whole.clone(),
+            material: self.material,
+            entity_box: self.entity_box,
+            source: self.source.clone(),
+            ..shape
+        })
     }
 
     /// A model's collision in model space: its `PHY2` shapes if `phy2` is
@@ -1023,6 +1140,10 @@ impl CollisionShape {
         let mut ghost_path = Vec::new();
         let mut ghost_part = false;
         let mut entity_box: Option<(Vec3, Vec3)> = None;
+        // Each standing shape's flags, kind and triangles, kept for the
+        // other presets ([CollisionShape::as_preset]).
+        let mut runs: Vec<ShapeRun> = Vec::new();
+        let mut shape_triangles: Vec<[u32; 3]> = Vec::new();
         let mut loose = None;
         let mut material = None;
         // Shapes of its own, whether or not any stands in the way: no
@@ -1069,30 +1190,21 @@ impl CollisionShape {
                 }
                 let first = vertices.len() as u32;
                 vertices.extend(v.iter().map(|&x| to_model.transform_point3(Vec3::from(x))));
-                let placed = t.iter().map(|t| t.map(|i| first + i));
-                if !meets_vehicles(s) {
-                    if in_ais_way(s) {
-                        ghost_path.extend(placed.clone());
-                    } else {
-                        ghost_part = true;
-                    }
-                    ghost_triangles.extend(placed);
-                    continue;
-                }
-                if in_ais_way(s) {
-                    path_triangles.extend(placed.clone());
-                } else {
-                    path_part = true;
-                }
-                triangles.extend(placed);
+                let from = shape_triangles.len() as u32;
+                shape_triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
+                runs.push(ShapeRun {
+                    flags: s.flags(),
+                    kind: s.kind(),
+                    triangles: from..shape_triangles.len() as u32,
+                });
             }
-            // A model of no shape a vehicle meets keeps them all solid
-            // (none such is known; kept as before).
-            if triangles.is_empty() {
-                triangles.append(&mut ghost_triangles);
-                path_part |= ghost_part;
-                path_triangles.append(&mut ghost_path);
-            }
+            let split = split_shapes(&runs, &shape_triangles, Preset::Building);
+            triangles = split.solid;
+            path_triangles = split.path;
+            path_part = split.path_part;
+            ghost_triangles = split.ghost;
+            ghost_path = split.ghost_path;
+            ghost_part = split.ghost_part;
         }
         let stand_in = !shaped && triangles.is_empty();
         if stand_in {
@@ -1180,6 +1292,13 @@ impl CollisionShape {
                     PathSolid::All
                 },
             });
+        }
+        if !runs.is_empty() {
+            shape.source = Some(Arc::new(ShapeSource {
+                vertices,
+                triangles: shape_triangles,
+                runs,
+            }));
         }
         let whole = match (&loose, sub_object) {
             (None, None) => Loose::whole(model, shape.bounds()).map(Arc::new),
@@ -3107,6 +3226,9 @@ pub struct Physics {
     /// The pieces of one broken model ([`Physics::group_debris`]): each
     /// piece's body to the model's place and all its pieces' bodies.
     debris_groups: HashMap<r::RigidBodyHandle, (r::Pose, Arc<[r::RigidBodyHandle]>)>,
+    /// Models' collision split by a preset other than the building's
+    /// ([`Physics::add_static_as`]), by their source and preset.
+    preset_shapes: HashMap<(usize, Preset), Option<CollisionShape>>,
     controller: KinematicCharacterController,
     vehicles: Vec<Option<VehicleBody>>,
     ragdolls: Vec<Option<Ragdoll>>,
@@ -3173,6 +3295,7 @@ impl Physics {
             ghosts: HashMap::new(),
             boxes: HashMap::new(),
             debris_groups: HashMap::new(),
+            preset_shapes: HashMap::new(),
             controller,
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
@@ -3255,6 +3378,33 @@ impl Physics {
             if !matches!(g.path, PathSolid::All) {
                 self.path_solid.insert(h, g.path.clone());
             }
+        }
+    }
+
+    /// [`add_static`](Self::add_static) for a body of `preset` (its
+    /// template's, [`Preset`]): `shape` split by that preset's layers
+    /// ([`CollisionShape::as_preset`]), made once for each model and
+    /// preset and kept.
+    pub fn add_static_as(
+        &mut self,
+        key: StaticKey,
+        shape: &CollisionShape,
+        position: Vec3,
+        rotation: Quat,
+        preset: Preset,
+    ) {
+        let Some(src) = shape.source.as_ref().filter(|_| preset != Preset::Building) else {
+            return self.add_static(key, shape, position, rotation);
+        };
+        let id = (Arc::as_ptr(src) as usize, preset);
+        let made = self
+            .preset_shapes
+            .entry(id)
+            .or_insert_with(|| shape.as_preset(preset))
+            .clone();
+        match made {
+            Some(s) => self.add_static(key, &s, position, rotation),
+            None => self.add_static(key, shape, position, rotation),
         }
     }
 
@@ -9972,6 +10122,78 @@ mod tests {
         assert!(!meets_vehicles(layer(0x05)));
     }
 
+    /// A model of two 2 m boxes 10 m apart along x: one of flags 0x27 (a
+    /// solid shape), one of 0x25 (an AI-only box), as its source.
+    fn two_box_model() -> CollisionShape {
+        let mut vertices = Vec::new();
+        let mut triangles = Vec::new();
+        let mut runs = Vec::new();
+        for (x, flags) in [(0.0f32, 0x27u32), (10.0, 0x25)] {
+            let lo = Vec3::new(x - 1.0, 0.0, -1.0);
+            let hi = Vec3::new(x + 1.0, 2.0, 1.0);
+            let first = vertices.len() as u32;
+            let (v, t) = m2_assets::physics::Geometry::Box {
+                half_extents: [1.0, 1.0, 1.0],
+            }
+            .triangles(0.0);
+            vertices.extend(v.iter().map(|&p| (lo + hi) * 0.5 + Vec3::from(p)));
+            let from = triangles.len() as u32;
+            triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
+            runs.push(ShapeRun {
+                flags,
+                kind: 3,
+                triangles: from..triangles.len() as u32,
+            });
+        }
+        let mut shape = CollisionShape::cuboid(Vec3::ONE);
+        shape.source = Some(Arc::new(ShapeSource {
+            vertices,
+            triangles,
+            runs,
+        }));
+        shape
+    }
+
+    // A loose prop's solid shapes are on layer 18 (0x82155328, 0x8218EBF8),
+    // which no path search sees; a fixed prop's are on 13, which it does.
+    // Its AI-only box (layer 14) is seen either way and no vehicle meets it.
+    #[test]
+    fn a_loose_props_solid_shapes_are_in_no_paths_way() {
+        let model = two_box_model();
+        for (preset, solid_seen) in [(Preset::Prop, true), (Preset::LooseProp, false)] {
+            let mut p = Physics::new();
+            p.add_static_as(
+                StaticKey::Entity(1),
+                &model,
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                preset,
+            );
+            p.step(DT);
+            let sweep = |x: f32| {
+                p.sweep_obstacle(
+                    Vec3::new(x, 1.0, -5.0),
+                    Vec3::new(x, 1.0, 5.0),
+                    Vec3::new(0.2, 0.2, 0.05),
+                    None,
+                )
+                .is_some()
+            };
+            assert_eq!(sweep(0.0), solid_seen, "{preset:?} solid box");
+            assert!(sweep(10.0), "{preset:?} AI box");
+            // The solid box is solid; the AI box is a sensor.
+            let ray = |x: f32| {
+                let ray = r::Ray::new(vector(Vec3::new(x, 5.0, 0.0)), vector(Vec3::NEG_Y));
+                p.world
+                    .query_pipeline_with_filter(ground())
+                    .cast_ray(&ray, 10.0, true)
+                    .is_some()
+            };
+            assert!(ray(0.0), "{preset:?} stands on the solid box");
+            assert!(!ray(10.0), "{preset:?} not on the AI box");
+        }
+    }
+
     // A broken fence's planks stay its entity's bodies on the 360: a path
     // sweep meeting one plank sizes it up by the box round both, in the
     // fence's frame; a lone piece by its own.
@@ -10064,6 +10286,7 @@ mod tests {
             path: PathSolid::All,
             ghost: None,
             entity_box: None,
+            source: None,
         };
         let base = Vec3::new(0.0, 0.0, 12.0);
         p.add_static(StaticKey::Object(7), &pole, base, Quat::IDENTITY);
