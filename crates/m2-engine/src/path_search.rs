@@ -59,9 +59,26 @@
 //! The sweeps and ground rays see the layers of
 //! [`PATH_MASK`](crate::collision_layers::PATH_MASK): so not a chain-link
 //! fence ([`PathSolid`](crate::physics::PathSolid)), which a vehicle drives
-//! through and breaks. Not applied: a loose prop's layers (its own preset),
-//! and the leaves and AI-only shapes of [`collision_layers`](crate::collision_layers)
-//! layers 19 and 30, which the alpha's colliders don't keep apart.
+//! through and breaks. A model's shapes no vehicle meets (a rock's AI box,
+//! layer 30's AI-only shapes) stand apart as a
+//! [`Ghost`](crate::physics::Ghost), which the sweeps still see. Not
+//! applied: a loose prop's layers (its own preset), and the leaves of
+//! layer 19.
+//!
+//! Two of the 360's checks don't apply to a vehicle's search, so they are
+//! not ported:
+//! - A body of the search's goal entity (its +0x14, the mind's +0x340) is
+//!   no obstacle (0x822E74A8). Only CarAttack's move on a message (event
+//!   4, 0x822ACB28) gives 0x822BF7A8 a goal entity; TankAttack and the
+//!   others pass none.
+//! - A sweep's edge that leaves the box of the entity under its start
+//!   (0x822E46B0: a ray down 20 m from 1 m up) where, 1 m either side of
+//!   where it leaves, the ground falls more than 2 m (0x822E4358, two rays
+//!   50 m down from 1 m over the higher end) is blocked (kind 6: no
+//!   corners, only that entity's hints). The search's +0x1545 turns it
+//!   on, and 0x822BEA78 sets that only when the mind's +0x14 top byte is
+//!   0: its vehicle's class, which 0x822BB608 sets to 1 to 7 for any
+//!   vehicle (0 with none).
 //!
 //! Inferred: a body's box is its collider's own bounds (the 360's is its
 //! entity's, 0x821861B0). Stand-ins: the search runs to its end at once
