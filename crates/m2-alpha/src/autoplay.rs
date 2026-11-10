@@ -1042,6 +1042,8 @@ pub struct Autoplay {
     /// When the vehicles near her boat were last logged.
     near_logged: f32,
     way_logged: f32,
+    /// When she last logged something solid ahead in a race.
+    rock_logged: f32,
     /// The island's roads as one graph, made the first time a place is
     /// far ([`Autoplay::by_road`]).
     roads: Option<RoadGraph>,
@@ -4790,7 +4792,25 @@ impl Autoplay {
         // round 36 stood 19 s against one 103 m from its twelfth), round
         // what is in the way, not by road.
         let racing = self.racing() && driving.is_some();
-        if racing && self.clock - self.best.1 < RACE_STRAIGHT_FOR {
+        // Not straight into what stands in the way, though (MecCon001
+        // round 6: the Monster Truck ran into the mine's boulders at up to
+        // 25 m/s, three times in 40 s, and lost the race).
+        let rock = racing
+            .then(|| driving.and_then(|i| game.scene.vehicles.get(i)))
+            .flatten()
+            .and_then(|v| solid_ahead(&game.scene.world, v, pos, at, speed));
+        if let Some(hit) = rock
+            && self.clock - self.rock_logged > LOG_ROCK
+        {
+            self.rock_logged = self.clock;
+            eprintln!(
+                "autoplay {:.1} s: racing, something solid ahead at {hit:.1} ({:.0} m off at {speed:.1} m/s): round it",
+                self.clock,
+                (hit - pos).with_y(0.0).length()
+            );
+        }
+        let rock = rock.is_some();
+        if racing && !rock && self.clock - self.best.1 < RACE_STRAIGHT_FOR {
             self.way = None;
             return at;
         }
@@ -5861,6 +5881,50 @@ fn afloat_near(
             AFLOAT_SIDES.map(|s| along + side * s)
         })
         .find(|&p| open(p))
+}
+
+/// Racing, she looks this far ahead for what stands in her way: as far as
+/// she goes in [`RACE_LOOK`] seconds, at least [`RACE_LOOK_LEAST`] metres
+/// (and never past the checkpoint), with a box her vehicle's width,
+/// [`RACE_LOOK_HEIGHT`] metres over its bottom. Invented.
+const RACE_LOOK: f32 = 1.5;
+/// Seconds between her logs of something solid ahead in a race.
+const LOG_ROCK: f32 = 2.0;
+const RACE_LOOK_LEAST: f32 = 15.0;
+const RACE_LOOK_HEIGHT: f32 = 0.9;
+
+/// Where something solid other than the ground (a boulder, a wall, a
+/// house, a parked vehicle) stands on the straight line from vehicle `v`
+/// toward `at` within the look ahead for `speed` (m/s), if anything does.
+fn solid_ahead(
+    world: &Option<m2_engine::World>,
+    v: &crate::scene::ParkedVehicle,
+    pos: Vec3,
+    at: Vec3,
+    speed: f32,
+) -> Option<Vec3> {
+    let (Some(w), Some(id)) = (world.as_ref(), v.id) else {
+        return None;
+    };
+    let pos = w
+        .physics
+        .vehicle_transform(id)
+        .map_or(pos, |m| m.w_axis.truncate());
+    let d = (at - pos).with_y(0.0).length();
+    if d < 1.0 {
+        return None;
+    }
+    let reach = (speed.max(0.0) * RACE_LOOK).max(RACE_LOOK_LEAST).min(d);
+    let (lo, hi) = v.spec.hull;
+    let from = pos + Vec3::Y * (lo.y + RACE_LOOK_HEIGHT);
+    let half = Vec3::new(((hi.x - lo.x) * 0.5).max(0.5), 0.3, 0.5);
+    // Down (or up) the way the checkpoint lies, so a boulder down a slope
+    // ahead is not swept over (MecCon001 round 2 of this fix: one 3 m
+    // under her line at 24 m/s).
+    w.physics
+        .sweep_obstacle(from, from + (at - pos) * (reach / d), half, Some(id))
+        .filter(|o| !o.ground)
+        .map(|o| o.point)
 }
 
 /// How deep a boat's keel floats under the water, metres.
