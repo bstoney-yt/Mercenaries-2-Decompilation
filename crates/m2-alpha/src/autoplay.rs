@@ -4790,7 +4790,14 @@ impl Autoplay {
         // round 36 stood 19 s against one 103 m from its twelfth), round
         // what is in the way, not by road.
         let racing = self.racing() && driving.is_some();
-        if racing && self.clock - self.best.1 < RACE_STRAIGHT_FOR {
+        // Not straight into what stands in the way, though (MecCon001
+        // round 6: the Monster Truck ran into the mine's boulders at up to
+        // 25 m/s, three times in 40 s, and lost the race).
+        let rock = racing
+            && driving
+                .and_then(|i| game.scene.vehicles.get(i))
+                .is_some_and(|v| solid_ahead(&game.scene.world, v, pos, at, speed));
+        if racing && !rock && self.clock - self.best.1 < RACE_STRAIGHT_FOR {
             self.way = None;
             return at;
         }
@@ -5861,6 +5868,45 @@ fn afloat_near(
             AFLOAT_SIDES.map(|s| along + side * s)
         })
         .find(|&p| open(p))
+}
+
+/// Racing, she looks this far ahead for what stands in her way: as far as
+/// she goes in [`RACE_LOOK`] seconds, at least [`RACE_LOOK_LEAST`] metres
+/// (and never past the checkpoint), with a box her vehicle's width,
+/// [`RACE_LOOK_HEIGHT`] metres over its bottom. Invented.
+const RACE_LOOK: f32 = 1.5;
+const RACE_LOOK_LEAST: f32 = 15.0;
+const RACE_LOOK_HEIGHT: f32 = 0.9;
+
+/// Whether something solid other than the ground (a boulder, a wall, a
+/// house, a parked vehicle) stands on the straight line from vehicle `v`
+/// toward `at` within the look ahead for `speed` (m/s).
+fn solid_ahead(
+    world: &Option<m2_engine::World>,
+    v: &crate::scene::ParkedVehicle,
+    pos: Vec3,
+    at: Vec3,
+    speed: f32,
+) -> bool {
+    let (Some(w), Some(id)) = (world.as_ref(), v.id) else {
+        return false;
+    };
+    let pos = w
+        .physics
+        .vehicle_transform(id)
+        .map_or(pos, |m| m.w_axis.truncate());
+    let flat = (at - pos).with_y(0.0);
+    let d = flat.length();
+    if d < 1.0 {
+        return false;
+    }
+    let reach = (speed.max(0.0) * RACE_LOOK).max(RACE_LOOK_LEAST).min(d);
+    let (lo, hi) = v.spec.hull;
+    let from = pos + Vec3::Y * (lo.y + RACE_LOOK_HEIGHT);
+    let half = Vec3::new(((hi.x - lo.x) * 0.5).max(0.5), 0.3, 0.5);
+    w.physics
+        .sweep_obstacle(from, from + flat / d * reach, half, Some(id))
+        .is_some_and(|o| !o.ground)
 }
 
 /// How deep a boat's keel floats under the water, metres.
