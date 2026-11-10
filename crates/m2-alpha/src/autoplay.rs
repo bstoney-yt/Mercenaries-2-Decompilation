@@ -474,6 +474,10 @@ fn way_in_of(
     });
     into.or(door)
 }
+/// A soldier whose foe is within this of someone following her (metres)
+/// is going for them (invented: `foe_at` is where that foe stood when the
+/// soldier last looked).
+const LED_NEAR: f32 = 2.0;
 /// Within this of a crewed vehicle's middle she starts its hijack,
 /// metres (invented; m2-alpha's `HIJACK_REACH` is 6).
 const HIJACK_NEAR: f32 = 5.0;
@@ -2029,13 +2033,24 @@ impl Autoplay {
                 || self
                     .delivered
                     .is_some_and(|t| self.clock - t < DESIGNATOR_WAIT));
+        let led = game.scene.people.followers();
         if driving.is_none()
             && !p.swimming()
             && !throwing
             && let Some((i, d)) = npcs
                 .iter()
                 .enumerate()
-                .filter(|(_, n)| n.alive && n.soldier && n.alert)
+                // One going for someone following her as well (the
+                // contract sweep's ChiCon001: an Allied soldier 6 m off
+                // shot the VIP behind her, 14 s after she freed him, while
+                // she walked on; the contract was cancelled).
+                .filter(|(_, n)| {
+                    n.alive
+                        && n.soldier
+                        && (n.alert
+                            || n.foe_at
+                                .is_some_and(|f| led.iter().any(|l| l.distance(f) < LED_NEAR)))
+                })
                 .filter(|(_, n)| {
                     !self.unseen.iter().any(|&(at, until)| {
                         until > self.clock && at.distance(n.character.position) < UNSEEN_NEAR
@@ -2848,9 +2863,15 @@ impl Autoplay {
             })
             .find(|&i| near(i, RIDE_FRESH))
             .or_else(|| {
+                // With someone following her, not one to take from its
+                // crew: the contract sweep's ChiCon001 went for a crewed
+                // Allied M1A2 with the VIP behind her, was run over by it
+                // and lay 48 s by it; the contract was cancelled 14 s on.
+                let led = !game.scene.people.followers().is_empty();
                 self.ride
                     .into_iter()
                     .chain((0..vehicles.len()).filter(|&i| vehicles[i].guid.is_some()))
+                    .filter(|&i| !led || vehicles[i].crew.is_empty())
                     .find(|&i| near(i, RIDE_NEAR))
             })
     }
