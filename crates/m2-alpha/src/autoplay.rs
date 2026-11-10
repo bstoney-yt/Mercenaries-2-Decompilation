@@ -5895,8 +5895,7 @@ fn solid_ahead(
         .physics
         .vehicle_transform(id)
         .map_or(pos, |m| m.w_axis.truncate());
-    let flat = (at - pos).with_y(0.0);
-    let d = flat.length();
+    let d = (at - pos).with_y(0.0).length();
     if d < 1.0 {
         return false;
     }
@@ -5904,8 +5903,11 @@ fn solid_ahead(
     let (lo, hi) = v.spec.hull;
     let from = pos + Vec3::Y * (lo.y + RACE_LOOK_HEIGHT);
     let half = Vec3::new(((hi.x - lo.x) * 0.5).max(0.5), 0.3, 0.5);
+    // Down (or up) the way the checkpoint lies, so a boulder down a slope
+    // ahead is not swept over (MecCon001 round 2 of this fix: one 3 m
+    // under her line at 24 m/s).
     w.physics
-        .sweep_obstacle(from, from + flat / d * reach, half, Some(id))
+        .sweep_obstacle(from, from + (at - pos) * (reach / d), half, Some(id))
         .is_some_and(|o| !o.ground)
 }
 
