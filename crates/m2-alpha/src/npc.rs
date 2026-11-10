@@ -106,8 +106,10 @@ impl Arms {
     }
 }
 
-/// Her arms on foot: the "Assault Rifle"'s `WeaponHint` stands in for
-/// whatever she holds (invented: her own weapon's hint is not passed on).
+/// Her arms on foot where the game has not said what she carries (tests,
+/// no game): the "Assault Rifle"'s `WeaponHint`. In play
+/// [`People::her_arms`] holds her own guns' hints
+/// ([`crate::combat::Combat::carried_hints`]).
 pub const HER_ON_FOOT: Arms = Arms::Person([Some(STAND_IN), None]);
 
 /// The first number in a mind's attack slot of a vehicle, the rest going

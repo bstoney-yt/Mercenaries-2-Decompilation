@@ -193,6 +193,8 @@ pub struct Rifle {
     pub camera: Option<m2_engine::weapons::CameraFeel>,
     /// Its scope's least and most magnification (`WeaponScope`).
     pub scope: Option<(f32, f32)>,
+    /// How soldiers rate it, carried (`WeaponHint`), if its template says.
+    pub hint: Option<m2_engine::weapons::FireHint>,
 }
 
 impl Default for Rifle {
@@ -217,6 +219,7 @@ impl Default for Rifle {
             assist: None,
             camera: None,
             scope: None,
+            hint: None,
         }
     }
 }
@@ -272,6 +275,7 @@ impl Rifle {
             assist: spec.assist,
             camera: spec.camera,
             scope: spec.scope,
+            hint: spec.hint,
         }
     }
 
@@ -2247,6 +2251,14 @@ pub fn explosives(index: &m2_engine::WorldIndex) -> Vec<Explosive> {
 }
 
 impl Combat {
+    /// The `WeaponHint`s of the guns she carries: her rifle's, and the
+    /// launcher's while she has one. Soldiers rate her threat by every
+    /// weapon in her inventory, carried or in her hands (0x822EC1B8 walks
+    /// the holder's items), not only the one she holds.
+    pub fn carried_hints(&self) -> [Option<m2_engine::weapons::FireHint>; 2] {
+        [self.rifle.hint, self.second.and(self.launcher.hint)]
+    }
+
     /// Rockets, grenades and rounds in flight: what, where, velocity.
     pub fn projectiles(&self) -> impl Iterator<Item = (Flying, Vec3, Vec3)> + '_ {
         self.projectiles.iter().filter_map(|p| match *p {
@@ -8032,6 +8044,40 @@ mod tests {
                 at,
                 template: 0x8000_a286
             }]
+        );
+    }
+
+    // Soldiers rate her by her own guns' `WeaponHint`s, the launcher's
+    // only while she carries one (0x822EC1B8 walks her items).
+    #[test]
+    fn her_threat_comes_from_the_guns_she_carries() {
+        use m2_engine::ai_target::{HUMAN, threat};
+        let hint = |range: f32, against: [u32; 4]| m2_engine::weapons::FireHint {
+            min_range: 1.0,
+            range,
+            angle: 2,
+            on: 0.8,
+            off: 1.0,
+            on_close: 0.8,
+            off_close: 1.0,
+            against,
+            kinds: [3, 1],
+            single: false,
+        };
+        let mut combat = Combat::default();
+        combat.rifle.hint = Some(hint(50.0, [3, 1, 0, 0]));
+        combat.launcher.hint = Some(hint(150.0, [1, 3, 0, 0]));
+        combat.second = None;
+        let rate = |c: &Combat, d: f32| threat(c.carried_hints().iter().flatten(), HUMAN, d, false);
+        assert!(rate(&combat, 30.0) > 0.0, "her rifle in its range");
+        assert_eq!(rate(&combat, 100.0), 0.0, "beyond it, and no launcher");
+        combat.second = Some(Weapon::GrenadeLauncher);
+        assert!(rate(&combat, 100.0) > 0.0, "the launcher reaches");
+        combat.rifle.hint = None;
+        assert_eq!(
+            rate(&combat, 30.0),
+            rate(&combat, 100.0),
+            "a gun with no hint adds nothing"
         );
     }
 }
