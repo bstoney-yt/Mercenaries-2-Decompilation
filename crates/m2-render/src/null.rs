@@ -317,6 +317,11 @@ impl RenderBackend for NullBackend {
         self.textures.remove(texture.0).map(drop)
     }
 
+    fn remove_material(&mut self, id: MaterialId) -> Result<(), BackendError> {
+        self.materials.remove(&id);
+        Ok(())
+    }
+
     fn set_material(&mut self, id: MaterialId, desc: &MaterialDesc) -> Result<(), BackendError> {
         if let Some(t) = desc.texture {
             self.textures.get(t.0)?;
@@ -537,6 +542,10 @@ impl RenderBackend for RecordingBackend {
     fn destroy_texture(&mut self, handle: TextureHandle) -> Result<(), BackendError> {
         let result = self.inner.destroy_texture(handle);
         self.log(result, |()| Command::DestroyTexture(handle))
+    }
+
+    fn remove_material(&mut self, id: MaterialId) -> Result<(), BackendError> {
+        self.inner.remove_material(id)
     }
 
     fn set_material(&mut self, id: MaterialId, desc: &MaterialDesc) -> Result<(), BackendError> {

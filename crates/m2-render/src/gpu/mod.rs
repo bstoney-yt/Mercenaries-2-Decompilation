@@ -2516,6 +2516,11 @@ impl RenderBackend for WgpuBackend {
         self.textures.remove(texture.0).map(drop)
     }
 
+    fn remove_material(&mut self, id: MaterialId) -> Result<(), BackendError> {
+        self.materials.remove(&id);
+        Ok(())
+    }
+
     fn set_material(&mut self, id: MaterialId, desc: &MaterialDesc) -> Result<(), BackendError> {
         let view = |t: Option<TextureHandle>| -> Result<&wgpu::TextureView, BackendError> {
             match t {
