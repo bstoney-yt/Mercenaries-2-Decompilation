@@ -910,6 +910,9 @@ pub struct ScriptWorld {
     /// then they know her for who she is, and she is a candidate for
     /// their opening as their script judges her.
     pub honk_heard: f32,
+    /// The game's main clock, seconds since the scripts started: what a
+    /// time stamp reads (`Sys.MainTimeStamp`).
+    pub main_clock: f64,
     /// The player's camera as the game last fed it; `None` until it has.
     pub camera: Option<Camera>,
     /// Objects the game found behind something solid from the camera at
@@ -3221,6 +3224,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Single player: this machine is the server.
     let net = lib("Net")?;
     add(&net, "IsServer", |_, _, _| values([Value::Boolean(true)]))?;
+    // Net.SendCustomEvent(module, event, args, ...): a script's own event
+    // sent to the other player's game (a race's gates). From the 360 code
+    // (8232CC78): with no network game on it sends nothing and gives true.
+    add(&net, "SendCustomEvent", |_, _, _| {
+        values([Value::Boolean(true)])
+    })?;
     for name in ["IsClient", "IsActive", "IsMultiplayer"] {
         add(&net, name, |_, _, _| values([Value::Boolean(false)]))?;
     }
@@ -3599,7 +3608,32 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Developer switches: skip to a mission (off unless asked for), and
     // force a new game (off).
     let sys = lib("Sys")?;
-    // The game shows its tutorial tips, unless the player turned them off.
+    // Time stamps (a race times its run with one, for its best time).
+    // From the 360 code: `Sys.MainTimeStamp()` (82345330) makes a stamp
+    // of the main clock as it stands; `Sys.TimeStampMark(stamp)`
+    // (823453C0) sets it to the clock now; `Sys.TimeStampGetElapsed(stamp)`
+    // (82345438) gives the clock's ticks since, times a scale the game
+    // sets as it runs (821754F0; taken to give seconds: the scripts hand
+    // it to `MrxStatsManager.RecordBestTime`). Either gives nothing for
+    // what isn't a stamp. A stamp is userdata there and a table here.
+    add(&sys, "MainTimeStamp", |w, lua, _| {
+        let stamp = lua.create_table()?;
+        stamp.set("mark", w.main_clock)?;
+        values([Value::Table(stamp)])
+    })?;
+    add(&sys, "TimeStampMark", |w, _, a| {
+        if let Some(Value::Table(stamp)) = a.first() {
+            stamp.set("mark", w.main_clock)?;
+        }
+        values([])
+    })?;
+    add(&sys, "TimeStampGetElapsed", |w, _, a| {
+        let Some(Value::Table(stamp)) = a.first() else {
+            return values([]);
+        };
+        let mark = stamp.get::<Option<f64>>("mark")?.unwrap_or(w.main_clock);
+        values([Value::Number(w.main_clock - mark)])
+    })?; // The game shows its tutorial tips, unless the player turned them off.
     add(&sys, "TutorialsEnabled", |w, _, _| {
         values([Value::Boolean(!w.tutorials_off)])
     })?;
@@ -4593,6 +4627,35 @@ mod tests {
         assert_eq!((n, more, listed), (2, false, 1));
     }
 
+    #[test]
+    fn a_time_stamp_reads_the_main_clock_since_its_mark() {
+        let (host, world) = setup();
+        world.borrow_mut().main_clock = 10.0;
+        host.lua()
+            .load("stamp = Sys.MainTimeStamp() Sys.TimeStampMark(stamp)")
+            .exec()
+            .unwrap();
+        world.borrow_mut().main_clock = 72.5;
+        let (elapsed, none, sent): (f64, Value, bool) = host
+            .lua()
+            .load(
+                "return Sys.TimeStampGetElapsed(stamp), Sys.TimeStampGetElapsed(nil), \
+                 Net.SendCustomEvent('MrxTaskRace', 2, { 1 })",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(elapsed, 62.5);
+        assert_eq!(none, Value::Nil);
+        // No network game: nothing sent, and true.
+        assert!(sent);
+        // Marked again, it starts from the clock now.
+        let again: f64 = host
+            .lua()
+            .load("Sys.TimeStampMark(stamp) return Sys.TimeStampGetElapsed(stamp)")
+            .eval()
+            .unwrap();
+        assert_eq!(again, 0.0);
+    }
     #[test]
     fn atmosphere_calls_reach_the_game_and_the_rest_are_stubs() {
         let (host, world) = setup();
