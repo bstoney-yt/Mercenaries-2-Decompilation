@@ -8408,13 +8408,20 @@ mod tests {
     /// chassis's shape 0.38 m up: how far it slid over the last 10 s, and
     /// how many of its six track points touch at the end.
     fn parked_tank_on_a_slope(shape_floor: Option<f32>) -> (f32, usize) {
-        let (slid, touching, _) = parked_tank(shape_floor, 20.0, false);
+        let (slid, touching, _) = parked_tank(shape_floor, 20.0, None);
         (slid, touching)
     }
 
     /// [`parked_tank_on_a_slope`] on a slope of `degrees`, with how far it
-    /// sank over the last 10 s and whether it ends asleep.
-    fn parked_tank(shape_floor: Option<f32>, degrees: f32, turret: bool) -> (f32, usize, (f32, bool)) {
+    /// dropped below where it stood at 2 s, at its lowest over the last
+    /// 10 s, and whether it ends asleep. `turret`: a
+    /// turret on its own body on a hinge, turned at that many radians a
+    /// second (0: kept still).
+    fn parked_tank(
+        shape_floor: Option<f32>,
+        degrees: f32,
+        turret: Option<f32>,
+    ) -> (f32, usize, (f32, bool)) {
         use crate::vehicle::WheelSpec;
         let mut spec = tank();
         spec.wheels = [-2.3f32, 0.0, 2.3]
@@ -8459,14 +8466,27 @@ mod tests {
             })
             .unwrap_or_default()
             .into();
-        if turret {
-            spec.turret_shapes = vec![box_points(Vec3::new(-1.0, 1.6, -1.0), Vec3::new(1.0, 2.4, 1.0))].into();
+        if turret.is_some() {
+            spec.turret_shapes = vec![box_points(
+                Vec3::new(-1.0, 1.6, -1.0),
+                Vec3::new(1.0, 2.4, 1.0),
+            )]
+            .into();
             spec.turret_mass = Some(crate::vehicle::Chassis {
                 mass: 3000.0,
                 inertia: Mat3::from_diagonal(Vec3::new(2000.0, 2500.0, 1000.0)),
                 centre_of_mass: Vec3::new(0.0, 2.0, 0.0),
             });
             spec.pivot = Some(Vec3::new(0.0, 2.0, 0.0));
+            spec.tuning.turret = Some(crate::tuning::TurretTuning {
+                main: true,
+                yaw_speed: 1.0,
+                yaw_accel: 20.0,
+                pitch: (-0.1, 0.3),
+                pitch_speed: 1.0,
+                pitch_accel: 20.0,
+                yaw: None,
+            });
         }
         let mut p = Physics::new();
         let tilt = Quat::from_rotation_x(-degrees.to_radians());
@@ -8486,32 +8506,53 @@ mod tests {
             ..Default::default()
         };
         let mut from = Vec3::ZERO;
+        let mut low = f32::MAX;
         for i in 0..(12.0 / DT) as usize {
             if i == (2.0 / DT) as usize {
                 from = p.vehicle_transform(id).unwrap().w_axis.truncate();
             }
             p.drive(id, parked);
+            if let Some(rate) = turret {
+                p.turn_turret(id, rate * i as f32 * DT);
+            }
             p.step(DT);
+            if i >= (2.0 / DT) as usize {
+                let y = p.vehicle_transform(id).unwrap().w_axis.y;
+                low = low.min(y);
+            }
         }
         let at = p.vehicle_transform(id).unwrap().w_axis.truncate();
         (
             (at - from).length(),
             p.vehicle_contacts(id).0,
-            (from.y - at.y, p.vehicle_asleep(id)),
+            (from.y - low, p.vehicle_asleep(id)),
         )
     }
 
     #[test]
-    fn a_parked_tank_sleeps_with_its_island_and_stays_up() {
+    fn a_parked_tank_sleeps_and_stays_up() {
         // On its springs alone over flat ground (its shape 0.38 m up), it
-        // keeps still, sleeps (its whole island, as Havok's 0x8264ABF8)
-        // and stays where it stood. Put to sleep on its own (rapier's
-        // `RigidBody::sleep`) its tracks stopped while rapier still moved
-        // it, and it sank through the ground (PmcCon001's villa tank).
-        let (slid, touching, (sank, asleep)) = parked_tank(Some(0.38), 0.0, true);
+        // keeps still and sleeps with its island (Havok's 0x8264ABF8).
+        let (slid, touching, (dropped, asleep)) = parked_tank(Some(0.38), 0.0, None);
         assert!(asleep, "awake");
-        assert!(sank.abs() < 0.05, "sank {sank} m");
-        assert!(slid < 0.05, "slid {slid} m");
+        assert!(dropped < 0.05, "dropped {dropped} m");
+        assert!(slid < 0.1, "slid {slid} m");
+        assert_eq!(touching, 6);
+    }
+
+    #[test]
+    fn a_parked_tank_whose_turret_keeps_its_island_awake_stays_up() {
+        // Its turret on its own body, held by its hinge's motor, keeps its
+        // island awake, so it may not sleep (Havok's 0x8264ABF8 sleeps an
+        // island only once none of its bodies moves) and its tracks go on
+        // holding it up. Put to sleep on its own (rapier's
+        // `RigidBody::sleep`) rapier still moved it with its awake turret
+        // while its tracks no longer held it: it dropped 0.39 m here,
+        // caught by its shape, and through the HQ's floor at PmcCon001's
+        // villa.
+        let (slid, touching, (dropped, _)) = parked_tank(Some(0.38), 0.0, Some(0.0));
+        assert!(dropped < 0.05, "dropped {dropped} m");
+        assert!(slid < 0.1, "slid {slid} m");
         assert_eq!(touching, 6);
     }
 

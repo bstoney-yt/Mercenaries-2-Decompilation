@@ -6017,7 +6017,11 @@ fn plough_at(game: &mut Game, kind: &str) -> bool {
         };
         // What it stands on along the way, 5 m under the roofs.
         for k in 0..=10 {
-            let p = Vec3::new(x + (tx - x) * k as f32 / 10.0, here.y + 5.0, z + (tz - z) * k as f32 / 10.0);
+            let p = Vec3::new(
+                x + (tx - x) * k as f32 / 10.0,
+                here.y + 5.0,
+                z + (tz - z) * k as f32 / 10.0,
+            );
             let hit = world.physics.cast_ray_keyed(p, Vec3::NEG_Y, 60.0);
             eprintln!(
                 "plough: under {:.1}: {}",
