@@ -131,7 +131,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let shape = CollisionShape::for_model(&m, phy2.as_deref(), 0).ok_or("no collision")?;
     let (lo, hi) = shape.bounds();
-    println!("model box {lo:.1} .. {hi:.1}");
+    println!(
+        "model box {lo:.1} .. {hi:.1}, entity box {:.1?}",
+        shape.entity_box
+    );
     let mut p = Physics::new();
     p.add_static(StaticKey::Object(0), &shape, Vec3::ZERO, Quat::IDENTITY);
     p.step(0.01);
