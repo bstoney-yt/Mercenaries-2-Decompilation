@@ -183,6 +183,8 @@ struct IndexBuffer {
 #[derive(Debug)]
 struct Texture {
     view: wgpu::TextureView,
+    /// Its mips' bytes, as uploaded.
+    bytes: u64,
 }
 
 #[derive(Debug)]
@@ -2505,7 +2507,8 @@ impl RenderBackend for WgpuBackend {
             );
         }
         let view = texture.create_view(&Default::default());
-        Ok(TextureHandle(self.textures.insert(Texture { view })))
+        let bytes = mips.iter().map(|m| m.len() as u64).sum();
+        Ok(TextureHandle(self.textures.insert(Texture { view, bytes })))
     }
 
     fn destroy_texture(&mut self, texture: TextureHandle) -> Result<(), BackendError> {
@@ -2693,6 +2696,39 @@ pub struct OverlayTarget<'a> {
     pub format: wgpu::TextureFormat,
     /// Width and height in pixels.
     pub size: (u32, u32),
+}
+
+/// What the backend holds on the GPU of what it was given
+/// ([`WgpuBackend::memory`]): its live buffers' and textures' bytes, and
+/// how many materials it keeps (each holds its textures' views, so a
+/// texture destroyed while a material still names it stays in memory).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuMemory {
+    pub vertex_buffers: usize,
+    pub vertex_bytes: u64,
+    pub index_buffers: usize,
+    pub index_bytes: u64,
+    pub textures: usize,
+    pub texture_bytes: u64,
+    pub materials: usize,
+}
+
+impl WgpuBackend {
+    /// What it holds on the GPU of what it was given, for the log.
+    pub fn memory(&self) -> GpuMemory {
+        fn live<T>(p: &Slots<T>) -> impl Iterator<Item = &T> {
+            p.slots.iter().filter_map(|s| s.1.as_ref())
+        }
+        GpuMemory {
+            vertex_buffers: self.vertex_buffers.live,
+            vertex_bytes: live(&self.vertex_buffers).map(|b| b.buffer.size()).sum(),
+            index_buffers: self.index_buffers.live,
+            index_bytes: live(&self.index_buffers).map(|b| b.buffer.size()).sum(),
+            textures: self.textures.live,
+            texture_bytes: live(&self.textures).map(|t| t.bytes).sum(),
+            materials: self.materials.len(),
+        }
+    }
 }
 
 impl WgpuBackend {
