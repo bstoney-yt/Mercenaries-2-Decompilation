@@ -6937,7 +6937,12 @@ mod tests {
             )
             .expect("meets the hull");
         assert!(o.max.y > 3.9, "box top {}", o.max.y);
-        assert!(o.max.x > 2.9 || o.min.x < -2.9, "box {} .. {}", o.min, o.max);
+        assert!(
+            o.max.x > 2.9 || o.min.x < -2.9,
+            "box {} .. {}",
+            o.min,
+            o.max
+        );
     }
 
     // A turret's colliders turn with it ([`Physics::turn_turret`]): a
