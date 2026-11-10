@@ -3685,37 +3685,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
 
-    // The engine's additions to the math library: random integers in
-    // [a, b] (or [1, a]), random reals in [a, b] and normalising.
+    // `Math` is the math library under the name some scripts use; the
+    // engine's own additions go on both (`script_math`, from the 360).
     lua.load(
         r#"
-        local function randi(a, b)
-            if b then return math.random(a, b) end
-            return math.random(a)
-        end
-        local function randf(a, b)
-            a, b = a or 0, b or 1
-            return a + (b - a) * math.random()
-        end
-        math.randi, math.randf = randi, randf
         local M = rawget(_G, "Math")
         if type(M) ~= "table" then
             M = {}
             rawset(_G, "Math", M)
         end
-        M.randi, M.randf = randi, randf
-        -- A vector scaled to length 1 (the strikes aim their bombs so);
-        -- the zero vector stays as it is.
-        function M.Normalize(x, y, z)
-            local l = math.sqrt(x * x + y * y + z * z)
-            if l == 0 then return x, y, z end
-            return x / l, y / l, z / l
-        end
-        -- A vector's length (the fuel-air bomb measures its drop so).
-        function M.Length(x, y, z)
-            return math.sqrt(x * x + y * y + (z or 0) * (z or 0))
-        end
-        -- Math is the math library with the additions.
         for k, v in pairs(math) do
             if rawget(M, k) == nil then M[k] = v end
         end
@@ -3723,6 +3701,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     )
     .set_name("=m2-math")
     .exec()?;
+    crate::script_math::install(lua, Rc::default())?;
 
     // The engine's table helpers: `Table.Create(narray, nhash)` makes a
     // table with room reserved, `Table.InsertI(t, value, i)` stores at
@@ -4733,7 +4712,10 @@ mod tests {
         assert_eq!(left, "streaming WaitForStreaming exit");
         let r: bool = host
             .lua()
-            .load("local n = math.randi(3); return n >= 1 and n <= 3 and Math.randf(2, 2) == 2")
+            .load(
+                "local n, f = math.randi(3), Math.randf(2, 2)
+                 return n >= 1 and n <= 3 and f >= 2 and f < 3",
+            )
             .eval()
             .unwrap();
         assert!(r);
