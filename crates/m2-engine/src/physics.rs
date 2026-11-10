@@ -175,6 +175,37 @@ pub struct CollisionShape {
     pub surfaces: Arc<[(u32, u32)]>,
     /// What of it stands in an AI's way ([`PathSolid`]).
     pub path: PathSolid,
+    /// Its shapes no vehicle meets ([`Ghost`]), if it has both kinds.
+    pub ghost: Option<Ghost>,
+}
+
+/// Shapes of a model that no vehicle meets and the world's queries still
+/// see. From the 360 code: a `_BuildingPhysics` shape takes its layer from
+/// its flags (0x8216C308), and the world's filter (0x82164A58) has a
+/// vehicle's hull layers (8 and 9, 0x82189448) meet only some layers
+/// ([`collision_layers::meets_vehicles`]). A jungle rock cluster's AI box
+/// (flags 0x25, layer 4), a canopy's flags 5 shapes and the
+/// `..._aicollision` bridges' shapes (layer 30) are on layers they don't
+/// meet, while the path search (0x822E6FD8) and the AI's sight lines see
+/// layer 4 and 30. So a tank drives through such a box that its path goes
+/// round.
+///
+/// In the alpha they stand apart from the model's other shapes as a
+/// sensor: no body bumps into them, and every query sees them but a
+/// wheel's look for the ground. People still walk into them (inferred:
+/// the filter's layers 27 and 28, which meet them, aren't named, and
+/// which layer people are on isn't traced).
+#[derive(Clone)]
+pub struct Ghost {
+    shape: r::SharedShape,
+    /// What of them stands in an AI's way.
+    pub path: PathSolid,
+}
+
+impl fmt::Debug for Ghost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ghost").field("path", &self.path).finish()
+    }
 }
 
 /// What of a model a path search meets. From the 360 code: its sweeps and
@@ -198,6 +229,12 @@ impl PathSolid {
     pub fn of(vertices: &[Vec3], triangles: &[[u32; 3]]) -> Self {
         CollisionShape::mesh(vertices, triangles).map_or(Self::Nothing, |m| Self::Part(m.shape))
     }
+}
+
+/// Whether a vehicle meets `PHY2` shape `s` of a building's model
+/// ([`Ghost`]).
+fn meets_vehicles(s: &m2_assets::physics::Shape) -> bool {
+    collision_layers::meets_vehicles(layer_of(&collision_layers::BUILDING, s.flags(), s.kind()))
 }
 
 /// Whether a path search meets `PHY2` shape `s` of a building's model.
@@ -818,6 +855,7 @@ impl CollisionShape {
             material: None,
             surfaces: Arc::new([]),
             path: PathSolid::All,
+            ghost: None,
         }
     }
 
@@ -861,6 +899,7 @@ impl CollisionShape {
             material: None,
             surfaces: runs.into(),
             path: PathSolid::All,
+            ghost: None,
         })
     }
 
@@ -948,6 +987,11 @@ impl CollisionShape {
         // some are left out.
         let mut path_triangles = Vec::new();
         let mut path_part = false;
+        // Those of its shapes no vehicle meets ([`Ghost`]), and of them
+        // those a path search meets.
+        let mut ghost_triangles = Vec::new();
+        let mut ghost_path = Vec::new();
+        let mut ghost_part = false;
         let mut loose = None;
         let mut material = None;
         // Shapes of its own, whether or not any stands in the way: no
@@ -981,12 +1025,29 @@ impl CollisionShape {
                 let (v, t) = s.geometry.triangles(s.radius);
                 let first = vertices.len() as u32;
                 vertices.extend(v.iter().map(|&x| to_model.transform_point3(Vec3::from(x))));
+                let placed = t.iter().map(|t| t.map(|i| first + i));
+                if !meets_vehicles(s) {
+                    if in_ais_way(s) {
+                        ghost_path.extend(placed.clone());
+                    } else {
+                        ghost_part = true;
+                    }
+                    ghost_triangles.extend(placed);
+                    continue;
+                }
                 if in_ais_way(s) {
-                    path_triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
+                    path_triangles.extend(placed.clone());
                 } else {
                     path_part = true;
                 }
-                triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
+                triangles.extend(placed);
+            }
+            // A model of no shape a vehicle meets keeps them all solid
+            // (none such is known; kept as before).
+            if triangles.is_empty() {
+                triangles.append(&mut ghost_triangles);
+                path_part |= ghost_part;
+                path_triangles.append(&mut ghost_path);
             }
         }
         let stand_in = !shaped && triangles.is_empty();
@@ -1064,6 +1125,16 @@ impl CollisionShape {
         let mut shape = Self::mesh_of(&vertices, &triangles, &surfaces)?;
         if path_part {
             shape.path = PathSolid::of(&vertices, &path_triangles);
+        }
+        if let Some(g) = Self::mesh(&vertices, &ghost_triangles) {
+            shape.ghost = Some(Ghost {
+                shape: g.shape,
+                path: if ghost_part {
+                    PathSolid::of(&vertices, &ghost_path)
+                } else {
+                    PathSolid::All
+                },
+            });
         }
         let whole = match (&loose, sub_object) {
             (None, None) => Loose::whole(model, shape.bounds()).map(Arc::new),
@@ -1972,6 +2043,10 @@ const CARGO: r::Group = r::Group::GROUP_6;
 /// The collision group of a vehicle's own collision shapes, its `PHY2`
 /// ([`Physics::add_bed`]): only goods riding it ([`CARGO`]) meet them.
 const BED: r::Group = r::Group::GROUP_7;
+
+/// The collision group of a model's shapes no vehicle meets ([`Ghost`]):
+/// sensors, which every query sees but a wheel's look for the ground.
+const GHOST: r::Group = r::Group::GROUP_8;
 
 /// A tracked vehicle's push at `s` of its top speed, of its most: its
 /// curve's points (of its top speed, of its most) in a line between, as
@@ -2940,7 +3015,8 @@ fn ground<'a>() -> r::QueryFilter<'a> {
             .difference(DEBRIS)
             .difference(RUBBLE)
             .difference(CARGO)
-            .difference(BED),
+            .difference(BED)
+            .difference(GHOST),
         r::InteractionTestMode::And,
     ))
 }
@@ -2979,6 +3055,8 @@ pub struct Physics {
     surfaces: HashMap<r::ColliderHandle, CollisionShape>,
     /// What of a static a path search does not see in full ([`PathSolid`]).
     path_solid: HashMap<r::ColliderHandle, PathSolid>,
+    /// Each static's shapes no vehicle meets ([Ghost]).
+    ghosts: HashMap<StaticKey, r::ColliderHandle>,
     controller: KinematicCharacterController,
     vehicles: Vec<Option<VehicleBody>>,
     ragdolls: Vec<Option<Ragdoll>>,
@@ -3042,6 +3120,7 @@ impl Physics {
             keys: HashMap::new(),
             surfaces: HashMap::new(),
             path_solid: HashMap::new(),
+            ghosts: HashMap::new(),
             controller,
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
@@ -3105,14 +3184,34 @@ impl Physics {
         if !matches!(shape.path, PathSolid::All) {
             self.path_solid.insert(handle, shape.path.clone());
         }
+        if let Some(g) = &shape.ghost {
+            let collider = r::ColliderBuilder::new(g.shape.clone())
+                .position(pose(position, rotation))
+                .sensor(true)
+                .collision_groups(r::InteractionGroups::new(
+                    GHOST,
+                    r::Group::ALL,
+                    r::InteractionTestMode::And,
+                ))
+                .build();
+            let h = insert_collider(&mut self.world, collider, None);
+            self.ghosts.insert(key, h);
+            self.keys.insert(h, key);
+            if !matches!(g.path, PathSolid::All) {
+                self.path_solid.insert(h, g.path.clone());
+            }
+        }
     }
 
     pub fn remove_static(&mut self, key: StaticKey) {
+        let ghost = self.ghosts.remove(&key);
         if let Some(h) = self.statics.remove(&key) {
-            self.keys.remove(&h);
-            self.surfaces.remove(&h);
-            self.path_solid.remove(&h);
-            self.world.remove_collider(h);
+            for h in std::iter::once(h).chain(ghost) {
+                self.keys.remove(&h);
+                self.surfaces.remove(&h);
+                self.path_solid.remove(&h);
+                self.world.remove_collider(h);
+            }
         }
     }
 
@@ -5842,7 +5941,8 @@ impl Physics {
         for (handle, _) in self.world.intersect_shape(
             pose(middle, Quat::IDENTITY),
             &cube,
-            r::QueryFilter::default(),
+            // Not a model's shapes no vehicle meets ([`Ghost`]).
+            r::QueryFilter::default().exclude_sensors(),
         ) {
             let fixed = matches!(
                 self.keys.get(&handle),
@@ -9520,6 +9620,81 @@ mod tests {
         );
     }
 
+    /// A 4 m wide, 2 m tall box 12 m ahead, `ghost` (only its AI box, as a
+    /// jungle rock cluster's flags 0x25 shape) or solid: how far a car
+    /// driving at it for 6 s gets, and whether a path sweep through it
+    /// meets it.
+    fn drive_at_box(ghost: bool) -> (f32, bool) {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        let block = r::SharedShape::cuboid(2.0, 1.0, 1.0);
+        // A post far off as the model's solid part.
+        let post = r::SharedShape::compound(vec![(
+            pose(Vec3::new(30.0, 1.0, 0.0), Quat::IDENTITY),
+            r::SharedShape::cuboid(0.1, 1.0, 0.1),
+        )]);
+        let mut shape = CollisionShape::cuboid(Vec3::ONE);
+        if ghost {
+            shape.shape = post;
+            shape.ghost = Some(Ghost {
+                shape: block,
+                path: PathSolid::All,
+            });
+        } else {
+            shape.shape = block;
+        }
+        p.add_static(
+            StaticKey::Object(3),
+            &shape,
+            Vec3::new(0.0, 1.0, 12.0),
+            Quat::IDENTITY,
+        );
+        p.step(DT);
+        let met = p
+            .sweep_obstacle(
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.0, 1.0, 24.0),
+                Vec3::new(1.0, 0.5, 0.05),
+                None,
+            )
+            .is_some();
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..360 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        (p.vehicle_transform(id).unwrap().w_axis.z, met)
+    }
+
+    #[test]
+    fn a_car_drives_through_what_only_paths_see() {
+        let (solid_z, solid_met) = drive_at_box(false);
+        let (ghost_z, ghost_met) = drive_at_box(true);
+        assert!(solid_met && ghost_met, "a path sweep meets both");
+        assert!(solid_z < 12.0, "stopped by the solid box at {solid_z}");
+        assert!(ghost_z > 20.0, "drove through the AI box to {ghost_z}");
+    }
+
+    #[test]
+    fn only_some_layers_are_met_by_vehicles() {
+        use crate::collision_layers::{BUILDING, meets_vehicles};
+        // A rock cluster's two shapes (0x822E6FD8's sweep sees the first,
+        // a tank meets the second), a chain fence, a wall, an AI bridge.
+        let layer = |flags| layer_of(&BUILDING, flags, 3);
+        assert!(!meets_vehicles(layer(0x25)));
+        assert!(meets_vehicles(layer(0x03)));
+        assert!(meets_vehicles(layer(0x07)));
+        assert!(meets_vehicles(layer(0x27)));
+        assert!(!meets_vehicles(layer(0x60)));
+        assert!(!meets_vehicles(layer(0x05)));
+    }
+
     #[test]
     fn a_car_knocks_a_loose_pole_over_and_ploughs_on() {
         let mut p = Physics::new();
@@ -9547,6 +9722,7 @@ mod tests {
             material: None,
             surfaces: Arc::new([]),
             path: PathSolid::All,
+            ghost: None,
         };
         let base = Vec3::new(0.0, 0.0, 12.0);
         p.add_static(StaticKey::Object(7), &pole, base, Quat::IDENTITY);
