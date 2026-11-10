@@ -80,8 +80,12 @@
 //!   0: its vehicle's class, which 0x822BB608 sets to 1 to 7 for any
 //!   vehicle (0 with none).
 //!
-//! Inferred: a body's box is its collider's own bounds (the 360's is its
-//! entity's, 0x821861B0). Stand-ins: the search runs to its end at once
+//! A body's box is its entity's (0x821861B0, 0x82182E90): a static's
+//! model's box round all its shapes on parts it shows intact, leaves
+//! included ([`CollisionShape::entity_box`](crate::physics::CollisionShape::entity_box)),
+//! and a vehicle's round its hull, turret and gun. A loose piece's is its
+//! own (whether the 360's pieces are bodies of the broken entity or
+//! entities of their own isn't traced). Stand-ins: the search runs to its end at once
 //! (the 360's manager spreads searches over frames, 8 steps a frame
 //! within 1.5 ms); the way followed is the straight lines between its
 //! nodes (the 360 follows Hermite curves through them, 0x8216D818, with
