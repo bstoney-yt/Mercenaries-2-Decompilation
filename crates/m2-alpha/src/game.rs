@@ -2082,6 +2082,7 @@ impl Game {
                     priority: v
                         .guid
                         .is_some_and(|g| self.scene.people.priority.contains(&g)),
+                    vehicle: v.id,
                 })
             })
             .collect();

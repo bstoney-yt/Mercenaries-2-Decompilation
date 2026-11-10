@@ -7011,18 +7011,9 @@ mod tests {
 
     #[test]
     fn a_tank_fires_no_more_shells_than_its_cannon_carries() {
-        use m2_engine::VehicleSpec;
         use m2_engine::tuning::{GunTuning, RoundScale, VehicleTuning};
-        use m2_engine::vehicle::WheelSpec;
         let mut physics = ground();
         let dt = 1.0 / 60.0;
-        let wheel = |x: f32, z: f32| WheelSpec {
-            centre: Vec3::new(x, 0.4, z),
-            radius: 0.4,
-            width: 0.4,
-            steers: false,
-        };
-        let hull = (Vec3::new(-1.5, 0.0, -3.0), Vec3::new(1.5, 2.0, 3.0));
         // Its cannon carries two shells and could fire ten a second.
         let gun = GunTuning {
             weapon: 1,
@@ -7034,56 +7025,10 @@ mod tests {
             flash: None,
             sound_bank: None,
         };
-        let spec = VehicleSpec {
-            model: 1,
-            kind: "tank".into(),
-            label: "test".into(),
-            node_names: Vec::new(),
-            armed: Vec::new(),
-            wheels: vec![
-                wheel(-1.3, 2.0),
-                wheel(1.3, 2.0),
-                wheel(-1.3, -2.0),
-                wheel(1.3, -2.0),
-            ],
-            bounds: hull,
-            seat: None,
-            door: None,
-            seating: None,
-            entrances: Vec::new(),
-            tracked: true,
-            road_wheels: Vec::new(),
-            rest: Vec::new(),
-            node_wheel: Vec::new(),
-            node_rolls: Vec::new(),
-            mass: 32_000.0,
-            turret: Vec::new(),
-            pivot: None,
-            muzzle: Some(Vec3::new(0.0, 2.2, 5.0)),
-            gun: Vec::new(),
-            gun_pivot: None,
-            muzzle_on_gun: false,
-            elevation: (0.0, 0.0),
-            hull,
-            turret_box: None,
-            rotors: Vec::new(),
-            tilts: Vec::new(),
-            bomb_bay: None,
-            node_parents: Vec::new(),
-            aimers: Vec::new(),
-            damage: None,
-            chassis: None,
-            shapes: Default::default(),
-            material: None,
-            turret_shapes: Default::default(),
-            turret_mass: None,
-            gun_body: None,
-            wreck: None,
-            tuning: VehicleTuning {
-                gun: Some(gun),
-                ..VehicleTuning::default()
-            },
-        };
+        let spec = crate::npc::tests::tank(VehicleTuning {
+            gun: Some(gun),
+            ..VehicleTuning::default()
+        });
         let id = physics.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
         physics.step(dt);
         let mut vehicles = vec![ParkedVehicle {
