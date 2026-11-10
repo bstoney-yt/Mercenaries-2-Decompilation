@@ -1842,6 +1842,14 @@ const TURRET_LEAD_DAMP: f32 = 0.0;
 /// 1.8 degrees. Closer, it and its tank sleep on.
 const TURRET_WAKE: f32 = 0.031_622_78;
 
+/// How fast, radians a second, the pitch asked of a sleeping gun on its
+/// own body must move to wake it: the 360's turret update hands the gun's
+/// action its pitch every frame and wakes the gun's body only when the
+/// square of its pitch speed (the turret's +0x18, which its pitch aim
+/// 0x822749E8 moves its pitch +0x10 by) is over 0.005 (0x820F8C6C), about
+/// 0.07. Its speed here is the asked pitch's change over the step.
+const GUN_WAKE: f32 = 0.070_710_68;
+
 /// A turret's gun on a body of its own, on a hinge across the turret
 /// at its trunnions, as the 360 code builds it (0x82275974 calls
 /// 0x82273F90 with the pitch part, its `MinPitch`/`MaxPitch` and
@@ -1855,6 +1863,8 @@ struct GunHinge {
     force: f32,
     /// The pitch asked, radians (up is positive).
     target: f32,
+    /// The pitch asked when it was last driven.
+    last: f32,
 }
 
 /// A boat's hull in the water: what floats it, and what its driver asks
@@ -3712,6 +3722,7 @@ impl Physics {
             joint,
             force,
             target: 0.0,
+            last: 0.0,
         }
     }
 
@@ -4619,20 +4630,33 @@ impl Physics {
                 }
             }
             // Its gun to the pitch asked.
-            let Some((joint, force, target)) = self.vehicles[i]
-                .as_ref()
-                .and_then(|v| v.hinge.as_ref())
-                .and_then(|h| h.gun.as_ref())
-                .map(|g| (g.joint, g.force, g.target))
+            let Some((joint, force, target, body, last)) = self.vehicles[i]
+                .as_mut()
+                .and_then(|v| v.hinge.as_mut())
+                .and_then(|h| h.gun.as_mut())
+                .map(|g| {
+                    let last = g.last;
+                    g.last = g.target;
+                    (g.joint, g.force, g.target, g.body, last)
+                })
             else {
                 continue;
             };
             let Some(now) = self.gun_pitch(VehicleId(i)) else {
                 continue;
             };
+            // Asleep, it is woken only when the pitch asked moves faster
+            // than [`GUN_WAKE`] (0x82275608); else it sleeps on.
+            let speed = if dt > 0.0 { (target - last) / dt } else { 0.0 };
+            let asleep = self.world.bodies.get(body).is_some_and(|b| b.is_sleeping());
+            let wake = !asleep || speed * speed > GUN_WAKE * GUN_WAKE;
             // The joint turns about +x, the gun's pitch about -x.
             let off = -(target - now);
-            if let Some(j) = self.world.impulse_joints.get_mut(joint, off.abs() > 1e-4) {
+            if let Some(j) = self
+                .world
+                .impulse_joints
+                .get_mut(joint, wake && off.abs() > 1e-4)
+            {
                 j.data
                     .set_motor_velocity(r::JointAxis::AngX, 20.0 * off, force);
             }
@@ -6374,6 +6398,100 @@ mod tests {
     // motor (20 x the angle to go, a second; 0x82273F90): asked to move at
     // 1 rad/s it keeps up a twentieth of a second behind, and turns the
     // hull it sits on hardly at all.
+    #[test]
+    fn a_sleeping_gun_wakes_only_when_its_pitch_asked_moves_fast_enough() {
+        // 0x82275608: a sleeping gun's body is woken only when its pitch
+        // speed squared is over 0.005 (about 0.07 radians a second).
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let cube = |lo: Vec3, hi: Vec3| {
+            let mut v = Vec::new();
+            for x in [lo.x, hi.x] {
+                for y in [lo.y, hi.y] {
+                    for z in [lo.z, hi.z] {
+                        v.push(Vec3::new(x, y, z));
+                    }
+                }
+            }
+            v
+        };
+        let spec = VehicleSpec {
+            turret_shapes: vec![cube(Vec3::new(-1.0, 1.6, -1.0), Vec3::new(1.0, 2.4, 1.0))].into(),
+            turret_mass: Some(crate::vehicle::Chassis {
+                mass: 3000.0,
+                inertia: Mat3::from_diagonal(Vec3::new(2000.0, 2500.0, 1000.0)),
+                centre_of_mass: Vec3::new(0.0, 2.0, 0.0),
+            }),
+            gun_body: Some(crate::vehicle::GunBody {
+                shapes: vec![cube(Vec3::new(-0.1, 1.9, 1.1), Vec3::new(0.1, 2.1, 4.0))].into(),
+                mass: crate::vehicle::Chassis {
+                    mass: 80.0,
+                    inertia: Mat3::from_diagonal(Vec3::new(60.0, 60.0, 0.5)),
+                    centre_of_mass: Vec3::new(0.0, 2.0, 2.0),
+                },
+            }),
+            gun_pivot: Some(Vec3::new(0.0, 2.0, 1.0)),
+            pivot: Some(Vec3::new(0.0, 2.0, 0.0)),
+            mass: 30000.0,
+            tuning: crate::tuning::VehicleTuning {
+                turret: Some(crate::tuning::TurretTuning {
+                    main: true,
+                    yaw_speed: 1.0,
+                    yaw_accel: 20.0,
+                    pitch: (-0.1, 0.3),
+                    pitch_speed: 1.0,
+                    pitch_accel: 20.0,
+                    yaw: None,
+                }),
+                ..car().tuning
+            },
+            ..car()
+        };
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.5, 0.0), 0.0);
+        for _ in 0..60 {
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        let v = p.vehicles[id.0].as_ref().unwrap();
+        let h = v.hinge.as_ref().unwrap();
+        let bodies = [v.controller.chassis, h.body, h.gun.as_ref().unwrap().body];
+        let gun = bodies[2];
+        for b in bodies {
+            p.world.bodies[b].sleep();
+        }
+        let start = p.gun_pitch(id).unwrap();
+        // Raised at 0.03 radians a second: it sleeps on, where it was (for
+        // 12 steps: this car's hull wakes itself every step, and rapier
+        // wakes the rest of its island from it some 18 steps on).
+        let mut pitch = 0.0;
+        for _ in 0..12 {
+            pitch += 0.03 * DT;
+            p.aim_gun(id, pitch);
+            p.step(DT);
+        }
+        assert!(p.world.bodies[gun].is_sleeping(), "woken at 0.03 rad/s");
+        assert!((p.gun_pitch(id).unwrap() - start).abs() < 1e-4);
+        // Raised at 0.3 radians a second: woken, it follows.
+        for _ in 0..30 {
+            pitch += 0.3 * DT;
+            p.aim_gun(id, pitch);
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        assert!(
+            !p.world.bodies[gun].is_sleeping(),
+            "still asleep at 0.3 rad/s"
+        );
+        let up = p.gun_pitch(id).unwrap() - start;
+        assert!(up > 0.1, "rose {up}");
+    }
+
     #[test]
     fn a_turret_s_gun_on_its_own_body_tilts_to_the_pitch_asked() {
         let mut p = Physics::new();
