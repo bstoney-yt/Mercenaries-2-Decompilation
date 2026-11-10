@@ -795,6 +795,20 @@ pub(crate) fn body_shapes_showing(
     body: usize,
     wrecked: bool,
 ) -> (Vec<Vec<Vec3>>, bool) {
+    let (shapes, hull) = body_shapes_seen(model, p, body, wrecked);
+    (shapes.into_iter().map(|(v, _)| v).collect(), hull)
+}
+
+/// [`body_shapes_showing`], each shape with whether a path search sees
+/// it: its layer as a vehicle's ([`collision_layers::VEHICLE`], by its
+/// flags, 0x8216C308) in [`PATH_MASK`](collision_layers::PATH_MASK). A
+/// car's flags 0x28 hull shape (layer 11) isn't.
+pub(crate) fn body_shapes_seen(
+    model: &Model<'_>,
+    p: &Phy2,
+    body: usize,
+    wrecked: bool,
+) -> (Vec<(Vec<Vec3>, bool)>, bool) {
     let hidden = model
         .states
         .as_ref()
@@ -816,11 +830,17 @@ pub(crate) fn body_shapes_showing(
                 .unwrap_or(Mat4::IDENTITY)
                 * p.shape_place(k).map_or(Mat4::IDENTITY, place);
             let (v, _) = s.geometry.triangles(s.radius);
-            v.iter()
+            let seen = seen_by(
+                collision_layers::PATH_MASK,
+                layer_of(&collision_layers::VEHICLE, s.flags(), s.kind()),
+            );
+            let points: Vec<Vec3> = v
+                .iter()
                 .map(|&x| to_model.transform_point3(Vec3::from(x)))
-                .collect()
+                .collect();
+            (points, seen)
         })
-        .filter(|v: &Vec<Vec3>| v.len() >= 4)
+        .filter(|(v, _)| v.len() >= 4)
         .collect();
     (shapes, hull)
 }
@@ -3998,12 +4018,15 @@ impl Physics {
         // its points' convex hull (Havok's are convex but for a mesh one,
         // whose hull covers a little more). A model without them keeps the
         // invented box.
-        let shapes: Vec<r::SharedShape> = spec
+        // Each with whether a path search sees it
+        // ([`VehicleSpec::path_unseen`]).
+        let shapes: Vec<(r::SharedShape, bool)> = spec
             .shapes
             .iter()
-            .filter_map(|v| {
+            .enumerate()
+            .filter_map(|(k, v)| {
                 let points: Vec<_> = v.iter().map(|&p| vector(p)).collect();
-                r::SharedShape::convex_hull(&points)
+                r::SharedShape::convex_hull(&points).map(|s| (s, !spec.path_unseen.contains(&k)))
             })
             .collect();
         if shapes.is_empty() {
@@ -4015,7 +4038,7 @@ impl Physics {
                 .collision_groups(hull);
             insert_collider(&mut self.world, collider, Some(body));
         }
-        for (i, shape) in shapes.into_iter().enumerate() {
+        for (i, (shape, seen)) in shapes.into_iter().enumerate() {
             let collider = r::ColliderBuilder::new(shape)
                 .friction(hull_friction)
                 .friction_combine_rule(combine)
@@ -4029,7 +4052,10 @@ impl Physics {
             } else {
                 collider.density(0.0)
             };
-            insert_collider(&mut self.world, collider, Some(body));
+            let h = insert_collider(&mut self.world, collider, Some(body));
+            if !seen {
+                self.path_solid.insert(h, PathSolid::Nothing);
+            }
         }
         // The turret: a body of its own on a hinge about the up through
         // its mount when its parts have a mass ([`VehicleSpec::turret_mass`];
@@ -4332,6 +4358,11 @@ impl Physics {
                 self.world.remove_body_with_colliders(h.body, true);
                 if let Some(g) = &h.gun {
                     self.world.remove_body_with_colliders(g.body, true);
+                }
+            }
+            if let Some(b) = self.world.bodies.get(v.controller.chassis) {
+                for h in b.colliders() {
+                    self.path_solid.remove(h);
                 }
             }
             self.world
@@ -6595,6 +6626,7 @@ mod tests {
             v
         };
         let spec = VehicleSpec {
+            path_unseen: Default::default(),
             turret_shapes: vec![cube(Vec3::new(-1.0, 1.6, -1.0), Vec3::new(1.0, 2.4, 1.0))].into(),
             turret_mass: Some(crate::vehicle::Chassis {
                 mass: 3000.0,
@@ -6687,6 +6719,7 @@ mod tests {
             v
         };
         let spec = VehicleSpec {
+            path_unseen: Default::default(),
             turret_shapes: vec![cube(Vec3::new(-1.0, 1.6, -1.0), Vec3::new(1.0, 2.4, 1.0))].into(),
             turret_mass: Some(crate::vehicle::Chassis {
                 mass: 3000.0,
@@ -6780,6 +6813,7 @@ mod tests {
             }
         }
         let spec = VehicleSpec {
+            path_unseen: Default::default(),
             turret_shapes: vec![block].into(),
             turret_mass: Some(crate::vehicle::Chassis {
                 mass: 3000.0,
@@ -6850,6 +6884,7 @@ mod tests {
             }
         }
         let spec = VehicleSpec {
+            path_unseen: Default::default(),
             turret_shapes: vec![block].into(),
             turret_mass: Some(crate::vehicle::Chassis {
                 mass: 3000.0,
@@ -6903,6 +6938,49 @@ mod tests {
         assert!((heading(&p) - before).abs() < 0.05, "hull turned");
     }
 
+    // A vehicle's flags 0x28 hull shape (layer 11) is no path obstacle
+    // (0x822E6FD8's mask), its others are; the car still bumps into both.
+    #[test]
+    fn a_path_sweep_misses_a_vehicles_shape_on_a_layer_it_doesnt_see() {
+        let block = |x: f32| {
+            let mut v = Vec::new();
+            for dx in [-0.5, 0.5] {
+                for y in [0.5, 1.5] {
+                    for z in [-1.0, 1.0] {
+                        v.push(Vec3::new(x + dx, y, z));
+                    }
+                }
+            }
+            v
+        };
+        let spec = VehicleSpec {
+            shapes: vec![block(0.0), block(6.0)].into(),
+            path_unseen: vec![1].into(),
+            ..car()
+        };
+        let mut p = Physics::new();
+        let id = p.add_vehicle(&spec, Vec3::ZERO, 0.0);
+        p.hold_vehicle(id, true);
+        p.step(DT);
+        let at = p.vehicle_transform(id).unwrap();
+        let across = |x: f32| {
+            let x = at.transform_point3(Vec3::new(x, 1.0, 0.0));
+            p.sweep_obstacle(
+                x - Vec3::Z * 5.0,
+                x + Vec3::Z * 5.0,
+                Vec3::new(0.1, 0.1, 0.05),
+                None,
+            )
+        };
+        assert!(across(0.0).is_some(), "the seen shape is met");
+        assert!(across(6.0).is_none(), "the unseen one isn't");
+        let ray = |x: f32| {
+            let x = at.transform_point3(Vec3::new(x, 1.0, 0.0));
+            p.cast_ray(x - Vec3::Z * 5.0, Vec3::Z, 10.0)
+        };
+        assert!(ray(6.0).is_some(), "but it is still solid");
+    }
+
     // A path search sizes a vehicle up by all its bodies (0x82182E90): a
     // sweep low past the hull meets it, and the box takes in the turret's
     // block up to 4 m, turned a quarter left out to its left.
@@ -6918,6 +6996,7 @@ mod tests {
             }
         }
         let spec = VehicleSpec {
+            path_unseen: Default::default(),
             turret_shapes: vec![block].into(),
             pivot: Some(Vec3::new(0.0, 3.0, 0.0)),
             ..car()
@@ -6960,6 +7039,7 @@ mod tests {
             }
         }
         let spec = VehicleSpec {
+            path_unseen: Default::default(),
             turret_shapes: vec![block].into(),
             pivot: Some(Vec3::new(0.0, 3.0, 0.0)),
             ..car()
@@ -7389,6 +7469,7 @@ mod tests {
             chassis: None,
             shapes: Default::default(),
             material: None,
+            path_unseen: Default::default(),
             turret_shapes: Default::default(),
             turret_mass: None,
             gun_body: None,
