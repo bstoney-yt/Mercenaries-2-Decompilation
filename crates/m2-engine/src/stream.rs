@@ -795,7 +795,8 @@ impl World {
             .iter()
             .zip(loose.starts(placed))
             .map(|(piece, at)| self.physics.add_debris(piece, at, velocity, spin))
-            .collect();
+            .collect::<Vec<_>>();
+        self.physics.group_debris(&pieces, placed);
         self.knocked.insert(i, pieces);
         true
     }

@@ -3104,6 +3104,9 @@ pub struct Physics {
     ghosts: HashMap<StaticKey, r::ColliderHandle>,
     /// Each static's box as a path search sizes it up ([CollisionShape::entity_box]).
     boxes: HashMap<StaticKey, (Vec3, Vec3)>,
+    /// The pieces of one broken model ([`Physics::group_debris`]): each
+    /// piece's body to the model's place and all its pieces' bodies.
+    debris_groups: HashMap<r::RigidBodyHandle, (r::Pose, Arc<[r::RigidBodyHandle]>)>,
     controller: KinematicCharacterController,
     vehicles: Vec<Option<VehicleBody>>,
     ragdolls: Vec<Option<Ragdoll>>,
@@ -3169,6 +3172,7 @@ impl Physics {
             path_solid: HashMap::new(),
             ghosts: HashMap::new(),
             boxes: HashMap::new(),
+            debris_groups: HashMap::new(),
             controller,
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
@@ -3761,7 +3765,52 @@ impl Physics {
         b.set_angvel(vector(Vec3::ZERO), true);
     }
 
+    /// Marks `pieces` as one broken model placed at `at` (world space;
+    /// scale ignored). From the 360 code: a model whose state changes has
+    /// its physics rebuilt for the parts it now shows (0x8222D2F0 sets the
+    /// state, 0x821C7648, and queues 0x82182CE8; 0x82152780 tears it down
+    /// and sets it up again, 0x821831B0), so its pieces stay bodies of its
+    /// entity, and a path search sizes any of them up by the box round all
+    /// of them in the entity's frame (0x821861B0, 0x82182E90).
+    pub fn group_debris(&mut self, pieces: &[DebrisId], at: Mat4) {
+        let (_, rotation, translation) = at.to_scale_rotation_translation();
+        let place = pose(translation, rotation.normalize());
+        let bodies: Arc<[r::RigidBodyHandle]> = pieces
+            .iter()
+            .filter_map(|d| self.debris.get(d.0).copied().flatten())
+            .collect();
+        for &b in bodies.iter() {
+            self.debris_groups.insert(b, (place, bodies.clone()));
+        }
+    }
+
+    /// The box round the pieces of the broken model `body` is one of
+    /// ([`group_debris`](Self::group_debris)), in its frame, and its place.
+    fn debris_box(&self, body: r::RigidBodyHandle) -> Option<(r::Pose, r::Aabb)> {
+        let (place, bodies) = self.debris_groups.get(&body)?;
+        let mut out: Option<r::Aabb> = None;
+        for &b in bodies.iter() {
+            let Some(rb) = self.world.bodies.get(b) else {
+                continue;
+            };
+            for &h in rb.colliders() {
+                let Some(c) = self.world.colliders.get(h) else {
+                    continue;
+                };
+                let a = c.shape().compute_aabb(&place.inv_mul(c.position()));
+                out = Some(match out {
+                    Some(o) => rapier3d::geometry::BoundingVolume::merged(&o, &a),
+                    None => a,
+                });
+            }
+        }
+        Some((*place, out?))
+    }
+
     pub fn remove_debris(&mut self, id: DebrisId) {
+        if let Some(h) = self.debris.get(id.0).copied().flatten() {
+            self.debris_groups.remove(&h);
+        }
         if let Some(h) = self.debris.get_mut(id.0).and_then(Option::take) {
             self.world.remove_body_with_colliders(h, true);
         }
@@ -6068,7 +6117,10 @@ impl Physics {
         };
         // A vehicle's: round all its bodies (hull, turret, gun), in its
         // hull's frame, as the 360's entity box is (0x82182E90).
-        if let Some((p, b)) = c.parent().and_then(|body| self.vehicle_box(body)) {
+        if let Some((p, b)) = c
+            .parent()
+            .and_then(|body| self.vehicle_box(body).or_else(|| self.debris_box(body)))
+        {
             let (i, g) = handle.into_raw_parts();
             return Some(crate::path_search::Obstacle {
                 point: vec3(p.translation),
@@ -9918,6 +9970,69 @@ mod tests {
         assert!(meets_vehicles(layer(0x27)));
         assert!(!meets_vehicles(layer(0x60)));
         assert!(!meets_vehicles(layer(0x05)));
+    }
+
+    // A broken fence's planks stay its entity's bodies on the 360: a path
+    // sweep meeting one plank sizes it up by the box round both, in the
+    // fence's frame; a lone piece by its own.
+    #[test]
+    fn a_broken_models_pieces_share_its_path_box() {
+        let mut p = Physics::new();
+        let plank = LoosePiece {
+            node: None,
+            shape: r::SharedShape::cuboid(2.0, 0.5, 0.2),
+            mass: 20.0,
+            material: BodyMaterial::DEBRIS,
+            from_model: Mat4::IDENTITY,
+        };
+        let fence = Mat4::from_translation(Vec3::new(0.0, 0.0, 10.0));
+        let a = p.add_debris(
+            &plank,
+            fence * Mat4::from_translation(Vec3::new(-3.0, 0.5, 0.0)),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        let b = p.add_debris(
+            &plank,
+            fence * Mat4::from_translation(Vec3::new(4.0, 0.5, 0.0)),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        p.add_debris(
+            &plank,
+            Mat4::from_translation(Vec3::new(30.0, 0.5, 10.0)),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        p.group_debris(&[a, b], fence);
+        p.step(DT);
+        let sweep = |p: &Physics, x: f32| {
+            p.sweep_obstacle(
+                Vec3::new(x, 0.5, 0.0),
+                Vec3::new(x, 0.5, 20.0),
+                Vec3::new(0.1, 0.1, 0.05),
+                None,
+            )
+        };
+        let o = sweep(&p, -3.0).expect("meets the first plank");
+        assert!(
+            (o.min.x + 5.0).abs() < 0.1 && (o.max.x - 6.0).abs() < 0.1,
+            "{} .. {}",
+            o.min,
+            o.max
+        );
+        assert!((o.pose.0 - Vec3::new(0.0, 0.0, 10.0)).length() < 1e-3);
+        let o = sweep(&p, 30.0).expect("meets the lone piece");
+        assert!(
+            (o.max.x - o.min.x - 4.0).abs() < 0.1,
+            "{} .. {}",
+            o.min,
+            o.max
+        );
+        // Gone with its pieces.
+        p.remove_debris(a);
+        p.remove_debris(b);
+        assert!(p.debris_groups.is_empty());
     }
 
     #[test]
