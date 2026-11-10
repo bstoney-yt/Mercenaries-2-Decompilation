@@ -45,8 +45,10 @@ defaults:
     shell: cmd
 
 jobs:
-  host:
-    name: Lint and test (host)
+  # One job, so a run checks out once and does not queue a second time
+  # behind other runs on the single runner.
+  ci:
+    name: Lint, test and build
     if: >-
       github.event_name == 'push' ||
       (github.event.action != 'closed' &&
@@ -60,14 +62,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
       - run: cargo xtask symbols
-
-  windows-i686:
-    name: Build (i686-pc-windows-msvc)
-    runs-on: [self-hosted, Windows, X64, m2-pc]
-    needs: host
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show
       # Lints the Windows target, where the C parts (the vendored Lua in
       # m2-game) are compiled.
       - run: cargo clippy --workspace --all-targets --target i686-pc-windows-msvc
@@ -75,10 +69,14 @@ jobs:
       # The script host's Lua raises errors with longjmp, which unwinds
       # differently on Windows; run its tests on the 32-bit target too.
       - run: cargo test -p m2-game --target i686-pc-windows-msvc
+      # The release exe is built only for main: PRs already get the debug
+      # i686 build above, and this step takes about 8 minutes.
       - name: Build the alpha exe
+        if: github.event_name == 'push'
         run: cargo build --release -p m2-alpha --target i686-pc-windows-msvc
       # Our code only: the exe reads the game from the player's own install.
       - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
         with:
           name: m2-alpha-windows-i686
           path: target/i686-pc-windows-msvc/release/m2-alpha.exe
