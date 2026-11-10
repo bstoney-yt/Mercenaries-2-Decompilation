@@ -3279,19 +3279,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Single player: this machine is the server.
     let net = lib("Net")?;
     add(&net, "IsServer", |_, _, _| values([Value::Boolean(true)]))?;
-    for name in ["IsClient", "IsActive", "IsMultiplayer"] {
-        add(&net, name, |_, _, _| values([Value::Boolean(false)]))?;
-    }
-    // From the 360 code (`Net.SendCustomEvent`, 0x8232cc78): outside a
-    // multiplayer session (the flag `Net.IsMultiplayer` reads) it sends
-    // nothing and answers true. In one, it packs the target script's name
-    // hash, the event and up to five values and sends them to the other
-    // machine; it never calls this machine's own handler. The contracts
-    // do the local half themselves (PmcCon004's ProximityCallback: her
-    // own docking attack here, the event only for a partner's).
+    // Net.SendCustomEvent(module, event, args, ...): a script's own event
+    // sent to the other player's game (a race's gates). From the 360 code
+    // (8232CC78): with no network game on it sends nothing and gives true.
     add(&net, "SendCustomEvent", |_, _, _| {
         values([Value::Boolean(true)])
     })?;
+    for name in ["IsClient", "IsActive", "IsMultiplayer"] {
+        add(&net, name, |_, _, _| values([Value::Boolean(false)]))?;
+    }
     // Co-op bookkeeping around layer loads: nothing to do.
     for name in [
         "BeginLayerEventGroup",
