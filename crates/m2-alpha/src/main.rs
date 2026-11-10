@@ -6008,8 +6008,63 @@ fn plough_at(game: &mut Game, kind: &str) -> bool {
         eprintln!("plough: the {mine} parked 14 m short of the {theirs} at {at:.1}, facing it");
         return true;
     }
+    // `at:<x>,<z>,<to x>,<to z>`: parked at (x, z) facing (to x, to z)
+    // (where PmcCon001's villa tank ends its path, heading into the HQ).
+    if let Some(v) = kind.strip_prefix("at:") {
+        let n: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let [x, z, tx, tz] = n[..] else {
+            eprintln!("plough: at: wants x,z,to x,to z");
+            return false;
+        };
+        // What it stands on along the way, 5 m under the roofs.
+        for k in 0..=10 {
+            let p = Vec3::new(
+                x + (tx - x) * k as f32 / 10.0,
+                here.y + 5.0,
+                z + (tz - z) * k as f32 / 10.0,
+            );
+            let hit = world.physics.cast_ray_keyed(p, Vec3::NEG_Y, 60.0);
+            eprintln!(
+                "plough: under {:.1}: {}",
+                p.with_y(0.0),
+                hit.map_or("nothing".into(), |(d, _, key)| format!(
+                    "{:.2} ({})",
+                    p.y - d,
+                    static_name(world, key)
+                ))
+            );
+        }
+        let spot = Vec3::new(x, here.y, z);
+        let ground = world
+            .physics
+            .cast_ray(spot.with_y(spot.y + 5.0), Vec3::NEG_Y, 60.0)
+            .map_or(spot.y, |(d, _)| spot.y + 5.0 - d);
+        let ahead = Vec3::new(tx - x, 0.0, tz - z).normalize_or(Vec3::Z);
+        let turn = Quat::from_rotation_y(ahead.x.atan2(ahead.z));
+        world.physics.remove_vehicle(id);
+        let v = &mut game.scene.vehicles[i];
+        v.id = Some(
+            world
+                .physics
+                .add_vehicle_turned(&v.spec, spot.with_y(ground + 1.0), turn),
+        );
+        eprintln!(
+            "plough: the {} parked at {:.1}, facing [{tx}, {tz}]",
+            v.spec.label,
+            spot.with_y(ground)
+        );
+        return true;
+    }
+    // `template:<hex>`: the nearest placed object of that template (the
+    // PMC outpost's HQ, 8000735c, that PmcCon001's villa tank runs into).
+    let template = kind
+        .strip_prefix("template:")
+        .and_then(|h| u32::from_str_radix(h.trim_start_matches("0x"), 16).ok());
     let wanted = |w: &m2_engine::World, o: usize| {
         let t = w.index.objects[o].template;
+        if let Some(want) = template {
+            return t == want;
+        }
         let crash = w.index.template_db.crashable.get(&t).map(|c| c.how);
         match kind {
             "fence" => crash == Some(CrashHow::Breaks),
@@ -6304,6 +6359,31 @@ fn drive_for_screenshot(
         }
         if i % 30 == 0 {
             render(backend, game, fov, aspect, None)?;
+        }
+    }
+    // Ploughing: let go and watch where it settles, and whether it stays
+    // on the ground (PmcCon001's villa tank sank through it at the HQ).
+    if ploughing {
+        for i in 0..1800 {
+            game.step(Intent::default(), tick);
+            if i % 15 == 14
+                && let (Some(w), Some((at, _)), Some((id, _))) =
+                    (game.scene.world.as_ref(), game.driving(), driven(game))
+            {
+                let touching = w.physics.vehicle_touching(id);
+                eprintln!(
+                    "plough: let go {:.2} s: at {at:.2}, velocity {:.2}, asleep {}, touching {} \
+                     ({} static)",
+                    (i + 1) as f32 * tick,
+                    w.physics.vehicle_velocity(id),
+                    w.physics.vehicle_asleep(id),
+                    touching.len(),
+                    touching.iter().filter(|t| t.0.is_some()).count()
+                );
+                if at.y < -40.0 {
+                    break;
+                }
+            }
         }
     }
     if let (Some(from), Some((to, speed))) = (from, game.driving()) {
