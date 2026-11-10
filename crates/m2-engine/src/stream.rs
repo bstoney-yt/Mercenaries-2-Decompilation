@@ -99,11 +99,20 @@ impl Default for TextureLimits {
 }
 
 /// A loaded model is kept while one of its placed objects is within its
-/// reach plus this, metres, and freed once none has been for
-/// [`MODEL_KEEP_FOR`] (with the materials and textures only it used). Both
-/// invented: the 360's own release of streamed models is not traced.
+/// reach plus this, metres, and freed (with the materials and textures
+/// only it used) once none is, after [`MODEL_KEEP_FOR`].
+///
+/// From the 360 code: its assets stream through a request list
+/// (0x82846BD0 adds a request and counts it, +0x20/+0x24; 0x82846768 runs
+/// the list by priority within a byte budget, +0x4C350) and an asset is
+/// let go as soon as both its counts are 0 (0x82846768 unlinks it,
+/// 0x82845560, 0x8284A040): released by count, not after a time, so the
+/// time here is 0. What sets and clears the counts for a placed object's
+/// model, and at what distance, is not traced: the margin is invented,
+/// to keep a model at the edge of its reach from loading and freeing by
+/// turns.
 pub const MODEL_KEEP_MARGIN: f32 = 100.0;
-pub const MODEL_KEEP_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+pub const MODEL_KEEP_FOR: std::time::Duration = std::time::Duration::ZERO;
 
 /// The loader thread.
 #[derive(Debug)]
@@ -1120,7 +1129,7 @@ impl World {
         Ok(())
     }
 
-    /// Frees the loaded models no placed object has kept for
+    /// Frees the loaded models no placed object has kept for longer than
     /// [`MODEL_KEEP_FOR`], and the materials and textures only they used;
     /// the loader sends those textures again when next asked.
     fn free_unseen_models(
