@@ -974,6 +974,9 @@ pub struct MissionLink {
     tutorials: bool,
     /// Time not yet given to the scripts.
     lag: f32,
+    /// The ten-second mark at which the scripts' place for her was last
+    /// logged as apart from hers ([`log_held_apart`]).
+    apart_logged: i64,
     log: Option<BufWriter<File>>,
     /// The newest objective message, its text readable, and its age.
     message: Option<(ObjectiveMessage, String, f32)>,
@@ -1178,6 +1181,7 @@ impl MissionLink {
             subtitles: true,
             tutorials: true,
             lag: 0.0,
+            apart_logged: -1,
             log,
             message: None,
             drivers,
@@ -2931,6 +2935,7 @@ impl MissionLink {
             {
                 mission.put_player(at.to_array());
             }
+            log_held_apart(game, mission, &self.vehicles, &mut self.apart_logged);
             // The hardpoints of the props the scripts spawn (a faction
             // HQ's `HqInterior`, whose model holds `hp_playerA_enter`) and
             // of those people sit on: each node of the model where the
@@ -3164,8 +3169,16 @@ impl MissionLink {
             // What she chose in the support menu, the scripts call in;
             // they hand her its designator.
             if let Some(key) = game.support.call_in.take() {
+                let (cash, fuel) = mission.resources();
+                let cost = mission
+                    .support_items()
+                    .into_iter()
+                    .find(|i| i.key == key)
+                    .map(|i| (i.cash, i.fuel));
                 let took = mission.use_support(&key);
-                eprintln!("mission: she calls in {key}: {took}");
+                eprintln!(
+                    "mission: she calls in {key}: {took} (she has cash {cash:.0}, fuel {fuel:.0}; it costs {cost:?})"
+                );
                 self.stock_look = 0;
             }
             // An aimed designator came down: the support manager takes the
@@ -4519,8 +4532,39 @@ fn rides(game: &Game, mission: &Mission) -> Vec<(u32, Vec3)> {
 /// hers: the alpha shows it only while it flies a delivery.
 fn board_ride(game: &mut Game, mission: &mut Mission, g: u32) {
     eprintln!("mission: she boards {g:#x} as a passenger");
-    mission.ride(Some(g));
+    mission.ride_as_passenger(g);
     game.aboard = Some(g);
+}
+
+/// How far the scripts' place for her may lie from where she is before
+/// it is logged (invented: a logging threshold only).
+const HELD_APART: f32 = 50.0;
+
+/// Logs, at most every 10 s of script time, when the scripts hold her
+/// more than [`HELD_APART`] from where she is in play, with what the
+/// position sync depends on: what is near her is judged from their place
+/// (hibernation, `Event.ObjectHibernation`), so a stale one puts what she
+/// marks to sleep.
+fn log_held_apart(game: &Game, mission: &Mission, fleet: &Fleet, logged: &mut i64) {
+    let Some(her) = game.scene.player.as_ref() else {
+        return;
+    };
+    let (held, rides) = {
+        let w = mission.world().borrow();
+        let Some(o) = w.objects.get(&PLAYER) else {
+            return;
+        };
+        (Vec3::from(o.position), o.vehicle)
+    };
+    let apart = held.distance(her.character.position);
+    let mark = (mission.now() / 10.0) as i64;
+    if apart > HELD_APART && mark != *logged {
+        *logged = mark;
+        eprintln!(
+            "mission: the scripts hold her at {held:.1}, {apart:.0} m from {:.1} (driving {:?}, aboard {:?}, waiting to re-enter {:?}, their vehicle for her {rides:?})",
+            her.character.position, her.driving, game.aboard, fleet.reenter
+        );
+    }
 }
 
 /// She gets out of the helicopter `g` she rode in: onto the floor beside

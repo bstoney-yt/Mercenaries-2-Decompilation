@@ -584,12 +584,22 @@ pub struct FireHint {
     /// `SingleShotWeapon` (@20): one round a burst (its burst length
     /// taken as none, 0x822F0098).
     pub single: bool,
+    /// The two unnamed words at @0 and @4 (fields 63e66df5, f34f9919):
+    /// what kind of target and what domain the weapon is for, matched
+    /// against the target's `ObjectHint` words at the same places (its
+    /// @0: 2 vehicle, 3 human; @4: 2 ground, 3 air) by the AI's threat
+    /// rating (0x822EC060, [`crate::ai_target::weapon_threat`]); 1 is any
+    /// (rifles 3 and 1, the AT rocket 1 and 2). Meaning from the 360 code
+    /// and the values; names not found.
+    pub kinds: [u32; 2],
 }
 // Also in `WeaponHint`, named by hashing (gap-list sweep) and not read:
 // `SingleShotWeapon` (read: [`FireHint::single`]; @20: 1 on the 31
-// records whose `BurstOnLength` is 0 but the rocket pod's). Unnamed: the
-// small whole numbers at @0 (1 to 3), @4 (1 to 3) and @24 (1 on the
-// guided missiles only).
+// records whose `BurstOnLength` is 0 but the rocket pod's). Unnamed: @24
+// (1 on the guided missiles only).
+
+/// `WeaponHint`'s @0 and @4 fields ([`FireHint::kinds`]), by hash.
+const KINDS: [u32; 2] = [0x63e6_6df5, 0xf34f_9919];
 
 /// A launcher a soldier carries beside his gun (an `EquipmentLink` to a
 /// weapon firing rockets or missiles: the AT soldiers' `AT Rocket`), and
@@ -639,6 +649,7 @@ impl FireHint {
             on_close: f("BurstOnCloseLength")?,
             off_close: f("BurstOffCloseLength")?,
             against: AGAINST.map(|n| hint.word(r, name_hash(n)).unwrap_or(0)),
+            kinds: KINDS.map(|h| hint.word(r, h).unwrap_or(0)),
             single: hint.word(r, name_hash("SingleShotWeapon")) == Some(1),
         })
     }
@@ -1572,6 +1583,7 @@ mod tests {
             on_close: -1.0,
             off_close: 2.0,
             against: [0; 4],
+            kinds: [1, 1],
             single: false,
         };
         assert_eq!(FireHint::cycle(Some(&h), 0.0), (1.0, 2.0));
@@ -1602,6 +1614,7 @@ mod tests {
             on_close: -1.0,
             off_close: -1.0,
             against: [0; 4],
+            kinds: [1, 1],
             single: false,
         };
         let held = |seen: bool, run: bool, h: &FireHint| {
@@ -1912,6 +1925,7 @@ mod tests {
             on_close: -1.0,
             off_close: 0.75,
             against: [3, 1, 0, 0],
+            kinds: [3, 1],
             single: false,
         };
         let gap = 60.0 / 562.0;

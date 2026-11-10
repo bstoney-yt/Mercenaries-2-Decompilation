@@ -141,6 +141,9 @@ pub struct Game {
     pub gunships: crate::gunships::Gunships,
     /// A pursuit's cars ([`crate::pursuers`]).
     pub pursuers: crate::pursuers::Pursuers,
+    /// The `AiHintNode` points AI vehicles' path searches go by
+    /// ([`crate::path_hints`]).
+    pub path_hints: crate::path_hints::PathHints,
     /// The armies' patrols gone after a foe.
     pub assaults: crate::pursuers::Assaults,
     /// Vehicles the mission scripts send along a path (`crate::paths`).
@@ -462,6 +465,7 @@ impl Game {
             gunships: crate::gunships::Gunships::default(),
             pursuers: crate::pursuers::Pursuers::default(),
             assaults: crate::pursuers::Assaults::default(),
+            path_hints: crate::path_hints::PathHints::default(),
             paths: crate::paths::PathMoves::default(),
             roads: crate::roads::RoadTraffic::default(),
             census: std::env::var("M2_LIFE_CENSUS")
@@ -1092,24 +1096,24 @@ impl Game {
                     if player.driving == Some(i)
                         && let Some(v) = scene.vehicles.get(i)
                     {
-                        // By the seat's exit clip (the 360's exit kind for
-                        // a boarding entrance is `Animated`, 0x822A2B60),
-                        // which ends where she stands.
-                        let exit = crate::ride::exit_entrance(crate::ride::Ride::of(v), seat);
+                        // Where she sits: 0x822A0C30 calls 0x822A1280 with
+                        // its second argument 0, which skips putting her at
+                        // the exit entrance (0x823F8370 -> 0x823F8178), so
+                        // she stands up where the seat is (the Piranha's
+                        // boarding seats are on its deck, 0.9 m up; their
+                        // exits are by the water).
+                        let place = seat_place(physics, v, seat);
                         eprintln!(
-                            "boarding: aboard the {} by a boarding entrance: out by its exit {exit:08x?}",
+                            "boarding: aboard the {} by a boarding entrance: up out of the seat at {place:.2?}",
                             v.spec.label
                         );
-                        match exit {
-                            Some(e) => {
-                                self.boarding =
-                                    Some(crate::boarding::Boarding::exit(i, seat, Some(e)));
+                        match place {
+                            Some((at, facing)) => {
+                                get_out_at(physics, v, seat, player, at, facing);
                             }
-                            None => {
-                                get_out(physics, v, seat, player);
-                                self.ride = None;
-                            }
+                            None => get_out(physics, v, seat, player),
                         }
+                        self.ride = None;
                     }
                 }
                 // Out of the vehicle the use key seated her in, or in
@@ -1769,11 +1773,36 @@ impl Game {
                 })
                 .collect();
             let template_db = &world.index.template_db;
+            if let Some(install) = &self.scene.install
+                && self.path_hints.load(install, template_db)
+            {
+                let placed = world
+                    .index
+                    .objects
+                    .iter()
+                    .filter(|o| self.path_hints.has(o.template))
+                    .count();
+                eprintln!("path hints: {placed} placed objects offer them");
+            }
+            let (objects, props, path_hints) =
+                (&world.index.objects, &self.scene.props, &self.path_hints);
+            let hints = |key: StaticKey| {
+                path_hints.of(key, |k| match k {
+                    StaticKey::Object(i) => {
+                        objects.get(i).map(|o| (o.template, o.position, o.rotation))
+                    }
+                    StaticKey::Entity(e) => props
+                        .get(e)
+                        .map(|(p, _)| (p.template, p.position, p.rotation)),
+                    _ => None,
+                })
+            };
             self.assaults.drive(
                 &mut world.physics,
                 &mut self.scene.vehicles,
                 &foes,
                 |v| template_db.vehicle_labels_for(&v.spec.label, v.spec.model),
+                &hints,
                 dt,
             );
             self.traffic.drive(
@@ -1837,6 +1866,7 @@ impl Game {
                             .template_db
                             .vehicle_labels_for(&v.spec.label, v.spec.model)
                     },
+                    &hints,
                     dt,
                 );
                 for i in dropped {
@@ -2048,10 +2078,20 @@ impl Game {
                     at: at.transform_point3(Vec3::Y),
                     visibility: v.spec.tuning.visibility.unwrap_or(200.0),
                     armour: v.spec.tuning.armour.unwrap_or(1),
+                    threat: vehicle_threat(&v.spec),
                 })
             })
             .collect();
         self.scene.people.vehicle_subjects = subjects;
+        // What she carries, for her threat to soldiers: a vehicle's mounts
+        // when she drives one.
+        self.scene.people.her_arms = self
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| self.scene.vehicles.get(i))
+            .map(|v| crate::npc::Arms::Vehicle(vehicle_threat(&v.spec)));
         if let Some(world) = &mut self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {
@@ -5188,6 +5228,22 @@ fn animated_exit(physics: &Physics, v: &ParkedVehicle, seat: Option<u32>) -> Opt
     Some(index.and_then(|i| seating.exit_of(i)).map(|e| e.name))
 }
 
+/// Where seat `seat` (`SeatLink` name) of `v` is, world space, and the
+/// way the vehicle faces (yaw): its `SeatLink` hardpoint node.
+fn seat_place(physics: &Physics, v: &ParkedVehicle, seat: Option<u32>) -> Option<(Vec3, f32)> {
+    let s = v.spec.seating.as_deref()?;
+    let hardpoint = s.seats[s.seat(seat?)?].hardpoint?;
+    let node = v.spec.node_names.iter().position(|&n| n == hardpoint)?;
+    let local = v
+        .spec
+        .node_place(node, v.turret, &v.aims)?
+        .w_axis
+        .truncate();
+    let at = physics.vehicle_transform(v.id?)?;
+    let ahead = at.transform_vector3(Vec3::Z);
+    Some((at.transform_point3(local), ahead.x.atan2(ahead.z)))
+}
+
 /// Gets her out of `v` at the end of her exit clips: as [`get_out`],
 /// standing at `place` (world space), where the last clip left her.
 pub(crate) fn get_out_at(
@@ -5811,4 +5867,12 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
             );
         }
     }
+}
+
+/// How much of a threat a vehicle is to a soldier on foot: its mounted
+/// weapons' `WeaponHint`s' best rating, 0.6 at the least
+/// ([`m2_engine::ai_target::threat`], 0x822EC430).
+fn vehicle_threat(spec: &m2_engine::vehicle::VehicleSpec) -> f32 {
+    let hints = spec.armed.iter().filter_map(|m| m.weapon.hint.as_ref());
+    m2_engine::ai_target::threat(hints, m2_engine::ai_target::HUMAN, 0.0, true)
 }

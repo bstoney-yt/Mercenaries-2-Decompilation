@@ -217,6 +217,9 @@ const UNSEEN_NEAR: f32 = 3.0;
 const LASER_RINGS: [f32; 4] = [30.0, 40.0, 55.0, 70.0];
 const LASER_SHORT: f32 = LASER_NEAR;
 const LASER_AGAIN: f32 = 20.0;
+/// After her laser marks a spot she waits this long for its bomb before she
+/// calls again, seconds (invented).
+const LASER_FLIGHT: f32 = 60.0;
 /// How long she makes for one such spot before trying another (seconds).
 const LASER_WALK: f32 = 40.0;
 /// The laser counts as on its target within this of it (metres), and
@@ -481,10 +484,15 @@ const LED_NEAR: f32 = 2.0;
 /// Within this of a crewed vehicle's middle she starts its hijack,
 /// metres (invented; m2-alpha's `HIJACK_REACH` is 6).
 const HIJACK_NEAR: f32 = 5.0;
+/// With another entrance nearer her than her vehicle's door she steps to
+/// this far out from the door (metres, invented).
+const DOOR_OUT: f32 = 0.3;
 const PRESS_GAP: f32 = 1.5;
 /// Fallen this far under the ground (metres: a hole where the island
 /// hadn't streamed in yet), she is put back on it.
 const UNDER: f32 = 5.0;
+/// Going down this fast (m/s) a driven vehicle's fall is logged.
+const FALLING: f32 = 8.0;
 /// From further than this from a place (metres), she goes the way planned
 /// to it ([`Route`]): in cells this size on foot and driving (metres),
 /// over ground up to this steep on foot, on wheels and on tracks; planned
@@ -1046,6 +1054,8 @@ pub struct Autoplay {
     /// When the vehicles near her boat were last logged.
     near_logged: f32,
     way_logged: f32,
+    /// When she last logged something solid ahead in a race.
+    rock_logged: f32,
     /// The island's roads as one graph, made the first time a place is
     /// far ([`Autoplay::by_road`]).
     roads: Option<RoadGraph>,
@@ -1110,6 +1120,8 @@ pub struct Autoplay {
     laser_failed: u32,
     /// Seconds one following her has been left behind.
     left_behind: f32,
+    /// When a driven vehicle's fall was last logged, seconds ([`Self::watch_fall`]).
+    fall_logged: f32,
 }
 
 impl Autoplay {
@@ -1133,6 +1145,18 @@ impl Autoplay {
         dt: f32,
     ) -> Intent {
         self.clock += dt;
+        self.watch_fall(game);
+        // Once in, the time she took to get in starts again for the next
+        // time (OilCon021 round r2: out of the mail scooter after 90 s in
+        // it, it counted as never reached, and was left for good).
+        if game
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| p.driving.is_some())
+        {
+            self.boarding = None;
+        }
         if std::mem::take(&mut game.countdown_tick) {
             self.hurry_until = self.clock + HURRY_FOR;
         }
@@ -2034,15 +2058,18 @@ impl Autoplay {
                     .delivered
                     .is_some_and(|t| self.clock - t < DESIGNATOR_WAIT));
         let led = game.scene.people.followers();
+        // Nor with her rifle empty: she can't (PmcCon001 round r3 aimed at one
+        // for 2,170 s with no rounds left); she restocks first.
         if driving.is_none()
             && !p.swimming()
             && !throwing
+            && game.combat.rifle_rounds.total() > 0
             && let Some((i, d)) = npcs
                 .iter()
                 .enumerate()
                 // One going for someone following her as well (the
                 // contract sweep's ChiCon001: an Allied soldier 6 m off
-                // shot the VIP behind her, 14 s after she freed him, while
+                // shot the VIP behind her, 14 s after she freed them, while
                 // she walked on; the contract was cancelled).
                 .filter(|(_, n)| {
                     n.alive
@@ -2230,10 +2257,7 @@ impl Autoplay {
         let rockets_out = game.combat.second == Some(Weapon::Rpg)
             && game.combat.launcher_rounds.is_none_or(|r| r.total() == 0)
             && live.iter().any(|m| m.kind == "destroy");
-        let rifle_out = game.combat.rifle_rounds.total() == 0
-            && live
-                .iter()
-                .any(|m| m.kind == "destroy" && takes_rounds(game, m.target));
+        let rifle_out = game.combat.rifle_rounds.total() == 0;
         if driving.is_none()
             && let Some((from, d)) = game
                 .scene
@@ -2258,7 +2282,14 @@ impl Autoplay {
                     // With the contract's things still to blow up, only
                     // what lies close is worth the detour (round 16's
                     // AllCon002 lost the boats' race to pickups).
-                    let reach = if destroying { BUSY_NEAR } else { OPEN_NEAR };
+                    // Nor while the scripts wait for her to look at something
+                    // (PmcCon001 round r2: the villa's column, which brings
+                    // the tank in; she went 190 m off for a dead soldier's gun).
+                    let reach = if destroying || !self.sights.is_empty() {
+                        BUSY_NEAR
+                    } else {
+                        OPEN_NEAR
+                    };
                     // Nor what lies out of her depth: she can't fight
                     // swimming (OilCon002 round 17 swam 1100 s by the first
                     // post after a dead soldier's rifle in the harbour).
@@ -2360,24 +2391,30 @@ impl Autoplay {
                     at.y > m.at.y + HOLDS_UP_RISE
                         && at.with_y(0.0).distance(m.at.with_y(0.0)) < HOLDS_UP
                 })
-                // Herself only on it, her feet at its box: from PmcCon031's
-                // MG platform, 4 m over its columns, those within 20 m were
-                // passed over, and 12 stood (round 24 of its thread).
-                || game
-                    .scene
-                    .props
-                    .stood_on(m.target, here, STANDS_ON)
-                    .unwrap_or(false)
                 || followers.iter().any(|f| {
                     f.with_y(0.0).distance(m.at.with_y(0.0)) < crate::combat::BOMB_FRAG.0 + HOLDS_UP
                 })
         };
+        // Herself only on it, her feet at its box: from PmcCon031's MG
+        // platform, 4 m over its columns, those within 20 m were passed
+        // over, and 12 stood (round 24 of its thread). Those wait for the
+        // others, not for good: on the only one left (PmcCon002's oil rig,
+        // PmcCon003's bunker) she stood with nothing to do for 50 minutes.
+        let stands_on = |m: &Mark| {
+            game.scene
+                .props
+                .stood_on(m.target, here, STANDS_ON)
+                .unwrap_or(false)
+        };
+        let others_to_destroy = live
+            .iter()
+            .any(|m| m.kind == "destroy" && !held_up(m) && !stands_on(m));
         // What to destroy, and HVTs to verify still standing: shot first.
         let mut destroy: Vec<&Mark> = live
             .iter()
             .copied()
             .filter(|m| {
-                (m.kind == "destroy" && !held_up(m))
+                (m.kind == "destroy" && !held_up(m) && !(others_to_destroy && stands_on(m)))
                     || (m.kind == "verify"
                         && npcs.iter().any(|n| n.spawn == Some(m.target) && n.alive))
             })
@@ -4390,12 +4427,18 @@ impl Autoplay {
                 // Its laser has to reach the target: from where nothing
                 // stands between (round 19 marked a wall 40 m short and
                 // spent all three), and not again while one is under way.
-                if let Some(i) = game
-                    .support
-                    .entries()
-                    .iter()
-                    .position(|e| matches!(e, Entry::Stocked(s) if s.key == "bunkerbuster"))
-                {
+                // Its nuclear kin first: PmcCon004's bunker falls only to
+                // the `PmcCon004_Nuke` the contract gives her (the scripts
+                // wait for its `Nuked`, not a plain bunker buster's
+                // `Busted`, which she spent there in story run r1104).
+                let entries = game.support.entries();
+                let laser = |nuke: bool| {
+                    entries.iter().position(|e| {
+                        matches!(e, Entry::Stocked(s)
+                            if s.key == "bunkerbuster" && !nuke || nuke && s.key.contains("Nuke"))
+                    })
+                };
+                if let Some(i) = laser(true).or_else(|| laser(false)) {
                     if self
                         .laser_called
                         .is_some_and(|t| self.clock - t < LASER_AGAIN)
@@ -4501,6 +4544,10 @@ impl Autoplay {
             Phase::Designating {
                 aim: Aim::Laser, ..
             } => {
+                // The call stands from when the laser comes off: its bomber
+                // is under way then (PmcCon003 round r3: called again the
+                // moment the laser marked the bunker, every call was lost).
+                self.laser_called = Some(self.clock + LASER_FLIGHT - LASER_AGAIN);
                 // Held only while it lands on the target (the laser's own
                 // ray, from the camera: round 22 lased a building 40 m
                 // short three times); kept off it a while, she goes
@@ -4681,6 +4728,31 @@ impl Autoplay {
             |d| m.transform_point3(d),
         );
         let here = p.character.position;
+        // Crewed and taken only by its hijack (PmcCon001's villa tank):
+        // the key anywhere close by starts it, door or not (round 4 stood
+        // 3 m off its door for minutes, the way to it blocked). Before the
+        // door's side below (round r5c circled the tank's hatch 420 s).
+        let v = &game.scene.vehicles[i];
+        if game.hijack_only.contains(&v.spec.model)
+            && !v.crew.is_empty()
+            && (m.w_axis.truncate() - here).length() < HIJACK_NEAR
+        {
+            return self.press(0.0);
+        }
+        // Another entrance nearer her than the door's is the one the use
+        // key takes (the nearest, [`m2_engine::seats::pick`]): OilCon021's
+        // mail scooter's pillion entrance, whose seat she may not use, had
+        // her press 3,000 s from behind it. She steps round to the door.
+        let flat = |a: Vec3| (a - here).with_y(0.0).length();
+        let other_nearer = spec.door.is_some_and(|d| {
+            spec.entrances
+                .iter()
+                .any(|(_, at)| at.distance(d) > 0.01 && flat(m.transform_point3(*at)) < flat(door))
+        });
+        if other_nearer && flat(door) < door_reach(spec) + 1.0 {
+            let out = (door - m.w_axis.truncate()).with_y(0.0).normalize_or_zero();
+            return self.walk(game, door + out * DOOR_OUT, 0.2, dt);
+        }
         if (door - here).with_y(0.0).length() < door_reach(spec) {
             // The key takes the nearest entrance ahead of the camera
             // (0x82440F30): she faces her way in first, or another
@@ -4701,16 +4773,6 @@ impl Autoplay {
                 look,
                 ..self.press(0.0)
             };
-        }
-        // Crewed and taken only by its hijack (PmcCon001's villa tank):
-        // the key anywhere close by starts it, door or not (round 4 stood
-        // 3 m off its door for minutes, the way to it blocked).
-        let v = &game.scene.vehicles[i];
-        if game.hijack_only.contains(&v.spec.model)
-            && !v.crew.is_empty()
-            && (m.w_axis.truncate() - here).length() < HIJACK_NEAR
-        {
-            return self.press(0.0);
         }
         self.walk(game, door, 1.0, dt)
     }
@@ -4819,7 +4881,25 @@ impl Autoplay {
         // round 36 stood 19 s against one 103 m from its twelfth), round
         // what is in the way, not by road.
         let racing = self.racing() && driving.is_some();
-        if racing && self.clock - self.best.1 < RACE_STRAIGHT_FOR {
+        // Not straight into what stands in the way, though (MecCon001
+        // round 6: the Monster Truck ran into the mine's boulders at up to
+        // 25 m/s, three times in 40 s, and lost the race).
+        let rock = racing
+            .then(|| driving.and_then(|i| game.scene.vehicles.get(i)))
+            .flatten()
+            .and_then(|v| solid_ahead(&game.scene.world, v, pos, at, speed));
+        if let Some(hit) = rock
+            && self.clock - self.rock_logged > LOG_ROCK
+        {
+            self.rock_logged = self.clock;
+            eprintln!(
+                "autoplay {:.1} s: racing, something solid ahead at {hit:.1} ({:.0} m off at {speed:.1} m/s): round it",
+                self.clock,
+                (hit - pos).with_y(0.0).length()
+            );
+        }
+        let rock = rock.is_some();
+        if racing && !rock && self.clock - self.best.1 < RACE_STRAIGHT_FOR {
             self.way = None;
             return at;
         }
@@ -5347,6 +5427,48 @@ impl Autoplay {
         }
     }
 
+    /// Says what lies under a vehicle she drives that is falling.
+    fn watch_fall(&mut self, game: &Game) {
+        let (Some(p), Some(w)) = (game.scene.player.as_ref(), game.scene.world.as_ref()) else {
+            return;
+        };
+        let Some(id) = p
+            .driving
+            .and_then(|i| game.scene.vehicles.get(i))
+            .filter(|v| !v.spec.is_helicopter() && !v.spec.is_boat())
+            .and_then(|v| v.id)
+        else {
+            return;
+        };
+        let v = w.physics.vehicle_velocity(id);
+        let Some(at) = w.physics.vehicle_transform(id).map(|m| m.w_axis.truncate()) else {
+            return;
+        };
+        // Or sunk under the ground she drives on (the ground not found
+        // from 2 m over its middle, within 6 m).
+        let sunk = w
+            .physics
+            .cast_ray_past(at + Vec3::Y * 2.0, Vec3::NEG_Y, 6.0, id)
+            .is_none();
+        if (v.y > -FALLING && !sunk) || self.clock - self.fall_logged < 0.5 {
+            return;
+        }
+        self.fall_logged = self.clock;
+        let top = at + Vec3::Y * 300.0;
+        eprintln!(
+            "autoplay {:.1} s: her vehicle falls or sinks at {v:.1} at {at:.1}: wheels on the ground {:?}, ground under it {:?}, from 300 m over {:?}, touching {}",
+            self.clock,
+            w.physics.vehicle_contacts(id),
+            w.physics
+                .cast_ray_past(at, Vec3::NEG_Y, 100.0, id)
+                .map(|h| h.0),
+            w.physics
+                .cast_ray_past(top, Vec3::NEG_Y, 600.0, id)
+                .map(|h| top.y - h.0),
+            w.physics.vehicle_touching(id).len(),
+        );
+    }
+
     /// How she is getting on, for the log.
     fn report(&self, game: &Game) {
         let Some(p) = game.scene.player.as_ref() else {
@@ -5380,11 +5502,12 @@ impl Autoplay {
             }
         }
         eprintln!(
-            "autoplay {:.1} s: at {:.1}, {}, health {:.0}, {}; closest {:.0} m, {:.0} s ago; {} hops{holding}; {}",
+            "autoplay {:.1} s: at {:.1}, {}, health {:.0}, rifle rounds {}, {}; closest {:.0} m, {:.0} s ago; {} hops{holding}; {}",
             self.clock,
             game.focus(),
             riding.unwrap_or_else(|| "on foot".to_owned()),
             game.combat.hp,
+            game.combat.rifle_rounds.total(),
             self.what,
             self.best.0,
             self.since_moved(),
@@ -5890,6 +6013,50 @@ fn afloat_near(
             AFLOAT_SIDES.map(|s| along + side * s)
         })
         .find(|&p| open(p))
+}
+
+/// Racing, she looks this far ahead for what stands in her way: as far as
+/// she goes in [`RACE_LOOK`] seconds, at least [`RACE_LOOK_LEAST`] metres
+/// (and never past the checkpoint), with a box her vehicle's width,
+/// [`RACE_LOOK_HEIGHT`] metres over its bottom. Invented.
+const RACE_LOOK: f32 = 1.5;
+/// Seconds between her logs of something solid ahead in a race.
+const LOG_ROCK: f32 = 2.0;
+const RACE_LOOK_LEAST: f32 = 15.0;
+const RACE_LOOK_HEIGHT: f32 = 0.9;
+
+/// Where something solid other than the ground (a boulder, a wall, a
+/// house, a parked vehicle) stands on the straight line from vehicle `v`
+/// toward `at` within the look ahead for `speed` (m/s), if anything does.
+fn solid_ahead(
+    world: &Option<m2_engine::World>,
+    v: &crate::scene::ParkedVehicle,
+    pos: Vec3,
+    at: Vec3,
+    speed: f32,
+) -> Option<Vec3> {
+    let (Some(w), Some(id)) = (world.as_ref(), v.id) else {
+        return None;
+    };
+    let pos = w
+        .physics
+        .vehicle_transform(id)
+        .map_or(pos, |m| m.w_axis.truncate());
+    let d = (at - pos).with_y(0.0).length();
+    if d < 1.0 {
+        return None;
+    }
+    let reach = (speed.max(0.0) * RACE_LOOK).max(RACE_LOOK_LEAST).min(d);
+    let (lo, hi) = v.spec.hull;
+    let from = pos + Vec3::Y * (lo.y + RACE_LOOK_HEIGHT);
+    let half = Vec3::new(((hi.x - lo.x) * 0.5).max(0.5), 0.3, 0.5);
+    // Down (or up) the way the checkpoint lies, so a boulder down a slope
+    // ahead is not swept over (MecCon001 round 2 of this fix: one 3 m
+    // under her line at 24 m/s).
+    w.physics
+        .sweep_obstacle(from, from + (at - pos) * (reach / d), half, Some(id))
+        .filter(|o| !o.ground)
+        .map(|o| o.point)
 }
 
 /// How deep a boat's keel floats under the water, metres.

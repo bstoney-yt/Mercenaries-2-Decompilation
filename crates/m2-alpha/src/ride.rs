@@ -165,22 +165,6 @@ pub fn boards_onto_deck(ride: Ride<'_>, entrance: Option<u32>) -> bool {
         .is_some_and(|e| e.params.boarding)
 }
 
-/// The entrance seat `seat` (`None`: the driver's) is got out of by: its
-/// first `EntranceToSeat` row with `CanExit` naming one of the vehicle's
-/// entrances (0x8229C190).
-pub fn exit_entrance(ride: Ride<'_>, seat: Option<u32>) -> Option<u32> {
-    let s = ride.seating?;
-    let i = match seat {
-        Some(n) => s.seat(n)?,
-        None => s.driver()?,
-    };
-    s.seats[i]
-        .rows
-        .iter()
-        .find(|r| r.can_exit && s.entrance(r.link_name).is_some())
-        .map(|r| r.link_name)
-}
-
 /// Puts the riders of `seats` out of `crew` (`None`: any driver's seat;
 /// the crew forgets them: playtest 4, no car could be taken from traffic).
 /// The templates of those put out.

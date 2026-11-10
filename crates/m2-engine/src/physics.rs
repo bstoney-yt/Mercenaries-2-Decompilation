@@ -1835,6 +1835,20 @@ const TURRET_DAMP: f32 = 200.0;
 /// it reads there (0x8380EC18) is in zeroed memory and no code found
 /// writes it (searched as a store, an immediate and a pointer), so 0.
 const TURRET_LEAD_DAMP: f32 = 0.0;
+/// How far, radians, the angle asked must be from where a sleeping
+/// turret points to wake it: the 360's turret update sets its action's
+/// angle every frame (0x821A64B8) and wakes its body only when the
+/// square of that error is over 0.001 (the constant at 0x820F8BE4), about
+/// 1.8 degrees. Closer, it and its tank sleep on.
+const TURRET_WAKE: f32 = 0.031_622_78;
+
+/// How fast, radians a second, the pitch asked of a sleeping gun on its
+/// own body must move to wake it: the 360's turret update hands the gun's
+/// action its pitch every frame and wakes the gun's body only when the
+/// square of its pitch speed (the turret's +0x18, which its pitch aim
+/// 0x822749E8 moves its pitch +0x10 by) is over 0.005 (0x820F8C6C), about
+/// 0.07. Its speed here is the asked pitch's change over the step.
+const GUN_WAKE: f32 = 0.070_710_68;
 
 /// A turret's gun on a body of its own, on a hinge across the turret
 /// at its trunnions, as the 360 code builds it (0x82275974 calls
@@ -1849,6 +1863,8 @@ struct GunHinge {
     force: f32,
     /// The pitch asked, radians (up is positive).
     target: f32,
+    /// The pitch asked when it was last driven.
+    last: f32,
 }
 
 /// A boat's hull in the water: what floats it, and what its driver asks
@@ -2086,6 +2102,31 @@ impl Rest {
     /// Woken: it starts counting again.
     fn wake(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// Lets a tank's body sleep, when [`Rest`] finds it still, the way Havok
+/// sleeps a body: with its whole island (0x8264ABF8 deactivates an island
+/// only once none of its bodies is moving, 0x824D0C88), so a body joined
+/// to one still moving, or touched by one, stays awake. Rapier's own
+/// island sleep does that; `still` lets it sleep this body at the end of
+/// the step (no speed or time of rapier's own stands in for [`Rest`]'s
+/// check), otherwise it never does. A body put to sleep alone
+/// (`RigidBody::sleep`) is still moved by rapier but no longer by its
+/// tracks, and sinks.
+fn rest_hand_off(body: &mut r::RigidBody, still: bool) {
+    let (threshold, after) = if still {
+        (f32::MAX, 0.0)
+    } else {
+        (-1.0, r::RigidBodyActivation::default_time_until_sleep())
+    };
+    // Only touched when it changes: each touch tells rapier its sleep
+    // changed.
+    if body.activation().normalized_linear_threshold != threshold {
+        let a = body.activation_mut();
+        a.normalized_linear_threshold = threshold;
+        a.angular_threshold = threshold;
+        a.time_until_sleep = after;
     }
 }
 
@@ -3105,17 +3146,23 @@ impl Physics {
                 && let Some(b) = w.bodies.get_mut(v.controller.chassis)
             {
                 if b.is_sleeping() {
+                    // Asleep with its island: it stays so until something
+                    // wakes the island (no sleep of rapier's own after).
                     tank.rest.asleep = true;
+                    rest_hand_off(b, false);
                     continue;
                 }
                 if tank.rest.asleep {
                     tank.rest.wake();
                 }
-                if !v.wrecked && tank.rest.step(vec3(b.center_of_mass()), dt) {
-                    b.sleep();
-                    tank.rest.asleep = true;
-                    continue;
-                }
+                // Still long enough: its island may sleep at the end of
+                // this step, if every body in it may (its turret and
+                // gun on their joints, anything resting on it). Its body
+                // is never put to sleep alone: rapier would go on moving
+                // it (gravity) while its tracks no longer hold it up
+                // (PmcCon001: the villa tank fell through the HQ's floor).
+                let still = !v.wrecked && tank.rest.step(vec3(b.center_of_mass()), dt);
+                rest_hand_off(b, still);
             }
             let filter = ground().exclude_rigid_body(v.controller.chassis);
             let queries = w.broad_phase.as_query_pipeline_mut(
@@ -3675,6 +3722,7 @@ impl Physics {
             joint,
             force,
             target: 0.0,
+            last: 0.0,
         }
     }
 
@@ -4571,26 +4619,44 @@ impl Physics {
                     } else {
                         TURRET_DAMP
                     };
-                    let want = (w + dt * (TURRET_PULL * e - damp * w)).clamp(-h.speed, h.speed);
-                    let change = (want - w).clamp(-h.accel * dt, h.accel * dt);
-                    b.set_angvel(vector(spin + up * change), change.abs() > 1e-6);
+                    // Asleep, it is woken only when the angle asked is
+                    // more than [`TURRET_WAKE`] off where it points
+                    // (0x821A64B8); else it, and its island, sleep on.
+                    if !b.is_sleeping() || e * e > TURRET_WAKE * TURRET_WAKE {
+                        let want = (w + dt * (TURRET_PULL * e - damp * w)).clamp(-h.speed, h.speed);
+                        let change = (want - w).clamp(-h.accel * dt, h.accel * dt);
+                        b.set_angvel(vector(spin + up * change), true);
+                    }
                 }
             }
             // Its gun to the pitch asked.
-            let Some((joint, force, target)) = self.vehicles[i]
-                .as_ref()
-                .and_then(|v| v.hinge.as_ref())
-                .and_then(|h| h.gun.as_ref())
-                .map(|g| (g.joint, g.force, g.target))
+            let Some((joint, force, target, body, last)) = self.vehicles[i]
+                .as_mut()
+                .and_then(|v| v.hinge.as_mut())
+                .and_then(|h| h.gun.as_mut())
+                .map(|g| {
+                    let last = g.last;
+                    g.last = g.target;
+                    (g.joint, g.force, g.target, g.body, last)
+                })
             else {
                 continue;
             };
             let Some(now) = self.gun_pitch(VehicleId(i)) else {
                 continue;
             };
+            // Asleep, it is woken only when the pitch asked moves faster
+            // than [`GUN_WAKE`] (0x82275608); else it sleeps on.
+            let speed = if dt > 0.0 { (target - last) / dt } else { 0.0 };
+            let asleep = self.world.bodies.get(body).is_some_and(|b| b.is_sleeping());
+            let wake = !asleep || speed * speed > GUN_WAKE * GUN_WAKE;
             // The joint turns about +x, the gun's pitch about -x.
             let off = -(target - now);
-            if let Some(j) = self.world.impulse_joints.get_mut(joint, off.abs() > 1e-4) {
+            if let Some(j) = self
+                .world
+                .impulse_joints
+                .get_mut(joint, wake && off.abs() > 1e-4)
+            {
                 j.data
                     .set_motor_velocity(r::JointAxis::AngX, 20.0 * off, force);
             }
@@ -4820,6 +4886,15 @@ impl Physics {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether a vehicle's body is asleep (a tank keeping still, [`Rest`]).
+    pub fn vehicle_asleep(&self, id: VehicleId) -> bool {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| self.world.bodies.get(v.controller.chassis))
+            .is_some_and(|b| b.is_sleeping())
     }
 
     /// How many of a vehicle's wheels touch the ground, of how many.
@@ -5852,6 +5927,17 @@ impl Physics {
         })
     }
 
+    /// What a path search's obstacle `id` is, when a static (a placed
+    /// object, a state layer's prop, a terrain cell).
+    pub fn obstacle_key(&self, id: u64) -> Option<StaticKey> {
+        self.keys
+            .get(&r::ColliderHandle::from_raw_parts(
+                id as u32,
+                (id >> 32) as u32,
+            ))
+            .copied()
+    }
+
     /// A path search's obstacle by its id
     /// ([`sweep_obstacle`](Self::sweep_obstacle)).
     pub fn obstacle(&self, id: u64) -> Option<crate::path_search::Obstacle> {
@@ -6313,6 +6399,100 @@ mod tests {
     // 1 rad/s it keeps up a twentieth of a second behind, and turns the
     // hull it sits on hardly at all.
     #[test]
+    fn a_sleeping_gun_wakes_only_when_its_pitch_asked_moves_fast_enough() {
+        // 0x82275608: a sleeping gun's body is woken only when its pitch
+        // speed squared is over 0.005 (about 0.07 radians a second).
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let cube = |lo: Vec3, hi: Vec3| {
+            let mut v = Vec::new();
+            for x in [lo.x, hi.x] {
+                for y in [lo.y, hi.y] {
+                    for z in [lo.z, hi.z] {
+                        v.push(Vec3::new(x, y, z));
+                    }
+                }
+            }
+            v
+        };
+        let spec = VehicleSpec {
+            turret_shapes: vec![cube(Vec3::new(-1.0, 1.6, -1.0), Vec3::new(1.0, 2.4, 1.0))].into(),
+            turret_mass: Some(crate::vehicle::Chassis {
+                mass: 3000.0,
+                inertia: Mat3::from_diagonal(Vec3::new(2000.0, 2500.0, 1000.0)),
+                centre_of_mass: Vec3::new(0.0, 2.0, 0.0),
+            }),
+            gun_body: Some(crate::vehicle::GunBody {
+                shapes: vec![cube(Vec3::new(-0.1, 1.9, 1.1), Vec3::new(0.1, 2.1, 4.0))].into(),
+                mass: crate::vehicle::Chassis {
+                    mass: 80.0,
+                    inertia: Mat3::from_diagonal(Vec3::new(60.0, 60.0, 0.5)),
+                    centre_of_mass: Vec3::new(0.0, 2.0, 2.0),
+                },
+            }),
+            gun_pivot: Some(Vec3::new(0.0, 2.0, 1.0)),
+            pivot: Some(Vec3::new(0.0, 2.0, 0.0)),
+            mass: 30000.0,
+            tuning: crate::tuning::VehicleTuning {
+                turret: Some(crate::tuning::TurretTuning {
+                    main: true,
+                    yaw_speed: 1.0,
+                    yaw_accel: 20.0,
+                    pitch: (-0.1, 0.3),
+                    pitch_speed: 1.0,
+                    pitch_accel: 20.0,
+                    yaw: None,
+                }),
+                ..car().tuning
+            },
+            ..car()
+        };
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.5, 0.0), 0.0);
+        for _ in 0..60 {
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        let v = p.vehicles[id.0].as_ref().unwrap();
+        let h = v.hinge.as_ref().unwrap();
+        let bodies = [v.controller.chassis, h.body, h.gun.as_ref().unwrap().body];
+        let gun = bodies[2];
+        for b in bodies {
+            p.world.bodies[b].sleep();
+        }
+        let start = p.gun_pitch(id).unwrap();
+        // Raised at 0.03 radians a second: it sleeps on, where it was (for
+        // 12 steps: this car's hull wakes itself every step, and rapier
+        // wakes the rest of its island from it some 18 steps on).
+        let mut pitch = 0.0;
+        for _ in 0..12 {
+            pitch += 0.03 * DT;
+            p.aim_gun(id, pitch);
+            p.step(DT);
+        }
+        assert!(p.world.bodies[gun].is_sleeping(), "woken at 0.03 rad/s");
+        assert!((p.gun_pitch(id).unwrap() - start).abs() < 1e-4);
+        // Raised at 0.3 radians a second: woken, it follows.
+        for _ in 0..30 {
+            pitch += 0.3 * DT;
+            p.aim_gun(id, pitch);
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        assert!(
+            !p.world.bodies[gun].is_sleeping(),
+            "still asleep at 0.3 rad/s"
+        );
+        let up = p.gun_pitch(id).unwrap() - start;
+        assert!(up > 0.1, "rose {up}");
+    }
+
+    #[test]
     fn a_turret_s_gun_on_its_own_body_tilts_to_the_pitch_asked() {
         let mut p = Physics::new();
         let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
@@ -6406,6 +6586,78 @@ mod tests {
     // once, it speeds up no faster than its `MaxYawAccel`, turns no faster
     // than its `MaxYawSpeed`, and settles on the angle asked, the hull
     // left as it was.
+    #[test]
+    fn a_sleeping_turret_wakes_only_when_asked_more_than_its_threshold_off() {
+        // 0x821A64B8: a sleeping turret's body is woken only when the angle
+        // asked is more than sqrt(0.001) radians (1.8 degrees) off.
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let mut block = Vec::new();
+        for x in [-1.0, 1.0] {
+            for y in [1.6, 2.4] {
+                for z in [-1.0, 2.0] {
+                    block.push(Vec3::new(x, y, z));
+                }
+            }
+        }
+        let spec = VehicleSpec {
+            turret_shapes: vec![block].into(),
+            turret_mass: Some(crate::vehicle::Chassis {
+                mass: 3000.0,
+                inertia: Mat3::from_diagonal(Vec3::new(2000.0, 2500.0, 1000.0)),
+                centre_of_mass: Vec3::new(0.0, 2.0, 0.3),
+            }),
+            pivot: Some(Vec3::new(0.0, 2.0, 0.0)),
+            mass: 30000.0,
+            tuning: crate::tuning::VehicleTuning {
+                turret: Some(crate::tuning::TurretTuning {
+                    main: true,
+                    yaw_speed: 0.5,
+                    yaw_accel: 2.0,
+                    pitch: (-0.1, 0.3),
+                    pitch_speed: 1.0,
+                    pitch_accel: 20.0,
+                    yaw: None,
+                }),
+                ..car().tuning
+            },
+            ..car()
+        };
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.5, 0.0), 0.0);
+        for _ in 0..60 {
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        let start = p.turret_yaw(id).unwrap();
+        let v = p.vehicles[id.0].as_ref().unwrap();
+        let (chassis, turret) = (v.controller.chassis, v.hinge.as_ref().unwrap().body);
+        p.turn_turret(id, start);
+        p.world.bodies[chassis].sleep();
+        p.world.bodies[turret].sleep();
+        let asleep = |p: &Physics| p.world.bodies[turret].is_sleeping();
+        // 1.5 degrees off: it sleeps on.
+        for _ in 0..30 {
+            p.turn_turret(id, start + 1.5f32.to_radians());
+            p.step(DT);
+        }
+        assert!(asleep(&p), "woken 1.5 degrees off");
+        assert!((p.turret_yaw(id).unwrap() - start).abs() < 1e-4);
+        // 2.5 degrees off: woken, it turns there.
+        for _ in 0..120 {
+            p.turn_turret(id, start + 2.5f32.to_radians());
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        let turned = (p.turret_yaw(id).unwrap() - start).to_degrees();
+        assert!(turned > 1.5, "turned {turned} degrees");
+    }
+
     #[test]
     fn a_turret_on_its_own_body_turns_as_the_360_action_turns_it() {
         let mut p = Physics::new();
@@ -8368,6 +8620,20 @@ mod tests {
     /// chassis's shape 0.38 m up: how far it slid over the last 10 s, and
     /// how many of its six track points touch at the end.
     fn parked_tank_on_a_slope(shape_floor: Option<f32>) -> (f32, usize) {
+        let (slid, touching, _) = parked_tank(shape_floor, 20.0, None);
+        (slid, touching)
+    }
+
+    /// [`parked_tank_on_a_slope`] on a slope of `degrees`, with how far it
+    /// dropped below where it stood at 2 s, at its lowest over the last
+    /// 10 s, and whether it ends asleep. `turret`: a
+    /// turret on its own body on a hinge, turned at that many radians a
+    /// second (0: kept still).
+    fn parked_tank(
+        shape_floor: Option<f32>,
+        degrees: f32,
+        turret: Option<f32>,
+    ) -> (f32, usize, (f32, bool)) {
         use crate::vehicle::WheelSpec;
         let mut spec = tank();
         spec.wheels = [-2.3f32, 0.0, 2.3]
@@ -8412,8 +8678,30 @@ mod tests {
             })
             .unwrap_or_default()
             .into();
+        if turret.is_some() {
+            spec.turret_shapes = vec![box_points(
+                Vec3::new(-1.0, 1.6, -1.0),
+                Vec3::new(1.0, 2.4, 1.0),
+            )]
+            .into();
+            spec.turret_mass = Some(crate::vehicle::Chassis {
+                mass: 3000.0,
+                inertia: Mat3::from_diagonal(Vec3::new(2000.0, 2500.0, 1000.0)),
+                centre_of_mass: Vec3::new(0.0, 2.0, 0.0),
+            });
+            spec.pivot = Some(Vec3::new(0.0, 2.0, 0.0));
+            spec.tuning.turret = Some(crate::tuning::TurretTuning {
+                main: true,
+                yaw_speed: 1.0,
+                yaw_accel: 20.0,
+                pitch: (-0.1, 0.3),
+                pitch_speed: 1.0,
+                pitch_accel: 20.0,
+                yaw: None,
+            });
+        }
         let mut p = Physics::new();
-        let tilt = Quat::from_rotation_x(-20f32.to_radians());
+        let tilt = Quat::from_rotation_x(-degrees.to_radians());
         let half = 200.0;
         let v = [
             Vec3::new(-half, 0.0, -half),
@@ -8430,15 +8718,54 @@ mod tests {
             ..Default::default()
         };
         let mut from = Vec3::ZERO;
+        let mut low = f32::MAX;
         for i in 0..(12.0 / DT) as usize {
             if i == (2.0 / DT) as usize {
                 from = p.vehicle_transform(id).unwrap().w_axis.truncate();
             }
             p.drive(id, parked);
+            if let Some(rate) = turret {
+                p.turn_turret(id, rate * i as f32 * DT);
+            }
             p.step(DT);
+            if i >= (2.0 / DT) as usize {
+                let y = p.vehicle_transform(id).unwrap().w_axis.y;
+                low = low.min(y);
+            }
         }
         let at = p.vehicle_transform(id).unwrap().w_axis.truncate();
-        ((at - from).length(), p.vehicle_contacts(id).0)
+        (
+            (at - from).length(),
+            p.vehicle_contacts(id).0,
+            (from.y - low, p.vehicle_asleep(id)),
+        )
+    }
+
+    #[test]
+    fn a_parked_tank_sleeps_and_stays_up() {
+        // On its springs alone over flat ground (its shape 0.38 m up), it
+        // keeps still and sleeps with its island (Havok's 0x8264ABF8).
+        let (slid, touching, (dropped, asleep)) = parked_tank(Some(0.38), 0.0, None);
+        assert!(asleep, "awake");
+        assert!(dropped < 0.05, "dropped {dropped} m");
+        assert!(slid < 0.1, "slid {slid} m");
+        assert_eq!(touching, 6);
+    }
+
+    #[test]
+    fn a_parked_tank_whose_turret_keeps_its_island_awake_stays_up() {
+        // Its turret on its own body, held by its hinge's motor, keeps its
+        // island awake, so it may not sleep (Havok's 0x8264ABF8 sleeps an
+        // island only once none of its bodies moves) and its tracks go on
+        // holding it up. Put to sleep on its own (rapier's
+        // `RigidBody::sleep`) rapier still moved it with its awake turret
+        // while its tracks no longer held it: it dropped 0.39 m here,
+        // caught by its shape, and through the HQ's floor at PmcCon001's
+        // villa.
+        let (slid, touching, (dropped, _)) = parked_tank(Some(0.38), 0.0, Some(0.0));
+        assert!(dropped < 0.05, "dropped {dropped} m");
+        assert!(slid < 0.1, "slid {slid} m");
+        assert_eq!(touching, 6);
     }
 
     #[test]

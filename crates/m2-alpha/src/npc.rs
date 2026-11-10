@@ -67,7 +67,36 @@ pub struct VehicleSubject {
     pub visibility: f32,
     /// Its armour class ([`Npc::target_armour`]).
     pub armour: u32,
+    /// How much of a threat it is to a soldier on foot: its mounted
+    /// weapons' (`WeaponHint`) best rating, 0.6 at the least
+    /// ([`m2_engine::ai_target::threat`]).
+    pub threat: f32,
 }
+
+/// What a subject carries, for how much of a threat it is to a soldier
+/// on foot ([`m2_engine::ai_target::threat`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Arms {
+    /// A person's gun and launcher `WeaponHint`s, each within its range.
+    Person([Option<FireHint>; 2]),
+    /// A vehicle's, already rated: its weapons reach anywhere.
+    Vehicle(f32),
+}
+
+impl Arms {
+    /// Its threat to a soldier on foot `distance` metres off.
+    pub fn threat(&self, distance: f32) -> f32 {
+        use m2_engine::ai_target::{HUMAN, threat};
+        match self {
+            Arms::Person(w) => threat(w.iter().flatten(), HUMAN, distance, false),
+            Arms::Vehicle(t) => *t,
+        }
+    }
+}
+
+/// Her arms on foot: the "Assault Rifle"'s `WeaponHint` stands in for
+/// whatever she holds (invented: her own weapon's hint is not passed on).
+pub const HER_ON_FOOT: Arms = Arms::Person([Some(STAND_IN), None]);
 
 /// The first number in a mind's attack slot of a vehicle, the rest going
 /// by [`People::vehicle_subjects`]'s order.
@@ -152,6 +181,7 @@ const STAND_IN: FireHint = FireHint {
     on_close: 0.8,
     off_close: 1.5,
     against: [3, 1, 0, 0],
+    kinds: [3, 1],
     single: false,
 };
 /// The least pause between a soldier's rockets, seconds, where his
@@ -2715,6 +2745,9 @@ pub struct People {
     /// The armies' vehicles about, for those at war with them to see;
     /// their order may change, so a soldier's hold on one lasts a look.
     pub vehicle_subjects: Vec<VehicleSubject>,
+    /// What she carries, for her threat to soldiers; `None` is
+    /// [`HER_ON_FOOT`].
+    pub her_arms: Option<Arms>,
     /// As the templates have it.
     authored: HashMap<(&'static str, &'static str), f32>,
     /// Rounds between the armies since the start: fired, hit, killed.
@@ -3452,18 +3485,21 @@ impl People {
         if self.relations.is_empty() {
             return;
         }
-        let all: Vec<(u32, &'static str, Vec3, f32)> = self
+        type Subject = (u32, &'static str, Vec3, f32, Arms);
+        let all: Vec<Subject> = self
             .npcs
             .iter()
             .filter(|n| n.alive && n.landed)
-            .filter_map(|n| Some((n.shooter, n.faction?, n.chest(), n.ai.visibility)))
-            .chain(
-                self.vehicle_subjects
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| (VEHICLES + i as u32, v.faction, v.at, v.visibility)),
-            )
+            .filter_map(|n| {
+                let arms = Arms::Person([n.gun.map(|_| n.fire_hint()), n.launcher.map(|l| l.hint)]);
+                Some((n.shooter, n.faction?, n.chest(), n.ai.visibility, arms))
+            })
+            .chain(self.vehicle_subjects.iter().enumerate().map(|(i, v)| {
+                let arms = Arms::Vehicle(v.threat);
+                (VEHICLES + i as u32, v.faction, v.at, v.visibility, arms)
+            }))
             .collect();
+        let her_arms = self.her_arms.unwrap_or(HER_ON_FOOT);
         self.calm(dt);
         for i in 0..self.npcs.len() {
             if !self.npcs[i].can_war() {
@@ -3501,14 +3537,14 @@ impl People {
             // (0x822E89B0).
             let vision = n.ai.vision;
             let held_now = n.slot.who;
-            let reach = |c: &(u32, &'static str, Vec3, f32)| {
+            let reach = |c: &Subject| {
                 let hold = if held_now == Some(c.0) { 1.5 } else { 1.0 };
                 vision * c.3 * hold
             };
-            let mut seen: Vec<(f32, u32, Vec3, &'static str, f32)> = all
+            let mut seen: Vec<(f32, u32, Vec3, &'static str, f32, Arms)> = all
                 .iter()
                 .filter(|c| c.0 != me && c.1 != side)
-                .map(|c| (c.2.distance(at), c.0, c.2, c.1, reach(c)))
+                .map(|c| (c.2.distance(at), c.0, c.2, c.1, reach(c), c.4))
                 .filter(|c| c.0 <= c.4 || Some(c.1) == heard || Some(c.1) == shot)
                 .collect();
             seen.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -3520,12 +3556,16 @@ impl People {
             let n = &mut self.npcs[i];
             let current = n.foe_at.map(|f| f.distance(at));
             let alert = n.alert;
-            for (d, who, chest, _, far) in seen {
+            for (d, who, chest, _, far, arms) in seen {
                 let in_slot = n.slot.who == Some(who);
                 n.foe_reach = Some(far);
                 let perceived = shot == Some(who) || heard == Some(who);
                 if in_slot || perceived || n.sees(physics, chest, alert) {
-                    let score = m2_engine::ai_target::score(d, current, in_slot);
+                    // How much of a threat and how well seen (the record's
+                    // +0xC8 and +0x68, 0x822D56B0 and 0x822E89B0).
+                    let seen = m2_engine::ai_target::visible(d, far);
+                    let score =
+                        m2_engine::ai_target::score(d, current, in_slot, arms.threat(d), seen);
                     n.slot.offer(who, score);
                 }
             }
@@ -3535,16 +3575,24 @@ impl People {
             {
                 let d = t.distance(at);
                 let in_slot = n.slot.who == Some(HER);
-                if d <= n.her_sight() && (in_slot || n.alert || n.sees(physics, t, false)) {
-                    n.slot
-                        .offer(HER, m2_engine::ai_target::score(d, current, in_slot));
+                let far = n.her_sight();
+                if d <= far && (in_slot || n.alert || n.sees(physics, t, false)) {
+                    let seen = m2_engine::ai_target::visible(d, far);
+                    let threat = her_arms.threat(d);
+                    n.slot.offer(
+                        HER,
+                        m2_engine::ai_target::score(d, current, in_slot, threat, seen),
+                    );
                 }
             }
             match n.slot.who.filter(|&w| w != HER) {
                 Some(w) => {
                     let c = all.iter().find(|c| c.0 == w);
                     n.foe_at = c.map(|c| c.2);
-                    n.foe_armour = (w >= VEHICLES && w != HER)
+                    // A vehicle by its record, not its number: people's numbers
+                    // are hashes and may lie above [`VEHICLES`] too.
+                    let vehicle = c.is_some_and(|c| matches!(c.4, Arms::Vehicle(_)));
+                    n.foe_armour = vehicle
                         .then(|| self.vehicle_subjects.get((w - VEHICLES) as usize))
                         .flatten()
                         .map(|v| v.armour);
@@ -3555,7 +3603,11 @@ impl People {
                         n.last_seen = n.foe_at;
                         if let Some(c) = c {
                             let d = c.2.distance(at);
-                            eprintln!("war: a {side} soldier goes for a {} at {d:.0} m", c.1);
+                            let what = if vehicle { "vehicle" } else { "soldier" };
+                            eprintln!(
+                                "war: a {side} soldier goes for a {} {what} at {d:.0} m",
+                                c.1
+                            );
                         }
                     }
                 }
@@ -5399,6 +5451,7 @@ pub(crate) mod tests {
             [true, true, false, false]
         );
         let rocket = FireHint {
+            kinds: [1, 2],
             against: [1, 3, 3, 3],
             single: false,
             ..STAND_IN
@@ -5717,6 +5770,37 @@ pub(crate) mod tests {
         assert!(people.npcs[0].foe_at.is_some(), "hostile at once");
     }
 
+    // Two of the enemy in sight: an unarmed one at 15 m, a rifleman at
+    // 25 m. Both within 30 m, so by distance alone they tie and the nearer
+    // (looked at first) is taken; rated by threat, the rifleman is.
+    #[test]
+    fn a_soldier_goes_for_the_armed_foe_over_a_nearer_unarmed_one() {
+        let physics = ground();
+        let mut people = People::default();
+        for (k, (z, side, armed)) in [
+            (0.0, "Vza", true),
+            (15.0, "All", false),
+            (25.0, "All", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let post = Brain::Post { facing: 0.0 };
+            let mut n = Npc::new(k, &rig(), Vec3::new(0.0, 1.0, z), 0.0, post, Some(1));
+            n.facing = if z > 0.0 { std::f32::consts::PI } else { 0.0 };
+            n.faction = Some(side);
+            n.gun = armed.then(rifle);
+            n.landed = true;
+            n.soldier = false;
+            n.character.position = Vec3::new(0.0, 0.0, z);
+            people.npcs.push(n);
+        }
+        people.set_relations([(("Vza", "All"), -80.0)].into_iter().collect());
+        people.war(&physics, None, 0.25);
+        let foe = people.npcs[0].foe_at.expect("he goes for one");
+        assert!(foe.z > 20.0, "the rifleman, not the unarmed one: {foe}");
+    }
+
     #[test]
     fn soldiers_see_an_armys_vehicle_from_as_far_as_its_visibility() {
         let physics = ground();
@@ -5734,6 +5818,7 @@ pub(crate) mod tests {
             at: Vec3::new(0.0, 1.0, z),
             visibility,
             armour: 2,
+            threat: m2_engine::ai_target::VEHICLE_THREAT,
         };
         people.vehicle_subjects = vec![truck(150.0, 100.0)];
         people.war(&physics, None, 0.25);
