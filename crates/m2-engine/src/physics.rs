@@ -1799,6 +1799,19 @@ struct BikeFooting {
     brake: f32,
 }
 
+/// How many physics steps a frame of `dt` seconds takes, and how long
+/// each is (from the 360 code, 0x82152E20): none for a frame under 1 ms
+/// (0x820F8BE4), else `dt x 59.999996 + 0.99` (0x820F8BAC, 0x82B7D824)
+/// truncated and held to 1..=3, sharing the frame equally. So up to
+/// 1/60 s a frame takes one step; 1/30 s, two of 1/60; longer, three.
+pub fn frame_steps(dt: f32) -> (usize, f32) {
+    if dt.is_nan() || dt < 0.001 {
+        return (0, 0.0);
+    }
+    let n = ((dt * 59.999_996 + 0.99) as i32).clamp(1, 3) as usize;
+    (n, dt / n as f32)
+}
+
 /// A turret's own body and the hinge it turns on, as the 360 code builds
 /// them (0x82273F90, from the turret update 0x82275608): a hinge between
 /// the turret part's body and its parent's about the turret's up, its
@@ -3122,6 +3135,16 @@ impl Physics {
 
     pub fn static_count(&self) -> usize {
         self.statics.len()
+    }
+
+    /// Advances the simulation by a frame of `dt` seconds as the 360 does
+    /// (0x82152E20): in [`frame_steps`] steps of equal length, none for a
+    /// frame under a millisecond.
+    pub fn step_frame(&mut self, dt: f32) {
+        let (n, each) = frame_steps(dt);
+        for _ in 0..n {
+            self.step(each);
+        }
     }
 
     /// Advances the simulation by `dt` seconds (and brings colliders added
@@ -6656,6 +6679,35 @@ mod tests {
         }
         let turned = (p.turret_yaw(id).unwrap() - start).to_degrees();
         assert!(turned > 1.5, "turned {turned} degrees");
+    }
+
+    #[test]
+    fn a_frame_is_stepped_as_the_360_steps_it() {
+        // 0x82152E20: n = trunc(dt x 59.999996 + 0.99) held to 1..=3.
+        assert_eq!(frame_steps(0.0005), (0, 0.0));
+        assert_eq!(frame_steps(1.0 / 60.0).0, 1);
+        assert_eq!(frame_steps(1.0 / 120.0), (1, 1.0 / 120.0));
+        let (n, each) = frame_steps(1.0 / 30.0);
+        assert_eq!(n, 2);
+        assert!((each - 1.0 / 60.0).abs() < 1e-7);
+        assert_eq!(frame_steps(0.02).0, 2);
+        assert_eq!(frame_steps(0.04).0, 3);
+        assert_eq!(frame_steps(0.2).0, 3);
+        // A frame of 1/30 s moves a falling body as two steps of 1/60 do.
+        let fall = |frame: bool| {
+            let mut p = Physics::new();
+            let id = p.add_vehicle(&car(), Vec3::new(0.0, 100.0, 0.0), 0.0);
+            for _ in 0..30 {
+                if frame {
+                    p.step_frame(1.0 / 30.0);
+                } else {
+                    p.step(1.0 / 60.0);
+                    p.step(1.0 / 60.0);
+                }
+            }
+            p.vehicle_transform(id).unwrap().w_axis.y
+        };
+        assert_eq!(fall(true), fall(false));
     }
 
     #[test]
