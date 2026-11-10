@@ -4326,7 +4326,10 @@ impl Combat {
                         // A gun fires only along a clear line (inferred: a soldier's
                         // fight keeps him from firing blind; a crew has no such step).
                         if hit.is_none() {
-                            let score = m2_engine::ai_target::score(d, current, in_slot);
+                            // How well seen (0x822E89B0); what each carries is not
+                            // rated against a vehicle here yet, so no threat.
+                            let seen = m2_engine::ai_target::visible(d, reach);
+                            let score = m2_engine::ai_target::score(d, current, in_slot, 0.0, seen);
                             best.offer(who, score);
                             if best.who == Some(who) {
                                 gun.at = Some(at);
@@ -7914,6 +7917,7 @@ mod tests {
             on_close: -1.0,
             off_close: 0.75,
             against: [3, 1, 0, 0],
+            kinds: [3, 1],
             single: false,
         };
         let gap = 60.0 / 562.0;
