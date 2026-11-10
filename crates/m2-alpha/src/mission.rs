@@ -6118,7 +6118,13 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 eprintln!("mission: {what} put up as {guid:#x} at {:.1?}", position);
             }
         }
+        // The armies go for it before anything else (0x822E0988).
+        Command::PriorityTarget(guid) => {
+            eprintln!("war: {guid:#x} is made a priority target");
+            game.scene.people.priority.insert(*guid);
+        }
         Command::Remove(guid) => {
+            game.scene.people.priority.remove(guid);
             game.scene.people.scripted_gone(*guid);
             if let Some(w) = game.scene.world.as_mut() {
                 game.scene.props.hide(&mut w.physics, [*guid]);

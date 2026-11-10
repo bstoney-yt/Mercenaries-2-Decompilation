@@ -190,6 +190,9 @@ pub enum Command {
     },
     Remove(u32),
     Kill(u32),
+    /// The armies go for `guid` before anything else
+    /// (`Ai.SetPriorityTarget`).
+    PriorityTarget(u32),
     Move {
         guid: u32,
         position: [f32; 3],
@@ -3193,6 +3196,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             target,
             haste,
         });
+        values([])
+    })?;
+
+    // The armies go for `guid` before anything else: it gets the object
+    // property `PriorityTarget` (0x82311B98), which their target score
+    // reads (0x822E0988). The support the player calls in is made one
+    // (`MrxSupport.SetupDamageEvent`). The 360 has no way to unset it.
+    add(&ai, "SetPriorityTarget", |w, _, a| {
+        if let Some(guid) = id(a.first()) {
+            w.commands.push(Command::PriorityTarget(guid));
+        }
         values([])
     })?;
 

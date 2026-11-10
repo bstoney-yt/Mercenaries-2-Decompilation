@@ -4329,7 +4329,9 @@ impl Combat {
                             // How well seen (0x822E89B0); what each carries is not
                             // rated against a vehicle here yet, so no threat.
                             let seen = m2_engine::ai_target::visible(d, reach);
-                            let score = m2_engine::ai_target::score(d, current, in_slot, 0.0, seen);
+                            let worth = m2_engine::ai_target::worth(0.0, false);
+                            let score =
+                                m2_engine::ai_target::score(d, current, in_slot, worth, seen);
                             best.offer(who, score);
                             if best.who == Some(who) {
                                 gun.at = Some(at);

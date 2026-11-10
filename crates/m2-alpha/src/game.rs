@@ -2079,6 +2079,9 @@ impl Game {
                     visibility: v.spec.tuning.visibility.unwrap_or(200.0),
                     armour: v.spec.tuning.armour.unwrap_or(1),
                     threat: vehicle_threat(&v.spec),
+                    priority: v
+                        .guid
+                        .is_some_and(|g| self.scene.people.priority.contains(&g)),
                 })
             })
             .collect();
@@ -2091,7 +2094,10 @@ impl Game {
             .as_ref()
             .and_then(|p| p.driving)
             .and_then(|i| self.scene.vehicles.get(i))
-            .map(|v| crate::npc::Arms::Vehicle(vehicle_threat(&v.spec)));
+            .map(|v| crate::npc::Arms::Vehicle {
+                threat: vehicle_threat(&v.spec),
+                priority: false,
+            });
         if let Some(world) = &mut self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {
