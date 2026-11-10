@@ -609,6 +609,8 @@ const KINDS: [u32; 2] = [0x63e6_6df5, 0xf34f_9919];
 pub struct NpcLauncher {
     pub template: u32,
     pub hint: FireHint,
+    /// Shots a minute (its `RateOfFire`).
+    pub rate_of_fire: f32,
     pub ammo: Ammo,
     /// Its shots' sound set and flash.
     pub feel: Feel,
@@ -622,6 +624,7 @@ impl NpcLauncher {
         Some(Self {
             template: w.template,
             hint: w.hint?,
+            rate_of_fire: 60.0 / w.gap().max(1e-3),
             ammo: w.ammo,
             feel: w.feel,
         })
