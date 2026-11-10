@@ -89,6 +89,12 @@ pub struct Object {
     pub label_hashes: Vec<u32>,
     /// The vehicle it rides in.
     pub vehicle: Option<u32>,
+    /// Seated in `vehicle` other than at its controls: a passenger,
+    /// gunner or commander (`Vehicle.Enter`'s seat `"p"`, `"g"`, `"c"`,
+    /// the letters `Vehicle.GetRiders` filters by), or she boarding the
+    /// scripts' helicopter as a passenger. Never its driver
+    /// ([`ScriptWorld::driver_of`]).
+    pub not_driving: bool,
     /// It got in (or out) at once, put there by a script, rather than
     /// climbing in itself: seat events tell the two apart.
     pub seated_instantly: bool,
@@ -924,11 +930,32 @@ impl ScriptWorld {
     /// Puts `guid` aboard `vehicle` (`seated_instantly` as `instant`), if
     /// it is an object.
     pub fn put_aboard(&mut self, guid: u32, vehicle: u32, instant: bool) {
+        self.seat(guid, vehicle, instant, false);
+    }
+
+    /// Puts `guid` aboard `vehicle` as [`Self::put_aboard`], `not_driving`
+    /// when it takes a seat other than the driver's ([`Object::not_driving`]).
+    pub fn seat(&mut self, guid: u32, vehicle: u32, instant: bool, not_driving: bool) {
         if let Some(o) = self.objects.get_mut(&guid) {
             o.vehicle = Some(vehicle);
             o.seated_instantly = instant;
+            o.not_driving = not_driving;
             self.riders.push(guid);
         }
+    }
+
+    /// Who drives `vehicle`, as `Vehicle.GetDriver` answers: the 360's
+    /// (0x823467C8, through 0x8229C958) walks the vehicle's riders and
+    /// returns the one in the driver's seat, never a passenger, and nil
+    /// when that seat is empty. Riders whose seat isn't known here stand
+    /// for the driver as before, the first made (lowest guid) first: a
+    /// crewed spawn's driver is made before its passengers.
+    pub fn driver_of(&self, vehicle: u32) -> Option<u32> {
+        self.objects
+            .iter()
+            .filter(|(_, o)| o.vehicle == Some(vehicle) && !o.not_driving)
+            .map(|(&g, _)| g)
+            .min()
     }
 
     /// The object called `name` (layer entity names are unique enough;
@@ -1363,6 +1390,18 @@ impl World for ScriptWorld {
 
 /// The world shared between the game and the script libraries.
 pub type Shared = Rc<RefCell<ScriptWorld>>;
+
+/// Whether `Vehicle.Enter`'s seat argument names a seat other than the
+/// driver's. The scripts pass a letter (`"d"`, `"D"`, `"p"`); the 360's
+/// `Vehicle.GetRiders` (0x82346530) reads the same letters as roles:
+/// `d` driver, `g` gunner, `c` commander, `p` passenger. Anything else
+/// (no seat given) is left as it was: it may be the driver.
+fn seat_not_driving(seat: &str) -> bool {
+    matches!(
+        seat.as_bytes().first().map(u8::to_ascii_lowercase),
+        Some(b'p' | b'g' | b'c')
+    )
+}
 
 /// Reports that `guid` reached `at` (its AI goal's location): it, its
 /// vehicle and any cargo on that vehicle's winch are there, the cargo is
@@ -2781,14 +2820,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     let vehicle = lib("Vehicle")?;
     add(&vehicle, "GetDriver", |w, _, a| {
-        // The first rider found stands for the driver.
-        let v = id(a.first());
-        let driver = w
-            .objects
-            .iter()
-            .filter(|(_, o)| o.vehicle.is_some() && o.vehicle == v)
-            .map(|(&g, _)| g)
-            .min();
+        let driver = id(a.first()).and_then(|v| w.driver_of(v));
         values([guid_value(driver)])
     })?;
     add(&vehicle, "GetFromRider", |w, _, a| {
@@ -2813,11 +2845,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .map(|(&g, _)| g)
             .collect();
         riders.sort_unstable();
-        // `"p"`: the passengers, not the driver (the first rider, as
-        // `Vehicle.GetDriver` has it; a soldier delivery's soldiers).
-        if matches!(a.get(1), Some(Value::String(s)) if s.as_bytes() == b"p") && !riders.is_empty()
+        // `"p"`: the passengers, not the driver (as `Vehicle.GetDriver`
+        // has it; a soldier delivery's soldiers).
+        if matches!(a.get(1), Some(Value::String(s)) if s.as_bytes() == b"p")
+            && let Some(driver) = v.and_then(|v| w.driver_of(v))
         {
-            riders.remove(0);
+            riders.retain(|&r| r != driver);
         }
         for r in riders {
             t.raw_push(crate::events::guid_value(r))?;
@@ -2834,6 +2867,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             if let Some(o) = w.objects.get_mut(&guid) {
                 o.vehicle = None;
                 o.seated_instantly = false;
+                o.not_driving = false;
             }
             w.commands.push(Command::ExitVehicle(guid));
         }
@@ -2849,7 +2883,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => String::new(),
         };
         let instant = matches!(a.get(3), Some(Value::Boolean(true)));
-        w.put_aboard(guid, vehicle, instant);
+        w.seat(guid, vehicle, instant, seat_not_driving(&seat));
         w.commands.push(Command::EnterVehicle {
             guid,
             vehicle,
@@ -3091,8 +3125,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .map(|(&g, _)| g)
             .collect();
         riders.sort_unstable();
-        if passengers && !riders.is_empty() {
-            riders.remove(0);
+        if passengers && let Some(driver) = w.driver_of(vehicle) {
+            riders.retain(|&r| r != driver);
         }
         let at = w.objects.get(&vehicle).map_or([0.0; 3], |o| o.position);
         for (i, g) in riders.into_iter().enumerate() {
@@ -3102,6 +3136,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             if let Some(o) = w.objects.get_mut(&g) {
                 o.vehicle = None;
                 o.seated_instantly = false;
+                o.not_driving = false;
                 o.position = position;
             }
             w.commands.push(Command::ExitVehicle(g));
@@ -5426,6 +5461,56 @@ mod tests {
             (pilot.as_str(), riders, fuel, slots, version),
             (PILOT, 1, 40.0, 1, 10)
         );
+    }
+
+    #[test]
+    fn a_passenger_is_never_the_driver() {
+        // PmcCon003's taxi: she (guid 1, the lowest) boards Ewan's
+        // helicopter as a passenger; the scripts send its driver home, and
+        // that must be its pilot, not her (360: 0x8229C958 takes only the
+        // driver's seat).
+        let (host, world) = setup();
+        let (copter, pilot): (u32, String) = {
+            let v = host
+                .lua()
+                .load(
+                    r#"local c = Pg.Spawn("Mi26 (VZA Intro) (Driver)", 0, 50, 0, 0)
+                    return c, Object.GetName(Vehicle.GetDriver(c))"#,
+                )
+                .eval::<(Value, String)>()
+                .unwrap();
+            (id(Some(&v.0)).unwrap(), v.1)
+        };
+        assert_eq!(pilot, PILOT);
+        world.borrow_mut().seat(1, copter, false, true);
+        let (driver, passengers, others): (String, i64, i64) = host
+            .lua()
+            .load(
+                r#"local c = ...
+                return Object.GetName(Vehicle.GetDriver(c)), #Vehicle.GetRiders(c, "p"),
+                    #Vehicle.GetRiders(c)"#,
+            )
+            .call(crate::events::guid_value(copter))
+            .unwrap();
+        assert_eq!((driver.as_str(), passengers, others), (PILOT, 1, 2));
+        // Seated by the scripts with a seat letter: `"p"` rides, `"d"`
+        // drives; out again, the seat no longer counts.
+        let jeep: Value = host
+            .lua()
+            .load(
+                r#"local j = Pg.Spawn("M151 Softtop (VZ)", 5, 0, 0, 0)
+                Vehicle.Enter(j, Sys.StringToGuid("1"), "p", true)
+                assert(Vehicle.GetDriver(j) == nil)
+                Vehicle.Exit(j, Sys.StringToGuid("1"))
+                Vehicle.Enter(j, Sys.StringToGuid("1"), "D", true)
+                return j"#,
+            )
+            .eval()
+            .unwrap();
+        let j = id(Some(&jeep)).unwrap();
+        assert_eq!(world.borrow().driver_of(j), Some(1));
+        assert!(seat_not_driving("p") && seat_not_driving("G") && !seat_not_driving("d"));
+        assert!(!seat_not_driving(""));
     }
 
     #[test]

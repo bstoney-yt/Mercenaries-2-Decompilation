@@ -640,6 +640,7 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             && let Some(o) = w.objects.get_mut(&hero)
         {
             o.vehicle = Some(vehicle);
+            o.not_driving = false;
             w.riders.push(hero);
         }
         w.commands
