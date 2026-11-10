@@ -3569,7 +3569,14 @@ impl People {
                 self.perceive(i, c.3);
             }
             seen.retain(|c| self.hostile(i, c.3));
-            seen.truncate(FOE_LOOKS);
+            // The nearest few, and any priority target in reach besides: the
+            // limit is ours (the 360 looks over them all, its sight lines
+            // queued), so it must not hide what the scripts made first.
+            let mut n = 0;
+            seen.retain(|c| {
+                n += 1;
+                n <= FOE_LOOKS || matches!(c.5, Arms::Vehicle { priority: true, .. })
+            });
             let n = &mut self.npcs[i];
             let current = n.foe_at.map(|f| f.distance(at));
             let alert = n.alert;
@@ -3947,8 +3954,23 @@ impl People {
                 }
             }
             let (fired, hit, killed) = self.war_tally;
+            // Those whose slot holds a vehicle the scripts made a priority
+            // target (its armour is only known for a vehicle).
+            let on_priority = self
+                .npcs
+                .iter()
+                .filter(|n| n.alive && n.foe_armour.is_some())
+                .filter_map(|n| n.slot.who)
+                .filter(|&w| {
+                    w >= VEHICLES
+                        && self
+                            .vehicle_subjects
+                            .get((w - VEHICLES) as usize)
+                            .is_some_and(|v| v.priority)
+                })
+                .count();
             eprintln!(
-                "war: {sides:?}: {fighting} fighting, {fired} rounds, {hit} hit, {killed} killed"
+                "war: {sides:?}: {fighting} fighting ({on_priority} on a priority target), {fired} rounds, {hit} hit, {killed} killed"
             );
         }
         self.refill(spawns, focus, dt);
@@ -5882,6 +5904,44 @@ pub(crate) mod tests {
         };
         assert!(pick(false) < 60.0, "the rifleman by threat");
         assert!(pick(true) > 100.0, "the priority target");
+    }
+
+    // More foes nearer than the few he looks over must not hide a priority
+    // target from him.
+    #[test]
+    fn a_priority_target_behind_many_nearer_foes_is_still_looked_over() {
+        let physics = ground();
+        let mut people = People::default();
+        for (k, z) in [0.0, 30.0, 34.0, 38.0, 42.0, 46.0, 50.0]
+            .into_iter()
+            .enumerate()
+        {
+            let post = Brain::Post { facing: 0.0 };
+            let mut n = Npc::new(k, &rig(), Vec3::new(0.0, 1.0, z), 0.0, post, Some(1));
+            n.facing = if z > 0.0 { std::f32::consts::PI } else { 0.0 };
+            n.faction = Some(if z > 0.0 { "All" } else { "Vza" });
+            n.gun = Some(rifle());
+            n.landed = true;
+            n.soldier = false;
+            n.character.position = Vec3::new(0.0, 0.0, z);
+            people.npcs.push(n);
+        }
+        assert!(
+            people.npcs.len() - 1 > FOE_LOOKS,
+            "more foes than he looks over"
+        );
+        people.set_relations([(("Vza", "All"), -80.0)].into_iter().collect());
+        people.vehicle_subjects = vec![VehicleSubject {
+            faction: "All",
+            at: Vec3::new(0.0, 1.0, 120.0),
+            visibility: 300.0,
+            armour: 2,
+            threat: m2_engine::ai_target::VEHICLE_THREAT,
+            priority: true,
+        }];
+        people.war(&physics, None, 0.25);
+        let z = people.npcs[0].foe_at.expect("he goes for one").z;
+        assert!(z > 100.0, "the priority target, not a rifleman at {z} m");
     }
 
     #[test]
