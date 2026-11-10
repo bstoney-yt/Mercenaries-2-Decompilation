@@ -1,6 +1,6 @@
 name: CI
 
-# Runs on the test PC (a self-hosted Windows x64 runner labelled m2-pc),
+# Runs on the dev VM (a self-hosted Windows x64 runner labelled m2-pc),
 # not GitHub's machines. The repository is public, so code from a fork's
 # pull request never runs here: the jobs run only for pushes to main and
 # for pull requests whose branch is in this repository. The runner keeps its checkout and target directory between runs, so
@@ -21,11 +21,13 @@ on:
       - 'docs/**'
 
 # A new push to a PR, or merging or closing it, cancels the run it
-# supersedes; runs on main finish. PR runs are grouped by PR number so
-# the `closed` event lands in the same group as the PR's earlier runs.
+# supersedes. A new push to main likewise cancels the older main run,
+# queued or running: with one runner, only the newest main commit needs
+# a result. PR runs are grouped by PR number so the `closed` event lands
+# in the same group as the PR's earlier runs.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 # The job token can read the repository and nothing more.
 permissions:
