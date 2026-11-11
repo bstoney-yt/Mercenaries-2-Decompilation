@@ -15,7 +15,7 @@
 //! - When a wave's delay has run out it spawns `NumToSpawn` helicopters
 //!   (at most 8), each a unit picked at random by weight, `SpawnDist`
 //!   ahead of the player within 0.4 rad either side of where she faces,
-//!   at least 70 m up, side by side 12 m apart; each faces her. No room
+//!   high enough (below), side by side 12 m apart; each faces her. No room
 //!   there (the 360 raises the point up to ten times by 5 m before giving
 //!   up): try again in 2 s.
 //! - It follows each helicopter until it is destroyed or gone, or more
@@ -23,10 +23,19 @@
 //!   stops following it). When none is left it starts the next wave's
 //!   delay; after the last wave it stops.
 //!
-//! Here (inferred, not from the 360 code): the ground isn't known, so
-//! "70 m up" is 70 m over her own height, and nothing is in the way of
-//! the point; the 500 m message isn't sent. The random numbers come from
-//! the spawner's own generator, not the 360's.
+//! - Its height (0x8223add0): the higher of 5 m over her and the ground
+//!   under the point (0x822ed8c0 -> 0x822ed5d8, a ray cast down through
+//!   the physics world) plus the higher of 70 m and a per-player value
+//!   less 5 m (0x82f0ed34, written per player by 0x822644e0; what it
+//!   holds isn't traced).
+//!
+//! INVENTED here, where the 360 code isn't followed: the ground comes from
+//! [`WaveWorld::ground_at`], and where the world can't answer (the
+//! scripts' world has no terrain) it is taken to be her own height, so
+//! the point is 70 m over her; the per-player value is left out (as if
+//! it were under 75 m); nothing is in the way of the point; the 500 m
+//! message isn't sent; the random numbers come from the spawner's own
+//! generator, not the 360's.
 
 use m2_math::glam::Vec3;
 
@@ -42,6 +51,8 @@ pub const DEFAULT_DISTANCE: f32 = 150.0;
 pub const SPREAD: f32 = 0.4;
 /// The least height over the ground a wave comes in at (0x820b7b54).
 pub const MIN_HEIGHT: f32 = 70.0;
+/// The least height over her a wave comes in at (0x820baf84).
+pub const OVER_HER: f32 = 5.0;
 /// How far apart a wave's helicopters come, side by side (0x82de895c).
 pub const SPACING: f32 = 12.0;
 /// How long to wait to try again when there was no room (0x820c77a4).
@@ -69,6 +80,11 @@ pub trait WaveWorld {
     fn spawn(&mut self, template: u32, at: [f32; 3], yaw: f32) -> Option<u32>;
     /// Where `guid` is while it is still there and not destroyed.
     fn alive_at(&self, guid: u32) -> Option<[f32; 3]>;
+    /// The ground's height under `(x, z)`, where known (the 360 casts a
+    /// ray down through its physics world).
+    fn ground_at(&self, _x: f32, _z: f32) -> Option<f32> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -173,11 +189,10 @@ impl HeliWaves {
         };
         let heading = facing + (0.5 - self.random()) * 2.0 * SPREAD;
         let (s, c) = heading.sin_cos();
-        let mut at = [
-            her[0] + s * wave.distance,
-            her[1] + MIN_HEIGHT,
-            her[2] + c * wave.distance,
-        ];
+        let (x, z) = (her[0] + s * wave.distance, her[2] + c * wave.distance);
+        // INVENTED: with no ground known, the ground is taken at her height.
+        let ground = world.ground_at(x, z).unwrap_or(her[1]);
+        let mut at = [x, (her[1] + OVER_HER).max(ground + MIN_HEIGHT), z];
         // Side by side: along the heading turned a quarter.
         let (ss, sc) = (heading + std::f32::consts::FRAC_PI_2).sin_cos();
         // Facing her.
@@ -214,6 +229,7 @@ mod tests {
         her: [f32; 3],
         objects: HashMap<u32, (u32, [f32; 3])>,
         next: u32,
+        ground: Option<f32>,
     }
 
     impl WaveWorld for Fake {
@@ -227,6 +243,23 @@ mod tests {
         }
         fn alive_at(&self, guid: u32) -> Option<[f32; 3]> {
             self.objects.get(&guid).map(|(_, at)| *at)
+        }
+        fn ground_at(&self, _: f32, _: f32) -> Option<f32> {
+            self.ground
+        }
+    }
+
+    #[test]
+    fn a_wave_comes_70_m_over_the_ground_and_never_under_5_m_over_her() {
+        for (ground, height) in [(Some(50.0), 120.0), (Some(-100.0), 5.0), (None, 70.0)] {
+            let mut s = HeliWaves::default();
+            let mut w = Fake {
+                ground,
+                ..Fake::default()
+            };
+            s.start(vec![wave(1, 0.0, vec![(7, 1)])]);
+            s.update(0.1, &mut w);
+            assert_eq!(w.objects[&1].1[1], height, "{ground:?}");
         }
     }
 
