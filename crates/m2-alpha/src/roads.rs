@@ -84,9 +84,6 @@ pub(crate) fn in_the_way(
 /// line, metres (invented: room to stop, and a truck's half width more
 /// than its own).
 const STOP_SECONDS: f32 = 1.8;
-/// Her vehicle is in a road vehicle's lane ahead within this of its line,
-/// metres (inferred: half a lane's width).
-const HER_LANE: f32 = 1.75;
 const CLEAR_SIDE: f32 = 3.5;
 /// One stuck this long, seconds, at least this far from her, metres, is
 /// taken back and comes again elsewhere (invented).
@@ -503,12 +500,12 @@ impl RoadTraffic {
                 .chain(
                     her_car
                         .map(|(p, h)| (p, h.unwrap_or(heading)))
-                        .filter(|&(p, _)| {
-                            // Her vehicle, in its lane ahead (inferred: the 360
-                            // puts her on the road she is nearest, 0x822644E0).
-                            let d = flat(p - here);
-                            d.perp_dot(forward).abs() < HER_LANE
-                        }),
+                        // Her, on foot or in her vehicle, in its lane: the
+                        // 360 puts her on a lane of the road she is on when
+                        // how far she is from its line falls in that lane's
+                        // strip (0x822644E0, 0x82263C98, the strips laid
+                        // out by 0x8223E508).
+                        .filter(|&(p, _)| in_lane(r, car, p)),
                 )
                 .filter(|&(p, _)| flat(p - here).dot(forward) > 0.0)
                 .min_by(|a, b| {
@@ -713,6 +710,37 @@ fn off_line(points: &[Vec3], at: Vec3) -> f32 {
 
 /// The right-hand side of a road going `dir` (level, unit): for a vehicle
 /// facing +z, +x is its left.
+/// Whether `p` is in lane `car.lane` of `road` the way `car` goes: how
+/// far right of the road's line it is (on the stretch nearest it) falls in
+/// that lane's strip ([`Road::lane_strips`]; the outermost where it has
+/// fewer).
+fn in_lane(road: &Road, car: Car, p: Vec3) -> bool {
+    let strips = road.lane_strips();
+    let Some(&(from, to)) = strips.get(car.lane).or(strips.last()) else {
+        return false;
+    };
+    let at = flat(p);
+    let best = road
+        .points
+        .windows(2)
+        .map(|w| {
+            let (a, b) = (flat(w[0]), flat(w[1]));
+            let ab = b - a;
+            let t = ((at - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+            let near = a + ab * t;
+            (at.distance_squared(near), near, ab.normalize_or_zero())
+        })
+        .min_by(|x, y| x.0.total_cmp(&y.0));
+    let Some((_, near, dir)) = best else {
+        return false;
+    };
+    let dir = if car.forward { dir } else { -dir };
+    // Right of the way it goes (+x of a vehicle facing +z is its left).
+    let right = Vec2::new(-dir.y, dir.x);
+    let off = (at - near).dot(right);
+    (from..=to).contains(&off)
+}
+
 /// How much of its road is left ahead of a vehicle at `here` heading for
 /// point `car.next` the way it goes, and the road's length, metres.
 fn along(road: &Road, car: Car, here: Vec3) -> (f32, f32) {
@@ -841,6 +869,25 @@ mod tests {
             along(&r, car(false, 1), Vec3::new(0.0, 0.0, 20.0)),
             (20.0, 30.0)
         );
+    }
+
+    // She is in a road vehicle's lane when how far right of the line she
+    // is falls in its strip (0x82263C98): on the near half going +z, the
+    // far half going back; not off the road.
+    #[test]
+    fn she_is_in_its_lane_by_the_lanes_strip() {
+        let r = road(1, &[(0.0, 0.0), (0.0, 100.0)]);
+        let car = |forward| Car {
+            road: 0,
+            forward,
+            next: 1,
+            lane: 0,
+            stuck: 0.0,
+        };
+        assert!(in_lane(&r, car(true), Vec3::new(-2.0, 0.0, 50.0)));
+        assert!(!in_lane(&r, car(true), Vec3::new(2.0, 0.0, 50.0)));
+        assert!(in_lane(&r, car(false), Vec3::new(2.0, 0.0, 50.0)));
+        assert!(!in_lane(&r, car(true), Vec3::new(-6.0, 0.0, 50.0)));
     }
 
     // A road with no junction at its end leads nowhere: no way out.

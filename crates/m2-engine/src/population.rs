@@ -150,6 +150,34 @@ impl RoadLanes {
             .collect()
     }
 
+    /// How far out from the line each of its lanes of traffic runs, inner
+    /// first: from and to, as [`layout`](Self::layout) lays them.
+    pub fn traffic_strips(&self, half: f32) -> Vec<(f32, f32)> {
+        let total: f32 = self
+            .strips
+            .iter()
+            .filter(|&&(k, w)| k != LANE_NONE && w > 0.0)
+            .map(|&(_, w)| w)
+            .sum();
+        if total <= 0.0 {
+            return Vec::new();
+        }
+        let mut from = 0.0;
+        let mut out = Vec::new();
+        for &(k, w) in self
+            .strips
+            .iter()
+            .filter(|&&(k, w)| k != LANE_NONE && w > 0.0)
+        {
+            let w = w / total * half;
+            if k == LANE_TRAFFIC {
+                out.push((from, from + w));
+            }
+            from += w;
+        }
+        out
+    }
+
     /// How far out from the line the middles of its lanes of traffic
     /// are, inner first.
     pub fn traffic(&self, half: f32) -> Vec<f32> {

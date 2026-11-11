@@ -27,9 +27,11 @@
 //! control (0x822B9210, 0x82234B38). They act only for a road linked to an
 //! `RtFlowControl` entity (0x822B81A0, store 0x8365778C, its record's +0x14
 //! the kind, +0x1C the sub-kind), and no layer the alpha reads holds one.
-//! Nor the 7 m/s at a road's very end (its +0x18 exactly 0 or 1), nor the
-//! wheel jiggled once blocked over 6 s (0x822AAAE8: its timer, +0x1C0, isn't
-//! traced).
+//! Nor the 7 m/s at a road's very end (its +0x18 exactly 0 or 1), nor what
+//! 0x822AAAE8 does under a stop request: 0x822BB270 (from 0x822C0958) sets
+//! the follower's +0x1B8 bit 3 and a 2 s timer (+0x1C0) that runs down;
+//! while it is set it brakes, its wheel jiggled at random. What asks it to
+//! stop so isn't traced.
 
 /// Under this it brakes and holds, m/s (0x822AAD80's 0.5).
 pub const HOLD: f32 = 0.5;
