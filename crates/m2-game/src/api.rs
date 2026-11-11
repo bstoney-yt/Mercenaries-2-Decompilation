@@ -791,6 +791,8 @@ pub struct ScriptWorld {
     /// leaves or comes back, and whether the player is out.
     pub boundaries: Vec<u32>,
     pub boundary_callback: Option<Function>,
+    /// What the setter ports of missing natives keep ([crate::ported_misc]).
+    pub misc: crate::ported_misc::MiscState,
     pub outside: bool,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
@@ -2533,6 +2535,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         )])
     })?;
 
+    crate::ported_misc::install(&lib, &add)?;
     let player = lib("Player")?;
     add(&player, "AddBoundary", |w, _, a| {
         if let Some(b) = id(a.get(1))
