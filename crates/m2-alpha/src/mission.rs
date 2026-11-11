@@ -6255,6 +6255,36 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 game.winches.set_state(id, s);
             }
         }
+        // `Object.AttachCargoToWinch` (0x82333460 -> 0x82195C30) and
+        // `Object.DetachCargoFromWinch` (0x82333640 -> 0x82195FF8) on one
+        // of the scripts' helicopters with a winch in play: hooked at its
+        // hang point, or let go. Others hang their cargo as
+        // [`crate::flights`] carries it.
+        Command::Winch { cargo, carrier } => {
+            let id = |g: &u32| index(g).and_then(|i| game.scene.vehicles[i].id);
+            let (cargo_id, carrier_id) = (id(cargo), carrier.as_ref().and_then(id));
+            match (carrier_id, cargo_id) {
+                (Some(heli), Some(load)) => {
+                    let all = game.winch_cargo();
+                    if let Some(c) = all.iter().find(|c| c.id == load)
+                        && let Some(world) = game.scene.world.as_mut()
+                    {
+                        let hooked = game.winches.attach(&mut world.physics, heli, c);
+                        eprintln!(
+                            "mission: winch cargo {cargo:#x} on {carrier:x?}: hooked {hooked}"
+                        );
+                    }
+                }
+                (None, Some(load)) if carrier.is_none() => {
+                    if let Some(heli) = game.winches.carrier_of(load)
+                        && let Some(world) = game.scene.world.as_mut()
+                    {
+                        game.winches.detach(&mut world.physics, heli);
+                    }
+                }
+                _ => {}
+            }
+        }
         // Seated in one of the scripts' vehicles that is placed: drive it.
         Command::EnterVehicle { guid, vehicle, .. } if *guid == PLAYER => {
             if let Some(i) = index(vehicle).filter(|&i| game.scene.vehicles[i].id.is_some())

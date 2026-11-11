@@ -144,6 +144,65 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, WinchParams> {
         .collect()
 }
 
+/// A `ConnectPoint` (store 0x83652244; fields `Name`, `BoneName`, the
+/// default record 0x823ECC70): where a winch may hang the template's
+/// objects from, the node `bone` names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectPoint {
+    pub name: u32,
+    pub bone: u32,
+}
+
+/// A `ConnectPoint` of this name keeps its object off every winch
+/// (0x82195C30, through 0x823DA3C8). No template's has it.
+pub const NOT_CONNECTABLE: u32 = 0xd211_1b26;
+
+/// Every template's `ConnectPoint`s, by template id, in record order.
+pub fn connect_points(db: &Layer<'_>) -> HashMap<u32, Vec<ConnectPoint>> {
+    let t = Table::new(db, "ConnectPoint");
+    t.templates()
+        .map(|id| {
+            let points = t
+                .of_template(id)
+                .iter()
+                .filter_map(|r| {
+                    Some(ConnectPoint {
+                        name: t.word(r, name_hash("Name"))?,
+                        bone: t.word(r, name_hash("BoneName"))?,
+                    })
+                })
+                .collect();
+            (id, points)
+        })
+        .collect()
+}
+
+/// Where cargo with `points` (each with its node's place in its space
+/// where its model has it) hangs from (0x82195C30): `None` when it may
+/// not be carried ([`NOT_CONNECTABLE`]); else the point nearest `hook`
+/// of those its model has (`to_world` places one in the world), or
+/// `Some(None)` with none, for the fallback
+/// ([`crate::Physics::cargo_hang_point`]).
+pub fn hang_point(
+    points: &[(ConnectPoint, Option<Vec3>)],
+    hook: Vec3,
+    to_world: impl Fn(Vec3) -> Vec3,
+) -> Option<Option<Vec3>> {
+    if points.iter().any(|(p, _)| p.name == NOT_CONNECTABLE) {
+        return None;
+    }
+    let mut best: Option<(f32, Vec3)> = None;
+    for &(_, at) in points {
+        let Some(at) = at else { continue };
+        let d = to_world(at).distance_squared(hook);
+        // The first of equals (the walk keeps a later one only nearer).
+        if best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, at));
+        }
+    }
+    Some(best.map(|(_, at)| at))
+}
+
 /// The winch's state (+0x140), as `Object.GetWinchState` names it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -440,6 +499,27 @@ pub fn magnet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_hangs_from_its_connect_point_nearest_the_hook() {
+        let p = |name, bone| ConnectPoint { name, bone };
+        let points = [
+            (p(1, 10), Some(Vec3::new(0.0, 1.0, 2.0))),
+            (p(2, 11), None),
+            (p(3, 12), Some(Vec3::new(0.0, 1.0, -2.0))),
+        ];
+        let up = |v: Vec3| v + Vec3::Y * 5.0;
+        assert_eq!(
+            hang_point(&points, Vec3::new(0.0, 8.0, -3.0), up),
+            Some(Some(Vec3::new(0.0, 1.0, -2.0)))
+        );
+        // None found on its model: the fallback.
+        assert_eq!(hang_point(&points[1..2], Vec3::ZERO, up), Some(None));
+        assert_eq!(hang_point(&[], Vec3::ZERO, up), Some(None));
+        // One named 0xD2111B26: not carried at all.
+        let barred = [(p(NOT_CONNECTABLE, 10), Some(Vec3::ZERO))];
+        assert_eq!(hang_point(&barred, Vec3::ZERO, up), None);
+    }
 
     fn heli() -> Winch {
         Winch::new(&WinchParams {
