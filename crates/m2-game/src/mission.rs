@@ -1373,6 +1373,17 @@ impl Mission {
         self.world.borrow_mut().hijack.set_hardpoint(guid, name, at);
     }
 
+    /// `guid` (a helicopter) has a winch in this state (0 retracted, 1
+    /// deployed, 2 deploying, 3 retracting: `Object.GetWinchState`), or
+    /// none.
+    pub fn set_winch(&mut self, guid: u32, state: Option<u8>) {
+        let mut w = self.world.borrow_mut();
+        match state {
+            Some(s) => w.winches.insert(guid, s),
+            None => w.winches.remove(&guid),
+        };
+    }
+
     pub fn hold(&mut self, button: u32, down: bool) {
         let at = down.then_some(self.now);
         self.world.borrow_mut().hijack.hold(button, at);
