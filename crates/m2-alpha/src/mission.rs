@@ -4791,6 +4791,24 @@ impl Fleet {
                 let f = m.transform_vector3(Vec3::Z);
                 mission.place(g, m.transform_point3(Vec3::ZERO).to_array(), f.x.atan2(f.z));
             }
+            // On the ground and flipped, as the 360's physics kinds have
+            // them (`ObjectIsGrounded`, `Vehicle.IsFlipped`): a car is
+            // `_CarPhysicsV2`, kind 2 (no tank, boat, helicopter or jet).
+            let car = !v.spec.tracked
+                && !v.spec.is_boat()
+                && !v.spec.is_helicopter()
+                && !v.spec.wheels.is_empty();
+            let mut w = mission.world().borrow_mut();
+            if physics.vehicle_grounded(id, car) == Some(false) {
+                w.airborne.insert(g);
+            } else {
+                w.airborne.remove(&g);
+            }
+            if physics.vehicle_flipped(id, car) == Some(true) {
+                w.flipped.insert(g);
+            } else {
+                w.flipped.remove(&g);
+            }
         }
         if self.look > 0 {
             self.look -= 1;

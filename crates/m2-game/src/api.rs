@@ -916,6 +916,12 @@ pub struct ScriptWorld {
     /// its last look (it looks at those `ObjectIsVisible` events wait
     /// for: [`crate::mission::Mission::sight_watched`]).
     pub unseen: HashSet<u32>,
+    /// The vehicles off the ground, as the game last said
+    /// ([`World::grounded`]: anything not here stands on it).
+    pub airborne: HashSet<u32>,
+    /// The vehicles lying flipped, as the game last said
+    /// (`Vehicle.IsFlipped`).
+    pub flipped: HashSet<u32>,
 }
 
 impl ScriptWorld {
@@ -1263,6 +1269,9 @@ impl World for ScriptWorld {
     }
     fn vehicle_of(&self, guid: u32) -> Option<u32> {
         self.objects.get(&guid)?.vehicle
+    }
+    fn grounded(&self, guid: u32) -> bool {
+        !self.airborne.contains(&guid)
     }
     fn player(&self) -> Option<u32> {
         self.player
@@ -2819,6 +2828,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let vehicle = lib("Vehicle")?;
+    // 0x82348358: whether a car lies flipped (the game's to say; the 360
+    // asks the physics object's vtable +0x9C). True only for a car.
+    add(&vehicle, "IsFlipped", |w, _, a| {
+        let Some(v) = id(a.first()) else {
+            return Err(mlua::Error::runtime("Vehicle.IsFlipped: bad argument"));
+        };
+        values([Value::Boolean(w.flipped.contains(&v))])
+    })?;
     add(&vehicle, "GetDriver", |w, _, a| {
         let driver = id(a.first()).and_then(|v| w.driver_of(v));
         values([guid_value(driver)])
