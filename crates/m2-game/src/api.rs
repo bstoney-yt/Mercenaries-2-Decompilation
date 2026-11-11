@@ -6716,11 +6716,12 @@ mod tests {
             .load(
                 r#"
                 log = {}
-                local function note(t) return function(cargo, carrier, how)
-                    log[#log + 1] = t .. " " .. Sys.GuidToString(cargo) .. " "
-                        .. Sys.GuidToString(carrier) .. " " .. how
-                end end
                 local copter, box = Sys.StringToGuid("80"), Sys.StringToGuid("82")
+                local names = { [copter] = "80", [box] = "82" }
+                local function note(t) return function(cargo, carrier, how)
+                    log[#log + 1] = t .. " " .. names[cargo] .. " "
+                        .. names[carrier] .. " " .. how
+                end end
                 Event.CreatePersistent(Event.ObjectWinched, {box, copter, "Attach"}, note("att"))
                 Event.CreatePersistent(Event.ObjectWinched, {box, 0, "Detach"}, note("det"))
                 Event.CreatePersistent(Event.ObjectWinched, {box, 0, "any"}, note("any"))
