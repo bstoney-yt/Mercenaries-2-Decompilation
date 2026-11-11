@@ -3106,7 +3106,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         w.commands.push(Command::Follow { guid, target, near });
         // From the 360 code (0x82310d50): a number, 1 when there was an AI
         // to give the role to (0 when not).
-        values([Value::Integer(mlua::Integer::from(w.objects.contains_key(&guid)))])
+        values([Value::Integer(mlua::Integer::from(
+            w.objects.contains_key(&guid),
+        ))])
     })?;
     // `Ai.Squad{ SquadGuid, Action = "GetUnits" }`: the squad's people
     // (OilCon001 waits on `oc001.obj1.vzsquad1`'s to fall). Inferred from
