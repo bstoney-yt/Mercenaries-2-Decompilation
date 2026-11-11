@@ -3014,8 +3014,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => String::new(),
         };
         let instant = matches!(a.get(3), Some(Value::Boolean(true)));
-        let name = (!seat.is_empty()).then(|| m2_assets::hash::name_hash(&seat));
-        w.seat_named(guid, vehicle, instant, seat_not_driving(&seat), name);
+        // The seat is named by its type's letter (`d`, `p`, `g`, `c`): the
+        // first free seat of that type, else the first of it.
+        let kind = seat.as_bytes().first().copied().unwrap_or(b'd');
+        w.seat(guid, vehicle, instant, seat_not_driving(&seat));
+        if let Some(s) = w
+            .seats
+            .by_type(vehicle, kind, true)
+            .or_else(|| w.seats.by_type(vehicle, kind, false))
+        {
+            w.seats.move_to(guid, s);
+        }
         w.commands.push(Command::EnterVehicle {
             guid,
             vehicle,

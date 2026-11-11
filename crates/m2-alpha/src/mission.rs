@@ -4773,11 +4773,22 @@ impl Fleet {
         // their templates' `SeatLink`s and `SeatParameters`.
         {
             let mut w = mission.world().borrow_mut();
-            for v in &game.scene.vehicles {
-                let (Some(g), Some(seating)) = (v.guid, v.spec.seating.as_deref()) else {
+            for v in &mut game.scene.vehicles {
+                let (Some(g), Some(seating)) = (v.guid, v.spec.seating.as_mut()) else {
                     continue;
                 };
                 w.seats.add(g, seating.seats.iter().map(seat_of_template));
+                // `Vehicle.SetCanPlayerUse` (0x82346D10): the seats she may
+                // take, as the scripts last set them.
+                let barred: Vec<(u32, bool)> =
+                    w.seats.of(g).map(|(_, s)| (s.name, s.player_use)).collect();
+                for (name, can) in barred {
+                    if let Some(i) = seating.seat(name)
+                        && seating.seats[i].player_use != can
+                    {
+                        std::sync::Arc::make_mut(seating).seats[i].player_use = can;
+                    }
+                }
             }
         }
         for v in &game.scene.vehicles {
@@ -5521,7 +5532,9 @@ fn send_gunship(game: &mut Game, faction: &'static str, template: &str, her: Vec
 }
 
 /// A seat as the scripts read it ([`m2_game::vehicle_seats::SeatParams`]).
-fn seat_of_template(s: &m2_engine::seats::Seat) -> (u32, m2_game::vehicle_seats::SeatParams, bool) {
+fn seat_of_template(
+    s: &m2_engine::seats::Seat,
+) -> (u32, m2_game::vehicle_seats::SeatParams, bool, Vec<u32>) {
     let f = s.flags;
     let params = m2_game::vehicle_seats::SeatParams {
         driver: s.driver,
@@ -5533,8 +5546,9 @@ fn seat_of_template(s: &m2_engine::seats::Seat) -> (u32, m2_game::vehicle_seats:
         rider_vulnerable: f.rider_vulnerable,
         rider_bashable: f.rider_bashable,
         stowable: f.stowable,
+        ladder: f.ladder,
     };
-    (s.name, params, s.player_use)
+    (s.name, params, s.player_use, s.links.clone())
 }
 
 fn pursuit_standing(game: &Game, her: Vec3) -> crate::reinforce::Standing {
