@@ -206,6 +206,9 @@ pub enum Command {
     },
     Remove(u32),
     Kill(u32),
+    /// The armies go for `guid` before anything else
+    /// (`Ai.SetPriorityTarget`).
+    PriorityTarget(u32),
     Move {
         guid: u32,
         position: [f32; 3],
@@ -838,6 +841,8 @@ pub struct ScriptWorld {
     /// The outlines of region objects (`LineRegion`), by the region's guid;
     /// placed at the object's position and yaw.
     pub regions: HashMap<u32, m2_assets::Region>,
+    /// The object link table ([`crate::links`]).
+    pub links: crate::links::Links,
     /// What `Pg.GetAllLandingZones(kind)` answers, by kind: the zones by
     /// their number. The transit script reads kinds 1 and 2 (where each
     /// player lands) as tables keyed alike.
@@ -882,6 +887,8 @@ pub struct ScriptWorld {
     pub outside: bool,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Templates' cash values by name in lower case ([`crate::cash`]).
+    pub template_cash: HashMap<String, i32>,
     /// Every template the template database names, in lower case: the
     /// names `Pg.GetGuidByName` answers with a template's guid
     /// ([`ScriptWorld::is_template`]).
@@ -1835,6 +1842,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     crate::airstrike::install(&lib("Airstrike")?, &add)?;
     crate::shop::install(lua, &lib("Hud")?)?;
+    crate::cash::install(&lib, &add)?;
 
     // A string's hash, as the scripts key tables by name (their recruits'
     // states). The archive's name hash: the scripts only compare hashes
@@ -2512,6 +2520,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&report, "SetDelay", |_, _, _| values([]))?;
     // Weapons as objects: a loadout of templates, each weapon with its own
     // reserve of ammunition.
+    crate::links::install(&lib, &add)?;
     let human = lib("Human")?;
     // Human.SetAllowCorpseCleanup(character, allow): whether the game may
     // clear its body away (the verify objective keeps a target's until it
@@ -3651,6 +3660,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
 
+    // The armies go for `guid` before anything else: it gets the object
+    // property `PriorityTarget` (0x82311B98), which their target score
+    // reads (0x822E0988). The support the player calls in is made one
+    // (`MrxSupport.SetupDamageEvent`). The 360 has no way to unset it.
+    add(&ai, "SetPriorityTarget", |w, _, a| {
+        if let Some(guid) = id(a.first()) {
+            w.commands.push(Command::PriorityTarget(guid));
+        }
+        values([])
+    })?;
+
     // A pilot flies its vehicle, with any cargo on the winch, to a point
     // and lets the cargo go there: pilot, x, y, z, then how low the cargo
     // comes before it is let go (0x82311C50 puts the fifth value in the
@@ -4268,37 +4288,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
 
-    // The engine's additions to the math library: random integers in
-    // [a, b] (or [1, a]), random reals in [a, b] and normalising.
+    // `Math` is the math library under the name some scripts use; the
+    // engine's own additions go on both (`script_math`, from the 360).
     lua.load(
         r#"
-        local function randi(a, b)
-            if b then return math.random(a, b) end
-            return math.random(a)
-        end
-        local function randf(a, b)
-            a, b = a or 0, b or 1
-            return a + (b - a) * math.random()
-        end
-        math.randi, math.randf = randi, randf
         local M = rawget(_G, "Math")
         if type(M) ~= "table" then
             M = {}
             rawset(_G, "Math", M)
         end
-        M.randi, M.randf = randi, randf
-        -- A vector scaled to length 1 (the strikes aim their bombs so);
-        -- the zero vector stays as it is.
-        function M.Normalize(x, y, z)
-            local l = math.sqrt(x * x + y * y + z * z)
-            if l == 0 then return x, y, z end
-            return x / l, y / l, z / l
-        end
-        -- A vector's length (the fuel-air bomb measures its drop so).
-        function M.Length(x, y, z)
-            return math.sqrt(x * x + y * y + (z or 0) * (z or 0))
-        end
-        -- Math is the math library with the additions.
         for k, v in pairs(math) do
             if rawget(M, k) == nil then M[k] = v end
         end
@@ -4306,6 +4304,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     )
     .set_name("=m2-math")
     .exec()?;
+    crate::script_math::install(lua, Rc::default())?;
 
     // The engine's table helpers: `Table.Create(narray, nhash)` makes a
     // table with room reserved, `Table.InsertI(t, value, i)` stores at
@@ -5529,7 +5528,7 @@ mod tests {
                 local her = Player.GetAnyCharacter()
                 Human.PlayRawAnimation(her, "all_starter03_job_briefing_spiel", true, true, 0.5, false, true)
                 Event.Create(Event.HumanAnimationNearlyCompleted, { her, 0.1 },
-                    function(who) done = who end, {})
+                    function() done = true end, {})
                 "#,
             )
             .exec()
@@ -5576,7 +5575,7 @@ mod tests {
                 left = nil
                 Sys.RequestGameState("WaitForStreaming")
                 Event.Create(Event.GameStateChange, {"WaitForStreaming", "exit"},
-                    function(state, name, how) left = state .. " " .. name .. " " .. how end,
+                    function(state, extra) left = state .. " " .. tostring(extra) end,
                     {"streaming"})
                 "#,
             )
@@ -5592,10 +5591,14 @@ mod tests {
         world.borrow_mut().game_state = "Game".into();
         events.update_shared(0.5, &world);
         let left: String = host.lua().globals().get("left").unwrap();
-        assert_eq!(left, "streaming WaitForStreaming exit");
+        // Nothing of the engine's own follows the data (as the 360).
+        assert_eq!(left, "streaming nil");
         let r: bool = host
             .lua()
-            .load("local n = math.randi(3); return n >= 1 and n <= 3 and Math.randf(2, 2) == 2")
+            .load(
+                "local n, f = math.randi(3), Math.randf(2, 2)
+                 return n >= 1 and n <= 3 and f >= 2 and f < 3",
+            )
             .eval()
             .unwrap();
         assert!(r);

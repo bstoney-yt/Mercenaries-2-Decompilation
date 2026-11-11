@@ -183,6 +183,31 @@ pub fn state_matches(pattern: &str, state: &str) -> bool {
         None => pattern.eq_ignore_ascii_case(state),
     }
 }
+/// What a `Button` event passes when `button` is pressed: the pad that
+/// pressed it, the button's name, and "press".
+///
+/// From the 360 code (arguments slot 0x823576f8): the pad number first,
+/// then a name for six of the nine buttons parse 0x82357328 knows, then
+/// the mode ("press", "held" or "release"). "lsleft" and "lsright" pass no
+/// name. "rtrigger" passes "rtrigger" and then "lbutton" as well: its jump
+/// table entry runs on into the "lbutton" one. Only presses are seen here,
+/// and the one local player's pad is taken as 0 (inferred).
+fn button_args(button: &str) -> (Vec<Value>, Vec<&'static str>) {
+    let names: &[&'static str] = match button.to_ascii_lowercase().as_str() {
+        "action" => &["action"],
+        "selection" => &["selection"],
+        "cancel" => &["cancel"],
+        "lbutton" => &["lbutton"],
+        "rtrigger" => &["rtrigger", "lbutton"],
+        "start" => &["start"],
+        "select" => &["select"],
+        _ => &[],
+    };
+    let mut words = names.to_vec();
+    words.push("press");
+    (vec![Value::Number(0.0)], words)
+}
+
 /// The kinds the scripts use, by how often.
 pub const KINDS: [&str; 22] = [
     "TimerRelative",
@@ -677,6 +702,13 @@ impl Events {
             for mut p in std::mem::take(&mut s.pending) {
                 let extra = match check(&p, now, &posted, accepted, world) {
                     Check::Fire(extra) => Some(vec![extra]),
+                    Check::FireWords(mut extra, words) => {
+                        let lua = s.lua.0.as_ref().and_then(mlua::WeakLua::try_upgrade);
+                        extra.extend(words.iter().filter_map(|w| {
+                            lua.as_ref()?.create_string(w).ok().map(Value::String)
+                        }));
+                        Some(vec![extra])
+                    }
                     // Fires as the condition starts to hold.
                     Check::Holds(holds, extra) => {
                         let rising = holds && !p.held;
@@ -980,6 +1012,8 @@ fn seat_mode(p: &Pending) -> String {
 enum Check {
     /// Fire now with these values after the callback's data.
     Fire(Vec<Value>),
+    /// Fire now with these values and then these words as strings.
+    FireWords(Vec<Value>, Vec<&'static str>),
     /// A condition: whether it holds, and the values to pass when it
     /// starts to.
     Holds(bool, Vec<Value>),
@@ -1278,8 +1312,11 @@ fn check(
         // the support helicopter's pilot is free again once his
         // helicopter is (`MakeRecruitAvailable("Copter")`). Passes the
         // object.
+        // Passes nothing (from the 360 code: its arguments slot is the
+        // empty 0x8225e998; the support helicopter's callback takes only
+        // its data).
         "ObjectDelete" => match guid(&p.params, 1) {
-            Some(g) => Check::Holds(world.position(g).is_none(), vec![id(g)]),
+            Some(g) => Check::Holds(world.position(g).is_none(), Vec::new()),
             None => no,
         },
         // { object, health }: once the object's health is below the figure
@@ -1408,19 +1445,15 @@ fn check(
             Check::Holds((riding != on_foot) != exit, Vec::new())
         }
         // { state, "enter" or "exit" }: as the game enters or leaves a
-        // state; passes both.
+        // state. Passes nothing (from the 360 code: parse 0x823555a8,
+        // test 0x82355628, and the empty arguments slot 0x8225e998; the
+        // scripts' callbacks take only their data).
         "GameStateChange" => {
             let (Some(state), Some(current)) = (text(&p.params, 1), world.game_state()) else {
                 return no;
             };
             let exit = text(&p.params, 2).as_deref() == Some("exit");
-            Check::Holds(
-                current.eq_ignore_ascii_case(&state) != exit,
-                vec![
-                    p.params.raw_get::<Value>(1).unwrap_or(Value::Nil),
-                    p.params.raw_get::<Value>(2).unwrap_or(Value::Nil),
-                ],
-            )
+            Check::Holds(current.eq_ignore_ascii_case(&state) != exit, Vec::new())
         }
         // { object, boundary, "enter" or "exit" }.
         "Boundary" => {
@@ -1650,7 +1683,12 @@ fn check(
                     .button_presses()
                     .iter()
                     .any(|(t, b)| *b == button && *t >= p.last && (*t > p.last || !p.persistent));
-                if pressed { Check::Fire(Vec::new()) } else { no }
+                if pressed {
+                    let (pad, words) = button_args(&button);
+                    Check::FireWords(pad, words)
+                } else {
+                    no
+                }
             }
             None => no,
         },
@@ -1674,8 +1712,10 @@ fn check(
         "HumanAnimationNearlyCompleted" => match guid(&p.params, 1) {
             Some(g) => {
                 let margin = p.params.raw_get::<f64>(2).unwrap_or(0.1) as f32;
+                // Passes nothing (from the 360 code: parse 0x82356228, test
+                // 0x823562a0, and the empty arguments slot 0x8225e998).
                 match world.raw_clip_left(g) {
-                    Some(left) if left <= margin => Check::Holds(true, vec![id(g)]),
+                    Some(left) if left <= margin => Check::Holds(true, Vec::new()),
                     _ => no,
                 }
             }
@@ -1708,14 +1748,16 @@ fn check(
         // ([`World::is_visible`]): PmcCon001 waits, once she is inside the
         // villa, for the outpost's tank column to come into view to load
         // the tank (`LoadTank`). A label or filter names several: the
-        // first seen. Passes the object.
+        // first seen. Passes nothing (from the 360 code: parse 0x823551e8,
+        // test 0x82355230, and the empty arguments slot 0x8225e998).
         "ObjectIsVisible" => {
             let seen = objects(&p.params, 1, world)
                 .into_iter()
-                .find(|&g| world.is_visible(g) == Some(true));
-            match seen {
-                Some(g) => Check::Holds(true, vec![id(g)]),
-                None => no,
+                .any(|g| world.is_visible(g) == Some(true));
+            if seen {
+                Check::Holds(true, Vec::new())
+            } else {
+                no
             }
         }
         // { name, filter }: when something posts that name, and the
@@ -2471,7 +2513,7 @@ mod tests {
             .load(
                 r#"
                 Event.Create(Event.ObjectIsVisible, { 9 },
-                    function(who, seen) table.insert(log, who .. " saw " .. gid(seen)) end,
+                    function(who, seen) table.insert(log, who .. " saw " .. tostring(seen)) end,
                     { "LoadTank" })
                 "#,
             )
@@ -2486,7 +2528,8 @@ mod tests {
         assert_eq!(events.sight_watched(&world), [9]);
         world.visible.push(9);
         events.update(0.1, &world);
-        assert_eq!(log(&host), ["LoadTank saw 9"]);
+        // Only the data: the engine passes nothing of its own.
+        assert_eq!(log(&host), ["LoadTank saw nil"]);
         assert!(events.is_empty());
         assert!(events.take_unhandled().is_empty());
     }
