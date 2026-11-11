@@ -73,7 +73,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use m2_assets::{Font, StringTable, name_hash};
+use m2_assets::{Font, StringTable};
 use mlua::{Function, IntoLuaMulti, Lua, MultiValue, Table, Value};
 
 use crate::gui::{Anchor, Correction, VIRTUAL_SIZE};
@@ -1759,8 +1759,7 @@ pub fn install(lua: &Lua) -> mlua::Result<ScreenRef> {
     // `String.GetHash(name)`, likewise in `String`: the support scripts
     // key their recruits by it (`MrxSupportManager.IsRecruitAvailable`;
     // the support menu greys out an item whose recruit it can't find).
-    // The archive's name hash: what the scripts compare are their own
-    // hashes, so any consistent hash would do.
+    // The engine's hash, as light userdata (`crate::script_hash`).
     let string = match lua.globals().raw_get::<Value>("String")? {
         Value::Table(t) if t.metatable().is_none() => t,
         _ => {
@@ -1771,9 +1770,9 @@ pub fn install(lua: &Lua) -> mlua::Result<ScreenRef> {
     };
     string.raw_set(
         "GetHash",
-        safe_function(lua, |lua, args| match args.front() {
-            Some(Value::String(s)) => ret(lua, name_hash(&s.to_string_lossy())),
-            _ => ret(lua, Value::Nil),
+        safe_function(lua, |_, args| {
+            let args: Vec<Value> = args.into_iter().collect();
+            Ok(crate::script_hash::get_hash_native(&args))
         })?,
     )?;
     lua.set_app_data(Rc::clone(&screen));

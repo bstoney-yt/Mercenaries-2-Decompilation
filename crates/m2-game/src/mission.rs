@@ -723,6 +723,9 @@ impl Mission {
             w.inventory.thrown = thrown;
             for e in layers.values().flatten() {
                 w.entities.insert(e.guid, e.at);
+                if !e.path.is_empty() {
+                    w.paths.insert(e.guid, e.path.clone());
+                }
                 if e.is_marker() {
                     w.entity_names
                         .entry(e.name.to_ascii_lowercase())
@@ -769,6 +772,7 @@ impl Mission {
         let events = Events::default();
         events.install(host.lua())?;
         crate::hijack::install(&host, &world)?;
+        crate::vehicle_state::install(&host, &world)?;
         crate::vehicle_seats::install(&host, &world)?;
         host.install_library(Rc::clone(&library), true)?;
         // The contracts' own globals read nil while unset, as in the game,
@@ -1369,6 +1373,17 @@ impl Mission {
         self.world.borrow_mut().hijack.set_hardpoint(guid, name, at);
     }
 
+    /// `guid` (a helicopter) has a winch in this state (0 retracted, 1
+    /// deployed, 2 deploying, 3 retracting: `Object.GetWinchState`), or
+    /// none.
+    pub fn set_winch(&mut self, guid: u32, state: Option<u8>) {
+        let mut w = self.world.borrow_mut();
+        match state {
+            Some(s) => w.winches.insert(guid, s),
+            None => w.winches.remove(&guid),
+        };
+    }
+
     pub fn hold(&mut self, button: u32, down: bool) {
         let at = down.then_some(self.now);
         self.world.borrow_mut().hijack.hold(button, at);
@@ -1392,6 +1407,11 @@ impl Mission {
             .push((self.now, holder, what.to_owned(), weapon));
         let extra = w.weapon_events.len().saturating_sub(32);
         w.weapon_events.drain(..extra);
+    }
+
+    /// Object `guid` now moves at `speed` m/s, for `Object.GetVelocity`.
+    pub fn set_speed(&mut self, guid: u32, speed: f32) {
+        self.world.borrow_mut().speeds.insert(guid, speed);
     }
 
     /// Character `guid` is now in human state `state` (`Stance.Action`:
@@ -3170,7 +3190,7 @@ mod tests {
         m.run(
             r#"
             local me = Player.GetCharacter(1)
-            assert(Object.GetName(me) == "Mattias")
+            assert(__m2_object_name(me) == "Mattias")
             assert(Object.HasLabel(me, "mattias"))
             Object.AddLabel(me, "Scripted")
             "#,
@@ -3181,7 +3201,7 @@ mod tests {
         m.run(
             r#"
             local me = Player.GetCharacter(1)
-            assert(Object.GetName(me) == "Jennifer")
+            assert(__m2_object_name(me) == "Jennifer")
             assert(Pg.GetGuidByName("Jennifer") == me)
             assert(Object.HasLabel(me, "jennifer"))
             assert(not Object.HasLabel(me, "mattias"))
@@ -3655,6 +3675,34 @@ mod tests {
             .unwrap();
         assert!(m.lua().globals().get::<bool>("__c").unwrap());
     }
+    #[test]
+    fn a_health_below_its_figure_fires_the_less_than_event() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let mut tank = crate::api::Object::new("OilCon002_Tank", [5.0, 0.0, 0.0]);
+        tank.health = 100.0;
+        m.world.borrow_mut().insert(9, tank);
+        m.run(
+            r#"__n = 0
+            Event.Create(Event.ObjectHealthLessThan, { Sys.StringToGuid('0x9'), 40 },
+                function(...) __n = __n + 1 + select('#', ...) end, {})"#,
+            "events",
+        )
+        .unwrap();
+        let fired = |m: &Mission| m.lua().globals().get::<i64>("__n").unwrap();
+        m.tick(0.1);
+        assert_eq!(fired(&m), 0);
+        m.world.borrow_mut().objects.get_mut(&9).unwrap().health = 40.0;
+        m.tick(0.1);
+        // At the figure is not below it.
+        assert_eq!(fired(&m), 0);
+        m.world.borrow_mut().objects.get_mut(&9).unwrap().health = 39.0;
+        m.tick(0.1);
+        // Once, and with nothing passed.
+        assert_eq!(fired(&m), 1);
+        m.tick(0.1);
+        assert_eq!(fired(&m), 1);
+    }
+
     #[test]
     fn what_she_does_with_a_weapon_reaches_the_weapon_events() {
         let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();

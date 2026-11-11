@@ -28,6 +28,19 @@ use crate::script::safe_function;
 pub const FIRST_SPAWNED: u32 = 0x4000_0000;
 /// What crews a vehicle spawned with its driver.
 pub const PILOT: &str = "Pilot";
+/// The Lua registry name `Disguise.Init`'s `InvestigatorCallback` is
+/// kept by.
+pub const INVESTIGATOR: &str = "m2.disguise_investigator";
+
+/// 0x82446790: an AI came onto her disguise's watcher list, or left it:
+/// calls the `InvestigatorCallback` with (player, ai, came).
+pub fn investigator(lua: &Lua, player: Option<u32>, ai: u32, came: bool) -> mlua::Result<()> {
+    if let Value::Function(f) = lua.named_registry_value::<Value>(INVESTIGATOR)? {
+        f.call::<()>((guid_value(player), guid_value(Some(ai)), came))?;
+    }
+    Ok(())
+}
+
 /// `Object.GetWinchState`'s names, by state (0x823336E8), and
 /// `Object.SetWinchState`'s (0x823337E8, by their hashes 0xA62D3A27,
 /// 0x07D744CF, 0x0A765168, 0xBB522D10).
@@ -194,6 +207,8 @@ impl Object {
 /// Something a script asked the game to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
+    /// What a script asked of a vehicle ([`crate::vehicle_state`]).
+    Vehicle(crate::vehicle_state::VehicleCommand),
     /// A hijack's own requests (`crate::hijack`).
     Hijack(crate::hijack::HijackCommand),
     /// Create `what` (an object template's name, such as `"Veyron"` or
@@ -253,6 +268,13 @@ pub enum Command {
         guid: u32,
         on: bool,
     },
+    /// An AI takes part in the living world or stops (`Ai.LivingWorld`
+    /// with `Attrib = "LivingWorldBehaviour"`): `MrxFollow` turns it off
+    /// for someone following her.
+    LivingWorld {
+        guid: u32,
+        on: bool,
+    },
     /// Shut a gate or door again (`Object.CloseGate`).
     CloseGate(u32),
     /// Whether `guid` may take up its weapons (`Human.DisableWeapons` and
@@ -268,6 +290,42 @@ pub enum Command {
     Usable {
         guid: u32,
         on: bool,
+    },
+    /// An AI's haste from here on (`Ai.SetHaste(ai, haste)`), held to
+    /// 0..=2 as the 360 code does (82311968).
+    SetHaste {
+        guid: u32,
+        haste: f32,
+    },
+    /// An AI keeps within `radius` metres of a point (`Ai.Anchor`): `at`,
+    /// or where `target` is, as the call gave one (from the 360 code,
+    /// 82310EB8: `AnchorGuid`, else `AnchorPosition`, else where the AI
+    /// itself stands).
+    Anchor {
+        guid: u32,
+        radius: f32,
+        target: Option<u32>,
+        at: Option<[f32; 3]>,
+    },
+    /// An object fades from sight over `seconds` (`Object.FadeOut(object,
+    /// seconds, flag)`); what the flag asks isn't known (OilCon001 passes
+    /// true as its executive leaves).
+    FadeOut {
+        guid: u32,
+        seconds: f32,
+        flag: bool,
+    },
+    /// An ambience by name starts or stops (`Sound.CueAmbience`,
+    /// `Sound.StopAmbience`).
+    Ambience {
+        name: String,
+        on: bool,
+    },
+    /// The spawners attached to object `guid` are changed
+    /// (`Ai.TweakAttachedSpawners`): each setting the call gave.
+    TweakSpawners {
+        guid: u32,
+        tweak: SpawnerTweak,
     },
     /// The player's fuel goes up by this (`Player.AddFuel`: a fuel
     /// pickup's script), up to the tanks' capacity.
@@ -739,6 +797,26 @@ pub const HONK_HEARD: f32 = 3.0;
 /// (`Object.SetInfiniteAmmo`), rounds (invented).
 pub const INFINITE_RESERVE: u32 = 999;
 
+/// `Pg.GetTetherDiameterStart`'s answer, metres (from the 360 code,
+/// 82446B68).
+pub const TETHER_DIAMETER_START: f64 = 400.0;
+
+/// What `Ai.TweakAttachedSpawners(object, settings)` changes of an
+/// object's spawners: the settings the call's table gave, `None` for
+/// those it left alone. From the 360 code (the table's reader, 8230CE00):
+/// `SpawnerState` and `SpawnList` are names (OilCon002 turns a balcony's
+/// spawner `"on"` with `"Spawnlist (VZ Balcony)"`), `ChanceNotActive`,
+/// `ChanceSkip` and `SecondsPerCycle` numbers. The reader takes one more
+/// field whose name was not made out.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SpawnerTweak {
+    pub state: Option<String>,
+    pub spawn_list: Option<String>,
+    pub chance_not_active: Option<f32>,
+    pub chance_skip: Option<f32>,
+    pub seconds_per_cycle: Option<f32>,
+}
+
 /// The scripts' view of the game, and what they asked of it.
 #[derive(Debug, Default)]
 pub struct ScriptWorld {
@@ -785,12 +863,17 @@ pub struct ScriptWorld {
     /// Assets asked for with a callback (`Pg.LoadAsset(name, type,
     /// callback, data)`): answered as loaded on the next tick
     /// ([`answer_asset_loads`]).
-    asset_loads: Vec<(Function, Value)>,
+    pub(crate) asset_loads: Vec<(Function, Value)>,
     /// The outlines of region objects (`LineRegion`), by the region's guid;
     /// placed at the object's position and yaw.
     pub regions: HashMap<u32, m2_assets::Region>,
     /// The object link table ([`crate::links`]).
     pub links: crate::links::Links,
+    /// The sound engine's state the scripts set (`crate::script_sound`).
+    pub sound: crate::script_sound::SoundSettings,
+    /// The level and shell names and the post-processing values the
+    /// scripts set (`crate::script_shell`).
+    pub shell: crate::script_shell::ShellState,
     /// What `Pg.GetAllLandingZones(kind)` answers, by kind: the zones by
     /// their number. The transit script reads kinds 1 and 2 (where each
     /// player lands) as tables keyed alike.
@@ -888,9 +971,16 @@ pub struct ScriptWorld {
     /// who carries whom (`Human.IsCarrying`) ([`crate::mission::Mission::set_human_state`]).
     pub human_states: HashMap<u32, String>,
     pub state_changes: Vec<crate::events::StateChange>,
+    /// How fast objects move, m/s, as the game last said
+    /// ([`crate::mission::Mission::set_speed`]); none for one at rest or
+    /// never reported (`Object.GetVelocity`).
+    pub speeds: HashMap<u32, f32>,
     /// What characters did with their weapons, for `WeaponEvent` events
     /// ([`crate::mission::Mission::weapon_event`]).
     pub weapon_events: Vec<crate::events::WeaponChange>,
+    /// The points of the layers' path entities in the world, by guid
+    /// (`Pg.GetDistantSpawnPointOnPath` walks one).
+    pub paths: HashMap<u32, Vec<[f32; 3]>>,
     pub carrying: HashMap<u32, u32>,
     /// Events met in the clips the scripts play by name
     /// (`Human.PlayRawAnimation`: the briefings' `CinematicStart` and
@@ -927,6 +1017,8 @@ pub struct ScriptWorld {
     pub reports: crate::report::Reports,
     /// The pursuit as the scripts set it ([`Pursuit`]).
     pub pursuit: Pursuit,
+    /// The `Sys` flags: build switches and the player's options.
+    pub sys_flags: crate::script_flags::SysFlags,
     /// The engine's game and real clocks (`Sys.MainTime`, the time
     /// stamps), stepped each frame.
     pub clocks: crate::script_time::Clocks,
@@ -936,10 +1028,20 @@ pub struct ScriptWorld {
     /// mission flow turns them off for a new game and back on only once
     /// OilCon021 is done, so off until a script says otherwise.
     pub vehicle_disguise: bool,
+    /// `Player.SetVehicleControlsLock`: her vehicle's controls locked.
+    pub vehicle_controls_locked: bool,
+    /// `Player.VehicleDisguise`'s `AutoRemove`.
+    pub vehicle_disguise_auto_remove: bool,
+    /// The vehicle entrance markers' settings, by player
+    /// ([`crate::vehicle_state::EntranceMarkers`]).
+    pub entrance_markers: [crate::vehicle_state::EntranceMarkers; 2],
     /// Her disguise while she drives another faction's vehicle with
     /// disguises on: how much is left (0..=100) and whether it holds.
     /// `None` out of one.
     pub disguise: Option<(f32, bool)>,
+    /// `Player.GetVehicleDisguiseState`'s second answer: the owner-chain
+    /// root she is seen as (0x82445778), as the game last said.
+    pub disguise_seen_as: Option<u32>,
     /// The friendly faction gates in play: objects the engine runs
     /// `friendlygate` on ([`crate::mission::OBJECT_SCRIPTS`]).
     pub gates: HashSet<u32>,
@@ -965,6 +1067,12 @@ pub struct ScriptWorld {
     /// its last look (it looks at those `ObjectIsVisible` events wait
     /// for: [`crate::mission::Mission::sight_watched`]).
     pub unseen: HashSet<u32>,
+    /// The vehicles off the ground, as the game last said
+    /// ([`World::grounded`]: anything not here stands on it).
+    pub airborne: HashSet<u32>,
+    /// The vehicles lying flipped, as the game last said
+    /// (`Vehicle.IsFlipped`).
+    pub flipped: HashSet<u32>,
     /// The vehicles' seats and who sits in which
     /// ([`crate::vehicle_seats`]).
     pub seats: crate::vehicle_seats::Seats,
@@ -1364,6 +1472,9 @@ impl World for ScriptWorld {
     fn vehicle_of(&self, guid: u32) -> Option<u32> {
         self.objects.get(&guid)?.vehicle
     }
+    fn grounded(&self, guid: u32) -> bool {
+        !self.airborne.contains(&guid)
+    }
     fn player(&self) -> Option<u32> {
         self.player
     }
@@ -1714,13 +1825,18 @@ pub const AUTOSAVE: &str = "autosave";
 
 /// The table of the game's own functions that hear the scripts' free
 /// support items (`AddFreebie`, `RemoveFreebie`).
+/// The global holding the port's own object-name lookup: `name =
+/// __m2_object_name(guid)`, the text `Object.GetName` gave before it
+/// answered the 360's hash.
+pub const OBJECT_NAME: &str = "__m2_object_name";
+
 pub const SUPPORT_EARS: &str = "__m2_support";
 
 /// Installs the libraries over `world`. Functions not written here stay
 /// missing (or stubs, with `ScriptHost::stub_missing_globals`).
 /// The engine's libraries (the rest of the globals scripts use are their
 /// own modules); see `ScriptHost::complete_libraries`.
-pub const LIBRARIES: [&str; 28] = [
+pub const LIBRARIES: [&str; 29] = [
     "Ai",
     "Airstrike",
     "Camera",
@@ -1731,6 +1847,7 @@ pub const LIBRARIES: [&str; 28] = [
     "Gui",
     "Hud",
     "Human",
+    "Junk",
     "Marker",
     "Math",
     "Munitions",
@@ -1785,14 +1902,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // A string's hash, as the scripts key tables by name (their recruits'
     // states). The archive's name hash: the scripts only compare hashes
     // with each other, so any one hash they all share serves.
+    // The engine's hash, as light userdata (`crate::script_hash`).
     add(&lib("String")?, "GetHash", |_, _, a| {
-        values(a.first().and_then(|v| match v {
-            // A number (Lua 5.1 has no integers), whole on 32-bit builds.
-            Value::String(s) => Some(Value::Number(f64::from(m2_assets::name_hash(
-                &s.to_string_lossy(),
-            )))),
-            _ => None,
-        }))
+        Ok(crate::script_hash::get_hash_native(a))
+    })?;
+    add(&lib("ObjectState")?, "GetStringHash", |_, _, a| {
+        Ok(crate::script_hash::get_hash_native(a))
     })?;
 
     let debug = lib("Debug")?;
@@ -1810,6 +1925,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     add(&debug, "GetCallstack", |_, lua, _| {
         values([Value::String(lua.create_string("")?)])
+    })?;
+
+    let junk = lib("Junk")?;
+    add(&junk, "FormatTime", |_, lua, a| {
+        crate::script_junk::format_time_native(lua, a)
+    })?;
+    add(&junk, "IsInstallable", |_, _, _| {
+        Ok(crate::script_junk::is_installable())
     })?;
 
     let pg = lib("Pg")?;
@@ -1922,6 +2045,49 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&pg, "FastCollectBuildings", |w, lua, a| {
         collect(w, lua, a, &["Building", "Structure"], &[])
     })?;
+    // Pg.GetAwakeObjects(x, y, z, radius, filter): the awake objects
+    // within the radius of the point, as a list (the gunship looks for
+    // what is in play within 100 m of where it aims). From the 360 code
+    // (823356B0): every awake object when the radius is left out or not
+    // above 0; the distance is in all three axes. Its last argument, an
+    // object filter to pass as well, isn't applied here: the scripts'
+    // one call gives none.
+    add(&pg, "GetAwakeObjects", |w, lua, a| {
+        let at = match (num(a.first()), num(a.get(1)), num(a.get(2))) {
+            (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+            _ => None,
+        };
+        let radius = num(a.get(if at.is_some() { 3 } else { 0 })).unwrap_or(-1.0);
+        let at = at.unwrap_or([0.0; 3]);
+        let mut found: Vec<u32> = w
+            .objects
+            .iter()
+            .filter(|&(&g, o)| {
+                let off = [
+                    at[0] - o.position[0],
+                    at[1] - o.position[1],
+                    at[2] - o.position[2],
+                ];
+                w.is_awake(g)
+                    && (radius <= 0.0
+                        || off[0] * off[0] + off[2] * off[2] + off[1] * off[1] <= radius * radius)
+            })
+            .map(|(&g, _)| g)
+            .collect();
+        found.sort_unstable();
+        let list = lua.create_table()?;
+        for (i, g) in found.into_iter().enumerate() {
+            list.raw_set(i + 1, guid_value(Some(g)))?;
+        }
+        values([Value::Table(list)])
+    })?;
+    // Pg.GetTetherDiameterStart(): how far apart the two players may be
+    // before the tether starts to pull, metres. From the 360 code
+    // (823385A8 reads it; 82446B68, the only code that sets it, makes it
+    // 400).
+    add(&pg, "GetTetherDiameterStart", |_, _, _| {
+        values([Value::Number(TETHER_DIAMETER_START)])
+    })?;
     add(&pg, "FastCollectHumans", |w, lua, a| {
         collect(w, lua, a, &["Human", "Soldier", "Civilian"], &[])
     })?;
@@ -2019,6 +2185,34 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             }
         }
         values([Value::Table(xs), Value::Table(zs)])
+    })?;
+    // Pg.GetDistantSpawnPointOnPath(path, from, other, distance): see
+    // [`crate::spawn_point`]. Gives true, x, y, z and a heading in
+    // degrees, or false alone.
+    add(&pg, "GetDistantSpawnPointOnPath", |w, _, a| {
+        let (Some(path), Some(from)) = (id(a.first()), id(a.get(1))) else {
+            return values([]);
+        };
+        // The third is the other object (0 for none); all four are
+        // needed.
+        let Some(distance) = num(a.get(3)) else {
+            return values([]);
+        };
+        let point = w
+            .paths
+            .get(&path)
+            .zip(w.place_of(from))
+            .and_then(|(points, from)| crate::spawn_point::distant(points, from, distance));
+        match point {
+            Some(p) if p.found => values([
+                Value::Boolean(true),
+                Value::Number(f64::from(p.at[0])),
+                Value::Number(f64::from(p.at[1])),
+                Value::Number(f64::from(p.at[2])),
+                Value::Number(f64::from(p.heading())),
+            ]),
+            _ => values([Value::Boolean(false)]),
+        }
     })?;
     add(&pg, "GetGuidByName", |w, _, a| {
         let g = match a.first() {
@@ -2241,6 +2435,50 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&object, "IsAwake", |w, _, a| {
         values([Value::Boolean(id(a.first()).is_some_and(|g| w.is_awake(g)))])
     })?;
+    // Object.IsHibernated(object): not awake. From the 360 code
+    // (82330BE8): the same test as `Object.IsAwake`'s (82330C90), turned
+    // round; nothing for what isn't an object.
+    add(&object, "IsHibernated", |w, _, a| match id(a.first()) {
+        Some(g) if w.objects.contains_key(&g) => values([Value::Boolean(!w.is_awake(g))]),
+        _ => values([]),
+    })?;
+    // Object.FadeOut(object, seconds, flag): the object fades from sight
+    // over the seconds; gives true. From the 360 code (8232FDB0): the
+    // object and the seconds are needed, the flag is false when left out.
+    add(&object, "FadeOut", |w, _, a| {
+        let (Some(guid), Some(seconds)) = (id(a.first()), num(a.get(1))) else {
+            return values([]);
+        };
+        w.commands.push(Command::FadeOut {
+            guid,
+            seconds,
+            flag: matches!(a.get(2), Some(Value::Boolean(true))),
+        });
+        values([Value::Boolean(true)])
+    })?;
+    // Object.GetVelocity(object): how fast it moves, one number (m/s),
+    // not a vector. From the 360 code (8232ED50): the length of a moving
+    // body's velocity, else the speed kept for it; nothing for what isn't
+    // an object.
+    add(&object, "GetVelocity", |w, _, a| match id(a.first()) {
+        Some(g) if w.objects.contains_key(&g) => {
+            let speed = w.speeds.get(&g).copied().unwrap_or(0.0);
+            values([Value::Number(f64::from(speed))])
+        }
+        _ => values([]),
+    })?;
+    // Object.IsVisible(object): whether it is awake and on the player's
+    // screen. From the 360 code (82331C10): false for one asleep, out of
+    // view or not in play; nothing when the call names no object.
+    add(&object, "IsVisible", |w, _, a| match id(a.first()) {
+        Some(g) => {
+            use crate::events::World as _;
+            values([Value::Boolean(
+                w.objects.contains_key(&g) && w.is_awake(g) && w.is_visible(g) == Some(true),
+            )])
+        }
+        None => values([]),
+    })?;
     add(&object, "GetHealth", |w, _, a| {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
         values([o.map_or(Value::Nil, |o| Value::Number(f64::from(o.health)))])
@@ -2379,6 +2617,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Weapons as objects: a loadout of templates, each weapon with its own
     // reserve of ammunition.
     crate::links::install(&lib, &add)?;
+    crate::script_sound::install(&lib, &add)?;
+    crate::script_shell::install(lua, &lib, &add)?;
     let human = lib("Human")?;
     // Human.SetAllowCorpseCleanup(character, allow): whether the game may
     // clear its body away (the verify objective keeps a target's until it
@@ -2629,15 +2869,22 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
-    add(&object, "GetName", |w, lua, a| {
+    // From the 360 code (`0x8232EF88`): the object's name hash, pushed as
+    // light userdata like `String.GetHash` (`crate::script_hash`), nil for
+    // a guid without a name (or a name hashing to 0). Not the name's
+    // text: the port's own Lua reads that with `OBJECT_NAME`.
+    add(&object, "GetName", |w, _, a| {
         let g = id(a.first());
         let o = g.and_then(|g| w.objects.get(&g));
         values([match (o, g) {
-            (Some(o), _) => Value::String(lua.create_string(&o.name)?),
+            (Some(o), _) => match crate::script_hash::engine_hash(o.name.as_bytes()) {
+                0 => Value::Nil,
+                h => crate::script_hash::hash_value(h),
+            },
             // A faction's name as the faction zones look it up: keyed by
             // `String.GetHash` of the name, which its guid already is.
             (None, Some(g)) if FACTIONS.iter().any(|f| m2_assets::name_hash(f) == g) => {
-                Value::Number(f64::from(g))
+                crate::script_hash::hash_value(g)
             }
             _ => Value::Nil,
         }])
@@ -2885,6 +3132,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&player, "GetCash", |w, _, _| {
         values([Value::Number(w.cash)])
     })?;
+    // Player.AddCash(amount): her cash goes up (or down) by a whole
+    // amount, and not below nothing. From the 360 code (8233F668): taking
+    // more than she has leaves her with none. `MrxPmc` pays back a
+    // client's reimbursement with it.
+    add(&player, "AddCash", |w, _, a| {
+        if let Some(amount) = num(a.first()) {
+            w.cash = (w.cash + f64::from(amount).trunc()).max(0.0);
+        }
+        values([])
+    })?;
     add(&player, "SetCash", |w, _, a| {
         if let Some(c) = num(a.first()) {
             w.cash = f64::from(c);
@@ -2983,10 +3240,32 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // `{ Player = character }`: whether her disguise holds, nil out of a
     // disguise (the disguise tutorial tells the two apart by
     // `tostring`).
+    // 0x82340B20: `Disguise.Init { InvestigatorCallback = f }` keeps `f`
+    // (0x83134548) for the disguise's watchers coming and going
+    // ([`investigator`]); true for a table, false without one.
+    let disguise = lib("Disguise")?;
+    add(&disguise, "Init", |_, lua, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([Value::Boolean(false)]);
+        };
+        match t.get::<Value>("InvestigatorCallback")? {
+            Value::Function(f) => lua.set_named_registry_value(INVESTIGATOR, f)?,
+            _ => lua.unset_named_registry_value(INVESTIGATOR)?,
+        }
+        values([Value::Boolean(true)])
+    })?;
+    // 0x82340438 ({ Player = p }): two answers, whether she is disguised
+    // (flag 0x40 with disguises on) and 0x82445778's value, the root of the
+    // owner chain (store 0x836539A4, 0x82251E68) of her vehicle while
+    // disguised, else of herself: inferred to be the faction she is seen
+    // as. Nil where the game hasn't said.
     add(&player, "GetVehicleDisguiseState", |w, _, _| {
-        values([w
-            .disguise
-            .map_or(Value::Nil, |(_, held)| Value::Boolean(held))])
+        let held = w.disguise.is_some_and(|(_, held)| held) && w.vehicle_disguise;
+        values([
+            w.disguise.map_or(Value::Nil, |_| Value::Boolean(held)),
+            w.disguise_seen_as
+                .map_or(Value::Nil, |g| Value::Number(f64::from(g))),
+        ])
     })?;
     // One player slot; the game creates the player itself.
     add(&player, "GetMaximumPlayers", |_, _, _| {
@@ -3037,11 +3316,25 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // ...and how many there are, which they compare and count with
     // (`nPlayers == 2`, `1 < n`; from the scripts' use: PirCon004 did
     // sums on it and stopped short of its ending).
+    // Player.IsCoopMultiplayer(): whether both players are in the game.
+    // From the 360 code (8233E058): player 0 and player 1 both joined.
+    // One player here.
+    add(&player, "IsCoopMultiplayer", |_, _, _| {
+        values([Value::Boolean(false)])
+    })?;
     add(&player, "GetCurrentPlayers", |_, _, _| {
         values([Value::Integer(1)])
     })?;
 
     let vehicle = lib("Vehicle")?;
+    // 0x82348358: whether a car lies flipped (the game's to say; the 360
+    // asks the physics object's vtable +0x9C). True only for a car.
+    add(&vehicle, "IsFlipped", |w, _, a| {
+        let Some(v) = id(a.first()) else {
+            return Err(mlua::Error::runtime("Vehicle.IsFlipped: bad argument"));
+        };
+        values([Value::Boolean(w.flipped.contains(&v))])
+    })?;
     add(&vehicle, "GetDriver", |w, _, a| {
         let driver = id(a.first()).and_then(|v| w.driver_of(v));
         values([guid_value(driver)])
@@ -3305,6 +3598,32 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // follower: `MrxFollow`'s VIP); another role ("Idle") ends it. The
     // rest of a role (its priorities, the callback when cancelled) is not
     // kept.
+    // Ai.LivingWorld({ AIGuid, Attrib, State }): see
+    // [`Command::LivingWorld`]. From the 360 code (82311238): the AI and
+    // the attribute are needed, the only attribute it knows is
+    // `"LivingWorldBehaviour"`, the state is true when left out, and it
+    // gives what setting it gave (taken here as whether there is such
+    // an AI), false otherwise.
+    add(&ai, "LivingWorld", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([Value::Boolean(false)]);
+        };
+        let guid = id(t.raw_get::<Value>("AIGuid").ok().as_ref());
+        let attrib = t.raw_get::<Option<String>>("Attrib").ok().flatten();
+        let on = match t.raw_get::<Value>("State")? {
+            Value::Boolean(b) => Some(b),
+            Value::Nil => None,
+            _ => Some(true),
+        };
+        let (Some(guid), Some(attrib), Some(on)) = (guid, attrib, on) else {
+            return values([Value::Boolean(false)]);
+        };
+        if !attrib.eq_ignore_ascii_case("LivingWorldBehaviour") || !w.objects.contains_key(&guid) {
+            return values([Value::Boolean(false)]);
+        }
+        w.commands.push(Command::LivingWorld { guid, on });
+        values([Value::Boolean(true)])
+    })?;
     add(&ai, "Role", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([]);
@@ -3386,6 +3705,78 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             let data = t.raw_get::<Value>("CallbackData")?;
             w.asset_loads.push((f, data));
         }
+        values([])
+    })?;
+    // Ai.SetHaste(ai, haste): the AI's haste from here on, held to 0..=2;
+    // gives whether there is such an AI. From the 360 code (82311968).
+    add(&ai, "SetHaste", |w, _, a| {
+        let (Some(guid), Some(haste)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Boolean(false)]);
+        };
+        if !w.objects.contains_key(&guid) {
+            return values([Value::Boolean(false)]);
+        }
+        w.commands.push(Command::SetHaste {
+            guid,
+            haste: haste.clamp(0.0, 2.0),
+        });
+        values([Value::Boolean(true)])
+    })?;
+    // Ai.Anchor({ AIGuid, AnchorRadius, AnchorGuid or AnchorPosition }):
+    // the AI keeps within the radius of the object or point given, else
+    // of where it stands; gives whether it had a place to anchor to.
+    // From the 360 code (82310EB8): the AI and the radius are needed.
+    add(&ai, "Anchor", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([Value::Boolean(false)]);
+        };
+        let (Some(guid), Some(radius)) = (
+            id(t.raw_get::<Value>("AIGuid").ok().as_ref()),
+            num(t.raw_get::<Value>("AnchorRadius").ok().as_ref()),
+        ) else {
+            return values([Value::Boolean(false)]);
+        };
+        let target = id(t.raw_get::<Value>("AnchorGuid").ok().as_ref()).filter(|&g| g != 0);
+        let at = match t.raw_get::<Value>("AnchorPosition")? {
+            Value::Table(l) => {
+                let c = |i| num(l.raw_get::<Value>(i).ok().as_ref());
+                match (c(1), c(2), c(3)) {
+                    (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if target.is_none() && at.is_none() && w.place_of(guid).is_none() {
+            return values([Value::Boolean(false)]);
+        }
+        w.commands.push(Command::Anchor {
+            guid,
+            radius,
+            target,
+            at: if target.is_some() { None } else { at },
+        });
+        values([Value::Boolean(true)])
+    })?;
+    // Ai.TweakAttachedSpawners(object, settings): see [`SpawnerTweak`].
+    // From the 360 code (8230D450): the object and the table are needed,
+    // and it gives nothing.
+    add(&ai, "TweakAttachedSpawners", |w, _, a| {
+        let (Some(guid), Some(Value::Table(t))) = (id(a.first()), a.get(1)) else {
+            return values([]);
+        };
+        let name = |k: &str| t.raw_get::<Option<String>>(k).ok().flatten();
+        let number = |k: &str| num(t.raw_get::<Value>(k).ok().as_ref());
+        w.commands.push(Command::TweakSpawners {
+            guid,
+            tweak: SpawnerTweak {
+                state: name("SpawnerState"),
+                spawn_list: name("SpawnList"),
+                chance_not_active: number("ChanceNotActive"),
+                chance_skip: number("ChanceSkip"),
+                seconds_per_cycle: number("SecondsPerCycle"),
+            },
+        });
         values([])
     })?;
     add(&ai, "Goal", |w, _, a| {
@@ -3567,6 +3958,29 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.commands.push(Command::CueSound {
                 at: id(a.first()).filter(|&g| g != 0),
                 cue: cue.to_string_lossy(),
+            });
+        }
+        values([])
+    })?;
+
+    // Sound.CueAmbience(name) and Sound.StopAmbience(name): an ambience
+    // by name (OilCon001's `ksMissionAmbience`). From the 360 code
+    // (82342F28, 82342FB0): the name is needed, and neither gives
+    // anything.
+    add(&sound, "CueAmbience", |w, _, a| {
+        if let Some(Value::String(name)) = a.first() {
+            w.commands.push(Command::Ambience {
+                name: name.to_string_lossy(),
+                on: true,
+            });
+        }
+        values([])
+    })?;
+    add(&sound, "StopAmbience", |w, _, a| {
+        if let Some(Value::String(name)) = a.first() {
+            w.commands.push(Command::Ambience {
+                name: name.to_string_lossy(),
+                on: false,
             });
         }
         values([])
@@ -3922,6 +4336,83 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
     {
+        use crate::script_flags as f;
+        add(&sys, "IsFinalConfig", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "IsFinalConfig").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "NoHud", |w, _, _| {
+            Ok(f::yes_no(f::getter(&w.sys_flags, "NoHud").unwrap_or(false)))
+        })?;
+        add(&sys, "AutoLoad", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "AutoLoad").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "DisableAssetPreload", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "DisableAssetPreload").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "FinishedShell", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "FinishedShell").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "GetINILoadLastSave", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "GetINILoadLastSave").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "IsDemoMode", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "IsDemoMode").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "PlayIntroMovies", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "PlayIntroMovies").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "StartWithResources", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "StartWithResources").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "YAxisInverted", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "YAxisInverted").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "IsAutosaveEnabled", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "IsAutosaveEnabled").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "RumbleEnabled", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "RumbleEnabled").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "IsConfirmOnCircle", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "IsConfirmOnCircle").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "ForceNextAutosave", |w, _, _| {
+            w.sys_flags.force_next_autosave = true;
+            values([])
+        })?;
+        add(&sys, "SetAutosaveEnabled", |w, _, a| {
+            Ok(f::set_autosave(&mut w.sys_flags, a))
+        })?;
+        add(&sys, "HaveActiveProfile", |w, _, _| {
+            Ok(f::yes_no(w.sys_flags.have_profile))
+        })?;
+        add(&sys, "IsGermanSKU", |w, _, _| {
+            Ok(f::yes_no(w.sys_flags.german_sku))
+        })?;
         use crate::script_time::{self as t, ClockKind};
         add(&sys, "MainTime", |w, _, _| {
             Ok(t::time(&w.clocks, ClockKind::Main))
@@ -3942,9 +4433,6 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         add(&sys, "Clock", |_, _, _| Ok(t::clock()))?;
         add(&sys, "DiffTime", |_, _, a| t::diff_time_native(a))?;
     }
-    add(&sys, "GetLevelName", |_, lua, _| {
-        values([Value::String(lua.create_string("vz")?)])
-    })?;
     add(&sys, "GetIgnoreLayers", |_, lua, _| {
         values([Value::Table(lua.create_table()?)])
     })?;
@@ -4149,6 +4637,25 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     .set_name("=m2-objectfilter")
     .exec()?;
 
+    // The port's own name lookup (the HUD shims, tests): an object's name
+    // as text, which the scripts' `Object.GetName` no longer gives.
+    lua.globals().raw_set(
+        OBJECT_NAME,
+        safe_function(lua, {
+            let w = Rc::clone(world);
+            move |lua, args| {
+                let name = args
+                    .front()
+                    .and_then(|v| id(Some(v)))
+                    .and_then(|g| w.borrow().objects.get(&g).map(|o| o.name.clone()));
+                Ok(MultiValue::from_vec(vec![match name {
+                    Some(n) => Value::String(lua.create_string(&n)?),
+                    None => Value::Nil,
+                }]))
+            }
+        })?,
+    )?;
+
     // The game's assert: logged, and the script carries on, as a release
     // build would.
     lua.globals().raw_set(
@@ -4175,12 +4682,27 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         })?,
     )?;
     crate::hud::install(lua, world)?;
-    crate::layers::install(lua, world)
+    crate::layers::install(lua, world)?;
+    // Last, so the port's own versions (`Debug.Printf`) stay.
+    crate::script_noops::install(lua)?;
+    Ok(())
 }
 
 /// The objects in play within `a`'s radius of its point (x, y, z,
 /// radius) with any of the labels `with` and none of `without`, as a
 /// list ([`ScriptWorld::place_of`]: a rider is where its vehicle is).
+/// `Pg.FastCollect..`'s search over objects labelled `with` and none of
+/// `without` ([`collect`]).
+pub(crate) fn collect_labelled(
+    w: &mut ScriptWorld,
+    lua: &Lua,
+    a: &[Value],
+    with: &[&str],
+    without: &[&str],
+) -> mlua::Result<MultiValue> {
+    collect(w, lua, a, with, without)
+}
+
 fn collect(
     w: &mut ScriptWorld,
     lua: &Lua,
@@ -4500,6 +5022,51 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_modules_calls_are_answered() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.cash = 1000.0;
+            w.insert(70, Object::new("Near", [10.0, 0.0, 0.0]));
+            w.insert(71, Object::new("Far", [500.0, 0.0, 0.0]));
+        }
+        let (near, tether, living, wrong, nobody): (i64, f64, bool, bool, bool) = host
+            .lua()
+            .load(
+                r#"
+                local g = Sys.StringToGuid
+                Player.AddCash(250.9)
+                Player.AddCash(-5000)
+                Player.AddCash(40)
+                local list = Pg.GetAwakeObjects(0, 0, 0, 100)
+                local near = 0
+                for _, o in pairs(list) do if o == g("70") then near = near + 1 end
+                    if o == g("71") then near = near + 100 end end
+                return near, Pg.GetTetherDiameterStart(),
+                    Ai.LivingWorld({ AIGuid = g("70"), Attrib = "LivingWorldBehaviour", State = false }),
+                    Ai.LivingWorld({ AIGuid = g("70"), Attrib = "Other", State = false }),
+                    Ai.LivingWorld({ AIGuid = g("72"), Attrib = "LivingWorldBehaviour", State = false })
+                "#,
+            )
+            .eval()
+            .unwrap();
+        // Within 100 m and awake: the near one, not the far one.
+        assert_eq!(near, 1);
+        assert_eq!(tether, 400.0);
+        assert!(living && !wrong && !nobody);
+        let mut w = world.borrow_mut();
+        // 1000 + 250 (whole), then more taken than she has: none; + 40.
+        assert_eq!(w.cash, 40.0);
+        assert_eq!(
+            w.take_commands(),
+            [Command::LivingWorld {
+                guid: 70,
+                on: false
+            }]
+        );
+    }
+
+    #[test]
     fn gates_weapons_usable_vehicles_and_fuel_reach_the_game() {
         let (host, world) = setup();
         world.borrow_mut().fuel_capacity = Some(50.0);
@@ -4533,6 +5100,154 @@ mod tests {
     }
 
     #[test]
+    fn oilcon001s_calls_reach_the_game() {
+        let (host, world) = setup();
+        world
+            .borrow_mut()
+            .insert(70, Object::new("OilCon001_Exec", [5.0, 0.0, 7.0]));
+        let (hasty, nobody, anchored, bare, faded, hibernated, unknown): (
+            bool,
+            bool,
+            bool,
+            bool,
+            Value,
+            Value,
+            Value,
+        ) = host
+            .lua()
+            .load(
+                r#"
+                local exec = Sys.StringToGuid("70")
+                Sound.CueAmbience("amb_oilcon001")
+                Sound.StopAmbience("amb_oilcon001")
+                return Ai.SetHaste(exec, 5), Ai.SetHaste(Sys.StringToGuid("71"), 1),
+                    Ai.Anchor({ AIGuid = exec, AnchorRadius = 0 }),
+                    Ai.Anchor({ AIGuid = exec }),
+                    Object.FadeOut(exec, 1, true),
+                    Object.IsHibernated(exec),
+                    Object.IsHibernated(Sys.StringToGuid("71"))
+                "#,
+            )
+            .eval()
+            .unwrap();
+        // Haste is held to 0..=2; no such AI, no haste.
+        assert!(hasty && !nobody);
+        // Anchored where it stands; without a radius, not at all.
+        assert!(anchored && !bare);
+        assert_eq!(faded, Value::Boolean(true));
+        assert!(matches!(hibernated, Value::Boolean(_)));
+        assert_eq!(unknown, Value::Nil);
+        let commands = world.borrow_mut().take_commands();
+        assert_eq!(
+            commands,
+            [
+                Command::Ambience {
+                    name: "amb_oilcon001".into(),
+                    on: true
+                },
+                Command::Ambience {
+                    name: "amb_oilcon001".into(),
+                    on: false
+                },
+                Command::SetHaste {
+                    guid: 70,
+                    haste: 2.0
+                },
+                Command::Anchor {
+                    guid: 70,
+                    radius: 0.0,
+                    target: None,
+                    at: None
+                },
+                Command::FadeOut {
+                    guid: 70,
+                    seconds: 1.0,
+                    flag: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_spawn_point_down_the_path_and_a_spawner_tweak_reach_the_game() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(70, Object::new("OilCon001_Exec", [0.0, 0.0, 0.0]));
+            w.paths.insert(90, vec![[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]]);
+        }
+        let (found, x, y, z, heading, lost, bare): (bool, f64, f64, f64, f64, Value, Value) = host
+            .lua()
+            .load(
+                r#"
+                local g = Sys.StringToGuid
+                Ai.TweakAttachedSpawners(g("70"),
+                    { SpawnerState = "on", SpawnList = "Spawnlist (VZ Balcony)" })
+                local found, x, y, z, heading = Pg.GetDistantSpawnPointOnPath(g("90"), g("70"), 0, 60)
+                -- A path the game doesn't know: false alone.
+                local lost, more = Pg.GetDistantSpawnPointOnPath(g("91"), g("70"), 0, 60)
+                assert(more == nil)
+                return found, x, y, z, heading, lost, (Pg.GetDistantSpawnPointOnPath(g("90")))
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(found);
+        assert!((x - 60.0).abs() < 1e-3 && y == 0.0 && z.abs() < 1e-3);
+        assert!((heading - 90.0).abs() < 1e-3);
+        assert_eq!(lost, Value::Boolean(false));
+        assert_eq!(bare, Value::Nil);
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [Command::TweakSpawners {
+                guid: 70,
+                tweak: SpawnerTweak {
+                    state: Some("on".into()),
+                    spawn_list: Some("Spawnlist (VZ Balcony)".into()),
+                    ..SpawnerTweak::default()
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn the_oil_contracts_questions_are_answered() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(70, Object::new("OilCon003_Truck", [5.0, 0.0, 7.0]));
+            w.speeds.insert(70, 12.5);
+            w.insert(71, Object::new("OilCon003_Parked", [9.0, 0.0, 7.0]));
+        }
+        let (moving, parked, nothing, coop, unseen, no_object): (
+            f64,
+            f64,
+            Value,
+            bool,
+            Value,
+            Value,
+        ) = host
+            .lua()
+            .load(
+                r#"
+                local g = Sys.StringToGuid
+                return Object.GetVelocity(g("70")), Object.GetVelocity(g("71")),
+                    (Object.GetVelocity(g("72"))), Player.IsCoopMultiplayer(),
+                    Object.IsVisible(g("72")), (Object.IsVisible())
+                "#,
+            )
+            .eval()
+            .unwrap();
+        // A speed, not a vector; at rest, 0; no such object, nothing.
+        assert_eq!((moving, parked), (12.5, 0.0));
+        assert_eq!(nothing, Value::Nil);
+        assert!(!coop);
+        // Not in play: not visible. No object named: nothing.
+        assert_eq!(unseen, Value::Boolean(false));
+        assert_eq!(no_object, Value::Nil);
+    }
+
+    #[test]
     fn usable_answers_whether_it_was_handed_a_vehicle() {
         let (host, world) = setup();
         let (set, none, bare): (Value, Value, Value) = host
@@ -4553,6 +5268,7 @@ mod tests {
             [Command::Usable { guid: 50, on: true }]
         );
     }
+
     #[test]
     fn the_scripts_radio_playlists_are_kept_by_name_hash() {
         let (host, world) = setup();
@@ -4764,7 +5480,7 @@ mod tests {
                 local jeep = Pg.GetGuidByName("_global_veh_jeep 0x0001")
                 Object.SetPosition(jeep, x + 1, y, z)
                 Debug.Printf("jeep ", "moved")
-                return x, Object.GetName(jeep), Object.IsAlive(jeep) and Object.HasLabel(jeep, "Vehicle")
+                return x, __m2_object_name(jeep), Object.IsAlive(jeep) and Object.HasLabel(jeep, "Vehicle")
                 "#,
             )
             .eval()
@@ -4785,6 +5501,94 @@ mod tests {
     }
 
     #[test]
+    fn the_shell_and_post_processing_calls_answer_as_the_360_ones() {
+        let (host, world) = setup();
+        let (name, set, bad, a, b): (String, bool, usize, f64, f64) = host
+            .lua()
+            .load(
+                r#"
+                local before = Sys.GetLevelName()
+                local set = Sys.SetLevelName("vz_island")
+                Graphics.Bloom.SetThreshold(0.8)
+                local bad = select('#', Graphics.Contrast.SetLimit())
+                local a, b = Sys.GetVersion()
+                return before .. " " .. Sys.GetLevelName(), set, bad, a, b
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(
+            (name.as_str(), set, bad, a, b),
+            ("vz vz_island", true, 1, 100000.0, 100000.0)
+        );
+        assert_eq!(world.borrow().shell.bloom_threshold, Some(0.8));
+    }
+
+    #[test]
+    fn the_sound_settings_and_vo_calls_answer_as_the_360_ones() {
+        let (host, world) = setup();
+        let (vol, unset, bad, cancelled, paused, profile, sku): (
+            f32,
+            f32,
+            usize,
+            bool,
+            bool,
+            bool,
+            bool,
+        ) = host
+            .lua()
+            .load(
+                r#"
+                Sound.SetCategoryVolume("music", 0.5)
+                return Sound.GetCategoryVolume("music"), Sound.GetCategoryPitch("music"),
+                    select('#', Sound.SetCategoryVolume("music")),
+                    VO.CancelAll(), VO.Unpause(), Sys.HaveActiveProfile(), Sys.IsGermanSKU()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(
+            (vol, unset, bad, cancelled, paused, profile, sku),
+            (0.5, 1.0, 1, true, true, true, false)
+        );
+        host.lua()
+            .load(r#"Sound.TestCueSound("sfx_test")"#)
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [Command::CueSound {
+                at: Some(1),
+                cue: "sfx_test".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn object_get_name_answers_the_names_hash_as_on_the_360() {
+        let (host, _world) = setup();
+        let (same, kind, renamed, none): (bool, String, bool, bool) = host
+            .lua()
+            .load(
+                r#"
+                local jeep = Pg.GetGuidByName("_global_veh_jeep 0x0001")
+                local name = Object.GetName(jeep)
+                local same = name == String.GetHash("_global_veh_jeep 0x0001")
+                Object.SetName(jeep, "HqInterior")
+                local renamed = Object.GetName(jeep) == String.GetHash("HqInterior")
+                    and __m2_object_name(jeep) == "HqInterior"
+                return same, type(name), renamed, Object.GetName(Sys.StringToGuid("0x7ffe")) == nil
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(
+            (same, kind.as_str(), renamed, none),
+            (true, "userdata", true, true)
+        );
+    }
+
+    #[test]
     fn a_loadout_of_one_weapon_alone_is_given_too() {
         let (host, world) = setup();
         let name: String = host
@@ -4793,7 +5597,7 @@ mod tests {
                 r#"
                 local hero = Player.GetLocalCharacter()
                 Human.Inventory.SetAllWeapons(hero, Pg.GetGuidByName("Carbine"))
-                return Object.GetName(Human.Inventory.GetPrimaryWeapon(hero))
+                return __m2_object_name(Human.Inventory.GetPrimaryWeapon(hero))
                 "#,
             )
             .eval()
@@ -4838,7 +5642,7 @@ mod tests {
                     local gun = Human.Inventory.GetPrimaryWeapon(hero)
                     Weapon.SetReserveAmmo(gun, Weapon.GetMaxReserveAmmo(gun))
                     local all = Human.Inventory.GetAllWeapons(hero)
-                    return Object.GetName(gun), Weapon.GetReserveAmmo(all[2]),
+                    return __m2_object_name(gun), Weapon.GetReserveAmmo(all[2]),
                         Weapon.GetReserveAmmo(gun),
                         Object.GetParent(all[1]) == Pg.GetGuidByName("Carbine"),
                         Object.HasLabel(all[2], "Grenade"), #all
@@ -5514,8 +6318,18 @@ mod tests {
             )
             .exec()
             .unwrap();
-        let faction: f64 = host.lua().globals().get("faction").unwrap();
-        assert_eq!(faction as u32, m2_assets::name_hash("VZ"));
+        let faction: Value = host.lua().globals().get("faction").unwrap();
+        assert_eq!(
+            faction,
+            crate::script_hash::hash_value(m2_assets::name_hash("VZ"))
+        );
+        // A faction's guid is the hash of its name, and both are userdata.
+        let same: bool = host
+            .lua()
+            .load(r#"return String.GetHash("VZ") == faction and type(faction) == "userdata""#)
+            .eval()
+            .unwrap();
+        assert!(same);
         let crossed = || -> Vec<String> { host.lua().globals().get("crossed").unwrap() };
         assert!(events.update_shared(0.1, &world).is_empty());
         assert!(crossed().is_empty());
@@ -5604,6 +6418,26 @@ mod tests {
             ask("return Object.IsDisguised(Player.GetLocalCharacter())"),
             Value::Boolean(true)
         );
+        // Disguise.Init keeps the investigator callback (0x82340B20).
+        let ok: bool = host
+            .lua()
+            .load(
+                "seen = {} return Disguise.Init({InvestigatorCallback =                  function(p, ai, came) table.insert(seen, came) end})",
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
+        investigator(host.lua(), Some(1), 9, true).unwrap();
+        let seen: Vec<bool> = host.lua().load("return seen").eval().unwrap();
+        assert_eq!(seen, [true]);
+        // Two answers (0x82340438): disguised, and who she is seen as.
+        world.borrow_mut().disguise_seen_as = Some(42);
+        let (held, seen): (bool, f64) = host
+            .lua()
+            .load("return Player.GetVehicleDisguiseState({})")
+            .eval()
+            .unwrap();
+        assert_eq!((held, seen), (true, 42.0));
         ask("Player.SetVehicleDisguise(false)");
         assert_eq!(world.borrow().disguise, None);
         assert_eq!(ask("return Player.GetVehicleDisguiseState({})"), Value::Nil);
@@ -5733,7 +6567,7 @@ mod tests {
                 local cargo = Pg.SpawnFromCamera(crate, 4, 1, true, Player.GetLocalCharacter(), false, true)
                 local x, y, z = Pg.FindPointFromCamera(10, 50, 10)
                 return x, y, z, crate == Pg.GetGuidByName("Supply Drop (GL)"),
-                    Object.GetName(cargo), Pg.GetGuidByName("vza001_gate") == nil
+                    __m2_object_name(cargo), Pg.GetGuidByName("vza001_gate") == nil
                 "#,
             )
             .eval()
@@ -5907,7 +6741,7 @@ mod tests {
                 assert(Vehicle.GetDriver(jeep) == nil)
                 assert(Sound.GetAudioDir() .. "\\vo_x." .. Gui.GetLanguageName() == "data\\Audios\\vo_x.english")
                 Player.SetFuel(40)
-                return Object.GetName(Vehicle.GetDriver(copter)), #Vehicle.GetRiders(copter),
+                return __m2_object_name(Vehicle.GetDriver(copter)), #Vehicle.GetRiders(copter),
                     Player.GetFuel(), Player.GetMaximumPlayers(), Sound._GetLibVersion()
                 "#,
             )
@@ -5931,7 +6765,7 @@ mod tests {
                 .lua()
                 .load(
                     r#"local c = Pg.Spawn("Mi26 (VZA Intro) (Driver)", 0, 50, 0, 0)
-                    return c, Object.GetName(Vehicle.GetDriver(c))"#,
+                    return c, __m2_object_name(Vehicle.GetDriver(c))"#,
                 )
                 .eval::<(Value, String)>()
                 .unwrap();
@@ -5943,7 +6777,7 @@ mod tests {
             .lua()
             .load(
                 r#"local c = ...
-                return Object.GetName(Vehicle.GetDriver(c)), #Vehicle.GetRiders(c, "p"),
+                return __m2_object_name(Vehicle.GetDriver(c)), #Vehicle.GetRiders(c, "p"),
                     #Vehicle.GetRiders(c)"#,
             )
             .call(crate::events::guid_value(copter))
@@ -5980,7 +6814,7 @@ mod tests {
             .lua()
             .load(
                 r#"local copter = Pg.Spawn("AH1Z (Ewan)", 0, 50, 0, 0)
-                return Object.GetName(Vehicle.GetDriver(copter))"#,
+                return __m2_object_name(Vehicle.GetDriver(copter))"#,
             )
             .eval()
             .unwrap();
@@ -6093,7 +6927,7 @@ mod tests {
             .load(
                 r#"Ai.Goal({ AIGuid = Sys.StringToGuid("0x1"), Goal = "HeliLand",
                     Location = { 1, 2, 3 }, Callback = function(me, pilot, result)
-                        heard = { me, Object.GetName(pilot), result } end,
+                        heard = { me, __m2_object_name(pilot), result } end,
                     CallbackData = { "copter" } })"#,
             )
             .exec()

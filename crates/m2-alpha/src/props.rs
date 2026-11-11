@@ -67,6 +67,8 @@ pub struct Prop {
     /// island one whose model has no collision of its own is in nobody's
     /// way; here it is only logged ([`through_on_island`]).
     pub named: bool,
+    /// Its template's collision preset ([`m2_engine::collision_layers::Preset`]).
+    pub preset: m2_engine::collision_layers::Preset,
 }
 
 /// A model's GPU copy and collision, once loaded, and how it breaks
@@ -113,6 +115,8 @@ pub struct Props {
     reach: f32,
     /// Those knocked loose: their pieces, in [`Loose`] order.
     knocked: HashMap<u32, Vec<DebrisId>>,
+    /// The templates' collision presets, from the first put up.
+    presets: Option<HashMap<u32, m2_engine::collision_layers::Preset>>,
     /// Those riding loose on a vehicle's load bed (PirCon002's rum jugs on
     /// its truck, OilCon020's guns on the El Grande): [`Props::load`].
     cargo: HashMap<u32, Riding>,
@@ -420,8 +424,12 @@ impl Props {
                 wrecked,
                 template: o.template,
                 named: o.named,
+                preset: db.presets.get(&o.template).copied().unwrap_or_default(),
             },
         );
+        if self.presets.is_none() {
+            self.presets = Some(db.presets.clone());
+        }
         if let Some(&kg) = db.piece_masses.get(&o.template) {
             self.piece_mass.insert(e, kg);
         }
@@ -467,6 +475,11 @@ impl Props {
                 wrecked: false,
                 template: o.template,
                 named: o.named,
+                preset: self
+                    .presets
+                    .as_ref()
+                    .and_then(|p| p.get(&o.template).copied())
+                    .unwrap_or_default(),
             },
         );
         self.changed();
@@ -1007,7 +1020,13 @@ impl Props {
             && !p.wrecked
             && stands(entity)
         {
-            physics.add_static(StaticKey::Entity(entity), shape, p.position, p.rotation);
+            physics.add_static_as(
+                StaticKey::Entity(entity),
+                shape,
+                p.position,
+                p.rotation,
+                p.preset,
+            );
         }
     }
 
@@ -1463,7 +1482,13 @@ impl Props {
                 && !self.knocked.contains_key(&e)
                 && !physics.has_static(StaticKey::Entity(e))
             {
-                physics.add_static(StaticKey::Entity(e), shape, p.position, p.rotation);
+                physics.add_static_as(
+                    StaticKey::Entity(e),
+                    shape,
+                    p.position,
+                    p.rotation,
+                    p.preset,
+                );
             }
         }
         let Some(loaders) = &self.loaders else {
@@ -1616,7 +1641,13 @@ impl Props {
                     through.push(format!("{e:#x} (template {:08x})", p.template));
                 }
                 if !p.wrecked && !self.knocked.contains_key(&e) {
-                    physics.add_static(StaticKey::Entity(e), shape, p.position, p.rotation);
+                    physics.add_static_as(
+                        StaticKey::Entity(e),
+                        shape,
+                        p.position,
+                        p.rotation,
+                        p.preset,
+                    );
                 }
             }
             if !through.is_empty() {
@@ -2136,6 +2167,7 @@ mod tests {
             wrecked: false,
             template: 0,
             named: true,
+            preset: Default::default(),
         };
         assert!(stands(5) && !through_on_island(&p, &shape));
         // Cut from its drawn triangles: the island puts none up for one

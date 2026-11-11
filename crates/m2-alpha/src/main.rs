@@ -110,6 +110,7 @@ mod support;
 mod touch;
 mod traffic;
 mod ui;
+mod winches;
 
 use crate::hero::Hero;
 use std::collections::{HashMap, HashSet};

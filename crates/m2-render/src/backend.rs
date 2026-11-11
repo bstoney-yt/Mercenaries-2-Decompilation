@@ -91,6 +91,10 @@ pub struct Lighting {
     /// Direction the sunlight travels (from the sun towards the ground),
     /// world space. Need not be normalised.
     pub sun_direction: Vec3,
+    /// Direction the sun's shadows are cast along, when not the
+    /// sunlight's own (the game casts them from a sun never lower than
+    /// about 18 degrees: see `m2_engine::atmosphere`).
+    pub shadow_direction: Option<Vec3>,
     /// Linear RGB (see [`gamma_light`](Self::gamma_light)).
     pub sun_color: Vec3,
     /// Linear RGB light reaching surfaces from every side, by the way they
@@ -175,6 +179,11 @@ pub struct ToneMap {
     pub min_key: f32,
     pub max_key: f32,
     pub retention: f32,
+    /// `BloomAdaptiveLuminanceScale`: how fast the eye follows. Each
+    /// frame it keeps `retention ^ (speed * dt)` of the luminance it had,
+    /// `dt` held within 1/120 and 0.1 s (from the 360 code, 0x821BD348:
+    /// its `adaptiveParams`, which the game's adaptation shader takes).
+    pub speed: f32,
     pub contrast_limit: f32,
     pub contrast: f32,
     /// Adapt to the frame's geometric mean luminance (of display values)
@@ -317,6 +326,7 @@ impl Default for Lighting {
     fn default() -> Self {
         Self {
             sun_direction: Vec3::new(-0.4, -1.0, 0.3),
+            shadow_direction: None,
             sun_color: Vec3::new(1.0, 0.95, 0.85),
             // Sky above, warm bounce from the ground below.
             ambient_cube: [

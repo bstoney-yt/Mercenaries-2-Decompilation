@@ -1964,7 +1964,7 @@ impl Npc {
                     let to = end - from;
                     let length = to.length();
                     physics
-                        .cast_ray_keyed(from, to, length)
+                        .cast_ray_sight_keyed(from, to, length)
                         .and_then(|(t, _, key)| Some((t, key?)))
                         .filter(|&(t, _)| t > length - t)
                         .map(|(t, key)| (from + to.normalize_or_zero() * t, key))
