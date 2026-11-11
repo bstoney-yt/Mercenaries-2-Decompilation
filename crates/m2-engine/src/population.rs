@@ -309,6 +309,9 @@ pub struct SpawnerSlot {
     pub group: u32,
     pub state: u32,
     pub chance_not_active: u8,
+    /// Its `SpawnerType`: one of type
+    /// [`crate::ai_anchor::ANCHORING_SPAWNER`] anchors whom it sends.
+    pub kind: u32,
 }
 
 /// Spawn entities for an entity's second and later spawner records start
@@ -358,6 +361,7 @@ pub fn spawner_records(c: &Component<'_>) -> Vec<(Spawner, SpawnerSlot)> {
                     group: word(r, group).unwrap_or(0),
                     state: word(r, state).unwrap_or(1),
                     chance_not_active: r.get(chance).copied().unwrap_or(0),
+                    kind: word(r, kind).unwrap_or(0),
                 },
             ))
         })

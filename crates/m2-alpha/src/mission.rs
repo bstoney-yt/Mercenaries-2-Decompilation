@@ -3408,6 +3408,31 @@ impl MissionLink {
                                 (*rounds * combat::RIFLE_CLIP).min(combat::RIFLE_SPARE);
                         }
                     }
+                    // The scripts anchor someone (`Ai.Anchor`): to the
+                    // object or the point they name, else where the
+                    // person stands (from the 360 code, 82310EB8).
+                    Command::Anchor {
+                        guid,
+                        radius,
+                        target,
+                        at,
+                    } => {
+                        let place = target
+                            .and_then(|t| {
+                                mission.world().borrow().objects.get(&t).map(|o| o.position)
+                            })
+                            .or(*at)
+                            .map(Vec3::from);
+                        let done = game.scene.people.anchor(*guid, place, *radius);
+                        eprintln!(
+                            "mission: {guid:#x} is anchored within {radius} m of {place:.1?}{}",
+                            if done {
+                                ""
+                            } else {
+                                ": not in play, and no place given"
+                            }
+                        );
+                    }
                     // The scripts' changes to an object's attached
                     // spawners: which of them send anyone, and how often.
                     Command::TweakSpawners { guid, record } => {
@@ -4413,7 +4438,11 @@ impl MissionLink {
         if objectives.is_empty() {
             objectives = hud.mission.iter().map(|(t, _)| mission.text(t)).collect();
         }
-        objectives.dedup();
+        // Each text once, in order: the map has an objective for each
+        // target, with its job's text (a log listed "Destroy targets
+        // (0/13)" six times for two jobs' 26 targets).
+        let mut seen = HashSet::new();
+        objectives.retain(|o| seen.insert(o.clone()));
         let discs = hud
             .discs
             .values()
