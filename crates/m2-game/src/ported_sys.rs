@@ -92,7 +92,8 @@ fn boolean(v: Option<&Value>) -> Option<bool> {
 
 fn integer(v: Option<&Value>) -> Option<i32> {
     match v? {
-        Value::Integer(i) => i32::try_from(*i).ok(),
+        // Through f64: `mlua::Integer` is i32 on i686 and i64 elsewhere.
+        Value::Integer(i) => Some(*i as f64 as i32),
         Value::Number(n) if n.is_finite() => Some(*n as i32),
         _ => None,
     }
