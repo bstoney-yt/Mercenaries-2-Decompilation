@@ -784,6 +784,9 @@ pub struct ScriptWorld {
     pub music: crate::music::Music,
     /// The environmental reverb.
     pub reverb: crate::reverb::Reverb,
+    /// What the single-player ports of missing natives keep
+    /// ([crate::ported_sp]).
+    pub sp: crate::ported_sp::SpState,
     /// Why each object is invincible (`Object.SetInvincible` reasons).
     pub invincible: HashMap<u32, std::collections::BTreeSet<String>>,
     /// The play area's boundaries (`Player.AddBoundary`: story-stage
@@ -1668,6 +1671,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     };
 
     crate::airstrike::install(&lib("Airstrike")?, &add)?;
+    crate::ported_sp::install(&lib, &add)?;
     crate::shop::install(lua, &lib("Hud")?)?;
 
     // A string's hash, as the scripts key tables by name (their recruits'
