@@ -133,6 +133,8 @@ pub struct Game {
     /// The scripts' vehicles whose load bed's goods were logged (taken up,
     /// or what stood near and why not), by index.
     beds_told: HashSet<usize>,
+    /// The helicopters' winches ([`crate::winches`]).
+    pub winches: crate::winches::Winches,
     /// Layer entities of the island's vehicles asked for so far.
     fetched: HashSet<u32>,
     /// The island's traffic spawners and what they have out.
@@ -460,6 +462,7 @@ impl Game {
             beds: HashMap::new(),
             bed_shapes: HashMap::new(),
             beds_told: HashSet::new(),
+            winches: Default::default(),
             fetched: HashSet::new(),
             traffic: crate::traffic::Traffic::default(),
             gunships: crate::gunships::Gunships::default(),
@@ -1667,6 +1670,44 @@ impl Game {
                         .or_insert_with(|| bed_shape(source, v.spec.model));
                 }
             }
+        }
+        // The helicopters with a `Winch` get theirs, hung from their
+        // `WinchBone` node; then each winch's update for the frame's steps.
+        if let (Some(source), Some(world)) = (self.scene.source.as_mut(), self.scene.world.as_mut())
+        {
+            for v in &self.scene.vehicles {
+                let Some(id) = v.id else { continue };
+                if !self.winches.unseen(id) {
+                    continue;
+                }
+                let params = world
+                    .index
+                    .template_db
+                    .winch_for(&v.spec.label, v.spec.model);
+                let at = params.and_then(|p| {
+                    let bone = p.bone?;
+                    crate::hijack::nodes(source, v.spec.model)
+                        .into_iter()
+                        .find(|(n, _)| *n == bone)
+                        .map(|(_, at)| at)
+                });
+                if let (Some(p), Some(at)) = (params, at) {
+                    eprintln!(
+                        "winch: {} has one, {} m of cable at {at:.2?}",
+                        v.spec.label, p.length
+                    );
+                    self.winches.add(id, p, at);
+                } else if params.is_some() {
+                    eprintln!(
+                        "winch: {}'s WinchBone is not a node of its model: none",
+                        v.spec.label
+                    );
+                }
+            }
+            let physics = &mut world.physics;
+            self.winches
+                .retain(|id| physics.vehicle_transform(id).is_some());
+            self.winches.step(physics, dt);
         }
         // Each one's own collision goes on it for the goods on its bed.
         if let Some(world) = &mut self.scene.world {
