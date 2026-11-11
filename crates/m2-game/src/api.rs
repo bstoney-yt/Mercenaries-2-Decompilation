@@ -874,6 +874,8 @@ pub struct ScriptWorld {
     /// The level and shell names and the post-processing values the
     /// scripts set (`crate::script_shell`).
     pub shell: crate::script_shell::ShellState,
+    /// `Sys.RequiredAsset`'s list and `CameraFade` (`crate::script_effects`).
+    pub effects: crate::script_effects::EffectsState,
     /// What `Pg.GetAllLandingZones(kind)` answers, by kind: the zones by
     /// their number. The transit script reads kinds 1 and 2 (where each
     /// player lands) as tables keyed alike.
@@ -2619,6 +2621,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     crate::links::install(&lib, &add)?;
     crate::script_sound::install(&lib, &add)?;
     crate::script_shell::install(lua, &lib, &add)?;
+    crate::script_effects::install(lua, &lib, &add)?;
     let human = lib("Human")?;
     // Human.SetAllowCorpseCleanup(character, allow): whether the game may
     // clear its body away (the verify objective keeps a target's until it

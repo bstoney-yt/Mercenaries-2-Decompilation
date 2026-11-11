@@ -22,6 +22,7 @@ pub mod report;
 pub mod reverb;
 pub mod savedata;
 pub mod script;
+pub mod script_effects;
 pub mod script_flags;
 pub mod script_hash;
 pub mod script_junk;
