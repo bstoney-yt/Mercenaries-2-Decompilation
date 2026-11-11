@@ -845,6 +845,9 @@ pub struct ScriptWorld {
     /// who carries whom (`Human.IsCarrying`) ([`crate::mission::Mission::set_human_state`]).
     pub human_states: HashMap<u32, String>,
     pub state_changes: Vec<crate::events::StateChange>,
+    /// What characters did with their weapons, for `WeaponEvent` events
+    /// ([`crate::mission::Mission::weapon_event`]).
+    pub weapon_events: Vec<crate::events::WeaponChange>,
     pub carrying: HashMap<u32, u32>,
     /// Events met in the clips the scripts play by name
     /// (`Human.PlayRawAnimation`: the briefings' `CinematicStart` and
@@ -1377,6 +1380,10 @@ impl World for ScriptWorld {
 
     fn state_changes(&self) -> &[crate::events::StateChange] {
         &self.state_changes
+    }
+
+    fn weapon_events(&self) -> &[crate::events::WeaponChange] {
+        &self.weapon_events
     }
 
     fn animation_events(&self) -> &[(f64, u32, String)] {
