@@ -889,6 +889,13 @@ pub struct ScriptWorld {
     /// mission flow turns them off for a new game and back on only once
     /// OilCon021 is done, so off until a script says otherwise.
     pub vehicle_disguise: bool,
+    /// `Player.SetVehicleControlsLock`: her vehicle's controls locked.
+    pub vehicle_controls_locked: bool,
+    /// `Player.VehicleDisguise`'s `AutoRemove`.
+    pub vehicle_disguise_auto_remove: bool,
+    /// The vehicle entrance markers' settings, by player
+    /// ([`crate::vehicle_state::EntranceMarkers`]).
+    pub entrance_markers: [crate::vehicle_state::EntranceMarkers; 2],
     /// Her disguise while she drives another faction's vehicle with
     /// disguises on: how much is left (0..=100) and whether it holds.
     /// `None` out of one.
@@ -3921,6 +3928,18 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 /// The objects in play within `a`'s radius of its point (x, y, z,
 /// radius) with any of the labels `with` and none of `without`, as a
 /// list ([`ScriptWorld::place_of`]: a rider is where its vehicle is).
+/// `Pg.FastCollect..`'s search over objects labelled `with` and none of
+/// `without` ([`collect`]).
+pub(crate) fn collect_labelled(
+    w: &mut ScriptWorld,
+    lua: &Lua,
+    a: &[Value],
+    with: &[&str],
+    without: &[&str],
+) -> mlua::Result<MultiValue> {
+    collect(w, lua, a, with, without)
+}
+
 fn collect(
     w: &mut ScriptWorld,
     lua: &Lua,

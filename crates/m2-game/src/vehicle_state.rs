@@ -71,6 +71,12 @@ pub enum VehicleCommand {
         steer: f32,
     },
     RestoreHealth(u32),
+    /// `Sound.SetVehicleEngineBoost` (0x823435C8): the vehicle's engine
+    /// sound's boost (+0x30 of its sound object), while sound is on.
+    EngineBoost {
+        vehicle: u32,
+        boost: f32,
+    },
     RestoreAmmo(u32),
     ClearControls(u32),
 }
@@ -199,6 +205,109 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             .push(Command::Vehicle(VehicleCommand::RestoreAmmo(v)));
         Ok(MultiValue::new())
     })?;
+    let lib = |name: &str| -> mlua::Result<Table> {
+        match globals.get::<Value>(name)? {
+            Value::Table(t) => Ok(t),
+            _ => {
+                let t = lua.create_table()?;
+                globals.raw_set(name, &t)?;
+                Ok(t)
+            }
+        }
+    };
+    // 0x82335110: as `FastCollectGroundVehicles` (0x82334FE8, its kinds 3
+    // and 2), only kind 2: no tanks.
+    add(
+        &lib("Pg")?,
+        "FastCollectGroundVehiclesExceptTanks",
+        |w, lua, a| {
+            crate::api::collect_labelled(
+                w,
+                lua,
+                a,
+                &["Vehicle"],
+                &["helicopter", "Plane", "Aircraft", "Tank"],
+            )
+        },
+    )?;
+    let player = lib("Player")?;
+    // 0x8233DBD8: her player record's +0x450, true.
+    add(&player, "SetVehicleControlsLock", |w, _, a| {
+        if id(a.first()).is_none_or(|p| Some(p) != w.player) {
+            return Err(bad("SetVehicleControlsLock"));
+        }
+        w.vehicle_controls_locked = matches!(a.get(1), Some(Value::Boolean(true)));
+        ok(true)
+    })?;
+    // 0x823402B8: `{Player = p, Callback = f, AutoRemove = b}` keeps `f`
+    // for her vehicle disguise (the player's +0x420, `AutoRemove` +0x428
+    // bit 4) and answers true; `Remove = true` drops it.
+    add(&player, "VehicleDisguise", |w, lua, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return ok(false);
+        };
+        let who = t.get::<Value>("Player")?;
+        if id(Some(&who)).is_none_or(|p| Some(p) != w.player) {
+            return ok(false);
+        }
+        if matches!(t.get::<Value>("Remove")?, Value::Boolean(true)) {
+            lua.unset_named_registry_value(DISGUISE_CALLBACK)?;
+            w.vehicle_disguise_auto_remove = false;
+            return ok(false);
+        }
+        match t.get::<Value>("Callback")? {
+            Value::Function(f) => {
+                lua.set_named_registry_value(DISGUISE_CALLBACK, f)?;
+                w.vehicle_disguise_auto_remove =
+                    matches!(t.get::<Value>("AutoRemove")?, Value::Boolean(true));
+                ok(true)
+            }
+            _ => ok(false),
+        }
+    })?;
+    let gui = lib("Gui")?;
+    // 0x8231C090, 0x8231C120, 0x8231C238: per player (second argument,
+    // 1 unless given) the entrance markers' distance (kept squared), on or
+    // off, and size (0x20 unless given).
+    add(
+        &gui,
+        "SetVehicleEntranceMarkerVisibleDistance",
+        |w, _, a| {
+            let Some(d) = num(a.first()) else {
+                return Err(bad("SetVehicleEntranceMarkerVisibleDistance"));
+            };
+            let p = player_index(a.get(1));
+            w.entrance_markers[p].distance_squared = d * d;
+            Ok(MultiValue::new())
+        },
+    )?;
+    add(&gui, "EnableVehicleEntranceMarkers", |w, _, a| {
+        let Some(Value::Boolean(on)) = a.first() else {
+            return Err(bad("EnableVehicleEntranceMarkers"));
+        };
+        let p = player_index(a.get(1));
+        w.entrance_markers[p].on = *on;
+        Ok(MultiValue::new())
+    })?;
+    add(&gui, "SetVehicleEntranceMarkerSize", |w, _, a| {
+        let size = num(a.first()).map_or(0x20, |n| n as u8);
+        let p = player_index(a.get(1));
+        w.entrance_markers[p].size = size;
+        Ok(MultiValue::new())
+    })?;
+    add(&lib("Sound")?, "SetVehicleEngineBoost", |w, _, a| {
+        let (Some(vehicle), Some(boost)) = (id(a.first()), num(a.get(1))) else {
+            return Err(mlua::Error::runtime(
+                "Sound.SetVehicleEngineBoost: bad argument",
+            ));
+        };
+        w.commands
+            .push(Command::Vehicle(VehicleCommand::EngineBoost {
+                vehicle,
+                boost,
+            }));
+        Ok(MultiValue::new())
+    })?;
     add(&vehicle, "ClearControls", |w, _, a| {
         let Some(v) = id(a.first()) else {
             return Err(bad("ClearControls"));
@@ -208,6 +317,39 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
         Ok(MultiValue::new())
     })?;
     Ok(())
+}
+
+/// The Lua registry name `Player.VehicleDisguise`'s callback is kept by.
+pub const DISGUISE_CALLBACK: &str = "m2.vehicle_disguise_callback";
+
+/// A player number argument (1 or 2; 1 unless given) as an index.
+fn player_index(v: Option<&Value>) -> usize {
+    match v {
+        Some(Value::Integer(2)) => 1,
+        Some(Value::Number(n)) if *n == 2.0 => 1,
+        _ => 0,
+    }
+}
+
+/// The vehicle entrance markers' settings for a player (the `Gui` calls,
+/// 0x82F14440 / 0x82F14454 / 0x82F1442C by player).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EntranceMarkers {
+    pub on: bool,
+    pub distance_squared: f32,
+    pub size: u8,
+}
+
+impl Default for EntranceMarkers {
+    /// Inferred: on, at the 360's untouched globals' zero distance, size
+    /// 0x20 (the size call's default).
+    fn default() -> Self {
+        Self {
+            on: true,
+            distance_squared: 0.0,
+            size: 0x20,
+        }
+    }
 }
 
 fn turret(w: &mut ScriptWorld, a: &[Value], yaw: bool) -> mlua::Result<MultiValue> {
