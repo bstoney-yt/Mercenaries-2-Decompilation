@@ -814,6 +814,9 @@ pub struct ScriptWorld {
     pub asset_request_max: u32,
     /// The game state (`Sys.RequestGameState`), `"Game"` while playing.
     pub game_state: String,
+    /// What the system, sound and player ports of missing natives keep
+    /// ([crate::ported_sys]).
+    pub sys: crate::ported_sys::SysState,
     /// The player's cash (`Player.GetCash`, `Player.SetCash`); the
     /// scripts' `MrxPmc.AddCashQty` reads it, adds and clamps.
     pub cash: f64,
@@ -2056,6 +2059,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     crate::ported_sp::install(&lib, &add)?;
     crate::shop::install(lua, &lib("Hud")?)?;
     crate::ported::install(&lib, &add)?;
+    crate::ported_sys::install(&lib, &add)?;
 
     // A string's hash, as the scripts key tables by name (their recruits'
     // states). The archive's name hash: the scripts only compare hashes
