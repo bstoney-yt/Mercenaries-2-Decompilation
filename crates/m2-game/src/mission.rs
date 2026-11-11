@@ -3448,7 +3448,7 @@ mod tests {
             Object.SetName(g, "HqInterior")
             Object.SetPosition(g, 3750, 450, -3840)
             Event.Create(Event.ObjectHibernation, { g, "awake" },
-                function(o) __awake = o end, {})"#,
+                function(o) __awake = o end, { g })"#,
             "spawn actor",
         )
         .unwrap();
