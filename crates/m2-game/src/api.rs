@@ -106,6 +106,11 @@ pub struct Object {
     /// Simulated near the player rather than hibernating
     /// ([`ScriptWorld::update_hibernation`]).
     pub awake: bool,
+    /// Its own hibernation distance, whole metres, when a script set one
+    /// (`Object.SetHibernationDistance`); else [`HIBERNATION_DISTANCE`].
+    /// From the 360 code: the engine keeps it per object as a 16-bit
+    /// count, which `Object.GetHibernationDistance` reads back.
+    pub hibernation_distance: Option<u16>,
     /// Hidden by the scripts (`Object.SetVisible(o, false)`): not on
     /// screen.
     pub hidden: bool,
@@ -163,6 +168,13 @@ impl Object {
             .map(|l| m2_assets::name_hash(l))
             .chain(self.label_hashes.iter().copied())
             .collect()
+    }
+
+    /// How near the player must come to wake it, metres: its own
+    /// distance, else [`HIBERNATION_DISTANCE`].
+    pub fn hibernation_distance(&self) -> f32 {
+        self.hibernation_distance
+            .map_or(HIBERNATION_DISTANCE as f32, f32::from)
     }
 
     pub fn new(name: &str, position: [f32; 3]) -> Self {
@@ -1241,8 +1253,9 @@ impl ScriptWorld {
     }
 
     /// Wakes the objects the player has come within their hibernation
-    /// distance of ([`HIBERNATION_DISTANCE`], every object's until the
-    /// templates' own are read) and puts to sleep those she has left
+    /// distance of (its own, [`Object::hibernation_distance`]; every
+    /// other object's [`HIBERNATION_DISTANCE`] until the templates' own
+    /// are read) and puts to sleep those she has left
     /// [`HIBERNATION_MARGIN`] beyond it: what `Object.IsAwake` and
     /// `Event.ObjectHibernation` read. The engine hibernates what is far
     /// from the player (inferred from the scripts: PmcCon001's gate
@@ -1275,8 +1288,8 @@ impl ScriptWorld {
             return;
         };
         let (at, riding) = (Vec3::from(her.position), her.vehicle);
-        let wake = HIBERNATION_DISTANCE as f32;
         for (g, o) in &mut self.objects {
+            let wake = o.hibernation_distance();
             if o.vehicle.is_some() {
                 self.riders.push(*g);
             }
@@ -1591,6 +1604,13 @@ pub const FACTIONS: [&str; 9] = [
 
 /// [`Object.GetHibernationDistance`]'s answer, metres.
 const HIBERNATION_DISTANCE: f64 = 155.0;
+
+/// A distance as `Object.SetHibernationDistance` keeps it: truncated to
+/// whole metres (the PowerPC's float-to-integer conversion), low 16 bits
+/// (from the 360 code).
+fn hibernation_metres(d: f32) -> u16 {
+    (d as i32) as u16
+}
 
 /// A place argument at `a[i]`: three numbers (x, y, z), else an object's
 /// place; and the index of the argument after it.
@@ -2117,8 +2137,34 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // How far off an object goes to sleep (metres). The deliveries place
     // a helicopter's cargo by it, with 155 as their own fallback: that,
     // until the templates' hibernation data is read.
-    add(&object, "GetHibernationDistance", |_, _, _| {
-        values([Value::Number(HIBERNATION_DISTANCE)])
+    //
+    // From the 360 code (`Object.GetHibernationDistance`, 0x82330de0): an
+    // object without hibernation data answers -1. Here every object in
+    // play has some.
+    add(&object, "GetHibernationDistance", |w, _, a| {
+        let d = id(a.first())
+            .and_then(|g| w.objects.get(&g))
+            .map_or(-1.0, |o| f64::from(o.hibernation_distance()));
+        values([Value::Number(d)])
+    })?;
+    // From the 360 code (`Object.SetHibernationDistance`, 0x82330ea0): the
+    // distance is cut to whole metres and kept in 16 bits in the object's
+    // hibernation data, which the engine then updates; the answer is
+    // whether the object has such data (else nothing changes). PmcCon004
+    // keeps its paradropped APCs awake out to 300 m this way, then waits
+    // for them to wake (`Event.ObjectHibernation`).
+    add(&object, "SetHibernationDistance", |w, _, a| {
+        let set = match (id(a.first()), num(a.get(1))) {
+            (Some(g), Some(d)) => match w.objects.get_mut(&g) {
+                Some(o) => {
+                    o.hibernation_distance = Some(hibernation_metres(d));
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        };
+        values([Value::Boolean(set)])
     })?;
     add(&object, "SetYaw", |w, _, a| {
         if let (Some(guid), Some(yaw)) = (id(a.first()), num(a.get(1))) {
@@ -4264,6 +4310,69 @@ mod tests {
         w.objects.get_mut(&1).unwrap().position = [far - 10.0, 0.0, 0.0];
         w.update_hibernation();
         assert!(w.is_awake(50));
+    }
+
+    #[test]
+    fn a_scripts_hibernation_distance_is_kept_per_object_in_whole_metres() {
+        // PmcCon004's APC drop: Object.SetHibernationDistance(apc, 300).
+        let (host, world) = setup();
+        let (before, set, after, other, missing, unknown): (f64, bool, f64, f64, bool, f64) = host
+            .lua()
+            .load(
+                "local before = Object.GetHibernationDistance(50)
+                 local set = Object.SetHibernationDistance(50, 300.9)
+                 return before, set, Object.GetHibernationDistance(50),
+                   Object.GetHibernationDistance(1),
+                   Object.SetHibernationDistance(999, 300),
+                   Object.GetHibernationDistance(999)",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(before, HIBERNATION_DISTANCE);
+        // Cut to whole metres, for that object alone.
+        assert!(set);
+        assert_eq!(after, 300.0);
+        assert_eq!(other, HIBERNATION_DISTANCE);
+        // No such object: nothing kept, and -1 for its distance.
+        assert!(!missing);
+        assert_eq!(unknown, -1.0);
+        // Kept in 16 bits, as the engine keeps it.
+        assert_eq!(hibernation_metres(65_536.0 + 12.5), 12);
+        assert_eq!(world.borrow().objects[&50].hibernation_distance, Some(300));
+    }
+
+    #[test]
+    fn an_object_with_a_longer_hibernation_distance_stays_awake_further_off() {
+        let (_host, world) = setup();
+        let mut w = world.borrow_mut();
+        w.objects.get_mut(&50).unwrap().hibernation_distance = Some(300);
+        let gone = HIBERNATION_DISTANCE as f32 + HIBERNATION_MARGIN + 20.0;
+        w.objects.get_mut(&1).unwrap().position = [gone, 0.0, 0.0];
+        w.update_hibernation();
+        assert!(w.is_awake(50));
+        w.objects.get_mut(&1).unwrap().position = [300.0 + HIBERNATION_MARGIN + 1.0, 0.0, 0.0];
+        w.update_hibernation();
+        assert!(!w.is_awake(50));
+        // It wakes at its own distance, not the usual one.
+        w.objects.get_mut(&1).unwrap().position = [290.0, 0.0, 0.0];
+        w.update_hibernation();
+        assert!(w.is_awake(50));
+    }
+
+    #[test]
+    fn custom_events_go_nowhere_in_single_player() {
+        // PmcCon004 tells a co-op partner to change the atmosphere; alone,
+        // the engine sends nothing and answers true.
+        let (host, world) = setup();
+        world.borrow_mut().take_commands();
+        let sent: bool = host
+            .lua()
+            .load("return Net.SendCustomEvent('PmcCon004', 4, {}, true)")
+            .eval()
+            .unwrap();
+        assert!(sent);
+        assert!(world.borrow_mut().take_commands().is_empty());
+        assert!(host.take_calls().is_empty());
     }
 
     #[test]
