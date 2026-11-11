@@ -73,6 +73,7 @@ pub mod vehicle_damage;
 pub mod vehicle_door;
 pub mod vehicle_parts;
 pub mod weapons;
+pub mod winch;
 pub mod world;
 
 pub use ai::{AiFlags, AiProfile};
