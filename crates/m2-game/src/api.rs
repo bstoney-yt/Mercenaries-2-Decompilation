@@ -2512,10 +2512,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     // Hanging from a winch, not yet let go: a delivery's objective waits
     // for its cargo to be put down, not merely brought over the place.
+    //
+    // From the 360 code (`Object.IsWinched`, 0x82333330): not a boolean.
+    // It walks the object's physics constraints for a rope whose owner's
+    // winch (`PhysicsActorWinch`) holds this object, and answers that
+    // owner (the helicopter); otherwise nil. The deliveries test the
+    // answer against nil (`MrxTaskObjectiveDeliver`'s target setup:
+    // `bWinched = IsWinched(o) ~= nil`), so a false here read as winched.
     add(&object, "IsWinched", |w, _, a| {
-        values([Value::Boolean(
-            id(a.first()).is_some_and(|g| w.winch.get(&g).is_some_and(Option::is_some)),
-        )])
+        let carrier = id(a.first()).and_then(|g| w.winch.get(&g).copied().flatten());
+        values([guid_value(carrier)])
     })?;
     // How far the winch is let out: the game's to animate.
     add(&object, "SetWinchState", |_, _, _| values([]))?;
@@ -5332,7 +5338,7 @@ mod tests {
         ));
         let winched = |host: &ScriptHost| -> bool {
             host.lua()
-                .load(r#"return Object.IsWinched(Sys.StringToGuid("82"))"#)
+                .load(r#"return Object.IsWinched(Sys.StringToGuid("82")) ~= nil"#)
                 .eval()
                 .unwrap()
         };
@@ -5394,7 +5400,7 @@ mod tests {
                 local copter, post = Sys.StringToGuid("80"), Sys.StringToGuid("82")
                 Object.AttachCargoToWinch(post, copter)
                 Event.Create(Event.ObjectWinched, {post, 0, "any"}, function(c)
-                    heard = Object.IsWinched(c)
+                    heard = Object.IsWinched(c) == nil and "free" or "held"
                 end)
                 "#,
             )
@@ -5402,11 +5408,11 @@ mod tests {
             .unwrap();
         events.update_shared(0.1, &world);
         let heard =
-            |host: &ScriptHost| -> Option<bool> { host.lua().globals().get("heard").unwrap() };
+            |host: &ScriptHost| -> Option<String> { host.lua().globals().get("heard").unwrap() };
         assert_eq!(heard(&host), None);
         assert!(arrived(&world, 81, [50.0, 0.0, 60.0]).is_empty());
         events.update_shared(0.1, &world);
-        assert_eq!(heard(&host), Some(false));
+        assert_eq!(heard(&host).as_deref(), Some("free"));
     }
 
     #[test]
@@ -5760,6 +5766,25 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((orig, copy, players), (2, 1, true));
+    }
+
+    #[test]
+    fn is_winched_answers_the_helicopter_or_nil() {
+        // MrxTaskObjectiveDeliver: `bWinched = Object.IsWinched(o) ~= nil`.
+        let (host, _) = setup();
+        let (before, carrier, after, unknown): (bool, bool, bool, bool) = host
+            .lua()
+            .load(
+                "local before = Object.IsWinched(50) == nil
+                 Object.AttachCargoToWinch(50, 1)
+                 local carrier = Object.IsWinched(50) == Sys.StringToGuid('1')
+                 Object.DetachCargoFromWinch(50)
+                 return before, carrier, Object.IsWinched(50) == nil,
+                   Object.IsWinched(999) == nil",
+            )
+            .eval()
+            .unwrap();
+        assert!(before && carrier && after && unknown);
     }
 
     #[test]
