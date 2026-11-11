@@ -74,6 +74,7 @@ mod jobs;
 mod keytable;
 mod ladders;
 mod loading;
+mod marker_models;
 mod mission;
 mod movie;
 mod moving;
@@ -509,6 +510,10 @@ struct Options {
     /// With `--screenshot`: bring down the mission's gates as the bomb
     /// does, logging where their pieces go ([`gates_for_screenshot`]).
     gates: bool,
+    /// With `--screenshot`: stands a race's markers (a tripwire, a ring,
+    /// a finish and a pin) in front of the camera and pictures them
+    /// ([`marker_test`]).
+    marker_test: bool,
     sea: Option<f32>,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
@@ -970,6 +975,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 o.honk_every = Some(value()?.parse().context("--honk-every expects seconds")?)
             }
             "--gates" => o.gates = true,
+            "--marker-test" => o.marker_test = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
             "--pause-at" => o.pause_at = Some(value()?.parse()?),
             "--contracts" => {
@@ -2529,6 +2535,9 @@ fn screenshot(
     if let Some(reach) = options.look_pickup {
         look_at_pickup(&mut game, reach);
     }
+    if options.marker_test {
+        marker_test(&mut backend, &mut game, fov, aspect)?;
+    }
     if let Some(p) = game.scene.player.as_ref().filter(|_| game.on_foot) {
         // Hits from around her, as the camera sees it: 0 ahead, 90 right.
         let at = p.character.position + m2_math::glam::Vec3::Y;
@@ -3534,12 +3543,18 @@ fn look_at_marker(
 ) -> anyhow::Result<()> {
     use m2_math::glam::Vec3;
     let here = game.focus();
-    let Some((at, label)) = link
-        .view()
+    let view = link.view();
+    // The icon markers and those drawn as models (a race's gates).
+    let models = view
+        .models
+        .iter()
+        .map(|m| (m.at, format!("model {:08x}", m.model)));
+    let Some((at, label)) = view
         .markers
-        .into_iter()
-        .min_by(|a, b| a.at.distance(here).total_cmp(&b.at.distance(here)))
+        .iter()
         .map(|m| (m.at, m.label()))
+        .chain(models)
+        .min_by(|a, b| a.0.distance(here).total_cmp(&b.0.distance(here)))
     else {
         eprintln!("mission look: no markers");
         return Ok(());
@@ -3558,6 +3573,85 @@ fn look_at_marker(
         }
         let pending = game.scene.world.as_ref().map_or(0, |w| w.stats().pending);
         if (i > 120 && pending == 0) || started.elapsed() > Duration::from_secs(60) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// With `--marker-test`: a tripwire 20 m wide in red, a ring and a
+/// finish in yellow and a pin in white, 25 m ahead of the camera, the
+/// camera looking at them from 1.5 m up, once their models have loaded.
+fn marker_test(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+) -> anyhow::Result<()> {
+    use crate::marker_models::{MarkerModel, PIN_MODEL, TRIPWIRE_MODEL};
+    use m2_math::glam::Vec3;
+    let ground = game.focus();
+    let ahead = game.camera.forward().with_y(0.0).normalize_or(Vec3::Z);
+    let at = ground + ahead * 25.0;
+    let yaw = ahead.x.atan2(ahead.z);
+    let side = Vec3::new(ahead.z, 0.0, -ahead.x);
+    let model = |model, at, yaw, scale, width, colour| MarkerModel {
+        model,
+        at,
+        yaw,
+        scale,
+        width,
+        colour,
+    };
+    game.scene.marker_models = vec![
+        model(TRIPWIRE_MODEL, at, Some(yaw), 1.0, Some(20.0), [255, 0, 0]),
+        model(
+            m2_assets::name_hash("global_airring"),
+            at + side * 14.0 + Vec3::Y * 4.0,
+            Some(yaw),
+            6.0,
+            None,
+            [255, 255, 0],
+        ),
+        model(
+            m2_assets::name_hash("global_tripwirefinish"),
+            at - side * 14.0,
+            Some(yaw),
+            1.0,
+            None,
+            [255, 255, 0],
+        ),
+        model(
+            PIN_MODEL,
+            at + ahead * 4.0 + Vec3::Y * 2.0,
+            None,
+            0.25,
+            None,
+            [255; 3],
+        ),
+    ];
+    game.on_foot = false;
+    game.camera = FlyCamera::looking_at(ground + Vec3::Y * 2.0 + ahead * 6.0, at + Vec3::Y * 2.0);
+    // `M2_MARKER_TEST_ONLY=<n>` keeps the nth alone, in the middle.
+    if let Some(n) = std::env::var("M2_MARKER_TEST_ONLY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        let mut m = game.scene.marker_models.swap_remove(n);
+        m.at = at + Vec3::Y * 2.0;
+        game.scene.marker_models = vec![m];
+    }
+    for m in &game.scene.marker_models {
+        eprintln!("marker test: {:08x} at {:.1}", m.model, m.at);
+    }
+    let tick = TICK.as_secs_f32();
+    let started = Instant::now();
+    for i in 0.. {
+        game.step(Intent::default(), tick);
+        if i % 10 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+        if (i > 240) || started.elapsed() > Duration::from_secs(60) {
             break;
         }
     }

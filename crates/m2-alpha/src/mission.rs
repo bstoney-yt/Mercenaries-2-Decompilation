@@ -145,6 +145,9 @@ pub struct MissionView {
     pub radar: Vec<RadarView>,
     /// Discs on the ground (`Marker.AddDisc`): centre, radius, colour.
     pub discs: Vec<(Vec3, f32, [u8; 3])>,
+    /// The markers drawn as models: tripwires, `Marker.Add3D`'s and
+    /// `Marker.Add`'s ([`crate::marker_models`]).
+    pub models: Vec<crate::marker_models::MarkerModel>,
     /// The newest objective message: completed (or else added), and text.
     pub message: Option<(bool, String)>,
     /// The same message as the scripts sent it, for the game's own HUD to
@@ -2057,6 +2060,11 @@ impl MissionLink {
     /// player is and who died, and carries out what they ask of the
     /// player.
     pub fn tick(&mut self, game: &mut Game, dt: f32) {
+        // The markers drawn as models, as the scripts left them last tick.
+        game.scene.marker_models = match &self.state {
+            State::Running(m) => self.marker_models(&m.world().borrow()),
+            _ => Vec::new(),
+        };
         if let Some((_, _, age)) = &mut self.message {
             *age += dt;
         }
@@ -4364,6 +4372,62 @@ impl MissionLink {
     }
 
     /// What the HUD shows.
+    /// The scripts' markers drawn as models ([`crate::marker_models`]),
+    /// where they stand now.
+    fn marker_models(
+        &self,
+        w: &m2_game::api::ScriptWorld,
+    ) -> Vec<crate::marker_models::MarkerModel> {
+        use crate::marker_models::{MarkerModel, PIN_MODEL, TRIPWIRE_MODEL};
+        let hud = &w.hud;
+        let place = |g: u32| -> Option<(Vec3, f32)> {
+            let o = w.objects.get(&g)?;
+            let at = self
+                .marked
+                .get(&g)
+                .copied()
+                .unwrap_or_else(|| Vec3::from(o.position));
+            Some((at, o.yaw))
+        };
+        let wires = hud.tripwires.values().map(|t| MarkerModel {
+            model: TRIPWIRE_MODEL,
+            at: Vec3::from(t.at),
+            yaw: Some(t.yaw.to_radians()),
+            scale: 1.0,
+            width: Some(t.width),
+            colour: t.colour,
+        });
+        // Where its target stands and faces (the 360 takes both when it
+        // is called; a race's gates stand still).
+        let models = hud.models.values().filter_map(|m| {
+            let (at, yaw) = place(m.target?)?;
+            Some(MarkerModel {
+                model: m2_assets::name_hash(&m.model),
+                at,
+                yaw: Some(yaw),
+                scale: m.scale,
+                width: None,
+                colour: m.colour,
+            })
+        });
+        let pins = hud.pins.values().filter_map(|p| {
+            let offset = Vec3::from(p.offset);
+            let at = match p.target {
+                Some(g) => place(g)?.0 + offset,
+                None => offset,
+            };
+            Some(MarkerModel {
+                model: PIN_MODEL,
+                at,
+                yaw: None,
+                scale: p.scale,
+                width: None,
+                colour: p.colour,
+            })
+        });
+        wires.chain(models).chain(pins).collect()
+    }
+
     pub fn view(&self) -> MissionView {
         let recent = self.message.as_ref().filter(|m| m.2 < MESSAGE_TIME);
         let message = recent.map(|(m, text, _)| (m.done(), text.clone()));
@@ -4439,6 +4503,7 @@ impl MissionLink {
                 })
             })
             .collect();
+        let models = self.marker_models(&w);
         let radar = radar_views(mission.lua(), &hud.radar, |g| {
             let o = w.objects.get(&g)?;
             Some(
@@ -4461,6 +4526,7 @@ impl MissionLink {
             markers,
             radar,
             discs,
+            models,
             message,
             game_message,
             contract_complete: self.completed.is_some_and(|age| age < BANNER_TIME),

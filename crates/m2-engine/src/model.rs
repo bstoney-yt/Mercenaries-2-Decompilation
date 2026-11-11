@@ -1388,6 +1388,9 @@ pub struct GpuModel {
     /// The material each of its records got from the [`MaterialCache`],
     /// one hold each, given back by [`release`](Self::release).
     material_ids: Vec<MaterialId>,
+    /// Multiplies its surfaces' colour and alpha ([`DrawCall::tint`]):
+    /// `[1.0; 4]` but for a marker model drawn in the scripts' colour.
+    pub tint: [f32; 4],
 }
 
 /// Which of a vehicle's lamps are lit ([`GpuModel::lamps`]).
@@ -1598,6 +1601,7 @@ impl GpuModel {
         }
         Ok(Self {
             material_ids: ids.clone(),
+            tint: [1.0; 4],
             hash: cpu.hash,
             pieces,
             bounds: cpu.bounds,
@@ -1930,6 +1934,7 @@ impl GpuModel {
                         ],
                         _ => [0.0; 2],
                     },
+                    tint: self.tint,
                 },
                 layer: Layer::WORLD,
                 translucent,

@@ -40,13 +40,13 @@ pub use ::wgpu;
 
 /// Bytes of a draw's uniforms: its world matrix, then the first palette
 /// matrix and the palette length, then the same for its instances, then
-/// its texture coordinate offset. The frame's draws lie one after another
+/// its texture coordinate offset, then its tint. The frame's draws lie one after another
 /// in one storage buffer, and each instance drawn has a slot (the draw's
 /// index and its instance's) in another: a draw is drawn with its first
 /// slot as its first instance, so its vertices find their uniforms from
 /// the instance index, and no bind group changes between draws. Binding
 /// one per draw cost the CPU about 8 ms a frame of 10,000 draws.
-const DRAW_UNIFORM_SIZE: u64 = 96;
+const DRAW_UNIFORM_SIZE: u64 = 112;
 /// Bytes of an instance's slot: its draw's index and its own.
 const SLOT_SIZE: u64 = 8;
 /// Bone matrices the palette buffer starts with.
@@ -2761,6 +2761,7 @@ impl RenderBackend for WgpuBackend {
             0.0,
             0.0,
         ]));
+        uniforms.extend_from_slice(bytemuck::cast_slice(&call.tint));
         let index = frame.draws.len() as u32;
         let first_slot = frame.slots.len() as u32;
         frame

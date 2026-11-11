@@ -138,6 +138,7 @@ fn draw(vb: VertexBufferHandle, ib: IndexBufferHandle, material: u32, world: Mat
         skin: None,
         instances: None,
         uv_offset: [0.0; 2],
+        tint: [1.0; 4],
     }
 }
 
@@ -212,6 +213,7 @@ fn draws_a_textured_unlit_quad() {
     b.begin_frame(&view()).unwrap();
     b.draw(&DrawCall {
         uv_offset: [0.5, 0.0],
+        tint: [1.0; 4],
         ..draw(vb, ib, 1, Mat4::IDENTITY)
     })
     .unwrap();
@@ -427,6 +429,7 @@ fn instanced_draws_repeat_the_geometry() {
     b.draw(&DrawCall {
         instances: Some(instances),
         uv_offset: [0.0; 2],
+        tint: [1.0; 4],
         ..draw(vb, ib, 1, Mat4::IDENTITY)
     })
     .unwrap();
@@ -464,6 +467,7 @@ fn draws_after_instanced_ones_keep_their_own_uniforms() {
     b.draw(&DrawCall {
         instances: Some(instances),
         uv_offset: [0.0; 2],
+        tint: [1.0; 4],
         ..draw(vb, ib, 1, Mat4::IDENTITY)
     })
     .unwrap();

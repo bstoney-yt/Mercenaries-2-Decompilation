@@ -46,6 +46,7 @@ fn call(vb: VertexBufferHandle, ib: IndexBufferHandle, material: u32) -> DrawCal
         skin: None,
         instances: None,
         uv_offset: [0.0; 2],
+        tint: [1.0; 4],
     }
 }
 

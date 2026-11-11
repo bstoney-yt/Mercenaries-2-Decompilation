@@ -9,6 +9,7 @@
 //! cargo run -p m2-assets --example wad -- dds     <archive.wad> <texture name> <out.dds>
 //! cargo run -p m2-assets --example wad -- models  <archive.wad>
 //! cargo run -p m2-assets --example wad -- obj     <archive.wad> <model hash> <out.obj> [lod]
+//! cargo run -p m2-assets --example wad -- nodes   <archive.wad> <model name or hash>
 //! cargo run -p m2-assets --example wad -- material <archive.wad> <material hash>
 //! cargo run -p m2-assets --example wad -- anims   <archive.wad>
 //! cargo run -p m2-assets --example wad -- world   <archive.wad>
@@ -312,6 +313,13 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 );
             }
+        }
+        ("nodes", [name]) => {
+            let hash = match u32::from_str_radix(name.trim_start_matches("0x"), 16) {
+                Ok(h) if name.len() == 8 || name.starts_with("0x") => h,
+                _ => m2_assets::name_hash(name),
+            };
+            model_nodes(&mut wad, hash)?;
         }
         ("obj", [hash, out, rest @ ..]) => {
             let hash = u32::from_str_radix(hash.trim_start_matches("0x"), 16)?;
@@ -806,6 +814,45 @@ fn material_users<R: Read + Seek>(wad: &mut WadArchive<R>, material: u32) -> Any
         }
     }
     println!("\n{shown} models use material {material:08x}");
+    Ok(())
+}
+
+/// Prints a model's nodes: index, name hash, parent, the translation
+/// from it to its parent, and its bounds.
+fn model_nodes<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32) -> AnyResult<()> {
+    let mut blocks: Vec<usize> = Vec::new();
+    for a in wad.index().assets_by_hash(hash) {
+        blocks.extend(
+            std::iter::once(a.block)
+                .chain(a.alt_blocks())
+                .map(usize::from),
+        );
+    }
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut found = HashMap::new();
+    for block in blocks {
+        collect_models(wad, block, Some(hash), &mut found)?;
+    }
+    let bytes = found
+        .get_mut(&hash)
+        .ok_or_else(|| format!("no model {hash:08x}"))?;
+    let model = bytes.assemble()?;
+    println!("model {hash:08x}: {} nodes", model.nodes.len());
+    for (i, n) in model.nodes.iter().enumerate() {
+        // D3DX rows: the translation is the fourth.
+        let t = n.local.m[3];
+        println!(
+            "{i:3} {:08x} parent {:?} at ({:.3}, {:.3}, {:.3}) bounds {:?}..{:?}",
+            n.name_hash,
+            n.parent,
+            t[0],
+            t[1],
+            t[2],
+            &n.bounds_min[..3],
+            &n.bounds_max[..3]
+        );
+    }
     Ok(())
 }
 

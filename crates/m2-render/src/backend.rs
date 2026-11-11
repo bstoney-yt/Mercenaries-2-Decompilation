@@ -67,6 +67,9 @@ pub struct DrawCall {
     /// Added to the texture coordinates: a scrolling texture, such as a
     /// tank's moving tracks.
     pub uv_offset: [f32; 2],
+    /// Multiplies the surface's colour and alpha (`[1.0; 4]`: as it is):
+    /// a marker model's colour, as the scripts give it.
+    pub tint: [f32; 4],
 }
 
 /// How many [`PointLight`]s a frame draws (the game's shaders take 8).
