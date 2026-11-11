@@ -393,8 +393,16 @@ fn table_clips(
             .iter()
             .position(|c| c.hash == hash && !rig.foreign.contains(&hash))
     };
+    // The slots whose action the 360 code names go forward, by the
+    // action's handle ([`held::slot_handles`]); the rest by their key clip.
+    let forward = source
+        .asset(table::ACTIONS, table::ANIMATION_TABLE_TYPE)
+        .ok()
+        .and_then(|a| AnimationTable::parse(&a).ok())
+        .map(|a| held::slot_handles(&a))
+        .unwrap_or_default();
     let resolve = |key: u32| {
-        table::character_clip(&t, key, (gender, name), table::RIFLE, |c| {
+        held::slot_clip(&t, &forward, key, (gender, name), table::RIFLE, |c| {
             index(c).is_some()
         })
     };
@@ -1039,7 +1047,6 @@ impl Rig {
             (Gait::Idle, Carry::Aim) => (clips.aim, None),
             (_, Carry::Aim) => (None, clips.aim),
             (Gait::Run, _) => (clips.run_low, None),
-            (Gait::Sprint, _) => (clips.sprint, None),
             _ => (None, None),
         };
         match whole {

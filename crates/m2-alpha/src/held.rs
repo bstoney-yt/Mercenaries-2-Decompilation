@@ -36,6 +36,7 @@ use std::collections::HashMap;
 
 use m2_assets::animation_table::{self as table, AnimationTable};
 use m2_engine::Gait;
+use m2_engine::hero_action::{self, ThrowWay};
 
 use crate::npc::FightClips;
 use crate::scene::Rig;
@@ -77,6 +78,10 @@ pub struct Held {
     pub equip: HashMap<(Side, bool), usize>,
     /// Changing its clip, running (true) or standing.
     pub reload: HashMap<bool, usize>,
+    /// Throwing a grenade with it held, on the move (true) or standing,
+    /// each way from her facing: the clip and when in it the grenade
+    /// leaves her hand ([`throw_clip`]).
+    pub throws: HashMap<(bool, ThrowWay), (usize, f32)>,
     /// Crouched and aiming ([`m2_engine::on_foot::CROUCH_HOLD`]): each
     /// gait's clip, walking forwards (false) or backwards (true), from
     /// the on-foot table's `Crouch_Aim_*` handles ([`CROUCH_HANDLES`]).
@@ -222,6 +227,55 @@ impl Switch {
     }
 }
 
+/// The animation handle of each fight clip slot whose action the 360
+/// code names ([`hero_action::SLOT_ACTIONS`]), by the slot's key clip
+/// ([`FightClips::TABLE_KEYS`]): the stance and action table's, looked up
+/// forward. A slot the table has no row for is left out (it stays keyed
+/// by its clip).
+pub fn slot_handles(actions: &AnimationTable) -> HashMap<u32, u32> {
+    FightClips::TABLE_KEYS
+        .iter()
+        .filter_map(|&(slot, key)| {
+            let a = hero_action::slot_action(slot)?;
+            Some((key, table::action_handle(actions, a.stance, a.action)?))
+        })
+        .collect()
+}
+
+/// The clip the on-foot table `t` gives `who` holding `class` for the
+/// slot keyed by `key`: by the slot's action's handle where `forward`
+/// ([`slot_handles`]) has one, else by the first row listing the key
+/// clip ([`table::character_clip`]).
+pub fn slot_clip(
+    t: &AnimationTable,
+    forward: &HashMap<u32, u32>,
+    key: u32,
+    who: (u32, u32),
+    class: u32,
+    fits: impl Fn(u32) -> bool,
+) -> Option<table::CharacterClip> {
+    match forward.get(&key) {
+        Some(&handle) => table::handle_clip(t, handle, who, class, fits),
+        None => table::character_clip(t, key, who, class, fits),
+    }
+}
+
+/// The clip `who` throws a grenade with, holding `class`: the throw's
+/// action and way ([`hero_action`]) through both tables, with a grenade
+/// in use.
+pub fn throw_clip(
+    t: &AnimationTable,
+    actions: &AnimationTable,
+    who: (u32, u32),
+    class: u32,
+    (moving, way): (bool, ThrowWay),
+    fits: impl Fn(u32) -> bool,
+) -> Option<table::CharacterClip> {
+    let action = hero_action::throw_action(moving);
+    let handle = table::action_handle_toward(actions, "Upright", action, way.hash())?;
+    table::handle_clip_using(t, handle, who, class, table::GRENADE, fits)
+}
+
 /// Works out [`Moves`] for a hero (`who`: the template's gender and
 /// character name) on `rig`: for each of [`CLASSES`], the fight clips and
 /// gaits the on-foot table `t` gives the class by `keys` (each slot's or
@@ -251,13 +305,14 @@ pub fn resolve(
         let p = table::handle_clip(t, h, who, class, fits)?;
         index(p.clip)
     };
+    let forward = slot_handles(actions);
     let mut held = Vec::new();
     for name in CLASSES {
         let class = m2_assets::name_hash(name);
         let (clips, gaits) = if class == table::RIFLE {
             (base, base_gaits.to_vec())
         } else {
-            let theirs = |key: u32| Some(table::character_clip(t, key, who, class, fits)?.clip);
+            let theirs = |key: u32| Some(slot_clip(t, &forward, key, who, class, fits)?.clip);
             let mut clips = base;
             clips.by_table(rig, &theirs);
             let gaits = gait_keys
@@ -283,6 +338,17 @@ pub fn resolve(
                 }
                 if let Some(c) = by_action(&format!("Equip{w}{gait}"), class) {
                     equip.insert((side, running), c);
+                }
+            }
+        }
+        let mut throws = HashMap::new();
+        for moving in [false, true] {
+            for way in ThrowWay::ALL {
+                let found = throw_clip(t, actions, who, class, (moving, way), fits)
+                    .and_then(|p| index(p.clip))
+                    .and_then(|i| Some((i, FightClips::release(&rig.clips[i])?)));
+                if let Some(found) = found {
+                    throws.insert((moving, way), found);
                 }
             }
         }
@@ -343,6 +409,7 @@ pub fn resolve(
             stow,
             equip,
             reload,
+            throws,
         });
     }
     Moves {
@@ -355,6 +422,20 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every slot the 360 code names an action for is one of the fight
+    /// clips' slots, so [`slot_handles`] leaves none of them out by a
+    /// misspelt name.
+    #[test]
+    fn every_named_action_is_a_fight_clip_slot() {
+        for a in hero_action::SLOT_ACTIONS {
+            assert!(
+                FightClips::TABLE_KEYS.iter().any(|k| k.0 == a.slot),
+                "{}",
+                a.slot
+            );
+        }
+    }
 
     fn moves() -> Moves {
         let pistol = m2_assets::name_hash("pistol");

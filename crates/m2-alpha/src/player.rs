@@ -407,6 +407,9 @@ pub struct Player {
     jump_queued: bool,
     /// Seconds into a grenade throw, while she throws.
     pub throwing: Option<f32>,
+    /// The throw's clip and when in it the grenade leaves her hand, picked
+    /// as it starts ([`Player::start_throw`]).
+    throw_clip: Option<(usize, f32)>,
     /// A melee bash, while she bashes: she stands, facing the camera's
     /// way.
     pub bashing: Option<Bash>,
@@ -624,6 +627,7 @@ impl Player {
             leap: Leap::No,
             jump_queued: false,
             throwing: None,
+            throw_clip: None,
             bashing: None,
             launcher: false,
             down: false,
@@ -669,9 +673,6 @@ impl Player {
     pub fn set_body(&mut self, model: Option<(GpuModel, Rig)>, clips: FightClips, moves: Moves) {
         self.model = model;
         self.clips = clips;
-        if let Some((_, rig)) = &self.model {
-            self.clips.sprint = crate::npc::two_handed_sprint(rig, self.clips.run_low);
-        }
         self.moves = moves;
         self.leap = Leap::No;
         self.jump_queued = false;
@@ -715,9 +716,6 @@ impl Player {
             l.clips.extend(set.gaits.iter().copied());
             let gait = rig.gait;
             rig.set_gait(gait);
-        }
-        if let Some((_, rig)) = &self.model {
-            self.clips.sprint = crate::npc::two_handed_sprint(rig, self.clips.run_low);
         }
     }
 
@@ -775,12 +773,39 @@ impl Player {
     /// Starts throwing a grenade, if she has a throw to play and isn't
     /// throwing already: the seconds until it leaves her hand. `None`
     /// without the clip (the grenade goes at once).
+    ///
+    /// From the 360 code ([`m2_engine::hero_action`]): the throw is
+    /// `ThrowGrenadeRun` on the move and `ThrowGrenadeIdle` standing, to
+    /// the front, back, left or right by the angle from the way she faces
+    /// to the way she throws (the camera's), and the tables give the clip
+    /// for what she holds ([`crate::held::Held::throws`]). On the move is
+    /// her gait above a walk (inferred: the program tests its pace bits
+    /// above 1, whose values were not traced). Where the tables give her
+    /// none, the throw found by name plays as before.
     pub fn start_throw(&mut self) -> Option<f32> {
         if self.throwing.is_some() {
             return None;
         }
-        let (_, release) = self.clips.throw?;
-        self.model.as_ref()?;
+        let (_, rig) = self.model.as_ref()?;
+        let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
+        let moving = !matches!(
+            crate::scene::loco_gait(self.motion.paces, moved),
+            Gait::Idle | Gait::Walk
+        );
+        let way = m2_engine::hero_action::throw_way(self.facing - self.yaw);
+        let tabled = self
+            .moves
+            .of(self.shown.class)
+            .and_then(|h| h.throws.get(&(moving, way)).copied());
+        let (clip, release) = tabled.or(self.clips.throw)?;
+        eprintln!(
+            "anim: throw {:08x} ({}, {}{})",
+            rig.clips[clip].hash,
+            m2_engine::hero_action::throw_action(moving),
+            way.name(),
+            if tabled.is_some() { "" } else { "; by name" }
+        );
+        self.throw_clip = Some((clip, release));
         self.throwing = Some(0.0);
         Some(release)
     }
@@ -1416,7 +1441,7 @@ impl Player {
                 }
             }
             // A throw plays over the upper body, whatever the legs do.
-            match (self.throwing, clips.throw, rig.upper.clone()) {
+            match (self.throwing, self.throw_clip, rig.upper.clone()) {
                 (Some(t), Some((clip, _)), Some(mask)) if t < rig.clips[clip].info.duration => {
                     rig.animator.upper_at(clip, mask, t);
                     rig.two_handed = false;

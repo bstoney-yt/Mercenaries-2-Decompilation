@@ -363,10 +363,6 @@ pub struct FightClips {
     pub ready: Option<usize>,
     /// Running with the rifle held low across the body in both hands.
     pub run_low: Option<usize>,
-    /// Sprinting with the rifle in both hands: her sprint gait's clip when
-    /// it holds the rifle so ([`two_handed_sprint`]), else the run above
-    /// (the player's alone: set by [`crate::player::Player`]).
-    pub sprint: Option<usize>,
     /// A jump: take-off and the air, ending off the ground (resident
     /// c846e6fd); the stand-in when the take-offs below aren't there.
     pub jump: Option<usize>,
@@ -428,37 +424,6 @@ pub fn hand_spread(rig: &Rig, c: &BoundClip) -> Option<f32> {
         })
         .fold(0.0, f32::max);
     (c.info.hips > 0.0).then(|| widest / c.info.hips)
-}
-
-/// What she sprints with a rifle in: her sprint gait's clip if its hands
-/// stay as close as a two-handed run's (nearer the spread of `run_low`,
-/// the rifle low across her in both hands, than of the run gait, arms
-/// free), else `run_low` itself. Playtest 8: the sprint clip's arms are
-/// free, and the rifle, hung from a hand held as she stands, dangled by
-/// her leg. From samples (the clips' hands); that the game sprints with
-/// it in both hands is inferred from its rifle run.
-pub fn two_handed_sprint(rig: &Rig, run_low: Option<usize>) -> Option<usize> {
-    let run_low = run_low?;
-    let sprint = rig.gait_clip(Gait::Sprint);
-    let spread = |i: usize| hand_spread(rig, &rig.clips[i]);
-    let both = spread(run_low);
-    let free = rig.gait_clip(Gait::Run).and_then(spread);
-    let s = sprint.and_then(spread);
-    let holds =
-        matches!((both, free, s), (Some(b), Some(f), Some(s)) if b < f && s < (b + f) * 0.5);
-    eprintln!(
-        "hero clips: sprint {}: hands {} apart for the hips (two-handed run {}, run gait {}): {}",
-        sprint.map_or("none".to_owned(), |i| format!("{:08x}", rig.clips[i].hash)),
-        s.map_or("?".to_owned(), |s| format!("{s:.2}")),
-        both.map_or("?".to_owned(), |s| format!("{s:.2}")),
-        free.map_or("?".to_owned(), |s| format!("{s:.2}")),
-        if holds {
-            "it holds the rifle"
-        } else {
-            "the two-handed run plays"
-        },
-    );
-    if holds { sprint } else { Some(run_low) }
 }
 
 impl FightClips {
@@ -600,7 +565,6 @@ impl FightClips {
             aim: find(Self::AIM),
             ready,
             run_low: first(&Self::RUN_LOW),
-            sprint: None,
             jump: find(Self::JUMP),
             takeoff: first(&Self::TAKEOFF),
             takeoff_still: first(&Self::TAKEOFF_STILL),
@@ -630,6 +594,16 @@ impl FightClips {
             getup: find(Self::GETUP),
             subdued: find(Self::SUBDUED),
         }
+    }
+
+    /// When in `clip` a throw lets go of the grenade (its
+    /// `releasegrenade` event), if it has one.
+    pub fn release(clip: &BoundClip) -> Option<f32> {
+        clip.clip
+            .events
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(Self::RELEASE))
+            .map(|e| e.time)
     }
 
     /// The clips carrying `event` (not another hero's): each one's index,
@@ -675,6 +649,16 @@ impl FightClips {
     /// `d1f2ee32` (her rows there are rocket ones), throw `399f45f4`
     /// (with a grenade in use), bashes `fbc71879` and `7a9110c8`, die
     /// `f9d7a61c`.
+    ///
+    /// A clip is listed under more than one handle, so a key can give
+    /// another action's: by the stance and action table `fbc71879` is the
+    /// `Crouched` stance's `MeleeBash`, `24af79c8` is
+    /// `DieAnimatedRagdoll`'s and `cca02d6b` is `Swim` `EnterSwim`'s. The
+    /// landings and bashes, whose actions the 360 code names, are looked
+    /// up by action instead ([`crate::held::slot_handles`]: the upright
+    /// `MeleeBash` is `bccb7ce4`), and the player's throw by its own
+    /// ([`crate::held::throw_clip`]). The take-offs, the jump and the
+    /// death stay keyed by clip until their actions are traced.
     pub const TABLE_KEYS: [(&'static str, u32); 12] = [
         ("aim", Self::AIM),
         ("ready", Self::READY),
