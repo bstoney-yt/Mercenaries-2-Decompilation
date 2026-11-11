@@ -5931,23 +5931,28 @@ impl Physics {
         f(solid().predicate(&keep))
     }
 
-    /// Whether nothing solid but the terrain is in the box from `lo` to
-    /// `hi` (sensors aside): where road traffic may come out
-    /// ([`crate::road_population::spawn_box`]; the 360 asks its world's
-    /// broadphase, 0x82153B30).
+    /// Whether nothing that moves is in the box from `lo` to `hi`: no
+    /// vehicle, loose prop or body (sensors aside), where road traffic may
+    /// come out ([`crate::road_population::spawn_box`]). From the 360 code:
+    /// 0x82153B30 asks its world's broadphase and lets by what the owner's
+    /// kind (its vtable's +0xE0) says: 6, a `_BuildingPhysics` (0x822F64D8),
+    /// 7, an `EffectAiOccluder`'s stand-in box (0x8218DE80), 9, a `Winch`
+    /// (0x821952E8), and 5, not identified; the ground, 13, falls outside
+    /// its switch and is let by too. What blocks is kinds 0 to 4, 8 and 10
+    /// (boats). Inferred: every fixed static here stands for a building
+    /// (as [`fixed_near`](Self::fixed_near) takes them).
     pub fn box_clear(&self, lo: Vec3, hi: Vec3) -> bool {
         let middle = (lo + hi) * 0.5;
         let cube = r::Cuboid::new(vector(((hi - lo) * 0.5).max(Vec3::splat(1e-3))));
-        self.skipping(None, false, |filter| {
-            self.world
-                .intersect_shape(
-                    pose(middle, Quat::IDENTITY),
-                    &cube,
-                    filter.exclude_sensors(),
-                )
-                .next()
-                .is_none()
-        })
+        let moves = |h: r::ColliderHandle, _: &r::Collider| !self.keys.contains_key(&h);
+        self.world
+            .intersect_shape(
+                pose(middle, Quat::IDENTITY),
+                &cube,
+                solid().exclude_sensors().predicate(&moves),
+            )
+            .next()
+            .is_none()
     }
 
     /// What stands fixed in the box from `lo` to `hi` (0x822ED248's
@@ -6330,6 +6335,36 @@ mod tests {
             assert!((-0.5..=-0.25).contains(&l), "{l}");
         }
         assert_eq!(ai_wobble(3.0, 0.6), [0.0; 3]);
+    }
+
+    // 0x82153B30: a building or the ground lets a road vehicle come out
+    // in its box; something loose there doesn't.
+    #[test]
+    fn a_spawn_box_is_kept_by_what_moves_not_by_buildings() {
+        let mut p = Physics::new();
+        let block = CollisionShape::cuboid(Vec3::new(3.0, 4.0, 3.0));
+        p.add_static(StaticKey::Cell(1), &block, Vec3::ZERO, Quat::IDENTITY);
+        p.add_static(
+            StaticKey::Object(2),
+            &block,
+            Vec3::new(20.0, 0.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.5), 30.0);
+        p.add_debris(
+            &piece,
+            Mat4::from_translation(Vec3::new(40.0, 1.0, 0.0)),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        p.step(DT);
+        let around = |x: f32| (Vec3::new(x - 2.0, 0.2, -1.0), Vec3::new(x + 2.0, 3.0, 1.0));
+        let (lo, hi) = around(0.0);
+        assert!(p.box_clear(lo, hi));
+        let (lo, hi) = around(20.0);
+        assert!(p.box_clear(lo, hi));
+        let (lo, hi) = around(40.0);
+        assert!(!p.box_clear(lo, hi));
     }
 
     // What stands fixed in a boat's area, without the terrain.

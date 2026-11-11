@@ -32,11 +32,10 @@
 //!   the zone where it comes out (0x8226C618); one taken away comes again
 //!   under its entity with its new model.
 //! - One comes out only where its box (0x8226BD10,
-//!   [`road_population::spawn_box`]) meets nothing in the world but the
-//!   ground (0x82153B30 asks the broadphase; it lets some kinds of
-//!   entity by, kinds 5, 6, 7 and 9 of their +0xE0, not identified: ours
-//!   lets none by but sensors). Invented: off the roads the rings are
-//!   laid from the road she was last on.
+//!   [`road_population::spawn_box`]) meets nothing that moves: 0x82153B30
+//!   lets buildings, the ground, winches and AI occluders by
+//!   ([`m2_engine::Physics::box_clear`]). Invented: off the roads the
+//!   rings are laid from the road she was last on.
 //!   Not ported: junctions' stop lines and flow control (no layer read
 //!   holds an `RtFlowControl`); the 360's density grid for rings that
 //!   ask it; the upkeep of states 7 and 8 (0x8226AE98).
@@ -529,7 +528,7 @@ impl RoadTraffic {
             if !ask.seen.allows(seen) || !road_population::spawn_keeps(d, seen, mode) {
                 continue;
             }
-            // Its box clear of the world but the ground (0x8226BD10), and
+            // Its box clear of what moves (0x8226BD10, 0x82153B30), and
             // of those put out this frame, not yet in it.
             let (lo, hi) = road_population::spawn_box(at, dir);
             let meets = |o: &(Vec3, Vec3)| lo.cmple(o.1).all() && hi.cmpge(o.0).all();
