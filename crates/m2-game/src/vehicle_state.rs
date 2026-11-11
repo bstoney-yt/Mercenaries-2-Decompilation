@@ -29,6 +29,13 @@
 //! a script call through the store 0x83658404). The script world keeps what was asked ([`VehicleCommand`]); the game
 //! applies it. Inferred: a restored vehicle's health is its full health
 //! at once in the script world.
+//!
+//! Other libraries' vehicle calls: `Pg.FastCollectGroundVehiclesExceptTanks`
+//! (0x82335110, kind 2 only: `FastCollectCars`' kind), `Player.SetVehicleControlsLock`
+//! (0x8233DBD8), `Player.VehicleDisguise` (0x823402B8), the `Gui` entrance
+//! marker settings (0x8231C090, 0x8231C120, 0x8231C238) and
+//! `Sound.SetVehicleEngineBoost` (0x823435C8). Not ported: when the
+//! disguise callback is called, `Human.GetVehicleWeapon` (0x82325E08).
 
 use mlua::{Lua, MultiValue, Table, Value};
 
@@ -216,7 +223,11 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
         }
     };
     // 0x82335110: as `FastCollectGroundVehicles` (0x82334FE8, its kinds 3
-    // and 2), only kind 2: no tanks.
+    // and 2), only kind 2: the kind `FastCollectCars` searches
+    // (0x82334EE8); `FastCollectTanks` is kind 3 (0x82334DE8),
+    // `FastCollectBoats` kind 10 (0x82335310). The script world has no
+    // physics classes: the cars are told by labels, a `Vehicle` neither
+    // flying, `Tank` nor `Boat`.
     add(
         &lib("Pg")?,
         "FastCollectGroundVehiclesExceptTanks",
@@ -226,7 +237,7 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
                 lua,
                 a,
                 &["Vehicle"],
-                &["helicopter", "Plane", "Aircraft", "Tank"],
+                &["helicopter", "Plane", "Aircraft", "Tank", "Boat"],
             )
         },
     )?;
