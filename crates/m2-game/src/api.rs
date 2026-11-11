@@ -6645,6 +6645,50 @@ mod tests {
     }
 
     #[test]
+    fn attach_copies_a_template_and_attaches_an_object_itself() {
+        let (host, world) = setup();
+        crate::hijack::install(&host, &world).unwrap();
+        world.borrow_mut().take_commands();
+        // A hijack's pistol: a template, made new at her hand.
+        let (ok, pistol, template): (bool, Value, Value) = host
+            .lua()
+            .load(
+                "local t = Pg.GetGuidByName('Carbine')
+                 local ok, g = Object.Attach(1, 'bone_attach_rhand', t)
+                 return ok, g, t",
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
+        let (pistol, template) = (
+            crate::events::as_guid(&pistol).unwrap(),
+            crate::events::as_guid(&template).unwrap(),
+        );
+        assert!(pistol >= FIRST_SPAWNED && pistol != template);
+        // MrxTaskObjectiveVerify: an object in play goes to her left hand
+        // itself.
+        let (ok, same): (bool, bool) = host
+            .lua()
+            .load(
+                "local ok, g = Object.Attach(1, 'bone_attach_lhand', 50)
+                 return ok, g == Sys.StringToGuid('50')",
+            )
+            .eval()
+            .unwrap();
+        assert!(ok && same);
+        let props: Vec<u32> = world
+            .borrow_mut()
+            .take_commands()
+            .iter()
+            .filter_map(|c| match c {
+                Command::Hijack(crate::hijack::HijackCommand::Attach { prop, .. }) => Some(*prop),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(props, [pistol, 50]);
+    }
+
+    #[test]
     fn single_player_answers() {
         let (host, _) = setup();
         let (server, client, second): (bool, bool, Value) = host
