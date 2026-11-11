@@ -3631,8 +3631,25 @@ impl Scene {
             && player.scope.is_none()
             && let Some((model, rig)) = &player.model
         {
-            let (nodes, skin) = rig.posed();
-            let body = player.model_matrix();
+            // Down on foot she lies as her limp body fell.
+            let limp = player
+                .ragdoll
+                .zip(self.world.as_ref())
+                .and_then(|(doll, world)| world.physics.ragdoll_nodes(doll));
+            let (nodes, skin, body) = match limp {
+                Some(nodes) => {
+                    let skin: Vec<Mat4> = nodes
+                        .iter()
+                        .zip(&rig.skeleton.inverse_bind)
+                        .map(|(m, ib)| *m * *ib)
+                        .collect();
+                    (nodes, skin, Mat4::IDENTITY)
+                }
+                None => {
+                    let (nodes, skin) = rig.posed();
+                    (nodes, skin, player.model_matrix())
+                }
+            };
             model.draw_posed(backend, queue, body, &nodes, &skin)?;
             // Throwing, her weapon is put away and the grenade is in her
             // hand until it goes; calling a support strike, the

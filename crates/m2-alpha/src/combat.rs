@@ -2928,6 +2928,14 @@ impl Combat {
         }
         self.went_off.clear();
         self.struck.clear();
+        // Up again (revived, respawned, or put on her feet by a script):
+        // her limp body goes. The state table's `Resurrect` leads from
+        // `Die` and `Dead` straight to `Upright` `Idle`.
+        if !f.player.down
+            && let Some(id) = f.player.ragdoll.take()
+        {
+            f.physics.remove_ragdoll(id);
+        }
         for e in &mut self.effects {
             e.1 -= dt;
         }
@@ -3747,10 +3755,31 @@ impl Combat {
             self.down = DOWN_TIME;
             f.player.down = true;
             f.player.aiming = false;
-            if let (Some(die), Some((_, rig))) = (f.player.clips.die, &mut f.player.model) {
+            // On foot the 360 posts her `Die` (0x82287F98, when no hit's
+            // direction is picked), whose action has no clip and the mode
+            // `FULL`: she goes limp where she stands. The beta does not
+            // record where a hit landed on her, so it is always the plain
+            // death; the clip played here before (479c4a51) is `Upright`
+            // `ProneTransition`'s by the tables, not a death. In a
+            // vehicle the 360 goes by a mode of the seat, not traced:
+            // there the old clip still plays.
+            let on_foot = f.player.driving.is_none() && !f.player.seated;
+            let body = f.player.model_matrix();
+            if let Some((_, rig)) = &mut f.player.model {
                 rig.animator.set_upper(None);
                 rig.two_handed = false;
-                rig.animator.play_once(die);
+                if on_foot {
+                    let (nodes, _) = rig.posed();
+                    let world: Vec<Mat4> = nodes.iter().map(|m| body * *m).collect();
+                    // Limp from rest: what shove the 360 gives the body
+                    // was not traced.
+                    let id = f
+                        .physics
+                        .add_ragdoll(&rig.skeleton.parents, &world, Vec3::ZERO);
+                    f.player.ragdoll = Some(id);
+                } else if let Some(die) = f.player.clips.die {
+                    rig.animator.play_once(die);
+                }
             }
             f.people.stand_down();
         } else {
@@ -7175,6 +7204,61 @@ mod tests {
         vehicles[0].spec.kind = "car".into();
         vehicles[0].spec.tuning.gun = None;
         assert_eq!(vehicles[0].rounds(), None);
+    }
+
+    /// Her limp body lasts while she is down and goes when she is up
+    /// again, whatever put her back on her feet.
+    #[test]
+    fn her_limp_body_goes_when_she_is_up_again() {
+        let mut physics = ground();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut explosives = [];
+        let mut combat = Combat::default();
+        let doll = physics.add_ragdoll(&[None], &[Mat4::IDENTITY], Vec3::ZERO);
+        player.ragdoll = Some(doll);
+        player.down = true;
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut explosives,
+        };
+        combat.step(&mut field, Trigger::default(), 1.0 / 60.0);
+        assert_eq!(field.player.ragdoll, Some(doll), "kept while she is down");
+        assert!(field.physics.ragdoll_nodes(doll).is_some());
+        field.player.down = false;
+        combat.step(&mut field, Trigger::default(), 1.0 / 60.0);
+        assert_eq!(field.player.ragdoll, None);
+        assert!(field.physics.ragdoll_nodes(doll).is_none());
+    }
+
+    /// Killed on foot with no body loaded there is nothing to go limp;
+    /// she is down all the same.
+    #[test]
+    fn a_death_without_a_body_is_still_a_death() {
+        let mut physics = ground();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut explosives = [];
+        let mut combat = Combat::default();
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut explosives,
+        };
+        combat.hurt_player(&mut field, 1.0e6, None);
+        assert!(field.player.down);
+        assert_eq!(field.player.ragdoll, None);
     }
 
     #[test]
