@@ -482,8 +482,12 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             let seconds = num(a.get(1)).unwrap_or(0.0);
             w.commands
                 .push(Command::Hijack(HijackCommand::Knockdown { guid, seconds }));
+            // From the 360 code (0x82324d28): whether it is a person (with a
+            // state machine to knock down).
+            let person = w.objects.contains_key(&guid);
+            return Ok(MultiValue::from_vec(vec![Value::Boolean(person)]));
         }
-        Ok(MultiValue::new())
+        Ok(MultiValue::from_vec(vec![Value::Nil]))
     })?;
 
     let object = lib("Object")?;
@@ -497,8 +501,10 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
                     channel: text(a.get(3)).unwrap_or_default(),
                     blend: num(a.get(4)).unwrap_or(0.0),
                 }));
+            // From the 360 code (0x82332370): true once it plays.
+            return Ok(MultiValue::from_vec(vec![Value::Boolean(true)]));
         }
-        Ok(MultiValue::new())
+        Ok(MultiValue::from_vec(vec![Value::Nil]))
     })?;
     add(&object, "StopAnimationChannel", |w, _, a| {
         if let Some(guid) = id(a.first()) {

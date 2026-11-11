@@ -2248,13 +2248,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Boolean(carrying)])
     })?;
     // Human.Drop(character): puts down whom it carries.
+    // From the 360 code (0x82325100): whether the person was carrying
+    // something (and so drops it); nil for no person.
     add(&human, "Drop", |w, _, a| {
-        if let Some(guid) = id(a.first())
-            && w.carrying.contains_key(&guid)
-        {
+        let Some(guid) = id(a.first()) else {
+            return values([Value::Nil]);
+        };
+        let carrying = w.carrying.contains_key(&guid);
+        if carrying {
             w.commands.push(Command::Drop(guid));
         }
-        values([])
+        values([Value::Boolean(carrying)])
     })?;
     // Human.PlayRawAnimation(character, clip, false, false, -1, true,
     // true): the one call site (WifHq._NextCinematicFrame) plays each
@@ -2399,7 +2403,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&weapon, "SetReserveAmmo", |w, _, a| {
         let (Some(g), Some(rounds)) = (id(a.first()), num(a.get(1))) else {
-            return values([]);
+            return values([Value::Nil]);
         };
         let rounds = rounds.max(0.0) as u32;
         let name = w.weapon_name(g);
@@ -2411,8 +2415,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 weapon,
                 rounds,
             });
+            // From the 360 code (0x82349b48): true for a weapon, nil else.
+            return values([Value::Boolean(true)]);
         }
-        values([])
+        values([Value::Nil])
     })?;
     // The number of the player controlling it (scripts pass it on to
     // `Player.IsLocal` and key tables by it), else nil.
@@ -2471,8 +2477,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             o.labels.retain(|x| *x != l);
             let h = m2_assets::name_hash(&l);
             o.label_hashes.retain(|&x| x != h);
+            // From the 360 code (0x823307f8): true once it had a label and
+            // an object, false without.
+            return values([Value::Boolean(true)]);
         }
-        values([])
+        values([Value::Boolean(false)])
     })?;
     add(&object, "GetName", |w, lua, a| {
         let g = id(a.first());
@@ -2558,7 +2567,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // that coming back is no "exit".
     add(&player, "SetOutBoundary", |w, _, a| {
         w.outside = matches!(a.get(1), Some(Value::Boolean(true)));
-        values([])
+        // From the 360 code (0x8233ceb0): true.
+        values([Value::Boolean(true)])
     })?;
     // A character's camera: the game's one camera looks over the player,
     // so it is named by her guid, and its yaw is hers (`Camera.GetYaw`:
@@ -3215,7 +3225,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             target: None,
             haste: num(a.get(4)),
         });
-        values([])
+        // From the 360 code (0x82311c50): false, once it has a place to go;
+        // nothing without one.
+        if location.is_none() {
+            return values([]);
+        }
+        values([Value::Boolean(false)])
     })?;
 
     // Single player: this machine is the server.
@@ -3245,7 +3260,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => String::new(),
         };
         w.commands.push(Command::Save { slot });
-        values([])
+        // From the 360 code (0x823387c8): the save's own answer; the game
+        // saves here, so true (inferred).
+        values([Value::Boolean(true)])
     })?;
     for name in [
         "ContractActivated",
@@ -5760,6 +5777,34 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((orig, copy, players), (2, 1, true));
+    }
+
+    #[test]
+    fn natives_past_160_answer_as_the_360_ones_do() {
+        let (host, world) = setup();
+        crate::hijack::install(&host, &world).unwrap();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        for code in [
+            "Object.AddLabel(50, 'Target') return Object.RemoveLabel(50, 'Target')",
+            "return Player.SetOutBoundary(Player.GetLocalPlayer(), false)",
+            "return Pg.SaveGame('slot')",
+            "return Human.Knockdown(50, 2)",
+            "return Object.PlayAnimation(50, 'open', false)",
+        ] {
+            assert_eq!(ask(code), Value::Boolean(true), "{code}");
+        }
+        assert_eq!(
+            ask("return Object.RemoveLabel(999, 'Target')"),
+            Value::Boolean(false)
+        );
+        assert_eq!(ask("return Human.Drop(50)"), Value::Boolean(false));
+        assert_eq!(
+            ask("return Ai.Deliver(50, 1, 2, 3, 10)"),
+            Value::Boolean(false)
+        );
+        assert!(ask("return Weapon.SetReserveAmmo(999, 3)").is_nil());
+        assert!(ask("return Human.Knockdown(nil, 2)").is_nil());
     }
 
     #[test]
