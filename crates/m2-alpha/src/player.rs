@@ -38,6 +38,7 @@ pub const JENNIFER: HumanMotion = HumanMotion {
     crouch_walk: 1.5,
     capsule_radius: 0.4,
     capsule_height: 1.8,
+    falls: on_foot::HERO_FALLS,
 };
 /// Seconds after take-off before touching the ground counts as landing.
 const MIN_AIR: f32 = 0.15;
@@ -405,8 +406,15 @@ pub struct Player {
     /// Jump was pressed while she was landing: she jumps again as the
     /// landing ends.
     jump_queued: bool,
+    /// Whether she carries someone (a subdued prisoner): her gaits are
+    /// then the `Carrying` stance's ([`crate::held::Moves::carrying`]; from
+    /// the 360 code, the stance's own locomotion node).
+    pub carrying: bool,
     /// Seconds into a grenade throw, while she throws.
     pub throwing: Option<f32>,
+    /// The throw's clip and when in it the grenade leaves her hand, picked
+    /// as it starts ([`Player::start_throw`]).
+    throw_clip: Option<(usize, f32)>,
     /// A melee bash, while she bashes: she stands, facing the camera's
     /// way.
     pub bashing: Option<Bash>,
@@ -414,9 +422,18 @@ pub struct Player {
     pub launcher: bool,
     /// Down (out of health): she lies where she fell.
     pub down: bool,
+    /// How far she falls, from leaving the ground to coming down
+    /// ([`on_foot::FallWatch`]), and a fall that hurt her this step, for
+    /// the fight to take from her health.
+    fall: on_foot::FallWatch,
+    pub fell: Option<on_foot::Fell>,
     /// Sitting in the seat of the vehicle she drives, posed and placed
     /// there (`hijack::Hijacks::seat`): drawn though driving.
     pub seated: bool,
+    /// Her limp body, while she is down from a death on foot: the 360's
+    /// plain `Die` has no clip and makes a person a ragdoll at once
+    /// ([`crate::combat::Combat`] makes it and takes it away).
+    pub ragdoll: Option<m2_engine::RagdollId>,
     /// Seated: model to world for her body, the vehicle's whole turn
     /// (pitch and roll as well as heading) with her clip's origin on the
     /// seat ([`model_matrix`](Self::model_matrix)).
@@ -430,6 +447,11 @@ pub struct Player {
     shown: InHand,
     /// A weapon switch, while it plays over her upper body.
     pub switching: Option<Switch>,
+    /// Standing still: the idle, the second idle or the fidget, as the
+    /// 360's standing mode times them ([`m2_engine::stand_idle`]), and
+    /// the seconds the fidget has played.
+    stand: m2_engine::stand_idle::StandIdle,
+    fidgeted: f32,
     /// Her binoculars, while they are up ([`crate::binoculars`]): the
     /// frame is seen through them and her body is left out.
     pub binoculars: Option<Binoculars>,
@@ -623,16 +645,23 @@ impl Player {
             last_yaw: yaw,
             leap: Leap::No,
             jump_queued: false,
+            carrying: false,
             throwing: None,
+            throw_clip: None,
             bashing: None,
             launcher: false,
             down: false,
+            fall: on_foot::FallWatch::default(),
+            fell: None,
             seated: false,
+            ragdoll: None,
             seat_frame: None,
             moves: Moves::default(),
             in_hand: InHand::default(),
             shown: InHand::default(),
             switching: None,
+            stand: m2_engine::stand_idle::StandIdle::new(0.5),
+            fidgeted: 0.0,
             picking: None,
             reloading: None,
             binoculars: None,
@@ -669,9 +698,6 @@ impl Player {
     pub fn set_body(&mut self, model: Option<(GpuModel, Rig)>, clips: FightClips, moves: Moves) {
         self.model = model;
         self.clips = clips;
-        if let Some((_, rig)) = &self.model {
-            self.clips.sprint = crate::npc::two_handed_sprint(rig, self.clips.run_low);
-        }
         self.moves = moves;
         self.leap = Leap::No;
         self.jump_queued = false;
@@ -715,9 +741,6 @@ impl Player {
             l.clips.extend(set.gaits.iter().copied());
             let gait = rig.gait;
             rig.set_gait(gait);
-        }
-        if let Some((_, rig)) = &self.model {
-            self.clips.sprint = crate::npc::two_handed_sprint(rig, self.clips.run_low);
         }
     }
 
@@ -775,12 +798,39 @@ impl Player {
     /// Starts throwing a grenade, if she has a throw to play and isn't
     /// throwing already: the seconds until it leaves her hand. `None`
     /// without the clip (the grenade goes at once).
+    ///
+    /// From the 360 code ([`m2_engine::hero_action`]): the throw is
+    /// `ThrowGrenadeRun` on the move and `ThrowGrenadeIdle` standing, to
+    /// the front, back, left or right by the angle from the way she faces
+    /// to the way she throws (the camera's), and the tables give the clip
+    /// for what she holds ([`crate::held::Held::throws`]). On the move is
+    /// her gait above a walk (inferred: the program tests its pace bits
+    /// above 1, whose values were not traced). Where the tables give her
+    /// none, the throw found by name plays as before.
     pub fn start_throw(&mut self) -> Option<f32> {
         if self.throwing.is_some() {
             return None;
         }
-        let (_, release) = self.clips.throw?;
-        self.model.as_ref()?;
+        let (_, rig) = self.model.as_ref()?;
+        let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
+        let moving = !matches!(
+            crate::scene::loco_gait(self.motion.paces, moved),
+            Gait::Idle | Gait::Walk
+        );
+        let way = m2_engine::hero_action::throw_way(self.facing - self.yaw);
+        let tabled = self
+            .moves
+            .of(self.shown.class)
+            .and_then(|h| h.throws.get(&(moving, way)).copied());
+        let (clip, release) = tabled.or(self.clips.throw)?;
+        eprintln!(
+            "anim: throw {:08x} ({}, {}{})",
+            rig.clips[clip].hash,
+            m2_engine::hero_action::throw_action(moving),
+            way.name(),
+            if tabled.is_some() { "" } else { "; by name" }
+        );
+        self.throw_clip = Some((clip, release));
         self.throwing = Some(0.0);
         Some(release)
     }
@@ -1021,6 +1071,11 @@ impl Player {
             direction
         };
         if self.update_swim(physics, swim_push, self.swim_speeds[pace], dt) {
+            // In the water no fall is being measured (inferred: the 360
+            // does not send the fall's distance under two flags of the
+            // physics object that were not traced; a dive must not cost
+            // her health when she walks out).
+            self.fall = on_foot::FallWatch::default();
             self.camera(physics);
             return;
         }
@@ -1107,6 +1162,23 @@ impl Player {
             .takes_off(intent.jump, bashing)
             .then(|| self.motion.jump_speed());
         physics.move_character(&mut self.character, wanted, jump, dt);
+        // A fall that hurts: the 360 measures it from where she left the
+        // ground, and by her template's limits it costs her health and
+        // posts `FallImpactLight` or `FallImpactHeavy`.
+        let fallen = self
+            .fall
+            .step(!self.character.grounded, self.character.position.y)
+            .and_then(|d| on_foot::fall_impact(&self.motion.falls, d).map(|f| (d, f)));
+        if let Some((distance, fell)) = fallen {
+            eprintln!(
+                "fall: {distance:.1} m, {} damage{}",
+                fell.damage,
+                fell.impact
+                    .map_or(String::new(), |i| format!(", {}", i.name()))
+            );
+            self.fell = Some(fell);
+        }
+        let impact = fallen.and_then(|(_, f)| f.impact);
 
         // Aiming, throwing or bashing, she turns the camera's way.
         let aimed = self.aiming || self.throwing.is_some() || bashing;
@@ -1226,6 +1298,10 @@ impl Player {
                     h.crouch.iter().find(|(g, b, _)| *g == gait && *b == back)
                 })
                 .map(|&(_, _, c)| c);
+            // Carrying someone she is `Carrying`: its gait's clip, whole.
+            let carried = (self.carrying && !self.aiming)
+                .then(|| self.moves.carry_clip(gait))
+                .flatten();
             // The jump: a take-off (on the run or standing), the air,
             // and a landing.
             if jump.is_some() {
@@ -1295,6 +1371,15 @@ impl Player {
                     }
                     Leap::Land(..) | Leap::No => Leap::No,
                 };
+            }
+            // A fall that hurt plays its impact in the landing's place.
+            if let Some(i) = impact
+                && let Some(clip) =
+                    self.moves.fall_impacts[usize::from(i == on_foot::FallImpact::Heavy)]
+            {
+                rig.animator
+                    .play_action(clip, true, m2_assets::name_hash(i.name()));
+                self.leap = Leap::Land(0.0, clip);
             }
             let leaping = self.leap != Leap::No;
             // The launcher rides on her shoulder, as when she aims it.
@@ -1374,11 +1459,81 @@ impl Player {
                 let upper = (gait != Gait::Idle).then_some(clips.aim).flatten();
                 rig.animator.set_upper(upper.zip(rig.upper.clone()));
                 rig.two_handed = rig.barrel;
+            } else if let Some(c) = carried {
+                rig.gait = gait;
+                rig.play_gait(c);
+                rig.animator.set_upper(None);
+                rig.two_handed = false;
             } else {
-                rig.hold_rifle(gait, clips, carry);
-                // A pistol is held in the right hand alone.
-                if !rig.barrel {
-                    rig.two_handed = false;
+                // Standing still and not aiming she is in the 360's
+                // standing mode: its second idle after a while and its
+                // fidget now and then ([`m2_engine::stand_idle`]), for
+                // what she holds. Anything else she does starts the waits
+                // again (inferred: the 360 leaves the standing mode, or
+                // the action, for those).
+                use m2_engine::stand_idle::{Person, StandIdle, Standing};
+                let held = self.moves.of(self.shown.class);
+                let (settled, fidget) = held.map_or((None, None), |h| (h.settled, h.fidget));
+                let still = gait == Gait::Idle
+                    && !self.aiming
+                    && self.bashing.is_none()
+                    && self.picking.is_none()
+                    && self.throwing.is_none()
+                    && self.switching.is_none()
+                    && self.reloading.is_none()
+                    && self.stopping.is_none();
+                // The wait's random part, from where she stands (the
+                // 360's is its random number; which she gets is invented).
+                let at = self.character.position;
+                let roll = ((at.x * 12.9898 + at.z * 78.233).sin() * 43_758.547)
+                    .fract()
+                    .abs();
+                if still {
+                    let fidget_length = fidget.map_or(0.0, |c| rig.clips[c].info.duration);
+                    let person = Person {
+                        aiming: false,
+                        held: false,
+                        has_settled: settled.is_some(),
+                        // Not aiming, her aim rests ahead of her (inferred).
+                        aim_yaw: 0.0,
+                        fidget_done: fidget.is_none() || self.fidgeted >= fidget_length,
+                    };
+                    if let Some(to) = self.stand.step(dt, person, roll) {
+                        self.fidgeted = 0.0;
+                        eprintln!("anim: standing {to:?}");
+                    }
+                    if self.stand.state == Standing::Fidget {
+                        self.fidgeted += dt;
+                    }
+                } else {
+                    self.stand = StandIdle::new(roll);
+                    self.fidgeted = 0.0;
+                }
+                let clip = match self.stand.state {
+                    Standing::Settled => settled,
+                    Standing::Fidget => fidget,
+                    Standing::Idle => None,
+                };
+                match clip.filter(|_| still) {
+                    Some(c) => {
+                        // A clip of the locomotion node's, as its gaits
+                        // are: faded over the node's 0.3 s, from its start.
+                        let fresh = rig.animator.current().is_none_or(|(i, _)| i != c);
+                        rig.gait = gait;
+                        rig.play_gait(c);
+                        if fresh {
+                            rig.animator.restart();
+                        }
+                        rig.animator.set_upper(None);
+                        rig.two_handed = rig.barrel;
+                    }
+                    None => {
+                        rig.hold_rifle(gait, clips, carry);
+                        // A pistol is held in the right hand alone.
+                        if !rig.barrel {
+                            rig.two_handed = false;
+                        }
+                    }
                 }
             }
             // A weapon switch: what she holds goes away over her upper
@@ -1416,7 +1571,7 @@ impl Player {
                 }
             }
             // A throw plays over the upper body, whatever the legs do.
-            match (self.throwing, clips.throw, rig.upper.clone()) {
+            match (self.throwing, self.throw_clip, rig.upper.clone()) {
                 (Some(t), Some((clip, _)), Some(mask)) if t < rig.clips[clip].info.duration => {
                     rig.animator.upper_at(clip, mask, t);
                     rig.two_handed = false;
@@ -1452,8 +1607,9 @@ impl Player {
             } else if leaping || self.stopping.is_some() {
                 1.0
             } else {
-                match crouched.map(|c| rig.clips[c].info.speed) {
-                    // Crouched and moving, its stride to her speed.
+                match crouched.or(carried).map(|c| rig.clips[c].info.speed) {
+                    // Crouched (or carrying) and moving, its stride to
+                    // her speed.
                     Some(s) if gait != Gait::Idle && s > 0.1 => moved / s,
                     Some(_) => 1.0,
                     None => rig.play_rate(gait, moved, 0),

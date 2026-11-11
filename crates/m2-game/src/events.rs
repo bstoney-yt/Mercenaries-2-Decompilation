@@ -720,7 +720,13 @@ impl Events {
             let mut fired = Vec::new();
             let mut keep = Vec::with_capacity(s.pending.len());
             for mut p in std::mem::take(&mut s.pending) {
-                let extra = match check(&p, now, &posted, accepted, world) {
+                // The wildcard characters stand for her ([`with_wildcards`]).
+                let own = with_wildcards(&mut p, world);
+                let checked = check(&p, now, &posted, accepted, world);
+                if let Some(own) = own {
+                    p.params = own;
+                }
+                let extra = match checked {
                     Check::Fire(extra) => Some(vec![extra]),
                     Check::FireWords(mut extra, words) => {
                         let lua = s.lua.0.as_ref().and_then(mlua::WeakLua::try_upgrade);
@@ -980,6 +986,44 @@ fn fire(store: &RefCell<Store>, fired: Vec<Fired>) -> Vec<EventError> {
     errors
 }
 
+/// `Player.GetAnyCharacter()`'s answer: the wildcard for any player's
+/// character (0x8233e8c8).
+pub const ANY_CHARACTER: u32 = 0xf000_0000;
+/// `Player.GetAllCharacters()`'s answer: the wildcard for every player's
+/// character (0x8233e928).
+pub const ALL_CHARACTERS: u32 = 0xf000_0001;
+
+/// Puts the player's character in the place of the wildcard characters in
+/// a pending event's parameters, for one check; returns the scripts' own
+/// table to put back. None when there are none.
+///
+/// From the 360 code: an event subject of `ANY_CHARACTER` holds when the
+/// condition holds for any active player's character; `ALL_CHARACTERS`
+/// only when it holds for every one (a bit per player, 0x82359f80). With
+/// one player both are her. Other natives handed a wildcard find no object
+/// in it, as on the 360.
+fn with_wildcards(p: &mut Pending, world: &dyn World) -> Option<Table> {
+    let wild = |v: &Value| {
+        matches!(as_guid(v), Some(ANY_CHARACTER | ALL_CHARACTERS))
+            && matches!(v, Value::LightUserData(_))
+    };
+    let values: Vec<(Value, Value)> = p
+        .params
+        .pairs::<Value, Value>()
+        .filter_map(Result::ok)
+        .collect();
+    if !values.iter().any(|(_, v)| wild(v)) {
+        return None;
+    }
+    let lua = p.lua.0.try_upgrade()?;
+    let her = world.player().map_or(Value::Nil, guid_value);
+    let copy = lua.create_table().ok()?;
+    for (k, v) in values {
+        let v = if wild(&v) { her.clone() } else { v };
+        copy.raw_set(k, v).ok()?;
+    }
+    Some(std::mem::replace(&mut p.params, copy))
+}
 /// A guid as scripts see it: userdata, as in the game (scripts check
 /// `type(target) == "userdata"`). Light userdata compares by value, so the
 /// same guid is equal to itself and works as a table key.

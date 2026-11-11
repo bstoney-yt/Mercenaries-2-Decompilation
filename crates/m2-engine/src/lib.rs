@@ -14,10 +14,12 @@
 //! game's data directly (see `docs/alpha-roadmap.md`).
 
 pub mod ai;
+pub mod ai_anchor;
 pub mod ai_close;
 pub mod ai_cover;
 pub mod ai_dither;
 pub mod ai_plan;
+pub mod ai_sense;
 pub mod ai_target;
 pub mod aim_sweep;
 pub mod ambience;
@@ -30,6 +32,7 @@ pub mod boat_attack;
 pub mod car_attack;
 pub mod car_driver;
 pub mod collision_layers;
+pub mod death;
 pub mod durability;
 pub mod grapple;
 pub mod gun_sounds;
@@ -37,6 +40,7 @@ pub mod gunner_aim;
 pub mod hand_ik;
 pub mod heli_land;
 pub mod heli_pilot;
+pub mod hero_action;
 pub mod hijack;
 pub mod ladder;
 pub mod lights;
@@ -63,6 +67,7 @@ pub mod scatter;
 pub mod seats;
 pub mod sound_regions;
 pub mod spawn_sound;
+pub mod stand_idle;
 pub mod standin;
 pub mod stream;
 pub mod surface;

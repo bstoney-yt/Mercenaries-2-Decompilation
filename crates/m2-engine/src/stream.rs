@@ -620,6 +620,9 @@ pub struct World {
     inland: Option<(VertexBufferHandle, IndexBufferHandle, u32)>,
     /// The sky's cloud noise, if it loaded.
     pub cloud_noise: Option<m2_render::TextureHandle>,
+    /// The sun flare's texture (`radial_flare`), as the game's post pass
+    /// loads it (0x821BB010).
+    pub sun_flare: Option<m2_render::TextureHandle>,
     stats: WorldStats,
     /// Placed objects (index into the index's `objects`) blown up: drawn
     /// as their wrecks, or not at all without one.
@@ -725,6 +728,15 @@ impl World {
         }
         materials.pin(noise);
         let cloud_noise = materials.texture(noise).map(|(t, _)| t);
+        // The sun flare's texture, which the game's post pass loads by
+        // name (0x821BB010).
+        let flare = m2_assets::name_hash("radial_flare");
+        match source.texture(flare, 512) {
+            Ok(t) => materials.add_texture(backend, flare, Some(&t))?,
+            Err(e) => eprintln!("sun flare texture {flare:08x}: {e}"),
+        }
+        materials.pin(flare);
+        let sun_flare = materials.texture(flare).map(|(t, _)| t);
         // The trees' far stand-ins, ready from the start: few, and small.
         let mut far_trees = Vec::with_capacity(index.far_trees.len());
         for tree in &index.far_trees {
@@ -771,6 +783,7 @@ impl World {
             sea,
             inland,
             cloud_noise,
+            sun_flare,
             stats: WorldStats::default(),
             destroyed: HashSet::new(),
             loose: HashMap::new(),
@@ -1539,6 +1552,8 @@ impl World {
                         skin: None,
                         instances: None,
                         uv_offset: [0.0; 2],
+                        tint: [1.0; 4],
+                        beams_lit: false,
                     },
                     layer: Layer::WORLD,
                     translucent,
@@ -1695,6 +1710,8 @@ impl World {
                 skin: None,
                 instances: None,
                 uv_offset: [0.0; 2],
+                tint: [1.0; 4],
+                beams_lit: false,
             },
             layer: Layer::WORLD,
             translucent: true,
@@ -1717,6 +1734,8 @@ impl World {
                     skin: None,
                     instances: None,
                     uv_offset: [0.0; 2],
+                    tint: [1.0; 4],
+                    beams_lit: false,
                 },
                 layer: Layer::WORLD,
                 translucent: true,
@@ -1915,6 +1934,8 @@ impl World {
                         skin: None,
                         instances: Some(instances),
                         uv_offset: [0.0; 2],
+                        tint: [1.0; 4],
+                        beams_lit: false,
                     },
                     layer: Layer::WORLD,
                     translucent: c.translucent,
@@ -1979,6 +2000,8 @@ impl World {
                         skin: None,
                         instances: Some(instances),
                         uv_offset: [0.0; 2],
+                        tint: [1.0; 4],
+                        beams_lit: false,
                     },
                     layer: Layer::WORLD,
                     translucent,

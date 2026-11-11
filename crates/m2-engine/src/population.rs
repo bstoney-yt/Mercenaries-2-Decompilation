@@ -316,6 +316,9 @@ pub struct SpawnerSlot {
     pub group: u32,
     pub state: u32,
     pub chance_not_active: u8,
+    /// Its `SpawnerType`: one of type
+    /// [`crate::ai_anchor::ANCHORING_SPAWNER`] anchors whom it sends.
+    pub kind: u32,
     /// Its `SpawnerName` (field 32): an object has one spawner of each
     /// name, its own record's before its template's (from the 360 code,
     /// 82242BD8, which skips a name it already has).
@@ -425,6 +428,7 @@ pub fn spawner_records(c: &Component<'_>) -> Vec<(Spawner, SpawnerSlot)> {
                     group: word(r, group).unwrap_or(0),
                     state: word(r, state).unwrap_or(1),
                     chance_not_active: r.get(chance).copied().unwrap_or(0),
+                    kind: word(r, kind).unwrap_or(0),
                     name: word(r, name).unwrap_or(0),
                     template: false,
                 },
@@ -769,6 +773,7 @@ mod tests {
             group: 0,
             state,
             chance_not_active: 0,
+            kind: 0,
             name,
             template: false,
         };
