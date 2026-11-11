@@ -872,6 +872,8 @@ pub struct ScriptWorld {
     pub wait_for_in_game: bool,
     /// Places people kept by `Human.PersistTransform`: place and yaw.
     pub persisted: HashMap<u32, ([f32; 3], f32)>,
+    /// The VO system's (speaker, priority) sequences (`VO.AddSequence`).
+    pub vo_sequences: Vec<(u32, i32)>,
     /// What the scripts want on the player's screen.
     pub hud: crate::hud::Hud,
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
@@ -1675,6 +1677,9 @@ fn category(v: Option<&Value>) -> Option<String> {
 pub const FACTIONS: [&str; 9] = [
     "Allied", "China", "Civ", "Guerilla", "OC", "Pirate", "PMC", "VZ", "Police",
 ];
+
+/// How many VO sequences the engine keeps (from the 360 code: 0x20).
+const VO_SEQUENCES: usize = 32;
 
 /// [`Object.GetHibernationDistance`]'s answer, metres.
 const HIBERNATION_DISTANCE: f64 = 155.0;
@@ -4298,9 +4303,41 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         // From the 360 code (0x82349230, 0x82277cc0): always true.
         values([Value::Boolean(true)])
     })?;
-    for name in ["AddSequence", "RemoveSequence"] {
-        add(&vo, name, |_, _, _| values([]))?;
-    }
+    // From the 360 code: the VO system keeps up to 32 (speaker, priority)
+    // pairs. `VO.AddSequence(speaker, priority)` (0x82349690) adds one
+    // and answers true; false when the list is full or the speaker
+    // already holds one with a higher number than the new one. The
+    // engine also starts the speaker's sequence then (0x822783b0, not
+    // traced). `VO.RemoveSequence(speaker, priority)` (0x823497b0) takes
+    // out that exact pair and answers whether it was there. Nil for bad
+    // arguments.
+    add(&vo, "AddSequence", |w, _, a| {
+        let (Some(speaker), Some(priority)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let priority = priority as i32;
+        let full = w.vo_sequences.len() >= VO_SEQUENCES;
+        let outranked = w
+            .vo_sequences
+            .iter()
+            .any(|&(s, p)| s == speaker && priority < p);
+        if full || outranked {
+            return values([Value::Boolean(false)]);
+        }
+        w.vo_sequences.push((speaker, priority));
+        values([Value::Boolean(true)])
+    })?;
+    add(&vo, "RemoveSequence", |w, _, a| {
+        let (Some(speaker), Some(priority)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let pair = (speaker, priority as i32);
+        let Some(at) = w.vo_sequences.iter().position(|&p| p == pair) else {
+            return values([Value::Boolean(false)]);
+        };
+        w.vo_sequences.swap_remove(at);
+        values([Value::Boolean(true)])
+    })?;
     // Priorities the sequences copy at load and compare: a new sequence
     // whose number is no higher than the running one's cuts it off, so the
     // most important is lowest. Only the order is known, not the values.
@@ -7201,6 +7238,27 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn vo_sequences_are_kept_as_the_360_keeps_them() {
+        let (host, world) = setup();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        assert_eq!(ask("return VO.AddSequence(50, 5)"), Value::Boolean(true));
+        // The speaker holds one numbered higher than 3: refused.
+        assert_eq!(ask("return VO.AddSequence(50, 3)"), Value::Boolean(false));
+        assert_eq!(ask("return VO.AddSequence(50, 7)"), Value::Boolean(true));
+        assert_eq!(ask("return VO.RemoveSequence(50, 5)"), Value::Boolean(true));
+        assert_eq!(
+            ask("return VO.RemoveSequence(50, 5)"),
+            Value::Boolean(false)
+        );
+        assert!(ask("return VO.AddSequence(50)").is_nil());
+        assert_eq!(world.borrow().vo_sequences, [(50, 7)]);
+        // At most 32.
+        world.borrow_mut().vo_sequences = (0..32).map(|i| (100 + i, 1)).collect();
+        assert_eq!(ask("return VO.AddSequence(1, 1)"), Value::Boolean(false));
     }
 
     #[test]
