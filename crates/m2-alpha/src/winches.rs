@@ -29,7 +29,11 @@
 //!   [`m2_engine::Physics::cargo_hang_point`]). Letting go (0x82195FF8)
 //!   with cargo on starts the time hung empty again (+0x168), which
 //!   grows each step while out and empty (0x82195780); the magnet looks
-//!   once it is over two seconds.
+//!   once it is over two seconds. A step: the state's work, the magnet,
+//!   the time hung empty, then the stretch check (0x82198308).
+//! - `Object.IsWinched` (0x82333330) answers from the cargo's body's
+//!   constraints the winch whose cargo (+0x170) it is: so the scripts
+//!   hear of what a magnet took ([`Winches::told`]).
 //! - The links' radius is 0.3 ([`m2_engine::physics::LINK_RADIUS`]) and
 //!   their mass 102 400 ([`m2_engine::physics::LINK_MASS`]).
 //!
@@ -41,10 +45,6 @@
 //! - Cargo other than vehicles (props, crates, people): the cable hooks
 //!   vehicles' bodies only. The scripts' cargo on their AI flights still
 //!   hangs as [`crate::flights`] carries it.
-//! - The scripts' `Object.IsWinched` does not hear of what a magnet took.
-//! - The order within a step: the 360 runs the magnet before the stretch
-//!   check (0x82195780); here the winch's own step runs the stretch check
-//!   first.
 //! - A hardpoint record's own link radius (+0x1F4).
 
 use std::collections::HashMap;
@@ -90,6 +90,8 @@ pub struct Winches {
     seen: std::collections::HashSet<VehicleId>,
     /// Each model's nodes (name hash, place in its space), as looked up.
     nodes: HashMap<u32, Vec<(u32, Vec3)>>,
+    /// The cargo (guids) the scripts were told hangs on a winch.
+    told: std::collections::HashSet<u32>,
 }
 
 impl Winches {
@@ -136,6 +138,16 @@ impl Winches {
         self.by_vehicle.values().any(ready)
     }
 
+    /// Notes that the scripts were told `cargo` (a guid) hangs on a
+    /// winch, or no longer; answers whether they had been told it did.
+    pub fn told(&mut self, cargo: u32, hangs: bool) -> bool {
+        if hangs {
+            !self.told.insert(cargo)
+        } else {
+            self.told.remove(&cargo)
+        }
+    }
+
     /// The helicopter whose winch `cargo` hangs on.
     pub fn carrier_of(&self, cargo: VehicleId) -> Option<VehicleId> {
         self.by_vehicle
@@ -175,8 +187,7 @@ impl Winches {
         let (n, each) = frame_steps(dt);
         for _ in 0..n {
             for (&id, w) in &mut self.by_vehicle {
-                let stretched = w.cable.is_some_and(|c| physics.cable_stretched(c));
-                let c = w.winch.step(each, stretched);
+                let c = w.winch.step_state(each);
                 apply(physics, id, w, c);
                 if let Some(taken) = magnet(physics, id, w, cargo) {
                     took.push((id, taken));
@@ -184,6 +195,9 @@ impl Winches {
                 if w.cargo.is_none() && w.winch.state != WinchState::Retracted {
                     w.empty += each;
                 }
+                let stretched = w.cable.is_some_and(|c| physics.cable_stretched(c));
+                let c = w.winch.step_stretch(each, stretched);
+                apply(physics, id, w, c);
             }
         }
         took
@@ -438,6 +452,11 @@ mod tests {
             p.step_frame(1.0 / 60.0);
         }
         assert_eq!(took, vec![(id, load2)]);
+        // The scripts hear of it once, and once it goes.
+        assert!(!ws.told(9, true));
+        assert!(ws.told(9, true));
+        assert!(ws.told(9, false));
+        assert!(!ws.told(9, false));
         assert_eq!(ws.carrier_of(load2), Some(id));
         assert!(ws.by_vehicle[&id].winch.cargo);
         // Let go: the time hung empty starts again.

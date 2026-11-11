@@ -349,8 +349,21 @@ impl Winch {
 
     /// One step of `dt` (0x82195780's state work and 0x82198308);
     /// `stretched`: the links are as far apart as 0x82198308 counts as
-    /// stretched.
+    /// stretched. [`step_state`](Self::step_state) then
+    /// [`step_stretch`](Self::step_stretch), with nothing between (the
+    /// 360's update runs the magnet between them).
     pub fn step(&mut self, dt: f32, stretched: bool) -> Change {
+        let mut c = self.step_state(dt);
+        let s = self.step_stretch(dt, stretched);
+        c.add += s.add;
+        c.take += s.take;
+        c.drop |= s.drop;
+        c
+    }
+
+    /// The first part of a step (0x82195780): the state's work, paying
+    /// out or reeling in, and the cargo dropped reeling in.
+    pub fn step_state(&mut self, dt: f32) -> Change {
         let mut c = Change::default();
         match self.state {
             WinchState::Retracted => {
@@ -373,7 +386,13 @@ impl Winch {
         {
             self.drop(&mut c);
         }
-        // 0x82198308.
+        c
+    }
+
+    /// The last part of a step, 0x82198308: stretched over 0.2 s, the
+    /// cargo drops, or with none it reels in.
+    pub fn step_stretch(&mut self, dt: f32, stretched: bool) -> Change {
+        let mut c = Change::default();
         if self.state == WinchState::Deployed && self.links > 1 && stretched {
             self.stretched += dt;
         } else if self.state != WinchState::Retracting {

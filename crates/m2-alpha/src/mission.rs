@@ -2957,11 +2957,28 @@ impl MissionLink {
             // on them (`Object.GetHardpointPosition(truck, "HP_Truckbed")`),
             // and their winches' states (`Object.HasWinch`,
             // `Object.GetWinchState`).
+            let mut hangs = Vec::new();
             if let Some(world) = game.scene.world.as_ref() {
                 for v in &game.scene.vehicles {
                     if let Some(g) = v.guid {
                         let state = v.id.and_then(|id| game.winches.state(id));
                         mission.set_winch(g, state.map(|s| s as u8));
+                        // What hangs on the winches in play
+                        // (`Object.IsWinched`, 0x82333330: the winch whose
+                        // cargo it is): a magnet's take too; none once let
+                        // go.
+                        let guid_of = |id| {
+                            game.scene
+                                .vehicles
+                                .iter()
+                                .find(|o| o.id == Some(id))
+                                .and_then(|o| o.guid)
+                        };
+                        hangs.push((
+                            g,
+                            v.id.and_then(|id| game.winches.carrier_of(id))
+                                .and_then(guid_of),
+                        ));
                     }
                     if let (Some(g), Some(id)) = (v.guid, v.id)
                         && let Some(bed) = game.bed(v.spec.model)
@@ -2973,6 +2990,11 @@ impl MissionLink {
                             t.transform_point3(bed).to_array(),
                         );
                     }
+                }
+            }
+            for (g, hung) in hangs {
+                if game.winches.told(g, hung.is_some()) || hung.is_some() {
+                    mission.set_winched(g, hung);
                 }
             }
             // What rides on a vehicle is where it rides, for the scripts
