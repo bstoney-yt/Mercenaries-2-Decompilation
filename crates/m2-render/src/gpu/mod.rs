@@ -99,6 +99,12 @@ const SEA_MIRROR_REACH: f32 = 600.0;
 /// 1.27-1.35).
 const SKY_QUAD: f32 = 64000.0;
 
+/// The cosine of the sun disc's angular radius: the game draws a 64-sided
+/// disc of radius 0.8 at 16 m along the sun's way (from the 360 code: the
+/// disc built at 0x821D0538, placed and scaled at 0x821D0A28), about
+/// 2.86 degrees. Taken as a circle (its sides lie within 0.12% of it).
+const SUN_DISC_COS: f32 = 0.998_752_3;
+
 /// A generational slot map, as in the null backend.
 #[derive(Debug)]
 struct Slots<T> {
@@ -287,6 +293,9 @@ struct FrameUniforms {
     lights: [[f32; 4]; 2 * POINT_LIGHTS],
     /// x: how many of them.
     light_info: [f32; 4],
+    /// The sun's disc: rgb its colour (display values, black for none),
+    /// w the cosine of its angular radius ([`SUN_DISC_COS`]).
+    sun_disc: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -2331,6 +2340,7 @@ impl WgpuBackend {
                 0.0,
                 0.0,
             ],
+            sun_disc: l.sun_disc.extend(SUN_DISC_COS).to_array(),
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));

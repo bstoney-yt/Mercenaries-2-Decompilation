@@ -95,6 +95,8 @@ pub struct Lighting {
     /// sunlight's own (the game casts them from a sun never lower than
     /// about 18 degrees: see `m2_engine::atmosphere`).
     pub shadow_direction: Option<Vec3>,
+    /// The sun's disc in the sky, display values (black: none drawn).
+    pub sun_disc: Vec3,
     /// Linear RGB (see [`gamma_light`](Self::gamma_light)).
     pub sun_color: Vec3,
     /// Linear RGB light reaching surfaces from every side, by the way they
@@ -327,6 +329,7 @@ impl Default for Lighting {
         Self {
             sun_direction: Vec3::new(-0.4, -1.0, 0.3),
             shadow_direction: None,
+            sun_disc: Vec3::ZERO,
             sun_color: Vec3::new(1.0, 0.95, 0.85),
             // Sky above, warm bounce from the ground below.
             ambient_cube: [
