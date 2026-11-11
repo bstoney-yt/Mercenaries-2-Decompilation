@@ -828,10 +828,10 @@ impl Post {
         let glow_layer = target(device, "glow layer", width, height);
         let merged = target(device, "world and glows", width, height);
         let group = |i: usize, views: [&wgpu::TextureView; 5]| {
-            // `BlurH0` for the composite's sun flare; elsewhere an image no
-            // post pass draws into.
+            // `BlurH0` (the game's first blur level, its image kept in [0])
+            // for the composite's sun flare; elsewhere an image no post pass draws into.
             let blur_h0 = if i == COMPOSITE {
-                &levels[0][1]
+                &levels[0][0]
             } else {
                 &glow_layer
             };
