@@ -28,6 +28,19 @@ use crate::script::safe_function;
 pub const FIRST_SPAWNED: u32 = 0x4000_0000;
 /// What crews a vehicle spawned with its driver.
 pub const PILOT: &str = "Pilot";
+/// The Lua registry name `Disguise.Init`'s `InvestigatorCallback` is
+/// kept by.
+pub const INVESTIGATOR: &str = "m2.disguise_investigator";
+
+/// 0x82446790: an AI came onto her disguise's watcher list, or left it:
+/// calls the `InvestigatorCallback` with (player, ai, came).
+pub fn investigator(lua: &Lua, player: Option<u32>, ai: u32, came: bool) -> mlua::Result<()> {
+    if let Value::Function(f) = lua.named_registry_value::<Value>(INVESTIGATOR)? {
+        f.call::<()>((guid_value(player), guid_value(Some(ai)), came))?;
+    }
+    Ok(())
+}
+
 /// Guids of object templates start here.
 pub const FIRST_TEMPLATE: u32 = 0x3000_0000;
 /// How far off an object can be seen on screen, metres (inferred: about
@@ -2763,6 +2776,20 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // `{ Player = character }`: whether her disguise holds, nil out of a
     // disguise (the disguise tutorial tells the two apart by
     // `tostring`).
+    // 0x82340B20: `Disguise.Init { InvestigatorCallback = f }` keeps `f`
+    // (0x83134548) for the disguise's watchers coming and going
+    // ([`investigator`]); true for a table, false without one.
+    let disguise = lib("Disguise")?;
+    add(&disguise, "Init", |_, lua, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([Value::Boolean(false)]);
+        };
+        match t.get::<Value>("InvestigatorCallback")? {
+            Value::Function(f) => lua.set_named_registry_value(INVESTIGATOR, f)?,
+            _ => lua.unset_named_registry_value(INVESTIGATOR)?,
+        }
+        values([Value::Boolean(true)])
+    })?;
     // 0x82340438 ({ Player = p }): two answers, whether she is disguised
     // (flag 0x40 with disguises on) and 0x82445778's value, the root of the
     // owner chain (store 0x836539A4, 0x82251E68) of her vehicle while
@@ -5159,6 +5186,18 @@ mod tests {
             ask("return Object.IsDisguised(Player.GetLocalCharacter())"),
             Value::Boolean(true)
         );
+        // Disguise.Init keeps the investigator callback (0x82340B20).
+        let ok: bool = host
+            .lua()
+            .load(
+                "seen = {} return Disguise.Init({InvestigatorCallback =                  function(p, ai, came) table.insert(seen, came) end})",
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
+        investigator(host.lua(), Some(1), 9, true).unwrap();
+        let seen: Vec<bool> = host.lua().load("return seen").eval().unwrap();
+        assert_eq!(seen, [true]);
         // Two answers (0x82340438): disguised, and who she is seen as.
         world.borrow_mut().disguise_seen_as = Some(42);
         let (held, seen): (bool, i64) = host

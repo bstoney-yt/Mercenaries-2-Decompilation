@@ -15,7 +15,9 @@
 //!   gives up the entry with the largest value. An entry runs out after
 //!   its 3 s (0x824460F8) and goes when the AI's sense of her resets
 //!   (0x82446008). Each coming and going is told to the script callback at
-//!   0x83134548 (0x82446790: the player, the AI, whether it came).
+//!   0x83134548 (0x82446790: the player, the AI, whether it came): the
+//!   `InvestigatorCallback` a script hands `Disguise.Init` (0x82340B20;
+//!   the mission scripts pass `HandleInvestigator`).
 //! - **Each tick** (0x82445C38, one player):
 //!   - In a disguise vehicle with no AI aboard (0x824463F0, 0x82446330):
 //!     an entry valued under 30 (0x820BB1F8) holds the grace timer
@@ -37,8 +39,9 @@
 //! Not settled (inferred or left out): the entry's value is what the AI
 //! sensing passes (read as her distance, not confirmed), so what the
 //! under-30 test means; the extra gate in 0x822DF988 (AI +0x17DC bit 0,
-//! +0xFF0/+0xFF4); what marks the player in 0x831342A8 +0x3CE4; where the
-//! callback's latch (+0x438) clears.
+//! +0xFF0/+0xFF4: many writers, not traced); what marks the player in
+//! 0x831342A8 +0x3CE4. The callback's latch (+0x438) is cleared only by
+//! the reset on getting in (0x82445648).
 
 /// Seconds an AI's sighting holds (0x820C7A20).
 pub const SIGHTING: f32 = 3.0;
@@ -110,19 +113,23 @@ pub struct VehicleDisguise {
 impl VehicleDisguise {
     /// 0x824461D8: she gets into a vehicle with `scale` (`None`: the
     /// defaults); `marked`, the player's entry in 0x831342A8 +0x3CE4.
+    ///
+    /// The block is reset first (0x82445648: flags 0x80, 0x40 and 0x20
+    /// cleared, the list emptied, the gauge 0, the grace 2 s, the
+    /// callback's latch cleared), so getting in never fires the callback.
     pub fn enter(&mut self, scale: Option<DisguiseScale>, marked: bool) -> Vec<DisguiseEvent> {
         self.scale = scale.unwrap_or_default();
+        self.watchers.clear();
+        self.disguised = false;
+        self.may_fill = false;
+        self.level = 0.0;
+        self.grace = GRACE;
         let mut out = Vec::new();
-        let was = self.disguised;
         if marked {
             self.drop_disguise(&mut out);
         } else {
-            self.level = 0.0;
             self.grace = 0.0;
             self.may_fill = true;
-        }
-        if self.disguised != was {
-            out.push(DisguiseEvent::Changed(self.disguised));
         }
         out
     }
@@ -351,5 +358,8 @@ mod tests {
         let mut m = VehicleDisguise::default();
         m.enter(None, true);
         assert!(!m.may_fill && m.grace == GRACE);
+        // Getting in again resets the block and says nothing.
+        assert!(d.enter(None, false).is_empty());
+        assert!(d.watchers.is_empty() && d.may_fill && d.grace == 0.0);
     }
 }
