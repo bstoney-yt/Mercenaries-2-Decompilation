@@ -2747,7 +2747,7 @@ pub fn first_lines(s: &str) -> String {
 /// the two regions with a `BoundaryData` record are the HQs' exclusions
 /// (`Boundary_ALHQ_Exclusion`, `Boundary_CHHQ_Exclusion`), the only ones
 /// so named; the record itself isn't decoded.
-fn is_exclusion(name: &str) -> bool {
+pub(crate) fn is_exclusion(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with("_exclusion")
 }
 

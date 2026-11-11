@@ -964,6 +964,39 @@ pub struct ScriptWorld {
 }
 
 impl ScriptWorld {
+    /// Whether world spot (x, z) is out of the play area
+    /// (`Player.IsPositionOutBoundary`).
+    ///
+    /// From the 360 code (0x8233d860, 0x8243e500): the player's play-area
+    /// boundaries are tested in turn, and the spot is in bounds if any of
+    /// them holds it. With no boundaries at all, nothing is out of bounds.
+    /// The engine keeps exclusion boundaries in a second list (0x8243d4d0
+    /// files a boundary there when its object is marked as one), and this
+    /// test skips that list. It also tests only regions of kinds 2 and 4.
+    ///
+    /// From samples: every region shape in `vz.wad` (625) is of kind 2,
+    /// so that filter passes them all here. Exclusions are told by name
+    /// (see `mission::is_exclusion`).
+    pub fn position_out_of_bounds(&self, x: f32, z: f32) -> bool {
+        let mut any = false;
+        for &b in &self.boundaries {
+            let Some(at) = self.objects.get(&b) else {
+                continue;
+            };
+            if crate::mission::is_exclusion(&at.name) {
+                continue;
+            }
+            let Some(region) = self.regions.get(&b) else {
+                continue;
+            };
+            any = true;
+            if region.contains([at.position[0], at.position[2]], at.yaw, x, z) {
+                return false;
+            }
+        }
+        any
+    }
+
     /// Adds (or replaces) an object scripts can name.
     pub fn insert(&mut self, guid: u32, object: Object) {
         if object.vehicle.is_some() {
@@ -2729,6 +2762,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&player, "SetOutBoundary", |w, _, a| {
         w.outside = matches!(a.get(1), Some(Value::Boolean(true)));
         values([])
+    })?;
+    // Player.IsPositionOutBoundary(player, x, y, z): whether a spot is
+    // outside the play area. The PDA's beacon check asks it
+    // (`MrxGuiPda.HandleBeaconCheck`, OilCon020's tutorial): a beacon is
+    // refused out of bounds, and also when this native is missing.
+    add(&player, "IsPositionOutBoundary", |w, _, a| {
+        let Some(_) = id(a.first()) else {
+            return values([Value::Nil]);
+        };
+        let [x, z] = [num(a.get(1)), num(a.get(3))].map(|v| v.unwrap_or(0.0));
+        values([Value::Boolean(w.position_out_of_bounds(x, z))])
     })?;
     // A character's camera: the game's one camera looks over the player,
     // so it is named by her guid, and its yaw is hers (`Camera.GetYaw`:
@@ -5291,6 +5335,68 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((truck, bike), (true, false));
+    }
+
+    /// `Player.IsPositionOutBoundary` over the play-area boundaries, and the
+    /// PDA's beacon check built on it (`MrxGuiPda.HandleBeaconCheck`: the
+    /// map's spot less 35 and 40, a beacon allowed when that is in bounds).
+    #[test]
+    fn a_spot_is_out_of_bounds_outside_every_play_area_boundary() {
+        let (host, world) = setup();
+        let lua = host.lua();
+        let out = |x: f64, z: f64| -> Option<bool> {
+            lua.load(format!(
+                "return Player.IsPositionOutBoundary(Player.GetLocalPlayer(), {x}, 0, {z})"
+            ))
+            .eval()
+            .unwrap()
+        };
+        // No boundaries: nowhere is out.
+        assert_eq!(out(5000.0, 5000.0), Some(false));
+        let square = |half: f32| m2_assets::Region {
+            flags: 0x0004_0002,
+            unk_0x04: 0,
+            corners: vec![[-half, -half], [half, -half], [half, half], [-half, half]],
+        };
+        {
+            let mut w = world.borrow_mut();
+            // A play area round OilCon020's tutorial box, and an HQ
+            // exclusion far off (not part of this test).
+            w.insert(80, Object::new("BoundaryVZ", [2750.0, 0.0, -425.0]));
+            w.regions.insert(80, square(500.0));
+            w.insert(81, Object::new("Boundary_ALHQ_Exclusion", [0.0, 0.0, 0.0]));
+            w.regions.insert(81, square(100.0));
+        }
+        lua.load(
+            "local p = Player.GetLocalPlayer() \
+             Player.AddBoundary(p, Pg.GetGuidByName('BoundaryVZ')) \
+             Player.AddBoundary(p, Pg.GetGuidByName('Boundary_ALHQ_Exclusion'))",
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(out(2750.0, -425.0), Some(false));
+        assert_eq!(out(3500.0, -425.0), Some(true));
+        // Inside only the exclusion: the exclusion list isn't tested.
+        assert_eq!(out(0.0, 0.0), Some(true));
+        // Bad arguments: nil.
+        let bad: Option<bool> = lua
+            .load("return Player.IsPositionOutBoundary(nil, 1, 2, 3)")
+            .eval()
+            .unwrap();
+        assert_eq!(bad, None);
+        // The beacon check's answer for a map spot "x,z".
+        let check = |spot: &str| -> bool {
+            lua.load(format!(
+                "local n = {{}} \
+                 for v in string.gmatch('{spot}', '-*%d+') do n[#n + 1] = tonumber(v) end \
+                 local f = Player.IsPositionOutBoundary \
+                 return f ~= nil and not f(Player.GetLocalPlayer(), n[1] - 35, 0, n[2] - 40)"
+            ))
+            .eval()
+            .unwrap()
+        };
+        assert!(check("2785,-385"));
+        assert!(!check("3600,-385"));
     }
 
     #[test]
