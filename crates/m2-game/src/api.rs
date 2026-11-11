@@ -211,6 +211,9 @@ pub enum Command {
         target: Option<u32>,
         /// Its `Haste`, if given (PmcCon001's garage smash gives 1).
         haste: Option<f32>,
+        /// A `PathMove`'s own settings ([`crate::path_order`]); `None`
+        /// for other goals.
+        path: Option<crate::path_order::PathOrder>,
     },
     ExitVehicle(u32),
     /// A person keeps near `target` (`Ai.Role` `Follow`: a VIP being
@@ -3196,12 +3199,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             let data = t.raw_get::<Option<Table>>("CallbackData")?;
             w.goal_callbacks.push((guid, f, data));
         }
+        let path = (goal == "PathMove")
+            .then(|| crate::path_order::PathOrder::read(t))
+            .transpose()?;
         w.commands.push(Command::Goal {
             guid,
             goal,
             location,
             target,
             haste,
+            path,
         });
         values([])
     })?;
@@ -3224,6 +3231,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             location,
             target: None,
             haste: num(a.get(4)),
+            path: None,
         });
         values([])
     })?;
@@ -4949,7 +4957,8 @@ mod tests {
                 goal: "MoveTo".into(),
                 location: Some([4.0, 5.0, 6.0]),
                 target: None,
-                haste: None
+                haste: None,
+                path: None,
             }
         );
         assert!(goal_finished(&world, g).is_empty());
