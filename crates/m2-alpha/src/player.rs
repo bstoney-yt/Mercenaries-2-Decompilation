@@ -405,8 +405,15 @@ pub struct Player {
     /// Jump was pressed while she was landing: she jumps again as the
     /// landing ends.
     jump_queued: bool,
+    /// Whether she carries someone (a subdued prisoner): her gaits are
+    /// then the `Carrying` stance's ([`crate::held::Moves::carrying`]; from
+    /// the 360 code, the stance's own locomotion node).
+    pub carrying: bool,
     /// Seconds into a grenade throw, while she throws.
     pub throwing: Option<f32>,
+    /// The throw's clip and when in it the grenade leaves her hand, picked
+    /// as it starts ([`Player::start_throw`]).
+    throw_clip: Option<(usize, f32)>,
     /// A melee bash, while she bashes: she stands, facing the camera's
     /// way.
     pub bashing: Option<Bash>,
@@ -623,7 +630,9 @@ impl Player {
             last_yaw: yaw,
             leap: Leap::No,
             jump_queued: false,
+            carrying: false,
             throwing: None,
+            throw_clip: None,
             bashing: None,
             launcher: false,
             down: false,
@@ -669,9 +678,6 @@ impl Player {
     pub fn set_body(&mut self, model: Option<(GpuModel, Rig)>, clips: FightClips, moves: Moves) {
         self.model = model;
         self.clips = clips;
-        if let Some((_, rig)) = &self.model {
-            self.clips.sprint = crate::npc::two_handed_sprint(rig, self.clips.run_low);
-        }
         self.moves = moves;
         self.leap = Leap::No;
         self.jump_queued = false;
@@ -715,9 +721,6 @@ impl Player {
             l.clips.extend(set.gaits.iter().copied());
             let gait = rig.gait;
             rig.set_gait(gait);
-        }
-        if let Some((_, rig)) = &self.model {
-            self.clips.sprint = crate::npc::two_handed_sprint(rig, self.clips.run_low);
         }
     }
 
@@ -775,12 +778,39 @@ impl Player {
     /// Starts throwing a grenade, if she has a throw to play and isn't
     /// throwing already: the seconds until it leaves her hand. `None`
     /// without the clip (the grenade goes at once).
+    ///
+    /// From the 360 code ([`m2_engine::hero_action`]): the throw is
+    /// `ThrowGrenadeRun` on the move and `ThrowGrenadeIdle` standing, to
+    /// the front, back, left or right by the angle from the way she faces
+    /// to the way she throws (the camera's), and the tables give the clip
+    /// for what she holds ([`crate::held::Held::throws`]). On the move is
+    /// her gait above a walk (inferred: the program tests its pace bits
+    /// above 1, whose values were not traced). Where the tables give her
+    /// none, the throw found by name plays as before.
     pub fn start_throw(&mut self) -> Option<f32> {
         if self.throwing.is_some() {
             return None;
         }
-        let (_, release) = self.clips.throw?;
-        self.model.as_ref()?;
+        let (_, rig) = self.model.as_ref()?;
+        let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
+        let moving = !matches!(
+            crate::scene::loco_gait(self.motion.paces, moved),
+            Gait::Idle | Gait::Walk
+        );
+        let way = m2_engine::hero_action::throw_way(self.facing - self.yaw);
+        let tabled = self
+            .moves
+            .of(self.shown.class)
+            .and_then(|h| h.throws.get(&(moving, way)).copied());
+        let (clip, release) = tabled.or(self.clips.throw)?;
+        eprintln!(
+            "anim: throw {:08x} ({}, {}{})",
+            rig.clips[clip].hash,
+            m2_engine::hero_action::throw_action(moving),
+            way.name(),
+            if tabled.is_some() { "" } else { "; by name" }
+        );
+        self.throw_clip = Some((clip, release));
         self.throwing = Some(0.0);
         Some(release)
     }
@@ -1226,6 +1256,10 @@ impl Player {
                     h.crouch.iter().find(|(g, b, _)| *g == gait && *b == back)
                 })
                 .map(|&(_, _, c)| c);
+            // Carrying someone she is `Carrying`: its gait's clip, whole.
+            let carried = (self.carrying && !self.aiming)
+                .then(|| self.moves.carry_clip(gait))
+                .flatten();
             // The jump: a take-off (on the run or standing), the air,
             // and a landing.
             if jump.is_some() {
@@ -1374,6 +1408,11 @@ impl Player {
                 let upper = (gait != Gait::Idle).then_some(clips.aim).flatten();
                 rig.animator.set_upper(upper.zip(rig.upper.clone()));
                 rig.two_handed = rig.barrel;
+            } else if let Some(c) = carried {
+                rig.gait = gait;
+                rig.play_gait(c);
+                rig.animator.set_upper(None);
+                rig.two_handed = false;
             } else {
                 rig.hold_rifle(gait, clips, carry);
                 // A pistol is held in the right hand alone.
@@ -1416,7 +1455,7 @@ impl Player {
                 }
             }
             // A throw plays over the upper body, whatever the legs do.
-            match (self.throwing, clips.throw, rig.upper.clone()) {
+            match (self.throwing, self.throw_clip, rig.upper.clone()) {
                 (Some(t), Some((clip, _)), Some(mask)) if t < rig.clips[clip].info.duration => {
                     rig.animator.upper_at(clip, mask, t);
                     rig.two_handed = false;
@@ -1452,8 +1491,9 @@ impl Player {
             } else if leaping || self.stopping.is_some() {
                 1.0
             } else {
-                match crouched.map(|c| rig.clips[c].info.speed) {
-                    // Crouched and moving, its stride to her speed.
+                match crouched.or(carried).map(|c| rig.clips[c].info.speed) {
+                    // Crouched (or carrying) and moving, its stride to
+                    // her speed.
                     Some(s) if gait != Gait::Idle && s > 0.1 => moved / s,
                     Some(_) => 1.0,
                     None => rig.play_rate(gait, moved, 0),

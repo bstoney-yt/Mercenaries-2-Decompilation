@@ -393,8 +393,16 @@ fn table_clips(
             .iter()
             .position(|c| c.hash == hash && !rig.foreign.contains(&hash))
     };
+    // The slots whose action the 360 code names go forward, by the
+    // action's handle ([`held::slot_handles`]); the rest by their key clip.
+    let forward = source
+        .asset(table::ACTIONS, table::ANIMATION_TABLE_TYPE)
+        .ok()
+        .and_then(|a| AnimationTable::parse(&a).ok())
+        .map(|a| held::slot_handles(&a))
+        .unwrap_or_default();
     let resolve = |key: u32| {
-        table::character_clip(&t, key, (gender, name), table::RIFLE, |c| {
+        held::slot_clip(&t, &forward, key, (gender, name), table::RIFLE, |c| {
             index(c).is_some()
         })
     };
@@ -423,9 +431,13 @@ fn table_clips(
         .zip(clips.slots())
         .map(|(&(_, key), (_, i))| (key, hash(i)))
         .collect();
+    // Her standing take-off was a `DieAnimatedRagdoll` clip, found by
+    // eye: there the table's rise stands, footage-matched or not.
+    let forced = |key: u32| key == npc::FightClips::TAKEOFF_STILL[0];
     let theirs = |key: u32| {
         let p = resolve(key)?;
-        (!jennifer || had.get(&key).copied().flatten() == Some(p.clip)).then_some(p.clip)
+        (!jennifer || forced(key) || had.get(&key).copied().flatten() == Some(p.clip))
+            .then_some(p.clip)
     };
     let mut picked = *clips;
     let settled = picked.by_table(rig, &theirs);
@@ -1039,7 +1051,6 @@ impl Rig {
             (Gait::Idle, Carry::Aim) => (clips.aim, None),
             (_, Carry::Aim) => (None, clips.aim),
             (Gait::Run, _) => (clips.run_low, None),
-            (Gait::Sprint, _) => (clips.sprint, None),
             _ => (None, None),
         };
         match whole {

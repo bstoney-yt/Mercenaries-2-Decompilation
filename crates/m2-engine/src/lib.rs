@@ -37,6 +37,7 @@ pub mod gunner_aim;
 pub mod hand_ik;
 pub mod heli_land;
 pub mod heli_pilot;
+pub mod hero_action;
 pub mod hijack;
 pub mod ladder;
 pub mod lights;
