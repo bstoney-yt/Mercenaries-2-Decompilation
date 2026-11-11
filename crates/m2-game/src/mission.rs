@@ -3053,6 +3053,39 @@ mod tests {
     }
 
     #[test]
+    fn health_watches_pass_the_health_and_the_comparison() {
+        // MrxHq: `{ hq, "*", "<=", 1 }`; a contract: `{ her, "<", 40 }`.
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            got, low, part = {}, nil, 0
+            local hero = Player.GetCharacter(1)
+            Event.Create(Event.ObjectHealth, { hero, "<", 40 },
+                function(tag, h, how) got = { tag, h, how } end, { "low" })
+            Event.Create(Event.ObjectHealth, { hero, "*", "<=", 25 },
+                function(h, how) low = how end)
+            Event.Create(Event.ObjectHealth, { hero, "wing_l", "<", 99 },
+                function() part = part + 1 end)
+            "#,
+            "test",
+        )
+        .unwrap();
+        m.tick(0.1);
+        m.set_health(PLAYER, 25.0);
+        m.tick(0.1);
+        m.tick(0.1);
+        let (tag, h, how, low, part): (String, f64, String, String, i64) = m
+            .lua()
+            .load("return got[1], got[2], got[3], low, part")
+            .eval()
+            .unwrap();
+        assert_eq!((tag.as_str(), h, how.as_str()), ("low", 25.0, "<"));
+        assert_eq!(low, "<=");
+        // A part she doesn't have never holds.
+        assert_eq!(part, 0);
+    }
+
+    #[test]
     fn health_watches_fire_as_she_is_hurt() {
         let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
         m.run(
