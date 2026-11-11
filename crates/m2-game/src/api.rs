@@ -2800,7 +2800,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([
             w.disguise.map_or(Value::Nil, |_| Value::Boolean(held)),
             w.disguise_seen_as
-                .map_or(Value::Nil, |g| Value::Integer(i64::from(g))),
+                .map_or(Value::Nil, |g| Value::Number(f64::from(g))),
         ])
     })?;
     // One player slot; the game creates the player itself.
@@ -5200,12 +5200,12 @@ mod tests {
         assert_eq!(seen, [true]);
         // Two answers (0x82340438): disguised, and who she is seen as.
         world.borrow_mut().disguise_seen_as = Some(42);
-        let (held, seen): (bool, i64) = host
+        let (held, seen): (bool, f64) = host
             .lua()
             .load("return Player.GetVehicleDisguiseState({})")
             .eval()
             .unwrap();
-        assert_eq!((held, seen), (true, 42));
+        assert_eq!((held, seen), (true, 42.0));
         ask("Player.SetVehicleDisguise(false)");
         assert_eq!(world.borrow().disguise, None);
         assert_eq!(ask("return Player.GetVehicleDisguiseState({})"), Value::Nil);
