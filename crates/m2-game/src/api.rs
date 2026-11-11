@@ -891,6 +891,9 @@ pub struct ScriptWorld {
     /// disguises on: how much is left (0..=100) and whether it holds.
     /// `None` out of one.
     pub disguise: Option<(f32, bool)>,
+    /// `Player.GetVehicleDisguiseState`'s second answer: the owner-chain
+    /// root she is seen as (0x82445778), as the game last said.
+    pub disguise_seen_as: Option<u32>,
     /// The friendly faction gates in play: objects the engine runs
     /// `friendlygate` on ([`crate::mission::OBJECT_SCRIPTS`]).
     pub gates: HashSet<u32>,
@@ -2760,10 +2763,18 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // `{ Player = character }`: whether her disguise holds, nil out of a
     // disguise (the disguise tutorial tells the two apart by
     // `tostring`).
+    // 0x82340438 ({ Player = p }): two answers, whether she is disguised
+    // (flag 0x40 with disguises on) and 0x82445778's value, the root of the
+    // owner chain (store 0x836539A4, 0x82251E68) of her vehicle while
+    // disguised, else of herself: inferred to be the faction she is seen
+    // as. Nil where the game hasn't said.
     add(&player, "GetVehicleDisguiseState", |w, _, _| {
-        values([w
-            .disguise
-            .map_or(Value::Nil, |(_, held)| Value::Boolean(held))])
+        let held = w.disguise.is_some_and(|(_, held)| held) && w.vehicle_disguise;
+        values([
+            w.disguise.map_or(Value::Nil, |_| Value::Boolean(held)),
+            w.disguise_seen_as
+                .map_or(Value::Nil, |g| Value::Integer(i64::from(g))),
+        ])
     })?;
     // One player slot; the game creates the player itself.
     add(&player, "GetMaximumPlayers", |_, _, _| {
@@ -5148,6 +5159,14 @@ mod tests {
             ask("return Object.IsDisguised(Player.GetLocalCharacter())"),
             Value::Boolean(true)
         );
+        // Two answers (0x82340438): disguised, and who she is seen as.
+        world.borrow_mut().disguise_seen_as = Some(42);
+        let (held, seen): (bool, i64) = host
+            .lua()
+            .load("return Player.GetVehicleDisguiseState({})")
+            .eval()
+            .unwrap();
+        assert_eq!((held, seen), (true, 42));
         ask("Player.SetVehicleDisguise(false)");
         assert_eq!(world.borrow().disguise, None);
         assert_eq!(ask("return Player.GetVehicleDisguiseState({})"), Value::Nil);
