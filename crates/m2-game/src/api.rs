@@ -794,6 +794,8 @@ pub struct ScriptWorld {
     pub outside: bool,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Templates' cash values by name in lower case ([`crate::cash`]).
+    pub template_cash: HashMap<String, i32>,
     /// Every template the template database names, in lower case: the
     /// names `Pg.GetGuidByName` answers with a template's guid
     /// ([`ScriptWorld::is_template`]).
@@ -1669,6 +1671,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     crate::airstrike::install(&lib("Airstrike")?, &add)?;
     crate::shop::install(lua, &lib("Hud")?)?;
+    crate::cash::install(&lib, &add)?;
 
     // A string's hash, as the scripts key tables by name (their recruits'
     // states). The archive's name hash: the scripts only compare hashes
