@@ -253,6 +253,13 @@ pub enum Command {
         guid: u32,
         on: bool,
     },
+    /// An AI takes part in the living world or stops (`Ai.LivingWorld`
+    /// with `Attrib = "LivingWorldBehaviour"`): `MrxFollow` turns it off
+    /// for someone following her.
+    LivingWorld {
+        guid: u32,
+        on: bool,
+    },
     /// Shut a gate or door again (`Object.CloseGate`).
     CloseGate(u32),
     /// Whether `guid` may take up its weapons (`Human.DisableWeapons` and
@@ -774,6 +781,10 @@ pub const HONK_HEARD: f32 = 3.0;
 /// The reserve that stands for infinite ammunition
 /// (`Object.SetInfiniteAmmo`), rounds (invented).
 pub const INFINITE_RESERVE: u32 = 999;
+
+/// `Pg.GetTetherDiameterStart`'s answer, metres (from the 360 code,
+/// 82446B68).
+pub const TETHER_DIAMETER_START: f64 = 400.0;
 
 /// What `Ai.TweakAttachedSpawners(object, settings)` changes of an
 /// object's spawners: the settings the call's table gave, `None` for
@@ -1992,6 +2003,49 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&pg, "FastCollectBuildings", |w, lua, a| {
         collect(w, lua, a, &["Building", "Structure"], &[])
     })?;
+    // Pg.GetAwakeObjects(x, y, z, radius, filter): the awake objects
+    // within the radius of the point, as a list (the gunship looks for
+    // what is in play within 100 m of where it aims). From the 360 code
+    // (823356B0): every awake object when the radius is left out or not
+    // above 0; the distance is in all three axes. Its last argument, an
+    // object filter to pass as well, isn't applied here: the scripts'
+    // one call gives none.
+    add(&pg, "GetAwakeObjects", |w, lua, a| {
+        let at = match (num(a.first()), num(a.get(1)), num(a.get(2))) {
+            (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+            _ => None,
+        };
+        let radius = num(a.get(if at.is_some() { 3 } else { 0 })).unwrap_or(-1.0);
+        let at = at.unwrap_or([0.0; 3]);
+        let mut found: Vec<u32> = w
+            .objects
+            .iter()
+            .filter(|&(&g, o)| {
+                let off = [
+                    at[0] - o.position[0],
+                    at[1] - o.position[1],
+                    at[2] - o.position[2],
+                ];
+                w.is_awake(g)
+                    && (radius <= 0.0
+                        || off[0] * off[0] + off[2] * off[2] + off[1] * off[1] <= radius * radius)
+            })
+            .map(|(&g, _)| g)
+            .collect();
+        found.sort_unstable();
+        let list = lua.create_table()?;
+        for (i, g) in found.into_iter().enumerate() {
+            list.raw_set(i + 1, guid_value(Some(g)))?;
+        }
+        values([Value::Table(list)])
+    })?;
+    // Pg.GetTetherDiameterStart(): how far apart the two players may be
+    // before the tether starts to pull, metres. From the 360 code
+    // (823385A8 reads it; 82446B68, the only code that sets it, makes it
+    // 400).
+    add(&pg, "GetTetherDiameterStart", |_, _, _| {
+        values([Value::Number(TETHER_DIAMETER_START)])
+    })?;
     add(&pg, "FastCollectHumans", |w, lua, a| {
         collect(w, lua, a, &["Human", "Soldier", "Civilian"], &[])
     })?;
@@ -3027,6 +3081,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&player, "GetCash", |w, _, _| {
         values([Value::Number(w.cash)])
     })?;
+    // Player.AddCash(amount): her cash goes up (or down) by a whole
+    // amount, and not below nothing. From the 360 code (8233F668): taking
+    // more than she has leaves her with none. `MrxPmc` pays back a
+    // client's reimbursement with it.
+    add(&player, "AddCash", |w, _, a| {
+        if let Some(amount) = num(a.first()) {
+            w.cash = (w.cash + f64::from(amount).trunc()).max(0.0);
+        }
+        values([])
+    })?;
     add(&player, "SetCash", |w, _, a| {
         if let Some(c) = num(a.first()) {
             w.cash = f64::from(c);
@@ -3453,6 +3517,32 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // follower: `MrxFollow`'s VIP); another role ("Idle") ends it. The
     // rest of a role (its priorities, the callback when cancelled) is not
     // kept.
+    // Ai.LivingWorld({ AIGuid, Attrib, State }): see
+    // [`Command::LivingWorld`]. From the 360 code (82311238): the AI and
+    // the attribute are needed, the only attribute it knows is
+    // `"LivingWorldBehaviour"`, the state is true when left out, and it
+    // gives what setting it gave (taken here as whether there is such
+    // an AI), false otherwise.
+    add(&ai, "LivingWorld", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([Value::Boolean(false)]);
+        };
+        let guid = id(t.raw_get::<Value>("AIGuid").ok().as_ref());
+        let attrib = t.raw_get::<Option<String>>("Attrib").ok().flatten();
+        let on = match t.raw_get::<Value>("State")? {
+            Value::Boolean(b) => Some(b),
+            Value::Nil => None,
+            _ => Some(true),
+        };
+        let (Some(guid), Some(attrib), Some(on)) = (guid, attrib, on) else {
+            return values([Value::Boolean(false)]);
+        };
+        if !attrib.eq_ignore_ascii_case("LivingWorldBehaviour") || !w.objects.contains_key(&guid) {
+            return values([Value::Boolean(false)]);
+        }
+        w.commands.push(Command::LivingWorld { guid, on });
+        values([Value::Boolean(true)])
+    })?;
     add(&ai, "Role", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([]);
@@ -4819,6 +4909,51 @@ mod tests {
                     on: true
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn the_shared_modules_calls_are_answered() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.cash = 1000.0;
+            w.insert(70, Object::new("Near", [10.0, 0.0, 0.0]));
+            w.insert(71, Object::new("Far", [500.0, 0.0, 0.0]));
+        }
+        let (near, tether, living, wrong, nobody): (i64, f64, bool, bool, bool) = host
+            .lua()
+            .load(
+                r#"
+                local g = Sys.StringToGuid
+                Player.AddCash(250.9)
+                Player.AddCash(-5000)
+                Player.AddCash(40)
+                local list = Pg.GetAwakeObjects(0, 0, 0, 100)
+                local near = 0
+                for _, o in pairs(list) do if o == g("70") then near = near + 1 end
+                    if o == g("71") then near = near + 100 end end
+                return near, Pg.GetTetherDiameterStart(),
+                    Ai.LivingWorld({ AIGuid = g("70"), Attrib = "LivingWorldBehaviour", State = false }),
+                    Ai.LivingWorld({ AIGuid = g("70"), Attrib = "Other", State = false }),
+                    Ai.LivingWorld({ AIGuid = g("72"), Attrib = "LivingWorldBehaviour", State = false })
+                "#,
+            )
+            .eval()
+            .unwrap();
+        // Within 100 m and awake: the near one, not the far one.
+        assert_eq!(near, 1);
+        assert_eq!(tether, 400.0);
+        assert!(living && !wrong && !nobody);
+        let mut w = world.borrow_mut();
+        // 1000 + 250 (whole), then more taken than she has: none; + 40.
+        assert_eq!(w.cash, 40.0);
+        assert_eq!(
+            w.take_commands(),
+            [Command::LivingWorld {
+                guid: 70,
+                on: false
+            }]
         );
     }
 
