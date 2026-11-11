@@ -20,8 +20,6 @@ pub struct InitState {
     pub music_entry_states: Vec<u32>,
     /// `Sound.OpenStreamFile`: (name, second name) pairs opened, in order.
     pub stream_files: Vec<(String, String)>,
-    /// `Disguise.Init`'s `InvestigatorCallback` (0x83134548).
-    pub investigator_callback: Option<Function>,
     /// `FactionZone.Init`'s `TresspasserCallback` (0x83134298; the scripts'
     /// spelling).
     pub trespasser_callback: Option<Function>,
@@ -44,7 +42,6 @@ pub(crate) fn install(
     })?;
     add(&sound, "AddSourceMusicEntryState", add_music_entry_state)?;
     add(&sound, "OpenStreamFile", open_stream_file)?;
-    add(&lib("Disguise")?, "Init", disguise_init)?;
     add(&lib("FactionZone")?, "Init", faction_zone_init)?;
     add(
         &lib("Player")?,
@@ -133,7 +130,8 @@ fn open_stream_file(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<M
 }
 
 /// The function at `key` of a table argument, and whether there was a
-/// table: the shape of `Disguise.Init` and `FactionZone.Init`.
+/// table: the shape of `FactionZone.Init` (and `Disguise.Init`, kept in
+/// `api.rs`).
 fn callback_in(a: &[Value], key: &str) -> mlua::Result<(bool, Option<Function>)> {
     match a.first() {
         Some(Value::Table(t)) => Ok((true, t.raw_get::<Option<Function>>(key).ok().flatten())),
@@ -141,19 +139,9 @@ fn callback_in(a: &[Value], key: &str) -> mlua::Result<(bool, Option<Function>)>
     }
 }
 
-/// `Disguise.Init({ InvestigatorCallback = f })` (0x82340b20): keeps the
+/// `FactionZone.Init({ TresspasserCallback = f })` (0x82340bf8): keeps the
 /// callback (none if the table has none) and returns true; false, keeping
 /// the old one, without a table.
-fn disguise_init(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
-    let (table, f) = callback_in(a, "InvestigatorCallback")?;
-    if table {
-        w.init.investigator_callback = f;
-    }
-    one(Value::Boolean(table))
-}
-
-/// `FactionZone.Init({ TresspasserCallback = f })` (0x82340bf8): as
-/// `Disguise.Init`, for the faction zones' trespass callback.
 fn faction_zone_init(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
     let (table, f) = callback_in(a, "TresspasserCallback")?;
     if table {
@@ -225,9 +213,6 @@ mod tests {
             Value::Boolean(true)
         );
         assert!(world.borrow().init.trespasser_callback.is_some());
-        assert_eq!(got("Disguise.Init({})"), Value::Boolean(true));
-        assert!(world.borrow().init.investigator_callback.is_none());
-        assert_eq!(got("Disguise.Init()"), Value::Boolean(false));
         // Satellite scan.
         assert_eq!(
             n("Player.SetSatelliteScanMode(Player.GetLocalPlayer(), true, 1, 2, 3)"),

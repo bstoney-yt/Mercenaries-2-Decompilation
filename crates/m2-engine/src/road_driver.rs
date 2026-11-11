@@ -19,16 +19,15 @@
 //!   across, 1 m high, 3 m long) and stops while that meets something;
 //!   it counts the seconds it has been blocked so.
 //!
-//! - **Its speed** starts at 20 m/s, 10 within 100 m of its road's end
-//!   ([`base_speed`]), and it stops within 10 m of an end that leads
-//!   nowhere ([`DEAD_END`]).
+//! - **Its speed** starts at 20 m/s, 10 within 100 m of its road's end,
+//!   and 7 where it is off its road's ends ([`base_speed`]), and it stops
+//!   within 10 m of an end that leads nowhere ([`DEAD_END`]).
 //!
 //! Not ported: the junctions' stop lines and slow-downs by their flow
 //! control (0x822B9210, 0x82234B38). They act only for a road linked to an
 //! `RtFlowControl` entity (0x822B81A0, store 0x8365778C, its record's +0x14
 //! the kind, +0x1C the sub-kind), and no layer the alpha reads holds one.
-//! Nor the 7 m/s at a road's very end (its +0x18 exactly 0 or 1), nor what
-//! 0x822AAAE8 does under a stop request: 0x822BB270 (from 0x822C0958) sets
+//! Nor what 0x822AAAE8 does under a stop request: 0x822BB270 (from 0x822C0958) sets
 //! the follower's +0x1B8 bit 3 and a 2 s timer (+0x1C0) that runs down;
 //! while it is set it brakes, its wheel jiggled at random. What asks it to
 //! stop so isn't traced.
@@ -59,11 +58,17 @@ pub fn near_end(remaining: f32, length: f32, within: f32) -> bool {
     remaining / length < share
 }
 
-/// The speed it starts from, m/s (0x822AAD80): 20 (0x820BB204), 10 within
-/// 100 m of its road's end ([`near_end`]).
-pub fn base_speed(remaining: f32, length: f32) -> f32 {
+/// The speed it starts from, m/s (0x822AAD80): 10 (0x820BAEEC) within
+/// 100 m of its road's end ([`near_end`]); else 7 (0x820D329C) when it is
+/// off its road's ends (`off_ends`: its follower's fraction, +0x18, is
+/// exactly 0 or 1, which 0x822B9A30 clamps the road registry's place of
+/// it to, so before its road's start, or past its end, in the junction it
+/// is crossing); else 20 (0x820BB204).
+pub fn base_speed(remaining: f32, length: f32, off_ends: bool) -> f32 {
     if near_end(remaining, length, 100.0) {
         10.0
+    } else if off_ends {
+        7.0
     } else {
         20.0
     }
@@ -132,8 +137,12 @@ mod tests {
     // end; on a road under 111 m long, within 0.75 of its length.
     #[test]
     fn it_slows_toward_its_roads_end() {
-        assert_eq!(base_speed(400.0, 1000.0), 20.0);
-        assert_eq!(base_speed(90.0, 1000.0), 10.0);
+        assert_eq!(base_speed(400.0, 1000.0, false), 20.0);
+        assert_eq!(base_speed(90.0, 1000.0, false), 10.0);
+        // Still behind its new road's start, crossing the junction.
+        assert_eq!(base_speed(1003.0, 1000.0, true), 7.0);
+        // Past its end: near the end wins.
+        assert_eq!(base_speed(0.0, 1000.0, true), 10.0);
         assert!(near_end(70.0, 100.0, 100.0));
         assert!(!near_end(80.0, 100.0, 100.0));
         assert!(near_end(5.0, 300.0, DEAD_END));
