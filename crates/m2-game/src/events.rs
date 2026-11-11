@@ -1655,11 +1655,27 @@ fn check(
             }
             None => no,
         },
-        "ObjectHibernation" | "ObjectIsReady" => match guid(&p.params, 1) {
+        // { object, mode, [level] }: while the object is awake (a mode
+        // starting with "a") or hibernating (any other mode, or none).
+        // From the 360 code: parse 0x82352728 reads only the first letter,
+        // so the HQ manager's `{ hq, "s" }` (wait for a destroyed HQ to
+        // hibernate before reviving it) waits for hibernation, as do
+        // "hibernated" and a missing mode. Its arguments slot (0x8225e998)
+        // passes nothing. The optional level (a streaming detail the
+        // object must have reached) isn't modelled.
+        "ObjectHibernation" => match guid(&p.params, 1) {
             Some(g) => {
-                let want_awake = !text(&p.params, 2).is_some_and(|t| t.starts_with("hibernat"));
-                Check::Holds(world.is_awake(g) == want_awake, vec![id(g)])
+                let want_awake = text(&p.params, 2).is_some_and(|t| t.starts_with('a'));
+                Check::Holds(world.is_awake(g) == want_awake, Vec::new())
             }
+            None => no,
+        },
+        // { object, [level] }: once the object is in the world. From the
+        // 360 code (0x82352c28, 0x82352ab0) it checks the object is loaded
+        // rather than awake; here awake stands in for that (inferred).
+        // Passes nothing (0x8225e998).
+        "ObjectIsReady" => match guid(&p.params, 1) {
+            Some(g) => Check::Holds(world.is_awake(g), Vec::new()),
             None => no,
         },
         // { object }: while it is on the player's screen
@@ -2066,7 +2082,7 @@ mod tests {
                 Event.Create(Event.ObjectDeath, { 7 }, note("dead "), { 7 })
                 Event.Create(Event.ObjectProximity, { "hero", 2, "<", 10, false, false }, note("near "), {})
                 Event.Create(Event.ObjectInSeat, { "hero", nil, "Any", "enter" }, note("seat "), {})
-                Event.Create(Event.ObjectHibernation, { 3, "awake" }, note("awake "), {})
+                Event.Create(Event.ObjectHibernation, { 3, "awake" }, note("awake "), { 3 })
                 Event.Create(Event.ScriptEvent, { "Go" }, note("posted "), { "x" })
                 "#,
             )
@@ -2367,14 +2383,19 @@ mod tests {
         // door hibernated waits for her to leave, then for it to wake.
         host.lua()
             .load(
-                r#"
-                Event.Create(Event.ObjectHibernation, { 3, "awake" },
-                    function(d) table.insert(log, "awake " .. gid(d)) end)
-                Event.Create(Event.ObjectHibernation, { 3, "hibernated" },
-                    function(d) table.insert(log, "hibernated " .. gid(d)) end)
-                Event.Create(Event.ObjectHibernation, { 3, "hibernate" },
-                    function(d) table.insert(log, "hibernate " .. gid(d)) end)
-                "#,
+                r##"
+                -- The engine passes nothing of its own: only the data.
+                local function note(s) return function(...)
+                    table.insert(log, s .. select("#", ...))
+                end end
+                Event.Create(Event.ObjectHibernation, { 3, "awake" }, note("awake "))
+                Event.Create(Event.ObjectHibernation, { 3, "hibernated" }, note("hibernated "))
+                Event.Create(Event.ObjectHibernation, { 3, "hibernate" }, note("hibernate "))
+                -- The HQ manager's wait before reviving a destroyed HQ: any
+                -- mode not starting with "a" waits for hibernation.
+                Event.Create(Event.ObjectHibernation, { 3, "s" }, note("s "))
+                Event.Create(Event.ObjectHibernation, { 3 }, note("none "))
+                "##,
             )
             .exec()
             .unwrap();
@@ -2383,13 +2404,16 @@ mod tests {
         for _ in 0..5 {
             events.update(0.1, &world);
         }
-        assert_eq!(log(&host), ["awake 3"]);
-        assert_eq!(events.len(), 2);
+        assert_eq!(log(&host), ["awake 0"]);
+        assert_eq!(events.len(), 4);
         world.positions.remove(&3);
         events.update(0.1, &world);
         let mut got = log(&host);
         got.sort();
-        assert_eq!(got, ["awake 3", "hibernate 3", "hibernated 3"]);
+        assert_eq!(
+            got,
+            ["awake 0", "hibernate 0", "hibernated 0", "none 0", "s 0"]
+        );
         assert!(events.is_empty());
     }
 
