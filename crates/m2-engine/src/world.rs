@@ -318,6 +318,8 @@ pub struct Templates {
     pub exhausts: HashMap<u32, Vec<crate::vehicle_parts::Exhaust>>,
     /// Each template's `Winch`, by id ([`crate::winch`]).
     pub winches: HashMap<u32, crate::winch::WinchParams>,
+    /// Each template's `ConnectPoint`s, by id ([`crate::winch`]).
+    pub connect_points: HashMap<u32, Vec<crate::winch::ConnectPoint>>,
     /// The emitter each `EffectModel` template draws as a model, by its
     /// name hash.
     pub effect_models: HashMap<u32, crate::vehicle_parts::ModelEmitter>,
@@ -745,6 +747,25 @@ impl Templates {
             })
     }
 
+    /// The `ConnectPoint`s of template `name` (an object's own), else of
+    /// the lowest id of `model`'s templates that have them.
+    pub fn connect_points_for(&self, name: &str, model: u32) -> &[crate::winch::ConnectPoint] {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.connect_points.get(id))
+            .or_else(|| {
+                self.infos
+                    .iter()
+                    .filter(|(id, t)| {
+                        t.model == Some(model) && self.connect_points.contains_key(id)
+                    })
+                    .map(|(&id, _)| id)
+                    .min()
+                    .and_then(|id| self.connect_points.get(&id))
+            })
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// The tuning of template `name` (a vehicle's own, `AMX30 (Full)`),
     /// else of a template of its `model`
     /// ([`tuning_for_model`](Self::tuning_for_model)).
@@ -1070,6 +1091,7 @@ impl Templates {
             spawn_sounds: crate::spawn_sound::read(&db),
             exhausts: crate::vehicle_parts::read(&db),
             winches: crate::winch::read(&db),
+            connect_points: crate::winch::connect_points(&db),
             effect_models: crate::vehicle_parts::effect_models(&db)
                 .into_iter()
                 .filter_map(|(name, model, emitter, fx)| {

@@ -41,6 +41,138 @@ pub struct HumanMotion {
     /// constructor's first shape, 0x821771B0).
     pub capsule_radius: f32,
     pub capsule_height: f32,
+    /// The falls that hurt ([`fall_impact`]).
+    pub falls: FallLimits,
+}
+
+/// A person template's `_HumanPhysics` fall fields: how far a fall is
+/// light, heavy and deadly, metres (`FallDistanceLight`,
+/// `FallDistanceHeavy`, `FallDistanceDeath`, at +0x60, +0x64 and +0x68 of
+/// the record), and what the light and the heavy one cost
+/// (`FallDamageLight`, `FallDamageHeavy`, +0x6c and +0x70). The defaults
+/// are the program's registered ones (0x823EAE98), which every soldier's
+/// template keeps; the heroes' give 5, 15 and 30 m (from samples).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FallLimits {
+    pub light: f32,
+    pub heavy: f32,
+    pub death: f32,
+    pub damage_light: f32,
+    pub damage_heavy: f32,
+}
+
+impl Default for FallLimits {
+    fn default() -> Self {
+        Self {
+            light: 2.0,
+            heavy: 3.0,
+            death: 4.0,
+            damage_light: 10.0,
+            damage_heavy: 50.0,
+        }
+    }
+}
+
+/// The heroes' fall fields (templates `Jen`, `mattias`, `Chris`, `Hero`;
+/// from samples).
+pub const HERO_FALLS: FallLimits = FallLimits {
+    light: 5.0,
+    heavy: 15.0,
+    death: 30.0,
+    damage_light: 10.0,
+    damage_heavy: 50.0,
+};
+
+/// The message a fall posts the person, which the human state table
+/// turns into the `Upright` action of the same name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FallImpact {
+    Light,
+    Heavy,
+}
+
+impl FallImpact {
+    /// The message's name, and the action's.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Light => "FallImpactLight",
+            Self::Heavy => "FallImpactHeavy",
+        }
+    }
+}
+
+/// What a fall does: the damage, and the message if the person lives to
+/// play it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fell {
+    pub damage: f32,
+    pub impact: Option<FallImpact>,
+}
+
+/// What a deadly fall costs: the program's float 1,000,000 (0x820F9604).
+pub const FALL_DEATH_DAMAGE: f32 = 1_000_000.0;
+
+/// What a fall of `distance` metres does to a person with `limits`.
+///
+/// From the 360 code (0x82205F20): nothing under `FallDistanceLight`;
+/// under `FallDistanceHeavy`, `FallDamageLight` and the message
+/// `FallImpactLight` (0x9E1B18F4); under `FallDistanceDeath`,
+/// `FallDamageHeavy` and `FallImpactHeavy` (0x56482A61); from there on,
+/// [`FALL_DEATH_DAMAGE`] and no message. (The function also skips the
+/// message for a person whose action is already a ragdoll's, and skips
+/// everything by a record of the person's that was not traced.)
+pub fn fall_impact(limits: &FallLimits, distance: f32) -> Option<Fell> {
+    if distance < limits.light {
+        None
+    } else if distance >= limits.death {
+        Some(Fell {
+            damage: FALL_DEATH_DAMAGE,
+            impact: None,
+        })
+    } else if distance < limits.heavy {
+        Some(Fell {
+            damage: limits.damage_light,
+            impact: Some(FallImpact::Light),
+        })
+    } else {
+        Some(Fell {
+            damage: limits.damage_heavy,
+            impact: Some(FallImpact::Heavy),
+        })
+    }
+}
+
+/// How far a person fell: the height they left the ground at less the
+/// height they came down at.
+///
+/// From the 360 code: the human physics' state step (0x8217C4A8) keeps
+/// whether the character is in the air (its Havok state jumping or in
+/// air). On leaving the ground it records its height (+0x180); on coming
+/// back down it sends (0x8217C410) the recorded height less its height
+/// now as the fall's distance (a physics event of kind 7, which
+/// 0x82206128 hands to the fall impact). So a jump on level ground falls
+/// no distance, whatever height it reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct FallWatch {
+    airborne: bool,
+    left_at: f32,
+}
+
+impl FallWatch {
+    /// One step: `airborne` now, at height `y`. Returns the distance
+    /// fallen on the step the person comes down.
+    pub fn step(&mut self, airborne: bool, y: f32) -> Option<f32> {
+        if airborne == self.airborne {
+            return None;
+        }
+        self.airborne = airborne;
+        if airborne {
+            self.left_at = y;
+            None
+        } else {
+            Some(self.left_at - y)
+        }
+    }
 }
 
 impl Default for HumanMotion {
@@ -54,14 +186,16 @@ impl Default for HumanMotion {
             crouch_walk: 1.5,
             capsule_radius: 0.4,
             capsule_height: 1.8,
+            falls: FallLimits::default(),
         }
     }
 }
 
 /// The field name hashes [`HumanMotion`] is read from, in its order:
 /// `JumpHeight`, `Gravity`, `MaxRotationSpeed`, `MaxAirSpeed`, the four
-/// `Upright` paces and `CrouchWalkSpeed`.
-pub const FIELDS: [&str; 11] = [
+/// `Upright` paces, `CrouchWalkSpeed`, the capsule and the five fall
+/// fields.
+pub const FIELDS: [&str; 16] = [
     "JumpHeight",
     "Gravity",
     "MaxRotationSpeed",
@@ -73,11 +207,16 @@ pub const FIELDS: [&str; 11] = [
     "CrouchWalkSpeed",
     "ProxyCapsuleRadius",
     "ProxyCapsuleHeight",
+    "FallDistanceLight",
+    "FallDistanceHeavy",
+    "FallDistanceDeath",
+    "FallDamageLight",
+    "FallDamageHeavy",
 ];
 
 impl HumanMotion {
-    /// From the eight fields in [`FIELDS`]' order.
-    pub fn from_fields(f: [f32; 11]) -> Self {
+    /// From the fields in [`FIELDS`]' order.
+    pub fn from_fields(f: [f32; 16]) -> Self {
         Self {
             jump_height: f[0],
             gravity: f[1],
@@ -87,7 +226,36 @@ impl HumanMotion {
             crouch_walk: f[8],
             capsule_radius: f[9],
             capsule_height: f[10],
+            falls: FallLimits {
+                light: f[11],
+                heavy: f[12],
+                death: f[13],
+                damage_light: f[14],
+                damage_heavy: f[15],
+            },
         }
+    }
+
+    /// The fields in [`FIELDS`]' order.
+    pub fn to_fields(&self) -> [f32; 16] {
+        [
+            self.jump_height,
+            self.gravity,
+            self.max_rotation,
+            self.max_air_speed,
+            self.paces[0],
+            self.paces[1],
+            self.paces[2],
+            self.paces[3],
+            self.crouch_walk,
+            self.capsule_radius,
+            self.capsule_height,
+            self.falls.light,
+            self.falls.heavy,
+            self.falls.death,
+            self.falls.damage_light,
+            self.falls.damage_heavy,
+        ]
     }
 
     /// The upward speed a jump leaves the ground at, m/s: Havok's jumping
@@ -504,7 +672,67 @@ mod tests {
             crouch_walk: 1.5,
             capsule_radius: 0.4,
             capsule_height: 1.8,
+            falls: HERO_FALLS,
         }
+    }
+
+    #[test]
+    fn a_fall_hurts_by_how_far_it_was() {
+        let hero = HERO_FALLS;
+        assert_eq!(fall_impact(&hero, 4.9), None);
+        let light = Fell {
+            damage: 10.0,
+            impact: Some(FallImpact::Light),
+        };
+        assert_eq!(fall_impact(&hero, 5.0), Some(light));
+        assert_eq!(fall_impact(&hero, 14.9), Some(light));
+        let heavy = Fell {
+            damage: 50.0,
+            impact: Some(FallImpact::Heavy),
+        };
+        assert_eq!(fall_impact(&hero, 15.0), Some(heavy));
+        assert_eq!(fall_impact(&hero, 29.9), Some(heavy));
+        let dead = Fell {
+            damage: FALL_DEATH_DAMAGE,
+            impact: None,
+        };
+        assert_eq!(fall_impact(&hero, 30.0), Some(dead));
+        // A soldier's, the program's defaults: 2, 3 and 4 m.
+        let soldier = FallLimits::default();
+        assert_eq!(fall_impact(&soldier, 1.9), None);
+        assert_eq!(fall_impact(&soldier, 2.5).map(|f| f.damage), Some(10.0));
+        assert_eq!(fall_impact(&soldier, 3.5).map(|f| f.damage), Some(50.0));
+        assert_eq!(fall_impact(&soldier, 4.0), Some(dead));
+        // The messages' names hash to the program's words.
+        assert_eq!(m2_assets::name_hash(FallImpact::Light.name()), 0x9e1b_18f4);
+        assert_eq!(m2_assets::name_hash(FallImpact::Heavy.name()), 0x5648_2a61);
+    }
+
+    #[test]
+    fn a_fall_is_measured_from_where_the_ground_was_left() {
+        let mut w = FallWatch::default();
+        // On the ground: nothing.
+        assert_eq!(w.step(false, 10.0), None);
+        // A jump on the level: up and back to the same height falls 0.
+        assert_eq!(w.step(true, 10.0), None);
+        assert_eq!(w.step(true, 11.0), None);
+        assert_eq!(w.step(false, 10.0), Some(0.0));
+        // Off a ledge: the height left less the height reached.
+        assert_eq!(w.step(true, 10.0), None);
+        assert_eq!(w.step(true, 4.0), None);
+        assert_eq!(w.step(false, 3.5), Some(6.5));
+        // Up onto something higher: a negative distance, no fall.
+        assert_eq!(w.step(true, 3.5), None);
+        assert_eq!(w.step(false, 4.5), Some(-1.0));
+        assert_eq!(fall_impact(&HERO_FALLS, -1.0), None);
+    }
+
+    #[test]
+    fn the_fields_go_round() {
+        let m = jennifer();
+        assert_eq!(HumanMotion::from_fields(m.to_fields()), m);
+        assert_eq!(FIELDS.len(), m.to_fields().len());
+        assert_eq!(FIELDS[11], "FallDistanceLight");
     }
 
     #[test]

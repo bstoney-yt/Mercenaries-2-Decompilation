@@ -266,6 +266,10 @@ pub struct Game {
     /// The scripts' camera shot for a scene (the HQ's briefings), while
     /// it lasts: the frame is seen from it ([`Shot::view`]).
     pub shot: Option<Shot>,
+    /// The scripts' camera's view (eye, forward) while a scene's script
+    /// directs it (`Camera.SetPosition`, `SetLookAt`, `Follow`, `Hold`,
+    /// `Blend`: [`m2_game::script_camera`]); a shot comes first.
+    pub script_view: Option<(Vec3, Vec3)>,
     /// Seconds the HUD's save icon has left up after the game was saved
     /// ([`SAVE_ICON_SECONDS`]).
     pub save_icon: f32,
@@ -510,6 +514,7 @@ impl Game {
             context_taken: None,
             aboard: None,
             shot: None,
+            script_view: None,
             save_icon: 0.0,
             raw: crate::raw::RawClips::default(),
             outfit_wanted: None,
@@ -1721,10 +1726,21 @@ impl Game {
                 );
                 self.winches.add(id, p, found.unwrap_or(Vec3::ZERO));
             }
+        }
+        // What a magnet might take, gathered only while one could: each
+        // vehicle with its `ConnectPoint`s' nodes.
+        let cargo = if self.winches.magnet_ready() {
+            self.winch_cargo()
+        } else {
+            Vec::new()
+        };
+        if let Some(world) = self.scene.world.as_mut() {
             let physics = &mut world.physics;
             self.winches
                 .retain(|id| physics.vehicle_transform(id).is_some());
-            self.winches.step(physics, dt);
+            for (carrier, taken) in self.winches.step(physics, dt, &cargo) {
+                eprintln!("winch: {carrier:?}'s magnet took {taken:?}");
+            }
         }
         // Each one's own collision goes on it for the goods on its bed.
         if let Some(world) = &mut self.scene.world {
@@ -2142,10 +2158,29 @@ impl Game {
                         .guid
                         .is_some_and(|g| self.scene.people.priority.contains(&g)),
                     vehicle: v.id,
+                    hint: vehicle_hint(&v.spec.tuning),
+                    speed: v
+                        .id
+                        .map_or(0.0, |id| physics.map_or(0.0, |p| p.vehicle_speed(id))),
+                    row: v.spec.tuning.key,
                 })
             })
             .collect();
         self.scene.people.vehicle_subjects = subjects;
+        // Her row of the damage table, and the table, for what soldiers'
+        // weapons are worth against her and the armies' vehicles.
+        self.scene.people.her_row = Some(
+            self.scene
+                .player
+                .as_ref()
+                .and_then(|p| p.driving)
+                .and_then(|i| self.scene.vehicles.get(i))
+                .and_then(|v| v.spec.tuning.key)
+                .unwrap_or_else(|| m2_assets::name_hash("Hero")),
+        );
+        if self.scene.people.damage_table.is_none() {
+            self.scene.people.damage_table = self.combat.damage_table.clone();
+        }
         // What she carries, for her threat to soldiers: a vehicle's mounts
         // when she drives one, else her guns' own `WeaponHint`s.
         let driven = self
@@ -3382,7 +3417,11 @@ impl Game {
     /// Where the frame is seen from: her camera (shaken by a bomb close
     /// by), the satellite's while she looks through it, or the free one.
     pub fn view(&self, fov: f32, aspect: f32) -> View {
-        let shot = self.shot.as_ref().and_then(|s| s.view);
+        let shot = self
+            .shot
+            .as_ref()
+            .and_then(|s| s.view)
+            .or(self.script_view.map(|(eye, forward)| (eye, eye + forward)));
         let mut view = match (self.walking(), shot) {
             // A scene's shot of the scripts' (the HQ's briefings).
             (Some(_), Some((eye, at))) => FlyCamera::looking_at(eye, at).view(fov, aspect),
@@ -3431,6 +3470,7 @@ impl Game {
                 }
             }
             view.lighting.clouds.noise = world.cloud_noise;
+            view.lighting.flare_map = world.sun_flare;
         }
         finish(&mut view.lighting);
         post_override(&mut view.lighting);
@@ -3919,6 +3959,41 @@ impl Game {
         );
         self.combat.struck.clear();
         self.combat.went_off.clear();
+    }
+
+    /// The vehicles in play as a winch's cargo ([`crate::winches::Cargo`]):
+    /// each one's `ConnectPoint`s with their nodes' places on its model.
+    pub fn winch_cargo(&mut self) -> Vec<crate::winches::Cargo> {
+        let (Some(source), Some(world)) = (self.scene.source.as_mut(), self.scene.world.as_ref())
+        else {
+            return Vec::new();
+        };
+        let db = &world.index.template_db;
+        self.scene
+            .vehicles
+            .iter()
+            .filter_map(|v| {
+                let id = v.id?;
+                let points = db.connect_points_for(&v.spec.label, v.spec.model);
+                let nodes = if points.is_empty() {
+                    &[][..]
+                } else {
+                    self.winches
+                        .nodes(v.spec.model, || crate::hijack::nodes(source, v.spec.model))
+                };
+                Some(crate::winches::Cargo {
+                    id,
+                    points: points
+                        .iter()
+                        .map(|&p| {
+                            let at = nodes.iter().find(|(n, _)| *n == p.bone).map(|(_, a)| *a);
+                            (p, at)
+                        })
+                        .collect(),
+                    carriable: v.spec.kind != m2_engine::vehicle::HELICOPTER,
+                })
+            })
+            .collect()
     }
 
     /// The load bed of vehicle model `model` (its `HP_Truckbed` node),
@@ -5934,6 +6009,17 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
                 cands.len()
             );
         }
+    }
+}
+
+/// What a vehicle is, as its `ObjectHint` has it
+/// ([`crate::npc::VEHICLE_HINT`] for any word it lacks).
+fn vehicle_hint(t: &m2_engine::tuning::VehicleTuning) -> m2_engine::ai_target::Hint {
+    let d = crate::npc::VEHICLE_HINT;
+    m2_engine::ai_target::Hint {
+        kind: t.kind.map_or(d.kind, |k| k.0),
+        domain: t.kind.map_or(d.domain, |k| k.1),
+        armour: t.armour.unwrap_or(d.armour),
     }
 }
 
