@@ -16,15 +16,25 @@
 //!   of the road's ([`m2_engine::population::RoadLanes`]): they drive the
 //!   middle of one of the lanes on the right, and only on roads with one
 //!   (not the sidewalks, curbs, walls and driveways placed as roads).
+//! - From the 360 code ([`m2_engine::road_driver`], 0x822AAD80): each
+//!   drives by 0x822AC008 toward its lane's next point at 20 m/s, 10 near
+//!   its road's end, stopping short of an end that leads nowhere; it eases off and
+//!   stops behind a car (or her) ahead in its lane, stops while a box
+//!   just ahead of it meets something, and brakes and holds under
+//!   0.5 m/s.
 //! - Invented (no field decoded says): how far off they come and go,
-//!   their speed, and that they slow for what is ahead.
+//!   and that one stuck for [`STUCK`] seconds out of her sight comes
+//!   again elsewhere (the 360's spawner's own despawn isn't traced).
+//!   Not ported: junctions' stop lines and flow control (no layer read
+//!   holds an `RtFlowControl`).
 
 use std::collections::{HashMap, HashSet};
 
+use m2_engine::car_driver::{CarDriver, CarInputs, CarState};
 use m2_engine::population::{DensityZone, zone_at};
 use m2_engine::world::{Junction, Road};
-use m2_engine::{Physics, VehicleControls};
-use m2_math::glam::{Vec2, Vec3};
+use m2_engine::{Physics, VehicleControls, road_driver};
+use m2_math::glam::{Quat, Vec2, Vec3};
 
 use crate::scene::{ParkedVehicle, Scene};
 
@@ -46,22 +56,17 @@ const PLACE_TRIES: usize = 8;
 const ARRIVE: f32 = 6.0;
 /// A road's end meets a junction's port this near, metres.
 const PORT: f32 = 8.0;
-/// The share of their template's top speed they drive at (invented: the
-/// placed traffic's `Haste` runs 0.175 to 0.35; the highway's traffic in
-/// the footage passes her car).
-const HASTE: f32 = 0.45;
 /// Top speed when the template gives none, m/s.
 const DEFAULT_TOP: f32 = 20.0;
-/// Full lock at this many radians off the way.
-const FULL_LOCK: f32 = 0.6;
-/// They brake for her or a vehicle this near ahead, metres, for at most
-/// this long, seconds, then go on (round her, or into what is there).
+/// The scripts' path movers ([`crate::paths`]) brake for her or a vehicle
+/// this near ahead, metres (invented; road traffic stops by the 360's
+/// rules, [`road_driver`]).
 const CLEAR_AHEAD: f32 = 12.0;
 
 /// Whether any of `places` is in the way of a vehicle at `here` facing
 /// `forward` (flat) going `speed`: ahead of it within [`CLEAR_AHEAD`], or
 /// as far as it goes in [`STOP_SECONDS`], and within [`CLEAR_SIDE`] of its
-/// line. Road and path traffic both stop for it.
+/// line. The scripts' path movers stop for it (invented).
 pub(crate) fn in_the_way(
     here: Vec3,
     forward: Vec2,
@@ -80,7 +85,6 @@ pub(crate) fn in_the_way(
 /// than its own).
 const STOP_SECONDS: f32 = 1.8;
 const CLEAR_SIDE: f32 = 3.5;
-const MOST_WAIT: f32 = 3.0;
 /// One stuck this long, seconds, at least this far from her, metres, is
 /// taken back and comes again elsewhere (invented).
 const STUCK: f32 = 20.0;
@@ -100,10 +104,29 @@ struct Car {
     /// Which of the road's lanes on its right it keeps to, inner first
     /// (the outermost there is, where a road has fewer).
     lane: usize,
-    /// Seconds it has stood waiting for what is ahead.
-    waited: f32,
     /// Seconds it has hardly moved (stuck on something).
     stuck: f32,
+}
+
+/// A road vehicle's look just ahead of it (0x822B8C68): seconds to the
+/// next, whether the last met something, and for how long it has.
+#[derive(Clone, Copy, Debug, Default)]
+struct Look {
+    next: f32,
+    blocked: bool,
+    blocked_for: f32,
+}
+
+/// Where a road vehicle is, by its road, way and lane, for those behind
+/// it (the 360's road registry, store 0x8365739C).
+#[derive(Clone, Copy, Debug)]
+struct OnRoad {
+    entity: u32,
+    road: usize,
+    forward: bool,
+    lane: usize,
+    at: Vec3,
+    heading: Vec3,
 }
 
 #[derive(Debug, Default)]
@@ -117,6 +140,10 @@ pub struct RoadTraffic {
     /// Per road entity: the junctions it meets and the port where.
     ends: HashMap<u32, Vec<(usize, Vec3)>>,
     cars: HashMap<u32, Car>,
+    /// Each one's look ahead ([`Look`]) and its driver and what its
+    /// input holds ([`m2_engine::car_driver`]).
+    looks: HashMap<u32, Look>,
+    drivers: HashMap<u32, (CarDriver, CarInputs)>,
     /// Ones asked for, with the seconds they have taken to load.
     loading: HashMap<u32, f32>,
     /// Ones she has driven: hers now.
@@ -273,7 +300,6 @@ impl RoadTraffic {
                 forward,
                 next,
                 lane: pick,
-                waited: 0.0,
                 stuck: 0.0,
             };
             if let Some(i) = far.pop() {
@@ -377,15 +403,34 @@ impl RoadTraffic {
         if !self.indexed {
             return;
         }
-        let places: Vec<Vec3> = vehicles
+        // Each road vehicle's road, way and lane, and her vehicle (the
+        // 360's road registry, 0x82265540).
+        let mine: Vec<OnRoad> = vehicles
             .iter()
             .filter_map(|v| {
-                physics
-                    .vehicle_transform(v.id?)
-                    .map(|m| m.w_axis.truncate())
+                let (e, _, _) = v.spot?;
+                let car = self.cars.get(&e)?;
+                let m = physics.vehicle_transform(v.id?)?;
+                Some(OnRoad {
+                    entity: e,
+                    road: car.road,
+                    forward: car.forward,
+                    lane: car.lane,
+                    at: m.w_axis.truncate(),
+                    heading: m.transform_vector3(Vec3::Z).with_y(0.0),
+                })
             })
-            .chain(player)
             .collect();
+        let her_car = driven
+            .and_then(|i| vehicles.get(i)?.id)
+            .and_then(|id| physics.vehicle_transform(id))
+            .map(|m| {
+                (
+                    m.w_axis.truncate(),
+                    Some(m.transform_vector3(Vec3::Z).with_y(0.0)),
+                )
+            })
+            .or(player.map(|p| (p, None)));
         for (i, v) in vehicles.iter().enumerate() {
             let (Some((entity, _, _)), Some(id)) = (v.spot, v.id) else {
                 continue;
@@ -414,59 +459,127 @@ impl RoadTraffic {
                 match (car.forward, car.next) {
                     (true, n) if n < last => car.next += 1,
                     (false, n) if n > 0 => car.next -= 1,
+                    // A road that leads nowhere: it stays, stopped short
+                    // of its end (0x822B9440), not turned back.
+                    _ if self.ways_out(car, roads).is_empty() => break,
                     _ => car = self.turn_off(car, roads),
                 }
             }
             let r = &roads[car.road];
-            let mut target = lane_point(r, car.next, car.forward, car.lane);
-            let forward = flat(at.transform_vector3(Vec3::Z)).normalize_or_zero();
+            let target = lane_point(r, car.next, car.forward, car.lane);
+            let heading = at
+                .transform_vector3(Vec3::Z)
+                .with_y(0.0)
+                .normalize_or(Vec3::Z);
+            let forward = flat(heading).normalize_or_zero();
             let top = v.spec.tuning.max_speed.unwrap_or(DEFAULT_TOP);
             let speed = physics.vehicle_speed(id);
-            // Further ahead the faster it goes, to stop short of it (a
-            // van at 10 m/s ran into her organ truck crossing its road:
-            // PirCon004 round 68).
-            let mut blocked = in_the_way(here, forward, speed, places.iter().copied());
-            car.waited = if blocked { car.waited + dt } else { 0.0 };
             car.stuck = if speed.abs() < 0.5 {
                 car.stuck + dt
             } else {
                 0.0
             };
-            // Waited long enough: on it goes for a while, round her or
-            // whatever it is, a little way off to the right; then it
-            // waits again if it must.
-            if car.waited > MOST_WAIT {
-                blocked = false;
-                target += right_of(Vec3::new(forward.x, 0.0, forward.y)) * 2.0;
-                if car.waited > 2.0 * MOST_WAIT {
-                    car.waited = 0.0;
+            self.cars.insert(entity, car);
+            // The 360's road driver (0x822AAD80, [`road_driver`]): 20 m/s,
+            // 10 near its road's end, none short of an end that leads
+            // nowhere, less for a car ahead in its lane, and none while a
+            // box just ahead of it meets something. (No faster than its
+            // template's top speed.)
+            let (remaining, length) = along(r, car, here);
+            let mut want = road_driver::base_speed(remaining, length).min(top);
+            if road_driver::near_end(remaining, length, road_driver::DEAD_END)
+                && self.ways_out(car, roads).is_empty()
+            {
+                want = 0.0;
+            }
+            let ahead = mine
+                .iter()
+                .filter(|o| o.entity != entity && o.road == car.road && o.forward == car.forward)
+                .filter(|o| o.lane == car.lane)
+                .map(|o| (o.at, o.heading))
+                .chain(
+                    her_car
+                        .map(|(p, h)| (p, h.unwrap_or(heading)))
+                        // Her, on foot or in her vehicle, in its lane: the
+                        // 360 puts her on a lane of the road she is on when
+                        // how far she is from its line falls in that lane's
+                        // strip (0x822644E0, 0x82263C98, the strips laid
+                        // out by 0x8223E508).
+                        .filter(|&(p, _)| in_lane(r, car, p)),
+                )
+                .filter(|&(p, _)| flat(p - here).dot(forward) > 0.0)
+                .min_by(|a, b| {
+                    here.distance_squared(a.0)
+                        .total_cmp(&here.distance_squared(b.0))
+                });
+            if let Some((p, h)) = ahead {
+                let aligned = flat(h).normalize_or_zero().dot(forward) >= road_driver::AHEAD_COS;
+                if let Some(s) =
+                    road_driver::follow(here.distance(p), speed.max(0.0), want, aligned)
+                {
+                    want = want.min(s);
                 }
             }
-            self.cars.insert(entity, car);
-            let to = flat(target - here).normalize_or_zero();
-            // Positive: the point is to the left (+x of a vehicle facing
-            // +z), and wheels turned the positive way steer left.
-            let off = -forward.perp_dot(to).atan2(forward.dot(to));
-            let want = if blocked {
-                0.0
+            let look = self.looks.entry(entity).or_default();
+            look.next -= dt;
+            if look.next <= 0.0 {
+                let last = r.points.len().saturating_sub(1).max(1);
+                let t = car.next as f32 / last as f32;
+                look.next = road_driver::probe_every(t, self.rng as f32 / u32::MAX as f32);
+                // Ahead, or behind when its point is behind it.
+                let way = if flat(target - here).dot(forward) > 0.1 {
+                    heading
+                } else {
+                    -heading
+                };
+                let up = at.transform_vector3(Vec3::Y).normalize_or(Vec3::Y);
+                let from = here + up * road_driver::PROBE_UP + way * road_driver::PROBE_OUT;
+                let [w, h] = road_driver::PROBE_HALF;
+                look.blocked = physics
+                    .cast_box(
+                        from + Vec3::Y * h,
+                        Quat::from_rotation_y(way.x.atan2(way.z)),
+                        Vec3::new(w, h, 0.05),
+                        way,
+                        road_driver::PROBE_LENGTH,
+                        Some(id),
+                    )
+                    .is_some();
+            }
+            look.blocked_for = if look.blocked {
+                look.blocked_for + dt
             } else {
-                top * HASTE * (1.0 - (off.abs() / std::f32::consts::PI).min(0.6))
+                0.0
             };
-            physics.drive(
-                id,
+            if look.blocked {
+                want = 0.0;
+            }
+            let controls = if want < road_driver::HOLD {
                 VehicleControls {
-                    throttle: ((want - speed) / want.max(1.0)).clamp(-1.0, 1.0),
-                    steer: (off / FULL_LOCK).clamp(-1.0, 1.0),
-                    brake: speed > want * 1.3 + 0.5,
-                    parked: false,
-                },
-            );
+                    brake: true,
+                    ..VehicleControls::default()
+                }
+            } else {
+                let state = CarState {
+                    at: here,
+                    forward: heading,
+                    velocity: physics.vehicle_velocity(id),
+                };
+                let (driver, held) = self.drivers.entry(entity).or_default();
+                let input = driver.drive_to(&state, target, want, false, dt);
+                let ahead_gear = physics.vehicle_gear(id).is_none_or(|(g, _)| g != 0);
+                held.take(&input, ahead_gear);
+                held.controls()
+            };
+            physics.drive(id, controls);
         }
     }
-
     /// At the end of its road: onto another road that meets the junction
     /// there (at random), else back the way it came.
-    fn turn_off(&mut self, car: Car, roads: &[Road]) -> Car {
+    /// The roads out of the junction at the end of its road ahead, and
+    /// which way each goes from there (0x8223D270 finds none at a road
+    /// that leads nowhere).
+    fn ways_out(&self, car: Car, roads: &[Road]) -> Vec<(usize, bool)> {
         let r = &roads[car.road];
         let end = if car.forward {
             r.points[r.points.len() - 1]
@@ -504,6 +617,12 @@ impl RoadTraffic {
         }
         ways.sort_unstable();
         ways.dedup();
+        ways
+    }
+
+    fn turn_off(&mut self, car: Car, roads: &[Road]) -> Car {
+        let r = &roads[car.road];
+        let ways = self.ways_out(car, roads);
         if ways.is_empty() {
             let last = r.points.len() - 1;
             return Car {
@@ -515,7 +634,6 @@ impl RoadTraffic {
                     1.min(last)
                 },
                 lane: car.lane,
-                waited: 0.0,
                 stuck: 0.0,
             };
         }
@@ -531,7 +649,6 @@ impl RoadTraffic {
                 last.saturating_sub(1)
             },
             lane: car.lane,
-            waited: 0.0,
             stuck: 0.0,
         }
     }
@@ -593,6 +710,58 @@ fn off_line(points: &[Vec3], at: Vec3) -> f32 {
 
 /// The right-hand side of a road going `dir` (level, unit): for a vehicle
 /// facing +z, +x is its left.
+/// Whether `p` is in lane `car.lane` of `road` the way `car` goes: how
+/// far right of the road's line it is (on the stretch nearest it) falls in
+/// that lane's strip ([`Road::lane_strips`]; the outermost where it has
+/// fewer).
+fn in_lane(road: &Road, car: Car, p: Vec3) -> bool {
+    let strips = road.lane_strips();
+    let Some(&(from, to)) = strips.get(car.lane).or(strips.last()) else {
+        return false;
+    };
+    let at = flat(p);
+    let best = road
+        .points
+        .windows(2)
+        .map(|w| {
+            let (a, b) = (flat(w[0]), flat(w[1]));
+            let ab = b - a;
+            let t = ((at - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+            let near = a + ab * t;
+            (at.distance_squared(near), near, ab.normalize_or_zero())
+        })
+        .min_by(|x, y| x.0.total_cmp(&y.0));
+    let Some((_, near, dir)) = best else {
+        return false;
+    };
+    let dir = if car.forward { dir } else { -dir };
+    // Right of the way it goes (+x of a vehicle facing +z is its left).
+    let right = Vec2::new(-dir.y, dir.x);
+    let off = (at - near).dot(right);
+    (from..=to).contains(&off)
+}
+
+/// How much of its road is left ahead of a vehicle at `here` heading for
+/// point `car.next` the way it goes, and the road's length, metres.
+fn along(road: &Road, car: Car, here: Vec3) -> (f32, f32) {
+    let p = &road.points;
+    let length: f32 = p.windows(2).map(|w| flat(w[1] - w[0]).length()).sum();
+    let next = car.next.min(p.len() - 1);
+    let mut left = flat(p[next] - here).length();
+    if car.forward {
+        left += p[next..]
+            .windows(2)
+            .map(|w| flat(w[1] - w[0]).length())
+            .sum::<f32>();
+    } else {
+        left += p[..=next]
+            .windows(2)
+            .map(|w| flat(w[1] - w[0]).length())
+            .sum::<f32>();
+    }
+    (left, length)
+}
+
 fn right_of(dir: Vec3) -> Vec3 {
     Vec3::new(-dir.z, 0.0, dir.x)
 }
@@ -680,6 +849,62 @@ mod tests {
         }
     }
 
+    // What is left of its road ahead, the way it goes (for 0x822B8138's
+    // "near the end").
+    #[test]
+    fn it_knows_how_much_road_is_left() {
+        let r = road(1, &[(0.0, 0.0), (0.0, 10.0), (0.0, 30.0)]);
+        let car = |forward, next| Car {
+            road: 0,
+            forward,
+            next,
+            lane: 0,
+            stuck: 0.0,
+        };
+        assert_eq!(
+            along(&r, car(true, 1), Vec3::new(0.0, 0.0, 5.0)),
+            (25.0, 30.0)
+        );
+        assert_eq!(
+            along(&r, car(false, 1), Vec3::new(0.0, 0.0, 20.0)),
+            (20.0, 30.0)
+        );
+    }
+
+    // She is in a road vehicle's lane when how far right of the line she
+    // is falls in its strip (0x82263C98): on the near half going +z, the
+    // far half going back; not off the road.
+    #[test]
+    fn she_is_in_its_lane_by_the_lanes_strip() {
+        let r = road(1, &[(0.0, 0.0), (0.0, 100.0)]);
+        let car = |forward| Car {
+            road: 0,
+            forward,
+            next: 1,
+            lane: 0,
+            stuck: 0.0,
+        };
+        assert!(in_lane(&r, car(true), Vec3::new(-2.0, 0.0, 50.0)));
+        assert!(!in_lane(&r, car(true), Vec3::new(2.0, 0.0, 50.0)));
+        assert!(in_lane(&r, car(false), Vec3::new(2.0, 0.0, 50.0)));
+        assert!(!in_lane(&r, car(true), Vec3::new(-6.0, 0.0, 50.0)));
+    }
+
+    // A road with no junction at its end leads nowhere: no way out.
+    #[test]
+    fn a_road_without_a_junction_leads_nowhere() {
+        let roads = [road(1, &[(0.0, 0.0), (0.0, 30.0)])];
+        let t = RoadTraffic::default();
+        let car = Car {
+            road: 0,
+            forward: true,
+            next: 1,
+            lane: 0,
+            stuck: 0.0,
+        };
+        assert!(t.ways_out(car, &roads).is_empty());
+    }
+
     #[test]
     fn traffic_keeps_to_the_right() {
         // Going +z, the right is -x; going back, +x.
@@ -753,7 +978,6 @@ mod tests {
             forward: true,
             next: 1,
             lane: 0,
-            waited: 0.0,
             stuck: 0.0,
         };
         let mut seen = HashSet::new();
@@ -769,7 +993,6 @@ mod tests {
             forward: true,
             next: 1,
             lane: 0,
-            waited: 0.0,
             stuck: 0.0,
         };
         let back = t.turn_off(dead, &roads);

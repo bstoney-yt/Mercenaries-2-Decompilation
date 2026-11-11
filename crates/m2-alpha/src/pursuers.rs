@@ -36,7 +36,13 @@
 //!
 //! Not yet: men are not sent (no faction's table asks for any). Inferred: how long a gunner has
 //! gone without seeing her is the time since his sight lines were last
-//! clear (the 360 keeps it in her record, +0x8C). Inferred: the gunners aim at her where she is (0x822C95D8's lead
+//! clear (the 360 keeps it in her record, +0x8C); car and tank drivers
+//! read the same time ([`driver_sight`]). Not ported: where the record
+//! puts her while she is unsensed (0x822D5468 moves its point on from
+//! where she was last sensed by its +0x28 x the time, or x
+//! `1 - 1 / (t + 1)` when +0x0 bit 26 is set, which 0x822F4178 sets for a
+//! target with a mind; which field +0x28 holds is not confirmed): the
+//! drivers are given where she is. Inferred: the gunners aim at her where she is (0x822C95D8's lead
 //! and line-of-fire checks are not ported); the 360 thinks at its own
 //! rate (not traced), the alpha every step. Invented: once the pursuit is
 //! over a car stops (0x822AA568) and is taken out of play past
@@ -331,6 +337,21 @@ impl Kind {
             Kind::Tank => "Tank",
             Kind::Boat => "Boat",
         }
+    }
+}
+
+/// What a pursuing driver knows of her: her record (the mind's +0x8D4).
+/// Its +0x8C, seconds since she was last sensed, is the one timer its
+/// driver and gunners share: the record's tick (0x822DE240) adds the
+/// think's length, a sensing of her (0x822D5468, 0x822D6030) sets it to
+/// 0. `CarAttack` gives up past 20 s of it, `TankAttack`'s states read
+/// it at 2, 3 and 5 s. Inferred: sensed is its sight lines clear, as
+/// for its gunners (the 360's other senses are not ported).
+fn driver_sight(her: Vec3, unseen: f32, vehicle: bool) -> Sight {
+    Sight {
+        at: her,
+        unseen,
+        vehicle,
     }
 }
 
@@ -897,7 +918,9 @@ impl Pursuers {
                 let target = boat_attack::Target {
                     sight: Sight {
                         at: her,
-                        unseen: 0.0,
+                        // Its record's +0x8C: since its sight lines to her
+                        // were last clear (below).
+                        unseen: p.unseen,
                         vehicle: in_vehicle,
                     },
                     velocity: her_velocity,
@@ -905,7 +928,7 @@ impl Pursuers {
                     size: she.size,
                     swimming: she.swimming,
                 };
-                let state = p.boat.state;
+                let (state, idle) = (p.boat.state, p.boat.idle);
                 let near = around(physics, &others, &car, (lo, hi));
                 let mut world = Afloat {
                     physics: &*physics,
@@ -926,6 +949,20 @@ impl Pursuers {
                     rand,
                     dt,
                 );
+                if p.boat.idle != idle {
+                    eprintln!(
+                        "pursuers: {} {:#x} {}, {:.0} m from her, {:.0} m from where it last had her",
+                        p.template,
+                        p.entity,
+                        if p.boat.idle {
+                            "BoatIdle"
+                        } else {
+                            "BoatAttack again"
+                        },
+                        car.at.distance(her),
+                        p.boat.last.map_or(0.0, |l| car.at.distance(l))
+                    );
+                }
                 if p.boat.state != state {
                     eprintln!(
                         "pursuers: {} {:#x} BoatAttack {:?} -> {:?}, {:.0} m from her",
@@ -967,11 +1004,7 @@ impl Pursuers {
                     width: hi.x - lo.x,
                     gunner: crate::combat::armed_seats(v).len() > 1,
                 };
-                let sight = Sight {
-                    at: her,
-                    unseen: 0.0,
-                    vehicle: in_vehicle,
-                };
+                let sight = driver_sight(her, p.unseen, in_vehicle);
                 // What she has hit it for since the last think (0x822FA988).
                 p.tank.feel(std::mem::take(&mut v.hit), dt);
                 let state = p.tank.state;
@@ -1032,11 +1065,7 @@ impl Pursuers {
                     // report and his weapon slot's distances.
                     let crew = rider_list(v, &p.reports, car.at, car.forward);
                     let (lo, hi) = v.spec.bounds;
-                    let sight = Sight {
-                        at: her,
-                        unseen: 0.0,
-                        vehicle: in_vehicle,
-                    };
+                    let sight = driver_sight(her, p.unseen, in_vehicle);
                     let mut world = Look {
                         physics,
                         rng: &mut self.rng,
@@ -1241,6 +1270,15 @@ fn behind_chance(standing: Standing) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_driver_reads_the_time_since_she_was_last_sensed() {
+        // Her record's +0x8C (0x822DE240 adds the think, a sensing
+        // clears it), not a constant 0.
+        let s = driver_sight(Vec3::X, 21.5, true);
+        assert_eq!((s.at, s.unseen, s.vehicle), (Vec3::X, 21.5, true));
+    }
+
     use super::*;
 
     #[test]
