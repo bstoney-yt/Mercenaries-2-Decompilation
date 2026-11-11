@@ -1,10 +1,9 @@
 name: CI
 
-# Runs on the test PC (a self-hosted Windows x64 runner labelled m2-pc),
-# not GitHub's machines. The repository is public, so code from a fork's
-# pull request never runs here: the jobs run only for pushes to main and
-# for pull requests whose branch is in this repository. The runner keeps its checkout and target directory between runs, so
-# builds are incremental and need no cache step.
+# Runs on GitHub's hosted Windows runners, which are free for public
+# repositories. No step reads the game install, so nothing here needs the
+# dev VM. Each job starts clean; rust-cache keeps the cargo registry and
+# target directory between runs.
 on:
   push:
     branches: [main]
@@ -13,19 +12,20 @@ on:
       - 'docs/**'
   pull_request:
     # `closed` runs nothing: it only joins the PR's concurrency group so
-    # that a merged or closed PR's queued run is cancelled instead of
-    # holding the one runner for an hour (see concurrency below).
+    # that a merged or closed PR's queued or running run is cancelled.
     types: [opened, synchronize, reopened, ready_for_review, closed]
     paths-ignore:
       - '**.md'
       - 'docs/**'
 
 # A new push to a PR, or merging or closing it, cancels the run it
-# supersedes; runs on main finish. PR runs are grouped by PR number so
-# the `closed` event lands in the same group as the PR's earlier runs.
+# supersedes. A new push to main likewise cancels the older main run:
+# only the newest main commit needs a result. PR runs are grouped by PR
+# number so the `closed` event lands in the same group as the PR's
+# earlier runs.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 # The job token can read the repository and nothing more.
 permissions:
@@ -35,25 +35,16 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
-# The runner's service account may not run PowerShell scripts (its
-# execution policy), and every step here is a plain command, so steps
-# run in cmd.
-defaults:
-  run:
-    shell: cmd
-
 jobs:
   host:
     name: Lint and test (host)
-    if: >-
-      github.event_name == 'push' ||
-      (github.event.action != 'closed' &&
-       github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: [self-hosted, Windows, X64, m2-pc]
+    if: github.event.action != 'closed'
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       # rust-toolchain.toml installs the pinned toolchain and the i686 target.
       - run: rustup show
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
@@ -61,11 +52,12 @@ jobs:
 
   windows-i686:
     name: Build (i686-pc-windows-msvc)
-    runs-on: [self-hosted, Windows, X64, m2-pc]
-    needs: host
+    if: github.event.action != 'closed'
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
+      - uses: Swatinem/rust-cache@v2
       # Lints the Windows target, where the C parts (the vendored Lua in
       # m2-game) are compiled.
       - run: cargo clippy --workspace --all-targets --target i686-pc-windows-msvc
@@ -73,10 +65,14 @@ jobs:
       # The script host's Lua raises errors with longjmp, which unwinds
       # differently on Windows; run its tests on the 32-bit target too.
       - run: cargo test -p m2-game --target i686-pc-windows-msvc
+      # The release exe is built only for main: PRs already get the debug
+      # i686 build above, and this step takes several minutes.
       - name: Build the alpha exe
+        if: github.event_name == 'push'
         run: cargo build --release -p m2-alpha --target i686-pc-windows-msvc
       # Our code only: the exe reads the game from the player's own install.
       - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
         with:
           name: m2-alpha-windows-i686
           path: target/i686-pc-windows-msvc/release/m2-alpha.exe
