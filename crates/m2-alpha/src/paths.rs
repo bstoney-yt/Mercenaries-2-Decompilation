@@ -24,6 +24,7 @@ use std::collections::HashMap;
 
 use m2_engine::car_driver::{CarDriver, CarInputs, CarState};
 use m2_engine::{Physics, VehicleControls, boat_attack, tank_attack};
+use m2_game::path_order::PathMode;
 use m2_math::glam::{Vec2, Vec3};
 
 use crate::scene::ParkedVehicle;
@@ -42,12 +43,38 @@ const LOG_EVERY: u32 = 30;
 #[derive(Debug)]
 struct PathMove {
     route: Vec<Vec3>,
+    /// The whole path as it is travelled, for another time along it, and
+    /// what it does at its end (`Mode`, [`m2_game::path_order`]).
+    lap: Vec<Vec3>,
+    mode: PathMode,
     next: usize,
     haste: f32,
     steps: u32,
     /// A car's driver and what its input holds.
     driver: CarDriver,
     held: CarInputs,
+}
+
+impl PathMove {
+    /// At its route's end, sets out along its path again if its mode has
+    /// it do so (and the path has a second point to go to): whether it
+    /// did.
+    fn again(&mut self) -> bool {
+        if self.lap.len() < 2 {
+            return false;
+        }
+        match self.mode {
+            PathMode::Oneway => return false,
+            PathMode::Loop => self.next = 0,
+            // Back the way it came: it stands at what is now the first.
+            PathMode::Bounce => {
+                self.lap.reverse();
+                self.next = 1;
+            }
+        }
+        self.route = self.lap.clone();
+        true
+    }
 }
 
 /// The vehicles driving the scripts' paths, by the scripts' guid.
@@ -59,7 +86,17 @@ pub struct PathMoves {
 impl PathMoves {
     /// Sends `vehicle` along `route` at `haste` (0..1) of its top speed,
     /// from the route's first point.
-    pub fn start(&mut self, vehicle: u32, route: Vec<Vec3>, haste: f32) {
+    /// Along `route` first and then, by `mode`, `lap` (the whole path as
+    /// it is travelled) again: round it from its first point (`Loop`) or
+    /// back and forth (`Bounce`).
+    pub fn start(
+        &mut self,
+        vehicle: u32,
+        route: Vec<Vec3>,
+        lap: Vec<Vec3>,
+        mode: PathMode,
+        haste: f32,
+    ) {
         if route.is_empty() {
             return;
         }
@@ -67,6 +104,8 @@ impl PathMoves {
             vehicle,
             PathMove {
                 route,
+                lap,
+                mode,
                 next: 0,
                 haste: haste.clamp(0.05, 1.0),
                 steps: 0,
@@ -117,6 +156,13 @@ impl PathMoves {
                     m.next,
                     m.route.len()
                 );
+            }
+            if m.next >= m.route.len() && m.again() {
+                eprintln!(
+                    "paths: {g:#x} at its path's end, {here:.1}: along it again ({:?})",
+                    m.mode
+                );
+                return true;
             }
             if m.next >= m.route.len() {
                 physics.drive(
@@ -255,9 +301,33 @@ mod tests {
     #[test]
     fn an_empty_route_is_not_driven() {
         let mut p = PathMoves::default();
-        p.start(7, Vec::new(), 1.0);
+        p.start(7, Vec::new(), Vec::new(), PathMode::Oneway, 1.0);
         assert!(p.moves.is_empty());
-        p.start(7, vec![Vec3::ZERO], 1.0);
+        p.start(7, vec![Vec3::ZERO], vec![Vec3::ZERO], PathMode::Oneway, 1.0);
         assert!(p.moves.contains_key(&7));
+    }
+
+    #[test]
+    fn at_its_end_a_path_is_parked_on_looped_or_bounced_by_its_mode() {
+        let lap = vec![Vec3::ZERO, Vec3::X * 50.0, Vec3::new(50.0, 0.0, 50.0)];
+        let at_end = |mode| {
+            let mut p = PathMoves::default();
+            // Joined at its second point (a `Nearest` start).
+            p.start(7, lap[1..].to_vec(), lap.clone(), mode, 1.0);
+            let mut m = p.moves.remove(&7).unwrap();
+            m.next = m.route.len();
+            let again = m.again();
+            (again, m.route, m.next)
+        };
+        assert!(!at_end(PathMode::Oneway).0);
+        // Round again: the whole path from its first point.
+        assert_eq!(at_end(PathMode::Loop), (true, lap.clone(), 0));
+        // Back: the path reversed, heading for the point before the end.
+        let back: Vec<Vec3> = lap.iter().rev().copied().collect();
+        assert_eq!(at_end(PathMode::Bounce), (true, back, 1));
+        // One point is nowhere to go again.
+        let mut p = PathMoves::default();
+        p.start(7, vec![Vec3::ZERO], vec![Vec3::ZERO], PathMode::Loop, 1.0);
+        assert!(!p.moves.get_mut(&7).unwrap().again());
     }
 }
