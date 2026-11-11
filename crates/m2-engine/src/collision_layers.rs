@@ -165,8 +165,10 @@ impl Preset {
     ///
     /// A `_DebrisPhysics` object, with no `_PropPhysics` record (0x8218EDA0
     /// gives 3), is loose by a record of its own physics (0x82187CA0: bit
-    /// 0x10 of its +0x18 byte, or either of two properties of its owner,
-    /// 0x823DA3C8 with 0x71246D6D or 0x9B6005C0), or without that record
+    /// 0x10 of its +0x18 byte, or either of two of its owner's labels,
+    /// 0x823DA3C8: 0x71246D6D, the template database's `Label` `tree`, or
+    /// 0x9B6005C0, found in no label or string of the data), or without
+    /// that record
     /// when its `PhysicsActor` (store 0x836571D4) is of kind 0xE. Which
     /// records those are isn't traced, so a debris template takes the
     /// prop preset ([`crate::durability::presets`]).
