@@ -8,7 +8,11 @@
 //!   `0x82344C88`) copy the name into a 64-byte buffer (`0x83133F18` /
 //!   `0x83133FD8`, through `0x82308390`) and answer true, or nil if it
 //!   came out empty. `GetMasterScriptName` (`0x82344BA0`) answers that
-//!   buffer, nil while empty; `GetCharacterTemplate` (`0x82344CF8`) does
+//!   buffer (nil while empty). The boot fills both from the configuration
+//!   (`0x822193D8`: the level name, copied into the master script name),
+//!   so the port answers the level name for an unset master script name
+//!   and "vz" for an unset level (inferred: the configuration's value isn't
+//!   read). `GetCharacterTemplate` (`0x82344CF8`) does
 //!   the same with `0x8313406C`, which nothing the scripts call sets.
 //! - `Sys.GetVersion` (`0x82346268`) answers two numbers, each clamped to
 //!   100000..999999; both words (`0x831340C0`/`C4`) are 0 in the image, so
@@ -28,9 +32,7 @@
 //!   `0x836508E8`/`EC`/`F0` and `0x83650904`/`08`. All answer nil without a
 //!   number and nothing otherwise.
 //!
-//! Invented: `Sys.GetLevelName` answers "vz" until a name is set (the
-//! port's earlier answer; the 360's reads the same buffer as the setter),
-//! and `GetAvailableCostumes` answers 0 (a fresh profile's byte, not
+//! Invented: `GetAvailableCostumes` answers 0 (a fresh profile's byte, not
 //! traced). The renderer doesn't read the bloom and contrast values yet.
 
 use mlua::{Lua, MultiValue, Table, Value};
@@ -106,12 +108,19 @@ fn sys_get_master_script_name(
     lua: &Lua,
     _args: &[Value],
 ) -> mlua::Result<MultiValue> {
-    match &w.shell.master_script_name {
-        Some(s) if !s.is_empty() => Ok(MultiValue::from_vec(vec![Value::String(
-            lua.create_string(s)?,
-        )])),
-        _ => Ok(nil()),
-    }
+    // The boot fills the buffer from the configuration's level name
+    // (`0x822193D8` copies the level into the master script name), so the
+    // shell finds a string here (its bootstrap ASSERTs one and passes it
+    // to `Sys.StartSingleplayer`): the level name until one is set.
+    let name = w
+        .shell
+        .master_script_name
+        .clone()
+        .or_else(|| w.shell.level_name.clone())
+        .unwrap_or_else(|| "vz".to_owned());
+    Ok(MultiValue::from_vec(vec![Value::String(
+        lua.create_string(&name)?,
+    )]))
 }
 
 // Sys.GetLevelName()
@@ -419,7 +428,7 @@ mod tests {
         );
         assert_eq!(
             texts(sys_get_master_script_name(&mut w, &lua, &[]).unwrap()),
-            ["nil"]
+            ["vz"]
         );
         assert_eq!(
             texts(sys_set_level_name(&mut w, &lua, &[s(&lua, "")]).unwrap()),
