@@ -153,7 +153,17 @@ pub trait World {
     fn animation_events(&self) -> &[(f64, u32, String)] {
         &[]
     }
+    /// What characters did with their weapons (`"Equip"`, `"Stow"`,
+    /// `"Drop"`), each with its game time, for `WeaponEvent` events.
+    fn weapon_events(&self) -> &[WeaponChange] {
+        &[]
+    }
 }
+
+/// Something a character did with a weapon: game time, the character,
+/// what (`"Equip"`, `"Stow"`, `"Drop"`: the three the scripts wait for),
+/// the weapon.
+pub type WeaponChange = (f64, u32, String, u32);
 
 /// A character's state change: game time, character, from, to.
 pub type StateChange = (f64, u32, String, String);
@@ -174,7 +184,7 @@ pub fn state_matches(pattern: &str, state: &str) -> bool {
     }
 }
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 20] = [
+pub const KINDS: [&str; 21] = [
     "TimerRelative",
     // Every update, in the mission's scripts too: the support manager's
     // recruit cooldowns count with it (`SupportTimer`, which takes
@@ -199,6 +209,7 @@ pub const KINDS: [&str; 20] = [
     "ObjectDelete",
     "HumanStateTransition",
     "ObjectPhysicsEvent",
+    "WeaponEvent",
 ];
 
 /// Kinds the game delivers itself through `Event.__m2_fire` (besides
@@ -1470,6 +1481,35 @@ fn check(
             });
             match hit {
                 Some((_, g, _, _)) => Check::Fire(vec![id(*g)]),
+                None => no,
+            }
+        }
+        // { holder (or filter), what, weapon (or filter) }: as one of the
+        // holders does `what` with a weapon, after the event was made
+        // (`MrxStatsManager` times her favourite weapon by her `"Equip"`,
+        // `"Stow"` and `"Drop"`). From the 360 code (the event's reader
+        // 82358000, its test 823580F8 and what it passes 82358190): the
+        // holder and what are needed; `"Any"` is anything done; the
+        // weapon may be left out, for any weapon; it passes the holder
+        // and the weapon.
+        "WeaponEvent" => {
+            let Some(what) = text(&p.params, 2) else {
+                return no;
+            };
+            let holders = objects(&p.params, 1, world);
+            if holders.is_empty() {
+                return no;
+            }
+            let weapons = objects(&p.params, 3, world);
+            let hit = world.weapon_events().iter().find(|(t, who, did, weapon)| {
+                *t >= p.last
+                    && (*t > p.last || !p.persistent)
+                    && holders.contains(who)
+                    && (what.eq_ignore_ascii_case("Any") || what.eq_ignore_ascii_case(did))
+                    && (weapons.is_empty() || weapons.contains(weapon))
+            });
+            match hit {
+                Some((_, who, _, weapon)) => Check::Fire(vec![id(*who), id(*weapon)]),
                 None => no,
             }
         }

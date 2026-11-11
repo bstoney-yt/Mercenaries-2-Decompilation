@@ -1377,6 +1377,16 @@ impl Mission {
             .map(|a| a.text.clone())
     }
 
+    /// Character `holder` did `what` (`"Equip"`, `"Stow"`, `"Drop"`) with
+    /// `weapon`, for the scripts' `WeaponEvent` events.
+    pub fn weapon_event(&mut self, holder: u32, what: &str, weapon: u32) {
+        let mut w = self.world.borrow_mut();
+        w.weapon_events
+            .push((self.now, holder, what.to_owned(), weapon));
+        let extra = w.weapon_events.len().saturating_sub(32);
+        w.weapon_events.drain(..extra);
+    }
+
     /// Character `guid` is now in human state `state` (`Stance.Action`:
     /// `KnockedDown.Idle`), for the scripts' `HumanStateTransition` events.
     pub fn set_human_state(&mut self, guid: u32, state: &str) {
@@ -3572,6 +3582,52 @@ mod tests {
             .unwrap();
         assert!(m.lua().globals().get::<bool>("__c").unwrap());
     }
+    #[test]
+    fn what_she_does_with_a_weapon_reaches_the_weapon_events() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        // As `MrxStatsManager` waits for her favourite weapon's time, and
+        // one for a single weapon, one for anything done.
+        m.run(
+            r#"__heard = {}
+            local function note(s)
+                return function(who, weapon)
+                    __heard[#__heard + 1] = s .. " " .. tostring(who == Player.GetLocalCharacter())
+                        .. " " .. tostring(weapon == Sys.StringToGuid('0x77'))
+                end
+            end
+            local her = Player.GetLocalCharacter()
+            Event.CreatePersistent(Event.WeaponEvent, { her, "Equip" }, note("equip"), {})
+            Event.CreatePersistent(Event.WeaponEvent, { her, "Stow" }, note("stow"), {})
+            Event.CreatePersistent(Event.WeaponEvent, { her, "Any", Sys.StringToGuid('0x78') }, note("other"), {})
+            Event.CreatePersistent(Event.WeaponEvent, { Sys.StringToGuid('0x9'), "Any" }, note("him"), {})"#,
+            "events",
+        )
+        .unwrap();
+        let heard = |m: &Mission| -> Vec<String> {
+            m.lua()
+                .globals()
+                .get::<Table>("__heard")
+                .unwrap()
+                .sequence_values()
+                .map(|v| v.unwrap())
+                .collect()
+        };
+        m.tick(0.1);
+        assert!(heard(&m).is_empty());
+        m.weapon_event(PLAYER, "Equip", 0x77);
+        m.tick(0.1);
+        m.weapon_event(PLAYER, "Stow", 0x77);
+        m.tick(0.1);
+        // Dropped: nobody waits for that one, nor for another's weapon.
+        m.weapon_event(PLAYER, "Drop", 0x77);
+        m.tick(0.1);
+        assert_eq!(heard(&m), ["equip true true", "stow true true"]);
+        m.weapon_event(PLAYER, "Drop", 0x78);
+        m.tick(0.1);
+        assert_eq!(heard(&m).last().unwrap(), "other true false");
+        assert_eq!(heard(&m).len(), 3);
+    }
+
     #[test]
     fn leaving_the_play_area_or_entering_an_exclusion_tells_the_boundary_callback() {
         let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
