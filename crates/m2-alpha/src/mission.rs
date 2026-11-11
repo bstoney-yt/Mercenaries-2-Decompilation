@@ -4769,6 +4769,28 @@ impl Fleet {
         }
         let now = mission.now();
         self.landing.retain(|_, until| *until > now);
+        // The scripts' vehicles' seats ([`m2_game::vehicle_seats`]), from
+        // their templates' `SeatLink`s and `SeatParameters`.
+        {
+            let mut w = mission.world().borrow_mut();
+            for v in &mut game.scene.vehicles {
+                let (Some(g), Some(seating)) = (v.guid, v.spec.seating.as_mut()) else {
+                    continue;
+                };
+                w.seats.add(g, seating.seats.iter().map(seat_of_template));
+                // `Vehicle.SetCanPlayerUse` (0x82346D10): the seats she may
+                // take, as the scripts last set them.
+                let barred: Vec<(u32, bool)> =
+                    w.seats.of(g).map(|(_, s)| (s.name, s.player_use)).collect();
+                for (name, can) in barred {
+                    if let Some(i) = seating.seat(name)
+                        && seating.seats[i].player_use != can
+                    {
+                        std::sync::Arc::make_mut(seating).seats[i].player_use = can;
+                    }
+                }
+            }
+        }
         for v in &game.scene.vehicles {
             let (Some(g), Some(id)) = (v.guid, v.id) else {
                 continue;
@@ -5527,6 +5549,26 @@ fn send_gunship(game: &mut Game, faction: &'static str, template: &str, her: Vec
     eprintln!("gunships: {faction} send their {template} from {at:.0}");
 }
 
+/// A seat as the scripts read it ([`m2_game::vehicle_seats::SeatParams`]).
+fn seat_of_template(
+    s: &m2_engine::seats::Seat,
+) -> (u32, m2_game::vehicle_seats::SeatParams, bool, Vec<u32>) {
+    let f = s.flags;
+    let params = m2_game::vehicle_seats::SeatParams {
+        driver: s.driver,
+        gunner: s.gunner,
+        cargo: f.cargo,
+        hijackable: s.hijackable,
+        hijack_blocker: f.hijack_blocker,
+        rider_invisible: f.rider_invisible,
+        rider_vulnerable: f.rider_vulnerable,
+        rider_bashable: f.rider_bashable,
+        stowable: f.stowable,
+        ladder: f.ladder,
+    };
+    (s.name, params, s.player_use, s.links.clone())
+}
+
 fn pursuit_standing(game: &Game, her: Vec3) -> crate::reinforce::Standing {
     use crate::reinforce::Standing;
     // For a test run: `M2_TEST_PURSUIT=<faction>,<level>,<state>` takes
@@ -5935,6 +5977,7 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
                             location: Some(to),
                             target: None,
                             haste: None,
+                            path: None,
                         },
                     );
                 }
@@ -6472,10 +6515,29 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             goal,
             target: Some(path),
             haste,
+            path: order,
             ..
         } if goal == "PathMove" => {
             let vehicle = mission.world().borrow().vehicle_of(*guid);
-            let route: Vec<Vec3> = mission.path(*path).iter().map(|&p| Vec3::from(p)).collect();
+            // Where on the path it starts, which way it goes and what it
+            // does at the end are the goal's own (from the 360 code,
+            // `m2_game::path_order`): unless told otherwise, from the
+            // point of the path nearest it.
+            let order = order.unwrap_or_default();
+            let points = mission.path(*path).to_vec();
+            let from = {
+                let w = mission.world().borrow();
+                vehicle
+                    .and_then(|v| w.objects.get(&v))
+                    .or_else(|| w.objects.get(guid))
+                    .map(|o| o.position)
+            };
+            let to_vec = |ps: Vec<[f32; 3]>| ps.into_iter().map(Vec3::from).collect::<Vec<_>>();
+            let lap = to_vec(order.lap(&points));
+            let route = match from {
+                Some(from) => to_vec(order.route(&points, from)),
+                None => lap.clone(),
+            };
             match vehicle {
                 Some(v) if !route.is_empty() => {
                     eprintln!(
@@ -6485,7 +6547,8 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                         route[0],
                         route[route.len() - 1]
                     );
-                    game.paths.start(v, route, haste.unwrap_or(1.0));
+                    game.paths
+                        .start(v, route, lap, order.mode, haste.unwrap_or(1.0));
                 }
                 // A person on foot (the villa's wave soldiers, coming in
                 // through the garage and over the walls): they run it.

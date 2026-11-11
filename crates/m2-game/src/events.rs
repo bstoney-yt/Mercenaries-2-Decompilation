@@ -689,6 +689,17 @@ impl Events {
                         p.held = holds;
                         rising.then_some(vec![extra])
                     }
+                    Check::Health(holds, health, comparison) => {
+                        let rising = holds && !p.held;
+                        p.held = holds;
+                        let lua = s.lua.0.as_ref().and_then(mlua::WeakLua::try_upgrade);
+                        let text = lua.as_ref().and_then(|l| l.create_string(comparison).ok());
+                        rising.then(|| {
+                            let mut extra = vec![Value::Number(health)];
+                            extra.extend(text.map(Value::String));
+                            vec![extra]
+                        })
+                    }
                     // `held_by` keeps who was seated at the last check
                     // (none before the first).
                     Check::Seats(riders) => {
@@ -829,7 +840,15 @@ impl Events {
                             ));
                         }
                         if p.persistent {
-                            p.last = now;
+                            // A repeating timer keeps what it overran by
+                            // (from the 360 code: 0x823554d0 takes the
+                            // delay off the time counted, 0x82355480
+                            // counts on from there), so it keeps its rate
+                            // whatever the frame length.
+                            p.last = match (p.kind.as_str(), number(&p.params, 1)) {
+                                ("TimerRelative", Some(delay)) => p.last + delay,
+                                _ => now,
+                            };
                             keep.push(p);
                         }
                     }
@@ -970,6 +989,9 @@ enum Check {
     /// A condition: whether it holds, and the values to pass when it
     /// starts to.
     Holds(bool, Vec<Value>),
+    /// ObjectHealth's condition: whether it holds, the health that made
+    /// it, and the comparison as text, which it passes (both, no guid).
+    Health(bool, f64, &'static str),
     /// Riders and whether each is in a wanted seat, with the values to
     /// pass: fired by the event's mode as they get in or out.
     Seats(Vec<(u32, (bool, bool), Vec<Value>)>),
@@ -1210,6 +1232,18 @@ fn text(t: &Table, i: i64) -> Option<String> {
 /// filter said yes to.
 type Accepted = HashSet<(usize, usize)>;
 
+/// `ObjectHealth`'s comparison text as (equal, less, more), as the 360 reads
+/// it (0x8234c970): equal when either of the first two characters is `=`,
+/// then less or more by the first. Anything else compares as nothing
+/// (none here).
+fn health_comparison(s: &str) -> Option<(bool, bool, bool)> {
+    let b = s.as_bytes();
+    let equal = b.first() == Some(&b'=') || b.get(1) == Some(&b'=');
+    let less = b.first() == Some(&b'<');
+    let more = b.first() == Some(&b'>');
+    (equal || less || more).then_some((equal, less, more))
+}
+
 fn check(
     p: &Pending,
     now: f64,
@@ -1254,6 +1288,23 @@ fn check(
             Some(g) => Check::Holds(world.position(g).is_none(), vec![id(g)]),
             None => no,
         },
+        // { object, health }: once the object's health is below the figure
+        // (4 scripts: ChiCon001's VIP and the like wait for half of
+        // `Object.GetHealth`). From the 360 code: parse 0x82350e28 takes a
+        // guid and a number, test 0x82350ee8 compares the object's health
+        // with it as its health changes (a health it can't read counts as
+        // below), and nothing is passed (0x8225e998). Here it is checked
+        // every update; an object this world doesn't hold is left waiting
+        // (inferred: the engine only tests on a health change).
+        "ObjectHealthLessThan" => {
+            let (Some(g), Some(figure)) = (guid(&p.params, 1), number(&p.params, 2)) else {
+                return no;
+            };
+            match world.health(g) {
+                Some(h) => Check::Holds(f64::from(h) < figure, Vec::new()),
+                None => no,
+            }
+        }
         // { a, b, op, metres, stopped, flat }: when some a is within
         // ("<", "<=") or beyond (">", ">=") the distance of some b,
         // checked whenever it is pending (scripts wanting repeats make a
@@ -1466,20 +1517,51 @@ fn check(
         // { object, "<" or ">", health }: while its health is below (or
         // above) the figure; passes the object. The hero's survival
         // script watches for drops below her current health this way.
+        // From the 360 code (the kind's parse 0x82351050, test 0x823512a8,
+        // arguments 0x82351420): `{ object, comparison, value }`, or with
+        // four `{ object, part, comparison, value }` (a part's name hash,
+        // `"*"` for any of its parts). The comparison is read as `=`
+        // (either character), then `<` or `>` (0x8234c970): `<`, `<=`,
+        // `>`, `>=` or `=`. The callback gets the health that made it hold
+        // and the comparison as text, after its data; no guid.
+        //
+        // Here objects have no parts: `"*"` takes the object's health
+        // (inferred), a named part never holds (the 360 answers false for
+        // a part the object lacks).
         "ObjectHealth" => {
-            let Some(figure) = number(&p.params, 3) else {
+            let four = p.params.raw_len() >= 4;
+            let (at, part) = if four {
+                (3, text(&p.params, 2))
+            } else {
+                (2, None)
+            };
+            let (Some(comparison), Some(figure)) = (text(&p.params, at), number(&p.params, at + 1))
+            else {
                 return no;
             };
-            let above = text(&p.params, 2).as_deref() == Some(">");
+            if part.is_some_and(|s| s != "*") {
+                return Check::Health(false, 0.0, "=");
+            }
+            let Some((equal, less, more)) = health_comparison(&comparison) else {
+                return no;
+            };
+            let shown = match (less, more, equal) {
+                (true, _, true) => "<=",
+                (true, _, false) => "<",
+                (_, true, true) => ">=",
+                (_, true, false) => ">",
+                _ => "=",
+            };
             for o in objects(&p.params, 1, world) {
-                if let Some(h) = world.health(o)
-                    && (f64::from(h) > figure) == above
-                    && f64::from(h) != figure
-                {
-                    return Check::Holds(true, vec![id(o)]);
+                if let Some(h) = world.health(o).map(f64::from) {
+                    let holds =
+                        (equal && h == figure) || (less && h < figure) || (more && h > figure);
+                    if holds {
+                        return Check::Health(true, h, shown);
+                    }
                 }
             }
-            no
+            Check::Health(false, 0.0, shown)
         }
         // { character (or filter), from, to }: as one of them goes from a
         // state matching `from` to one matching `to` ([`state_matches`]:
@@ -1616,11 +1698,27 @@ fn check(
             }
             None => no,
         },
-        "ObjectHibernation" | "ObjectIsReady" => match guid(&p.params, 1) {
+        // { object, mode, [level] }: while the object is awake (a mode
+        // starting with "a") or hibernating (any other mode, or none).
+        // From the 360 code: parse 0x82352728 reads only the first letter,
+        // so the HQ manager's `{ hq, "s" }` (wait for a destroyed HQ to
+        // hibernate before reviving it) waits for hibernation, as do
+        // "hibernated" and a missing mode. Its arguments slot (0x8225e998)
+        // passes nothing. The optional level (a streaming detail the
+        // object must have reached) isn't modelled.
+        "ObjectHibernation" => match guid(&p.params, 1) {
             Some(g) => {
-                let want_awake = !text(&p.params, 2).is_some_and(|t| t.starts_with("hibernat"));
-                Check::Holds(world.is_awake(g) == want_awake, vec![id(g)])
+                let want_awake = text(&p.params, 2).is_some_and(|t| t.starts_with('a'));
+                Check::Holds(world.is_awake(g) == want_awake, Vec::new())
             }
+            None => no,
+        },
+        // { object, [level] }: once the object is in the world. From the
+        // 360 code (0x82352c28, 0x82352ab0) it checks the object is loaded
+        // rather than awake; here awake stands in for that (inferred).
+        // Passes nothing (0x8225e998).
+        "ObjectIsReady" => match guid(&p.params, 1) {
+            Some(g) => Check::Holds(world.is_awake(g), Vec::new()),
             None => no,
         },
         // { object }: while it is on the player's screen
@@ -1861,6 +1959,27 @@ mod tests {
         assert_eq!(log(&host).len(), 3);
     }
 
+    /// A repeating timer keeps its rate when the frames don't divide its
+    /// delay: 0.1 s at 30 frames a second is 30 a second, not one every
+    /// fourth frame (22 or so).
+    #[test]
+    fn a_repeating_timer_carries_what_it_overran() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                "Event.CreatePersistent(Event.TimerRelative, { 0.1 }, \
+                 function() table.insert(log, 'tick') end)",
+            )
+            .exec()
+            .unwrap();
+        let world = TestWorld::default();
+        for _ in 0..90 {
+            events.update(1.0 / 30.0, &world);
+        }
+        let n = log(&host).len();
+        assert!((29..=30).contains(&n), "{n} ticks in 3 s");
+    }
+
     #[test]
     fn a_context_action_fires_when_taken_at_its_object() {
         let (host, events) = setup();
@@ -2055,7 +2174,7 @@ mod tests {
                 Event.Create(Event.ObjectDeath, { 7 }, note("dead "), { 7 })
                 Event.Create(Event.ObjectProximity, { "hero", 2, "<", 10, false, false }, note("near "), {})
                 Event.Create(Event.ObjectInSeat, { "hero", nil, "Any", "enter" }, note("seat "), {})
-                Event.Create(Event.ObjectHibernation, { 3, "awake" }, note("awake "), {})
+                Event.Create(Event.ObjectHibernation, { 3, "awake" }, note("awake "), { 3 })
                 Event.Create(Event.ScriptEvent, { "Go" }, note("posted "), { "x" })
                 "#,
             )
@@ -2356,14 +2475,19 @@ mod tests {
         // door hibernated waits for her to leave, then for it to wake.
         host.lua()
             .load(
-                r#"
-                Event.Create(Event.ObjectHibernation, { 3, "awake" },
-                    function(d) table.insert(log, "awake " .. gid(d)) end)
-                Event.Create(Event.ObjectHibernation, { 3, "hibernated" },
-                    function(d) table.insert(log, "hibernated " .. gid(d)) end)
-                Event.Create(Event.ObjectHibernation, { 3, "hibernate" },
-                    function(d) table.insert(log, "hibernate " .. gid(d)) end)
-                "#,
+                r##"
+                -- The engine passes nothing of its own: only the data.
+                local function note(s) return function(...)
+                    table.insert(log, s .. select("#", ...))
+                end end
+                Event.Create(Event.ObjectHibernation, { 3, "awake" }, note("awake "))
+                Event.Create(Event.ObjectHibernation, { 3, "hibernated" }, note("hibernated "))
+                Event.Create(Event.ObjectHibernation, { 3, "hibernate" }, note("hibernate "))
+                -- The HQ manager's wait before reviving a destroyed HQ: any
+                -- mode not starting with "a" waits for hibernation.
+                Event.Create(Event.ObjectHibernation, { 3, "s" }, note("s "))
+                Event.Create(Event.ObjectHibernation, { 3 }, note("none "))
+                "##,
             )
             .exec()
             .unwrap();
@@ -2372,13 +2496,16 @@ mod tests {
         for _ in 0..5 {
             events.update(0.1, &world);
         }
-        assert_eq!(log(&host), ["awake 3"]);
-        assert_eq!(events.len(), 2);
+        assert_eq!(log(&host), ["awake 0"]);
+        assert_eq!(events.len(), 4);
         world.positions.remove(&3);
         events.update(0.1, &world);
         let mut got = log(&host);
         got.sort();
-        assert_eq!(got, ["awake 3", "hibernate 3", "hibernated 3"]);
+        assert_eq!(
+            got,
+            ["awake 0", "hibernate 0", "hibernated 0", "none 0", "s 0"]
+        );
         assert!(events.is_empty());
     }
 

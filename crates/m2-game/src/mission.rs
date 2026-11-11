@@ -764,6 +764,7 @@ impl Mission {
         events.install(host.lua())?;
         crate::hijack::install(&host, &world)?;
         crate::vehicle_state::install(&host, &world)?;
+        crate::vehicle_seats::install(&host, &world)?;
         host.install_library(Rc::clone(&library), true)?;
         // The contracts' own globals read nil while unset, as in the game,
         // not stubs: every global a contract's or job's script assigns.
@@ -2747,7 +2748,7 @@ pub fn first_lines(s: &str) -> String {
 /// the two regions with a `BoundaryData` record are the HQs' exclusions
 /// (`Boundary_ALHQ_Exclusion`, `Boundary_CHHQ_Exclusion`), the only ones
 /// so named; the record itself isn't decoded.
-fn is_exclusion(name: &str) -> bool {
+pub(crate) fn is_exclusion(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with("_exclusion")
 }
 
@@ -3050,6 +3051,72 @@ mod tests {
         .unwrap();
         let on = |on| Command::Invincible { guid: PLAYER, on };
         assert_eq!(m.take_commands(), [on(true), on(false)]);
+    }
+
+    /// `Event.ObjectHealthLessThan` as ChiCon001 waits for its VIP at half
+    /// health: `{ target, Object.GetHealth(target) / 2 }`.
+    #[test]
+    fn a_health_less_than_watch_fires_below_its_figure() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            halved, args = 0, -1
+            local hero = Player.GetCharacter(1)
+            Event.Create(Event.ObjectHealthLessThan, { hero, Object.GetHealth(hero) / 2 },
+                function(...) halved = halved + 1; args = select('#', ...) end)
+            "#,
+            "test",
+        )
+        .unwrap();
+        let full: f64 = m
+            .lua()
+            .load("return Object.GetHealth(Player.GetCharacter(1))")
+            .eval()
+            .unwrap();
+        m.tick(0.1);
+        m.set_health(PLAYER, (full * 0.6) as f32);
+        m.tick(0.1);
+        let g = m.lua().globals();
+        assert_eq!(g.raw_get::<i64>("halved").unwrap(), 0);
+        m.set_health(PLAYER, (full * 0.4) as f32);
+        m.tick(0.1);
+        m.tick(0.1);
+        assert_eq!(g.raw_get::<i64>("halved").unwrap(), 1);
+        // The engine passes nothing of its own.
+        assert_eq!(g.raw_get::<i64>("args").unwrap(), 0);
+    }
+
+    #[test]
+    fn health_watches_pass_the_health_and_the_comparison() {
+        // MrxHq: `{ hq, "*", "<=", 1 }`; a contract: `{ her, "<", 40 }`.
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            got, low, part = {}, nil, 0
+            local hero = Player.GetCharacter(1)
+            Event.Create(Event.ObjectHealth, { hero, "<", 40 },
+                function(tag, h, how) got = { tag, h, how } end, { "low" })
+            Event.Create(Event.ObjectHealth, { hero, "*", "<=", 25 },
+                function(h, how) low = how end)
+            Event.Create(Event.ObjectHealth, { hero, "wing_l", "<", 99 },
+                function() part = part + 1 end)
+            "#,
+            "test",
+        )
+        .unwrap();
+        m.tick(0.1);
+        m.set_health(PLAYER, 25.0);
+        m.tick(0.1);
+        m.tick(0.1);
+        let (tag, h, how, low, part): (String, f64, String, String, i64) = m
+            .lua()
+            .load("return got[1], got[2], got[3], low, part")
+            .eval()
+            .unwrap();
+        assert_eq!((tag.as_str(), h, how.as_str()), ("low", 25.0, "<"));
+        assert_eq!(low, "<=");
+        // A part she doesn't have never holds.
+        assert_eq!(part, 0);
     }
 
     #[test]
@@ -3461,7 +3528,7 @@ mod tests {
             Object.SetName(g, "HqInterior")
             Object.SetPosition(g, 3750, 450, -3840)
             Event.Create(Event.ObjectHibernation, { g, "awake" },
-                function(o) __awake = o end, {})"#,
+                function(o) __awake = o end, { g })"#,
             "spawn actor",
         )
         .unwrap();
