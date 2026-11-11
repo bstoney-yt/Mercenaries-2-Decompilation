@@ -224,6 +224,13 @@ pub enum Command {
     /// Open a gate or door (`Object.OpenGate`): PmcCon001's villa doors
     /// as the player comes near them.
     OpenGate(u32),
+    /// A road junction is opened to traffic or closed (`Pg.EnableIntersection(on,
+    /// object)`): ChiCon002 closes the two segments of the Maracaibo
+    /// bridge it is about to bring down.
+    Intersection {
+        guid: u32,
+        on: bool,
+    },
     /// Shut a gate or door again (`Object.CloseGate`).
     CloseGate(u32),
     /// Whether `guid` may take up its weapons (`Human.DisableWeapons` and
@@ -1952,6 +1959,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             None => vec![Value::Nil],
         })
     })?;
+    // Pg.EnableIntersection(on, object): see [`Command::Intersection`].
+    // From the 360 code (82338740): both are needed, and it gives
+    // nothing.
+    add(&pg, "EnableIntersection", |w, _, a| {
+        if let (Some(Value::Boolean(on)), Some(guid)) = (a.first(), id(a.get(1))) {
+            w.commands.push(Command::Intersection { guid, on: *on });
+        }
+        values([])
+    })?;
     add(&pg, "Spawn", |w, _, a| {
         let what = match a.first() {
             Some(Value::String(s)) => s.to_string_lossy(),
@@ -2080,6 +2096,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => false,
         };
         values([Value::Boolean(inside)])
+    })?;
+    // Object.IsValid(object): whether the call was handed an object at
+    // all (ChiCon009 asks before it stops its ambulance's health bar).
+    // From the 360 code (8232FF50): it does not look the object up.
+    // Inferred: a null guid doesn't count.
+    add(&object, "IsValid", |_, _, a| {
+        values([Value::Boolean(id(a.first()).is_some_and(|g| g != 0))])
     })?;
     add(&object, "IsAlive", |w, _, a| {
         values([Value::Boolean(id(a.first()).is_some_and(|g| w.is_alive(g)))])
@@ -4138,6 +4161,39 @@ mod tests {
         assert_eq!(
             world.borrow_mut().take_commands(),
             [Command::AimMode(false), Command::AimMode(true)]
+        );
+    }
+
+    #[test]
+    fn a_closed_junction_reaches_the_game_and_an_object_is_valid_or_not() {
+        let (host, world) = setup();
+        let (valid, nothing, number): (bool, bool, bool) = host
+            .lua()
+            .load(
+                r#"
+                local bridge = Sys.StringToGuid("568220")
+                Pg.EnableIntersection(false, bridge)
+                Pg.EnableIntersection(true, bridge)
+                Pg.EnableIntersection(bridge)
+                return Object.IsValid(bridge), Object.IsValid(nil), Object.IsValid("bridge")
+                "#,
+            )
+            .eval()
+            .unwrap();
+        // It does not ask whether the object is in the world.
+        assert!(valid && !nothing && !number);
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [
+                Command::Intersection {
+                    guid: 568220,
+                    on: false
+                },
+                Command::Intersection {
+                    guid: 568220,
+                    on: true
+                },
+            ]
         );
     }
 
