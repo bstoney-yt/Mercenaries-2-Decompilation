@@ -3006,6 +3006,24 @@ impl MissionLink {
                     mission.place(g, n.character.position.to_array(), n.facing);
                 }
             }
+            // How fast the scripts' vehicles and people move, for
+            // `Object.GetVelocity` (from the 360 code, 8232ED50: the
+            // length of the body's velocity): OilCon003 and PirCon003 ask.
+            if let Some(world) = game.scene.world.as_ref() {
+                let vehicles = game
+                    .scene
+                    .vehicles
+                    .iter()
+                    .filter_map(|v| Some((v.guid?, world.physics.vehicle_velocity(v.id?))));
+                let people = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .filter(|n| n.alive)
+                    .filter_map(|n| Some((n.spawn?, n.character.velocity)));
+                report_speeds(mission, vehicles.chain(people));
+            }
             // Targets to destroy: soldiers stand at those that are spawns,
             // and blasts close to the rest (gates, buildings) destroy them.
             // Those the contract's destroy objectives name with no marker
@@ -5284,6 +5302,22 @@ fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
 /// on with her if she gets into another meanwhile (invented: the autoplay
 /// swaps a stuck vehicle for another, and ChiCon001's VIP, out in a fight
 /// meanwhile, was shot).
+/// Tells the scripts how fast each of their objects among `moving` goes
+/// (`Mission::set_speed`): the length of its velocity, m/s. Those the
+/// scripts hold no object for are left out.
+fn report_speeds(mission: &mut Mission, moving: impl Iterator<Item = (u32, Vec3)>) {
+    let known: Vec<(u32, f32)> = {
+        let w = mission.world().borrow();
+        moving
+            .filter(|(g, _)| w.objects.contains_key(g))
+            .map(|(g, v)| (g, v.length()))
+            .collect()
+    };
+    for (g, speed) in known {
+        mission.set_speed(g, speed);
+    }
+}
+
 fn ride_along(
     game: &mut Game,
     mission: &mut Mission,
@@ -7548,6 +7582,27 @@ mod tests {
         let view = link.view();
         assert_eq!(view.black, 1.0);
         assert!(view.status.is_some());
+    }
+
+    // The scripts read how fast their objects move as one number.
+    #[test]
+    fn the_scripts_objects_speeds_are_told() {
+        use m2_game::mission::{GameData, Mission};
+        use m2_math::glam::Vec3;
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.world().borrow_mut().insert(
+            9,
+            m2_game::api::Object::new("OilCon003_Truck", [5.0, 0.0, 0.0]),
+        );
+        // 3-4-12: 13 m/s. One the scripts don't hold is left out.
+        super::report_speeds(
+            &mut m,
+            [(9, Vec3::new(3.0, 4.0, 12.0)), (10, Vec3::X)].into_iter(),
+        );
+        m.run("__v = Object.GetVelocity(Sys.StringToGuid('0x9'))", "speed")
+            .unwrap();
+        assert_eq!(m.lua().globals().get::<f64>("__v").unwrap(), 13.0);
+        assert!(!m.world().borrow().speeds.contains_key(&10));
     }
 
     // The props the scripts spawn have their hardpoints told, as do
