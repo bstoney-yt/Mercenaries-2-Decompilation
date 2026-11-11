@@ -638,7 +638,8 @@ impl RoadTraffic {
             // box just ahead of it meets something. (No faster than its
             // template's top speed.)
             let (remaining, length) = along(r, car, here);
-            let mut want = road_driver::base_speed(remaining, length).min(top);
+            let mut want =
+                road_driver::base_speed(remaining, length, off_ends(&r.points, here)).min(top);
             if road_driver::near_end(remaining, length, road_driver::DEAD_END)
                 && self.ways_out(car, roads).is_empty()
             {
@@ -889,6 +890,30 @@ fn in_lane(road: &Road, car: Car, p: Vec3) -> bool {
     let right = Vec2::new(-dir.y, dir.x);
     let off = (at - near).dot(right);
     (from..=to).contains(&off)
+}
+
+/// Whether `at` lies off a road's ends: its nearest place on the road's
+/// line, as a fraction along it, would be below 0 or above 1 were it not
+/// clamped (the 360's follower fraction at exactly 0 or 1).
+fn off_ends(points: &[Vec3], at: Vec3) -> bool {
+    let n = points.len();
+    if n < 2 {
+        return false;
+    }
+    let p = flat(at);
+    let (mut best, mut off) = (f32::MAX, false);
+    for (k, w) in points.windows(2).enumerate() {
+        let (a, b) = (flat(w[0]), flat(w[1]));
+        let ab = b - a;
+        let raw = (p - a).dot(ab) / ab.length_squared().max(1e-6);
+        let t = raw.clamp(0.0, 1.0);
+        let d = (p - (a + ab * t)).length_squared();
+        if d < best {
+            best = d;
+            off = (k == 0 && raw < 0.0) || (k == n - 2 && raw > 1.0);
+        }
+    }
+    off
 }
 
 /// How much of its road is left ahead of a vehicle at `here` heading for
@@ -1148,6 +1173,18 @@ mod tests {
             &mut stands,
         );
         assert!(got.is_empty());
+    }
+
+    // 0x822B9A30's clamp: before the first point or past the last.
+    #[test]
+    fn it_knows_when_it_is_off_its_roads_ends() {
+        let p: Vec<Vec3> = [(0.0, 0.0), (0.0, 50.0), (10.0, 100.0)]
+            .iter()
+            .map(|&(x, z)| Vec3::new(x, 0.0, z))
+            .collect();
+        assert!(off_ends(&p, Vec3::new(0.0, 0.0, -3.0)));
+        assert!(!off_ends(&p, Vec3::new(1.0, 0.0, 20.0)));
+        assert!(off_ends(&p, Vec3::new(12.0, 0.0, 105.0)));
     }
 
     // A road with no junction at its end leads nowhere: no way out.
