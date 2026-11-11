@@ -10182,16 +10182,23 @@ impl Running {
             if let Some(preset) = m.take_reverb() {
                 self.audio.set_reverb(preset);
             }
+            for (cue, on) in m.take_ambiences() {
+                self.audio.script_ambience(cue, on);
+            }
+            self.audio.silence_ambience(m.ambience_silenced());
         }
         self.answer_saves(config.options.autosave);
         let (ear, facing) = self.game.listener();
         self.audio.update(ear, facing);
-        // The ambience region the listener is in plays its own bed and
-        // one-shots; until they are read, the town's or jungle's stand in.
-        let zone = self.game.scene.world.as_ref().and_then(|w| {
-            m2_engine::sound_regions::ambience_at(&w.index.sound_regions, ear.x, ear.z)
-                .and_then(|r| r.ambience)
+        // Every ambience region the listener is in asks for its ambience,
+        // as the scripts do; the one the list picks plays its bed and
+        // one-shots. Until they are read, the town's or jungle's stand in.
+        let inside: Vec<_> = self.game.scene.world.as_ref().map_or_else(Vec::new, |w| {
+            m2_engine::sound_regions::ambiences_at(&w.index.sound_regions, ear.x, ear.z)
+                .filter_map(|r| Some((r.entity, r.ambience?)))
+                .collect()
         });
+        let zone = self.audio.ambience_heard(&inside);
         if !self.audio.zone_ambience(zone, ear, TICK.as_secs_f32())
             && self.audio.ambient_due(TICK.as_secs_f32())
         {
