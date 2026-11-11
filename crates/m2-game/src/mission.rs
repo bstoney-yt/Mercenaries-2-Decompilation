@@ -1037,7 +1037,6 @@ impl Mission {
         {
             let mut w = self.world.borrow_mut();
             w.honk_heard = (w.honk_heard - dt as f32).max(0.0);
-            w.main_clock = now;
             w.pursuit.clock.step(dt as f32);
         }
         // Streaming is instant here: a waiting state ends a second after
