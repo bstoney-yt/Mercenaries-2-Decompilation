@@ -178,6 +178,8 @@ impl Object {
 /// Something a script asked the game to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
+    /// What a script asked of a vehicle ([`crate::vehicle_state`]).
+    Vehicle(crate::vehicle_state::VehicleCommand),
     /// A hijack's own requests (`crate::hijack`).
     Hijack(crate::hijack::HijackCommand),
     /// Create `what` (an object template's name, such as `"Veyron"` or

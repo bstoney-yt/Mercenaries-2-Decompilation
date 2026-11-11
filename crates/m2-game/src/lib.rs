@@ -22,4 +22,5 @@ pub mod script;
 pub mod shop;
 pub mod subtitles;
 pub mod support;
+pub mod vehicle_state;
 pub mod vo;
