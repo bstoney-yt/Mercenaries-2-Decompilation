@@ -39,6 +39,9 @@ use crate::tuning::{
 use crate::vehicle::VehicleSpec;
 use rapier3d::prelude as r;
 
+mod winch_cable;
+pub use winch_cable::{CARGO_TILT, CableId, HALF_LINK, LINK_MASS, LINK_RADIUS, MIN_LINKS_TO_HOOK};
+
 /// Highest step a character walks up without jumping, metres.
 pub const STEP_HEIGHT: f32 = 0.5;
 /// Steepest slope a character walks up, radians (50 degrees).
@@ -3133,6 +3136,8 @@ pub struct Physics {
     /// How long it has run, seconds: the game's clock its helicopters'
     /// turbulence reads ([`turbulence`]).
     time: f32,
+    /// Winches' cables ([`winch_cable`]).
+    cables: Vec<Option<winch_cable::Cable>>,
 }
 
 /// A loose prop's piece in the physics world ([`Physics::add_debris`]).
@@ -3193,6 +3198,7 @@ impl Physics {
             water: None,
             inland: None,
             time: 0.0,
+            cables: Vec::new(),
         }
     }
 
@@ -7524,7 +7530,7 @@ mod tests {
         assert!(ramp(65.0) < 1.5, "65 degrees should not be");
     }
 
-    fn car() -> VehicleSpec {
+    pub(super) fn car() -> VehicleSpec {
         use crate::vehicle::WheelSpec;
         let wheel = |x: f32, z: f32| WheelSpec {
             centre: Vec3::new(x, 0.35, z),

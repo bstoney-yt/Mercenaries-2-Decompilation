@@ -183,8 +183,33 @@ pub fn state_matches(pattern: &str, state: &str) -> bool {
         None => pattern.eq_ignore_ascii_case(state),
     }
 }
+/// What a `Button` event passes when `button` is pressed: the pad that
+/// pressed it, the button's name, and "press".
+///
+/// From the 360 code (arguments slot 0x823576f8): the pad number first,
+/// then a name for six of the nine buttons parse 0x82357328 knows, then
+/// the mode ("press", "held" or "release"). "lsleft" and "lsright" pass no
+/// name. "rtrigger" passes "rtrigger" and then "lbutton" as well: its jump
+/// table entry runs on into the "lbutton" one. Only presses are seen here,
+/// and the one local player's pad is taken as 0 (inferred).
+fn button_args(button: &str) -> (Vec<Value>, Vec<&'static str>) {
+    let names: &[&'static str] = match button.to_ascii_lowercase().as_str() {
+        "action" => &["action"],
+        "selection" => &["selection"],
+        "cancel" => &["cancel"],
+        "lbutton" => &["lbutton"],
+        "rtrigger" => &["rtrigger", "lbutton"],
+        "start" => &["start"],
+        "select" => &["select"],
+        _ => &[],
+    };
+    let mut words = names.to_vec();
+    words.push("press");
+    (vec![Value::Number(0.0)], words)
+}
+
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 21] = [
+pub const KINDS: [&str; 22] = [
     "TimerRelative",
     // Every update, in the mission's scripts too: the support manager's
     // recruit cooldowns count with it (`SupportTimer`, which takes
@@ -210,6 +235,7 @@ pub const KINDS: [&str; 21] = [
     "HumanStateTransition",
     "ObjectPhysicsEvent",
     "WeaponEvent",
+    "ObjectHealthLessThan",
 ];
 
 /// Kinds the game delivers itself through `Event.__m2_fire` (besides
@@ -685,11 +711,29 @@ impl Events {
             for mut p in std::mem::take(&mut s.pending) {
                 let extra = match check(&p, now, &posted, accepted, world) {
                     Check::Fire(extra) => Some(vec![extra]),
+                    Check::FireWords(mut extra, words) => {
+                        let lua = s.lua.0.as_ref().and_then(mlua::WeakLua::try_upgrade);
+                        extra.extend(words.iter().filter_map(|w| {
+                            lua.as_ref()?.create_string(w).ok().map(Value::String)
+                        }));
+                        Some(vec![extra])
+                    }
                     // Fires as the condition starts to hold.
                     Check::Holds(holds, extra) => {
                         let rising = holds && !p.held;
                         p.held = holds;
                         rising.then_some(vec![extra])
+                    }
+                    Check::Health(holds, health, comparison) => {
+                        let rising = holds && !p.held;
+                        p.held = holds;
+                        let lua = s.lua.0.as_ref().and_then(mlua::WeakLua::try_upgrade);
+                        let text = lua.as_ref().and_then(|l| l.create_string(comparison).ok());
+                        rising.then(|| {
+                            let mut extra = vec![Value::Number(health)];
+                            extra.extend(text.map(Value::String));
+                            vec![extra]
+                        })
                     }
                     // `held_by` keeps who was seated at the last check
                     // (none before the first).
@@ -831,7 +875,15 @@ impl Events {
                             ));
                         }
                         if p.persistent {
-                            p.last = now;
+                            // A repeating timer keeps what it overran by
+                            // (from the 360 code: 0x823554d0 takes the
+                            // delay off the time counted, 0x82355480
+                            // counts on from there), so it keeps its rate
+                            // whatever the frame length.
+                            p.last = match (p.kind.as_str(), number(&p.params, 1)) {
+                                ("TimerRelative", Some(delay)) => p.last + delay,
+                                _ => now,
+                            };
                             keep.push(p);
                         }
                     }
@@ -969,9 +1021,14 @@ fn seat_mode(p: &Pending) -> String {
 enum Check {
     /// Fire now with these values after the callback's data.
     Fire(Vec<Value>),
+    /// Fire now with these values and then these words as strings.
+    FireWords(Vec<Value>, Vec<&'static str>),
     /// A condition: whether it holds, and the values to pass when it
     /// starts to.
     Holds(bool, Vec<Value>),
+    /// ObjectHealth's condition: whether it holds, the health that made
+    /// it, and the comparison as text, which it passes (both, no guid).
+    Health(bool, f64, &'static str),
     /// Riders and whether each is in a wanted seat, with the values to
     /// pass: fired by the event's mode as they get in or out.
     Seats(Vec<(u32, (bool, bool), Vec<Value>)>),
@@ -1212,6 +1269,18 @@ fn text(t: &Table, i: i64) -> Option<String> {
 /// filter said yes to.
 type Accepted = HashSet<(usize, usize)>;
 
+/// `ObjectHealth`'s comparison text as (equal, less, more), as the 360 reads
+/// it (0x8234c970): equal when either of the first two characters is `=`,
+/// then less or more by the first. Anything else compares as nothing
+/// (none here).
+fn health_comparison(s: &str) -> Option<(bool, bool, bool)> {
+    let b = s.as_bytes();
+    let equal = b.first() == Some(&b'=') || b.get(1) == Some(&b'=');
+    let less = b.first() == Some(&b'<');
+    let more = b.first() == Some(&b'>');
+    (equal || less || more).then_some((equal, less, more))
+}
+
 fn check(
     p: &Pending,
     now: f64,
@@ -1252,10 +1321,30 @@ fn check(
         // the support helicopter's pilot is free again once his
         // helicopter is (`MakeRecruitAvailable("Copter")`). Passes the
         // object.
+        // Passes nothing (from the 360 code: its arguments slot is the
+        // empty 0x8225e998; the support helicopter's callback takes only
+        // its data).
         "ObjectDelete" => match guid(&p.params, 1) {
-            Some(g) => Check::Holds(world.position(g).is_none(), vec![id(g)]),
+            Some(g) => Check::Holds(world.position(g).is_none(), Vec::new()),
             None => no,
         },
+        // { object, health }: once the object's health is below the figure
+        // (4 scripts: ChiCon001's VIP and the like wait for half of
+        // `Object.GetHealth`). From the 360 code: parse 0x82350e28 takes a
+        // guid and a number, test 0x82350ee8 compares the object's health
+        // with it as its health changes (a health it can't read counts as
+        // below), and nothing is passed (0x8225e998). Here it is checked
+        // every update; an object this world doesn't hold is left waiting
+        // (inferred: the engine only tests on a health change).
+        "ObjectHealthLessThan" => {
+            let (Some(g), Some(figure)) = (guid(&p.params, 1), number(&p.params, 2)) else {
+                return no;
+            };
+            match world.health(g) {
+                Some(h) => Check::Holds(f64::from(h) < figure, Vec::new()),
+                None => no,
+            }
+        }
         // { a, b, op, metres, stopped, flat }: when some a is within
         // ("<", "<=") or beyond (">", ">=") the distance of some b,
         // checked whenever it is pending (scripts wanting repeats make a
@@ -1365,19 +1454,15 @@ fn check(
             Check::Holds((riding != on_foot) != exit, Vec::new())
         }
         // { state, "enter" or "exit" }: as the game enters or leaves a
-        // state; passes both.
+        // state. Passes nothing (from the 360 code: parse 0x823555a8,
+        // test 0x82355628, and the empty arguments slot 0x8225e998; the
+        // scripts' callbacks take only their data).
         "GameStateChange" => {
             let (Some(state), Some(current)) = (text(&p.params, 1), world.game_state()) else {
                 return no;
             };
             let exit = text(&p.params, 2).as_deref() == Some("exit");
-            Check::Holds(
-                current.eq_ignore_ascii_case(&state) != exit,
-                vec![
-                    p.params.raw_get::<Value>(1).unwrap_or(Value::Nil),
-                    p.params.raw_get::<Value>(2).unwrap_or(Value::Nil),
-                ],
-            )
+            Check::Holds(current.eq_ignore_ascii_case(&state) != exit, Vec::new())
         }
         // { object, boundary, "enter" or "exit" }.
         "Boundary" => {
@@ -1457,20 +1542,51 @@ fn check(
         // { object, "<" or ">", health }: while its health is below (or
         // above) the figure; passes the object. The hero's survival
         // script watches for drops below her current health this way.
+        // From the 360 code (the kind's parse 0x82351050, test 0x823512a8,
+        // arguments 0x82351420): `{ object, comparison, value }`, or with
+        // four `{ object, part, comparison, value }` (a part's name hash,
+        // `"*"` for any of its parts). The comparison is read as `=`
+        // (either character), then `<` or `>` (0x8234c970): `<`, `<=`,
+        // `>`, `>=` or `=`. The callback gets the health that made it hold
+        // and the comparison as text, after its data; no guid.
+        //
+        // Here objects have no parts: `"*"` takes the object's health
+        // (inferred), a named part never holds (the 360 answers false for
+        // a part the object lacks).
         "ObjectHealth" => {
-            let Some(figure) = number(&p.params, 3) else {
+            let four = p.params.raw_len() >= 4;
+            let (at, part) = if four {
+                (3, text(&p.params, 2))
+            } else {
+                (2, None)
+            };
+            let (Some(comparison), Some(figure)) = (text(&p.params, at), number(&p.params, at + 1))
+            else {
                 return no;
             };
-            let above = text(&p.params, 2).as_deref() == Some(">");
+            if part.is_some_and(|s| s != "*") {
+                return Check::Health(false, 0.0, "=");
+            }
+            let Some((equal, less, more)) = health_comparison(&comparison) else {
+                return no;
+            };
+            let shown = match (less, more, equal) {
+                (true, _, true) => "<=",
+                (true, _, false) => "<",
+                (_, true, true) => ">=",
+                (_, true, false) => ">",
+                _ => "=",
+            };
             for o in objects(&p.params, 1, world) {
-                if let Some(h) = world.health(o)
-                    && (f64::from(h) > figure) == above
-                    && f64::from(h) != figure
-                {
-                    return Check::Holds(true, vec![id(o)]);
+                if let Some(h) = world.health(o).map(f64::from) {
+                    let holds =
+                        (equal && h == figure) || (less && h < figure) || (more && h > figure);
+                    if holds {
+                        return Check::Health(true, h, shown);
+                    }
                 }
             }
-            no
+            Check::Health(false, 0.0, shown)
         }
         // { character (or filter), from, to }: as one of them goes from a
         // state matching `from` to one matching `to` ([`state_matches`]:
@@ -1576,7 +1692,12 @@ fn check(
                     .button_presses()
                     .iter()
                     .any(|(t, b)| *b == button && *t >= p.last && (*t > p.last || !p.persistent));
-                if pressed { Check::Fire(Vec::new()) } else { no }
+                if pressed {
+                    let (pad, words) = button_args(&button);
+                    Check::FireWords(pad, words)
+                } else {
+                    no
+                }
             }
             None => no,
         },
@@ -1600,32 +1721,52 @@ fn check(
         "HumanAnimationNearlyCompleted" => match guid(&p.params, 1) {
             Some(g) => {
                 let margin = p.params.raw_get::<f64>(2).unwrap_or(0.1) as f32;
+                // Passes nothing (from the 360 code: parse 0x82356228, test
+                // 0x823562a0, and the empty arguments slot 0x8225e998).
                 match world.raw_clip_left(g) {
-                    Some(left) if left <= margin => Check::Holds(true, vec![id(g)]),
+                    Some(left) if left <= margin => Check::Holds(true, Vec::new()),
                     _ => no,
                 }
             }
             None => no,
         },
-        "ObjectHibernation" | "ObjectIsReady" => match guid(&p.params, 1) {
+        // { object, mode, [level] }: while the object is awake (a mode
+        // starting with "a") or hibernating (any other mode, or none).
+        // From the 360 code: parse 0x82352728 reads only the first letter,
+        // so the HQ manager's `{ hq, "s" }` (wait for a destroyed HQ to
+        // hibernate before reviving it) waits for hibernation, as do
+        // "hibernated" and a missing mode. Its arguments slot (0x8225e998)
+        // passes nothing. The optional level (a streaming detail the
+        // object must have reached) isn't modelled.
+        "ObjectHibernation" => match guid(&p.params, 1) {
             Some(g) => {
-                let want_awake = !text(&p.params, 2).is_some_and(|t| t.starts_with("hibernat"));
-                Check::Holds(world.is_awake(g) == want_awake, vec![id(g)])
+                let want_awake = text(&p.params, 2).is_some_and(|t| t.starts_with('a'));
+                Check::Holds(world.is_awake(g) == want_awake, Vec::new())
             }
+            None => no,
+        },
+        // { object, [level] }: once the object is in the world. From the
+        // 360 code (0x82352c28, 0x82352ab0) it checks the object is loaded
+        // rather than awake; here awake stands in for that (inferred).
+        // Passes nothing (0x8225e998).
+        "ObjectIsReady" => match guid(&p.params, 1) {
+            Some(g) => Check::Holds(world.is_awake(g), Vec::new()),
             None => no,
         },
         // { object }: while it is on the player's screen
         // ([`World::is_visible`]): PmcCon001 waits, once she is inside the
         // villa, for the outpost's tank column to come into view to load
         // the tank (`LoadTank`). A label or filter names several: the
-        // first seen. Passes the object.
+        // first seen. Passes nothing (from the 360 code: parse 0x823551e8,
+        // test 0x82355230, and the empty arguments slot 0x8225e998).
         "ObjectIsVisible" => {
             let seen = objects(&p.params, 1, world)
                 .into_iter()
-                .find(|&g| world.is_visible(g) == Some(true));
-            match seen {
-                Some(g) => Check::Holds(true, vec![id(g)]),
-                None => no,
+                .any(|g| world.is_visible(g) == Some(true));
+            if seen {
+                Check::Holds(true, Vec::new())
+            } else {
+                no
             }
         }
         // { name, filter }: when something posts that name, and the
@@ -1837,6 +1978,27 @@ mod tests {
         assert!(posted && !bare);
     }
 
+    /// A repeating timer keeps its rate when the frames don't divide its
+    /// delay: 0.1 s at 30 frames a second is 30 a second, not one every
+    /// fourth frame (22 or so).
+    #[test]
+    fn a_repeating_timer_carries_what_it_overran() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                "Event.CreatePersistent(Event.TimerRelative, { 0.1 }, \
+                 function() table.insert(log, 'tick') end)",
+            )
+            .exec()
+            .unwrap();
+        let world = TestWorld::default();
+        for _ in 0..90 {
+            events.update(1.0 / 30.0, &world);
+        }
+        let n = log(&host).len();
+        assert!((29..=30).contains(&n), "{n} ticks in 3 s");
+    }
+
     #[test]
     fn a_context_action_fires_when_taken_at_its_object() {
         let (host, events) = setup();
@@ -2031,7 +2193,7 @@ mod tests {
                 Event.Create(Event.ObjectDeath, { 7 }, note("dead "), { 7 })
                 Event.Create(Event.ObjectProximity, { "hero", 2, "<", 10, false, false }, note("near "), {})
                 Event.Create(Event.ObjectInSeat, { "hero", nil, "Any", "enter" }, note("seat "), {})
-                Event.Create(Event.ObjectHibernation, { 3, "awake" }, note("awake "), {})
+                Event.Create(Event.ObjectHibernation, { 3, "awake" }, note("awake "), { 3 })
                 Event.Create(Event.ScriptEvent, { "Go" }, note("posted "), { "x" })
                 "#,
             )
@@ -2332,14 +2494,19 @@ mod tests {
         // door hibernated waits for her to leave, then for it to wake.
         host.lua()
             .load(
-                r#"
-                Event.Create(Event.ObjectHibernation, { 3, "awake" },
-                    function(d) table.insert(log, "awake " .. gid(d)) end)
-                Event.Create(Event.ObjectHibernation, { 3, "hibernated" },
-                    function(d) table.insert(log, "hibernated " .. gid(d)) end)
-                Event.Create(Event.ObjectHibernation, { 3, "hibernate" },
-                    function(d) table.insert(log, "hibernate " .. gid(d)) end)
-                "#,
+                r##"
+                -- The engine passes nothing of its own: only the data.
+                local function note(s) return function(...)
+                    table.insert(log, s .. select("#", ...))
+                end end
+                Event.Create(Event.ObjectHibernation, { 3, "awake" }, note("awake "))
+                Event.Create(Event.ObjectHibernation, { 3, "hibernated" }, note("hibernated "))
+                Event.Create(Event.ObjectHibernation, { 3, "hibernate" }, note("hibernate "))
+                -- The HQ manager's wait before reviving a destroyed HQ: any
+                -- mode not starting with "a" waits for hibernation.
+                Event.Create(Event.ObjectHibernation, { 3, "s" }, note("s "))
+                Event.Create(Event.ObjectHibernation, { 3 }, note("none "))
+                "##,
             )
             .exec()
             .unwrap();
@@ -2348,13 +2515,16 @@ mod tests {
         for _ in 0..5 {
             events.update(0.1, &world);
         }
-        assert_eq!(log(&host), ["awake 3"]);
-        assert_eq!(events.len(), 2);
+        assert_eq!(log(&host), ["awake 0"]);
+        assert_eq!(events.len(), 4);
         world.positions.remove(&3);
         events.update(0.1, &world);
         let mut got = log(&host);
         got.sort();
-        assert_eq!(got, ["awake 3", "hibernate 3", "hibernated 3"]);
+        assert_eq!(
+            got,
+            ["awake 0", "hibernate 0", "hibernated 0", "none 0", "s 0"]
+        );
         assert!(events.is_empty());
     }
 
@@ -2365,7 +2535,7 @@ mod tests {
             .load(
                 r#"
                 Event.Create(Event.ObjectIsVisible, { 9 },
-                    function(who, seen) table.insert(log, who .. " saw " .. gid(seen)) end,
+                    function(who, seen) table.insert(log, who .. " saw " .. tostring(seen)) end,
                     { "LoadTank" })
                 "#,
             )
@@ -2380,7 +2550,8 @@ mod tests {
         assert_eq!(events.sight_watched(&world), [9]);
         world.visible.push(9);
         events.update(0.1, &world);
-        assert_eq!(log(&host), ["LoadTank saw 9"]);
+        // Only the data: the engine passes nothing of its own.
+        assert_eq!(log(&host), ["LoadTank saw nil"]);
         assert!(events.is_empty());
         assert!(events.take_unhandled().is_empty());
     }

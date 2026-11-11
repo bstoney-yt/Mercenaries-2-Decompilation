@@ -2084,19 +2084,28 @@ impl Game {
                     visibility: v.spec.tuning.visibility.unwrap_or(200.0),
                     armour: v.spec.tuning.armour.unwrap_or(1),
                     threat: vehicle_threat(&v.spec),
+                    priority: v
+                        .guid
+                        .is_some_and(|g| self.scene.people.priority.contains(&g)),
+                    vehicle: v.id,
                 })
             })
             .collect();
         self.scene.people.vehicle_subjects = subjects;
         // What she carries, for her threat to soldiers: a vehicle's mounts
-        // when she drives one.
-        self.scene.people.her_arms = self
+        // when she drives one, else her guns' own `WeaponHint`s.
+        let driven = self
             .scene
             .player
             .as_ref()
             .and_then(|p| p.driving)
             .and_then(|i| self.scene.vehicles.get(i))
-            .map(|v| crate::npc::Arms::Vehicle(vehicle_threat(&v.spec)));
+            .map(|v| crate::npc::Arms::Vehicle {
+                threat: vehicle_threat(&v.spec),
+                priority: false,
+            });
+        self.scene.people.her_arms =
+            Some(driven.unwrap_or(crate::npc::Arms::Person(self.combat.carried_hints())));
         if let Some(world) = &mut self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {

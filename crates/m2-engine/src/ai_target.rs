@@ -10,11 +10,19 @@
 //! mind's attack slot (0x822C0318): the one in it keeps its place with
 //! its own new weight, and a challenger needs a weight above that.
 //!
-//! The score is how much of a threat the subject is to the mind (the
-//! perception record's +0xC8, [`threat`]) plus [`BASE`], times how well
-//! the mind can see it (+0x68, [`visible`]). Then the distance: within
+//! The score is what the subject is worth ([`worth`]: how much of a
+//! threat it is to the mind, the perception record's +0xC8, [`threat`],
+//! plus [`BASE`]; or [`PRIORITY`] for one the scripts made a priority
+//! target), times how well the mind can see it (+0x68, [`visible`]) and
+//! by the mind's own [`Heat`] (+0x804). Then the distance: within
 //! [`NEAR`] (or [`HOLD`] for the one in the slot) a subject counts double,
 //! and one nearer than the one in the slot gains [`CLOSER`].
+//!
+//! Not traced yet: 0x822E0988 also puts 1.2 in place of the worth for
+//! vehicles of two kinds (their object's +0x170 at 4 or 5), 9.8 for people
+//! of one class (0x823F7B88 at 0x80008240), and lifts the score to
+//! `0.2 x + 0.8` for the subject in the mind's +0xC58 order while that
+//! order weighs more than 0.3.
 //!
 //! What a mind holds of a subject is not the relation itself but its own
 //! attitude ([`Attitude`], the record's +0xE4), which follows the
@@ -148,6 +156,55 @@ pub fn visible(distance: f32, reach: f32) -> f32 {
     }
     r * r / (r * r + distance * distance)
 }
+/// What a priority target is worth, in place of its threat (0x820F9560):
+/// enough that the score is at its [`MOST`] whenever it is seen at all
+/// well.
+pub const PRIORITY: f32 = 9.8;
+/// The object property that makes one a priority target, by its name
+/// hash: `"PriorityTarget"`, set by the scripts' `Ai.SetPriorityTarget`
+/// (0x82311B98) and read by 0x822E0988 through the property lookup
+/// 0x823DA3C8.
+pub const PRIORITY_PROPERTY: u32 = 0xe60c_6ca2;
+
+/// What a subject is worth to a mind before how well it is seen: its
+/// `threat` ([`threat`]) plus [`BASE`], or [`PRIORITY`] in its place for a
+/// priority target.
+pub fn worth(threat: f32, priority: bool) -> f32 {
+    if priority { PRIORITY } else { threat + BASE }
+}
+
+/// A mind's heat (+0x1730, 0x822D9C10): up 1 each update it has someone
+/// in its attack slot, to 10; down 0.5 each update it has none, to 0.
+/// While any is left its scores count half again ([`Heat::factor`], the
+/// mind's +0x804). Counted per update, not per second, as the 360 does.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Heat(pub f32);
+
+/// How far a mind's heat climbs while it has a target (0x820BAEEC).
+const HEAT_UP_TO: f32 = 10.0;
+/// What a mind's scores count by while it is hot (0x820BB6AC).
+const HOT: f32 = 1.5;
+
+impl Heat {
+    /// One update, `engaged` if the mind has someone in its attack slot.
+    /// (The 360 also holds the heat in one mind state, 0x17, not named
+    /// yet; that is left out.)
+    pub fn tick(&mut self, engaged: bool) {
+        if !engaged {
+            self.0 -= 0.5;
+        } else if self.0 < HEAT_UP_TO {
+            self.0 += 1.0;
+        }
+        self.0 = self.0.clamp(0.0, 500.0);
+    }
+
+    /// What the mind's scores count by: [`HOT`] while any heat is left
+    /// (above 0.0001), else 1.
+    pub fn factor(&self) -> f32 {
+        if self.0 > 1e-4 { HOT } else { 1.0 }
+    }
+}
+
 /// Within this a subject counts double, metres (0x820BB1F8).
 const NEAR: f32 = 30.0;
 /// As [`NEAR`], for the one already in the slot (0x820B7FB8).
@@ -165,13 +222,13 @@ pub fn attacks(relation: f32) -> bool {
     relation < ATTACK_BELOW
 }
 
-/// Score of a subject `distance` metres away, of this `threat`
-/// ([`threat`]) and seen this well ([`visible`]); `current` is the
-/// distance to the one in the slot, if there is one, and `held` that this
-/// is it.
-pub fn score(distance: f32, current: Option<f32>, held: bool, threat: f32, seen: f32) -> f32 {
+/// Score of a subject `distance` metres away, `worth` this much
+/// ([`worth`]) and seen this well ([`visible`], times the mind's
+/// [`Heat::factor`]); `current` is the distance to the one in the slot, if
+/// there is one, and `held` that this is it.
+pub fn score(distance: f32, current: Option<f32>, held: bool, worth: f32, seen: f32) -> f32 {
     let near = if held { HOLD } else { NEAR };
-    let base = (threat + BASE) * seen;
+    let base = worth * seen;
     let doubled = if distance < near { base * 2.0 } else { base };
     let closer = current.is_some_and(|c| distance < c);
     doubled.min(MOST) + if closer { CLOSER } else { 0.0 }
@@ -264,8 +321,8 @@ mod tests {
         assert!(visible(300.0, 100.0) < 0.06);
         assert_eq!(visible(10.0, 0.0), 0.0);
         // An armed man near outscores an unarmed one; neither tops 0.9.
-        let armed = score(20.0, None, false, 0.9, visible(20.0, 90.0));
-        let unarmed = score(20.0, None, false, 0.0, visible(20.0, 90.0));
+        let armed = score(20.0, None, false, worth(0.9, false), visible(20.0, 90.0));
+        let unarmed = score(20.0, None, false, worth(0.0, false), visible(20.0, 90.0));
         assert!(armed > unarmed && armed <= 0.9, "{armed} {unarmed}");
     }
 
@@ -300,23 +357,62 @@ mod tests {
 
     #[test]
     fn near_counts_double_and_the_held_one_longer() {
-        assert_eq!(score(20.0, None, false, 0.0, 1.0), 0.2);
-        assert_eq!(score(40.0, None, false, 0.0, 1.0), 0.1);
-        assert_eq!(score(40.0, Some(40.0), true, 0.0, 1.0), 0.2);
-        assert!(score(35.0, Some(40.0), false, 0.0, 1.0) > score(40.0, None, false, 0.0, 1.0));
+        assert_eq!(score(20.0, None, false, worth(0.0, false), 1.0), 0.2);
+        assert_eq!(score(40.0, None, false, worth(0.0, false), 1.0), 0.1);
+        assert_eq!(score(40.0, Some(40.0), true, worth(0.0, false), 1.0), 0.2);
+        assert!(
+            score(35.0, Some(40.0), false, worth(0.0, false), 1.0)
+                > score(40.0, None, false, worth(0.0, false), 1.0)
+        );
     }
 
     #[test]
     fn a_challenger_needs_more_weight_than_the_one_held() {
         let mut slot = Slot::default();
-        slot.offer(1, score(40.0, None, false, 0.0, 1.0));
-        slot.offer(2, score(45.0, Some(40.0), false, 0.0, 1.0));
+        slot.offer(1, score(40.0, None, false, worth(0.0, false), 1.0));
+        slot.offer(2, score(45.0, Some(40.0), false, worth(0.0, false), 1.0));
         assert_eq!(slot.who, Some(1));
-        slot.offer(3, score(35.0, Some(40.0), false, 0.0, 1.0));
+        slot.offer(3, score(35.0, Some(40.0), false, worth(0.0, false), 1.0));
         assert_eq!(slot.who, Some(3));
-        slot.offer(1, score(10.0, Some(35.0), false, 0.0, 1.0));
+        slot.offer(1, score(10.0, Some(35.0), false, worth(0.0, false), 1.0));
         assert_eq!(slot.who, Some(1));
         slot.clear();
         assert_eq!(slot.who, None);
+    }
+
+    // A priority target is worth 9.8: seen at all well, it scores the most
+    // there is, over the nearest rifleman.
+    #[test]
+    fn a_priority_target_outscores_anyone() {
+        let seen = visible(150.0, 200.0);
+        let heli = score(150.0, None, false, worth(VEHICLE_THREAT, true), seen);
+        let rifleman = score(10.0, None, false, worth(0.9, false), 1.0);
+        assert_eq!(heli, MOST);
+        assert!(heli >= rifleman, "{heli} vs {rifleman}");
+        assert!((worth(0.9, false) - 1.0).abs() < 1e-6);
+        assert_eq!(
+            PRIORITY_PROPERTY,
+            m2_assets::hash::name_hash("PriorityTarget")
+        );
+    }
+
+    // Heat: up 1 an update with a target, to 10; down 0.5 without. Hot,
+    // scores count 1.5 times; cold, once.
+    #[test]
+    fn a_mind_with_a_target_runs_hot_and_cools_after() {
+        let mut heat = Heat::default();
+        assert_eq!(heat.factor(), 1.0);
+        for _ in 0..30 {
+            heat.tick(true);
+        }
+        assert_eq!(heat.0, 10.0);
+        assert_eq!(heat.factor(), 1.5);
+        for _ in 0..19 {
+            heat.tick(false);
+        }
+        assert_eq!(heat.factor(), 1.5, "0.5 left");
+        heat.tick(false);
+        assert_eq!(heat.0, 0.0);
+        assert_eq!(heat.factor(), 1.0);
     }
 }

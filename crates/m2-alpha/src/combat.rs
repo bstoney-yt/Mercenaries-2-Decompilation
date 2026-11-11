@@ -193,6 +193,8 @@ pub struct Rifle {
     pub camera: Option<m2_engine::weapons::CameraFeel>,
     /// Its scope's least and most magnification (`WeaponScope`).
     pub scope: Option<(f32, f32)>,
+    /// How soldiers rate it, carried (`WeaponHint`), if its template says.
+    pub hint: Option<m2_engine::weapons::FireHint>,
 }
 
 impl Default for Rifle {
@@ -217,6 +219,7 @@ impl Default for Rifle {
             assist: None,
             camera: None,
             scope: None,
+            hint: None,
         }
     }
 }
@@ -272,6 +275,7 @@ impl Rifle {
             assist: spec.assist,
             camera: spec.camera,
             scope: spec.scope,
+            hint: spec.hint,
         }
     }
 
@@ -2247,6 +2251,14 @@ pub fn explosives(index: &m2_engine::WorldIndex) -> Vec<Explosive> {
 }
 
 impl Combat {
+    /// The `WeaponHint`s of the guns she carries: her rifle's, and the
+    /// launcher's while she has one. Soldiers rate her threat by every
+    /// weapon in her inventory, carried or in her hands (0x822EC1B8 walks
+    /// the holder's items), not only the one she holds.
+    pub fn carried_hints(&self) -> [Option<m2_engine::weapons::FireHint>; 2] {
+        [self.rifle.hint, self.second.and(self.launcher.hint)]
+    }
+
     /// Rockets, grenades and rounds in flight: what, where, velocity.
     pub fn projectiles(&self) -> impl Iterator<Item = (Flying, Vec3, Vec3)> + '_ {
         self.projectiles.iter().filter_map(|p| match *p {
@@ -4329,7 +4341,9 @@ impl Combat {
                             // How well seen (0x822E89B0); what each carries is not
                             // rated against a vehicle here yet, so no threat.
                             let seen = m2_engine::ai_target::visible(d, reach);
-                            let score = m2_engine::ai_target::score(d, current, in_slot, 0.0, seen);
+                            let worth = m2_engine::ai_target::worth(0.0, false);
+                            let score =
+                                m2_engine::ai_target::score(d, current, in_slot, worth, seen);
                             best.offer(who, score);
                             if best.who == Some(who) {
                                 gun.at = Some(at);
@@ -6997,18 +7011,9 @@ mod tests {
 
     #[test]
     fn a_tank_fires_no_more_shells_than_its_cannon_carries() {
-        use m2_engine::VehicleSpec;
         use m2_engine::tuning::{GunTuning, RoundScale, VehicleTuning};
-        use m2_engine::vehicle::WheelSpec;
         let mut physics = ground();
         let dt = 1.0 / 60.0;
-        let wheel = |x: f32, z: f32| WheelSpec {
-            centre: Vec3::new(x, 0.4, z),
-            radius: 0.4,
-            width: 0.4,
-            steers: false,
-        };
-        let hull = (Vec3::new(-1.5, 0.0, -3.0), Vec3::new(1.5, 2.0, 3.0));
         // Its cannon carries two shells and could fire ten a second.
         let gun = GunTuning {
             weapon: 1,
@@ -7020,57 +7025,10 @@ mod tests {
             flash: None,
             sound_bank: None,
         };
-        let spec = VehicleSpec {
-            model: 1,
-            kind: "tank".into(),
-            label: "test".into(),
-            node_names: Vec::new(),
-            armed: Vec::new(),
-            wheels: vec![
-                wheel(-1.3, 2.0),
-                wheel(1.3, 2.0),
-                wheel(-1.3, -2.0),
-                wheel(1.3, -2.0),
-            ],
-            bounds: hull,
-            seat: None,
-            door: None,
-            seating: None,
-            entrances: Vec::new(),
-            tracked: true,
-            road_wheels: Vec::new(),
-            rest: Vec::new(),
-            node_wheel: Vec::new(),
-            node_rolls: Vec::new(),
-            mass: 32_000.0,
-            turret: Vec::new(),
-            pivot: None,
-            muzzle: Some(Vec3::new(0.0, 2.2, 5.0)),
-            gun: Vec::new(),
-            gun_pivot: None,
-            muzzle_on_gun: false,
-            elevation: (0.0, 0.0),
-            hull,
-            turret_box: None,
-            rotors: Vec::new(),
-            tilts: Vec::new(),
-            bomb_bay: None,
-            node_parents: Vec::new(),
-            aimers: Vec::new(),
-            damage: None,
-            chassis: None,
-            shapes: Default::default(),
-            material: None,
-            path_unseen: Default::default(),
-            turret_shapes: Default::default(),
-            turret_mass: None,
-            gun_body: None,
-            wreck: None,
-            tuning: VehicleTuning {
-                gun: Some(gun),
-                ..VehicleTuning::default()
-            },
-        };
+        let spec = crate::npc::tests::tank(VehicleTuning {
+            gun: Some(gun),
+            ..VehicleTuning::default()
+        });
         let id = physics.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
         physics.step(dt);
         let mut vehicles = vec![ParkedVehicle {
@@ -8031,6 +7989,40 @@ mod tests {
                 at,
                 template: 0x8000_a286
             }]
+        );
+    }
+
+    // Soldiers rate her by her own guns' `WeaponHint`s, the launcher's
+    // only while she carries one (0x822EC1B8 walks her items).
+    #[test]
+    fn her_threat_comes_from_the_guns_she_carries() {
+        use m2_engine::ai_target::{HUMAN, threat};
+        let hint = |range: f32, against: [u32; 4]| m2_engine::weapons::FireHint {
+            min_range: 1.0,
+            range,
+            angle: 2,
+            on: 0.8,
+            off: 1.0,
+            on_close: 0.8,
+            off_close: 1.0,
+            against,
+            kinds: [3, 1],
+            single: false,
+        };
+        let mut combat = Combat::default();
+        combat.rifle.hint = Some(hint(50.0, [3, 1, 0, 0]));
+        combat.launcher.hint = Some(hint(150.0, [1, 3, 0, 0]));
+        combat.second = None;
+        let rate = |c: &Combat, d: f32| threat(c.carried_hints().iter().flatten(), HUMAN, d, false);
+        assert!(rate(&combat, 30.0) > 0.0, "her rifle in its range");
+        assert_eq!(rate(&combat, 100.0), 0.0, "beyond it, and no launcher");
+        combat.second = Some(Weapon::GrenadeLauncher);
+        assert!(rate(&combat, 100.0) > 0.0, "the launcher reaches");
+        combat.rifle.hint = None;
+        assert_eq!(
+            rate(&combat, 30.0),
+            rate(&combat, 100.0),
+            "a gun with no hint adds nothing"
         );
     }
 }

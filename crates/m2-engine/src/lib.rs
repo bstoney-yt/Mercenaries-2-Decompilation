@@ -54,6 +54,7 @@ pub mod physics;
 pub mod pickup;
 pub mod population;
 pub mod reverb;
+pub mod road_driver;
 pub mod road_graph;
 pub mod road_ring;
 pub mod scatter;
@@ -71,6 +72,7 @@ pub mod vehicle_damage;
 pub mod vehicle_door;
 pub mod vehicle_parts;
 pub mod weapons;
+pub mod winch;
 pub mod world;
 
 pub use ai::{AiFlags, AiProfile};

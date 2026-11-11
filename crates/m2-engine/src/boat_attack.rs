@@ -73,8 +73,21 @@
 //! facing (0x822EC800 reads her 0x83657FA8 record).
 //! Everything fixed in the area counts as a building, of which the alpha
 //! keeps no list: the props standing there too. `BoatAttack` itself has no
-//! leash: it never reads +0x7BC. Not ported: `BoatIdle` (0x822AA0C8, on to
-//! where it last saw her at 20 m/s, slowing), a target in a vehicle of sub-kinds 0x180 and
+//! leash: it never reads +0x7BC.
+//! - **`BoatIdle`** (0x822AA0C8, task record 0x82B7BFC8, after
+//!   `BoatAttack`'s 0x82B7BEA8): each `BoatAttack` think that gets past the
+//!   10 s check keeps where she is (0x8225E998 on her record) in the mind's
+//!   +0x5C and sets +0x3F8 bit 0x20 (0x822A987C..0x822A98AC); with her
+//!   record empty it clears the bit (0x822A9938), as does the mind's reset
+//!   (0x822BCA30). Once `BoatAttack` has given up, `BoatIdle` goes to that
+//!   point at 20 m/s, slowing, keeping clear as every drive does
+//!   (0x822A7C30 calls 0x822A7858 itself); with no point kept it stops
+//!   (0x822A7730).
+//!
+//! Inferred there: the task switch back once she is seen again (the
+//! 360's task selection is not traced) is taken as `BoatAttack` starting
+//! afresh. Not ported: `BoatIdle`'s entry (0x822AA058, a message
+//! 0x6C5F1491 about the boat, flag bits 2 and 4 of its +0x14 cleared). Not ported: a target in a vehicle of sub-kinds 0x180 and
 //! 0x300 (no point: not known which those are), the flip of the aim
 //! (+0x3F8 bit 0x40, no writer found).
 
@@ -288,6 +301,11 @@ pub struct BoatAttack {
     /// The way it turns off, and for how long (+0x3F0, +0x3EC).
     turn: f32,
     hold: f32,
+    /// Where she was at its last think short of giving up: the mind's
+    /// +0x5C, kept while +0x3F8 bit 0x20 is set.
+    pub last: Option<Vec3>,
+    /// `BoatIdle` is running: `BoatAttack` gave up on her.
+    pub idle: bool,
 }
 
 /// 0x822A86B0's ring for a boat `width` wide, `rank` out, at a target of
@@ -434,6 +452,19 @@ impl BoatAttack {
         })
     }
 
+    /// 0x822AA0C8, `BoatIdle`: on to where she was when it gave up, at
+    /// 20 m/s and slowing for it; stopping with nowhere kept.
+    pub fn boat_idle(&self, h: &Hull, others: &[Neighbour]) -> BoatInput {
+        let car = &h.car;
+        match self.last {
+            Some(at) => {
+                let push = keep_clear(car, h.length, h.length.max(h.width), others);
+                drive_to(car, at, 20.0, true, push)
+            }
+            None => stop(car).0,
+        }
+    }
+
     /// One think at her.
     #[allow(clippy::too_many_arguments)]
     pub fn think(
@@ -451,8 +482,16 @@ impl BoatAttack {
         self.hold -= dt;
         let car = &h.car;
         if her.sight.unseen > 10.0 {
-            return stop(car).0;
+            self.idle = true;
+            return self.boat_idle(h, others);
         }
+        if self.idle {
+            *self = BoatAttack {
+                last: self.last,
+                ..BoatAttack::default()
+            };
+        }
+        self.last = Some(her.sight.at);
         if self.state == State::Choose {
             if self.timer > 0.0 {
                 return BoatInput::default();
@@ -687,6 +726,40 @@ mod tests {
         assert_eq!((i.throttle, i.steer), (0.5, 1.0));
         a.think(&h, &t, &mut w, &[], &mut None, 0.5, 2.5);
         assert_eq!(a.state, State::Choose);
+    }
+
+    #[test]
+    fn unseen_over_ten_seconds_it_goes_where_it_last_had_her() {
+        let mut a = BoatAttack::default();
+        let mut w = sea();
+        let mut t = her(100.0);
+        let h = hull(0);
+        // Never had her: it stops (0x822A7730).
+        t.sight.unseen = 11.0;
+        let i = a.think(&h, &t, &mut w, &[], &mut None, 0.5, 0.1);
+        assert_eq!(i, stop(&h.car).0);
+        assert!(a.idle);
+        // Seen, it keeps where she is each think and starts afresh.
+        t.sight.unseen = 10.0;
+        a.think(&h, &t, &mut w, &[], &mut None, 0.5, 0.1);
+        assert!(!a.idle);
+        assert_eq!(a.last, Some(t.sight.at));
+        let kept = t.sight.at;
+        // Given up: she has moved, it goes where it last had her, at
+        // 20 m/s, slowing.
+        t.sight.unseen = 10.5;
+        t.sight.at += Vec3::X * 300.0;
+        let i = a.think(&h, &t, &mut w, &[], &mut None, 0.5, 0.1);
+        assert_eq!(a.last, Some(kept));
+        assert_eq!(i, drive_to(&h.car, kept, 20.0, true, Vec3::ZERO));
+        assert!(i.throttle > 0.0);
+        let mut fast = h;
+        fast.car.velocity = Vec3::Z * 25.0;
+        assert!(
+            a.think(&fast, &t, &mut w, &[], &mut None, 0.5, 0.1)
+                .throttle
+                < 0.0
+        );
     }
 
     #[test]
