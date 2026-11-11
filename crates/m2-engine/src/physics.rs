@@ -6385,6 +6385,35 @@ impl Physics {
         Some((pose, out?))
     }
 
+    /// Whether the line from `from` to `to` is clear of what a path search
+    /// sees ([`PATH_MASK`](collision_layers::PATH_MASK)): `CarAttack`'s
+    /// check on its line to her (0x822ACB28 sweeps 0x82166958 with that
+    /// mask). As [`sweep_obstacle`](Self::sweep_obstacle) sees (leaves and
+    /// AI-only shapes, not a chain fence or a loose prop's solid shapes),
+    /// and the terrain. A line, where the 360 sweeps a thin box (its
+    /// size not ported).
+    pub fn path_line_clear(&self, from: Vec3, to: Vec3, skip: Option<VehicleId>) -> bool {
+        let d = to - from;
+        let len = d.length();
+        if len < 1e-4 {
+            return true;
+        }
+        if self
+            .sweep_obstacle(from, to, Vec3::splat(0.01), skip)
+            .is_some()
+        {
+            return false;
+        }
+        let ray = r::Ray::new(vector(from), vector(d / len));
+        let cell = |h: r::ColliderHandle, _: &r::Collider| {
+            matches!(self.keys.get(&h), Some(StaticKey::Cell(_)))
+        };
+        self.world
+            .query_pipeline_with_filter(solid().predicate(&cell))
+            .cast_ray(&ray, len, true)
+            .is_none()
+    }
+
     /// Whether an AI gunner's sight line from `from` to `to` is clear
     /// (0x822C95D8's rays, [`SIGHT_MASK`](collision_layers::SIGHT_MASK)):
     /// as [`line_clear`](Self::line_clear), and leaves block it too
@@ -6511,6 +6540,25 @@ impl Physics {
         let (handle, hit) = self
             .world
             .query_pipeline_with_filter(solid())
+            .cast_ray_and_get_normal(&ray, max, true)?;
+        let key = self.keys.get(&handle).copied();
+        Some((hit.time_of_impact, vec3(hit.normal), key))
+    }
+
+    /// [`cast_ray_keyed`](Self::cast_ray_keyed) as an AI's line of fire
+    /// sees ([`SIGHT_MASK`](collision_layers::SIGHT_MASK): 0x822C95D8's
+    /// rays carry 0x223F6FDA): leaves block it too
+    /// ([`CollisionShape::leaves`]).
+    pub fn cast_ray_sight_keyed(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max: f32,
+    ) -> Option<(f32, Vec3, Option<StaticKey>)> {
+        let ray = r::Ray::new(vector(origin), vector(direction.normalize_or_zero()));
+        let (handle, hit) = self
+            .world
+            .query_pipeline_with_filter(paths())
             .cast_ray_and_get_normal(&ray, max, true)?;
         let key = self.keys.get(&handle).copied();
         Some((hit.time_of_impact, vec3(hit.normal), key))
@@ -10336,6 +10384,51 @@ mod tests {
         // Gone with it.
         p.remove_static(StaticKey::Object(4));
         assert!(p.sight_clear(a, b, None));
+    }
+
+    // CarAttack's line to her (0x82166958, the path mask) passes a loose
+    // prop's solid shape (layer 18) and stops at leaves (19); a soldier's
+    // line of fire (0x822C95D8, the sight mask) stops at both.
+    #[test]
+    fn ai_lines_see_loose_props_and_leaves_by_their_masks() {
+        let mut p = Physics::new();
+        let model = two_box_model();
+        p.add_static_as(
+            StaticKey::Entity(1),
+            &model,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            Preset::LooseProp,
+        );
+        let mut bush = CollisionShape::cuboid(Vec3::new(0.05, 0.05, 0.05));
+        bush.leaves = Some(r::SharedShape::cuboid(1.0, 1.0, 1.0));
+        p.add_static(
+            StaticKey::Object(2),
+            &bush,
+            Vec3::new(20.0, 5.0, 0.0),
+            Quat::IDENTITY,
+        );
+        p.step(DT);
+        let across = |x: f32, y: f32| (Vec3::new(x, y, -5.0), Vec3::new(x, y, 5.0));
+        let (a, b) = across(0.0, 1.0);
+        assert!(
+            p.path_line_clear(a, b, None),
+            "a loose prop is in no CarAttack line's way"
+        );
+        assert!(
+            p.cast_ray_sight_keyed(a, b - a, 10.0).is_some(),
+            "a soldier's line meets it"
+        );
+        let (a, b) = across(20.5, 5.0);
+        assert!(
+            !p.path_line_clear(a, b, None),
+            "leaves stop CarAttack's line"
+        );
+        assert!(
+            p.cast_ray_sight_keyed(a, b - a, 10.0).is_some(),
+            "and a soldier's"
+        );
+        assert!(p.cast_ray_keyed(a, b - a, 10.0).is_none(), "but not a shot");
     }
 
     // A broken fence's planks stay its entity's bodies on the 360: a path
