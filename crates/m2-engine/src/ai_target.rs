@@ -339,6 +339,86 @@ impl Slot {
     }
 }
 
+/// How often a mind looks again at what is in each perception lane,
+/// seconds (0x822DB5A8): lane 0 at each think, the others when their
+/// timer (the mind's +0xC48..) passes these.
+pub const LANE_EVERY: [f32; 4] = [0.0, 0.09, 1.8, 8.0];
+
+/// Below this speed a subject is in the slowest lane, m/s (its speed
+/// squared at most 2.25, 0x822F1198).
+pub const LANE_SLOW: f32 = 1.5;
+
+/// Above this speed a subject is in the fastest timed lane, m/s (squared
+/// above 81).
+pub const LANE_FAST: f32 = 9.0;
+
+/// A subject newer than this, seconds, is in lane 1 at the slowest.
+pub const LANE_NEW: f32 = 0.3;
+
+/// The most sight checks queued in one frame across all minds (0x800,
+/// 0x822E8DF8): past them a subject goes unseen that frame.
+pub const LOOKS_PER_FRAME: usize = 0x800;
+
+/// A subject's perception lane (0x822F1198): by its speed, 3 when
+/// slow, 2 between [`LANE_SLOW`] and [`LANE_FAST`], 1 above; one
+/// faster when `urgent` (the record's flags 0x18000000, or the caller's
+/// own urgency) and not already 1; 1 at the slowest while `age` is under
+/// [`LANE_NEW`]; 0 when `every_think` (the record's flags 0x80000000 or
+/// 0x4000000000, or one being forgotten).
+pub fn lane(speed: f32, age: f32, urgent: bool, every_think: bool) -> usize {
+    if every_think {
+        return 0;
+    }
+    let sq = speed * speed;
+    let mut lane = if sq <= LANE_SLOW * LANE_SLOW {
+        3
+    } else if sq <= LANE_FAST * LANE_FAST {
+        2
+    } else {
+        1
+    };
+    if urgent && lane > 1 {
+        lane -= 1;
+    }
+    if age < LANE_NEW && lane > 1 {
+        lane = 1;
+    }
+    lane
+}
+
+/// A mind's lane timers (+0xC48 to +0xC54). A new mind looks over every
+/// lane at its first think (invented: where the 360 starts them is not
+/// traced).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lanes {
+    waited: [f32; 4],
+}
+
+impl Default for Lanes {
+    fn default() -> Self {
+        Self {
+            waited: [f32::INFINITY; 4],
+        }
+    }
+}
+
+impl Lanes {
+    /// Moves the timers on by `dt` and says which lanes it looks over
+    /// now: each whose timer passes its [`LANE_EVERY`], which then starts
+    /// again from 0.
+    pub fn tick(&mut self, dt: f32) -> [bool; 4] {
+        let mut due = [false; 4];
+        for (k, w) in self.waited.iter_mut().enumerate() {
+            *w += dt;
+            if LANE_EVERY[k] < *w {
+                due[k] = true;
+                *w = 0.0;
+            }
+        }
+        due
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,5 +616,31 @@ mod tests {
         assert_eq!(pick_weapon(&[1.0, 3.0], 0.2), Some(0));
         assert_eq!(pick_weapon(&[1.0, 3.0], 0.3), Some(1));
         assert_eq!(pick_weapon(&[1.0, 3.0], 1.0), Some(1));
+    }
+    // Fast, walking and still subjects fall in lanes 1, 2 and 3; urgency
+    // and youth bring them forward; the timers run each lane at its rate.
+    #[test]
+    fn subjects_are_looked_at_by_how_fast_they_move() {
+        assert_eq!(lane(0.0, 10.0, false, false), 3);
+        assert_eq!(lane(1.5, 10.0, false, false), 3);
+        assert_eq!(lane(4.0, 10.0, false, false), 2);
+        assert_eq!(lane(9.0, 10.0, false, false), 2);
+        assert_eq!(lane(20.0, 10.0, false, false), 1);
+        assert_eq!(lane(0.0, 10.0, true, false), 2);
+        assert_eq!(lane(20.0, 10.0, true, false), 1);
+        assert_eq!(lane(0.0, 0.1, false, false), 1);
+        assert_eq!(lane(20.0, 10.0, false, true), 0);
+        let mut lanes = Lanes::default();
+        let dt = 1.0 / 30.0;
+        let mut counts = [0; 4];
+        for _ in 0..30 * 16 {
+            for (k, d) in lanes.tick(dt).into_iter().enumerate() {
+                counts[k] += usize::from(d);
+            }
+        }
+        assert_eq!(counts[0], 480, "each think");
+        assert!((150..=170).contains(&counts[1]), "{}", counts[1]);
+        assert!((9..=10).contains(&counts[2]), "{}", counts[2]);
+        assert_eq!(counts[3], 2, "at the first think and 8 s on");
     }
 }
