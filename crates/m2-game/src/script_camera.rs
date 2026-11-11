@@ -35,8 +35,8 @@
 //! bone stands at its object's place, and "along" looks the way the object
 //! faces. A look at an object with no bone is raised by its box height
 //! times 0.85 for people and 0.5 for anything else (from the 360 code).
-//! The box isn't held here, so people are taken as [`PERSON_HEIGHT`] tall
-//! (invented) and other objects as flat.
+//! The box's height comes from the game (its models' bounds); an object
+//! the game has no model for is taken as flat.
 
 use m2_math::glam::{Mat3, Quat, Vec3};
 
@@ -44,10 +44,6 @@ use m2_math::glam::{Mat3, Quat, Vec3};
 /// the 360 code); others are raised by [`OTHER_LOOK_RAISE`] of theirs.
 pub const PERSON_LOOK_RAISE: f32 = 0.85;
 pub const OTHER_LOOK_RAISE: f32 = 0.5;
-
-/// How tall a person is taken to be, metres (invented: their bounding
-/// boxes aren't held by the scripts' world).
-pub const PERSON_HEIGHT: f32 = 1.8;
 
 /// Where an object stands, as the camera needs it: its place, the way it
 /// faces (radians clockwise from +z) and its box's height.
@@ -273,8 +269,9 @@ impl ScriptWorld {
     }
 
     /// Moves the scripts' camera on by `dt` seconds, its objects where the
-    /// scripts' world has them.
-    pub fn update_script_camera(&mut self, dt: f32) {
+    /// scripts' world has them and as tall as `height` says (their models'
+    /// bounds, from the game; none is flat).
+    pub fn update_script_camera(&mut self, dt: f32, height: &dyn Fn(u32) -> Option<f32>) {
         let Some(mut c) = self.script_camera.take() else {
             return;
         };
@@ -289,7 +286,7 @@ impl ScriptWorld {
                 Placed {
                     position: Vec3::from(o.position),
                     yaw: o.yaw,
-                    height: if person { PERSON_HEIGHT } else { 0.0 },
+                    height: height(g).unwrap_or(0.0),
                     person,
                 }
             })
@@ -474,7 +471,7 @@ mod tests {
         Placed {
             position,
             yaw,
-            height: PERSON_HEIGHT,
+            height: 1.8,
             person: true,
         }
     }
@@ -500,7 +497,7 @@ mod tests {
         };
         assert!(c.update(0.1, &place));
         assert_eq!(c.view.eye, Vec3::ZERO);
-        let want = Vec3::new(0.0, PERSON_HEIGHT * PERSON_LOOK_RAISE, 10.0).normalize();
+        let want = Vec3::new(0.0, 1.8 * PERSON_LOOK_RAISE, 10.0).normalize();
         assert!((c.view.forward() - want).length() < 1e-5);
     }
 
@@ -571,7 +568,7 @@ mod tests {
                 .object,
             0
         );
-        world.borrow_mut().update_script_camera(0.1);
+        world.borrow_mut().update_script_camera(0.1, &|_| None);
         let v = world.borrow().script_view().unwrap();
         assert_eq!(v.eye, Vec3::new(0.0, 5.0, 0.0));
         assert!((v.forward() - Vec3::new(0.0, -5.0, 10.0).normalize()).length() < 1e-5);

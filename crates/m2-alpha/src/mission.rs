@@ -2753,8 +2753,24 @@ impl MissionLink {
         // The scripts' camera in a scene: on with its objects, and its view
         // while a script directs it.
         {
+            // How tall an object is, from its model's bounds: hers, a
+            // person's (by the guid it was spawned with) or a vehicle's.
+            let scene = &game.scene;
+            let height = |g: u32| -> Option<f32> {
+                let tall = |(lo, hi): (Vec3, Vec3)| hi.y - lo.y;
+                if g == PLAYER {
+                    let p = scene.player.as_ref()?;
+                    return p.model.as_ref().map(|(m, _)| tall(m.bounds));
+                }
+                if let Some(v) = scene.vehicles.iter().find(|v| v.guid == Some(g)) {
+                    return Some(tall(v.model.bounds));
+                }
+                let people = &scene.people;
+                let n = people.npcs.iter().find(|n| n.spawn == Some(g))?;
+                people.kinds.get(n.kind).map(|k| tall(k.model.bounds))
+            };
             let mut w = mission.world().borrow_mut();
-            w.update_script_camera(dt);
+            w.update_script_camera(dt, &height);
             game.script_view = w.script_view().map(|v| (v.eye, v.forward()));
         }
         // A scene's camera shot, from where its two stand now.
