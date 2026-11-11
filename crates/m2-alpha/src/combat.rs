@@ -5567,9 +5567,9 @@ impl Combat {
             // `Explosion`, `HumanArmor` 0.5).
             let own = self.on_person(n, key);
             if d < KILL {
-                killed |= n.hurt(1000.0 * own, push) && n.soldier;
+                killed |= n.hurt_by_blast(1000.0 * own, push, key, at) && n.soldier;
             } else if d < REACH {
-                killed |= n.hurt(100.0 * near * own, push) && n.soldier;
+                killed |= n.hurt_by_blast(100.0 * near * own, push, key, at) && n.soldier;
                 n.panic(at);
             } else if d < REACH * 3.0 {
                 n.panic(at);
@@ -5867,7 +5867,7 @@ impl Combat {
                 let away = (n.chest() - at).with_y(0.0).normalize_or(Vec3::X);
                 let push =
                     away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
-                killed |= n.hurt(b.damage_at(d) * scale, push) && n.soldier;
+                killed |= n.hurt_by_blast(b.damage_at(d) * scale, push, b.key, at) && n.soldier;
                 n.panic(at);
             } else if d < reach * 3.0 {
                 n.panic(at);
@@ -6114,7 +6114,7 @@ impl Combat {
             let away = (chest - at).with_y(0.0).normalize_or(Vec3::X);
             let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
             let own = self.on_person(n, key);
-            killed |= n.hurt(damage * near * own, push) && n.soldier;
+            killed |= n.hurt_by_blast(damage * near * own, push, key, at) && n.soldier;
         }
         let her = (f.player.driving.is_none() && f.player.landed)
             .then(|| f.player.character.position + Vec3::Y)
