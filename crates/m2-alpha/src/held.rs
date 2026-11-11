@@ -131,9 +131,22 @@ pub struct Moves {
     /// `RunStop`: the slide to a stop after a run, the whole body
     /// ([`m2_engine::on_foot::RunStop`]).
     pub run_stop: Option<usize>,
+    /// Carrying someone: standing, walking and running, the `Carrying`
+    /// locomotion node's gaits ([`hero_action::CARRY_GAITS`]).
+    pub carrying: [Option<usize>; 3],
 }
 
 impl Moves {
+    /// The clip she carries someone with at `gait`: the 360's `Carrying`
+    /// node has one clip for the jog, the run and the sprint.
+    pub fn carry_clip(&self, gait: Gait) -> Option<usize> {
+        self.carrying[match gait {
+            Gait::Idle => 0,
+            Gait::Walk => 1,
+            _ => 2,
+        }]
+    }
+
     /// The clips for class `class`; the rifle's for a class not worked
     /// out (inferred: the rifle is what every hero starts with).
     pub fn of(&self, class: u32) -> Option<&Held> {
@@ -416,6 +429,11 @@ pub fn resolve(
         held,
         pickup: by_action("PickupWeapon", table::RIFLE),
         run_stop: by_action(m2_engine::on_foot::RUN_STOP_ACTION, table::RIFLE),
+        // The carry's rows name no class and no one.
+        carrying: hero_action::CARRY_GAITS.map(|h| {
+            let p = table::handle_clip(t, h, who, table::RIFLE, fits)?;
+            index(p.clip)
+        }),
     }
 }
 
@@ -460,7 +478,20 @@ mod tests {
             held: vec![rifle, pistol, rocket],
             pickup: Some(9),
             run_stop: None,
+            carrying: [Some(20), Some(21), Some(22)],
         }
+    }
+
+    /// The `Carrying` node has one clip for the jog, run and sprint.
+    #[test]
+    fn carrying_runs_on_one_clip_above_a_walk() {
+        let m = moves();
+        assert_eq!(m.carry_clip(Gait::Idle), Some(20));
+        assert_eq!(m.carry_clip(Gait::Walk), Some(21));
+        for g in [Gait::Run, Gait::Sprint, Gait::FullSprint] {
+            assert_eq!(m.carry_clip(g), Some(22));
+        }
+        assert_eq!(Moves::default().carry_clip(Gait::Run), None);
     }
 
     #[test]

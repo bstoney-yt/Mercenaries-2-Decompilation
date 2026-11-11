@@ -2387,6 +2387,15 @@ impl MissionLink {
             .find(|n| n.down == Some(crate::npc::Down::Carried))
             .and_then(|n| n.spawn);
         mission.set_carrying(PLAYER, carried);
+        let carrying = game
+            .scene
+            .people
+            .npcs
+            .iter()
+            .any(|n| n.down == Some(crate::npc::Down::Carried));
+        if let Some(p) = game.scene.player.as_mut() {
+            p.carrying = carrying;
+        }
         lap.mark("scripts: actions");
         // The placed people's human states, as they change, for the
         // scripts' `HumanStateTransition` events.

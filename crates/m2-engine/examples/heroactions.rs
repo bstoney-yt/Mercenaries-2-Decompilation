@@ -17,7 +17,9 @@ use m2_assets::animation::ANIMATION_TYPE;
 use m2_assets::animation_table::{self as table, AnimationTable};
 use m2_assets::{Clip, name_hash};
 use m2_engine::Install;
-use m2_engine::hero_action::{SLOT_ACTIONS, ThrowWay, throw_action};
+use m2_engine::hero_action::{
+    CARRY_GAITS, CROUCH_FIDGET, CROUCH_GAITS, SLOT_ACTIONS, SWIM_GAITS, ThrowWay, throw_action,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::args()
@@ -86,6 +88,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     h.map_or("none".to_owned(), |h| format!("{h:08x}")),
                     describe(p)
                 );
+            }
+            // The locomotion nodes' gait handles, by stance.
+            let crouch = CROUCH_GAITS.map(name_hash);
+            let nodes: [(&str, &[u32]); 4] = [
+                ("Swim", &SWIM_GAITS),
+                ("Carrying", &CARRY_GAITS),
+                ("Crouched", &crouch),
+                ("Crouched fidget", &[name_hash(CROUCH_FIDGET)]),
+            ];
+            for (stance, handles) in nodes {
+                for (i, &h) in handles.iter().enumerate() {
+                    let p = table::handle_clip(&foot, h, key, class_hash, fits);
+                    println!("{who}	{class}	{stance}	gait {i}	{h:08x}	{}", describe(p));
+                }
             }
             for moving in [false, true] {
                 for way in ThrowWay::ALL {

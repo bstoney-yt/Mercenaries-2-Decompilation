@@ -54,7 +54,46 @@
 //! plays in the `InAir` stance, was not read, so the beta's take-off and
 //! air clips stay as they were found.
 
+//!
+//! # The locomotion nodes' handle lists
+//!
+//! From the 360 code: a person's animation driver builds one locomotion
+//! node for its stance (0x8241F878), all of one class (0x82802B10), and
+//! each stance's node is given its own list of 29 animation handles, which
+//! the node's binder (0x82804AE8) hands to its clips by position: 0 to 6
+//! the aim gaits, 7 to 11 the sprint, run, jog, walk and idle, 12 a second
+//! idle, 13 the fidget, 14 to 26 the sets blended in moving and standing,
+//! 27 and 28 the aim shuffles. The lists are `Upright`'s at 0x82B4DA98,
+//! `Carrying`'s at 0x82B4DB40 (read from its binder, 0x8280E978) and
+//! `Swim`'s at 0x82B4D978 (its binder, 0x827F98D8); `Crouched`'s is taken
+//! to be the one at 0x82B4DBC0, whose handles are the hashes of `Crouch_`
+//! names (its binder was not read). [`SWIM_GAITS`], [`CARRY_GAITS`] and
+//! [`CROUCH_GAITS`] are those lists' entries 11, 10, 9, 8 and 7. The
+//! swim's and the carry's handles are not named (no name is a string in
+//! the program, and none guessed hashes to them); the crouch's are named
+//! by their hashes (tested below).
+
 use m2_assets::name_hash;
+
+/// The `Swim` node's gait handles: still, walk, jog, and the run and
+/// sprint (one handle for both).
+pub const SWIM_GAITS: [u32; 4] = [0x3dcb_9682, 0x410a_acbc, 0x980d_a78a, 0x65a1_9525];
+
+/// The `Carrying` node's gait handles: still, walk, and the jog, run and
+/// sprint (one handle for the three).
+pub const CARRY_GAITS: [u32; 3] = [0x53ae_edeb, 0xde4d_3907, 0x2015_a258];
+
+/// The `Crouched` node's gaits when not aiming, by name: still, walk,
+/// jog, and the run and sprint (one handle for both); then its fidget.
+/// The beta plays none of them yet: its player crouches only aimed in
+/// ([`crate::on_foot::CROUCH_HOLD`]) and its soldiers do not crouch.
+pub const CROUCH_GAITS: [&str; 4] = [
+    "Crouch_Idle",
+    "Crouch_Walk_Forward",
+    "Crouch_Jog_Forward",
+    "Crouch_Run_Forward",
+];
+pub const CROUCH_FIDGET: &str = "Crouch_Fidget";
 
 /// A fight clip slot whose action the 360 code names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,6 +216,16 @@ mod tests {
         assert_eq!(throw_action(false), "ThrowGrenadeIdle");
         assert_eq!(throw_action(true), "ThrowGrenadeRun");
         assert_eq!(ThrowWay::Right.hash(), 0x1ca1_1cdd);
+    }
+
+    /// The crouched gaits' names hash to the list's entries 11, 10, 9 and
+    /// 8 (and 7), and the fidget's to entry 13.
+    #[test]
+    fn crouch_gait_names_hash_to_the_lists_handles() {
+        let list = [0xd491_dd44, 0x5e7a_dcc3, 0x3c16_5288, 0xbbf6_af9f];
+        assert_eq!(CROUCH_GAITS.map(name_hash), list);
+        assert_eq!(name_hash(CROUCH_FIDGET), 0x9b20_b655);
+        assert_eq!(name_hash("Upright_Fidget"), 0x700d_4de0);
     }
 
     #[test]

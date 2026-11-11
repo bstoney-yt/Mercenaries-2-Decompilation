@@ -440,13 +440,14 @@ impl FightClips {
     /// The swim stroke and the climb-out (see [`FightClips::swim`]).
     pub const SWIM: u32 = 0xc846_e6fd;
     pub const SWIM_OUT: u32 = 0x97c8_40ed;
-    /// The swim gaits: the on-foot tables' rows beside the swim rows that
-    /// no actions table names (handles 82c3b8c6, 410aacbc, 980da78a and
-    /// 65a19525), as the upright gaits are. From samples: their root
-    /// speeds, 0, 0.67, 1.00 and 2.00 m/s, the body near the waterline in
-    /// each; which is which (float, slow, forward, fast) is inferred from
-    /// those speeds, the handles' names not being known.
-    pub const SWIM_GAITS: [u32; 4] = [0x64b3_cc44, 0x1b69_9e96, 0x2c6f_a0f0, 0x03bd_0113];
+    /// The swim gaits: the clips of the `Swim` locomotion node's gait
+    /// handles ([`m2_engine::hero_action::SWIM_GAITS`], from the 360 code:
+    /// still 3dcb9682, walk 410aacbc, jog 980da78a, run and sprint
+    /// 65a19525), each handle's one row in the on-foot table (from
+    /// samples). Their root speeds are 0, 0.67, 1.00 and 2.00 m/s. The
+    /// still one was 64b3cc44 before, the clip of a handle (82c3b8c6) the
+    /// node does not list, picked for its speed.
+    pub const SWIM_GAITS: [u32; 4] = [0x4d12_6d78, 0x1b69_9e96, 0x2c6f_a0f0, 0x03bd_0113];
     /// The upright stance's aim movement, the clips of the generic rifle
     /// rows under its handles (from the 360 code: the upright locomotion
     /// node's handle list, 0x82B4DA98, entries 6, 4, 2 and 0, which its

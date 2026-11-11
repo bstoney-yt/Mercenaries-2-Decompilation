@@ -405,6 +405,10 @@ pub struct Player {
     /// Jump was pressed while she was landing: she jumps again as the
     /// landing ends.
     jump_queued: bool,
+    /// Whether she carries someone (a subdued prisoner): her gaits are
+    /// then the `Carrying` stance's ([`crate::held::Moves::carrying`]; from
+    /// the 360 code, the stance's own locomotion node).
+    pub carrying: bool,
     /// Seconds into a grenade throw, while she throws.
     pub throwing: Option<f32>,
     /// The throw's clip and when in it the grenade leaves her hand, picked
@@ -626,6 +630,7 @@ impl Player {
             last_yaw: yaw,
             leap: Leap::No,
             jump_queued: false,
+            carrying: false,
             throwing: None,
             throw_clip: None,
             bashing: None,
@@ -1251,6 +1256,10 @@ impl Player {
                     h.crouch.iter().find(|(g, b, _)| *g == gait && *b == back)
                 })
                 .map(|&(_, _, c)| c);
+            // Carrying someone she is `Carrying`: its gait's clip, whole.
+            let carried = (self.carrying && !self.aiming)
+                .then(|| self.moves.carry_clip(gait))
+                .flatten();
             // The jump: a take-off (on the run or standing), the air,
             // and a landing.
             if jump.is_some() {
@@ -1399,6 +1408,11 @@ impl Player {
                 let upper = (gait != Gait::Idle).then_some(clips.aim).flatten();
                 rig.animator.set_upper(upper.zip(rig.upper.clone()));
                 rig.two_handed = rig.barrel;
+            } else if let Some(c) = carried {
+                rig.gait = gait;
+                rig.play_gait(c);
+                rig.animator.set_upper(None);
+                rig.two_handed = false;
             } else {
                 rig.hold_rifle(gait, clips, carry);
                 // A pistol is held in the right hand alone.
@@ -1477,8 +1491,9 @@ impl Player {
             } else if leaping || self.stopping.is_some() {
                 1.0
             } else {
-                match crouched.map(|c| rig.clips[c].info.speed) {
-                    // Crouched and moving, its stride to her speed.
+                match crouched.or(carried).map(|c| rig.clips[c].info.speed) {
+                    // Crouched (or carrying) and moving, its stride to
+                    // her speed.
                     Some(s) if gait != Gait::Idle && s > 0.1 => moved / s,
                     Some(_) => 1.0,
                     None => rig.play_rate(gait, moved, 0),
