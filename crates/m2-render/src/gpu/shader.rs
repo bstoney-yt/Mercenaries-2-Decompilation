@@ -91,6 +91,9 @@ struct Frame {
     lights: array<vec4<f32>, 16>,
     // x: how many of them
     light_info: vec4<f32>,
+    // The sun's disc: rgb its colour (display values, 0 for none), w the
+    // cosine of its angular radius
+    sun_disc: vec4<f32>,
 };
 
 // The point lights' light on a surface at `p` facing `n`, summed as the
@@ -1063,6 +1066,12 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
     let r = normalize(p.xyz / p.w - frame.eye.xyz);
     // The game's sky dome (`game_sky`), drawn before its clouds.
     var rgb = sky(r);
+    // Then its sun disc, a flat colour (the material's emissive, shader
+    // 484), before the clouds (0x821D0A28).
+    let disc = frame.sun_disc;
+    if max(disc.r, max(disc.g, disc.b)) > 0.0 && dot(r, -normalize(frame.sun_dir.xyz)) > disc.w {
+        rgb = light_from_display(disc.rgb);
+    }
     // Where the ray meets the cloud deck, the deck moving with the eye so
     // clouds stay overhead; sampled before any branch for mip selection.
     // Rays below a floor all met the deck at one far point per column,

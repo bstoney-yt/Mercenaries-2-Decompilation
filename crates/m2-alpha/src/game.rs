@@ -3448,6 +3448,7 @@ impl Game {
                 }
             }
             view.lighting.clouds.noise = world.cloud_noise;
+            view.lighting.flare_map = world.sun_flare;
         }
         finish(&mut view.lighting);
         post_override(&mut view.lighting);
