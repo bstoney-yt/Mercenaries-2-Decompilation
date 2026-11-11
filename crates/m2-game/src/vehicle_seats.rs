@@ -38,7 +38,15 @@
 //! - `Vehicle.IsSeatALadder(seat)` (0x82347408): whether the seat has a
 //!   `ControllerLadder` (the store 0x83653518, named by 0x823B1F98).
 //!
-//! Not ported: `IsSeatBlocked` (0x82347240), the animation of a
+//! - `Vehicle.IsSeatBlocked(seat)` (0x82347240): a rider of it has a
+//!   player record (store 0x83657FA8), or a rider of another seat of the
+//!   vehicle has its `Rider` record's `TargetGuid` (+8) on it. The `Rider`
+//!   record (0x823F20A0) is `Role` (+0: Rider, Hijacker, Cargo), `State`
+//!   (+4: Idle, Entering, Exiting, Transferring) and `TargetGuid` (+8).
+//!   Seating here is at once, so nobody is headed for another seat and
+//!   only the first holds.
+//!
+//! Not ported: the animation of a
 //! transfer (the game only moves the rider's seat), the blocked-seat
 //! test of a `free` search (0x8229CBB8), the
 //! stow seat's guid (`uStowSeat`; given nil).
@@ -354,6 +362,19 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             None => Err(mlua::Error::runtime("Vehicle.GetSeatParams: not a seat")),
         }
     })?;
+    // 0x82347240: blocked when a player's character sits in it, or a rider
+    // of another seat of its vehicle is headed for it (its `Rider`
+    // record's `TargetGuid`, +8). Seating here is at once (no rider is
+    // `Entering` or `Transferring`), so only the first holds.
+    add(&vehicle, "IsSeatBlocked", |w, _, a| {
+        let Some(seat) = id(a.first()) else {
+            return Err(mlua::Error::runtime("Vehicle.IsSeatBlocked: not a seat"));
+        };
+        let blocked = w.seats.rider_in(seat).is_some_and(|r| {
+            w.objects.get(&r).is_some_and(|o| o.player_controlled) || w.player == Some(r)
+        });
+        Ok(MultiValue::from_iter([Value::Boolean(blocked)]))
+    })?;
     // 0x82347408: whether the seat is in the `ControllerLadder` store.
     add(&vehicle, "IsSeatALadder", |w, _, a| {
         let Some(seat) = id(a.first()) else {
@@ -555,6 +576,18 @@ mod tests {
             .eval()
             .unwrap();
         assert!(ladder && not);
+        // The player in a seat blocks it; an AI rider doesn't.
+        {
+            let mut w = world.borrow_mut();
+            w.player = Some(100);
+        }
+        let (mine, free): (bool, bool) = lua
+            .load(
+                "return Vehicle.IsSeatBlocked(Vehicle.GetSeatFromRider(rider)),                  not Vehicle.IsSeatBlocked(Vehicle.GetSeatByType(jeep, 'g'))",
+            )
+            .eval()
+            .unwrap();
+        assert!(mine && free);
         assert_eq!(list_len, 2);
     }
 }
