@@ -5067,6 +5067,7 @@ pub(crate) mod tests {
             chassis: None,
             shapes: Default::default(),
             material: None,
+            path_unseen: Default::default(),
             turret_shapes: Default::default(),
             turret_mass: None,
             gun_body: None,

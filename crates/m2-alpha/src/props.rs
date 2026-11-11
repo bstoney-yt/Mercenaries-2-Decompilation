@@ -971,7 +971,8 @@ impl Props {
             .iter()
             .zip(loose.starts(placed))
             .map(|(piece, at)| physics.add_debris(piece, at, velocity, spin))
-            .collect();
+            .collect::<Vec<_>>();
+        physics.group_debris(&pieces, placed);
         self.knocked.insert(entity, pieces);
         self.fresh_knocks.push(entity);
         true
