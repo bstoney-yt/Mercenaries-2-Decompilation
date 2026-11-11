@@ -1,0 +1,295 @@
+//! The actions the original asks a person's animation for by name, and
+//! how a grenade throw picks its action: the request side of the two
+//! animation tables.
+//!
+//! A person's clip comes of two steps
+//! ([`m2_assets::animation_table`]): the stance and action table turns a
+//! stance and an action into an animation handle, and the on-foot table
+//! turns the handle, the character and what they hold into a clip. The
+//! tables say nothing of which action is asked for when; that is the
+//! program's. The beta's fight clips were first found the other way
+//! round, from a clip that looked right to the first row listing it, and
+//! a clip is listed under several handles: that way gave the bash the
+//! `Crouched` stance's handle and the standing take-off
+//! `DieAnimatedRagdoll`'s. [`SLOT_ACTIONS`] are the slots whose action the
+//! 360 code names, to be looked up forward.
+//!
+//! # Provenance
+//!
+//! From the 360 code:
+//!
+//! - **Bash**: the bash handler (0x8222A828) sets action 0x29EFE0B5 for a
+//!   high bash and 0x47BC7419 for a low one ([`crate::melee`]); they are
+//!   the hashes of `MeleeBash` and `MeleeBashLow` (tested below).
+//! - **Landing**: the locomotion node's step (0x828071A8) and the blend
+//!   time function (0x8241FCA8) compare the action with 0xADCED6B8 and
+//!   0xC9592BE4, the hashes of `JumpLandMoving` and `JumpLandStationary`.
+//!   Where the action is set was not found (no code builds the two as
+//!   constants to store): which one a landing takes, moving or standing,
+//!   is inferred from the names.
+//! - **Throw** (0x8227E560): the action is `ThrowGrenadeRun`
+//!   (0xDFD8FAC6) when the thrower is moving (0x82282CC8: the pace bits of
+//!   its movement record above 1) and `ThrowGrenadeIdle` (0xE65AF5D5)
+//!   otherwise, and its `ActionDirection` is set from the angle between
+//!   the way the thrower faces and the way the throw goes, wrapped to half
+//!   a turn either way ([`throw_way`]): `Front` under 60 degrees, `Back`
+//!   over 120, else `Right` for an angle of 0 or more and `Left` below
+//!   (the degrees are the doubles at 0x820F9840 and 0x820F9838, times the
+//!   float pi/180 at 0x82DE2F08). The function's flag argument picks two
+//!   other actions (0x5B79336E, 0x79D780AF) that the stance and action
+//!   table has no row for; not named.
+//!
+//! From samples: the stance and action table's rows for these actions
+//! under `Upright`, and the on-foot table's rows for their handles (a
+//! throw's name `Grenade` in use and the gender `Hero`, with no row of a
+//! hero's own; a high bash's are upper body, a low bash's whole body).
+//!
+//! **Inferred**: which sign of the angle is the thrower's right. The
+//! program takes the facing's heading less the throw's; the beta's
+//! headings are taken to turn the same way.
+//!
+//! **The jump.** The beta plays one clip from the press until she lands
+//! (its "take-off", on the run or standing) and has a stand-in for when
+//! it has none (its "jump"). From samples, the tables give a jump four
+//! clips: `Upright` `JumpTakeoffMoving` or `JumpTakeoffStationary` (one
+//! clip for both, 0.17 to 0.20 s, with a `jump` event 0.10 s in),
+//! `Upright` `Jump` (0.93 to 0.97 s, the rise), `InAir` `Jump` (0.53 s,
+//! looping) and a landing. The beta's take-off slots are keyed to the
+//! rise, `Upright` `Jump`, which is the clip its running take-off always
+//! was (found by eye, it sat under another handle with the same rows);
+//! its standing take-off was a `DieAnimatedRagdoll` clip. The stand-in is
+//! keyed to `InAir` `Jump` (it was `Swim` `EnterSwim`'s).
+//!
+//! **Not traced**: who sets the take-off, landing and fall actions and in
+//! what order. No code in the 360 program builds their hashes to store
+//! them (only to compare: 0x82436A48, 0x8241FCA8, 0x828071A8; checked over
+//! the raw words of the whole image), so the setter takes them from loaded
+//! data. 0x82420208 answers the hash of `jump` (the event's and the
+//! action's alike) by sending the physics its jump message. So the
+//! 0.17 s wind-up before she leaves the ground, and the air loop after
+//! the rise, are not played: that would change the jump's timing on
+//! inference alone.
+
+//!
+//! # The locomotion nodes' handle lists
+//!
+//! From the 360 code: a person's animation driver builds one locomotion
+//! node for its stance (0x8241F878), all of one class (0x82802B10), and
+//! each stance's node is given its own list of 29 animation handles, which
+//! the node's binder (0x82804AE8) hands to its clips by position: 0 to 6
+//! the aim gaits, 7 to 11 the sprint, run, jog, walk and idle, 12 a second
+//! idle, 13 the fidget, 14 to 26 the sets blended in moving and standing,
+//! 27 and 28 the aim shuffles. The lists are `Upright`'s at 0x82B4DA98,
+//! `Carrying`'s at 0x82B4DB40 (read from its binder, 0x8280E978) and
+//! `Swim`'s at 0x82B4D978 (its binder, 0x827F98D8); `Crouched`'s is taken
+//! to be the one at 0x82B4DBC0, whose handles are the hashes of `Crouch_`
+//! names (its binder was not read). [`SWIM_GAITS`], [`CARRY_GAITS`] and
+//! [`CROUCH_GAITS`] are those lists' entries 11, 10, 9, 8 and 7. The
+//! swim's and the carry's handles are not named (no name is a string in
+//! the program, and none guessed hashes to them); the crouch's are named
+//! by their hashes (tested below).
+
+use m2_assets::name_hash;
+
+/// The `Swim` node's gait handles: still, walk, jog, and the run and
+/// sprint (one handle for both).
+pub const SWIM_GAITS: [u32; 4] = [0x3dcb_9682, 0x410a_acbc, 0x980d_a78a, 0x65a1_9525];
+
+/// The `Carrying` node's gait handles: still, walk, and the jog, run and
+/// sprint (one handle for the three).
+pub const CARRY_GAITS: [u32; 3] = [0x53ae_edeb, 0xde4d_3907, 0x2015_a258];
+
+/// The `Crouched` node's gaits when not aiming, by name: still, walk,
+/// jog, and the run and sprint (one handle for both); then its fidget.
+/// The beta plays none of them yet: its player crouches only aimed in
+/// ([`crate::on_foot::CROUCH_HOLD`]) and its soldiers do not crouch.
+pub const CROUCH_GAITS: [&str; 4] = [
+    "Crouch_Idle",
+    "Crouch_Walk_Forward",
+    "Crouch_Jog_Forward",
+    "Crouch_Run_Forward",
+];
+pub const CROUCH_FIDGET: &str = "Crouch_Fidget";
+
+/// A fight clip slot whose action the 360 code names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotAction {
+    /// The slot's name in the beta's logs.
+    pub slot: &'static str,
+    pub stance: &'static str,
+    pub action: &'static str,
+}
+
+/// The slots looked up forward, by stance and action.
+pub const SLOT_ACTIONS: [SlotAction; 7] = [
+    SlotAction {
+        slot: "take-off",
+        stance: "Upright",
+        action: "Jump",
+    },
+    SlotAction {
+        slot: "standing take-off",
+        stance: "Upright",
+        action: "Jump",
+    },
+    SlotAction {
+        slot: "jump",
+        stance: "InAir",
+        action: "Jump",
+    },
+    SlotAction {
+        slot: "land",
+        stance: "Upright",
+        action: "JumpLandMoving",
+    },
+    SlotAction {
+        slot: "standing land",
+        stance: "Upright",
+        action: "JumpLandStationary",
+    },
+    SlotAction {
+        slot: "bash",
+        stance: "Upright",
+        action: "MeleeBash",
+    },
+    SlotAction {
+        slot: "low bash",
+        stance: "Upright",
+        action: "MeleeBashLow",
+    },
+];
+
+/// The action of `slot`, if the 360 code names one.
+pub fn slot_action(slot: &str) -> Option<SlotAction> {
+    SLOT_ACTIONS.iter().copied().find(|a| a.slot == slot)
+}
+
+/// Which way a throw goes from the way the thrower faces: the stance and
+/// action table's `ActionDirection`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ThrowWay {
+    Front,
+    Back,
+    Left,
+    Right,
+}
+
+impl ThrowWay {
+    pub const ALL: [Self; 4] = [Self::Front, Self::Back, Self::Left, Self::Right];
+
+    /// The table's word for it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Front => "Front",
+            Self::Back => "Back",
+            Self::Left => "Left",
+            Self::Right => "Right",
+        }
+    }
+
+    /// The word's hash, as the table's cells hold it.
+    pub fn hash(self) -> u32 {
+        name_hash(self.name())
+    }
+}
+
+/// Under this the throw goes to the front, radians (60 degrees).
+pub const THROW_FRONT: f32 = 60.0 * std::f32::consts::PI / 180.0;
+/// Over this it goes to the back, radians (120 degrees).
+pub const THROW_BACK: f32 = 120.0 * std::f32::consts::PI / 180.0;
+
+/// The way a throw goes for `angle`, the thrower's heading less the
+/// throw's, radians (any size: wrapped to half a turn either way here).
+pub fn throw_way(angle: f32) -> ThrowWay {
+    use std::f32::consts::{PI, TAU};
+    let a = (angle + PI).rem_euclid(TAU) - PI;
+    if a.abs() < THROW_FRONT {
+        ThrowWay::Front
+    } else if a.abs() > THROW_BACK {
+        ThrowWay::Back
+    } else if a >= 0.0 {
+        ThrowWay::Right
+    } else {
+        ThrowWay::Left
+    }
+}
+
+/// The throw's action: on the move or standing.
+pub fn throw_action(moving: bool) -> &'static str {
+    if moving {
+        "ThrowGrenadeRun"
+    } else {
+        "ThrowGrenadeIdle"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The names hash to the words the program compares and stores.
+    #[test]
+    fn names_hash_to_the_programs_words() {
+        for (name, hash) in [
+            ("MeleeBash", 0x29ef_e0b5),
+            ("MeleeBashLow", 0x47bc_7419),
+            ("JumpLandMoving", 0xadce_d6b8),
+            ("JumpLandStationary", 0xc959_2be4),
+            ("ThrowGrenadeIdle", 0xe65a_f5d5),
+            ("ThrowGrenadeRun", 0xdfd8_fac6),
+            ("Front", 0xe4d5_3df6),
+            ("Back", 0xe490_c918),
+            ("Right", 0x1ca1_1cdd),
+            ("Left", 0x25f2_11ae),
+        ] {
+            assert_eq!(name_hash(name), hash, "{name}");
+        }
+        assert_eq!(throw_action(false), "ThrowGrenadeIdle");
+        assert_eq!(throw_action(true), "ThrowGrenadeRun");
+        assert_eq!(ThrowWay::Right.hash(), 0x1ca1_1cdd);
+    }
+
+    /// The crouched gaits' names hash to the list's entries 11, 10, 9 and
+    /// 8 (and 7), and the fidget's to entry 13.
+    #[test]
+    fn crouch_gait_names_hash_to_the_lists_handles() {
+        let list = [0xd491_dd44, 0x5e7a_dcc3, 0x3c16_5288, 0xbbf6_af9f];
+        assert_eq!(CROUCH_GAITS.map(name_hash), list);
+        assert_eq!(name_hash(CROUCH_FIDGET), 0x9b20_b655);
+        assert_eq!(name_hash("Upright_Fidget"), 0x700d_4de0);
+    }
+
+    #[test]
+    fn slots_have_one_action_each() {
+        assert_eq!(slot_action("bash").map(|a| a.action), Some("MeleeBash"));
+        assert_eq!(
+            slot_action("low bash").map(|a| a.action),
+            Some("MeleeBashLow")
+        );
+        assert_eq!(slot_action("take-off").map(|a| a.action), Some("Jump"));
+        assert_eq!(slot_action("jump").map(|a| a.stance), Some("InAir"));
+        assert_eq!(slot_action("die"), None);
+        for (i, a) in SLOT_ACTIONS.iter().enumerate() {
+            assert!(SLOT_ACTIONS[..i].iter().all(|b| b.slot != a.slot));
+        }
+    }
+
+    #[test]
+    fn throw_way_follows_the_angle() {
+        let deg = |d: f32| d.to_radians();
+        assert_eq!(throw_way(0.0), ThrowWay::Front);
+        assert_eq!(throw_way(deg(59.0)), ThrowWay::Front);
+        assert_eq!(throw_way(deg(-59.0)), ThrowWay::Front);
+        assert_eq!(throw_way(deg(61.0)), ThrowWay::Right);
+        assert_eq!(throw_way(deg(119.0)), ThrowWay::Right);
+        assert_eq!(throw_way(deg(-61.0)), ThrowWay::Left);
+        assert_eq!(throw_way(deg(-119.0)), ThrowWay::Left);
+        assert_eq!(throw_way(deg(121.0)), ThrowWay::Back);
+        assert_eq!(throw_way(deg(-121.0)), ThrowWay::Back);
+        assert_eq!(throw_way(deg(180.0)), ThrowWay::Back);
+        // Wrapped: 350 degrees is 10 the other way.
+        assert_eq!(throw_way(deg(350.0)), ThrowWay::Front);
+        assert_eq!(throw_way(deg(270.0)), ThrowWay::Left);
+        assert_eq!(throw_way(deg(-270.0)), ThrowWay::Right);
+    }
+}

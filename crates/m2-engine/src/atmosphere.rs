@@ -140,6 +140,9 @@ pub struct Atmosphere {
     /// `LightMultiplier_X`..`_Z`: the sunlight's colour (1, 0.85, 0.8 in
     /// the islands' evening records).
     pub light_color: Vec3,
+    /// `SunEmissiveColor_X`..`_Z`: the sun disc's colour, before the code
+    /// scales it by the sunlight and 32 ([`Atmosphere::sun_disc`]).
+    pub sun_emissive: Vec3,
     /// `InterpolateTime`: seconds the change to these settings takes.
     pub interpolate_time: f32,
     /// `Water0`..`2_Color1`/`Color2`: the water's colour and opacity by
@@ -397,6 +400,11 @@ impl Atmosphere {
                 float("LightMultiplier_Y").unwrap_or(1.0),
                 float("LightMultiplier_Z").unwrap_or(1.0),
             ),
+            sun_emissive: Vec3::new(
+                float("SunEmissiveColor_X").unwrap_or(0.0),
+                float("SunEmissiveColor_Y").unwrap_or(0.0),
+                float("SunEmissiveColor_Z").unwrap_or(0.0),
+            ),
             interpolate_time: float("InterpolateTime").unwrap_or(0.0),
             // Every record's ramp is taken, as the game's composite shader
             // always blends the frame towards its monochrome map. Earlier
@@ -507,6 +515,7 @@ impl Atmosphere {
             cloud_scales: std::array::from_fn(|i| f(self.cloud_scales[i], to.cloud_scales[i])),
             wind: std::array::from_fn(|i| f(self.wind[i], to.wind[i])),
             light_color: v(self.light_color, to.light_color),
+            sun_emissive: v(self.sun_emissive, to.sun_emissive),
             interpolate_time: to.interpolate_time,
             tone_map: match (self.tone_map, to.tone_map) {
                 (Some(a), Some(b)) => Some(ToneMap {
@@ -646,6 +655,15 @@ impl Atmosphere {
         -towards_sun(self.light_time[0])
     }
 
+    /// The sun disc's colour (display values): `SunEmissiveColor` times
+    /// the sunlight ([`Atmosphere::sun_light`]) times 32, which the code
+    /// puts in the disc's material as its emissive colour each frame
+    /// (from the 360 code, 0x821CDCA0, constant at 0x820F8BE8) and the
+    /// disc's pixel shader draws flat (the install's shader 484).
+    pub fn sun_disc(&self) -> Vec3 {
+        (self.sun_emissive * self.sun_light() * 32.0).max(Vec3::ZERO)
+    }
+
     /// The way the sun's shadows are cast: the game reckons a second sun
     /// at `0.8 LightTime + 0.1`, never lower than a tenth of a half turn
     /// (18 degrees), and hands its way to the shadow maps (from the 360
@@ -665,6 +683,7 @@ impl Atmosphere {
         lighting.rim_threshold = self.rim_threshold;
         lighting.sun_direction = self.sun_direction();
         lighting.shadow_direction = Some(self.shadow_direction());
+        lighting.sun_disc = self.sun_disc();
         // `M2_LIGHTING=linear` sums the light in linear light, with the
         // sun's colour taken as linear, as before, for comparison.
         lighting.gamma_light = gamma_light();
@@ -1266,6 +1285,7 @@ mod tests {
             cloud_scales: [1.0; 3],
             wind: [0.0; 2],
             light_color: Vec3::ONE,
+            sun_emissive: Vec3::ZERO,
             interpolate_time,
             water_ramp: None,
             tone_map: None,
@@ -1362,6 +1382,21 @@ mod tests {
         assert!(h.rayleigh.z / h.mie.z > 1.9);
     }
 
+    #[test]
+    fn the_sun_disc_is_its_emissive_colour_times_sunlight_times_32() {
+        let a = Atmosphere {
+            light_intensity: 1.15,
+            sun_emissive: Vec3::splat(0.06),
+            ..plain(0.2, 0.0)
+        };
+        let want = Vec3::splat(0.06) * a.sun_light() * 32.0;
+        assert!((a.sun_disc() - want).abs().max_element() < 1e-5);
+        // The island's default: about 2.5 to 2.8 in each channel.
+        assert!(a.sun_disc().min_element() > 2.4 && a.sun_disc().max_element() < 2.9);
+        let mut lighting = Lighting::default();
+        a.apply(&mut lighting);
+        assert_eq!(lighting.sun_disc, a.sun_disc());
+    }
     #[test]
     fn the_sun_takes_the_codes_path() {
         // At LightTime 0 the sun is on the horizon over SUN_SETS; at 1 on
