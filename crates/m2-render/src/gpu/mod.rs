@@ -40,13 +40,13 @@ pub use ::wgpu;
 
 /// Bytes of a draw's uniforms: its world matrix, then the first palette
 /// matrix and the palette length, then the same for its instances, then
-/// its texture coordinate offset. The frame's draws lie one after another
+/// its texture coordinate offset, then its tint. The frame's draws lie one after another
 /// in one storage buffer, and each instance drawn has a slot (the draw's
 /// index and its instance's) in another: a draw is drawn with its first
 /// slot as its first instance, so its vertices find their uniforms from
 /// the instance index, and no bind group changes between draws. Binding
 /// one per draw cost the CPU about 8 ms a frame of 10,000 draws.
-const DRAW_UNIFORM_SIZE: u64 = 96;
+const DRAW_UNIFORM_SIZE: u64 = 112;
 /// Bytes of an instance's slot: its draw's index and its own.
 const SLOT_SIZE: u64 = 8;
 /// Bone matrices the palette buffer starts with.
@@ -98,6 +98,12 @@ const SEA_MIRROR_REACH: f32 = 600.0;
 /// 256 and 1,000 km), and its blue matches PC footage (B/R 1.32 against
 /// 1.27-1.35).
 const SKY_QUAD: f32 = 64000.0;
+
+/// The cosine of the sun disc's angular radius: the game draws a 64-sided
+/// disc of radius 0.8 at 16 m along the sun's way (from the 360 code: the
+/// disc built at 0x821D0538, placed and scaled at 0x821D0A28), about
+/// 2.86 degrees. Taken as a circle (its sides lie within 0.12% of it).
+const SUN_DISC_COS: f32 = 0.998_752_3;
 
 /// A generational slot map, as in the null backend.
 #[derive(Debug)]
@@ -287,6 +293,9 @@ struct FrameUniforms {
     lights: [[f32; 4]; 2 * POINT_LIGHTS],
     /// x: how many of them.
     light_info: [f32; 4],
+    /// The sun's disc: rgb its colour (display values, black for none),
+    /// w the cosine of its angular radius ([`SUN_DISC_COS`]).
+    sun_disc: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -2331,6 +2340,7 @@ impl WgpuBackend {
                 0.0,
                 0.0,
             ],
+            sun_disc: l.sun_disc.extend(SUN_DISC_COS).to_array(),
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
@@ -2385,7 +2395,33 @@ impl WgpuBackend {
         mark(&mut encoder, 2);
         self.encode_glows(&mut encoder, draws)?;
         mark(&mut encoder, 3);
-        self.post.encode(&self.queue, &mut encoder, l, target);
+        // The sun flare: its texture, and where its point (the sun's way
+        // times SUN_FLARE_DISTANCE, as the game's code places it) lands
+        // on screen, when in front and its square overlaps the screen.
+        if let Some(h) = l.flare_map
+            && let Ok(t) = self.textures.get(h.0)
+        {
+            self.post.set_flare_map(&self.device, h, &t.view);
+        }
+        let sun = {
+            let point = -l.sun_direction.normalize_or_zero() * post::SUN_FLARE_DISTANCE;
+            let clip = view.projection * view.view * point.extend(1.0);
+            (clip.w > 0.0 && l.flare_map.is_some())
+                .then(|| {
+                    let ndc = clip.truncate().truncate() / clip.w;
+                    [(ndc.x + 1.0) * 0.5, 0.5 - 0.5 * ndc.y]
+                })
+                .filter(|[x, y]| {
+                    let (w, h) = self.size();
+                    let (w, h) = (w as f32, h as f32);
+                    let half = 0.41 * h;
+                    x * w + half >= 0.0
+                        && x * w - half <= w
+                        && y * h + half >= 0.0
+                        && y * h - half <= h
+                })
+        };
+        self.post.encode(&self.queue, &mut encoder, l, target, sun);
         mark(&mut encoder, 4);
         if let Some(t) = timer {
             t.end(&mut encoder);
@@ -2758,9 +2794,10 @@ impl RenderBackend for WgpuBackend {
         uniforms.extend_from_slice(bytemuck::cast_slice(&[
             call.uv_offset[0],
             call.uv_offset[1],
-            0.0,
+            if call.beams_lit { 1.0 } else { 0.0 },
             0.0,
         ]));
+        uniforms.extend_from_slice(bytemuck::cast_slice(&call.tint));
         let index = frame.draws.len() as u32;
         let first_slot = frame.slots.len() as u32;
         frame

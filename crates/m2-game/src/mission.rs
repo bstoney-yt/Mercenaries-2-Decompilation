@@ -1394,6 +1394,12 @@ impl Mission {
         self.world.borrow_mut().hijack.set_hardpoint(guid, name, at);
     }
 
+    /// What `cargo` hangs on: the carrier whose winch has it
+    /// (`Object.IsWinched`), or none.
+    pub fn set_winched(&mut self, cargo: u32, carrier: Option<u32>) {
+        self.world.borrow_mut().winch.insert(cargo, carrier);
+    }
+
     /// `guid` (a helicopter) has a winch in this state (0 retracted, 1
     /// deployed, 2 deploying, 3 retracting: `Object.GetWinchState`), or
     /// none.

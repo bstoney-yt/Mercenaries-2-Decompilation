@@ -2922,8 +2922,20 @@ impl Combat {
     /// One fixed tick: her weapons, the soldiers' shots, projectiles,
     /// health and effects.
     pub fn step(&mut self, f: &mut Field<'_>, trigger: Trigger, dt: f32) {
+        // A fall that hurt her ([`m2_engine::on_foot::fall_impact`]).
+        if let Some(fell) = f.player.fell.take() {
+            self.hurt_player(f, fell.damage, None);
+        }
         self.went_off.clear();
         self.struck.clear();
+        // Up again (revived, respawned, or put on her feet by a script):
+        // her limp body goes. The state table's `Resurrect` leads from
+        // `Die` and `Dead` straight to `Upright` `Idle`.
+        if !f.player.down
+            && let Some(id) = f.player.ragdoll.take()
+        {
+            f.physics.remove_ragdoll(id);
+        }
         for e in &mut self.effects {
             e.1 -= dt;
         }
@@ -3346,8 +3358,15 @@ impl Combat {
                 kind: round_kind(ammo.key),
             });
         }
-        if let Some((_, Some(j))) = hit
-            && self.round_on_person(f.people, j, (damage, ammo.hero), ammo.key, aim * SHOT_PUSH)
+        if let Some((d, Some(j))) = hit
+            && self.round_on_person(
+                f.people,
+                j,
+                (damage, ammo.hero),
+                ammo.key,
+                aim * SHOT_PUSH,
+                Some(from + aim * d),
+            )
         {
             self.remarks.push(Remark::Kill);
         }
@@ -3417,10 +3436,17 @@ impl Combat {
             // What it does to people: its `Damage` times the damage
             // table's cell for their `ModifierKey` and its `DamageKey`,
             // against their template's `Health`.
-            if let Some((_, Some(i))) = hit {
+            if let Some((d, Some(i))) = hit {
                 let key = ammo.and_then(|a| a.key);
                 let hero = ammo.map_or(1.0, |a| a.hero);
-                killed |= self.round_on_person(f.people, i, (damage, hero), key, dir * SHOT_PUSH);
+                killed |= self.round_on_person(
+                    f.people,
+                    i,
+                    (damage, hero),
+                    key,
+                    dir * SHOT_PUSH,
+                    Some(eye + dir * d),
+                );
             }
             if self.rifle.pellets > 1 {
                 self.effect(Effect::Tracer { from, to }, 0.05);
@@ -3729,10 +3755,31 @@ impl Combat {
             self.down = DOWN_TIME;
             f.player.down = true;
             f.player.aiming = false;
-            if let (Some(die), Some((_, rig))) = (f.player.clips.die, &mut f.player.model) {
+            // On foot the 360 posts her `Die` (0x82287F98, when no hit's
+            // direction is picked), whose action has no clip and the mode
+            // `FULL`: she goes limp where she stands. The beta does not
+            // record where a hit landed on her, so it is always the plain
+            // death; the clip played here before (479c4a51) is `Upright`
+            // `ProneTransition`'s by the tables, not a death. In a
+            // vehicle the 360 goes by a mode of the seat, not traced:
+            // there the old clip still plays.
+            let on_foot = f.player.driving.is_none() && !f.player.seated;
+            let body = f.player.model_matrix();
+            if let Some((_, rig)) = &mut f.player.model {
                 rig.animator.set_upper(None);
                 rig.two_handed = false;
-                rig.animator.play_once(die);
+                if on_foot {
+                    let (nodes, _) = rig.posed();
+                    let world: Vec<Mat4> = nodes.iter().map(|m| body * *m).collect();
+                    // Limp from rest: what shove the 360 gives the body
+                    // was not traced.
+                    let id = f
+                        .physics
+                        .add_ragdoll(&rig.skeleton.parents, &world, Vec3::ZERO);
+                    f.player.ragdoll = Some(id);
+                } else if let Some(die) = f.player.clips.die {
+                    rig.animator.play_once(die);
+                }
             }
             f.people.stand_down();
         } else {
@@ -4039,13 +4086,14 @@ impl Combat {
                     self.effect(Effect::Tracer { from, to }, 0.07);
                     let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
                     let on_props = RIFLE_DAMAGE * damage / CARBINE_ROUND;
-                    if let Some((_, Some(j))) = hit
+                    if let Some((d, Some(j))) = hit
                         && self.round_on_person(
                             f.people,
                             j,
                             (damage, ammo.hero),
                             ammo.key,
                             aim * SHOT_PUSH,
+                            Some(from + aim * d),
                         )
                     {
                         self.remarks.push(Remark::Kill);
@@ -4654,8 +4702,15 @@ impl Combat {
             let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
             self.effect(Effect::Tracer { from, to }, 0.07);
             let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
-            if let Some((_, Some(j))) = hit
-                && self.round_on_person(f.people, j, (damage, ammo.hero), ammo.key, aim * SHOT_PUSH)
+            if let Some((d, Some(j))) = hit
+                && self.round_on_person(
+                    f.people,
+                    j,
+                    (damage, ammo.hero),
+                    ammo.key,
+                    aim * SHOT_PUSH,
+                    Some(from + aim * d),
+                )
             {
                 self.remarks.push(Remark::Kill);
             }
@@ -5631,7 +5686,9 @@ impl Combat {
     /// Her round of `damage` (its `Damage` at that range) and `DamageKey`
     /// `key` striking person `j`, shoving the body `push` if it kills:
     /// they take what [`on_person`](Self::on_person) gives of it. True if
-    /// it killed a soldier.
+    /// it killed a soldier. `at` is where it struck them, where the shot
+    /// knows: the hit a death's direction is read from
+    /// ([`m2_engine::death`]).
     fn round_on_person(
         &mut self,
         people: &mut People,
@@ -5639,8 +5696,10 @@ impl Combat {
         (damage, hero): (f32, f32),
         key: Option<u32>,
         push: Vec3,
+        at: Option<Vec3>,
     ) -> bool {
         let taken = damage * hero * self.on_person(&people.npcs[j], key);
+        people.npcs[j].last_hit = at.map(|p| (p, push));
         if self.crew_firing {
             let killed = people.npcs[j].shot_by_army(taken, push, 0);
             people.war_tally.1 += 1;
@@ -7147,6 +7206,61 @@ mod tests {
         assert_eq!(vehicles[0].rounds(), None);
     }
 
+    /// Her limp body lasts while she is down and goes when she is up
+    /// again, whatever put her back on her feet.
+    #[test]
+    fn her_limp_body_goes_when_she_is_up_again() {
+        let mut physics = ground();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut explosives = [];
+        let mut combat = Combat::default();
+        let doll = physics.add_ragdoll(&[None], &[Mat4::IDENTITY], Vec3::ZERO);
+        player.ragdoll = Some(doll);
+        player.down = true;
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut explosives,
+        };
+        combat.step(&mut field, Trigger::default(), 1.0 / 60.0);
+        assert_eq!(field.player.ragdoll, Some(doll), "kept while she is down");
+        assert!(field.physics.ragdoll_nodes(doll).is_some());
+        field.player.down = false;
+        combat.step(&mut field, Trigger::default(), 1.0 / 60.0);
+        assert_eq!(field.player.ragdoll, None);
+        assert!(field.physics.ragdoll_nodes(doll).is_none());
+    }
+
+    /// Killed on foot with no body loaded there is nothing to go limp;
+    /// she is down all the same.
+    #[test]
+    fn a_death_without_a_body_is_still_a_death() {
+        let mut physics = ground();
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut explosives = [];
+        let mut combat = Combat::default();
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut explosives,
+        };
+        combat.hurt_player(&mut field, 1.0e6, None);
+        assert!(field.player.down);
+        assert_eq!(field.player.ragdoll, None);
+    }
+
     #[test]
     fn fuel_tanks_go_off_one_after_another() {
         let mut physics = ground();
@@ -7426,11 +7540,11 @@ mod tests {
         // The carbine's round (6 to 15 m, `HeroMultiplier` 3): a deathsquad
         // mook's 75 health goes in 5 hits.
         let kills: Vec<bool> = (0..5)
-            .map(|_| combat.round_on_person(&mut people, 0, (6.0, 3.0), None, Vec3::ZERO))
+            .map(|_| combat.round_on_person(&mut people, 0, (6.0, 3.0), None, Vec3::ZERO, None))
             .collect();
         assert_eq!(kills.iter().filter(|k| **k).count(), 1);
         assert!(kills[4]);
-        combat.round_on_person(&mut people, 1, (6.0, 3.0), None, Vec3::ZERO);
+        combat.round_on_person(&mut people, 1, (6.0, 3.0), None, Vec3::ZERO, None);
         assert!((people.npcs[1].hp - (75.0 - 6.0 * 3.0 * 0.25)).abs() < 1e-4);
         assert_eq!((combat.tally.hits, combat.tally.kills), (6, 1));
     }

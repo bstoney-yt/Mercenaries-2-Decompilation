@@ -259,6 +259,45 @@ impl Physics {
         }
     }
 
+    /// Where vehicle `cargo` hangs from with no `ConnectPoint` of its own
+    /// found (0x82197C28), in its hull's space: over the middle of its
+    /// box (its bodies' shapes, 0x82182E90), two rays through the box's
+    /// height and as much again (from below up, from above down) against
+    /// its hull's shapes; the hit nearest `hook` (world space), else the
+    /// middle of the box's top.
+    pub fn cargo_hang_point(&self, cargo: VehicleId, hook: Vec3) -> Option<Vec3> {
+        let chassis = self.vehicles.get(cargo.0)?.as_ref()?.controller.chassis;
+        let (pose, b) = self.vehicle_box(chassis)?;
+        let (lo, hi) = (vec3(b.mins), vec3(b.maxs));
+        let mid = (lo + hi) * 0.5;
+        let h = hi.y - lo.y;
+        let mut best: Option<(f32, Vec3)> = None;
+        for (from, to) in [(mid.y - h, mid.y + h), (mid.y + h, mid.y - h)] {
+            let start = Vec3::new(mid.x, from, mid.z);
+            let end = Vec3::new(mid.x, to, mid.z);
+            let ray = r::Ray::new(vector(start), vector(end - start));
+            let body = self.world.bodies.get(chassis)?;
+            let hit = body
+                .colliders()
+                .iter()
+                .filter_map(|&c| self.world.colliders.get(c))
+                .filter_map(|c| {
+                    let local = pose.inv_mul(c.position());
+                    c.shape().cast_ray(&local, &ray, 1.0, true)
+                })
+                .min_by(f32::total_cmp);
+            let Some(t) = hit.filter(|t| *t < 1.0) else {
+                continue;
+            };
+            let at = start + (end - start) * t;
+            let d = vec3(pose.transform_point(vector(at))).distance_squared(hook);
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, at));
+            }
+        }
+        Some(best.map_or(Vec3::new(mid.x, hi.y, mid.z), |(_, at)| at))
+    }
+
     /// Whether cargo is on it.
     pub fn cable_has_cargo(&self, id: CableId) -> bool {
         self.cable(id).is_some_and(|c| c.cargo.is_some())
@@ -301,6 +340,37 @@ mod tests {
         assert_eq!(p.cable_links(c), 6);
         p.cable_reel_in(c, 10);
         assert_eq!((p.cable_links(c), p.cable_hook(c)), (0, None));
+    }
+
+    #[test]
+    fn cargo_with_no_connect_point_hangs_from_its_box_s_face_nearest_the_hook() {
+        // 0x82197C28: rays up and down the middle of its box; the hit
+        // nearest the hook.
+        let p = {
+            let mut p = Physics::new();
+            p.add_vehicle(&crate::physics::tests::car(), Vec3::ZERO, 0.0);
+            p
+        };
+        let cargo = VehicleId(0);
+        let chassis = p.vehicles[0].as_ref().unwrap().controller.chassis;
+        let (_, b) = p.vehicle_box(chassis).unwrap();
+        let (lo, hi) = (vec3(b.mins), vec3(b.maxs));
+        let mid = (lo + hi) * 0.5;
+        let top = p
+            .cargo_hang_point(cargo, Vec3::new(0.0, 20.0, 0.0))
+            .unwrap();
+        assert!(
+            (top - Vec3::new(mid.x, hi.y, mid.z)).length() < 1e-3,
+            "{top} {hi}"
+        );
+        let under = p
+            .cargo_hang_point(cargo, Vec3::new(0.0, -20.0, 0.0))
+            .unwrap();
+        assert!(
+            (under - Vec3::new(mid.x, lo.y, mid.z)).length() < 1e-3,
+            "{under} {lo}"
+        );
+        assert_eq!(p.cargo_hang_point(VehicleId(5), Vec3::ZERO), None);
     }
 
     #[test]
