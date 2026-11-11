@@ -4005,15 +4005,22 @@ impl Physics {
                 .ccd_enabled(true),
         );
         // A tank's, boat's or helicopter's: its chassis body's, as the 360
-        // code sets it (see [`chassis_mass`]). Without one (a model with no
-        // `PHY2` chassis, a car with no template): mass low in the hull and
-        // inertia a little above a solid box's, invented.
+        // code sets it (see [`chassis_mass`]). A car's is its template's
+        // `Mass`, else its `PHY2` chassis record's: the body builder keeps
+        // the record's mass when handed none above 0 (0x82182848). Only a
+        // model with neither (no template, no `PHY2` chassis) keeps the
+        // invented mass by kind. Its inertia, without a chassis body: a
+        // little above a solid box's, invented.
         let chassis = spec
             .chassis
             .as_ref()
             .filter(|_| spec.tracked || spec.wheels.is_empty())
             .map(|c| chassis_mass(c, spec.tuning.mass));
-        let m = chassis.map_or(spec.mass, |c| c.0);
+        let m = chassis
+            .map(|c| c.0)
+            .or(spec.tuning.mass)
+            .or(spec.chassis.map(|c| c.mass).filter(|m| *m > 0.0))
+            .unwrap_or(spec.mass);
         let size = half * 2.0;
         let inertia = Vec3::new(
             size.y * size.y + size.z * size.z,
@@ -7650,6 +7657,33 @@ mod tests {
             wreck: None,
             tuning: crate::VehicleTuning::default(),
         }
+    }
+
+    #[test]
+    fn a_car_without_a_template_mass_keeps_its_chassis_record_s() {
+        // 0x82182848: a body builder handed no mass above 0 keeps its
+        // `PHY2` record's; a template's `Mass` replaces it.
+        let mass = |p: &Physics, id: VehicleId| p.vehicles[id.0].as_ref().unwrap().mass;
+        let record = crate::vehicle::Chassis {
+            mass: 5000.0,
+            inertia: Mat3::from_diagonal(Vec3::new(4000.0, 5000.0, 2000.0)),
+            centre_of_mass: Vec3::new(0.0, 0.5, 0.0),
+        };
+        let mut p = Physics::new();
+        let bare = VehicleSpec {
+            chassis: Some(record),
+            ..car()
+        };
+        let id = p.add_vehicle(&bare, Vec3::ZERO, 0.0);
+        assert_eq!(mass(&p, id), 5000.0);
+        let mut tuned = bare.clone();
+        tuned.tuning.mass = Some(1500.0);
+        tuned.mass = 1500.0;
+        let id = p.add_vehicle(&tuned, Vec3::new(10.0, 0.0, 0.0), 0.0);
+        assert_eq!(mass(&p, id), 1500.0);
+        // Neither: the mass by kind it was made with.
+        let id = p.add_vehicle(&car(), Vec3::new(20.0, 0.0, 0.0), 0.0);
+        assert_eq!(mass(&p, id), car().mass);
     }
 
     fn boat() -> VehicleSpec {
