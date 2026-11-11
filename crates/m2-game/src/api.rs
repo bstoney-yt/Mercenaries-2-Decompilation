@@ -881,6 +881,9 @@ pub struct ScriptWorld {
     pub reports: crate::report::Reports,
     /// The pursuit as the scripts set it ([`Pursuit`]).
     pub pursuit: Pursuit,
+    /// The engine's game and real clocks (`Sys.MainTime`, the time
+    /// stamps), stepped each frame.
+    pub clocks: crate::script_time::Clocks,
     /// Strikes and designators under way.
     pub strikes: crate::airstrike::Strikes,
     /// Whether vehicle disguises work (`Player.SetVehicleDisguise`): the
@@ -3665,6 +3668,27 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    {
+        use crate::script_time::{self as t, ClockKind};
+        add(&sys, "MainTime", |w, _, _| {
+            Ok(t::time(&w.clocks, ClockKind::Main))
+        })?;
+        add(&sys, "RealTime", |w, _, _| {
+            Ok(t::time(&w.clocks, ClockKind::Real))
+        })?;
+        add(&sys, "MainTimeStamp", |w, lua, _| {
+            t::stamp(lua, &w.clocks, ClockKind::Main)
+        })?;
+        add(&sys, "RealTimeStamp", |w, lua, _| {
+            t::stamp(lua, &w.clocks, ClockKind::Real)
+        })?;
+        add(&sys, "TimeStampMark", |w, _, a| t::mark(&w.clocks, a))?;
+        add(&sys, "TimeStampGetElapsed", |w, _, a| {
+            t::elapsed(&w.clocks, a)
+        })?;
+        add(&sys, "Clock", |_, _, _| Ok(t::clock()))?;
+        add(&sys, "DiffTime", |_, _, a| t::diff_time_native(a))?;
+    }
     add(&sys, "GetLevelName", |_, lua, _| {
         values([Value::String(lua.create_string("vz")?)])
     })?;
