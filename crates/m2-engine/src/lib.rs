@@ -54,6 +54,7 @@ pub mod physics;
 pub mod pickup;
 pub mod population;
 pub mod reverb;
+pub mod road_driver;
 pub mod road_graph;
 pub mod road_ring;
 pub mod scatter;
