@@ -1541,7 +1541,7 @@ impl Game {
                         physics.right_vehicle(id);
                     }
                 }
-                physics.step(dt);
+                physics.step_frame(dt);
                 match id.and_then(|(id, v)| Some((physics.vehicle_transform(id)?, v, id))) {
                     Some((at, v, id)) => {
                         let speed = physics.vehicle_speed(id);
@@ -1648,7 +1648,7 @@ impl Game {
                 }
             } else {
                 self.halts.clear();
-                physics.step(dt);
+                physics.step_frame(dt);
             }
         }
         split("game: player and physics");
