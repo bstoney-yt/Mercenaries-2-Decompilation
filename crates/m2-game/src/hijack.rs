@@ -415,6 +415,10 @@ fn on(v: Option<&Value>) -> bool {
     matches!(v, Some(Value::Boolean(true)))
 }
 
+/// The Lua registry name the hijack's script object is kept by
+/// (`Vehicle.HijackStart`'s fourth argument).
+pub const HIJACK_SCRIPT: &str = "m2.hijack_script";
+
 /// Installs the engine calls the hijack scripts make, over `world`. Run
 /// after the other libraries are in (it adds to them).
 pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
@@ -482,8 +486,12 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             let seconds = num(a.get(1)).unwrap_or(0.0);
             w.commands
                 .push(Command::Hijack(HijackCommand::Knockdown { guid, seconds }));
+            // From the 360 code (0x82324d28): whether it is a person (with a
+            // state machine to knock down).
+            let person = w.objects.contains_key(&guid);
+            return Ok(MultiValue::from_vec(vec![Value::Boolean(person)]));
         }
-        Ok(MultiValue::new())
+        Ok(MultiValue::from_vec(vec![Value::Nil]))
     })?;
 
     let object = lib("Object")?;
@@ -497,8 +505,10 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
                     channel: text(a.get(3)).unwrap_or_default(),
                     blend: num(a.get(4)).unwrap_or(0.0),
                 }));
+            // From the 360 code (0x82332370): true once it plays.
+            return Ok(MultiValue::from_vec(vec![Value::Boolean(true)]));
         }
-        Ok(MultiValue::new())
+        Ok(MultiValue::from_vec(vec![Value::Nil]))
     })?;
     add(&object, "StopAnimationChannel", |w, _, a| {
         if let Some(guid) = id(a.first()) {
@@ -519,13 +529,23 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
         else {
             return Ok(MultiValue::from_vec(vec![Value::Nil, Value::Nil]));
         };
+        // From the 360 code (`Object.Attach(parent, bone, child)`,
+        // 0x82332750): a template's id makes a new object from it (the
+        // hijacks' "attaching pistol": they keep the guid it answers); an
+        // object in play is attached itself. Either way it answers true and
+        // the attached object.
+        let template = (crate::api::FIRST_TEMPLATE..crate::api::FIRST_SPAWNED).contains(&child);
         let name = w.objects.get(&child).map(|o| o.name.clone());
         let at = w.objects.get(&parent).map(|o| o.position);
         let prop = match (name, at) {
-            (Some(name), Some(at)) => Some(w.spawn(name, at, 0.0)),
+            (Some(name), Some(at)) if template => Some(w.spawn(name, at, 0.0)),
+            (Some(_), Some(_)) => Some(child),
             _ => None,
         };
         if let Some(prop) = prop {
+            // The link table's record (0x823d9e10 from 0x82332750):
+            // the bone's hash and the child ([`crate::links`]).
+            w.links.attach(parent, m2_assets::name_hash(&bone), prop);
             w.commands.push(Command::Hijack(HijackCommand::Attach {
                 parent,
                 bone,
@@ -537,12 +557,20 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             prop.map_or(Value::Nil, guid_value),
         ]))
     })?;
+    // From the 360 code (0x823328b8): whether it let go of something; no
+    // child is false (inferred here: anything named is let go of; the 360
+    // raises an error for a child that isn't on that parent).
     add(&object, "Detach", |w, _, a| {
-        if let (Some(parent), Some(prop)) = (id(a.first()), id(a.get(1))) {
-            w.commands
-                .push(Command::Hijack(HijackCommand::Detach { parent, prop }));
-        }
-        Ok(MultiValue::new())
+        let Some(parent) = id(a.first()) else {
+            return Ok(MultiValue::from_vec(vec![Value::Nil]));
+        };
+        let Some(prop) = id(a.get(1)) else {
+            return Ok(MultiValue::from_vec(vec![Value::Boolean(false)]));
+        };
+        w.links.detach(parent, prop);
+        w.commands
+            .push(Command::Hijack(HijackCommand::Detach { parent, prop }));
+        Ok(MultiValue::from_vec(vec![Value::Boolean(true)]))
     })?;
     for (name, flag) in [("DisablePhysics", false), ("EnablePhysics", true)] {
         let w = std::rc::Rc::clone(world);
@@ -567,8 +595,12 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             }
             w.commands
                 .push(Command::Hijack(HijackCommand::Visible { guid, on }));
+            // From the 360 code (0x823319b0): whether it has a model to
+            // show or hide (here: whether it is known).
+            let known = w.objects.contains_key(&guid);
+            return Ok(MultiValue::from_vec(vec![Value::Boolean(known)]));
         }
-        Ok(MultiValue::new())
+        Ok(MultiValue::from_vec(vec![Value::Nil]))
     })?;
 
     // (object, name): a hardpoint's place, as the game last gave it; else
@@ -604,7 +636,9 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             w.commands
                 .push(Command::Hijack(HijackCommand::Ai { guid, on }));
         }
-        Ok(MultiValue::new())
+        // From the 360 code (0x82311898): whether there was an AI.
+        let there = id(a.first()).is_some_and(|g| w.objects.contains_key(&g));
+        Ok(MultiValue::from_vec(vec![Value::Boolean(there)]))
     })?;
 
     let vehicle = lib("Vehicle")?;
@@ -615,13 +649,20 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             let on = on(a.get(2));
             w.commands
                 .push(Command::Hijack(HijackCommand::Turret { guid, turret, on }));
+            // From the 360 code (0x82347ba0): true.
+            return Ok(MultiValue::from_vec(vec![Value::Boolean(true)]));
         }
-        Ok(MultiValue::new())
+        Ok(MultiValue::from_vec(vec![Value::Nil]))
     })?;
-    add(&vehicle, "HijackStart", |w, _, a| {
+    // 0x82348488: (hijacker, hijackee, vehicle, script): the script object
+    // is kept by a registry reference (0x82306FF8) in the hijacker's
+    // `RuntimeHijackState` (0x836583EC), which `Vehicle.CancelHijack`
+    // hands to `MrxActionHijack.ActionHijackCancel`.
+    add(&vehicle, "HijackStart", |w, lua, a| {
         if let (Some(hero), Some(driver), Some(vehicle)) =
             (id(a.first()), id(a.get(1)), id(a.get(2)))
         {
+            lua.set_named_registry_value(HIJACK_SCRIPT, a.get(3).cloned().unwrap_or(Value::Nil))?;
             w.hijack.current = Some((hero, driver, vehicle));
             w.commands.push(Command::Hijack(HijackCommand::Started {
                 hero,
@@ -632,6 +673,36 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
         Ok(MultiValue::new())
     })?;
     // The hijacker takes the driver's seat.
+    // 0x823486D8: with a hijack under way by `character` (its
+    // `RuntimeHijackState`, 0x83658404), calls
+    // `MrxActionHijack.ActionHijackCancel(script)` with the script object
+    // the hijack started with; nothing returned. Its one caller in the
+    // scripts is co-op's player-left handler.
+    {
+        let w = std::rc::Rc::clone(world);
+        vehicle.raw_set(
+            "CancelHijack",
+            safe_function(lua, move |lua, args| {
+                let Some(character) = id(args.iter().next()) else {
+                    return Err(mlua::Error::runtime("Vehicle.CancelHijack: bad argument"));
+                };
+                let hijacking = w
+                    .borrow()
+                    .hijack
+                    .current
+                    .is_some_and(|(hero, _, _)| hero == character);
+                if hijacking {
+                    let script: Value = lua.named_registry_value(HIJACK_SCRIPT)?;
+                    if let Value::Table(m) = lua.globals().get::<Value>("MrxActionHijack")?
+                        && let Value::Function(f) = m.get::<Value>("ActionHijackCancel")?
+                    {
+                        f.call::<()>(script)?;
+                    }
+                }
+                Ok(MultiValue::new())
+            })?,
+        )?;
+    }
     add(&vehicle, "HijackComplete", |w, _, a| {
         let Some(hero) = id(a.first()) else {
             return Ok(MultiValue::new());
@@ -698,7 +769,10 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             amplitude,
             seconds,
         }));
-        Ok(MultiValue::new())
+        // From the 360 code (0x82316e20): true when the object at the third
+        // place has a place to shake from.
+        let placed = id(a.get(2)).is_some_and(|g| w.objects.contains_key(&g));
+        Ok(MultiValue::from_vec(vec![Value::Boolean(placed)]))
     })?;
 
     // The hijack waits for the atmosphere to stop changing before it
@@ -998,6 +1072,31 @@ mod tests {
         );
         let c = check_minigame(&p, 0.0, 2.6, None, None, &pad);
         assert_eq!(statuses(&c), ["success"]);
+    }
+
+    #[test]
+    fn cancel_hijack_hands_the_script_its_object() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Default::default();
+        crate::api::install(host.lua(), &world).unwrap();
+        install(&host, &world).unwrap();
+        let (cancelled, other): (bool, bool) = host
+            .lua()
+            .load(
+                "local me = {name = 'hijack'}
+                 local got = nil
+                 MrxActionHijack = {ActionHijackCancel = function(o) got = o end}
+                 Vehicle.CancelHijack(1)
+                 local before = got
+                 Vehicle.HijackStart(1, 2, 3, me)
+                 Vehicle.CancelHijack(9)
+                 local other = got == nil
+                 Vehicle.CancelHijack(1)
+                 return before == nil and got == me, other",
+            )
+            .eval()
+            .unwrap();
+        assert!(cancelled && other);
     }
 
     #[test]

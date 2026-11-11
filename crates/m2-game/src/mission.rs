@@ -338,6 +338,12 @@ pub struct GameData {
     /// Templates' labels (name hashes) by the template's name in lower
     /// case, for objects the scripts spawn.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// The layers' `PhysicalLink` records by parent entity: (link name
+    /// hash, child entity) ([`crate::links::physical_links`]).
+    pub physical_links: HashMap<u32, Vec<(u32, u32)>>,
+    /// Templates' `CashValue` (`Object.GetCashValue`) by the template's
+    /// name in lower case.
+    pub template_cash: HashMap<String, i32>,
     /// Every template's name in the template database, in lower case:
     /// the names scripts look templates up by (`Pg.GetGuidByName("OC")`).
     pub template_names: std::collections::HashSet<String>,
@@ -353,6 +359,10 @@ pub struct GameData {
     /// lower case ([`crate::inventory::read`]).
     pub max_reserve: HashMap<String, u32>,
     pub thrown: std::collections::HashSet<String>,
+    /// How one template regards another, from the template database's
+    /// `Relationship` records ([`m2_engine::ai::relations`]): what
+    /// `Ai.GetRelation` answers where no script has set the pair.
+    pub relations: Vec<(String, String, f32)>,
 }
 
 /// `Label`'s field: the label's name hash.
@@ -447,10 +457,12 @@ impl GameData {
                     && let Ok(db) = Layer::parse(asset)
                 {
                     template_labels = labels_of(db.component("Label"));
+                    data.template_cash = crate::cash::template_cash(&db);
                     template_scripts = db.hashes("ObjectScript");
                     template_script_data = script_data(&db);
                     template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
+                    data.relations = m2_engine::ai::relations(&db);
                     template_names = db
                         .names()
                         .into_iter()
@@ -481,6 +493,9 @@ impl GameData {
                         .map(|c| riders(c))
                         .unwrap_or_default();
                     let placements = layer.placements();
+                    for (parent, link) in crate::links::physical_links(&layer) {
+                        data.physical_links.entry(parent).or_default().push(link);
+                    }
                     let mut own = labels_of(layer.component("Label"));
                     for (guid, entity) in layer.names() {
                         let p = placements.get(&guid);
@@ -688,11 +703,14 @@ impl Mission {
             shapes,
             strings,
             template_labels,
+            physical_links,
+            template_cash,
             template_names,
             template_drivers,
             template_passengers,
             max_reserve,
             thrown,
+            relations,
         } = data;
         let regions = layers
             .values()
@@ -710,6 +728,12 @@ impl Mission {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
+            w.relations = relations
+                .into_iter()
+                .map(|(a, b, r)| ((a.to_ascii_lowercase(), b.to_ascii_lowercase()), r))
+                .collect();
+            w.physical_links = physical_links;
+            w.template_cash = template_cash;
             w.template_names = template_names;
             w.template_drivers = template_drivers;
             w.template_passengers = template_passengers;
@@ -717,6 +741,9 @@ impl Mission {
             w.inventory.thrown = thrown;
             for e in layers.values().flatten() {
                 w.entities.insert(e.guid, e.at);
+                if !e.path.is_empty() {
+                    w.paths.insert(e.guid, e.path.clone());
+                }
                 if e.is_marker() {
                     w.entity_names
                         .entry(e.name.to_ascii_lowercase())
@@ -763,6 +790,8 @@ impl Mission {
         let events = Events::default();
         events.install(host.lua())?;
         crate::hijack::install(&host, &world)?;
+        crate::vehicle_state::install(&host, &world)?;
+        crate::vehicle_seats::install(&host, &world)?;
         host.install_library(Rc::clone(&library), true)?;
         // The contracts' own globals read nil while unset, as in the game,
         // not stubs: every global a contract's or job's script assigns.
@@ -1038,6 +1067,8 @@ impl Mission {
             let mut w = self.world.borrow_mut();
             w.honk_heard = (w.honk_heard - dt as f32).max(0.0);
             w.pursuit.clock.step(dt as f32);
+            // No time scale yet: game and real time run together.
+            w.clocks.step(dt as f32, dt as f32);
         }
         // Streaming is instant here: a waiting state ends a second after
         // it was asked for, and the scripts hear that it did.
@@ -1057,6 +1088,9 @@ impl Mission {
             let mut w = self.world.borrow_mut();
             w.update_hibernation();
             w.tick_raw_clips(dt as f32);
+            let mut waves = std::mem::take(&mut w.heli_waves);
+            waves.update(dt as f32, &mut *w);
+            w.heli_waves = waves;
         }
         for t in self.events.take_trace() {
             self.log.push(format!("  t={:.1} event {t}", self.now));
@@ -1370,6 +1404,17 @@ impl Mission {
         };
     }
 
+    /// `guid` (a helicopter) has a winch in this state (0 retracted, 1
+    /// deployed, 2 deploying, 3 retracting: `Object.GetWinchState`), or
+    /// none.
+    pub fn set_winch(&mut self, guid: u32, state: Option<u8>) {
+        let mut w = self.world.borrow_mut();
+        match state {
+            Some(s) => w.winches.insert(guid, s),
+            None => w.winches.remove(&guid),
+        };
+    }
+
     pub fn hold(&mut self, button: u32, down: bool) {
         let at = down.then_some(self.now);
         self.world.borrow_mut().hijack.hold(button, at);
@@ -1383,6 +1428,21 @@ impl Mission {
             .context_actions
             .get(&guid)
             .map(|a| a.text.clone())
+    }
+
+    /// Character `holder` did `what` (`"Equip"`, `"Stow"`, `"Drop"`) with
+    /// `weapon`, for the scripts' `WeaponEvent` events.
+    pub fn weapon_event(&mut self, holder: u32, what: &str, weapon: u32) {
+        let mut w = self.world.borrow_mut();
+        w.weapon_events
+            .push((self.now, holder, what.to_owned(), weapon));
+        let extra = w.weapon_events.len().saturating_sub(32);
+        w.weapon_events.drain(..extra);
+    }
+
+    /// Object `guid` now moves at `speed` m/s, for `Object.GetVelocity`.
+    pub fn set_speed(&mut self, guid: u32, speed: f32) {
+        self.world.borrow_mut().speeds.insert(guid, speed);
     }
 
     /// Character `guid` is now in human state `state` (`Stance.Action`:
@@ -2595,6 +2655,18 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             o.label_hashes.clone_from(&e.labels);
             o.faction = e.faction;
             w.insert(e.guid, o);
+            // Its data-authored links (`PhysicalLink`), made as it is
+            // placed, as the 360's instancing (0x82408c30) makes them.
+            if let Some(links) = w.physical_links.get(&e.guid).cloned() {
+                for (key, child) in links {
+                    w.links.insert(crate::links::Link {
+                        parent: e.guid,
+                        hardpoint: child,
+                        key,
+                        child,
+                    });
+                }
+            }
             if e.script == Some(FRIENDLY_GATE) {
                 w.gates.insert(e.guid);
             }
@@ -2612,6 +2684,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             }
         } else {
             w.crews.remove(&e.guid);
+            w.links.remove(e.guid);
             w.placed_as.remove(&e.guid);
             w.gates.remove(&e.guid);
             w.crew_riders.retain(|_, v| *v != e.guid);
@@ -2744,7 +2817,7 @@ pub fn first_lines(s: &str) -> String {
 /// the two regions with a `BoundaryData` record are the HQs' exclusions
 /// (`Boundary_ALHQ_Exclusion`, `Boundary_CHHQ_Exclusion`), the only ones
 /// so named; the record itself isn't decoded.
-fn is_exclusion(name: &str) -> bool {
+pub(crate) fn is_exclusion(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with("_exclusion")
 }
 
@@ -3049,6 +3122,72 @@ mod tests {
         assert_eq!(m.take_commands(), [on(true), on(false)]);
     }
 
+    /// `Event.ObjectHealthLessThan` as ChiCon001 waits for its VIP at half
+    /// health: `{ target, Object.GetHealth(target) / 2 }`.
+    #[test]
+    fn a_health_less_than_watch_fires_below_its_figure() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            halved, args = 0, -1
+            local hero = Player.GetCharacter(1)
+            Event.Create(Event.ObjectHealthLessThan, { hero, Object.GetHealth(hero) / 2 },
+                function(...) halved = halved + 1; args = select('#', ...) end)
+            "#,
+            "test",
+        )
+        .unwrap();
+        let full: f64 = m
+            .lua()
+            .load("return Object.GetHealth(Player.GetCharacter(1))")
+            .eval()
+            .unwrap();
+        m.tick(0.1);
+        m.set_health(PLAYER, (full * 0.6) as f32);
+        m.tick(0.1);
+        let g = m.lua().globals();
+        assert_eq!(g.raw_get::<i64>("halved").unwrap(), 0);
+        m.set_health(PLAYER, (full * 0.4) as f32);
+        m.tick(0.1);
+        m.tick(0.1);
+        assert_eq!(g.raw_get::<i64>("halved").unwrap(), 1);
+        // The engine passes nothing of its own.
+        assert_eq!(g.raw_get::<i64>("args").unwrap(), 0);
+    }
+
+    #[test]
+    fn health_watches_pass_the_health_and_the_comparison() {
+        // MrxHq: `{ hq, "*", "<=", 1 }`; a contract: `{ her, "<", 40 }`.
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            got, low, part = {}, nil, 0
+            local hero = Player.GetCharacter(1)
+            Event.Create(Event.ObjectHealth, { hero, "<", 40 },
+                function(tag, h, how) got = { tag, h, how } end, { "low" })
+            Event.Create(Event.ObjectHealth, { hero, "*", "<=", 25 },
+                function(h, how) low = how end)
+            Event.Create(Event.ObjectHealth, { hero, "wing_l", "<", 99 },
+                function() part = part + 1 end)
+            "#,
+            "test",
+        )
+        .unwrap();
+        m.tick(0.1);
+        m.set_health(PLAYER, 25.0);
+        m.tick(0.1);
+        m.tick(0.1);
+        let (tag, h, how, low, part): (String, f64, String, String, i64) = m
+            .lua()
+            .load("return got[1], got[2], got[3], low, part")
+            .eval()
+            .unwrap();
+        assert_eq!((tag.as_str(), h, how.as_str()), ("low", 25.0, "<"));
+        assert_eq!(low, "<=");
+        // A part she doesn't have never holds.
+        assert_eq!(part, 0);
+    }
+
     #[test]
     fn health_watches_fire_as_she_is_hurt() {
         let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
@@ -3095,7 +3234,7 @@ mod tests {
         m.run(
             r#"
             local me = Player.GetCharacter(1)
-            assert(Object.GetName(me) == "Mattias")
+            assert(__m2_object_name(me) == "Mattias")
             assert(Object.HasLabel(me, "mattias"))
             Object.AddLabel(me, "Scripted")
             "#,
@@ -3106,7 +3245,7 @@ mod tests {
         m.run(
             r#"
             local me = Player.GetCharacter(1)
-            assert(Object.GetName(me) == "Jennifer")
+            assert(__m2_object_name(me) == "Jennifer")
             assert(Pg.GetGuidByName("Jennifer") == me)
             assert(Object.HasLabel(me, "jennifer"))
             assert(not Object.HasLabel(me, "mattias"))
@@ -3458,7 +3597,7 @@ mod tests {
             Object.SetName(g, "HqInterior")
             Object.SetPosition(g, 3750, 450, -3840)
             Event.Create(Event.ObjectHibernation, { g, "awake" },
-                function(o) __awake = o end, {})"#,
+                function(o) __awake = o end, { g })"#,
             "spawn actor",
         )
         .unwrap();
@@ -3548,8 +3687,8 @@ mod tests {
             Event.CreatePersistent(Event.HumanStateTransition, { t, "*", "KnockedDown.Idle" }, note("down"), {})
             Event.CreatePersistent(Event.HumanStateTransition, { t, "*", "Subdued.Idle" }, note("subdued"), {})
             Event.CreatePersistent(Event.HumanStateTransition, { t, "KnockedDown.*", "Upright.*" }, note("up"), {})
-            Human.DoAction(Player.GetAnyCharacter(), "VerifyCamera")
-            Event.Create(Event.HumanActionComplete, { Player.GetAnyCharacter() }, note("photo"), {})"#,
+            Human.DoAction(Player.GetLocalCharacter(), "VerifyCamera")
+            Event.Create(Event.HumanActionComplete, { Player.GetLocalCharacter() }, note("photo"), {})"#,
             "events",
         )
         .unwrap();
@@ -3576,10 +3715,87 @@ mod tests {
         assert_eq!(heard(&m), ["down", "up", "subdued", "photo"]);
         // And carrying, as `Human.IsCarrying` reads it.
         m.set_carrying(PLAYER, Some(9));
-        m.run("__c = Human.IsCarrying(Player.GetAnyCharacter())", "carry")
-            .unwrap();
+        m.run(
+            "__c = Human.IsCarrying(Player.GetLocalCharacter())",
+            "carry",
+        )
+        .unwrap();
         assert!(m.lua().globals().get::<bool>("__c").unwrap());
     }
+    #[test]
+    fn a_health_below_its_figure_fires_the_less_than_event() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let mut tank = crate::api::Object::new("OilCon002_Tank", [5.0, 0.0, 0.0]);
+        tank.health = 100.0;
+        m.world.borrow_mut().insert(9, tank);
+        m.run(
+            r#"__n = 0
+            Event.Create(Event.ObjectHealthLessThan, { Sys.StringToGuid('0x9'), 40 },
+                function(...) __n = __n + 1 + select('#', ...) end, {})"#,
+            "events",
+        )
+        .unwrap();
+        let fired = |m: &Mission| m.lua().globals().get::<i64>("__n").unwrap();
+        m.tick(0.1);
+        assert_eq!(fired(&m), 0);
+        m.world.borrow_mut().objects.get_mut(&9).unwrap().health = 40.0;
+        m.tick(0.1);
+        // At the figure is not below it.
+        assert_eq!(fired(&m), 0);
+        m.world.borrow_mut().objects.get_mut(&9).unwrap().health = 39.0;
+        m.tick(0.1);
+        // Once, and with nothing passed.
+        assert_eq!(fired(&m), 1);
+        m.tick(0.1);
+        assert_eq!(fired(&m), 1);
+    }
+
+    #[test]
+    fn what_she_does_with_a_weapon_reaches_the_weapon_events() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        // As `MrxStatsManager` waits for her favourite weapon's time, and
+        // one for a single weapon, one for anything done.
+        m.run(
+            r#"__heard = {}
+            local function note(s)
+                return function(who, weapon)
+                    __heard[#__heard + 1] = s .. " " .. tostring(who == Player.GetLocalCharacter())
+                        .. " " .. tostring(weapon == Sys.StringToGuid('0x77'))
+                end
+            end
+            local her = Player.GetLocalCharacter()
+            Event.CreatePersistent(Event.WeaponEvent, { her, "Equip" }, note("equip"), {})
+            Event.CreatePersistent(Event.WeaponEvent, { her, "Stow" }, note("stow"), {})
+            Event.CreatePersistent(Event.WeaponEvent, { her, "Any", Sys.StringToGuid('0x78') }, note("other"), {})
+            Event.CreatePersistent(Event.WeaponEvent, { Sys.StringToGuid('0x9'), "Any" }, note("him"), {})"#,
+            "events",
+        )
+        .unwrap();
+        let heard = |m: &Mission| -> Vec<String> {
+            m.lua()
+                .globals()
+                .get::<Table>("__heard")
+                .unwrap()
+                .sequence_values()
+                .map(|v| v.unwrap())
+                .collect()
+        };
+        m.tick(0.1);
+        assert!(heard(&m).is_empty());
+        m.weapon_event(PLAYER, "Equip", 0x77);
+        m.tick(0.1);
+        m.weapon_event(PLAYER, "Stow", 0x77);
+        m.tick(0.1);
+        // Dropped: nobody waits for that one, nor for another's weapon.
+        m.weapon_event(PLAYER, "Drop", 0x77);
+        m.tick(0.1);
+        assert_eq!(heard(&m), ["equip true true", "stow true true"]);
+        m.weapon_event(PLAYER, "Drop", 0x78);
+        m.tick(0.1);
+        assert_eq!(heard(&m).last().unwrap(), "other true false");
+        assert_eq!(heard(&m).len(), 3);
+    }
+
     #[test]
     fn leaving_the_play_area_or_entering_an_exclusion_tells_the_boundary_callback() {
         let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
@@ -3856,5 +4072,39 @@ mod tests {
         m.tick(0.1);
         m.tick(0.1);
         assert_eq!(skipped(&m), 1);
+    }
+
+    /// What a button event passes after its data, as the 360's arguments
+    /// slot (0x823576f8) does: the pad, the button's name, "press";
+    /// "rtrigger" adds "lbutton" (its case runs on), "lsleft" has no name.
+    #[test]
+    fn a_button_event_passes_pad_name_and_mode() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            got = {}
+            local function note(...) got[#got + 1] = table.concat({ ... }, " ") end
+            local p = Player.GetLocalPlayer()
+            Event.Create(Event.Button, { p, "cancel", "press", true }, note, { "fanfare" })
+            Event.Create(Event.Button, { p, "rtrigger", "press", true }, note)
+            Event.Create(Event.Button, { p, "lsleft", "press", true }, note)
+            "#,
+            "test",
+        )
+        .unwrap();
+        m.tick(0.1);
+        for b in ["cancel", "rtrigger", "lsleft"] {
+            m.press_button(b);
+            m.tick(0.1);
+        }
+        let got: Vec<String> = m.host.lua().globals().get("got").unwrap();
+        assert_eq!(
+            got,
+            [
+                "fanfare 0 cancel press",
+                "0 rtrigger lbutton press",
+                "0 press"
+            ]
+        );
     }
 }

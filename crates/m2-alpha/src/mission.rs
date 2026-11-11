@@ -34,6 +34,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use m2_assets::{WadArchive, name_hash};
 use m2_engine::vehicle::DRIVABLE;
+use m2_engine::winch::WinchState;
 use m2_engine::world::member_stem;
 use m2_engine::{
     CatalogueEntry, Install, Physics, StaticKey, TemplateInfo, Templates, VehicleKind,
@@ -324,7 +325,8 @@ const BANNER_TIME: f32 = 10.0;
 
 /// The regions the scripts put on the radar (`Hud.Radar:AddLineRegion`:
 /// the world's boundary, shaded outside, as `WifVzBoundary` draws it),
-/// kept by the region's name in `__m2_radar_regions` for the game HUD,
+/// kept by the region's name (the port's `__m2_object_name`: the scripts'
+/// `Object.GetName` answers a hash) in `__m2_radar_regions` for the game HUD,
 /// which runs the radar in a Lua state of its own. Here the call reaches
 /// no radar (there are no widgets in this state) and goes on as it would.
 const RADAR_REGIONS: &str = r#"
@@ -333,7 +335,7 @@ local radar = Hud and Hud.Radar
 if radar then
     local add, remove = radar.AddLineRegion, radar.RemoveLineRegion
     radar.AddLineRegion = function(self, t)
-        local name = t and t.uGuid and Object.GetName(t.uGuid)
+        local name = t and t.uGuid and __m2_object_name and __m2_object_name(t.uGuid)
         if name then
             __m2_radar_regions[name] = {
                 nRed = t.nRed, nGreen = t.nGreen, nBlue = t.nBlue,
@@ -343,7 +345,7 @@ if radar then
         if add then return add(self, t) end
     end
     radar.RemoveLineRegion = function(self, t)
-        local name = t and t.uGuid and Object.GetName(t.uGuid)
+        local name = t and t.uGuid and __m2_object_name and __m2_object_name(t.uGuid)
         if name then __m2_radar_regions[name] = nil end
         if remove then return remove(self, t) end
     end
@@ -2750,6 +2752,68 @@ impl MissionLink {
             .as_ref()
             .is_some_and(|p| p.driving.is_none() && p.swimming());
         mission.set_swimming(PLAYER, swimming);
+        // The scripts' camera in a scene: on with its objects, and its view
+        // while a script directs it.
+        {
+            // How tall an object is, from its model's bounds: hers, a
+            // person's (by the guid it was spawned with) or a vehicle's.
+            let scene = &game.scene;
+            let height = |g: u32| -> Option<f32> {
+                let tall = |(lo, hi): (Vec3, Vec3)| hi.y - lo.y;
+                if g == PLAYER {
+                    let p = scene.player.as_ref()?;
+                    return p.model.as_ref().map(|(m, _)| tall(m.bounds));
+                }
+                if let Some(v) = scene.vehicles.iter().find(|v| v.guid == Some(g)) {
+                    return Some(tall(v.model.bounds));
+                }
+                let people = &scene.people;
+                let n = people.npcs.iter().find(|n| n.spawn == Some(g))?;
+                people.kinds.get(n.kind).map(|k| tall(k.model.bounds))
+            };
+            let mut w = mission.world().borrow_mut();
+            w.update_script_camera(dt, &height);
+            game.script_view = w.script_view().map(|v| (v.eye, v.forward()));
+        }
+
+        // The physics bodies the scripts can ask the kind of
+        // (`Object.GetPhysicsType`): hers and the people's (human), the
+        // vehicles' by how they drive.
+        {
+            let mut w = mission.world().borrow_mut();
+            let kinds = &mut w.physics_kinds;
+            kinds.clear();
+            kinds.insert(PLAYER, 1);
+            for n in &game.scene.people.npcs {
+                if let Some(g) = n.spawn {
+                    kinds.insert(g, 1);
+                }
+            }
+            for v in &game.scene.vehicles {
+                if let (Some(g), Some(k)) = (
+                    v.guid,
+                    m2_game::ported_physics::vehicle_physics_kind(&v.spec.kind),
+                ) {
+                    kinds.insert(g, k);
+                }
+            }
+        }
+
+        // What her crosshair is on, for `Player.GetTargetUnderReticle`: the
+        // point, and the person there if one (by the guid they were
+        // spawned with). On foot only, as her crosshair is.
+        {
+            let reticle = match (game.walking(), game.scene.world.as_ref()) {
+                (Some(p), Some(world)) => {
+                    let at = combat::Combat::aim_point(&world.physics, &game.scene.people, p, None);
+                    let who = combat::Combat::aim_probe(&world.physics, &game.scene.people, p)
+                        .and_then(|(_, n)| game.scene.people.npcs.get(n?)?.spawn);
+                    Some((at.to_array(), who))
+                }
+                _ => None,
+            };
+            mission.world().borrow_mut().reticle_target = reticle;
+        }
         // A scene's camera shot, from where its two stand now.
         if let Some(mut shot) = game.shot.take() {
             let w = mission.world().borrow();
@@ -2953,11 +3017,15 @@ impl MissionLink {
             }
             // The scripts' vehicles' load beds, where they count the goods
             // on them (`Object.GetHardpointPosition(truck, "HP_Truckbed")`),
-            // and their mass (`Object.GetMass`, the jump and boost scripts').
+            // their mass (`Object.GetMass`, the jump and boost scripts')
+            // and their winches' states (`Object.HasWinch`,
+            // `Object.GetWinchState`).
             if let Some(world) = game.scene.world.as_ref() {
                 for v in &game.scene.vehicles {
                     if let Some(g) = v.guid {
                         mission.set_mass(g, v.id.and_then(|id| world.physics.vehicle_mass(id)));
+                        let state = v.id.and_then(|id| game.winches.state(id));
+                        mission.set_winch(g, state.map(|s| s as u8));
                     }
                     if let (Some(g), Some(id)) = (v.guid, v.id)
                         && let Some(bed) = game.bed(v.spec.model)
@@ -3009,6 +3077,24 @@ impl MissionLink {
                 {
                     mission.place(g, n.character.position.to_array(), n.facing);
                 }
+            }
+            // How fast the scripts' vehicles and people move, for
+            // `Object.GetVelocity` (from the 360 code, 8232ED50: the
+            // length of the body's velocity): OilCon003 and PirCon003 ask.
+            if let Some(world) = game.scene.world.as_ref() {
+                let vehicles = game
+                    .scene
+                    .vehicles
+                    .iter()
+                    .filter_map(|v| Some((v.guid?, world.physics.vehicle_velocity(v.id?))));
+                let people = game
+                    .scene
+                    .people
+                    .npcs
+                    .iter()
+                    .filter(|n| n.alive)
+                    .filter_map(|n| Some((n.spawn?, n.character.velocity)));
+                report_speeds(mission, vehicles.chain(people));
             }
             // Targets to destroy: soldiers stand at those that are spawns,
             // and blasts close to the rest (gates, buildings) destroy them.
@@ -4773,6 +4859,28 @@ impl Fleet {
         }
         let now = mission.now();
         self.landing.retain(|_, until| *until > now);
+        // The scripts' vehicles' seats ([`m2_game::vehicle_seats`]), from
+        // their templates' `SeatLink`s and `SeatParameters`.
+        {
+            let mut w = mission.world().borrow_mut();
+            for v in &mut game.scene.vehicles {
+                let (Some(g), Some(seating)) = (v.guid, v.spec.seating.as_mut()) else {
+                    continue;
+                };
+                w.seats.add(g, seating.seats.iter().map(seat_of_template));
+                // `Vehicle.SetCanPlayerUse` (0x82346D10): the seats she may
+                // take, as the scripts last set them.
+                let barred: Vec<(u32, bool)> =
+                    w.seats.of(g).map(|(_, s)| (s.name, s.player_use)).collect();
+                for (name, can) in barred {
+                    if let Some(i) = seating.seat(name)
+                        && seating.seats[i].player_use != can
+                    {
+                        std::sync::Arc::make_mut(seating).seats[i].player_use = can;
+                    }
+                }
+            }
+        }
         for v in &game.scene.vehicles {
             let (Some(g), Some(id)) = (v.guid, v.id) else {
                 continue;
@@ -4794,6 +4902,24 @@ impl Fleet {
             if let Some(m) = physics.vehicle_transform(id) {
                 let f = m.transform_vector3(Vec3::Z);
                 mission.place(g, m.transform_point3(Vec3::ZERO).to_array(), f.x.atan2(f.z));
+            }
+            // On the ground and flipped, as the 360's physics kinds have
+            // them (`ObjectIsGrounded`, `Vehicle.IsFlipped`): a car is
+            // `_CarPhysicsV2`, kind 2 (no tank, boat, helicopter or jet).
+            let car = !v.spec.tracked
+                && !v.spec.is_boat()
+                && !v.spec.is_helicopter()
+                && !v.spec.wheels.is_empty();
+            let mut w = mission.world().borrow_mut();
+            if physics.vehicle_grounded(id, car) == Some(false) {
+                w.airborne.insert(g);
+            } else {
+                w.airborne.remove(&g);
+            }
+            if physics.vehicle_flipped(id, car) == Some(true) {
+                w.flipped.insert(g);
+            } else {
+                w.flipped.remove(&g);
             }
         }
         if self.look > 0 {
@@ -5266,6 +5392,22 @@ fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
 /// on with her if she gets into another meanwhile (invented: the autoplay
 /// swaps a stuck vehicle for another, and ChiCon001's VIP, out in a fight
 /// meanwhile, was shot).
+/// Tells the scripts how fast each of their objects among `moving` goes
+/// (`Mission::set_speed`): the length of its velocity, m/s. Those the
+/// scripts hold no object for are left out.
+fn report_speeds(mission: &mut Mission, moving: impl Iterator<Item = (u32, Vec3)>) {
+    let known: Vec<(u32, f32)> = {
+        let w = mission.world().borrow();
+        moving
+            .filter(|(g, _)| w.objects.contains_key(g))
+            .map(|(g, v)| (g, v.length()))
+            .collect()
+    };
+    for (g, speed) in known {
+        mission.set_speed(g, speed);
+    }
+}
+
 fn ride_along(
     game: &mut Game,
     mission: &mut Mission,
@@ -5511,6 +5653,26 @@ fn send_gunship(game: &mut Game, faction: &'static str, template: &str, her: Vec
     game.scene
         .load_world_vehicle(entity, at, toward.x.atan2(toward.z), crew, models);
     eprintln!("gunships: {faction} send their {template} from {at:.0}");
+}
+
+/// A seat as the scripts read it ([`m2_game::vehicle_seats::SeatParams`]).
+fn seat_of_template(
+    s: &m2_engine::seats::Seat,
+) -> (u32, m2_game::vehicle_seats::SeatParams, bool, Vec<u32>) {
+    let f = s.flags;
+    let params = m2_game::vehicle_seats::SeatParams {
+        driver: s.driver,
+        gunner: s.gunner,
+        cargo: f.cargo,
+        hijackable: s.hijackable,
+        hijack_blocker: f.hijack_blocker,
+        rider_invisible: f.rider_invisible,
+        rider_vulnerable: f.rider_vulnerable,
+        rider_bashable: f.rider_bashable,
+        stowable: f.stowable,
+        ladder: f.ladder,
+    };
+    (s.name, params, s.player_use, s.links.clone())
 }
 
 fn pursuit_standing(game: &Game, her: Vec3) -> crate::reinforce::Standing {
@@ -5921,6 +6083,7 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
                             location: Some(to),
                             target: None,
                             haste: None,
+                            path: None,
                         },
                     );
                 }
@@ -6122,7 +6285,13 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 eprintln!("mission: {what} put up as {guid:#x} at {:.1?}", position);
             }
         }
+        // The armies go for it before anything else (0x822E0988).
+        Command::PriorityTarget(guid) => {
+            eprintln!("war: {guid:#x} is made a priority target");
+            game.scene.people.priority.insert(*guid);
+        }
         Command::Remove(guid) => {
+            game.scene.people.priority.remove(guid);
             game.scene.people.scripted_gone(*guid);
             if let Some(w) = game.scene.world.as_mut() {
                 game.scene.props.hide(&mut w.physics, [*guid]);
@@ -6172,6 +6341,19 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                     at = t.transform_point3(at);
                 }
                 world.physics.push_vehicle(id, push, at);
+            }
+        }
+        // `Object.SetWinchState` on one of the scripts' helicopters: its
+        // winch takes that state and pays out or reels in to match.
+        Command::WinchState { carrier, state } => {
+            let s = [
+                WinchState::Retracted,
+                WinchState::Deployed,
+                WinchState::Deploying,
+                WinchState::Retracting,
+            ][usize::from(state & 3)];
+            if let Some(id) = index(carrier).and_then(|i| game.scene.vehicles[i].id) {
+                game.winches.set_state(id, s);
             }
         }
         // Seated in one of the scripts' vehicles that is placed: drive it.
@@ -6495,10 +6677,29 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             goal,
             target: Some(path),
             haste,
+            path: order,
             ..
         } if goal == "PathMove" => {
             let vehicle = mission.world().borrow().vehicle_of(*guid);
-            let route: Vec<Vec3> = mission.path(*path).iter().map(|&p| Vec3::from(p)).collect();
+            // Where on the path it starts, which way it goes and what it
+            // does at the end are the goal's own (from the 360 code,
+            // `m2_game::path_order`): unless told otherwise, from the
+            // point of the path nearest it.
+            let order = order.unwrap_or_default();
+            let points = mission.path(*path).to_vec();
+            let from = {
+                let w = mission.world().borrow();
+                vehicle
+                    .and_then(|v| w.objects.get(&v))
+                    .or_else(|| w.objects.get(guid))
+                    .map(|o| o.position)
+            };
+            let to_vec = |ps: Vec<[f32; 3]>| ps.into_iter().map(Vec3::from).collect::<Vec<_>>();
+            let lap = to_vec(order.lap(&points));
+            let route = match from {
+                Some(from) => to_vec(order.route(&points, from)),
+                None => lap.clone(),
+            };
             match vehicle {
                 Some(v) if !route.is_empty() => {
                     eprintln!(
@@ -6508,7 +6709,7 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                         route[0],
                         route[route.len() - 1]
                     );
-                    game.paths.start(v, route, haste.unwrap_or(1.0));
+                    game.paths.start(v, route, lap, order.mode, *haste);
                 }
                 // A person on foot (the villa's wave soldiers, coming in
                 // through the garage and over the walls): they run it.
@@ -7520,6 +7721,27 @@ mod tests {
         let view = link.view();
         assert_eq!(view.black, 1.0);
         assert!(view.status.is_some());
+    }
+
+    // The scripts read how fast their objects move as one number.
+    #[test]
+    fn the_scripts_objects_speeds_are_told() {
+        use m2_game::mission::{GameData, Mission};
+        use m2_math::glam::Vec3;
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.world().borrow_mut().insert(
+            9,
+            m2_game::api::Object::new("OilCon003_Truck", [5.0, 0.0, 0.0]),
+        );
+        // 3-4-12: 13 m/s. One the scripts don't hold is left out.
+        super::report_speeds(
+            &mut m,
+            [(9, Vec3::new(3.0, 4.0, 12.0)), (10, Vec3::X)].into_iter(),
+        );
+        m.run("__v = Object.GetVelocity(Sys.StringToGuid('0x9'))", "speed")
+            .unwrap();
+        assert_eq!(m.lua().globals().get::<f64>("__v").unwrap(), 13.0);
+        assert!(!m.world().borrow().speeds.contains_key(&10));
     }
 
     // The props the scripts spawn have their hardpoints told, as do

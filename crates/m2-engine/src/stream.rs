@@ -838,7 +838,8 @@ impl World {
             .iter()
             .zip(loose.starts(placed))
             .map(|(piece, at)| self.physics.add_debris(piece, at, velocity, spin))
-            .collect();
+            .collect::<Vec<_>>();
+        self.physics.group_debris(&pieces, placed);
         self.knocked.insert(i, pieces);
         true
     }
@@ -1296,11 +1297,19 @@ impl World {
                                 if let Some(shape) = m.collision.as_ref().filter(|s| {
                                     !(o.named && s.stand_in) && !self.taken.contains(&i) && !ai_only
                                 }) {
-                                    self.physics.add_static(
+                                    let preset = self
+                                        .index
+                                        .template_db
+                                        .presets
+                                        .get(&o.template)
+                                        .copied()
+                                        .unwrap_or_default();
+                                    self.physics.add_static_as(
                                         StaticKey::Object(i),
                                         shape,
                                         o.position,
                                         o.rotation,
+                                        preset,
                                     );
                                 }
                                 for (k, member) in m.members.iter().enumerate() {

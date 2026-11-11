@@ -71,6 +71,12 @@ pub struct VehicleSubject {
     /// weapons' (`WeaponHint`) best rating, 0.6 at the least
     /// ([`m2_engine::ai_target::threat`]).
     pub threat: f32,
+    /// Made a priority target by the scripts (`Ai.SetPriorityTarget`, the
+    /// support the player calls in): worth
+    /// [`m2_engine::ai_target::PRIORITY`] in place of its threat.
+    pub priority: bool,
+    /// Its body, left out of the sight lines to it.
+    pub vehicle: Option<m2_engine::VehicleId>,
 }
 
 /// What a subject carries, for how much of a threat it is to a soldier
@@ -79,8 +85,9 @@ pub struct VehicleSubject {
 pub enum Arms {
     /// A person's gun and launcher `WeaponHint`s, each within its range.
     Person([Option<FireHint>; 2]),
-    /// A vehicle's, already rated: its weapons reach anywhere.
-    Vehicle(f32),
+    /// A vehicle's, already rated: its weapons reach anywhere; and
+    /// whether the scripts made it a priority target.
+    Vehicle { threat: f32, priority: bool },
 }
 
 impl Arms {
@@ -89,13 +96,22 @@ impl Arms {
         use m2_engine::ai_target::{HUMAN, threat};
         match self {
             Arms::Person(w) => threat(w.iter().flatten(), HUMAN, distance, false),
-            Arms::Vehicle(t) => *t,
+            Arms::Vehicle { threat, .. } => *threat,
         }
+    }
+
+    /// What it is worth to a soldier on foot `distance` metres off
+    /// ([`m2_engine::ai_target::worth`]).
+    pub fn worth(&self, distance: f32) -> f32 {
+        let priority = matches!(self, Arms::Vehicle { priority: true, .. });
+        m2_engine::ai_target::worth(self.threat(distance), priority)
     }
 }
 
-/// Her arms on foot: the "Assault Rifle"'s `WeaponHint` stands in for
-/// whatever she holds (invented: her own weapon's hint is not passed on).
+/// Her arms on foot where the game has not said what she carries (tests,
+/// no game): the "Assault Rifle"'s `WeaponHint`. In play
+/// [`People::her_arms`] holds her own guns' hints
+/// ([`crate::combat::Combat::carried_hints`]).
 pub const HER_ON_FOOT: Arms = Arms::Person([Some(STAND_IN), None]);
 
 /// The first number in a mind's attack slot of a vehicle, the rest going
@@ -943,6 +959,9 @@ pub struct Npc {
     pub faction: Option<&'static str>,
     /// Whom they go for ([`People::war`]).
     pub slot: m2_engine::ai_target::Slot,
+    /// How hot they are from having someone to go for: their scores
+    /// count half again while any is left ([`m2_engine::ai_target::Heat`]).
+    pub heat: m2_engine::ai_target::Heat,
     /// Their own attitude to each army they have perceived one of
     /// ([`m2_engine::ai_target::Attitude`]): it follows the relation
     /// down at once and back up slowly.
@@ -951,6 +970,8 @@ pub struct Npc {
     pub foe_at: Option<Vec3>,
     /// The armour class of the vehicle they go for, if it is one.
     foe_armour: Option<u32>,
+    /// That vehicle's body, which their sight lines to it pass through.
+    foe_body: Option<m2_engine::VehicleId>,
     /// Until they next look for a target, seconds.
     foe_look: f32,
     /// From how far they can see the one they look at, unless that's
@@ -1238,9 +1259,11 @@ impl Npc {
             held: false,
             faction: None,
             slot: m2_engine::ai_target::Slot::default(),
+            heat: m2_engine::ai_target::Heat::default(),
             attitudes: Vec::new(),
             foe_at: None,
             foe_armour: None,
+            foe_body: None,
             foe_look: 0.0,
             foe_reach: None,
             shot_by: None,
@@ -1793,6 +1816,20 @@ impl Npc {
     }
 
     pub fn sees(&self, physics: &Physics, target: Vec3, any_way: bool) -> bool {
+        self.sees_past(physics, target, any_way, None)
+    }
+
+    /// [`sees`](Self::sees) a subject that is vehicle `body`, if one: the
+    /// line runs all the way to it, passing through its own body, as the
+    /// 360's sight lines leave the subject out (0x822E8DF8 puts its object
+    /// in the request). A person's ends short of him instead.
+    pub fn sees_past(
+        &self,
+        physics: &Physics,
+        target: Vec3,
+        any_way: bool,
+        body: Option<m2_engine::VehicleId>,
+    ) -> bool {
         let eye = self.character.position + Vec3::Y * EYE;
         let to = target - eye;
         let distance = to.length();
@@ -1806,6 +1843,11 @@ impl Npc {
             if ahead.dot(flat) < half.cos() {
                 return false;
             }
+        }
+        if let Some(body) = body {
+            return physics
+                .cast_ray_vehicle(eye, to / distance, distance, Some(body))
+                .is_none();
         }
         let clear = (distance - 2.5).max(0.5);
         physics.cast_ray(eye, to / distance, clear).is_none()
@@ -1829,7 +1871,7 @@ impl Npc {
         self.look -= dt;
         if self.look <= 0.0 || self.last_seen.is_none() {
             self.look = LOOK_EVERY;
-            if self.sees(physics, threat, true) {
+            if self.sees_past(physics, threat, true, self.foe_body) {
                 self.spotted |= self.unseen > LOOK_EVERY * 1.5 || self.last_seen.is_none();
                 self.last_seen = Some(threat);
                 self.unseen = 0.0;
@@ -1851,7 +1893,7 @@ impl Npc {
                     let to = end - from;
                     let length = to.length();
                     physics
-                        .cast_ray_keyed(from, to, length)
+                        .cast_ray_sight_keyed(from, to, length)
                         .and_then(|(t, _, key)| Some((t, key?)))
                         .filter(|&(t, _)| t > length - t)
                         .map(|(t, key)| (from + to.normalize_or_zero() * t, key))
@@ -2432,7 +2474,7 @@ impl Npc {
             if self.look <= 0.0 {
                 self.look = LOOK_EVERY;
                 if let Some(t) = threat
-                    && (self.sees(physics, t, false) || self.hears(t))
+                    && (self.sees_past(physics, t, false, self.foe_body) || self.hears(t))
                 {
                     self.alert = true;
                     self.spotted = true;
@@ -2452,6 +2494,7 @@ impl Npc {
                     self.foe_at = None;
                     self.foe_reach = None;
                     self.foe_armour = None;
+                    self.foe_body = None;
                     self.calm();
                 }
             }
@@ -2748,6 +2791,9 @@ pub struct People {
     /// What she carries, for her threat to soldiers; `None` is
     /// [`HER_ON_FOOT`].
     pub her_arms: Option<Arms>,
+    /// The scripts' objects made priority targets (`Ai.SetPriorityTarget`),
+    /// by guid.
+    pub priority: std::collections::HashSet<u32>,
     /// As the templates have it.
     authored: HashMap<(&'static str, &'static str), f32>,
     /// Rounds between the armies since the start: fired, hit, killed.
@@ -3495,11 +3541,15 @@ impl People {
                 Some((n.shooter, n.faction?, n.chest(), n.ai.visibility, arms))
             })
             .chain(self.vehicle_subjects.iter().enumerate().map(|(i, v)| {
-                let arms = Arms::Vehicle(v.threat);
+                let arms = Arms::Vehicle {
+                    threat: v.threat,
+                    priority: v.priority,
+                };
                 (VEHICLES + i as u32, v.faction, v.at, v.visibility, arms)
             }))
             .collect();
         let her_arms = self.her_arms.unwrap_or(HER_ON_FOOT);
+        let bodies: Vec<_> = self.vehicle_subjects.iter().map(|v| v.vehicle).collect();
         self.calm(dt);
         for i in 0..self.npcs.len() {
             if !self.npcs[i].can_war() {
@@ -3522,6 +3572,8 @@ impl People {
                 n.alert = n.soldier && n.alert;
             }
             let n = &mut self.npcs[i];
+            // Heat, each update whether he looks or not (0x822D9C10).
+            n.heat.tick(n.slot.who.is_some());
             n.foe_look -= dt;
             let shot = n.shot_by.take();
             let heard = n.heard.take();
@@ -3552,20 +3604,33 @@ impl People {
                 self.perceive(i, c.3);
             }
             seen.retain(|c| self.hostile(i, c.3));
-            seen.truncate(FOE_LOOKS);
+            // The nearest few, and any priority target in reach besides: the
+            // limit is ours (the 360 looks over them all, its sight lines
+            // queued), so it must not hide what the scripts made first.
+            let mut n = 0;
+            seen.retain(|c| {
+                n += 1;
+                n <= FOE_LOOKS || matches!(c.5, Arms::Vehicle { priority: true, .. })
+            });
             let n = &mut self.npcs[i];
             let current = n.foe_at.map(|f| f.distance(at));
             let alert = n.alert;
+            let hot = n.heat.factor();
             for (d, who, chest, _, far, arms) in seen {
                 let in_slot = n.slot.who == Some(who);
                 n.foe_reach = Some(far);
                 let perceived = shot == Some(who) || heard == Some(who);
-                if in_slot || perceived || n.sees(physics, chest, alert) {
-                    // How much of a threat and how well seen (the record's
-                    // +0xC8 and +0x68, 0x822D56B0 and 0x822E89B0).
-                    let seen = m2_engine::ai_target::visible(d, far);
+                let body = matches!(arms, Arms::Vehicle { .. })
+                    .then(|| bodies.get(who.wrapping_sub(VEHICLES) as usize).copied())
+                    .flatten()
+                    .flatten();
+                if in_slot || perceived || n.sees_past(physics, chest, alert, body) {
+                    // What it is worth and how well seen (the record's
+                    // +0xC8 and +0x68, 0x822D56B0 and 0x822E89B0), by his
+                    // heat (+0x804).
+                    let seen = m2_engine::ai_target::visible(d, far) * hot;
                     let score =
-                        m2_engine::ai_target::score(d, current, in_slot, arms.threat(d), seen);
+                        m2_engine::ai_target::score(d, current, in_slot, arms.worth(d), seen);
                     n.slot.offer(who, score);
                 }
             }
@@ -3577,11 +3642,11 @@ impl People {
                 let in_slot = n.slot.who == Some(HER);
                 let far = n.her_sight();
                 if d <= far && (in_slot || n.alert || n.sees(physics, t, false)) {
-                    let seen = m2_engine::ai_target::visible(d, far);
-                    let threat = her_arms.threat(d);
+                    let seen = m2_engine::ai_target::visible(d, far) * hot;
+                    let worth = her_arms.worth(d);
                     n.slot.offer(
                         HER,
-                        m2_engine::ai_target::score(d, current, in_slot, threat, seen),
+                        m2_engine::ai_target::score(d, current, in_slot, worth, seen),
                     );
                 }
             }
@@ -3591,11 +3656,15 @@ impl People {
                     n.foe_at = c.map(|c| c.2);
                     // A vehicle by its record, not its number: people's numbers
                     // are hashes and may lie above [`VEHICLES`] too.
-                    let vehicle = c.is_some_and(|c| matches!(c.4, Arms::Vehicle(_)));
+                    let vehicle = c.is_some_and(|c| matches!(c.4, Arms::Vehicle { .. }));
                     n.foe_armour = vehicle
                         .then(|| self.vehicle_subjects.get((w - VEHICLES) as usize))
                         .flatten()
                         .map(|v| v.armour);
+                    n.foe_body = vehicle
+                        .then(|| self.vehicle_subjects.get((w - VEHICLES) as usize))
+                        .flatten()
+                        .and_then(|v| v.vehicle);
                     n.foe_reach = c.map(|c| vision * c.3 * 1.5);
                     if !n.alert {
                         n.alert = true;
@@ -3615,6 +3684,7 @@ impl People {
                     n.foe_at = None;
                     n.foe_reach = None;
                     n.foe_armour = None;
+                    n.foe_body = None;
                 }
             }
         }
@@ -3928,8 +3998,38 @@ impl People {
                 }
             }
             let (fired, hit, killed) = self.war_tally;
+            // Those whose slot holds a vehicle the scripts made a priority
+            // target (its armour is only known for a vehicle).
+            let on_priority = self
+                .npcs
+                .iter()
+                .filter(|n| n.alive && n.foe_armour.is_some())
+                .filter_map(|n| n.slot.who)
+                .filter(|&w| {
+                    w >= VEHICLES
+                        && self
+                            .vehicle_subjects
+                            .get((w - VEHICLES) as usize)
+                            .is_some_and(|v| v.priority)
+                })
+                .count();
+            // Each priority target's nearest foe on foot, metres.
+            let nearest: Vec<f32> = self
+                .vehicle_subjects
+                .iter()
+                .filter(|v| v.priority)
+                .map(|v| {
+                    self.npcs
+                        .iter()
+                        .filter(|n| n.alive && n.landed)
+                        .filter(|n| n.faction.is_some_and(|f| self.at_war(f, v.faction)))
+                        .map(|n| n.chest().distance(v.at))
+                        .fold(f32::INFINITY, f32::min)
+                })
+                .collect();
+            eprintln!("war: priority targets' nearest foes on foot: {nearest:.0?} m");
             eprintln!(
-                "war: {sides:?}: {fighting} fighting, {fired} rounds, {hit} hit, {killed} killed"
+                "war: {sides:?}: {fighting} fighting ({on_priority} on a priority target), {fired} rounds, {hit} hit, {killed} killed"
             );
         }
         self.refill(spawns, focus, dt);
@@ -4804,6 +4904,68 @@ pub(crate) mod tests {
         assert_eq!(cues.len(), 3);
         assert_eq!(shooter_number(at(2), 0.5), shooter_number(at(2), 0.5));
         assert_ne!(shooter_number(at(2), 0.5), shooter_number(at(2), 0.6));
+    }
+
+    /// A tank 3 m wide, 6 m long and 2 m high on four wheels, its tuning
+    /// as given.
+    pub(crate) fn tank(tuning: m2_engine::tuning::VehicleTuning) -> m2_engine::VehicleSpec {
+        use m2_engine::VehicleSpec;
+        use m2_engine::vehicle::WheelSpec;
+        let wheel = |x: f32, z: f32| WheelSpec {
+            centre: Vec3::new(x, 0.4, z),
+            radius: 0.4,
+            width: 0.4,
+            steers: false,
+        };
+        let hull = (Vec3::new(-1.5, 0.0, -3.0), Vec3::new(1.5, 2.0, 3.0));
+        VehicleSpec {
+            model: 1,
+            kind: "tank".into(),
+            label: "test".into(),
+            node_names: Vec::new(),
+            armed: Vec::new(),
+            wheels: vec![
+                wheel(-1.3, 2.0),
+                wheel(1.3, 2.0),
+                wheel(-1.3, -2.0),
+                wheel(1.3, -2.0),
+            ],
+            bounds: hull,
+            seat: None,
+            door: None,
+            seating: None,
+            entrances: Vec::new(),
+            tracked: true,
+            road_wheels: Vec::new(),
+            rest: Vec::new(),
+            node_wheel: Vec::new(),
+            node_rolls: Vec::new(),
+            mass: 32_000.0,
+            turret: Vec::new(),
+            pivot: None,
+            muzzle: Some(Vec3::new(0.0, 2.2, 5.0)),
+            gun: Vec::new(),
+            gun_pivot: None,
+            muzzle_on_gun: false,
+            elevation: (0.0, 0.0),
+            hull,
+            turret_box: None,
+            rotors: Vec::new(),
+            tilts: Vec::new(),
+            bomb_bay: None,
+            node_parents: Vec::new(),
+            aimers: Vec::new(),
+            damage: None,
+            chassis: None,
+            shapes: Default::default(),
+            material: None,
+            path_unseen: Default::default(),
+            turret_shapes: Default::default(),
+            turret_mass: None,
+            gun_body: None,
+            wreck: None,
+            tuning,
+        }
     }
 
     pub(crate) fn ground() -> Physics {
@@ -5819,6 +5981,8 @@ pub(crate) mod tests {
             visibility,
             armour: 2,
             threat: m2_engine::ai_target::VEHICLE_THREAT,
+            priority: false,
+            vehicle: None,
         };
         people.vehicle_subjects = vec![truck(150.0, 100.0)];
         people.war(&physics, None, 0.25);
@@ -5827,6 +5991,121 @@ pub(crate) mod tests {
         people.war(&physics, None, 0.25);
         assert!(people.npcs[0].foe_at.is_some());
         assert_eq!(people.npcs[0].foe_armour, Some(2));
+    }
+
+    // A rifleman of the enemy at 40 m and one of their trucks at 120 m:
+    // by threat the rifleman is the one to go for, until the scripts make
+    // the truck a priority target (worth 9.8: the most a score comes to).
+    #[test]
+    fn a_soldier_goes_for_a_priority_target_over_a_nearer_rifleman() {
+        let physics = ground();
+        let pick = |priority: bool| {
+            let mut people = People::default();
+            for (k, (z, side)) in [(0.0, "Vza"), (40.0, "All")].into_iter().enumerate() {
+                let post = Brain::Post { facing: 0.0 };
+                let mut n = Npc::new(k, &rig(), Vec3::new(0.0, 1.0, z), 0.0, post, Some(1));
+                n.facing = if z > 0.0 { std::f32::consts::PI } else { 0.0 };
+                n.faction = Some(side);
+                n.gun = Some(rifle());
+                n.landed = true;
+                n.soldier = false;
+                n.character.position = Vec3::new(0.0, 0.0, z);
+                people.npcs.push(n);
+            }
+            people.set_relations([(("Vza", "All"), -80.0)].into_iter().collect());
+            people.vehicle_subjects = vec![VehicleSubject {
+                faction: "All",
+                at: Vec3::new(0.0, 1.0, 120.0),
+                visibility: 300.0,
+                armour: 2,
+                threat: m2_engine::ai_target::VEHICLE_THREAT,
+                priority,
+                vehicle: None,
+            }];
+            people.war(&physics, None, 0.25);
+            people.npcs[0].foe_at.expect("he goes for one").z
+        };
+        assert!(pick(false) < 60.0, "the rifleman by threat");
+        assert!(pick(true) > 100.0, "the priority target");
+    }
+
+    // A soldier sees a tank nose-on: his sight line ends at its middle, and
+    // the 360 leaves the subject's own body out of the line check
+    // (0x822E8DF8 puts its object in the request), so its hull 3 m out
+    // does not hide it.
+    #[test]
+    fn a_soldier_sees_a_tank_nose_on() {
+        let mut physics = ground();
+        let spec = tank(m2_engine::tuning::VehicleTuning::default());
+        let id = physics.add_vehicle(&spec, Vec3::new(0.0, 0.1, 40.0), 0.0);
+        physics.step(1.0 / 60.0);
+        let at = physics
+            .vehicle_transform(id)
+            .unwrap()
+            .transform_point3(Vec3::Y);
+        let mut people = People::default();
+        let post = Brain::Post { facing: 0.0 };
+        let mut n = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(1));
+        n.faction = Some("Vza");
+        n.gun = Some(rifle());
+        n.landed = true;
+        n.soldier = false;
+        people.npcs.push(n);
+        people.set_relations([(("Vza", "All"), -80.0)].into_iter().collect());
+        people.vehicle_subjects = vec![VehicleSubject {
+            faction: "All",
+            at,
+            visibility: 300.0,
+            armour: 2,
+            threat: m2_engine::ai_target::VEHICLE_THREAT,
+            priority: false,
+            vehicle: Some(id),
+        }];
+        people.war(&physics, None, 0.25);
+        assert_eq!(
+            people.npcs[0].slot.who,
+            Some(VEHICLES),
+            "he goes for the tank"
+        );
+    }
+
+    // More foes nearer than the few he looks over must not hide a priority
+    // target from him.
+    #[test]
+    fn a_priority_target_behind_many_nearer_foes_is_still_looked_over() {
+        let physics = ground();
+        let mut people = People::default();
+        for (k, z) in [0.0, 30.0, 34.0, 38.0, 42.0, 46.0, 50.0]
+            .into_iter()
+            .enumerate()
+        {
+            let post = Brain::Post { facing: 0.0 };
+            let mut n = Npc::new(k, &rig(), Vec3::new(0.0, 1.0, z), 0.0, post, Some(1));
+            n.facing = if z > 0.0 { std::f32::consts::PI } else { 0.0 };
+            n.faction = Some(if z > 0.0 { "All" } else { "Vza" });
+            n.gun = Some(rifle());
+            n.landed = true;
+            n.soldier = false;
+            n.character.position = Vec3::new(0.0, 0.0, z);
+            people.npcs.push(n);
+        }
+        assert!(
+            people.npcs.len() - 1 > FOE_LOOKS,
+            "more foes than he looks over"
+        );
+        people.set_relations([(("Vza", "All"), -80.0)].into_iter().collect());
+        people.vehicle_subjects = vec![VehicleSubject {
+            faction: "All",
+            at: Vec3::new(0.0, 1.0, 120.0),
+            visibility: 300.0,
+            armour: 2,
+            threat: m2_engine::ai_target::VEHICLE_THREAT,
+            priority: true,
+            vehicle: None,
+        }];
+        people.war(&physics, None, 0.25);
+        let z = people.npcs[0].foe_at.expect("he goes for one").z;
+        assert!(z > 100.0, "the priority target, not a rifleman at {z} m");
     }
 
     #[test]

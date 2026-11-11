@@ -438,6 +438,46 @@ fn instanced_draws_repeat_the_geometry() {
     assert_eq!(pixel(&rgba, 50, 32), white, "right");
 }
 
+/// Draws share one bind group and find their uniforms by instance: a
+/// plain draw after an instanced one still gets its own matrix, and the
+/// instanced one each of its instances.
+#[test]
+fn draws_after_instanced_ones_keep_their_own_uniforms() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            lit: false,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    b.begin_frame(&view()).unwrap();
+    let small = Mat4::from_scale(Vec3::splat(0.2));
+    let instances = b
+        .set_skin(&[
+            Mat4::from_translation(Vec3::new(-1.0, 0.0, 0.0)) * small,
+            Mat4::from_translation(Vec3::new(1.0, 0.0, 0.0)) * small,
+        ])
+        .unwrap();
+    b.draw(&DrawCall {
+        instances: Some(instances),
+        uv_offset: [0.0; 2],
+        ..draw(vb, ib, 1, Mat4::IDENTITY)
+    })
+    .unwrap();
+    // A small quad in the middle, drawn on its own after them.
+    b.draw(&draw(vb, ib, 1, small)).unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    let (white, sky) = ([255; 4], [0, 0, 255, 255]);
+    assert_eq!(pixel(&rgba, 32, 32), white, "middle");
+    assert_eq!(pixel(&rgba, 14, 32), white, "left");
+    assert_eq!(pixel(&rgba, 50, 32), white, "right");
+    assert_eq!(pixel(&rgba, 23, 32), sky, "between left and middle");
+}
+
 #[test]
 fn detail_maps_add_grain_up_close() {
     let Some(mut b) = backend() else { return };
@@ -675,6 +715,7 @@ fn the_game_tone_map_adapts_to_its_own_average() {
         max_key: 0.85,
         // None of the last frame kept: each frame adapts all the way.
         retention: 0.0,
+        speed: 30.0,
         contrast_limit: 0.145,
         contrast: 1.95,
         log_average: false,

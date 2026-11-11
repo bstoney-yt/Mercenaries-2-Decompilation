@@ -128,6 +128,59 @@ pub fn meet(a: u32, b: u32) -> bool {
     FILTER[(a & 31) as usize] >> (b & 31) & 1 != 0
 }
 
+/// Which of the presets a fixed model's body takes (0x821697D0), by its
+/// template: a `_BuildingPhysics` one (and one with neither component)
+/// [`BUILDING`]; a `_PropPhysics` or `_DebrisPhysics` one [`PROP`]
+/// (0x8218EBF8), or [`LOOSE_PROP`] when 0x82155328 says so
+/// ([`Preset::of_prop`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum Preset {
+    #[default]
+    Building,
+    Prop,
+    LooseProp,
+}
+
+impl Preset {
+    /// Its layers.
+    pub fn layers(self) -> &'static Layers {
+        match self {
+            Self::Building => &BUILDING,
+            Self::Prop => &PROP,
+            Self::LooseProp => &LOOSE_PROP,
+        }
+    }
+
+    /// A `_PropPhysics` template's, by its record's `Mass` (+0) and its
+    /// heavy flag (+4, `0xeca7c282`). From the 360 code: 0x8218EDA0 reads
+    /// that record (store 0x83651BC8, registered as `_PropPhysics` by
+    /// 0x823A9658): 0 for `Mass` 0, 2 for heavy, else 1; 0x82155328 says
+    /// loose for 1 alone, and 0x821831B0 keeps that (+0x132) for the prop
+    /// builder 0x8218EBF8, which then takes preset 2 for 1. Its first check
+    /// passes on a global that is 1 unless a setting clears it (0x82B7D8BC,
+    /// 0x822193D8), and its second on a session flag that is 0 in the
+    /// game alone (0x82DE698D: byte 1 of a block 0x82469508 fills, set
+    /// only with a network session whose +8 is set and, by 0x8246A940,
+    /// another player in one of its slots).
+    ///
+    /// A `_DebrisPhysics` object, with no `_PropPhysics` record (0x8218EDA0
+    /// gives 3), is loose by a record of its own physics (0x82187CA0: bit
+    /// 0x10 of its +0x18 byte, or either of two of its owner's labels,
+    /// 0x823DA3C8: 0x71246D6D, the template database's `Label` `tree`, or
+    /// 0x9B6005C0, found in no label or string of the data), or without
+    /// that record
+    /// when its `PhysicsActor` (store 0x836571D4) is of kind 0xE. Which
+    /// records those are isn't traced, so a debris template takes the
+    /// prop preset ([`crate::durability::presets`]).
+    pub fn of_prop(mass: f32, heavy: bool) -> Self {
+        if mass == 0.0 || heavy {
+            Self::Prop
+        } else {
+            Self::LooseProp
+        }
+    }
+}
+
 /// The layers of a vehicle's hull and turret ([`VEHICLE`]'s).
 pub const VEHICLE_LAYERS: [u32; 2] = [8, 9];
 
@@ -175,6 +228,43 @@ mod tests {
         assert_eq!(layer_of(&BUILDING, 0x60, 4), 3);
         assert_eq!(layer_of(&LOOSE_PROP, 0x27, 3), 18);
         assert_eq!(layer_of(&LOOSE_PROP, 0x07, 3), 18);
+    }
+
+    // The three presets a fixed model's body takes (0x821697D0's tables),
+    // over the data's flags, and what a path search and a tank make of
+    // each layer.
+    #[test]
+    fn the_three_presets_lay_shapes_out_as_the_360_does() {
+        let flags = [0x25, 0x05, 0x27, 0x07, 0x23, 0x03, 0x28, 0x00];
+        let expect: [(Preset, [u32; 8]); 3] = [
+            (Preset::Building, [4, 7, 3, 6, 2, 5, 19, 3]),
+            (Preset::Prop, [14, 17, 13, 16, 12, 15, 19, 13]),
+            (Preset::LooseProp, [14, 17, 18, 18, 18, 18, 18, 18]),
+        ];
+        for (preset, layers) in expect {
+            for (f, l) in flags.iter().zip(layers) {
+                assert_eq!(layer_of(preset.layers(), *f, 3), l, "{preset:?} {f:#x}");
+            }
+        }
+        // A loose prop's solid shapes (0x27, layer 18) are in no path's
+        // way; a fixed prop's (13) and a building's (3) are.
+        assert!(!seen_by(PATH_MASK, 18));
+        assert!(seen_by(PATH_MASK, 13) && seen_by(PATH_MASK, 3));
+        // A tank meets all three.
+        assert!(meets_vehicles(18) && meets_vehicles(13) && meets_vehicles(3));
+        // Its AI-only box (0x25) takes layer 14 as a prop: paths see it,
+        // tanks don't meet it.
+        assert!(seen_by(PATH_MASK, 14) && !meets_vehicles(14));
+    }
+
+    // 0x8218EDA0 and 0x82155328: a prop with a mass (the data's -1 too)
+    // that isn't heavy is loose.
+    #[test]
+    fn a_props_preset_follows_its_mass_and_heavy_flag() {
+        assert_eq!(Preset::of_prop(0.0, false), Preset::Prop);
+        assert_eq!(Preset::of_prop(2000.0, true), Preset::Prop);
+        assert_eq!(Preset::of_prop(-1.0, false), Preset::LooseProp);
+        assert_eq!(Preset::of_prop(50.0, false), Preset::LooseProp);
     }
 
     // A chain fence (flags 7) stops a tank but not its path; a wooden one

@@ -366,7 +366,9 @@ fn carpet_line(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiV
     let Some(at) = point(a, 0) else {
         return values([]);
     };
-    let heading = num(a.get(3)).unwrap_or(0.0);
+    // Degrees, as every angle the scripts pass (the 360 multiplies by
+    // 0.01745, 0x820f8c74).
+    let heading = num(a.get(3)).unwrap_or(0.0).to_radians();
     let owner = id(a.get(4));
     let count = num(a.get(6)).unwrap_or(1.0).max(0.0) as u32;
     let spacing = num(a.get(7)).unwrap_or(0.0);
