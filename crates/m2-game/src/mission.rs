@@ -338,6 +338,9 @@ pub struct GameData {
     /// Templates' labels (name hashes) by the template's name in lower
     /// case, for objects the scripts spawn.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// The layers' `PhysicalLink` records by parent entity: (link name
+    /// hash, child entity) ([`crate::links::physical_links`]).
+    pub physical_links: HashMap<u32, Vec<(u32, u32)>>,
     /// Templates' `CashValue` (`Object.GetCashValue`) by the template's
     /// name in lower case.
     pub template_cash: HashMap<String, i32>,
@@ -356,6 +359,10 @@ pub struct GameData {
     /// lower case ([`crate::inventory::read`]).
     pub max_reserve: HashMap<String, u32>,
     pub thrown: std::collections::HashSet<String>,
+    /// How one template regards another, from the template database's
+    /// `Relationship` records ([`m2_engine::ai::relations`]): what
+    /// `Ai.GetRelation` answers where no script has set the pair.
+    pub relations: Vec<(String, String, f32)>,
 }
 
 /// `Label`'s field: the label's name hash.
@@ -455,6 +462,7 @@ impl GameData {
                     template_script_data = script_data(&db);
                     template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
+                    data.relations = m2_engine::ai::relations(&db);
                     template_names = db
                         .names()
                         .into_iter()
@@ -485,6 +493,9 @@ impl GameData {
                         .map(|c| riders(c))
                         .unwrap_or_default();
                     let placements = layer.placements();
+                    for (parent, link) in crate::links::physical_links(&layer) {
+                        data.physical_links.entry(parent).or_default().push(link);
+                    }
                     let mut own = labels_of(layer.component("Label"));
                     for (guid, entity) in layer.names() {
                         let p = placements.get(&guid);
@@ -692,12 +703,14 @@ impl Mission {
             shapes,
             strings,
             template_labels,
+            physical_links,
             template_cash,
             template_names,
             template_drivers,
             template_passengers,
             max_reserve,
             thrown,
+            relations,
         } = data;
         let regions = layers
             .values()
@@ -715,6 +728,11 @@ impl Mission {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
+            w.relations = relations
+                .into_iter()
+                .map(|(a, b, r)| ((a.to_ascii_lowercase(), b.to_ascii_lowercase()), r))
+                .collect();
+            w.physical_links = physical_links;
             w.template_cash = template_cash;
             w.template_names = template_names;
             w.template_drivers = template_drivers;
@@ -1070,6 +1088,9 @@ impl Mission {
             let mut w = self.world.borrow_mut();
             w.update_hibernation();
             w.tick_raw_clips(dt as f32);
+            let mut waves = std::mem::take(&mut w.heli_waves);
+            waves.update(dt as f32, &mut *w);
+            w.heli_waves = waves;
         }
         for t in self.events.take_trace() {
             self.log.push(format!("  t={:.1} event {t}", self.now));
@@ -2624,6 +2645,18 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             o.label_hashes.clone_from(&e.labels);
             o.faction = e.faction;
             w.insert(e.guid, o);
+            // Its data-authored links (`PhysicalLink`), made as it is
+            // placed, as the 360's instancing (0x82408c30) makes them.
+            if let Some(links) = w.physical_links.get(&e.guid).cloned() {
+                for (key, child) in links {
+                    w.links.insert(crate::links::Link {
+                        parent: e.guid,
+                        hardpoint: child,
+                        key,
+                        child,
+                    });
+                }
+            }
             if e.script == Some(FRIENDLY_GATE) {
                 w.gates.insert(e.guid);
             }
@@ -2641,6 +2674,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             }
         } else {
             w.crews.remove(&e.guid);
+            w.links.remove(e.guid);
             w.placed_as.remove(&e.guid);
             w.gates.remove(&e.guid);
             w.crew_riders.retain(|_, v| *v != e.guid);
@@ -3643,8 +3677,8 @@ mod tests {
             Event.CreatePersistent(Event.HumanStateTransition, { t, "*", "KnockedDown.Idle" }, note("down"), {})
             Event.CreatePersistent(Event.HumanStateTransition, { t, "*", "Subdued.Idle" }, note("subdued"), {})
             Event.CreatePersistent(Event.HumanStateTransition, { t, "KnockedDown.*", "Upright.*" }, note("up"), {})
-            Human.DoAction(Player.GetAnyCharacter(), "VerifyCamera")
-            Event.Create(Event.HumanActionComplete, { Player.GetAnyCharacter() }, note("photo"), {})"#,
+            Human.DoAction(Player.GetLocalCharacter(), "VerifyCamera")
+            Event.Create(Event.HumanActionComplete, { Player.GetLocalCharacter() }, note("photo"), {})"#,
             "events",
         )
         .unwrap();
@@ -3671,8 +3705,11 @@ mod tests {
         assert_eq!(heard(&m), ["down", "up", "subdued", "photo"]);
         // And carrying, as `Human.IsCarrying` reads it.
         m.set_carrying(PLAYER, Some(9));
-        m.run("__c = Human.IsCarrying(Player.GetAnyCharacter())", "carry")
-            .unwrap();
+        m.run(
+            "__c = Human.IsCarrying(Player.GetLocalCharacter())",
+            "carry",
+        )
+        .unwrap();
         assert!(m.lua().globals().get::<bool>("__c").unwrap());
     }
     #[test]

@@ -275,6 +275,9 @@ struct Pending {
     /// _OnPlayerInVehicle(self, rider, vehicle)` erred on the 0 a rider
     /// out of every vehicle has).
     rode: std::collections::BTreeMap<u32, Value>,
+    /// `ObjectWinched`: the cargo's winch as last seen (who held it), none
+    /// before the first look.
+    winched: Option<Option<u32>>,
     /// When it was made.
     made: f64,
     /// For minigames: how many of the player's presses it has read (none
@@ -405,6 +408,7 @@ impl Events {
                         held: false,
                         held_by: BTreeSet::new(),
                         rode: std::collections::BTreeMap::new(),
+                        winched: None,
                         made: now,
                         read: None,
                         memo: None,
@@ -432,10 +436,14 @@ impl Events {
                             gone.as_deref().unwrap_or("none")
                         ));
                     }
+                    // From the 360 code (0x823583d8): it answers whether
+                    // there was such an event to delete.
+                    let found = s.pending.iter().any(|p| p.id == id);
                     s.deleted.insert(id);
                     s.pending.retain(|p| p.id != id);
+                    return Ok(MultiValue::from_vec(vec![Value::Boolean(found)]));
                 }
-                Ok(MultiValue::new())
+                Ok(MultiValue::from_vec(vec![Value::Boolean(false)]))
             })?,
         )?;
         let store = Rc::clone(&self.store);
@@ -444,15 +452,20 @@ impl Events {
             safe_function(lua, move |_, args| {
                 let mut args = args.into_iter();
                 if let Some(Value::String(name)) = args.next() {
-                    let data = args.next().unwrap_or(Value::Nil);
+                    let data = args.next();
+                    let has_data = data.is_some();
+                    let data = data.unwrap_or(Value::Nil);
                     let name = name.to_string_lossy();
                     let mut s = store.borrow_mut();
                     if s.relay.contains(&name) {
                         s.relayed.push((name.clone(), data.clone()));
                     }
                     s.posted.push((name, data));
+                    // From the 360 code (0x82358470): true once it has a
+                    // name and something to send with it, else false.
+                    return Ok(MultiValue::from_vec(vec![Value::Boolean(has_data)]));
                 }
-                Ok(MultiValue::new())
+                Ok(MultiValue::from_vec(vec![Value::Boolean(false)]))
             })?,
         )?;
         // `Event.__m2_fire(kind, ...)`: the engine's own events (the GUI's
@@ -707,7 +720,13 @@ impl Events {
             let mut fired = Vec::new();
             let mut keep = Vec::with_capacity(s.pending.len());
             for mut p in std::mem::take(&mut s.pending) {
-                let extra = match check(&p, now, &posted, accepted, world) {
+                // The wildcard characters stand for her ([`with_wildcards`]).
+                let own = with_wildcards(&mut p, world);
+                let checked = check(&p, now, &posted, accepted, world);
+                if let Some(own) = own {
+                    p.params = own;
+                }
+                let extra = match checked {
                     Check::Fire(extra) => Some(vec![extra]),
                     Check::FireWords(mut extra, words) => {
                         let lua = s.lua.0.as_ref().and_then(mlua::WeakLua::try_upgrade);
@@ -804,6 +823,33 @@ impl Events {
                     }
                     // `held_by` keeps who was inside at the last check
                     // (none before the first: one inside then enters).
+                    // The winch's changes since the last look, as the
+                    // 360's attach (1) and detach (2) occurrences.
+                    Check::Winch(cargo, now, carrier, mode) => {
+                        let before = p.winched.replace(now);
+                        let change = match (before, now) {
+                            (Some(was), now) if was != now => match (was, now) {
+                                (Some(c), None) => Some((c, 2u8)),
+                                (_, Some(c)) => Some((c, 1u8)),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        match change {
+                            Some((c, bit)) if bit & mode != 0 && (carrier == 0 || carrier == c) => {
+                                let lua = s.lua.0.as_ref().and_then(mlua::WeakLua::try_upgrade);
+                                let word = lua
+                                    .as_ref()
+                                    .and_then(|l| {
+                                        l.create_string(if bit == 1 { "attach" } else { "detach" })
+                                            .ok()
+                                    })
+                                    .map_or(Value::Nil, Value::String);
+                                Some(vec![vec![guid_value(cargo), guid_value(c), word]])
+                            }
+                            _ => None,
+                        }
+                    }
                     Check::Crossings(members) => {
                         let lua = s.lua.0.as_ref().and_then(mlua::WeakLua::try_upgrade);
                         let mut crossed = Vec::new();
@@ -940,6 +986,44 @@ fn fire(store: &RefCell<Store>, fired: Vec<Fired>) -> Vec<EventError> {
     errors
 }
 
+/// `Player.GetAnyCharacter()`'s answer: the wildcard for any player's
+/// character (0x8233e8c8).
+pub const ANY_CHARACTER: u32 = 0xf000_0000;
+/// `Player.GetAllCharacters()`'s answer: the wildcard for every player's
+/// character (0x8233e928).
+pub const ALL_CHARACTERS: u32 = 0xf000_0001;
+
+/// Puts the player's character in the place of the wildcard characters in
+/// a pending event's parameters, for one check; returns the scripts' own
+/// table to put back. None when there are none.
+///
+/// From the 360 code: an event subject of `ANY_CHARACTER` holds when the
+/// condition holds for any active player's character; `ALL_CHARACTERS`
+/// only when it holds for every one (a bit per player, 0x82359f80). With
+/// one player both are her. Other natives handed a wildcard find no object
+/// in it, as on the 360.
+fn with_wildcards(p: &mut Pending, world: &dyn World) -> Option<Table> {
+    let wild = |v: &Value| {
+        matches!(as_guid(v), Some(ANY_CHARACTER | ALL_CHARACTERS))
+            && matches!(v, Value::LightUserData(_))
+    };
+    let values: Vec<(Value, Value)> = p
+        .params
+        .pairs::<Value, Value>()
+        .filter_map(Result::ok)
+        .collect();
+    if !values.iter().any(|(_, v)| wild(v)) {
+        return None;
+    }
+    let lua = p.lua.0.try_upgrade()?;
+    let her = world.player().map_or(Value::Nil, guid_value);
+    let copy = lua.create_table().ok()?;
+    for (k, v) in values {
+        let v = if wild(&v) { her.clone() } else { v };
+        copy.raw_set(k, v).ok()?;
+    }
+    Some(std::mem::replace(&mut p.params, copy))
+}
 /// A guid as scripts see it: userdata, as in the game (scripts check
 /// `type(target) == "userdata"`). Light userdata compares by value, so the
 /// same guid is equal to itself and works as a table key.
@@ -1040,6 +1124,9 @@ enum Check {
     /// to pass: fired as each goes in or out, the values then followed by
     /// `"enter"` or `"exit"`.
     Crossings(Vec<(u32, bool, Vec<Value>)>),
+    /// `ObjectWinched`: the cargo, who holds it now (`None`: nobody),
+    /// the carrier filter (0: any) and the mode bits (1 attach, 2 detach).
+    Winch(u32, Option<u32>, u32, u8),
     /// A kind no check knows: it never fires.
     Unhandled,
 }
@@ -1505,13 +1592,6 @@ fn check(
             }
             no
         }
-        // { cargo, carrier, "Attach" or "Detach" }: when the cargo is
-        // hooked onto (or let go from) a winch. Passes cargo and carrier.
-        // `MrxTaskObjectiveDeliver` waits on { cargo, 0, "any" } for cargo
-        // that reached its place still hanging (OilCon002's listening
-        // posts): carrier 0 is any; "any" is taken to hold once it is let
-        // go, the change that objective waits for (inferred from its
-        // `_OnObjectWinched` use, not checked against the game).
         // { object, name }: as the engine reports that physics event of the
         // object (MecCon001 and the mechanic's garage wait for theirs:
         // `{ garage, "gateFullyClosed" }` after `Object.CloseGate`, and
@@ -1532,21 +1612,35 @@ fn check(
                 None => Check::Unhandled,
             }
         }
+        // { cargo, carrier, mode }: as the cargo is hooked onto a winch or
+        // let go from one. From the 360 code (parse 0x823520b8, test
+        // 0x82352190, arguments 0x82352218):
+        // - The mode is read by its first letters: not "a" is detach (2),
+        //   "an..." is any (3), any other "a..." is attach (1).
+        // - Each occurrence is { carrier, cargo, 1 attach or 2 detach }; it
+        //   holds when the cargo filter takes the cargo, the carrier filter
+        //   (0: any) takes the carrier, and the mode has its bit.
+        // - It passes the cargo, the carrier, and "attach" or "detach".
+        // Here the occurrences are the changes in the world's winch state
+        // ([`World::winch`]) between checks. The first look only records it.
         "ObjectWinched" => {
             let Some(cargo) = guid(&p.params, 1) else {
                 return no;
             };
-            let mode = text(&p.params, 3);
-            let detach = matches!(mode.as_deref(), Some("detach" | "any"));
-            let carrier = guid(&p.params, 2).filter(|&c| c != 0);
-            let holds = match world.winch(cargo) {
-                Some(None) => detach,
-                Some(Some(c)) => !detach && carrier.is_none_or(|w| w == c),
-                None => false,
+            let carrier = guid(&p.params, 2).unwrap_or(0);
+            let mode = match text(&p.params, 3) {
+                Some(m) => {
+                    let mut c = m.chars().map(|c| c.to_ascii_lowercase());
+                    match (c.next(), c.next()) {
+                        (Some('a'), Some('n')) => 3,
+                        (Some('a'), _) => 1,
+                        _ => 2,
+                    }
+                }
+                None => return no,
             };
-            let mut extra = vec![id(cargo)];
-            extra.extend(carrier.map(id));
-            Check::Holds(holds, extra)
+            // Cargo the world has no winch record for hangs from nothing.
+            Check::Winch(cargo, world.winch(cargo).flatten(), carrier, mode)
         }
         // { object, "<" or ">", health }: while its health is below (or
         // above) the figure; passes the object. The hero's survival
@@ -1997,9 +2091,22 @@ mod tests {
             events.update(1.0, &world);
         }
         assert_eq!(log(&host).len(), 3);
-        host.lua().load("Event.Delete(id)").exec().unwrap();
+        // Event.Delete answers whether there was one (0x823583d8).
+        let (first, again): (bool, bool) = host
+            .lua()
+            .load("return Event.Delete(id), Event.Delete(id)")
+            .eval()
+            .unwrap();
+        assert!(first && !again);
         events.update(1.0, &world);
         assert_eq!(log(&host).len(), 3);
+        // Event.Post answers whether it had a name and data (0x82358470).
+        let (posted, bare): (bool, bool) = host
+            .lua()
+            .load("return Event.Post('Ping', {}), Event.Post('Ping')")
+            .eval()
+            .unwrap();
+        assert!(posted && !bare);
     }
 
     /// A repeating timer keeps its rate when the frames don't divide its

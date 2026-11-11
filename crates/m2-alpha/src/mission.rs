@@ -2752,6 +2752,68 @@ impl MissionLink {
             .as_ref()
             .is_some_and(|p| p.driving.is_none() && p.swimming());
         mission.set_swimming(PLAYER, swimming);
+        // The scripts' camera in a scene: on with its objects, and its view
+        // while a script directs it.
+        {
+            // How tall an object is, from its model's bounds: hers, a
+            // person's (by the guid it was spawned with) or a vehicle's.
+            let scene = &game.scene;
+            let height = |g: u32| -> Option<f32> {
+                let tall = |(lo, hi): (Vec3, Vec3)| hi.y - lo.y;
+                if g == PLAYER {
+                    let p = scene.player.as_ref()?;
+                    return p.model.as_ref().map(|(m, _)| tall(m.bounds));
+                }
+                if let Some(v) = scene.vehicles.iter().find(|v| v.guid == Some(g)) {
+                    return Some(tall(v.model.bounds));
+                }
+                let people = &scene.people;
+                let n = people.npcs.iter().find(|n| n.spawn == Some(g))?;
+                people.kinds.get(n.kind).map(|k| tall(k.model.bounds))
+            };
+            let mut w = mission.world().borrow_mut();
+            w.update_script_camera(dt, &height);
+            game.script_view = w.script_view().map(|v| (v.eye, v.forward()));
+        }
+
+        // The physics bodies the scripts can ask the kind of
+        // (`Object.GetPhysicsType`): hers and the people's (human), the
+        // vehicles' by how they drive.
+        {
+            let mut w = mission.world().borrow_mut();
+            let kinds = &mut w.physics_kinds;
+            kinds.clear();
+            kinds.insert(PLAYER, 1);
+            for n in &game.scene.people.npcs {
+                if let Some(g) = n.spawn {
+                    kinds.insert(g, 1);
+                }
+            }
+            for v in &game.scene.vehicles {
+                if let (Some(g), Some(k)) = (
+                    v.guid,
+                    m2_game::ported_physics::vehicle_physics_kind(&v.spec.kind),
+                ) {
+                    kinds.insert(g, k);
+                }
+            }
+        }
+
+        // What her crosshair is on, for `Player.GetTargetUnderReticle`: the
+        // point, and the person there if one (by the guid they were
+        // spawned with). On foot only, as her crosshair is.
+        {
+            let reticle = match (game.walking(), game.scene.world.as_ref()) {
+                (Some(p), Some(world)) => {
+                    let at = combat::Combat::aim_point(&world.physics, &game.scene.people, p, None);
+                    let who = combat::Combat::aim_probe(&world.physics, &game.scene.people, p)
+                        .and_then(|(_, n)| game.scene.people.npcs.get(n?)?.spawn);
+                    Some((at.to_array(), who))
+                }
+                _ => None,
+            };
+            mission.world().borrow_mut().reticle_target = reticle;
+        }
         // A scene's camera shot, from where its two stand now.
         if let Some(mut shot) = game.shot.take() {
             let w = mission.world().borrow();
