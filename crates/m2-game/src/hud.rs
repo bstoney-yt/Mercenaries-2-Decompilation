@@ -178,6 +178,12 @@ pub struct Hud {
     pub models: BTreeMap<u32, Model3d>,
     /// Marks held by a target by handle (`Marker.Add`).
     pub pins: BTreeMap<u32, Pin>,
+    /// Markers that pulse, by handle, each in its colour (`Marker.Pulse`,
+    /// until `Marker.HaltPulse` or the marker's removal). From the 360
+    /// code (`Gui._MarkerPulse`, 8231BB88, and `_MarkerHaltPulse`,
+    /// 8231BC90): the call is `(marker, r, g, b)`, 255 each where left
+    /// out. The faction manager pulses a faction's map marker red.
+    pub pulses: BTreeMap<u32, [u8; 3]>,
     /// Objective messages not yet shown.
     pub messages: Vec<ObjectiveMessage>,
     /// How the engine's markers over pickups are drawn, as the scripts
@@ -648,8 +654,22 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         );
         Ok(MultiValue::from_vec(vec![guid_value(handle)]))
     })?;
+    add(&marker, "Pulse", |hud, _, a| {
+        if let Some(h) = guid(a.first()) {
+            let c = |i: usize| number(a.get(i)).map_or(255, |v| v.clamp(0.0, 255.0) as u8);
+            hud.pulses.insert(h, [c(1), c(2), c(3)]);
+        }
+        Ok(MultiValue::new())
+    })?;
+    add(&marker, "HaltPulse", |hud, _, a| {
+        if let Some(h) = guid(a.first()) {
+            hud.pulses.remove(&h);
+        }
+        Ok(MultiValue::new())
+    })?;
     add(&marker, "Remove", |hud, _, a| {
         if let Some(h) = guid(a.first()) {
+            hud.pulses.remove(&h);
             hud.markers.remove(&h);
             hud.discs.remove(&h);
             hud.tripwires.remove(&h);
@@ -845,6 +865,36 @@ mod tests {
         }
         host.lua().load("Marker.Remove(mark)").exec().unwrap();
         assert_eq!(world.borrow().hud.pins.len(), 2);
+    }
+
+    #[test]
+    fn a_marker_pulses_in_its_colour_until_halted_or_removed() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        api::install(host.lua(), &world).unwrap();
+        host.lua()
+            .load(
+                r#"
+                local t = Sys.StringToGuid("734801")
+                a = Marker.AddBlip(t, "MiniMap_Icon_Faction_PMC", 32, 255, 255, 255, 255, 2)
+                b = Marker.AddBlip(t, "MiniMap_Icon_Faction_GR", 32, 255, 255, 255, 255, 2)
+                Marker.Pulse(a, 255, 0, 0)
+                Marker.Pulse(b)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let g = |n: &str| as_guid(&host.lua().globals().get::<Value>(n).unwrap()).unwrap();
+        assert_eq!(world.borrow().hud.pulses[&g("a")], [255, 0, 0]);
+        assert_eq!(world.borrow().hud.pulses[&g("b")], [255, 255, 255]);
+        host.lua()
+            .load("Marker.HaltPulse(a) Marker.Remove(b)")
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        assert!(w.hud.pulses.is_empty());
+        // Halted, the marker itself stays.
+        assert!(w.hud.markers.contains_key(&g("a")));
     }
 
     #[test]

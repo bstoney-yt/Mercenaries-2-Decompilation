@@ -300,7 +300,12 @@ pub struct VehicleSpec {
     /// `m2_assets::vehicle::rolls_with_wheel`. Empty, or a node past
     /// its end: every such node spins.
     pub node_rolls: Vec<bool>,
-    /// Mass, kg (by kind; invented).
+    /// Mass, kg: its template's `Mass` ([`VehicleSpec::tuned`]), else by
+    /// kind, invented. A car's body takes its `PHY2` chassis record's
+    /// before the invented one (`Physics::add_vehicle`); measured, the
+    /// invented one is left only on the eight catalogue models with
+    /// neither (five boats, two helicopters and a tank whose models no
+    /// physics template names).
     pub mass: f32,
     /// The nodes that turn with the turret (its mount, every node under
     /// it), if it has one.
