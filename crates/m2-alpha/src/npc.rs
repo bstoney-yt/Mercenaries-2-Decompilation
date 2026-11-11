@@ -180,6 +180,9 @@ pub const ON_FOOT_VISIBILITY: f32 = 90.0;
 const HELD_SIGHT: f32 = 1.5;
 /// From how high he sees (his head), and how often he looks, seconds.
 const EYE: f32 = 1.6;
+
+/// How far short of whom he looks at his sight line stops, metres.
+const TOUCHING: f32 = 0.1;
 const LOOK_EVERY: f32 = 0.2;
 /// Seconds a soldier hunts without sight of her before calming down, and
 /// how close to where he last saw her he goes (inferred).
@@ -1826,10 +1829,6 @@ impl Npc {
         turn.abs()
     }
 
-    /// Whether he sees `target` from his head: within his
-    /// [`sight`](Self::sight), inside his `VisionFOV` (unless `any_way`, as in a fight,
-    /// where he keeps turning to her), and nothing static between (a
-    /// little short of her, so the car she sits in doesn't hide her).
     /// How far he sees her, metres: his `Vision` times her `Visibility`,
     /// half as far again once he is on to her (0x822E89B0).
     /// His senses for a query ([`m2_engine::ai_sense::sense`]): from his
@@ -1883,6 +1882,11 @@ impl Npc {
         self.foe_reach.unwrap_or_else(|| self.her_sight())
     }
 
+    /// Whether he sees `target` from his head: within his
+    /// [`sight`](Self::sight), inside his `VisionFOV` (unless `any_way`, as
+    /// in a fight, where he keeps turning to her), and nothing static
+    /// between, all the way to it (the car she sits in is no static
+    /// surface, so it does not hide her).
     pub fn sees(&self, physics: &Physics, target: Vec3, any_way: bool) -> bool {
         self.sees_past(physics, target, any_way, None)
     }
@@ -1890,7 +1894,8 @@ impl Npc {
     /// [`sees`](Self::sees) a subject that is vehicle `body`, if one: the
     /// line runs all the way to it, passing through its own body, as the
     /// 360's sight lines leave the subject out (0x822E8DF8 puts its object
-    /// in the request). A person's ends short of him instead.
+    /// in the request). A person's runs to him too, through no vehicle
+    /// (static surfaces only).
     pub fn sees_past(
         &self,
         physics: &Physics,
@@ -1917,7 +1922,10 @@ impl Npc {
                 .cast_ray_vehicle(eye, to / distance, distance, Some(body))
                 .is_none();
         }
-        let clear = (distance - 2.5).max(0.5);
+        // All the way to her: the 360's request runs to the subject
+        // (0x822E8DF8). Ours stops a hand short, so a surface she touches
+        // is not taken for one between (invented).
+        let clear = (distance - TOUCHING).max(0.0);
         physics.cast_ray(eye, to / distance, clear).is_none()
     }
 
@@ -6820,6 +6828,23 @@ pub(crate) mod tests {
             Quat::IDENTITY,
         );
         physics.step(1.0 / 60.0);
+    }
+
+    // A wall a step in front of her hides her: the line runs all the way
+    // to her (it used to stop 2.5 m short and see past it).
+    #[test]
+    fn a_wall_just_before_her_hides_her() {
+        let mut physics = ground();
+        wall(&mut physics, 28.5, 5.0);
+        let post = Brain::Post { facing: 0.0 };
+        let mut n = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(1));
+        n.her_visibility = 300.0;
+        n.character.position = Vec3::ZERO;
+        assert!(!n.sees(&physics, Vec3::new(0.0, 1.6, 30.0), false));
+        assert!(
+            n.sees(&physics, Vec3::new(0.0, 1.6, 27.0), false),
+            "this side of it"
+        );
     }
 
     // Playtest 8: the villa's waves stuck outside, on walls their paths
