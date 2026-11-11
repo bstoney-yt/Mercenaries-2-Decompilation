@@ -240,6 +240,36 @@ pub enum Command {
         guid: u32,
         on: bool,
     },
+    /// An AI's haste from here on (`Ai.SetHaste(ai, haste)`), held to
+    /// 0..=2 as the 360 code does (82311968).
+    SetHaste {
+        guid: u32,
+        haste: f32,
+    },
+    /// An AI keeps within `radius` metres of a point (`Ai.Anchor`): `at`,
+    /// or where `target` is, as the call gave one (from the 360 code,
+    /// 82310EB8: `AnchorGuid`, else `AnchorPosition`, else where the AI
+    /// itself stands).
+    Anchor {
+        guid: u32,
+        radius: f32,
+        target: Option<u32>,
+        at: Option<[f32; 3]>,
+    },
+    /// An object fades from sight over `seconds` (`Object.FadeOut(object,
+    /// seconds, flag)`); what the flag asks isn't known (OilCon001 passes
+    /// true as its executive leaves).
+    FadeOut {
+        guid: u32,
+        seconds: f32,
+        flag: bool,
+    },
+    /// An ambience by name starts or stops (`Sound.CueAmbience`,
+    /// `Sound.StopAmbience`).
+    Ambience {
+        name: String,
+        on: bool,
+    },
     /// The player's fuel goes up by this (`Player.AddFuel`: a fuel
     /// pickup's script), up to the tanks' capacity.
     AddFuel(f32),
@@ -2108,6 +2138,27 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&object, "IsAwake", |w, _, a| {
         values([Value::Boolean(id(a.first()).is_some_and(|g| w.is_awake(g)))])
     })?;
+    // Object.IsHibernated(object): not awake. From the 360 code
+    // (82330BE8): the same test as `Object.IsAwake`'s (82330C90), turned
+    // round; nothing for what isn't an object.
+    add(&object, "IsHibernated", |w, _, a| match id(a.first()) {
+        Some(g) if w.objects.contains_key(&g) => values([Value::Boolean(!w.is_awake(g))]),
+        _ => values([]),
+    })?;
+    // Object.FadeOut(object, seconds, flag): the object fades from sight
+    // over the seconds; gives true. From the 360 code (8232FDB0): the
+    // object and the seconds are needed, the flag is false when left out.
+    add(&object, "FadeOut", |w, _, a| {
+        let (Some(guid), Some(seconds)) = (id(a.first()), num(a.get(1))) else {
+            return values([]);
+        };
+        w.commands.push(Command::FadeOut {
+            guid,
+            seconds,
+            flag: matches!(a.get(2), Some(Value::Boolean(true))),
+        });
+        values([Value::Boolean(true)])
+    })?;
     add(&object, "GetHealth", |w, _, a| {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
         values([o.map_or(Value::Nil, |o| Value::Number(f64::from(o.health)))])
@@ -3169,6 +3220,57 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // Ai.SetHaste(ai, haste): the AI's haste from here on, held to 0..=2;
+    // gives whether there is such an AI. From the 360 code (82311968).
+    add(&ai, "SetHaste", |w, _, a| {
+        let (Some(guid), Some(haste)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Boolean(false)]);
+        };
+        if !w.objects.contains_key(&guid) {
+            return values([Value::Boolean(false)]);
+        }
+        w.commands.push(Command::SetHaste {
+            guid,
+            haste: haste.clamp(0.0, 2.0),
+        });
+        values([Value::Boolean(true)])
+    })?;
+    // Ai.Anchor({ AIGuid, AnchorRadius, AnchorGuid or AnchorPosition }):
+    // the AI keeps within the radius of the object or point given, else
+    // of where it stands; gives whether it had a place to anchor to.
+    // From the 360 code (82310EB8): the AI and the radius are needed.
+    add(&ai, "Anchor", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([Value::Boolean(false)]);
+        };
+        let (Some(guid), Some(radius)) = (
+            id(t.raw_get::<Value>("AIGuid").ok().as_ref()),
+            num(t.raw_get::<Value>("AnchorRadius").ok().as_ref()),
+        ) else {
+            return values([Value::Boolean(false)]);
+        };
+        let target = id(t.raw_get::<Value>("AnchorGuid").ok().as_ref()).filter(|&g| g != 0);
+        let at = match t.raw_get::<Value>("AnchorPosition")? {
+            Value::Table(l) => {
+                let c = |i| num(l.raw_get::<Value>(i).ok().as_ref());
+                match (c(1), c(2), c(3)) {
+                    (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if target.is_none() && at.is_none() && w.place_of(guid).is_none() {
+            return values([Value::Boolean(false)]);
+        }
+        w.commands.push(Command::Anchor {
+            guid,
+            radius,
+            target,
+            at: if target.is_some() { None } else { at },
+        });
+        values([Value::Boolean(true)])
+    })?;
     add(&ai, "Goal", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([]);
@@ -3332,6 +3434,29 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.commands.push(Command::CueSound {
                 at: id(a.first()).filter(|&g| g != 0),
                 cue: cue.to_string_lossy(),
+            });
+        }
+        values([])
+    })?;
+
+    // Sound.CueAmbience(name) and Sound.StopAmbience(name): an ambience
+    // by name (OilCon001's `ksMissionAmbience`). From the 360 code
+    // (82342F28, 82342FB0): the name is needed, and neither gives
+    // anything.
+    add(&sound, "CueAmbience", |w, _, a| {
+        if let Some(Value::String(name)) = a.first() {
+            w.commands.push(Command::Ambience {
+                name: name.to_string_lossy(),
+                on: true,
+            });
+        }
+        values([])
+    })?;
+    add(&sound, "StopAmbience", |w, _, a| {
+        if let Some(Value::String(name)) = a.first() {
+            w.commands.push(Command::Ambience {
+                name: name.to_string_lossy(),
+                on: false,
             });
         }
         values([])
@@ -4300,6 +4425,75 @@ mod tests {
         // Added whole: the engine doesn't hold it to the tanks' capacity
         // (the 360's `Player.AddFuel`).
         assert_eq!(w.objects[&1].fuel, 180.0);
+    }
+
+    #[test]
+    fn oilcon001s_calls_reach_the_game() {
+        let (host, world) = setup();
+        world
+            .borrow_mut()
+            .insert(70, Object::new("OilCon001_Exec", [5.0, 0.0, 7.0]));
+        let (hasty, nobody, anchored, bare, faded, hibernated, unknown): (
+            bool,
+            bool,
+            bool,
+            bool,
+            Value,
+            Value,
+            Value,
+        ) = host
+            .lua()
+            .load(
+                r#"
+                local exec = Sys.StringToGuid("70")
+                Sound.CueAmbience("amb_oilcon001")
+                Sound.StopAmbience("amb_oilcon001")
+                return Ai.SetHaste(exec, 5), Ai.SetHaste(Sys.StringToGuid("71"), 1),
+                    Ai.Anchor({ AIGuid = exec, AnchorRadius = 0 }),
+                    Ai.Anchor({ AIGuid = exec }),
+                    Object.FadeOut(exec, 1, true),
+                    Object.IsHibernated(exec),
+                    Object.IsHibernated(Sys.StringToGuid("71"))
+                "#,
+            )
+            .eval()
+            .unwrap();
+        // Haste is held to 0..=2; no such AI, no haste.
+        assert!(hasty && !nobody);
+        // Anchored where it stands; without a radius, not at all.
+        assert!(anchored && !bare);
+        assert_eq!(faded, Value::Boolean(true));
+        assert!(matches!(hibernated, Value::Boolean(_)));
+        assert_eq!(unknown, Value::Nil);
+        let commands = world.borrow_mut().take_commands();
+        assert_eq!(
+            commands,
+            [
+                Command::Ambience {
+                    name: "amb_oilcon001".into(),
+                    on: true
+                },
+                Command::Ambience {
+                    name: "amb_oilcon001".into(),
+                    on: false
+                },
+                Command::SetHaste {
+                    guid: 70,
+                    haste: 2.0
+                },
+                Command::Anchor {
+                    guid: 70,
+                    radius: 0.0,
+                    target: None,
+                    at: None
+                },
+                Command::FadeOut {
+                    guid: 70,
+                    seconds: 1.0,
+                    flag: true
+                },
+            ]
+        );
     }
 
     #[test]
