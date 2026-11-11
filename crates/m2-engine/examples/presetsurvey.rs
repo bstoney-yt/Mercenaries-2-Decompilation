@@ -43,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let mut bytes: HashMap<u32, usize> = HashMap::new();
+    let mut leafy: HashSet<u32> = HashSet::new();
     for &m in &models {
         let Ok(d) = source.model(m) else { continue };
         let Ok(parsed) = Model::parse(&d.base) else {
@@ -51,9 +52,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let phy2 = Ucfx::parse(&d.base)
             .ok()
             .and_then(|u| u.top_level(*b"PHY2").map(<[u8]>::to_vec));
-        let kept = CollisionShape::for_model(&parsed, phy2.as_deref(), 0)
-            .and_then(|s| s.source.map(|s| s.bytes()))
-            .unwrap_or(0);
+        let shape = CollisionShape::for_model(&parsed, phy2.as_deref(), 0);
+        if shape.as_ref().is_some_and(|s| s.leaves.is_some()) {
+            leafy.insert(m);
+        }
+        let kept = shape.and_then(|s| s.source.map(|s| s.bytes())).unwrap_or(0);
         bytes.insert(m, kept);
     }
     let with: Vec<usize> = bytes.values().copied().filter(|&b| b > 0).collect();
@@ -77,6 +80,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "models placed within {radius} m of ({x}, {z}): {}, their shapes kept {} bytes",
         near.len(),
         near_total
+    );
+    let leafy_objects = world
+        .objects
+        .iter()
+        .filter(|o| leafy.contains(&o.model))
+        .count();
+    println!(
+        "models placed with leaves: {}, objects of them: {leafy_objects}",
+        leafy.len()
     );
     Ok(())
 }

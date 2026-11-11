@@ -1120,7 +1120,7 @@ impl Pursuers {
                     .any(|&(a, b)| {
                         // Stopping 1 m short: she or her vehicle is no block.
                         let end = b - (b - a).normalize_or_zero();
-                        physics.line_clear(a, end, Some(id))
+                        physics.sight_clear(a, end, Some(id))
                     });
             }
             p.unseen = if p.sees { 0.0 } else { p.unseen + dt };
