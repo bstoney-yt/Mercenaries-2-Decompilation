@@ -63,33 +63,6 @@ const ARRIVE: f32 = 6.0;
 const PORT: f32 = 8.0;
 /// Top speed when the template gives none, m/s.
 const DEFAULT_TOP: f32 = 20.0;
-/// The scripts' path movers ([`crate::paths`]) brake for her or a vehicle
-/// this near ahead, metres (invented; road traffic stops by the 360's
-/// rules, [`road_driver`]).
-const CLEAR_AHEAD: f32 = 12.0;
-
-/// Whether any of `places` is in the way of a vehicle at `here` facing
-/// `forward` (flat) going `speed`: ahead of it within [`CLEAR_AHEAD`], or
-/// as far as it goes in [`STOP_SECONDS`], and within [`CLEAR_SIDE`] of its
-/// line. The scripts' path movers stop for it (invented).
-pub(crate) fn in_the_way(
-    here: Vec3,
-    forward: Vec2,
-    speed: f32,
-    places: impl IntoIterator<Item = Vec3>,
-) -> bool {
-    let reach = CLEAR_AHEAD.max(speed * STOP_SECONDS);
-    places.into_iter().any(|p| {
-        let d = flat(p - here);
-        let ahead = d.dot(forward);
-        ahead > 1.0 && ahead < reach && d.perp_dot(forward).abs() < CLEAR_SIDE
-    })
-}
-/// And as far ahead as it goes in this long, seconds, within this of its
-/// line, metres (invented: room to stop, and a truck's half width more
-/// than its own).
-const STOP_SECONDS: f32 = 1.8;
-const CLEAR_SIDE: f32 = 3.5;
 /// A vehicle not loaded after this many seconds never will be.
 const GIVE_UP: f32 = 30.0;
 /// Road vehicles' entities, which no layer uses.
@@ -1010,20 +983,6 @@ fn next_point(points: &[Vec3], s: f32, forward: bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // A boat on its path at 17 m/s sees her ahead of it in time to stop
-    // (GurCon003 round 82), not one beside its line or behind it; slow,
-    // only what is near.
-    #[test]
-    fn what_is_in_the_way_reaches_further_the_faster() {
-        let f = Vec2::new(0.0, 1.0);
-        let ahead = |z: f32, x: f32| [Vec3::new(x, 0.0, z)];
-        assert!(in_the_way(Vec3::ZERO, f, 17.0, ahead(28.0, 1.0)));
-        assert!(!in_the_way(Vec3::ZERO, f, 17.0, ahead(28.0, 5.0)));
-        assert!(!in_the_way(Vec3::ZERO, f, 17.0, ahead(-5.0, 0.0)));
-        assert!(!in_the_way(Vec3::ZERO, f, 2.0, ahead(28.0, 0.0)));
-        assert!(in_the_way(Vec3::ZERO, f, 2.0, ahead(10.0, 0.0)));
-    }
 
     fn road(entity: u32, points: &[(f32, f32)]) -> Road {
         Road {

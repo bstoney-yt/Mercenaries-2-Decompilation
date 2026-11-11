@@ -6535,8 +6535,7 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                         route[0],
                         route[route.len() - 1]
                     );
-                    game.paths
-                        .start(v, route, lap, order.mode, haste.unwrap_or(1.0));
+                    game.paths.start(v, route, lap, order.mode, *haste);
                 }
                 // A person on foot (the villa's wave soldiers, coming in
                 // through the garage and over the walls): they run it.
