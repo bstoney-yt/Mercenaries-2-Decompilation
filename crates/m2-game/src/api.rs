@@ -2619,6 +2619,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     crate::links::install(&lib, &add)?;
     crate::script_sound::install(&lib, &add)?;
     crate::script_shell::install(lua, &lib, &add)?;
+    crate::screen_queries::install(&lib, &add)?;
     let human = lib("Human")?;
     // Human.SetAllowCorpseCleanup(character, allow): whether the game may
     // clear its body away (the verify objective keeps a target's until it

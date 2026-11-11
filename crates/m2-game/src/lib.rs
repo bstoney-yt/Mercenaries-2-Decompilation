@@ -21,6 +21,7 @@ pub mod path_order;
 pub mod report;
 pub mod reverb;
 pub mod savedata;
+pub mod screen_queries;
 pub mod script;
 pub mod script_flags;
 pub mod script_hash;
