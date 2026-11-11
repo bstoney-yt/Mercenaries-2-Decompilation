@@ -180,6 +180,14 @@ impl Object {
 pub enum Command {
     /// A hijack's own requests (`crate::hijack`).
     Hijack(crate::hijack::HijackCommand),
+    /// Open (or close) vehicle `guid`'s door `door`, a part's name hash
+    /// (`"pivot"`): `Vehicle.OpenDoor` and `Vehicle.CloseDoor`, which the
+    /// 360 queues for the vehicle to swing.
+    Door {
+        guid: u32,
+        door: u32,
+        open: bool,
+    },
     /// Create `what` (an object template's name, such as `"Veyron"` or
     /// `"Explosion (Grenade)"`) as `guid`.
     Spawn {
@@ -760,6 +768,9 @@ pub struct ScriptWorld {
     pub landing_zones: HashMap<i64, BTreeMap<i64, u32>>,
     /// Cargo on winches: what carries each, `None` once let go.
     pub winch: HashMap<u32, Option<u32>>,
+    /// Vehicles' doors the scripts opened (true) or closed, by (vehicle,
+    /// door's name hash).
+    pub doors: HashMap<(u32, u32), bool>,
     /// What the scripts want on the player's screen.
     pub hud: crate::hud::Hud,
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
@@ -1588,6 +1599,21 @@ fn squad_members<'a>(squad: &str, objects: impl Iterator<Item = (u32, &'a str)>)
         .collect();
     out.sort_unstable();
     out
+}
+
+/// `Vehicle.OpenDoor(v, door)` or `Vehicle.CloseDoor`: the door is a part's
+/// name, hashed (or the hash itself).
+fn door_request(w: &mut ScriptWorld, a: &[Value], open: bool) -> mlua::Result<MultiValue> {
+    let door = match a.get(1) {
+        Some(Value::String(s)) => Some(m2_assets::name_hash(&s.to_string_lossy())),
+        Some(Value::Integer(i)) => Some(*i as u32),
+        _ => None,
+    };
+    if let (Some(guid), Some(door)) = (id(a.first()), door) {
+        w.doors.insert((guid, door), open);
+        w.commands.push(Command::Door { guid, door, open });
+    }
+    values([])
 }
 
 fn guid_value(g: Option<u32>) -> Value {
@@ -2819,6 +2845,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let vehicle = lib("Vehicle")?;
+    // From the 360 code: `Vehicle.OpenDoor(v, door)` (0x82347ee0) and
+    // `Vehicle.CloseDoor` (0x82347f80) read the vehicle and the door's
+    // name (hashed), queue the request (open 0, close 1; at most 100 a
+    // frame, 0x82245c98) and return nothing; bad arguments raise the
+    // usual argument error. PmcCon033 opens and closes a vehicle's
+    // `"pivot"` on timers, passing `Vehicle.OpenDoor` itself as the
+    // timer's callback.
+    add(&vehicle, "OpenDoor", |w, _, a| door_request(w, a, true))?;
+    add(&vehicle, "CloseDoor", |w, _, a| door_request(w, a, false))?;
     add(&vehicle, "GetDriver", |w, _, a| {
         let driver = id(a.first()).and_then(|v| w.driver_of(v));
         values([guid_value(driver)])
@@ -5760,6 +5795,43 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((orig, copy, players), (2, 1, true));
+    }
+
+    #[test]
+    fn vehicle_doors_open_and_close_on_request() {
+        // PmcCon033 hands `Vehicle.OpenDoor` to a timer as its callback.
+        let (host, world) = setup();
+        world.borrow_mut().take_commands();
+        let (kind, n): (String, i64) = host
+            .lua()
+            .load(
+                "local f = Vehicle.OpenDoor
+                 local n = select('#', f(50, 'pivot'))
+                 Vehicle.CloseDoor(50, 'pivot')
+                 return type(f), n",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((kind.as_str(), n), ("function", 0));
+        let pivot = m2_assets::name_hash("pivot");
+        let mut w = world.borrow_mut();
+        assert_eq!(
+            w.take_commands(),
+            [
+                Command::Door {
+                    guid: 50,
+                    door: pivot,
+                    open: true
+                },
+                Command::Door {
+                    guid: 50,
+                    door: pivot,
+                    open: false
+                },
+            ]
+        );
+        assert_eq!(w.doors.get(&(50, pivot)), Some(&false));
+        assert!(host.take_calls().is_empty());
     }
 
     #[test]
