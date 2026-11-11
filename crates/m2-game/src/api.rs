@@ -2666,8 +2666,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Human.IsGrappling(character): the player's, as the game says; no
     // one else grapples.
     add(&human, "IsGrappling", |w, _, a| {
-        let her = id(a.first()).is_some_and(|g| Some(g) == w.player);
-        values([Value::Boolean(her && w.grappling)])
+        // From the 360 code (0x823251e0): nil when the guid is no object
+        // (a wildcard character among them), else the human's flag.
+        match id(a.first()).filter(|g| w.objects.contains_key(g)) {
+            Some(g) => values([Value::Boolean(Some(g) == w.player && w.grappling)]),
+            None => values([Value::Nil]),
+        }
     })?;
     // Human.DisableWeapons(character) / EnableWeapons(character).
     add(&human, "DisableWeapons", |w, _, a| {
@@ -3275,24 +3279,21 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let first = matches!(num(a.first()), Some(n) if n == 0.0);
         values([guid_value(w.player.filter(|_| first))])
     })?;
-    for name in [
-        "GetLocalCharacter",
-        "GetAnyCharacter",
-        "GetPrimaryCharacter",
-        "GetCharacter",
-    ] {
+    for name in ["GetLocalCharacter", "GetPrimaryCharacter", "GetCharacter"] {
         add(&player, name, |w, _, _| values([guid_value(w.player)]))?;
     }
+    // The wildcard characters (0x8233e8c8, 0x8233e928): light userdata
+    // 0xf0000000 and 0xf0000001, which events take as any player's (every
+    // player's) character ([`crate::events::ANY_CHARACTER`]).
+    add(&player, "GetAnyCharacter", |_, _, _| {
+        values([crate::events::guid_value(crate::events::ANY_CHARACTER)])
+    })?;
     // The second player of co-op: none.
     add(&player, "GetSecondaryCharacter", |_, _, _| {
         values([Value::Nil])
     })?;
-    add(&player, "GetAllCharacters", |w, lua, _| {
-        let t = lua.create_table()?;
-        if let Some(p) = w.player {
-            t.raw_push(crate::events::guid_value(p))?;
-        }
-        values([Value::Table(t)])
+    add(&player, "GetAllCharacters", |_, _, _| {
+        values([crate::events::guid_value(crate::events::ALL_CHARACTERS)])
     })?;
     // One player, guid 1, as userdata (from the scripts:
     // `MrxGuiBase.WidgetManager.GetWidgetByNameAndOwner` answers only for
@@ -4614,21 +4615,21 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             -- `sTgtLabelFilter`) puts no targets on the radar or the map,
             -- and counts its kills as they come.
             if f.players then
-                local p = Player.GetAnyCharacter()
+                local p = Player.GetLocalCharacter()
                 if p ~= nil and not has(f, p) and not f.ex[p] then r[#r + 1] = p end
             end
             return r
         end
         function F.GetCoopPlayerGuid(f)
             if not ok(f) then return nil end
-            local p = Player.GetAnyCharacter()
+            local p = Player.GetLocalCharacter()
             if p ~= nil and (f.players or has(f, p)) then return p end
             return nil
         end
         function F.Eval(f, g)
             if not ok(f) or g == nil or f.ex[g] then return false end
             if has(f, g) then return true end
-            if f.players and g == Player.GetAnyCharacter() then return true end
+            if f.players and g == Player.GetLocalCharacter() then return true end
             return f.label ~= nil and Object.HasLabel(g, f.label) or false
         end
         ObjectFilter = F
@@ -5073,8 +5074,8 @@ mod tests {
         host.lua()
             .load(
                 "Object.CloseGate('_global_veh_jeep 0x0001')\n\
-                 Human.DisableWeapons(Player.GetAnyCharacter())\n\
-                 Human.EnableWeapons(Player.GetAnyCharacter())\n\
+                 Human.DisableWeapons(Player.GetLocalCharacter())\n\
+                 Human.EnableWeapons(Player.GetLocalCharacter())\n\
                  Vehicle.Usable(Pg.GetGuidByName('_global_veh_jeep 0x0001'), false)\n\
                  Player.AddFuel(80)",
             )
@@ -5372,7 +5373,7 @@ mod tests {
             .exec()
             .unwrap();
         assert!(world.borrow().grapple_enabled);
-        let ask = "return Human.IsGrappling(Player.GetAnyCharacter())";
+        let ask = "return Human.IsGrappling(Player.GetLocalCharacter())";
         assert!(!lua.load(ask).eval::<bool>().unwrap());
         world.borrow_mut().grappling = true;
         assert!(lua.load(ask).eval::<bool>().unwrap());
@@ -5394,8 +5395,8 @@ mod tests {
             .unwrap();
         lua.load(
             "Player.SetProfileCostume(3)\n\
-             Player.SetOutfit(Player.GetAnyCharacter(), 'pmc_hum_jen_v2')\n\
-             Human.PlayRawAnimation(Player.GetAnyCharacter(), \
+             Player.SetOutfit(Player.GetLocalCharacter(), 'pmc_hum_jen_v2')\n\
+             Human.PlayRawAnimation(Player.GetLocalCharacter(), \
                 'ALL01_Contract_Briefing_Jennifer', false, false, -1, true, true)",
         )
         .exec()
@@ -5438,7 +5439,7 @@ mod tests {
         }
         host.lua()
             .load(
-                "Object.SetTransformToObject(Player.GetAnyCharacter(), \
+                "Object.SetTransformToObject(Player.GetLocalCharacter(), \
                  'PmcInterior_StarterFiona_BriefingLoc_Hero1')",
             )
             .exec()
@@ -5460,7 +5461,7 @@ mod tests {
         }
         host.lua()
             .load(
-                "Object.SetTransformToObject(Player.GetAnyCharacter(), \
+                "Object.SetTransformToObject(Player.GetLocalCharacter(), \
                  Pg.GetGuidByName('_global_veh_jeep 0x0001'), 'hp_seat')",
             )
             .exec()
@@ -5698,6 +5699,52 @@ mod tests {
     }
 
     #[test]
+    fn the_wildcard_characters_stand_for_her_in_events_only() {
+        // From the 360 code: GetAnyCharacter and GetAllCharacters answer
+        // light userdata 0xf0000000 and 0xf0000001. Event subjects take
+        // them as her; Human natives look the guid up and find nothing;
+        // Player.SetGrappleEnabled falls back to the local player.
+        let (host, world) = setup();
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        world.borrow_mut().grappling = true;
+        let lua = host.lua();
+        let (same, wild, grappling): (bool, bool, Value) = lua
+            .load(
+                r#"
+                local any, all = Player.GetAnyCharacter(), Player.GetAllCharacters()
+                near = {}
+                Event.Create(Event.ObjectProximity, {any, 50, "<", 5},
+                    function() near[#near + 1] = "any" end)
+                Event.Create(Event.ObjectProximity, {all, 50, "<", 5},
+                    function() near[#near + 1] = "all" end)
+                Player.SetGrappleEnabled(any, true)
+                return any == Player.GetAnyCharacter(),
+                    type(any) == "userdata" and any ~= Player.GetLocalCharacter()
+                        and any ~= all,
+                    Human.IsGrappling(any)
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(same && wild);
+        assert_eq!(grappling, Value::Nil);
+        assert!(world.borrow().grapple_enabled);
+        events.update_shared(0.1, &world);
+        world.borrow_mut().objects.get_mut(&1).unwrap().position = [1.0, 0.0, 1.0];
+        events.update_shared(0.1, &world);
+        let mut near: Vec<String> = lua
+            .globals()
+            .get::<Table>("near")
+            .unwrap()
+            .sequence_values()
+            .map(|v| v.unwrap())
+            .collect();
+        near.sort();
+        assert_eq!(near, ["all", "any"]);
+    }
+
+    #[test]
     fn asserts_log_and_switches_are_off() {
         let (host, world) = setup();
         let n: f64 = host
@@ -5857,7 +5904,7 @@ mod tests {
             .load(
                 r#"
                 done = nil
-                local her = Player.GetAnyCharacter()
+                local her = Player.GetLocalCharacter()
                 Human.PlayRawAnimation(her, "all_starter03_job_briefing_spiel", true, true, 0.5, false, true)
                 Event.Create(Event.HumanAnimationNearlyCompleted, { her, 0.1 },
                     function() done = true end, {})
