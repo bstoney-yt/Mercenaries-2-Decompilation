@@ -5917,6 +5917,7 @@ fn fly(game: &mut Game, mission: &mut Mission, landed: &mut HashSet<u32>, c: &Co
                             location: Some(to),
                             target: None,
                             haste: None,
+                            path: None,
                         },
                     );
                 }
@@ -6454,10 +6455,29 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             goal,
             target: Some(path),
             haste,
+            path: order,
             ..
         } if goal == "PathMove" => {
             let vehicle = mission.world().borrow().vehicle_of(*guid);
-            let route: Vec<Vec3> = mission.path(*path).iter().map(|&p| Vec3::from(p)).collect();
+            // Where on the path it starts, which way it goes and what it
+            // does at the end are the goal's own (from the 360 code,
+            // `m2_game::path_order`): unless told otherwise, from the
+            // point of the path nearest it.
+            let order = order.unwrap_or_default();
+            let points = mission.path(*path).to_vec();
+            let from = {
+                let w = mission.world().borrow();
+                vehicle
+                    .and_then(|v| w.objects.get(&v))
+                    .or_else(|| w.objects.get(guid))
+                    .map(|o| o.position)
+            };
+            let to_vec = |ps: Vec<[f32; 3]>| ps.into_iter().map(Vec3::from).collect::<Vec<_>>();
+            let lap = to_vec(order.lap(&points));
+            let route = match from {
+                Some(from) => to_vec(order.route(&points, from)),
+                None => lap.clone(),
+            };
             match vehicle {
                 Some(v) if !route.is_empty() => {
                     eprintln!(
@@ -6467,7 +6487,8 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                         route[0],
                         route[route.len() - 1]
                     );
-                    game.paths.start(v, route, haste.unwrap_or(1.0));
+                    game.paths
+                        .start(v, route, lap, order.mode, haste.unwrap_or(1.0));
                 }
                 // A person on foot (the villa's wave soldiers, coming in
                 // through the garage and over the walls): they run it.

@@ -15,6 +15,7 @@ pub mod layers;
 pub mod library;
 pub mod mission;
 pub mod music;
+pub mod path_order;
 pub mod report;
 pub mod reverb;
 pub mod savedata;
