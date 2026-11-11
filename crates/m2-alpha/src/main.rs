@@ -2813,7 +2813,11 @@ fn run_bench(
             next_line += BENCH_EVERY;
             let gpu = backend.take_gpu_times().unwrap_or_default();
             gpu_all.frames += gpu.frames;
+            gpu_all.cpu_frames += gpu.cpu_frames;
             for (a, b) in gpu_all.stages.iter_mut().zip(gpu.stages) {
+                *a += b;
+            }
+            for (a, b) in gpu_all.cpu.iter_mut().zip(gpu.cpu) {
                 *a += b;
             }
             let n = span.summary().frames.max(1) as f64;
@@ -8714,7 +8718,8 @@ impl Pace {
 }
 
 /// GPU milliseconds a frame, all stages and each
-/// ([`m2_render::gpu::timer::STAGES`]), over the frames timed.
+/// ([`m2_render::gpu::timer::STAGES`]), over the frames timed, then the
+/// CPU's milliseconds encoding each stage and finishing the submit.
 fn gpu_line(g: &m2_render::gpu::timer::GpuTimes) -> String {
     let n = f64::from(g.frames.max(1));
     let stages: Vec<String> = m2_render::gpu::timer::STAGES
@@ -8722,11 +8727,19 @@ fn gpu_line(g: &m2_render::gpu::timer::GpuTimes) -> String {
         .zip(g.stages)
         .map(|(name, ms)| format!("{name} {:.2}", ms / n))
         .collect();
+    let c = f64::from(g.cpu_frames.max(1));
+    let cpu: Vec<String> = m2_render::gpu::timer::STAGES
+        .iter()
+        .chain(&["submit"])
+        .zip(g.cpu)
+        .map(|(name, ms)| format!("{name} {:.2}", ms / c))
+        .collect();
     format!(
-        "ms a frame {:.2} over {} frames ({})",
+        "ms a frame {:.2} over {} frames ({}); encode cpu ms a frame ({})",
         g.per_frame(),
         g.frames,
-        stages.join(", ")
+        stages.join(", "),
+        cpu.join(", ")
     )
 }
 

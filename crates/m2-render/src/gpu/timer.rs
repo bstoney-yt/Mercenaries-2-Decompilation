@@ -1,15 +1,22 @@
 //! GPU time per frame stage, from timestamp queries written between the
 //! stages of a frame's command encoder ([`GpuTimer`]). Read back a few
 //! frames late (the GPU runs behind), summed until taken
-//! ([`GpuTimer::take`]). Needs the device's `TIMESTAMP_QUERY` and
+//! ([`GpuTimer::take`]). The CPU's time encoding each stage is summed
+//! alongside, with the time from the last stage to the end of the
+//! submit as [`CPU_SUBMIT`]. Needs the device's `TIMESTAMP_QUERY` and
 //! `TIMESTAMP_QUERY_INSIDE_ENCODERS`; without them there is no timer.
 
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Instant;
 
 /// The stages of a frame, in order, each timed from the mark before it.
 pub const STAGES: [&str; 5] = ["shadows", "world", "water", "glows", "post"];
+
+/// [`GpuTimes::cpu`]'s last entry: the CPU from the end of the last stage
+/// to the end of the frame's submit.
+pub const CPU_SUBMIT: usize = STAGES.len();
 
 /// Marks a frame writes: one before the first stage and one after each.
 const MARKS: u32 = STAGES.len() as u32 + 1;
@@ -30,6 +37,11 @@ pub struct GpuTimes {
     pub frames: u32,
     /// Milliseconds in each of [`STAGES`], summed over the frames.
     pub stages: [f64; STAGES.len()],
+    /// Frames whose CPU encoding was timed.
+    pub cpu_frames: u32,
+    /// The CPU's milliseconds encoding each of [`STAGES`], then
+    /// [`CPU_SUBMIT`], summed over `cpu_frames`.
+    pub cpu: [f64; STAGES.len() + 1],
 }
 
 impl GpuTimes {
@@ -63,6 +75,8 @@ struct Inner {
     /// The slot the frame being encoded writes to, if one was free.
     current: Option<usize>,
     times: GpuTimes,
+    /// When the CPU began the stage it is encoding.
+    lap: Option<Instant>,
 }
 
 /// Times a frame's stages on the GPU (see the module docs).
@@ -128,6 +142,7 @@ impl GpuTimer {
             inner: RefCell::new(Inner {
                 current: None,
                 times: GpuTimes::default(),
+                lap: None,
             }),
         })
     }
@@ -139,7 +154,10 @@ impl GpuTimer {
             .slots
             .iter()
             .position(|s| s.state.load(Ordering::Acquire) == FREE);
-        self.inner.borrow_mut().current = free;
+        let mut inner = self.inner.borrow_mut();
+        inner.current = free;
+        inner.lap = Some(Instant::now());
+        drop(inner);
         if free.is_some() {
             encoder.write_timestamp(&self.set, 0);
         }
@@ -147,6 +165,7 @@ impl GpuTimer {
 
     /// Ends stage `stage` (an index into [`STAGES`]).
     pub fn mark(&self, encoder: &mut wgpu::CommandEncoder, stage: usize) {
+        self.lap(stage);
         if self.inner.borrow().current.is_some() {
             encoder.write_timestamp(&self.set, stage as u32 + 1);
         }
@@ -166,6 +185,9 @@ impl GpuTimer {
     /// buffer, and takes in the times of earlier frames that have come
     /// back.
     pub fn after_submit(&self, device: &wgpu::Device) {
+        if self.lap(CPU_SUBMIT) {
+            self.inner.borrow_mut().times.cpu_frames += 1;
+        }
         for s in &self.slots {
             if s.state
                 .compare_exchange(WRITTEN, MAPPING, Ordering::AcqRel, Ordering::Acquire)
@@ -197,6 +219,19 @@ impl GpuTimer {
                 _ => {}
             }
         }
+    }
+
+    /// Adds the CPU's time since the last lap to entry `i` of
+    /// [`GpuTimes::cpu`] and starts the next; ends the frame's laps at
+    /// [`CPU_SUBMIT`]. False outside a frame.
+    fn lap(&self, i: usize) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let Some(lap) = inner.lap else {
+            return false;
+        };
+        inner.times.cpu[i] += lap.elapsed().as_secs_f64() * 1000.0;
+        inner.lap = (i < CPU_SUBMIT).then(Instant::now);
+        true
     }
 
     /// The times summed since last taken.
