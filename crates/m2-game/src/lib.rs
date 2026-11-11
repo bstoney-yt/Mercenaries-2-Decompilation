@@ -27,6 +27,7 @@ pub mod script_hash;
 pub mod script_junk;
 pub mod script_math;
 pub mod script_noops;
+pub mod script_shell;
 pub mod script_sound;
 pub mod script_time;
 pub mod shop;

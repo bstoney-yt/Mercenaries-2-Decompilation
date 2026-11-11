@@ -845,6 +845,9 @@ pub struct ScriptWorld {
     pub links: crate::links::Links,
     /// The sound engine's state the scripts set (`crate::script_sound`).
     pub sound: crate::script_sound::SoundSettings,
+    /// The level and shell names and the post-processing values the
+    /// scripts set (`crate::script_shell`).
+    pub shell: crate::script_shell::ShellState,
     /// What `Pg.GetAllLandingZones(kind)` answers, by kind: the zones by
     /// their number. The transit script reads kinds 1 and 2 (where each
     /// player lands) as tables keyed alike.
@@ -2527,6 +2530,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // reserve of ammunition.
     crate::links::install(&lib, &add)?;
     crate::script_sound::install(&lib, &add)?;
+    crate::script_shell::install(lua, &lib, &add)?;
     let human = lib("Human")?;
     // Human.SetAllowCorpseCleanup(character, allow): whether the game may
     // clear its body away (the verify objective keeps a target's until it
@@ -4275,9 +4279,6 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         add(&sys, "Clock", |_, _, _| Ok(t::clock()))?;
         add(&sys, "DiffTime", |_, _, a| t::diff_time_native(a))?;
     }
-    add(&sys, "GetLevelName", |_, lua, _| {
-        values([Value::String(lua.create_string("vz")?)])
-    })?;
     add(&sys, "GetIgnoreLayers", |_, lua, _| {
         values([Value::Table(lua.create_table()?)])
     })?;
@@ -5286,6 +5287,30 @@ mod tests {
             }]
         );
         assert_eq!(w.printed, ["jeep moved"]);
+    }
+
+    #[test]
+    fn the_shell_and_post_processing_calls_answer_as_the_360_ones() {
+        let (host, world) = setup();
+        let (name, set, bad, a, b): (String, bool, usize, f64, f64) = host
+            .lua()
+            .load(
+                r#"
+                local before = Sys.GetLevelName()
+                local set = Sys.SetLevelName("vz_island")
+                Graphics.Bloom.SetThreshold(0.8)
+                local bad = select('#', Graphics.Contrast.SetLimit())
+                local a, b = Sys.GetVersion()
+                return before .. " " .. Sys.GetLevelName(), set, bad, a, b
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(
+            (name.as_str(), set, bad, a, b),
+            ("vz vz_island", true, 1, 100000.0, 100000.0)
+        );
+        assert_eq!(world.borrow().shell.bloom_threshold, Some(0.8));
     }
 
     #[test]
