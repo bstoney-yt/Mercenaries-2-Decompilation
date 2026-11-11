@@ -180,14 +180,6 @@ impl Object {
 pub enum Command {
     /// A hijack's own requests (`crate::hijack`).
     Hijack(crate::hijack::HijackCommand),
-    /// Whether the player may take vehicle `guid`'s seats of kind `seats`
-    /// (`'a'` all, `'d'` driver, `'g'` gunner, `'c'` commander, `'p'`
-    /// passenger): `Vehicle.SetCanPlayerUse`.
-    PlayerSeats {
-        guid: u32,
-        seats: char,
-        can: bool,
-    },
     /// Create `what` (an object template's name, such as `"Veyron"` or
     /// `"Explosion (Grenade)"`) as `guid`.
     Spawn {
@@ -2848,24 +2840,6 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.commands.push(Command::Usable { guid, on });
         }
         values([])
-    })?;
-    // From the 360 code (`Vehicle.SetCanPlayerUse(v, seats, can)`,
-    // 0x82346d10): `seats` is a seat letter, "a" (all) when left out;
-    // each of the vehicle's seats of that kind ("d" driver, "g" gunner,
-    // "c" commander, "p" passenger: one that is none of the three) gets
-    // its may-the-player-sit-here flag set to `can`. Any other letter
-    // matches no seat. It answers true. PmcCon013 shuts the passenger
-    // seats of the challenge's helicopters as they wake, so she flies.
-    add(&vehicle, "SetCanPlayerUse", |w, _, a| {
-        let (guid, seats, can) = match (id(a.first()), a.get(1), a.get(2)) {
-            (Some(g), Some(Value::String(s)), Some(Value::Boolean(b))) => {
-                (g, s.to_string_lossy().chars().next().unwrap_or('\0'), *b)
-            }
-            (Some(g), Some(Value::Boolean(b)), _) => (g, 'a', *b),
-            _ => return values([Value::Nil]),
-        };
-        w.commands.push(Command::PlayerSeats { guid, seats, can });
-        values([Value::Boolean(true)])
     })?;
     add(&vehicle, "GetRiders", |w, lua, a| {
         let v = id(a.first());
@@ -5811,36 +5785,6 @@ mod tests {
             .eval()
             .unwrap();
         assert!(before && carrier && after && unknown);
-    }
-
-    #[test]
-    fn the_scripts_can_keep_her_out_of_a_vehicles_seats() {
-        // PmcCon013: Vehicle.SetCanPlayerUse(copter, "p", false).
-        let (host, world) = setup();
-        world.borrow_mut().take_commands();
-        let (one, all): (bool, bool) = host
-            .lua()
-            .load(
-                "return Vehicle.SetCanPlayerUse(50, 'p', false), Vehicle.SetCanPlayerUse(50, true)",
-            )
-            .eval()
-            .unwrap();
-        assert!(one && all);
-        assert_eq!(
-            world.borrow_mut().take_commands(),
-            [
-                Command::PlayerSeats {
-                    guid: 50,
-                    seats: 'p',
-                    can: false
-                },
-                Command::PlayerSeats {
-                    guid: 50,
-                    seats: 'a',
-                    can: true
-                },
-            ]
-        );
     }
 
     #[test]
