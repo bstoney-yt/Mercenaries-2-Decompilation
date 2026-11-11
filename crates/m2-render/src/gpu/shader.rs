@@ -310,23 +310,27 @@ fn game_air(p: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(add, dot(e, vec3<f32>(1.0 / 3.0)) * frame.scatter.x);
 }
 
-// How far the sky's haze is reckoned along a ray that never leaves the
-// air (metres). Invented: the game's sky is the haze at its cloud quad's
-// corners, which come from code.
-const SKY_FAR: f32 = 20000.0;
+// The game's sky dome: a unit sphere stretched to these half-sizes
+// (metres, x y z) about the eye (from the 360 code: the sky object's
+// constant `Matrix_`, set to (20000, 10000, 20000) at 0x821D0A28; its
+// 65 x 65 sphere is built at 0x821CDD70).
+const SKY_DOME: vec3<f32> = vec3<f32>(20000.0, 10000.0, 20000.0);
 
-// The game's haze looking along the unit ray r, out to the top of its
-// layers (or SKY_FAR), in display values.
+// The sky along the unit ray r, in display values, as the game's sky
+// shaders colour the dome (the install's shaders 417 and 416, the sky's
+// by their `Matrix` constant): at the dome's point p, half the sunlight
+// the air keeps on the way (E * dirLightColor * ScatteringTermMultiplier.x)
+// plus the air's in-scattering (`game_air`), held within 1e-5 and 30000.
 fn game_sky(r: vec3<f32>) -> vec3<f32> {
-    let l = frame.haze_layers;
-    let top = max(select(0.0, 1.0 / l.y, l.y > 0.0), select(0.0, 1.0 / l.w, l.w > 0.0));
     let eye = frame.eye.xyz;
-    var d = SKY_FAR;
-    if r.y > 1e-3 {
-        d = min(max(top - eye.y, 0.0) / r.y, SKY_FAR);
-    }
-    let along = normalize(vec3<f32>(r.x, max(r.y, 0.0), r.z));
-    return game_air(eye + along * d).rgb;
+    let p = eye + r / max(length(r / SKY_DOME), 1e-6);
+    let d = distance(p, eye);
+    let l = frame.haze_layers;
+    let rho = l.x * layer_density(p.y, eye.y, l.y) + l.z * layer_density(p.y, eye.y, l.w);
+    let beta = max(frame.rayleigh.rgb + frame.mie.rgb, vec3<f32>(1e-12));
+    let e = exp(-rho * beta * d);
+    let keep = 0.5 * e * light_to_display(frame.sun_color.rgb) * frame.scatter.x;
+    return clamp(keep + game_air(p).rgb, vec3<f32>(1e-5), vec3<f32>(30000.0));
 }
 
 // The air in front of the cloud deck along the unit ray r as the game's
@@ -1045,13 +1049,8 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
     // A point on the near plane, then the ray from the eye through it.
     let p = frame.inv_view_proj * vec4<f32>(v.ndc, 1.0, 1.0);
     let r = normalize(p.xyz / p.w - frame.eye.xyz);
+    // The game's sky dome (`game_sky`), drawn before its clouds.
     var rgb = sky(r);
-    if quad_sky() && r.y > 0.0 {
-        // Above the horizon the sky is the quad's haze, meeting the far
-        // air that land fades into at the horizon.
-        let quad = light_from_display(quad_air(r).rgb);
-        rgb = mix(rgb, quad, smoothstep(0.0, 4.0 * HORIZON_UP, r.y));
-    }
     // Where the ray meets the cloud deck, the deck moving with the eye so
     // clouds stay overhead; sampled before any branch for mip selection.
     // Rays below a floor all met the deck at one far point per column,
@@ -1258,14 +1257,16 @@ mod tests {
     }
 
     #[test]
-    fn sky_takes_the_cloud_quads_haze() {
-        // The sky above the horizon and the clouds' air both come from the
-        // quad's corners when its size is set, as the game's vertex shader
-        // reckons them.
+    fn clouds_take_the_quads_haze_and_the_sky_the_dome() {
+        // The clouds' air comes from the quad's corners when its size is
+        // set, as the game's cloud vertex shader reckons it; the sky
+        // between is the game's dome (0x821D0A28, shaders 417/416).
         let sky = sky_source();
         assert!(sky.contains("fn quad_air("));
-        assert_eq!(sky.matches("quad_air(r)").count(), 2);
-        assert!(sky.contains("frame.deck_fit.z > 0.0"));
+        assert_eq!(sky.matches("quad_air(r)").count(), 1);
+        assert!(sky.contains("vec3<f32>(20000.0, 10000.0, 20000.0)"));
+        assert!(sky.contains("0.5 * e * light_to_display(frame.sun_color.rgb) * frame.scatter.x"));
+        assert!(!sky.contains("SKY_FAR"));
     }
 
     #[test]
