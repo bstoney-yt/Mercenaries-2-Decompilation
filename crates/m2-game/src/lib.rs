@@ -45,6 +45,7 @@ pub mod script_sound;
 pub mod script_time;
 pub mod shop;
 pub mod spawn_point;
+pub mod spawner_tweak;
 pub mod subtitles;
 pub mod support;
 pub mod vehicle_seats;

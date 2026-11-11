@@ -402,10 +402,12 @@ pub enum Command {
         on: bool,
     },
     /// The spawners attached to object `guid` are changed
-    /// (`Ai.TweakAttachedSpawners`): each setting the call gave.
+    /// (`Ai.TweakAttachedSpawners`, `...InGroup`): the object's whole
+    /// record as it stands after the call ([`crate::spawner_tweak`]); one
+    /// with nothing set means the object has none any more.
     TweakSpawners {
         guid: u32,
-        tweak: SpawnerTweak,
+        record: Box<crate::spawner_tweak::SpawnerRecord>,
     },
     /// The player's fuel goes up by this (`Player.AddFuel`: a fuel
     /// pickup's script), up to the tanks' capacity.
@@ -887,22 +889,6 @@ pub const INFINITE_RESERVE: u32 = 999;
 /// 82446B68).
 pub const TETHER_DIAMETER_START: f64 = 400.0;
 
-/// What `Ai.TweakAttachedSpawners(object, settings)` changes of an
-/// object's spawners: the settings the call's table gave, `None` for
-/// those it left alone. From the 360 code (the table's reader, 8230CE00):
-/// `SpawnerState` and `SpawnList` are names (OilCon002 turns a balcony's
-/// spawner `"on"` with `"Spawnlist (VZ Balcony)"`), `ChanceNotActive`,
-/// `ChanceSkip` and `SecondsPerCycle` numbers. The reader takes one more
-/// field whose name was not made out.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct SpawnerTweak {
-    pub state: Option<String>,
-    pub spawn_list: Option<String>,
-    pub chance_not_active: Option<f32>,
-    pub chance_skip: Option<f32>,
-    pub seconds_per_cycle: Option<f32>,
-}
-
 /// The scripts' view of the game, and what they asked of it.
 #[derive(Debug, Default)]
 pub struct ScriptWorld {
@@ -1114,6 +1100,9 @@ pub struct ScriptWorld {
     /// who carries whom (`Human.IsCarrying`) ([`crate::mission::Mission::set_human_state`]).
     pub human_states: HashMap<u32, String>,
     pub state_changes: Vec<crate::events::StateChange>,
+    /// What the scripts have changed of each object's attached spawners,
+    /// by object ([`crate::spawner_tweak`]).
+    pub spawner_records: HashMap<u32, crate::spawner_tweak::SpawnerRecord>,
     /// How fast objects move, m/s, as the game last said
     /// ([`crate::mission::Mission::set_speed`]); none for one at rest or
     /// never reported (`Object.GetVelocity`).
@@ -1224,6 +1213,28 @@ pub struct ScriptWorld {
 }
 
 impl ScriptWorld {
+    /// Merges a call's spawner settings into object `guid`'s record, for
+    /// one group or all ([`crate::spawner_tweak`]), and tells the game
+    /// the record as it now stands. A record left with nothing set is
+    /// dropped.
+    pub fn tweak_spawners(
+        &mut self,
+        guid: u32,
+        group: Option<usize>,
+        tweak: &crate::spawner_tweak::GroupTweak,
+    ) {
+        let record = self.spawner_records.entry(guid).or_default();
+        record.merge(group, tweak);
+        let record = record.clone();
+        if record.is_empty() {
+            self.spawner_records.remove(&guid);
+        }
+        self.commands.push(Command::TweakSpawners {
+            guid,
+            record: Box::new(record),
+        });
+    }
+
     /// Whether world spot (x, z) is out of the play area
     /// (`Player.IsPositionOutBoundary`).
     ///
@@ -4462,25 +4473,28 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         });
         values([Value::Boolean(true)])
     })?;
-    // Ai.TweakAttachedSpawners(object, settings): see [`SpawnerTweak`].
-    // From the 360 code (8230D450): the object and the table are needed,
-    // and it gives nothing.
+    // Ai.TweakAttachedSpawners(object, settings) and
+    // Ai.TweakAttachedSpawnersInGroup(object, group, settings): see
+    // [`crate::spawner_tweak`]. From the 360 code (8230D450, 8230D4E0):
+    // the object and the table are needed (and the group, by name: a name
+    // that is no group's does nothing), and neither gives anything.
     add(&ai, "TweakAttachedSpawners", |w, _, a| {
-        let (Some(guid), Some(Value::Table(t))) = (id(a.first()), a.get(1)) else {
-            return values([]);
-        };
-        let name = |k: &str| t.raw_get::<Option<String>>(k).ok().flatten();
-        let number = |k: &str| num(t.raw_get::<Value>(k).ok().as_ref());
-        w.commands.push(Command::TweakSpawners {
-            guid,
-            tweak: SpawnerTweak {
-                state: name("SpawnerState"),
-                spawn_list: name("SpawnList"),
-                chance_not_active: number("ChanceNotActive"),
-                chance_skip: number("ChanceSkip"),
-                seconds_per_cycle: number("SecondsPerCycle"),
-            },
-        });
+        if let (Some(guid), Some(Value::Table(t))) = (id(a.first()), a.get(1)) {
+            w.tweak_spawners(guid, None, &crate::spawner_tweak::GroupTweak::read(t));
+        }
+        values([])
+    })?;
+    add(&ai, "TweakAttachedSpawnersInGroup", |w, _, a| {
+        if let (Some(guid), Some(Value::String(group)), Some(Value::Table(t))) =
+            (id(a.first()), a.get(1), a.get(2))
+            && let Some(group) = crate::spawner_tweak::group_of(&group.to_string_lossy())
+        {
+            w.tweak_spawners(
+                guid,
+                Some(group),
+                &crate::spawner_tweak::GroupTweak::read(t),
+            );
+        }
         values([])
     })?;
     add(&ai, "Goal", |w, _, a| {
@@ -5798,6 +5812,51 @@ mod tests {
     }
 
     #[test]
+    fn spawner_tweaks_add_up_per_object_and_group() {
+        let (host, world) = setup();
+        host.lua()
+            .load(
+                r#"
+                local tower = Sys.StringToGuid("70")
+                -- As the dangerous building and GurJob020 do.
+                Ai.TweakAttachedSpawners(tower, { SpawnerState = "on", SpawnList = "Spawnlist (VZ Balcony)" })
+                Ai.TweakAttachedSpawnersInGroup(tower, "Ground", { SpawnList = "Spawnlist (VZ Ground)" })
+                Ai.TweakAttachedSpawnersInGroup(tower, "ground", { SpawnerState = "off" })
+                -- No such group: nothing happens.
+                Ai.TweakAttachedSpawnersInGroup(tower, "cellar", { SpawnerState = "off" })
+                -- Nothing the engine reads: no record is kept.
+                Ai.TweakAttachedSpawners(Sys.StringToGuid("71"), { ActiveRadius = 100 })
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let mut w = world.borrow_mut();
+        let record = w.spawner_records[&70].clone();
+        assert!(record.off(1));
+        assert_eq!(
+            record.groups[1].spawn_list.as_deref(),
+            Some("Spawnlist (VZ Ground)")
+        );
+        assert!(!record.off(2));
+        assert_eq!(
+            record.groups[2].spawn_list.as_deref(),
+            Some("Spawnlist (VZ Balcony)")
+        );
+        assert!(!w.spawner_records.contains_key(&71));
+        let told: Vec<(u32, bool)> = w
+            .take_commands()
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::TweakSpawners { guid, record } => Some((guid, record.is_empty())),
+                _ => None,
+            })
+            .collect();
+        // Three calls for the tower, each with its record so far; the
+        // fourth named no group; the other object's is told as empty.
+        assert_eq!(told, [(70, false), (70, false), (70, false), (71, true)]);
+    }
+
+    #[test]
     fn the_shared_modules_calls_are_answered() {
         let (host, world) = setup();
         {
@@ -5973,17 +6032,25 @@ mod tests {
         assert!((heading - 90.0).abs() < 1e-3);
         assert_eq!(lost, Value::Boolean(false));
         assert_eq!(bare, Value::Nil);
+        // Every group on, from the balcony's list.
+        let mut on_from_the_balcony = crate::spawner_tweak::SpawnerRecord::default();
+        on_from_the_balcony.merge(
+            None,
+            &crate::spawner_tweak::GroupTweak {
+                state: Some(1),
+                spawn_list: Some("Spawnlist (VZ Balcony)".into()),
+                ..Default::default()
+            },
+        );
+        let mut w = world.borrow_mut();
         assert_eq!(
-            world.borrow_mut().take_commands(),
+            w.take_commands(),
             [Command::TweakSpawners {
                 guid: 70,
-                tweak: SpawnerTweak {
-                    state: Some("on".into()),
-                    spawn_list: Some("Spawnlist (VZ Balcony)".into()),
-                    ..SpawnerTweak::default()
-                },
+                record: Box::new(on_from_the_balcony.clone()),
             }]
         );
+        assert_eq!(w.spawner_records[&70], on_from_the_balcony);
     }
 
     #[test]

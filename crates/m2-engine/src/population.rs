@@ -293,6 +293,96 @@ impl Population {
     }
 }
 
+/// Where a spawner record stands with the scripts' changes to an object's
+/// attached spawners (`Ai.TweakAttachedSpawners`). From the 360 code (the
+/// spawners' start test, 82241C38, reads these off the record): the
+/// spawner belongs to the entity that carries its record, its
+/// `SpawnerGroup` (0 to 7; a record with another value never takes a
+/// change) says which of the object's groups it is in, its state (the
+/// field at 80, 0 for off) whether it sends anyone before the scripts
+/// say so, and its `ChanceNotActive` (a percent) how likely it is to
+/// stay out when it would start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpawnerSlot {
+    /// The entity carrying the record.
+    pub owner: u32,
+    pub group: u32,
+    pub state: u32,
+    pub chance_not_active: u8,
+}
+
+/// Spawn entities for an entity's second and later spawner records start
+/// here: no layer uses these.
+pub const EXTRA_SPAWNERS: u32 = 0xf300_0000;
+
+/// The field at 80, by its hash: the spawner's state.
+const STATE_HASH: u32 = 0xa57a_feeb;
+const GROUP_AT: usize = 88;
+const STATE_AT: usize = 80;
+const CHANCE_NOT_ACTIVE_AT: usize = 95;
+
+/// Every spawner record of a component, in the data's order, each with
+/// the entity carrying it: an entity may carry several (a guard tower's
+/// two rooftop spawners, a building's ground, balcony and rooftop ones).
+pub fn spawner_records(c: &Component<'_>) -> Vec<(Spawner, SpawnerSlot)> {
+    let at = |name: &str, fallback: usize| field_at(c, name).unwrap_or(fallback);
+    let (cycle, radius, kind, group, chance) = (
+        at("SecondsPerCycle", CYCLE_AT),
+        at("ActiveRadius", RADIUS_AT),
+        at("SpawnerType", KIND_AT),
+        at("SpawnerGroup", GROUP_AT),
+        at("ChanceNotActive", CHANCE_NOT_ACTIVE_AT),
+    );
+    let by_hash = |h: u32| {
+        c.fields
+            .iter()
+            .find(|f| f.name_hash == h)
+            .map(|f| usize::from(f.offset))
+    };
+    let far = by_hash(FAR_HASH);
+    let state = by_hash(STATE_HASH).unwrap_or(STATE_AT);
+    c.records()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(id, r)| {
+            Some((
+                Spawner {
+                    list: word(r, LIST_AT)?,
+                    seconds_per_cycle: float(r, cycle)?,
+                    active_radius: float(r, radius)?,
+                    kind: word(r, kind)?,
+                    far: far.and_then(|at| float(r, at)),
+                },
+                SpawnerSlot {
+                    owner: id,
+                    group: word(r, group).unwrap_or(0),
+                    state: word(r, state).unwrap_or(1),
+                    chance_not_active: r.get(chance).copied().unwrap_or(0),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// The spawn entity of each of `owners`' records, in order: an owner's
+/// first record is the owner itself, its later ones new entities from
+/// [`EXTRA_SPAWNERS`] on, after the `taken` already given out.
+pub fn spawn_entities(owners: &[u32], taken: u32) -> Vec<u32> {
+    let mut seen = std::collections::HashSet::new();
+    let mut extra = taken;
+    owners
+        .iter()
+        .map(|&owner| {
+            if seen.insert(owner) {
+                owner
+            } else {
+                extra += 1;
+                EXTRA_SPAWNERS + extra - 1
+            }
+        })
+        .collect()
+}
+
 /// Every spawner record of a component (a layer's or the database's).
 pub fn spawners(c: &Component<'_>) -> HashMap<u32, Spawner> {
     let at = |name: &str, fallback: usize| field_at(c, name).unwrap_or(fallback);
@@ -594,6 +684,26 @@ mod tests {
     fn weights_read_as_integers_or_floats() {
         assert_eq!(weight_of(&100u32.to_le_bytes()), 100.0);
         assert_eq!(weight_of(&17.5f32.to_bits().to_le_bytes()), 17.5);
+    }
+
+    #[test]
+    fn an_entitys_later_spawner_records_get_entities_of_their_own() {
+        // A tower with two spawners, a house with three, one with one.
+        let owners = [0x10, 0x20, 0x10, 0x20, 0x30, 0x20];
+        let ids = spawn_entities(&owners, 0);
+        assert_eq!(
+            ids,
+            [
+                0x10,
+                0x20,
+                EXTRA_SPAWNERS,
+                EXTRA_SPAWNERS + 1,
+                0x30,
+                EXTRA_SPAWNERS + 2
+            ]
+        );
+        // The next layer's carry on after those given out.
+        assert_eq!(spawn_entities(&[0x40, 0x40], 3), [0x40, EXTRA_SPAWNERS + 3]);
     }
 
     #[test]

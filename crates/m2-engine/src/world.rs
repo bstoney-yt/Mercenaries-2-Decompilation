@@ -1363,6 +1363,12 @@ pub struct WorldIndex {
     pub objects: Vec<ObjectPlacement>,
     /// People the layers place, all layers.
     pub spawns: Vec<SpawnPoint>,
+    /// Where each spawner's spawn entity stands with the scripts' changes
+    /// to an object's attached spawners: its owner, group, state and
+    /// chance ([`crate::population::SpawnerSlot`]), for the layers' own
+    /// spawner records. An entity's second and later records have spawn
+    /// entities of their own ([`crate::population::EXTRA_SPAWNERS`]).
+    pub spawner_slots: HashMap<u32, crate::population::SpawnerSlot>,
     /// Every placed entity of the static layers by id: the buildings of
     /// the merged town batches are among them (see
     /// [`Model::tiny_members`](m2_assets::Model::tiny_members)).
@@ -1975,10 +1981,44 @@ impl WorldIndex {
         }
         let names = layer.names();
         let mut seen: HashSet<u32> = HashSet::new();
-        let own_spawners = layer
+        // Every spawner record the layer's entities carry: an entity's
+        // first is the entity's own spawner, its later ones spawners with
+        // spawn entities of their own (they were dropped before: a guard
+        // tower's second sentry, a building's balcony and rooftop).
+        let own_records = layer
             .component("PopulationSimpleSpawner")
-            .map(crate::population::spawners)
+            .map(crate::population::spawner_records)
             .unwrap_or_default();
+        let record_entities = crate::population::spawn_entities(
+            &own_records.iter().map(|(_, s)| s.owner).collect::<Vec<_>>(),
+            self.spawner_slots
+                .keys()
+                .filter(|&&e| e >= crate::population::EXTRA_SPAWNERS)
+                .count() as u32,
+        );
+        let own_spawners: HashMap<u32, crate::population::Spawner> = own_records
+            .iter()
+            .zip(&record_entities)
+            .filter(|((_, slot), entity)| slot.owner == **entity)
+            .map(|((spawner, slot), _)| (slot.owner, *spawner))
+            .collect();
+        let people_from = |spawner: &crate::population::Spawner| -> Vec<(String, u32, f32)> {
+            let population = &templates.population;
+            population
+                .lists
+                .get(&spawner.list)
+                .or_else(|| population.lists.get(&(spawner.list | TEMPLATE_BIT)))
+                .into_iter()
+                .flatten()
+                .filter_map(|&(t, w)| {
+                    let (name, info) = templates
+                        .by_id(t)
+                        .or_else(|| templates.by_id(t | TEMPLATE_BIT))?;
+                    let model = info.model.filter(|_| info.human)?;
+                    Some((name.to_owned(), model, w))
+                })
+                .collect()
+        };
         let people_of = |id: u32, p: &Placement| -> Vec<(String, u32, f32)> {
             let population = &templates.population;
             let Some(spawner) = own_spawners
@@ -2056,6 +2096,26 @@ impl WorldIndex {
                     continue;
                 }
                 self.spawns.push(spawn(id, p));
+            }
+        }
+        // The layer's spawner records: where each stands with the
+        // scripts' changes, and a spawn point for each record after an
+        // entity's first.
+        for ((spawner, slot), &entity) in own_records.iter().zip(&record_entities) {
+            let Some(p) = placements.get(&slot.owner) else {
+                continue;
+            };
+            self.spawner_slots.insert(entity, *slot);
+            if entity != slot.owner {
+                let list = people_from(spawner);
+                if !list.is_empty() {
+                    self.spawns.push(SpawnPoint {
+                        entity,
+                        list,
+                        cycle: Some(spawner.seconds_per_cycle),
+                        ..spawn(slot.owner, p)
+                    });
+                }
             }
         }
         // Entities spawning people by their template's spawner alone (the
