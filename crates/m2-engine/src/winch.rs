@@ -38,7 +38,18 @@
 //! - **Cargo** (the update): reeling in with cargo on and no more links
 //!   out than the autodrop count, or retracted, the cargo drops.
 //!
-//! Not ported here: the links' bodies and their physics (0x821962B8,
+//! - **The magnet** (0x82197710, each step of the update): what it takes
+//!   ([`magnet`]); its search is a sphere twice `MagnetRadius` about the
+//!   hook (0x825F7E60 shape, 0x82153748 query), its candidates' hang
+//!   points their hardpoints (store 0x83652244) nearest the hook. The
+//!   player has no hook button: her two buttons (0x82198118) pay out,
+//!   reel in and drop; the magnet hooks.
+//! - 0x824AFFD8 and 0x824B0440 are the network apply and encode of a
+//!   winch's state (state, cargo flag, cargo handle), and 0x82458DB8 the
+//!   co-op pass: not single-player input.
+//!
+//! Not ported here: when +0x168 (seconds empty) starts again from 0, the
+//! links' bodies and their physics (0x821962B8,
 //! 0x82196BB8, read through VMX), the attach and the hook (0x82195C30,
 //! 0x82196238), the sounds each change plays (0x82174F88), the ground
 //! check that stops a winch deploying near the ground (0x82167400).
@@ -47,6 +58,7 @@ use std::collections::HashMap;
 
 use m2_assets::layer::Layer;
 use m2_assets::name_hash;
+use m2_math::glam::Vec3;
 
 use crate::tuning::Table;
 
@@ -134,12 +146,13 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, WinchParams> {
 
 /// The winch's state (+0x140), as `Object.GetWinchState` names it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub enum WinchState {
     #[default]
-    Retracted,
-    Deployed,
-    Deploying,
-    Retracting,
+    Retracted = 0,
+    Deployed = 1,
+    Deploying = 2,
+    Retracting = 3,
 }
 
 impl WinchState {
@@ -371,6 +384,59 @@ impl Winch {
     }
 }
 
+/// The magnet's reach: twice `MagnetRadius` for the search (0x82197710's
+/// sphere), `MagnetRadius` for the take.
+pub const MAGNET_SEARCH: f32 = 2.0;
+/// Seconds a winch hangs empty before its magnet looks (0x820C77A4).
+pub const MAGNET_WAIT: f32 = 2.0;
+
+/// Something under the hook the magnet may take (0x82197710's loop).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MagnetCandidate {
+    pub id: u32,
+    /// Where it would hang from: its hardpoint nearest the hook, or the
+    /// fallback point (0x82197C28) when it has none.
+    pub at: Vec3,
+    /// It has a body with mass, is not the helicopter, has no hardpoint
+    /// named 0xD2111B26, is not of kind 4, and says it may be carried
+    /// (its vtable +0xC0).
+    pub eligible: bool,
+}
+
+/// 0x82197710: the winch's magnet. Deployed or deploying, empty, with
+/// seven links or more out and empty for over two seconds (`empty`, its
+/// +0x168), it takes the nearest eligible candidate within
+/// `MagnetRadius` of the hook that hangs below it (the way from the hook
+/// to it at no more than a right angle to the way from the winch to the
+/// hook).
+pub fn magnet(
+    w: &Winch,
+    empty: f32,
+    magnet_radius: f32,
+    hook: Vec3,
+    winch: Vec3,
+    candidates: &[MagnetCandidate],
+) -> Option<(u32, Vec3)> {
+    if !matches!(w.state, WinchState::Deployed | WinchState::Deploying)
+        || w.cargo
+        || w.links < 7
+        || empty <= MAGNET_WAIT
+    {
+        return None;
+    }
+    let reach = magnet_radius * MAGNET_SEARCH;
+    let best = candidates
+        .iter()
+        .filter(|c| c.eligible && c.at.distance_squared(hook) <= reach * reach)
+        .min_by(|a, b| {
+            a.at.distance_squared(hook)
+                .total_cmp(&b.at.distance_squared(hook))
+        })?;
+    let off = hook - best.at;
+    (off.length_squared() < magnet_radius * magnet_radius && (winch - hook).dot(off) >= 0.0)
+        .then_some((best.id, best.at))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +447,32 @@ mod tests {
             retract_autodrop_when_length_shorter: 2.0,
             ..WinchParams::default()
         })
+    }
+
+    #[test]
+    fn the_magnet_takes_the_nearest_below_the_hook() {
+        let mut w = heli();
+        w.state = WinchState::Deployed;
+        w.links = 10;
+        let (hook, winch) = (Vec3::new(0.0, 10.0, 0.0), Vec3::new(0.0, 20.0, 0.0));
+        let c = |id, y: f32, eligible| MagnetCandidate {
+            id,
+            at: Vec3::new(0.0, y, 0.0),
+            eligible,
+        };
+        let under = [c(1, 9.5, true), c(2, 9.8, false), c(3, 9.2, true)];
+        // Not yet empty two seconds.
+        assert_eq!(magnet(&w, 1.0, 1.0, hook, winch, &under), None);
+        assert_eq!(
+            magnet(&w, 2.5, 1.0, hook, winch, &under),
+            Some((1, under[0].at))
+        );
+        // Above the hook, or out of reach: nothing.
+        assert_eq!(magnet(&w, 2.5, 1.0, hook, winch, &[c(4, 10.5, true)]), None);
+        assert_eq!(magnet(&w, 2.5, 1.0, hook, winch, &[c(5, 8.5, true)]), None);
+        // Too few links out, or cargo on.
+        w.links = 6;
+        assert_eq!(magnet(&w, 2.5, 1.0, hook, winch, &under), None);
     }
 
     #[test]
