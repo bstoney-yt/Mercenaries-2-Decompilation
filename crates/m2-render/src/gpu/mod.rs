@@ -2155,7 +2155,11 @@ impl WgpuBackend {
         target: &wgpu::TextureView,
     ) -> Result<wgpu::CommandBuffer, BackendError> {
         let l = &view.lighting;
-        let mut cascades = shadow::Cascades::new(view, l.sun_direction, l.shadow_distance);
+        let mut cascades = shadow::Cascades::new(
+            view,
+            l.shadow_direction.unwrap_or(l.sun_direction),
+            l.shadow_distance,
+        );
         // Far cascades are redrawn every few frames only, each keeping the
         // matrix it was drawn with meanwhile: they cost as much as the near
         // ones and change little.

@@ -48,10 +48,11 @@
 //! The time of day is each record's `LightTime` (`LightTimeSpeed` is 0 in
 //! every record, so the sun stands still): 0.05 to 0.1 in the records of
 //! the islands, whose reference footage is at sunset and dusk, 0.2 in the
-//! default, 0.3 for the scripts' `afternoon`, 0.9 in Cumana's. The sun is
-//! taken to cross the sky on a half circle as `LightTime` goes from 0 to
-//! 1, at the horizon at 0 and 1 and overhead at 0.5 ([`SUN_SETS`] says
-//! which way): inferred from those values and the footage, not confirmed.
+//! default, 0.3 for the scripts' `afternoon`, 0.9 in Cumana's. The sun
+//! crosses the sky on a half circle as `LightTime` goes from 0 to 1, at
+//! the horizon at 0 and 1 and overhead at 0.5 ([`SUN_SETS`] says which
+//! way): from the 360 code (0x821B5608), with its shadows cast from a
+//! sun at `0.8 LightTime + 0.1`.
 //!
 //! # Provenance
 //!
@@ -184,12 +185,36 @@ pub struct ScriptAtmosphere {
     pub restore: Option<f32>,
 }
 
-/// Which way the sun stands at `LightTime` 0 (and 0.1, low in the
-/// evening), over the horizon: 60 degrees from `+z` towards `+x`, so
-/// that from the start of `VzaCon001` it stands behind the island 20 to
-/// 25 degrees left of its searchlights, as the footage of the boat ride
-/// has it. Inferred from the footage.
-pub const SUN_SETS: Vec3 = Vec3::new(0.87, 0.0, 0.49);
+/// Which way the sun stands at `LightTime` 0 to 0.5 (morning), at the
+/// horizon: the code's light angle, -150 degrees, turned half a circle
+/// (from the 360 code, 0x821B5608 and 0x821B4EE0: `(cos a, 0, sin a)`
+/// for the angle `a`, plus 3.141 before noon). It lands 30 degrees from
+/// `+x` towards `+z`, where footage of the boat ride had put it.
+pub const SUN_SETS: Vec3 = Vec3::new(0.866_025_4, 0.0, 0.5);
+
+/// The light angle the game's code starts with (degrees, 0x821B4C08,
+/// constant at 0x820F8E24). No record holds one and no script calls
+/// `Graphics.Atmosphere.SetLightAngle`, so it is the angle throughout.
+const LIGHT_ANGLE: f32 = -150.0;
+
+/// The game's own pi where it turns `LightTime` into the sun's place
+/// (0x821B5608, constant at 0x820F8C7C).
+#[allow(clippy::approx_constant)]
+const HALF_TURN: f32 = 3.141;
+
+/// The unit way towards the sun at `LightTime` `t`, as the game's code
+/// reckons it (from the 360 code, 0x821B5608 calling 0x821B4EE0): its
+/// angle from overhead is `|t - 0.5|` half turns, its compass angle
+/// [`LIGHT_ANGLE`] in degrees (times 0.01745), plus a half turn before
+/// noon; the way is `(sin z cos a, cos z, sin z sin a)`.
+fn towards_sun(t: f32) -> Vec3 {
+    let z = (t - 0.5).abs() * HALF_TURN;
+    let mut a = LIGHT_ANGLE * 0.017_45;
+    if t < 0.5 {
+        a += HALF_TURN;
+    }
+    Vec3::new(z.sin() * a.cos(), z.cos(), z.sin() * a.sin())
+}
 
 /// How much of the night's monochrome ramp (its weight, 0.36 there) shows
 /// the searchlights' beams in full; below it they fade out (inferred).
@@ -201,10 +226,6 @@ const BEAMS_FULL_RAMP: f32 = 0.3;
 /// alpha (inferred); with the day contrast gone (round V) the landing cores
 /// fell to L119-122 at 0.28, so it is raised to 0.5.
 const BEAM_NIGHT_ALPHA: f32 = 0.5;
-
-/// The lowest the sun is drawn, in radians over the horizon, so that low
-/// `LightTime`s still light the ground a little.
-const SUN_LOWEST: f32 = 0.05;
 
 /// The cloud shader's darkness per unit of `DarknessK` (`c` in
 /// [`Atmosphere::cloud_darkness`]). The proportion is inferred from the
@@ -388,6 +409,7 @@ impl Atmosphere {
                 Some(ToneMap {
                     target: f(&["BloomTargetLuminance"])?,
                     retention: f(&["BloomAdaptiveLuminancePercent"])?,
+                    speed: f(&["BloomAdaptiveLuminanceScale"])?,
                     min: f(&["BloomAdaptiveLuminanceMin", "AdaptiveLuminanceMin"])?,
                     max: f(&["BloomAdaptiveLuminanceMax", "AdaptiveLuminanceMax"])?,
                     min_key: f(&[
@@ -477,6 +499,7 @@ impl Atmosphere {
                     min_key: f(a.min_key, b.min_key),
                     max_key: f(a.max_key, b.max_key),
                     retention: f(a.retention, b.retention),
+                    speed: f(a.speed, b.speed),
                     contrast_limit: f(a.contrast_limit, b.contrast_limit),
                     contrast: f(a.contrast, b.contrast),
                     log_average: b.log_average,
@@ -600,12 +623,19 @@ impl Atmosphere {
         (a, unused)
     }
 
-    /// The way the sunlight travels at this `LightTime`: from a sun on
-    /// a half circle over [`SUN_SETS`] (see the module's notes).
+    /// The way the sunlight travels at this `LightTime` ([`towards_sun`]
+    /// turned round): the sun reaches the horizon at 0 and 1.
     pub fn sun_direction(&self) -> Vec3 {
-        let half = std::f32::consts::PI * self.light_time[0].clamp(0.0, 1.0);
-        let up = half.sin().max(SUN_LOWEST.sin());
-        -(SUN_SETS.normalize() * half.cos() + Vec3::Y * up)
+        -towards_sun(self.light_time[0])
+    }
+
+    /// The way the sun's shadows are cast: the game reckons a second sun
+    /// at `0.8 LightTime + 0.1`, never lower than a tenth of a half turn
+    /// (18 degrees), and hands its way to the shadow maps (from the 360
+    /// code: 0x821B5608 into the light state's +0x20, which 0x821B67F8
+    /// passes to 0x821C0150).
+    pub fn shadow_direction(&self) -> Vec3 {
+        -towards_sun(self.light_time[0] * 0.8 + 0.1)
     }
 
     /// Puts the ambient cube, sunlight strength, rim light, haze, bloom,
@@ -617,6 +647,7 @@ impl Atmosphere {
         lighting.rim_color = decode(self.rim);
         lighting.rim_threshold = self.rim_threshold;
         lighting.sun_direction = self.sun_direction();
+        lighting.shadow_direction = Some(self.shadow_direction());
         // `M2_LIGHTING=linear` sums the light in linear light, with the
         // sun's colour taken as linear, as before, for comparison.
         lighting.gamma_light = gamma_light();
@@ -1221,6 +1252,36 @@ mod tests {
         assert!(low.y < 0.0 && high.y < 0.0);
         assert!(low.normalize().dot(-SUN_SETS.normalize()) > 0.9);
         assert!(high.normalize().y < -0.99);
+    }
+
+    #[test]
+    fn the_sun_takes_the_codes_path() {
+        // At LightTime 0 the sun is on the horizon over SUN_SETS; at 1 on
+        // the horizon opposite (0x821B5608, light angle -150 degrees).
+        let dawn = -plain(0.0, 0.0).sun_direction();
+        assert!(
+            dawn.y.abs() < 1e-3 && (dawn - SUN_SETS).length() < 1e-3,
+            "{dawn}"
+        );
+        let dusk = -plain(1.0, 0.0).sun_direction();
+        assert!(
+            dusk.y.abs() < 1e-3 && (dusk + SUN_SETS).length() < 1e-3,
+            "{dusk}"
+        );
+        // LightTime 0.25: 45 degrees up, on the morning side.
+        let morning = -plain(0.25, 0.0).sun_direction();
+        assert!((morning.y - 0.707).abs() < 1e-3 && morning.x > 0.0);
+        // The shadows' sun never sinks below 18 degrees.
+        for t in [0.0, 0.05, 0.95, 1.0] {
+            let s = -plain(t, 0.0).shadow_direction();
+            assert!(s.y >= 0.309 - 1e-3, "{t}: {s}");
+        }
+        let mut lighting = Lighting::default();
+        plain(0.05, 0.0).apply(&mut lighting);
+        assert_eq!(
+            lighting.shadow_direction,
+            Some(plain(0.05, 0.0).shadow_direction())
+        );
     }
 
     #[test]

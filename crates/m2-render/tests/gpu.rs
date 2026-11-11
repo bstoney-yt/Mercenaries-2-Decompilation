@@ -715,6 +715,7 @@ fn the_game_tone_map_adapts_to_its_own_average() {
         max_key: 0.85,
         // None of the last frame kept: each frame adapts all the way.
         retention: 0.0,
+        speed: 30.0,
         contrast_limit: 0.145,
         contrast: 1.95,
         log_average: false,
