@@ -80,6 +80,12 @@ pub trait World {
     fn named(&self, _name: &str) -> Option<u32> {
         None
     }
+    /// Whether an object stands on the ground (`ObjectIsGrounded`,
+    /// 0x82354AE8): true for all but vehicles off it, and for anything the
+    /// game doesn't know (the 360 answers 1 without an object).
+    fn grounded(&self, _guid: u32) -> bool {
+        true
+    }
     /// Cargo on a winch: `None` if it never was, else what carries it now
     /// (`None` once let go).
     fn winch(&self, _cargo: u32) -> Option<Option<u32>> {
@@ -209,7 +215,7 @@ fn button_args(button: &str) -> (Vec<Value>, Vec<&'static str>) {
 }
 
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 22] = [
+pub const KINDS: [&str; 23] = [
     "TimerRelative",
     // Every update, in the mission's scripts too: the support manager's
     // recruit cooldowns count with it (`SupportTimer`, which takes
@@ -235,6 +241,7 @@ pub const KINDS: [&str; 22] = [
     "HumanStateTransition",
     "ObjectPhysicsEvent",
     "WeaponEvent",
+    "ObjectIsGrounded",
     "ObjectHealthLessThan",
 ];
 
@@ -1444,6 +1451,17 @@ fn check(
             let exit = text(&p.params, 3).as_deref() == Some("exit");
             Check::Holds((riding != on_foot) != exit, Vec::new())
         }
+        // { object, want = true } (0x82354CB0; test 0x82354AA0): when the
+        // object's being on the ground is `want`; passes both.
+        "ObjectIsGrounded" => {
+            let want = !matches!(p.params.raw_get::<Value>(2), Ok(Value::Boolean(false)));
+            for o in objects(&p.params, 1, world) {
+                if world.grounded(o) == want {
+                    return Check::Holds(true, vec![id(o), Value::Boolean(want)]);
+                }
+            }
+            no
+        }
         // { state, "enter" or "exit" }: as the game enters or leaves a
         // state. Passes nothing (from the 360 code: parse 0x823555a8,
         // test 0x82355628, and the empty arguments slot 0x8225e998; the
@@ -1824,6 +1842,8 @@ mod tests {
         anims: Vec<(f64, u32, String)>,
         /// Who killed whom.
         killers: HashMap<u32, u32>,
+        /// Vehicles off the ground.
+        airborne: Vec<u32>,
     }
 
     impl World for TestWorld {
@@ -1838,6 +1858,9 @@ mod tests {
         }
         fn killer(&self, guid: u32) -> Option<u32> {
             self.killers.get(&guid).copied()
+        }
+        fn grounded(&self, guid: u32) -> bool {
+            !self.airborne.contains(&guid)
         }
         fn vehicle_of(&self, guid: u32) -> Option<u32> {
             self.seats.get(&guid).copied()
@@ -1894,6 +1917,29 @@ mod tests {
             .sequence_values::<String>()
             .map(Result::unwrap)
             .collect()
+    }
+
+    #[test]
+    fn grounded_events_fire_as_a_vehicle_lands_or_leaves_the_ground() {
+        // A jump's ResetJump waits for its car to land:
+        // `Event.Create(Event.ObjectIsGrounded, { car }, ..)`.
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                "Event.Create(Event.ObjectIsGrounded, { 7 }, function(o, want)                  table.insert(log, 'landed ' .. gid(o) .. ' ' .. tostring(want)) end)                  Event.Create(Event.ObjectIsGrounded, { 7, false }, function(o, want)                  table.insert(log, 'off ' .. gid(o) .. ' ' .. tostring(want)) end)",
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld {
+            airborne: vec![7],
+            ..TestWorld::default()
+        };
+        world.positions.insert(7, [0.0; 3]);
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["off 7 false"]);
+        world.airborne.clear();
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["off 7 false", "landed 7 true"]);
     }
 
     #[test]

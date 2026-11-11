@@ -32,4 +32,5 @@ pub mod spawn_point;
 pub mod subtitles;
 pub mod support;
 pub mod vehicle_seats;
+pub mod vehicle_state;
 pub mod vo;
