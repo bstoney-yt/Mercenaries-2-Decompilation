@@ -73,6 +73,13 @@ impl Links {
         });
     }
 
+    /// Drops the parent's link to `child` (`Object.Detach`, 0x823328b8;
+    /// that it takes the entry out of this table is inferred).
+    pub fn detach(&mut self, parent: u32, child: u32) {
+        self.entries
+            .retain(|l| !(l.parent == parent && l.child == child));
+    }
+
     /// Drops every link of `guid`, as parent or as child (a removed or
     /// detached object).
     pub fn remove(&mut self, guid: u32) {
@@ -102,6 +109,33 @@ impl Links {
             .find(|l| l.child == child)
             .map(|l| l.parent)
     }
+}
+
+/// A layer's `PhysicalLink` records: (parent entity, (link name hash,
+/// child entity)).
+///
+/// From samples: the component's 44-byte record is the child entity (+0),
+/// the link's name hash twice (+4, +8: `hp_snap_oilrig_bld_buildingA` for
+/// the PMC002 oil rig's `PmcCon002_OilrigA`) and a transform (+12). A
+/// parent has one record per child.
+///
+/// From the 360 code: instancing an object (0x82408c30) copies each of its
+/// link records into the link table, with the child as the second key and
+/// the record's first two words as the entry's. So the entry's second word,
+/// the one `GetLinkGuid` matches, is the name. The template database's
+/// records (a template's child templates, spawned with it) aren't read
+/// here.
+pub fn physical_links(layer: &m2_assets::layer::Layer<'_>) -> Vec<(u32, (u32, u32))> {
+    let Some(records) = layer.component("PhysicalLink").and_then(|c| c.records()) else {
+        return Vec::new();
+    };
+    let word = |r: &[u8], at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(r.get(at..at + 4)?.try_into().ok()?))
+    };
+    records
+        .into_iter()
+        .filter_map(|(parent, r)| Some((parent, (word(r, 4)?, word(r, 0)?))))
+        .collect()
 }
 
 pub(crate) fn install(
@@ -185,6 +219,92 @@ mod tests {
         l.remove(20);
         assert_eq!(l.children(10).collect::<Vec<_>>(), [21, 30]);
         assert_eq!(l.parent_of(20), None);
+    }
+
+    /// The PMC002 oil rig's data-authored links, as its script asks them:
+    /// placing the rig makes them, and its buildings are found by their
+    /// snap names (values from the layer's `PhysicalLink` records).
+    #[test]
+    fn a_placed_parent_brings_its_physical_links() {
+        use crate::mission::{Entity, GameData, Mission};
+        let rig = 0x000b_637b;
+        let entity = |guid: u32, name: &str| Entity {
+            guid,
+            name: name.into(),
+            at: [0.0; 3],
+            yaw: 0.0,
+            region: None,
+            labels: Vec::new(),
+            script: None,
+            script_data: None,
+            faction: None,
+            path: Vec::new(),
+            template: None,
+            crew: Vec::new(),
+        };
+        let snap = |n: &str| m2_assets::name_hash(n);
+        let mut data = GameData::default();
+        data.physical_links.insert(
+            rig,
+            vec![
+                (snap("hp_snap_oilrig_bld_buildingA"), 0x0010_ea85),
+                (snap("hp_snap_oilrig_bld_buildingB"), 0x0010_ea86),
+                (snap("hp_snap_oilrig_catwalkB"), 0x0010_ea8e),
+                (snap("hp_snap_oilrig_scaffold"), 0x0010_eb05),
+            ],
+        );
+        data.layers.insert(
+            "pmccon002".into(),
+            vec![
+                entity(rig, "PMC002 Oilrig"),
+                entity(0x0010_ea85, "PmcCon002_OilrigA"),
+                entity(0x0010_ea86, "PmcCon002_OilrigB"),
+            ],
+        );
+        let mut m = Mission::new(data, "Jennifer", [0.0; 3]).unwrap();
+        assert_eq!(m.preload("pmccon002"), ["pmccon002"]);
+        m.tick(0.1);
+        let found: bool = m
+            .lua()
+            .load(
+                "local rig = Pg.GetGuidByName('PMC002 Oilrig') \
+                 return ObjectState.GetLinkGuid(rig, String.GetHash('hp_snap_oilrig_bld_buildingA')) \
+                 == Pg.GetGuidByName('PmcCon002_OilrigA') \
+                 and #Object.GetAttachedObjects(rig) == 4",
+            )
+            .eval()
+            .unwrap();
+        assert!(found);
+        // Unloaded: gone.
+        m.run("Pg.UnloadLayer('pmccon002')", "unload").unwrap();
+        m.tick(0.1);
+        assert_eq!(m.world().borrow().links.children(rig).count(), 0);
+    }
+
+    /// `Object.Attach` records into the table and `Object.Detach` takes
+    /// it out (an object in play hung off the parent's bone).
+    #[test]
+    fn attach_and_detach_keep_the_table() {
+        let host = ScriptHost::new().unwrap();
+        let world = Shared::default();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(1, Object::new("truck", [0.0; 3]));
+            w.insert(2, Object::new("crate", [0.0; 3]));
+        }
+        install(host.lua(), &world).unwrap();
+        crate::hijack::install(&host, &world).unwrap();
+        host.lua()
+            .load("Object.Attach(Pg.GetGuidByName('truck'), 'hp_bed', Pg.GetGuidByName('crate'))")
+            .exec()
+            .unwrap();
+        assert_eq!(world.borrow().links.children(1).collect::<Vec<_>>(), [2]);
+        assert_eq!(world.borrow().links.parent_of(2), Some(1));
+        host.lua()
+            .load("Object.Detach(Pg.GetGuidByName('truck'), Pg.GetGuidByName('crate'))")
+            .exec()
+            .unwrap();
+        assert_eq!(world.borrow().links.parent_of(2), None);
     }
 
     #[test]

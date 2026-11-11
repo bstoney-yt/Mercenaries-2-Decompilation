@@ -211,6 +211,41 @@ pub enum Command {
     Vehicle(crate::vehicle_state::VehicleCommand),
     /// A hijack's own requests (`crate::hijack`).
     Hijack(crate::hijack::HijackCommand),
+    /// Open (or close) vehicle `guid`'s door `door`, a part's name hash
+    /// (`"pivot"`): `Vehicle.OpenDoor` and `Vehicle.CloseDoor`, which the
+    /// 360 queues for the vehicle to swing.
+    Door {
+        guid: u32,
+        door: u32,
+        open: bool,
+    },
+    /// Turn vehicle `guid`'s parts of kind `part` (1 to 8,
+    /// [`vehicle_part`]) on or off: `Vehicle.SetParts`.
+    Part {
+        guid: u32,
+        part: u8,
+        on: bool,
+    },
+    /// Drop every goal person `guid` has (`Ai.RemoveGoal` with handle 0).
+    ClearGoals {
+        guid: u32,
+    },
+    /// Set (or clear) AI state `state` (`"Vip"`) on person `guid`
+    /// (`Ai.SetState`).
+    AiState {
+        guid: u32,
+        state: String,
+        on: bool,
+    },
+    /// `Ai.AddInfraction(who, faction, amount)`: the faction's people who
+    /// perceive `who` hold an infraction (the engine's kind 6) against
+    /// them, `amount` of it; `faction` is its template's guid, or 0 for
+    /// every faction.
+    Infraction {
+        who: u32,
+        faction: u32,
+        amount: f32,
+    },
     /// Create `what` (an object template's name, such as `"Veyron"` or
     /// `"Explosion (Grenade)"`) as `guid`.
     Spawn {
@@ -219,8 +254,53 @@ pub enum Command {
         position: [f32; 3],
         yaw: f32,
     },
+    /// What the natives of [crate::ported_player] ask of the game.
+    Ported(crate::ported_player::PortedCommand),
     Remove(u32),
     Kill(u32),
+    /// `Object.Revive(object, fraction)`: back in play, at that share of
+    /// its most health.
+    Revive {
+        guid: u32,
+        health: f32,
+    },
+    /// `Object.ApplyImpulse`: a push in world space.
+    Impulse {
+        guid: u32,
+        impulse: [f32; 3],
+    },
+    /// `Player.SetScopeEnabled`: whether she may use a scope now.
+    ScopeEnabled(bool),
+    /// `Human.SetFireLock`: whether the person may not fire.
+    FireLock {
+        guid: u32,
+        on: bool,
+    },
+    /// `Sound.SetMasterVolume(volume, seconds)`.
+    MasterVolume {
+        volume: f32,
+        seconds: f32,
+    },
+    /// `Camera.SetYaw`: the camera turned to this yaw (radians).
+    CameraYaw(f32),
+    /// `ObjectState.StartEmitter` / `StopEmitter`: an emitter of an
+    /// object's state, by the two name hashes the scripts give.
+    Emitter {
+        guid: u32,
+        state: u32,
+        emitter: u32,
+        on: bool,
+    },
+    /// `Object.PlayMaterialAnimation(object, name, loop)`.
+    MaterialAnimation {
+        guid: u32,
+        name: String,
+        looped: bool,
+    },
+    /// `Graphics.SetShadowBaseDistance(metres)`.
+    ShadowBaseDistance(f32),
+    /// `VO.SetCinematicMode(on)`.
+    VoCinematic(bool),
     /// The armies go for `guid` before anything else
     /// (`Ai.SetPriorityTarget`).
     PriorityTarget(u32),
@@ -437,6 +517,12 @@ pub enum Command {
     /// `guid` can (no longer) be hurt: on while the scripts hold any
     /// reason for it (`"MrxState"` while the screen fades, `"Fanfare"`).
     Invincible {
+        guid: u32,
+        on: bool,
+    },
+    /// `guid` can (no longer) be killed, though it can be hurt: on while
+    /// the scripts hold any reason for it (`Object.SetUnkillable`).
+    Unkillable {
         guid: u32,
         on: bool,
     },
@@ -847,6 +933,9 @@ pub struct ScriptWorld {
     pub asset_request_max: u32,
     /// The game state (`Sys.RequestGameState`), `"Game"` while playing.
     pub game_state: String,
+    /// What the system, sound and player ports of missing natives keep
+    /// ([crate::ported_sys]).
+    pub sys: crate::ported_sys::SysState,
     /// The player's cash (`Player.GetCash`, `Player.SetCash`); the
     /// scripts' `MrxPmc.AddCashQty` reads it, adds and clamps.
     pub cash: f64,
@@ -869,6 +958,9 @@ pub struct ScriptWorld {
     pub regions: HashMap<u32, m2_assets::Region>,
     /// The object link table ([`crate::links`]).
     pub links: crate::links::Links,
+    /// The layers' data-authored links by parent entity: (link name hash,
+    /// child entity), made into [`Self::links`] as the parent is placed.
+    pub physical_links: HashMap<u32, Vec<(u32, u32)>>,
     /// The sound engine's state the scripts set (`crate::script_sound`).
     pub sound: crate::script_sound::SoundSettings,
     /// The level and shell names and the post-processing values the
@@ -880,6 +972,40 @@ pub struct ScriptWorld {
     pub landing_zones: HashMap<i64, BTreeMap<i64, u32>>,
     /// Cargo on winches: what carries each, `None` once let go.
     pub winch: HashMap<u32, Option<u32>>,
+    /// Vehicles' doors the scripts opened (true) or closed, by (vehicle,
+    /// door's name hash).
+    pub doors: HashMap<(u32, u32), bool>,
+    /// Vehicles' parts the scripts turned on (true) or off, by (vehicle,
+    /// kind of part, [`vehicle_part`]).
+    pub parts: HashMap<(u32, u8), bool>,
+    /// AI states the scripts set (`Ai.SetState`), by (person, state in
+    /// lower case).
+    pub ai_states: HashMap<(u32, String), bool>,
+    /// `Pg.StartHeliWaveSpawner`'s waves under way.
+    pub heli_waves: crate::heliwaves::HeliWaves,
+    /// How each person regards another (`Ai.SetFeeling`), by (person,
+    /// other).
+    pub feelings: HashMap<(u32, u32), f32>,
+    /// The last goal handle `Ai.Goal` gave out.
+    pub goal_handles: u32,
+    /// How many reasons the scripts gave for her scope to be off
+    /// (`Player.SetScopeEnabled`); she may use it at 0.
+    pub scope_off: u32,
+    /// Textures the scripts asked the GUI to load (`Gui.LoadTexture`), by
+    /// name hash.
+    pub textures_asked: Vec<u32>,
+    /// Whether the other players' markers show (`Gui.EnablePlayerMarkers`),
+    /// once the scripts said.
+    pub player_markers: Option<bool>,
+    /// The PDA map's callbacks for its two modes
+    /// (`Player.SetPDAMapModeCallback`).
+    pub pda_map_callbacks: [Option<Function>; 2],
+    /// `Player.SetWaitForInGame`: the player waits for the game proper.
+    pub wait_for_in_game: bool,
+    /// Places people kept by `Human.PersistTransform`: place and yaw.
+    pub persisted: HashMap<u32, ([f32; 3], f32)>,
+    /// The VO system's (speaker, priority) sequences (`VO.AddSequence`).
+    pub vo_sequences: Vec<(u32, i32)>,
     /// The helicopters with a winch (a `Winch` component; the 360's
     /// `PhysicsActorWinch` store 0x83657220) and its state (+0x140: 0
     /// retracted, 1 deployed, 2 deploying, 3 retracting).
@@ -908,14 +1034,30 @@ pub struct ScriptWorld {
     pub music: crate::music::Music,
     /// The environmental reverb.
     pub reverb: crate::reverb::Reverb,
+    /// What the single-player ports of missing natives keep
+    /// ([crate::ported_sp]).
+    pub sp: crate::ported_sp::SpState,
     /// Why each object is invincible (`Object.SetInvincible` reasons).
     pub invincible: HashMap<u32, std::collections::BTreeSet<String>>,
+    /// `Object.SetUnkillable`'s reason bits by object ([`crate::ported_physics`]).
+    pub unkillable: HashMap<u32, u16>,
+    /// Each object's physics body kind as the 360 numbers them (0 prop,
+    /// 1 human, 2 car, 3 tank, 4 helicopter, 8 jet, 10 boat...), as the game
+    /// says (`Object.GetPhysicsType`).
+    pub physics_kinds: HashMap<u32, u8>,
     /// The play area's boundaries (`Player.AddBoundary`: story-stage
     /// regions such as `BoundaryIntro`), the callback told when the player
     /// leaves or comes back, and whether the player is out.
     pub boundaries: Vec<u32>,
     pub boundary_callback: Option<Function>,
+    /// What the setter ports of missing natives keep ([crate::ported_misc]).
+    pub misc: crate::ported_misc::MiscState,
     pub outside: bool,
+    /// What the initialiser ports of missing natives keep ([crate::ported_init]).
+    pub init: crate::ported_init::InitState,
+    /// The point under her reticle and the object there, as the game
+    /// keeps them (`Player.GetTargetUnderReticle`: [`crate::player_target`]).
+    pub reticle_target: Option<([f32; 3], Option<u32>)>,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
     /// Templates' cash values by name in lower case ([`crate::cash`]).
@@ -953,8 +1095,9 @@ pub struct ScriptWorld {
     pub survival_mode: bool,
     /// The weapons people carry.
     pub inventory: crate::inventory::Inventory,
-    /// Faction relations (`Ai.SetRelation`), -100 to 100, by (faction,
-    /// faction) in lower case.
+    /// Faction relations, -100 to 100, by (template, template) names in
+    /// lower case, in order: the templates' own `Relationship` records,
+    /// and what `Ai.SetRelation` wrote over them.
     pub relations: HashMap<(String, String), f32>,
     /// Actions playing and the pad, for hijacks.
     pub hijack: crate::hijack::HijackWorld,
@@ -1010,6 +1153,8 @@ pub struct ScriptWorld {
     pub placed_as: HashMap<u32, String>,
     /// The player is in a scene of the scripts' (`Player.SetCinematicMode`).
     pub cinematic: bool,
+    /// The scripts' camera while a scene has it ([`crate::script_camera`]).
+    pub script_camera: Option<crate::script_camera::Cinematic>,
     /// Characters swimming, as the game last said (`Human.IsSwimming`).
     pub swimming: HashSet<u32>,
     /// Witnesses reporting her, and what each faction has against her
@@ -1730,12 +1875,27 @@ fn id(v: Option<&Value>) -> Option<u32> {
 }
 
 /// A faction argument (`"Pmc"`), in lower case.
-fn faction(v: Option<&Value>) -> Option<String> {
-    match v? {
-        Value::String(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
-        Value::Integer(i) => Some(i.to_string()),
-        _ => None,
+/// The bound of a relation either way (from the 360 code: -100 and 100
+/// at 0x820f8c3c and 0x820d9f18).
+const RELATION_LIMIT: f32 = 100.0;
+
+/// One side of a relation, as the relation table keys it: a template's
+/// name in lower case (`"oc"`). A name stands for itself; a template's
+/// guid (`Pg.GetGuidByName("OC")`) for its name; anyone else's for their
+/// faction's, the parent the 360 code walks up to (inferred: the parent
+/// chain itself isn't read, only the faction), else their own name.
+fn relation_side(w: &ScriptWorld, v: Option<&Value>) -> Option<String> {
+    if let Some(Value::String(s)) = v {
+        return Some(s.to_string_lossy().to_ascii_lowercase());
     }
+    let g = id(v)?;
+    let o = w.objects.get(&g)?;
+    let name = if (FIRST_TEMPLATE..FIRST_SPAWNED).contains(&g) {
+        o.name.as_str()
+    } else {
+        o.faction_name().unwrap_or(o.name.as_str())
+    };
+    Some(name.to_ascii_lowercase())
 }
 
 /// A sound category argument (`non_ui`), as named.
@@ -1752,6 +1912,9 @@ fn category(v: Option<&Value>) -> Option<String> {
 pub const FACTIONS: [&str; 9] = [
     "Allied", "China", "Civ", "Guerilla", "OC", "Pirate", "PMC", "VZ", "Police",
 ];
+
+/// How many VO sequences the engine keeps (from the 360 code: 0x20).
+const VO_SEQUENCES: usize = 32;
 
 /// [`Object.GetHibernationDistance`]'s answer, metres.
 const HIBERNATION_DISTANCE: f64 = 155.0;
@@ -1810,6 +1973,244 @@ fn squad_members<'a>(squad: &str, objects: impl Iterator<Item = (u32, &'a str)>)
         .collect();
     out.sort_unstable();
     out
+}
+
+/// `Vehicle.OpenDoor(v, door)` or `Vehicle.CloseDoor`: the door is a part's
+/// name, hashed (or the hash itself).
+fn door_request(w: &mut ScriptWorld, a: &[Value], open: bool) -> mlua::Result<MultiValue> {
+    let door = match a.get(1) {
+        Some(Value::String(s)) => Some(m2_assets::name_hash(&s.to_string_lossy())),
+        Some(Value::Integer(i)) => Some(*i as u32),
+        _ => None,
+    };
+    if let (Some(guid), Some(door)) = (id(a.first()), door) {
+        w.doors.insert((guid, door), open);
+        w.commands.push(Command::Door { guid, door, open });
+    }
+    values([])
+}
+
+/// The kind of vehicle part `Vehicle.SetParts` names, by its name hash:
+/// from the 360 code's table (0x82348af8). The names known are those the
+/// scripts pass, and two whose hashes match: `LightBrake` 1,
+/// `LightReverse` 2, `LightFront` 3, `CtrlRotation` 4; kinds 5 to 8 by
+/// hash alone.
+pub fn vehicle_part(hash: u32) -> Option<u8> {
+    Some(match hash {
+        0x8194_f448 => 1, // LightBrake
+        0xdd45_b6c3 => 2, // LightReverse
+        0x7139_75a4 => 3, // LightFront
+        0xc079_3c78 => 4, // CtrlRotation
+        0x98f3_790f => 5,
+        0x4905_c3bd => 6,
+        0xe91f_1b2f => 7,
+        0x3273_505d => 8,
+        _ => return None,
+    })
+}
+
+/// `Pg.StartHeliWaveSpawner`'s argument: its waves, in order, as the 360
+/// reads them (0x8233b4d0, 0x8233b1c0): `NumToSpawn` (1), `WaveDelay`
+/// (15), `SpawnDist` (150) and `units`, each `{ template, weight }` with
+/// the weight 1 when left out and at least 1. A unit that isn't a table
+/// with a template is left out.
+fn heli_waves(t: &mlua::Table) -> mlua::Result<Vec<crate::heliwaves::Wave>> {
+    use crate::heliwaves::{DEFAULT_DELAY, DEFAULT_DISTANCE, Wave};
+    let mut out = Vec::new();
+    for v in t.sequence_values::<Value>() {
+        let Value::Table(w) = v? else { continue };
+        let number = |k: &str| num(w.raw_get::<Value>(k).ok().as_ref());
+        let mut units = Vec::new();
+        if let Ok(Value::Table(u)) = w.raw_get::<Value>("units") {
+            for unit in u.sequence_values::<Value>() {
+                let Value::Table(unit) = unit? else { continue };
+                let template = id(unit.raw_get::<Value>(1).ok().as_ref());
+                let weight = num(unit.raw_get::<Value>(2).ok().as_ref()).unwrap_or(1.0);
+                if let Some(template) = template {
+                    units.push((template, (weight as i32).max(1) as u32));
+                }
+            }
+        }
+        out.push(Wave {
+            count: number("NumToSpawn").map_or(1, |n| (n as i32).max(1) as u32),
+            delay: number("WaveDelay").unwrap_or(DEFAULT_DELAY),
+            distance: number("SpawnDist").unwrap_or(DEFAULT_DISTANCE),
+            units,
+        });
+    }
+    Ok(out)
+}
+
+impl crate::heliwaves::WaveWorld for ScriptWorld {
+    fn player(&self) -> Option<([f32; 3], f32)> {
+        let o = self.objects.get(&self.player?)?;
+        Some((o.position, o.yaw))
+    }
+    fn spawn(&mut self, template: u32, at: [f32; 3], yaw: f32) -> Option<u32> {
+        let name = self.objects.get(&template)?.name.clone();
+        Some(ScriptWorld::spawn(self, name, at, yaw))
+    }
+    fn alive_at(&self, guid: u32) -> Option<[f32; 3]> {
+        self.objects
+            .get(&guid)
+            .filter(|o| o.alive)
+            .map(|o| o.position)
+    }
+}
+
+type Native = fn(&mut ScriptWorld, &Lua, &[Value]) -> mlua::Result<MultiValue>;
+
+/// Natives ported from the 360 code one by one (the PMC thread's share of
+/// the gap list), each with its function's address.
+fn install_ported(
+    lib: &dyn Fn(&str) -> mlua::Result<Table>,
+    add: &dyn Fn(&Table, &str, Native) -> mlua::Result<()>,
+) -> mlua::Result<()> {
+    let object = lib("Object")?;
+    // Object.Revive(object, fraction) (0x823300f8): its health back to
+    // `fraction` (1 when left out) of its most, kept between 0 and the
+    // most; out of the destroyed state; true, or nil for no object.
+    add(&object, "Revive", |w, _, a| {
+        let Some(guid) = id(a.first()) else {
+            return values([Value::Nil]);
+        };
+        let fraction = num(a.get(1)).unwrap_or(1.0);
+        let Some(o) = w.objects.get_mut(&guid) else {
+            return values([Value::Nil]);
+        };
+        let health = (o.max_health * fraction).min(o.max_health).max(0.0);
+        o.health = health;
+        o.alive = true;
+        w.commands.push(Command::Revive { guid, health });
+        values([Value::Boolean(true)])
+    })?;
+    // Object.ApplyImpulse(object, x, y, z, local) (0x82331638): a push on
+    // its physics body; with `local` true the push is turned by the
+    // object's own facing first. True, or nil for no body.
+    add(&object, "ApplyImpulse", |w, _, a| {
+        let Some(guid) = id(a.first()) else {
+            return values([Value::Nil]);
+        };
+        let Some((push, next)) = place_arg(w, a, 1) else {
+            return values([Value::Nil]);
+        };
+        let local = matches!(a.get(next), Some(Value::Boolean(true)));
+        let Some(o) = w.objects.get(&guid) else {
+            return values([Value::Nil]);
+        };
+        let impulse = if local {
+            let (s, c) = o.yaw.sin_cos();
+            [
+                push[0] * c + push[2] * s,
+                push[1],
+                push[2] * c - push[0] * s,
+            ]
+        } else {
+            push
+        };
+        w.commands.push(Command::Impulse { guid, impulse });
+        values([Value::Boolean(true)])
+    })?;
+
+    let player = lib("Player")?;
+    // Player.GetPlayer(number) (0x8233e2c0): the player in that slot, nil
+    // for an empty one. One player here, in slot 0, guid 1.
+    add(&player, "GetPlayer", |_, _, a| {
+        let Some(n) = num(a.first()) else {
+            return values([Value::Nil]);
+        };
+        values([guid_value((n == 0.0).then_some(1))])
+    })?;
+    // Player.IsRemote(number) (0x8233e610): whether that player plays on
+    // another machine; never alone.
+    add(&player, "IsRemote", |_, _, a| {
+        if num(a.first()).is_none() {
+            return values([Value::Nil]);
+        }
+        values([Value::Boolean(false)])
+    })?;
+    // Player.SetScopeEnabled(player, on) (0x82340030): a count of reasons
+    // the scope is off, one more for each false, one fewer (not below 0)
+    // for each true; she may use it at 0. True, nil for bad arguments.
+    add(&player, "SetScopeEnabled", |w, _, a| {
+        let (Some(_), Some(Value::Boolean(on))) = (id(a.first()), a.get(1)) else {
+            return values([Value::Nil]);
+        };
+        let was = w.scope_off == 0;
+        w.scope_off = if *on {
+            w.scope_off.saturating_sub(1)
+        } else {
+            w.scope_off + 1
+        };
+        if was != (w.scope_off == 0) {
+            w.commands.push(Command::ScopeEnabled(w.scope_off == 0));
+        }
+        values([Value::Boolean(true)])
+    })?;
+
+    let human = lib("Human")?;
+    // Human.SetFireLock(person, on) (0x82325498): whether the person may
+    // not fire; true, nil for bad arguments.
+    add(&human, "SetFireLock", |w, _, a| {
+        let (Some(guid), Some(Value::Boolean(on))) = (id(a.first()), a.get(1)) else {
+            return values([Value::Nil]);
+        };
+        w.commands.push(Command::FireLock { guid, on: *on });
+        values([Value::Boolean(true)])
+    })?;
+
+    let sound = lib("Sound")?;
+    // Sound.SetMasterVolume(volume, seconds) (0x82343fb8): both numbers
+    // needed (nil else); answers nothing.
+    add(&sound, "SetMasterVolume", |w, _, a| {
+        let (Some(volume), Some(seconds)) = (num(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        w.commands.push(Command::MasterVolume { volume, seconds });
+        values([])
+    })?;
+
+    let camera = lib("Camera")?;
+    // Camera.SetYaw(camera, degrees) (0x82316ba8): the camera turned
+    // (degrees, as every angle the scripts pass); true when there is such
+    // a camera (here: a known holder), nil for bad arguments.
+    add(&camera, "SetYaw", |w, _, a| {
+        let (Some(holder), Some(degrees)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let known = w.objects.contains_key(&holder);
+        if known {
+            w.commands.push(Command::CameraYaw(degrees.to_radians()));
+        }
+        values([Value::Boolean(known)])
+    })?;
+
+    let state = lib("ObjectState")?;
+    // ObjectState.StartEmitter / StopEmitter(object, state, emitter)
+    // (0x823341f0, 0x82334298): the two names as hashes; nothing back,
+    // nil for bad arguments.
+    fn emitter(w: &mut ScriptWorld, a: &[Value], on: bool) -> mlua::Result<MultiValue> {
+        let hash = |v: Option<&Value>| match v {
+            Some(Value::String(s)) => Some(m2_assets::name_hash(&s.to_string_lossy())),
+            Some(Value::Integer(i)) => Some(*i as u32),
+            _ => None,
+        };
+        let (Some(guid), Some(state), Some(emitter)) =
+            (id(a.first()), hash(a.get(1)), hash(a.get(2)))
+        else {
+            return values([Value::Nil]);
+        };
+        w.commands.push(Command::Emitter {
+            guid,
+            state,
+            emitter,
+            on,
+        });
+        values([])
+    }
+    add(&state, "StartEmitter", |w, _, a| emitter(w, a, true))?;
+    add(&state, "StopEmitter", |w, _, a| emitter(w, a, false))?;
+    Ok(())
 }
 
 fn guid_value(g: Option<u32>) -> Value {
@@ -1896,7 +2297,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     };
 
     crate::airstrike::install(&lib("Airstrike")?, &add)?;
+    crate::ported_player::install(&lib, &add)?;
+    crate::ported_sp::install(&lib, &add)?;
     crate::shop::install(lua, &lib("Hud")?)?;
+    crate::ported::install(&lib, &add)?;
+    crate::ported_sys::install(&lib, &add)?;
     crate::cash::install(&lib, &add)?;
 
     // A string's hash, as the scripts key tables by name (their recruits'
@@ -1936,6 +2341,19 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let pg = lib("Pg")?;
+    // The helicopter wave spawner ([`crate::heliwaves`]): both natives
+    // return nothing (from the 360 code, 0x8233b6c0 and 0x8233b990).
+    add(&pg, "StartHeliWaveSpawner", |w, _, a| {
+        if let Some(Value::Table(t)) = a.first() {
+            let waves = heli_waves(t)?;
+            w.heli_waves.start(waves);
+        }
+        values([])
+    })?;
+    add(&pg, "StopHeliWaveSpawner", |w, _, _| {
+        w.heli_waves.stop();
+        values([])
+    })?;
     // The pursuit ([`Pursuit`]).
     add(&pg, "SetPursuitLevelTimes", |w, _, a| {
         if let (Some(low), Some(high)) = (num(a.first()), num(a.get(1))) {
@@ -1961,38 +2379,41 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Table(t)])
     })?;
     // (faction, level, _) for a while; (faction, level) locked.
-    fn pursue(w: &mut ScriptWorld, a: &[Value], locked: bool) {
-        let Some(f) = id(a.first()) else { return };
-        let level = num(a.get(1)).map_or(1, |l| l as i64).clamp(1, 3);
-        let Some(name) = w
+    //
+    // The answer, from the 360 code (0x823392b8 -> 0x82238398 and
+    // 0x823390c8): whether a pursuit started (SetPursuit: not with one
+    // locked, nor over one under way without force, nor below level 1;
+    // LockPursuit: a level of 1 or more); nil for bad arguments.
+    fn pursue(w: &mut ScriptWorld, a: &[Value], locked: bool) -> Option<bool> {
+        let f = id(a.first())?;
+        let asked = num(a.get(1)).map_or(1, |l| l as i64);
+        let level = asked.clamp(1, 3);
+        let name = w
             .templates
             .iter()
             .find(|(_, g)| **g == f)
-            .map(|(n, _)| n.clone())
-        else {
-            return;
-        };
+            .map(|(n, _)| n.clone())?;
         w.pursuit.level = level;
         w.pursuit.faction = Some(f);
-        if locked {
+        let started = if locked {
             w.pursuit.clock.lock(f, level as i32);
+            true
         } else {
             let force = matches!(a.get(2), Some(Value::Boolean(true)));
-            w.pursuit.clock.set(f, level as i32, force);
-        }
+            w.pursuit.clock.set(f, level as i32, force)
+        };
         let seconds = (!locked).then(|| w.pursuit.seconds(level));
         w.commands.push(Command::Pursuit {
             faction: name,
             seconds,
         });
+        Some(started && asked >= 1)
     }
     add(&pg, "SetPursuit", |w, _, a| {
-        pursue(w, a, false);
-        values([])
+        values([pursue(w, a, false).map_or(Value::Nil, Value::Boolean)])
     })?;
     add(&pg, "LockPursuit", |w, _, a| {
-        pursue(w, a, true);
-        values([])
+        values([pursue(w, a, true).map_or(Value::Nil, Value::Boolean)])
     })?;
     // (faction, seconds, levels): -1 s until cleared.
     add(&pg, "SetCustomPursuit", |w, _, a| {
@@ -2031,11 +2452,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // many seconds left (0x823393B0 -> 0x82238570), at the level they
     // make: the faction manager's `IncrementPursuit` gives 5, level 0.
     add(&pg, "SetPursuitSeconds", |w, _, a| {
-        if let (Some(f), Some(s)) = (id(a.first()), num(a.get(1))) {
-            let force = matches!(a.get(2), Some(Value::Boolean(true)));
-            w.pursuit.clock.set_seconds(f, s as i32, force);
-        }
-        values([])
+        // The answer (0x82238570): whether it started; nil for bad
+        // arguments.
+        let (Some(f), Some(s)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let force = matches!(a.get(2), Some(Value::Boolean(true)));
+        let started = w.pursuit.clock.set_seconds(f, s as i32, force);
+        values([Value::Boolean(started)])
     })?;
     // The objects of a kind within a radius of a point (x, y, z, radius),
     // as a list: what the strikes hit (the bunker buster's buildings, the
@@ -2246,13 +2670,28 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .map_or(0.0, |o| o.yaw);
         values([crate::events::guid_value(w.spawn(what, at, yaw))])
     })?;
-    // The point a distance in front of the camera and a height above it.
+    // Pg.FindPointFromCamera(distance, height, radius, player, degrees):
+    // the point `distance` ahead of the player's camera, flat, turned by
+    // `degrees`, `height` over the ground there. From the 360 code
+    // (0x823374c0): distance 10 and height 1 when left out (0x820baeec,
+    // 0x820baee8); the camera is the player's (the local one when left
+    // out); the angle is degrees (x 0.01745, 0x820f8c74); the ground is
+    // found by a ray (0x821d15a0) and, for a radius over 0, the point is
+    // moved to somewhere near within it (0x82336528). Here the camera is
+    // where she stands, facing her way. INVENTED: the ground is taken at
+    // her height, and the radius isn't used.
     add(&pg, "FindPointFromCamera", |w, _, a| {
-        let at = w.ahead(
-            None,
-            num(a.first()).unwrap_or(0.0),
-            num(a.get(1)).unwrap_or(0.0),
-        );
+        let turn = num(a.get(4)).unwrap_or(0.0).to_radians();
+        let her = w.player.and_then(|p| w.objects.get(&p));
+        let at = her.map(|o| {
+            let (s, c) = (o.yaw + turn).sin_cos();
+            let distance = num(a.first()).unwrap_or(10.0);
+            [
+                o.position[0] + s * distance,
+                o.position[1] + num(a.get(1)).unwrap_or(1.0),
+                o.position[2] + c * distance,
+            ]
+        });
         values(match at {
             Some(p) => p.map(|c| Value::Number(f64::from(c))).to_vec(),
             None => vec![Value::Nil],
@@ -2282,10 +2721,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             num(a.get(2)).unwrap_or(0.0),
             num(a.get(3)).unwrap_or(0.0),
         ];
-        let yaw = num(a.get(4)).unwrap_or(0.0);
+        // Degrees (the 360 multiplies by 0.0174533); scripts pass 0 or 90.
+        let yaw = num(a.get(4)).unwrap_or(0.0).to_radians();
         values([crate::events::guid_value(w.spawn(what, position, yaw))])
     })?;
 
+    crate::ported_physics::install(&lib, &add)?;
     let object = lib("Object")?;
     // Whether the player passes for her vehicle's faction (the faction
     // manager then takes the vehicle's faction for hers).
@@ -2298,7 +2739,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&object, "GetPosition", |w, _, a| {
         match id(a.first()).and_then(|g| w.objects.get(&g)) {
             Some(o) => values(o.position.map(|c| Value::Number(f64::from(c)))),
-            None => values([]),
+            // From the 360 code (0x8232eb58): one nil.
+            None => values([Value::Nil]),
         }
     })?;
     add(&object, "SetPosition", |w, _, a| {
@@ -2324,12 +2766,18 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             && let Some(o) = w.objects.get_mut(&g)
         {
             o.name = name.to_string_lossy();
+            // From the 360 code (0x8232f000): true.
+            return values([Value::Boolean(true)]);
         }
-        values([])
+        values([Value::Nil])
     })?;
+    // Angles cross the script boundary in degrees (from the 360 code:
+    // `Object.GetYaw` 0x8232ebd8 multiplies by 57.29583, `Object.SetYaw`
+    // 0x8232f8b0 and `Pg.Spawn` 0x82336b70 by 0.0174533, `Camera.GetYaw`
+    // 0x82316ad8 by 57.29578). Here objects keep radians.
     add(&object, "GetYaw", |w, _, a| {
         let yaw = id(a.first()).and_then(|g| w.objects.get(&g)).map(|o| o.yaw);
-        values([yaw.map_or(Value::Nil, |y| Value::Number(f64::from(y)))])
+        values([yaw.map_or(Value::Nil, |y| Value::Number(f64::from(y.to_degrees())))])
     })?;
     // (holder, object): whether `object` is still in `holder`'s hands. A
     // designator the game reports thrown has left them.
@@ -2367,7 +2815,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         w.commands.push(Command::Move { guid, position });
         w.commands.push(Command::Turn { guid, yaw });
-        values([])
+        // From the 360 code (0x8232f510): true; nil when there is nothing
+        // to take the place from.
+        values([Value::Boolean(true)])
     })?;
     // How far off an object goes to sleep (metres). The deliveries place
     // a helicopter's cargo by it, with 155 as their own fallback: that,
@@ -2401,14 +2851,19 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         };
         values([Value::Boolean(set)])
     })?;
+    // Object.SetYaw(object, degrees): from the 360 code (0x8232f8b0) it
+    // answers true, or nil for a bad argument or an object with no place.
     add(&object, "SetYaw", |w, _, a| {
-        if let (Some(guid), Some(yaw)) = (id(a.first()), num(a.get(1))) {
-            if let Some(o) = w.objects.get_mut(&guid) {
-                o.yaw = yaw;
-            }
-            w.commands.push(Command::Turn { guid, yaw });
-        }
-        values([])
+        let (Some(guid), Some(degrees)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let yaw = degrees.to_radians();
+        let Some(o) = w.objects.get_mut(&guid) else {
+            return values([Value::Nil]);
+        };
+        o.yaw = yaw;
+        w.commands.push(Command::Turn { guid, yaw });
+        values([Value::Boolean(true)])
     })?;
     // (object, boundary): whether the object (a rider: its vehicle) is
     // inside the boundary, as the `Boundary` event judges it. From the 8
@@ -2418,6 +2873,29 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&object, "InsideBoundary", |w, _, a| {
         let inside = match (id(a.first()), id(a.get(1))) {
             (Some(o), Some(b)) => w.inside(o, b).unwrap_or(false),
+            _ => false,
+        };
+        values([Value::Boolean(inside)])
+    })?;
+    // From the 360 code (`Pg.IsPointInBoundary(x, y, z, boundary)`,
+    // 0x82337828): a point, then the boundary object; the answer is
+    // whether the boundary's shape holds the point (false when it has
+    // none). The 360 tests only two kinds of shape there (kinds 2 and 4 of
+    // the shape record); which of the regions read here those are isn't
+    // established, so every region is tested (inferred). A bad argument
+    // is the usual argument error (nil here). GurCon001 asks whether the
+    // jammer is in `LR_TowerBase`.
+    add(&pg, "IsPointInBoundary", |w, _, a| {
+        let Some((p, next)) = place_arg(w, a, 0) else {
+            return values([Value::Nil]);
+        };
+        let Some(boundary) = id(a.get(next)) else {
+            return values([Value::Nil]);
+        };
+        let inside = match (w.regions.get(&boundary), w.objects.get(&boundary)) {
+            (Some(region), Some(at)) => {
+                region.contains([at.position[0], at.position[2]], at.yaw, p[0], p[2])
+            }
             _ => false,
         };
         values([Value::Boolean(inside)])
@@ -2487,14 +2965,27 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
         values([o.map_or(Value::Nil, |o| Value::Number(f64::from(o.max_health)))])
     })?;
+    // From the 360 code (0x8232e6a8): the health is kept between 0 and the
+    // object's most; the answer is true, or nil for no object (or no
+    // health) or a bad argument.
     add(&object, "SetHealth", |w, _, a| {
-        if let (Some(guid), Some(health)) = (id(a.first()), num(a.get(1))) {
-            if let Some(o) = w.objects.get_mut(&guid) {
-                o.health = health;
-            }
-            w.commands.push(Command::SetHealth { guid, health });
-        }
-        values([])
+        let (Some(guid), Some(health)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let Some(o) = w.objects.get_mut(&guid) else {
+            return values([Value::Nil]);
+        };
+        // Most objects' most health isn't read here yet (100 stands in), so
+        // only the player's, which the game sets, caps it.
+        let capped = if Some(guid) == w.player {
+            health.min(o.max_health)
+        } else {
+            health
+        };
+        let health = capped.max(0.0);
+        o.health = health;
+        w.commands.push(Command::SetHealth { guid, health });
+        values([Value::Boolean(true)])
     })?;
     add(&object, "SetInvincible", |w, _, a| {
         let Some(guid) = id(a.first()) else {
@@ -2516,7 +3007,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         if now != was {
             w.commands.push(Command::Invincible { guid, on: now });
         }
-        values([])
+        // From the 360 code (0x82330450): true.
+        values([Value::Boolean(true)])
     })?;
     add(&object, "Kill", |w, _, a| {
         if let Some(guid) = id(a.first()) {
@@ -2643,13 +3135,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Boolean(carrying)])
     })?;
     // Human.Drop(character): puts down whom it carries.
+    // From the 360 code (0x82325100): whether the person was carrying
+    // something (and so drops it); nil for no person.
     add(&human, "Drop", |w, _, a| {
-        if let Some(guid) = id(a.first())
-            && w.carrying.contains_key(&guid)
-        {
+        let Some(guid) = id(a.first()) else {
+            return values([Value::Nil]);
+        };
+        let carrying = w.carrying.contains_key(&guid);
+        if carrying {
             w.commands.push(Command::Drop(guid));
         }
-        values([])
+        values([Value::Boolean(carrying)])
     })?;
     // Human.PlayRawAnimation(character, clip, false, false, -1, true,
     // true): the one call site (WifHq._NextCinematicFrame) plays each
@@ -2775,26 +3271,47 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Object.SetInfiniteAmmo(character, on): her weapons don't run dry
     // (PmcCon034's sniper tower, after handing her its rifle; from the
     // scripts). Stood in for by a reserve no range empties (invented).
+    //
+    // From the 360 code (0x823305f0): the flag is true when left out; false
+    // takes the object off the engine's infinite-ammo list; the answer is
+    // true (nil for no object). Here infinite is a full-to-the-brim reserve,
+    // so false puts each weapon back to its template's most (inferred: the
+    // 360 just stops topping it up).
     add(&object, "SetInfiniteAmmo", |w, _, a| {
-        let (Some(who), Some(Value::Boolean(true))) = (id(a.first()), a.get(1)) else {
-            return values([]);
+        let Some(who) = id(a.first()) else {
+            return values([Value::Nil]);
         };
+        let on = !matches!(a.get(1), Some(Value::Boolean(false)));
         for g in w.inventory.of(who).to_vec() {
-            let name = w.weapon_name(g);
-            if let (Some(c), Some(weapon)) = (w.inventory.carried.get_mut(&g), name) {
-                c.reserve = INFINITE_RESERVE;
+            let Some(weapon) = w.weapon_name(g) else {
+                continue;
+            };
+            let rounds = if on {
+                INFINITE_RESERVE
+            } else {
+                match w.inventory.max_reserve.get(&weapon.to_ascii_lowercase()) {
+                    Some(&max) => max,
+                    None => continue,
+                }
+            };
+            if let Some(c) = w.inventory.carried.get_mut(&g) {
+                // Off leaves a weapon that wasn't topped up as it is.
+                if !on && c.reserve != INFINITE_RESERVE {
+                    continue;
+                }
+                c.reserve = rounds;
                 w.commands.push(Command::Reserve {
                     who,
                     weapon,
-                    rounds: INFINITE_RESERVE,
+                    rounds,
                 });
             }
         }
-        values([])
+        values([Value::Boolean(true)])
     })?;
     add(&weapon, "SetReserveAmmo", |w, _, a| {
         let (Some(g), Some(rounds)) = (id(a.first()), num(a.get(1))) else {
-            return values([]);
+            return values([Value::Nil]);
         };
         let rounds = rounds.max(0.0) as u32;
         let name = w.weapon_name(g);
@@ -2806,8 +3323,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 weapon,
                 rounds,
             });
+            // From the 360 code (0x82349b48): true for a weapon, nil else.
+            return values([Value::Boolean(true)]);
         }
-        values([])
+        values([Value::Nil])
     })?;
     // The number of the player controlling it (scripts pass it on to
     // `Player.IsLocal` and key tables by it), else nil.
@@ -2832,11 +3351,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&object, "IsPlayerControlled", |w, _, a| {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
-        values([if o.is_some_and(|o| o.player_controlled) {
-            Value::Integer(1)
-        } else {
-            Value::Nil
-        }])
+        // From the 360 code (0x8232ffc8): the player who controls it (as
+        // Player.GetLocalPlayer names her, guid 1), else nil.
+        values([guid_value(
+            o.is_some_and(|o| o.player_controlled).then_some(1),
+        )])
     })?;
     add(&object, "HasLabel", |w, _, a| {
         let has = match (id(a.first()).and_then(|g| w.objects.get(&g)), a.get(1)) {
@@ -2855,8 +3374,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             if !o.labels.contains(&l) {
                 o.labels.push(l);
             }
+            // From the 360 code (0x82330700): true once it had a label and
+            // an object.
+            return values([Value::Boolean(true)]);
         }
-        values([])
+        values([Value::Boolean(false)])
     })?;
     add(&object, "RemoveLabel", |w, _, a| {
         if let (Some(o), Some(Value::String(l))) =
@@ -2866,8 +3388,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             o.labels.retain(|x| *x != l);
             let h = m2_assets::name_hash(&l);
             o.label_hashes.retain(|&x| x != h);
+            // From the 360 code (0x823307f8): true once it had a label and
+            // an object, false without.
+            return values([Value::Boolean(true)]);
         }
-        values([])
+        values([Value::Boolean(false)])
     })?;
     // From the 360 code (`0x8232EF88`): the object's name hash, pushed as
     // light userdata like `String.GetHash` (`crate::script_hash`), nil for
@@ -2992,24 +3517,35 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         )])
     })?;
 
+    crate::ported_misc::install(&lib, &add)?;
     let player = lib("Player")?;
+    // From the 360 code (0x8233d400 -> 0x8243d4d0): true when the
+    // boundary has a shape (already held or added), false without one;
+    // nil for bad arguments.
     add(&player, "AddBoundary", |w, _, a| {
-        if let Some(b) = id(a.get(1))
-            && !w.boundaries.contains(&b)
-        {
+        let Some(b) = id(a.get(1)) else {
+            return values([Value::Nil]);
+        };
+        // Kept even without a shape here: a region this world didn't read
+        // may still be one the game has (the 360 keeps only shaped ones).
+        if !w.boundaries.contains(&b) {
             w.boundaries.push(b);
         }
-        values([])
+        values([Value::Boolean(w.regions.contains_key(&b))])
     })?;
     add(&player, "RemoveBoundary", |w, _, a| {
-        if let Some(b) = id(a.get(1)) {
-            w.boundaries.retain(|&x| x != b);
-        }
-        values([])
+        // From the 360 code (0x8233d500 -> 0x8243d770): whether she had it.
+        let Some(b) = id(a.get(1)) else {
+            return values([Value::Nil]);
+        };
+        let had = w.boundaries.contains(&b);
+        w.boundaries.retain(|&x| x != b);
+        values([Value::Boolean(had)])
     })?;
     add(&player, "RemoveAllBoundary", |w, _, _| {
         w.boundaries.clear();
-        values([])
+        // From the 360 code (0x8233d5d8): true.
+        values([Value::Boolean(true)])
     })?;
     // (player, out): sets whether she is out of the play area, without the
     // callback hearing it: `WifVzBoundary`'s interior mode (the HQ) and the
@@ -3017,7 +3553,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // that coming back is no "exit".
     add(&player, "SetOutBoundary", |w, _, a| {
         w.outside = matches!(a.get(1), Some(Value::Boolean(true)));
-        values([])
+        // From the 360 code (0x8233ceb0): true.
+        values([Value::Boolean(true)])
     })?;
     // Player.IsPositionOutBoundary(player, x, y, z): whether a spot is
     // outside the play area. The PDA's beacon check asks it
@@ -3037,35 +3574,41 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let who = id(a.first()).or(w.player);
         values([guid_value(who)])
     })?;
+    crate::ported_init::install(&lib, &add)?;
+    crate::player_target::install(&lib, &add)?;
     let camera = lib("Camera")?;
     // The camera looks the way she faces; a camera whose holder this
     // world doesn't place (the HUD's own world) faces north. Always a
     // number: the PDA's map turns by it (`math.rad`), and nil broke its
     // Open half-way, leaving the PDA marked open and the support menu shut.
+    crate::script_camera::install(&lib, &add)?;
     add(&camera, "GetYaw", |w, _, a| {
         let yaw = id(a.first())
             .or(w.player)
             .and_then(|g| w.objects.get(&g))
             .map_or(0.0, |o| o.yaw);
-        values([Value::Number(f64::from(yaw))])
+        values([Value::Number(f64::from(yaw.to_degrees()))])
     })?;
     // Camera.SetShot(camera, shot, base, target, ...): a named shot of the
     // engine's (the HQ's briefings ask `OverTheShoulderLeft` and `Right`,
     // from one speaker to the other, `MrxBriefing`'s cheap cinematic),
     // held while the player is in cinematic mode.
     add(&camera, "SetShot", |w, _, a| {
+        // From the 360 code (0x82317990): true once the camera takes the
+        // shot, nil for bad arguments (a shot needs both objects).
         let name = match a.get(1) {
             Some(Value::String(s)) => s.to_string_lossy(),
-            _ => return values([]),
+            _ => return values([Value::Nil]),
         };
-        if let (Some(base), Some(target)) = (id(a.get(2)), id(a.get(3))) {
-            w.commands.push(Command::CameraShot {
-                shot: name,
-                base,
-                target,
-            });
-        }
-        values([])
+        let (Some(base), Some(target)) = (id(a.get(2)), id(a.get(3))) else {
+            return values([Value::Nil]);
+        };
+        w.commands.push(Command::CameraShot {
+            shot: name,
+            base,
+            target,
+        });
+        values([Value::Boolean(true)])
     })?;
     // Player.SetCinematicMode([player,] on, ...): the scripts take her
     // controls and the camera for a scene (the HQ's briefings), and give
@@ -3080,7 +3623,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }) {
             w.commands.push(Command::AimMode(on));
         }
-        values([])
+        // From the 360 code (0x8233fee0): true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "SetCinematicMode", |w, _, a| {
         let Some(on) = a.iter().find_map(|v| match v {
@@ -3091,9 +3635,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         };
         if on != w.cinematic {
             w.cinematic = on;
+            w.cinematic_camera(on);
             w.commands.push(Command::Cinematic(on));
         }
-        values([])
+        // From the 360 code (0x8233ccc0): true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "InCinematicMode", |w, _, _| {
         values([Value::Boolean(w.cinematic)])
@@ -3106,23 +3652,27 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.health_clamp = on;
             w.commands.push(Command::HealthClamp(on));
         }
-        values([])
+        // From the 360 code (0x8233d110): true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "SetInputEnabled", |w, _, a| {
         let on = !matches!(a.get(1), Some(Value::Boolean(false)));
         w.commands.push(Command::InputEnabled(on));
-        values([])
+        // From the 360 code (0x8233cf68): true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "SetSurvivalMode", |w, _, a| {
         w.survival_mode = matches!(a.get(1), Some(Value::Boolean(true)));
-        values([])
+        // From the 360 code (0x8233d030): true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "SetBoundaryCallback", |w, _, a| {
         w.boundary_callback = match a.get(1) {
             Some(Value::Function(f)) => Some(f.clone()),
             _ => None,
         };
-        values([])
+        // From the 360 code: true.
+        values([Value::Boolean(true)])
     })?;
     // A new game starts at the usual marker.
     add(&player, "GetPlayerStart", |_, lua, _| {
@@ -3191,14 +3741,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         if let (Some(guid), Some(Value::String(model))) = (id(a.first()), a.get(1)) {
             let model = model.to_string_lossy();
             w.commands.push(Command::Outfit { guid, model });
+            // From the 360 code (0x8233fb90): true.
+            return values([Value::Boolean(true)]);
         }
-        values([])
+        values([Value::Nil])
     })?;
     // Player.SetGrappleEnabled(player, on): the one call site turns it on
     // for each player as the mechanic joins the PMC.
     add(&player, "SetGrappleEnabled", |w, _, a| {
         w.grapple_enabled = !matches!(a.get(1), None | Some(Value::Nil | Value::Boolean(false)));
-        values([])
+        // From the 360 code: true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "GetFuel", |w, _, _| {
         let fuel = w
@@ -3232,7 +3785,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         if !w.vehicle_disguise {
             w.disguise = None;
         }
-        values([])
+        // From the 360 code (0x823401a0's setter): true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "GetVehicleDisguise", |w, _, _| {
         values([Value::Boolean(w.vehicle_disguise)])
@@ -3304,8 +3858,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&player, "GetSecondaryPlayer", |_, _, _| {
         values([Value::Nil])
     })?;
-    add(&player, "IsLocal", |_, _, a| {
-        values([Value::Boolean(id(a.first()) == Some(1))])
+    // From the 360 code (0x8233e528): a player's number (0 is hers) or a
+    // player; nil for neither.
+    add(&player, "IsLocal", |_, _, a| match a.first() {
+        Some(Value::Integer(n)) => values([Value::Boolean(*n == 0)]),
+        Some(Value::Number(n)) => values([Value::Boolean(*n == 0.0)]),
+        v => match id(v) {
+            Some(g) => values([Value::Boolean(g == 1)]),
+            None => values([Value::Nil]),
+        },
     })?;
     // The players, a list the scripts go through (`pairs`, `ipairs`)...
     add(&player, "GetAllPlayers", |_, lua, _| {
@@ -3327,6 +3888,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let vehicle = lib("Vehicle")?;
+    // From the 360 code: `Vehicle.OpenDoor(v, door)` (0x82347ee0) and
+    // `Vehicle.CloseDoor` (0x82347f80) read the vehicle and the door's
+    // name (hashed), queue the request (open 0, close 1; at most 100 a
+    // frame, 0x82245c98) and return nothing; bad arguments raise the
+    // usual argument error. PmcCon033 opens and closes a vehicle's
+    // `"pivot"` on timers, passing `Vehicle.OpenDoor` itself as the
+    // timer's callback.
+    add(&vehicle, "OpenDoor", |w, _, a| door_request(w, a, true))?;
+    add(&vehicle, "CloseDoor", |w, _, a| door_request(w, a, false))?;
     // 0x82348358: whether a car lies flipped (the game's to say; the 360
     // asks the physics object's vtable +0x9C). True only for a car.
     add(&vehicle, "IsFlipped", |w, _, a| {
@@ -3479,6 +4049,42 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let ai = lib("Ai")?;
+    // How one person regards another (`Ai.GetFeeling(ai, other)`,
+    // `Ai.SetFeeling(ai, other, value)`), as the AI keeps it per person
+    // it has perceived. From the 360 code: `GetFeeling` (0x82313350,
+    // 0x822F9398) looks the other up in the AI's own store and answers
+    // its feeling; with no AI there or no record of the other it answers
+    // nil. A record flagged so (bit 22 of +0xe8) answers no more than -38
+    // (0x820f8d38). `SetFeeling` (0x82313408, 0x822F9438) finds or makes
+    // the AI's record of the other and sets it, answering whether it
+    // could (false without an AI).
+    //
+    // Inferred here: records come only from `SetFeeling` (the 360 also
+    // makes one as the AI perceives someone, which happens in the game,
+    // not in the scripts' world); the -38 cap's flag isn't modelled; the
+    // value is kept as given. OilCon021 asks whether the mailman's
+    // feeling for her is down to -33 (hostile); a script elsewhere puts a
+    // feeling below 0 back to 100.
+    add(&ai, "GetFeeling", |w, _, a| {
+        let feeling = match (id(a.first()), id(a.get(1))) {
+            (Some(ai), Some(other)) if w.objects.get(&ai).is_some_and(|o| o.alive) => {
+                w.feelings.get(&(ai, other)).copied()
+            }
+            _ => None,
+        };
+        values([feeling.map_or(Value::Nil, |f| Value::Number(f64::from(f)))])
+    })?;
+    add(&ai, "SetFeeling", |w, _, a| {
+        let (Some(ai), Some(other), Some(value)) = (id(a.first()), id(a.get(1)), num(a.get(2)))
+        else {
+            return values([Value::Nil]);
+        };
+        let set = w.objects.get(&ai).is_some_and(|o| o.alive);
+        if set {
+            w.feelings.insert((ai, other), value);
+        }
+        values([Value::Boolean(set)])
+    })?;
     // Ai.SetInfractionMultiplier(faction, m), the faction as its
     // template's guid (`Pg.GetGuidByName("OC")`): see
     // [`crate::report::Reports::multipliers`].
@@ -3486,10 +4092,38 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let name = id(a.first())
             .and_then(|g| w.objects.get(&g))
             .map(|o| o.name.to_ascii_lowercase());
-        if let (Some(name), Some(m)) = (name, num(a.get(1))) {
+        // From the 360 code (0x823138b8): a multiplier of 1 takes the
+        // faction off the list; the answer is true, nil for bad arguments.
+        let (Some(name), Some(m)) = (name, num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        if m == 1.0 {
+            w.reports.multipliers.remove(&name);
+        } else {
             w.reports.multipliers.insert(name, m);
         }
-        values([])
+        values([Value::Boolean(true)])
+    })?;
+    // From the 360 code (`Ai.AddInfraction(who, faction, amount)`,
+    // 0x823137c8, and 0x822F6FB8): `amount` is 1 when left out. Every AI
+    // of that faction (of any, for faction 0) that has a record of `who`
+    // with its +0x8c below 0.5 notes an infraction of the engine's kind 6
+    // against them, and unless it is flagged not to, its feeling for
+    // them drops by its faction's cost of that kind (0x822dd4d8). The
+    // answer is whether `who` was given, not whether anyone saw. Who
+    // perceives whom is the game's, so the request goes to it as a
+    // command. AllCon003 sets China against her by 100 this way.
+    add(&ai, "AddInfraction", |w, _, a| {
+        let (Some(who), Some(faction)) = (id(a.first()), id(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let amount = num(a.get(2)).unwrap_or(1.0);
+        w.commands.push(Command::Infraction {
+            who,
+            faction,
+            amount,
+        });
+        values([Value::Boolean(true)])
     })?;
     add(&ai, "GetFactionGuid", |w, _, a| {
         // A zone's own; a person's, their faction's template (as
@@ -3504,25 +4138,39 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     // How one faction's AI regards another, -100 (hostile) to 100
     // (friendly), as the faction manager sets it (`Ai.SetRelation(a, b,
-    // value)`); the faction manager reads attitudes back from it. Pairs
-    // never set are neutral, 0; one set only the other way round answers
-    // for both (inferred).
+    // value)`); the faction manager reads attitudes back from it.
+    //
+    // From the 360 code: `Ai.SetRelation` (0x82313578, store 0x822F0600)
+    // clamps the value to -100..100 (0x820f8c3c, 0x820d9f18), keeps it
+    // for the pair in that order only, and answers true. `Ai.GetRelation`
+    // (0x823134e0, lookup 0x822F0440/0x822F02C0) reads the same table,
+    // which also holds the templates' own `Relationship` records (seeded
+    // here from the template database): the pair in order, walking each
+    // side up to its parent (a person to its faction) while none is
+    // found. Never the other way round. A pair with no record answers 0,
+    // unless both sides come to the same template: then 100.
     add(&ai, "SetRelation", |w, _, a| {
-        if let (Some(from), Some(to), Some(value)) =
-            (faction(a.first()), faction(a.get(1)), num(a.get(2)))
-        {
-            w.relations.insert((from, to), value);
-        }
-        values([])
+        let set = match (
+            relation_side(w, a.first()),
+            relation_side(w, a.get(1)),
+            num(a.get(2)),
+        ) {
+            (Some(from), Some(to), Some(value)) => {
+                w.relations
+                    .insert((from, to), value.clamp(-RELATION_LIMIT, RELATION_LIMIT));
+                true
+            }
+            _ => false,
+        };
+        values([Value::Boolean(set)])
     })?;
     add(&ai, "GetRelation", |w, _, a| {
-        let value = match (faction(a.first()), faction(a.get(1))) {
-            (Some(from), Some(to)) => w
-                .relations
-                .get(&(from.clone(), to.clone()))
-                .or_else(|| w.relations.get(&(to, from)))
-                .copied()
-                .unwrap_or(0.0),
+        let value = match (relation_side(w, a.first()), relation_side(w, a.get(1))) {
+            (Some(from), Some(to)) => match w.relations.get(&(from.clone(), to.clone())) {
+                Some(&r) => r,
+                None if from == to => RELATION_LIMIT,
+                None => 0.0,
+            },
             _ => 0.0,
         };
         values([Value::Number(f64::from(value))])
@@ -3568,7 +4216,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // (`MrxTaskObjectiveAction`; inferred that they succeed).
     add(&pg, "AddContextAction", |w, _, a| {
         let (Some(guid), Some(Value::String(text))) = (id(a.first()), a.get(1)) else {
-            return values([]);
+            // From the 360 code (0x823381e8): nil for bad arguments.
+            return values([Value::Nil]);
         };
         let reach = num(a.get(2)).filter(|r| *r > 0.0).unwrap_or(CONTEXT_REACH);
         w.context_actions.insert(
@@ -3638,7 +4287,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let target = id(t.raw_get::<Value>("Target").ok().as_ref()).filter(|_| follow);
         let near = num(t.raw_get::<Value>("MoveDistance").ok().as_ref()).unwrap_or(4.0);
         w.commands.push(Command::Follow { guid, target, near });
-        values([Value::Boolean(true)])
+        // From the 360 code (0x82310d50): a number, 1 when there was an AI
+        // to give the role to (0 when not).
+        values([Value::Integer(mlua::Integer::from(
+            w.objects.contains_key(&guid),
+        ))])
     })?;
     // `Ai.Squad{ SquadGuid, Action = "GetUnits" }`: the squad's people
     // (OilCon001 waits on `oc001.obj1.vzsquad1`'s to fall). Inferred from
@@ -3668,10 +4321,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&ai, "Deploy", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
-            return values([]);
+            return values([Value::Boolean(false)]);
         };
         let Some(vehicle) = id(t.raw_get::<Value>("Vehicle").ok().as_ref()) else {
-            return values([]);
+            return values([Value::Boolean(false)]);
         };
         let passengers = matches!(
             t.raw_get::<Value>("Role")?,
@@ -3705,7 +4358,55 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             let data = t.raw_get::<Value>("CallbackData")?;
             w.asset_loads.push((f, data));
         }
-        values([])
+        // From the 360 code (0x82311ed0): true once it has a vehicle, false
+        // without one (or without a table).
+        values([Value::Boolean(true)])
+    })?;
+    // From the 360 code (`Ai.RemoveGoal{ AIGuid, Handle }`, 0x82310308
+    // and 0x822F9188): without an AI there it answers false; `Handle` 0
+    // clears all its goals and answers true; another handle removes that
+    // goal and answers whether it did. Goals here hand out no handles
+    // (`Ai.Goal` answers nothing), so another handle finds none
+    // (inferred). PmcCon003 clears its pursuit helicopters' goals before
+    // giving them new ones.
+    add(&ai, "RemoveGoal", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([Value::Boolean(false)]);
+        };
+        let guid = id(t.raw_get::<Value>("AIGuid").ok().as_ref());
+        let handle = num(t.raw_get::<Value>("Handle").ok().as_ref()).unwrap_or(0.0);
+        let Some(guid) = guid.filter(|g| w.objects.get(g).is_some_and(|o| o.alive)) else {
+            return values([Value::Boolean(false)]);
+        };
+        if handle != 0.0 {
+            return values([Value::Boolean(false)]);
+        }
+        w.goal_callbacks.retain(|(g, _, _)| *g != guid);
+        w.commands.push(Command::ClearGoals { guid });
+        values([Value::Boolean(true)])
+    })?;
+    // From the 360 code (`Ai.SetState{ AIGuid, State, Value }`,
+    // 0x823114a0): `Value` is true when left out; the state goes to the
+    // AI's controller by name, and the answer is the controller's (false
+    // without an AI). What each state does is the controller's and isn't
+    // traced; it is kept per person and passed to the game, answering
+    // true (inferred). PmcCon003 makes Carmona a VIP (`State = "Vip"`).
+    add(&ai, "SetState", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([Value::Nil]);
+        };
+        let guid = id(t.raw_get::<Value>("AIGuid").ok().as_ref());
+        let state = t.raw_get::<Option<String>>("State")?;
+        let on = !matches!(t.raw_get::<Value>("Value")?, Value::Boolean(false));
+        let (Some(guid), Some(state)) = (guid, state) else {
+            return values([Value::Nil]);
+        };
+        if !w.objects.get(&guid).is_some_and(|o| o.alive) {
+            return values([Value::Boolean(false)]);
+        }
+        w.ai_states.insert((guid, state.to_ascii_lowercase()), on);
+        w.commands.push(Command::AiState { guid, state, on });
+        values([Value::Boolean(true)])
     })?;
     // Ai.SetHaste(ai, haste): the AI's haste from here on, held to 0..=2;
     // gives whether there is such an AI. From the 360 code (82311968).
@@ -3786,6 +4487,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let Some(guid) = id(t.raw_get::<Value>("AIGuid").ok().as_ref()) else {
             return values([]);
         };
+        // The 360 answers nil for no AI. The goal still goes to the game
+        // here: the scripts' world may not hold everyone the game does
+        // (a layer's people named before their layer is read).
+        let known = w.objects.contains_key(&guid);
         let goal: String = t.raw_get::<Option<String>>("Goal")?.unwrap_or_default();
         let location = match t.raw_get::<Value>("Location")? {
             Value::Table(l) => {
@@ -3828,7 +4533,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             haste,
             path,
         });
-        values([])
+        // From the 360 code (0x8230ffb8): the goal's handle, a number
+        // (`Ai.RemoveGoal{ AIGuid, Handle }` takes it back); nil when
+        // `AIGuid` is no AI. `Force = true` clears the AI's goals first,
+        // which a new goal here does anyway (above). Handles count up
+        // from 1 here; the 360's own numbering isn't traced.
+        if !known {
+            return values([Value::Nil]);
+        }
+        w.goal_handles += 1;
+        values([Value::Number(f64::from(w.goal_handles))])
     })?;
 
     // The armies go for `guid` before anything else: it gets the object
@@ -3862,11 +4576,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             haste: num(a.get(4)),
             path: None,
         });
-        values([])
+        // From the 360 code (0x82311c50): false, once it has a place to go;
+        // nothing without one.
+        if location.is_none() {
+            return values([]);
+        }
+        values([Value::Boolean(false)])
     })?;
 
     // Single player: this machine is the server.
     let net = lib("Net")?;
+    crate::ported_net::install(&lib, &add)?;
     add(&net, "IsServer", |_, _, _| values([Value::Boolean(true)]))?;
     // Net.SendCustomEvent(module, event, args, ...): a script's own event
     // sent to the other player's game (a race's gates). From the 360 code
@@ -3888,7 +4608,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&net, "SetLoadingScreen", |w, _, a| {
         let on = matches!(a.first(), Some(Value::Boolean(true)));
         w.commands.push(Command::LoadingScreen(on));
-        values([])
+        // From the 360 code (0x8232db28): true.
+        values([Value::Boolean(true)])
     })?;
 
     // Calls the game only needs to hear about.
@@ -3898,7 +4619,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => String::new(),
         };
         w.commands.push(Command::Save { slot });
-        values([])
+        // From the 360 code (0x823387c8): the save's own answer; the game
+        // saves here, so true (inferred).
+        values([Value::Boolean(true)])
     })?;
     for name in [
         "ContractActivated",
@@ -4251,11 +4974,44 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             raw(a.get(1))
         ));
         w.commands.extend(hush);
-        values([])
+        // From the 360 code (0x82349230, 0x82277cc0): always true.
+        values([Value::Boolean(true)])
     })?;
-    for name in ["AddSequence", "RemoveSequence"] {
-        add(&vo, name, |_, _, _| values([]))?;
-    }
+    // From the 360 code: the VO system keeps up to 32 (speaker, priority)
+    // pairs. `VO.AddSequence(speaker, priority)` (0x82349690) adds one
+    // and answers true; false when the list is full or the speaker
+    // already holds one with a higher number than the new one. The
+    // engine also starts the speaker's sequence then (0x822783b0, not
+    // traced). `VO.RemoveSequence(speaker, priority)` (0x823497b0) takes
+    // out that exact pair and answers whether it was there. Nil for bad
+    // arguments.
+    add(&vo, "AddSequence", |w, _, a| {
+        let (Some(speaker), Some(priority)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let priority = priority as i32;
+        let full = w.vo_sequences.len() >= VO_SEQUENCES;
+        let outranked = w
+            .vo_sequences
+            .iter()
+            .any(|&(s, p)| s == speaker && priority < p);
+        if full || outranked {
+            return values([Value::Boolean(false)]);
+        }
+        w.vo_sequences.push((speaker, priority));
+        values([Value::Boolean(true)])
+    })?;
+    add(&vo, "RemoveSequence", |w, _, a| {
+        let (Some(speaker), Some(priority)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let pair = (speaker, priority as i32);
+        let Some(at) = w.vo_sequences.iter().position(|&p| p == pair) else {
+            return values([Value::Boolean(false)]);
+        };
+        w.vo_sequences.swap_remove(at);
+        values([Value::Boolean(true)])
+    })?;
     // Priorities the sequences copy at load and compare: a new sequence
     // whose number is no higher than the running one's cuts it off, so the
     // most important is lowest. Only the order is known, not the values.
@@ -4274,6 +5030,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     // Developer switches: skip to a mission (off unless asked for), and
     // force a new game (off).
+    install_ported(&lib, &add)?;
     let sys = lib("Sys")?;
     // The game shows its tutorial tips, unless the player turned them off.
     add(&sys, "TutorialsEnabled", |w, _, _| {
@@ -4324,8 +5081,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Scripts also call it bare.
     globals.raw_set("StringToGuid", sys.get::<Function>("StringToGuid")?)?;
     add(&sys, "GuidToString", |_, lua, a| {
-        let text = id(a.first()).map_or_else(|| "nil".to_owned(), |g| g.to_string());
-        values([Value::String(lua.create_string(&text)?)])
+        // From the 360 code (0x82344660): "0x%08X"; nil for a bad argument.
+        let Some(g) = id(a.first()) else {
+            return values([Value::Nil]);
+        };
+        values([Value::String(lua.create_string(format!("0x{g:08X}"))?)])
     })?;
     add(&sys, "RequestGameState", |w, _, a| {
         if let Some(Value::String(s)) = a.first() {
@@ -4333,7 +5093,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.game_state = state.clone();
             w.commands.push(Command::GameState(state));
         }
-        values([])
+        // From the 360 code (0x82344710): true.
+        values([Value::Boolean(true)])
     })?;
     {
         use crate::script_flags as f;
@@ -4450,10 +5211,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Number(f64::from(w.asset_request_max))])
     })?;
     add(&sys, "SetAssetRequestMax", |w, _, a| {
-        if let Some(n) = num(a.first()) {
-            w.asset_request_max = n as u32;
-        }
-        values([])
+        // From the 360 code (0x82344e60 -> 0x8230aa70): true, unless it
+        // would leave fewer slots than requests under way (false, and
+        // nothing changes); nil for no number. No request waits here
+        // (loads are at once), so true.
+        let Some(n) = num(a.first()) else {
+            return values([Value::Nil]);
+        };
+        w.asset_request_max = n as u32;
+        values([Value::Boolean(true)])
     })?;
 
     // `Math` is the math library under the name some scripts use; the
@@ -4802,9 +5568,16 @@ mod tests {
             jeep.labels.push("Vehicle".into());
             w.insert(50, jeep);
             // The template database's templates the tests' scripts name.
-            w.template_names = ["carbine", "grenade", "supply drop (gl)", "oc", "allied"]
-                .map(String::from)
-                .into();
+            w.template_names = [
+                "carbine",
+                "grenade",
+                "supply drop (gl)",
+                "oc",
+                "allied",
+                "pmc",
+            ]
+            .map(String::from)
+            .into();
         }
         install(host.lua(), &world).unwrap();
         (host, world)
@@ -5956,7 +6729,7 @@ mod tests {
             .unwrap();
         assert!(events.update_shared(0.1, &world).is_empty());
         let seated: String = host.lua().globals().get("seated").unwrap();
-        assert_eq!(seated, "in:1/50");
+        assert_eq!(seated, "in:0x00000001/0x00000032");
     }
 
     #[test]
@@ -6244,7 +7017,7 @@ mod tests {
         world.borrow_mut().objects.get_mut(&1).unwrap().position = [103.0, 9.0, 98.0];
         assert!(events.update_shared(0.1, &world).is_empty());
         let arrived: String = host.lua().globals().get("arrived").unwrap();
-        assert_eq!(arrived, "1@70");
+        assert_eq!(arrived, "0x00000001@0x00000046");
     }
 
     // PmcCon034's out-of-bounds: the region an "exit" waits on is watched,
@@ -6395,7 +7168,7 @@ mod tests {
             world.borrow_mut().objects.get_mut(&1).unwrap().position = to;
             assert!(events.update_shared(0.1, &world).is_empty());
             let crossed: String = host.lua().globals().get("crossed").unwrap();
-            assert_eq!(crossed, format!("zone 1@70 {mode}"));
+            assert_eq!(crossed, format!("zone 0x00000001@0x00000046 {mode}"));
         }
     }
 
@@ -6531,7 +7304,7 @@ mod tests {
         events.update_shared(0.1, &world);
         events.update_shared(0.1, &world);
         let dead: Vec<String> = host.lua().globals().get("dead").unwrap();
-        assert_eq!(dead, ["60", "61"]);
+        assert_eq!(dead, ["0x0000003C", "0x0000003D"]);
     }
 
     // Only the template database's names are templates: `HqInterior`
@@ -6639,7 +7412,7 @@ mod tests {
         )));
         events.update_shared(0.1, &world);
         let dropped: String = host.lua().globals().get("dropped").unwrap();
-        assert_eq!(dropped, "82");
+        assert_eq!(dropped, "0x00000052");
     }
 
     #[test]
@@ -6726,7 +7499,7 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((a, b, w, m, kids, left), (1, 2, 0.0, 2.0, 2, 1));
-        assert_eq!(guid, "16");
+        assert_eq!(guid, "0x00000010");
     }
 
     #[test]
@@ -7050,6 +7823,663 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((orig, copy, players), (2, 1, true));
+    }
+
+    #[test]
+    fn relations_are_kept_in_order_clamped_and_read_through_the_templates() {
+        // PmcCon018 reads OC's regard for the PMC, sets its own, and puts
+        // the old one back at the end.
+        let (host, world) = setup();
+        world
+            .borrow_mut()
+            .relations
+            .insert(("oc".into(), "pmc".into()), 25.0);
+        let (authored, set, clamped, reverse, same, by_name): (f64, bool, f64, f64, f64, f64) =
+            host.lua()
+                .load(
+                    "local oc, pmc = Pg.GetGuidByName('OC'), Pg.GetGuidByName('PMC')
+                     local authored = Ai.GetRelation(oc, pmc)
+                     local set = Ai.SetRelation(oc, pmc, -250)
+                     return authored, set, Ai.GetRelation(oc, pmc),
+                       Ai.GetRelation(pmc, oc), Ai.GetRelation(oc, oc),
+                       Ai.GetRelation('OC', 'PMC')",
+                )
+                .eval()
+                .unwrap();
+        // The templates' value where no script has set the pair.
+        assert_eq!(authored, 25.0);
+        assert!(set);
+        assert_eq!(clamped, -100.0);
+        // Only the pair in that order.
+        assert_eq!(reverse, 0.0);
+        // A side regards itself fully.
+        assert_eq!(same, 100.0);
+        assert_eq!(by_name, -100.0);
+    }
+
+    #[test]
+    fn a_persons_relation_is_their_factions() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.relations.insert(("vz".into(), "allied".into()), -100.0);
+            w.insert(60, Object::new("VZ Soldier (AK)", [0.0; 3]));
+        }
+        let r: f64 = host
+            .lua()
+            .load("return Ai.GetRelation(60, Pg.GetGuidByName('Allied'))")
+            .eval()
+            .unwrap();
+        assert_eq!(r, -100.0);
+    }
+
+    #[test]
+    fn vehicle_doors_open_and_close_on_request() {
+        // PmcCon033 hands `Vehicle.OpenDoor` to a timer as its callback.
+        let (host, world) = setup();
+        world.borrow_mut().take_commands();
+        let (kind, n): (String, i64) = host
+            .lua()
+            .load(
+                "local f = Vehicle.OpenDoor
+                 local n = select('#', f(50, 'pivot'))
+                 Vehicle.CloseDoor(50, 'pivot')
+                 return type(f), n",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((kind.as_str(), n), ("function", 0));
+        let pivot = m2_assets::name_hash("pivot");
+        let mut w = world.borrow_mut();
+        assert_eq!(
+            w.take_commands(),
+            [
+                Command::Door {
+                    guid: 50,
+                    door: pivot,
+                    open: true
+                },
+                Command::Door {
+                    guid: 50,
+                    door: pivot,
+                    open: false
+                },
+            ]
+        );
+        assert_eq!(w.doors.get(&(50, pivot)), Some(&false));
+        assert!(host.take_calls().is_empty());
+    }
+
+    #[test]
+    fn remove_goal_clears_a_persons_goals_and_set_state_is_kept() {
+        let (host, world) = setup();
+        world.borrow_mut().take_commands();
+        let (cleared, other, nobody, state, gone): (bool, bool, bool, bool, bool) = host
+            .lua()
+            .load(
+                "return Ai.RemoveGoal{ AIGuid = 50, Handle = 0 },
+                   Ai.RemoveGoal{ AIGuid = 50, Handle = 7 },
+                   Ai.RemoveGoal{ AIGuid = 999, Handle = 0 },
+                   Ai.SetState{ AIGuid = 50, State = 'Vip' },
+                   Ai.SetState{ AIGuid = 999, State = 'Vip', Value = false }",
+            )
+            .eval()
+            .unwrap();
+        assert!(cleared && !other && !nobody && state && !gone);
+        let mut w = world.borrow_mut();
+        assert_eq!(
+            w.take_commands(),
+            [
+                Command::ClearGoals { guid: 50 },
+                Command::AiState {
+                    guid: 50,
+                    state: "Vip".into(),
+                    on: true
+                },
+            ]
+        );
+        assert_eq!(w.ai_states.get(&(50, "vip".into())), Some(&true));
+    }
+
+    #[test]
+    fn the_scripts_start_and_stop_helicopter_waves() {
+        // PmcCon003's first wave: one Alouette at once, 200 m off.
+        let (host, world) = setup();
+        let n: i64 = host
+            .lua()
+            .load(
+                "local alouette = Pg.GetGuidByName('Carbine')
+                 return select('#', Pg.StartHeliWaveSpawner({
+                   { NumToSpawn = 1, WaveDelay = 0, SpawnDist = 200, units = { { alouette, 1 } } },
+                   { WaveDelay = 8, units = { { alouette } } },
+                 }))",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(n, 0);
+        world.borrow_mut().take_commands();
+        {
+            let mut w = world.borrow_mut();
+            let mut waves = std::mem::take(&mut w.heli_waves);
+            waves.update(0.1, &mut *w);
+            w.heli_waves = waves;
+            assert_eq!(w.heli_waves.following().len(), 1);
+            assert!(w.take_commands().iter().any(
+                |c| matches!(c, Command::Spawn { what, .. } if what.eq_ignore_ascii_case("carbine"))
+            ));
+        }
+        host.lua().load("Pg.StopHeliWaveSpawner()").exec().unwrap();
+        assert!(!world.borrow().heli_waves.running());
+    }
+
+    #[test]
+    fn a_point_is_tested_against_a_boundarys_region() {
+        // GurCon001: Pg.IsPointInBoundary(nX, nY, nZ, LR_TowerBase).
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(70, Object::new("LR_TowerBase", [100.0, 0.0, 100.0]));
+            w.regions.insert(
+                70,
+                m2_assets::Region {
+                    flags: 0x0004_0002,
+                    unk_0x04: 0,
+                    corners: vec![[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]],
+                },
+            );
+        }
+        let (inside, outside, no_region, bad): (bool, bool, bool, Value) = host
+            .lua()
+            .load(
+                "return Pg.IsPointInBoundary(103, 0, 98, 70), Pg.IsPointInBoundary(120, 0, 100, 70),
+                   Pg.IsPointInBoundary(103, 0, 98, 50), Pg.IsPointInBoundary(103, 0, 98)",
+            )
+            .eval()
+            .unwrap();
+        assert!(inside && !outside && !no_region);
+        assert!(bad.is_nil());
+    }
+
+    #[test]
+    fn feelings_are_nil_until_set_and_need_a_person() {
+        // OilCon021: Ai.GetFeeling(mailman, her) <= -33 means hostile.
+        let (host, _) = setup();
+        let (before, set, after, nobody, unset): (Value, bool, f64, bool, Value) = host
+            .lua()
+            .load(
+                "local before = Ai.GetFeeling(50, 1)
+                 local set = Ai.SetFeeling(50, 1, -40)
+                 return before, set, Ai.GetFeeling(50, 1), Ai.SetFeeling(999, 1, 5),
+                   Ai.GetFeeling(1, 50)",
+            )
+            .eval()
+            .unwrap();
+        assert!(before.is_nil() && unset.is_nil());
+        assert!(set && !nobody);
+        assert_eq!(after, -40.0);
+    }
+
+    #[test]
+    fn an_infraction_goes_to_the_game_for_its_witnesses() {
+        // AllCon003: Ai.AddInfraction(her, China, 100).
+        let (host, world) = setup();
+        world.borrow_mut().take_commands();
+        let (given, one, bad): (bool, bool, Value) = host
+            .lua()
+            .load(
+                "local china = Pg.GetGuidByName('Allied')
+                 return Ai.AddInfraction(1, china, 100), Ai.AddInfraction(1, china),
+                   Ai.AddInfraction(1)",
+            )
+            .eval()
+            .unwrap();
+        assert!(given && one && bad.is_nil());
+        let commands = world.borrow_mut().take_commands();
+        let amounts: Vec<f32> = commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::Infraction { who: 1, amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(amounts, [100.0, 1.0]);
+    }
+
+    #[test]
+    fn angles_cross_the_script_boundary_in_degrees() {
+        // Scripts spawn turned 90 and read yaws back in degrees; objects
+        // keep radians.
+        let (host, world) = setup();
+        let (spawned, set, bad, turned, camera): (f64, bool, Value, f64, f64) = host
+            .lua()
+            .load(
+                "local g = Pg.Spawn('Veyron', 0, 0, 0, 90)
+                 local spawned = Object.GetYaw(g)
+                 local set = Object.SetYaw(50, 180)
+                 return spawned, set, Object.SetYaw(999, 10), Object.GetYaw(50),
+                   Camera.GetYaw(Player.GetCamera())",
+            )
+            .eval()
+            .unwrap();
+        assert!((spawned - 90.0).abs() < 1e-3);
+        assert!(set && bad.is_nil());
+        assert!((turned - 180.0).abs() < 1e-3);
+        let w = world.borrow();
+        assert!((w.objects[&50].yaw - std::f32::consts::PI).abs() < 1e-5);
+        let her = f64::from(w.objects[&1].yaw.to_degrees());
+        assert!((camera - her).abs() < 1e-3);
+    }
+
+    #[test]
+    fn natives_answer_as_the_360_ones_do() {
+        let (host, _) = setup();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        let handle = |v: Value| v.as_number().or(v.as_integer().map(|i| i as f64));
+        // Ai.Goal: a handle per goal; nil for no AI.
+        let a = handle(ask("return Ai.Goal{ AIGuid = 50, Goal = 'MoveTo' }")).unwrap();
+        let b = handle(ask(
+            "return Ai.Goal{ AIGuid = 50, Goal = 'MoveTo', Force = true }",
+        ))
+        .unwrap();
+        assert!(b > a && a >= 1.0);
+        assert!(ask("return Ai.Goal{ AIGuid = 999, Goal = 'MoveTo' }").is_nil());
+        // Sys.GuidToString: "0x%08X".
+        let s: String = lua
+            .load("return Sys.GuidToString(Sys.StringToGuid('0x2a'))")
+            .eval()
+            .unwrap();
+        assert_eq!(s, "0x0000002A");
+        assert!(ask("return Sys.GuidToString(nil)").is_nil());
+        // Object.IsPlayerControlled: her player, not a number.
+        assert_eq!(
+            ask("return Object.IsPlayerControlled(1) == Player.GetLocalPlayer()"),
+            Value::Boolean(true)
+        );
+        assert!(ask("return Object.IsPlayerControlled(50)").is_nil());
+        // True from these.
+        for code in [
+            "return Sys.RequestGameState('Game')",
+            "return Object.SetInvincible(50, true, 'test')",
+            "return Player.IsLocal(0)",
+            "return Player.IsLocal(Player.GetLocalPlayer())",
+        ] {
+            assert_eq!(ask(code), Value::Boolean(true), "{code}");
+        }
+        assert_eq!(ask("return Player.IsLocal(1)"), Value::Boolean(false));
+        // Object.GetPosition: one nil for no object.
+        let n: i64 = lua
+            .load("return select('#', Object.GetPosition(999))")
+            .eval()
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn find_point_from_camera_defaults_and_turns_in_degrees() {
+        // A support delivery: Pg.FindPointFromCamera(300, 200, -1, owner).
+        let (host, world) = setup();
+        let (at, yaw) = {
+            let w = world.borrow();
+            (w.objects[&1].position, w.objects[&1].yaw)
+        };
+        let point = |code: &str| -> [f32; 3] {
+            let (x, y, z): (f32, f32, f32) = host.lua().load(code).eval().unwrap();
+            [x, y, z]
+        };
+        let ahead = |d: f32, up: f32, turn: f32| {
+            let (s, c) = (yaw + turn).sin_cos();
+            [at[0] + s * d, at[1] + up, at[2] + c * d]
+        };
+        let near = |p: [f32; 3], q: [f32; 3]| p.iter().zip(q).all(|(a, b)| (a - b).abs() < 1e-3);
+        assert!(near(
+            point("return Pg.FindPointFromCamera()"),
+            ahead(10.0, 1.0, 0.0)
+        ));
+        assert!(near(
+            point("return Pg.FindPointFromCamera(300, 200, -1, Player.GetLocalPlayer())"),
+            ahead(300.0, 200.0, 0.0)
+        ));
+        assert!(near(
+            point("return Pg.FindPointFromCamera(20, 0, -1, nil, 90)"),
+            ahead(20.0, 0.0, std::f32::consts::FRAC_PI_2)
+        ));
+    }
+
+    #[test]
+    fn more_natives_answer_as_the_360_ones_do() {
+        let (host, world) = setup();
+        crate::hijack::install(&host, &world).unwrap();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        for code in [
+            "return Object.SetInfiniteAmmo(1)",
+            "return Object.SetTransformToObject(1, 50)",
+            "return Player.SetAimMode(Player.GetLocalPlayer(), true)",
+            "return Net.SetLoadingScreen(false)",
+            "return Object.Detach(50, 1)",
+            "return Ai.Enable(50, true)",
+            "return Vehicle.EnableTurret(50, 'main_turret', true)",
+        ] {
+            assert_eq!(ask(code), Value::Boolean(true), "{code}");
+        }
+        assert_eq!(ask("return Object.Detach(50)"), Value::Boolean(false));
+        assert_eq!(ask("return Ai.Enable(999, true)"), Value::Boolean(false));
+        assert!(ask("return Pg.AddContextAction(50)").is_nil());
+        assert_eq!(
+            ask("return Ai.Role{ AIGuid = 50, Role = 'Follow', Target = 1 }"),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            ask("return Ai.Role{ AIGuid = 999, Role = 'Follow' }"),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn infinite_ammo_defaults_on_and_comes_off_again() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.inventory.max_reserve.insert("carbine".into(), 90);
+        }
+        host.lua()
+            .load("Human.Inventory.SetAllWeapons(Player.GetLocalCharacter(), { Pg.GetGuidByName('Carbine') })")
+            .exec()
+            .unwrap();
+        let weapons = world.borrow().inventory.of(1).to_vec();
+        assert_eq!(weapons.len(), 1);
+        let reserve = |world: &Shared| world.borrow().inventory.carried[&weapons[0]].reserve;
+        host.lua().load("Object.SetInfiniteAmmo(1)").exec().unwrap();
+        assert_eq!(reserve(&world), INFINITE_RESERVE);
+        host.lua()
+            .load("Object.SetInfiniteAmmo(1, false)")
+            .exec()
+            .unwrap();
+        assert_eq!(reserve(&world), 90);
+    }
+
+    #[test]
+    fn attach_copies_a_template_and_attaches_an_object_itself() {
+        let (host, world) = setup();
+        crate::hijack::install(&host, &world).unwrap();
+        world.borrow_mut().take_commands();
+        // A hijack's pistol: a template, made new at her hand.
+        let (ok, pistol, template): (bool, Value, Value) = host
+            .lua()
+            .load(
+                "local t = Pg.GetGuidByName('Carbine')
+                 local ok, g = Object.Attach(1, 'bone_attach_rhand', t)
+                 return ok, g, t",
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
+        let (pistol, template) = (
+            crate::events::as_guid(&pistol).unwrap(),
+            crate::events::as_guid(&template).unwrap(),
+        );
+        assert!(pistol >= FIRST_SPAWNED && pistol != template);
+        // MrxTaskObjectiveVerify: an object in play goes to her left hand
+        // itself.
+        let (ok, same): (bool, bool) = host
+            .lua()
+            .load(
+                "local ok, g = Object.Attach(1, 'bone_attach_lhand', 50)
+                 return ok, g == Sys.StringToGuid('50')",
+            )
+            .eval()
+            .unwrap();
+        assert!(ok && same);
+        let props: Vec<u32> = world
+            .borrow_mut()
+            .take_commands()
+            .iter()
+            .filter_map(|c| match c {
+                Command::Hijack(crate::hijack::HijackCommand::Attach { prop, .. }) => Some(*prop),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(props, [pistol, 50]);
+    }
+
+    #[test]
+    fn natives_past_100_answer_as_the_360_ones_do() {
+        let (host, world) = setup();
+        crate::hijack::install(&host, &world).unwrap();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        for code in [
+            "return Object.SetHealth(50, 40)",
+            "return Object.AddLabel(50, 'Target')",
+            "return Object.SetName(50, 'Renamed')",
+            "return Ai.SetInfractionMultiplier(Pg.GetGuidByName('OC'), 0.2)",
+            "return Player.SetCinematicMode(Player.GetLocalPlayer(), true)",
+            "return Player.SetInputEnabled(Player.GetLocalPlayer(), false)",
+            "return Object.SetVisible(50, false)",
+            "return Camera.Shake(Player.GetCamera(), 'small', 50, 1, 2)",
+            "return VO.Cancel(nil, 'line')",
+            "return Ai.Deploy{ Vehicle = 50 }",
+        ] {
+            assert_eq!(ask(code), Value::Boolean(true), "{code}");
+        }
+        assert!(ask("return Object.SetHealth(999, 40)").is_nil());
+        assert_eq!(
+            ask("return Object.AddLabel(999, 'Target')"),
+            Value::Boolean(false)
+        );
+        assert!(ask("return Object.SetName(999, 'x')").is_nil());
+        assert_eq!(
+            ask("return Object.SetVisible(999, true)"),
+            Value::Boolean(false)
+        );
+        // Health never goes below 0, and hers never above her most.
+        lua.load("Object.SetHealth(50, -5) Object.SetHealth(Player.GetLocalCharacter(), 1e6)")
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        assert_eq!(w.objects[&50].health, 0.0);
+        assert_eq!(w.objects[&1].health, w.objects[&1].max_health);
+        // A multiplier of 1 takes the faction off the list.
+        drop(w);
+        lua.load("Ai.SetInfractionMultiplier(Pg.GetGuidByName('OC'), 1)")
+            .exec()
+            .unwrap();
+        assert!(!world.borrow().reports.multipliers.contains_key("oc"));
+    }
+
+    #[test]
+    fn natives_past_160_answer_as_the_360_ones_do() {
+        let (host, world) = setup();
+        crate::hijack::install(&host, &world).unwrap();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        for code in [
+            "Object.AddLabel(50, 'Target') return Object.RemoveLabel(50, 'Target')",
+            "return Player.SetOutBoundary(Player.GetLocalPlayer(), false)",
+            "return Pg.SaveGame('slot')",
+            "return Human.Knockdown(50, 2)",
+            "return Object.PlayAnimation(50, 'open', false)",
+        ] {
+            assert_eq!(ask(code), Value::Boolean(true), "{code}");
+        }
+        assert_eq!(
+            ask("return Object.RemoveLabel(999, 'Target')"),
+            Value::Boolean(false)
+        );
+        assert_eq!(ask("return Human.Drop(50)"), Value::Boolean(false));
+        assert_eq!(
+            ask("return Ai.Deliver(50, 1, 2, 3, 10)"),
+            Value::Boolean(false)
+        );
+        assert!(ask("return Weapon.SetReserveAmmo(999, 3)").is_nil());
+        assert!(ask("return Human.Knockdown(nil, 2)").is_nil());
+    }
+
+    #[test]
+    fn player_and_pursuit_natives_answer_as_the_360_ones_do() {
+        let (host, world) = setup();
+        world.borrow_mut().regions.insert(
+            50,
+            m2_assets::Region {
+                flags: 0x0004_0002,
+                unk_0x04: 0,
+                corners: vec![[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]],
+            },
+        );
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        let me = "Player.GetLocalPlayer()";
+        for code in [
+            format!("return Player.AddBoundary({me}, 50)"),
+            format!("return Player.RemoveBoundary({me}, 50)"),
+            format!("return Player.RemoveAllBoundary({me})"),
+            format!("return Player.SetHealthClamp({me}, true)"),
+            format!("return Player.SetSurvivalMode({me}, true)"),
+            format!("return Player.SetBoundaryCallback({me}, function() end)"),
+            "return Player.SetOutfit(1, 'outfit')".to_owned(),
+            format!("return Player.SetGrappleEnabled({me}, true)"),
+            "return Player.SetVehicleDisguise(true)".to_owned(),
+            "return Pg.SetPursuit(Pg.GetGuidByName('OC'), 2)".to_owned(),
+            "return Pg.LockPursuit(Pg.GetGuidByName('OC'), 1)".to_owned(),
+        ] {
+            assert_eq!(ask(&code), Value::Boolean(true), "{code}");
+        }
+        assert_eq!(
+            ask(&format!("return Player.AddBoundary({me}, 999)")),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            ask(&format!("return Player.RemoveBoundary({me}, 998)")),
+            Value::Boolean(false)
+        );
+        // Locked: a new pursuit doesn't start.
+        assert_eq!(
+            ask("return Pg.SetPursuit(Pg.GetGuidByName('OC'), 2)"),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            ask("return Pg.SetPursuitSeconds(Pg.GetGuidByName('OC'), 30)"),
+            Value::Boolean(false)
+        );
+        assert!(ask("return Pg.SetPursuit(nil, 2)").is_nil());
+    }
+
+    #[test]
+    fn camera_shot_and_asset_slots_answer_as_the_360_ones_do() {
+        let (host, _) = setup();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        assert_eq!(
+            ask("return Camera.SetShot(Player.GetCamera(), 'OverShoulder', 1, 50)"),
+            Value::Boolean(true)
+        );
+        assert!(ask("return Camera.SetShot(Player.GetCamera(), 'OverShoulder', 1)").is_nil());
+        assert_eq!(
+            ask("return Sys.SetAssetRequestMax(8)"),
+            Value::Boolean(true)
+        );
+        assert!(ask("return Sys.SetAssetRequestMax()").is_nil());
+    }
+
+    #[test]
+    fn ported_natives_follow_the_360_code() {
+        let (host, world) = setup();
+        world.borrow_mut().take_commands();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        // Revive: half her most health, back alive.
+        lua.load("Object.Kill(50)").exec().unwrap();
+        assert_eq!(ask("return Object.Revive(50, 0.5)"), Value::Boolean(true));
+        {
+            let w = world.borrow();
+            assert!(w.objects[&50].alive);
+            assert_eq!(w.objects[&50].health, w.objects[&50].max_health * 0.5);
+        }
+        assert!(ask("return Object.Revive(999)").is_nil());
+        // ApplyImpulse: world space, or turned by its facing.
+        world.borrow_mut().objects.get_mut(&50).unwrap().yaw = std::f32::consts::FRAC_PI_2;
+        assert_eq!(
+            ask("return Object.ApplyImpulse(50, 0, 0, 10, true)"),
+            Value::Boolean(true)
+        );
+        assert!(ask("return Object.ApplyImpulse(999, 0, 0, 10)").is_nil());
+        // Players: one, in slot 0, never remote.
+        assert_eq!(
+            ask("return Player.GetPlayer(0) == Player.GetLocalPlayer()"),
+            Value::Boolean(true)
+        );
+        assert!(ask("return Player.GetPlayer(1)").is_nil());
+        assert_eq!(ask("return Player.IsRemote(0)"), Value::Boolean(false));
+        // The scope: off twice, on once, still off; on again, on.
+        lua.load(
+            "local p = Player.GetLocalPlayer()
+             Player.SetScopeEnabled(p, false) Player.SetScopeEnabled(p, false)
+             Player.SetScopeEnabled(p, true)",
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(world.borrow().scope_off, 1);
+        assert_eq!(
+            ask("return Player.SetScopeEnabled(Player.GetLocalPlayer(), true)"),
+            Value::Boolean(true)
+        );
+        assert_eq!(world.borrow().scope_off, 0);
+        assert_eq!(
+            ask("return Human.SetFireLock(50, true)"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            ask("return select('#', Sound.SetMasterVolume(0.5, 2))"),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            ask("return Camera.SetYaw(Player.GetCamera(), 90)"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            ask("return select('#', ObjectState.StartEmitter(50, 'Burning', 'fire'))"),
+            Value::Integer(0)
+        );
+        let commands = world.borrow_mut().take_commands();
+        let impulse = commands.iter().find_map(|c| match c {
+            Command::Impulse { impulse, .. } => Some(*impulse),
+            _ => None,
+        });
+        let i = impulse.unwrap();
+        assert!((i[0] - 10.0).abs() < 1e-4 && i[2].abs() < 1e-4, "{i:?}");
+        assert!(commands.contains(&Command::ScopeEnabled(false)));
+        assert!(commands.contains(&Command::ScopeEnabled(true)));
+        assert!(commands.iter().any(|c| matches!(c, Command::CameraYaw(y) if (*y - std::f32::consts::FRAC_PI_2).abs() < 1e-5)));
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            Command::Emitter {
+                guid: 50,
+                on: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn vo_sequences_are_kept_as_the_360_keeps_them() {
+        let (host, world) = setup();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        assert_eq!(ask("return VO.AddSequence(50, 5)"), Value::Boolean(true));
+        // The speaker holds one numbered higher than 3: refused.
+        assert_eq!(ask("return VO.AddSequence(50, 3)"), Value::Boolean(false));
+        assert_eq!(ask("return VO.AddSequence(50, 7)"), Value::Boolean(true));
+        assert_eq!(ask("return VO.RemoveSequence(50, 5)"), Value::Boolean(true));
+        assert_eq!(
+            ask("return VO.RemoveSequence(50, 5)"),
+            Value::Boolean(false)
+        );
+        assert!(ask("return VO.AddSequence(50)").is_nil());
+        assert_eq!(world.borrow().vo_sequences, [(50, 7)]);
+        // At most 32.
+        world.borrow_mut().vo_sequences = (0..32).map(|i| (100 + i, 1)).collect();
+        assert_eq!(ask("return VO.AddSequence(1, 1)"), Value::Boolean(false));
     }
 
     #[test]
