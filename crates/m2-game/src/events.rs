@@ -1281,6 +1281,23 @@ fn check(
             Some(g) => Check::Holds(world.position(g).is_none(), vec![id(g)]),
             None => no,
         },
+        // { object, health }: once the object's health is below the figure
+        // (4 scripts: ChiCon001's VIP and the like wait for half of
+        // `Object.GetHealth`). From the 360 code: parse 0x82350e28 takes a
+        // guid and a number, test 0x82350ee8 compares the object's health
+        // with it as its health changes (a health it can't read counts as
+        // below), and nothing is passed (0x8225e998). Here it is checked
+        // every update; an object this world doesn't hold is left waiting
+        // (inferred: the engine only tests on a health change).
+        "ObjectHealthLessThan" => {
+            let (Some(g), Some(figure)) = (guid(&p.params, 1), number(&p.params, 2)) else {
+                return no;
+            };
+            match world.health(g) {
+                Some(h) => Check::Holds(f64::from(h) < figure, Vec::new()),
+                None => no,
+            }
+        }
         // { a, b, op, metres, stopped, flat }: when some a is within
         // ("<", "<=") or beyond (">", ">=") the distance of some b,
         // checked whenever it is pending (scripts wanting repeats make a
