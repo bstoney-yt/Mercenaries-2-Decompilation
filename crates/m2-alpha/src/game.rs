@@ -266,6 +266,10 @@ pub struct Game {
     /// The scripts' camera shot for a scene (the HQ's briefings), while
     /// it lasts: the frame is seen from it ([`Shot::view`]).
     pub shot: Option<Shot>,
+    /// The scripts' camera's view (eye, forward) while a scene's script
+    /// directs it (`Camera.SetPosition`, `SetLookAt`, `Follow`, `Hold`,
+    /// `Blend`: [`m2_game::script_camera`]); a shot comes first.
+    pub script_view: Option<(Vec3, Vec3)>,
     /// Seconds the HUD's save icon has left up after the game was saved
     /// ([`SAVE_ICON_SECONDS`]).
     pub save_icon: f32,
@@ -510,6 +514,7 @@ impl Game {
             context_taken: None,
             aboard: None,
             shot: None,
+            script_view: None,
             save_icon: 0.0,
             raw: crate::raw::RawClips::default(),
             outfit_wanted: None,
@@ -3382,7 +3387,11 @@ impl Game {
     /// Where the frame is seen from: her camera (shaken by a bomb close
     /// by), the satellite's while she looks through it, or the free one.
     pub fn view(&self, fov: f32, aspect: f32) -> View {
-        let shot = self.shot.as_ref().and_then(|s| s.view);
+        let shot = self
+            .shot
+            .as_ref()
+            .and_then(|s| s.view)
+            .or(self.script_view.map(|(eye, forward)| (eye, eye + forward)));
         let mut view = match (self.walking(), shot) {
             // A scene's shot of the scripts' (the HQ's briefings).
             (Some(_), Some((eye, at))) => FlyCamera::looking_at(eye, at).view(fov, aspect),

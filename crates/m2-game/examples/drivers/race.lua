@@ -68,5 +68,5 @@ Event.CreatePersistent(Event.TimerRelative, { 1 }, function()
   local x, z = gx - dx / d * 12, gz - dz / d * 12
   say(string.format('%s up 6 s, %.0f m off: car put 12 m short of it', name, d))
   Object.SetPosition(v, x, gy + 1, z)
-  if Object.SetYaw then Object.SetYaw(v, math.atan2(dx, dz)) end
+  if Object.SetYaw then Object.SetYaw(v, math.deg(math.atan2(dx, dz))) end
 end, {})
