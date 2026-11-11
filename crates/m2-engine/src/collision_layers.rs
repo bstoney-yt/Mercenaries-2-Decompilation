@@ -128,6 +128,15 @@ pub fn meet(a: u32, b: u32) -> bool {
     FILTER[(a & 31) as usize] >> (b & 31) & 1 != 0
 }
 
+/// The layers of a vehicle's hull and turret ([`VEHICLE`]'s).
+pub const VEHICLE_LAYERS: [u32; 2] = [8, 9];
+
+/// Whether a vehicle's hull meets a shape on `layer` ([`meet`] with
+/// [`VEHICLE_LAYERS`]).
+pub fn meets_vehicles(layer: u32) -> bool {
+    VEHICLE_LAYERS.iter().any(|&v| meet(v, layer))
+}
+
 /// Whether a query of `mask` sees a body on `layer` (0x827F8550).
 pub fn seen_by(mask: u32, layer: u32) -> bool {
     layer == 0 || mask >> (layer & 31) & 1 != 0

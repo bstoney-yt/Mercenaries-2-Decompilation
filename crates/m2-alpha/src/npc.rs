@@ -1500,6 +1500,13 @@ impl Npc {
         if self.hp <= 0.0 {
             self.alive = false;
             self.died = true;
+            if matches!(self.brain, Brain::Follow { .. }) {
+                eprintln!(
+                    "people: {:08x} following her is killed at {:.1}",
+                    self.spawn.unwrap_or(0),
+                    self.character.position
+                );
+            }
             self.killed_by_her = true;
             self.alert = false;
             self.flee = None;

@@ -509,6 +509,11 @@ pub trait RenderBackend {
     /// material's texture must be live when it is drawn.
     fn set_material(&mut self, id: MaterialId, desc: &MaterialDesc) -> Result<(), BackendError>;
 
+    /// Forgets material `id`: draws with it use [`MaterialDesc::default`]
+    /// again, and it no longer holds its textures (a texture destroyed
+    /// while a material names it is only freed once the material goes).
+    fn remove_material(&mut self, id: MaterialId) -> Result<(), BackendError>;
+
     fn live_buffers(&self) -> LiveBuffers;
 
     /// Opens a frame rendered from `view`. Draws are only valid inside a frame.
