@@ -3111,9 +3111,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Weapons as objects: a loadout of templates, each weapon with its own
     // reserve of ammunition.
     crate::links::install(&lib, &add)?;
+    crate::character_binding::install(&lib, &add)?;
     crate::script_sound::install(&lib, &add)?;
     crate::script_shell::install(lua, &lib, &add)?;
     crate::script_effects::install(lua, &lib, &add)?;
+    crate::screen_queries::install(&lib, &add)?;
     let human = lib("Human")?;
     // Human.SetAllowCorpseCleanup(character, allow): whether the game may
     // clear its body away (the verify objective keeps a target's until it
