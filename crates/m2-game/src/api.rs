@@ -180,6 +180,17 @@ impl Object {
 pub enum Command {
     /// A hijack's own requests (`crate::hijack`).
     Hijack(crate::hijack::HijackCommand),
+    /// Drop every goal person `guid` has (`Ai.RemoveGoal` with handle 0).
+    ClearGoals {
+        guid: u32,
+    },
+    /// Set (or clear) AI state `state` (`"Vip"`) on person `guid`
+    /// (`Ai.SetState`).
+    AiState {
+        guid: u32,
+        state: String,
+        on: bool,
+    },
     /// Create `what` (an object template's name, such as `"Veyron"` or
     /// `"Explosion (Grenade)"`) as `guid`.
     Spawn {
@@ -760,6 +771,11 @@ pub struct ScriptWorld {
     pub landing_zones: HashMap<i64, BTreeMap<i64, u32>>,
     /// Cargo on winches: what carries each, `None` once let go.
     pub winch: HashMap<u32, Option<u32>>,
+    /// AI states the scripts set (`Ai.SetState`), by (person, state in
+    /// lower case).
+    pub ai_states: HashMap<(u32, String), bool>,
+    /// `Pg.StartHeliWaveSpawner`'s waves under way.
+    pub heli_waves: crate::heliwaves::HeliWaves,
     /// What the scripts want on the player's screen.
     pub hud: crate::hud::Hud,
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
@@ -1590,6 +1606,55 @@ fn squad_members<'a>(squad: &str, objects: impl Iterator<Item = (u32, &'a str)>)
     out
 }
 
+/// `Pg.StartHeliWaveSpawner`'s argument: its waves, in order, as the 360
+/// reads them (0x8233b4d0, 0x8233b1c0): `NumToSpawn` (1), `WaveDelay`
+/// (15), `SpawnDist` (150) and `units`, each `{ template, weight }` with
+/// the weight 1 when left out and at least 1. A unit that isn't a table
+/// with a template is left out.
+fn heli_waves(t: &mlua::Table) -> mlua::Result<Vec<crate::heliwaves::Wave>> {
+    use crate::heliwaves::{DEFAULT_DELAY, DEFAULT_DISTANCE, Wave};
+    let mut out = Vec::new();
+    for v in t.sequence_values::<Value>() {
+        let Value::Table(w) = v? else { continue };
+        let number = |k: &str| num(w.raw_get::<Value>(k).ok().as_ref());
+        let mut units = Vec::new();
+        if let Ok(Value::Table(u)) = w.raw_get::<Value>("units") {
+            for unit in u.sequence_values::<Value>() {
+                let Value::Table(unit) = unit? else { continue };
+                let template = id(unit.raw_get::<Value>(1).ok().as_ref());
+                let weight = num(unit.raw_get::<Value>(2).ok().as_ref()).unwrap_or(1.0);
+                if let Some(template) = template {
+                    units.push((template, (weight as i32).max(1) as u32));
+                }
+            }
+        }
+        out.push(Wave {
+            count: number("NumToSpawn").map_or(1, |n| (n as i32).max(1) as u32),
+            delay: number("WaveDelay").unwrap_or(DEFAULT_DELAY),
+            distance: number("SpawnDist").unwrap_or(DEFAULT_DISTANCE),
+            units,
+        });
+    }
+    Ok(out)
+}
+
+impl crate::heliwaves::WaveWorld for ScriptWorld {
+    fn player(&self) -> Option<([f32; 3], f32)> {
+        let o = self.objects.get(&self.player?)?;
+        Some((o.position, o.yaw))
+    }
+    fn spawn(&mut self, template: u32, at: [f32; 3], yaw: f32) -> Option<u32> {
+        let name = self.objects.get(&template)?.name.clone();
+        Some(ScriptWorld::spawn(self, name, at, yaw))
+    }
+    fn alive_at(&self, guid: u32) -> Option<[f32; 3]> {
+        self.objects
+            .get(&guid)
+            .filter(|o| o.alive)
+            .map(|o| o.position)
+    }
+}
+
 fn guid_value(g: Option<u32>) -> Value {
     g.map_or(Value::Nil, crate::events::guid_value)
 }
@@ -1701,6 +1766,19 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let pg = lib("Pg")?;
+    // The helicopter wave spawner ([`crate::heliwaves`]): both natives
+    // return nothing (from the 360 code, 0x8233b6c0 and 0x8233b990).
+    add(&pg, "StartHeliWaveSpawner", |w, _, a| {
+        if let Some(Value::Table(t)) = a.first() {
+            let waves = heli_waves(t)?;
+            w.heli_waves.start(waves);
+        }
+        values([])
+    })?;
+    add(&pg, "StopHeliWaveSpawner", |w, _, _| {
+        w.heli_waves.stop();
+        values([])
+    })?;
     // The pursuit ([`Pursuit`]).
     add(&pg, "SetPursuitLevelTimes", |w, _, a| {
         if let (Some(low), Some(high)) = (num(a.first()), num(a.get(1))) {
@@ -3147,6 +3225,52 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.asset_loads.push((f, data));
         }
         values([])
+    })?;
+    // From the 360 code (`Ai.RemoveGoal{ AIGuid, Handle }`, 0x82310308
+    // and 0x822F9188): without an AI there it answers false; `Handle` 0
+    // clears all its goals and answers true; another handle removes that
+    // goal and answers whether it did. Goals here hand out no handles
+    // (`Ai.Goal` answers nothing), so another handle finds none
+    // (inferred). PmcCon003 clears its pursuit helicopters' goals before
+    // giving them new ones.
+    add(&ai, "RemoveGoal", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([Value::Boolean(false)]);
+        };
+        let guid = id(t.raw_get::<Value>("AIGuid").ok().as_ref());
+        let handle = num(t.raw_get::<Value>("Handle").ok().as_ref()).unwrap_or(0.0);
+        let Some(guid) = guid.filter(|g| w.objects.get(g).is_some_and(|o| o.alive)) else {
+            return values([Value::Boolean(false)]);
+        };
+        if handle != 0.0 {
+            return values([Value::Boolean(false)]);
+        }
+        w.goal_callbacks.retain(|(g, _, _)| *g != guid);
+        w.commands.push(Command::ClearGoals { guid });
+        values([Value::Boolean(true)])
+    })?;
+    // From the 360 code (`Ai.SetState{ AIGuid, State, Value }`,
+    // 0x823114a0): `Value` is true when left out; the state goes to the
+    // AI's controller by name, and the answer is the controller's (false
+    // without an AI). What each state does is the controller's and isn't
+    // traced; it is kept per person and passed to the game, answering
+    // true (inferred). PmcCon003 makes Carmona a VIP (`State = "Vip"`).
+    add(&ai, "SetState", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([Value::Nil]);
+        };
+        let guid = id(t.raw_get::<Value>("AIGuid").ok().as_ref());
+        let state = t.raw_get::<Option<String>>("State")?;
+        let on = !matches!(t.raw_get::<Value>("Value")?, Value::Boolean(false));
+        let (Some(guid), Some(state)) = (guid, state) else {
+            return values([Value::Nil]);
+        };
+        if !w.objects.get(&guid).is_some_and(|o| o.alive) {
+            return values([Value::Boolean(false)]);
+        }
+        w.ai_states.insert((guid, state.to_ascii_lowercase()), on);
+        w.commands.push(Command::AiState { guid, state, on });
+        values([Value::Boolean(true)])
     })?;
     add(&ai, "Goal", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
@@ -5760,6 +5884,68 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((orig, copy, players), (2, 1, true));
+    }
+
+    #[test]
+    fn remove_goal_clears_a_persons_goals_and_set_state_is_kept() {
+        let (host, world) = setup();
+        world.borrow_mut().take_commands();
+        let (cleared, other, nobody, state, gone): (bool, bool, bool, bool, bool) = host
+            .lua()
+            .load(
+                "return Ai.RemoveGoal{ AIGuid = 50, Handle = 0 },
+                   Ai.RemoveGoal{ AIGuid = 50, Handle = 7 },
+                   Ai.RemoveGoal{ AIGuid = 999, Handle = 0 },
+                   Ai.SetState{ AIGuid = 50, State = 'Vip' },
+                   Ai.SetState{ AIGuid = 999, State = 'Vip', Value = false }",
+            )
+            .eval()
+            .unwrap();
+        assert!(cleared && !other && !nobody && state && !gone);
+        let mut w = world.borrow_mut();
+        assert_eq!(
+            w.take_commands(),
+            [
+                Command::ClearGoals { guid: 50 },
+                Command::AiState {
+                    guid: 50,
+                    state: "Vip".into(),
+                    on: true
+                },
+            ]
+        );
+        assert_eq!(w.ai_states.get(&(50, "vip".into())), Some(&true));
+    }
+
+    #[test]
+    fn the_scripts_start_and_stop_helicopter_waves() {
+        // PmcCon003's first wave: one Alouette at once, 200 m off.
+        let (host, world) = setup();
+        let n: i64 = host
+            .lua()
+            .load(
+                "local alouette = Pg.GetGuidByName('Carbine')
+                 return select('#', Pg.StartHeliWaveSpawner({
+                   { NumToSpawn = 1, WaveDelay = 0, SpawnDist = 200, units = { { alouette, 1 } } },
+                   { WaveDelay = 8, units = { { alouette } } },
+                 }))",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(n, 0);
+        world.borrow_mut().take_commands();
+        {
+            let mut w = world.borrow_mut();
+            let mut waves = std::mem::take(&mut w.heli_waves);
+            waves.update(0.1, &mut *w);
+            w.heli_waves = waves;
+            assert_eq!(w.heli_waves.following().len(), 1);
+            assert!(w.take_commands().iter().any(
+                |c| matches!(c, Command::Spawn { what, .. } if what.eq_ignore_ascii_case("carbine"))
+            ));
+        }
+        host.lua().load("Pg.StopHeliWaveSpawner()").exec().unwrap();
+        assert!(!world.borrow().heli_waves.running());
     }
 
     #[test]

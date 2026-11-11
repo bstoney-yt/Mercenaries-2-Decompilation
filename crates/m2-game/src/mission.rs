@@ -1057,6 +1057,9 @@ impl Mission {
             let mut w = self.world.borrow_mut();
             w.update_hibernation();
             w.tick_raw_clips(dt as f32);
+            let mut waves = std::mem::take(&mut w.heli_waves);
+            waves.update(dt as f32, &mut *w);
+            w.heli_waves = waves;
         }
         for t in self.events.take_trace() {
             self.log.push(format!("  t={:.1} event {t}", self.now));
