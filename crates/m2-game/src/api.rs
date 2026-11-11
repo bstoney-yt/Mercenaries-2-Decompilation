@@ -258,6 +258,16 @@ pub enum Command {
         emitter: u32,
         on: bool,
     },
+    /// `Object.PlayMaterialAnimation(object, name, loop)`.
+    MaterialAnimation {
+        guid: u32,
+        name: String,
+        looped: bool,
+    },
+    /// `Graphics.SetShadowBaseDistance(metres)`.
+    ShadowBaseDistance(f32),
+    /// `VO.SetCinematicMode(on)`.
+    VoCinematic(bool),
     Move {
         guid: u32,
         position: [f32; 3],
@@ -847,6 +857,15 @@ pub struct ScriptWorld {
     /// How many reasons the scripts gave for her scope to be off
     /// (`Player.SetScopeEnabled`); she may use it at 0.
     pub scope_off: u32,
+    /// Textures the scripts asked the GUI to load (`Gui.LoadTexture`), by
+    /// name hash.
+    pub textures_asked: Vec<u32>,
+    /// Whether the other players' markers show (`Gui.EnablePlayerMarkers`),
+    /// once the scripts said.
+    pub player_markers: Option<bool>,
+    /// The PDA map's callbacks for its two modes
+    /// (`Player.SetPDAMapModeCallback`).
+    pub pda_map_callbacks: [Option<Function>; 2],
     /// What the scripts want on the player's screen.
     pub hud: crate::hud::Hud,
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
@@ -2020,6 +2039,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     crate::airstrike::install(&lib("Airstrike")?, &add)?;
     crate::shop::install(lua, &lib("Hud")?)?;
+    crate::ported::install(&lib, &add)?;
 
     // A string's hash, as the scripts key tables by name (their recruits'
     // states). The archive's name hash: the scripts only compare hashes
