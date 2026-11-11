@@ -1673,14 +1673,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // A string's hash, as the scripts key tables by name (their recruits'
     // states). The archive's name hash: the scripts only compare hashes
     // with each other, so any one hash they all share serves.
+    // The engine's hash, as light userdata (`crate::script_hash`).
     add(&lib("String")?, "GetHash", |_, _, a| {
-        values(a.first().and_then(|v| match v {
-            // A number (Lua 5.1 has no integers), whole on 32-bit builds.
-            Value::String(s) => Some(Value::Number(f64::from(m2_assets::name_hash(
-                &s.to_string_lossy(),
-            )))),
-            _ => None,
-        }))
+        Ok(crate::script_hash::get_hash_native(a))
+    })?;
+    add(&lib("ObjectState")?, "GetStringHash", |_, _, a| {
+        Ok(crate::script_hash::get_hash_native(a))
     })?;
 
     let debug = lib("Debug")?;
@@ -2482,7 +2480,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             // A faction's name as the faction zones look it up: keyed by
             // `String.GetHash` of the name, which its guid already is.
             (None, Some(g)) if FACTIONS.iter().any(|f| m2_assets::name_hash(f) == g) => {
-                Value::Number(f64::from(g))
+                crate::script_hash::hash_value(g)
             }
             _ => Value::Nil,
         }])
@@ -5058,8 +5056,18 @@ mod tests {
             )
             .exec()
             .unwrap();
-        let faction: f64 = host.lua().globals().get("faction").unwrap();
-        assert_eq!(faction as u32, m2_assets::name_hash("VZ"));
+        let faction: Value = host.lua().globals().get("faction").unwrap();
+        assert_eq!(
+            faction,
+            crate::script_hash::hash_value(m2_assets::name_hash("VZ"))
+        );
+        // A faction's guid is the hash of its name, and both are userdata.
+        let same: bool = host
+            .lua()
+            .load(r#"return String.GetHash("VZ") == faction and type(faction) == "userdata""#)
+            .eval()
+            .unwrap();
+        assert!(same);
         let crossed = || -> Vec<String> { host.lua().globals().get("crossed").unwrap() };
         assert!(events.update_shared(0.1, &world).is_empty());
         assert!(crossed().is_empty());
