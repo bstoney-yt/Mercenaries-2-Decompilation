@@ -215,7 +215,7 @@ fn button_args(button: &str) -> (Vec<Value>, Vec<&'static str>) {
 }
 
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 22] = [
+pub const KINDS: [&str; 23] = [
     "TimerRelative",
     // Every update, in the mission's scripts too: the support manager's
     // recruit cooldowns count with it (`SupportTimer`, which takes
@@ -242,6 +242,7 @@ pub const KINDS: [&str; 22] = [
     "ObjectPhysicsEvent",
     "WeaponEvent",
     "ObjectIsGrounded",
+    "ObjectHealthLessThan",
 ];
 
 /// Kinds the game delivers itself through `Event.__m2_fire` (besides
