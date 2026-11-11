@@ -17,6 +17,7 @@ pub mod library;
 pub mod mission;
 pub mod music;
 pub mod ported;
+pub mod ported_player;
 pub mod report;
 pub mod reverb;
 pub mod savedata;
