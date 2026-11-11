@@ -55,7 +55,7 @@ mod tests {
         assert_eq!(Mover::Car.speed(None), 20.0);
         assert_eq!(Mover::Tank.speed(None), 10.0);
         assert_eq!(Mover::Boat.speed(None), 16.0);
-        assert_eq!(Mover::Car.speed(Some(0.3)), 15.0);
+        assert!((Mover::Car.speed(Some(0.3)) - 15.0).abs() < 1e-4);
         // A request's 0 leaves the set-up's factor.
         assert_eq!(Mover::Car.speed(Some(0.0)), 20.0);
     }
