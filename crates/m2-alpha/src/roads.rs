@@ -22,36 +22,40 @@
 //!   stops behind a car (or her) ahead in its lane, stops while a box
 //!   just ahead of it meets something, and brakes and holds under
 //!   0.5 m/s.
-//! - Invented (no field decoded says): how far off they come and go,
-//!   and that one stuck for [`STUCK`] seconds out of her sight comes
-//!   again elsewhere (the 360's spawner's own despawn isn't traced).
+//! - From the 360 code ([`m2_engine::road_population`], 0x822639A0):
+//!   how many are out (the zone at her, 2 outside every zone), where new
+//!   ones come out (on the upkeep's timed rings along the road network,
+//!   ahead of her or behind, each with what may be seen there, by her
+//!   camera's real frustum) and when they go (beyond 200 m out of sight,
+//!   beyond 250 m always). Nothing takes one away for being stuck.
+//! - Invented: one taken away comes again as the next one put out,
+//!   keeping its model; none comes out within [`CLEAR`] of another (the
+//!   360's spacing test isn't traced); off the roads the rings are laid
+//!   from the road she was last on.
 //!   Not ported: junctions' stop lines and flow control (no layer read
-//!   holds an `RtFlowControl`).
+//!   holds an `RtFlowControl`); the 360's density grid for rings that
+//!   ask it; the upkeep of states 7 and 8 (0x8226AE98).
 
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::car_driver::{CarDriver, CarInputs, CarState};
 use m2_engine::population::{DensityZone, zone_at};
+use m2_engine::road_population::{self, Mode, Spawner, Viewer};
+use m2_engine::road_ring::{self, Flood, RingPoint, RoadNet};
 use m2_engine::world::{Junction, Road};
 use m2_engine::{Physics, VehicleControls, road_driver};
 use m2_math::glam::{Quat, Vec2, Vec3};
 
 use crate::scene::{ParkedVehicle, Scene};
 
-/// Road vehicles made in all (those beyond are moved to new places when
-/// she leaves them behind; invented: the zones ask for 12 at most).
-const MOST_MADE: usize = 16;
-/// They come between these distances from her, metres, and are taken
-/// back past `GONE`. Invented: out of sight, inside the vehicles' reach.
-const COME_NEAR: f32 = 140.0;
-const COME_FAR: f32 = 320.0;
-const GONE: f32 = 420.0;
-/// Seconds between looks for a place to bring one.
-const LOOK: f32 = 1.0;
 /// None comes out nearer another vehicle than this, metres (a semi is 9
-/// m long), and so many places are tried for each. Invented.
+/// m long). Invented: the 360's spacing test (0x82266D38, 400 squared,
+/// so likely 20 m) isn't traced through.
 const CLEAR: f32 = 12.0;
-const PLACE_TRIES: usize = 8;
+/// A ring point's road must be longer than this, and the point is kept
+/// this far off its ends, metres (0x8226A438).
+const SHORTEST: f32 = 12.0;
+const END_GAP: f32 = 6.0;
 /// A point of the way is reached this near, metres.
 const ARRIVE: f32 = 6.0;
 /// A road's end meets a junction's port this near, metres.
@@ -85,10 +89,6 @@ pub(crate) fn in_the_way(
 /// than its own).
 const STOP_SECONDS: f32 = 1.8;
 const CLEAR_SIDE: f32 = 3.5;
-/// One stuck this long, seconds, at least this far from her, metres, is
-/// taken back and comes again elsewhere (invented).
-const STUCK: f32 = 20.0;
-const STUCK_AWAY: f32 = 80.0;
 /// A vehicle not loaded after this many seconds never will be.
 const GIVE_UP: f32 = 30.0;
 /// Road vehicles' entities, which no layer uses.
@@ -104,8 +104,6 @@ struct Car {
     /// Which of the road's lanes on its right it keeps to, inner first
     /// (the outermost there is, where a road has fewer).
     lane: usize,
-    /// Seconds it has hardly moved (stuck on something).
-    stuck: f32,
 }
 
 /// A road vehicle's look just ahead of it (0x822B8C68): seconds to the
@@ -151,9 +149,27 @@ pub struct RoadTraffic {
     /// Templates that won't load, left out.
     refused: HashSet<String>,
     made: u32,
-    wait: f32,
     rng: u32,
+    /// The network as the 360's traffic manager floods it, and each of
+    /// its roads' index among the roads.
+    net: Option<RoadNet>,
+    net_roads: Vec<usize>,
+    /// The road she was last on or by, how far along and which way she
+    /// faced along it.
+    on_road: Option<(usize, f32, i32)>,
+    spawner: Spawner,
+    /// Where the rotating look at those out starts next.
+    cursor: usize,
+    /// Those taken away, to come again.
+    resting: HashSet<u32>,
+    /// Her place last frame, for her speed.
+    last_focus: Option<Vec3>,
 }
+
+/// A place for one to come out ([`RoadTraffic::places_on`]): the road,
+/// its way, metres along, the zone's vehicle list, the lane, the place
+/// and the way it faces.
+type Place = (usize, bool, f32, u32, usize, Vec3, Vec3);
 
 impl RoadTraffic {
     /// Whether vehicle `v` is road traffic.
@@ -167,6 +183,13 @@ impl RoadTraffic {
         }
         self.indexed = true;
         self.rng = 0x2545_f491;
+        self.net = Some(RoadNet::new(roads, junctions));
+        self.net_roads = roads
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.drivable() && r.points.len() >= 2)
+            .map(|(i, _)| i)
+            .collect();
         self.by_entity = roads
             .iter()
             .enumerate()
@@ -210,13 +233,17 @@ impl RoadTraffic {
         (x >> 8) as f32 / (1u32 << 24) as f32
     }
 
-    /// Brings vehicles out near `focus`, as many as the zone there asks
-    /// for (of the zones whose layer is in: `layer_in`), and moves those
-    /// she left far behind to new places near her.
+    /// Keeps the road traffic round her as the 360's upkeep does
+    /// ([`road_population`]): takes away those the band and her view say
+    /// go, then puts out the rings due while fewer are out than the zone
+    /// at `focus` wants (of the zones whose layer is in: `layer_in`).
+    /// `viewer` is her camera this frame; without it nothing comes or
+    /// goes.
     pub fn spawn(
         &mut self,
         scene: &mut Scene,
         focus: Vec3,
+        viewer: Option<Viewer>,
         layer_in: impl Fn(u32) -> bool,
         dt: f32,
     ) {
@@ -225,43 +252,93 @@ impl RoadTraffic {
         };
         let index = &world.index;
         self.index(&index.roads, &index.junctions);
-        let zones: Vec<&DensityZone> = index.zones.iter().filter(|z| layer_in(z.layer)).collect();
-        let wanted =
-            zone_at(zones.iter().copied(), focus.x, focus.z).map_or(0, |z| z.vehicles as usize);
         for t in self.loading.values_mut() {
             *t += dt;
         }
         self.loading.retain(|_, t| *t < GIVE_UP);
-        self.wait -= dt;
-        if self.wait > 0.0 {
+        let her_speed = self
+            .last_focus
+            .filter(|_| dt > 0.0)
+            .map_or(0.0, |p| flat(focus - p).length() / dt);
+        self.last_focus = Some(focus);
+        let Some(viewer) = viewer else {
             return;
-        }
-        self.wait = LOOK;
-        let mut near = 0;
-        let mut far = Vec::new();
-        for (i, v) in scene.vehicles.iter().enumerate() {
-            let Some((e, at, _)) = v.spot.filter(|(e, _, _)| self.cars.contains_key(e)) else {
+        };
+        let her_car = scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| scene.vehicles.get(i));
+        let in_vehicle = her_car.is_some();
+        let afloat_or_flying = her_car.is_some_and(|v| v.spec.is_boat() || v.spec.is_helicopter());
+        let height = world
+            .physics
+            .cast_ray(focus + Vec3::Y * 0.5, Vec3::NEG_Y, 100.0)
+            .map_or(100.0, |(d, _)| (d - 0.5).max(0.0));
+        let zones: Vec<&DensityZone> = index.zones.iter().filter(|z| layer_in(z.layer)).collect();
+        let zone = zone_at(zones.iter().copied(), focus.x, focus.z);
+        let (zv, zp) = zone.map_or(
+            (
+                road_population::DEFAULT_WANTED,
+                road_population::DEFAULT_WANTED,
+            ),
+            |z| (z.vehicles, z.people),
+        );
+        let mode = Mode::of(zv, zp, height, afloat_or_flying);
+        let wanted = road_population::wanted(zone.map(|z| z.vehicles), mode, in_vehicle);
+
+        // Those that go (0x82263590): a rotating few looked at a frame,
+        // at most two taken.
+        let ours: Vec<usize> = scene
+            .vehicles
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| {
+                v.id.is_some()
+                    && v.spot.is_some_and(|(e, _, _)| {
+                        self.cars.contains_key(&e) && !self.taken.contains(&e)
+                    })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let mut taken = 0;
+        for k in 0..ours.len().min(road_population::LOOK_AT) {
+            if taken >= road_population::MOST_TAKEN {
+                break;
+            }
+            let i = ours[(self.cursor + k) % ours.len()];
+            let v = &mut scene.vehicles[i];
+            let Some((e, at, _)) = v.spot else {
                 continue;
             };
-            self.loading.remove(&e);
-            if self.taken.contains(&e) {
-                continue;
-            }
             let here =
                 v.id.and_then(|id| world.physics.vehicle_transform(id))
                     .map_or(at, |m| m.w_axis.truncate());
-            let away = flat(here - focus).length();
-            let stuck = self.cars.get(&e).is_some_and(|c| c.stuck > STUCK);
-            if away > GONE || stuck && away > STUCK_AWAY {
-                far.push(i);
-            } else {
-                near += 1;
+            let d = viewer.distance(here, in_vehicle);
+            if road_population::despawns(d, viewer.sees(here)) {
+                if let Some(id) = v.id.take() {
+                    world.physics.remove_vehicle(id);
+                }
+                self.cars.remove(&e);
+                self.looks.remove(&e);
+                self.drivers.remove(&e);
+                self.resting.insert(e);
+                taken += 1;
             }
         }
-        near += self.loading.len();
-        // Where vehicles stand already: none comes out on top of another
-        // (playtest 5: a Sportbike and an Austin semi came out on the same
-        // spot, the semi on the bike).
+        self.cursor = if ours.is_empty() {
+            0
+        } else {
+            (self.cursor + road_population::LOOK_AT) % ours.len()
+        };
+
+        // Those that come (0x8226ADB0).
+        let live = self.cars.keys().filter(|e| !self.taken.contains(e)).count();
+        let room = road_population::MOST_A_FRAME.min(wanted.saturating_sub(live));
+        let Some(flood) = self.flood(focus, viewer.look) else {
+            return;
+        };
+        let coin = self.roll();
         let mut stands: Vec<Vec3> = scene
             .vehicles
             .iter()
@@ -271,55 +348,48 @@ impl RoadTraffic {
                     .or(v.spot.map(|s| s.1))
             })
             .collect();
+        let mut places = Vec::new();
+        let mut spawner = self.spawner;
+        spawner.step(dt, mode, !in_vehicle, her_speed, coin, room, &mut |ask| {
+            let found = self.places_on(
+                &index.roads,
+                &zones,
+                &flood,
+                ask,
+                mode,
+                &viewer,
+                in_vehicle,
+                &mut stands,
+            );
+            let n = found.len();
+            places.extend(found);
+            n
+        });
+        self.spawner = spawner;
         let mut loads = Vec::new();
-        'come: while near < wanted {
-            let mut found = None;
-            for _ in 0..PLACE_TRIES {
-                let Some((road, forward, s, list)) = self.place_near(&index.roads, &zones, focus)
-                else {
-                    break 'come;
-                };
-                let r = &index.roads[road];
-                let lanes = r.lane_offsets().len().max(1);
-                let pick = ((self.roll() * lanes as f32) as usize).min(lanes - 1);
-                let (at, dir) = lane(r, s, forward, pick);
-                if stands.iter().all(|&o| flat(o - at).length() >= CLEAR) {
-                    found = Some((road, forward, s, list, pick, at, dir));
-                    break;
-                }
-            }
-            let Some((road, forward, s, list, pick, at, dir)) = found else {
-                break;
-            };
-            stands.push(at);
+        for (road, forward, s, list, pick, at, dir) in places {
             let r = &index.roads[road];
             let yaw = dir.x.atan2(dir.z);
-            let next = next_point(&r.points, s, forward);
             let car = Car {
                 road,
                 forward,
-                next,
+                next: next_point(&r.points, s, forward),
                 lane: pick,
-                stuck: 0.0,
             };
-            if let Some(i) = far.pop() {
-                // One left far behind comes round again here.
-                let v = &mut scene.vehicles[i];
-                if let Some(id) = v.id.take() {
-                    world.physics.remove_vehicle(id);
-                }
-                let Some((e, _, _)) = v.spot else {
-                    continue;
-                };
+            // One taken away comes again here (its own model kept).
+            let rest = self.resting.iter().copied().next();
+            if let Some(e) = rest
+                && let Some(v) = scene
+                    .vehicles
+                    .iter_mut()
+                    .find(|v| v.spot.is_some_and(|(x, _, _)| x == e))
+            {
+                self.resting.remove(&e);
                 v.spot = Some((e, at, yaw));
                 v.wrecked = false;
                 v.damage = 0.0;
                 self.cars.insert(e, car);
-                near += 1;
                 continue;
-            }
-            if self.made as usize >= MOST_MADE {
-                break;
             }
             let roll = self.roll();
             let list = self.list(list, &index.template_db).to_vec();
@@ -330,7 +400,7 @@ impl RoadTraffic {
                 .map(|(i, (_, w))| (i as u32, *w))
                 .collect();
             let Some(pick) = m2_engine::population::pick(&weights, roll) else {
-                break;
+                continue;
             };
             let name = list[pick as usize].0.clone();
             let models =
@@ -344,50 +414,101 @@ impl RoadTraffic {
             self.made += 1;
             let crew = index.template_db.crew(&name);
             eprintln!(
-                "road traffic {entity:#x}: {name} as {} at ({:.0}, {:.0}, {:.0}) on road {:#x} (zone wants {wanted}), crew {crew:?}",
+                "road traffic {entity:#x}: {name} as {} at ({:.0}, {:.0}, {:.0}) on road {:#x} ({mode:?}, wants {wanted}), crew {crew:?}",
                 models[0].label, at.x, at.y, at.z, r.entity,
             );
             loads.push((entity, at, yaw, crew, models));
             self.cars.insert(entity, car);
             self.loading.insert(entity, 0.0);
-            near += 1;
         }
         for (entity, at, yaw, crew, models) in loads {
             scene.load_world_vehicle(entity, at, yaw, crew, models);
         }
     }
 
-    /// A place for one to come out: a point of a road between
-    /// [`COME_NEAR`] and [`COME_FAR`] from `focus` whose zone sends
-    /// vehicles, and which way it goes; how far along the road that point
-    /// is, and the zone's vehicle list.
-    fn place_near(
+    /// Whether `entity` is a road vehicle taken away, waiting to come
+    /// again (not to be put back where it stood).
+    pub fn resting(&self, entity: u32) -> bool {
+        self.resting.contains(&entity)
+    }
+
+    /// The road network flooded out from her at `focus`, looking `look`
+    /// (0x822644E0): from the road she is on or by, else the last she was
+    /// (inferred: what the 360 does off the roads isn't traced).
+    fn flood(&mut self, focus: Vec3, look: Vec3) -> Option<Flood> {
+        let net = self.net.as_ref()?;
+        if let Some((road, frac, _)) = net.nearest(focus) {
+            let frac = frac.clamp(0.001, 0.999);
+            let dir = road_ring::facing_along(&net.roads[road], frac, focus, look, road_ring::NEAR);
+            self.on_road = Some((road, frac, dir));
+        }
+        let (road, frac, dir) = self.on_road?;
+        Flood::new(net, road, frac, dir, road_ring::REACH)
+    }
+
+    /// Up to `ask.count` places on its ring (0x8226A438): on her side the
+    /// ask says, on a road over [`SHORTEST`] long, kept [`END_GAP`] off
+    /// its ends; far enough from her and no farther than
+    /// [`road_population::FARTHEST`], seen or not as the ask says, passing
+    /// the vehicles' keep test, clear of the others, and in a zone that
+    /// sends vehicles.
+    #[allow(clippy::too_many_arguments)]
+    fn places_on(
         &mut self,
         roads: &[Road],
         zones: &[&DensityZone],
-        focus: Vec3,
-    ) -> Option<(usize, bool, f32, u32)> {
-        let mut spots: Vec<(usize, f32, u32)> = Vec::new();
-        for (i, r) in roads.iter().enumerate().filter(|(_, r)| r.drivable()) {
-            let mut along = 0.0;
-            for w in r.points.windows(2) {
-                let d = flat(w[0] - focus).length();
-                if (COME_NEAR..COME_FAR).contains(&d)
-                    && let Some(zone) = zone_at(zones.iter().copied(), w[0].x, w[0].z)
-                    && zone.vehicles > 0
-                    && zone.vehicle_list != 0
-                {
-                    spots.push((i, along, zone.vehicle_list));
-                }
-                along += w[0].distance(w[1]);
+        flood: &Flood,
+        ask: road_population::Ask,
+        mode: Mode,
+        viewer: &Viewer,
+        in_vehicle: bool,
+        stands: &mut Vec<Vec3>,
+    ) -> Vec<Place> {
+        let mut out = Vec::new();
+        let side = if ask.behind { -1 } else { 1 };
+        let points: Vec<RingPoint> = flood
+            .ring(ask.radius)
+            .into_iter()
+            .filter(|p| p.side == side)
+            .collect();
+        for p in points {
+            if out.len() >= ask.count {
+                break;
             }
+            let Some(length) = self.net.as_ref().map(|n| n.roads[p.road].length) else {
+                break;
+            };
+            if length <= SHORTEST {
+                continue;
+            }
+            let gap = END_GAP / length;
+            let s = p.frac.clamp(gap, 1.0 - gap) * length;
+            let road = self.net_roads[p.road];
+            let r = &roads[road];
+            let forward = (p.dir == 1) != ask.toward;
+            let lanes = r.lane_offsets().len().max(1);
+            let pick = ((self.roll() * lanes as f32) as usize).min(lanes - 1);
+            let (at, dir) = lane(r, s, forward, pick);
+            let d = viewer.distance(at, in_vehicle);
+            if d < ask.least || d > road_population::FARTHEST {
+                continue;
+            }
+            let seen = viewer.sees(at);
+            if !ask.seen.allows(seen) || !road_population::spawn_keeps(d, seen, mode) {
+                continue;
+            }
+            if stands.iter().any(|&o| flat(o - at).length() < CLEAR) {
+                continue;
+            }
+            let Some(zone) = zone_at(zones.iter().copied(), at.x, at.z)
+                .filter(|z| z.vehicles > 0 && z.vehicle_list != 0)
+            else {
+                continue;
+            };
+            stands.push(at);
+            out.push((road, forward, s, zone.vehicle_list, pick, at, dir));
         }
-        if spots.is_empty() {
-            return None;
-        }
-        let k = ((self.roll() * spots.len() as f32) as usize).min(spots.len() - 1);
-        let (road, s, list) = spots[k];
-        Some((road, self.roll() < 0.5, s, list))
+        out
     }
 
     /// Drives the road traffic; `driven` is the vehicle she is in.
@@ -474,11 +595,6 @@ impl RoadTraffic {
             let forward = flat(heading).normalize_or_zero();
             let top = v.spec.tuning.max_speed.unwrap_or(DEFAULT_TOP);
             let speed = physics.vehicle_speed(id);
-            car.stuck = if speed.abs() < 0.5 {
-                car.stuck + dt
-            } else {
-                0.0
-            };
             self.cars.insert(entity, car);
             // The 360's road driver (0x822AAD80, [`road_driver`]): 20 m/s,
             // 10 near its road's end, none short of an end that leads
@@ -634,7 +750,6 @@ impl RoadTraffic {
                     1.min(last)
                 },
                 lane: car.lane,
-                stuck: 0.0,
             };
         }
         let k = ((self.roll() * ways.len() as f32) as usize).min(ways.len() - 1);
@@ -649,7 +764,6 @@ impl RoadTraffic {
                 last.saturating_sub(1)
             },
             lane: car.lane,
-            stuck: 0.0,
         }
     }
 
@@ -859,7 +973,6 @@ mod tests {
             forward,
             next,
             lane: 0,
-            stuck: 0.0,
         };
         assert_eq!(
             along(&r, car(true, 1), Vec3::new(0.0, 0.0, 5.0)),
@@ -882,12 +995,106 @@ mod tests {
             forward,
             next: 1,
             lane: 0,
-            stuck: 0.0,
         };
         assert!(in_lane(&r, car(true), Vec3::new(-2.0, 0.0, 50.0)));
         assert!(!in_lane(&r, car(true), Vec3::new(2.0, 0.0, 50.0)));
         assert!(in_lane(&r, car(false), Vec3::new(2.0, 0.0, 50.0)));
         assert!(!in_lane(&r, car(true), Vec3::new(-6.0, 0.0, 50.0)));
+    }
+
+    // 0x8226A438 on her road: the 110 m ring's point ahead of her, in
+    // view (flag 8), heading away (no flag 2); none behind her for it; one
+    // nearer her than the ring's least distance is refused.
+    #[test]
+    fn they_come_out_on_the_rings_ahead_in_view() {
+        use m2_math::glam::Mat4;
+        let mut r0 = road(10, &[(0.0, 0.0), (0.0, 400.0)]);
+        r0.ends = [0, 0];
+        let roads = [r0];
+        let mut t = RoadTraffic::default();
+        t.index(&roads, &[]);
+        let her = Vec3::new(0.0, 0.0, 20.0);
+        let viewer = Viewer {
+            at: her,
+            look: Vec3::Z,
+            view_proj: Mat4::perspective_rh(1.0, 1.5, 0.1, 1000.0)
+                * Mat4::look_at_rh(her, her + Vec3::Z, Vec3::Y),
+        };
+        let zone = DensityZone {
+            entity: 1,
+            name: String::new(),
+            layer: 0,
+            static_layer: true,
+            outline: vec![
+                Vec2::new(-50.0, -50.0),
+                Vec2::new(50.0, -50.0),
+                Vec2::new(50.0, 450.0),
+                Vec2::new(-50.0, 450.0),
+            ],
+            vehicles: 12,
+            people: 8,
+            vehicle_list: 7,
+            people_list: 0,
+            priority: 0,
+            faction: 0,
+        };
+        let flood = t.flood(her, Vec3::Z).unwrap();
+        let ask = |radius, flags| {
+            let mut got = None;
+            let mut s = road_population::Spawner::default();
+            // Find the ask by running the dense timers until it is due.
+            s.step(3.0, Mode::Dense, true, 0.0, 0.0, 10, &mut |a| {
+                if a.radius == radius
+                    && got.is_none()
+                    && (flags & 8 != 0) == (a.seen == road_population::Seen::InView)
+                {
+                    got = Some(a);
+                }
+                0
+            });
+            got.unwrap()
+        };
+        let in_view = ask(110.0, 0xa);
+        let mut stands = Vec::new();
+        let got = t.places_on(
+            &roads,
+            &[&zone],
+            &flood,
+            in_view,
+            Mode::Dense,
+            &viewer,
+            false,
+            &mut stands,
+        );
+        assert_eq!(got.len(), 1);
+        let (road, forward, s, list, _, at, _) = got[0];
+        assert_eq!((road, list), (0, 7));
+        // Flag 2: it heads toward her, back down the road.
+        assert!(!forward);
+        // On her own road, her fraction plus 110 m over what is left of
+        // it (0x8223F3F8, kept as the 360 works it).
+        let want = 400.0 * (0.05 + 110.0 / 380.0);
+        assert!((s - want).abs() < 1e-2, "{s}");
+        assert!(viewer.sees(at));
+        // Turned round, she doesn't see it: an in-view ring puts none out.
+        let away = Viewer {
+            look: Vec3::NEG_Z,
+            view_proj: Mat4::perspective_rh(1.0, 1.5, 0.1, 1000.0)
+                * Mat4::look_at_rh(her, her - Vec3::Z, Vec3::Y),
+            ..viewer
+        };
+        let mut stands = Vec::new();
+        let got = t.places_on(
+            &roads,
+            &[&zone],
+            &flood,
+            in_view,
+            Mode::Dense,
+            &away,
+            false,
+            &mut stands,
+        );
+        assert!(got.is_empty());
     }
 
     // A road with no junction at its end leads nowhere: no way out.
@@ -900,7 +1107,6 @@ mod tests {
             forward: true,
             next: 1,
             lane: 0,
-            stuck: 0.0,
         };
         assert!(t.ways_out(car, &roads).is_empty());
     }
@@ -978,7 +1184,6 @@ mod tests {
             forward: true,
             next: 1,
             lane: 0,
-            stuck: 0.0,
         };
         let mut seen = HashSet::new();
         for _ in 0..40 {
@@ -993,7 +1198,6 @@ mod tests {
             forward: true,
             next: 1,
             lane: 0,
-            stuck: 0.0,
         };
         let back = t.turn_off(dead, &roads);
         assert_eq!((back.road, back.forward, back.next), (1, false, 0));

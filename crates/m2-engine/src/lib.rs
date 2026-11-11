@@ -56,6 +56,7 @@ pub mod population;
 pub mod reverb;
 pub mod road_driver;
 pub mod road_graph;
+pub mod road_population;
 pub mod road_ring;
 pub mod scatter;
 pub mod seats;

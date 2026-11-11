@@ -648,6 +648,7 @@ impl Game {
     /// vehicle catalogue is known, and places the ones that have loaded
     /// where the layers park them.
     fn fetch_world_vehicles(&mut self, dt: f32) {
+        let roads = &self.roads;
         let scene = &mut self.scene;
         let (Some(world), Some(player)) = (&mut scene.world, &scene.player) else {
             return;
@@ -656,8 +657,9 @@ impl Game {
             // A gunship is put in the air where it comes in
             // ([`crate::gunships::Gunships::fly`]), a pursuit's car on the
             // road ([`crate::pursuers::Pursuers::drive`]), or is gone.
+            // Nor is road traffic taken away ([`RoadTraffic::resting`]).
             if v.spot
-                .is_some_and(|(e, _, _)| e >= crate::pursuers::FIRST_ENTITY)
+                .is_some_and(|(e, _, _)| e >= crate::pursuers::FIRST_ENTITY || roads.resting(e))
             {
                 continue;
             }
@@ -1038,7 +1040,16 @@ impl Game {
                     m2_engine::population::zone_at(zones, focus.x, focus.z)
                         .map_or(0, |z| z.people as usize);
             }
-            self.roads.spawn(&mut self.scene, focus, layer_in, dt);
+            // Her camera, as the upkeep measures and sees from it.
+            let (fov, aspect) = self.lens;
+            let view = self.view(fov, aspect);
+            let viewer = m2_engine::road_population::Viewer {
+                at: view.eye(),
+                look: (-view.view.inverse().z_axis.truncate()).normalize_or(Vec3::Z),
+                view_proj: view.projection * view.view,
+            };
+            self.roads
+                .spawn(&mut self.scene, focus, Some(viewer), layer_in, dt);
         }
         let intent = self.call_support(intent, dt);
         split("game: arrival");
