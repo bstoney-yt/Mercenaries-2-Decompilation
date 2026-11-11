@@ -3677,8 +3677,8 @@ mod tests {
             Event.CreatePersistent(Event.HumanStateTransition, { t, "*", "KnockedDown.Idle" }, note("down"), {})
             Event.CreatePersistent(Event.HumanStateTransition, { t, "*", "Subdued.Idle" }, note("subdued"), {})
             Event.CreatePersistent(Event.HumanStateTransition, { t, "KnockedDown.*", "Upright.*" }, note("up"), {})
-            Human.DoAction(Player.GetAnyCharacter(), "VerifyCamera")
-            Event.Create(Event.HumanActionComplete, { Player.GetAnyCharacter() }, note("photo"), {})"#,
+            Human.DoAction(Player.GetLocalCharacter(), "VerifyCamera")
+            Event.Create(Event.HumanActionComplete, { Player.GetLocalCharacter() }, note("photo"), {})"#,
             "events",
         )
         .unwrap();
@@ -3705,8 +3705,11 @@ mod tests {
         assert_eq!(heard(&m), ["down", "up", "subdued", "photo"]);
         // And carrying, as `Human.IsCarrying` reads it.
         m.set_carrying(PLAYER, Some(9));
-        m.run("__c = Human.IsCarrying(Player.GetAnyCharacter())", "carry")
-            .unwrap();
+        m.run(
+            "__c = Human.IsCarrying(Player.GetLocalCharacter())",
+            "carry",
+        )
+        .unwrap();
         assert!(m.lua().globals().get::<bool>("__c").unwrap());
     }
     #[test]
