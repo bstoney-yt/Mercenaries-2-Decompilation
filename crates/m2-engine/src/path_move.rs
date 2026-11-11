@@ -11,9 +11,11 @@
 //! over 0 (`MindPathMove`'s enter, 0x822B4908). So a car asks 20 m/s, a
 //! tank 10 and a boat 16 unless its request says.
 //!
-//! Inferred: a placed patrol's `Haste` (0.175 to 0.35 on the install's
-//! spawners) is the request's +0x24 (what fills it from a spawner isn't
-//! traced).
+//! A script's `PathMove` goal gives its `Haste` as the request's +0x24
+//! (0x8230EB48 reads it, 0 when absent). Inferred: a placed patrol's
+//! `Haste` (0.175 to 0.35 on the install's spawners) is that factor too;
+//! its reader (0x823EF0F0, 0.5 when absent) hands it to 0x82246020, and
+//! the way from there to the request isn't traced.
 
 /// The mind's speed factor before a move request gives one (0x822BDAD0).
 pub const DEFAULT_FACTOR: f32 = 0.4;

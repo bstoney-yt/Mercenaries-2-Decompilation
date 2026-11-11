@@ -21,9 +21,10 @@
 //! the request gives one; nothing in it stops for what is ahead (a boat
 //! still keeps clear of other boats by its own driver).
 //!
-//! Inferred: the goal's `Haste` is the request's speed factor (+0x24). Not
-//! ported: the search for a way between the points (0x822BF7A8); it goes
-//! straight at each.
+//! The goal's `Haste` is that factor: the scripts' `PathMove` reader
+//! (0x8230EB48) puts it in the request's +0x24, 0 when the goal has none
+//! (so the mind's 0.4). Not ported: the search for a way between the
+//! points (0x822BF7A8); it goes straight at each.
 
 use std::collections::HashMap;
 
