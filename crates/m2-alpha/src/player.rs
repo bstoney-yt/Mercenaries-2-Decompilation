@@ -437,6 +437,11 @@ pub struct Player {
     shown: InHand,
     /// A weapon switch, while it plays over her upper body.
     pub switching: Option<Switch>,
+    /// Standing still: the idle, the second idle or the fidget, as the
+    /// 360's standing mode times them ([`m2_engine::stand_idle`]), and
+    /// the seconds the fidget has played.
+    stand: m2_engine::stand_idle::StandIdle,
+    fidgeted: f32,
     /// Her binoculars, while they are up ([`crate::binoculars`]): the
     /// frame is seen through them and her body is left out.
     pub binoculars: Option<Binoculars>,
@@ -642,6 +647,8 @@ impl Player {
             in_hand: InHand::default(),
             shown: InHand::default(),
             switching: None,
+            stand: m2_engine::stand_idle::StandIdle::new(0.5),
+            fidgeted: 0.0,
             picking: None,
             reloading: None,
             binoculars: None,
@@ -1414,10 +1421,75 @@ impl Player {
                 rig.animator.set_upper(None);
                 rig.two_handed = false;
             } else {
-                rig.hold_rifle(gait, clips, carry);
-                // A pistol is held in the right hand alone.
-                if !rig.barrel {
-                    rig.two_handed = false;
+                // Standing still and not aiming she is in the 360's
+                // standing mode: its second idle after a while and its
+                // fidget now and then ([`m2_engine::stand_idle`]), for
+                // what she holds. Anything else she does starts the waits
+                // again (inferred: the 360 leaves the standing mode, or
+                // the action, for those).
+                use m2_engine::stand_idle::{Person, StandIdle, Standing};
+                let held = self.moves.of(self.shown.class);
+                let (settled, fidget) = held.map_or((None, None), |h| (h.settled, h.fidget));
+                let still = gait == Gait::Idle
+                    && !self.aiming
+                    && self.bashing.is_none()
+                    && self.picking.is_none()
+                    && self.throwing.is_none()
+                    && self.switching.is_none()
+                    && self.reloading.is_none()
+                    && self.stopping.is_none();
+                // The wait's random part, from where she stands (the
+                // 360's is its random number; which she gets is invented).
+                let at = self.character.position;
+                let roll = ((at.x * 12.9898 + at.z * 78.233).sin() * 43_758.547)
+                    .fract()
+                    .abs();
+                if still {
+                    let fidget_length = fidget.map_or(0.0, |c| rig.clips[c].info.duration);
+                    let person = Person {
+                        aiming: false,
+                        held: false,
+                        has_settled: settled.is_some(),
+                        // Not aiming, her aim rests ahead of her (inferred).
+                        aim_yaw: 0.0,
+                        fidget_done: fidget.is_none() || self.fidgeted >= fidget_length,
+                    };
+                    if let Some(to) = self.stand.step(dt, person, roll) {
+                        self.fidgeted = 0.0;
+                        eprintln!("anim: standing {to:?}");
+                    }
+                    if self.stand.state == Standing::Fidget {
+                        self.fidgeted += dt;
+                    }
+                } else {
+                    self.stand = StandIdle::new(roll);
+                    self.fidgeted = 0.0;
+                }
+                let clip = match self.stand.state {
+                    Standing::Settled => settled,
+                    Standing::Fidget => fidget,
+                    Standing::Idle => None,
+                };
+                match clip.filter(|_| still) {
+                    Some(c) => {
+                        // A clip of the locomotion node's, as its gaits
+                        // are: faded over the node's 0.3 s, from its start.
+                        let fresh = rig.animator.current().is_none_or(|(i, _)| i != c);
+                        rig.gait = gait;
+                        rig.play_gait(c);
+                        if fresh {
+                            rig.animator.restart();
+                        }
+                        rig.animator.set_upper(None);
+                        rig.two_handed = rig.barrel;
+                    }
+                    None => {
+                        rig.hold_rifle(gait, clips, carry);
+                        // A pistol is held in the right hand alone.
+                        if !rig.barrel {
+                            rig.two_handed = false;
+                        }
+                    }
                 }
             }
             // A weapon switch: what she holds goes away over her upper

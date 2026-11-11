@@ -93,7 +93,22 @@ pub struct Held {
     /// firing sweeps ([`m2_engine::aim_sweep`]): the on-foot table's rows
     /// for her and the class under the rifle sweeps' handles.
     pub sweeps: Option<crate::scene::Sweeps>,
+    /// Standing still with it: the second idle she settles into and the
+    /// fidget ([`m2_engine::stand_idle`]), the upright locomotion node's
+    /// entries 12 ([`SETTLED_HANDLE`]) and 13 (`Upright_Fidget`).
+    pub settled: Option<usize>,
+    pub fidget: Option<usize>,
 }
+
+/// The upright locomotion node's second idle: entry 12 of its handle
+/// list (0x82B4DA98, from the 360 code). Its name is not known (no name
+/// guessed hashes to it); the on-foot table gives it rows by class and
+/// character, and to anyone holding anything its stand-in for no clip.
+pub const SETTLED_HANDLE: u32 = 0x2403_f715;
+
+/// The upright locomotion node's fidget, entry 13 of the same list, by
+/// name (its hash is the entry, 700d4de0).
+pub const FIDGET_HANDLE: &str = "Upright_Fidget";
 
 /// The on-foot table's handles for the crouched, aiming gaits, by name
 /// (their hashes are in the table; the names are the ones that hash to
@@ -412,7 +427,15 @@ pub fn resolve(
                 .zip(sweep_of(RIFLE_MOVING))
                 .map(|(s, m)| crate::scene::Sweeps { aim: [s, m], fire })
         });
+        let by_handle = |handle: u32| {
+            let p = table::handle_clip(t, handle, who, class, fits)?;
+            (p.clip != table::NO_ANIMATION)
+                .then(|| index(p.clip))
+                .flatten()
+        };
         held.push(Held {
+            settled: by_handle(SETTLED_HANDLE),
+            fidget: by_handle(m2_assets::name_hash(FIDGET_HANDLE)),
             sweeps,
             crouch,
             shuffle,
@@ -562,5 +585,11 @@ mod tests {
             m.of(m2_assets::name_hash("pistol")).map(|h| h.class),
             Some(m2_assets::name_hash("pistol"))
         );
+    }
+
+    /// The fidget's name hashes to entry 13 of the upright node's list.
+    #[test]
+    fn the_fidgets_name_is_the_lists_entry() {
+        assert_eq!(m2_assets::name_hash(FIDGET_HANDLE), 0x700d_4de0);
     }
 }
