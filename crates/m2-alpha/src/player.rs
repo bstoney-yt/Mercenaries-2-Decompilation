@@ -417,6 +417,10 @@ pub struct Player {
     /// Sitting in the seat of the vehicle she drives, posed and placed
     /// there (`hijack::Hijacks::seat`): drawn though driving.
     pub seated: bool,
+    /// Her limp body, while she is down from a death on foot: the 360's
+    /// plain `Die` has no clip and makes a person a ragdoll at once
+    /// ([`crate::combat::Combat`] makes it and takes it away).
+    pub ragdoll: Option<m2_engine::RagdollId>,
     /// Seated: model to world for her body, the vehicle's whole turn
     /// (pitch and roll as well as heading) with her clip's origin on the
     /// seat ([`model_matrix`](Self::model_matrix)).
@@ -628,6 +632,7 @@ impl Player {
             launcher: false,
             down: false,
             seated: false,
+            ragdoll: None,
             seat_frame: None,
             moves: Moves::default(),
             in_hand: InHand::default(),
