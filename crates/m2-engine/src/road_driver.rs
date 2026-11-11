@@ -19,11 +19,17 @@
 //!   across, 1 m high, 3 m long) and stops while that meets something;
 //!   it counts the seconds it has been blocked so.
 //!
-//! Not ported here (the data they need isn't mapped): the junctions' stop
-//! lines and slow-downs by their kind and traffic control (0x822B9210,
-//! 0x82234B38), the stop at a road that leads nowhere (0x8223D270), the
-//! road record's own speeds (7, 20 or 10 m/s by its +0x18), and the wheel
-//! jiggled after 6 s blocked (0x822AAAE8).
+//! - **Its speed** starts at 20 m/s, 10 within 100 m of its road's end
+//!   ([`base_speed`]), and it stops within 10 m of an end that leads
+//!   nowhere ([`DEAD_END`]).
+//!
+//! Not ported: the junctions' stop lines and slow-downs by their flow
+//! control (0x822B9210, 0x82234B38). They act only for a road linked to an
+//! `RtFlowControl` entity (0x822B81A0, store 0x8365778C, its record's +0x14
+//! the kind, +0x1C the sub-kind), and no layer the alpha reads holds one.
+//! Nor the 7 m/s at a road's very end (its +0x18 exactly 0 or 1), nor the
+//! wheel jiggled once blocked over 6 s (0x822AAAE8: its timer, +0x1C0, isn't
+//! traced).
 
 /// Under this it brakes and holds, m/s (0x822AAD80's 0.5).
 pub const HOLD: f32 = 0.5;
@@ -38,6 +44,39 @@ pub const AHEAD_COS: f32 = 0.7;
 /// length (0x822B8C68's 0.6 by 1 by 3 m, to 0x822E3558).
 pub const PROBE_HALF: [f32; 2] = [0.3, 0.5];
 pub const PROBE_LENGTH: f32 = 3.0;
+
+/// Whether it is within `within` metres of its road's end ahead, with
+/// `remaining` metres of its road of `length` left (0x822B8138: `within`
+/// of the length, that share capped at 0.75 once it is over 0.9).
+pub fn near_end(remaining: f32, length: f32, within: f32) -> bool {
+    let length = length.max(1e-3);
+    let mut share = within / length;
+    if share > 0.9 {
+        share = 0.75;
+    }
+    remaining / length < share
+}
+
+/// The speed it starts from, m/s (0x822AAD80): 20 (0x820BB204), 10 within
+/// 100 m of its road's end ([`near_end`]).
+pub fn base_speed(remaining: f32, length: f32) -> f32 {
+    if near_end(remaining, length, 100.0) {
+        10.0
+    } else {
+        20.0
+    }
+}
+
+/// It stops within this of a road's end that leads nowhere, metres
+/// (0x822B9440: 0x822B8138 with 10, and 0x8223D270 finding no road out
+/// of the junction there).
+pub const DEAD_END: f32 = 10.0;
+
+/// Where its look ahead starts and how far it reaches (0x822B8C68): from
+/// its origin 0.6 m up and 2 m along the way it is going (ahead, or behind
+/// when its follower's point is behind it), 3 m on that way.
+pub const PROBE_UP: f32 = 0.6;
+pub const PROBE_OUT: f32 = 2.0;
 
 /// The speed it asks for a car ahead `gap` metres off going the way it
 /// does when `aligned` (within [`AHEAD_COS`]), its own speed `v` and the
@@ -85,6 +124,18 @@ mod tests {
         assert!((eased - (3.0 - 2.0 * f) * f * f * 20.0).abs() < 1e-4);
         assert!(eased > 0.0 && eased < 20.0);
         assert_eq!(follow(20.0, 2.0, 20.0, false), Some(10.0));
+    }
+
+    // 0x822B8138 and 0x822AAD80's start: 20 m/s, 10 within 100 m of the
+    // end; on a road under 111 m long, within 0.75 of its length.
+    #[test]
+    fn it_slows_toward_its_roads_end() {
+        assert_eq!(base_speed(400.0, 1000.0), 20.0);
+        assert_eq!(base_speed(90.0, 1000.0), 10.0);
+        assert!(near_end(70.0, 100.0, 100.0));
+        assert!(!near_end(80.0, 100.0, 100.0));
+        assert!(near_end(5.0, 300.0, DEAD_END));
+        assert!(!near_end(15.0, 300.0, DEAD_END));
     }
 
     #[test]

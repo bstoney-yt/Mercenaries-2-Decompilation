@@ -17,16 +17,16 @@
 //!   middle of one of the lanes on the right, and only on roads with one
 //!   (not the sidewalks, curbs, walls and driveways placed as roads).
 //! - From the 360 code ([`m2_engine::road_driver`], 0x822AAD80): each
-//!   drives by 0x822AC008 toward its lane's next point; it eases off and
+//!   drives by 0x822AC008 toward its lane's next point at 20 m/s, 10 near
+//!   its road's end, stopping short of an end that leads nowhere; it eases off and
 //!   stops behind a car (or her) ahead in its lane, stops while a box
 //!   just ahead of it meets something, and brakes and holds under
 //!   0.5 m/s.
 //! - Invented (no field decoded says): how far off they come and go,
-//!   the speed they ask (the 360's road record gives one, not mapped),
 //!   and that one stuck for [`STUCK`] seconds out of her sight comes
 //!   again elsewhere (the 360's spawner's own despawn isn't traced).
-//!   Not ported: junctions' stop lines and traffic control, and the
-//!   stop at a road leading nowhere (it turns back instead).
+//!   Not ported: junctions' stop lines and flow control (no layer read
+//!   holds an `RtFlowControl`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -56,10 +56,6 @@ const PLACE_TRIES: usize = 8;
 const ARRIVE: f32 = 6.0;
 /// A road's end meets a junction's port this near, metres.
 const PORT: f32 = 8.0;
-/// The share of their template's top speed they drive at (invented: the
-/// placed traffic's `Haste` runs 0.175 to 0.35; the highway's traffic in
-/// the footage passes her car).
-const HASTE: f32 = 0.45;
 /// Top speed when the template gives none, m/s.
 const DEFAULT_TOP: f32 = 20.0;
 /// The scripts' path movers ([`crate::paths`]) brake for her or a vehicle
@@ -466,6 +462,9 @@ impl RoadTraffic {
                 match (car.forward, car.next) {
                     (true, n) if n < last => car.next += 1,
                     (false, n) if n > 0 => car.next -= 1,
+                    // A road that leads nowhere: it stays, stopped short
+                    // of its end (0x822B9440), not turned back.
+                    _ if self.ways_out(car, roads).is_empty() => break,
                     _ => car = self.turn_off(car, roads),
                 }
             }
@@ -484,11 +483,18 @@ impl RoadTraffic {
                 0.0
             };
             self.cars.insert(entity, car);
-            // The 360's road driver (0x822AAD80, [`road_driver`]): the
-            // speed it would ask (invented, as before), less for a car
-            // ahead in its lane, and none while a box just ahead of it
-            // meets something.
-            let mut want = top * HASTE;
+            // The 360's road driver (0x822AAD80, [`road_driver`]): 20 m/s,
+            // 10 near its road's end, none short of an end that leads
+            // nowhere, less for a car ahead in its lane, and none while a
+            // box just ahead of it meets something. (No faster than its
+            // template's top speed.)
+            let (remaining, length) = along(r, car, here);
+            let mut want = road_driver::base_speed(remaining, length).min(top);
+            if road_driver::near_end(remaining, length, road_driver::DEAD_END)
+                && self.ways_out(car, roads).is_empty()
+            {
+                want = 0.0;
+            }
             let ahead = mine
                 .iter()
                 .filter(|o| o.entity != entity && o.road == car.road && o.forward == car.forward)
@@ -523,14 +529,21 @@ impl RoadTraffic {
                 let last = r.points.len().saturating_sub(1).max(1);
                 let t = car.next as f32 / last as f32;
                 look.next = road_driver::probe_every(t, self.rng as f32 / u32::MAX as f32);
-                let nose = here + heading * v.spec.bounds.1.z.max(-v.spec.bounds.0.z);
+                // Ahead, or behind when its point is behind it.
+                let way = if flat(target - here).dot(forward) > 0.1 {
+                    heading
+                } else {
+                    -heading
+                };
+                let up = at.transform_vector3(Vec3::Y).normalize_or(Vec3::Y);
+                let from = here + up * road_driver::PROBE_UP + way * road_driver::PROBE_OUT;
                 let [w, h] = road_driver::PROBE_HALF;
                 look.blocked = physics
                     .cast_box(
-                        nose + Vec3::Y * h,
-                        Quat::from_rotation_y(heading.x.atan2(heading.z)),
+                        from + Vec3::Y * h,
+                        Quat::from_rotation_y(way.x.atan2(way.z)),
                         Vec3::new(w, h, 0.05),
-                        heading,
+                        way,
                         road_driver::PROBE_LENGTH,
                         Some(id),
                     )
@@ -566,7 +579,10 @@ impl RoadTraffic {
     }
     /// At the end of its road: onto another road that meets the junction
     /// there (at random), else back the way it came.
-    fn turn_off(&mut self, car: Car, roads: &[Road]) -> Car {
+    /// The roads out of the junction at the end of its road ahead, and
+    /// which way each goes from there (0x8223D270 finds none at a road
+    /// that leads nowhere).
+    fn ways_out(&self, car: Car, roads: &[Road]) -> Vec<(usize, bool)> {
         let r = &roads[car.road];
         let end = if car.forward {
             r.points[r.points.len() - 1]
@@ -604,6 +620,12 @@ impl RoadTraffic {
         }
         ways.sort_unstable();
         ways.dedup();
+        ways
+    }
+
+    fn turn_off(&mut self, car: Car, roads: &[Road]) -> Car {
+        let r = &roads[car.road];
+        let ways = self.ways_out(car, roads);
         if ways.is_empty() {
             let last = r.points.len() - 1;
             return Car {
@@ -691,6 +713,27 @@ fn off_line(points: &[Vec3], at: Vec3) -> f32 {
 
 /// The right-hand side of a road going `dir` (level, unit): for a vehicle
 /// facing +z, +x is its left.
+/// How much of its road is left ahead of a vehicle at `here` heading for
+/// point `car.next` the way it goes, and the road's length, metres.
+fn along(road: &Road, car: Car, here: Vec3) -> (f32, f32) {
+    let p = &road.points;
+    let length: f32 = p.windows(2).map(|w| flat(w[1] - w[0]).length()).sum();
+    let next = car.next.min(p.len() - 1);
+    let mut left = flat(p[next] - here).length();
+    if car.forward {
+        left += p[next..]
+            .windows(2)
+            .map(|w| flat(w[1] - w[0]).length())
+            .sum::<f32>();
+    } else {
+        left += p[..=next]
+            .windows(2)
+            .map(|w| flat(w[1] - w[0]).length())
+            .sum::<f32>();
+    }
+    (left, length)
+}
+
 fn right_of(dir: Vec3) -> Vec3 {
     Vec3::new(-dir.z, 0.0, dir.x)
 }
@@ -776,6 +819,43 @@ mod tests {
             named_road: true,
             ends: [0, 0],
         }
+    }
+
+    // What is left of its road ahead, the way it goes (for 0x822B8138's
+    // "near the end").
+    #[test]
+    fn it_knows_how_much_road_is_left() {
+        let r = road(1, &[(0.0, 0.0), (0.0, 10.0), (0.0, 30.0)]);
+        let car = |forward, next| Car {
+            road: 0,
+            forward,
+            next,
+            lane: 0,
+            stuck: 0.0,
+        };
+        assert_eq!(
+            along(&r, car(true, 1), Vec3::new(0.0, 0.0, 5.0)),
+            (25.0, 30.0)
+        );
+        assert_eq!(
+            along(&r, car(false, 1), Vec3::new(0.0, 0.0, 20.0)),
+            (20.0, 30.0)
+        );
+    }
+
+    // A road with no junction at its end leads nowhere: no way out.
+    #[test]
+    fn a_road_without_a_junction_leads_nowhere() {
+        let roads = [road(1, &[(0.0, 0.0), (0.0, 30.0)])];
+        let t = RoadTraffic::default();
+        let car = Car {
+            road: 0,
+            forward: true,
+            next: 1,
+            lane: 0,
+            stuck: 0.0,
+        };
+        assert!(t.ways_out(car, &roads).is_empty());
     }
 
     #[test]
