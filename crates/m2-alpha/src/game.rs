@@ -3103,6 +3103,12 @@ impl Game {
                 .map(|(_, text)| text.clone())
                 .or(prompt)
                 .filter(|_| !self.support.busy()),
+            context_action: self
+                .context
+                .as_ref()
+                .filter(|_| self.on_foot && !self.input_locked && !self.cinematic)
+                .filter(|_| !self.support.busy())
+                .map(|(_, text)| text.clone()),
             hijack_keys: None,
             driving,
             crosshair: crosshair.filter(|_| self.support.looking().is_none()),
