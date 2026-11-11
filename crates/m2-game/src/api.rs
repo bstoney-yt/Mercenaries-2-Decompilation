@@ -863,12 +863,17 @@ pub struct ScriptWorld {
     /// Assets asked for with a callback (`Pg.LoadAsset(name, type,
     /// callback, data)`): answered as loaded on the next tick
     /// ([`answer_asset_loads`]).
-    asset_loads: Vec<(Function, Value)>,
+    pub(crate) asset_loads: Vec<(Function, Value)>,
     /// The outlines of region objects (`LineRegion`), by the region's guid;
     /// placed at the object's position and yaw.
     pub regions: HashMap<u32, m2_assets::Region>,
     /// The object link table ([`crate::links`]).
     pub links: crate::links::Links,
+    /// The sound engine's state the scripts set (`crate::script_sound`).
+    pub sound: crate::script_sound::SoundSettings,
+    /// The level and shell names and the post-processing values the
+    /// scripts set (`crate::script_shell`).
+    pub shell: crate::script_shell::ShellState,
     /// What `Pg.GetAllLandingZones(kind)` answers, by kind: the zones by
     /// their number. The transit script reads kinds 1 and 2 (where each
     /// player lands) as tables keyed alike.
@@ -1820,6 +1825,11 @@ pub const AUTOSAVE: &str = "autosave";
 
 /// The table of the game's own functions that hear the scripts' free
 /// support items (`AddFreebie`, `RemoveFreebie`).
+/// The global holding the port's own object-name lookup: `name =
+/// __m2_object_name(guid)`, the text `Object.GetName` gave before it
+/// answered the 360's hash.
+pub const OBJECT_NAME: &str = "__m2_object_name";
+
 pub const SUPPORT_EARS: &str = "__m2_support";
 
 /// Installs the libraries over `world`. Functions not written here stay
@@ -1892,14 +1902,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // A string's hash, as the scripts key tables by name (their recruits'
     // states). The archive's name hash: the scripts only compare hashes
     // with each other, so any one hash they all share serves.
+    // The engine's hash, as light userdata (`crate::script_hash`).
     add(&lib("String")?, "GetHash", |_, _, a| {
-        values(a.first().and_then(|v| match v {
-            // A number (Lua 5.1 has no integers), whole on 32-bit builds.
-            Value::String(s) => Some(Value::Number(f64::from(m2_assets::name_hash(
-                &s.to_string_lossy(),
-            )))),
-            _ => None,
-        }))
+        Ok(crate::script_hash::get_hash_native(a))
+    })?;
+    add(&lib("ObjectState")?, "GetStringHash", |_, _, a| {
+        Ok(crate::script_hash::get_hash_native(a))
     })?;
 
     let debug = lib("Debug")?;
@@ -2609,6 +2617,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Weapons as objects: a loadout of templates, each weapon with its own
     // reserve of ammunition.
     crate::links::install(&lib, &add)?;
+    crate::script_sound::install(&lib, &add)?;
+    crate::script_shell::install(lua, &lib, &add)?;
     let human = lib("Human")?;
     // Human.SetAllowCorpseCleanup(character, allow): whether the game may
     // clear its body away (the verify objective keeps a target's until it
@@ -2859,15 +2869,22 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
-    add(&object, "GetName", |w, lua, a| {
+    // From the 360 code (`0x8232EF88`): the object's name hash, pushed as
+    // light userdata like `String.GetHash` (`crate::script_hash`), nil for
+    // a guid without a name (or a name hashing to 0). Not the name's
+    // text: the port's own Lua reads that with `OBJECT_NAME`.
+    add(&object, "GetName", |w, _, a| {
         let g = id(a.first());
         let o = g.and_then(|g| w.objects.get(&g));
         values([match (o, g) {
-            (Some(o), _) => Value::String(lua.create_string(&o.name)?),
+            (Some(o), _) => match crate::script_hash::engine_hash(o.name.as_bytes()) {
+                0 => Value::Nil,
+                h => crate::script_hash::hash_value(h),
+            },
             // A faction's name as the faction zones look it up: keyed by
             // `String.GetHash` of the name, which its guid already is.
             (None, Some(g)) if FACTIONS.iter().any(|f| m2_assets::name_hash(f) == g) => {
-                Value::Number(f64::from(g))
+                crate::script_hash::hash_value(g)
             }
             _ => Value::Nil,
         }])
@@ -4390,11 +4407,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         add(&sys, "SetAutosaveEnabled", |w, _, a| {
             Ok(f::set_autosave(&mut w.sys_flags, a))
         })?;
-        add(&sys, "HaveActiveProfile", |w, _, a| {
-            Ok(f::with_arg(a, w.sys_flags.have_profile))
+        add(&sys, "HaveActiveProfile", |w, _, _| {
+            Ok(f::yes_no(w.sys_flags.have_profile))
         })?;
-        add(&sys, "IsGermanSKU", |w, _, a| {
-            Ok(f::with_arg(a, w.sys_flags.german_sku))
+        add(&sys, "IsGermanSKU", |w, _, _| {
+            Ok(f::yes_no(w.sys_flags.german_sku))
         })?;
         use crate::script_time::{self as t, ClockKind};
         add(&sys, "MainTime", |w, _, _| {
@@ -4416,9 +4433,6 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         add(&sys, "Clock", |_, _, _| Ok(t::clock()))?;
         add(&sys, "DiffTime", |_, _, a| t::diff_time_native(a))?;
     }
-    add(&sys, "GetLevelName", |_, lua, _| {
-        values([Value::String(lua.create_string("vz")?)])
-    })?;
     add(&sys, "GetIgnoreLayers", |_, lua, _| {
         values([Value::Table(lua.create_table()?)])
     })?;
@@ -4622,6 +4636,25 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     )
     .set_name("=m2-objectfilter")
     .exec()?;
+
+    // The port's own name lookup (the HUD shims, tests): an object's name
+    // as text, which the scripts' `Object.GetName` no longer gives.
+    lua.globals().raw_set(
+        OBJECT_NAME,
+        safe_function(lua, {
+            let w = Rc::clone(world);
+            move |lua, args| {
+                let name = args
+                    .front()
+                    .and_then(|v| id(Some(v)))
+                    .and_then(|g| w.borrow().objects.get(&g).map(|o| o.name.clone()));
+                Ok(MultiValue::from_vec(vec![match name {
+                    Some(n) => Value::String(lua.create_string(&n)?),
+                    None => Value::Nil,
+                }]))
+            }
+        })?,
+    )?;
 
     // The game's assert: logged, and the script carries on, as a release
     // build would.
@@ -5447,7 +5480,7 @@ mod tests {
                 local jeep = Pg.GetGuidByName("_global_veh_jeep 0x0001")
                 Object.SetPosition(jeep, x + 1, y, z)
                 Debug.Printf("jeep ", "moved")
-                return x, Object.GetName(jeep), Object.IsAlive(jeep) and Object.HasLabel(jeep, "Vehicle")
+                return x, __m2_object_name(jeep), Object.IsAlive(jeep) and Object.HasLabel(jeep, "Vehicle")
                 "#,
             )
             .eval()
@@ -5468,6 +5501,94 @@ mod tests {
     }
 
     #[test]
+    fn the_shell_and_post_processing_calls_answer_as_the_360_ones() {
+        let (host, world) = setup();
+        let (name, set, bad, a, b): (String, bool, usize, f64, f64) = host
+            .lua()
+            .load(
+                r#"
+                local before = Sys.GetLevelName()
+                local set = Sys.SetLevelName("vz_island")
+                Graphics.Bloom.SetThreshold(0.8)
+                local bad = select('#', Graphics.Contrast.SetLimit())
+                local a, b = Sys.GetVersion()
+                return before .. " " .. Sys.GetLevelName(), set, bad, a, b
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(
+            (name.as_str(), set, bad, a, b),
+            ("vz vz_island", true, 1, 100000.0, 100000.0)
+        );
+        assert_eq!(world.borrow().shell.bloom_threshold, Some(0.8));
+    }
+
+    #[test]
+    fn the_sound_settings_and_vo_calls_answer_as_the_360_ones() {
+        let (host, world) = setup();
+        let (vol, unset, bad, cancelled, paused, profile, sku): (
+            f32,
+            f32,
+            usize,
+            bool,
+            bool,
+            bool,
+            bool,
+        ) = host
+            .lua()
+            .load(
+                r#"
+                Sound.SetCategoryVolume("music", 0.5)
+                return Sound.GetCategoryVolume("music"), Sound.GetCategoryPitch("music"),
+                    select('#', Sound.SetCategoryVolume("music")),
+                    VO.CancelAll(), VO.Unpause(), Sys.HaveActiveProfile(), Sys.IsGermanSKU()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(
+            (vol, unset, bad, cancelled, paused, profile, sku),
+            (0.5, 1.0, 1, true, true, true, false)
+        );
+        host.lua()
+            .load(r#"Sound.TestCueSound("sfx_test")"#)
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [Command::CueSound {
+                at: Some(1),
+                cue: "sfx_test".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn object_get_name_answers_the_names_hash_as_on_the_360() {
+        let (host, _world) = setup();
+        let (same, kind, renamed, none): (bool, String, bool, bool) = host
+            .lua()
+            .load(
+                r#"
+                local jeep = Pg.GetGuidByName("_global_veh_jeep 0x0001")
+                local name = Object.GetName(jeep)
+                local same = name == String.GetHash("_global_veh_jeep 0x0001")
+                Object.SetName(jeep, "HqInterior")
+                local renamed = Object.GetName(jeep) == String.GetHash("HqInterior")
+                    and __m2_object_name(jeep) == "HqInterior"
+                return same, type(name), renamed, Object.GetName(Sys.StringToGuid("0x7ffe")) == nil
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(
+            (same, kind.as_str(), renamed, none),
+            (true, "userdata", true, true)
+        );
+    }
+
+    #[test]
     fn a_loadout_of_one_weapon_alone_is_given_too() {
         let (host, world) = setup();
         let name: String = host
@@ -5476,7 +5597,7 @@ mod tests {
                 r#"
                 local hero = Player.GetLocalCharacter()
                 Human.Inventory.SetAllWeapons(hero, Pg.GetGuidByName("Carbine"))
-                return Object.GetName(Human.Inventory.GetPrimaryWeapon(hero))
+                return __m2_object_name(Human.Inventory.GetPrimaryWeapon(hero))
                 "#,
             )
             .eval()
@@ -5521,7 +5642,7 @@ mod tests {
                     local gun = Human.Inventory.GetPrimaryWeapon(hero)
                     Weapon.SetReserveAmmo(gun, Weapon.GetMaxReserveAmmo(gun))
                     local all = Human.Inventory.GetAllWeapons(hero)
-                    return Object.GetName(gun), Weapon.GetReserveAmmo(all[2]),
+                    return __m2_object_name(gun), Weapon.GetReserveAmmo(all[2]),
                         Weapon.GetReserveAmmo(gun),
                         Object.GetParent(all[1]) == Pg.GetGuidByName("Carbine"),
                         Object.HasLabel(all[2], "Grenade"), #all
@@ -6197,8 +6318,18 @@ mod tests {
             )
             .exec()
             .unwrap();
-        let faction: f64 = host.lua().globals().get("faction").unwrap();
-        assert_eq!(faction as u32, m2_assets::name_hash("VZ"));
+        let faction: Value = host.lua().globals().get("faction").unwrap();
+        assert_eq!(
+            faction,
+            crate::script_hash::hash_value(m2_assets::name_hash("VZ"))
+        );
+        // A faction's guid is the hash of its name, and both are userdata.
+        let same: bool = host
+            .lua()
+            .load(r#"return String.GetHash("VZ") == faction and type(faction) == "userdata""#)
+            .eval()
+            .unwrap();
+        assert!(same);
         let crossed = || -> Vec<String> { host.lua().globals().get("crossed").unwrap() };
         assert!(events.update_shared(0.1, &world).is_empty());
         assert!(crossed().is_empty());
@@ -6436,7 +6567,7 @@ mod tests {
                 local cargo = Pg.SpawnFromCamera(crate, 4, 1, true, Player.GetLocalCharacter(), false, true)
                 local x, y, z = Pg.FindPointFromCamera(10, 50, 10)
                 return x, y, z, crate == Pg.GetGuidByName("Supply Drop (GL)"),
-                    Object.GetName(cargo), Pg.GetGuidByName("vza001_gate") == nil
+                    __m2_object_name(cargo), Pg.GetGuidByName("vza001_gate") == nil
                 "#,
             )
             .eval()
@@ -6610,7 +6741,7 @@ mod tests {
                 assert(Vehicle.GetDriver(jeep) == nil)
                 assert(Sound.GetAudioDir() .. "\\vo_x." .. Gui.GetLanguageName() == "data\\Audios\\vo_x.english")
                 Player.SetFuel(40)
-                return Object.GetName(Vehicle.GetDriver(copter)), #Vehicle.GetRiders(copter),
+                return __m2_object_name(Vehicle.GetDriver(copter)), #Vehicle.GetRiders(copter),
                     Player.GetFuel(), Player.GetMaximumPlayers(), Sound._GetLibVersion()
                 "#,
             )
@@ -6634,7 +6765,7 @@ mod tests {
                 .lua()
                 .load(
                     r#"local c = Pg.Spawn("Mi26 (VZA Intro) (Driver)", 0, 50, 0, 0)
-                    return c, Object.GetName(Vehicle.GetDriver(c))"#,
+                    return c, __m2_object_name(Vehicle.GetDriver(c))"#,
                 )
                 .eval::<(Value, String)>()
                 .unwrap();
@@ -6646,7 +6777,7 @@ mod tests {
             .lua()
             .load(
                 r#"local c = ...
-                return Object.GetName(Vehicle.GetDriver(c)), #Vehicle.GetRiders(c, "p"),
+                return __m2_object_name(Vehicle.GetDriver(c)), #Vehicle.GetRiders(c, "p"),
                     #Vehicle.GetRiders(c)"#,
             )
             .call(crate::events::guid_value(copter))
@@ -6683,7 +6814,7 @@ mod tests {
             .lua()
             .load(
                 r#"local copter = Pg.Spawn("AH1Z (Ewan)", 0, 50, 0, 0)
-                return Object.GetName(Vehicle.GetDriver(copter))"#,
+                return __m2_object_name(Vehicle.GetDriver(copter))"#,
             )
             .eval()
             .unwrap();
@@ -6796,7 +6927,7 @@ mod tests {
             .load(
                 r#"Ai.Goal({ AIGuid = Sys.StringToGuid("0x1"), Goal = "HeliLand",
                     Location = { 1, 2, 3 }, Callback = function(me, pilot, result)
-                        heard = { me, Object.GetName(pilot), result } end,
+                        heard = { me, __m2_object_name(pilot), result } end,
                     CallbackData = { "copter" } })"#,
             )
             .exec()

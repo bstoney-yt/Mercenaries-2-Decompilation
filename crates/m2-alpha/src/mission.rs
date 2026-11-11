@@ -324,7 +324,8 @@ const BANNER_TIME: f32 = 10.0;
 
 /// The regions the scripts put on the radar (`Hud.Radar:AddLineRegion`:
 /// the world's boundary, shaded outside, as `WifVzBoundary` draws it),
-/// kept by the region's name in `__m2_radar_regions` for the game HUD,
+/// kept by the region's name (the port's `__m2_object_name`: the scripts'
+/// `Object.GetName` answers a hash) in `__m2_radar_regions` for the game HUD,
 /// which runs the radar in a Lua state of its own. Here the call reaches
 /// no radar (there are no widgets in this state) and goes on as it would.
 const RADAR_REGIONS: &str = r#"
@@ -333,7 +334,7 @@ local radar = Hud and Hud.Radar
 if radar then
     local add, remove = radar.AddLineRegion, radar.RemoveLineRegion
     radar.AddLineRegion = function(self, t)
-        local name = t and t.uGuid and Object.GetName(t.uGuid)
+        local name = t and t.uGuid and __m2_object_name and __m2_object_name(t.uGuid)
         if name then
             __m2_radar_regions[name] = {
                 nRed = t.nRed, nGreen = t.nGreen, nBlue = t.nBlue,
@@ -343,7 +344,7 @@ if radar then
         if add then return add(self, t) end
     end
     radar.RemoveLineRegion = function(self, t)
-        local name = t and t.uGuid and Object.GetName(t.uGuid)
+        local name = t and t.uGuid and __m2_object_name and __m2_object_name(t.uGuid)
         if name then __m2_radar_regions[name] = nil end
         if remove then return remove(self, t) end
     end

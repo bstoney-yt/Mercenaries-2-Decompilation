@@ -3179,7 +3179,7 @@ mod tests {
         m.run(
             r#"
             local me = Player.GetCharacter(1)
-            assert(Object.GetName(me) == "Mattias")
+            assert(__m2_object_name(me) == "Mattias")
             assert(Object.HasLabel(me, "mattias"))
             Object.AddLabel(me, "Scripted")
             "#,
@@ -3190,7 +3190,7 @@ mod tests {
         m.run(
             r#"
             local me = Player.GetCharacter(1)
-            assert(Object.GetName(me) == "Jennifer")
+            assert(__m2_object_name(me) == "Jennifer")
             assert(Pg.GetGuidByName("Jennifer") == me)
             assert(Object.HasLabel(me, "jennifer"))
             assert(not Object.HasLabel(me, "mattias"))
