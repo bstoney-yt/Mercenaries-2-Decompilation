@@ -2774,6 +2774,8 @@ fn run_bench(
     let (mut cpu_all, mut cpu_span) = ([0.0f64; 5], [0.0f64; 5]);
     let (mut gpu_all, mut draws_all, mut draws_span) =
         (m2_render::gpu::timer::GpuTimes::default(), 0u64, 0u64);
+    // Draw commands encoded, every pass counted.
+    let mut commands_all = 0u64;
     let mut next_line = BENCH_EVERY;
     for k in 1..=frames {
         let t = k as f32 * tick;
@@ -2810,6 +2812,7 @@ fn run_bench(
         }
         draws_all += drawn;
         draws_span += drawn;
+        commands_all += backend.take_draw_commands();
         if t >= next_line || k == frames {
             next_line += BENCH_EVERY;
             let gpu = backend.take_gpu_times().unwrap_or_default();
@@ -2850,7 +2853,7 @@ fn run_bench(
     let s = all.summary();
     let n = s.frames.max(1) as f64;
     eprintln!(
-        "bench summary: {} frames, {:.1} fps, 1% low {:.1} fps, p50 {:.1} p99 {:.1} slowest {:.1} ms;          cpu ms a frame {}; gpu {}; {} draws a frame",
+        "bench summary: {} frames, {:.1} fps, 1% low {:.1} fps, p50 {:.1} p99 {:.1} slowest {:.1} ms;          cpu ms a frame {}; gpu {}; {} draws a frame, {} draw commands in all passes",
         s.frames,
         s.fps,
         s.low1,
@@ -2865,6 +2868,7 @@ fn run_bench(
             .join(", "),
         gpu_line(&gpu_all),
         draws_all / n as u64,
+        commands_all / n as u64,
     );
     Ok(())
 }

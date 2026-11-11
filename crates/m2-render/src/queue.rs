@@ -58,6 +58,21 @@ pub struct DrawQueue {
     stage: Stage,
 }
 
+/// A number that is the same for draws of one mesh ([`KeyFields::geometry`]):
+/// its vertex buffer and where its vertices or indices start, mixed.
+fn geometry_bits(call: &crate::DrawCall) -> u16 {
+    let first = match call.geometry {
+        crate::Geometry::Vertices { first, .. } | crate::Geometry::Indexed { first, .. } => first,
+    };
+    let mixed = call
+        .vertex_buffer
+        .0
+        .index
+        .wrapping_mul(0x9E37_79B1)
+        .wrapping_add(first.wrapping_mul(0x85EB_CA6B));
+    (mixed >> 20) as u16
+}
+
 impl DrawQueue {
     pub fn new() -> Self {
         Self::default()
@@ -85,6 +100,7 @@ impl DrawQueue {
                 layer: p.layer,
                 translucent: p.translucent,
                 material: p.call.material,
+                geometry: geometry_bits(&p.call),
                 depth: view.normalized_depth(p.sort_origin),
                 user: p.user,
             });

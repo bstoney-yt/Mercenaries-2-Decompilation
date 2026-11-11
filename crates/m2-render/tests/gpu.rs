@@ -278,6 +278,42 @@ fn nearer_draws_hide_farther_ones() {
     assert_eq!(pixel(&rgba, 2, 2), [0, 255, 0, 255]);
 }
 
+/// Neighbouring draws of one geometry and material go out as one
+/// instanced draw, each still at its own place.
+#[test]
+fn like_neighbours_go_out_as_one_draw() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    let (vb2, ib2) = quad(&mut b);
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            lit: false,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    let small = Mat4::from_scale(Vec3::splat(0.2));
+    let left = Mat4::from_translation(Vec3::new(-1.0, 0.0, 0.0)) * small;
+    let right = Mat4::from_translation(Vec3::new(1.0, 0.0, 0.0)) * small;
+    let frame = |b: &mut WgpuBackend, second: (VertexBufferHandle, IndexBufferHandle)| {
+        let _ = b.take_draw_commands();
+        b.begin_frame(&view()).unwrap();
+        b.draw(&draw(vb, ib, 1, left)).unwrap();
+        b.draw(&draw(second.0, second.1, 1, right)).unwrap();
+        b.end_frame().unwrap();
+        let rgba = b.read_pixels().unwrap();
+        let (white, sky) = ([255; 4], [0, 0, 255, 255]);
+        assert_eq!(pixel(&rgba, 32, 32), sky, "middle");
+        assert_eq!(pixel(&rgba, 14, 32), white, "left");
+        assert_eq!(pixel(&rgba, 50, 32), white, "right");
+        b.take_draw_commands()
+    };
+    let merged = frame(&mut b, (vb, ib));
+    let apart = frame(&mut b, (vb2, ib2));
+    assert!(merged < apart, "{merged} commands merged, {apart} apart");
+}
+
 #[test]
 fn many_draws_grow_the_uniform_buffer() {
     let Some(mut b) = backend() else { return };

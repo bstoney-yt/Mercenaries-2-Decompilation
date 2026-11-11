@@ -385,6 +385,31 @@ struct RecordedDraw {
     caster: Option<Caster>,
 }
 
+/// The draws from `draws[k]` on that go out with it as one instanced draw,
+/// and the instances they make: those straight after it with its
+/// geometry (vertex buffer, indices and range) that `same` passes (its
+/// pipeline and material, as the pass has them), each one's slots
+/// following the last's. Every instance finds its own draw's uniforms by
+/// its slot, so the picture is the same; the GPU is handed one command
+/// in place of several.
+fn run(draws: &[RecordedDraw], k: usize, same: impl Fn(&RecordedDraw) -> bool) -> (usize, u32) {
+    let d = &draws[k];
+    let mut instances = d.instances;
+    let mut merged = 1;
+    for o in &draws[k + 1..] {
+        if o.vertex_buffer != d.vertex_buffer
+            || o.geometry != d.geometry
+            || o.first_slot != d.first_slot + instances
+            || !same(o)
+        {
+            break;
+        }
+        instances += o.instances;
+        merged += 1;
+    }
+    (merged, instances)
+}
+
 /// The depth buffer and its copy for water, with a copy of the colour
 /// drawn before water for it to mirror.
 #[derive(Debug)]
@@ -454,6 +479,9 @@ pub struct WgpuBackend {
     palette_buffer: wgpu::Buffer,
     slot_buffer: wgpu::Buffer,
     draw_group: wgpu::BindGroup,
+    /// Draw commands encoded since last taken
+    /// ([`take_draw_commands`](Self::take_draw_commands)).
+    commands: std::cell::Cell<u64>,
     /// Repeating, then clamping.
     samplers: [wgpu::Sampler; 2],
     white: wgpu::TextureView,
@@ -1039,6 +1067,7 @@ impl WgpuBackend {
             palette_buffer,
             slot_buffer,
             draw_group,
+            commands: std::cell::Cell::new(0),
             samplers,
             white,
             shaders: HashMap::new(),
@@ -1837,16 +1866,33 @@ impl WgpuBackend {
             let mut material_now = None;
             let mut vertices_now = None;
             let mut indices_now = None;
-            for d in draws {
+            // Whether a caster shows in this cascade: in it, and not too
+            // small in it.
+            let shows = |c: &Caster| {
+                c.sphere.is_none_or(|(centre, radius)| {
+                    radius >= cascades.texels[i] * 2.0 && cascades.touches(i, centre, radius)
+                })
+            };
+            let mut next = 0;
+            for (k, d) in draws.iter().enumerate() {
+                if k < next {
+                    continue;
+                }
                 let Some(caster) = &d.caster else {
                     continue;
                 };
-                // Out of this cascade, or too small in it to show.
-                if let Some((centre, radius)) = caster.sphere
-                    && (radius < cascades.texels[i] * 2.0 || !cascades.touches(i, centre, radius))
-                {
+                if !shows(caster) {
                     continue;
                 }
+                let (merged, instances) = run(draws, k, |o| {
+                    o.caster.as_ref().is_some_and(|c| {
+                        c.pipeline == caster.pipeline
+                            && shows(c)
+                            && (!caster.pipeline.masked || o.material == d.material)
+                    })
+                });
+                next = k + merged;
+                self.commands.set(self.commands.get() + 1);
                 if pipeline_now != Some(&caster.pipeline) {
                     pass.set_pipeline(&self.shadow_pipelines[&caster.pipeline]);
                     pipeline_now = Some(&caster.pipeline);
@@ -1871,10 +1917,7 @@ impl WgpuBackend {
                 }
                 match d.geometry {
                     Geometry::Vertices { first, count } => {
-                        pass.draw(
-                            first..first + count,
-                            d.first_slot..d.first_slot + d.instances,
-                        );
+                        pass.draw(first..first + count, d.first_slot..d.first_slot + instances);
                     }
                     Geometry::Indexed {
                         buffer,
@@ -1893,7 +1936,7 @@ impl WgpuBackend {
                         pass.draw_indexed(
                             first..first + count,
                             base_vertex,
-                            d.first_slot..d.first_slot + d.instances,
+                            d.first_slot..d.first_slot + instances,
                         );
                     }
                 }
@@ -1976,10 +2019,19 @@ impl WgpuBackend {
         let mut material_now = None;
         let mut vertices_now = None;
         let mut indices_now = None;
-        for d in draws {
+        let mut next = 0;
+        for (k, d) in draws.iter().enumerate() {
+            if k < next {
+                continue;
+            }
             let Some(pipeline) = self.glow_pipelines.get(&d.pipeline) else {
                 continue;
             };
+            let (merged, instances) = run(draws, k, |o| {
+                o.pipeline == d.pipeline && o.material == d.material
+            });
+            next = k + merged;
+            self.commands.set(self.commands.get() + 1);
             if pipeline_now != Some(&d.pipeline) {
                 pass.set_pipeline(pipeline);
                 pipeline_now = Some(&d.pipeline);
@@ -1999,10 +2051,7 @@ impl WgpuBackend {
             }
             match d.geometry {
                 Geometry::Vertices { first, count } => {
-                    pass.draw(
-                        first..first + count,
-                        d.first_slot..d.first_slot + d.instances,
-                    );
+                    pass.draw(first..first + count, d.first_slot..d.first_slot + instances);
                 }
                 Geometry::Indexed {
                     buffer,
@@ -2021,7 +2070,7 @@ impl WgpuBackend {
                     pass.draw_indexed(
                         first..first + count,
                         base_vertex,
-                        d.first_slot..d.first_slot + d.instances,
+                        d.first_slot..d.first_slot + instances,
                     );
                 }
             }
@@ -2094,11 +2143,20 @@ impl WgpuBackend {
         let mut material_now = None;
         let mut vertices_now = None;
         let mut indices_now = None;
-        for d in draws {
+        let mut next = 0;
+        for (k, d) in draws.iter().enumerate() {
+            if k < next {
+                continue;
+            }
             // Glows draw into the glow layer instead (`encode_glows`).
             if d.pipeline.blend == BlendKind::Additive {
                 continue;
             }
+            let (merged, instances) = run(draws, k, |o| {
+                o.pipeline == d.pipeline && o.material == d.material
+            });
+            next = k + merged;
+            self.commands.set(self.commands.get() + 1);
             if pipeline_now != Some(&d.pipeline) {
                 pass.set_pipeline(&self.pipelines[&d.pipeline]);
                 pipeline_now = Some(&d.pipeline);
@@ -2118,10 +2176,7 @@ impl WgpuBackend {
             }
             match d.geometry {
                 Geometry::Vertices { first, count } => {
-                    pass.draw(
-                        first..first + count,
-                        d.first_slot..d.first_slot + d.instances,
-                    );
+                    pass.draw(first..first + count, d.first_slot..d.first_slot + instances);
                 }
                 Geometry::Indexed {
                     buffer,
@@ -2140,7 +2195,7 @@ impl WgpuBackend {
                     pass.draw_indexed(
                         first..first + count,
                         base_vertex,
-                        d.first_slot..d.first_slot + d.instances,
+                        d.first_slot..d.first_slot + instances,
                     );
                 }
             }
@@ -2854,6 +2909,13 @@ impl WgpuBackend {
 
     /// The GPU time of each frame stage summed since last taken
     /// ([`timer::STAGES`]); `None` where the device has no timestamps.
+    /// The draw commands encoded since last asked, every pass counted:
+    /// fewer than the draws recorded where neighbours went out as one
+    /// instanced draw.
+    pub fn take_draw_commands(&self) -> u64 {
+        self.commands.take()
+    }
+
     pub fn take_gpu_times(&self) -> Option<timer::GpuTimes> {
         self.timer.as_ref().map(timer::GpuTimer::take)
     }

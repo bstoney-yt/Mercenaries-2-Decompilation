@@ -12,12 +12,15 @@
 //! | 63..56 | layer                  | layer                     |
 //! | 55     | 0                      | 1                         |
 //! | 54..39 | material               | inverted depth (54..31)   |
-//! | 38..15 | depth (front to back)  | material (30..15)         |
+//! | 38..27 | geometry               |                           |
+//! | 26..15 | depth (front to back)  | material (30..15)         |
 //! | 14..0  | user tiebreak          | user tiebreak             |
 //!
 //! So within a layer, opaque draws come first and are grouped by material to
-//! cut state changes, then nearest first to help early depth rejection;
-//! translucent draws follow, farthest first so blending composes correctly.
+//! cut state changes, then by geometry, so the copies of one mesh lie
+//! together and the backend can send them as one instanced draw, then
+//! nearest first to help early depth rejection; translucent draws follow,
+//! farthest first so blending composes correctly.
 
 /// Coarse ordering bucket; lower layers draw first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -41,6 +44,9 @@ pub struct MaterialId(pub u32);
 
 const DEPTH_BITS: u32 = 24;
 const DEPTH_MAX: u32 = (1 << DEPTH_BITS) - 1;
+/// Bits of an opaque key's geometry, and of the depth after it.
+const GEOMETRY_BITS: u32 = 12;
+const OPAQUE_DEPTH_BITS: u32 = DEPTH_BITS - GEOMETRY_BITS;
 const USER_BITS: u32 = 15;
 const USER_MAX: u16 = (1 << USER_BITS) - 1;
 
@@ -54,6 +60,9 @@ pub struct KeyFields {
     pub layer: Layer,
     pub translucent: bool,
     pub material: MaterialId,
+    /// Which mesh it draws, for opaque draws: any number that is the
+    /// same for copies of one mesh. Only the low 12 bits are kept.
+    pub geometry: u16,
     /// Normalised view depth, `0.0` at the near plane and `1.0` at the far
     /// plane. Values outside are clamped.
     pub depth: f32,
@@ -70,7 +79,8 @@ impl SortKey {
         let body = if f.translucent {
             (1 << 55) | (u64::from(DEPTH_MAX) - depth) << 31 | material << 15
         } else {
-            material << 39 | depth << 15
+            let geometry = u64::from(f.geometry) & ((1 << GEOMETRY_BITS) - 1);
+            material << 39 | geometry << 27 | (depth >> GEOMETRY_BITS) << 15
         };
         Self(layer | body | user)
     }
@@ -88,13 +98,19 @@ impl SortKey {
         MaterialId(((self.0 >> shift) & 0xFFFF) as u32)
     }
 
-    /// The quantised depth, `0..=2^24-1`.
+    /// The quantised depth, `0..=2^24-1` (an opaque key keeps its top 12
+    /// bits).
     pub fn depth_bits(self) -> u32 {
         if self.is_translucent() {
             DEPTH_MAX - ((self.0 >> 31) as u32 & DEPTH_MAX)
         } else {
-            (self.0 >> 15) as u32 & DEPTH_MAX
+            ((self.0 >> 15) as u32 & ((1 << OPAQUE_DEPTH_BITS) - 1)) << GEOMETRY_BITS
         }
+    }
+
+    /// An opaque key's geometry bits.
+    pub fn geometry(self) -> u16 {
+        ((self.0 >> 27) as u16) & ((1 << GEOMETRY_BITS) - 1)
     }
 
     pub fn user(self) -> u16 {
@@ -117,6 +133,7 @@ mod tests {
             layer,
             translucent,
             material: MaterialId(material),
+            geometry: 0,
             depth,
             user: 0,
         })
@@ -129,13 +146,22 @@ mod tests {
                 layer: Layer::WORLD,
                 translucent,
                 material: MaterialId(0x1234),
+                geometry: 0xABC,
                 depth: 0.5,
                 user: 7,
             });
             assert_eq!(k.layer(), Layer::WORLD);
             assert_eq!(k.is_translucent(), translucent);
             assert_eq!(k.material(), MaterialId(0x1234));
-            assert_eq!(k.depth_bits(), quantize_depth(0.5));
+            let lost = if translucent {
+                0
+            } else {
+                (1 << GEOMETRY_BITS) - 1
+            };
+            assert_eq!(k.depth_bits(), quantize_depth(0.5) & !lost);
+            if !translucent {
+                assert_eq!(k.geometry(), 0xABC);
+            }
             assert_eq!(k.user(), 7);
         }
     }
@@ -154,6 +180,22 @@ mod tests {
     fn opaque_groups_by_material_then_front_to_back() {
         assert!(key(Layer::WORLD, false, 1, 0.9) < key(Layer::WORLD, false, 2, 0.1));
         assert!(key(Layer::WORLD, false, 1, 0.1) < key(Layer::WORLD, false, 1, 0.9));
+    }
+
+    #[test]
+    fn opaque_groups_by_geometry_within_a_material() {
+        let k = |geometry, depth| {
+            SortKey::new(KeyFields {
+                layer: Layer::WORLD,
+                material: MaterialId(1),
+                geometry,
+                depth,
+                ..KeyFields::default()
+            })
+        };
+        // Copies of one mesh lie together whatever their depths.
+        assert!(k(1, 0.9) < k(2, 0.1));
+        assert!(k(1, 0.1) < k(1, 0.9));
     }
 
     #[test]
