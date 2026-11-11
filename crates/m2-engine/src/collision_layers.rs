@@ -158,8 +158,18 @@ impl Preset {
     /// loose for 1 alone, and 0x821831B0 keeps that (+0x132) for the prop
     /// builder 0x8218EBF8, which then takes preset 2 for 1. Its first check
     /// passes on a global that is 1 unless a setting clears it (0x82B7D8BC,
-    /// 0x822193D8), and its second on a run-time flag (0x82DE698D, 0 at
-    /// start; inferred 0 in the game alone).
+    /// 0x822193D8), and its second on a session flag that is 0 in the
+    /// game alone (0x82DE698D: byte 1 of a block 0x82469508 fills, set
+    /// only with a network session whose +8 is set and, by 0x8246A940,
+    /// another player in one of its slots).
+    ///
+    /// A `_DebrisPhysics` object, with no `_PropPhysics` record (0x8218EDA0
+    /// gives 3), is loose by a record of its own physics (0x82187CA0: bit
+    /// 0x10 of its +0x18 byte, or either of two properties of its owner,
+    /// 0x823DA3C8 with 0x71246D6D or 0x9B6005C0), or without that record
+    /// when its `PhysicsActor` (store 0x836571D4) is of kind 0xE. Which
+    /// records those are isn't traced, so a debris template takes the
+    /// prop preset ([`crate::durability::presets`]).
     pub fn of_prop(mass: f32, heavy: bool) -> Self {
         if mass == 0.0 || heavy {
             Self::Prop
