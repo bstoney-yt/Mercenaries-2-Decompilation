@@ -188,6 +188,8 @@ pub enum Command {
         position: [f32; 3],
         yaw: f32,
     },
+    /// What the natives of [crate::ported_player] ask of the game.
+    Ported(crate::ported_player::PortedCommand),
     Remove(u32),
     Kill(u32),
     Move {
@@ -760,6 +762,10 @@ pub struct ScriptWorld {
     pub landing_zones: HashMap<i64, BTreeMap<i64, u32>>,
     /// Cargo on winches: what carries each, `None` once let go.
     pub winch: HashMap<u32, Option<u32>>,
+    /// `Player.SetWaitForInGame`: the player waits for the game proper.
+    pub wait_for_in_game: bool,
+    /// Places people kept by `Human.PersistTransform`: place and yaw.
+    pub persisted: HashMap<u32, ([f32; 3], f32)>,
     /// What the scripts want on the player's screen.
     pub hud: crate::hud::Hud,
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
@@ -1668,6 +1674,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     };
 
     crate::airstrike::install(&lib("Airstrike")?, &add)?;
+    crate::ported_player::install(&lib, &add)?;
     crate::shop::install(lua, &lib("Hud")?)?;
 
     // A string's hash, as the scripts key tables by name (their recruits'
