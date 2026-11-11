@@ -4991,6 +4991,44 @@ impl Physics {
         v.rotor.as_ref().map(|r| r.state.ground <= 0.5)
     }
 
+    /// Whether a vehicle stands on the ground as the 360's
+    /// `ObjectIsGrounded` test has it (0x82354AE8, by its physics kind):
+    /// a helicopter once on something over half a second (its rotor's
+    /// ground time, the 360's +0x140 object's +0x4C, over 0.5); a car
+    /// (`_CarPhysicsV2`, kind 2: its vtable +0x134, 0x82189A68) when a
+    /// wheel touches this step (0x8219C338 counts the wheels whose contact
+    /// timer, +0x0, 0x8219F510 just set back to 0.4 for a wheel with
+    /// contacts, +0x34; here a wheel's ray in contact); anything else
+    /// (tanks, boats, jets) always. `None` for no vehicle.
+    pub fn vehicle_grounded(&self, id: VehicleId, car: bool) -> Option<bool> {
+        let v = self.vehicles.get(id.0).and_then(Option::as_ref)?;
+        if let Some(r) = v.rotor.as_ref() {
+            return Some(r.state.ground > 0.5);
+        }
+        if !car {
+            return Some(true);
+        }
+        Some(
+            v.controller
+                .wheels()
+                .iter()
+                .any(|w| w.raycast_info().is_in_contact),
+        )
+    }
+
+    /// `Vehicle.IsFlipped` (0x82348358, the physics object's vtable
+    /// +0x9C): only a car flips (0x82189A00: its up axis's world height
+    /// under 0.5, 0x820D9EDC, and no wheel touching, as
+    /// [`vehicle_grounded`](Self::vehicle_grounded)); boats, helicopters
+    /// and tanks never (0x828280B0). `None` for no vehicle.
+    pub fn vehicle_flipped(&self, id: VehicleId, car: bool) -> Option<bool> {
+        let up = self
+            .vehicle_transform(id)?
+            .transform_vector3(Vec3::Y)
+            .normalize_or_zero();
+        Some(car && up.y < 0.5 && !self.vehicle_grounded(id, true)?)
+    }
+
     /// Hands a helicopter's stick to an AI (`true`) or back to the
     /// player: with an AI it flies by its `_HelicopterPhysicsAi` record,
     /// as the 360 code picks it for one the player does not fly
@@ -7522,6 +7560,38 @@ mod tests {
         };
         assert!(ramp(30.0) > 3.0, "30 degrees should be climbable");
         assert!(ramp(65.0) < 1.5, "65 degrees should not be");
+    }
+
+    #[test]
+    fn a_car_on_its_wheels_is_grounded_and_on_its_roof_flipped() {
+        // 0x82189A68 / 0x82189A00: grounded with a wheel touching; flipped
+        // with its up axis under 0.5 high and none touching.
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let upright = p.add_vehicle(&car(), Vec3::new(0.0, 0.5, 0.0), 0.0);
+        let roof = p.add_vehicle_turned(
+            &car(),
+            Vec3::new(20.0, 2.0, 0.0),
+            Quat::from_rotation_z(std::f32::consts::PI),
+        );
+        let high = p.add_vehicle(&car(), Vec3::new(-20.0, 50.0, 0.0), 0.0);
+        for _ in 0..30 {
+            p.step(1.0 / 60.0);
+        }
+        assert_eq!(p.vehicle_grounded(upright, true), Some(true));
+        assert_eq!(p.vehicle_flipped(upright, true), Some(false));
+        assert_eq!(p.vehicle_grounded(roof, true), Some(false));
+        assert_eq!(p.vehicle_flipped(roof, true), Some(true));
+        assert_eq!(p.vehicle_grounded(high, true), Some(false));
+        // Anything not a car stands on the ground and never flips.
+        assert_eq!(p.vehicle_grounded(high, false), Some(true));
+        assert_eq!(p.vehicle_flipped(roof, false), Some(false));
     }
 
     fn car() -> VehicleSpec {
