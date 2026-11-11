@@ -2081,6 +2081,29 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         };
         values([Value::Boolean(inside)])
     })?;
+    // From the 360 code (`Pg.IsPointInBoundary(x, y, z, boundary)`,
+    // 0x82337828): a point, then the boundary object; the answer is
+    // whether the boundary's shape holds the point (false when it has
+    // none). The 360 tests only two kinds of shape there (kinds 2 and 4 of
+    // the shape record); which of the regions read here those are isn't
+    // established, so every region is tested (inferred). A bad argument
+    // is the usual argument error (nil here). GurCon001 asks whether the
+    // jammer is in `LR_TowerBase`.
+    add(&pg, "IsPointInBoundary", |w, _, a| {
+        let Some((p, next)) = place_arg(w, a, 0) else {
+            return values([Value::Nil]);
+        };
+        let Some(boundary) = id(a.get(next)) else {
+            return values([Value::Nil]);
+        };
+        let inside = match (w.regions.get(&boundary), w.objects.get(&boundary)) {
+            (Some(region), Some(at)) => {
+                region.contains([at.position[0], at.position[2]], at.yaw, p[0], p[2])
+            }
+            _ => false,
+        };
+        values([Value::Boolean(inside)])
+    })?;
     add(&object, "IsAlive", |w, _, a| {
         values([Value::Boolean(id(a.first()).is_some_and(|g| w.is_alive(g)))])
     })?;
@@ -5760,6 +5783,34 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((orig, copy, players), (2, 1, true));
+    }
+
+    #[test]
+    fn a_point_is_tested_against_a_boundarys_region() {
+        // GurCon001: Pg.IsPointInBoundary(nX, nY, nZ, LR_TowerBase).
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(70, Object::new("LR_TowerBase", [100.0, 0.0, 100.0]));
+            w.regions.insert(
+                70,
+                m2_assets::Region {
+                    flags: 0x0004_0002,
+                    unk_0x04: 0,
+                    corners: vec![[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]],
+                },
+            );
+        }
+        let (inside, outside, no_region, bad): (bool, bool, bool, Value) = host
+            .lua()
+            .load(
+                "return Pg.IsPointInBoundary(103, 0, 98, 70), Pg.IsPointInBoundary(120, 0, 100, 70),
+                   Pg.IsPointInBoundary(103, 0, 98, 50), Pg.IsPointInBoundary(103, 0, 98)",
+            )
+            .eval()
+            .unwrap();
+        assert!(inside && !outside && !no_region);
+        assert!(bad.is_nil());
     }
 
     #[test]
