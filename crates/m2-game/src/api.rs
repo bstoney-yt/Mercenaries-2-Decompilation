@@ -225,6 +225,39 @@ pub enum Command {
     },
     Remove(u32),
     Kill(u32),
+    /// `Object.Revive(object, fraction)`: back in play, at that share of
+    /// its most health.
+    Revive {
+        guid: u32,
+        health: f32,
+    },
+    /// `Object.ApplyImpulse`: a push in world space.
+    Impulse {
+        guid: u32,
+        impulse: [f32; 3],
+    },
+    /// `Player.SetScopeEnabled`: whether she may use a scope now.
+    ScopeEnabled(bool),
+    /// `Human.SetFireLock`: whether the person may not fire.
+    FireLock {
+        guid: u32,
+        on: bool,
+    },
+    /// `Sound.SetMasterVolume(volume, seconds)`.
+    MasterVolume {
+        volume: f32,
+        seconds: f32,
+    },
+    /// `Camera.SetYaw`: the camera turned to this yaw (radians).
+    CameraYaw(f32),
+    /// `ObjectState.StartEmitter` / `StopEmitter`: an emitter of an
+    /// object's state, by the two name hashes the scripts give.
+    Emitter {
+        guid: u32,
+        state: u32,
+        emitter: u32,
+        on: bool,
+    },
     Move {
         guid: u32,
         position: [f32; 3],
@@ -811,6 +844,9 @@ pub struct ScriptWorld {
     pub feelings: HashMap<(u32, u32), f32>,
     /// The last goal handle `Ai.Goal` gave out.
     pub goal_handles: u32,
+    /// How many reasons the scripts gave for her scope to be off
+    /// (`Player.SetScopeEnabled`); she may use it at 0.
+    pub scope_off: u32,
     /// What the scripts want on the player's screen.
     pub hud: crate::hud::Hud,
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
@@ -1748,6 +1784,161 @@ impl crate::heliwaves::WaveWorld for ScriptWorld {
             .filter(|o| o.alive)
             .map(|o| o.position)
     }
+}
+
+type Native = fn(&mut ScriptWorld, &Lua, &[Value]) -> mlua::Result<MultiValue>;
+
+/// Natives ported from the 360 code one by one (the PMC thread's share of
+/// the gap list), each with its function's address.
+fn install_ported(
+    lib: &dyn Fn(&str) -> mlua::Result<Table>,
+    add: &dyn Fn(&Table, &str, Native) -> mlua::Result<()>,
+) -> mlua::Result<()> {
+    let object = lib("Object")?;
+    // Object.Revive(object, fraction) (0x823300f8): its health back to
+    // `fraction` (1 when left out) of its most, kept between 0 and the
+    // most; out of the destroyed state; true, or nil for no object.
+    add(&object, "Revive", |w, _, a| {
+        let Some(guid) = id(a.first()) else {
+            return values([Value::Nil]);
+        };
+        let fraction = num(a.get(1)).unwrap_or(1.0);
+        let Some(o) = w.objects.get_mut(&guid) else {
+            return values([Value::Nil]);
+        };
+        let health = (o.max_health * fraction).min(o.max_health).max(0.0);
+        o.health = health;
+        o.alive = true;
+        w.commands.push(Command::Revive { guid, health });
+        values([Value::Boolean(true)])
+    })?;
+    // Object.ApplyImpulse(object, x, y, z, local) (0x82331638): a push on
+    // its physics body; with `local` true the push is turned by the
+    // object's own facing first. True, or nil for no body.
+    add(&object, "ApplyImpulse", |w, _, a| {
+        let Some(guid) = id(a.first()) else {
+            return values([Value::Nil]);
+        };
+        let Some((push, next)) = place_arg(w, a, 1) else {
+            return values([Value::Nil]);
+        };
+        let local = matches!(a.get(next), Some(Value::Boolean(true)));
+        let Some(o) = w.objects.get(&guid) else {
+            return values([Value::Nil]);
+        };
+        let impulse = if local {
+            let (s, c) = o.yaw.sin_cos();
+            [
+                push[0] * c + push[2] * s,
+                push[1],
+                push[2] * c - push[0] * s,
+            ]
+        } else {
+            push
+        };
+        w.commands.push(Command::Impulse { guid, impulse });
+        values([Value::Boolean(true)])
+    })?;
+
+    let player = lib("Player")?;
+    // Player.GetPlayer(number) (0x8233e2c0): the player in that slot, nil
+    // for an empty one. One player here, in slot 0, guid 1.
+    add(&player, "GetPlayer", |_, _, a| {
+        let Some(n) = num(a.first()) else {
+            return values([Value::Nil]);
+        };
+        values([guid_value((n == 0.0).then_some(1))])
+    })?;
+    // Player.IsRemote(number) (0x8233e610): whether that player plays on
+    // another machine; never alone.
+    add(&player, "IsRemote", |_, _, a| {
+        if num(a.first()).is_none() {
+            return values([Value::Nil]);
+        }
+        values([Value::Boolean(false)])
+    })?;
+    // Player.SetScopeEnabled(player, on) (0x82340030): a count of reasons
+    // the scope is off, one more for each false, one fewer (not below 0)
+    // for each true; she may use it at 0. True, nil for bad arguments.
+    add(&player, "SetScopeEnabled", |w, _, a| {
+        let (Some(_), Some(Value::Boolean(on))) = (id(a.first()), a.get(1)) else {
+            return values([Value::Nil]);
+        };
+        let was = w.scope_off == 0;
+        w.scope_off = if *on {
+            w.scope_off.saturating_sub(1)
+        } else {
+            w.scope_off + 1
+        };
+        if was != (w.scope_off == 0) {
+            w.commands.push(Command::ScopeEnabled(w.scope_off == 0));
+        }
+        values([Value::Boolean(true)])
+    })?;
+
+    let human = lib("Human")?;
+    // Human.SetFireLock(person, on) (0x82325498): whether the person may
+    // not fire; true, nil for bad arguments.
+    add(&human, "SetFireLock", |w, _, a| {
+        let (Some(guid), Some(Value::Boolean(on))) = (id(a.first()), a.get(1)) else {
+            return values([Value::Nil]);
+        };
+        w.commands.push(Command::FireLock { guid, on: *on });
+        values([Value::Boolean(true)])
+    })?;
+
+    let sound = lib("Sound")?;
+    // Sound.SetMasterVolume(volume, seconds) (0x82343fb8): both numbers
+    // needed (nil else); answers nothing.
+    add(&sound, "SetMasterVolume", |w, _, a| {
+        let (Some(volume), Some(seconds)) = (num(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        w.commands.push(Command::MasterVolume { volume, seconds });
+        values([])
+    })?;
+
+    let camera = lib("Camera")?;
+    // Camera.SetYaw(camera, degrees) (0x82316ba8): the camera turned
+    // (degrees, as every angle the scripts pass); true when there is such
+    // a camera (here: a known holder), nil for bad arguments.
+    add(&camera, "SetYaw", |w, _, a| {
+        let (Some(holder), Some(degrees)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let known = w.objects.contains_key(&holder);
+        if known {
+            w.commands.push(Command::CameraYaw(degrees.to_radians()));
+        }
+        values([Value::Boolean(known)])
+    })?;
+
+    let state = lib("ObjectState")?;
+    // ObjectState.StartEmitter / StopEmitter(object, state, emitter)
+    // (0x823341f0, 0x82334298): the two names as hashes; nothing back,
+    // nil for bad arguments.
+    fn emitter(w: &mut ScriptWorld, a: &[Value], on: bool) -> mlua::Result<MultiValue> {
+        let hash = |v: Option<&Value>| match v {
+            Some(Value::String(s)) => Some(m2_assets::name_hash(&s.to_string_lossy())),
+            Some(Value::Integer(i)) => Some(*i as u32),
+            _ => None,
+        };
+        let (Some(guid), Some(state), Some(emitter)) =
+            (id(a.first()), hash(a.get(1)), hash(a.get(2)))
+        else {
+            return values([Value::Nil]);
+        };
+        w.commands.push(Command::Emitter {
+            guid,
+            state,
+            emitter,
+            on,
+        });
+        values([])
+    }
+    add(&state, "StartEmitter", |w, _, a| emitter(w, a, true))?;
+    add(&state, "StopEmitter", |w, _, a| emitter(w, a, false))?;
+    Ok(())
 }
 
 fn guid_value(g: Option<u32>) -> Value {
@@ -4101,6 +4292,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     // Developer switches: skip to a mission (off unless asked for), and
     // force a new game (off).
+    install_ported(&lib, &add)?;
     let sys = lib("Sys")?;
     // The game shows its tutorial tips, unless the player turned them off.
     add(&sys, "TutorialsEnabled", |w, _, _| {
@@ -6903,6 +7095,85 @@ mod tests {
             Value::Boolean(true)
         );
         assert!(ask("return Sys.SetAssetRequestMax()").is_nil());
+    }
+
+    #[test]
+    fn ported_natives_follow_the_360_code() {
+        let (host, world) = setup();
+        world.borrow_mut().take_commands();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        // Revive: half her most health, back alive.
+        lua.load("Object.Kill(50)").exec().unwrap();
+        assert_eq!(ask("return Object.Revive(50, 0.5)"), Value::Boolean(true));
+        {
+            let w = world.borrow();
+            assert!(w.objects[&50].alive);
+            assert_eq!(w.objects[&50].health, w.objects[&50].max_health * 0.5);
+        }
+        assert!(ask("return Object.Revive(999)").is_nil());
+        // ApplyImpulse: world space, or turned by its facing.
+        world.borrow_mut().objects.get_mut(&50).unwrap().yaw = std::f32::consts::FRAC_PI_2;
+        assert_eq!(
+            ask("return Object.ApplyImpulse(50, 0, 0, 10, true)"),
+            Value::Boolean(true)
+        );
+        assert!(ask("return Object.ApplyImpulse(999, 0, 0, 10)").is_nil());
+        // Players: one, in slot 0, never remote.
+        assert_eq!(
+            ask("return Player.GetPlayer(0) == Player.GetLocalPlayer()"),
+            Value::Boolean(true)
+        );
+        assert!(ask("return Player.GetPlayer(1)").is_nil());
+        assert_eq!(ask("return Player.IsRemote(0)"), Value::Boolean(false));
+        // The scope: off twice, on once, still off; on again, on.
+        lua.load(
+            "local p = Player.GetLocalPlayer()
+             Player.SetScopeEnabled(p, false) Player.SetScopeEnabled(p, false)
+             Player.SetScopeEnabled(p, true)",
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(world.borrow().scope_off, 1);
+        assert_eq!(
+            ask("return Player.SetScopeEnabled(Player.GetLocalPlayer(), true)"),
+            Value::Boolean(true)
+        );
+        assert_eq!(world.borrow().scope_off, 0);
+        assert_eq!(
+            ask("return Human.SetFireLock(50, true)"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            ask("return select('#', Sound.SetMasterVolume(0.5, 2))"),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            ask("return Camera.SetYaw(Player.GetCamera(), 90)"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            ask("return select('#', ObjectState.StartEmitter(50, 'Burning', 'fire'))"),
+            Value::Integer(0)
+        );
+        let commands = world.borrow_mut().take_commands();
+        let impulse = commands.iter().find_map(|c| match c {
+            Command::Impulse { impulse, .. } => Some(*impulse),
+            _ => None,
+        });
+        let i = impulse.unwrap();
+        assert!((i[0] - 10.0).abs() < 1e-4 && i[2].abs() < 1e-4, "{i:?}");
+        assert!(commands.contains(&Command::ScopeEnabled(false)));
+        assert!(commands.contains(&Command::ScopeEnabled(true)));
+        assert!(commands.iter().any(|c| matches!(c, Command::CameraYaw(y) if (*y - std::f32::consts::FRAC_PI_2).abs() < 1e-5)));
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            Command::Emitter {
+                guid: 50,
+                on: true,
+                ..
+            }
+        )));
     }
 
     #[test]
