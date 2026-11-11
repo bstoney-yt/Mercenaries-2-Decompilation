@@ -1708,14 +1708,6 @@ impl Player {
         self.camera(physics);
     }
 
-    /// Whether she takes off now, jump `pressed` this tick. A jump is a
-    /// whole-body action (the action table's `Upright` `JUMP` row is
-    /// `FullBody`): she takes off again only once the last one is over,
-    /// landing and all. Spammed, a press used to launch her again while
-    /// still on the ground 0.08 s into the jump (29 take-offs in 3 s on
-    /// the run), or a moment after touching down, cutting the landing
-    /// short (playtest 8). A press while she lands is kept for its end.
-    /// Inferred from the table and the clips; the 360 code was not read.
     /// One step of the jump's start, as the 360 runs it
     /// ([`m2_engine::human_state`]): the press posts `JumpMoving` or
     /// `JumpStationary` (by `stick_sq`, the squared length of the stick's
@@ -1735,6 +1727,8 @@ impl Player {
         let mut windup_started = None;
         let mut launch = false;
         if self.takes_off(pressed, bashing) {
+            // Whatever cut the last jump short, she starts from the idle.
+            self.human = HumanState::default();
             let message = human_state::jump_message(stick_sq);
             let states = self.moves.states.clone();
             let posted = states
@@ -1774,6 +1768,14 @@ impl Player {
         (windup_started, launch)
     }
 
+    /// Whether she takes off now, jump `pressed` this tick. A jump is a
+    /// whole-body action (the action table's `Upright` `JUMP` row is
+    /// `FullBody`): she takes off again only once the last one is over,
+    /// landing and all. Spammed, a press used to launch her again while
+    /// still on the ground 0.08 s into the jump (29 take-offs in 3 s on
+    /// the run), or a moment after touching down, cutting the landing
+    /// short (playtest 8). A press while she lands is kept for its end.
+    /// Inferred from the table and the clips; the 360 code was not read.
     fn takes_off(&mut self, pressed: bool, bashing: bool) -> bool {
         if pressed && matches!(self.leap, Leap::Land(..)) {
             self.jump_queued = true;
