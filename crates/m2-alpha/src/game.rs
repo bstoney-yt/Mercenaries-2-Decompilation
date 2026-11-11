@@ -1810,6 +1810,7 @@ impl Game {
                 &self.scene.vehicles,
                 driven,
                 &self.assaults,
+                dt,
             );
             // A pursuit's gunships, at her.
             if let Some(p) = self.scene.player.as_ref() {
