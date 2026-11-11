@@ -3972,4 +3972,38 @@ mod tests {
         m.tick(0.1);
         assert_eq!(skipped(&m), 1);
     }
+
+    /// What a button event passes after its data, as the 360's arguments
+    /// slot (0x823576f8) does: the pad, the button's name, "press";
+    /// "rtrigger" adds "lbutton" (its case runs on), "lsleft" has no name.
+    #[test]
+    fn a_button_event_passes_pad_name_and_mode() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            got = {}
+            local function note(...) got[#got + 1] = table.concat({ ... }, " ") end
+            local p = Player.GetLocalPlayer()
+            Event.Create(Event.Button, { p, "cancel", "press", true }, note, { "fanfare" })
+            Event.Create(Event.Button, { p, "rtrigger", "press", true }, note)
+            Event.Create(Event.Button, { p, "lsleft", "press", true }, note)
+            "#,
+            "test",
+        )
+        .unwrap();
+        m.tick(0.1);
+        for b in ["cancel", "rtrigger", "lsleft"] {
+            m.press_button(b);
+            m.tick(0.1);
+        }
+        let got: Vec<String> = m.host.lua().globals().get("got").unwrap();
+        assert_eq!(
+            got,
+            [
+                "fanfare 0 cancel press",
+                "0 rtrigger lbutton press",
+                "0 press"
+            ]
+        );
+    }
 }
