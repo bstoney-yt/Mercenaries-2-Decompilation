@@ -11,8 +11,15 @@
 //!   (0x824461D8; defaults 0x820BB1F8, 0x820BAEEC, 0x820BAFA8).
 //! - **Who sees her** (block [7..], at most 8, 0x82445EC8): an AI sensing
 //!   her within block [1] (0x822DF988) adds itself, or refreshes its
-//!   entry, with a value and 3 s on its timer (0x820C7A20); a full list
-//!   gives up the entry with the largest value. An entry runs out after
+//!   entry, with its sensing record's +0x5C (her distance, 3D) and 3 s
+//!   on its timer (0x820C7A20); a full list gives up the entry farthest
+//!   off, or, every entry at 0, doesn't take the newcomer. The AI side
+//!   (0x822DF988) offers only a person's record sensed within 0.5 s
+//!   (+0x8C), seen (+0x70 above 0), within block [1] (+0x39C), and not a
+//!   civilian (+0x17DC bit 0, a `Civ` mind) or one gated by +0xFF0/+0xFF4;
+//!   after the offer it raises event 0x4E1A2D0D at 50 (and sets the
+//!   mind's +0x17DD bit 0x20) while she is disguised with disguises on,
+//!   else 0x2E16ACCD while block [6] (player +0x3B0) is under 5 s. An entry runs out after
 //!   its 3 s (0x824460F8) and goes when the AI's sense of her resets
 //!   (0x82446008). Each coming and going is told to the script callback at
 //!   0x83134548 (0x82446790: the player, the AI, whether it came): the
@@ -28,18 +35,16 @@
 //!     can't fill; else, free to fill and short of 100, it fills 100 / [2]
 //!     a second. At 100 she is disguised (flag 0x40); at 0 she isn't and
 //!     can't fill. Kept to 0..100.
-//!   - How long she has been disguised (block [6]) counts up to 5 s, and
-//!     back to 0 as it ends.
+//!   - Block [6] (player +0x3B0) counts up to 5 s each tick and back to
+//!     0 as the disguise ends: seconds since it last ended.
 //!   - A change of disguise calls the `Player.VehicleDisguise` callback
 //!     (0x824466A8) and has every AI look at her afresh.
 //! - **Getting in** (0x824461D8 -> 0x82446568): the gauge starts from 0,
 //!   free to fill, unless the player is marked in the table at
 //!   0x831342A8 +0x3CE4 (its entry's +0x4C), when she starts undisguised.
 //!
-//! Not settled (inferred or left out): the entry's value is what the AI
-//! sensing passes (read as her distance, not confirmed), so what the
-//! under-30 test means; the extra gate in 0x822DF988 (AI +0x17DC bit 0,
-//! +0xFF0/+0xFF4: many writers, not traced); what marks the player in
+//! Not settled (inferred or left out): what the AI's +0xFF0/+0xFF4 gate
+//! means; what marks the player in
 //! 0x831342A8 +0x3CE4. The callback's latch (+0x438) is cleared only by
 //! the reset on getting in (0x82445648).
 
@@ -101,8 +106,9 @@ pub struct VehicleDisguise {
     pub grace: f32,
     /// The gauge, 0..=100 (block [5]).
     pub level: f32,
-    /// Seconds disguised, up to 5 (block [6]).
-    pub held_for: f32,
+    /// Seconds since the disguise last ended, up to 5 (block [6], player
+    /// +0x3B0): counts up each tick, back to 0 as it ends.
+    pub since_ended: f32,
     pub watchers: Vec<Watcher>,
     /// Flag 0x20: the gauge may fill.
     pub may_fill: bool,
@@ -149,13 +155,17 @@ impl VehicleDisguise {
                 return out;
             }
             None => {
-                // The one with the largest value gives way.
-                let (i, w) = self
+                // The one with the largest value (above 0) gives way; with
+                // none above 0 the newcomer isn't taken.
+                let Some((i, w)) = self
                     .watchers
                     .iter()
                     .enumerate()
+                    .filter(|(_, w)| w.value > 0.0)
                     .max_by(|a, b| a.1.value.total_cmp(&b.1.value))
-                    .expect("full");
+                else {
+                    return out;
+                };
                 out.push(DisguiseEvent::Watcher {
                     who: w.who,
                     came: false,
@@ -254,12 +264,12 @@ impl VehicleDisguise {
                 i += 1;
             }
         }
-        if self.held_for < 5.0 {
-            self.held_for += dt;
+        if self.since_ended < 5.0 {
+            self.since_ended += dt;
         }
         if self.disguised != was {
             if !self.disguised {
-                self.held_for = 0.0;
+                self.since_ended = 0.0;
             }
             out.push(DisguiseEvent::Changed(self.disguised));
             out.push(DisguiseEvent::LookAgain);
@@ -331,7 +341,7 @@ mod tests {
         for who in 0..8 {
             d.sighted(who, who as f32 * 5.0);
         }
-        // Full: the one valued highest (7, at 35) gives way.
+        // Full: the one farthest off (7, at 35) gives way.
         let out = d.sighted(100, 1.0);
         assert_eq!(
             out,
@@ -347,6 +357,13 @@ mod tests {
             ]
         );
         assert_eq!(d.watchers.len(), MAX_WATCHERS);
+        // Full with every entry at 0: no newcomer.
+        let mut z = VehicleDisguise::default();
+        for who in 0..8 {
+            z.sighted(who, 0.0);
+        }
+        assert!(z.sighted(50, 5.0).is_empty());
+        assert!(!z.watchers.iter().any(|w| w.who == 50));
         assert_eq!(
             d.forget(3),
             [DisguiseEvent::Watcher {
