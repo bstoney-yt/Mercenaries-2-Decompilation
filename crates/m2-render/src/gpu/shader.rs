@@ -167,7 +167,8 @@ struct Draw {
     // x: first palette matrix, y: palette length (0: not skinned),
     // z: first instance matrix, w: instance count (0: not instanced)
     skin: vec4<u32>,
-    // xy: added to the texture coordinates (scrolling textures)
+    // xy: added to the texture coordinates (scrolling textures), z: its
+    // beams shine whatever the hour
     uv: vec4<f32>,
     // Multiplies the surface's colour and alpha (a marker model's colour)
     tint: vec4<f32>,
@@ -244,6 +245,8 @@ struct Varyings {
     @location(5) haze: vec4<f32>,
     // The draw's tint (see `Draw`)
     @location(6) tint: vec4<f32>,
+    // Its beams shine whatever the hour (see `Draw`)
+    @location(7) @interpolate(flat) beams_lit: f32,
 };
 "#;
 
@@ -950,7 +953,7 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
         let facing = abs(dot(normalize(v.normal), normalize(frame.eye.xyz - v.world_pos)));
         alpha = alpha * facing * facing;
     }
-    if material.direct.w > 0.5 {
+    if material.direct.w > 0.5 && v.beams_lit < 0.5 {
         alpha = alpha * frame.surface.y;
     }
     // The draw's tint over all of it, its own light too.
@@ -1219,6 +1222,7 @@ fn place(v: VertexIn, instance: u32) -> Varyings {{
     out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
     out.haze = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     out.tint = draw.tint;
+    out.beams_lit = draw.uv.z;
     return out;
 }}
 

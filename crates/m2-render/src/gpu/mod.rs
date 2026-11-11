@@ -2758,7 +2758,7 @@ impl RenderBackend for WgpuBackend {
         uniforms.extend_from_slice(bytemuck::cast_slice(&[
             call.uv_offset[0],
             call.uv_offset[1],
-            0.0,
+            if call.beams_lit { 1.0 } else { 0.0 },
             0.0,
         ]));
         uniforms.extend_from_slice(bytemuck::cast_slice(&call.tint));

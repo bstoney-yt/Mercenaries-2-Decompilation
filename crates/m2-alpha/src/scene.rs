@@ -3774,6 +3774,8 @@ impl Scene {
                 continue;
             };
             model.tint = m.tint();
+            // A ring's material is a beam's: lit by day too.
+            model.beams_lit = true;
             if m.width.is_none() {
                 // In its bind pose: nothing of it moves.
                 model.draw(queue, m.world());
@@ -3821,6 +3823,7 @@ impl Scene {
                 instances: None,
                 uv_offset: [0.0; 2],
                 tint: [1.0; 4],
+                beams_lit: false,
             },
             layer: Layer::WORLD,
             translucent: false,
@@ -4080,6 +4083,7 @@ impl Effects {
                 instances: None,
                 uv_offset: [0.0; 2],
                 tint: [1.0; 4],
+                beams_lit: false,
             },
             layer: Layer::WORLD,
             translucent,

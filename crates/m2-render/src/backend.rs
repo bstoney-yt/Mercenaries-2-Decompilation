@@ -70,6 +70,10 @@ pub struct DrawCall {
     /// Multiplies the surface's colour and alpha (`[1.0; 4]`: as it is):
     /// a marker model's colour, as the scripts give it.
     pub tint: [f32; 4],
+    /// A beam material on it shines whatever the hour: the searchlights'
+    /// beams follow the night ([`Lighting::beam_gain`]), and a race's ring,
+    /// drawn with the same kind of material, must not.
+    pub beams_lit: bool,
 }
 
 /// How many [`PointLight`]s a frame draws (the game's shaders take 8).
