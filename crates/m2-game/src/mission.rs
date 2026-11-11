@@ -763,6 +763,7 @@ impl Mission {
         let events = Events::default();
         events.install(host.lua())?;
         crate::hijack::install(&host, &world)?;
+        crate::vehicle_state::install(&host, &world)?;
         host.install_library(Rc::clone(&library), true)?;
         // The contracts' own globals read nil while unset, as in the game,
         // not stubs: every global a contract's or job's script assigns.
