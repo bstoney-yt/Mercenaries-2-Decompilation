@@ -519,10 +519,17 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
         else {
             return Ok(MultiValue::from_vec(vec![Value::Nil, Value::Nil]));
         };
+        // From the 360 code (`Object.Attach(parent, bone, child)`,
+        // 0x82332750): a template's id makes a new object from it (the
+        // hijacks' "attaching pistol": they keep the guid it answers); an
+        // object in play is attached itself. Either way it answers true and
+        // the attached object.
+        let template = (crate::api::FIRST_TEMPLATE..crate::api::FIRST_SPAWNED).contains(&child);
         let name = w.objects.get(&child).map(|o| o.name.clone());
         let at = w.objects.get(&parent).map(|o| o.position);
         let prop = match (name, at) {
-            (Some(name), Some(at)) => Some(w.spawn(name, at, 0.0)),
+            (Some(name), Some(at)) if template => Some(w.spawn(name, at, 0.0)),
+            (Some(_), Some(_)) => Some(child),
             _ => None,
         };
         if let Some(prop) = prop {
