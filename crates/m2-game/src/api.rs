@@ -3136,10 +3136,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&ai, "Deploy", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
-            return values([]);
+            return values([Value::Boolean(false)]);
         };
         let Some(vehicle) = id(t.raw_get::<Value>("Vehicle").ok().as_ref()) else {
-            return values([]);
+            return values([Value::Boolean(false)]);
         };
         let passengers = matches!(
             t.raw_get::<Value>("Role")?,
@@ -3173,7 +3173,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             let data = t.raw_get::<Value>("CallbackData")?;
             w.asset_loads.push((f, data));
         }
-        values([])
+        // From the 360 code (0x82311ed0): true once it has a vehicle, false
+        // without one (or without a table).
+        values([Value::Boolean(true)])
     })?;
     add(&ai, "Goal", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
@@ -3602,7 +3604,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             raw(a.get(1))
         ));
         w.commands.extend(hush);
-        values([])
+        // From the 360 code (0x82349230, 0x82277cc0): always true.
+        values([Value::Boolean(true)])
     })?;
     for name in ["AddSequence", "RemoveSequence"] {
         add(&vo, name, |_, _, _| values([]))?;
@@ -5804,6 +5807,8 @@ mod tests {
             "return Player.SetInputEnabled(Player.GetLocalPlayer(), false)",
             "return Object.SetVisible(50, false)",
             "return Camera.Shake(Player.GetCamera(), 'small', 50, 1, 2)",
+            "return VO.Cancel(nil, 'line')",
+            "return Ai.Deploy{ Vehicle = 50 }",
         ] {
             assert_eq!(ask(code), Value::Boolean(true), "{code}");
         }
