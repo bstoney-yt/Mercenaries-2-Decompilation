@@ -1643,6 +1643,38 @@ fn hud_info(
     info
 }
 
+/// How often the GPU memory line is logged, seconds of wall clock.
+const GPU_LOG_EVERY: u64 = 60;
+
+/// Logs what the backend holds on the GPU (`WgpuBackend::memory`) and
+/// what the island has streamed in, every [`GPU_LOG_EVERY`] seconds, to
+/// follow video memory over a long run.
+fn log_gpu_memory(backend: &WgpuBackend, game: &Game) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    if last.is_some_and(|t| now.duration_since(t).as_secs() < GPU_LOG_EVERY) {
+        return;
+    }
+    *last = Some(now);
+    let m = backend.memory();
+    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "gpu memory: {} textures {:.0} MB, {} vertex buffers {:.0} MB, {} index buffers {:.0} MB,          {} materials; world {:?}",
+        m.textures,
+        mb(m.texture_bytes),
+        m.vertex_buffers,
+        mb(m.vertex_bytes),
+        m.index_buffers,
+        mb(m.index_bytes),
+        m.materials,
+        game.scene.world.as_ref().map(|w| w.stats())
+    );
+}
+
 /// Streams around the player (or camera) and draws a frame.
 fn render(
     backend: &mut WgpuBackend,
@@ -1658,6 +1690,7 @@ fn render(
     }
     let focus = game.focus();
     spans::time("stream", || game.scene.update(backend, focus))?;
+    log_gpu_memory(backend, game);
     let mut queue = DrawQueue::new();
     spans::time("draw", || -> anyhow::Result<()> {
         backend.begin_frame(&view)?;
