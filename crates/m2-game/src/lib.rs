@@ -13,6 +13,7 @@ pub mod inventory;
 pub mod jobs;
 pub mod layers;
 pub mod library;
+pub mod links;
 pub mod mission;
 pub mod music;
 pub mod path_order;
