@@ -45,7 +45,8 @@ const CLOSED: f32 = 20.0;
 const BOAT_PATROL_SPEED: f32 = 40.0;
 /// The AI's path-move speed factor when its move asks none (the 360 AI's
 /// +0x7EC, 0.4 from its set-up 0x822BDAD0; a move's own speed above 0
-/// replaces it, read here as the patrol's `Haste`, inferred).
+/// replaces it: the patrol's `Haste`, from the 360 code,
+/// [`m2_engine::path_move`]).
 const BOAT_SPEED_FACTOR: f32 = 0.4;
 const BOAT_REFERENCE_SPEED: f32 = 25.0;
 /// A vehicle not loaded after this many seconds never will be.
@@ -280,11 +281,10 @@ impl Traffic {
             // A boat's own controller (0x822A7C30) looks ahead by its
             // length x (its speed over its reference speed + 1.5, 1.5 to 2).
             let boat = v.spec.is_boat();
-            let task = BOAT_PATROL_SPEED
-                * point
-                    .haste
-                    .filter(|&h| h > 0.0)
-                    .unwrap_or(BOAT_SPEED_FACTOR);
+            // Its `Haste`, 0.5 without an `AiPatrol` of its own
+            // ([`m2_engine::path_move::patrol_factor`]).
+            let haste = m2_engine::path_move::patrol_factor(point.haste);
+            let task = BOAT_PATROL_SPEED * haste.filter(|&h| h > 0.0).unwrap_or(BOAT_SPEED_FACTOR);
             let reference = task.max(BOAT_REFERENCE_SPEED);
             let arrive = if boat {
                 let length = v.spec.hull.1.z - v.spec.hull.0.z;
@@ -385,7 +385,7 @@ impl Traffic {
             let ahead = path_search::lookahead(side, physics.vehicle_speed(id), dt);
             let point_to = look_ahead(route, next, closed, here, ahead);
             let controls = if v.spec.tracked {
-                let cap = Mover::Tank.speed(point.haste);
+                let cap = Mover::Tank.speed(haste);
                 let t = tank_attack::drive_to(&car, point_to, cap, false);
                 VehicleControls {
                     throttle: t.throttle,
@@ -393,7 +393,7 @@ impl Traffic {
                     ..VehicleControls::default()
                 }
             } else {
-                let cap = Mover::Car.speed(point.haste);
+                let cap = Mover::Car.speed(haste);
                 let (driver, held) = self.drivers.entry(entity).or_default();
                 let input = driver.drive_to(&car, point_to, cap, false, dt);
                 let ahead_gear = physics.vehicle_gear(id).is_none_or(|(g, _)| g != 0);
