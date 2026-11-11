@@ -4574,8 +4574,11 @@ impl People {
         threat: Option<Vec3>,
         dt: f32,
     ) {
+        let mut lap = crate::spans::Lap::new();
         self.pursue(dt);
+        lap.mark("people: pursuit");
         self.war(physics, threat, dt);
+        lap.mark("people: war");
         self.war_log -= dt;
         if self.war_log <= 0.0 {
             self.war_log = 30.0;
@@ -4625,6 +4628,7 @@ impl People {
         }
         self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
+        lap.mark("people: spawning");
         let scripted = std::mem::take(&mut self.scripted);
         if !scripted.is_empty() {
             self.populate(physics, &scripted, focus);
@@ -4694,13 +4698,17 @@ impl People {
                 .max(2.0 * npc.motion.capsule_radius);
             npc.rammed = (npc.rammed - dt).max(0.0);
             let facing = npc.facing;
-            npc.update(physics, &mut self.rng, threat, dt);
+            crate::spans::time("people: each one's update", || {
+                npc.update(physics, &mut self.rng, threat, dt)
+            });
             let p = npc.character.position;
-            self.checks
-                .count(npc, facing, physics.water_at(p.x, p.z), dt);
-            if let Some(t) = threat {
-                self.idle.count(physics, npc, t, dt);
-            }
+            crate::spans::time("people: checks", || {
+                self.checks
+                    .count(npc, facing, physics.water_at(p.x, p.z), dt);
+                if let Some(t) = threat {
+                    self.idle.count(physics, npc, t, dt);
+                }
+            });
             if std::mem::take(&mut npc.spotted) && npc.alive && self.smarter.enabled {
                 callouts.push(npc.character.position);
             }

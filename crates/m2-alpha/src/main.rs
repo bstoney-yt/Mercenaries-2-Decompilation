@@ -4278,6 +4278,10 @@ fn mission_for_screenshot(
     let mut screen_cycle = loading::Cycle::default();
     let played = Instant::now();
     let every = if auto.is_some() { 10 } else { 30 };
+    // The wall clock at the last `pace:` line, and the spans from before
+    // play dropped.
+    let mut pace_since = Instant::now();
+    let _ = spans::take();
     // With --autoplay, a picture of each delivery as its helicopter
     // hovers over the drop point (`<out>-delivery1.ppm`, ...), and one
     // from the same place once the load has come down (`-down`).
@@ -4449,7 +4453,9 @@ fn mission_for_screenshot(
                 a.exits = link.exit_offers();
                 a.enters = link.enter_offers_for(failed_contract.as_deref());
                 let objectives = link.view().objectives;
-                a.step(game, &marks, &objectives, &link.awaited(), tick)
+                spans::time("autoplay", || {
+                    a.step(game, &marks, &objectives, &link.awaited(), tick)
+                })
             }
             None => Intent::default(),
         };
@@ -4728,8 +4734,8 @@ fn mission_for_screenshot(
                 _ => {}
             }
         }
-        game.step(intent, tick);
-        link.tick(game, tick);
+        spans::time("game", || game.step(intent, tick));
+        spans::time("scripts", || link.tick(game, tick));
         // In a starter's box (her menu, then a contract's terms), autoplay
         // picks after a moment the contract on offer and then Accept, as a
         // player taking it would; the game's HUD answers the scripts' box
@@ -5422,6 +5428,24 @@ fn mission_for_screenshot(
         }
         if i % every == 0 {
             render(backend, game, fov, aspect, None)?;
+        }
+        // Each minute of play, where the wall clock went (`pace: autoplay`):
+        // the play it got through for each second, and the parts of a tick
+        // ([`spans`]: the game's steps, the scripts, and the frames drawn
+        // every `every` ticks) in milliseconds a tick, longest first.
+        let ticks_a_minute = (60.0 / tick).round() as u32;
+        if i > 0 && i % ticks_a_minute == 0 {
+            let wall = pace_since.elapsed().as_secs_f32();
+            eprintln!(
+                "pace: autoplay {:.0} s of play: {:.2} s of play a second, {:.1} ms a tick, {} people, {} vehicles; ms a tick: {}",
+                i as f32 * tick,
+                60.0 / wall.max(1e-3),
+                wall * 1000.0 / ticks_a_minute as f32,
+                game.scene.people.npcs.len(),
+                game.scene.vehicles.len(),
+                spans::describe(&spans::take(), ticks_a_minute as f32, 20)
+            );
+            pace_since = Instant::now();
         }
         if auto.is_some() {
             for (copter, at, to) in game.scene.flights.hovering() {
