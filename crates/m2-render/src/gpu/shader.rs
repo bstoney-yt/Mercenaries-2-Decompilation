@@ -278,6 +278,13 @@ fn layer_density(a: f32, b: f32, k: f32) -> f32 {
     return (hi - lo) / dh * (1.0 - (lo + hi) * 0.5);
 }
 
+// The air's Mie scattering towards the eye per unit of its scattering
+// (frame.mie), for red, green and blue: the game's code hands its
+// shaders a table of its own, (1.3337875e-3, 1.7344574e-3, 2.4976188e-3)
+// against its Mie scattering (5.740597e-3, 7.3996866e-3, 1.0514312e-2),
+// rather than 1 / (4 pi). From the 360 code (0x821B51F0, 0x821B5728).
+const MIE_ANGULAR: vec3<f32> = vec3<f32>(0.232343, 0.234396, 0.237544);
+
 // The air between the eye and p as the game's vertex shaders have it: the
 // light it adds (rgb), in display values, and the share of p's light it
 // keeps (a). Both layers scatter with the same coefficients, weighted by
@@ -295,7 +302,7 @@ fn game_air(p: vec3<f32>) -> vec4<f32> {
     let mu = min(dot(v, -normalize(frame.sun_dir.xyz)), 0.0);
     let g = frame.rayleigh.a;
     let phase = frame.rayleigh.rgb * (0.0596831 * (1.0 + mu * mu))
-        + frame.mie.rgb * (0.0795775 * (1.0 - g) * (1.0 - g)
+        + frame.mie.rgb * MIE_ANGULAR * ((1.0 - g) * (1.0 - g)
             / pow(max(1.0 + g * g + 2.0 * g * mu, 1e-4), 1.5));
     let add = phase / beta * (1.0 - e) * light_to_display(frame.sun_color.rgb) * frame.mie.a;
     return vec4<f32>(add, dot(e, vec3<f32>(1.0 / 3.0)) * frame.scatter.x);
@@ -367,7 +374,7 @@ fn through_air(rgb: vec3<f32>, h: vec4<f32>) -> vec3<f32> {
 fn inscatter(c: f32, tr: vec3<f32>, tm: vec3<f32>) -> vec3<f32> {
     let g = frame.rayleigh.a;
     let rayleigh = 0.0596831 * (1.0 + c * c);
-    let mie = 0.0795775 * (1.0 - g) * (1.0 - g) / pow(max(1.0 + g * g - 2.0 * g * c, 1e-4), 1.5);
+    let mie = MIE_ANGULAR * ((1.0 - g) * (1.0 - g) / pow(max(1.0 + g * g - 2.0 * g * c, 1e-4), 1.5));
     let t = max(tr + tm, vec3<f32>(1e-9));
     return (tr * rayleigh + tm * mie) / t * frame.sun_color.rgb * frame.mie.a;
 }
