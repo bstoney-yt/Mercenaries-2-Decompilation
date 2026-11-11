@@ -22,6 +22,7 @@ pub mod ported_sp;
 pub mod ported_sys;
 pub mod ported_net;
 pub mod ported_misc;
+pub mod ported_init;
 pub mod report;
 pub mod reverb;
 pub mod savedata;

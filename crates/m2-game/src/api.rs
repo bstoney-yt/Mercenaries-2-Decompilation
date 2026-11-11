@@ -914,6 +914,8 @@ pub struct ScriptWorld {
     /// What the setter ports of missing natives keep ([crate::ported_misc]).
     pub misc: crate::ported_misc::MiscState,
     pub outside: bool,
+    /// What the initialiser ports of missing natives keep ([crate::ported_init]).
+    pub init: crate::ported_init::InitState,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
     /// Every template the template database names, in lower case: the
@@ -3091,6 +3093,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let who = id(a.first()).or(w.player);
         values([guid_value(who)])
     })?;
+    crate::ported_init::install(&lib, &add)?;
     let camera = lib("Camera")?;
     // The camera looks the way she faces; a camera whose holder this
     // world doesn't place (the HUD's own world) faces north. Always a
