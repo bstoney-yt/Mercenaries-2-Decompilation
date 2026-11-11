@@ -413,6 +413,29 @@ pub struct FightClips {
     pub subdued: Option<usize>,
 }
 
+/// The clips of the 14 directions a person dies in on foot
+/// ([`m2_engine::death::DIRECTIONS`]). From samples: each direction is
+/// one `Upright` `DieAnimatedRagdoll` row of the stance and action table,
+/// whose handle has one on-foot row, for anyone holding anything, of
+/// these clips (0.37 to 0.40 s each). The first on the rig plays; the
+/// 360 picks one of a row's at random.
+pub const DEATH_CLIPS: [(u32, &[u32]); 14] = [
+    (0x46c2_3ec3, &[0xddc2_d5f0]),
+    (0x72fe_ba3b, &[0x4801_61e7, 0xe0d4_c021]),
+    (0xbc33_1a02, &[0xe824_3172, 0x3aee_9ae8]),
+    (0xa777_0bd6, &[0x1687_d31b]),
+    (0x5dc2_4c72, &[0xa60e_f32a]),
+    (0xccf8_b4d2, &[0xdcea_f4c9, 0xbc0c_6f1f]),
+    (0x2ae2_1fc9, &[0x3d43_0f4c, 0xc296_0cb6]),
+    (0xaa72_f76b, &[0x3029_73d5]),
+    (0x72a8_0b35, &[0x7774_5488]),
+    (0x6a8f_71e3, &[0xe4be_20b3, 0x3a65_09cd]),
+    (0xda62_8978, &[0x7b07_4973]),
+    (0xb00f_f0da, &[0xdd7d_ccc3]),
+    (0x2abc_c9f2, &[0x6667_6e42, 0x55e0_ccf8]),
+    (0xd9f6_4e93, &[0x10d0_d774]),
+];
+
 /// How far apart a clip's hands get over the whole clip, for its hip
 /// height: a rifle held in both hands keeps them close.
 pub fn hand_spread(rig: &Rig, c: &BoundClip) -> Option<f32> {
@@ -1084,6 +1107,13 @@ pub struct Npc {
     /// A shove not yet given to their body (m/s): they went limp, or
     /// were hit again after.
     fling: Option<Vec3>,
+    /// Where the round now striking them landed and the way it flew, set
+    /// by the shot just before [`hurt`](Self::hurt) and read by it.
+    pub last_hit: Option<(Vec3, Vec3)>,
+    /// Killed by a hit whose direction is known: the short clip they play
+    /// (`DieAnimatedRagdoll`) and the shove kept for when it ends and
+    /// they go limp ([`m2_engine::death`]).
+    dying: Option<(usize, Vec3)>,
     /// Has shouted since they were last calm.
     shouted: bool,
     /// Killed since [`People::take_deaths`] last looked.
@@ -1246,6 +1276,8 @@ impl Npc {
             dead_for: 0.0,
             ragdoll: None,
             fling: None,
+            last_hit: None,
+            dying: None,
             shouted: false,
             died: false,
             kind,
@@ -1450,12 +1482,54 @@ impl Npc {
         true
     }
 
+    /// The direction a hit that kills them makes them die in and its clip
+    /// on their rig ([`m2_engine::death::damage_direction`],
+    /// [`DEATH_CLIPS`]): `None` with no hit known or no such clip.
+    fn death_clip(&self, hit: Option<(Vec3, Vec3)>) -> Option<(u32, usize)> {
+        use m2_engine::death::{self, Body, Hit};
+        let (at, direction) = hit?;
+        let body = self.model_matrix();
+        let (nodes, _) = self.rig.posed();
+        let height = |node: u32| {
+            let i = self
+                .rig
+                .skeleton
+                .name_hashes
+                .iter()
+                .position(|&h| h == node)?;
+            Some((body * *nodes.get(i)?).w_axis.y)
+        };
+        let direction = death::damage_direction(
+            &Body {
+                position: self.character.position,
+                facing: self.facing,
+                upper_y: height(death::UPPER_NODE),
+                pelvis_y: height(death::PELVIS_NODE),
+            },
+            Some(&Hit {
+                at,
+                direction,
+                age: 0.0,
+                flagged: false,
+            }),
+        )?;
+        let clips = DEATH_CLIPS.iter().find(|d| d.0 == direction)?.1;
+        let clip = clips.iter().find_map(|&hash| {
+            let hash = self.rig.their_clip(hash);
+            self.rig.clips.iter().position(|c| c.hash == hash)
+        })?;
+        Some((direction, clip))
+    }
+
     /// Takes `damage`; at no health left, falls: true if it killed.
     /// `push` (m/s) shoves the body if it kills or is dead already.
     pub fn hurt(&mut self, damage: f32, push: Vec3) -> bool {
         let clips = self.clips;
+        let last_hit = self.last_hit.take();
         if !self.alive {
-            self.fling = Some(self.fling.unwrap_or_default() + push);
+            // Hit again in the clip they die in: limp now.
+            let kept = self.dying.take().map_or(Vec3::ZERO, |d| d.1);
+            self.fling = Some(self.fling.unwrap_or_default() + kept + push);
             return false;
         }
         self.hp -= damage;
@@ -1477,9 +1551,32 @@ impl Npc {
             self.flee = None;
             self.rig.animator.set_upper(None);
             self.rig.two_handed = false;
-            self.fling = Some(push);
-            if let Some(die) = clips.die {
-                self.rig.animator.play_once(die);
+            // On her feet and the killing hit known, the 360 posts
+            // `DieAnimatedRagdoll` with the hit's direction: its short
+            // clip, then the ragdoll. Otherwise `Die`: limp at once.
+            let directed = (self.down.is_none() && self.swim.is_none())
+                .then(|| self.death_clip(last_hit))
+                .flatten();
+            match directed {
+                Some((direction, clip)) => {
+                    eprintln!(
+                        "people: {:08x} dies in direction {direction:08x}, clip {:08x}",
+                        self.spawn.unwrap_or(0),
+                        self.rig.clips[clip].hash
+                    );
+                    self.rig.animator.play_action(
+                        clip,
+                        true,
+                        m2_engine::blend::action::DIE_ANIMATED_RAGDOLL,
+                    );
+                    self.dying = Some((clip, push));
+                }
+                None => {
+                    self.fling = Some(push);
+                    if let Some(die) = clips.die {
+                        self.rig.animator.play_once(die);
+                    }
+                }
             }
         }
         !self.alive
@@ -2456,6 +2553,17 @@ impl Npc {
         if !self.alive {
             self.dead_for += dt;
             self.rig.advance(dt);
+            // The clip they die in over (the action's `ON_END`): limp.
+            if let Some((clip, push)) = self.dying
+                && self
+                    .rig
+                    .animator
+                    .current()
+                    .is_none_or(|(c, at)| c != clip || at + 1e-3 >= self.rig.clips[c].info.duration)
+            {
+                self.dying = None;
+                self.fling = Some(push);
+            }
             return;
         }
         if self.down.is_some() {
@@ -6252,6 +6360,45 @@ pub(crate) mod tests {
             assert!(people.npcs[0].alert, "he sees her");
             assert_eq!(people.npcs[1].alert, smart, "told only when smarter");
         }
+    }
+
+    /// Every direction the 360's table can give has its clips here, and
+    /// no other.
+    #[test]
+    fn the_death_clips_are_the_tables_fourteen_directions() {
+        let mut table: Vec<u32> = m2_engine::death::DIRECTIONS
+            .iter()
+            .flatten()
+            .flatten()
+            .copied()
+            .collect();
+        table.sort_unstable();
+        table.dedup();
+        let mut ours: Vec<u32> = DEATH_CLIPS.iter().map(|d| d.0).collect();
+        ours.sort_unstable();
+        assert_eq!(ours, table);
+        assert!(DEATH_CLIPS.iter().all(|d| !d.1.is_empty()));
+    }
+
+    /// With the hit known but no clip for its direction on the rig, the
+    /// plain death: limp at once, as with no hit known.
+    #[test]
+    fn a_death_without_its_clip_goes_limp_at_once() {
+        let stand = || Brain::Wander {
+            home: Vec3::ZERO,
+            target: Vec3::ZERO,
+            wait: 10.0,
+        };
+        let mut n = Npc::new(0, &rig(), Vec3::ZERO, 0.0, stand(), None);
+        n.last_hit = Some((Vec3::new(0.0, 1.2, 0.3), Vec3::NEG_Z));
+        assert!(n.hurt(f32::INFINITY, Vec3::NEG_Z));
+        assert!(n.dying.is_none());
+        assert_eq!(n.fling, Some(Vec3::NEG_Z));
+        // The hit is used up by the blow it came with.
+        assert!(n.last_hit.is_none());
+        let mut m = Npc::new(0, &rig(), Vec3::ZERO, 0.0, stand(), None);
+        assert!(m.hurt(f32::INFINITY, Vec3::X));
+        assert_eq!(m.fling, Some(Vec3::X));
     }
 
     #[test]

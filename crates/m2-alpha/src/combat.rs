@@ -3346,8 +3346,15 @@ impl Combat {
                 kind: round_kind(ammo.key),
             });
         }
-        if let Some((_, Some(j))) = hit
-            && self.round_on_person(f.people, j, (damage, ammo.hero), ammo.key, aim * SHOT_PUSH)
+        if let Some((d, Some(j))) = hit
+            && self.round_on_person(
+                f.people,
+                j,
+                (damage, ammo.hero),
+                ammo.key,
+                aim * SHOT_PUSH,
+                Some(from + aim * d),
+            )
         {
             self.remarks.push(Remark::Kill);
         }
@@ -3417,10 +3424,17 @@ impl Combat {
             // What it does to people: its `Damage` times the damage
             // table's cell for their `ModifierKey` and its `DamageKey`,
             // against their template's `Health`.
-            if let Some((_, Some(i))) = hit {
+            if let Some((d, Some(i))) = hit {
                 let key = ammo.and_then(|a| a.key);
                 let hero = ammo.map_or(1.0, |a| a.hero);
-                killed |= self.round_on_person(f.people, i, (damage, hero), key, dir * SHOT_PUSH);
+                killed |= self.round_on_person(
+                    f.people,
+                    i,
+                    (damage, hero),
+                    key,
+                    dir * SHOT_PUSH,
+                    Some(eye + dir * d),
+                );
             }
             if self.rifle.pellets > 1 {
                 self.effect(Effect::Tracer { from, to }, 0.05);
@@ -4039,13 +4053,14 @@ impl Combat {
                     self.effect(Effect::Tracer { from, to }, 0.07);
                     let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
                     let on_props = RIFLE_DAMAGE * damage / CARBINE_ROUND;
-                    if let Some((_, Some(j))) = hit
+                    if let Some((d, Some(j))) = hit
                         && self.round_on_person(
                             f.people,
                             j,
                             (damage, ammo.hero),
                             ammo.key,
                             aim * SHOT_PUSH,
+                            Some(from + aim * d),
                         )
                     {
                         self.remarks.push(Remark::Kill);
@@ -4654,8 +4669,15 @@ impl Combat {
             let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
             self.effect(Effect::Tracer { from, to }, 0.07);
             let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
-            if let Some((_, Some(j))) = hit
-                && self.round_on_person(f.people, j, (damage, ammo.hero), ammo.key, aim * SHOT_PUSH)
+            if let Some((d, Some(j))) = hit
+                && self.round_on_person(
+                    f.people,
+                    j,
+                    (damage, ammo.hero),
+                    ammo.key,
+                    aim * SHOT_PUSH,
+                    Some(from + aim * d),
+                )
             {
                 self.remarks.push(Remark::Kill);
             }
@@ -5631,7 +5653,9 @@ impl Combat {
     /// Her round of `damage` (its `Damage` at that range) and `DamageKey`
     /// `key` striking person `j`, shoving the body `push` if it kills:
     /// they take what [`on_person`](Self::on_person) gives of it. True if
-    /// it killed a soldier.
+    /// it killed a soldier. `at` is where it struck them, where the shot
+    /// knows: the hit a death's direction is read from
+    /// ([`m2_engine::death`]).
     fn round_on_person(
         &mut self,
         people: &mut People,
@@ -5639,8 +5663,10 @@ impl Combat {
         (damage, hero): (f32, f32),
         key: Option<u32>,
         push: Vec3,
+        at: Option<Vec3>,
     ) -> bool {
         let taken = damage * hero * self.on_person(&people.npcs[j], key);
+        people.npcs[j].last_hit = at.map(|p| (p, push));
         if self.crew_firing {
             let killed = people.npcs[j].shot_by_army(taken, push, 0);
             people.war_tally.1 += 1;
@@ -7426,11 +7452,11 @@ mod tests {
         // The carbine's round (6 to 15 m, `HeroMultiplier` 3): a deathsquad
         // mook's 75 health goes in 5 hits.
         let kills: Vec<bool> = (0..5)
-            .map(|_| combat.round_on_person(&mut people, 0, (6.0, 3.0), None, Vec3::ZERO))
+            .map(|_| combat.round_on_person(&mut people, 0, (6.0, 3.0), None, Vec3::ZERO, None))
             .collect();
         assert_eq!(kills.iter().filter(|k| **k).count(), 1);
         assert!(kills[4]);
-        combat.round_on_person(&mut people, 1, (6.0, 3.0), None, Vec3::ZERO);
+        combat.round_on_person(&mut people, 1, (6.0, 3.0), None, Vec3::ZERO, None);
         assert!((people.npcs[1].hp - (75.0 - 6.0 * 3.0 * 0.25)).abs() < 1e-4);
         assert_eq!((combat.tally.hits, combat.tally.kills), (6, 1));
     }
