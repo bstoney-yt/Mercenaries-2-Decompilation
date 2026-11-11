@@ -811,7 +811,15 @@ impl Events {
                             ));
                         }
                         if p.persistent {
-                            p.last = now;
+                            // A repeating timer keeps what it overran by
+                            // (from the 360 code: 0x823554d0 takes the
+                            // delay off the time counted, 0x82355480
+                            // counts on from there), so it keeps its rate
+                            // whatever the frame length.
+                            p.last = match (p.kind.as_str(), number(&p.params, 1)) {
+                                ("TimerRelative", Some(delay)) => p.last + delay,
+                                _ => now,
+                            };
                             keep.push(p);
                         }
                     }
@@ -1773,6 +1781,27 @@ mod tests {
         host.lua().load("Event.Delete(id)").exec().unwrap();
         events.update(1.0, &world);
         assert_eq!(log(&host).len(), 3);
+    }
+
+    /// A repeating timer keeps its rate when the frames don't divide its
+    /// delay: 0.1 s at 30 frames a second is 30 a second, not one every
+    /// fourth frame (22 or so).
+    #[test]
+    fn a_repeating_timer_carries_what_it_overran() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                "Event.CreatePersistent(Event.TimerRelative, { 0.1 }, \
+                 function() table.insert(log, 'tick') end)",
+            )
+            .exec()
+            .unwrap();
+        let world = TestWorld::default();
+        for _ in 0..90 {
+            events.update(1.0 / 30.0, &world);
+        }
+        let n = log(&host).len();
+        assert!((29..=30).contains(&n), "{n} ticks in 3 s");
     }
 
     #[test]
