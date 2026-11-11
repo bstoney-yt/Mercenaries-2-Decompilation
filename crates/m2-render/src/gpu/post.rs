@@ -24,11 +24,16 @@
 //! .08, .02 and raised to 0.4, its luminance kept in alpha. The composite
 //! takes the frame part of the way to 1.2 times that image (bloom) and
 //! compresses each pixel by the blurred luminance around it rather than
-//! its own (a local tone map). From the shaders: all of that. Inferred:
-//! the bloom's share is `BloomAmount` x `BloomMultiplier` (0.25 in most
-//! records; the shader's `imageParams.x` is set by the program), the
-//! levels' sizes (a quarter of the frame down to 1/32) and the taps' step
-//! (one texel; `BloomBlurRadius`, 0.55 in most records, may be it).
+//! its own (a local tone map). From the shaders: all of that. From the
+//! 360 code (0x821BD348, 0x8224C398): the bloom's share (`imageParams.x`)
+//! is `BloomAmount` alone; the levels are the frame over 2, 4, 8 and 16,
+//! blurred 0, 1, 2 and 4 times across and down, their taps 0.4 and 0.8
+//! times `BloomBlurRadius`, then 0.45 and 0.95, texels apart.
+//! The composite's last two settings match ours at their defaults: its
+//! luminance scale `imageParams.z` is 0.5 + the options' brightness / 100
+//! (0x8239E338; 50 by default, 0x8256D1B0), so 1, which we leave out; its
+//! grain `filterParams.z` is 0 unless a screen effect sets it
+//! (0x821BA6B0, 0x821B62B8), as ours is outside the satellite's view.
 //! `BloomThreshold` is read but no game shader applies a threshold.
 //! `M2_GRADE_BLUR=off` restores the bright pass (PC round grade27).
 //!
@@ -505,11 +510,21 @@ const COMBINE: usize = GAME_BLUR + 1 + 3 * LEVELS;
 const MERGE: usize = PASSES - 1;
 /// The game's blur levels (its combine shader, 017, reads four).
 const LEVELS: usize = 4;
-/// What each of the game's blur levels divides the frame's sides by.
-/// Inferred: its first shader (332) halves the frame and the next (333)
-/// halves again, but how many halvings come before the first level the
-/// combine reads is set by the program, not read; a quarter is taken.
-const LEVEL_DIVISORS: [u32; LEVELS] = [4, 8, 16, 32];
+/// What each of the game's blur levels divides the frame's sides by
+/// (from the 360 code, 0x821BD348: 2, 4, 8 and 16). The first is the
+/// frame halved (its shader 332), each next the one before halved.
+const LEVEL_DIVISORS: [u32; LEVELS] = [2, 4, 8, 16];
+/// How many times each level is blurred across and down (0x821BD348:
+/// 0, 1, 2 and 4; the first level is not blurred).
+const BLUR_ROUNDS: [usize; LEVELS] = [0, 1, 2, 4];
+
+/// How far apart each level's blur taps stand, in texels of the level,
+/// for a `BloomBlurRadius` of `radius` (0x821BD348: `blurScale` is the
+/// level's texel times 0.4 and 0.8 times the radius for the first two
+/// levels, 0.45 and 0.95 for the others).
+fn blur_spread(radius: f32) -> [f32; LEVELS] {
+    [0.4 * radius, 0.8 * radius, 0.45, 0.95]
+}
 
 /// The `index`th pass of level `level` of the game's blur: 0 the halving
 /// into it, 1 the blur across, 2 the blur down.
@@ -564,9 +579,8 @@ pub struct Post {
 struct Images {
     /// Quarter-size glow images, ping-ponged by the blur.
     glow: [wgpu::TextureView; 2],
-    /// The game's blur: the half-size frame, each level (ping-ponged by
-    /// its blur) and the levels combined.
-    half: wgpu::TextureView,
+    /// The game's blur: each level (the first the frame halved, each
+    /// next ping-ponged by its blur) and the levels combined.
     levels: [[wgpu::TextureView; 2]; LEVELS],
     combined: wgpu::TextureView,
     /// The world's glows in display values (the world shader's `fs_glow`),
@@ -615,17 +629,6 @@ fn target_texture(
 /// compressed by its own luminance, as before).
 fn game_blur_on() -> bool {
     !std::env::var("M2_GRADE_BLUR").is_ok_and(|v| v == "off")
-}
-
-/// How far apart the game's blur taps stand, in texels of their level:
-/// its blur shaders (018, 019) step by a constant the program sets
-/// (`blurScale`); one texel is taken (inferred). `M2_BLUR_STEP=<x>`
-/// changes it, to test.
-fn blur_step() -> f32 {
-    std::env::var("M2_BLUR_STEP")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(1.0)
 }
 
 impl Post {
@@ -816,7 +819,6 @@ impl Post {
             target(device, "glow", width / 4, height / 4),
             target(device, "glow", width / 4, height / 4),
         ];
-        let half = target(device, "blur half", width / 2, height / 2);
         let levels = LEVEL_DIVISORS.map(|d| {
             [
                 target(device, "blur level", width / d, height / d),
@@ -879,7 +881,7 @@ impl Post {
                 BRIGHT => group(i, [&merged, &glow[1], now, spare, spare]),
                 1 => group(i, [&glow[0], &hdr, now, spare, spare]),
                 2 => group(i, [&glow[1], &hdr, now, spare, spare]),
-                COMPOSITE => group(i, [&merged, &glow[0], now, &combined, &half]),
+                COMPOSITE => group(i, [&merged, &glow[0], now, &combined, spare]),
                 ADAPT => group(i, [&luminance[last], &glow[0], before, spare, spare]),
                 GAME_BLUR => group(i, [&merged, &glow[0], now, spare, spare]),
                 COMBINE => group(
@@ -895,7 +897,8 @@ impl Post {
                 i if i > GAME_BLUR => {
                     let level = (i - GAME_BLUR - 1) / 3;
                     let source = match (i - GAME_BLUR - 1) % 3 {
-                        0 if level == 0 => &half,
+                        // Level 0 is drawn by the halving (GAME_BLUR).
+                        0 if level == 0 => &merged,
                         0 => &levels[level - 1][0],
                         1 => &levels[level][0],
                         _ => &levels[level][1],
@@ -918,7 +921,6 @@ impl Post {
             hdr,
             Images {
                 glow,
-                half,
                 levels,
                 combined,
                 glow_layer,
@@ -1087,13 +1089,14 @@ impl Post {
         // The game's blur: each halving's taps half a texel of its
         // source either side, each blur's a step apart.
         steps[GAME_BLUR] = texel(w, h);
-        let spread = blur_step();
+        let spread = blur_spread(lighting.bloom_radius);
         for (level, d) in LEVEL_DIVISORS.into_iter().enumerate() {
-            let source = if level == 0 { 2 } else { d / 2 };
+            // Level 0 is the halving itself; each next halves the last.
+            let source = (d / 2).max(1);
             steps[level_pass(level, 0)] = texel(w / source, h / source);
             let [x, y] = texel(w / d, h / d);
-            steps[level_pass(level, 1)] = [x * spread, 0.0];
-            steps[level_pass(level, 2)] = [0.0, y * spread];
+            steps[level_pass(level, 1)] = [x * spread[level], 0.0];
+            steps[level_pass(level, 2)] = [0.0, y * spread[level]];
         }
         let frame = self.frame.get() % 65536;
         self.frame.set(frame + 1);
@@ -1179,11 +1182,15 @@ impl Post {
         }
         if game_blur {
             let levels = &self.sized.levels;
-            pass(&self.game_down0, &groups[GAME_BLUR], &self.sized.half);
-            for (level, images) in levels.iter().enumerate() {
+            // The frame halved is level 0 (not blurred); each next level
+            // halves the last and is blurred across and down its rounds.
+            pass(&self.game_down0, &groups[GAME_BLUR], &levels[0][0]);
+            for (level, images) in levels.iter().enumerate().skip(1) {
                 pass(&self.game_down, &groups[level_pass(level, 0)], &images[0]);
-                pass(&self.game_blur, &groups[level_pass(level, 1)], &images[1]);
-                pass(&self.game_blur, &groups[level_pass(level, 2)], &images[0]);
+                for _ in 0..BLUR_ROUNDS[level] {
+                    pass(&self.game_blur, &groups[level_pass(level, 1)], &images[1]);
+                    pass(&self.game_blur, &groups[level_pass(level, 2)], &images[0]);
+                }
             }
             pass(&self.game_combine, &groups[COMBINE], &self.sized.combined);
         }
@@ -1360,6 +1367,17 @@ mod tests {
         for pair in LEVEL_DIVISORS.windows(2) {
             assert_eq!(pair[1], pair[0] * 2);
         }
+    }
+
+    #[test]
+    fn the_game_blur_takes_the_codes_levels() {
+        use super::*;
+        assert_eq!(LEVEL_DIVISORS, [2, 4, 8, 16]);
+        assert_eq!(BLUR_ROUNDS, [0, 1, 2, 4]);
+        // The island's default BloomBlurRadius, 0.556.
+        let s = blur_spread(0.556);
+        assert!((s[0] - 0.2224).abs() < 1e-5 && (s[1] - 0.4448).abs() < 1e-5);
+        assert_eq!([s[2], s[3]], [0.45, 0.95]);
     }
 
     #[test]
