@@ -537,12 +537,19 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             prop.map_or(Value::Nil, guid_value),
         ]))
     })?;
+    // From the 360 code (0x823328b8): whether it let go of something; no
+    // child is false (inferred here: anything named is let go of; the 360
+    // raises an error for a child that isn't on that parent).
     add(&object, "Detach", |w, _, a| {
-        if let (Some(parent), Some(prop)) = (id(a.first()), id(a.get(1))) {
-            w.commands
-                .push(Command::Hijack(HijackCommand::Detach { parent, prop }));
-        }
-        Ok(MultiValue::new())
+        let Some(parent) = id(a.first()) else {
+            return Ok(MultiValue::from_vec(vec![Value::Nil]));
+        };
+        let Some(prop) = id(a.get(1)) else {
+            return Ok(MultiValue::from_vec(vec![Value::Boolean(false)]));
+        };
+        w.commands
+            .push(Command::Hijack(HijackCommand::Detach { parent, prop }));
+        Ok(MultiValue::from_vec(vec![Value::Boolean(true)]))
     })?;
     for (name, flag) in [("DisablePhysics", false), ("EnablePhysics", true)] {
         let w = std::rc::Rc::clone(world);
@@ -604,7 +611,9 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             w.commands
                 .push(Command::Hijack(HijackCommand::Ai { guid, on }));
         }
-        Ok(MultiValue::new())
+        // From the 360 code (0x82311898): whether there was an AI.
+        let there = id(a.first()).is_some_and(|g| w.objects.contains_key(&g));
+        Ok(MultiValue::from_vec(vec![Value::Boolean(there)]))
     })?;
 
     let vehicle = lib("Vehicle")?;
@@ -615,8 +624,10 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             let on = on(a.get(2));
             w.commands
                 .push(Command::Hijack(HijackCommand::Turret { guid, turret, on }));
+            // From the 360 code (0x82347ba0): true.
+            return Ok(MultiValue::from_vec(vec![Value::Boolean(true)]));
         }
-        Ok(MultiValue::new())
+        Ok(MultiValue::from_vec(vec![Value::Nil]))
     })?;
     add(&vehicle, "HijackStart", |w, _, a| {
         if let (Some(hero), Some(driver), Some(vehicle)) =
