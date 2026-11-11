@@ -916,6 +916,9 @@ pub struct ScriptWorld {
     /// its last look (it looks at those `ObjectIsVisible` events wait
     /// for: [`crate::mission::Mission::sight_watched`]).
     pub unseen: HashSet<u32>,
+    /// The vehicles' seats and who sits in which
+    /// ([`crate::vehicle_seats`]).
+    pub seats: crate::vehicle_seats::Seats,
 }
 
 impl ScriptWorld {
@@ -936,11 +939,25 @@ impl ScriptWorld {
     /// Puts `guid` aboard `vehicle` as [`Self::put_aboard`], `not_driving`
     /// when it takes a seat other than the driver's ([`Object::not_driving`]).
     pub fn seat(&mut self, guid: u32, vehicle: u32, instant: bool, not_driving: bool) {
+        self.seat_named(guid, vehicle, instant, not_driving, None);
+    }
+
+    /// [`Self::seat`] in the seat named `name` (its `SeatLink` `Name`,
+    /// hashed), when the vehicle has one so named.
+    pub fn seat_named(
+        &mut self,
+        guid: u32,
+        vehicle: u32,
+        instant: bool,
+        not_driving: bool,
+        name: Option<u32>,
+    ) {
         if let Some(o) = self.objects.get_mut(&guid) {
             o.vehicle = Some(vehicle);
             o.seated_instantly = instant;
             o.not_driving = not_driving;
             self.riders.push(guid);
+            self.seats.sit(guid, vehicle, name, !not_driving);
         }
     }
 
@@ -2869,6 +2886,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 o.seated_instantly = false;
                 o.not_driving = false;
             }
+            w.seats.leave(guid);
             w.commands.push(Command::ExitVehicle(guid));
         }
         values([])
@@ -2883,7 +2901,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => String::new(),
         };
         let instant = matches!(a.get(3), Some(Value::Boolean(true)));
-        w.seat(guid, vehicle, instant, seat_not_driving(&seat));
+        let name = (!seat.is_empty()).then(|| m2_assets::hash::name_hash(&seat));
+        w.seat_named(guid, vehicle, instant, seat_not_driving(&seat), name);
         w.commands.push(Command::EnterVehicle {
             guid,
             vehicle,

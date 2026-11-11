@@ -4769,6 +4769,17 @@ impl Fleet {
         }
         let now = mission.now();
         self.landing.retain(|_, until| *until > now);
+        // The scripts' vehicles' seats ([`m2_game::vehicle_seats`]), from
+        // their templates' `SeatLink`s and `SeatParameters`.
+        {
+            let mut w = mission.world().borrow_mut();
+            for v in &game.scene.vehicles {
+                let (Some(g), Some(seating)) = (v.guid, v.spec.seating.as_deref()) else {
+                    continue;
+                };
+                w.seats.add(g, seating.seats.iter().map(seat_of_template));
+            }
+        }
         for v in &game.scene.vehicles {
             let (Some(g), Some(id)) = (v.guid, v.id) else {
                 continue;
@@ -5507,6 +5518,23 @@ fn send_gunship(game: &mut Game, faction: &'static str, template: &str, her: Vec
     game.scene
         .load_world_vehicle(entity, at, toward.x.atan2(toward.z), crew, models);
     eprintln!("gunships: {faction} send their {template} from {at:.0}");
+}
+
+/// A seat as the scripts read it ([`m2_game::vehicle_seats::SeatParams`]).
+fn seat_of_template(s: &m2_engine::seats::Seat) -> (u32, m2_game::vehicle_seats::SeatParams, bool) {
+    let f = s.flags;
+    let params = m2_game::vehicle_seats::SeatParams {
+        driver: s.driver,
+        gunner: s.gunner,
+        cargo: f.cargo,
+        hijackable: s.hijackable,
+        hijack_blocker: f.hijack_blocker,
+        rider_invisible: f.rider_invisible,
+        rider_vulnerable: f.rider_vulnerable,
+        rider_bashable: f.rider_bashable,
+        stowable: f.stowable,
+    };
+    (s.name, params, s.player_use)
 }
 
 fn pursuit_standing(game: &Game, her: Vec3) -> crate::reinforce::Standing {
