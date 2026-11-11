@@ -21,6 +21,7 @@ pub mod savedata;
 pub mod script;
 pub mod script_flags;
 pub mod script_noops;
+pub mod script_junk;
 pub mod script_time;
 pub mod shop;
 pub mod subtitles;

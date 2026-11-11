@@ -1713,6 +1713,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::String(lua.create_string("")?)])
     })?;
 
+    let junk = lib("Junk")?;
+    add(&junk, "FormatTime", |_, lua, a| {
+        crate::script_junk::format_time_native(lua, a)
+    })?;
+    add(&junk, "IsInstallable", |_, _, _| {
+        Ok(crate::script_junk::is_installable())
+    })?;
+
     let pg = lib("Pg")?;
     // The pursuit ([`Pursuit`]).
     add(&pg, "SetPursuitLevelTimes", |w, _, a| {
