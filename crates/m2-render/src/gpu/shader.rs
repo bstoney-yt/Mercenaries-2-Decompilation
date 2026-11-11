@@ -167,8 +167,11 @@ struct Draw {
     // x: first palette matrix, y: palette length (0: not skinned),
     // z: first instance matrix, w: instance count (0: not instanced)
     skin: vec4<u32>,
-    // xy: added to the texture coordinates (scrolling textures)
+    // xy: added to the texture coordinates (scrolling textures), z: its
+    // beams shine whatever the hour
     uv: vec4<f32>,
+    // Multiplies the surface's colour and alpha (a marker model's colour)
+    tint: vec4<f32>,
 };
 
 struct Material {
@@ -240,6 +243,10 @@ struct Varyings {
     // The air between eye and vertex, as the game computes it per vertex:
     // rgb light it adds, a: fraction of the surface's light it keeps
     @location(5) haze: vec4<f32>,
+    // The draw's tint (see `Draw`)
+    @location(6) tint: vec4<f32>,
+    // Its beams shine whatever the hour (see `Draw`)
+    @location(7) @interpolate(flat) beams_lit: f32,
 };
 "#;
 
@@ -946,10 +953,11 @@ fn surface(v: Varyings, front: bool) -> vec4<f32> {
         let facing = abs(dot(normalize(v.normal), normalize(frame.eye.xyz - v.world_pos)));
         alpha = alpha * facing * facing;
     }
-    if material.direct.w > 0.5 {
+    if material.direct.w > 0.5 && v.beams_lit < 0.5 {
         alpha = alpha * frame.surface.y;
     }
-    return vec4<f32>(rgb, alpha);
+    // The draw's tint over all of it, its own light too.
+    return vec4<f32>(rgb, alpha) * v.tint;
 }
 
 @fragment
@@ -980,7 +988,7 @@ fn fs_glow(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
     var rgb = pow(max(s.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
     if material.params.y < 0.5 && material.params.z > 0.5 {
         let t = textureSample(base_map, base_sampler, v.uv);
-        rgb = srgb_encode(t.rgb) * material.color.rgb * v.color.rgb;
+        rgb = srgb_encode(t.rgb) * material.color.rgb * v.color.rgb * v.tint.rgb;
     }
     if material.params.w > 0.5 {
         var keep = vec3<f32>(v.haze.a);
@@ -1213,6 +1221,8 @@ fn place(v: VertexIn, instance: u32) -> Varyings {{
     out.color = {color};
     out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
     out.haze = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    out.tint = draw.tint;
+    out.beams_lit = draw.uv.z;
     return out;
 }}
 
@@ -1342,7 +1352,11 @@ mod tests {
                 .unwrap();
         let src = source(&layout);
         validate(&src);
-        assert!(src.contains("rgb = srgb_encode(t.rgb) * material.color.rgb * v.color.rgb;"));
+        assert!(
+            src.contains(
+                "rgb = srgb_encode(t.rgb) * material.color.rgb * v.color.rgb * v.tint.rgb;"
+            )
+        );
         assert!(src.contains("var keep = vec3<f32>(v.haze.a);"));
         assert!(src.contains("return vec4<f32>(0.0, 0.0, 0.0, surface(v, front).a);"));
         let glow = src.split("fn fs_glow").nth(1).unwrap();

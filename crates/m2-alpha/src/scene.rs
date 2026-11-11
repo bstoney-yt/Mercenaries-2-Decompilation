@@ -1477,6 +1477,12 @@ pub struct Scene {
     pub chunks: Vec<Chunk>,
     /// The chunks' models by hash, `None` while one loads.
     chunk_models: HashMap<u32, Option<GpuModel>>,
+    /// The scripts' markers drawn as models, set each tick by the mission
+    /// ([`crate::marker_models`]).
+    pub marker_models: Vec<crate::marker_models::MarkerModel>,
+    /// Their models by hash, with their nodes' name hashes (`None` while
+    /// loading or when one could not be read).
+    marker_meshes: HashMap<u32, Option<MarkerMesh>>,
     /// What each vehicle (by model and label) shows over its exhausts
     /// while it has a driver: (node, the effect), read once.
     hazes: HashMap<(u32, String), Vec<(usize, m2_engine::vehicle_parts::ModelEmitter)>>,
@@ -2001,6 +2007,10 @@ const PROP_MARGIN: f32 = 100.0;
 /// its own (the rest stand in their template's).
 const ARMY: [&str; 3] = ["vz_hum_soldier", "vz_hum_soldierelite", "vz_hum_deathsquad"];
 
+/// A marker's model on the GPU, with each node's name hash and place in
+/// the model at rest.
+type MarkerMesh = (GpuModel, Vec<(u32, Mat4)>);
+
 /// A model the loading thread has decoded.
 pub enum Loaded {
     Vehicle(VehicleSpec, CpuModel),
@@ -2033,6 +2043,9 @@ pub enum Loaded {
     ),
     /// A wreck's chunk's model ([`Chunk`]): its hash and model.
     Chunk(u32, CpuModel),
+    /// A marker's model ([`crate::marker_models`]): its hash, model, and
+    /// per node its name hash and its place in the model at rest.
+    Marker(u32, CpuModel, Vec<(u32, Mat4)>),
 }
 
 /// Finds the island's vehicle and person models and decodes the soldiers'
@@ -2247,6 +2260,8 @@ impl Scene {
             requests: channel(),
             chunks: Vec::new(),
             chunk_models: HashMap::new(),
+            marker_models: Vec::new(),
+            marker_meshes: HashMap::new(),
             hazes: HashMap::new(),
             smokes: HashMap::new(),
             engine_sets: HashMap::new(),
@@ -2818,6 +2833,35 @@ impl Scene {
         });
     }
 
+    /// Loads a marker's model ([`crate::marker_models`]) on a thread, with
+    /// its nodes' name hashes.
+    fn load_marker_model(&self, hash: u32) {
+        let Some(install) = self.install.clone() else {
+            return;
+        };
+        let tx = self.requests.0.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let mut source = install.open_world()?;
+                let data = source.model(hash)?;
+                let model = data.parse()?;
+                let nodes = (0..model.nodes.len())
+                    .map(|n| {
+                        let rest = model.node_to_model(n as u16).unwrap_or(Mat4::IDENTITY);
+                        (model.nodes[n].name_hash, rest)
+                    })
+                    .collect();
+                let mut cpu = CpuModel::from_data(&data, 0)?;
+                cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
+                let _ = tx.send(Loaded::Marker(hash, cpu, nodes));
+                Ok(())
+            })();
+            if let Err(e) = result {
+                eprintln!("marker model {hash:08x}: {e:#}");
+            }
+        });
+    }
+
     /// Loads a template's own person model (`Carmona`'s, a `VZ Soldier`'s)
     /// on a thread; it joins the people's kinds as `template`.
     fn load_character(&self, model: u32, template: String) {
@@ -2964,7 +3008,8 @@ impl Scene {
             | Loaded::Weapon(_, cpu, _, _)
             | Loaded::HandModel(_, cpu, _, _)
             | Loaded::Flight(_, cpu, _, _, _)
-            | Loaded::Chunk(_, cpu) => cpu,
+            | Loaded::Chunk(_, cpu)
+            | Loaded::Marker(_, cpu, _) => cpu,
         };
         let uploaded = self
             .materials
@@ -3103,6 +3148,10 @@ impl Scene {
                     Some(i) => self.vehicles[i] = vehicle,
                     None => self.vehicles.push(vehicle),
                 }
+            }
+            Loaded::Marker(hash, _, nodes) => {
+                eprintln!("marker model {hash:08x} up ({} nodes)", nodes.len());
+                self.marker_meshes.insert(hash, Some((model, nodes)));
             }
             Loaded::Chunk(hash, _) => {
                 let (lying, near) = (
@@ -3390,6 +3439,18 @@ impl Scene {
             if let std::collections::hash_map::Entry::Vacant(e) = self.chunk_models.entry(m) {
                 e.insert(None);
                 self.load_chunk_model(m);
+            }
+        }
+        let markers: Vec<u32> = self
+            .marker_models
+            .iter()
+            .map(|m| m.model)
+            .filter(|m| !self.marker_meshes.contains_key(m))
+            .collect();
+        for m in markers {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.marker_meshes.entry(m) {
+                e.insert(None);
+                self.load_marker_model(m);
             }
         }
     }
@@ -3719,6 +3780,30 @@ impl Scene {
         if let Some(p) = self.particles.as_mut().filter(|_| !hide) {
             p.draw(backend, queue, view)?;
         }
+        for m in &self.marker_models {
+            let Some(Some((model, nodes))) = self.marker_meshes.get_mut(&m.model) else {
+                continue;
+            };
+            model.tint = m.tint();
+            // A ring's material is a beam's: lit by day too.
+            model.beams_lit = true;
+            if m.width.is_none() {
+                // In its bind pose: nothing of it moves.
+                model.draw(queue, m.world());
+                continue;
+            }
+            // Each node moved in model space (a tripwire's ends): its
+            // place and its skinning both shift by the move.
+            let hashes: Vec<u32> = nodes.iter().map(|n| n.0).collect();
+            let moves = m.node_moves(&hashes);
+            let skin: Vec<Mat4> = moves.iter().map(|&d| Mat4::from_translation(d)).collect();
+            let posed: Vec<Mat4> = nodes
+                .iter()
+                .zip(&skin)
+                .map(|(n, moved)| *moved * n.1)
+                .collect();
+            model.draw_posed(backend, queue, m.world(), &posed, &skin)?;
+        }
         for p in &self.models {
             match &p.rig {
                 Some(rig) => {
@@ -3748,6 +3833,8 @@ impl Scene {
                 skin: None,
                 instances: None,
                 uv_offset: [0.0; 2],
+                tint: [1.0; 4],
+                beams_lit: false,
             },
             layer: Layer::WORLD,
             translucent: false,
@@ -4006,6 +4093,8 @@ impl Effects {
                 skin: None,
                 instances: None,
                 uv_offset: [0.0; 2],
+                tint: [1.0; 4],
+                beams_lit: false,
             },
             layer: Layer::WORLD,
             translucent,
