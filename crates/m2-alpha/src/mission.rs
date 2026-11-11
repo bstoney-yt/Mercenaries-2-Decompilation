@@ -2750,6 +2750,13 @@ impl MissionLink {
             .as_ref()
             .is_some_and(|p| p.driving.is_none() && p.swimming());
         mission.set_swimming(PLAYER, swimming);
+        // The scripts' camera in a scene: on with its objects, and its view
+        // while a script directs it.
+        {
+            let mut w = mission.world().borrow_mut();
+            w.update_script_camera(dt);
+            game.script_view = w.script_view().map(|v| (v.eye, v.forward()));
+        }
         // A scene's camera shot, from where its two stand now.
         if let Some(mut shot) = game.shot.take() {
             let w = mission.world().borrow();
