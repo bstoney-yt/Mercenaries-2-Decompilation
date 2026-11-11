@@ -231,6 +231,7 @@ mod tests {
             }],
             links: links.iter().map(|l| name_hash(l)).collect(),
             turret: None,
+            flags: Default::default(),
         }
     }
 
