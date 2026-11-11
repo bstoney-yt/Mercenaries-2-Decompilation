@@ -32,6 +32,7 @@ pub mod ported_sys;
 pub mod report;
 pub mod reverb;
 pub mod savedata;
+pub mod screen_queries;
 pub mod script;
 pub mod script_camera;
 pub mod script_flags;
