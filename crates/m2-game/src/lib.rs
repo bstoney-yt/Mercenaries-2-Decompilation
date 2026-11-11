@@ -27,6 +27,7 @@ pub mod report;
 pub mod reverb;
 pub mod savedata;
 pub mod script;
+pub mod script_camera;
 pub mod script_time;
 pub mod shop;
 pub mod subtitles;

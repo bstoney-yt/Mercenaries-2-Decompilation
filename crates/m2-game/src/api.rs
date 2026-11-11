@@ -1002,6 +1002,8 @@ pub struct ScriptWorld {
     pub placed_as: HashMap<u32, String>,
     /// The player is in a scene of the scripts' (`Player.SetCinematicMode`).
     pub cinematic: bool,
+    /// The scripts' camera while a scene has it ([`crate::script_camera`]).
+    pub script_camera: Option<crate::script_camera::Cinematic>,
     /// Characters swimming, as the game last said (`Human.IsSwimming`).
     pub swimming: HashSet<u32>,
     /// Witnesses reporting her, and what each faction has against her
@@ -3099,6 +3101,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // world doesn't place (the HUD's own world) faces north. Always a
     // number: the PDA's map turns by it (`math.rad`), and nil broke its
     // Open half-way, leaving the PDA marked open and the support menu shut.
+    crate::script_camera::install(&lib, &add)?;
     add(&camera, "GetYaw", |w, _, a| {
         let yaw = id(a.first())
             .or(w.player)
@@ -3152,6 +3155,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         };
         if on != w.cinematic {
             w.cinematic = on;
+            w.cinematic_camera(on);
             w.commands.push(Command::Cinematic(on));
         }
         // From the 360 code (0x8233ccc0): true.
