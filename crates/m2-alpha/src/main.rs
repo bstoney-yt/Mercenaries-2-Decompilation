@@ -3608,7 +3608,8 @@ fn marker_test(
         model(
             m2_assets::name_hash("global_airring"),
             at + side * 14.0 + Vec3::Y * 4.0,
-            Some(yaw),
+            // Its one face is its +z side: turned to the camera.
+            Some(yaw + std::f32::consts::PI),
             6.0,
             None,
             [255, 255, 0],

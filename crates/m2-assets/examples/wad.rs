@@ -839,6 +839,37 @@ fn model_nodes<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32) -> AnyResult<
         .ok_or_else(|| format!("no model {hash:08x}"))?;
     let model = bytes.assemble()?;
     println!("model {hash:08x}: {} nodes", model.nodes.len());
+    // Each group's vertex colours and texture coordinates, as ranges.
+    for (n, (segment, geometry)) in model.lod(0).enumerate() {
+        for (gi, g) in geometry.groups.iter().enumerate() {
+            println!(
+                "segment {n} group {gi}: {:?}, {} indices, material ranges {:?}",
+                geometry.kind,
+                g.indices.len(),
+                g.material_ranges
+            );
+            for usage in [DeclUsage::Color, DeclUsage::TexCoord] {
+                let values = g
+                    .decl
+                    .find(usage, 0)
+                    .and_then(|e| g.vertices.read(e))
+                    .unwrap_or_default();
+                let range = |k: usize| {
+                    let it = values.iter().map(|v| v[k]);
+                    (
+                        it.clone().fold(f32::INFINITY, f32::min),
+                        it.fold(f32::NEG_INFINITY, f32::max),
+                    )
+                };
+                println!(
+                    "segment {n} (node {}) group {gi} {usage:?}: {} values, ranges {:?}",
+                    segment.node,
+                    values.len(),
+                    (0..4).map(range).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
     for (i, n) in model.nodes.iter().enumerate() {
         // D3DX rows: the translation is the fourth.
         let t = n.local.m[3];

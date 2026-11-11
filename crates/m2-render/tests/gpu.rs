@@ -441,6 +441,30 @@ fn instanced_draws_repeat_the_geometry() {
     assert_eq!(pixel(&rgba, 50, 32), white, "right");
 }
 
+/// A draw's tint multiplies its surface's colour.
+#[test]
+fn a_tint_colours_the_draw() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            lit: false,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    b.begin_frame(&view()).unwrap();
+    b.draw(&DrawCall {
+        tint: [1.0, 0.0, 0.0, 1.0],
+        ..draw(vb, ib, 1, Mat4::from_scale(Vec3::splat(0.2)))
+    })
+    .unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    assert_eq!(pixel(&rgba, 32, 32), [255, 0, 0, 255]);
+}
+
 /// Draws share one bind group and find their uniforms by instance: a
 /// plain draw after an instanced one still gets its own matrix, and the
 /// instanced one each of its instances.

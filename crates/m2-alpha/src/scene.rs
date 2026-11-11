@@ -1471,7 +1471,7 @@ pub struct Scene {
     pub marker_models: Vec<crate::marker_models::MarkerModel>,
     /// Their models by hash, with their nodes' name hashes (`None` while
     /// loading or when one could not be read).
-    marker_meshes: HashMap<u32, Option<(GpuModel, Vec<(u32, Mat4)>)>>,
+    marker_meshes: HashMap<u32, Option<MarkerMesh>>,
     /// What each vehicle (by model and label) shows over its exhausts
     /// while it has a driver: (node, the effect), read once.
     hazes: HashMap<(u32, String), Vec<(usize, m2_engine::vehicle_parts::ModelEmitter)>>,
@@ -1995,6 +1995,10 @@ const PROP_MARGIN: f32 = 100.0;
 /// soldiers' names ask for, for soldiers whose template has no model of
 /// its own (the rest stand in their template's).
 const ARMY: [&str; 3] = ["vz_hum_soldier", "vz_hum_soldierelite", "vz_hum_deathsquad"];
+
+/// A marker's model on the GPU, with each node's name hash and place in
+/// the model at rest.
+type MarkerMesh = (GpuModel, Vec<(u32, Mat4)>);
 
 /// A model the loading thread has decoded.
 pub enum Loaded {
@@ -3770,6 +3774,11 @@ impl Scene {
                 continue;
             };
             model.tint = m.tint();
+            if m.width.is_none() {
+                // In its bind pose: nothing of it moves.
+                model.draw(queue, m.world());
+                continue;
+            }
             // Each node moved in model space (a tripwire's ends): its
             // place and its skinning both shift by the move.
             let hashes: Vec<u32> = nodes.iter().map(|n| n.0).collect();
