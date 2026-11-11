@@ -5546,6 +5546,7 @@ fn seat_of_template(
         rider_vulnerable: f.rider_vulnerable,
         rider_bashable: f.rider_bashable,
         stowable: f.stowable,
+        ladder: f.ladder,
     };
     (s.name, params, s.player_use, s.links.clone())
 }

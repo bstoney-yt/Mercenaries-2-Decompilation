@@ -35,8 +35,10 @@
 //!
 //! Inferred: a rider the game seats without naming the seat takes the
 //! driver's seat when driving, else the first free one that isn't. Not
-//! ported: `IsSeatBlocked` (0x82347240) and `IsSeatALadder` (0x82347408:
-//! the seat store 0x83653518, not identified), the animation of a
+//! - `Vehicle.IsSeatALadder(seat)` (0x82347408): whether the seat has a
+//!   `ControllerLadder` (the store 0x83653518, named by 0x823B1F98).
+//!
+//! Not ported: `IsSeatBlocked` (0x82347240), the animation of a
 //! transfer (the game only moves the rider's seat), the blocked-seat
 //! test of a `free` search (0x8229CBB8), the
 //! stow seat's guid (`uStowSeat`; given nil).
@@ -66,6 +68,8 @@ pub struct SeatParams {
     pub rider_vulnerable: bool,
     pub rider_bashable: bool,
     pub stowable: bool,
+    /// A ladder (its template's `ControllerLadder`).
+    pub ladder: bool,
 }
 
 impl SeatParams {
@@ -350,6 +354,15 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             None => Err(mlua::Error::runtime("Vehicle.GetSeatParams: not a seat")),
         }
     })?;
+    // 0x82347408: whether the seat is in the `ControllerLadder` store.
+    add(&vehicle, "IsSeatALadder", |w, _, a| {
+        let Some(seat) = id(a.first()) else {
+            return Err(mlua::Error::runtime("Vehicle.IsSeatALadder: not a seat"));
+        };
+        Ok(MultiValue::from_iter([Value::Boolean(
+            w.seats.get(seat).is_some_and(|s| s.params.ladder),
+        )]))
+    })?;
     // 0x82346F00: the seats a seat's rider may move to, keyed by their
     // `SeatLinkName` (the default) or as a list.
     add(&vehicle, "GetSeatToSeat", |w, lua, a| {
@@ -521,6 +534,27 @@ mod tests {
             .eval()
             .unwrap();
         assert!(to_driver && moved && now_passenger && entered);
+        // A ladder seat (its template's `ControllerLadder`).
+        world.borrow_mut().seats.add(
+            20,
+            [(
+                9,
+                SeatParams {
+                    ladder: true,
+                    ..SeatParams::default()
+                },
+                false,
+                vec![],
+            )],
+        );
+        lua.globals().set("ladderjeep", guid_value(20)).unwrap();
+        let (ladder, not): (bool, bool) = lua
+            .load(
+                "return Vehicle.IsSeatALadder(Vehicle.GetSeatByType(ladderjeep, 'p')),                  not Vehicle.IsSeatALadder(Vehicle.GetSeatByType(jeep, 'd'))",
+            )
+            .eval()
+            .unwrap();
+        assert!(ladder && not);
         assert_eq!(list_len, 2);
     }
 }

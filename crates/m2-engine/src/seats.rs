@@ -318,6 +318,9 @@ pub struct SeatFlags {
     pub rider_vulnerable: bool,
     pub rider_bashable: bool,
     pub stowable: bool,
+    /// Its template has a `ControllerLadder` (the store 0x83653518 that
+    /// `Vehicle.IsSeatALadder`, 0x82347408, asks).
+    pub ladder: bool,
 }
 
 impl Seat {
@@ -695,6 +698,7 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
     let to_seat = Table::new(db, "EntranceToSeat");
     let seat_to_seat = Table::new(db, "SeatToSeat");
     let controller = Table::new(db, "ControllerTurret");
+    let ladder = Table::new(db, "ControllerLadder");
     let turret = Table::new(db, "Turret");
     let h = name_hash;
     let (hardpoint, name) = (h("Hardpoint"), h("Name"));
@@ -773,6 +777,7 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
                             rider_vulnerable: b("bIsRiderVulnerable"),
                             rider_bashable: b("bIsRiderBashable"),
                             stowable: b("bIsStowable"),
+                            ladder: !ladder.of_template(template).is_empty(),
                         }
                     },
                 })
