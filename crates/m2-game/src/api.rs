@@ -2009,8 +2009,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             && let Some(o) = w.objects.get_mut(&g)
         {
             o.name = name.to_string_lossy();
+            // From the 360 code (0x8232f000): true.
+            return values([Value::Boolean(true)]);
         }
-        values([])
+        values([Value::Nil])
     })?;
     add(&object, "GetYaw", |w, _, a| {
         let yaw = id(a.first()).and_then(|g| w.objects.get(&g)).map(|o| o.yaw);
@@ -2095,14 +2097,27 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
         values([o.map_or(Value::Nil, |o| Value::Number(f64::from(o.max_health)))])
     })?;
+    // From the 360 code (0x8232e6a8): the health is kept between 0 and the
+    // object's most; the answer is true, or nil for no object (or no
+    // health) or a bad argument.
     add(&object, "SetHealth", |w, _, a| {
-        if let (Some(guid), Some(health)) = (id(a.first()), num(a.get(1))) {
-            if let Some(o) = w.objects.get_mut(&guid) {
-                o.health = health;
-            }
-            w.commands.push(Command::SetHealth { guid, health });
-        }
-        values([])
+        let (Some(guid), Some(health)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let Some(o) = w.objects.get_mut(&guid) else {
+            return values([Value::Nil]);
+        };
+        // Most objects' most health isn't read here yet (100 stands in), so
+        // only the player's, which the game sets, caps it.
+        let capped = if Some(guid) == w.player {
+            health.min(o.max_health)
+        } else {
+            health
+        };
+        let health = capped.max(0.0);
+        o.health = health;
+        w.commands.push(Command::SetHealth { guid, health });
+        values([Value::Boolean(true)])
     })?;
     add(&object, "SetInvincible", |w, _, a| {
         let Some(guid) = id(a.first()) else {
@@ -2460,8 +2475,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             if !o.labels.contains(&l) {
                 o.labels.push(l);
             }
+            // From the 360 code (0x82330700): true once it had a label and
+            // an object.
+            return values([Value::Boolean(true)]);
         }
-        values([])
+        values([Value::Boolean(false)])
     })?;
     add(&object, "RemoveLabel", |w, _, a| {
         if let (Some(o), Some(Value::String(l))) =
@@ -2623,7 +2641,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.cinematic = on;
             w.commands.push(Command::Cinematic(on));
         }
-        values([])
+        // From the 360 code (0x8233ccc0): true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "InCinematicMode", |w, _, _| {
         values([Value::Boolean(w.cinematic)])
@@ -2641,7 +2660,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&player, "SetInputEnabled", |w, _, a| {
         let on = !matches!(a.get(1), Some(Value::Boolean(false)));
         w.commands.push(Command::InputEnabled(on));
-        values([])
+        // From the 360 code (0x8233cf68): true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "SetSurvivalMode", |w, _, a| {
         w.survival_mode = matches!(a.get(1), Some(Value::Boolean(true)));
@@ -2953,10 +2973,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let name = id(a.first())
             .and_then(|g| w.objects.get(&g))
             .map(|o| o.name.to_ascii_lowercase());
-        if let (Some(name), Some(m)) = (name, num(a.get(1))) {
+        // From the 360 code (0x823138b8): a multiplier of 1 takes the
+        // faction off the list; the answer is true, nil for bad arguments.
+        let (Some(name), Some(m)) = (name, num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        if m == 1.0 {
+            w.reports.multipliers.remove(&name);
+        } else {
             w.reports.multipliers.insert(name, m);
         }
-        values([])
+        values([Value::Boolean(true)])
     })?;
     add(&ai, "GetFactionGuid", |w, _, a| {
         // A zone's own; a person's, their faction's template (as
@@ -5760,6 +5787,49 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((orig, copy, players), (2, 1, true));
+    }
+
+    #[test]
+    fn natives_past_100_answer_as_the_360_ones_do() {
+        let (host, world) = setup();
+        crate::hijack::install(&host, &world).unwrap();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        for code in [
+            "return Object.SetHealth(50, 40)",
+            "return Object.AddLabel(50, 'Target')",
+            "return Object.SetName(50, 'Renamed')",
+            "return Ai.SetInfractionMultiplier(Pg.GetGuidByName('OC'), 0.2)",
+            "return Player.SetCinematicMode(Player.GetLocalPlayer(), true)",
+            "return Player.SetInputEnabled(Player.GetLocalPlayer(), false)",
+            "return Object.SetVisible(50, false)",
+            "return Camera.Shake(Player.GetCamera(), 'small', 50, 1, 2)",
+        ] {
+            assert_eq!(ask(code), Value::Boolean(true), "{code}");
+        }
+        assert!(ask("return Object.SetHealth(999, 40)").is_nil());
+        assert_eq!(
+            ask("return Object.AddLabel(999, 'Target')"),
+            Value::Boolean(false)
+        );
+        assert!(ask("return Object.SetName(999, 'x')").is_nil());
+        assert_eq!(
+            ask("return Object.SetVisible(999, true)"),
+            Value::Boolean(false)
+        );
+        // Health never goes below 0, and hers never above her most.
+        lua.load("Object.SetHealth(50, -5) Object.SetHealth(Player.GetLocalCharacter(), 1e6)")
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        assert_eq!(w.objects[&50].health, 0.0);
+        assert_eq!(w.objects[&1].health, w.objects[&1].max_health);
+        // A multiplier of 1 takes the faction off the list.
+        drop(w);
+        lua.load("Ai.SetInfractionMultiplier(Pg.GetGuidByName('OC'), 1)")
+            .exec()
+            .unwrap();
+        assert!(!world.borrow().reports.multipliers.contains_key("oc"));
     }
 
     #[test]

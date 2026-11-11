@@ -567,8 +567,12 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             }
             w.commands
                 .push(Command::Hijack(HijackCommand::Visible { guid, on }));
+            // From the 360 code (0x823319b0): whether it has a model to
+            // show or hide (here: whether it is known).
+            let known = w.objects.contains_key(&guid);
+            return Ok(MultiValue::from_vec(vec![Value::Boolean(known)]));
         }
-        Ok(MultiValue::new())
+        Ok(MultiValue::from_vec(vec![Value::Nil]))
     })?;
 
     // (object, name): a hardpoint's place, as the game last gave it; else
@@ -698,7 +702,10 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             amplitude,
             seconds,
         }));
-        Ok(MultiValue::new())
+        // From the 360 code (0x82316e20): true when the object at the third
+        // place has a place to shake from.
+        let placed = id(a.get(2)).is_some_and(|g| w.objects.contains_key(&g));
+        Ok(MultiValue::from_vec(vec![Value::Boolean(placed)]))
     })?;
 
     // The hijack waits for the atmosphere to stop changing before it
