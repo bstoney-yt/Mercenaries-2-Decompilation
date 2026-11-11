@@ -2874,18 +2874,21 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // from one speaker to the other, `MrxBriefing`'s cheap cinematic),
     // held while the player is in cinematic mode.
     add(&camera, "SetShot", |w, _, a| {
+        // From the 360 code (0x82317990): true once the camera takes the
+        // shot, nil for bad arguments (a shot needs both objects).
         let name = match a.get(1) {
             Some(Value::String(s)) => s.to_string_lossy(),
-            _ => return values([]),
+            _ => return values([Value::Nil]),
         };
-        if let (Some(base), Some(target)) = (id(a.get(2)), id(a.get(3))) {
-            w.commands.push(Command::CameraShot {
-                shot: name,
-                base,
-                target,
-            });
-        }
-        values([])
+        let (Some(base), Some(target)) = (id(a.get(2)), id(a.get(3))) else {
+            return values([Value::Nil]);
+        };
+        w.commands.push(Command::CameraShot {
+            shot: name,
+            base,
+            target,
+        });
+        values([Value::Boolean(true)])
     })?;
     // Player.SetCinematicMode([player,] on, ...): the scripts take her
     // controls and the camera for a scene (the HQ's briefings), and give
@@ -4204,10 +4207,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Number(f64::from(w.asset_request_max))])
     })?;
     add(&sys, "SetAssetRequestMax", |w, _, a| {
-        if let Some(n) = num(a.first()) {
-            w.asset_request_max = n as u32;
-        }
-        values([])
+        // From the 360 code (0x82344e60 -> 0x8230aa70): true, unless it
+        // would leave fewer slots than requests under way (false, and
+        // nothing changes); nil for no number. No request waits here
+        // (loads are at once), so true.
+        let Some(n) = num(a.first()) else {
+            return values([Value::Nil]);
+        };
+        w.asset_request_max = n as u32;
+        values([Value::Boolean(true)])
     })?;
 
     // The engine's additions to the math library: random integers in
@@ -6878,6 +6886,23 @@ mod tests {
             Value::Boolean(false)
         );
         assert!(ask("return Pg.SetPursuit(nil, 2)").is_nil());
+    }
+
+    #[test]
+    fn camera_shot_and_asset_slots_answer_as_the_360_ones_do() {
+        let (host, _) = setup();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        assert_eq!(
+            ask("return Camera.SetShot(Player.GetCamera(), 'OverShoulder', 1, 50)"),
+            Value::Boolean(true)
+        );
+        assert!(ask("return Camera.SetShot(Player.GetCamera(), 'OverShoulder', 1)").is_nil());
+        assert_eq!(
+            ask("return Sys.SetAssetRequestMax(8)"),
+            Value::Boolean(true)
+        );
+        assert!(ask("return Sys.SetAssetRequestMax()").is_nil());
     }
 
     #[test]
