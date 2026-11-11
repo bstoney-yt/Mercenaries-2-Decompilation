@@ -20,6 +20,12 @@
 //!   `IsDriver`, `IsGunner`, `IsCargo`, `IsHijackable`, `IsHijackBlocker`,
 //!   `IsRiderInvisible`, `IsRiderVulnerable`, `IsRiderBashable`,
 //!   `IsStowable`, and `StowSeatGuid`.
+//! - `Vehicle.GetSeatToSeat(seat, keyed)` (0x82346F00): the seats its
+//!   rider may move over to (the seat's `SeatToSeat` rows), keyed by
+//!   their `SeatLinkName` or, `keyed` false, as a list.
+//! - `Vehicle.TransferToSeat(rider, seat, instant)` (0x823474A0, through
+//!   0x822A6FF0) and `Vehicle.EnterBySeatGuid(character, vehicle, seat,
+//!   instant, ..)` (0x82347748): to that seat; false if they can't.
 //! - `Vehicle.SetCanPlayerUse(vehicle, type, can)` (0x82346D10): sets
 //!   whether she may take each of its seats of that type (`a` all, the
 //!   default; `d`, `g`, `c`, `p` as above).
@@ -29,7 +35,10 @@
 //!
 //! Inferred: a rider the game seats without naming the seat takes the
 //! driver's seat when driving, else the first free one that isn't. Not
-//! ported: the blocked-seat test of a `free` search (0x8229CBB8), the
+//! ported: `IsSeatBlocked` (0x82347240) and `IsSeatALadder` (0x82347408:
+//! the seat store 0x83653518, not identified), the animation of a
+//! transfer (the game only moves the rider's seat), the blocked-seat
+//! test of a `free` search (0x8229CBB8), the
 //! stow seat's guid (`uStowSeat`; given nil).
 
 use std::collections::{BTreeMap, HashMap};
@@ -82,6 +91,9 @@ pub struct SeatInfo {
     pub params: SeatParams,
     /// She may take it (`bCanPlayerUse`, `Vehicle.SetCanPlayerUse`).
     pub player_use: bool,
+    /// The seats its rider may move over to (its template's `SeatToSeat`
+    /// rows' `SeatLinkName`s, hashed), in order.
+    pub links: Vec<u32>,
 }
 
 /// The seats of the vehicles in play and who sits where.
@@ -95,11 +107,15 @@ pub struct Seats {
 impl Seats {
     /// Gives `vehicle` its seats, in `SeatLink` order (once: a vehicle
     /// that has them keeps them).
-    pub fn add(&mut self, vehicle: u32, seats: impl IntoIterator<Item = (u32, SeatParams, bool)>) {
+    pub fn add(
+        &mut self,
+        vehicle: u32,
+        seats: impl IntoIterator<Item = (u32, SeatParams, bool, Vec<u32>)>,
+    ) {
         if self.seats.values().any(|s| s.vehicle == vehicle) {
             return;
         }
-        for (name, params, player_use) in seats {
+        for (name, params, player_use, links) in seats {
             let guid = FIRST_SEAT + self.next;
             self.next += 1;
             self.seats.insert(
@@ -109,6 +125,7 @@ impl Seats {
                     name,
                     params,
                     player_use,
+                    links,
                 },
             );
         }
@@ -166,6 +183,32 @@ impl Seats {
         if let Some(s) = seat {
             self.rider.insert(rider, s);
         }
+    }
+
+    /// 0x82346F00: the seats `seat`'s rider may move over to, each with
+    /// its `SeatLinkName`.
+    pub fn to_seats(&self, seat: u32) -> Vec<(u32, u32)> {
+        let Some(s) = self.get(seat) else {
+            return Vec::new();
+        };
+        s.links
+            .iter()
+            .filter_map(|&n| {
+                self.of(s.vehicle)
+                    .find(|(_, t)| t.name == n)
+                    .map(|(g, _)| (n, g))
+            })
+            .collect()
+    }
+
+    /// Moves `rider` to `seat` (0x822A6FF0 for `TransferToSeat`): false
+    /// if it is no seat or someone else sits in it.
+    pub fn move_to(&mut self, rider: u32, seat: u32) -> bool {
+        if self.get(seat).is_none() || self.rider_in(seat).is_some_and(|r| r != rider) {
+            return false;
+        }
+        self.rider.insert(rider, seat);
+        true
     }
 
     /// `rider` is out of its seat.
@@ -307,6 +350,71 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             None => Err(mlua::Error::runtime("Vehicle.GetSeatParams: not a seat")),
         }
     })?;
+    // 0x82346F00: the seats a seat's rider may move to, keyed by their
+    // `SeatLinkName` (the default) or as a list.
+    add(&vehicle, "GetSeatToSeat", |w, lua, a| {
+        let Some(seat) = id(a.first()) else {
+            return Err(mlua::Error::runtime("Vehicle.GetSeatToSeat: not a seat"));
+        };
+        let keyed = !matches!(a.get(1), Some(Value::Boolean(false)));
+        let t = lua.create_table()?;
+        for (i, (name, s)) in w.seats.to_seats(seat).into_iter().enumerate() {
+            if keyed {
+                t.raw_set(i64::from(name), guid_value(s))?;
+            } else {
+                t.raw_set(i as i64 + 1, guid_value(s))?;
+            }
+        }
+        Ok(MultiValue::from_iter([Value::Table(t)]))
+    })?;
+    // 0x823474A0 (0x822A6FF0): moves a rider to a seat of its vehicle.
+    add(&vehicle, "TransferToSeat", |w, _, a| {
+        let ok = match (id(a.first()), id(a.get(1))) {
+            (Some(r), Some(s)) => {
+                let v = w.seats.get(s).map(|s| (s.vehicle, s.params.driver));
+                match v {
+                    Some((vehicle, driver))
+                        if w.objects.get(&r).and_then(|o| o.vehicle) == Some(vehicle) =>
+                    {
+                        let moved = w.seats.move_to(r, s);
+                        if moved && let Some(o) = w.objects.get_mut(&r) {
+                            o.not_driving = !driver;
+                        }
+                        moved
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        Ok(MultiValue::from_iter([Value::Boolean(ok)]))
+    })?;
+    // 0x82347748: seats a character in the seat given by guid
+    // (`EnterBySeatGuid(character, vehicle, seat, instant, ..)`).
+    add(&vehicle, "EnterBySeatGuid", |w, _, a| {
+        let (Some(guid), Some(vehicle), Some(seat)) = (id(a.first()), id(a.get(1)), id(a.get(2)))
+        else {
+            return Err(mlua::Error::runtime("Vehicle.EnterBySeatGuid: arguments"));
+        };
+        let Some(driver) = w
+            .seats
+            .get(seat)
+            .filter(|s| s.vehicle == vehicle)
+            .map(|s| s.params.driver)
+        else {
+            return Ok(MultiValue::from_iter([Value::Boolean(false)]));
+        };
+        let instant = !matches!(a.get(3), Some(Value::Boolean(false)));
+        w.seat(guid, vehicle, instant, !driver);
+        let moved = w.seats.move_to(guid, seat);
+        w.commands.push(crate::api::Command::EnterVehicle {
+            guid,
+            vehicle,
+            seat: if driver { "d" } else { "p" }.into(),
+            instant,
+        });
+        Ok(MultiValue::from_iter([Value::Boolean(moved)]))
+    })?;
     add(&vehicle, "SetCanPlayerUse", |w, _, a| {
         if let Some(v) = id(a.first()) {
             let (k, can) = match a.get(1) {
@@ -339,9 +447,9 @@ mod tests {
         s.add(
             10,
             [
-                (1, p(true, false, false), true),
-                (2, p(false, true, false), true),
-                (3, p(false, false, false), true),
+                (1, p(true, false, false), true, vec![3]),
+                (2, p(false, true, false), true, vec![1, 3]),
+                (3, p(false, false, false), true, vec![]),
             ],
         );
     }
@@ -399,5 +507,20 @@ mod tests {
             .eval()
             .unwrap();
         assert!(gunner && same && driver_free && nobody);
+        // The gunner may move to the driver's seat and the passenger's.
+        let (to_driver, list_len, moved, now_passenger, entered): (bool, i64, bool, bool, bool) = lua
+            .load(
+                "local seat = Vehicle.GetSeatFromRider(rider)
+                 local keyed = Vehicle.GetSeatToSeat(seat)
+                 local list = Vehicle.GetSeatToSeat(seat, false)
+                 local p = Vehicle.GetSeatByType(jeep, 'p')
+                 local moved = Vehicle.TransferToSeat(rider, p, true)
+                 local d = Vehicle.GetSeatByType(jeep, 'd')
+                 return keyed[1] == d, #list, moved, Vehicle.GetSeatFromRider(rider) == p,                    Vehicle.EnterBySeatGuid(rider, jeep, d) and Vehicle.GetSeatFromRider(rider) == d",
+            )
+            .eval()
+            .unwrap();
+        assert!(to_driver && moved && now_passenger && entered);
+        assert_eq!(list_len, 2);
     }
 }
