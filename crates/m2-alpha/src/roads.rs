@@ -28,10 +28,12 @@
 //!   ahead of her or behind, each with what may be seen there, by her
 //!   camera's real frustum) and when they go (beyond 200 m out of sight,
 //!   beyond 250 m always). Nothing takes one away for being stuck.
-//! - Invented: one taken away comes again as the next one put out,
-//!   keeping its model; none comes out within [`CLEAR`] of another (the
-//!   360's spacing test isn't traced); off the roads the rings are laid
-//!   from the road she was last on.
+//! - Each one put out takes its template afresh from the vehicle list of
+//!   the zone where it comes out (0x8226C618); one taken away comes again
+//!   under its entity with its new model.
+//! - Invented: none comes out within [`CLEAR`] of another, in place of
+//!   the 360's box test against the world (0x8226BD10); off the roads
+//!   the rings are laid from the road she was last on.
 //!   Not ported: junctions' stop lines and flow control (no layer read
 //!   holds an `RtFlowControl`); the 360's density grid for rings that
 //!   ask it; the upkeep of states 7 and 8 (0x8226AE98).
@@ -49,8 +51,9 @@ use m2_math::glam::{Quat, Vec2, Vec3};
 use crate::scene::{ParkedVehicle, Scene};
 
 /// None comes out nearer another vehicle than this, metres (a semi is 9
-/// m long). Invented: the 360's spacing test (0x82266D38, 400 squared,
-/// so likely 20 m) isn't traced through.
+/// m long). Invented in place of the 360's: it puts the new one's box
+/// against the world (0x8226BD10 through 0x82153B30) and comes out only
+/// where nothing is there.
 const CLEAR: f32 = 12.0;
 /// A ring point's road must be longer than this, and the point is kept
 /// this far off its ends, metres (0x8226A438).
@@ -160,8 +163,10 @@ pub struct RoadTraffic {
     spawner: Spawner,
     /// Where the rotating look at those out starts next.
     cursor: usize,
-    /// Those taken away, to come again.
+    /// Those taken away, to come again, and those of them coming again
+    /// with where (their new model loading).
     resting: HashSet<u32>,
+    reloading: HashMap<u32, Vec3>,
     /// Her place last frame, for her speed.
     last_focus: Option<Vec3>,
 }
@@ -256,6 +261,29 @@ impl RoadTraffic {
             *t += dt;
         }
         self.loading.retain(|_, t| *t < GIVE_UP);
+        // One coming again is out once its new model stands where it was
+        // put; one whose model never came stays taken away.
+        let vehicles = &scene.vehicles;
+        let loading = &self.loading;
+        let mut back = Vec::new();
+        self.reloading.retain(|&e, &mut at| {
+            let here = vehicles
+                .iter()
+                .any(|v| v.spot.is_some_and(|(x, p, _)| x == e && p == at));
+            if here || !loading.contains_key(&e) {
+                back.push((e, here));
+                false
+            } else {
+                true
+            }
+        });
+        for (e, here) in back {
+            if here {
+                self.resting.remove(&e);
+            } else {
+                self.cars.remove(&e);
+            }
+        }
         let her_speed = self
             .last_focus
             .filter(|_| dt > 0.0)
@@ -376,21 +404,6 @@ impl RoadTraffic {
                 next: next_point(&r.points, s, forward),
                 lane: pick,
             };
-            // One taken away comes again here (its own model kept).
-            let rest = self.resting.iter().copied().next();
-            if let Some(e) = rest
-                && let Some(v) = scene
-                    .vehicles
-                    .iter_mut()
-                    .find(|v| v.spot.is_some_and(|(x, _, _)| x == e))
-            {
-                self.resting.remove(&e);
-                v.spot = Some((e, at, yaw));
-                v.wrecked = false;
-                v.damage = 0.0;
-                self.cars.insert(e, car);
-                continue;
-            }
             let roll = self.roll();
             let list = self.list(list, &index.template_db).to_vec();
             let weights: Vec<(u32, f32)> = list
@@ -410,8 +423,24 @@ impl RoadTraffic {
                 self.refused.insert(name);
                 continue;
             }
-            let entity = BASE + self.made;
-            self.made += 1;
+            // Each one out takes its template afresh from the zone's list
+            // where it comes out (0x8226C618 through 0x82233A30 and
+            // 0x82249B90), one taken away coming again under its entity.
+            let rest = self
+                .resting
+                .iter()
+                .copied()
+                .find(|e| !self.reloading.contains_key(e));
+            let entity = match rest {
+                Some(e) => {
+                    self.reloading.insert(e, at);
+                    e
+                }
+                None => {
+                    self.made += 1;
+                    BASE + self.made - 1
+                }
+            };
             let crew = index.template_db.crew(&name);
             eprintln!(
                 "road traffic {entity:#x}: {name} as {} at ({:.0}, {:.0}, {:.0}) on road {:#x} ({mode:?}, wants {wanted}), crew {crew:?}",
