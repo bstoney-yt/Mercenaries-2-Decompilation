@@ -188,6 +188,13 @@ pub enum Command {
         door: u32,
         open: bool,
     },
+    /// Turn vehicle `guid`'s parts of kind `part` (1 to 8,
+    /// [`vehicle_part`]) on or off: `Vehicle.SetParts`.
+    Part {
+        guid: u32,
+        part: u8,
+        on: bool,
+    },
     /// Create `what` (an object template's name, such as `"Veyron"` or
     /// `"Explosion (Grenade)"`) as `guid`.
     Spawn {
@@ -771,6 +778,9 @@ pub struct ScriptWorld {
     /// Vehicles' doors the scripts opened (true) or closed, by (vehicle,
     /// door's name hash).
     pub doors: HashMap<(u32, u32), bool>,
+    /// Vehicles' parts the scripts turned on (true) or off, by (vehicle,
+    /// kind of part, [`vehicle_part`]).
+    pub parts: HashMap<(u32, u8), bool>,
     /// What the scripts want on the player's screen.
     pub hud: crate::hud::Hud,
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
@@ -1640,6 +1650,25 @@ fn door_request(w: &mut ScriptWorld, a: &[Value], open: bool) -> mlua::Result<Mu
         w.commands.push(Command::Door { guid, door, open });
     }
     values([])
+}
+
+/// The kind of vehicle part `Vehicle.SetParts` names, by its name hash:
+/// from the 360 code's table (0x82348af8). The names known are those the
+/// scripts pass, and two whose hashes match: `LightBrake` 1,
+/// `LightReverse` 2, `LightFront` 3, `CtrlRotation` 4; kinds 5 to 8 by
+/// hash alone.
+pub fn vehicle_part(hash: u32) -> Option<u8> {
+    Some(match hash {
+        0x8194_f448 => 1, // LightBrake
+        0xdd45_b6c3 => 2, // LightReverse
+        0x7139_75a4 => 3, // LightFront
+        0xc079_3c78 => 4, // CtrlRotation
+        0x98f3_790f => 5,
+        0x4905_c3bd => 6,
+        0xe91f_1b2f => 7,
+        0x3273_505d => 8,
+        _ => return None,
+    })
 }
 
 fn guid_value(g: Option<u32>) -> Value {
@@ -2895,6 +2924,31 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.commands.push(Command::Usable { guid, on });
         }
         values([])
+    })?;
+    // From the 360 code (`Vehicle.SetParts(v, part, on)`, 0x82348af8): the
+    // part's name (hashed) picks one of eight kinds ([`vehicle_part`]);
+    // another name, or a missing argument, is the usual argument error
+    // (nil here). It sets that kind on the vehicle (0x82276828: 1 to 3
+    // its lights; 4 the rotation controllers' enable bit; 5 a door,
+    // queued opening when on; 6 to 8 other parts) and answers true.
+    // PmcCon002 turns a vehicle's front lights and its rotating part on
+    // and off.
+    add(&vehicle, "SetParts", |w, _, a| {
+        let part = match a.get(1) {
+            Some(Value::String(s)) => vehicle_part(m2_assets::name_hash(&s.to_string_lossy())),
+            _ => None,
+        };
+        let (Some(guid), Some(part), Some(Value::Boolean(on))) = (id(a.first()), part, a.get(2))
+        else {
+            return values([Value::Nil]);
+        };
+        w.parts.insert((guid, part), *on);
+        w.commands.push(Command::Part {
+            guid,
+            part,
+            on: *on,
+        });
+        values([Value::Boolean(true)])
     })?;
     add(&vehicle, "GetRiders", |w, lua, a| {
         let v = id(a.first());
@@ -5964,6 +6018,42 @@ mod tests {
         );
         assert_eq!(w.doors.get(&(50, pivot)), Some(&false));
         assert!(host.take_calls().is_empty());
+    }
+
+    #[test]
+    fn vehicle_parts_turn_on_and_off_by_kind() {
+        // PmcCon002: Vehicle.SetParts(v, "LightFront", true), "CtrlRotation".
+        let (host, world) = setup();
+        world.borrow_mut().take_commands();
+        let (front, turn, other): (bool, bool, Value) = host
+            .lua()
+            .load(
+                "return Vehicle.SetParts(50, 'LightFront', true),
+                   Vehicle.SetParts(50, 'CtrlRotation', false),
+                   Vehicle.SetParts(50, 'Wheels', true)",
+            )
+            .eval()
+            .unwrap();
+        assert!(front && turn && other.is_nil());
+        let mut w = world.borrow_mut();
+        assert_eq!(
+            w.take_commands(),
+            [
+                Command::Part {
+                    guid: 50,
+                    part: 3,
+                    on: true
+                },
+                Command::Part {
+                    guid: 50,
+                    part: 4,
+                    on: false
+                },
+            ]
+        );
+        assert_eq!(w.parts.get(&(50, 3)), Some(&true));
+        assert_eq!(vehicle_part(m2_assets::name_hash("LightBrake")), Some(1));
+        assert_eq!(vehicle_part(m2_assets::name_hash("LightReverse")), Some(2));
     }
 
     #[test]
