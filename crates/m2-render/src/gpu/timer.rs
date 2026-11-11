@@ -14,9 +14,12 @@ use std::time::Instant;
 /// The stages of a frame, in order, each timed from the mark before it.
 pub const STAGES: [&str; 5] = ["shadows", "world", "water", "glows", "post"];
 
-/// [`GpuTimes::cpu`]'s last entry: the CPU from the end of the last stage
-/// to the end of the frame's submit.
-pub const CPU_SUBMIT: usize = STAGES.len();
+/// [`GpuTimes::cpu`]'s entry for the CPU from the end of the last stage
+/// to the command buffer finished.
+pub const CPU_FINISH: usize = STAGES.len();
+/// [`GpuTimes::cpu`]'s last entry: the CPU from the command buffer
+/// finished to the end of the frame's submit.
+pub const CPU_SUBMIT: usize = STAGES.len() + 1;
 
 /// Marks a frame writes: one before the first stage and one after each.
 const MARKS: u32 = STAGES.len() as u32 + 1;
@@ -40,8 +43,8 @@ pub struct GpuTimes {
     /// Frames whose CPU encoding was timed.
     pub cpu_frames: u32,
     /// The CPU's milliseconds encoding each of [`STAGES`], then
-    /// [`CPU_SUBMIT`], summed over `cpu_frames`.
-    pub cpu: [f64; STAGES.len() + 1],
+    /// [`CPU_FINISH`] and [`CPU_SUBMIT`], summed over `cpu_frames`.
+    pub cpu: [f64; STAGES.len() + 2],
 }
 
 impl GpuTimes {
@@ -169,6 +172,11 @@ impl GpuTimer {
         if self.inner.borrow().current.is_some() {
             encoder.write_timestamp(&self.set, stage as u32 + 1);
         }
+    }
+
+    /// The frame's command buffer is finished (CPU time only).
+    pub fn finished(&self) {
+        self.lap(CPU_FINISH);
     }
 
     /// Copies the frame's marks out to its read-back buffer.

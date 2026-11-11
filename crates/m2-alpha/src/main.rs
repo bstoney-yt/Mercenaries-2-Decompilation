@@ -8730,7 +8730,7 @@ fn gpu_line(g: &m2_render::gpu::timer::GpuTimes) -> String {
     let c = f64::from(g.cpu_frames.max(1));
     let cpu: Vec<String> = m2_render::gpu::timer::STAGES
         .iter()
-        .chain(&["submit"])
+        .chain(&["finish", "submit"])
         .zip(g.cpu)
         .map(|(name, ms)| format!("{name} {:.2}", ms / c))
         .collect();

@@ -2328,7 +2328,11 @@ impl WgpuBackend {
         if let Some(t) = timer {
             t.end(&mut encoder);
         }
-        Ok(encoder.finish())
+        let commands = encoder.finish();
+        if let Some(t) = timer {
+            t.finished();
+        }
+        Ok(commands)
     }
 }
 
