@@ -2138,7 +2138,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             num(a.get(2)).unwrap_or(0.0),
             num(a.get(3)).unwrap_or(0.0),
         ];
-        let yaw = num(a.get(4)).unwrap_or(0.0);
+        // Degrees (the 360 multiplies by 0.0174533); scripts pass 0 or 90.
+        let yaw = num(a.get(4)).unwrap_or(0.0).to_radians();
         values([crate::events::guid_value(w.spawn(what, position, yaw))])
     })?;
 
@@ -2183,9 +2184,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // Angles cross the script boundary in degrees (from the 360 code:
+    // `Object.GetYaw` 0x8232ebd8 multiplies by 57.29583, `Object.SetYaw`
+    // 0x8232f8b0 and `Pg.Spawn` 0x82336b70 by 0.0174533, `Camera.GetYaw`
+    // 0x82316ad8 by 57.29578). Here objects keep radians.
     add(&object, "GetYaw", |w, _, a| {
         let yaw = id(a.first()).and_then(|g| w.objects.get(&g)).map(|o| o.yaw);
-        values([yaw.map_or(Value::Nil, |y| Value::Number(f64::from(y)))])
+        values([yaw.map_or(Value::Nil, |y| Value::Number(f64::from(y.to_degrees())))])
     })?;
     // (holder, object): whether `object` is still in `holder`'s hands. A
     // designator the game reports thrown has left them.
@@ -2231,14 +2236,19 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&object, "GetHibernationDistance", |_, _, _| {
         values([Value::Number(HIBERNATION_DISTANCE)])
     })?;
+    // Object.SetYaw(object, degrees): from the 360 code (0x8232f8b0) it
+    // answers true, or nil for a bad argument or an object with no place.
     add(&object, "SetYaw", |w, _, a| {
-        if let (Some(guid), Some(yaw)) = (id(a.first()), num(a.get(1))) {
-            if let Some(o) = w.objects.get_mut(&guid) {
-                o.yaw = yaw;
-            }
-            w.commands.push(Command::Turn { guid, yaw });
-        }
-        values([])
+        let (Some(guid), Some(degrees)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let yaw = degrees.to_radians();
+        let Some(o) = w.objects.get_mut(&guid) else {
+            return values([Value::Nil]);
+        };
+        o.yaw = yaw;
+        w.commands.push(Command::Turn { guid, yaw });
+        values([Value::Boolean(true)])
     })?;
     // (object, boundary): whether the object (a rider: its vehicle) is
     // inside the boundary, as the `Boundary` event judges it. From the 8
@@ -2771,7 +2781,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .or(w.player)
             .and_then(|g| w.objects.get(&g))
             .map_or(0.0, |o| o.yaw);
-        values([Value::Number(f64::from(yaw))])
+        values([Value::Number(f64::from(yaw.to_degrees()))])
     })?;
     // Camera.SetShot(camera, shot, base, target, ...): a named shot of the
     // engine's (the HQ's briefings ask `OverTheShoulderLeft` and `Right`,
@@ -6405,6 +6415,31 @@ mod tests {
             })
             .collect();
         assert_eq!(amounts, [100.0, 1.0]);
+    }
+
+    #[test]
+    fn angles_cross_the_script_boundary_in_degrees() {
+        // Scripts spawn turned 90 and read yaws back in degrees; objects
+        // keep radians.
+        let (host, world) = setup();
+        let (spawned, set, bad, turned, camera): (f64, bool, Value, f64, f64) = host
+            .lua()
+            .load(
+                "local g = Pg.Spawn('Veyron', 0, 0, 0, 90)
+                 local spawned = Object.GetYaw(g)
+                 local set = Object.SetYaw(50, 180)
+                 return spawned, set, Object.SetYaw(999, 10), Object.GetYaw(50),
+                   Camera.GetYaw(Player.GetCamera())",
+            )
+            .eval()
+            .unwrap();
+        assert!((spawned - 90.0).abs() < 1e-3);
+        assert!(set && bad.is_nil());
+        assert!((turned - 180.0).abs() < 1e-3);
+        let w = world.borrow();
+        assert!((w.objects[&50].yaw - std::f32::consts::PI).abs() < 1e-5);
+        let her = f64::from(w.objects[&1].yaw.to_degrees());
+        assert!((camera - her).abs() < 1e-3);
     }
 
     #[test]
