@@ -809,6 +809,8 @@ pub struct ScriptWorld {
     /// How each person regards another (`Ai.SetFeeling`), by (person,
     /// other).
     pub feelings: HashMap<(u32, u32), f32>,
+    /// The last goal handle `Ai.Goal` gave out.
+    pub goal_handles: u32,
     /// What the scripts want on the player's screen.
     pub hud: crate::hud::Hud,
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
@@ -2155,7 +2157,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&object, "GetPosition", |w, _, a| {
         match id(a.first()).and_then(|g| w.objects.get(&g)) {
             Some(o) => values(o.position.map(|c| Value::Number(f64::from(c)))),
-            None => values([]),
+            // From the 360 code (0x8232eb58): one nil.
+            None => values([Value::Nil]),
         }
     })?;
     add(&object, "SetPosition", |w, _, a| {
@@ -2328,7 +2331,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         if now != was {
             w.commands.push(Command::Invincible { guid, on: now });
         }
-        values([])
+        // From the 360 code (0x82330450): true.
+        values([Value::Boolean(true)])
     })?;
     add(&object, "Kill", |w, _, a| {
         if let Some(guid) = id(a.first()) {
@@ -2641,11 +2645,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&object, "IsPlayerControlled", |w, _, a| {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
-        values([if o.is_some_and(|o| o.player_controlled) {
-            Value::Integer(1)
-        } else {
-            Value::Nil
-        }])
+        // From the 360 code (0x8232ffc8): the player who controls it (as
+        // Player.GetLocalPlayer names her, guid 1), else nil.
+        values([guid_value(
+            o.is_some_and(|o| o.player_controlled).then_some(1),
+        )])
     })?;
     add(&object, "HasLabel", |w, _, a| {
         let has = match (id(a.first()).and_then(|g| w.objects.get(&g)), a.get(1)) {
@@ -3006,8 +3010,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&player, "GetSecondaryPlayer", |_, _, _| {
         values([Value::Nil])
     })?;
-    add(&player, "IsLocal", |_, _, a| {
-        values([Value::Boolean(id(a.first()) == Some(1))])
+    // From the 360 code (0x8233e528): a player's number (0 is hers) or a
+    // player; nil for neither.
+    add(&player, "IsLocal", |_, _, a| match a.first() {
+        Some(Value::Integer(n)) => values([Value::Boolean(*n == 0)]),
+        Some(Value::Number(n)) => values([Value::Boolean(*n == 0.0)]),
+        v => match id(v) {
+            Some(g) => values([Value::Boolean(g == 1)]),
+            None => values([Value::Nil]),
+        },
     })?;
     // The players, a list the scripts go through (`pairs`, `ipairs`)...
     add(&player, "GetAllPlayers", |_, lua, _| {
@@ -3510,6 +3521,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let Some(guid) = id(t.raw_get::<Value>("AIGuid").ok().as_ref()) else {
             return values([]);
         };
+        // The 360 answers nil for no AI. The goal still goes to the game
+        // here: the scripts' world may not hold everyone the game does
+        // (a layer's people named before their layer is read).
+        let known = w.objects.contains_key(&guid);
         let goal: String = t.raw_get::<Option<String>>("Goal")?.unwrap_or_default();
         let location = match t.raw_get::<Value>("Location")? {
             Value::Table(l) => {
@@ -3548,7 +3563,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             target,
             haste,
         });
-        values([])
+        // From the 360 code (0x8230ffb8): the goal's handle, a number
+        // (`Ai.RemoveGoal{ AIGuid, Handle }` takes it back); nil when
+        // `AIGuid` is no AI. `Force = true` clears the AI's goals first,
+        // which a new goal here does anyway (above). Handles count up
+        // from 1 here; the 360's own numbering isn't traced.
+        if !known {
+            return values([Value::Nil]);
+        }
+        w.goal_handles += 1;
+        values([Value::Number(f64::from(w.goal_handles))])
     })?;
 
     // A pilot flies its vehicle, with any cargo on the winch, to a point
@@ -4009,8 +4033,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Scripts also call it bare.
     globals.raw_set("StringToGuid", sys.get::<Function>("StringToGuid")?)?;
     add(&sys, "GuidToString", |_, lua, a| {
-        let text = id(a.first()).map_or_else(|| "nil".to_owned(), |g| g.to_string());
-        values([Value::String(lua.create_string(&text)?)])
+        // From the 360 code (0x82344660): "0x%08X"; nil for a bad argument.
+        let Some(g) = id(a.first()) else {
+            return values([Value::Nil]);
+        };
+        values([Value::String(lua.create_string(format!("0x{g:08X}"))?)])
     })?;
     add(&sys, "RequestGameState", |w, _, a| {
         if let Some(Value::String(s)) = a.first() {
@@ -4018,7 +4045,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.game_state = state.clone();
             w.commands.push(Command::GameState(state));
         }
-        values([])
+        // From the 360 code (0x82344710): true.
+        values([Value::Boolean(true)])
     })?;
     {
         use crate::script_time::{self as t, ClockKind};
@@ -5158,7 +5186,7 @@ mod tests {
             .unwrap();
         assert!(events.update_shared(0.1, &world).is_empty());
         let seated: String = host.lua().globals().get("seated").unwrap();
-        assert_eq!(seated, "in:1/50");
+        assert_eq!(seated, "in:0x00000001/0x00000032");
     }
 
     #[test]
@@ -5383,7 +5411,7 @@ mod tests {
         world.borrow_mut().objects.get_mut(&1).unwrap().position = [103.0, 9.0, 98.0];
         assert!(events.update_shared(0.1, &world).is_empty());
         let arrived: String = host.lua().globals().get("arrived").unwrap();
-        assert_eq!(arrived, "1@70");
+        assert_eq!(arrived, "0x00000001@0x00000046");
     }
 
     // PmcCon034's out-of-bounds: the region an "exit" waits on is watched,
@@ -5524,7 +5552,7 @@ mod tests {
             world.borrow_mut().objects.get_mut(&1).unwrap().position = to;
             assert!(events.update_shared(0.1, &world).is_empty());
             let crossed: String = host.lua().globals().get("crossed").unwrap();
-            assert_eq!(crossed, format!("zone 1@70 {mode}"));
+            assert_eq!(crossed, format!("zone 0x00000001@0x00000046 {mode}"));
         }
     }
 
@@ -5640,7 +5668,7 @@ mod tests {
         events.update_shared(0.1, &world);
         events.update_shared(0.1, &world);
         let dead: Vec<String> = host.lua().globals().get("dead").unwrap();
-        assert_eq!(dead, ["60", "61"]);
+        assert_eq!(dead, ["0x0000003C", "0x0000003D"]);
     }
 
     // Only the template database's names are templates: `HqInterior`
@@ -5748,7 +5776,7 @@ mod tests {
         )));
         events.update_shared(0.1, &world);
         let dropped: String = host.lua().globals().get("dropped").unwrap();
-        assert_eq!(dropped, "82");
+        assert_eq!(dropped, "0x00000052");
     }
 
     #[test]
@@ -5835,7 +5863,7 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((a, b, w, m, kids, left), (1, 2, 0.0, 2.0, 2, 1));
-        assert_eq!(guid, "16");
+        assert_eq!(guid, "0x00000010");
     }
 
     #[test]
@@ -6440,6 +6468,51 @@ mod tests {
         assert!((w.objects[&50].yaw - std::f32::consts::PI).abs() < 1e-5);
         let her = f64::from(w.objects[&1].yaw.to_degrees());
         assert!((camera - her).abs() < 1e-3);
+    }
+
+    #[test]
+    fn natives_answer_as_the_360_ones_do() {
+        let (host, _) = setup();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        let handle = |v: Value| v.as_number().or(v.as_integer().map(|i| i as f64));
+        // Ai.Goal: a handle per goal; nil for no AI.
+        let a = handle(ask("return Ai.Goal{ AIGuid = 50, Goal = 'MoveTo' }")).unwrap();
+        let b = handle(ask(
+            "return Ai.Goal{ AIGuid = 50, Goal = 'MoveTo', Force = true }",
+        ))
+        .unwrap();
+        assert!(b > a && a >= 1.0);
+        assert!(ask("return Ai.Goal{ AIGuid = 999, Goal = 'MoveTo' }").is_nil());
+        // Sys.GuidToString: "0x%08X".
+        let s: String = lua
+            .load("return Sys.GuidToString(Sys.StringToGuid('0x2a'))")
+            .eval()
+            .unwrap();
+        assert_eq!(s, "0x0000002A");
+        assert!(ask("return Sys.GuidToString(nil)").is_nil());
+        // Object.IsPlayerControlled: her player, not a number.
+        assert_eq!(
+            ask("return Object.IsPlayerControlled(1) == Player.GetLocalPlayer()"),
+            Value::Boolean(true)
+        );
+        assert!(ask("return Object.IsPlayerControlled(50)").is_nil());
+        // True from these.
+        for code in [
+            "return Sys.RequestGameState('Game')",
+            "return Object.SetInvincible(50, true, 'test')",
+            "return Player.IsLocal(0)",
+            "return Player.IsLocal(Player.GetLocalPlayer())",
+        ] {
+            assert_eq!(ask(code), Value::Boolean(true), "{code}");
+        }
+        assert_eq!(ask("return Player.IsLocal(1)"), Value::Boolean(false));
+        // Object.GetPosition: one nil for no object.
+        let n: i64 = lua
+            .load("return select('#', Object.GetPosition(999))")
+            .eval()
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

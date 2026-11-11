@@ -399,10 +399,14 @@ impl Events {
                             gone.as_deref().unwrap_or("none")
                         ));
                     }
+                    // From the 360 code (0x823583d8): it answers whether
+                    // there was such an event to delete.
+                    let found = s.pending.iter().any(|p| p.id == id);
                     s.deleted.insert(id);
                     s.pending.retain(|p| p.id != id);
+                    return Ok(MultiValue::from_vec(vec![Value::Boolean(found)]));
                 }
-                Ok(MultiValue::new())
+                Ok(MultiValue::from_vec(vec![Value::Boolean(false)]))
             })?,
         )?;
         let store = Rc::clone(&self.store);
@@ -411,15 +415,20 @@ impl Events {
             safe_function(lua, move |_, args| {
                 let mut args = args.into_iter();
                 if let Some(Value::String(name)) = args.next() {
-                    let data = args.next().unwrap_or(Value::Nil);
+                    let data = args.next();
+                    let has_data = data.is_some();
+                    let data = data.unwrap_or(Value::Nil);
                     let name = name.to_string_lossy();
                     let mut s = store.borrow_mut();
                     if s.relay.contains(&name) {
                         s.relayed.push((name.clone(), data.clone()));
                     }
                     s.posted.push((name, data));
+                    // From the 360 code (0x82358470): true once it has a
+                    // name and something to send with it, else false.
+                    return Ok(MultiValue::from_vec(vec![Value::Boolean(has_data)]));
                 }
-                Ok(MultiValue::new())
+                Ok(MultiValue::from_vec(vec![Value::Boolean(false)]))
             })?,
         )?;
         // `Event.__m2_fire(kind, ...)`: the engine's own events (the GUI's
@@ -1810,9 +1819,22 @@ mod tests {
             events.update(1.0, &world);
         }
         assert_eq!(log(&host).len(), 3);
-        host.lua().load("Event.Delete(id)").exec().unwrap();
+        // Event.Delete answers whether there was one (0x823583d8).
+        let (first, again): (bool, bool) = host
+            .lua()
+            .load("return Event.Delete(id), Event.Delete(id)")
+            .eval()
+            .unwrap();
+        assert!(first && !again);
         events.update(1.0, &world);
         assert_eq!(log(&host).len(), 3);
+        // Event.Post answers whether it had a name and data (0x82358470).
+        let (posted, bare): (bool, bool) = host
+            .lua()
+            .load("return Event.Post('Ping', {}), Event.Post('Ping')")
+            .eval()
+            .unwrap();
+        assert!(posted && !bare);
     }
 
     #[test]
