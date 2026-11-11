@@ -529,6 +529,25 @@ pub fn crash_base(size: f32) -> f32 {
 /// `DamageKey` of its own names (survey `runover`).
 pub const RAM_KIND: &str = "Car";
 
+/// A living person hit by a vehicle for at least this much is knocked
+/// down, for about [`KNOCKDOWN_SECONDS`]
+/// ([`crate::melee::knockdown_seconds`] spreads it a fifth either way).
+///
+/// From the 360 code: the animation driver's damage handler (0x824203F0)
+/// tries the knockdown (0x82422480) before any stagger when the damage
+/// event's amount is at least the float at 0x82DE887C, 2.0 in the image.
+/// The knockdown happens when the attacker is an object of kind 2, 3, 4,
+/// 8 or 10 (2 is `_CarPhysicsV2`, 10 the boats) and the person is not
+/// player-kind; it posts `KnockDown` (0x9C9F3F13) and sets the time down
+/// by 0x82423848 from 5.0 (the float at 0x820BAF84).
+///
+/// **Inferred**: kinds 3, 4 and 8 read as the other vehicles (not
+/// established); the amount as the damage after the table's cell. The
+/// float at 0x82DE887C is a variable: what may change it was not looked
+/// for.
+pub const KNOCKDOWN_DAMAGE: f32 = 2.0;
+pub const KNOCKDOWN_SECONDS: f32 = 5.0;
+
 /// What a vehicle of `mass` (kg) whose ram is of kind `key` (a name hash:
 /// `Car`, `Tank`) does to a person whose `ModifierKey` row is `row`
 /// (`Human`, `HumanArmor`, `Hero`), running into them at `speed` (m/s):
