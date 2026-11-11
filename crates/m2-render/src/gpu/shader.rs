@@ -317,10 +317,14 @@ fn game_air(p: vec3<f32>) -> vec4<f32> {
 const SKY_DOME: vec3<f32> = vec3<f32>(20000.0, 10000.0, 20000.0);
 
 // The sky along the unit ray r, in display values, as the game's sky
-// shaders colour the dome (the install's shaders 417 and 416, the sky's
-// by their `Matrix` constant): at the dome's point p, half the sunlight
-// the air keeps on the way (E * dirLightColor * ScatteringTermMultiplier.x)
-// plus the air's in-scattering (`game_air`), held within 1e-5 and 30000.
+// shaders colour the dome: the install's vertex shader 417 (the only one
+// with the sky's `Matrix` constant) hands its pixel shader the sunlight
+// the air keeps (E * dirLightColor * ScatteringTermMultiplier.x) and the
+// air's in-scattering; pixel shader 416 adds half the first to the
+// second, held within 1e-5 and 30000. Inferred: that 416 is the sky's
+// pixel shader. The other reading of the pair, 482, keeps the in-scattering
+// alone (and may be the sun's or the reflected sky's); footage of an
+// in-scattering-only sky ran darker than the game's.
 fn game_sky(r: vec3<f32>) -> vec3<f32> {
     let eye = frame.eye.xyz;
     let p = eye + r / max(length(r / SKY_DOME), 1e-6);
