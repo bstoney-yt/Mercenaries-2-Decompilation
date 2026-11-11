@@ -717,6 +717,9 @@ impl Mission {
             w.inventory.thrown = thrown;
             for e in layers.values().flatten() {
                 w.entities.insert(e.guid, e.at);
+                if !e.path.is_empty() {
+                    w.paths.insert(e.guid, e.path.clone());
+                }
                 if e.is_marker() {
                     w.entity_names
                         .entry(e.name.to_ascii_lowercase())

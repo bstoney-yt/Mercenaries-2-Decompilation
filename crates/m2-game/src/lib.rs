@@ -20,6 +20,7 @@ pub mod reverb;
 pub mod savedata;
 pub mod script;
 pub mod shop;
+pub mod spawn_point;
 pub mod subtitles;
 pub mod support;
 pub mod vo;
