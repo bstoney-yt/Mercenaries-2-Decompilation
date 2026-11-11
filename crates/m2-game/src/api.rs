@@ -897,6 +897,10 @@ pub struct ScriptWorld {
     /// who carries whom (`Human.IsCarrying`) ([`crate::mission::Mission::set_human_state`]).
     pub human_states: HashMap<u32, String>,
     pub state_changes: Vec<crate::events::StateChange>,
+    /// How fast objects move, m/s, as the game last said
+    /// ([`crate::mission::Mission::set_speed`]); none for one at rest or
+    /// never reported (`Object.GetVelocity`).
+    pub speeds: HashMap<u32, f32>,
     /// What characters did with their weapons, for `WeaponEvent` events
     /// ([`crate::mission::Mission::weapon_event`]).
     pub weapon_events: Vec<crate::events::WeaponChange>,
@@ -2212,6 +2216,29 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         });
         values([Value::Boolean(true)])
     })?;
+    // Object.GetVelocity(object): how fast it moves, one number (m/s),
+    // not a vector. From the 360 code (8232ED50): the length of a moving
+    // body's velocity, else the speed kept for it; nothing for what isn't
+    // an object.
+    add(&object, "GetVelocity", |w, _, a| match id(a.first()) {
+        Some(g) if w.objects.contains_key(&g) => {
+            let speed = w.speeds.get(&g).copied().unwrap_or(0.0);
+            values([Value::Number(f64::from(speed))])
+        }
+        _ => values([]),
+    })?;
+    // Object.IsVisible(object): whether it is awake and on the player's
+    // screen. From the 360 code (82331C10): false for one asleep, out of
+    // view or not in play; nothing when the call names no object.
+    add(&object, "IsVisible", |w, _, a| match id(a.first()) {
+        Some(g) => {
+            use crate::events::World as _;
+            values([Value::Boolean(
+                w.objects.contains_key(&g) && w.is_awake(g) && w.is_visible(g) == Some(true),
+            )])
+        }
+        None => values([]),
+    })?;
     add(&object, "GetHealth", |w, _, a| {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
         values([o.map_or(Value::Nil, |o| Value::Number(f64::from(o.health)))])
@@ -2939,6 +2966,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // ...and how many there are, which they compare and count with
     // (`nPlayers == 2`, `1 < n`; from the scripts' use: PirCon004 did
     // sums on it and stopped short of its ending).
+    // Player.IsCoopMultiplayer(): whether both players are in the game.
+    // From the 360 code (8233E058): player 0 and player 1 both joined.
+    // One player here.
+    add(&player, "IsCoopMultiplayer", |_, _, _| {
+        values([Value::Boolean(false)])
+    })?;
     add(&player, "GetCurrentPlayers", |_, _, _| {
         values([Value::Integer(1)])
     })?;
@@ -4610,6 +4643,43 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn the_oil_contracts_questions_are_answered() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(70, Object::new("OilCon003_Truck", [5.0, 0.0, 7.0]));
+            w.speeds.insert(70, 12.5);
+            w.insert(71, Object::new("OilCon003_Parked", [9.0, 0.0, 7.0]));
+        }
+        let (moving, parked, nothing, coop, unseen, no_object): (
+            f64,
+            f64,
+            Value,
+            bool,
+            Value,
+            Value,
+        ) = host
+            .lua()
+            .load(
+                r#"
+                local g = Sys.StringToGuid
+                return Object.GetVelocity(g("70")), Object.GetVelocity(g("71")),
+                    (Object.GetVelocity(g("72"))), Player.IsCoopMultiplayer(),
+                    Object.IsVisible(g("72")), (Object.IsVisible())
+                "#,
+            )
+            .eval()
+            .unwrap();
+        // A speed, not a vector; at rest, 0; no such object, nothing.
+        assert_eq!((moving, parked), (12.5, 0.0));
+        assert_eq!(nothing, Value::Nil);
+        assert!(!coop);
+        // Not in play: not visible. No object named: nothing.
+        assert_eq!(unseen, Value::Boolean(false));
+        assert_eq!(no_object, Value::Nil);
     }
 
     #[test]

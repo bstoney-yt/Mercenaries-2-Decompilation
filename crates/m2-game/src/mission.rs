@@ -1390,6 +1390,11 @@ impl Mission {
         w.weapon_events.drain(..extra);
     }
 
+    /// Object `guid` now moves at `speed` m/s, for `Object.GetVelocity`.
+    pub fn set_speed(&mut self, guid: u32, speed: f32) {
+        self.world.borrow_mut().speeds.insert(guid, speed);
+    }
+
     /// Character `guid` is now in human state `state` (`Stance.Action`:
     /// `KnockedDown.Idle`), for the scripts' `HumanStateTransition` events.
     pub fn set_human_state(&mut self, guid: u32, state: &str) {
@@ -3585,6 +3590,34 @@ mod tests {
             .unwrap();
         assert!(m.lua().globals().get::<bool>("__c").unwrap());
     }
+    #[test]
+    fn a_health_below_its_figure_fires_the_less_than_event() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let mut tank = crate::api::Object::new("OilCon002_Tank", [5.0, 0.0, 0.0]);
+        tank.health = 100.0;
+        m.world.borrow_mut().insert(9, tank);
+        m.run(
+            r#"__n = 0
+            Event.Create(Event.ObjectHealthLessThan, { Sys.StringToGuid('0x9'), 40 },
+                function(...) __n = __n + 1 + select('#', ...) end, {})"#,
+            "events",
+        )
+        .unwrap();
+        let fired = |m: &Mission| m.lua().globals().get::<i64>("__n").unwrap();
+        m.tick(0.1);
+        assert_eq!(fired(&m), 0);
+        m.world.borrow_mut().objects.get_mut(&9).unwrap().health = 40.0;
+        m.tick(0.1);
+        // At the figure is not below it.
+        assert_eq!(fired(&m), 0);
+        m.world.borrow_mut().objects.get_mut(&9).unwrap().health = 39.0;
+        m.tick(0.1);
+        // Once, and with nothing passed.
+        assert_eq!(fired(&m), 1);
+        m.tick(0.1);
+        assert_eq!(fired(&m), 1);
+    }
+
     #[test]
     fn what_she_does_with_a_weapon_reaches_the_weapon_events() {
         let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
