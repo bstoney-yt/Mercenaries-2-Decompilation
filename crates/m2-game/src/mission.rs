@@ -2739,11 +2739,25 @@ fn seat_crew(
 /// offered its context action (`[ContextAction.TagMunition:...]`), and
 /// taking it stocks the item and posts `MunitionsPickup`, which
 /// JetCon001 counts its three bunker busters by.
-pub const OBJECT_SCRIPTS: [(&str, u32); 3] = [
+///
+/// `DangerousBuilding` is the script of the buildings whose spawners start
+/// off (from the 360 code: nothing in the engine turns a spawner on that
+/// its data has off; only `Ai.TweakAttachedSpawners` does). As its
+/// building wakes: if it is labelled `Occupied`, it waits for the building
+/// to be damaged and turns all its spawners on; otherwise, unless 8
+/// buildings are dangerous already, it turns them on (the ground group
+/// off, the list `Spawnlist (VZ Tower)`) one time in its rarity (16 by
+/// default, `WifVzRegionNames`; `"never"` while OilCon001, OilCon020,
+/// OilCon021 and PirCon004 run).
+pub const OBJECT_SCRIPTS: [(&str, u32); 4] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
+    ("DangerousBuilding", DANGEROUS_BUILDING),
 ];
+
+/// `DangerousBuilding`'s module hash.
+pub const DANGEROUS_BUILDING: u32 = 0x5439_77f7;
 
 /// `Munitions`' module hash.
 pub const MUNITIONS: u32 = 0xf71e_9491;
@@ -3434,6 +3448,18 @@ mod tests {
         bb.script_data = Some(3);
         assert!(activate(&lua, &[bb], true).is_empty());
         assert_eq!(lua.globals().get::<u32>("got").unwrap(), 3);
+    }
+
+    #[test]
+    fn a_dangerous_building_is_activated_as_its_layer_comes_in() {
+        let lua = mlua::Lua::new();
+        lua.load("DangerousBuilding = { OnActivate = function(g) woke = g end }")
+            .exec()
+            .unwrap();
+        let mut house = villa_tank();
+        house.script = Some(DANGEROUS_BUILDING);
+        assert!(activate(&lua, &[house], true).is_empty());
+        assert!(lua.globals().get::<mlua::Value>("woke").unwrap() != mlua::Value::Nil);
     }
 
     fn villa_tank() -> Entity {

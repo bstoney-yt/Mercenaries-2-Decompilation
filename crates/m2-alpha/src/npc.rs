@@ -5422,7 +5422,6 @@ pub(crate) mod tests {
             chance_not_active: chance,
             name: 0,
             template: false,
-            kept_on: false,
         };
         // Untouched by the scripts: its own state, then its own chance.
         assert!(spawner_starts(&slot(1, 0), None, 0.0));
@@ -5518,7 +5517,6 @@ pub(crate) mod tests {
                     chance_not_active: 0,
                     name: 0,
                     template: false,
-                    kept_on: false,
                 },
             );
         }

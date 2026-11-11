@@ -322,27 +322,22 @@ pub struct SpawnerSlot {
     pub name: u32,
     /// It comes from the owner's template, not from the owner itself.
     pub template: bool,
-    /// It is the one template record the port sent people from before
-    /// every template record was kept: it keeps sending, whatever its
-    /// state in the data, until the dangerous-building script that turns
-    /// template spawners on is ported (see [`SpawnerSlot::sends_by_data`]).
-    pub kept_on: bool,
 }
 
 impl SpawnerSlot {
     /// Whether the data has it send anyone before a script says so: its
-    /// state is not off, or it is [`SpawnerSlot::kept_on`].
+    /// state is not off (from the 360 code, 82241C38: states 2 to 4 start
+    /// as 1 does). The buildings' spawners that are off are turned on by
+    /// their `DangerousBuilding` script.
     pub fn sends_by_data(&self) -> bool {
-        self.state != 0 || self.kept_on
+        self.state != 0
     }
 }
 
 /// An entity's spawner records: its own (`own`, as they come), then those
 /// of its template (`template`) whose `SpawnerName` none of its own has,
 /// each made the entity's. From the 360 code (82242BD8, gathering an
-/// object's spawner definitions for 82242DC8). The first of the template's
-/// is [`SpawnerSlot::kept_on`] when the entity has none of its own: it is
-/// the one the port sent people from before.
+/// object's spawner definitions for 82242DC8).
 pub fn entity_spawners(
     entity: u32,
     own: &[(Spawner, SpawnerSlot)],
@@ -350,7 +345,6 @@ pub fn entity_spawners(
 ) -> Vec<(Spawner, SpawnerSlot)> {
     let named: std::collections::HashSet<u32> = own.iter().map(|(_, s)| s.name).collect();
     let mut out: Vec<(Spawner, SpawnerSlot)> = own.to_vec();
-    let mut first = own.is_empty();
     for (spawner, slot) in template {
         if named.contains(&slot.name) {
             continue;
@@ -360,7 +354,6 @@ pub fn entity_spawners(
             SpawnerSlot {
                 owner: entity,
                 template: true,
-                kept_on: std::mem::take(&mut first),
                 ..*slot
             },
         ));
@@ -434,7 +427,6 @@ pub fn spawner_records(c: &Component<'_>) -> Vec<(Spawner, SpawnerSlot)> {
                     chance_not_active: r.get(chance).copied().unwrap_or(0),
                     name: word(r, name).unwrap_or(0),
                     template: false,
-                    kept_on: false,
                 },
             ))
         })
@@ -779,7 +771,6 @@ mod tests {
             chance_not_active: 0,
             name,
             template: false,
-            kept_on: false,
         };
         // The template (0x8000_0001) has three, off in the data; the
         // entity (9) has its own of the second name.
@@ -794,14 +785,12 @@ mod tests {
         assert_eq!(names, [0xb, 0xa, 0xc]);
         assert!(all.iter().all(|(_, s)| s.owner == 9));
         assert!(!all[0].1.template && all[1].1.template && all[2].1.template);
-        // With its own, none of the template's was ever sending.
-        assert!(all.iter().all(|(_, s)| !s.kept_on));
-        assert!(!all[1].1.sends_by_data());
-        // Without its own: the template's first keeps sending as before.
+        // The template's are off in the data: they wait for a script.
+        assert!(all[0].1.sends_by_data());
+        assert!(!all[1].1.sends_by_data() && !all[2].1.sends_by_data());
         let all = entity_spawners(9, &[], &template);
         assert_eq!(all.len(), 3);
-        assert!(all[0].1.kept_on && all[0].1.sends_by_data());
-        assert!(!all[1].1.sends_by_data() && !all[2].1.sends_by_data());
+        assert!(all.iter().all(|(_, s)| !s.sends_by_data()));
     }
 
     #[test]
