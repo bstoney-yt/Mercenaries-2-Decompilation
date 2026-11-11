@@ -38,16 +38,18 @@
 //! - **Cargo** (the update): reeling in with cargo on and no more links
 //!   out than the autodrop count, or retracted, the cargo drops.
 //!
-//! - **Her controls** (0x824AFFD8, for a helicopter she flies with a
-//!   winch): asking for a state other than the winch's presses the second
-//!   button when it is retracted and asked to deploy, or deployed and asked
-//!   to retract; deployed, holding the hook button with a target not
-//!   already on, it hooks the target, first putting it under the hook if
-//!   it is over a metre away (velocities zeroed); letting go of the
-//!   button drops the cargo ([`player_step`]).
+//! - **The magnet** (0x82197710, each step of the update): what it takes
+//!   ([`magnet`]); its search is a sphere twice `MagnetRadius` about the
+//!   hook (0x825F7E60 shape, 0x82153748 query), its candidates' hang
+//!   points their hardpoints (store 0x83652244) nearest the hook. The
+//!   player has no hook button: her two buttons (0x82198118) pay out,
+//!   reel in and drop; the magnet hooks.
+//! - 0x824AFFD8 and 0x824B0440 are the network apply and encode of a
+//!   winch's state (state, cargo flag, cargo handle), and 0x82458DB8 the
+//!   co-op pass: not single-player input.
 //!
-//! Not ported here: how her controls pick the target (+0x19, filled
-//! elsewhere), the links' bodies and their physics (0x821962B8,
+//! Not ported here: when +0x168 (seconds empty) starts again from 0, the
+//! links' bodies and their physics (0x821962B8,
 //! 0x82196BB8, read through VMX), the attach and the hook (0x82195C30,
 //! 0x82196238), the sounds each change plays (0x82174F88), the ground
 //! check that stops a winch deploying near the ground (0x82167400).
@@ -56,6 +58,7 @@ use std::collections::HashMap;
 
 use m2_assets::layer::Layer;
 use m2_assets::name_hash;
+use m2_math::glam::Vec3;
 
 use crate::tuning::Table;
 
@@ -381,65 +384,57 @@ impl Winch {
     }
 }
 
-/// The player's winch controls for a step, as her helicopter's input
-/// has them (0x824AFFD8 reads its input's +0x17 to +0x19).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WinchPad {
-    /// The winch is hers to work (+0x17 bit 7).
-    pub on: bool,
-    /// The state she asks for (+0x17 bits 0 and 1).
-    pub want: u8,
-    /// She holds the hook-on button (+0x18 bit 7).
-    pub hold: bool,
+/// The magnet's reach: twice `MagnetRadius` for the search (0x82197710's
+/// sphere), `MagnetRadius` for the take.
+pub const MAGNET_SEARCH: f32 = 2.0;
+/// Seconds a winch hangs empty before its magnet looks (0x820C77A4).
+pub const MAGNET_WAIT: f32 = 2.0;
+
+/// Something under the hook the magnet may take (0x82197710's loop).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MagnetCandidate {
+    pub id: u32,
+    /// Where it would hang from: its hardpoint nearest the hook, or the
+    /// fallback point (0x82197C28) when it has none.
+    pub at: Vec3,
+    /// It has a body with mass, is not the helicopter, has no hardpoint
+    /// named 0xD2111B26, is not of kind 4, and says it may be carried
+    /// (its vtable +0xC0).
+    pub eligible: bool,
 }
 
-/// What the player's controls ask of the winch this step.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PlayerAsk {
-    /// The second button's action (0xB422F25E, [`Winch::press_deploy`]).
-    pub press: bool,
-    /// Hook on her target (0x82195C30), first putting it under the hook
-    /// when it is more than a metre from it.
-    pub hook: bool,
-    pub snap: bool,
-    /// Let the cargo go (0x82195FF8).
-    pub drop: bool,
-}
-
-/// 0x824AFFD8: the player's winch for a step. `target` is the object her
-/// controls name (+0x19), `cargo` what is on the cable, `far` that the
-/// target is more than a metre from the hook.
-pub fn player_step(
+/// 0x82197710: the winch's magnet. Deployed or deploying, empty, with
+/// seven links or more out and empty for over two seconds (`empty`, its
+/// +0x168), it takes the nearest eligible candidate within
+/// `MagnetRadius` of the hook that hangs below it (the way from the hook
+/// to it at no more than a right angle to the way from the winch to the
+/// hook).
+pub fn magnet(
     w: &Winch,
-    pad: &WinchPad,
-    target: Option<u32>,
-    cargo: Option<u32>,
-    far: bool,
-) -> PlayerAsk {
-    let mut ask = PlayerAsk::default();
-    if !pad.on {
-        return ask;
-    }
-    let want = pad.want & 3;
-    let state = w.state as u8;
-    if want != state {
-        // Retracted, asked deployed or deploying; deployed, asked
-        // retracted or retracting: the second button.
-        ask.press = (w.state == WinchState::Retracted && (want == 1 || want == 2))
-            || (w.state == WinchState::Deployed && (want == 0 || want == 3));
-    }
-    if w.state == WinchState::Deployed
-        && pad.hold
-        && let Some(t) = target
-        && cargo != Some(t)
+    empty: f32,
+    magnet_radius: f32,
+    hook: Vec3,
+    winch: Vec3,
+    candidates: &[MagnetCandidate],
+) -> Option<(u32, Vec3)> {
+    if !matches!(w.state, WinchState::Deployed | WinchState::Deploying)
+        || w.cargo
+        || w.links < 7
+        || empty <= MAGNET_WAIT
     {
-        ask.hook = true;
-        ask.snap = far;
+        return None;
     }
-    if !pad.hold && cargo.is_some() {
-        ask.drop = true;
-    }
-    ask
+    let reach = magnet_radius * MAGNET_SEARCH;
+    let best = candidates
+        .iter()
+        .filter(|c| c.eligible && c.at.distance_squared(hook) <= reach * reach)
+        .min_by(|a, b| {
+            a.at.distance_squared(hook)
+                .total_cmp(&b.at.distance_squared(hook))
+        })?;
+    let off = hook - best.at;
+    (off.length_squared() < magnet_radius * magnet_radius && (winch - hook).dot(off) >= 0.0)
+        .then_some((best.id, best.at))
 }
 
 #[cfg(test)]
@@ -455,30 +450,29 @@ mod tests {
     }
 
     #[test]
-    fn her_controls_work_the_winch() {
+    fn the_magnet_takes_the_nearest_below_the_hook() {
         let mut w = heli();
-        let pad = |want, hold| WinchPad {
-            on: true,
-            want,
-            hold,
-        };
-        // Off: nothing.
-        assert_eq!(
-            player_step(&w, &WinchPad::default(), Some(5), None, false),
-            PlayerAsk::default()
-        );
-        // Retracted, asked to deploy: the second button.
-        assert!(player_step(&w, &pad(2, false), None, None, false).press);
-        assert!(!player_step(&w, &pad(3, false), None, None, false).press);
         w.state = WinchState::Deployed;
-        assert!(player_step(&w, &pad(0, false), None, None, false).press);
-        assert!(!player_step(&w, &pad(2, false), None, None, false).press);
-        // Deployed, holding with a target: hook it, snapped if far.
-        let a = player_step(&w, &pad(1, true), Some(5), None, true);
-        assert!(a.hook && a.snap && !a.drop);
-        assert!(!player_step(&w, &pad(1, true), Some(5), Some(5), true).hook);
-        // Let go of the button: the cargo drops.
-        assert!(player_step(&w, &pad(1, false), Some(5), Some(5), false).drop);
+        w.links = 10;
+        let (hook, winch) = (Vec3::new(0.0, 10.0, 0.0), Vec3::new(0.0, 20.0, 0.0));
+        let c = |id, y: f32, eligible| MagnetCandidate {
+            id,
+            at: Vec3::new(0.0, y, 0.0),
+            eligible,
+        };
+        let under = [c(1, 9.5, true), c(2, 9.8, false), c(3, 9.2, true)];
+        // Not yet empty two seconds.
+        assert_eq!(magnet(&w, 1.0, 1.0, hook, winch, &under), None);
+        assert_eq!(
+            magnet(&w, 2.5, 1.0, hook, winch, &under),
+            Some((1, under[0].at))
+        );
+        // Above the hook, or out of reach: nothing.
+        assert_eq!(magnet(&w, 2.5, 1.0, hook, winch, &[c(4, 10.5, true)]), None);
+        assert_eq!(magnet(&w, 2.5, 1.0, hook, winch, &[c(5, 8.5, true)]), None);
+        // Too few links out, or cargo on.
+        w.links = 6;
+        assert_eq!(magnet(&w, 2.5, 1.0, hook, winch, &under), None);
     }
 
     #[test]
