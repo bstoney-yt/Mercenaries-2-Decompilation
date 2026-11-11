@@ -20,8 +20,16 @@
 
 use m2_math::glam::Vec3;
 
-/// The most records a mind keeps (its +0x820 table, 0x80 entries).
-pub const RECORDS: usize = 0x80;
+/// The most records a mind keeps (0x822D5EF0 makes no more past 0x50;
+/// its +0x820 table hashes them in 0x80 slots).
+pub const RECORDS: usize = 0x50;
+
+/// How long a record outlives its last update, seconds (+0x94, set by
+/// 0x822D51E8; 0x822DE240 frees it once +0x8C passes it).
+pub const RECORD_LIFETIME: f32 = 30.0;
+
+/// The same for a plain object's record (its flags bit 0).
+pub const OBJECT_RECORD_LIFETIME: f32 = 3.0;
 
 /// Within this distance a subject counts as in sight whatever way the
 /// mind faces, metres.
@@ -46,7 +54,9 @@ pub const SEEN_THROUGH_DISGUISE: u32 = 0x4E1A_2D0D;
 /// The event a mind raises on seeing her undisguised and near.
 pub const SEEN_UNDISGUISED: u32 = 0x2E16_ACCD;
 
-/// Below this value of the player's +0x3B0 (not traced) an undisguised
+/// Within this many seconds of her disguise ending (the player's +0x3B0,
+/// her disguise block's [6]: 5 at the start, 0x82445648; counting up to 5
+/// each tick, back to 0 when a disguise ends, 0x82445C38) an undisguised
 /// sighting raises [`SEEN_UNDISGUISED`].
 pub const UNDISGUISED_BELOW: f32 = 5.0;
 
@@ -77,6 +87,8 @@ pub struct Subject {
     pub audibility: f32,
     /// A person (record kind 4), as against a vehicle or other object.
     pub person: bool,
+    /// A plain object (flags bit 0), as against a person or vehicle.
+    pub object: bool,
     /// Being forgotten (its flags bit 36): kept at full strength.
     pub forgotten: bool,
 }
@@ -100,6 +112,9 @@ pub struct SenseRecord {
     pub since_update: f32,
     /// A person (kind 4).
     pub person: bool,
+    /// Its lifetime after an update ([`RECORD_LIFETIME`] or
+    /// [`OBJECT_RECORD_LIFETIME`]).
+    pub lifetime: f32,
 }
 
 /// One sense query of `subject` (0x822E89B0): `None` when neither seen
@@ -125,6 +140,11 @@ pub fn sense(
         perceived: false,
         since_update: 0.0,
         person: subject.person,
+        lifetime: if subject.object {
+            OBJECT_RECORD_LIFETIME
+        } else {
+            RECORD_LIFETIME
+        },
     };
     if subject.audibility > 0.0 {
         let reach = block.hearing * block.scale * k * subject.audibility;
@@ -152,10 +172,12 @@ pub fn sense(
     (rec.hearing + rec.sight > block.threshold).then_some(rec)
 }
 
-/// A mind's records, by the caller's subject number (its +0x820 table).
+/// A mind's records, by the caller's subject number (its +0x820 table),
+/// each with whether its last look found it (ours: what it rates as in
+/// sight between looks).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SenseTable {
-    records: Vec<(u32, SenseRecord)>,
+    records: Vec<(u32, SenseRecord, bool)>,
 }
 
 impl SenseTable {
@@ -169,6 +191,11 @@ impl SenseTable {
         self.get(who).is_some()
     }
 
+    /// Whether its last look at `who` found it.
+    pub fn in_sight(&self, who: u32) -> bool {
+        self.records.iter().any(|r| r.0 == who && r.2)
+    }
+
     /// Merges a query's result into its record of `who`, new or not
     /// (0x822D6030): its age starts again. A full table takes no new one.
     pub fn merge(&mut self, who: u32, rec: SenseRecord) {
@@ -178,27 +205,26 @@ impl SenseTable {
         };
         if let Some(r) = self.records.iter_mut().find(|r| r.0 == who) {
             r.1 = rec;
+            r.2 = true;
         } else if self.records.len() < RECORDS {
-            self.records.push((who, rec));
+            self.records.push((who, rec, true));
         }
     }
 
-    /// Ages every record by `dt`.
+    /// Marks `who` not found by the last look: its record stays, ageing.
+    pub fn lose(&mut self, who: u32) {
+        for r in self.records.iter_mut().filter(|r| r.0 == who) {
+            r.2 = false;
+        }
+    }
+
+    /// Ages every record by `dt` and frees those past their lifetime
+    /// (0x822DE240).
     pub fn tick(&mut self, dt: f32) {
         for r in &mut self.records {
             r.1.since_update += dt;
         }
-    }
-
-    /// Drops its record of `who` (invented: when a fresh look finds it no
-    /// longer; how long the 360 keeps a record is not traced).
-    pub fn forget(&mut self, who: u32) {
-        self.records.retain(|r| r.0 != who);
-    }
-
-    /// Keeps only its records of `who` (invented, as [`forget`](Self::forget)).
-    pub fn keep_only(&mut self, who: &[u32]) {
-        self.records.retain(|r| who.contains(&r.0));
+        self.records.retain(|r| r.1.since_update <= r.1.lifetime);
     }
 
     /// Drops them all, as when the mind is reset (0x822F8A10).
@@ -209,6 +235,11 @@ impl SenseTable {
     /// Whom it has records of.
     pub fn subjects(&self) -> impl Iterator<Item = u32> + '_ {
         self.records.iter().map(|r| r.0)
+    }
+
+    /// Whom its last looks found.
+    pub fn sighted(&self) -> impl Iterator<Item = u32> + '_ {
+        self.records.iter().filter(|r| r.2).map(|r| r.0)
     }
 }
 
@@ -254,7 +285,8 @@ pub enum SeenOutcome {
 /// The event after an offer `taken` by her watchers: with vehicle
 /// disguises on and her disguised, [`SeenOutcome::SeenThroughDisguise`];
 /// undisguised with her +0x3B0 (`her_3b0`, not traced) under
-/// [`UNDISGUISED_BELOW`], [`SeenOutcome::SeenUndisguised`].
+/// [`UNDISGUISED_BELOW`] (seconds since her disguise ended),
+/// [`SeenOutcome::SeenUndisguised`].
 pub fn outcome(
     taken: bool,
     disguises_on: bool,
@@ -295,6 +327,7 @@ mod tests {
             visibility: 1.0,
             audibility: 1.0,
             person: true,
+            object: false,
             forgotten: false,
         }
     }
@@ -336,8 +369,19 @@ mod tests {
             t.merge(100 + k, rec);
         }
         assert_eq!(t.subjects().count(), RECORDS);
-        t.forget(7);
-        assert!(!t.knows(7));
+        t.lose(7);
+        assert!(t.knows(7) && !t.in_sight(7), "lost, still kept");
+        t.tick(29.9);
+        assert!(t.knows(7));
+        t.tick(0.2);
+        assert!(!t.knows(7), "freed 30 s on");
+        let object = Subject {
+            object: true,
+            ..her(Vec3::new(0.0, 0.0, 10.0))
+        };
+        t.merge(9, sense(&b, &object, false, true).unwrap());
+        t.tick(3.1);
+        assert!(!t.knows(9), "an object's lasts 3 s");
         t.forget_all();
         assert_eq!(t.subjects().count(), 0);
     }

@@ -990,10 +990,10 @@ pub struct Npc {
     /// Until they next look for a target, seconds.
     /// His perception lanes' timers ([`m2_engine::ai_target::Lanes`]).
     lanes: m2_engine::ai_target::Lanes,
-    /// His records of whom his last sight line found, still in reach
-    /// ([`m2_engine::ai_sense`]): he goes on rating them each think between
-    /// looks, as the 360 rates the records it keeps (0x822DDF50); hers by
-    /// [`HER`].
+    /// His records of whom he has sensed ([`m2_engine::ai_sense`]), kept
+    /// 30 s past the last; those his last look found he goes on rating
+    /// each think between looks, as the 360 rates the records it keeps
+    /// (0x822DDF50); hers by [`HER`].
     pub senses: m2_engine::ai_sense::SenseTable,
     /// From how far they can see the one they look at, unless that's
     /// her ([`People::war`]).
@@ -3732,7 +3732,7 @@ impl People {
             let vision = n.ai.vision;
             let held_now = n.slot.who;
             n.senses.tick(dt);
-            let known: Vec<u32> = n.senses.subjects().collect();
+            let known: Vec<u32> = n.senses.sighted().collect();
             let block = n.sense_block();
             let mut keep: Vec<u32> = Vec::new();
             let reach = |c: &Subject| {
@@ -3810,6 +3810,7 @@ impl People {
                         visibility,
                         audibility: 0.0,
                         person: !matches!(arms, Arms::Vehicle { .. }),
+                        object: false,
                         forgotten: false,
                     };
                     if let Some(r) = m2_engine::ai_sense::sense(&block, &subject, in_slot, true) {
@@ -3853,6 +3854,7 @@ impl People {
                             visibility: n.her_visibility,
                             audibility: n.her_audibility,
                             person: true,
+                            object: false,
                             forgotten: false,
                         };
                         if let Some(r) = m2_engine::ai_sense::sense(&block, &subject, in_slot, true)
@@ -3870,7 +3872,11 @@ impl People {
                     );
                 }
             }
-            n.senses.keep_only(&keep);
+            // Those his looks no longer find stay on record, ageing out
+            // over 30 s (0x822DE240), but are not rated as in sight.
+            for w in known.iter().filter(|w| !keep.contains(w)) {
+                n.senses.lose(*w);
+            }
             match n.slot.who.filter(|&w| w != HER) {
                 Some(w) => {
                     let c = all.iter().find(|c| c.0 == w);
@@ -3914,7 +3920,7 @@ impl People {
         let now: HashSet<u32> = self
             .npcs
             .iter()
-            .filter(|n| n.alive && n.senses.subjects().next().is_some())
+            .filter(|n| n.can_war())
             .map(|n| n.shooter)
             .collect();
         self.dropped_minds = self.sensing.difference(&now).copied().collect();
