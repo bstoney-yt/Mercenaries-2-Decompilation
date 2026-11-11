@@ -433,7 +433,10 @@ fn table_clips(
         .collect();
     // Her standing take-off was a `DieAnimatedRagdoll` clip, found by
     // eye: there the table's rise stands, footage-matched or not.
-    let forced = |key: u32| key == npc::FightClips::TAKEOFF_STILL[0];
+    // Her stand-in jump was `Swim` `EnterSwim`'s clip; the table's
+    // `InAir` `Jump` is the air's loop the state table leads to.
+    let forced =
+        |key: u32| key == npc::FightClips::TAKEOFF_STILL[0] || key == npc::FightClips::JUMP;
     let theirs = |key: u32| {
         let p = resolve(key)?;
         (!jennifer || forced(key) || had.get(&key).copied().flatten() == Some(p.clip))
@@ -531,7 +534,24 @@ fn hero_moves(
         g.sort_by_key(|(g, _)| format!("{g:?}"));
         g
     });
-    let moves = held::resolve(&t, &actions, who, rig, clips, &gaits, &GAIT_KEYS);
+    let mut moves = held::resolve(&t, &actions, who, rig, clips, &gaits, &GAIT_KEYS);
+    {
+        use m2_assets::human_states::{HUMAN_STATES, HUMAN_STATES_TYPE, HumanStates};
+        match source
+            .asset(HUMAN_STATES, HUMAN_STATES_TYPE)
+            .map_err(anyhow::Error::from)
+            .and_then(|a| Ok(HumanStates::parse(&a)?))
+        {
+            Ok(s) => {
+                eprintln!(
+                    "hero moves: {hero}: the state table: {} stances",
+                    s.stances.len()
+                );
+                moves.states = Some(Arc::new(s));
+            }
+            Err(e) => eprintln!("hero moves: {hero}: no state table: {e:#}"),
+        }
+    }
     let h =
         |i: Option<usize>| i.map_or("none".to_owned(), |i| format!("{:08x}", rig.clips[i].hash));
     for (held, name) in moves.held.iter().zip(held::CLASSES) {

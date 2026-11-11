@@ -296,6 +296,10 @@ pub struct Bash {
 enum Leap {
     /// On the ground.
     No,
+    /// On the ground in the take-off (`Upright` `JumpTakeoffMoving` or
+    /// `JumpTakeoffStationary`): seconds into its clip, the clip, and when
+    /// in it its `jump` event launches her.
+    Windup(f32, usize, f32),
     /// In the air, this many seconds after taking off.
     Air(f32),
     /// Landed this many seconds ago, playing the landing clip.
@@ -406,6 +410,10 @@ pub struct Player {
     /// Jump was pressed while she was landing: she jumps again as the
     /// landing ends.
     jump_queued: bool,
+    /// The stance and action the state table has her in through a jump
+    /// ([`m2_engine::human_state`]), and whether the air's loop plays.
+    human: m2_engine::human_state::HumanState,
+    air_looped: bool,
     /// Whether she carries someone (a subdued prisoner): her gaits are
     /// then the `Carrying` stance's ([`crate::held::Moves::carrying`]; from
     /// the 360 code, the stance's own locomotion node).
@@ -645,6 +653,8 @@ impl Player {
             last_yaw: yaw,
             leap: Leap::No,
             jump_queued: false,
+            human: m2_engine::human_state::HumanState::default(),
+            air_looped: false,
             carrying: false,
             throwing: None,
             throw_clip: None,
@@ -1158,9 +1168,10 @@ impl Player {
             )
         };
         let wanted = Vec3::new(ground.x, 0.0, ground.y);
-        let jump = self
-            .takes_off(intent.jump, bashing)
-            .then(|| self.motion.jump_speed());
+        use m2_engine::human_state::{self, HumanState};
+        let (windup_started, launch) =
+            self.jump_step(intent.jump, bashing, walking.length_squared(), dt);
+        let jump = launch.then(|| self.motion.jump_speed());
         physics.move_character(&mut self.character, wanted, jump, dt);
         // A fall that hurts: the 360 measures it from where she left the
         // ground, and by her template's limits it costs her health and
@@ -1304,7 +1315,31 @@ impl Player {
                 .flatten();
             // The jump: a take-off (on the run or standing), the air,
             // and a landing.
-            if jump.is_some() {
+            if let Some(clip) = windup_started {
+                use m2_engine::blend::action;
+                let act = if self.human.is("Upright", "JumpTakeoffMoving") {
+                    action::JUMP_TAKEOFF_MOVING
+                } else {
+                    action::JUMP_TAKEOFF_STATIONARY
+                };
+                eprintln!(
+                    "jump: wind-up {:08x} ({}.{}), launch at {:.2} s",
+                    rig.clips[clip].hash,
+                    self.human.stance,
+                    self.human.action,
+                    match self.leap {
+                        Leap::Windup(_, _, at) => at,
+                        _ => 0.0,
+                    }
+                );
+                let hips = rig
+                    .gait_clip(Gait::Idle)
+                    .map_or(1.0, |i| rig.clips[i].info.hips);
+                rig.animator.play_leveled(clip, hips, act);
+            } else if jump.is_some() {
+                // Out of a take-off the rise is the `Jump` action's.
+                let risen = matches!(self.leap, Leap::Windup(..));
+                self.air_looped = false;
                 let takeoff = if moved > RUNNING_JUMP {
                     clips.takeoff.or(clips.takeoff_still)
                 } else {
@@ -1315,6 +1350,7 @@ impl Player {
                 let was = match self.leap {
                     Leap::No => "on her feet".to_owned(),
                     Leap::Air(t) => format!("in the air {t:.2} s"),
+                    Leap::Windup(t, ..) => format!("{t:.2} s into the take-off"),
                     Leap::Land(t, c) => {
                         format!("landing {t:.2} of {:.2} s", rig.clips[c].info.duration)
                     }
@@ -1325,6 +1361,7 @@ impl Player {
                 // take-off blends in, the air `Jump` snaps.
                 use m2_engine::blend::action;
                 let played = match takeoff {
+                    Some(c) if risen => Some((c, action::JUMP)),
                     Some(c) if Some(c) == clips.takeoff => Some((c, action::JUMP_TAKEOFF_MOVING)),
                     Some(c) => Some((c, action::JUMP_TAKEOFF_STATIONARY)),
                     None => clips.jump.map(|c| (c, action::JUMP)),
@@ -1338,9 +1375,26 @@ impl Player {
                     rig.animator.play_leveled(clip, hips, act);
                 }
             } else {
+                let states = self.moves.states.clone();
+                let was_landing = matches!(self.leap, Leap::Land(..));
                 self.leap = match self.leap {
+                    Leap::Windup(..) => self.leap,
                     Leap::Air(t) if t > MIN_AIR && self.character.grounded => {
-                        let land = if moved > RUNNING_LAND {
+                        // The physics' message on touching down picks the
+                        // landing by the state table; without it, by her
+                        // speed as before.
+                        let (fs, fc) = self.facing.sin_cos();
+                        let v = self.character.velocity;
+                        let message = human_state::ground_message(v.x * fs + v.z * fc);
+                        let posted = states
+                            .as_deref()
+                            .is_some_and(|t| self.human.post(t, message));
+                        let running = if posted {
+                            self.human.is("Upright", "JumpLandMoving")
+                        } else {
+                            moved > RUNNING_LAND
+                        };
+                        let land = if running {
                             clips.land.or(clips.land_still)
                         } else {
                             clips.land_still.or(clips.land)
@@ -1361,7 +1415,28 @@ impl Player {
                             None => Leap::No,
                         }
                     }
-                    Leap::Air(t) => Leap::Air(t + dt),
+                    Leap::Air(t) => {
+                        // The rise's clip over, `Complete` takes her to
+                        // `InAir` `Jump`, the air's loop.
+                        let over = rig
+                            .animator
+                            .current()
+                            .is_some_and(|(c, at)| at + 1e-3 >= rig.clips[c].info.duration);
+                        if !self.air_looped
+                            && over
+                            && self.human.is("Upright", "Jump")
+                            && let Some(t) = states.as_deref()
+                            && self.human.post(t, human_state::message::COMPLETE)
+                            && self.human.is("InAir", "Jump")
+                            && let Some(air) = clips.jump
+                        {
+                            self.air_looped = true;
+                            eprintln!("jump: the air's loop {:08x}", rig.clips[air].hash);
+                            rig.animator
+                                .play_action(air, false, m2_engine::blend::action::JUMP);
+                        }
+                        Leap::Air(t + dt)
+                    }
                     // A standing landing gives way when she sets off.
                     Leap::Land(t, clip)
                         if t + LAND_FADE < rig.clips[clip].info.duration
@@ -1371,6 +1446,13 @@ impl Player {
                     }
                     Leap::Land(..) | Leap::No => Leap::No,
                 };
+                // The landing's clip over: `Complete`, back to the idle.
+                if self.leap == Leap::No {
+                    if was_landing && let Some(t) = states.as_deref() {
+                        self.human.post(t, human_state::message::COMPLETE);
+                    }
+                    self.human = HumanState::default();
+                }
             }
             // A fall that hurt plays its impact in the landing's place.
             if let Some(i) = impact
@@ -1634,6 +1716,64 @@ impl Player {
     /// the run), or a moment after touching down, cutting the landing
     /// short (playtest 8). A press while she lands is kept for its end.
     /// Inferred from the table and the clips; the 360 code was not read.
+    /// One step of the jump's start, as the 360 runs it
+    /// ([`m2_engine::human_state`]): the press posts `JumpMoving` or
+    /// `JumpStationary` (by `stick_sq`, the squared length of the stick's
+    /// move), the state table answers with the take-off, and its clip's
+    /// `jump` event launches her. Returns the take-off's clip on the step
+    /// it starts, and whether she leaves the ground this step. Without
+    /// the table or the take-off's clip she leaves on the press, as
+    /// before.
+    fn jump_step(
+        &mut self,
+        pressed: bool,
+        bashing: bool,
+        stick_sq: f32,
+        dt: f32,
+    ) -> (Option<usize>, bool) {
+        use m2_engine::human_state::{self, HumanState};
+        let mut windup_started = None;
+        let mut launch = false;
+        if self.takes_off(pressed, bashing) {
+            let message = human_state::jump_message(stick_sq);
+            let states = self.moves.states.clone();
+            let posted = states
+                .as_deref()
+                .is_some_and(|t| self.human.post(t, message));
+            let windup = posted
+                .then(|| {
+                    let moving = self.human.is("Upright", "JumpTakeoffMoving");
+                    self.moves
+                        .of(self.shown.class)
+                        .and_then(|h| h.windup[usize::from(moving)])
+                })
+                .flatten();
+            match windup {
+                Some((clip, at)) => {
+                    self.leap = Leap::Windup(0.0, clip, at);
+                    windup_started = Some(clip);
+                }
+                None => launch = true,
+            }
+        } else if let Leap::Windup(t, clip, at) = self.leap {
+            if !self.character.grounded || bashing {
+                // The ground went from under her: no jump (invented; the
+                // 360's take-off then goes on `Falling` to `InAir` `Fall`).
+                self.leap = Leap::No;
+                self.human = HumanState::default();
+            } else if t + dt >= at {
+                launch = true;
+            } else {
+                self.leap = Leap::Windup(t + dt, clip, at);
+            }
+        }
+        if launch && let Some(t) = self.moves.states.clone() {
+            // What the physics posts as she leaves the ground.
+            self.human.post(&t, human_state::message::JUMP_IN_AIR);
+        }
+        (windup_started, launch)
+    }
+
     fn takes_off(&mut self, pressed: bool, bashing: bool) -> bool {
         if pressed && matches!(self.leap, Leap::Land(..)) {
             self.jump_queued = true;
@@ -2320,6 +2460,99 @@ mod tests {
         p.driving = None;
         let up = p.model_matrix().transform_vector3(Vec3::Y);
         assert!((up - Vec3::Y).length() < 1e-5, "{up}");
+    }
+
+    /// A state table with the jump's rows, and a rifle whose take-offs
+    /// are clips 7 and 8, launching just under 0.10 s in.
+    fn jump_moves() -> Moves {
+        use m2_assets::human_states::{Action, HumanStates, Stance, Transition};
+        let action = |name: &str, to: &[[&str; 3]]| Action {
+            name: name.to_owned(),
+            transitions: to
+                .iter()
+                .map(|t| Transition {
+                    message: t[0].to_owned(),
+                    stance: t[1].to_owned(),
+                    action: t[2].to_owned(),
+                    unk_0x0c: 0,
+                })
+                .collect(),
+            ..Action::default()
+        };
+        let rise = [["JumpInAir", "Upright", "Jump"]];
+        let states = HumanStates {
+            unk_0x00: 5,
+            stances: vec![Stance {
+                name: "Upright".to_owned(),
+                actions: vec![
+                    action(
+                        "Idle",
+                        &[
+                            ["JumpMoving", "Upright", "JumpTakeoffMoving"],
+                            ["JumpStationary", "Upright", "JumpTakeoffStationary"],
+                        ],
+                    ),
+                    action("JumpTakeoffMoving", &rise),
+                    action("JumpTakeoffStationary", &rise),
+                    action("Jump", &[]),
+                ],
+            }],
+        };
+        Moves {
+            held: vec![crate::held::Held {
+                class: m2_assets::animation_table::RIFLE,
+                windup: [Some((7, 0.095)), Some((8, 0.095))],
+                ..Default::default()
+            }],
+            states: Some(std::sync::Arc::new(states)),
+            ..Moves::default()
+        }
+    }
+
+    #[test]
+    fn a_jump_winds_up_and_leaves_the_ground_on_the_clips_event() {
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        p.character.grounded = true;
+        p.moves = jump_moves();
+        // Pressed with the stick pushed: the moving take-off starts, and
+        // she stays down.
+        assert_eq!(p.jump_step(true, false, 1.0, 0.02), (Some(8), false));
+        assert!(p.human.is("Upright", "JumpTakeoffMoving"));
+        assert!(matches!(p.leap, Leap::Windup(..)));
+        // A press in the take-off does nothing; four steps on (0.08 s) she
+        // is still down, the fifth reaches the event and launches.
+        for _ in 0..4 {
+            assert_eq!(p.jump_step(true, false, 1.0, 0.02), (None, false));
+        }
+        assert_eq!(p.jump_step(false, false, 1.0, 0.02), (None, true));
+        assert!(p.human.is("Upright", "Jump"));
+    }
+
+    #[test]
+    fn a_standing_jump_takes_the_stationary_take_off() {
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        p.character.grounded = true;
+        p.moves = jump_moves();
+        assert_eq!(p.jump_step(true, false, 0.2, 0.02), (Some(7), false));
+        assert!(p.human.is("Upright", "JumpTakeoffStationary"));
+        // The ground gone from under her in the take-off: no jump.
+        p.character.grounded = false;
+        assert_eq!(p.jump_step(false, false, 0.2, 0.02), (None, false));
+        assert_eq!(p.leap, Leap::No);
+        assert!(p.human.is("Upright", "Idle"));
+    }
+
+    #[test]
+    fn without_the_state_table_she_jumps_on_the_press() {
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        p.character.grounded = true;
+        assert_eq!(p.jump_step(true, false, 1.0, 0.02), (None, true));
+        // With the table but no take-off clip for what she holds, too.
+        let mut q = Player::new(0.0, 0.0, 0.0, None);
+        q.character.grounded = true;
+        q.moves = jump_moves();
+        q.moves.held[0].windup = [None, None];
+        assert_eq!(q.jump_step(true, false, 1.0, 0.02), (None, true));
     }
 
     #[test]
