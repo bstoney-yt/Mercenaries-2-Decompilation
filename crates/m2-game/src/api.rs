@@ -1621,7 +1621,7 @@ pub const SUPPORT_EARS: &str = "__m2_support";
 /// missing (or stubs, with `ScriptHost::stub_missing_globals`).
 /// The engine's libraries (the rest of the globals scripts use are their
 /// own modules); see `ScriptHost::complete_libraries`.
-pub const LIBRARIES: [&str; 28] = [
+pub const LIBRARIES: [&str; 29] = [
     "Ai",
     "Airstrike",
     "Camera",
@@ -1632,6 +1632,7 @@ pub const LIBRARIES: [&str; 28] = [
     "Gui",
     "Hud",
     "Human",
+    "Junk",
     "Marker",
     "Math",
     "Munitions",
@@ -4029,7 +4030,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         })?,
     )?;
     crate::hud::install(lua, world)?;
-    crate::layers::install(lua, world)
+    crate::layers::install(lua, world)?;
+    // Last, so the port's own versions (`Debug.Printf`) stay.
+    crate::script_noops::install(lua)?;
+    Ok(())
 }
 
 /// The objects in play within `a`'s radius of its point (x, y, z,
