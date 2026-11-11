@@ -43,10 +43,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use m2_engine::population::SpawnerSlot;
 use m2_engine::tuning::HandGun;
 use m2_engine::weapons::{FireHint, NpcLauncher};
 use m2_engine::world::{SpawnPoint, is_walker};
 use m2_engine::{AiProfile, BoundClip, Character, Gait, GpuModel, Physics, RagdollId};
+use m2_game::spawner_tweak::SpawnerRecord;
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
@@ -130,6 +132,31 @@ const INACTIVE: f32 = 500.0;
 /// most, Maracaibo's centre).
 const MAX_SOLDIERS: usize = 48;
 const MAX_WALKERS: usize = 24;
+/// Whether a spawner sends anyone, by its record in the data (`slot`), the
+/// scripts' changes to its object's spawners if any (`record`) and its
+/// roll (0 to 1). From the 360 code (the spawners' start test, 82241C38):
+///
+/// - with no changes for its object, or a group outside 0 to 7: not if
+///   its own state is off; else it starts unless its own
+///   `ChanceNotActive` (a percent) is above the roll;
+/// - with changes: not if they set its group off, or left the state
+///   alone and its own is off; else it starts unless the chance they set
+///   for its group is above the roll (they set none: it starts; its own
+///   chance is not used then).
+pub fn spawner_starts(slot: &SpawnerSlot, record: Option<&SpawnerRecord>, roll: f32) -> bool {
+    let chance = |percent: u8| f32::from(percent) * 0.01 <= roll;
+    match record.and_then(|r| r.groups.get(slot.group as usize)) {
+        None => slot.state != 0 && (slot.chance_not_active < 1 || chance(slot.chance_not_active)),
+        Some(tweak) => {
+            let on = match tweak.state {
+                Some(state) => state != m2_game::spawner_tweak::STATE_OFF,
+                None => slot.state != 0,
+            };
+            on && tweak.chance_not_active.is_none_or(chance)
+        }
+    }
+}
+
 /// A spawner whose one fell sends the next its `SecondsPerCycle` later,
 /// but not while she is this near it, metres (invented: the data's
 /// fields for how many it sends in all aren't decoded).
@@ -2750,6 +2777,16 @@ pub struct People {
     cycles: Option<HashMap<u32, f32>>,
     /// Spawners whose one fell, by entity: seconds before the next.
     pub refills: HashMap<u32, f32>,
+    /// Where each spawner's spawn entity stands with the scripts'
+    /// changes (its owner, group, state and chance), from the world's
+    /// index ([`m2_engine::world::WorldIndex::spawner_slots`]).
+    pub spawner_slots: HashMap<u32, SpawnerSlot>,
+    /// What the scripts changed of each object's attached spawners, by
+    /// the object ([`People::tweak_spawners`]).
+    spawner_records: HashMap<u32, SpawnerRecord>,
+    /// Each spawner's roll against its chance of staying out, by spawn
+    /// entity: made once, and again after its object's record changes.
+    spawner_rolls: HashMap<u32, f32>,
     /// How many passers-by the traffic zone where she is asks for (its
     /// people count, [`m2_engine::population::DensityZone`]).
     pub walker_cap: usize,
@@ -4495,6 +4532,40 @@ impl People {
         })
     }
 
+    /// The scripts changed object `owner`'s attached spawners
+    /// (`Ai.TweakAttachedSpawners`): its record as it now stands, empty
+    /// for none. Its spawners roll their chance of staying out anew.
+    pub fn tweak_spawners(&mut self, owner: u32, record: SpawnerRecord) {
+        if record.is_empty() {
+            self.spawner_records.remove(&owner);
+        } else {
+            self.spawner_records.insert(owner, record);
+        }
+        let slots = &self.spawner_slots;
+        self.spawner_rolls
+            .retain(|e, _| slots.get(e).is_none_or(|s| s.owner != owner));
+    }
+
+    /// The spawn entities whose spawner sends nobody now
+    /// ([`spawner_starts`]).
+    fn spawners_held(&mut self) -> HashSet<u32> {
+        let mut held = HashSet::new();
+        for (&entity, slot) in &self.spawner_slots {
+            let roll = match self.spawner_rolls.get(&entity) {
+                Some(&r) => r,
+                None => {
+                    let r = self.rng.range(0.0, 1.0);
+                    self.spawner_rolls.insert(entity, r);
+                    r
+                }
+            };
+            if !spawner_starts(slot, self.spawner_records.get(&slot.owner), roll) {
+                held.insert(entity);
+            }
+        }
+        held
+    }
+
     /// A spawner sending from its list (not a mission's target) sends
     /// another its `SecondsPerCycle` after its one fell, while it is in
     /// reach and she isn't on top of it: the fallen one lies where he fell,
@@ -4515,6 +4586,19 @@ impl People {
             let Some(&cycle) = cycles.get(&id) else {
                 continue;
             };
+            // The scripts' cycle for its group, if they set one
+            // (`SecondsPerCycle`; from the 360 code, 82243110).
+            let cycle = self
+                .spawner_slots
+                .get(&id)
+                .and_then(|s| {
+                    self.spawner_records
+                        .get(&s.owner)?
+                        .groups
+                        .get(s.group as usize)?
+                        .seconds_per_cycle
+                })
+                .unwrap_or(cycle);
             if self.mission_soldiers.contains(&id) {
                 continue;
             }
@@ -4610,11 +4694,14 @@ impl People {
             .iter()
             .filter(|n| n.spawn.is_some_and(is_walker))
             .count();
+        // Spawners the data or the scripts hold off send nobody.
+        let held = self.spawners_held();
         let mut near: Vec<(f32, &SpawnPoint, Vec3)> = spawns
             .iter()
             .map(|s| (s, self.moved.get(&s.entity).copied()))
             .filter(|&(s, moved)| {
                 !self.active.contains(&s.entity)
+                    && !held.contains(&s.entity)
                     && !self.killed.contains(&s.entity)
                     && !self.aboard.contains(&s.entity)
                     && !far(moved.unwrap_or(s.position), ACTIVE)
@@ -5321,6 +5408,133 @@ pub(crate) mod tests {
             people.update(&mut physics, &spawns, near, None, dt);
         }
         assert_eq!(people.npcs.iter().filter(|n| n.alive).count(), 0);
+    }
+
+    #[test]
+    fn a_spawner_starts_by_its_own_state_and_chance_or_the_scripts() {
+        use m2_game::spawner_tweak::{GroupTweak, SpawnerRecord};
+        let slot = |state, chance| SpawnerSlot {
+            owner: 9,
+            group: 3,
+            state,
+            chance_not_active: chance,
+        };
+        // Untouched by the scripts: its own state, then its own chance.
+        assert!(spawner_starts(&slot(1, 0), None, 0.0));
+        assert!(!spawner_starts(&slot(0, 0), None, 0.99));
+        assert!(!spawner_starts(&slot(1, 40), None, 0.39));
+        assert!(spawner_starts(&slot(1, 40), None, 0.40));
+        let with = |tweak: GroupTweak, group: Option<usize>| {
+            let mut r = SpawnerRecord::default();
+            r.merge(group, &tweak);
+            r
+        };
+        let on = GroupTweak {
+            state: Some(1),
+            ..GroupTweak::default()
+        };
+        let off = GroupTweak {
+            state: Some(0),
+            ..GroupTweak::default()
+        };
+        // Turned on by the scripts, though off in the data; its own chance
+        // no longer counts.
+        assert!(spawner_starts(
+            &slot(0, 100),
+            Some(&with(on.clone(), None)),
+            0.0
+        ));
+        // Turned off, its group alone or all of them.
+        assert!(!spawner_starts(
+            &slot(1, 0),
+            Some(&with(off.clone(), Some(3))),
+            0.99
+        ));
+        // Another group's being off is not its business.
+        assert!(spawner_starts(&slot(1, 0), Some(&with(off, Some(1))), 0.0));
+        // The state left alone: its own stands.
+        let cycle_only = GroupTweak {
+            seconds_per_cycle: Some(5.0),
+            ..GroupTweak::default()
+        };
+        assert!(!spawner_starts(
+            &slot(0, 0),
+            Some(&with(cycle_only, None)),
+            0.99
+        ));
+        // The scripts' chance for the group.
+        let chancy = GroupTweak {
+            chance_not_active: Some(50),
+            ..on
+        };
+        let r = with(chancy, None);
+        assert!(!spawner_starts(&slot(1, 0), Some(&r), 0.49));
+        assert!(spawner_starts(&slot(1, 0), Some(&r), 0.5));
+        // A group outside 0 to 7 never takes a change.
+        let stray = SpawnerSlot {
+            group: 8,
+            ..slot(1, 0)
+        };
+        assert!(spawner_starts(
+            &stray,
+            Some(&with(
+                GroupTweak {
+                    state: Some(0),
+                    ..GroupTweak::default()
+                },
+                None
+            )),
+            0.0
+        ));
+    }
+
+    #[test]
+    fn a_spawner_the_scripts_turn_off_sends_nobody_until_it_is_on_again() {
+        use m2_game::spawner_tweak::{GroupTweak, SpawnerRecord};
+        let mut physics = ground();
+        let mut people = People::default();
+        people.add_kind(kind("VZ Soldier", true));
+        // A tower (entity 9) with two rooftop spawners: its own, and its
+        // second record's.
+        let extra = m2_engine::population::EXTRA_SPAWNERS;
+        let point = |entity| SpawnPoint {
+            list: vec![("VZ Soldier".into(), 0x45cc, 1.0)],
+            cycle: Some(10.0),
+            ..spawn(entity, "vzoutpost_bld_guardtower", 40.0)
+        };
+        let spawns = [point(9), point(extra)];
+        for entity in [9, extra] {
+            people.spawner_slots.insert(
+                entity,
+                SpawnerSlot {
+                    owner: 9,
+                    group: 3,
+                    state: 1,
+                    chance_not_active: 0,
+                },
+            );
+        }
+        let state = |s| {
+            let mut r = SpawnerRecord::default();
+            r.merge(
+                Some(3),
+                &GroupTweak {
+                    state: Some(s),
+                    ..GroupTweak::default()
+                },
+            );
+            r
+        };
+        let dt = 1.0 / 60.0;
+        people.tweak_spawners(9, state(0));
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, dt);
+        assert!(people.npcs.is_empty());
+        // On again: both of the tower's spawners send their one.
+        people.tweak_spawners(9, state(1));
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, dt);
+        let mut out: Vec<u32> = people.npcs.iter().filter_map(|n| n.spawn).collect();
+        out.sort_unstable();
+        assert_eq!(out, [9, extra]);
     }
 
     #[test]

@@ -3382,6 +3382,15 @@ impl MissionLink {
                                 (*rounds * combat::RIFLE_CLIP).min(combat::RIFLE_SPARE);
                         }
                     }
+                    // The scripts' changes to an object's attached
+                    // spawners: which of them send anyone, and how often.
+                    Command::TweakSpawners { guid, record } => {
+                        eprintln!(
+                            "mission: the spawners of {guid:#x} are changed: groups off {:?}",
+                            (0..8).filter(|&g| record.off(g)).collect::<Vec<_>>()
+                        );
+                        game.scene.people.tweak_spawners(*guid, (**record).clone());
+                    }
                     Command::DropWeapon { who, weapon } => {
                         eprintln!("mission: {who:#x} lets go of their {weapon}");
                     }
