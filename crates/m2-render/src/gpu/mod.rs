@@ -2395,7 +2395,33 @@ impl WgpuBackend {
         mark(&mut encoder, 2);
         self.encode_glows(&mut encoder, draws)?;
         mark(&mut encoder, 3);
-        self.post.encode(&self.queue, &mut encoder, l, target);
+        // The sun flare: its texture, and where its point (the sun's way
+        // times SUN_FLARE_DISTANCE, as the game's code places it) lands
+        // on screen, when in front and its square overlaps the screen.
+        if let Some(h) = l.flare_map
+            && let Ok(t) = self.textures.get(h.0)
+        {
+            self.post.set_flare_map(&self.device, h, &t.view);
+        }
+        let sun = {
+            let point = -l.sun_direction.normalize_or_zero() * post::SUN_FLARE_DISTANCE;
+            let clip = view.projection * view.view * point.extend(1.0);
+            (clip.w > 0.0 && l.flare_map.is_some())
+                .then(|| {
+                    let ndc = clip.truncate().truncate() / clip.w;
+                    [(ndc.x + 1.0) * 0.5, 0.5 - 0.5 * ndc.y]
+                })
+                .filter(|[x, y]| {
+                    let (w, h) = self.size();
+                    let (w, h) = (w as f32, h as f32);
+                    let half = 0.41 * h;
+                    x * w + half >= 0.0
+                        && x * w - half <= w
+                        && y * h + half >= 0.0
+                        && y * h - half <= h
+                })
+        };
+        self.post.encode(&self.queue, &mut encoder, l, target, sun);
         mark(&mut encoder, 4);
         if let Some(t) = timer {
             t.end(&mut encoder);

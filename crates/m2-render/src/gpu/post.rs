@@ -85,6 +85,10 @@ struct Post {
     // read it), y: how far the bloom takes the frame to it
     // (`imageParams.x`)
     blur: vec4<f32>,
+    // The sun flare (see `sun_flare`): xy the sun on screen, z the
+    // square's half height, w 1 to draw; its turnings' cosines and sines
+    flare: vec4<f32>,
+    flare_rot: vec4<f32>,
 };
 
 fn game_tone_map() -> bool {
@@ -127,6 +131,49 @@ fn to_game(c: vec3<f32>) -> vec3<f32> {
 // combined image (`blurMap`) in the composite.
 @group(0) @binding(5) var extra: texture_2d<f32>;
 @group(0) @binding(6) var extra2: texture_2d<f32>;
+// The game's first blur level across (`BlurH0`), which its sun flare
+// samples, in the composite.
+@group(0) @binding(7) var blur_h0: texture_2d<f32>;
+// The flare's texture (`radial_flare`), in the composite.
+@group(1) @binding(0) var flare_map: texture_2d<f32>;
+
+// The game's sun flare (from the 360 code, 0x821BCB08, and its shader,
+// the install's 347): over a square half the screen's height times 0.41
+// each way about the sun, four taps of `BlurH0` near the sun, each less
+// 0.8, summed and scaled by `colormod` (0.01 each), times the flare
+// texture (the mean of two turnings of it, `rotX0/Y0` and `rotX1/Y1`)
+// times 0.6 times that mean raised to `brightpow` (3), in display
+// values. `post.flare`: xy the sun on screen, z the square's half
+// height (0.41), w 1 to draw; `post.flare_rot`: the turnings' cosines
+// and sines.
+fn sun_flare(uv: vec2<f32>) -> vec3<f32> {
+    let size = vec2<f32>(textureDimensions(source));
+    let half = vec2<f32>(post.flare.z * size.y / size.x, post.flare.z);
+    let q = (uv - (post.flare.xy - half)) / (2.0 * half);
+    if any(q < vec2<f32>(0.0)) || any(q > vec2<f32>(1.0)) {
+        return vec3<f32>(0.0);
+    }
+    // The taps (`scaleset` 0.16, 0.08, 0.04, 0.02; `srect` the sun and
+    // twice the half height; 0.7 of a texel of `BlurH0` over).
+    let r = q * 2.0 - 1.0;
+    let texel = 0.7 / vec2<f32>(textureDimensions(blur_h0));
+    let reach = 2.0 * post.flare.z;
+    var sum = vec3<f32>(0.0);
+    for (var i = 0; i < 4; i = i + 1) {
+        let s = 0.16 / f32(1 << u32(i));
+        let at = post.flare.xy + r * s * reach + texel;
+        let tap = textureSampleLevel(blur_h0, linear, at, 0.0).rgb;
+        sum = sum + max(tap - 0.8, vec3<f32>(0.0));
+    }
+    sum = sum * 0.01;
+    let p = q - 0.5;
+    let rot = post.flare_rot;
+    let a = vec2<f32>(rot.x * p.x - rot.y * p.y, rot.y * p.x + rot.x * p.y) + 0.5;
+    let b = vec2<f32>(rot.z * p.x - rot.w * p.y, rot.w * p.x + rot.z * p.y) + 0.5;
+    let f = (textureSampleLevel(flare_map, linear, a, 0.0).rgb
+        + textureSampleLevel(flare_map, linear, b, 0.0).rgb) * 0.5;
+    return sum * f * 0.6 * pow(max(f, vec3<f32>(0.0)), vec3<f32>(3.0));
+}
 
 // Exposure, scaled for the eye's adaptation.
 fn exposure() -> f32 {
@@ -376,6 +423,11 @@ fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
         // frame takes as linear light, so they are decoded at the end).
         let a = textureLoad(adapted, vec2<i32>(0, 0), 0).r;
         c = to_game(c);
+        // The sun flare, added to the frame's display values before the
+        // tone map (inferred: where the game draws it is not established).
+        if post.flare.w > 0.5 {
+            c = c + sun_flare(v.uv);
+        }
         // Bloom: the frame taken part of the way to the blurred image
         // times 1.2; the compression divides by the blurred image's
         // luminance, not the pixel's own (a local tone map).
@@ -429,6 +481,8 @@ struct Uniforms {
     limits: [f32; 4],
     mono: [f32; 4],
     blur: [f32; 4],
+    flare: [f32; 4],
+    flare_rot: [f32; 4],
 }
 
 /// The passes, by index: bright, blur across, blur down, composite, then
@@ -479,6 +533,13 @@ pub struct Post {
     game_blur: wgpu::RenderPipeline,
     game_combine: wgpu::RenderPipeline,
     merge: wgpu::RenderPipeline,
+    /// The sun flare's texture group (black until one is set), which
+    /// texture it holds, the flare's four turnings and its clock.
+    flare_layout: wgpu::BindGroupLayout,
+    flare_group: std::cell::RefCell<wgpu::BindGroup>,
+    flare_key: Cell<Option<crate::TextureHandle>>,
+    flare_angles: Cell<[f32; 4]>,
+    flare_time: Cell<f64>,
     uniforms: [wgpu::Buffer; PASSES],
     /// The world's floating-point target, and its texture (copied for
     /// water to mirror).
@@ -608,6 +669,7 @@ impl Post {
                 texture(4),
                 texture(5),
                 texture(6),
+                texture(7),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -615,14 +677,42 @@ impl Post {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
+        // The composite's second group: the sun flare's texture.
+        let flare_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("post flare"),
+            entries: &[texture(0)],
+        });
+        let composite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("post composite"),
+            bind_group_layouts: &[Some(&layout), Some(&flare_layout)],
+            immediate_size: 0,
+        });
+        // No flare texture yet: a black one (textures start zeroed).
+        let black = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("no flare"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let flare_group = flare_group(device, &flare_layout, &black);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("post"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
-        let pipeline = |entry: &str, format| {
+        let pipeline_in = |entry: &str, format, layout: &wgpu::PipelineLayout| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(entry),
-                layout: Some(&pipeline_layout),
+                layout: Some(layout),
                 vertex: wgpu::VertexState {
                     module: &module,
                     entry_point: Some("vs_screen"),
@@ -646,6 +736,7 @@ impl Post {
                 cache: None,
             })
         };
+        let pipeline = |entry: &str, format| pipeline_in(entry, format, &pipeline_layout);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("post"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -671,7 +762,7 @@ impl Post {
         Self {
             bright: pipeline("fs_bright", HDR_FORMAT),
             blur: pipeline("fs_blur", HDR_FORMAT),
-            composite: pipeline("fs_composite", output),
+            composite: pipeline_in("fs_composite", output, &composite_layout),
             log_luminance: pipeline("fs_log_luminance", HDR_FORMAT),
             reduce: pipeline("fs_reduce", HDR_FORMAT),
             adapt: pipeline("fs_adapt", HDR_FORMAT),
@@ -681,6 +772,11 @@ impl Post {
             game_combine: pipeline("fs_game_combine", HDR_FORMAT),
             merge: pipeline("fs_merge", HDR_FORMAT),
             layout,
+            flare_layout,
+            flare_group: std::cell::RefCell::new(flare_group),
+            flare_key: Cell::new(None),
+            flare_angles: Cell::new([0.0; 4]),
+            flare_time: Cell::new(0.0),
             sampler,
             uniforms,
             hdr,
@@ -732,6 +828,13 @@ impl Post {
         let glow_layer = target(device, "glow layer", width, height);
         let merged = target(device, "world and glows", width, height);
         let group = |i: usize, views: [&wgpu::TextureView; 5]| {
+            // `BlurH0` for the composite's sun flare; elsewhere an image no
+            // post pass draws into.
+            let blur_h0 = if i == COMPOSITE {
+                &levels[0][1]
+            } else {
+                &glow_layer
+            };
             let [source, glow, adapted, extra, extra2] = views;
             let view = |binding, view| wgpu::BindGroupEntry {
                 binding,
@@ -754,6 +857,7 @@ impl Post {
                     view(4, adapted),
                     view(5, extra),
                     view(6, extra2),
+                    view(7, blur_h0),
                 ],
             })
         };
@@ -848,12 +952,27 @@ impl Post {
     }
 
     /// Runs the passes for a frame lit by `lighting`, into `target`.
+    /// Gives the sun flare its texture (`radial_flare`), `key` naming it
+    /// so it is bound once.
+    pub fn set_flare_map(
+        &self,
+        device: &wgpu::Device,
+        key: crate::TextureHandle,
+        view: &wgpu::TextureView,
+    ) {
+        if self.flare_key.get() != Some(key) {
+            *self.flare_group.borrow_mut() = flare_group(device, &self.flare_layout, view);
+            self.flare_key.set(Some(key));
+        }
+    }
+
     pub fn encode(
         &self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         lighting: &Lighting,
         target: &wgpu::TextureView,
+        sun: Option<[f32; 2]>,
     ) {
         let (w, h) = (self.size.0, self.size.1);
         let (gw, gh) = ((w / 4).max(1) as f32, (h / 4).max(1) as f32);
@@ -938,6 +1057,22 @@ impl Post {
         let game_blur = game && game_blur_on();
         let glowing = lighting.bloom > 0.0 && !game_blur;
         let blur = [if game_blur { 1.0 } else { 0.0 }, lighting.bloom, 0.0, 0.0];
+        // The sun flare, with the game's tone map and blur only (it reads
+        // `BlurH0`), when the sun's square is on screen.
+        let (flare, flare_rot) =
+            match sun.filter(|_| game && game_blur && self.flare_key.get().is_some()) {
+                Some([x, y]) => {
+                    let t = self.flare_time.get() + f64::from(dt.unwrap_or(0.0));
+                    self.flare_time.set(t);
+                    let a = turn_flare(self.flare_angles.get(), t);
+                    self.flare_angles.set(a);
+                    (
+                        [x, y, SUN_FLARE_HALF, 1.0],
+                        [a[0].cos(), a[0].sin(), a[1].cos(), a[1].sin()],
+                    )
+                }
+                None => ([0.0; 4], [1.0, 0.0, 1.0, 0.0]),
+            };
         let texel = |w: u32, h: u32| [1.0 / w.max(1) as f32, 1.0 / h.max(1) as f32];
         let mut steps = [[0.0f32; 2]; PASSES];
         steps[BRIGHT] = [1.0 / w as f32, 1.0 / h as f32];
@@ -988,11 +1123,14 @@ impl Post {
                     .filter(|_| game)
                     .map_or([0.0; 4], |m| m.to_array()),
                 blur,
+                flare,
+                flare_rot,
             };
             queue.write_buffer(buffer, 0, bytemuck::bytes_of(&u));
         }
         let parity = self.parity.get();
         let groups = &self.sized.groups[parity];
+        let flare = self.flare_group.borrow();
         let mut pass = |pipeline: &wgpu::RenderPipeline, group: &wgpu::BindGroup, target| {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("post"),
@@ -1012,6 +1150,8 @@ impl Post {
             });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, group, &[]);
+            // The composite's flare texture; other passes' layouts lack it.
+            pass.set_bind_group(1, &*flare, &[]);
             pass.draw(0..3, 0..1);
         };
         pass(&self.merge, &groups[MERGE], &self.sized.merged);
@@ -1051,6 +1191,82 @@ impl Post {
     }
 }
 
+/// Half the height of the sun flare's square over the screen's: its size
+/// in screen heights, 0.41 near and far (from the 360 code: 0x821BB010
+/// sets both ends of its size, 0x821BCB08 scales by the screen height).
+const SUN_FLARE_HALF: f32 = 0.41;
+
+/// How far the sun's flare point stands along the sun's way (metres; from
+/// the 360 code, 0x821BCB08).
+pub const SUN_FLARE_DISTANCE: f32 = 800_000.0;
+
+/// The sun flare's texture group.
+fn flare_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("post flare"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(view),
+        }],
+    })
+}
+
+/// The game's integer noise (from the 360 code, 0x825733B8): `k` mixed
+/// with itself shifted 13 bits, then `k (k^2 15731 + 789221) - 0x2df722f3`
+/// in 32 bits, its low 31 bits over 2^30 taken from 1.
+fn integer_noise(k: i32) -> f32 {
+    let k = (k << 13) ^ k;
+    let h = k
+        .wrapping_mul(k.wrapping_mul(k).wrapping_mul(15731).wrapping_add(789_221))
+        .wrapping_sub(0x2df7_22f3)
+        & 0x7fff_ffff;
+    1.0 - h as f32 * 9.313_226e-10
+}
+
+/// The integer noise at `(x, y)` smoothed with its eight neighbours
+/// (0x825733B8): the cell a quarter, its four sides an eighth, its four
+/// corners a sixteenth; a cell is `x + 57 y`, reckoned in floats and
+/// truncated, as the code does.
+fn smooth_noise(x: f32, y: f32) -> f32 {
+    let at = |v: f32| integer_noise(v as i32);
+    let c = y * 57.0 + x;
+    let down = (y - 1.0) * 57.0 + x;
+    let sides = at(c + 57.0) + at(down) + at(c - 1.0) + at(c + 1.0);
+    let corners = at(c + 56.0) + at(c + 58.0) + at(down - 1.0) + at(down + 1.0);
+    at(c) * 0.25 + sides * 0.125 + corners * 0.0625
+}
+
+/// [`smooth_noise`] between whole cells, blended in straight lines
+/// (0x825736B0).
+fn value_noise(x: f32, y: f32) -> f32 {
+    let (fx, fy) = (x.floor(), y.floor());
+    let (tx, ty) = (x - fx, y - fy);
+    let a = smooth_noise(fx + 1.0, fy) * tx + smooth_noise(fx, fy) * (1.0 - tx);
+    let b = smooth_noise(fx, fy + 1.0) * (1.0 - tx) + smooth_noise(fx + 1.0, fy + 1.0) * tx;
+    a * (1.0 - ty) + b * ty
+}
+
+/// The flare's turnings after one more frame (from the 360 code,
+/// 0x821BCB08): turning `i` moves by 0.001 times the noise at
+/// `(3.931 i + t, 1.98324 i t)` plus 3 and 9 times it at twice and four
+/// times those, held within a whole turn; `t` the seconds the flare has
+/// been drawn.
+fn turn_flare(angles: [f32; 4], t: f64) -> [f32; 4] {
+    std::array::from_fn(|i| {
+        let x = (i as f64 * f64::from(3.931f32) + t) as f32;
+        let y = (i as f64 * t * 1.983_240_051_269_531_4) as f32;
+        let n = value_noise(x, y)
+            + 3.0 * value_noise(2.0 * x, 2.0 * y)
+            + 9.0 * value_noise(4.0 * x, 4.0 * y);
+        (angles[i] + 0.001 * n) % std::f32::consts::TAU
+    })
+}
+
 /// How far the game's eye moves towards this frame's luminance: it keeps
 /// `retention ^ (speed * dt)` of what it had, `dt` held within 1/120 and
 /// 0.1 s (from the 360 code, 0x821BD348: `adaptiveParams.w`, which the
@@ -1061,6 +1277,25 @@ fn follow(retention: f32, speed: f32, dt: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_flare_turns_by_the_codes_noise() {
+        // 1 - (k (k^2 15731 + 789221) - 0x2df722f3 & 0x7fffffff) / 2^30
+        // with k = (n << 13) ^ n, worked by hand.
+        for (n, want) in [(0, -0.281_791), (1, -0.226_373), (57, 0.204_344)] {
+            let got = super::integer_noise(n);
+            assert!((got - want).abs() < 1e-5, "{n}: {got}");
+        }
+        // On whole cells the blended noise is the smoothed one.
+        assert_eq!(super::value_noise(3.0, 5.0), super::smooth_noise(3.0, 5.0));
+        // Each frame a turning moves by at most 0.001 x (1 + 3 + 9) x the
+        // smoothed noise's reach (1), and stays within a turn.
+        let a = super::turn_flare([0.0; 4], 12.5);
+        let b = super::turn_flare(a, 12.6);
+        for i in 0..4 {
+            assert!(a[i].abs() <= 0.013 + 1e-6 && (b[i] - a[i]).abs() <= 0.013 + 1e-6);
+        }
+    }
+
     #[test]
     fn the_eye_follows_at_the_records_speed() {
         // The default record: 0.98 kept at a speed of 30.37. At 30 frames
