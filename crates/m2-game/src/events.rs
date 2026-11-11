@@ -671,6 +671,17 @@ impl Events {
                         p.held = holds;
                         rising.then_some(vec![extra])
                     }
+                    Check::Health(holds, health, comparison) => {
+                        let rising = holds && !p.held;
+                        p.held = holds;
+                        let lua = s.lua.0.as_ref().and_then(mlua::WeakLua::try_upgrade);
+                        let text = lua.as_ref().and_then(|l| l.create_string(comparison).ok());
+                        rising.then(|| {
+                            let mut extra = vec![Value::Number(health)];
+                            extra.extend(text.map(Value::String));
+                            vec![extra]
+                        })
+                    }
                     // `held_by` keeps who was seated at the last check
                     // (none before the first).
                     Check::Seats(riders) => {
@@ -952,6 +963,9 @@ enum Check {
     /// A condition: whether it holds, and the values to pass when it
     /// starts to.
     Holds(bool, Vec<Value>),
+    /// ObjectHealth's condition: whether it holds, the health that made
+    /// it, and the comparison as text, which it passes (both, no guid).
+    Health(bool, f64, &'static str),
     /// Riders and whether each is in a wanted seat, with the values to
     /// pass: fired by the event's mode as they get in or out.
     Seats(Vec<(u32, (bool, bool), Vec<Value>)>),
@@ -1191,6 +1205,18 @@ fn text(t: &Table, i: i64) -> Option<String> {
 /// The (filter function's address, post's index) pairs a `ScriptEvent`'s
 /// filter said yes to.
 type Accepted = HashSet<(usize, usize)>;
+
+/// `ObjectHealth`'s comparison text as (equal, less, more), as the 360 reads
+/// it (0x8234c970): equal when either of the first two characters is `=`,
+/// then less or more by the first. Anything else compares as nothing
+/// (none here).
+fn health_comparison(s: &str) -> Option<(bool, bool, bool)> {
+    let b = s.as_bytes();
+    let equal = b.first() == Some(&b'=') || b.get(1) == Some(&b'=');
+    let less = b.first() == Some(&b'<');
+    let more = b.first() == Some(&b'>');
+    (equal || less || more).then_some((equal, less, more))
+}
 
 fn check(
     p: &Pending,
@@ -1437,20 +1463,51 @@ fn check(
         // { object, "<" or ">", health }: while its health is below (or
         // above) the figure; passes the object. The hero's survival
         // script watches for drops below her current health this way.
+        // From the 360 code (the kind's parse 0x82351050, test 0x823512a8,
+        // arguments 0x82351420): `{ object, comparison, value }`, or with
+        // four `{ object, part, comparison, value }` (a part's name hash,
+        // `"*"` for any of its parts). The comparison is read as `=`
+        // (either character), then `<` or `>` (0x8234c970): `<`, `<=`,
+        // `>`, `>=` or `=`. The callback gets the health that made it hold
+        // and the comparison as text, after its data; no guid.
+        //
+        // Here objects have no parts: `"*"` takes the object's health
+        // (inferred), a named part never holds (the 360 answers false for
+        // a part the object lacks).
         "ObjectHealth" => {
-            let Some(figure) = number(&p.params, 3) else {
+            let four = p.params.raw_len() >= 4;
+            let (at, part) = if four {
+                (3, text(&p.params, 2))
+            } else {
+                (2, None)
+            };
+            let (Some(comparison), Some(figure)) = (text(&p.params, at), number(&p.params, at + 1))
+            else {
                 return no;
             };
-            let above = text(&p.params, 2).as_deref() == Some(">");
+            if part.is_some_and(|s| s != "*") {
+                return Check::Health(false, 0.0, "=");
+            }
+            let Some((equal, less, more)) = health_comparison(&comparison) else {
+                return no;
+            };
+            let shown = match (less, more, equal) {
+                (true, _, true) => "<=",
+                (true, _, false) => "<",
+                (_, true, true) => ">=",
+                (_, true, false) => ">",
+                _ => "=",
+            };
             for o in objects(&p.params, 1, world) {
-                if let Some(h) = world.health(o)
-                    && (f64::from(h) > figure) == above
-                    && f64::from(h) != figure
-                {
-                    return Check::Holds(true, vec![id(o)]);
+                if let Some(h) = world.health(o).map(f64::from) {
+                    let holds =
+                        (equal && h == figure) || (less && h < figure) || (more && h > figure);
+                    if holds {
+                        return Check::Health(true, h, shown);
+                    }
                 }
             }
-            no
+            Check::Health(false, 0.0, shown)
         }
         // { character (or filter), from, to }: as one of them goes from a
         // state matching `from` to one matching `to` ([`state_matches`]:
