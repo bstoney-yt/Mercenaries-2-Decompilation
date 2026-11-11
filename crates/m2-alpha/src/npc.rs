@@ -52,9 +52,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::scene::{Carry, Rig};
 
-/// The most subjects a soldier looks over for a target at each look,
-/// nearest first (invented: the frame rate's limit; the 360 queues its
-/// sight lines and runs at most 0x800 a frame, 0x822E8DF8).
+/// The most foes [`People::foes_of`] gives, nearest first (invented;
+/// soldiers' own target looks go by the 360's lanes instead,
+/// [`m2_engine::ai_target::lane`]).
 const FOE_LOOKS: usize = 4;
 /// A vehicle of an army, as those at war with it see it.
 #[derive(Clone, Copy, Debug)]
