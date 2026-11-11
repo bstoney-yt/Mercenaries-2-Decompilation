@@ -1723,10 +1723,21 @@ impl Game {
                 );
                 self.winches.add(id, p, found.unwrap_or(Vec3::ZERO));
             }
+        }
+        // What a magnet might take, gathered only while one could: each
+        // vehicle with its `ConnectPoint`s' nodes.
+        let cargo = if self.winches.magnet_ready() {
+            self.winch_cargo()
+        } else {
+            Vec::new()
+        };
+        if let Some(world) = self.scene.world.as_mut() {
             let physics = &mut world.physics;
             self.winches
                 .retain(|id| physics.vehicle_transform(id).is_some());
-            self.winches.step(physics, dt);
+            for (carrier, taken) in self.winches.step(physics, dt, &cargo) {
+                eprintln!("winch: {carrier:?}'s magnet took {taken:?}");
+            }
         }
         // Each one's own collision goes on it for the goods on its bed.
         if let Some(world) = &mut self.scene.world {
@@ -3925,6 +3936,41 @@ impl Game {
         );
         self.combat.struck.clear();
         self.combat.went_off.clear();
+    }
+
+    /// The vehicles in play as a winch's cargo ([`crate::winches::Cargo`]):
+    /// each one's `ConnectPoint`s with their nodes' places on its model.
+    pub fn winch_cargo(&mut self) -> Vec<crate::winches::Cargo> {
+        let (Some(source), Some(world)) = (self.scene.source.as_mut(), self.scene.world.as_ref())
+        else {
+            return Vec::new();
+        };
+        let db = &world.index.template_db;
+        self.scene
+            .vehicles
+            .iter()
+            .filter_map(|v| {
+                let id = v.id?;
+                let points = db.connect_points_for(&v.spec.label, v.spec.model);
+                let nodes = if points.is_empty() {
+                    &[][..]
+                } else {
+                    self.winches
+                        .nodes(v.spec.model, || crate::hijack::nodes(source, v.spec.model))
+                };
+                Some(crate::winches::Cargo {
+                    id,
+                    points: points
+                        .iter()
+                        .map(|&p| {
+                            let at = nodes.iter().find(|(n, _)| *n == p.bone).map(|(_, a)| *a);
+                            (p, at)
+                        })
+                        .collect(),
+                    carriable: v.spec.kind != m2_engine::vehicle::HELICOPTER,
+                })
+            })
+            .collect()
     }
 
     /// The load bed of vehicle model `model` (its `HP_Truckbed` node),
