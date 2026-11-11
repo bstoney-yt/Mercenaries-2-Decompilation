@@ -2246,7 +2246,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         w.commands.push(Command::Move { guid, position });
         w.commands.push(Command::Turn { guid, yaw });
-        values([])
+        // From the 360 code (0x8232f510): true; nil when there is nothing
+        // to take the place from.
+        values([Value::Boolean(true)])
     })?;
     // How far off an object goes to sleep (metres). The deliveries place
     // a helicopter's cargo by it, with 155 as their own fallback: that,
@@ -2603,22 +2605,43 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Object.SetInfiniteAmmo(character, on): her weapons don't run dry
     // (PmcCon034's sniper tower, after handing her its rifle; from the
     // scripts). Stood in for by a reserve no range empties (invented).
+    //
+    // From the 360 code (0x823305f0): the flag is true when left out; false
+    // takes the object off the engine's infinite-ammo list; the answer is
+    // true (nil for no object). Here infinite is a full-to-the-brim reserve,
+    // so false puts each weapon back to its template's most (inferred: the
+    // 360 just stops topping it up).
     add(&object, "SetInfiniteAmmo", |w, _, a| {
-        let (Some(who), Some(Value::Boolean(true))) = (id(a.first()), a.get(1)) else {
-            return values([]);
+        let Some(who) = id(a.first()) else {
+            return values([Value::Nil]);
         };
+        let on = !matches!(a.get(1), Some(Value::Boolean(false)));
         for g in w.inventory.of(who).to_vec() {
-            let name = w.weapon_name(g);
-            if let (Some(c), Some(weapon)) = (w.inventory.carried.get_mut(&g), name) {
-                c.reserve = INFINITE_RESERVE;
+            let Some(weapon) = w.weapon_name(g) else {
+                continue;
+            };
+            let rounds = if on {
+                INFINITE_RESERVE
+            } else {
+                match w.inventory.max_reserve.get(&weapon.to_ascii_lowercase()) {
+                    Some(&max) => max,
+                    None => continue,
+                }
+            };
+            if let Some(c) = w.inventory.carried.get_mut(&g) {
+                // Off leaves a weapon that wasn't topped up as it is.
+                if !on && c.reserve != INFINITE_RESERVE {
+                    continue;
+                }
+                c.reserve = rounds;
                 w.commands.push(Command::Reserve {
                     who,
                     weapon,
-                    rounds: INFINITE_RESERVE,
+                    rounds,
                 });
             }
         }
-        values([])
+        values([Value::Boolean(true)])
     })?;
     add(&weapon, "SetReserveAmmo", |w, _, a| {
         let (Some(g), Some(rounds)) = (id(a.first()), num(a.get(1))) else {
@@ -2833,7 +2856,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }) {
             w.commands.push(Command::AimMode(on));
         }
-        values([])
+        // From the 360 code (0x8233fee0): true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "SetCinematicMode", |w, _, a| {
         let Some(on) = a.iter().find_map(|v| match v {
@@ -3370,7 +3394,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // (`MrxTaskObjectiveAction`; inferred that they succeed).
     add(&pg, "AddContextAction", |w, _, a| {
         let (Some(guid), Some(Value::String(text))) = (id(a.first()), a.get(1)) else {
-            return values([]);
+            // From the 360 code (0x823381e8): nil for bad arguments.
+            return values([Value::Nil]);
         };
         let reach = num(a.get(2)).filter(|r| *r > 0.0).unwrap_or(CONTEXT_REACH);
         w.context_actions.insert(
@@ -3414,7 +3439,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let target = id(t.raw_get::<Value>("Target").ok().as_ref()).filter(|_| follow);
         let near = num(t.raw_get::<Value>("MoveDistance").ok().as_ref()).unwrap_or(4.0);
         w.commands.push(Command::Follow { guid, target, near });
-        values([Value::Boolean(true)])
+        // From the 360 code (0x82310d50): a number, 1 when there was an AI
+        // to give the role to (0 when not).
+        values([Value::Integer(mlua::Integer::from(
+            w.objects.contains_key(&guid),
+        ))])
     })?;
     // `Ai.Squad{ SquadGuid, Action = "GetUnits" }`: the squad's people
     // (OilCon001 waits on `oc001.obj1.vzsquad1`'s to fall). Inferred from
@@ -3635,7 +3664,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&net, "SetLoadingScreen", |w, _, a| {
         let on = matches!(a.first(), Some(Value::Boolean(true)));
         w.commands.push(Command::LoadingScreen(on));
-        values([])
+        // From the 360 code (0x8232db28): true.
+        values([Value::Boolean(true)])
     })?;
 
     // Calls the game only needs to hear about.
@@ -6559,6 +6589,59 @@ mod tests {
             point("return Pg.FindPointFromCamera(20, 0, -1, nil, 90)"),
             ahead(20.0, 0.0, std::f32::consts::FRAC_PI_2)
         ));
+    }
+
+    #[test]
+    fn more_natives_answer_as_the_360_ones_do() {
+        let (host, world) = setup();
+        crate::hijack::install(&host, &world).unwrap();
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        for code in [
+            "return Object.SetInfiniteAmmo(1)",
+            "return Object.SetTransformToObject(1, 50)",
+            "return Player.SetAimMode(Player.GetLocalPlayer(), true)",
+            "return Net.SetLoadingScreen(false)",
+            "return Object.Detach(50, 1)",
+            "return Ai.Enable(50, true)",
+            "return Vehicle.EnableTurret(50, 'main_turret', true)",
+        ] {
+            assert_eq!(ask(code), Value::Boolean(true), "{code}");
+        }
+        assert_eq!(ask("return Object.Detach(50)"), Value::Boolean(false));
+        assert_eq!(ask("return Ai.Enable(999, true)"), Value::Boolean(false));
+        assert!(ask("return Pg.AddContextAction(50)").is_nil());
+        assert_eq!(
+            ask("return Ai.Role{ AIGuid = 50, Role = 'Follow', Target = 1 }"),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            ask("return Ai.Role{ AIGuid = 999, Role = 'Follow' }"),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn infinite_ammo_defaults_on_and_comes_off_again() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.inventory.max_reserve.insert("carbine".into(), 90);
+        }
+        host.lua()
+            .load("Human.Inventory.SetAllWeapons(Player.GetLocalCharacter(), { Pg.GetGuidByName('Carbine') })")
+            .exec()
+            .unwrap();
+        let weapons = world.borrow().inventory.of(1).to_vec();
+        assert_eq!(weapons.len(), 1);
+        let reserve = |world: &Shared| world.borrow().inventory.carried[&weapons[0]].reserve;
+        host.lua().load("Object.SetInfiniteAmmo(1)").exec().unwrap();
+        assert_eq!(reserve(&world), INFINITE_RESERVE);
+        host.lua()
+            .load("Object.SetInfiniteAmmo(1, false)")
+            .exec()
+            .unwrap();
+        assert_eq!(reserve(&world), 90);
     }
 
     #[test]
