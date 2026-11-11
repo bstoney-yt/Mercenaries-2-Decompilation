@@ -180,9 +180,6 @@ pub const ON_FOOT_VISIBILITY: f32 = 90.0;
 const HELD_SIGHT: f32 = 1.5;
 /// From how high he sees (his head), and how often he looks, seconds.
 const EYE: f32 = 1.6;
-
-/// How far short of whom he looks at his sight line stops, metres.
-const TOUCHING: f32 = 0.1;
 const LOOK_EVERY: f32 = 0.2;
 /// Seconds a soldier hunts without sight of her before calming down, and
 /// how close to where he last saw her he goes (inferred).
@@ -1923,10 +1920,8 @@ impl Npc {
                 .is_none();
         }
         // All the way to her: the 360's request runs to the subject
-        // (0x822E8DF8). Ours stops a hand short, so a surface she touches
-        // is not taken for one between (invented).
-        let clear = (distance - TOUCHING).max(0.0);
-        physics.cast_ray(eye, to / distance, clear).is_none()
+        // (0x822E8DF8).
+        physics.cast_ray(eye, to / distance, distance).is_none()
     }
 
     /// A soldier's tick in a fight with the player at `threat`. While he
