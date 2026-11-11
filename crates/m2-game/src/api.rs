@@ -180,6 +180,15 @@ impl Object {
 pub enum Command {
     /// A hijack's own requests (`crate::hijack`).
     Hijack(crate::hijack::HijackCommand),
+    /// `Ai.AddInfraction(who, faction, amount)`: the faction's people who
+    /// perceive `who` hold an infraction (the engine's kind 6) against
+    /// them, `amount` of it; `faction` is its template's guid, or 0 for
+    /// every faction.
+    Infraction {
+        who: u32,
+        faction: u32,
+        amount: f32,
+    },
     /// Create `what` (an object template's name, such as `"Veyron"` or
     /// `"Explosion (Grenade)"`) as `guid`.
     Spawn {
@@ -2957,6 +2966,27 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.reports.multipliers.insert(name, m);
         }
         values([])
+    })?;
+    // From the 360 code (`Ai.AddInfraction(who, faction, amount)`,
+    // 0x823137c8, and 0x822F6FB8): `amount` is 1 when left out. Every AI
+    // of that faction (of any, for faction 0) that has a record of `who`
+    // with its +0x8c below 0.5 notes an infraction of the engine's kind 6
+    // against them, and unless it is flagged not to, its feeling for
+    // them drops by its faction's cost of that kind (0x822dd4d8). The
+    // answer is whether `who` was given, not whether anyone saw. Who
+    // perceives whom is the game's, so the request goes to it as a
+    // command. AllCon003 sets China against her by 100 this way.
+    add(&ai, "AddInfraction", |w, _, a| {
+        let (Some(who), Some(faction)) = (id(a.first()), id(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let amount = num(a.get(2)).unwrap_or(1.0);
+        w.commands.push(Command::Infraction {
+            who,
+            faction,
+            amount,
+        });
+        values([Value::Boolean(true)])
     })?;
     add(&ai, "GetFactionGuid", |w, _, a| {
         // A zone's own; a person's, their faction's template (as
@@ -5760,6 +5790,32 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((orig, copy, players), (2, 1, true));
+    }
+
+    #[test]
+    fn an_infraction_goes_to_the_game_for_its_witnesses() {
+        // AllCon003: Ai.AddInfraction(her, China, 100).
+        let (host, world) = setup();
+        world.borrow_mut().take_commands();
+        let (given, one, bad): (bool, bool, Value) = host
+            .lua()
+            .load(
+                "local china = Pg.GetGuidByName('Allied')
+                 return Ai.AddInfraction(1, china, 100), Ai.AddInfraction(1, china),
+                   Ai.AddInfraction(1)",
+            )
+            .eval()
+            .unwrap();
+        assert!(given && one && bad.is_nil());
+        let commands = world.borrow_mut().take_commands();
+        let amounts: Vec<f32> = commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::Infraction { who: 1, amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(amounts, [100.0, 1.0]);
     }
 
     #[test]
