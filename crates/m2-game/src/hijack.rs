@@ -415,6 +415,10 @@ fn on(v: Option<&Value>) -> bool {
     matches!(v, Some(Value::Boolean(true)))
 }
 
+/// The Lua registry name the hijack's script object is kept by
+/// (`Vehicle.HijackStart`'s fourth argument).
+pub const HIJACK_SCRIPT: &str = "m2.hijack_script";
+
 /// Installs the engine calls the hijack scripts make, over `world`. Run
 /// after the other libraries are in (it adds to them).
 pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
@@ -618,10 +622,15 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
         }
         Ok(MultiValue::new())
     })?;
-    add(&vehicle, "HijackStart", |w, _, a| {
+    // 0x82348488: (hijacker, hijackee, vehicle, script): the script object
+    // is kept by a registry reference (0x82306FF8) in the hijacker's
+    // `RuntimeHijackState` (0x836583EC), which `Vehicle.CancelHijack`
+    // hands to `MrxActionHijack.ActionHijackCancel`.
+    add(&vehicle, "HijackStart", |w, lua, a| {
         if let (Some(hero), Some(driver), Some(vehicle)) =
             (id(a.first()), id(a.get(1)), id(a.get(2)))
         {
+            lua.set_named_registry_value(HIJACK_SCRIPT, a.get(3).cloned().unwrap_or(Value::Nil))?;
             w.hijack.current = Some((hero, driver, vehicle));
             w.commands.push(Command::Hijack(HijackCommand::Started {
                 hero,
@@ -632,6 +641,36 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
         Ok(MultiValue::new())
     })?;
     // The hijacker takes the driver's seat.
+    // 0x823486D8: with a hijack under way by `character` (its
+    // `RuntimeHijackState`, 0x83658404), calls
+    // `MrxActionHijack.ActionHijackCancel(script)` with the script object
+    // the hijack started with; nothing returned. Its one caller in the
+    // scripts is co-op's player-left handler.
+    {
+        let w = std::rc::Rc::clone(world);
+        vehicle.raw_set(
+            "CancelHijack",
+            safe_function(lua, move |lua, args| {
+                let Some(character) = id(args.iter().next()) else {
+                    return Err(mlua::Error::runtime("Vehicle.CancelHijack: bad argument"));
+                };
+                let hijacking = w
+                    .borrow()
+                    .hijack
+                    .current
+                    .is_some_and(|(hero, _, _)| hero == character);
+                if hijacking {
+                    let script: Value = lua.named_registry_value(HIJACK_SCRIPT)?;
+                    if let Value::Table(m) = lua.globals().get::<Value>("MrxActionHijack")?
+                        && let Value::Function(f) = m.get::<Value>("ActionHijackCancel")?
+                    {
+                        f.call::<()>(script)?;
+                    }
+                }
+                Ok(MultiValue::new())
+            })?,
+        )?;
+    }
     add(&vehicle, "HijackComplete", |w, _, a| {
         let Some(hero) = id(a.first()) else {
             return Ok(MultiValue::new());
@@ -998,6 +1037,31 @@ mod tests {
         );
         let c = check_minigame(&p, 0.0, 2.6, None, None, &pad);
         assert_eq!(statuses(&c), ["success"]);
+    }
+
+    #[test]
+    fn cancel_hijack_hands_the_script_its_object() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Default::default();
+        crate::api::install(host.lua(), &world).unwrap();
+        install(&host, &world).unwrap();
+        let (cancelled, other): (bool, bool) = host
+            .lua()
+            .load(
+                "local me = {name = 'hijack'}
+                 local got = nil
+                 MrxActionHijack = {ActionHijackCancel = function(o) got = o end}
+                 Vehicle.CancelHijack(1)
+                 local before = got
+                 Vehicle.HijackStart(1, 2, 3, me)
+                 Vehicle.CancelHijack(9)
+                 local other = got == nil
+                 Vehicle.CancelHijack(1)
+                 return before == nil and got == me, other",
+            )
+            .eval()
+            .unwrap();
+        assert!(cancelled && other);
     }
 
     #[test]

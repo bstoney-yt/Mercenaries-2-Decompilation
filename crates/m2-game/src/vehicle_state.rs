@@ -25,8 +25,8 @@
 //!   (0x831B7420, 0x831BA408); nothing returned.
 //!
 //! Not ported: `IsFlipped` (0x82348358, the physics object's vtable
-//! +0x9C: the script world has no up vector), `CancelHijack` (0x823486D8,
-//! a script call through the store 0x83658404). The script world keeps what was asked ([`VehicleCommand`]); the game
+//! +0x9C: the script world has no up vector). `CancelHijack` is in
+//! [`crate::hijack`]. The script world keeps what was asked ([`VehicleCommand`]); the game
 //! applies it. Inferred: a restored vehicle's health is its full health
 //! at once in the script world.
 //!
