@@ -34,8 +34,9 @@
 //! (0x82335110, kind 2 only: `FastCollectCars`' kind), `Player.SetVehicleControlsLock`
 //! (0x8233DBD8), `Player.VehicleDisguise` (0x823402B8), the `Gui` entrance
 //! marker settings (0x8231C090, 0x8231C120, 0x8231C238) and
-//! `Sound.SetVehicleEngineBoost` (0x823435C8). Not ported: when the
-//! disguise callback is called, `Human.GetVehicleWeapon` (0x82325E08).
+//! `Sound.SetVehicleEngineBoost` (0x823435C8). [`disguise_changed`] calls the
+//! disguise callback as 0x824466A8 does (the game doesn't call it yet: its
+//! disguise isn't the 360's machine, #474). `Human.GetVehicleWeapon` (0x82325E08).
 
 use mlua::{Lua, MultiValue, Table, Value};
 
@@ -333,6 +334,33 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
 /// The Lua registry name `Player.VehicleDisguise`'s callback is kept by.
 pub const DISGUISE_CALLBACK: &str = "m2.vehicle_disguise_callback";
 
+/// 0x824466A8: her disguise changed: calls the `Player.VehicleDisguise`
+/// callback with (player, disguised, state) and, with `AutoRemove`, drops
+/// it after (0x82309000's flag). Only with disguises on. The state
+/// (0x82445778's value) is passed as nil here: the script world doesn't
+/// hold it on this branch.
+pub fn disguise_changed(lua: &Lua, world: &Shared, disguised: bool) -> mlua::Result<()> {
+    let (player, on, auto) = {
+        let w = world.borrow();
+        (w.player, w.vehicle_disguise, w.vehicle_disguise_auto_remove)
+    };
+    let Value::Function(f) = lua.named_registry_value::<Value>(DISGUISE_CALLBACK)? else {
+        return Ok(());
+    };
+    if !on {
+        return Ok(());
+    }
+    if auto {
+        lua.unset_named_registry_value(DISGUISE_CALLBACK)?;
+        world.borrow_mut().vehicle_disguise_auto_remove = false;
+    }
+    f.call::<()>((
+        player.map_or(Value::Nil, crate::events::guid_value),
+        disguised,
+        Value::Nil,
+    ))
+}
+
 /// A player number argument (1 or 2; 1 unless given) as an index.
 fn player_index(v: Option<&Value>) -> usize {
     match v {
@@ -415,6 +443,44 @@ mod tests {
         );
         assert_eq!(part("lightfront"), Some(3));
         assert_eq!(part("Siren"), None);
+    }
+
+    #[test]
+    fn the_other_libraries_and_the_disguise_callback() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Default::default();
+        world.borrow_mut().player = Some(1);
+        install(&host, &world).unwrap();
+        let lua = host.lua();
+        lua.globals()
+            .set("me", crate::events::guid_value(1))
+            .unwrap();
+        let (lock, disguise, removed): (bool, bool, bool) = lua
+            .load(
+                "Gui.EnableVehicleEntranceMarkers(false, 2)                  Gui.SetVehicleEntranceMarkerVisibleDistance(10)                  return Player.SetVehicleControlsLock(me, true),                    Player.VehicleDisguise({Player = me, Callback = function() end}),                    Player.VehicleDisguise({Player = me, Remove = true})",
+            )
+            .eval()
+            .unwrap();
+        assert!(lock && disguise && !removed);
+        {
+            let w = world.borrow();
+            assert!(w.vehicle_controls_locked);
+            assert!(!w.entrance_markers[1].on && w.entrance_markers[0].on);
+            assert_eq!(w.entrance_markers[0].distance_squared, 100.0);
+        }
+        // The callback hears a change while disguises are on, and with
+        // AutoRemove only once.
+        lua.load(
+            "heard = {} Player.VehicleDisguise({Player = me, AutoRemove = true,              Callback = function(p, d) table.insert(heard, d) end})",
+        )
+        .exec()
+        .unwrap();
+        disguise_changed(lua, &world, true).unwrap();
+        world.borrow_mut().vehicle_disguise = true;
+        disguise_changed(lua, &world, true).unwrap();
+        disguise_changed(lua, &world, false).unwrap();
+        let heard: Vec<bool> = lua.load("return heard").eval().unwrap();
+        assert_eq!(heard, [true]);
     }
 
     #[test]
