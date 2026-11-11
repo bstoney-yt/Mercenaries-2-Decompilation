@@ -38,6 +38,7 @@ pub const JENNIFER: HumanMotion = HumanMotion {
     crouch_walk: 1.5,
     capsule_radius: 0.4,
     capsule_height: 1.8,
+    falls: on_foot::HERO_FALLS,
 };
 /// Seconds after take-off before touching the ground counts as landing.
 const MIN_AIR: f32 = 0.15;
@@ -421,6 +422,11 @@ pub struct Player {
     pub launcher: bool,
     /// Down (out of health): she lies where she fell.
     pub down: bool,
+    /// How far she falls, from leaving the ground to coming down
+    /// ([`on_foot::FallWatch`]), and a fall that hurt her this step, for
+    /// the fight to take from her health.
+    fall: on_foot::FallWatch,
+    pub fell: Option<on_foot::Fell>,
     /// Sitting in the seat of the vehicle she drives, posed and placed
     /// there (`hijack::Hijacks::seat`): drawn though driving.
     pub seated: bool,
@@ -641,6 +647,8 @@ impl Player {
             bashing: None,
             launcher: false,
             down: false,
+            fall: on_foot::FallWatch::default(),
+            fell: None,
             seated: false,
             seat_frame: None,
             moves: Moves::default(),
@@ -1058,6 +1066,11 @@ impl Player {
             direction
         };
         if self.update_swim(physics, swim_push, self.swim_speeds[pace], dt) {
+            // In the water no fall is being measured (inferred: the 360
+            // does not send the fall's distance under two flags of the
+            // physics object that were not traced; a dive must not cost
+            // her health when she walks out).
+            self.fall = on_foot::FallWatch::default();
             self.camera(physics);
             return;
         }
@@ -1144,6 +1157,23 @@ impl Player {
             .takes_off(intent.jump, bashing)
             .then(|| self.motion.jump_speed());
         physics.move_character(&mut self.character, wanted, jump, dt);
+        // A fall that hurts: the 360 measures it from where she left the
+        // ground, and by her template's limits it costs her health and
+        // posts `FallImpactLight` or `FallImpactHeavy`.
+        let fallen = self
+            .fall
+            .step(!self.character.grounded, self.character.position.y)
+            .and_then(|d| on_foot::fall_impact(&self.motion.falls, d).map(|f| (d, f)));
+        if let Some((distance, fell)) = fallen {
+            eprintln!(
+                "fall: {distance:.1} m, {} damage{}",
+                fell.damage,
+                fell.impact
+                    .map_or(String::new(), |i| format!(", {}", i.name()))
+            );
+            self.fell = Some(fell);
+        }
+        let impact = fallen.and_then(|(_, f)| f.impact);
 
         // Aiming, throwing or bashing, she turns the camera's way.
         let aimed = self.aiming || self.throwing.is_some() || bashing;
@@ -1336,6 +1366,15 @@ impl Player {
                     }
                     Leap::Land(..) | Leap::No => Leap::No,
                 };
+            }
+            // A fall that hurt plays its impact in the landing's place.
+            if let Some(i) = impact
+                && let Some(clip) =
+                    self.moves.fall_impacts[usize::from(i == on_foot::FallImpact::Heavy)]
+            {
+                rig.animator
+                    .play_action(clip, true, m2_assets::name_hash(i.name()));
+                self.leap = Leap::Land(0.0, clip);
             }
             let leaping = self.leap != Leap::No;
             // The launcher rides on her shoulder, as when she aims it.

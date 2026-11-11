@@ -2922,6 +2922,10 @@ impl Combat {
     /// One fixed tick: her weapons, the soldiers' shots, projectiles,
     /// health and effects.
     pub fn step(&mut self, f: &mut Field<'_>, trigger: Trigger, dt: f32) {
+        // A fall that hurt her ([`m2_engine::on_foot::fall_impact`]).
+        if let Some(fell) = f.player.fell.take() {
+            self.hurt_player(f, fell.damage, None);
+        }
         self.went_off.clear();
         self.struck.clear();
         for e in &mut self.effects {

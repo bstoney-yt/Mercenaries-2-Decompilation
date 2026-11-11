@@ -141,6 +141,10 @@ impl Held {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Moves {
     pub held: Vec<Held>,
+    /// Coming down from a fall that hurt, light and heavy (`Upright`
+    /// `FallImpactLight` and `FallImpactHeavy`): the whole body, once
+    /// ([`m2_engine::on_foot::fall_impact`]).
+    pub fall_impacts: [Option<usize>; 2],
     /// `PickupWeapon`: the whole body, once.
     pub pickup: Option<usize>,
     /// `RunStop`: the slide to a stop after a run, the whole body
@@ -448,8 +452,11 @@ pub fn resolve(
             throws,
         });
     }
+    use m2_engine::on_foot;
     Moves {
         held,
+        fall_impacts: [on_foot::FallImpact::Light, on_foot::FallImpact::Heavy]
+            .map(|i| by_action(i.name(), table::RIFLE)),
         pickup: by_action("PickupWeapon", table::RIFLE),
         run_stop: by_action(m2_engine::on_foot::RUN_STOP_ACTION, table::RIFLE),
         // The carry's rows name no class and no one.
@@ -499,6 +506,7 @@ mod tests {
         };
         Moves {
             held: vec![rifle, pistol, rocket],
+            fall_impacts: [None, None],
             pickup: Some(9),
             run_stop: None,
             carrying: [Some(20), Some(21), Some(22)],

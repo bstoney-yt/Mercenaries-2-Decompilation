@@ -1547,20 +1547,7 @@ pub fn human_speeds(db: &Layer<'_>) -> HashMap<u32, [f32; 3]> {
 pub fn human_motion(db: &Layer<'_>) -> HashMap<u32, crate::on_foot::HumanMotion> {
     use crate::on_foot::{FIELDS, HumanMotion};
     let physics = Table::new(db, "_HumanPhysics");
-    let d = HumanMotion::default();
-    let defaults = [
-        d.jump_height,
-        d.gravity,
-        d.max_rotation,
-        d.max_air_speed,
-        d.paces[0],
-        d.paces[1],
-        d.paces[2],
-        d.paces[3],
-        d.crouch_walk,
-        d.capsule_radius,
-        d.capsule_height,
-    ];
+    let defaults = HumanMotion::default().to_fields();
     physics
         .records
         .keys()
