@@ -3944,6 +3944,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     // Single player: this machine is the server.
     let net = lib("Net")?;
+    crate::ported_net::install(&lib, &add)?;
     add(&net, "IsServer", |_, _, _| values([Value::Boolean(true)]))?;
     // Net.SendCustomEvent(module, event, args, ...): a script's own event
     // sent to the other player's game (a race's gates). From the 360 code
