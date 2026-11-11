@@ -316,6 +316,8 @@ pub struct Templates {
     pub spawn_sounds: HashMap<u32, crate::spawn_sound::SpawnSound>,
     /// Each template's exhausts, by id ([`crate::vehicle_parts`]).
     pub exhausts: HashMap<u32, Vec<crate::vehicle_parts::Exhaust>>,
+    /// Each template's `Winch`, by id ([`crate::winch`]).
+    pub winches: HashMap<u32, crate::winch::WinchParams>,
     /// The emitter each `EffectModel` template draws as a model, by its
     /// name hash.
     pub effect_models: HashMap<u32, crate::vehicle_parts::ModelEmitter>,
@@ -726,6 +728,23 @@ impl Templates {
             .scale(name_hash(target), name_hash(damage))
     }
 
+    /// The `Winch` of template `name` (a vehicle's own), else of the
+    /// lowest id of `model`'s templates that have one (its variants:
+    /// drivers, factions).
+    pub fn winch_for(&self, name: &str, model: u32) -> Option<crate::winch::WinchParams> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.winches.get(id).copied())
+            .or_else(|| {
+                self.infos
+                    .iter()
+                    .filter(|(id, t)| t.model == Some(model) && self.winches.contains_key(id))
+                    .map(|(&id, _)| id)
+                    .min()
+                    .and_then(|id| self.winches.get(&id).copied())
+            })
+    }
+
     /// The tuning of template `name` (a vehicle's own, `AMX30 (Full)`),
     /// else of a template of its `model`
     /// ([`tuning_for_model`](Self::tuning_for_model)).
@@ -1050,6 +1069,7 @@ impl Templates {
             music_sources: crate::music_source::read(&db),
             spawn_sounds: crate::spawn_sound::read(&db),
             exhausts: crate::vehicle_parts::read(&db),
+            winches: crate::winch::read(&db),
             effect_models: crate::vehicle_parts::effect_models(&db)
                 .into_iter()
                 .filter_map(|(name, model, emitter, fx)| {
@@ -3077,6 +3097,39 @@ pub fn low_res_tile<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vehicle_s_winch_is_its_own_template_s_else_its_model_s() {
+        let info = |model| TemplateInfo {
+            model: Some(model),
+            vehicle: None,
+            engine: None,
+            person: false,
+            human: false,
+        };
+        let w = |length| crate::winch::WinchParams {
+            length,
+            ..Default::default()
+        };
+        let db = Templates {
+            names: HashMap::from([
+                (0x8000_0001, "Mi35 (base)".to_owned()),
+                (0x8000_0002, "Mi35 (Driver)".to_owned()),
+                (0x8000_0003, "Mi35 (Full)".to_owned()),
+            ]),
+            infos: HashMap::from([
+                (0x8000_0001, info(7)),
+                (0x8000_0002, info(7)),
+                (0x8000_0003, info(7)),
+            ]),
+            winches: HashMap::from([(0x8000_0002, w(8.0)), (0x8000_0003, w(9.0))]),
+            ..Templates::default()
+        };
+        assert_eq!(db.winch_for("Mi35 (Full)", 7).map(|p| p.length), Some(9.0));
+        // No winch of its own: its model's lowest id's.
+        assert_eq!(db.winch_for("Mi35 (base)", 7).map(|p| p.length), Some(8.0));
+        assert_eq!(db.winch_for("Other", 8), None);
+    }
 
     fn gun(template: u32, semi: bool, blast: bool) -> crate::weapons::WeaponSpec {
         let b = crate::weapons::Blast {

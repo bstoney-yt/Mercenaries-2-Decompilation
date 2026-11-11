@@ -34,6 +34,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use m2_assets::{WadArchive, name_hash};
 use m2_engine::vehicle::DRIVABLE;
+use m2_engine::winch::WinchState;
 use m2_engine::world::member_stem;
 use m2_engine::{
     CatalogueEntry, Install, Physics, StaticKey, TemplateInfo, Templates, VehicleKind,
@@ -2953,9 +2954,15 @@ impl MissionLink {
                 }
             }
             // The scripts' vehicles' load beds, where they count the goods
-            // on them (`Object.GetHardpointPosition(truck, "HP_Truckbed")`).
+            // on them (`Object.GetHardpointPosition(truck, "HP_Truckbed")`),
+            // and their winches' states (`Object.HasWinch`,
+            // `Object.GetWinchState`).
             if let Some(world) = game.scene.world.as_ref() {
                 for v in &game.scene.vehicles {
+                    if let Some(g) = v.guid {
+                        let state = v.id.and_then(|id| game.winches.state(id));
+                        mission.set_winch(g, state.map(|s| s as u8));
+                    }
                     if let (Some(g), Some(id)) = (v.guid, v.id)
                         && let Some(bed) = game.bed(v.spec.model)
                         && let Some(t) = world.physics.vehicle_transform(id)
@@ -6235,6 +6242,19 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             .position(|v| v.guid == Some(*guid))
     };
     match c {
+        // `Object.SetWinchState` on one of the scripts' helicopters: its
+        // winch takes that state and pays out or reels in to match.
+        Command::WinchState { carrier, state } => {
+            let s = [
+                WinchState::Retracted,
+                WinchState::Deployed,
+                WinchState::Deploying,
+                WinchState::Retracting,
+            ][usize::from(state & 3)];
+            if let Some(id) = index(carrier).and_then(|i| game.scene.vehicles[i].id) {
+                game.winches.set_state(id, s);
+            }
+        }
         // Seated in one of the scripts' vehicles that is placed: drive it.
         Command::EnterVehicle { guid, vehicle, .. } if *guid == PLAYER => {
             if let Some(i) = index(vehicle).filter(|&i| game.scene.vehicles[i].id.is_some())
