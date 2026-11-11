@@ -6699,6 +6699,64 @@ mod tests {
         assert_eq!(heard(&host).as_deref(), Some("free"));
     }
 
+    /// `Event.ObjectWinched` as the 360 reads it: the mode by its first
+    /// letters (not "a" detach, "an" any, else attach), fired on the hook
+    /// or the release, passing cargo, carrier and "attach"/"detach".
+    #[test]
+    fn winch_events_fire_on_hook_and_release_by_mode() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(80, Object::new("copter", [0.0, 100.0, 0.0]));
+            w.insert(82, Object::new("crate", [0.0, 95.0, 0.0]));
+        }
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                log = {}
+                local function note(t) return function(cargo, carrier, how)
+                    log[#log + 1] = t .. " " .. Sys.GuidToString(cargo) .. " "
+                        .. Sys.GuidToString(carrier) .. " " .. how
+                end end
+                local copter, box = Sys.StringToGuid("80"), Sys.StringToGuid("82")
+                Event.CreatePersistent(Event.ObjectWinched, {box, copter, "Attach"}, note("att"))
+                Event.CreatePersistent(Event.ObjectWinched, {box, 0, "Detach"}, note("det"))
+                Event.CreatePersistent(Event.ObjectWinched, {box, 0, "any"}, note("any"))
+                "#,
+            )
+            .exec()
+            .unwrap();
+        // The first look records it unhooked: nothing fires.
+        events.update_shared(0.1, &world);
+        let log = |host: &ScriptHost| -> Vec<String> { host.lua().globals().get("log").unwrap() };
+        assert!(log(&host).is_empty());
+        host.lua()
+            .load("Object.AttachCargoToWinch(Sys.StringToGuid('82'), Sys.StringToGuid('80'))")
+            .exec()
+            .unwrap();
+        events.update_shared(0.1, &world);
+        let mut got = log(&host);
+        got.sort();
+        assert_eq!(got, ["any 82 80 attach", "att 82 80 attach"]);
+        host.lua()
+            .load("Object.DetachCargoFromWinch(Sys.StringToGuid('82'))")
+            .exec()
+            .unwrap();
+        events.update_shared(0.1, &world);
+        let mut got = log(&host);
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "any 82 80 attach",
+                "any 82 80 detach",
+                "att 82 80 attach",
+                "det 82 80 detach"
+            ]
+        );
+    }
     #[test]
     fn menus_build_widgets_and_math_has_the_basics() {
         let (host, _) = setup();
