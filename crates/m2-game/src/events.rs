@@ -184,7 +184,7 @@ pub fn state_matches(pattern: &str, state: &str) -> bool {
     }
 }
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 21] = [
+pub const KINDS: [&str; 22] = [
     "TimerRelative",
     // Every update, in the mission's scripts too: the support manager's
     // recruit cooldowns count with it (`SupportTimer`, which takes
@@ -210,6 +210,7 @@ pub const KINDS: [&str; 21] = [
     "HumanStateTransition",
     "ObjectPhysicsEvent",
     "WeaponEvent",
+    "ObjectHealthLessThan",
 ];
 
 /// Kinds the game delivers itself through `Event.__m2_fire` (besides
@@ -1462,6 +1463,18 @@ fn check(
                 }
             }
             no
+        }
+        // { object, health }: once the object's health is below the
+        // figure, or can no longer be read (OilCon002 watches one of its
+        // targets this way). From the 360 code (the event's reader
+        // 82350E28 and its test 82350EE8): both are needed, it is tested
+        // as the object is damaged, and it passes nothing.
+        "ObjectHealthLessThan" => {
+            let (Some(object), Some(figure)) = (guid(&p.params, 1), number(&p.params, 2)) else {
+                return no;
+            };
+            let below = world.health(object).is_none_or(|h| f64::from(h) < figure);
+            Check::Holds(below, Vec::new())
         }
         // { character (or filter), from, to }: as one of them goes from a
         // state matching `from` to one matching `to` ([`state_matches`]:
