@@ -5931,20 +5931,26 @@ impl Physics {
         f(solid().predicate(&keep))
     }
 
-    /// Whether nothing that moves is in the box from `lo` to `hi`: no
-    /// vehicle, loose prop or body (sensors aside), where road traffic may
-    /// come out ([`crate::road_population::spawn_box`]). From the 360 code:
-    /// 0x82153B30 asks its world's broadphase and lets by what the owner's
-    /// kind (its vtable's +0xE0) says: 6, a `_BuildingPhysics` (0x822F64D8),
-    /// 7, an `EffectAiOccluder`'s stand-in box (0x8218DE80), 9, a `Winch`
-    /// (0x821952E8), and 5, not identified; the ground, 13, falls outside
-    /// its switch and is let by too. What blocks is kinds 0 to 4, 8 and 10
-    /// (boats). Inferred: every fixed static here stands for a building
-    /// (as [`fixed_near`](Self::fixed_near) takes them).
-    pub fn box_clear(&self, lo: Vec3, hi: Vec3) -> bool {
+    /// Whether nothing that keeps a road vehicle from coming out is in the
+    /// box from `lo` to `hi` ([`crate::road_population::spawn_box`]): no
+    /// moving body but debris (sensors aside), and no static `blocks` says
+    /// is a prop. From the 360 code: 0x82153B30 asks its world's
+    /// broadphase and goes by each owner's kind (its vtable's +0xE0): a
+    /// `_PropPhysics` (0, 0x828280B0, fixed or loose alike), a human (1,
+    /// 0x822A2F80), a car (2, 0x82225D30), a tank (3, 0x82799AA0), a
+    /// helicopter (4, 0x823B4D18), a jet (8, 0x82225AA8) or a boat (10,
+    /// 0x824258B8) keeps it; a `_BuildingPhysics` (6, 0x822F64D8), an
+    /// `EffectAiOccluder`'s stand-in box (7), a `Winch` (9) or kind 5 (not
+    /// identified) lets it by, and so does what falls outside its switch:
+    /// a `_DebrisPhysics` piece (14, 0x8218B648) and the ground (13).
+    pub fn box_clear(&self, lo: Vec3, hi: Vec3, blocks: impl Fn(StaticKey) -> bool) -> bool {
         let middle = (lo + hi) * 0.5;
         let cube = r::Cuboid::new(vector(((hi - lo) * 0.5).max(Vec3::splat(1e-3))));
-        let moves = |h: r::ColliderHandle, _: &r::Collider| !self.keys.contains_key(&h);
+        let debris: Vec<r::RigidBodyHandle> = self.debris.iter().flatten().copied().collect();
+        let moves = |h: r::ColliderHandle, c: &r::Collider| match self.keys.get(&h) {
+            Some(&k) => blocks(k),
+            None => c.parent().is_none_or(|b| !debris.contains(&b)),
+        };
         self.world
             .intersect_shape(
                 pose(middle, Quat::IDENTITY),
@@ -6337,34 +6343,30 @@ mod tests {
         assert_eq!(ai_wobble(3.0, 0.6), [0.0; 3]);
     }
 
-    // 0x82153B30: a building or the ground lets a road vehicle come out
-    // in its box; something loose there doesn't.
+    // 0x82153B30: a building, the ground or debris lets a road vehicle
+    // come out in its box; a prop there doesn't.
     #[test]
-    fn a_spawn_box_is_kept_by_what_moves_not_by_buildings() {
+    fn a_spawn_box_is_kept_by_props_not_by_buildings() {
         let mut p = Physics::new();
         let block = CollisionShape::cuboid(Vec3::new(3.0, 4.0, 3.0));
         p.add_static(StaticKey::Cell(1), &block, Vec3::ZERO, Quat::IDENTITY);
-        p.add_static(
-            StaticKey::Object(2),
-            &block,
-            Vec3::new(20.0, 0.0, 0.0),
-            Quat::IDENTITY,
-        );
+        for (k, x) in [(2, 20.0), (3, 60.0)] {
+            let at = Vec3::new(x, 0.0, 0.0);
+            p.add_static(StaticKey::Object(k), &block, at, Quat::IDENTITY);
+        }
         let piece = LoosePiece::block(None, Vec3::ZERO, Vec3::splat(0.5), 30.0);
-        p.add_debris(
-            &piece,
-            Mat4::from_translation(Vec3::new(40.0, 1.0, 0.0)),
-            Vec3::ZERO,
-            Vec3::ZERO,
-        );
+        let at = Mat4::from_translation(Vec3::new(40.0, 1.0, 0.0));
+        p.add_debris(&piece, at, Vec3::ZERO, Vec3::ZERO);
         p.step(DT);
-        let around = |x: f32| (Vec3::new(x - 2.0, 0.2, -1.0), Vec3::new(x + 2.0, 3.0, 1.0));
-        let (lo, hi) = around(0.0);
-        assert!(p.box_clear(lo, hi));
-        let (lo, hi) = around(20.0);
-        assert!(p.box_clear(lo, hi));
-        let (lo, hi) = around(40.0);
-        assert!(!p.box_clear(lo, hi));
+        // Object 3 is a fixed prop, object 2 a building.
+        let clear = |x: f32| {
+            let (lo, hi) = (Vec3::new(x - 2.0, 0.2, -1.0), Vec3::new(x + 2.0, 3.0, 1.0));
+            p.box_clear(lo, hi, |k| k == StaticKey::Object(3))
+        };
+        assert!(clear(0.0));
+        assert!(clear(20.0));
+        assert!(clear(40.0));
+        assert!(!clear(60.0));
     }
 
     // What stands fixed in a boat's area, without the terrain.

@@ -32,9 +32,9 @@
 //!   the zone where it comes out (0x8226C618); one taken away comes again
 //!   under its entity with its new model.
 //! - One comes out only where its box (0x8226BD10,
-//!   [`road_population::spawn_box`]) meets nothing that moves: 0x82153B30
-//!   lets buildings, the ground, winches and AI occluders by
-//!   ([`m2_engine::Physics::box_clear`]). Invented: off the roads the
+//!   [`road_population::spawn_box`]) meets no vehicle or prop, fixed or
+//!   loose: 0x82153B30 lets buildings, the ground, debris, winches and AI
+//!   occluders by ([`m2_engine::Physics::box_clear`]). Invented: off the roads the
 //!   rings are laid from the road she was last on.
 //!   Not ported: junctions' stop lines and flow control (no layer read
 //!   holds an `RtFlowControl`); the 360's density grid for rings that
@@ -43,6 +43,7 @@
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::car_driver::{CarDriver, CarInputs, CarState};
+use m2_engine::physics::StaticKey;
 use m2_engine::population::{DensityZone, zone_at};
 use m2_engine::road_population::{self, Mode, Spawner, Viewer};
 use m2_engine::road_ring::{self, Flood, RingPoint, RoadNet};
@@ -376,6 +377,18 @@ impl RoadTraffic {
                 road_population::spawn_box(at, Vec3::new(yaw.sin(), 0.0, yaw.cos()))
             })
             .collect();
+        // Which statics keep one from coming out: the props
+        // (`_PropPhysics`, fixed or loose), not the buildings.
+        let props = &scene.props;
+        let db = &index.template_db;
+        let blocks = |k: StaticKey| {
+            let template = match k {
+                StaticKey::Object(i) => index.objects.get(i).map(|o| o.template),
+                StaticKey::Entity(e) => props.get(e).map(|(p, _)| p.template),
+                StaticKey::Cell(_) | StaticKey::Member(..) => None,
+            };
+            template.is_some_and(|t| db.prop_physics.contains_key(&t))
+        };
         let mut places = Vec::new();
         let mut spawner = self.spawner;
         spawner.step(dt, mode, !in_vehicle, her_speed, coin, room, &mut |ask| {
@@ -388,6 +401,7 @@ impl RoadTraffic {
                 &viewer,
                 in_vehicle,
                 &world.physics,
+                &blocks,
                 &mut stands,
             );
             let n = found.len();
@@ -493,6 +507,7 @@ impl RoadTraffic {
         viewer: &Viewer,
         in_vehicle: bool,
         physics: &Physics,
+        blocks: &dyn Fn(StaticKey) -> bool,
         stands: &mut Vec<(Vec3, Vec3)>,
     ) -> Vec<Place> {
         let mut out = Vec::new();
@@ -528,11 +543,11 @@ impl RoadTraffic {
             if !ask.seen.allows(seen) || !road_population::spawn_keeps(d, seen, mode) {
                 continue;
             }
-            // Its box clear of what moves (0x8226BD10, 0x82153B30), and
+            // Its box clear of vehicles and props (0x8226BD10, 0x82153B30), and
             // of those put out this frame, not yet in it.
             let (lo, hi) = road_population::spawn_box(at, dir);
             let meets = |o: &(Vec3, Vec3)| lo.cmple(o.1).all() && hi.cmpge(o.0).all();
-            if !physics.box_clear(lo, hi) || stands.iter().any(meets) {
+            if !physics.box_clear(lo, hi, blocks) || stands.iter().any(meets) {
                 continue;
             }
             let Some(zone) = zone_at(zones.iter().copied(), at.x, at.z)
@@ -1126,6 +1141,7 @@ mod tests {
             &viewer,
             false,
             &physics,
+            &|_| false,
             &mut stands,
         );
         assert_eq!(got.len(), 1);
@@ -1149,6 +1165,7 @@ mod tests {
             &viewer,
             false,
             &physics,
+            &|_| false,
             &mut stands,
         );
         assert!(again.is_empty());
@@ -1169,6 +1186,7 @@ mod tests {
             &away,
             false,
             &physics,
+            &|_| false,
             &mut stands,
         );
         assert!(got.is_empty());
