@@ -3060,7 +3060,13 @@ impl Scene {
                 });
             }
             Loaded::WorldVehicle(entity, at, yaw, crew, spec, _) => {
-                self.vehicles.push(ParkedVehicle {
+                // Road traffic taken away comes again under its entity
+                // with a new model: in its old place, not a second one.
+                let old = self
+                    .vehicles
+                    .iter()
+                    .position(|v| v.id.is_none() && v.spot.is_some_and(|(e, _, _)| e == entity));
+                let vehicle = ParkedVehicle {
                     spec: tune(spec),
                     model,
                     id: None,
@@ -3081,7 +3087,11 @@ impl Scene {
                     parts: None,
                     loose: Vec::new(),
                     debris_thrown: self.ruins.contains(&entity),
-                });
+                };
+                match old {
+                    Some(i) => self.vehicles[i] = vehicle,
+                    None => self.vehicles.push(vehicle),
+                }
             }
             Loaded::Chunk(hash, _) => {
                 let (lying, near) = (
