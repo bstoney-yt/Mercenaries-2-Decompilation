@@ -837,12 +837,14 @@ pub struct ScriptWorld {
     /// Assets asked for with a callback (`Pg.LoadAsset(name, type,
     /// callback, data)`): answered as loaded on the next tick
     /// ([`answer_asset_loads`]).
-    asset_loads: Vec<(Function, Value)>,
+    pub(crate) asset_loads: Vec<(Function, Value)>,
     /// The outlines of region objects (`LineRegion`), by the region's guid;
     /// placed at the object's position and yaw.
     pub regions: HashMap<u32, m2_assets::Region>,
     /// The object link table ([`crate::links`]).
     pub links: crate::links::Links,
+    /// The sound engine's state the scripts set (`crate::script_sound`).
+    pub sound: crate::script_sound::SoundSettings,
     /// What `Pg.GetAllLandingZones(kind)` answers, by kind: the zones by
     /// their number. The transit script reads kinds 1 and 2 (where each
     /// player lands) as tables keyed alike.
@@ -2524,6 +2526,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Weapons as objects: a loadout of templates, each weapon with its own
     // reserve of ammunition.
     crate::links::install(&lib, &add)?;
+    crate::script_sound::install(&lib, &add)?;
     let human = lib("Human")?;
     // Human.SetAllowCorpseCleanup(character, allow): whether the game may
     // clear its body away (the verify objective keeps a target's until it
@@ -4246,11 +4249,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         add(&sys, "SetAutosaveEnabled", |w, _, a| {
             Ok(f::set_autosave(&mut w.sys_flags, a))
         })?;
-        add(&sys, "HaveActiveProfile", |w, _, a| {
-            Ok(f::with_arg(a, w.sys_flags.have_profile))
+        add(&sys, "HaveActiveProfile", |w, _, _| {
+            Ok(f::yes_no(w.sys_flags.have_profile))
         })?;
-        add(&sys, "IsGermanSKU", |w, _, a| {
-            Ok(f::with_arg(a, w.sys_flags.german_sku))
+        add(&sys, "IsGermanSKU", |w, _, _| {
+            Ok(f::yes_no(w.sys_flags.german_sku))
         })?;
         use crate::script_time::{self as t, ClockKind};
         add(&sys, "MainTime", |w, _, _| {
@@ -5283,6 +5286,46 @@ mod tests {
             }]
         );
         assert_eq!(w.printed, ["jeep moved"]);
+    }
+
+    #[test]
+    fn the_sound_settings_and_vo_calls_answer_as_the_360_ones() {
+        let (host, world) = setup();
+        let (vol, unset, bad, cancelled, paused, profile, sku): (
+            f32,
+            f32,
+            usize,
+            bool,
+            bool,
+            bool,
+            bool,
+        ) = host
+            .lua()
+            .load(
+                r#"
+                Sound.SetCategoryVolume("music", 0.5)
+                return Sound.GetCategoryVolume("music"), Sound.GetCategoryPitch("music"),
+                    select('#', Sound.SetCategoryVolume("music")),
+                    VO.CancelAll(), VO.Unpause(), Sys.HaveActiveProfile(), Sys.IsGermanSKU()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(
+            (vol, unset, bad, cancelled, paused, profile, sku),
+            (0.5, 1.0, 1, true, true, true, false)
+        );
+        host.lua()
+            .load(r#"Sound.TestCueSound("sfx_test")"#)
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [Command::CueSound {
+                at: Some(1),
+                cue: "sfx_test".into()
+            }]
+        );
     }
 
     #[test]
