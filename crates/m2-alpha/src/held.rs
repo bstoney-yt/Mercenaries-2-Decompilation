@@ -77,6 +77,11 @@ pub struct Held {
     pub equip: HashMap<(Side, bool), usize>,
     /// Changing its clip, running (true) or standing.
     pub reload: HashMap<bool, usize>,
+    /// Standing still with it: the second idle she settles into and the
+    /// fidget ([`m2_engine::stand_idle`]), the upright locomotion node's
+    /// entries 12 ([`SETTLED_HANDLE`]) and 13 (`Upright_Fidget`).
+    pub settled: Option<usize>,
+    pub fidget: Option<usize>,
     /// Crouched and aiming ([`m2_engine::on_foot::CROUCH_HOLD`]): each
     /// gait's clip, walking forwards (false) or backwards (true), from
     /// the on-foot table's `Crouch_Aim_*` handles ([`CROUCH_HANDLES`]).
@@ -96,6 +101,16 @@ pub struct Held {
 /// gaits'): the 360 aims in by going `Crouched`, and its aim movement
 /// (`AimMovementNodes`, 0x82802B10) is these seven and two 90 degree
 /// shuffles. The alpha's run and sprint are the 360's jog and run.
+/// The upright locomotion node's second idle: entry 12 of its handle
+/// list (0x82B4DA98, from the 360 code). Its name is not known (no name
+/// guessed hashes to it); the on-foot table gives it rows by class and
+/// character, and to anyone holding anything its stand-in for no clip.
+pub const SETTLED_HANDLE: u32 = 0x2403_f715;
+
+/// The upright locomotion node's fidget, entry 13 of the same list, by
+/// name (its hash is the entry, 700d4de0).
+pub const FIDGET_HANDLE: &str = "Upright_Fidget";
+
 pub const CROUCH_HANDLES: [(Gait, bool, &str); 7] = [
     (Gait::Idle, false, "Crouch_Aim_Idle"),
     (Gait::Walk, false, "Crouch_Aim_WalkForward"),
@@ -286,6 +301,14 @@ pub fn resolve(
                 }
             }
         }
+        let by_handle = |handle: u32| {
+            let p = table::handle_clip(t, handle, who, class, fits)?;
+            (p.clip != table::NO_ANIMATION)
+                .then(|| index(p.clip))
+                .flatten()
+        };
+        let settled = by_handle(SETTLED_HANDLE);
+        let fidget = by_handle(m2_assets::name_hash(FIDGET_HANDLE));
         let crouch = CROUCH_HANDLES
             .iter()
             .filter_map(|&(g, back, name)| {
@@ -343,6 +366,8 @@ pub fn resolve(
             stow,
             equip,
             reload,
+            settled,
+            fidget,
         });
     }
     Moves {
@@ -355,6 +380,12 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fidget's name hashes to entry 13 of the upright node's list.
+    #[test]
+    fn the_fidgets_name_is_the_lists_entry() {
+        assert_eq!(m2_assets::name_hash(FIDGET_HANDLE), 0x700d_4de0);
+    }
 
     fn moves() -> Moves {
         let pistol = m2_assets::name_hash("pistol");
