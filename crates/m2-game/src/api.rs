@@ -2840,13 +2840,19 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([guid_value(id(a.first()).and_then(|g| w.vehicle_of(g)))])
     })?;
     // Vehicle.Usable(vehicle, usable): all three calls in the scripts pass
-    // false, for vehicles the scripts keep for themselves.
+    // false, for vehicles the scripts keep for themselves (two of them a
+    // race's tank, ChiCon008's and PmcCon016's). From the 360 code
+    // (823487C0): it gives whether it was handed a vehicle; with a
+    // vehicle and no second argument it does nothing and gives nothing.
     add(&vehicle, "Usable", |w, _, a| {
-        if let Some(guid) = id(a.first()) {
-            let on = !matches!(a.get(1), Some(Value::Boolean(false)));
-            w.commands.push(Command::Usable { guid, on });
-        }
-        values([])
+        let Some(guid) = id(a.first()) else {
+            return values([Value::Boolean(false)]);
+        };
+        let Some(Value::Boolean(on)) = a.get(1) else {
+            return values([]);
+        };
+        w.commands.push(Command::Usable { guid, on: *on });
+        values([Value::Boolean(true)])
     })?;
     add(&vehicle, "GetRiders", |w, lua, a| {
         let v = id(a.first());
@@ -4219,6 +4225,27 @@ mod tests {
         assert_eq!(w.objects[&1].fuel, 180.0);
     }
 
+    #[test]
+    fn usable_answers_whether_it_was_handed_a_vehicle() {
+        let (host, world) = setup();
+        let (set, none, bare): (Value, Value, Value) = host
+            .lua()
+            .load(
+                "local jeep = Pg.GetGuidByName('_global_veh_jeep 0x0001')\n\
+                 return Vehicle.Usable(jeep, true), Vehicle.Usable(nil, false), \
+                 (Vehicle.Usable(jeep))",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(set, Value::Boolean(true));
+        assert_eq!(none, Value::Boolean(false));
+        // A vehicle and nothing to set it to: nothing done, nothing given.
+        assert_eq!(bare, Value::Nil);
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [Command::Usable { guid: 50, on: true }]
+        );
+    }
     #[test]
     fn the_scripts_radio_playlists_are_kept_by_name_hash() {
         let (host, world) = setup();
