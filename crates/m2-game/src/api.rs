@@ -3220,6 +3220,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     // Single player: this machine is the server.
     let net = lib("Net")?;
+    crate::ported_net::install(&lib, &add)?;
     add(&net, "IsServer", |_, _, _| values([Value::Boolean(true)]))?;
     for name in ["IsClient", "IsActive", "IsMultiplayer"] {
         add(&net, name, |_, _, _| values([Value::Boolean(false)]))?;
