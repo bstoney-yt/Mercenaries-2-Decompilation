@@ -34,6 +34,9 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const ARGS_FILE: &str = "m2-alpha-args.txt";
 const LOG_FILE: &str = "m2-alpha.log";
+/// The run before's log, kept beside it when a new one starts, so a
+/// problem met in play can still be sent after the game is opened again.
+const PREVIOUS_LOG: &str = "m2-alpha.prev.log";
 /// The top of the phone's shared storage.
 const STORAGE: &str = "/storage/emulated/0";
 /// The folder the player drags onto the phone (its name, then the alpha's
@@ -107,15 +110,28 @@ fn android_main(app: AndroidApp) {
 }
 
 /// Sends standard error (where the game reports) to `path`: an app has no
-/// console. False when the file can't be made.
+/// console. The log already there is kept as [`PREVIOUS_LOG`] beside it
+/// (copied when it can't be renamed). False when the file can't be made.
 fn log_to(path: &Path) -> bool {
     use std::os::fd::AsRawFd as _;
+    keep_previous(path);
     let Ok(file) = std::fs::File::create(path) else {
         return false;
     };
     // SAFETY: both descriptors are open; dup2 leaves `file`'s own to be
     // closed when it drops.
     unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) != -1 }
+}
+
+/// Keeps the log at `path`, if any, as [`PREVIOUS_LOG`] in its folder.
+fn keep_previous(path: &Path) {
+    if !path.is_file() {
+        return;
+    }
+    let previous = path.with_file_name(PREVIOUS_LOG);
+    if std::fs::rename(path, &previous).is_err() {
+        let _ = std::fs::copy(path, &previous);
+    }
 }
 
 /// Captures the mouse (`on`) or lets it go: while captured it moves no
