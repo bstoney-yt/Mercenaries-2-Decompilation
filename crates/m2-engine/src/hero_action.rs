@@ -48,11 +48,27 @@
 //! program takes the facing's heading less the throw's; the beta's
 //! headings are taken to turn the same way.
 //!
-//! **Not traced**: the take-off and the air. `JumpTakeoffMoving`,
-//! `JumpTakeoffStationary` and `Jump` are compared in the player's input
-//! code (0x82436A48) but the order the jump goes through them, and what
-//! plays in the `InAir` stance, was not read, so the beta's take-off and
-//! air clips stay as they were found.
+//! **The jump.** The beta plays one clip from the press until she lands
+//! (its "take-off", on the run or standing) and has a stand-in for when
+//! it has none (its "jump"). From samples, the tables give a jump four
+//! clips: `Upright` `JumpTakeoffMoving` or `JumpTakeoffStationary` (one
+//! clip for both, 0.17 to 0.20 s, with a `jump` event 0.10 s in),
+//! `Upright` `Jump` (0.93 to 0.97 s, the rise), `InAir` `Jump` (0.53 s,
+//! looping) and a landing. The beta's take-off slots are keyed to the
+//! rise, `Upright` `Jump`, which is the clip its running take-off always
+//! was (found by eye, it sat under another handle with the same rows);
+//! its standing take-off was a `DieAnimatedRagdoll` clip. The stand-in is
+//! keyed to `InAir` `Jump` (it was `Swim` `EnterSwim`'s).
+//!
+//! **Not traced**: who sets the take-off, landing and fall actions and in
+//! what order. No code in the 360 program builds their hashes to store
+//! them (only to compare: 0x82436A48, 0x8241FCA8, 0x828071A8; checked over
+//! the raw words of the whole image), so the setter takes them from loaded
+//! data. 0x82420208 answers the hash of `jump` (the event's and the
+//! action's alike) by sending the physics its jump message. So the
+//! 0.17 s wind-up before she leaves the ground, and the air loop after
+//! the rise, are not played: that would change the jump's timing on
+//! inference alone.
 
 //!
 //! # The locomotion nodes' handle lists
@@ -105,7 +121,22 @@ pub struct SlotAction {
 }
 
 /// The slots looked up forward, by stance and action.
-pub const SLOT_ACTIONS: [SlotAction; 4] = [
+pub const SLOT_ACTIONS: [SlotAction; 7] = [
+    SlotAction {
+        slot: "take-off",
+        stance: "Upright",
+        action: "Jump",
+    },
+    SlotAction {
+        slot: "standing take-off",
+        stance: "Upright",
+        action: "Jump",
+    },
+    SlotAction {
+        slot: "jump",
+        stance: "InAir",
+        action: "Jump",
+    },
     SlotAction {
         slot: "land",
         stance: "Upright",
@@ -235,7 +266,9 @@ mod tests {
             slot_action("low bash").map(|a| a.action),
             Some("MeleeBashLow")
         );
-        assert_eq!(slot_action("take-off"), None);
+        assert_eq!(slot_action("take-off").map(|a| a.action), Some("Jump"));
+        assert_eq!(slot_action("jump").map(|a| a.stance), Some("InAir"));
+        assert_eq!(slot_action("die"), None);
         for (i, a) in SLOT_ACTIONS.iter().enumerate() {
             assert!(SLOT_ACTIONS[..i].iter().all(|b| b.slot != a.slot));
         }

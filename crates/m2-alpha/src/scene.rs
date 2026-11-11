@@ -431,9 +431,13 @@ fn table_clips(
         .zip(clips.slots())
         .map(|(&(_, key), (_, i))| (key, hash(i)))
         .collect();
+    // Her standing take-off was a `DieAnimatedRagdoll` clip, found by
+    // eye: there the table's rise stands, footage-matched or not.
+    let forced = |key: u32| key == npc::FightClips::TAKEOFF_STILL[0];
     let theirs = |key: u32| {
         let p = resolve(key)?;
-        (!jennifer || had.get(&key).copied().flatten() == Some(p.clip)).then_some(p.clip)
+        (!jennifer || forced(key) || had.get(&key).copied().flatten() == Some(p.clip))
+            .then_some(p.clip)
     };
     let mut picked = *clips;
     let settled = picked.by_table(rig, &theirs);
