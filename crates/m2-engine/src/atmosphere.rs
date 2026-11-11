@@ -702,9 +702,14 @@ impl Atmosphere {
                 lighting.clouds.tone *= sky;
             }
         }
-        // `BloomAmount` times `BloomMultiplier` above `BloomThreshold`
-        // (inferred from the names).
-        lighting.bloom = self.bloom[0] * self.bloom[1];
+        // `BloomAmount` alone: the record blend hands the post pass the
+        // amount (its `imageParams.x`), the radius and the tone settings,
+        // and never `BloomMultiplier` or `BloomThreshold`, which the
+        // scripts' setters for them only store (from the 360 code: 0x8224C398,
+        // 0x821BD348, `Graphics.Bloom.SetMultiplier`/`SetThreshold`). The
+        // fitted bright pass still uses the threshold.
+        lighting.bloom = self.bloom[0];
+        lighting.bloom_radius = self.bloom[3];
         lighting.bloom_threshold = self.bloom[2];
         // Clouds are lit by the game's formula; `M2_CLOUDS=old` lights
         // them as before.

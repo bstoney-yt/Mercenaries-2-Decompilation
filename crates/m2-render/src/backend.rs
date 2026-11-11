@@ -119,6 +119,9 @@ pub struct Lighting {
     /// into its surroundings; 0 turns bloom off.
     pub bloom: f32,
     pub bloom_threshold: f32,
+    /// `BloomBlurRadius`: how far apart the game's blur taps stand in its
+    /// first two blurred levels (see the post pass's `blur_spread`).
+    pub bloom_radius: f32,
     /// Per-channel scale on the finished frame: a colour grade.
     pub grade: Vec3,
     /// Power on the frame's luminance about mid grey (0.18): above 1
@@ -344,6 +347,7 @@ impl Default for Lighting {
             shadow_distance: 200.0,
             exposure: 1.0,
             bloom: 0.0,
+            bloom_radius: 0.0,
             bloom_threshold: 1.0,
             grade: Vec3::ONE,
             contrast: 1.0,
