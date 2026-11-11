@@ -2750,6 +2750,21 @@ impl MissionLink {
             .as_ref()
             .is_some_and(|p| p.driving.is_none() && p.swimming());
         mission.set_swimming(PLAYER, swimming);
+        // What her crosshair is on, for `Player.GetTargetUnderReticle`: the
+        // point, and the person there if one (by the guid they were
+        // spawned with). On foot only, as her crosshair is.
+        {
+            let reticle = match (game.walking(), game.scene.world.as_ref()) {
+                (Some(p), Some(world)) => {
+                    let at = combat::Combat::aim_point(&world.physics, &game.scene.people, p, None);
+                    let who = combat::Combat::aim_probe(&world.physics, &game.scene.people, p)
+                        .and_then(|(_, n)| game.scene.people.npcs.get(n?)?.spawn);
+                    Some((at.to_array(), who))
+                }
+                _ => None,
+            };
+            mission.world().borrow_mut().reticle_target = reticle;
+        }
         // A scene's camera shot, from where its two stand now.
         if let Some(mut shot) = game.shot.take() {
             let w = mission.world().borrow();

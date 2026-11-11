@@ -792,6 +792,9 @@ pub struct ScriptWorld {
     pub boundaries: Vec<u32>,
     pub boundary_callback: Option<Function>,
     pub outside: bool,
+    /// The point under her reticle and the object there, as the game
+    /// keeps them (`Player.GetTargetUnderReticle`: [`crate::player_target`]).
+    pub reticle_target: Option<([f32; 3], Option<u32>)>,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
     /// Every template the template database names, in lower case: the
@@ -2567,6 +2570,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let who = id(a.first()).or(w.player);
         values([guid_value(who)])
     })?;
+    crate::player_target::install(&lib, &add)?;
     let camera = lib("Camera")?;
     // The camera looks the way she faces; a camera whose holder this
     // world doesn't place (the HUD's own world) faces north. Always a
