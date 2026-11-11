@@ -38,7 +38,16 @@
 //! - **Cargo** (the update): reeling in with cargo on and no more links
 //!   out than the autodrop count, or retracted, the cargo drops.
 //!
-//! Not ported here: the links' bodies and their physics (0x821962B8,
+//! - **Her controls** (0x824AFFD8, for a helicopter she flies with a
+//!   winch): asking for a state other than the winch's presses the second
+//!   button when it is retracted and asked to deploy, or deployed and asked
+//!   to retract; deployed, holding the hook button with a target not
+//!   already on, it hooks the target, first putting it under the hook if
+//!   it is over a metre away (velocities zeroed); letting go of the
+//!   button drops the cargo ([`player_step`]).
+//!
+//! Not ported here: how her controls pick the target (+0x19, filled
+//! elsewhere), the links' bodies and their physics (0x821962B8,
 //! 0x82196BB8, read through VMX), the attach and the hook (0x82195C30,
 //! 0x82196238), the sounds each change plays (0x82174F88), the ground
 //! check that stops a winch deploying near the ground (0x82167400).
@@ -134,12 +143,13 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, WinchParams> {
 
 /// The winch's state (+0x140), as `Object.GetWinchState` names it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub enum WinchState {
     #[default]
-    Retracted,
-    Deployed,
-    Deploying,
-    Retracting,
+    Retracted = 0,
+    Deployed = 1,
+    Deploying = 2,
+    Retracting = 3,
 }
 
 impl WinchState {
@@ -371,6 +381,67 @@ impl Winch {
     }
 }
 
+/// The player's winch controls for a step, as her helicopter's input
+/// has them (0x824AFFD8 reads its input's +0x17 to +0x19).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WinchPad {
+    /// The winch is hers to work (+0x17 bit 7).
+    pub on: bool,
+    /// The state she asks for (+0x17 bits 0 and 1).
+    pub want: u8,
+    /// She holds the hook-on button (+0x18 bit 7).
+    pub hold: bool,
+}
+
+/// What the player's controls ask of the winch this step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlayerAsk {
+    /// The second button's action (0xB422F25E, [`Winch::press_deploy`]).
+    pub press: bool,
+    /// Hook on her target (0x82195C30), first putting it under the hook
+    /// when it is more than a metre from it.
+    pub hook: bool,
+    pub snap: bool,
+    /// Let the cargo go (0x82195FF8).
+    pub drop: bool,
+}
+
+/// 0x824AFFD8: the player's winch for a step. `target` is the object her
+/// controls name (+0x19), `cargo` what is on the cable, `far` that the
+/// target is more than a metre from the hook.
+pub fn player_step(
+    w: &Winch,
+    pad: &WinchPad,
+    target: Option<u32>,
+    cargo: Option<u32>,
+    far: bool,
+) -> PlayerAsk {
+    let mut ask = PlayerAsk::default();
+    if !pad.on {
+        return ask;
+    }
+    let want = pad.want & 3;
+    let state = w.state as u8;
+    if want != state {
+        // Retracted, asked deployed or deploying; deployed, asked
+        // retracted or retracting: the second button.
+        ask.press = (w.state == WinchState::Retracted && (want == 1 || want == 2))
+            || (w.state == WinchState::Deployed && (want == 0 || want == 3));
+    }
+    if w.state == WinchState::Deployed
+        && pad.hold
+        && let Some(t) = target
+        && cargo != Some(t)
+    {
+        ask.hook = true;
+        ask.snap = far;
+    }
+    if !pad.hold && cargo.is_some() {
+        ask.drop = true;
+    }
+    ask
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +452,33 @@ mod tests {
             retract_autodrop_when_length_shorter: 2.0,
             ..WinchParams::default()
         })
+    }
+
+    #[test]
+    fn her_controls_work_the_winch() {
+        let mut w = heli();
+        let pad = |want, hold| WinchPad {
+            on: true,
+            want,
+            hold,
+        };
+        // Off: nothing.
+        assert_eq!(
+            player_step(&w, &WinchPad::default(), Some(5), None, false),
+            PlayerAsk::default()
+        );
+        // Retracted, asked to deploy: the second button.
+        assert!(player_step(&w, &pad(2, false), None, None, false).press);
+        assert!(!player_step(&w, &pad(3, false), None, None, false).press);
+        w.state = WinchState::Deployed;
+        assert!(player_step(&w, &pad(0, false), None, None, false).press);
+        assert!(!player_step(&w, &pad(2, false), None, None, false).press);
+        // Deployed, holding with a target: hook it, snapped if far.
+        let a = player_step(&w, &pad(1, true), Some(5), None, true);
+        assert!(a.hook && a.snap && !a.drop);
+        assert!(!player_step(&w, &pad(1, true), Some(5), Some(5), true).hook);
+        // Let go of the button: the cargo drops.
+        assert!(player_step(&w, &pad(1, false), Some(5), Some(5), false).drop);
     }
 
     #[test]
