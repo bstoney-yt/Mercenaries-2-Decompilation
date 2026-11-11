@@ -31,6 +31,7 @@ pub mod boat_attack;
 pub mod car_attack;
 pub mod car_driver;
 pub mod collision_layers;
+pub mod death;
 pub mod durability;
 pub mod grapple;
 pub mod gun_sounds;
