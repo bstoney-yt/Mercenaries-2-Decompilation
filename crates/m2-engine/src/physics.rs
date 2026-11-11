@@ -5931,6 +5931,25 @@ impl Physics {
         f(solid().predicate(&keep))
     }
 
+    /// Whether nothing solid but the terrain is in the box from `lo` to
+    /// `hi` (sensors aside): where road traffic may come out
+    /// ([`crate::road_population::spawn_box`]; the 360 asks its world's
+    /// broadphase, 0x82153B30).
+    pub fn box_clear(&self, lo: Vec3, hi: Vec3) -> bool {
+        let middle = (lo + hi) * 0.5;
+        let cube = r::Cuboid::new(vector(((hi - lo) * 0.5).max(Vec3::splat(1e-3))));
+        self.skipping(None, false, |filter| {
+            self.world
+                .intersect_shape(
+                    pose(middle, Quat::IDENTITY),
+                    &cube,
+                    filter.exclude_sensors(),
+                )
+                .next()
+                .is_none()
+        })
+    }
+
     /// What stands fixed in the box from `lo` to `hi` (0x822ED248's
     /// area): each placed object's or building's bounds as a centre and
     /// radius. Not the terrain.

@@ -366,6 +366,29 @@ impl Viewer {
     }
 }
 
+/// The box a new road vehicle must find clear to come out at `at` facing
+/// `forward` (level, unit), lowest and highest corners (0x8226BD10): the
+/// bounds of a footprint [`SPAWN_HALF_LENGTH`] each way along it and 1 m
+/// each side, [`SPAWN_LOW`] up, and up to [`SPAWN_HIGH`] above `at`.
+pub fn spawn_box(at: Vec3, forward: Vec3) -> (Vec3, Vec3) {
+    let f = forward * SPAWN_HALF_LENGTH;
+    let r = Vec3::new(-forward.z, 0.0, forward.x);
+    let low = at + Vec3::Y * SPAWN_LOW;
+    let mut lo = at + Vec3::Y * SPAWN_HIGH;
+    let mut hi = lo;
+    for c in [low + f + r, low + f - r, low - f + r, low - f - r] {
+        lo = lo.min(c);
+        hi = hi.max(c);
+    }
+    (lo, hi)
+}
+
+/// 0x8226BD10's box: half its length along the vehicle (2.0), how far up
+/// its footprint is and how high it reaches (0.2 and 3.0), metres.
+pub const SPAWN_HALF_LENGTH: f32 = 2.0;
+pub const SPAWN_LOW: f32 = 0.2;
+pub const SPAWN_HIGH: f32 = 3.0;
+
 /// Whether a ball of `radius` round `at` is in the frustum of
 /// `view_proj` (clip planes of its rows, right-handed, depth 0..1).
 pub fn in_view(view_proj: Mat4, at: Vec3, radius: f32) -> bool {
@@ -476,6 +499,17 @@ mod tests {
             a.count
         });
         assert_eq!(counts, vec![2, 1]);
+    }
+
+    // 0x8226BD10: 4 m along, 2 m across, 0.2 to 3 m up, as bounds.
+    #[test]
+    fn the_spawn_box_is_its_footprint_s_bounds() {
+        let (lo, hi) = spawn_box(Vec3::new(10.0, 5.0, 0.0), Vec3::Z);
+        assert_eq!(lo, Vec3::new(9.0, 5.2, -2.0));
+        assert_eq!(hi, Vec3::new(11.0, 8.0, 2.0));
+        let (lo, hi) = spawn_box(Vec3::ZERO, Vec3::new(1.0, 0.0, 1.0).normalize());
+        let w = 3.0 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!((hi.x - w).abs() < 1e-5 && (lo.z + w).abs() < 1e-5);
     }
 
     // 0x82264DF0: the nearer of the camera and a point on along its view.

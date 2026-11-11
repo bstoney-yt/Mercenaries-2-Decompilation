@@ -31,9 +31,12 @@
 //! - Each one put out takes its template afresh from the vehicle list of
 //!   the zone where it comes out (0x8226C618); one taken away comes again
 //!   under its entity with its new model.
-//! - Invented: none comes out within [`CLEAR`] of another, in place of
-//!   the 360's box test against the world (0x8226BD10); off the roads
-//!   the rings are laid from the road she was last on.
+//! - One comes out only where its box (0x8226BD10,
+//!   [`road_population::spawn_box`]) meets nothing in the world but the
+//!   ground (0x82153B30 asks the broadphase; it lets some kinds of
+//!   entity by, kinds 5, 6, 7 and 9 of their +0xE0, not identified: ours
+//!   lets none by but sensors). Invented: off the roads the rings are
+//!   laid from the road she was last on.
 //!   Not ported: junctions' stop lines and flow control (no layer read
 //!   holds an `RtFlowControl`); the 360's density grid for rings that
 //!   ask it; the upkeep of states 7 and 8 (0x8226AE98).
@@ -50,11 +53,6 @@ use m2_math::glam::{Quat, Vec2, Vec3};
 
 use crate::scene::{ParkedVehicle, Scene};
 
-/// None comes out nearer another vehicle than this, metres (a semi is 9
-/// m long). Invented in place of the 360's: it puts the new one's box
-/// against the world (0x8226BD10 through 0x82153B30) and comes out only
-/// where nothing is there.
-const CLEAR: f32 = 12.0;
 /// A ring point's road must be longer than this, and the point is kept
 /// this far off its ends, metres (0x8226A438).
 const SHORTEST: f32 = 12.0;
@@ -367,13 +365,16 @@ impl RoadTraffic {
             return;
         };
         let coin = self.roll();
-        let mut stands: Vec<Vec3> = scene
+        // Those put out and not yet in the world (loading, or coming
+        // again), by their boxes: the world's box test can't see them.
+        let mut stands: Vec<(Vec3, Vec3)> = scene
             .vehicles
             .iter()
-            .filter_map(|v| {
-                v.id.and_then(|id| world.physics.vehicle_transform(id))
-                    .map(|m| m.w_axis.truncate())
-                    .or(v.spot.map(|s| s.1))
+            .filter(|v| v.id.is_none())
+            .filter_map(|v| v.spot)
+            .filter(|(e, _, _)| self.cars.contains_key(e))
+            .map(|(_, at, yaw)| {
+                road_population::spawn_box(at, Vec3::new(yaw.sin(), 0.0, yaw.cos()))
             })
             .collect();
         let mut places = Vec::new();
@@ -387,6 +388,7 @@ impl RoadTraffic {
                 mode,
                 &viewer,
                 in_vehicle,
+                &world.physics,
                 &mut stands,
             );
             let n = found.len();
@@ -491,7 +493,8 @@ impl RoadTraffic {
         mode: Mode,
         viewer: &Viewer,
         in_vehicle: bool,
-        stands: &mut Vec<Vec3>,
+        physics: &Physics,
+        stands: &mut Vec<(Vec3, Vec3)>,
     ) -> Vec<Place> {
         let mut out = Vec::new();
         let side = if ask.behind { -1 } else { 1 };
@@ -526,7 +529,11 @@ impl RoadTraffic {
             if !ask.seen.allows(seen) || !road_population::spawn_keeps(d, seen, mode) {
                 continue;
             }
-            if stands.iter().any(|&o| flat(o - at).length() < CLEAR) {
+            // Its box clear of the world but the ground (0x8226BD10), and
+            // of those put out this frame, not yet in it.
+            let (lo, hi) = road_population::spawn_box(at, dir);
+            let meets = |o: &(Vec3, Vec3)| lo.cmple(o.1).all() && hi.cmpge(o.0).all();
+            if !physics.box_clear(lo, hi) || stands.iter().any(meets) {
                 continue;
             }
             let Some(zone) = zone_at(zones.iter().copied(), at.x, at.z)
@@ -534,7 +541,7 @@ impl RoadTraffic {
             else {
                 continue;
             };
-            stands.push(at);
+            stands.push((lo, hi));
             out.push((road, forward, s, zone.vehicle_list, pick, at, dir));
         }
         out
@@ -1084,6 +1091,7 @@ mod tests {
             got.unwrap()
         };
         let in_view = ask(110.0, 0xa);
+        let physics = Physics::new();
         let mut stands = Vec::new();
         let got = t.places_on(
             &roads,
@@ -1093,6 +1101,7 @@ mod tests {
             Mode::Dense,
             &viewer,
             false,
+            &physics,
             &mut stands,
         );
         assert_eq!(got.len(), 1);
@@ -1105,6 +1114,20 @@ mod tests {
         let want = 400.0 * (0.05 + 110.0 / 380.0);
         assert!((s - want).abs() < 1e-2, "{s}");
         assert!(viewer.sees(at));
+        // That place is now taken by its box: none comes out on it again.
+        assert_eq!(stands.len(), 1);
+        let again = t.places_on(
+            &roads,
+            &[&zone],
+            &flood,
+            in_view,
+            Mode::Dense,
+            &viewer,
+            false,
+            &physics,
+            &mut stands,
+        );
+        assert!(again.is_empty());
         // Turned round, she doesn't see it: an in-view ring puts none out.
         let away = Viewer {
             look: Vec3::NEG_Z,
@@ -1121,6 +1144,7 @@ mod tests {
             Mode::Dense,
             &away,
             false,
+            &physics,
             &mut stands,
         );
         assert!(got.is_empty());
