@@ -301,6 +301,23 @@ pub struct Seat {
     /// `ControllerTurret` `TurretName`): a tank driver's `main_turret`,
     /// the M151 gunner's pintle gun. `None`: it aims nothing.
     pub turret: Option<u32>,
+    /// Its template's other `SeatParameters` bits (reflection names
+    /// 0x820E85E0 to 0x820E8674, read by `Vehicle.GetSeatParams`,
+    /// 0x82346AF8).
+    pub flags: SeatFlags,
+}
+
+/// A seat's `SeatParameters` bits the scripts read and the alpha does
+/// not act on: `bIsCargoSeat`, `bIsHijackBlocker`, `bIsRiderInvisible`,
+/// `bIsRiderVulnerable`, `bIsRiderBashable`, `bIsStowable`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SeatFlags {
+    pub cargo: bool,
+    pub hijack_blocker: bool,
+    pub rider_invisible: bool,
+    pub rider_vulnerable: bool,
+    pub rider_bashable: bool,
+    pub stowable: bool,
 }
 
 impl Seat {
@@ -747,6 +764,17 @@ pub fn read_vehicles(db: &Layer<'_>) -> HashMap<u32, VehicleSeats> {
                         .of_template(template)
                         .first()
                         .and_then(|r| nonzero(controller.word(r, h("TurretName")))),
+                    flags: {
+                        let b = |f: &str| p.is_some_and(|p| bit(&seat_params, p, f));
+                        SeatFlags {
+                            cargo: b("bIsCargoSeat"),
+                            hijack_blocker: b("bIsHijackBlocker"),
+                            rider_invisible: b("bIsRiderInvisible"),
+                            rider_vulnerable: b("bIsRiderVulnerable"),
+                            rider_bashable: b("bIsRiderBashable"),
+                            stowable: b("bIsStowable"),
+                        }
+                    },
                 })
             })
             .collect();
@@ -1004,6 +1032,7 @@ mod tests {
                 .collect(),
             links: Vec::new(),
             turret: None,
+            flags: Default::default(),
         }
     }
 

@@ -24,4 +24,5 @@ pub mod script_time;
 pub mod shop;
 pub mod subtitles;
 pub mod support;
+pub mod vehicle_seats;
 pub mod vo;
