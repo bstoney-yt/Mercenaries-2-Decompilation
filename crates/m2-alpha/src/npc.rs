@@ -146,11 +146,13 @@ const MAX_WALKERS: usize = 24;
 pub fn spawner_starts(slot: &SpawnerSlot, record: Option<&SpawnerRecord>, roll: f32) -> bool {
     let chance = |percent: u8| f32::from(percent) * 0.01 <= roll;
     match record.and_then(|r| r.groups.get(slot.group as usize)) {
-        None => slot.state != 0 && (slot.chance_not_active < 1 || chance(slot.chance_not_active)),
+        None => {
+            slot.sends_by_data() && (slot.chance_not_active < 1 || chance(slot.chance_not_active))
+        }
         Some(tweak) => {
             let on = match tweak.state {
                 Some(state) => state != m2_game::spawner_tweak::STATE_OFF,
-                None => slot.state != 0,
+                None => slot.sends_by_data(),
             };
             on && tweak.chance_not_active.is_none_or(chance)
         }
@@ -5418,6 +5420,9 @@ pub(crate) mod tests {
             group: 3,
             state,
             chance_not_active: chance,
+            name: 0,
+            template: false,
+            kept_on: false,
         };
         // Untouched by the scripts: its own state, then its own chance.
         assert!(spawner_starts(&slot(1, 0), None, 0.0));
@@ -5511,6 +5516,9 @@ pub(crate) mod tests {
                     group: 3,
                     state: 1,
                     chance_not_active: 0,
+                    name: 0,
+                    template: false,
+                    kept_on: false,
                 },
             );
         }

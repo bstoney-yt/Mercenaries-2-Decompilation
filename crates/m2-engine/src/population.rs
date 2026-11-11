@@ -69,6 +69,9 @@ const FAR_HASH: u32 = 0xd192_b18a;
 pub struct Population {
     /// Spawner templates, by id.
     pub spawners: HashMap<u32, Spawner>,
+    /// Every spawner record of each template, by id
+    /// ([`template_spawner_records`]).
+    pub spawner_records: HashMap<u32, Vec<(Spawner, SpawnerSlot)>>,
     /// List templates, by id: each entry's template id and weight.
     pub lists: HashMap<u32, Vec<(u32, f32)>>,
     /// `AiPatrol` templates' `Haste`, by id.
@@ -285,6 +288,10 @@ impl Population {
                 .component("PopulationSimpleSpawner")
                 .map(spawners)
                 .unwrap_or_default(),
+            spawner_records: db
+                .component("PopulationSimpleSpawner")
+                .map(template_spawner_records)
+                .unwrap_or_default(),
             lists,
             haste: db.component("AiPatrol").map(haste).unwrap_or_default(),
             riders: db.component("Rider").map(riders).unwrap_or_default(),
@@ -309,6 +316,71 @@ pub struct SpawnerSlot {
     pub group: u32,
     pub state: u32,
     pub chance_not_active: u8,
+    /// Its `SpawnerName` (field 32): an object has one spawner of each
+    /// name, its own record's before its template's (from the 360 code,
+    /// 82242BD8, which skips a name it already has).
+    pub name: u32,
+    /// It comes from the owner's template, not from the owner itself.
+    pub template: bool,
+    /// It is the one template record the port sent people from before
+    /// every template record was kept: it keeps sending, whatever its
+    /// state in the data, until the dangerous-building script that turns
+    /// template spawners on is ported (see [`SpawnerSlot::sends_by_data`]).
+    pub kept_on: bool,
+}
+
+impl SpawnerSlot {
+    /// Whether the data has it send anyone before a script says so: its
+    /// state is not off, or it is [`SpawnerSlot::kept_on`].
+    pub fn sends_by_data(&self) -> bool {
+        self.state != 0 || self.kept_on
+    }
+}
+
+/// An entity's spawner records: its own (`own`, as they come), then those
+/// of its template (`template`) whose `SpawnerName` none of its own has,
+/// each made the entity's. From the 360 code (82242BD8, gathering an
+/// object's spawner definitions for 82242DC8). The first of the template's
+/// is [`SpawnerSlot::kept_on`] when the entity has none of its own: it is
+/// the one the port sent people from before.
+pub fn entity_spawners(
+    entity: u32,
+    own: &[(Spawner, SpawnerSlot)],
+    template: &[(Spawner, SpawnerSlot)],
+) -> Vec<(Spawner, SpawnerSlot)> {
+    let named: std::collections::HashSet<u32> = own.iter().map(|(_, s)| s.name).collect();
+    let mut out: Vec<(Spawner, SpawnerSlot)> = own.to_vec();
+    let mut first = own.is_empty();
+    for (spawner, slot) in template {
+        if named.contains(&slot.name) {
+            continue;
+        }
+        out.push((
+            *spawner,
+            SpawnerSlot {
+                owner: entity,
+                template: true,
+                kept_on: std::mem::take(&mut first),
+                ..*slot
+            },
+        ));
+    }
+    out
+}
+
+/// The template database's spawner records, by template: each template's
+/// in the data's order, except that its last comes first, the one the
+/// port's single spawner per template ([`Population::spawners`]) has
+/// always been.
+pub fn template_spawner_records(c: &Component<'_>) -> HashMap<u32, Vec<(Spawner, SpawnerSlot)>> {
+    let mut out: HashMap<u32, Vec<(Spawner, SpawnerSlot)>> = HashMap::new();
+    for record in spawner_records(c) {
+        out.entry(record.1.owner).or_default().push(record);
+    }
+    for records in out.values_mut() {
+        records.rotate_right(1);
+    }
+    out
 }
 
 /// Spawn entities for an entity's second and later spawner records start
@@ -320,18 +392,20 @@ const STATE_HASH: u32 = 0xa57a_feeb;
 const GROUP_AT: usize = 88;
 const STATE_AT: usize = 80;
 const CHANCE_NOT_ACTIVE_AT: usize = 95;
+const NAME_AT: usize = 32;
 
 /// Every spawner record of a component, in the data's order, each with
 /// the entity carrying it: an entity may carry several (a guard tower's
 /// two rooftop spawners, a building's ground, balcony and rooftop ones).
 pub fn spawner_records(c: &Component<'_>) -> Vec<(Spawner, SpawnerSlot)> {
     let at = |name: &str, fallback: usize| field_at(c, name).unwrap_or(fallback);
-    let (cycle, radius, kind, group, chance) = (
+    let (cycle, radius, kind, group, chance, name) = (
         at("SecondsPerCycle", CYCLE_AT),
         at("ActiveRadius", RADIUS_AT),
         at("SpawnerType", KIND_AT),
         at("SpawnerGroup", GROUP_AT),
         at("ChanceNotActive", CHANCE_NOT_ACTIVE_AT),
+        at("SpawnerName", NAME_AT),
     );
     let by_hash = |h: u32| {
         c.fields
@@ -358,6 +432,9 @@ pub fn spawner_records(c: &Component<'_>) -> Vec<(Spawner, SpawnerSlot)> {
                     group: word(r, group).unwrap_or(0),
                     state: word(r, state).unwrap_or(1),
                     chance_not_active: r.get(chance).copied().unwrap_or(0),
+                    name: word(r, name).unwrap_or(0),
+                    template: false,
+                    kept_on: false,
                 },
             ))
         })
@@ -684,6 +761,47 @@ mod tests {
     fn weights_read_as_integers_or_floats() {
         assert_eq!(weight_of(&100u32.to_le_bytes()), 100.0);
         assert_eq!(weight_of(&17.5f32.to_bits().to_le_bytes()), 17.5);
+    }
+
+    #[test]
+    fn an_entity_has_its_own_spawners_then_its_templates_by_name() {
+        let s = Spawner {
+            list: 1,
+            seconds_per_cycle: 10.0,
+            active_radius: 100.0,
+            kind: 0,
+            far: None,
+        };
+        let slot = |owner, name, state| SpawnerSlot {
+            owner,
+            group: 0,
+            state,
+            chance_not_active: 0,
+            name,
+            template: false,
+            kept_on: false,
+        };
+        // The template (0x8000_0001) has three, off in the data; the
+        // entity (9) has its own of the second name.
+        let template = [
+            (s, slot(0x8000_0001, 0xa, 0)),
+            (s, slot(0x8000_0001, 0xb, 0)),
+            (s, slot(0x8000_0001, 0xc, 0)),
+        ];
+        let own = [(s, slot(9, 0xb, 1))];
+        let all = entity_spawners(9, &own, &template);
+        let names: Vec<u32> = all.iter().map(|(_, s)| s.name).collect();
+        assert_eq!(names, [0xb, 0xa, 0xc]);
+        assert!(all.iter().all(|(_, s)| s.owner == 9));
+        assert!(!all[0].1.template && all[1].1.template && all[2].1.template);
+        // With its own, none of the template's was ever sending.
+        assert!(all.iter().all(|(_, s)| !s.kept_on));
+        assert!(!all[1].1.sends_by_data());
+        // Without its own: the template's first keeps sending as before.
+        let all = entity_spawners(9, &[], &template);
+        assert_eq!(all.len(), 3);
+        assert!(all[0].1.kept_on && all[0].1.sends_by_data());
+        assert!(!all[1].1.sends_by_data() && !all[2].1.sends_by_data());
     }
 
     #[test]

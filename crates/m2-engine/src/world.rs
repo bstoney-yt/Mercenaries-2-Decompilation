@@ -1963,10 +1963,40 @@ impl WorldIndex {
         // first is the entity's own spawner, its later ones spawners with
         // spawn entities of their own (they were dropped before: a guard
         // tower's second sentry, a building's balcony and rooftop).
-        let own_records = layer
+        let own_list = layer
             .component("PopulationSimpleSpawner")
             .map(crate::population::spawner_records)
             .unwrap_or_default();
+        // An entity's own records, then its template's that none of its
+        // own share a name with (`population::entity_spawners`): every
+        // placed entity whose template carries spawner records.
+        let mut own_by_entity: HashMap<u32, Vec<_>> = HashMap::new();
+        for record in &own_list {
+            own_by_entity
+                .entry(record.1.owner)
+                .or_default()
+                .push(*record);
+        }
+        let mut owners: Vec<u32> = placements
+            .iter()
+            .filter(|(id, p)| {
+                own_by_entity.contains_key(*id)
+                    || templates.population.spawner_records.contains_key(&p.parent)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        owners.sort_unstable();
+        let own_records: Vec<(crate::population::Spawner, crate::population::SpawnerSlot)> = owners
+            .iter()
+            .flat_map(|id| {
+                let own = own_by_entity.get(id).map_or(&[][..], Vec::as_slice);
+                let template = placements
+                    .get(id)
+                    .and_then(|p| templates.population.spawner_records.get(&p.parent))
+                    .map_or(&[][..], Vec::as_slice);
+                crate::population::entity_spawners(*id, own, template)
+            })
+            .collect();
         let record_entities = crate::population::spawn_entities(
             &own_records.iter().map(|(_, s)| s.owner).collect::<Vec<_>>(),
             self.spawner_slots
@@ -1977,7 +2007,7 @@ impl WorldIndex {
         let own_spawners: HashMap<u32, crate::population::Spawner> = own_records
             .iter()
             .zip(&record_entities)
-            .filter(|((_, slot), entity)| slot.owner == **entity)
+            .filter(|((_, slot), entity)| slot.owner == **entity && !slot.template)
             .map(|((spawner, slot), _)| (slot.owner, *spawner))
             .collect();
         let people_from = |spawner: &crate::population::Spawner| -> Vec<(String, u32, f32)> {
