@@ -874,44 +874,53 @@ impl Post {
             .last
             .replace(Some(now))
             .map(|t| now.duration_since(t).as_secs_f32().min(1.0));
-        let rate = |retention_per_frame: f32| {
-            dt.map_or(1.0, |dt| 1.0 - retention_per_frame.powf(dt * 30.0))
-        };
+        // The game's eye keeps `retention ^ (speed * dt)` of the last
+        // luminance each frame, `dt` held within 1/120 and 0.1 s
+        // (0x821BD348, its `adaptiveParams`).
+
         let (adapt, limits) = match (lighting.tone_map, lighting.adaptation) {
-            (Some(t), _) => ([t.target, t.min_key, rate(t.retention), t.max_key], {
-                // `M2_TONE_CONTRAST=limit/multiplier` replaces the
-                // record's contrast limit and multiplier, to test.
-                // The game's composite shader applies the records' contrast
-                // (multiplier 1.85-1.95 about a limit of 0.13-0.15) to every
-                // frame. Earlier rounds kept it to the night's monochrome
-                // ramp because by day it crushed the ground's blue; that was
-                // with the frame exposed about half as bright as the game's
-                // (the luminance average, see `game_average`). With the
-                // game's average it brings the day spots from L 58-69 to
-                // L 75-99 against PC footage's L 94-104 (round grade01).
-                // `M2_CONTRAST=night` keeps it to the night ramp as before.
-                let night = if std::env::var("M2_CONTRAST").is_ok_and(|v| v == "night") {
-                    lighting
-                        .monochrome
-                        .map_or(0.0, |m| (m.w / 0.3).clamp(0.0, 1.0))
-                } else {
-                    1.0
-                };
-                let mut l = [
-                    t.min,
-                    t.max,
-                    t.contrast_limit,
-                    1.0 + (t.contrast - 1.0) * night,
-                ];
-                if let Ok(v) = std::env::var("M2_TONE_CONTRAST") {
-                    for (slot, x) in l[2..].iter_mut().zip(v.split('/')) {
-                        if let Ok(x) = x.trim().parse::<f32>() {
-                            *slot = x;
+            (Some(t), _) => (
+                [
+                    t.target,
+                    t.min_key,
+                    dt.map_or(1.0, |dt| follow(t.retention, t.speed, dt)),
+                    t.max_key,
+                ],
+                {
+                    // `M2_TONE_CONTRAST=limit/multiplier` replaces the
+                    // record's contrast limit and multiplier, to test.
+                    // The game's composite shader applies the records' contrast
+                    // (multiplier 1.85-1.95 about a limit of 0.13-0.15) to every
+                    // frame. Earlier rounds kept it to the night's monochrome
+                    // ramp because by day it crushed the ground's blue; that was
+                    // with the frame exposed about half as bright as the game's
+                    // (the luminance average, see `game_average`). With the
+                    // game's average it brings the day spots from L 58-69 to
+                    // L 75-99 against PC footage's L 94-104 (round grade01).
+                    // `M2_CONTRAST=night` keeps it to the night ramp as before.
+                    let night = if std::env::var("M2_CONTRAST").is_ok_and(|v| v == "night") {
+                        lighting
+                            .monochrome
+                            .map_or(0.0, |m| (m.w / 0.3).clamp(0.0, 1.0))
+                    } else {
+                        1.0
+                    };
+                    let mut l = [
+                        t.min,
+                        t.max,
+                        t.contrast_limit,
+                        1.0 + (t.contrast - 1.0) * night,
+                    ];
+                    if let Ok(v) = std::env::var("M2_TONE_CONTRAST") {
+                        for (slot, x) in l[2..].iter_mut().zip(v.split('/')) {
+                            if let Ok(x) = x.trim().parse::<f32>() {
+                                *slot = x;
+                            }
                         }
                     }
-                }
-                l
-            }),
+                    l
+                },
+            ),
             (None, Some(a)) => (
                 [
                     a.key,
@@ -1042,8 +1051,33 @@ impl Post {
     }
 }
 
+/// How far the game's eye moves towards this frame's luminance: it keeps
+/// `retention ^ (speed * dt)` of what it had, `dt` held within 1/120 and
+/// 0.1 s (from the 360 code, 0x821BD348: `adaptiveParams.w`, which the
+/// game's adaptation shader blends by).
+fn follow(retention: f32, speed: f32, dt: f32) -> f32 {
+    1.0 - retention.powf(speed * dt.clamp(1.0 / 120.0, 0.1))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_eye_follows_at_the_records_speed() {
+        // The default record: 0.98 kept at a speed of 30.37. At 30 frames
+        // a second each frame keeps 0.98^1.012 of the old luminance.
+        let f = super::follow(0.98, 30.3704, 1.0 / 30.0);
+        assert!((f - (1.0 - 0.98f32.powf(30.3704 / 30.0))).abs() < 1e-6);
+        // Long frames count as a tenth of a second, short ones as 1/120.
+        assert_eq!(
+            super::follow(0.98, 30.0, 1.0),
+            super::follow(0.98, 30.0, 0.1)
+        );
+        assert_eq!(
+            super::follow(0.98, 30.0, 0.001),
+            super::follow(0.98, 30.0, 1.0 / 120.0)
+        );
+    }
+
     #[test]
     fn post_shader_compiles() {
         let module = naga::front::wgsl::parse_str(super::SHADER)

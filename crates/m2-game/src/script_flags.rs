@@ -23,8 +23,8 @@
 //! `IsConfirmOnCircle` asks whether the button layout (`0x82B7C5F8`, 6 at
 //! start) is 8. `HaveActiveProfile` is true when the profile manager's
 //! "no profile" byte is clear; `IsGermanSKU` reads the SKU byte. Both
-//! answer nothing when called with no argument (`0x827DED18` checks for
-//! one), matching the scripts' habit of passing the player.
+//! always answer: `0x827DED18`, which they call first, is the stack-space
+//! check (`lua_checkstack(L, 1)`), not an argument count.
 //! `SetAutosaveEnabled` needs a boolean; anything else answers nil.
 //!
 //! Invented: the starting profile options (autosave on, rumble on,
@@ -121,16 +121,6 @@ pub const GETTERS: [&str; 13] = [
     "IsConfirmOnCircle",
 ];
 
-/// `Sys.HaveActiveProfile` / `Sys.IsGermanSKU`: the answer, or nothing
-/// without an argument.
-pub fn with_arg(args: &[Value], b: bool) -> MultiValue {
-    if args.is_empty() {
-        MultiValue::new()
-    } else {
-        yes_no(b)
-    }
-}
-
 /// `Sys.SetAutosaveEnabled(on)`: nothing on success, nil when `on` isn't
 /// a boolean.
 pub fn set_autosave(flags: &mut SysFlags, args: &[Value]) -> MultiValue {
@@ -184,11 +174,5 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert!(matches!(r.into_iter().next(), Some(Value::Nil)));
         assert!(!f.autosave_enabled);
-    }
-
-    #[test]
-    fn profile_questions_need_an_argument() {
-        assert!(with_arg(&[], true).is_empty());
-        assert_eq!(with_arg(&[Value::Integer(0)], true).len(), 1);
     }
 }

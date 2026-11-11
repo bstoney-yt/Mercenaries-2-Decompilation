@@ -90,6 +90,14 @@ impl Lines {
         gone.into_iter().map(|l| Command::Hush(l.id)).collect()
     }
 
+    /// Stops every line (`VO.CancelAll`), without callbacks.
+    pub fn cancel_all(&mut self) -> Vec<Command> {
+        std::mem::take(&mut self.playing)
+            .into_iter()
+            .map(|l| Command::Hush(l.id))
+            .collect()
+    }
+
     /// The subtitles to go up now, each with how long its line lasts: the
     /// line's length once the game says it ([`Lines::set_length`]), or
     /// [`UNHEARD_SECONDS`] if it hasn't after [`LENGTH_WAIT`] of play (no
