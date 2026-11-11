@@ -2992,18 +2992,6 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let ai = lib("Ai")?;
-    // From the 360 code: in the retail build these are the empty native
-    // that `Debug.Printf` and 57 others share (0x828280b0), which reads no
-    // argument and returns nothing. PmcCon001 calls `SetLaneActive`; the
-    // spawning switches are the same function.
-    for name in [
-        "SetLaneActive",
-        "SetTrafficSpawning",
-        "SetSidewalkSpawning",
-        "SetRoadSpawning",
-    ] {
-        add(&ai, name, |_, _, _| values([]))?;
-    }
     // Ai.SetInfractionMultiplier(faction, m), the faction as its
     // template's guid (`Pg.GetGuidByName("OC")`): see
     // [`crate::report::Reports::multipliers`].
@@ -4217,21 +4205,6 @@ mod tests {
             .unwrap();
         assert!(sent);
         assert!(world.borrow_mut().take_commands().is_empty());
-        assert!(host.take_calls().is_empty());
-    }
-
-    #[test]
-    fn the_retail_builds_empty_ai_switches_return_nothing() {
-        let (host, _) = setup();
-        let n: i64 = host
-            .lua()
-            .load(
-                "return select('#', Ai.SetLaneActive('PmcCon001_Lane', false))
-                   + select('#', Ai.SetTrafficSpawning(false))",
-            )
-            .eval()
-            .unwrap();
-        assert_eq!(n, 0);
         assert!(host.take_calls().is_empty());
     }
 
