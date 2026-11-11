@@ -28,6 +28,10 @@ use crate::script::safe_function;
 pub const FIRST_SPAWNED: u32 = 0x4000_0000;
 /// What crews a vehicle spawned with its driver.
 pub const PILOT: &str = "Pilot";
+/// `Object.GetWinchState`'s names, by state (0x823336E8), and
+/// `Object.SetWinchState`'s (0x823337E8, by their hashes 0xA62D3A27,
+/// 0x07D744CF, 0x0A765168, 0xBB522D10).
+pub const WINCH_STATES: [&str; 4] = ["retracted", "deployed", "deploying", "retracting"];
 /// Guids of object templates start here.
 pub const FIRST_TEMPLATE: u32 = 0x3000_0000;
 /// How far off an object can be seen on screen, metres (inferred: about
@@ -291,6 +295,12 @@ pub enum Command {
         vehicle: u32,
         seat: String,
         instant: bool,
+    },
+    /// A script set a helicopter's winch state (`Object.SetWinchState`:
+    /// 0 retracted, 1 deployed, 2 deploying, 3 retracting).
+    WinchState {
+        carrier: u32,
+        state: u8,
     },
     /// Hook cargo onto a carrier's winch, or let it go (`carrier` `None`).
     Winch {
@@ -770,6 +780,10 @@ pub struct ScriptWorld {
     pub landing_zones: HashMap<i64, BTreeMap<i64, u32>>,
     /// Cargo on winches: what carries each, `None` once let go.
     pub winch: HashMap<u32, Option<u32>>,
+    /// The helicopters with a winch (a `Winch` component; the 360's
+    /// `PhysicsActorWinch` store 0x83657220) and its state (+0x140: 0
+    /// retracted, 1 deployed, 2 deploying, 3 retracting).
+    pub winches: HashMap<u32, u8>,
     /// What the scripts want on the player's screen.
     pub hud: crate::hud::Hud,
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
@@ -2559,8 +2573,59 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let carrier = id(a.first()).and_then(|g| w.winch.get(&g).copied().flatten());
         values([guid_value(carrier)])
     })?;
-    // How far the winch is let out: the game's to animate.
-    add(&object, "SetWinchState", |_, _, _| values([]))?;
+    // A helicopter's winch (0x823331E0..0x823337E8, the store 0x83657220):
+    // whether it has one, its state by name, what hangs on it.
+    add(&object, "HasWinch", |w, _, a| {
+        values([Value::Boolean(
+            id(a.first()).is_some_and(|g| w.winches.contains_key(&g)),
+        )])
+    })?;
+    add(&object, "GetWinchState", |w, lua, a| {
+        match id(a.first()).and_then(|g| w.winches.get(&g)) {
+            Some(&s) => values([Value::String(
+                lua.create_string(WINCH_STATES[usize::from(s & 3)])?,
+            )]),
+            None => Err(mlua::Error::runtime("Object.GetWinchState: no winch")),
+        }
+    })?;
+    add(&object, "SetWinchState", |w, _, a| {
+        let state = match a.get(1) {
+            Some(Value::String(s)) => {
+                let h = m2_assets::name_hash(&s.to_string_lossy());
+                WINCH_STATES
+                    .iter()
+                    .position(|n| m2_assets::name_hash(n) == h)
+            }
+            _ => None,
+        };
+        match (id(a.first()), state) {
+            (Some(g), Some(s)) if w.winches.contains_key(&g) => {
+                w.winches.insert(g, s as u8);
+                w.commands.push(Command::WinchState {
+                    carrier: g,
+                    state: s as u8,
+                });
+                values([])
+            }
+            _ => Err(mlua::Error::runtime(
+                "Object.SetWinchState: no winch or state",
+            )),
+        }
+    })?;
+    add(&object, "IsWinching", |w, _, a| {
+        match id(a.first()).filter(|g| w.winches.contains_key(g)) {
+            Some(heli) => {
+                let cargo = w
+                    .winch
+                    .iter()
+                    .filter(|(_, c)| **c == Some(heli))
+                    .map(|(&g, _)| g)
+                    .min();
+                values([guid_value(cargo)])
+            }
+            None => Err(mlua::Error::runtime("Object.IsWinching: no winch")),
+        }
+    })?;
     // No string tables yet: an object's own name.
     add(&object, "GetLocalizedName", |w, lua, a| {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
@@ -5924,6 +5989,35 @@ mod tests {
             .eval()
             .unwrap();
         assert!(before && carrier && after && unknown);
+    }
+
+    #[test]
+    fn a_winch_says_its_state_and_its_cargo() {
+        let (host, world) = setup();
+        world.borrow_mut().winches.insert(1, 0);
+        let (has, none, state, hooked, after, set): (bool, bool, String, bool, bool, String) = host
+            .lua()
+            .load(
+                "local has, none = Object.HasWinch(1), not Object.HasWinch(50)
+                 local state = Object.GetWinchState(1)
+                 Object.AttachCargoToWinch(50, 1)
+                 local hooked = Object.IsWinching(1) == Sys.StringToGuid('50')
+                 Object.DetachCargoFromWinch(50)
+                 local after = Object.IsWinching(1) == nil
+                 Object.SetWinchState(1, 'Deploying')
+                 return has, none, state, hooked, after, Object.GetWinchState(1)",
+            )
+            .eval()
+            .unwrap();
+        assert!(has && none && hooked && after);
+        assert_eq!((state.as_str(), set.as_str()), ("retracted", "deploying"));
+        // The names' hashes are the ones 0x823337E8 compares.
+        let h: Vec<u32> = WINCH_STATES
+            .iter()
+            .map(|n| m2_assets::name_hash(n))
+            .collect();
+        assert_eq!(h, [0xA62D_3A27, 0x07D7_44CF, 0x0A76_5168, 0xBB52_2D10]);
+        assert!(host.lua().load("Object.GetWinchState(50)").exec().is_err());
     }
 
     #[test]
