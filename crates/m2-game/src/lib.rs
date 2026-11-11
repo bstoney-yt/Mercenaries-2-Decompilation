@@ -25,6 +25,7 @@ pub mod ported_net;
 pub mod ported_misc;
 pub mod ported_init;
 pub mod ported_physics;
+pub mod player_target;
 pub mod report;
 pub mod reverb;
 pub mod savedata;

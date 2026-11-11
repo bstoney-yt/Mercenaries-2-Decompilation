@@ -933,6 +933,9 @@ pub struct ScriptWorld {
     pub outside: bool,
     /// What the initialiser ports of missing natives keep ([crate::ported_init]).
     pub init: crate::ported_init::InitState,
+    /// The point under her reticle and the object there, as the game
+    /// keeps them (`Player.GetTargetUnderReticle`: [`crate::player_target`]).
+    pub reticle_target: Option<([f32; 3], Option<u32>)>,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
     /// Every template the template database names, in lower case: the
@@ -3115,6 +3118,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([guid_value(who)])
     })?;
     crate::ported_init::install(&lib, &add)?;
+    crate::player_target::install(&lib, &add)?;
     let camera = lib("Camera")?;
     // The camera looks the way she faces; a camera whose holder this
     // world doesn't place (the HUD's own world) faces north. Always a
