@@ -884,6 +884,8 @@ pub struct ScriptWorld {
     pub reports: crate::report::Reports,
     /// The pursuit as the scripts set it ([`Pursuit`]).
     pub pursuit: Pursuit,
+    /// The `Sys` flags: build switches and the player's options.
+    pub sys_flags: crate::script_flags::SysFlags,
     /// The engine's game and real clocks (`Sys.MainTime`, the time
     /// stamps), stepped each frame.
     pub clocks: crate::script_time::Clocks,
@@ -3676,6 +3678,83 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
     {
+        use crate::script_flags as f;
+        add(&sys, "IsFinalConfig", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "IsFinalConfig").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "NoHud", |w, _, _| {
+            Ok(f::yes_no(f::getter(&w.sys_flags, "NoHud").unwrap_or(false)))
+        })?;
+        add(&sys, "AutoLoad", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "AutoLoad").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "DisableAssetPreload", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "DisableAssetPreload").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "FinishedShell", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "FinishedShell").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "GetINILoadLastSave", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "GetINILoadLastSave").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "IsDemoMode", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "IsDemoMode").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "PlayIntroMovies", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "PlayIntroMovies").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "StartWithResources", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "StartWithResources").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "YAxisInverted", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "YAxisInverted").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "IsAutosaveEnabled", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "IsAutosaveEnabled").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "RumbleEnabled", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "RumbleEnabled").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "IsConfirmOnCircle", |w, _, _| {
+            Ok(f::yes_no(
+                f::getter(&w.sys_flags, "IsConfirmOnCircle").unwrap_or(false),
+            ))
+        })?;
+        add(&sys, "ForceNextAutosave", |w, _, _| {
+            w.sys_flags.force_next_autosave = true;
+            values([])
+        })?;
+        add(&sys, "SetAutosaveEnabled", |w, _, a| {
+            Ok(f::set_autosave(&mut w.sys_flags, a))
+        })?;
+        add(&sys, "HaveActiveProfile", |w, _, a| {
+            Ok(f::with_arg(a, w.sys_flags.have_profile))
+        })?;
+        add(&sys, "IsGermanSKU", |w, _, a| {
+            Ok(f::with_arg(a, w.sys_flags.german_sku))
+        })?;
         use crate::script_time::{self as t, ClockKind};
         add(&sys, "MainTime", |w, _, _| {
             Ok(t::time(&w.clocks, ClockKind::Main))
