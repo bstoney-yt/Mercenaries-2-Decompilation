@@ -19,6 +19,7 @@ pub mod report;
 pub mod reverb;
 pub mod savedata;
 pub mod script;
+pub mod script_junk;
 pub mod shop;
 pub mod subtitles;
 pub mod support;

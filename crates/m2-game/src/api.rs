@@ -1609,7 +1609,7 @@ pub const SUPPORT_EARS: &str = "__m2_support";
 /// missing (or stubs, with `ScriptHost::stub_missing_globals`).
 /// The engine's libraries (the rest of the globals scripts use are their
 /// own modules); see `ScriptHost::complete_libraries`.
-pub const LIBRARIES: [&str; 28] = [
+pub const LIBRARIES: [&str; 29] = [
     "Ai",
     "Airstrike",
     "Camera",
@@ -1620,6 +1620,7 @@ pub const LIBRARIES: [&str; 28] = [
     "Gui",
     "Hud",
     "Human",
+    "Junk",
     "Marker",
     "Math",
     "Munitions",
@@ -1698,6 +1699,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     add(&debug, "GetCallstack", |_, lua, _| {
         values([Value::String(lua.create_string("")?)])
+    })?;
+
+    let junk = lib("Junk")?;
+    add(&junk, "FormatTime", |_, lua, a| {
+        crate::script_junk::format_time_native(lua, a)
+    })?;
+    add(&junk, "IsInstallable", |_, _, _| {
+        Ok(crate::script_junk::is_installable())
     })?;
 
     let pg = lib("Pg")?;
