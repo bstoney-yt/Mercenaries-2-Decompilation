@@ -23,12 +23,6 @@ pub enum PortedCommand {
     BoundaryEffect(f32),
     /// `Sound.LockListenerPosition(on)`.
     ListenerLocked(bool),
-    /// `Camera.SetLookAt(camera, point, target, bone, ...)`.
-    LookAt {
-        at: [f32; 3],
-        target: Option<u32>,
-        bone: u32,
-    },
     /// `Object.StopMaterialAnimation(object, name)`.
     StopMaterialAnimation { guid: u32, name: String },
     /// `Object.AddToDisposer(object, kind)`: cleared away by the disposer
@@ -152,27 +146,7 @@ pub(crate) fn install(
         values([])
     })?;
 
-    let camera = lib("Camera")?;
-    // Camera.SetLookAt(camera, x, y, z, target, bone, ...) (0x823172e0):
-    // the camera looks at a point or at a target's bone; true when there
-    // is such a camera (here: a known holder), false else.
-    add(&camera, "SetLookAt", |w, _, a| {
-        let Some(holder) = a.first().and_then(as_guid) else {
-            return values([Value::Nil]);
-        };
-        let (at, next) = match (num(a.get(1)), num(a.get(2)), num(a.get(3))) {
-            (Some(x), Some(y), Some(z)) => ([x, y, z], 4),
-            _ => ([0.0; 3], 1),
-        };
-        let target = a.get(next).and_then(as_guid);
-        let bone = hash(a.get(next + 1)).unwrap_or(0);
-        if !w.objects.contains_key(&holder) {
-            return values([Value::Boolean(false)]);
-        }
-        w.commands
-            .push(Command::Ported(PortedCommand::LookAt { at, target, bone }));
-        values([Value::Boolean(true)])
-    })?;
+    // Camera.SetLookAt is the script camera's (crate::script_camera).
 
     let object = lib("Object")?;
     // Object.StopMaterialAnimation(object, name) (0x82332d08): stops it if
@@ -241,11 +215,6 @@ mod tests {
             ask("return Human.PersistTransform(1)"),
             Value::Boolean(true)
         );
-        assert_eq!(
-            ask("return Camera.SetLookAt(Player.GetCamera(), 1, 2, 3, 50, 'head')"),
-            Value::Boolean(true)
-        );
-        assert_eq!(ask("return Camera.SetLookAt(999)"), Value::Boolean(false));
         for code in [
             "Player.TeleportCamera(Player.GetLocalPlayer())",
             "Player.ClearGPS(Player.GetLocalPlayer())",
@@ -273,15 +242,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(ported.contains(&PortedCommand::LookAt {
-            at: [1.0, 2.0, 3.0],
-            target: Some(50),
-            bone: m2_assets::name_hash("head"),
-        }));
         assert!(ported.contains(&PortedCommand::Dispose {
             guid: 50,
             kind: m2_assets::name_hash("Vehicle"),
         }));
-        assert_eq!(ported.len(), 8);
+        assert_eq!(ported.len(), 7);
     }
 }

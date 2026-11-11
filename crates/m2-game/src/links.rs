@@ -73,6 +73,13 @@ impl Links {
         });
     }
 
+    /// Drops the parent's link to `child` (`Object.Detach`, 0x823328b8;
+    /// that it takes the entry out of this table is inferred).
+    pub fn detach(&mut self, parent: u32, child: u32) {
+        self.entries
+            .retain(|l| !(l.parent == parent && l.child == child));
+    }
+
     /// Drops every link of `guid`, as parent or as child (a removed or
     /// detached object).
     pub fn remove(&mut self, guid: u32) {
@@ -272,6 +279,32 @@ mod tests {
         m.run("Pg.UnloadLayer('pmccon002')", "unload").unwrap();
         m.tick(0.1);
         assert_eq!(m.world().borrow().links.children(rig).count(), 0);
+    }
+
+    /// `Object.Attach` records into the table and `Object.Detach` takes
+    /// it out (an object in play hung off the parent's bone).
+    #[test]
+    fn attach_and_detach_keep_the_table() {
+        let host = ScriptHost::new().unwrap();
+        let world = Shared::default();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(1, Object::new("truck", [0.0; 3]));
+            w.insert(2, Object::new("crate", [0.0; 3]));
+        }
+        install(host.lua(), &world).unwrap();
+        crate::hijack::install(&host, &world).unwrap();
+        host.lua()
+            .load("Object.Attach(Pg.GetGuidByName('truck'), 'hp_bed', Pg.GetGuidByName('crate'))")
+            .exec()
+            .unwrap();
+        assert_eq!(world.borrow().links.children(1).collect::<Vec<_>>(), [2]);
+        assert_eq!(world.borrow().links.parent_of(2), Some(1));
+        host.lua()
+            .load("Object.Detach(Pg.GetGuidByName('truck'), Pg.GetGuidByName('crate'))")
+            .exec()
+            .unwrap();
+        assert_eq!(world.borrow().links.parent_of(2), None);
     }
 
     #[test]

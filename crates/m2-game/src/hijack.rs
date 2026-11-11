@@ -539,6 +539,9 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
             _ => None,
         };
         if let Some(prop) = prop {
+            // The link table's record (0x823d9e10 from 0x82332750):
+            // the bone's hash and the child ([`crate::links`]).
+            w.links.attach(parent, m2_assets::name_hash(&bone), prop);
             w.commands.push(Command::Hijack(HijackCommand::Attach {
                 parent,
                 bone,
@@ -560,6 +563,7 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
         let Some(prop) = id(a.get(1)) else {
             return Ok(MultiValue::from_vec(vec![Value::Boolean(false)]));
         };
+        w.links.detach(parent, prop);
         w.commands
             .push(Command::Hijack(HijackCommand::Detach { parent, prop }));
         Ok(MultiValue::from_vec(vec![Value::Boolean(true)]))
