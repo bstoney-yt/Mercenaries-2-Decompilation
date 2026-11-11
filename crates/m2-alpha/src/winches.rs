@@ -9,7 +9,10 @@
 //! - Which helicopters have one: a template's `Winch` component (the
 //!   actor `PhysicsActorWinch` is built for it, 0x823FE8B0 ->
 //!   0x821952E8), its params from that record.
-//! - Where the cable hangs from: the helicopter's `WinchBone` node.
+//! - Where the cable hangs from (+0x1D0, 0x82198568, each step): the
+//!   hardpoint `WinchBone` names, found by 0x8241E478 as a node of the
+//!   helicopter's model by its name hash; finding none (no such node, no
+//!   `WinchBone`), the helicopter's origin, and it still has its winch.
 //! - Each physics step runs the winch's update (0x82195780): its state
 //!   work (pay out, reel in, the stretch check 0x82198308) and what that
 //!   asks of the links and the cargo. Here it runs as many times a frame
@@ -30,8 +33,6 @@
 //!   hooking a body to the cable: both need where the cargo hangs from
 //!   (its hardpoints, store 0x83652244, or the fallback point 0x82197C28).
 //!   The scripts' cargo still hangs as [`crate::flights`] carries it.
-//! - A winch whose helicopter model has no `WinchBone` node: none is
-//!   made.
 //! - A hardpoint record's own link radius (+0x1F4).
 
 use std::collections::HashMap;
@@ -45,7 +46,8 @@ use m2_math::glam::Vec3;
 #[derive(Clone, Debug)]
 pub struct HeliWinch {
     pub winch: Winch,
-    /// Its `WinchBone` node, in the helicopter's space.
+    /// Its `WinchBone` node, in the helicopter's space (its origin when
+    /// it has none).
     pub at: Vec3,
     cable: Option<CableId>,
 }

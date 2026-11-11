@@ -1672,7 +1672,8 @@ impl Game {
             }
         }
         // The helicopters with a `Winch` get theirs, hung from their
-        // `WinchBone` node; then each winch's update for the frame's steps.
+        // `WinchBone` hardpoint; then each winch's update for the frame's
+        // steps.
         if let (Some(source), Some(world)) = (self.scene.source.as_mut(), self.scene.world.as_mut())
         {
             for v in &self.scene.vehicles {
@@ -1680,29 +1681,31 @@ impl Game {
                 if !self.winches.unseen(id) {
                     continue;
                 }
-                let params = world
+                let Some(p) = world
                     .index
                     .template_db
-                    .winch_for(&v.spec.label, v.spec.model);
-                let at = params.and_then(|p| {
-                    let bone = p.bone?;
+                    .winch_for(&v.spec.label, v.spec.model)
+                else {
+                    continue;
+                };
+                // The hardpoint `WinchBone` names, a node of its model; with
+                // none so named, its origin (0x82198568: 0x8241E478 finding
+                // nothing leaves the point at 0, 0, 0).
+                let found = p.bone.and_then(|bone| {
                     crate::hijack::nodes(source, v.spec.model)
                         .into_iter()
                         .find(|(n, _)| *n == bone)
                         .map(|(_, at)| at)
                 });
-                if let (Some(p), Some(at)) = (params, at) {
-                    eprintln!(
-                        "winch: {} has one, {} m of cable at {at:.2?}",
-                        v.spec.label, p.length
-                    );
-                    self.winches.add(id, p, at);
-                } else if params.is_some() {
-                    eprintln!(
-                        "winch: {}'s WinchBone is not a node of its model: none",
-                        v.spec.label
-                    );
-                }
+                eprintln!(
+                    "winch: {} has one, {} m of cable at {}",
+                    v.spec.label,
+                    p.length,
+                    found.map_or("its origin (no WinchBone node)".to_owned(), |at| format!(
+                        "{at:.2?}"
+                    ))
+                );
+                self.winches.add(id, p, found.unwrap_or(Vec3::ZERO));
             }
             let physics = &mut world.physics;
             self.winches
