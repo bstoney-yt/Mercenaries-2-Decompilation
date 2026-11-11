@@ -52,9 +52,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::scene::{Carry, Rig};
 
-/// The most subjects a soldier looks over for a target at each look,
-/// nearest first (invented: the frame rate's limit; the 360 queues its
-/// sight lines and runs at most 0x800 a frame, 0x822E8DF8).
+/// The most foes [`People::foes_of`] gives, nearest first (invented;
+/// soldiers' own target looks go by the 360's lanes instead,
+/// [`m2_engine::ai_target::lane`]).
 const FOE_LOOKS: usize = 4;
 /// A vehicle of an army, as those at war with it see it.
 #[derive(Clone, Copy, Debug)]
@@ -77,7 +77,22 @@ pub struct VehicleSubject {
     pub priority: bool,
     /// Its body, left out of the sight lines to it.
     pub vehicle: Option<m2_engine::VehicleId>,
+    /// How fast it goes, m/s, for how often soldiers look at it.
+    pub speed: f32,
+    /// What it is (its `ObjectHint`), for what a soldier's weapons are
+    /// worth against it.
+    pub hint: m2_engine::ai_target::Hint,
+    /// Its `ModifierKey`: its row of the damage table.
+    pub row: Option<u32>,
 }
+
+/// A vehicle's `ObjectHint` where its template gives none: a ground
+/// vehicle (kind 2, domain 2) with no armour.
+pub const VEHICLE_HINT: m2_engine::ai_target::Hint = m2_engine::ai_target::Hint {
+    kind: 2,
+    domain: 2,
+    armour: 1,
+};
 
 /// What a subject carries, for how much of a threat it is to a soldier
 /// on foot ([`m2_engine::ai_target::threat`]).
@@ -958,7 +973,13 @@ pub struct Npc {
     /// That vehicle's body, which their sight lines to it pass through.
     foe_body: Option<m2_engine::VehicleId>,
     /// Until they next look for a target, seconds.
-    foe_look: f32,
+    /// His perception lanes' timers ([`m2_engine::ai_target::Lanes`]).
+    lanes: m2_engine::ai_target::Lanes,
+    /// His records of whom he has sensed ([`m2_engine::ai_sense`]), kept
+    /// 30 s past the last; those his last look found he goes on rating
+    /// each think between looks, as the 360 rates the records it keeps
+    /// (0x822DDF50); hers by [`HER`].
+    pub senses: m2_engine::ai_sense::SenseTable,
     /// From how far they can see the one they look at, unless that's
     /// her ([`People::war`]).
     foe_reach: Option<f32>,
@@ -1026,6 +1047,16 @@ pub struct Npc {
     /// The armour class of what she is in (`ObjectHint`'s `Armor`, 1 to
     /// 4; 1 on foot), from [`People::target_armour`].
     pub target_armour: u32,
+    /// What his target is (`ObjectHint`), and what it takes of his gun's
+    /// and his launcher's damage (the damage table's cells), for what
+    /// each is worth against it ([`m2_engine::ai_target::weapon_worth`]).
+    pub target_hint: m2_engine::ai_target::Hint,
+    pub target_takes: [f32; 2],
+    /// The weapon he has up: 0 his gun, 1 his launcher; none when neither
+    /// is worth anything against his target (0x822EF4C0).
+    pub weapon: Option<usize>,
+    /// Until he next chooses his weapon, seconds.
+    weapon_wait: f32,
     /// From how far those with `Vision` 1 can see her, metres.
     pub her_visibility: f32,
     /// From how far those with `Hearing` 1 can hear her, metres.
@@ -1249,7 +1280,8 @@ impl Npc {
             foe_at: None,
             foe_armour: None,
             foe_body: None,
-            foe_look: 0.0,
+            lanes: m2_engine::ai_target::Lanes::default(),
+            senses: m2_engine::ai_sense::SenseTable::default(),
             foe_reach: None,
             shot_by: None,
             heard: None,
@@ -1279,6 +1311,10 @@ impl Npc {
             grenade_wait: 0.0,
             smart: SmarterAi::default(),
             target_armour: 1,
+            target_hint: m2_engine::ai_target::HUMAN,
+            target_takes: [1.0; 2],
+            weapon: None,
+            weapon_wait: 0.0,
             her_visibility: ON_FOOT_VISIBILITY,
             her_audibility: 0.0,
             spotted: false,
@@ -1775,12 +1811,40 @@ impl Npc {
         turn.abs()
     }
 
-    /// Whether he sees `target` from his head: within his
-    /// [`sight`](Self::sight), inside his `VisionFOV` (unless `any_way`, as in a fight,
-    /// where he keeps turning to her), and nothing static between (a
-    /// little short of her, so the car she sits in doesn't hide her).
     /// How far he sees her, metres: his `Vision` times her `Visibility`,
     /// half as far again once he is on to her (0x822E89B0).
+    /// His senses for a query ([`m2_engine::ai_sense::sense`]): from his
+    /// eyes, the way he faces, his `Vision`, `Hearing` and view cone. The
+    /// block's scale is taken as 1 and its threshold left open: whether
+    /// he sees is settled by his sight line (invented, not traced).
+    pub fn sense_block(&self) -> m2_engine::ai_sense::SenseBlock {
+        m2_engine::ai_sense::SenseBlock {
+            origin: self.character.position + Vec3::Y * EYE,
+            facing: Vec3::new(self.facing.sin(), 0.0, self.facing.cos()),
+            hearing: self.ai.hearing,
+            vision: self.ai.vision,
+            cone_cos: (self.ai.vision_fov * 0.5).to_radians().cos(),
+            scale: 1.0,
+            threshold: f32::NEG_INFINITY,
+        }
+    }
+
+    /// What keeps him from feeding her disguise meter
+    /// ([`m2_engine::ai_sense::DisguiseGate`]): a civilian (here, one of
+    /// no army: a stand-in for the 360's `Civ` label), or aboard his
+    /// task's vehicle (not modelled: never).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the vehicle disguise once both are in")
+    )]
+    pub fn disguise_gate(&self) -> m2_engine::ai_sense::DisguiseGate {
+        m2_engine::ai_sense::DisguiseGate {
+            civilian: self.faction.is_none(),
+            task_object: false,
+            aboard: false,
+        }
+    }
+
     fn her_sight(&self) -> f32 {
         let held = if self.alert { HELD_SIGHT } else { 1.0 };
         self.ai.vision * self.her_visibility * held
@@ -1800,6 +1864,11 @@ impl Npc {
         self.foe_reach.unwrap_or_else(|| self.her_sight())
     }
 
+    /// Whether he sees `target` from his head: within his
+    /// [`sight`](Self::sight), inside his `VisionFOV` (unless `any_way`, as
+    /// in a fight, where he keeps turning to her), and nothing static
+    /// between, all the way to it (the car she sits in is no static
+    /// surface, so it does not hide her).
     pub fn sees(&self, physics: &Physics, target: Vec3, any_way: bool) -> bool {
         self.sees_past(physics, target, any_way, None)
     }
@@ -1807,7 +1876,8 @@ impl Npc {
     /// [`sees`](Self::sees) a subject that is vehicle `body`, if one: the
     /// line runs all the way to it, passing through its own body, as the
     /// 360's sight lines leave the subject out (0x822E8DF8 puts its object
-    /// in the request). A person's ends short of him instead.
+    /// in the request). A person's runs to him too, through no vehicle
+    /// (static surfaces only).
     pub fn sees_past(
         &self,
         physics: &Physics,
@@ -1834,8 +1904,9 @@ impl Npc {
                 .cast_ray_vehicle(eye, to / distance, distance, Some(body))
                 .is_none();
         }
-        let clear = (distance - 2.5).max(0.5);
-        physics.cast_ray(eye, to / distance, clear).is_none()
+        // All the way to her: the 360's request runs to the subject
+        // (0x822E8DF8).
+        physics.cast_ray(eye, to / distance, distance).is_none()
     }
 
     /// A soldier's tick in a fight with the player at `threat`. While he
@@ -2192,10 +2263,10 @@ impl Npc {
         self.cooldown -= dt;
         self.launcher_wait -= dt;
         let hint = self.fire_hint();
-        // His launcher, when it rates what she is in higher than his gun
-        // does (an AT rocket's 3 against a tank's class, the rifle's 0),
-        // within its range, once its pause since the last is out.
-        if let Some(l) = self.launcher.filter(|_| self.reaches_for_launcher()) {
+        self.choose_weapon(distance, rng, dt);
+        // His launcher, when he has it up, within its range, once its
+        // pause since the last is out.
+        if let Some(l) = self.launcher.filter(|_| self.weapon == Some(1)) {
             if seen
                 && off < FIRE_ARC
                 && self.launcher_wait <= 0.0
@@ -2217,7 +2288,7 @@ impl Npc {
                 self.cooldown = self.burst_gap();
             }
         } else if seen
-            && self.rates_target()
+            && self.weapon == Some(0)
             && self.cooldown <= 0.0
             && off < FIRE_ARC
             && distance < hint.range
@@ -2256,21 +2327,59 @@ impl Npc {
             .map_or(BURST_GAP, |g| 60.0 / g.rate_of_fire)
     }
 
-    /// Whether his gun is any use against what she is in: its
-    /// `WeaponHint` rating for her armour class is above 0 (a rifle's 0
-    /// against an APC or a tank; inferred from the ratings' names and
-    /// values, gap-list sweep). He still faces and aims at her.
-    pub fn rates_target(&self) -> bool {
-        let class = self.target_armour.clamp(1, 4) as usize - 1;
-        self.fire_hint().against[class] > 0
+    /// What his gun and his launcher are worth against his target
+    /// `distance` metres off ([`m2_engine::ai_target::weapon_worth`]):
+    /// a launcher he lacks, nothing.
+    pub fn weapon_worths(&self, distance: f32) -> [f32; 2] {
+        use m2_engine::ai_target::weapon_worth;
+        let to = self.target_hint;
+        // One whose template names no gun fires the "Assault Rifle"'s:
+        // 450 a minute, 9 a round.
+        let (damage, rate) = self.gun.map_or((9.0, 60.0 / BURST_GAP), |g| {
+            (g.damage * g.pellets.max(1) as f32, g.rate_of_fire)
+        });
+        let hint = self.fire_hint();
+        let gun = weapon_worth(
+            damage * self.target_takes[0],
+            rate,
+            &hint,
+            to,
+            distance,
+            self.weapon == Some(0),
+        );
+        let launcher = self.launcher.map_or(0.0, |l| {
+            let blast = l.ammo.blast.map_or(0.0, |b| b.damage);
+            let damage = l.ammo.damage.max(blast) * self.target_takes[1];
+            weapon_worth(
+                damage,
+                l.rate_of_fire,
+                &l.hint,
+                to,
+                distance,
+                self.weapon == Some(1),
+            )
+        });
+        [gun, launcher]
     }
 
-    /// Whether he fires his launcher rather than his gun at what she is
-    /// in: it rates her armour class higher than the gun does.
-    pub fn reaches_for_launcher(&self) -> bool {
-        let class = self.target_armour.clamp(1, 4) as usize - 1;
-        self.launcher
-            .is_some_and(|l| l.hint.against[class] > self.fire_hint().against[class])
+    /// He chooses the weapon he has up against his target `distance`
+    /// metres off, at random by their worths
+    /// ([`m2_engine::ai_target::pick_weapon`]): again each
+    /// [`WEAPON_EVERY`](m2_engine::ai_target::WEAPON_EVERY) seconds, and
+    /// [`NO_WEAPON_WAIT`](m2_engine::ai_target::NO_WEAPON_WAIT) after a
+    /// change (0x822BE240, 0x822EF4C0). With none up he chooses each time.
+    fn choose_weapon(&mut self, distance: f32, rng: &mut Rng, dt: f32) {
+        use m2_engine::ai_target::{NO_WEAPON_WAIT, WEAPON_EVERY, pick_weapon};
+        self.weapon_wait -= dt;
+        if self.weapon_wait > 0.0 && self.weapon.is_some() {
+            return;
+        }
+        self.weapon_wait = WEAPON_EVERY;
+        let pick = pick_weapon(&self.weapon_worths(distance), rng.range(0.0, 1.0));
+        if pick != self.weapon {
+            self.weapon = pick;
+            self.weapon_wait = NO_WEAPON_WAIT;
+        }
     }
 
     /// How he fires his gun: its `WeaponHint`, else the "Assault
@@ -2743,9 +2852,8 @@ pub struct People {
     pub smarter: SmarterAi,
     /// The armour class of what she is in, 1 to 4 (`ObjectHint`'s
     /// `Armor`: 1 on foot or in a car, 2 a helicopter or a light truck, 3
-    /// the APCs, 4 the tanks): a soldier whose gun's `WeaponHint` rates it
-    /// 0 against that class holds his fire ([`Npc::rates_target`]). 0
-    /// (unset) is taken as 1.
+    /// the APCs, 4 the tanks): what soldiers' weapons are worth against
+    /// her goes by it ([`Npc::weapon_worths`]). 0 (unset) is taken as 1.
     /// From how far she can be heard, metres: her own `Audibility` as
     /// she moves, or her vehicle's.
     pub her_audibility: f32,
@@ -2776,6 +2884,18 @@ pub struct People {
     /// What she carries, for her threat to soldiers; `None` is
     /// [`HER_ON_FOOT`].
     pub her_arms: Option<Arms>,
+    /// The game's damage table, for what each target takes of a
+    /// soldier's weapons (their worth, [`Npc::weapon_worths`]).
+    pub damage_table: Option<m2_engine::tuning::DamageTable>,
+    /// Her row of it: her vehicle's `ModifierKey` while she drives one,
+    /// else `Hero`'s.
+    pub her_row: Option<u32>,
+    /// Where she was at the last update, for her speed.
+    her_last: Option<Vec3>,
+    /// The minds that had records last update, by number, and those that
+    /// went or were reset at it ([`take_dropped_minds`](Self::take_dropped_minds)).
+    sensing: HashSet<u32>,
+    dropped_minds: Vec<u32>,
     /// The scripts' objects made priority targets (`Ai.SetPriorityTarget`),
     /// by guid.
     pub priority: std::collections::HashSet<u32>,
@@ -3516,28 +3636,58 @@ impl People {
         if self.relations.is_empty() {
             return;
         }
-        type Subject = (u32, &'static str, Vec3, f32, Arms);
+        type Subject = (u32, &'static str, Vec3, f32, Arms, usize);
+        use m2_engine::ai_target::{LOOKS_PER_FRAME, lane};
+        // Each subject's perception lane, by its speed (0x822F1198; how
+        // new it is and the record's flags are not kept: taken as old
+        // and unflagged).
+        let lane_of = |speed: f32| lane(speed, f32::INFINITY, false, false);
         let all: Vec<Subject> = self
             .npcs
             .iter()
             .filter(|n| n.alive && n.landed)
             .filter_map(|n| {
                 let arms = Arms::Person([n.gun.map(|_| n.fire_hint()), n.launcher.map(|l| l.hint)]);
-                Some((n.shooter, n.faction?, n.chest(), n.ai.visibility, arms))
+                let speed = n.character.velocity.length();
+                Some((
+                    n.shooter,
+                    n.faction?,
+                    n.chest(),
+                    n.ai.visibility,
+                    arms,
+                    lane_of(speed),
+                ))
             })
             .chain(self.vehicle_subjects.iter().enumerate().map(|(i, v)| {
                 let arms = Arms::Vehicle {
                     threat: v.threat,
                     priority: v.priority,
                 };
-                (VEHICLES + i as u32, v.faction, v.at, v.visibility, arms)
+                (
+                    VEHICLES + i as u32,
+                    v.faction,
+                    v.at,
+                    v.visibility,
+                    arms,
+                    lane_of(v.speed),
+                )
             }))
             .collect();
         let her_arms = self.her_arms.unwrap_or(HER_ON_FOOT);
+        // Her lane, by how far she moved since the last update.
+        let her_speed = match (threat, self.her_last) {
+            (Some(t), Some(l)) if dt > 0.0 => t.distance(l) / dt,
+            _ => 0.0,
+        };
+        self.her_last = threat;
+        let her_lane = lane_of(her_speed);
+        // Sight checks so far this frame, across all of them.
+        let mut looks = 0usize;
         let bodies: Vec<_> = self.vehicle_subjects.iter().map(|v| v.vehicle).collect();
         self.calm(dt);
         for i in 0..self.npcs.len() {
             if !self.npcs[i].can_war() {
+                self.npcs[i].senses.forget_all();
                 if self.npcs[i].foe_at.take().is_some() {
                     self.npcs[i].slot.clear();
                     self.npcs[i].foe_reach = None;
@@ -3559,49 +3709,66 @@ impl People {
             let n = &mut self.npcs[i];
             // Heat, each update whether he looks or not (0x822D9C10).
             n.heat.tick(n.slot.who.is_some());
-            n.foe_look -= dt;
+            // Which lanes he looks over now (0x822DB5A8): the one in his
+            // slot each think, the rest as their lane comes due.
+            let due = n.lanes.tick(dt);
             let shot = n.shot_by.take();
             let heard = n.heard.take();
-            if n.foe_look > 0.0 && shot.is_none() && heard.is_none() {
-                if let Some(c) = foe.filter(|_| n.slot.who.is_some()) {
-                    n.foe_at = Some(c.2);
-                }
-                continue;
-            }
-            n.foe_look = LOOK_EVERY;
             // As far as they can see each: their `Vision` times its
             // `Visibility`, half as far again for the one in the slot
             // (0x822E89B0).
             let vision = n.ai.vision;
             let held_now = n.slot.who;
+            n.senses.tick(dt);
+            let known: Vec<u32> = n.senses.sighted().collect();
+            let block = n.sense_block();
+            let mut keep: Vec<u32> = Vec::new();
             let reach = |c: &Subject| {
                 let hold = if held_now == Some(c.0) { 1.5 } else { 1.0 };
                 vision * c.3 * hold
             };
-            let mut seen: Vec<(f32, u32, Vec3, &'static str, f32, Arms)> = all
+            let mut seen: Vec<_> = all
                 .iter()
                 .filter(|c| c.0 != me && c.1 != side)
-                .map(|c| (c.2.distance(at), c.0, c.2, c.1, reach(c), c.4))
+                .filter(|c| {
+                    due[c.5]
+                        || held_now == Some(c.0)
+                        || Some(c.0) == heard
+                        || Some(c.0) == shot
+                        || known.contains(&c.0)
+                })
+                .map(|c| {
+                    (
+                        c.2.distance(at),
+                        c.0,
+                        c.2,
+                        c.1,
+                        reach(c),
+                        c.4,
+                        due[c.5],
+                        c.3,
+                    )
+                })
                 .filter(|c| c.0 <= c.4 || Some(c.1) == heard || Some(c.1) == shot)
                 .collect();
             seen.sort_by(|a, b| a.0.total_cmp(&b.0));
             for c in &seen {
                 self.perceive(i, c.3);
             }
+            // Those he is not hostile to now he still remembers, for when
+            // he is again (the records outlast the attitude).
+            let calm: Vec<u32> = seen
+                .iter()
+                .filter(|c| !self.hostile(i, c.3) && known.contains(&c.1))
+                .map(|c| c.1)
+                .collect();
             seen.retain(|c| self.hostile(i, c.3));
-            // The nearest few, and any priority target in reach besides: the
-            // limit is ours (the 360 looks over them all, its sight lines
-            // queued), so it must not hide what the scripts made first.
-            let mut n = 0;
-            seen.retain(|c| {
-                n += 1;
-                n <= FOE_LOOKS || matches!(c.5, Arms::Vehicle { priority: true, .. })
-            });
             let n = &mut self.npcs[i];
+            keep.extend(calm);
             let current = n.foe_at.map(|f| f.distance(at));
             let alert = n.alert;
             let hot = n.heat.factor();
-            for (d, who, chest, _, far, arms) in seen {
+            for (d, who, chest, _, far, arms, fresh, visibility) in seen {
                 let in_slot = n.slot.who == Some(who);
                 n.foe_reach = Some(far);
                 let perceived = shot == Some(who) || heard == Some(who);
@@ -3609,7 +3776,36 @@ impl People {
                     .then(|| bodies.get(who.wrapping_sub(VEHICLES) as usize).copied())
                     .flatten()
                     .flatten();
-                if in_slot || perceived || n.sees_past(physics, chest, alert, body) {
+                // A sight line, while the frame's are not used up
+                // (0x822E8DF8); past them, unseen.
+                let mut look = || {
+                    looks += 1;
+                    looks <= LOOKS_PER_FRAME
+                };
+                // One his lane does not bring up now he rates as last seen.
+                let sighted = if fresh {
+                    look() && n.sees_past(physics, chest, alert, body)
+                } else {
+                    known.contains(&who)
+                };
+                if sighted {
+                    keep.push(who);
+                }
+                if sighted && fresh {
+                    // A people's or vehicle's `Audibility` is not kept here.
+                    let subject = m2_engine::ai_sense::Subject {
+                        position: chest,
+                        visibility,
+                        audibility: 0.0,
+                        person: !matches!(arms, Arms::Vehicle { .. }),
+                        object: false,
+                        forgotten: false,
+                    };
+                    if let Some(r) = m2_engine::ai_sense::sense(&block, &subject, in_slot, true) {
+                        n.senses.merge(who, r);
+                    }
+                }
+                if in_slot || perceived || sighted {
                     // What it is worth and how well seen (the record's
                     // +0xC8 and +0x68, 0x822D56B0 and 0x822E89B0), by his
                     // heat (+0x804).
@@ -3626,7 +3822,36 @@ impl People {
                 let d = t.distance(at);
                 let in_slot = n.slot.who == Some(HER);
                 let far = n.her_sight();
-                if d <= far && (in_slot || n.alert || n.sees(physics, t, false)) {
+                let fresh = due[her_lane];
+                let sighted = if fresh {
+                    !in_slot
+                        && !n.alert
+                        && {
+                            looks += 1;
+                            looks <= LOOKS_PER_FRAME
+                        }
+                        && n.sees(physics, t, false)
+                } else {
+                    known.contains(&HER)
+                };
+                if d <= far && sighted {
+                    keep.push(HER);
+                    if fresh {
+                        let subject = m2_engine::ai_sense::Subject {
+                            position: t,
+                            visibility: n.her_visibility,
+                            audibility: n.her_audibility,
+                            person: true,
+                            object: false,
+                            forgotten: false,
+                        };
+                        if let Some(r) = m2_engine::ai_sense::sense(&block, &subject, in_slot, true)
+                        {
+                            n.senses.merge(HER, r);
+                        }
+                    }
+                }
+                if d <= far && (in_slot || n.alert || sighted) {
                     let seen = m2_engine::ai_target::visible(d, far) * hot;
                     let worth = her_arms.worth(d);
                     n.slot.offer(
@@ -3634,6 +3859,11 @@ impl People {
                         m2_engine::ai_target::score(d, current, in_slot, worth, seen),
                     );
                 }
+            }
+            // Those his looks no longer find stay on record, ageing out
+            // over 30 s (0x822DE240), but are not rated as in sight.
+            for w in known.iter().filter(|w| !keep.contains(w)) {
+                n.senses.lose(*w);
             }
             match n.slot.who.filter(|&w| w != HER) {
                 Some(w) => {
@@ -3673,6 +3903,43 @@ impl People {
                 }
             }
         }
+        // Minds gone or reset since the last update: their watchers are
+        // dropped (0x822F8A10).
+        let now: HashSet<u32> = self
+            .npcs
+            .iter()
+            .filter(|n| n.can_war())
+            .map(|n| n.shooter)
+            .collect();
+        self.dropped_minds = self.sensing.difference(&now).copied().collect();
+        self.sensing = now;
+    }
+
+    /// Person `i`'s record of her ([`m2_engine::ai_sense::SenseRecord`]),
+    /// for her disguise meter, with what may keep him from feeding it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the vehicle disguise once both are in")
+    )]
+    pub fn her_record(
+        &self,
+        i: usize,
+    ) -> Option<(
+        m2_engine::ai_sense::SenseRecord,
+        m2_engine::ai_sense::DisguiseGate,
+    )> {
+        let n = self.npcs.get(i)?;
+        Some((*n.senses.get(HER)?, n.disguise_gate()))
+    }
+
+    /// The minds gone or reset at the last update, by number: her
+    /// watchers drop them (0x822F8A10 calling 0x82446008).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the vehicle disguise once both are in")
+    )]
+    pub fn take_dropped_minds(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.dropped_minds)
     }
 
     /// Faction soldiers fight her or stand down as their faction now
@@ -4028,9 +4295,47 @@ impl People {
             n.follow_to = focus;
         }
         let mut callouts = Vec::new();
+        // Each person's row of the damage table, by number.
+        let human = m2_assets::name_hash("Human");
+        let rows: HashMap<u32, u32> = self
+            .npcs
+            .iter()
+            .map(|n| (n.shooter, n.ai.modifier.unwrap_or(human)))
+            .collect();
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
             npc.target_armour = npc.foe_armour.unwrap_or(self.target_armour).max(1);
+            // What his target is and what it takes of his weapons: a
+            // vehicle's own `ObjectHint` and row; a person's, `human`'s
+            // with his own row; hers, `human`'s with the armour of what
+            // she is in (inferred: which of her and her vehicle the 360
+            // rates is not settled).
+            let subject = npc
+                .slot
+                .who
+                .filter(|_| npc.foe_armour.is_some())
+                .and_then(|w| self.vehicle_subjects.get(w.wrapping_sub(VEHICLES) as usize));
+            let (hint, row) = match (subject, npc.slot.who) {
+                (Some(v), _) => (v.hint, v.row),
+                (None, Some(w)) if w != HER => (m2_engine::ai_target::HUMAN, rows.get(&w).copied()),
+                _ => (
+                    m2_engine::ai_target::Hint {
+                        armour: self.target_armour.clamp(1, 4),
+                        ..m2_engine::ai_target::HUMAN
+                    },
+                    self.her_row,
+                ),
+            };
+            let takes = |key: Option<u32>| match (&self.damage_table, row, key) {
+                (Some(t), Some(row), Some(key)) => t.scale(row, key).unwrap_or(1.0),
+                _ => 1.0,
+            };
+            let bullet = m2_assets::name_hash("Bullet");
+            npc.target_hint = hint;
+            npc.target_takes = [
+                takes(Some(npc.gun.and_then(|g| g.damage_key).unwrap_or(bullet))),
+                takes(npc.launcher.and_then(|l| l.ammo.key)),
+            ];
             npc.her_visibility = self.her_visibility.unwrap_or(ON_FOOT_VISIBILITY);
             npc.her_audibility = self.her_audibility;
             npc.swim_speed = self
@@ -5580,7 +5885,7 @@ pub(crate) mod tests {
     // 0 against them), not on foot or in a helicopter; an AT rocket man
     // fires at all of them.
     #[test]
-    fn soldiers_hold_fire_where_their_gun_is_no_use() {
+    fn a_rifle_is_worth_nothing_against_a_vehicle_and_little_against_armour() {
         let mut n = Npc::new(
             0,
             &rig(),
@@ -5589,32 +5894,33 @@ pub(crate) mod tests {
             Brain::Post { facing: 0.0 },
             Some(1),
         );
-        let rated = |n: &mut Npc, class| {
-            n.target_armour = class;
-            n.rates_target()
+        n.gun = Some(rifle());
+        let tank = m2_engine::ai_target::Hint {
+            armour: 4,
+            ..VEHICLE_HINT
         };
+        n.target_hint = tank;
         assert_eq!(
-            [1, 2, 3, 4].map(|c| rated(&mut n, c)),
-            [true, true, false, false]
+            n.weapon_worths(50.0)[0],
+            0.0,
+            "a rifle's hint is for people"
         );
-        let rocket = FireHint {
-            kinds: [1, 2],
-            against: [1, 3, 3, 3],
-            single: false,
-            ..STAND_IN
+        // Her in a tank, rated as a person in its armour: her gun rated 0
+        // against it still worth something.
+        n.target_hint = m2_engine::ai_target::Hint {
+            armour: 4,
+            ..m2_engine::ai_target::HUMAN
         };
-        n.gun = Some(HandGun {
-            hint: Some(rocket),
-            ..rifle()
-        });
-        assert_eq!([1, 2, 3, 4].map(|c| rated(&mut n, c)), [true; 4]);
+        assert!(
+            n.weapon_worths(50.0)[0] > 0.0,
+            "a rating of 0 weighs, not forbids"
+        );
     }
 
-    // A rifleman with the RPG (rated 1 against every class) fires the
-    // rifle at her on foot and the RPG at her in a tank; with a Stinger
-    // (1, 3, 2, 0), at her in a helicopter, not in a tank.
+    // A rifleman with an RPG (any kind) takes it up against a tank every
+    // time; against a soldier, either.
     #[test]
-    fn soldiers_reach_for_the_launcher_that_rates_her_higher() {
+    fn soldiers_take_up_the_launcher_by_its_worth() {
         let mut n = Npc::new(
             0,
             &rig(),
@@ -5623,19 +5929,22 @@ pub(crate) mod tests {
             Brain::Post { facing: 0.0 },
             Some(1),
         );
-        let launcher = |against| NpcLauncher {
+        n.gun = Some(rifle());
+        n.launcher = Some(NpcLauncher {
             template: 7,
             hint: FireHint {
-                against,
+                kinds: [1, 1],
+                against: [1, 1, 1, 1],
                 ..STAND_IN
             },
+            rate_of_fire: 30.0,
             ammo: m2_engine::weapons::Ammo {
                 template: 8,
                 velocity: 25.0,
                 max_velocity: 0.0,
                 human_boost: 2.0,
                 gravity: 0.0,
-                damage: 0.0,
+                damage: 100.0,
                 damage_min: 0.0,
                 falloff: (0.0, 0.0),
                 dropoff: 1.0,
@@ -5649,21 +5958,31 @@ pub(crate) mod tests {
                 sticky: false,
             },
             feel: Default::default(),
+        });
+        let mut rng = Rng::default();
+        let mut picks = |n: &mut Npc, to| {
+            n.target_hint = to;
+            let mut seen = [0; 2];
+            for _ in 0..200 {
+                n.weapon = None;
+                n.choose_weapon(50.0, &mut rng, 0.1);
+                seen[n.weapon.expect("one is worth something")] += 1;
+            }
+            seen
         };
-        let reaches = |n: &mut Npc, class| {
-            n.target_armour = class;
-            n.reaches_for_launcher()
+        let tank = m2_engine::ai_target::Hint {
+            armour: 4,
+            ..VEHICLE_HINT
         };
-        n.launcher = Some(launcher([1, 1, 1, 1]));
-        assert_eq!(
-            [1, 2, 3, 4].map(|c| reaches(&mut n, c)),
-            [false, false, true, true]
-        );
-        n.launcher = Some(launcher([1, 3, 2, 0]));
-        assert_eq!(
-            [1, 2, 3, 4].map(|c| reaches(&mut n, c)),
-            [false, true, true, false]
-        );
+        assert_eq!(picks(&mut n, tank), [0, 200]);
+        let [gun, launcher] = picks(&mut n, m2_engine::ai_target::HUMAN);
+        assert!(gun > 0 && launcher > 0, "{gun} and {launcher}");
+        // With the rifle alone, a tank leaves him nothing to fire.
+        n.launcher = None;
+        n.target_hint = tank;
+        n.weapon = None;
+        n.choose_weapon(50.0, &mut rng, 0.1);
+        assert_eq!(n.weapon, None);
     }
 
     fn rifle() -> HandGun {
@@ -5871,6 +6190,35 @@ pub(crate) mod tests {
         assert!(people.npcs[0].foe_at.is_some(), "he heard the shot");
     }
 
+    // A soldier who sees her keeps a record of her (her distance from his
+    // eyes, seen, fresh) that feeds her disguise meter within her range;
+    // once he falls, his mind is reported dropped.
+    #[test]
+    fn a_soldier_keeps_a_record_of_her_and_is_dropped_when_he_falls() {
+        let physics = ground();
+        let mut people = People::default();
+        let post = Brain::Post { facing: 0.0 };
+        let mut n = Npc::new(0, &rig(), Vec3::Y, 0.0, post, Some(1));
+        n.faction = Some("Vza");
+        n.gun = Some(rifle());
+        n.soldier = true;
+        n.landed = true;
+        n.character.position = Vec3::ZERO;
+        people.npcs.push(n);
+        people.set_relations([(("Vza", "All"), -80.0)].into_iter().collect());
+        let her = Vec3::new(0.0, 1.6, 30.0);
+        people.war(&physics, Some(her), 0.25);
+        let (rec, gate) = people.her_record(0).expect("a record of her");
+        assert!((rec.distance - 30.0).abs() < 1e-3, "{}", rec.distance);
+        assert!(rec.sight > 0.0 && rec.person);
+        assert!(m2_engine::ai_sense::feeds_disguise(&rec, &gate, 40.0));
+        assert!(!m2_engine::ai_sense::feeds_disguise(&rec, &gate, 20.0));
+        assert!(people.take_dropped_minds().is_empty());
+        people.npcs[0].alive = false;
+        people.war(&physics, Some(her), 0.25);
+        assert_eq!(people.take_dropped_minds(), vec![people.npcs[0].shooter]);
+    }
+
     #[test]
     fn made_peace_a_soldier_fights_on_until_he_calms_but_war_is_at_once() {
         let physics = ground();
@@ -5968,11 +6316,19 @@ pub(crate) mod tests {
             threat: m2_engine::ai_target::VEHICLE_THREAT,
             priority: false,
             vehicle: None,
+            hint: VEHICLE_HINT,
+            speed: 0.0,
+            row: None,
         };
         people.vehicle_subjects = vec![truck(150.0, 100.0)];
         people.war(&physics, None, 0.25);
         assert_eq!(people.npcs[0].foe_at, None, "out of its reach");
+        // Standing still, it is looked at again 8 s on (its lane, 3).
         people.vehicle_subjects = vec![truck(150.0, 200.0)];
+        for _ in 0..32 {
+            people.war(&physics, None, 0.25);
+        }
+        assert_eq!(people.npcs[0].foe_at, None, "not looked at again yet");
         people.war(&physics, None, 0.25);
         assert!(people.npcs[0].foe_at.is_some());
         assert_eq!(people.npcs[0].foe_armour, Some(2));
@@ -6006,6 +6362,9 @@ pub(crate) mod tests {
                 threat: m2_engine::ai_target::VEHICLE_THREAT,
                 priority,
                 vehicle: None,
+                hint: VEHICLE_HINT,
+                speed: 0.0,
+                row: None,
             }];
             people.war(&physics, None, 0.25);
             people.npcs[0].foe_at.expect("he goes for one").z
@@ -6045,6 +6404,9 @@ pub(crate) mod tests {
             threat: m2_engine::ai_target::VEHICLE_THREAT,
             priority: false,
             vehicle: Some(id),
+            hint: VEHICLE_HINT,
+            speed: 0.0,
+            row: None,
         }];
         people.war(&physics, None, 0.25);
         assert_eq!(
@@ -6087,6 +6449,9 @@ pub(crate) mod tests {
             threat: m2_engine::ai_target::VEHICLE_THREAT,
             priority: true,
             vehicle: None,
+            hint: VEHICLE_HINT,
+            speed: 0.0,
+            row: None,
         }];
         people.war(&physics, None, 0.25);
         let z = people.npcs[0].foe_at.expect("he goes for one").z;
@@ -6443,6 +6808,23 @@ pub(crate) mod tests {
             Quat::IDENTITY,
         );
         physics.step(1.0 / 60.0);
+    }
+
+    // A wall a step in front of her hides her: the line runs all the way
+    // to her (it used to stop 2.5 m short and see past it).
+    #[test]
+    fn a_wall_just_before_her_hides_her() {
+        let mut physics = ground();
+        wall(&mut physics, 28.5, 5.0);
+        let post = Brain::Post { facing: 0.0 };
+        let mut n = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(1));
+        n.her_visibility = 300.0;
+        n.character.position = Vec3::ZERO;
+        assert!(!n.sees(&physics, Vec3::new(0.0, 1.6, 30.0), false));
+        assert!(
+            n.sees(&physics, Vec3::new(0.0, 1.6, 27.0), false),
+            "this side of it"
+        );
     }
 
     // Playtest 8: the villa's waves stuck outside, on walls their paths
