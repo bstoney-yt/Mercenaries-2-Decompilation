@@ -4667,7 +4667,7 @@ mod tests {
                 local her = Player.GetAnyCharacter()
                 Human.PlayRawAnimation(her, "all_starter03_job_briefing_spiel", true, true, 0.5, false, true)
                 Event.Create(Event.HumanAnimationNearlyCompleted, { her, 0.1 },
-                    function(who) done = who end, {})
+                    function() done = true end, {})
                 "#,
             )
             .exec()
@@ -4714,7 +4714,7 @@ mod tests {
                 left = nil
                 Sys.RequestGameState("WaitForStreaming")
                 Event.Create(Event.GameStateChange, {"WaitForStreaming", "exit"},
-                    function(state, name, how) left = state .. " " .. name .. " " .. how end,
+                    function(state, extra) left = state .. " " .. tostring(extra) end,
                     {"streaming"})
                 "#,
             )
@@ -4730,7 +4730,8 @@ mod tests {
         world.borrow_mut().game_state = "Game".into();
         events.update_shared(0.5, &world);
         let left: String = host.lua().globals().get("left").unwrap();
-        assert_eq!(left, "streaming WaitForStreaming exit");
+        // Nothing of the engine's own follows the data (as the 360).
+        assert_eq!(left, "streaming nil");
         let r: bool = host
             .lua()
             .load("local n = math.randi(3); return n >= 1 and n <= 3 and Math.randf(2, 2) == 2")
