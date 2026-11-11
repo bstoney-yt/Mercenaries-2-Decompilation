@@ -3039,6 +3039,39 @@ mod tests {
         assert_eq!(m.take_commands(), [on(true), on(false)]);
     }
 
+    /// `Event.ObjectHealthLessThan` as ChiCon001 waits for its VIP at half
+    /// health: `{ target, Object.GetHealth(target) / 2 }`.
+    #[test]
+    fn a_health_less_than_watch_fires_below_its_figure() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            halved, args = 0, -1
+            local hero = Player.GetCharacter(1)
+            Event.Create(Event.ObjectHealthLessThan, { hero, Object.GetHealth(hero) / 2 },
+                function(...) halved = halved + 1; args = select('#', ...) end)
+            "#,
+            "test",
+        )
+        .unwrap();
+        let full: f64 = m
+            .lua()
+            .load("return Object.GetHealth(Player.GetCharacter(1))")
+            .eval()
+            .unwrap();
+        m.tick(0.1);
+        m.set_health(PLAYER, (full * 0.6) as f32);
+        m.tick(0.1);
+        let g = m.lua().globals();
+        assert_eq!(g.raw_get::<i64>("halved").unwrap(), 0);
+        m.set_health(PLAYER, (full * 0.4) as f32);
+        m.tick(0.1);
+        m.tick(0.1);
+        assert_eq!(g.raw_get::<i64>("halved").unwrap(), 1);
+        // The engine passes nothing of its own.
+        assert_eq!(g.raw_get::<i64>("args").unwrap(), 0);
+    }
+
     #[test]
     fn health_watches_fire_as_she_is_hurt() {
         let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
