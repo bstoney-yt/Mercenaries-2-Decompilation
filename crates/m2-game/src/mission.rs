@@ -353,6 +353,10 @@ pub struct GameData {
     /// lower case ([`crate::inventory::read`]).
     pub max_reserve: HashMap<String, u32>,
     pub thrown: std::collections::HashSet<String>,
+    /// How one template regards another, from the template database's
+    /// `Relationship` records ([`m2_engine::ai::relations`]): what
+    /// `Ai.GetRelation` answers where no script has set the pair.
+    pub relations: Vec<(String, String, f32)>,
 }
 
 /// `Label`'s field: the label's name hash.
@@ -451,6 +455,7 @@ impl GameData {
                     template_script_data = script_data(&db);
                     template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
+                    data.relations = m2_engine::ai::relations(&db);
                     template_names = db
                         .names()
                         .into_iter()
@@ -693,6 +698,7 @@ impl Mission {
             template_passengers,
             max_reserve,
             thrown,
+            relations,
         } = data;
         let regions = layers
             .values()
@@ -710,6 +716,10 @@ impl Mission {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
+            w.relations = relations
+                .into_iter()
+                .map(|(a, b, r)| ((a.to_ascii_lowercase(), b.to_ascii_lowercase()), r))
+                .collect();
             w.template_names = template_names;
             w.template_drivers = template_drivers;
             w.template_passengers = template_passengers;

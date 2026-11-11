@@ -827,8 +827,9 @@ pub struct ScriptWorld {
     pub survival_mode: bool,
     /// The weapons people carry.
     pub inventory: crate::inventory::Inventory,
-    /// Faction relations (`Ai.SetRelation`), -100 to 100, by (faction,
-    /// faction) in lower case.
+    /// Faction relations, -100 to 100, by (template, template) names in
+    /// lower case, in order: the templates' own `Relationship` records,
+    /// and what `Ai.SetRelation` wrote over them.
     pub relations: HashMap<(String, String), f32>,
     /// Actions playing and the pad, for hijacks.
     pub hijack: crate::hijack::HijackWorld,
@@ -1515,12 +1516,27 @@ fn id(v: Option<&Value>) -> Option<u32> {
 }
 
 /// A faction argument (`"Pmc"`), in lower case.
-fn faction(v: Option<&Value>) -> Option<String> {
-    match v? {
-        Value::String(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
-        Value::Integer(i) => Some(i.to_string()),
-        _ => None,
+/// The bound of a relation either way (from the 360 code: -100 and 100
+/// at 0x820f8c3c and 0x820d9f18).
+const RELATION_LIMIT: f32 = 100.0;
+
+/// One side of a relation, as the relation table keys it: a template's
+/// name in lower case (`"oc"`). A name stands for itself; a template's
+/// guid (`Pg.GetGuidByName("OC")`) for its name; anyone else's for their
+/// faction's, the parent the 360 code walks up to (inferred: the parent
+/// chain itself isn't read, only the faction), else their own name.
+fn relation_side(w: &ScriptWorld, v: Option<&Value>) -> Option<String> {
+    if let Some(Value::String(s)) = v {
+        return Some(s.to_string_lossy().to_ascii_lowercase());
     }
+    let g = id(v)?;
+    let o = w.objects.get(&g)?;
+    let name = if (FIRST_TEMPLATE..FIRST_SPAWNED).contains(&g) {
+        o.name.as_str()
+    } else {
+        o.faction_name().unwrap_or(o.name.as_str())
+    };
+    Some(name.to_ascii_lowercase())
 }
 
 /// A sound category argument (`non_ui`), as named.
@@ -2971,25 +2987,39 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     // How one faction's AI regards another, -100 (hostile) to 100
     // (friendly), as the faction manager sets it (`Ai.SetRelation(a, b,
-    // value)`); the faction manager reads attitudes back from it. Pairs
-    // never set are neutral, 0; one set only the other way round answers
-    // for both (inferred).
+    // value)`); the faction manager reads attitudes back from it.
+    //
+    // From the 360 code: `Ai.SetRelation` (0x82313578, store 0x822F0600)
+    // clamps the value to -100..100 (0x820f8c3c, 0x820d9f18), keeps it
+    // for the pair in that order only, and answers true. `Ai.GetRelation`
+    // (0x823134e0, lookup 0x822F0440/0x822F02C0) reads the same table,
+    // which also holds the templates' own `Relationship` records (seeded
+    // here from the template database): the pair in order, walking each
+    // side up to its parent (a person to its faction) while none is
+    // found. Never the other way round. A pair with no record answers 0,
+    // unless both sides come to the same template: then 100.
     add(&ai, "SetRelation", |w, _, a| {
-        if let (Some(from), Some(to), Some(value)) =
-            (faction(a.first()), faction(a.get(1)), num(a.get(2)))
-        {
-            w.relations.insert((from, to), value);
-        }
-        values([])
+        let set = match (
+            relation_side(w, a.first()),
+            relation_side(w, a.get(1)),
+            num(a.get(2)),
+        ) {
+            (Some(from), Some(to), Some(value)) => {
+                w.relations
+                    .insert((from, to), value.clamp(-RELATION_LIMIT, RELATION_LIMIT));
+                true
+            }
+            _ => false,
+        };
+        values([Value::Boolean(set)])
     })?;
     add(&ai, "GetRelation", |w, _, a| {
-        let value = match (faction(a.first()), faction(a.get(1))) {
-            (Some(from), Some(to)) => w
-                .relations
-                .get(&(from.clone(), to.clone()))
-                .or_else(|| w.relations.get(&(to, from)))
-                .copied()
-                .unwrap_or(0.0),
+        let value = match (relation_side(w, a.first()), relation_side(w, a.get(1))) {
+            (Some(from), Some(to)) => match w.relations.get(&(from.clone(), to.clone())) {
+                Some(&r) => r,
+                None if from == to => RELATION_LIMIT,
+                None => 0.0,
+            },
             _ => 0.0,
         };
         values([Value::Number(f64::from(value))])
@@ -4018,9 +4048,16 @@ mod tests {
             jeep.labels.push("Vehicle".into());
             w.insert(50, jeep);
             // The template database's templates the tests' scripts name.
-            w.template_names = ["carbine", "grenade", "supply drop (gl)", "oc", "allied"]
-                .map(String::from)
-                .into();
+            w.template_names = [
+                "carbine",
+                "grenade",
+                "supply drop (gl)",
+                "oc",
+                "allied",
+                "pmc",
+            ]
+            .map(String::from)
+            .into();
         }
         install(host.lua(), &world).unwrap();
         (host, world)
@@ -5760,6 +5797,54 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((orig, copy, players), (2, 1, true));
+    }
+
+    #[test]
+    fn relations_are_kept_in_order_clamped_and_read_through_the_templates() {
+        // PmcCon018 reads OC's regard for the PMC, sets its own, and puts
+        // the old one back at the end.
+        let (host, world) = setup();
+        world
+            .borrow_mut()
+            .relations
+            .insert(("oc".into(), "pmc".into()), 25.0);
+        let (authored, set, clamped, reverse, same, by_name): (f64, bool, f64, f64, f64, f64) =
+            host.lua()
+                .load(
+                    "local oc, pmc = Pg.GetGuidByName('OC'), Pg.GetGuidByName('PMC')
+                     local authored = Ai.GetRelation(oc, pmc)
+                     local set = Ai.SetRelation(oc, pmc, -250)
+                     return authored, set, Ai.GetRelation(oc, pmc),
+                       Ai.GetRelation(pmc, oc), Ai.GetRelation(oc, oc),
+                       Ai.GetRelation('OC', 'PMC')",
+                )
+                .eval()
+                .unwrap();
+        // The templates' value where no script has set the pair.
+        assert_eq!(authored, 25.0);
+        assert!(set);
+        assert_eq!(clamped, -100.0);
+        // Only the pair in that order.
+        assert_eq!(reverse, 0.0);
+        // A side regards itself fully.
+        assert_eq!(same, 100.0);
+        assert_eq!(by_name, -100.0);
+    }
+
+    #[test]
+    fn a_persons_relation_is_their_factions() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.relations.insert(("vz".into(), "allied".into()), -100.0);
+            w.insert(60, Object::new("VZ Soldier (AK)", [0.0; 3]));
+        }
+        let r: f64 = host
+            .lua()
+            .load("return Ai.GetRelation(60, Pg.GetGuidByName('Allied'))")
+            .eval()
+            .unwrap();
+        assert_eq!(r, -100.0);
     }
 
     #[test]
