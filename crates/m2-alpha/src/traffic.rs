@@ -3,17 +3,27 @@
 //! sub-layer the game loaded: `layers_static` holds many, and the game
 //! loads only some) spawns a vehicle from its list while the player is
 //! within its `ActiveRadius`, again `SecondsPerCycle` after the last one
-//! is wrecked. A vehicle with a patrol path drives it at its `Haste`; one
-//! without stands where its spawner is (the roadblocks' gun trucks). The
-//! player can take any of them over.
+//! is wrecked. A vehicle with a patrol path drives it; one without stands
+//! where its spawner is (the roadblocks' gun trucks). The player can take
+//! any of them over.
 //!
-//! What `Haste` scales is not known: it is taken as the part of the
-//! template's top speed to drive at.
+//! A patrol drives as the 360's `MindPathMove` (0x822B4538) has its
+//! drivers do: a car by 0x822AC008, a tank by 0x822B5B98, a boat by
+//! 0x822A7C30, toward the point the path follower looks ahead to
+//! (0x822E2770), at their speeds for its speed factor
+//! ([`m2_engine::path_move`]); nothing makes it stop for what is ahead
+//! (`CarMove`, 0x822AC458, has no such check). Inferred: `Haste` is that
+//! factor. Invented: a waypoint is passed within [`ARRIVE`]; at an open
+//! path's end it parks (the 360 ends the move by the request's flags, not
+//! traced for patrols).
 
 use std::collections::{HashMap, HashSet};
 
+use m2_engine::car_driver::{CarDriver, CarInputs, CarState};
+use m2_engine::path_move::Mover;
 use m2_engine::world::TrafficPoint;
 use m2_engine::{Catalogue, Physics, VehicleControls, WorldIndex};
+use m2_engine::{path_search, tank_attack};
 use m2_math::glam::{Vec2, Vec3};
 
 use crate::scene::{ParkedVehicle, Scene};
@@ -28,13 +38,6 @@ const MOST_STANDING: usize = 8;
 const ARRIVE: f32 = 7.0;
 /// A path whose ends are this near is driven round and round.
 const CLOSED: f32 = 20.0;
-/// Steering: full lock at this many radians off the way.
-const FULL_LOCK: f32 = 0.6;
-/// Top speed when the template gives none, m/s.
-const DEFAULT_TOP: f32 = 20.0;
-/// Haste when the patrol gives none (the install's spawners give 0.175 to
-/// 0.35).
-const DEFAULT_HASTE: f32 = 0.3;
 /// A boat on its patrol: the speed its path move asks, m/s a unit of its
 /// speed factor (40 x the AI's +0x7EC, [`BOAT_SPEED_FACTOR`]), and the
 /// least reference speed its controller slows into turns by, m/s (the 360
@@ -64,6 +67,9 @@ pub struct Traffic {
     next: HashMap<u32, (usize, bool)>,
     /// Spawners whose vehicle the player has driven: it is hers now.
     taken: HashSet<u32>,
+    /// Per spawner: its car's driver and what its input holds
+    /// ([`m2_engine::car_driver`]).
+    drivers: HashMap<u32, (CarDriver, CarInputs)>,
     /// Why a spawner in reach sent nothing out, said once each.
     skipped: HashMap<u32, &'static str>,
     rng: u32,
@@ -242,6 +248,7 @@ impl Traffic {
         vehicles: &[ParkedVehicle],
         driven: Option<usize>,
         assaults: &crate::pursuers::Assaults,
+        dt: f32,
     ) {
         for (i, v) in vehicles.iter().enumerate() {
             let (Some(entity), Some(id)) = (v.spot.map(|(e, _, _)| e).or(v.guid), v.id) else {
@@ -343,10 +350,10 @@ impl Traffic {
             } else {
                 to
             };
-            // Positive: the waypoint is to the left (+x of a vehicle facing
-            // +z), and wheels turned the positive way steer left.
-            let off = -forward.perp_dot(to).atan2(forward.dot(to));
             if boat {
+                // Positive: the waypoint is to the left (+x of a vehicle
+                // facing +z), and wheels turned the positive way steer left.
+                let off = -forward.perp_dot(to).atan2(forward.dot(to));
                 // The 360 boat controller (0x822A7C30): helm 10/pi a radian
                 // off, held to full; it asks its task speed, less into a
                 // turn (its reference speed x 0.1309 / (|off| + 0.1309)), and
@@ -364,22 +371,57 @@ impl Traffic {
                 );
                 continue;
             }
-            let top = v.spec.tuning.max_speed.unwrap_or(DEFAULT_TOP);
-            let haste = point.haste.unwrap_or(DEFAULT_HASTE);
-            // Slower into a turn.
-            let want = top * haste * (1.0 - (off.abs() / std::f32::consts::PI).min(0.6));
-            let speed = physics.vehicle_speed(id);
-            physics.drive(
-                id,
+            // A car or a tank: `MindPathMove`'s drivers (0x822B4538),
+            // toward the point the path follower looks ahead to
+            // (0x822E2770), at their speed for the patrol's haste
+            // ([`m2_engine::path_move`]).
+            let car = CarState {
+                at: here,
+                forward: Vec3::new(forward.x, 0.0, forward.y).normalize_or(Vec3::Z),
+                velocity: physics.vehicle_velocity(id),
+            };
+            let (lo, hi) = v.spec.bounds;
+            let side = (hi - lo).max_element();
+            let ahead = path_search::lookahead(side, physics.vehicle_speed(id), dt);
+            let point_to = look_ahead(route, next, closed, here, ahead);
+            let controls = if v.spec.tracked {
+                let cap = Mover::Tank.speed(point.haste);
+                let t = tank_attack::drive_to(&car, point_to, cap, false);
                 VehicleControls {
-                    throttle: ((want - speed) / want.max(1.0)).clamp(-1.0, 1.0),
-                    steer: (off / FULL_LOCK).clamp(-1.0, 1.0),
-                    brake: speed > want * 1.3,
-                    parked: false,
-                },
-            );
+                    throttle: t.throttle,
+                    steer: t.steer,
+                    ..VehicleControls::default()
+                }
+            } else {
+                let cap = Mover::Car.speed(point.haste);
+                let (driver, held) = self.drivers.entry(entity).or_default();
+                let input = driver.drive_to(&car, point_to, cap, false, dt);
+                let ahead_gear = physics.vehicle_gear(id).is_none_or(|(g, _)| g != 0);
+                held.take(&input, ahead_gear);
+                held.controls()
+            };
+            physics.drive(id, controls);
         }
     }
+}
+
+/// The point `ahead` metres on along `route` from where `here` is nearest
+/// the stretch into point `next` and those after it (round to the start
+/// again when `closed`): the path follower's (0x822E2770).
+fn look_ahead(route: &[Vec3], next: usize, closed: bool, here: Vec3, ahead: f32) -> Vec3 {
+    let mut points = Vec::with_capacity(route.len() + 1);
+    if next > 0 {
+        points.push(route[next - 1]);
+    } else if closed {
+        points.push(route[route.len() - 1]);
+    } else {
+        points.push(here);
+    }
+    points.extend_from_slice(&route[next..]);
+    if closed {
+        points.extend_from_slice(&route[..next]);
+    }
+    path_search::Way { points }.ahead_of(here, ahead)
 }
 
 impl Traffic {
@@ -733,6 +775,7 @@ mod tests {
                 &vehicles,
                 None,
                 &crate::pursuers::Assaults::default(),
+                dt,
             );
             physics.step(dt);
             let next = traffic.next.get(&7).map_or(0, |n| n.0);
@@ -742,6 +785,24 @@ mod tests {
             }
         }
         assert!(passed >= 3, "passed {passed} waypoints");
+    }
+
+    // The follower's point (0x822E2770) runs on along the patrol from
+    // where the vehicle is, round the corner, and back to the start on a
+    // closed path.
+    #[test]
+    fn a_patrol_looks_ahead_along_its_path() {
+        let route = [
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, 20.0),
+            Vec3::new(20.0, 0.0, 20.0),
+            Vec3::new(20.0, 0.0, 0.0),
+        ];
+        let p = look_ahead(&route, 1, false, Vec3::new(0.0, 0.0, 15.0), 10.0);
+        assert!(p.distance(Vec3::new(5.0, 0.0, 20.0)) < 1e-3, "{p}");
+        // Closed: from the last stretch on round to the first point.
+        let p = look_ahead(&route, 0, true, Vec3::new(10.0, 0.0, 0.0), 15.0);
+        assert!(p.distance(Vec3::new(0.0, 0.0, 5.0)) < 1e-3, "{p}");
     }
 
     // A boat heading for another just off its line steers away from it;
