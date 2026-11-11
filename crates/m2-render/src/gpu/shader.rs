@@ -205,7 +205,14 @@ struct Material {
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var shadow_map: texture_depth_2d_array;
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
-@group(1) @binding(0) var<uniform> draw: Draw;
+// Every draw's uniforms, one after another, and per instance drawn, the
+// draw it belongs to and which of its instances it is: a draw is drawn
+// with its first slot as its first instance, so the instance index finds
+// its slot, and no bind group changes between draws.
+@group(1) @binding(0) var<storage, read> draws: array<Draw>;
+@group(1) @binding(4) var<storage, read> slots: array<vec2<u32>>;
+// The draw the vertex belongs to (set by the entry points).
+var<private> draw: Draw;
 @group(1) @binding(1) var<storage, read> palette: array<mat4x4<f32>>;
 @group(2) @binding(0) var<uniform> material: Material;
 @group(2) @binding(1) var base_map: texture_2d<f32>;
@@ -1198,16 +1205,20 @@ fn place(v: VertexIn, instance: u32) -> Varyings {{
 }}
 
 @vertex
-fn vs_main(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
-    var out = place(v, instance);
+fn vs_main(v: VertexIn, @builtin(instance_index) slot: u32) -> Varyings {{
+    let s = slots[slot];
+    draw = draws[s.x];
+    var out = place(v, s.y);
     out.haze = haze_terms(out.world_pos);
     return out;
 }}
 
 // Shadow casters need no haze.
 @vertex
-fn vs_shadow(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
-    return place(v, instance);
+fn vs_shadow(v: VertexIn, @builtin(instance_index) slot: u32) -> Varyings {{
+    let s = slots[slot];
+    draw = draws[s.x];
+    return place(v, s.y);
 }}
 "#
     );
