@@ -29,7 +29,11 @@
 //! is `BloomAmount` alone; the levels are the frame over 2, 4, 8 and 16,
 //! blurred 0, 1, 2 and 4 times across and down, their taps 0.4 and 0.8
 //! times `BloomBlurRadius`, then 0.45 and 0.95, texels apart.
-//! The composite's last two settings match ours at their defaults: its//! luminance scale `imageParams.z` is 0.5 + the options' brightness / 100//! (0x8239E338; 50 by default, 0x8256D1B0), so 1, which we leave out; its//! grain `filterParams.z` is 0 unless a screen effect sets it//! (0x821BA6B0, 0x821B62B8), as ours is outside the satellite's view.
+//! The composite's last two settings match ours at their defaults: its
+//! luminance scale `imageParams.z` is 0.5 + the options' brightness / 100
+//! (0x8239E338; 50 by default, 0x8256D1B0), so 1, which we leave out; its
+//! grain `filterParams.z` is 0 unless a screen effect sets it
+//! (0x821BA6B0, 0x821B62B8), as ours is outside the satellite's view.
 //! `BloomThreshold` is read but no game shader applies a threshold.
 //! `M2_GRADE_BLUR=off` restores the bright pass (PC round grade27).
 //!
