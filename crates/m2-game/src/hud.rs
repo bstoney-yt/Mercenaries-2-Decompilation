@@ -98,6 +98,36 @@ pub struct Model3d {
     pub scale: f32,
 }
 
+/// A coloured mark held at an offset from a target (`Marker.Add`): the
+/// mark over someone being delivered (`MrxTaskObjectiveDeliver` puts one
+/// 2 m over each, `Marker.Add(0, 2, 0, who, 255, 255, 0, 0.05)`).
+///
+/// From the 360 code (`Gui._MarkerAddOld`, 8231B828; the scripts' one
+/// call fits it and not `Gui._MarkerAdd`, 8231AEE8, which is
+/// `Marker.AddBlip`'s `(target, icon, size, ...)`): the call is
+/// `(x, y, z, target, r, g, b, scale, icon, ...)` and every argument may
+/// be left out: the offset is `(0, 2, 0)`, the colour 255 each and the
+/// scale 0.25 by default, with no target it is a point in the world, and
+/// it fades as other markers do, between [`MARKER_NEAR`] and
+/// [`MARKER_FAR`]. Three more arguments after the icon (a number, a
+/// boolean, a number) are passed on to the marker and aren't understood;
+/// the scripts never give them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pin {
+    pub target: Option<u32>,
+    /// From the target (or the world's origin), metres.
+    pub offset: [f32; 3],
+    pub colour: [u8; 3],
+    pub scale: f32,
+    /// Its icon by name; `None` for the game's own default.
+    pub icon: Option<String>,
+}
+
+/// A [`Pin`]'s offset and scale when the call gives none (from the 360
+/// code, 8231B828).
+pub const PIN_OFFSET: [f32; 3] = [0.0, 2.0, 0.0];
+pub const PIN_SCALE: f32 = 0.25;
+
 /// A marker over a target in the world.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Marker {
@@ -146,6 +176,8 @@ pub struct Hud {
     pub tripwires: BTreeMap<u32, Tripwire>,
     /// Models drawn as markers by handle (`Marker.Add3D`).
     pub models: BTreeMap<u32, Model3d>,
+    /// Marks held by a target by handle (`Marker.Add`).
+    pub pins: BTreeMap<u32, Pin>,
     /// Markers that pulse, by handle, each in its colour (`Marker.Pulse`,
     /// until `Marker.HaltPulse` or the marker's removal). From the 360
     /// code (`Gui._MarkerPulse`, 8231BB88, and `_MarkerHaltPulse`,
@@ -578,6 +610,50 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         );
         Ok(MultiValue::from_vec(vec![guid_value(handle)]))
     })?;
+    // Marker.Add(x, y, z, target, r, g, b, scale, icon): see [`Pin`]. An
+    // argument of another kind is skipped, as the 360's reader does (each
+    // is read from where the last one read ended).
+    add(&marker, "Add", |hud, _, a| {
+        let mut next = 0;
+        let mut num = |d: f32| match number(a.get(next)) {
+            Some(v) => {
+                next += 1;
+                v as f32
+            }
+            None => d,
+        };
+        let offset = [num(PIN_OFFSET[0]), num(PIN_OFFSET[1]), num(PIN_OFFSET[2])];
+        let target = guid(a.get(next));
+        if target.is_some() {
+            next += 1;
+        }
+        let mut num = |d: f32| match number(a.get(next)) {
+            Some(v) => {
+                next += 1;
+                v as f32
+            }
+            None => d,
+        };
+        let colour = [num(255.0), num(255.0), num(255.0)].map(|c| c.clamp(0.0, 255.0) as u8);
+        let scale = num(PIN_SCALE);
+        let icon = match a.get(next) {
+            Some(Value::String(s)) => Some(s.to_string_lossy()),
+            _ => None,
+        };
+        let handle = FIRST_MARKER + hud.next_marker;
+        hud.next_marker += 1;
+        hud.pins.insert(
+            handle,
+            Pin {
+                target,
+                offset,
+                colour,
+                scale,
+                icon,
+            },
+        );
+        Ok(MultiValue::from_vec(vec![guid_value(handle)]))
+    })?;
     add(&marker, "Pulse", |hud, _, a| {
         if let Some(h) = guid(a.first()) {
             let c = |i: usize| number(a.get(i)).map_or(255, |v| v.clamp(0.0, 255.0) as u8);
@@ -598,6 +674,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             hud.discs.remove(&h);
             hud.tripwires.remove(&h);
             hud.models.remove(&h);
+            hud.pins.remove(&h);
         }
         Ok(MultiValue::new())
     })?;
@@ -738,6 +815,56 @@ mod tests {
             .unwrap();
         let w = world.borrow();
         assert_eq!((w.hud.tripwires.len(), w.hud.models.len()), (1, 2));
+    }
+
+    #[test]
+    fn someone_being_delivered_is_marked_two_metres_over_them() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        api::install(host.lua(), &world).unwrap();
+        host.lua()
+            .load(
+                r#"
+                local vip = Sys.StringToGuid("734801")
+                -- As MrxTaskObjectiveDeliver marks an attached person.
+                mark = Marker.Add(0, 2, 0, vip, 255, 255, 0, 0.05)
+                bare = Marker.Add()
+                named = Marker.Add(1, 3, 5, vip, 10, 20, 30, 2, "HUD_objective_action")
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let g = |n: &str| as_guid(&host.lua().globals().get::<Value>(n).unwrap()).unwrap();
+        {
+            let w = world.borrow();
+            assert_eq!(
+                w.hud.pins[&g("mark")],
+                Pin {
+                    target: Some(734801),
+                    offset: [0.0, 2.0, 0.0],
+                    colour: [255, 255, 0],
+                    scale: 0.05,
+                    icon: None,
+                }
+            );
+            // Everything left out: the game's defaults, at no target.
+            assert_eq!(
+                w.hud.pins[&g("bare")],
+                Pin {
+                    target: None,
+                    offset: PIN_OFFSET,
+                    colour: [255, 255, 255],
+                    scale: PIN_SCALE,
+                    icon: None,
+                }
+            );
+            let named = &w.hud.pins[&g("named")];
+            assert_eq!(named.offset, [1.0, 3.0, 5.0]);
+            assert_eq!(named.icon.as_deref(), Some("HUD_objective_action"));
+            assert_eq!((named.colour, named.scale), ([10, 20, 30], 2.0));
+        }
+        host.lua().load("Marker.Remove(mark)").exec().unwrap();
+        assert_eq!(world.borrow().hud.pins.len(), 2);
     }
 
     #[test]
