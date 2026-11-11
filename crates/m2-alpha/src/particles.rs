@@ -474,6 +474,8 @@ impl ParticleDraw {
                     skin: None,
                     instances: None,
                     uv_offset: [0.0; 2],
+                    tint: [1.0; 4],
+                    beams_lit: false,
                 },
                 layer: Layer::WORLD,
                 translucent: true,

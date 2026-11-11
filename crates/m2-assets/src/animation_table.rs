@@ -94,6 +94,9 @@ pub const RIFLE: u32 = 0xd045_9a41;
 /// The class the 360's query gives a character holding nothing
 /// (0xD20EC345, 828011C0).
 pub const UNARMED: u32 = 0xd20e_c345;
+/// The class of a grenade in use (`grenade`'s hash): what a throw's rows
+/// hold in `InUseEquipmentClass`.
+pub const GRENADE: u32 = 0x496d_5a75;
 
 /// A column's type code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,6 +531,45 @@ pub fn action_handle(actions: &AnimationTable, stance: &str, action: &str) -> Op
             ("Seat", None),
             ("Target", None),
             ("ActionDirection", None),
+            ("DamageDirection", None),
+        ],
+        "AnimationHandles",
+    )
+}
+
+/// As [`handle_clip`] with something in use: its equipment class
+/// (`in_use`: [`GRENADE`] for a throw, whose rows name it in
+/// `InUseEquipmentClass`), as the 360's query fills that cell in
+/// (828011C0).
+pub fn handle_clip_using(
+    table: &AnimationTable,
+    handle: u32,
+    who: (u32, u32),
+    equipment: u32,
+    in_use: u32,
+    fits: impl Fn(u32) -> bool,
+) -> Option<CharacterClip> {
+    handle_rows(table, handle, (in_use, ANY), who, equipment, None, fits)
+}
+
+/// As [`action_handle`] for an action the table splits by
+/// `ActionDirection` (`direction`: the hash of `Front`, `Back`, `Left`
+/// or `Right`): a grenade throw's four rows.
+pub fn action_handle_toward(
+    actions: &AnimationTable,
+    stance: &str,
+    action: &str,
+    direction: u32,
+) -> Option<u32> {
+    actions.lookup(
+        &[
+            ("Stance", Some(crate::name_hash(stance))),
+            ("Action", Some(crate::name_hash(action))),
+            ("AimState", None),
+            ("Tandem", None),
+            ("Seat", None),
+            ("Target", None),
+            ("ActionDirection", Some(direction)),
             ("DamageDirection", None),
         ],
         "AnimationHandles",
@@ -1094,6 +1136,57 @@ mod tests {
         assert_eq!(clip(Some(0x0bad)), Some(0x9d88_6544));
         assert_eq!(action_handle(&a, "InVehicle", "Idle"), Some(0x9999));
     }
+    #[test]
+    fn a_throws_handle_is_its_directions_row() {
+        let (stance, throw) = (name_hash("Upright"), name_hash("ThrowGrenadeIdle"));
+        let (front, back) = (name_hash("Front"), name_hash("Back"));
+        let cols: Vec<(&str, u16)> = [
+            "Stance",
+            "Action",
+            "AimState",
+            "Tandem",
+            "Seat",
+            "Target",
+            "ActionDirection",
+            "DamageDirection",
+            "AnimationHandles",
+        ]
+        .iter()
+        .map(|&c| (c, 4))
+        .collect();
+        // As the game's: a throw has a row for each way and none without.
+        let a = table(
+            &cols,
+            &[
+                &[ANY; 9],
+                &[stance, throw, ANY, ANY, ANY, ANY, back, ANY, 0xa69c],
+                &[stance, throw, ANY, ANY, ANY, ANY, front, ANY, 0x3052],
+            ],
+            None,
+        );
+        let a = AnimationTable::parse(&a).unwrap();
+        let toward = |way| action_handle_toward(&a, "Upright", "ThrowGrenadeIdle", way);
+        assert_eq!(toward(front), Some(0x3052));
+        assert_eq!(toward(back), Some(0xa69c));
+        assert_eq!(toward(name_hash("Left")), None);
+        // Without a way no row answers.
+        assert_eq!(action_handle(&a, "Upright", "ThrowGrenadeIdle"), None);
+    }
+
+    #[test]
+    fn a_handles_clip_with_a_grenade_in_use_is_the_in_use_rows() {
+        let t = on_foot();
+        let who = (name_hash("Hero"), name_hash("mattias"));
+        let throw = 0x399f_45f4;
+        assert_eq!(GRENADE, name_hash("grenade"));
+        let using = handle_clip_using(&t, throw, who, RIFLE, GRENADE, |_| true).unwrap();
+        assert_eq!(using.clip, 0x690b_c7d1);
+        assert_eq!(using.by, Precedence::Equipment);
+        // With nothing in use, the row that names nothing in use.
+        let bare = handle_clip(&t, throw, who, RIFLE, |_| true).unwrap();
+        assert_eq!(bare.clip, 0xdead);
+    }
+
     #[test]
     fn a_rate_is_one_without_limits() {
         // -1 (most rows), 0, max below min, NaN: the clip plays at 1.0.

@@ -875,6 +875,15 @@ impl Animator {
         });
     }
 
+    /// Starts the clip playing again from its beginning, keeping the fade
+    /// it is in (the locomotion node's second idle and fidget start from
+    /// 0 as they fade in, where a gait starts in step with the last).
+    pub fn restart(&mut self) {
+        if let Some(c) = &mut self.current {
+            c.time = 0.0;
+        }
+    }
+
     /// Jumps the clip playing to `time` seconds in, done fading (for
     /// pictures of a moment of a clip).
     pub fn seek(&mut self, time: f32) {
