@@ -303,7 +303,7 @@ impl AttackWorld for Look<'_> {
     fn line_clear(&mut self, from: Vec3, to: Vec3) -> bool {
         let (a, b) = (from + Vec3::Y, to + Vec3::Y);
         let end = b - (b - a).normalize_or_zero() * 4.0;
-        self.physics.line_clear(a, end, Some(self.car))
+        self.physics.path_line_clear(a, end, Some(self.car))
     }
 }
 
