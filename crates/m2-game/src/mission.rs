@@ -338,6 +338,9 @@ pub struct GameData {
     /// Templates' labels (name hashes) by the template's name in lower
     /// case, for objects the scripts spawn.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Templates' `CashValue` (`Object.GetCashValue`) by the template's
+    /// name in lower case.
+    pub template_cash: HashMap<String, i32>,
     /// Every template's name in the template database, in lower case:
     /// the names scripts look templates up by (`Pg.GetGuidByName("OC")`).
     pub template_names: std::collections::HashSet<String>,
@@ -447,6 +450,7 @@ impl GameData {
                     && let Ok(db) = Layer::parse(asset)
                 {
                     template_labels = labels_of(db.component("Label"));
+                    data.template_cash = crate::cash::template_cash(&db);
                     template_scripts = db.hashes("ObjectScript");
                     template_script_data = script_data(&db);
                     template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
@@ -688,6 +692,7 @@ impl Mission {
             shapes,
             strings,
             template_labels,
+            template_cash,
             template_names,
             template_drivers,
             template_passengers,
@@ -710,6 +715,7 @@ impl Mission {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
+            w.template_cash = template_cash;
             w.template_names = template_names;
             w.template_drivers = template_drivers;
             w.template_passengers = template_passengers;

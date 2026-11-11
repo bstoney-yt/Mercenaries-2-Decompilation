@@ -3,6 +3,7 @@
 pub mod airstrike;
 pub mod api;
 pub mod atmosphere_script;
+pub mod cash;
 pub mod cheat;
 pub mod events;
 pub mod gui;
