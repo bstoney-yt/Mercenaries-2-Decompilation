@@ -1038,6 +1038,8 @@ impl Mission {
             let mut w = self.world.borrow_mut();
             w.honk_heard = (w.honk_heard - dt as f32).max(0.0);
             w.pursuit.clock.step(dt as f32);
+            // No time scale yet: game and real time run together.
+            w.clocks.step(dt as f32, dt as f32);
         }
         // Streaming is instant here: a waiting state ends a second after
         // it was asked for, and the scripts hear that it did.
