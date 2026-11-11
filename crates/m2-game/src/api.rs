@@ -797,6 +797,9 @@ pub struct ScriptWorld {
     pub ai_states: HashMap<(u32, String), bool>,
     /// `Pg.StartHeliWaveSpawner`'s waves under way.
     pub heli_waves: crate::heliwaves::HeliWaves,
+    /// How each person regards another (`Ai.SetFeeling`), by (person,
+    /// other).
+    pub feelings: HashMap<(u32, u32), f32>,
     /// What the scripts want on the player's screen.
     pub hud: crate::hud::Hud,
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
@@ -3162,6 +3165,42 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let ai = lib("Ai")?;
+    // How one person regards another (`Ai.GetFeeling(ai, other)`,
+    // `Ai.SetFeeling(ai, other, value)`), as the AI keeps it per person
+    // it has perceived. From the 360 code: `GetFeeling` (0x82313350,
+    // 0x822F9398) looks the other up in the AI's own store and answers
+    // its feeling; with no AI there or no record of the other it answers
+    // nil. A record flagged so (bit 22 of +0xe8) answers no more than -38
+    // (0x820f8d38). `SetFeeling` (0x82313408, 0x822F9438) finds or makes
+    // the AI's record of the other and sets it, answering whether it
+    // could (false without an AI).
+    //
+    // Inferred here: records come only from `SetFeeling` (the 360 also
+    // makes one as the AI perceives someone, which happens in the game,
+    // not in the scripts' world); the -38 cap's flag isn't modelled; the
+    // value is kept as given. OilCon021 asks whether the mailman's
+    // feeling for her is down to -33 (hostile); a script elsewhere puts a
+    // feeling below 0 back to 100.
+    add(&ai, "GetFeeling", |w, _, a| {
+        let feeling = match (id(a.first()), id(a.get(1))) {
+            (Some(ai), Some(other)) if w.objects.get(&ai).is_some_and(|o| o.alive) => {
+                w.feelings.get(&(ai, other)).copied()
+            }
+            _ => None,
+        };
+        values([feeling.map_or(Value::Nil, |f| Value::Number(f64::from(f)))])
+    })?;
+    add(&ai, "SetFeeling", |w, _, a| {
+        let (Some(ai), Some(other), Some(value)) = (id(a.first()), id(a.get(1)), num(a.get(2)))
+        else {
+            return values([Value::Nil]);
+        };
+        let set = w.objects.get(&ai).is_some_and(|o| o.alive);
+        if set {
+            w.feelings.insert((ai, other), value);
+        }
+        values([Value::Boolean(set)])
+    })?;
     // Ai.SetInfractionMultiplier(faction, m), the faction as its
     // template's guid (`Pg.GetGuidByName("OC")`): see
     // [`crate::report::Reports::multipliers`].
@@ -6291,6 +6330,25 @@ mod tests {
             .unwrap();
         assert!(inside && !outside && !no_region);
         assert!(bad.is_nil());
+    }
+
+    #[test]
+    fn feelings_are_nil_until_set_and_need_a_person() {
+        // OilCon021: Ai.GetFeeling(mailman, her) <= -33 means hostile.
+        let (host, _) = setup();
+        let (before, set, after, nobody, unset): (Value, bool, f64, bool, Value) = host
+            .lua()
+            .load(
+                "local before = Ai.GetFeeling(50, 1)
+                 local set = Ai.SetFeeling(50, 1, -40)
+                 return before, set, Ai.GetFeeling(50, 1), Ai.SetFeeling(999, 1, 5),
+                   Ai.GetFeeling(1, 50)",
+            )
+            .eval()
+            .unwrap();
+        assert!(before.is_nil() && unset.is_nil());
+        assert!(set && !nobody);
+        assert_eq!(after, -40.0);
     }
 
     #[test]
