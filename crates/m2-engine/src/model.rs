@@ -53,6 +53,14 @@ struct MaterialKey {
     depth_bias: bool,
 }
 
+/// A model material in use ([`MaterialCache::release`]).
+#[derive(Debug)]
+struct Held {
+    count: u32,
+    key: Option<MaterialKey>,
+    textures: Vec<u32>,
+}
+
 /// Textures and materials shared between models.
 #[derive(Debug)]
 pub struct MaterialCache {
@@ -67,6 +75,14 @@ pub struct MaterialCache {
     /// Materials that blend over what is behind them.
     translucent: HashSet<MaterialId>,
     next_material: u32,
+    /// Material ids given back ([`release`](Self::release)), handed out
+    /// again before new ones (only the low 16 bits reach the sort key).
+    free_ids: Vec<u32>,
+    /// Model materials in use: how many uploads hold each, what it is
+    /// cached under and the textures it holds.
+    held: HashMap<MaterialId, Held>,
+    /// How many model materials hold each texture.
+    texture_holds: HashMap<u32, u32>,
     /// Every material, including ones defined later, draws both faces.
     all_double_sided: bool,
     /// Largest texture width to read for models; bigger mips are skipped.
@@ -82,6 +98,9 @@ impl Default for MaterialCache {
             translucent: HashSet::new(),
             // 0 stays the backend's default material.
             next_material: 1,
+            free_ids: Vec::new(),
+            held: HashMap::new(),
+            texture_holds: HashMap::new(),
             all_double_sided: false,
             max_texture_width: MODEL_TEXTURE_WIDTH,
         }
@@ -213,6 +232,9 @@ impl MaterialCache {
             depth_bias,
         };
         if let Some(&id) = self.materials.get(&key) {
+            if let Some(h) = self.held.get_mut(&id) {
+                h.count += 1;
+            }
             return Ok(id);
         }
         let technique = Technique::from_hash(material.technique);
@@ -394,10 +416,29 @@ impl MaterialCache {
             );
         }
         let id = self.define(backend, &desc)?;
-        if material_textures(material)
+        // The textures it holds, freed once no material does.
+        let mut textures: Vec<u32> = material_textures(material)
             .iter()
-            .all(|&(t, _)| self.has_texture(t))
-        {
+            .map(|&(t, _)| t)
+            .filter(|&t| self.uploaded(t).is_some())
+            .collect();
+        textures.sort_unstable();
+        textures.dedup();
+        for &t in &textures {
+            *self.texture_holds.entry(t).or_default() += 1;
+        }
+        let cached = material_textures(material)
+            .iter()
+            .all(|&(t, _)| self.has_texture(t));
+        self.held.insert(
+            id,
+            Held {
+                count: 1,
+                key: cached.then(|| key.clone()),
+                textures,
+            },
+        );
+        if cached {
             if tinted {
                 eprintln!(
                     "tinted material {:08x}: technique {:08x}, flags {:04x}, textures {:08x?}{}",
@@ -424,8 +465,10 @@ impl MaterialCache {
         backend: &mut dyn RenderBackend,
         desc: &MaterialDesc,
     ) -> Result<MaterialId, BackendError> {
-        let id = MaterialId(self.next_material);
-        self.next_material += 1;
+        let id = MaterialId(self.free_ids.pop().unwrap_or_else(|| {
+            self.next_material += 1;
+            self.next_material - 1
+        }));
         backend.set_material(
             id,
             &MaterialDesc {
@@ -438,6 +481,59 @@ impl MaterialCache {
             self.translucent.insert(id);
         }
         Ok(id)
+    }
+
+    /// Holds texture `hash` for good: one drawn by something other than a
+    /// model material (the ground, the sea's foam), never freed by
+    /// [`release`](Self::release).
+    pub fn pin(&mut self, hash: u32) {
+        *self.texture_holds.entry(hash).or_default() += 1;
+    }
+
+    /// Gives back one hold on model material `id` (one [`material`](Self::material)
+    /// call's): once none is left, the backend forgets it, its id is free
+    /// again, and each texture no material holds any more is destroyed and
+    /// forgotten (added again, it is uploaded again). Returns the textures
+    /// destroyed. Materials not made by `material` are kept.
+    pub fn release(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        id: MaterialId,
+    ) -> Result<Vec<u32>, BackendError> {
+        let Some(h) = self.held.get_mut(&id) else {
+            return Ok(Vec::new());
+        };
+        h.count = h.count.saturating_sub(1);
+        if h.count > 0 {
+            return Ok(Vec::new());
+        }
+        let Some(h) = self.held.remove(&id) else {
+            return Ok(Vec::new());
+        };
+        if let Some(key) = &h.key
+            && self.materials.get(key) == Some(&id)
+        {
+            self.materials.remove(key);
+        }
+        backend.remove_material(id)?;
+        self.defined.retain(|(d, _)| *d != id);
+        self.translucent.remove(&id);
+        self.free_ids.push(id.0);
+        let mut freed = Vec::new();
+        for t in h.textures {
+            let Some(n) = self.texture_holds.get_mut(&t) else {
+                continue;
+            };
+            *n -= 1;
+            if *n == 0 {
+                self.texture_holds.remove(&t);
+                if let Some(Some(u)) = self.textures.remove(&t) {
+                    backend.destroy_texture(u.handle)?;
+                }
+                freed.push(t);
+            }
+        }
+        Ok(freed)
     }
 
     /// Whether material `id` blends over what is behind it (draw it after
@@ -1289,6 +1385,9 @@ pub struct GpuModel {
     pub lamps: Lamps,
     /// The nodes those lamps hang on ([`CpuModel::lamp_nodes`]).
     lamp_nodes: [Vec<u16>; 3],
+    /// The material each of its records got from the [`MaterialCache`],
+    /// one hold each, given back by [`release`](Self::release).
+    material_ids: Vec<MaterialId>,
 }
 
 /// Which of a vehicle's lamps are lit ([`GpuModel::lamps`]).
@@ -1498,6 +1597,7 @@ impl GpuModel {
             });
         }
         Ok(Self {
+            material_ids: ids.clone(),
             hash: cpu.hash,
             pieces,
             bounds: cpu.bounds,
@@ -1848,6 +1948,23 @@ impl GpuModel {
         Ok(())
     }
 
+    /// Frees the model's buffers and gives back its holds on its
+    /// materials ([`MaterialCache::release`]), so materials and textures
+    /// no other model uses are freed too. Returns the textures freed.
+    pub fn release(
+        self,
+        backend: &mut dyn RenderBackend,
+        materials: &mut MaterialCache,
+    ) -> Result<Vec<u32>, BackendError> {
+        let ids = self.material_ids.clone();
+        self.destroy(backend)?;
+        let mut freed = Vec::new();
+        for id in ids {
+            freed.extend(materials.release(backend, id)?);
+        }
+        Ok(freed)
+    }
+
     pub fn draw_count(&self) -> usize {
         self.pieces.iter().map(|p| p.ranges.len()).sum()
     }
@@ -1961,6 +2078,47 @@ mod tests {
         assert!(alpha);
         assert_eq!(backend.texture_desc(handle).unwrap().width, 4);
         assert_eq!(backend.live_buffers().texture, 1);
+    }
+
+    /// A model material and its textures are freed once the last model
+    /// holding them gives them back; a texture another material still
+    /// holds stays, and a freed id is handed out again.
+    #[test]
+    fn released_materials_free_textures_no_material_holds() {
+        let mut backend = NullBackend::new();
+        let mut cache = MaterialCache::new();
+        let t = DecodedTexture {
+            width: 1,
+            height: 1,
+            mips: vec![vec![1, 2, 3, 255]],
+            alpha: false,
+            linear: false,
+        };
+        cache.add_texture(&mut backend, 10, Some(&t)).unwrap();
+        cache.add_texture(&mut backend, 11, Some(&t)).unwrap();
+        assert_eq!(backend.live_buffers().texture, 2);
+        // Two models hold material a; b shares its texture 10; c has 11.
+        let a = cache.material(&mut backend, &material(1, 10)).unwrap();
+        assert_eq!(cache.material(&mut backend, &material(1, 10)).unwrap(), a);
+        let b = cache.material(&mut backend, &material(2, 10)).unwrap();
+        let c = cache.material(&mut backend, &material(3, 11)).unwrap();
+        assert_eq!(cache.release(&mut backend, c).unwrap(), vec![11]);
+        assert!(!cache.has_texture(11));
+        assert_eq!(backend.live_buffers().texture, 1);
+        // One hold on a given back, then b's: 10 stays for a.
+        assert!(cache.release(&mut backend, a).unwrap().is_empty());
+        assert!(cache.release(&mut backend, b).unwrap().is_empty());
+        assert!(cache.has_texture(10));
+        // a's last: 10 goes too, and a freed id comes back.
+        assert_eq!(cache.release(&mut backend, a).unwrap(), vec![10]);
+        assert_eq!(backend.live_buffers().texture, 0);
+        cache.add_texture(&mut backend, 10, Some(&t)).unwrap();
+        let again = cache.material(&mut backend, &material(1, 10)).unwrap();
+        assert!([a, b, c].contains(&again));
+        // A texture pinned (the ground's) is never freed.
+        cache.pin(10);
+        assert!(cache.release(&mut backend, again).unwrap().is_empty());
+        assert!(cache.has_texture(10));
     }
 
     #[test]

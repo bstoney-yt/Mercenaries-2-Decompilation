@@ -98,9 +98,28 @@ impl Default for TextureLimits {
     }
 }
 
+/// A loaded model is kept while one of its placed objects is within its
+/// reach plus this, metres, and freed (with the materials and textures
+/// only it used) once none is, after [`MODEL_KEEP_FOR`].
+///
+/// From the 360 code: its assets stream through a request list
+/// (0x82846BD0 adds a request and counts it, +0x20/+0x24; 0x82846768 runs
+/// the list by priority within a byte budget, +0x4C350) and an asset is
+/// let go as soon as both its counts are 0 (0x82846768 unlinks it,
+/// 0x82845560, 0x8284A040): released by count, not after a time, so the
+/// time here is 0. What sets and clears the counts for a placed object's
+/// model, and at what distance, is not traced: the margin is invented,
+/// to keep a model at the edge of its reach from loading and freeing by
+/// turns.
+pub const MODEL_KEEP_MARGIN: f32 = 100.0;
+pub const MODEL_KEEP_FOR: std::time::Duration = std::time::Duration::ZERO;
+
 /// The loader thread.
 #[derive(Debug)]
 pub struct Loader {
+    /// The textures the thread has sent: each is sent once, until
+    /// [`forget_textures`](Self::forget_textures) says it was freed.
+    sent_textures: Arc<std::sync::Mutex<HashSet<u32>>>,
     requests: Option<Sender<Request>>,
     results: Receiver<Loaded>,
     thread: Option<JoinHandle<()>>,
@@ -115,14 +134,16 @@ impl Loader {
         let mut source = install.open_world()?;
         let (req_tx, req_rx) = channel::<Request>();
         let (res_tx, res_rx) = channel::<Loaded>();
+        let sent_textures: Arc<std::sync::Mutex<HashSet<u32>>> = Arc::default();
+        let sent = sent_textures.clone();
         let thread = std::thread::Builder::new()
             .name("asset loader".into())
             .spawn(move || {
-                let mut sent_textures = HashSet::new();
                 let mut building_shapes = HashMap::new();
-                let mut texture =
+                let texture =
                     |source: &mut crate::AssetSource<_>, hash: u32, max: u32, linear: bool| {
-                        if sent_textures.insert(hash) {
+                        let fresh = sent.lock().map_or(true, |mut s| s.insert(hash));
+                        if fresh {
                             let t = match source.texture(hash, max) {
                                 Ok(mut t) => {
                                     t.linear = linear;
@@ -213,6 +234,7 @@ impl Loader {
                 source,
             })?;
         Ok(Self {
+            sent_textures,
             requests: Some(req_tx),
             results: res_rx,
             thread: Some(thread),
@@ -222,6 +244,16 @@ impl Loader {
     pub fn request(&self, r: Request) {
         if let Some(tx) = &self.requests {
             let _ = tx.send(r);
+        }
+    }
+
+    /// Has the thread send `hashes` again when next asked for them: the
+    /// textures were freed.
+    pub fn forget_textures(&self, hashes: &[u32]) {
+        if let Ok(mut s) = self.sent_textures.lock() {
+            for h in hashes {
+                s.remove(h);
+            }
         }
     }
 
@@ -563,6 +595,13 @@ pub struct World {
     tiles: HashMap<u32, Slot<TerrainGpu>>,
     cells: HashMap<u32, Slot<TerrainGpu>>,
     models: HashMap<u32, Slot<GpuModel>>,
+    /// When each loaded model last had a placed object near enough to
+    /// keep it ([`MODEL_KEEP_MARGIN`]); one left out longer than
+    /// [`MODEL_KEEP_FOR`] is freed with what only it uses.
+    model_seen: HashMap<u32, std::time::Instant>,
+    /// Models whose objects' collision is already in the world: loaded
+    /// again after being freed, it is not added again.
+    collided: HashSet<u32>,
     scatter: HashMap<u32, Slot<Vec<ClumpGpu>>>,
     /// Each tree species' far stand-in, by species.
     far_trees: Vec<Option<FarTreeGpu>>,
@@ -684,6 +723,7 @@ impl World {
             }
             Err(e) => eprintln!("cloud noise texture {noise:08x}: {e}"),
         }
+        materials.pin(noise);
         let cloud_noise = materials.texture(noise).map(|(t, _)| t);
         // The trees' far stand-ins, ready from the start: few, and small.
         let mut far_trees = Vec::with_capacity(index.far_trees.len());
@@ -708,6 +748,7 @@ impl World {
                 .push(i);
             by_model.entry(o.model).or_default().push(i);
         }
+        materials.pin(foam);
         let foam = materials.texture(foam).map(|(t, _)| t);
         let sea = sea_plane(backend, materials, settings.sea_level, foam)?;
         let mut world = Self {
@@ -719,6 +760,8 @@ impl World {
             tiles: HashMap::new(),
             cells: HashMap::new(),
             models: HashMap::new(),
+            model_seen: HashMap::new(),
+            collided: HashSet::new(),
             scatter: HashMap::new(),
             far_trees,
             objects,
@@ -795,7 +838,8 @@ impl World {
             .iter()
             .zip(loose.starts(placed))
             .map(|(piece, at)| self.physics.add_debris(piece, at, velocity, spin))
-            .collect();
+            .collect::<Vec<_>>();
+        self.physics.group_debris(&pieces, placed);
         self.knocked.insert(i, pieces);
         true
     }
@@ -1034,8 +1078,10 @@ impl World {
                 }),
         );
 
-        // Models of placed objects in range.
-        let reach = self.settings.object_distance;
+        // Models of placed objects in range; those loaded kept while one
+        // of their objects is a little further.
+        let now = std::time::Instant::now();
+        let reach = self.settings.object_distance + MODEL_KEEP_MARGIN;
         let (b0, b1) = (
             bucket(eye.x - reach, eye.z - reach),
             bucket(eye.x + reach, eye.z + reach),
@@ -1044,16 +1090,21 @@ impl World {
             for bz in b0.1..=b1.1 {
                 for &i in self.objects.get(&(bx, bz)).map_or(&[][..], Vec::as_slice) {
                     let o = &self.index.objects[i];
+                    let d = o.position.distance(eye);
+                    let limit = self.settings.reach_limit(o);
                     if self.models.contains_key(&o.model) {
+                        if d <= limit + MODEL_KEEP_MARGIN {
+                            self.model_seen.insert(o.model, now);
+                        }
                         continue;
                     }
-                    let d = o.position.distance(eye);
-                    if d <= self.settings.reach_limit(o) {
+                    if d <= limit {
                         requests.push((d, Request::Model(o.model)));
                     }
                 }
             }
         }
+        self.free_unseen_models(backend, materials, now)?;
         requests.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (_, r) in requests {
             if self.in_flight.len() >= self.settings.in_flight {
@@ -1076,6 +1127,39 @@ impl World {
                 .values()
                 .filter(|t| matches!(t, Slot::Loading))
                 .count();
+        Ok(())
+    }
+
+    /// Frees the loaded models no placed object has kept for longer than
+    /// [`MODEL_KEEP_FOR`], and the materials and textures only they used;
+    /// the loader sends those textures again when next asked.
+    fn free_unseen_models(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        materials: &mut MaterialCache,
+        now: std::time::Instant,
+    ) -> Result<(), BackendError> {
+        let stale: Vec<u32> = self
+            .models
+            .iter()
+            .filter(|(_, slot)| matches!(slot, Slot::Ready(_)))
+            .map(|(&h, _)| h)
+            .filter(|h| {
+                self.model_seen
+                    .get(h)
+                    .is_none_or(|&t| now.duration_since(t) > MODEL_KEEP_FOR)
+            })
+            .collect();
+        let mut freed = Vec::new();
+        for h in stale {
+            self.model_seen.remove(&h);
+            if let Some(Slot::Ready(m)) = self.models.remove(&h) {
+                freed.extend(m.release(backend, materials)?);
+            }
+        }
+        if !freed.is_empty() {
+            self.loader.forget_textures(&freed);
+        }
         Ok(())
     }
 
@@ -1155,6 +1239,23 @@ impl World {
                 }
                 Loaded::Model(hash, model) => {
                     self.in_flight.remove(&Request::Model(hash));
+                    // A texture freed after the loader took it as sent is
+                    // missing: asked for again, with the model.
+                    if let Ok(m) = &model {
+                        let missing: Vec<u32> = m
+                            .texture_requests()
+                            .iter()
+                            .map(|&(t, _)| t)
+                            .filter(|&t| !materials.has_texture(t))
+                            .collect();
+                        if !missing.is_empty() {
+                            self.loader.forget_textures(&missing);
+                            self.models.remove(&hash);
+                            continue;
+                        }
+                    }
+                    let collide = self.collided.insert(hash);
+                    self.model_seen.insert(hash, std::time::Instant::now());
                     let slot = match model {
                         Ok(m) if !m.pieces.is_empty() => {
                             if let Some(loose) = m.collision.as_ref().and_then(|c| c.loose.clone())
@@ -1169,7 +1270,12 @@ impl World {
                                 // as one, of its template's mass.
                                 self.loose.insert(hash, Arc::new(whole.weighing(prop.kg())));
                             }
-                            for &i in self.by_model.get(&hash).map_or(&[][..], Vec::as_slice) {
+                            let placed: &[usize] = if collide {
+                                self.by_model.get(&hash).map_or(&[][..], Vec::as_slice)
+                            } else {
+                                &[]
+                            };
+                            for &i in placed {
                                 let o = &self.index.objects[i];
                                 // A prop placed by name with no collision
                                 // of its own (a bush, a plant) has none:
@@ -1361,6 +1467,9 @@ impl World {
                                 backend,
                                 &ground_material(materials, *colour_map, *detail_map, layers),
                             )?;
+                            for (t, _, _) in surface.textures() {
+                                materials.pin(t);
+                            }
                             // Kept only once every texture is known.
                             let known = surface
                                 .textures()

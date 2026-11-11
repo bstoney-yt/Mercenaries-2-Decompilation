@@ -881,6 +881,9 @@ pub struct ScriptWorld {
     pub reports: crate::report::Reports,
     /// The pursuit as the scripts set it ([`Pursuit`]).
     pub pursuit: Pursuit,
+    /// The engine's game and real clocks (`Sys.MainTime`, the time
+    /// stamps), stepped each frame.
+    pub clocks: crate::script_time::Clocks,
     /// Strikes and designators under way.
     pub strikes: crate::airstrike::Strikes,
     /// Whether vehicle disguises work (`Player.SetVehicleDisguise`): the
@@ -3221,6 +3224,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Single player: this machine is the server.
     let net = lib("Net")?;
     add(&net, "IsServer", |_, _, _| values([Value::Boolean(true)]))?;
+    // Net.SendCustomEvent(module, event, args, ...): a script's own event
+    // sent to the other player's game (a race's gates). From the 360 code
+    // (8232CC78): with no network game on it sends nothing and gives true.
+    add(&net, "SendCustomEvent", |_, _, _| {
+        values([Value::Boolean(true)])
+    })?;
     for name in ["IsClient", "IsActive", "IsMultiplayer"] {
         add(&net, name, |_, _, _| values([Value::Boolean(false)]))?;
     }
@@ -3659,6 +3668,27 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    {
+        use crate::script_time::{self as t, ClockKind};
+        add(&sys, "MainTime", |w, _, _| {
+            Ok(t::time(&w.clocks, ClockKind::Main))
+        })?;
+        add(&sys, "RealTime", |w, _, _| {
+            Ok(t::time(&w.clocks, ClockKind::Real))
+        })?;
+        add(&sys, "MainTimeStamp", |w, lua, _| {
+            t::stamp(lua, &w.clocks, ClockKind::Main)
+        })?;
+        add(&sys, "RealTimeStamp", |w, lua, _| {
+            t::stamp(lua, &w.clocks, ClockKind::Real)
+        })?;
+        add(&sys, "TimeStampMark", |w, _, a| t::mark(&w.clocks, a))?;
+        add(&sys, "TimeStampGetElapsed", |w, _, a| {
+            t::elapsed(&w.clocks, a)
+        })?;
+        add(&sys, "Clock", |_, _, _| Ok(t::clock()))?;
+        add(&sys, "DiffTime", |_, _, a| t::diff_time_native(a))?;
+    }
     add(&sys, "GetLevelName", |_, lua, _| {
         values([Value::String(lua.create_string("vz")?)])
     })?;
@@ -4572,6 +4602,16 @@ mod tests {
         assert_eq!((n, more, listed), (2, false, 1));
     }
 
+    #[test]
+    fn a_custom_event_with_no_network_game_sends_nothing_and_gives_true() {
+        let (host, _world) = setup();
+        let sent: bool = host
+            .lua()
+            .load("return Net.SendCustomEvent('MrxTaskRace', 2, { 1 })")
+            .eval()
+            .unwrap();
+        assert!(sent);
+    }
     #[test]
     fn atmosphere_calls_reach_the_game_and_the_rest_are_stubs() {
         let (host, world) = setup();
