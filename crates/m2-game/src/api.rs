@@ -2113,13 +2113,28 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .map_or(0.0, |o| o.yaw);
         values([crate::events::guid_value(w.spawn(what, at, yaw))])
     })?;
-    // The point a distance in front of the camera and a height above it.
+    // Pg.FindPointFromCamera(distance, height, radius, player, degrees):
+    // the point `distance` ahead of the player's camera, flat, turned by
+    // `degrees`, `height` over the ground there. From the 360 code
+    // (0x823374c0): distance 10 and height 1 when left out (0x820baeec,
+    // 0x820baee8); the camera is the player's (the local one when left
+    // out); the angle is degrees (x 0.01745, 0x820f8c74); the ground is
+    // found by a ray (0x821d15a0) and, for a radius over 0, the point is
+    // moved to somewhere near within it (0x82336528). Here the camera is
+    // where she stands, facing her way. INVENTED: the ground is taken at
+    // her height, and the radius isn't used.
     add(&pg, "FindPointFromCamera", |w, _, a| {
-        let at = w.ahead(
-            None,
-            num(a.first()).unwrap_or(0.0),
-            num(a.get(1)).unwrap_or(0.0),
-        );
+        let turn = num(a.get(4)).unwrap_or(0.0).to_radians();
+        let her = w.player.and_then(|p| w.objects.get(&p));
+        let at = her.map(|o| {
+            let (s, c) = (o.yaw + turn).sin_cos();
+            let distance = num(a.first()).unwrap_or(10.0);
+            [
+                o.position[0] + s * distance,
+                o.position[1] + num(a.get(1)).unwrap_or(1.0),
+                o.position[2] + c * distance,
+            ]
+        });
         values(match at {
             Some(p) => p.map(|c| Value::Number(f64::from(c))).to_vec(),
             None => vec![Value::Nil],
@@ -6513,6 +6528,37 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn find_point_from_camera_defaults_and_turns_in_degrees() {
+        // A support delivery: Pg.FindPointFromCamera(300, 200, -1, owner).
+        let (host, world) = setup();
+        let (at, yaw) = {
+            let w = world.borrow();
+            (w.objects[&1].position, w.objects[&1].yaw)
+        };
+        let point = |code: &str| -> [f32; 3] {
+            let (x, y, z): (f32, f32, f32) = host.lua().load(code).eval().unwrap();
+            [x, y, z]
+        };
+        let ahead = |d: f32, up: f32, turn: f32| {
+            let (s, c) = (yaw + turn).sin_cos();
+            [at[0] + s * d, at[1] + up, at[2] + c * d]
+        };
+        let near = |p: [f32; 3], q: [f32; 3]| p.iter().zip(q).all(|(a, b)| (a - b).abs() < 1e-3);
+        assert!(near(
+            point("return Pg.FindPointFromCamera()"),
+            ahead(10.0, 1.0, 0.0)
+        ));
+        assert!(near(
+            point("return Pg.FindPointFromCamera(300, 200, -1, Player.GetLocalPlayer())"),
+            ahead(300.0, 200.0, 0.0)
+        ));
+        assert!(near(
+            point("return Pg.FindPointFromCamera(20, 0, -1, nil, 90)"),
+            ahead(20.0, 0.0, std::f32::consts::FRAC_PI_2)
+        ));
     }
 
     #[test]
