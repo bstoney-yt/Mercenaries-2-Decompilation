@@ -1899,38 +1899,41 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Table(t)])
     })?;
     // (faction, level, _) for a while; (faction, level) locked.
-    fn pursue(w: &mut ScriptWorld, a: &[Value], locked: bool) {
-        let Some(f) = id(a.first()) else { return };
-        let level = num(a.get(1)).map_or(1, |l| l as i64).clamp(1, 3);
-        let Some(name) = w
+    //
+    // The answer, from the 360 code (0x823392b8 -> 0x82238398 and
+    // 0x823390c8): whether a pursuit started (SetPursuit: not with one
+    // locked, nor over one under way without force, nor below level 1;
+    // LockPursuit: a level of 1 or more); nil for bad arguments.
+    fn pursue(w: &mut ScriptWorld, a: &[Value], locked: bool) -> Option<bool> {
+        let f = id(a.first())?;
+        let asked = num(a.get(1)).map_or(1, |l| l as i64);
+        let level = asked.clamp(1, 3);
+        let name = w
             .templates
             .iter()
             .find(|(_, g)| **g == f)
-            .map(|(n, _)| n.clone())
-        else {
-            return;
-        };
+            .map(|(n, _)| n.clone())?;
         w.pursuit.level = level;
         w.pursuit.faction = Some(f);
-        if locked {
+        let started = if locked {
             w.pursuit.clock.lock(f, level as i32);
+            true
         } else {
             let force = matches!(a.get(2), Some(Value::Boolean(true)));
-            w.pursuit.clock.set(f, level as i32, force);
-        }
+            w.pursuit.clock.set(f, level as i32, force)
+        };
         let seconds = (!locked).then(|| w.pursuit.seconds(level));
         w.commands.push(Command::Pursuit {
             faction: name,
             seconds,
         });
+        Some(started && asked >= 1)
     }
     add(&pg, "SetPursuit", |w, _, a| {
-        pursue(w, a, false);
-        values([])
+        values([pursue(w, a, false).map_or(Value::Nil, Value::Boolean)])
     })?;
     add(&pg, "LockPursuit", |w, _, a| {
-        pursue(w, a, true);
-        values([])
+        values([pursue(w, a, true).map_or(Value::Nil, Value::Boolean)])
     })?;
     // (faction, seconds, levels): -1 s until cleared.
     add(&pg, "SetCustomPursuit", |w, _, a| {
@@ -1969,11 +1972,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // many seconds left (0x823393B0 -> 0x82238570), at the level they
     // make: the faction manager's `IncrementPursuit` gives 5, level 0.
     add(&pg, "SetPursuitSeconds", |w, _, a| {
-        if let (Some(f), Some(s)) = (id(a.first()), num(a.get(1))) {
-            let force = matches!(a.get(2), Some(Value::Boolean(true)));
-            w.pursuit.clock.set_seconds(f, s as i32, force);
-        }
-        values([])
+        // The answer (0x82238570): whether it started; nil for bad
+        // arguments.
+        let (Some(f), Some(s)) = (id(a.first()), num(a.get(1))) else {
+            return values([Value::Nil]);
+        };
+        let force = matches!(a.get(2), Some(Value::Boolean(true)));
+        let started = w.pursuit.clock.set_seconds(f, s as i32, force);
+        values([Value::Boolean(started)])
     })?;
     // The objects of a kind within a radius of a point (x, y, z, radius),
     // as a list: what the strikes hit (the bunker buster's buildings, the
@@ -2807,23 +2813,33 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let player = lib("Player")?;
+    // From the 360 code (0x8233d400 -> 0x8243d4d0): true when the
+    // boundary has a shape (already held or added), false without one;
+    // nil for bad arguments.
     add(&player, "AddBoundary", |w, _, a| {
-        if let Some(b) = id(a.get(1))
-            && !w.boundaries.contains(&b)
-        {
+        let Some(b) = id(a.get(1)) else {
+            return values([Value::Nil]);
+        };
+        // Kept even without a shape here: a region this world didn't read
+        // may still be one the game has (the 360 keeps only shaped ones).
+        if !w.boundaries.contains(&b) {
             w.boundaries.push(b);
         }
-        values([])
+        values([Value::Boolean(w.regions.contains_key(&b))])
     })?;
     add(&player, "RemoveBoundary", |w, _, a| {
-        if let Some(b) = id(a.get(1)) {
-            w.boundaries.retain(|&x| x != b);
-        }
-        values([])
+        // From the 360 code (0x8233d500 -> 0x8243d770): whether she had it.
+        let Some(b) = id(a.get(1)) else {
+            return values([Value::Nil]);
+        };
+        let had = w.boundaries.contains(&b);
+        w.boundaries.retain(|&x| x != b);
+        values([Value::Boolean(had)])
     })?;
     add(&player, "RemoveAllBoundary", |w, _, _| {
         w.boundaries.clear();
-        values([])
+        // From the 360 code (0x8233d5d8): true.
+        values([Value::Boolean(true)])
     })?;
     // (player, out): sets whether she is out of the play area, without the
     // callback hearing it: `WifVzBoundary`'s interior mode (the HQ) and the
@@ -2912,7 +2928,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.health_clamp = on;
             w.commands.push(Command::HealthClamp(on));
         }
-        values([])
+        // From the 360 code (0x8233d110): true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "SetInputEnabled", |w, _, a| {
         let on = !matches!(a.get(1), Some(Value::Boolean(false)));
@@ -2922,14 +2939,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&player, "SetSurvivalMode", |w, _, a| {
         w.survival_mode = matches!(a.get(1), Some(Value::Boolean(true)));
-        values([])
+        // From the 360 code (0x8233d030): true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "SetBoundaryCallback", |w, _, a| {
         w.boundary_callback = match a.get(1) {
             Some(Value::Function(f)) => Some(f.clone()),
             _ => None,
         };
-        values([])
+        // From the 360 code: true.
+        values([Value::Boolean(true)])
     })?;
     // A new game starts at the usual marker.
     add(&player, "GetPlayerStart", |_, lua, _| {
@@ -2988,14 +3007,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         if let (Some(guid), Some(Value::String(model))) = (id(a.first()), a.get(1)) {
             let model = model.to_string_lossy();
             w.commands.push(Command::Outfit { guid, model });
+            // From the 360 code (0x8233fb90): true.
+            return values([Value::Boolean(true)]);
         }
-        values([])
+        values([Value::Nil])
     })?;
     // Player.SetGrappleEnabled(player, on): the one call site turns it on
     // for each player as the mechanic joins the PMC.
     add(&player, "SetGrappleEnabled", |w, _, a| {
         w.grapple_enabled = !matches!(a.get(1), None | Some(Value::Nil | Value::Boolean(false)));
-        values([])
+        // From the 360 code: true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "GetFuel", |w, _, _| {
         let fuel = w
@@ -3029,7 +3051,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         if !w.vehicle_disguise {
             w.disguise = None;
         }
-        values([])
+        // From the 360 code (0x823401a0's setter): true.
+        values([Value::Boolean(true)])
     })?;
     add(&player, "GetVehicleDisguise", |w, _, _| {
         values([Value::Boolean(w.vehicle_disguise)])
@@ -6806,6 +6829,55 @@ mod tests {
         );
         assert!(ask("return Weapon.SetReserveAmmo(999, 3)").is_nil());
         assert!(ask("return Human.Knockdown(nil, 2)").is_nil());
+    }
+
+    #[test]
+    fn player_and_pursuit_natives_answer_as_the_360_ones_do() {
+        let (host, world) = setup();
+        world.borrow_mut().regions.insert(
+            50,
+            m2_assets::Region {
+                flags: 0x0004_0002,
+                unk_0x04: 0,
+                corners: vec![[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]],
+            },
+        );
+        let lua = host.lua();
+        let ask = |code: &str| -> Value { lua.load(code).eval().unwrap() };
+        let me = "Player.GetLocalPlayer()";
+        for code in [
+            format!("return Player.AddBoundary({me}, 50)"),
+            format!("return Player.RemoveBoundary({me}, 50)"),
+            format!("return Player.RemoveAllBoundary({me})"),
+            format!("return Player.SetHealthClamp({me}, true)"),
+            format!("return Player.SetSurvivalMode({me}, true)"),
+            format!("return Player.SetBoundaryCallback({me}, function() end)"),
+            "return Player.SetOutfit(1, 'outfit')".to_owned(),
+            format!("return Player.SetGrappleEnabled({me}, true)"),
+            "return Player.SetVehicleDisguise(true)".to_owned(),
+            "return Pg.SetPursuit(Pg.GetGuidByName('OC'), 2)".to_owned(),
+            "return Pg.LockPursuit(Pg.GetGuidByName('OC'), 1)".to_owned(),
+        ] {
+            assert_eq!(ask(&code), Value::Boolean(true), "{code}");
+        }
+        assert_eq!(
+            ask(&format!("return Player.AddBoundary({me}, 999)")),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            ask(&format!("return Player.RemoveBoundary({me}, 998)")),
+            Value::Boolean(false)
+        );
+        // Locked: a new pursuit doesn't start.
+        assert_eq!(
+            ask("return Pg.SetPursuit(Pg.GetGuidByName('OC'), 2)"),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            ask("return Pg.SetPursuitSeconds(Pg.GetGuidByName('OC'), 30)"),
+            Value::Boolean(false)
+        );
+        assert!(ask("return Pg.SetPursuit(nil, 2)").is_nil());
     }
 
     #[test]
