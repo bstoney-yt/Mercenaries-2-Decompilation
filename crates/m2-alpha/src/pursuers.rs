@@ -918,7 +918,9 @@ impl Pursuers {
                 let target = boat_attack::Target {
                     sight: Sight {
                         at: her,
-                        unseen: 0.0,
+                        // Its record's +0x8C: since its sight lines to her
+                        // were last clear (below).
+                        unseen: p.unseen,
                         vehicle: in_vehicle,
                     },
                     velocity: her_velocity,
@@ -926,7 +928,7 @@ impl Pursuers {
                     size: she.size,
                     swimming: she.swimming,
                 };
-                let state = p.boat.state;
+                let (state, idle) = (p.boat.state, p.boat.idle);
                 let near = around(physics, &others, &car, (lo, hi));
                 let mut world = Afloat {
                     physics: &*physics,
@@ -947,6 +949,20 @@ impl Pursuers {
                     rand,
                     dt,
                 );
+                if p.boat.idle != idle {
+                    eprintln!(
+                        "pursuers: {} {:#x} {}, {:.0} m from her, {:.0} m from where it last had her",
+                        p.template,
+                        p.entity,
+                        if p.boat.idle {
+                            "BoatIdle"
+                        } else {
+                            "BoatAttack again"
+                        },
+                        car.at.distance(her),
+                        p.boat.last.map_or(0.0, |l| car.at.distance(l))
+                    );
+                }
                 if p.boat.state != state {
                     eprintln!(
                         "pursuers: {} {:#x} BoatAttack {:?} -> {:?}, {:.0} m from her",

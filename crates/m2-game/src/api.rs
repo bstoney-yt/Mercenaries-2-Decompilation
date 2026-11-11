@@ -28,6 +28,10 @@ use crate::script::safe_function;
 pub const FIRST_SPAWNED: u32 = 0x4000_0000;
 /// What crews a vehicle spawned with its driver.
 pub const PILOT: &str = "Pilot";
+/// `Object.GetWinchState`'s names, by state (0x823336E8), and
+/// `Object.SetWinchState`'s (0x823337E8, by their hashes 0xA62D3A27,
+/// 0x07D744CF, 0x0A765168, 0xBB522D10).
+pub const WINCH_STATES: [&str; 4] = ["retracted", "deployed", "deploying", "retracting"];
 /// Guids of object templates start here.
 pub const FIRST_TEMPLATE: u32 = 0x3000_0000;
 /// How far off an object can be seen on screen, metres (inferred: about
@@ -102,6 +106,11 @@ pub struct Object {
     /// Simulated near the player rather than hibernating
     /// ([`ScriptWorld::update_hibernation`]).
     pub awake: bool,
+    /// Its own hibernation distance, whole metres, when a script set one
+    /// (`Object.SetHibernationDistance`); else [`HIBERNATION_DISTANCE`].
+    /// From the 360 code: the engine keeps it per object as a 16-bit
+    /// count, which `Object.GetHibernationDistance` reads back.
+    pub hibernation_distance: Option<u16>,
     /// Hidden by the scripts (`Object.SetVisible(o, false)`): not on
     /// screen.
     pub hidden: bool,
@@ -161,6 +170,13 @@ impl Object {
             .collect()
     }
 
+    /// How near the player must come to wake it, metres: its own
+    /// distance, else [`HIBERNATION_DISTANCE`].
+    pub fn hibernation_distance(&self) -> f32 {
+        self.hibernation_distance
+            .map_or(HIBERNATION_DISTANCE as f32, f32::from)
+    }
+
     pub fn new(name: &str, position: [f32; 3]) -> Self {
         Self {
             fuel: 100.0,
@@ -211,6 +227,9 @@ pub enum Command {
         target: Option<u32>,
         /// Its `Haste`, if given (PmcCon001's garage smash gives 1).
         haste: Option<f32>,
+        /// A `PathMove`'s own settings ([`crate::path_order`]); `None`
+        /// for other goals.
+        path: Option<crate::path_order::PathOrder>,
     },
     ExitVehicle(u32),
     /// A person keeps near `target` (`Ai.Role` `Follow`: a VIP being
@@ -224,6 +243,13 @@ pub enum Command {
     /// Open a gate or door (`Object.OpenGate`): PmcCon001's villa doors
     /// as the player comes near them.
     OpenGate(u32),
+    /// A road junction is opened to traffic or closed (`Pg.EnableIntersection(on,
+    /// object)`): ChiCon002 closes the two segments of the Maracaibo
+    /// bridge it is about to bring down.
+    Intersection {
+        guid: u32,
+        on: bool,
+    },
     /// Shut a gate or door again (`Object.CloseGate`).
     CloseGate(u32),
     /// Whether `guid` may take up its weapons (`Human.DisableWeapons` and
@@ -317,6 +343,12 @@ pub enum Command {
         vehicle: u32,
         seat: String,
         instant: bool,
+    },
+    /// A script set a helicopter's winch state (`Object.SetWinchState`:
+    /// 0 retracted, 1 deployed, 2 deploying, 3 retracting).
+    WinchState {
+        carrier: u32,
+        state: u8,
     },
     /// Hook cargo onto a carrier's winch, or let it go (`carrier` `None`).
     Winch {
@@ -812,6 +844,10 @@ pub struct ScriptWorld {
     pub landing_zones: HashMap<i64, BTreeMap<i64, u32>>,
     /// Cargo on winches: what carries each, `None` once let go.
     pub winch: HashMap<u32, Option<u32>>,
+    /// The helicopters with a winch (a `Winch` component; the 360's
+    /// `PhysicsActorWinch` store 0x83657220) and its state (+0x140: 0
+    /// retracted, 1 deployed, 2 deploying, 3 retracting).
+    pub winches: HashMap<u32, u8>,
     /// What the scripts want on the player's screen.
     pub hud: crate::hud::Hud,
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
@@ -983,9 +1019,45 @@ pub struct ScriptWorld {
     /// its last look (it looks at those `ObjectIsVisible` events wait
     /// for: [`crate::mission::Mission::sight_watched`]).
     pub unseen: HashSet<u32>,
+    /// The vehicles' seats and who sits in which
+    /// ([`crate::vehicle_seats`]).
+    pub seats: crate::vehicle_seats::Seats,
 }
 
 impl ScriptWorld {
+    /// Whether world spot (x, z) is out of the play area
+    /// (`Player.IsPositionOutBoundary`).
+    ///
+    /// From the 360 code (0x8233d860, 0x8243e500): the player's play-area
+    /// boundaries are tested in turn, and the spot is in bounds if any of
+    /// them holds it. With no boundaries at all, nothing is out of bounds.
+    /// The engine keeps exclusion boundaries in a second list (0x8243d4d0
+    /// files a boundary there when its object is marked as one), and this
+    /// test skips that list. It also tests only regions of kinds 2 and 4.
+    ///
+    /// From samples: every region shape in `vz.wad` (625) is of kind 2,
+    /// so that filter passes them all here. Exclusions are told by name
+    /// (see `mission::is_exclusion`).
+    pub fn position_out_of_bounds(&self, x: f32, z: f32) -> bool {
+        let mut any = false;
+        for &b in &self.boundaries {
+            let Some(at) = self.objects.get(&b) else {
+                continue;
+            };
+            if crate::mission::is_exclusion(&at.name) {
+                continue;
+            }
+            let Some(region) = self.regions.get(&b) else {
+                continue;
+            };
+            any = true;
+            if region.contains([at.position[0], at.position[2]], at.yaw, x, z) {
+                return false;
+            }
+        }
+        any
+    }
+
     /// Adds (or replaces) an object scripts can name.
     pub fn insert(&mut self, guid: u32, object: Object) {
         if object.vehicle.is_some() {
@@ -1003,11 +1075,25 @@ impl ScriptWorld {
     /// Puts `guid` aboard `vehicle` as [`Self::put_aboard`], `not_driving`
     /// when it takes a seat other than the driver's ([`Object::not_driving`]).
     pub fn seat(&mut self, guid: u32, vehicle: u32, instant: bool, not_driving: bool) {
+        self.seat_named(guid, vehicle, instant, not_driving, None);
+    }
+
+    /// [`Self::seat`] in the seat named `name` (its `SeatLink` `Name`,
+    /// hashed), when the vehicle has one so named.
+    pub fn seat_named(
+        &mut self,
+        guid: u32,
+        vehicle: u32,
+        instant: bool,
+        not_driving: bool,
+        name: Option<u32>,
+    ) {
         if let Some(o) = self.objects.get_mut(&guid) {
             o.vehicle = Some(vehicle);
             o.seated_instantly = instant;
             o.not_driving = not_driving;
             self.riders.push(guid);
+            self.seats.sit(guid, vehicle, name, !not_driving);
         }
     }
 
@@ -1261,8 +1347,9 @@ impl ScriptWorld {
     }
 
     /// Wakes the objects the player has come within their hibernation
-    /// distance of ([`HIBERNATION_DISTANCE`], every object's until the
-    /// templates' own are read) and puts to sleep those she has left
+    /// distance of (its own, [`Object::hibernation_distance`]; every
+    /// other object's [`HIBERNATION_DISTANCE`] until the templates' own
+    /// are read) and puts to sleep those she has left
     /// [`HIBERNATION_MARGIN`] beyond it: what `Object.IsAwake` and
     /// `Event.ObjectHibernation` read. The engine hibernates what is far
     /// from the player (inferred from the scripts: PmcCon001's gate
@@ -1295,8 +1382,8 @@ impl ScriptWorld {
             return;
         };
         let (at, riding) = (Vec3::from(her.position), her.vehicle);
-        let wake = HIBERNATION_DISTANCE as f32;
         for (g, o) in &mut self.objects {
+            let wake = o.hibernation_distance();
             if o.vehicle.is_some() {
                 self.riders.push(*g);
             }
@@ -1611,6 +1698,13 @@ pub const FACTIONS: [&str; 9] = [
 
 /// [`Object.GetHibernationDistance`]'s answer, metres.
 const HIBERNATION_DISTANCE: f64 = 155.0;
+
+/// A distance as `Object.SetHibernationDistance` keeps it: truncated to
+/// whole metres (the PowerPC's float-to-integer conversion), low 16 bits
+/// (from the 360 code).
+fn hibernation_metres(d: f32) -> u16 {
+    (d as i32) as u16
+}
 
 /// A place argument at `a[i]`: three numbers (x, y, z), else an object's
 /// place; and the index of the argument after it.
@@ -2060,6 +2154,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             None => vec![Value::Nil],
         })
     })?;
+    // Pg.EnableIntersection(on, object): see [`Command::Intersection`].
+    // From the 360 code (82338740): both are needed, and it gives
+    // nothing.
+    add(&pg, "EnableIntersection", |w, _, a| {
+        if let (Some(Value::Boolean(on)), Some(guid)) = (a.first(), id(a.get(1))) {
+            w.commands.push(Command::Intersection { guid, on: *on });
+        }
+        values([])
+    })?;
     add(&pg, "Spawn", |w, _, a| {
         let what = match a.first() {
             Some(Value::String(s)) => s.to_string_lossy(),
@@ -2165,8 +2268,34 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // How far off an object goes to sleep (metres). The deliveries place
     // a helicopter's cargo by it, with 155 as their own fallback: that,
     // until the templates' hibernation data is read.
-    add(&object, "GetHibernationDistance", |_, _, _| {
-        values([Value::Number(HIBERNATION_DISTANCE)])
+    //
+    // From the 360 code (`Object.GetHibernationDistance`, 0x82330de0): an
+    // object without hibernation data answers -1. Here every object in
+    // play has some.
+    add(&object, "GetHibernationDistance", |w, _, a| {
+        let d = id(a.first())
+            .and_then(|g| w.objects.get(&g))
+            .map_or(-1.0, |o| f64::from(o.hibernation_distance()));
+        values([Value::Number(d)])
+    })?;
+    // From the 360 code (`Object.SetHibernationDistance`, 0x82330ea0): the
+    // distance is cut to whole metres and kept in 16 bits in the object's
+    // hibernation data, which the engine then updates; the answer is
+    // whether the object has such data (else nothing changes). PmcCon004
+    // keeps its paradropped APCs awake out to 300 m this way, then waits
+    // for them to wake (`Event.ObjectHibernation`).
+    add(&object, "SetHibernationDistance", |w, _, a| {
+        let set = match (id(a.first()), num(a.get(1))) {
+            (Some(g), Some(d)) => match w.objects.get_mut(&g) {
+                Some(o) => {
+                    o.hibernation_distance = Some(hibernation_metres(d));
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        };
+        values([Value::Boolean(set)])
     })?;
     add(&object, "SetYaw", |w, _, a| {
         if let (Some(guid), Some(yaw)) = (id(a.first()), num(a.get(1))) {
@@ -2188,6 +2317,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => false,
         };
         values([Value::Boolean(inside)])
+    })?;
+    // Object.IsValid(object): whether the call was handed an object at
+    // all (ChiCon009 asks before it stops its ambulance's health bar).
+    // From the 360 code (8232FF50): it does not look the object up.
+    // Inferred: a null guid doesn't count.
+    add(&object, "IsValid", |_, _, a| {
+        values([Value::Boolean(id(a.first()).is_some_and(|g| g != 0))])
     })?;
     add(&object, "IsAlive", |w, _, a| {
         values([Value::Boolean(id(a.first()).is_some_and(|g| w.is_alive(g)))])
@@ -2664,13 +2800,70 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     // Hanging from a winch, not yet let go: a delivery's objective waits
     // for its cargo to be put down, not merely brought over the place.
+    //
+    // From the 360 code (`Object.IsWinched`, 0x82333330): not a boolean.
+    // It walks the object's physics constraints for a rope whose owner's
+    // winch (`PhysicsActorWinch`) holds this object, and answers that
+    // owner (the helicopter); otherwise nil. The deliveries test the
+    // answer against nil (`MrxTaskObjectiveDeliver`'s target setup:
+    // `bWinched = IsWinched(o) ~= nil`), so a false here read as winched.
     add(&object, "IsWinched", |w, _, a| {
+        let carrier = id(a.first()).and_then(|g| w.winch.get(&g).copied().flatten());
+        values([guid_value(carrier)])
+    })?;
+    // A helicopter's winch (0x823331E0..0x823337E8, the store 0x83657220):
+    // whether it has one, its state by name, what hangs on it.
+    add(&object, "HasWinch", |w, _, a| {
         values([Value::Boolean(
-            id(a.first()).is_some_and(|g| w.winch.get(&g).is_some_and(Option::is_some)),
+            id(a.first()).is_some_and(|g| w.winches.contains_key(&g)),
         )])
     })?;
-    // How far the winch is let out: the game's to animate.
-    add(&object, "SetWinchState", |_, _, _| values([]))?;
+    add(&object, "GetWinchState", |w, lua, a| {
+        match id(a.first()).and_then(|g| w.winches.get(&g)) {
+            Some(&s) => values([Value::String(
+                lua.create_string(WINCH_STATES[usize::from(s & 3)])?,
+            )]),
+            None => Err(mlua::Error::runtime("Object.GetWinchState: no winch")),
+        }
+    })?;
+    add(&object, "SetWinchState", |w, _, a| {
+        let state = match a.get(1) {
+            Some(Value::String(s)) => {
+                let h = m2_assets::name_hash(&s.to_string_lossy());
+                WINCH_STATES
+                    .iter()
+                    .position(|n| m2_assets::name_hash(n) == h)
+            }
+            _ => None,
+        };
+        match (id(a.first()), state) {
+            (Some(g), Some(s)) if w.winches.contains_key(&g) => {
+                w.winches.insert(g, s as u8);
+                w.commands.push(Command::WinchState {
+                    carrier: g,
+                    state: s as u8,
+                });
+                values([])
+            }
+            _ => Err(mlua::Error::runtime(
+                "Object.SetWinchState: no winch or state",
+            )),
+        }
+    })?;
+    add(&object, "IsWinching", |w, _, a| {
+        match id(a.first()).filter(|g| w.winches.contains_key(g)) {
+            Some(heli) => {
+                let cargo = w
+                    .winch
+                    .iter()
+                    .filter(|(_, c)| **c == Some(heli))
+                    .map(|(&g, _)| g)
+                    .min();
+                values([guid_value(cargo)])
+            }
+            None => Err(mlua::Error::runtime("Object.IsWinching: no winch")),
+        }
+    })?;
     // No string tables yet: an object's own name.
     add(&object, "GetLocalizedName", |w, lua, a| {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
@@ -2711,6 +2904,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&player, "SetOutBoundary", |w, _, a| {
         w.outside = matches!(a.get(1), Some(Value::Boolean(true)));
         values([])
+    })?;
+    // Player.IsPositionOutBoundary(player, x, y, z): whether a spot is
+    // outside the play area. The PDA's beacon check asks it
+    // (`MrxGuiPda.HandleBeaconCheck`, OilCon020's tutorial): a beacon is
+    // refused out of bounds, and also when this native is missing.
+    add(&player, "IsPositionOutBoundary", |w, _, a| {
+        let Some(_) = id(a.first()) else {
+            return values([Value::Nil]);
+        };
+        let [x, z] = [num(a.get(1)), num(a.get(3))].map(|v| v.unwrap_or(0.0));
+        values([Value::Boolean(w.position_out_of_bounds(x, z))])
     })?;
     // A character's camera: the game's one camera looks over the player,
     // so it is named by her guid, and its yaw is hers (`Camera.GetYaw`:
@@ -2985,13 +3189,19 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([guid_value(id(a.first()).and_then(|g| w.vehicle_of(g)))])
     })?;
     // Vehicle.Usable(vehicle, usable): all three calls in the scripts pass
-    // false, for vehicles the scripts keep for themselves.
+    // false, for vehicles the scripts keep for themselves (two of them a
+    // race's tank, ChiCon008's and PmcCon016's). From the 360 code
+    // (823487C0): it gives whether it was handed a vehicle; with a
+    // vehicle and no second argument it does nothing and gives nothing.
     add(&vehicle, "Usable", |w, _, a| {
-        if let Some(guid) = id(a.first()) {
-            let on = !matches!(a.get(1), Some(Value::Boolean(false)));
-            w.commands.push(Command::Usable { guid, on });
-        }
-        values([])
+        let Some(guid) = id(a.first()) else {
+            return values([Value::Boolean(false)]);
+        };
+        let Some(Value::Boolean(on)) = a.get(1) else {
+            return values([]);
+        };
+        w.commands.push(Command::Usable { guid, on: *on });
+        values([Value::Boolean(true)])
     })?;
     add(&vehicle, "GetRiders", |w, lua, a| {
         let v = id(a.first());
@@ -3027,6 +3237,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 o.seated_instantly = false;
                 o.not_driving = false;
             }
+            w.seats.leave(guid);
             w.commands.push(Command::ExitVehicle(guid));
         }
         values([])
@@ -3041,7 +3252,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => String::new(),
         };
         let instant = matches!(a.get(3), Some(Value::Boolean(true)));
+        // The seat is named by its type's letter (`d`, `p`, `g`, `c`): the
+        // first free seat of that type, else the first of it.
+        let kind = seat.as_bytes().first().copied().unwrap_or(b'd');
         w.seat(guid, vehicle, instant, seat_not_driving(&seat));
+        if let Some(s) = w
+            .seats
+            .by_type(vehicle, kind, true)
+            .or_else(|| w.seats.by_type(vehicle, kind, false))
+        {
+            w.seats.move_to(guid, s);
+        }
         w.commands.push(Command::EnterVehicle {
             guid,
             vehicle,
@@ -3416,12 +3637,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             let data = t.raw_get::<Option<Table>>("CallbackData")?;
             w.goal_callbacks.push((guid, f, data));
         }
+        let path = (goal == "PathMove")
+            .then(|| crate::path_order::PathOrder::read(t))
+            .transpose()?;
         w.commands.push(Command::Goal {
             guid,
             goal,
             location,
             target,
             haste,
+            path,
         });
         values([])
     })?;
@@ -3444,6 +3669,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             location,
             target: None,
             haste: num(a.get(4)),
+            path: None,
         });
         values([])
     })?;
@@ -4454,6 +4680,69 @@ mod tests {
     }
 
     #[test]
+    fn a_scripts_hibernation_distance_is_kept_per_object_in_whole_metres() {
+        // PmcCon004's APC drop: Object.SetHibernationDistance(apc, 300).
+        let (host, world) = setup();
+        let (before, set, after, other, missing, unknown): (f64, bool, f64, f64, bool, f64) = host
+            .lua()
+            .load(
+                "local before = Object.GetHibernationDistance(50)
+                 local set = Object.SetHibernationDistance(50, 300.9)
+                 return before, set, Object.GetHibernationDistance(50),
+                   Object.GetHibernationDistance(1),
+                   Object.SetHibernationDistance(999, 300),
+                   Object.GetHibernationDistance(999)",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(before, HIBERNATION_DISTANCE);
+        // Cut to whole metres, for that object alone.
+        assert!(set);
+        assert_eq!(after, 300.0);
+        assert_eq!(other, HIBERNATION_DISTANCE);
+        // No such object: nothing kept, and -1 for its distance.
+        assert!(!missing);
+        assert_eq!(unknown, -1.0);
+        // Kept in 16 bits, as the engine keeps it.
+        assert_eq!(hibernation_metres(65_536.0 + 12.5), 12);
+        assert_eq!(world.borrow().objects[&50].hibernation_distance, Some(300));
+    }
+
+    #[test]
+    fn an_object_with_a_longer_hibernation_distance_stays_awake_further_off() {
+        let (_host, world) = setup();
+        let mut w = world.borrow_mut();
+        w.objects.get_mut(&50).unwrap().hibernation_distance = Some(300);
+        let gone = HIBERNATION_DISTANCE as f32 + HIBERNATION_MARGIN + 20.0;
+        w.objects.get_mut(&1).unwrap().position = [gone, 0.0, 0.0];
+        w.update_hibernation();
+        assert!(w.is_awake(50));
+        w.objects.get_mut(&1).unwrap().position = [300.0 + HIBERNATION_MARGIN + 1.0, 0.0, 0.0];
+        w.update_hibernation();
+        assert!(!w.is_awake(50));
+        // It wakes at its own distance, not the usual one.
+        w.objects.get_mut(&1).unwrap().position = [290.0, 0.0, 0.0];
+        w.update_hibernation();
+        assert!(w.is_awake(50));
+    }
+
+    #[test]
+    fn custom_events_go_nowhere_in_single_player() {
+        // PmcCon004 tells a co-op partner to change the atmosphere; alone,
+        // the engine sends nothing and answers true.
+        let (host, world) = setup();
+        world.borrow_mut().take_commands();
+        let sent: bool = host
+            .lua()
+            .load("return Net.SendCustomEvent('PmcCon004', 4, {}, true)")
+            .eval()
+            .unwrap();
+        assert!(sent);
+        assert!(world.borrow_mut().take_commands().is_empty());
+        assert!(host.take_calls().is_empty());
+    }
+
+    #[test]
     fn a_spawn_far_off_is_awake_when_the_scripts_next_look() {
         // VzaCon001's weapon drop: the helicopter starts about 190 m from
         // her, and the drop waits for it to be awake before sending it.
@@ -4498,6 +4787,39 @@ mod tests {
         assert_eq!(
             world.borrow_mut().take_commands(),
             [Command::AimMode(false), Command::AimMode(true)]
+        );
+    }
+
+    #[test]
+    fn a_closed_junction_reaches_the_game_and_an_object_is_valid_or_not() {
+        let (host, world) = setup();
+        let (valid, nothing, number): (bool, bool, bool) = host
+            .lua()
+            .load(
+                r#"
+                local bridge = Sys.StringToGuid("568220")
+                Pg.EnableIntersection(false, bridge)
+                Pg.EnableIntersection(true, bridge)
+                Pg.EnableIntersection(bridge)
+                return Object.IsValid(bridge), Object.IsValid(nil), Object.IsValid("bridge")
+                "#,
+            )
+            .eval()
+            .unwrap();
+        // It does not ask whether the object is in the world.
+        assert!(valid && !nothing && !number);
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [
+                Command::Intersection {
+                    guid: 568220,
+                    on: false
+                },
+                Command::Intersection {
+                    guid: 568220,
+                    on: true
+                },
+            ]
         );
     }
 
@@ -4680,6 +5002,28 @@ mod tests {
         // Not in play: not visible. No object named: nothing.
         assert_eq!(unseen, Value::Boolean(false));
         assert_eq!(no_object, Value::Nil);
+    }
+
+    #[test]
+    fn usable_answers_whether_it_was_handed_a_vehicle() {
+        let (host, world) = setup();
+        let (set, none, bare): (Value, Value, Value) = host
+            .lua()
+            .load(
+                "local jeep = Pg.GetGuidByName('_global_veh_jeep 0x0001')\n\
+                 return Vehicle.Usable(jeep, true), Vehicle.Usable(nil, false), \
+                 (Vehicle.Usable(jeep))",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(set, Value::Boolean(true));
+        assert_eq!(none, Value::Boolean(false));
+        // A vehicle and nothing to set it to: nothing done, nothing given.
+        assert_eq!(bare, Value::Nil);
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [Command::Usable { guid: 50, on: true }]
+        );
     }
 
     #[test]
@@ -5420,7 +5764,8 @@ mod tests {
                 goal: "MoveTo".into(),
                 location: Some([4.0, 5.0, 6.0]),
                 target: None,
-                haste: None
+                haste: None,
+                path: None,
             }
         );
         assert!(goal_finished(&world, g).is_empty());
@@ -5462,6 +5807,68 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((truck, bike), (true, false));
+    }
+
+    /// `Player.IsPositionOutBoundary` over the play-area boundaries, and the
+    /// PDA's beacon check built on it (`MrxGuiPda.HandleBeaconCheck`: the
+    /// map's spot less 35 and 40, a beacon allowed when that is in bounds).
+    #[test]
+    fn a_spot_is_out_of_bounds_outside_every_play_area_boundary() {
+        let (host, world) = setup();
+        let lua = host.lua();
+        let out = |x: f64, z: f64| -> Option<bool> {
+            lua.load(format!(
+                "return Player.IsPositionOutBoundary(Player.GetLocalPlayer(), {x}, 0, {z})"
+            ))
+            .eval()
+            .unwrap()
+        };
+        // No boundaries: nowhere is out.
+        assert_eq!(out(5000.0, 5000.0), Some(false));
+        let square = |half: f32| m2_assets::Region {
+            flags: 0x0004_0002,
+            unk_0x04: 0,
+            corners: vec![[-half, -half], [half, -half], [half, half], [-half, half]],
+        };
+        {
+            let mut w = world.borrow_mut();
+            // A play area round OilCon020's tutorial box, and an HQ
+            // exclusion far off (not part of this test).
+            w.insert(80, Object::new("BoundaryVZ", [2750.0, 0.0, -425.0]));
+            w.regions.insert(80, square(500.0));
+            w.insert(81, Object::new("Boundary_ALHQ_Exclusion", [0.0, 0.0, 0.0]));
+            w.regions.insert(81, square(100.0));
+        }
+        lua.load(
+            "local p = Player.GetLocalPlayer() \
+             Player.AddBoundary(p, Pg.GetGuidByName('BoundaryVZ')) \
+             Player.AddBoundary(p, Pg.GetGuidByName('Boundary_ALHQ_Exclusion'))",
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(out(2750.0, -425.0), Some(false));
+        assert_eq!(out(3500.0, -425.0), Some(true));
+        // Inside only the exclusion: the exclusion list isn't tested.
+        assert_eq!(out(0.0, 0.0), Some(true));
+        // Bad arguments: nil.
+        let bad: Option<bool> = lua
+            .load("return Player.IsPositionOutBoundary(nil, 1, 2, 3)")
+            .eval()
+            .unwrap();
+        assert_eq!(bad, None);
+        // The beacon check's answer for a map spot "x,z".
+        let check = |spot: &str| -> bool {
+            lua.load(format!(
+                "local n = {{}} \
+                 for v in string.gmatch('{spot}', '-*%d+') do n[#n + 1] = tonumber(v) end \
+                 local f = Player.IsPositionOutBoundary \
+                 return f ~= nil and not f(Player.GetLocalPlayer(), n[1] - 35, 0, n[2] - 40)"
+            ))
+            .eval()
+            .unwrap()
+        };
+        assert!(check("2785,-385"));
+        assert!(!check("3600,-385"));
     }
 
     #[test]
@@ -5850,7 +6257,7 @@ mod tests {
         ));
         let winched = |host: &ScriptHost| -> bool {
             host.lua()
-                .load(r#"return Object.IsWinched(Sys.StringToGuid("82"))"#)
+                .load(r#"return Object.IsWinched(Sys.StringToGuid("82")) ~= nil"#)
                 .eval()
                 .unwrap()
         };
@@ -5912,7 +6319,7 @@ mod tests {
                 local copter, post = Sys.StringToGuid("80"), Sys.StringToGuid("82")
                 Object.AttachCargoToWinch(post, copter)
                 Event.Create(Event.ObjectWinched, {post, 0, "any"}, function(c)
-                    heard = Object.IsWinched(c)
+                    heard = Object.IsWinched(c) == nil and "free" or "held"
                 end)
                 "#,
             )
@@ -5920,11 +6327,11 @@ mod tests {
             .unwrap();
         events.update_shared(0.1, &world);
         let heard =
-            |host: &ScriptHost| -> Option<bool> { host.lua().globals().get("heard").unwrap() };
+            |host: &ScriptHost| -> Option<String> { host.lua().globals().get("heard").unwrap() };
         assert_eq!(heard(&host), None);
         assert!(arrived(&world, 81, [50.0, 0.0, 60.0]).is_empty());
         events.update_shared(0.1, &world);
-        assert_eq!(heard(&host), Some(false));
+        assert_eq!(heard(&host).as_deref(), Some("free"));
     }
 
     #[test]
@@ -6278,6 +6685,54 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((orig, copy, players), (2, 1, true));
+    }
+
+    #[test]
+    fn is_winched_answers_the_helicopter_or_nil() {
+        // MrxTaskObjectiveDeliver: `bWinched = Object.IsWinched(o) ~= nil`.
+        let (host, _) = setup();
+        let (before, carrier, after, unknown): (bool, bool, bool, bool) = host
+            .lua()
+            .load(
+                "local before = Object.IsWinched(50) == nil
+                 Object.AttachCargoToWinch(50, 1)
+                 local carrier = Object.IsWinched(50) == Sys.StringToGuid('1')
+                 Object.DetachCargoFromWinch(50)
+                 return before, carrier, Object.IsWinched(50) == nil,
+                   Object.IsWinched(999) == nil",
+            )
+            .eval()
+            .unwrap();
+        assert!(before && carrier && after && unknown);
+    }
+
+    #[test]
+    fn a_winch_says_its_state_and_its_cargo() {
+        let (host, world) = setup();
+        world.borrow_mut().winches.insert(1, 0);
+        let (has, none, state, hooked, after, set): (bool, bool, String, bool, bool, String) = host
+            .lua()
+            .load(
+                "local has, none = Object.HasWinch(1), not Object.HasWinch(50)
+                 local state = Object.GetWinchState(1)
+                 Object.AttachCargoToWinch(50, 1)
+                 local hooked = Object.IsWinching(1) == Sys.StringToGuid('50')
+                 Object.DetachCargoFromWinch(50)
+                 local after = Object.IsWinching(1) == nil
+                 Object.SetWinchState(1, 'Deploying')
+                 return has, none, state, hooked, after, Object.GetWinchState(1)",
+            )
+            .eval()
+            .unwrap();
+        assert!(has && none && hooked && after);
+        assert_eq!((state.as_str(), set.as_str()), ("retracted", "deploying"));
+        // The names' hashes are the ones 0x823337E8 compares.
+        let h: Vec<u32> = WINCH_STATES
+            .iter()
+            .map(|n| m2_assets::name_hash(n))
+            .collect();
+        assert_eq!(h, [0xA62D_3A27, 0x07D7_44CF, 0x0A76_5168, 0xBB52_2D10]);
+        assert!(host.lua().load("Object.GetWinchState(50)").exec().is_err());
     }
 
     #[test]

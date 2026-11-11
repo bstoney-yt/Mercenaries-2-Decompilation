@@ -1439,6 +1439,18 @@ impl Road {
         }
     }
 
+    /// How far right of its line each lane of traffic runs, from and to,
+    /// metres, inner first ([`lane_offsets`](Self::lane_offsets)'
+    /// lanes); a road with no `LaneData` but a road's name, its right
+    /// half.
+    pub fn lane_strips(&self) -> Vec<(f32, f32)> {
+        match &self.lanes {
+            Some(l) => l.traffic_strips(self.width / 2.0),
+            None if self.named_road => vec![(0.0, self.width / 2.0)],
+            None => Vec::new(),
+        }
+    }
+
     /// How far each side of its line people walk, metres: its walkways'
     /// middles.
     pub fn walk_offsets(&self) -> Vec<f32> {
