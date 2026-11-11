@@ -189,8 +189,25 @@ pub struct CollisionShape {
     /// without `PHY2` shapes.
     pub entity_box: Option<(Vec3, Vec3)>,
     /// Its standing shapes as laid out, to split them by another preset
-    /// ([CollisionShape::as_preset]); None without PHY2 shapes.
+    /// ([`CollisionShape::as_preset`]); `None` without `PHY2` shapes.
     pub source: Option<Arc<ShapeSource>>,
+    /// Its leaves, as the world's queries meet them, if it shows any. From
+    /// the 360 code: a `PHY2` leaf shape (its class [`FOLIAGE`](m2_assets::physics::FOLIAGE);
+    /// flags bit 3 on a shape that isn't a mesh) takes its preset's seventh
+    /// layer (0x8216C308): 19 for a building or a prop, which the path
+    /// search's sweeps ([`PATH_MASK`](collision_layers::PATH_MASK),
+    /// 0x822E6FD8) and the gunners' sight lines
+    /// ([`SIGHT_MASK`](collision_layers::SIGHT_MASK), 0x822C95D8) both see.
+    /// So an AI's path goes round a bush and its gunner doesn't see through
+    /// one.
+    ///
+    /// In the alpha they stand as a sensor that only those two kinds of query
+    /// meet (its `LEAVES` group): no body bumps into them, people walk through them,
+    /// shots pass. (The 360's filter has layer 19 meet a vehicle's layers 8, 9
+    /// and 11; what a vehicle then does in a bush isn't traced, and the alpha
+    /// keeps driving through it.) A loose prop's leaves would take layer 18
+    /// (its preset has no seventh layer); they are left out.
+    pub leaves: Option<r::SharedShape>,
 }
 
 /// Shapes of a model that no vehicle meets and the world's queries still
@@ -966,6 +983,7 @@ impl CollisionShape {
             ghost: None,
             entity_box: None,
             source: None,
+            leaves: None,
         }
     }
 
@@ -1012,6 +1030,7 @@ impl CollisionShape {
             ghost: None,
             entity_box: None,
             source: None,
+            leaves: None,
         })
     }
 
@@ -1071,6 +1090,7 @@ impl CollisionShape {
             material: self.material,
             entity_box: self.entity_box,
             source: self.source.clone(),
+            leaves: self.leaves.clone().filter(|_| preset != Preset::LooseProp),
             ..shape
         })
     }
@@ -1147,6 +1167,8 @@ impl CollisionShape {
         // other presets ([CollisionShape::as_preset]).
         let mut runs: Vec<ShapeRun> = Vec::new();
         let mut shape_triangles: Vec<[u32; 3]> = Vec::new();
+        // Its leaves' triangles ([`CollisionShape::leaves`]).
+        let mut leaf_triangles: Vec<[u32; 3]> = Vec::new();
         let mut loose = None;
         let mut material = None;
         // Shapes of its own, whether or not any stands in the way: no
@@ -1189,6 +1211,13 @@ impl CollisionShape {
                     *hi = hi.max(x);
                 }
                 if !standing(&p, k, &hidden) {
+                    // Shown but not standing: leaves ([`CollisionShape::leaves`]).
+                    if s.is_foliage() {
+                        let first = vertices.len() as u32;
+                        vertices
+                            .extend(v.iter().map(|&x| to_model.transform_point3(Vec3::from(x))));
+                        leaf_triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
+                    }
                     continue;
                 }
                 let first = vertices.len() as u32;
@@ -1296,6 +1325,7 @@ impl CollisionShape {
                 },
             });
         }
+        shape.leaves = Self::mesh(&vertices, &leaf_triangles).map(|m| m.shape);
         if !runs.is_empty() {
             shape.source = Some(Arc::new(ShapeSource {
                 vertices,
@@ -2227,6 +2257,10 @@ const BED: r::Group = r::Group::GROUP_7;
 /// The collision group of a model's shapes no vehicle meets ([`Ghost`]):
 /// sensors, which every query sees but a wheel's look for the ground.
 const GHOST: r::Group = r::Group::GROUP_8;
+
+/// The collision group of a model's leaves ([`CollisionShape::leaves`]):
+/// sensors that only a path search's queries and AI sight lines see.
+const LEAVES: r::Group = r::Group::GROUP_9;
 
 /// A tracked vehicle's push at `s` of its top speed, of its most: its
 /// curve's points (of its top speed, of its most) in a line between, as
@@ -3180,6 +3214,22 @@ fn solid<'a>() -> r::QueryFilter<'a> {
         r::Group::ALL
             .difference(RAGDOLL)
             .difference(RUBBLE)
+            .difference(BED)
+            .difference(LEAVES),
+        r::InteractionTestMode::And,
+    ))
+}
+
+/// What a path search's queries and AI sight lines see: what [`solid`]
+/// does, and leaves ([`CollisionShape::leaves`]: layer 19 is in
+/// [`PATH_MASK`](collision_layers::PATH_MASK) and
+/// [`SIGHT_MASK`](collision_layers::SIGHT_MASK)).
+fn paths<'a>() -> r::QueryFilter<'a> {
+    r::QueryFilter::default().groups(r::InteractionGroups::new(
+        r::Group::ALL,
+        r::Group::ALL
+            .difference(RAGDOLL)
+            .difference(RUBBLE)
             .difference(BED),
         r::InteractionTestMode::And,
     ))
@@ -3196,7 +3246,8 @@ fn ground<'a>() -> r::QueryFilter<'a> {
             .difference(RUBBLE)
             .difference(CARGO)
             .difference(BED)
-            .difference(GHOST),
+            .difference(GHOST)
+            .difference(LEAVES),
         r::InteractionTestMode::And,
     ))
 }
@@ -3242,6 +3293,8 @@ pub struct Physics {
     /// The pieces of one broken model ([`Physics::group_debris`]): each
     /// piece's body to the model's place and all its pieces' bodies.
     debris_groups: HashMap<r::RigidBodyHandle, (r::Pose, Arc<[r::RigidBodyHandle]>)>,
+    /// Each static's leaves ([`CollisionShape::leaves`]).
+    leaf_colliders: HashMap<StaticKey, r::ColliderHandle>,
     /// Models' collision split by a preset other than the building's
     /// ([`Physics::add_static_as`]), by their source and preset.
     preset_shapes: HashMap<(usize, Preset), Option<CollisionShape>>,
@@ -3314,6 +3367,7 @@ impl Physics {
             boxes: HashMap::new(),
             debris_groups: HashMap::new(),
             preset_shapes: HashMap::new(),
+            leaf_colliders: HashMap::new(),
             controller,
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
@@ -3398,6 +3452,20 @@ impl Physics {
                 self.path_solid.insert(h, g.path.clone());
             }
         }
+        if let Some(leaves) = &shape.leaves {
+            let collider = r::ColliderBuilder::new(leaves.clone())
+                .position(pose(position, rotation))
+                .sensor(true)
+                .collision_groups(r::InteractionGroups::new(
+                    LEAVES,
+                    r::Group::ALL,
+                    r::InteractionTestMode::And,
+                ))
+                .build();
+            let h = insert_collider(&mut self.world, collider, None);
+            self.leaf_colliders.insert(key, h);
+            self.keys.insert(h, key);
+        }
     }
 
     /// [`add_static`](Self::add_static) for a body of `preset` (its
@@ -3429,9 +3497,10 @@ impl Physics {
 
     pub fn remove_static(&mut self, key: StaticKey) {
         let ghost = self.ghosts.remove(&key);
+        let leaves = self.leaf_colliders.remove(&key);
         self.boxes.remove(&key);
         if let Some(h) = self.statics.remove(&key) {
-            for h in std::iter::once(h).chain(ghost) {
+            for h in std::iter::once(h).chain(ghost).chain(leaves) {
                 self.keys.remove(&h);
                 self.surfaces.remove(&h);
                 self.path_solid.remove(&h);
@@ -6219,7 +6288,7 @@ impl Physics {
                 && !matches!(self.path_solid.get(&h), Some(PathSolid::Nothing))
                 && !past.contains(&h)
         };
-        f(solid().predicate(&keep))
+        f(paths().predicate(&keep))
     }
 
     /// What stands fixed in the box from `lo` to `hi` (0x822ED248's
@@ -6343,6 +6412,26 @@ impl Physics {
             }
         }
         Some((pose, out?))
+    }
+
+    /// Whether an AI gunner's sight line from `from` to `to` is clear
+    /// (0x822C95D8's rays, [`SIGHT_MASK`](collision_layers::SIGHT_MASK)):
+    /// as [`line_clear`](Self::line_clear), and leaves block it too
+    /// ([`CollisionShape::leaves`]).
+    pub fn sight_clear(&self, from: Vec3, to: Vec3, skip: Option<VehicleId>) -> bool {
+        let d = to - from;
+        let len = d.length();
+        if len < 1e-4 {
+            return true;
+        }
+        let ray = r::Ray::new(vector(from), vector(d / len));
+        let own = self.bodies_of(skip);
+        let keep =
+            |_: r::ColliderHandle, c: &r::Collider| c.parent().is_none_or(|p| !own.contains(&p));
+        self.world
+            .query_pipeline_with_filter(paths().predicate(&keep))
+            .cast_ray(&ray, len, true)
+            .is_none()
     }
 
     /// Whether the line from `from` to `to` meets nothing solid, passing
@@ -10252,6 +10341,61 @@ mod tests {
         }
     }
 
+    // A bush: a trunk 0.4 m across and leaves 4 m across round it, 12 m
+    // ahead. A path sweep and an AI's sight line meet the leaves (layer 19
+    // in both masks); a shot's line, a wheel's look for the ground and the
+    // car itself go through them.
+    #[test]
+    fn leaves_stand_in_paths_and_sight_lines_alone() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        let mut bush = CollisionShape::cuboid(Vec3::new(0.2, 1.5, 0.2));
+        bush.leaves = Some(r::SharedShape::cuboid(2.0, 1.0, 2.0));
+        p.add_static(
+            StaticKey::Object(4),
+            &bush,
+            Vec3::new(3.0, 1.5, 12.0),
+            Quat::IDENTITY,
+        );
+        p.step(DT);
+        // Past the trunk, through the leaves.
+        let (a, b) = (Vec3::new(4.5, 1.5, 0.0), Vec3::new(4.5, 1.5, 24.0));
+        assert!(
+            p.sweep_obstacle(a, b, Vec3::new(0.1, 0.1, 0.05), None)
+                .is_some(),
+            "a path sweep meets the leaves"
+        );
+        assert!(!p.sight_clear(a, b, None), "an AI doesn't see through them");
+        assert!(p.line_clear(a, b, None), "a shot's line goes through them");
+        let ray = r::Ray::new(vector(Vec3::new(4.5, 5.0, 12.0)), vector(Vec3::NEG_Y));
+        let (_, toi) = p
+            .world
+            .query_pipeline_with_filter(ground())
+            .cast_ray(&ray, 10.0, true)
+            .expect("the floor");
+        assert!(
+            (toi - 5.0).abs() < 0.01,
+            "a wheel stands on the floor, not the leaves: {toi}"
+        );
+        // A car drives through them.
+        let id = p.add_vehicle(&car(), Vec3::new(4.5, 0.1, 0.0), 0.0);
+        for _ in 0..360 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let z = p.vehicle_transform(id).unwrap().w_axis.z;
+        assert!(z > 20.0, "drove through the leaves to {z}");
+        // Gone with it.
+        p.remove_static(StaticKey::Object(4));
+        assert!(p.sight_clear(a, b, None));
+    }
+
     // A broken fence's planks stay its entity's bodies on the 360: a path
     // sweep meeting one plank sizes it up by the box round both, in the
     // fence's frame; a lone piece by its own.
@@ -10345,6 +10489,7 @@ mod tests {
             ghost: None,
             entity_box: None,
             source: None,
+            leaves: None,
         };
         let base = Vec3::new(0.0, 0.0, 12.0);
         p.add_static(StaticKey::Object(7), &pole, base, Quat::IDENTITY);

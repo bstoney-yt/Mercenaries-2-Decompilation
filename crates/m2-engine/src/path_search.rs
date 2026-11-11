@@ -61,9 +61,11 @@
 //! fence ([`PathSolid`](crate::physics::PathSolid)), which a vehicle drives
 //! through and breaks. A model's shapes no vehicle meets (a rock's AI box,
 //! layer 30's AI-only shapes) stand apart as a
-//! [`Ghost`](crate::physics::Ghost), which the sweeps still see. Not
-//! applied: a loose prop's layers (its own preset), and the leaves of
-//! layer 19.
+//! [`Ghost`](crate::physics::Ghost), which the sweeps still see. A prop
+//! takes its own preset's layers
+//! ([`Preset`](crate::collision_layers::Preset)), and leaves (layer 19)
+//! stand as a sensor only the sweeps and AI sight lines meet
+//! ([`CollisionShape::leaves`](crate::physics::CollisionShape::leaves)).
 //!
 //! Two of the 360's checks don't apply to a vehicle's search, so they are
 //! not ported:
