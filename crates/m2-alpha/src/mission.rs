@@ -2773,6 +2773,29 @@ impl MissionLink {
             w.update_script_camera(dt, &height);
             game.script_view = w.script_view().map(|v| (v.eye, v.forward()));
         }
+
+        // The physics bodies the scripts can ask the kind of
+        // (`Object.GetPhysicsType`): hers and the people's (human), the
+        // vehicles' by how they drive.
+        {
+            let mut w = mission.world().borrow_mut();
+            let kinds = &mut w.physics_kinds;
+            kinds.clear();
+            kinds.insert(PLAYER, 1);
+            for n in &game.scene.people.npcs {
+                if let Some(g) = n.spawn {
+                    kinds.insert(g, 1);
+                }
+            }
+            for v in &game.scene.vehicles {
+                if let (Some(g), Some(k)) = (
+                    v.guid,
+                    m2_game::ported_physics::vehicle_physics_kind(&v.spec.kind),
+                ) {
+                    kinds.insert(g, k);
+                }
+            }
+        }
         // A scene's camera shot, from where its two stand now.
         if let Some(mut shot) = game.shot.take() {
             let w = mission.world().borrow();

@@ -427,6 +427,12 @@ pub enum Command {
         guid: u32,
         on: bool,
     },
+    /// `guid` can (no longer) be killed, though it can be hurt: on while
+    /// the scripts hold any reason for it (`Object.SetUnkillable`).
+    Unkillable {
+        guid: u32,
+        on: bool,
+    },
     /// Play a music cue (`mu_fac_pmc_explore_01`), looped unless it is a
     /// one-shot, in place of what plays; `None` stops the music.
     Music(Option<String>),
@@ -906,6 +912,12 @@ pub struct ScriptWorld {
     pub sp: crate::ported_sp::SpState,
     /// Why each object is invincible (`Object.SetInvincible` reasons).
     pub invincible: HashMap<u32, std::collections::BTreeSet<String>>,
+    /// `Object.SetUnkillable`'s reason bits by object ([`crate::ported_physics`]).
+    pub unkillable: HashMap<u32, u16>,
+    /// Each object's physics body kind as the 360 numbers them (0 prop,
+    /// 1 human, 2 car, 3 tank, 4 helicopter, 8 jet, 10 boat...), as the game
+    /// says (`Object.GetPhysicsType`).
+    pub physics_kinds: HashMap<u32, u8>,
     /// The play area's boundaries (`Player.AddBoundary`: story-stage
     /// regions such as `BoundaryIntro`), the callback told when the player
     /// leaves or comes back, and whether the player is out.
@@ -2403,6 +2415,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([crate::events::guid_value(w.spawn(what, position, yaw))])
     })?;
 
+    crate::ported_physics::install(&lib, &add)?;
     let object = lib("Object")?;
     // Whether the player passes for her vehicle's faction (the faction
     // manager then takes the vehicle's faction for hers).
