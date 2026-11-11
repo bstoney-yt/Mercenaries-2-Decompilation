@@ -5495,6 +5495,49 @@ impl Physics {
         }
     }
 
+    /// Shoves a vehicle through its centre of mass: `impulse` (kg m/s),
+    /// world space, on its chassis body.
+    ///
+    /// From the 360 code: a vehicle's physics (car, tank, helicopter and
+    /// boat alike, vtable +0x10 0x82181818) hands the push to its first
+    /// body (0x8216DCC8), which takes it as a linear impulse with no turn
+    /// (0x8262AB60); [`push_vehicle`](Self::push_vehicle) is the same at a
+    /// point (+0x14 0x82181858, 0x8216DD38). Its first body is its
+    /// chassis ([`crate::vehicle::CHASSIS`]).
+    pub fn impulse_vehicle(&mut self, id: VehicleId, impulse: Vec3) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.apply_impulse(vector(impulse), true);
+        }
+    }
+
+    /// A vehicle's mass as its physics reports it (`Object.GetMass`), kg:
+    /// its bodies' masses together (chassis, turret and gun), or 0 while
+    /// any of them does not move (held, [`hold_vehicle`](Self::hold_vehicle)).
+    ///
+    /// From the 360 code: a vehicle's physics (car, tank, helicopter and
+    /// boat alike, vtable +0x60 0x82182418) sums its bodies' masses, each
+    /// one over its inverse mass (0x8262C120), and answers 0 at the first
+    /// body whose inverse mass is 0.
+    pub fn vehicle_mass(&self, id: VehicleId) -> Option<f32> {
+        let v = self.vehicles.get(id.0)?.as_ref()?;
+        let hinge = v.hinge.as_ref();
+        let bodies = std::iter::once(v.controller.chassis)
+            .chain(hinge.map(|h| h.body))
+            .chain(hinge.and_then(|h| h.gun.as_ref()).map(|g| g.body));
+        let mut sum = 0.0;
+        for handle in bodies {
+            let body = self.world.bodies.get(handle)?;
+            if !body.is_dynamic() || body.mass() <= 0.0 {
+                return Some(0.0);
+            }
+            sum += body.mass();
+        }
+        Some(sum)
+    }
+
     /// Lets a skeleton go limp: `parents` and `nodes` (world space, as
     /// posed when it went) give its bones, and every limb starts moving at
     /// `velocity`. Limbs are capsules along bones from
@@ -6494,22 +6537,9 @@ mod tests {
         assert!((a - a1 * 0.5).abs() < 1e-6 && (b - b1 * 0.5).abs() < 1e-6);
     }
 
-    // A turret on its own body follows the angle asked on its hinge's
-    // motor (20 x the angle to go, a second; 0x82273F90): asked to move at
-    // 1 rad/s it keeps up a twentieth of a second behind, and turns the
-    // hull it sits on hardly at all.
-    #[test]
-    fn a_sleeping_gun_wakes_only_when_its_pitch_asked_moves_fast_enough() {
-        // 0x82275608: a sleeping gun's body is woken only when its pitch
-        // speed squared is over 0.005 (about 0.07 radians a second).
-        let mut p = Physics::new();
-        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
-        p.add_static(
-            StaticKey::Cell(1),
-            &ground,
-            Vec3::new(0.0, -1.0, 0.0),
-            Quat::IDENTITY,
-        );
+    /// A car with a turret and a gun on bodies of their own: chassis
+    /// 30 t, turret 3 t, gun 80 kg.
+    fn gun_tank() -> VehicleSpec {
         let cube = |lo: Vec3, hi: Vec3| {
             let mut v = Vec::new();
             for x in [lo.x, hi.x] {
@@ -6521,7 +6551,7 @@ mod tests {
             }
             v
         };
-        let spec = VehicleSpec {
+        VehicleSpec {
             turret_shapes: vec![cube(Vec3::new(-1.0, 1.6, -1.0), Vec3::new(1.0, 2.4, 1.0))].into(),
             turret_mass: Some(crate::vehicle::Chassis {
                 mass: 3000.0,
@@ -6552,7 +6582,64 @@ mod tests {
                 ..car().tuning
             },
             ..car()
-        };
+        }
+    }
+
+    // A turret on its own body follows the angle asked on its hinge's
+    // motor (20 x the angle to go, a second; 0x82273F90): asked to move at
+    // 1 rad/s it keeps up a twentieth of a second behind, and turns the
+    // hull it sits on hardly at all.
+    #[test]
+    fn a_vehicle_s_mass_is_its_bodies_together_and_none_while_held() {
+        // 0x82182418: every body's mass summed; 0 once one does not move.
+        let mut p = Physics::new();
+        let id = p.add_vehicle(&gun_tank(), Vec3::new(0.0, 0.5, 0.0), 0.0);
+        let m = p.vehicle_mass(id).unwrap();
+        assert!((m - 33_080.0).abs() < 1.0, "{m}");
+        p.hold_vehicle(id, true);
+        assert_eq!(p.vehicle_mass(id), Some(0.0));
+        p.hold_vehicle(id, false);
+        assert!((p.vehicle_mass(id).unwrap() - 33_080.0).abs() < 1.0);
+        // A car alone: its chassis.
+        let alone = p.add_vehicle(&car(), Vec3::new(10.0, 0.5, 0.0), 0.0);
+        assert!((p.vehicle_mass(alone).unwrap() - car().mass).abs() < 1.0);
+        assert_eq!(p.vehicle_mass(VehicleId(99)), None);
+    }
+
+    #[test]
+    fn a_vehicle_shoved_through_its_centre_moves_without_turning() {
+        // 0x8216DCC8 -> 0x8262AB60: a linear impulse on the chassis body.
+        let mut p = Physics::new();
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 5.0, 0.0), 0.0);
+        let mass = p.vehicle_mass(id).unwrap();
+        let before = p.vehicle_velocity(id);
+        p.impulse_vehicle(id, Vec3::new(mass * 2.0, 0.0, 0.0));
+        let gained = p.vehicle_velocity(id) - before;
+        assert!((gained.x - 2.0).abs() < 1e-3, "{gained:?}");
+        assert!(p.vehicle_spin(id).length() < 1e-4);
+        // At a point off its centre it also turns.
+        let m = p.vehicle_transform(id).unwrap();
+        p.push_vehicle(
+            id,
+            Vec3::new(mass, 0.0, 0.0),
+            m.transform_point3(Vec3::new(0.0, 0.0, 2.0)),
+        );
+        assert!(p.vehicle_spin(id).length() > 1e-3);
+    }
+
+    #[test]
+    fn a_sleeping_gun_wakes_only_when_its_pitch_asked_moves_fast_enough() {
+        // 0x82275608: a sleeping gun's body is woken only when its pitch
+        // speed squared is over 0.005 (about 0.07 radians a second).
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(200.0, 1.0, 200.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let spec = gun_tank();
         let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.5, 0.0), 0.0);
         for _ in 0..60 {
             p.drive(id, VehicleControls::default());

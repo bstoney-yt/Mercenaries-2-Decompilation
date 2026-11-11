@@ -1360,6 +1360,16 @@ impl Mission {
         self.world.borrow_mut().hijack.set_hardpoint(guid, name, at);
     }
 
+    /// `guid`'s mass as its physics reports it, kg (`Object.GetMass`),
+    /// or `None` once it has none.
+    pub fn set_mass(&mut self, guid: u32, mass: Option<f32>) {
+        let mut w = self.world.borrow_mut();
+        match mass {
+            Some(m) => w.masses.insert(guid, m),
+            None => w.masses.remove(&guid),
+        };
+    }
+
     pub fn hold(&mut self, button: u32, down: bool) {
         let at = down.then_some(self.now);
         self.world.borrow_mut().hijack.hold(button, at);

@@ -2952,9 +2952,13 @@ impl MissionLink {
                 }
             }
             // The scripts' vehicles' load beds, where they count the goods
-            // on them (`Object.GetHardpointPosition(truck, "HP_Truckbed")`).
+            // on them (`Object.GetHardpointPosition(truck, "HP_Truckbed")`),
+            // and their mass (`Object.GetMass`, the jump and boost scripts').
             if let Some(world) = game.scene.world.as_ref() {
                 for v in &game.scene.vehicles {
+                    if let Some(g) = v.guid {
+                        mission.set_mass(g, v.id.and_then(|id| world.physics.vehicle_mass(id)));
+                    }
                     if let (Some(g), Some(id)) = (v.guid, v.id)
                         && let Some(bed) = game.bed(v.spec.model)
                         && let Some(t) = world.physics.vehicle_transform(id)
@@ -6133,6 +6137,43 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             .position(|v| v.guid == Some(*guid))
     };
     match c {
+        // The scripts push one of their vehicles (`Object.ApplyImpulse`,
+        // `Object.ApplyPointImpulse`): in its own space turned (and the
+        // point placed) by its transform first, as the 360 natives do.
+        Command::Impulse {
+            guid,
+            impulse,
+            local,
+        } => {
+            if let Some(id) = index(guid).and_then(|i| game.scene.vehicles[i].id)
+                && let Some(world) = game.scene.world.as_mut()
+                && let Some(t) = world.physics.vehicle_transform(id)
+            {
+                let mut push = Vec3::from(*impulse);
+                if *local {
+                    push = t.transform_vector3(push);
+                }
+                world.physics.impulse_vehicle(id, push);
+            }
+        }
+        Command::PointImpulse {
+            guid,
+            impulse,
+            point,
+            local,
+        } => {
+            if let Some(id) = index(guid).and_then(|i| game.scene.vehicles[i].id)
+                && let Some(world) = game.scene.world.as_mut()
+                && let Some(t) = world.physics.vehicle_transform(id)
+            {
+                let (mut push, mut at) = (Vec3::from(*impulse), Vec3::from(*point));
+                if *local {
+                    push = t.transform_vector3(push);
+                    at = t.transform_point3(at);
+                }
+                world.physics.push_vehicle(id, push, at);
+            }
+        }
         // Seated in one of the scripts' vehicles that is placed: drive it.
         Command::EnterVehicle { guid, vehicle, .. } if *guid == PLAYER => {
             if let Some(i) = index(vehicle).filter(|&i| game.scene.vehicles[i].id.is_some())
