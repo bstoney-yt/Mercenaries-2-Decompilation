@@ -55,6 +55,13 @@
 //!
 //! # Provenance
 //!
+//! From the 360 code: the sunlight's colour ([`Atmosphere::sun_light`],
+//! 0x821B5000: the air's toll on sunlight at the sun's height times
+//! `LightMultiplier` and `LightIntensity`) and the air's Rayleigh and Mie
+//! scattering with their multipliers (0x821B51F0). The record fields
+//! behind the code's light state were matched through the game's blend
+//! between two records (0x8224C398) and its record layout (0x823F6088).
+//!
 //! The field names come from matching name hashes; what each one does is
 //! read from its name and from the game's pixel shaders (ambient cube
 //! faces in the order +x, -x, +y, -y, +z, -z: the `Default` cube is
@@ -97,6 +104,12 @@ pub struct Atmosphere {
     pub inscattering: f32,
     pub extinction: f32,
     pub mie: f32,
+    /// `ScatterBetaRayMultiplier`: the scale on the air's Rayleigh
+    /// scattering ([`RAYLEIGH`]; 0.04 to 0.3 in the records).
+    pub ray: f32,
+    /// `ScatterTurbinity` (the game's spelling): the haze in the
+    /// sunlight's path ([`Atmosphere::sun_light`]); 0 in every record but one.
+    pub turbidity: f32,
     pub hg_g: f32,
     /// `AtmosphereForce`, `AtmosphereLimit`, `HazeForce` and `HazeLimit`:
     /// the haze's two layers of air, each as thick as its limit (metres)
@@ -329,6 +342,8 @@ impl Atmosphere {
             inscattering: float("ScatterInscatteringMultiplier").unwrap_or(0.0),
             extinction: float("ScatterExtinctionMultiplier").unwrap_or(0.0),
             mie: float("ScatterBetaMieMultiplier").unwrap_or(0.0),
+            ray: float("ScatterBetaRayMultiplier").unwrap_or(0.0),
+            turbidity: float("ScatterTurbinity").unwrap_or(0.0),
             hg_g: float("ScatterHgG").unwrap_or(0.0),
             haze_layers: (|| {
                 Some([
@@ -455,6 +470,8 @@ impl Atmosphere {
             inscattering: f(self.inscattering, to.inscattering),
             extinction: f(self.extinction, to.extinction),
             mie: f(self.mie, to.mie),
+            ray: f(self.ray, to.ray),
+            turbidity: f(self.turbidity, to.turbidity),
             hg_g: f(self.hg_g, to.hg_g),
             haze_layers: match (self.haze_layers, to.haze_layers) {
                 (Some(a), Some(b)) => Some(std::array::from_fn(|i| f(a[i], b[i]))),
@@ -620,17 +637,11 @@ impl Atmosphere {
         // `M2_LIGHTING=linear` sums the light in linear light, with the
         // sun's colour taken as linear, as before, for comparison.
         lighting.gamma_light = gamma_light();
-        // `LightIntensity` dims the sky's haze, but not the sun on
-        // surfaces or clouds: in the sun's colour, at Guanare's 0.3
-        // the town's sunlit road was 1.2 times as bright as its shadow
-        // against 1.4 to 2.8 in footage, and without it 1.5; left out of
-        // the sky too, the night sky was half as bright again as footage
-        // (PC rounds A and W). Inferred. `M2_SUN=li` puts it in the sun's
-        // colour throughout, `M2_SUN=full` nowhere.
-        let mode = std::env::var("M2_SUN").unwrap_or_default();
-        let full = mode != "li";
-        let intensity = if full { 1.0 } else { self.light_intensity };
-        let sun = self.light_color * intensity;
+        // The sun's colour as the game's code reckons it (from the 360
+        // code, 0x821B5000): `LightMultiplier` times `LightIntensity`
+        // times what the air leaves of sunlight at the sun's height. The
+        // shaders take it as it is, a display value.
+        let sun = self.sun_light();
         lighting.sun_color = if lighting.gamma_light {
             decode(sun)
         } else {
@@ -638,14 +649,10 @@ impl Atmosphere {
         };
         lighting.haze = self.haze();
         lighting.clouds.tone = self.tone;
-        // The game's haze shaders take the sun's colour and nothing of
-        // LightIntensity (PC round R); `M2_HAZE_LI=on` dims it by that in
-        // display values all the same.
-        if lighting.haze.layers.is_some() {
-            if env_is("M2_HAZE_LI", "on") {
-                lighting.haze.inscattering *= self.light_intensity.max(0.0);
-            }
-        } else if mode != "li" && mode != "full" {
+        // The game's haze shaders take the sun's colour, which holds
+        // `LightIntensity` (above); every record has haze layers. Without
+        // them (no record), the older haze is dimmed by it as before.
+        if lighting.haze.layers.is_none() {
             let li = self.light_intensity.max(0.0);
             // `M2_SKY_LI=linear` dims the haze by the intensity itself
             // rather than its decoded value (0.3 rather than 0.07 at
@@ -738,18 +745,17 @@ impl Atmosphere {
         });
     }
 
-    /// The haze these settings describe: Hoffman and Preetham's standard
-    /// Rayleigh and Mie scattering (Mie for a turbidity of 2), scaled by
-    /// the `Scatter...` multipliers. That the game's multipliers apply to
-    /// these standard coefficients is inferred: its shaders take the
-    /// products from code. On their own they haze land a few percent per
-    /// kilometre; [`HAZE_DENSITY`] thickens that to match footage.
+    /// The haze these settings describe: the game's Rayleigh and Mie
+    /// scattering ([`RAYLEIGH`], [`MIE`]) times `ScatterBetaRayMultiplier`
+    /// and `ScatterBetaMieMultiplier`, as its code hands them to the
+    /// shaders (from the 360 code, 0x821B51F0 and 0x821B5728).
+    /// [`HAZE_DENSITY`] applies only to the older haze without layers.
     pub fn haze(&self) -> Haze {
         if self.inscattering <= 0.0 {
             return Haze::default();
         }
         Haze {
-            rayleigh: RAYLEIGH,
+            rayleigh: RAYLEIGH * self.ray,
             // `M2_MIE=<x>` scales the haze's Mie scattering alone, to test
             // the sunset's glow about the sun (PC round Q: ours has none).
             mie: MIE
@@ -1071,12 +1077,52 @@ impl AtmosphereMix {
 /// 2 km away is about half haze, as in PC footage of the game (the game's
 /// own density comes from code).
 const HAZE_DENSITY: f32 = 4.0;
-/// Rayleigh scattering of air per metre at 650, 570 and 475 nm.
-const RAYLEIGH: Vec3 = Vec3::new(6.95e-6, 1.18e-5, 2.44e-5);
-/// Mie scattering per metre at the same wavelengths for a turbidity of 2,
-/// before the game's multiplier: `0.434 c pi (2 pi / lambda)^2 K` with
-/// `c = (0.6544 T - 0.6510) 1e-16`.
-const MIE: Vec3 = Vec3::new(5.75e-3, 7.39e-3, 1.045e-2);
+/// The air's Rayleigh scattering at 650, 570 and 475 nm before
+/// `ScatterBetaRayMultiplier` scales it. From the 360 code (0x821B51F0,
+/// constants at 0x820F9300..08).
+const RAYLEIGH: Vec3 = Vec3::new(6.971_528e-4, 1.178_913_7e-3, 2.444_595_8e-3);
+/// The air's Mie scattering at the same wavelengths before
+/// `ScatterBetaMieMultiplier` scales it. From the 360 code (0x821B51F0,
+/// constants at 0x820F92DC..E4).
+const MIE: Vec3 = Vec3::new(5.740_597e-3, 7.399_686_6e-3, 1.051_431_2e-2);
+
+/// The game's own pi, as its code writes it where it turns `LightTime`
+/// into the sun's angle (0x821B5608, constant at 0x820F8C7C).
+#[allow(clippy::approx_constant)]
+const CODE_PI: f32 = 3.141;
+
+/// The wavelengths (micrometres) of the sunlight's red, green and blue,
+/// as the game reckons what the air leaves of it. From the 360 code
+/// (0x821B5000, constants at 0x820F8DF0..F8).
+const SUN_WAVELENGTHS: [f32; 3] = [0.65, 0.57, 0.475];
+
+impl Atmosphere {
+    /// The sunlight's colour, as the game's code reckons it each frame
+    /// (from the 360 code, 0x821B5000, called from 0x821B5608): what the
+    /// air leaves of sunlight at the sun's height, per wavelength `l`,
+    /// `exp(-0.008735 m l^-2.255) * exp(-b m l^-1.9125)`, with
+    /// `b = 0.04608366 T - 0.04586026` for `ScatterTurbinity` `T` and the
+    /// optical mass `m = 1 / (cos z + 0.15 (93.885 - z)^-1.9066249)` for
+    /// the sun's angle `z` from overhead (degrees in the second term),
+    /// times `LightMultiplier` and `LightIntensity`, each channel at
+    /// least 0. `ScatterTurbinity` is 0 in all records but one, which
+    /// makes `b` below 0: the light comes out a little stronger and bluer
+    /// than `LightMultiplier` as the sun sinks, as the code has it.
+    pub fn sun_light(&self) -> Vec3 {
+        // The sun's angle from overhead, as in `sun_direction`'s source
+        // (0x821B5608): |LightTime - 0.5| times 3.141.
+        let z = (self.light_time[0] - 0.5).abs() * CODE_PI;
+        let b = 0.046_083_66 * self.turbidity - 0.045_860_26;
+        let deg = z * 57.295_83;
+        let m = 1.0 / (z.cos() + 0.15 * (93.885 - deg).max(1e-3).powf(-1.906_625));
+        let left = SUN_WAVELENGTHS.map(|l| {
+            let rayleigh = (-0.008_735 * m * l.powf(-2.255)).exp();
+            let haze = (-b * m * l.powf(-1.9125)).exp();
+            rayleigh * haze
+        });
+        (Vec3::from_array(left) * self.light_color * self.light_intensity).max(Vec3::ZERO)
+    }
+}
 
 /// What a record colour is for: light on surfaces (ambient, rim) or the
 /// water and post pass (depth colour map, monochrome ramp).
@@ -1182,6 +1228,8 @@ mod tests {
             inscattering: 0.0,
             extinction: 0.0,
             mie: 0.0,
+            ray: 0.0,
+            turbidity: 0.0,
             hg_g: 0.0,
             haze_layers: None,
             tone: Vec3::ONE,
@@ -1221,6 +1269,71 @@ mod tests {
         assert!(low.y < 0.0 && high.y < 0.0);
         assert!(low.normalize().dot(-SUN_SETS.normalize()) > 0.9);
         assert!(high.normalize().y < -0.99);
+    }
+
+    #[test]
+    fn sunlight_is_the_codes_colour_times_light_intensity() {
+        // The island's default record: LightTime 0.2, LightIntensity 1.15,
+        // white LightMultiplier, ScatterTurbinity 0 (0x821B5000 by hand:
+        // optical mass 1.70 at 54 degrees from overhead).
+        let default = Atmosphere {
+            light_intensity: 1.15,
+            ..plain(0.2, 0.0)
+        };
+        let sun = default.sun_light();
+        let want = Vec3::new(1.320, 1.371, 1.468);
+        assert!((sun - want).abs().max_element() < 0.01, "{sun}");
+        // With no turbidity the sun overhead is a little over white and
+        // grows stronger and bluer as it sinks.
+        let noon = Atmosphere {
+            light_intensity: 1.15,
+            ..plain(0.5, 0.0)
+        }
+        .sun_light()
+            / 1.15;
+        assert!(
+            (noon - Vec3::new(1.085, 1.11, 1.154)).abs().max_element() < 0.01,
+            "{noon}"
+        );
+        assert!(sun.z / 1.15 > noon.z && sun.z > sun.x);
+        // It scales with LightIntensity and LightMultiplier.
+        let dim = Atmosphere {
+            light_intensity: 0.3,
+            light_color: Vec3::new(1.05, 0.9, 0.7),
+            ..plain(0.2, 0.0)
+        };
+        let ratio = dim.sun_light() / sun;
+        assert!(
+            (ratio - Vec3::new(1.05, 0.9, 0.7) * 0.3 / 1.15)
+                .abs()
+                .max_element()
+                < 1e-4
+        );
+        // A haze in the sun's path (ScatterTurbinity) reddens a low sun.
+        let hazy = Atmosphere {
+            light_intensity: 1.0,
+            turbidity: 4.0,
+            ..plain(0.05, 0.0)
+        };
+        let s = hazy.sun_light();
+        assert!(s.x > s.z && s.z < 0.5, "{s}");
+    }
+
+    #[test]
+    fn rayleigh_scattering_follows_its_multiplier() {
+        let a = Atmosphere {
+            inscattering: 15.0,
+            ray: 0.0832,
+            mie: 0.01,
+            ..plain(0.2, 0.0)
+        };
+        let h = a.haze();
+        assert!((h.rayleigh - RAYLEIGH * 0.0832).abs().max_element() < 1e-9);
+        assert!((h.mie - MIE * 0.01).abs().max_element() < 1e-9);
+        // About as much Rayleigh as Mie in red at the island's default,
+        // two and a half times as much in blue.
+        assert!((h.rayleigh.x / h.mie.x - 1.01).abs() < 0.02);
+        assert!(h.rayleigh.z / h.mie.z > 1.9);
     }
 
     #[test]
