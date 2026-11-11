@@ -338,6 +338,9 @@ pub struct GameData {
     /// Templates' labels (name hashes) by the template's name in lower
     /// case, for objects the scripts spawn.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// The layers' `PhysicalLink` records by parent entity: (link name
+    /// hash, child entity) ([`crate::links::physical_links`]).
+    pub physical_links: HashMap<u32, Vec<(u32, u32)>>,
     /// Every template's name in the template database, in lower case:
     /// the names scripts look templates up by (`Pg.GetGuidByName("OC")`).
     pub template_names: std::collections::HashSet<String>,
@@ -486,6 +489,9 @@ impl GameData {
                         .map(|c| riders(c))
                         .unwrap_or_default();
                     let placements = layer.placements();
+                    for (parent, link) in crate::links::physical_links(&layer) {
+                        data.physical_links.entry(parent).or_default().push(link);
+                    }
                     let mut own = labels_of(layer.component("Label"));
                     for (guid, entity) in layer.names() {
                         let p = placements.get(&guid);
@@ -693,6 +699,7 @@ impl Mission {
             shapes,
             strings,
             template_labels,
+            physical_links,
             template_names,
             template_drivers,
             template_passengers,
@@ -720,6 +727,7 @@ impl Mission {
                 .into_iter()
                 .map(|(a, b, r)| ((a.to_ascii_lowercase(), b.to_ascii_lowercase()), r))
                 .collect();
+            w.physical_links = physical_links;
             w.template_names = template_names;
             w.template_drivers = template_drivers;
             w.template_passengers = template_passengers;
@@ -2610,6 +2618,18 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             o.label_hashes.clone_from(&e.labels);
             o.faction = e.faction;
             w.insert(e.guid, o);
+            // Its data-authored links (`PhysicalLink`), made as it is
+            // placed, as the 360's instancing (0x82408c30) makes them.
+            if let Some(links) = w.physical_links.get(&e.guid).cloned() {
+                for (key, child) in links {
+                    w.links.insert(crate::links::Link {
+                        parent: e.guid,
+                        hardpoint: child,
+                        key,
+                        child,
+                    });
+                }
+            }
             if e.script == Some(FRIENDLY_GATE) {
                 w.gates.insert(e.guid);
             }
@@ -2627,6 +2647,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             }
         } else {
             w.crews.remove(&e.guid);
+            w.links.remove(e.guid);
             w.placed_as.remove(&e.guid);
             w.gates.remove(&e.guid);
             w.crew_riders.retain(|_, v| *v != e.guid);

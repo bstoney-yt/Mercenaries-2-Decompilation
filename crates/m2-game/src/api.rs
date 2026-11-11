@@ -843,6 +843,11 @@ pub struct ScriptWorld {
     /// The outlines of region objects (`LineRegion`), by the region's guid;
     /// placed at the object's position and yaw.
     pub regions: HashMap<u32, m2_assets::Region>,
+    /// The object link table ([`crate::links`]).
+    pub links: crate::links::Links,
+    /// The layers' data-authored links by parent entity: (link name hash,
+    /// child entity), made into [`Self::links`] as the parent is placed.
+    pub physical_links: HashMap<u32, Vec<(u32, u32)>>,
     /// What `Pg.GetAllLandingZones(kind)` answers, by kind: the zones by
     /// their number. The transit script reads kinds 1 and 2 (where each
     /// player lands) as tables keyed alike.
@@ -2720,6 +2725,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&report, "SetDelay", |_, _, _| values([]))?;
     // Weapons as objects: a loadout of templates, each weapon with its own
     // reserve of ammunition.
+    crate::links::install(&lib, &add)?;
     let human = lib("Human")?;
     // Human.SetAllowCorpseCleanup(character, allow): whether the game may
     // clear its body away (the verify objective keeps a target's until it
