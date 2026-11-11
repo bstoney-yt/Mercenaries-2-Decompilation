@@ -43,6 +43,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use m2_engine::ai_anchor::{ANCHORING_SPAWNER, Anchor, SPAWNER_RADIUS};
 use m2_engine::population::SpawnerSlot;
 use m2_engine::tuning::HandGun;
 use m2_engine::weapons::{FireHint, NpcLauncher};
@@ -1127,6 +1128,10 @@ pub struct Npc {
     since_shot: f32,
     /// Running from gunfire: where to, and for how much longer.
     flee: Option<(Vec3, f32)>,
+    /// The point and radius they are held within, if any
+    /// ([`m2_engine::ai_anchor`]): the scripts' (`Ai.Anchor`), or their
+    /// spawner's.
+    pub anchor: Option<Anchor>,
     /// Put out of a vehicle's seat ([`People::put_out`]): no spawn keeps
     /// them, so they go once out of range.
     put_out: bool,
@@ -1384,6 +1389,7 @@ impl Npc {
             burst: 0,
             since_shot: f32::INFINITY,
             flee: None,
+            anchor: None,
             put_out: false,
             down: None,
             brain,
@@ -1782,6 +1788,13 @@ impl Npc {
     /// they slide 0.4 s ([`m2_engine::on_foot::RunStop`]).
     fn move_dry(&mut self, physics: &Physics, wanted: Vec3, dt: f32) {
         use m2_engine::on_foot;
+        // Anchored, they go no further from their anchor than its radius:
+        // where the step would take them is clamped as the 360 clamps
+        // where its people want to go (822C0800).
+        let wanted = match &self.anchor {
+            Some(anchor) => anchor.hold(self.character.position, wanted, dt),
+            None => wanted,
+        };
         let asked = Vec2::new(wanted.x, wanted.z);
         let full = self.motion.full_speed().max(1e-4);
         let (_, pace) = on_foot::pace(&self.motion, asked.length() / full, false, 1.0, false);
@@ -2986,6 +2999,9 @@ pub struct People {
     /// What the scripts changed of each object's attached spawners, by
     /// the object ([`People::tweak_spawners`]).
     spawner_records: HashMap<u32, SpawnerRecord>,
+    /// Anchors the scripts gave, by entity (`Ai.Anchor`): theirs when
+    /// they stand, too.
+    anchors: HashMap<u32, Anchor>,
     /// Each spawner's roll against its chance of staying out, by spawn
     /// entity: made once, and again after its object's record changes.
     spawner_rolls: HashMap<u32, f32>,
@@ -4930,6 +4946,26 @@ impl People {
         })
     }
 
+    /// The scripts anchor person `entity` (`Ai.Anchor`): within `radius`
+    /// metres of `at`, or of where they stand if no place was given.
+    /// Whether there was a place to anchor to (one not in play, and no
+    /// place given: no).
+    pub fn anchor(&mut self, entity: u32, at: Option<Vec3>, radius: f32) -> bool {
+        let live = self
+            .npcs
+            .iter_mut()
+            .find(|n| n.spawn == Some(entity) && n.alive);
+        let Some(at) = at.or_else(|| live.as_ref().map(|n| n.character.position)) else {
+            return false;
+        };
+        let anchor = Anchor { at, radius };
+        self.anchors.insert(entity, anchor);
+        if let Some(n) = live {
+            n.anchor = Some(anchor);
+        }
+        true
+    }
+
     /// The scripts changed object `owner`'s attached spawners
     /// (`Ai.TweakAttachedSpawners`): its record as it now stands, empty
     /// for none. Its spawners roll their chance of staying out anew.
@@ -5218,6 +5254,18 @@ impl People {
             };
             npc.launcher = if listed { None } else { s.launcher };
             npc.outfit = self.dress(kind, s);
+            // Anchored by the scripts before they stood, else by their
+            // spawner if it is of the type that anchors whom it sends
+            // (from the 360 code, 82243320: to its place, within 50 m).
+            npc.anchor = self.anchors.get(&s.entity).copied().or_else(|| {
+                self.spawner_slots
+                    .get(&s.entity)
+                    .filter(|slot| slot.kind == ANCHORING_SPAWNER)
+                    .map(|_| Anchor {
+                        at: s.position,
+                        radius: SPAWNER_RADIUS,
+                    })
+            });
             self.tell(s, &npc);
             self.npcs.push(npc);
         }
@@ -5816,6 +5864,7 @@ pub(crate) mod tests {
             group: 3,
             state,
             chance_not_active: chance,
+            kind: 0,
         };
         // Untouched by the scripts: its own state, then its own chance.
         assert!(spawner_starts(&slot(1, 0), None, 0.0));
@@ -5909,6 +5958,7 @@ pub(crate) mod tests {
                     group: 3,
                     state: 1,
                     chance_not_active: 0,
+                    kind: 0,
                 },
             );
         }
@@ -5933,6 +5983,81 @@ pub(crate) mod tests {
         let mut out: Vec<u32> = people.npcs.iter().filter_map(|n| n.spawn).collect();
         out.sort_unstable();
         assert_eq!(out, [9, extra]);
+    }
+
+    #[test]
+    fn an_anchored_soldier_goes_no_further_than_the_radius() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.add_kind(kind("VZ Soldier", true));
+        let spawns = [SpawnPoint {
+            list: vec![("VZ Soldier".into(), 0x45cc, 1.0)],
+            cycle: Some(10.0),
+            ..spawn(9, "spawner", 40.0)
+        }];
+        let dt = 1.0 / 60.0;
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, dt);
+        let home = people.npcs[0].character.position;
+        // Not in play and no place given: nothing to anchor to.
+        assert!(!people.anchor(77, None, 5.0));
+        // Anchored where he stands, within 5 m.
+        assert!(people.anchor(9, None, 5.0));
+        let n = &mut people.npcs[0];
+        assert_eq!(n.anchor.map(|a| a.radius), Some(5.0));
+        // Told to walk off for 20 s, he is still within the radius.
+        for _ in 0..(20.0 / dt) as usize {
+            n.move_dry(&physics, Vec3::new(3.0, 0.0, 0.0), dt);
+        }
+        let gone = (n.character.position - home).with_y(0.0).length();
+        assert!(gone <= 5.0 + 0.05, "{gone} m from his anchor");
+        assert!(gone > 4.0, "he may go as far as the radius: {gone} m");
+        // Radius 0, as OilCon001 anchors its executive: he holds the spot.
+        assert!(people.anchor(9, Some(home), 0.0));
+        let n = &mut people.npcs[0];
+        n.character.position = home;
+        for _ in 0..(5.0 / dt) as usize {
+            n.move_dry(&physics, Vec3::new(3.0, 0.0, 0.0), dt);
+        }
+        assert!((n.character.position - home).with_y(0.0).length() < 0.3);
+    }
+
+    #[test]
+    fn a_spawner_of_the_anchoring_type_anchors_whom_it_sends() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.add_kind(kind("VZ Soldier", true));
+        let point = |entity, x| SpawnPoint {
+            list: vec![("VZ Soldier".into(), 0x45cc, 1.0)],
+            cycle: Some(10.0),
+            ..spawn(entity, "spawner", x)
+        };
+        let spawns = [point(9, 40.0), point(10, 60.0)];
+        for (entity, kind) in [(9, ANCHORING_SPAWNER), (10, 2)] {
+            people.spawner_slots.insert(
+                entity,
+                SpawnerSlot {
+                    owner: entity,
+                    group: 0,
+                    state: 1,
+                    chance_not_active: 0,
+                    kind,
+                },
+            );
+        }
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        let anchor_of = |e| {
+            people
+                .npcs
+                .iter()
+                .find(|n| n.spawn == Some(e))
+                .unwrap()
+                .anchor
+        };
+        let a = anchor_of(9).expect("anchored by its spawner");
+        assert_eq!(a.radius, SPAWNER_RADIUS);
+        assert_eq!(a.at, spawns[0].position);
+        // Another type of spawner anchors nobody.
+        assert_eq!(anchor_of(10), None);
     }
 
     #[test]
