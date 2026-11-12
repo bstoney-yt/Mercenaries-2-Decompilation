@@ -15,9 +15,21 @@
 //! loading, the mission's fade), and [`LoadingScreen`] runs the movie
 //! with [`m2_assets::flash`] and draws it.
 //!
-//! The hints are 57 strings of the English table (`shell.wad`), stored
-//! one after another; their ids are not known, so [`HINTS`] lists their
-//! keys (hashes) in stored order.
+//! The hints are strings of the English table (`shell.wad`):
+//! `Loading.Set1.006` to `Loading.Set1.057`, the [`HINTS`] the engine's
+//! count finds ([`hint_key`]). The table also has `Loading.Set1.001` to
+//! `005`, which the engine's count, starting at 006, never shows.
+//!
+//! From the 360 code, the GUI's update (`0x8236E248`) and its hint sender
+//! (`0x82370340`): while hints are on (`Gui.ShowLoadingHints`,
+//! `0x8231C678`) a timer runs; from 3 s on, each 10 s is one of 7 slots,
+//! and a slot not yet filled gets the next hint, so a screen shows its
+//! first hint 3 s after its wipe, one more every 10 s, and no more than
+//! 7. The hints are counted once by looking up `Loading.Set1.%03d` from
+//! 006 until one is missing; the next is the profile's own counter, kept
+//! across screens, modulo that count. The action line is the string
+//! `SHELL.LoadingHints.ActionLoading`. Turning hints off clears the
+//! line and the slots.
 //!
 //! # Provenance
 //!
@@ -30,11 +42,9 @@
 //! - From the PC footage: the wipe in plays at 30 frames a second (the
 //!   footage's frames line up one to one with the movie's at 12:59); its
 //!   wipe back ran faster there (about 10 footage frames), not matched.
-//! - From the PC footage: a hint is up at the start (the first stored,
-//!   then the second about 12 s later) and on contract changes (the third
-//!   at 7:58, the sixth at 20:44), so the engine shows them in stored
-//!   order, one more each time; [`HINT_SECONDS`] is between the 6 s the
-//!   first stayed and the 12 s before the second.
+//! - From the 360 code: which hint comes when (above). The PC footage
+//!   agrees: the first stored hint at the start, the second about 12 s
+//!   later, the third and the sixth on later screens.
 //! - From the scripts: after the villa contract (PmcCon001), its
 //!   consequence in the mission flow (`ce4166ed`) unlocks the next
 //!   contracts and calls `WifPmcInterior.Enter`, which raises the screen
@@ -46,10 +56,10 @@
 //!   since round 25). Talking to Fiona in the HQ fades the same way
 //!   (`WifPmcInterior._EnableStarter`'s `ContextAction` event), and her
 //!   briefing's end raises the screen itself (`Net.SetLoadingScreen`).
-//! - Invented: the order once the last is shown (back to the first), and
-//!   which loads show a hint (all here; the footage's screen after a
-//!   failed mission has none, which the engine's choice is not read for).
-//!   Nothing from the executable.
+//! - Invented: which loads show a hint (all here; the footage's screen
+//!   after a failed mission has none, which the engine's choice is not
+//!   read for), and the counter starting at the first hint each run (the
+//!   360 keeps it in the profile).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -84,79 +94,31 @@ pub const WIPE_FRAMES: u32 = 60;
 /// Its frame rate.
 pub const FRAME_RATE: f32 = 30.0;
 
-/// Seconds each hint stays while the screen is up (from footage, see the
-/// module docs).
+/// Seconds each hint stays while the screen is up, seconds before a
+/// screen's first, and how many a screen shows at most (from the 360
+/// code, see the module docs).
 pub const HINT_SECONDS: f32 = 10.0;
+pub const FIRST_HINT: f32 = 3.0;
+pub const HINTS_A_SCREEN: u32 = 7;
 
 /// Seconds the island's loading keeps the screen up at most (invented: a
 /// load that never ends must not hide the game for good).
 pub const LOADING_CAP: f32 = 90.0;
 
-/// The action line's text in the English table: its only string that
-/// is "Loading", which the footage shows there (inferred: the engine's
-/// `sAction` id is not known).
-pub const ACTION: u32 = 0x3971_2df8;
+/// The action line's text in the English table:
+/// `SHELL.LoadingHints.ActionLoading` (from the 360 code: the string the
+/// hint sender passes as the action), "Loading".
+pub const ACTION: u32 = 0xacd5_4bc3;
 
-/// The hints' keys in the English table, in stored order.
-pub const HINTS: [u32; 57] = [
-    0x6b7f_031f,
-    0x698b_cbec,
-    0x638e_0111,
-    0x780e_fa0f,
-    0x560c_85f2,
-    0xd814_0e5d,
-    0xee11_f268,
-    0xf005_299b,
-    0xce02_b57e,
-    0x700a_7049,
-    0x5608_08c4,
-    0xf823_4b47,
-    0xd620_d72a,
-    0x0f5b_646a,
-    0x315d_d887,
-    0x075f_d500,
-    0x3162_55b5,
-    0x2750_fcd6,
-    0x8953_d5b3,
-    0xaf56_501c,
-    0xa958_8541,
-    0x8f47_1332,
-    0xb149_874f,
-    0x7df2_b165,
-    0x13ef_cbf0,
-    0xfded_6ab7,
-    0x1beb_5b5a,
-    0xf5e8_e0f1,
-    0x7be5_e24c,
-    0x95e3_cca3,
-    0x73e1_5886,
-    0x1dde_928d,
-    0xf3dc_11d8,
-    0xccee_f888,
-    0x36f1_ddfd,
-    0xb4ea_5592,
-    0xd6ec_c9af,
-    0x34e5_0ee4,
-    0x4ee7_7669,
-    0x2ce0_851e,
-    0x4ee2_f93b,
-    0x2d03_1760,
-    0x5705_9815,
-    0x3cc3_7a03,
-    0x1ac1_05e6,
-    0x9cc8_8e51,
-    0xa2c6_592c,
-    0x79d4_a013,
-    0x97d2_90b6,
-    0xa1e3_e995,
-    0x77e1_68e0,
-    0x21de_a2e7,
-    0xffdc_2eca,
-    0x99c5_c7e9,
-    0x7fc3_6064,
-    0x8b42_99c6,
-    0xad45_0de3,
-];
+/// How many hints there are: the engine counts them as it first needs
+/// one, looking up `Loading.Set1.%03d` from 006 until one is missing;
+/// the PC's English table has 006 to 057.
+pub const HINTS: usize = 52;
+
+/// The key of hint `n` (0 the first) in the English table.
+pub fn hint_key(n: usize) -> u32 {
+    name_hash(&format!("Loading.Set1.{:03}", n + 6))
+}
 
 /// What the screen does next, for the movie.
 #[derive(Clone, Debug, PartialEq)]
@@ -175,8 +137,8 @@ pub enum Step {
 #[derive(Clone, Copy, Debug, Default)]
 struct Up {
     age: f32,
-    since: f32,
-    hinted: bool,
+    /// Hints shown on this screen.
+    hints: u32,
 }
 
 /// When the screen is up and which hint it shows: the engine's side of
@@ -241,7 +203,6 @@ impl Cycle {
             }
             (Some(mut up), true) => {
                 up.age += dt;
-                up.since += dt;
                 self.up = Some(up);
                 steps.extend(self.due());
             }
@@ -259,17 +220,23 @@ impl Cycle {
         self.up.is_some()
     }
 
-    /// A hint, if one is due: the first once the wipe is done
-    /// (`wipeComplete`), then one every [`HINT_SECONDS`].
+    /// A hint, if one is due: hints come on as the wipe is done
+    /// (`wipeComplete`); the first is [`FIRST_HINT`] seconds later, then
+    /// one every [`HINT_SECONDS`], [`HINTS_A_SCREEN`] at most.
     fn due(&mut self) -> Option<Step> {
         let wipe = WIPE_FRAMES as f32 / FRAME_RATE;
         let up = self.up.as_mut()?;
-        if up.age < wipe || (up.hinted && up.since < HINT_SECONDS) {
+        let on = up.age - wipe;
+        if on < FIRST_HINT || up.hints >= HINTS_A_SCREEN {
             return None;
         }
-        up.hinted = true;
-        up.since = 0.0;
-        let n = self.next % HINTS.len();
+        // The slot the time is in: filled if a hint was shown for it.
+        let slot = ((on - FIRST_HINT) / HINT_SECONDS) as u32;
+        if slot < up.hints {
+            return None;
+        }
+        up.hints += 1;
+        let n = self.next % HINTS;
         self.next = n + 1;
         self.hints += 1;
         Some(Step::Hint(n))
@@ -338,9 +305,8 @@ impl LoadingScreen {
         let action = strings
             .get(ACTION)
             .map_or_else(|| "[]".to_owned(), str::to_owned);
-        let hints = HINTS
-            .iter()
-            .map(|&k| strings.get(k).unwrap_or_default().to_owned())
+        let hints = (0..HINTS)
+            .map(|n| strings.get(hint_key(n)).unwrap_or_default().to_owned())
             .collect();
         let mut sources = vec![loading];
         for name in ["vz.wad", "English.wad"] {
@@ -639,13 +605,23 @@ mod tests {
 
     const WIPE: f32 = WIPE_FRAMES as f32 / FRAME_RATE;
 
+    /// The hints are the table's `Loading.Set1.006` and on, and the action
+    /// line `SHELL.LoadingHints.ActionLoading`, by the names the 360 looks
+    /// them up by.
     #[test]
-    fn the_start_is_covered_and_shows_the_first_hint_at_once() {
+    fn the_hints_are_named_as_the_engine_names_them() {
+        assert_eq!(hint_key(0), name_hash("Loading.Set1.006"));
+        assert_eq!(hint_key(1), 0x6b7f_031f, "Loading.Set1.007");
+        assert_eq!(hint_key(HINTS - 1), name_hash("Loading.Set1.057"));
+        assert_eq!(name_hash("SHELL.LoadingHints.ActionLoading"), ACTION);
+    }
+
+    #[test]
+    fn the_start_is_covered_and_its_first_hint_comes_three_seconds_on() {
         let mut c = Cycle::default();
-        assert_eq!(
-            c.update(true, 0.0, true),
-            [Step::Start { covered: true }, Step::Hint(0)]
-        );
+        assert_eq!(c.update(true, 0.0, true), [Step::Start { covered: true }]);
+        assert!(c.update(true, FIRST_HINT - 0.1, false).is_empty());
+        assert_eq!(c.update(true, 0.2, false), [Step::Hint(0)]);
         // The next after its time.
         assert!(c.update(true, HINT_SECONDS - 0.5, false).is_empty());
         assert_eq!(c.update(true, 1.0, false), [Step::Hint(1)]);
@@ -654,12 +630,14 @@ mod tests {
     }
 
     #[test]
-    fn a_fade_shows_the_next_hint_once_its_wipe_is_done() {
+    fn a_fade_shows_the_next_hint_three_seconds_after_its_wipe() {
         let mut c = Cycle::default();
         c.update(true, 0.0, true);
+        c.update(true, FIRST_HINT, false);
         c.update(false, 0.1, false);
         assert_eq!(c.update(true, 0.1, false), [Step::Start { covered: false }]);
         assert!(c.update(true, WIPE - 0.2, false).is_empty());
+        assert!(c.update(true, FIRST_HINT, false).is_empty());
         assert_eq!(c.update(true, 0.3, false), [Step::Hint(1)]);
         assert!(c.update(true, 1.0, false).is_empty());
         assert_eq!((c.shown, c.hints), (2, 2));
@@ -668,11 +646,27 @@ mod tests {
     #[test]
     fn hints_go_round_after_the_last() {
         let mut c = Cycle {
-            next: HINTS.len() - 1,
+            next: HINTS - 1,
             ..Cycle::default()
         };
         c.update(true, 0.0, true);
+        assert_eq!(c.update(true, FIRST_HINT, false), [Step::Hint(HINTS - 1)]);
         assert_eq!(c.update(true, HINT_SECONDS, false), [Step::Hint(0)]);
+    }
+
+    /// A screen left up shows seven hints, ten seconds apart, and no more.
+    #[test]
+    fn a_screen_shows_seven_hints_at_most() {
+        let mut c = Cycle::default();
+        c.update(true, 0.0, true);
+        let mut at = Vec::new();
+        for tick in 1..=2000 {
+            if !c.update(true, 0.1, false).is_empty() {
+                at.push((tick as f32 * 0.1).round() as u32);
+            }
+        }
+        assert_eq!(at, [3, 13, 23, 33, 43, 53, 63]);
+        assert_eq!(c.hints, HINTS_A_SCREEN);
     }
 
     #[test]
