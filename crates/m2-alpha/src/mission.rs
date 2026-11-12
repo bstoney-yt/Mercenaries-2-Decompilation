@@ -6814,6 +6814,21 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
+        // Every goal of an AI cleared (`Ai.RemoveGoal` with `Handle` 0:
+        // OilCon001's executive, PmcCon003's pursuers before their next
+        // goal): a route it runs on foot is dropped, a path its vehicle
+        // drives is left, and her own `MoveTo` is forgotten.
+        Command::ClearGoals { guid } => {
+            if *guid == PLAYER {
+                fleet.player_goal = None;
+            }
+            game.scene.people.clear_goals(*guid);
+            let vehicle = mission.world().borrow().vehicle_of(*guid);
+            if game.paths.stop(vehicle.unwrap_or(*guid)) {
+                eprintln!("mission: {guid:#x}'s goals cleared: its vehicle leaves its path");
+            }
+            return false;
+        }
         // Someone following her (`Ai.Role` `Follow`: a VIP to deliver).
         Command::Follow { guid, target, near } => {
             game.scene

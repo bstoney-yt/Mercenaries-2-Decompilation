@@ -121,6 +121,22 @@ impl PathMoves {
         );
     }
 
+    /// The scripts cleared the goals of `vehicle`'s driver (`Ai.RemoveGoal`
+    /// with `Handle` 0, which empties the AI's goal list in the 360 code,
+    /// 0x822CEE48): it drives on no further and, like a path driven to its
+    /// end, parks where it is at its next step. Parking is a stand-in
+    /// (invented): with no goals the 360's AI falls back on its own
+    /// behaviour, which isn't traced here. Whether it was on a path.
+    pub fn stop(&mut self, vehicle: u32) -> bool {
+        let Some(m) = self.moves.get_mut(&vehicle) else {
+            return false;
+        };
+        m.route.clear();
+        m.lap.clear();
+        m.next = 0;
+        true
+    }
+
     /// Drives each vehicle on a path one step; `driven` is the one she is
     /// in, which leaves its path.
     pub fn drive(
@@ -305,6 +321,19 @@ mod tests {
             None,
         );
         assert!(p.moves.contains_key(&7));
+    }
+
+    #[test]
+    fn a_cleared_driver_goes_no_further_and_does_not_go_round_again() {
+        let lap = vec![Vec3::ZERO, Vec3::X * 50.0, Vec3::new(50.0, 0.0, 50.0)];
+        let mut p = PathMoves::default();
+        assert!(!p.stop(7), "not on a path");
+        p.start(7, lap.clone(), lap, PathMode::Loop, None);
+        assert!(p.stop(7));
+        let m = p.moves.get_mut(&7).unwrap();
+        // At its end at once (parked at the next step), and no lap to loop.
+        assert!(m.next >= m.route.len());
+        assert!(!m.again());
     }
 
     #[test]
