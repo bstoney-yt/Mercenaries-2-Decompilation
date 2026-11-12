@@ -2607,7 +2607,20 @@ end
     /// (its `vo` events: the faction HQs' briefings are spoken by their
     /// clips, 806 lines over 258 clips, from samples): said as a scripted
     /// line with no callback, its subtitle up if the player has them on.
+    ///
+    /// From the 360 code: the voice manager hears the clips' voice
+    /// events only while it is in cinematic mode (`VO.SetCinematicMode`,
+    /// `0x82278118`, which joins and leaves their queue; the update
+    /// `0x82277D98` reads it only then), and cues each line at priority
+    /// 0, the one priority that mode lets play, with its subtitle. Out
+    /// of that mode the event is dropped.
     pub fn clip_line(&mut self, speaker: u32, cue: &str) {
+        if !self.world.borrow().vo.cinematic {
+            self.log.push(format!(
+                "  clip line {cue} not said: the voice is not in cinematic mode"
+            ));
+            return;
+        }
         let mut w = self.world.borrow_mut();
         let subtitled = !w.subtitles_off;
         let sequences = std::mem::take(&mut w.vo_sequences);
@@ -2616,7 +2629,7 @@ end
             cue.to_owned(),
             None,
             subtitled,
-            crate::vo::DEFAULT_PRIORITY,
+            0,
             &sequences,
         );
         w.vo_sequences = sequences;
