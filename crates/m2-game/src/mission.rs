@@ -697,6 +697,11 @@ pub struct Mission {
     black: f32,
     /// [`FADE`], compiled once (on the first tick) rather than every tick.
     fade: Option<mlua::Function>,
+    /// The scripts' joined callback is called for her
+    /// ([`set_script_join`](Self::set_script_join)).
+    script_join: bool,
+    /// The joined callback was called.
+    joined: bool,
 }
 
 impl Mission {
@@ -886,6 +891,8 @@ impl Mission {
             movie_out: false,
             black: 0.0,
             fade: None,
+            script_join: false,
+            joined: false,
         };
         mission.settle("set-up");
         Ok(mission)
@@ -1022,6 +1029,7 @@ impl Mission {
                     .push(format!("  {name}: {}", first_lines(&e.to_string())));
             }
         }
+        self.join_player();
         if saved.is_some() {
             self.world.borrow_mut().saved = None;
             let _ = self.host.lua().globals().set("__m2_saved", Value::Nil);
@@ -1067,11 +1075,104 @@ impl Mission {
         });
     }
 
+    /// Has the game call the scripts' "player joined" callback for her,
+    /// as the 360 does, once it is registered (off unless asked for).
+    ///
+    /// From the 360 code: the game state entered before the wait for
+    /// streaming (0x8220EC98) queues a join record for local player 0,
+    /// and the game update (0x82466F28, then 0x82467230) calls the
+    /// callback `Player.SetPlayerJoinedCallback` kept, once there is one,
+    /// with `(0, name, { iIndex, iUpgrade, iCostume }, true, 0)`: the
+    /// three numbers are the profile's character, upgrade and costume
+    /// (bytes +0x61..+0x63, what `Player.GetProfileCharacter`,
+    /// `GetProfileUpgrade` and `GetProfileCostume` answer), and the last
+    /// argument is always 0. `MrxPlayer.OnPlayerJoined` (from the script,
+    /// 8d35cf13) then spawns her template, attaches and binds it, has her
+    /// interface made, makes her an AI subject, watches for her death
+    /// (`PlayerDied`), calls the current mission's `OnPlayerJoined` and
+    /// posts `mpPlayerJoin`.
+    ///
+    /// Inferred: `iIndex` counts the heroes from 1 in the order of
+    /// `MrxPlayer`'s own table (Mattias, Chris, Jennifer), because the
+    /// script indexes that table with it; the profile's own numbering is
+    /// not traced.
+    ///
+    /// Invented: her character stays the one the game made (the script's
+    /// `Pg.Spawn` is answered with it, and she is not moved to the
+    /// script's start point); `iUpgrade` is 0 (the port keeps no upgrade),
+    /// so her base template is asked for; the name is the hero's (on the
+    /// 360 a run-time string, untraced; the script only prints it); and
+    /// the call is made when play starts, or on the first tick after the
+    /// callback is registered, rather than on the 360's game state.
+    pub fn set_script_join(&mut self, on: bool) {
+        self.script_join = on;
+    }
+
+    /// Whether the joined callback has been called for her.
+    pub fn player_joined(&self) -> bool {
+        self.joined
+    }
+
+    /// Calls the joined callback for her, once, when the switch is on and
+    /// the scripts have registered one.
+    fn join_player(&mut self) {
+        if !self.script_join || self.joined {
+            return;
+        }
+        let lua = self.host.lua();
+        let Some(callback) = crate::character_binding::joined_callback(lua) else {
+            return;
+        };
+        self.joined = true;
+        let (name, costume) = {
+            let mut w = self.world.borrow_mut();
+            w.joining = true;
+            let name = w
+                .player
+                .and_then(|p| w.objects.get(&p))
+                .map(|o| o.name.clone())
+                .unwrap_or_default();
+            (name, w.profile_costume)
+        };
+        let index = match name.to_ascii_lowercase().as_str() {
+            "mattias" => Some(1),
+            "chris" => Some(2),
+            "jennifer" => Some(3),
+            _ => None,
+        };
+        let result = lua.create_table().and_then(|profile| {
+            if let Some(i) = index {
+                profile.raw_set("iIndex", i)?;
+            }
+            profile.raw_set("iUpgrade", 0)?;
+            profile.raw_set("iCostume", costume)?;
+            callback.call::<()>((0, name.as_str(), profile, true, 0))
+        });
+        let asked = {
+            let mut w = self.world.borrow_mut();
+            w.joining = false;
+            w.joined_template.clone()
+        };
+        let now = self.now;
+        self.log.push(match result {
+            Ok(()) => format!(
+                "t={now:.1} player joined: the scripts' callback ran for {name} (template {})",
+                asked.as_deref().unwrap_or("none asked for")
+            ),
+            Err(e) => format!(
+                "t={now:.1} player joined: callback: {}",
+                first_lines(&e.to_string())
+            ),
+        });
+        self.settle("player joined");
+    }
+
     /// Advances game time by `dt` seconds: fires the events that are due
     /// and carries out what their callbacks asked for.
     pub fn tick(&mut self, dt: f64) {
         self.now += dt;
         let now = self.now;
+        self.join_player();
         {
             let mut w = self.world.borrow_mut();
             w.honk_heard = (w.honk_heard - dt as f32).max(0.0);
@@ -3030,6 +3131,66 @@ mod tests {
             .map(|s| s.matches(r#"add(&player, "GetCamera""#).count())
             .sum();
         assert_eq!(count, 1, "Player.GetCamera registered {count} times");
+    }
+
+    /// A stand-in for `MrxPlayer.OnPlayerJoined`: keeps what it was
+    /// called with and spawns her template, as the script does.
+    const JOINED: &str = r#"
+        calls = 0
+        Player.SetPlayerJoinedCallback(function(n, name, profile, isLocal, controller)
+            calls = calls + 1
+            got = { n, name, profile.iIndex, profile.iUpgrade, profile.iCostume,
+                    isLocal, controller }
+            her = Pg.Spawn("jen", 10, 20, 30, 90, false, false, false)
+            other = Pg.Spawn("jen", 10, 20, 30, 90, false, false, false)
+        end)
+    "#;
+
+    // Off unless asked for: the joined callback is kept and never called.
+    #[test]
+    fn the_joined_callback_is_not_called_by_default() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(JOINED, "joined").unwrap();
+        m.tick(0.5);
+        assert!(!m.player_joined());
+        assert_eq!(m.lua().load("return calls").eval::<i64>().unwrap(), 0);
+    }
+
+    // From the 360 code (0x82467230): the callback is called once for
+    // local player 0 with (0, name, { iIndex, iUpgrade, iCostume }, true,
+    // 0), the costume being the profile's. Her character stays the game's
+    // (invented): the callback's first spawn answers it and makes nothing,
+    // and a later spawn is an ordinary one.
+    #[test]
+    fn the_joined_callback_is_called_once_for_her_with_the_switch_on() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [1.0, 2.0, 3.0]).unwrap();
+        m.set_script_join(true);
+        // No callback yet: nothing to call, and it is tried again later.
+        m.tick(0.5);
+        assert!(!m.player_joined());
+        m.run(&format!("Player.SetProfileCostume(4) {JOINED}"), "joined")
+            .unwrap();
+        m.take_commands();
+        m.tick(0.5);
+        m.tick(0.5);
+        assert!(m.player_joined());
+        let got: (i64, String, i64, i64, f64, bool, i64) = m
+            .lua()
+            .load("return got[1], got[2], got[3], got[4], got[5], got[6], got[7]")
+            .eval()
+            .unwrap();
+        assert_eq!(got, (0, "Jennifer".to_owned(), 3, 0, 4.0, true, 0));
+        assert_eq!(m.lua().load("return calls").eval::<i64>().unwrap(), 1);
+        let (her, other): (bool, bool) = m
+            .lua()
+            .load("return her == Player.GetLocalCharacter(), other == her")
+            .eval()
+            .unwrap();
+        assert!(her && !other);
+        let w = m.world.borrow();
+        assert_eq!(w.joined_template.as_deref(), Some("jen"));
+        assert_eq!(w.objects[&PLAYER].position, [1.0, 2.0, 3.0]);
+        assert!(!w.joining);
     }
 
     #[test]
