@@ -2879,7 +2879,10 @@ impl Npc {
             self.update_down(dt);
             return;
         }
-        if self.update_swim(physics, dt) {
+        let mut lap = crate::spans::Lap::new();
+        let swims = self.update_swim(physics, dt);
+        lap.mark("person: depth check and swim");
+        if swims {
             return;
         }
         if self.update_stagger(dt) {
@@ -2906,9 +2909,12 @@ impl Npc {
         // run it to its end first, and fight from there (inferred: the
         // villa's waves come in to the hall).
         let sent = matches!(self.brain, Brain::Route { .. });
+        lap.mark("person: look");
         if self.alert && !sent {
+            let fights = threat.is_some_and(|t| self.fight(physics, t, rng, dt));
+            lap.mark("person: fight");
             match threat {
-                Some(t) if self.fight(physics, t, rng, dt) => return,
+                Some(_) if fights => return,
                 _ => {
                     self.slot.clear();
                     self.foe_at = None;
@@ -3060,6 +3066,7 @@ impl Npc {
             }
             None => self.move_dry(physics, wanted, dt),
         }
+        lap.mark("person: walk");
         // Walked into something: give up on that point (strolls) or wait
         // and try again (routes).
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
@@ -3108,7 +3115,9 @@ impl Npc {
         }
         // His number stands in for the game's entity handle (invented).
         let rate = self.rig.play_rate(gait, moved, self.shooter);
+        lap.mark("person: steer and gait");
         self.rig.advance(dt * rate);
+        lap.mark("person: animation");
     }
 }
 
@@ -4574,8 +4583,11 @@ impl People {
         threat: Option<Vec3>,
         dt: f32,
     ) {
+        let mut lap = crate::spans::Lap::new();
         self.pursue(dt);
+        lap.mark("people: pursuit");
         self.war(physics, threat, dt);
+        lap.mark("people: war");
         self.war_log -= dt;
         if self.war_log <= 0.0 {
             self.war_log = 30.0;
@@ -4625,6 +4637,7 @@ impl People {
         }
         self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
+        lap.mark("people: spawning");
         let scripted = std::mem::take(&mut self.scripted);
         if !scripted.is_empty() {
             self.populate(physics, &scripted, focus);
@@ -4694,13 +4707,17 @@ impl People {
                 .max(2.0 * npc.motion.capsule_radius);
             npc.rammed = (npc.rammed - dt).max(0.0);
             let facing = npc.facing;
-            npc.update(physics, &mut self.rng, threat, dt);
+            crate::spans::time("people: each one's update", || {
+                npc.update(physics, &mut self.rng, threat, dt)
+            });
             let p = npc.character.position;
-            self.checks
-                .count(npc, facing, physics.water_at(p.x, p.z), dt);
-            if let Some(t) = threat {
-                self.idle.count(physics, npc, t, dt);
-            }
+            crate::spans::time("people: checks", || {
+                self.checks
+                    .count(npc, facing, physics.water_at(p.x, p.z), dt);
+                if let Some(t) = threat {
+                    self.idle.count(physics, npc, t, dt);
+                }
+            });
             if std::mem::take(&mut npc.spotted) && npc.alive && self.smarter.enabled {
                 callouts.push(npc.character.position);
             }
