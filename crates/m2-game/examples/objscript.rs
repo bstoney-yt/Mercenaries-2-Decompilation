@@ -9,8 +9,9 @@
 //!
 //! For `crate` it then stands the player beside the first one, hangs it
 //! on a winch, lets it go and destroys it, printing the marker count
-//! after each. Prints names,
-//! counts and the scripts' errors only.
+//! after each. For `collectable` it stands her beside the first one and
+//! takes its context action. Prints names, counts and the scripts'
+//! errors only.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -95,6 +96,27 @@ fn main() -> Result<()> {
         mission.kill(first);
         run(&mut mission, 1.0);
         println!("markers with it destroyed: {}", markers(&mission));
+    }
+    if name.eq_ignore_ascii_case("collectable")
+        && let Some(&(_, first, at)) = on.first()
+    {
+        let offered = |m: &Mission| m.context_text(first).unwrap_or_else(|| "none".into());
+        let alive = |m: &Mission| m.world().borrow().objects.get(&first).map(|o| o.alive);
+        mission.put_player([at[0] + 1.0, at[1], at[2]]);
+        run(&mut mission, 1.0);
+        println!(
+            "beside the first: offered {}, alive {:?}; {} offered in all",
+            offered(&mission),
+            alive(&mission),
+            mission.context_actions().len()
+        );
+        mission.take_context_action(first);
+        run(&mut mission, 1.0);
+        println!(
+            "taken: offered {}, alive {:?}",
+            offered(&mission),
+            alive(&mission)
+        );
     }
     println!("{name} lines logged: {failures}");
     Ok(())
