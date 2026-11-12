@@ -58,6 +58,7 @@ mod disguise;
 mod display;
 mod drops;
 mod entrance_marker;
+mod errlog;
 mod flights;
 mod flow;
 mod frametimes;
@@ -1095,6 +1096,8 @@ fn keep_crash_reports() {
         if std::fs::write(&path, report).is_ok() {
             eprintln!("crash report written to {}", path.display());
         }
+        // The process ends here (panics abort): the log's last lines out.
+        errlog::finish();
     }));
 }
 
@@ -1124,8 +1127,11 @@ const PROPS_CHECK_AFTER: f32 = 20.0;
 #[cfg_attr(target_os = "android", allow(dead_code))]
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
+    errlog::start();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    run(&args, EventLoop::new)
+    let out = run(&args, EventLoop::new);
+    errlog::finish();
+    out
 }
 
 /// The game, given its arguments and how to make its event loop (the
@@ -4362,7 +4368,9 @@ fn mission_for_screenshot(
     // Message box calls with a callback, while the game's HUD isn't
     // running: when each is due back, by call number; the last seen.
     let (mut boxed, mut boxed_seen): (Vec<(f32, u64)>, u64) = (Vec::new(), 0);
+    let mut lap = spans::Lap::new();
     for i in 0..(seconds / tick).round() as u32 {
+        lap.mark("loop: pictures and checks");
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
             Some(a) => {
                 let contract = link.contract();
@@ -4459,6 +4467,7 @@ fn mission_for_screenshot(
             }
             None => Intent::default(),
         };
+        lap.mark("loop: autoplay and what it reads");
         if let Some(hp) = options.hurt
             && i == (HURT_AT / tick).round() as u32
         {
@@ -4734,8 +4743,10 @@ fn mission_for_screenshot(
                 _ => {}
             }
         }
+        lap.mark("loop: before the step");
         spans::time("game", || game.step(intent, tick));
         spans::time("scripts", || link.tick(game, tick));
+        lap.mark("loop: step and scripts");
         // In a starter's box (her menu, then a contract's terms), autoplay
         // picks after a moment the contract on offer and then Accept, as a
         // player taking it would; the game's HUD answers the scripts' box
@@ -5426,9 +5437,11 @@ fn mission_for_screenshot(
             );
             break;
         }
+        lap.mark("loop: after the scripts");
         if i % every == 0 {
             render(backend, game, fov, aspect, None)?;
         }
+        lap.mark("loop: frame");
         // Each minute of play, where the wall clock went (`pace: autoplay`):
         // the play it got through for each second, and the parts of a tick
         // ([`spans`]: the game's steps, the scripts, and the frames drawn
