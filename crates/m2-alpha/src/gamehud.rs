@@ -3513,6 +3513,24 @@ impl Thread {
             log.push(format!("flash {}: {name}({} args)", m.swf, args.len()));
             m.rt.call(&name, &args);
         }
+        // The keys the scripts send a movie themselves (`SendFlashInput`:
+        // the store's stick pushes): a press goes down and comes up, a
+        // hold stays down until its release. That a press is both is
+        // inferred from its name; the 360's own handling of the queue was
+        // not read.
+        let inputs = screen.borrow_mut().take_flash_inputs();
+        for (id, code, what) in inputs {
+            let Some(m) = self.flash.get_mut(&id) else {
+                continue;
+            };
+            log.push(format!("flash {}: input {code} {what:?}", m.swf));
+            if what != gui_runtime::FlashInput::Release {
+                m.rt.key_down(code);
+            }
+            if what != gui_runtime::FlashInput::Hold {
+                m.rt.key_up(code);
+            }
+        }
         for (code, down) in std::mem::take(&mut self.keys) {
             log.push(format!(
                 "flash: key {code} {}",

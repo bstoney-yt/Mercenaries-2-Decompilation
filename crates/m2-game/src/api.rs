@@ -1004,6 +1004,9 @@ pub struct ScriptWorld {
     /// The PDA map's callbacks for its two modes
     /// (`Player.SetPDAMapModeCallback`).
     pub pda_map_callbacks: [Option<Function>; 2],
+    /// The PDA map mode while the scripts have it up
+    /// (`Player.SetPDAMapMode`: the satellite view).
+    pub pda_map: Option<crate::pda_map::MapMode>,
     /// `Player.SetWaitForInGame`: the player waits for the game proper.
     pub wait_for_in_game: bool,
     /// Places people kept by `Human.PersistTransform`: place and yaw.
@@ -1066,6 +1069,15 @@ pub struct ScriptWorld {
     pub reticle_target: Option<([f32; 3], Option<u32>)>,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Templates' object scripts by name in lower case: the module's hash
+    /// and its data ([`crate::mission::GameData::template_scripts`]).
+    pub template_scripts: HashMap<String, (u32, Option<u32>)>,
+    /// Objects spawned since the last tick whose template names an object
+    /// script (guid, script, data), for the mission to run it on them;
+    /// those it ran one on, by guid; and those of them removed since.
+    pub script_spawns: Vec<(u32, u32, Option<u32>)>,
+    pub scripted: HashMap<u32, u32>,
+    pub script_removals: Vec<(u32, u32)>,
     /// Templates' cash values by name in lower case ([`crate::cash`]).
     pub template_cash: HashMap<String, i32>,
     /// Every template the template database names, in lower case: the
@@ -1120,6 +1132,10 @@ pub struct ScriptWorld {
     /// who carries whom (`Human.IsCarrying`) ([`crate::mission::Mission::set_human_state`]).
     pub human_states: HashMap<u32, String>,
     pub state_changes: Vec<crate::events::StateChange>,
+    /// Objects a script killed (`Object.Kill` of a live one) whose own
+    /// script has not heard of its death yet
+    /// ([`crate::mission::Mission::tick`] tells it: `OnDeath`).
+    pub script_killed: Vec<u32>,
     /// What the scripts have changed of each object's attached spawners,
     /// by object ([`crate::spawner_tweak`]).
     pub spawner_records: HashMap<u32, crate::spawner_tweak::SpawnerRecord>,
@@ -1423,6 +1439,7 @@ impl ScriptWorld {
         }
         self.insert(guid, object);
         self.fresh.push(guid);
+        self.note_script(guid, &lower);
         self.commands.push(Command::Spawn {
             guid,
             what,
@@ -1561,6 +1578,16 @@ impl ScriptWorld {
         });
         if let Some(c) = found.and_then(|w| self.inventory.carried.get_mut(&w)) {
             c.reserve = rounds;
+        }
+    }
+
+    /// Notes that `guid`, just spawned from template `lower` (its name in
+    /// lower case), is to have its template's object script run on it, as
+    /// the engine runs it on every object of the template.
+    pub(crate) fn note_script(&mut self, guid: u32, lower: &str) {
+        if let Some(&(script, data)) = self.template_scripts.get(lower) {
+            self.script_spawns.push((guid, script, data));
+            self.scripted.insert(guid, script);
         }
     }
 
@@ -2369,6 +2396,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     crate::ported_sp::install(&lib, &add)?;
     crate::shop::install(lua, &lib("Hud")?)?;
     crate::ported::install(&lib, &add)?;
+    crate::pda_map::install(&lib, &add)?;
     crate::ported_sys::install(&lib, &add)?;
     crate::cash::install(&lib, &add)?;
 
@@ -3088,9 +3116,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&object, "Kill", |w, _, a| {
         if let Some(guid) = id(a.first()) {
+            let mut died = false;
             if let Some(o) = w.objects.get_mut(&guid) {
+                died = o.alive;
                 o.alive = false;
                 o.health = 0.0;
+            }
+            if died {
+                w.script_killed.push(guid);
             }
             w.commands.push(Command::Kill(guid));
         }
@@ -3100,6 +3133,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         if let Some(guid) = id(a.first()) {
             if w.objects.remove(&guid).is_some_and(|o| o.alive) {
                 w.removed_alive.insert(guid);
+            }
+            if let Some(script) = w.scripted.remove(&guid) {
+                w.script_removals.push((guid, script));
             }
             w.inventory.drop(guid);
             w.commands.push(Command::Remove(guid));

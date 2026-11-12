@@ -183,6 +183,17 @@ pub struct Widget {
     /// ([`Screen::take_flash_calls`]): the movie's function and its
     /// arguments.
     pub flash_calls: Vec<(String, Vec<FlashArg>)>,
+    /// `SendFlashInput` inputs not yet taken by the host
+    /// ([`Screen::take_flash_inputs`]): the key's code and what is done
+    /// with it.
+    pub flash_inputs: Vec<(i32, FlashInput)>,
+    /// `SetFlashPlaySpeed`: the movie's play speed, as given (1 until
+    /// set: inferred, the 360's start value was not read).
+    pub flash_speed: f32,
+    /// `SetWidgetIgnoresPause` and `SetWidgetUseResolutionCorrection`, as
+    /// last set (the correction is on until turned off).
+    pub ignores_pause: bool,
+    pub resolution_correction: bool,
     /// `SetFlashCallback`: the movie's `fscommand` names and the callbacks
     /// they call ([`flash_command`]).
     flash_handlers: BTreeMap<String, u32>,
@@ -243,6 +254,10 @@ impl Widget {
             wraps: false,
             swf: None,
             flash_calls: Vec::new(),
+            flash_inputs: Vec::new(),
+            flash_speed: 1.0,
+            ignores_pause: false,
+            resolution_correction: true,
             flash_handlers: BTreeMap::new(),
             flash_paused: false,
             flash_restarts: 0,
@@ -438,6 +453,18 @@ impl Screen {
     /// Natives the scripts called that this does not implement.
     pub fn unknown(&self) -> &BTreeSet<String> {
         &self.unknown
+    }
+
+    /// The Flash inputs the scripts sent since the last call
+    /// (`SendFlashInput`), by widget, in the order sent.
+    pub fn take_flash_inputs(&mut self) -> Vec<(u32, i32, FlashInput)> {
+        let mut inputs = Vec::new();
+        for (&id, w) in &mut self.widgets {
+            for (code, what) in w.flash_inputs.drain(..) {
+                inputs.push((id, code, what));
+            }
+        }
+        inputs
     }
 
     /// The Flash calls the scripts made since the last call, by widget, in
@@ -1856,6 +1883,20 @@ pub fn fire(lua: &Lua, event: &str, args: impl IntoLuaMulti) -> mlua::Result<usi
     fire.call::<usize>(MultiValue::from_vec(call))
 }
 
+/// What `SendFlashInput` asks done with a key. From the 360 code
+/// (`0x823223F8`): its third argument's first letter picks it, `h` hold
+/// (2), `r` release (3), anything else or nothing press (1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlashInput {
+    Press,
+    Hold,
+    Release,
+}
+
+/// How many inputs a Flash widget keeps till its next update (the 360's
+/// queue holds 32; more are dropped).
+const FLASH_INPUTS: usize = 32;
+
 /// `SendFlash...AnalogInput(widget, x, y)`: the movie's `function(x, y)`.
 fn analog(s: &mut Screen, a: &Args, function: &str) -> mlua::Result<MultiValue> {
     let args = a.0.iter().skip(1).take(2).map(FlashArg::of).collect();
@@ -2223,7 +2264,57 @@ natives! {
     "GetImageClockElapsed" => |_, l, _| ret(l, 0),
     // Settings with nothing to draw differently here.
     "SetWidgetViewport" => |_, _, _| Ok(MultiValue::new()),
-    "SetWidgetIgnoresPause" => |_, _, _| Ok(MultiValue::new()),
+    // (widget, flag): the widget's ignores-pause flag; read back by
+    // `GetWidgetIgnoresPause` (0x8231D3A8: a boolean for a widget, nothing
+    // without one).
+    "SetWidgetIgnoresPause" => |s, _, a| {
+        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.ignores_pause = a.truthy(1);
+        }
+        Ok(MultiValue::new())
+    },
+    "GetWidgetIgnoresPause" => |s, l, a| match s.widgets.get(&a.id(0)) {
+        Some(w) => ret(l, w.ignores_pause),
+        None => Ok(MultiValue::new()),
+    },
+    // (widget, flag) (0x8231E780): whether the widget is corrected for the
+    // screen's shape; the lock-on reticle's target box turns it off.
+    "SetWidgetUseResolutionCorrection" => |s, _, a| {
+        if let (Some(w), Some(Value::Boolean(on))) = (s.widgets.get_mut(&a.id(0)), a.get(1)) {
+            w.resolution_correction = *on;
+        }
+        Ok(MultiValue::new())
+    },
+    // (flash widget, key code[, "p" | "h" | "r"]) (0x823223F8): queues a
+    // key for the movie's next update, pressed, held or released.
+    "SendFlashInput" => |s, _, a| {
+        let (Some(w), Some(code)) = (s.widgets.get_mut(&a.id(0)), a.num(1)) else {
+            return Ok(MultiValue::new());
+        };
+        if w.kind == Kind::Flash && w.flash_inputs.len() < FLASH_INPUTS {
+            let what = match a.text(2).as_deref().and_then(|t| t.chars().next()) {
+                Some('h') => FlashInput::Hold,
+                Some('r') => FlashInput::Release,
+                _ => FlashInput::Press,
+            };
+            w.flash_inputs.push((code as i32, what));
+        }
+        Ok(MultiValue::new())
+    },
+    // (flash widget, speed) and (flash widget) (0x82322020, 0x823220F0):
+    // the movie's play speed, kept and read back as given.
+    "SetFlashPlaySpeed" => |s, _, a| {
+        if let (Some(w), Some(speed)) = (s.widgets.get_mut(&a.id(0)), a.f(1))
+            && w.kind == Kind::Flash
+        {
+            w.flash_speed = speed;
+        }
+        Ok(MultiValue::new())
+    },
+    "GetFlashPlaySpeed" => |s, l, a| match s.widgets.get(&a.id(0)) {
+        Some(w) if w.kind == Kind::Flash => ret(l, w.flash_speed),
+        _ => Ok(MultiValue::new()),
+    },
     "SetWidgetFullscreen" => |s, _, a| {
         if let Some(w) = s.widgets.get_mut(&a.id(0)) {
             w.fullscreen = a.truthy(1);
@@ -3294,6 +3385,61 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// The Flash input, play speed and flag natives keep what the scripts
+    /// give them, for Flash widgets only where the 360 asks for one.
+    #[test]
+    fn flash_inputs_speeds_and_flags_are_kept() {
+        let host = ScriptHost::new().unwrap();
+        let screen = install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r##"
+                local g = _GuiInternal
+                movie = g.CreateFlashWidget()
+                plain = g.CreateWidget()
+                g.SendFlashInput(movie, 9, "p")
+                g.SendFlashInput(movie, 13)
+                g.SendFlashInput(movie, 37, "hold")
+                g.SendFlashInput(movie, 37, "r")
+                g.SendFlashInput(plain, 9, "p")
+                assert(g.GetFlashPlaySpeed(movie) == 1)
+                g.SetFlashPlaySpeed(movie, 2.5)
+                g.SetFlashPlaySpeed(plain, 9)
+                assert(g.GetFlashPlaySpeed(movie) == 2.5)
+                assert(select("#", g.GetFlashPlaySpeed(plain)) == 0)
+                assert(g.GetWidgetIgnoresPause(plain) == false)
+                g.SetWidgetIgnoresPause(plain, true)
+                assert(g.GetWidgetIgnoresPause(plain) == true)
+                assert(select("#", g.GetWidgetIgnoresPause(9999)) == 0)
+                g.SetWidgetUseResolutionCorrection(plain, false)
+                for i = 1, 40 do g.SendFlashInput(plain, i) end
+                "##,
+            )
+            .exec()
+            .unwrap();
+        let (movie, plain): (u32, u32) = host.lua().load("return movie, plain").eval().unwrap();
+        let mut s = screen.borrow_mut();
+        assert!(!s.widgets[&plain].resolution_correction);
+        assert!(s.widgets[&movie].resolution_correction);
+        assert_eq!(
+            s.take_flash_inputs(),
+            [
+                (movie, 9, FlashInput::Press),
+                (movie, 13, FlashInput::Press),
+                (movie, 37, FlashInput::Hold),
+                (movie, 37, FlashInput::Release),
+            ]
+        );
+        assert!(s.take_flash_inputs().is_empty());
+        // No more than 32 wait at once.
+        drop(s);
+        host.lua()
+            .load("for i = 1, 40 do _GuiInternal.SendFlashInput(movie, i) end")
+            .exec()
+            .unwrap();
+        assert_eq!(screen.borrow_mut().take_flash_inputs().len(), 32);
     }
 
     #[test]
