@@ -2756,6 +2756,16 @@ fn seat_crew(
 /// taking it stocks the item and posts `MunitionsPickup`, which
 /// JetCon001 counts its three bunker busters by.
 ///
+/// `DangerousBuilding` is the script of the buildings whose spawners start
+/// off (from the 360 code: nothing in the engine turns a spawner on that
+/// its data has off; only `Ai.TweakAttachedSpawners` does). As its
+/// building wakes: if it is labelled `Occupied`, it waits for the building
+/// to be damaged and turns all its spawners on; otherwise, unless 8
+/// buildings are dangerous already, it turns them on (the ground group
+/// off, the list `Spawnlist (VZ Tower)`) one time in its rarity (16 by
+/// default, `WifVzRegionNames`; `"never"` while OilCon001, OilCon020,
+/// OilCon021 and PirCon004 run).
+///
 /// `Tank`, `Helicopter` and `Airplane` are the scripts of the tanks' (38
 /// templates), the helicopters' (132) and the F35b's (2) radar blips, by
 /// the template database's `ObjectScript` records; their names are the
@@ -2771,14 +2781,18 @@ fn seat_crew(
 /// PMC's own green), set again as a driver gets in or out or the
 /// faction's attitude changes, and taken off while a player drives it
 /// ([`crate::hud::Blip`], `Hud.Radar:AddObjective`).
-pub const OBJECT_SCRIPTS: [(&str, u32); 6] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 7] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
+    ("DangerousBuilding", DANGEROUS_BUILDING),
     ("Tank", TANK),
     ("Helicopter", HELICOPTER),
     ("Airplane", AIRPLANE),
 ];
+
+/// `DangerousBuilding`'s module hash.
+pub const DANGEROUS_BUILDING: u32 = 0x5439_77f7;
 
 /// `Tank`'s module hash (the tanks' radar blip; see [`OBJECT_SCRIPTS`]).
 pub const TANK: u32 = 0xc686_ae99;
@@ -3499,6 +3513,18 @@ mod tests {
         bb.script_data = Some(3);
         assert!(activate(&lua, &[bb], true).is_empty());
         assert_eq!(lua.globals().get::<u32>("got").unwrap(), 3);
+    }
+
+    #[test]
+    fn a_dangerous_building_is_activated_as_its_layer_comes_in() {
+        let lua = mlua::Lua::new();
+        lua.load("DangerousBuilding = { OnActivate = function(g) woke = g end }")
+            .exec()
+            .unwrap();
+        let mut house = villa_tank();
+        house.script = Some(DANGEROUS_BUILDING);
+        assert!(activate(&lua, &[house], true).is_empty());
+        assert!(lua.globals().get::<mlua::Value>("woke").unwrap() != mlua::Value::Nil);
     }
 
     /// A tank's, a helicopter's and a plane's script is run on it as its

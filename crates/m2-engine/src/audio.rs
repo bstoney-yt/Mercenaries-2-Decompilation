@@ -14,8 +14,10 @@
 //!
 //! # Provenance
 //!
-//! Clean-room. Formats as `m2_assets::sound` decodes them; the mixing,
-//! falloff and panning are ordinary game-audio practice, not the game's.
+//! Formats as `m2_assets::sound` decodes them. From the 360 code: how a
+//! sound read from a cue record fades with distance ([`Falloff`]). The
+//! mixing and panning are ordinary game-audio practice, not the game's,
+//! and so is the fade of a sound with no record ([`Falloff::default`]).
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -235,11 +237,24 @@ impl SoundBuffer {
 }
 
 /// Distances, metres, for placed sounds: full volume within `near`,
-/// falling off as `near / distance` beyond it, silent past `far`.
+/// silent past `far`, and between them fading as the game's sound
+/// records say.
+///
+/// From the 360 code (the sound engine's fade, `0x828424A0`, called
+/// with the listener's distance by `0x828375F8`): the level is 1 at the
+/// near distance or closer, 0 at the far distance or beyond, and between
+/// them `1 - ((d - near) / (far - near)) ^ power`, the power the
+/// record's own ([`m2_assets::voice::Record::exponent`]).
+///
+/// A falloff with no power (`exponent: None`) is one made up here for a
+/// sound whose record is not read: it falls off as `near / distance`,
+/// faded out over the last fifth (invented).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Falloff {
     pub near: f32,
     pub far: f32,
+    /// The power of the game's fade; `None` for the stand-in curve.
+    pub exponent: Option<f32>,
 }
 
 impl Default for Falloff {
@@ -247,33 +262,52 @@ impl Default for Falloff {
         Self {
             near: 4.0,
             far: 250.0,
+            exponent: None,
         }
     }
 }
 
 impl Falloff {
-    /// A cue record's distances (`min_distance`, `max_distance`): full
-    /// within the first, silent past the second. `None` for a record that
-    /// gives none (0 or less, or the far no further than the near).
-    pub fn of_record(min_distance: f32, max_distance: f32) -> Option<Self> {
+    /// A cue record's distances and power (`min_distance`,
+    /// `max_distance`, `exponent`). `None` for a record that gives none
+    /// (a far of 0 or less, or no further than the near, or no power).
+    pub fn of_record(min_distance: f32, max_distance: f32, exponent: f32) -> Option<Self> {
         (min_distance.is_finite()
             && max_distance.is_finite()
+            && exponent.is_finite()
+            && exponent > 0.0
             && max_distance > 0.0
             && max_distance > min_distance)
-            .then(|| Self {
-                near: min_distance.max(1.0),
+            .then_some(Self {
+                near: min_distance,
                 far: max_distance,
+                exponent: Some(exponent),
             })
+    }
+
+    /// The falloff of `record`.
+    pub fn of(record: &m2_assets::voice::Record) -> Option<Self> {
+        Self::of_record(record.min_distance, record.max_distance, record.exponent)
     }
 
     pub fn gain(&self, distance: f32) -> f32 {
         if distance >= self.far {
             return 0.0;
         }
-        let g = self.near / distance.max(self.near);
-        // Fade the last fifth to zero so sounds don't cut out.
-        let edge = ((self.far - distance) / (self.far * 0.2)).clamp(0.0, 1.0);
-        g * edge
+        match self.exponent {
+            Some(power) => {
+                if distance <= self.near {
+                    return 1.0;
+                }
+                1.0 - ((distance - self.near) / (self.far - self.near)).powf(power)
+            }
+            None => {
+                let g = self.near / distance.max(self.near);
+                // Fade the last fifth to zero so sounds don't cut out.
+                let edge = ((self.far - distance) / (self.far * 0.2)).clamp(0.0, 1.0);
+                g * edge
+            }
+        }
     }
 }
 
@@ -946,7 +980,7 @@ impl EngineCue {
             tracks.push(EngineTrack {
                 sound,
                 volume: volume * t.level,
-                falloff: Falloff::of_record(record.min_distance, record.max_distance),
+                falloff: Falloff::of(record),
                 curves: curves.clone(),
             });
         }
@@ -1032,7 +1066,7 @@ impl KeySounds {
             if sounds.is_empty() {
                 continue;
             }
-            let falloff = Falloff::of_record(record.min_distance, record.max_distance);
+            let falloff = Falloff::of(record);
             let how = format!(
                 "cue of table {:08x}: {} of its {} variants (banks {}), volume {:.2}, heard {:.0} to {:.0} m",
                 t.hash,
@@ -1125,11 +1159,8 @@ impl KeySounds {
         // As far as its farthest-carrying record.
         let falloff = records
             .iter()
-            .filter_map(|(r, _, _)| Falloff::of_record(r.min_distance, r.max_distance))
-            .reduce(|a, b| Falloff {
-                near: a.near.max(b.near),
-                far: a.far.max(b.far),
-            });
+            .filter_map(|(r, _, _)| Falloff::of(r))
+            .reduce(|a, b| if b.far > a.far { b } else { a });
         let layers: Vec<(Vec<SoundBuffer>, f32, f32)> = records
             .iter()
             .map(|(r, start, level)| {
@@ -1921,14 +1952,8 @@ mod tests {
     #[test]
     fn an_engine_cue_reaches_as_far_as_its_farthest_track() {
         let mut c = engine_cue();
-        c.tracks[0].falloff = Some(Falloff {
-            near: 35.0,
-            far: 75.0,
-        });
-        c.tracks[1].falloff = Some(Falloff {
-            near: 10.0,
-            far: 80.0,
-        });
+        c.tracks[0].falloff = Falloff::of_record(35.0, 75.0, 1.0);
+        c.tracks[1].falloff = Falloff::of_record(10.0, 80.0, 1.0);
         assert_eq!(c.reach(), 80.0);
     }
 
@@ -2164,15 +2189,36 @@ mod tests {
     #[test]
     fn a_records_distances_set_how_far_it_carries() {
         // A gun shot's record: full to 10 m, gone at 1000 m.
-        let f = Falloff::of_record(10.0, 1000.0).unwrap();
+        let f = Falloff::of_record(10.0, 1000.0, 1.0).unwrap();
         assert_eq!((f.near, f.far), (10.0, 1000.0));
         assert_eq!(f.gain(10.0), 1.0);
         assert!(f.gain(300.0) > 0.0 && f.gain(1000.0) == 0.0);
         // Nothing given, or nonsense: none.
-        assert_eq!(Falloff::of_record(0.0, 0.0), None);
-        assert_eq!(Falloff::of_record(50.0, 20.0), None);
-        // A near closer than a metre is a metre.
-        assert_eq!(Falloff::of_record(0.0, 40.0).unwrap().near, 1.0);
+        assert_eq!(Falloff::of_record(0.0, 0.0, 1.0), None);
+        assert_eq!(Falloff::of_record(50.0, 20.0, 1.0), None);
+        assert_eq!(Falloff::of_record(10.0, 100.0, 0.0), None);
+        // The near is the record's own, however close.
+        assert_eq!(Falloff::of_record(0.0, 40.0, 1.0).unwrap().near, 0.0);
+    }
+
+    #[test]
+    fn a_record_fades_by_its_own_power_as_the_360_has_it() {
+        // 1 - ((d - near) / (far - near)) ^ power.
+        let at = |power: f32, d: f32| Falloff::of_record(10.0, 110.0, power).unwrap().gain(d);
+        // Full at the near and closer, none at the far and beyond.
+        for power in [0.25, 1.0, 2.0] {
+            assert_eq!(at(power, 0.0), 1.0);
+            assert_eq!(at(power, 10.0), 1.0);
+            assert_eq!(at(power, 110.0), 0.0);
+            assert_eq!(at(power, 500.0), 0.0);
+        }
+        // Power 1 is a straight line.
+        assert!((at(1.0, 35.0) - 0.75).abs() < 1e-6);
+        assert!((at(1.0, 60.0) - 0.5).abs() < 1e-6);
+        // A power above 1 holds its level longer; below 1 it drops at once.
+        assert!((at(2.0, 60.0) - 0.75).abs() < 1e-6);
+        assert!((at(0.5, 35.0) - 0.5).abs() < 1e-6);
+        assert!((at(0.25, 16.25) - 0.5).abs() < 1e-5);
     }
 
     #[test]

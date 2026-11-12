@@ -81,6 +81,10 @@ pub struct ParticleDraw {
     /// ([`fresh_hold`]).
     clock: f32,
     held_asks: HashMap<u64, f32>,
+    /// The three constants `Graphics.Effect.CameraFade` last set
+    /// ([`m2_engine::particles::camera_fade`]): particles fade out close
+    /// in front of the camera.
+    pub camera_fade: [f32; 3],
 }
 
 /// A light an effect lit: where, what, how old, and for a held effect
@@ -190,6 +194,7 @@ impl ParticleDraw {
             flashes: Vec::new(),
             clock: 0.0,
             held_asks: HashMap::new(),
+            camera_fade: m2_game::script_effects::FADE_ON,
         })
     }
 
@@ -495,7 +500,12 @@ impl ParticleDraw {
             } else {
                 sprite_light(&lights, s.at)
             };
-            quad(&mut self.vertices, s, right, up, light);
+            // The view looks down -z: the particle's depth along the
+            // camera's forward. Both blends weigh colour by alpha.
+            let depth = -v.transform_point3(s.at).z;
+            let mut s = *s;
+            s.colour[3] *= m2_engine::particles::camera_fade(depth, self.camera_fade);
+            quad(&mut self.vertices, &s, right, up, light);
         }
         let bytes: Vec<u8> = self.vertices.iter().flat_map(|f| f.to_le_bytes()).collect();
         backend.write_vertex_buffer(self.vb, 0, &bytes)?;
