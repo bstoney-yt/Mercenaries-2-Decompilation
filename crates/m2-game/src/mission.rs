@@ -31,6 +31,7 @@ use crate::events::Events;
 use crate::hud::render;
 use crate::layers::{LayerOp, LayerState, finished, layer_name};
 use crate::library::{KNOWN_MODULES, LOADERS, Library};
+use crate::object_hooks::{ON_DEATH, ON_STATE_CHANGE, death_args, state_change_args};
 use crate::script::{ScriptError, ScriptHost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
@@ -1179,6 +1180,12 @@ impl Mission {
             // No time scale yet: game and real time run together.
             w.clocks.step(dt as f32, dt as f32);
         }
+        // What the scripts killed since the last tick dies as anything
+        // else does: its own script's `OnDeath` hears of it.
+        let killed = std::mem::take(&mut self.world.borrow_mut().script_killed);
+        for guid in killed {
+            self.object_hook(guid, ON_DEATH, death_args(guid));
+        }
         // Streaming is instant here: a waiting state ends a second after
         // it was asked for, and the scripts hear that it did.
         {
@@ -2054,22 +2061,56 @@ impl Mission {
     }
 
     pub fn kill(&mut self, guid: u32) {
+        let mut died = false;
         if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            died = o.alive;
             o.alive = false;
             o.health = 0.0;
         }
+        if died {
+            self.object_hook(guid, ON_DEATH, death_args(guid));
+        }
+    }
+
+    /// Calls `hook` of `guid`'s object script, if it has one the port
+    /// runs ([`OBJECT_SCRIPTS`]) and the script has that hook
+    /// ([`crate::object_hooks`]). A failure is logged.
+    fn object_hook(&mut self, guid: u32, hook: &str, args: Vec<mlua::Value>) {
+        let record = crate::object_hooks::record(self.layers.values().flatten(), guid);
+        let lua = self.host.lua();
+        if let Err(e) = crate::object_hooks::call(lua, &OBJECT_SCRIPTS, record, hook, args) {
+            self.log.push(format!(
+                "  {hook} of {guid:#x}: {}",
+                first_lines(&e.to_string())
+            ));
+        }
+    }
+
+    /// One of object `guid`'s state machines (`machine`, its name's hash)
+    /// went to another state (`state`, its name's hash): its object
+    /// script's `OnStateChange` hears of it. To be called only when the
+    /// state really changed, after the states' own actions, as the engine
+    /// does (0x82231380).
+    pub fn object_state_changed(&mut self, guid: u32, machine: u32, state: u32) {
+        let args = state_change_args(guid, machine, state);
+        self.object_hook(guid, ON_STATE_CHANGE, args);
     }
 
     /// As [`kill`](Self::kill), by `killer` (her character, for what her
     /// shots, blasts and rams kill): the death event passes the killer
     /// to the scripts, which pay a hero-only bounty for it.
     pub fn kill_by(&mut self, guid: u32, killer: u32) {
+        let mut died = false;
         if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            died = o.alive;
             if o.alive {
                 o.killer = Some(killer);
             }
             o.alive = false;
             o.health = 0.0;
+        }
+        if died {
+            self.object_hook(guid, ON_DEATH, death_args(guid));
         }
     }
 
@@ -3725,6 +3766,66 @@ mod tests {
             parent: 0,
             flags: 0,
         }
+    }
+
+    #[test]
+    fn a_death_and_a_state_change_reach_the_objects_script_once() {
+        let mut crate_ = villa_tank();
+        crate_.script = Some(MUNITIONS);
+        crate_.script_data = Some(3);
+        let guid = crate_.guid;
+        let mut data = GameData::default();
+        data.layers.insert("test_layer".into(), vec![crate_]);
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        m.lua()
+            .load(
+                r#"
+                deaths, states = 0, 0
+                Munitions = {
+                    OnDeath = function(g, n) deaths = deaths + 1; dead, dead_data = g, n end,
+                    OnStateChange = function(g, machine, state, n)
+                        states = states + 1; to, state_data = state, n
+                    end,
+                }
+                "#,
+            )
+            .exec()
+            .unwrap();
+        m.world
+            .borrow_mut()
+            .insert(guid, Object::new("Munitions (Bunker Buster)", [0.0; 3]));
+        m.kill(guid);
+        // Already dead: the engine's death handler runs once.
+        m.kill(guid);
+        m.kill_by(guid, PLAYER);
+        let g = m.lua().globals();
+        assert_eq!(g.get::<u32>("deaths").unwrap(), 1);
+        assert_eq!(
+            g.get::<Value>("dead").unwrap(),
+            crate::events::guid_value(guid)
+        );
+        assert_eq!(g.get::<u32>("dead_data").unwrap(), 3);
+        // One a script kills dies the same way, at the next tick.
+        m.world
+            .borrow_mut()
+            .insert(guid, Object::new("Munitions (Bunker Buster)", [0.0; 3]));
+        m.lua()
+            .load("Object.Kill(...)")
+            .call::<()>(crate::events::guid_value(guid))
+            .unwrap();
+        m.tick(0.25);
+        m.tick(0.25);
+        assert_eq!(g.get::<u32>("deaths").unwrap(), 2);
+        m.object_state_changed(guid, 0x1111_2222, 0x7687_df41);
+        assert_eq!(g.get::<u32>("states").unwrap(), 1);
+        assert_eq!(
+            g.get::<Value>("to").unwrap(),
+            crate::events::guid_value(0x7687_df41)
+        );
+        assert_eq!(g.get::<u32>("state_data").unwrap(), 3);
+        // An object with no script of its own: nothing is called.
+        m.object_state_changed(0x999, 1, 2);
+        assert_eq!(g.get::<u32>("states").unwrap(), 1);
     }
 
     #[test]
