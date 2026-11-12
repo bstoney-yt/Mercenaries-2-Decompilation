@@ -338,6 +338,11 @@ pub struct GameData {
     /// Templates' labels (name hashes) by the template's name in lower
     /// case, for objects the scripts spawn.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Templates' object scripts by the template's name in lower case:
+    /// the module's hash and what the engine hands it
+    /// ([`Entity::script`], [`Entity::script_data`]), for objects the
+    /// scripts spawn.
+    pub template_scripts: HashMap<String, (u32, Option<u32>)>,
     /// The layers' `PhysicalLink` records by parent entity: (link name
     /// hash, child entity) ([`crate::links::physical_links`]).
     pub physical_links: HashMap<u32, Vec<(u32, u32)>>,
@@ -476,6 +481,12 @@ impl GameData {
                         if let Some(l) = template_labels.get(&id) {
                             data.template_labels
                                 .insert(name.to_ascii_lowercase(), l.clone());
+                        }
+                        if let Some(s) = template_scripts.get(&id) {
+                            data.template_scripts.insert(
+                                name.to_ascii_lowercase(),
+                                (*s, template_script_data.get(&id).copied()),
+                            );
                         }
                     }
                 } else if entry.type_hash == LAYER_TYPE
@@ -703,6 +714,7 @@ impl Mission {
             shapes,
             strings,
             template_labels,
+            template_scripts,
             physical_links,
             template_cash,
             template_names,
@@ -728,6 +740,7 @@ impl Mission {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
+            w.template_scripts = template_scripts;
             w.relations = relations
                 .into_iter()
                 .map(|(a, b, r)| ((a.to_ascii_lowercase(), b.to_ascii_lowercase()), r))
@@ -1084,13 +1097,30 @@ impl Mission {
                 }
             }
         }
+        let scripted;
         {
             let mut w = self.world.borrow_mut();
             w.update_hibernation();
             w.tick_raw_clips(dt as f32);
+            scripted = (
+                std::mem::take(&mut w.script_spawns),
+                std::mem::take(&mut w.script_removals),
+            );
             let mut waves = std::mem::take(&mut w.heli_waves);
             waves.update(dt as f32, &mut *w);
             w.heli_waves = waves;
+        }
+        // The object scripts of what the scripts spawned and removed
+        // since the last tick ([`OBJECT_SCRIPTS`]).
+        let (spawned, removed) = scripted;
+        for (guid, script, data, load) in spawned
+            .into_iter()
+            .map(|(g, s, d)| (g, s, d, true))
+            .chain(removed.into_iter().map(|(g, s)| (g, s, None, false)))
+        {
+            if let Some(Err(f)) = object_script(self.host.lua(), script, load, guid, data) {
+                self.log.push(format!("  {f} (spawned {guid:#x})"));
+            }
         }
         for t in self.events.take_trace() {
             self.log.push(format!("  t={:.1} event {t}", self.now));
@@ -1834,6 +1864,18 @@ impl Mission {
 
     /// Aircraft `guid` (an [`Command::Flyby`]) has reached the end of its
     /// run at `at`: its script lets its ordnance go.
+    /// The game says a flyby's plane has flown on out of play: its object
+    /// goes, and its object script is told (its radar blip comes off).
+    /// That the plane is deleted once it has flown off is inferred, not
+    /// read from the 360 code.
+    pub fn flyby_gone(&mut self, guid: u32) {
+        let mut w = self.world.borrow_mut();
+        w.objects.remove(&guid);
+        if let Some(script) = w.scripted.remove(&guid) {
+            w.script_removals.push((guid, script));
+        }
+    }
+
     pub fn flyby_arrived(&mut self, guid: u32, at: [f32; 3]) {
         self.strike_callbacks(guid, at, true, "flyby arrived");
     }
@@ -2771,13 +2813,14 @@ fn seat_crew(
 /// PMC's own green), set again as a driver gets in or out or the
 /// faction's attitude changes, and taken off while a player drives it
 /// ([`crate::hud::Blip`], `Hud.Radar:AddObjective`).
-pub const OBJECT_SCRIPTS: [(&str, u32); 6] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 7] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
     ("Tank", TANK),
     ("Helicopter", HELICOPTER),
     ("Airplane", AIRPLANE),
+    ("SupportAirPlane", SUPPORT_AIRPLANE),
 ];
 
 /// `Tank`'s module hash (the tanks' radar blip; see [`OBJECT_SCRIPTS`]).
@@ -2788,6 +2831,15 @@ pub const HELICOPTER: u32 = 0x800d_c82e;
 
 /// `Airplane`'s module hash (the F35b's radar blip).
 pub const AIRPLANE: u32 = 0xf800_2bbf;
+
+/// `SupportAirPlane`'s module hash: the script of the 29
+/// `Support Vehicle (...)` templates (the airstrikes' and deliveries'
+/// planes and the cruise missile). As one comes into play it blips at
+/// once, `temp_radar_icon_airplane` or its type's by its label (`C130`,
+/// `Mig27`, `F35`, `b2`, `f117`, `a10`, `ov10`, `cruisemissile`), size
+/// 5, coloured by its faction's relation to the PMC as the vehicles' are
+/// but neutral (200, 200, 200); one labelled `PMC` is made unkillable.
+pub const SUPPORT_AIRPLANE: u32 = 0x1e47_a21c;
 
 /// `Munitions`' module hash.
 pub const MUNITIONS: u32 = 0xf71e_9491;
@@ -2811,35 +2863,34 @@ pub const FRIENDLY_GATE: u32 = 0x6d4f_9301;
 /// Runs the object scripts of `entities` (see [`OBJECT_SCRIPTS`]) as their
 /// layer comes in (`load`) or goes. Returns what failed.
 fn activate(lua: &mlua::Lua, entities: &[Entity], load: bool) -> Vec<String> {
-    let mut failed = Vec::new();
-    for e in entities {
-        let Some((module, _)) = e
-            .script
-            .and_then(|h| OBJECT_SCRIPTS.iter().find(|(_, s)| *s == h))
-        else {
-            continue;
-        };
-        let call = if load { "OnActivate" } else { "OnDeactivate" };
-        let result = lua
-            .globals()
+    entities
+        .iter()
+        .filter_map(|e| {
+            let run = object_script(lua, e.script?, load, e.guid, e.script_data)?;
+            run.err().map(|f| format!("{f} {}", e.name))
+        })
+        .collect()
+}
+
+/// Runs object script `script` on `guid` as it comes into play (`load`:
+/// `OnActivate(guid, nil, data)`) or goes (`OnDeactivate`), if it is one
+/// of [`OBJECT_SCRIPTS`]; what failed, as `Module.Call: error`.
+fn object_script(
+    lua: &mlua::Lua,
+    script: u32,
+    load: bool,
+    guid: u32,
+    data: Option<u32>,
+) -> Option<Result<(), String>> {
+    let (module, _) = OBJECT_SCRIPTS.iter().find(|(_, s)| *s == script)?;
+    let call = if load { "OnActivate" } else { "OnDeactivate" };
+    Some(
+        lua.globals()
             .get::<mlua::Table>(*module)
             .and_then(|m| m.get::<mlua::Function>(call))
-            .and_then(|f| {
-                f.call::<()>((
-                    crate::events::guid_value(e.guid),
-                    mlua::Value::Nil,
-                    e.script_data,
-                ))
-            });
-        if let Err(err) = result {
-            failed.push(format!(
-                "{module}.{call} {}: {}",
-                e.name,
-                first_lines(&err.to_string())
-            ));
-        }
-    }
-    failed
+            .and_then(|f| f.call::<()>((crate::events::guid_value(guid), mlua::Value::Nil, data)))
+            .map_err(|err| format!("{module}.{call}: {}", first_lines(&err.to_string()))),
+    )
 }
 
 /// The first lines of a (Lua) error, on one line.

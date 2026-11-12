@@ -1064,6 +1064,15 @@ pub struct ScriptWorld {
     pub reticle_target: Option<([f32; 3], Option<u32>)>,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Templates' object scripts by name in lower case: the module's hash
+    /// and its data ([`crate::mission::GameData::template_scripts`]).
+    pub template_scripts: HashMap<String, (u32, Option<u32>)>,
+    /// Objects spawned since the last tick whose template names an object
+    /// script (guid, script, data), for the mission to run it on them;
+    /// those it ran one on, by guid; and those of them removed since.
+    pub script_spawns: Vec<(u32, u32, Option<u32>)>,
+    pub scripted: HashMap<u32, u32>,
+    pub script_removals: Vec<(u32, u32)>,
     /// Templates' cash values by name in lower case ([`crate::cash`]).
     pub template_cash: HashMap<String, i32>,
     /// Every template the template database names, in lower case: the
@@ -1415,6 +1424,7 @@ impl ScriptWorld {
         }
         self.insert(guid, object);
         self.fresh.push(guid);
+        self.note_script(guid, &lower);
         self.commands.push(Command::Spawn {
             guid,
             what,
@@ -1553,6 +1563,16 @@ impl ScriptWorld {
         });
         if let Some(c) = found.and_then(|w| self.inventory.carried.get_mut(&w)) {
             c.reserve = rounds;
+        }
+    }
+
+    /// Notes that `guid`, just spawned from template `lower` (its name in
+    /// lower case), is to have its template's object script run on it, as
+    /// the engine runs it on every object of the template.
+    pub(crate) fn note_script(&mut self, guid: u32, lower: &str) {
+        if let Some(&(script, data)) = self.template_scripts.get(lower) {
+            self.script_spawns.push((guid, script, data));
+            self.scripted.insert(guid, script);
         }
     }
 
@@ -3084,6 +3104,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         if let Some(guid) = id(a.first()) {
             if w.objects.remove(&guid).is_some_and(|o| o.alive) {
                 w.removed_alive.insert(guid);
+            }
+            if let Some(script) = w.scripted.remove(&guid) {
+                w.script_removals.push((guid, script));
             }
             w.inventory.drop(guid);
             w.commands.push(Command::Remove(guid));

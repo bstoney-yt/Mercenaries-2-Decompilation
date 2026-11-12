@@ -5746,6 +5746,14 @@ fn report_strikes(game: &mut Game, mission: &mut Mission) -> (u32, u32) {
     }
     let strikes = &mut game.scene.strikes;
     let counts = (strikes.arrived.len() as u32, strikes.burst.len() as u32);
+    // The planes in the air, where they are (their radar blips follow
+    // them), and those flown off.
+    for (g, at, yaw) in strikes.jets() {
+        mission.place(g, at.to_array(), yaw);
+    }
+    for g in strikes.gone.drain(..) {
+        mission.flyby_gone(g);
+    }
     for (g, at) in strikes.arrived.drain(..) {
         mission.flyby_arrived(g, at.to_array());
     }
