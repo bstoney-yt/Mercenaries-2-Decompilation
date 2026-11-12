@@ -12,9 +12,10 @@
 //!   sets three render constants at `0x82B80B48` (`0x821E41C8`): (2.25,
 //!   1.25, 1.0) for nonzero, the values the image starts with, and (0.1,
 //!   0.0, 0.1) for zero. It answers nothing; nil without a number. The
-//!   hijack sets 0 on entry and 1 on exit. The renderer's use of the
-//!   three values wasn't traced, and the port's renderer doesn't read
-//!   [`EffectsState::camera_fade`] yet.
+//!   hijack sets 0 on entry and 1 on exit. The three are far, near and
+//!   range of the particles' fade close to the camera (the particle sort
+//!   pass, `0x821E3440`), which the alpha's particle draw applies from
+//!   [`EffectsState::camera_fade`] (`m2_engine::particles::camera_fade`).
 //! - `Graphics.Effect.Terrain(name, a [, b] [, at])` (`0x8231A5D0`) and
 //!   `AmbientTop`/`AmbientSides(name, slot, a [, b])` (`0x8231A4F0`,
 //!   `0x8231A6D0`) spawn an effect object from the named model (kinds 6 and
