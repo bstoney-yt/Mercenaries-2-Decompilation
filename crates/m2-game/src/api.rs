@@ -1056,6 +1056,8 @@ pub struct ScriptWorld {
     pub boundary_callback: Option<Function>,
     /// What the setter ports of missing natives keep ([crate::ported_misc]).
     pub misc: crate::ported_misc::MiscState,
+    /// The alarms in play and their messages ([crate::alarm]).
+    pub alarms: crate::alarm::Alarms,
     pub outside: bool,
     /// What the initialiser ports of missing natives keep ([crate::ported_init]).
     pub init: crate::ported_init::InitState,

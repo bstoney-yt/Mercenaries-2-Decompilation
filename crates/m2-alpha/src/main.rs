@@ -4461,7 +4461,7 @@ fn mission_for_screenshot(
                 a.in_hq = link.in_hq();
                 a.exits = link.exit_offers();
                 a.enters = link.enter_offers_for(failed_contract.as_deref());
-                let objectives = link.view().objectives;
+                let objectives = link.objectives();
                 spans::time("autoplay", || {
                     a.step(game, &marks, &objectives, &link.awaited(), tick)
                 })
@@ -5012,7 +5012,7 @@ fn mission_for_screenshot(
         // (inferred: the box shows one at a time, which isn't kept).
         if late_hud.is_none() {
             let now = i as f32 * tick;
-            for c in link.view().hud_calls {
+            for c in link.hud_calls_after(boxed_seen) {
                 if c.seq <= boxed_seen {
                     continue;
                 }
@@ -5419,7 +5419,7 @@ fn mission_for_screenshot(
             }
         }
         if auto.is_some() {
-            let shown = link.view().tutorial;
+            let shown = link.tutorial();
             if shown != tutorial_shown {
                 eprintln!(
                     "autoplay: the tutorial box reads {shown:?} at {:.1} s",
