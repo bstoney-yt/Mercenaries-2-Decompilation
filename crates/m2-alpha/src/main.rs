@@ -1512,7 +1512,7 @@ fn loading_screen(install: Option<&Install>) -> Option<loading::LoadingScreen> {
                 "loading screen: {} read, {} of {} hints",
                 loading::MOVIE,
                 screen.hints_read(),
-                loading::HINTS.len()
+                loading::HINTS
             );
             Some(screen)
         }
