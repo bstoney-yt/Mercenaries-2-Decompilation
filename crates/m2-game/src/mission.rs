@@ -31,6 +31,7 @@ use crate::events::Events;
 use crate::hud::render;
 use crate::layers::{LayerOp, LayerState, finished, layer_name};
 use crate::library::{KNOWN_MODULES, LOADERS, Library};
+use crate::object_hooks::{ON_DEATH, ON_STATE_CHANGE, death_args, state_change_args};
 use crate::script::{ScriptError, ScriptHost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
@@ -1942,22 +1943,56 @@ impl Mission {
     }
 
     pub fn kill(&mut self, guid: u32) {
+        let mut died = false;
         if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            died = o.alive;
             o.alive = false;
             o.health = 0.0;
         }
+        if died {
+            self.object_hook(guid, ON_DEATH, death_args(guid));
+        }
+    }
+
+    /// Calls `hook` of `guid`'s object script, if it has one the port
+    /// runs ([`OBJECT_SCRIPTS`]) and the script has that hook
+    /// ([`crate::object_hooks`]). A failure is logged.
+    fn object_hook(&mut self, guid: u32, hook: &str, args: Vec<mlua::Value>) {
+        let record = crate::object_hooks::record(self.layers.values().flatten(), guid);
+        let lua = self.host.lua();
+        if let Err(e) = crate::object_hooks::call(lua, &OBJECT_SCRIPTS, record, hook, args) {
+            self.log.push(format!(
+                "  {hook} of {guid:#x}: {}",
+                first_lines(&e.to_string())
+            ));
+        }
+    }
+
+    /// One of object `guid`'s state machines (`machine`, its name's hash)
+    /// went to another state (`state`, its name's hash): its object
+    /// script's `OnStateChange` hears of it. To be called only when the
+    /// state really changed, after the states' own actions, as the engine
+    /// does (0x82231380).
+    pub fn object_state_changed(&mut self, guid: u32, machine: u32, state: u32) {
+        let args = state_change_args(guid, machine, state);
+        self.object_hook(guid, ON_STATE_CHANGE, args);
     }
 
     /// As [`kill`](Self::kill), by `killer` (her character, for what her
     /// shots, blasts and rams kill): the death event passes the killer
     /// to the scripts, which pay a hero-only bounty for it.
     pub fn kill_by(&mut self, guid: u32, killer: u32) {
+        let mut died = false;
         if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            died = o.alive;
             if o.alive {
                 o.killer = Some(killer);
             }
             o.alive = false;
             o.health = 0.0;
+        }
+        if died {
+            self.object_hook(guid, ON_DEATH, death_args(guid));
         }
     }
 
