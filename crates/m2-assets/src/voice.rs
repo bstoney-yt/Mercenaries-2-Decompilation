@@ -23,7 +23,9 @@
 //! ```text
 //! 0x00  u32  cue hash
 //! 0x04  u32  category (`POSITIONAL` or `RADIO`, below)
-//! 0x10  f32  volume
+//! 0x0c  u8   0: a short record, its level and pitch at 0x2c and 0x30;
+//!            1: a long one, their ranges at 0x50 and 0x5c
+//! 0x10  f32  priority (not its level: see [`record_level`])
 //! 0x14  u32  1 on the positional lines inspected, 0 on radio (unchecked)
 //! 0x18  f32  distance at which it starts to fade
 //! 0x1c  f32  distance beyond which it is not heard
@@ -260,12 +262,47 @@ pub struct PlainCue {
     pub seconds: f32,
 }
 
+/// The level a record's sound plays at, and its priority (the float at
+/// 0x10).
+///
+/// From the 360 code: a sound starts (`0x82838320`) at the level
+/// `0x82842E40` answers: for a record whose byte at 0xc is 0, the float
+/// at 0x2c; for one with it set, a level drawn evenly between the
+/// floats at 0x50 and 0x54. The float at 0x10, which was taken for the
+/// volume here, is the record's priority: `PalSoundInstance::
+/// GetWavePriority` (`0x828379C0`) answers it times the sound's fade
+/// with distance, for choosing which sounds to drop
+/// (`GetLowestPrioritySound`, `0x82837D90`); nothing multiplies it into
+/// the level.
+///
+/// From the data (the `recordvol` example, 1,776 records): every
+/// 64-byte record has the byte clear and every longer one has it set;
+/// the levels are steps of decibels (0.3162, 0.3981, 0.5012, 0.6310,
+/// 0.7079, 1.0), where the float at 0x10 is 0.85 or 0.96 on nearly all.
+///
+/// The level answered for a range is its middle (the draw itself, and
+/// the pitch beside it at 0x30 or 0x5c..0x60, are not played yet).
+pub fn record_level(rec: &[u8]) -> (f32, f32) {
+    let f = |at: usize| {
+        rec.get(at..at + 4)
+            .map_or(0.0, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let ranged = rec.get(0xc).is_some_and(|&b| b != 0) && rec.len() >= 0x58;
+    let level = if ranged {
+        (f(0x50) + f(0x54)) * 0.5
+    } else {
+        f(0x2c)
+    };
+    (level, f(0x10))
+}
+
 /// A record as the cue list points at it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
     /// The cue hash its first word holds (0 for a record too short to
     /// hold one).
     pub cue: u32,
+    /// The level it plays at ([`record_level`]).
     pub volume: f32,
     /// Fades from `min_distance` and is not heard beyond `max_distance`
     /// (metres: the guns' shots 10 and 1000 or so), as a line's (0x18 and
@@ -386,7 +423,7 @@ impl CueTable {
                 };
                 all.push(Record {
                     cue: word(0),
-                    volume: f32::from_bits(word(0x10)),
+                    volume: record_level(rec).0,
                     min_distance: f32::from_bits(word(0x18)),
                     max_distance: f32::from_bits(word(0x1c)),
                     positional: rec[0x14] != 0,
@@ -422,7 +459,7 @@ impl CueTable {
                 groups.push(Group {
                     cue: word(0),
                     category: word(4),
-                    volume: f32::from_bits(word(0x10)),
+                    volume: record_level(rec).0,
                     min_distance: f32::from_bits(word(0x18)),
                     max_distance: f32::from_bits(word(0x1c)),
                     streams: (GROUP_VARIANTS..size)
@@ -439,7 +476,7 @@ impl CueTable {
             lines.push(Line {
                 cue: word(0),
                 category: word(4),
-                volume: f32::from_bits(word(0x10)),
+                volume: record_level(&rec).0,
                 min_distance: f32::from_bits(word(0x18)),
                 max_distance: f32::from_bits(word(0x1c)),
                 stream: word(0x38),
@@ -666,7 +703,9 @@ mod tests {
         let mut w = [0u32; 16];
         w[0] = cue;
         w[1] = category;
-        w[4] = 0.7f32.to_bits();
+        // Its priority, and (a short record) its level at 0x2c.
+        w[4] = 0.85f32.to_bits();
+        w[11] = 0.7f32.to_bits();
         w[5] = u32::from(category == POSITIONAL);
         w[6] = min.to_bits();
         w[7] = max.to_bits();
@@ -678,7 +717,11 @@ mod tests {
         let mut w = vec![0u32; GROUP_VARIANTS / 4];
         w[0] = cue;
         w[1] = POSITIONAL;
-        w[4] = 1.0f32.to_bits();
+        // A long record: its level drawn between 0x50 and 0x54.
+        w[3] = 1;
+        w[4] = 0.85f32.to_bits();
+        w[20] = 0.5f32.to_bits();
+        w[21] = 0.7f32.to_bits();
         for &s in streams {
             w.extend([0x4216_80b7, s, (1.0 / streams.len() as f32).to_bits()]);
         }
@@ -695,6 +738,8 @@ mod tests {
         let t = CueTable::parse_data(&d).unwrap();
         assert_eq!((t.hash, t.groups.len(), t.lines.len()), (0xabcd, 1, 2));
         assert_eq!(t.groups[0].streams, [(7, 0.5), (8, 0.5)]);
+        // The middle of its range, not its priority.
+        assert!((t.groups[0].volume - 0.6).abs() < 1e-6);
         assert!(t.groups[0].is_positional());
         assert_eq!(t.streams(9), Some(vec![7, 8]));
         assert_eq!(t.streams(2), Some(vec![610]));
