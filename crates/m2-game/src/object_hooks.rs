@@ -38,7 +38,7 @@
 //! **Invented:** nothing. Only entities placed in layers have a record
 //! here; objects spawned in play do not.
 
-use mlua::{Function, Lua, MultiValue, Table, Value};
+use mlua::{Function, IntoLua, Lua, MultiValue, Table, Value};
 
 use crate::events::guid_value;
 use crate::mission::Entity;
@@ -85,7 +85,9 @@ pub fn call(
         return Ok(false);
     };
     let mut args = args;
-    args.push(data.map_or(Value::Nil, |d| Value::Integer(i64::from(d))));
+    // As `OnActivate`'s is handed over: a number (an integer where the
+    // build's Lua integers hold it).
+    args.push(data.into_lua(lua)?);
     function.call::<()>(MultiValue::from_vec(args))?;
     Ok(true)
 }
@@ -133,7 +135,7 @@ mod tests {
         let record = Some((0xcf21_0c94, Some(7)));
         assert!(call(&lua, &MODULES, record, ON_DEATH, death_args(0x1234)).unwrap());
         assert_eq!(seen(&lua, 1, 2), guid_value(0x1234));
-        assert_eq!(seen(&lua, 1, 3), Value::Integer(7));
+        assert_eq!(crate::events::as_guid(&seen(&lua, 1, 3)), Some(7));
         assert_eq!(seen(&lua, 1, 4), Value::Nil);
     }
 
