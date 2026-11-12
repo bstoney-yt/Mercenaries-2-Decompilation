@@ -165,6 +165,56 @@ pub struct Atmosphere {
     /// `AmbientEffect0`..`4`: the particle effects the record keeps about
     /// the camera ([`AmbientEffect`]); unused slots have no template.
     pub ambient: [AmbientEffect; 5],
+    /// `ScreenEffect0...`: the record's screen overlay ([`ScreenEffect`]).
+    pub screen: ScreenEffect,
+}
+
+/// A record's screen overlay (`ScreenEffect0Speed`, `...Density`,
+/// `...DirX`, `...DirY`, `...Texture`, `...Color`, `...Type`): rain and the
+/// like, drawn over the whole screen while `density` is above 0.
+///
+/// From the 360 code (0x8224C398): of the record's seven slots only slot 0
+/// is read; slots 1..6 have no reader. Between two records the speed,
+/// density and direction blend, the colour blends byte by byte, and the
+/// texture and type switch halfway. They go to the "rain" object
+/// (0x821BF458), which scrolls by `speed` along `dir` and draws one
+/// full-screen quad with `PgRainVP`/`PgRainFP` (0x821BF628). The port
+/// reads the fields and doesn't draw the overlay yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScreenEffect {
+    pub speed: f32,
+    pub density: f32,
+    /// `DirX`, `DirY`.
+    pub dir: [f32; 2],
+    /// The texture's name hash; 0 for none.
+    pub texture: u32,
+    /// The colour word as stored.
+    pub colour: u32,
+    /// `ScreenEffect0Type`: picks the blend (1, 2 or other; meanings not
+    /// read).
+    pub kind: u32,
+}
+
+impl ScreenEffect {
+    /// `t` of the way from `self` to `to`, as 0x8224C398 blends them.
+    pub fn lerp(&self, to: &Self, t: f32) -> Self {
+        let f = |a: f32, b: f32| a + (b - a) * t;
+        // Each byte on its own, truncated as the game's integer convert.
+        let byte = |shift: u32| {
+            let a = (self.colour >> shift & 0xff) as f32;
+            let b = (to.colour >> shift & 0xff) as f32;
+            ((a + (b - a) * t) as u32 & 0xff) << shift
+        };
+        let late = if t > 0.5 { to } else { self };
+        Self {
+            speed: f(self.speed, to.speed),
+            density: f(self.density, to.density),
+            dir: [f(self.dir[0], to.dir[0]), f(self.dir[1], to.dir[1])],
+            texture: late.texture,
+            colour: byte(24) | byte(16) | byte(8) | byte(0),
+            kind: late.kind,
+        }
+    }
 }
 
 /// One of a record's ambient effects (`AmbientEffectN...`): on every
@@ -451,6 +501,17 @@ impl Atmosphere {
                 height: float(&format!("AmbientEffect{i}Height")).unwrap_or(0.0),
                 variance: float(&format!("AmbientEffect{i}Variance")).unwrap_or(0.0),
             }),
+            screen: ScreenEffect {
+                speed: float("ScreenEffect0Speed").unwrap_or(0.0),
+                density: float("ScreenEffect0Density").unwrap_or(0.0),
+                dir: [
+                    float("ScreenEffect0DirX").unwrap_or(0.0),
+                    float("ScreenEffect0DirY").unwrap_or(0.0),
+                ],
+                texture: field("ScreenEffect0Texture").unwrap_or(0),
+                colour: field("ScreenEffect0Color").unwrap_or(0),
+                kind: field("ScreenEffect0Type").unwrap_or(0),
+            },
             night: if field("Name") == Some(name_hash("night")) {
                 1.0
             } else {
@@ -572,6 +633,7 @@ impl Atmosphere {
             night: f(self.night, to.night),
             // The game swaps them whole on a change ([`AmbientEffect`]).
             ambient: to.ambient,
+            screen: self.screen.lerp(&to.screen, t),
             water_ramp: match (self.water_ramp, to.water_ramp) {
                 (Some(a), Some(b)) => Some(std::array::from_fn(|i| a[i].lerp(b[i], t))),
                 (_, b) => b,
@@ -1328,6 +1390,7 @@ mod tests {
             monochrome: None,
             night: 0.0,
             ambient: [AmbientEffect::default(); 5],
+            screen: ScreenEffect::default(),
         }
     }
 
@@ -1434,6 +1497,32 @@ mod tests {
         a.apply(&mut lighting);
         assert_eq!(lighting.sun_disc, a.sun_disc());
     }
+    #[test]
+    fn the_screen_effect_blends_as_the_game_does() {
+        // 0x8224C398: numbers and colour bytes blend, texture and type
+        // switch past halfway.
+        let rain = ScreenEffect {
+            speed: 2.0,
+            density: 1.0,
+            dir: [0.5, -1.0],
+            texture: 0x1234,
+            colour: 0x80ff_4000,
+            kind: 1,
+        };
+        let none = ScreenEffect::default();
+        let early = none.lerp(&rain, 0.25);
+        assert_eq!(early.speed, 0.5);
+        assert_eq!(early.density, 0.25);
+        assert_eq!(early.dir, [0.125, -0.25]);
+        assert_eq!((early.texture, early.kind), (0, 0));
+        assert_eq!(early.colour, 0x203f_1000);
+        let half = none.lerp(&rain, 0.5);
+        assert_eq!((half.texture, half.kind), (0, 0));
+        let late = none.lerp(&rain, 0.75);
+        assert_eq!((late.texture, late.kind), (0x1234, 1));
+        assert_eq!(none.lerp(&rain, 1.0), rain);
+    }
+
     #[test]
     fn a_change_takes_the_new_records_ambient_effects_whole() {
         // 0x8224D650 deletes the last record's and spawns the new one's.
