@@ -12,7 +12,7 @@
 //! and a readable account of the session in [`Mission::take_log`].
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
@@ -31,6 +31,7 @@ use crate::events::Events;
 use crate::hud::render;
 use crate::layers::{LayerOp, LayerState, finished, layer_name};
 use crate::library::{KNOWN_MODULES, LOADERS, Library};
+use crate::object_hooks::{ON_DEATH, ON_STATE_CHANGE, death_args, state_change_args};
 use crate::script::{ScriptError, ScriptHost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
@@ -295,6 +296,9 @@ pub struct Entity {
     /// The template it was placed as (`Mi35 (Solano)` for PmcCon004's
     /// `Mi35 (Solano Hijack)`), by name, when the database names it.
     pub template: Option<String>,
+    /// Whether it has an alarm (the `Alarm` component, its own or its
+    /// template's: the alarm towers; [`crate::alarm`]).
+    pub alarm: bool,
 }
 
 impl Entity {
@@ -420,6 +424,7 @@ impl GameData {
         let mut template_labels: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut template_scripts: HashMap<u32, u32> = HashMap::new();
         let mut template_script_data: HashMap<u32, u32> = HashMap::new();
+        let mut template_alarms: HashSet<u32> = HashSet::new();
         // Faction zones' faction templates, and every template's name.
         let mut zone_factions: Vec<(String, usize, u32)> = Vec::new();
         let mut template_names: HashMap<u32, String> = HashMap::new();
@@ -460,6 +465,7 @@ impl GameData {
                     data.template_cash = crate::cash::template_cash(&db);
                     template_scripts = db.hashes("ObjectScript");
                     template_script_data = script_data(&db);
+                    template_alarms = carriers(&db, "Alarm");
                     template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
                     data.relations = m2_engine::ai::relations(&db);
@@ -486,6 +492,7 @@ impl GameData {
                     let lines = layer.hashes("LineRegion");
                     let scripts = layer.hashes("ObjectScript");
                     let own_data = script_data(&layer);
+                    let alarms = carriers(&layer, "Alarm");
                     let zones = layer.hashes("FactionZone");
                     let path_of = layer.hashes("Path");
                     let mut rides = layer
@@ -521,6 +528,7 @@ impl GameData {
                             path: Vec::new(),
                             template: None,
                             crew: Vec::new(),
+                            alarm: alarms.contains(&guid),
                         });
                         if let Some(r) = rides.remove(&guid) {
                             own_riders.push((name.clone(), list.len() - 1, r));
@@ -545,6 +553,7 @@ impl GameData {
             if e.script_data.is_none() {
                 e.script_data = template_script_data.get(template).copied();
             }
+            e.alarm |= template_alarms.contains(template);
         }
         for (layer, i, template) in zone_factions {
             if let Some(n) = template_names.get(&template) {
@@ -688,6 +697,11 @@ pub struct Mission {
     black: f32,
     /// [`FADE`], compiled once (on the first tick) rather than every tick.
     fade: Option<mlua::Function>,
+    /// The scripts' joined callback is called for her
+    /// ([`set_script_join`](Self::set_script_join)).
+    script_join: bool,
+    /// The joined callback was called.
+    joined: bool,
 }
 
 impl Mission {
@@ -877,6 +891,8 @@ impl Mission {
             movie_out: false,
             black: 0.0,
             fade: None,
+            script_join: false,
+            joined: false,
         };
         mission.settle("set-up");
         Ok(mission)
@@ -1013,6 +1029,7 @@ impl Mission {
                     .push(format!("  {name}: {}", first_lines(&e.to_string())));
             }
         }
+        self.join_player();
         if saved.is_some() {
             self.world.borrow_mut().saved = None;
             let _ = self.host.lua().globals().set("__m2_saved", Value::Nil);
@@ -1058,17 +1075,116 @@ impl Mission {
         });
     }
 
+    /// Has the game call the scripts' "player joined" callback for her,
+    /// as the 360 does, once it is registered (off unless asked for).
+    ///
+    /// From the 360 code: the game state entered before the wait for
+    /// streaming (0x8220EC98) queues a join record for local player 0,
+    /// and the game update (0x82466F28, then 0x82467230) calls the
+    /// callback `Player.SetPlayerJoinedCallback` kept, once there is one,
+    /// with `(0, name, { iIndex, iUpgrade, iCostume }, true, 0)`: the
+    /// three numbers are the profile's character, upgrade and costume
+    /// (bytes +0x61..+0x63, what `Player.GetProfileCharacter`,
+    /// `GetProfileUpgrade` and `GetProfileCostume` answer), and the last
+    /// argument is always 0. `MrxPlayer.OnPlayerJoined` (from the script,
+    /// 8d35cf13) then spawns her template, attaches and binds it, has her
+    /// interface made, makes her an AI subject, watches for her death
+    /// (`PlayerDied`), calls the current mission's `OnPlayerJoined` and
+    /// posts `mpPlayerJoin`.
+    ///
+    /// Inferred: `iIndex` counts the heroes from 1 in the order of
+    /// `MrxPlayer`'s own table (Mattias, Chris, Jennifer), because the
+    /// script indexes that table with it; the profile's own numbering is
+    /// not traced.
+    ///
+    /// Invented: her character stays the one the game made (the script's
+    /// `Pg.Spawn` is answered with it, and she is not moved to the
+    /// script's start point); `iUpgrade` is 0 (the port keeps no upgrade),
+    /// so her base template is asked for; the name is the hero's (on the
+    /// 360 a run-time string, untraced; the script only prints it); and
+    /// the call is made when play starts, or on the first tick after the
+    /// callback is registered, rather than on the 360's game state.
+    pub fn set_script_join(&mut self, on: bool) {
+        self.script_join = on;
+    }
+
+    /// Whether the joined callback has been called for her.
+    pub fn player_joined(&self) -> bool {
+        self.joined
+    }
+
+    /// Calls the joined callback for her, once, when the switch is on and
+    /// the scripts have registered one.
+    fn join_player(&mut self) {
+        if !self.script_join || self.joined {
+            return;
+        }
+        let lua = self.host.lua();
+        let Some(callback) = crate::character_binding::joined_callback(lua) else {
+            return;
+        };
+        self.joined = true;
+        let (name, costume) = {
+            let mut w = self.world.borrow_mut();
+            w.joining = true;
+            let name = w
+                .player
+                .and_then(|p| w.objects.get(&p))
+                .map(|o| o.name.clone())
+                .unwrap_or_default();
+            (name, w.profile_costume)
+        };
+        let index = match name.to_ascii_lowercase().as_str() {
+            "mattias" => Some(1),
+            "chris" => Some(2),
+            "jennifer" => Some(3),
+            _ => None,
+        };
+        let result = lua.create_table().and_then(|profile| {
+            if let Some(i) = index {
+                profile.raw_set("iIndex", i)?;
+            }
+            profile.raw_set("iUpgrade", 0)?;
+            profile.raw_set("iCostume", costume)?;
+            callback.call::<()>((0, name.as_str(), profile, true, 0))
+        });
+        let asked = {
+            let mut w = self.world.borrow_mut();
+            w.joining = false;
+            w.joined_template.clone()
+        };
+        let now = self.now;
+        self.log.push(match result {
+            Ok(()) => format!(
+                "t={now:.1} player joined: the scripts' callback ran for {name} (template {})",
+                asked.as_deref().unwrap_or("none asked for")
+            ),
+            Err(e) => format!(
+                "t={now:.1} player joined: callback: {}",
+                first_lines(&e.to_string())
+            ),
+        });
+        self.settle("player joined");
+    }
+
     /// Advances game time by `dt` seconds: fires the events that are due
     /// and carries out what their callbacks asked for.
     pub fn tick(&mut self, dt: f64) {
         self.now += dt;
         let now = self.now;
+        self.join_player();
         {
             let mut w = self.world.borrow_mut();
             w.honk_heard = (w.honk_heard - dt as f32).max(0.0);
             w.pursuit.clock.step(dt as f32);
             // No time scale yet: game and real time run together.
             w.clocks.step(dt as f32, dt as f32);
+        }
+        // What the scripts killed since the last tick dies as anything
+        // else does: its own script's `OnDeath` hears of it.
+        let killed = std::mem::take(&mut self.world.borrow_mut().script_killed);
+        for guid in killed {
+            self.object_hook(guid, ON_DEATH, death_args(guid));
         }
         // Streaming is instant here: a waiting state ends a second after
         // it was asked for, and the scripts hear that it did.
@@ -1101,6 +1217,9 @@ impl Mission {
                 e.kind,
                 first_lines(&e.error.to_string())
             ));
+        }
+        for e in use_alarms(&self.world, self.host.lua()) {
+            self.log.push(format!("  t={now:.1} alarm: {e}"));
         }
         for kind in self.events.take_unhandled() {
             self.log.push(format!(
@@ -1942,22 +2061,56 @@ impl Mission {
     }
 
     pub fn kill(&mut self, guid: u32) {
+        let mut died = false;
         if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            died = o.alive;
             o.alive = false;
             o.health = 0.0;
         }
+        if died {
+            self.object_hook(guid, ON_DEATH, death_args(guid));
+        }
+    }
+
+    /// Calls `hook` of `guid`'s object script, if it has one the port
+    /// runs ([`OBJECT_SCRIPTS`]) and the script has that hook
+    /// ([`crate::object_hooks`]). A failure is logged.
+    fn object_hook(&mut self, guid: u32, hook: &str, args: Vec<mlua::Value>) {
+        let record = crate::object_hooks::record(self.layers.values().flatten(), guid);
+        let lua = self.host.lua();
+        if let Err(e) = crate::object_hooks::call(lua, &OBJECT_SCRIPTS, record, hook, args) {
+            self.log.push(format!(
+                "  {hook} of {guid:#x}: {}",
+                first_lines(&e.to_string())
+            ));
+        }
+    }
+
+    /// One of object `guid`'s state machines (`machine`, its name's hash)
+    /// went to another state (`state`, its name's hash): its object
+    /// script's `OnStateChange` hears of it. To be called only when the
+    /// state really changed, after the states' own actions, as the engine
+    /// does (0x82231380).
+    pub fn object_state_changed(&mut self, guid: u32, machine: u32, state: u32) {
+        let args = state_change_args(guid, machine, state);
+        self.object_hook(guid, ON_STATE_CHANGE, args);
     }
 
     /// As [`kill`](Self::kill), by `killer` (her character, for what her
     /// shots, blasts and rams kill): the death event passes the killer
     /// to the scripts, which pay a hero-only bounty for it.
     pub fn kill_by(&mut self, guid: u32, killer: u32) {
+        let mut died = false;
         if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            died = o.alive;
             if o.alive {
                 o.killer = Some(killer);
             }
             o.alive = false;
             o.health = 0.0;
+        }
+        if died {
+            self.object_hook(guid, ON_DEATH, death_args(guid));
         }
     }
 
@@ -2676,6 +2829,9 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             if e.script == Some(FRIENDLY_GATE) {
                 w.gates.insert(e.guid);
             }
+            if e.alarm {
+                w.alarms.add(e.guid, e.script);
+            }
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());
             }
@@ -2693,6 +2849,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             w.links.remove(e.guid);
             w.placed_as.remove(&e.guid);
             w.gates.remove(&e.guid);
+            w.alarms.remove(e.guid);
             w.crew_riders.retain(|_, v| *v != e.guid);
             w.objects.remove(&e.guid);
             w.regions.remove(&e.guid);
@@ -2756,6 +2913,16 @@ fn seat_crew(
 /// taking it stocks the item and posts `MunitionsPickup`, which
 /// JetCon001 counts its three bunker busters by.
 ///
+/// `DangerousBuilding` is the script of the buildings whose spawners start
+/// off (from the 360 code: nothing in the engine turns a spawner on that
+/// its data has off; only `Ai.TweakAttachedSpawners` does). As its
+/// building wakes: if it is labelled `Occupied`, it waits for the building
+/// to be damaged and turns all its spawners on; otherwise, unless 8
+/// buildings are dangerous already, it turns them on (the ground group
+/// off, the list `Spawnlist (VZ Tower)`) one time in its rarity (16 by
+/// default, `WifVzRegionNames`; `"never"` while OilCon001, OilCon020,
+/// OilCon021 and PirCon004 run).
+///
 /// `Tank`, `Helicopter` and `Airplane` are the scripts of the tanks' (38
 /// templates), the helicopters' (132) and the F35b's (2) radar blips, by
 /// the template database's `ObjectScript` records; their names are the
@@ -2771,14 +2938,67 @@ fn seat_crew(
 /// PMC's own green), set again as a driver gets in or out or the
 /// faction's attitude changes, and taken off while a player drives it
 /// ([`crate::hud::Blip`], `Hud.Radar:AddObjective`).
-pub const OBJECT_SCRIPTS: [(&str, u32); 6] = [
+///
+/// `Alarm` is the alarm towers' script ([`crate::alarm`]): as a tower
+/// wakes it offers the player `[ContextAction.UseAlarm]`, and its `OnUse`
+/// raises or lowers the alarm.
+pub const OBJECT_SCRIPTS: [(&str, u32); 8] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
+    ("DangerousBuilding", DANGEROUS_BUILDING),
     ("Tank", TANK),
     ("Helicopter", HELICOPTER),
     ("Airplane", AIRPLANE),
+    ("Alarm", ALARM),
 ];
+
+/// `Alarm`'s module hash.
+pub const ALARM: u32 = 0xbe65_fdd0;
+
+/// The entities with a component, its own records.
+fn carriers(layer: &Layer, component: &str) -> HashSet<u32> {
+    layer
+        .component(component)
+        .and_then(|c| c.records())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(e, _)| e)
+        .collect()
+}
+
+/// Carries out the alarm messages posted since the last tick
+/// ([`crate::alarm`]): each sets its tower's flag and calls the tower's
+/// script's `OnUse(tower, on)`. Returns what failed.
+fn use_alarms(world: &Shared, lua: &mlua::Lua) -> Vec<String> {
+    let messages = world.borrow_mut().alarms.take();
+    let mut failed = Vec::new();
+    for (tower, mode) in messages {
+        let Some(on) = world.borrow_mut().alarms.apply(tower, mode) else {
+            continue;
+        };
+        let script = world.borrow().alarms.scripts.get(&tower).copied();
+        let Some((module, _)) = script.and_then(|h| OBJECT_SCRIPTS.iter().find(|(_, s)| *s == h))
+        else {
+            continue;
+        };
+        let result = lua
+            .globals()
+            .get::<mlua::Table>(*module)
+            .and_then(|m| m.get::<mlua::Function>("OnUse"))
+            .and_then(|f| f.call::<()>((crate::events::guid_value(tower), on)));
+        if let Err(err) = result {
+            failed.push(format!(
+                "{module}.OnUse {tower:#x}: {}",
+                first_lines(&err.to_string())
+            ));
+        }
+    }
+    failed
+}
+
+/// `DangerousBuilding`'s module hash.
+pub const DANGEROUS_BUILDING: u32 = 0x5439_77f7;
 
 /// `Tank`'s module hash (the tanks' radar blip; see [`OBJECT_SCRIPTS`]).
 pub const TANK: u32 = 0xc686_ae99;
@@ -2911,6 +3131,66 @@ mod tests {
             .map(|s| s.matches(r#"add(&player, "GetCamera""#).count())
             .sum();
         assert_eq!(count, 1, "Player.GetCamera registered {count} times");
+    }
+
+    /// A stand-in for `MrxPlayer.OnPlayerJoined`: keeps what it was
+    /// called with and spawns her template, as the script does.
+    const JOINED: &str = r#"
+        calls = 0
+        Player.SetPlayerJoinedCallback(function(n, name, profile, isLocal, controller)
+            calls = calls + 1
+            got = { n, name, profile.iIndex, profile.iUpgrade, profile.iCostume,
+                    isLocal, controller }
+            her = Pg.Spawn("jen", 10, 20, 30, 90, false, false, false)
+            other = Pg.Spawn("jen", 10, 20, 30, 90, false, false, false)
+        end)
+    "#;
+
+    // Off unless asked for: the joined callback is kept and never called.
+    #[test]
+    fn the_joined_callback_is_not_called_by_default() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(JOINED, "joined").unwrap();
+        m.tick(0.5);
+        assert!(!m.player_joined());
+        assert_eq!(m.lua().load("return calls").eval::<i64>().unwrap(), 0);
+    }
+
+    // From the 360 code (0x82467230): the callback is called once for
+    // local player 0 with (0, name, { iIndex, iUpgrade, iCostume }, true,
+    // 0), the costume being the profile's. Her character stays the game's
+    // (invented): the callback's first spawn answers it and makes nothing,
+    // and a later spawn is an ordinary one.
+    #[test]
+    fn the_joined_callback_is_called_once_for_her_with_the_switch_on() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [1.0, 2.0, 3.0]).unwrap();
+        m.set_script_join(true);
+        // No callback yet: nothing to call, and it is tried again later.
+        m.tick(0.5);
+        assert!(!m.player_joined());
+        m.run(&format!("Player.SetProfileCostume(4) {JOINED}"), "joined")
+            .unwrap();
+        m.take_commands();
+        m.tick(0.5);
+        m.tick(0.5);
+        assert!(m.player_joined());
+        let got: (i64, String, i64, i64, f64, bool, i64) = m
+            .lua()
+            .load("return got[1], got[2], got[3], got[4], got[5], got[6], got[7]")
+            .eval()
+            .unwrap();
+        assert_eq!(got, (0, "Jennifer".to_owned(), 3, 0, 4.0, true, 0));
+        assert_eq!(m.lua().load("return calls").eval::<i64>().unwrap(), 1);
+        let (her, other): (bool, bool) = m
+            .lua()
+            .load("return her == Player.GetLocalCharacter(), other == her")
+            .eval()
+            .unwrap();
+        assert!(her && !other);
+        let w = m.world.borrow();
+        assert_eq!(w.joined_template.as_deref(), Some("jen"));
+        assert_eq!(w.objects[&PLAYER].position, [1.0, 2.0, 3.0]);
+        assert!(!w.joining);
     }
 
     #[test]
@@ -3489,6 +3769,66 @@ mod tests {
     }
 
     #[test]
+    fn a_death_and_a_state_change_reach_the_objects_script_once() {
+        let mut crate_ = villa_tank();
+        crate_.script = Some(MUNITIONS);
+        crate_.script_data = Some(3);
+        let guid = crate_.guid;
+        let mut data = GameData::default();
+        data.layers.insert("test_layer".into(), vec![crate_]);
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        m.lua()
+            .load(
+                r#"
+                deaths, states = 0, 0
+                Munitions = {
+                    OnDeath = function(g, n) deaths = deaths + 1; dead, dead_data = g, n end,
+                    OnStateChange = function(g, machine, state, n)
+                        states = states + 1; to, state_data = state, n
+                    end,
+                }
+                "#,
+            )
+            .exec()
+            .unwrap();
+        m.world
+            .borrow_mut()
+            .insert(guid, Object::new("Munitions (Bunker Buster)", [0.0; 3]));
+        m.kill(guid);
+        // Already dead: the engine's death handler runs once.
+        m.kill(guid);
+        m.kill_by(guid, PLAYER);
+        let g = m.lua().globals();
+        assert_eq!(g.get::<u32>("deaths").unwrap(), 1);
+        assert_eq!(
+            g.get::<Value>("dead").unwrap(),
+            crate::events::guid_value(guid)
+        );
+        assert_eq!(g.get::<u32>("dead_data").unwrap(), 3);
+        // One a script kills dies the same way, at the next tick.
+        m.world
+            .borrow_mut()
+            .insert(guid, Object::new("Munitions (Bunker Buster)", [0.0; 3]));
+        m.lua()
+            .load("Object.Kill(...)")
+            .call::<()>(crate::events::guid_value(guid))
+            .unwrap();
+        m.tick(0.25);
+        m.tick(0.25);
+        assert_eq!(g.get::<u32>("deaths").unwrap(), 2);
+        m.object_state_changed(guid, 0x1111_2222, 0x7687_df41);
+        assert_eq!(g.get::<u32>("states").unwrap(), 1);
+        assert_eq!(
+            g.get::<Value>("to").unwrap(),
+            crate::events::guid_value(0x7687_df41)
+        );
+        assert_eq!(g.get::<u32>("state_data").unwrap(), 3);
+        // An object with no script of its own: nothing is called.
+        m.object_state_changed(0x999, 1, 2);
+        assert_eq!(g.get::<u32>("states").unwrap(), 1);
+    }
+
+    #[test]
     fn an_object_script_is_handed_its_records_data() {
         let lua = mlua::Lua::new();
         lua.load("Munitions = { OnActivate = function(g, _, n) got = n end }")
@@ -3499,6 +3839,18 @@ mod tests {
         bb.script_data = Some(3);
         assert!(activate(&lua, &[bb], true).is_empty());
         assert_eq!(lua.globals().get::<u32>("got").unwrap(), 3);
+    }
+
+    #[test]
+    fn a_dangerous_building_is_activated_as_its_layer_comes_in() {
+        let lua = mlua::Lua::new();
+        lua.load("DangerousBuilding = { OnActivate = function(g) woke = g end }")
+            .exec()
+            .unwrap();
+        let mut house = villa_tank();
+        house.script = Some(DANGEROUS_BUILDING);
+        assert!(activate(&lua, &[house], true).is_empty());
+        assert!(lua.globals().get::<mlua::Value>("woke").unwrap() != mlua::Value::Nil);
     }
 
     /// A tank's, a helicopter's and a plane's script is run on it as its
@@ -3553,7 +3905,43 @@ mod tests {
                 ("seat_gunner".into(), "VZ Soldier".into()),
                 ("seat_driver".into(), "VZ Tank Commander".into()),
             ],
+            alarm: false,
         }
+    }
+
+    #[test]
+    fn an_alarm_message_calls_its_towers_script_with_the_flag() {
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        let lua = mlua::Lua::new();
+        lua.load("heard = {} Alarm = { OnUse = function(g, on) heard[#heard + 1] = on end }")
+            .exec()
+            .unwrap();
+        let tower = Entity {
+            guid: 0x5150,
+            name: "vzoutpost_bld_alarmtower".into(),
+            script: Some(ALARM),
+            alarm: true,
+            crew: Vec::new(),
+            ..villa_tank()
+        };
+        place(&world, std::slice::from_ref(&tower), true);
+        {
+            let mut w = world.borrow_mut();
+            // The player's prompt, then on again, then another object.
+            w.alarms.post(0x5150, crate::alarm::TOGGLE);
+            w.alarms.post(0x5150, crate::alarm::ON);
+            w.alarms.post(0xfaa53, crate::alarm::ON);
+        }
+        assert!(use_alarms(&world, &lua).is_empty());
+        let heard: Vec<bool> = lua.globals().get("heard").unwrap();
+        assert_eq!(heard, [true, true]);
+        assert!(world.borrow().alarms.queue.is_empty());
+        // Gone with its layer: its messages do nothing.
+        place(&world, std::slice::from_ref(&tower), false);
+        world.borrow_mut().alarms.post(0x5150, crate::alarm::TOGGLE);
+        assert!(use_alarms(&world, &lua).is_empty());
+        let heard: Vec<bool> = lua.globals().get("heard").unwrap();
+        assert_eq!(heard.len(), 2);
     }
 
     #[test]

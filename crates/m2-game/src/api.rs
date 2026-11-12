@@ -1056,6 +1056,8 @@ pub struct ScriptWorld {
     pub boundary_callback: Option<Function>,
     /// What the setter ports of missing natives keep ([crate::ported_misc]).
     pub misc: crate::ported_misc::MiscState,
+    /// The alarms in play and their messages ([crate::alarm]).
+    pub alarms: crate::alarm::Alarms,
     pub outside: bool,
     /// What the initialiser ports of missing natives keep ([crate::ported_init]).
     pub init: crate::ported_init::InitState,
@@ -1118,6 +1120,10 @@ pub struct ScriptWorld {
     /// who carries whom (`Human.IsCarrying`) ([`crate::mission::Mission::set_human_state`]).
     pub human_states: HashMap<u32, String>,
     pub state_changes: Vec<crate::events::StateChange>,
+    /// Objects a script killed (`Object.Kill` of a live one) whose own
+    /// script has not heard of its death yet
+    /// ([`crate::mission::Mission::tick`] tells it: `OnDeath`).
+    pub script_killed: Vec<u32>,
     /// What the scripts have changed of each object's attached spawners,
     /// by object ([`crate::spawner_tweak`]).
     pub spawner_records: HashMap<u32, crate::spawner_tweak::SpawnerRecord>,
@@ -1137,6 +1143,12 @@ pub struct ScriptWorld {
     /// `CinematicEnd`), by who plays them, with their game time
     /// ([`crate::events::World::animation_events`]).
     pub animation_events: Vec<(f64, u32, String)>,
+    /// The joined callback is running for the local player and has not
+    /// made her character yet ([`crate::mission::Mission::set_script_join`]):
+    /// its `Pg.Spawn` answers the character the game already made.
+    pub joining: bool,
+    /// The template the joined callback asked for as her character.
+    pub joined_template: Option<String>,
     /// The costume the player's profile keeps (`Player.GetProfileCostume`,
     /// `SetProfileCostume`: the wardrobe's pick, counted from 0).
     pub profile_costume: f64,
@@ -2776,6 +2788,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             },
             None => return values([Value::Nil]),
         };
+        // `MrxPlayer.CreatePlayerCharacter`'s spawn while she joins: the
+        // game has made her already, so it is her that is answered, where
+        // she stands (invented: on the 360 this spawn makes her).
+        if let Some(her) = w.player.filter(|_| w.joining) {
+            w.joining = false;
+            w.joined_template = Some(what);
+            return values([crate::events::guid_value(her)]);
+        }
         let position = [
             num(a.get(1)).unwrap_or(0.0),
             num(a.get(2)).unwrap_or(0.0),
@@ -3072,9 +3092,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&object, "Kill", |w, _, a| {
         if let Some(guid) = id(a.first()) {
+            let mut died = false;
             if let Some(o) = w.objects.get_mut(&guid) {
+                died = o.alive;
                 o.alive = false;
                 o.health = 0.0;
+            }
+            if died {
+                w.script_killed.push(guid);
             }
             w.commands.push(Command::Kill(guid));
         }

@@ -241,6 +241,7 @@ mod tests {
             path: Vec::new(),
             template: None,
             crew: Vec::new(),
+            alarm: false,
         };
         let snap = |n: &str| m2_assets::name_hash(n);
         let mut data = GameData::default();

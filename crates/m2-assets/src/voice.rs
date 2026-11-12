@@ -272,6 +272,19 @@ pub struct Record {
     /// 0x1c); 0 for a record too short to hold them.
     pub min_distance: f32,
     pub max_distance: f32,
+    /// Whether it is placed in the world and fades with distance (the
+    /// byte at 0x14), and the power its fade follows (the float at 0x24).
+    ///
+    /// From the 360 code: the sound engine's distance check
+    /// (`0x828375F8`) skips a record whose distance block's first byte
+    /// is 0, and the fade (`0x828424A0`) reads the block's floats at
+    /// +4, +8 and +0x10 as the near distance, the far distance and the
+    /// power. The block is taken to start at the record's 0x14, where
+    /// its near and far land on the distances already read (0x18 and
+    /// 0x1c): inferred from that fit, with the powers the data holds
+    /// there (see the `recorddist` example).
+    pub positional: bool,
+    pub exponent: f32,
     pub variants: Vec<(u32, u32, f32)>,
 }
 
@@ -376,6 +389,8 @@ impl CueTable {
                     volume: f32::from_bits(word(0x10)),
                     min_distance: f32::from_bits(word(0x18)),
                     max_distance: f32::from_bits(word(0x1c)),
+                    positional: rec[0x14] != 0,
+                    exponent: f32::from_bits(word(0x24)),
                     variants: (first..size)
                         .step_by(12)
                         .filter(|at| at + 12 <= size)
@@ -388,6 +403,8 @@ impl CueTable {
                     volume: 0.0,
                     min_distance: 0.0,
                     max_distance: 0.0,
+                    positional: false,
+                    exponent: 0.0,
                     variants: Vec::new(),
                 });
             }

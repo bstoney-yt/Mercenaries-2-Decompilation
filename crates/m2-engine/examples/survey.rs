@@ -1208,6 +1208,33 @@ fn atmospheres(world: &WorldIndex, names: &Names, arg: &str) {
         );
         for (i, (name, a)) in r.settings.iter().enumerate() {
             println!("  #{i} {} ({name:08x}): {}", names.show(*name), show(a));
+            for (k, e) in a.ambient.iter().enumerate() {
+                if e.template != 0 {
+                    println!(
+                        "    ambient {k}: type {} template {} ({:08x}) radius {} height {} variance {}",
+                        e.kind,
+                        names.show(e.template),
+                        e.template,
+                        e.radius,
+                        e.height,
+                        e.variance
+                    );
+                }
+            }
+            let s = a.screen;
+            if s != m2_engine::atmosphere::ScreenEffect::default() {
+                println!(
+                    "    screen effect: speed {} density {} dir {},{} texture {} ({:08x}) colour {:08x} type {}",
+                    s.speed,
+                    s.density,
+                    s.dir[0],
+                    s.dir[1],
+                    names.show(s.texture),
+                    s.texture,
+                    s.colour,
+                    s.kind
+                );
+            }
         }
     }
     let words = words_of(arg);

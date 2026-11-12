@@ -644,6 +644,24 @@ pub fn template_runs(db: &Layer<'_>) -> HashMap<u32, Vec<EffectRun>> {
         .collect()
 }
 
+/// How much of a particle shows at `depth` metres in front of the camera
+/// (its offset from the camera along the camera's forward), given the three
+/// constants `Graphics.Effect.CameraFade` sets: far, near and range.
+///
+/// From the 360 code (the particle sort pass, `0x821E3440`): the depth is
+/// taken down to `far` and up to `near`, and `(depth - near) / range` is
+/// kept in the particle's record as 16 bits (times 65535, truncated). With
+/// the fade on (2.25, 1.25, 1.0) a particle fades out from 2.25 m to 1.25 m;
+/// off (0.1, 0.0, 0.1), only within the last 0.1 m.
+///
+/// Assumed: the particle's shader multiplies its alpha by this value. The
+/// shader isn't in the program, and that use wasn't read.
+pub fn camera_fade(depth: f32, [far, near, range]: [f32; 3]) -> f32 {
+    let d = depth.min(far).max(near);
+    let stored = ((d - near) * (1.0 / range) * 65535.0) as u16;
+    f32::from(stored) / 65535.0
+}
+
 /// One particle to draw: a square facing the camera.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sprite {
@@ -693,6 +711,9 @@ struct Instance {
     /// Where its particles start: on its emitters' shapes, or about the
     /// camera for a record's ambient effect.
     placement: Placement,
+    /// The ground under a terrain effect this frame
+    /// ([`Particles::update_terrain`]).
+    patch: Option<GroundPatch>,
 }
 
 /// Where an effect's particles start.
@@ -708,6 +729,185 @@ pub enum Placement {
     /// in the game's left-handed frame), each particle flying out about
     /// the world's down as its emitter spreads it.
     AboutCamera { radius: f32, height: f32 },
+    /// Over the ground about its place, as `Graphics.Effect.Terrain` asks
+    /// (from the 360 code: kind 6, 0x821DA650): on a [`GroundPatch`] of
+    /// half-size `radius`, each particle flying out about the ground's
+    /// normal there, at most the patch's area times `density` a frame
+    /// ([`GroundPatch::frame_count`]).
+    Terrain { radius: f32, density: f32 },
+    /// On the ground about the camera, as a record's ambient effect of
+    /// type 1 (from the 360 code: kind 7, 0x821DA768, its starts at
+    /// 0x821E6AD8): on a [`GroundPatch`] of half-size `radius` under the
+    /// camera, `height` above the ground give or take `variance`, each
+    /// particle flying out about the ground's normal there. The effect is
+    /// moved to the camera every frame, as kind 2 is (0x821DA498).
+    GroundAboutCamera {
+        radius: f32,
+        height: f32,
+        variance: f32,
+    },
+}
+
+/// The ground under a terrain effect (from the 360 code, 0x821D9D40,
+/// rebuilt every frame): the 12 points of a 4 by 4 grid without its
+/// corners, over `[x - r, x + r]` by `[z - r, z + r]` in steps of `2r / 3`,
+/// each the ground's height and normal there (the game's ground query,
+/// 0x82194E20, gives both).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroundPatch {
+    /// Place and normal of each point, by [`GroundPatch::index`].
+    pub points: [(Vec3, Vec3); 12],
+}
+
+impl GroundPatch {
+    /// Point `(a, b)` of the grid (each 0..=3, not a corner): `a` along x
+    /// (the outer loop of 0x821D9D40), `b` along z.
+    pub fn index(a: usize, b: usize) -> usize {
+        let skipped = match a {
+            0 => 1,
+            3 => 3,
+            _ => 2,
+        };
+        a * 4 + b - skipped
+    }
+
+    /// The patch about `centre` of half-size `radius`, by `ground`: the
+    /// height and normal at an (x, z). `None` if the query finds ground
+    /// nowhere (the game marks such a patch unusable); a point it misses
+    /// lies at the centre's height, facing up (invented: the game keeps
+    /// whatever its query left there).
+    pub fn build(
+        centre: Vec3,
+        radius: f32,
+        ground: &dyn Fn(f32, f32) -> Option<(f32, Vec3)>,
+    ) -> Option<Self> {
+        let step = radius * 2.0 / 3.0;
+        let mut points = [(Vec3::ZERO, Vec3::Y); 12];
+        let mut any = false;
+        for a in 0..4 {
+            for b in 0..4 {
+                if (a == 0 || a == 3) && (b == 0 || b == 3) {
+                    continue;
+                }
+                let x = centre.x - radius + a as f32 * step;
+                let z = centre.z - radius + b as f32 * step;
+                let (y, n) = match ground(x, z) {
+                    Some(hit) => {
+                        any = true;
+                        hit
+                    }
+                    None => (centre.y, Vec3::Y),
+                };
+                points[Self::index(a, b)] = (Vec3::new(x, y, z), n);
+            }
+        }
+        any.then_some(Self { points })
+    }
+
+    /// The patch's 14 triangles, as 0x821E6EF8 walks them: a corner cell's
+    /// one, and every other cell's two (split from `(a, b + 1)` to
+    /// `(a + 1, b)`).
+    pub fn triangles() -> Vec<[usize; 3]> {
+        let i = Self::index;
+        let mut out = Vec::with_capacity(14);
+        for a in 0..3 {
+            for b in 0..3 {
+                match (a, b) {
+                    (0, 0) => out.push([i(1, 1), i(0, 1), i(1, 0)]),
+                    (0, 2) => out.push([i(1, 2), i(0, 2), i(1, 3)]),
+                    (2, 0) => out.push([i(2, 1), i(2, 0), i(3, 1)]),
+                    (2, 2) => out.push([i(2, 2), i(2, 3), i(3, 2)]),
+                    _ => {
+                        out.push([i(a + 1, b + 1), i(a, b + 1), i(a + 1, b)]);
+                        out.push([i(a, b + 1), i(a, b), i(a + 1, b)]);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The size of the cross of triangle `t`'s two edges from its first
+    /// point: twice its area, which is what the game counts by.
+    fn weight(&self, t: [usize; 3]) -> f32 {
+        let [p0, p1, p2] = t.map(|k| self.points[k].0);
+        (p1 - p0).cross(p2 - p0).length()
+    }
+
+    /// The most particles a frame gives off over the patch (0x821E73A8):
+    /// each triangle's weight times `density`, whole ones counted and the
+    /// fraction carried on to the next triangle.
+    pub fn frame_count(&self, density: f32) -> usize {
+        let mut carry = 0.0f32;
+        let mut count = 0;
+        for t in Self::triangles() {
+            carry += self.weight(t) * density;
+            let whole = carry.floor();
+            count += whole as usize;
+            carry -= whole;
+        }
+        count
+    }
+
+    /// A start on the patch as kind 7 picks it (0x821E6AD8): cell `(a, b)`
+    /// (each 0..=2) and its `second` or first triangle, then as
+    /// [`start`](Self::start). `None` for the half a corner cell lacks,
+    /// which the game draws again for (16 tries).
+    pub fn start_in_cell(
+        &self,
+        a: usize,
+        b: usize,
+        second: bool,
+        u: f32,
+        v: f32,
+    ) -> Option<(Vec3, Vec3)> {
+        let i = Self::index;
+        let t = match (a, b, second) {
+            (0, 0, false) => [i(1, 1), i(0, 1), i(1, 0)],
+            (0, 2, false) => [i(1, 2), i(0, 2), i(1, 3)],
+            (2, 0, false) => [i(2, 1), i(2, 0), i(3, 1)],
+            (2, 2, false) => [i(2, 2), i(2, 3), i(3, 2)],
+            (0 | 2, 0 | 2, true) => return None,
+            (_, _, false) => [i(a + 1, b + 1), i(a, b + 1), i(a + 1, b)],
+            (_, _, true) => [i(a, b + 1), i(a, b), i(a + 1, b)],
+        };
+        Some(self.on_triangle(t, u, v))
+    }
+
+    /// `p0 + u e1 + v e2` on triangle `t`, `u` and `v` turned back into it
+    /// when they add past 1, and the points' normals mixed the same way.
+    fn on_triangle(&self, t: [usize; 3], u: f32, v: f32) -> (Vec3, Vec3) {
+        let (u, v) = if u + v > 1.0 {
+            (1.0 - u, 1.0 - v)
+        } else {
+            (u, v)
+        };
+        let [(p0, n0), (p1, n1), (p2, n2)] = t.map(|k| self.points[k]);
+        (
+            p0 + (p1 - p0) * u + (p2 - p0) * v,
+            (n0 + (n1 - n0) * u + (n2 - n0) * v).normalize_or(Vec3::Y),
+        )
+    }
+
+    /// A start on the patch for draws `pick`, `u` and `v` (each 0..1): a
+    /// triangle by its weight, then `p0 + u e1 + v e2` with `u` and `v`
+    /// turned back into the triangle when they add past 1, and the three
+    /// points' normals mixed the same way, at unit length (0x821E6EF8).
+    pub fn start(&self, pick: f32, u: f32, v: f32) -> (Vec3, Vec3) {
+        let tris = Self::triangles();
+        let total: f32 = tris.iter().map(|&t| self.weight(t)).sum();
+        let mut left = pick * total;
+        let mut chosen = tris[tris.len() - 1];
+        for &t in &tris {
+            let w = self.weight(t);
+            if left <= w {
+                chosen = t;
+                break;
+            }
+            left -= w;
+        }
+        self.on_triangle(chosen, u, v)
+    }
 }
 
 /// Effects running in the world.
@@ -779,6 +979,7 @@ impl Particles {
             owed: vec![0.0; spec.emitters.len()],
             particles: Vec::new(),
             placement: Placement::Shape,
+            patch: None,
         });
         true
     }
@@ -833,6 +1034,50 @@ impl Particles {
         self.camera = Some([eye, right, up, forward]);
     }
 
+    /// Starts template `id`'s effects at `at` as
+    /// `Graphics.Effect.Terrain` does ([`Placement::Terrain`]); how many
+    /// it started. Each runs as long as the template's record says.
+    pub fn spawn_terrain(
+        &mut self,
+        lib: &Library,
+        id: u32,
+        at: Vec3,
+        radius: f32,
+        density: f32,
+    ) -> usize {
+        let n = self.spawn_template(lib, id, at, 0.0, 1.0);
+        let from = self.instances.len() - n;
+        for i in &mut self.instances[from..] {
+            i.placement = Placement::Terrain {
+                radius,
+                density: density.max(0.0),
+            };
+        }
+        n
+    }
+
+    /// Rebuilds the ground under every terrain effect, as the game does
+    /// each frame (0x821DD6F0 calling 0x821D9D40), at most 64 a frame;
+    /// `ground` gives the height and normal at an (x, z).
+    pub fn update_terrain(&mut self, ground: &dyn Fn(f32, f32) -> Option<(f32, Vec3)>) {
+        let mut built = 0;
+        for i in &mut self.instances {
+            // A terrain effect's about its place; an ambient one's under
+            // the camera.
+            let (centre, radius) = match (i.placement, self.camera) {
+                (Placement::Terrain { radius, .. }, _) => (i.at, radius),
+                (Placement::GroundAboutCamera { radius, .. }, Some([eye, ..])) => (eye, radius),
+                _ => continue,
+            };
+            i.patch = if built < 64 {
+                built += 1;
+                GroundPatch::build(centre, radius, ground)
+            } else {
+                None
+            };
+        }
+    }
+
     /// Starts `effect` about the camera for good, as a record's ambient
     /// effect ([`Placement::AboutCamera`]); false if the library has no
     /// such effect.
@@ -852,11 +1097,40 @@ impl Particles {
         true
     }
 
+    /// Starts `effect` on the ground about the camera for good, as a
+    /// record's ambient effect of type 1
+    /// ([`Placement::GroundAboutCamera`]); false if the library has no
+    /// such effect.
+    pub fn spawn_on_ground_about_camera(
+        &mut self,
+        lib: &Library,
+        effect: u32,
+        radius: f32,
+        height: f32,
+        variance: f32,
+    ) -> bool {
+        if !self.start(lib, effect, Vec3::ZERO, f32::INFINITY, 1.0) {
+            return false;
+        }
+        if let Some(i) = self.instances.last_mut() {
+            i.placement = Placement::GroundAboutCamera {
+                radius,
+                height,
+                variance,
+            };
+        }
+        true
+    }
+
     /// Deletes every effect kept about the camera, its particles with it,
     /// as the game deletes a record's ambient effects on a change.
     pub fn clear_about_camera(&mut self) {
-        self.instances
-            .retain(|i| !matches!(i.placement, Placement::AboutCamera { .. }));
+        self.instances.retain(|i| {
+            !matches!(
+                i.placement,
+                Placement::AboutCamera { .. } | Placement::GroundAboutCamera { .. }
+            )
+        });
     }
 
     /// Particles alive.
@@ -895,7 +1169,10 @@ impl Particles {
             };
             inst.age += dt;
             // An effect kept about the camera moves with it (0x821DA498).
-            if let (Placement::AboutCamera { .. }, Some([eye, ..])) = (inst.placement, self.camera)
+            if let (
+                Placement::AboutCamera { .. } | Placement::GroundAboutCamera { .. },
+                Some([eye, ..]),
+            ) = (inst.placement, self.camera)
             {
                 inst.at = eye;
             }
@@ -931,6 +1208,80 @@ impl Particles {
                 };
                 let rate = (e.rate.at(clock) + self.spread(e.rate_var)).max(0.0);
                 inst.owed[k] += rate * dt;
+                // Over the ground (0x821D98B8, kind 6): only with more
+                // than one owed and a patch, at most the patch's count a
+                // frame, and what isn't given stays owed.
+                if let Placement::Terrain { density, .. } = inst.placement {
+                    let cap = inst
+                        .patch
+                        .map_or(0, |p| p.frame_count(density * inst.scale));
+                    if inst.owed[k] > 1.0 {
+                        let n = (inst.owed[k] as usize)
+                            .min(cap)
+                            .min(EMITTER_BUDGET)
+                            .min(BUDGET.saturating_sub(total));
+                        for _ in 0..n {
+                            let mut p =
+                                self.emit(e, k as u16, inst.at, inst.scale, frame, inst.placement);
+                            if let Some(patch) = &inst.patch {
+                                let (pick, u, v) = (self.random(), self.random(), self.random());
+                                let (at, normal) = patch.start(pick, u, v);
+                                // The effect's own height is added to the
+                                // ground's (see `onto_ground`).
+                                self.onto_ground(&mut p, e, at + Vec3::Y * inst.at.y, normal);
+                            }
+                            inst.particles.push(p);
+                        }
+                        total += n;
+                        inst.owed[k] -= n as f32;
+                    }
+                    // Not without end: what a frame can't give is not
+                    // kept past a budget's worth (invented bound).
+                    inst.owed[k] = inst.owed[k].min(EMITTER_BUDGET as f32);
+                    continue;
+                }
+                // On the ground about the camera (0x821D98B8, kind 7): the
+                // whole particles owed, none without a patch; one height
+                // for the emitter's frame, `height` give or take
+                // `variance`; a cell and half of the patch drawn for each,
+                // again (16 tries) on the half a corner cell lacks, the
+                // frame's giving ended where all 16 miss.
+                if let Placement::GroundAboutCamera {
+                    height, variance, ..
+                } = inst.placement
+                {
+                    let Some(patch) = inst.patch else {
+                        inst.owed[k] = inst.owed[k].min(EMITTER_BUDGET as f32);
+                        continue;
+                    };
+                    let lift = height + (self.random() - 0.5) * 2.0 * variance;
+                    let n = (inst.owed[k] as usize)
+                        .min(EMITTER_BUDGET)
+                        .min(BUDGET.saturating_sub(total));
+                    inst.owed[k] -= (inst.owed[k] as usize) as f32;
+                    'giving: for _ in 0..n {
+                        let mut tries = 16;
+                        let (at, normal) = loop {
+                            let a = ((self.random() * 3.0) as usize).min(2);
+                            let b = ((self.random() * 3.0) as usize).min(2);
+                            let second = self.random() >= 0.5;
+                            let (u, v) = (self.random(), self.random());
+                            if let Some(start) = patch.start_in_cell(a, b, second, u, v) {
+                                break start;
+                            }
+                            tries -= 1;
+                            if tries == 0 {
+                                break 'giving;
+                            }
+                        };
+                        let mut p =
+                            self.emit(e, k as u16, inst.at, inst.scale, frame, inst.placement);
+                        self.onto_ground(&mut p, e, at + Vec3::Y * lift, normal);
+                        inst.particles.push(p);
+                        total += 1;
+                    }
+                    continue;
+                }
                 let mut given = 0;
                 while inst.owed[k] >= 1.0 {
                     inst.owed[k] -= 1.0;
@@ -1017,6 +1368,28 @@ impl Particles {
             emitter,
             draw: (0.5 - (self.random() * 256.0).floor().min(255.0) / 255.0) * 2.0,
         }
+    }
+
+    /// Puts a fresh particle at `at` on a ground patch, flying out about
+    /// the ground's `normal` there as its emitter spreads it (0x821E6EF8,
+    /// 0x821E6AD8: both store the start and the mixed normal as the
+    /// particle's direction).
+    ///
+    /// `at`'s height is the ground's plus what the game adds. For kind 7
+    /// that is the record's height (the code computes it in place). For
+    /// kind 6 it is the fourth number the caller passes, read as the y of
+    /// the effect's own place: the dust fall's script gives its point a y
+    /// of 8, a height to fall from (inferred: the decompiler shows the
+    /// value as the matrix's y, and which matrix isn't established).
+    fn onto_ground(&mut self, p: &mut Particle, e: &EmitterSpec, at: Vec3, normal: Vec3) {
+        let speed = p.velocity.length();
+        let half = (e.spread.at(0.0)).to_radians();
+        let tilt = self.random() * half;
+        let (sin, cos) = tilt.sin_cos();
+        let around = self.random() * std::f32::consts::TAU;
+        let local = Vec3::new(sin * around.cos(), cos, sin * around.sin());
+        p.at = at;
+        p.velocity = Quat::from_rotation_arc(Vec3::Y, normal) * local * speed;
     }
 
     /// A point on emitter `e`'s shape, in the shape's own space, and the
@@ -1136,6 +1509,79 @@ fn srgb_to_linear(c: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Flat ground at height 2.
+    fn flat(_: f32, _: f32) -> Option<(f32, Vec3)> {
+        Some((2.0, Vec3::Y))
+    }
+
+    #[test]
+    fn a_ground_patch_is_a_grid_without_its_corners() {
+        // 0x821D9D40: 12 points over [x - r, x + r] in steps of 2r / 3.
+        let p = GroundPatch::build(Vec3::new(10.0, 0.0, -5.0), 3.0, &flat).unwrap();
+        let idx: Vec<usize> = (0..4)
+            .flat_map(|a| (0..4).map(move |b| (a, b)))
+            .filter(|&(a, b)| !((a == 0 || a == 3) && (b == 0 || b == 3)))
+            .map(|(a, b)| GroundPatch::index(a, b))
+            .collect();
+        assert_eq!(idx, (0..12).collect::<Vec<_>>());
+        assert_eq!(
+            p.points[GroundPatch::index(0, 1)].0,
+            Vec3::new(7.0, 2.0, -6.0)
+        );
+        assert_eq!(
+            p.points[GroundPatch::index(3, 2)].0,
+            Vec3::new(13.0, 2.0, -4.0)
+        );
+        // No ground anywhere: no patch.
+        assert!(GroundPatch::build(Vec3::ZERO, 3.0, &|_, _| None).is_none());
+    }
+
+    #[test]
+    fn a_ground_patch_counts_by_its_triangles_cross_products() {
+        // 0x821E73A8: 14 triangles, each counted by the cross of its
+        // edges (twice its area). Flat, r = 3: cells of 2 by 2, so each
+        // triangle weighs 4 and the patch 56.
+        let p = GroundPatch::build(Vec3::ZERO, 3.0, &flat).unwrap();
+        assert_eq!(GroundPatch::triangles().len(), 14);
+        assert_eq!(p.frame_count(1.0), 56);
+        // The fraction carries from triangle to triangle: 14 x 0.4 = 5.6.
+        assert_eq!(p.frame_count(0.1), 5);
+        // The dust fall's call: radius 20, density 0.005.
+        let dust = GroundPatch::build(Vec3::ZERO, 20.0, &flat).unwrap();
+        assert_eq!(dust.frame_count(0.005), 12);
+    }
+
+    #[test]
+    fn a_start_on_the_patch_lies_on_it_with_the_grounds_normal() {
+        let slope = |x: f32, _: f32| Some((x * 0.5, Vec3::new(-0.5, 1.0, 0.0).normalize()));
+        let p = GroundPatch::build(Vec3::ZERO, 3.0, &slope).unwrap();
+        for k in 0..50 {
+            let f = k as f32 / 50.0;
+            let (at, n) = p.start(f, (f * 7.0).fract(), (f * 13.0).fract());
+            assert!(at.x.abs() <= 3.0 + 1e-4 && at.z.abs() <= 3.0 + 1e-4);
+            assert!((at.y - at.x * 0.5).abs() < 1e-4);
+            assert!((n - Vec3::new(-0.5, 1.0, 0.0).normalize()).length() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn the_camera_fade_runs_from_far_to_near() {
+        let on = [2.25, 1.25, 1.0];
+        assert_eq!(camera_fade(10.0, on), 1.0);
+        assert_eq!(camera_fade(2.25, on), 1.0);
+        assert!((camera_fade(1.75, on) - 0.5).abs() < 1e-4);
+        assert_eq!(camera_fade(1.25, on), 0.0);
+        assert_eq!(camera_fade(-3.0, on), 0.0);
+        // Off: whole to within 0.1 m of the camera.
+        let off = [0.1, 0.0, 0.1];
+        assert_eq!(camera_fade(1.3, off), 1.0);
+        assert!((camera_fade(0.05, off) - 0.5).abs() < 1e-4);
+        assert_eq!(camera_fade(0.0, off), 0.0);
+        // Kept as 16 bits: steps of 1/65535.
+        let v = camera_fade(1.25 + 0.3, on) * 65535.0;
+        assert_eq!(v, v.trunc());
+    }
 
     fn keyed(keys: &[(f32, f32)]) -> Attr {
         Attr {
@@ -1576,6 +2022,74 @@ mod tests {
             p.step(&lib, dt);
         }
         assert_eq!(p.running(), 0);
+    }
+
+    #[test]
+    fn a_terrain_effect_gives_off_over_its_ground_patch() {
+        // 0x821D98B8 kind 6: at most the patch's count a frame, each on
+        // the ground; nothing without a patch, and what isn't given stays
+        // owed.
+        let mut e = burst();
+        e.rate = plain(2000.0);
+        e.life = plain(10.0);
+        let lib = library(e);
+        let mut p = Particles::default();
+        let at = Vec3::new(50.0, 8.0, 50.0);
+        assert!(p.spawn(&lib, 7, at, 100.0, 1.0));
+        p.instances[0].placement = Placement::Terrain {
+            radius: 3.0,
+            density: 0.1,
+        };
+        // No ground yet: none given.
+        p.step(&lib, 0.1);
+        assert_eq!(p.live(), 0);
+        // Flat ground at 2: the patch gives 5 a frame at this density.
+        p.update_terrain(&flat);
+        p.step(&lib, 0.1);
+        assert_eq!(p.live(), 5);
+        for q in p.positions() {
+            assert!((q.x - at.x).abs() <= 3.0 + 1e-3 && (q.z - at.z).abs() <= 3.0 + 1e-3);
+            // The ground's height (2) plus the effect's own (8).
+            assert!((q.y - 10.0).abs() < 0.5, "{q}");
+        }
+        p.step(&lib, 0.1);
+        assert_eq!(p.live(), 10);
+    }
+
+    #[test]
+    fn a_type_1_ambient_effect_starts_on_the_ground_about_the_camera() {
+        // 0x821E6AD8 (kind 7): on the camera's ground patch, the record's
+        // height above the ground, following the camera.
+        let mut e = burst();
+        e.rate = plain(200.0);
+        e.life = plain(10.0);
+        e.speed = plain(0.0);
+        let lib = library(e);
+        let mut p = Particles::default();
+        let eye = Vec3::new(100.0, 20.0, -50.0);
+        p.set_camera(eye, Vec3::X, Vec3::Y, Vec3::NEG_Z);
+        assert!(p.spawn_on_ground_about_camera(&lib, 7, 25.0, 0.5, 0.25));
+        // No ground yet: none given.
+        p.step(&lib, 0.5);
+        assert_eq!(p.live(), 0);
+        p.update_terrain(&flat);
+        p.step(&lib, 0.5);
+        let at = p.positions();
+        assert!(at.len() > 50, "{}", at.len());
+        for q in &at {
+            assert!((q.x - eye.x).abs() <= 25.0 + 1e-3 && (q.z - eye.z).abs() <= 25.0 + 1e-3);
+            // Ground 2, height 0.5 give or take 0.25.
+            assert!((q.y - 2.5).abs() <= 0.25 + 0.3, "{q}");
+        }
+        // The patch has no corners: none starts in a corner cell's far half.
+        let corner = at
+            .iter()
+            .filter(|q| (q.x - eye.x) + (q.z - eye.z) > 25.0 * 4.0 / 3.0 + 1e-2)
+            .count();
+        assert_eq!(corner, 0);
+        // It goes with the light, like the other ambient effects.
+        p.clear_about_camera();
+        assert_eq!((p.running(), p.live()), (0, 0));
     }
 
     #[test]
