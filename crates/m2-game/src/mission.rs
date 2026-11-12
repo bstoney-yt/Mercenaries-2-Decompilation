@@ -2781,14 +2781,33 @@ fn seat_crew(
 /// default, `WifVzRegionNames`; `"never"` while OilCon001, OilCon020,
 /// OilCon021 and PirCon004 run).
 ///
+/// `Tank`, `Helicopter` and `Airplane` are the scripts of the tanks' (38
+/// templates), the helicopters' (132) and the F35b's (2) radar blips, by
+/// the template database's `ObjectScript` records; their names are the
+/// ones whose hashes these are. From the 360 code the minimap gets a blip
+/// only when a script asks (its add, 0x82388580, is called by the native
+/// `MinimapAddObjective`, 0x82320DF0, alone), so without these scripts no
+/// vehicle shows on it. Each waits for its vehicle to be awake
+/// (`Event.ObjectHibernation`) and, while it has health, makes a
+/// `VehicleBlippable`: `temp_radar_icon_tank`, `..._helicopter` or
+/// `..._airplane`, size 5, turning with the vehicle, grey (100, 100, 100)
+/// with no driver, else by the driver's relation to the PMC (at most -60
+/// red, at least 60 blue (0, 127, 255), between them (230, 230, 255); the
+/// PMC's own green), set again as a driver gets in or out or the
+/// faction's attitude changes, and taken off while a player drives it
+/// ([`crate::hud::Blip`], `Hud.Radar:AddObjective`).
+///
 /// `Alarm` is the alarm towers' script ([`crate::alarm`]): as a tower
 /// wakes it offers the player `[ContextAction.UseAlarm]`, and its `OnUse`
 /// raises or lowers the alarm.
-pub const OBJECT_SCRIPTS: [(&str, u32); 5] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 8] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
     ("DangerousBuilding", DANGEROUS_BUILDING),
+    ("Tank", TANK),
+    ("Helicopter", HELICOPTER),
+    ("Airplane", AIRPLANE),
     ("Alarm", ALARM),
 ];
 
@@ -2838,6 +2857,15 @@ fn use_alarms(world: &Shared, lua: &mlua::Lua) -> Vec<String> {
 
 /// `DangerousBuilding`'s module hash.
 pub const DANGEROUS_BUILDING: u32 = 0x5439_77f7;
+
+/// `Tank`'s module hash (the tanks' radar blip; see [`OBJECT_SCRIPTS`]).
+pub const TANK: u32 = 0xc686_ae99;
+
+/// `Helicopter`'s module hash (the helicopters' radar blip).
+pub const HELICOPTER: u32 = 0x800d_c82e;
+
+/// `Airplane`'s module hash (the F35b's radar blip).
+pub const AIRPLANE: u32 = 0xf800_2bbf;
 
 /// `Munitions`' module hash.
 pub const MUNITIONS: u32 = 0xf71e_9491;
@@ -3561,6 +3589,41 @@ mod tests {
         house.script = Some(DANGEROUS_BUILDING);
         assert!(activate(&lua, &[house], true).is_empty());
         assert!(lua.globals().get::<mlua::Value>("woke").unwrap() != mlua::Value::Nil);
+    }
+
+    /// A tank's, a helicopter's and a plane's script is run on it as its
+    /// layer comes in and goes (their radar blips), each by its own
+    /// module.
+    #[test]
+    fn the_vehicles_blip_scripts_are_run() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            ran = {}
+            for _, name in ipairs({ "Tank", "Helicopter", "Airplane" }) do
+                _G[name] = {
+                    OnActivate = function() table.insert(ran, name .. " on") end,
+                    OnDeactivate = function() table.insert(ran, name .. " off") end,
+                }
+            end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let entities: Vec<Entity> = [TANK, HELICOPTER, AIRPLANE]
+            .into_iter()
+            .map(|script| {
+                let mut e = villa_tank();
+                e.script = Some(script);
+                e
+            })
+            .collect();
+        assert!(activate(&lua, &entities, true).is_empty());
+        assert!(activate(&lua, &entities[..1], false).is_empty());
+        assert_eq!(
+            lua.globals().get::<Vec<String>>("ran").unwrap(),
+            ["Tank on", "Helicopter on", "Airplane on", "Tank off"]
+        );
     }
 
     fn villa_tank() -> Entity {

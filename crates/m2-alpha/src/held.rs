@@ -103,6 +103,10 @@ pub struct Held {
     /// when in it its `jump` event launches her
     /// ([`m2_engine::human_state`]).
     pub windup: [Option<(usize, f32)>; 2],
+    /// The staggers, by [`m2_engine::stagger::Stagger`] and
+    /// [`m2_engine::stagger::Direction`]: the `Upright` `StaggerShort`,
+    /// `StaggerInPlace` and `StaggerLong` rows of each `DamageDirection`.
+    pub staggers: [[Option<usize>; 4]; 3],
 }
 
 /// The upright locomotion node's second idle: entry 12 of its handle
@@ -458,8 +462,16 @@ pub fn resolve(
                 .time;
             Some((i, at))
         });
+        let staggers = m2_engine::stagger::Stagger::ALL.map(|s| {
+            m2_engine::stagger::Direction::ALL.map(|d| {
+                let h = table::action_handle_hurt(actions, "Upright", s.name(), d.hash())?;
+                let p = table::handle_clip(t, h, who, class, fits)?;
+                index(p.clip)
+            })
+        });
         held.push(Held {
             windup,
+            staggers,
             settled: by_handle(SETTLED_HANDLE),
             fidget: by_handle(m2_assets::name_hash(FIDGET_HANDLE)),
             sweeps,

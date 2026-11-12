@@ -576,6 +576,30 @@ pub fn action_handle_toward(
     )
 }
 
+/// As [`action_handle`] for an action the table splits by
+/// `DamageDirection` (`direction`: the hash of `Front`, `Back`, `Left`
+/// or `Right`): a stagger's four rows.
+pub fn action_handle_hurt(
+    actions: &AnimationTable,
+    stance: &str,
+    action: &str,
+    direction: u32,
+) -> Option<u32> {
+    actions.lookup(
+        &[
+            ("Stance", Some(crate::name_hash(stance))),
+            ("Action", Some(crate::name_hash(action))),
+            ("AimState", None),
+            ("Tandem", None),
+            ("Seat", None),
+            ("Target", None),
+            ("ActionDirection", None),
+            ("DamageDirection", Some(direction)),
+        ],
+        "AnimationHandles",
+    )
+}
+
 /// The on-foot table's filter columns, in order: the seven a row is
 /// scored over ([`foot_rows`]).
 const FOOT_FILTERS: [&str; 7] = [

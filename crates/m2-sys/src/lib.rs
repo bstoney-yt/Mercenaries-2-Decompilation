@@ -6,6 +6,7 @@
 pub mod bink;
 pub mod clipboard;
 pub mod registry;
+pub mod stdio;
 pub mod xinput;
 
 #[cfg(windows)]

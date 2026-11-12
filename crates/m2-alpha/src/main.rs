@@ -58,6 +58,7 @@ mod disguise;
 mod display;
 mod drops;
 mod entrance_marker;
+mod errlog;
 mod flights;
 mod flow;
 mod frametimes;
@@ -1095,6 +1096,8 @@ fn keep_crash_reports() {
         if std::fs::write(&path, report).is_ok() {
             eprintln!("crash report written to {}", path.display());
         }
+        // The process ends here (panics abort): the log's last lines out.
+        errlog::finish();
     }));
 }
 
@@ -1124,8 +1127,11 @@ const PROPS_CHECK_AFTER: f32 = 20.0;
 #[cfg_attr(target_os = "android", allow(dead_code))]
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
+    errlog::start();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    run(&args, EventLoop::new)
+    let out = run(&args, EventLoop::new);
+    errlog::finish();
+    out
 }
 
 /// The game, given its arguments and how to make its event loop (the
@@ -4278,6 +4284,10 @@ fn mission_for_screenshot(
     let mut screen_cycle = loading::Cycle::default();
     let played = Instant::now();
     let every = if auto.is_some() { 10 } else { 30 };
+    // The wall clock at the last `pace:` line, and the spans from before
+    // play dropped.
+    let mut pace_since = Instant::now();
+    let _ = spans::take();
     // With --autoplay, a picture of each delivery as its helicopter
     // hovers over the drop point (`<out>-delivery1.ppm`, ...), and one
     // from the same place once the load has come down (`-down`).
@@ -4358,7 +4368,9 @@ fn mission_for_screenshot(
     // Message box calls with a callback, while the game's HUD isn't
     // running: when each is due back, by call number; the last seen.
     let (mut boxed, mut boxed_seen): (Vec<(f32, u64)>, u64) = (Vec::new(), 0);
+    let mut lap = spans::Lap::new();
     for i in 0..(seconds / tick).round() as u32 {
+        lap.mark("loop: pictures and checks");
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
             Some(a) => {
                 let contract = link.contract();
@@ -4449,10 +4461,13 @@ fn mission_for_screenshot(
                 a.exits = link.exit_offers();
                 a.enters = link.enter_offers_for(failed_contract.as_deref());
                 let objectives = link.view().objectives;
-                a.step(game, &marks, &objectives, &link.awaited(), tick)
+                spans::time("autoplay", || {
+                    a.step(game, &marks, &objectives, &link.awaited(), tick)
+                })
             }
             None => Intent::default(),
         };
+        lap.mark("loop: autoplay and what it reads");
         if let Some(hp) = options.hurt
             && i == (HURT_AT / tick).round() as u32
         {
@@ -4728,8 +4743,10 @@ fn mission_for_screenshot(
                 _ => {}
             }
         }
-        game.step(intent, tick);
-        link.tick(game, tick);
+        lap.mark("loop: before the step");
+        spans::time("game", || game.step(intent, tick));
+        spans::time("scripts", || link.tick(game, tick));
+        lap.mark("loop: step and scripts");
         // In a starter's box (her menu, then a contract's terms), autoplay
         // picks after a moment the contract on offer and then Accept, as a
         // player taking it would; the game's HUD answers the scripts' box
@@ -4803,7 +4820,9 @@ fn mission_for_screenshot(
                 None => transit_up = 0.0,
             }
         }
+        lap.mark("loop: autoplay picks");
         game.dress(backend);
+        lap.mark("loop: dress");
         // `--context exit,enter,talk`: each in turn, once the last is done.
         if let Some(want) = options
             .context
@@ -4983,6 +5002,7 @@ fn mission_for_screenshot(
         if options.movies {
             movies_offscreen(&mut link, install, out);
         }
+        lap.mark("loop: saves, checks and hijacks");
         // Until the contract is done the game's HUD doesn't run here, so
         // its message box can't call back as each message ends: an
         // objective's added message, which the objective waits on before
@@ -5038,6 +5058,7 @@ fn mission_for_screenshot(
                 eprintln!("shop-key: shop open 3 s after: {}", link.shop_open());
             }
         }
+        lap.mark("loop: late hud");
         // After the contract (--after-contract) the game's HUD runs too:
         // the flow waits on its fanfare closing.
         let boxed_now = options.dialog_shots && (late_hud.is_some() || link.dialog_open());
@@ -5203,6 +5224,7 @@ fn mission_for_screenshot(
                 }
             }
         }
+        lap.mark("loop: dialog and done");
         // `--visit-faction <abbrev>`: 30 s after the contract, she is put
         // 25 m from the nearest soldier spawn of that faction whose layer
         // is in; 15 s on, she hurts the nearest of them; who stands with
@@ -5345,6 +5367,7 @@ fn mission_for_screenshot(
                 }
             }
         }
+        lap.mark("loop: visits and medevac");
         // After the contract (--after-contract), where she is every five
         // seconds.
         if contract_done.is_some() && i % (5.0 / tick).round() as u32 == 0 {
@@ -5420,8 +5443,28 @@ fn mission_for_screenshot(
             );
             break;
         }
+        lap.mark("loop: after the scripts");
         if i % every == 0 {
             render(backend, game, fov, aspect, None)?;
+        }
+        lap.mark("loop: frame");
+        // Each minute of play, where the wall clock went (`pace: autoplay`):
+        // the play it got through for each second, and the parts of a tick
+        // ([`spans`]: the game's steps, the scripts, and the frames drawn
+        // every `every` ticks) in milliseconds a tick, longest first.
+        let ticks_a_minute = (60.0 / tick).round() as u32;
+        if i > 0 && i % ticks_a_minute == 0 {
+            let wall = pace_since.elapsed().as_secs_f32();
+            eprintln!(
+                "pace: autoplay {:.0} s of play: {:.2} s of play a second, {:.1} ms a tick, {} people, {} vehicles; ms a tick: {}",
+                i as f32 * tick,
+                60.0 / wall.max(1e-3),
+                wall * 1000.0 / ticks_a_minute as f32,
+                game.scene.people.npcs.len(),
+                game.scene.vehicles.len(),
+                spans::describe(&spans::take(), ticks_a_minute as f32, 20)
+            );
+            pace_since = Instant::now();
         }
         if auto.is_some() {
             for (copter, at, to) in game.scene.flights.hovering() {
@@ -10221,6 +10264,7 @@ impl Running {
         let engine = self.game.engine();
         self.audio.engine(engine, TICK.as_secs_f32());
         self.audio.rotors(&self.game.scene.flights.sounding());
+        self.audio.flybys(&self.game.scene.strikes.sounding());
         let others = self.game.others_engines(ear);
         self.audio.others_engines(&others, ear);
         let driving = self.game.driving().is_some();

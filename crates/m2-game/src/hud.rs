@@ -50,6 +50,16 @@ pub struct Blip {
     /// Draw order, 1 to 7: lower sorts draw over higher (from the 360
     /// code: the minimap's renderer draws 7 down to 1, clamping to that).
     pub sort: i64,
+    /// Its icon by name (`temp_radar_icon_tank`), when the call gave a
+    /// texture and not an index (`Hud.Radar:AddObjective`); read before
+    /// [`Self::icon`].
+    pub texture: Option<String>,
+    /// Width and height as given (the scripts' `nWidth`, `nHeight`).
+    pub size: [f32; 2],
+    /// `bRotate` and `bOriented` as given: the vehicles' and the planes'
+    /// blips set both.
+    pub rotate: bool,
+    pub oriented: bool,
 }
 
 /// A disc on the ground round a target or a point (`Marker.AddDisc`).
@@ -359,6 +369,19 @@ fn number(v: Option<&Value>) -> Option<f64> {
     }
 }
 
+/// A radar objective's name as its key: a text or a number as it is, an
+/// object's guid (the object scripts name their blip by their object) as
+/// `guid 0x...`.
+fn blip_name(v: Option<&Value>) -> Option<String> {
+    let v = v?;
+    match as_guid(v) {
+        Some(g) if !matches!(v, Value::Integer(_) | Value::Number(_) | Value::String(_)) => {
+            Some(format!("guid {g:#x}"))
+        }
+        _ => Some(text(Some(v))).filter(|s| !s.is_empty()),
+    }
+}
+
 fn int(v: Option<&Value>) -> i64 {
     number(v).map_or(0, |n| n as i64)
 }
@@ -449,6 +472,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 icon: int(a.get(9)),
                 sticky: matches!(a.get(11), Some(Value::Boolean(true))),
                 sort: int(a.get(14)).clamp(1, 7),
+                texture: None,
+                size: [f(7), f(8)],
+                rotate: matches!(a.get(12), Some(Value::Boolean(true))),
+                oriented: matches!(a.get(13), Some(Value::Boolean(true))),
             },
         );
         Ok(MultiValue::new())
@@ -485,6 +512,65 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&gui, "SetPickupMarkerVisibleDistance", |hud, _, a| {
         if let Some(reach) = number(a.first()) {
             hud.pickup_markers.reach[pickup_view(a.get(1))] = reach as f32;
+        }
+        Ok(MultiValue::new())
+    })?;
+
+    // The engine's `Hud` library hands `Hud.Radar:AddObjective(t)` and
+    // `:RemoveObjective(t)` to the HUD's interface (`HudInterface.Radar`,
+    // script 7f4bf50e), which gives the minimap `t`'s `sName`, `nX`,
+    // `nY`, `nZ`, `nR`, `nG`, `nB`, `nWidth`, `nHeight`, `sTexture`,
+    // `uGuid`, `bSticky`, `bRotate`, `bOriented` and `nSortOrder` as they
+    // are. What is left out takes the minimap widget's defaults for the
+    // place and the colour (0, 2, 0 and 255, 255, 0) and, for the size and
+    // the sort order, those the same script sends over the network (3,
+    // 3 and 5). The object scripts' blips come this way (`Blippable`:
+    // the munitions', the tanks', the helicopters' and the planes'), with
+    // `bDontNetSync` set, so no `Net.SendEvent_AddRadarObjective` follows.
+    let radar = match lib("Hud")?.raw_get::<Value>("Radar")? {
+        Value::Table(t) => t,
+        _ => {
+            let t = lua.create_table()?;
+            lib("Hud")?.raw_set("Radar", &t)?;
+            t
+        }
+    };
+    add(&radar, "AddObjective", |hud, _, a| {
+        let Some(Value::Table(t)) = a.get(1) else {
+            return Ok(MultiValue::new());
+        };
+        let get = |k: &str| t.raw_get::<Value>(k).ok();
+        let f = |k: &str, default: f32| number(get(k).as_ref()).map_or(default, |n| n as f32);
+        let flag = |k: &str| matches!(get(k), Some(Value::Boolean(true)));
+        let Some(name) = blip_name(get("sName").as_ref()) else {
+            return Ok(MultiValue::new());
+        };
+        hud.radar.insert(
+            name,
+            Blip {
+                target: guid(get("uGuid").as_ref()),
+                offset: [f("nX", 0.0), f("nY", 2.0), f("nZ", 0.0)],
+                colour: [
+                    f("nR", 255.0).clamp(0.0, 255.0) as u8,
+                    f("nG", 255.0).clamp(0.0, 255.0) as u8,
+                    f("nB", 0.0).clamp(0.0, 255.0) as u8,
+                ],
+                icon: 0,
+                sticky: flag("bSticky"),
+                sort: (f("nSortOrder", 5.0) as i64).clamp(1, 7),
+                texture: Some(text(get("sTexture").as_ref())).filter(|s| !s.is_empty()),
+                size: [f("nWidth", 3.0), f("nHeight", 3.0)],
+                rotate: flag("bRotate"),
+                oriented: flag("bOriented"),
+            },
+        );
+        Ok(MultiValue::new())
+    })?;
+    add(&radar, "RemoveObjective", |hud, _, a| {
+        if let Some(Value::Table(t)) = a.get(1)
+            && let Some(name) = blip_name(t.raw_get::<Value>("sName").ok().as_ref())
+        {
+            hud.radar.remove(&name);
         }
         Ok(MultiValue::new())
     })?;
@@ -980,6 +1066,49 @@ mod tests {
             .unwrap();
         let w = world.borrow();
         assert!(w.hud.objectives.is_empty() && w.hud.radar.is_empty() && w.hud.markers.is_empty());
+    }
+
+    /// The object scripts' blips (`Blippable`'s `Hud.Radar:AddObjective`
+    /// with a table): named by their object, with the texture's name, the
+    /// size and the turning flags as given; what is left out takes the
+    /// defaults; `RemoveObjective` takes the blip off by the same name.
+    #[test]
+    fn the_radar_takes_objectives_by_table() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        api::install(host.lua(), &world).unwrap();
+        host.lua()
+            .load(
+                r#"
+                tank = Sys.StringToGuid("0xb4bc2")
+                Hud.Radar:AddObjective({ sName = tank, nR = 100, nG = 100, nB = 100,
+                    nWidth = 5, nHeight = 5, sTexture = "temp_radar_icon_tank", uGuid = tank,
+                    bRotate = true, bOriented = true, bDontNetSync = true })
+                Hud.Radar:AddObjective({ sName = "plain" })
+                Hud.Radar:AddObjective({})
+                "#,
+            )
+            .exec()
+            .unwrap();
+        {
+            let w = world.borrow();
+            assert_eq!(w.hud.radar.len(), 2);
+            let b = &w.hud.radar["guid 0xb4bc2"];
+            assert_eq!(b.target, Some(0xb4bc2));
+            assert_eq!(b.texture.as_deref(), Some("temp_radar_icon_tank"));
+            assert_eq!((b.colour, b.size), ([100, 100, 100], [5.0, 5.0]));
+            assert!(b.rotate && b.oriented && !b.sticky);
+            assert_eq!((b.offset, b.sort), ([0.0, 2.0, 0.0], 5));
+            let p = &w.hud.radar["plain"];
+            assert_eq!((p.target, p.texture.clone()), (None, None));
+            assert_eq!((p.colour, p.size), ([255, 255, 0], [3.0, 3.0]));
+        }
+        host.lua()
+            .load(r#"Hud.Radar:RemoveObjective({ sName = tank, bDontNetSync = true })"#)
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        assert_eq!(w.hud.radar.keys().collect::<Vec<_>>(), ["plain"]);
     }
 
     #[test]

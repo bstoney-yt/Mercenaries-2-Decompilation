@@ -98,6 +98,24 @@ pub const OTHERS_ENGINE_EVENT: u32 = 0xfbf9_a4b4;
 /// the surface picks ([`crate::surface::tyre_class`]).
 pub const TYRE_LOOP_EVENT: u32 = 0x514c_1ed1;
 pub const ENGINE_OFF_EVENT: u32 = 0xc8f1_7f2a;
+/// The `Sounds` table event of an aircraft on a fly-past (name unknown).
+///
+/// From the 360 code: `0x82395258` posts the sound system a message
+/// naming the entity, its `SoundEffect` record's set, this event and the
+/// `Param` wildcard, of the kind the engine loops are started with (7: a
+/// sound that stays on its entity). Its three callers are the fly-past
+/// object's own code (the object `Airstrike.Flyby` makes, `0x82392AE8`):
+/// as its path is laid and its run starts (`0x823945C8`), and each time
+/// it starts another leg (`0x82393010`, `0x82393A70`). Nothing else
+/// posts it. When the entity goes, its sounds are stopped
+/// (`0x82403918`).
+///
+/// From samples: only the aircraft sets have a row for it, one each (the
+/// "Support Vehicle" templates' `9557a368`, `e5e50c7e`, `e0e19d55`,
+/// `f8033199`, `f1bbeac7` and `689eee5f`), and those sets have no other
+/// row. Their records are not engines, play nothing as they come into
+/// being (mode 0) and register a reach of 400 or 600 m.
+pub const FLYBY_EVENT: u32 = 0x4d65_6bde;
 
 /// `SoundEffect`'s field naming its sound set.
 const SET: &str = "SoundSet";

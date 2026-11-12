@@ -1719,17 +1719,41 @@ impl Npc {
                 }
             }
         } else if let Some((_, direction)) = last_hit {
-            self.stagger_from(direction);
+            self.stagger_from(&m2_engine::stagger::Event {
+                direction,
+                direct: true,
+                melee: false,
+                key: None,
+            });
         }
         !self.alive
     }
 
-    /// Alive after a direct hit travelling `direction`: the stagger the
-    /// 360 picks ([`m2_engine::stagger::pick`]), if its clip is on the
-    /// rig. On their feet only: the state table leads to the staggers
-    /// from `Upright` actions.
-    fn stagger_from(&mut self, direction: Vec3) {
-        use m2_engine::stagger::{self, Event, Person};
+    /// A blast at `from` whose `DamageKey` is `key` takes `damage`, as
+    /// [`hurt`](Self::hurt). Alive after it, they stagger as the 360 has
+    /// area damage do ([`m2_engine::stagger`]): the long stagger, for an
+    /// `Explosion` or `ExplosionLarge` only. The way the damage travelled
+    /// is taken as from the blast to them (inferred).
+    pub fn hurt_by_blast(&mut self, damage: f32, push: Vec3, key: Option<u32>, from: Vec3) -> bool {
+        self.last_hit = None;
+        let killed = self.hurt(damage, push);
+        if self.alive {
+            self.stagger_from(&m2_engine::stagger::Event {
+                direction: (self.character.position - from).with_y(0.0),
+                direct: false,
+                melee: false,
+                key,
+            });
+        }
+        killed
+    }
+
+    /// Alive after the damage `event`: the stagger the 360 picks
+    /// ([`m2_engine::stagger::pick`]), if its clip is on the rig. On
+    /// their feet only: the state table leads to the staggers from
+    /// `Upright` actions.
+    fn stagger_from(&mut self, event: &m2_engine::stagger::Event) {
+        use m2_engine::stagger::{self, Person};
         if self.down.is_some() || self.swim.is_some() || !self.landed {
             return;
         }
@@ -1745,12 +1769,7 @@ impl Npc {
                 cooldown: stagger::COOLDOWN,
                 reset: stagger::RESET,
             },
-            &Event {
-                direction,
-                direct: true,
-                melee: false,
-                key: None,
-            },
+            event,
         ) else {
             return;
         };
@@ -2881,7 +2900,10 @@ impl Npc {
             self.update_down(dt);
             return;
         }
-        if self.update_swim(physics, dt) {
+        let mut lap = crate::spans::Lap::new();
+        let swims = self.update_swim(physics, dt);
+        lap.mark("person: depth check and swim");
+        if swims {
             return;
         }
         if self.update_stagger(dt) {
@@ -2908,9 +2930,12 @@ impl Npc {
         // run it to its end first, and fight from there (inferred: the
         // villa's waves come in to the hall).
         let sent = matches!(self.brain, Brain::Route { .. });
+        lap.mark("person: look");
         if self.alert && !sent {
+            let fights = threat.is_some_and(|t| self.fight(physics, t, rng, dt));
+            lap.mark("person: fight");
             match threat {
-                Some(t) if self.fight(physics, t, rng, dt) => return,
+                Some(_) if fights => return,
                 _ => {
                     self.slot.clear();
                     self.foe_at = None;
@@ -3062,6 +3087,7 @@ impl Npc {
             }
             None => self.move_dry(physics, wanted, dt),
         }
+        lap.mark("person: walk");
         // Walked into something: give up on that point (strolls) or wait
         // and try again (routes).
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
@@ -3110,7 +3136,9 @@ impl Npc {
         }
         // His number stands in for the game's entity handle (invented).
         let rate = self.rig.play_rate(gait, moved, self.shooter);
+        lap.mark("person: steer and gait");
         self.rig.advance(dt * rate);
+        lap.mark("person: animation");
     }
 }
 
@@ -4576,8 +4604,11 @@ impl People {
         threat: Option<Vec3>,
         dt: f32,
     ) {
+        let mut lap = crate::spans::Lap::new();
         self.pursue(dt);
+        lap.mark("people: pursuit");
         self.war(physics, threat, dt);
+        lap.mark("people: war");
         self.war_log -= dt;
         if self.war_log <= 0.0 {
             self.war_log = 30.0;
@@ -4627,6 +4658,7 @@ impl People {
         }
         self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
+        lap.mark("people: spawning");
         let scripted = std::mem::take(&mut self.scripted);
         if !scripted.is_empty() {
             self.populate(physics, &scripted, focus);
@@ -4696,13 +4728,17 @@ impl People {
                 .max(2.0 * npc.motion.capsule_radius);
             npc.rammed = (npc.rammed - dt).max(0.0);
             let facing = npc.facing;
-            npc.update(physics, &mut self.rng, threat, dt);
+            crate::spans::time("people: each one's update", || {
+                npc.update(physics, &mut self.rng, threat, dt)
+            });
             let p = npc.character.position;
-            self.checks
-                .count(npc, facing, physics.water_at(p.x, p.z), dt);
-            if let Some(t) = threat {
-                self.idle.count(physics, npc, t, dt);
-            }
+            crate::spans::time("people: checks", || {
+                self.checks
+                    .count(npc, facing, physics.water_at(p.x, p.z), dt);
+                if let Some(t) = threat {
+                    self.idle.count(physics, npc, t, dt);
+                }
+            });
             if std::mem::take(&mut npc.spotted) && npc.alive && self.smarter.enabled {
                 callouts.push(npc.character.position);
             }
@@ -7300,6 +7336,15 @@ pub(crate) mod tests {
         assert!(n.stagger.is_none() && n.since_stagger.is_none());
         assert!(n.last_hit.is_none());
         assert!(!n.update_stagger(0.1));
+        // A blast's, too: hurt as by anything, and no stagger without
+        // the clip.
+        assert!(!n.hurt_by_blast(
+            1.0,
+            Vec3::X,
+            Some(m2_engine::stagger::EXPLOSION),
+            Vec3::NEG_X
+        ));
+        assert!(n.alive && n.stagger.is_none());
     }
 
     /// With the hit known but no clip for its direction on the rig, the
