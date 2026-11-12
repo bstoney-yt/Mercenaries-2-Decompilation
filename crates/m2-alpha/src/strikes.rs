@@ -29,6 +29,9 @@ const LIFETIME: f32 = 30.0;
 struct Jet {
     guid: u32,
     model: Option<u32>,
+    /// Its template's sound set (0: none), whose fly-past cue is heard
+    /// from it ([`m2_engine::spawn_sound::FLYBY_EVENT`]).
+    sound_set: u32,
     at: Vec3,
     /// Its heading, level, and speed (m/s).
     dir: Vec3,
@@ -87,11 +90,16 @@ impl Strikes {
             } => {
                 let (from, to) = (Vec3::from(*from), Vec3::from(*to));
                 let model = templates.get(what).and_then(|t| t.model);
+                let sound_set = templates
+                    .id(what)
+                    .and_then(|id| templates.spawn_sounds.get(&id))
+                    .map_or(0, |s| s.set);
                 self.wanted.extend(model);
                 eprintln!("strike: {what} flies from {from:.0} over {to:.0} at {speed} m/s");
                 self.jets.push(Jet {
                     guid: *guid,
                     model,
+                    sound_set,
                     at: from,
                     dir: (to - from).with_y(0.0).normalize_or(Vec3::Z),
                     speed: speed.max(1.0),
@@ -139,6 +147,15 @@ impl Strikes {
             }
             _ => {}
         }
+    }
+
+    /// The aircraft in the air, to be heard: each one's guid, where it
+    /// is and its sound set (0: none).
+    pub fn sounding(&self) -> Vec<(u32, Vec3, u32)> {
+        self.jets
+            .iter()
+            .map(|j| (j.guid, j.at, j.sound_set))
+            .collect()
     }
 
     /// Flies everything on by `dt` seconds.
@@ -279,5 +296,12 @@ mod tests {
         }
         assert_eq!(s.arrived, vec![(7, Vec3::new(0.0, 0.0, 200.0))]);
         assert_eq!(s.jets.len(), 1);
+        // It is heard from where it is for as long as it flies (no
+        // template database here: no sound set).
+        assert_eq!(s.sounding(), vec![(7, Vec3::new(0.0, 100.0, 300.0), 0)]);
+        for _ in 0..200 {
+            s.step(&physics, 0.1);
+        }
+        assert!(s.sounding().is_empty());
     }
 }
