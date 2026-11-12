@@ -1139,6 +1139,12 @@ pub struct ScriptWorld {
     /// `CinematicEnd`), by who plays them, with their game time
     /// ([`crate::events::World::animation_events`]).
     pub animation_events: Vec<(f64, u32, String)>,
+    /// The joined callback is running for the local player and has not
+    /// made her character yet ([`crate::mission::Mission::set_script_join`]):
+    /// its `Pg.Spawn` answers the character the game already made.
+    pub joining: bool,
+    /// The template the joined callback asked for as her character.
+    pub joined_template: Option<String>,
     /// The costume the player's profile keeps (`Player.GetProfileCostume`,
     /// `SetProfileCostume`: the wardrobe's pick, counted from 0).
     pub profile_costume: f64,
@@ -2778,6 +2784,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             },
             None => return values([Value::Nil]),
         };
+        // `MrxPlayer.CreatePlayerCharacter`'s spawn while she joins: the
+        // game has made her already, so it is her that is answered, where
+        // she stands (invented: on the 360 this spawn makes her).
+        if let Some(her) = w.player.filter(|_| w.joining) {
+            w.joining = false;
+            w.joined_template = Some(what);
+            return values([crate::events::guid_value(her)]);
+        }
         let position = [
             num(a.get(1)).unwrap_or(0.0),
             num(a.get(2)).unwrap_or(0.0),
