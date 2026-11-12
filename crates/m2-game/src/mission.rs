@@ -2942,7 +2942,14 @@ fn seat_crew(
 /// `Alarm` is the alarm towers' script ([`crate::alarm`]): as a tower
 /// wakes it offers the player `[ContextAction.UseAlarm]`, and its `OnUse`
 /// raises or lowers the alarm.
-pub const OBJECT_SCRIPTS: [(&str, u32); 8] = [
+///
+/// `crate` is the script of the supply drop crates (the `Supply Drop
+/// (...)` templates, 0x33ed14de): awake and not hanging on a winch, a
+/// crate has a blip (`Marker.AddBlip` of `pickup_crate_2`, size 48,
+/// white, half a metre up, fading from 16 m to 20 m); the blip goes
+/// while a winch has it and comes back when it is let go, and goes for
+/// good when the crate dies (its `OnDeath`) or leaves.
+pub const OBJECT_SCRIPTS: [(&str, u32); 9] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -2951,7 +2958,11 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 8] = [
     ("Helicopter", HELICOPTER),
     ("Airplane", AIRPLANE),
     ("Alarm", ALARM),
+    ("crate", SUPPLY_CRATE),
 ];
+
+/// `crate`'s module hash.
+pub const SUPPLY_CRATE: u32 = 0x33ed_14de;
 
 /// `Alarm`'s module hash.
 pub const ALARM: u32 = 0xbe65_fdd0;
@@ -3826,6 +3837,32 @@ mod tests {
         // An object with no script of its own: nothing is called.
         m.object_state_changed(0x999, 1, 2);
         assert_eq!(g.get::<u32>("states").unwrap(), 1);
+    }
+
+    #[test]
+    fn a_supply_crates_blip_is_read_as_the_script_gives_it() {
+        let m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        // The call `crate` makes for a crate that is awake and not winched.
+        m.lua()
+            .load(
+                r#"
+                local c = Pg.Spawn("Supply Drop (Sniper)", 1, 0, 1, 0)
+                h = Marker.AddBlip(c, "pickup_crate_2", 48, 255, 255, 255, 255, 0.5, 16, 20)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let w = m.world.borrow();
+        assert_eq!(w.hud.markers.len(), 1);
+        let blip = w.hud.markers.values().next().unwrap();
+        assert_eq!(blip.icon, "pickup_crate_2");
+        assert_eq!(blip.colour, [255; 4]);
+        assert_eq!((blip.height, blip.near, blip.far), (0.5, 16.0, 20.0));
+        assert_eq!(blip.sizes[0], 48.0);
+        drop(w);
+        m.lua().load("Marker.Remove(h)").exec().unwrap();
+        assert!(m.world.borrow().hud.markers.is_empty());
+        assert!(OBJECT_SCRIPTS.contains(&("crate", SUPPLY_CRATE)));
     }
 
     #[test]
