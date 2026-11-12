@@ -69,6 +69,9 @@ pub struct Music {
     pub hostility: Hostility,
     /// `Sound.LockActionLevelMusic`: the action level stands as it is.
     pub action_locked: bool,
+    /// The hostile characters aware of the player, by the engine's four
+    /// groups ([`crate::music_machine::group`]), as the game last said.
+    pub aware: [u32; 4],
 }
 
 impl Music {

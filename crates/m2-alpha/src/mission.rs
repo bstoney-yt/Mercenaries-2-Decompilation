@@ -3362,6 +3362,19 @@ impl MissionLink {
             let spare = game.combat.rifle_rounds.stored;
             mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
             crate::spans::time("scripts: look", || look(game, mission, &mut self.sighted));
+            // The score's action level: the soldiers on foot turned on
+            // her are the fourth group. Hostile vehicle crews (the other
+            // three) are not counted yet.
+            let on_foot = game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .filter(|n| n.alive && n.alert)
+                .count();
+            let mut aware = [0; 4];
+            aware[m2_game::music_machine::group(0)] = on_foot as u32;
+            mission.set_hostile_aware(aware);
             crate::spans::time("scripts: lua", || mission.tick(f64::from(STEP)));
             // The scripts' own interface runs too: its animations finish
             // and their callbacks run (`MrxGuiCinematic.ShowMovie` plays

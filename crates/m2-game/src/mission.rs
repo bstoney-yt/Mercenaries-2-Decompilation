@@ -1192,16 +1192,17 @@ impl Mission {
             w.pursuit.clock.step(dt as f32);
             // No time scale yet: game and real time run together.
             w.clocks.step(dt as f32, dt as f32);
-            // The score moves by itself (its states' lengths; the action
-            // level, for which the game counts nobody yet: the engine's
-            // four groups of hostile characters are not known).
+            // The score moves by itself: by its states' lengths, and by
+            // the action level from those the game says are hostile and
+            // aware of her ([`Self::set_hostile_aware`]).
             let decay = w.sound.hostility_decay_rate;
             let clocks = w.sys.timer_update_music.unwrap_or(true);
             let force = std::mem::take(&mut w.sound.force_action_transition);
             let draw = (now * 7919.0).fract() as f32;
+            let aware = w.music.aware;
             if let Some(c) = w
                 .music
-                .update(dt as f32, decay, [0; 4], clocks, force, || draw)
+                .update(dt as f32, decay, aware, clocks, force, || draw)
             {
                 w.commands.push(c);
             }
@@ -2605,6 +2606,13 @@ end
 
     /// The player is (no longer) on her grappling hook's line, for the
     /// scripts' `Human.IsGrappling`.
+    /// How many hostile characters are aware of the player now, in the
+    /// music's four groups ([`crate::music_machine::group`]): what the
+    /// score's action level is worked out from.
+    pub fn set_hostile_aware(&mut self, counts: [u32; 4]) {
+        self.world.borrow_mut().music.aware = counts;
+    }
+
     pub fn set_grappling(&mut self, on: bool) {
         self.world.borrow_mut().grappling = on;
     }

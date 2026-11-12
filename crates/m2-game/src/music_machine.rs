@@ -35,10 +35,8 @@
 //! action), `pause` (delay 0.25 s, flag 2), and the thresholds 2 and 0
 //! on `none` and `explore`.
 //!
-//! Not known: which characters fall in which of the four groups (the
-//! AI's class byte was not traced to its meaning), so the game feeds no
-//! counts yet; and what the engine does with a state's cue beyond
-//! starting it (the player's cross-fades).
+//! Not known: what the engine does with a state's cue beyond starting
+//! it (the player's cross-fades).
 
 /// The action around the player: four running values, one for each group
 /// of hostile characters aware of them.
@@ -83,6 +81,25 @@ impl Hostility {
         } else {
             0
         }
+    }
+}
+
+/// Which of [`Hostility`]'s four groups a hostile character aware of the
+/// player counts in, by the AI's class of them.
+///
+/// From the 360 code: the class is set from the vehicle the character
+/// is in (`0x822BB608`): 0 none, 1 a car (the vehicle has a
+/// `ControllerCar`), 2 a tank (`ControllerTank`), 3 a helicopter
+/// (`ControllerHelicopter`), 4 a boat (`ControllerBoat`), 7 a turret, 6
+/// any other vehicle. The music's count (`0x822DD7C8`) puts 3 and 8 in
+/// the first group, 2 and 4 in the second, 1 and 5 in the third and
+/// the rest in the fourth. (Nothing found sets 5 or 8.)
+pub fn group(class: u8) -> usize {
+    match class {
+        3 | 8 => 0,
+        2 | 4 => 1,
+        1 | 5 => 2,
+        _ => 3,
     }
 }
 
@@ -551,6 +568,14 @@ mod tests {
         // One of the first groups is enough.
         h.update(0.1, 1.0, [0, 1, 0, 0]);
         assert_eq!(h.level((2.0, 0.0)), 2);
+    }
+
+    #[test]
+    fn the_groups_are_helicopters_tanks_and_boats_cars_and_the_rest() {
+        assert_eq!([group(3), group(8)], [0, 0]);
+        assert_eq!([group(2), group(4)], [1, 1]);
+        assert_eq!([group(1), group(5)], [2, 2]);
+        assert_eq!([group(0), group(6), group(7), group(9)], [3; 4]);
     }
 
     #[test]
