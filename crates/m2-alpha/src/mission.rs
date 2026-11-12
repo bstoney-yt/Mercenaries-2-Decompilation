@@ -4701,10 +4701,12 @@ impl MissionLink {
         objective_texts(mission, &mission.world().borrow().hud)
     }
 
-    /// [`view`](Self::view)'s HUD calls alone, oldest first.
-    pub fn hud_calls(&self) -> Vec<HudCall> {
+    /// [`view`](Self::view)'s HUD calls numbered after `seq`, oldest
+    /// first: only those are read (up to 512 are kept, each with a copy
+    /// of its data, and reading them all cost 3 to 5 ms).
+    pub fn hud_calls_after(&self, seq: u64) -> Vec<HudCall> {
         match &self.state {
-            State::Running(mission) => hud_calls(mission.lua()),
+            State::Running(mission) => hud_calls_after(mission.lua(), seq),
             _ => Vec::new(),
         }
     }
@@ -4890,6 +4892,29 @@ fn let_go_hud_calls(lua: &mlua::Lua, seq: u64) {
         )
         .set_name("=m2-hud calls let go")
         .call::<()>(seq as f64);
+}
+
+/// The calls [`HUD_CALLS`] keeps numbered after `seq`, oldest first: by
+/// number up to the latest (`__m2_hud_call_count`), so those seen already
+/// aren't read again.
+fn hud_calls_after(lua: &mlua::Lua, seq: u64) -> Vec<HudCall> {
+    let g = lua.globals();
+    let (Ok(Some(calls)), Ok(Some(latest))) = (
+        g.get::<Option<mlua::Table>>("__m2_hud_calls"),
+        g.get::<Option<u64>>("__m2_hud_call_count"),
+    ) else {
+        return Vec::new();
+    };
+    (seq + 1..=latest)
+        .filter_map(|k| calls.raw_get::<Option<mlua::Table>>(k).ok().flatten())
+        .map(|t| HudCall {
+            seq: t.get("seq").unwrap_or(0),
+            group: t.get("group").unwrap_or_default(),
+            method: t.get("method").unwrap_or_default(),
+            data: Plain::of(&t.get("data").unwrap_or(mlua::Value::Nil)),
+            callback: t.get("callback").unwrap_or(false),
+        })
+        .collect()
 }
 
 /// The calls [`HUD_CALLS`] keeps, oldest first.
@@ -9074,6 +9099,9 @@ mod tests {
                 .filter(|&s| s > last)
                 .collect();
             assert_eq!(new.len(), n, "after adding {n}: {new:?}");
+            // Read by number, the same ones.
+            let after: Vec<u64> = hud_calls_after(&lua, last).iter().map(|c| c.seq).collect();
+            assert_eq!(after, new);
             last = new.last().copied().unwrap_or(last);
             let_go_hud_calls(&lua, last);
             assert!(hud_calls(&lua).is_empty());

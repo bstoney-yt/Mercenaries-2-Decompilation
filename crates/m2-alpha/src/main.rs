@@ -5011,7 +5011,7 @@ fn mission_for_screenshot(
         // (inferred: the box shows one at a time, which isn't kept).
         if late_hud.is_none() {
             let now = i as f32 * tick;
-            for c in link.hud_calls() {
+            for c in link.hud_calls_after(boxed_seen) {
                 if c.seq <= boxed_seen {
                     continue;
                 }
