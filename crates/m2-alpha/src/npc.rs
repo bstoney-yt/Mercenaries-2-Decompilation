@@ -555,6 +555,44 @@ pub const STAGGER_CLIPS: [(Stagger, Direction, [u32; 4]); 12] = {
 /// movement record whose meaning is not established).
 const STAGGER_MOVING: f32 = 0.5;
 
+/// Someone using a thing by one of its seats ([`crate::social`]): where
+/// they get on, where and which way they sit, and how long a use of the
+/// thing lasts (its `SocialUse` record's duration).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UseJob {
+    /// The placed object and the seat's name hash.
+    pub object: usize,
+    pub seat: u32,
+    pub entrance: Vec3,
+    pub seat_at: Vec3,
+    pub seat_yaw: f32,
+    pub duration: f32,
+    /// The seat's clips on their rig: getting on, seated, getting off.
+    pub enter: Option<usize>,
+    pub idle: usize,
+    pub exit: Option<usize>,
+}
+
+/// Where someone using a thing is at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum UsePhase {
+    /// Walking to the seat's entrance, for this long so far.
+    Walk(f32),
+    /// Getting on: the clip.
+    Enter(usize),
+    Sit,
+    /// Getting off: the clip.
+    Exit(usize),
+}
+
+/// How near the seat's entrance they get on, metres (invented; the 360
+/// boards through the vehicles' entrance check, not read for people).
+const USE_REACH: f32 = 0.6;
+
+/// They give a thing up when they have not reached it after this long,
+/// seconds (invented: the port's people can be blocked for good).
+const USE_GIVE_UP: f32 = 30.0;
+
 /// How far apart a clip's hands get over the whole clip, for its hip
 /// height: a rifle held in both hands keeps them close.
 pub fn hand_spread(rig: &Rig, c: &BoundClip) -> Option<f32> {
@@ -1246,6 +1284,11 @@ pub struct Npc {
     /// since their last stagger began ([`m2_engine::stagger`]).
     stagger: Option<usize>,
     since_stagger: Option<f32>,
+    /// The thing they are using or going to use, and where they are at
+    /// with it ([`crate::social`]).
+    using: Option<(UseJob, UsePhase)>,
+    /// How lately they used something ([`m2_engine::social_use::UseMeter`]).
+    pub use_meter: m2_engine::social_use::UseMeter,
     /// Has shouted since they were last calm.
     shouted: bool,
     /// Killed since [`People::take_deaths`] last looked.
@@ -1412,6 +1455,8 @@ impl Npc {
             dying: None,
             stagger: None,
             since_stagger: None,
+            using: None,
+            use_meter: Default::default(),
             shouted: false,
             died: false,
             kind,
@@ -1806,6 +1851,141 @@ impl Npc {
             .play_action(clip, true, pick.stagger.action());
         self.stagger = Some(clip);
         self.since_stagger = Some(0.0);
+    }
+
+    /// The thing they use or are on their way to, and its seat.
+    pub fn using(&self) -> Option<(usize, u32)> {
+        self.using.map(|(j, _)| (j.object, j.seat))
+    }
+
+    /// Whether they are seated at a thing (getting on or off too).
+    pub fn seated_at_use(&self) -> bool {
+        matches!(self.using, Some((_, p)) if !matches!(p, UsePhase::Walk(_)))
+    }
+
+    /// Whether a usable thing may call them over this tick: the 360
+    /// lists those standing idle whose use meter is low
+    /// ([`m2_engine::social_use::is_candidate`]). Here: pausing on a
+    /// stroll, calm, on their feet and free.
+    pub fn use_candidate(&self, listed: usize) -> bool {
+        self.alive
+            && self.landed
+            && !self.alert
+            && !self.held
+            && self.flee.is_none()
+            && self.down.is_none()
+            && self.swim.is_none()
+            && self.using.is_none()
+            && self.stagger.is_none()
+            && matches!(self.brain, Brain::Wander { wait, .. } if wait > 0.0)
+            && m2_engine::social_use::is_candidate(self.use_meter.0, listed)
+    }
+
+    /// Called over to use a thing: they walk to its seat's entrance.
+    pub fn start_use(&mut self, job: UseJob) {
+        self.using = Some((job, UsePhase::Walk(0.0)));
+    }
+
+    /// Whether something has put them off using a thing.
+    fn use_disturbed(&self) -> bool {
+        self.alert || self.held || self.flee.is_some() || self.hit
+    }
+
+    /// One step of using a thing, once at its seat: getting on, seated,
+    /// getting off. True while seated, when they do nothing else. The
+    /// use is over when their meter says so (the 360's use step,
+    /// 0x822ABD60) or something disturbs them (invented: what the 360
+    /// does with a seated person who is alarmed was not traced).
+    fn update_use(&mut self, dt: f32) -> bool {
+        let Some((job, phase)) = self.using else {
+            self.use_meter.step(dt, None);
+            return false;
+        };
+        let over = |rig: &Rig, clip: usize| {
+            rig.animator
+                .current()
+                .is_none_or(|(c, at)| c != clip || at + 1e-3 >= rig.clips[c].info.duration)
+        };
+        let leave = |n: &mut Self| match job.exit {
+            Some(c) => {
+                n.rig
+                    .animator
+                    .play_action(c, true, m2_engine::blend::action::EXIT_VEHICLE);
+                Some((job, UsePhase::Exit(c)))
+            }
+            None => {
+                n.character.position = job.entrance;
+                None
+            }
+        };
+        let next = match phase {
+            UsePhase::Walk(_) => {
+                self.use_meter.step(dt, None);
+                return false;
+            }
+            UsePhase::Enter(c) if over(&self.rig, c) => {
+                if job.idle < self.rig.clips.len() {
+                    self.rig.animator.play(job.idle);
+                }
+                Some((job, UsePhase::Sit))
+            }
+            UsePhase::Sit if self.use_meter.done() || self.use_disturbed() => leave(self),
+            UsePhase::Exit(c) if over(&self.rig, c) => {
+                self.character.position = job.entrance;
+                None
+            }
+            p => Some((job, p)),
+        };
+        self.using = next;
+        // The meter rises while they sit, and falls again after.
+        let sitting = matches!(next, Some((_, UsePhase::Enter(_) | UsePhase::Sit)));
+        self.use_meter.step(dt, sitting.then_some(job.duration));
+        if next.is_none() {
+            return false;
+        }
+        self.character.position = job.seat_at;
+        self.character.velocity = Vec3::ZERO;
+        self.facing = job.seat_yaw;
+        self.rig.advance(dt);
+        true
+    }
+
+    /// Walking to the thing they were called over to: the way to its
+    /// seat's entrance, `None` once there (then they get on) or once
+    /// they give it up.
+    fn walk_to_use(&mut self, dt: f32) -> Option<Vec3> {
+        let (job, UsePhase::Walk(t)) = self.using? else {
+            return None;
+        };
+        if self.use_disturbed() || t > USE_GIVE_UP {
+            self.using = None;
+            return None;
+        }
+        let to = (job.entrance - self.character.position).with_y(0.0);
+        if to.length() > USE_REACH {
+            self.using = Some((job, UsePhase::Walk(t + dt)));
+            return Some(to.normalize());
+        }
+        self.rig.animator.set_upper(None);
+        let phase = match job.enter {
+            Some(c) => {
+                self.rig
+                    .animator
+                    .play_action(c, true, m2_assets::name_hash("EnterVehicle"));
+                UsePhase::Enter(c)
+            }
+            None => {
+                if job.idle < self.rig.clips.len() {
+                    self.rig.animator.play(job.idle);
+                }
+                UsePhase::Sit
+            }
+        };
+        self.using = Some((job, phase));
+        self.character.position = job.seat_at;
+        self.character.velocity = Vec3::ZERO;
+        self.facing = job.seat_yaw;
+        None
     }
 
     /// One step of a stagger: true while its clip plays, when they do
@@ -2897,6 +3077,7 @@ impl Npc {
         }
         if self.down.is_some() {
             self.stagger = None;
+            self.using = None;
             self.update_down(dt);
             return;
         }
@@ -2907,6 +3088,9 @@ impl Npc {
             return;
         }
         if self.update_stagger(dt) {
+            return;
+        }
+        if self.update_use(dt) {
             return;
         }
         self.since_shot += dt;
@@ -3076,6 +3260,14 @@ impl Npc {
             };
             self.reached = true;
             self.ended = true;
+        }
+        // Called over to a thing: to its seat's entrance, at a walk.
+        if let Some(way) = self.walk_to_use(dt) {
+            wanted = way * self.push(HUMAN_WALK);
+            glide = None;
+        } else if self.seated_at_use() {
+            // Got on this step.
+            return;
         }
         match glide {
             Some(point) => {
@@ -4591,6 +4783,24 @@ impl People {
     pub fn add_kind(&mut self, kind: PersonKind) {
         eprintln!("people: kind {:?}: {}", kind.role, kind.rig.idle_line());
         self.kinds.push(kind);
+    }
+
+    /// This tick's candidates for the usable things, in the people's
+    /// order: who (index into `npcs`) and where
+    /// ([`Npc::use_candidate`]).
+    pub fn use_candidates(&self) -> Vec<(usize, Vec3)> {
+        let mut out = Vec::new();
+        for (i, n) in self.npcs.iter().enumerate() {
+            if n.use_candidate(out.len()) {
+                out.push((i, n.character.position));
+            }
+        }
+        out
+    }
+
+    /// A random number in [0, 1) of the people's own.
+    pub fn random(&mut self) -> f32 {
+        self.rng.next()
     }
 
     /// One fixed tick: people come and go around `focus`, then move;
@@ -7301,6 +7511,98 @@ pub(crate) mod tests {
         ours.sort_unstable();
         assert_eq!(ours, table);
         assert!(DEATH_CLIPS.iter().all(|d| !d.1.is_empty()));
+    }
+
+    /// Called over, they walk to the entrance, get on, sit their time
+    /// out and are back on their feet at the entrance.
+    #[test]
+    fn called_over_they_walk_sit_the_duration_and_get_up() {
+        let physics = ground();
+        let mut rng = Rng::default();
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Wander {
+                home: Vec3::ZERO,
+                target: Vec3::ZERO,
+                wait: 100.0,
+            },
+            None,
+        );
+        let step = |n: &mut Npc, seconds: f32, rng: &mut Rng| {
+            for _ in 0..(seconds * 60.0) as usize {
+                n.update(&physics, rng, None, 1.0 / 60.0);
+            }
+        };
+        step(&mut n, 0.5, &mut rng);
+        assert!(n.use_candidate(0));
+        assert!(!n.use_candidate(m2_engine::social_use::CANDIDATES_MOST));
+        let job = UseJob {
+            object: 3,
+            seat: 0xa759_c6cc,
+            entrance: n.character.position + Vec3::new(2.0, 0.0, 0.0),
+            seat_at: n.character.position + Vec3::new(2.0, 0.4, 0.5),
+            seat_yaw: 1.0,
+            duration: 2.0,
+            enter: None,
+            idle: 0,
+            exit: None,
+        };
+        n.start_use(job);
+        assert_eq!(n.using(), Some((3, 0xa759_c6cc)));
+        assert!(!n.use_candidate(0) && !n.seated_at_use());
+        // Walking: nearer the entrance, not yet seated.
+        step(&mut n, 0.5, &mut rng);
+        assert!(n.character.position.x > 0.2 && !n.seated_at_use());
+        // There: seated at the seat, facing its way.
+        step(&mut n, 4.0, &mut rng);
+        assert!(n.seated_at_use());
+        assert_eq!(n.character.position, job.seat_at);
+        assert_eq!(n.facing, 1.0);
+        // The duration over (and a little): up, at the entrance, and not
+        // a candidate again at once.
+        step(&mut n, 2.5, &mut rng);
+        assert_eq!(n.using(), None);
+        assert!((n.character.position - job.entrance).with_y(0.0).length() < 0.5);
+        assert!(!n.use_candidate(0));
+    }
+
+    /// Alarmed on the way, they give the thing up; alarmed seated, they
+    /// get off.
+    #[test]
+    fn alarm_puts_them_off_a_thing() {
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            None,
+        );
+        let job = UseJob {
+            object: 1,
+            seat: 2,
+            entrance: Vec3::new(5.0, 0.0, 0.0),
+            seat_at: Vec3::new(5.0, 0.4, 0.0),
+            seat_yaw: 0.0,
+            duration: 30.0,
+            enter: None,
+            idle: 0,
+            exit: None,
+        };
+        n.start_use(job);
+        n.alert = true;
+        assert_eq!(n.walk_to_use(0.1), None);
+        assert_eq!(n.using(), None);
+        n.alert = false;
+        n.using = Some((job, UsePhase::Sit));
+        assert!(n.update_use(0.1));
+        n.hit = true;
+        assert!(!n.update_use(0.1));
+        assert_eq!(n.using(), None);
+        assert_eq!(n.character.position, job.entrance);
     }
 
     /// Each of the three staggers has its four directions, once each.

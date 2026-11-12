@@ -103,6 +103,7 @@ mod save;
 mod scene;
 mod shell;
 mod shopcheck;
+mod social;
 mod sound;
 mod spans;
 mod startup;

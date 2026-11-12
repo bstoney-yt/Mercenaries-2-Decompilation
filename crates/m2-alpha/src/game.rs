@@ -232,6 +232,9 @@ pub struct Game {
     pub last_vehicle: Option<usize>,
     /// The island's ladders ([`crate::ladders`]).
     pub ladders: crate::ladders::Ladders,
+    /// The island's benches, chairs and the like, calling people over
+    /// ([`crate::social`]).
+    pub social: crate::social::Social,
     /// The ladder she is on.
     pub climb: Option<crate::ladders::Climbing>,
     /// The vehicle the use key seated her in and her seat's `SeatLink`
@@ -504,6 +507,7 @@ impl Game {
             unusable: HashSet::new(),
             last_vehicle: None,
             ladders: Default::default(),
+            social: Default::default(),
             climb: None,
             ride: None,
             boarding: None,
@@ -2201,6 +2205,14 @@ impl Game {
             self.scene
                 .people
                 .update(&mut world.physics, &world.index.spawns, focus, threat, dt);
+            self.social.step(
+                &world.index,
+                &world.destroyed,
+                self.scene.source.as_mut(),
+                &mut self.scene.people,
+                focus,
+                dt,
+            );
             let cars: Vec<_> = self
                 .scene
                 .vehicles
