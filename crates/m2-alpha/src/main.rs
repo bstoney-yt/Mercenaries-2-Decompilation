@@ -186,6 +186,11 @@ struct Options {
     /// skips the fade before the villa's closing movie and the move into
     /// the PMC HQ, and Fiona's Talk never comes.
     skip_mode_off: bool,
+    /// The scripts' "player joined" callback is called for her
+    /// (`--script-join`; [`m2_game::mission::Mission::set_script_join`]).
+    /// Off by default: with it on the scripts make her interface and
+    /// watch for her death themselves.
+    script_join: bool,
     /// With `--mission`: the story skipped to this contract the game's
     /// developer way, and whether to its briefing (`--skip-to <id>[,briefing]`).
     skip_to: Option<(String, bool)>,
@@ -688,6 +693,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             // The default since round 25; kept so old launch lines work.
             "--skip-mode-off" => o.skip_mode_off = true,
             "--skip-mode-on" => o.skip_mode_off = false,
+            "--script-join" => o.script_join = true,
             "--skip-to" => {
                 let v = value()?;
                 o.skip_to = Some(match v.split_once(',') {
@@ -1037,7 +1043,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 17] = [
+    const PLAIN: [&str; 18] = [
         "--install",
         "--config",
         "--size",
@@ -1051,6 +1057,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
         "--dev",
         "--skip-mode-off",
         "--skip-mode-on",
+        "--script-join",
         // Co-op plays the whole game too.
         "--host",
         "--join",
@@ -1307,6 +1314,7 @@ fn run(
         no_boot: options.no_boot,
         to_front_end: options.to_front_end,
         skip_mode_off: options.skip_mode_off,
+        script_join: options.script_join,
         skip_to: options.skip_to.clone(),
         guns: options.guns.clone(),
         load: options.load.clone(),
@@ -4288,6 +4296,7 @@ fn mission_for_screenshot(
         .with_support(options.support.clone())
         .with_movies(options.movies)
         .with_skip_mode_off(options.skip_mode_off)
+        .with_script_join(options.script_join)
         .with_skip_to(options.skip_to.clone())
         .with_job_near(options.job_near);
     let started = Instant::now();
@@ -9208,6 +9217,9 @@ struct App {
     /// End the scripts' skip mode after their start (unless
     /// `--skip-mode-on`).
     skip_mode_off: bool,
+    /// The scripts' "player joined" callback is called for her
+    /// (`--script-join`).
+    script_join: bool,
     /// The story skipped to this contract (`--skip-to`).
     skip_to: Option<(String, bool)>,
     /// Weapons to start with (`--gun`).
@@ -9337,6 +9349,7 @@ impl App {
                         .with_support(self.support.clone())
                         .with_movies(self.alpha)
                         .with_skip_mode_off(self.skip_mode_off)
+                        .with_script_join(self.script_join)
                         .with_skip_to(self.skip_to.clone())
                         .with_subtitles(self.config.options.subtitles),
                 ),
