@@ -27,11 +27,13 @@
 //!   model name into the table `Player.SetOutfit` also writes (0x836511a4)
 //!   and answers true; it reloads nothing itself.
 //!
-//! Not ported (the game side): the 360 engine calls the joined callback as
-//! a player joins, and `MrxPlayer.OnPlayerJoined` then makes her character
-//! and binds it. Here the game makes her itself, so nothing calls the
-//! kept callbacks yet, and a record's character doesn't move the game's
-//! player ([`crate::api::ScriptWorld::player`]). Also left out: the
+//! The game side: the 360 engine calls the joined callback as a player
+//! joins, and `MrxPlayer.OnPlayerJoined` then makes her character and
+//! binds it. Here the game makes her itself; with the mission's switch on
+//! ([`crate::mission::Mission::set_script_join`], off by default) the
+//! joined callback is called for her as well. A record's character doesn't
+//! move the game's player ([`crate::api::ScriptWorld::player`]), and
+//! nothing calls the left callback yet. Also left out: the
 //! detach's 0x8225c728 call on an object flagged 0x10, the controller's
 //! input routing (0x8225d288), and what DestroyPlayer frees.
 
@@ -78,6 +80,11 @@ impl Bindings {
     pub fn left(&self, lua: &Lua) -> Option<Function> {
         self.left.as_ref().and_then(|k| lua.registry_value(k).ok())
     }
+}
+
+/// The function `Player.SetPlayerJoinedCallback` kept, if any.
+pub fn joined_callback(lua: &Lua) -> Option<Function> {
+    lua.app_data_ref::<Bindings>().and_then(|b| b.joined(lua))
 }
 
 /// A copy of what the natives keep: the records and the model names.
