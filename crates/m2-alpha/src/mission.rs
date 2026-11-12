@@ -2114,6 +2114,19 @@ impl MissionLink {
         if let Some(p) = game.scene.particles.as_mut() {
             p.camera_fade = mission.world().borrow().effects.camera_fade;
         }
+        // `Graphics.Camera.SetFocusParams` and `RestoreFocusParams` for the
+        // first view: a new call starts the focus's blend, which runs on
+        // every tick (0x824B8208).
+        let ask = mission.world().borrow().effects.focus[0];
+        if ask.calls != game.focus_calls {
+            game.focus_calls = ask.calls;
+            game.focus.ask(ask.params, ask.seconds);
+            eprintln!(
+                "camera: the scripts set the focus to {:?} over {} s",
+                ask.params, ask.seconds
+            );
+        }
+        game.focus.step(dt, m2_engine::camera_focus::OWN);
         let focus = game.focus();
         let mut lap = crate::spans::Lap::new();
         // The music region she is in: the free-play score follows it.

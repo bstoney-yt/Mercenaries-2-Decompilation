@@ -180,6 +180,10 @@ pub struct Game {
     /// Lights blasts' scripts set, seconds before each comes in
     /// ([`m2_game::atmosphere_script`]).
     script_lights: Vec<(f32, ScriptAtmosphere)>,
+    /// The first view's focus as the scripts change it
+    /// (`Graphics.Camera.SetFocusParams`), and how many calls it has taken.
+    pub focus: m2_engine::camera_focus::FocusBlend,
+    pub focus_calls: u32,
     /// Props that move on their own.
     moving: MovingProps,
     /// Her support: the items she holds and the call under way; her
@@ -488,6 +492,8 @@ impl Game {
             spray_wait: 0.0,
             sky: AtmosphereMix::default(),
             script_lights: Vec::new(),
+            focus: Default::default(),
+            focus_calls: 0,
             moving: MovingProps::default(),
             support: Support::default(),
             earned: Vec::new(),
@@ -3494,6 +3500,7 @@ impl Game {
             }
             view.lighting.clouds.noise = world.cloud_noise;
             view.lighting.flare_map = world.sun_flare;
+            view.lighting.focus = self.focus.current;
         }
         finish(&mut view.lighting);
         post_override(&mut view.lighting);

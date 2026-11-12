@@ -30,6 +30,7 @@ pub mod atmosphere;
 pub mod audio;
 pub mod blend;
 pub mod boat_attack;
+pub mod camera_focus;
 pub mod car_attack;
 pub mod car_driver;
 pub mod collision_layers;

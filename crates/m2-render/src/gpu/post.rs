@@ -95,8 +95,10 @@ struct Post {
     flare: vec4<f32>,
     flare_rot: vec4<f32>,
     // The depth of field: x, y the projection's z scale and offset (view
-    // depth -z = y / (depth + x)), z 1 to draw it
+    // depth -z = y / (depth + x)), z 1 to draw it, w the least it leaves
+    // sharp; its focus: near start and end, far start and end
     dof: vec4<f32>,
+    focus: vec4<f32>,
 };
 
 fn game_tone_map() -> bool {
@@ -193,10 +195,6 @@ fn sun_flare(uv: vec2<f32>) -> vec3<f32> {
 // 100 m, fading to 300 m; never less than 0.4 sharp (one less twice the
 // camera's 0.3), the rest the first blur level (the frame halved, its
 // values taken back from the 2.5 power).
-const DOF_NEAR: vec2<f32> = vec2<f32>(0.0, 0.1);
-const DOF_FAR: vec2<f32> = vec2<f32>(100.0, 300.0);
-const DOF_LEAST_SHARP: f32 = 0.4;
-
 // How sharp the pixel at `uv` is drawn (1: all the frame, 0: all the
 // first blur level).
 fn dof_sharpness(uv: vec2<f32>) -> f32 {
@@ -204,9 +202,9 @@ fn dof_sharpness(uv: vec2<f32>) -> f32 {
     let px = vec2<i32>(clamp(uv * size, vec2<f32>(0.0), size - 1.0));
     let d = textureLoad(depth_map, px, 0);
     let z = post.dof.y / (d + post.dof.x);
-    let near = clamp((z - DOF_NEAR.y) / (DOF_NEAR.y - DOF_NEAR.x), 0.0, 1.0);
-    let far = clamp((z - DOF_FAR.y) / (DOF_FAR.x - DOF_FAR.y), 0.0, 1.0);
-    return max(DOF_LEAST_SHARP, near * far);
+    let near = clamp((z - post.focus.y) / (post.focus.y - post.focus.x), 0.0, 1.0);
+    let far = clamp((z - post.focus.w) / (post.focus.z - post.focus.w), 0.0, 1.0);
+    return max(post.dof.w, near * far);
 }
 
 // Exposure, scaled for the eye's adaptation.
@@ -523,6 +521,7 @@ struct Uniforms {
     flare: [f32; 4],
     flare_rot: [f32; 4],
     dof: [f32; 4],
+    focus: [f32; 4],
 }
 
 /// The passes, by index: bright, blur across, blur down, composite, then
@@ -1194,8 +1193,19 @@ impl Post {
                 flare_rot,
                 dof: {
                     let [scale, offset] = self.projection.get();
-                    [scale, offset, if game_blur { 1.0 } else { 0.0 }, 0.0]
+                    [
+                        scale,
+                        offset,
+                        if game_blur { 1.0 } else { 0.0 },
+                        least_sharp(lighting.focus[4]),
+                    ]
                 },
+                focus: [
+                    lighting.focus[0],
+                    lighting.focus[1],
+                    lighting.focus[2],
+                    lighting.focus[3],
+                ],
             };
             queue.write_buffer(buffer, 0, bytemuck::bytes_of(&u));
         }
@@ -1276,6 +1286,13 @@ const SUN_FLARE_HALF: f32 = 0.41;
 pub const SUN_FLARE_DISTANCE: f32 = 800_000.0;
 
 /// The sun flare's texture group.
+/// The least the depth of field leaves a pixel sharp for the camera's
+/// focus amount: one less twice it (the game's `filterParams.w`, from the
+/// 360 code), not under 0.
+fn least_sharp(amount: f32) -> f32 {
+    (1.0 - 2.0 * amount).max(0.0)
+}
+
 fn flare_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -1443,9 +1460,12 @@ mod tests {
         // (so at least 1 - 2 x 0.3 sharp), as the composite (526) takes
         // them; the soft image back from the 2.5 power.
         let s = super::SHADER;
-        assert!(s.contains("const DOF_NEAR: vec2<f32> = vec2<f32>(0.0, 0.1);"));
-        assert!(s.contains("const DOF_FAR: vec2<f32> = vec2<f32>(100.0, 300.0);"));
-        assert!(s.contains("const DOF_LEAST_SHARP: f32 = 0.4;"));
+        let own = crate::Lighting::default().focus;
+        assert_eq!(own, [0.0, 0.1, 100.0, 300.0, 0.3]);
+        assert!((super::least_sharp(own[4]) - 0.4).abs() < 1e-6);
+        // A script's full amount leaves nothing held sharp.
+        assert_eq!(super::least_sharp(1.0), 0.0);
+        assert!(s.contains("return max(post.dof.w, near * far);"));
         assert!(s.contains("vec3<f32>(0.4));\n            c = mix(soft, c, dof_sharpness(v.uv));"));
     }
 
