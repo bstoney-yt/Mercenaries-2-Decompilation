@@ -2470,6 +2470,9 @@ impl Game {
 
     /// Sets off the game's effects the fight asked for and runs them.
     fn run_particles(&mut self, dt: f32) {
+        /// Where a terrain effect's ground query starts, metres up
+        /// (invented: above anything on the island).
+        const GROUND_QUERY_TOP: f32 = 2000.0;
         if let Some(world) = self.scene.world.as_ref() {
             state_effects(world, &mut self.combat);
         }
@@ -2490,6 +2493,16 @@ impl Game {
         // What came into being is heard as its template's `SoundEffect`
         // says.
         self.combat.created(created);
+        // The ground under the scripts' terrain effects: the first fixed
+        // surface straight down from well above (inferred: the game asks
+        // its ground query by x and z alone, 0x82194E20).
+        let physics = &world.physics;
+        p.run_terrain(&world.index.template_db, &|x, z| {
+            let top = Vec3::new(x, GROUND_QUERY_TOP, z);
+            physics
+                .cast_ray(top, Vec3::NEG_Y, GROUND_QUERY_TOP * 2.0)
+                .map(|(d, n)| (GROUND_QUERY_TOP - d, n))
+        });
         p.step(dt);
     }
 
