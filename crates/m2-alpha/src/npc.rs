@@ -4754,8 +4754,10 @@ impl People {
     /// Anyone a car's box meets takes its ram by the damage table `table`
     /// ([`m2_engine::durability::run_over`]: a `Human` three times a
     /// `Car`'s, a `HumanArmor` once, the bosses and targets once) and is
-    /// knocked flying if it kills, shoved aside if not (and not hurt by a
-    /// vehicle again for [`RAM_GAP`]); without the table, as before, it
+    /// knocked flying if it kills, shoved aside if not, and knocked down
+    /// when it took [`m2_engine::durability::KNOCKDOWN_DAMAGE`] or more
+    /// (and not hurt by a vehicle again for [`RAM_GAP`]); without the
+    /// table, as before, it
     /// kills. Those who don't fight in its path (as wide as it is, and a
     /// little more) dive out of the way, but story characters. The number
     /// of soldiers killed.
@@ -4798,6 +4800,16 @@ impl People {
                         n.character.velocity = heading * speed * 0.5 + side * SHOVE;
                         n.rammed = RAM_GAP;
                         n.panic(centre);
+                        // Hit hard enough by a vehicle, the 360 knocks
+                        // them down ([`durability::KNOCKDOWN_DAMAGE`]).
+                        if damage >= m2_engine::durability::KNOCKDOWN_DAMAGE {
+                            let seconds = m2_engine::melee::knockdown_seconds(
+                                m2_engine::durability::KNOCKDOWN_SECONDS,
+                                false,
+                                self.rng.next(),
+                            );
+                            n.knock_down_for(seconds, Vec3::ZERO);
+                        }
                     }
                     continue;
                 }
@@ -7376,6 +7388,9 @@ pub(crate) mod tests {
         let n = &people.npcs[0];
         assert!(n.alive && n.hp == 55.0 && n.rammed == RAM_GAP);
         assert!(n.character.velocity.x > 0.0, "shoved off its line");
+        // 45 of damage is over the 360's 2.0: knocked down, for 4 to 6 s.
+        assert!(matches!(n.down, Some(Down::Falling(_))));
+        assert!(n.knocked_for.is_some_and(|s| (4.0..=6.0).contains(&s)));
         people.traffic(&[slow], Some(&table));
         assert_eq!(people.npcs[0].hp, 55.0, "not again at once");
         // Faster and heavier: a soldier dies, a heavy lives.
