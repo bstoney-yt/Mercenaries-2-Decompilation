@@ -5102,6 +5102,26 @@ impl People {
         }
     }
 
+    /// The scripts cleared every goal of the person of spawn `entity`
+    /// (`Ai.RemoveGoal` with `Handle` 0: the 360 code, 0x822F9188 and
+    /// 0x822CEE48, empties the AI's goal list): a route they were sent
+    /// along is dropped, here or still to come, and one running it stands
+    /// where they are. Following her is a role (`Ai.Role`), not a goal, so
+    /// it stays. Whether they had a route.
+    pub fn clear_goals(&mut self, entity: u32) -> bool {
+        let mut had = self.routes.remove(&entity).is_some();
+        for n in self.npcs.iter_mut().filter(|n| n.spawn == Some(entity)) {
+            if matches!(n.brain, Brain::Route { .. }) {
+                had = true;
+                n.brain = Brain::Post { facing: n.facing };
+            }
+        }
+        if had {
+            eprintln!("people: {entity:08x} has its goals cleared");
+        }
+        had
+    }
+
     /// The scripts killed the soldier of spawn `entity` (or took it away,
     /// `gone`): dead where they stand, or not there at all. Either way they
     /// don't come back.
@@ -7619,6 +7639,49 @@ pub(crate) mod tests {
         );
         assert!(people.checks.arrived.contains(&1));
         assert!(people.checks.stuck.is_empty(), "{:?}", people.checks);
+    }
+
+    // `Ai.RemoveGoal` with `Handle` 0 (OilCon001's executive, PmcCon003's
+    // pursuers): one running a route stops and stands; one not yet in
+    // play doesn't run it when they come; a follower keeps following.
+    #[test]
+    fn cleared_goals_stop_a_route_but_not_following() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.kinds.push(kind("vz_hum_soldier", false));
+        let far = Vec3::new(0.0, 0.0, 40.0);
+        people.walk(1, vec![far]);
+        let spawns = [spawn(1, "VZ Soldier 01", 0.0)];
+        for _ in 0..60 {
+            people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        }
+        assert!(matches!(people.npcs[0].brain, Brain::Route { .. }));
+        assert!(people.clear_goals(1));
+        assert!(matches!(people.npcs[0].brain, Brain::Post { .. }));
+        let at = people.npcs[0].character.position;
+        for _ in 0..60 * 3 {
+            people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        }
+        let n = &people.npcs[0];
+        // Running, three seconds would carry them some 10 m on; they slow
+        // to a stand within a stride or so.
+        assert!(
+            (n.character.position - at).with_y(0.0).length() < 2.0,
+            "stands: {} from {at}",
+            n.character.position
+        );
+        assert!(!people.checks.arrived.contains(&1));
+        assert!(!people.clear_goals(1), "nothing left to clear");
+
+        // Sent before they come, cleared before they come.
+        people.walk(2, vec![far]);
+        assert!(people.clear_goals(2));
+        assert!(!people.routes.contains_key(&2));
+
+        // Following her is a role, not a goal.
+        people.follow(1, Some(3.0));
+        assert!(!people.clear_goals(1));
+        assert!(matches!(people.npcs[0].brain, Brain::Follow { .. }));
     }
 
     // Playtest 8: with the island's soldiers at the most about, the
