@@ -1242,6 +1242,16 @@ pub struct Npc {
     /// (`DieAnimatedRagdoll`) and the shove kept for when it ends and
     /// they go limp ([`m2_engine::death`]).
     dying: Option<(usize, Vec3)>,
+    /// The expressions on their face and the weights they give the
+    /// head's blend shapes ([`m2_engine::face_expression`]). Everyone
+    /// blinks from the start, as the 360's animation driver has it
+    /// (0x8241F360).
+    pub face: m2_engine::face_expression::Face,
+    /// A number of their own, for what the scene keeps for them from
+    /// frame to frame (their face's vertices).
+    pub uid: u64,
+    /// The state of their face's own random numbers.
+    face_seed: u64,
     /// The stagger's clip they play, hit and still alive, and the seconds
     /// since their last stagger began ([`m2_engine::stagger`]).
     stagger: Option<usize>,
@@ -1400,6 +1410,8 @@ impl Npc {
         rig.set_gait(Gait::Idle);
         let clips = FightClips::find(&rig);
         let hand = rig.rifle_hand();
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let uid = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             clips,
             hand,
@@ -1410,6 +1422,21 @@ impl Npc {
             fling: None,
             last_hit: None,
             dying: None,
+            face: {
+                let mut face = m2_engine::face_expression::Face::default();
+                let r = |k: u64| {
+                    ((uid.wrapping_mul(0x9e37_79b9).wrapping_add(k * 7919)) % 1000) as f32 / 1000.0
+                };
+                face.play(
+                    m2_engine::face_expression::BLINK,
+                    1.0,
+                    -1.0,
+                    [r(1), r(2), r(3), r(4)],
+                );
+                face
+            },
+            uid,
+            face_seed: uid.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
             stagger: None,
             since_stagger: None,
             shouted: false,
@@ -1804,8 +1831,39 @@ impl Npc {
         self.rig
             .animator
             .play_action(clip, true, pick.stagger.action());
+        self.show(
+            m2_engine::face_expression::ANGRY,
+            m2_engine::face_expression::ANGRY_SECONDS,
+        );
         self.stagger = Some(clip);
         self.since_stagger = Some(0.0);
+    }
+
+    /// An expression on their face at full weight for `seconds` (under
+    /// 0: until stopped).
+    pub fn show(&mut self, expression: u32, seconds: f32) {
+        let r = |k: u64| {
+            ((self.uid.wrapping_mul(0x9e37_79b9).wrapping_add(k * 7919)) % 1000) as f32 / 1000.0
+        };
+        self.face
+            .play(expression, 1.0, seconds, [r(5), r(6), r(7), r(8)]);
+    }
+
+    /// Their mouth flapping while a line of theirs plays (`on`), as the
+    /// 360's voice system has every speaker's (0x822782D8, 0x82278440).
+    // Called from the voice lines' started and stopped signal once that
+    // is in (`m2_game::vo::Speech`).
+    #[allow(dead_code)]
+    pub fn speak(&mut self, on: bool) {
+        let r = |k: u64| {
+            ((self.uid.wrapping_mul(0x9e37_79b9).wrapping_add(k * 7919)) % 1000) as f32 / 1000.0
+        };
+        self.face.play(
+            m2_engine::face_expression::FLAP,
+            if on { 1.0 } else { 0.0 },
+            -1.0,
+            [r(9), r(10), r(11), r(12)],
+        );
     }
 
     /// One step of a stagger: true while its clip plays, when they do
@@ -1877,6 +1935,11 @@ impl Npc {
             return;
         }
         self.down = Some(Down::Falling(FALL_SECONDS));
+        // `Knockdown` is one of the actions the 360 shows `Angry` on.
+        self.show(
+            m2_engine::face_expression::ANGRY,
+            m2_engine::face_expression::ANGRY_SECONDS,
+        );
         self.alert = false;
         self.flee = None;
         self.rig.animator.set_upper(None);
@@ -2849,6 +2912,19 @@ impl Npc {
     }
 
     fn update(&mut self, physics: &Physics, rng: &mut Rng, threat: Option<Vec3>, dt: f32) {
+        // Their face goes on while they live; a dead face stays as it
+        // was.
+        if self.alive {
+            // Its own random numbers, so faces do not change what the
+            // people's shared ones decide.
+            let seed = &mut self.face_seed;
+            self.face.step(dt, || {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                (*seed >> 40) as f32 / (1u64 << 24) as f32
+            });
+        }
         if !self.landed {
             // Onto the ground (or the roof or floor of their post) under
             // where they were placed.
@@ -7301,6 +7377,63 @@ pub(crate) mod tests {
         ours.sort_unstable();
         assert_eq!(ours, table);
         assert!(DEATH_CLIPS.iter().all(|d| !d.1.is_empty()));
+    }
+
+    /// Everyone blinks from the start; a knockdown shows Angry for its
+    /// two seconds; speaking flaps the mouth until the line is over.
+    #[test]
+    fn faces_blink_show_anger_and_flap_while_speaking() {
+        use m2_engine::face_expression::{ANGRY, BLINK, FLAP};
+        let physics = ground();
+        let mut rng = Rng::default();
+        let mut n = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            None,
+        );
+        let other = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            None,
+        );
+        assert_ne!(n.uid, other.uid);
+        assert!(n.face.plays(BLINK) && !n.face.plays(ANGRY));
+        let mut step = |n: &mut Npc, seconds: f32| {
+            for _ in 0..(seconds * 60.0) as usize {
+                n.update(&physics, &mut rng, None, 1.0 / 60.0);
+            }
+        };
+        // Over ten seconds the eyes shut now and then.
+        let mut shut = 0;
+        for _ in 0..600 {
+            step(&mut n, 1.0 / 60.0);
+            shut += usize::from(n.face.weight(BLINK) > 0.5);
+        }
+        assert!((10..200).contains(&shut), "{shut} frames shut in 10 s");
+        n.speak(true);
+        step(&mut n, 1.0);
+        assert!(n.face.plays(FLAP));
+        n.speak(false);
+        step(&mut n, 0.5);
+        assert!(!n.face.plays(FLAP));
+        assert_eq!(n.face.weight(FLAP), 0.0);
+        n.knock_down();
+        assert!(n.face.plays(ANGRY));
+        step(&mut n, 0.5);
+        assert!(n.face.weight(ANGRY) >= 0.5);
+        step(&mut n, 2.0);
+        assert!(!n.face.plays(ANGRY));
+        // Dead, the face stays as it was.
+        n.hurt(f32::INFINITY, Vec3::ZERO);
+        let before = n.face.clone();
+        step(&mut n, 1.0);
+        assert_eq!(n.face, before);
     }
 
     /// Each of the three staggers has its four directions, once each.
