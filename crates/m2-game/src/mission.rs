@@ -1279,11 +1279,18 @@ impl Mission {
             });
         }
         let ended = crate::vo::update(&self.world, self.host.lua(), now);
-        for (cue, error) in ended {
+        for (cue, state, error) in ended {
+            // What became of the line: it ended, or was refused
+            // ("failed") or cut off ("cancel"), as its callback is told.
+            let what = match state {
+                "complete" => "ended".to_owned(),
+                "failed" => "refused (failed)".to_owned(),
+                state => format!("cut off ({state})"),
+            };
             self.log.push(match error {
-                None => format!("  t={now:.1} line {cue} ended"),
+                None => format!("  t={now:.1} line {cue} {what}"),
                 Some(e) => format!(
-                    "  t={now:.1} line {cue} ended; callback: {}",
+                    "  t={now:.1} line {cue} {what}; callback: {}",
                     first_lines(&e.to_string())
                 ),
             });
@@ -3562,6 +3569,14 @@ mod tests {
         assert!(!g.raw_get::<bool>("refused").unwrap());
         assert_eq!(g.raw_get::<String>("d").unwrap(), "failed");
         assert_eq!(g.raw_get::<String>("c").unwrap(), "cancel");
+        let log = m.take_log();
+        for line in [
+            "line D refused (failed)",
+            "line C cut off (cancel)",
+            "line A ended",
+        ] {
+            assert!(log.iter().any(|l| l.ends_with(line)), "{line}: {log:?}");
+        }
         assert!(g.raw_get::<bool>("ordered").unwrap());
     }
 
