@@ -5762,11 +5762,11 @@ pub(crate) mod tests {
         };
         let mut people = People::default();
         people.npcs = vec![
-            soldier(30.0, "Vza", true),  // 30 m off: score 20
-            soldier(20.0, "Vza", true),  // 20 m off: score 30, the nearest
-            soldier(10.0, "Chi", true),  // another army's
-            soldier(5.0, "Vza", false),  // not fighting
-            soldier(60.0, "Vza", true),  // beyond 50 m
+            soldier(30.0, "Vza", true), // 30 m off: score 20
+            soldier(20.0, "Vza", true), // 20 m off: score 30, the nearest
+            soldier(10.0, "Chi", true), // another army's
+            soldier(5.0, "Vza", false), // not fighting
+            soldier(60.0, "Vza", true), // beyond 50 m
         ];
         let mut tower = AlarmTower {
             guid: 0x5150,
@@ -5776,7 +5776,11 @@ pub(crate) mod tests {
             hardpoints: vec![Vec3::new(-2.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0)],
         };
         assert!(people.raise_alarms(std::slice::from_ref(&tower)).is_empty());
-        let runs: Vec<Option<u32>> = people.npcs.iter().map(|n| n.alarm.map(|r| r.tower)).collect();
+        let runs: Vec<Option<u32>> = people
+            .npcs
+            .iter()
+            .map(|n| n.alarm.map(|r| r.tower))
+            .collect();
         // One soldier only: the second in the list may take it from the
         // first by more than a tenth.
         assert_eq!(runs, [None, Some(0x5150), None, None, None]);

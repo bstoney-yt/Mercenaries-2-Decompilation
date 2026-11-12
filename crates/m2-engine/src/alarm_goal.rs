@@ -140,7 +140,10 @@ mod tests {
                 distance: 50.5,
                 ..guard()
             },
-            Candidate { on: true, ..guard() },
+            Candidate {
+                on: true,
+                ..guard()
+            },
             Candidate {
                 same_faction: false,
                 ..guard()
