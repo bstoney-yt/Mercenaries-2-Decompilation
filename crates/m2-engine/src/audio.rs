@@ -1027,6 +1027,9 @@ impl EngineCue {
 pub struct KeySounds {
     pub sounds: Vec<(SoundBuffer, f32)>,
     pub volume: f32,
+    /// The level and pitch each start is drawn at, about `volume` (a
+    /// plain record's; a mix is rendered whole, at its tracks' middles).
+    pub start: Option<m2_assets::voice::StartDraw>,
     /// How far it carries: its record's distances (a mixed cue's, the
     /// farthest of its tracks' records'), where the record gives them.
     pub falloff: Option<Falloff>,
@@ -1034,6 +1037,14 @@ pub struct KeySounds {
 }
 
 impl KeySounds {
+    /// What a start plays at, for draws of 0 to 1: its gain and its rate.
+    pub fn started(&self, level_draw: f32, pitch_draw: f32) -> (f32, f32) {
+        match &self.start {
+            Some(s) => (self.volume * s.level_scale(level_draw), s.rate(pitch_draw)),
+            None => (self.volume, 1.0),
+        }
+    }
+
     /// What sound key `key` plays, found as the game finds its interface's
     /// sounds (`ui_hud`): a cue of that name in one of the world's cue
     /// `tables`, whose record names its variants (bank, sound, weight);
@@ -1089,6 +1100,7 @@ impl KeySounds {
             return Some(Self {
                 sounds,
                 volume,
+                start: Some(record.start),
                 falloff,
                 how,
             });
@@ -1107,6 +1119,7 @@ impl KeySounds {
                 .map(|s| (s.clone(), 1.0))
                 .collect();
             (!sounds.is_empty()).then(|| Self {
+                start: None,
                 how: format!(
                     "{how}: {} sounds ({}), each alike",
                     sounds.len(),
@@ -1200,6 +1213,7 @@ impl KeySounds {
             })
             .collect();
         (!sounds.is_empty()).then(|| Self {
+            start: None,
             how: format!(
                 "mixed cue: {} of its {} tracks ({}), {} takes of {:.2} s, peak {peak:.2} of full scale",
                 layers.len(),
@@ -1980,6 +1994,7 @@ mod tests {
         let key = KeySounds {
             sounds: vec![(sound(1), 0.25), (sound(2), 0.75)],
             volume: 1.0,
+            start: None,
             falloff: None,
             how: String::new(),
         };
