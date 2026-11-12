@@ -3552,12 +3552,20 @@ impl Default for Picture {
 }
 
 impl Picture {
-    /// Brightness scales the finished frame's light, a stop down at 0 and
-    /// up at 100 (invented: the game's gamma curve is not known); shadows
-    /// off, the sun casts none.
+    /// Brightness scales the tone-mapped frame's light by `0.5 +
+    /// brightness / 100`: half at 0, as lit at 50, half as much again at
+    /// 100. Shadows off, the sun casts none.
+    ///
+    /// From the 360 code: the saved `videoBrightness` byte times 0.01
+    /// (0x8239E338; 0.5 at start-up, 0x8256D1B0) becomes the composite's
+    /// `imageParams.z = (1 - b) * 0.5 + b * 1.5`, which its shader (the
+    /// PC's 526) multiplies the luminance by after the tone map's
+    /// compression, where our composite multiplies by the grade. Not
+    /// established: the slider's range (the byte could hold more than
+    /// 100; our menu runs the game's own script, which gives 0 to 100).
     pub fn apply(&self, lighting: &mut m2_render::Lighting) {
-        let stops = (self.brightness.clamp(0.0, 100.0) - 50.0) / 50.0;
-        lighting.grade *= 2f32.powf(stops as f32);
+        let b = (self.brightness.clamp(0.0, 100.0) / 100.0) as f32;
+        lighting.grade *= 0.5 + b;
         if !self.shadows {
             lighting.shadow_distance = 0.0;
         }
@@ -5937,7 +5945,7 @@ mod picture_tests {
     }
 
     #[test]
-    fn brightness_is_a_stop_either_way_and_shadows_can_go() {
+    fn brightness_runs_from_half_to_one_and_a_half_and_shadows_can_go() {
         let lit = |p: Picture| {
             let mut l = m2_render::Lighting {
                 shadow_distance: 120.0,
@@ -5951,7 +5959,15 @@ mod picture_tests {
             brightness: 100.0,
             ..Picture::default()
         };
-        assert_eq!(lit(bright).0, 2.0);
+        assert_eq!(lit(bright).0, 1.5);
+        // A straight line between: 0.75 and 1.25 at the quarters.
+        for (b, k) in [(25.0, 0.75), (75.0, 1.25)] {
+            let p = Picture {
+                brightness: b,
+                ..Picture::default()
+            };
+            assert_eq!(lit(p).0, k);
+        }
         let dark = Picture {
             brightness: 0.0,
             shadows: false,
