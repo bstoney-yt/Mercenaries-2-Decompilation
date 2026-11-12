@@ -3538,6 +3538,55 @@ mod tests {
     }
 
     #[test]
+    fn a_death_and_a_state_change_reach_the_objects_script_once() {
+        let mut crate_ = villa_tank();
+        crate_.script = Some(MUNITIONS);
+        crate_.script_data = Some(3);
+        let guid = crate_.guid;
+        let mut data = GameData::default();
+        data.layers.insert("test_layer".into(), vec![crate_]);
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        m.lua()
+            .load(
+                r#"
+                deaths, states = 0, 0
+                Munitions = {
+                    OnDeath = function(g, n) deaths = deaths + 1; dead, dead_data = g, n end,
+                    OnStateChange = function(g, machine, state, n)
+                        states = states + 1; to, state_data = state, n
+                    end,
+                }
+                "#,
+            )
+            .exec()
+            .unwrap();
+        m.world
+            .borrow_mut()
+            .insert(guid, Object::new("Munitions (Bunker Buster)", [0.0; 3]));
+        m.kill(guid);
+        // Already dead: the engine's death handler runs once.
+        m.kill(guid);
+        m.kill_by(guid, PLAYER);
+        let g = m.lua().globals();
+        assert_eq!(g.get::<u32>("deaths").unwrap(), 1);
+        assert_eq!(
+            g.get::<Value>("dead").unwrap(),
+            crate::events::guid_value(guid)
+        );
+        assert_eq!(g.get::<u32>("dead_data").unwrap(), 3);
+        m.object_state_changed(guid, 0x1111_2222, 0x7687_df41);
+        assert_eq!(g.get::<u32>("states").unwrap(), 1);
+        assert_eq!(
+            g.get::<Value>("to").unwrap(),
+            crate::events::guid_value(0x7687_df41)
+        );
+        assert_eq!(g.get::<u32>("state_data").unwrap(), 3);
+        // An object with no script of its own: nothing is called.
+        m.object_state_changed(0x999, 1, 2);
+        assert_eq!(g.get::<u32>("states").unwrap(), 1);
+    }
+
+    #[test]
     fn an_object_script_is_handed_its_records_data() {
         let lua = mlua::Lua::new();
         lua.load("Munitions = { OnActivate = function(g, _, n) got = n end }")
