@@ -292,6 +292,11 @@ pub struct Bash {
 }
 
 /// Where she is in a jump.
+/// Over this speed over the ground she counts as on the move for the
+/// stagger picked, m/s (invented, as for the people: the 360 reads a
+/// field of the movement record whose meaning is not established).
+const STAGGER_MOVING: f32 = 0.5;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Leap {
     /// On the ground.
@@ -414,6 +419,11 @@ pub struct Player {
     /// ([`m2_engine::human_state`]), and whether the air's loop plays.
     human: m2_engine::human_state::HumanState,
     air_looped: bool,
+    /// A stagger picked for her, to start on her rig this step (its clip
+    /// and action), and the seconds since her last began
+    /// ([`m2_engine::stagger`]).
+    stagger_pending: Option<(usize, u32)>,
+    since_stagger: Option<f32>,
     /// Whether she carries someone (a subdued prisoner): her gaits are
     /// then the `Carrying` stance's ([`crate::held::Moves::carrying`]; from
     /// the 360 code, the stance's own locomotion node).
@@ -655,6 +665,8 @@ impl Player {
             jump_queued: false,
             human: m2_engine::human_state::HumanState::default(),
             air_looped: false,
+            stagger_pending: None,
+            since_stagger: None,
             carrying: false,
             throwing: None,
             throw_clip: None,
@@ -1169,6 +1181,9 @@ impl Player {
         };
         let wanted = Vec3::new(ground.x, 0.0, ground.y);
         use m2_engine::human_state::{self, HumanState};
+        if let Some(s) = &mut self.since_stagger {
+            *s += dt;
+        }
         let (windup_started, launch) =
             self.jump_step(intent.jump, bashing, walking.length_squared(), dt);
         let jump = launch.then(|| self.motion.jump_speed());
@@ -1461,6 +1476,14 @@ impl Player {
             {
                 rig.animator
                     .play_action(clip, true, m2_assets::name_hash(i.name()));
+                self.leap = Leap::Land(0.0, clip);
+            }
+            // A stagger plays whole in the same way (a whole-body action
+            // of the `Upright` stance).
+            if let Some((clip, action)) = self.stagger_pending.take() {
+                eprintln!("stagger: she plays {:08x}", rig.clips[clip].hash);
+                rig.animator.set_upper(None);
+                rig.animator.play_action(clip, true, action);
                 self.leap = Leap::Land(0.0, clip);
             }
             let leaping = self.leap != Leap::No;
@@ -1776,6 +1799,52 @@ impl Player {
     /// the run), or a moment after touching down, cutting the landing
     /// short (playtest 8). A press while she lands is kept for its end.
     /// Inferred from the table and the clips; the 360 code was not read.
+    /// The damage `event` reached her and she lives: the stagger the 360
+    /// picks for a player's character ([`m2_engine::stagger::pick`]: by
+    /// a melee bash, or the long one by an explosion), if she holds a
+    /// clip for it. On her feet on the ground only: the state table
+    /// leads to the staggers from `Upright` actions. True if she
+    /// staggers.
+    pub fn stagger(&mut self, event: &m2_engine::stagger::Event) -> bool {
+        use m2_engine::stagger::{self, Person};
+        if self.down || self.driving.is_some() || self.seated || !self.character.grounded {
+            return false;
+        }
+        if !matches!(self.leap, Leap::No | Leap::Land(..)) {
+            return false;
+        }
+        let v = self.character.velocity;
+        let Some(pick) = stagger::pick(
+            &Person {
+                facing: self.facing,
+                player: true,
+                immune: false,
+                crouched: false,
+                moving: v.x.hypot(v.z) > STAGGER_MOVING,
+                since: self.since_stagger,
+                cooldown: stagger::COOLDOWN,
+                reset: stagger::RESET,
+            },
+            event,
+        ) else {
+            return false;
+        };
+        let Some(clip) = self
+            .moves
+            .of(self.shown.class)
+            .and_then(|h| h.staggers[pick.stagger as usize][pick.direction as usize])
+        else {
+            return false;
+        };
+        eprintln!(
+            "stagger: she staggers {:?} {:?}",
+            pick.stagger, pick.direction
+        );
+        self.stagger_pending = Some((clip, pick.stagger.action()));
+        self.since_stagger = Some(0.0);
+        true
+    }
+
     fn takes_off(&mut self, pressed: bool, bashing: bool) -> bool {
         if pressed && matches!(self.leap, Leap::Land(..)) {
             self.jump_queued = true;
@@ -2542,6 +2611,48 @@ mod tests {
         assert_eq!(p.jump_step(false, false, 0.2, 0.02), (None, false));
         assert_eq!(p.leap, Leap::No);
         assert!(p.human.is("Upright", "Idle"));
+    }
+
+    #[test]
+    fn she_staggers_by_a_bash_and_a_blast_but_not_a_bullet() {
+        use m2_engine::stagger::{Direction, EXPLOSION, Event, Stagger};
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        p.character.grounded = true;
+        let mut held = crate::held::Held {
+            class: m2_assets::animation_table::RIFLE,
+            ..Default::default()
+        };
+        held.staggers[Stagger::InPlace as usize][Direction::Front as usize] = Some(11);
+        held.staggers[Stagger::Long as usize][Direction::Back as usize] = Some(12);
+        p.moves = Moves {
+            held: vec![held],
+            ..Moves::default()
+        };
+        let hit = |direction, direct, melee, key| Event {
+            direction,
+            direct,
+            melee,
+            key,
+        };
+        // Facing +z: a bullet does nothing, a bash from ahead staggers.
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, false, None)));
+        assert!(p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+        assert_eq!(
+            p.stagger_pending,
+            Some((11, m2_engine::blend::action::STAGGER_IN_PLACE))
+        );
+        // Not again within a quarter of a second.
+        p.since_stagger = Some(0.1);
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
+        // A blast behind her: the long one. Without its clip, nothing.
+        p.since_stagger = Some(2.0);
+        assert!(p.stagger(&hit(Vec3::Z, false, false, Some(EXPLOSION))));
+        assert_eq!(p.stagger_pending.map(|s| s.0), Some(12));
+        p.since_stagger = Some(2.0);
+        assert!(!p.stagger(&hit(Vec3::X, false, false, Some(EXPLOSION))));
+        // In the air, never.
+        p.character.grounded = false;
+        assert!(!p.stagger(&hit(Vec3::NEG_Z, true, true, None)));
     }
 
     #[test]
