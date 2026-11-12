@@ -2991,7 +2991,15 @@ fn seat_crew(
 /// white, half a metre up, fading from 16 m to 20 m); the blip goes
 /// while a winch has it and comes back when it is let go, and goes for
 /// good when the crate dies (its `OnDeath`) or leaves.
-pub const OBJECT_SCRIPTS: [(&str, u32); 10] = [
+///
+/// `collectable` is the script of the treasures and blueprints lying
+/// about (`_global_treasures`, `_global_blueprints`, 0xb8c49381): near a
+/// live one she is offered its context action
+/// (`[ContextAction.Toolbox]`), and taking it kills the object, which is
+/// all the script does of the pickup; its death takes the offer away
+/// (`Inheritable`'s `OnDeath`). One labelled `CollectableInvalidated` is
+/// killed as it comes in instead.
+pub const OBJECT_SCRIPTS: [(&str, u32); 11] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3002,7 +3010,11 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 10] = [
     ("SupportAirPlane", SUPPORT_AIRPLANE),
     ("Alarm", ALARM),
     ("crate", SUPPLY_CRATE),
+    ("collectable", COLLECTABLE),
 ];
+
+/// `collectable`'s module hash.
+pub const COLLECTABLE: u32 = 0xb8c4_9381;
 
 /// `crate`'s module hash.
 pub const SUPPLY_CRATE: u32 = 0x33ed_14de;
@@ -3914,6 +3926,44 @@ mod tests {
         m.lua().load("Marker.Remove(h)").exec().unwrap();
         assert!(m.world.borrow().hud.markers.is_empty());
         assert!(OBJECT_SCRIPTS.contains(&("crate", SUPPLY_CRATE)));
+    }
+
+    #[test]
+    fn a_taken_collectables_offer_goes_with_its_death() {
+        let mut treasure = villa_tank();
+        treasure.script = Some(COLLECTABLE);
+        let guid = treasure.guid;
+        let mut data = GameData::default();
+        data.layers.insert("test_layer".into(), vec![treasure]);
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        // The shape of `collectable`: the offer as it comes in, the kill
+        // as it is taken, the offer's end as it dies.
+        m.lua()
+            .load(
+                r#"
+                collectable = {
+                    OnDeath = function(g) Pg.RemoveContextAction(g) end,
+                }
+                local g = ...
+                Pg.AddContextAction(g, "[ContextAction.Toolbox]", 2, 0, 0, 0, 0)
+                "#,
+            )
+            .call::<()>(crate::events::guid_value(guid))
+            .unwrap();
+        m.world
+            .borrow_mut()
+            .insert(guid, Object::new("_global_treasures", [0.0; 3]));
+        assert_eq!(
+            m.context_text(guid).as_deref(),
+            Some("[ContextAction.Toolbox]")
+        );
+        m.lua()
+            .load("Object.Kill(...)")
+            .call::<()>(crate::events::guid_value(guid))
+            .unwrap();
+        m.tick(0.25);
+        assert_eq!(m.context_text(guid), None);
+        assert!(OBJECT_SCRIPTS.contains(&("collectable", COLLECTABLE)));
     }
 
     #[test]
