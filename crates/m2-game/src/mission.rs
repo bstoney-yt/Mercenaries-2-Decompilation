@@ -12,7 +12,7 @@
 //! and a readable account of the session in [`Mission::take_log`].
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
@@ -296,6 +296,9 @@ pub struct Entity {
     /// The template it was placed as (`Mi35 (Solano)` for PmcCon004's
     /// `Mi35 (Solano Hijack)`), by name, when the database names it.
     pub template: Option<String>,
+    /// Whether it has an alarm (the `Alarm` component, its own or its
+    /// template's: the alarm towers; [`crate::alarm`]).
+    pub alarm: bool,
 }
 
 impl Entity {
@@ -421,6 +424,7 @@ impl GameData {
         let mut template_labels: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut template_scripts: HashMap<u32, u32> = HashMap::new();
         let mut template_script_data: HashMap<u32, u32> = HashMap::new();
+        let mut template_alarms: HashSet<u32> = HashSet::new();
         // Faction zones' faction templates, and every template's name.
         let mut zone_factions: Vec<(String, usize, u32)> = Vec::new();
         let mut template_names: HashMap<u32, String> = HashMap::new();
@@ -461,6 +465,7 @@ impl GameData {
                     data.template_cash = crate::cash::template_cash(&db);
                     template_scripts = db.hashes("ObjectScript");
                     template_script_data = script_data(&db);
+                    template_alarms = carriers(&db, "Alarm");
                     template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
                     data.relations = m2_engine::ai::relations(&db);
@@ -487,6 +492,7 @@ impl GameData {
                     let lines = layer.hashes("LineRegion");
                     let scripts = layer.hashes("ObjectScript");
                     let own_data = script_data(&layer);
+                    let alarms = carriers(&layer, "Alarm");
                     let zones = layer.hashes("FactionZone");
                     let path_of = layer.hashes("Path");
                     let mut rides = layer
@@ -522,6 +528,7 @@ impl GameData {
                             path: Vec::new(),
                             template: None,
                             crew: Vec::new(),
+                            alarm: alarms.contains(&guid),
                         });
                         if let Some(r) = rides.remove(&guid) {
                             own_riders.push((name.clone(), list.len() - 1, r));
@@ -546,6 +553,7 @@ impl GameData {
             if e.script_data.is_none() {
                 e.script_data = template_script_data.get(template).copied();
             }
+            e.alarm |= template_alarms.contains(template);
         }
         for (layer, i, template) in zone_factions {
             if let Some(n) = template_names.get(&template) {
@@ -1108,6 +1116,9 @@ impl Mission {
                 e.kind,
                 first_lines(&e.error.to_string())
             ));
+        }
+        for e in use_alarms(&self.world, self.host.lua()) {
+            self.log.push(format!("  t={now:.1} alarm: {e}"));
         }
         for kind in self.events.take_unhandled() {
             self.log.push(format!(
@@ -2717,6 +2728,9 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             if e.script == Some(FRIENDLY_GATE) {
                 w.gates.insert(e.guid);
             }
+            if e.alarm {
+                w.alarms.add(e.guid, e.script);
+            }
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());
             }
@@ -2734,6 +2748,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             w.links.remove(e.guid);
             w.placed_as.remove(&e.guid);
             w.gates.remove(&e.guid);
+            w.alarms.remove(e.guid);
             w.crew_riders.retain(|_, v| *v != e.guid);
             w.objects.remove(&e.guid);
             w.regions.remove(&e.guid);
@@ -2822,7 +2837,11 @@ fn seat_crew(
 /// PMC's own green), set again as a driver gets in or out or the
 /// faction's attitude changes, and taken off while a player drives it
 /// ([`crate::hud::Blip`], `Hud.Radar:AddObjective`).
-pub const OBJECT_SCRIPTS: [(&str, u32); 7] = [
+///
+/// `Alarm` is the alarm towers' script ([`crate::alarm`]): as a tower
+/// wakes it offers the player `[ContextAction.UseAlarm]`, and its `OnUse`
+/// raises or lowers the alarm.
+pub const OBJECT_SCRIPTS: [(&str, u32); 8] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -2830,7 +2849,52 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 7] = [
     ("Tank", TANK),
     ("Helicopter", HELICOPTER),
     ("Airplane", AIRPLANE),
+    ("Alarm", ALARM),
 ];
+
+/// `Alarm`'s module hash.
+pub const ALARM: u32 = 0xbe65_fdd0;
+
+/// The entities with a component, its own records.
+fn carriers(layer: &Layer, component: &str) -> HashSet<u32> {
+    layer
+        .component(component)
+        .and_then(|c| c.records())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(e, _)| e)
+        .collect()
+}
+
+/// Carries out the alarm messages posted since the last tick
+/// ([`crate::alarm`]): each sets its tower's flag and calls the tower's
+/// script's `OnUse(tower, on)`. Returns what failed.
+fn use_alarms(world: &Shared, lua: &mlua::Lua) -> Vec<String> {
+    let messages = world.borrow_mut().alarms.take();
+    let mut failed = Vec::new();
+    for (tower, mode) in messages {
+        let Some(on) = world.borrow_mut().alarms.apply(tower, mode) else {
+            continue;
+        };
+        let script = world.borrow().alarms.scripts.get(&tower).copied();
+        let Some((module, _)) = script.and_then(|h| OBJECT_SCRIPTS.iter().find(|(_, s)| *s == h))
+        else {
+            continue;
+        };
+        let result = lua
+            .globals()
+            .get::<mlua::Table>(*module)
+            .and_then(|m| m.get::<mlua::Function>("OnUse"))
+            .and_then(|f| f.call::<()>((crate::events::guid_value(tower), on)));
+        if let Err(err) = result {
+            failed.push(format!(
+                "{module}.OnUse {tower:#x}: {}",
+                first_lines(&err.to_string())
+            ));
+        }
+    }
+    failed
+}
 
 /// `DangerousBuilding`'s module hash.
 pub const DANGEROUS_BUILDING: u32 = 0x5439_77f7;
@@ -3680,7 +3744,43 @@ mod tests {
                 ("seat_gunner".into(), "VZ Soldier".into()),
                 ("seat_driver".into(), "VZ Tank Commander".into()),
             ],
+            alarm: false,
         }
+    }
+
+    #[test]
+    fn an_alarm_message_calls_its_towers_script_with_the_flag() {
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        let lua = mlua::Lua::new();
+        lua.load("heard = {} Alarm = { OnUse = function(g, on) heard[#heard + 1] = on end }")
+            .exec()
+            .unwrap();
+        let tower = Entity {
+            guid: 0x5150,
+            name: "vzoutpost_bld_alarmtower".into(),
+            script: Some(ALARM),
+            alarm: true,
+            crew: Vec::new(),
+            ..villa_tank()
+        };
+        place(&world, std::slice::from_ref(&tower), true);
+        {
+            let mut w = world.borrow_mut();
+            // The player's prompt, then on again, then another object.
+            w.alarms.post(0x5150, crate::alarm::TOGGLE);
+            w.alarms.post(0x5150, crate::alarm::ON);
+            w.alarms.post(0xfaa53, crate::alarm::ON);
+        }
+        assert!(use_alarms(&world, &lua).is_empty());
+        let heard: Vec<bool> = lua.globals().get("heard").unwrap();
+        assert_eq!(heard, [true, true]);
+        assert!(world.borrow().alarms.queue.is_empty());
+        // Gone with its layer: its messages do nothing.
+        place(&world, std::slice::from_ref(&tower), false);
+        world.borrow_mut().alarms.post(0x5150, crate::alarm::TOGGLE);
+        assert!(use_alarms(&world, &lua).is_empty());
+        let heard: Vec<bool> = lua.globals().get("heard").unwrap();
+        assert_eq!(heard.len(), 2);
     }
 
     #[test]
