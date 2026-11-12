@@ -10264,6 +10264,7 @@ impl Running {
         let engine = self.game.engine();
         self.audio.engine(engine, TICK.as_secs_f32());
         self.audio.rotors(&self.game.scene.flights.sounding());
+        self.audio.flybys(&self.game.scene.strikes.sounding());
         let others = self.game.others_engines(ear);
         self.audio.others_engines(&others, ear);
         let driving = self.game.driving().is_some();

@@ -4948,9 +4948,14 @@ fn radar_views(
                 Some(g) => place(g)? + offset,
                 None => offset,
             };
-            let icon = name_of
-                .as_ref()
-                .and_then(|f| f.call::<Option<String>>(b.icon).ok().flatten())
+            let icon = b
+                .texture
+                .clone()
+                .or_else(|| {
+                    name_of
+                        .as_ref()
+                        .and_then(|f| f.call::<Option<String>>(b.icon).ok().flatten())
+                })
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "objective_action".to_owned());
             let [r, g, bl] = b.colour;
