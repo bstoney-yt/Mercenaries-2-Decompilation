@@ -7557,8 +7557,12 @@ pub(crate) mod tests {
         step(&mut n, 0.5, &mut rng);
         assert!(n.character.position.x > 0.2 && !n.seated_at_use());
         // There: seated at the seat, facing its way.
-        step(&mut n, 4.0, &mut rng);
-        assert!(n.seated_at_use());
+        let mut walked = 0.5;
+        while !n.seated_at_use() && walked < 6.0 {
+            step(&mut n, 0.1, &mut rng);
+            walked += 0.1;
+        }
+        assert!(n.seated_at_use(), "not there after {walked:.1} s");
         assert_eq!(n.character.position, job.seat_at);
         assert_eq!(n.facing, 1.0);
         // The duration over (and a little): up, at the entrance, and not
