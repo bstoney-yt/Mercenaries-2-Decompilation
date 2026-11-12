@@ -4864,6 +4864,7 @@ pub const SHOW_ALL_COUNTERS: &str = "ShowAllCounters";
 fn show_counters(lua: &Lua, told: &mut u32, asked: u32) -> mlua::Result<()> {
     if *told != asked {
         *told = asked;
+        eprintln!("hud: all counters asked up ({asked})");
         fire(lua, SHOW_ALL_COUNTERS, ())?;
     }
     Ok(())
