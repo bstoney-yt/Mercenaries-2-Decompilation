@@ -3085,7 +3085,7 @@ fn seat_crew(
 /// `repairpad` is the script of the helipads and the PMC's garage
 /// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
 /// `LightFront`), and they go out when it dies.
-pub const OBJECT_SCRIPTS: [(&str, u32); 13] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 14] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3099,7 +3099,11 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 13] = [
     ("collectable", COLLECTABLE),
     ("pmcgate", PMC_GATE),
     ("repairpad", REPAIR_PAD),
+    ("pursuitcopter", PURSUIT_COPTER),
 ];
+
+/// `pursuitcopter`'s module hash.
+pub const PURSUIT_COPTER: u32 = 0x3e29_6216;
 
 /// `pmcgate`'s module hash.
 pub const PMC_GATE: u32 = 0xff56_2dd6;

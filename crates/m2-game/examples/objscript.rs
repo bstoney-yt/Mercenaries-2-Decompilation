@@ -144,6 +144,38 @@ fn main() -> Result<()> {
         }
         println!("beside the first: {opened} gate openings, {parts} parts turned on");
     }
+    if name.eq_ignore_ascii_case("pursuitcopter") {
+        // One comes in as a pursuit's air unit does: 350 m off her, 70 m up.
+        let template = args
+            .get(2)
+            .map_or("Alouette3 Transport (VZ) (Pursuit)", String::as_str);
+        mission.put_player([100.0, 0.0, 100.0]);
+        let copter = mission.spawn(template, [450.0, 70.0, 100.0]);
+        println!("spawned {template}: {copter:?}");
+        let mut seen: Vec<String> = Vec::new();
+        let end = mission.now() + 20.0;
+        while mission.now() < end {
+            mission.tick(0.25);
+            for c in mission.take_commands() {
+                let text = format!("{c:?}");
+                let short: String = text.chars().take(150).collect();
+                if !matches!(c, Command::Spawn { .. }) || seen.len() < 12 {
+                    seen.push(format!("t={:.2} {short}", mission.now()));
+                }
+            }
+            for line in mission.take_log() {
+                if seen.len() < 60 {
+                    seen.push(format!(
+                        "log {}",
+                        line.chars().take(150).collect::<String>()
+                    ));
+                }
+            }
+        }
+        for s in seen.iter().take(40) {
+            println!("{s}");
+        }
+    }
     println!("{name} lines logged: {failures}");
     Ok(())
 }

@@ -1473,8 +1473,10 @@ impl ScriptWorld {
         // A full one (`"Ka29b (Full)"`, a soldier delivery's) comes with its
         // passengers too, as its other `Rider` records name them
         // (inferred from the name: `MrxSoldierDelivery` takes them out with
-        // `Ai.Deploy` once it has landed).
-        if lower.contains("(full)") {
+        // `Ai.Deploy` once it has landed). So does an army's pursuit
+        // helicopter (`"MH53J (Pursuit)"`), whose own script
+        // (`pursuitcopter`) lands it and takes them out the same way.
+        if lower.contains("(full)") || lower.contains("(pursuit)") {
             for rider in self
                 .template_passengers
                 .get(&lower)

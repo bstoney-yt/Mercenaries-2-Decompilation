@@ -2291,7 +2291,7 @@ impl MissionLink {
             let releases = scene
                 .flights
                 .step(dt, &mut world.physics, &mut scene.vehicles, focus);
-            for r in self.reinforcements.take_releases(releases) {
+            for r in releases {
                 for &g in &r.dropped {
                     self.vehicles.landing.insert(g, mission.now() + LANDING);
                 }
@@ -2880,30 +2880,58 @@ impl MissionLink {
                 }
             }
             game.pursuers.call_off(faction);
-            // Where the next transport comes in, looked for only when one
-            // is due (each look takes a random number).
-            let next_in = match wanted {
-                Some((f, n)) if n > self.reinforcements.out(f) => air_unit_in(game, her),
-                _ => None,
-            };
-            let due = self.reinforcements.step(
-                wanted,
-                squads,
-                &mut game.scene.flights,
-                her,
-                &mut || next_in,
-                dt,
-            );
-            for (g, template, at) in due {
-                let model = game
-                    .scene
-                    .world
-                    .as_ref()
-                    .and_then(|w| w.index.template_db.get(&template))
-                    .and_then(|t| t.model);
-                let at = ground_under(game, at);
-                if game.scene.people.bring_scripted(g, &template, model, at) {
-                    self.reinforcements.brought(g);
+            // Its transports: those gone from the scripts' world are out
+            // no more; those called off with their passengers still aboard
+            // are taken away; each one due comes in as an air unit does
+            // and is its own script's from there (`pursuitcopter`: it
+            // finds its drop zone by her, lands, sets its passengers down
+            // and goes home; [`crate::reinforce`]).
+            self.reinforcements
+                .keep(|g| mission.world().borrow().objects.contains_key(&g));
+            for copter in self.reinforcements.take_off() {
+                let aboard: Vec<u32> = {
+                    let w = mission.world().borrow();
+                    let mut riders: Vec<u32> = w
+                        .objects
+                        .iter()
+                        .filter(|(_, o)| o.vehicle == Some(copter))
+                        .map(|(&g, _)| g)
+                        .collect();
+                    riders.sort_unstable();
+                    riders
+                };
+                // Only its pilot left: its passengers are down, it goes
+                // home by itself.
+                if aboard.len() <= 1 {
+                    continue;
+                }
+                eprintln!(
+                    "reinforcements: helicopter {copter:#x} called off with {} aboard",
+                    aboard.len()
+                );
+                for g in aboard.into_iter().chain([copter]) {
+                    if let Err(e) = mission.run(&format!("Object.Remove({g})"), "call off") {
+                        eprintln!("reinforcements: {g:#x} not taken away: {e}");
+                    }
+                }
+            }
+            for (f, template) in self.reinforcements.due(wanted, squads) {
+                // In as any air unit (0x82239DA0, 0x8223ADD0).
+                let Some(from) = air_unit_in(game, her) else {
+                    eprintln!("reinforcements: no clear place for {f}'s {template}");
+                    break;
+                };
+                match mission.spawn(&template, from.to_array()) {
+                    Some(copter) => {
+                        eprintln!(
+                            "reinforcements: {f} send their {template} from {from:.0} as {copter:#x}"
+                        );
+                        self.reinforcements.sent(f, copter);
+                    }
+                    None => {
+                        eprintln!("reinforcements: {f}'s {template} did not spawn");
+                        break;
+                    }
                 }
             }
         }
