@@ -2105,6 +2105,10 @@ impl MissionLink {
         let State::Running(mission) = &mut self.state else {
             return;
         };
+        // `Graphics.Effect.CameraFade`'s constants, for the particles.
+        if let Some(p) = game.scene.particles.as_mut() {
+            p.camera_fade = mission.world().borrow().effects.camera_fade;
+        }
         let focus = game.focus();
         let mut lap = crate::spans::Lap::new();
         // The music region she is in: the free-play score follows it.
