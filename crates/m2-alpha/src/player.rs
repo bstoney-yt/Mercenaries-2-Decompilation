@@ -1997,35 +1997,44 @@ impl Player {
     /// Her camera's view; through her binoculars, from the point the
     /// camera turns about above her head, with their narrower lens.
     pub fn view(&self, fov_degrees: f32, aspect: f32) -> View {
+        use m2_engine::projection::{FAR, NEAR, fov_y};
+        // `fov_degrees` is the game's field of view (the picture's width
+        // at 4:3); the picture's height follows from the screen's shape
+        // ([`m2_engine::projection`]). Scope and binoculars narrow that
+        // height, as before.
+        let tall = fov_y(fov_degrees.to_radians(), aspect).to_degrees();
         // Through her scope, from the camera's pivot as through her
         // binoculars, magnified.
         if let Some(z) = self.scope.filter(|_| self.driving.is_none()) {
             return View::perspective(
                 self.look_at(),
                 self.camera_forward(),
-                crate::binoculars::magnified(fov_degrees, z).to_radians(),
+                crate::binoculars::magnified(tall, z).to_radians(),
                 aspect,
-                0.1,
-                10_000.0,
+                NEAR,
+                FAR,
             );
         }
         if let Some(b) = self.binoculars.filter(|_| self.driving.is_none()) {
             return View::perspective(
                 self.look_at(),
                 self.camera_forward(),
-                b.fov(fov_degrees).to_radians(),
+                b.fov(tall).to_radians(),
                 aspect,
-                0.1,
-                10_000.0,
+                NEAR,
+                FAR,
             );
         }
         View::perspective(
             self.eye(),
             self.camera_forward(),
-            (fov_degrees * self.lens.clamp(0.1, 2.0)).to_radians(),
+            fov_y(
+                (fov_degrees * self.lens.clamp(0.1, 2.0)).to_radians(),
+                aspect,
+            ),
             aspect,
-            0.1,
-            10_000.0,
+            NEAR,
+            FAR,
         )
     }
 

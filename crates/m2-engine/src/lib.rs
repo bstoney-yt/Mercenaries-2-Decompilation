@@ -60,6 +60,7 @@ pub mod path_search;
 pub mod physics;
 pub mod pickup;
 pub mod population;
+pub mod projection;
 pub mod reverb;
 pub mod road_driver;
 pub mod road_graph;
