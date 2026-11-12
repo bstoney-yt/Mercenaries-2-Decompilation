@@ -524,6 +524,7 @@ fn radio_falloff(reach: f32) -> Falloff {
     Falloff {
         near: (reach * 0.25).max(1.0),
         far: reach.max(2.0),
+        exponent: None,
     }
 }
 
@@ -538,6 +539,7 @@ const CUE_GAIN: f32 = 0.55;
 const CUE_FALLOFF: Falloff = Falloff {
     near: 2.0,
     far: 35.0,
+    exponent: None,
 };
 /// Most clip sounds started in one tick.
 const CUES_AT_ONCE: usize = 6;
@@ -988,6 +990,7 @@ const ROTOR_WHINE: f32 = 0.3;
 const ROTOR_FALLOFF: Falloff = Falloff {
     near: 20.0,
     far: 800.0,
+    exponent: None,
 };
 
 /// A tank's main gun: the loudest of its bank's sounds 0.4 to 4 s long.
@@ -1644,6 +1647,7 @@ impl GameAudio {
         let falloff = Falloff {
             near: line.min_distance.max(1.0),
             far: line.max_distance.max(line.min_distance + 1.0),
+            exponent: None,
         };
         self.speak(voices, line.stream, at, falloff, line.volume, None);
     }
@@ -1730,6 +1734,7 @@ impl GameAudio {
         let falloff = Falloff {
             near: near.max(1.0),
             far: far.max(near + 1.0),
+            exponent: None,
         };
         // Jennifer keeps quiet while she is spoken to.
         let now = Instant::now();
@@ -1783,6 +1788,7 @@ impl GameAudio {
         let falloff = Falloff {
             near: near.max(1.0),
             far: far.max(near + 1.0),
+            exponent: None,
         };
         let _ = self.said.0.send((
             buffer,
@@ -2049,7 +2055,8 @@ impl GameAudio {
             let distance = 10.0 + self.random() * 30.0;
             let at = listener + Vec3::new(angle.cos() * distance, 2.0, angle.sin() * distance);
             let falloff =
-                Falloff::of_record(layer.min_distance, layer.max_distance).unwrap_or_default();
+                Falloff::of_record(layer.min_distance, layer.max_distance, layer.exponent)
+                    .unwrap_or_default();
             let play = Play::at(buffer, at).gain(layer.volume).falloff(falloff);
             self.out.with(|m| m.play(play));
         }
@@ -3428,6 +3435,8 @@ mod tests {
             volume: 1.0,
             min_distance: 10.0,
             max_distance: 1000.0,
+            positional: false,
+            exponent: 1.0,
             variants: vec![(table, stream, 1.0)],
         };
         m2_assets::CueTable {

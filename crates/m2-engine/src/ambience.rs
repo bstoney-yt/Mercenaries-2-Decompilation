@@ -47,6 +47,8 @@ pub struct Layer {
     pub volume: f32,
     pub min_distance: f32,
     pub max_distance: f32,
+    /// The power its fade with distance follows (the record's).
+    pub exponent: f32,
     /// (bank hash, sound index, weight).
     pub sounds: Vec<(u32, u32, f32)>,
 }
@@ -116,6 +118,7 @@ impl AmbiencePlan {
                         volume: r.volume * t.level,
                         min_distance: r.min_distance,
                         max_distance: r.max_distance,
+                        exponent: r.exponent,
                         sounds: r.variants.clone(),
                     }),
                 }
@@ -197,6 +200,8 @@ mod tests {
             volume: 0.3,
             min_distance: 10.0,
             max_distance: 1000.0,
+            positional: true,
+            exponent: 1.0,
             variants,
         }
     }
