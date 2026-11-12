@@ -1071,6 +1071,12 @@ impl Mission {
             // No time scale yet: game and real time run together.
             w.clocks.step(dt as f32, dt as f32);
         }
+        // What the scripts killed since the last tick dies as anything
+        // else does: its own script's `OnDeath` hears of it.
+        let killed = std::mem::take(&mut self.world.borrow_mut().script_killed);
+        for guid in killed {
+            self.object_hook(guid, ON_DEATH, death_args(guid));
+        }
         // Streaming is instant here: a waiting state ends a second after
         // it was asked for, and the scripts hear that it did.
         {
@@ -3574,6 +3580,17 @@ mod tests {
             crate::events::guid_value(guid)
         );
         assert_eq!(g.get::<u32>("dead_data").unwrap(), 3);
+        // One a script kills dies the same way, at the next tick.
+        m.world
+            .borrow_mut()
+            .insert(guid, Object::new("Munitions (Bunker Buster)", [0.0; 3]));
+        m.lua()
+            .load("Object.Kill(...)")
+            .call::<()>(crate::events::guid_value(guid))
+            .unwrap();
+        m.tick(0.25);
+        m.tick(0.25);
+        assert_eq!(g.get::<u32>("deaths").unwrap(), 2);
         m.object_state_changed(guid, 0x1111_2222, 0x7687_df41);
         assert_eq!(g.get::<u32>("states").unwrap(), 1);
         assert_eq!(
