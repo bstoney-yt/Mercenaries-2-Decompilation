@@ -61,5 +61,15 @@ missing_debug_implementations = "warn"
 undocumented_unsafe_blocks = "warn"
 
 [profile.release]
-debug = true
+debug = "line-tables-only"
 panic = "abort"
+
+# Debug info is most of a target folder's size (each worktree has its own).
+# Line tables keep backtraces' function names, files and lines for the
+# workspace's own crates; dependencies keep function names only. What is
+# given up is inspecting variables in a debugger.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
