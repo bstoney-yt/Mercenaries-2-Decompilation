@@ -29,8 +29,32 @@ pub fn take_draws() -> u64 {
     all / frames.max(1)
 }
 
-/// Runs `f`, adding the time it took to `name`'s.
+/// Starts the Tracy client, so a profiler can connect: with the `tracy`
+/// feature only (see docs/profiling.md), and nothing without it.
+pub fn start_profiler() {
+    #[cfg(feature = "tracy")]
+    tracy_client::Client::start();
+}
+
+/// A frame begins: Tracy's frame mark, with the `tracy` feature.
+pub fn frame_mark() {
+    #[cfg(feature = "tracy")]
+    if let Some(client) = tracy_client::Client::running() {
+        client.frame_mark();
+    }
+}
+
+/// A Tracy zone named as the span is, open until dropped.
+#[cfg(feature = "tracy")]
+fn zone(name: &'static str) -> Option<tracy_client::Span> {
+    tracy_client::Client::running().map(|client| client.span_alloc(Some(name), "", file!(), 0, 0))
+}
+
+/// Runs `f`, adding the time it took to `name`'s. With the `tracy`
+/// feature the run is a Tracy zone of the same name too.
 pub fn time<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "tracy")]
+    let _zone = zone(name);
     let started = Instant::now();
     let out = f();
     add(name, started.elapsed());
