@@ -93,6 +93,18 @@ pub enum Stagger {
 }
 
 impl Stagger {
+    /// The three, in the order of their discriminants.
+    pub const ALL: [Self; 3] = [Self::Short, Self::InPlace, Self::Long];
+
+    /// The action's name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Short => "StaggerShort",
+            Self::InPlace => "StaggerInPlace",
+            Self::Long => "StaggerLong",
+        }
+    }
+
     /// The action's name hash.
     pub fn action(self) -> u32 {
         match self {
@@ -113,6 +125,9 @@ pub enum Direction {
 }
 
 impl Direction {
+    /// The four, in the order of their discriminants.
+    pub const ALL: [Self; 4] = [Self::Front, Self::Back, Self::Left, Self::Right];
+
     /// The direction's name hash, as the stance and action table has it.
     pub fn hash(self) -> u32 {
         match self {
@@ -251,6 +266,15 @@ mod tests {
             melee: false,
             key: None,
         }
+    }
+
+    #[test]
+    fn the_staggers_names_hash_to_their_actions() {
+        for s in Stagger::ALL {
+            assert_eq!(s.action(), name_hash(s.name()), "{}", s.name());
+        }
+        assert_eq!(Stagger::ALL.map(|s| s as usize), [0, 1, 2]);
+        assert_eq!(Direction::ALL.map(|d| d as usize), [0, 1, 2, 3]);
     }
 
     #[test]
