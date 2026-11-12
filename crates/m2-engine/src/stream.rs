@@ -623,6 +623,8 @@ pub struct World {
     /// The sun flare's texture (`radial_flare`), as the game's post pass
     /// loads it (0x821BB010).
     pub sun_flare: Option<m2_render::TextureHandle>,
+    /// The screen overlay's texture (`global_rain`), if it loaded.
+    pub screen_rain: Option<m2_render::TextureHandle>,
     stats: WorldStats,
     /// Placed objects (index into the index's `objects`) blown up: drawn
     /// as their wrecks, or not at all without one.
@@ -737,6 +739,19 @@ impl World {
         }
         materials.pin(flare);
         let sun_flare = materials.texture(flare).map(|(t, _)| t);
+        // The screen overlay's texture, which the game's rain object
+        // starts with (0x821BF458) and every record names: sampled as
+        // stored, like the game's shader.
+        let rain = m2_assets::name_hash("global_rain");
+        match source.texture(rain, 512) {
+            Ok(mut t) => {
+                t.linear = true;
+                materials.add_texture(backend, rain, Some(&t))?;
+            }
+            Err(e) => eprintln!("screen overlay texture {rain:08x}: {e}"),
+        }
+        materials.pin(rain);
+        let screen_rain = materials.texture(rain).map(|(t, _)| t);
         // The trees' far stand-ins, ready from the start: few, and small.
         let mut far_trees = Vec::with_capacity(index.far_trees.len());
         for tree in &index.far_trees {
@@ -784,6 +799,7 @@ impl World {
             inland,
             cloud_noise,
             sun_flare,
+            screen_rain,
             stats: WorldStats::default(),
             destroyed: HashSet::new(),
             loose: HashMap::new(),

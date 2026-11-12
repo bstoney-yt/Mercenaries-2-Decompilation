@@ -57,6 +57,8 @@
 use std::cell::Cell;
 use std::time::Instant;
 
+use m2_math::glam::{Mat4, Vec3};
+
 use crate::backend::Lighting;
 
 /// Format the world draws in, before the post pass.
@@ -97,6 +99,13 @@ struct Post {
     // The depth of field: x, y the projection's z scale and offset (view
     // depth -z = y / (depth + x)), z 1 to draw it
     dof: vec4<f32>,
+    // The screen overlay (see `screen_overlay`): the game's rainVelocity
+    // and rainColor; xy its rainCenter, zw its rainFov; x: 0 none, 1
+    // added, 2 taken away, 3 blended over
+    rain_vel: vec4<f32>,
+    rain_color: vec4<f32>,
+    rain_view: vec4<f32>,
+    rain_mode: vec4<f32>,
 };
 
 fn game_tone_map() -> bool {
@@ -144,6 +153,37 @@ fn to_game(c: vec3<f32>) -> vec3<f32> {
 @group(0) @binding(7) var blur_h0: texture_2d<f32>;
 // The flare's texture (`radial_flare`), in the composite.
 @group(1) @binding(0) var flare_map: texture_2d<f32>;
+// The screen overlay's texture (`global_rain`) and a repeating sampler.
+@group(1) @binding(1) var rain_map: texture_2d<f32>;
+@group(1) @binding(2) var repeating: sampler;
+
+// The game's screen overlay over display values `d` (its shaders
+// PgRainVP/PgRainFP, the PC's 421/420): the quad's corner v in 0..1 (y
+// up) takes the texture at rainFov * (v - 0.5) * 2 + rainCenter, less
+// the direction times the phase; times the colour and the density. The
+// blend is the record's type (from the 360 code, see `OverlayBlend`).
+// Assumed: the texture repeats, and the frame it is drawn onto holds
+// values in 0..1.
+fn screen_overlay(d: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    if post.rain_mode.x < 0.5 {
+        return d;
+    }
+    let v = vec2<f32>(uv.x, 1.0 - uv.y);
+    let at = post.rain_view.zw * (v - vec2<f32>(0.5)) * 2.0 + post.rain_view.xy
+        - post.rain_vel.xy * post.rain_vel.z;
+    let s = clamp(
+        textureSampleLevel(rain_map, repeating, at, 0.0) * post.rain_color * post.rain_vel.w,
+        vec4<f32>(0.0),
+        vec4<f32>(1.0),
+    );
+    var o = d + s.rgb * s.a;
+    if post.rain_mode.x > 2.5 {
+        o = mix(d, s.rgb, s.a);
+    } else if post.rain_mode.x > 1.5 {
+        o = d - s.rgb * s.a;
+    }
+    return clamp(o, vec3<f32>(0.0), vec3<f32>(1.0));
+}
 
 // The game's sun flare (from the 360 code, 0x821BCB08, and its shader,
 // the install's 347): over a square half the screen's height times 0.41
@@ -493,6 +533,8 @@ fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
         );
         d = mix(d, ramp, post.mono.a);
         d = clamp(d + grain(v.position), vec3<f32>(0.0), vec3<f32>(1.0));
+        // The game draws its overlay after the composite (0x82396828).
+        d = screen_overlay(d, v.uv);
         return vec4<f32>(display_to_linear(d), 1.0);
     }
     // Contrast on luminance about a mid grey, keeping each colour's hue,
@@ -523,6 +565,10 @@ struct Uniforms {
     flare: [f32; 4],
     flare_rot: [f32; 4],
     dof: [f32; 4],
+    rain_vel: [f32; 4],
+    rain_color: [f32; 4],
+    rain_view: [f32; 4],
+    rain_mode: [f32; 4],
 }
 
 /// The passes, by index: bright, blur across, blur down, composite, then
@@ -588,6 +634,13 @@ pub struct Post {
     flare_layout: wgpu::BindGroupLayout,
     flare_group: std::cell::RefCell<wgpu::BindGroup>,
     flare_key: Cell<Option<crate::TextureHandle>>,
+    /// The group's two textures as last given (the flare's, the screen
+    /// overlay's), which overlay texture it holds, the repeating sampler,
+    /// and the overlay's rainCenter and rainFov for this frame.
+    flare_views: std::cell::RefCell<[wgpu::TextureView; 2]>,
+    rain_key: Cell<Option<crate::TextureHandle>>,
+    repeating: wgpu::Sampler,
+    rain_view: Cell<[f32; 4]>,
     flare_angles: Cell<[f32; 4]>,
     flare_time: Cell<f64>,
     uniforms: [wgpu::Buffer; PASSES],
@@ -732,7 +785,24 @@ impl Post {
         // The composite's second group: the sun flare's texture.
         let flare_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("post flare"),
-            entries: &[texture(0)],
+            entries: &[
+                texture(0),
+                texture(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let repeating = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("post repeating"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
         });
         let composite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("post composite"),
@@ -756,7 +826,8 @@ impl Post {
                 view_formats: &[],
             })
             .create_view(&Default::default());
-        let flare_group = flare_group(device, &flare_layout, &black);
+        let flare_views = [black.clone(), black];
+        let flare_group = flare_group(device, &flare_layout, &flare_views, &repeating);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("post"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -827,6 +898,10 @@ impl Post {
             flare_layout,
             flare_group: std::cell::RefCell::new(flare_group),
             flare_key: Cell::new(None),
+            flare_views: std::cell::RefCell::new(flare_views),
+            rain_key: Cell::new(None),
+            repeating,
+            rain_view: Cell::new([0.0; 4]),
             flare_angles: Cell::new([0.0; 4]),
             flare_time: Cell::new(0.0),
             sampler,
@@ -1027,9 +1102,40 @@ impl Post {
         view: &wgpu::TextureView,
     ) {
         if self.flare_key.get() != Some(key) {
-            *self.flare_group.borrow_mut() = flare_group(device, &self.flare_layout, view);
+            self.flare_views.borrow_mut()[0] = view.clone();
+            self.regroup(device);
             self.flare_key.set(Some(key));
         }
+    }
+
+    /// Gives the screen overlay its texture, `key` naming it so it is
+    /// bound once.
+    pub fn set_rain_map(
+        &self,
+        device: &wgpu::Device,
+        key: crate::TextureHandle,
+        view: &wgpu::TextureView,
+    ) {
+        if self.rain_key.get() != Some(key) {
+            self.flare_views.borrow_mut()[1] = view.clone();
+            self.regroup(device);
+            self.rain_key.set(Some(key));
+        }
+    }
+
+    fn regroup(&self, device: &wgpu::Device) {
+        *self.flare_group.borrow_mut() = flare_group(
+            device,
+            &self.flare_layout,
+            &self.flare_views.borrow(),
+            &self.repeating,
+        );
+    }
+
+    /// The screen overlay's rainCenter and rainFov for the frame's view
+    /// ([`overlay_view`]).
+    pub fn set_overlay_view(&self, forward: Vec3, projection: &Mat4) {
+        self.rain_view.set(overlay_view(forward, projection));
     }
 
     pub fn encode(
@@ -1123,6 +1229,10 @@ impl Post {
         let game_blur = game && game_blur_on();
         let glowing = lighting.bloom > 0.0 && !game_blur;
         let blur = [if game_blur { 1.0 } else { 0.0 }, lighting.bloom, 0.0, 0.0];
+        // The screen overlay, once its texture is bound and where it shows.
+        let overlay = lighting
+            .screen_overlay
+            .filter(|o| self.rain_key.get() == Some(o.map) && o.velocity[3] > 0.0);
         // The sun flare, with the game's tone map and blur only (it reads
         // `BlurH0`), when the sun's square is on screen.
         let (flare, flare_rot) =
@@ -1192,6 +1302,20 @@ impl Post {
                 blur,
                 flare,
                 flare_rot,
+                rain_vel: overlay.map_or([0.0; 4], |o| o.velocity),
+                rain_color: overlay.map_or([0.0; 4], |o| o.colour),
+                rain_view: self.rain_view.get(),
+                rain_mode: [
+                    match overlay.map(|o| o.blend) {
+                        None => 0.0,
+                        Some(crate::OverlayBlend::Add) => 1.0,
+                        Some(crate::OverlayBlend::Subtract) => 2.0,
+                        Some(crate::OverlayBlend::Alpha) => 3.0,
+                    },
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
                 dof: {
                     let [scale, offset] = self.projection.get();
                     [scale, offset, if game_blur { 1.0 } else { 0.0 }, 0.0]
@@ -1279,16 +1403,48 @@ pub const SUN_FLARE_DISTANCE: f32 = 800_000.0;
 fn flare_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-    view: &wgpu::TextureView,
+    views: &[wgpu::TextureView; 2],
+    repeating: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("post flare"),
         layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::TextureView(view),
-        }],
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&views[0]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&views[1]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(repeating),
+            },
+        ],
     })
+}
+
+/// The screen overlay's `rainCenter` (x, y) and `rainFov` (z, w) for a
+/// camera looking along `forward` through `projection` (from the 360
+/// code, 0x821BF628): the centre is the view's bearing and pitch, each
+/// over pi plus a half, so the texture stays put in the world as the
+/// camera turns; the reach each way from it is the projection's x and y
+/// scales over 2 pi.
+///
+/// The bearing is `atan2(z, x)`. The pitch's routine (0x82854020) clamps
+/// to -1..1 and is taken as the arcsine. Our world's handedness against
+/// the 360's isn't settled, so the texture may run mirrored.
+pub fn overlay_view(forward: Vec3, projection: &Mat4) -> [f32; 4] {
+    use std::f32::consts::{PI, TAU};
+    let f = forward.normalize_or_zero();
+    [
+        f.z.atan2(f.x) / PI + 0.5,
+        f.y.clamp(-1.0, 1.0).asin() / PI + 0.5,
+        projection.x_axis.x.abs() / TAU,
+        projection.y_axis.y.abs() / TAU,
+    ]
 }
 
 /// The game's integer noise (from the 360 code, 0x825733B8): `k` mixed
@@ -1417,8 +1573,24 @@ mod tests {
     }
 
     #[test]
+    fn the_overlay_is_laid_out_by_view_direction() {
+        use super::*;
+        // A 90 degree view straight along +x, level: centre (0.5, 0.5),
+        // reach 1 / 2 pi each way (the projection's scales are 1).
+        let p = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0);
+        let v = overlay_view(Vec3::X, &p);
+        assert!((v[0] - 0.5).abs() < 1e-6 && (v[1] - 0.5).abs() < 1e-6);
+        assert!((v[2] - 1.0 / std::f32::consts::TAU).abs() < 1e-5);
+        assert!((v[3] - 1.0 / std::f32::consts::TAU).abs() < 1e-5);
+        // Turned a quarter to +z: half a texture on. Straight up: 1.
+        assert!((overlay_view(Vec3::Z, &p)[0] - 1.0).abs() < 1e-6);
+        assert!((overlay_view(Vec3::Y, &p)[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn the_game_blur_passes_run_in_order_to_the_combine() {
         use super::*;
+
         let mut seen = vec![GAME_BLUR];
         for level in 0..LEVELS {
             for index in 0..3 {
