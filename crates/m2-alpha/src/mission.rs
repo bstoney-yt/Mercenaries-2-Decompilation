@@ -973,6 +973,10 @@ pub struct MissionLink {
     /// sequences with it, the PMC HQ its interior. Both contracts' flows
     /// were seen to finish with it off.
     end_skip: bool,
+    /// The scripts' "player joined" callback is called for her
+    /// (`--script-join`; [`Mission::set_script_join`]). The callback then
+    /// makes her interface itself, so the stand-in call is left out.
+    script_join: bool,
     /// The player has subtitles on.
     subtitles: bool,
     /// The player has the tutorial tips on.
@@ -1186,6 +1190,7 @@ impl MissionLink {
             movies: false,
             acts_logged: Default::default(),
             end_skip: false,
+            script_join: false,
             subtitles: true,
             tutorials: true,
             lag: 0.0,
@@ -3621,6 +3626,15 @@ impl MissionLink {
         self.write(lines);
     }
 
+    /// Has the scripts' "player joined" callback called for her
+    /// (`--script-join`).
+    pub fn with_script_join(self, script_join: bool) -> Self {
+        Self {
+            script_join,
+            ..self
+        }
+    }
+
     fn begin(&mut self, data: GameData, game: &mut Game) {
         let at = game
             .scene
@@ -3675,6 +3689,7 @@ impl MissionLink {
                         None => pmc,
                     }
                 });
+                mission.set_script_join(self.script_join);
                 mission.start();
                 if let Some((to, _)) = &self.skip_to {
                     // What the scripts' skip is meant to hand her there,
@@ -3693,7 +3708,12 @@ impl MissionLink {
                 // updates the PDA's support page, and without one it
                 // stopped ("No PDA found") and JetCon001's bunker busters
                 // never counted.
-                if let Err(e) = mission.run(
+                // With `--script-join` the joined callback has made it
+                // (`MrxPlayer.OnPlayerJoined`), unless no callback was
+                // registered by now.
+                if mission.player_joined() {
+                    self.write(["player joined: her interface is the scripts' own".to_owned()]);
+                } else if let Err(e) = mission.run(
                     "MrxGuiManager.CreateGui(Player.GetLocalPlayer())",
                     "create gui",
                 ) {
