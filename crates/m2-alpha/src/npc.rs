@@ -1851,9 +1851,6 @@ impl Npc {
 
     /// Their mouth flapping while a line of theirs plays (`on`), as the
     /// 360's voice system has every speaker's (0x822782D8, 0x82278440).
-    // Called from the voice lines' started and stopped signal once that
-    // is in (`m2_game::vo::Speech`).
-    #[allow(dead_code)]
     pub fn speak(&mut self, on: bool) {
         let r = |k: u64| {
             ((self.uid.wrapping_mul(0x9e37_79b9).wrapping_add(k * 7919)) % 1000) as f32 / 1000.0

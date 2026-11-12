@@ -2114,6 +2114,35 @@ impl MissionLink {
         if let Some(p) = game.scene.particles.as_mut() {
             p.camera_fade = mission.world().borrow().effects.camera_fade;
         }
+        // The lines that started and stopped: the speaker's mouth flaps
+        // while theirs plays, as the 360's voice manager has it
+        // (0x822782D8, 0x82278440; [`m2_engine::face_expression`]).
+        for speech in mission.world().borrow_mut().vo.take_speech() {
+            let (on, speaker, cue) = match speech {
+                m2_game::vo::Speech::Started { speaker, cue, .. } => (true, speaker, cue),
+                m2_game::vo::Speech::Stopped { speaker, cue, .. } => (false, speaker, cue),
+            };
+            let Some(guid) = speaker else { continue };
+            match game
+                .scene
+                .people
+                .npcs
+                .iter_mut()
+                .find(|n| n.spawn == Some(guid))
+            {
+                Some(n) => {
+                    eprintln!(
+                        "face: {guid:#x} {} speaking (line {cue:08x})",
+                        if on { "starts" } else { "stops" }
+                    );
+                    n.speak(on);
+                }
+                None if on => {
+                    eprintln!("face: line {cue:08x}'s speaker {guid:#x} is no person here")
+                }
+                None => {}
+            }
+        }
         let focus = game.focus();
         let mut lap = crate::spans::Lap::new();
         // The music region she is in: the free-play score follows it.
