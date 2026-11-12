@@ -2823,7 +2823,7 @@ fn seat_crew(
 /// PMC's own green), set again as a driver gets in or out or the
 /// faction's attitude changes, and taken off while a player drives it
 /// ([`crate::hud::Blip`], `Hud.Radar:AddObjective`).
-pub const OBJECT_SCRIPTS: [(&str, u32); 7] = [
+pub const OBJECT_SCRIPTS: [(&str, u32); 8] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
