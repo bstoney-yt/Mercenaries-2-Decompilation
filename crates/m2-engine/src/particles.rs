@@ -644,6 +644,24 @@ pub fn template_runs(db: &Layer<'_>) -> HashMap<u32, Vec<EffectRun>> {
         .collect()
 }
 
+/// How much of a particle shows at `depth` metres in front of the camera
+/// (its offset from the camera along the camera's forward), given the three
+/// constants `Graphics.Effect.CameraFade` sets: far, near and range.
+///
+/// From the 360 code (the particle sort pass, `0x821E3440`): the depth is
+/// taken down to `far` and up to `near`, and `(depth - near) / range` is
+/// kept in the particle's record as 16 bits (times 65535, truncated). With
+/// the fade on (2.25, 1.25, 1.0) a particle fades out from 2.25 m to 1.25 m;
+/// off (0.1, 0.0, 0.1), only within the last 0.1 m.
+///
+/// Assumed: the particle's shader multiplies its alpha by this value. The
+/// shader isn't in the program, and that use wasn't read.
+pub fn camera_fade(depth: f32, [far, near, range]: [f32; 3]) -> f32 {
+    let d = depth.min(far).max(near);
+    let stored = ((d - near) * (1.0 / range) * 65535.0) as u16;
+    f32::from(stored) / 65535.0
+}
+
 /// One particle to draw: a square facing the camera.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sprite {
@@ -1136,6 +1154,24 @@ fn srgb_to_linear(c: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_camera_fade_runs_from_far_to_near() {
+        let on = [2.25, 1.25, 1.0];
+        assert_eq!(camera_fade(10.0, on), 1.0);
+        assert_eq!(camera_fade(2.25, on), 1.0);
+        assert!((camera_fade(1.75, on) - 0.5).abs() < 1e-4);
+        assert_eq!(camera_fade(1.25, on), 0.0);
+        assert_eq!(camera_fade(-3.0, on), 0.0);
+        // Off: whole to within 0.1 m of the camera.
+        let off = [0.1, 0.0, 0.1];
+        assert_eq!(camera_fade(1.3, off), 1.0);
+        assert!((camera_fade(0.05, off) - 0.5).abs() < 1e-4);
+        assert_eq!(camera_fade(0.0, off), 0.0);
+        // Kept as 16 bits: steps of 1/65535.
+        let v = camera_fade(1.25 + 0.3, on) * 65535.0;
+        assert_eq!(v, v.trunc());
+    }
 
     fn keyed(keys: &[(f32, f32)]) -> Attr {
         Attr {
