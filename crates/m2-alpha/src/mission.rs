@@ -8724,6 +8724,8 @@ mod tests {
             icon: picture,
             reticle: 1,
             crosshair: true,
+            reticle_type: 0,
+            health_type: 0,
         });
         assert_eq!(pickup(&db, ak).unwrap().icon, Some(picture));
         let records = vec![(shotgun, 3), (bullet, 3)];

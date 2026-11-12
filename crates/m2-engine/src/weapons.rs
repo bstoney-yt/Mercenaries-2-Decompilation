@@ -62,6 +62,9 @@ const CLASS: u32 = 0xd641_1a49;
 /// off its nose it keeps a target in (degrees).
 const TURN_SPEED: u32 = 0xcefb_c415;
 const MAX_ANGLE: u32 = 0xa10e_79fa;
+/// `HomingWeapon`'s lock cone, degrees (its name not found; the 360's
+/// weapon-equipped event sizes the lock-on frame by it, `0x8234F458`).
+const LOCK_CONE: u32 = 0x6749_c828;
 /// `HomingWeapon`'s lock range, metres (the Stinger's 400; inferred).
 const LOCK_RANGE: u32 = 0x1a09_69d2;
 /// `WeaponThrown`'s throw speeds at the reticle's lowest, middle and
@@ -531,15 +534,26 @@ const ASSIST_FAR: [&str; 2] = ["HorizontalAimAssistFar", "VerticalAimAssistFar"]
 /// `reticle_bullets`, the shotgun's `weapons_shotgun_1` and
 /// `reticle_shotgun`), and whether the reticle has its crosshair (the
 /// shotgun's and the launchers' have none). From samples (PC data,
-/// playtest 4); the reticle's field name is unknown, only its hash.
+/// playtest 4). The record's fields, in order: `texture`,
+/// `ReticleTexture`, `ReticleHealthType`, `ReticleType`, one unnamed and
+/// `bReticleCrosshair`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GunUi {
     pub icon: u32,
     pub reticle: u32,
     pub crosshair: bool,
+    /// `ReticleType`, as the 360's weapon-equipped event reads it
+    /// (`0x8234F458`): 1 the homing launchers' lock-on reticle, 3 the
+    /// laser's, 4 none, anything else the normal one. From the data: 0
+    /// for the guns, 1 for the Stinger and the mounted missile launchers,
+    /// 2 for the TOW launchers, 3 for the Laser Designator.
+    pub reticle_type: u32,
+    /// `ReticleHealthType`: 1 the straight target-health bar under the
+    /// reticle, anything else the curved one (the same event).
+    pub health_type: u32,
 }
 
-/// `WeaponUI`'s reticle texture field (its name not found).
+/// `WeaponUI`'s reticle texture field, `ReticleTexture`.
 const UI_RETICLE: u32 = 0x0e36_56d4;
 
 /// How a soldier fires a gun, from its template's `WeaponHint` (names
@@ -1130,6 +1144,9 @@ pub fn machine_gun(armed: &[Mounted]) -> MachineGun<'_> {
 #[derive(Clone, Debug, Default)]
 pub struct Arms {
     pub weapons: HashMap<u32, WeaponSpec>,
+    /// The homing weapons' lock cones, degrees, by weapon template
+    /// (`HomingWeapon`'s third field: the Stinger's 10).
+    pub lock_cones: HashMap<u32, f32>,
     pub throwables: HashMap<u32, Throwable>,
     /// By vehicle template.
     pub armaments: HashMap<u32, Armament>,
@@ -1396,6 +1413,10 @@ pub fn read(db: &Layer<'_>) -> Arms {
                             reticle: Parts::first(&ui, id, UI_RETICLE).filter(|&t| t != 0)?,
                             crosshair: Parts::first(&ui, id, name_hash("bReticleCrosshair"))
                                 .is_some_and(|c| c & 0xff != 0),
+                            reticle_type: Parts::first(&ui, id, name_hash("ReticleType"))
+                                .unwrap_or(0),
+                            health_type: Parts::first(&ui, id, name_hash("ReticleHealthType"))
+                                .unwrap_or(0),
                         })
                     })(),
                     assist: assist_of(id),
@@ -1516,8 +1537,16 @@ pub fn read(db: &Layer<'_>) -> Arms {
         })
         .collect();
 
+    let lock_cones = lock
+        .templates()
+        .filter_map(|id| {
+            let l = *lock.of_template(id).first()?;
+            Some((id, lock.float(l, LOCK_CONE)?))
+        })
+        .collect();
     Arms {
         weapons,
+        lock_cones,
         throwables,
         armaments,
     }

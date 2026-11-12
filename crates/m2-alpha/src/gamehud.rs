@@ -845,6 +845,9 @@ pub struct HudState {
     /// where its target is on the screen (x right, y up, -1 to 1), while
     /// it is locking on one in view ([`STINGER_UPDATE`]).
     pub homing: Option<Option<(f32, [f32; 2])>>,
+    /// The homing launcher's lock cone, degrees, if its template says
+    /// ([`stinger_frame`]).
+    pub homing_cone: Option<f32>,
     /// The text of the scripts' context action in her reach
     /// (`Pg.AddContextAction`), for the game's own prompt
     /// ([`CONTEXT_ACTION`]).
@@ -1067,6 +1070,10 @@ impl HudState {
             },
             fired: game.combat.fired,
             ammo_shown: game.combat.ammo_shown,
+            homing_cone: game
+                .scene
+                .arms()
+                .and_then(|a| a.lock_cones.get(&game.combat.launcher.template?).copied()),
             picked: game.combat.picked,
             launcher: game.combat.launcher_rounds,
             rifle: game.combat.rifle_rounds,
@@ -4072,6 +4079,18 @@ impl Thread {
                 } else {
                     (icon, guid, reticle, crosshair)
                 };
+            // The weapon's own reticle kinds, where it has a `WeaponUI`
+            // record here: the gun in her rifle's place, a tank's machine
+            // gun.
+            let ui_kind = if let Some((ui, _, _)) = s.machine_gun.filter(|_| mg) {
+                Some((ui.reticle_type, ui.health_type))
+            } else if cannon || holding || s.weapon != Weapon::Rifle {
+                None
+            } else {
+                s.gun
+                    .as_ref()
+                    .map(|(_, _, ui)| (ui.reticle_type, ui.health_type))
+            };
             // What `MrxGuiHudReticle.HandleReticleGunSwitchEvent` reads:
             // without a type it leaves the reticle as it was. No target
             // health type: that bar shows only on a target. The crosshair
@@ -4084,7 +4103,11 @@ impl Thread {
                     ("uNewCurrentGunGuid", guid_value(guid)),
                     (
                         "sReticleType",
-                        Value::String(lua.create_string(reticle_type(homing_up, laser_up))?),
+                        Value::String(lua.create_string(reticle_type(
+                            homing_up,
+                            laser_up,
+                            ui_kind.map(|k| k.0),
+                        ))?),
                     ),
                     (
                         "uReticleTexture",
@@ -4093,6 +4116,17 @@ impl Thread {
                     ("bReticleCrosshair", Value::Boolean(crosshair)),
                 ],
             )?;
+            // The lock-on frame's size, as wide as the launcher's cone.
+            if let (Value::Table(t), Some(cone)) = (&t, s.homing_cone.filter(|_| homing_up)) {
+                let [w, h] = stinger_frame(cone, s.size[0] / s.size[1].max(1.0));
+                t.raw_set("nStingerReticleWidth", w)?;
+                t.raw_set("nStingerReticleHeight", h)?;
+            }
+            // The target-health bar's shape, sent with the record's other
+            // fields (360 0x8234F458).
+            if let (Value::Table(t), Some((_, health))) = (&t, ui_kind) {
+                t.raw_set("sReticleHealthType", health_type(health))?;
+            }
             fire(lua, "GuiWeaponEquippedUpdate", t)?;
         }
         // The lock-on reticle's word, every tick while a lock is coming
@@ -4906,16 +4940,54 @@ const STINGER_UPDATE: &str = "StingerReticleUpdate";
 
 /// `GuiWeaponEquippedUpdate`'s `sReticleType`. From the 360 code
 /// (`0x8234F458`): by the weapon's `WeaponUI` `ReticleType`, 1 `Homing`,
-/// 3 `Laser`, 4 `None`, anything else `Normal`; from the data the
-/// Stinger's is 1 (and the laser designator's 3). Here a launcher with a
-/// `HomingWeapon` is taken for type 1; the other types are not sent yet.
-fn reticle_type(homing: bool, laser: bool) -> &'static str {
-    if laser {
-        "Laser"
-    } else if homing {
-        "Homing"
+/// 3 `Laser`, 4 `None`, anything else `Normal`. `data` is that field
+/// where the weapon up has its record here; the laser designator and the
+/// launcher, which the HUD shows from constants, are told by `laser` and
+/// `homing` (from the data their types are 3 and, for the Stinger, 1).
+fn reticle_type(homing: bool, laser: bool, data: Option<u32>) -> &'static str {
+    match data {
+        _ if laser => "Laser",
+        _ if homing => "Homing",
+        Some(1) => "Homing",
+        Some(3) => "Laser",
+        Some(4) => "None",
+        _ => "Normal",
+    }
+}
+
+/// The engine's default camera field of view, radians (360 `0x821B6148`).
+const DEFAULT_CAMERA_FOV: f32 = 0.959_749_94;
+
+/// `GuiWeaponEquippedUpdate`'s `nStingerReticleWidth` and `...Height` for
+/// a homing weapon whose lock cone is `cone` degrees, on a screen `aspect`
+/// wide for its height.
+///
+/// From the 360 code (`0x8234F458`): the points tan(cone) x 10 to the
+/// side and above, 10 ahead, go through the default camera's projection
+/// (`0x8234EF98`: half width at distance 1 = tan(fov x 0.75 x aspect / 2)
+/// with fov 0.95975 rad, half height that over the aspect); each one's
+/// place on the screen (-1 to 1) times the screen's width or height is
+/// the size. So the frame is as wide as the cone. The script hands them
+/// to `SetStingerReticleDimensions`.
+///
+/// The sizes are given here in the HUD's 640 x 480 units; that the 360's
+/// screen width and height in this sum are in those units, not pixels,
+/// was not read.
+fn stinger_frame(cone: f32, aspect: f32) -> [f32; 2] {
+    let half_width = (DEFAULT_CAMERA_FOV * 0.75 * aspect / 2.0).tan();
+    let half_height = half_width / aspect;
+    let reach = cone.to_radians().tan();
+    [reach / half_width * 640.0, reach / half_height * 480.0]
+}
+
+/// `GuiWeaponEquippedUpdate`'s `sReticleHealthType`, by the record's
+/// `ReticleHealthType` (the same builder): 1 the straight bar, anything
+/// else the curved one.
+fn health_type(data: u32) -> &'static str {
+    if data == 1 {
+        "straight (bottom)"
     } else {
-        "Normal"
+        "curved"
     }
 }
 
@@ -6626,10 +6698,27 @@ mod tests {
     /// The lock-on reticle's type and the place its target box is told.
     #[test]
     fn the_lock_on_reticle_is_told_as_the_script_reads_it() {
-        assert_eq!(reticle_type(true, false), "Homing");
-        assert_eq!(reticle_type(false, false), "Normal");
+        assert_eq!(reticle_type(true, false, None), "Homing");
+        assert_eq!(reticle_type(false, false, None), "Normal");
         // The designator in her hands comes before the weapon behind it.
-        assert_eq!(reticle_type(true, true), "Laser");
+        assert_eq!(reticle_type(true, true, Some(0)), "Laser");
+        // By the weapon's own record: 1, 3 and 4; the guns' 0 and the TOW
+        // launchers' 2 are the normal one.
+        let by_data = |n| reticle_type(false, false, Some(n));
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(by_data),
+            ["Normal", "Homing", "Normal", "Laser", "None"]
+        );
+        // The Stinger's 10 degree cone at 16:9: as far across the screen
+        // as up it (the same share of 640 x 16 as of 480 x 9).
+        let [w, h] = stinger_frame(10.0, 16.0 / 9.0);
+        assert!(
+            (w - 151.6).abs() < 0.2 && (h - 202.1).abs() < 0.2,
+            "{w} {h}"
+        );
+        assert!((w / 640.0 * 16.0 - h / 480.0 * 9.0).abs() < 1e-3);
+        assert_eq!(health_type(1), "straight (bottom)");
+        assert_eq!([0, 2].map(health_type), ["curved", "curved"]);
         let lua = Lua::new();
         let Value::Table(on) = laser_state(&lua, true).unwrap() else {
             panic!()
