@@ -2174,6 +2174,10 @@ struct Told {
     weapon: Option<(Weapon, bool, bool, bool)>,
     /// The weapon told of was a homing launcher ([`HudState::homing`]).
     homing_up: bool,
+    /// The weapon told of was the laser designator, and the laser was
+    /// told to be on ([`LASER_STATE`]).
+    laser_up: bool,
+    lasing: bool,
     /// The template of the gun in her rifle's place ([`HudState::gun`]).
     gun: Option<u32>,
     ammo: Option<[i64; 5]>,
@@ -3977,12 +3981,22 @@ impl Thread {
         // A homing launcher in her hands (not the designator, nor a
         // vehicle's gun): its reticle is the lock-on one.
         let homing_up = s.homing.is_some() && !holding && !cannon && !mg;
+        // The laser designator in her hands: its reticle is the laser's.
+        let laser_up = s
+            .support
+            .designator
+            .as_deref()
+            .is_some_and(|d| d.contains("Laser"));
         if self.told.weapon != Some((s.weapon, holding, cannon, mg))
             || self.told.gun != gun
             || self.told.homing_up != homing_up
+            || self.told.laser_up != laser_up
         {
             self.told.weapon = Some((s.weapon, holding, cannon, mg));
             self.told.homing_up = homing_up;
+            self.told.laser_up = laser_up;
+            // The switch itself puts the laser's reticle back to rest.
+            self.told.lasing = false;
             self.told.gun = gun;
             // The gun in her rifle's place shows as its `WeaponUI` says,
             // and the gun box names it (playtest 4: her pistol showed the
@@ -4070,7 +4084,7 @@ impl Thread {
                     ("uNewCurrentGunGuid", guid_value(guid)),
                     (
                         "sReticleType",
-                        Value::String(lua.create_string(reticle_type(homing_up))?),
+                        Value::String(lua.create_string(reticle_type(homing_up, laser_up))?),
                     ),
                     (
                         "uReticleTexture",
@@ -4094,6 +4108,12 @@ impl Thread {
                 ],
             )?;
             fire(lua, STINGER_UPDATE, t)?;
+        }
+        // The laser coming on and going off before its mark is made.
+        let lasing = laser_up && s.support.lasing;
+        if lasing != self.told.lasing {
+            self.told.lasing = lasing;
+            fire(lua, LASER_STATE, laser_state(lua, lasing)?)?;
         }
         // Her explosive, as the engine's `GuiWeaponEquippedUpdate` carries it
         // when the equipped explosive changes (360 0x8234F458: its
@@ -4889,8 +4909,37 @@ const STINGER_UPDATE: &str = "StingerReticleUpdate";
 /// 3 `Laser`, 4 `None`, anything else `Normal`; from the data the
 /// Stinger's is 1 (and the laser designator's 3). Here a launcher with a
 /// `HomingWeapon` is taken for type 1; the other types are not sent yet.
-fn reticle_type(homing: bool) -> &'static str {
-    if homing { "Homing" } else { "Normal" }
+fn reticle_type(homing: bool, laser: bool) -> &'static str {
+    if laser {
+        "Laser"
+    } else if homing {
+        "Homing"
+    } else {
+        "Normal"
+    }
+}
+
+/// The engine's word to the laser designator's reticle (the layout's
+/// `Laser Reticle`, `MrxGuiHudReticle.HandleLaserReticleStateChangeEvent`).
+///
+/// From the 360 code (the designator's update, `0x823911F0`): as the
+/// laser comes on it sends `bActive` true with `nTime` 1.0; as it goes
+/// off with its mark not made yet, `bActive` false; when the mark is
+/// made it sends nothing (the weapon switch that follows resets the
+/// reticle). Both carry the player's guid, left out here.
+///
+/// From the script (data): active, the reticle's four arcs play and its
+/// arrow turns once every `nTime` seconds; otherwise it snaps to rest.
+const LASER_STATE: &str = "LaserState";
+
+/// [`LASER_STATE`]'s table.
+fn laser_state(lua: &Lua, active: bool) -> mlua::Result<Value> {
+    let t = lua.create_table()?;
+    t.raw_set("bActive", active)?;
+    if active {
+        t.raw_set("nTime", 1.0)?;
+    }
+    Ok(Value::Table(t))
 }
 
 /// A screen point (x right, y up, -1 to 1) in the HUD's 640 x 480 units,
@@ -6577,8 +6626,21 @@ mod tests {
     /// The lock-on reticle's type and the place its target box is told.
     #[test]
     fn the_lock_on_reticle_is_told_as_the_script_reads_it() {
-        assert_eq!(reticle_type(true), "Homing");
-        assert_eq!(reticle_type(false), "Normal");
+        assert_eq!(reticle_type(true, false), "Homing");
+        assert_eq!(reticle_type(false, false), "Normal");
+        // The designator in her hands comes before the weapon behind it.
+        assert_eq!(reticle_type(true, true), "Laser");
+        let lua = Lua::new();
+        let Value::Table(on) = laser_state(&lua, true).unwrap() else {
+            panic!()
+        };
+        assert!(on.get::<bool>("bActive").unwrap());
+        assert_eq!(on.get::<f64>("nTime").unwrap(), 1.0);
+        let Value::Table(off) = laser_state(&lua, false).unwrap() else {
+            panic!()
+        };
+        assert!(!off.get::<bool>("bActive").unwrap());
+        assert!(off.get::<Value>("nTime").unwrap().is_nil());
         assert_eq!(stinger_place([0.0, 0.0]), [320.0, 240.0]);
         assert_eq!(stinger_place([-1.0, 1.0]), [0.0, 0.0]);
         assert_eq!(stinger_place([1.0, -1.0]), [640.0, 480.0]);
