@@ -2118,7 +2118,21 @@ impl Mission {
     /// runs ([`OBJECT_SCRIPTS`]) and the script has that hook
     /// ([`crate::object_hooks`]). A failure is logged.
     fn object_hook(&mut self, guid: u32, hook: &str, args: Vec<mlua::Value>) {
-        let record = crate::object_hooks::record(self.layers.values().flatten(), guid);
+        // A layer's entity has its record; one spawned in play has its
+        // template's (noted as it was spawned, with the data its
+        // template's record gives).
+        let record =
+            crate::object_hooks::record(self.layers.values().flatten(), guid).or_else(|| {
+                let w = self.world.borrow();
+                let script = *w.scripted.get(&guid)?;
+                let template = w.objects.get(&guid)?.name.to_ascii_lowercase();
+                let data = w
+                    .template_scripts
+                    .get(&template)
+                    .filter(|(s, _)| *s == script)
+                    .and_then(|(_, d)| *d);
+                Some((script, data))
+            });
         let lua = self.host.lua();
         if let Err(e) = crate::object_hooks::call(lua, &OBJECT_SCRIPTS, record, hook, args) {
             self.log.push(format!(
@@ -3913,6 +3927,21 @@ mod tests {
             crate::events::guid_value(0x7687_df41)
         );
         assert_eq!(g.get::<u32>("state_data").unwrap(), 3);
+        // One spawned in play runs its template's script, and hears of
+        // its death with its template's data.
+        let spawned = {
+            let mut w = m.world.borrow_mut();
+            w.template_scripts
+                .insert("munitions (cash)".into(), (MUNITIONS, Some(21)));
+            w.spawn("Munitions (Cash)".into(), [0.0; 3], 0.0)
+        };
+        m.kill(spawned);
+        assert_eq!(g.get::<u32>("deaths").unwrap(), 3);
+        assert_eq!(
+            g.get::<Value>("dead").unwrap(),
+            crate::events::guid_value(spawned)
+        );
+        assert_eq!(g.get::<u32>("dead_data").unwrap(), 21);
         // An object with no script of its own: nothing is called.
         m.object_state_changed(0x999, 1, 2);
         assert_eq!(g.get::<u32>("states").unwrap(), 1);
