@@ -5041,7 +5041,7 @@ fn radar_views(
             Some(RadarView {
                 at,
                 icon,
-                colour: [r, g, bl, 255],
+                colour: [r, g, bl, b.alpha],
                 sticky: b.sticky,
                 sort: b.sort,
             })

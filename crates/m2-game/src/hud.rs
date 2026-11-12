@@ -60,6 +60,23 @@ pub struct Blip {
     /// blips set both.
     pub rotate: bool,
     pub oriented: bool,
+    /// Its opacity, 255 unless an animation fades it
+    /// ([`crate::radar_anim`]).
+    pub alpha: u8,
+    /// Its animations.
+    pub anims: crate::radar_anim::Anims,
+}
+
+impl Hud {
+    /// Moves the radar blips' animations on by `dt` seconds
+    /// ([`crate::radar_anim`]).
+    pub fn step_radar(&mut self, dt: f32) {
+        for b in self.radar.values_mut() {
+            if !b.anims.is_empty() {
+                b.anims.step(&mut b.size, &mut b.alpha, dt);
+            }
+        }
+    }
 }
 
 /// A disc on the ground round a target or a point (`Marker.AddDisc`).
@@ -476,6 +493,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 size: [f(7), f(8)],
                 rotate: matches!(a.get(12), Some(Value::Boolean(true))),
                 oriented: matches!(a.get(13), Some(Value::Boolean(true))),
+                alpha: 255,
+                anims: Default::default(),
             },
         );
         Ok(MultiValue::new())
@@ -562,6 +581,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 size: [f("nWidth", 3.0), f("nHeight", 3.0)],
                 rotate: flag("bRotate"),
                 oriented: flag("bOriented"),
+                alpha: 255,
+                anims: Default::default(),
             },
         );
         Ok(MultiValue::new())
@@ -571,6 +592,85 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             && let Some(name) = blip_name(t.raw_get::<Value>("sName").ok().as_ref())
         {
             hud.radar.remove(&name);
+        }
+        Ok(MultiValue::new())
+    })?;
+
+    // The blips' animations ([`crate::radar_anim`]), by the fields the
+    // HUD's interface hands the minimap: a size animation needs its
+    // duration and its four limits, an opacity one its duration and two
+    // limits (the natives answer nothing without them); the speeds default
+    // to 10 and 10, and 0.5.
+    add(&radar, "AnimateObjectiveSize", |hud, _, a| {
+        let Some(Value::Table(t)) = a.get(1) else {
+            return Ok(MultiValue::new());
+        };
+        let f = |k: &str| number(t.raw_get::<Value>(k).ok().as_ref()).map(|n| n as f32);
+        let (Some(left), Some(min_w), Some(min_h), Some(max_w), Some(max_h)) = (
+            f("nDuration"),
+            f("nMinWidth"),
+            f("nMinHeight"),
+            f("nMaxWidth"),
+            f("nMaxHeight"),
+        ) else {
+            return Ok(MultiValue::new());
+        };
+        if let Some(b) =
+            blip_name(t.raw_get::<Value>("sName").ok().as_ref()).and_then(|n| hud.radar.get_mut(&n))
+        {
+            // One of the kind at a time: the old one gives the size back.
+            b.anims.remove("size", &mut b.size, &mut b.alpha);
+            b.anims.size = Some(crate::radar_anim::SizeAnim {
+                left,
+                min: [min_w, min_h],
+                max: [max_w, max_h],
+                speed: [
+                    f("nSpeedWidth").unwrap_or(10.0),
+                    f("nSpeedHeight").unwrap_or(10.0),
+                ],
+                one_way: matches!(t.raw_get::<Value>("bOneWay"), Ok(Value::Boolean(true))),
+                original: b.size,
+            });
+        }
+        Ok(MultiValue::new())
+    })?;
+    add(&radar, "AnimateObjectiveAlpha", |hud, _, a| {
+        let Some(Value::Table(t)) = a.get(1) else {
+            return Ok(MultiValue::new());
+        };
+        let f = |k: &str| number(t.raw_get::<Value>(k).ok().as_ref()).map(|n| n as f32);
+        let (Some(left), Some(min), Some(max)) = (f("nDuration"), f("nMinAlpha"), f("nMaxAlpha"))
+        else {
+            return Ok(MultiValue::new());
+        };
+        if let Some(b) =
+            blip_name(t.raw_get::<Value>("sName").ok().as_ref()).and_then(|n| hud.radar.get_mut(&n))
+        {
+            b.anims.remove("alpha", &mut b.size, &mut b.alpha);
+            b.anims.alpha = Some(crate::radar_anim::AlphaAnim {
+                left,
+                min,
+                max,
+                speed: f("nSpeed").unwrap_or(0.5),
+                one_way: matches!(t.raw_get::<Value>("bOneWay"), Ok(Value::Boolean(true))),
+                value: f32::from(b.alpha) / 255.0,
+                original: b.alpha,
+            });
+        }
+        Ok(MultiValue::new())
+    })?;
+    add(&radar, "UnanimateObjective", |hud, _, a| {
+        let Some(Value::Table(t)) = a.get(1) else {
+            return Ok(MultiValue::new());
+        };
+        let kind = match t.raw_get::<Value>("sType") {
+            Ok(Value::String(s)) => s.to_string_lossy(),
+            _ => "all".to_owned(),
+        };
+        if let Some(b) =
+            blip_name(t.raw_get::<Value>("sName").ok().as_ref()).and_then(|n| hud.radar.get_mut(&n))
+        {
+            b.anims.remove(&kind, &mut b.size, &mut b.alpha);
         }
         Ok(MultiValue::new())
     })?;
@@ -1066,6 +1166,56 @@ mod tests {
             .unwrap();
         let w = world.borrow();
         assert!(w.hud.objectives.is_empty() && w.hud.radar.is_empty() && w.hud.markers.is_empty());
+    }
+
+    /// The scripts' animation calls reach the blip they name, step with
+    /// the HUD, and come off by kind.
+    #[test]
+    fn radar_blips_animate_as_the_scripts_ask() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        api::install(host.lua(), &world).unwrap();
+        host.lua()
+            .load(
+                r#"
+                Hud.Radar:AddObjective({ sName = "db_1", nWidth = 8, nHeight = 8 })
+                Hud.Radar:AnimateObjectiveSize({ sName = "db_1", nDuration = 0,
+                    nMinWidth = 8, nMinHeight = 8, nMaxWidth = 12, nMaxHeight = 12 })
+                Hud.Radar:AnimateObjectiveAlpha({ sName = "db_1", nDuration = 0,
+                    nMinAlpha = 0.5, nMaxAlpha = 1, nSpeed = -1 })
+                -- Without its limits, or for a blip that is not there: nothing.
+                Hud.Radar:AnimateObjectiveSize({ sName = "db_1", nDuration = 0 })
+                Hud.Radar:AnimateObjectiveSize({ sName = "none", nDuration = 0,
+                    nMinWidth = 1, nMinHeight = 1, nMaxWidth = 2, nMaxHeight = 2 })
+                "#,
+            )
+            .exec()
+            .unwrap();
+        {
+            let mut w = world.borrow_mut();
+            assert_eq!(w.hud.radar["db_1"].anims.size.unwrap().speed, [10.0, 10.0]);
+            w.hud.step_radar(0.25);
+            let b = &w.hud.radar["db_1"];
+            assert_eq!(b.size, [10.5, 10.5]);
+            assert_eq!(b.alpha, 191);
+        }
+        host.lua()
+            .load(r#"Hud.Radar:UnanimateObjective({ sName = "db_1", sType = "size" })"#)
+            .exec()
+            .unwrap();
+        {
+            let w = world.borrow();
+            let b = &w.hud.radar["db_1"];
+            assert_eq!(b.size, [8.0, 8.0]);
+            assert!(b.anims.size.is_none() && b.anims.alpha.is_some());
+        }
+        host.lua()
+            .load(r#"Hud.Radar:UnanimateObjective({ sName = "db_1" })"#)
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        assert_eq!(w.hud.radar["db_1"].alpha, 255);
+        assert!(w.hud.radar["db_1"].anims.is_empty());
     }
 
     /// The object scripts' blips (`Blippable`'s `Hud.Radar:AddObjective`
