@@ -201,6 +201,7 @@ mod tests {
             faction: None,
             path: Vec::new(),
             template: None,
+            alarm: false,
             crew: Vec::new(),
         };
         // No script, no record, whatever its data.
