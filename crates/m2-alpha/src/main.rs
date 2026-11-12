@@ -397,6 +397,21 @@ struct Options {
     /// With `--screenshot` on foot and `--gait`: she goes on this long
     /// (seconds, default 3), logging where she is each second.
     walk_seconds: Option<f32>,
+    /// `--knock-nearest <s>` with `--screenshot` on foot: that many
+    /// seconds in, she is put 1.2 m from the nearest person, facing
+    /// them, and bashes them a fifth of a second after; then each second
+    /// what that person does is logged (knock-check lines). With `r`
+    /// after the seconds (`4r`) they are run into instead, by a car that
+    /// is not there (1.5 t at 6 m/s, as the vehicles' ram is taken): for
+    /// checking a knockdown without playing a contract.
+    knock_nearest: Option<(f32, bool)>,
+    /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
+    /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
+    check_shots: Vec<f32>,
+    /// `--people-watch` with `--screenshot` on foot: each second, how
+    /// many people are in play by what they are doing, and the nearest
+    /// five's state, clip and distance (people-watch lines).
+    people_watch: bool,
     /// In play (the window, not `--screenshot`): open the pause menu as
     /// Escape would, this many seconds after play begins. For testing what
     /// pausing asks of the sound (the pause music).
@@ -984,6 +999,26 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--gates" => o.gates = true,
             "--marker-test" => o.marker_test = true,
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
+            "--knock-nearest" => {
+                let v = value()?;
+                let (seconds, ram) = match v.strip_suffix('r') {
+                    Some(s) => (s, true),
+                    None => (v.as_str(), false),
+                };
+                o.knock_nearest = Some((
+                    seconds
+                        .parse()
+                        .context("--knock-nearest expects seconds, or seconds and r")?,
+                    ram,
+                ));
+            }
+            "--check-shots" => {
+                for s in value()?.split(',') {
+                    o.check_shots
+                        .push(s.trim().parse().context("--check-shots expects seconds")?);
+                }
+            }
+            "--people-watch" => o.people_watch = true,
             "--pause-at" => o.pause_at = Some(value()?.parse()?),
             "--contracts" => {
                 o.contracts = value()?.parse().context("--contracts expects a count")?
@@ -2270,7 +2305,24 @@ fn screenshot(
             .map_or(180, |s| (s * 60.0).round() as usize);
         // `--npc-swim`: the soldier put in the water.
         let (mut swimmer, mut swim_gave_up): (Option<u32>, bool) = (None, false);
+        // `--knock-nearest`: the person picked (index into the people).
+        let mut knocked: Option<usize> = None;
+        let knock_tick = options
+            .knock_nearest
+            .map(|(s, ram)| ((s * 60.0).round() as usize, ram));
         for i in 0..ticks {
+            if let Some((at, _)) = knock_tick
+                && i == at
+            {
+                knocked = knock_pick(&mut game);
+            }
+            if let (Some((at, true)), Some(k)) = (knock_tick, knocked)
+                && i == at + 12
+            {
+                knock_ram(&mut game, k);
+            }
+            let knock_bash =
+                matches!(knock_tick, Some((at, false)) if i == at + 12) && knocked.is_some();
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
                 if i == 0 {
@@ -2329,7 +2381,7 @@ fn screenshot(
                 // The last shot's flash is still up for the picture.
                 fire: options.fire && i + 3 == ticks,
                 throw: options.throw && i == ticks - lead,
-                melee: options.bash && i == ticks - lead,
+                melee: (options.bash && i == ticks - lead) || knock_bash,
                 reload: options.reload && i == ticks - lead,
                 select: options.weapon.filter(|_| i == 0).or_else(|| {
                     (options.switch && i == ticks - lead).then_some(match game.combat.weapon {
@@ -2486,6 +2538,29 @@ fn screenshot(
                     },
                     at.distance(p.character.position)
                 );
+            }
+            if i % 60 == 59 {
+                let second = (i + 1) / 60;
+                if let Some(k) = knocked {
+                    knock_log(&game, k, second);
+                }
+                if options.people_watch {
+                    people_watch(&game, second);
+                }
+            }
+            let t = (i + 1) as f32 / 60.0;
+            for &s in options
+                .check_shots
+                .iter()
+                .filter(|&&s| t >= s && t - 1.0 / 60.0 < s)
+            {
+                render(&mut backend, &mut game, fov, aspect, None)?;
+                let stem = out
+                    .file_stem()
+                    .map_or("shot".into(), |n| n.to_string_lossy().into_owned());
+                let path = out.with_file_name(format!("{stem}-at{s}.ppm"));
+                write_ppm(&backend, &path)?;
+                eprintln!("check-shot: {s} s in: {}", path.display());
             }
             if i % 30 == 0 {
                 // Keep streaming around her as she goes.
@@ -5855,6 +5930,145 @@ fn look_at_story_character(game: &mut Game) {
 /// forward for four seconds (backing out first if it is parked close
 /// behind something, and steering round what it meets), printing how it
 /// went.
+/// `--knock-nearest`: puts her 1.2 m from the nearest person on their
+/// feet, facing them. Their index into the people, if anyone is about.
+fn knock_pick(game: &mut Game) -> Option<usize> {
+    let her = game.scene.player.as_ref()?.character.position;
+    let (k, there) = game
+        .scene
+        .people
+        .npcs
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.alive && n.landed && !n.held && n.down.is_none())
+        .map(|(k, n)| (k, n.character.position))
+        .min_by(|a, b| a.1.distance(her).total_cmp(&b.1.distance(her)))
+        .or_else(|| {
+            eprintln!("knock-check: nobody on their feet in play to knock down");
+            None
+        })?;
+    let back = (her - there)
+        .with_y(0.0)
+        .normalize_or(m2_math::glam::Vec3::X);
+    let p = game.scene.player.as_mut()?;
+    p.drop_at(there + back * 1.2);
+    p.facing = (-back.x).atan2(-back.z);
+    p.yaw = p.facing;
+    let n = &game.scene.people.npcs[k];
+    eprintln!(
+        "knock-check: person {k} ({:08x}, {}) at {there:.1}, {:.0} m off; she is put 1.2 m from them",
+        n.spawn.unwrap_or(0),
+        if n.soldier { "soldier" } else { "civilian" },
+        there.distance(her)
+    );
+    Some(k)
+}
+
+/// `--knock-nearest <s>r`: person `k` is run into by a car that is not
+/// there, coming from behind her at 6 m/s (1.5 t, a box 2 m wide and
+/// 4 m long), as [`npc::People::traffic`] takes a vehicle's ram.
+fn knock_ram(game: &mut Game, k: usize) {
+    use m2_math::glam::{Mat4, Quat, Vec3};
+    let Some(n) = game.scene.people.npcs.get(k) else {
+        return;
+    };
+    let there = n.character.position;
+    let her = game
+        .scene
+        .player
+        .as_ref()
+        .map_or(there - Vec3::Z, |p| p.character.position);
+    let way = (there - her).with_y(0.0).normalize_or(Vec3::Z);
+    let at = Mat4::from_rotation_translation(
+        Quat::from_rotation_y(way.x.atan2(way.z)),
+        there - way * 1.0,
+    );
+    let hp = n.hp;
+    let bounds = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
+    let killed = game.scene.people.traffic(
+        &[(at, way * 6.0, bounds, 1500.0)],
+        game.combat.damage_table.as_ref(),
+    );
+    let n = &game.scene.people.npcs[k];
+    eprintln!(
+        "knock-check: person {k} run into at 6 m/s: health {hp:.0} to {:.0}, {}, killed {killed}",
+        n.hp,
+        n.human_state()
+    );
+}
+
+/// `--knock-nearest`: what person `k` is doing, `second` seconds in.
+fn knock_log(game: &Game, k: usize, second: usize) {
+    let Some(n) = game.scene.people.npcs.get(k) else {
+        return;
+    };
+    let her = game
+        .scene
+        .player
+        .as_ref()
+        .map_or(n.character.position, |p| p.character.position);
+    let limp = n
+        .ragdoll
+        .and_then(|d| game.scene.world.as_ref()?.physics.ragdoll_nodes(d))
+        .and_then(|nodes| nodes.first().map(|m| m.w_axis.truncate()));
+    eprintln!(
+        "knock-check: {second} s: person {k} {}, {}, health {:.0}, at {:.1} ({:.1} m from her), clip {:08x}, limp body {}",
+        if n.alive { "alive" } else { "dead" },
+        n.human_state(),
+        n.hp,
+        n.character.position,
+        n.character.position.distance(her),
+        n.rig
+            .animator
+            .current()
+            .map_or(0, |(c, _)| n.rig.clips[c].hash),
+        limp.map_or("none".to_owned(), |p| format!("at {p:.1}")),
+    );
+}
+
+/// `--people-watch`: how many people are in play by what they are
+/// doing, and the nearest five to her, `second` seconds in.
+fn people_watch(game: &Game, second: usize) {
+    let Some(her) = game.scene.player.as_ref().map(|p| p.character.position) else {
+        return;
+    };
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    let mut near: Vec<(f32, usize)> = Vec::new();
+    for (k, n) in game.scene.people.npcs.iter().enumerate() {
+        if !n.alive || !n.landed {
+            continue;
+        }
+        let state = n.human_state();
+        match counts.iter_mut().find(|c| c.0 == state) {
+            Some(c) => c.1 += 1,
+            None => counts.push((state, 1)),
+        }
+        near.push((n.character.position.distance(her), k));
+    }
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let counts: Vec<String> = counts.iter().map(|(s, n)| format!("{n} {s}")).collect();
+    let near: Vec<String> = near
+        .iter()
+        .take(5)
+        .map(|&(d, k)| {
+            let n = &game.scene.people.npcs[k];
+            format!(
+                "{k}: {} {:08x} {d:.0} m",
+                n.human_state(),
+                n.rig
+                    .animator
+                    .current()
+                    .map_or(0, |(c, _)| n.rig.clips[c].hash)
+            )
+        })
+        .collect();
+    eprintln!(
+        "people-watch: {second} s: {}; nearest {}",
+        counts.join(", "),
+        near.join("; ")
+    );
+}
+
 /// With `--screenshot --drive --hijack`: puts her beside the nearest
 /// hijackable vehicle (`--vehicle`'s, if given), starts the hijack and
 /// answers its prompts at once ([`hijack::Autopad`]), and leaves her in the
