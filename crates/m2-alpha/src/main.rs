@@ -6052,13 +6052,17 @@ fn people_watch(game: &Game, second: usize) {
         .take(5)
         .map(|&(d, k)| {
             let n = &game.scene.people.npcs[k];
+            use m2_engine::face_expression::{ANGRY, BLINK, FLAP};
             format!(
-                "{k}: {} {:08x} {d:.0} m",
+                "{k}: {} {:08x} {d:.0} m, face blink {:.2} flap {:.2} angry {:.2}",
                 n.human_state(),
                 n.rig
                     .animator
                     .current()
-                    .map_or(0, |(c, _)| n.rig.clips[c].hash)
+                    .map_or(0, |(c, _)| n.rig.clips[c].hash),
+                n.face.weight(BLINK),
+                n.face.weight(FLAP),
+                n.face.weight(ANGRY),
             )
         })
         .collect();
