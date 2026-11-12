@@ -314,6 +314,9 @@ pub struct Templates {
     /// What each template with a `SoundEffect` plays as its objects come
     /// into being, by id ([`crate::spawn_sound`]).
     pub spawn_sounds: HashMap<u32, crate::spawn_sound::SpawnSound>,
+    /// The AI's class of each vehicle template's driver, by the
+    /// vehicle's id ([`crate::vehicle_class`]).
+    pub vehicle_classes: HashMap<u32, u8>,
     /// Each template's exhausts, by id ([`crate::vehicle_parts`]).
     pub exhausts: HashMap<u32, Vec<crate::vehicle_parts::Exhaust>>,
     /// Each template's `Winch`, by id ([`crate::winch`]).
@@ -954,6 +957,24 @@ impl Templates {
             .map(|(bank, _)| bank)
     }
 
+    /// The AI's class of the driver of a vehicle of `model`
+    /// ([`crate::vehicle_class`]): that of most of the model's templates
+    /// that have one, else [`crate::vehicle_class::OTHER`].
+    pub fn vehicle_class_for_model(&self, model: u32) -> u8 {
+        let mut counts: HashMap<u8, usize> = HashMap::new();
+        for (id, t) in &self.infos {
+            if t.model == Some(model)
+                && let Some(&c) = self.vehicle_classes.get(id)
+            {
+                *counts.entry(c).or_default() += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .max_by_key(|&(class, n)| (n, std::cmp::Reverse(class)))
+            .map_or(crate::vehicle_class::OTHER, |(class, _)| class)
+    }
+
     /// The sound set most templates of `model` with an engine name in
     /// their `SoundEffect` ([`crate::spawn_sound::SpawnSound::engine`]):
     /// the set its engine's start and stop are heard from.
@@ -1089,6 +1110,7 @@ impl Templates {
             hijack: crate::hijack::read(&db),
             music_sources: crate::music_source::read(&db),
             spawn_sounds: crate::spawn_sound::read(&db),
+            vehicle_classes: crate::vehicle_class::read(&db),
             exhausts: crate::vehicle_parts::read(&db),
             winches: crate::winch::read(&db),
             connect_points: crate::winch::connect_points(&db),

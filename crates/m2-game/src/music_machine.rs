@@ -87,11 +87,12 @@ impl Hostility {
 /// Which of [`Hostility`]'s four groups a hostile character aware of the
 /// player counts in, by the AI's class of them.
 ///
-/// From the 360 code: the class is set from the vehicle the character
-/// is in (`0x822BB608`): 0 none, 1 a car (the vehicle has a
-/// `ControllerCar`), 2 a tank (`ControllerTank`), 3 a helicopter
-/// (`ControllerHelicopter`), 4 a boat (`ControllerBoat`), 7 a turret, 6
-/// any other vehicle. The music's count (`0x822DD7C8`) puts 3 and 8 in
+/// From the 360 code: the class is set from the seat the character is
+/// in (`0x822BB608`): 0 none, 1 a car's driver (the seat has a
+/// `ControllerCar`), 2 a tank's (`ControllerTank`), 3 a helicopter's
+/// (`ControllerHelicopter`), 4 a boat's (`ControllerBoat`), 7 a turret
+/// seat, 6 any other seat. The controllers are on the driver seats (from
+/// the data), so only drivers and pilots have classes 1 to 4. The music's count (`0x822DD7C8`) puts 3 and 8 in
 /// the first group, 2 and 4 in the second, 1 and 5 in the third and
 /// the rest in the fourth. (Nothing found sets 5 or 8.)
 pub fn group(class: u8) -> usize {
@@ -571,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn the_groups_are_helicopters_tanks_and_boats_cars_and_the_rest() {
+    fn the_groups_are_pilots_tank_and_boat_drivers_car_drivers_and_the_rest() {
         assert_eq!([group(3), group(8)], [0, 0]);
         assert_eq!([group(2), group(4)], [1, 1]);
         assert_eq!([group(1), group(5)], [2, 2]);

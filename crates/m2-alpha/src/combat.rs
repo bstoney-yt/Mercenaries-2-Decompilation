@@ -4305,6 +4305,17 @@ impl Combat {
         }
     }
 
+    /// The vehicles whose crews have settled on her: one entry (the
+    /// vehicle's place in the scene's list) for each armed seat whose
+    /// foe she is.
+    pub fn crews_on_her(&self) -> Vec<usize> {
+        self.crews
+            .iter()
+            .filter(|(_, gun)| gun.slot.who == Some(crate::npc::HER))
+            .map(|(&(i, _), _)| i)
+            .collect()
+    }
+
     /// The vehicles whose guns have a foe, each with where that foe is
     /// and whether it is a vehicle, its first seat's that has one.
     pub fn crew_foes(&self, driving: bool) -> Vec<(usize, Vec3, bool)> {

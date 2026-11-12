@@ -1088,6 +1088,8 @@ pub struct MissionLink {
     saves: Vec<String>,
     /// Steps to the next look at her support stock.
     stock_look: u32,
+    /// The counts last given to the score's action level (for the log).
+    music_aware: [u32; 4],
     /// Her support stock by item key, as last looked at.
     stock_counts: Vec<(String, u32)>,
     /// Aimed designators' marks (guid, where) waiting to settle, and the
@@ -1240,6 +1242,7 @@ impl MissionLink {
             sighted: HashMap::new(),
             saves: Vec::new(),
             stock_look: 0,
+            music_aware: [0; 4],
             stock_counts: Vec::new(),
             aimed: Vec::new(),
             landed: HashSet::new(),
@@ -3362,9 +3365,12 @@ impl MissionLink {
             let spare = game.combat.rifle_rounds.stored;
             mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
             crate::spans::time("scripts: look", || look(game, mission, &mut self.sighted));
-            // The score's action level: the soldiers on foot turned on
-            // her are the fourth group. Hostile vehicle crews (the other
-            // three) are not counted yet.
+            // The score's action level, from those hostile and aware of
+            // her, grouped as the 360 does by the seat they are in: the
+            // soldiers on foot turned on her and each vehicle gunner
+            // settled on her are the fourth group; the driver of a
+            // vehicle with such a gunner counts by its kind (inferred:
+            // the game does not say what a driver is aware of).
             let on_foot = game
                 .scene
                 .people
@@ -3374,6 +3380,29 @@ impl MissionLink {
                 .count();
             let mut aware = [0; 4];
             aware[m2_game::music_machine::group(0)] = on_foot as u32;
+            if let Some(world) = game.scene.world.as_ref() {
+                let mut crews = game.combat.crews_on_her();
+                aware[m2_game::music_machine::group(m2_engine::vehicle_class::TURRET)] +=
+                    crews.len() as u32;
+                crews.sort_unstable();
+                crews.dedup();
+                for i in crews {
+                    if let Some(v) = game.scene.vehicles.get(i).filter(|v| v.exhausting(false)) {
+                        let class = world
+                            .index
+                            .template_db
+                            .vehicle_class_for_model(v.spec.model);
+                        aware[m2_game::music_machine::group(class)] += 1;
+                    }
+                }
+                if aware != self.music_aware {
+                    eprintln!(
+                        "music: hostile and aware of her, by group (helicopter pilots, tank \
+                         and boat drivers, car drivers, the rest): {aware:?}"
+                    );
+                    self.music_aware = aware;
+                }
+            }
             mission.set_hostile_aware(aware);
             crate::spans::time("scripts: lua", || mission.tick(f64::from(STEP)));
             // The scripts' own interface runs too: its animations finish
