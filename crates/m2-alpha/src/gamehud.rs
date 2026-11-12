@@ -4132,7 +4132,7 @@ impl Thread {
         // The lock-on reticle's word, every tick while a lock is coming
         // on a target in view (the script hides it after a tick without).
         if let Some(Some((share, at))) = s.homing.filter(|_| homing_up) {
-            let [x, y] = stinger_place(at);
+            let [x, y] = stinger_place(at, s.size[0] / s.size[1].max(1.0));
             let t = table(
                 lua,
                 [
@@ -4970,14 +4970,22 @@ const DEFAULT_CAMERA_FOV: f32 = 0.959_749_94;
 /// the size. So the frame is as wide as the cone. The script hands them
 /// to `SetStingerReticleDimensions`.
 ///
-/// The sizes are given here in the HUD's 640 x 480 units; that the 360's
-/// screen width and height in this sum are in those units, not pixels,
-/// was not read.
+/// The 360's sizes are screen pixels: the screen's width and height in
+/// that sum are a viewport's, in pixels, and the script sets the frame
+/// with `SetCorrectedLocation` (corrected boxes are screen pixels; the
+/// widget correction `0x82390550` scales a box's size by the screen's
+/// height over 480). The port's widgets keep virtual units and scale them
+/// by that same height factor when drawing, so the sizes are given here
+/// as pixels over it: a share of the width times 480 x aspect, a share of
+/// the height times 480. The frame comes out as wide as it is high.
 fn stinger_frame(cone: f32, aspect: f32) -> [f32; 2] {
     let half_width = (DEFAULT_CAMERA_FOV * 0.75 * aspect / 2.0).tan();
     let half_height = half_width / aspect;
     let reach = cone.to_radians().tan();
-    [reach / half_width * 640.0, reach / half_height * 480.0]
+    [
+        reach / half_width * 480.0 * aspect,
+        reach / half_height * 480.0,
+    ]
 }
 
 /// `GuiWeaponEquippedUpdate`'s `sReticleHealthType`, by the record's
@@ -5014,12 +5022,20 @@ fn laser_state(lua: &Lua, active: bool) -> mlua::Result<Value> {
     Ok(Value::Table(t))
 }
 
-/// A screen point (x right, y up, -1 to 1) in the HUD's 640 x 480 units,
-/// y down, for the lock-on reticle's `nX` and `nY`: the script puts the
-/// target box's middle there (`SetLocation`). That the 360's projection
-/// answers in these units is inferred from that, not read from its code.
-fn stinger_place([x, y]: [f32; 2]) -> [f32; 2] {
-    [(x + 1.0) * 320.0, (1.0 - y) * 240.0]
+/// A screen point (x right, y up, -1 to 1) as the lock-on reticle's `nX`
+/// and `nY` on a screen `aspect` wide for its height: the script puts
+/// the target box's middle there (`SetLocation`).
+///
+/// From the 360 code: the script turns the box's resolution correction
+/// off (`SetWidgetUseResolutionCorrection`), and the widget correction
+/// (`0x82390550`) then leaves such a widget's place as it is given, in
+/// screen pixels, scaling only its size. So the engine's `nX` and `nY`
+/// are pixels. The port draws the box through its parent's centred
+/// correction (virtual units times the screen's height over 480, centred
+/// on the screen), so the same pixel is given here in those units: 320
+/// plus x times 240 times the aspect, and 240 less y times 240.
+fn stinger_place([x, y]: [f32; 2], aspect: f32) -> [f32; 2] {
+    [320.0 + x * 240.0 * aspect, (1.0 - y) * 240.0]
 }
 
 /// The explosive half of `GuiWeaponEquippedUpdate` (360 0x8234F458, its
@@ -6713,10 +6729,12 @@ mod tests {
         // as up it (the same share of 640 x 16 as of 480 x 9).
         let [w, h] = stinger_frame(10.0, 16.0 / 9.0);
         assert!(
-            (w - 151.6).abs() < 0.2 && (h - 202.1).abs() < 0.2,
+            (w - 202.1).abs() < 0.2 && (h - 202.1).abs() < 0.2,
             "{w} {h}"
         );
-        assert!((w / 640.0 * 16.0 - h / 480.0 * 9.0).abs() < 1e-3);
+        // Whatever the screen's shape: the cone is round.
+        let [w, h] = stinger_frame(10.0, 4.0 / 3.0);
+        assert!((w - h).abs() < 1e-3, "{w} {h}");
         assert_eq!(health_type(1), "straight (bottom)");
         assert_eq!([0, 2].map(health_type), ["curved", "curved"]);
         let lua = Lua::new();
@@ -6730,9 +6748,13 @@ mod tests {
         };
         assert!(!off.get::<bool>("bActive").unwrap());
         assert!(off.get::<Value>("nTime").unwrap().is_nil());
-        assert_eq!(stinger_place([0.0, 0.0]), [320.0, 240.0]);
-        assert_eq!(stinger_place([-1.0, 1.0]), [0.0, 0.0]);
-        assert_eq!(stinger_place([1.0, -1.0]), [640.0, 480.0]);
+        // At 4:3 the virtual screen is the screen; at 16:9 its edges are
+        // 106.7 units past the virtual screen's on each side.
+        assert_eq!(stinger_place([0.0, 0.0], 16.0 / 9.0), [320.0, 240.0]);
+        assert_eq!(stinger_place([-1.0, 1.0], 4.0 / 3.0), [0.0, 0.0]);
+        assert_eq!(stinger_place([1.0, -1.0], 4.0 / 3.0), [640.0, 480.0]);
+        let [x, y] = stinger_place([1.0, -1.0], 16.0 / 9.0);
+        assert!((x - 746.67).abs() < 0.01 && y == 480.0, "{x} {y}");
     }
 
     /// The context action in reach goes to the script's
