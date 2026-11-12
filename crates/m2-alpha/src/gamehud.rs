@@ -4928,6 +4928,15 @@ impl MapView {
         )
     }
 
+    /// Which way the world direction (`dx`, `dz`) points on the map,
+    /// degrees clockwise from straight up (as [`Self::screen`] lays it).
+    fn bearing(&self, dx: f32, dz: f32) -> f32 {
+        let (s, c) = self.heading.to_radians().sin_cos();
+        let ahead = dx * s + dz * c;
+        let right = -dx * c + dz * s;
+        right.atan2(ahead).to_degrees()
+    }
+
     /// The world `(x, z)` that shows at `angle` degrees clockwise from
     /// straight up, `along` (0..=1) of the way to the rim.
     fn world(&self, angle: f32, along: f32) -> [f32; 2] {
@@ -5467,9 +5476,15 @@ fn minimap(
         };
         let hash = name_hash(&b.icon);
         want.push(hash);
-        let s = r * 0.16;
+        let [w, h] = blip_half_size(b.size).map(|v| v * r / RADAR_RADIUS);
         let c = b.colour.map(|v| f32::from(v) / 255.0);
-        out.push(quad(Some(hash), [x - s, y - s, x + s, y + s], full, c, 0.0));
+        out.push(quad(
+            Some(hash),
+            [x - w, y - h, x + w, y + h],
+            full,
+            c,
+            blip_turn(view, b),
+        ));
     }
     // Her: a white square, upright whichever way she faces (the map turns
     // with the camera, not with her).
@@ -5481,6 +5496,44 @@ fn minimap(
         white,
         0.0,
     ));
+}
+
+/// The radar's radius in its own units (the [`BORDER`]'s minimap is 100
+/// across).
+const RADAR_RADIUS: f32 = 50.0;
+
+/// A blip's half width and height in the radar's units. From the 360
+/// code: the minimap's icon draw (`0x823871F8`) makes the quad from
+/// (x - width, y - height) to (x + width, y + height), each times the
+/// screen's scale, so the scripts' `nWidth` and `nHeight` are half sizes
+/// (10.667 for an objective's, 5 for a vehicle's). A blip with no size
+/// (0) keeps the size the port drew every blip at before, 8.
+fn blip_half_size(size: [f32; 2]) -> [f32; 2] {
+    size.map(|v| if v > 0.0 { v } else { 8.0 })
+}
+
+/// How far a blip's icon is turned, degrees clockwise. From the 360 code:
+/// the minimap's objective update (`0x82388320`) keeps an angle per blip,
+/// 0 unless it is `bOriented` and has a target, when it is minus the
+/// target's heading; the renderer (`0x823879D0`) adds the map's own
+/// rotation to it when the blip is `bRotate` and hands the sum to the
+/// icon's draw. So an oriented, rotating blip (a vehicle's, a plane's)
+/// points the way its target goes on the turning map; a rotating one
+/// alone turns with the map; an oriented one alone turns as on a
+/// north-up map. Here the same angles are taken from the view's own
+/// projection, whatever way it counts headings.
+fn blip_turn(view: &MapView, b: &crate::mission::RadarView) -> f32 {
+    let north = view.bearing(0.0, 1.0);
+    let heading = b
+        .yaw
+        .filter(|_| b.oriented)
+        .map(|yaw| view.bearing(yaw.sin(), yaw.cos()) - north);
+    match (heading, b.rotate) {
+        (Some(h), true) => h + north,
+        (Some(h), false) => h,
+        (None, true) => north,
+        (None, false) => 0.0,
+    }
 }
 
 /// How far past the rim a sticky blip out of range sits: 2 of the
@@ -6509,6 +6562,58 @@ mod tests {
         );
         assert_eq!(parse_pair(" 12.7,-3x"), Some([12, -3]));
         assert_eq!(parse_pair("12"), None);
+    }
+
+    /// A blip's icon is as big as the scripts say (half sizes, in the
+    /// radar's units) and turned as the 360's minimap turns it: by its
+    /// target's heading when oriented, with the map when rotating.
+    #[test]
+    fn blips_are_sized_and_turned_as_the_minimap_does() {
+        use crate::mission::RadarView;
+        assert_eq!(blip_half_size([5.0, 5.0]), [5.0, 5.0]);
+        assert_eq!(blip_half_size([10.667, 0.0]), [10.667, 8.0]);
+        let view = |heading: f32| MapView {
+            rect: [0.0, 0.0, 100.0, 100.0],
+            player: [0.0; 3],
+            heading,
+            range: 100.0,
+        };
+        let blip = |yaw: Option<f32>, rotate: bool, oriented: bool| RadarView {
+            at: Vec3::ZERO,
+            icon: String::new(),
+            colour: [255; 4],
+            sticky: false,
+            sort: 5,
+            size: [5.0, 5.0],
+            yaw,
+            rotate,
+            oriented,
+        };
+        let near = |a: f32, b: f32| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs() < 1e-3;
+        let east = std::f32::consts::FRAC_PI_2;
+        for heading in [0.0_f32, 90.0, 215.0] {
+            let v = view(heading);
+            let north = v.bearing(0.0, 1.0);
+            // Neither: upright. Rotating alone: with the map.
+            assert_eq!(blip_turn(&v, &blip(Some(east), false, false)), 0.0);
+            assert!(near(blip_turn(&v, &blip(None, true, false)), north));
+            // A vehicle's (both): the way it goes, as the map shows it:
+            // where the map puts a point ahead of it.
+            let both = blip_turn(&v, &blip(Some(east), true, true));
+            let ([x, y], _) = v.screen(1.0, 0.0);
+            let [cx, cy] = v.centre();
+            assert!(near(both, (x - cx).atan2(cy - y).to_degrees()), "{heading}");
+            // Oriented alone: its heading on a map that does not turn.
+            let alone = blip_turn(&v, &blip(Some(east), false, true));
+            assert!(near(alone, both - north), "{heading}");
+            // Oriented with no target: nothing to take a heading from.
+            assert!(near(blip_turn(&v, &blip(None, true, true)), north));
+        }
+        // Facing north on a north-up map it is upright.
+        assert!(near(
+            blip_turn(&view(0.0), &blip(Some(0.0), true, true)),
+            0.0
+        ));
     }
 
     /// The context action in reach goes to the script's
