@@ -4614,21 +4614,7 @@ impl MissionLink {
         };
         let w = mission.world().borrow();
         let hud = &w.hud;
-        // The objectives on the map, else the mission's list.
-        let mut objectives: Vec<String> = hud
-            .objectives
-            .iter()
-            .filter(|(name, _)| !name.ends_with("_PreMission"))
-            .map(|(_, o)| mission.text(&o.text))
-            .collect();
-        if objectives.is_empty() {
-            objectives = hud.mission.iter().map(|(t, _)| mission.text(t)).collect();
-        }
-        // Each text once, in order: the map has an objective for each
-        // target, with its job's text (a log listed "Destroy targets
-        // (0/13)" six times for two jobs' 26 targets).
-        let mut seen = HashSet::new();
-        objectives.retain(|o| seen.insert(o.clone()));
+        let objectives = objective_texts(mission, hud);
         let discs = hud
             .discs
             .values()
@@ -4703,6 +4689,56 @@ impl MissionLink {
             pickup_markers: hud.pickup_markers,
         }
     }
+
+    /// [`view`](Self::view)'s objectives alone. The whole view costs 3 to
+    /// 6 ms in a busy contract (its markers, radar and the scripts' kept
+    /// tables), which the autoplay run paid three times a tick for three
+    /// of its fields; these three read only what they give.
+    pub fn objectives(&self) -> Vec<String> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        objective_texts(mission, &mission.world().borrow().hud)
+    }
+
+    /// [`view`](Self::view)'s HUD calls numbered after `seq`, oldest
+    /// first: only those are read (up to 512 are kept, each with a copy
+    /// of its data, and reading them all cost 3 to 5 ms).
+    pub fn hud_calls_after(&self, seq: u64) -> Vec<HudCall> {
+        match &self.state {
+            State::Running(mission) => hud_calls_after(mission.lua(), seq),
+            _ => Vec::new(),
+        }
+    }
+
+    /// [`view`](Self::view)'s tutorial text alone, its keys named.
+    pub fn tutorial(&self) -> Option<String> {
+        if !matches!(self.state, State::Running(_)) {
+            return None;
+        }
+        self.tutorial
+            .as_ref()
+            .map(|t| crate::input::name_keys(t, &self.keys))
+    }
+}
+
+/// The objectives on the map, else the mission's list, each text once.
+fn objective_texts(mission: &Mission, hud: &m2_game::hud::Hud) -> Vec<String> {
+    let mut objectives: Vec<String> = hud
+        .objectives
+        .iter()
+        .filter(|(name, _)| !name.ends_with("_PreMission"))
+        .map(|(_, o)| mission.text(&o.text))
+        .collect();
+    if objectives.is_empty() {
+        objectives = hud.mission.iter().map(|(t, _)| mission.text(t)).collect();
+    }
+    // Each text once, in order: the map has an objective for each
+    // target, with its job's text (a log listed "Destroy targets
+    // (0/13)" six times for two jobs' 26 targets).
+    let mut seen = HashSet::new();
+    objectives.retain(|o| seen.insert(o.clone()));
+    objectives
 }
 
 /// Makes the player of `mission` (the mission's scripts, the hijack
@@ -4856,6 +4892,29 @@ fn let_go_hud_calls(lua: &mlua::Lua, seq: u64) {
         )
         .set_name("=m2-hud calls let go")
         .call::<()>(seq as f64);
+}
+
+/// The calls [`HUD_CALLS`] keeps numbered after `seq`, oldest first: by
+/// number up to the latest (`__m2_hud_call_count`), so those seen already
+/// aren't read again.
+fn hud_calls_after(lua: &mlua::Lua, seq: u64) -> Vec<HudCall> {
+    let g = lua.globals();
+    let (Ok(Some(calls)), Ok(Some(latest))) = (
+        g.get::<Option<mlua::Table>>("__m2_hud_calls"),
+        g.get::<Option<u64>>("__m2_hud_call_count"),
+    ) else {
+        return Vec::new();
+    };
+    (seq + 1..=latest)
+        .filter_map(|k| calls.raw_get::<Option<mlua::Table>>(k).ok().flatten())
+        .map(|t| HudCall {
+            seq: t.get("seq").unwrap_or(0),
+            group: t.get("group").unwrap_or_default(),
+            method: t.get("method").unwrap_or_default(),
+            data: Plain::of(&t.get("data").unwrap_or(mlua::Value::Nil)),
+            callback: t.get("callback").unwrap_or(false),
+        })
+        .collect()
 }
 
 /// The calls [`HUD_CALLS`] keeps, oldest first.
@@ -9040,6 +9099,9 @@ mod tests {
                 .filter(|&s| s > last)
                 .collect();
             assert_eq!(new.len(), n, "after adding {n}: {new:?}");
+            // Read by number, the same ones.
+            let after: Vec<u64> = hud_calls_after(&lua, last).iter().map(|c| c.seq).collect();
+            assert_eq!(after, new);
             last = new.last().copied().unwrap_or(last);
             let_go_hud_calls(&lua, last);
             assert!(hud_calls(&lua).is_empty());
