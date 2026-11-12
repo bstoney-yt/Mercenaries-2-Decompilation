@@ -442,6 +442,20 @@ impl View {
         }
     }
 
+    /// The same view between other near and far distances: the picture's
+    /// width and height (the projection's x and y scales) kept.
+    pub fn with_near_far(mut self, near: f32, far: f32) -> Self {
+        let (x, y) = (self.projection.x_axis.x, self.projection.y_axis.y);
+        // Reversed depth, as `perspective`: the planes swapped.
+        let mut p = Mat4::perspective_rh(1.0, 1.0, far, near);
+        p.x_axis.x = x;
+        p.y_axis.y = y;
+        self.projection = p;
+        self.near = near;
+        self.far = far;
+        self
+    }
+
     /// The camera's world position.
     pub fn eye(&self) -> Vec3 {
         self.view.inverse().w_axis.truncate()
@@ -554,4 +568,25 @@ pub trait RenderBackend {
 
     /// Closes the frame and presents it.
     fn end_frame(&mut self) -> Result<(), BackendError>;
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn other_near_and_far_keep_the_pictures_shape() {
+        let v = View::perspective(Vec3::ZERO, Vec3::NEG_Z, 0.8, 16.0 / 9.0, 0.2, 2400.0);
+        let w = v.with_near_far(0.3, 500.0);
+        assert_eq!(w.projection.x_axis.x, v.projection.x_axis.x);
+        assert_eq!(w.projection.y_axis.y, v.projection.y_axis.y);
+        assert_eq!((w.near, w.far), (0.3, 500.0));
+        // Reversed depth: the near plane at depth 1, the far at 0.
+        let depth = |z: f32| {
+            let c = w.projection * m2_math::glam::Vec4::new(0.0, 0.0, -z, 1.0);
+            c.z / c.w
+        };
+        assert!((depth(0.3) - 1.0).abs() < 1e-5);
+        assert!(depth(500.0).abs() < 1e-5);
+    }
 }

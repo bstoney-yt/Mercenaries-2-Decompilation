@@ -180,6 +180,12 @@ pub struct Game {
     /// Lights blasts' scripts set, seconds before each comes in
     /// ([`m2_game::atmosphere_script`]).
     script_lights: Vec<(f32, ScriptAtmosphere)>,
+    /// The first view's field of view (radians) and near and far distances
+    /// as the scripts change them (`Graphics.Camera.SetFovParams`,
+    /// `SetNearFar`), and how many calls each has taken.
+    pub fov_blend: m2_engine::camera_blend::Blend<1>,
+    pub near_far_blend: m2_engine::camera_blend::Blend<2>,
+    pub camera_calls: [u32; 2],
     /// Props that move on their own.
     moving: MovingProps,
     /// Her support: the items she holds and the call under way; her
@@ -488,6 +494,12 @@ impl Game {
             spray_wait: 0.0,
             sky: AtmosphereMix::default(),
             script_lights: Vec::new(),
+            fov_blend: m2_engine::camera_blend::Blend::new([m2_engine::projection::FOV]),
+            near_far_blend: m2_engine::camera_blend::Blend::new([
+                m2_engine::projection::NEAR,
+                m2_engine::projection::FAR,
+            ]),
+            camera_calls: [0; 2],
             moving: MovingProps::default(),
             support: Support::default(),
             earned: Vec::new(),
@@ -3440,6 +3452,12 @@ impl Game {
     /// Where the frame is seen from: her camera (shaken by a bomb close
     /// by), the satellite's while she looks through it, or the free one.
     pub fn view(&self, fov: f32, aspect: f32) -> View {
+        // The scripts' field of view: the game's own (the configured one
+        // here) moved by as much as the scripted one is from the game's
+        // default, so a player's wider setting stays wider under it
+        // (the offset is the port's; at the default setting it is the
+        // game's value itself).
+        let fov = fov + (self.fov_blend.current[0] - m2_engine::projection::FOV).to_degrees();
         let shot = self
             .shot
             .as_ref()
@@ -3456,6 +3474,14 @@ impl Game {
                 None => self.camera.view(fov, aspect),
             },
         };
+        // The scripts' near and far distances (not the satellite's view,
+        // which has its own).
+        let [near, far] = self.near_far_blend.current;
+        if self.support.looking().is_none()
+            && [near, far] != [m2_engine::projection::NEAR, m2_engine::projection::FAR]
+        {
+            view = view.with_near_far(near, far);
+        }
         if let Some((a, b)) = self.support.shake_turn()
             && self.support.looking().is_none()
         {
