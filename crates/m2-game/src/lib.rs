@@ -20,6 +20,7 @@ pub mod library;
 pub mod links;
 pub mod mission;
 pub mod music;
+pub mod object_hooks;
 pub mod path_order;
 pub mod player_target;
 pub mod ported;
