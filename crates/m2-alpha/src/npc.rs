@@ -52,9 +52,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::scene::{Carry, Rig};
 
-/// The most subjects a soldier looks over for a target at each look,
-/// nearest first (invented: the frame rate's limit; the 360 queues its
-/// sight lines and runs at most 0x800 a frame, 0x822E8DF8).
+/// The most foes [`People::foes_of`] gives, nearest first (invented;
+/// soldiers' own target looks go by the 360's lanes instead,
+/// [`m2_engine::ai_target::lane`]).
 const FOE_LOOKS: usize = 4;
 /// A vehicle of an army, as those at war with it see it.
 #[derive(Clone, Copy, Debug)]
@@ -77,6 +77,8 @@ pub struct VehicleSubject {
     pub priority: bool,
     /// Its body, left out of the sight lines to it.
     pub vehicle: Option<m2_engine::VehicleId>,
+    /// How fast it goes, m/s, for how often soldiers look at it.
+    pub speed: f32,
     /// What it is (its `ObjectHint`), for what a soldier's weapons are
     /// worth against it.
     pub hint: m2_engine::ai_target::Hint,
@@ -986,7 +988,12 @@ pub struct Npc {
     /// That vehicle's body, which their sight lines to it pass through.
     foe_body: Option<m2_engine::VehicleId>,
     /// Until they next look for a target, seconds.
-    foe_look: f32,
+    /// His perception lanes' timers ([`m2_engine::ai_target::Lanes`]).
+    lanes: m2_engine::ai_target::Lanes,
+    /// Whom his last sight line found, still in reach: he goes on rating
+    /// them each think between looks, as the 360 rates the perception
+    /// records it keeps (0x822DDF50); her by [`HER`].
+    known: Vec<u32>,
     /// From how far they can see the one they look at, unless that's
     /// her ([`People::war`]).
     foe_reach: Option<f32>,
@@ -1287,7 +1294,8 @@ impl Npc {
             foe_at: None,
             foe_armour: None,
             foe_body: None,
-            foe_look: 0.0,
+            lanes: m2_engine::ai_target::Lanes::default(),
+            known: Vec::new(),
             foe_reach: None,
             shot_by: None,
             heard: None,
@@ -2861,6 +2869,8 @@ pub struct People {
     /// Her row of it: her vehicle's `ModifierKey` while she drives one,
     /// else `Hero`'s.
     pub her_row: Option<u32>,
+    /// Where she was at the last update, for her speed.
+    her_last: Option<Vec3>,
     /// The scripts' objects made priority targets (`Ai.SetPriorityTarget`),
     /// by guid.
     pub priority: std::collections::HashSet<u32>,
@@ -3601,24 +3611,53 @@ impl People {
         if self.relations.is_empty() {
             return;
         }
-        type Subject = (u32, &'static str, Vec3, f32, Arms);
+        type Subject = (u32, &'static str, Vec3, f32, Arms, usize);
+        use m2_engine::ai_target::{LOOKS_PER_FRAME, lane};
+        // Each subject's perception lane, by its speed (0x822F1198; how
+        // new it is and the record's flags are not kept: taken as old
+        // and unflagged).
+        let lane_of = |speed: f32| lane(speed, f32::INFINITY, false, false);
         let all: Vec<Subject> = self
             .npcs
             .iter()
             .filter(|n| n.alive && n.landed)
             .filter_map(|n| {
                 let arms = Arms::Person([n.gun.map(|_| n.fire_hint()), n.launcher.map(|l| l.hint)]);
-                Some((n.shooter, n.faction?, n.chest(), n.ai.visibility, arms))
+                let speed = n.character.velocity.length();
+                Some((
+                    n.shooter,
+                    n.faction?,
+                    n.chest(),
+                    n.ai.visibility,
+                    arms,
+                    lane_of(speed),
+                ))
             })
             .chain(self.vehicle_subjects.iter().enumerate().map(|(i, v)| {
                 let arms = Arms::Vehicle {
                     threat: v.threat,
                     priority: v.priority,
                 };
-                (VEHICLES + i as u32, v.faction, v.at, v.visibility, arms)
+                (
+                    VEHICLES + i as u32,
+                    v.faction,
+                    v.at,
+                    v.visibility,
+                    arms,
+                    lane_of(v.speed),
+                )
             }))
             .collect();
         let her_arms = self.her_arms.unwrap_or(HER_ON_FOOT);
+        // Her lane, by how far she moved since the last update.
+        let her_speed = match (threat, self.her_last) {
+            (Some(t), Some(l)) if dt > 0.0 => t.distance(l) / dt,
+            _ => 0.0,
+        };
+        self.her_last = threat;
+        let her_lane = lane_of(her_speed);
+        // Sight checks so far this frame, across all of them.
+        let mut looks = 0usize;
         let bodies: Vec<_> = self.vehicle_subjects.iter().map(|v| v.vehicle).collect();
         self.calm(dt);
         for i in 0..self.npcs.len() {
@@ -3644,49 +3683,52 @@ impl People {
             let n = &mut self.npcs[i];
             // Heat, each update whether he looks or not (0x822D9C10).
             n.heat.tick(n.slot.who.is_some());
-            n.foe_look -= dt;
+            // Which lanes he looks over now (0x822DB5A8): the one in his
+            // slot each think, the rest as their lane comes due.
+            let due = n.lanes.tick(dt);
             let shot = n.shot_by.take();
             let heard = n.heard.take();
-            if n.foe_look > 0.0 && shot.is_none() && heard.is_none() {
-                if let Some(c) = foe.filter(|_| n.slot.who.is_some()) {
-                    n.foe_at = Some(c.2);
-                }
-                continue;
-            }
-            n.foe_look = LOOK_EVERY;
             // As far as they can see each: their `Vision` times its
             // `Visibility`, half as far again for the one in the slot
             // (0x822E89B0).
             let vision = n.ai.vision;
             let held_now = n.slot.who;
+            let known = std::mem::take(&mut n.known);
             let reach = |c: &Subject| {
                 let hold = if held_now == Some(c.0) { 1.5 } else { 1.0 };
                 vision * c.3 * hold
             };
-            let mut seen: Vec<(f32, u32, Vec3, &'static str, f32, Arms)> = all
+            let mut seen: Vec<(f32, u32, Vec3, &'static str, f32, Arms, bool)> = all
                 .iter()
                 .filter(|c| c.0 != me && c.1 != side)
-                .map(|c| (c.2.distance(at), c.0, c.2, c.1, reach(c), c.4))
+                .filter(|c| {
+                    due[c.5]
+                        || held_now == Some(c.0)
+                        || Some(c.0) == heard
+                        || Some(c.0) == shot
+                        || known.contains(&c.0)
+                })
+                .map(|c| (c.2.distance(at), c.0, c.2, c.1, reach(c), c.4, due[c.5]))
                 .filter(|c| c.0 <= c.4 || Some(c.1) == heard || Some(c.1) == shot)
                 .collect();
             seen.sort_by(|a, b| a.0.total_cmp(&b.0));
             for c in &seen {
                 self.perceive(i, c.3);
             }
+            // Those he is not hostile to now he still remembers, for when
+            // he is again (the records outlast the attitude).
+            let calm: Vec<u32> = seen
+                .iter()
+                .filter(|c| !self.hostile(i, c.3) && known.contains(&c.1))
+                .map(|c| c.1)
+                .collect();
             seen.retain(|c| self.hostile(i, c.3));
-            // The nearest few, and any priority target in reach besides: the
-            // limit is ours (the 360 looks over them all, its sight lines
-            // queued), so it must not hide what the scripts made first.
-            let mut n = 0;
-            seen.retain(|c| {
-                n += 1;
-                n <= FOE_LOOKS || matches!(c.5, Arms::Vehicle { priority: true, .. })
-            });
             let n = &mut self.npcs[i];
+            n.known.extend(calm);
             let current = n.foe_at.map(|f| f.distance(at));
             let alert = n.alert;
             let hot = n.heat.factor();
-            for (d, who, chest, _, far, arms) in seen {
+            for (d, who, chest, _, far, arms, fresh) in seen {
                 let in_slot = n.slot.who == Some(who);
                 n.foe_reach = Some(far);
                 let perceived = shot == Some(who) || heard == Some(who);
@@ -3694,7 +3736,22 @@ impl People {
                     .then(|| bodies.get(who.wrapping_sub(VEHICLES) as usize).copied())
                     .flatten()
                     .flatten();
-                if in_slot || perceived || n.sees_past(physics, chest, alert, body) {
+                // A sight line, while the frame's are not used up
+                // (0x822E8DF8); past them, unseen.
+                let mut look = || {
+                    looks += 1;
+                    looks <= LOOKS_PER_FRAME
+                };
+                // One his lane does not bring up now he rates as last seen.
+                let sighted = if fresh {
+                    look() && n.sees_past(physics, chest, alert, body)
+                } else {
+                    known.contains(&who)
+                };
+                if sighted {
+                    n.known.push(who);
+                }
+                if in_slot || perceived || sighted {
                     // What it is worth and how well seen (the record's
                     // +0xC8 and +0x68, 0x822D56B0 and 0x822E89B0), by his
                     // heat (+0x804).
@@ -3711,7 +3768,22 @@ impl People {
                 let d = t.distance(at);
                 let in_slot = n.slot.who == Some(HER);
                 let far = n.her_sight();
-                if d <= far && (in_slot || n.alert || n.sees(physics, t, false)) {
+                let fresh = due[her_lane];
+                let sighted = if fresh {
+                    !in_slot
+                        && !n.alert
+                        && {
+                            looks += 1;
+                            looks <= LOOKS_PER_FRAME
+                        }
+                        && n.sees(physics, t, false)
+                } else {
+                    known.contains(&HER)
+                };
+                if d <= far && sighted {
+                    n.known.push(HER);
+                }
+                if d <= far && (in_slot || n.alert || sighted) {
                     let seen = m2_engine::ai_target::visible(d, far) * hot;
                     let worth = her_arms.worth(d);
                     n.slot.offer(
@@ -6106,12 +6178,18 @@ pub(crate) mod tests {
             priority: false,
             vehicle: None,
             hint: VEHICLE_HINT,
+            speed: 0.0,
             row: None,
         };
         people.vehicle_subjects = vec![truck(150.0, 100.0)];
         people.war(&physics, None, 0.25);
         assert_eq!(people.npcs[0].foe_at, None, "out of its reach");
+        // Standing still, it is looked at again 8 s on (its lane, 3).
         people.vehicle_subjects = vec![truck(150.0, 200.0)];
+        for _ in 0..32 {
+            people.war(&physics, None, 0.25);
+        }
+        assert_eq!(people.npcs[0].foe_at, None, "not looked at again yet");
         people.war(&physics, None, 0.25);
         assert!(people.npcs[0].foe_at.is_some());
         assert_eq!(people.npcs[0].foe_armour, Some(2));
@@ -6146,6 +6224,7 @@ pub(crate) mod tests {
                 priority,
                 vehicle: None,
                 hint: VEHICLE_HINT,
+                speed: 0.0,
                 row: None,
             }];
             people.war(&physics, None, 0.25);
@@ -6187,6 +6266,7 @@ pub(crate) mod tests {
             priority: false,
             vehicle: Some(id),
             hint: VEHICLE_HINT,
+            speed: 0.0,
             row: None,
         }];
         people.war(&physics, None, 0.25);
@@ -6231,6 +6311,7 @@ pub(crate) mod tests {
             priority: true,
             vehicle: None,
             hint: VEHICLE_HINT,
+            speed: 0.0,
             row: None,
         }];
         people.war(&physics, None, 0.25);

@@ -2084,6 +2084,9 @@ impl Game {
                         .is_some_and(|g| self.scene.people.priority.contains(&g)),
                     vehicle: v.id,
                     hint: vehicle_hint(&v.spec.tuning),
+                    speed: v
+                        .id
+                        .map_or(0.0, |id| physics.map_or(0.0, |p| p.vehicle_speed(id))),
                     row: v.spec.tuning.key,
                 })
             })
