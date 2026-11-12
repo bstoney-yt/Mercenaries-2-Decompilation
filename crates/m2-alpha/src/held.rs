@@ -98,6 +98,11 @@ pub struct Held {
     /// entries 12 ([`SETTLED_HANDLE`]) and 13 (`Upright_Fidget`).
     pub settled: Option<usize>,
     pub fidget: Option<usize>,
+    /// The jump's take-off, standing and on the move (`Upright`
+    /// `JumpTakeoffStationary` and `JumpTakeoffMoving`): the clip and
+    /// when in it its `jump` event launches her
+    /// ([`m2_engine::human_state`]).
+    pub windup: [Option<(usize, f32)>; 2],
 }
 
 /// The upright locomotion node's second idle: entry 12 of its handle
@@ -153,6 +158,9 @@ pub struct Moves {
     /// Carrying someone: standing, walking and running, the `Carrying`
     /// locomotion node's gaits ([`hero_action::CARRY_GAITS`]).
     pub carrying: [Option<usize>; 3],
+    /// The human state table, if the archive has it: which stance and
+    /// action each message leads to ([`m2_engine::human_state`]).
+    pub states: Option<std::sync::Arc<m2_assets::human_states::HumanStates>>,
 }
 
 impl Moves {
@@ -437,7 +445,21 @@ pub fn resolve(
                 .then(|| index(p.clip))
                 .flatten()
         };
+        let windup = ["JumpTakeoffStationary", "JumpTakeoffMoving"].map(|action| {
+            let i = by_action(action, class)?;
+            let at = rig.clips[i]
+                .clip
+                .events
+                .iter()
+                .find(|e| {
+                    e.name
+                        .eq_ignore_ascii_case(m2_engine::human_state::JUMP_EVENT)
+                })?
+                .time;
+            Some((i, at))
+        });
         held.push(Held {
+            windup,
             settled: by_handle(SETTLED_HANDLE),
             fidget: by_handle(m2_assets::name_hash(FIDGET_HANDLE)),
             sweeps,
@@ -464,6 +486,7 @@ pub fn resolve(
             let p = table::handle_clip(t, h, who, table::RIFLE, fits)?;
             index(p.clip)
         }),
+        states: None,
     }
 }
 
@@ -510,6 +533,7 @@ mod tests {
             pickup: Some(9),
             run_stop: None,
             carrying: [Some(20), Some(21), Some(22)],
+            states: None,
         }
     }
 

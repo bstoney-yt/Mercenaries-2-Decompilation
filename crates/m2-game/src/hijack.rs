@@ -48,9 +48,6 @@ pub const BUTTONS: [(&str, u32); 8] = [
     ("LStick_Down", 12),
 ];
 
-/// What `Player.GetCamera` answers: the one camera, as a handle.
-pub const PLAYER_CAMERA: u32 = 0x2fff_ff01;
-
 /// What a hijack asks of the game, beyond the commands every script uses.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HijackCommand {
@@ -622,12 +619,9 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
         }))
     })?;
 
-    // The player's camera, for the camera calls that take one (shakes,
-    // the failure's look at her chest).
-    let player = lib("Player")?;
-    add(&player, "GetCamera", |_, _, _| {
-        Ok(MultiValue::from_vec(vec![guid_value(PLAYER_CAMERA)]))
-    })?;
+    // `Player.GetCamera` is the api's (one registration: this one, a
+    // fixed handle installed after it, hid the api's from every camera
+    // call that names the camera by the player).
 
     let ai = lib("Ai")?;
     add(&ai, "Enable", |w, _, a| {

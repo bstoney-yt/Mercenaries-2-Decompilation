@@ -42,6 +42,7 @@ pub mod heli_land;
 pub mod heli_pilot;
 pub mod hero_action;
 pub mod hijack;
+pub mod human_state;
 pub mod ladder;
 pub mod lights;
 pub mod melee;

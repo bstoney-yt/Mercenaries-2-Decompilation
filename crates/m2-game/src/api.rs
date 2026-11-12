@@ -264,10 +264,23 @@ pub enum Command {
         guid: u32,
         health: f32,
     },
-    /// `Object.ApplyImpulse`: a push in world space.
+    /// `Object.ApplyImpulse`: a push (kg m/s) through its centre of
+    /// mass, world space, or its own space when `local` (the game turns
+    /// it by the object's whole transform, as 0x82331638 does).
     Impulse {
         guid: u32,
         impulse: [f32; 3],
+        local: bool,
+    },
+    /// `Object.ApplyPointImpulse`: a push (kg m/s) at a point, both
+    /// world space, or both its own space when `local` (the game turns
+    /// the push and places the point by the object's transform, as
+    /// 0x82331748 does).
+    PointImpulse {
+        guid: u32,
+        impulse: [f32; 3],
+        point: [f32; 3],
+        local: bool,
     },
     /// `Player.SetScopeEnabled`: whether she may use a scope now.
     ScopeEnabled(bool),
@@ -893,6 +906,9 @@ pub const TETHER_DIAMETER_START: f64 = 400.0;
 #[derive(Debug, Default)]
 pub struct ScriptWorld {
     pub objects: HashMap<u32, Object>,
+    /// Each object's mass as its physics reports it, kg
+    /// (`Object.GetMass`), as the game last said: its vehicles'.
+    pub masses: HashMap<u32, f32>,
     /// Each character's last raw clip (`Human.PlayRawAnimation`): seconds
     /// left once the game has said its length ([`ScriptWorld::raw_clip_length`]),
     /// `None` until then.
@@ -2098,31 +2114,62 @@ fn install_ported(
         values([Value::Boolean(true)])
     })?;
     // Object.ApplyImpulse(object, x, y, z, local) (0x82331638): a push on
-    // its physics body; with `local` true the push is turned by the
-    // object's own facing first. True, or nil for no body.
+    // its physics body; with `local` true the push is in the object's own
+    // space, which the game turns by its transform. True, or nil for no
+    // body.
     add(&object, "ApplyImpulse", |w, _, a| {
         let Some(guid) = id(a.first()) else {
             return values([Value::Nil]);
         };
-        let Some((push, next)) = place_arg(w, a, 1) else {
+        let Some((impulse, next)) = place_arg(w, a, 1) else {
             return values([Value::Nil]);
         };
         let local = matches!(a.get(next), Some(Value::Boolean(true)));
-        let Some(o) = w.objects.get(&guid) else {
+        if !w.objects.contains_key(&guid) {
+            return values([Value::Nil]);
+        }
+        w.commands.push(Command::Impulse {
+            guid,
+            impulse,
+            local,
+        });
+        values([Value::Boolean(true)])
+    })?;
+    // Object.ApplyPointImpulse(object, ix, iy, iz, px, py, pz, local)
+    // (0x82331748): a push at a point on its physics body, three numbers
+    // each (0x82308620); with `local` true both are in the object's own
+    // space (the push turned, 0x82855A48, the point placed, 0x828561A8,
+    // by its transform, 0x823F8370). It goes to the body's vtable +0x14
+    // and the native answers true. Nil here for an object it does not
+    // know (the 360 raises an argument error, 0x82206F20).
+    add(&object, "ApplyPointImpulse", |w, _, a| {
+        let Some(guid) = id(a.first()) else {
             return values([Value::Nil]);
         };
-        let impulse = if local {
-            let (s, c) = o.yaw.sin_cos();
-            [
-                push[0] * c + push[2] * s,
-                push[1],
-                push[2] * c - push[0] * s,
-            ]
-        } else {
-            push
+        let three = |i: usize| Some([num(a.get(i))?, num(a.get(i + 1))?, num(a.get(i + 2))?]);
+        let (Some(impulse), Some(point)) = (three(1), three(4)) else {
+            return values([Value::Nil]);
         };
-        w.commands.push(Command::Impulse { guid, impulse });
+        let local = matches!(a.get(7), Some(Value::Boolean(true)));
+        if !w.objects.contains_key(&guid) {
+            return values([Value::Nil]);
+        }
+        w.commands.push(Command::PointImpulse {
+            guid,
+            impulse,
+            point,
+            local,
+        });
         values([Value::Boolean(true)])
+    })?;
+    // Object.GetMass(object) (0x82330A90): its physics' mass, kg (vtable
+    // +0x60: a vehicle's bodies' masses together, 0 while one of them
+    // does not move), as the game last said ([`ScriptWorld::masses`]).
+    // Nil here for an object whose mass the game has not said (the 360
+    // raises an argument error for one with no physics).
+    add(&object, "GetMass", |w, _, a| {
+        let mass = id(a.first()).and_then(|g| w.masses.get(&g));
+        values([mass.map_or(Value::Nil, |m| Value::Number(f64::from(*m)))])
     })?;
 
     let player = lib("Player")?;
@@ -8575,13 +8622,23 @@ mod tests {
             assert_eq!(w.objects[&50].health, w.objects[&50].max_health * 0.5);
         }
         assert!(ask("return Object.Revive(999)").is_nil());
-        // ApplyImpulse: world space, or turned by its facing.
-        world.borrow_mut().objects.get_mut(&50).unwrap().yaw = std::f32::consts::FRAC_PI_2;
+        // ApplyImpulse: world space, or its own space for the game to turn.
         assert_eq!(
             ask("return Object.ApplyImpulse(50, 0, 0, 10, true)"),
             Value::Boolean(true)
         );
         assert!(ask("return Object.ApplyImpulse(999, 0, 0, 10)").is_nil());
+        // ApplyPointImpulse: push, then point, then local; true.
+        assert_eq!(
+            ask("return Object.ApplyPointImpulse(50, 0, 0, 50000, 0, -0.5, -1.5, true)"),
+            Value::Boolean(true)
+        );
+        assert!(ask("return Object.ApplyPointImpulse(999, 0, 0, 1, 0, 0, 0)").is_nil());
+        assert!(ask("return Object.ApplyPointImpulse(50, 0, 0, 1)").is_nil());
+        // GetMass: what the game said, nil before it says.
+        assert!(ask("return Object.GetMass(50)").is_nil());
+        world.borrow_mut().masses.insert(50, 1500.0);
+        assert_eq!(ask("return Object.GetMass(50)"), Value::Number(1500.0));
         // Players: one, in slot 0, never remote.
         assert_eq!(
             ask("return Player.GetPlayer(0) == Player.GetLocalPlayer()"),
@@ -8620,12 +8677,24 @@ mod tests {
             Value::Integer(0)
         );
         let commands = world.borrow_mut().take_commands();
-        let impulse = commands.iter().find_map(|c| match c {
-            Command::Impulse { impulse, .. } => Some(*impulse),
-            _ => None,
-        });
-        let i = impulse.unwrap();
-        assert!((i[0] - 10.0).abs() < 1e-4 && i[2].abs() < 1e-4, "{i:?}");
+        assert!(commands.contains(&Command::Impulse {
+            guid: 50,
+            impulse: [0.0, 0.0, 10.0],
+            local: true,
+        }));
+        assert!(commands.contains(&Command::PointImpulse {
+            guid: 50,
+            impulse: [0.0, 0.0, 50000.0],
+            point: [0.0, -0.5, -1.5],
+            local: true,
+        }));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| matches!(c, Command::PointImpulse { .. }))
+                .count(),
+            1
+        );
         assert!(commands.contains(&Command::ScopeEnabled(false)));
         assert!(commands.contains(&Command::ScopeEnabled(true)));
         assert!(commands.iter().any(|c| matches!(c, Command::CameraYaw(y) if (*y - std::f32::consts::FRAC_PI_2).abs() < 1e-5)));
