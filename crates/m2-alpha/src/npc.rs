@@ -77,7 +77,20 @@ pub struct VehicleSubject {
     pub priority: bool,
     /// Its body, left out of the sight lines to it.
     pub vehicle: Option<m2_engine::VehicleId>,
+    /// What it is (its `ObjectHint`), for what a soldier's weapons are
+    /// worth against it.
+    pub hint: m2_engine::ai_target::Hint,
+    /// Its `ModifierKey`: its row of the damage table.
+    pub row: Option<u32>,
 }
+
+/// A vehicle's `ObjectHint` where its template gives none: a ground
+/// vehicle (kind 2, domain 2) with no armour.
+pub const VEHICLE_HINT: m2_engine::ai_target::Hint = m2_engine::ai_target::Hint {
+    kind: 2,
+    domain: 2,
+    armour: 1,
+};
 
 /// What a subject carries, for how much of a threat it is to a soldier
 /// on foot ([`m2_engine::ai_target::threat`]).
@@ -1041,6 +1054,16 @@ pub struct Npc {
     /// The armour class of what she is in (`ObjectHint`'s `Armor`, 1 to
     /// 4; 1 on foot), from [`People::target_armour`].
     pub target_armour: u32,
+    /// What his target is (`ObjectHint`), and what it takes of his gun's
+    /// and his launcher's damage (the damage table's cells), for what
+    /// each is worth against it ([`m2_engine::ai_target::weapon_worth`]).
+    pub target_hint: m2_engine::ai_target::Hint,
+    pub target_takes: [f32; 2],
+    /// The weapon he has up: 0 his gun, 1 his launcher; none when neither
+    /// is worth anything against his target (0x822EF4C0).
+    pub weapon: Option<usize>,
+    /// Until he next chooses his weapon, seconds.
+    weapon_wait: f32,
     /// From how far those with `Vision` 1 can see her, metres.
     pub her_visibility: f32,
     /// From how far those with `Hearing` 1 can hear her, metres.
@@ -1294,6 +1317,10 @@ impl Npc {
             grenade_wait: 0.0,
             smart: SmarterAi::default(),
             target_armour: 1,
+            target_hint: m2_engine::ai_target::HUMAN,
+            target_takes: [1.0; 2],
+            weapon: None,
+            weapon_wait: 0.0,
             her_visibility: ON_FOOT_VISIBILITY,
             her_audibility: 0.0,
             spotted: false,
@@ -2207,10 +2234,10 @@ impl Npc {
         self.cooldown -= dt;
         self.launcher_wait -= dt;
         let hint = self.fire_hint();
-        // His launcher, when it rates what she is in higher than his gun
-        // does (an AT rocket's 3 against a tank's class, the rifle's 0),
-        // within its range, once its pause since the last is out.
-        if let Some(l) = self.launcher.filter(|_| self.reaches_for_launcher()) {
+        self.choose_weapon(distance, rng, dt);
+        // His launcher, when he has it up, within its range, once its
+        // pause since the last is out.
+        if let Some(l) = self.launcher.filter(|_| self.weapon == Some(1)) {
             if seen
                 && off < FIRE_ARC
                 && self.launcher_wait <= 0.0
@@ -2232,7 +2259,7 @@ impl Npc {
                 self.cooldown = self.burst_gap();
             }
         } else if seen
-            && self.rates_target()
+            && self.weapon == Some(0)
             && self.cooldown <= 0.0
             && off < FIRE_ARC
             && distance < hint.range
@@ -2271,21 +2298,59 @@ impl Npc {
             .map_or(BURST_GAP, |g| 60.0 / g.rate_of_fire)
     }
 
-    /// Whether his gun is any use against what she is in: its
-    /// `WeaponHint` rating for her armour class is above 0 (a rifle's 0
-    /// against an APC or a tank; inferred from the ratings' names and
-    /// values, gap-list sweep). He still faces and aims at her.
-    pub fn rates_target(&self) -> bool {
-        let class = self.target_armour.clamp(1, 4) as usize - 1;
-        self.fire_hint().against[class] > 0
+    /// What his gun and his launcher are worth against his target
+    /// `distance` metres off ([`m2_engine::ai_target::weapon_worth`]):
+    /// a launcher he lacks, nothing.
+    pub fn weapon_worths(&self, distance: f32) -> [f32; 2] {
+        use m2_engine::ai_target::weapon_worth;
+        let to = self.target_hint;
+        // One whose template names no gun fires the "Assault Rifle"'s:
+        // 450 a minute, 9 a round.
+        let (damage, rate) = self.gun.map_or((9.0, 60.0 / BURST_GAP), |g| {
+            (g.damage * g.pellets.max(1) as f32, g.rate_of_fire)
+        });
+        let hint = self.fire_hint();
+        let gun = weapon_worth(
+            damage * self.target_takes[0],
+            rate,
+            &hint,
+            to,
+            distance,
+            self.weapon == Some(0),
+        );
+        let launcher = self.launcher.map_or(0.0, |l| {
+            let blast = l.ammo.blast.map_or(0.0, |b| b.damage);
+            let damage = l.ammo.damage.max(blast) * self.target_takes[1];
+            weapon_worth(
+                damage,
+                l.rate_of_fire,
+                &l.hint,
+                to,
+                distance,
+                self.weapon == Some(1),
+            )
+        });
+        [gun, launcher]
     }
 
-    /// Whether he fires his launcher rather than his gun at what she is
-    /// in: it rates her armour class higher than the gun does.
-    pub fn reaches_for_launcher(&self) -> bool {
-        let class = self.target_armour.clamp(1, 4) as usize - 1;
-        self.launcher
-            .is_some_and(|l| l.hint.against[class] > self.fire_hint().against[class])
+    /// He chooses the weapon he has up against his target `distance`
+    /// metres off, at random by their worths
+    /// ([`m2_engine::ai_target::pick_weapon`]): again each
+    /// [`WEAPON_EVERY`](m2_engine::ai_target::WEAPON_EVERY) seconds, and
+    /// [`NO_WEAPON_WAIT`](m2_engine::ai_target::NO_WEAPON_WAIT) after a
+    /// change (0x822BE240, 0x822EF4C0). With none up he chooses each time.
+    fn choose_weapon(&mut self, distance: f32, rng: &mut Rng, dt: f32) {
+        use m2_engine::ai_target::{NO_WEAPON_WAIT, WEAPON_EVERY, pick_weapon};
+        self.weapon_wait -= dt;
+        if self.weapon_wait > 0.0 && self.weapon.is_some() {
+            return;
+        }
+        self.weapon_wait = WEAPON_EVERY;
+        let pick = pick_weapon(&self.weapon_worths(distance), rng.range(0.0, 1.0));
+        if pick != self.weapon {
+            self.weapon = pick;
+            self.weapon_wait = NO_WEAPON_WAIT;
+        }
     }
 
     /// How he fires his gun: its `WeaponHint`, else the "Assault
@@ -2758,9 +2823,8 @@ pub struct People {
     pub smarter: SmarterAi,
     /// The armour class of what she is in, 1 to 4 (`ObjectHint`'s
     /// `Armor`: 1 on foot or in a car, 2 a helicopter or a light truck, 3
-    /// the APCs, 4 the tanks): a soldier whose gun's `WeaponHint` rates it
-    /// 0 against that class holds his fire ([`Npc::rates_target`]). 0
-    /// (unset) is taken as 1.
+    /// the APCs, 4 the tanks): what soldiers' weapons are worth against
+    /// her goes by it ([`Npc::weapon_worths`]). 0 (unset) is taken as 1.
     /// From how far she can be heard, metres: her own `Audibility` as
     /// she moves, or her vehicle's.
     pub her_audibility: f32,
@@ -2791,6 +2855,12 @@ pub struct People {
     /// What she carries, for her threat to soldiers; `None` is
     /// [`HER_ON_FOOT`].
     pub her_arms: Option<Arms>,
+    /// The game's damage table, for what each target takes of a
+    /// soldier's weapons (their worth, [`Npc::weapon_worths`]).
+    pub damage_table: Option<m2_engine::tuning::DamageTable>,
+    /// Her row of it: her vehicle's `ModifierKey` while she drives one,
+    /// else `Hero`'s.
+    pub her_row: Option<u32>,
     /// The scripts' objects made priority targets (`Ai.SetPriorityTarget`),
     /// by guid.
     pub priority: std::collections::HashSet<u32>,
@@ -4043,9 +4113,47 @@ impl People {
             n.follow_to = focus;
         }
         let mut callouts = Vec::new();
+        // Each person's row of the damage table, by number.
+        let human = m2_assets::name_hash("Human");
+        let rows: HashMap<u32, u32> = self
+            .npcs
+            .iter()
+            .map(|n| (n.shooter, n.ai.modifier.unwrap_or(human)))
+            .collect();
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
             npc.target_armour = npc.foe_armour.unwrap_or(self.target_armour).max(1);
+            // What his target is and what it takes of his weapons: a
+            // vehicle's own `ObjectHint` and row; a person's, `human`'s
+            // with his own row; hers, `human`'s with the armour of what
+            // she is in (inferred: which of her and her vehicle the 360
+            // rates is not settled).
+            let subject = npc
+                .slot
+                .who
+                .filter(|_| npc.foe_armour.is_some())
+                .and_then(|w| self.vehicle_subjects.get(w.wrapping_sub(VEHICLES) as usize));
+            let (hint, row) = match (subject, npc.slot.who) {
+                (Some(v), _) => (v.hint, v.row),
+                (None, Some(w)) if w != HER => (m2_engine::ai_target::HUMAN, rows.get(&w).copied()),
+                _ => (
+                    m2_engine::ai_target::Hint {
+                        armour: self.target_armour.clamp(1, 4),
+                        ..m2_engine::ai_target::HUMAN
+                    },
+                    self.her_row,
+                ),
+            };
+            let takes = |key: Option<u32>| match (&self.damage_table, row, key) {
+                (Some(t), Some(row), Some(key)) => t.scale(row, key).unwrap_or(1.0),
+                _ => 1.0,
+            };
+            let bullet = m2_assets::name_hash("Bullet");
+            npc.target_hint = hint;
+            npc.target_takes = [
+                takes(Some(npc.gun.and_then(|g| g.damage_key).unwrap_or(bullet))),
+                takes(npc.launcher.and_then(|l| l.ammo.key)),
+            ];
             npc.her_visibility = self.her_visibility.unwrap_or(ON_FOOT_VISIBILITY);
             npc.her_audibility = self.her_audibility;
             npc.swim_speed = self
@@ -5595,7 +5703,7 @@ pub(crate) mod tests {
     // 0 against them), not on foot or in a helicopter; an AT rocket man
     // fires at all of them.
     #[test]
-    fn soldiers_hold_fire_where_their_gun_is_no_use() {
+    fn a_rifle_is_worth_nothing_against_a_vehicle_and_little_against_armour() {
         let mut n = Npc::new(
             0,
             &rig(),
@@ -5604,32 +5712,33 @@ pub(crate) mod tests {
             Brain::Post { facing: 0.0 },
             Some(1),
         );
-        let rated = |n: &mut Npc, class| {
-            n.target_armour = class;
-            n.rates_target()
+        n.gun = Some(rifle());
+        let tank = m2_engine::ai_target::Hint {
+            armour: 4,
+            ..VEHICLE_HINT
         };
+        n.target_hint = tank;
         assert_eq!(
-            [1, 2, 3, 4].map(|c| rated(&mut n, c)),
-            [true, true, false, false]
+            n.weapon_worths(50.0)[0],
+            0.0,
+            "a rifle's hint is for people"
         );
-        let rocket = FireHint {
-            kinds: [1, 2],
-            against: [1, 3, 3, 3],
-            single: false,
-            ..STAND_IN
+        // Her in a tank, rated as a person in its armour: her gun rated 0
+        // against it still worth something.
+        n.target_hint = m2_engine::ai_target::Hint {
+            armour: 4,
+            ..m2_engine::ai_target::HUMAN
         };
-        n.gun = Some(HandGun {
-            hint: Some(rocket),
-            ..rifle()
-        });
-        assert_eq!([1, 2, 3, 4].map(|c| rated(&mut n, c)), [true; 4]);
+        assert!(
+            n.weapon_worths(50.0)[0] > 0.0,
+            "a rating of 0 weighs, not forbids"
+        );
     }
 
-    // A rifleman with the RPG (rated 1 against every class) fires the
-    // rifle at her on foot and the RPG at her in a tank; with a Stinger
-    // (1, 3, 2, 0), at her in a helicopter, not in a tank.
+    // A rifleman with an RPG (any kind) takes it up against a tank every
+    // time; against a soldier, either.
     #[test]
-    fn soldiers_reach_for_the_launcher_that_rates_her_higher() {
+    fn soldiers_take_up_the_launcher_by_its_worth() {
         let mut n = Npc::new(
             0,
             &rig(),
@@ -5638,19 +5747,22 @@ pub(crate) mod tests {
             Brain::Post { facing: 0.0 },
             Some(1),
         );
-        let launcher = |against| NpcLauncher {
+        n.gun = Some(rifle());
+        n.launcher = Some(NpcLauncher {
             template: 7,
             hint: FireHint {
-                against,
+                kinds: [1, 1],
+                against: [1, 1, 1, 1],
                 ..STAND_IN
             },
+            rate_of_fire: 30.0,
             ammo: m2_engine::weapons::Ammo {
                 template: 8,
                 velocity: 25.0,
                 max_velocity: 0.0,
                 human_boost: 2.0,
                 gravity: 0.0,
-                damage: 0.0,
+                damage: 100.0,
                 damage_min: 0.0,
                 falloff: (0.0, 0.0),
                 dropoff: 1.0,
@@ -5664,21 +5776,31 @@ pub(crate) mod tests {
                 sticky: false,
             },
             feel: Default::default(),
+        });
+        let mut rng = Rng::default();
+        let mut picks = |n: &mut Npc, to| {
+            n.target_hint = to;
+            let mut seen = [0; 2];
+            for _ in 0..200 {
+                n.weapon = None;
+                n.choose_weapon(50.0, &mut rng, 0.1);
+                seen[n.weapon.expect("one is worth something")] += 1;
+            }
+            seen
         };
-        let reaches = |n: &mut Npc, class| {
-            n.target_armour = class;
-            n.reaches_for_launcher()
+        let tank = m2_engine::ai_target::Hint {
+            armour: 4,
+            ..VEHICLE_HINT
         };
-        n.launcher = Some(launcher([1, 1, 1, 1]));
-        assert_eq!(
-            [1, 2, 3, 4].map(|c| reaches(&mut n, c)),
-            [false, false, true, true]
-        );
-        n.launcher = Some(launcher([1, 3, 2, 0]));
-        assert_eq!(
-            [1, 2, 3, 4].map(|c| reaches(&mut n, c)),
-            [false, true, true, false]
-        );
+        assert_eq!(picks(&mut n, tank), [0, 200]);
+        let [gun, launcher] = picks(&mut n, m2_engine::ai_target::HUMAN);
+        assert!(gun > 0 && launcher > 0, "{gun} and {launcher}");
+        // With the rifle alone, a tank leaves him nothing to fire.
+        n.launcher = None;
+        n.target_hint = tank;
+        n.weapon = None;
+        n.choose_weapon(50.0, &mut rng, 0.1);
+        assert_eq!(n.weapon, None);
     }
 
     fn rifle() -> HandGun {
@@ -5983,6 +6105,8 @@ pub(crate) mod tests {
             threat: m2_engine::ai_target::VEHICLE_THREAT,
             priority: false,
             vehicle: None,
+            hint: VEHICLE_HINT,
+            row: None,
         };
         people.vehicle_subjects = vec![truck(150.0, 100.0)];
         people.war(&physics, None, 0.25);
@@ -6021,6 +6145,8 @@ pub(crate) mod tests {
                 threat: m2_engine::ai_target::VEHICLE_THREAT,
                 priority,
                 vehicle: None,
+                hint: VEHICLE_HINT,
+                row: None,
             }];
             people.war(&physics, None, 0.25);
             people.npcs[0].foe_at.expect("he goes for one").z
@@ -6060,6 +6186,8 @@ pub(crate) mod tests {
             threat: m2_engine::ai_target::VEHICLE_THREAT,
             priority: false,
             vehicle: Some(id),
+            hint: VEHICLE_HINT,
+            row: None,
         }];
         people.war(&physics, None, 0.25);
         assert_eq!(
@@ -6102,6 +6230,8 @@ pub(crate) mod tests {
             threat: m2_engine::ai_target::VEHICLE_THREAT,
             priority: true,
             vehicle: None,
+            hint: VEHICLE_HINT,
+            row: None,
         }];
         people.war(&physics, None, 0.25);
         let z = people.npcs[0].foe_at.expect("he goes for one").z;

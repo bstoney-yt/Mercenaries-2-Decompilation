@@ -65,6 +65,69 @@ pub struct Disc {
     pub lift: f32,
 }
 
+/// A tripwire across a race's gate (`Marker.AddTripwire`). From the 360
+/// code (`Gui._MarkerAddTripwire`, 8231B230): the call is
+/// `(x, y, z, width, yaw, r, g, b)`; the first five are needed (without
+/// them no marker is made), the colour is 255 each where left out, the
+/// width is held within [`TRIPWIRE_WIDTH`] and the yaw is in degrees.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tripwire {
+    pub at: [f32; 3],
+    /// Across, metres.
+    pub width: f32,
+    /// Degrees, as the scripts give it (`Object.GetYaw` of the gate).
+    pub yaw: f32,
+    pub colour: [u8; 3],
+}
+
+/// The least and most a tripwire's width is held to, metres (from the 360
+/// code, 8231B230: 1.0 and 50.0).
+pub const TRIPWIRE_WIDTH: (f32, f32) = (1.0, 50.0);
+
+/// A model drawn at a target as a marker (`Marker.Add3D`): a race's ring
+/// (`global_airring`) and its finish (`global_tripwirefinish`). From the
+/// 360 code (`Gui._MarkerAdd3D`, 8231B5A8): the call is
+/// `(target, model, r, g, b, scale)`; the target and the model are
+/// needed, the colour is 255 each and the scale 1 where left out, and it
+/// fades as other markers do, between [`MARKER_NEAR`] and [`MARKER_FAR`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Model3d {
+    pub target: Option<u32>,
+    pub model: String,
+    pub colour: [u8; 3],
+    pub scale: f32,
+}
+
+/// A coloured mark held at an offset from a target (`Marker.Add`): the
+/// mark over someone being delivered (`MrxTaskObjectiveDeliver` puts one
+/// 2 m over each, `Marker.Add(0, 2, 0, who, 255, 255, 0, 0.05)`).
+///
+/// From the 360 code (`Gui._MarkerAddOld`, 8231B828; the scripts' one
+/// call fits it and not `Gui._MarkerAdd`, 8231AEE8, which is
+/// `Marker.AddBlip`'s `(target, icon, size, ...)`): the call is
+/// `(x, y, z, target, r, g, b, scale, icon, ...)` and every argument may
+/// be left out: the offset is `(0, 2, 0)`, the colour 255 each and the
+/// scale 0.25 by default, with no target it is a point in the world, and
+/// it fades as other markers do, between [`MARKER_NEAR`] and
+/// [`MARKER_FAR`]. Three more arguments after the icon (a number, a
+/// boolean, a number) are passed on to the marker and aren't understood;
+/// the scripts never give them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pin {
+    pub target: Option<u32>,
+    /// From the target (or the world's origin), metres.
+    pub offset: [f32; 3],
+    pub colour: [u8; 3],
+    pub scale: f32,
+    /// Its icon by name; `None` for the game's own default.
+    pub icon: Option<String>,
+}
+
+/// A [`Pin`]'s offset and scale when the call gives none (from the 360
+/// code, 8231B828).
+pub const PIN_OFFSET: [f32; 3] = [0.0, 2.0, 0.0];
+pub const PIN_SCALE: f32 = 0.25;
+
 /// A marker over a target in the world.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Marker {
@@ -109,6 +172,12 @@ pub struct Hud {
     pub markers: BTreeMap<u32, Marker>,
     /// Discs on the ground by handle (`Marker.AddDisc`).
     pub discs: BTreeMap<u32, Disc>,
+    /// Tripwires across gates by handle (`Marker.AddTripwire`).
+    pub tripwires: BTreeMap<u32, Tripwire>,
+    /// Models drawn as markers by handle (`Marker.Add3D`).
+    pub models: BTreeMap<u32, Model3d>,
+    /// Marks held by a target by handle (`Marker.Add`).
+    pub pins: BTreeMap<u32, Pin>,
     /// Objective messages not yet shown.
     pub messages: Vec<ObjectiveMessage>,
     /// How the engine's markers over pickups are drawn, as the scripts
@@ -491,10 +560,101 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         );
         Ok(MultiValue::from_vec(vec![guid_value(handle)]))
     })?;
+    // Marker.AddTripwire(x, y, z, width, yaw, r, g, b) and
+    // Marker.Add3D(target, model, r, g, b, scale): see [`Tripwire`] and
+    // [`Model3d`]. Their handles come off the counter the other markers
+    // use (from the 360 code: one counter, 8313452C+0x10), and
+    // `Marker.Remove` takes them.
+    add(&marker, "AddTripwire", |hud, _, a| {
+        let f = |i: usize| number(a.get(i)).map(|v| v as f32);
+        let (Some(x), Some(y), Some(z), Some(width), Some(yaw)) = (f(0), f(1), f(2), f(3), f(4))
+        else {
+            return Ok(MultiValue::new());
+        };
+        let c = |i: usize| number(a.get(i)).map_or(255, |v| v.clamp(0.0, 255.0) as u8);
+        let handle = FIRST_MARKER + hud.next_marker;
+        hud.next_marker += 1;
+        hud.tripwires.insert(
+            handle,
+            Tripwire {
+                at: [x, y, z],
+                width: width.clamp(TRIPWIRE_WIDTH.0, TRIPWIRE_WIDTH.1),
+                yaw,
+                colour: [c(5), c(6), c(7)],
+            },
+        );
+        Ok(MultiValue::from_vec(vec![guid_value(handle)]))
+    })?;
+    add(&marker, "Add3D", |hud, _, a| {
+        let target = guid(a.first());
+        if target.is_none() || !matches!(a.get(1), Some(Value::String(_))) {
+            return Ok(MultiValue::new());
+        }
+        let c = |i: usize| number(a.get(i)).map_or(255, |v| v.clamp(0.0, 255.0) as u8);
+        let handle = FIRST_MARKER + hud.next_marker;
+        hud.next_marker += 1;
+        hud.models.insert(
+            handle,
+            Model3d {
+                target,
+                model: text(a.get(1)),
+                colour: [c(2), c(3), c(4)],
+                scale: number(a.get(5)).map_or(1.0, |v| v as f32),
+            },
+        );
+        Ok(MultiValue::from_vec(vec![guid_value(handle)]))
+    })?;
+    // Marker.Add(x, y, z, target, r, g, b, scale, icon): see [`Pin`]. An
+    // argument of another kind is skipped, as the 360's reader does (each
+    // is read from where the last one read ended).
+    add(&marker, "Add", |hud, _, a| {
+        let mut next = 0;
+        let mut num = |d: f32| match number(a.get(next)) {
+            Some(v) => {
+                next += 1;
+                v as f32
+            }
+            None => d,
+        };
+        let offset = [num(PIN_OFFSET[0]), num(PIN_OFFSET[1]), num(PIN_OFFSET[2])];
+        let target = guid(a.get(next));
+        if target.is_some() {
+            next += 1;
+        }
+        let mut num = |d: f32| match number(a.get(next)) {
+            Some(v) => {
+                next += 1;
+                v as f32
+            }
+            None => d,
+        };
+        let colour = [num(255.0), num(255.0), num(255.0)].map(|c| c.clamp(0.0, 255.0) as u8);
+        let scale = num(PIN_SCALE);
+        let icon = match a.get(next) {
+            Some(Value::String(s)) => Some(s.to_string_lossy()),
+            _ => None,
+        };
+        let handle = FIRST_MARKER + hud.next_marker;
+        hud.next_marker += 1;
+        hud.pins.insert(
+            handle,
+            Pin {
+                target,
+                offset,
+                colour,
+                scale,
+                icon,
+            },
+        );
+        Ok(MultiValue::from_vec(vec![guid_value(handle)]))
+    })?;
     add(&marker, "Remove", |hud, _, a| {
         if let Some(h) = guid(a.first()) {
             hud.markers.remove(&h);
             hud.discs.remove(&h);
+            hud.tripwires.remove(&h);
+            hud.models.remove(&h);
+            hud.pins.remove(&h);
         }
         Ok(MultiValue::new())
     })?;
@@ -584,6 +744,107 @@ mod tests {
         assert_eq!((m.near, m.far), (MARKER_NEAR, MARKER_FAR));
         assert_eq!((m.near, m.far), (200.0, 300.0));
         assert!(!m.flat);
+    }
+
+    #[test]
+    fn a_race_gate_has_its_tripwire_and_models() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        api::install(host.lua(), &world).unwrap();
+        host.lua()
+            .load(
+                r#"
+                local gate = Sys.StringToGuid("734801")
+                wire = Marker.AddTripwire(10, 2, -30, 80, 90, 51, 204, 153)
+                plain = Marker.AddTripwire(1, 2, 3, 0.5, 45)
+                none = Marker.AddTripwire(1, 2, 3, 10)
+                ring = Marker.Add3D(gate, "global_airring", 255, 200, 0, 12)
+                finish = Marker.Add3D(gate, "global_tripwirefinish", 255, 200, 0)
+                bare = Marker.Add3D(gate, "global_airring")
+                nomodel = Marker.Add3D(gate)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let g = |n: &str| as_guid(&host.lua().globals().get::<Value>(n).unwrap());
+        {
+            let w = world.borrow();
+            // Width held to 1..50 m; colour 255 each where left out.
+            let wire = &w.hud.tripwires[&g("wire").unwrap()];
+            assert_eq!(wire.at, [10.0, 2.0, -30.0]);
+            assert_eq!((wire.width, wire.yaw), (50.0, 90.0));
+            assert_eq!(wire.colour, [51, 204, 153]);
+            let plain = &w.hud.tripwires[&g("plain").unwrap()];
+            assert_eq!((plain.width, plain.colour), (1.0, [255, 255, 255]));
+            // Without its five numbers, or its model, nothing is made.
+            assert_eq!(g("none"), None);
+            assert_eq!(g("nomodel"), None);
+            let ring = &w.hud.models[&g("ring").unwrap()];
+            assert_eq!((ring.model.as_str(), ring.scale), ("global_airring", 12.0));
+            assert_eq!(ring.colour, [255, 200, 0]);
+            assert_eq!(w.hud.models[&g("finish").unwrap()].scale, 1.0);
+            assert_eq!(w.hud.models[&g("bare").unwrap()].colour, [255, 255, 255]);
+            // One counter for every kind of marker: no handle twice.
+            let mut hs = [g("wire"), g("plain"), g("ring"), g("finish"), g("bare")];
+            hs.sort();
+            assert!(hs.windows(2).all(|p| p[0] != p[1]));
+        }
+        host.lua()
+            .load("Marker.Remove(wire) Marker.Remove(ring)")
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        assert_eq!((w.hud.tripwires.len(), w.hud.models.len()), (1, 2));
+    }
+
+    #[test]
+    fn someone_being_delivered_is_marked_two_metres_over_them() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        api::install(host.lua(), &world).unwrap();
+        host.lua()
+            .load(
+                r#"
+                local vip = Sys.StringToGuid("734801")
+                -- As MrxTaskObjectiveDeliver marks an attached person.
+                mark = Marker.Add(0, 2, 0, vip, 255, 255, 0, 0.05)
+                bare = Marker.Add()
+                named = Marker.Add(1, 3, 5, vip, 10, 20, 30, 2, "HUD_objective_action")
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let g = |n: &str| as_guid(&host.lua().globals().get::<Value>(n).unwrap()).unwrap();
+        {
+            let w = world.borrow();
+            assert_eq!(
+                w.hud.pins[&g("mark")],
+                Pin {
+                    target: Some(734801),
+                    offset: [0.0, 2.0, 0.0],
+                    colour: [255, 255, 0],
+                    scale: 0.05,
+                    icon: None,
+                }
+            );
+            // Everything left out: the game's defaults, at no target.
+            assert_eq!(
+                w.hud.pins[&g("bare")],
+                Pin {
+                    target: None,
+                    offset: PIN_OFFSET,
+                    colour: [255, 255, 255],
+                    scale: PIN_SCALE,
+                    icon: None,
+                }
+            );
+            let named = &w.hud.pins[&g("named")];
+            assert_eq!(named.offset, [1.0, 3.0, 5.0]);
+            assert_eq!(named.icon.as_deref(), Some("HUD_objective_action"));
+            assert_eq!((named.colour, named.scale), ([10, 20, 30], 2.0));
+        }
+        host.lua().load("Marker.Remove(mark)").exec().unwrap();
+        assert_eq!(world.borrow().hud.pins.len(), 2);
     }
 
     #[test]

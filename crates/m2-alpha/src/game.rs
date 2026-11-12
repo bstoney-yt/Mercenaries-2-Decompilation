@@ -1541,7 +1541,7 @@ impl Game {
                         physics.right_vehicle(id);
                     }
                 }
-                physics.step(dt);
+                physics.step_frame(dt);
                 match id.and_then(|(id, v)| Some((physics.vehicle_transform(id)?, v, id))) {
                     Some((at, v, id)) => {
                         let speed = physics.vehicle_speed(id);
@@ -1648,7 +1648,7 @@ impl Game {
                 }
             } else {
                 self.halts.clear();
-                physics.step(dt);
+                physics.step_frame(dt);
             }
         }
         split("game: player and physics");
@@ -2083,10 +2083,26 @@ impl Game {
                         .guid
                         .is_some_and(|g| self.scene.people.priority.contains(&g)),
                     vehicle: v.id,
+                    hint: vehicle_hint(&v.spec.tuning),
+                    row: v.spec.tuning.key,
                 })
             })
             .collect();
         self.scene.people.vehicle_subjects = subjects;
+        // Her row of the damage table, and the table, for what soldiers'
+        // weapons are worth against her and the armies' vehicles.
+        self.scene.people.her_row = Some(
+            self.scene
+                .player
+                .as_ref()
+                .and_then(|p| p.driving)
+                .and_then(|i| self.scene.vehicles.get(i))
+                .and_then(|v| v.spec.tuning.key)
+                .unwrap_or_else(|| m2_assets::name_hash("Hero")),
+        );
+        if self.scene.people.damage_table.is_none() {
+            self.scene.people.damage_table = self.combat.damage_table.clone();
+        }
         // What she carries, for her threat to soldiers: a vehicle's mounts
         // when she drives one, else her guns' own `WeaponHint`s.
         let driven = self
@@ -5875,6 +5891,17 @@ fn serve_cover(world: &m2_engine::World, people: &mut crate::npc::People) {
                 cands.len()
             );
         }
+    }
+}
+
+/// What a vehicle is, as its `ObjectHint` has it
+/// ([`crate::npc::VEHICLE_HINT`] for any word it lacks).
+fn vehicle_hint(t: &m2_engine::tuning::VehicleTuning) -> m2_engine::ai_target::Hint {
+    let d = crate::npc::VEHICLE_HINT;
+    m2_engine::ai_target::Hint {
+        kind: t.kind.map_or(d.kind, |k| k.0),
+        domain: t.kind.map_or(d.domain, |k| k.1),
+        armour: t.armour.unwrap_or(d.armour),
     }
 }
 

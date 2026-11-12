@@ -124,6 +124,86 @@ pub fn weapon_threat(w: &crate::weapons::FireHint, to: Hint) -> f32 {
     base * domain * kind
 }
 
+/// Of a weapon's rate of fire (a minute), where its worth is a half
+/// (0x82B7D884).
+const RATE_HALF: f32 = 60.0;
+/// The least a weapon's expected damage is taken as (0x820F8BE4).
+const LEAST_DAMAGE: f32 = 0.001;
+/// The most a weapon's worth comes to before its aim and threat
+/// (0x820BB2F0).
+const MOST_WORTH: f32 = 16.0;
+/// What a weapon's worth is divided by, with its aim (0x820B7B6C).
+const AIM_SHARE: f32 = 4.0;
+/// What a weapon's threat rating is counted by in its worth (0x820BAEEC).
+const THREAT_WEIGHT: f32 = 10.0;
+/// The most a weapon is worth outside its fire ranges (0x820B7AE0).
+const OUT_OF_RANGE: f32 = 0.01;
+/// What the weapon in hand counts by (0x820C7A20).
+const IN_HAND: f32 = 3.0;
+/// Seconds between a mind's weapon choices while it has one up
+/// (0x820C7A20, 0x822BE240); [`NO_WEAPON_WAIT`] after it found none.
+pub const WEAPON_EVERY: f32 = 3.0;
+/// See [`WEAPON_EVERY`] (0x820BAF84, 0x822EF4C0).
+pub const NO_WEAPON_WAIT: f32 = 5.0;
+
+/// What a weapon is worth to a mind against a target `distance` metres
+/// off (0x822EF4C0 by 0x822EF200): its `damage` to the target (its round's
+/// damage times what the target takes of its kind, at least
+/// [`LEAST_DAMAGE`]) times its rate's share (`1 - 60 / (rate + 60)`),
+/// at most [`MOST_WORTH`], over [`AIM_SHARE`], times its threat to the
+/// target ([`weapon_threat`], times [`THREAT_WEIGHT`]). Outside its fire
+/// ranges it is worth at most [`OUT_OF_RANGE`]; the one in hand counts
+/// [`IN_HAND`] times.
+///
+/// So a weapon for another kind of target (a rifle's `WeaponHint` is
+/// for people, against a vehicle) is worth nothing, and one rated 0
+/// against the target's armour is still worth a tenth of a rating of 3:
+/// the rating weighs the choice, it does not forbid it.
+///
+/// Not ported: 0x822EF040's aim term, which scales the divisor by the
+/// target's motion across the line of fire and two of the weapon's
+/// fields not yet named (taken as 1); 0x822EF128's weapons that need a
+/// property of their target (flags 0x8000 and 0x4000, none named), and a
+/// half again for flag 0x2000 (not named); and the nearest the weapon is
+/// used at (its slot's +0x14, not named).
+pub fn weapon_worth(
+    damage: f32,
+    rate_of_fire: f32,
+    hint: &crate::weapons::FireHint,
+    to: Hint,
+    distance: f32,
+    in_hand: bool,
+) -> f32 {
+    let rate = 1.0 - RATE_HALF / (rate_of_fire.max(0.0) + RATE_HALF);
+    let worth = (damage.max(LEAST_DAMAGE) * rate).min(MOST_WORTH) / AIM_SHARE
+        * weapon_threat(hint, to)
+        * THREAT_WEIGHT;
+    let ranged = if distance < hint.min_range || distance > hint.range {
+        worth.min(OUT_OF_RANGE)
+    } else {
+        worth
+    };
+    if in_hand { ranged * IN_HAND } else { ranged }
+}
+
+/// The weapon a mind takes up of those `worths` ([`weapon_worth`]), by
+/// `roll` (0 to 1): each as likely as its share of their sum; none when
+/// none is worth anything (0x822EF4C0).
+pub fn pick_weapon(worths: &[f32], roll: f32) -> Option<usize> {
+    let sum: f32 = worths.iter().sum();
+    if sum <= 0.0 {
+        return None;
+    }
+    let mut left = roll * (sum - 1e-4);
+    for (i, w) in worths.iter().enumerate() {
+        left -= w;
+        if left <= 0.0 {
+            return Some(i);
+        }
+    }
+    Some(worths.len() - 1)
+}
+
 /// A subject's threat to `to` from the weapons it carries `distance`
 /// metres off (0x822EC430 by 0x822EC1B8): the most any rates, of those
 /// whose `FireRange` reaches; a vehicle's (`vehicle`) reach anywhere, and
@@ -414,5 +494,47 @@ mod tests {
         heat.tick(false);
         assert_eq!(heat.0, 0.0);
         assert_eq!(heat.factor(), 1.0);
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    // A rifle (a `WeaponHint` for people) is worth nothing against a tank;
+    // an RPG (any kind) is. Rated 0 against the armour, a weapon is still
+    // worth a tenth of one rated 3.
+    #[test]
+    fn a_weapon_is_worth_what_it_can_do_to_its_target() {
+        let tank = Hint {
+            kind: 2,
+            domain: 2,
+            armour: 4,
+        };
+        let rifle = hint([3, 1], [3, 1, 0, 0], 100.0);
+        let rpg = hint([1, 1], [1, 1, 1, 1], 150.0);
+        assert_eq!(weapon_worth(9.0, 450.0, &rifle, tank, 50.0, false), 0.0);
+        assert!(weapon_worth(9.0, 450.0, &rifle, HUMAN, 50.0, false) > 1.0);
+        assert!(weapon_worth(100.0, 30.0, &rpg, tank, 50.0, false) > 1.0);
+        let none = hint([1, 1], [1, 1, 1, 0], 150.0);
+        let three = hint([1, 1], [1, 1, 1, 3], 150.0);
+        let w = |h| weapon_worth(9.0, 450.0, h, tank, 50.0, false);
+        assert!(w(&none) > 0.0, "rated 0 still worth something");
+        assert!(close(w(&none) / w(&three), 0.1), "a tenth of a 3");
+        // Out of its range: a hundredth at most; in hand: three times.
+        assert!(weapon_worth(9.0, 450.0, &rifle, HUMAN, 200.0, false) <= 0.01);
+        let held = weapon_worth(9.0, 450.0, &rifle, HUMAN, 50.0, true);
+        assert!(close(
+            held,
+            3.0 * weapon_worth(9.0, 450.0, &rifle, HUMAN, 50.0, false)
+        ));
+    }
+
+    #[test]
+    fn a_mind_takes_up_a_weapon_by_its_share_of_their_worth() {
+        assert_eq!(pick_weapon(&[0.0, 0.0], 0.5), None);
+        assert_eq!(pick_weapon(&[0.0, 2.0], 0.1), Some(1));
+        assert_eq!(pick_weapon(&[1.0, 3.0], 0.2), Some(0));
+        assert_eq!(pick_weapon(&[1.0, 3.0], 0.3), Some(1));
+        assert_eq!(pick_weapon(&[1.0, 3.0], 1.0), Some(1));
     }
 }
