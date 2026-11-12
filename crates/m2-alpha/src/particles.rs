@@ -344,6 +344,53 @@ impl ParticleDraw {
         created
     }
 
+    /// The camera the effects kept about it follow.
+    pub fn set_camera(&mut self, eye: Vec3, right: Vec3, up: Vec3, forward: Vec3) {
+        self.sim.set_camera(eye, right, up, forward);
+    }
+
+    /// Swaps the ambient effects for a record's (`AmbientEffect0..4`): the
+    /// last ones deleted with their particles, each new one with a
+    /// template of type 0 started about the camera, as the game does on
+    /// every change of the light (from the 360 code, 0x8224D650). Type 1
+    /// (on the ground about the camera) is left out: no record uses it.
+    /// Returns how many effects started.
+    pub fn set_ambient(
+        &mut self,
+        effects: &[m2_engine::atmosphere::AmbientEffect],
+        templates: &Templates,
+    ) -> usize {
+        self.sim.clear_about_camera();
+        let mut started = 0;
+        for a in effects.iter().filter(|a| a.template != 0 && a.kind == 0) {
+            let Some(id) = self.template_by_hash(a.template, templates) else {
+                eprintln!("particles: ambient effect #{:08x}: no template", a.template);
+                continue;
+            };
+            for fx in self.lib.of_template(id).to_vec() {
+                if self
+                    .sim
+                    .spawn_about_camera(&self.lib, fx, a.radius, a.height)
+                {
+                    started += 1;
+                }
+            }
+        }
+        started
+    }
+
+    /// The template whose name hashes to `h` (of twins, the lowest id).
+    fn template_by_hash(&mut self, h: u32, templates: &Templates) -> Option<u32> {
+        let by_hash = self.by_hash.get_or_insert_with(|| {
+            let mut ids: Vec<(&u32, &String)> = templates.names.iter().collect();
+            ids.sort_unstable_by_key(|&(&id, _)| std::cmp::Reverse(id));
+            ids.into_iter()
+                .map(|(&id, n)| (m2_assets::name_hash(n), id))
+                .collect()
+        });
+        by_hash.get(&h).copied()
+    }
+
     pub fn step(&mut self, dt: f32) {
         self.sim.step(&self.lib, dt);
         self.clock += dt;

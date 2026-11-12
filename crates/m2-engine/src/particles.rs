@@ -690,6 +690,24 @@ struct Instance {
     /// Each emitter's fraction of a particle owed.
     owed: Vec<f32>,
     particles: Vec<Particle>,
+    /// Where its particles start: on its emitters' shapes, or about the
+    /// camera for a record's ambient effect.
+    placement: Placement,
+}
+
+/// Where an effect's particles start.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Placement {
+    /// On its emitters' shapes about its place (the game's kind 0).
+    Shape,
+    /// About the camera, as a record's ambient effect (from the 360 code:
+    /// kind 2, 0x821DA518, its starts at 0x821D9ED0): evenly over a disc of
+    /// `radius` in the plane of the camera's right and forward ways,
+    /// centred `height` along its down from the camera (the code offsets
+    /// it by the cross of its first and third rows, right x forward, down
+    /// in the game's left-handed frame), each particle flying out about
+    /// the world's down as its emitter spreads it.
+    AboutCamera { radius: f32, height: f32 },
 }
 
 /// Effects running in the world.
@@ -699,6 +717,9 @@ pub struct Particles {
     seed: u32,
     /// Effects started, by hash, since the start.
     pub started: HashMap<u32, u32>,
+    /// The camera's place and its right, up and forward ways, for the
+    /// effects kept about it ([`Particles::set_camera`]).
+    camera: Option<[Vec3; 4]>,
 }
 
 impl Particles {
@@ -757,6 +778,7 @@ impl Particles {
             until,
             owed: vec![0.0; spec.emitters.len()],
             particles: Vec::new(),
+            placement: Placement::Shape,
         });
         true
     }
@@ -805,6 +827,38 @@ impl Particles {
             .count()
     }
 
+    /// Where the camera is and its right, up and forward ways, for the
+    /// effects kept about it.
+    pub fn set_camera(&mut self, eye: Vec3, right: Vec3, up: Vec3, forward: Vec3) {
+        self.camera = Some([eye, right, up, forward]);
+    }
+
+    /// Starts `effect` about the camera for good, as a record's ambient
+    /// effect ([`Placement::AboutCamera`]); false if the library has no
+    /// such effect.
+    pub fn spawn_about_camera(
+        &mut self,
+        lib: &Library,
+        effect: u32,
+        radius: f32,
+        height: f32,
+    ) -> bool {
+        if !self.start(lib, effect, Vec3::ZERO, f32::INFINITY, 1.0) {
+            return false;
+        }
+        if let Some(i) = self.instances.last_mut() {
+            i.placement = Placement::AboutCamera { radius, height };
+        }
+        true
+    }
+
+    /// Deletes every effect kept about the camera, its particles with it,
+    /// as the game deletes a record's ambient effects on a change.
+    pub fn clear_about_camera(&mut self) {
+        self.instances
+            .retain(|i| !matches!(i.placement, Placement::AboutCamera { .. }));
+    }
+
     /// Particles alive.
     pub fn live(&self) -> usize {
         self.instances.iter().map(|i| i.particles.len()).sum()
@@ -840,6 +894,11 @@ impl Particles {
                 continue;
             };
             inst.age += dt;
+            // An effect kept about the camera moves with it (0x821DA498).
+            if let (Placement::AboutCamera { .. }, Some([eye, ..])) = (inst.placement, self.camera)
+            {
+                inst.at = eye;
+            }
             let frame = inst.age * FRAME;
             // The effect's forces this frame ([`ForceSpec::live`]).
             let live: Vec<LiveForce> = spec
@@ -879,7 +938,7 @@ impl Particles {
                         continue;
                     }
                     given += 1;
-                    let p = self.emit(e, k as u16, inst.at, inst.scale, frame);
+                    let p = self.emit(e, k as u16, inst.at, inst.scale, frame, inst.placement);
                     inst.particles.push(p);
                     total += 1;
                 }
@@ -911,6 +970,7 @@ impl Particles {
         at: Vec3,
         scale: f32,
         frame: f32,
+        placement: Placement,
     ) -> Particle {
         let half = (e.spread.at(frame) + self.spread(e.spread_var)).to_radians();
         // A direction tilted from the axis by an angle even in 0 to `half`
@@ -925,9 +985,20 @@ impl Particles {
         // On its shape, flying out along the patch's normal (the patch's
         // own space turned as the emitter is); with no shape, at the
         // emitter, along its axis.
-        let (start, axis) = match self.on_shape(e) {
-            Some((p, n)) => (e.pose * p, e.pose * n),
-            None => (Vec3::ZERO, e.axis),
+        // About the camera: a start on its disc, in the world, flying out
+        // about the world's down.
+        let about = match (placement, self.camera) {
+            (Placement::AboutCamera { radius, height }, Some([eye, right, up, forward])) => {
+                let r = self.random().sqrt() * radius;
+                let (sin, cos) = (self.random() * std::f32::consts::TAU).sin_cos();
+                Some(eye - up * height + (right * cos + forward * sin) * r)
+            }
+            _ => None,
+        };
+        let (start, axis) = match (about, self.on_shape(e)) {
+            (Some(_), _) => (Vec3::ZERO, Vec3::NEG_Y),
+            (None, Some((p, n))) => (e.pose * p, e.pose * n),
+            (None, None) => (Vec3::ZERO, e.axis),
         };
         let dir = Quat::from_rotation_arc(Vec3::Y, axis.normalize_or(Vec3::Y)) * local;
         // Each a fresh draw on its spread, a speed not held above zero, a
@@ -936,7 +1007,7 @@ impl Particles {
         let speed = e.speed.at(frame) + self.spread(e.speed_var);
         let life = (e.life.at(frame) + self.spread(e.life_var)).max(0.0);
         Particle {
-            at: at + (e.offset + start) * scale,
+            at: about.unwrap_or(at + (e.offset + start) * scale),
             velocity: dir * speed * scale,
             age: 0.0,
             life,
@@ -1399,7 +1470,7 @@ mod tests {
         let n = 4000;
         let mean: f32 = (0..n)
             .map(|_| {
-                p.emit(&e, 0, Vec3::ZERO, 1.0, 0.0)
+                p.emit(&e, 0, Vec3::ZERO, 1.0, 0.0, Placement::Shape)
                     .velocity
                     .angle_between(Vec3::Y)
             })
@@ -1505,6 +1576,40 @@ mod tests {
             p.step(&lib, dt);
         }
         assert_eq!(p.running(), 0);
+    }
+
+    #[test]
+    fn ambient_effects_start_on_a_disc_about_the_camera() {
+        // 0x821D9ED0: evenly over a disc of the record's radius in the
+        // camera's right and forward plane, `height` down from it.
+        let mut e = burst();
+        e.rate = plain(200.0);
+        e.life = plain(10.0);
+        let lib = library(e);
+        let mut p = Particles::default();
+        let eye = Vec3::new(100.0, 20.0, -50.0);
+        p.set_camera(eye, Vec3::X, Vec3::Y, Vec3::NEG_Z);
+        assert!(p.spawn_about_camera(&lib, 7, 25.0, 3.0));
+        p.step(&lib, 0.5);
+        let at = p.positions();
+        assert!(at.len() > 50, "{}", at.len());
+        for q in &at {
+            let flat = Vec3::new(q.x - eye.x, 0.0, q.z - eye.z).length();
+            assert!(flat <= 25.0 + 1e-3, "{q}");
+        }
+        // Spread over the disc, not crowding its middle.
+        let far = at
+            .iter()
+            .filter(|q| Vec3::new(q.x - eye.x, 0.0, q.z - eye.z).length() > 12.5)
+            .count();
+        assert!(far * 2 > at.len() / 2, "{far} of {}", at.len());
+        // It runs until the light changes, then goes with its particles.
+        for _ in 0..40 {
+            p.step(&lib, 0.5);
+        }
+        assert_eq!(p.running(), 1);
+        p.clear_about_camera();
+        assert_eq!((p.running(), p.live()), (0, 0));
     }
 
     #[test]
