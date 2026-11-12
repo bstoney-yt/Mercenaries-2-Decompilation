@@ -1004,6 +1004,9 @@ pub struct ScriptWorld {
     /// The PDA map's callbacks for its two modes
     /// (`Player.SetPDAMapModeCallback`).
     pub pda_map_callbacks: [Option<Function>; 2],
+    /// The PDA map mode while the scripts have it up
+    /// (`Player.SetPDAMapMode`: the satellite view).
+    pub pda_map: Option<crate::pda_map::MapMode>,
     /// `Player.SetWaitForInGame`: the player waits for the game proper.
     pub wait_for_in_game: bool,
     /// Places people kept by `Human.PersistTransform`: place and yaw.
@@ -2373,6 +2376,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     crate::ported_sp::install(&lib, &add)?;
     crate::shop::install(lua, &lib("Hud")?)?;
     crate::ported::install(&lib, &add)?;
+    crate::pda_map::install(&lib, &add)?;
     crate::ported_sys::install(&lib, &add)?;
     crate::cash::install(&lib, &add)?;
 

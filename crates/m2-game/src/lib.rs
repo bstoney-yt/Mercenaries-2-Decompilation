@@ -22,6 +22,7 @@ pub mod mission;
 pub mod music;
 pub mod object_hooks;
 pub mod path_order;
+pub mod pda_map;
 pub mod player_target;
 pub mod ported;
 pub mod ported_init;
