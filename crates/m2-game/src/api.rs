@@ -1120,6 +1120,10 @@ pub struct ScriptWorld {
     /// who carries whom (`Human.IsCarrying`) ([`crate::mission::Mission::set_human_state`]).
     pub human_states: HashMap<u32, String>,
     pub state_changes: Vec<crate::events::StateChange>,
+    /// Objects a script killed (`Object.Kill` of a live one) whose own
+    /// script has not heard of its death yet
+    /// ([`crate::mission::Mission::tick`] tells it: `OnDeath`).
+    pub script_killed: Vec<u32>,
     /// What the scripts have changed of each object's attached spawners,
     /// by object ([`crate::spawner_tweak`]).
     pub spawner_records: HashMap<u32, crate::spawner_tweak::SpawnerRecord>,
@@ -3088,9 +3092,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&object, "Kill", |w, _, a| {
         if let Some(guid) = id(a.first()) {
+            let mut died = false;
             if let Some(o) = w.objects.get_mut(&guid) {
+                died = o.alive;
                 o.alive = false;
                 o.health = 0.0;
+            }
+            if died {
+                w.script_killed.push(guid);
             }
             w.commands.push(Command::Kill(guid));
         }
