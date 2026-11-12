@@ -298,6 +298,10 @@ pub struct Entity {
     /// Whether it has an alarm (the `Alarm` component, its own or its
     /// template's: the alarm towers; [`crate::alarm`]).
     pub alarm: bool,
+    /// Whom its template says it belongs to (`Association`: the name of
+    /// the faction's template, `Allied`, `China`, `Guerilla`), when it
+    /// says.
+    pub association: Option<String>,
 }
 
 impl Entity {
@@ -424,6 +428,7 @@ impl GameData {
         let mut template_scripts: HashMap<u32, u32> = HashMap::new();
         let mut template_script_data: HashMap<u32, u32> = HashMap::new();
         let mut template_alarms: HashSet<u32> = HashSet::new();
+        let mut template_associations: HashMap<u32, u32> = HashMap::new();
         // Faction zones' faction templates, and every template's name.
         let mut zone_factions: Vec<(String, usize, u32)> = Vec::new();
         let mut template_names: HashMap<u32, String> = HashMap::new();
@@ -465,6 +470,7 @@ impl GameData {
                     template_scripts = db.hashes("ObjectScript");
                     template_script_data = script_data(&db);
                     template_alarms = carriers(&db, "Alarm");
+                    template_associations = db.hashes("Association");
                     template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
                     data.relations = m2_engine::ai::relations(&db);
@@ -528,6 +534,7 @@ impl GameData {
                             template: None,
                             crew: Vec::new(),
                             alarm: alarms.contains(&guid),
+                            association: None,
                         });
                         if let Some(r) = rides.remove(&guid) {
                             own_riders.push((name.clone(), list.len() - 1, r));
@@ -588,6 +595,10 @@ impl GameData {
                 e.crew = crew_of(r);
             }
             e.template = named(*template);
+            e.association = template_associations
+                .get(template)
+                .or_else(|| template_associations.get(&(template & !TEMPLATE_BIT)))
+                .and_then(|&a| named(a));
         }
         for (&template, records) in &template_riders {
             let driver = crew_of(records)
@@ -2688,7 +2699,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
                 w.gates.insert(e.guid);
             }
             if e.alarm {
-                w.alarms.add(e.guid, e.script);
+                w.alarms.add(e.guid, e.script, e.association.clone());
             }
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());
@@ -3644,6 +3655,7 @@ mod tests {
                 ("seat_driver".into(), "VZ Tank Commander".into()),
             ],
             alarm: false,
+            association: None,
         }
     }
 

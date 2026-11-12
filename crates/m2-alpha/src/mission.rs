@@ -3040,6 +3040,22 @@ impl MissionLink {
                     mission.set_hardpoint(g, name, place);
                 }
             }
+            // Soldiers running to raise their alarms, and the alarms they
+            // reach raised ([`crate::npc::People::raise_alarms`]).
+            let towers = {
+                let w = mission.world().borrow();
+                alarm_towers(game, &mut self.prop_nodes, &w.alarms)
+            };
+            if !towers.is_empty() {
+                for t in game.scene.people.raise_alarms(&towers) {
+                    eprintln!("people: alarm {t:#x} raised by a soldier");
+                    mission
+                        .world()
+                        .borrow_mut()
+                        .alarms
+                        .post(t, m2_game::alarm::ON);
+                }
+            }
             // The scripts' vehicles' load beds, where they count the goods
             // on them (`Object.GetHardpointPosition(truck, "HP_Truckbed")`),
             // their mass (`Object.GetMass`, the jump and boost scripts')
@@ -7788,6 +7804,56 @@ fn prop_hardpoints(
             (g, hardpoints_at(known, at))
         })
         .collect()
+}
+
+/// The alarms in play that stand as props, as their soldiers see them:
+/// where each is, its faction (its `Association`, by [`faction_of`]),
+/// whether its flag is on, and where its model's four alarm hardpoints
+/// are ([`m2_engine::alarm_goal::HARDPOINTS`]); each model's nodes are
+/// read once (`nodes`).
+///
+/// [`faction_of`]: crate::npc::faction_of
+fn alarm_towers(
+    game: &mut Game,
+    nodes: &mut HashMap<u32, Vec<(u32, Vec3)>>,
+    alarms: &m2_game::alarm::Alarms,
+) -> Vec<crate::npc::AlarmTower> {
+    let mut out = Vec::new();
+    for (&guid, &on) in &alarms.on {
+        let Some((p, _)) = game.scene.props.get(guid) else {
+            continue;
+        };
+        let (model, at) = (
+            p.model,
+            m2_math::glam::Mat4::from_rotation_translation(p.rotation, p.position),
+        );
+        let position = p.position;
+        let known = nodes.entry(model).or_insert_with(|| {
+            game.scene
+                .source
+                .as_mut()
+                .map(|s| crate::hijack::nodes(s, model))
+                .unwrap_or_default()
+        });
+        let placed = hardpoints_at(known, at);
+        let hardpoints = m2_engine::alarm_goal::HARDPOINTS
+            .iter()
+            .filter_map(|h| placed.iter().find(|(n, _)| n == h))
+            .map(|(_, p)| Vec3::from_array(*p))
+            .collect();
+        out.push(crate::npc::AlarmTower {
+            guid,
+            at: position,
+            faction: alarms
+                .factions
+                .get(&guid)
+                .and_then(|f| crate::npc::faction_of(&format!("{f} "))),
+            on,
+            hardpoints,
+        });
+    }
+    out.sort_by_key(|t| t.guid);
+    out
 }
 
 /// Where the scripts' character `guid` stands for a camera shot: the
