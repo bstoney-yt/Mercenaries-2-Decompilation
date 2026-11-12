@@ -1192,6 +1192,19 @@ impl Mission {
             w.pursuit.clock.step(dt as f32);
             // No time scale yet: game and real time run together.
             w.clocks.step(dt as f32, dt as f32);
+            // The score moves by itself (its states' lengths; the action
+            // level, for which the game counts nobody yet: the engine's
+            // four groups of hostile characters are not known).
+            let decay = w.sound.hostility_decay_rate;
+            let clocks = w.sys.timer_update_music.unwrap_or(true);
+            let force = std::mem::take(&mut w.sound.force_action_transition);
+            let draw = (now * 7919.0).fract() as f32;
+            if let Some(c) = w
+                .music
+                .update(dt as f32, decay, [0; 4], clocks, force, || draw)
+            {
+                w.commands.push(c);
+            }
         }
         // What the scripts killed since the last tick dies as anything
         // else does: its own script's `OnDeath` hears of it.

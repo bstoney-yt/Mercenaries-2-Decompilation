@@ -4995,11 +4995,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Boolean(w.music.locked)])
     })?;
     add(&sound, "SetDynamicMusic", |w, _, a| {
-        w.music.dynamic = matches!(a.first(), Some(Value::Boolean(true)));
+        w.music.fixed = !matches!(a.first(), Some(Value::Boolean(true)));
         values([])
     })?;
     add(&sound, "IsDynamicMusic", |w, _, _| {
-        values([Value::Boolean(w.music.dynamic)])
+        values([Value::Boolean(!w.music.fixed)])
     })?;
     // Sound.LoadTempBank(name, type, callback, data) and
     // Sound.LoadBankWithCallback(name, type, callback): how
@@ -5028,17 +5028,85 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&sound, "UnloadBankWithCallback", |w, _, a| {
         bank(w, a, false)
     })?;
-    // Set-up and the action level the score is not driven by yet.
-    for name in [
-        "AddFactionMusic",
-        "AddMusicState",
-        "AddMusicTransition",
-        "SetActionThresholdsMusic",
-        "SetActionLevelsMusic",
-        "LockActionLevelMusic",
-    ] {
-        add(&sound, name, |_, _, _| values([]))?;
-    }
+    // The score's state machine ([`crate::music_machine`]). Each answers
+    // nothing; with an argument missing the 360 answers nil and does
+    // nothing, which here is nothing done.
+    //
+    // AddFactionMusic(name) (0x82341858): the new faction is the one in
+    // use, so the states that follow are its own.
+    add(&sound, "AddFactionMusic", |w, _, a| {
+        if let Some(Value::String(name)) = a.first() {
+            w.music.set_faction(&name.to_string_lossy());
+        }
+        values([])
+    })?;
+    // AddMusicState(name, length, level, delay, interval, flags [, least])
+    // (0x82342130).
+    add(&sound, "AddMusicState", |w, _, a| {
+        let (Some(Value::String(name)), Some(length), Some(level), Some(delay)) =
+            (a.first(), num(a.get(1)), num(a.get(2)), num(a.get(3)))
+        else {
+            return values([]);
+        };
+        let (Some(interval), Some(flags)) = (num(a.get(4)), num(a.get(5))) else {
+            return values([]);
+        };
+        w.music.machine().add_state(crate::music_machine::State {
+            name: name.to_string_lossy().to_ascii_lowercase(),
+            length,
+            level: level as i32,
+            delay,
+            interval,
+            least: num(a.get(6)).unwrap_or(0.0),
+            flags: flags as u8,
+            thresholds: (0.0, 0.0),
+            transitions: Vec::new(),
+        });
+        values([])
+    })?;
+    // AddMusicTransition(from, to, weight, sync, kind) (0x823422A0).
+    add(&sound, "AddMusicTransition", |w, _, a| {
+        if let (Some(Value::String(from)), Some(Value::String(to)), Some(weight)) =
+            (a.first(), a.get(1), num(a.get(2)))
+            && let (Some(sync), Some(kind)) = (num(a.get(3)), num(a.get(4)))
+        {
+            w.music.machine().add_transition(
+                &from.to_string_lossy(),
+                &to.to_string_lossy(),
+                weight,
+                sync as i32,
+                kind as i32,
+            );
+        }
+        values([])
+    })?;
+    // SetActionThresholdsMusic(state, first, second) (0x82341F68).
+    add(&sound, "SetActionThresholdsMusic", |w, _, a| {
+        if let (Some(Value::String(state)), Some(first), Some(second)) =
+            (a.first(), num(a.get(1)), num(a.get(2)))
+        {
+            w.music
+                .machine()
+                .set_thresholds(&state.to_string_lossy(), first, second);
+        }
+        values([])
+    })?;
+    // SetActionLevelsMusic(a, b, c, d) (0x82341A88).
+    add(&sound, "SetActionLevelsMusic", |w, _, a| {
+        if let (Some(p), Some(q), Some(r), Some(s)) =
+            (num(a.first()), num(a.get(1)), num(a.get(2)), num(a.get(3)))
+        {
+            w.music.set_action_levels(p, q, r, s);
+        }
+        values([])
+    })?;
+    // LockActionLevelMusic(on) (0x82341BB0).
+    add(&sound, "LockActionLevelMusic", |w, _, a| {
+        if let Some(Value::Boolean(on)) = a.first() {
+            w.music.action_locked = *on;
+        }
+        values([])
+    })?;
 
     // Scripted voice lines, as (speaker, cue, callback, values, priority,
     // send over the network); speaker 0 is the radio. The sequences that
