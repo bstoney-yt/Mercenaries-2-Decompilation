@@ -1009,7 +1009,7 @@ impl Events {
                 .collect();
             let mut near: Vec<Fired> = slots
                 .iter()
-                .map(|&i| std::mem::replace(&mut fired[i], (0, String::new(), Vec::new())))
+                .map(|&i| std::mem::take(&mut fired[i]))
                 .collect();
             near.sort_by_key(|f| std::cmp::Reverse(f.0));
             for (slot, f) in slots.into_iter().zip(near) {
