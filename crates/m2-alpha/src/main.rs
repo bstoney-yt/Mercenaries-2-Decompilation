@@ -10454,6 +10454,10 @@ impl Running {
             if let Some(preset) = m.take_reverb() {
                 self.audio.set_reverb(preset);
             }
+            for (level, seconds) in m.take_master_volumes() {
+                self.audio.master_volume(level, seconds);
+            }
+            self.audio.lock_listener(m.listener_locked());
             for (cue, on) in m.take_ambiences() {
                 self.audio.script_ambience(cue, on);
             }

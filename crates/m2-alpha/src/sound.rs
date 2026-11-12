@@ -207,6 +207,8 @@ pub struct GameAudio {
     /// for, by guid, and its voice (`None`: its set has no cue, or the
     /// cue no sound).
     flybys: HashMap<u32, Option<VoiceId>>,
+    /// `Sound.LockListenerPosition`: the listener stays where it is.
+    listener_locked: bool,
     /// Others' engines heard: their cue and a voice per track.
     others: HashMap<usize, (Arc<EngineCue>, Vec<VoiceId>)>,
     /// Banks read and found to have no engine sounds.
@@ -1281,6 +1283,7 @@ impl GameAudio {
             }),
             rotors: HashMap::new(),
             flybys: HashMap::new(),
+            listener_locked: false,
             others: HashMap::new(),
             silent: HashSet::new(),
             ambient_wait: 3.0,
@@ -3289,7 +3292,28 @@ impl GameAudio {
             }
             self.bed_decoded(buffer);
         }
-        self.out.with(|m| m.set_listener(listener, forward));
+        // Locked, the listener stays where it was (from the 360 code,
+        // the listener's update 0x8236D4D8: the camera's place is taken
+        // only while the lock, the manager's byte at +0x50, is clear).
+        if !self.listener_locked {
+            self.out.with(|m| m.set_listener(listener, forward));
+        }
+    }
+
+    /// `Sound.LockListenerPosition(on)` (0x823412D8).
+    pub fn lock_listener(&mut self, on: bool) {
+        if on != self.listener_locked {
+            eprintln!("sound: listener {}", if on { "locked" } else { "unlocked" });
+        }
+        self.listener_locked = on;
+    }
+
+    /// `Sound.SetMasterVolume(level, seconds)` (0x82343FB8): every
+    /// sound's level fades to `level` times its own over `seconds`
+    /// ([`m2_engine::audio::MasterFade`]).
+    pub fn master_volume(&mut self, level: f32, seconds: f32) {
+        eprintln!("sound: master volume to {level:.2} over {seconds:.2} s");
+        self.out.with(|m| m.script_master.set(level, seconds));
     }
 }
 

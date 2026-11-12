@@ -443,6 +443,124 @@ impl Play {
     }
 }
 
+/// The master level the scripts set (`Sound.SetMasterVolume(level,
+/// seconds)`): every sound's level is multiplied by it.
+///
+/// From the 360 code: the sound engine keeps one fade (at +0x1E0; its
+/// level, +0x1E4, is what `PalSoundInstance::Update` `0x82838558`
+/// multiplies each sound by). [`Self::set`] is the setter (`0x82834B20`)
+/// and [`Self::step`] its update (`0x82834D38`, run each frame by
+/// `0x82835058`), both followed branch by branch, with what they do to a
+/// fade already under way:
+///
+/// - no time given: the level is set at once and the fade is idle;
+/// - idle: a fade starts from the level it is at, over the time given;
+/// - rising, asked lower: it falls instead, over the new time, but still
+///   from where the rise began, the clock back at 0;
+/// - rising, asked higher: only where it is going changes;
+/// - falling, asked lower: only where it is going changes;
+/// - falling, asked higher: it rises from the level it is at, but the
+///   fall's time stands and the new time is written to the clock (so the
+///   rise begins that far along).
+///
+/// The level starts at 1.0 (the engine's start value was not traced;
+/// inferred from the scripts fading down from, and back up to, 1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MasterFade {
+    state: FadeState,
+    level: f32,
+    target: f32,
+    clock: f32,
+    time: f32,
+    from: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FadeState {
+    Idle,
+    Rising,
+    Falling,
+}
+
+impl Default for MasterFade {
+    fn default() -> Self {
+        Self {
+            state: FadeState::Idle,
+            level: 1.0,
+            target: 1.0,
+            clock: 0.0,
+            time: 0.0,
+            from: 1.0,
+        }
+    }
+}
+
+impl MasterFade {
+    /// The level now.
+    pub fn level(&self) -> f32 {
+        self.level
+    }
+
+    /// `Sound.SetMasterVolume(level, seconds)`.
+    pub fn set(&mut self, level: f32, seconds: f32) {
+        if seconds <= 0.0 {
+            self.level = level;
+            self.state = FadeState::Idle;
+            return;
+        }
+        match self.state {
+            FadeState::Idle => {
+                if level < self.level {
+                    self.state = FadeState::Falling;
+                } else if level > self.level {
+                    self.state = FadeState::Rising;
+                }
+                self.time = seconds;
+                self.clock = 0.0;
+                self.from = self.level;
+                self.target = level;
+            }
+            FadeState::Rising => {
+                if level < self.target {
+                    self.state = FadeState::Falling;
+                    self.time = seconds;
+                    self.clock = 0.0;
+                    self.target = level;
+                } else if level > self.target {
+                    self.target = level;
+                }
+            }
+            FadeState::Falling => {
+                if level < self.target {
+                    self.target = level;
+                } else if level > self.target {
+                    self.state = FadeState::Rising;
+                    self.from = self.level;
+                    self.clock = seconds;
+                    self.target = level;
+                }
+            }
+        }
+    }
+
+    /// Moves the fade on `dt` seconds.
+    pub fn step(&mut self, dt: f32) {
+        if self.state == FadeState::Idle {
+            return;
+        }
+        let at = (self.from + (self.target - self.from) / self.time * self.clock).clamp(0.0, 1.0);
+        self.level = at;
+        self.clock += dt;
+        let there = match self.state {
+            FadeState::Rising => at >= self.target,
+            _ => at <= self.target,
+        };
+        if there {
+            self.state = FadeState::Idle;
+        }
+    }
+}
+
 /// A playing sound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VoiceId(u64);
@@ -472,6 +590,9 @@ pub struct Mixer {
     /// The listener's right, horizontal.
     right: Vec3,
     pub master: f32,
+    /// The scripts' master level (`Sound.SetMasterVolume`), on top of
+    /// `master`.
+    pub script_master: MasterFade,
     /// Each category's level and pitch, glided by [`Self::fade`] and
     /// [`Self::pitch`] (the scripts duck the world under a radio
     /// conversation and slow it in the survival rescue).
@@ -500,6 +621,7 @@ impl Mixer {
             listener: Vec3::ZERO,
             right: Vec3::X,
             master: 0.8,
+            script_master: MasterFade::default(),
             levels: [Glide::ONE; Category::ALL],
             pitches: [Glide::ONE; Category::ALL],
             volumes: [1.0; Category::ALL],
@@ -646,7 +768,11 @@ impl Mixer {
 
     /// Left and right gain for `play` from the listener.
     fn gains(&self, play: &Play) -> (f32, f32) {
-        let g = play.gain * self.master * self.level(play.category) * self.volume(play.category);
+        let g = play.gain
+            * self.master
+            * self.script_master.level()
+            * self.level(play.category)
+            * self.volume(play.category);
         let Some(at) = play.position else {
             return (g, g);
         };
@@ -684,6 +810,7 @@ impl Mixer {
         for g in self.levels.iter_mut().chain(&mut self.pitches) {
             g.step(seconds);
         }
+        self.script_master.step(seconds);
         let pitches = self.pitches.map(|g| g.now);
         let gains: Vec<(f32, f32)> = self.voices.iter().map(|v| self.gains(&v.play)).collect();
         let reverb = self.reverb.is_some();
@@ -2176,6 +2303,62 @@ mod tests {
             ..KeySounds::default()
         };
         assert!((k.punch() - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_master_level_fades_as_the_360_s_does() {
+        let run = |f: &mut MasterFade, seconds: f32| {
+            for _ in 0..(seconds * 100.0).round() as usize {
+                f.step(0.01);
+            }
+        };
+        let mut f = MasterFade::default();
+        assert_eq!(f.level(), 1.0);
+        // No time: at once.
+        f.set(0.5, 0.0);
+        assert_eq!(f.level(), 0.5);
+        // Down to 0 over 2 s, in a straight line, then idle.
+        f.set(0.0, 2.0);
+        run(&mut f, 1.0);
+        assert!((f.level() - 0.25).abs() < 0.01, "{f:?}");
+        run(&mut f, 1.5);
+        assert_eq!((f.level(), f.state), (0.0, FadeState::Idle));
+        // Up to 1 over 1 s.
+        f.set(1.0, 1.0);
+        run(&mut f, 0.5);
+        assert!((f.level() - 0.5).abs() < 0.02, "{f:?}");
+        // Rising, asked lower: it falls from where the rise began (0),
+        // which is already under where it is going: it lands on 0 and
+        // stops there.
+        f.set(0.2, 1.0);
+        f.step(0.01);
+        assert_eq!((f.level(), f.state), (0.0, FadeState::Idle));
+        // Falling, asked higher: it rises from where it is, with the
+        // fall's time (2 s) and the clock set to the new time (1 s), so
+        // it starts half way along and is there a second later.
+        let mut f = MasterFade::default();
+        f.set(0.0, 2.0);
+        run(&mut f, 1.0);
+        let was = f.level();
+        assert!((was - 0.5).abs() < 0.02, "{f:?}");
+        f.set(0.8, 1.0);
+        f.step(0.01);
+        assert!(
+            (f.level() - (was + (0.8 - was) * 0.5)).abs() < 0.01,
+            "{f:?}"
+        );
+        run(&mut f, 1.1);
+        // It stops on the step that reaches the end, a hair past it.
+        assert_eq!(f.state, FadeState::Idle);
+        assert!((f.level() - 0.8).abs() < 0.01, "{f:?}");
+        // Rising, asked higher: only the end moves.
+        let mut f = MasterFade::default();
+        f.set(0.0, 0.0);
+        f.set(0.5, 1.0);
+        run(&mut f, 0.5);
+        f.set(1.0, 9.0);
+        run(&mut f, 0.6);
+        assert_eq!((f.level(), f.state), (1.0, FadeState::Idle));
     }
 
     #[test]
