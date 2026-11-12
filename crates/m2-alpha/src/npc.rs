@@ -564,6 +564,8 @@ pub struct UseJob {
     pub object: usize,
     pub seat: u32,
     pub entrance: Vec3,
+    /// How near the entrance they get on: its `UseDistance`, metres.
+    pub reach: f32,
     pub seat_at: Vec3,
     pub seat_yaw: f32,
     pub duration: f32,
@@ -585,12 +587,16 @@ enum UsePhase {
     Exit(usize),
 }
 
-/// How near the seat's entrance they get on, metres (invented; the 360
-/// boards through the vehicles' entrance check, not read for people).
-const USE_REACH: f32 = 0.6;
+/// How near a seat's entrance they get on where the entrance has no
+/// `UseDistance`, metres. From the 360 code: the use task's step
+/// (0x822B1F50) walks them to the entrance until they are within its
+/// record's distance, 2.0 (0x820C77A4) with no record, then boards.
+pub const USE_REACH: f32 = 2.0;
 
 /// They give a thing up when they have not reached it after this long,
-/// seconds (invented: the port's people can be blocked for good).
+/// seconds. A stand-in: the 360 has no such timer, its task fails when
+/// the path does (0x822D19C8) or the seat is taken (0x822B22E0), and
+/// the port's people have no word of a path failing.
 const USE_GIVE_UP: f32 = 30.0;
 
 /// How far apart a clip's hands get over the whole clip, for its hip
@@ -1962,7 +1968,7 @@ impl Npc {
             return None;
         }
         let to = (job.entrance - self.character.position).with_y(0.0);
-        if to.length() > USE_REACH {
+        if to.length() > job.reach {
             self.using = Some((job, UsePhase::Walk(t + dt)));
             return Some(to.normalize());
         }
@@ -7543,6 +7549,7 @@ pub(crate) mod tests {
             object: 3,
             seat: 0xa759_c6cc,
             entrance: n.character.position + Vec3::new(2.0, 0.0, 0.0),
+            reach: 0.6,
             seat_at: n.character.position + Vec3::new(2.0, 0.4, 0.5),
             seat_yaw: 1.0,
             duration: 2.0,
@@ -7589,6 +7596,7 @@ pub(crate) mod tests {
             object: 1,
             seat: 2,
             entrance: Vec3::new(5.0, 0.0, 0.0),
+            reach: USE_REACH,
             seat_at: Vec3::new(5.0, 0.4, 0.0),
             seat_yaw: 0.0,
             duration: 30.0,

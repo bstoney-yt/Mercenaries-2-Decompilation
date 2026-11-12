@@ -67,6 +67,8 @@ pub struct Social {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SeatPlace {
     entrance: Vec3,
+    /// The entrance's `UseDistance`.
+    reach: f32,
     seat_at: Vec3,
     seat_yaw: f32,
 }
@@ -132,14 +134,21 @@ impl Social {
         };
         let sat = node(seat.hardpoint)?;
         // Its first entrance with a place; with none, the seat itself.
-        let entrance = seat
+        let (entrance, reach) = seat
             .rows
             .iter()
             .filter(|r| r.can_enter)
-            .find_map(|r| node(s.entrance(r.link_name)?.hardpoint))
-            .map_or(sat.w_axis.truncate(), |m| m.w_axis.truncate());
+            .find_map(|r| {
+                let e = s.entrance(r.link_name)?;
+                let reach = Some(e.params.use_distance).filter(|&d| d > 0.0);
+                Some((node(e.hardpoint)?, reach.unwrap_or(crate::npc::USE_REACH)))
+            })
+            .map_or((sat.w_axis.truncate(), crate::npc::USE_REACH), |(m, d)| {
+                (m.w_axis.truncate(), d)
+            });
         Some(SeatPlace {
             entrance,
+            reach,
             seat_at: sat.w_axis.truncate(),
             seat_yaw: yaw_of(&sat),
         })
@@ -270,6 +279,7 @@ impl Social {
                 object: i,
                 seat: seat.name,
                 entrance: place.entrance,
+                reach: place.reach,
                 seat_at: place.seat_at,
                 seat_yaw: place.seat_yaw,
                 duration,
