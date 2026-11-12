@@ -5465,6 +5465,25 @@ fn minimap(
         let Some([x, y]) = blip_place(view, b.at, b.sticky) else {
             continue;
         };
+        // Its sonar rings first, under the icon (from the 360 code, the
+        // icon's draw 0x823871F8 runs the animators' own draws before the
+        // icon's quad): each a square half its width each way, the
+        // radar's radius being 50 of those units.
+        if let Some((texture, colour, rings)) = &b.rings {
+            let ring = name_hash(texture);
+            want.push(ring);
+            for &(width, alpha) in rings {
+                let half = width * 0.5 * r / 50.0;
+                let [cr, cg, cb] = colour.map(|v| f32::from(v) / 255.0);
+                out.push(quad(
+                    Some(ring),
+                    [x - half, y - half, x + half, y + half],
+                    full,
+                    [cr, cg, cb, alpha],
+                    0.0,
+                ));
+            }
+        }
         let hash = name_hash(&b.icon);
         want.push(hash);
         let s = r * 0.16;

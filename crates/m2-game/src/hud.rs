@@ -659,6 +659,58 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         Ok(MultiValue::new())
     })?;
+    // A sonar needs its duration, texture, two counts and five numbers;
+    // the grow speed is 5 and the colour white unless given (the
+    // interface's defaults).
+    add(&radar, "AnimateObjectiveSonar", |hud, _, a| {
+        let Some(Value::Table(t)) = a.get(1) else {
+            return Ok(MultiValue::new());
+        };
+        let f = |k: &str| number(t.raw_get::<Value>(k).ok().as_ref()).map(|n| n as f32);
+        let texture = match t.raw_get::<Value>("sTexture") {
+            Ok(Value::String(s)) => s.to_string_lossy(),
+            _ => return Ok(MultiValue::new()),
+        };
+        let (
+            Some(left),
+            Some(total),
+            Some(visible),
+            Some(min),
+            Some(max),
+            Some(delay),
+            Some(at_min),
+            Some(at_max),
+        ) = (
+            f("nDuration"),
+            f("nTotalBlips"),
+            f("nVisibleBlips"),
+            f("nMinWidth"),
+            f("nMaxWidth"),
+            f("nBlipDelay"),
+            f("nAlphaAtMin"),
+            f("nAlphaAtMax"),
+        )
+        else {
+            return Ok(MultiValue::new());
+        };
+        let c = |k: &str| f(k).unwrap_or(255.0).clamp(0.0, 255.0) as u8;
+        if let Some(b) =
+            blip_name(t.raw_get::<Value>("sName").ok().as_ref()).and_then(|n| hud.radar.get_mut(&n))
+        {
+            b.anims.sonar = Some(crate::radar_anim::SonarAnim::new(
+                left,
+                texture,
+                total.max(0.0) as u32,
+                visible.max(0.0) as u32,
+                [min, max],
+                delay,
+                [at_min, at_max],
+                f("nGrowSpeed").unwrap_or(5.0),
+                [c("nRed"), c("nGreen"), c("nBlue")],
+            ));
+        }
+        Ok(MultiValue::new())
+    })?;
     add(&radar, "UnanimateObjective", |hud, _, a| {
         let Some(Value::Table(t)) = a.get(1) else {
             return Ok(MultiValue::new());
@@ -1183,6 +1235,9 @@ mod tests {
                     nMinWidth = 8, nMinHeight = 8, nMaxWidth = 12, nMaxHeight = 12 })
                 Hud.Radar:AnimateObjectiveAlpha({ sName = "db_1", nDuration = 0,
                     nMinAlpha = 0.5, nMaxAlpha = 1, nSpeed = -1 })
+                Hud.Radar:AnimateObjectiveSonar({ sName = "db_1", nDuration = 0,
+                    sTexture = "ring", nTotalBlips = 3, nVisibleBlips = 2, nMinWidth = 2,
+                    nMaxWidth = 20, nBlipDelay = 1, nAlphaAtMin = 1, nAlphaAtMax = 0 })
                 -- Without its limits, or for a blip that is not there: nothing.
                 Hud.Radar:AnimateObjectiveSize({ sName = "db_1", nDuration = 0 })
                 Hud.Radar:AnimateObjectiveSize({ sName = "none", nDuration = 0,
@@ -1198,6 +1253,9 @@ mod tests {
             let b = &w.hud.radar["db_1"];
             assert_eq!(b.size, [10.5, 10.5]);
             assert_eq!(b.alpha, 191);
+            // The interface's speed, 5 a second: a ring at once.
+            let sonar = b.anims.sonar.as_ref().unwrap();
+            assert_eq!((sonar.speed, sonar.rings.as_slice()), (5.0, &[2.0][..]));
         }
         host.lua()
             .load(r#"Hud.Radar:UnanimateObjective({ sName = "db_1", sType = "size" })"#)
@@ -1208,6 +1266,7 @@ mod tests {
             let b = &w.hud.radar["db_1"];
             assert_eq!(b.size, [8.0, 8.0]);
             assert!(b.anims.size.is_none() && b.anims.alpha.is_some());
+            assert!(b.anims.sonar.is_some());
         }
         host.lua()
             .load(r#"Hud.Radar:UnanimateObjective({ sName = "db_1" })"#)

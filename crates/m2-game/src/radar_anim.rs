@@ -22,8 +22,20 @@
 //!   `alpha` or `sonar` animator, or with `all` (the scripts' default)
 //!   every one.
 //!
-//! Not here yet: the sonar animator (rings spreading from the blip, native
-//! `0x82321638`, step `0x82386CA8`, draw `0x82386EA8`).
+//! - Sonar (native `0x82321638`, set-up `0x82386B10`, step `0x82386CA8`,
+//!   draw `0x82386EA8`): rings of a texture of their own round the blip.
+//!   Each ring's width moves by the grow speed a second (6 unless given;
+//!   the scripts' interface gives 5). Until the total number have come, a
+//!   new one comes every blip delay (the first at once), at the smallest
+//!   width, or at the largest when the speed is negative; with as many up
+//!   as may show (8 at most) the oldest goes to make room. A ring past
+//!   the largest width or under the smallest goes. With a speed of 0 the
+//!   rings stand still, spread evenly from the largest width down. Each
+//!   is drawn under the blip's icon as a square half its width each way.
+//!   The two alphas, at the smallest and the largest width (each kept
+//!   between 0 and 1), and the colour are kept by the set-up; that a
+//!   ring's opacity runs between the two with its width is inferred from
+//!   their names (the draw read here sets no colour itself).
 
 /// A blip's size animation (see the module).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -53,11 +65,124 @@ pub struct AlphaAnim {
     pub original: u8,
 }
 
+/// A blip's sonar rings (see the module).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SonarAnim {
+    pub left: f32,
+    pub texture: String,
+    /// How many rings come in all, and how many show at once.
+    pub total: u32,
+    pub visible: u32,
+    pub min: f32,
+    pub max: f32,
+    /// Seconds between rings.
+    pub delay: f32,
+    /// Opacity at the smallest and the largest width, 0 to 1.
+    pub alpha_at_min: f32,
+    pub alpha_at_max: f32,
+    /// Width units a second.
+    pub speed: f32,
+    pub colour: [u8; 3],
+    /// Seconds to the next ring, and how many have come.
+    pub timer: f32,
+    pub come: u32,
+    /// The rings' widths, oldest first.
+    pub rings: Vec<f32>,
+}
+
+/// The most rings a sonar shows at once.
+pub const SONAR_RINGS: u32 = 8;
+
+impl SonarAnim {
+    /// A sonar as the set-up makes it: with no speed its rings stand
+    /// spread from the largest width down, and none more come.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        left: f32,
+        texture: String,
+        total: u32,
+        visible: u32,
+        [min, max]: [f32; 2],
+        delay: f32,
+        [alpha_at_min, alpha_at_max]: [f32; 2],
+        speed: f32,
+        colour: [u8; 3],
+    ) -> Self {
+        let visible = visible.min(SONAR_RINGS);
+        let mut a = Self {
+            left,
+            texture,
+            total,
+            visible,
+            min,
+            max,
+            delay,
+            alpha_at_min: alpha_at_min.clamp(0.0, 1.0),
+            alpha_at_max: alpha_at_max.clamp(0.0, 1.0),
+            speed,
+            colour,
+            timer: 0.0,
+            come: 0,
+            rings: Vec::new(),
+        };
+        if speed == 0.0 && visible > 0 {
+            let step = (max - min) / visible as f32;
+            a.rings = (0..visible).map(|i| max - step * i as f32).collect();
+            a.come = visible;
+            a.total = visible;
+        }
+        a
+    }
+
+    fn step(&mut self, dt: f32) {
+        for r in &mut self.rings {
+            *r += self.speed * dt;
+        }
+        if self.come < self.total {
+            self.timer -= dt;
+            if self.timer < 0.0 {
+                self.timer = self.delay;
+                self.come += 1;
+                if self.rings.len() as u32 >= self.visible && !self.rings.is_empty() {
+                    // The oldest makes room.
+                    self.rings.remove(0);
+                }
+                if self.visible > 0 {
+                    self.rings
+                        .push(if self.speed < 0.0 { self.max } else { self.min });
+                }
+            }
+        }
+        let (min, max) = (self.min, self.max);
+        self.rings.retain(|&w| w <= max && w >= min);
+    }
+
+    /// The rings to draw: each one's width and opacity (0 to 1).
+    pub fn rings(&self) -> Vec<(f32, f32)> {
+        let span = self.max - self.min;
+        self.rings
+            .iter()
+            .map(|&w| {
+                let t = if span > 0.0 {
+                    ((w - self.min) / span).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                (
+                    w,
+                    self.alpha_at_min + (self.alpha_at_max - self.alpha_at_min) * t,
+                )
+            })
+            .collect()
+    }
+}
+
 /// A blip's animators.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Anims {
     pub size: Option<SizeAnim>,
     pub alpha: Option<AlphaAnim>,
+    pub sonar: Option<SonarAnim>,
 }
 
 /// One value's step between its limits: the new value and speed.
@@ -115,6 +240,13 @@ impl Anims {
                 *alpha = (a.value * 255.0).clamp(0.0, 255.0) as u8;
             }
         }
+        if let Some(a) = &mut self.sonar {
+            if runs_out(&mut a.left, dt) {
+                self.sonar = None;
+            } else {
+                a.step(dt);
+            }
+        }
     }
 
     /// Takes off the animators of `kind` (`size`, `alpha`, `sonar`, or
@@ -131,10 +263,13 @@ impl Anims {
         {
             *alpha = a.original;
         }
+        if all || kind == "sonar" {
+            self.sonar = None;
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.size.is_none() && self.alpha.is_none()
+        self.size.is_none() && self.alpha.is_none() && self.sonar.is_none()
     }
 }
 
@@ -153,6 +288,7 @@ mod tests {
                 original: [5.0, 5.0],
             }),
             alpha: None,
+            sonar: None,
         }
     }
 
@@ -198,6 +334,66 @@ mod tests {
         assert_eq!(s, [5.0, 5.0]);
     }
 
+    fn sonar(speed: f32, total: u32, visible: u32) -> SonarAnim {
+        SonarAnim::new(
+            0.0,
+            "ring".into(),
+            total,
+            visible,
+            [2.0, 10.0],
+            1.0,
+            [1.0, 0.0],
+            speed,
+            [255; 3],
+        )
+    }
+
+    /// Rings come one every delay, the first at once, grow, and go past
+    /// the largest width; no more than the total come.
+    #[test]
+    fn sonar_rings_come_grow_and_go() {
+        let mut a = sonar(4.0, 3, 8);
+        a.step(0.5);
+        // The first at once, at the smallest width.
+        assert_eq!(a.rings, [2.0]);
+        a.step(0.5);
+        assert_eq!(a.rings, [4.0]);
+        a.step(0.5);
+        assert_eq!(a.rings, [6.0]);
+        a.step(0.5);
+        // A second once the delay has run out (past it, not on it).
+        assert_eq!(a.rings, [8.0, 2.0]);
+        // Its opacity runs from the one at the smallest to the one at the
+        // largest width.
+        assert_eq!(a.rings(), [(8.0, 0.25), (2.0, 1.0)]);
+        for _ in 0..20 {
+            a.step(0.5);
+        }
+        assert!(a.rings.is_empty());
+        assert_eq!(a.come, 3);
+    }
+
+    /// With as many up as may show, the oldest makes room; shrinking
+    /// rings start at the largest width; with no speed they stand spread.
+    #[test]
+    fn sonar_rings_keep_to_their_number() {
+        let mut a = sonar(1.0, 10, 2);
+        for _ in 0..3 {
+            a.step(1.0);
+            a.step(0.001);
+        }
+        assert_eq!(a.rings.len(), 2);
+        assert!(a.rings[0] > a.rings[1]);
+        let mut b = sonar(-4.0, 2, 8);
+        b.step(0.5);
+        assert_eq!(b.rings, [10.0]);
+        let c = sonar(0.0, 99, 4);
+        assert_eq!(c.rings, [10.0, 8.0, 6.0, 4.0]);
+        assert_eq!((c.come, c.total), (4, 4));
+        // No more than eight show.
+        assert_eq!(sonar(0.0, 99, 20).rings.len(), 8);
+    }
+
     /// The opacity is put on the limit it passes, and given back when the
     /// animator is taken off.
     #[test]
@@ -213,6 +409,7 @@ mod tests {
                 value: 1.0,
                 original: 255,
             }),
+            sonar: None,
         };
         let (mut s, mut alpha) = ([5.0, 5.0], 255);
         a.step(&mut s, &mut alpha, 1.0);
