@@ -1394,6 +1394,16 @@ impl Mission {
         self.world.borrow_mut().hijack.set_hardpoint(guid, name, at);
     }
 
+    /// `guid`'s mass as its physics reports it, kg (`Object.GetMass`),
+    /// or `None` once it has none.
+    pub fn set_mass(&mut self, guid: u32, mass: Option<f32>) {
+        let mut w = self.world.borrow_mut();
+        match mass {
+            Some(m) => w.masses.insert(guid, m),
+            None => w.masses.remove(&guid),
+        };
+    }
+
     /// What `cargo` hangs on: the carrier whose winch has it
     /// (`Object.IsWinched`), or none.
     pub fn set_winched(&mut self, cargo: u32, carrier: Option<u32>) {
@@ -2866,6 +2876,27 @@ mod tests {
         m.set_subtitles(false);
         m.set_tutorials(true);
         assert_eq!(ask(&m), [false, true]);
+    }
+
+    // From the 360 code (0x8233BF58): `Player.GetCamera(player)` answers
+    // that player's camera; here the one camera, named by the player, as
+    // the camera calls take it (`crate::script_camera`). Registered once:
+    // a second registration installed later wins silently.
+    #[test]
+    fn the_players_camera_is_named_by_the_player_and_registered_once() {
+        let m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let same: bool = m
+            .lua()
+            .load("local p = Player.GetLocalPlayer() return Player.GetCamera(p) == p")
+            .eval()
+            .unwrap();
+        assert!(same);
+        let sources = [include_str!("api.rs"), include_str!("hijack.rs")];
+        let count: usize = sources
+            .iter()
+            .map(|s| s.matches(r#"add(&player, "GetCamera""#).count())
+            .sum();
+        assert_eq!(count, 1, "Player.GetCamera registered {count} times");
     }
 
     #[test]

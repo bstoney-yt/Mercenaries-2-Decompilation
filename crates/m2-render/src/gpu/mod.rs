@@ -1012,7 +1012,7 @@ impl WgpuBackend {
             Target::Window { config, .. } => config.format,
             Target::Offscreen { format, .. } => *format,
         };
-        let post = post::Post::new(&device, output, width, height);
+        let post = post::Post::new(&device, output, width, height, &depth.view);
         Self {
             default_material: Self::material_group(
                 &device,
@@ -1150,7 +1150,9 @@ impl WgpuBackend {
         };
         let depth = texture(
             "depth",
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let scene = texture(
             "scene depth",
@@ -1455,7 +1457,7 @@ impl WgpuBackend {
     fn size_world(&mut self) {
         let (w, h) = self.world_size();
         self.depth = Self::depth_targets(&self.device, &self.scene_layout, w, h);
-        self.post.resize(&self.device, w, h);
+        self.post.resize(&self.device, w, h, &self.depth.view);
     }
 
     /// Switches vertical sync (window targets only).
@@ -2421,6 +2423,7 @@ impl WgpuBackend {
                         && y * h - half <= h
                 })
         };
+        self.post.set_projection(&view.projection);
         self.post.encode(&self.queue, &mut encoder, l, target, sun);
         mark(&mut encoder, 4);
         if let Some(t) = timer {

@@ -35,6 +35,7 @@ pub mod savedata;
 pub mod screen_queries;
 pub mod script;
 pub mod script_camera;
+pub mod script_effects;
 pub mod script_flags;
 pub mod script_hash;
 pub mod script_junk;

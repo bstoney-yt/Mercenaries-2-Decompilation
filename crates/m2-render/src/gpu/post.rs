@@ -94,6 +94,9 @@ struct Post {
     // square's half height, w 1 to draw; its turnings' cosines and sines
     flare: vec4<f32>,
     flare_rot: vec4<f32>,
+    // The depth of field: x, y the projection's z scale and offset (view
+    // depth -z = y / (depth + x)), z 1 to draw it
+    dof: vec4<f32>,
 };
 
 fn game_tone_map() -> bool {
@@ -178,6 +181,32 @@ fn sun_flare(uv: vec2<f32>) -> vec3<f32> {
     let f = (textureSampleLevel(flare_map, linear, a, 0.0).rgb
         + textureSampleLevel(flare_map, linear, b, 0.0).rgb) * 0.5;
     return sum * f * 0.6 * pow(max(f, vec3<f32>(0.0)), vec3<f32>(3.0));
+}
+
+// The frame's depth (reversed: 1 near, 0 far).
+@group(0) @binding(8) var depth_map: texture_depth_2d;
+
+// The game's depth of field as its camera has it by default (from the
+// 360 code: the camera settings' defaults at 0x821B6148 and how the post
+// pass hands them to its composite, 0x821BD348; the composite, the
+// install's shader 526): sharp from 0.1 to 0.2 m and from there out to
+// 100 m, fading to 300 m; never less than 0.4 sharp (one less twice the
+// camera's 0.3), the rest the first blur level (the frame halved, its
+// values taken back from the 2.5 power).
+const DOF_NEAR: vec2<f32> = vec2<f32>(0.0, 0.1);
+const DOF_FAR: vec2<f32> = vec2<f32>(100.0, 300.0);
+const DOF_LEAST_SHARP: f32 = 0.4;
+
+// How sharp the pixel at `uv` is drawn (1: all the frame, 0: all the
+// first blur level).
+fn dof_sharpness(uv: vec2<f32>) -> f32 {
+    let size = vec2<f32>(textureDimensions(depth_map));
+    let px = vec2<i32>(clamp(uv * size, vec2<f32>(0.0), size - 1.0));
+    let d = textureLoad(depth_map, px, 0);
+    let z = post.dof.y / (d + post.dof.x);
+    let near = clamp((z - DOF_NEAR.y) / (DOF_NEAR.y - DOF_NEAR.x), 0.0, 1.0);
+    let far = clamp((z - DOF_FAR.y) / (DOF_FAR.x - DOF_FAR.y), 0.0, 1.0);
+    return max(DOF_LEAST_SHARP, near * far);
 }
 
 // Exposure, scaled for the eye's adaptation.
@@ -433,6 +462,11 @@ fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
         if post.flare.w > 0.5 {
             c = c + sun_flare(v.uv);
         }
+        // The depth of field, before the bloom (as the game's composite).
+        if post.dof.z > 0.5 {
+            let soft = pow(max(textureSampleLevel(extra2, linear, v.uv, 0.0).rgb, vec3<f32>(0.0)), vec3<f32>(0.4));
+            c = mix(soft, c, dof_sharpness(v.uv));
+        }
         // Bloom: the frame taken part of the way to the blurred image
         // times 1.2; the compression divides by the blurred image's
         // luminance, not the pixel's own (a local tone map).
@@ -488,6 +522,7 @@ struct Uniforms {
     blur: [f32; 4],
     flare: [f32; 4],
     flare_rot: [f32; 4],
+    dof: [f32; 4],
 }
 
 /// The passes, by index: bright, blur across, blur down, composite, then
@@ -572,6 +607,8 @@ pub struct Post {
     last: Cell<Option<Instant>>,
     /// Frames drawn, seeding the grain.
     frame: Cell<u32>,
+    /// The frame's projection: its z scale and offset ([`Post::set_projection`]).
+    projection: Cell<[f32; 2]>,
 }
 
 /// The post pass's images sized by the frame, and its bind groups.
@@ -637,6 +674,7 @@ impl Post {
         output: wgpu::TextureFormat,
         width: u32,
         height: u32,
+        depth: &wgpu::TextureView,
     ) -> Self {
         let texture = |binding| wgpu::BindGroupLayoutEntry {
             binding,
@@ -673,6 +711,17 @@ impl Post {
                 texture(5),
                 texture(6),
                 texture(7),
+                // The frame's depth, for the depth of field.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -760,7 +809,7 @@ impl Post {
             .collect();
         let adapted = std::array::from_fn(|_| target(device, "adapted", 1, 1));
         let (hdr_texture, hdr, sized) = Self::targets(
-            device, &layout, &sampler, &uniforms, &luminance, &adapted, width, height,
+            device, &layout, &sampler, &uniforms, &luminance, &adapted, width, height, depth,
         );
         Self {
             bright: pipeline("fs_bright", HDR_FORMAT),
@@ -791,6 +840,7 @@ impl Post {
             parity: Cell::new(0),
             last: Cell::new(None),
             frame: Cell::new(0),
+            projection: Cell::new([0.0, 1.0]),
         }
     }
 
@@ -806,6 +856,7 @@ impl Post {
         adapted: &[wgpu::TextureView; 2],
         width: u32,
         height: u32,
+        depth: &wgpu::TextureView,
     ) -> (wgpu::Texture, wgpu::TextureView, Images) {
         let hdr_texture = target_texture(
             device,
@@ -860,6 +911,7 @@ impl Post {
                     view(5, extra),
                     view(6, extra2),
                     view(7, blur_h0),
+                    view(8, depth),
                 ],
             })
         };
@@ -881,7 +933,7 @@ impl Post {
                 BRIGHT => group(i, [&merged, &glow[1], now, spare, spare]),
                 1 => group(i, [&glow[0], &hdr, now, spare, spare]),
                 2 => group(i, [&glow[1], &hdr, now, spare, spare]),
-                COMPOSITE => group(i, [&merged, &glow[0], now, &combined, spare]),
+                COMPOSITE => group(i, [&merged, &glow[0], now, &combined, &levels[0][0]]),
                 ADAPT => group(i, [&luminance[last], &glow[0], before, spare, spare]),
                 GAME_BLUR => group(i, [&merged, &glow[0], now, spare, spare]),
                 COMBINE => group(
@@ -936,10 +988,15 @@ impl Post {
         &self.sized.glow_layer
     }
 
-    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        if (width, height) == self.size {
-            return;
-        }
+    /// Remakes the images for a frame `width` x `height` whose depth is
+    /// `depth` (always: the depth image is new each time).
+    pub fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        depth: &wgpu::TextureView,
+    ) {
         (self.hdr_texture, self.hdr, self.sized) = Self::targets(
             device,
             &self.layout,
@@ -949,8 +1006,15 @@ impl Post {
             &self.adapted,
             width,
             height,
+            depth,
         );
         self.size = (width, height);
+    }
+
+    /// The frame's projection `p` (its z row's scale and offset), which
+    /// the depth of field turns depth back into distance with.
+    pub fn set_projection(&self, p: &m2_math::glam::Mat4) {
+        self.projection.set([p.z_axis.z, p.w_axis.z]);
     }
 
     /// Runs the passes for a frame lit by `lighting`, into `target`.
@@ -1128,6 +1192,10 @@ impl Post {
                 blur,
                 flare,
                 flare_rot,
+                dof: {
+                    let [scale, offset] = self.projection.get();
+                    [scale, offset, if game_blur { 1.0 } else { 0.0 }, 0.0]
+                },
             };
             queue.write_buffer(buffer, 0, bytemuck::bytes_of(&u));
         }
@@ -1367,6 +1435,18 @@ mod tests {
         for pair in LEVEL_DIVISORS.windows(2) {
             assert_eq!(pair[1], pair[0] * 2);
         }
+    }
+
+    #[test]
+    fn the_depth_of_field_takes_the_cameras_defaults() {
+        // 0x821B6148: focus 0 to 0.1 m near, 100 to 300 m far, and 0.3
+        // (so at least 1 - 2 x 0.3 sharp), as the composite (526) takes
+        // them; the soft image back from the 2.5 power.
+        let s = super::SHADER;
+        assert!(s.contains("const DOF_NEAR: vec2<f32> = vec2<f32>(0.0, 0.1);"));
+        assert!(s.contains("const DOF_FAR: vec2<f32> = vec2<f32>(100.0, 300.0);"));
+        assert!(s.contains("const DOF_LEAST_SHARP: f32 = 0.4;"));
+        assert!(s.contains("vec3<f32>(0.4));\n            c = mix(soft, c, dof_sharpness(v.uv));"));
     }
 
     #[test]
