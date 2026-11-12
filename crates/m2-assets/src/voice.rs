@@ -240,6 +240,55 @@ pub struct Track {
     /// What its record's level is scaled by: its block's value where it
     /// has one (see [`MixedCue`]), else 1.
     pub level: f32,
+    /// How its track loops ([`TrackLoop`]).
+    pub looping: TrackLoop,
+}
+
+/// How a mixed cue's track loops: each track keeps its own time, and
+/// when that reaches `end` with passes left it goes back to `start` and
+/// the track's records are started again as their own starts come.
+///
+/// ```text
+/// 0x00  u8   passes after the first: 0 none, 0xff for ever
+/// 0x01  u8   the track's events (levels, curves)
+/// 0x02  u8   the track's records
+/// 0x04  f32  where a pass goes back to, seconds (-1 on a track that
+///            does not loop)
+/// 0x08  f32  where a pass ends, seconds
+/// 0x0c  u32  0x1c, then offsets within the track
+/// ```
+///
+/// From the 360 code: a track's update (`0x82842088`) adds the frame's
+/// time to its own (+0xb8); when that reaches the header's float at +8
+/// and its count of passes (+0xbd, the header's first byte, `0x82841FD8`)
+/// is not 0, the records are started again (`0x82841DA8`, `0x82844BE8`),
+/// the time becomes the float at +4 plus what it overshot by, and the
+/// count goes down by one unless it is 0xff. A record starts once the
+/// track's time reaches its start (`0x82844BE8`).
+///
+/// From samples: `amb_jungle`'s one-shot tracks loop for ever over 0 to
+/// 23.2 s, 25.67 to 65 s and 3.4 to 17.2 s, with their records at 5.11,
+/// 26.97 and 6.2 s (the `mixhead` example).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrackLoop {
+    /// Passes after the first; 0xff: for ever.
+    pub passes: u8,
+    pub start: f32,
+    pub end: f32,
+}
+
+impl TrackLoop {
+    /// A track that plays through once.
+    pub const ONCE: Self = Self {
+        passes: 0,
+        start: -1.0,
+        end: -1.0,
+    };
+
+    /// Whether it loops for ever.
+    pub fn is_endless(&self) -> bool {
+        self.passes == 0xff
+    }
 }
 
 /// A plain cue: its name hash, the record it plays, and how long it
@@ -506,6 +555,9 @@ fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
     let mut mixes = Vec::new();
     let mut current: Option<MixedCue> = None;
     let mut pending: Vec<Curve> = Vec::new();
+    let mut looping = TrackLoop::ONCE;
+    // A loop's time: -1 for none, else seconds.
+    let time = |t: f32| t == -1.0 || (0.0..36000.0).contains(&t);
     let close = |m: Option<MixedCue>, mixes: &mut Vec<MixedCue>| {
         if let Some(m) = m.filter(|m| !m.tracks.is_empty()) {
             mixes.push(m);
@@ -515,6 +567,26 @@ fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
     while at + 4 <= region.len() {
         let (w, flags) = (word(at), word(at + 4));
         let (a, seconds) = (float(at + 8), float(at + 12));
+        // A track's header ([`TrackLoop`]): its counts, its loop and the
+        // 0x1c its offsets start with.
+        if current.is_some()
+            && at + 20 <= region.len()
+            && w >> 24 == 0
+            && (1..=16).contains(&(w >> 16 & 0xff))
+            && w >> 8 & 0xff <= 16
+            && word(at + 12) == 0x1c
+            && (0x1c..0x1000).contains(&word(at + 16))
+            && time(float(at + 4))
+            && time(float(at + 8))
+        {
+            looping = TrackLoop {
+                passes: w as u8,
+                start: float(at + 4),
+                end: float(at + 8),
+            };
+            at += 16;
+            continue;
+        }
         // A cue's hash, not a small offset (a track header's 0x44 is
         // followed by 0x10100, 0.2 and 0.7 on the minigun's loop).
         // Nor a track header (0x00010000 or 0x00010100), which a cue's
@@ -541,6 +613,7 @@ fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
                 curves: Vec::new(),
             });
             pending.clear();
+            looping = TrackLoop::ONCE;
             at += 16;
             continue;
         }
@@ -595,6 +668,7 @@ fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
                     start,
                     weight,
                     level: track_block(region, at - 16).unwrap_or(1.0),
+                    looping,
                 });
                 m.curves.push(std::mem::take(&mut pending));
                 at += 12;
@@ -902,6 +976,83 @@ mod tests {
         assert_eq!(t.mixes.len(), 1);
     }
 
+    // A looped mix as the ambience table has them: a bed track that
+    // plays through, and a one-shot track looping over its own span.
+    #[test]
+    fn a_track_carries_its_loop() {
+        let mut d = table(&[
+            line(1, RADIO, 10.0, 1000.0, 15),
+            line(2, RADIO, 10.0, 1000.0, 16),
+        ]);
+        let list = d.len() as u32;
+        let f = |v: f32| v.to_bits();
+        let words: Vec<u32> = vec![
+            0x9999_0077,
+            0x100,
+            f(0.316),
+            f(-1.0), // the mixed cue, looping
+            0x2_0000,
+            0x200,
+            f(1.0),
+            f(-1.0),
+            f(-1.0),
+            0,
+            0x44,
+            0x44,
+            // The bed's track: one record, no loop.
+            0x1_0000,
+            f(-1.0),
+            f(-1.0),
+            0x1c,
+            0x1c,
+            0x1c,
+            0x38,
+            0x102_0200,
+            1,
+            f(0.0),
+            0x10,
+            0xabcd,
+            0,
+            f(1.0),
+            0,
+            // A one-shot's: for ever over 0 to 23.2 s, its record 5.11 s in.
+            0x1_01ff,
+            f(0.0),
+            f(23.2),
+            0x1c,
+            0x64,
+            0x68,
+            0x84,
+            0x102_0201,
+            1,
+            f(5.11),
+            0x10,
+            0xabcd,
+            1,
+            f(0.25),
+            0,
+        ];
+        d.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+        let end = d.len() as u32;
+        d[0x18..0x1c].copy_from_slice(&list.to_le_bytes());
+        d[0x1c..0x20].copy_from_slice(&end.to_le_bytes());
+        let t = CueTable::parse_data(&d).unwrap();
+        let m = t.mix(0x9999_0077).unwrap();
+        assert_eq!(m.tracks.len(), 2);
+        assert_eq!(m.tracks[0].looping, TrackLoop::ONCE);
+        let shot = m.tracks[1];
+        assert_eq!((shot.record, shot.start, shot.weight), (1, 5.11, 0.25));
+        assert_eq!(
+            shot.looping,
+            TrackLoop {
+                passes: 0xff,
+                start: 0.0,
+                end: 23.2
+            }
+        );
+        assert!(shot.looping.is_endless());
+    }
+
     #[test]
     fn finds_mixed_cues_and_their_tracks() {
         let mut d = table(&[
@@ -970,14 +1121,16 @@ mod tests {
                     record: 1,
                     start: 0.0,
                     weight: 1.0,
-                    level: 1.0
+                    level: 1.0,
+                    looping: TrackLoop::ONCE,
                 },
                 Track {
                     table: 0xabcd,
                     record: 0,
                     start: 0.5667,
                     weight: 1.0,
-                    level: 1.0
+                    level: 1.0,
+                    looping: TrackLoop::ONCE,
                 }
             ]
         );

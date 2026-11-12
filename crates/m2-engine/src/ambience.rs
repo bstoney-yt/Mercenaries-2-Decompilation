@@ -20,15 +20,21 @@
 //!   survey example's `ambience` section).
 //! - That the stream track is the bed and loops: from the data (it alone
 //!   names the stream table; every region cue is a loop, -1 s).
-//! - What a one-shot track's start and weight mean in a looped mix is not
-//!   known (on a gun's shot the start is a delay within the shot). They
-//!   are taken as the mean seconds between its sounds and the chance each
-//!   comes (inferred, invented in detail: each wait is drawn from half to
-//!   one and a half times the start). Not checked against the game's code.
+//! - When a one-shot comes, from the 360 code: each track keeps its own
+//!   time and loops over its own span ([`m2_assets::voice::TrackLoop`]);
+//!   its record starts once that time reaches the record's start, so
+//!   once in each pass (`0x82842088`, `0x82844BE8`). `amb_jungle`'s
+//!   first one-shot is 5.11 s into a 23.2 s span: one every 23.2 s.
+//! - Whether it comes at all then, from the 360 code: the pick among the
+//!   track entry's variants (`0x82844FD0`) draws against the sum of
+//!   their weights and plays nothing when the draw is past it, so a lone
+//!   variant's weight is its chance (`amb_jungle`'s third: 0.25).
 //! - Where the one-shots sound from (10 to 40 m around the listener) is
-//!   invented, as before.
+//!   invented. The 360 gives each a random level per speaker instead
+//!   (the track's level event, `0x82844538`); not done.
 
 use m2_assets::CueTable;
+use m2_assets::voice::TrackLoop;
 
 /// A bed stream: which stream of `ambience.pws`, and how loud.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -37,12 +43,15 @@ pub struct Bed {
     pub volume: f32,
 }
 
-/// A layer of one-shots: a record's sounds by weight, every so often.
+/// A layer of one-shots: a record's sounds by weight, once in each pass
+/// of its track.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
-    /// Mean seconds between its sounds (the track's start).
-    pub every: f32,
-    /// The chance each comes (the track's weight).
+    /// Seconds into its track its sound starts (the track entry's start).
+    pub at: f32,
+    /// How its track loops.
+    pub looping: TrackLoop,
+    /// The chance it comes in a pass (the track entry's weight).
     pub chance: f32,
     pub volume: f32,
     pub min_distance: f32,
@@ -74,10 +83,6 @@ impl Layer {
         self.sounds.last().map(|s| (s.0, s.1))
     }
 }
-
-/// Shortest mean wait a layer is given, seconds (a track starting at 0
-/// that is not the bed would otherwise fire every frame; invented).
-const SHORTEST: f32 = 1.0;
 
 /// What an ambience cue plays.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -113,7 +118,8 @@ impl AmbiencePlan {
                     Some(bed) if plan.bed.is_none() => plan.bed = Some(bed),
                     Some(_) => {}
                     None => plan.layers.push(Layer {
-                        every: t.start.max(SHORTEST),
+                        at: t.start,
+                        looping: t.looping,
                         chance: t.weight.clamp(0.0, 1.0),
                         volume: r.volume * t.level,
                         min_distance: r.min_distance,
@@ -146,21 +152,35 @@ impl AmbiencePlan {
     }
 }
 
+/// One layer's track as it plays.
+#[derive(Clone, Copy, Debug)]
+struct Playing {
+    /// The track's time, seconds.
+    time: f32,
+    /// Passes left after this one; 0xff: for ever.
+    passes: u8,
+    /// Its record has been started in this pass.
+    started: bool,
+}
+
 /// When each of a plan's layers fires.
 #[derive(Clone, Debug, Default)]
 pub struct Layers {
-    /// Seconds until each layer's next try.
-    wait: Vec<f32>,
+    playing: Vec<Playing>,
 }
 
 impl Layers {
-    /// Starts `plan`'s layers, each a draw of its wait from now.
-    pub fn new(plan: &AmbiencePlan, mut random: impl FnMut() -> f32) -> Self {
+    /// Starts `plan`'s layers, each track at its time 0.
+    pub fn new(plan: &AmbiencePlan, _random: impl FnMut() -> f32) -> Self {
         Self {
-            wait: plan
+            playing: plan
                 .layers
                 .iter()
-                .map(|l| l.every * (0.5 + random()))
+                .map(|l| Playing {
+                    time: 0.0,
+                    passes: l.looping.passes,
+                    started: false,
+                })
                 .collect(),
         }
     }
@@ -173,13 +193,32 @@ impl Layers {
         mut random: impl FnMut() -> f32,
     ) -> Vec<usize> {
         let mut out = Vec::new();
-        for (i, (w, l)) in self.wait.iter_mut().zip(&plan.layers).enumerate() {
-            *w -= dt;
-            if *w <= 0.0 {
-                *w += l.every * (0.5 + random());
+        for (i, (p, l)) in self.playing.iter_mut().zip(&plan.layers).enumerate() {
+            let mut start = |p: &mut Playing| {
+                p.started = true;
                 if random() < l.chance {
                     out.push(i);
                 }
+            };
+            p.time += dt;
+            let TrackLoop {
+                start: from, end, ..
+            } = l.looping;
+            // The pass is over (a loop of no length would never end).
+            if p.passes != 0 && end > from && p.time >= end {
+                // What the pass still owed is started as it ends.
+                if !p.started && l.at <= end {
+                    start(p);
+                }
+                p.time = from + (p.time - end);
+                if p.passes != 0xff {
+                    p.passes -= 1;
+                }
+                // Back to the first record at or after where it goes back to.
+                p.started = l.at < from;
+            }
+            if !p.started && p.time >= l.at {
+                start(p);
             }
         }
         out
@@ -206,13 +245,22 @@ mod tests {
         }
     }
 
-    fn track(record: u32, start: f32, weight: f32) -> Track {
+    fn track(record: u32, start: f32, weight: f32, span: (f32, f32)) -> Track {
         Track {
             table: TABLE,
             record,
             start,
             weight,
             level: 1.0,
+            looping: if span.1 > 0.0 {
+                TrackLoop {
+                    passes: 0xff,
+                    start: span.0,
+                    end: span.1,
+                }
+            } else {
+                TrackLoop::ONCE
+            },
         }
     }
 
@@ -239,9 +287,9 @@ mod tests {
                 seconds: -1.0,
                 curves: Vec::new(),
                 tracks: vec![
-                    track(0, 0.0, 1.0),
-                    track(1, 5.11, 1.0),
-                    track(2, 26.97, 0.25),
+                    track(0, 0.0, 1.0, (-1.0, -1.0)),
+                    track(1, 5.11, 1.0, (0.0, 23.2)),
+                    track(2, 26.97, 0.25, (25.67, 65.0)),
                 ],
             }],
         }
@@ -259,8 +307,9 @@ mod tests {
             })
         );
         assert_eq!(p.layers.len(), 2);
-        assert_eq!((p.layers[0].every, p.layers[0].chance), (5.11, 1.0));
-        assert_eq!((p.layers[1].every, p.layers[1].chance), (26.97, 0.25));
+        assert_eq!((p.layers[0].at, p.layers[0].chance), (5.11, 1.0));
+        assert_eq!((p.layers[1].at, p.layers[1].chance), (26.97, 0.25));
+        assert_eq!(p.layers[0].looping.end, 23.2);
         assert_eq!(p.banks(), [0x7250_8dc1, JUNGLE]);
         let plain = AmbiencePlan::of(&t, 0x5eb9_3649).unwrap();
         assert_eq!(plain.bed.map(|b| b.stream), Some(9));
@@ -273,7 +322,33 @@ mod tests {
     }
 
     #[test]
-    fn layers_come_about_as_often_as_their_start_and_weight_say() {
+    fn a_layer_comes_once_in_each_pass_of_its_track() {
+        let p = AmbiencePlan::of(&table(), JUNGLE).unwrap();
+        let mut layers = Layers::new(&p, || 0.0);
+        let dt = 0.01;
+        let mut times: [Vec<f32>; 2] = Default::default();
+        for k in 1..=20_000 {
+            // A draw of 0.2 is under both chances: every pass is heard.
+            for i in layers.step(&p, dt, || 0.2) {
+                times[i].push(k as f32 * dt);
+            }
+        }
+        let near = |a: &[f32], b: &[f32]| {
+            assert_eq!(a.len(), b.len(), "{a:?} vs {b:?}");
+            for (x, y) in a.iter().zip(b) {
+                assert!((x - y).abs() < 0.05, "{a:?} vs {b:?}");
+            }
+        };
+        // 5.11 s into a 23.2 s span: then every 23.2 s.
+        let first: Vec<f32> = (0..9).map(|n| 5.11 + 23.2 * n as f32).collect();
+        near(&times[0], &first);
+        // 26.97 s in, the span going back from 65 to 25.67 s: every 39.33 s.
+        let second: Vec<f32> = (0..5).map(|n| 26.97 + 39.33 * n as f32).collect();
+        near(&times[1], &second);
+    }
+
+    #[test]
+    fn a_layer_s_weight_is_the_chance_it_comes_in_a_pass() {
         let p = AmbiencePlan::of(&table(), JUNGLE).unwrap();
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut random = move || {
@@ -284,15 +359,15 @@ mod tests {
         };
         let mut layers = Layers::new(&p, &mut random);
         let mut counts = [0usize; 2];
-        let (dt, seconds) = (1.0 / 60.0, 100_000.0);
+        let (dt, seconds) = (0.05, 400_000.0);
         for _ in 0..(seconds / dt) as usize {
             for i in layers.step(&p, dt, &mut random) {
                 counts[i] += 1;
             }
         }
-        // 100,000 s: 19,569 of the first (every 5.11 s), 927 of the second
-        // (a quarter of every 26.97 s).
-        let want = [seconds / 5.11, seconds / 26.97 * 0.25];
+        // Every pass of the first (23.2 s), a quarter of the second's
+        // (39.33 s).
+        let want = [seconds / 23.2, seconds / 39.33 * 0.25];
         for (n, w) in counts.iter().zip(want) {
             assert!((*n as f32 / w - 1.0).abs() < 0.08, "{counts:?} vs {want:?}");
         }
