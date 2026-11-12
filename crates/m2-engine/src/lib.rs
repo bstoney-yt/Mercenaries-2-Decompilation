@@ -23,6 +23,7 @@ pub mod ai_sense;
 pub mod ai_target;
 pub mod aim_sweep;
 pub mod ambience;
+pub mod ambience_stack;
 pub mod anim;
 pub mod assets;
 pub mod atmosphere;

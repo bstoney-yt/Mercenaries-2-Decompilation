@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use m2_engine::ambience::{AmbiencePlan, Layers};
+use m2_engine::ambience_stack::{AmbienceStack, Change, Entry, Inside};
 use m2_engine::audio::{
     EngineCue, EngineSounds, Falloff, KeySounds, Play, SoundLibrary, VoiceBank,
 };
@@ -216,6 +217,10 @@ pub struct GameAudio {
     /// it plays.
     zone_cue: Option<u32>,
     zone: Option<Zone>,
+    /// The ambiences asked for (by the scripts and the regions the
+    /// listener is in), and the regions they are in.
+    ambiences: AmbienceStack,
+    ambience_regions: Inside,
     /// Beds fading: voice, its gain now and where it goes (out: 0, then
     /// stopped).
     zone_fades: Vec<(VoiceId, f32, f32)>,
@@ -1294,6 +1299,8 @@ impl GameAudio {
                 rx
             }),
             zone_cue: None,
+            ambiences: AmbienceStack::new(),
+            ambience_regions: Inside::default(),
             zone: None,
             zone_fades: Vec::new(),
             seed: 0x9e37_79b9_7f4a_7c15,
@@ -1879,6 +1886,61 @@ impl GameAudio {
         self.seed ^= self.seed >> 7;
         self.seed ^= self.seed << 17;
         (self.seed >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// A script cues (`Sound.CueAmbience`) or stops (`Sound.StopAmbience`)
+    /// the ambience of cue `cue`, a name hash. Anything else that wants
+    /// an ambience heard (an alarm, an interior) asks the same way, with
+    /// its own [`Entry`], through [`Self::cue_ambience`].
+    pub fn script_ambience(&mut self, cue: u32, on: bool) {
+        if on {
+            self.cue_ambience(Entry::script(cue));
+        } else {
+            self.stop_ambience(cue, 0);
+        }
+    }
+
+    /// Asks for an ambience; the list ([`AmbienceStack`]) decides which
+    /// of those asked for plays.
+    pub fn cue_ambience(&mut self, entry: Entry) {
+        if !self.ambiences.cue(entry) {
+            eprintln!("ambience: cue {:08x} dropped, the list is full", entry.cue);
+        }
+    }
+
+    /// Takes back an ambience asked for, by its cue and overlay.
+    pub fn stop_ambience(&mut self, cue: u32, overlay: u32) {
+        self.ambiences.stop(cue, overlay);
+    }
+
+    /// `Sound.SilenceAmbience`: the ambience stops, or plays again.
+    pub fn silence_ambience(&mut self, on: bool) {
+        let change = self.ambiences.silence(on);
+        self.ambience_changed(&change);
+    }
+
+    /// The listener is inside the ambience regions `inside` (each one's
+    /// entity and ambience). Answers the cue to play now
+    /// ([`Self::zone_ambience`]): the list's pick, none while silenced.
+    pub fn ambience_heard(&mut self, inside: &[(u32, Entry)]) -> Option<u32> {
+        self.ambience_regions.listen(&mut self.ambiences, inside);
+        let change = self.ambiences.update();
+        self.ambience_changed(&change);
+        self.ambiences.heard()
+    }
+
+    /// Notes what a change of ambience asks for beyond the cue played:
+    /// its bank (the regions' banks are all read at the start, so none
+    /// is loaded here), its overlay cue and its reverb preset, which are
+    /// not acted on (no region or script sets either).
+    fn ambience_changed(&self, change: &Change) {
+        if change.is_empty() {
+            return;
+        }
+        eprintln!(
+            "ambience: stop {:08x?}, bank {:08x?}, start {:08x?}, reverb {:08x?}",
+            change.stop, change.bank, change.start, change.reverb
+        );
     }
 
     /// The regions' ambience, once read: plays region cue `cue` (`None`:
