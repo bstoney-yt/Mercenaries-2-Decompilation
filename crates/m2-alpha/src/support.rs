@@ -52,13 +52,36 @@ const SAT_HEIGHT: f32 = 170.0;
 const SAT_SPAN: f32 = 110.0;
 const SAT_NEAR: f32 = 5.0;
 const SAT_FAR: f32 = 3000.0;
-/// The view moves this fast with the keys or the stick (m/s), and no
-/// further than this from her (metres). The mouse leaves it be: on the PC
-/// it moves with W A S D (the owner's play of the PC game). Invented: 5
-/// was found too slow to call strikes with (playtest on the phone), 20
-/// crosses its reach in five seconds.
-const VIEW_SPEED: f32 = 20.0;
+/// The view goes no further than this from her (metres; the scripts'
+/// `nRadius`). The mouse leaves it be: on the PC it moves with W A S D
+/// (the owner's play of the PC game).
 pub const VIEW_REACH: f32 = 100.0;
+
+/// How fast the view moves with the keys or the stick pushed all the way
+/// (m/s), its camera `height` metres up (its place's own height, not the
+/// height over the ground).
+///
+/// From the 360 code, the map mode camera's update (`0x824C6740`): each
+/// of its three inputs (-1 to 1: the two pans and the zoom, as its
+/// controller `0x824322D0` posts them from the pad) moves it by the input
+/// times its speed (24, set by its constructor `0x824373B0`) times its
+/// height, kept between 100 and 2000, times 0.01, a second. So the higher
+/// the view the faster it moves: 40.8 m/s from 170 m up.
+fn view_speed(height: f32) -> f32 {
+    24.0 * height.clamp(100.0, 2000.0) * 0.01
+}
+
+/// Where the view is after a step's move `moved` from `at`, `centre` the
+/// place it opened over. From the 360 code (the same update): a move that
+/// would take it further than the radius from there is not made at all
+/// (the view stops; it does not slide along the edge).
+fn view_moved(at: Vec2, moved: Vec2, centre: Vec2) -> Vec2 {
+    if (at + moved).distance_squared(centre) > VIEW_REACH * VIEW_REACH {
+        at
+    } else {
+        at + moved
+    }
+}
 /// The designator comes up this long before the view opens (seconds; the
 /// videos: a moment, up to a second).
 const EQUIP_TIME: f32 = 0.5;
@@ -643,8 +666,12 @@ impl Support {
         }
         // Screen right is the world's -x, looking down with north (+z) up.
         let steer = |at: Vec2| {
-            let moved = Vec2::new(-call.steer.x, call.steer.y) * VIEW_SPEED * dt;
-            here + (at + moved - here).clamp_length_max(VIEW_REACH)
+            let speed = view_speed(her.y + SAT_HEIGHT);
+            view_moved(
+                at,
+                Vec2::new(-call.steer.x, call.steer.y) * speed * dt,
+                here,
+            )
         };
         self.phase = match self.phase {
             _ if self.pda => self.phase,
@@ -954,6 +981,28 @@ impl Support {
 mod tests {
     use super::*;
 
+    /// The 360's map camera law: 24 times a hundredth of its height a
+    /// second, the height kept between 100 and 2000; a move past the
+    /// radius is not made.
+    #[test]
+    fn the_view_moves_by_its_height_and_stops_at_its_reach() {
+        assert!((view_speed(170.0) - 40.8).abs() < 1e-4);
+        assert_eq!(view_speed(20.0), 24.0);
+        assert_eq!(view_speed(5000.0), 480.0);
+        let centre = Vec2::new(10.0, -5.0);
+        let at = centre + Vec2::new(VIEW_REACH - 1.0, 0.0);
+        assert_eq!(
+            view_moved(at, Vec2::new(0.5, 0.0), centre),
+            at + Vec2::new(0.5, 0.0)
+        );
+        assert_eq!(view_moved(at, Vec2::new(2.0, 0.0), centre), at);
+        // Back inwards it moves as ever.
+        assert_eq!(
+            view_moved(at, Vec2::new(-2.0, 0.0), centre),
+            at - Vec2::new(2.0, 0.0)
+        );
+    }
+
     const DT: f32 = 0.05;
 
     /// Steps `s` once, keeping what it posted.
@@ -1028,7 +1077,8 @@ mod tests {
         assert_eq!(posts, [TARGETTING_START]);
         assert!(s.busy());
         assert_eq!(s.looking(), Some(Vec2::new(her.x, her.z)));
-        // Steered over the gate, up the screen (north), at 20 m/s.
+        // Steered over the gate, up the screen (north), at the speed its
+        // height gives.
         let mut seconds = 0.0;
         for _ in 0..1000 {
             let at = s.looking().unwrap();
@@ -1046,7 +1096,9 @@ mod tests {
             seconds += DT;
         }
         assert!(s.looking().unwrap().distance(gate) < 1.0);
-        assert!((3.0..3.6).contains(&seconds), "{seconds}");
+        // 65 m at 36.5 m/s (the camera 152 m up: she stands 18 m under
+        // the sea's level), slowing over the last half metre.
+        assert!((1.7..2.1).contains(&seconds), "{seconds}");
         press_fire(&mut s, her, &mut posts);
         assert!(matches!(s.phase, Phase::Timing { .. }));
         // The wheel opens with its needle at the top: presses don't count
@@ -1176,7 +1228,12 @@ mod tests {
             step(&mut s, right, her, &mut posts);
         }
         let at = s.looking().unwrap();
-        assert!((at.length() - VIEW_REACH).abs() < 0.1, "{at}");
+        // It stops at the last step that stays inside the reach.
+        let step_length = view_speed(SAT_HEIGHT) * DT;
+        assert!(
+            at.length() <= VIEW_REACH && at.length() > VIEW_REACH - step_length,
+            "{at}"
+        );
         // Right on the screen is -x.
         assert!(at.x < 0.0);
         let select = Call {
