@@ -40,8 +40,6 @@ pub struct MiscState {
     pub ambience_banks: Vec<u32>,
     /// `Ai.AddSubject`'s slots: 0 is free.
     pub ai_subjects: [u32; AI_SUBJECTS],
-    /// `Junk.ToggleAlarm`: objects whose alarm was toggled, in order.
-    pub alarms: Vec<u32>,
 }
 
 pub(crate) fn install(
@@ -69,7 +67,9 @@ pub(crate) fn install(
     let ai = lib("Ai")?;
     add(&ai, "AddSubject", add_subject)?;
     add(&ai, "RemoveSubject", remove_subject)?;
-    add(&lib("Junk")?, "ToggleAlarm", toggle_alarm)?;
+    let junk = lib("Junk")?;
+    add(&junk, "ToggleAlarm", toggle_alarm)?;
+    add(&junk, "ActivateAlarm", activate_alarm)?;
     Ok(())
 }
 
@@ -313,15 +313,33 @@ fn remove_subject(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<Mul
     one(Value::Boolean(removed))
 }
 
-/// `Junk.ToggleAlarm(object)` (0x82327380): toggles its alarm (message 2);
-/// returns nothing, or nil without a guid.
+/// `Junk.ToggleAlarm(object)` (0x82327380): posts a flip of its alarm
+/// ([`crate::alarm`]); returns nothing, or nil without a guid.
 fn toggle_alarm(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
     match guid(a.first()) {
         Some(g) => {
-            w.misc.alarms.push(g);
+            w.alarms.post(g, crate::alarm::TOGGLE);
             nothing()
         }
         None => nil(),
+    }
+}
+
+/// `Junk.ActivateAlarm(object, on)` (0x823272D8): posts its alarm on
+/// (`true`) or off (`false`) ([`crate::alarm`]); returns nothing, or nil
+/// without a guid and a boolean. No script in the data calls it.
+fn activate_alarm(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
+    match (guid(a.first()), boolean(a.get(1))) {
+        (Some(g), Some(on)) => {
+            let mode = if on {
+                crate::alarm::ON
+            } else {
+                crate::alarm::OFF
+            };
+            w.alarms.post(g, mode);
+            nothing()
+        }
+        _ => nil(),
     }
 }
 
@@ -418,6 +436,10 @@ mod tests {
         assert_eq!(got("Ai.RemoveSubject(nil)"), Value::Boolean(false));
         // Alarms.
         assert_eq!(n(&format!("Junk.ToggleAlarm({me})")), 0);
-        assert_eq!(w().alarms, [1]);
+        assert_eq!(n(&format!("Junk.ActivateAlarm({me}, false)")), 0);
+        assert_eq!(n(&format!("Junk.ActivateAlarm({me}, true)")), 0);
+        assert_eq!(got(&format!("Junk.ActivateAlarm({me})")), Value::Nil);
+        assert_eq!(got("Junk.ToggleAlarm(nil)"), Value::Nil);
+        assert_eq!(world.borrow().alarms.queue, [(1, 2), (1, 1), (1, 0)]);
     }
 }
