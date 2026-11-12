@@ -10,14 +10,17 @@
 //! For `crate` it then stands the player beside the first one, hangs it
 //! on a winch, lets it go and destroys it, printing the marker count
 //! after each. For `collectable` it stands her beside the first one and
-//! takes its context action. Prints names, counts and the scripts'
+//! takes its context action; for `pmcgate` and `repairpad` it counts
+//! what they ask of the first one. Prints names, counts and the scripts'
 //! errors only.
 
 use std::fs::File;
 use std::io::BufReader;
 
 use m2_assets::WadArchive;
+use m2_game::api::Command;
 use m2_game::mission::{GameData, Mission, OBJECT_SCRIPTS};
+use m2_game::vehicle_state::VehicleCommand;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -117,6 +120,29 @@ fn main() -> Result<()> {
             offered(&mission),
             alive(&mission)
         );
+    }
+    if ["pmcgate", "repairpad"].contains(&name.to_ascii_lowercase().as_str())
+        && let Some(&(_, first, at)) = on.first()
+    {
+        // Beside the first, for four seconds: what the scripts ask of it.
+        mission.put_player([at[0] + 5.0, at[1], at[2]]);
+        let (mut opened, mut parts) = (0, 0);
+        let end = mission.now() + 4.0;
+        while mission.now() < end {
+            mission.tick(0.25);
+            for c in mission.take_commands() {
+                match c {
+                    Command::OpenGate(g) if g == first => opened += 1,
+                    Command::Vehicle(VehicleCommand::Part { vehicle, on, .. })
+                        if vehicle == first && on =>
+                    {
+                        parts += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        println!("beside the first: {opened} gate openings, {parts} parts turned on");
     }
     println!("{name} lines logged: {failures}");
     Ok(())

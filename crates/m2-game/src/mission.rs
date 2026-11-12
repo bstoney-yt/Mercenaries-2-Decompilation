@@ -2999,7 +2999,16 @@ fn seat_crew(
 /// all the script does of the pickup; its death takes the offer away
 /// (`Inheritable`'s `OnDeath`). One labelled `CollectableInvalidated` is
 /// killed as it comes in instead.
-pub const OBJECT_SCRIPTS: [(&str, u32); 11] = [
+///
+/// `pmcgate` is the script of the PMC's own gates and one Venezuelan
+/// outpost gate (6 layer entities name it themselves, 0xff562dd6): two
+/// seconds after the gate wakes it opens (`Object.OpenGate`), and stays
+/// open.
+///
+/// `repairpad` is the script of the helipads and the PMC's garage
+/// (0xcd561a19): awake, its lights are on (`Vehicle.SetParts` of
+/// `LightFront`), and they go out when it dies.
+pub const OBJECT_SCRIPTS: [(&str, u32); 13] = [
     ("FactionZone", 0x6726_7cc1),
     ("friendlygate", FRIENDLY_GATE),
     ("Munitions", MUNITIONS),
@@ -3011,7 +3020,14 @@ pub const OBJECT_SCRIPTS: [(&str, u32); 11] = [
     ("Alarm", ALARM),
     ("crate", SUPPLY_CRATE),
     ("collectable", COLLECTABLE),
+    ("pmcgate", PMC_GATE),
+    ("repairpad", REPAIR_PAD),
 ];
+
+/// `pmcgate`'s module hash.
+pub const PMC_GATE: u32 = 0xff56_2dd6;
+/// `repairpad`'s module hash.
+pub const REPAIR_PAD: u32 = 0xcd56_1a19;
 
 /// `collectable`'s module hash.
 pub const COLLECTABLE: u32 = 0xb8c4_9381;
@@ -3964,6 +3980,31 @@ mod tests {
         m.tick(0.25);
         assert_eq!(m.context_text(guid), None);
         assert!(OBJECT_SCRIPTS.contains(&("collectable", COLLECTABLE)));
+    }
+
+    #[test]
+    fn a_gate_and_a_pad_ask_what_their_scripts_ask() {
+        let m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        // What `pmcgate` asks of its gate and `repairpad` of its pad.
+        m.lua()
+            .load(
+                r#"
+                local gate = Pg.Spawn("pmc_front_gate", 1, 0, 1, 0)
+                local pad = Pg.Spawn("_pmcoutpost_bld_hqgarage", 9, 0, 9, 0)
+                Object.OpenGate(gate)
+                Vehicle.SetParts(pad, "LightFront", true)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let commands = m.world.borrow_mut().take_commands();
+        assert!(commands.iter().any(|c| matches!(c, Command::OpenGate(_))));
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            Command::Vehicle(crate::vehicle_state::VehicleCommand::Part { on: true, .. })
+        )));
+        assert!(OBJECT_SCRIPTS.contains(&("pmcgate", PMC_GATE)));
+        assert!(OBJECT_SCRIPTS.contains(&("repairpad", REPAIR_PAD)));
     }
 
     #[test]
