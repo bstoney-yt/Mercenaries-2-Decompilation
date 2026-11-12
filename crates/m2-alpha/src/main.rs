@@ -1134,6 +1134,7 @@ fn run(
     args: &[String],
     event_loop: impl FnOnce() -> Result<EventLoop<()>, winit::error::EventLoopError>,
 ) -> anyhow::Result<()> {
+    spans::start_profiler();
     let mut options = parse_args(args)?;
     let ignored = screenshot_only_ignored(args);
     if !ignored.is_empty() {
@@ -9205,6 +9206,7 @@ impl Running {
         if self.background {
             return Ok(());
         }
+        spans::frame_mark();
         let now = Instant::now();
         let dt = (now - self.last).min(MAX_FRAME).as_secs_f64();
         self.read_pad(dt);
