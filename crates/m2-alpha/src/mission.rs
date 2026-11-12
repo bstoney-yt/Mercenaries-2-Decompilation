@@ -4614,21 +4614,7 @@ impl MissionLink {
         };
         let w = mission.world().borrow();
         let hud = &w.hud;
-        // The objectives on the map, else the mission's list.
-        let mut objectives: Vec<String> = hud
-            .objectives
-            .iter()
-            .filter(|(name, _)| !name.ends_with("_PreMission"))
-            .map(|(_, o)| mission.text(&o.text))
-            .collect();
-        if objectives.is_empty() {
-            objectives = hud.mission.iter().map(|(t, _)| mission.text(t)).collect();
-        }
-        // Each text once, in order: the map has an objective for each
-        // target, with its job's text (a log listed "Destroy targets
-        // (0/13)" six times for two jobs' 26 targets).
-        let mut seen = HashSet::new();
-        objectives.retain(|o| seen.insert(o.clone()));
+        let objectives = objective_texts(mission, hud);
         let discs = hud
             .discs
             .values()
@@ -4703,6 +4689,54 @@ impl MissionLink {
             pickup_markers: hud.pickup_markers,
         }
     }
+
+    /// [`view`](Self::view)'s objectives alone. The whole view costs 3 to
+    /// 6 ms in a busy contract (its markers, radar and the scripts' kept
+    /// tables), which the autoplay run paid three times a tick for three
+    /// of its fields; these three read only what they give.
+    pub fn objectives(&self) -> Vec<String> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        objective_texts(mission, &mission.world().borrow().hud)
+    }
+
+    /// [`view`](Self::view)'s HUD calls alone, oldest first.
+    pub fn hud_calls(&self) -> Vec<HudCall> {
+        match &self.state {
+            State::Running(mission) => hud_calls(mission.lua()),
+            _ => Vec::new(),
+        }
+    }
+
+    /// [`view`](Self::view)'s tutorial text alone, its keys named.
+    pub fn tutorial(&self) -> Option<String> {
+        if !matches!(self.state, State::Running(_)) {
+            return None;
+        }
+        self.tutorial
+            .as_ref()
+            .map(|t| crate::input::name_keys(t, &self.keys))
+    }
+}
+
+/// The objectives on the map, else the mission's list, each text once.
+fn objective_texts(mission: &Mission, hud: &m2_game::hud::Hud) -> Vec<String> {
+    let mut objectives: Vec<String> = hud
+        .objectives
+        .iter()
+        .filter(|(name, _)| !name.ends_with("_PreMission"))
+        .map(|(_, o)| mission.text(&o.text))
+        .collect();
+    if objectives.is_empty() {
+        objectives = hud.mission.iter().map(|(t, _)| mission.text(t)).collect();
+    }
+    // Each text once, in order: the map has an objective for each
+    // target, with its job's text (a log listed "Destroy targets
+    // (0/13)" six times for two jobs' 26 targets).
+    let mut seen = HashSet::new();
+    objectives.retain(|o| seen.insert(o.clone()));
+    objectives
 }
 
 /// Makes the player of `mission` (the mission's scripts, the hijack
