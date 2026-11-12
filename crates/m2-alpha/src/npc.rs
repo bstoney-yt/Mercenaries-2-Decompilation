@@ -1892,6 +1892,18 @@ impl Npc {
         self.using = Some((job, UsePhase::Walk(0.0)));
     }
 
+    /// The thing they use or walk to is gone (destroyed): they give it
+    /// up where they are, on their feet at its entrance if seated. The
+    /// 360's use task ends when its seat is no longer usable
+    /// (0x822B22E0).
+    pub fn drop_use(&mut self) {
+        if let Some((job, phase)) = self.using.take()
+            && !matches!(phase, UsePhase::Walk(_))
+        {
+            self.character.position = job.entrance;
+        }
+    }
+
     /// Whether something has put them off using a thing.
     fn use_disturbed(&self) -> bool {
         self.alert || self.held || self.flee.is_some() || self.hit
@@ -7613,6 +7625,12 @@ pub(crate) mod tests {
         assert!(n.update_use(0.1));
         n.hit = true;
         assert!(!n.update_use(0.1));
+        assert_eq!(n.using(), None);
+        assert_eq!(n.character.position, job.entrance);
+        // The thing gone from under them: on their feet at its entrance.
+        n.using = Some((job, UsePhase::Sit));
+        n.character.position = job.seat_at;
+        n.drop_use();
         assert_eq!(n.using(), None);
         assert_eq!(n.character.position, job.entrance);
     }

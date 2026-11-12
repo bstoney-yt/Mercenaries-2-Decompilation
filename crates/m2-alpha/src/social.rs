@@ -20,9 +20,12 @@
 //! test of a seat). A person sits at the seat's hardpoint, turned as it
 //! is, as a vehicle's riders do.
 //!
-//! **Invented**: a timer runs only for objects within [`LOOK`] of her
-//! (the 360 makes one when the object comes in, by its streaming, which
-//! this does not follow), and is forgotten beyond it.
+//! **Stand-ins**: a timer runs only for objects within [`LOOK`] of her
+//! and is forgotten beyond it. The 360 has no such distance: every
+//! loaded usable object's timer runs (0x822F96B8), made when the object
+//! comes in (0x82400440), and the port does not follow the objects'
+//! streaming. And a person gives a thing up after 30 s of not reaching
+//! it ([`crate::npc`]), where the 360's task fails with its path.
 //!
 //! **Not here**: the scripts' `Use` and `UnUse` hooks (the 360 calls
 //! `Use` as the person gets on; every such script body is empty in the
@@ -175,6 +178,13 @@ impl Social {
             })
             .collect();
         self.timers.retain(|i, _| near.contains(i));
+        // A thing destroyed is no longer usable: those on it or on
+        // their way give it up.
+        for n in &mut people.npcs {
+            if n.using().is_some_and(|u| destroyed.contains(&u.0)) {
+                n.drop_use();
+            }
+        }
         if near.is_empty() {
             return;
         }
