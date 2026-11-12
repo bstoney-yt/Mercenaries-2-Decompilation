@@ -3,9 +3,10 @@
 //!
 //! The static layer `vz_sfx_ambience` places 61 line regions
 //! (`rgn_sfx_amb_Jungle`, `rgn_sfx_amb_Ocean`, `rgn_sfx_amb_Caracas_City`,
-//! ...). Each has a `SoundAmbience` component naming the ambience cue that
-//! plays inside it, by name hash, in its first two fields (the same cue in
-//! 53 of them; the other 8 name a cue only in the first), and 35 also have
+//! ...). Each has a `SoundAmbience` component: the ambience cue that plays
+//! inside it and the sound bank it needs, by name hash (`AmbienceCue`,
+//! `AmbienceBank`: the same hash in 53 of them; the other 8 name no bank),
+//! a `Priority`, a `ReverbPreset` and an `OverlayCue`. 35 also have
 //! a `MusicRegion` component naming a free-play faction of the score in
 //! its `faction` field: 20 `freeplay_jungle` and 15 `freeplay_water`; none
 //! names `freeplay_city`.
@@ -21,12 +22,20 @@
 //! The regions, their outlines, factions and ambience cues: from the data
 //! (`vz.wad`'s `layers_static`; the survey example's `having:MusicRegion`
 //! and `ambience` sections). The root and when music regions apply: from
-//! the scripts (`mrxmusic`). Which region wins where they overlap (the
-//! smallest, as for the atmosphere regions) is inferred, and so is reading
-//! the first `SoundAmbience` field as the cue to play (the second's
-//! meaning, its `Priority` (0 on all 61) and its last two fields (0 on
-//! all) are not known); not checked against the game's code.
+//! the scripts (`mrxmusic`). Which music region wins where they overlap
+//! (the smallest, as for the atmosphere regions) is inferred, not checked
+//! against the game's code.
+//!
+//! From the 360 code: the `SoundAmbience` record's five fields and their
+//! order (its registration, `0x823F3F40`), and that every ambience region
+//! holding the listener asks for its ambience, the list
+//! ([`crate::ambience_stack`]) choosing among them (`0x8236DBD8`). All 61
+//! regions have priority 0, reverb 0 and overlay 0 (from the data), so
+//! where they overlap the one entered last plays. The 360 tests the
+//! listener's position against the region's shape; here the outline's
+//! column stands in for it (heights are not read).
 
+use crate::ambience_stack::Entry;
 use m2_assets::{Layer, name_hash};
 use m2_math::glam::{Quat, Vec2, Vec3};
 
@@ -42,8 +51,10 @@ pub struct SoundRegion {
     /// The score's faction inside, by name hash
     /// (`name_hash("freeplay_jungle")`), if a music region.
     pub faction: Option<u32>,
-    /// The ambience cue inside (`name_hash("amb_jungle")`), if any.
-    pub ambience: Option<u32>,
+    /// The ambience asked for while the listener is inside (its cue
+    /// `name_hash("amb_jungle")`, bank, priority, reverb and overlay), if
+    /// any.
+    pub ambience: Option<Entry>,
 }
 
 impl SoundRegion {
@@ -84,10 +95,13 @@ pub fn music_at(regions: &[SoundRegion], x: f32, z: f32) -> Option<&SoundRegion>
     smallest(regions, x, z, |r| r.faction.is_some())
 }
 
-/// The ambience region over `(x, z)`: of those with a cue holding it, the
-/// smallest.
-pub fn ambience_at(regions: &[SoundRegion], x: f32, z: f32) -> Option<&SoundRegion> {
-    smallest(regions, x, z, |r| r.ambience.is_some())
+/// The ambience regions holding `(x, z)`, in the order read: each asks
+/// for its ambience while the listener is inside
+/// ([`crate::ambience_stack`]).
+pub fn ambiences_at(regions: &[SoundRegion], x: f32, z: f32) -> impl Iterator<Item = &SoundRegion> {
+    regions
+        .iter()
+        .filter(move |r| r.ambience.is_some() && r.contains(x, z))
 }
 
 fn smallest(
@@ -121,9 +135,14 @@ fn field_words(layer: &Layer<'_>, component: &str, field: u32) -> Vec<(u32, u32)
         .collect()
 }
 
-/// The `SoundAmbience` field naming the cue (its first; its name is not
-/// known, only its hash).
-const AMBIENCE_CUE: u32 = 0xdc0a_5e16;
+/// The `SoundAmbience` record's fields, in the record's order.
+const AMBIENCE_FIELDS: [&str; 5] = [
+    "AmbienceCue",
+    "AmbienceBank",
+    "Priority",
+    "ReverbPreset",
+    "OverlayCue",
+];
 
 /// Reads the regions of a layer with `MusicRegion` or `SoundAmbience`,
 /// and `LineRegion`, components (outlines read by `shape` from the shape's
@@ -133,7 +152,8 @@ pub fn read_regions(
     mut shape: impl FnMut(u32) -> Option<Vec<[f32; 2]>>,
 ) -> Vec<SoundRegion> {
     let factions = field_words(layer, "MusicRegion", name_hash("faction"));
-    let cues = field_words(layer, "SoundAmbience", AMBIENCE_CUE);
+    let [cues, banks, priorities, reverbs, overlays] =
+        AMBIENCE_FIELDS.map(|f| field_words(layer, "SoundAmbience", name_hash(f)));
     let mut entities: Vec<u32> = factions.iter().chain(&cues).map(|e| e.0).collect();
     entities.sort_unstable();
     entities.dedup();
@@ -162,9 +182,16 @@ pub fn read_regions(
                     .map(|e| e.1)
                     .filter(|&w| w != 0)
             };
+            let or_0 = |of: &[(u32, u32)]| word(of).unwrap_or(0);
             Some(SoundRegion {
                 faction: word(&factions),
-                ambience: word(&cues),
+                ambience: word(&cues).map(|cue| Entry {
+                    cue,
+                    bank: or_0(&banks),
+                    priority: or_0(&priorities).cast_signed(),
+                    reverb: or_0(&reverbs),
+                    overlay: or_0(&overlays),
+                }),
                 ..SoundRegion::new(entity, name, outline)
             })
         })
@@ -183,11 +210,18 @@ mod tests {
     }
 
     #[test]
-    fn the_smallest_region_over_a_spot_names_its_faction_and_ambience() {
+    fn the_smallest_region_over_a_spot_names_its_faction_and_all_ask_for_ambience() {
+        let ambience = |cue: &str| {
+            Some(Entry {
+                cue: name_hash(cue),
+                bank: name_hash(cue),
+                ..Entry::default()
+            })
+        };
         let regions = [
             SoundRegion {
                 faction: Some(name_hash("freeplay_jungle")),
-                ambience: Some(name_hash("amb_jungle")),
+                ambience: ambience("amb_jungle"),
                 ..square(1, Vec2::ZERO, 1000.0)
             },
             SoundRegion {
@@ -195,19 +229,27 @@ mod tests {
                 ..square(2, Vec2::new(500.0, 0.0), 100.0)
             },
             SoundRegion {
-                ambience: Some(name_hash("amb_citymed")),
+                ambience: ambience("amb_citymed"),
                 ..square(3, Vec2::new(-500.0, 0.0), 100.0)
             },
         ];
         assert_eq!(regions[0].area, 4.0e6);
         let music = |x, z| music_at(&regions, x, z).and_then(|r| r.faction);
-        let amb = |x, z| ambience_at(&regions, x, z).and_then(|r| r.ambience);
+        let amb = |x, z| -> Vec<u32> { ambiences_at(&regions, x, z).map(|r| r.entity).collect() };
         assert_eq!(music(0.0, 0.0), Some(name_hash("freeplay_jungle")));
         assert_eq!(music(520.0, 10.0), Some(name_hash("freeplay_water")));
-        // A region without ambience leaves the larger one's playing.
-        assert_eq!(amb(520.0, 10.0), Some(name_hash("amb_jungle")));
-        assert_eq!(amb(-520.0, 10.0), Some(name_hash("amb_citymed")));
+        // A region without ambience asks for none.
+        assert_eq!(amb(520.0, 10.0), [1]);
+        // Both regions over a spot ask for theirs.
+        assert_eq!(amb(-520.0, 10.0), [1, 3]);
         assert_eq!(music(-520.0, 10.0), Some(name_hash("freeplay_jungle")));
         assert_eq!(music(2000.0, 0.0), None);
+        assert!(amb(2000.0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn the_cue_field_is_the_one_the_regions_were_read_by() {
+        // The field's hash was known from the data before its name was.
+        assert_eq!(name_hash(AMBIENCE_FIELDS[0]), 0xdc0a_5e16);
     }
 }

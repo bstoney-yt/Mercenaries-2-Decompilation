@@ -1508,7 +1508,7 @@ fn ambience<R: Read + Seek>(
 /// at every start point (outside every music region the root,
 /// `freeplay_city`).
 fn music_regions(world: &WorldIndex, names: &Names, stems: &HashMap<u32, String>) {
-    use m2_engine::sound_regions::{ambience_at, music_at};
+    use m2_engine::sound_regions::{ambiences_at, music_at};
     let regions = &world.sound_regions;
     let name = |h: u32| {
         stems
@@ -1533,7 +1533,7 @@ fn music_regions(world: &WorldIndex, names: &Names, stems: &HashMap<u32, String>
             r.name,
             r.entity,
             r.faction.map_or("-".to_owned(), name),
-            r.ambience.map_or("-".to_owned(), name),
+            r.ambience.map_or("-".to_owned(), |e| name(e.cue)),
             r.area / 1e6,
             c.x,
             c.y,
@@ -1546,9 +1546,12 @@ fn music_regions(world: &WorldIndex, names: &Names, stems: &HashMap<u32, String>
             .map_or("freeplay_city (root)".to_owned(), name)
     };
     let ambience = |x: f32, z: f32| {
-        ambience_at(regions, x, z)
+        // Of those holding the spot, the last read stands for the one
+        // entered last.
+        ambiences_at(regions, x, z)
+            .last()
             .and_then(|r| r.ambience)
-            .map_or("none".to_owned(), name)
+            .map_or("none".to_owned(), |e| name(e.cue))
     };
     let mut grid: [BTreeMap<String, usize>; 2] = Default::default();
     let mut cells = 0;
