@@ -304,9 +304,19 @@ pub fn record_level(rec: &[u8]) -> (f32, f32) {
 /// at 0xc is 0, else between the floats at 0x5c and 0x60), then its
 /// level (`0x82842E40`, [`record_level`]). The pitch is added to the
 /// category's and sent to the voice as `pitch / 24 * 8192`
-/// (`0x82838558`, the doubles at `0x82076458`): twelve to the octave if
-/// the voice counts 4096 to the octave, which is taken here (semitones;
-/// the voice's own unit was not traced).
+/// (`0x82838558`: two doubles, 1/24 at `0x82076460` and 8192 at
+/// `0x82076458`), so 4096/12 of the voice's units to one of the
+/// record's.
+///
+/// The unit is taken as semitones. That rests on the voice counting
+/// 4096 to the octave, which is how the console's audio library states
+/// a source voice's pitch (a 4.12 fixed-point count of octaves); the
+/// call that hands the number to the library was not traced, so this
+/// part is inferred, not read. One thing does not fit and is not
+/// explained: the engine turns a category's pitch into the same unit
+/// with `6 * log2` (`0x82837598`, 2.0 at `0x820F8D88`, 6.0 at
+/// `0x82003CF8`), which would be six to the octave if its input is a
+/// plain rate.
 ///
 /// From the data (the `recordvol` example): most records' ends are the
 /// same; some levels run 0.631 to 0.794 or 0.038 to 0.094, some pitches

@@ -2428,6 +2428,11 @@ impl GameAudio {
                         buffer.seconds()
                     );
                     let (gain, pitch) = found.started(self.random(), self.random());
+                    eprintln!(
+                        "sound: key {key:08x} starts at level {gain:.4}, rate {pitch:.4} \
+                         (its record's ranges: {:?})",
+                        found.start
+                    );
                     let play = Play {
                         pitch,
                         ..Play::at(buffer, at).gain(gain)
@@ -3121,9 +3126,11 @@ impl GameAudio {
                     let voice = found.pick(pick).cloned().map(|buffer| {
                         eprintln!(
                             "sound: fly-past, set {set:08x}, cue {cue:08x}: sound {:08x} \
-                             ({:.2} s) at {at:.0}",
+                             ({:.2} s) at {at:.0}, level {gain:.4}, rate {pitch:.4} (its \
+                             record's ranges: {:?})",
                             buffer.hash,
-                            buffer.seconds()
+                            buffer.seconds(),
+                            found.start
                         );
                         let play = Play {
                             pitch,
