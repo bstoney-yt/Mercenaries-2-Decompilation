@@ -3735,6 +3735,21 @@ impl Combat {
     }
 
     /// `damage` done to her from `from`: the health she lost.
+    /// A blast at `at` of `DamageKey` `key` reached her: alive after it,
+    /// she staggers as the 360 has area damage do
+    /// ([`m2_engine::stagger`]: the long stagger, for the explosion keys
+    /// only). The way it travelled is taken as from the blast to her
+    /// (inferred).
+    fn blast_staggers_her(f: &mut Field<'_>, at: Vec3, key: Option<u32>) {
+        let direction = (f.player.character.position - at).with_y(0.0);
+        f.player.stagger(&m2_engine::stagger::Event {
+            direction,
+            direct: false,
+            melee: false,
+            key,
+        });
+    }
+
     fn hurt_player(&mut self, f: &mut Field<'_>, damage: f32, from: Option<Vec3>) -> f32 {
         if self.down > 0.0 || self.invincible {
             return 0.0;
@@ -5567,9 +5582,9 @@ impl Combat {
             // `Explosion`, `HumanArmor` 0.5).
             let own = self.on_person(n, key);
             if d < KILL {
-                killed |= n.hurt(1000.0 * own, push) && n.soldier;
+                killed |= n.hurt_by_blast(1000.0 * own, push, key, at) && n.soldier;
             } else if d < REACH {
-                killed |= n.hurt(100.0 * near * own, push) && n.soldier;
+                killed |= n.hurt_by_blast(100.0 * near * own, push, key, at) && n.soldier;
                 n.panic(at);
             } else if d < REACH * 3.0 {
                 n.panic(at);
@@ -5589,6 +5604,7 @@ impl Combat {
                 let damage = 100.0 * (1.0 - d / REACH).max(0.0);
                 self.tally.taken_blasts +=
                     self.hurt_player(f, damage * self.hero_damage.explosion, Some(at));
+                Self::blast_staggers_her(f, at, key);
             }
         }
         for (i, v) in f.vehicles.iter_mut().enumerate() {
@@ -5785,6 +5801,15 @@ impl Combat {
             "melee: a soldier's blow lands on her: {damage:.1} ({lost:.1} lost), shake {}",
             m2_engine::melee::SHAKE_HIT
         );
+        // Bashed and alive, she staggers (the 360's picker: a player's
+        // character by a melee bash).
+        let direction = (f.player.character.position - from).with_y(0.0);
+        f.player.stagger(&m2_engine::stagger::Event {
+            direction,
+            direct: true,
+            melee: true,
+            key: None,
+        });
     }
 
     fn npc_round(&self, gun: Option<m2_engine::tuning::HandGun>) -> f32 {
@@ -5867,7 +5892,7 @@ impl Combat {
                 let away = (n.chest() - at).with_y(0.0).normalize_or(Vec3::X);
                 let push =
                     away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
-                killed |= n.hurt(b.damage_at(d) * scale, push) && n.soldier;
+                killed |= n.hurt_by_blast(b.damage_at(d) * scale, push, b.key, at) && n.soldier;
                 n.panic(at);
             } else if d < reach * 3.0 {
                 n.panic(at);
@@ -5878,6 +5903,7 @@ impl Combat {
             let d = (f.player.character.position + Vec3::Y).distance(at);
             if d < reach {
                 self.tally.taken_blasts += self.hurt_player(f, b.damage_at(d) * hers, Some(at));
+                Self::blast_staggers_her(f, at, b.key);
             }
         }
         for (i, v) in f.vehicles.iter_mut().enumerate() {
@@ -6114,7 +6140,7 @@ impl Combat {
             let away = (chest - at).with_y(0.0).normalize_or(Vec3::X);
             let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
             let own = self.on_person(n, key);
-            killed |= n.hurt(damage * near * own, push) && n.soldier;
+            killed |= n.hurt_by_blast(damage * near * own, push, key, at) && n.soldier;
         }
         let her = (f.player.driving.is_none() && f.player.landed)
             .then(|| f.player.character.position + Vec3::Y)
@@ -6162,6 +6188,7 @@ impl Combat {
             // For checking what hurts her (autoplay logs).
             eprintln!("blast: at {at:.1}, she takes {d:.0}");
             self.tally.taken_blasts += self.hurt_player(f, d, Some(at));
+            Self::blast_staggers_her(f, at, key);
         }
         if killed {
             self.remarks.push(Remark::Kill);

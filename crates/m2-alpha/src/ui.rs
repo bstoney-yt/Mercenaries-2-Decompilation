@@ -50,6 +50,11 @@ pub struct HudInfo {
     /// What the use key takes from within reach, as the game words it
     /// ("Equip Grenade Launcher").
     pub prompt: Option<String>,
+    /// The scripts' context action in reach, by its text
+    /// (`[ContextAction.Talk]`): the game's HUD draws its prompt itself
+    /// ([`crate::gamehud::HudState::context_action`]), so [`Self::prompt`]
+    /// is drawn here only without it.
+    pub context_action: Option<String>,
     /// A hijack's button prompt is up and the keyboard plays: the keys
     /// that press it ("Space"), under the game's icon
     /// ([`crate::hijack::key_hint`]).
@@ -229,6 +234,7 @@ impl Hud {
             state.key_names = m.key_names.clone();
             state.pda_objectives = m.pda_objectives.clone();
             state.trespass = m.trespass.clone();
+            state.context_action = info.context_action.clone();
             state.vehicle_disguise = m.vehicle_disguise;
             state.disguise = m.disguise;
         }
@@ -298,6 +304,7 @@ impl Hud {
             state.key_names = m.key_names.clone();
             state.pda_objectives = m.pda_objectives.clone();
             state.trespass = m.trespass.clone();
+            state.context_action = info.context_action.clone();
             state.vehicle_disguise = m.vehicle_disguise;
             state.disguise = m.disguise;
         }
@@ -787,7 +794,9 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
             white,
         );
     }
-    if let Some(prompt) = &info.prompt {
+    if game.is_some() && info.context_action.is_some() {
+        // The game's own prompt is up (`Context Action Text`).
+    } else if let Some(prompt) = &info.prompt {
         use_prompt(prompt);
     } else if let Some(name) = &info.can_enter
         && info.driving.is_none()
