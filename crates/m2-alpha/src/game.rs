@@ -3111,6 +3111,11 @@ impl Game {
                 .map(|(_, text)| text.clone())
                 .or(prompt)
                 .filter(|_| !self.support.busy()),
+            homing: self.combat.homing().map(|lock| {
+                let physics = &self.scene.world.as_ref()?.physics;
+                let (id, share) = lock?;
+                Some((share, physics.vehicle_transform(id)?.w_axis.truncate()))
+            }),
             context_action: self
                 .context
                 .as_ref()

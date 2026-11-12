@@ -55,6 +55,10 @@ pub struct HudInfo {
     /// ([`crate::gamehud::HudState::context_action`]), so [`Self::prompt`]
     /// is drawn here only without it.
     pub context_action: Option<String>,
+    /// A homing launcher is up ([`crate::combat::Combat::homing`]): how
+    /// far its lock has come (0 to 1) and where its target is, if it is
+    /// locking on.
+    pub homing: Option<Option<(f32, Vec3)>>,
     /// A hijack's button prompt is up and the keyboard plays: the keys
     /// that press it ("Space"), under the game's icon
     /// ([`crate::hijack::key_hint`]).
@@ -216,6 +220,9 @@ impl Hud {
         state.blips = blips(info);
         state.textures = marker_textures(info);
         state.reticle = reticle(info);
+        state.homing = info
+            .homing
+            .map(|lock| lock.and_then(|(share, at)| Some((share, on_screen(info, at)?))));
         state.support = info.support.clone();
         state.cash = info.mission.as_ref().and_then(|m| m.cash);
         state.fuel = info.mission.as_ref().and_then(|m| m.fuel);
@@ -286,6 +293,9 @@ impl Hud {
         state.blips = blips(info);
         state.textures = marker_textures(info);
         state.reticle = reticle(info);
+        state.homing = info
+            .homing
+            .map(|lock| lock.and_then(|(share, at)| Some((share, on_screen(info, at)?))));
         state.support = info.support.clone();
         state.cash = info.mission.as_ref().and_then(|m| m.cash);
         state.fuel = info.mission.as_ref().and_then(|m| m.fuel);
@@ -597,6 +607,17 @@ fn reticle(info: &HudInfo) -> Option<[f32; 2]> {
     }
     let ndc = clip.truncate() / clip.w;
     Some([ndc.x.clamp(-1.0, 1.0), ndc.y.clamp(-1.0, 1.0)])
+}
+
+/// Where the world point `at` is on the screen, x right and y up, -1 to
+/// 1, if it is in front of the camera and on it.
+fn on_screen(info: &HudInfo, at: Vec3) -> Option<[f32; 2]> {
+    let clip = info.view_proj? * at.extend(1.0);
+    if clip.w <= 0.01 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    (ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0).then_some([ndc.x, ndc.y])
 }
 
 /// The textures the world's markers draw: the objective markers' icons,

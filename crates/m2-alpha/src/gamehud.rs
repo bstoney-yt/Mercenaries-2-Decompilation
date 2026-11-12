@@ -841,6 +841,10 @@ pub struct HudState {
     pub stock: Vec<(String, u32)>,
     /// What the faction zones last told the HUD (`MissionView::trespass`).
     pub trespass: crate::mission::Trespass,
+    /// A homing launcher is up: how far its lock has come (0 to 1) and
+    /// where its target is on the screen (x right, y up, -1 to 1), while
+    /// it is locking on one in view ([`STINGER_UPDATE`]).
+    pub homing: Option<Option<(f32, [f32; 2])>>,
     /// The text of the scripts' context action in her reach
     /// (`Pg.AddContextAction`), for the game's own prompt
     /// ([`CONTEXT_ACTION`]).
@@ -2168,6 +2172,8 @@ struct Told {
     /// The gun in her hands, whether she holds the designator, and whether
     /// she drives a vehicle with a cannon.
     weapon: Option<(Weapon, bool, bool, bool)>,
+    /// The weapon told of was a homing launcher ([`HudState::homing`]).
+    homing_up: bool,
     /// The template of the gun in her rifle's place ([`HudState::gun`]).
     gun: Option<u32>,
     ammo: Option<[i64; 5]>,
@@ -3968,8 +3974,15 @@ impl Thread {
         // gun was changed after (PC playtest, 2026-10-08).
         self.told.seat(s.in_vehicle);
         let gun = s.gun.as_ref().map(|g| g.0);
-        if self.told.weapon != Some((s.weapon, holding, cannon, mg)) || self.told.gun != gun {
+        // A homing launcher in her hands (not the designator, nor a
+        // vehicle's gun): its reticle is the lock-on one.
+        let homing_up = s.homing.is_some() && !holding && !cannon && !mg;
+        if self.told.weapon != Some((s.weapon, holding, cannon, mg))
+            || self.told.gun != gun
+            || self.told.homing_up != homing_up
+        {
             self.told.weapon = Some((s.weapon, holding, cannon, mg));
+            self.told.homing_up = homing_up;
             self.told.gun = gun;
             // The gun in her rifle's place shows as its `WeaponUI` says,
             // and the gun box names it (playtest 4: her pistol showed the
@@ -4055,7 +4068,10 @@ impl Thread {
                 [
                     ("uNewCurrentGun", Value::String(lua.create_string(&icon)?)),
                     ("uNewCurrentGunGuid", guid_value(guid)),
-                    ("sReticleType", Value::String(lua.create_string("Normal")?)),
+                    (
+                        "sReticleType",
+                        Value::String(lua.create_string(reticle_type(homing_up))?),
+                    ),
                     (
                         "uReticleTexture",
                         Value::String(lua.create_string(&reticle)?),
@@ -4064,6 +4080,20 @@ impl Thread {
                 ],
             )?;
             fire(lua, "GuiWeaponEquippedUpdate", t)?;
+        }
+        // The lock-on reticle's word, every tick while a lock is coming
+        // on a target in view (the script hides it after a tick without).
+        if let Some(Some((share, at))) = s.homing.filter(|_| homing_up) {
+            let [x, y] = stinger_place(at);
+            let t = table(
+                lua,
+                [
+                    ("nPercent", Value::Number(share.into())),
+                    ("nX", Value::Number(x.into())),
+                    ("nY", Value::Number(y.into())),
+                ],
+            )?;
+            fire(lua, STINGER_UPDATE, t)?;
         }
         // Her explosive, as the engine's `GuiWeaponEquippedUpdate` carries it
         // when the equipped explosive changes (360 0x8234F458: its
@@ -4836,6 +4866,39 @@ fn ammo(
 
 fn fire(lua: &Lua, event: &str, args: impl IntoLuaMulti) -> mlua::Result<()> {
     gui_runtime::fire(lua, event, args).map(|_| ())
+}
+
+/// The engine's word to the lock-on reticle (the layout's `Stinger
+/// Reticle`, `MrxGuiHudReticle.HandleStingerReticleDataUpdate`).
+///
+/// From the 360 code: the homing lock update (`0x82294318`) sends it for
+/// a local player's weapon through `0x822956C0`, with `nPercent` (how far
+/// the lock has come: 1 less the time left over the weapon's
+/// `LockOnTime`) and, when the target's place projects onto the screen
+/// (`0x821B9DE0`), `nX` and `nY`; also the player's guid, left out here
+/// (the handler does not read it).
+///
+/// From the script (data): above 0 the target box shows at (`nX`, `nY`),
+/// flashing every 0.15 s, every 0.01 s from 0.75, and steady in the
+/// lock colour with the targeting sound stopped at 1; a tick without the
+/// event hides it.
+const STINGER_UPDATE: &str = "StingerReticleUpdate";
+
+/// `GuiWeaponEquippedUpdate`'s `sReticleType`. From the 360 code
+/// (`0x8234F458`): by the weapon's `WeaponUI` `ReticleType`, 1 `Homing`,
+/// 3 `Laser`, 4 `None`, anything else `Normal`; from the data the
+/// Stinger's is 1 (and the laser designator's 3). Here a launcher with a
+/// `HomingWeapon` is taken for type 1; the other types are not sent yet.
+fn reticle_type(homing: bool) -> &'static str {
+    if homing { "Homing" } else { "Normal" }
+}
+
+/// A screen point (x right, y up, -1 to 1) in the HUD's 640 x 480 units,
+/// y down, for the lock-on reticle's `nX` and `nY`: the script puts the
+/// target box's middle there (`SetLocation`). That the 360's projection
+/// answers in these units is inferred from that, not read from its code.
+fn stinger_place([x, y]: [f32; 2]) -> [f32; 2] {
+    [(x + 1.0) * 320.0, (1.0 - y) * 240.0]
 }
 
 /// The explosive half of `GuiWeaponEquippedUpdate` (360 0x8234F458, its
@@ -6509,6 +6572,16 @@ mod tests {
         );
         assert_eq!(parse_pair(" 12.7,-3x"), Some([12, -3]));
         assert_eq!(parse_pair("12"), None);
+    }
+
+    /// The lock-on reticle's type and the place its target box is told.
+    #[test]
+    fn the_lock_on_reticle_is_told_as_the_script_reads_it() {
+        assert_eq!(reticle_type(true), "Homing");
+        assert_eq!(reticle_type(false), "Normal");
+        assert_eq!(stinger_place([0.0, 0.0]), [320.0, 240.0]);
+        assert_eq!(stinger_place([-1.0, 1.0]), [0.0, 0.0]);
+        assert_eq!(stinger_place([1.0, -1.0]), [640.0, 480.0]);
     }
 
     /// The context action in reach goes to the script's

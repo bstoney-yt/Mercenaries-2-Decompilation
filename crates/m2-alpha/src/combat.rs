@@ -3856,6 +3856,19 @@ impl Combat {
         };
     }
 
+    /// With a homing launcher up (one whose template has a
+    /// `HomingWeapon`): the vehicle it is locking on and how far the lock
+    /// has come, 0 to 1, if any. From the 360 code (the lock update,
+    /// `0x82294318`): the share is 1 less the lock's time left over the
+    /// weapon's `LockOnTime`, 1 when there is none to wait.
+    pub fn homing(&self) -> Option<Option<(VehicleId, f32)>> {
+        let (time, _) = self.launcher.lock_on?;
+        if self.weapon != self.launcher.slot() || self.second.is_none() {
+            return None;
+        }
+        Some(self.lock.map(|(id, t)| (id, lock_share(t, time))))
+    }
+
     /// The vehicle a homing launcher has locked on, once held long enough.
     pub fn locked(&self) -> Option<VehicleId> {
         let (time, _) = self.launcher.lock_on?;
@@ -6451,8 +6464,29 @@ fn place_key(kind: u64, at: Vec3) -> u64 {
     (kind << 48) | (q(at.x) << 32) | (q(at.y) << 16) | q(at.z)
 }
 
+/// How far a lock held for `held` seconds has come on a weapon that
+/// takes `time` to lock on, 0 to 1 (see [`Combat::homing`]).
+fn lock_share(held: f32, time: f32) -> f32 {
+    if time > 0.0 {
+        (held / time).clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The Stinger's 2 s lock: half way after a second, whole at 2 and
+    /// after; a weapon with no time to wait is locked at once.
+    #[test]
+    fn a_lock_comes_on_over_the_weapons_lock_on_time() {
+        assert_eq!(super::lock_share(0.0, 2.0), 0.0);
+        assert_eq!(super::lock_share(1.0, 2.0), 0.5);
+        assert_eq!(super::lock_share(2.0, 2.0), 1.0);
+        assert_eq!(super::lock_share(5.0, 2.0), 1.0);
+        assert_eq!(super::lock_share(0.0, 0.0), 1.0);
+    }
+
     use super::*;
     use crate::npc::tests::{ground, rig};
     use crate::npc::{Brain, Npc};
