@@ -4820,7 +4820,9 @@ fn mission_for_screenshot(
                 None => transit_up = 0.0,
             }
         }
+        lap.mark("loop: autoplay picks");
         game.dress(backend);
+        lap.mark("loop: dress");
         // `--context exit,enter,talk`: each in turn, once the last is done.
         if let Some(want) = options
             .context
@@ -5000,6 +5002,7 @@ fn mission_for_screenshot(
         if options.movies {
             movies_offscreen(&mut link, install, out);
         }
+        lap.mark("loop: saves, checks and hijacks");
         // Until the contract is done the game's HUD doesn't run here, so
         // its message box can't call back as each message ends: an
         // objective's added message, which the objective waits on before
@@ -5055,6 +5058,7 @@ fn mission_for_screenshot(
                 eprintln!("shop-key: shop open 3 s after: {}", link.shop_open());
             }
         }
+        lap.mark("loop: late hud");
         // After the contract (--after-contract) the game's HUD runs too:
         // the flow waits on its fanfare closing.
         let boxed_now = options.dialog_shots && (late_hud.is_some() || link.dialog_open());
@@ -5220,6 +5224,7 @@ fn mission_for_screenshot(
                 }
             }
         }
+        lap.mark("loop: dialog and done");
         // `--visit-faction <abbrev>`: 30 s after the contract, she is put
         // 25 m from the nearest soldier spawn of that faction whose layer
         // is in; 15 s on, she hurts the nearest of them; who stands with
@@ -5362,6 +5367,7 @@ fn mission_for_screenshot(
                 }
             }
         }
+        lap.mark("loop: visits and medevac");
         // After the contract (--after-contract), where she is every five
         // seconds.
         if contract_done.is_some() && i % (5.0 / tick).round() as u32 == 0 {
