@@ -1061,6 +1061,9 @@ pub struct MissionLink {
     states: HashMap<u32, &'static str>,
     /// The reverb to switch to, if the scripts changed it.
     reverb: Option<Option<m2_engine::reverb::ReverbPreset>>,
+    /// The ambiences the scripts cued (true) or stopped since last taken,
+    /// by name hash, in order.
+    ambiences: Vec<(u32, bool)>,
     /// The music region she was last in, by entity (`Some(None)`: none).
     music_region: Option<Option<u32>>,
     /// Support items to stock and call in once the scripts run
@@ -1223,6 +1226,7 @@ impl MissionLink {
             radio: Radio::default(),
             states: HashMap::new(),
             reverb: None,
+            ambiences: Vec::new(),
             music_region: None,
             support: Vec::new(),
             ashore_for: 0.0,
@@ -3457,6 +3461,9 @@ impl MissionLink {
                         }
                     }
                     Command::Reverb(preset) => self.reverb = Some(preset.clone()),
+                    Command::Ambience { name, on } => {
+                        self.ambiences.push((m2_assets::name_hash(name), *on));
+                    }
                     Command::Invincible { guid, on } if *guid == PLAYER => {
                         game.combat.invincible = *on;
                     }
@@ -3796,6 +3803,22 @@ impl MissionLink {
     /// The reverb to switch to, if the scripts changed it.
     pub fn take_reverb(&mut self) -> Option<Option<m2_engine::reverb::ReverbPreset>> {
         self.reverb.take()
+    }
+
+    /// The ambiences the scripts cued (true) or stopped
+    /// (`Sound.CueAmbience`, `Sound.StopAmbience`) since last asked, by
+    /// name hash, in order.
+    pub fn take_ambiences(&mut self) -> Vec<(u32, bool)> {
+        std::mem::take(&mut self.ambiences)
+    }
+
+    /// Whether the scripts have the ambience silenced
+    /// (`Sound.SilenceAmbience`).
+    pub fn ambience_silenced(&self) -> bool {
+        let State::Running(m) = &self.state else {
+            return false;
+        };
+        m.world().borrow().sound.ambience_silenced
     }
 
     /// Scripted line `id` lasts `seconds`.

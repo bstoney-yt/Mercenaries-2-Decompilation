@@ -162,6 +162,28 @@ pub struct Atmosphere {
     /// 1 for the record named `night`, else 0, blended between records:
     /// how far the searchlights' beams show (see [`BEAMS_FULL_RAMP`]).
     pub night: f32,
+    /// `AmbientEffect0`..`4`: the particle effects the record keeps about
+    /// the camera ([`AmbientEffect`]); unused slots have no template.
+    pub ambient: [AmbientEffect; 5],
+}
+
+/// One of a record's ambient effects (`AmbientEffectN...`): on every
+/// change of the light the game deletes the last record's and spawns the
+/// new one's, each with a template (from the 360 code, 0x8224D650): type
+/// 0 keeps the effect's particles about the camera (`kind` 2, 0x821DA518),
+/// type 1 on the ground about it (`kind` 7, 0x821DA768; no record uses
+/// it). The templates are the `global_particle_flotsum` family (papers,
+/// dust, bugs, birds, smoke).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AmbientEffect {
+    /// `AmbientEffectNType`.
+    pub kind: u32,
+    /// `AmbientEffectNName`: the effect template's name hash; 0 for none.
+    pub template: u32,
+    /// `AmbientEffectNRadius`, `...Height`, `...Variance`.
+    pub radius: f32,
+    pub height: f32,
+    pub variance: f32,
 }
 
 /// A value a script sets on the light ([`Atmosphere::edited`]).
@@ -422,6 +444,13 @@ impl Atmosphere {
                     _ => true,
                 })
                 .map(|v| Vec4::from_array(channels(v, Lit::Post))),
+            ambient: std::array::from_fn(|i| AmbientEffect {
+                kind: field(&format!("AmbientEffect{i}Type")).unwrap_or(0),
+                template: field(&format!("AmbientEffect{i}Name")).unwrap_or(0),
+                radius: float(&format!("AmbientEffect{i}Radius")).unwrap_or(0.0),
+                height: float(&format!("AmbientEffect{i}Height")).unwrap_or(0.0),
+                variance: float(&format!("AmbientEffect{i}Variance")).unwrap_or(0.0),
+            }),
             night: if field("Name") == Some(name_hash("night")) {
                 1.0
             } else {
@@ -541,6 +570,8 @@ impl Atmosphere {
                 (None, None) => None,
             },
             night: f(self.night, to.night),
+            // The game swaps them whole on a change ([`AmbientEffect`]).
+            ambient: to.ambient,
             water_ramp: match (self.water_ramp, to.water_ramp) {
                 (Some(a), Some(b)) => Some(std::array::from_fn(|i| a[i].lerp(b[i], t))),
                 (_, b) => b,
@@ -1296,6 +1327,7 @@ mod tests {
             tone_map: None,
             monochrome: None,
             night: 0.0,
+            ambient: [AmbientEffect::default(); 5],
         }
     }
 
@@ -1402,6 +1434,23 @@ mod tests {
         a.apply(&mut lighting);
         assert_eq!(lighting.sun_disc, a.sun_disc());
     }
+    #[test]
+    fn a_change_takes_the_new_records_ambient_effects_whole() {
+        // 0x8224D650 deletes the last record's and spawns the new one's.
+        let papers = AmbientEffect {
+            kind: 0,
+            template: name_hash("global_particle_flotsum_papers"),
+            radius: 25.0,
+            height: 3.0,
+            variance: 0.0,
+        };
+        let mut to = plain(0.2, 0.0);
+        to.ambient[0] = papers;
+        let from = plain(0.2, 0.0);
+        assert_eq!(from.lerp(&to, 0.1).ambient[0], papers);
+        assert_eq!(to.lerp(&from, 0.9).ambient[0], AmbientEffect::default());
+    }
+
     #[test]
     fn the_sun_takes_the_codes_path() {
         // At LightTime 0 the sun is on the horizon over SUN_SETS; at 1 on

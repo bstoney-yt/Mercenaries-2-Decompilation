@@ -2474,7 +2474,15 @@ impl Game {
             state_effects(world, &mut self.combat);
         }
         let asked = std::mem::take(&mut self.combat.game_fx);
+        // The camera the ambient effects are kept about (taken level: the
+        // camera has no roll).
+        let (eye, forward) = self.listener();
+        let right = forward.cross(Vec3::Y).normalize_or(Vec3::X);
+        let up = right.cross(forward).normalize_or(Vec3::Y);
         let scene = &mut self.scene;
+        if let Some(p) = scene.particles.as_mut() {
+            p.set_camera(eye, right, up, forward);
+        }
         let (Some(p), Some(world)) = (scene.particles.as_mut(), scene.world.as_ref()) else {
             return;
         };
@@ -3380,6 +3388,15 @@ impl Game {
                     );
                 }
                 None => eprintln!("atmosphere: the island's default"),
+            }
+            // The new record's ambient effects replace the last's.
+            let ambient = match now {
+                Some((r, s)) => regions[r].settings[s].1.ambient,
+                None => default.ambient,
+            };
+            if let Some(p) = self.scene.particles.as_mut() {
+                let started = p.set_ambient(&ambient, &world.index.template_db);
+                eprintln!("atmosphere: {started} ambient effects started");
             }
         }
     }

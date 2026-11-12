@@ -45,6 +45,7 @@ use std::collections::{HashMap, HashSet};
 
 use m2_engine::ai_anchor::{ANCHORING_SPAWNER, Anchor, SPAWNER_RADIUS};
 use m2_engine::population::SpawnerSlot;
+use m2_engine::stagger::{Direction, Stagger};
 use m2_engine::tuning::HandGun;
 use m2_engine::weapons::{FireHint, NpcLauncher};
 use m2_engine::world::{SpawnPoint, is_walker};
@@ -476,6 +477,83 @@ pub const DEATH_CLIPS: [(u32, &[u32]); 14] = [
     (0x2abc_c9f2, &[0x6667_6e42, 0x55e0_ccf8]),
     (0xd9f6_4e93, &[0x10d0_d774]),
 ];
+
+/// The clips of the staggers a living person hit plays
+/// ([`m2_engine::stagger`]), by stagger and direction. From samples: each
+/// is one `Upright` row of the stance and action table whose handle has
+/// an on-foot row for anyone, per class of weapon held: these are the
+/// unarmed, pistol, rifle and rocket rows' clips, in that order.
+pub const STAGGER_CLIPS: [(Stagger, Direction, [u32; 4]); 12] = {
+    use Direction::{Back, Front, Left, Right};
+    use Stagger::{InPlace, Long, Short};
+    [
+        (
+            InPlace,
+            Back,
+            [0xbebd_5e87, 0x19e3_0e14, 0x9730_b86f, 0x2f36_a8cf],
+        ),
+        (
+            InPlace,
+            Front,
+            [0x7048_99e5, 0xe8ba_c0ca, 0x6785_1cbb, 0x32d3_909b],
+        ),
+        (
+            InPlace,
+            Left,
+            [0xf0b5_c5b5, 0x48fd_66ba, 0xa8c7_e0cd, 0xaddc_3ead],
+        ),
+        (
+            InPlace,
+            Right,
+            [0xac9f_db60, 0x2173_a111, 0xb70f_516c, 0x29a5_884c],
+        ),
+        (
+            Short,
+            Back,
+            [0x99d2_d2a7, 0x99d2_d2a7, 0xd759_5635, 0x44ee_e7e7],
+        ),
+        (
+            Short,
+            Front,
+            [0xfa2f_4423, 0xfa2f_4423, 0xd5e4_683d, 0x6a46_0f63],
+        ),
+        (
+            Short,
+            Left,
+            [0xcaa5_72d2, 0xcaa5_72d2, 0x17b3_0ee4, 0x3805_2112],
+        ),
+        (
+            Short,
+            Right,
+            [0xa6ef_8efb, 0xa6ef_8efb, 0xf777_00fd, 0x083b_fd3b],
+        ),
+        (
+            Long,
+            Back,
+            [0xeb74_016b, 0xeb74_016b, 0xf791_0445, 0x6595_4dab],
+        ),
+        (
+            Long,
+            Front,
+            [0x5da5_e8b7, 0x5da5_e8b7, 0xbdd4_ff4d, 0x759f_74f7],
+        ),
+        (
+            Long,
+            Left,
+            [0x44b3_281a, 0x44b3_281a, 0x3b89_2080, 0x0a98_c15a],
+        ),
+        (
+            Long,
+            Right,
+            [0x302c_64ef, 0x302c_64ef, 0x3b1d_2f0d, 0xbb19_ae2f],
+        ),
+    ]
+};
+
+/// Over this speed over the ground a person hit counts as on the move
+/// for the stagger picked, m/s (invented: the 360 reads a field of the
+/// movement record whose meaning is not established).
+const STAGGER_MOVING: f32 = 0.5;
 
 /// How far apart a clip's hands get over the whole clip, for its hip
 /// height: a rifle held in both hands keeps them close.
@@ -1164,6 +1242,10 @@ pub struct Npc {
     /// (`DieAnimatedRagdoll`) and the shove kept for when it ends and
     /// they go limp ([`m2_engine::death`]).
     dying: Option<(usize, Vec3)>,
+    /// The stagger's clip they play, hit and still alive, and the seconds
+    /// since their last stagger began ([`m2_engine::stagger`]).
+    stagger: Option<usize>,
+    since_stagger: Option<f32>,
     /// Has shouted since they were last calm.
     shouted: bool,
     /// Killed since [`People::take_deaths`] last looked.
@@ -1328,6 +1410,8 @@ impl Npc {
             fling: None,
             last_hit: None,
             dying: None,
+            stagger: None,
+            since_stagger: None,
             shouted: false,
             died: false,
             kind,
@@ -1634,8 +1718,98 @@ impl Npc {
                     }
                 }
             }
+        } else if let Some((_, direction)) = last_hit {
+            self.stagger_from(direction);
         }
         !self.alive
+    }
+
+    /// Alive after a direct hit travelling `direction`: the stagger the
+    /// 360 picks ([`m2_engine::stagger::pick`]), if its clip is on the
+    /// rig. On their feet only: the state table leads to the staggers
+    /// from `Upright` actions.
+    fn stagger_from(&mut self, direction: Vec3) {
+        use m2_engine::stagger::{self, Event, Person};
+        if self.down.is_some() || self.swim.is_some() || !self.landed {
+            return;
+        }
+        let v = self.character.velocity;
+        let Some(pick) = stagger::pick(
+            &Person {
+                facing: self.facing,
+                player: false,
+                immune: false,
+                crouched: false,
+                moving: Vec2::new(v.x, v.z).length() > STAGGER_MOVING,
+                since: self.since_stagger,
+                cooldown: stagger::COOLDOWN,
+                reset: stagger::RESET,
+            },
+            &Event {
+                direction,
+                direct: true,
+                melee: false,
+                key: None,
+            },
+        ) else {
+            return;
+        };
+        // The row of what they hold: the rifle's for the armed (which
+        // class the gun is, the people's rig does not say), else the
+        // unarmed; then whichever the rig has.
+        let order: [usize; 4] = if self.gun.is_some() {
+            [2, 1, 3, 0]
+        } else {
+            [0, 2, 1, 3]
+        };
+        let Some(clip) = STAGGER_CLIPS
+            .iter()
+            .find(|c| (c.0, c.1) == (pick.stagger, pick.direction))
+            .and_then(|c| {
+                order.iter().find_map(|&i| {
+                    let hash = self.rig.their_clip(c.2[i]);
+                    self.rig.clips.iter().position(|r| r.hash == hash)
+                })
+            })
+        else {
+            return;
+        };
+        eprintln!(
+            "people: {:08x} staggers {:?} {:?}, clip {:08x}",
+            self.spawn.unwrap_or(0),
+            pick.stagger,
+            pick.direction,
+            self.rig.clips[clip].hash
+        );
+        self.rig.animator.set_upper(None);
+        self.rig
+            .animator
+            .play_action(clip, true, pick.stagger.action());
+        self.stagger = Some(clip);
+        self.since_stagger = Some(0.0);
+    }
+
+    /// One step of a stagger: true while its clip plays, when they do
+    /// nothing else (a whole-body action).
+    fn update_stagger(&mut self, dt: f32) -> bool {
+        if let Some(s) = &mut self.since_stagger {
+            *s += dt;
+        }
+        let Some(clip) = self.stagger else {
+            return false;
+        };
+        self.rig.advance(dt);
+        if self
+            .rig
+            .animator
+            .current()
+            .is_none_or(|(c, at)| c != clip || at + 1e-3 >= self.rig.clips[c].info.duration)
+        {
+            self.stagger = None;
+            return false;
+        }
+        self.character.velocity = Vec3::ZERO;
+        true
     }
 
     /// A round from `by`, of another army, takes `damage`, as
@@ -2703,10 +2877,14 @@ impl Npc {
             return;
         }
         if self.down.is_some() {
+            self.stagger = None;
             self.update_down(dt);
             return;
         }
         if self.update_swim(physics, dt) {
+            return;
+        }
+        if self.update_stagger(dt) {
             return;
         }
         self.since_shot += dt;
@@ -4578,8 +4756,10 @@ impl People {
     /// Anyone a car's box meets takes its ram by the damage table `table`
     /// ([`m2_engine::durability::run_over`]: a `Human` three times a
     /// `Car`'s, a `HumanArmor` once, the bosses and targets once) and is
-    /// knocked flying if it kills, shoved aside if not (and not hurt by a
-    /// vehicle again for [`RAM_GAP`]); without the table, as before, it
+    /// knocked flying if it kills, shoved aside if not, and knocked down
+    /// when it took [`m2_engine::durability::KNOCKDOWN_DAMAGE`] or more
+    /// (and not hurt by a vehicle again for [`RAM_GAP`]); without the
+    /// table, as before, it
     /// kills. Those who don't fight in its path (as wide as it is, and a
     /// little more) dive out of the way, but story characters. The number
     /// of soldiers killed.
@@ -4622,6 +4802,16 @@ impl People {
                         n.character.velocity = heading * speed * 0.5 + side * SHOVE;
                         n.rammed = RAM_GAP;
                         n.panic(centre);
+                        // Hit hard enough by a vehicle, the 360 knocks
+                        // them down ([`durability::KNOCKDOWN_DAMAGE`]).
+                        if damage >= m2_engine::durability::KNOCKDOWN_DAMAGE {
+                            let seconds = m2_engine::melee::knockdown_seconds(
+                                m2_engine::durability::KNOCKDOWN_SECONDS,
+                                false,
+                                self.rng.next(),
+                            );
+                            n.knock_down_for(seconds, Vec3::ZERO);
+                        }
                     }
                     continue;
                 }
@@ -7077,6 +7267,41 @@ pub(crate) mod tests {
         assert!(DEATH_CLIPS.iter().all(|d| !d.1.is_empty()));
     }
 
+    /// Each of the three staggers has its four directions, once each.
+    #[test]
+    fn the_stagger_clips_are_the_tables_twelve_rows() {
+        let mut rows: Vec<(u32, u32)> = STAGGER_CLIPS
+            .iter()
+            .map(|c| (c.0.action(), c.1.hash()))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        assert_eq!(rows.len(), 12);
+        for s in [Stagger::Short, Stagger::InPlace, Stagger::Long] {
+            assert_eq!(STAGGER_CLIPS.iter().filter(|c| c.0 == s).count(), 4);
+        }
+    }
+
+    /// A hit that leaves them alive staggers only with its clip on the
+    /// rig: without it nothing plays and the stagger's timer is not
+    /// started.
+    #[test]
+    fn a_hit_without_its_stagger_clip_changes_nothing() {
+        let stand = || Brain::Wander {
+            home: Vec3::ZERO,
+            target: Vec3::ZERO,
+            wait: 10.0,
+        };
+        let mut n = Npc::new(0, &rig(), Vec3::ZERO, 0.0, stand(), None);
+        n.landed = true;
+        n.last_hit = Some((Vec3::new(0.0, 1.2, 0.3), Vec3::NEG_Z));
+        assert!(!n.hurt(1.0, Vec3::NEG_Z));
+        assert!(n.alive);
+        assert!(n.stagger.is_none() && n.since_stagger.is_none());
+        assert!(n.last_hit.is_none());
+        assert!(!n.update_stagger(0.1));
+    }
+
     /// With the hit known but no clip for its direction on the rig, the
     /// plain death: limp at once, as with no hit known.
     #[test]
@@ -7171,6 +7396,9 @@ pub(crate) mod tests {
         let n = &people.npcs[0];
         assert!(n.alive && n.hp == 55.0 && n.rammed == RAM_GAP);
         assert!(n.character.velocity.x > 0.0, "shoved off its line");
+        // 45 of damage is over the 360's 2.0: knocked down, for 4 to 6 s.
+        assert!(matches!(n.down, Some(Down::Falling(_))));
+        assert!(n.knocked_for.is_some_and(|s| (4.0..=6.0).contains(&s)));
         people.traffic(&[slow], Some(&table));
         assert_eq!(people.npcs[0].hp, 55.0, "not again at once");
         // Faster and heavier: a soldier dies, a heavy lives.
