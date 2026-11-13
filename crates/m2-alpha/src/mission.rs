@@ -1052,6 +1052,8 @@ pub struct MissionLink {
     /// The factions' pursuit lists of units ([`crate::gunships::Lists`]).
     pursuit_lists: Option<crate::gunships::Lists>,
     reinforcements: crate::reinforce::Reinforcements,
+    /// The scripts' drop zone tests being searched ([`crate::drop_zones`]).
+    drop_zones: crate::drop_zones::DropZones,
     /// Seconds since the scripts said the contract was completed.
     completed: Option<f32>,
     /// How many times the scripts have said a contract was completed.
@@ -1243,6 +1245,7 @@ impl MissionLink {
             pursuit_counts: None,
             pursuit_lists: None,
             reinforcements: crate::reinforce::Reinforcements::default(),
+            drop_zones: crate::drop_zones::DropZones::default(),
             completed: None,
             contracts: 0,
             cancelled: 0,
@@ -2288,6 +2291,29 @@ impl MissionLink {
         // pursuits' helicopters', [`crate::reinforce`]).
         let scene = &mut game.scene;
         if let Some(world) = &mut scene.world {
+            // The scripts' drop zone tests, a think a frame each
+            // ([`crate::drop_zones`]).
+            let tests = {
+                let mut w = mission.world().borrow_mut();
+                w.search_drop_zones();
+                w.drop_tests()
+            };
+            let ended = self.drop_zones.step(
+                &tests,
+                &mut crate::drop_zones::Ground {
+                    physics: &world.physics,
+                },
+            );
+            for (id, found, at) in ended {
+                eprintln!(
+                    "drop zone: test {id} {} at ({:.1}, {:.1}, {:.1})",
+                    if found { "found" } else { "failed" },
+                    at[0],
+                    at[1],
+                    at[2]
+                );
+                mission.world().borrow_mut().answer_drop_test(id, found, at);
+            }
             let releases = scene
                 .flights
                 .step(dt, &mut world.physics, &mut scene.vehicles, focus);

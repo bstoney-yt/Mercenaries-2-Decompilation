@@ -42,7 +42,10 @@
 //! it comes 50 m over her and asks again 3 s on, three times, then goes
 //! home. So this module only decides when one is due and spawns it into
 //! the scripts' world ([`m2_game::mission::Mission::spawn`]); the game
-//! flies its landing as it does a soldier delivery's.
+//! searches its drop zone as the 360 does ([`crate::drop_zones`]: the
+//! landing-zone search of `HeliLand`, with the script's sizes, so none is
+//! found out at sea) and flies its landing as it does a soldier
+//! delivery's.
 //!
 //! Not yet sent: the tables' men, and their helicopters other than the
 //! transport and the gunships.
