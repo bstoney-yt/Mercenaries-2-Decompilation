@@ -197,7 +197,11 @@ class MatrixTracker:
         """The world matrices within tol of start that move forward along
         their own row 2 while `press()` runs (e.g. the throttle)."""
         cands = []
-        for h in g.scan_vec3(start, tol, lo=0x4000_0000, hi=0xFFFF_0000, limit=100000):
+        # Only the 0xA0000000-0xBFFFFFFF view (the physical heap): the copies
+        # there were refreshed every frame on the speedboat, while those at
+        # 0x7..., 0x8.../0x9... (other views of the same pages) froze or were
+        # reused for other things (measured 2026-11-13).
+        for h in g.scan_vec3(start, tol, lo=0xA000_0000, hi=0xC000_0000, limit=100000):
             m = world_matrix(g, h)
             if m:
                 cands.append((h, m))

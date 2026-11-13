@@ -30,6 +30,8 @@ Route files are one step per line (`#` comments):
     mark <label>                   log a timestamped label
     track <x> <y> <z>              follow the hero's position in guest memory (xmem.py)
     goto <x> <z> <radius> <timeout> <buttons|-> [<gain>]  steer there by that position
+    trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
+    walk <x> <z> <radius> <timeout> [<buttons|-> [<every_s> <name>]]  walk/sprint (ls) there
     listen <file>                  then run steps appended to <file> live, until `end`
 """
 
@@ -411,6 +413,65 @@ def run(args) -> int:
                     tracker = xmem.Tracker(g, tuple(float(v) for v in w[1:4]))
                 else:
                     say(f"track: {len(tracker.addrs)} moving world matrices of {n_m} (first {tracker.addr:#x}, {moved:.1f} m forward); at {tracker.update()}")
+            elif op == "trackfoot":
+                # trackfoot <x> <y> <z>: as track, for the hero on foot (found
+                # by walking forward for a moment instead of the throttle).
+                import xmem
+
+                g = xmem.Guest(p.pid)
+
+                def forward():
+                    apply(0, 0, 0, 0.0, 1.0, 0.0, 0.0)
+                    time.sleep(1.5)
+                    apply()
+
+                start = tracker.pos if w[1] == "here" and tracker else tuple(float(v) for v in w[1:4])
+                tracker, n_m, moved = xmem.MatrixTracker.find(g, start, forward)
+                if tracker is None:
+                    say(f"trackfoot: no moving world matrix among {n_m}")
+                else:
+                    say(f"trackfoot: {len(tracker.addrs)} moving matrices of {n_m}, {moved:.1f} m forward; at {tracker.update()}")
+            elif op == "walk":
+                # walk <x> <z> <radius_m> <timeout_s> [<buttons|->] [<shots_every_s> <name>]:
+                # on foot the stick is camera-relative, so the camera's yaw is
+                # estimated from where she goes against where the stick points
+                # (stick angle a to the right of the camera moves her on
+                # bearing yaw - a in this world), and the stick aimed at the
+                # point from it. With ls held she sprints. Frames on the way
+                # with shots_every_s.
+                import math
+
+                tx, tz, radius, timeout = (float(v) for v in w[1:5])
+                b, lt, rt = parse_buttons(w[5]) if len(w) > 5 else (0, 0, 0)
+                every = float(w[6]) if len(w) > 6 else 0.0
+                name = w[7] if len(w) > 7 else f"walk{i:03d}"
+                end, yaw, a, k, next_shot = time.time() + timeout, None, 0.0, 0, time.time()
+                while time.time() < end:
+                    pos = tracker.update() if tracker else None
+                    if pos is None:
+                        time.sleep(0.1)
+                        continue
+                    dist = math.hypot(tx - pos[0], tz - pos[2])
+                    if dist <= radius:
+                        say(f"walk: at ({pos[0]:.0f}, {pos[2]:.0f}), {dist:.0f} m from the point")
+                        break
+                    want = math.degrees(math.atan2(tx - pos[0], tz - pos[2]))
+                    travel = tracker.heading() if len(tracker.trail) >= 2 else None
+                    if travel is not None:
+                        est = (travel + a + 180) % 360 - 180
+                        yaw = est if yaw is None else yaw + 0.5 * ((est - yaw + 180) % 360 - 180)
+                    a = 0.0 if yaw is None else (yaw - want + 180) % 360 - 180
+                    apply(b, lt, rt, math.sin(math.radians(a)), math.cos(math.radians(a)), 0.0, 0.0)
+                    if every and time.time() >= next_shot:
+                        next_shot = time.time() + every
+                        shot(f"{name}-{k:03d}")
+                        k += 1
+                    elif k % 5 == 0:
+                        say(f"walk: ({pos[0]:.0f}, {pos[2]:.0f}) want {want:.0f} yaw {yaw if yaw is None else round(yaw)} stick {a:+.0f} deg dist {dist:.0f}")
+                    time.sleep(0.15)
+                else:
+                    say(f"walk ({tx:.0f}, {tz:.0f}) TIMED OUT")
+                apply()
             elif op == "goto":
                 # goto <x> <z> <radius_m> <timeout_s> <buttons|-> [<gain_deg>]:
                 # hold the buttons (the boat's throttle is A) and steer the left
