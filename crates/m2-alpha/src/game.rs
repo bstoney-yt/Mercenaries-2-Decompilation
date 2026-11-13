@@ -2533,11 +2533,11 @@ impl Game {
         // What came into being is heard as its template's `SoundEffect`
         // says.
         self.combat.created(created);
-        // The ground under the effects that start on it: the first fixed
+        // The ground under the scripts' terrain effects: the first fixed
         // surface straight down from well above (inferred: the game asks
         // its ground query by x and z alone, 0x82194E20).
         let physics = &world.physics;
-        p.update_ground(&|x, z| {
+        p.run_terrain(&world.index.template_db, &|x, z| {
             let top = Vec3::new(x, GROUND_QUERY_TOP, z);
             physics
                 .cast_ray(top, Vec3::NEG_Y, GROUND_QUERY_TOP * 2.0)

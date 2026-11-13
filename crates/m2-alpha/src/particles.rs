@@ -85,6 +85,9 @@ pub struct ParticleDraw {
     /// ([`m2_engine::particles::camera_fade`]): particles fade out close
     /// in front of the camera.
     pub camera_fade: [f32; 3],
+    /// `Graphics.Effect.Terrain` calls the scripts made, not yet started
+    /// ([`ParticleDraw::run_terrain`]).
+    pub terrain_asks: Vec<m2_game::script_effects::TerrainEffect>,
 }
 
 /// A light an effect lit: where, what, how old, and for a held effect
@@ -195,6 +198,7 @@ impl ParticleDraw {
             clock: 0.0,
             held_asks: HashMap::new(),
             camera_fade: m2_game::script_effects::FADE_ON,
+            terrain_asks: Vec::new(),
         })
     }
 
@@ -390,13 +394,6 @@ impl ParticleDraw {
         started
     }
 
-    /// Puts this frame's ground under the effects that start on it (the
-    /// type 1 ambient effects); `ground` gives the ground's height and
-    /// normal at an (x, z).
-    pub fn update_ground(&mut self, ground: &dyn Fn(f32, f32) -> Option<(f32, Vec3)>) {
-        self.sim.update_terrain(ground);
-    }
-
     /// The template whose name hashes to `h` (of twins, the lowest id).
     fn template_by_hash(&mut self, h: u32, templates: &Templates) -> Option<u32> {
         let by_hash = self.by_hash.get_or_insert_with(|| {
@@ -407,6 +404,34 @@ impl ParticleDraw {
                 .collect()
         });
         by_hash.get(&h).copied()
+    }
+
+    /// Starts the terrain effects the scripts asked for and puts every
+    /// running one's ground patch under it for this frame; `ground` gives
+    /// the ground's height and normal at an (x, z).
+    pub fn run_terrain(
+        &mut self,
+        templates: &Templates,
+        ground: &dyn Fn(f32, f32) -> Option<(f32, Vec3)>,
+    ) {
+        for ask in std::mem::take(&mut self.terrain_asks) {
+            let started = self
+                .template_by_hash(ask.template, templates)
+                .map_or(0, |id| {
+                    self.sim.spawn_terrain(
+                        &self.lib,
+                        id,
+                        Vec3::from(ask.at),
+                        ask.radius,
+                        ask.density,
+                    )
+                });
+            eprintln!(
+                "effects: terrain effect {:08x} at {:.0?}, radius {}, density {}: {started} started",
+                ask.template, ask.at, ask.radius, ask.density
+            );
+        }
+        self.sim.update_terrain(ground);
     }
 
     pub fn step(&mut self, dt: f32) {

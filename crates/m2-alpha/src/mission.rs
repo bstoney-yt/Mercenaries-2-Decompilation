@@ -2142,7 +2142,10 @@ impl MissionLink {
         };
         // `Graphics.Effect.CameraFade`'s constants, for the particles.
         if let Some(p) = game.scene.particles.as_mut() {
-            p.camera_fade = mission.world().borrow().effects.camera_fade;
+            let mut w = mission.world().borrow_mut();
+            p.camera_fade = w.effects.camera_fade;
+            // `Graphics.Effect.Terrain`'s calls, for the particles to start.
+            p.terrain_asks.append(&mut w.effects.terrain);
         }
         // `Graphics.Camera.SetFovParams`, `SetNearFar` and their restores
         // for the first view: a new call starts that set's blend, and both
