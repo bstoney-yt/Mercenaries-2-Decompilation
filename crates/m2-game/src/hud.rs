@@ -32,6 +32,9 @@ pub struct Objective {
     pub mission: i64,
 }
 
+/// [`Blip::icon`] for a blip given no icon index (`Hud.Radar:AddObjective`).
+pub const NO_ICON: i64 = -1;
+
 /// A blip on the radar.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Blip {
@@ -40,7 +43,8 @@ pub struct Blip {
     pub offset: [f32; 3],
     pub colour: [u8; 3],
     /// Index into the scripts' radar icons
-    /// (`MrxUtil.MarkerGetNameByIndex_Radar`: `"objective_action"`).
+    /// (`MrxUtil.MarkerGetNameByIndex_Radar`: `"objective_action"`);
+    /// [`NO_ICON`] for none.
     pub icon: i64,
     /// Kept on the radar's rim while out of its range; else not drawn
     /// there (from the 360 code, see [`Blip::sticky`]'s use in the
@@ -574,7 +578,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                     f("nG", 255.0).clamp(0.0, 255.0) as u8,
                     f("nB", 0.0).clamp(0.0, 255.0) as u8,
                 ],
-                icon: 0,
+                // No index: the radar's objectives take only `sTexture`
+                // (from the 360 code, the minimap native 0x82320DF0 reads
+                // a texture or nothing).
+                icon: NO_ICON,
                 sticky: flag("bSticky"),
                 sort: (f("nSortOrder", 5.0) as i64).clamp(1, 7),
                 texture: Some(text(get("sTexture").as_ref())).filter(|s| !s.is_empty()),
