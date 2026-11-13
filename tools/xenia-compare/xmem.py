@@ -298,6 +298,20 @@ class Camera:
         b = self.g.read(0x831345C8, 4)
         return struct.unpack(">I", b)[0] + 0x20 + self.slot * 0x620 if b else 0
 
+    def pitch(self) -> float | None:
+        """Degrees up (+) or down (-) of its forward axis (row 2's y)."""
+        import math
+
+        b = self.g.read(self.base() + 0x10, 0x30)
+        if not b or len(b) < 0x30:
+            return None
+        fy = struct.unpack(">12f", b)[9]
+        return math.degrees(math.asin(max(-1.0, min(1.0, fy))))
+
+    def pos(self):
+        b = self.g.read(self.base() + 0x40, 12)
+        return struct.unpack(">3f", b) if b and len(b) == 12 else None
+
     def yaw(self) -> float | None:
         import math
 

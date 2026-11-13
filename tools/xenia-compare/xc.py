@@ -34,6 +34,7 @@ Route files are one step per line (`#` comments):
     measure <buttons|-> <secs> [<ly>]  hold, logging tracked position and speed
     walkcam <x> <z> <radius> <timeout> [<buttons|-> [<every_s> <name>]]  stick forward, steer by the camera
     airlog start <x> <z> <name> | airlog stop   log state-table movers near (x, z) in the background
+    fight2 <secs> [<every_s> <name>] approach, aim (yaw and pitch) and fire at ground movers
     fight <secs> [<every_s> <name>]  aim at the nearest slow ground mover and fire in bursts
     airwatch <dropx> <dropz> <secs> [<every_s> <name>]  log movers near a drop, camera on the fastest airborne one
     look <bearing> [<timeout>]     turn the camera to face that bearing (xmem.Camera)
@@ -629,6 +630,100 @@ def run(args) -> int:
                             say(f"fight: target {target is not None}; ocr: {t_ocr[:80]}")
                             if "completed" in t_ocr.lower() and "kill" in t_ocr.lower():
                                 say("fight: Kill enemies completed")
+                                break
+                    time.sleep(0.05)
+                apply()
+            elif op == "fight2":
+                # fight2 <secs> [<every_s> <name>]: clear "Kill enemies". Target: the
+                # nearest ground mover within 150 m (state table), kept until it
+                # has not moved for 5 s (counted as down). Over 25 m: stick
+                # forward, the camera steered at it (as walkcam); within 25 m:
+                # stand, pitch the camera (right stick y) at its chest, and fire
+                # RT in bursts when within 8 deg across and 6 deg up/down.
+                # Logs distance and errors; OCR of the HUD every few seconds.
+                import math
+                import xmem
+
+                secs = float(w[1])
+                every = float(w[2]) if len(w) > 2 else 3.0
+                name = w[3] if len(w) > 3 else f"fight{i:03d}"
+                g = xmem.Guest(p.pid)
+                cam = xmem.Camera(g)
+                seen: dict[int, tuple] = {}   # index -> (t last moved, pos)
+                downed: set[int] = set()
+                tgt = None
+                sx, sy, rx, ry, last_yaw, last_pitch = 1.0, 1.0, 0.0, 0.0, None, None
+                offset, end, k, next_shot, last_say = 0.0, time.time() + secs, 0, time.time(), 0.0
+                while time.time() < end:
+                    now = time.time()
+                    hp = tracker.update() if tracker else None
+                    ents = xmem.state_entries(g)
+                    for idx, pt in ents.items():
+                        old = seen.get(idx)
+                        if old is None or math.dist(pt, old[1]) > 0.3:
+                            seen[idx] = (now, pt)
+                    if hp is None:
+                        time.sleep(0.1)
+                        continue
+                    if tgt is not None and now - seen.get(tgt, (0, None))[0] > 5.0:
+                        downed.add(tgt)
+                        say(f"fight2: target {tgt} still for 5 s: counted down ({len(downed)})")
+                        tgt = None
+                    if tgt is None:
+                        cands = []
+                        for idx, (tm, pt) in seen.items():
+                            if idx in downed or now - tm > 1.5 or idx not in ents:
+                                continue
+                            d = math.hypot(pt[0] - hp[0], pt[2] - hp[2])
+                            # the soldiers gather near (-1466, 2772) (r10 state table)
+                            if 3.0 < d < 150.0 and abs(pt[1] - hp[1]) < 15 and math.hypot(pt[0] + 1466, pt[2] - 2772) < 60:
+                                cands.append((d, idx))
+                        tgt = min(cands)[1] if cands else None
+                    fire, ly = 0, 0.0
+                    if tgt is not None and (tgt not in ents or math.hypot(ents[tgt][0] - hp[0], ents[tgt][2] - hp[2]) > 150):
+                        tgt = None  # gone, or the slot reused for something far away
+                    if tgt is not None:
+                        tp = ents[tgt]
+                        d = math.hypot(tp[0] - hp[0], tp[2] - hp[2])
+                        bearing = math.degrees(math.atan2(tp[0] - hp[0], tp[2] - hp[2]))
+                        yv, pv, cp = cam.yaw(), cam.pitch(), cam.pos()
+                        if yv is not None:
+                            # Measured (look, r6d): right stick left (-) raises the
+                            # camera's yaw; fixed, not learnt (learning flip-flopped).
+                            err = (bearing - yv + 180) % 360 - 180
+                            rx = max(-1.0, min(1.0, -err / 30))
+                            perr = 0.0
+                            if pv is not None and cp is not None:
+                                hd = max(1.0, math.hypot(tp[0] - cp[0], tp[2] - cp[2]))
+                                want_p = math.degrees(math.atan2(tp[1] + 1.2 - cp[1], hd))
+                                if last_pitch is not None and abs(ry) > 0.3:
+                                    mv = pv - last_pitch
+                                    if abs(mv) > 0.5 and (mv > 0) != (sy * ry > 0):
+                                        sy = -sy
+                                last_pitch = pv
+                                perr = want_p - pv
+                                ry = max(-1.0, min(1.0, sy * perr / 20))
+                            if d > 25.0:
+                                ly = 1.0
+                            elif abs(err) < 8 and abs(perr) < 6 and int(now * 2.5) % 2 == 0:
+                                fire = 255
+                            if now - last_say > 1.0:
+                                last_say = now
+                                say(f"fight2: target {tgt} at {d:.0f} m, yaw err {err:+.0f}, pitch err {perr:+.0f}, {'advance' if ly else ('FIRE' if fire else 'aim')}, down {len(downed)}")
+                    else:
+                        rx = ry = 0.0
+                    apply(0, 0, fire, 0.0, ly, rx, ry)
+                    if now >= next_shot:
+                        next_shot = now + every
+                        dd = shot(f"{name}-{k:03d}")
+                        k += 1
+                        if dd is not None:
+                            t_ocr = ocr(dd)
+                            if t_ocr:
+                                say(f"fight2: ocr: {t_ocr[:90]}")
+                            low = t_ocr.lower()
+                            if "completed" in low and "kill" in low:
+                                say("fight2: Kill enemies completed")
                                 break
                     time.sleep(0.05)
                 apply()
