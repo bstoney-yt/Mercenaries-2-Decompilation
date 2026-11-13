@@ -189,6 +189,11 @@ impl<T: Copy + PartialEq> Lock<T> {
         self.target = None;
     }
 
+    /// The target it is locking or locked on.
+    pub fn target(&self) -> Option<T> {
+        self.target
+    }
+
     /// The target it is locked on: one with no time left.
     pub fn locked(&self) -> Option<T> {
         self.target.filter(|_| self.left <= 0.0)

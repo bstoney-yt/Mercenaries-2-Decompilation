@@ -3089,6 +3089,17 @@ impl Npc {
         [gun, launcher]
     }
 
+    /// Debug (`--homing-check`): he holds launcher `l` up, goes for no
+    /// other army's soldier, and asks to fire it (his shot then waits for
+    /// its lock, [`crate::combat`]'s `npc_seek`).
+    pub fn hold_launcher(&mut self, l: m2_engine::weapons::NpcLauncher) {
+        self.launcher = Some(l);
+        self.weapon = Some(1);
+        self.weapon_wait = 1.0e6;
+        self.foe_at = None;
+        self.launches = true;
+    }
+
     /// He chooses the weapon he has up against his target `distance`
     /// metres off, at random by their worths
     /// ([`m2_engine::ai_target::pick_weapon`]): again each
@@ -6411,6 +6422,23 @@ impl People {
     }
 }
 
+/// The locking launcher `--homing-check` hands its soldier: the first a
+/// person here carries, else the lowest template's of `weapons` that
+/// locks on ground signatures (kind 1), else on air.
+pub fn locking_launcher<'a>(
+    carried: impl IntoIterator<Item = NpcLauncher>,
+    weapons: impl IntoIterator<Item = (&'a u32, &'a m2_engine::weapons::WeaponSpec)>,
+) -> Option<NpcLauncher> {
+    let locks = |l: &NpcLauncher| l.seeker.is_some_and(|s| s.locks());
+    carried.into_iter().find(locks).or_else(|| {
+        weapons
+            .into_iter()
+            .filter_map(|(id, w)| NpcLauncher::of(w).filter(locks).map(|l| (*id, l)))
+            .min_by_key(|(id, l)| (l.seeker.map_or(9, |s| s.kind), *id))
+            .map(|(_, l)| l)
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -7527,7 +7555,36 @@ pub(crate) mod tests {
             Some(1),
         );
         n.gun = Some(rifle());
-        n.launcher = Some(NpcLauncher {
+        n.launcher = Some(soldier_launcher());
+        let mut rng = Rng::default();
+        let mut picks = |n: &mut Npc, to| {
+            n.target_hint = to;
+            let mut seen = [0; 2];
+            for _ in 0..200 {
+                n.weapon = None;
+                n.choose_weapon(50.0, &mut rng, 0.1);
+                seen[n.weapon.expect("one is worth something")] += 1;
+            }
+            seen
+        };
+        let tank = m2_engine::ai_target::Hint {
+            armour: 4,
+            ..VEHICLE_HINT
+        };
+        assert_eq!(picks(&mut n, tank), [0, 200]);
+        let [gun, launcher] = picks(&mut n, m2_engine::ai_target::HUMAN);
+        assert!(gun > 0 && launcher > 0, "{gun} and {launcher}");
+        // With the rifle alone, a tank leaves him nothing to fire.
+        n.launcher = None;
+        n.target_hint = tank;
+        n.weapon = None;
+        n.choose_weapon(50.0, &mut rng, 0.1);
+        assert_eq!(n.weapon, None);
+    }
+
+    /// An RPG as a soldier carries it: unguided.
+    fn soldier_launcher() -> NpcLauncher {
+        NpcLauncher {
             template: 7,
             seeker: None,
             hint: FireHint {
@@ -7556,31 +7613,34 @@ pub(crate) mod tests {
                 sticky: false,
             },
             feel: Default::default(),
-        });
-        let mut rng = Rng::default();
-        let mut picks = |n: &mut Npc, to| {
-            n.target_hint = to;
-            let mut seen = [0; 2];
-            for _ in 0..200 {
-                n.weapon = None;
-                n.choose_weapon(50.0, &mut rng, 0.1);
-                seen[n.weapon.expect("one is worth something")] += 1;
-            }
-            seen
+        }
+    }
+
+    // `--homing-check`'s launcher: one a person carries first, if it
+    // locks; a TOW (kind 3) or an unguided one does not.
+    #[test]
+    fn the_check_takes_a_carried_locking_launcher_first() {
+        let rocket = soldier_launcher();
+        let seeker = |kind| m2_engine::weapons::Seeker {
+            kind,
+            min_signature: 0.5,
+            cone: 12.0,
+            range: 400.0,
+            lock_time: 1.0,
         };
-        let tank = m2_engine::ai_target::Hint {
-            armour: 4,
-            ..VEHICLE_HINT
+        let tow = NpcLauncher {
+            template: 1,
+            seeker: Some(seeker(3)),
+            ..rocket
         };
-        assert_eq!(picks(&mut n, tank), [0, 200]);
-        let [gun, launcher] = picks(&mut n, m2_engine::ai_target::HUMAN);
-        assert!(gun > 0 && launcher > 0, "{gun} and {launcher}");
-        // With the rifle alone, a tank leaves him nothing to fire.
-        n.launcher = None;
-        n.target_hint = tank;
-        n.weapon = None;
-        n.choose_weapon(50.0, &mut rng, 0.1);
-        assert_eq!(n.weapon, None);
+        let at = NpcLauncher {
+            template: 2,
+            seeker: Some(seeker(1)),
+            ..rocket
+        };
+        let none = std::iter::empty::<(&u32, &m2_engine::weapons::WeaponSpec)>;
+        assert_eq!(locking_launcher([rocket, tow], none()), None);
+        assert_eq!(locking_launcher([rocket, tow, at], none()), Some(at));
     }
 
     fn rifle() -> HandGun {
