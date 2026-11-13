@@ -396,6 +396,36 @@ fn context_action(lua: &Lua, text: Option<&str>) -> mlua::Result<()> {
         .call::<()>(text)
 }
 
+/// The engine's own prompts to the HUD (`crate::action_prompt`).
+///
+/// From the 360 code: when the player's action kind or its object changes,
+/// `0x82438D10` takes the old prompt back (`0x822070E0`, by its kind) and
+/// sends the new one (`0x82207018`) with its kind as the priority; the
+/// HUD's `SetContextActionMessage(text, player, priority)` (nil to take
+/// one back) files each text under its priority, shows the newest and,
+/// when the one shown is taken back, the one left.
+const ACTION_MESSAGE: &str = r#"
+local old, kind, text = ...
+local ok, m = pcall(import, "MrxGuiHudMelee")
+if ok and type(m) == "table" and m.SetContextActionMessage then
+    local me = Sys.StringToGuid("0x1")
+    if old then m.SetContextActionMessage(nil, me, old) end
+    if kind then m.SetContextActionMessage(text, me, kind) end
+end
+"#;
+
+/// Tells the HUD's script that the engine's own prompt went from `old` to
+/// `new` ([`ACTION_MESSAGE`]).
+fn action_message(
+    lua: &Lua,
+    old: Option<&(u32, String)>,
+    new: Option<&(u32, String)>,
+) -> mlua::Result<()> {
+    lua.load(ACTION_MESSAGE)
+        .set_name("=m2-hud action prompt")
+        .call::<()>((old.map(|o| o.0), new.map(|n| n.0), new.map(|n| n.1.clone())))
+}
+
 /// The map movie's GPS destination commands ([`GPS_DEST`]): whether
 /// `command` was one, sent on to the GUI.
 fn gps_dest(lua: &Lua, command: &str, arg: &str) -> bool {
@@ -845,6 +875,9 @@ pub struct HudState {
     /// (`Pg.AddContextAction`), for the game's own prompt
     /// ([`CONTEXT_ACTION`]).
     pub context_action: Option<String>,
+    /// The engine's own prompt in reach: its kind and text
+    /// ([`ACTION_MESSAGE`]).
+    pub action: Option<(u32, String)>,
     /// Whether vehicle disguises work, and her disguise while one holds:
     /// how much is left (0..=100) and whether it holds.
     pub vehicle_disguise: bool,
@@ -2162,6 +2195,8 @@ fn run(
 struct Told {
     /// The context action's text last given to the script.
     context_action: Option<String>,
+    /// The engine's own prompt last given to it.
+    action: Option<(u32, String)>,
     /// The save icon was asked up ([`HudState::saving`]).
     saving: bool,
     hp: Option<(i32, bool)>,
@@ -3974,6 +4009,10 @@ impl Thread {
         if self.told.context_action != s.context_action {
             self.told.context_action = s.context_action.clone();
             context_action(lua, s.context_action.as_deref())?;
+        }
+        if self.told.action != s.action {
+            let old = std::mem::replace(&mut self.told.action, s.action.clone());
+            action_message(lua, old.as_ref(), s.action.as_ref())?;
         }
         let holding = s.support.designator.is_some();
         // In a tank, the gun chosen: its machine gun, else its cannon.
@@ -6567,6 +6606,42 @@ mod tests {
         context_action(&lua, Some("[ContextAction.Talk]")).unwrap();
         let calls: Vec<String> = lua.globals().get("calls").unwrap();
         assert_eq!(calls.len(), 2);
+    }
+
+    /// The engine's own prompt goes to the same script with its kind as
+    /// the priority; a change takes the old one back by its kind first.
+    #[test]
+    fn the_engines_prompt_is_sent_with_its_kind() {
+        let lua = Lua::new();
+        lua.load(
+            r##"
+            calls = {}
+            Sys = { StringToGuid = function(s) return "guid " .. s end }
+            local melee = { SetContextActionMessage = function(...)
+                local text, player, priority = ...
+                table.insert(calls, select("#", ...) .. " " .. tostring(text) .. " "
+                    .. tostring(player) .. " " .. tostring(priority))
+            end }
+            function import(name) return melee end
+            "##,
+        )
+        .exec()
+        .unwrap();
+        let drive = (6, "[ContextAction.DriveVehicle]".to_owned());
+        let equip = (2, "[ContextAction.PickupWeapon]".to_owned());
+        action_message(&lua, None, Some(&drive)).unwrap();
+        action_message(&lua, Some(&drive), Some(&equip)).unwrap();
+        action_message(&lua, Some(&equip), None).unwrap();
+        let calls: Vec<String> = lua.globals().get("calls").unwrap();
+        assert_eq!(
+            calls,
+            [
+                "3 [ContextAction.DriveVehicle] guid 0x1 6",
+                "3 nil guid 0x1 6",
+                "3 [ContextAction.PickupWeapon] guid 0x1 2",
+                "3 nil guid 0x1 2",
+            ]
+        );
     }
 
     /// The PDA's `ControllerInput` event carries both sticks: the left

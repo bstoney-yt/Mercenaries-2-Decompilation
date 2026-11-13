@@ -3035,15 +3035,29 @@ impl Game {
                 &[],
                 None,
             )
-            .map(|(i, _)| {
-                let spec = &self.scene.vehicles[i].spec;
-                vehicle_name(&w.index.template_db, strings, &spec.label, spec.model)
+            .map(|(i, entrance)| {
+                let db = &w.index.template_db;
+                let v = &self.scene.vehicles[i];
+                let spec = &v.spec;
+                let action = crate::action_prompt::vehicle_action(&approach(
+                    db,
+                    &self.scene.people,
+                    v,
+                    entrance,
+                ));
+                let key = db.localized_keys(&spec.label, spec.model).first().copied();
+                (
+                    vehicle_name(db, strings, &spec.label, spec.model),
+                    action.kind(),
+                    action.text(key),
+                )
             }),
             _ => None,
         };
         // What the use key takes, as the game words it.
         let prompt = match (&self.scene.world, player) {
             (Some(w), Some(p)) if p.driving.is_none() && p.landed && self.on_foot => {
+                use crate::action_prompt::Action as Prompt;
                 use crate::mission::Offer;
                 let db = &w.index.template_db;
                 let word = |key: u32, english: &str| {
@@ -3063,19 +3077,27 @@ impl Game {
                             let refill = crate::mission::refill(db, &self.combat, &lying.what);
                             self.combat
                                 .can_use(refill, lying.what.health)
-                                .then(|| word(TAKE_AMMO, "Take Ammo"))
+                                .then(|| (word(TAKE_AMMO, "Take Ammo"), Prompt::TakeAmmo, None))
                         }
-                        Offer::Equip => Some(word(EQUIP, "Equip %s").replace(
-                            "%s",
-                            &shown_name(db, strings, lying.what.template, lying.what.gun),
+                        Offer::Equip => Some((
+                            word(EQUIP, "Equip %s").replace(
+                                "%s",
+                                &shown_name(db, strings, lying.what.template, lying.what.gun),
+                            ),
+                            Prompt::PickupWeapon,
+                            shown_key(db, lying.what.template, lying.what.gun),
                         )),
                     },
                     None if self.combat.manned.is_none() => self
                         .placed
                         .emplacement_near(&self.scene.props, db, p.character.position)
                         .map(|m| {
-                            word(USE, "Use %s")
-                                .replace("%s", &shown_name(db, strings, m.template, None))
+                            (
+                                word(USE, "Use %s")
+                                    .replace("%s", &shown_name(db, strings, m.template, None)),
+                                Prompt::Use,
+                                shown_key(db, m.template, None),
+                            )
                         }),
                     None => None,
                 }
@@ -3115,8 +3137,16 @@ impl Game {
                 .as_ref()
                 .filter(|_| self.on_foot && !self.input_locked && !self.cinematic)
                 .map(|(_, text)| text.clone())
-                .or(prompt)
+                .or(prompt.as_ref().map(|p| p.0.clone()))
                 .filter(|_| !self.support.busy()),
+            // The engine's own prompt, for the game's HUD: what the use
+            // key takes, else the vehicle to get into (the alpha's order;
+            // the 360 picks the one she faces).
+            action: prompt
+                .map(|(_, a, key)| (a.kind(), a.text(key)))
+                .or_else(|| can_enter.as_ref().map(|c| (c.1, c.2.clone())))
+                .filter(|_| self.on_foot && self.context.is_none())
+                .filter(|_| !self.input_locked && !self.cinematic && !self.support.busy()),
             context_action: self
                 .context
                 .as_ref()
@@ -3126,7 +3156,7 @@ impl Game {
             hijack_keys: None,
             driving,
             crosshair: crosshair.filter(|_| self.support.looking().is_none()),
-            can_enter: can_enter.filter(|_| !self.support.busy()),
+            can_enter: can_enter.map(|c| c.0).filter(|_| !self.support.busy()),
             loading,
             support: self
                 .support
@@ -4897,6 +4927,64 @@ fn vehicle_name(
 const TAKE_AMMO: u32 = 0xbd07_d121;
 const EQUIP: u32 = 0xdb58_ae4b;
 const USE: u32 = 0x93e3_1c00;
+
+/// The string table key of the name the game shows for template `t` (or,
+/// without one, for `or`): its `LocalizedName`.
+fn shown_key(db: &Templates, t: u32, or: Option<u32>) -> Option<u32> {
+    db.localized
+        .get(&t)
+        .or_else(|| db.localized.get(&or?))
+        .copied()
+}
+
+/// What the 360 reads of vehicle `v`'s entrance `entrance` in her reach
+/// for its prompt ([`crate::action_prompt::vehicle_action`]): the seat it
+/// gives her (before any slide over, as `0x82299D68`), the entrance's
+/// `bLadder`, the template's physics, whether it rides on two wheels,
+/// and its crew and whether they are hostile to her. The 360 asks the
+/// vehicle's own standing with the players (`0x822F08D0`, below -33);
+/// the alpha asks whether its riders' factions fight her.
+fn approach(
+    db: &Templates,
+    people: &crate::npc::People,
+    v: &ParkedVehicle,
+    entrance: Option<u32>,
+) -> crate::action_prompt::Approach {
+    use m2_engine::world::VehicleKind;
+    let ride = crate::ride::Ride::of(v);
+    let labels = db.vehicle_labels_for(&v.spec.label, v.spec.model);
+    let seat = crate::ride::board(ride, entrance, crate::ride::car_or_truck(&labels), people)
+        .and_then(|b| b.slid_from.or(b.seat));
+    let ladder = entrance
+        .and_then(|e| ride.seating?.entrance(e))
+        .is_some_and(|e| e.params.ladder);
+    // The database's physics component, else what the model was built as.
+    let physics = db
+        .names_for(&v.spec.label, v.spec.model)
+        .iter()
+        .find_map(|n| db.get(n)?.vehicle)
+        .filter(|k| *k != VehicleKind::Unknown)
+        .or(Some(if v.spec.is_helicopter() {
+            VehicleKind::Helicopter
+        } else if v.spec.is_boat() {
+            VehicleKind::Boat
+        } else if v.spec.kind == "tank" {
+            VehicleKind::Tank
+        } else {
+            VehicleKind::Car
+        }));
+    crate::action_prompt::Approach {
+        role: ride.role(seat),
+        ladder,
+        physics,
+        bike: v.spec.is_bike(),
+        crewed: !v.crew.is_empty(),
+        hostile: v
+            .crew
+            .iter()
+            .any(|(_, who)| crate::npc::faction_of(who).is_some_and(|f| people.fights_for(f))),
+    }
+}
 
 /// The name the game shows for template `t` (or, without one, for `or`):
 /// the English string its `LocalizedName` keys; else its template's name.
