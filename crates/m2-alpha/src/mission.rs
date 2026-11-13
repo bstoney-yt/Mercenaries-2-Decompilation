@@ -7416,9 +7416,10 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             return false;
         }
         // A gate or door opened (PmcCon001's villa gates): its hinged
-        // leaves swing open, as the 360's joints do ([`m2_engine::gate`]);
-        // one whose model has no hinge is taken down with its collision,
-        // so she walks through.
+        // leaves swing open, as the 360's joints do ([`m2_engine::gate`]).
+        // One whose model has no hinge (the villa's front arch,
+        // `_pmcoutpost_gate_open`) has no joint for the 360's OpenGate
+        // (0x82332DD8) to drive: it stands as it is.
         Command::OpenGate(guid) => {
             let name = mission
                 .world()
@@ -7430,20 +7431,12 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             let Some(world) = &mut scene.world else {
                 return false;
             };
-            match scene.props.open_gate(&mut world.physics, *guid, true) {
-                Some(true) => {
-                    eprintln!("mission: Object.OpenGate {name} ({guid:#x}): its leaves swing open");
-                }
-                Some(false) => {
-                    scene.props.hide(&mut world.physics, [*guid]);
-                    eprintln!(
-                        "mission: Object.OpenGate {name} ({guid:#x}): no hinge in its model,                          taken down with its collision"
-                    );
-                }
-                None => eprintln!(
-                    "mission: Object.OpenGate {name} ({guid:#x}): no model of it up to open"
-                ),
-            }
+            let said = match scene.props.open_gate(&mut world.physics, *guid, true) {
+                Some(true) => "its leaves swing open",
+                Some(false) => "no hinge in its model: it stands as it is",
+                None => "no model of it up to open",
+            };
+            eprintln!("mission: Object.OpenGate {name} ({guid:#x}): {said}");
             return false;
         }
         // An infraction the scripts add against her (`Ai.AddInfraction`:
@@ -7513,27 +7506,18 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 }
             }
         }
-        // Shut again: a swung gate's leaves swing back (its collision
-        // back up once shut); one taken down goes back up where its layer
-        // has it.
+        // Shut: a gate the scripts opened swings back, its collision back
+        // up once shut. Like the 360's CloseGate (0x82332F18), which only
+        // sets its joints' targets, it does nothing to a gate never opened
+        // (PmcCon001 shuts the middle gate before opening it, and the HQ
+        // door it never opened) or to one with no hinge.
         Command::CloseGate(guid) => {
             let scene = &mut game.scene;
-            if scene.props.gate_open(*guid).is_some()
-                && let Some(world) = &mut scene.world
+            if let Some(world) = &mut scene.world
                 && scene.props.open_gate(&mut world.physics, *guid, false) == Some(true)
             {
                 eprintln!("mission: Object.CloseGate {guid:#x}: its leaves swing shut");
-                return false;
             }
-            let put = game.scene.show_props([*guid]);
-            eprintln!(
-                "mission: Object.CloseGate {guid:#x}: {}",
-                if put > 0 {
-                    "shut, its model and collision back up"
-                } else {
-                    "already shut, or not a layer's model here"
-                }
-            );
             return false;
         }
         Command::Weapons { guid, on } if *guid == PLAYER => {
