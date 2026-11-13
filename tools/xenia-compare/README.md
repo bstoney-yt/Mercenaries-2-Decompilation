@@ -67,6 +67,24 @@ uv run --no-project --with pillow --with numpy python -I sheet.py <case>
   seconds of play, `<out>-t<s>.ppm`.
 - One GPU program at a time: both launchers wait for the slot.
 
+## State and how to continue (2026-11-13)
+
+Works, every run:
+- Boot to VzaCon001's speedboat (`routes/vzacon001-boat.txt`, ~70 s).
+- The player's character from the 360 code's own tables (`xmem.Hero`, `trackhero`): player pool
+  0x83657FA8 -> character handle (+0x14) -> state table 0x83658140 -> position + quaternion.
+- The camera block (`xmem.Camera`, from Player.GetCamera 0x8233BF58): *(0x831345C8) + 0x20 + slot x 0x620,
+  rotation at +0x10 (row 2 forward), position at +0x40; `look <bearing>` turns it with the right stick.
+- The boat up the channel east of the shoals to the beach (`routes/case-r6.txt`, `goto ... max=`), 4 of 4 with
+  `trackhero`; brake (X) before getting out (Y); `if_text` to retry.
+- `walkcam`: left stick forward, steered by turning the camera; brought her 51 m ashore through the shallows.
+
+Not solved:
+- On the sand by the beached boat she did not move with the stick forward ("Drive Speedboat" prompt in view);
+  try walking away from the boat first (stick back, or a sideways leg), then the sprint (L3 click) and the drop.
+- The crate's helicopter has not been seen in the 360 frames yet (`look 65` toward its approach).
+- RPG: needs a later scene; saves need a Xenia profile (not created: the Account file is console-key encrypted).
+
 ## Route steps
 
 See the docstring at the top of `xc.py` (`wait`, `press`, `hold`, `stick`,

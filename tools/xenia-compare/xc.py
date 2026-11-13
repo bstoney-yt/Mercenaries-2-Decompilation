@@ -32,6 +32,7 @@ Route files are one step per line (`#` comments):
     track <x> <y> <z>              follow the hero's position in guest memory (xmem.py)
     goto <x> <z> <radius> <timeout> <buttons|-> [<gain>] [max=<m/s>]  steer there by that position
     measure <buttons|-> <secs> [<ly>]  hold, logging tracked position and speed
+    walkcam <x> <z> <radius> <timeout> [<buttons|-> [<every_s> <name>]]  stick forward, steer by the camera
     look <bearing> [<timeout>]     turn the camera to face that bearing (xmem.Camera)
     trackhero                      follow the player's character by the 360 code's tables (xmem.Hero)
     trackfoot <x> <y> <z>|here     as track, for the hero on foot (here: where track was)
@@ -444,6 +445,68 @@ def run(args) -> int:
                         say(f"measure {w[1]} t={now - t0:5.2f} pos=({pos[0]:.1f}, {pos[2]:.1f}) v={'-' if v is None else f'{v:.2f}'} m/s")
                         last = (now, pos)
                     time.sleep(0.25)
+                apply()
+            elif op == "walkcam":
+                # walkcam <x> <z> <radius> <timeout> [<buttons|->] [<every_s> <name>]:
+                # left stick held forward; steered by turning the camera with
+                # the right stick. Her measured travel (exact position from
+                # xmem.Hero) against the camera's yaw (xmem.Camera) gives the
+                # offset between them; the camera is turned to want - offset.
+                # The right stick's sense is learnt from the camera's response.
+                # ls is clicked once, a second in (sprint, tControlMap).
+                import math
+                import xmem
+
+                tx, tz, radius, timeout = (float(v) for v in w[1:5])
+                b, lt, rt = parse_buttons(w[5]) if len(w) > 5 else (0, 0, 0)
+                every = float(w[6]) if len(w) > 6 else 0.0
+                name = w[7] if len(w) > 7 else f"walkcam{i:03d}"
+                cam = xmem.Camera(xmem.Guest(p.pid))
+                end, t0, k, next_shot, last_say = time.time() + timeout, time.time(), 0, time.time(), 0.0
+                offset, sense, rx = 0.0, 1.0, 0.0
+                last_yaw, clicked = None, 0.0
+                while time.time() < end:
+                    pos = tracker.update() if tracker else None
+                    yv = cam.yaw()
+                    if pos is None or yv is None:
+                        time.sleep(0.1)
+                        continue
+                    dist = math.hypot(tx - pos[0], tz - pos[2])
+                    if dist <= radius:
+                        say(f"walkcam: at ({pos[0]:.0f}, {pos[2]:.0f}), {dist:.0f} m from the point")
+                        break
+                    want = math.degrees(math.atan2(tx - pos[0], tz - pos[2]))
+                    trail = getattr(tracker, "trail", [])
+                    if len(trail) >= 2:
+                        (t1, p1), (t2, p2) = trail[0], trail[-1]
+                        if t2 - t1 > 0.3 and math.hypot(p2[0] - p1[0], p2[2] - p1[2]) / (t2 - t1) > 0.5:
+                            travel = math.degrees(math.atan2(p2[0] - p1[0], p2[2] - p1[2]))
+                            d = (travel - yv - offset + 180) % 360 - 180
+                            offset = (offset + 0.2 * d + 180) % 360 - 180
+                    # learn the right stick's sense: pushed, did the yaw move the way meant?
+                    if last_yaw is not None and abs(rx) > 0.3:
+                        moved = (yv - last_yaw + 180) % 360 - 180
+                        if abs(moved) > 1.0 and (moved > 0) != (sense * rx > 0):
+                            sense = -sense
+                    last_yaw = yv
+                    err = (want - offset - yv + 180) % 360 - 180
+                    rx = max(-1.0, min(1.0, sense * err / 40))
+                    bb = b & ~BTN["ls"]
+                    if b & BTN["ls"] and not clicked and time.time() - t0 > 1.0:
+                        clicked = time.time()
+                    if clicked and time.time() - clicked < 0.2:
+                        bb |= BTN["ls"]
+                    apply(bb, lt, rt, 0.0, 1.0, rx, 0.0)
+                    if every and time.time() >= next_shot:
+                        next_shot = time.time() + every
+                        shot(f"{name}-{k:03d}")
+                        k += 1
+                    if time.time() - last_say > 1.0:
+                        last_say = time.time()
+                        say(f"walkcam: ({pos[0]:.0f}, {pos[2]:.0f}) want {want:.0f} cam {yv:.0f} offset {offset:+.0f} rx {rx:+.2f} dist {dist:.0f}")
+                    time.sleep(0.1)
+                else:
+                    say(f"walkcam ({tx:.0f}, {tz:.0f}) TIMED OUT")
                 apply()
             elif op == "look":
                 # look <bearing> [<timeout>]: turn the camera with the right stick
