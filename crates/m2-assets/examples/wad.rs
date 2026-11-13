@@ -28,6 +28,7 @@
 //! cargo run -p m2-assets --example wad -- flashfonts <archive.wad>
 //! cargo run -p m2-assets --example wad -- flashmasks <archive.wad>
 //! cargo run -p m2-assets --example wad -- flashtext <archive.wad>
+//! cargo run -p m2-assets --example wad -- flashgradients <archive.wad>
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -227,6 +228,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("flashfonts", []) => flash_fonts(&mut wad)?,
         ("flashmasks", []) => flash_masks(&mut wad)?,
         ("flashtext", []) => flash_text(&mut wad)?,
+        ("flashgradients", []) => flash_gradients(&mut wad)?,
         ("dds", [name, out]) => {
             let dds = texture_dds(&mut wad, name)?;
             std::fs::write(out, &dds)?;
@@ -2704,6 +2706,87 @@ fn flash_fonts<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
         }
     }
     println!("{fields} text fields in {with_text} of {movies} movies");
+    Ok(())
+}
+
+/// Every gradient fill in the archive's movies' shapes and morph shapes
+/// (`DefineShape` fill types 0x10, 0x12 and 0x13), per movie: how many
+/// shapes have one, how many fills, and Scaleform's gradient tags
+/// (`DefineExternalGradient`, `DefineGradientMap`), which would stand
+/// prepared images in for them.
+fn flash_gradients<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    use m2_assets::flash::{Fill, Library};
+    use m2_assets::gfx::tag::{GFX_DEFINE_EXTERNAL_GRADIENT, GFX_DEFINE_GRADIENT_MAP};
+    let (mut movies, mut with) = (0, 0);
+    let (mut shapes_total, mut fills_total, mut tags_total) = (0, 0, 0);
+    for block in blocks_with_type(wad, MOVIE_TYPE) {
+        let decoded = wad.read_block(block)?;
+        let contents = BlockContents::parse(&decoded)?;
+        for (e, data) in contents.iter() {
+            if e.type_hash != MOVIE_TYPE {
+                continue;
+            }
+            let Ok(movie) = movie_from_asset(data) else {
+                continue;
+            };
+            movies += 1;
+            let lib = Library::new(&movie);
+            let count = |fills: &[Fill]| {
+                fills
+                    .iter()
+                    .filter(|f| matches!(f, Fill::Gradient(..)))
+                    .count()
+            };
+            let (mut shapes, mut fills) = (0, 0);
+            for (s, _) in lib.shapes.values() {
+                let n = count(&s.fills);
+                shapes += usize::from(n > 0);
+                fills += n;
+            }
+            for m in lib.morphs.values() {
+                let n = count(&m.start.fills);
+                shapes += usize::from(n > 0);
+                fills += n;
+            }
+            let tags = movie
+                .tags
+                .iter()
+                .filter(|t| {
+                    t.code == GFX_DEFINE_EXTERNAL_GRADIENT || t.code == GFX_DEFINE_GRADIENT_MAP
+                })
+                .count();
+            for t in movie.tags.iter().filter(|t| {
+                t.code == GFX_DEFINE_EXTERNAL_GRADIENT || t.code == GFX_DEFINE_GRADIENT_MAP
+            }) {
+                let body = movie.data(t);
+                let hex: String = body.iter().take(48).map(|b| format!("{b:02x}")).collect();
+                let text: String = body
+                    .iter()
+                    .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+                    .collect();
+                println!("  tag {} ({} bytes): {hex} {text}", t.code, body.len());
+            }
+            if fills > 0 || tags > 0 {
+                with += 1;
+                println!(
+                    "{:08x} {:<28} {shapes:4} shapes {fills:5} gradient fills {tags} gradient tags, exporter flags {:#x}",
+                    e.name_hash,
+                    movie
+                        .summary()
+                        .exporter
+                        .as_ref()
+                        .map_or("-", |x| x.4.as_str()),
+                    movie.summary().exporter.as_ref().map_or(0, |x| x.1)
+                );
+            }
+            shapes_total += shapes;
+            fills_total += fills;
+            tags_total += tags;
+        }
+    }
+    println!(
+        "{movies} movies, {with} with gradients: {shapes_total} shapes, {fills_total} gradient fills, {tags_total} gradient tags"
+    );
     Ok(())
 }
 
