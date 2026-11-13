@@ -1067,12 +1067,7 @@ impl Rig {
             self.animator.set_upper(None);
             return;
         }
-        let (whole, upper) = match (gait, carry) {
-            (Gait::Idle, Carry::Aim) => (clips.aim, None),
-            (_, Carry::Aim) => (None, clips.aim),
-            (Gait::Run, _) => (clips.run_low, None),
-            _ => (None, None),
-        };
+        let (whole, upper) = rifle_clips(gait, carry, clips, self.gait_clip(Gait::FullSprint));
         match whole {
             Some(clip) => {
                 self.gait = gait;
@@ -4264,8 +4259,72 @@ fn ground(
     Ok((vb, ib, material))
 }
 
+/// The clips a rifle is held by at `gait` and `carry`: one played whole
+/// (held in both hands), and one over the upper body (the aim's arms).
+/// Neither: the gait's own clip, the rifle carried low in the right hand
+/// with the standing arm over it. `full_sprint` is the 360's sprint's
+/// clip, where the rig has its own (`gait` comes as [`Gait::Sprint`]
+/// where it has not).
+fn rifle_clips(
+    gait: Gait,
+    carry: Carry,
+    clips: &npc::FightClips,
+    full_sprint: Option<usize>,
+) -> (Option<usize>, Option<usize>) {
+    match (gait, carry) {
+        (Gait::Idle, Carry::Aim) => (clips.aim, None),
+        (_, Carry::Aim) => (None, clips.aim),
+        (Gait::Run, _) => (clips.run_low, None),
+        // The 360's sprint with a clip of its own (the on-foot table's
+        // `Upright_Sprint_Forward` for what she holds) is made with the
+        // rifle in both hands: played whole, held in both, not with the
+        // standing arm laid over it, which left her front hand under the
+        // rifle (playtest 11-12, Chris).
+        (Gait::FullSprint, _) => (full_sprint, None),
+        _ => (None, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The 360's sprint with its own clip plays it whole, the rifle in
+    /// both hands; the walk and the alpha's sprint keep the carry (the
+    /// standing arm over the gait), the jog its low two-handed run, and
+    /// aiming the aim's arms.
+    #[test]
+    fn the_sprint_holds_the_rifle_in_both_hands() {
+        let clips = npc::FightClips {
+            aim: Some(1),
+            run_low: Some(2),
+            ..Default::default()
+        };
+        let own = Some(7);
+        assert_eq!(
+            rifle_clips(Gait::FullSprint, Carry::Low, &clips, own),
+            (own, None)
+        );
+        assert_eq!(
+            rifle_clips(Gait::FullSprint, Carry::Aim, &clips, own),
+            (None, Some(1))
+        );
+        assert_eq!(
+            rifle_clips(Gait::Run, Carry::Low, &clips, own),
+            (Some(2), None)
+        );
+        assert_eq!(
+            rifle_clips(Gait::Walk, Carry::Low, &clips, own),
+            (None, None)
+        );
+        assert_eq!(
+            rifle_clips(Gait::Sprint, Carry::Low, &clips, own),
+            (None, None)
+        );
+        assert_eq!(
+            rifle_clips(Gait::Idle, Carry::Aim, &clips, own),
+            (Some(1), None)
+        );
+    }
+
     use super::*;
     use m2_render::NullBackend;
 
