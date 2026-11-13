@@ -39,6 +39,7 @@
 //! `--fight` she shoots the nearest soldier, fires a rocket at a vehicle and
 //! throws a grenade.
 
+mod action_prompt;
 mod aim;
 #[cfg(target_os = "android")]
 mod android;
@@ -9516,6 +9517,19 @@ impl Running {
             // The game's own prompt (`Hijack %s`); the buttons it asks
             // for are the HUD's to draw.
             info.prompt = (!v.running).then(|| format!("Hijack {}", v.vehicle));
+            // The engine's own prompt for it (kind 11, named with the
+            // vehicle's `LocalizedName`); while it runs, the hijack
+            // scripts drive the HUD.
+            info.action = (!v.running).then(|| {
+                let a = action_prompt::Action::Hijack;
+                let key = self.game.scene.world.as_ref().and_then(|w| {
+                    let db = &w.index.template_db;
+                    db.ids(&v.vehicle)
+                        .iter()
+                        .find_map(|id| db.localized.get(id).copied())
+                });
+                (a.kind(), a.text(key))
+            });
             // With the keyboard, which keys the arrow means (playtest 12:
             // no tap of 9 rounds reached the scripts).
             if v.running && !self.input.pad() {
