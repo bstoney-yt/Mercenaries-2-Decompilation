@@ -6163,10 +6163,14 @@ fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
 /// (`Mission::set_speed`): the length of its velocity, m/s. Those the
 /// scripts hold no object for are left out.
 /// `--check-node-damage`: the scripts' vehicle nearest her whose template
-/// gives node health has its first node with health left sent a share
-/// of 1 (`ObjectState.SendDamage`, as the island fortress's script sends
-/// its slices). Logs the node's health before and after; the message it
-/// takes is logged as the command is carried out (`nodedamage:`).
+/// gives node health to one of its model's damage parts has that node (the
+/// first with health left) sent a share of 1 (`ObjectState.SendDamage`, as
+/// the island fortress's script sends its slices). Logs the node's health
+/// before and after; the message it takes is logged as the command is
+/// carried out (`nodedamage:`). A node no part of the model is (the 668
+/// records naming `c851b695`, which no model has: the first contract's
+/// speed boat's only one) is passed over: on the 360 its message goes to
+/// no part ([`m2_engine::vehicle_damage::UNNAMED_WHOLE`]).
 fn check_node_damage(mission: &mut Mission, game: &Game) {
     let at = game.focus();
     let mut near: Vec<(f32, u32)> = {
@@ -6184,12 +6188,22 @@ fn check_node_damage(mission: &mut Mission, game: &Game) {
     };
     near.sort_by(|a, b| a.0.total_cmp(&b.0));
     for (d, guid) in near {
+        // The vehicle's damage parts: a node is checked only if one is it.
+        let part = |node: u32| {
+            game.scene
+                .vehicles
+                .iter()
+                .find(|v| v.guid == Some(guid))
+                .and_then(|v| v.spec.damage.as_deref())
+                .and_then(|dm| dm.part_named(node))
+                .is_some()
+        };
         let node = {
             let mut w = mission.world().borrow_mut();
             let Some(t) = w.node_table(guid) else {
                 continue;
             };
-            let Some(e) = t.entries().iter().find(|e| e.health > 0) else {
+            let Some(e) = t.entries().iter().find(|e| e.health > 0 && part(e.node)) else {
                 continue;
             };
             (e.node, e.health, e.most, t.entries().len())
@@ -6210,7 +6224,7 @@ fn check_node_damage(mission: &mut Mission, game: &Game) {
         );
         return;
     }
-    eprintln!("nodedamage check: no vehicle with node health near");
+    eprintln!("nodedamage check: no vehicle with node health on a damage part near");
 }
 
 fn report_speeds(mission: &mut Mission, moving: impl Iterator<Item = (u32, Vec3)>) {
