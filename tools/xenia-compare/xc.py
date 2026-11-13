@@ -467,6 +467,7 @@ def run(args) -> int:
                 every = float(w[6]) if len(w) > 6 else 0.0
                 name = w[7] if len(w) > 7 else f"walk{i:03d}"
                 end, yaw, a, k, next_shot = time.time() + timeout, None, 0.0, 0, time.time()
+                clicked = 0.0
                 while time.time() < end:
                     pos = tracker.update() if tracker else None
                     if pos is None:
@@ -482,7 +483,15 @@ def run(args) -> int:
                         est = (travel + a + 180) % 360 - 180
                         yaw = est if yaw is None else yaw + 0.5 * ((est - yaw + 180) % 360 - 180)
                     a = 0.0 if yaw is None else (yaw - want + 180) % 360 - 180
-                    apply(b, lt, rt, math.sin(math.radians(a)), math.cos(math.radians(a)), 0.0, 0.0)
+                    # ls: L3 (the game's sprint, tControlMap) latches sprint while
+                    # the stick is pushed, so it is clicked once, moving, not held.
+                    bb = b & ~BTN["ls"]
+                    if b & BTN["ls"] and not clicked and travel is not None:
+                        bb |= BTN["ls"]
+                        clicked = time.time()
+                    elif clicked and time.time() - clicked < 0.2:
+                        bb |= BTN["ls"]
+                    apply(bb, lt, rt, math.sin(math.radians(a)), math.cos(math.radians(a)), 0.0, 0.0)
                     if every and time.time() >= next_shot:
                         next_shot = time.time() + every
                         shot(f"{name}-{k:03d}")
