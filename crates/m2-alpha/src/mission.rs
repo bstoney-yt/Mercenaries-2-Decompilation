@@ -4512,6 +4512,15 @@ impl MissionLink {
             if !found.is_empty() {
                 return found;
             }
+            // A destroy objective by label only (`sTgtLabelFilter`, a
+            // quota of anything carrying it): the scripts list and mark
+            // no target, so the nearest that carry it now are hers to
+            // destroy (PmcCon001 r2: "Kill Solano's Entourage" by "VZ",
+            // 10 of them; she sat in the tank with nothing to do).
+            let hunted = self.hunted(index);
+            if !hunted.is_empty() {
+                return hunted;
+            }
         }
         let acts = self.contract_actions();
         if *self.acts_logged.borrow() != acts {
@@ -4572,6 +4581,71 @@ impl MissionLink {
         } else {
             marks.into_iter().filter(|m| m.mission.is_some()).collect()
         }
+    }
+
+    /// The nearest carriers of the labels of the contract's label-only
+    /// destroy objectives ([`CONTRACT_LABELS`], [`hunt_order`]), as marks
+    /// to destroy.
+    fn hunted(&self, index: i64) -> Vec<Mark> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        let labels: Vec<u32> = match mission
+            .lua()
+            .load(CONTRACT_LABELS)
+            .set_name("=contract labels")
+            .eval::<Option<Vec<String>>>()
+        {
+            Ok(l) => l
+                .unwrap_or_default()
+                .iter()
+                .map(|l| m2_assets::name_hash(l))
+                .collect(),
+            Err(e) => {
+                eprintln!(
+                    "mission: contract labels: {}",
+                    m2_game::mission::first_lines(&e.to_string())
+                );
+                return Vec::new();
+            }
+        };
+        if labels.is_empty() {
+            return Vec::new();
+        }
+        let w = mission.world().borrow();
+        let Some((me, her)) = w
+            .player
+            .and_then(|p| Some((p, Vec3::from(w.objects.get(&p)?.position))))
+        else {
+            return Vec::new();
+        };
+        let carried: Vec<(u32, Vec3, bool, Vec<u32>)> = w
+            .objects
+            .iter()
+            .filter(|&(&g, _)| g != me)
+            .map(|(&g, o)| (g, Vec3::from(o.position), o.alive, o.all_labels()))
+            .collect();
+        hunt_order(
+            carried
+                .iter()
+                .map(|(g, at, a, l)| (*g, *at, *a, l.as_slice())),
+            &labels,
+            her,
+        )
+        .into_iter()
+        .filter_map(|g| {
+            let o = w.objects.get(&g)?;
+            Some(Mark {
+                target: g,
+                kind: "destroy".to_owned(),
+                name: o.name.clone(),
+                at: Vec3::from(o.position),
+                alive: true,
+                mission: Some(MarkFor::Index(index)),
+                secondary: false,
+            })
+        })
+        .collect()
     }
 
     /// The standing targets of the current contract's active destroy
@@ -5802,6 +5876,59 @@ end
 walk(m, 0)
 return out
 "#;
+
+/// The labels of the current contract's active destroy objectives that
+/// name no targets, only a label (`sTgtLabelFilter`; from the scripts:
+/// `MrxTaskObjective` keeps it in its `_uTgtObjFilter`, whose
+/// `ObjectFilter.GetObjects` lists nothing for a label).
+const CONTRACT_LABELS: &str = r#"
+local ps = rawget(_G, "MrxPlayState")
+if type(ps) ~= "table" or not ps.GetCurrentMission then return nil end
+local m = ps.GetCurrentMission()
+if type(m) ~= "table" then return nil end
+local out = {}
+local function walk(t, depth)
+    if depth > 6 or type(t) ~= "table" then return end
+    local ok, kids = pcall(function() return t:GetChildren() end)
+    if not ok or type(kids) ~= "table" then return end
+    for _, c in pairs(kids) do
+        local okActive, active = pcall(function() return c:IsActive() end)
+        local cfg = type(c.GetConfig) == "function" and c:GetConfig() or {}
+        if okActive and active and type(cfg) == "table"
+            and cfg.sModuleName == "MrxTaskObjectiveDestroy"
+            and type(cfg.sTgtLabelFilter) == "string" and cfg.vTgtInclude == nil then
+            out[#out + 1] = cfg.sTgtLabelFilter
+        end
+        walk(c, depth + 1)
+    end
+end
+walk(m, 0)
+return out
+"#;
+
+/// At most this many of a label's carriers are hers to hunt at once
+/// (invented).
+const HUNT_MOST: usize = 6;
+
+/// Only those this near her, metres (invented: the reach of a fight
+/// she can see).
+const HUNT_REACH: f32 = 400.0;
+
+/// The nearest `HUNT_MOST` alive objects within [`HUNT_REACH`] of `from`
+/// carrying one of `labels` (name hashes), nearest first.
+fn hunt_order<'a>(
+    objects: impl Iterator<Item = (u32, Vec3, bool, &'a [u32])>,
+    labels: &[u32],
+    from: Vec3,
+) -> Vec<u32> {
+    let mut found: Vec<(u32, f32)> = objects
+        .filter(|&(_, _, alive, carried)| alive && carried.iter().any(|l| labels.contains(l)))
+        .map(|(g, at, _, _)| (g, at.distance(from)))
+        .filter(|&(_, d)| d < HUNT_REACH)
+        .collect();
+    found.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    found.into_iter().take(HUNT_MOST).map(|(g, _)| g).collect()
+}
 
 /// The targets of the current contract's active destroy objectives
 /// ([`CONTRACT_TARGETS`]), marked or not.
@@ -8433,6 +8560,29 @@ fn send_pursuit_car(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_label_only_destroy_hunts_the_nearest_living_carriers() {
+        use m2_math::glam::Vec3;
+        let vz = [m2_assets::name_hash("VZ")];
+        let pmc = [m2_assets::name_hash("PMC")];
+        let objs: Vec<(u32, Vec3, bool, &[u32])> = vec![
+            (10, Vec3::new(50.0, 0.0, 0.0), true, &vz),
+            (11, Vec3::new(20.0, 0.0, 0.0), true, &vz),
+            (12, Vec3::new(5.0, 0.0, 0.0), false, &vz),
+            (13, Vec3::new(3.0, 0.0, 0.0), true, &pmc),
+            (14, Vec3::new(900.0, 0.0, 0.0), true, &vz),
+        ];
+        let got = super::hunt_order(objs.iter().copied(), &vz, Vec3::ZERO);
+        assert_eq!(got, vec![11, 10]);
+        let many: Vec<(u32, Vec3, bool, &[u32])> = (0..20)
+            .map(|i| (i, Vec3::new(i as f32, 0.0, 0.0), true, &vz[..]))
+            .collect();
+        assert_eq!(
+            super::hunt_order(many.into_iter(), &vz, Vec3::ZERO),
+            (0..super::HUNT_MOST as u32).collect::<Vec<_>>()
+        );
+    }
+
     // `Vehicle.SetTurretYaw` / `SetTurretPitch` (0x82347E00, 0x82347D20
     // -> 0x82275CD8): the named turret's target, radians as given.
     #[test]
