@@ -11,7 +11,8 @@ goto -1465 2330 12 30 a max=15
 goto -1465 2400 12 30 a max=15
 goto -1462 2440 12 30 a max=12
 goto -1478 2500 12 30 a max=12
-goto -1480 2560 10 30 a max=10           # onto the sand (run 16 beached at (-1480, 2536))
+goto -1488 2545 6 30 a max=8             # slow final approach
+goto -1490 2565 4 25 a max=5             # the grounding point the two landings that reached the marker used
 mark beached
 hold x 2                                 # stop first: Y does not get her out while it moves
 press y 0.3
