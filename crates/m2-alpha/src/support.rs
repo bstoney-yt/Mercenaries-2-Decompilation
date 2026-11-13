@@ -392,6 +392,8 @@ pub struct SupportHud {
     pub menu: bool,
     /// She holds the designator: its name.
     pub designator: Option<String>,
+    /// Fire is held on the laser designator's spot (the laser is on).
+    pub lasing: bool,
     /// Looking through the satellite: the view's middle (on the ground
     /// she stands on), seconds since it opened (the "time of operation")
     /// and the cost ($K).
@@ -1005,6 +1007,10 @@ impl Support {
             item,
             menu: self.phase == Phase::Menu,
             designator,
+            lasing: matches!(
+                self.phase,
+                Phase::Designating { aim: Aim::Laser, held, .. } if held > 0.0
+            ),
             satellite,
             wheel,
             inbound: self.inbound(),
@@ -1489,6 +1495,10 @@ mod tests {
         assert!(!s.equip("Smoke Designator"), "thrown, not aimed");
         assert!(s.equip("Laser Designator"));
         assert!(s.lasing() && s.busy());
+        assert!(
+            !s.hud(0.0).lasing,
+            "the laser is off until fire is held on a spot"
+        );
         let lase = Call {
             fire: true,
             aim_at: Some(spot),

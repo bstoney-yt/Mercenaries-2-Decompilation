@@ -182,6 +182,10 @@ pub struct Game {
     /// Lights blasts' scripts set, seconds before each comes in
     /// ([`m2_game::atmosphere_script`]).
     script_lights: Vec<(f32, ScriptAtmosphere)>,
+    /// The first view's focus as the scripts change it
+    /// (`Graphics.Camera.SetFocusParams`), and how many calls it has taken.
+    pub focus: m2_engine::camera_focus::FocusBlend,
+    pub focus_calls: u32,
     /// The first view's field of view (radians) and near and far distances
     /// as the scripts change them (`Graphics.Camera.SetFovParams`,
     /// `SetNearFar`), and how many calls each has taken.
@@ -243,6 +247,9 @@ pub struct Game {
     pub last_vehicle: Option<usize>,
     /// The island's ladders ([`crate::ladders`]).
     pub ladders: crate::ladders::Ladders,
+    /// The island's benches, chairs and the like, calling people over
+    /// ([`crate::social`]).
+    pub social: crate::social::Social,
     /// The ladder she is on.
     pub climb: Option<crate::ladders::Climbing>,
     /// The vehicle the use key seated her in and her seat's `SeatLink`
@@ -505,6 +512,8 @@ impl Game {
             sky: AtmosphereMix::default(),
             screen_scroll: Default::default(),
             script_lights: Vec::new(),
+            focus: Default::default(),
+            focus_calls: 0,
             fov_blend: m2_engine::camera_blend::Blend::new([m2_engine::projection::FOV]),
             near_far_blend: m2_engine::camera_blend::Blend::new([
                 m2_engine::projection::NEAR,
@@ -528,6 +537,7 @@ impl Game {
             unusable: HashSet::new(),
             last_vehicle: None,
             ladders: Default::default(),
+            social: Default::default(),
             climb: None,
             ride: None,
             boarding: None,
@@ -2226,6 +2236,14 @@ impl Game {
             self.scene
                 .people
                 .update(&mut world.physics, &world.index.spawns, focus, threat, dt);
+            self.social.step(
+                &world.index,
+                &world.destroyed,
+                self.scene.source.as_mut(),
+                &mut self.scene.people,
+                focus,
+                dt,
+            );
             let cars: Vec<_> = self
                 .scene
                 .vehicles
@@ -2533,11 +2551,11 @@ impl Game {
         // What came into being is heard as its template's `SoundEffect`
         // says.
         self.combat.created(created);
-        // The ground under the effects that start on it: the first fixed
+        // The ground under the scripts' terrain effects: the first fixed
         // surface straight down from well above (inferred: the game asks
         // its ground query by x and z alone, 0x82194E20).
         let physics = &world.physics;
-        p.update_ground(&|x, z| {
+        p.run_terrain(&world.index.template_db, &|x, z| {
             let top = Vec3::new(x, GROUND_QUERY_TOP, z);
             physics
                 .cast_ray(top, Vec3::NEG_Y, GROUND_QUERY_TOP * 2.0)
@@ -3192,6 +3210,11 @@ impl Game {
                 .map(|(_, text)| text.clone())
                 .or(prompt.as_ref().map(|p| p.0.clone()))
                 .filter(|_| !self.support.busy()),
+            homing: self.combat.homing().map(|lock| {
+                let physics = &self.scene.world.as_ref()?.physics;
+                let (id, share) = lock?;
+                Some((share, physics.vehicle_transform(id)?.w_axis.truncate()))
+            }),
             // The engine's own prompt, for the game's HUD: what the use
             // key takes, else the vehicle to get into (the alpha's order;
             // the 360 picks the one she faces).
@@ -3600,6 +3623,7 @@ impl Game {
             }
             view.lighting.clouds.noise = world.cloud_noise;
             view.lighting.flare_map = world.sun_flare;
+            view.lighting.focus = self.focus.current;
             // The light's screen overlay. The records name one texture,
             // `global_rain`, which is the one loaded: another is not drawn.
             if let (Some(a), Some(map)) = (world.index.atmosphere, world.screen_rain) {

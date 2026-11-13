@@ -105,6 +105,7 @@ mod save;
 mod scene;
 mod shell;
 mod shopcheck;
+mod social;
 mod sound;
 mod spans;
 mod startup;
@@ -416,6 +417,12 @@ struct Options {
     /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
     /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
     check_shots: Vec<f32>,
+    /// `--use-nearest <s>` with `--screenshot` on foot: that many seconds
+    /// in, the usable thing with seats nearest her calls the person
+    /// nearest it over at once (whatever its timer and the candidate
+    /// rules say); then each second where that person is at (use-check
+    /// lines).
+    use_nearest: Option<f32>,
     /// `--face-test <s>` with `--screenshot` on foot: that many seconds
     /// in, the nearest person (and she) says a line for 3 s, then shows
     /// `Angry`; their face's weights are logged every tenth of a second
@@ -1039,6 +1046,9 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                 }
             }
             "--people-watch" => o.people_watch = true,
+            "--use-nearest" => {
+                o.use_nearest = Some(value()?.parse().context("--use-nearest expects seconds")?)
+            }
             "--face-test" => {
                 o.face_test = Some(value()?.parse().context("--face-test expects seconds")?)
             }
@@ -2344,12 +2354,37 @@ fn screenshot(
                 if off > 50.0 { " (NOT where asked)" } else { "" }
             );
         }
+        // `--use-nearest`: the tick, and the person called over.
+        let use_tick = options.use_nearest.map(|s| (s * 60.0).round() as usize);
+        let mut user: Option<usize> = None;
         // `--face-test`: the person picked, and the tick it starts.
         let face_tick = options.face_test.map(|s| (s * 60.0).round() as usize);
         let mut face_who: Option<usize> = None;
         for i in 0..ticks {
             if let Some(at) = face_tick {
                 face_test_step(&mut game, &mut face_who, i, at);
+            }
+            if use_tick == Some(i) {
+                user = use_pick(&mut game);
+            }
+            if let (Some(at), Some(k)) = (use_tick, user)
+                && i > at
+                && (i - at).is_multiple_of(60)
+                && let Some(n) = game.scene.people.npcs.get(k)
+            {
+                eprintln!(
+                    "use-check: {} s: person {k} {} ({:?}), at {:.1}",
+                    (i - at) / 60,
+                    if n.seated_at_use() {
+                        "seated"
+                    } else if n.using().is_some() {
+                        "on the way"
+                    } else {
+                        "not using it"
+                    },
+                    n.using(),
+                    n.character.position
+                );
             }
             if let Some((at, _)) = knock_tick
                 && i == at
@@ -6127,6 +6162,22 @@ fn knock_log(game: &Game, k: usize, second: usize) {
     );
 }
 
+/// `--use-nearest`: the nearest usable thing calls the person nearest
+/// it over. That person's index into the people, if it took.
+fn use_pick(game: &mut Game) -> Option<usize> {
+    let her = game.scene.player.as_ref()?.character.position;
+    let world = game.scene.world.as_ref()?;
+    game.social
+        .force_call(
+            &world.index,
+            &world.destroyed,
+            game.scene.source.as_mut(),
+            &mut game.scene.people,
+            her,
+        )
+        .map(|(_, who)| who)
+}
+
 /// `--face-test`: at tick `at` the nearest person to her and she start
 /// saying a line; 3 s on they stop and the person shows `Angry`; every
 /// tenth of a second for 8 s both faces' weights are logged.
@@ -6224,8 +6275,15 @@ fn people_watch(game: &Game, second: usize) {
             let n = &game.scene.people.npcs[k];
             use m2_engine::face_expression::{ANGRY, BLINK, FLAP};
             format!(
-                "{k}: {} {:08x} {d:.0} m, face blink {:.2} flap {:.2} angry {:.2}",
+                "{k}: {}{} {:08x} {d:.0} m, face blink {:.2} flap {:.2} angry {:.2}",
                 n.human_state(),
+                if n.seated_at_use() {
+                    " seated"
+                } else if n.using().is_some() {
+                    " to-seat"
+                } else {
+                    ""
+                },
                 n.rig
                     .animator
                     .current()
