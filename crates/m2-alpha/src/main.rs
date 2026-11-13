@@ -835,7 +835,8 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                     .split(',')
                     .map(|s| s.trim().parse())
                     .collect::<Result<_, _>>()
-                    .context("--mission-shots expects seconds")?
+                    .context("--mission-shots expects seconds")?;
+                o.mission_shots.sort_by(f32::total_cmp);
             }
             "--medevac" => o.medevac = Some(value()?.parse()?),
             "--visit-faction" => o.visit_faction = Some(value()?),
@@ -4569,6 +4570,8 @@ fn mission_for_screenshot(
         audio
     });
     let mut was_driving = false;
+    // `--mission-shots` pictured so far (they are kept sorted).
+    let mut mission_shots_taken = 0;
     for i in 0..(seconds / tick).round() as u32 {
         lap.mark("loop: pictures and checks");
         let intent = match auto.as_mut().filter(|_| play_done.is_none()) {
@@ -5266,13 +5269,15 @@ fn mission_for_screenshot(
             }
         }
         // `--mission-shots`: the scene (without the game's HUD, which only
-        // runs once the contract is done) at those seconds of play.
+        // runs once the contract is done) at those seconds of play, each
+        // once, on the first tick that gets here at or after it.
         let now = i as f32 * tick;
-        for &s in options
+        while let Some(&s) = options
             .mission_shots
-            .iter()
-            .filter(|&&s| now >= s && now - tick < s)
+            .get(mission_shots_taken)
+            .filter(|&&s| now >= s)
         {
+            mission_shots_taken += 1;
             render(backend, game, fov, aspect, None)?;
             let path = out.with_file_name(format!("{stem}-t{s:05.1}.ppm"));
             write_ppm(backend, &path)?;
@@ -11222,7 +11227,7 @@ mod tests {
     #[test]
     fn mission_shots_are_seconds_of_play() {
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let o = parse_args(&args(&["--mission-shots", "5, 12.5,30"])).unwrap();
+        let o = parse_args(&args(&["--mission-shots", "12.5,5, 30"])).unwrap();
         assert_eq!(o.mission_shots, [5.0, 12.5, 30.0]);
         assert!(parse_args(&args(&["--mission-shots", "5,x"])).is_err());
         assert_eq!(
