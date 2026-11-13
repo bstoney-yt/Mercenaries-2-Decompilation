@@ -403,8 +403,12 @@ struct Options {
     /// what that person does is logged (knock-check lines). With `r`
     /// after the seconds (`4r`) they are run into instead, by a car that
     /// is not there (1.5 t at 6 m/s, as the vehicles' ram is taken): for
-    /// checking a knockdown without playing a contract.
-    knock_nearest: Option<(f32, bool)>,
+    /// checking a knockdown without playing a contract. With `k` they are
+    /// knocked down at once, unhurt (a knockdown's own time, for the limp
+    /// body and the getting up); with `s` they take a light direct hit
+    /// from her that leaves them alive (for a stagger). The nearest
+    /// soldier is picked if there is one, else the nearest person.
+    knock_nearest: Option<(f32, KnockHow)>,
     /// `--check-shots <s>,<s>...` with `--screenshot` on foot: the scene
     /// is pictured at those seconds in too (`<out>-at<s>.ppm`).
     check_shots: Vec<f32>,
@@ -1005,15 +1009,17 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--walk-seconds" => o.walk_seconds = Some(value()?.parse()?),
             "--knock-nearest" => {
                 let v = value()?;
-                let (seconds, ram) = match v.strip_suffix('r') {
-                    Some(s) => (s, true),
-                    None => (v.as_str(), false),
+                let (seconds, how) = match v.chars().last() {
+                    Some('r') => (&v[..v.len() - 1], KnockHow::Ram),
+                    Some('k') => (&v[..v.len() - 1], KnockHow::Knock),
+                    Some('s') => (&v[..v.len() - 1], KnockHow::Hit),
+                    _ => (v.as_str(), KnockHow::Bash),
                 };
                 o.knock_nearest = Some((
                     seconds
                         .parse()
-                        .context("--knock-nearest expects seconds, or seconds and r")?,
-                    ram,
+                        .context("--knock-nearest expects seconds, then r, k or s if any")?,
+                    how,
                 ));
             }
             "--check-shots" => {
@@ -2314,20 +2320,29 @@ fn screenshot(
         let mut knocked: Option<usize> = None;
         let knock_tick = options
             .knock_nearest
-            .map(|(s, ram)| ((s * 60.0).round() as usize, ram));
+            .map(|(s, how)| ((s * 60.0).round() as usize, how));
+        // Where she was asked to start, and where she is.
+        if let (Some((x, z)), Some(p)) = (options.spawn, game.scene.player.as_ref()) {
+            let at = p.character.position;
+            let off = m2_math::glam::Vec2::new(at.x - x, at.z - z).length();
+            eprintln!(
+                "spawn: asked for {x:.0},{z:.0}; she is at {at:.1}, {off:.0} m from it{}",
+                if off > 50.0 { " (NOT where asked)" } else { "" }
+            );
+        }
         for i in 0..ticks {
             if let Some((at, _)) = knock_tick
                 && i == at
             {
                 knocked = knock_pick(&mut game);
             }
-            if let (Some((at, true)), Some(k)) = (knock_tick, knocked)
+            if let (Some((at, how)), Some(k)) = (knock_tick, knocked)
                 && i == at + 12
             {
-                knock_ram(&mut game, k);
+                knock_other(&mut game, k, how);
             }
-            let knock_bash =
-                matches!(knock_tick, Some((at, false)) if i == at + 12) && knocked.is_some();
+            let knock_bash = matches!(knock_tick, Some((at, KnockHow::Bash)) if i == at + 12)
+                && knocked.is_some();
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
                 if i == 0 {
@@ -5949,17 +5964,64 @@ fn look_at_story_character(game: &mut Game) {
 /// forward for four seconds (backing out first if it is parked close
 /// behind something, and steering round what it meets), printing how it
 /// went.
-/// `--knock-nearest`: puts her 1.2 m from the nearest person on their
-/// feet, facing them. Their index into the people, if anyone is about.
+/// How `--knock-nearest` deals with the one it picks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KnockHow {
+    /// She bashes them.
+    Bash,
+    /// A car that is not there runs into them.
+    Ram,
+    /// Knocked down at once, unhurt.
+    Knock,
+    /// A light direct hit from her.
+    Hit,
+}
+
+/// `--knock-nearest` with `r`, `k` or `s`: what is done to person `k`
+/// (a bash is her own, by the trigger).
+fn knock_other(game: &mut Game, k: usize, how: KnockHow) {
+    use m2_math::glam::Vec3;
+    match how {
+        KnockHow::Bash => {}
+        KnockHow::Ram => knock_ram(game, k),
+        KnockHow::Knock => {
+            let seconds = m2_engine::melee::knockdown_seconds(
+                m2_engine::melee::KNOCKDOWN_SECONDS,
+                false,
+                0.5,
+            );
+            eprintln!("knock-check: person {k} knocked down for {seconds:.1} s, unhurt");
+            game.scene.people.npcs[k].knock_down_for(seconds, Vec3::ZERO);
+        }
+        KnockHow::Hit => {
+            let her = game.scene.player.as_ref().map(|p| p.character.position);
+            let n = &mut game.scene.people.npcs[k];
+            let chest = n.chest();
+            let way = her.map_or(Vec3::X, |h| (chest - h - Vec3::Y).normalize_or(Vec3::X));
+            n.last_hit = Some((chest, way));
+            let killed = n.hurt(1.0, way * 0.2);
+            eprintln!(
+                "knock-check: person {k} hit lightly from her (health {:.0}, killed {killed})",
+                n.hp
+            );
+        }
+    }
+}
+
+/// `--knock-nearest`: puts her 1.2 m from the nearest soldier on their
+/// feet (the nearest person if there is no soldier), facing them. Their
+/// index into the people, if anyone is about.
 fn knock_pick(game: &mut Game) -> Option<usize> {
     let her = game.scene.player.as_ref()?.character.position;
+    let up = |n: &npc::Npc| n.alive && n.landed && !n.held && n.down.is_none();
+    let any_soldier = game.scene.people.npcs.iter().any(|n| up(n) && n.soldier);
     let (k, there) = game
         .scene
         .people
         .npcs
         .iter()
         .enumerate()
-        .filter(|(_, n)| n.alive && n.landed && !n.held && n.down.is_none())
+        .filter(|(_, n)| up(n) && (n.soldier || !any_soldier))
         .map(|(k, n)| (k, n.character.position))
         .min_by(|a, b| a.1.distance(her).total_cmp(&b.1.distance(her)))
         .or_else(|| {
