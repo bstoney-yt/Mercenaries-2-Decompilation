@@ -217,13 +217,66 @@ impl ScreenEffect {
     }
 }
 
+impl ScreenEffect {
+    /// The way the overlay scrolls: `dir` at unit length, or nothing
+    /// without one. The 360's draw (0x821BF628) normalises it where its
+    /// length is above 0 (the vector code is lost in the decompiler: that
+    /// both parts are kept and nothing else is done is inferred).
+    pub fn direction(&self) -> [f32; 2] {
+        let [x, y] = self.dir;
+        let len = (x * x + y * y).sqrt();
+        if len > 0.0 {
+            [x / len, y / len]
+        } else {
+            [0.0; 2]
+        }
+    }
+
+    /// The shader's `rainColor`: the colour word's bytes from the lowest
+    /// up, each over 255 (0x821BF628), so the top byte is the alpha.
+    pub fn colour_rgba(&self) -> [f32; 4] {
+        std::array::from_fn(|i| (self.colour >> (8 * i) & 0xff) as f32 / 255.0)
+    }
+}
+
+/// How far the screen overlay has scrolled (the rain object's +0x254).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScreenScroll {
+    pub phase: f32,
+}
+
+impl ScreenScroll {
+    /// A frame of `dt` seconds (from the 360 code, 0x821B5348): the phase
+    /// grows by `speed * dt` and, past a period, drops by one. The period
+    /// is 1 over the smaller part of the direction (in size), so that both
+    /// parts times it come to whole turns of the texture; 1 where that
+    /// part is 0.
+    pub fn step(&mut self, effect: &ScreenEffect, dt: f32) {
+        self.phase += effect.speed * dt;
+        let [x, y] = effect.direction();
+        let least = x.abs().min(y.abs());
+        let period = if least > 0.0 { 1.0 / least } else { 1.0 };
+        if self.phase > period {
+            self.phase -= period;
+        }
+    }
+
+    /// The shader's `rainVelocity`: the direction, the phase, the density.
+    pub fn velocity(&self, effect: &ScreenEffect) -> [f32; 4] {
+        let [x, y] = effect.direction();
+        [x, y, self.phase, effect.density]
+    }
+}
+
 /// One of a record's ambient effects (`AmbientEffectN...`): on every
 /// change of the light the game deletes the last record's and spawns the
 /// new one's, each with a template (from the 360 code, 0x8224D650): type
-/// 0 keeps the effect's particles about the camera (`kind` 2, 0x821DA518),
-/// type 1 on the ground about it (`kind` 7, 0x821DA768; no record uses
-/// it). The templates are the `global_particle_flotsum` family (papers,
-/// dust, bugs, birds, smoke).
+/// 0 keeps the effect's particles on a disc about the camera (`kind` 2,
+/// 0x821DA518), type 1 on the ground about it (`kind` 7, 0x821DA768).
+/// The records set slots 0 (37 of the 59), 1 (22) and 2 (10), never 3 or
+/// 4; 68 of those 69 are type 1 and one is type 0 (PC data, 2026-11-12).
+/// The templates are the `global_particle_flotsum` family (papers, dust,
+/// bugs, birds, smoke).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AmbientEffect {
     /// `AmbientEffectNType`.
@@ -724,6 +777,9 @@ impl Atmosphere {
                             let slot = match f {
                                 "BloomTargetLuminance" => Some(&mut t.target),
                                 "BloomAdaptiveLuminancePercent" => Some(&mut t.retention),
+                                // The record's own field feeds the same
+                                // value (adaptiveParams' scale, 0x821BD348).
+                                "BloomAdaptiveLuminanceScale" => Some(&mut t.speed),
                                 "BloomContastLimit" => Some(&mut t.contrast_limit),
                                 "BloomContastMultiplier" => Some(&mut t.contrast),
                                 _ => None,
@@ -1498,6 +1554,43 @@ mod tests {
         assert_eq!(lighting.sun_disc, a.sun_disc());
     }
     #[test]
+    fn the_screen_overlay_scrolls_and_wraps_by_its_period() {
+        // 0x821B5348. Sideways only: the period is 1.
+        let across = ScreenEffect {
+            speed: 0.075,
+            density: 0.9,
+            dir: [0.1, 0.0],
+            colour: 0x806d_7b7e,
+            ..Default::default()
+        };
+        assert_eq!(across.direction(), [1.0, 0.0]);
+        let mut s = ScreenScroll::default();
+        s.step(&across, 2.0);
+        assert!((s.phase - 0.15).abs() < 1e-6);
+        s.phase = 0.99;
+        s.step(&across, 1.0);
+        assert!((s.phase - 0.065).abs() < 1e-5);
+        assert_eq!(s.velocity(&across), [1.0, 0.0, s.phase, 0.9]);
+        // Slanted: 1 over the smaller part.
+        let slant = ScreenEffect {
+            speed: 2.0,
+            dir: [0.1, -1.0],
+            ..Default::default()
+        };
+        let [x, _] = slant.direction();
+        let mut s = ScreenScroll { phase: 10.0 };
+        s.step(&slant, 0.1);
+        assert!((s.phase - (10.2 - 1.0 / x)).abs() < 1e-4);
+        // No direction: nothing to scroll along, period 1.
+        assert_eq!(ScreenEffect::default().direction(), [0.0; 2]);
+        // The colour's bytes from the lowest: 7e, 7b, 6d, then alpha 80.
+        let c = across.colour_rgba();
+        assert_eq!(c[0], f32::from(0x7e_u8) / 255.0);
+        assert_eq!(c[2], f32::from(0x6d_u8) / 255.0);
+        assert_eq!(c[3], f32::from(0x80_u8) / 255.0);
+    }
+
+    #[test]
     fn the_screen_effect_blends_as_the_game_does() {
         // 0x8224C398: numbers and colour bytes blend, texture and type
         // switch past halfway.
@@ -1658,6 +1751,41 @@ mod tests {
 
     /// The satellite bomb's blast script (228f1fde): grey ambient light,
     /// sunlight 3.75, then back to the region's light over 1.7 s.
+    #[test]
+    fn a_script_sets_the_eyes_adaptation_speed() {
+        // Every blast-light script sets `fBloomAdaptiveLuminanceScale`
+        // (15 to 30); it is the record field the tone map's speed is read
+        // from.
+        let day = Atmosphere {
+            tone_map: Some(m2_render::ToneMap {
+                target: 0.4,
+                min: 0.01,
+                max: 0.8,
+                min_key: 2.5,
+                max_key: 0.85,
+                retention: 0.98,
+                speed: 30.37,
+                contrast_limit: 0.145,
+                contrast: 1.95,
+                log_average: false,
+                average_power: -1.0,
+            }),
+            ..plain(0.2, 0.0)
+        };
+        let script = ScriptAtmosphere {
+            edits: vec![(
+                "fBloomAdaptiveLuminanceScale".into(),
+                EditValue::Float(25.0),
+            )],
+            interpolate: 0.0,
+            restore: None,
+        };
+        let mut mix = AtmosphereMix::default();
+        mix.update(&day, &[], Vec3::ZERO, 0.0);
+        assert!(mix.script(&day, &script).is_empty());
+        assert_eq!(mix.current(&day).tone_map.unwrap().speed, 25.0);
+    }
+
     #[test]
     fn a_script_s_light_comes_in_at_once_and_eases_back_over_its_restore() {
         let day = Atmosphere {

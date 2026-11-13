@@ -652,13 +652,35 @@ impl ScriptHost {
                     return #q, errors
                 end
                 function dynamic_remove(name) end
+                -- The modules that have inherited a base.
+                local inherits = setmetatable({}, { __mode = "k" })
                 function inherit(name)
                     local env = caller()
                     local base = bind(env, name)
                     -- A wrongly resolved module could make a class its own
                     -- ancestor; keep the globals as the fallback then.
                     if env ~= _G and not reaches(base, env) then
-                        setmetatable(env, { __index = base })
+                        -- A second base (`SupportAirPlane` inherits
+                        -- `OrientedBlippable`, then `MrxFactionManager`):
+                        -- the 360's `_INHERIT` (0x82316528) appends each
+                        -- base to a list the module keeps, so the earlier
+                        -- ones stay bases. Which the lookup tries first
+                        -- was not found in the code: the latest here, as
+                        -- before, then the earlier ones.
+                        local meta = getmetatable(env)
+                        local old = type(meta) == "table" and meta.__index
+                        if (type(old) == "table" or type(old) == "function")
+                            and old ~= _G and old ~= base and inherits[env] then
+                            setmetatable(env, { __index = function(_, k)
+                                local v = base[k]
+                                if v ~= nil then return v end
+                                if type(old) == "function" then return old(env, k) end
+                                return old[k]
+                            end })
+                        else
+                            setmetatable(env, { __index = base })
+                        end
+                        inherits[env] = true
                     else
                         __m2_note("inherit " .. tostring(name) .. " would loop")
                     end
@@ -953,6 +975,39 @@ mod tests {
         // them.
         let greet: String = host.lua().load("return Util.Greet('you')").eval().unwrap();
         assert_eq!(greet, "hi you");
+    }
+
+    /// A module with two bases keeps both (the 360's `_INHERIT` lists
+    /// them): what the later one lacks comes from the earlier one, and
+    /// each is bound by its name as an import is.
+    #[test]
+    fn a_second_base_keeps_the_first() {
+        let host = ScriptHost::new().unwrap();
+        let library = Rc::new(crate::library::tests::library());
+        host.install_library(Rc::clone(&library), false).unwrap();
+        let (describe, greet, bound, missing, once): (bool, bool, bool, bool, bool) = host
+            .lua()
+            .load(
+                r#"
+                local env = setmetatable({}, { __index = _G })
+                local two = setfenv(function()
+                    inherit("Task")
+                    inherit("Util")
+                    return Describe == Task.Describe, Greet == Util.Greet,
+                        rawget(getfenv(1), "Task") == Task, NoSuchName == nil
+                end, env)
+                local a, b, c, d = two()
+                -- One base: as before, the base itself is the fallback.
+                local single = setmetatable({}, { __index = _G })
+                setfenv(function() inherit("Task") end, single)()
+                return a, b, c, d, getmetatable(single).__index == Task
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(describe, "the first base's");
+        assert!(greet, "the second base's");
+        assert!(bound && missing && once);
     }
 
     #[test]

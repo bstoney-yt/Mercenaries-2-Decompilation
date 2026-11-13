@@ -2424,6 +2424,14 @@ impl WgpuBackend {
                 })
         };
         self.post.set_projection(&view.projection);
+        // The screen overlay: its texture, and the view it is laid out by.
+        if let Some(o) = l.screen_overlay
+            && let Ok(t) = self.textures.get(o.map.0)
+        {
+            self.post.set_rain_map(&self.device, o.map, &t.view);
+        }
+        let forward = -view.view.inverse().z_axis.truncate();
+        self.post.set_overlay_view(forward, &view.projection);
         self.post.encode(&self.queue, &mut encoder, l, target, sun);
         mark(&mut encoder, 4);
         if let Some(t) = timer {

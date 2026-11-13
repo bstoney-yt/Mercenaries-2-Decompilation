@@ -59,6 +59,12 @@ pub struct HudInfo {
     /// far its lock has come (0 to 1) and where its target is, if it is
     /// locking on.
     pub homing: Option<Option<(f32, Vec3)>>,
+    /// The engine's own prompt for what the use key does in reach, as its
+    /// kind (the HUD's priority) and text
+    /// ([`crate::action_prompt::Action`]); the game's HUD draws it, so
+    /// [`Self::prompt`] and [`Self::can_enter`] are drawn here only
+    /// without it.
+    pub action: Option<(u32, String)>,
     /// A hijack's button prompt is up and the keyboard plays: the keys
     /// that press it ("Space"), under the game's icon
     /// ([`crate::hijack::key_hint`]).
@@ -236,6 +242,7 @@ impl Hud {
             .as_ref()
             .map_or_else(Vec::new, |m| m.radar_regions.clone());
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
+        state.action = info.action.clone();
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
             state.key_names = m.key_names.clone();
@@ -309,6 +316,7 @@ impl Hud {
             .as_ref()
             .map_or_else(Vec::new, |m| m.radar_regions.clone());
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
+        state.action = info.action.clone();
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
             state.key_names = m.key_names.clone();
@@ -815,7 +823,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
             white,
         );
     }
-    if game.is_some() && info.context_action.is_some() {
+    if game.is_some() && (info.context_action.is_some() || info.action.is_some()) {
         // The game's own prompt is up (`Context Action Text`).
     } else if let Some(prompt) = &info.prompt {
         use_prompt(prompt);

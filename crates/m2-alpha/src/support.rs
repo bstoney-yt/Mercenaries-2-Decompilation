@@ -28,6 +28,10 @@
 //! never give one while a gate stands, one is given anyway after a while
 //! ([`Support::fallback`]).
 //!
+//! From the 360 code: the view's field of view is the engine's default
+//! camera's ([`default_fov_y`]: 142 m of ground from top to bottom at 16:9
+//! from 170 m up, where the video below was read as about 110 m).
+//!
 //! Measured in the Xbox 360 video (round 94): the view shows about 110 m
 //! of ground from top to bottom, moves about 5 m/s and opens over where
 //! she stands; the view goes back to her a fifth of a second after the
@@ -46,19 +50,74 @@ use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
 
 /// The satellite looks down from this high over the ground she stands on
-/// (metres), showing this much ground from the screen's top to its bottom
 /// (metres); near and far planes (metres).
 const SAT_HEIGHT: f32 = 170.0;
-const SAT_SPAN: f32 = 110.0;
+
+/// The engine's default camera field of view, radians (55 degrees): the
+/// width of the view on a 4:3 screen. From the 360 code: the default
+/// camera settings (`0x821B6148`: near 0.2, far 2400, this), which the map
+/// mode's camera copies and never changes.
+pub const DEFAULT_FOV: f32 = 0.959_749_94;
+
+/// The default camera's vertical field of view on a screen `aspect` wide
+/// for its height, radians.
+///
+/// From the 360 code, the projection the engine builds from the default
+/// settings (`0x8234EF98`, into the matrix builder `0x82569080`): the
+/// half angle is the field of view times 0.75 times the screen's aspect
+/// (4/3 or 16/9), halved; the view's half width at distance 1 is that
+/// angle's tangent, and its half height the tangent over the aspect. So
+/// the 55 degrees are the width at 4:3 (42.7 up and down); at 16:9 the
+/// angle itself is widened to 73.3 degrees across, 45.4 up and down. The
+/// 360 has those two aspects only; here any aspect goes through the same
+/// rule.
+pub fn default_fov_y(aspect: f32) -> f32 {
+    let half = DEFAULT_FOV * 0.75 * aspect / 2.0;
+    2.0 * (half.tan() / aspect).atan()
+}
 const SAT_NEAR: f32 = 5.0;
 const SAT_FAR: f32 = 3000.0;
-/// The view moves this fast with the keys or the stick (m/s), and no
-/// further than this from her (metres). The mouse leaves it be: on the PC
-/// it moves with W A S D (the owner's play of the PC game). Invented: 5
-/// was found too slow to call strikes with (playtest on the phone), 20
-/// crosses its reach in five seconds.
-const VIEW_SPEED: f32 = 20.0;
+/// The view goes no further than this from her (metres; the scripts'
+/// `nRadius`). The mouse leaves it be: on the PC it moves with W A S D
+/// (the owner's play of the PC game).
 pub const VIEW_REACH: f32 = 100.0;
+/// Whether health gone from `before` to `now` since the last tick calls a
+/// designation off.
+///
+/// From the 360 code, the map mode's update (`0x82441DD8`): it reads the
+/// damage events on her character since its last update and cancels (as
+/// the cancel button does) on one whose amount is above 0.5; smaller
+/// ones leave the view up. Here the health lost in a tick stands for the
+/// event's amount.
+pub fn hit_cancels(before: f32, now: f32) -> bool {
+    before - now > 0.5
+}
+
+/// How fast the view moves with the keys or the stick pushed all the way
+/// (m/s), its camera `height` metres up (its place's own height, not the
+/// height over the ground).
+///
+/// From the 360 code, the map mode camera's update (`0x824C6740`): each
+/// of its three inputs (-1 to 1: the two pans and the zoom, as its
+/// controller `0x824322D0` posts them from the pad) moves it by the input
+/// times its speed (24, set by its constructor `0x824373B0`) times its
+/// height, kept between 100 and 2000, times 0.01, a second. So the higher
+/// the view the faster it moves: 40.8 m/s from 170 m up.
+fn view_speed(height: f32) -> f32 {
+    24.0 * height.clamp(100.0, 2000.0) * 0.01
+}
+
+/// Where the view is after a step's move `moved` from `at`, `centre` the
+/// place it opened over. From the 360 code (the same update): a move that
+/// would take it further than the radius from there is not made at all
+/// (the view stops; it does not slide along the edge).
+fn view_moved(at: Vec2, moved: Vec2, centre: Vec2) -> Vec2 {
+    if (at + moved).distance_squared(centre) > VIEW_REACH * VIEW_REACH {
+        at
+    } else {
+        at + moved
+    }
+}
 /// The designator comes up this long before the view opens (seconds; the
 /// videos: a moment, up to a second).
 const EQUIP_TIME: f32 = 0.5;
@@ -451,7 +510,7 @@ pub fn needle(turned: f32) -> Option<(u32, f32)> {
 /// ground about `ground` high, north (+z) up the screen.
 pub fn satellite_view(at: Vec2, ground: f32, aspect: f32) -> View {
     let eye = Vec3::new(at.x, ground + SAT_HEIGHT, at.y);
-    let fov = 2.0 * (SAT_SPAN / 2.0 / SAT_HEIGHT).atan();
+    let fov = default_fov_y(aspect);
     View {
         view: Mat4::look_to_rh(eye, Vec3::NEG_Y, Vec3::Z),
         // Reversed depth, as `View::perspective`.
@@ -645,8 +704,12 @@ impl Support {
         }
         // Screen right is the world's -x, looking down with north (+z) up.
         let steer = |at: Vec2| {
-            let moved = Vec2::new(-call.steer.x, call.steer.y) * VIEW_SPEED * dt;
-            here + (at + moved - here).clamp_length_max(VIEW_REACH)
+            let speed = view_speed(her.y + SAT_HEIGHT);
+            view_moved(
+                at,
+                Vec2::new(-call.steer.x, call.steer.y) * speed * dt,
+                here,
+            )
         };
         self.phase = match self.phase {
             _ if self.pda => self.phase,
@@ -960,6 +1023,39 @@ impl Support {
 mod tests {
     use super::*;
 
+    /// Only a hit above half a point of health calls the view off.
+    #[test]
+    fn a_small_hit_leaves_the_view_up() {
+        assert!(!hit_cancels(80.0, 80.0));
+        assert!(!hit_cancels(80.0, 79.5));
+        assert!(!hit_cancels(80.0, 79.6));
+        assert!(hit_cancels(80.0, 79.4));
+        // Healing never does.
+        assert!(!hit_cancels(80.0, 95.0));
+    }
+
+    /// The 360's map camera law: 24 times a hundredth of its height a
+    /// second, the height kept between 100 and 2000; a move past the
+    /// radius is not made.
+    #[test]
+    fn the_view_moves_by_its_height_and_stops_at_its_reach() {
+        assert!((view_speed(170.0) - 40.8).abs() < 1e-4);
+        assert_eq!(view_speed(20.0), 24.0);
+        assert_eq!(view_speed(5000.0), 480.0);
+        let centre = Vec2::new(10.0, -5.0);
+        let at = centre + Vec2::new(VIEW_REACH - 1.0, 0.0);
+        assert_eq!(
+            view_moved(at, Vec2::new(0.5, 0.0), centre),
+            at + Vec2::new(0.5, 0.0)
+        );
+        assert_eq!(view_moved(at, Vec2::new(2.0, 0.0), centre), at);
+        // Back inwards it moves as ever.
+        assert_eq!(
+            view_moved(at, Vec2::new(-2.0, 0.0), centre),
+            at - Vec2::new(2.0, 0.0)
+        );
+    }
+
     const DT: f32 = 0.05;
 
     /// Steps `s` once, keeping what it posted.
@@ -1034,7 +1130,8 @@ mod tests {
         assert_eq!(posts, [TARGETTING_START]);
         assert!(s.busy());
         assert_eq!(s.looking(), Some(Vec2::new(her.x, her.z)));
-        // Steered over the gate, up the screen (north), at 20 m/s.
+        // Steered over the gate, up the screen (north), at the speed its
+        // height gives.
         let mut seconds = 0.0;
         for _ in 0..1000 {
             let at = s.looking().unwrap();
@@ -1052,7 +1149,9 @@ mod tests {
             seconds += DT;
         }
         assert!(s.looking().unwrap().distance(gate) < 1.0);
-        assert!((3.0..3.6).contains(&seconds), "{seconds}");
+        // 65 m at 36.5 m/s (the camera 152 m up: she stands 18 m under
+        // the sea's level), slowing over the last half metre.
+        assert!((1.7..2.1).contains(&seconds), "{seconds}");
         press_fire(&mut s, her, &mut posts);
         assert!(matches!(s.phase, Phase::Timing { .. }));
         // The wheel opens with its needle at the top: presses don't count
@@ -1182,7 +1281,12 @@ mod tests {
             step(&mut s, right, her, &mut posts);
         }
         let at = s.looking().unwrap();
-        assert!((at.length() - VIEW_REACH).abs() < 0.1, "{at}");
+        // It stops at the last step that stays inside the reach.
+        let step_length = view_speed(SAT_HEIGHT) * DT;
+        assert!(
+            at.length() <= VIEW_REACH && at.length() > VIEW_REACH - step_length,
+            "{at}"
+        );
         // Right on the screen is -x.
         assert!(at.x < 0.0);
         let select = Call {
@@ -1309,8 +1413,14 @@ mod tests {
         assert!(middle.x.abs() < 1e-4 && middle.y.abs() < 1e-4);
         assert!(clip(Vec3::new(100.0, 10.0, 230.0)).y > 0.1);
         assert!(clip(Vec3::new(70.0, 10.0, 200.0)).x > 0.1);
-        // 110 m of ground from the top of the screen to the bottom.
-        assert!((clip(Vec3::new(100.0, 10.0, 255.0)).y - 1.0).abs() < 1e-3);
+        // At 16:9 the default camera shows 45.4 degrees up and down: 142 m
+        // of ground from the top of the screen to the bottom, 170 m up.
+        assert!((default_fov_y(16.0 / 9.0).to_degrees() - 45.43).abs() < 0.02);
+        assert!((clip(Vec3::new(100.0, 10.0, 271.18)).y - 1.0).abs() < 2e-3);
+        // At 4:3 the 55 degrees are its width, 42.65 its height.
+        let x = (default_fov_y(4.0 / 3.0) / 2.0).tan() * 4.0 / 3.0;
+        assert!((2.0 * x.atan() - DEFAULT_FOV).abs() < 1e-5);
+        assert!((default_fov_y(4.0 / 3.0).to_degrees() - 42.65).abs() < 0.02);
         // In front of the camera, within depth.
         assert!((0.0..=1.0).contains(&middle.z));
     }

@@ -37,12 +37,9 @@
 //! Not yet: men are not sent (no faction's table asks for any). Inferred: how long a gunner has
 //! gone without seeing her is the time since his sight lines were last
 //! clear (the 360 keeps it in her record, +0x8C); car and tank drivers
-//! read the same time ([`driver_sight`]). Not ported: where the record
-//! puts her while she is unsensed (0x822D5468 moves its point on from
-//! where she was last sensed by its +0x28 x the time, or x
-//! `1 - 1 / (t + 1)` when +0x0 bit 26 is set, which 0x822F4178 sets for a
-//! target with a mind; which field +0x28 holds is not confirmed): the
-//! drivers are given where she is. Inferred: the gunners aim at her where she is (0x822C95D8's lead
+//! read the same time ([`driver_sight`]). Where the record
+//! puts her while she is unsensed is [`TargetRecord`]'s
+//! ([`m2_engine::target_record`]). Inferred: the gunners aim at her where she is (0x822C95D8's lead
 //! and line-of-fire checks are not ported); the 360 thinks at its own
 //! rate (not traced), the alpha every step. Invented: once the pursuit is
 //! over a car stops (0x822AA568) and is taken out of play past
@@ -59,6 +56,7 @@ use m2_engine::path_search::{self, PathWorld};
 use m2_engine::physics::StaticKey;
 use m2_engine::road_ring::{self, Arrival, Flood, RoadNet};
 use m2_engine::tank_attack::{Hull, TankAttack};
+use m2_engine::target_record::TargetRecord;
 use m2_math::glam::{Mat4, Quat, Vec3};
 
 use crate::gunships::Shot;
@@ -340,17 +338,19 @@ impl Kind {
     }
 }
 
-/// What a pursuing driver knows of her: her record (the mind's +0x8D4).
-/// Its +0x8C, seconds since she was last sensed, is the one timer its
-/// driver and gunners share: the record's tick (0x822DE240) adds the
-/// think's length, a sensing of her (0x822D5468, 0x822D6030) sets it to
-/// 0. `CarAttack` gives up past 20 s of it, `TankAttack`'s states read
-/// it at 2, 3 and 5 s. Inferred: sensed is its sight lines clear, as
-/// for its gunners (the 360's other senses are not ported).
-fn driver_sight(her: Vec3, unseen: f32, vehicle: bool) -> Sight {
+/// What a pursuing driver knows of her: her record (the mind's +0x8D4,
+/// [`TargetRecord`]). Its +0x8C, seconds since she was last sensed, is
+/// the one timer its driver and gunners share: the record's tick
+/// (0x822DE240) adds the think's length, a sensing of her (0x822D5468,
+/// 0x822D6030) sets it to 0. `CarAttack` gives up past 20 s of it,
+/// `TankAttack`'s states read it at 2, 3 and 5 s. Unsensed, the record
+/// has her moving on from where she was sensed at her velocity then
+/// (0x822D5468). Inferred: sensed is its sight lines clear, as for its
+/// gunners (the 360's other senses are not ported).
+fn driver_sight(record: &TargetRecord, vehicle: bool) -> Sight {
     Sight {
-        at: her,
-        unseen,
+        at: record.at(),
+        unseen: record.unseen,
         vehicle,
     }
 }
@@ -380,6 +380,8 @@ struct Pursuer {
     sight_wait: f32,
     sees: bool,
     unseen: f32,
+    /// Its mind's record of her (+0x8D4).
+    record: TargetRecord,
     /// What each armed seat's fire control last reported
     /// ([`m2_engine::gunner_aim::Report`]), by [`armed_seats`](crate::combat::armed_seats).
     reports: Vec<Report>,
@@ -747,6 +749,7 @@ impl Pursuers {
             sight_wait: 0.0,
             sees: false,
             unseen: 0.0,
+            record: TargetRecord::default(),
             reports: Vec::new(),
             leaving: false,
         });
@@ -1004,7 +1007,7 @@ impl Pursuers {
                     width: hi.x - lo.x,
                     gunner: crate::combat::armed_seats(v).len() > 1,
                 };
-                let sight = driver_sight(her, p.unseen, in_vehicle);
+                let sight = driver_sight(&p.record, in_vehicle);
                 // What she has hit it for since the last think (0x822FA988).
                 p.tank.feel(std::mem::take(&mut v.hit), dt);
                 let state = p.tank.state;
@@ -1065,7 +1068,7 @@ impl Pursuers {
                     // report and his weapon slot's distances.
                     let crew = rider_list(v, &p.reports, car.at, car.forward);
                     let (lo, hi) = v.spec.bounds;
-                    let sight = driver_sight(her, p.unseen, in_vehicle);
+                    let sight = driver_sight(&p.record, in_vehicle);
                     let mut world = Look {
                         physics,
                         rng: &mut self.rng,
@@ -1152,7 +1155,12 @@ impl Pursuers {
                         physics.sight_clear(a, end, Some(id))
                     });
             }
-            p.unseen = if p.sees { 0.0 } else { p.unseen + dt };
+            if p.sees {
+                p.record.sensed(her, her_velocity);
+            } else {
+                p.record.tick(dt);
+            }
+            p.unseen = p.record.unseen;
             // Its gunners, and its driver when he has a gun of his own
             // (`CarAttack` and `TankAttack` fire it, 0x822C95D8): each
             // think ends in a report, and short of firing unless ready.
@@ -1272,11 +1280,18 @@ fn behind_chance(standing: Standing) -> Option<f32> {
 mod tests {
 
     #[test]
-    fn a_driver_reads_the_time_since_she_was_last_sensed() {
+    fn a_driver_reads_her_record() {
         // Her record's +0x8C (0x822DE240 adds the think, a sensing
-        // clears it), not a constant 0.
-        let s = driver_sight(Vec3::X, 21.5, true);
-        assert_eq!((s.at, s.unseen, s.vehicle), (Vec3::X, 21.5, true));
+        // clears it), not a constant 0; unsensed, her point moves on at
+        // her velocity when sensed (0x822D5468).
+        let mut r = TargetRecord::default();
+        r.sensed(Vec3::X, Vec3::Z * 10.0);
+        let s = driver_sight(&r, true);
+        assert_eq!((s.at, s.unseen, s.vehicle), (Vec3::X, 0.0, true));
+        r.tick(1.5);
+        let s = driver_sight(&r, false);
+        assert_eq!(s.unseen, 1.5);
+        assert!((s.at - Vec3::new(1.0, 0.0, 15.0)).length() < 1e-5);
     }
 
     use super::*;

@@ -396,6 +396,36 @@ fn context_action(lua: &Lua, text: Option<&str>) -> mlua::Result<()> {
         .call::<()>(text)
 }
 
+/// The engine's own prompts to the HUD (`crate::action_prompt`).
+///
+/// From the 360 code: when the player's action kind or its object changes,
+/// `0x82438D10` takes the old prompt back (`0x822070E0`, by its kind) and
+/// sends the new one (`0x82207018`) with its kind as the priority; the
+/// HUD's `SetContextActionMessage(text, player, priority)` (nil to take
+/// one back) files each text under its priority, shows the newest and,
+/// when the one shown is taken back, the one left.
+const ACTION_MESSAGE: &str = r#"
+local old, kind, text = ...
+local ok, m = pcall(import, "MrxGuiHudMelee")
+if ok and type(m) == "table" and m.SetContextActionMessage then
+    local me = Sys.StringToGuid("0x1")
+    if old then m.SetContextActionMessage(nil, me, old) end
+    if kind then m.SetContextActionMessage(text, me, kind) end
+end
+"#;
+
+/// Tells the HUD's script that the engine's own prompt went from `old` to
+/// `new` ([`ACTION_MESSAGE`]).
+fn action_message(
+    lua: &Lua,
+    old: Option<&(u32, String)>,
+    new: Option<&(u32, String)>,
+) -> mlua::Result<()> {
+    lua.load(ACTION_MESSAGE)
+        .set_name("=m2-hud action prompt")
+        .call::<()>((old.map(|o| o.0), new.map(|n| n.0), new.map(|n| n.1.clone())))
+}
+
 /// The map movie's GPS destination commands ([`GPS_DEST`]): whether
 /// `command` was one, sent on to the GUI.
 fn gps_dest(lua: &Lua, command: &str, arg: &str) -> bool {
@@ -728,6 +758,9 @@ pub struct HudState {
     /// The times she asked to see her ammo (reload, a weapon switch;
     /// `Combat::ammo_shown`): each puts both ammo boxes up.
     pub ammo_shown: u32,
+    /// The requests to show every counter so far
+    /// ([`SHOW_ALL_COUNTERS`]).
+    pub counters_shown: u32,
     /// The rifle's rounds: in the clip, stored.
     pub rifle: Rounds,
     /// Rounds the gun in her hands holds a clip (the carbine's 30, the
@@ -852,6 +885,9 @@ pub struct HudState {
     /// (`Pg.AddContextAction`), for the game's own prompt
     /// ([`CONTEXT_ACTION`]).
     pub context_action: Option<String>,
+    /// The engine's own prompt in reach: its kind and text
+    /// ([`ACTION_MESSAGE`]).
+    pub action: Option<(u32, String)>,
     /// Whether vehicle disguises work, and her disguise while one holds:
     /// how much is left (0..=100) and whether it holds.
     pub vehicle_disguise: bool,
@@ -1074,6 +1110,7 @@ impl HudState {
                 .scene
                 .arms()
                 .and_then(|a| a.lock_cones.get(&game.combat.launcher.template?).copied()),
+            counters_shown: game.combat.counters_shown,
             picked: game.combat.picked,
             launcher: game.combat.launcher_rounds,
             rifle: game.combat.rifle_rounds,
@@ -2173,6 +2210,8 @@ fn run(
 struct Told {
     /// The context action's text last given to the script.
     context_action: Option<String>,
+    /// The engine's own prompt last given to it.
+    action: Option<(u32, String)>,
     /// The save icon was asked up ([`HudState::saving`]).
     saving: bool,
     hp: Option<(i32, bool)>,
@@ -2192,6 +2231,8 @@ struct Told {
     explosive: bool,
     /// The ammo-box requests passed on ([`HudState::ammo_shown`]).
     ammo_shown: u32,
+    /// The all-counters requests passed on.
+    counters_shown: u32,
     /// She was in a vehicle ([`HudState::in_vehicle`]).
     in_vehicle: Option<bool>,
     /// The gun box's icon widgets as last logged ([`Thread::gun_box`]).
@@ -3530,6 +3571,24 @@ impl Thread {
             log.push(format!("flash {}: {name}({} args)", m.swf, args.len()));
             m.rt.call(&name, &args);
         }
+        // The keys the scripts send a movie themselves (`SendFlashInput`:
+        // the store's stick pushes): a press goes down and comes up, a
+        // hold stays down until its release. That a press is both is
+        // inferred from its name; the 360's own handling of the queue was
+        // not read.
+        let inputs = screen.borrow_mut().take_flash_inputs();
+        for (id, code, what) in inputs {
+            let Some(m) = self.flash.get_mut(&id) else {
+                continue;
+            };
+            log.push(format!("flash {}: input {code} {what:?}", m.swf));
+            if what != gui_runtime::FlashInput::Release {
+                m.rt.key_down(code);
+            }
+            if what != gui_runtime::FlashInput::Hold {
+                m.rt.key_up(code);
+            }
+        }
         for (code, down) in std::mem::take(&mut self.keys) {
             log.push(format!(
                 "flash: key {code} {}",
@@ -3974,6 +4033,10 @@ impl Thread {
             self.told.context_action = s.context_action.clone();
             context_action(lua, s.context_action.as_deref())?;
         }
+        if self.told.action != s.action {
+            let old = std::mem::replace(&mut self.told.action, s.action.clone());
+            action_message(lua, old.as_ref(), s.action.as_ref())?;
+        }
         let holding = s.support.designator.is_some();
         // In a tank, the gun chosen: its machine gun, else its cannon.
         let mg = s.in_vehicle && s.machine_gun.is_some();
@@ -4161,6 +4224,7 @@ impl Thread {
         // Reload or a weapon switch pressed: both ammo boxes up, as the
         // 360's on-foot input sends it (0x824333E0: `GuiShowAmmoCounter`
         // with `bShowGun` and `bShowExplosive` true).
+        show_counters(lua, &mut self.told.counters_shown, s.counters_shown)?;
         if s.ammo_shown != self.told.ammo_shown {
             self.told.ammo_shown = s.ammo_shown;
             let t = table(
@@ -5038,6 +5102,31 @@ fn stinger_place([x, y]: [f32; 2], aspect: f32) -> [f32; 2] {
     [320.0 + x * 240.0 * aspect, (1.0 - y) * 240.0]
 }
 
+/// The engine's word to put every counter of the HUD up for a while.
+///
+/// From the 360 code: the player's input update shared by the on-foot and
+/// the vehicle controls (`0x8242E7A0`) sends an event of this type alone
+/// (no fields but the player) when either of two of its input bits (2 and
+/// 4) is newly pressed; the bit beside them (8) sends `TogglePDA`. From
+/// the data, the game's control layout gives the d-pad's up and down as
+/// "cash & fuel" in a vehicle and as the support's on foot; that these are
+/// the two bits is inferred from that, not read from the pad's table.
+///
+/// From the scripts: the health counter (`HandleShowHealthEvent`) and the
+/// others bound to it show themselves and fade as after a change.
+pub const SHOW_ALL_COUNTERS: &str = "ShowAllCounters";
+
+/// Fires [`SHOW_ALL_COUNTERS`] once if requests came since `told`
+/// (however many: one press, one event), and notes them told.
+fn show_counters(lua: &Lua, told: &mut u32, asked: u32) -> mlua::Result<()> {
+    if *told != asked {
+        *told = asked;
+        eprintln!("hud: all counters asked up ({asked})");
+        fire(lua, SHOW_ALL_COUNTERS, ())?;
+    }
+    Ok(())
+}
+
 /// The explosive half of `GuiWeaponEquippedUpdate` (360 0x8234F458, its
 /// flag 0x20): the explosive's icon alone, so the gun box and the reticle,
 /// which find no `uNewCurrentGun`, are left as they were.
@@ -5126,6 +5215,15 @@ impl MapView {
             [cx + right * k, cy - ahead * k],
             ahead.hypot(right) <= self.range,
         )
+    }
+
+    /// Which way the world direction (`dx`, `dz`) points on the map,
+    /// degrees clockwise from straight up (as [`Self::screen`] lays it).
+    fn bearing(&self, dx: f32, dz: f32) -> f32 {
+        let (s, c) = self.heading.to_radians().sin_cos();
+        let ahead = dx * s + dz * c;
+        let right = -dx * c + dz * s;
+        right.atan2(ahead).to_degrees()
     }
 
     /// The world `(x, z)` that shows at `angle` degrees clockwise from
@@ -5665,11 +5763,36 @@ fn minimap(
         let Some([x, y]) = blip_place(view, b.at, b.sticky) else {
             continue;
         };
+        // Its sonar rings first, under the icon (from the 360 code, the
+        // icon's draw 0x823871F8 runs the animators' own draws before the
+        // icon's quad): each a square half its width each way, the
+        // radar's radius being 50 of those units.
+        if let Some((texture, colour, rings)) = &b.rings {
+            let ring = name_hash(texture);
+            want.push(ring);
+            for &(width, alpha) in rings {
+                let half = width * 0.5 * r / 50.0;
+                let [cr, cg, cb] = colour.map(|v| f32::from(v) / 255.0);
+                out.push(quad(
+                    Some(ring),
+                    [x - half, y - half, x + half, y + half],
+                    full,
+                    [cr, cg, cb, alpha],
+                    0.0,
+                ));
+            }
+        }
         let hash = name_hash(&b.icon);
         want.push(hash);
-        let s = r * 0.16;
+        let [w, h] = blip_half_size(b.size).map(|v| v * r / RADAR_RADIUS);
         let c = b.colour.map(|v| f32::from(v) / 255.0);
-        out.push(quad(Some(hash), [x - s, y - s, x + s, y + s], full, c, 0.0));
+        out.push(quad(
+            Some(hash),
+            [x - w, y - h, x + w, y + h],
+            full,
+            c,
+            blip_turn(view, b),
+        ));
     }
     // Her: a white square, upright whichever way she faces (the map turns
     // with the camera, not with her).
@@ -5681,6 +5804,44 @@ fn minimap(
         white,
         0.0,
     ));
+}
+
+/// The radar's radius in its own units (the [`BORDER`]'s minimap is 100
+/// across).
+const RADAR_RADIUS: f32 = 50.0;
+
+/// A blip's half width and height in the radar's units. From the 360
+/// code: the minimap's icon draw (`0x823871F8`) makes the quad from
+/// (x - width, y - height) to (x + width, y + height), each times the
+/// screen's scale, so the scripts' `nWidth` and `nHeight` are half sizes
+/// (10.667 for an objective's, 5 for a vehicle's). A blip with no size
+/// (0) keeps the size the port drew every blip at before, 8.
+fn blip_half_size(size: [f32; 2]) -> [f32; 2] {
+    size.map(|v| if v > 0.0 { v } else { 8.0 })
+}
+
+/// How far a blip's icon is turned, degrees clockwise. From the 360 code:
+/// the minimap's objective update (`0x82388320`) keeps an angle per blip,
+/// 0 unless it is `bOriented` and has a target, when it is minus the
+/// target's heading; the renderer (`0x823879D0`) adds the map's own
+/// rotation to it when the blip is `bRotate` and hands the sum to the
+/// icon's draw. So an oriented, rotating blip (a vehicle's, a plane's)
+/// points the way its target goes on the turning map; a rotating one
+/// alone turns with the map; an oriented one alone turns as on a
+/// north-up map. Here the same angles are taken from the view's own
+/// projection, whatever way it counts headings.
+fn blip_turn(view: &MapView, b: &crate::mission::RadarView) -> f32 {
+    let north = view.bearing(0.0, 1.0);
+    let heading = b
+        .yaw
+        .filter(|_| b.oriented)
+        .map(|yaw| view.bearing(yaw.sin(), yaw.cos()) - north);
+    match (heading, b.rotate) {
+        (Some(h), true) => h + north,
+        (Some(h), false) => h,
+        (None, true) => north,
+        (None, false) => 0.0,
+    }
 }
 
 /// How far past the rim a sticky blip out of range sits: 2 of the
@@ -6757,6 +6918,85 @@ mod tests {
         assert!((x - 746.67).abs() < 0.01 && y == 480.0, "{x} {y}");
     }
 
+    /// A request to show every counter fires the event once, with no
+    /// arguments, and not again until the next request.
+    #[test]
+    fn all_counters_are_asked_up_once_a_request() {
+        let lua = Lua::new();
+        lua.load(
+            r#"
+            fired = {}
+            Event = { __m2_fire = function(...)
+                table.insert(fired, table.concat({ ... }, " "))
+                return 1
+            end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let mut told = 0;
+        show_counters(&lua, &mut told, 0).unwrap();
+        show_counters(&lua, &mut told, 1).unwrap();
+        show_counters(&lua, &mut told, 1).unwrap();
+        show_counters(&lua, &mut told, 3).unwrap();
+        let fired: Vec<String> = lua.globals().get("fired").unwrap();
+        assert_eq!(fired, ["ShowAllCounters", "ShowAllCounters"]);
+        assert_eq!(told, 3);
+    }
+
+    /// A blip's icon is as big as the scripts say (half sizes, in the
+    /// radar's units) and turned as the 360's minimap turns it: by its
+    /// target's heading when oriented, with the map when rotating.
+    #[test]
+    fn blips_are_sized_and_turned_as_the_minimap_does() {
+        use crate::mission::RadarView;
+        assert_eq!(blip_half_size([5.0, 5.0]), [5.0, 5.0]);
+        assert_eq!(blip_half_size([10.667, 0.0]), [10.667, 8.0]);
+        let view = |heading: f32| MapView {
+            rect: [0.0, 0.0, 100.0, 100.0],
+            player: [0.0; 3],
+            heading,
+            range: 100.0,
+        };
+        let blip = |yaw: Option<f32>, rotate: bool, oriented: bool| RadarView {
+            at: Vec3::ZERO,
+            icon: String::new(),
+            colour: [255; 4],
+            sticky: false,
+            sort: 5,
+            size: [5.0, 5.0],
+            yaw,
+            rotate,
+            oriented,
+            rings: None,
+        };
+        let near = |a: f32, b: f32| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs() < 1e-3;
+        let east = std::f32::consts::FRAC_PI_2;
+        for heading in [0.0_f32, 90.0, 215.0] {
+            let v = view(heading);
+            let north = v.bearing(0.0, 1.0);
+            // Neither: upright. Rotating alone: with the map.
+            assert_eq!(blip_turn(&v, &blip(Some(east), false, false)), 0.0);
+            assert!(near(blip_turn(&v, &blip(None, true, false)), north));
+            // A vehicle's (both): the way it goes, as the map shows it:
+            // where the map puts a point ahead of it.
+            let both = blip_turn(&v, &blip(Some(east), true, true));
+            let ([x, y], _) = v.screen(1.0, 0.0);
+            let [cx, cy] = v.centre();
+            assert!(near(both, (x - cx).atan2(cy - y).to_degrees()), "{heading}");
+            // Oriented alone: its heading on a map that does not turn.
+            let alone = blip_turn(&v, &blip(Some(east), false, true));
+            assert!(near(alone, both - north), "{heading}");
+            // Oriented with no target: nothing to take a heading from.
+            assert!(near(blip_turn(&v, &blip(None, true, true)), north));
+        }
+        // Facing north on a north-up map it is upright.
+        assert!(near(
+            blip_turn(&view(0.0), &blip(Some(0.0), true, true)),
+            0.0
+        ));
+    }
+
     /// The context action in reach goes to the script's
     /// `SetContextActionMessage` as the engine calls it: the text, or nil
     /// once out of reach, and the player; nothing when the module is
@@ -6795,6 +7035,42 @@ mod tests {
         context_action(&lua, Some("[ContextAction.Talk]")).unwrap();
         let calls: Vec<String> = lua.globals().get("calls").unwrap();
         assert_eq!(calls.len(), 2);
+    }
+
+    /// The engine's own prompt goes to the same script with its kind as
+    /// the priority; a change takes the old one back by its kind first.
+    #[test]
+    fn the_engines_prompt_is_sent_with_its_kind() {
+        let lua = Lua::new();
+        lua.load(
+            r##"
+            calls = {}
+            Sys = { StringToGuid = function(s) return "guid " .. s end }
+            local melee = { SetContextActionMessage = function(...)
+                local text, player, priority = ...
+                table.insert(calls, select("#", ...) .. " " .. tostring(text) .. " "
+                    .. tostring(player) .. " " .. tostring(priority))
+            end }
+            function import(name) return melee end
+            "##,
+        )
+        .exec()
+        .unwrap();
+        let drive = (6, "[ContextAction.DriveVehicle]".to_owned());
+        let equip = (2, "[ContextAction.PickupWeapon]".to_owned());
+        action_message(&lua, None, Some(&drive)).unwrap();
+        action_message(&lua, Some(&drive), Some(&equip)).unwrap();
+        action_message(&lua, Some(&equip), None).unwrap();
+        let calls: Vec<String> = lua.globals().get("calls").unwrap();
+        assert_eq!(
+            calls,
+            [
+                "3 [ContextAction.DriveVehicle] guid 0x1 6",
+                "3 nil guid 0x1 6",
+                "3 [ContextAction.PickupWeapon] guid 0x1 2",
+                "3 nil guid 0x1 2",
+            ]
+        );
     }
 
     /// The PDA's `ControllerInput` event carries both sticks: the left

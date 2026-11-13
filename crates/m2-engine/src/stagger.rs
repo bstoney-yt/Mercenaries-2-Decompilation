@@ -38,7 +38,9 @@
 //!     otherwise (the floats 135 at 0x820F9868 and 45 at 0x82B7C5EC);
 //!   - the person is given a heading to turn to: the event direction's
 //!     plus pi for `Front`, plus a quarter turn for `Left`, less one for
-//!     `Right`, and itself for `Back`.
+//!     `Right`, and itself for `Back`. The animation driver's
+//!     state-change handler (0x8241FE38) sets their physics heading to
+//!     it at once as a stagger action starts: a snap, not a turn.
 //! - `StaggerCooldown` and `StaggerResetSeconds` are the human physics
 //!   template's, registered with the defaults [`COOLDOWN`] and [`RESET`].
 //!
