@@ -109,6 +109,32 @@ pub fn activation_light(chunk: &Chunk) -> Result<Option<(f32, ScriptAtmosphere)>
     )))
 }
 
+/// A script's light on activation: seconds until it, and the light.
+pub type ActivationLight = (f32, ScriptAtmosphere);
+
+/// The light each of `scripts` (object scripts, by any key) sets on
+/// activation ([`activation_light`]), for those that set one, and the
+/// keys of those that did not run, with why.
+pub fn lights_of<K: std::hash::Hash + Eq>(
+    scripts: impl IntoIterator<Item = (K, Chunk)>,
+) -> (
+    std::collections::HashMap<K, ActivationLight>,
+    Vec<(K, String)>,
+) {
+    let mut lights = std::collections::HashMap::new();
+    let mut failed = Vec::new();
+    for (key, chunk) in scripts {
+        match activation_light(&chunk) {
+            Ok(Some(light)) => {
+                lights.insert(key, light);
+            }
+            Ok(None) => {}
+            Err(e) => failed.push((key, e.to_string())),
+        }
+    }
+    (lights, failed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +178,33 @@ mod tests {
         );
         assert_eq!(light.interpolate, 0.0);
         assert!((light.restore.unwrap() - 1.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lights_are_gathered_for_the_scripts_that_set_one() {
+        let lit = compile(
+            r#"
+            function OnActivate(obj)
+                Graphics.Atmosphere.Begin()
+                Graphics.Atmosphere.SetValue("fLightIntensity", 2)
+                Graphics.Atmosphere.SetValue("fTimeRestore", 3)
+                Graphics.Atmosphere.End(0.5)
+            end
+            "#,
+        );
+        let plain = compile("function OnActivate(obj) end");
+        let broken = compile("function OnActivate(obj) error('no') end");
+        let (lights, failed) = lights_of([(1u32, lit), (2, plain), (3, broken)]);
+        assert_eq!(lights.len(), 1);
+        let (delay, light) = &lights[&1];
+        assert_eq!(*delay, 0.0);
+        assert_eq!((light.interpolate, light.restore), (0.5, Some(3.0)));
+        assert_eq!(
+            light.edits,
+            [("fLightIntensity".to_owned(), EditValue::Float(2.0))]
+        );
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, 3);
     }
 
     #[test]
