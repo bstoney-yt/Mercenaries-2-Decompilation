@@ -29,12 +29,17 @@
 //! u32 bone count, then per bone:
 //!   u32 0, ref name, u16 0, position 3 f32, rotation 4 f32 (w first),
 //!   scale 3 f32, u32 index, f32 weight
-//! u16 0, u32 1, u32 pose count, then per pose:
-//!   u32 its number, ref class ("FxBonePoseNode"), u32 0x5C, u32 0,
-//!   ref name, u16 2, f32 least, f32 most, 24 bytes of 0,
-//!   u32 bone count, then per bone:
+//! u16 0, u32 1, u32 node count, then per node:
+//!   u32 its number, ref class, u32 0x5C, u32 0, ref name, u16 2,
+//!   f32 least, f32 most, u32 0, u16 0,
+//!   u32 input count, then per input:
+//!     u32 0, ref the node it comes from, ref link function ("linear"),
+//!     u32 0, u32 parameter count, f32 per parameter, u32 0xFFFFFFFF
+//!   12 bytes (a u16 at +6: 0, 1, 2 or 4; not read)
+//!   for an "FxBonePoseNode" only: u16 0, u32 bone count, then per bone:
 //!     u32 0, ref name, u16 0, position, rotation, scale
-//! ... 52 bytes not read (a last name reference, "Default", among zeros)
+//!   ("FxCombinerNode" has nothing more)
+//! ... then a phoneme map and the rest, not read
 //! ```
 //!
 //! An animation set's body:
@@ -148,13 +153,44 @@ pub struct Bone {
     pub weight: f32,
 }
 
-/// A pose of a rig: the bones it moves and where it takes each.
+/// The combiner node class: a value the animations or other nodes set,
+/// that feeds other nodes (the head's and eyes' orientation, `Blink`,
+/// `Eyebrow Raise`).
+pub const COMBINER_NODE: &str = "FxCombinerNode";
+
+/// What feeds a node: another node's value through a link function.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Input {
+    /// The node it comes from.
+    pub from: String,
+    /// The link function's name (`linear` in every one of the game's)
+    /// and its parameters (for `linear`: a slope and an offset).
+    pub function: String,
+    pub parameters: Vec<f32>,
+}
+
+impl Input {
+    /// What the link makes of `value`: for `linear`, the slope times it
+    /// plus the offset; any other function passes it as it is.
+    pub fn apply(&self, value: f32) -> f32 {
+        match (self.function.as_str(), self.parameters.as_slice()) {
+            ("linear", [m, b, ..]) => m * value + b,
+            _ => value,
+        }
+    }
+}
+
+/// A node of a rig's face graph: a pose (the bones it moves and where
+/// it takes each) or a combiner (no bones), with what feeds it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pose {
     pub name: String,
-    /// The least and most its value may be (0 and 1 in the game's).
+    /// `FxBonePoseNode` or `FxCombinerNode`.
+    pub class: String,
+    /// The least and most its value may be.
     pub least: f32,
     pub most: f32,
+    pub inputs: Vec<Input>,
     pub bones: Vec<(String, Transform)>,
 }
 
@@ -389,12 +425,12 @@ impl Actor {
         }
         b.r.u16()?;
         b.r.u32()?;
-        let pose_count = b.count(60)?;
+        let pose_count = b.count(52)?;
         let mut poses = Vec::with_capacity(pose_count);
         for k in 0..pose_count {
             b.r.u32()?;
             let class = b.name()?;
-            if class != BONE_POSE_NODE {
+            if class != BONE_POSE_NODE && class != COMBINER_NODE {
                 return Err(FaceFxError::UnknownClass { pose: k, class });
             }
             b.r.u32()?;
@@ -403,19 +439,46 @@ impl Actor {
             b.r.u16()?;
             let least = b.f32()?;
             let most = b.f32()?;
-            b.r.take(24)?;
-            let moved = b.count(52)?;
-            let mut pose_bones = Vec::with_capacity(moved);
-            for _ in 0..moved {
-                b.expect_u32(0, "0 before a pose's bone")?;
-                let bone = b.name()?;
-                b.expect_u16(0, "0 after a pose's bone's name")?;
-                pose_bones.push((bone, b.transform()?));
+            b.r.u32()?;
+            b.r.u16()?;
+            let input_count = b.count(28)?;
+            let mut inputs = Vec::with_capacity(input_count);
+            for _ in 0..input_count {
+                b.expect_u32(0, "0 before an input")?;
+                let from = b.name()?;
+                let function = b.name()?;
+                b.r.u32()?;
+                let n = b.count(4)?;
+                let mut parameters = Vec::with_capacity(n);
+                for _ in 0..n {
+                    parameters.push(b.f32()?);
+                }
+                b.r.u32()?;
+                inputs.push(Input {
+                    from,
+                    function,
+                    parameters,
+                });
+            }
+            b.r.take(12)?;
+            let mut pose_bones = Vec::new();
+            if class == BONE_POSE_NODE {
+                b.r.u16()?;
+                let moved = b.count(52)?;
+                pose_bones.reserve(moved);
+                for _ in 0..moved {
+                    b.expect_u32(0, "0 before a pose's bone")?;
+                    let bone = b.name()?;
+                    b.expect_u16(0, "0 after a pose's bone's name")?;
+                    pose_bones.push((bone, b.transform()?));
+                }
             }
             poses.push(Pose {
                 name,
+                class,
                 least,
                 most,
+                inputs,
                 bones: pose_bones,
             });
         }
@@ -555,7 +618,15 @@ mod tests {
     }
 
     fn actor_bytes() -> Vec<u8> {
-        let mut out = head(&["Rig", "bone_jaw", "FxBonePoseNode", "Oat"]);
+        let mut out = head(&[
+            "Rig",
+            "bone_jaw",
+            "FxBonePoseNode",
+            "Oat",
+            "FxCombinerNode",
+            "Blink",
+            "linear",
+        ]);
         out.extend(0x21u32.to_le_bytes());
         out.extend(0u32.to_le_bytes());
         name(&mut out, 0);
@@ -574,16 +645,37 @@ mod tests {
         floats(&mut out, &[1.0]);
         out.extend(0u16.to_le_bytes());
         out.extend(1u32.to_le_bytes());
-        out.extend(1u32.to_le_bytes());
-        // The pose.
+        out.extend(2u32.to_le_bytes());
+        // A combiner, `Blink`, from -1 to 1, fed by nothing.
         out.extend(0u32.to_le_bytes());
+        name(&mut out, 4);
+        out.extend(0x5cu32.to_le_bytes());
+        out.extend(0u32.to_le_bytes());
+        name(&mut out, 5);
+        out.extend(2u16.to_le_bytes());
+        floats(&mut out, &[-1.0, 1.0]);
+        out.extend([0u8; 10]);
+        out.extend([0u8; 12]);
+        // The pose, fed by `Blink` through `linear` 2 x + 0.5.
+        out.extend(1u32.to_le_bytes());
         name(&mut out, 2);
         out.extend(0x5cu32.to_le_bytes());
         out.extend(0u32.to_le_bytes());
         name(&mut out, 3);
         out.extend(2u16.to_le_bytes());
         floats(&mut out, &[0.0, 1.0]);
-        out.extend([0u8; 24]);
+        out.extend(0u32.to_le_bytes());
+        out.extend(0u16.to_le_bytes());
+        out.extend(1u32.to_le_bytes());
+        out.extend(0u32.to_le_bytes());
+        name(&mut out, 5);
+        name(&mut out, 6);
+        out.extend(0u32.to_le_bytes());
+        out.extend(2u32.to_le_bytes());
+        floats(&mut out, &[2.0, 0.5]);
+        out.extend(u32::MAX.to_le_bytes());
+        out.extend([0u8; 12]);
+        out.extend(0u16.to_le_bytes());
         out.extend(1u32.to_le_bytes());
         out.extend(0u32.to_le_bytes());
         name(&mut out, 1);
@@ -641,8 +733,16 @@ mod tests {
         assert_eq!(a.bones[0].index, 31);
         // Stored w first, kept x, y, z, w.
         assert_eq!(a.bones[0].rest.rotation, [0.0, 0.0, 0.0, 1.0]);
+        let blink = a.pose("Blink").unwrap();
+        assert_eq!(blink.class, COMBINER_NODE);
+        assert!(blink.bones.is_empty() && blink.inputs.is_empty());
+        assert_eq!((blink.least, blink.most), (-1.0, 1.0));
         let oat = a.pose("oat").unwrap();
+        assert_eq!(oat.class, BONE_POSE_NODE);
         assert_eq!((oat.least, oat.most), (0.0, 1.0));
+        assert_eq!(oat.inputs.len(), 1);
+        assert_eq!(oat.inputs[0].from, "Blink");
+        assert_eq!(oat.inputs[0].apply(0.25), 1.0);
         assert_eq!(oat.bones[0].0, "bone_jaw");
         assert_eq!(oat.bones[0].1.position, [0.0, -0.05, 0.05]);
         assert_eq!(oat.bones[0].1.rotation, [0.1, 0.2, 0.3, 0.9]);
@@ -710,8 +810,19 @@ mod tests {
             Err(FaceFxError::KeyCounts { .. })
         ));
         // A pose of a class this does not read.
-        let mut other = head(&["Rig", "bone_jaw", "FxCombinerNode", "Oat"]);
-        other.extend(&actor_bytes()[head(&["Rig", "bone_jaw", "FxBonePoseNode", "Oat"]).len()..]);
+        let known = [
+            "Rig",
+            "bone_jaw",
+            "FxBonePoseNode",
+            "Oat",
+            "FxCombinerNode",
+            "Blink",
+            "linear",
+        ];
+        let mut unknown = known;
+        unknown[4] = "FxDeltaNodeXX";
+        let mut other = head(&unknown);
+        other.extend(&actor_bytes()[head(&known).len()..]);
         assert!(matches!(
             Actor::parse(&wrap(&other)),
             Err(FaceFxError::UnknownClass { .. })
