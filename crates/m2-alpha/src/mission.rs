@@ -3521,6 +3521,8 @@ impl MissionLink {
                     mission.kill(e);
                 }
             }
+            // Placed mines run into or blasted, her mines armed.
+            crate::mines::report(game, mission, &self.blasts, BLAST_REACH);
             self.blasts.clear();
             self.bombs.clear();
             // The scripts heal her and watch her health.
@@ -3915,6 +3917,17 @@ impl MissionLink {
                     && what.starts_with("Explosion (Bunker Buster")
                 {
                     self.bombs.push(Vec3::from(*position));
+                }
+                // An explosion the scripts spawn (a mine's) goes off there.
+                if let Command::Spawn { what, position, .. } = &c
+                    && let Some(blast) = game
+                        .scene
+                        .world
+                        .as_ref()
+                        .and_then(|w| crate::mines::explosion_blast(&w.index.template_db, what))
+                {
+                    eprintln!("mission: the scripts set off {what} at {position:.1?}");
+                    game.combat.set_off(Vec3::from(*position), Some(blast));
                 }
                 if c == Command::Notify("Pg.ContractCompleted".into()) {
                     self.completed = Some(0.0);

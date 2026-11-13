@@ -48,6 +48,20 @@ fn main() -> Result<()> {
             on.push((layer.clone(), e.guid, e.at));
         }
     }
+    // What they are: template and the data the engine hands the script.
+    let mut kinds: std::collections::BTreeMap<(String, Option<u32>), u32> = Default::default();
+    for e in data
+        .layers
+        .values()
+        .flatten()
+        .filter(|e| e.script == Some(*hash))
+    {
+        let t = e.template.clone().unwrap_or_else(|| e.name.clone());
+        *kinds.entry((t, e.script_data)).or_default() += 1;
+    }
+    for ((t, d), n) in &kinds {
+        println!("  {n} x {t} (data {d:?})");
+    }
     let mut layers: Vec<&str> = on.iter().map(|(l, _, _)| l.as_str()).collect();
     layers.dedup();
     println!(
@@ -205,8 +219,105 @@ fn main() -> Result<()> {
     if ["c4", "beacon"].contains(&name.to_ascii_lowercase().as_str()) {
         thrown(&mut mission, name);
     }
+    if name.eq_ignore_ascii_case("mine") {
+        mines(&mut mission, &on, &mut run);
+    }
+    if name.eq_ignore_ascii_case("proximitymine") {
+        planted(&mut mission);
+    }
     println!("{name} lines logged: {failures}");
     Ok(())
+}
+
+/// `mine`: for each kind of placed mine (the first of each name), she
+/// stands on it (0.5 m off) for 3 s, then it is killed as a vehicle or a
+/// blast would (`Mission::kill`) and 2 s pass. Prints what the scripts
+/// spawn (`mine:` lines).
+fn mines(
+    mission: &mut Mission,
+    on: &[(String, u32, [f32; 3])],
+    run: &mut impl FnMut(&mut Mission, f64),
+) {
+    let mut seen: Vec<String> = Vec::new();
+    for (_, g, at) in on {
+        let Some(n) = mission
+            .world()
+            .borrow()
+            .objects
+            .get(g)
+            .map(|o| o.name.clone())
+        else {
+            continue;
+        };
+        if seen.contains(&n) {
+            continue;
+        }
+        seen.push(n.clone());
+        mission.take_commands();
+        mission.put_player([at[0] + 0.5, at[1], at[2]]);
+        let spawned = |m: &mut Mission| -> Vec<String> {
+            m.take_commands()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Command::Spawn { what, .. } => Some(what),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut stepped = Vec::new();
+        for _ in 0..12 {
+            mission.tick(0.25);
+            stepped.extend(spawned(mission));
+        }
+        let alive = mission.world().borrow().objects.get(g).map(|o| o.alive);
+        println!("mine: {n} {g:#x}: stood on it: spawned {stepped:?}, alive {alive:?}");
+        if alive == Some(true) {
+            mission.put_player([at[0] + 50.0, at[1], at[2]]);
+            run(mission, 0.5);
+            mission.take_commands();
+            mission.kill(*g);
+            let mut killed = Vec::new();
+            for _ in 0..8 {
+                mission.tick(0.25);
+                killed.extend(spawned(mission));
+            }
+            println!("mine: {n} {g:#x}: killed: spawned {killed:?}");
+        }
+    }
+}
+
+/// `proximitymine`: one planted at (100, 0, 100); she waits 10 m off for
+/// 2 s, then comes 4 m off for 2 s. Prints what its script does
+/// (`planted:` lines).
+fn planted(mission: &mut Mission) {
+    mission.put_player([110.0, 0.0, 100.0]);
+    mission.take_commands();
+    let g = mission.ammo_spawned("Proximity Mine (Planted)", [100.0, 0.0, 100.0]);
+    for (phase, x) in [("10 m off", 110.0), ("4 m off", 104.0)] {
+        mission.put_player([x, 0.0, 100.0]);
+        for _ in 0..8 {
+            mission.tick(0.25);
+            for c in mission.take_commands() {
+                match c {
+                    Command::Remove(r) if r == g => println!("planted: {phase}: removed"),
+                    Command::Ordnance {
+                        what,
+                        at,
+                        launch,
+                        fuse,
+                        ..
+                    } => {
+                        println!("planted: {phase}: {what} at {at:?} {launch:?} {fuse:?}")
+                    }
+                    _ => {}
+                }
+            }
+        }
+        println!(
+            "planted: {phase}: still there {}",
+            mission.world().borrow().objects.contains_key(&g)
+        );
+    }
 }
 
 /// `C4` and `beacon`: thrown as she throws them (`C4 Projectile`; the
