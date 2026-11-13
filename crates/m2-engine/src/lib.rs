@@ -78,6 +78,7 @@ pub mod standin;
 pub mod stream;
 pub mod surface;
 pub mod tank_attack;
+pub mod target_record;
 pub mod technique;
 pub mod tuning;
 pub mod vehicle;
