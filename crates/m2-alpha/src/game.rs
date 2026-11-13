@@ -3446,6 +3446,7 @@ impl Game {
             slide,
             surface,
             braking,
+            load_time: gears.map(|g| g.load_transition_time),
         })
     }
 

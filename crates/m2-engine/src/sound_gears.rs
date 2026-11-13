@@ -41,8 +41,14 @@
 //! Capuchin trucks' (`b951f1df`) one to 23 (physics 22.2); all three top
 //! out at 10000 rpm. The three-gear sets are motorbikes' and boats'.
 //!
+//! The same gearbox eases the cue's load ([`load_target`], [`ease_load`])
+//! at the set's `LoadTransitionTime` (0.1 s for the semis' set, 0.25 s
+//! for the Belmont's and the Capuchin's).
+//!
 //! Not implemented: the controller's own gear and rpm simulation
-//! (0x82368080, 0x823682D0), which the revs numerator comes from.
+//! (0x82368080, 0x823682D0), which the revs numerator comes from, and its
+//! gear changes, during which the load aims at 0 (none of the one-gear
+//! sets changes gear).
 
 use std::collections::HashMap;
 
@@ -72,6 +78,53 @@ pub struct SoundGearbox {
     /// The most of the gears' `UpExitRPM`, and 0 with none above it (the
     /// record's word at 0x8, the revs' divisor).
     pub max_rpm: f32,
+    /// Seconds the cue's load takes to cross from 0 to 1: the gear-0
+    /// row's `LoadTransitionTime` (the record's float at 0x17c), 0 where
+    /// the table lacks the column.
+    pub load_transition_time: f32,
+}
+
+/// The load an engine cue's curves are driven toward ([`ease_load`]):
+/// the driver's throttle held to 0 to 1, and 0 while it brakes.
+///
+/// From the 360 code: the wheeled controller (0x823696E8) hands its
+/// gearbox (0x82368080) the throttle (the vehicle's +0xd4, the drive's
+/// float at +0x2c), or minus the brake when the brake (+0x140, the drive's
+/// +0x30; else the float at +0x34) is above 0; the gearbox aims at that
+/// held to 0 to 1, and at 0 while it changes gear. A reversing throttle
+/// below 0 is held to 0 the same way (inferred: that the 360's throttle
+/// goes below 0 in reverse is not traced). The sets the playtest drove
+/// have one gear and never change.
+pub fn load_target(throttle: f32, braking: bool) -> f32 {
+    if braking {
+        0.0
+    } else {
+        throttle.clamp(0.0, 1.0)
+    }
+}
+
+/// The load a frame of `dt` seconds later, from `load`, moving toward
+/// `target` at 1 / `transition` per second.
+///
+/// From the 360 code (0x82368080, the controller's float at +0x10, the
+/// cue's `e0924df9`): the step is the frame time over the record's
+/// `LoadTransitionTime`, taken whole in the target's direction (not
+/// stopped at it), and the load is then held to 0 to 1. A transition of
+/// 0 jumps straight to the end the target lies toward.
+pub fn ease_load(load: f32, target: f32, dt: f32, transition: f32) -> f32 {
+    let step = if transition > 0.0 {
+        dt / transition
+    } else {
+        f32::INFINITY
+    };
+    let moved = if target > load {
+        load + step
+    } else if target < load {
+        load - step
+    } else {
+        load
+    };
+    moved.clamp(0.0, 1.0)
 }
 
 impl SoundGearbox {
@@ -119,7 +172,12 @@ impl SoundGearbox {
             });
         }
         let max_rpm = gears.iter().map(|g| g.up_exit_rpm).fold(0.0, f32::max);
-        Some(Self { gears, max_rpm })
+        let load_transition_time = f(first, "LoadTransitionTime").unwrap_or(0.0);
+        Some(Self {
+            gears,
+            max_rpm,
+            load_transition_time,
+        })
     }
 
     /// The gears of each of `sets` that the table has.
@@ -221,6 +279,39 @@ mod tests {
     }
 
     #[test]
+    fn the_load_aims_at_the_throttle_held_to_0_to_1_and_at_0_braking() {
+        assert_eq!(load_target(1.0, false), 1.0);
+        assert_eq!(load_target(0.4, false), 0.4);
+        assert_eq!(load_target(-1.0, false), 0.0);
+        assert_eq!(load_target(1.0, true), 0.0);
+        assert_eq!(load_target(1.7, false), 1.0);
+    }
+
+    #[test]
+    fn the_load_moves_a_whole_step_a_frame_and_is_held_to_0_to_1() {
+        // The semis' 0.1 s: a frame of 1/60 s moves it 1/6.
+        let step = 1.0 / 60.0 / 0.1;
+        let up = ease_load(0.0, 1.0, 1.0 / 60.0, 0.1);
+        assert!((up - step).abs() < 1e-6);
+        // From 0 to 1 in six such frames.
+        let mut l = 0.0;
+        for _ in 0..6 {
+            l = ease_load(l, 1.0, 1.0 / 60.0, 0.1);
+        }
+        assert!((l - 1.0).abs() < 1e-5);
+        assert_eq!(ease_load(l, 1.0, 1.0 / 60.0, 0.1), 1.0);
+        // Down to 0 and no further.
+        assert_eq!(ease_load(0.05, 0.0, 1.0 / 60.0, 0.1), 0.0);
+        // The step is not stopped at a target between: it goes past it.
+        let past = ease_load(0.45, 0.5, 1.0 / 60.0, 0.1);
+        assert!(past > 0.6);
+        // At the target it stays; with no transition time it jumps.
+        assert_eq!(ease_load(0.5, 0.5, 1.0 / 60.0, 0.1), 0.5);
+        assert_eq!(ease_load(0.3, 1.0, 1.0 / 60.0, 0.0), 1.0);
+        assert_eq!(ease_load(0.3, 0.0, 1.0 / 60.0, 0.0), 0.0);
+    }
+
+    #[test]
     fn a_set_without_rows_has_no_gearbox() {
         // Row 0 is never picked (`AnimationTable::best`), so a set the
         // table lacks reads as none rather than as the catch-all's zero
@@ -244,15 +335,20 @@ mod tests {
             )
             .unwrap();
         let t = AnimationTable::parse(&data).unwrap();
-        for (set, top) in [
-            (0xb495_1f3a, 28.0), // Junker Belmont, Belmont (`RTR`)
-            (0x44e2_31ab, 28.0), // Austin and Ogre semis
-            (0xb951_f1df, 23.0), // Capuchin trucks (`M35`), Emissary Semi
+        for (set, top, load_time) in [
+            (0xb495_1f3a, 28.0, 0.25), // Junker Belmont, Belmont (`RTR`)
+            (0x44e2_31ab, 28.0, 0.1),  // Austin and Ogre semis
+            (0xb951_f1df, 23.0, 0.25), // Capuchin trucks (`M35`), Emissary Semi
         ] {
             let g = SoundGearbox::read(&t, set).unwrap();
             assert_eq!(
-                (g.gears.len(), g.top_speed(), g.max_rpm),
-                (1, Some(top), 10000.0)
+                (
+                    g.gears.len(),
+                    g.top_speed(),
+                    g.max_rpm,
+                    g.load_transition_time
+                ),
+                (1, Some(top), 10000.0, load_time)
             );
         }
     }

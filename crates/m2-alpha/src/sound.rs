@@ -851,6 +851,9 @@ pub struct EngineInput {
     pub slide: f32,
     pub surface: f32,
     pub braking: bool,
+    /// Its sound gearbox's `LoadTransitionTime`, seconds, where its set
+    /// has one ([`m2_engine::sound_gears::ease_load`]).
+    pub load_time: Option<f32>,
 }
 
 /// The resident bank's horns: a car's, then a lorry's.
@@ -934,8 +937,9 @@ struct Engine {
     tyre_key: Option<u32>,
     /// Its set's engine cue, played in place of the bank's loops.
     cue: Option<Arc<EngineCue>>,
-    /// The load, eased (the 360's rate is in a record not found:
-    /// [`ENGINE_EASE`] is invented).
+    /// The load, eased at its set's `LoadTransitionTime` (from the 360
+    /// code, [`m2_engine::sound_gears::ease_load`]); without a gearbox at
+    /// [`ENGINE_EASE`] (invented).
     load: f32,
     bank: u32,
     /// Its vehicle's sound set (0: none).
@@ -2897,7 +2901,17 @@ impl GameAudio {
         };
         e.running += dt;
         let load = input.throttle.abs().min(1.0);
-        e.load += (load - e.load) * (dt * ENGINE_EASE).min(1.0);
+        // The cue's load, as the 360's gearbox moves it (0x82368080): to
+        // the throttle held to 0 to 1, 0 braking, a step of the frame
+        // over the set's `LoadTransitionTime`. A set without a gearbox
+        // keeps the invented ease toward the throttle's size.
+        e.load = match input.load_time {
+            Some(t) => {
+                use m2_engine::sound_gears::{ease_load, load_target};
+                ease_load(e.load, load_target(input.throttle, input.braking), dt, t)
+            }
+            None => e.load + (load - e.load) * (dt * ENGINE_EASE).min(1.0),
+        };
         // The tyres join as soon as they are read.
         while let Ok((key, cue)) = self.engine_cue_loads.1.try_recv() {
             self.engine_cues.insert(key, cue.map(Arc::new));
@@ -2941,10 +2955,9 @@ impl GameAudio {
                 ),
                 (PARAM_LOAD, e.load),
                 (PARAM_REVS, input.revs.unwrap_or(0.0)),
-                (
-                    PARAM_REVERSE,
-                    f32::from(input.throttle < 0.0 && input.speed < 0.0),
-                ),
+                // Moving backwards, whatever the throttle (0x823696E8:
+                // the controller's +0x14 is 1 while the speed is below 0).
+                (PARAM_REVERSE, f32::from(input.speed < 0.0)),
             ]);
             self.out.with(|m| {
                 for (id, (g, pitch)) in e.voices.iter().zip(mix) {
