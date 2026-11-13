@@ -509,6 +509,10 @@ struct Options {
     /// With `--mission --screenshot`: the game's sound runs, through a
     /// mixer with no device, and logs what it plays (`--sound`).
     sound: bool,
+    /// The HUD and the scripts take an Xbox pad to be playing, with none
+    /// there (`--pad`): its button pictures in texts, the tutorials'
+    /// pad texts (`Gui.ControllerInUse`), for checking them offscreen.
+    pad: bool,
     /// With `--screenshot`: the front end alone (the shell's menus),
     /// pictured as `--shell-key`s are pressed.
     front_end: bool,
@@ -768,6 +772,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--to-front-end" => o.to_front_end = true,
             "--movies" => o.movies = true,
             "--sound" => o.sound = true,
+            "--pad" => o.pad = true,
             "--front-end" => o.front_end = true,
             "--shell-key" => o.shell_keys.push(
                 value()?
@@ -1212,6 +1217,7 @@ fn run(
         );
     }
     combat::use_attach_frame(!options.hands_grip);
+    gamehud::force_pad(options.pad);
     let config_path = options
         .config_path
         .clone()
@@ -11110,6 +11116,10 @@ mod tests {
         assert_eq!(screenshot_only_ignored(&args(&["--sound"])), ["--sound"]);
         let o = parse_args(&args(&["--mission", "--screenshot", "o.ppm", "--sound"])).unwrap();
         assert!(o.sound);
+        // A pad taken to play, window or not.
+        assert!(!o.pad);
+        assert!(parse_args(&args(&["--pad"])).unwrap().pad);
+        assert!(screenshot_only_ignored(&args(&["--pad"])).is_empty());
     }
 
     #[test]

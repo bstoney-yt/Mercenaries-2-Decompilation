@@ -25,6 +25,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write as _};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
@@ -47,6 +48,16 @@ use m2_game::hud::ObjectiveMessage;
 use m2_game::mission::{GameData, Mission};
 use m2_math::glam::Vec3;
 use mlua::{IntoLuaMulti, Lua, Table, Value};
+
+/// An Xbox pad is taken to be playing whatever the input says (`--pad`):
+/// texts show its pictures and `Gui.ControllerInUse` answers true, for
+/// checking the pad's prompts on a machine with no pad.
+static FORCE_PAD: AtomicBool = AtomicBool::new(false);
+
+/// Takes an Xbox pad to be playing from now on, or not (`--pad`).
+pub fn force_pad(on: bool) {
+    FORCE_PAD.store(on, Ordering::Relaxed);
+}
 
 use crate::binoculars;
 use crate::combat::{Combat, Fired, Picked, Rounds, Weapon};
@@ -3891,7 +3902,7 @@ impl Thread {
         if let Some(screen) = gui_runtime::screen(lua) {
             let mut screen = screen.borrow_mut();
             screen.set_camera_heading(heading);
-            screen.set_pad(s.pad);
+            screen.set_pad(s.pad || FORCE_PAD.load(Ordering::Relaxed));
         }
         // The keys the texts' control words name, as the bindings are (and
         // again should they change): before any text this frame is set.
