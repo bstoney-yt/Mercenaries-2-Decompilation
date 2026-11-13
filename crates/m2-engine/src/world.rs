@@ -341,6 +341,12 @@ pub struct Templates {
     /// Each vehicle template's seats and entrances, by id
     /// ([`crate::seats::read_vehicles`]).
     pub vehicle_seats: HashMap<u32, std::sync::Arc<crate::seats::VehicleSeats>>,
+    /// Each usable template's `SocialUse` record, by id
+    /// ([`crate::social_use::read`]).
+    pub social_use: HashMap<u32, crate::social_use::SocialUse>,
+    /// Each template's `VehicleAnimationSet`, by id
+    /// ([`crate::hijack::animation_sets`]).
+    pub animation_sets: HashMap<u32, (u32, u32)>,
     /// How air strikes' ordnance flies and what its blasts do.
     pub ordnance: crate::ordnance::Ordnance,
     /// The effects each template shows, by id
@@ -1137,6 +1143,8 @@ impl Templates {
                 .into_iter()
                 .map(|(id, s)| (id, std::sync::Arc::new(s)))
                 .collect(),
+            social_use: crate::social_use::read(&db),
+            animation_sets: crate::hijack::animation_sets(&db),
             ordnance: crate::ordnance::read(&db),
             effects: crate::particles::template_effects(&db),
             effect_runs: crate::particles::template_runs(&db),
