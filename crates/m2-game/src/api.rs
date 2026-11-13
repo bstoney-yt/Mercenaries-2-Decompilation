@@ -3628,7 +3628,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             Some(&s) => values([Value::String(
                 lua.create_string(WINCH_STATES[usize::from(s & 3)])?,
             )]),
-            None => Err(mlua::Error::runtime("Object.GetWinchState: no winch")),
+            // 0x823336E8: no winch (or no object), nil (0x82206F20).
+            None => values([Value::Nil]),
         }
     })?;
     add(&object, "SetWinchState", |w, _, a| {
@@ -3650,9 +3651,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 });
                 values([])
             }
-            _ => Err(mlua::Error::runtime(
-                "Object.SetWinchState: no winch or state",
-            )),
+            // 0x823337E8: no winch, or a name not among the four, is
+            // let be and answers nil (0x82206F20, which pushes nil): not
+            // an error, so the intro deliveries' callback (which sets
+            // "deployed" on a helicopter the world has no winch for)
+            // goes on to send it.
+            _ => values([Value::Nil]),
         }
     })?;
     add(&object, "IsWinching", |w, _, a| {
@@ -8999,7 +9003,19 @@ mod tests {
             .map(|n| m2_assets::name_hash(n))
             .collect();
         assert_eq!(h, [0xA62D_3A27, 0x07D7_44CF, 0x0A76_5168, 0xBB52_2D10]);
-        assert!(host.lua().load("Object.GetWinchState(50)").exec().is_err());
+        // No winch: nil from both, as the 360's natives answer (0x823336E8,
+        // 0x823337E8 fall to 0x82206F20), and the state is let be.
+        let (get, set, bad, kept): (Value, Value, Value, String) = host
+            .lua()
+            .load(
+                "return Object.GetWinchState(50), Object.SetWinchState(50, 'deployed'),
+                   Object.SetWinchState(1, 'sideways'), Object.GetWinchState(1)",
+            )
+            .eval()
+            .unwrap();
+        assert!(get.is_nil() && set.is_nil() && bad.is_nil());
+        assert_eq!(kept, "deploying");
+        assert!(!world.borrow().winches.contains_key(&50));
     }
 
     #[test]
