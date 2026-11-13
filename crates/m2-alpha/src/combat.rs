@@ -1284,6 +1284,24 @@ pub struct GameFx {
     pub template: FxTemplate,
     pub at: Vec3,
     pub hold: Option<u64>,
+    /// The frame it is set off in (the effect's +Z along `forward`, its
+    /// +Y up): a launcher's flash and back-blast along the barrel, a
+    /// rocket's smoke out of its tail. None: the world's frame.
+    pub turn: Option<Quat>,
+}
+
+/// The frame an effect set off along `forward` is turned to: its +Z along
+/// `forward`, its +Y as near the world's up as that allows, as the
+/// launcher's muzzle node and the rocket model lie (both with +Y up and
+/// +Z out of the barrel or nose, from samples: the RPG's muzzle node
+/// 0xB1486EF3 is unturned, 0.25 m along +Z).
+pub fn fx_turn(forward: Vec3) -> Option<Quat> {
+    let f = forward.try_normalize()?;
+    let right = Vec3::Y.cross(f).try_normalize().unwrap_or(Vec3::X);
+    let up = f.cross(right);
+    Some(Quat::from_mat3(&m2_math::glam::Mat3::from_cols(
+        right, up, f,
+    )))
 }
 
 /// A template, by id, by name, or by its name's hash (a state machine's
@@ -2781,6 +2799,7 @@ impl Combat {
                 template: FxTemplate::Id(shell),
                 at,
                 hold: None,
+                turn: None,
             });
         }
         match feel.and_then(|f| f.flash) {
@@ -2790,6 +2809,7 @@ impl Combat {
                     template: FxTemplate::Id(flash),
                     at: from,
                     hold: None,
+                    turn: None,
                 });
             }
             None => {
@@ -2892,6 +2912,7 @@ impl Combat {
             template: FxTemplate::Name(name.to_owned()),
             at,
             hold: None,
+            turn: None,
         });
     }
 
@@ -2902,6 +2923,7 @@ impl Combat {
             template: FxTemplate::Name(name.to_owned()),
             at,
             hold: Some(key),
+            turn: None,
         });
     }
 
@@ -2914,6 +2936,7 @@ impl Combat {
                 template: FxTemplate::Hash(effect),
                 at,
                 hold: None,
+                turn: None,
             });
         }
     }
@@ -4110,7 +4133,14 @@ impl Combat {
             },
             1.2,
         );
-        self.show_fx(fx::BACK_BLAST, from);
+        // The launcher's flash and back-blast in the barrel's frame: its
+        // emitter gives off along +Z, out of the muzzle.
+        self.game_fx.push(GameFx {
+            template: FxTemplate::Name(fx::BACK_BLAST.to_owned()),
+            at: from,
+            hold: None,
+            turn: fx_turn(velocity),
+        });
         self.sounds.push(Sound::Launch {
             at: from,
             set: self.launcher.feel.sound_set,
@@ -5697,7 +5727,7 @@ impl Combat {
                 if *shell {
                     streaks.push((*at, *at + step));
                 } else {
-                    puffs.push(*at);
+                    puffs.push((*at, *velocity));
                 }
                 *at += step;
                 *flown += len;
@@ -5798,11 +5828,17 @@ impl Combat {
                 true
             }
         });
-        for (k, at) in puffs.into_iter().enumerate() {
+        for (k, (at, velocity)) in puffs.into_iter().enumerate() {
             self.effect(Effect::Smoke { at, size: 0.4 }, 0.8);
             // Rockets have no id: the k-th in flight (one at a time, as a
-            // rule).
-            self.hold_fx(fx::ROCKET, at, (2 << 32) | k as u64);
+            // rule). Its smoke in the rocket's frame: the trail's emitter
+            // points along -Z, out of the tail.
+            self.game_fx.push(GameFx {
+                template: FxTemplate::Name(fx::ROCKET.to_owned()),
+                at,
+                hold: Some((2 << 32) | k as u64),
+                turn: fx_turn(velocity),
+            });
         }
         for (from, to) in streaks {
             self.effect(Effect::Tracer { from, to }, dt * 1.5);
@@ -6130,6 +6166,7 @@ impl Combat {
             template: FxTemplate::Id(b.template),
             at,
             hold: None,
+            turn: None,
         });
         let hers = if b.key == Some(m2_assets::name_hash("ExplosionLarge")) {
             self.hero_damage.explosion_large
@@ -6483,6 +6520,7 @@ impl Combat {
                 template: FxTemplate::Hash(effect),
                 at,
                 hold: Some(key),
+                turn: None,
             });
         }
         if self.part_fx_next <= 0.0 {
@@ -6723,6 +6761,23 @@ fn lock_share(held: f32, time: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// An effect set off along a way is turned so its +Z lies along it
+    /// and its +Y stays up: the launcher's flash (+Z) goes out of the
+    /// barrel, the rocket's smoke (-Z) out of its tail, not up.
+    #[test]
+    fn effects_set_off_along_a_way_turn_their_z_to_it() {
+        let ahead = Vec3::new(1.0, 0.2, -1.0).normalize();
+        let t = fx_turn(ahead * 25.0).expect("a way");
+        assert!((t * Vec3::Z).distance(ahead) < 1e-5);
+        assert!((t * Vec3::NEG_Z).distance(-ahead) < 1e-5);
+        assert!((t * Vec3::Y).y > 0.9);
+        assert!((t * Vec3::X).y.abs() < 1e-5);
+        // Straight up: still a frame; no way, none.
+        let up = fx_turn(Vec3::Y).expect("up");
+        assert!((up * Vec3::Z).distance(Vec3::Y) < 1e-5);
+        assert!(fx_turn(Vec3::ZERO).is_none());
+    }
+
     /// The Stinger's 2 s lock: half way after a second, whole at 2 and
     /// after; a weapon with no time to wait is locked at once.
     #[test]
