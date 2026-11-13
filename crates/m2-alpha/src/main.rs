@@ -4903,12 +4903,20 @@ fn mission_for_screenshot(
                     if game.combat.to_throw {
                         intent.trigger.throw = true;
                     }
-                    if let Phase::Designating { aim, .. } = game.support.phase {
-                        extraction_tap = !extraction_tap;
-                        intent.trigger.fire = match aim {
-                            Aim::Satellite => extraction_tap,
-                            Aim::Laser => true,
-                        };
+                    extraction_tap = !extraction_tap;
+                    match game.support.phase {
+                        Phase::Designating { aim, .. } => {
+                            intent.trigger.fire = match aim {
+                                Aim::Satellite => extraction_tap,
+                                Aim::Laser => true,
+                            };
+                        }
+                        // A satellite item's view and wheel.
+                        Phase::Viewing { .. } => intent.trigger.fire = extraction_tap,
+                        Phase::Timing { .. } => {
+                            intent.trigger.fire = extraction_tap && game.support.wheel_ready();
+                        }
+                        _ => {}
                     }
                     if let Some((heli, there)) =
                         link.labelled("ExtractionHelicopter").first().copied()
