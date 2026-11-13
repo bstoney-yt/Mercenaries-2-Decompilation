@@ -1145,6 +1145,16 @@ pub struct Npc {
     /// while it is low enough to attack, as it calms back to their
     /// faction's relation to the PMC ([`People::add_infraction`]).
     pub her_attitude: Option<m2_engine::ai_target::Attitude>,
+    /// They take part in the living world (`Ai.LivingWorld`, the 360's
+    /// +0x17DD bit 7): standing at a post, pushed more than
+    /// [`LIVING_WORLD_SLACK`] from the spot they stood at, they walk back
+    /// to it. Off (`MrxFollow` for one following her), they stay where
+    /// they end up.
+    pub living_world: bool,
+    /// The spot they took their post at, and whether they are walking back
+    /// to it ([`Npc::living_world`]).
+    post_at: Option<Vec3>,
+    returning: bool,
     /// Their death was taken as an infraction already.
     pub reported_dead: bool,
     /// Hurt since the last look ([`People::pursue`]).
@@ -1521,6 +1531,9 @@ impl Npc {
             heard: None,
             provoked: false,
             her_attitude: None,
+            living_world: true,
+            post_at: None,
+            returning: false,
             hurt_by_her: false,
             killed_by_her: false,
             reported_dead: false,
@@ -3137,6 +3150,10 @@ impl Npc {
         }
         let mut arrived = false;
         let mut glide = None;
+        if self.flee.is_some() || !matches!(self.brain, Brain::Post { .. }) {
+            self.post_at = None;
+            self.returning = false;
+        }
         match &mut self.brain {
             _ if self.flee.is_some() => {}
             _ if self.alarm.is_some() => {
@@ -3145,7 +3162,25 @@ impl Npc {
                     wanted = (to - at).with_y(0.0).normalize_or_zero() * run;
                 }
             }
-            Brain::Post { facing } => face = Some(*facing),
+            // From the 360 code (0x822B1BD0): the spot is kept when they
+            // first stand there; moved more than 1 m from it (squared, in
+            // 3D) and in the living world, they go back to it.
+            Brain::Post { facing } => {
+                let spot = *self.post_at.get_or_insert(at);
+                let off = spot - at;
+                if self.living_world
+                    && off.length_squared() > LIVING_WORLD_SLACK * LIVING_WORLD_SLACK
+                {
+                    self.returning = true;
+                }
+                let flat = off.with_y(0.0);
+                if self.returning && flat.length() > LIVING_WORLD_BACK {
+                    wanted = flat.normalize() * speed;
+                } else {
+                    self.returning = false;
+                    face = Some(*facing);
+                }
+            }
             Brain::Patrol {
                 route,
                 next,
@@ -3327,6 +3362,9 @@ pub struct People {
     /// Those the scripts keep from dying (`Object.SetUnkillable`), by
     /// spawn entity, here or still to come.
     unkillable: HashSet<u32>,
+    /// Those the scripts took out of the living world (`Ai.LivingWorld`
+    /// off), by spawn entity, here or still to come.
+    out_of_living_world: HashSet<u32>,
     /// Soldiers (by spawn entity) killed: they stay dead.
     pub killed: HashSet<u32>,
     /// Spawns a mission wants soldiers at though their names don't say
@@ -3810,6 +3848,12 @@ pub const INFRACTION_COST: f32 = 80.0;
 pub const INFRACTION_SEEN_WITHIN: f32 = 0.5;
 /// Her army as the faction manager names it (`GetRelation(f, "Pmc")`).
 pub const PMC: &str = "Pmc";
+/// How far a person at a post may be pushed from their spot before they
+/// walk back to it, metres (0x822B1BD0 against 1.0, 0x820BAEE8, squared).
+pub const LIVING_WORLD_SLACK: f32 = 1.0;
+/// How near the spot they stop once walking back (invented: the 360's
+/// move goal's own arrival isn't traced).
+pub const LIVING_WORLD_BACK: f32 = 0.25;
 
 /// Seconds the soldiers of a faction she provoked fight her: the first of
 /// the pursuit level times the faction manager sets
@@ -4909,6 +4953,11 @@ impl People {
         for n in &mut self.npcs {
             n.unkillable = n.spawn.is_some_and(|e| self.unkillable.contains(&e));
         }
+        for n in &mut self.npcs {
+            n.living_world = !n
+                .spawn
+                .is_some_and(|e| self.out_of_living_world.contains(&e));
+        }
         let scripted = std::mem::take(&mut self.scripted);
         if !scripted.is_empty() {
             self.populate(physics, &scripted, focus);
@@ -5420,6 +5469,21 @@ impl People {
             eprintln!("people: {entity:08x} has its goals cleared");
         }
         had
+    }
+
+    /// The scripts put the person of spawn `entity` into the living world
+    /// or take them out (`Ai.LivingWorld` with `Attrib =
+    /// "LivingWorldBehaviour"`; `MrxFollow` takes out one following her):
+    /// one in play at once, one still to come when they come.
+    pub fn set_living_world(&mut self, entity: u32, on: bool) {
+        if on {
+            self.out_of_living_world.remove(&entity);
+        } else {
+            self.out_of_living_world.insert(entity);
+        }
+        for n in self.npcs.iter_mut().filter(|n| n.spawn == Some(entity)) {
+            n.living_world = on;
+        }
     }
 
     /// The scripts killed the soldier of spawn `entity` (or took it away,
@@ -8305,6 +8369,41 @@ pub(crate) mod tests {
         assert!((n.hp - UNKILLABLE_FLOOR).abs() < 1e-4);
         people.set_unkillable(1, false);
         assert!(people.npcs[0].hurt(5.0, Vec3::ZERO), "dies once let go");
+    }
+
+    // `Ai.LivingWorld` (0x822B1BD0): one at a post pushed more than 1 m
+    // off their spot walks back to it; taken out of the living world
+    // (`MrxFollow`), they stay where they were put.
+    #[test]
+    fn in_the_living_world_one_pushed_off_their_post_walks_back() {
+        let pushed = |living: bool| {
+            let mut physics = ground();
+            let mut people = People::default();
+            people.kinds.push(kind("vz_hum_soldier", false));
+            if !living {
+                people.set_living_world(1, false);
+            }
+            let spawns = [spawn(1, "VZ Soldier 01", 0.0)];
+            for _ in 0..30 {
+                people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+            }
+            let n = &mut people.npcs[0];
+            n.brain = Brain::Post { facing: 0.0 };
+            n.flee = None;
+            people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+            let spot = people.npcs[0].character.position;
+            people.npcs[0].character.position += Vec3::new(3.0, 0.0, 0.0);
+            for _ in 0..60 * 8 {
+                people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+            }
+            (people.npcs[0].character.position - spot)
+                .with_y(0.0)
+                .length()
+        };
+        let back = pushed(true);
+        assert!(back <= 1.0, "walked back: {back}");
+        let stays = pushed(false);
+        assert!(stays > 2.5, "stays: {stays}");
     }
 
     // Playtest 8: with the island's soldiers at the most about, the
