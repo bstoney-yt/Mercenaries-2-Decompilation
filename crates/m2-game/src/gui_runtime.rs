@@ -2685,6 +2685,17 @@ natives! {
     // vertical anchor, world x min, max, z min, max): makes the minimap,
     // its circle centred on (x, y), and answers its id
     // (`MinimapWidget:SetUpMinimap`).
+    // (minimap): the scripts' `MinimapWidget:Delete`. From the 360 code
+    // (0x82321C60): a minimap widget (type 3) is taken off the manager's
+    // list and its slot, and destroyed at once; any other widget is left
+    // as it is (the native answers with its error).
+    "MinimapDelete" => |s, _, a| {
+        let id = a.id(0);
+        if s.widgets.get(&id).is_some_and(|w| w.kind == Kind::Minimap) {
+            s.delete(id);
+        }
+        Ok(MultiValue::new())
+    },
     "MinimapCreate" => |s, l, a| {
         let id = s.create(Kind::Minimap, String::new());
         let (x, y, r) = (a.f(0).unwrap_or(0.0), a.f(1).unwrap_or(0.0), a.f(2).unwrap_or(0.0));
@@ -2930,6 +2941,26 @@ mod tests {
         // To the front, in order again, a parent before its children.
         run(&host, "_GuiInternal.PushWidgetToFront(box)");
         assert_eq!(screen.borrow().order, [4, 1, 3, 2]);
+    }
+
+    /// `MinimapDelete` takes a minimap away, and only a minimap.
+    #[test]
+    fn a_minimap_is_deleted_and_nothing_else() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            map = G.MinimapCreate(100, 100, 50)
+            pic = G.CreateImageWidget()
+            G.MinimapDelete(pic)
+            G.MinimapDelete(map)
+            "#,
+        );
+        let id = |name: &str| host.lua().globals().get::<u32>(name).unwrap();
+        let s = screen.borrow();
+        assert!(s.widget(id("map")).is_none(), "the minimap is gone");
+        assert!(s.widget(id("pic")).is_some(), "an image is not a minimap");
     }
 
     #[test]
