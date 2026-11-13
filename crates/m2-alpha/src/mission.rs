@@ -2142,8 +2142,24 @@ impl MissionLink {
         };
         // `Graphics.Effect.CameraFade`'s constants, for the particles.
         if let Some(p) = game.scene.particles.as_mut() {
-            p.camera_fade = mission.world().borrow().effects.camera_fade;
+            let mut w = mission.world().borrow_mut();
+            p.camera_fade = w.effects.camera_fade;
+            // `Graphics.Effect.Terrain`'s calls, for the particles to start.
+            p.terrain_asks.append(&mut w.effects.terrain);
         }
+        // `Graphics.Camera.SetFocusParams` and `RestoreFocusParams` for the
+        // first view: a new call starts the focus's blend, which runs on
+        // every tick (0x824B8208).
+        let ask = mission.world().borrow().effects.focus[0];
+        if ask.calls != game.focus_calls {
+            game.focus_calls = ask.calls;
+            game.focus.ask(ask.params, ask.seconds);
+            eprintln!(
+                "camera: the scripts set the focus to {:?} over {} s",
+                ask.params, ask.seconds
+            );
+        }
+        game.focus.step(dt, m2_engine::camera_focus::OWN);
         // `Graphics.Camera.SetFovParams`, `SetNearFar` and their restores
         // for the first view: a new call starts that set's blend, and both
         // run on every tick (0x824B8208).
@@ -9183,6 +9199,7 @@ mod tests {
                 sticky: false,
             },
             lock_on: None,
+            seeker: None,
             pickup: Some(8),
             feel: Default::default(),
             hint: None,
@@ -9268,6 +9285,8 @@ mod tests {
             icon: picture,
             reticle: 1,
             crosshair: true,
+            reticle_type: 0,
+            health_type: 0,
         });
         assert_eq!(pickup(&db, ak).unwrap().icon, Some(picture));
         let records = vec![(shotgun, 3), (bullet, 3)];
