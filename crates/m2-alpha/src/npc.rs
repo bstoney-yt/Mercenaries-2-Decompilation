@@ -555,6 +555,21 @@ pub const STAGGER_CLIPS: [(Stagger, Direction, [u32; 4]); 12] = {
 /// movement record whose meaning is not established).
 const STAGGER_MOVING: f32 = 0.5;
 
+/// Where a limp body lies: the middle of its nodes over the ground
+/// plane, at their lowest. `None` for no nodes.
+fn limp_middle(nodes: &[Mat4]) -> Option<Vec3> {
+    if nodes.is_empty() {
+        return None;
+    }
+    let sum: Vec3 = nodes.iter().map(|m| m.w_axis.truncate()).sum();
+    let low = nodes
+        .iter()
+        .map(|m| m.w_axis.y)
+        .fold(f32::INFINITY, f32::min);
+    let mid = sum / nodes.len() as f32;
+    Some(Vec3::new(mid.x, low, mid.z))
+}
+
 /// How far apart a clip's hands get over the whole clip, for its hip
 /// height: a rifle held in both hands keeps them close.
 pub fn hand_spread(rig: &Rig, c: &BoundClip) -> Option<f32> {
@@ -1243,11 +1258,17 @@ pub struct Npc {
     pub shooter: u32,
     /// Seconds since they died.
     dead_for: f32,
-    /// Their body gone limp, once dead.
+    /// Their body gone limp: once dead, and while knocked down.
     pub ragdoll: Option<RagdollId>,
     /// A shove not yet given to their body (m/s): they went limp, or
     /// were hit again after.
     fling: Option<Vec3>,
+    /// Knocked down and limp, they get up (or are subdued) this step:
+    /// the limp body is given up and they are where it lay.
+    rise: bool,
+    /// Knocked down and limp: seconds the body has lain still, and
+    /// seconds it has been limp ([`LIMP_STILL`], [`LIMP_LONGEST`]).
+    limp: (f32, f32),
     /// Where the round now striking them landed and the way it flew, set
     /// by the shot just before [`hurt`](Self::hurt) and read by it.
     pub last_hit: Option<(Vec3, Vec3)>,
@@ -1379,8 +1400,24 @@ pub enum Down {
     Carried,
 }
 
+/// When someone knocked down stands up again. From the 360 code
+/// (0x8225CAE0, for a person in `KnockedDown` `Idle`): `Stand` is posted
+/// once they have been in that state longer than their time down (the
+/// record's +0x38, [`m2_engine::melee::knockdown_seconds`]), and, when
+/// their physics object is of kind 0xC, once a float of it (+0x300) is
+/// over 0.5 (0x820D9EDC) or another (+0x304) over 19.0 (0x820F8C84).
+///
+/// **Inferred**: kind 0xC is the limp body, the first float the seconds
+/// it has lain still and the second the seconds it has been limp. So
+/// they do not get up while still tumbling, but always after 19 s.
+/// Under [`LIMP_AT_REST`] m/s counts as still (invented).
+const LIMP_STILL: f32 = 0.5;
+const LIMP_LONGEST: f32 = 19.0;
+const LIMP_AT_REST: f32 = 0.2;
+
 /// Seconds a fall takes, someone lies knocked down, gets up, and is
-/// subdued (all invented).
+/// subdued (all invented). The time down the 360 sets counts from when
+/// they lie (`KnockedDown` `Idle`), after the fall.
 const FALL_SECONDS: f32 = 1.0;
 const KNOCKED_SECONDS: f32 = 10.0;
 const GETUP_SECONDS: f32 = 1.5;
@@ -1421,6 +1458,8 @@ impl Npc {
             dead_for: 0.0,
             ragdoll: None,
             fling: None,
+            rise: false,
+            limp: (0.0, 0.0),
             last_hit: None,
             dying: None,
             stagger: None,
@@ -1885,8 +1924,8 @@ impl Npc {
         if !self.alive || self.down.is_some() {
             return;
         }
-        self.character.velocity += push;
         self.knock_down();
+        self.fling = Some(push);
         self.knocked_for = Some(seconds);
     }
 
@@ -1899,6 +1938,12 @@ impl Npc {
         self.flee = None;
         self.rig.animator.set_upper(None);
         self.rig.two_handed = false;
+        // `Upright` `KnockDown` and `KnockedDown` `Idle` are of the mode
+        // `FULL` in the state table, as `Die` is: limp at once, and limp
+        // while they lie. The clip below shows only where no limp body
+        // can be made.
+        self.fling = Some(Vec3::ZERO);
+        self.character.velocity = Vec3::ZERO;
         if let Some(c) = self.clips.die.or(self.clips.knocked) {
             self.rig.animator.play_once(c);
         }
@@ -1911,6 +1956,8 @@ impl Npc {
             return false;
         }
         self.down = Some(Down::Subduing(SUBDUE_SECONDS));
+        // `KnockedDown` `SubdueDefender` is a clip's (mode `NONE`).
+        self.rise = true;
         true
     }
 
@@ -1936,14 +1983,24 @@ impl Npc {
                 if let Some(c) = clips.knocked {
                     self.rig.animator.play(c);
                 }
-                let lie = self
-                    .knocked_for
-                    .take()
-                    .map_or(KNOCKED_SECONDS, |s| (s - FALL_SECONDS).max(0.0));
+                let lie = self.knocked_for.take().unwrap_or(KNOCKED_SECONDS);
                 Some(Down::Knocked(lie))
             }
             Down::Falling(t) => Some(Down::Falling(t - dt)),
+            // Their time down over, but the limp body still tumbling:
+            // not yet.
+            Down::Knocked(t)
+                if t - dt <= 0.0
+                    && self.ragdoll.is_some()
+                    && self.limp.0 <= LIMP_STILL
+                    && self.limp.1 <= LIMP_LONGEST =>
+            {
+                Some(Down::Knocked(0.0))
+            }
             Down::Knocked(t) if t - dt <= 0.0 => {
+                // `KnockedDown.Getup` is a clip's (mode `NONE`): no
+                // longer limp.
+                self.rise = true;
                 if let Some(c) = clips.getup {
                     // `KnockedDown.Getup`: the original snaps into it.
                     self.rig
@@ -4836,8 +4893,34 @@ impl People {
             if std::mem::take(&mut npc.spotted) && npc.alive && self.smarter.enabled {
                 callouts.push(npc.character.position);
             }
-            // The dead go limp from where they stood, shoved as they were
-            // hit.
+            // How long the living's limp body has lain still, and been
+            // limp.
+            match npc.ragdoll.filter(|_| npc.alive) {
+                Some(id) => {
+                    let still = physics.ragdoll_speed(id).is_none_or(|v| v < LIMP_AT_REST);
+                    npc.limp.0 = if still { npc.limp.0 + dt } else { 0.0 };
+                    npc.limp.1 += dt;
+                }
+                None => npc.limp = (0.0, 0.0),
+            }
+            // Up from a knockdown (or subdued): where the limp body lay,
+            // on the ground under it.
+            if std::mem::take(&mut npc.rise)
+                && npc.alive
+                && let Some(id) = npc.ragdoll.take()
+            {
+                if let Some(at) = physics.ragdoll_nodes(id).and_then(|n| limp_middle(&n)) {
+                    let from = at + Vec3::Y;
+                    let y = physics
+                        .cast_ray(from, -Vec3::Y, 6.0)
+                        .map_or(npc.character.position.y, |(d, _)| from.y - d + 0.05);
+                    npc.character.position = Vec3::new(at.x, y, at.z);
+                    npc.character.velocity = Vec3::ZERO;
+                }
+                physics.remove_ragdoll(id);
+            }
+            // The dead, and the knocked down, go limp from where they
+            // stood, shoved as they were hit.
             let Some(push) = npc.fling.take() else {
                 continue;
             };
@@ -4929,7 +5012,8 @@ impl People {
                         let rel = (p - centre).with_y(0.0);
                         let side = (rel - heading * rel.dot(heading))
                             .normalize_or(Vec3::new(heading.z, 0.0, -heading.x));
-                        n.character.velocity = heading * speed * 0.5 + side * SHOVE;
+                        let shove = heading * speed * 0.5 + side * SHOVE;
+                        n.character.velocity = shove;
                         n.rammed = RAM_GAP;
                         n.panic(centre);
                         // Hit hard enough by a vehicle, the 360 knocks
@@ -4940,7 +5024,7 @@ impl People {
                                 false,
                                 self.rng.next(),
                             );
-                            n.knock_down_for(seconds, Vec3::ZERO);
+                            n.knock_down_for(seconds, shove);
                         }
                     }
                     continue;
@@ -7632,7 +7716,10 @@ pub(crate) mod tests {
         assert_eq!(people.traffic(&[slow], Some(&table)), 0);
         let n = &people.npcs[0];
         assert!(n.alive && n.hp == 55.0 && n.rammed == RAM_GAP);
-        assert!(n.character.velocity.x > 0.0, "shoved off its line");
+        assert!(
+            n.fling.is_some_and(|f| f.x > 0.0),
+            "their limp body is shoved off its line"
+        );
         // 45 of damage is over the 360's 2.0: knocked down, for 4 to 6 s.
         assert!(matches!(n.down, Some(Down::Falling(_))));
         assert!(n.knocked_for.is_some_and(|s| (4.0..=6.0).contains(&s)));
@@ -8078,9 +8165,32 @@ pub(crate) mod tests {
         };
         step(&mut n, 0.5, &mut rng);
         assert_eq!(n.human_state(), "Upright.Idle");
-        // Knocked down: the fall, lying, then up again.
+        // Knocked down: limp at once (the fall, lying), then up again.
         n.knock_down();
         assert_eq!(n.human_state(), "Upright.KnockDown");
+        assert_eq!(n.fling, Some(Vec3::ZERO), "a limp body is asked for");
+        assert!(!n.rise);
+        // Their time down over, a limp body still tumbling keeps them
+        // down; lain still half a second, or limp 19 s, they get up.
+        let mut m = Npc::new(
+            0,
+            &rig(),
+            Vec3::ZERO,
+            0.0,
+            Brain::Post { facing: 0.0 },
+            None,
+        );
+        m.down = Some(Down::Knocked(0.0));
+        m.ragdoll = Some(ground().add_ragdoll(&[None], &[Mat4::IDENTITY], Vec3::ZERO));
+        m.update_down(0.1);
+        assert_eq!(m.down, Some(Down::Knocked(0.0)));
+        m.limp = (0.0, LIMP_LONGEST + 0.1);
+        m.update_down(0.1);
+        assert!(matches!(m.down, Some(Down::GettingUp(_))) && m.rise);
+        m.down = Some(Down::Knocked(0.0));
+        m.limp = (LIMP_STILL + 0.1, 1.0);
+        m.update_down(0.1);
+        assert!(matches!(m.down, Some(Down::GettingUp(_))));
         step(&mut n, FALL_SECONDS + 0.1, &mut rng);
         assert_eq!(n.human_state(), "KnockedDown.Idle");
         step(&mut n, KNOCKED_SECONDS + 0.1, &mut rng);
