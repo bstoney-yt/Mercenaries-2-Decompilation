@@ -77,8 +77,11 @@ pub struct HudInfo {
     pub crosshair: Option<Vec3>,
     /// A vehicle in reach to get into.
     pub can_enter: Option<String>,
-    /// Shown while the island or its people are still loading.
-    pub loading: Option<String>,
+    /// The island, its vehicles and people, or her arrival are still
+    /// loading: the game's loading screen is wanted ([`crate::loading`]).
+    /// Nothing of ours is written over the world for it: the game shows
+    /// only its loading screen.
+    pub loading: bool,
     /// The mission's objectives and markers (`--mission`).
     pub mission: Option<MissionView>,
     /// World to clip, for placing markers.
@@ -407,7 +410,7 @@ impl Hud {
         let mut loading = self.loading.as_mut();
         if let Some(screen) = loading.as_deref_mut() {
             let black = info.mission.as_ref().map_or(0.0, |m| m.black);
-            screen.update(info.loading.is_some(), black, input.time.unwrap_or(0.0));
+            screen.update(info.loading, black, input.time.unwrap_or(0.0));
             for line in screen.take_log() {
                 eprintln!("{line}");
             }
@@ -693,15 +696,6 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
                 Color32::from_black_alpha((black.min(1.0) * 255.0) as u8),
             );
     }
-    if let Some(loading) = info.loading.as_ref().filter(|_| !covered) {
-        text(
-            screen.center_top() + vec2(0.0, 24.0),
-            Align2::CENTER_TOP,
-            loading,
-            18.0,
-            white,
-        );
-    }
     let time = ctx.input(|i| i.time);
     if let Some(view) = info.support.satellite {
         // The game's own view (`MrxGuiSatelliteLayout`) once its HUD runs,
@@ -835,17 +829,11 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool)
             name.trim_start_matches("global_veh_")
         ));
     }
-    if info.down {
-        text(
-            screen.center(),
-            Align2::CENTER_CENTER,
-            "Down! Back on your feet in a moment.",
-            26.0,
-            Color32::from_rgb(240, 90, 80),
-        );
-    }
-    // The game's HUD has its own support box; the bomb's countdown and the
-    // PDA are ours with either.
+    // Down: nothing of ours. The game's player script (`PlayerDied`)
+    // writes nothing on screen for a single player; it cancels the
+    // contract and moves her to the sickbay 2 s on.
+    // The game's HUD has its own support box; the PDA is ours with
+    // either.
     if info.driving.is_none() {
         support(screen, &info.support, game.is_none(), &text);
     }
@@ -971,8 +959,7 @@ fn stand_in<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
 
 /// The support box above the health bar (if `boxed`: the game's HUD has
 /// its own): the item ready to call (its name, how many, whether free,
-/// how it is called in) and the keys for the step the call is at; and
-/// while a bomb is on its way, how long.
+/// how it is called in) and the keys for the step the call is at.
 fn support<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     screen: egui::Rect,
     s: &SupportHud,
@@ -980,15 +967,9 @@ fn support<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     text: &T,
 ) {
     let white = Color32::from_gray(235);
-    if let Some(left) = s.inbound {
-        text(
-            screen.center_top() + vec2(0.0, 130.0),
-            Align2::CENTER_TOP,
-            &format!("Bomb inbound: {:.0} s", left.ceil()),
-            20.0,
-            Color32::from_rgb(240, 120, 60),
-        );
-    }
+    // A bomb on its way: nothing of ours. The bomb's script
+    // (`mrxsatelliteguidedbomb`) plays a radio line, flies the jet over
+    // and blips the bomb on the radar; no countdown is shown.
     // The game's HUD draws its own PDA.
     if s.pda && boxed {
         pda(screen, s, text);
@@ -2035,6 +2016,57 @@ mod tests {
         // The font atlas arrives on the first frame and is kept until
         // painted.
         assert!(!delta.set.is_empty());
+    }
+
+    /// Every piece of text a frame's shapes write.
+    fn texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    /// Down, with a bomb on its way and the island still loading, without
+    /// the game's loading screen: none of the alpha's own lines for them
+    /// (the game shows none), while its other text still draws.
+    #[test]
+    fn no_text_of_ours_when_down_a_bomb_falls_or_the_island_loads() {
+        let info = HudInfo {
+            playing: true,
+            hp: 0.0,
+            down: true,
+            loading: true,
+            can_enter: Some("global_veh_hondacrx".into()),
+            ..HudInfo::default()
+        };
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(headless_input(800, 600, 30.0), |ui| {
+            hud(ui, &info, None, false);
+        });
+        // The font atlas, not painted here.
+        out.textures_delta.clear();
+        let all = texts(&out.shapes);
+        assert!(
+            all.iter().any(|t| t.contains("hondacrx")),
+            "the frame's text is read: {all:?}"
+        );
+        for gone in [
+            "Down!",
+            "inbound",
+            "Loading the island",
+            "Arriving",
+            "Finding",
+        ] {
+            assert!(!all.iter().any(|t| t.contains(gone)), "{gone} in {all:?}");
+        }
     }
 
     #[test]

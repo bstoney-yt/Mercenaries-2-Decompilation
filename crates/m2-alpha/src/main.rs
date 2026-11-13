@@ -2852,7 +2852,7 @@ fn screenshot(
     // the first frame, run at 30 fps. `M2_LOADING_HINT=n` shows hint `n`.
     let mut time = 1.0;
     if let Some(seconds) = options.loading_seconds {
-        info.loading = Some("--loading-screen".into());
+        info.loading = true;
         if let (Some(screen), Some(n)) = (
             hud.loading.as_mut(),
             std::env::var("M2_LOADING_HINT")
@@ -2873,14 +2873,14 @@ fn screenshot(
     // writes each frame on the way (`<picture>.fNNN.ppm`).
     if let Some((up, out_seconds)) = options.loading_wipe {
         let every = std::env::var_os("M2_WIPE_EVERY").is_some();
-        info.loading = None;
+        info.loading = false;
         let _ = hud.build(ui::headless_input(w, h, 0.0), &info, &mut settings);
-        info.loading = Some("--loading-wipe".into());
+        info.loading = true;
         let frames_up = (up * 30.0).round() as u32;
         let frames = frames_up + out_seconds.map_or(0, |s| (s * 30.0).round() as u32);
         for i in 1..=frames {
             if i == frames_up + 1 {
-                info.loading = None;
+                info.loading = false;
             }
             let _ = hud.build(
                 ui::headless_input(w, h, f64::from(i) / 30.0),
@@ -2905,7 +2905,7 @@ fn screenshot(
         hud.menu = true;
         // The menu alone: no loading screen over it.
         hud.loading = None;
-        info.loading = None;
+        info.loading = false;
         // A new egui window sizes itself on its first frame and fades in
         // over the next few.
         for _ in 0..10 {
