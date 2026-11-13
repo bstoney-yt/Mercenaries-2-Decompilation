@@ -93,7 +93,6 @@ pub fn hit_cancels(before: f32, now: f32) -> bool {
     before - now > 0.5
 }
 
-
 /// How fast the view moves with the keys or the stick pushed all the way
 /// (m/s), its camera `height` metres up (its place's own height, not the
 /// height over the ground).
