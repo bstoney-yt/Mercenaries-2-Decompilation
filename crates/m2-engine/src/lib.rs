@@ -83,6 +83,7 @@ pub mod target_record;
 pub mod technique;
 pub mod tuning;
 pub mod vehicle;
+pub mod vehicle_class;
 pub mod vehicle_damage;
 pub mod vehicle_disguise;
 pub mod vehicle_door;
