@@ -42,6 +42,18 @@
 //!   seconds (0 without). Both answer nothing.
 //!   The port keeps what was asked in [`EffectsState::focus`]; nothing
 //!   draws from it yet.
+//! - `Graphics.Camera.SetFovParams(view, fov [, t])` (`0x823183C0`) and
+//!   `SetNearFar(view, near, far [, t])` (`0x823181C0`) do the same for
+//!   the view's two other parameter sets (view +0x370 and +0x4D0, with
+//!   their own elapsed time, length and scripted flag): the default block
+//!   with the field of view (given in degrees, kept times 0.01745 in
+//!   radians; the camera's own is 0.95974994) or the near and far
+//!   distances (the camera's own 0.2 and 2400) in place. `RestoreFovParams`
+//!   (`0x823184E8`) and `RestoreNearFar` (`0x823182F0`) `(view [, t])`
+//!   clear the flag and blend back. All answer nothing; nil without the
+//!   view and the values. The scripts call `SetNearFar(0, 0.3, 500, 0)`.
+//!   Kept in [`EffectsState::fov`] and [`EffectsState::near_far`]; nothing
+//!   draws from them yet.
 
 use mlua::{Lua, MultiValue, Table, Value};
 
@@ -82,6 +94,35 @@ pub struct FocusAsk {
     pub calls: u32,
 }
 
+/// The camera's own field of view, radians, and near and far distances
+/// (`0x821B6148`).
+pub const FOV_DEFAULT: f32 = 0.959_749_94;
+pub const NEAR_FAR_DEFAULT: [f32; 2] = [0.2, 2400.0];
+
+/// Degrees to radians as `SetFovParams` converts them (`0x820F8C74`).
+pub const FOV_DEGREES: f32 = 0.01745;
+
+/// What the scripts last asked of one of a view's blended camera sets:
+/// the values `Set...` gave (`None` after `Restore...` or before any
+/// call: the camera's own), the seconds the change blends in over, and a
+/// count of the calls, so the game sees one that repeats the last.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraAsk<T> {
+    pub params: Option<T>,
+    pub seconds: f32,
+    pub calls: u32,
+}
+
+impl<T> Default for CameraAsk<T> {
+    fn default() -> Self {
+        Self {
+            params: None,
+            seconds: 0.0,
+            calls: 0,
+        }
+    }
+}
+
 /// What these natives keep.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectsState {
@@ -90,6 +131,10 @@ pub struct EffectsState {
     pub camera_fade: [f32; 3],
     /// Each view's scripted focus (`Graphics.Camera.SetFocusParams`).
     pub focus: [FocusAsk; VIEWS],
+    /// Each view's scripted field of view, radians (`SetFovParams`).
+    pub fov: [CameraAsk<f32>; VIEWS],
+    /// Each view's scripted near and far distances (`SetNearFar`).
+    pub near_far: [CameraAsk<[f32; 2]>; VIEWS],
 }
 
 impl Default for EffectsState {
@@ -98,6 +143,8 @@ impl Default for EffectsState {
             required_assets: Vec::new(),
             camera_fade: FADE_ON,
             focus: [FocusAsk::default(); VIEWS],
+            fov: [CameraAsk::default(); VIEWS],
+            near_far: [CameraAsk::default(); VIEWS],
         }
     }
 }
@@ -189,6 +236,67 @@ fn restore_focus_params(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Resu
     Ok(none())
 }
 
+/// Records a `Set...` (`Some`) or `Restore...` (`None`) for `view`, as
+/// the 360 takes views under 5 (a negative one is not taken: see
+/// `set_focus_params`).
+fn ask<T: Copy>(slots: &mut [CameraAsk<T>; VIEWS], view: i32, params: Option<T>, seconds: f32) {
+    if let Some(a) = usize::try_from(view).ok().and_then(|v| slots.get_mut(v)) {
+        *a = CameraAsk {
+            params,
+            seconds,
+            calls: a.calls + 1,
+        };
+    }
+}
+
+/// `Graphics.Camera.SetFovParams(view, fov [, t])`: see the module's notes.
+fn set_fov_params(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
+    let (Some(view), Some(degrees)) = (int_arg(a, 1), num_arg(a, 2)) else {
+        return Ok(nil());
+    };
+    let seconds = num_arg(a, 3).unwrap_or(0.0);
+    ask(
+        &mut w.effects.fov,
+        view,
+        Some(degrees * FOV_DEGREES),
+        seconds,
+    );
+    Ok(none())
+}
+
+/// `Graphics.Camera.SetNearFar(view, near, far [, t])`.
+fn set_near_far(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
+    let (Some(view), Some(near), Some(far)) = (int_arg(a, 1), num_arg(a, 2), num_arg(a, 3)) else {
+        return Ok(nil());
+    };
+    let seconds = num_arg(a, 4).unwrap_or(0.0);
+    ask(&mut w.effects.near_far, view, Some([near, far]), seconds);
+    Ok(none())
+}
+
+/// `Graphics.Camera.RestoreFovParams(view [, t])`.
+fn restore_fov_params(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
+    let Some(view) = int_arg(a, 1) else {
+        return Ok(nil());
+    };
+    ask(&mut w.effects.fov, view, None, num_arg(a, 2).unwrap_or(0.0));
+    Ok(none())
+}
+
+/// `Graphics.Camera.RestoreNearFar(view [, t])`.
+fn restore_near_far(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> {
+    let Some(view) = int_arg(a, 1) else {
+        return Ok(nil());
+    };
+    ask(
+        &mut w.effects.near_far,
+        view,
+        None,
+        num_arg(a, 2).unwrap_or(0.0),
+    );
+    Ok(none())
+}
+
 pub(crate) fn install(
     lua: &Lua,
     lib: &dyn Fn(&str) -> mlua::Result<Table>,
@@ -223,6 +331,10 @@ pub(crate) fn install(
     };
     add(&camera, "SetFocusParams", set_focus_params)?;
     add(&camera, "RestoreFocusParams", restore_focus_params)?;
+    add(&camera, "SetFovParams", set_fov_params)?;
+    add(&camera, "RestoreFovParams", restore_fov_params)?;
+    add(&camera, "SetNearFar", set_near_far)?;
+    add(&camera, "RestoreNearFar", restore_near_far)?;
     Ok(())
 }
 
@@ -230,6 +342,54 @@ pub(crate) fn install(
 mod tests {
     use super::*;
     use crate::script_hash::engine_hash;
+
+    #[test]
+    fn the_fov_and_near_far_natives_keep_what_the_scripts_ask() {
+        let lua = Lua::new();
+        let mut w = ScriptWorld::default();
+        let n = |v: f64| Value::Number(v);
+        // The scripts' call: view 0, near 0.3, far 500, at once.
+        let r = set_near_far(&mut w, &lua, &[n(0.0), n(0.3), n(500.0), n(0.0)]).unwrap();
+        assert_eq!(r.len(), 0);
+        assert_eq!(
+            w.effects.near_far[0],
+            CameraAsk {
+                params: Some([0.3, 500.0]),
+                seconds: 0.0,
+                calls: 1
+            }
+        );
+        // Degrees in, radians kept, times the game's 0.01745.
+        set_fov_params(&mut w, &lua, &[n(0.0), n(40.0), n(1.5)]).unwrap();
+        assert_eq!(
+            w.effects.fov[0],
+            CameraAsk {
+                params: Some(40.0 * 0.01745),
+                seconds: 1.5,
+                calls: 1
+            }
+        );
+        // Restored: the camera's own again, over the time given (0 without).
+        restore_fov_params(&mut w, &lua, &[n(0.0), n(1.0)]).unwrap();
+        assert_eq!(
+            (w.effects.fov[0].params, w.effects.fov[0].seconds),
+            (None, 1.0)
+        );
+        assert_eq!(w.effects.fov[0].calls, 2);
+        restore_near_far(&mut w, &lua, &[n(0.0)]).unwrap();
+        assert_eq!(w.effects.near_far[0].params, None);
+        assert_eq!(w.effects.near_far[0].calls, 2);
+        // Short of their values: nil, nothing kept. A view of 5: not taken.
+        assert_eq!(
+            set_near_far(&mut w, &lua, &[n(0.0), n(0.3)]).unwrap().len(),
+            1
+        );
+        assert_eq!(set_fov_params(&mut w, &lua, &[n(0.0)]).unwrap().len(), 1);
+        assert_eq!(restore_fov_params(&mut w, &lua, &[]).unwrap().len(), 1);
+        set_fov_params(&mut w, &lua, &[n(5.0), n(40.0)]).unwrap();
+        assert_eq!(w.effects.near_far[0].calls, 2);
+        assert_eq!(w.effects.fov[0].calls, 2);
+    }
 
     #[test]
     fn the_focus_natives_keep_what_the_scripts_ask() {
