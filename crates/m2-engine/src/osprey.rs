@@ -588,6 +588,7 @@ impl Mesh {
             bones: Vec::new(),
             node: Some(node),
             at: node,
+            morph: None,
         })
     }
 }
