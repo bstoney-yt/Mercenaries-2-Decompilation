@@ -1240,6 +1240,8 @@ pub struct Npc {
     /// ([`m2_engine::ai_anchor`]): the scripts' (`Ai.Anchor`), or their
     /// spawner's.
     pub anchor: Option<Anchor>,
+    /// Running to raise an alarm ([`People::raise_alarms`]).
+    pub alarm: Option<AlarmRun>,
     /// Put out of a vehicle's seat ([`People::put_out`]): no spawn keeps
     /// them, so they go once out of range.
     put_out: bool,
@@ -1530,6 +1532,7 @@ impl Npc {
             since_shot: f32::INFINITY,
             flee: None,
             anchor: None,
+            alarm: None,
             put_out: false,
             down: None,
             brain,
@@ -2895,6 +2898,9 @@ impl Npc {
         if !self.landed {
             return "landing";
         }
+        if self.alarm.is_some() {
+            return "running to raise an alarm";
+        }
         if self.alert {
             return "fighting";
         }
@@ -3010,7 +3016,9 @@ impl Npc {
         // villa's waves come in to the hall).
         let sent = matches!(self.brain, Brain::Route { .. });
         lap.mark("person: look");
-        if self.alert && !sent {
+        // Running to raise an alarm (its goal, 9.9, outranks the fight;
+        // [`People::raise_alarms`]).
+        if self.alert && !sent && self.alarm.is_none() {
             let fights = threat.is_some_and(|t| self.fight(physics, t, rng, dt));
             lap.mark("person: fight");
             match threat {
@@ -3050,6 +3058,12 @@ impl Npc {
         let mut glide = None;
         match &mut self.brain {
             _ if self.flee.is_some() => {}
+            _ if self.alarm.is_some() => {
+                let to = self.alarm.as_ref().map_or(at, |r| r.to);
+                if !m2_engine::alarm_goal::reached(at.to_array(), to.to_array()) {
+                    wanted = (to - at).with_y(0.0).normalize_or_zero() * run;
+                }
+            }
             Brain::Post { facing } => face = Some(*facing),
             Brain::Patrol {
                 route,
@@ -5831,9 +5845,182 @@ impl Rng {
     }
 }
 
+/// A soldier's run to raise an alarm ([`People::raise_alarms`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AlarmRun {
+    /// The alarm's guid.
+    pub tower: u32,
+    /// The hardpoint he runs to.
+    pub to: Vec3,
+    /// His claim on it ([`m2_engine::alarm_goal::score`]), renewed each
+    /// tick.
+    pub score: f32,
+}
+
+/// An alarm in play, as its soldiers see it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlarmTower {
+    pub guid: u32,
+    pub at: Vec3,
+    /// Its faction, as [`faction_of`] has it.
+    pub faction: Option<&'static str>,
+    /// Its flag is on.
+    pub on: bool,
+    /// Where its hardpoints are ([`m2_engine::alarm_goal::HARDPOINTS`]),
+    /// those its model has.
+    pub hardpoints: Vec<Vec3>,
+}
+
+impl People {
+    /// Sends soldiers to raise their alarms and keeps those running at it
+    /// ([`m2_engine::alarm_goal`]): a soldier of an alarm's faction with
+    /// someone to fight, within 50 m of it while its flag is off, runs to
+    /// its nearest hardpoint unless another holds it with a score he
+    /// can't beat by a tenth; of several alarms, the one he scores
+    /// highest. A run ends when the flag is on, the alarm goes, he is
+    /// down or dead, or another takes it over; within half a metre of the
+    /// hardpoint the alarm is raised. Returns the alarms to raise
+    /// (`m2_game::alarm::ON`).
+    ///
+    /// Not ported: the use clip he plays there (0x29EFE0B5), going on to
+    /// the next hardpoint when stuck (he runs straight, as the alpha's
+    /// people do), and the score doubling for an AI whose +0x1010 is 0.
+    pub fn raise_alarms(&mut self, towers: &[AlarmTower]) -> Vec<u32> {
+        use m2_engine::alarm_goal::{
+            Candidate, by_distance, may_claim, pins, proposes, reached, score,
+        };
+        let mut raised = Vec::new();
+        for n in &mut self.npcs {
+            let Some(run) = n.alarm else { continue };
+            n.alarm = match towers.iter().find(|t| t.guid == run.tower) {
+                Some(t) if n.alive && n.down.is_none() && !t.on => {
+                    let at = n.character.position;
+                    if reached(at.to_array(), run.to.to_array()) {
+                        if !raised.contains(&t.guid) {
+                            raised.push(t.guid);
+                        }
+                        None
+                    } else {
+                        Some(AlarmRun {
+                            score: score(at.distance(t.at)),
+                            ..run
+                        })
+                    }
+                }
+                _ => None,
+            };
+        }
+        for i in 0..self.npcs.len() {
+            let n = &self.npcs[i];
+            let sent = matches!(n.brain, Brain::Route { .. });
+            if n.alarm.is_some() || !n.alive || !n.soldier || n.down.is_some() || sent {
+                continue;
+            }
+            let at = n.character.position;
+            let pinned = n.anchor.is_some_and(|a| pins(a.radius));
+            let best = towers
+                .iter()
+                .filter(|t| !t.hardpoints.is_empty())
+                .filter_map(|t| {
+                    let c = Candidate {
+                        on: t.on,
+                        same_faction: t.faction.is_some() && t.faction == n.faction,
+                        fighting: n.alert,
+                        pinned,
+                        distance: at.distance(t.at),
+                    };
+                    let mine = score(c.distance);
+                    let held = self
+                        .npcs
+                        .iter()
+                        .filter_map(|m| m.alarm)
+                        .find(|r| r.tower == t.guid)
+                        .map(|r| r.score);
+                    (proposes(&c) && may_claim(held, mine)).then_some((t, mine))
+                })
+                .max_by(|a, b| a.1.total_cmp(&b.1));
+            let Some((t, mine)) = best else { continue };
+            for m in &mut self.npcs {
+                if m.alarm.is_some_and(|r| r.tower == t.guid) {
+                    m.alarm = None;
+                }
+            }
+            let points: Vec<[f32; 3]> = t.hardpoints.iter().map(|p| p.to_array()).collect();
+            let to = Vec3::from_array(by_distance(at.to_array(), &points)[0]);
+            eprintln!(
+                "people: soldier at {at:.1} runs to raise alarm {:#x} ({:.1} m off)",
+                t.guid,
+                at.distance(t.at)
+            );
+            self.npcs[i].alarm = Some(AlarmRun {
+                tower: t.guid,
+                to,
+                score: mine,
+            });
+        }
+        raised
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn the_nearest_fighting_soldier_of_its_faction_runs_to_raise_the_alarm() {
+        let post = || Brain::Post { facing: 0.0 };
+        let soldier = |x: f32, faction: &'static str, alert: bool| {
+            let mut n = Npc::new(0, &rig(), Vec3::new(x, 0.0, 0.0), 0.0, post(), Some(1));
+            n.soldier = true;
+            n.faction = Some(faction);
+            n.alert = alert;
+            n
+        };
+        let mut people = People {
+            npcs: vec![
+                soldier(30.0, "Vza", true), // 30 m off: score 20
+                soldier(20.0, "Vza", true), // 20 m off: score 30, the nearest
+                soldier(10.0, "Chi", true), // another army's
+                soldier(5.0, "Vza", false), // not fighting
+                soldier(60.0, "Vza", true), // beyond 50 m
+            ],
+            ..Default::default()
+        };
+        let mut tower = AlarmTower {
+            guid: 0x5150,
+            at: Vec3::ZERO,
+            faction: Some("Vza"),
+            on: false,
+            hardpoints: vec![Vec3::new(-2.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0)],
+        };
+        assert!(people.raise_alarms(std::slice::from_ref(&tower)).is_empty());
+        let runs: Vec<Option<u32>> = people
+            .npcs
+            .iter()
+            .map(|n| n.alarm.map(|r| r.tower))
+            .collect();
+        // One soldier only: the second in the list may take it from the
+        // first by more than a tenth.
+        assert_eq!(runs, [None, Some(0x5150), None, None, None]);
+        assert_eq!(people.npcs[1].alarm.unwrap().to, Vec3::new(2.0, 0.0, 0.0));
+        // There: raised, and his run is over.
+        people.npcs[1].character.position = Vec3::new(2.3, 0.0, 0.2);
+        assert_eq!(people.raise_alarms(std::slice::from_ref(&tower)), [0x5150]);
+        // The flag on: nobody goes, and a run under way ends.
+        tower.on = true;
+        people.npcs[0].alarm = Some(AlarmRun {
+            tower: 0x5150,
+            to: Vec3::ZERO,
+            score: 1.0,
+        });
+        assert!(people.raise_alarms(std::slice::from_ref(&tower)).is_empty());
+        assert!(people.npcs.iter().all(|n| n.alarm.is_none()));
+        // A tower without the hardpoints: nobody goes.
+        tower.on = false;
+        tower.hardpoints.clear();
+        people.raise_alarms(std::slice::from_ref(&tower));
+        assert!(people.npcs.iter().all(|n| n.alarm.is_none()));
+    }
 
     #[test]
     fn the_aim_gaits_are_kept_for_rebinding() {

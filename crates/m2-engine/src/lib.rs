@@ -22,6 +22,7 @@ pub mod ai_plan;
 pub mod ai_sense;
 pub mod ai_target;
 pub mod aim_sweep;
+pub mod alarm_goal;
 pub mod ambience;
 pub mod ambience_stack;
 pub mod anim;
