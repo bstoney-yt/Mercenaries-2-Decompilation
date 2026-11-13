@@ -3210,6 +3210,11 @@ impl Game {
                 .map(|(_, text)| text.clone())
                 .or(prompt.as_ref().map(|p| p.0.clone()))
                 .filter(|_| !self.support.busy()),
+            homing: self.combat.homing().map(|lock| {
+                let physics = &self.scene.world.as_ref()?.physics;
+                let (id, share) = lock?;
+                Some((share, physics.vehicle_transform(id)?.w_axis.truncate()))
+            }),
             // The engine's own prompt, for the game's HUD: what the use
             // key takes, else the vehicle to get into (the alpha's order;
             // the 360 picks the one she faces).
