@@ -36,6 +36,7 @@ pub mod collision_layers;
 pub mod death;
 pub mod durability;
 pub mod face_expression;
+pub mod face_graph;
 pub mod grapple;
 pub mod gun_sounds;
 pub mod gunner_aim;
