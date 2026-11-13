@@ -1649,6 +1649,15 @@ pub struct Combat {
     pub scripted_health: bool,
     /// She just got back up after going down (taken by the mission).
     pub revived: bool,
+    /// The scripts keep her from firing (`Human.SetFireLock`: the
+    /// shooting gallery before its start). From the 360 code (0x82325498):
+    /// a bit of the person's own, and locking stops a shot under way.
+    pub fire_lock: bool,
+    /// The scripts keep her from looking through a scope
+    /// (`Player.SetScopeEnabled(p, false)`, held while any of them asks).
+    /// From the 360 code (0x82340030): a count on the player, and turning
+    /// it off drops a scope that is up.
+    pub scope_off: bool,
     quiet: f32,
     reload: f32,
     /// Seconds until a tank's machine gun fires again.
@@ -1990,6 +1999,8 @@ impl Default for Combat {
             health_clamp: false,
             scripted_health: false,
             revived: false,
+            fire_lock: false,
+            scope_off: false,
             quiet: 0.0,
             reload: 0.0,
             mg_reload: 0.0,
@@ -2629,6 +2640,9 @@ impl Combat {
     /// The scope of the weapon up in her hands, if it has one: its least
     /// and most magnification.
     pub fn scope(&self) -> Option<(f32, f32)> {
+        if self.scope_off {
+            return None;
+        }
         match self.weapon {
             Weapon::Rifle => self.rifle.scope,
             _ => self.launcher.scope,
@@ -2922,6 +2936,15 @@ impl Combat {
     /// One fixed tick: her weapons, the soldiers' shots, projectiles,
     /// health and effects.
     pub fn step(&mut self, f: &mut Field<'_>, trigger: Trigger, dt: f32) {
+        // Locked, the trigger does nothing (and a burst stops).
+        let trigger = if self.fire_lock {
+            Trigger {
+                fire: false,
+                ..trigger
+            }
+        } else {
+            trigger
+        };
         // A fall that hurt her ([`m2_engine::on_foot::fall_impact`]).
         if let Some(fell) = f.player.fell.take() {
             self.hurt_player(f, fell.damage, None);
@@ -7833,6 +7856,60 @@ mod tests {
         combat.rifle_rounds.stored = combat.rifle.spare;
         let rifle_only = combat.refill(&[(11, 1)], fires);
         assert!(!combat.can_use(rifle_only, 0.0));
+    }
+
+    // `Human.SetFireLock` (the shooting gallery, PmcCon031-034, before its
+    // start): locked, the trigger fires nothing; freed, it fires again.
+    // `Player.SetScopeEnabled(p, false)`: no scope while it holds.
+    #[test]
+    fn a_fire_lock_holds_her_fire_and_scopes_can_be_turned_off() {
+        let mut physics = ground();
+        let dt = 1.0 / 60.0;
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        for _ in 0..3 {
+            player.update(&physics, Default::default(), dt);
+        }
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut combat = Combat::default();
+        combat.equip(Weapon::GrenadeLauncher, 18);
+        player.aim_crosshair_at(Vec3::new(0.0, 0.0, 20.0));
+        let mut step = |combat: &mut Combat, player: &mut Player, trigger: Trigger| {
+            let mut field = Field {
+                physics: &mut physics,
+                player,
+                people: &mut people,
+                vehicles: &mut vehicles,
+                arsenal: &arsenal,
+                explosives: &mut [],
+            };
+            combat.step(&mut field, trigger, dt);
+        };
+        let fire = Trigger {
+            fire: true,
+            ..Trigger::default()
+        };
+        let pulls = |combat: &mut Combat,
+                     player: &mut Player,
+                     step: &mut dyn FnMut(&mut Combat, &mut Player, Trigger)| {
+            let before = combat.launcher_rounds;
+            for k in 0..120 {
+                let t = if k % 2 == 0 { fire } else { Trigger::default() };
+                step(combat, player, t);
+            }
+            before != combat.launcher_rounds
+        };
+        combat.fire_lock = true;
+        assert!(!pulls(&mut combat, &mut player, &mut step), "locked");
+        combat.fire_lock = false;
+        assert!(pulls(&mut combat, &mut player, &mut step), "freed");
+
+        combat.rifle.scope = Some((2.0, 8.0));
+        combat.weapon = Weapon::Rifle;
+        assert_eq!(combat.scope(), Some((2.0, 8.0)));
+        combat.scope_off = true;
+        assert_eq!(combat.scope(), None);
     }
 
     #[test]
