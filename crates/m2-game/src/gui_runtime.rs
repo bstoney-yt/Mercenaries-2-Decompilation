@@ -79,6 +79,9 @@ use mlua::{Function, IntoLuaMulti, Lua, MultiValue, Table, Value};
 use crate::gui::{Anchor, Correction, VIRTUAL_SIZE};
 use crate::script::{safe_function, show_arg};
 
+pub mod clock;
+pub use clock::Clock;
+
 /// The screen, shared by the natives and the host.
 pub type ScreenRef = Rc<RefCell<Screen>>;
 
@@ -171,6 +174,10 @@ pub struct Widget {
     pub sprite_run: Option<SpriteRun>,
     /// `SetImagePieSliceRender` arguments, as given.
     pub pie_slice: Option<Vec<f32>>,
+    /// Its clock wipe (`SetImageClockAnimation`, [`clock`]).
+    pub clock: Clock,
+    /// `SetImageClockCallback`: called once when the clock ends.
+    clock_callback: Option<u32>,
     pub text: String,
     pub font: String,
     pub scale: f32,
@@ -247,6 +254,8 @@ impl Widget {
             sprite_frame: 0,
             sprite_run: None,
             pie_slice: None,
+            clock: Clock::default(),
+            clock_callback: None,
             text: String::new(),
             font: String::new(),
             scale: 1.0,
@@ -709,7 +718,22 @@ impl Screen {
                 }
             }
         }
+        // Clocks turn; one that ends may hide its widget and calls back
+        // once (0x823856C8).
         let ids: Vec<u32> = self.widgets.keys().copied().collect();
+        for &id in &ids {
+            let Some(w) = self.widgets.get_mut(&id) else {
+                continue;
+            };
+            if let Some(hide) = w.clock.advance(dt) {
+                if let Some(cb) = w.clock_callback.take() {
+                    due.push((cb, Vec::new()));
+                }
+                if hide {
+                    self.set_visible(id, false);
+                }
+            }
+        }
         for id in ids {
             let Some(mut it) = self.widgets.get_mut(&id).and_then(|w| w.interp.take()) else {
                 continue;
@@ -1410,11 +1434,12 @@ fn inline_icon(word: &str) -> Option<&'static str> {
 /// An image's pie slice, as `SetImagePieSliceRender(id, from, to)` gives
 /// it: `MrxGuiHudReticle` cuts the target-health ring to 130..230 (centred
 /// on 180, under the reticle as footage shows it) and shortens it from the
-/// first end as health falls.
+/// first end as health falls. Else, while its clock runs, the clock's
+/// wedge (0x82385570 draws a pie slice first).
 fn pie(w: &Widget) -> Option<[f32; 2]> {
     match w.pie_slice.as_deref() {
         Some([from, to, ..]) => Some([*from, *to]),
-        _ => None,
+        _ => w.clock.wedge(),
     }
 }
 
@@ -2191,8 +2216,10 @@ natives! {
         }
         Ok(MultiValue::new())
     },
+    // A pie slice also stops the image's clock (0x8231F3F8).
     "SetImagePieSliceRender" => |s, _, a| {
         if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.clock.state = 0;
             w.pie_slice = Some((1..a.0.len()).filter_map(|i| a.f(i)).collect());
         }
         Ok(MultiValue::new())
@@ -2242,8 +2269,8 @@ natives! {
         }
         Ok(out)
     },
-    // Recorded as calls only: the text and sprite animations and the clock
-    // wipe draw as their full image or text (see the module docs).
+    // Recorded as a call only: text animations draw their full text (the
+    // 360's typing-out is drawn glyph by glyph in 0x8238DE68, not read).
     "AnimateText" => |s, _, a| {
         s.log_unknown("AnimateText (drawn whole)");
         let _ = a;
@@ -2270,13 +2297,47 @@ natives! {
         }
         Ok(MultiValue::new())
     },
+    // (image, start, seconds, keep, forwards): see [`clock`].
     "SetImageClockAnimation" => |s, _, a| {
-        s.log_unknown("SetImageClockAnimation (drawn whole)");
-        let _ = a;
+        let id = a.id(0);
+        let (Some(start), Some(seconds)) = (a.f(1), a.f(2)) else {
+            return Ok(MultiValue::new());
+        };
+        // Booleans only: forwards unless false; `keep` not given is read
+        // as false here (the 360 leaves it unset).
+        let flag = |i: usize, unset: bool| match a.get(i) {
+            Some(Value::Boolean(b)) => *b,
+            _ => unset,
+        };
+        let (keep, forwards) = (flag(3, false), flag(4, true));
+        let shows = match s.widgets.get_mut(&id) {
+            Some(w) if w.kind == Kind::Image => w.clock.start(start, seconds, keep, forwards),
+            _ => return Ok(MultiValue::new()),
+        };
+        s.set_visible(id, shows);
         Ok(MultiValue::new())
     },
-    "SetImageClockCallback" => |_, _, _| Ok(MultiValue::new()),
-    "GetImageClockElapsed" => |_, l, _| ret(l, 0),
+    // (image, function, data): called once when the clock ends; nil
+    // clears it (0x8231F1E0).
+    "SetImageClockCallback" => |s, l, a| {
+        let id = a.id(0);
+        if !s.widgets.get(&id).is_some_and(|w| w.kind == Kind::Image) {
+            return Ok(MultiValue::new());
+        }
+        let handle = keep_callback(s, l, a.get(1), a.get(2))?;
+        let old = s
+            .widgets
+            .get_mut(&id)
+            .and_then(|w| std::mem::replace(&mut w.clock_callback, handle));
+        if let Some(old) = old {
+            forget_callback(l, old)?;
+        }
+        Ok(MultiValue::new())
+    },
+    "GetImageClockElapsed" => |s, l, a| match s.widgets.get(&a.id(0)) {
+        Some(w) if w.kind == Kind::Image => ret(l, w.clock.elapsed()),
+        _ => Ok(MultiValue::new()),
+    },
     // Settings with nothing to draw differently here.
     "SetWidgetViewport" => |_, _, _| Ok(MultiValue::new()),
     // (widget, flag): the widget's ignores-pause flag; read back by
@@ -2962,6 +3023,64 @@ mod tests {
         let halted = frame(spark);
         tick(host.lua(), 0.1);
         assert_eq!(frame(spark), halted);
+    }
+
+    #[test]
+    fn a_clock_wipes_its_image_and_calls_back_once() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            img = G.CreateImageWidget()
+            G.SetWidgetLocation(img, 100, 100, 140, 140, true)
+            G.SetImageTexture(img, "countdown_circle")
+            calls = 0
+            G.SetImageClockCallback(img, function(n) calls = calls + n end, { 7 })
+            -- Four seconds, hiding at the end, forwards.
+            G.SetImageClockAnimation(img, 0, 4, false, true)
+            "#,
+        );
+        added(&screen);
+        let pie = || {
+            let s = screen.borrow();
+            match s.draw_list(640.0, 480.0).first() {
+                Some(DrawItem::Quad { pie, .. }) => *pie,
+                other => panic!("{other:?}"),
+            }
+        };
+        let elapsed = || {
+            host.lua()
+                .load("return _GuiInternal.GetImageClockElapsed(img)")
+                .eval::<f32>()
+                .unwrap()
+        };
+        tick(host.lua(), 1.0);
+        // A quarter gone: the wedge still to sweep, from the hand at 90.
+        let [from, to] = pie().unwrap();
+        assert!((from - 90.0).abs() < 0.01 && to == 360.0, "{from} {to}");
+        assert!((elapsed() - 1.0).abs() < 1e-3);
+        tick(host.lua(), 3.5);
+        let calls = || host.lua().globals().get::<i64>("calls").unwrap();
+        assert_eq!(calls(), 7);
+        let img: u32 = host.lua().globals().get("img").unwrap();
+        assert!(!screen.borrow().widget(img).unwrap().visible);
+        // Stopped: the whole time; no second call.
+        assert!((elapsed() - 4.0).abs() < 1e-3);
+        tick(host.lua(), 1.0);
+        assert_eq!(calls(), 7);
+        // A pie slice wins over a clock and stops it.
+        run(
+            &host,
+            r#"
+            G = _GuiInternal
+            G.SetWidgetVisible(img, true)
+            G.SetImageClockAnimation(img, 0, 4, true)
+            G.SetImagePieSliceRender(img, 130, 230)
+            "#,
+        );
+        assert_eq!(pie(), Some([130.0, 230.0]));
+        assert_eq!(screen.borrow().widget(img).unwrap().clock.state, 0);
     }
 
     #[test]
