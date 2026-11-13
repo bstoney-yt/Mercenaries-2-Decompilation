@@ -71,6 +71,7 @@ mod halt;
 mod held;
 mod hero;
 mod hijack;
+mod homing;
 mod input;
 mod jobs;
 mod keytable;
@@ -289,6 +290,8 @@ struct Options {
     take: bool,
     /// With `--aim` (or `--drive --look`): fire just before the picture.
     fire: bool,
+    /// `--homing-check`: her vehicle is seen by every homing weapon.
+    homing_check: bool,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -1001,6 +1004,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--riders" => o.riders = true,
             "--take" => o.take = true,
             "--fire" => o.fire = true,
+            "--homing-check" => o.homing_check = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
             }
@@ -2319,6 +2323,7 @@ fn screenshot(
             game.combat
                 .equip(combat::Weapon::GrenadeLauncher, 3 * combat::LAUNCHER_CLIP);
         }
+        game.combat.homing_check = options.homing_check;
         // A launcher on her back, the rifle up.
         if let Some(w) = options.slung {
             game.combat.equip(w, 3 * combat::LAUNCHER_CLIP);
@@ -10752,6 +10757,14 @@ fn world_sounds(audio: &mut sound::GameAudio, game: &mut Game, was_driving: &mut
     let sounds = game.combat.take_sounds();
     let db = game.scene.world.as_ref().map(|w| &w.index.template_db);
     audio.play_fight(&sounds, db);
+    // The locks on her vehicle she hears ([`homing::Warnings`]).
+    for (cue, stop) in game.combat.take_warning_cues() {
+        if stop {
+            audio.stop_ui_sound(cue);
+        } else {
+            audio.ui_sound(cue);
+        }
+    }
     let cues = game.scene.take_cues(ear, CUE_REACH);
     audio.play_cues(&cues);
     let engine = game.engine();

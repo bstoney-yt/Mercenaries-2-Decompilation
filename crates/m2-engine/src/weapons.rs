@@ -65,8 +65,20 @@ const MAX_ANGLE: u32 = 0xa10e_79fa;
 /// `HomingWeapon`'s lock cone, degrees (its name not found; the 360's
 /// weapon-equipped event sizes the lock-on frame by it, `0x8234F458`).
 const LOCK_CONE: u32 = 0x6749_c828;
-/// `HomingWeapon`'s lock range, metres (the Stinger's 400; inferred).
+/// `HomingWeapon`'s lock range, metres (the Stinger's 400): the cone
+/// test's range (360 0x822938C0, record +0xc).
 const LOCK_RANGE: u32 = 0x1a09_69d2;
+/// `HomingWeapon`'s kind (+0: 1 ground, 2 air, 3 the TOW's, 4 the
+/// grapple's), least target signature (+4) and cone half-angle (+8,
+/// degrees), as 0x822938C0 and 0x82294318 read them (names unknown).
+const SEEK_KIND: u32 = 0x28e1_0525;
+const SEEK_SIGNATURE: u32 = 0x8b2b_83f1;
+const SEEK_CONE: u32 = LOCK_CONE;
+/// `HomingTarget`'s ground and air signatures (+0, +4; the runtime
+/// component's +0x24 / +0x28 that 0x822938C0 picks by the weapon's kind:
+/// a CRX's 1 and 0, a helicopter's 0 and 1). Names unknown.
+const SIGNATURE_GROUND: u32 = 0xe49a_d93b;
+const SIGNATURE_AIR: u32 = 0x4d93_dc23;
 /// `WeaponThrown`'s throw speeds at the reticle's lowest, middle and
 /// highest pitch (unnamed: the grenade's 9, 13 and 16 m/s; inferred from
 /// `ReticlePitchMin`/`Middle` beside them), and the throw's rise.
@@ -421,6 +433,8 @@ pub struct WeaponSpec {
     pub ammo: Ammo,
     /// Seconds to lock on (`HomingWeapon` `LockOnTime`), and how far.
     pub lock_on: Option<(f32, f32)>,
+    /// Its whole `HomingWeapon` record, if it has one.
+    pub seeker: Option<Seeker>,
     /// Rounds an ammunition pickup of it gives (its `Pickup` of type 1).
     pub pickup: Option<u32>,
     /// Its shots' sound, muzzle flash and scatter.
@@ -622,6 +636,8 @@ const KINDS: [u32; 2] = [0x63e6_6df5, 0xf34f_9919];
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NpcLauncher {
     pub template: u32,
+    /// Its `HomingWeapon` record: a homing launcher locks before it fires.
+    pub seeker: Option<Seeker>,
     pub hint: FireHint,
     /// Shots a minute (its `RateOfFire`).
     pub rate_of_fire: f32,
@@ -637,12 +653,62 @@ impl NpcLauncher {
         matches!(w.flight(), Flight::Straight | Flight::Homing).then_some(())?;
         Some(Self {
             template: w.template,
+            seeker: w.seeker,
             hint: w.hint?,
             rate_of_fire: 60.0 / w.gap().max(1e-3),
             ammo: w.ammo,
             feel: w.feel,
         })
     }
+}
+
+/// A `HomingWeapon` record (360 0x822938C0, 0x82294318).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Seeker {
+    /// What it locks on: 1 ground signatures, 2 air (the AT missiles 1;
+    /// the Stinger, AA missiles and SAM 2); 3 the TOW's own guidance, 4
+    /// the grapple's.
+    pub kind: u32,
+    /// The least signature of its kind a target must show (0: any).
+    pub min_signature: f32,
+    /// Its cone's half-angle, degrees.
+    pub cone: f32,
+    /// How far, metres.
+    pub range: f32,
+    /// Seconds to lock on (`LockOnTime`).
+    pub lock_time: f32,
+}
+
+impl Seeker {
+    /// Whether it locks on a target's signature (kinds 1 and 2).
+    pub fn locks(&self) -> bool {
+        matches!(self.kind, 1 | 2)
+    }
+}
+
+/// Template `name`'s homing signatures (ground, air) among `targets`,
+/// else the lowest id's of `model`'s templates that have them.
+pub fn homing_signature(targets: &[HomingTarget], name: &str, model: u32) -> Option<[f32; 2]> {
+    targets
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case(name))
+        .or_else(|| {
+            targets
+                .iter()
+                .filter(|t| t.model == Some(model))
+                .min_by_key(|t| t.template)
+        })
+        .map(|t| t.signature)
+}
+
+/// A template's `HomingTarget` record: what homing weapons see of it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HomingTarget {
+    pub template: u32,
+    pub name: String,
+    pub model: Option<u32>,
+    /// Ground and air signatures.
+    pub signature: [f32; 2],
 }
 
 /// `WeaponHint`'s armour ratings ([`FireHint::against`]).
@@ -1150,9 +1216,18 @@ pub struct Arms {
     pub throwables: HashMap<u32, Throwable>,
     /// By vehicle template.
     pub armaments: HashMap<u32, Armament>,
+    /// Every template's `HomingTarget`, by template.
+    pub homing_targets: Vec<HomingTarget>,
 }
 
 impl Arms {
+    /// Template `name`'s homing signatures (ground, air), else the lowest
+    /// id's of `model`'s templates that have them (as the vehicles' own
+    /// tuning is found).
+    pub fn signature_for(&self, name: &str, model: u32) -> Option<[f32; 2]> {
+        homing_signature(&self.homing_targets, name, model)
+    }
+
     /// The weapon template named `name`, whatever its case: of several so
     /// named, the lowest id's.
     pub fn named(&self, name: &str) -> Option<&WeaponSpec> {
@@ -1316,6 +1391,17 @@ pub fn read(db: &Layer<'_>) -> Arms {
     let thrown = Table::new(db, "WeaponThrown");
     let equipment = Table::new(db, "Equipment");
     let lock = Table::new(db, "HomingWeapon");
+    let seeker_of = |id: u32| {
+        let l = *lock.of_template(id).first()?;
+        Some(Seeker {
+            kind: lock.word(l, SEEK_KIND)?,
+            min_signature: lock.float(l, SEEK_SIGNATURE).unwrap_or(0.0),
+            cone: lock.float(l, SEEK_CONE)?,
+            range: lock.float(l, LOCK_RANGE)?,
+            lock_time: lock.float(l, name_hash("LockOnTime"))?,
+        })
+    };
+    let target = Table::new(db, "HomingTarget");
     let pickup = Table::new(db, "Pickup");
     let scatter = Table::new(db, "WeaponScatter");
     let hint = Table::new(db, "WeaponHint");
@@ -1392,6 +1478,7 @@ pub fn read(db: &Layer<'_>) -> Arms {
                     scatter: Parts::float(&scatter, id, SCATTER).unwrap_or(0.0),
                     ammo: parts.ammo(ammo_id),
                     lock_on,
+                    seeker: seeker_of(id),
                     pickup: refill(id, ammo_id),
                     feel: Feel {
                         sound_bank: Parts::first(&sound, id, SOUND_BANK).filter(|&b| b != 0),
@@ -1537,6 +1624,23 @@ pub fn read(db: &Layer<'_>) -> Arms {
         })
         .collect();
 
+    let mut homing_targets: Vec<HomingTarget> = target
+        .templates()
+        .filter_map(|id| {
+            let r = *target.of_template(id).first()?;
+            Some(HomingTarget {
+                template: id,
+                name: name_of(id),
+                model: model_of(id),
+                signature: [
+                    target.float(r, SIGNATURE_GROUND).unwrap_or(0.0),
+                    target.float(r, SIGNATURE_AIR).unwrap_or(0.0),
+                ],
+            })
+        })
+        .collect();
+    homing_targets.sort_by_key(|t| t.template);
+
     let lock_cones = lock
         .templates()
         .filter_map(|id| {
@@ -1549,12 +1653,41 @@ pub fn read(db: &Layer<'_>) -> Arms {
         lock_cones,
         throwables,
         armaments,
+        homing_targets,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A vehicle's homing signatures are its own template's, else the
+    // lowest template's of its model; only kinds 1 and 2 lock.
+    #[test]
+    fn homing_signatures_by_name_then_model() {
+        let t = |template, name: &str, model, signature| HomingTarget {
+            template,
+            name: name.to_owned(),
+            model: Some(model),
+            signature,
+        };
+        let targets = [
+            t(5, "Helicopter", 9, [0.0, 1.0]),
+            t(3, "Gunship", 9, [0.0, 2.0]),
+            t(8, "CRX", 4, [1.0, 0.0]),
+        ];
+        assert_eq!(homing_signature(&targets, "crx", 1), Some([1.0, 0.0]));
+        assert_eq!(homing_signature(&targets, "Other", 9), Some([0.0, 2.0]));
+        assert_eq!(homing_signature(&targets, "Other", 2), None);
+        let s = |kind| Seeker {
+            kind,
+            min_signature: 1.0,
+            cone: 10.0,
+            range: 400.0,
+            lock_time: 2.0,
+        };
+        assert!(s(1).locks() && s(2).locks() && !s(3).locks() && !s(4).locks());
+    }
 
     // An AI's fixed vehicle gun fires inside cos(MaxAimAngleAi) of its
     // nose (a quarter turn for 0); its turret's limits widen by that
@@ -1821,6 +1954,7 @@ mod tests {
                 scatter: 0.0,
                 ammo,
                 lock_on: homing.then_some((1.0, 500.0)),
+                seeker: None,
                 pickup: None,
                 feel: Default::default(),
                 hint: None,
@@ -2019,6 +2153,7 @@ mod tests {
             scatter: 0.0,
             ammo: ammo(50.0, 50.0, (0.0, 0.0)),
             lock_on: None,
+            seeker: None,
             pickup: None,
             feel: Default::default(),
             hint: None,
