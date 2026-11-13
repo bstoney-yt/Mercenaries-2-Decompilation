@@ -3476,6 +3476,20 @@ impl MissionLink {
                     Command::Invincible { guid, on } if *guid == PLAYER => {
                         game.combat.invincible = *on;
                     }
+                    // The shooting gallery holds her fire till it starts
+                    // (`MrxShootingGallery`: `Human.SetFireLock`).
+                    Command::FireLock { guid, on } if *guid == PLAYER => {
+                        eprintln!(
+                            "mission: her fire is {}",
+                            if *on { "locked" } else { "free" }
+                        );
+                        game.combat.fire_lock = *on;
+                    }
+                    // `Player.SetScopeEnabled` (MrxState, MrxGuiSatellite,
+                    // MrxGuiHudMessage): scopes off while any of them asks.
+                    Command::ScopeEnabled(on) => {
+                        game.combat.scope_off = !*on;
+                    }
                     // Her weapons, as the contract's scripts hand them out:
                     // fresh ones come with nothing in reserve.
                     Command::Loadout { who, weapons } if *who == PLAYER => {
