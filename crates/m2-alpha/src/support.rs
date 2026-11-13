@@ -21,12 +21,19 @@
 //! "Satellite Designator" (800052f3, model global_weapon_detonator).
 //!
 //! The first contract's script gives the bomb free
-//! (`MrxSupportData.AddFreebie("VzaCon01_SatBomb", ...)`, as
-//! [`Support::grant`] here) once she has opened and closed her PDA at the
-//! first gate, and again at the second, and hears the call's steps
-//! ([`Support::posts`]) as the satellite interface posts them. Should it
-//! never give one while a gate stands, one is given anyway after a while
-//! ([`Support::fallback`]).
+//! (`MrxSupportData.AddFreebie("VzaCon01_SatBomb", ...)`) once she has
+//! opened and closed her PDA at the first gate, and again at the second,
+//! and hears the call's steps ([`Support::posts`]) as the satellite
+//! interface posts them. With the scripts running the bomb is theirs: in
+//! her stock ([`Support::stock`]), called in by them, its designator
+//! handed back ([`Support::equip`]) to open the view and the wheel here,
+//! the confirmed spot given to their support manager
+//! ([`Support::designated`]), and `MrxSatelliteGuidedBomb` flies the
+//! Tucano over, plays its line, drops the "Smart Bomb Projectile" and blips
+//! it red on the radar. The alpha's own bomb ([`Kind::SatelliteBomb`],
+//! [`Support::grant`]) is left for play without the scripts. Should they
+//! never give one while a gate stands, theirs is asked for after a while
+//! ([`Support::fallback`]; Invented).
 //!
 //! From the 360 code: the view's field of view is the engine's default
 //! camera's ([`default_fov_y`]: 142 m of ground from top to bottom at 16:9
