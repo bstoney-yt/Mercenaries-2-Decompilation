@@ -2120,6 +2120,34 @@ impl MissionLink {
         if let Some(p) = game.scene.particles.as_mut() {
             p.camera_fade = mission.world().borrow().effects.camera_fade;
         }
+        // `Graphics.Camera.SetFovParams`, `SetNearFar` and their restores
+        // for the first view: a new call starts that set's blend, and both
+        // run on every tick (0x824B8208).
+        {
+            use m2_engine::projection::{FAR, FOV, NEAR};
+            let (fov, near_far) = {
+                let w = mission.world().borrow();
+                (w.effects.fov[0], w.effects.near_far[0])
+            };
+            if fov.calls != game.camera_calls[0] {
+                game.camera_calls[0] = fov.calls;
+                game.fov_blend.ask(fov.params.map(|f| [f]), fov.seconds);
+                eprintln!(
+                    "camera: the scripts set the field of view to {:?} rad over {} s",
+                    fov.params, fov.seconds
+                );
+            }
+            if near_far.calls != game.camera_calls[1] {
+                game.camera_calls[1] = near_far.calls;
+                game.near_far_blend.ask(near_far.params, near_far.seconds);
+                eprintln!(
+                    "camera: the scripts set near and far to {:?} over {} s",
+                    near_far.params, near_far.seconds
+                );
+            }
+            game.fov_blend.step(dt, [FOV]);
+            game.near_far_blend.step(dt, [NEAR, FAR]);
+        }
         let focus = game.focus();
         let mut lap = crate::spans::Lap::new();
         // The music region she is in: the free-play score follows it.
