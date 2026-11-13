@@ -1117,6 +1117,9 @@ pub struct MissionLink {
     stock_look: u32,
     /// The counts last given to the score's action level (for the log).
     music_aware: [u32; 4],
+    /// The homing missiles fired on her vehicle that are the scripts'
+    /// objects: their guids by round ([`homing_to_scripts`]).
+    homing_rounds: HashMap<u32, u32>,
     /// Her support stock by item key, as last looked at.
     stock_counts: Vec<(String, u32)>,
     /// Aimed designators' marks (guid, where) waiting to settle, and the
@@ -1273,6 +1276,7 @@ impl MissionLink {
             saves: Vec::new(),
             stock_look: 0,
             music_aware: [0; 4],
+            homing_rounds: HashMap::new(),
             stock_counts: Vec::new(),
             aimed: Vec::new(),
             landed: HashSet::new(),
@@ -3643,6 +3647,7 @@ impl MissionLink {
                 }
             }
             mission.set_hostile_aware(aware);
+            homing_to_scripts(game, mission, &mut self.homing_rounds);
             crate::spans::time("scripts: lua", || mission.tick(f64::from(STEP)));
             // The scripts' own interface runs too: its animations finish
             // and their callbacks run (`MrxGuiCinematic.ShowMovie` plays
@@ -7051,6 +7056,75 @@ fn set_turret(
             v.aims[k].1 = angle;
         }
     }
+}
+
+/// The scripts' local player (`Player.GetLocalPlayer`), the target's
+/// player of the locks on her.
+const LOCAL_PLAYER: u32 = 1;
+
+/// Hands the scripts the locks on her vehicle since the last step
+/// ([`crate::homing::ScriptSide`]): each missile fired on one becomes an
+/// object of theirs (its template's `HomingMissile` script run on it),
+/// then the events go to `AntiAir`'s handlers with the guids they know;
+/// a missile in flight is kept where it is, and one burst or gone leaves
+/// their world.
+fn homing_to_scripts(
+    game: &mut Game,
+    mission: &mut m2_game::mission::Mission,
+    rounds: &mut HashMap<u32, u32>,
+) {
+    use m2_game::mission::{HomingKind, HomingPost};
+    let (fired, posts) = game.combat.scripts.take();
+    let names = game
+        .scene
+        .world
+        .as_ref()
+        .map(|w| &w.index.template_db.names);
+    for (round, template, at) in fired {
+        let name = names.and_then(|n| n.get(&template).or_else(|| n.get(&(template | 1 << 31))));
+        if let Some(name) = name {
+            let guid = mission.homing_round(name, at.to_array());
+            eprintln!("homing: the scripts' missile {guid:#x} ({name}), round {round}");
+            rounds.insert(round, guid);
+        }
+    }
+    for p in posts {
+        let kind = match p.event {
+            crate::homing::LockEvent::Start => HomingKind::Start,
+            crate::homing::LockEvent::Update(s) => HomingKind::Update(s),
+            crate::homing::LockEvent::Clear => HomingKind::Clear,
+            crate::homing::LockEvent::Launched => HomingKind::Launched,
+        };
+        let post = HomingPost {
+            kind,
+            player: LOCAL_PLAYER,
+            owner: p.locker.owner,
+            vehicle: p.locker.vehicle,
+            ammo: p.round.and_then(|r| rounds.get(&r).copied()),
+        };
+        let ran = mission.homing_post(post);
+        if !matches!(kind, HomingKind::Update(_)) {
+            eprintln!(
+                "homing: AntiAir.{} owner {:#x} vehicle {:?} ammo {:?}: ran {ran}",
+                kind.handler(),
+                post.owner,
+                post.vehicle.map(|v| format!("{v:#x}")),
+                post.ammo.map(|a| format!("{a:#x}"))
+            );
+        }
+    }
+    let flying = game.combat.rounds_flying();
+    rounds.retain(|round, guid| match flying.iter().find(|f| f.0 == *round) {
+        Some(&(_, at, yaw)) => {
+            mission.place(*guid, at.to_array(), yaw);
+            true
+        }
+        None => {
+            eprintln!("homing: the scripts' missile {guid:#x} is gone");
+            mission.round_gone(*guid);
+            false
+        }
+    });
 }
 
 fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> bool {
