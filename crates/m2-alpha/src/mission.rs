@@ -9253,6 +9253,7 @@ mod tests {
                 sticky: false,
             },
             lock_on: None,
+            seeker: None,
             pickup: Some(8),
             feel: Default::default(),
             hint: None,
