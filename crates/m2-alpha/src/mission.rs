@@ -7140,6 +7140,13 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             game.door_requests.push((*guid, *door, *open));
             return false;
         }
+        // In or out of the living world (`Ai.LivingWorld`: `MrxFollow`
+        // takes out one following her): out, pushed off their post they
+        // stay where they end up.
+        Command::LivingWorld { guid, on } => {
+            game.scene.people.set_living_world(*guid, *on);
+            return false;
+        }
         // Someone following her (`Ai.Role` `Follow`: a VIP to deliver).
         Command::Follow { guid, target, near } => {
             game.scene
