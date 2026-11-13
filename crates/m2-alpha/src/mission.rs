@@ -1085,6 +1085,11 @@ pub struct MissionLink {
     states: HashMap<u32, &'static str>,
     /// The reverb to switch to, if the scripts changed it.
     reverb: Option<Option<m2_engine::reverb::ReverbPreset>>,
+    /// The master volume fades the scripts asked for since last taken
+    /// (`Sound.SetMasterVolume`: level, seconds), in order.
+    master_volumes: Vec<(f32, f32)>,
+    /// `Sound.LockListenerPosition`, as the scripts last set it.
+    listener_locked: bool,
     /// The ambiences the scripts cued (true) or stopped since last taken,
     /// by name hash, in order.
     ambiences: Vec<(u32, bool)>,
@@ -1253,6 +1258,8 @@ impl MissionLink {
             radio: Radio::default(),
             states: HashMap::new(),
             reverb: None,
+            master_volumes: Vec::new(),
+            listener_locked: false,
             ambiences: Vec::new(),
             music_region: None,
             support: Vec::new(),
@@ -3576,6 +3583,12 @@ impl MissionLink {
                         }
                     }
                     Command::Reverb(preset) => self.reverb = Some(preset.clone()),
+                    Command::MasterVolume { volume, seconds } => {
+                        self.master_volumes.push((*volume, *seconds));
+                    }
+                    Command::Ported(m2_game::ported_player::PortedCommand::ListenerLocked(on)) => {
+                        self.listener_locked = *on;
+                    }
                     Command::Ambience { name, on } => {
                         self.ambiences.push((m2_assets::name_hash(name), *on));
                     }
@@ -3957,6 +3970,18 @@ impl MissionLink {
     /// carries: a radio's place and reach; `None` for the score.
     pub fn music_at(&self) -> Option<(Vec3, f32)> {
         self.music_at
+    }
+
+    /// The master volume fades the scripts asked for since last asked
+    /// (`Sound.SetMasterVolume`: level, seconds), in order.
+    pub fn take_master_volumes(&mut self) -> Vec<(f32, f32)> {
+        std::mem::take(&mut self.master_volumes)
+    }
+
+    /// Whether the scripts have the listener locked
+    /// (`Sound.LockListenerPosition`).
+    pub fn listener_locked(&self) -> bool {
+        self.listener_locked
     }
 
     /// The reverb to switch to, if the scripts changed it.

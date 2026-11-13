@@ -10566,6 +10566,10 @@ fn mission_sounds(audio: &mut sound::GameAudio, m: &mut mission::MissionLink) {
     if let Some(preset) = m.take_reverb() {
         audio.set_reverb(preset);
     }
+    for (level, seconds) in m.take_master_volumes() {
+        audio.master_volume(level, seconds);
+    }
+    audio.lock_listener(m.listener_locked());
     for (cue, on) in m.take_ambiences() {
         audio.script_ambience(cue, on);
     }
