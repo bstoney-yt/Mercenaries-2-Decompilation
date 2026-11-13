@@ -1279,11 +1279,18 @@ impl Mission {
             });
         }
         let ended = crate::vo::update(&self.world, self.host.lua(), now);
-        for (cue, error) in ended {
+        for (cue, state, error) in ended {
+            // What became of the line: it ended, or was refused
+            // ("failed") or cut off ("cancel"), as its callback is told.
+            let what = match state {
+                "complete" => "ended".to_owned(),
+                "failed" => "refused (failed)".to_owned(),
+                state => format!("cut off ({state})"),
+            };
             self.log.push(match error {
-                None => format!("  t={now:.1} line {cue} ended"),
+                None => format!("  t={now:.1} line {cue} {what}"),
                 Some(e) => format!(
-                    "  t={now:.1} line {cue} ended; callback: {}",
+                    "  t={now:.1} line {cue} {what}; callback: {}",
                     first_lines(&e.to_string())
                 ),
             });
@@ -2600,11 +2607,33 @@ end
     /// (its `vo` events: the faction HQs' briefings are spoken by their
     /// clips, 806 lines over 258 clips, from samples): said as a scripted
     /// line with no callback, its subtitle up if the player has them on.
+    ///
+    /// From the 360 code: the voice manager hears the clips' voice
+    /// events only while it is in cinematic mode (`VO.SetCinematicMode`,
+    /// `0x82278118`, which joins and leaves their queue; the update
+    /// `0x82277D98` reads it only then), and cues each line at priority
+    /// 0, the one priority that mode lets play, with its subtitle. Out
+    /// of that mode the event is dropped.
     pub fn clip_line(&mut self, speaker: u32, cue: &str) {
+        if !self.world.borrow().vo.cinematic {
+            self.log.push(format!(
+                "  clip line {cue} not said: the voice is not in cinematic mode"
+            ));
+            return;
+        }
         let mut w = self.world.borrow_mut();
         let subtitled = !w.subtitles_off;
-        let say = w.vo.cue(Some(speaker), cue.to_owned(), None, subtitled);
-        w.commands.push(say);
+        let sequences = std::mem::take(&mut w.vo_sequences);
+        let say = w.vo.cue(
+            Some(speaker),
+            cue.to_owned(),
+            None,
+            subtitled,
+            0,
+            &sequences,
+        );
+        w.vo_sequences = sequences;
+        w.commands.extend(say.into_iter().flatten());
     }
 
     /// Everything the scripts asked the game to do since the last call.
@@ -3506,8 +3535,10 @@ mod tests {
             r#"
             local function second(state) VO.Cue(0, "B", function() heard = state end) end
             VO.Cue(0, "A", second, {}, 1, true)
-            VO.Cue(0, "C", function() cancelled = true end)
-            VO.Cancel(0, "C", true)
+            -- Less important than A, the radio's line: it may not play.
+            refused = VO.Cue(0, "D", function(state) d = state end)
+            VO.Cue(1, "C", function(state) c = state end)
+            VO.Cancel(1, "C", true)
             ordered = VO.PRIORITY_CINEMATIC < VO.PRIORITY_SCRIPTED_CONTRACT
             "#,
             "test",
@@ -3520,13 +3551,21 @@ mod tests {
         };
         assert_eq!(
             m.take_commands(),
-            [say(1, "A"), say(2, "C"), Command::Hush(2)]
+            [
+                say(1, "A"),
+                Command::Say {
+                    id: 2,
+                    speaker: Some(1),
+                    cue: "C".into()
+                },
+                Command::Hush(2)
+            ]
         );
         // The call as the scripts made it, for the log.
         assert!(
             m.take_log()
                 .iter()
-                .any(|l| l == r#"  print VO.Cancel(0, "C"): speaker None, stops lines [2]"#)
+                .any(|l| l == r#"  print VO.Cancel(1, "C"): speaker Some(1), stops lines [2]"#)
         );
         m.tick(0.1);
         m.line_length(1, 1.0);
@@ -3534,12 +3573,23 @@ mod tests {
         assert!(m.take_commands().is_empty());
         m.tick(0.6);
         assert_eq!(m.take_commands(), [say(3, "B")]);
-        for _ in 0..50 {
+        for _ in 0..60 {
             m.tick(0.1);
         }
         let g = m.host.lua().globals();
         assert_eq!(g.raw_get::<String>("heard").unwrap(), "complete");
-        assert_eq!(g.raw_get::<Option<bool>>("cancelled").unwrap(), None);
+        // The refused line and the cancelled one are told so.
+        assert!(!g.raw_get::<bool>("refused").unwrap());
+        assert_eq!(g.raw_get::<String>("d").unwrap(), "failed");
+        assert_eq!(g.raw_get::<String>("c").unwrap(), "cancel");
+        let log = m.take_log();
+        for line in [
+            "line D refused (failed)",
+            "line C cut off (cancel)",
+            "line A ended",
+        ] {
+            assert!(log.iter().any(|l| l.ends_with(line)), "{line}: {log:?}");
+        }
         assert!(g.raw_get::<bool>("ordered").unwrap());
     }
 
