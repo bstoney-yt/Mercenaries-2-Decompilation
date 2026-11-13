@@ -1123,8 +1123,19 @@ impl EngineCue {
     }
 
     /// Each track's gain and pitch with the parameters at `params` (hash,
-    /// value): its volumes multiplied, its pitches added, as semitones
-    /// (inferred). A curve of a parameter not given is passed over.
+    /// value): its volume curves multiplied together and into its
+    /// record's level, the product held to 0 to 1, and its pitch curves
+    /// added (as semitones, inferred). A curve of a parameter not given is
+    /// passed over.
+    ///
+    /// From the 360 code: a track's events (0x82841308, each frame) start
+    /// its volume at 1 and its pitch at 0; a parameter's curve (event
+    /// kinds 5 and 6) reads the parameter's value from the cue's own list
+    /// (0x82836800) and is joined straight between its points, flat past
+    /// either end (0x82844418); a volume curve multiplies the volume, a
+    /// pitch curve adds to the pitch. A voice's level (0x82838558) is its
+    /// record's level times its track's volume times the category's,
+    /// held to 0 to 1 as it is set.
     pub fn mix(&self, params: &[(u32, f32)]) -> Vec<(f32, f32)> {
         use m2_assets::voice::{CURVE_PITCH, CURVE_VOLUME};
         self.tracks
@@ -1141,7 +1152,7 @@ impl EngineCue {
                         _ => {}
                     }
                 }
-                (gain, 2f32.powf(semitones / 12.0))
+                (gain.clamp(0.0, 1.0), 2f32.powf(semitones / 12.0))
             })
             .collect()
     }
@@ -2096,6 +2107,35 @@ mod tests {
         c.tracks[0].falloff = Falloff::of_record(35.0, 75.0, 1.0);
         c.tracks[1].falloff = Falloff::of_record(10.0, 80.0, 1.0);
         assert_eq!(c.reach(), 80.0);
+    }
+
+    /// The Austin semi's middle track as its cue (`c28d6b28`) has it: a
+    /// load curve falling 0.90 to 0.36 times a speed curve, at its
+    /// record's level of 0.5 (shapes from samples, rule from 0x82841308).
+    #[test]
+    fn a_tracks_volume_curves_multiply_and_the_product_is_held_to_1() {
+        use m2_assets::voice::{CURVE_VOLUME, Curve};
+        let mut c = engine_cue();
+        c.tracks[1].volume = 0.5;
+        c.tracks[1].curves = vec![
+            Curve {
+                kind: CURVE_VOLUME,
+                param: PARAM_LOAD,
+                points: vec![(0.0, 0.9005), (1.0, 0.3559)],
+            },
+            Curve {
+                kind: CURVE_VOLUME,
+                param: PARAM_SPEED,
+                points: vec![(0.0, 0.0), (0.0194, 0.5818), (0.0831, 0.7644)],
+            },
+        ];
+        let flat_out = c.mix(&[(PARAM_SPEED, 0.0831), (PARAM_LOAD, 1.0)])[1].0;
+        assert!((flat_out - 0.5 * 0.3559 * 0.7644).abs() < 1e-5);
+        let coasting = c.mix(&[(PARAM_SPEED, 0.0831), (PARAM_LOAD, 0.0)])[1].0;
+        assert!((coasting - 0.5 * 0.9005 * 0.7644).abs() < 1e-5);
+        // A record level above 1 is held to 1 (0x82838558).
+        c.tracks[1].volume = 3.0;
+        assert_eq!(c.mix(&[(PARAM_SPEED, 0.5), (PARAM_LOAD, 0.0)])[1].0, 1.0);
     }
 
     #[test]
