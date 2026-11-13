@@ -1827,6 +1827,9 @@ pub struct Combat {
     lockers: u32,
     /// What homing weapons see of each template (`HomingTarget`).
     homing_targets: Vec<m2_engine::weapons::HomingTarget>,
+    /// Debug (`--homing-check`): her vehicle shows ground and air
+    /// signatures of 1, whatever its template says.
+    pub homing_check: bool,
     gunner_wait: Vec<f32>,
     /// Rounds left in each such gunner's burst.
     gunner_burst: Vec<u32>,
@@ -2100,6 +2103,7 @@ impl Default for Combat {
             warned: None,
             lockers: 0,
             homing_targets: Vec::new(),
+            homing_check: false,
             gunner_wait: Vec::new(),
             gunner_burst: Vec::new(),
             gunner_clips: Vec::new(),
@@ -3551,11 +3555,11 @@ impl Combat {
         let v = &f.vehicles[f.player.driving?];
         let id = v.id?;
         let at = f.physics.vehicle_transform(id)?.w_axis.truncate();
-        let signature = m2_engine::weapons::homing_signature(
-            &self.homing_targets,
-            &v.spec.label,
-            v.spec.model,
-        )?;
+        let signature = if self.homing_check {
+            [1.0, 1.0]
+        } else {
+            m2_engine::weapons::homing_signature(&self.homing_targets, &v.spec.label, v.spec.model)?
+        };
         let (lo, hi) = v.spec.bounds;
         Some(crate::homing::Mark {
             id,
@@ -5660,7 +5664,10 @@ impl Combat {
                         .map(|m| m.w_axis.truncate());
                     match goal.and_then(|g| h.steer(*at, *velocity, g, dt)) {
                         Some(v) => *velocity = v,
-                        None => *homing = None,
+                        None => {
+                            eprintln!("homing: a missile lost its target");
+                            *homing = None;
+                        }
                     }
                 }
                 let step = *velocity * dt;

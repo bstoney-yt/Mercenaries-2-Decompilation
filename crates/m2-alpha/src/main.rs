@@ -289,6 +289,8 @@ struct Options {
     take: bool,
     /// With `--aim` (or `--drive --look`): fire just before the picture.
     fire: bool,
+    /// `--homing-check`: her vehicle is seen by every homing weapon.
+    homing_check: bool,
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
@@ -995,6 +997,7 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
             "--riders" => o.riders = true,
             "--take" => o.take = true,
             "--fire" => o.fire = true,
+            "--homing-check" => o.homing_check = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
             }
@@ -2310,6 +2313,7 @@ fn screenshot(
             game.combat
                 .equip(combat::Weapon::GrenadeLauncher, 3 * combat::LAUNCHER_CLIP);
         }
+        game.combat.homing_check = options.homing_check;
         // A launcher on her back, the rifle up.
         if let Some(w) = options.slung {
             game.combat.equip(w, 3 * combat::LAUNCHER_CLIP);
