@@ -567,8 +567,8 @@ def run(args) -> int:
                     airlog_state.update(stop=stop_ev, thread=th)
                     say(f"airlog: logging movers within 1200 m of ({ax:.0f}, {az:.0f}) to {name}.csv")
             elif op == "fight":
-                # fight <secs> [<every_s> <name>]: aim (LT held) and fire RT in short
-                # bursts at the nearest slow ground mover within 60 m (a soldier:
+                # fight <secs> [<every_s> <name>]: fire RT (tControlMap: RT fire on
+                # foot; LT is crouch) at the nearest slow ground mover within 60 m (a soldier:
                 # moved 1-8 m/s over the last second, near the hero's height),
                 # turning the camera with the right stick towards it; OCR logs
                 # the HUD (the "Kill enemies (n/4)" count) every few seconds.
@@ -594,13 +594,14 @@ def run(args) -> int:
                             if old and now - old[0] > 0.8:
                                 d_hero = math.hypot(pt[0] - hp[0], pt[2] - hp[2])
                                 v = math.dist(pt, old[1]) / (now - old[0])
-                                if 1.0 < v < 8.0 and 3.0 < d_hero < 60.0 and abs(pt[1] - hp[1]) < 6:
+                                if 1.0 < v < 8.0 and 3.0 < d_hero < 150.0 and abs(pt[1] - hp[1]) < 15:
                                     cands.append((d_hero, pt))
-                        target = min(cands)[1] if cands else None
+                        best = min(cands) if cands else None
+                        target, t_dist = (best[1], best[0]) if best else (None, 0.0)
                     for idx, pt in ents.items():
                         if idx not in hist or now - hist[idx][0] > 1.0:
                             hist[idx] = (now, pt)
-                    fire = 0
+                    fire, advance = 0, 0.0
                     if target is not None:
                         bearing = math.degrees(math.atan2(target[0] - hp[0], target[2] - hp[2]))
                         yv = cam.yaw()
@@ -612,16 +613,23 @@ def run(args) -> int:
                             last_yaw = yv
                             err = (bearing - yv + 180) % 360 - 180
                             rx = max(-1.0, min(1.0, sense * err / 40))
-                            fire = 255 if abs(err) < 15 and int(now * 2) % 2 == 0 else 0
+                            # over 35 m: run at it (the camera faces it, so stick
+                            # forward); within 35 m: stand and fire when on it.
+                            advance = 1.0 if t_dist > 35.0 and abs(err) < 30 else 0.0
+                            fire = 255 if abs(err) < 12 and t_dist <= 35.0 else 0
                     else:
                         rx = 0.0
-                    apply(0, 255, fire, 0.0, 0.0, rx, 0.0)
+                    apply(0, 0, fire, 0.0, advance, rx, 0.0)
                     if now >= next_shot:
                         next_shot = now + every
                         d = shot(f"{name}-{k:03d}")
                         k += 1
                         if d is not None:
-                            say(f"fight: target {target is not None}; ocr: {ocr(d)[:80]}")
+                            t_ocr = ocr(d)
+                            say(f"fight: target {target is not None}; ocr: {t_ocr[:80]}")
+                            if "completed" in t_ocr.lower() and "kill" in t_ocr.lower():
+                                say("fight: Kill enemies completed")
+                                break
                     time.sleep(0.05)
                 apply()
             elif op == "airwatch":
