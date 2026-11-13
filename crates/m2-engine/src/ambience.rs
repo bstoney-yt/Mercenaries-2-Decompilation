@@ -50,6 +50,8 @@ pub struct Layer {
     pub max_distance: f32,
     /// The power its fade with distance follows (the record's).
     pub exponent: f32,
+    /// The level (about `volume`) and pitch each of its sounds starts at.
+    pub start: m2_assets::voice::StartDraw,
     /// (bank hash, sound index, weight).
     pub sounds: Vec<(u32, u32, f32)>,
 }
@@ -120,6 +122,7 @@ impl AmbiencePlan {
                         min_distance: r.min_distance,
                         max_distance: r.max_distance,
                         exponent: r.exponent,
+                        start: r.start,
                         sounds: r.variants.clone(),
                     }),
                 }
@@ -201,6 +204,7 @@ mod tests {
             volume: 0.3,
             min_distance: 10.0,
             max_distance: 1000.0,
+            start: m2_assets::voice::StartDraw::FLAT,
             positional: true,
             exponent: 1.0,
             variants,

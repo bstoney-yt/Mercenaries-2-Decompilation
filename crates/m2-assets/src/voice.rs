@@ -296,6 +296,92 @@ pub fn record_level(rec: &[u8]) -> (f32, f32) {
     (level, f(0x10))
 }
 
+/// What a record's sound starts at: a level and a pitch, each drawn
+/// evenly between two ends.
+///
+/// From the 360 code: as a sound starts (`0x82838320`) its pitch is
+/// drawn first (`0x82842DA8`: the float at 0x30 of a record whose byte
+/// at 0xc is 0, else between the floats at 0x5c and 0x60), then its
+/// level (`0x82842E40`, [`record_level`]). The pitch is added to the
+/// category's and sent to the voice as `pitch / 24 * 8192`
+/// (`0x82838558`: two doubles, 1/24 at `0x82076460` and 8192 at
+/// `0x82076458`), so 4096/12 of the voice's units to one of the
+/// record's.
+///
+/// The unit is taken as semitones. That rests on the voice counting
+/// 4096 to the octave, which is how the console's audio library states
+/// a source voice's pitch (a 4.12 fixed-point count of octaves); the
+/// call that hands the number to the library was not traced, so this
+/// part is inferred, not read. One thing does not fit and is not
+/// explained: the engine turns a category's pitch into the same unit
+/// with `6 * log2` (`0x82837598`, 2.0 at `0x820F8D88`, 6.0 at
+/// `0x82003CF8`), which would be six to the octave if its input is a
+/// plain rate.
+///
+/// From the data (the `recordvol` example): most records' ends are the
+/// same; some levels run 0.631 to 0.794 or 0.038 to 0.094, some pitches
+/// -1 to 1.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StartDraw {
+    /// The level's ends.
+    pub level: (f32, f32),
+    /// The pitch's ends, semitones.
+    pub pitch: (f32, f32),
+}
+
+impl StartDraw {
+    /// A sound at its own level and pitch.
+    pub const FLAT: Self = Self {
+        level: (1.0, 1.0),
+        pitch: (0.0, 0.0),
+    };
+
+    /// A record's.
+    pub fn of(rec: &[u8]) -> Self {
+        let f = |at: usize| {
+            rec.get(at..at + 4)
+                .map_or(0.0, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        if rec.get(0xc).is_some_and(|&b| b != 0) && rec.len() >= 0x64 {
+            Self {
+                level: (f(0x50), f(0x54)),
+                pitch: (f(0x5c), f(0x60)),
+            }
+        } else {
+            Self {
+                level: (f(0x2c), f(0x2c)),
+                pitch: (f(0x30), f(0x30)),
+            }
+        }
+    }
+
+    /// The level a draw of 0 to 1 gives.
+    pub fn level(&self, draw: f32) -> f32 {
+        self.level.0 + (self.level.1 - self.level.0) * draw.clamp(0.0, 1.0)
+    }
+
+    /// What a draw of 0 to 1 scales the middle level by (1 for a level
+    /// with no spread): for a sound played at its record's middle level.
+    pub fn level_scale(&self, draw: f32) -> f32 {
+        let middle = (self.level.0 + self.level.1) * 0.5;
+        if middle > 0.0 && self.level.0 != self.level.1 {
+            self.level(draw) / middle
+        } else {
+            1.0
+        }
+    }
+
+    /// The pitch a draw of 0 to 1 gives, as a rate (1: its own).
+    pub fn rate(&self, draw: f32) -> f32 {
+        let semitones = self.pitch.0 + (self.pitch.1 - self.pitch.0) * draw.clamp(0.0, 1.0);
+        if semitones.is_finite() {
+            2.0_f32.powf(semitones / 12.0)
+        } else {
+            1.0
+        }
+    }
+}
+
 /// A record as the cue list points at it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
@@ -309,6 +395,8 @@ pub struct Record {
     /// 0x1c); 0 for a record too short to hold them.
     pub min_distance: f32,
     pub max_distance: f32,
+    /// The level and pitch its sound starts at.
+    pub start: StartDraw,
     /// Whether it is placed in the world and fades with distance (the
     /// byte at 0x14), and the power its fade follows (the float at 0x24).
     ///
@@ -426,6 +514,7 @@ impl CueTable {
                     volume: record_level(rec).0,
                     min_distance: f32::from_bits(word(0x18)),
                     max_distance: f32::from_bits(word(0x1c)),
+                    start: StartDraw::of(rec),
                     positional: rec[0x14] != 0,
                     exponent: f32::from_bits(word(0x24)),
                     variants: (first..size)
@@ -440,6 +529,7 @@ impl CueTable {
                     volume: 0.0,
                     min_distance: 0.0,
                     max_distance: 0.0,
+                    start: StartDraw::FLAT,
                     positional: false,
                     exponent: 0.0,
                     variants: Vec::new(),
@@ -740,6 +830,13 @@ mod tests {
         assert_eq!(t.groups[0].streams, [(7, 0.5), (8, 0.5)]);
         // The middle of its range, not its priority.
         assert!((t.groups[0].volume - 0.6).abs() < 1e-6);
+        // The record keeps the range, and a line's single level.
+        let start = t.records[1].start;
+        assert_eq!(start.level, (0.5, 0.7));
+        assert!((start.level(0.25) - 0.55).abs() < 1e-6);
+        assert!((start.level_scale(1.0) - 0.7 / 0.6).abs() < 1e-6);
+        assert_eq!(t.records[0].start.level, (0.7, 0.7));
+        assert_eq!(t.records[0].start.level_scale(0.9), 1.0);
         assert!(t.groups[0].is_positional());
         assert_eq!(t.streams(9), Some(vec![7, 8]));
         assert_eq!(t.streams(2), Some(vec![610]));
@@ -754,6 +851,19 @@ mod tests {
         assert_eq!((b.cue, b.stream, b.max_distance), (2, 610, 1000.0));
         let asset = crate::testutil::ucfx(&[crate::testutil::UcfxNode::Leaf(*b"data", d)]);
         assert_eq!(CueTable::parse(&asset).unwrap().lines.len(), 2);
+    }
+
+    #[test]
+    fn a_start_s_pitch_is_drawn_in_semitones() {
+        let s = StartDraw {
+            level: (1.0, 1.0),
+            pitch: (-12.0, 12.0),
+        };
+        assert_eq!(s.rate(0.0), 0.5);
+        assert_eq!(s.rate(0.5), 1.0);
+        assert_eq!(s.rate(1.0), 2.0);
+        assert_eq!(StartDraw::FLAT.rate(0.3), 1.0);
+        assert_eq!(StartDraw::FLAT.level_scale(0.3), 1.0);
     }
 
     // An engine's start as the vehicles' tables lay it out: the record
