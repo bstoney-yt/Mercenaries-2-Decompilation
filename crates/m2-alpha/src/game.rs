@@ -2657,6 +2657,12 @@ impl Game {
             )),
             _ => None,
         };
+        // The d-pad's up or down, whatever else it does here (the
+        // support's on foot, the seats in a vehicle), also asks all the
+        // HUD's counters up ([`crate::gamehud::SHOW_ALL_COUNTERS`]).
+        if intent.trigger.support || intent.trigger.support_down || intent.trigger.seat {
+            self.combat.counters_shown += 1;
+        }
         let call = match her {
             Some(_) => Call {
                 aim_at,

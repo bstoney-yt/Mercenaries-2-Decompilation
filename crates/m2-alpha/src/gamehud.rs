@@ -758,6 +758,9 @@ pub struct HudState {
     /// The times she asked to see her ammo (reload, a weapon switch;
     /// `Combat::ammo_shown`): each puts both ammo boxes up.
     pub ammo_shown: u32,
+    /// The requests to show every counter so far
+    /// ([`SHOW_ALL_COUNTERS`]).
+    pub counters_shown: u32,
     /// The rifle's rounds: in the clip, stored.
     pub rifle: Rounds,
     /// Rounds the gun in her hands holds a clip (the carbine's 30, the
@@ -1096,6 +1099,7 @@ impl HudState {
             },
             fired: game.combat.fired,
             ammo_shown: game.combat.ammo_shown,
+            counters_shown: game.combat.counters_shown,
             picked: game.combat.picked,
             launcher: game.combat.launcher_rounds,
             rifle: game.combat.rifle_rounds,
@@ -2210,6 +2214,8 @@ struct Told {
     explosive: bool,
     /// The ammo-box requests passed on ([`HudState::ammo_shown`]).
     ammo_shown: u32,
+    /// The all-counters requests passed on.
+    counters_shown: u32,
     /// She was in a vehicle ([`HudState::in_vehicle`]).
     in_vehicle: Option<bool>,
     /// The gun box's icon widgets as last logged ([`Thread::gun_box`]).
@@ -4134,6 +4140,7 @@ impl Thread {
         // Reload or a weapon switch pressed: both ammo boxes up, as the
         // 360's on-foot input sends it (0x824333E0: `GuiShowAmmoCounter`
         // with `bShowGun` and `bShowExplosive` true).
+        show_counters(lua, &mut self.told.counters_shown, s.counters_shown)?;
         if s.ammo_shown != self.told.ammo_shown {
             self.told.ammo_shown = s.ammo_shown;
             let t = table(
@@ -4893,6 +4900,31 @@ fn ammo(
 
 fn fire(lua: &Lua, event: &str, args: impl IntoLuaMulti) -> mlua::Result<()> {
     gui_runtime::fire(lua, event, args).map(|_| ())
+}
+
+/// The engine's word to put every counter of the HUD up for a while.
+///
+/// From the 360 code: the player's input update shared by the on-foot and
+/// the vehicle controls (`0x8242E7A0`) sends an event of this type alone
+/// (no fields but the player) when either of two of its input bits (2 and
+/// 4) is newly pressed; the bit beside them (8) sends `TogglePDA`. From
+/// the data, the game's control layout gives the d-pad's up and down as
+/// "cash & fuel" in a vehicle and as the support's on foot; that these are
+/// the two bits is inferred from that, not read from the pad's table.
+///
+/// From the scripts: the health counter (`HandleShowHealthEvent`) and the
+/// others bound to it show themselves and fade as after a change.
+pub const SHOW_ALL_COUNTERS: &str = "ShowAllCounters";
+
+/// Fires [`SHOW_ALL_COUNTERS`] once if requests came since `told`
+/// (however many: one press, one event), and notes them told.
+fn show_counters(lua: &Lua, told: &mut u32, asked: u32) -> mlua::Result<()> {
+    if *told != asked {
+        *told = asked;
+        eprintln!("hud: all counters asked up ({asked})");
+        fire(lua, SHOW_ALL_COUNTERS, ())?;
+    }
+    Ok(())
 }
 
 /// The explosive half of `GuiWeaponEquippedUpdate` (360 0x8234F458, its
@@ -6566,6 +6598,32 @@ mod tests {
         );
         assert_eq!(parse_pair(" 12.7,-3x"), Some([12, -3]));
         assert_eq!(parse_pair("12"), None);
+    }
+
+    /// A request to show every counter fires the event once, with no
+    /// arguments, and not again until the next request.
+    #[test]
+    fn all_counters_are_asked_up_once_a_request() {
+        let lua = Lua::new();
+        lua.load(
+            r#"
+            fired = {}
+            Event = { __m2_fire = function(...)
+                table.insert(fired, table.concat({ ... }, " "))
+                return 1
+            end }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let mut told = 0;
+        show_counters(&lua, &mut told, 0).unwrap();
+        show_counters(&lua, &mut told, 1).unwrap();
+        show_counters(&lua, &mut told, 1).unwrap();
+        show_counters(&lua, &mut told, 3).unwrap();
+        let fired: Vec<String> = lua.globals().get("fired").unwrap();
+        assert_eq!(fired, ["ShowAllCounters", "ShowAllCounters"]);
+        assert_eq!(told, 3);
     }
 
     /// The context action in reach goes to the script's

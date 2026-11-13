@@ -1830,6 +1830,9 @@ pub struct Combat {
     /// The times she asked to see her ammo (reload, a weapon switch):
     /// the HUD shows both ammo boxes for each.
     pub ammo_shown: u32,
+    /// How many times all the HUD's counters have been asked up (see
+    /// [`crate::gamehud::SHOW_ALL_COUNTERS`]).
+    pub counters_shown: u32,
     /// Every shot fired, by its gun's sound set (0: none) and whether the
     /// hero fired it, and the muzzle flashes drawn as the game's effect
     /// and as the alpha's own: for the run's log.
@@ -2083,6 +2086,7 @@ impl Default for Combat {
             seed: 0x2545_f491_4f6c_dd1d,
             fired: Fired::default(),
             ammo_shown: 0,
+            counters_shown: 0,
             shots: std::collections::BTreeMap::new(),
             shooters: std::collections::BTreeMap::new(),
             flashes: (0, 0),
