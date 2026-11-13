@@ -15,8 +15,9 @@
 //!
 //! # Provenance
 //!
-//! - The cues, their tracks, records, volumes (0.30 on every record),
-//!   distances and the variants' weights: from the data (`vz.wad`, the
+//! - The cues, their tracks, records, levels ([`m2_assets::voice::record_level`]:
+//!   the 0.30 on every record is its priority), distances and the
+//!   variants' weights: from the data (`vz.wad`, the
 //!   survey example's `ambience` section).
 //! - That the stream track is the bed and loops: from the data (it alone
 //!   names the stream table; every region cue is a loop, -1 s).
