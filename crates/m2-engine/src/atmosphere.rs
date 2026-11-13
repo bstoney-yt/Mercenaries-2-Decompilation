@@ -220,10 +220,12 @@ impl ScreenEffect {
 /// One of a record's ambient effects (`AmbientEffectN...`): on every
 /// change of the light the game deletes the last record's and spawns the
 /// new one's, each with a template (from the 360 code, 0x8224D650): type
-/// 0 keeps the effect's particles about the camera (`kind` 2, 0x821DA518),
-/// type 1 on the ground about it (`kind` 7, 0x821DA768; no record uses
-/// it). The templates are the `global_particle_flotsum` family (papers,
-/// dust, bugs, birds, smoke).
+/// 0 keeps the effect's particles on a disc about the camera (`kind` 2,
+/// 0x821DA518), type 1 on the ground about it (`kind` 7, 0x821DA768).
+/// The records set slots 0 (37 of the 59), 1 (22) and 2 (10), never 3 or
+/// 4; 68 of those 69 are type 1 and one is type 0 (PC data, 2026-11-12).
+/// The templates are the `global_particle_flotsum` family (papers, dust,
+/// bugs, birds, smoke).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AmbientEffect {
     /// `AmbientEffectNType`.
