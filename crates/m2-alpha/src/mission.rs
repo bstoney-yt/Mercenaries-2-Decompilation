@@ -3476,6 +3476,21 @@ impl MissionLink {
                     Command::Invincible { guid, on } if *guid == PLAYER => {
                         game.combat.invincible = *on;
                     }
+                    // Kept from dying, though hurt (`Object.SetUnkillable`:
+                    // the PMC's support planes, `SupportAirPlane`): her, a
+                    // person, or a vehicle.
+                    Command::Unkillable { guid, on } => {
+                        if *guid == PLAYER {
+                            game.combat.unkillable_her = *on;
+                        } else {
+                            if *on {
+                                game.combat.unkillable.insert(*guid);
+                            } else {
+                                game.combat.unkillable.remove(guid);
+                            }
+                            game.scene.people.set_unkillable(*guid, *on);
+                        }
+                    }
                     // The shooting gallery holds her fire till it starts
                     // (`MrxShootingGallery`: `Human.SetFireLock`).
                     Command::FireLock { guid, on } if *guid == PLAYER => {
