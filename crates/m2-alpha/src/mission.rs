@@ -1119,6 +1119,9 @@ pub struct MissionLink {
     stock_look: u32,
     /// The counts last given to the score's action level (for the log).
     music_aware: [u32; 4],
+    /// The homing missiles fired on her vehicle that are the scripts'
+    /// objects: their guids by round ([`homing_to_scripts`]).
+    homing_rounds: HashMap<u32, u32>,
     /// Her support stock by item key, as last looked at.
     stock_counts: Vec<(String, u32)>,
     /// Aimed designators' marks (guid, where) waiting to settle, and the
@@ -1276,6 +1279,7 @@ impl MissionLink {
             saves: Vec::new(),
             stock_look: 0,
             music_aware: [0; 4],
+            homing_rounds: HashMap::new(),
             stock_counts: Vec::new(),
             aimed: Vec::new(),
             landed: HashSet::new(),
@@ -3671,6 +3675,7 @@ impl MissionLink {
                 }
             }
             mission.set_hostile_aware(aware);
+            homing_to_scripts(game, mission, &mut self.homing_rounds);
             crate::spans::time("scripts: lua", || mission.tick(f64::from(STEP)));
             // The scripts' own interface runs too: its animations finish
             // and their callbacks run (`MrxGuiCinematic.ShowMovie` plays
@@ -7081,6 +7086,75 @@ fn set_turret(
     }
 }
 
+/// The scripts' local player (`Player.GetLocalPlayer`), the target's
+/// player of the locks on her.
+const LOCAL_PLAYER: u32 = 1;
+
+/// Hands the scripts the locks on her vehicle since the last step
+/// ([`crate::homing::ScriptSide`]): each missile fired on one becomes an
+/// object of theirs (its template's `HomingMissile` script run on it),
+/// then the events go to `AntiAir`'s handlers with the guids they know;
+/// a missile in flight is kept where it is, and one burst or gone leaves
+/// their world.
+fn homing_to_scripts(
+    game: &mut Game,
+    mission: &mut m2_game::mission::Mission,
+    rounds: &mut HashMap<u32, u32>,
+) {
+    use m2_game::mission::{HomingKind, HomingPost};
+    let (fired, posts) = game.combat.scripts.take();
+    let names = game
+        .scene
+        .world
+        .as_ref()
+        .map(|w| &w.index.template_db.names);
+    for (round, template, at) in fired {
+        let name = names.and_then(|n| n.get(&template).or_else(|| n.get(&(template | 1 << 31))));
+        if let Some(name) = name {
+            let guid = mission.homing_round(name, at.to_array());
+            eprintln!("homing: the scripts' missile {guid:#x} ({name}), round {round}");
+            rounds.insert(round, guid);
+        }
+    }
+    for p in posts {
+        let kind = match p.event {
+            crate::homing::LockEvent::Start => HomingKind::Start,
+            crate::homing::LockEvent::Update(s) => HomingKind::Update(s),
+            crate::homing::LockEvent::Clear => HomingKind::Clear,
+            crate::homing::LockEvent::Launched => HomingKind::Launched,
+        };
+        let post = HomingPost {
+            kind,
+            player: LOCAL_PLAYER,
+            owner: p.locker.owner,
+            vehicle: p.locker.vehicle,
+            ammo: p.round.and_then(|r| rounds.get(&r).copied()),
+        };
+        let ran = mission.homing_post(post);
+        if !matches!(kind, HomingKind::Update(_)) {
+            eprintln!(
+                "homing: AntiAir.{} owner {:#x} vehicle {:?} ammo {:?}: ran {ran}",
+                kind.handler(),
+                post.owner,
+                post.vehicle.map(|v| format!("{v:#x}")),
+                post.ammo.map(|a| format!("{a:#x}"))
+            );
+        }
+    }
+    let flying = game.combat.rounds_flying();
+    rounds.retain(|round, guid| match flying.iter().find(|f| f.0 == *round) {
+        Some(&(_, at, yaw)) => {
+            mission.place(*guid, at.to_array(), yaw);
+            true
+        }
+        None => {
+            eprintln!("homing: the scripts' missile {guid:#x} is gone");
+            mission.round_gone(*guid);
+            false
+        }
+    });
+}
+
 fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> bool {
     // A person the scripts make (`Pg.Spawn` of a person's template) stands
     // as a layer's spawn would; one they take away goes.
@@ -7679,9 +7753,11 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
-        // A gate or door opened (PmcCon001's villa doors): its model is
-        // taken down with its collision, so she walks through (inferred:
-        // the door's own opening animation isn't played).
+        // A gate or door opened (PmcCon001's villa gates): its hinged
+        // leaves swing open, as the 360's joints do ([`m2_engine::gate`]).
+        // One whose model has no hinge (the villa's front arch,
+        // `_pmcoutpost_gate_open`) has no joint for the 360's OpenGate
+        // (0x82332DD8) to drive: it stands as it is.
         Command::OpenGate(guid) => {
             let name = mission
                 .world()
@@ -7690,18 +7766,15 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 .get(guid)
                 .map_or_else(|| "?".to_owned(), |o| o.name.clone());
             let scene = &mut game.scene;
-            match (&mut scene.world, scene.props.get(*guid)) {
-                (Some(world), Some(_)) => {
-                    scene.props.hide(&mut world.physics, [*guid]);
-                    eprintln!(
-                        "mission: Object.OpenGate {name} ({guid:#x}): opened, its model and \
-                         collision taken down (inferred: no opening animation)"
-                    );
-                }
-                _ => eprintln!(
-                    "mission: Object.OpenGate {name} ({guid:#x}): no model of it up to open"
-                ),
-            }
+            let Some(world) = &mut scene.world else {
+                return false;
+            };
+            let said = match scene.props.open_gate(&mut world.physics, *guid, true) {
+                Some(true) => "its leaves swing open",
+                Some(false) => "no hinge in its model: it stands as it is",
+                None => "no model of it up to open",
+            };
+            eprintln!("mission: Object.OpenGate {name} ({guid:#x}): {said}");
             return false;
         }
         // An infraction the scripts add against her (`Ai.AddInfraction`:
@@ -7771,18 +7844,18 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 }
             }
         }
-        // Shut again: its model and collision go back up where its layer
-        // has it (as OpenGate took them down).
+        // Shut: a gate the scripts opened swings back, its collision back
+        // up once shut. Like the 360's CloseGate (0x82332F18), which only
+        // sets its joints' targets, it does nothing to a gate never opened
+        // (PmcCon001 shuts the middle gate before opening it, and the HQ
+        // door it never opened) or to one with no hinge.
         Command::CloseGate(guid) => {
-            let put = game.scene.show_props([*guid]);
-            eprintln!(
-                "mission: Object.CloseGate {guid:#x}: {}",
-                if put > 0 {
-                    "shut, its model and collision back up"
-                } else {
-                    "already shut, or not a layer's model here"
-                }
-            );
+            let scene = &mut game.scene;
+            if let Some(world) = &mut scene.world
+                && scene.props.open_gate(&mut world.physics, *guid, false) == Some(true)
+            {
+                eprintln!("mission: Object.CloseGate {guid:#x}: its leaves swing shut");
+            }
             return false;
         }
         Command::Weapons { guid, on } if *guid == PLAYER => {

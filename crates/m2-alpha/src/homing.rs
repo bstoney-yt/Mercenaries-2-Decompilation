@@ -48,7 +48,15 @@
 //! cue (`ui_hud_radar_targeting_alert`, `ui_hud_sam_targeted`), the last
 //! gone stops it. A new lock plays `ui_hud_radar_targeting_new_alert` once,
 //! at most once a second (`knCueAlertCooldown`). A lock with no word for
-//! 1 s is cleared (its `Event.Timer`).
+//! 1 s is cleared (its `Event.Timer`). The shipped script's `_SetSound`
+//! keeps only the alert's cooldown and plays nothing, and the cue names
+//! are not in the executable: that the cues sound when its counts say is
+//! **invented** from the script's names and counts.
+//!
+//! The script itself now runs too ([`ScriptSide`]): the lock events go to
+//! `AntiAir`'s handlers with the guids the scripts know, and each missile
+//! fired on a lock is an object of theirs while it flies, so
+//! `HomingMissile` blips it (m2-game `mission::homing`).
 //!
 //! **Invented / approximated:** the target is a sphere of its vehicle's
 //! bounds (0x822938C0 measures to its box); the line of sight is the port's
@@ -429,6 +437,100 @@ impl Warnings {
     }
 }
 
+/// Who holds a lock, as the scripts know them: `uOwnerGuid` and
+/// `uVehicleGuid` (0x822956C0).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Locker {
+    pub owner: u32,
+    pub vehicle: Option<u32>,
+}
+
+/// The guids made up for lockers the scripts have no object for (the
+/// port's own patrols and crews), by their number as lockers. Invented:
+/// above the scripts' spawned guids (`0x4000_0000` on).
+pub const UNKNOWN_LOCKER: u32 = 0x7f00_0000;
+
+impl Locker {
+    /// A soldier, `n`th locker, placed by layer entity `spawn` if one.
+    pub fn soldier(spawn: Option<u32>, n: u32) -> Self {
+        Self {
+            owner: spawn.unwrap_or(UNKNOWN_LOCKER + n),
+            vehicle: None,
+        }
+    }
+
+    /// A vehicle's gun, `n`th locker, the vehicle the scripts' `vehicle`
+    /// if theirs. Its crewman is not an object of theirs here, so the
+    /// vehicle stands for him as the owner too (invented).
+    pub fn crew(vehicle: Option<u32>, n: u32) -> Self {
+        Self {
+            owner: vehicle.unwrap_or(UNKNOWN_LOCKER + n),
+            vehicle,
+        }
+    }
+}
+
+/// A lock event for the scripts: what, by whom, and for a launch the
+/// round fired ([`ScriptSide::fired`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScriptPost {
+    pub event: LockEvent,
+    pub locker: Locker,
+    pub round: Option<u32>,
+}
+
+/// What the scripts hear of the locks on her vehicle: the events, and the
+/// homing missiles fired on them (numbered rounds, made objects of theirs
+/// by the mission).
+#[derive(Debug, Default)]
+pub struct ScriptSide {
+    posts: Vec<ScriptPost>,
+    /// Round, its ammo template, where it left.
+    fired: Vec<(u32, u32, Vec3)>,
+    rounds: u32,
+    /// The round a launch was posted for, until its missile flies.
+    armed: Option<u32>,
+}
+
+impl ScriptSide {
+    /// Locker `locker`'s event. A launch numbers the round the missile
+    /// about to fly will be.
+    pub fn post(&mut self, event: LockEvent, locker: Locker) {
+        let round = (event == LockEvent::Launched).then(|| {
+            self.rounds += 1;
+            self.armed = Some(self.rounds);
+            self.rounds
+        });
+        self.posts.push(ScriptPost {
+            event,
+            locker,
+            round,
+        });
+    }
+
+    /// A homing missile of ammo `template` fired at `at`: the round its
+    /// launch was posted for, if one was.
+    pub fn fired(&mut self, template: u32, at: Vec3) -> Option<u32> {
+        let r = self.armed.take()?;
+        self.fired.push((r, template, at));
+        Some(r)
+    }
+
+    /// No missile followed the launch.
+    pub fn disarm(&mut self) {
+        self.armed = None;
+    }
+
+    /// The rounds fired and the events since last asked, rounds first (a
+    /// launch's missile must be theirs before they hear of it).
+    pub fn take(&mut self) -> (Vec<(u32, u32, Vec3)>, Vec<ScriptPost>) {
+        (
+            std::mem::take(&mut self.fired),
+            std::mem::take(&mut self.posts),
+        )
+    }
+}
+
 /// The vehicle she drives, as homing weapons see it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Mark<T> {
@@ -496,6 +598,55 @@ mod tests {
     use m2_engine::weapons::Seeker;
 
     const DT: f32 = 1.0 / 30.0;
+
+    // A launch numbers the round; the missile fired after it takes that
+    // number, once; a fire with no launch posted has none.
+    #[test]
+    fn launches_number_their_rounds() {
+        let mut s = ScriptSide::default();
+        let who = Locker::crew(Some(0x50), 1);
+        s.post(LockEvent::Clear, who);
+        s.post(LockEvent::Launched, who);
+        assert_eq!(s.fired(7, Vec3::ZERO), Some(1));
+        assert_eq!(s.fired(7, Vec3::ZERO), None);
+        let (fired, posts) = s.take();
+        assert_eq!(fired, [(1, 7, Vec3::ZERO)]);
+        assert_eq!(
+            posts.iter().map(|p| (p.event, p.round)).collect::<Vec<_>>(),
+            [(LockEvent::Clear, None), (LockEvent::Launched, Some(1))]
+        );
+        s.post(LockEvent::Launched, who);
+        s.disarm();
+        assert_eq!(s.fired(7, Vec3::ZERO), None);
+    }
+
+    // The scripts' guids: a layer's soldier by his entity, a vehicle by its
+    // own; the port's own get made-up ones by locker number.
+    #[test]
+    fn lockers_take_the_scripts_guids() {
+        assert_eq!(
+            Locker::soldier(Some(0x1234), 3),
+            Locker {
+                owner: 0x1234,
+                vehicle: None
+            }
+        );
+        assert_eq!(Locker::soldier(None, 3).owner, UNKNOWN_LOCKER + 3);
+        assert_eq!(
+            Locker::crew(Some(0x50), 2),
+            Locker {
+                owner: 0x50,
+                vehicle: Some(0x50)
+            }
+        );
+        assert_eq!(
+            Locker::crew(None, 2),
+            Locker {
+                owner: UNKNOWN_LOCKER + 2,
+                vehicle: None
+            }
+        );
+    }
 
     // The template data's mounted SAM: air, least signature 1, 15
     // degrees, 400 m, 1.5 s.

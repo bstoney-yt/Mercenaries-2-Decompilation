@@ -16,14 +16,19 @@
 //! `paradrop` (or `paratrooper`) it puts the paradrop plane (an optional
 //! third argument names its template) 100 m over her, counts the men it
 //! drops in 20 s, sets their health to 0 and counts the soldiers put in
-//! their places. Prints names, counts and the scripts' errors only.
+//! their places.
+//! For `AntiAir` it spawns a crewed
+//! `M113 AA (VZ) (Driver)` where the first stands, comes near it, has it
+//! lock on her and fire, and counts the radar calls the scripts make
+//! (`antiair:` lines). Prints names, counts and the scripts'
+//! errors only.
 
 use std::fs::File;
 use std::io::BufReader;
 
 use m2_assets::WadArchive;
 use m2_game::api::Command;
-use m2_game::mission::{GameData, Mission, OBJECT_SCRIPTS};
+use m2_game::mission::{GameData, HomingKind, HomingPost, Mission, OBJECT_SCRIPTS};
 use m2_game::vehicle_state::VehicleCommand;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -124,6 +129,11 @@ fn main() -> Result<()> {
             offered(&mission),
             alive(&mission)
         );
+    }
+    if name.eq_ignore_ascii_case("AntiAir")
+        && let Some(&(_, _, at)) = on.first()
+    {
+        antiair(&mut mission, at, &mut run)?;
     }
     if ["pmcgate", "repairpad"].contains(&name.to_ascii_lowercase().as_str())
         && let Some(&(_, first, at)) = on.first()
@@ -272,4 +282,92 @@ fn paradrop(mission: &mut Mission, template: Option<&str>) {
     }
     soldiers.dedup();
     println!("landed: {removed} jumpers removed, soldiers put in: {soldiers:?}");
+}
+
+/// `AntiAir`: a crewed one (the layers' have no driver here, and only a
+/// hostile driver's is blipped: its other colours are `false`) with a VZ
+/// crew hostile to the PMC; she comes inside its `nAARange`; it locks on
+/// her for two seconds (`HomingLockUpdate` every 0.25 s, the share rising
+/// to 1); it fires a missile, which bursts after a second. Counts the
+/// scripts' `Hud.Radar:AddObjective` / `RemoveObjective` calls by blip
+/// (the game's own `MrxGuiInterface` takes them on to the HUD's widget,
+/// which is not run here).
+fn antiair(
+    mission: &mut Mission,
+    at: [f32; 3],
+    run: &mut impl FnMut(&mut Mission, f64),
+) -> Result<()> {
+    let aa = mission
+        .spawn("M113 AA (VZ) (Driver)", at)
+        .ok_or("no M113 AA (VZ) (Driver)")?;
+    let crew: Vec<u32> = mission
+        .world()
+        .borrow()
+        .objects
+        .iter()
+        .filter(|(_, o)| o.vehicle == Some(aa))
+        .map(|(g, _)| *g)
+        .collect();
+    for g in crew {
+        if let Some(o) = mission.world().borrow_mut().objects.get_mut(&g) {
+            o.faction = Some(m2_assets::name_hash("VZ"));
+        }
+    }
+    mission.run(
+        "Ai.SetRelation('VZ', 'PMC', -100)
+        __radar = {}
+        local function note(t, what)
+            local k = tostring(t.sName)
+            __radar[k] = (__radar[k] or '') .. what
+        end
+        local add, remove = Hud.Radar.AddObjective, Hud.Radar.RemoveObjective
+        Hud.Radar.AddObjective = function(s, t)
+            note(t, t.nR == 255 and t.nG == 255 and t.nB == 255 and 'F' or 'A')
+            return add(s, t)
+        end
+        Hud.Radar.RemoveObjective = function(s, t) note(t, 'R') return remove(s, t) end",
+        "antiair-check",
+    )?;
+    // The calls on a blip so far: A added in its colour, F in its flash
+    // colour (white), R removed.
+    let calls = |m: &Mission, g: u32| -> String {
+        m.lua()
+            .load("return __radar[tostring(...)] or ''")
+            .call::<String>(m2_game::events::guid_value(g))
+            .unwrap_or_default()
+    };
+    mission.put_player([at[0] + 30.0, at[1], at[2]]);
+    run(mission, 3.0);
+    println!(
+        "antiair: radar calls on it beside it: {:?}",
+        calls(mission, aa)
+    );
+    let post = |kind, ammo| HomingPost {
+        kind,
+        player: 1,
+        owner: aa,
+        vehicle: Some(aa),
+        ammo,
+    };
+    let mut ok = mission.homing_post(post(HomingKind::Start, None));
+    for step in 1..=8 {
+        ok &= mission.homing_post(post(HomingKind::Update(step as f32 / 8.0), None));
+        run(mission, 0.25);
+    }
+    println!(
+        "antiair: lock posts ran {ok}; radar calls on it: {:?}",
+        calls(mission, aa)
+    );
+    let round = mission.homing_round("AA Missile", [at[0], at[1] + 3.0, at[2]]);
+    ok = mission.homing_post(post(HomingKind::Clear, None));
+    ok &= mission.homing_post(post(HomingKind::Launched, Some(round)));
+    run(mission, 1.0);
+    println!(
+        "antiair: launch posts ran {ok}; radar calls on the missile: {:?}",
+        calls(mission, round)
+    );
+    mission.round_gone(round);
+    run(mission, 0.5);
+    println!("antiair: once it burst: {:?}", calls(mission, round));
+    Ok(())
 }
