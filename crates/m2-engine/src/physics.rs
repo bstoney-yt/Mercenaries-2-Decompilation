@@ -10355,6 +10355,7 @@ mod tests {
             version: 0x39,
             model: 0,
             unk_0x14: [0; 3],
+            constraints: Vec::new(),
             // A trunk and its leaves on node 1, a piece it breaks into on
             // node 2 (hidden intact).
             parts: vec![

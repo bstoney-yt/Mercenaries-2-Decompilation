@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use m2_assets::model::ModelInfo;
 use m2_engine::durability::BlastPush;
+use m2_engine::gate::Gate;
 use m2_engine::model::MODEL_TEXTURE_WIDTH;
 use m2_engine::stream::PROP_SIZES;
 use m2_engine::world::ObjectPlacement;
@@ -81,6 +82,16 @@ struct PropModel {
     /// For a merged batch (a `TINY` model), the entities it is made of: it
     /// isn't drawn while any of them is shown on its own.
     members: Vec<u32>,
+    /// Its hinged leaves, a gate's ([`m2_engine::gate`]).
+    gate: Option<Gate>,
+}
+
+/// A gate the scripts opened or shut ([`Props::open_gate`]): which way it
+/// is going and how far open it is (0 shut, 1 open).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Swing {
+    open: bool,
+    at: f32,
 }
 
 /// The state layers' models in play.
@@ -136,6 +147,8 @@ pub struct Props {
     /// Node matrices of those that move on their own, by entity
     /// ([`crate::moving`]).
     poses: HashMap<u32, Vec<Mat4>>,
+    /// The gates opened or shut, by entity, until shut again.
+    swings: HashMap<u32, Swing>,
     /// Those only a support strike brings down (a mission's gates): no
     /// vehicle or common blast knocks them loose.
     pub sturdy: HashSet<u32>,
@@ -254,7 +267,7 @@ const RENEAR: f32 = 50.0;
 
 /// A model decoded on a loading thread (and, for a merged batch, the
 /// entities it is made of), or why not.
-type Load = (u32, Result<(CpuModel, Vec<u32>), String>);
+type Load = (u32, Result<(CpuModel, Vec<u32>, Option<Gate>), String>);
 
 /// The loading threads: models are asked by hash and come back decoded.
 #[derive(Debug)]
@@ -515,6 +528,7 @@ impl Props {
                 self.changed();
             }
             self.parts_down.remove(&e);
+            self.swings.remove(&e);
             self.sinking.remove(&e);
             let broken = self.broken.remove(&e).into_iter().flatten();
             let riding = self.cargo.remove(&e).map(|r| r.piece);
@@ -1480,6 +1494,7 @@ impl Props {
                 && stands(e)
                 && !p.wrecked
                 && !self.knocked.contains_key(&e)
+                && !self.swings.contains_key(&e)
                 && !physics.has_static(StaticKey::Entity(e))
             {
                 physics.add_static_as(
@@ -1603,9 +1618,9 @@ impl Props {
         source: &mut AssetSource<BufReader<File>>,
         physics: &mut Physics,
         hash: u32,
-        cpu: Result<(CpuModel, Vec<u32>), String>,
+        cpu: Result<(CpuModel, Vec<u32>, Option<Gate>), String>,
     ) -> anyhow::Result<()> {
-        let (mut cpu, members) = match cpu {
+        let (mut cpu, members, gate) = match cpu {
             Ok(cpu) => cpu,
             Err(e) => {
                 eprintln!("state layer model {hash:08x}: {e}");
@@ -1640,7 +1655,7 @@ impl Props {
                 if through_on_island(p, shape) {
                     through.push(format!("{e:#x} (template {:08x})", p.template));
                 }
-                if !p.wrecked && !self.knocked.contains_key(&e) {
+                if !p.wrecked && !self.knocked.contains_key(&e) && !self.swings.contains_key(&e) {
                     physics.add_static_as(
                         StaticKey::Entity(e),
                         shape,
@@ -1686,13 +1701,57 @@ impl Props {
                 collision: cpu.collision,
                 breakup: cpu.breakup,
                 members,
+                gate,
             }),
         );
         Ok(())
     }
 
+    /// Opens or shuts gate `entity` (`Object.OpenGate`, `CloseGate`): its
+    /// hinged leaves swing that way ([`m2_engine::gate`]), and while it
+    /// is not shut it stands in nobody's way (invented: its leaves'
+    /// collision doesn't move with them, so it is taken down whole, the
+    /// posts too). Whether it is shown and can swing: `None` when it
+    /// isn't shown, `Some(false)` when its model is in and has no hinge
+    /// (the caller takes it down instead). One whose model isn't in yet
+    /// is taken to swing.
+    pub fn open_gate(&mut self, physics: &mut Physics, entity: u32, open: bool) -> Option<bool> {
+        let p = self.shown.get(&entity)?;
+        let hinged = match self.models.get(&p.model) {
+            Some(Some(m)) => m.gate.is_some(),
+            _ => true,
+        };
+        if !hinged {
+            return Some(false);
+        }
+        let s = self.swings.entry(entity).or_insert(Swing { open, at: 0.0 });
+        s.open = open;
+        if open {
+            physics.remove_static(StaticKey::Entity(entity));
+        }
+        Some(true)
+    }
+
+    /// How far gate `entity` is open (0 shut, 1 open), once the scripts
+    /// have opened it and until it is shut again.
+    pub fn gate_open(&self, entity: u32) -> Option<f32> {
+        self.swings.get(&entity).map(|s| s.at)
+    }
+
     /// Moves on `dt` seconds: what breaks apart sinks.
     pub fn advance(&mut self, dt: f32) {
+        // Gates swing on; a shut one stands in the way again
+        // ([`update`](Self::update) puts its collision back).
+        for s in self.swings.values_mut() {
+            let to = if s.open { 1.0 } else { 0.0 };
+            let step = m2_engine::gate::SWING * dt;
+            s.at = if s.at < to {
+                (s.at + step).min(to)
+            } else {
+                (s.at - step).max(to)
+            };
+        }
+        self.swings.retain(|_, s| s.open || s.at > 0.0);
         for (e, s) in self.sinking.iter_mut() {
             s.time += dt;
             let bounds = self
@@ -1785,8 +1844,12 @@ impl Props {
                 continue;
             }
             let at = Mat4::from_rotation_translation(p.rotation, p.position);
+            // A gate the scripts opened or shut, as far open as it is.
+            let swung = (self.swings.get(e).zip(m.gate.as_ref()))
+                .filter(|_| !p.wrecked)
+                .map(|(s, g)| g.nodes(s.at));
             match (
-                self.poses.get(e).filter(|_| !p.wrecked),
+                swung.as_ref().or(self.poses.get(e).filter(|_| !p.wrecked)),
                 self.parts_down.get(e),
             ) {
                 (Some(nodes), _) => m.gpu.draw_moved(queue, at, nodes, false, &[]),
@@ -2098,7 +2161,19 @@ impl Loaders {
                                         cpu.collision = None;
                                         members = parsed.tiny_members();
                                     }
-                                    Ok((cpu, members))
+                                    // Its hinged leaves, from its
+                                    // `PHY2` constraints.
+                                    let gate = m2_assets::Ucfx::parse(&data.base)
+                                        .ok()
+                                        .and_then(|u| u.top_level(*b"PHY2"))
+                                        .and_then(|d| m2_assets::physics::Physics::parse(d).ok())
+                                        .and_then(|phy2| {
+                                            let skeleton = m2_engine::anim::Skeleton::from_nodes(
+                                                &parsed.nodes,
+                                            );
+                                            Gate::of(&skeleton, &phy2)
+                                        });
+                                    Ok((cpu, members, gate))
                                 })
                                 .map_err(|e| e.to_string())
                         }))
@@ -2117,6 +2192,44 @@ impl Loaders {
 
 #[cfg(test)]
 mod tests {
+
+    /// A gate the scripts open swings open over its time and stands in
+    /// nobody's way meanwhile; shut, it swings back and stands in the way
+    /// again once shut. One not shown can't be opened.
+    #[test]
+    fn a_gate_swings_open_and_shut_out_of_the_way() {
+        let mut physics = Physics::new();
+        let mut props = Props::default();
+        props.shown.insert(
+            1,
+            Prop {
+                model: 7,
+                position: Vec3::ZERO,
+                rotation: Quat::IDENTITY,
+                wrecked: false,
+                template: 0,
+                named: false,
+                preset: Default::default(),
+            },
+        );
+        let shape = CollisionShape::cuboid(Vec3::ONE);
+        physics.add_static(StaticKey::Entity(1), &shape, Vec3::ZERO, Quat::IDENTITY);
+        assert_eq!(props.open_gate(&mut physics, 2, true), None);
+        assert_eq!(props.open_gate(&mut physics, 1, true), Some(true));
+        assert!(!physics.has_static(StaticKey::Entity(1)));
+        props.advance(1.0);
+        let at = props.gate_open(1).unwrap();
+        assert!((at - m2_engine::gate::SWING).abs() < 1e-6, "{at}");
+        props.advance(5.0);
+        assert_eq!(props.gate_open(1), Some(1.0));
+        // Shut: back, then gone from the swings (its collision goes back
+        // up as the props update).
+        props.open_gate(&mut physics, 1, false);
+        props.advance(1.0);
+        assert!(props.gate_open(1).is_some_and(|a| a < 1.0));
+        props.advance(5.0);
+        assert_eq!(props.gate_open(1), None);
+    }
     use super::*;
     use m2_engine::{CollisionShape, LoosePiece};
 

@@ -7415,9 +7415,10 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
-        // A gate or door opened (PmcCon001's villa doors): its model is
-        // taken down with its collision, so she walks through (inferred:
-        // the door's own opening animation isn't played).
+        // A gate or door opened (PmcCon001's villa gates): its hinged
+        // leaves swing open, as the 360's joints do ([`m2_engine::gate`]);
+        // one whose model has no hinge is taken down with its collision,
+        // so she walks through.
         Command::OpenGate(guid) => {
             let name = mission
                 .world()
@@ -7426,15 +7427,20 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 .get(guid)
                 .map_or_else(|| "?".to_owned(), |o| o.name.clone());
             let scene = &mut game.scene;
-            match (&mut scene.world, scene.props.get(*guid)) {
-                (Some(world), Some(_)) => {
+            let Some(world) = &mut scene.world else {
+                return false;
+            };
+            match scene.props.open_gate(&mut world.physics, *guid, true) {
+                Some(true) => {
+                    eprintln!("mission: Object.OpenGate {name} ({guid:#x}): its leaves swing open");
+                }
+                Some(false) => {
                     scene.props.hide(&mut world.physics, [*guid]);
                     eprintln!(
-                        "mission: Object.OpenGate {name} ({guid:#x}): opened, its model and \
-                         collision taken down (inferred: no opening animation)"
+                        "mission: Object.OpenGate {name} ({guid:#x}): no hinge in its model,                          taken down with its collision"
                     );
                 }
-                _ => eprintln!(
+                None => eprintln!(
                     "mission: Object.OpenGate {name} ({guid:#x}): no model of it up to open"
                 ),
             }
@@ -7507,9 +7513,18 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 }
             }
         }
-        // Shut again: its model and collision go back up where its layer
-        // has it (as OpenGate took them down).
+        // Shut again: a swung gate's leaves swing back (its collision
+        // back up once shut); one taken down goes back up where its layer
+        // has it.
         Command::CloseGate(guid) => {
+            let scene = &mut game.scene;
+            if scene.props.gate_open(*guid).is_some()
+                && let Some(world) = &mut scene.world
+                && scene.props.open_gate(&mut world.physics, *guid, false) == Some(true)
+            {
+                eprintln!("mission: Object.CloseGate {guid:#x}: its leaves swing shut");
+                return false;
+            }
             let put = game.scene.show_props([*guid]);
             eprintln!(
                 "mission: Object.CloseGate {guid:#x}: {}",
