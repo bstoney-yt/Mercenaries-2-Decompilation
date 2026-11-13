@@ -400,6 +400,10 @@ struct Options {
     /// is done at which the scene and the game's HUD are pictured
     /// (`<out>-late<s>.ppm`), for comparing its end screens.
     late_shots: Vec<f32>,
+    /// `--mission-shots <s>,<s>...` with `--mission --screenshot`: the
+    /// scene at those seconds of play (`<out>-t<s>.ppm`, zero-padded so
+    /// they sort), for side-by-side comparisons with footage.
+    mission_shots: Vec<f32>,
     /// With `--screenshot` on foot and `--gait`: she goes on this long
     /// (seconds, default 3), logging where she is each second.
     walk_seconds: Option<f32>,
@@ -826,6 +830,13 @@ fn parse_args(given: &[String]) -> anyhow::Result<Options> {
                     .map(str::parse)
                     .collect::<Result<_, _>>()?
             }
+            "--mission-shots" => {
+                o.mission_shots = value()?
+                    .split(',')
+                    .map(|s| s.trim().parse())
+                    .collect::<Result<_, _>>()
+                    .context("--mission-shots expects seconds")?
+            }
             "--medevac" => o.medevac = Some(value()?.parse()?),
             "--visit-faction" => o.visit_faction = Some(value()?),
             "--call-extraction" => o.call_extraction = Some(value()?.parse()?),
@@ -1143,6 +1154,7 @@ const SCREENSHOT_ONLY: &[&str] = &[
     "--autoplay-avoid",
     "--movies",
     "--sound",
+    "--mission-shots",
 ];
 
 /// Those of [`SCREENSHOT_ONLY`] given without `--screenshot`, in the order
@@ -5252,6 +5264,19 @@ fn mission_for_screenshot(
                 shop_pressed = 4;
                 eprintln!("shop-key: shop open 3 s after: {}", link.shop_open());
             }
+        }
+        // `--mission-shots`: the scene (without the game's HUD, which only
+        // runs once the contract is done) at those seconds of play.
+        let now = i as f32 * tick;
+        for &s in options
+            .mission_shots
+            .iter()
+            .filter(|&&s| now >= s && now - tick < s)
+        {
+            render(backend, game, fov, aspect, None)?;
+            let path = out.with_file_name(format!("{stem}-t{s:05.1}.ppm"));
+            write_ppm(backend, &path)?;
+            eprintln!("mission-shot: {s} s: {}", path.display());
         }
         lap.mark("loop: late hud");
         // After the contract (--after-contract) the game's HUD runs too:
@@ -11192,6 +11217,18 @@ mod tests {
         let o = parse_args(&args(&["--autoplay-avoid", "OilCon020,PmcCon031"])).unwrap();
         assert_eq!(o.autoplay_avoid, ["OilCon020", "PmcCon031"]);
         assert!(parse_args(&args(&[])).unwrap().autoplay_avoid.is_empty());
+    }
+
+    #[test]
+    fn mission_shots_are_seconds_of_play() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let o = parse_args(&args(&["--mission-shots", "5, 12.5,30"])).unwrap();
+        assert_eq!(o.mission_shots, [5.0, 12.5, 30.0]);
+        assert!(parse_args(&args(&["--mission-shots", "5,x"])).is_err());
+        assert_eq!(
+            screenshot_only_ignored(&args(&["--mission", "--mission-shots", "5"])),
+            ["--mission-shots"]
+        );
     }
 
     #[test]

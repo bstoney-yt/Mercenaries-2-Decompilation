@@ -1,0 +1,15 @@
+# Case A: VzaCon001's beach landing and the first air drop (weapon crate),
+# then the hero on foot sprinting with the rifle (case B). Run after
+# vzacon001-boat.txt's steps (xenia-route.ps1 joins them with -Route a,b).
+mark boat start
+seek ffc800 180 rt delivery 0.8        # drive at the yellow beach marker until "Wait for weapon delivery"
+mark objective: wait for weapon delivery
+burst drop 60 1                         # the helicopter brings the crate: 1 frame a second
+mark crate window over
+press y 0.3                             # out of the boat
+wait 3
+shot onfoot
+set 0 1 0 0 ls                          # forward with the left stick clicked: sprint
+burst sprint 8 1
+release
+mark done
