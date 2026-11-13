@@ -992,6 +992,66 @@ impl Mission {
         Ok(result?)
     }
 
+    /// Keeps the scripts' save data now as the retry save
+    /// ([`api::ScriptWorld::retry_save`]), as `Pg.SaveGame("retry")` does
+    /// at a contract's start: the fail fanfare's Retry loads it
+    /// ([`answer_retry_load`](Self::answer_retry_load)). Its size.
+    pub fn keep_retry(&mut self) -> Result<usize, MissionError> {
+        let text = self.save_data()?;
+        let n = text.len();
+        self.world.borrow_mut().retry_save = Some(text);
+        Ok(n)
+    }
+
+    /// Whether a retry save is kept ([`keep_retry`](Self::keep_retry)).
+    pub fn has_retry(&self) -> bool {
+        self.world.borrow().retry_save.is_some()
+    }
+
+    /// Loads the retry save in place if the scripts asked
+    /// (`Pg.LoadGame("retry")`): as the 360's 0x8230C880 does, its data is
+    /// compiled as `"return " .. data` and handed to the bootstrap's
+    /// `LoadSingleton` in the running scripts, `Pg.LoadIsRetry` answering
+    /// true. Not done here (unknown in the 360's 0x8230C740, which runs
+    /// first): the engine's own resets before the load. Whether it ran.
+    fn answer_retry_load(&mut self) -> bool {
+        let text = {
+            let mut w = self.world.borrow_mut();
+            if !std::mem::take(&mut w.retry_load) {
+                return false;
+            }
+            w.retry_save.clone()
+        };
+        let Some(text) = text else {
+            return false;
+        };
+        let lua = self.host.lua();
+        let loaded = lua
+            .globals()
+            .set("__m2_saved", text.as_str())
+            .and_then(|()| {
+                lua.load(format!(
+                    "Scripts[\"{BOOTSTRAP:08x}\"].LoadSingleton({LOAD_SAVED})"
+                ))
+                .set_name("=retry load")
+                .exec()
+            });
+        let _ = lua.globals().set("__m2_saved", Value::Nil);
+        match loaded {
+            Ok(()) => self.log.push(format!(
+                "t={:.1} save: the retry save loaded in place, {} bytes",
+                self.now,
+                text.len()
+            )),
+            Err(e) => self.log.push(format!(
+                "t={:.1} save: retry load: {}",
+                self.now,
+                first_lines(&e.to_string())
+            )),
+        }
+        true
+    }
+
     /// Has [`start`](Self::start) load a save: `text` is the scripts' save
     /// data as [`save_data`](Self::save_data) wrote it. The scripts then
     /// carry on from it (the contracts done and on offer, her PMC, the
@@ -2807,6 +2867,20 @@ end
                 commands.extend(self.report(&format!("{when}, {ran} modules loaded")));
             }
             let mut delivered = 0;
+            // The retry save the scripts take as a contract starts is kept
+            // now, as the 360's `Pg.SaveGame("retry")` keeps it before it
+            // returns ([`keep_retry`](Self::keep_retry)).
+            if commands
+                .iter()
+                .any(|c| matches!(c, Command::Save { slot } if slot == api::RETRY))
+            {
+                match self.keep_retry() {
+                    Ok(n) => self
+                        .log
+                        .push(format!("  save: the retry save kept, {n} bytes")),
+                    Err(e) => self.log.push(format!("  save: retry: {e}")),
+                }
+            }
             for c in &commands {
                 if let Command::Goal {
                     guid,
@@ -2834,6 +2908,10 @@ end
                 })
                 .collect();
             if requests.is_empty() {
+                if self.answer_retry_load() {
+                    commands = self.report(&format!("{when}, retry loaded"));
+                    continue;
+                }
                 if delivered > 0 {
                     commands = self.report(&format!("{when}, deliveries done"));
                     continue;
