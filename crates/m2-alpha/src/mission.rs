@@ -199,7 +199,15 @@ pub struct RadarView {
     pub sticky: bool,
     /// Draw order: lower over higher.
     pub sort: i64,
+    /// Its sonar rings, under its icon: their texture and colour, and
+    /// each one's width (radar units) and opacity
+    /// ([`m2_game::radar_anim::SonarAnim`]).
+    pub rings: Option<Rings>,
 }
+
+/// A blip's sonar rings: their texture and colour, and each one's width
+/// and opacity.
+pub type Rings = (String, [u8; 3], Vec<(f32, f32)>);
 
 /// A marker the scripts put over one of their objects (`Marker.AddBlip`),
 /// as the HUD shows it.
@@ -5164,9 +5172,14 @@ fn radar_views(
             Some(RadarView {
                 at,
                 icon,
-                colour: [r, g, bl, 255],
+                colour: [r, g, bl, b.alpha],
                 sticky: b.sticky,
                 sort: b.sort,
+                rings: b
+                    .anims
+                    .sonar
+                    .as_ref()
+                    .map(|s| (s.texture.clone(), s.colour, s.rings())),
             })
         })
         .collect()

@@ -1244,6 +1244,7 @@ impl Mission {
             w.update_hibernation();
             w.tick_raw_clips(dt as f32);
             w.tick_fades(dt as f32);
+            w.hud.step_radar(dt as f32);
             scripted = (
                 std::mem::take(&mut w.script_spawns),
                 std::mem::take(&mut w.script_removals),

@@ -33,6 +33,7 @@ pub mod ported_physics;
 pub mod ported_player;
 pub mod ported_sp;
 pub mod ported_sys;
+pub mod radar_anim;
 pub mod report;
 pub mod reverb;
 pub mod savedata;
