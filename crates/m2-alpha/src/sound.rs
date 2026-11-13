@@ -514,6 +514,8 @@ struct Zone {
     /// The bed stream asked for (by hash), until it plays.
     bed_wanted: Option<u32>,
     bed: Option<VoiceId>,
+    /// Seconds it has played (for the log).
+    age: f32,
 }
 
 /// Seconds a bed fades in and out over as the region changes (invented).
@@ -2031,12 +2033,14 @@ impl GameAudio {
                     layers,
                     bed_wanted,
                     bed: None,
+                    age: 0.0,
                 });
             }
         }
         let Some(mut zone) = self.zone.take() else {
             return true;
         };
+        zone.age += dt;
         let fire = {
             let mut seed = self.seed;
             let fire = zone.layers.step(&zone.plan, dt, || {
@@ -2056,6 +2060,17 @@ impl GameAudio {
             let Some(buffer) = sounds.sound(bank, index).cloned() else {
                 continue;
             };
+            eprintln!(
+                "ambience: one-shot {i} of cue {:08x} at {:.2} s (its track: {:.2} s in, \
+                 passes {}, span {:.2} to {:.2} s), sound {:08x}",
+                zone.plan.cue,
+                zone.age,
+                layer.at,
+                layer.looping.passes,
+                layer.looping.start,
+                layer.looping.end,
+                buffer.hash
+            );
             let angle = self.random() * std::f32::consts::TAU;
             let distance = 10.0 + self.random() * 30.0;
             let at = listener + Vec3::new(angle.cos() * distance, 2.0, angle.sin() * distance);
