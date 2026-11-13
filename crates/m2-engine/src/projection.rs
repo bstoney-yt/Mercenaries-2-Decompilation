@@ -40,11 +40,17 @@ pub fn half_width(fov: f32, aspect: f32) -> f32 {
     (fov * FOV_PER_ASPECT * aspect * 0.5).tan()
 }
 
+/// Half the picture's height at distance 1: the half width over the
+/// aspect.
+pub fn half_height(fov: f32, aspect: f32) -> f32 {
+    half_width(fov, aspect) / aspect
+}
+
 /// The picture's height as an angle, radians, for the game's field of
 /// view `fov` (radians) at `aspect`: what a projection asking for a
 /// vertical field of view takes.
 pub fn fov_y(fov: f32, aspect: f32) -> f32 {
-    2.0 * (half_width(fov, aspect) / aspect).atan()
+    2.0 * half_height(fov, aspect).atan()
 }
 
 #[cfg(test)]
@@ -70,5 +76,22 @@ mod tests {
             across.to_degrees()
         );
         assert!((fov_y(FOV, a).to_degrees() - 45.4).abs() < 0.1);
+    }
+
+    /// The half width and height at distance 1, as the matrix builder
+    /// (0x82569080) takes them: 0.7443 by 0.4187 at 16:9, in the screen's
+    /// own shape.
+    #[test]
+    fn the_half_extents_are_in_the_screens_shape() {
+        for a in [4.0 / 3.0, 16.0 / 9.0] {
+            let (w, h) = (half_width(FOV, a), half_height(FOV, a));
+            assert!((w / h - a).abs() < 1e-5, "{w} {h}");
+        }
+        let (w, h) = (half_width(FOV, 16.0 / 9.0), half_height(FOV, 16.0 / 9.0));
+        assert!(
+            (w - 0.7443).abs() < 1e-4 && (h - 0.4187).abs() < 1e-4,
+            "{w} {h}"
+        );
+        assert_eq!((NEAR, FAR), (0.2, 2400.0));
     }
 }
