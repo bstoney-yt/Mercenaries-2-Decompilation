@@ -203,6 +203,7 @@ mod tests {
             path: Vec::new(),
             template: None,
             alarm: false,
+            association: None,
             crew: Vec::new(),
         };
         // No script, no record, whatever its data.

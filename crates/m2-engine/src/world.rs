@@ -302,9 +302,10 @@ pub struct Templates {
     pub durability: HashMap<u32, crate::durability::Durability>,
     /// The blasts of those with `Explosive`, by id.
     pub explosions: HashMap<u32, crate::durability::Explosion>,
-    /// The compiled script (`ObjectScript`) of those blasts that run one,
-    /// by id, as the archive holds it (the satellite bomb's sets the
-    /// light: `m2_game::atmosphere_script`).
+    /// The compiled script (`ObjectScript`) of every template that runs
+    /// one, by id, as the archive holds it. Six of them set the light when
+    /// their object comes into being (`m2_game::atmosphere_script`): blasts
+    /// and the air strikes' effect templates (PC data, 2026-11-12).
     pub blast_scripts: HashMap<u32, Vec<u8>>,
     /// How the templates that can be hijacked are, by id.
     pub hijack: HashMap<u32, Vec<crate::hijack::HijackEntrance>>,
@@ -314,6 +315,9 @@ pub struct Templates {
     /// What each template with a `SoundEffect` plays as its objects come
     /// into being, by id ([`crate::spawn_sound`]).
     pub spawn_sounds: HashMap<u32, crate::spawn_sound::SpawnSound>,
+    /// The AI's class of each vehicle template's driver, by the
+    /// vehicle's id ([`crate::vehicle_class`]).
+    pub vehicle_classes: HashMap<u32, u8>,
     /// Each template's exhausts, by id ([`crate::vehicle_parts`]).
     pub exhausts: HashMap<u32, Vec<crate::vehicle_parts::Exhaust>>,
     /// Each template's `Winch`, by id ([`crate::winch`]).
@@ -337,6 +341,12 @@ pub struct Templates {
     /// Each vehicle template's seats and entrances, by id
     /// ([`crate::seats::read_vehicles`]).
     pub vehicle_seats: HashMap<u32, std::sync::Arc<crate::seats::VehicleSeats>>,
+    /// Each usable template's `SocialUse` record, by id
+    /// ([`crate::social_use::read`]).
+    pub social_use: HashMap<u32, crate::social_use::SocialUse>,
+    /// Each template's `VehicleAnimationSet`, by id
+    /// ([`crate::hijack::animation_sets`]).
+    pub animation_sets: HashMap<u32, (u32, u32)>,
     /// How air strikes' ordnance flies and what its blasts do.
     pub ordnance: crate::ordnance::Ordnance,
     /// The effects each template shows, by id
@@ -954,6 +964,24 @@ impl Templates {
             .map(|(bank, _)| bank)
     }
 
+    /// The AI's class of the driver of a vehicle of `model`
+    /// ([`crate::vehicle_class`]): that of most of the model's templates
+    /// that have one, else [`crate::vehicle_class::OTHER`].
+    pub fn vehicle_class_for_model(&self, model: u32) -> u8 {
+        let mut counts: HashMap<u8, usize> = HashMap::new();
+        for (id, t) in &self.infos {
+            if t.model == Some(model)
+                && let Some(&c) = self.vehicle_classes.get(id)
+            {
+                *counts.entry(c).or_default() += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .max_by_key(|&(class, n)| (n, std::cmp::Reverse(class)))
+            .map_or(crate::vehicle_class::OTHER, |(class, _)| class)
+    }
+
     /// The sound set most templates of `model` with an engine name in
     /// their `SoundEffect` ([`crate::spawn_sound::SpawnSound::engine`]):
     /// the set its engine's start and stop are heard from.
@@ -1089,6 +1117,7 @@ impl Templates {
             hijack: crate::hijack::read(&db),
             music_sources: crate::music_source::read(&db),
             spawn_sounds: crate::spawn_sound::read(&db),
+            vehicle_classes: crate::vehicle_class::read(&db),
             exhausts: crate::vehicle_parts::read(&db),
             winches: crate::winch::read(&db),
             connect_points: crate::winch::connect_points(&db),
@@ -1114,6 +1143,8 @@ impl Templates {
                 .into_iter()
                 .map(|(id, s)| (id, std::sync::Arc::new(s)))
                 .collect(),
+            social_use: crate::social_use::read(&db),
+            animation_sets: crate::hijack::animation_sets(&db),
             ordnance: crate::ordnance::read(&db),
             effects: crate::particles::template_effects(&db),
             effect_runs: crate::particles::template_runs(&db),
@@ -1140,9 +1171,7 @@ impl Templates {
             blast_scripts: HashMap::new(),
         };
         for (id, script) in db.hashes("ObjectScript") {
-            if templates.explosions.contains_key(&id)
-                && let Ok(chunk) = source.asset(script, SCRIPT_TYPE)
-            {
+            if let Ok(chunk) = source.asset(script, SCRIPT_TYPE) {
                 templates.blast_scripts.insert(id, chunk);
             }
         }
@@ -3285,6 +3314,7 @@ mod tests {
                 sticky: false,
             },
             lock_on: None,
+            seeker: None,
             pickup: None,
             feel: Default::default(),
             hint: None,

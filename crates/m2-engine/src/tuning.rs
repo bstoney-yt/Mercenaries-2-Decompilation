@@ -1378,7 +1378,8 @@ const LINK: u32 = 0x5470_4554;
 /// The `Turret` the driver's seat turns (`Vehicle Seat (Tank Default)
 /// (Driver)` names it in its `ControllerTurret`): a tank's gun turret,
 /// not the machine gun on its cupola, which has a `Turret` of its own.
-const MAIN_TURRET: &str = "main_turret";
+/// The `Turret` record a template's driver turns.
+pub const MAIN_TURRET: &str = "main_turret";
 /// `SoundEffect`'s field naming a sound bank (see `ENGINE_BANK_FIELD`).
 const BANK: u32 = 0x14a6_7fa6;
 /// `CameraTank`'s height above the turret ring (name unknown).

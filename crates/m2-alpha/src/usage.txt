@@ -222,6 +222,10 @@ m2-alpha [options]
                          walk to the fuel can the wreck left and take it
   --fire                 with --aim or --drive: fire just before the
                          picture
+  --homing-check         debug: the vehicle she drives counts as ground and
+                         air target (signatures 1, 1) for enemy homing
+                         weapons, so any army SAM/AA/AT gun or homing
+                         launcher within range locks on it (log: homing:)
   --grip attach|hands    draw weapons on the hand's attach node as posed
                          (attach, the default), or held as worked out from
                          the hands (hands)

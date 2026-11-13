@@ -177,9 +177,24 @@ pub struct Game {
     spray_wait: f32,
     /// The light of the atmosphere region the player is in.
     pub sky: AtmosphereMix,
+    /// How far the light's screen overlay has scrolled.
+    screen_scroll: m2_engine::atmosphere::ScreenScroll,
     /// Lights blasts' scripts set, seconds before each comes in
     /// ([`m2_game::atmosphere_script`]).
     script_lights: Vec<(f32, ScriptAtmosphere)>,
+    /// The first view's focus as the scripts change it
+    /// (`Graphics.Camera.SetFocusParams`), and how many calls it has taken.
+    pub focus: m2_engine::camera_focus::FocusBlend,
+    pub focus_calls: u32,
+    /// The first view's field of view (radians) and near and far distances
+    /// as the scripts change them (`Graphics.Camera.SetFovParams`,
+    /// `SetNearFar`), and how many calls each has taken.
+    pub fov_blend: m2_engine::camera_blend::Blend<1>,
+    pub near_far_blend: m2_engine::camera_blend::Blend<2>,
+    pub camera_calls: [u32; 2],
+    /// What each template's script does to the light when its object
+    /// comes into being, once asked ([`template_light`]).
+    object_lights: std::collections::HashMap<u32, Option<(f32, ScriptAtmosphere)>>,
     /// Props that move on their own.
     moving: MovingProps,
     /// Her support: the items she holds and the call under way; her
@@ -232,6 +247,9 @@ pub struct Game {
     pub last_vehicle: Option<usize>,
     /// The island's ladders ([`crate::ladders`]).
     pub ladders: crate::ladders::Ladders,
+    /// The island's benches, chairs and the like, calling people over
+    /// ([`crate::social`]).
+    pub social: crate::social::Social,
     /// The ladder she is on.
     pub climb: Option<crate::ladders::Climbing>,
     /// The vehicle the use key seated her in and her seat's `SeatLink`
@@ -273,6 +291,11 @@ pub struct Game {
     /// Seconds the HUD's save icon has left up after the game was saved
     /// ([`SAVE_ICON_SECONDS`]).
     pub save_icon: f32,
+    /// Vehicle doors the scripts open or shut (`Vehicle.OpenDoor`,
+    /// `CloseDoor`): the vehicle's guid, the door's `Name` hash and
+    /// whether it opens; taken by the doors' swinging
+    /// ([`crate::hijack::Hijacks`]).
+    pub door_requests: Vec<(u32, u32, bool)>,
     /// Clips the scripts hold characters in by name (a faction HQ's
     /// briefing, [`crate::raw`]).
     pub raw: crate::raw::RawClips,
@@ -487,7 +510,17 @@ impl Game {
             halts: crate::halt::Halts::default(),
             spray_wait: 0.0,
             sky: AtmosphereMix::default(),
+            screen_scroll: Default::default(),
             script_lights: Vec::new(),
+            focus: Default::default(),
+            focus_calls: 0,
+            fov_blend: m2_engine::camera_blend::Blend::new([m2_engine::projection::FOV]),
+            near_far_blend: m2_engine::camera_blend::Blend::new([
+                m2_engine::projection::NEAR,
+                m2_engine::projection::FAR,
+            ]),
+            camera_calls: [0; 2],
+            object_lights: Default::default(),
             moving: MovingProps::default(),
             support: Support::default(),
             earned: Vec::new(),
@@ -504,6 +537,7 @@ impl Game {
             unusable: HashSet::new(),
             last_vehicle: None,
             ladders: Default::default(),
+            social: Default::default(),
             climb: None,
             ride: None,
             boarding: None,
@@ -516,6 +550,7 @@ impl Game {
             shot: None,
             script_view: None,
             save_icon: 0.0,
+            door_requests: Vec::new(),
             raw: crate::raw::RawClips::default(),
             outfit_wanted: None,
             grapple: crate::grapple::Grappler::default(),
@@ -2201,6 +2236,14 @@ impl Game {
             self.scene
                 .people
                 .update(&mut world.physics, &world.index.spawns, focus, threat, dt);
+            self.social.step(
+                &world.index,
+                &world.destroyed,
+                self.scene.source.as_mut(),
+                &mut self.scene.people,
+                focus,
+                dt,
+            );
             let cars: Vec<_> = self
                 .scene
                 .vehicles
@@ -2470,6 +2513,9 @@ impl Game {
 
     /// Sets off the game's effects the fight asked for and runs them.
     fn run_particles(&mut self, dt: f32) {
+        /// Where an effect's ground query starts, metres up (invented:
+        /// above anything on the island).
+        const GROUND_QUERY_TOP: f32 = 2000.0;
         if let Some(world) = self.scene.world.as_ref() {
             state_effects(world, &mut self.combat);
         }
@@ -2487,9 +2533,34 @@ impl Game {
             return;
         };
         let created = p.take(asked, &world.index.template_db);
+        // An object whose script sets the light when it activates (a
+        // blast's, an air strike's effect) sets it as the satellite bomb's
+        // does: the game runs every spawned object's `OnActivate`. One
+        // already waiting with the same light isn't doubled.
+        for &(template, _) in &created {
+            let light = self
+                .object_lights
+                .entry(template)
+                .or_insert_with(|| template_light(&world.index.template_db, template));
+            if let Some(light) = light
+                && !self.script_lights.contains(light)
+            {
+                self.script_lights.push(light.clone());
+            }
+        }
         // What came into being is heard as its template's `SoundEffect`
         // says.
         self.combat.created(created);
+        // The ground under the scripts' terrain effects: the first fixed
+        // surface straight down from well above (inferred: the game asks
+        // its ground query by x and z alone, 0x82194E20).
+        let physics = &world.physics;
+        p.run_terrain(&world.index.template_db, &|x, z| {
+            let top = Vec3::new(x, GROUND_QUERY_TOP, z);
+            physics
+                .cast_ray(top, Vec3::NEG_Y, GROUND_QUERY_TOP * 2.0)
+                .map(|(d, n)| (GROUND_QUERY_TOP - d, n))
+        });
         p.step(dt);
     }
 
@@ -2626,6 +2697,12 @@ impl Game {
             )),
             _ => None,
         };
+        // The d-pad's up or down, whatever else it does here (the
+        // support's on foot, the seats in a vehicle), also asks all the
+        // HUD's counters up ([`crate::gamehud::SHOW_ALL_COUNTERS`]).
+        if intent.trigger.support || intent.trigger.support_down || intent.trigger.seat {
+            self.combat.counters_shown += 1;
+        }
         let call = match her {
             Some(_) => Call {
                 aim_at,
@@ -2637,7 +2714,7 @@ impl Game {
                 fire: intent.trigger.fire,
                 steer: intent.walking(),
                 select: intent.trigger.select.is_some(),
-                hurt: hp < self.support_hp,
+                hurt: crate::support::hit_cancels(self.support_hp, hp),
                 pda: intent.trigger.pda,
             },
             // In a vehicle only the PDA opens: the game's car layout keeps
@@ -3029,15 +3106,29 @@ impl Game {
                 &[],
                 None,
             )
-            .map(|(i, _)| {
-                let spec = &self.scene.vehicles[i].spec;
-                vehicle_name(&w.index.template_db, strings, &spec.label, spec.model)
+            .map(|(i, entrance)| {
+                let db = &w.index.template_db;
+                let v = &self.scene.vehicles[i];
+                let spec = &v.spec;
+                let action = crate::action_prompt::vehicle_action(&approach(
+                    db,
+                    &self.scene.people,
+                    v,
+                    entrance,
+                ));
+                let key = db.localized_keys(&spec.label, spec.model).first().copied();
+                (
+                    vehicle_name(db, strings, &spec.label, spec.model),
+                    action.kind(),
+                    action.text(key),
+                )
             }),
             _ => None,
         };
         // What the use key takes, as the game words it.
         let prompt = match (&self.scene.world, player) {
             (Some(w), Some(p)) if p.driving.is_none() && p.landed && self.on_foot => {
+                use crate::action_prompt::Action as Prompt;
                 use crate::mission::Offer;
                 let db = &w.index.template_db;
                 let word = |key: u32, english: &str| {
@@ -3057,19 +3148,27 @@ impl Game {
                             let refill = crate::mission::refill(db, &self.combat, &lying.what);
                             self.combat
                                 .can_use(refill, lying.what.health)
-                                .then(|| word(TAKE_AMMO, "Take Ammo"))
+                                .then(|| (word(TAKE_AMMO, "Take Ammo"), Prompt::TakeAmmo, None))
                         }
-                        Offer::Equip => Some(word(EQUIP, "Equip %s").replace(
-                            "%s",
-                            &shown_name(db, strings, lying.what.template, lying.what.gun),
+                        Offer::Equip => Some((
+                            word(EQUIP, "Equip %s").replace(
+                                "%s",
+                                &shown_name(db, strings, lying.what.template, lying.what.gun),
+                            ),
+                            Prompt::PickupWeapon,
+                            shown_key(db, lying.what.template, lying.what.gun),
                         )),
                     },
                     None if self.combat.manned.is_none() => self
                         .placed
                         .emplacement_near(&self.scene.props, db, p.character.position)
                         .map(|m| {
-                            word(USE, "Use %s")
-                                .replace("%s", &shown_name(db, strings, m.template, None))
+                            (
+                                word(USE, "Use %s")
+                                    .replace("%s", &shown_name(db, strings, m.template, None)),
+                                Prompt::Use,
+                                shown_key(db, m.template, None),
+                            )
                         }),
                     None => None,
                 }
@@ -3109,8 +3208,21 @@ impl Game {
                 .as_ref()
                 .filter(|_| self.on_foot && !self.input_locked && !self.cinematic)
                 .map(|(_, text)| text.clone())
-                .or(prompt)
+                .or(prompt.as_ref().map(|p| p.0.clone()))
                 .filter(|_| !self.support.busy()),
+            homing: self.combat.homing().map(|lock| {
+                let physics = &self.scene.world.as_ref()?.physics;
+                let (id, share) = lock?;
+                Some((share, physics.vehicle_transform(id)?.w_axis.truncate()))
+            }),
+            // The engine's own prompt, for the game's HUD: what the use
+            // key takes, else the vehicle to get into (the alpha's order;
+            // the 360 picks the one she faces).
+            action: prompt
+                .map(|(_, a, key)| (a.kind(), a.text(key)))
+                .or_else(|| can_enter.as_ref().map(|c| (c.1, c.2.clone())))
+                .filter(|_| self.on_foot && self.context.is_none())
+                .filter(|_| !self.input_locked && !self.cinematic && !self.support.busy()),
             context_action: self
                 .context
                 .as_ref()
@@ -3120,7 +3232,7 @@ impl Game {
             hijack_keys: None,
             driving,
             crosshair: crosshair.filter(|_| self.support.looking().is_none()),
-            can_enter: can_enter.filter(|_| !self.support.busy()),
+            can_enter: can_enter.map(|c| c.0).filter(|_| !self.support.busy()),
             loading,
             support: self
                 .support
@@ -3378,7 +3490,10 @@ impl Game {
             }
         }
         self.script_lights.retain(|(left, _)| *left > 0.0);
-        if let Some(now) = self.sky.update(default, regions, focus, dt) {
+        let changed = self.sky.update(default, regions, focus, dt);
+        self.screen_scroll
+            .step(&self.sky.current(default).screen, dt);
+        if let Some(now) = changed {
             match now {
                 Some((r, s)) => {
                     let (region, (_, a)) = (&regions[r], &regions[r].settings[s]);
@@ -3440,6 +3555,12 @@ impl Game {
     /// Where the frame is seen from: her camera (shaken by a bomb close
     /// by), the satellite's while she looks through it, or the free one.
     pub fn view(&self, fov: f32, aspect: f32) -> View {
+        // The scripts' field of view: the game's own (the configured one
+        // here) moved by as much as the scripted one is from the game's
+        // default, so a player's wider setting stays wider under it
+        // (the offset is the port's; at the default setting it is the
+        // game's value itself).
+        let fov = fov + (self.fov_blend.current[0] - m2_engine::projection::FOV).to_degrees();
         let shot = self
             .shot
             .as_ref()
@@ -3456,6 +3577,14 @@ impl Game {
                 None => self.camera.view(fov, aspect),
             },
         };
+        // The scripts' near and far distances (not the satellite's view,
+        // which has its own).
+        let [near, far] = self.near_far_blend.current;
+        if self.support.looking().is_none()
+            && [near, far] != [m2_engine::projection::NEAR, m2_engine::projection::FAR]
+        {
+            view = view.with_near_far(near, far);
+        }
         if let Some((a, b)) = self.support.shake_turn()
             && self.support.looking().is_none()
         {
@@ -3494,6 +3623,20 @@ impl Game {
             }
             view.lighting.clouds.noise = world.cloud_noise;
             view.lighting.flare_map = world.sun_flare;
+            view.lighting.focus = self.focus.current;
+            // The light's screen overlay. The records name one texture,
+            // `global_rain`, which is the one loaded: another is not drawn.
+            if let (Some(a), Some(map)) = (world.index.atmosphere, world.screen_rain) {
+                let s = self.sky.current(&a).screen;
+                if s.texture == m2_assets::name_hash("global_rain") {
+                    view.lighting.screen_overlay = Some(m2_render::ScreenOverlay {
+                        map,
+                        velocity: self.screen_scroll.velocity(&s),
+                        colour: s.colour_rgba(),
+                        blend: m2_render::OverlayBlend::from_type(s.kind),
+                    });
+                }
+            }
         }
         finish(&mut view.lighting);
         post_override(&mut view.lighting);
@@ -4370,15 +4513,27 @@ fn blast_light(db: &Templates, name: &str) -> Option<(f32, ScriptAtmosphere)> {
     if std::env::var("M2_BLAST_LIGHT").is_ok_and(|v| v == "off") {
         return None;
     }
-    let bytes = db.blast_scripts.get(&db.id(name)?)?;
+    template_light(db, db.id(name)?)
+}
+
+/// What the script of template `id` does to the light when its object
+/// comes into being, if it does ([`m2_game::atmosphere_script`]): seconds
+/// until, and the light. A script the light's runner can't run (most
+/// objects' scripts need the game's other libraries) reads as none.
+fn template_light(db: &Templates, id: u32) -> Option<(f32, ScriptAtmosphere)> {
+    let bytes = db.blast_scripts.get(&id)?;
     let chunk = m2_assets::lua::Chunk::from_asset(bytes).ok()?;
-    match m2_game::atmosphere_script::activation_light(&chunk) {
-        Ok(light) => light,
-        Err(e) => {
-            eprintln!("atmosphere: {name}'s script did not run: {e}");
-            None
-        }
+    let light = m2_game::atmosphere_script::activation_light(&chunk)
+        .ok()
+        .flatten();
+    if let Some((after, l)) = &light {
+        eprintln!(
+            "atmosphere: template {id:08x}'s script sets the light after {after} s ({} values, restored over {:?} s)",
+            l.edits.len(),
+            l.restore
+        );
     }
+    light
 }
 
 /// The first of `names` the template database gives a blast.
@@ -4891,6 +5046,64 @@ fn vehicle_name(
 const TAKE_AMMO: u32 = 0xbd07_d121;
 const EQUIP: u32 = 0xdb58_ae4b;
 const USE: u32 = 0x93e3_1c00;
+
+/// The string table key of the name the game shows for template `t` (or,
+/// without one, for `or`): its `LocalizedName`.
+fn shown_key(db: &Templates, t: u32, or: Option<u32>) -> Option<u32> {
+    db.localized
+        .get(&t)
+        .or_else(|| db.localized.get(&or?))
+        .copied()
+}
+
+/// What the 360 reads of vehicle `v`'s entrance `entrance` in her reach
+/// for its prompt ([`crate::action_prompt::vehicle_action`]): the seat it
+/// gives her (before any slide over, as `0x82299D68`), the entrance's
+/// `bLadder`, the template's physics, whether it rides on two wheels,
+/// and its crew and whether they are hostile to her. The 360 asks the
+/// vehicle's own standing with the players (`0x822F08D0`, below -33);
+/// the alpha asks whether its riders' factions fight her.
+fn approach(
+    db: &Templates,
+    people: &crate::npc::People,
+    v: &ParkedVehicle,
+    entrance: Option<u32>,
+) -> crate::action_prompt::Approach {
+    use m2_engine::world::VehicleKind;
+    let ride = crate::ride::Ride::of(v);
+    let labels = db.vehicle_labels_for(&v.spec.label, v.spec.model);
+    let seat = crate::ride::board(ride, entrance, crate::ride::car_or_truck(&labels), people)
+        .and_then(|b| b.slid_from.or(b.seat));
+    let ladder = entrance
+        .and_then(|e| ride.seating?.entrance(e))
+        .is_some_and(|e| e.params.ladder);
+    // The database's physics component, else what the model was built as.
+    let physics = db
+        .names_for(&v.spec.label, v.spec.model)
+        .iter()
+        .find_map(|n| db.get(n)?.vehicle)
+        .filter(|k| *k != VehicleKind::Unknown)
+        .or(Some(if v.spec.is_helicopter() {
+            VehicleKind::Helicopter
+        } else if v.spec.is_boat() {
+            VehicleKind::Boat
+        } else if v.spec.kind == "tank" {
+            VehicleKind::Tank
+        } else {
+            VehicleKind::Car
+        }));
+    crate::action_prompt::Approach {
+        role: ride.role(seat),
+        ladder,
+        physics,
+        bike: v.spec.is_bike(),
+        crewed: !v.crew.is_empty(),
+        hostile: v
+            .crew
+            .iter()
+            .any(|(_, who)| crate::npc::faction_of(who).is_some_and(|f| people.fights_for(f))),
+    }
+}
 
 /// The name the game shows for template `t` (or, without one, for `or`):
 /// the English string its `LocalizedName` keys; else its template's name.

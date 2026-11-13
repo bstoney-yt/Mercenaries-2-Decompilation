@@ -399,9 +399,22 @@ pub fn armed_seats(v: &ParkedVehicle) -> Vec<u32> {
 /// soldier does, `npc::LOOK_EVERY`; inferred).
 const CREW_LOOK: f32 = 0.2;
 
+/// What a soldier's launcher does this frame ([`Combat::npc_seek`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Seek {
+    /// Not a homing launcher on her vehicle: as before.
+    Unguided,
+    /// Waiting for its lock.
+    Held,
+    /// Locked: fires, homing.
+    Fire(Option<crate::homing::Homing<VehicleId>>),
+}
+
 /// An armed seat of an army's vehicle: see [`Combat::crews_fire`].
 #[derive(Debug, Default)]
 struct CrewGun {
+    /// A homing gun's lock on her vehicle.
+    seeking: crate::homing::Seeking<VehicleId>,
     slot: m2_engine::ai_target::Slot,
     /// Where the one in its slot is.
     at: Option<Vec3>,
@@ -1476,7 +1489,7 @@ enum Projectile {
         shell: bool,
         owner: Option<VehicleId>,
         blast: Option<Blast>,
-        homing: Option<(VehicleId, f32)>,
+        homing: Option<crate::homing::Homing<VehicleId>>,
         /// Its round's `DamageKey` (`Rocket`): what a weak point it
         /// strikes takes of its blast ([`DamageTable::weak_point`]).
         key: Option<u32>,
@@ -1805,6 +1818,18 @@ pub struct Combat {
     crews: std::collections::HashMap<(usize, usize), CrewGun>,
     /// A crew's gun, not hers, is firing.
     crew_firing: bool,
+    /// The homing a crew's next missile flies by (its gun's lock).
+    crew_homing: Option<crate::homing::Homing<VehicleId>>,
+    /// The locks on her vehicle as she hears them, the vehicle they are
+    /// for, and lockers numbered so far ([`crate::homing`]).
+    warnings: crate::homing::Warnings,
+    warned: Option<VehicleId>,
+    lockers: u32,
+    /// What homing weapons see of each template (`HomingTarget`).
+    homing_targets: Vec<m2_engine::weapons::HomingTarget>,
+    /// Debug (`--homing-check`): her vehicle shows ground and air
+    /// signatures of 1, whatever its template says.
+    pub homing_check: bool,
     gunner_wait: Vec<f32>,
     /// Rounds left in each such gunner's burst.
     gunner_burst: Vec<u32>,
@@ -1830,6 +1855,9 @@ pub struct Combat {
     /// The times she asked to see her ammo (reload, a weapon switch):
     /// the HUD shows both ammo boxes for each.
     pub ammo_shown: u32,
+    /// How many times all the HUD's counters have been asked up (see
+    /// [`crate::gamehud::SHOW_ALL_COUNTERS`]).
+    pub counters_shown: u32,
     /// Every shot fired, by its gun's sound set (0: none) and whether the
     /// hero fired it, and the muzzle flashes drawn as the game's effect
     /// and as the alpha's own: for the run's log.
@@ -2070,6 +2098,12 @@ impl Default for Combat {
             ripple: 0,
             crews: std::collections::HashMap::new(),
             crew_firing: false,
+            crew_homing: None,
+            warnings: Default::default(),
+            warned: None,
+            lockers: 0,
+            homing_targets: Vec::new(),
+            homing_check: false,
             gunner_wait: Vec::new(),
             gunner_burst: Vec::new(),
             gunner_clips: Vec::new(),
@@ -2083,6 +2117,7 @@ impl Default for Combat {
             seed: 0x2545_f491_4f6c_dd1d,
             fired: Fired::default(),
             ammo_shown: 0,
+            counters_shown: 0,
             shots: std::collections::BTreeMap::new(),
             shooters: std::collections::BTreeMap::new(),
             flashes: (0, 0),
@@ -2352,6 +2387,7 @@ impl Combat {
     /// name, and the grenade, C4 and proximity mine to throw.
     pub fn arm(&mut self, arms: &m2_engine::weapons::Arms, table: Option<DamageTable>) {
         self.damage_table = table;
+        self.homing_targets = arms.homing_targets.clone();
         self.feels = arms.weapons.iter().map(|(&id, w)| (id, w.feel)).collect();
         self.shells = arms
             .weapons
@@ -3161,6 +3197,8 @@ impl Combat {
 
         // Soldiers' shots and grenades.
         let target = self.target(f.player, true);
+        let mark = self.her_mark(f);
+        self.warn_for(mark.map(|m| m.id), dt);
         for i in 0..f.people.npcs.len() {
             // Whom they go for, of another army, else her.
             let foe = f.people.npcs[i].foe_at;
@@ -3168,8 +3206,14 @@ impl Combat {
                 let at = f.people.npcs[i].fire_at.take().or(foe).or(target);
                 self.npc_shoot(f, i, at);
             }
-            if std::mem::take(&mut f.people.npcs[i].launches) {
-                self.npc_launch(f, i, foe.or(target));
+            let launches = std::mem::take(&mut f.people.npcs[i].launches);
+            match self.npc_seek(f, i, mark, launches, dt) {
+                Seek::Unguided if launches => self.npc_launch(f, i, foe.or(target), None),
+                Seek::Fire(h) => {
+                    let at = mark.map(|m| m.at).or(foe).or(target);
+                    self.npc_launch(f, i, at, h);
+                }
+                _ => {}
             }
             if let Some(at) = f.people.npcs[i].throws.take() {
                 self.npc_throw(f, i, at);
@@ -3505,13 +3549,119 @@ impl Combat {
         alarm(f.people, f.player.character.position);
     }
 
+    /// The vehicle she drives as homing weapons see it: where, how big,
+    /// its template's `HomingTarget` signatures (none: not a target).
+    fn her_mark(&self, f: &Field<'_>) -> Option<crate::homing::Mark<VehicleId>> {
+        let v = &f.vehicles[f.player.driving?];
+        let id = v.id?;
+        let at = f.physics.vehicle_transform(id)?.w_axis.truncate();
+        let signature = if self.homing_check {
+            [1.0, 1.0]
+        } else {
+            m2_engine::weapons::homing_signature(&self.homing_targets, &v.spec.label, v.spec.model)?
+        };
+        let (lo, hi) = v.spec.bounds;
+        Some(crate::homing::Mark {
+            id,
+            at,
+            radius: (hi - lo).length() * 0.5,
+            signature,
+        })
+    }
+
+    /// The warnings she hears go with her vehicle: another, or none,
+    /// drops them; a frame passes for the rest.
+    fn warn_for(&mut self, vehicle: Option<VehicleId>, dt: f32) {
+        if vehicle != self.warned {
+            self.warnings.drop_all();
+            self.warned = vehicle;
+        }
+        self.warnings.tick(dt);
+    }
+
+    /// The warning cues to play (`false`) or stop (`true`) since last
+    /// asked ([`crate::homing::Warnings`]).
+    pub fn take_warning_cues(&mut self) -> Vec<(&'static str, bool)> {
+        self.warnings.take_cues()
+    }
+
+    /// A soldier's homing launcher (360 0x822C95D8, 0x82294B70): while he
+    /// has it up against her vehicle he names it as its target and its
+    /// lock runs; a shot he asks for waits for the lock, then flies after
+    /// her vehicle. A launcher that does not lock, or a target that is not
+    /// her vehicle, fires as before.
+    fn npc_seek(
+        &mut self,
+        f: &mut Field<'_>,
+        i: usize,
+        mark: Option<crate::homing::Mark<VehicleId>>,
+        launches: bool,
+        dt: f32,
+    ) -> Seek {
+        let n = &f.people.npcs[i];
+        let Some(l) = n.launcher else {
+            return Seek::Unguided;
+        };
+        let Some(s) = l.seeker.filter(|s| s.locks()) else {
+            return Seek::Unguided;
+        };
+        let up = n.alive && n.weapon == Some(1) && n.foe_at.is_none();
+        let from = n.chest() + Vec3::Y * 0.4;
+        let physics = &*f.physics;
+        let n = &mut f.people.npcs[i];
+        if n.seeking.owner == 0 {
+            self.lockers += 1;
+            n.seeking.owner = self.lockers;
+        }
+        if up && mark.is_some() {
+            n.seeking.named = crate::homing::NAMED;
+        }
+        let event = n.seeking.tick(dt, &s, from, mark, |o, d, r| {
+            physics.cast_ray_vehicle(o, d, r, None).and_then(|h| h.1)
+        });
+        if let Some(e) = event {
+            self.warnings.hear(n.seeking.owner, e);
+        }
+        if mark.is_none() || !up {
+            return Seek::Unguided;
+        }
+        if launches {
+            n.seeking.held = true;
+        }
+        if !n.seeking.held || n.seeking.lock.locked().is_none() {
+            return Seek::Held;
+        }
+        n.seeking.held = false;
+        let (events, target) = n.seeking.lock.launched();
+        for (e, t) in events {
+            if mark.map(|m| m.id) == Some(t) {
+                self.warnings.hear(n.seeking.owner, e);
+            }
+        }
+        eprintln!(
+            "homing: a soldier's {:#x} locked on her vehicle fires",
+            l.template
+        );
+        Seek::Fire(
+            target
+                .zip(l.ammo.homing)
+                .map(|(t, h)| crate::homing::Homing::new(t, h)),
+        )
+    }
+
     /// A soldier's rocket from his launcher at her ([`crate::npc::Npc::launcher`]):
     /// from over his shoulder, at its template's speed from a person's
     /// hands, bursting as its round says. His aim strays by his
     /// `Accuracy` as his rounds do ([`SoldierSpread`], with the launcher's
     /// own cone taken as none: inferred). A homing one is not locked on
     /// (invented: no lock is read for soldiers).
-    fn npc_launch(&mut self, f: &mut Field<'_>, i: usize, target: Option<Vec3>) {
+    fn npc_launch(
+        &mut self,
+        f: &mut Field<'_>,
+        i: usize,
+        target: Option<Vec3>,
+        homing: Option<crate::homing::Homing<VehicleId>>,
+    ) {
         let Some(aim) = target else { return };
         let n = &f.people.npcs[i];
         let Some(l) = n.launcher else { return };
@@ -3534,7 +3684,7 @@ impl Combat {
             shell: false,
             owner: None,
             blast: l.ammo.burst(),
-            homing: None,
+            homing,
             key: l.ammo.key,
             army: true,
         });
@@ -3894,6 +4044,19 @@ impl Combat {
         };
     }
 
+    /// With a homing launcher up (one whose template has a
+    /// `HomingWeapon`): the vehicle it is locking on and how far the lock
+    /// has come, 0 to 1, if any. From the 360 code (the lock update,
+    /// `0x82294318`): the share is 1 less the lock's time left over the
+    /// weapon's `LockOnTime`, 1 when there is none to wait.
+    pub fn homing(&self) -> Option<Option<(VehicleId, f32)>> {
+        let (time, _) = self.launcher.lock_on?;
+        if self.weapon != self.launcher.slot() || self.second.is_none() {
+            return None;
+        }
+        Some(self.lock.map(|(id, t)| (id, lock_share(t, time))))
+    }
+
     /// The vehicle a homing launcher has locked on, once held long enough.
     pub fn locked(&self) -> Option<VehicleId> {
         let (time, _) = self.launcher.lock_on?;
@@ -3914,12 +4077,10 @@ impl Combat {
         // Its template's speed (`Velocity` times `HumanBoost`: the RPG
         // rocket's 25 x 2).
         let velocity = (goal - from).normalize_or(dir) * self.launcher.speed(ROCKET_SPEED);
-        let homing = self.locked().zip(
-            self.launcher
-                .ammo
-                .and_then(|a| a.homing)
-                .map(|(turn, _)| turn.to_radians()),
-        );
+        let homing = self
+            .locked()
+            .zip(self.launcher.ammo.and_then(|a| a.homing))
+            .map(|(t, h)| crate::homing::Homing::new(t, h));
         self.last_launch = Some((from, goal));
         self.projectiles.push(Projectile::Rocket {
             at: from,
@@ -4201,7 +4362,7 @@ impl Combat {
                     shell: false,
                     owner: Some(id),
                     blast: ammo.burst(),
-                    homing: None,
+                    homing: self.crew_homing.take(),
                     key: ammo.key,
                     army: self.crew_firing,
                 });
@@ -4343,6 +4504,17 @@ impl Combat {
         }
     }
 
+    /// The vehicles whose crews have settled on her: one entry (the
+    /// vehicle's place in the scene's list) for each armed seat whose
+    /// foe she is.
+    pub fn crews_on_her(&self) -> Vec<usize> {
+        self.crews
+            .iter()
+            .filter(|(_, gun)| gun.slot.who == Some(crate::npc::HER))
+            .map(|(&(i, _), _)| i)
+            .collect()
+    }
+
     /// The vehicles whose guns have a foe, each with where that foe is
     /// and whether it is a vehicle, its first seat's that has one.
     pub fn crew_foes(&self, driving: bool) -> Vec<(usize, Vec3, bool)> {
@@ -4378,6 +4550,7 @@ impl Combat {
     fn crews_fire(&mut self, f: &mut Field<'_>, dt: f32) {
         const VISION: f32 = 1.25;
         let driven = f.player.driving;
+        let mark = self.her_mark(f);
         for i in 0..f.vehicles.len() {
             let v = &f.vehicles[i];
             let Some(side) = v.army() else { continue };
@@ -4404,6 +4577,9 @@ impl Combat {
                     continue;
                 };
                 let hint = m.weapon.hint;
+                let seeker = m.weapon.seeker.filter(|s| s.locks());
+                let guided = m.weapon.ammo.homing;
+                let skip = v.id;
                 let (near, far) = hint.map_or((0.0, GUNNER_RANGE), |h| (h.min_range, h.range));
                 let cone = m.weapon.feel.cone(0.0);
                 let gap = m.weapon.gap();
@@ -4470,6 +4646,25 @@ impl Combat {
                         Default::default()
                     };
                 }
+                // A homing gun names her vehicle while it goes for her, and
+                // its lock runs (360 0x822AE598, 0x82294B70).
+                let on_her = gun.slot.who == Some(crate::npc::HER) && mark.is_some();
+                if let Some(s) = seeker {
+                    if gun.seeking.owner == 0 {
+                        self.lockers += 1;
+                        gun.seeking.owner = self.lockers;
+                    }
+                    if on_her {
+                        gun.seeking.named = crate::homing::NAMED;
+                    }
+                    let physics = &*f.physics;
+                    let event = gun.seeking.tick(dt, &s, centre, mark, |o, d, r| {
+                        physics.cast_ray_vehicle(o, d, r, skip).and_then(|h| h.1)
+                    });
+                    if let Some(e) = event {
+                        self.warnings.hear(gun.seeking.owner, e);
+                    }
+                }
                 let Some(at) = gun.at else { continue };
                 // Where a round will find it, and how much it falls on the way.
                 gun.watch.see(at, dt);
@@ -4494,6 +4689,25 @@ impl Combat {
                 };
                 if !laid || wait > 0.0 || !empty {
                     continue;
+                }
+                // ... and it holds its fire until locked, each missile
+                // locked afresh (0x822AE598, 0x82293660).
+                self.crew_homing = None;
+                if seeker.is_some() && on_her {
+                    let gun = self.crews.entry((i, seat)).or_default();
+                    if gun.seeking.lock.locked().is_none() {
+                        continue;
+                    }
+                    let (events, target) = gun.seeking.lock.launched();
+                    for (e, t) in events {
+                        if mark.map(|m| m.id) == Some(t) {
+                            self.warnings.hear(gun.seeking.owner, e);
+                        }
+                    }
+                    self.crew_homing = target
+                        .zip(guided)
+                        .map(|(t, h)| crate::homing::Homing::new(t, h));
+                    eprintln!("homing: a crew's gun locked on her vehicle fires");
                 }
                 let to = at - centre;
                 let (a, b) = (self.random(), self.random());
@@ -5454,17 +5668,19 @@ impl Combat {
                 army,
             } => {
                 // Turning after the vehicle it locked on, no faster than its
-                // turn rate.
-                if let Some((target, turn)) = *homing
-                    && let Some(m) = f.physics.vehicle_transform(target)
-                {
-                    let want = (m.w_axis.truncate() - *at).normalize_or_zero();
-                    let speed = velocity.length();
-                    let have = velocity.normalize_or_zero();
-                    let angle = have.angle_between(want);
-                    if angle > 1e-4 && want != Vec3::ZERO {
-                        let t = ((turn * dt) / angle).min(1.0);
-                        *velocity = have.lerp(want, t).normalize_or(have) * speed;
+                // turn rate; one gone, or too far off its nose, is lost and
+                // it flies on straight ([`crate::homing::Homing::steer`]).
+                if let Some(h) = homing {
+                    let goal = f
+                        .physics
+                        .vehicle_transform(h.target)
+                        .map(|m| m.w_axis.truncate());
+                    match goal.and_then(|g| h.steer(*at, *velocity, g, dt)) {
+                        Some(v) => *velocity = v,
+                        None => {
+                            eprintln!("homing: a missile lost its target");
+                            *homing = None;
+                        }
                     }
                 }
                 let step = *velocity * dt;
@@ -6495,8 +6711,29 @@ fn place_key(kind: u64, at: Vec3) -> u64 {
     (kind << 48) | (q(at.x) << 32) | (q(at.y) << 16) | q(at.z)
 }
 
+/// How far a lock held for `held` seconds has come on a weapon that
+/// takes `time` to lock on, 0 to 1 (see [`Combat::homing`]).
+fn lock_share(held: f32, time: f32) -> f32 {
+    if time > 0.0 {
+        (held / time).clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The Stinger's 2 s lock: half way after a second, whole at 2 and
+    /// after; a weapon with no time to wait is locked at once.
+    #[test]
+    fn a_lock_comes_on_over_the_weapons_lock_on_time() {
+        assert_eq!(super::lock_share(0.0, 2.0), 0.0);
+        assert_eq!(super::lock_share(1.0, 2.0), 0.5);
+        assert_eq!(super::lock_share(2.0, 2.0), 1.0);
+        assert_eq!(super::lock_share(5.0, 2.0), 1.0);
+        assert_eq!(super::lock_share(0.0, 0.0), 1.0);
+    }
+
     use super::*;
     use crate::npc::tests::{ground, rig};
     use crate::npc::{Brain, Npc};
